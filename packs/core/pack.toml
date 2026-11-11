@@ -1,0 +1,46 @@
+name = "core"
+description = "General-purpose roles: a lead that owns a mission, workers and a verifier it can delegate to, and a plain chat role."
+default_role = "lead"
+
+[roles.lead]
+description = "Owns a mission end to end: plans, works, delegates, and finishes through the finish gate."
+prompt = "roles/lead.md"
+termination = "explicit"
+may_spawn = ["worker", "verifier"]
+verify_finish = true
+tools = [
+  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search",
+  "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "decide", "verify",
+  "finish", "ask_user", "report_blocker", "wait",
+]
+
+[roles.worker]
+description = "Carries out one assignment from a lead and returns a result with quoted evidence."
+prompt = "roles/worker.md"
+termination = "explicit"
+tools = [
+  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search",
+  "finish", "report_blocker", "wait",
+]
+
+[roles.verifier]
+description = "Independently tries to refute a claim or a finished mission. Cannot modify the workspace."
+prompt = "roles/verifier.md"
+termination = "explicit"
+read_only = true
+tools = [
+  "bash", "job_wait", "job_kill", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "ledger", "log_search",
+  "verdict", "report_blocker",
+]
+
+[roles.chat]
+description = "Interactive assistant: answers and acts turn by turn; a reply without a tool call ends the turn."
+prompt = "roles/chat.md"
+termination = "free"
+tools = [
+  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "pin", "log_search",
+]
