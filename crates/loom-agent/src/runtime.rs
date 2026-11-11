@@ -421,6 +421,9 @@ pub enum BusEvent {
     /// A child settled (also visible as records; this is for listings).
     Settled { session: SessionId, settlement: Box<Settlement> },
     Error { session: Option<SessionId>, message: String },
+    /// Never published by the runtime. The API sends it to a subscriber that fell behind and
+    /// missed `missed` events; the subscriber should fetch what it shows again.
+    Lagged { missed: u64 },
 }
 
 /// The runtime. Cheap to clone; all clones are the same runtime.
