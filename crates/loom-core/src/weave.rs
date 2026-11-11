@@ -673,9 +673,15 @@ pub fn render_brief(brief: &Brief) -> String {
 pub fn request_messages(weave: &Weave, hud: Option<&str>) -> Vec<Value> {
     let mut out: Vec<Value> = weave.messages.iter().map(Message::to_openai).collect();
     if let Some(h) = hud {
-        out.push(Message::user(format!("<harness-state>\n{h}\n</harness-state>")).to_openai());
+        out.push(hud_message(h).to_openai());
     }
     out
+}
+
+/// The message that carries the per-request state block. It is always the last message of a
+/// request and is never part of the stable prefix.
+pub fn hud_message(hud: &str) -> Message {
+    Message::user(format!("<harness-state>\n{hud}\n</harness-state>"))
 }
 
 #[cfg(test)]

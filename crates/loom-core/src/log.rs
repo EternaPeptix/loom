@@ -266,20 +266,13 @@ impl SessionLog {
         if upto_seq >= self.next_seq {
             return Err(LogError::ForkPoint { upto: upto_seq, last: self.next_seq.saturating_sub(1) });
         }
-        let mut child = SessionLog::create(dest, durability)?;
-        match self.copy_prefix(&mut child, upto_seq) {
-            Ok(()) => Ok(child),
-            Err(e) => {
-                drop(child);
-                let _ = std::fs::remove_file(dest);
-                Err(e)
-            }
-        }
+        fork_file(&self.path, dest, upto_seq, durability)
     }
 
-    /// Copy the first `upto_seq + 1` stored lines into `child` and set its chain state.
-    fn copy_prefix(&self, child: &mut SessionLog, upto_seq: Seq) -> Result<(), LogError> {
-        let src = File::open(&self.path).map_err(io_err(&self.path))?;
+    /// Copy the first `upto_seq + 1` stored lines of the log at `src_path` into `child` and set its
+    /// chain state.
+    fn copy_prefix(src_path: &Path, child: &mut SessionLog, upto_seq: Seq) -> Result<(), LogError> {
+        let src = File::open(src_path).map_err(io_err(src_path))?;
         let mut reader = BufReader::new(src);
         let mut out = BufWriter::new(&child.file);
         let mut buf = Vec::new();
@@ -288,9 +281,9 @@ impl SessionLog {
         let mut seq: Seq = 0;
         while seq <= upto_seq {
             buf.clear();
-            let n = reader.read_until(b'\n', &mut buf).map_err(io_err(&self.path))?;
+            let n = reader.read_until(b'\n', &mut buf).map_err(io_err(src_path))?;
             let Some((&b'\n', line)) = buf.split_last() else {
-                return Err(io_err(&self.path)(std::io::Error::new(
+                return Err(io_err(src_path)(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     format!("log ends before record {seq}; reopen the session so the log is repaired, then fork again"),
                 )));
@@ -309,6 +302,21 @@ impl SessionLog {
         child.last_hash = last_hash;
         child.len = copied;
         Ok(())
+    }
+}
+
+/// Fork the log file at `src` without holding it open for writing: copy records `0..=upto_seq`
+/// byte for byte into a new log at `dest` and return that log open. `src` is only read, so this is
+/// safe while another handle is appending to it (records up to `upto_seq` must already be complete).
+pub fn fork_file(src: &Path, dest: &Path, upto_seq: Seq, durability: Durability) -> Result<SessionLog, LogError> {
+    let mut child = SessionLog::create(dest, durability)?;
+    match SessionLog::copy_prefix(src, &mut child, upto_seq) {
+        Ok(()) => Ok(child),
+        Err(e) => {
+            drop(child);
+            let _ = std::fs::remove_file(dest);
+            Err(e)
+        }
     }
 }
 
