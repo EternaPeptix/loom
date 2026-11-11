@@ -14,7 +14,7 @@
 //! …)`; `Err(text)` → error `{text}\nNothing was delivered. Correct the quotes and call finish again.`
 //!
 //! **In a child session** (`S.is_child()`): store the answer when it is longer than
-//! `REPORT_MAX_CHARS` characters (`ctx.blobs.put_bytes`, handle via `BlobStore::handle`), render
+//! `REPORT_MAX_CHARS` characters (`ctx.blobs.put_bytes`, handle via `BlobRef::handle`), render
 //! `gate::render_report(ReportInput { outcome: Returned, answer, quotes: &verified, not_established,
 //! max_chars: REPORT_MAX_CHARS, full_handle })`, then `S.set_effect(Effect::Settle(Delivery {
 //! outcome: Returned, report, full, payload: {"quotes": [{"handle","start","end","text"}…]} }))`.
