@@ -400,7 +400,7 @@ pub(crate) mod testutil {
         for d in [&ws, &tmp, &home] {
             std::fs::create_dir_all(d).expect("create test dirs");
         }
-        let blobs = BlobStore::open(&home.join("blobs")).expect("blob store");
+        let blobs = BlobStore::open(home.join("blobs")).expect("blob store");
         let sandbox = sandbox::Sandbox::new(&sandbox_cfg, &ws, &tmp, &home, None).expect("sandbox");
         let (tx, job_events) = tokio::sync::mpsc::unbounded_channel();
         let jobs = jobs::JobTable::new(home.join("jobs"), blobs.clone(), tx, cfg.max_output_bytes);
