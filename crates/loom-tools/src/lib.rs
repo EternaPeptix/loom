@@ -210,35 +210,12 @@ pub async fn execute(
 ) -> ToolResult {
     let started = Instant::now();
     let Some(tool) = registry.get(name) else {
-        return not_run(ctx, name, ToolClass::State, unknown_tool_message(name, &registry.names()), started);
+        return refused(ctx, name, ToolClass::State, unknown_tool_message(name, &registry.names()), started);
     };
     let spec = tool.spec();
-
-    let parsed: Value = match serde_json::from_str(if arguments.trim().is_empty() { "{}" } else { arguments }) {
-        Ok(v) => v,
-        Err(e) => {
-            let msg = format!(
-                "The arguments were not valid JSON ({e}).\nWhat was received:\n{}\nNothing was executed. Call `{name}` again with a JSON object as arguments.",
-                preview(arguments, 600)
-            );
-            return not_run(ctx, name, spec.class, msg, started);
-        }
-    };
-    let checked = match schema::check(&spec.parameters, &parsed) {
+    let checked = match check_arguments(&spec, arguments) {
         Ok(c) => c,
-        Err(problems) => {
-            let mut msg = String::from("The arguments do not fit this tool:\n");
-            for p in &problems {
-                msg.push_str("- ");
-                msg.push_str(p);
-                msg.push('\n');
-            }
-            msg.push_str(&format!(
-                "Nothing was executed. Call `{name}` again with corrected arguments. Its parameters are:\n{}",
-                schema::describe(&spec.parameters)
-            ));
-            return not_run(ctx, name, spec.class, msg, started);
-        }
+        Err(msg) => return refused(ctx, name, spec.class, msg, started),
     };
 
     let ran = std::panic::AssertUnwindSafe(tool.run(ctx, &checked.args)).catch_unwind().await;
@@ -252,6 +229,34 @@ pub async fn execute(
         output.more.push(note);
     }
     finalize(ctx, &spec, output, admission, started)
+}
+
+/// Parse a call's raw arguments text and check it against the tool's parameters. The error is the
+/// complete refusal message for the model. Public so that runtime-owned tools share the same path.
+pub fn check_arguments(spec: &ToolSpec, arguments: &str) -> Result<schema::Checked, String> {
+    let name = &spec.name;
+    let parsed: Value = match serde_json::from_str(if arguments.trim().is_empty() { "{}" } else { arguments }) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(format!(
+                "The arguments were not valid JSON ({e}).\nWhat was received:\n{}\nNothing was executed. Call `{name}` again with a JSON object as arguments.",
+                preview(arguments, 600)
+            ));
+        }
+    };
+    schema::check(&spec.parameters, &parsed).map_err(|problems| {
+        let mut msg = String::from("The arguments do not fit this tool:\n");
+        for p in &problems {
+            msg.push_str("- ");
+            msg.push_str(p);
+            msg.push('\n');
+        }
+        msg.push_str(&format!(
+            "Nothing was executed. Call `{name}` again with corrected arguments. Its parameters are:\n{}",
+            schema::describe(&spec.parameters)
+        ));
+        msg
+    })
 }
 
 /// Turn a tool's output into the record. Public so that runtime-owned tools share the same path.
@@ -306,7 +311,9 @@ pub fn finalize(
     }
 }
 
-fn not_run(ctx: &ToolCtx, name: &str, class: ToolClass, message: String, started: Instant) -> ToolResult {
+/// The record of a call that was refused before it ran (status `Invalid`). Public so that
+/// runtime-owned tools refuse in exactly the same words.
+pub fn refused(ctx: &ToolCtx, name: &str, class: ToolClass, message: String, started: Instant) -> ToolResult {
     let facts = Facts { tool: name.to_string(), outcome: NOT_RUN.into(), more: Vec::new(), notes: None };
     ToolResult {
         call_id: ctx.call_id.clone(),
@@ -333,7 +340,8 @@ fn storage_failure(facts: &Facts, text: &str, error: &std::io::Error) -> String 
     envelope_plain(facts, &body)
 }
 
-fn unknown_tool_message(name: &str, names: &[String]) -> String {
+/// The sentence for a call to a tool that does not exist, naming the closest tools that do.
+pub fn unknown_tool_message(name: &str, names: &[String]) -> String {
     let mut near: Vec<(usize, &String)> = names.iter().map(|n| (schema::distance(name, n), n)).collect();
     near.sort();
     let close: Vec<&str> = near
