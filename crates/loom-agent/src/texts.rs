@@ -14,10 +14,10 @@ pub const JOB_TAIL_LINES: u64 = 20;
 pub const JOB_TAIL_LINE_CHARS: usize = 400;
 /// Steps a child gets after its budget is used up, to deliver what it has.
 pub const BUDGET_GRACE_STEPS: u32 = 2;
-/// Most output tokens of a digest request.
-pub const DIGEST_MAX_TOKENS: u64 = 3_000;
-/// Most output tokens of one `decide` vote.
-pub const VOTE_MAX_TOKENS: u64 = 600;
+/// Most output tokens of a digest request (reasoning included).
+pub const DIGEST_MAX_TOKENS: u64 = 8_000;
+/// Most output tokens of one `decide` vote (reasoning included).
+pub const VOTE_MAX_TOKENS: u64 = 6_000;
 
 /// `s` cut to `max` characters; when cut, `…[+N chars]` is appended.
 pub fn cut(s: &str, max: usize) -> String {
@@ -64,8 +64,37 @@ pub fn not_in_assignment(name: &str, role: &str, allowed: &[String]) -> String {
     )
 }
 
-/// The turn was stopped by the operator while this call was running or before it ran.
-pub const STOPPED_BY_OPERATOR: &str = "stopped by the operator";
+/// `Interrupted::reason` when the operator stopped the session.
+pub const REASON_OPERATOR: &str = "stopped by the operator";
+/// `Interrupted::reason` when the harness process went away in the middle of a turn.
+pub const REASON_RESTART: &str = "the harness was restarted";
+/// `Interrupted::reason` when the agent that assigned the work stopped it.
+pub const REASON_PARENT: &str = "stopped by the agent that assigned this work";
+
+/// A stretch of steps that recorded nothing and changed nothing.
+pub fn stall(steps: u32) -> String {
+    format!(
+        "The last {steps} steps recorded nothing in the ledger and changed no file. If you have learned something, record it now (`note`, or `claim` with `evidence`). If the current approach is not getting anywhere, record it as a dead end with `note` and take a different one. If you cannot continue, call `report_blocker`."
+    )
+}
+
+/// A message from the parent agent to a running child.
+pub fn agent_message(text: &str) -> String {
+    format!("Message from the agent that assigned this work:\n{text}")
+}
+
+/// The model server could not take the request even after folding (`why` is a complete sentence).
+pub const OVERFLOW_UNFOLDABLE: &str = "The request no longer fits the model's context window and nothing more can be folded out of view.";
+
+/// `s` as a sentence: trimmed, with a full stop added when it does not end in `.`, `!` or `?`.
+pub fn sentence(s: &str) -> String {
+    let s = s.trim();
+    if s.ends_with('.') || s.ends_with('!') || s.ends_with('?') || s.is_empty() {
+        s.to_string()
+    } else {
+        format!("{s}.")
+    }
+}
 
 /// Note at the start of the turn that follows a harness restart.
 pub const AFTER_RESTART: &str = "The harness was restarted while you were working. A call shown with no recorded result may or may not have taken effect: check the state of things before repeating it. Background jobs and agents from before the restart are gone; start them again if their results are still needed. Then carry on with the work.";
@@ -296,6 +325,15 @@ mod tests {
         assert_eq!(parse_vote("OPTION: 7\nREASON: x", 2), (None, "x".into()));
         assert_eq!(parse_vote("I would go left,\nprobably", 2), (None, "I would go left, probably".into()));
         assert_eq!(parse_vote("OPTION: 1\nOPTION: 2\nREASON: first wins", 2).0, Some(1));
+    }
+
+    #[test]
+    fn sentences_and_stall() {
+        assert_eq!(sentence(" no route to host "), "no route to host.");
+        assert_eq!(sentence("Refused."), "Refused.");
+        assert_eq!(sentence(""), "");
+        assert!(stall(30).starts_with("The last 30 steps recorded nothing"));
+        assert_eq!(agent_message("stop at 3"), "Message from the agent that assigned this work:\nstop at 3");
     }
 
     #[test]
