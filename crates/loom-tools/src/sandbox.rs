@@ -24,6 +24,8 @@
 //! ```text
 //! (version 1)
 //! (allow default)
+//! (deny signal)
+//! (allow signal (target same-sandbox))
 //! (deny file-write*)
 //! (allow file-write* (subpath "<writable root>") …)
 //! (deny file-write* (subpath "<protected>") …)
@@ -34,6 +36,9 @@
 //! (allow network-bind (local ip "localhost:*"))
 //! (allow network-inbound (local ip "localhost:*"))
 //! ```
+//!
+//! A sandboxed process can signal itself and the other processes of its sandbox, and nothing else:
+//! not the harness, not other sessions, not any other process of the same user.
 //!
 //! Paths are written as SBPL string literals: `\` and `"` are backslash-escaped; a path containing a
 //! control character is an error at construction.
@@ -282,7 +287,9 @@ impl Sandbox {
         let subpaths = |v: &[PathBuf]| {
             v.iter().filter_map(|p| sbpl(p).ok()).map(|s| format!(" (subpath \"{s}\")")).collect::<String>()
         };
-        let mut out = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
+        let mut out = String::from(
+            "(version 1)\n(allow default)\n(deny signal)\n(allow signal (target same-sandbox))\n(deny file-write*)\n",
+        );
         let literals: String = DEVICE_LITERALS.iter().map(|d| format!(" (literal \"{d}\")")).collect();
         out.push_str(&format!("(allow file-write*{}{literals})\n", subpaths(&self.writable)));
         if !self.protected.is_empty() {
@@ -472,7 +479,7 @@ mod tests {
         let sb = build(&f, &c, Some(8080));
         let r = s(&f.root);
         let expected = format!(
-            "(version 1)\n(allow default)\n(deny file-write*)\n\
+            "(version 1)\n(allow default)\n(deny signal)\n(allow signal (target same-sandbox))\n(deny file-write*)\n\
              (allow file-write* (subpath \"{r}/ws\") (subpath \"{r}/tmp\") (subpath \"{r}/extra\") (subpath \"/private/tmp\") (subpath \"/private/var/folders\") (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\"))\n\
              (deny file-write* (subpath \"{r}/ws/.loom\") (subpath \"{r}/home\") (subpath \"{r}/ws/secrets\"))\n\
              (deny file-read* (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\") (subpath \"{r}/hidden\"))\n\
@@ -837,5 +844,47 @@ mod tests {
         assert!(!ok);
         // Clean up the listener the second run left behind.
         let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+    }
+
+    fn pid_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only tests for existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[test]
+    fn commands_may_signal_their_own_processes() {
+        if !available() {
+            return;
+        }
+        let f = fx();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let script = "sleep 300 & c=$!; kill -0 $c || exit 11; kill $c || exit 12; wait $c 2>/dev/null; \
+                      if kill -0 $c 2>/dev/null; then exit 13; fi; echo killed";
+        let (ok, text) = run(&sb, &f.ws, script);
+        assert!(ok && text.trim() == "killed", "{text}");
+    }
+
+    #[test]
+    fn commands_cannot_signal_processes_outside_the_sandbox() {
+        if !available() {
+            return;
+        }
+        let f = fx();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let mut outside = std::process::Command::new("/bin/sleep").arg("300").spawn().expect("spawn sleep");
+        let pid = i32::try_from(outside.id()).expect("pid");
+        let (ok, text) = run(&sb, &f.ws, &format!("kill -9 {pid}"));
+        let still_alive = pid_alive(pid);
+        let _ = outside.kill();
+        let _ = outside.wait();
+        assert!(!ok, "kill should have failed: {text}");
+        assert!(text.contains("Operation not permitted"), "{text}");
+        assert!(still_alive, "the process outside the sandbox was signalled");
+        // The same signal from outside the sandbox works, so the refusal above is the profile's doing.
+        let mut other = std::process::Command::new("/bin/sleep").arg("300").spawn().expect("spawn sleep");
+        let pid = i32::try_from(other.id()).expect("pid");
+        let (ok, text) = run(&build(&f, &cfg(SandboxMode::None), None), &f.ws, &format!("kill -9 {pid}"));
+        assert!(ok, "{text}");
+        let _ = other.wait();
     }
 }
