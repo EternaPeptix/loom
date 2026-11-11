@@ -3,6 +3,11 @@
 //! CONTRACT (bodies are placeholders for the implementer; public signatures are fixed).
 //!
 //! ## `run(paths)` — the body of `loom daemon`
+//! 0. Raise the soft limit on open files to the smaller of the hard limit and 16384
+//!    (`libc::getrlimit` / `setrlimit` with `RLIMIT_NOFILE`; a failure is ignored). A process
+//!    started by launchd or over ssh gets 256, and every running session holds a log, pipes for
+//!    its commands and sockets to the model server, so a busy daemon would otherwise start failing
+//!    with "Too many open files" in the middle of missions.
 //! 1. Create `paths.home` (0700) and `paths.logs_dir()`. `Config::load(paths.config_file())`, then
 //!    `check()`; an error is returned as `{path}: {error}`.
 //! 2. If `daemon.json` exists and its `pid` is alive (`libc::kill(pid, 0)` succeeds or fails with
@@ -36,6 +41,7 @@
 //! A LaunchAgent property list with `Label` [`SERVICE_LABEL`], `ProgramArguments` `[exe, "daemon"]`,
 //! `EnvironmentVariables` `{LOOM_HOME: home, PATH: /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin}`,
 //! `RunAtLoad` true, `KeepAlive` `{SuccessfulExit: false}`, `ProcessType` `Background`,
+//! `SoftResourceLimits` `{NumberOfFiles: 16384}`,
 //! `StandardOutPath` and `StandardErrorPath` `{home}/logs/loomd.log`. Every inserted string is
 //! XML-escaped (`&`, `<`, `>`).
 //!

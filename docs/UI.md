@@ -37,7 +37,9 @@ Routes and bodies: `crates/loom-daemon/src/api.rs`, `wire.rs`, and the types the
 for the exact field names — serde conventions: enums and `kind`/`type` tags are `snake_case`; a
 `Record` is flat (`{seq, ts_ms, author, prev, kind, …fields of the event}`); `author` is `"user"`,
 `"model"`, `"tool"`, `"harness"` or `{"agent": "s-…"}`; `SessionInfo` is its `meta` fields
-flattened plus `active` and `status`.
+flattened plus `active` and `status`. One exception to the names in the Rust types: an inbox item's
+kind is `item_kind` on the wire (in an `inbox_opened` record and in `InboxEntry.item`), because
+`kind` is the record's own tag.
 
 - At load: `GET /api/sessions`, `GET /api/inbox`, `GET /api/status`; then one `EventSource` on
   `/api/events?deltas=true` for everything live. Every event is a `message` event whose data is one
