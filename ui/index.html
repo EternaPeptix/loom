@@ -1,2 +1,131 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>loom</title><link rel="stylesheet" href="/style.css"></head><body><script type="module" src="/app.js"></script></body></html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>loom</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app" class="layout">
+
+  <aside id="left" class="col left">
+    <header class="lhead">
+      <span class="brand">loom</span>
+      <span id="dot" class="dot dot-red" title="connecting"></span>
+      <span class="spacer"></span>
+      <button id="btn-inbox" type="button" class="btn">Inbox <span id="inbox-count" class="count" hidden>0</span></button>
+      <button id="btn-new" type="button" class="btn">New</button>
+    </header>
+    <nav id="sessions" class="sessions" aria-label="Sessions"></nav>
+    <footer class="lfoot">
+      <label><input id="show-archived" type="checkbox"> show archived</label>
+    </footer>
+  </aside>
+
+  <main id="mid" class="col mid">
+    <div class="bar">
+      <button id="open-left" type="button" class="btn drawer-btn">Sessions</button>
+      <span class="spacer"></span>
+      <button id="open-right" type="button" class="btn drawer-btn">State</button>
+    </div>
+    <div id="notice" class="notice" hidden>
+      <span id="notice-text"></span>
+      <button id="notice-close" type="button" class="btn small">dismiss</button>
+    </div>
+
+    <section id="view-empty" class="view empty">
+      <p>Pick a session on the left, or start a new one.</p>
+    </section>
+
+    <section id="view-session" class="view session" hidden>
+      <header class="shead">
+        <h1 id="s-title" class="stitle"></h1>
+        <span id="s-mark" class="mark"></span>
+        <span id="s-words" class="dim"></span>
+        <span id="s-step" class="dim"></span>
+        <span id="s-meter" class="meter small" title="prompt size of the last request"><span class="fill"></span></span>
+        <span id="s-meter-label" class="dim"></span>
+        <span class="spacer"></span>
+        <label class="dim"><input id="details" type="checkbox"> details</label>
+        <button id="b-stop" type="button" class="btn" hidden>Stop</button>
+        <button id="b-resume" type="button" class="btn" hidden>Resume</button>
+        <button id="b-archive" type="button" class="btn" hidden>Archive</button>
+        <button id="b-unarchive" type="button" class="btn" hidden>Unarchive</button>
+      </header>
+      <div id="scroller" class="scroller">
+        <div id="earlier" class="earlier" hidden>
+          <button id="btn-earlier" type="button" class="btn">Show earlier</button>
+        </div>
+        <div id="loading" class="dim pad">loading the record...</div>
+        <div id="blocks" class="blocks hide-details"></div>
+        <div id="live" class="live-wrap"></div>
+      </div>
+      <button id="jump" type="button" class="btn jump" hidden>jump to latest</button>
+      <footer id="composer" class="composer">
+        <p id="agent-note" class="dim pad" hidden>Messages go to the lead session of this mission, not to its agents.</p>
+        <p id="closed-note" class="dim pad" hidden></p>
+        <div id="composer-row" class="composer-row">
+          <textarea id="msg" rows="2" placeholder="Message (Enter sends, Shift+Enter is a new line)" aria-label="Message"></textarea>
+          <button id="send" type="button" class="btn primary">Send</button>
+        </div>
+      </footer>
+    </section>
+
+    <section id="view-inbox" class="view inbox" hidden>
+      <header class="vhead">
+        <h1 class="stitle">Inbox</h1>
+        <span class="spacer"></span>
+        <span id="notif-state" class="dim"></span>
+        <button id="notif-btn" type="button" class="btn">Enable notifications</button>
+      </header>
+      <div id="inbox-list" class="inbox-list"></div>
+    </section>
+
+    <section id="view-new" class="view newform" hidden>
+      <header class="vhead"><h1 class="stitle">New session</h1></header>
+      <form id="new-form" class="form" autocomplete="off">
+        <label>Workspace <input id="f-workspace" type="text" required placeholder="/path/to/workspace"></label>
+        <label>Message <textarea id="f-message" rows="6" required></textarea></label>
+        <div class="form-row">
+          <label>Role <select id="f-role"></select></label>
+          <label>Model profile <select id="f-model"></select></label>
+        </div>
+        <label>Title (optional) <input id="f-title" type="text"></label>
+        <label class="check"><input id="f-unattended" type="checkbox" checked> resume by itself after a restart</label>
+        <p id="f-error" class="error" hidden></p>
+        <div><button id="f-submit" type="submit" class="btn primary">Start</button></div>
+      </form>
+    </section>
+  </main>
+
+  <aside id="right" class="col right">
+    <header class="rhead">
+      <nav class="tabs" id="tabs">
+        <button type="button" class="tab" data-tab="ledger">Ledger</button>
+        <button type="button" class="tab" data-tab="context">Context</button>
+        <button type="button" class="tab" data-tab="network">Network</button>
+        <button type="button" class="tab" data-tab="session">Session</button>
+      </nav>
+      <button id="close-right" type="button" class="btn small drawer-btn">close</button>
+    </header>
+    <div id="panel" class="panel"></div>
+  </aside>
+
+  <div id="scrim" class="scrim"></div>
+
+  <section id="viewer" class="viewer" hidden>
+    <header class="vhead">
+      <strong id="viewer-title">Full output</strong>
+      <span id="viewer-info" class="dim"></span>
+      <span class="spacer"></span>
+      <button id="viewer-more" type="button" class="btn">Load more</button>
+      <button id="viewer-close" type="button" class="btn">Close</button>
+    </header>
+    <pre id="viewer-text" class="viewer-text"></pre>
+  </section>
+</div>
+<script type="module" src="/app.js"></script>
+</body>
+</html>
