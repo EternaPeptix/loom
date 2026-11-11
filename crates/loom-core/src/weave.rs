@@ -19,6 +19,7 @@
 //!   response with no text and no complete tool calls is not rendered.
 //! - `tool_result` → `tool` message, `tool_call_id` = call id, content = `text` verbatim.
 //! - `child_settled` → `user`-role `<harness kind="agent-report" agent="{child}" outcome="{outcome}">\n{report}\n</harness>`.
+//!   A settlement with `inline` set renders nothing: its report is the result of the call that waited.
 //! - everything else → nothing.
 //!
 //! Pairing: every rendered assistant tool call is followed (before the next assistant or user-role
@@ -316,6 +317,7 @@ fn build(records: &[Record]) -> (Weave, Vec<Aux<'_>>) {
                 msg.origin = vec![seq];
                 elems.push(Elem { group: seq, msg, entry: Some(entries.len() - 1) });
             }
+            Event::ChildSettled(c) if c.inline => {}
             Event::ChildSettled(c) => {
                 let (report, state) = match evictions.get(&seq) {
                     Some(EvictAction::Stub { text }) => (text.as_str(), ItemState::Stubbed),
@@ -801,6 +803,10 @@ mod tests {
         }
 
         fn child(&mut self, report: &str) -> Seq {
+            self.child_with(report, false)
+        }
+
+        fn child_with(&mut self, report: &str, inline: bool) -> Seq {
             self.push(
                 Author::Agent(SessionId::from("s-kid")),
                 Event::ChildSettled(ChildSettled {
@@ -810,6 +816,7 @@ mod tests {
                     full: None,
                     usage: Usage::default(),
                     steps: 1,
+                    inline,
                 }),
             )
         }
@@ -842,6 +849,23 @@ mod tests {
 
     fn brief() -> Brief {
         Brief { question: "Q?".into(), hypothesis: Some("H".into()), returns: Some("R".into()), ..Default::default() }
+    }
+
+    #[test]
+    fn inline_settlement_is_not_rendered() {
+        let mut l = Log::new();
+        l.user("do it");
+        l.resp("", "", &[("c1", "bash", "{}")]);
+        l.call("c1", ToolClass::Exec);
+        l.result("c1", ToolClass::Exec, "the report, as the call's result");
+        let before = weave(&l.recs);
+        l.child_with("the report", true);
+        let after = weave(&l.recs);
+        assert_eq!(before.messages, after.messages);
+        assert!(after.items.iter().all(|i| i.kind != "child_settled"));
+        l.child_with("a later report", false);
+        let last = weave(&l.recs);
+        assert_eq!(last.messages.len(), after.messages.len() + 1);
     }
 
     #[test]

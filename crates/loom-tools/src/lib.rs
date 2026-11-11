@@ -372,9 +372,11 @@ pub fn ranges_json(ranges: &[(u64, u64)]) -> Value {
     Value::Array(ranges.iter().map(|(a, b)| json!([a, b])).collect())
 }
 
-/// A complete tool context over a temporary directory, for tests in this crate.
-#[cfg(test)]
-pub(crate) mod testutil {
+/// A complete tool context over a temporary directory, for tests (this crate's, and other crates'
+/// through the `testutil` feature).
+#[cfg(any(test, feature = "testutil"))]
+#[allow(clippy::expect_used)]
+pub mod testutil {
     use super::*;
     use loom_core::config::{SandboxCfg, SandboxMode};
     use tokio::sync::mpsc::UnboundedReceiver;

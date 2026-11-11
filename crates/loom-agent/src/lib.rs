@@ -4,7 +4,9 @@
 //! - [`pack`]  roles: prompt, tool list, how a role ends
 //! - [`hud`]   the per-step state block appended to every request (never stored in the prefix)
 //! - [`gate`]  what happens when the model stops calling tools, and what `finish` must satisfy
+//! - [`rtools`] the tools the runtime owns: ledger, agents, and the tools that end a turn
 
 pub mod gate;
 pub mod hud;
 pub mod pack;
+pub mod rtools;

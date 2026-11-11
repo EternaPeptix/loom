@@ -580,6 +580,11 @@ pub struct ChildSettled {
     pub usage: Usage,
     #[serde(default)]
     pub steps: u32,
+    /// The report was returned as the result of the tool call that was waiting for the child. The
+    /// record is kept for the session's history; the weave does not render it (the report is
+    /// already in view as that call's result).
+    #[serde(default)]
+    pub inline: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -606,6 +611,9 @@ pub struct InboxItem {
     pub blocking: bool,
     #[serde(default)]
     pub call_id: Option<CallId>,
+    /// The ledger question (`q3`) this item belongs to; answering the item answers the question.
+    #[serde(default)]
+    pub reference: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

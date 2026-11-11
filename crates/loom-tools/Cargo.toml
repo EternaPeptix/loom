@@ -26,6 +26,11 @@ similar.workspace = true
 html2text.workspace = true
 url.workspace = true
 tracing.workspace = true
+tempfile = { workspace = true, optional = true }
+
+[features]
+# Exposes `testutil` (a tool context over a temporary directory) to other crates' tests.
+testutil = ["dep:tempfile"]
 
 [dev-dependencies]
 tempfile.workspace = true

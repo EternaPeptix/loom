@@ -66,6 +66,16 @@ impl MissionId {
     }
 }
 
+/// A new inbox item id (`i-…`), unique across sessions.
+pub fn new_item_id() -> String {
+    format!("i-{}", sortable(crate::now_ms()))
+}
+
+/// A new model request id (`r-…`).
+pub fn new_request_id() -> String {
+    format!("r-{}", sortable(crate::now_ms()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
