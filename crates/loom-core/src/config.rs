@@ -110,6 +110,10 @@ pub struct ToolsCfg {
     pub search_max_results: usize,
     pub web_fetch_timeout_s: u64,
     pub web_fetch_max_bytes: u64,
+    /// A command whose output grows past this is stopped, and the result says so.
+    pub max_output_bytes: u64,
+    /// How long `job_wait` waits when the call gives no time.
+    pub job_wait_s: u64,
 }
 
 impl Default for ToolsCfg {
@@ -121,6 +125,8 @@ impl Default for ToolsCfg {
             search_max_results: 200,
             web_fetch_timeout_s: 60,
             web_fetch_max_bytes: 20 * 1024 * 1024,
+            max_output_bytes: 64 * 1024 * 1024,
+            job_wait_s: 120,
         }
     }
 }
@@ -147,6 +153,12 @@ pub struct SandboxCfg {
     pub unreadable_paths: Vec<String>,
     /// Loopback TCP ports commands may connect to directly (local test services).
     pub loopback_ports: Vec<u16>,
+    /// Allow commands to connect to any loopback port (needed to talk to servers they start).
+    pub loopback_all: bool,
+    /// Unix sockets commands may connect to (absolute paths), e.g. a container runtime's socket.
+    pub unix_sockets: Vec<String>,
+    /// Environment variables passed to commands even though their names look like secrets.
+    pub env_pass: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]

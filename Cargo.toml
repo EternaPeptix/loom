@@ -46,6 +46,11 @@ ignore = "0.4"
 fs2 = "0.4"
 libc = "0.2"
 tempfile = "3"
+similar = "3"
+html2text = "0.17"
+httparse = "1"
+url = "2"
+base64 = "0.23"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

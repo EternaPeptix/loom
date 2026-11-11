@@ -4,6 +4,29 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "loom: tool execution pipeline, built-in tools, process control, sandbox"
 
 [dependencies]
 loom-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+regex.workspace = true
+globset.workspace = true
+ignore.workspace = true
+libc.workspace = true
+sha2.workspace = true
+hex.workspace = true
+similar.workspace = true
+html2text.workspace = true
+url.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+axum.workspace = true
