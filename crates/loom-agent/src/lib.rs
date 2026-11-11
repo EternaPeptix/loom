@@ -7,10 +7,12 @@
 //! - [`rtools`] the tools the runtime owns: ledger, agents, and the tools that end a turn
 //! - [`texts`] everything the step loop itself says to the model
 //! - [`session`] one session: its log, its step loop, and its reactions to what happens to it
+//! - [`runtime`] every session of a loom home: starting, restoring, parents and children, the operator's actions
 
 pub mod gate;
 pub mod hud;
 pub mod pack;
 pub mod rtools;
+pub mod runtime;
 pub mod session;
 pub mod texts;

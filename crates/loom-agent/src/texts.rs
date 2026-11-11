@@ -260,6 +260,56 @@ pub fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// The first part of a forked agent's assignment. A fork starts with a copy of its parent's context,
+/// system prompt included, so this states what is different from here on. The brief follows it.
+pub fn fork_contract(role: &str, role_prompt: &str, tools: &[String]) -> String {
+    format!(
+        "You are now a separate agent. Everything above this message is the context of the agent that assigned you this work, copied so that you start with what it knows. You are not that agent: its role, its plan and its unfinished work are not yours, and it carries on separately. From this message on your role is `{role}`. It replaces the role described at the start of this context.\n\n{}\n\nTools you may call in this role: {}. A call to any other tool is refused.\n\nYour assignment follows.",
+        role_prompt.trim(),
+        tools.iter().map(|t| format!("`{t}`")).collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// The sentence of the system prompt that states the network policy. `mode` is `open`, `allowlist`
+/// or `deny_all`.
+pub fn network_sentence(mode: &str, allow: &[String], deny: &[String], allow_private: &[String]) -> String {
+    let list = |v: &[String]| v.join(", ");
+    let mut s = match mode {
+        "deny_all" => return "There is no network access.".to_string(),
+        "allowlist" => {
+            if allow.is_empty() {
+                return "There is no network access.".to_string();
+            }
+            format!(
+                "Only these hosts can be reached, through the harness's proxy (already set in the environment of commands): {}. Everything else is refused.",
+                list(allow)
+            )
+        }
+        _ => {
+            let private = if allow_private.is_empty() {
+                "Addresses on private and local networks are refused.".to_string()
+            } else {
+                format!("Addresses on private and local networks are refused, except: {}.", list(allow_private))
+            };
+            format!(
+                "Commands and `web_fetch` reach the internet through the harness's proxy (already set in the environment of commands). {private}"
+            )
+        }
+    };
+    if !deny.is_empty() {
+        s.push_str(&format!(" Refused in every case: {}.", list(deny)));
+    }
+    s
+}
+
+/// A background job that was running when the harness went down.
+pub fn job_lost(id: &str, command: &str) -> String {
+    format!(
+        "Background job {id} (`{}`) was running when the harness was restarted. It is no longer tracked: its outcome is unknown and it may have been cut off. Check what it left behind before relying on it, and start it again if it is still needed.",
+        cut(&one_line(command), 120)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +375,22 @@ mod tests {
         assert_eq!(parse_vote("OPTION: 7\nREASON: x", 2), (None, "x".into()));
         assert_eq!(parse_vote("I would go left,\nprobably", 2), (None, "I would go left, probably".into()));
         assert_eq!(parse_vote("OPTION: 1\nOPTION: 2\nREASON: first wins", 2).0, Some(1));
+    }
+
+    #[test]
+    fn fork_contract_and_network() {
+        let c = fork_contract("worker", "# Your role: worker\n\nDo it.\n", &["bash".to_string(), "finish".to_string()]);
+        assert!(c.contains("your role is `worker`"));
+        assert!(c.contains("# Your role: worker\n\nDo it.\n\nTools you may call in this role: `bash`, `finish`."));
+        assert!(c.ends_with("Your assignment follows."));
+        assert_eq!(network_sentence("deny_all", &[], &[], &[]), "There is no network access.");
+        assert_eq!(network_sentence("allowlist", &[], &[], &[]), "There is no network access.");
+        let a = network_sentence("allowlist", &["pypi.org".to_string()], &["evil.example".to_string()], &[]);
+        assert!(a.contains("pypi.org") && a.ends_with("Refused in every case: evil.example."));
+        let o = network_sentence("open", &[], &[], &["192.168.0.0/24".to_string()]);
+        assert!(o.contains("except: 192.168.0.0/24."));
+        assert!(network_sentence("open", &[], &[], &[]).ends_with("local networks are refused."));
+        assert!(job_lost("j3", "make   test").contains("job j3 (`make test`)"));
     }
 
     #[test]
