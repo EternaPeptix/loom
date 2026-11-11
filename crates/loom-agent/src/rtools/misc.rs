@@ -6,12 +6,15 @@
 //!
 //! ## `pin`
 //! Resolve `handle` with `ctx.blobs.resolve` (failure → error ``There is no stored output {handle};
-//! handles are the out:… ids in result headers.``). Find the newest `tool_result` record in the log
-//! whose `output` blob id is that blob, or whose `meta[META_OF_BLOB]` names it; none → error
-//! ``{handle} was not produced in this session, so it is not part of your context and cannot be
-//! pinned.`` Then `shared.emit(Author::Model, Event::Pin { call_id, reason })`, or `Event::Unpin {
-//! call_id }` when `unpin` is true. Outcome `pinned` / `unpinned`; text ``{handle} ({tool}) will stay
-//! in view.`` / ``{handle} ({tool}) may be dropped from view again.``
+//! handles are the out:… ids in result headers.``). Find every `tool_result` record in the log
+//! whose `output` blob id is that blob, or whose `meta[META_OF_BLOB]` names it (the call that
+//! produced the output and every later view of it); none → error ``{handle} was not produced in this
+//! session, so it is not part of your context and cannot be pinned.`` Then, for each of them in log
+//! order (one per call id), `shared.emit(Author::Model, Event::Pin { call_id, reason })`, or
+//! `Event::Unpin { call_id }` when `unpin` is true: everything the session has been shown of that
+//! output stays in view. `{tool}` below is the tool of the first of them. Outcome `pinned` /
+//! `unpinned`; text ``{handle} ({tool}) will stay in view.`` / ``{handle} ({tool}) may be dropped
+//! from view again.``
 //!
 //! ## `log_search`
 //! Compile `pattern` (`regex`, case-sensitive; an invalid pattern → error with the regex error and
@@ -82,24 +85,32 @@ impl Tool for Pin {
             Ok(r) => r,
             Err(e) => return ToolOutput::error(log_fault(&e)),
         };
-        let found = report.records.iter().rev().find_map(|rec| match &rec.event {
-            Event::ToolResult(tr) => {
+        // The call that produced the output and every view of it, in log order, one per call id.
+        let mut shown: Vec<(loom_core::CallId, String)> = Vec::new();
+        for rec in &report.records {
+            if let Event::ToolResult(tr) = &rec.event {
                 let own = tr.output.as_ref().is_some_and(|o| o.id == blob);
                 let of = tr.meta.get(META_OF_BLOB).and_then(Value::as_str).is_some_and(|id| id == blob.as_str());
-                (own || of).then(|| (tr.call_id.clone(), tr.name.clone()))
+                if (own || of) && !shown.iter().any(|(id, _)| *id == tr.call_id) {
+                    shown.push((tr.call_id.clone(), tr.name.clone()));
+                }
             }
-            _ => None,
-        });
-        let Some((call_id, tool)) = found else {
+        }
+        let Some(tool) = shown.first().map(|(_, name)| name.clone()) else {
             return ToolOutput::error(format!(
                 "{handle} was not produced in this session, so it is not part of your context and cannot be pinned."
             ));
         };
+        for (call_id, _) in shown {
+            if unpin {
+                self.0.emit(Author::Model, Event::Unpin { call_id });
+            } else {
+                self.0.emit(Author::Model, Event::Pin { call_id, reason: reason.clone() });
+            }
+        }
         if unpin {
-            self.0.emit(Author::Model, Event::Unpin { call_id });
             ToolOutput::ok("unpinned", Body::Message(format!("{handle} ({tool}) may be dropped from view again.")))
         } else {
-            self.0.emit(Author::Model, Event::Pin { call_id, reason });
             ToolOutput::ok("pinned", Body::Message(format!("{handle} ({tool}) will stay in view.")))
         }
     }
@@ -328,14 +339,26 @@ mod tests {
         let h = blob.handle();
         let r = rig.call("pin", json!({"handle": h, "reason": "the failing run"})).await;
         assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
-        assert!(r.text.contains(&format!("{h} (out_read) will stay in view.")), "{}", r.text);
-        // The newest result that names the blob is the view c2.
+        assert!(r.text.contains(&format!("{h} (bash) will stay in view.")), "{}", r.text);
+        // The call that produced the output (c1) and the later view of it (c2) are both pinned.
         let emitted = rig.shared.take_emitted();
-        assert_eq!(emitted, vec![(Author::Model, Event::Pin { call_id: CallId::from("c2"), reason: "the failing run".into() })]);
+        assert_eq!(
+            emitted,
+            vec![
+                (Author::Model, Event::Pin { call_id: CallId::from("c1"), reason: "the failing run".into() }),
+                (Author::Model, Event::Pin { call_id: CallId::from("c2"), reason: "the failing run".into() }),
+            ]
+        );
 
         let r = rig.call("pin", json!({"handle": h, "reason": "done", "unpin": true})).await;
         assert!(r.text.contains("may be dropped from view again."), "{}", r.text);
-        assert_eq!(rig.shared.take_emitted(), vec![(Author::Model, Event::Unpin { call_id: CallId::from("c2") })]);
+        assert_eq!(
+            rig.shared.take_emitted(),
+            vec![
+                (Author::Model, Event::Unpin { call_id: CallId::from("c1") }),
+                (Author::Model, Event::Unpin { call_id: CallId::from("c2") }),
+            ]
+        );
     }
 
     #[tokio::test]
