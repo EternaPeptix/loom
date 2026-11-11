@@ -83,6 +83,40 @@ pub fn agent_message(text: &str) -> String {
     format!("Message from the agent that assigned this work:\n{text}")
 }
 
+/// A standing rule from the operator. `id` is its ledger id when the mission has a ledger.
+pub fn constraint(id: Option<&str>, text: &str) -> String {
+    let id = id.map(|i| format!(" ({i})")).unwrap_or_default();
+    format!(
+        "The operator set a standing rule{id}. It applies to all work on this mission, yours and that of every agent you assign work to, until the operator withdraws it. Where it conflicts with an earlier instruction, the rule wins:\n{}",
+        text.trim()
+    )
+}
+
+/// The operator withdrew a standing rule.
+pub fn constraint_withdrawn(id: &str, reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        format!("The operator withdrew rule {id}. It no longer applies.")
+    } else {
+        format!("The operator withdrew rule {id}. It no longer applies. Reason: {}", sentence(reason))
+    }
+}
+
+/// An approval from the operator. `id` is its ledger id when the mission has a ledger.
+pub fn approval(id: Option<&str>, text: &str, scope: &str) -> String {
+    let id = id.map(|i| format!(" ({i})")).unwrap_or_default();
+    let scope = scope.trim();
+    let covers = if scope.is_empty() {
+        "It covers what is written here and nothing beyond it.".to_string()
+    } else {
+        format!("It covers what is written here, within this scope and nothing beyond it: {}", sentence(scope))
+    };
+    format!(
+        "The operator gave an approval{id}. {covers} For anything it does not clearly cover, ask with `ask_user` rather than assume:\n{}",
+        text.trim()
+    )
+}
+
 /// The model server could not take the request even after folding (`why` is a complete sentence).
 pub const OVERFLOW_UNFOLDABLE: &str = "The request no longer fits the model's context window and nothing more can be folded out of view.";
 

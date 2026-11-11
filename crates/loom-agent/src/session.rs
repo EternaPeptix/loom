@@ -65,6 +65,17 @@
 //!   session has a journal, `shared.ledger_append(true, QuestionAnswer{id: reference, answer})` and
 //!   append what it queued (failure: warn, ignore); append
 //!   `user_message{texts::inbox_answer(item.text, answer)}`; start a turn (`Trigger::InboxAnswer`).
+//! - `Input::Constraint(text)`: a standing rule from the operator. Blank text is ignored. With a
+//!   journal, `shared.ledger_append(true, ConstraintAdd{text})` and append what it queued (failure:
+//!   warn, carry on without an id). Append `harness_note{Constraint, texts::constraint(id, text)}`
+//!   with author `User`, `id` being the new constraint's ledger id when there is one. It starts no
+//!   turn: it is in view from the next request on, it is never folded out of view, and through the
+//!   ledger it is in the state block of every agent of the mission.
+//! - `Input::Approval{text, scope}`: the same with `ApprovalGrant{text, scope}`,
+//!   `harness_note{Approval, texts::approval(id, text, scope)}`.
+//! - `Input::Withdraw{id, reason}`: `shared.ledger_append(true, ConstraintRetire{id, reason})`; on
+//!   success append what it queued and `harness_note{Constraint, texts::constraint_withdrawn(id,
+//!   reason)}` with author `User`; on refusal (or without a journal) warn and append nothing.
 //! - `Input::ChildSettled(s)`: append `child_settled{child, outcome, report, full, usage, steps,
 //!   inline: false}`. Start a turn (`Trigger::ChildSettled`) only if the last turn ended `Waiting`
 //!   or `Yielded`.
@@ -273,7 +284,7 @@ use loom_core::event::{
     META_SIGNAL,
 };
 use loom_core::ids::{new_item_id, new_request_id, CallId, SessionId};
-use loom_core::ledger::{BriefOpts, LedgerOp};
+use loom_core::ledger::{BriefOpts, LedgerOp, LedgerState};
 use loom_core::log::{fork_file, read_records, Durability, SessionLog};
 use loom_core::message::Message;
 use loom_core::now_ms;
@@ -302,6 +313,12 @@ pub enum Input {
     User(String),
     /// The operator answered one of the session's inbox items.
     Answer { item_id: String, answer: String },
+    /// The operator set a standing rule for the mission.
+    Constraint(String),
+    /// The operator approved something. `scope` says what the approval covers (may be empty).
+    Approval { text: String, scope: String },
+    /// The operator withdrew a standing rule (`id` is its ledger id, `k2`).
+    Withdraw { id: String, reason: String },
     /// A child that nobody was waiting for has settled.
     ChildSettled(Settlement),
     /// The agent that assigned this session's work sent it a message.
@@ -873,6 +890,28 @@ impl Session {
                 out.trigger = Some(Trigger::InboxAnswer);
                 out.user = true;
             }
+            Input::Constraint(text) => {
+                if text.trim().is_empty() {
+                    return Ok(out);
+                }
+                let state = self.operator_op(LedgerOp::ConstraintAdd { text: text.clone() })?;
+                let id = state.and_then(|s| s.constraints.last().map(|c| c.id.clone()));
+                self.note(Author::User, NoteKind::Constraint, texts::constraint(id.as_deref(), &text))?;
+            }
+            Input::Approval { text, scope } => {
+                if text.trim().is_empty() {
+                    return Ok(out);
+                }
+                let state = self.operator_op(LedgerOp::ApprovalGrant { text: text.clone(), scope: scope.clone() })?;
+                let id = state.and_then(|s| s.approvals.last().map(|a| a.id.clone()));
+                self.note(Author::User, NoteKind::Approval, texts::approval(id.as_deref(), &text, &scope))?;
+            }
+            Input::Withdraw { id, reason } => {
+                let op = LedgerOp::ConstraintRetire { id: id.clone(), reason: reason.clone() };
+                if self.operator_op(op)?.is_some() {
+                    self.note(Author::User, NoteKind::Constraint, texts::constraint_withdrawn(&id, &reason))?;
+                }
+            }
             Input::ChildSettled(s) => {
                 let child = s.child.clone();
                 let event = Event::ChildSettled(ChildSettled {
@@ -898,6 +937,24 @@ impl Session {
             Input::Resume | Input::Reweave | Input::Stop => {}
         }
         Ok(out)
+    }
+
+    /// Write an entry that only the operator may write. `None` when the session has no ledger or the
+    /// ledger refused the entry.
+    fn operator_op(&mut self, op: LedgerOp) -> R<Option<LedgerState>> {
+        if self.deps.shared.journal.is_none() {
+            return Ok(None);
+        }
+        match self.deps.shared.ledger_append(true, op) {
+            Ok((_, state)) => {
+                self.flush_emitted()?;
+                Ok(Some(state))
+            }
+            Err(e) => {
+                tracing::warn!(session = %self.deps.shared.session, "operator entry not recorded in the ledger: {e}");
+                Ok(None)
+            }
+        }
     }
 
     /// The first user message of a mission sets its goal.
@@ -2491,6 +2548,47 @@ mod tests {
         assert_eq!(count(&rs, "user_message"), 2);
         let reqs = fx.server.requests();
         assert!(all_text(reqs.last().unwrap()).contains("second, sent while the turn runs"));
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn operator_rules_and_approvals_reach_the_ledger_and_stay_in_view_without_starting_a_turn() {
+        let script = seq(vec![Reply::text("noted").into(), Reply::text("again").into()]);
+        let mut fx = Fx::new("lead", false, true, script).await;
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(Input::Constraint("never push to main".into())).unwrap();
+        tx.send(Input::Constraint("   ".into())).unwrap();
+        tx.send(Input::Approval { text: "you may restart the staging database".into(), scope: "staging only".into() }).unwrap();
+        tx.send(Input::Constraint("temporary rule".into())).unwrap();
+        tx.send(Input::Withdraw { id: "k2".into(), reason: "no longer needed".into() }).unwrap();
+        tx.send(Input::Withdraw { id: "k9".into(), reason: "no such rule".into() }).unwrap();
+        wait_until(&fx.sink, "the notes", |rs| count(rs, "harness_note") == 4).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let rs = fx.sink.records();
+        assert_eq!(count(&rs, "turn_start"), 0, "operator entries start no turn: {:?}", kinds(&rs));
+        assert_eq!(count(&rs, "ledger"), 4);
+        let rules = notes(&rs, NoteKind::Constraint);
+        assert_eq!(rules.len(), 3, "{rules:?}");
+        assert!(rules[0].contains("(k1)") && rules[0].ends_with("never push to main"), "{}", rules[0]);
+        assert!(rules[2].contains("k2") && rules[2].contains("no longer needed"), "{}", rules[2]);
+        let approvals = notes(&rs, NoteKind::Approval);
+        assert!(approvals[0].contains("(a1)") && approvals[0].contains("staging only"), "{}", approvals[0]);
+        for r in rs.iter().filter(|r| matches!(r.event, Event::HarnessNote { .. })) {
+            assert_eq!(r.author, Author::User);
+        }
+        let ledger = fx.shared.ledger().unwrap();
+        assert_eq!(ledger.constraints.len(), 2);
+        assert!(ledger.constraints[0].retired.is_none() && ledger.constraints[1].retired.is_some());
+        assert_eq!((ledger.approvals[0].scope.as_str(), ledger.approvals[0].used_for.is_none()), ("staging only", true));
+        // The next request carries them, and the state block lists the active rule.
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "a reply", |rs| count(rs, "model_response") >= 1).await;
+        let reqs = fx.server.requests();
+        let text = all_text(reqs.last().unwrap());
+        assert!(text.contains("<harness kind=\"constraint\">") && text.contains("never push to main"), "{text}");
+        assert!(text.contains("you may restart the staging database"));
+        assert!(text.contains("k1: never push to main"), "the state block lists the active rule: {text}");
         finish_task(tx, task).await;
     }
 
