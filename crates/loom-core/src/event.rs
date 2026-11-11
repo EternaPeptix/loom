@@ -602,6 +602,8 @@ pub enum InboxKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InboxItem {
     pub item_id: String,
+    /// On the wire this is `item_kind`: a record is flat and `kind` is the record's own tag.
+    #[serde(rename = "item_kind")]
     pub kind: InboxKind,
     pub text: String,
     #[serde(default)]
@@ -658,6 +660,7 @@ pub enum SessionOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::BlobId;
 
     fn record(event: Event) -> Record {
         Record { seq: 3, ts_ms: 1, author: Author::Harness, prev: "0".repeat(64), event }
@@ -693,6 +696,207 @@ mod tests {
         let r: Record = serde_json::from_str(&line).unwrap();
         assert_eq!(r.event, Event::Unknown);
         assert_eq!(r.seq, 9);
+    }
+
+    /// One record of every kind. A record is flat, so a field of an event that shares a name with a
+    /// field of the record (or with the `kind` tag) would silently produce a line that cannot be read
+    /// back; this is the guard against that.
+    fn one_of_each() -> Vec<(&'static str, Event)> {
+        let s = || SessionId::from("s-a");
+        let c = || CallId::from("c1");
+        let blob = || BlobRef { id: BlobId::from("ab".repeat(32)), bytes: 10, lines: 2 };
+        let brief = || Brief { question: "q".into(), returns: Some("r".into()), ..Default::default() };
+        let budget = || Budget { max_steps: Some(5), max_minutes: Some(9) };
+        vec![
+            (
+                "session_start",
+                Event::SessionStart(SessionStart {
+                    session: s(),
+                    mission: MissionId::from("m-a"),
+                    parent: Some(SessionId::from("s-p")),
+                    workspace: "/w".into(),
+                    pack: "core".into(),
+                    role: "lead".into(),
+                    termination: Termination::Explicit,
+                    model: ModelRef { profile: "local".into(), model: "m".into(), context_window: 1000 },
+                    reasoning_replay: ReasoningReplay::All,
+                    system_prompt: "sys".into(),
+                    tools: vec![ToolSpec {
+                        name: "bash".into(),
+                        description: "d".into(),
+                        parameters: serde_json::json!({"type": "object"}),
+                        class: ToolClass::Exec,
+                    }],
+                    budget: budget(),
+                    unattended: true,
+                    title: "t".into(),
+                }),
+            ),
+            (
+                "forked",
+                Event::Forked(Forked {
+                    session: s(),
+                    parent: SessionId::from("s-p"),
+                    upto_seq: 4,
+                    role: "worker".into(),
+                    termination: Termination::Explicit,
+                    budget: budget(),
+                    brief: brief(),
+                    contract: "c".into(),
+                    allowed_tools: Some(vec!["read".into()]),
+                    title: "t".into(),
+                }),
+            ),
+            ("user_message", Event::UserMessage { text: "hi".into() }),
+            ("harness_note", Event::HarnessNote { note: NoteKind::Nudge, text: "n".into() }),
+            ("turn_start", Event::TurnStart { trigger: Trigger::User }),
+            (
+                "model_request",
+                Event::ModelRequest(ModelRequest {
+                    req_id: "r-1".into(),
+                    step: 1,
+                    epoch: 0,
+                    purpose: Purpose::Step,
+                    n_messages: 3,
+                    stable_hash: "h".into(),
+                    hud: Some(blob()),
+                    est_tokens: 9,
+                }),
+            ),
+            (
+                "model_response",
+                Event::ModelResponse(ModelResponse {
+                    req_id: "r-1".into(),
+                    text: "t".into(),
+                    reasoning: "r".into(),
+                    tool_calls: vec![ToolCallRequest {
+                        call_id: c(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                        complete: true,
+                    }],
+                    finish: FinishReason::ToolCalls,
+                    usage: Usage { prompt_tokens: 5, cached_tokens: 4, completion_tokens: 3, reasoning_tokens: 2 },
+                    timing: Timing { queue_ms: 1, ttft_ms: 2, total_ms: 3 },
+                    attempts: 1,
+                }),
+            ),
+            (
+                "tool_call",
+                Event::ToolCall(ToolCall {
+                    call_id: c(),
+                    req_id: "r-1".into(),
+                    name: "bash".into(),
+                    args: serde_json::json!({"command": "ls"}),
+                    class: ToolClass::Exec,
+                }),
+            ),
+            (
+                "tool_result",
+                Event::ToolResult(ToolResult {
+                    call_id: c(),
+                    name: "bash".into(),
+                    status: ToolStatus::Ok,
+                    text: "ok".into(),
+                    output: Some(blob()),
+                    cut: true,
+                    class: ToolClass::Exec,
+                    meta: Map::new(),
+                    duration_ms: 5,
+                }),
+            ),
+            (
+                "reweave",
+                Event::Reweave(Reweave {
+                    epoch: 1,
+                    upto_seq: 7,
+                    evictions: vec![
+                        Eviction { seq: 3, action: EvictAction::Stub { text: "s".into() } },
+                        Eviction { seq: 4, action: EvictAction::Drop },
+                        Eviction { seq: 5, action: EvictAction::DropReasoning },
+                    ],
+                    brief: "b".into(),
+                    digest: Some("d".into()),
+                    reason: "target".into(),
+                    before_tokens: 9,
+                    after_tokens_est: 4,
+                }),
+            ),
+            ("pin", Event::Pin { call_id: c(), reason: "r".into() }),
+            ("unpin", Event::Unpin { call_id: c() }),
+            (
+                "child_spawned",
+                Event::ChildSpawned(ChildSpawned {
+                    child: s(),
+                    role: "worker".into(),
+                    mode: SpawnMode::Fork,
+                    brief: brief(),
+                    budget: budget(),
+                    call_id: Some(c()),
+                }),
+            ),
+            (
+                "child_settled",
+                Event::ChildSettled(ChildSettled {
+                    child: s(),
+                    outcome: ChildOutcome::Returned,
+                    report: "r".into(),
+                    full: Some(blob()),
+                    usage: Usage::default(),
+                    steps: 2,
+                    inline: true,
+                }),
+            ),
+            ("job_registered", Event::JobRegistered { job_id: "j1".into(), call_id: c(), command: "make".into() }),
+            (
+                "job_settled",
+                Event::JobSettled { job_id: "j1".into(), exit_code: Some(0), output: Some(blob()), detail: "d".into() },
+            ),
+            (
+                "inbox_opened",
+                Event::InboxOpened(InboxItem {
+                    item_id: "i-1".into(),
+                    kind: InboxKind::Question,
+                    text: "t".into(),
+                    options: vec!["a".into()],
+                    blocking: true,
+                    call_id: Some(c()),
+                    reference: Some("q1".into()),
+                }),
+            ),
+            ("inbox_resolved", Event::InboxResolved { item_id: "i-1".into(), answer: "a".into() }),
+            ("ledger", Event::Ledger { n: 3, summary: "s".into() }),
+            (
+                "net",
+                Event::Net(NetDecision {
+                    host: "h".into(),
+                    port: 443,
+                    method: "CONNECT".into(),
+                    allowed: false,
+                    rule: "deny".into(),
+                    resolved: Some("1.2.3.4".into()),
+                }),
+            ),
+            ("cache_break", Event::CacheBreak { req_id: "r-1".into(), first_diff_message: 2, detail: "d".into() }),
+            ("interrupted", Event::Interrupted { reason: "r".into() }),
+            ("turn_end", Event::TurnEnd { reason: TurnEndReason::Finished }),
+            ("session_end", Event::SessionEnd { outcome: SessionOutcome::Done, detail: "d".into() }),
+        ]
+    }
+
+    #[test]
+    fn every_kind_is_tagged_with_its_own_name_and_reads_back() {
+        for (name, event) in one_of_each() {
+            let r = record(event);
+            let line = serde_json::to_string(&r).unwrap();
+            let v: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["kind"], name, "tag of {name}: {line}");
+            assert_eq!(v["seq"], 3, "seq of {name}");
+            assert_eq!(v["author"], "harness", "author of {name}");
+            let back: Record = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{name} does not read back: {e}\n{line}"));
+            assert_eq!(back, r, "{name}");
+            assert_ne!(back.event, Event::Unknown, "{name}");
+        }
     }
 
     #[test]

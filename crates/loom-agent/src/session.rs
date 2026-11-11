@@ -193,17 +193,31 @@
 //! specs' JSON. `limit` = `deps.context.target_tokens`, lowered to `window − reserve` when
 //! `deps.context_window` is known and that is smaller (`reserve` = the profile's
 //! `max_output_tokens` or 16_384, plus 4_096). Not forced and `est <= limit`: nothing to do.
-//! 1. `plan = plan_reweave(records, estimator, &deps.context, false)`.
-//! 2. If there is no plan, or its `after_tokens_est` is above the midpoint between
-//!    `floor_tokens` and `limit`: ask for a digest — a request of the current stable messages plus
-//!    one `user` message `texts::DIGEST_PROMPT`, same tools, `max_tokens: DIGEST_MAX_TOKENS`,
-//!    recorded as `model_request{purpose: Digest, hud: None}` only (its reply is not appended as a
-//!    record). A non-empty reply text is the digest; an error, a cancellation or an empty text gives
-//!    none (a cancellation is then handled by the step). With a digest, replace the plan by
-//!    `plan_reweave(records, estimator, &deps.context, true)` when that returns one.
+//! A plan is *enough* when its `after_tokens_est` is at or below the midpoint between `floor_tokens`
+//! and `limit`.
+//! 1. `plan = plan_reweave(records, estimator, &policy, false)` with `policy = deps.context`. While
+//!    the plan is not enough and `policy.keep_recent_steps` is above `MIN_KEEP_RECENT_STEPS`, halve
+//!    `keep_recent_steps` (not below the minimum) and plan again: when folding what lies outside the
+//!    protected recent steps does not make room, it is the output of recent steps that fills the
+//!    window, so fewer of them are protected.
+//! 2. Still not enough: `text_plan = plan_reweave(records, estimator, &policy, true)`. Not forced
+//!    and `text_plan` is not enough either: return without a record and without a digest request (see
+//!    "Why a re-weave must be worth it"). Otherwise, when `text_plan` exists, ask for a digest — a
+//!    request of the current stable messages plus one `user` message `texts::DIGEST_PROMPT`, same
+//!    tools, `max_tokens: DIGEST_MAX_TOKENS`, recorded as `model_request{purpose: Digest, hud: None}`
+//!    only (its reply is not appended as a record). A non-empty reply text is the digest; an error
+//!    or an empty text gives none. A cancellation returns without a record (the step handles it).
+//!    The plan becomes `text_plan`, with or without a digest: the ledger brief is the durable state,
+//!    the digest an addition to it.
 //! 3. No plan: return without a record. Otherwise append `reweave{epoch: current + 1, upto_seq,
 //!    evictions, brief: texts::reweave_brief(<ledger.brief(default) or "">), digest, reason,
 //!    before_tokens: plan.before_tokens_est, after_tokens_est}`.
+//!
+//! Why a re-weave must be worth it: every re-weave starts a new epoch, and the server's cache of
+//! the conversation is lost with the old one. A re-weave that frees little is needed again one step
+//! later, and again after that, each at the price of re-reading the whole context. So one that was
+//! not asked for (`target`) happens only when it buys room for a long stretch of steps; otherwise
+//! the context is left to grow until the window itself forces one (`overflow`).
 //!
 //! ## Status
 //! [`Status`] is published through `Sink::status` whenever a field changes. `prompt_tokens` and
@@ -505,6 +519,9 @@ pub struct Session {
 
 /// Longest `session_end` detail.
 const DETAIL_CHARS: usize = 200;
+
+/// A re-weave never protects fewer recent steps than this.
+const MIN_KEEP_RECENT_STEPS: u32 = 2;
 
 fn fatal(e: impl std::fmt::Display) -> Fatal {
     Fatal(e.to_string())
@@ -1372,7 +1389,7 @@ impl Session {
     /// Fold older material out of view when the request has grown past the limit (or `forced`).
     /// True when a `reweave` record was appended.
     async fn reweave(&mut self, reason: &str, forced: bool, token: &CancellationToken) -> R<bool> {
-        let policy = self.deps.context.clone();
+        let mut policy = self.deps.context.clone();
         let mut limit = policy.target_tokens;
         if let Some(window) = self.deps.context_window {
             let reserve = self.deps.client.profile().max_output_tokens.unwrap_or(16_384).saturating_add(4_096);
@@ -1381,16 +1398,25 @@ impl Session {
         if !forced && self.estimate() <= limit {
             return Ok(false);
         }
-        let mut plan = plan_reweave(&self.records, &self.estimator, &policy, false);
         let midpoint = policy.floor_tokens.saturating_add(limit) / 2;
-        let sufficient = plan.as_ref().is_some_and(|p| p.after_tokens_est <= midpoint);
+        let enough = |p: &Option<loom_core::weave::ReweavePlan>| p.as_ref().is_some_and(|p| p.after_tokens_est <= midpoint);
+        let mut plan = plan_reweave(&self.records, &self.estimator, &policy, false);
+        while !enough(&plan) && policy.keep_recent_steps > MIN_KEEP_RECENT_STEPS {
+            policy.keep_recent_steps = (policy.keep_recent_steps / 2).max(MIN_KEEP_RECENT_STEPS);
+            plan = plan_reweave(&self.records, &self.estimator, &policy, false);
+        }
         let mut digest = None;
-        if !sufficient && plan_reweave(&self.records, &self.estimator, &policy, true).is_some() {
-            digest = self.ask_digest(token).await?;
-            if digest.is_some() {
-                if let Some(better) = plan_reweave(&self.records, &self.estimator, &policy, true) {
-                    plan = Some(better);
+        if !enough(&plan) {
+            let text_plan = plan_reweave(&self.records, &self.estimator, &policy, true);
+            if !forced && !enough(&text_plan) {
+                return Ok(false);
+            }
+            if text_plan.is_some() {
+                digest = self.ask_digest(token).await?;
+                if token.is_cancelled() {
+                    return Ok(false);
                 }
+                plan = text_plan;
             }
         }
         let Some(plan) = plan else { return Ok(false) };
@@ -1779,10 +1805,6 @@ mod tests {
     }
 
     fn kind(r: &Record) -> String {
-        // `inbox_opened` flattens an item that has its own `kind` field, so the tag is read off the event.
-        if matches!(r.event, Event::InboxOpened(_)) {
-            return "inbox_opened".to_string();
-        }
         serde_json::to_value(r).unwrap()["kind"].as_str().unwrap().to_string()
     }
 
@@ -1903,12 +1925,10 @@ mod tests {
         assert_eq!(rs[7].author, Author::Tool);
         assert_eq!(inbox(&rs)[0].kind, InboxKind::Finished);
         assert_eq!(fx.shared.ledger().unwrap().goal.as_deref(), Some("do it"));
-        // KNOWN SCHEMA BUG (reported): `InboxItem::kind` clashes with the record's `kind` tag, so an
-        // `inbox_opened` line does not read back and a reader stops just before it.
+        // What the sink was shown is what is on disk.
         let on_disk = read_records(&fx.log_path()).unwrap();
-        let at = rs.iter().position(|r| matches!(r.event, Event::InboxOpened(_))).unwrap();
-        assert_eq!(on_disk.records.len(), at);
-        assert_eq!(on_disk.records[..], rs[..at]);
+        assert!(on_disk.damage.is_none());
+        assert_eq!(on_disk.records, rs);
         let status = fx.sink.last_status().unwrap();
         assert_eq!((status.phase, status.step, status.last_end), (Phase::Idle, 2, Some(TurnEndReason::Finished)));
         assert!(status.completion_tokens_total > 0);
@@ -2271,9 +2291,9 @@ mod tests {
         assert_eq!(notes(&rs, NoteKind::Interrupted), vec![texts::AFTER_STOP.to_string()]);
         assert!(all_text(&fx.server.requests()[1]).contains(texts::AFTER_STOP));
         assert_eq!(finish_task(tx, task).await, End::Closed);
-        // The unanswered request ended in a user message that the next user message merges into, so
-        // the prefix did change; that is what the guard reports.
-        assert_eq!(count(&fx.sink.records(), "cache_break"), 1);
+        // The unanswered request ended in a user message that the next user message was merged
+        // into. That only appends to the final message, which the guard counts as growth.
+        assert_no_cache_break(&fx.sink.records());
     }
 
     #[tokio::test]
@@ -2449,7 +2469,7 @@ mod tests {
         assert!(rs.iter().any(|r| matches!(&r.event, Event::UserMessage { text } if *text == texts::inbox_answer("which branch?", "main"))));
         assert!(rs.iter().any(|r| matches!(&r.event, Event::TurnStart { trigger: Trigger::InboxAnswer })));
         let ledger = fx.shared.ledger().unwrap();
-        assert!(ledger.questions.iter().all(|q| q.answer.is_some()), "{:?}", ledger.questions);
+        assert!(ledger.questions.iter().all(|q| q.answer.is_some()), "{:?} // {:?} // {:?}", ledger.questions, kinds(&rs), turn_ends(&rs));
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Asked, TurnEndReason::Finished]);
         assert_eq!(fx.sink.last_status().unwrap().open_inbox, 1); // the Finished item
         finish_task(tx, task).await;
@@ -2544,10 +2564,52 @@ mod tests {
         let reqs = fx.server.requests();
         let line = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let lines = |n: usize| all_text(&reqs[n]).matches(line).count();
-        assert!(lines(1) >= 600, "the first output is shown whole before the re-weave");
+        assert!(
+            lines(1) >= 600,
+            "the first output is shown whole before the re-weave: lines per request {:?}, re-weaves {:?}",
+            (0..reqs.len()).map(lines).collect::<Vec<_>>(),
+            rw.iter().map(|w| (w.epoch, w.upto_seq, w.evictions.len(), w.before_tokens, w.after_tokens_est)).collect::<Vec<_>>()
+        );
         assert!(lines(2) < 700, "after the re-weave only the newest output is whole, got {}", lines(2));
         assert_no_cache_break(&rs);
         assert!(all_text(&reqs[2]).contains(&texts::reweave_brief("")));
+    }
+
+    #[tokio::test]
+    async fn reweave_protects_fewer_recent_steps_when_they_are_what_fills_the_context() {
+        // Every step is inside the protected recent region, so nothing could be folded without
+        // shrinking it.
+        let script = seq(vec![big(), big(), big(), big(), big(), big(), Reply::text("ok").into()]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context = ReweavePolicy { target_tokens: 40_000, floor_tokens: 10_000, keep_recent_steps: 64, stub_tail_lines: 3 };
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let rw = reweave_records(&rs);
+        assert!(!rw.is_empty(), "{:?}", kinds(&rs));
+        assert_eq!(rw[0].reason, "target");
+        assert!(!rw[0].evictions.is_empty());
+        let reqs = fx.server.requests();
+        let line = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let last = all_text(reqs.last().unwrap()).matches(line).count();
+        assert!(last < 4 * 600, "six outputs were produced; the last request shows {last} lines of them");
+        assert!(last >= 600, "the newest output is still whole, got {last}");
+        assert_no_cache_break(&rs);
+    }
+
+    #[tokio::test]
+    async fn a_reweave_that_would_free_little_is_not_done() {
+        // Two recent steps alone are larger than the target: folding the rest cannot make room for
+        // long, so the context is left alone rather than re-woven at every step.
+        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), Reply::text("ok").into()])).await;
+        fx.context = ReweavePolicy { target_tokens: 12_000, floor_tokens: 10_000, keep_recent_steps: 64, stub_tail_lines: 3 };
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert!(reweave_records(&rs).is_empty(), "{:?}", kinds(&rs));
+        assert_eq!(count(&rs, "model_request"), 5, "no digest request either");
+        assert_eq!(fx.sink.last_status().unwrap().epoch, 0);
+        assert_no_cache_break(&rs);
     }
 
     #[tokio::test]
@@ -2556,13 +2618,16 @@ mod tests {
             let long = || Reply::tool("bash", json!({ "command": BIG }).to_string()).with_text("t".repeat(40_000));
             let script = with_digest(vec![long().into(), long().into(), long().into(), Reply::text("ok").into()], digest);
             let mut fx = Fx::new("chat", false, false, script).await;
-            fx.context = ReweavePolicy { target_tokens: 20_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+            // Three steps of long text and output pass the target; folding the old output alone
+            // does not make enough room, folding the old text as well does.
+            fx.context = ReweavePolicy { target_tokens: 60_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
             let session = fx.create();
             run_with(session, vec![user("go")]).await;
             let rs = fx.sink.records();
             let rw = reweave_records(&rs);
             assert!(!rw.is_empty(), "{:?}", kinds(&rs));
             assert_eq!(rw[0].digest.as_deref(), digest);
+            assert!(rw[0].evictions.iter().any(|e| matches!(e.action, loom_core::event::EvictAction::Drop)), "text was folded");
             let digests = rs.iter().filter(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest)).count();
             assert!(digests >= 1);
             // The digest request is only a request record: no response record follows it.

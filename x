@@ -32,7 +32,7 @@ push() {
 remote() {
     "${SSH[@]}" "cd \$HOME/$REMOTE && \
         if [ ! -d target-$LANE ] && [ -d target-main ]; then cp -Rc target-main target-$LANE 2>/dev/null || true; fi; \
-        cd src-$LANE && export PATH=\$HOME/.cargo/bin:\$PATH MACOSX_DEPLOYMENT_TARGET=13.0 CARGO_TERM_COLOR=never \
+        ulimit -n 16384 2>/dev/null; cd src-$LANE && export PATH=\$HOME/.cargo/bin:\$PATH MACOSX_DEPLOYMENT_TARGET=13.0 CARGO_TERM_COLOR=never \
         CARGO_TARGET_DIR=\$HOME/$REMOTE/target-$LANE && $1"
 }
 pull_lock() {
