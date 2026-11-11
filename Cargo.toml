@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/loom-core",
+    "crates/loom-model",
+    "crates/loom-tools",
+    "crates/loom-net",
+    "crates/loom-agent",
+    "crates/loom-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+loom-core = { path = "crates/loom-core" }
+loom-model = { path = "crates/loom-model" }
+loom-tools = { path = "crates/loom-tools" }
+loom-net = { path = "crates/loom-net" }
+loom-agent = { path = "crates/loom-agent" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+async-trait = "0.1"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["trace"] }
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+rand = "0.9"
+toml = "0.8"
+regex = "1"
+globset = "0.4"
+ignore = "0.4"
+fs2 = "0.4"
+libc = "0.2"
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "debuginfo"
+
+[profile.dev]
+debug = 1

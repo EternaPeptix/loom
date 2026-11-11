@@ -1,0 +1,22 @@
+[package]
+name = "loom-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "loom: event log, blob store, weave, admission, ledger"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+rand.workspace = true
+regex.workspace = true
+fs2.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
