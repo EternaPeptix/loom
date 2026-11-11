@@ -53,8 +53,9 @@
 //! identical for identical inputs.
 
 use loom_core::event::Termination;
+use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Component, Path};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoleDef {
@@ -100,14 +101,247 @@ pub struct PromptEnv {
     pub network: String,
 }
 
+const CORE_TOML: &str = include_str!("../../../packs/core/pack.toml");
+const CORE_PREAMBLE: &str = include_str!("../../../packs/core/harness.md");
+const CORE_FILES: [(&str, &str); 4] = [
+    ("roles/lead.md", include_str!("../../../packs/core/roles/lead.md")),
+    ("roles/worker.md", include_str!("../../../packs/core/roles/worker.md")),
+    ("roles/verifier.md", include_str!("../../../packs/core/roles/verifier.md")),
+    ("roles/chat.md", include_str!("../../../packs/core/roles/chat.md")),
+];
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPack {
+    name: Option<String>,
+    description: Option<String>,
+    default_role: Option<String>,
+    preamble: Option<String>,
+    #[serde(default)]
+    roles: BTreeMap<String, RawRole>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRole {
+    description: Option<String>,
+    prompt: Option<String>,
+    termination: Option<String>,
+    tools: Option<Vec<String>>,
+    #[serde(default)]
+    may_spawn: Vec<String>,
+    #[serde(default)]
+    verify_finish: bool,
+    #[serde(default)]
+    read_only: bool,
+}
+
+fn valid_name(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// A path that stays inside the pack directory by construction.
+fn check_rel(label: &str, key: &str, rel: &str) -> Result<(), String> {
+    let p = Path::new(rel);
+    let ok = !rel.is_empty()
+        && p.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+        && p.components().any(|c| matches!(c, Component::Normal(_)));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "pack {label}: `{key}` = \"{rel}\" must be a relative path inside the pack directory (no absolute paths, no `..`)"
+        ))
+    }
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev.get(j).copied().unwrap_or(0) + usize::from(ca != *cb);
+            let del = prev.get(j + 1).copied().unwrap_or(0) + 1;
+            let ins = cur.get(j).copied().unwrap_or(0) + 1;
+            cur.push(sub.min(del).min(ins));
+        }
+        prev = cur;
+    }
+    prev.last().copied().unwrap_or(0)
+}
+
+/// Validate `pack.toml` text and assemble a pack. `read` returns the text of a file given its
+/// pack-relative path; `label` names the pack in errors.
+fn parse_pack(
+    label: &str,
+    toml_text: &str,
+    builtin_preamble: &str,
+    read: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<Pack, String> {
+    let raw: RawPack =
+        toml::from_str(toml_text).map_err(|e| format!("pack {label}: pack.toml is invalid: {e}"))?;
+    let name = raw
+        .name
+        .ok_or_else(|| format!("pack {label}: pack.toml is missing the required key `name`"))?;
+    if !valid_name(&name) {
+        return Err(format!(
+            "pack {label}: `name` = \"{name}\" is not valid; use only a-z, 0-9 and `-`"
+        ));
+    }
+    let default_role = raw.default_role.ok_or_else(|| {
+        format!("pack {label}: pack.toml is missing the required key `default_role`")
+    })?;
+    if raw.roles.is_empty() {
+        return Err(format!("pack {label}: pack.toml defines no `[roles.*]` tables"));
+    }
+    let role_list = raw.roles.keys().cloned().collect::<Vec<_>>().join(", ");
+    if !raw.roles.contains_key(&default_role) {
+        return Err(format!(
+            "pack {label}: `default_role` = \"{default_role}\" does not name a role of this pack (roles: {role_list})"
+        ));
+    }
+    let preamble = match raw.preamble {
+        None => builtin_preamble.trim_end().to_string(),
+        Some(rel) => {
+            check_rel(label, "preamble", &rel)?;
+            let text = read(&rel)?;
+            let text = text.trim_end();
+            if text.is_empty() {
+                return Err(format!("pack {label}: preamble file {rel} is empty"));
+            }
+            text.to_string()
+        }
+    };
+    let mut roles = BTreeMap::new();
+    for (rname, r) in &raw.roles {
+        if !valid_name(rname) {
+            return Err(format!(
+                "pack {label}: role name \"{rname}\" is not valid; use only a-z, 0-9 and `-`"
+            ));
+        }
+        let at = format!("pack {label}: roles.{rname}");
+        let prompt_rel = r
+            .prompt
+            .as_deref()
+            .ok_or_else(|| format!("{at} is missing the required key `prompt`"))?;
+        check_rel(label, &format!("roles.{rname}.prompt"), prompt_rel)?;
+        let prompt = read(prompt_rel)?.trim_end().to_string();
+        if prompt.is_empty() {
+            return Err(format!("{at}: prompt file {prompt_rel} is empty"));
+        }
+        let termination = match r.termination.as_deref() {
+            None | Some("explicit") => Termination::Explicit,
+            Some("free") => Termination::Free,
+            Some(other) => {
+                return Err(format!(
+                    "{at}: `termination` = \"{other}\" is not valid; use \"explicit\" or \"free\""
+                ))
+            }
+        };
+        let tools = r
+            .tools
+            .clone()
+            .ok_or_else(|| format!("{at} is missing the required key `tools`"))?;
+        if tools.is_empty() {
+            return Err(format!("{at}: `tools` is empty; a role needs at least one tool"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for t in &tools {
+            if t.is_empty() {
+                return Err(format!("{at}: `tools` contains an empty name"));
+            }
+            if !seen.insert(t.as_str()) {
+                return Err(format!("{at}: `tools` lists \"{t}\" more than once"));
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for m in &r.may_spawn {
+            if !raw.roles.contains_key(m) {
+                return Err(format!(
+                    "{at}: `may_spawn` names \"{m}\", which is not a role of this pack (roles: {role_list})"
+                ));
+            }
+            if !seen.insert(m.as_str()) {
+                return Err(format!("{at}: `may_spawn` lists \"{m}\" more than once"));
+            }
+        }
+        roles.insert(
+            rname.clone(),
+            RoleDef {
+                pack: name.clone(),
+                name: rname.clone(),
+                description: r.description.clone().unwrap_or_default(),
+                prompt,
+                termination,
+                tools,
+                may_spawn: r.may_spawn.clone(),
+                verify_finish: r.verify_finish,
+                read_only: r.read_only,
+            },
+        );
+    }
+    Ok(Pack {
+        name,
+        description: raw.description.unwrap_or_default(),
+        default_role,
+        preamble,
+        roles,
+    })
+}
+
+fn builtin_pack() -> Result<Pack, String> {
+    let read = |rel: &str| -> Result<String, String> {
+        let rel = rel.strip_prefix("./").unwrap_or(rel);
+        CORE_FILES
+            .iter()
+            .find(|(p, _)| *p == rel)
+            .map(|(_, t)| (*t).to_string())
+            .ok_or_else(|| format!("pack <built-in core>: file {rel} is not embedded in the binary"))
+    };
+    parse_pack("<built-in core>", CORE_TOML, CORE_PREAMBLE, &read)
+}
+
 impl Packs {
     pub fn builtin() -> Result<Packs, String> {
-        todo!("implement per module contract")
+        let core = builtin_pack()?;
+        let mut packs = BTreeMap::new();
+        packs.insert(core.name.clone(), core);
+        Ok(Packs { packs })
     }
 
     pub fn load(dir: &Path) -> Result<Packs, String> {
-        let _ = dir;
-        todo!("implement per module contract")
+        let mut out = Packs::builtin()?;
+        if !dir.exists() {
+            return Ok(out);
+        }
+        let rd = std::fs::read_dir(dir)
+            .map_err(|e| format!("pack directory {}: cannot be read: {e}", dir.display()))?;
+        let mut dirs = Vec::new();
+        for entry in rd {
+            let entry = entry
+                .map_err(|e| format!("pack directory {}: cannot be listed: {e}", dir.display()))?;
+            let path = entry.path();
+            if path.is_dir() && path.join("pack.toml").is_file() {
+                dirs.push(path);
+            }
+        }
+        dirs.sort();
+        let mut loaded: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
+        for path in dirs {
+            let pack = load_pack(&path)?;
+            if let Some(first) = loaded.get(&pack.name) {
+                return Err(format!(
+                    "pack {}: name \"{}\" is already used by the pack in {}; names must be unique",
+                    path.display(),
+                    pack.name,
+                    first.display()
+                ));
+            }
+            loaded.insert(pack.name.clone(), path);
+            out.packs.insert(pack.name.clone(), pack);
+        }
+        Ok(out)
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -119,23 +353,238 @@ impl Packs {
     }
 
     pub fn role(&self, pack: Option<&str>, role: Option<&str>) -> Result<&RoleDef, String> {
-        let _ = (pack, role);
-        todo!("implement per module contract")
+        let pname = pack.unwrap_or("core");
+        let p = self.packs.get(pname).ok_or_else(|| {
+            format!("unknown pack \"{pname}\"; packs available: {}", self.names().join(", "))
+        })?;
+        let rname = role.unwrap_or(&p.default_role);
+        p.roles.get(rname).ok_or_else(|| {
+            format!(
+                "pack \"{pname}\" has no role \"{rname}\"; roles available: {}",
+                p.roles.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })
     }
 
     pub fn check_tools(&self, known: &[String]) -> Result<(), String> {
-        let _ = known;
-        todo!("implement per module contract")
+        for pack in self.packs.values() {
+            for role in pack.roles.values() {
+                for tool in &role.tools {
+                    if known.iter().any(|k| k == tool) {
+                        continue;
+                    }
+                    let near = known
+                        .iter()
+                        .min_by_key(|k| levenshtein(tool, k))
+                        .map(|k| format!("; the nearest known tool is \"{k}\""))
+                        .unwrap_or_else(|| "; no tools are registered".to_string());
+                    return Err(format!(
+                        "pack \"{}\", role \"{}\": unknown tool \"{tool}\"{near}",
+                        pack.name, role.name
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
 /// Parse one pack from its directory.
 pub fn load_pack(dir: &Path) -> Result<Pack, String> {
-    let _ = dir;
-    todo!("implement per module contract")
+    let label = dir.display().to_string();
+    let toml_path = dir.join("pack.toml");
+    let text = std::fs::read_to_string(&toml_path)
+        .map_err(|e| format!("pack {label}: pack.toml cannot be read as UTF-8 text: {e}"))?;
+    let root = std::fs::canonicalize(dir)
+        .map_err(|e| format!("pack {label}: directory cannot be resolved: {e}"))?;
+    let read = |rel: &str| -> Result<String, String> {
+        let path = dir.join(rel);
+        // Symlinks must not lead out of the pack directory.
+        let real = std::fs::canonicalize(&path)
+            .map_err(|e| format!("pack {label}: file {rel} cannot be read: {e}"))?;
+        if !real.starts_with(&root) {
+            return Err(format!("pack {label}: file {rel} resolves outside the pack directory"));
+        }
+        std::fs::read_to_string(&real)
+            .map_err(|e| format!("pack {label}: file {rel} cannot be read as UTF-8 text: {e}"))
+    };
+    parse_pack(&label, &text, CORE_PREAMBLE, &read)
 }
 
 pub fn system_prompt(role: &RoleDef, preamble: &str, env: &PromptEnv) -> String {
-    let _ = (role, preamble, env);
-    todo!("implement per module contract")
+    format!(
+        "{}\n\n{}\n\n# Environment\nWorkspace: {}\nPlatform: {}\nSandbox: {}\nNetwork: {}",
+        preamble.trim_end(),
+        role.prompt.trim_end(),
+        env.workspace,
+        env.platform,
+        env.sandbox,
+        env.network
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    const GOOD: &str = "name = \"mine\"\ndefault_role = \"a\"\n[roles.a]\nprompt = \"a.md\"\ntools = [\"bash\"]\nmay_spawn = [\"b\"]\n[roles.b]\nprompt = \"b.md\"\ntools = [\"read\", \"grep\"]\ntermination = \"free\"\n";
+
+    fn mk(toml: &str) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("mine");
+        fs::create_dir(&p).unwrap();
+        fs::write(p.join("pack.toml"), toml).unwrap();
+        fs::write(p.join("a.md"), "Role A.\n\n").unwrap();
+        fs::write(p.join("b.md"), "Role B.").unwrap();
+        d
+    }
+
+    fn err(toml: &str) -> String {
+        let d = mk(toml);
+        let e = load_pack(&d.path().join("mine")).unwrap_err();
+        assert!(e.contains("mine"), "{e}");
+        e
+    }
+
+    fn env() -> PromptEnv {
+        PromptEnv {
+            workspace: "/w".into(),
+            platform: "linux".into(),
+            sandbox: "sb".into(),
+            network: "net".into(),
+        }
+    }
+
+    #[test]
+    fn builtin_loads() {
+        let p = Packs::builtin().unwrap();
+        let core = p.get("core").unwrap();
+        for r in ["lead", "worker", "verifier", "chat"] {
+            assert!(!core.roles[r].prompt.is_empty());
+        }
+        assert!(!core.preamble.is_empty());
+        assert_eq!(core.roles["chat"].termination, Termination::Free);
+        assert!(core.roles["verifier"].read_only);
+        assert!(core.roles["lead"].verify_finish);
+        assert_eq!(p.role(None, None).unwrap().name, "lead");
+    }
+
+    #[test]
+    fn directory_pack_loads_with_defaults() {
+        let d = mk(GOOD);
+        let p = Packs::load(d.path()).unwrap();
+        assert_eq!(p.names(), vec!["core".to_string(), "mine".to_string()]);
+        let a = p.role(Some("mine"), None).unwrap();
+        assert_eq!(a.prompt, "Role A.");
+        assert_eq!(a.termination, Termination::Explicit);
+        assert!(!a.verify_finish && !a.read_only);
+        assert_eq!(a.description, "");
+        assert_eq!(a.may_spawn, vec!["b".to_string()]);
+        assert_eq!(p.get("mine").unwrap().preamble, p.get("core").unwrap().preamble);
+        assert_eq!(p.role(Some("mine"), Some("b")).unwrap().termination, Termination::Free);
+    }
+
+    #[test]
+    fn missing_dir_is_fine_and_core_can_be_replaced() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(Packs::load(&d.path().join("nope")).unwrap().names(), vec!["core"]);
+        let c = d.path().join("c");
+        fs::create_dir(&c).unwrap();
+        fs::write(
+            c.join("pack.toml"),
+            "name=\"core\"\ndefault_role=\"x\"\npreamble=\"p.md\"\n[roles.x]\nprompt=\"x.md\"\ntools=[\"bash\"]\n",
+        )
+        .unwrap();
+        fs::write(c.join("x.md"), "X").unwrap();
+        fs::write(c.join("p.md"), "Pre\n").unwrap();
+        let p = Packs::load(d.path()).unwrap();
+        let core = p.get("core").unwrap();
+        assert_eq!(core.roles.keys().collect::<Vec<_>>(), vec!["x"]);
+        assert_eq!(core.preamble, "Pre");
+        // dirs without pack.toml are ignored
+        fs::create_dir(d.path().join("empty")).unwrap();
+        assert!(Packs::load(d.path()).is_ok());
+    }
+
+    #[test]
+    fn duplicate_names_rejected() {
+        let d = mk(GOOD);
+        let q = d.path().join("other");
+        fs::create_dir(&q).unwrap();
+        for f in ["pack.toml", "a.md", "b.md"] {
+            fs::copy(d.path().join("mine").join(f), q.join(f)).unwrap();
+        }
+        assert!(Packs::load(d.path()).unwrap_err().contains("already used"));
+    }
+
+    #[test]
+    fn validation_failures() {
+        assert!(err(&GOOD.replace("name = \"mine\"\n", "")).contains("`name`"));
+        assert!(err(&GOOD.replace("\"mine\"", "\"Bad_Name\"")).contains("Bad_Name"));
+        assert!(err(&GOOD.replace("name =", "colour = 1\nname =")).contains("colour"));
+        assert!(err(&GOOD.replace("tools = [\"bash\"]", "tools = [\"bash\"]\nbogus = 1")).contains("bogus"));
+        assert!(err(&GOOD.replace("a.md", "zzz.md")).contains("zzz.md"));
+        assert!(err(&GOOD.replace("a.md", "../x.md")).contains("roles.a.prompt"));
+        assert!(err(&GOOD.replace("a.md", "/etc/passwd")).contains("relative"));
+        assert!(err(&GOOD.replace("tools = [\"bash\"]", "tools = []")).contains("empty"));
+        assert!(err(&GOOD.replace("[\"read\", \"grep\"]", "[\"read\", \"read\"]")).contains("more than once"));
+        assert!(err(&GOOD.replace("tools = [\"bash\"]", "")).contains("`tools`"));
+        assert!(err(&GOOD.replace("default_role = \"a\"", "default_role = \"q\"")).contains("default_role"));
+        assert!(err(&GOOD.replace("[\"b\"]", "[\"q\"]")).contains("may_spawn"));
+        assert!(err(&GOOD.replace("\"free\"", "\"never\"")).contains("termination"));
+        assert!(err(&GOOD.replace("prompt = \"a.md\"\n", "")).contains("`prompt`"));
+        assert!(err("this is not toml").contains("invalid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_rejected() {
+        let d = mk(GOOD);
+        let outside = d.path().join("outside.md");
+        fs::write(&outside, "x").unwrap();
+        let link = d.path().join("mine/a.md");
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(load_pack(&d.path().join("mine")).unwrap_err().contains("outside"));
+    }
+
+    #[test]
+    fn role_lookup_errors() {
+        let p = Packs::builtin().unwrap();
+        assert_eq!(p.role(Some("core"), Some("chat")).unwrap().name, "chat");
+        let e = p.role(Some("nope"), None).unwrap_err();
+        assert!(e.contains("nope") && e.contains("core"));
+        let e = p.role(None, Some("boss")).unwrap_err();
+        assert!(e.contains("boss") && e.contains("worker"));
+    }
+
+    #[test]
+    fn check_tools_names_nearest() {
+        let p = Packs::builtin().unwrap();
+        let mut known: Vec<String> =
+            p.get("core").unwrap().roles.values().flat_map(|r| r.tools.clone()).collect();
+        assert!(p.check_tools(&known).is_ok());
+        known.retain(|t| t != "grep");
+        known.push("grap".into());
+        let e = p.check_tools(&known).unwrap_err();
+        assert!(e.contains("\"grep\"") && e.contains("\"grap\"") && e.contains("core"), "{e}");
+        assert!(p.check_tools(&[]).is_err());
+    }
+
+    #[test]
+    fn system_prompt_layout_and_stability() {
+        let p = Packs::builtin().unwrap();
+        let r = p.role(None, Some("worker")).unwrap();
+        let pre = &p.get("core").unwrap().preamble;
+        let s = system_prompt(r, pre, &env());
+        assert_eq!(
+            s,
+            format!(
+                "{pre}\n\n{}\n\n# Environment\nWorkspace: /w\nPlatform: linux\nSandbox: sb\nNetwork: net",
+                r.prompt
+            )
+        );
+        assert_eq!(s, system_prompt(r, pre, &env()));
+    }
 }
