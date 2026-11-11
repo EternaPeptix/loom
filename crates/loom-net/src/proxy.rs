@@ -18,6 +18,8 @@
 //! session id, password = 32 hex chars). The client authenticates with `Proxy-Authorization: Basic`.
 //! Missing or unknown credentials → `407` with `Proxy-Authenticate: Basic realm="loom"`.
 //! `revoke(session)` drops them; connections already open are left to finish.
+//! `set_policy(session, policy)` replaces the policy of a session that holds a grant and keeps its
+//! credentials, so commands already running pick the change up on their next connection.
 //! `SessionGrant::env()` gives the variables to place in a command's environment so that ordinary
 //! clients use the proxy: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case forms, all
 //! `http://{user}:{password}@127.0.0.1:{port}`, plus `NO_PROXY`/`no_proxy` = `` (empty, so loopback
@@ -159,6 +161,18 @@ impl Proxy {
         let entry = Entry { session: session.clone(), password: password.clone(), policy: Arc::new(policy) };
         lock(&self.inner.shared.sessions).insert(session.as_str().to_string(), entry);
         SessionGrant { port: self.inner.port, user: session.as_str().to_string(), password }
+    }
+
+    /// Replace the policy of a session that holds a grant. Its credentials stay as they are. False
+    /// when the session holds no grant.
+    pub fn set_policy(&self, session: &SessionId, policy: Policy) -> bool {
+        match lock(&self.inner.shared.sessions).get_mut(session.as_str()) {
+            Some(entry) => {
+                entry.policy = Arc::new(policy);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn revoke(&self, session: &SessionId) {
@@ -911,6 +925,31 @@ mod tests {
         assert_eq!(status(&r), 403);
         let (_, d) = decision(&mut rx).await;
         assert_eq!((d.rule.as_str(), d.method.as_str()), ("mode deny_all", "GET"));
+        no_more(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn set_policy_changes_what_the_same_credentials_may_reach() {
+        let (p, mut rx) = start().await;
+        let sid = SessionId::from("s-sp");
+        let g = p.grant(&sid, policy(NetworkMode::Allowlist, &["only.test"], &[], &[]));
+        let r = raw(p.port(), connect_req(&g, "other.test:443").as_bytes()).await;
+        assert_eq!(status(&r), 403);
+        let (_, d) = decision(&mut rx).await;
+        assert_eq!(d.rule.as_str(), "not in allow list");
+        // The new policy lists the host; the same credentials now pass the name check.
+        assert!(p.set_policy(&sid, policy(NetworkMode::Allowlist, &["only.test", "other.test"], &[], &[])));
+        let r = raw(p.port(), connect_req(&g, "other.test:443").as_bytes()).await;
+        assert_ne!(status(&r), 407, "{r}");
+        let (_, d) = decision(&mut rx).await;
+        assert_ne!(d.rule.as_str(), "not in allow list", "{d:?}");
+        // And back.
+        assert!(p.set_policy(&sid, policy(NetworkMode::DenyAll, &[], &[], &[])));
+        let r = raw(p.port(), connect_req(&g, "other.test:443").as_bytes()).await;
+        assert_eq!(status(&r), 403);
+        let (_, d) = decision(&mut rx).await;
+        assert_eq!(d.rule.as_str(), "mode deny_all");
+        assert!(!p.set_policy(&SessionId::from("s-none"), policy(NetworkMode::Open, &[], &[], &[])));
         no_more(&mut rx);
     }
 
