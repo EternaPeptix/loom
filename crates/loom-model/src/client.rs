@@ -907,7 +907,9 @@ mod tests {
         let ready = |evs: &[StreamEvent]| -> Vec<(u32, String, String)> {
             evs.iter()
                 .filter_map(|e| match e {
-                    StreamEvent::ToolCallReady { index, name, arguments } => Some((*index, name.clone(), arguments.clone())),
+                    StreamEvent::ToolCallReady { index, name, arguments, .. } => {
+                        Some((*index, name.clone(), arguments.clone()))
+                    }
                     _ => None,
                 })
                 .collect()

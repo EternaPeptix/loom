@@ -22,9 +22,10 @@
 //!   `function.arguments` string is appended. `function.name` arriving in several pieces is
 //!   concatenated. Emits `ToolCallStart` once per index (when the name is first known) and
 //!   `ToolCallArgs` for each non-empty arguments piece. An element for an index makes every lower
-//!   index that has a name complete: before that element is applied, `ToolCallReady` (index, name,
-//!   the arguments so far) is emitted for each of them, in index order, at most once per index. The
-//!   last call of a reply gets none (it is complete only when the whole reply is);
+//!   index that has a name complete: before that element is applied, `ToolCallReady` (index, the
+//!   server's id if one came, name, the arguments so far) is emitted for each of them, in index order,
+//!   at most once per index. The last call of a reply gets none (it is complete only when the whole
+//!   reply is);
 //! - `choices[0].finish_reason` (non-null) → recorded: `stop`→Stop, `tool_calls`/`function_call`→
 //!   ToolCalls, `length`→Length, anything else→Stop;
 //! - `usage` (object, on any chunk, the last one wins): `prompt_tokens`, `completion_tokens`,
@@ -64,10 +65,11 @@ pub enum StreamEvent {
     Reasoning(String),
     ToolCallStart { index: u32, name: String },
     ToolCallArgs { index: u32, delta: String },
-    /// The call at `index` is complete as far as this attempt goes: a later call has begun. `name`
-    /// and `arguments` are everything received for it. The final completion holds the call only if
-    /// nothing more arrives for it; whoever acts on this event compares the two.
-    ToolCallReady { index: u32, name: String, arguments: String },
+    /// The call at `index` is complete as far as this attempt goes: a later call has begun. `id` (the
+    /// server's, as received so far), `name` and `arguments` are everything received for it. The final
+    /// completion holds the call only if nothing more arrives for it; whoever acts on this event
+    /// compares the two.
+    ToolCallReady { index: u32, id: Option<String>, name: String, arguments: String },
     /// The attempt failed and another will follow after `after_ms`.
     Retrying { attempt: u32, after_ms: u64, reason: String },
 }
@@ -254,8 +256,8 @@ impl Assembler {
             for (i, earlier) in self.calls.range_mut(..index) {
                 if !earlier.ready && !earlier.name.is_empty() {
                     earlier.ready = true;
-                    let (name, arguments) = (earlier.name.clone(), earlier.arguments.clone());
-                    events.push(StreamEvent::ToolCallReady { index: *i, name, arguments });
+                    let (id, name, arguments) = (earlier.id.clone(), earlier.name.clone(), earlier.arguments.clone());
+                    events.push(StreamEvent::ToolCallReady { index: *i, id, name, arguments });
                 }
             }
             let acc = self.calls.entry(index).or_default();
@@ -564,8 +566,9 @@ mod tests {
 
     #[test]
     fn a_later_call_makes_the_named_earlier_ones_ready_once() {
-        let ready = |index: u32, name: &str, arguments: &str| StreamEvent::ToolCallReady {
+        let ready = |index: u32, id: Option<&str>, name: &str, arguments: &str| StreamEvent::ToolCallReady {
             index,
+            id: id.map(str::to_string),
             name: name.into(),
             arguments: arguments.into(),
         };
@@ -574,7 +577,8 @@ mod tests {
         for p in [
             tc_chunk(r#"[{"index":0,"id":"A","function":{"name":"re"}}]"#),
             tc_chunk(r#"[{"index":0,"function":{"name":"ad","arguments":"{\"path\":"}}]"#),
-            tc_chunk(r#"[{"index":0,"function":{"arguments":" \"a\"}"}},{"index":1,"id":"B","function":{"name":"glob"}}]"#),
+            // The second call comes without an id.
+            tc_chunk(r#"[{"index":0,"function":{"arguments":" \"a\"}"}},{"index":1,"function":{"name":"glob"}}]"#),
             tc_chunk(r#"[{"index":1,"function":{"arguments":"{}"}}]"#),
             // A piece for a call that is already ready, and a call without a name.
             tc_chunk(r#"[{"index":0,"function":{"arguments":" "}},{"index":2,"function":{"arguments":"{}"}}]"#),
@@ -586,9 +590,10 @@ mod tests {
         }
         let got: Vec<&StreamEvent> = events.iter().filter(|e| matches!(e, StreamEvent::ToolCallReady { .. })).collect();
         // Once each, with what had arrived; the nameless call and the last one are never ready.
-        assert_eq!(got, [&ready(0, "read", "{\"path\": \"a\"}"), &ready(1, "glob", "{}")]);
+        let first = ready(0, Some("A"), "read", "{\"path\": \"a\"}");
+        assert_eq!(got, [&first, &ready(1, None, "glob", "{}")]);
         let at = |e: &StreamEvent| events.iter().position(|x| x == e).unwrap();
-        assert_eq!(at(&ready(0, "read", "{\"path\": \"a\"}")) + 1, at(&StreamEvent::ToolCallStart { index: 1, name: "glob".into() }));
+        assert_eq!(at(&first) + 1, at(&StreamEvent::ToolCallStart { index: 1, name: "glob".into() }));
         // What came after the ready event is part of the call: the completion is what decides.
         let c = a.finish().unwrap();
         assert_eq!(c.tool_calls[0].arguments, "{\"path\": \"a\"} ");

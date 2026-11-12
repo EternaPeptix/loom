@@ -529,21 +529,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_parts_of_execute_make_the_same_record() {
+    async fn a_call_prepared_run_and_finished_apart_makes_the_usual_record() {
         let e = testutil::env();
         std::fs::write(e.ctx.workspace.join("a.txt"), "one\ntwo\n").unwrap();
         let admission = Admission { policy: &e.policy, estimator: &e.estimator };
-        let whole = execute(&e.registry, &e.ctx, "read", r#"{"path": "a.txt"}"#, &admission).await;
-        let parts = match prepare(&e.registry, &e.ctx, "read", r#"{"path": "a.txt"}"#) {
-            Ok(p) => p.run(&e.ctx).await.finish(&e.ctx, &admission),
-            Err(r) => *r,
-        };
-        assert_eq!(ToolResult { duration_ms: 0, ..parts }, ToolResult { duration_ms: 0, ..whole });
-        for (name, args) in [("reed", "{}"), ("read", "{}"), ("read", "{nope")] {
+        let prepared = prepare(&e.registry, &e.ctx, "read", r#"{"path": "a.txt"}"#).map_err(|r| r.text).unwrap();
+        let r = prepared.run(&e.ctx).await.finish(&e.ctx, &admission);
+        assert_eq!((r.status, r.name.as_str(), &r.call_id), (ToolStatus::Ok, "read", &e.ctx.call_id));
+        assert_eq!(r.text, "[read · ok · a.txt · lines 1-2 of 2]\n1\tone\n2\ttwo\n[end of read output · ok]");
+        assert_eq!(r.meta.get(META_SHOWN), Some(&json!([[1, 2]])));
+        for (name, args, says) in [
+            ("reed", "{}", "There is no tool named `reed`."),
+            ("read", "{}", "The arguments do not fit this tool:"),
+            ("read", "{nope", "The arguments were not valid JSON"),
+        ] {
             let refused = prepare(&e.registry, &e.ctx, name, args).err().unwrap();
-            let direct = execute(&e.registry, &e.ctx, name, args, &admission).await;
-            assert_eq!(refused.text, direct.text);
             assert_eq!(refused.status, ToolStatus::Invalid);
+            assert!(refused.text.starts_with(&format!("[{name} · not run]\n{says}")), "{}", refused.text);
         }
     }
 }

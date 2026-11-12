@@ -840,16 +840,23 @@ mod tests {
         let started = Instant::now();
         let mut resp = post_chat(&s, msgs(&["hi"])).await;
         let mut text = String::new();
-        let mut first_call_done = None;
+        // The body chunk (counted from 1) in which the first call is whole, and the one in which the
+        // second call begins.
+        let (mut chunks, mut first_call_done, mut second_call_begun) = (0usize, None, None);
         while let Some(c) = resp.chunk().await.expect("chunk") {
+            chunks += 1;
             text.push_str(std::str::from_utf8(&c).expect("utf8"));
             if first_call_done.is_none() && text.contains(r#"\"a\"}"#) {
-                first_call_done = Some(started.elapsed());
+                first_call_done = Some(chunks);
+            }
+            if second_call_begun.is_none() && text.contains(r#""name":"bash""#) {
+                second_call_begun = Some(chunks);
             }
         }
         let total = started.elapsed();
-        // The first call is whole well before the pause ends; the second call starts after it.
-        assert!(first_call_done.expect("first call") < Duration::from_millis(250), "{first_call_done:?}");
+        // The first call is whole before the pause; the second call starts after it.
+        let (done, begun) = (first_call_done.expect("first call"), second_call_begun.expect("second call"));
+        assert!(done < begun, "the first call was whole in body chunk {done}, the second began in {begun}");
         assert!(total >= Duration::from_millis(290), "{total:?}");
         let mut args = [String::new(), String::new()];
         let mut order = Vec::new();
