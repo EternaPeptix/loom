@@ -73,7 +73,13 @@ pub struct ModelProfile {
     pub max_concurrent: u32,
     /// Abort and retry a stream that delivers nothing for this long.
     pub stall_timeout_s: u64,
-    /// How long to keep retrying an unreachable or failing server. 0 = until it comes back.
+    /// How long to keep retrying an unreachable or failing server, in seconds (default 300, long
+    /// enough for a server relaunch). 0 = retry until the server comes back. Failures that waiting
+    /// cannot cure (a reply that is not HTTP or not an event stream, a stream that ends without a
+    /// finish reason, certificate errors) end the request after 3 attempts in a row whatever this is
+    /// set to. Every other failure is retried for the whole window, so with 0 one that never heals
+    /// but looks like an outage (a server that hangs up during the TLS handshake, an error object in
+    /// every stream) is retried until the request is cancelled.
     pub retry_window_s: u64,
     /// Longest pause between retries.
     pub retry_max_delay_s: u64,
@@ -91,7 +97,7 @@ impl Default for ModelProfile {
             extra_body: Map::new(),
             max_concurrent: 4,
             stall_timeout_s: 240,
-            retry_window_s: 0,
+            retry_window_s: 300,
             retry_max_delay_s: 30,
         }
     }
