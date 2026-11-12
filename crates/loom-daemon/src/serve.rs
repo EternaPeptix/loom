@@ -8,11 +8,14 @@
 //!    started by launchd or over ssh gets 256, and every running session holds a log, pipes for
 //!    its commands and sockets to the model server, so a busy daemon would otherwise start failing
 //!    with "Too many open files" in the middle of missions.
-//! 1. Create `paths.home` (0700). Take an exclusive, non-blocking lock on `<home>/daemon.lock` and hold it
+//! 1. `prepare_home(paths)`: create the home and its top-level directories `keys/`, `sessions/`, `missions/`,
+//!    `blobs/` and `logs/` with mode 0700, and tighten any of them that exists with a group or other permission
+//!    bit to 0700 (`Paths::ensure_private_layout`; files inside are left as they are). Take an exclusive,
+//!    non-blocking lock on `<home>/daemon.lock` (created 0600) and hold it
 //!    until `run` returns (the process exits): when it is taken, another daemon drives this home and the
 //!    answer is the "already running" sentence below (pid and address from `daemon.json` when it is readable
 //!    and its pid is alive; otherwise the sentence says the daemon is starting and its address is not written yet).
-//!    Create `paths.logs_dir()`. `Config::load(paths.config_file())`, then
+//!    `Config::load(paths.config_file())`, then
 //!    `check()`; an error is returned as `{path}: {error}`.
 //! 2. If `daemon.json` exists and its `pid` is alive (`libc::kill(pid, 0)` succeeds or fails with
 //!    `EPERM`) and `GET http://{bind}/healthz` answers within 2 s: return `A loom daemon is already
@@ -37,10 +40,10 @@
 //! If the daemon already answers (`healthz` on the configured bind; when the token file exists the listener must also
 //! prove it holds the token, `/healthz?nonce=`, unless `--unverified-daemon`): `Ok(Already)`. A listener that answers
 //! without the proof is refused with the identity sentence (no child is started, `daemon.json` is left alone; the
-//! same in `run_until`). Otherwise start
+//! same in `run_until`). Otherwise `prepare_home(paths)` (as in step 1 of `run`) and start
 //! `std::env::current_exe()` with the single argument `daemon`, `LOOM_HOME` set to `paths.home`,
-//! stdin `/dev/null`, stdout and stderr appended to `{logs}/loomd.log`, in its own session
-//! (`pre_exec` + `libc::setsid`) so it outlives the terminal. Then poll `healthz` every 100 ms for
+//! stdin `/dev/null`, stdout and stderr appended to `{logs}/loomd.log` (`open_daemon_log`: created 0600 when
+//! missing), in its own session (`pre_exec` + `libc::setsid`) so it outlives the terminal. Then poll `healthz` every 100 ms for
 //! up to 20 s. If the child exits first or the time runs out: `Err` with `The daemon did not come
 //! up. Last lines of {log}:` followed by the log's last 15 lines.
 //!
@@ -56,7 +59,8 @@
 //! `ready` fires, `daemon.json` exists and names the bound port, `/healthz` answers, the token file
 //! is 0600; cancelling `stop` returns `Ok` and removes `daemon.json`; a second `run` against a live
 //! first one is refused with the sentence above; a stale `daemon.json` is replaced; an invalid
-//! config is reported with its path; the plist (escaping, both paths present).
+//! config is reported with its path; the plist (escaping, both paths present); `prepare_home` tightens a
+//! 0755 home and makes the top-level directories 0700.
 
 use crate::api::{self, ApiState};
 use crate::auth;
@@ -206,6 +210,19 @@ pub fn prepare_home(paths: &Paths) -> Result<(), String> {
     paths.ensure_private_layout().map_err(|e| format!("Cannot prepare {} as a private directory: {e}.", paths.home.display()))
 }
 
+/// The daemon's log, `{logs}/loomd.log`, opened for appending and created 0600 when it is missing. Returns its path
+/// with the file.
+pub fn open_daemon_log(paths: &Paths) -> Result<(PathBuf, std::fs::File), String> {
+    let log = paths.logs_dir().join("loomd.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&log)
+        .map_err(|e| format!("Cannot open {}: {e}.", log.display()))?;
+    Ok((log, file))
+}
+
 /// Start the daemon in the background and wait until it answers.
 pub async fn spawn_background(paths: &Paths) -> Result<Spawned, String> {
     let config = load_config(paths)?;
@@ -213,13 +230,7 @@ pub async fn spawn_background(paths: &Paths) -> Result<Spawned, String> {
         return Ok(Spawned::Already);
     }
     prepare_home(paths)?;
-    let log = paths.logs_dir().join("loomd.log");
-    let out = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&log)
-        .map_err(|e| format!("Cannot open {}: {e}.", log.display()))?;
+    let (log, out) = open_daemon_log(paths)?;
     let err = out.try_clone().map_err(|e| format!("Cannot open {}: {e}.", log.display()))?;
     let exe = std::env::current_exe().map_err(|e| format!("Cannot find the loom program to start: {e}."))?;
     let mut command = std::process::Command::new(&exe);

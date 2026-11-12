@@ -345,8 +345,12 @@ fn id_dir(id: &str) -> PathBuf {
 
 /// Create `dir` (and any missing parents) with mode 0700; when it already exists with any group or other
 /// permission bit, tighten it to 0700. Every directory the harness creates under the loom home goes through this.
-/// On non-Unix targets it only creates the directory.
+/// On non-Unix targets it only creates the directory. An empty path (the parent of a bare file name) names the
+/// current directory, which is left as it is.
 pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.as_os_str().is_empty() {
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -560,6 +564,13 @@ allow = ["*.example.test"]
         assert_eq!(mode(&p.packs_dir()), 0o755);
         // A second call changes nothing and fails nowhere.
         p.ensure_private_layout().unwrap();
+    }
+
+    #[test]
+    fn an_empty_private_dir_path_is_the_current_directory_and_left_alone() {
+        // The parent of a bare file name is empty; it names a directory that exists and is not the harness's.
+        assert!(Path::new("log.jsonl").parent().is_some_and(|p| p.as_os_str().is_empty()));
+        ensure_private_dir(Path::new("")).unwrap();
     }
 
     #[test]

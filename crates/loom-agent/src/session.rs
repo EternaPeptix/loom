@@ -4665,6 +4665,23 @@ mod tests {
         finish_task(tx, task).await;
     }
 
+    #[test]
+    fn a_kept_input_is_private_and_its_directory_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        let id = SessionId::from("s-test");
+        let queue = queue_dir(&paths, &id);
+        // Left looser by an earlier version.
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::set_permissions(&queue, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let kept = queue_input(&paths, &id, Input::Constraint("never push to main".into())).unwrap();
+        let Input::Queued { file, .. } = &kept else { panic!("a rule is kept on disk") };
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(file), 0o600);
+        assert_eq!(mode(&queue), 0o700);
+    }
+
     #[tokio::test]
     async fn a_rule_left_on_disk_while_it_was_being_recorded_is_recorded_once() {
         let mut fx = Fx::new("lead", false, true, seq(vec![])).await;

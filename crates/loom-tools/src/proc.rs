@@ -1208,11 +1208,9 @@ mod tests {
         let mut r = f.start("echo hi");
         assert_eq!(finish(&mut r).await, Ended::Exit(0));
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&f.root.join("out")), 0o600);
-        assert_eq!(mode(&f.root.join("exit")), 0o600);
-        let pid = pid_path(&f.root.join("out"));
-        if pid.exists() {
-            assert_eq!(mode(&pid), 0o600);
+        // `spawn` writes the pid record and only a job table removes it, so it is there after the command ends.
+        for p in [f.root.join("out"), f.root.join("exit"), pid_path(&f.root.join("out"))] {
+            assert_eq!(mode(&p), 0o600, "{}", p.display());
         }
     }
 

@@ -925,6 +925,24 @@ mod tests {
         assert_eq!(f.table.allocate().await.expect("allocate").0, "j43");
     }
 
+    #[tokio::test]
+    async fn the_jobs_directory_and_the_files_of_a_job_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fx();
+        let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        // A directory left looser by an earlier version is tightened when the next id is handed out.
+        let dir = f.root.join("home/jobs");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let info = f.start("sleep 300").await;
+        assert_eq!(mode(&dir), 0o700);
+        // The pid record is removed when the job settles, so the files are checked while it runs.
+        for p in [info.out_path.clone(), info.exit_path.clone(), proc::pid_path(&info.out_path)] {
+            assert_eq!(mode(&p), 0o600, "{}", p.display());
+        }
+        f.table.kill(&info.id, Duration::from_secs(2)).await.expect("kill");
+    }
+
     /// A command spawned with its record in the jobs directory, never registered.
     fn orphan_running(f: &Fx, id: &str, script: &str) -> Running {
         let dir = f.root.join("home/jobs");

@@ -135,6 +135,7 @@ impl NetLogWriter {
         let mut tail = lock(&slot);
         let mut options = std::fs::OpenOptions::new();
         options.create(true).append(true).read(true);
+        #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options.open(path)?;
         let mut len = file.metadata()?.len();
