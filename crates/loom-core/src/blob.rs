@@ -297,6 +297,26 @@ impl BlobStore {
         found.map(BlobId).ok_or_else(|| not_found(handle))
     }
 
+    /// The stored outputs a handle (full id or prefix, `out:` accepted) could mean, sorted; at most `limit`.
+    /// More than one means `resolve` refused the handle as ambiguous.
+    pub fn candidates(&self, handle: &str, limit: usize) -> Vec<BlobId> {
+        let id = handle.trim().strip_prefix("out:").unwrap_or(handle.trim()).to_ascii_lowercase();
+        if id.len() < MIN_HANDLE_LEN || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Vec::new();
+        }
+        let mut found: Vec<String> = Vec::new();
+        if let Ok(entries) = fs::read_dir(self.root.join(&id[..2])) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.len() == 64 && name.starts_with(&id) {
+                    found.push(name);
+                }
+            }
+        }
+        found.sort();
+        found.into_iter().take(limit).map(BlobId).collect()
+    }
+
     pub fn meta(&self, id: &BlobId) -> io::Result<BlobRef> {
         let bytes = fs::metadata(self.path_of(&id.0))?.len();
         let lines = self.offsets(id)?.len() as u64;

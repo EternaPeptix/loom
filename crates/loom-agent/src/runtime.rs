@@ -194,6 +194,10 @@
 //!   (the texts are arguments, never part of the script). Elsewhere: nothing.
 //! - `config.notify.repeat_minutes > 0`: while a blocking item stays open, notify again every that
 //!   many minutes.
+//! - The text of an item opened by a tool call (a question, blocker or finish the model wrote)
+//!   starts with `[From the agent, unverified] `; items the harness opened itself are unchanged.
+//! - At start, every restored open blocking item is notified once (`Still waiting: {text}`) and its
+//!   repeat notice is armed as for a live one.
 //!
 //! ## Operator actions
 //! - `send_message(id, text)`: root sessions only (`Messages go to the lead session of a mission;
@@ -294,7 +298,8 @@
 //! - `window(id)`: `log::read_records` → `weave` → [`WindowView`] (`est_tokens` with a default
 //!   `TokenEstimator` over the messages plus the tool specs' JSON).
 //! - `missions()`: one per root session. `ledger(mission)`: the journal read and folded
-//!   (`No ledger: this mission's lead does not keep one.` when there is no journal file). The id
+//!   (`No ledger: this mission's lead does not keep one.` when there is no journal file and the
+//!   lead's role keeps none; a lead that keeps one but has no journal file yet has an empty ledger). The id
 //!   must be the mission of a known session, checked before a path is made from it (`There is no
 //!   mission {id}.`).
 //! - `inbox()`: open items, oldest first. `net(id, limit)`: the last `limit` entries.
@@ -1164,11 +1169,8 @@ impl Inner {
             }
         }
         if let Some((item, title)) = opened {
-            let kind = serde_json::to_value(item.kind)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_else(|| "question".to_string());
-            self.notify(&kind, session, &title, &item.text);
+            let kind = inbox_kind_word(&item);
+            self.notify(&kind, session, &title, &notice_text(&item, false));
             if item.blocking && self.config.notify.repeat_minutes > 0 {
                 self.repeat_notice(&kind, session, &title, &item);
             }
@@ -1215,10 +1217,62 @@ impl Inner {
                 if !open {
                     return;
                 }
-                inner.notify(&kind, &session, &title, &item.text);
+                inner.notify(&kind, &session, &title, &notice_text(&item, false));
             }
         });
         self.st().tasks.push(task);
+    }
+
+    /// After a restart: every open blocking item that was restored is notified once as still waiting, and its
+    /// repeat notice is armed as it is for an item opened live.
+    fn renotify_open_blocking(self: &Arc<Self>) {
+        let open: Vec<InboxEntry> = self.st().inbox.iter().filter(|e| e.item.blocking).cloned().collect();
+        for entry in open {
+            let kind = inbox_kind_word(&entry.item);
+            self.notify(&kind, &entry.session, &entry.title, &notice_text(&entry.item, true));
+            if self.config.notify.repeat_minutes > 0 {
+                self.repeat_notice(&kind, &entry.session, &entry.title, &entry.item);
+            }
+        }
+    }
+
+    /// Kill what a crashed daemon left running in the jobs directories of the sessions it knows, including the ones
+    /// nobody activates (a session that was idle at the crash). Runs off the async workers; logs what it did.
+    async fn clear_crash_leftovers(&self) {
+        let dirs: Vec<(SessionId, PathBuf)> = {
+            let st = self.st();
+            st.known
+                .iter()
+                .filter(|(_, k)| !k.meta.archived)
+                .map(|(id, _)| (id.clone(), self.paths.session_dir(id).join("jobs")))
+                .collect()
+        };
+        let swept = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            for (id, dir) in dirs {
+                let has_records = std::fs::read_dir(&dir)
+                    .is_ok_and(|d| d.flatten().any(|e| e.path().extension().and_then(|x| x.to_str()) == Some("pid")));
+                if has_records {
+                    out.push((id, loom_tools::jobs::clear_leftovers(&dir)));
+                }
+            }
+            out
+        })
+        .await;
+        match swept {
+            Ok(swept) => {
+                for (id, found) in swept.into_iter().filter(|(_, f)| !f.is_empty()) {
+                    let killed = found.iter().filter(|l| l.killed).count();
+                    let left = found.iter().filter(|l| l.left_running).count();
+                    tracing::warn!(
+                        session = id.as_str(),
+                        "cleared {} command(s) a previous daemon left behind: {killed} killed, {left} left alone because their process group could not be confirmed",
+                        found.len()
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("the sweep for a previous daemon's commands did not finish: {e}"),
+        }
     }
 
     // ---- building a session -----------------------------------------------------------------
@@ -1859,6 +1913,20 @@ impl Inner {
     }
 }
 
+/// The inbox kind in snake case, as notifications name it.
+fn inbox_kind_word(item: &InboxItem) -> String {
+    serde_json::to_value(item.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "question".to_string())
+}
+
+/// What a notification says about an inbox item. An item opened by a tool call (`call_id` set: a question, a
+/// blocker or a finish the model wrote) starts with a fixed label saying so; one the harness opened itself
+/// (`call_id` unset) is unchanged. `still_waiting` is the restart notice for an item that is still open.
+fn notice_text(item: &InboxItem, still_waiting: bool) -> String {
+    let label = if item.call_id.is_some() { "[From the agent, unverified] " } else { "" };
+    let waiting = if still_waiting { "Still waiting: " } else { "" };
+    format!("{label}{waiting}{}", item.text)
+}
+
 /// Run the notification for one event. Failures are warnings.
 async fn run_notify(command: Vec<String>, kind: String, session: String, title: String, text: String) {
     let mut cmd = if let Some((program, args)) = command.split_first() {
@@ -1997,6 +2065,7 @@ impl Runtime {
         inner.st().tasks.push(forwarder);
 
         inner.load_known();
+        inner.clear_crash_leftovers().await;
         let mut restored: Vec<SessionId> = Vec::new();
         // The flag marks a session that is wanted only if a job of its was lost (its turn yielded
         // while the job ran, and the job's end would have started the next one).
@@ -2040,6 +2109,7 @@ impl Runtime {
                 }
             }
         }
+        inner.renotify_open_blocking();
         let recovered = inner.recover_settlements();
         // The sessions told to carry on (parents come before their children).
         let mut going: HashSet<SessionId> = HashSet::new();
@@ -2312,7 +2382,9 @@ impl Runtime {
     }
 
     /// Withdraw the standing rule `rule_id` (`k<n>`, as listed in the ledger) of the mission of `id`.
-    /// Refused unless the mission's ledger lists that rule as in force; a mission that keeps no
+    /// Refused unless the mission's ledger lists that rule as in force. Only recorded entries are seen:
+    /// a rule still queued for a running lead, or a withdrawal queued earlier, is not in the ledger
+    /// yet, so a rule that was just set may be refused as unknown until the lead has recorded it. A mission that keeps no
     /// ledger has no rule ids, and the refusal says to tell the lead in a message instead. Then
     /// handed to the lead like a rule (see [`Runtime::add_rule`]): the ledger marks the rule retired
     /// with `reason` and the lead gets a protected note saying so; no turn is started. A blank
@@ -2543,7 +2615,15 @@ impl Runtime {
         }
         let path = self.inner.paths.journal(mission);
         if !path.is_file() {
-            return Err("No ledger: this mission's lead does not keep one.".to_string());
+            // A lead that keeps a ledger and has recorded nothing yet has an empty one; only a lead that keeps none has no ledger.
+            let lead = self.inner.st().known.values().find(|k| &k.meta.mission == mission && k.meta.parent.is_none()).map(|k| k.meta.clone());
+            let keeps = match lead {
+                Some(meta) => self.inner.mission_explicit(&meta)?,
+                None => false,
+            };
+            if !keeps {
+                return Err("No ledger: this mission's lead does not keep one.".to_string());
+            }
         }
         let state = Journal::new(path, self.inner.key.clone()).state().map_err(|e| e.to_string())?;
         let markdown = state.render_markdown();
@@ -3095,6 +3175,19 @@ mod tests {
         // The lead is waiting for the model: the rule is in its queue, not in the ledger.
         let state = e.rt.ledger(&mission).unwrap().state;
         assert_eq!((state.goal.as_deref(), state.constraints.len(), state.approvals.len()), (Some("go"), 0, 0));
+        tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lead_that_keeps_a_ledger_has_an_empty_one_before_its_journal_file_exists() {
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let info = e.rt.create_session(e.new_session(None)).await.unwrap();
+        let mission = info.meta.mission.clone();
+        let journal = e.rt.paths().journal(&mission);
+        assert!(!journal.exists(), "a lead with no goal yet has written nothing");
+        let view = e.rt.ledger(&mission).unwrap();
+        assert_eq!((view.state.constraints.len(), view.state.goal.as_deref()), (0, None));
+        assert!(!journal.exists(), "reading must not create the journal");
         tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
     }
 
@@ -3754,6 +3847,118 @@ mod tests {
         assert!(!records.iter().any(answered));
         assert!(e.rt.answer("i-nothing", "x").await.is_err());
         e.rt.shutdown().await;
+    }
+
+    /// A notify command that appends `kind|text` lines to `file`.
+    fn text_logging_notify(file: &Path) -> impl FnOnce(&mut Config) {
+        let command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo \"$LOOM_KIND|$LOOM_TEXT\" >> '{}'", file.display()),
+        ];
+        move |c: &mut Config| c.notify.command = command
+    }
+
+    fn lines_of(file: &Path) -> Vec<String> {
+        std::fs::read_to_string(file).unwrap_or_default().lines().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn notification_text_is_labelled_only_when_a_tool_call_opened_the_item() {
+        let item = |call_id: Option<&str>| InboxItem {
+            item_id: "i-1".into(),
+            kind: InboxKind::Question,
+            text: "which one?".into(),
+            options: Vec::new(),
+            blocking: true,
+            call_id: call_id.map(CallId::from),
+            reference: None,
+        };
+        assert_eq!(notice_text(&item(Some("c1")), false), "[From the agent, unverified] which one?");
+        assert_eq!(notice_text(&item(Some("c1")), true), "[From the agent, unverified] Still waiting: which one?");
+        // Opened by the harness itself: unchanged, whatever the text says.
+        assert_eq!(notice_text(&item(None), false), "which one?");
+        let mut forged = item(None);
+        forged.text = "[From the agent, unverified] x".into();
+        assert_eq!(notice_text(&forged, false), "[From the agent, unverified] x");
+    }
+
+    #[tokio::test]
+    async fn a_question_the_model_wrote_is_notified_with_the_unverified_label() {
+        let out = tempfile::tempdir().unwrap();
+        let file = out.path().join("n.txt");
+        let e = env_with(
+            Script::new(|_, n| if n == 0 { call("ask_user", json!({"question": "which one?"})) } else { Action::Stall { ms: 600_000 } }),
+            false,
+            text_logging_notify(&file),
+        )
+        .await;
+        e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        until("notification", || !lines_of(&file).is_empty()).await;
+        assert_eq!(lines_of(&file)[0], "question|[From the agent, unverified] which one?");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_restart_notifies_a_restored_blocking_item_once_and_arms_its_repeat() {
+        let out = tempfile::tempdir().unwrap();
+        let file = out.path().join("n.txt");
+        let e = env_with(
+            Script::new(|_, n| if n == 0 { call("ask_user", json!({"question": "which one?"})) } else { Action::Stall { ms: 600_000 } }),
+            false,
+            |c| {
+                text_logging_notify(&file)(c);
+                c.notify.repeat_minutes = 60;
+            },
+        )
+        .await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("live notification", || !lines_of(&file).is_empty()).await;
+        until("blocked", || e.rt.inbox().iter().any(|i| i.session == id && i.item.blocking)).await;
+        e.rt.shutdown().await;
+        std::fs::remove_file(&file).unwrap();
+
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        until("restart notification", || !lines_of(&file).is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(lines_of(&file), ["question|[From the agent, unverified] Still waiting: which one?"]);
+        // The forwarder is one task; the repeat notice of the restored item is another.
+        assert!(rt2.inner.st().tasks.len() >= 2, "the repeat notice was not armed");
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn start_clears_the_leftovers_of_a_session_nobody_activates() {
+        use std::os::unix::process::CommandExt;
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("inbox", || !e.rt.inbox().is_empty()).await;
+        // With its finished item dismissed nothing about the session asks for it to be restored.
+        let item = e.rt.inbox().remove(0).item.item_id;
+        e.rt.answer(&item, "").await.unwrap();
+        until("resolved", || e.rt.inbox().is_empty()).await;
+        e.rt.shutdown().await;
+        // (The status file keeps the count from before the dismissal; the idle session this test needs has none open.)
+        let status_file = e.rt.paths().session_dir(&id).join("status.json");
+        let status = std::fs::read_to_string(&status_file).unwrap();
+        std::fs::write(&status_file, status.replace("\"open_inbox\": 1", "\"open_inbox\": 0")).unwrap();
+        // The crash left a command running in its own process group, recorded as an earlier daemon's.
+        let mut child = std::process::Command::new("sleep").arg("300").process_group(0).spawn().unwrap();
+        let start = loom_tools::proc::process_start(child.id()).unwrap();
+        let jobs = e.rt.paths().session_dir(&id).join("jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        std::fs::write(jobs.join("j1.pid"), format!("{} {start}\nowner 1 1.000000\n", child.id())).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert!(rt2.inner.st().known.get(&id).is_none_or(|k| k.active.is_none()), "the session must stay idle");
+        let end = tokio::time::Instant::now() + WAIT;
+        while child.try_wait().unwrap().is_none() {
+            assert!(tokio::time::Instant::now() < end, "the previous daemon's command was not killed at start");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!jobs.join("j1.pid").exists());
+        rt2.shutdown().await;
     }
 
     #[tokio::test]

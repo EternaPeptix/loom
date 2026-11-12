@@ -30,7 +30,8 @@
 //! It calls `ready(bind)` once, after step 6.
 //!
 //! ## `spawn_background(paths)` — the body of `loom up`
-//! If the daemon already answers (`healthz` on the configured bind): `Ok(Already)`. Otherwise start
+//! If the daemon already answers (`healthz` on the configured bind; when the token file exists the listener must also
+//! prove it holds the token, `/healthz?nonce=`, unless `--unverified-daemon`): `Ok(Already)`. Otherwise start
 //! `std::env::current_exe()` with the single argument `daemon`, `LOOM_HOME` set to `paths.home`,
 //! stdin `/dev/null`, stdout and stderr appended to `{logs}/loomd.log`, in its own session
 //! (`pre_exec` + `libc::setsid`) so it outlives the terminal. Then poll `healthz` every 100 ms for
@@ -115,7 +116,7 @@ pub async fn run_until(
     loom_tools::sandbox::preflight(&config.sandbox)?;
 
     if let Some(file) = read_daemon_file(&paths) {
-        if pid_alive(file.pid) && healthy(&file.bind, PROBE_TIMEOUT).await {
+        if pid_alive(file.pid) && healthy(&paths, &file.bind, PROBE_TIMEOUT).await {
             return Err(format!(
                 "A loom daemon is already running for {} (pid {}, {}).",
                 paths.home.display(),
@@ -226,7 +227,7 @@ pub async fn spawn_background(paths: &Paths) -> Result<Spawned, String> {
     let deadline = Instant::now() + UP_TIMEOUT;
     loop {
         if let Some(file) = read_daemon_file(paths) {
-            if file.pid == child.id() && healthy(&file.bind, PROBE_TIMEOUT).await {
+            if file.pid == child.id() && healthy(paths, &file.bind, PROBE_TIMEOUT).await {
                 return Ok(Spawned::Started);
             }
         }
@@ -377,11 +378,21 @@ fn pid_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// True when `GET http://{bind}/healthz` is answered with a success within `timeout`.
-async fn healthy(bind: &str, timeout: Duration) -> bool {
+/// True when `GET http://{bind}/healthz` is answered with a success within `timeout` and, when this home has an
+/// access token, the listener proves it holds it (`/healthz?nonce=`): any other listener on the address is not
+/// "the daemon". `--unverified-daemon` accepts one that cannot prove it (a daemon from before the proof).
+async fn healthy(paths: &Paths, bind: &str, timeout: Duration) -> bool {
     let Ok(client) = reqwest::Client::builder().no_proxy().timeout(timeout).build() else { return false };
-    match client.get(format!("http://{bind}/healthz")).send().await {
-        Ok(response) => response.status().is_success(),
+    let token = std::fs::read_to_string(paths.token_file()).map(|t| t.trim().to_string()).unwrap_or_default();
+    if token.is_empty() {
+        return match client.get(format!("http://{bind}/healthz")).send().await {
+            Ok(response) => response.status().is_success(),
+            Err(_) => false,
+        };
+    }
+    match crate::client::daemon_proves_identity(&client, &format!("http://{bind}"), &token, timeout).await {
+        Ok(true) => true,
+        Ok(false) => crate::client::unverified_daemon_allowed(),
         Err(_) => false,
     }
 }
@@ -389,11 +400,11 @@ async fn healthy(bind: &str, timeout: Duration) -> bool {
 /// True when a daemon for this home answers: at the address in `daemon.json`, or the configured one.
 async fn answering(paths: &Paths, config: &Config) -> bool {
     if let Some(file) = read_daemon_file(paths) {
-        if pid_alive(file.pid) && healthy(&file.bind, PROBE_TIMEOUT).await {
+        if pid_alive(file.pid) && healthy(paths, &file.bind, PROBE_TIMEOUT).await {
             return true;
         }
     }
-    healthy(&config.daemon.bind, PROBE_TIMEOUT).await
+    healthy(paths, &config.daemon.bind, PROBE_TIMEOUT).await
 }
 
 /// Bind with `SO_REUSEADDR`, preferring an IPv4 address when the name has several.
@@ -538,6 +549,25 @@ mod tests {
         // The first one is untouched.
         assert!(h.paths.home.join("daemon.json").exists());
         assert_eq!(spawn_background(&h.paths).await, Ok(Spawned::Already));
+        stop_and_join(running).await;
+    }
+
+    #[tokio::test]
+    async fn only_a_listener_that_proves_the_token_counts_as_the_daemon() {
+        let h = home_with("").await;
+        let running = start(&h.paths).await;
+        // Something else answers 200 on every path, as an impostor on the port would.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other = listener.local_addr().unwrap().to_string();
+        let app = axum::Router::new().fallback(|| async { "ok" });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        assert!(healthy(&h.paths, &running.2, PROBE_TIMEOUT).await);
+        assert!(!healthy(&h.paths, &other, PROBE_TIMEOUT).await, "an unproven listener is not the daemon");
+        // Without a token file there is nothing to prove with: any 200 will do, as before.
+        std::fs::remove_file(h.paths.token_file()).unwrap();
+        assert!(healthy(&h.paths, &other, PROBE_TIMEOUT).await);
         stop_and_join(running).await;
     }
 

@@ -32,7 +32,8 @@
 //! - `POST /api/login-codes` (API token only) → `{"code", "expires_in_s"}`; `POST /api/web-sessions`
 //!   `{"code"}` (no Authorization) → `{"secret"}`, a bearer for the other `/api` routes.
 //! - All of them carry `Content-Security-Policy: ui::CSP` and `Referrer-Policy: no-referrer`.
-//! - `GET /healthz` → `200` `ok` (no token; says nothing else).
+//! - `GET /healthz` → `200` `ok` (no token; says nothing else). `?nonce=<32..128 hex>` →
+//!   `{"ok":true,"proof":hex(HMAC-SHA256(token, "loom-healthz-v1:"+nonce))}`; any other nonce is `400`.
 //!
 //! ## API (all under `/api`; JSON in, JSON out)
 //! | Route | Does | Answers |
@@ -173,7 +174,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/app.js", get(|| async { asset("text/javascript; charset=utf-8", ui::APP_JS) }))
         .route("/core.js", get(|| async { asset("text/javascript; charset=utf-8", ui::CORE_JS) }))
         .route("/style.css", get(|| async { asset("text/css; charset=utf-8", ui::STYLE_CSS) }))
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
         .route("/api/login-codes", post(login_code))
         .route("/api/web-sessions", post(web_session))
         .route("/api/status", get(status))
@@ -233,6 +234,18 @@ impl ApiError {
 
     fn no_blob(handle: &str) -> ApiError {
         ApiError::new(StatusCode::NOT_FOUND, format!("There is no stored output {handle}."))
+    }
+
+    fn ambiguous_blob(handle: &str, candidates: &[loom_core::BlobId]) -> ApiError {
+        let ids: Vec<String> = candidates.iter().map(|c| c.as_str().chars().take(16).collect()).collect();
+        ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "The handle {handle} matches {} stored outputs ({}). Give more of the id.",
+                if candidates.len() >= BLOB_CANDIDATES { "several".to_string() } else { candidates.len().to_string() },
+                ids.join(", ")
+            ),
+        )
     }
 
     fn unreadable_blob(handle: &str, why: impl std::fmt::Display) -> ApiError {
@@ -300,13 +313,28 @@ fn clamp_limit(requested: Option<u64>, default: usize, max: usize) -> usize {
     requested.map(|n| usize::try_from(n).unwrap_or(max)).unwrap_or(default).clamp(1, max)
 }
 
+/// How many candidate ids an ambiguous-handle answer lists at most.
+const BLOB_CANDIDATES: usize = 5;
+
+/// The stored output a handle means; an ambiguous handle is a 409 that lists the candidates, anything else 404.
+fn resolve_blob(blobs: &loom_core::blob::BlobStore, handle: &str) -> Res<loom_core::BlobId> {
+    blobs.resolve(handle).map_err(|_| {
+        let candidates = blobs.candidates(handle, BLOB_CANDIDATES);
+        if candidates.len() > 1 {
+            ApiError::ambiguous_blob(handle, &candidates)
+        } else {
+            ApiError::no_blob(handle)
+        }
+    })
+}
+
 /// Run blocking work off the async threads.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Res<T> + Send + 'static) -> Res<T> {
     match tokio::task::spawn_blocking(f).await {
         Ok(r) => r,
         Err(_) => Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "The daemon could not finish reading the stored output; try the request again.",
+            "The daemon could not finish that read; try the request again.",
         )),
     }
 }
@@ -379,6 +407,20 @@ fn seal(mut response: Response) -> Response {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     response
+}
+
+/// `GET /healthz` answers `ok`; with `?nonce=<hex>` it answers `{"ok":true,"proof":…}`, which only a holder of the
+/// API token can compute, so a client can tell this home's daemon from any other listener before it sends the token.
+async fn healthz(State(s): State<ApiState>, q: RawQuery) -> Res<Response> {
+    let q = params(q)?;
+    let Some(nonce) = q.get("nonce") else { return Ok("ok".into_response()) };
+    if !auth::valid_nonce(nonce) {
+        return Err(ApiError::bad_query("nonce must be 32 to 128 hexadecimal characters."));
+    }
+    let proof = auth::healthz_proof(&s.token, nonce).ok_or_else(|| {
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "The daemon cannot compute a proof with its access token.")
+    })?;
+    Ok(Json(json!({ "ok": true, "proof": proof })).into_response())
 }
 
 async fn not_found() -> Response {
@@ -511,12 +553,7 @@ async fn records(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery)
     let limit = clamp_limit(number(&q, "limit")?, RECORDS_DEFAULT, RECORDS_MAX);
     // The log is read from disk; keep that off the async workers.
     let runtime = s.runtime.clone();
-    let records = tokio::task::spawn_blocking(move || runtime.records(&SessionId::from(id), after, limit))
-        .await
-        .map_err(|e| {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("The records read did not finish: {e}. Try again."))
-        })?
-        .map_err(rt_err)?;
+    let records = blocking(move || runtime.records(&SessionId::from(id), after, limit).map_err(rt_err)).await?;
     let next_after = if records.len() >= limit { records.last().map(|r| r.seq) } else { None };
     Ok(Json(RecordsPage { records, next_after }))
 }
@@ -617,7 +654,7 @@ async fn shutdown(State(s): State<ApiState>) -> Response {
 async fn blob_meta(State(s): State<ApiState>, Path(handle): Path<String>) -> Res<Json<BlobRef>> {
     let blobs = s.runtime.blobs().clone();
     let meta = blocking(move || {
-        let id = blobs.resolve(&handle).map_err(|_| ApiError::no_blob(&handle))?;
+        let id = resolve_blob(&blobs, &handle)?;
         blobs.meta(&id).map_err(|e| ApiError::unreadable_blob(&handle, e))
     })
     .await?;
@@ -627,7 +664,7 @@ async fn blob_meta(State(s): State<ApiState>, Path(handle): Path<String>) -> Res
 async fn blob_raw(State(s): State<ApiState>, Path(handle): Path<String>) -> Res<Response> {
     let blobs = s.runtime.blobs().clone();
     let (id, bytes) = blocking(move || {
-        let id = blobs.resolve(&handle).map_err(|_| ApiError::no_blob(&handle))?;
+        let id = resolve_blob(&blobs, &handle)?;
         let bytes = blobs.read_all(&id).map_err(|e| ApiError::unreadable_blob(&handle, e))?;
         Ok((id, bytes))
     })
@@ -648,7 +685,7 @@ async fn blob_lines(State(s): State<ApiState>, Path(handle): Path<String>, q: Ra
     let end = number(&q, "end")?.unwrap_or(LINES_DEFAULT_END).min(start.saturating_add(LINES_MAX - 1));
     let blobs = s.runtime.blobs().clone();
     let slice = blocking(move || {
-        let id = blobs.resolve(&handle).map_err(|_| ApiError::no_blob(&handle))?;
+        let id = resolve_blob(&blobs, &handle)?;
         blobs.read_lines(&id, start, end).map_err(|e| ApiError::unreadable_blob(&handle, e))
     })
     .await?;
@@ -1188,6 +1225,30 @@ mod tests {
         assert_eq!(r.status(), 401);
 
         let r = anon("/healthz").send().await.unwrap();
+        assert_eq!((r.status().as_u16(), r.text().await.unwrap()), (200, "ok".to_string()));
+    }
+
+    #[tokio::test]
+    async fn healthz_with_a_nonce_proves_the_token_without_authentication() {
+        use hmac::{Hmac, Mac};
+        let e = env(Script::new(|_, _| finish("x"))).await;
+        let nonce = "ab12".repeat(8);
+        let r = e.http.get(e.url(&format!("/healthz?nonce={nonce}"))).send().await.unwrap();
+        let (s, b) = json_of(r).await;
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(e.token.as_bytes()).unwrap();
+        mac.update(format!("loom-healthz-v1:{nonce}").as_bytes());
+        let expected = hex::encode(mac.finalize().into_bytes());
+        assert_eq!((s, b["ok"].clone(), b["proof"].as_str().unwrap()), (200, json!(true), expected.as_str()));
+        // The longest nonce is fine; a different nonce gives a different proof.
+        let long = "F".repeat(128);
+        let (s, b2) = json_of(e.http.get(e.url(&format!("/healthz?nonce={long}"))).send().await.unwrap()).await;
+        assert_eq!(s, 200);
+        assert_ne!(b2["proof"], b["proof"]);
+        for bad in ["", "abc", &"a".repeat(31), &"a".repeat(129), &format!("{}g", "a".repeat(40))] {
+            let r = e.http.get(e.url(&format!("/healthz?nonce={bad}"))).send().await.unwrap();
+            assert_eq!(r.status(), 400, "nonce {bad:?}");
+        }
+        let r = e.http.get(e.url("/healthz")).send().await.unwrap();
         assert_eq!((r.status().as_u16(), r.text().await.unwrap()), (200, "ok".to_string()));
     }
 
@@ -1970,6 +2031,25 @@ mod tests {
             let (s, b) = e.get(&format!("/api/blobs/{path}")).await;
             assert_eq!((s, b["error"].as_str().unwrap()), (404, "There is no stored output zzz."), "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_blob_handle_is_a_409_that_lists_the_candidates() {
+        let e = env(Script::new(|_, _| finish("x"))).await;
+        let root = e.rt.blobs().root().join("ab");
+        std::fs::create_dir_all(&root).unwrap();
+        let (one, two) = (format!("abcdef01{}", "1".repeat(56)), format!("abcdef01{}", "2".repeat(56)));
+        std::fs::write(root.join(&one), b"x\n").unwrap();
+        std::fs::write(root.join(&two), b"y\n").unwrap();
+        for tail in ["", "/raw", "/lines"] {
+            let (s, b) = e.get(&format!("/api/blobs/abcdef01{tail}")).await;
+            let text = b["error"].as_str().unwrap();
+            assert_eq!(s, 409, "{tail}: {text}");
+            assert!(text.contains(&one[..16]) && text.contains(&two[..16]), "{text}");
+        }
+        // A prefix that names none is still a 404.
+        let (s, _) = e.get("/api/blobs/abcdef99").await;
+        assert_eq!(s, 404);
     }
 
     #[tokio::test]

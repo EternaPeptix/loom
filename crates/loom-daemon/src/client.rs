@@ -54,6 +54,7 @@ use loom_core::event::Seq;
 use loom_core::{BlobRef, MissionId, SessionId};
 use reqwest::Method;
 use serde::de::DeserializeOwned;
+use std::io::Write;
 use std::time::Duration;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -66,12 +67,51 @@ const LOST: &str = "The connection to the daemon was lost.";
 const NO_SUCH_PATH: &str = "There is no such path on the loom daemon.";
 const OLDER_DAEMON: &str = "The running daemon is older than this `loom` and cannot issue login codes. Restart it (`loom down`, then `loom up`) and run `loom open` again.";
 
+/// Set once by `--unverified-daemon`: talk to a listener that does not prove it is this home's daemon.
+static UNVERIFIED_DAEMON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Accept, for the rest of this process, a daemon that cannot prove its identity (one from before `/healthz?nonce=`).
+pub fn allow_unverified_daemon() {
+    UNVERIFIED_DAEMON.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn unverified_daemon_allowed() -> bool {
+    UNVERIFIED_DAEMON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Ask the listener at `base` to prove it holds `token`: a fresh nonce to `/healthz?nonce=`, the answer's `proof`
+/// compared in constant time. `Ok(false)` when it answers without a right proof; `Err` when it cannot be reached.
+/// The token itself is never sent.
+pub(crate) async fn daemon_proves_identity(
+    http: &reqwest::Client,
+    base: &str,
+    token: &str,
+    timeout: Duration,
+) -> Result<bool, reqwest::Error> {
+    let nonce = hex::encode(rand::random::<[u8; 32]>());
+    let response = http.get(format!("{base}/healthz")).query(&[("nonce", nonce.as_str())]).timeout(timeout).send().await?;
+    if !response.status().is_success() {
+        return Ok(false);
+    }
+    let body = response.bytes().await?;
+    let proof = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("proof").and_then(|p| p.as_str()).map(str::to_string));
+    Ok(proof.is_some_and(|p| crate::auth::healthz_proof_ok(token, &nonce, &p)))
+}
+
 /// A connection to one daemon.
 #[derive(Clone)]
 pub struct Client {
     base: String,
     token: String,
     http: reqwest::Client,
+    /// Whether the listener must prove it is this home's daemon before the token is sent (`from_home`).
+    verify: bool,
+    /// Carry on when it does not (`--unverified-daemon`), with a warning.
+    allow_unverified: bool,
+    /// Filled once the listener has been accepted; shared by clones.
+    proven: std::sync::Arc<tokio::sync::OnceCell<()>>,
 }
 
 /// An open event stream.
@@ -151,7 +191,26 @@ impl Client {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .unwrap_or_default();
-        Client { base: base.trim_end_matches('/').to_string(), token: token.to_string(), http }
+        Client {
+            base: base.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+            http,
+            verify: false,
+            allow_unverified: false,
+            proven: Default::default(),
+        }
+    }
+
+    /// Require the listener to prove it is this home's daemon before the first request that carries the token.
+    pub fn verifying(mut self) -> Client {
+        self.verify = true;
+        self
+    }
+
+    /// With [`Client::verifying`]: go on, with a warning, when the listener cannot prove it.
+    pub fn allowing_unverified(mut self) -> Client {
+        self.allow_unverified = true;
+        self
     }
 
     pub fn from_home(paths: &Paths) -> Result<Client, String> {
@@ -167,7 +226,35 @@ impl Client {
             }
             Err(e) => return Err(format!("Cannot read the access token at {}: {e}.", token_file.display())),
         };
-        Ok(Client::new(&format!("http://{bind}"), &token))
+        let client = Client::new(&format!("http://{bind}"), &token).verifying();
+        Ok(if unverified_daemon_allowed() { client.allowing_unverified() } else { client })
+    }
+
+    /// Before the first request of this process that would carry the token: the listener must prove it holds it.
+    async fn ensure_proven(&self) -> Result<(), String> {
+        if !self.verify {
+            return Ok(());
+        }
+        self.proven
+            .get_or_try_init(|| async {
+                let bind = self.base.strip_prefix("http://").unwrap_or(&self.base);
+                match daemon_proves_identity(&self.http, &self.base, &self.token, CONNECT_TIMEOUT).await {
+                    Ok(true) => Ok(()),
+                    Ok(false) if self.allow_unverified => {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "loom: warning: the listener on {bind} did not prove it is this home's loom daemon; sending the access token anyway (--unverified-daemon)."
+                        );
+                        Ok(())
+                    }
+                    Ok(false) => Err(format!(
+                        "Something is listening on {bind} but it did not prove it is this home's loom daemon, so the access token was not sent. If the daemon is older than this `loom`, restart it with `loom --unverified-daemon down` and then `loom up`; otherwise find what holds the port. To carry on without the proof, add --unverified-daemon."
+                    )),
+                    Err(e) => Err(self.transport_error(&Method::GET, "/healthz", e)),
+                }
+            })
+            .await
+            .map(|_| ())
     }
 
     /// `http://127.0.0.1:7878`.
@@ -208,6 +295,7 @@ impl Client {
         body: Option<serde_json::Value>,
         timeout: Option<Duration>,
     ) -> Result<reqwest::Response, String> {
+        self.ensure_proven().await?;
         let url = format!("{}{}", self.base, path);
         let mut req = self.http.request(method.clone(), url).bearer_auth(&self.token);
         if !query.is_empty() {
@@ -522,6 +610,8 @@ pub(crate) mod testkit {
         pub log: Option<Vec<Record>>,
         /// When set, `GET …/lines` serves a stored output of this many lines (`line {n}` + ESC).
         pub blob_total: Option<u64>,
+        /// When set, `GET /healthz?nonce=…` proves this token like the daemon does.
+        pub healthz_key: Option<String>,
         pub seen: Vec<Seen>,
     }
 
@@ -542,6 +632,10 @@ pub(crate) mod testkit {
         }
         pub fn blob_total(mut self, lines: u64) -> Script {
             self.blob_total = Some(lines);
+            self
+        }
+        pub fn healthz_key(mut self, token: &str) -> Script {
+            self.healthz_key = Some(token.to_string());
             self
         }
     }
@@ -585,6 +679,12 @@ pub(crate) mod testkit {
             return r;
         }
         let query = parts.uri.query().unwrap_or_default().to_string();
+        if let (Some(key), "/healthz") = (&script.healthz_key, path.as_str()) {
+            if let Some(nonce) = query.strip_prefix("nonce=") {
+                let proof = crate::auth::healthz_proof(key, nonce).unwrap_or_default();
+                return reply(200, json(&serde_json::json!({ "ok": true, "proof": proof })));
+            }
+        }
         let param = |name: &str| -> Option<u64> {
             query.split('&').find_map(|kv| kv.strip_prefix(name)?.strip_prefix('=')?.parse().ok())
         };
@@ -945,6 +1045,55 @@ mod tests {
         assert!(!client.alive().await);
     }
 
+    fn auth_headers_seen(shared: &Shared) -> Vec<Option<String>> {
+        shared.lock().unwrap().seen.iter().map(|s| s.auth.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_listener_without_a_proof_never_sees_the_token() {
+        let status_ok = json(&status_view());
+        // Answers 200 to everything, as a plain `ok`, with no proof field, or with a wrong proof.
+        let wrong = format!("{{\"ok\":true,\"proof\":\"{}\"}}", "0".repeat(64));
+        for healthz in ["ok", "{\"ok\":true}", wrong.as_str()] {
+            let script = Script::default().route("GET", "/healthz", 200, healthz).route("GET", "/api/status", 200, status_ok.clone());
+            let (client, shared) = start(script).await;
+            let client = client.verifying();
+            let e = client.status().await.unwrap_err();
+            assert!(e.contains("did not prove it is this home's loom daemon") && e.contains("--unverified-daemon"), "{e}");
+            assert!(e.contains("older daemon") || e.contains("older than this"), "{e}");
+            // A second call asks again and is refused again; no request ever carried the token.
+            assert!(client.sessions(false).await.is_err());
+            assert!(auth_headers_seen(&shared).iter().all(Option::is_none), "{:?}", shared.lock().unwrap().seen);
+            assert!(shared.lock().unwrap().seen.iter().all(|s| s.target.starts_with("/healthz?nonce=")));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_override_sends_the_token_to_an_unproven_listener_and_a_proof_proceeds() {
+        let status_ok = json(&status_view());
+        let (client, shared) =
+            start(Script::default().route("GET", "/healthz", 200, "ok").route("GET", "/api/status", 200, status_ok.clone())).await;
+        let client = client.verifying().allowing_unverified();
+        client.status().await.unwrap();
+        assert_eq!(auth_headers_seen(&shared), vec![None, Some("Bearer tok-123".to_string())]);
+
+        // A correct proof: one check for the first request, none for the later ones, and the token goes along.
+        let script = Script::default().healthz_key("tok-123").route("GET", "/api/status", 200, status_ok);
+        let (client, shared) = start(script).await;
+        let client = client.verifying();
+        client.status().await.unwrap();
+        client.status().await.unwrap();
+        assert_eq!(
+            auth_headers_seen(&shared),
+            vec![None, Some("Bearer tok-123".to_string()), Some("Bearer tok-123".to_string())]
+        );
+
+        // The proof is for this token: a daemon that holds another one is refused.
+        let (client, shared) = start(Script::default().healthz_key("other")).await;
+        assert!(client.verifying().status().await.is_err());
+        assert!(auth_headers_seen(&shared).iter().all(Option::is_none));
+    }
+
     fn listing() -> Script {
         Script::default().route(
             "GET",
@@ -1068,6 +1217,7 @@ mod tests {
         let c = Client::from_home(&paths).unwrap();
         assert_eq!(c.base(), "http://127.0.0.1:7878");
         assert_eq!(c.token(), "tok-abc");
+        assert!(c.verify, "a client for a home must ask the listener for its proof before sending the token");
         std::fs::write(paths.config_file(), "[daemon]\nbind = \"127.0.0.1:1111\"\n").unwrap();
         assert_eq!(Client::from_home(&paths).unwrap().base(), "http://127.0.0.1:1111");
         let file = DaemonFile { pid: 1, bind: "127.0.0.1:9999".into(), started_ms: 0 };
