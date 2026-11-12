@@ -255,6 +255,12 @@ pub const NO_MISSION: &str = "This session has no mission ledger, so there is no
 fn journal_sentence(e: &JournalError) -> String {
     match e {
         JournalError::Rule(text) => text.clone(),
+        JournalError::NewerVersion { .. } => format!(
+            "Nothing was recorded: {e}. Every tool that writes to the ledger, ask_user included, will keep failing the same way, so do not repeat the call. Tell the operator in your reply that loom must be upgraded before this mission can continue."
+        ),
+        JournalError::Unconfirmed { .. } => format!(
+            "The mission journal reported an error after the entry was written and the write could not be undone, so the entry may or may not be recorded ({e}). This is a harness fault, not a problem with the call. Look for the entry in the ledger (the `ledger` tool shows it) before repeating the call, so that it is not recorded twice."
+        ),
         other => format!(
             "The mission journal could not be used ({other}). This is a harness fault, not a problem with the call; nothing was recorded."
         ),
@@ -321,3 +327,36 @@ pub const NAMES: &[&str] = &[
     "ask_user", "report_blocker", "wait", "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "decide",
     "verify",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journal_sentences_are_distinct_and_say_what_to_do() {
+        assert_eq!(journal_sentence(&JournalError::Rule("Do X instead.".into())), "Do X instead.");
+
+        let tampered = journal_sentence(&JournalError::Tampered { n: 2, detail: "the seal does not match".into() });
+        assert!(tampered.contains("harness fault") && tampered.contains("nothing was recorded"), "{tampered}");
+
+        // A journal from a newer loom: retrying or asking through ask_user cannot work.
+        let detail = "op `hologram_set`: unknown variant `hologram_set`".to_string();
+        let newer = journal_sentence(&JournalError::NewerVersion { n: 2, detail });
+        assert!(newer.starts_with("Nothing was recorded") && newer.contains("newer loom"), "{newer}");
+        assert!(newer.contains("entry 2") && newer.contains("`hologram_set`"), "{newer}");
+        assert!(newer.contains("ask_user") && newer.contains("do not repeat the call"), "{newer}");
+        assert!(newer.contains("Tell the operator in your reply"), "{newer}");
+        assert!(!newer.contains("harness fault") && !newer.contains("then repeat"), "{newer}");
+
+        // A write that could be neither confirmed nor undone must not claim that nothing was recorded.
+        let unconfirmed = journal_sentence(&JournalError::Unconfirmed {
+            path: "journal.jsonl".into(),
+            n: 3,
+            source: std::io::Error::other("sync failed"),
+            undo: std::io::Error::other("truncate failed"),
+        });
+        assert!(unconfirmed.contains("may or may not be recorded") && unconfirmed.contains("entry 3"), "{unconfirmed}");
+        assert!(unconfirmed.contains("before repeating the call"), "{unconfirmed}");
+        assert!(!unconfirmed.contains("nothing was recorded"), "{unconfirmed}");
+    }
+}
