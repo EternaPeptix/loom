@@ -45,21 +45,130 @@
 //! file; permissions kept; diff shown; edit unique / all / ambiguous / each no-match hint;
 //! sandbox denial for read and write; `shown` ranges of read are exact.
 
-use crate::files::Freshness;
+use crate::files::{describe_type, open_probe, Freshness};
 use crate::outview::{string, uint};
 use crate::{params, schema, view, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
-use loom_core::event::{ToolClass, ToolSpec, META_PATH};
+use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_PATH};
 use serde_json::{json, Map, Value};
 use similar::TextDiff;
-use std::io::Write as IoWrite;
+use std::fs::{File, Metadata};
+use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio_util::sync::CancellationToken;
 
 /// Longest line shown, in characters.
 const MAX_LINE_CHARS: usize = 20_000;
 /// Longest line shown inside an error hint, in characters.
 const HINT_LINE_CHARS: usize = 500;
+/// Most bytes `read`, `write` and `edit` load into memory from one file (64 MiB). A larger file can
+/// still be read by line range, which streams it.
+const READ_CAP: u64 = 64 * 1024 * 1024;
+/// Size of one read from disk; cancellation is checked between reads.
+const CHUNK: usize = 1 << 20;
+/// A NUL within this many leading bytes marks a file as binary.
+const BINARY_PROBE: usize = 8192;
+
+/// Why a bounded read of a file did not produce its bytes.
+enum Fail {
+    Io(std::io::Error),
+    NotRegular(&'static str),
+    TooLarge(u64),
+    Cancelled,
+}
+
+fn interrupted(message: String) -> ToolOutput {
+    let mut out = ToolOutput::error(message);
+    out.status = ToolStatus::Interrupted;
+    out.outcome = "interrupted".into();
+    out
+}
+
+/// Run blocking file work off the async workers and stop waiting when the call is cancelled. A read
+/// stuck inside the kernel cannot be torn out, but the call returns at once as interrupted and the
+/// work observes the same token between reads.
+async fn off_thread<F>(ctx: &ToolCtx, tool: &str, work: F) -> ToolOutput
+where
+    F: FnOnce(ToolCtx) -> ToolOutput + Send + 'static,
+{
+    let owned = ctx.clone();
+    let cancel = ctx.cancel.clone();
+    let mut job = tokio::task::spawn_blocking(move || work(owned));
+    tokio::select! {
+        biased;
+        done = &mut job => done.unwrap_or_else(|e| {
+            ToolOutput::error(format!("The `{tool}` tool failed internally ({e}). Check the state of the file before repeating the call."))
+        }),
+        _ = cancel.cancelled() => interrupted(if tool == "read" {
+            "The `read` call was interrupted before the file was read. Nothing was changed. Call `read` again if you still need it.".to_string()
+        } else {
+            format!("The `{tool}` call was interrupted, and the file may or may not have been changed. Read it again with `read` to see its current content before deciding what to do.")
+        }),
+    }
+}
+
+/// Read the rest of an open regular file, at most `cap` bytes, checking `cancel` between chunks.
+fn read_open(mut file: File, len: u64, cap: u64, cancel: &CancellationToken) -> Result<Vec<u8>, Fail> {
+    let mut bytes = Vec::with_capacity(usize::try_from(len.min(cap)).unwrap_or(0));
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(Fail::Cancelled);
+        }
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(Fail::Io(e)),
+        };
+        bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
+        if bytes.len() as u64 > cap {
+            return Err(Fail::TooLarge(bytes.len() as u64));
+        }
+    }
+    Ok(bytes)
+}
+
+/// Open `path`, require a regular file of at most `cap` bytes, and read it.
+fn read_bounded(path: &Path, cap: u64, cancel: &CancellationToken) -> Result<Vec<u8>, Fail> {
+    let (file, meta) = open_probe(path).map_err(Fail::Io)?;
+    if !meta.is_file() {
+        return Err(Fail::NotRegular(describe_type(&meta.file_type())));
+    }
+    if meta.len() > cap {
+        return Err(Fail::TooLarge(meta.len()));
+    }
+    read_open(file, meta.len(), cap, cancel)
+}
+
+fn not_regular(given: &str, tool: &str, kind: &str) -> ToolOutput {
+    ToolOutput::error(format!(
+        "{given} is {kind}, not a regular file, and `{tool}` works only on regular files. Name a regular file instead; to look at a device or pipe on purpose, use `bash` with a bounded command (for example `head -c 1000 {given}`)."
+    ))
+}
+
+/// The error for a failed bounded read; `advice` says what to do about a file that is too large.
+fn fail_output(fail: Fail, given: &str, tool: &str, advice: &str) -> ToolOutput {
+    match fail {
+        Fail::Io(e) => ToolOutput::error(format!("{given} cannot be read ({e}). Check the path and its permissions.")),
+        Fail::NotRegular(kind) => not_regular(given, tool, kind),
+        Fail::TooLarge(n) => ToolOutput::error(format!(
+            "{given} is {n} bytes, above the {READ_CAP} byte limit `{tool}` loads into memory. {advice}"
+        )),
+        Fail::Cancelled => interrupted(format!(
+            "The `{tool}` call was interrupted before it changed anything. Call `{tool}` again if you still need it."
+        )),
+    }
+}
+
+/// The error for a failed freshness check.
+fn check_failed(given: &str, tool: &str, doing: &str, e: &std::io::Error) -> ToolOutput {
+    if e.kind() == std::io::ErrorKind::InvalidInput {
+        return ToolOutput::error(format!("{given} {e}, and `{tool}` works only on regular files. Name a regular file instead."));
+    }
+    ToolOutput::error(format!("{given} cannot be checked before {doing} ({e}). Check the path and its permissions."))
+}
 
 pub struct Read;
 pub struct Write;
@@ -168,19 +277,17 @@ impl Tool for Read {
             Ok(p) => p,
             Err(denied) => return *denied,
         };
-        with_path(read_file(ctx, given, &path, uint(args, "start"), uint(args, "end")), &path)
+        let (given, start, end) = (given.to_string(), uint(args, "start"), uint(args, "end"));
+        let target = path.clone();
+        let out = off_thread(ctx, "read", move |c| read_file(&c, &given, &target, start, end, READ_CAP)).await;
+        with_path(out, &path)
     }
 }
 
-fn read_file(ctx: &ToolCtx, given: &str, path: &Path, start: Option<u64>, end: Option<u64>) -> ToolOutput {
-    match std::fs::metadata(path) {
-        Ok(m) if m.is_dir() => {
-            return ToolOutput::error(format!(
-                "{given} is a directory, not a file. List its files with `glob` (for example pattern `{}/*`) and read one of them.",
-                given.trim_end_matches('/')
-            ))
-        }
-        Ok(_) => {}
+/// `cap` is the most bytes loaded whole; a larger file is read only by line range, streamed.
+fn read_file(ctx: &ToolCtx, given: &str, path: &Path, start: Option<u64>, end: Option<u64>, cap: u64) -> ToolOutput {
+    let (file, meta) = match open_probe(path) {
+        Ok(x) => x,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut msg = format!("{given} does not exist.");
             let near = similar_names(path);
@@ -191,10 +298,30 @@ fn read_file(ctx: &ToolCtx, given: &str, path: &Path, start: Option<u64>, end: O
             return ToolOutput::error(msg);
         }
         Err(e) => return ToolOutput::error(format!("{given} cannot be read ({e}). Check the path and its permissions.")),
+    };
+    if meta.is_dir() {
+        return ToolOutput::error(format!(
+            "{given} is a directory, not a file. List its files with `glob` (for example pattern `{}/*`) and read one of them.",
+            given.trim_end_matches('/')
+        ));
     }
-    let bytes = match std::fs::read(path) {
+    if !meta.is_file() {
+        return not_regular(given, "read", describe_type(&meta.file_type()));
+    }
+    if meta.len() > cap {
+        if start.is_none() && end.is_none() {
+            return ToolOutput::error(format!(
+                "{given} is {} bytes, above the {cap} byte limit `read` loads into memory. Pass `start` and `end` to read a range of its lines (the file is streamed), or use `grep` to find the lines you need.",
+                meta.len()
+            ));
+        }
+        return read_large_range(ctx, given, path, file, &meta, start, end);
+    }
+    let bytes = match read_open(file, meta.len(), cap, &ctx.cancel) {
         Ok(b) => b,
-        Err(e) => return ToolOutput::error(format!("{given} cannot be read ({e}). Check the path and its permissions.")),
+        Err(f) => {
+            return fail_output(f, given, "read", "Pass `start` and `end` to read a range of its lines (the file is streamed), or use `grep` to find the lines you need.")
+        }
     };
     ctx.files.note(path, &bytes);
     if bytes.is_empty() {
@@ -237,6 +364,143 @@ fn read_file(ctx: &ToolCtx, given: &str, path: &Path, start: Option<u64>, end: O
     out
 }
 
+/// The lines `first..=last` of a file, streamed, and what was learned about the rest of it.
+struct Window {
+    lines: Vec<(u64, String)>,
+    shortened: u64,
+    /// The number of lines in the file, known only when the scan reached its end.
+    total: Option<u64>,
+    more_below: bool,
+    crlf: bool,
+    binary: bool,
+}
+
+fn push_line(w: &mut Window, n: u64, cur: &[u8], full_bytes: u64) {
+    let mut text = String::from_utf8_lossy(cur).into_owned();
+    if full_bytes == cur.len() as u64 && text.ends_with('\r') {
+        text.pop();
+        w.crlf = true;
+    }
+    if full_bytes > cur.len() as u64 {
+        let head: String = text.chars().take(MAX_LINE_CHARS).collect();
+        text = format!("{head}…[line is {full_bytes} bytes; the rest is not shown]");
+        w.shortened += 1;
+    } else if let Some((cut, _)) = text.char_indices().nth(MAX_LINE_CHARS) {
+        let rest = text.get(cut..).map_or(0, |r| r.chars().count());
+        text = format!("{}…[+{rest} chars]", text.get(..cut).unwrap_or_default());
+        w.shortened += 1;
+    }
+    w.lines.push((n, text));
+}
+
+/// Stream `file`, keeping only lines `first..=last` (each at most a bounded number of bytes).
+fn stream_window(file: File, cancel: &CancellationToken, first: u64, last: u64) -> Result<Window, Fail> {
+    let mut reader = BufReader::with_capacity(1 << 16, file);
+    let keep = MAX_LINE_CHARS * 4;
+    let mut w = Window { lines: Vec::new(), shortened: 0, total: None, more_below: false, crlf: false, binary: false };
+    let mut lineno = 1u64;
+    let mut cur: Vec<u8> = Vec::new();
+    let mut cur_bytes = 0u64;
+    let mut probed = false;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(Fail::Cancelled);
+        }
+        let buf = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(Fail::Io(e)),
+        };
+        if buf.is_empty() {
+            break;
+        }
+        if !probed {
+            probed = true;
+            if buf.iter().take(BINARY_PROBE).any(|b| *b == 0) {
+                w.binary = true;
+                return Ok(w);
+            }
+        }
+        let (take, ended) = match buf.iter().position(|b| *b == b'\n') {
+            Some(i) => (i, true),
+            None => (buf.len(), false),
+        };
+        let in_range = lineno >= first && lineno <= last;
+        if in_range {
+            let room = keep.saturating_sub(cur.len()).min(take);
+            cur.extend_from_slice(buf.get(..room).unwrap_or_default());
+        }
+        cur_bytes += take as u64;
+        reader.consume(take + usize::from(ended));
+        if ended {
+            if in_range {
+                push_line(&mut w, lineno, &cur, cur_bytes);
+            }
+            cur.clear();
+            cur_bytes = 0;
+            if lineno >= last {
+                w.more_below = !reader.fill_buf().map_err(Fail::Io)?.is_empty();
+                if !w.more_below {
+                    w.total = Some(lineno);
+                }
+                return Ok(w);
+            }
+            lineno += 1;
+        }
+    }
+    if cur_bytes > 0 {
+        if lineno >= first && lineno <= last {
+            push_line(&mut w, lineno, &cur, cur_bytes);
+        }
+        w.total = Some(lineno);
+    } else {
+        w.total = Some(lineno - 1);
+    }
+    Ok(w)
+}
+
+/// A file above the whole-read cap, read by line range without loading it.
+fn read_large_range(ctx: &ToolCtx, given: &str, path: &Path, file: File, meta: &Metadata, start: Option<u64>, end: Option<u64>) -> ToolOutput {
+    let (first, last) = match view::window(start, end, u64::MAX, ctx.cfg.read_max_lines) {
+        Ok(Some(w)) => w,
+        Ok(None) => return ToolOutput::error("There is nothing to show for this range. Give a `start` of 1 or more."),
+        Err(e) => return ToolOutput::error(e),
+    };
+    let w = match stream_window(file, &ctx.cancel, first, last) {
+        Ok(w) => w,
+        Err(f) => return fail_output(f, given, "read", "Use `grep` to find the lines you need."),
+    };
+    if w.binary {
+        return ToolOutput::error(format!(
+            "{given} is binary data of {} bytes, above the size limit for whole reads, so it cannot be shown as lines. Use `bash` with a bounded command such as `xxd -l 256 {given}`.",
+            meta.len()
+        ));
+    }
+    let Some(shown_last) = w.lines.last().map(|(n, _)| *n) else {
+        return match view::window(start, end, w.total.unwrap_or(0), ctx.cfg.read_max_lines) {
+            Err(e) => ToolOutput::error(e),
+            _ => ToolOutput::ok("ok", Body::Message("(empty file)".into())).with_more(given.to_string()),
+        };
+    };
+    ctx.files.note_stat(path, meta);
+    let text = w.lines.iter().map(|(n, t)| format!("{n}\t{t}")).collect::<Vec<_>>().join("\n");
+    let range = match w.total {
+        Some(total) => view::range_fact(first, shown_last, total),
+        None => format!(
+            "lines {first}-{shown_last} — more below (the file is {} bytes, above the whole-read limit, so its lines are not counted)",
+            meta.len()
+        ),
+    };
+    let mut out = ToolOutput::ok("ok", Body::Message(text)).with_more(given.to_string()).with_more(range);
+    if w.shortened > 0 {
+        out = out.with_more(format!("{} long lines shortened", w.shortened));
+    }
+    if w.crlf {
+        out = out.with_more("CRLF line endings (the CRs are not shown)");
+    }
+    out
+}
+
 /// Why a write or edit must not proceed on a file in this state, if it must not.
 fn freshness_refusal(fresh: &Freshness, given: &str, tool: &str) -> Option<ToolOutput> {
     match fresh {
@@ -270,7 +534,10 @@ impl Tool for Write {
             Ok(p) => p,
             Err(denied) => return *denied,
         };
-        with_path(write_file(ctx, given, &path, string(args, "content")), &path)
+        let (given, content) = (given.to_string(), string(args, "content").to_string());
+        let target = path.clone();
+        let out = off_thread(ctx, "write", move |c| write_file(&c, &given, &target, &content)).await;
+        with_path(out, &path)
     }
 }
 
@@ -280,15 +547,21 @@ fn write_file(ctx: &ToolCtx, given: &str, path: &Path, content: &str) -> ToolOut
     }
     let fresh = match ctx.files.check(path) {
         Ok(f) => f,
-        Err(e) => return ToolOutput::error(format!("{given} cannot be checked before writing ({e}). Check the path and its permissions.")),
+        Err(e) => return check_failed(given, "write", "writing", &e),
     };
     if let Some(refusal) = freshness_refusal(&fresh, given, "write") {
         return refusal;
     }
+    // The previous content is needed only for the diff; a file above the cap is replaced without one.
+    let mut diff_omitted = false;
     let old = if fresh == Freshness::Current {
-        match std::fs::read(path) {
+        match read_bounded(path, READ_CAP, &ctx.cancel) {
             Ok(b) => Some(b),
-            Err(e) => return ToolOutput::error(format!("{given} cannot be read before writing ({e}). Check the path and its permissions.")),
+            Err(Fail::TooLarge(_)) => {
+                diff_omitted = true;
+                None
+            }
+            Err(f) => return fail_output(f, given, "write", ""),
         }
     } else {
         None
@@ -303,6 +576,10 @@ fn write_file(ctx: &ToolCtx, given: &str, path: &Path, content: &str) -> ToolOut
             let diff = unified_diff(given, &String::from_utf8_lossy(&old), content);
             ToolOutput::ok("replaced", Body::Raw(diff.into_bytes()))
         }
+        None if diff_omitted => ToolOutput::ok(
+            "replaced",
+            Body::Message(format!("(no diff: the previous file was larger than {READ_CAP} bytes, so it was replaced without reading it back)")),
+        ),
         None => ToolOutput::ok("created", Body::Message("(new file)".into())),
     };
     out = out.with_more(given.to_string());
@@ -335,7 +612,10 @@ impl Tool for Edit {
             Err(denied) => return *denied,
         };
         let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
-        with_path(edit_file(ctx, given, &path, string(args, "old"), string(args, "new"), all), &path)
+        let (given, old, new) = (given.to_string(), string(args, "old").to_string(), string(args, "new").to_string());
+        let target = path.clone();
+        let out = off_thread(ctx, "edit", move |c| edit_file(&c, &given, &target, &old, &new, all)).await;
+        with_path(out, &path)
     }
 }
 
@@ -351,7 +631,7 @@ fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all:
     }
     let fresh = match ctx.files.check(path) {
         Ok(f) => f,
-        Err(e) => return ToolOutput::error(format!("{given} cannot be checked before editing ({e}). Check the path and its permissions.")),
+        Err(e) => return check_failed(given, "edit", "editing", &e),
     };
     if fresh == Freshness::Missing {
         return ToolOutput::error(format!("{given} does not exist, so there is nothing to edit. Create it with `write`, or check the path (`glob` finds files)."));
@@ -359,9 +639,9 @@ fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all:
     if let Some(refusal) = freshness_refusal(&fresh, given, "edit") {
         return refusal;
     }
-    let bytes = match std::fs::read(path) {
+    let bytes = match read_bounded(path, READ_CAP, &ctx.cancel) {
         Ok(b) => b,
-        Err(e) => return ToolOutput::error(format!("{given} cannot be read ({e}). Check the path and its permissions.")),
+        Err(f) => return fail_output(f, given, "edit", "Use `bash` for a change to a file this large."),
     };
     let text = match String::from_utf8(bytes) {
         Ok(t) => t,
@@ -530,6 +810,104 @@ mod tests {
         let r = e.call("read", json!({"path": "bin.dat"})).await;
         assert!(r.text.contains("binary data, 7 bytes") && r.text.contains("binary"), "{}", r.text);
         assert_eq!(shown(&r), json!([[1, 1]]));
+    }
+
+    fn message(o: &ToolOutput) -> String {
+        match &o.body {
+            Body::Message(m) => m.clone(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_write_edit_refuse_devices_and_fifos_quickly() {
+        let e = env();
+        let fifo = ws(&e, "pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let limit = std::time::Duration::from_secs(10);
+        for target in ["/dev/zero".to_string(), fifo.display().to_string()] {
+            let r = tokio::time::timeout(limit, e.call("read", json!({"path": target}))).await.expect("read must not hang");
+            assert!(is_err(&r) && r.text.contains("not a regular file") && r.text.contains("bash"), "{}", r.text);
+        }
+        let r = tokio::time::timeout(limit, e.call("read", json!({"path": "pipe"}))).await.expect("read must not hang");
+        assert!(r.text.contains("FIFO"), "{}", r.text);
+        let r = tokio::time::timeout(limit, e.call("write", json!({"path": "pipe", "content": "x"}))).await.expect("write must not hang");
+        assert!(is_err(&r) && r.text.contains("regular file"), "{}", r.text);
+        let r = tokio::time::timeout(limit, e.call("edit", json!({"path": "pipe", "old": "a", "new": "b"}))).await.expect("edit must not hang");
+        assert!(is_err(&r) && r.text.contains("regular file"), "{}", r.text);
+        assert!(std::os::unix::fs::FileTypeExt::is_fifo(&std::fs::symlink_metadata(&fifo).unwrap().file_type()));
+    }
+
+    #[tokio::test]
+    async fn file_above_the_cap_is_refused_whole_and_read_by_range() {
+        let e = env();
+        let path = put(&e, "huge.txt", numbered_file(200).as_bytes());
+        let size = std::fs::metadata(&path).unwrap().len();
+        let whole = read_file(&e.ctx, "huge.txt", &path, None, None, 100);
+        assert_eq!(whole.status, ToolStatus::Error);
+        let m = message(&whole);
+        assert!(m.contains(&format!("{size} bytes")) && m.contains("`start` and `end`") && m.contains("grep"), "{m}");
+
+        let part = read_file(&e.ctx, "huge.txt", &path, Some(5), Some(7), 100);
+        assert_eq!(part.status, ToolStatus::Ok);
+        assert_eq!(message(&part), "5\trow 5\n6\trow 6\n7\trow 7");
+        assert!(part.more.iter().any(|f| f.contains("more below")), "{:?}", part.more);
+
+        let tail = read_file(&e.ctx, "huge.txt", &path, Some(199), Some(900), 100);
+        assert_eq!(message(&tail), "199\trow 199\n200\trow 200");
+        assert!(tail.more.iter().any(|f| f.contains("lines 199-200 of 200")), "{:?}", tail.more);
+        let past = read_file(&e.ctx, "huge.txt", &path, Some(300), None, 100);
+        assert!(message(&past).contains("200 lines"), "{}", message(&past));
+
+        std::fs::write(&path, [b'a', 0, b'b'].repeat(100)).unwrap();
+        let bin = read_file(&e.ctx, "huge.txt", &path, Some(1), Some(2), 100);
+        assert!(message(&bin).contains("binary"), "{}", message(&bin));
+    }
+
+    #[tokio::test]
+    async fn write_and_edit_refuse_a_changed_file_that_was_read_by_range() {
+        let e = env();
+        let path = put(&e, "big.txt", numbered_file(50).as_bytes());
+        let seen = read_file(&e.ctx, "big.txt", &path, Some(1), Some(2), 10);
+        assert_eq!(seen.status, ToolStatus::Ok);
+        // Unchanged since the ranged read: the freshness check passes without hashing the file.
+        let r = e.call("edit", json!({"path": "big.txt", "old": "row 3\n", "new": "three\n"})).await;
+        assert!(!is_err(&r), "{}", r.text);
+        // A second ranged read, then someone else changes the file.
+        read_file(&e.ctx, "big.txt", &path, Some(1), Some(2), 10);
+        put(&e, "big.txt", b"changed elsewhere\n");
+        let r = e.call("write", json!({"path": "big.txt", "content": "x"})).await;
+        assert!(is_err(&r) && r.text.contains("changed on disk"), "{}", r.text);
+        let r = e.call("edit", json!({"path": "big.txt", "old": "changed", "new": "x"})).await;
+        assert!(is_err(&r) && r.text.contains("changed on disk"), "{}", r.text);
+        assert_eq!(std::fs::read(&path).unwrap(), b"changed elsewhere\n");
+    }
+
+    #[tokio::test]
+    async fn cancellation_returns_interrupted_even_while_the_work_is_stuck() {
+        let e = env();
+        let cancel = e.ctx.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel.cancel();
+        });
+        let started = std::time::Instant::now();
+        let out = off_thread(&e.ctx, "read", |_c| {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            ToolOutput::error("finished late")
+        })
+        .await;
+        assert_eq!(out.status, ToolStatus::Interrupted);
+        assert!(started.elapsed() < std::time::Duration::from_millis(1000), "{:?}", started.elapsed());
+
+        // A call cancelled before it starts reading also ends as interrupted, whole or ranged.
+        put(&e, "f.txt", numbered_file(20).as_bytes());
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert_eq!(r.status, ToolStatus::Interrupted, "{}", r.text);
+        let path = ws(&e, "f.txt");
+        let r = read_file(&e.ctx, "f.txt", &path, Some(1), Some(2), 10);
+        assert_eq!(r.status, ToolStatus::Interrupted);
     }
 
     #[tokio::test]

@@ -38,6 +38,7 @@
 //! with the "would match with hidden/no_ignore" count; invalid patterns; a single file as `path`;
 //! sandbox-unreadable entries skipped; cancellation.
 
+use crate::files::open_probe;
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
 use globset::{GlobBuilder, GlobMatcher};
@@ -46,10 +47,11 @@ use loom_core::event::{ToolClass, ToolSpec, ToolStatus};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
+use std::io::Read as IoRead;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 
 /// Most context lines `grep` shows around a match.
@@ -58,6 +60,12 @@ const MAX_CONTEXT: usize = 20;
 const MAX_LINE_CHARS: usize = 2000;
 /// A NUL within this many leading bytes marks a file as binary.
 const BINARY_PROBE: usize = 8192;
+/// `grep` does not read a file larger than this (16 MiB); it counts it as skipped and says so.
+const MAX_GREP_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// The "what would hidden and ignored files add" pass examines at most this many files ...
+const HINT_MAX_FILES: usize = 20_000;
+/// ... and runs for at most this long; when either limit is reached the hint says it was cut short.
+const HINT_MAX_TIME: Duration = Duration::from_secs(10);
 
 pub struct Glob;
 pub struct Grep;
@@ -223,42 +231,114 @@ fn walk_facts(found: &Found, more: &mut Vec<String>) {
     }
 }
 
+/// How much work the hint pass may do.
+#[derive(Clone, Copy)]
+struct HintLimits {
+    max_files: usize,
+    max_time: Duration,
+}
+
+impl HintLimits {
+    const STANDARD: HintLimits = HintLimits { max_files: HINT_MAX_FILES, max_time: HINT_MAX_TIME };
+}
+
+/// What is left of the hint pass's allowance, and why it stopped when it did.
+struct Budget {
+    cancel: CancellationToken,
+    deadline: Instant,
+    files_left: usize,
+    max_files: usize,
+    /// Why the pass was cut short, once it was.
+    cut: Option<String>,
+    /// Files the pass did not read because they are over the size limit.
+    too_large: usize,
+}
+
+impl Budget {
+    fn new(cancel: CancellationToken, limits: HintLimits) -> Budget {
+        Budget {
+            cancel,
+            deadline: Instant::now() + limits.max_time,
+            files_left: limits.max_files,
+            max_files: limits.max_files,
+            cut: None,
+            too_large: 0,
+        }
+    }
+
+    /// Take one file from the allowance. False once the pass must stop (cancelled, out of time or files).
+    fn spend(&mut self) -> bool {
+        if self.cut.is_some() {
+            return false;
+        }
+        if self.cancel.is_cancelled() {
+            self.cut = Some("interrupted".to_string());
+        } else if Instant::now() >= self.deadline {
+            self.cut = Some("the time limit was reached".to_string());
+        } else if self.files_left == 0 {
+            self.cut = Some(format!("the limit of {} files was reached", self.max_files));
+        } else {
+            self.files_left -= 1;
+            return true;
+        }
+        false
+    }
+}
+
 /// For a search that found nothing: what the same search would find with the hidden and ignored
-/// files included. `count_new` counts the matches among the files that the current options leave out.
-fn widened_hint(scan: &Scan, hidden: bool, no_ignore: bool, base: &Found, count_new: &dyn Fn(&[&Entry]) -> usize) -> String {
+/// files included. `count_new` counts the matches among the files that the current options leave out;
+/// it takes one file from the budget before reading each. Each wider combination is visited once.
+fn widened_hint(
+    scan: &Scan,
+    hidden: bool,
+    no_ignore: bool,
+    base: &Found,
+    limits: HintLimits,
+    count_new: &dyn Fn(&[&Entry], &mut Budget) -> usize,
+) -> String {
     let have: HashSet<&Path> = base.files.iter().map(|e| e.abs.as_path()).collect();
-    let mut gains = Vec::new();
-    let mut widened = false;
-    let mut cut_short = false;
+    let mut combos: Vec<(bool, bool)> = Vec::new();
     for h in [hidden, true] {
         for n in [no_ignore, true] {
-            if (h, n) == (hidden, no_ignore) {
-                continue;
-            }
-            widened = true;
-            let wider = scan.collect(h, n);
-            cut_short |= wider.interrupted;
-            let extra: Vec<&Entry> = wider.files.iter().filter(|e| !have.contains(e.abs.as_path())).collect();
-            let k = count_new(&extra);
-            if k > 0 {
-                let label = match (h && !hidden, n && !no_ignore) {
-                    (true, true) => "`hidden: true` and `no_ignore: true`",
-                    (true, false) => "`hidden: true`",
-                    _ => "`no_ignore: true`",
-                };
-                gains.push(format!("{k} more would match with {label}"));
+            if (h, n) != (hidden, no_ignore) && !combos.contains(&(h, n)) {
+                combos.push((h, n));
             }
         }
     }
-    if !widened {
+    if combos.is_empty() {
         return String::new();
     }
-    match (gains.is_empty(), cut_short) {
-        (true, false) => " Including hidden and git-ignored files would not change this.".to_string(),
-        (true, true) => " Whether hidden and git-ignored files would change this could not be checked (interrupted).".to_string(),
-        (false, false) => format!(" {}.", gains.join("; ")),
-        (false, true) => format!(" {}. (That check was interrupted, so the counts may be low.)", gains.join("; ")),
+    let mut budget = Budget::new(scan.cancel.clone(), limits);
+    let mut gains = Vec::new();
+    for (h, n) in combos {
+        if budget.cut.is_some() {
+            break;
+        }
+        let wider = scan.collect(h, n);
+        if wider.interrupted && budget.cut.is_none() {
+            budget.cut = Some("interrupted".to_string());
+        }
+        let extra: Vec<&Entry> = wider.files.iter().filter(|e| !have.contains(e.abs.as_path())).collect();
+        let k = count_new(&extra, &mut budget);
+        if k > 0 {
+            let label = match (h && !hidden, n && !no_ignore) {
+                (true, true) => "`hidden: true` and `no_ignore: true`",
+                (true, false) => "`hidden: true`",
+                _ => "`no_ignore: true`",
+            };
+            gains.push(format!("{k} more would match with {label}"));
+        }
     }
+    let mut hint = match (gains.is_empty(), &budget.cut) {
+        (true, None) => " Including hidden and git-ignored files would not change this.".to_string(),
+        (true, Some(why)) => format!(" Whether hidden and git-ignored files would change this could not be fully checked ({why})."),
+        (false, None) => format!(" {}.", gains.join("; ")),
+        (false, Some(why)) => format!(" {}. (That check was cut short — {why} — so the counts may be low.)", gains.join("; ")),
+    };
+    if budget.too_large > 0 {
+        hint.push_str(&format!(" {} of those files are over the {MAX_GREP_FILE_BYTES} byte size limit and were not read.", budget.too_large));
+    }
+    hint
 }
 
 fn with_status(status: ToolStatus, mut out: ToolOutput) -> ToolOutput {
@@ -330,7 +410,9 @@ fn glob_job(scan: &Scan, glob: &PathGlob, pattern: &str, hidden: bool, no_ignore
         let hint = if found.interrupted {
             String::new()
         } else {
-            widened_hint(scan, hidden, no_ignore, &found, &|extra| extra.iter().filter(|e| glob.matches(&e.rel)).count())
+            widened_hint(scan, hidden, no_ignore, &found, HintLimits::STANDARD, &|extra, _| {
+                extra.iter().filter(|e| glob.matches(&e.rel)).count()
+            })
         };
         let msg = format!(
             "No file matched `{pattern}` among the {searched} files searched under {} ({}).{hint}",
@@ -429,13 +511,34 @@ struct GrepOpts {
 enum Read {
     Text(String),
     Binary,
+    /// Larger than `MAX_GREP_FILE_BYTES`: not read.
+    TooLarge,
     Unreadable,
 }
 
-fn read_text(path: &Path) -> Read {
-    let Ok(bytes) = std::fs::read(path) else { return Read::Unreadable };
-    if bytes.iter().take(BINARY_PROBE).any(|b| *b == 0) {
+/// The text of a regular file of at most `cap` bytes. The first `BINARY_PROBE` bytes are read and
+/// checked for a NUL before the rest is read, and a file over the cap is never read at all.
+fn read_text(path: &Path, cap: u64) -> Read {
+    let Ok((mut file, meta)) = open_probe(path) else { return Read::Unreadable };
+    if !meta.is_file() {
+        return Read::Unreadable;
+    }
+    if meta.len() > cap {
+        return Read::TooLarge;
+    }
+    let mut bytes = Vec::new();
+    if (&mut file).take(BINARY_PROBE as u64).read_to_end(&mut bytes).is_err() {
+        return Read::Unreadable;
+    }
+    if bytes.contains(&0) {
         return Read::Binary;
+    }
+    let rest = cap.saturating_add(1).saturating_sub(bytes.len() as u64);
+    if (&mut file).take(rest).read_to_end(&mut bytes).is_err() {
+        return Read::Unreadable;
+    }
+    if bytes.len() as u64 > cap {
+        return Read::TooLarge;
     }
     match String::from_utf8(bytes) {
         Ok(s) => Read::Text(s),
@@ -471,16 +574,21 @@ fn grep_job(scan: &Scan, opts: &GrepOpts) -> ToolOutput {
     let mut body = String::new();
     let mut groups_written = false;
     let (mut matches, mut files_with, mut scanned, mut binary, mut unreadable) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut too_large = 0usize;
     let mut interrupted = found.interrupted;
     for entry in &candidates {
         if scan.cancel.is_cancelled() {
             interrupted = true;
             break;
         }
-        let content = match read_text(&entry.abs) {
+        let content = match read_text(&entry.abs, MAX_GREP_FILE_BYTES) {
             Read::Text(t) => t,
             Read::Binary => {
                 binary += 1;
+                continue;
+            }
+            Read::TooLarge => {
+                too_large += 1;
                 continue;
             }
             Read::Unreadable => {
@@ -531,6 +639,9 @@ fn grep_job(scan: &Scan, opts: &GrepOpts) -> ToolOutput {
     if binary > 0 {
         more.push(format!("{binary} binary files skipped"));
     }
+    if too_large > 0 {
+        more.push(format!("{too_large} files skipped as too large (over {MAX_GREP_FILE_BYTES} bytes); they were not searched, so the search is not complete"));
+    }
     if unreadable > 0 {
         more.push(format!("{unreadable} files could not be read"));
     }
@@ -542,7 +653,7 @@ fn grep_job(scan: &Scan, opts: &GrepOpts) -> ToolOutput {
     if interrupted {
         more.push(format!(
             "interrupted: {} of the {} files found were searched; results are partial",
-            scanned + binary + unreadable,
+            scanned + binary + unreadable + too_large,
             candidates.len()
         ));
     }
@@ -552,18 +663,30 @@ fn grep_job(scan: &Scan, opts: &GrepOpts) -> ToolOutput {
         let hint = if interrupted {
             String::new()
         } else {
-            widened_hint(scan, opts.hidden, opts.no_ignore, &found, &|extra| {
+            widened_hint(scan, opts.hidden, opts.no_ignore, &found, HintLimits::STANDARD, &|extra, budget| {
                 extra
                     .iter()
                     .filter(|e| opts.filter.as_ref().is_none_or(|g| g.matches(&e.rel)))
-                    .filter(|e| match read_text(&e.abs) {
-                        Read::Text(t) => t.lines().any(|l| opts.re.is_match(l)),
-                        _ => false,
+                    .filter(|e| {
+                        if !budget.spend() {
+                            return false;
+                        }
+                        match read_text(&e.abs, MAX_GREP_FILE_BYTES) {
+                            Read::Text(t) => t.lines().any(|l| opts.re.is_match(l)),
+                            Read::TooLarge => {
+                                budget.too_large += 1;
+                                false
+                            }
+                            _ => false,
+                        }
                     })
                     .count()
             })
         };
-        let skipped = if binary > 0 { format!(", {binary} binary files skipped and not searched") } else { String::new() };
+        let mut skipped = if binary > 0 { format!(", {binary} binary files skipped and not searched") } else { String::new() };
+        if too_large > 0 {
+            skipped.push_str(&format!(", {too_large} files over {MAX_GREP_FILE_BYTES} bytes skipped as too large and not searched"));
+        }
         let filtered = if opts.filter.is_some() { " matching the glob" } else { "" };
         let msg = format!(
             "No line matched `{}` in the {scanned} text files{filtered} searched under {} ({}){skipped}.{hint}",
@@ -752,6 +875,77 @@ mod tests {
         assert_eq!(e.stored(&r), "text.txt:1:needle\n");
         let r = e.call("grep", json!({"pattern": "absent"})).await;
         assert!(r.text.contains("2 binary files skipped and not searched"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn oversized_and_binary_files_are_skipped_unread_and_reported() {
+        let e = env();
+        put(&e, "text.txt", "needle\n");
+        // A sparse file over the cap: it is never read, so this is instant and needs no disk.
+        let big = std::fs::File::create(e.ctx.workspace.join("model.bin")).unwrap();
+        big.set_len(MAX_GREP_FILE_BYTES + 1).unwrap();
+        // Binary at the very start: only the 8 KiB probe decides it.
+        std::fs::write(e.ctx.workspace.join("bin.dat"), [0u8; 4096]).unwrap();
+        let r = e.call("grep", json!({"pattern": "needle"})).await;
+        assert!(r.text.contains("1 matches in 1 files"), "{}", r.text);
+        assert!(r.text.contains("1 files skipped as too large") && r.text.contains("search is not complete"), "{}", r.text);
+        assert!(r.text.contains("1 binary files skipped"), "{}", r.text);
+        let r = e.call("grep", json!({"pattern": "absent"})).await;
+        assert!(r.text.contains("1 files over") && r.text.contains("skipped as too large and not searched"), "{}", r.text);
+        // read_text never returns the contents of a file over its cap.
+        assert!(matches!(read_text(&e.ctx.workspace.join("model.bin"), MAX_GREP_FILE_BYTES), Read::TooLarge));
+        assert!(matches!(read_text(&e.ctx.workspace.join("text.txt"), 3), Read::TooLarge));
+        assert!(matches!(read_text(&e.ctx.workspace.join("bin.dat"), MAX_GREP_FILE_BYTES), Read::Binary));
+        // The same holds for a single file named as the path.
+        let r = e.call("grep", json!({"pattern": "needle", "path": "model.bin"})).await;
+        assert!(r.text.contains("1 files skipped as too large"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn no_match_hint_visits_each_combination_once() {
+        let e = env();
+        put(&e, "plain.txt", "nothing\n");
+        put(&e, "ignored/only.txt", "zzz\n");
+        put(&e, ".gitignore", "ignored/\n");
+        for flags in [json!({"hidden": true}), json!({"no_ignore": false, "hidden": true})] {
+            let mut args = json!({"pattern": "zzz"});
+            args.as_object_mut().unwrap().extend(flags.as_object().unwrap().clone());
+            let r = e.call("grep", args).await;
+            assert_eq!(r.text.matches("more would match").count(), 1, "{}", r.text);
+            assert!(r.text.contains("1 more would match with `no_ignore: true`"), "{}", r.text);
+        }
+        let r = e.call("grep", json!({"pattern": "zzz", "no_ignore": true})).await;
+        assert!(r.text.contains("would not change this"), "{}", r.text);
+        let r = e.call("glob", json!({"pattern": "only.txt", "hidden": true})).await;
+        assert_eq!(r.text.matches("more would match").count(), 1, "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn hint_pass_stops_on_cancellation_and_on_its_budget() {
+        let e = env();
+        tree(&e);
+        let scan = Scan::new(&e.ctx, None).unwrap();
+        let base = scan.collect(false, false);
+        let limits = HintLimits { max_files: 1, max_time: Duration::from_secs(60) };
+        let spent = std::cell::Cell::new(0usize);
+        let hint = widened_hint(&scan, false, false, &base, limits, &|extra, budget| {
+            let n = extra.iter().take_while(|_| budget.spend()).count();
+            spent.set(spent.get() + n);
+            n
+        });
+        assert_eq!(spent.get(), 1, "{hint}");
+        assert!(hint.contains("limit of 1 files was reached") && hint.contains("counts may be low"), "{hint}");
+
+        let spent = std::cell::Cell::new(0usize);
+        let cancel = e.ctx.cancel.clone();
+        let hint = widened_hint(&scan, false, false, &base, HintLimits::STANDARD, &|extra, budget| {
+            cancel.cancel();
+            let n = extra.iter().take_while(|_| budget.spend()).count();
+            spent.set(spent.get() + n);
+            n
+        });
+        assert_eq!(spent.get(), 0, "{hint}");
+        assert!(hint.contains("interrupted"), "{hint}");
     }
 
     #[tokio::test]
