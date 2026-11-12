@@ -89,6 +89,12 @@ against the resolved address too. Private, loopback and link-local destinations 
 listed in `allow_private`. Every decision is recorded in the session's audit log (`loom net <session>`).
 A pack that sets `requires_restricted_network` (`vr` does) is refused while the mode is `open`.
 
+A session can also be given hosts by you while it runs. When it needs one it does not have, the agent
+calls `request_scope`; an item naming the hosts and why waits in your inbox, and the session keeps
+working. `loom scope <session> <host>...` grants them (the UI and the app have an Approve button on the
+item). The grant is recorded in the mission's ledger, applies to that mission only, and ends with the
+session. `loom net <session>` lists the hosts granted so far.
+
 ### Sandbox
 
 With `[sandbox] mode = "seatbelt"` (the default) commands run under a macOS sandbox profile:
@@ -189,10 +195,12 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom rule <session> <text...>` | set a standing rule (a ledger constraint) for the mission |
 | `loom rule <session> --withdraw <rule-id> [--reason <text>]` | withdraw a rule |
 | `loom approve <session> <text...> [--scope <text>]` | record an approval |
+| `loom scope <session> <host>... [--note <text>]` | let the mission's tools reach these hosts (one host per argument) |
+| `loom release <session> <reason...>` | accept a blocked mission as it is and close it: "closed by operator, goal not established" |
 | `loom inbox` / `loom answer <item> <text...>` | what waits for you / answer one |
 | `loom ledger <session>` | the mission ledger |
 | `loom window <session>` | what is in the model's context, and what was folded out |
-| `loom net <session> [-n <limit>]` | network requests and how each was decided |
+| `loom net <session> [-n <limit>]` | network requests and how each was decided, and the hosts you granted |
 | `loom out <handle> [--lines a:b]` | print a stored tool output |
 | `loom gc [--apply]` | delete stored outputs that nothing refers to |
 | `loom config path` / `check` / `init` | the configuration file |
@@ -210,6 +218,20 @@ Queued inputs are kept on disk (`queued/` in the session directory) until record
 daemon restart. A mission whose lead keeps no ledger (the `chat` role, for example) takes rules and
 approvals only as notes without an id, which cannot be withdrawn by id. Withdrawing an unknown rule id
 is refused by the daemon when the mission has a ledger.
+
+### Answering a blocked session
+
+A blocker or a used-up budget waits for you. In the UI and the app the item offers choices, cheapest
+first: "Keep working" (the default), "Keep working (more budget)" where a budget ran out, "Provide
+what's missing" for a blocker, and "Accept as blocked and close". Closing needs a reason you type and
+is recorded as `closed by operator, goal not established`; it is never shown as finished. From the
+terminal, `loom answer <item> <text...>` keeps it working and `loom release <session> <reason...>`
+closes it.
+
+When you answer, point at the next step instead of asking a yes/no question. "Is it blocked?" invites
+"yes". "Run the build with the staging config, then read the first failure" gives it something to do.
+A verifier that rejects a finish no longer parks the session on you: the agent gets the objection and
+continues.
 
 `loom gc` reports the stored outputs that appear in no file under `~/.loom/sessions` or
 `~/.loom/missions` and are older than one hour; `--apply` deletes them. Deleting a session's directory

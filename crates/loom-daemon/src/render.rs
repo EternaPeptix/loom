@@ -37,7 +37,8 @@
 //! - `job_registered`: `⚙ job {job_id}: {command}`; `job_settled`: `⚙ job {job_id} ended: {detail}`.
 //! - `inbox_opened`: `✉ {kind}` + ` (waiting for you)` when blocking (bold yellow), the text, the
 //!   options numbered `  1. …`, then `  answer: loom answer {item_id} "…"` (dim) unless the kind is
-//!   `Finished`.
+//!   `Finished`. A scope request (see [`scope_request_hosts`]) is `✉ scope request`, the text, `  hosts: a, b`
+//!   and `  approve: see loom inbox` (dim); it has no answer line, since answering it grants nothing.
 //! - `inbox_resolved`: `✉ answered: {answer}` (`✉ dismissed` for an empty answer).
 //! - `ledger`: `▪ ledger #{n}: {summary}` (dim).
 //! - `cache_break`: `! cache break at message {first_diff_message}: {detail}` (yellow).
@@ -64,7 +65,12 @@
 //!   ({outcome})`, else the last turn end in the words above, else `new`; ` *` appended when
 //!   `open_inbox > 0`. `CONTEXT`: `tokens(prompt_tokens)`. Empty list: `No sessions.`
 //! - `inbox_list(list, now_ms, style)`: per item `{item_id}  {kind}  {age}  {session} {title}` and
-//!   the text indented; `Nothing is waiting for you.` when empty.
+//!   the text indented, then the options numbered; `Nothing is waiting for you.` when empty. A scope
+//!   request is listed as `scope request`, with `hosts: a, b` and `approve: loom scope {session} a b`
+//!   (a host with a character the shell would read is single-quoted). A blocking `Blocker` or `Parked`
+//!   item gets the ways to answer it: `answer: loom answer {item_id} "…"` and `close as blocked: loom
+//!   release {session} "why"`; a blocker also says to name the next step, not ask a yes or no question.
+//!   `granted_hosts_line(hosts)` is the line `loom net` ends with.
 //! - `window_table(view, style)`: a summary line (`epoch {e} · about {tokens} tokens in view ·
 //!   folds at {target} down to {floor} · window {context_window or "unknown"} · last request
 //!   {prompt} in, {pct}% cached`), then per item `#{seq}  {kind}  {state}  {chars}  {pin}
@@ -84,7 +90,7 @@ use crate::wire::StatusView;
 use loom_agent::runtime::{InboxEntry, NetEntry, SessionInfo, WindowView};
 use loom_agent::session::Phase;
 use loom_core::event::{
-    Author, ChildOutcome, Event, FinishReason, InboxKind, Record, SessionOutcome, SpawnMode, ToolStatus,
+    Author, ChildOutcome, Event, FinishReason, InboxItem, InboxKind, Record, SessionOutcome, SpawnMode, ToolStatus,
     TurnEndReason,
 };
 use loom_core::weave::ItemState;
@@ -293,6 +299,34 @@ fn inbox_kind_word(kind: InboxKind) -> &'static str {
     }
 }
 
+/// The hosts a scope request asks for, when `item` is one. A scope request is the non-blocking `Approval`
+/// item the `request_scope` tool opens: its options are the requested hosts, in order, its text says why.
+/// The ui (`scopeRequestHosts`) and the app (`isScopeRequest`) detect it the same way; the mechanism must
+/// open the item with `InboxKind::Approval`, `blocking: false` and the hosts as `options`. Any other
+/// item, and an `Approval` with no hosts, is not one.
+pub fn scope_request_hosts(item: &InboxItem) -> Option<&[String]> {
+    (item.kind == InboxKind::Approval && !item.blocking && !item.options.is_empty()).then_some(item.options.as_slice())
+}
+
+/// `word` as one shell argument: as it is when it holds only plain characters, else in single quotes.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || "._:-/".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// The hosts a session has been granted, as `loom net` ends: the operator's grants, or that there are none.
+pub fn granted_hosts_line(hosts: &[String]) -> String {
+    if hosts.is_empty() {
+        return "No hosts granted by the operator.".to_string();
+    }
+    let hosts: Vec<String> = hosts.iter().map(|h| flat(h)).collect();
+    format!("Hosts granted by the operator: {}", hosts.join(", "))
+}
+
 /// The lines of `text` to print and how many were left out.
 fn limited_lines<'a>(text: &'a str, opts: &RecordOpts) -> (Vec<&'a str>, usize) {
     let all: Vec<&str> = text.lines().collect();
@@ -435,6 +469,14 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
             out.push(format!("⚙ job {} ended: {}", clean(job_id), clean(detail)));
         }
         Event::InboxOpened(item) => {
+            if let Some(hosts) = scope_request_hosts(item) {
+                out.push(paint(style, BOLD_YELLOW, "✉ scope request"));
+                push_block(&mut out, style, None, &item.text, "");
+                let hosts: Vec<String> = hosts.iter().map(|h| clean(h)).collect();
+                out.push(format!("  hosts: {}", hosts.join(", ")));
+                out.push(paint(style, DIM, "  approve: see loom inbox"));
+                return finish(out);
+            }
             let mut head = format!("✉ {}", inbox_kind_word(item.kind));
             if item.blocking {
                 head.push_str(" (waiting for you)");
@@ -622,8 +664,28 @@ pub fn inbox_list(list: &[InboxEntry], now_ms: u64, style: &Style) -> String {
             flat(entry.session.as_str()),
             flat(&entry.title)
         );
+        let item = &entry.item;
+        let scope = scope_request_hosts(item);
+        let head = if scope.is_some() { head.replacen(inbox_kind_word(item.kind), "scope request", 1) } else { head };
         out.push(cut(head.trim_end(), width_of(style)));
-        push_block(&mut out, style, None, &entry.item.text, "  ");
+        push_block(&mut out, style, None, &item.text, "  ");
+        let dim = |text: String| paint(style, DIM, &cut(&text, width_of(style)));
+        if let Some(hosts) = scope {
+            let shown: Vec<String> = hosts.iter().map(|h| flat(h)).collect();
+            out.push(format!("  hosts: {}", shown.join(", ")));
+            let args: Vec<String> = shown.iter().map(|h| shell_word(h)).collect();
+            out.push(dim(format!("  approve: loom scope {} {}", shell_word(&flat(entry.session.as_str())), args.join(" "))));
+            continue;
+        }
+        for (i, option) in item.options.iter().enumerate() {
+            out.push(format!("  {}. {}", i + 1, flat(option)));
+        }
+        if item.blocking && matches!(item.kind, InboxKind::Blocker | InboxKind::Parked) {
+            let next = if item.kind == InboxKind::Blocker { " (name the next step, not a yes or no question)" } else { "" };
+            out.push(dim(format!("  answer: loom answer {} \"…\"{next}", flat(&item.item_id))));
+            let session = shell_word(&flat(entry.session.as_str()));
+            out.push(dim(format!("  close as blocked: loom release {session} \"why\"")));
+        }
     }
     finish(out)
 }
@@ -1311,6 +1373,52 @@ mod tests {
     }
 
     #[test]
+    fn a_scope_request_shows_its_hosts_and_how_to_approve_and_no_answer_line() {
+        let item = |blocking: bool, options: Vec<&str>| InboxItem {
+            item_id: "i-7".into(),
+            kind: InboxKind::Approval,
+            text: "Needs docs.example.test to read the API reference.".into(),
+            options: options.into_iter().map(String::from).collect(),
+            blocking,
+            call_id: None,
+            reference: None,
+        };
+        let open = |i: InboxItem| render(Event::InboxOpened(i), &MONO);
+        assert_eq!(
+            open(item(false, vec!["docs.example.test", "*.cdn.test"])),
+            "✉ scope request\nNeeds docs.example.test to read the API reference.\n  hosts: docs.example.test, *.cdn.test\n  approve: see loom inbox\n"
+        );
+        // An approval that blocks, or names no hosts, is an ordinary approval.
+        assert!(open(item(true, vec!["a.test"])).starts_with("✉ approval (waiting for you)"));
+        assert!(open(item(false, vec![])).starts_with("✉ approval\n"));
+        assert_eq!(scope_request_hosts(&item(false, vec!["a.test"])), Some(&["a.test".to_string()][..]));
+        assert_eq!(scope_request_hosts(&item(true, vec!["a.test"])), None);
+        assert!(!open(item(false, vec!["a.test"])).contains('\x1b'));
+        // The listing names the exact command, quoting a host the shell would expand.
+        let mut e = entry(0);
+        e.item = item(false, vec!["docs.example.test", "*.cdn.test"]);
+        assert_eq!(
+            inbox_list(&[e], 5_000, &MONO),
+            "i-7  scope request  5s  s-a main job\n  Needs docs.example.test to read the API reference.\n  hosts: docs.example.test, *.cdn.test\n  approve: loom scope s-a docs.example.test '*.cdn.test'\n"
+        );
+    }
+
+    #[test]
+    fn a_hostile_host_is_quoted_in_the_approve_command() {
+        assert_eq!(shell_word("a.test"), "a.test");
+        assert_eq!(shell_word("*.a.test"), "'*.a.test'");
+        assert_eq!(shell_word("x';rm"), "'x'\\'';rm'");
+        assert_eq!(shell_word(""), "''");
+    }
+
+    #[test]
+    fn granted_hosts_are_listed_or_the_absence_is_said() {
+        assert_eq!(granted_hosts_line(&[]), "No hosts granted by the operator.");
+        let hosts = vec!["a.test".to_string(), "*.b.test".to_string()];
+        assert_eq!(granted_hosts_line(&hosts), "Hosts granted by the operator: a.test, *.b.test");
+    }
+
+    #[test]
     fn unshown_kinds_are_empty_and_verbose_shows_requests() {
         let request = Event::ModelRequest(ModelRequest {
             req_id: "r-1".into(),
@@ -1488,6 +1596,28 @@ mod tests {
         );
         let narrow = inbox_list(&[entry(0)], 5_000, &Style { color: false, width: 12 });
         assert_eq!(narrow.lines().next().map(|l| l.chars().count()), Some(12));
+    }
+
+    #[test]
+    fn a_blocking_blocker_or_park_offers_the_answer_and_closing_as_blocked() {
+        let with = |kind: InboxKind, blocking: bool, options: &[&str]| {
+            let mut e = entry(0);
+            e.item.kind = kind;
+            e.item.blocking = blocking;
+            e.item.options = options.iter().map(|o| o.to_string()).collect();
+            inbox_list(&[e], 5_000, &MONO)
+        };
+        assert_eq!(
+            with(InboxKind::Blocker, true, &[]),
+            "i-1  blocker  5s  s-a main job\n  May I?\n  Please.\n  answer: loom answer i-1 \"…\" (name the next step, not a yes or no question)\n  close as blocked: loom release s-a \"why\"\n"
+        );
+        let parked = with(InboxKind::Parked, true, &["Keep working", "Accept as blocked and close"]);
+        assert_eq!(
+            parked,
+            "i-1  parked  5s  s-a main job\n  May I?\n  Please.\n  1. Keep working\n  2. Accept as blocked and close\n  answer: loom answer i-1 \"…\"\n  close as blocked: loom release s-a \"why\"\n"
+        );
+        // A notice that does not block is not a park.
+        assert!(!with(InboxKind::Blocker, false, &[]).contains("loom release"));
     }
 
     fn window_item(seq: u64, state: ItemState, pinned: bool) -> WindowItem {

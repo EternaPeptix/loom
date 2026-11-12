@@ -672,6 +672,55 @@ mod tests {
         }
     }
 
+    /// The backticked words of `text` that name a tool in `known`.
+    fn tools_named(text: &str, known: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = text
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|w| known.iter().any(|k| k == w))
+            .map(str::to_string)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn scope_and_conclusion_tools_are_given_to_the_roles_whose_prompts_name_them() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let p = Packs::load(&dir).unwrap();
+        let known = crate::rtools::known_tools();
+        let has = |pack: &str, role: &str, tool: &str| p.get(pack).unwrap().roles[role].tools.iter().any(|t| t == tool);
+        for (pack, role) in [("core", "lead"), ("vr", "researcher"), ("vr", "scout")] {
+            assert!(has(pack, role, "request_scope") && has(pack, role, "conclude"), "{pack}/{role}");
+        }
+        // A read-only chat asks for scope; it concludes nothing.
+        for pack in ["core", "vr"] {
+            assert!(has(pack, "chat", "request_scope") && !has(pack, "chat", "conclude"), "{pack}/chat");
+        }
+        for (pack, role) in [("core", "worker"), ("core", "verifier"), ("vr", "judge")] {
+            assert!(!has(pack, role, "request_scope") && !has(pack, role, "conclude"), "{pack}/{role}");
+        }
+        assert!(known.iter().any(|t| t == "request_scope") && known.iter().any(|t| t == "conclude"));
+        // Every tool a role prompt names is a tool that role has, and every one is in the registry.
+        for pack in ["core", "vr"] {
+            for role in p.get(pack).unwrap().roles.values() {
+                for tool in tools_named(&role.prompt, &known) {
+                    assert!(role.tools.contains(&tool), "{pack}/{}: its prompt names `{tool}`, which it does not have", role.name);
+                }
+                assert!(role.tools.iter().all(|t| known.contains(t)), "{pack}/{}", role.name);
+            }
+        }
+        // The prompts say what the new tools are for.
+        let lead = &p.get("core").unwrap().roles["lead"].prompt;
+        assert!(lead.contains("`conclude`") && lead.contains("`request_scope`") && lead.contains("not a finish"));
+        let chat = &p.get("vr").unwrap().roles["chat"].prompt;
+        assert!(chat.contains("`request_scope`") && !chat.contains("`conclude`"));
+        let vr = &p.get("vr").unwrap().preamble;
+        assert!(vr.contains("`request_scope`") && vr.contains("`conclude`") && vr.contains("Only the operator grants scope"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_escape_rejected() {

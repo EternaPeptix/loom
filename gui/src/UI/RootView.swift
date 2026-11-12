@@ -96,7 +96,8 @@ struct ConnectionBar: View {
             }
             Spacer()
             if state.counts.running > 0 || state.counts.waiting > 0 || state.counts.active > 0 {
-                Text("\(state.counts.running) running · \(state.counts.waiting) waiting · \(state.counts.active) active")
+                Text("\(state.counts.running) running · \(state.counts.waiting) waiting · \(state.counts.active) active"
+                     + (state.counts.requests > 0 ? " · \(state.counts.requests) asking for hosts" : ""))
                     .font(.caption).foregroundStyle(state.counts.waiting > 0 ? Color.red : Color.secondary)
             }
             Text(state.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)

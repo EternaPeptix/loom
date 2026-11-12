@@ -3,7 +3,7 @@ description = "General-purpose roles: a lead that owns a mission, workers and a 
 default_role = "lead"
 
 [roles.lead]
-description = "Owns a mission end to end: plans, works, delegates, and finishes through the finish gate."
+description = "Owns a mission end to end: plans, works, delegates, concludes with a run that shows the goal met, and finishes through the finish gate."
 prompt = "roles/lead.md"
 termination = "explicit"
 may_spawn = ["worker", "verifier"]
@@ -12,7 +12,7 @@ tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
   "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search",
   "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "decide", "verify",
-  "finish", "ask_user", "report_blocker", "wait",
+  "request_scope", "conclude", "finish", "ask_user", "report_blocker", "wait",
 ]
 
 [roles.worker]
@@ -42,5 +42,5 @@ prompt = "roles/chat.md"
 termination = "free"
 tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
-  "pin", "log_search",
+  "pin", "log_search", "request_scope",
 ]

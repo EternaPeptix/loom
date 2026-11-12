@@ -9,8 +9,8 @@ There is no hook mechanism and no text-matching of shell commands anywhere in it
 
 | Role | Ends by | Writes files | Spawns | Job |
 |---|---|---|---|---|
-| `researcher` | `finish` (judge-gated) | yes | `scout`, `judge` | Owns the engagement; routes it into experiments; gates every result. |
-| `scout` | `finish` | yes | nothing | Runs one experiment; returns executed evidence or a blocker. |
+| `researcher` | `conclude`, then `finish` (judge-gated) | yes | `scout`, `judge` | Owns the engagement; routes it into experiments; gates every result. |
+| `scout` | `conclude`, then `finish` | yes | nothing | Runs one experiment; returns executed evidence or a blocker. |
 | `judge` | `verdict` | no (read-only) | nothing | Checks a proposed scope against its source, or tries to refute a finding. Never judges its own work. |
 | `chat` | a reply with no tool call | no (read-only) | nothing | Interactive, turn-by-turn assistant. |
 
@@ -31,9 +31,11 @@ host. A `vr` session is refused when the config says `[network] mode = "open"`; 
 operator to use `allowlist` or `deny_all` and restart the daemon. The check runs when a session is
 created and each time one is restored.
 
-To let an engagement reach its targets, set `[network] mode = "allowlist"` with `allow` listing exactly
-the authorized hosts, restart the daemon, and record the authorization as a standing rule
-(`loom rule <session> "..."`). Names are resolved by the proxy itself; private, loopback and
+To let an engagement reach its targets, the agent calls `request_scope` with the hosts and why. The
+request waits in your inbox without stopping the session; you approve it with `loom scope <session>
+<host>...` (or the Approve button in the UI). The grant is per session: it is recorded in the ledger with
+a standing rule, applies to that session's mission only, and ends with it. No config edit or restart is
+needed. Names are resolved by the proxy itself; private, loopback and
 link-local addresses are refused unless `allow_private` lists them. Every decision is in
 `loom net <session>`. The policy applies to the whole daemon, not to one session.
 
@@ -42,9 +44,9 @@ link-local addresses are refused unless `allow_private` lists them. Every decisi
 - **Scope must be qualified before anything else.** The boundary is not text-matched. Outbound
   traffic goes through loom's egress proxy under an OS sandbox that permits no other route, and the
   default policy reaches nothing. The researcher has a **judge** check a proposed scope against the
-  programme or authorization the operator named; the operator sets the matching network policy and
-  records it as a standing **constraint**. Widening scope is `ask_user`, then the operator, then a
-  constraint, never the agent's call.
+  programme or authorization the operator named; the researcher then calls `request_scope`, and the operator's
+  approval is recorded as a scope grant and a standing **constraint**. Widening scope is the operator's
+  call, never the agent's.
 - **The judge is a different agent.** The researcher has `verify_finish = true` and `verifier = "judge"`:
   a `read_only` role of the same pack with the `verdict` tool. Its `finish` is delivered only after the
   judge accepts it. A finding is attacked by an agent that did not produce it, and the finish gate is

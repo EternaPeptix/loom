@@ -807,7 +807,7 @@ function inboxCard(entry, resolved) {
   const item = entry.item;
   const card = el("div", "inbox-card");
   const h = el("div", "ih");
-  add(h, el("span", "kind", C.inboxKindWords(item.item_kind)));
+  add(h, el("span", "kind", C.inboxCardKind(item)));
   if (item.blocking) add(h, el("span", "warn", "blocking"));
   if (entry.title) add(h, link(entry.title, "#/s/" + encodeURIComponent(entry.session)));
   if (entry.opened_ms) add(h, el("span", "dim", C.age(S.now, entry.opened_ms)));
@@ -834,9 +834,29 @@ function inboxCard(entry, resolved) {
       for (const b of buttons) b.disabled = false;
     }
   };
+  const scopeHosts = C.scopeRequestHosts(item);
+  const park = C.parkChoices(item);
   if (item.item_kind === "finished") {
     const dismiss = btn("Dismiss", "", () => send("", [dismiss]));
     add(form, dismiss);
+  } else if (scopeHosts) {
+    // The operator grants; the agent only asked. Approving grants the hosts, then dismisses the item.
+    add(form, el("div", "hosts", "Hosts: " + scopeHosts.join(", ")));
+    const approve = btn("Approve hosts", "primary", async () => {
+      const req = C.scopeRequest(entry.session, scopeHosts, "approved from the inbox");
+      if (req.error) return fail(err, req.error);
+      approve.disabled = true;
+      err.hidden = true;
+      try {
+        await api("POST", req.path, req.body);
+      } catch (e) {
+        approve.disabled = false;
+        return fail(err, e.message);
+      }
+      await send("", [approve, dismiss]);
+    });
+    const dismiss = btn("Dismiss", "", () => send("", [approve, dismiss]));
+    add(form, add(el("div", "opts"), approve, dismiss));
   } else {
     const ta = el("textarea");
     ta.rows = 2;
@@ -847,7 +867,9 @@ function inboxCard(entry, resolved) {
     };
     ta.addEventListener("input", sync);
     sync();
-    if ((item.options || []).length) {
+    if (park) {
+      add(form, parkControls(entry, park, ta, sync, send, err));
+    } else if ((item.options || []).length) {
       const opts = el("div", "opts");
       for (const o of item.options) {
         add(opts, btn(o, "", () => {
@@ -859,9 +881,63 @@ function inboxCard(entry, resolved) {
       add(form, opts);
     }
     add(form, ta, sendBtn);
+    if (park) add(form, el("p", "dim", C.PARK_HELP));
   }
   add(card, form, err);
   return card;
+}
+
+function fail(err, text) {
+  err.textContent = text;
+  err.hidden = false;
+}
+
+/**
+ * The choices of a blocked or parked session. "Accept as blocked and close" takes two steps: it opens a
+ * row asking for the reason, and only the row's own button records the release.
+ */
+function parkControls(entry, choices, ta, sync, send, err) {
+  const box = el("div", "park");
+  const opts = el("div", "opts");
+  const reason = ruleInput("Why it is closed without the goal established (required)");
+  const confirm = el("div", "rule-row");
+  confirm.hidden = true;
+  const close = btn("Close as blocked", "small", async () => {
+    const req = C.releaseRequest(entry.session, reason.value);
+    if (req.error) return fail(err, req.error);
+    close.disabled = true;
+    err.hidden = true;
+    try {
+      await api("POST", req.path, req.body);
+      // The release closes the mission and its open items; the lists are read again to show it.
+      notice(C.RELEASED_WORDS + ".");
+      loadInbox();
+      loadLedger();
+    } catch (e) {
+      close.disabled = false;
+      fail(err, e.message);
+    }
+  });
+  add(confirm, reason, close, btn("Keep it open", "small", () => {
+    confirm.hidden = true;
+  }));
+  for (const c of choices) {
+    add(opts, btn(c.label, "", () => {
+      err.hidden = true;
+      if (c.action === "answer") {
+        ta.value = c.answer;
+        sync();
+        send(ta.value, []);
+      } else if (c.action === "provide") {
+        ta.focus();
+      } else {
+        confirm.hidden = false;
+        reason.focus();
+      }
+    }));
+  }
+  add(box, opts, confirm);
+  return box;
 }
 
 function showInbox() {
@@ -946,7 +1022,10 @@ function setTab(t) {
 function loadTab() {
   if (S.tab === "ledger") loadLedger();
   else if (S.tab === "context") loadWindow();
-  else if (S.tab === "network" && S.net.length === 0) loadNet();
+  else if (S.tab === "network") {
+    if (S.net.length === 0) loadNet();
+    if (S.ledger.stale || !S.ledger.model) loadLedger();
+  }
 }
 
 async function loadLedger() {
@@ -961,7 +1040,7 @@ async function loadLedger() {
   } catch (e) {
     S.ledger = { mission, model: null, error: e.message, stale: false };
   }
-  if (S.tab === "ledger") want("right");
+  if (S.tab === "ledger" || S.tab === "network") want("right");
 }
 
 async function loadWindow() {
@@ -1132,6 +1211,8 @@ function renderLedger(p) {
   const frag = document.createDocumentFragment();
   for (const n of m.notices) frag.append(el("p", "warn", n));
   frag.append(h2("Goal"), el("div", "", m.goal || "(not set)"));
+  if (m.outcome) frag.append(el("p", "warn", m.outcome.words + (m.outcome.detail ? ": " + m.outcome.detail : "")));
+  frag.append(h2("Hosts granted"), el("div", m.scope.length ? "" : "dim", m.scope.length ? m.scope.join(", ") : "None. A tool that needs one asks you through the inbox."));
   if (m.constraints.length) {
     frag.append(h2("Constraints"), ul(...m.constraints.map((c) => li(el("span", "k", c.id), el("span", c.retired ? "retired" : "", c.text), c.retired ? el("span", "dim", ` (retired: ${c.retired})`) : null))));
   }
@@ -1244,8 +1325,9 @@ function numItem(label, value) {
 function renderNetwork(p) {
   // A failed load (a damaged audit log among them) stays in view next to the decisions that arrive live.
   const error = S.netError ? [el("p", "error", S.netError)] : [];
+  const granted = S.ledger.model ? [el("p", "dim", C.scopeLine(S.ledger.model))] : [];
   if (S.net.length === 0) {
-    return p.replaceChildren(...(error.length ? error : [el("p", "dim", "No network decisions recorded for this session.")]));
+    return p.replaceChildren(...granted, ...(error.length ? error : [el("p", "dim", "No network decisions recorded for this session.")]));
   }
   const t = el("table", "net");
   for (const e of S.net.slice(-500).reverse().map(C.netRow)) {
@@ -1253,7 +1335,7 @@ function renderNetwork(p) {
     add(tr, el("td", "", clock(e.ts)), el("td", "", e.verdict), el("td", "", e.method), el("td", "", e.target), el("td", "", e.rule));
     t.append(tr);
   }
-  p.replaceChildren(...error, t);
+  p.replaceChildren(...granted, ...error, t);
 }
 
 function budgetWords(b) {

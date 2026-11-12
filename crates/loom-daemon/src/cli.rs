@@ -40,11 +40,19 @@
 //!   the lead is in a turn and records it at its next step, not while a tool call is running; check
 //!   with loom ledger {lead}`). It also names a stock scope or reason that was recorded for a blank
 //!   one, and says when the mission keeps no ledger (the rule is then a note without an id).
+//! - `scope <session> <host>… [--note <text>]`: `client.grant_scope`, one host per argument (`'*.example.com'`
+//!   quoted); the operator's grant of network hosts to the mission, for the session's lifetime. Prints
+//!   `scope granted for {lead}: a, b` (`scope_line`, from the daemon's receipt), and says when the mission
+//!   keeps no ledger. The command an agent's scope request (`loom inbox`) asks the operator to run.
+//!   `release <session> <reason…>` (`-` = standard input): `client.release`; the operator closes the mission
+//!   without the goal established. Prints `closed by operator, goal not established: release sent to {lead}`
+//!   (`release_line`). A blank reason is refused.
 //! - `gc [--apply]`: `client.gc`; one line with what was examined, kept and would be (or was) deleted.
 //! - `inbox`: `render::inbox_list`. `answer <item> <text…>`: `client.answer`; `answered {item}`.
 //! - `ledger <session|mission>`: the ledger's `markdown`, then one line for each of `LedgerView::notices`
 //!   (entries written by a newer loom that are not shown, an ignored torn tail, entries past the head record).
-//! - `window <session>`: `render::window_table`. `net <session> [-n <limit>]`: `render::net_table`.
+//! - `window <session>`: `render::window_table`. `net <session> [-n <limit>]`: `render::net_table`, then
+//!   `render::granted_hosts_line` from the mission's ledger (left out when the ledger cannot be read).
 //! - `out <handle> [--lines <a>:<b>]`: the stored output's lines (all of it, paged 5 000 lines at a
 //!   time, without `--lines`), passed through `render::clean`.
 //! - `config path` prints the config file's path; `config check` loads and checks it (`ok`, or the
@@ -82,7 +90,7 @@
 use crate::client::{self, Client};
 use crate::render::{self, RecordOpts, Style};
 use clap::{Args, Parser, Subcommand};
-use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt};
+use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt};
 use loom_agent::session::Phase;
 use loom_core::config::{Config, Paths};
 use loom_core::event::{Budget, Event, Record, Seq, SessionOutcome, TurnEndReason};
@@ -174,6 +182,10 @@ pub enum Command {
     Rule(RuleArgs),
     /// Record an approval for a mission
     Approve(ApproveArgs),
+    /// Let a mission's tools reach hosts (the operator's grant; ends with the session)
+    Scope(ScopeArgs),
+    /// Close a mission without the goal established, giving the reason
+    Release(ReleaseArgs),
     /// Delete stored tool outputs that no session or mission refers to any more (dry run unless --apply)
     ///
     /// Collects stored outputs older than one hour whose id or `out:` handle appears in no file under the
@@ -349,6 +361,26 @@ pub struct ApproveArgs {
     pub scope: Option<String>,
     /// What is approved ("-": read standard input)
     pub text: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ScopeArgs {
+    /// A session id, the beginning of one, or `last`
+    pub session: String,
+    /// Why the hosts are granted (kept in the ledger)
+    #[arg(long)]
+    pub note: Option<String>,
+    /// The hosts, one per argument, such as api.example.com or '*.example.com'
+    #[arg(required = true)]
+    pub hosts: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ReleaseArgs {
+    /// A session id, the beginning of one, or `last`
+    pub session: String,
+    /// Why the result is accepted without the goal established ("-": read standard input)
+    pub reason: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -556,6 +588,27 @@ fn receipt_line(what: &str, stock_of: &str, r: &RuleReceipt) -> String {
         parts.push(format!("check with loom ledger {lead}"));
     }
     parts.join("; ")
+}
+
+/// The line printed once the daemon accepted a scope grant.
+fn scope_line(r: &ScopeReceipt) -> String {
+    let mut line = format!("scope granted for {}: {}", r.lead.as_str(), r.hosts.join(", "));
+    if !r.ledger {
+        line.push_str("; this mission keeps no ledger, so the grant is not listed");
+    }
+    line
+}
+
+/// The line printed once the daemon accepted a release: the outcome in words, then what the lead was sent.
+fn release_line(r: &RuleReceipt) -> String {
+    let sent = receipt_line("release", "", r);
+    format!("closed by operator, goal not established: {sent}")
+}
+
+/// The hosts the operator granted the mission of `session`, or `None` when its ledger cannot be read.
+async fn granted_hosts_of(c: &Client, session: &str) -> Option<Vec<String>> {
+    let mission = c.mission_of(session).await.ok()?;
+    Some(c.ledger(&mission).await.ok()?.state.granted_hosts())
 }
 
 fn non_zero(n: u32) -> Option<u32> {
@@ -1024,6 +1077,19 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             let receipt = c.approve(&id, &text, a.scope.as_deref().unwrap_or("")).await?;
             outln(&receipt_line("approval", "scope", &receipt)).map(|()| 0)
         }
+        Command::Scope(a) => {
+            let c = client_of(&paths)?;
+            let id = c.resolve(&a.session).await?;
+            let receipt = c.grant_scope(&id, &a.hosts, a.note.as_deref()).await?;
+            outln(&scope_line(&receipt)).map(|()| 0)
+        }
+        Command::Release(a) => {
+            let reason = read_message(&a.reason, "reason")?;
+            let c = client_of(&paths)?;
+            let id = c.resolve(&a.session).await?;
+            let receipt = c.release(&id, &reason).await?;
+            outln(&release_line(&receipt)).map(|()| 0)
+        }
         Command::Gc(a) => {
             let r = client_of(&paths)?.gc(a.apply).await?;
             let (verb, hint) = if a.apply { ("deleted", "") } else { ("would delete", "\nRun `loom gc --apply` to delete them.") };
@@ -1067,7 +1133,11 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             let c = client_of(&paths)?;
             let id = c.resolve(&a.session).await?;
             let entries = c.net(&id, a.limit).await?;
-            block(&render::net_table(&entries, &style())).map(|()| 0)
+            let mut text = render::net_table(&entries, &style());
+            if let Some(hosts) = granted_hosts_of(&c, &a.session).await {
+                text.push_str(&format!("{}\n", render::granted_hosts_line(&hosts)));
+            }
+            block(&text).map(|()| 0)
         }
         Command::Out(a) => {
             let range = a.lines.as_deref().map(parse_lines).transpose()?;
@@ -1479,6 +1549,15 @@ mod tests {
         };
         assert_eq!((a.text, a.scope.as_deref()), (words(&["ship", "it"]), Some("staging")));
         rejected(&["approve"]);
+        let Command::Scope(a) = ok(&["scope", "last", "docs.example.test", "*.cdn.test"]) else { panic!("not scope") };
+        assert_eq!((a.session.as_str(), a.hosts, a.note), ("last", words(&["docs.example.test", "*.cdn.test"]), None));
+        let Command::Scope(a) = ok(&["scope", "s-1", "a.test", "--note", "for the docs"]) else { panic!("not scope") };
+        assert_eq!((a.hosts, a.note.as_deref()), (words(&["a.test"]), Some("for the docs")));
+        rejected(&["scope"]);
+        rejected(&["scope", "s-1"]);
+        let Command::Release(a) = ok(&["release", "s-1", "target", "is", "gone"]) else { panic!("not release") };
+        assert_eq!((a.session.as_str(), a.reason), ("s-1", words(&["target", "is", "gone"])));
+        rejected(&["release"]);
         assert!(matches!(ok(&["gc"]), Command::Gc(GcArgs { apply: false })));
         assert!(matches!(ok(&["gc", "--apply"]), Command::Gc(GcArgs { apply: true })));
         rejected(&["gc", "--force"]);
@@ -1553,6 +1632,25 @@ mod tests {
         let help = parse(&["rule", "--help"]).unwrap_err().to_string();
         let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(help.contains("say why with --reason"), "{help}");
+    }
+
+    #[test]
+    fn scope_and_release_lines_say_what_was_granted_and_how_the_mission_closed() {
+        let scope = |ledger: bool| ScopeReceipt {
+            lead: SessionId::from("s-1"),
+            hosts: vec!["a.test".to_string(), "*.b.test".to_string()],
+            ledger,
+        };
+        assert_eq!(scope_line(&scope(true)), "scope granted for s-1: a.test, *.b.test");
+        assert_eq!(
+            scope_line(&scope(false)),
+            "scope granted for s-1: a.test, *.b.test; this mission keeps no ledger, so the grant is not listed"
+        );
+        let release = |queued: bool| RuleReceipt { lead: SessionId::from("s-1"), queued, ledger: true, stock: None };
+        assert_eq!(release_line(&release(false)), "closed by operator, goal not established: release sent to s-1");
+        assert!(release_line(&release(true)).starts_with("closed by operator, goal not established: release queued for s-1"));
+        // A blank reason is refused before anything is sent.
+        assert_eq!(read_message(&words(&["  "]), "reason").unwrap_err(), "The reason is empty.");
     }
 
     #[test]

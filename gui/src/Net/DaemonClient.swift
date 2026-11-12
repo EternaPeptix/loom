@@ -35,6 +35,13 @@ final class DaemonClient: @unchecked Sendable {
         var item_kind: String?
         var text: String?
         var blocking: Bool?
+        /// For a scope request, the hosts it asks for.
+        var options: [String]?
+        /// A scope request is a non-blocking approval item whose options are the hosts. It waits for
+        /// the operator without stopping the session; the page has the Approve button.
+        var isScopeRequest: Bool {
+            item_kind == "approval" && blocking == false && !(options ?? []).isEmpty
+        }
         /// An explicit `blocking` wins; when absent, the kinds that need a human count as blocking.
         var isBlocking: Bool {
             if let b = blocking { return b }
@@ -342,7 +349,8 @@ final class DaemonClient: @unchecked Sendable {
         let live = sessions.filter { $0.archived != true }
         return Counts(running: live.filter { $0.phase == "running" }.count,
                       waiting: inbox.filter { $0.item.isBlocking }.count,
-                      active: live.filter { $0.phase != "ended" }.count)
+                      active: live.filter { $0.phase != "ended" }.count,
+                      requests: inbox.filter { $0.item.isScopeRequest }.count)
     }
 
     // MARK: SSE parsing (pure)
@@ -595,14 +603,15 @@ final class DaemonClient: @unchecked Sendable {
         """.utf8)
         let inbox = Data("""
         [{"session":"s1","mission":"m","title":"t","opened_ms":1,"item":{"item_id":"i1","item_kind":"question","text":"q?","blocking":true}},
-         {"session":"s3","title":"t","item":{"item_id":"i2","item_kind":"finished","text":"done","blocking":false}}]
+         {"session":"s3","title":"t","item":{"item_id":"i2","item_kind":"finished","text":"done","blocking":false}},
+         {"session":"s1","title":"t","item":{"item_id":"i3","item_kind":"approval","text":"needs a host","blocking":false,"options":["a.example.test"]}}]
         """.utf8)
         let ss = decodeList(SessionLite.self, from: sessions) ?? []
         let ii = decodeList(InboxLite.self, from: inbox) ?? []
         chk(ss.count == 3, "lossy session decode kept \(ss.count)")
-        chk(ii.count == 2, "inbox decode kept \(ii.count)")
+        chk(ii.count == 3, "inbox decode kept \(ii.count)")
         let c = derive(sessions: ss, inbox: ii)
-        chk(c == Counts(running: 1, waiting: 1, active: 2), "derive: \(c)")
+        chk(c == Counts(running: 1, waiting: 1, active: 2, requests: 1), "derive: \(c)")
 
         // Event folding.
         var m = Model()
