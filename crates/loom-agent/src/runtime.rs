@@ -2909,20 +2909,33 @@ impl Runtime {
     /// audit, journals, job output), and every blob younger than `min_age` (default one hour) when the scan
     /// began. Only the rest is deleted, and only with `apply`; otherwise the report says what would be.
     /// Removing a session's directory is what makes its outputs collectable (those that another session's or a
-    /// mission's files still name stay). Links below a session or mission directory are not followed. Any
-    /// file that cannot be read aborts the collection before anything is deleted.
+    /// mission's files still name stay). Session temp directories are not read, links below a session or
+    /// mission directory are not followed, and FIFOs, sockets and devices are not opened (`scan_tree_for_ids`).
+    /// A file larger than `GC_FILE_MAX` (4 GiB), a scan that takes longer than `GC_SCAN_TIME` (5 minutes), and
+    /// anything that cannot be read abort the collection before anything is deleted.
     pub async fn gc(&self, apply: bool, min_age: Option<Duration>) -> Result<loom_core::blob::SweepReport, String> {
+        self.gc_within(apply, min_age, GC_FILE_MAX, GC_SCAN_TIME).await
+    }
+
+    /// `gc` whose scan reads at most `file_max` bytes of one file and stops after `time`.
+    async fn gc_within(
+        &self,
+        apply: bool,
+        min_age: Option<Duration>,
+        file_max: u64,
+        time: Duration,
+    ) -> Result<loom_core::blob::SweepReport, String> {
         let blobs = self.inner.blobs.clone();
-        let roots = [self.inner.paths.sessions_dir(), self.inner.paths.missions_dir()];
+        // Only session directories have a temp directory.
+        let roots = [(self.inner.paths.sessions_dir(), true), (self.inner.paths.missions_dir(), false)];
         let min_age = min_age.unwrap_or(loom_core::blob::DEFAULT_GC_MIN_AGE);
         tokio::task::spawn_blocking(move || {
             let started = std::time::Instant::now();
+            let bounds = ScanBounds { file_max, time, started };
             let stored = blobs.ids().map_err(|e| format!("cannot list the blob store ({e}); nothing was collected."))?;
             let mut keep = HashSet::new();
-            for root in &roots {
-                scan_tree_for_ids(root, &stored, &mut keep).map_err(|(path, e)| {
-                    format!("cannot read {} ({e}); nothing was collected. Fix or remove it and run it again.", path.display())
-                })?;
+            for (root, temp_dirs) in &roots {
+                scan_tree_for_ids(root, *temp_dirs, &stored, &mut keep, &bounds)?;
             }
             // Ages count from the start of the scan: a blob stored since then (so not in `stored`), or stored
             // again, is kept whatever names it.
@@ -3154,49 +3167,177 @@ impl Runtime {
     }
 }
 
+/// The most a collection reads of one file under the sessions and missions directories. A larger file (a sparse
+/// file can claim any size) aborts the collection without being read.
+const GC_FILE_MAX: u64 = 4 << 30;
+
+/// How long a collection may spend reading the sessions and missions directories before it aborts.
+const GC_SCAN_TIME: Duration = Duration::from_secs(300);
+
+/// What one collection's scan may read: at most `file_max` bytes of one file, until `time` after `started`.
+struct ScanBounds {
+    file_max: u64,
+    time: Duration,
+    started: std::time::Instant,
+}
+
+/// Why a scan stopped before the end.
+enum ScanStop {
+    Unreadable(std::io::Error),
+    TooLarge,
+    OutOfTime,
+}
+
+impl ScanBounds {
+    fn out_of_time(&self) -> bool {
+        self.started.elapsed() >= self.time
+    }
+
+    /// The sentence for a scan that stopped at `path`.
+    fn stopped(&self, path: &Path, why: ScanStop) -> String {
+        let path = path.display();
+        match why {
+            ScanStop::Unreadable(e) => {
+                format!("cannot read {path} ({e}); nothing was collected. Fix or remove it and run it again.")
+            }
+            ScanStop::TooLarge => format!(
+                "cannot read {path} (it is larger than {} bytes, the most a collection reads of one file); nothing was \
+                 collected. Remove it, or the session or mission it belongs to, and run it again.",
+                self.file_max
+            ),
+            ScanStop::OutOfTime => format!(
+                "stopped at {path}: reading the sessions and missions took longer than {} seconds; nothing was \
+                 collected. Remove the sessions you no longer need and run it again.",
+                self.time.as_secs()
+            ),
+        }
+    }
+}
+
+/// A file being scanned. A read past `file_max` bytes or after the time is up fails, and `stop` says which.
+struct BoundedRead<'a> {
+    file: std::fs::File,
+    read: u64,
+    bounds: &'a ScanBounds,
+    stop: Option<ScanStop>,
+}
+
+impl std::io::Read for BoundedRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let stop = if self.bounds.out_of_time() {
+            ScanStop::OutOfTime
+        } else {
+            let n = std::io::Read::read(&mut self.file, buf)?;
+            self.read = self.read.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+            if self.read <= self.bounds.file_max {
+                return Ok(n);
+            }
+            ScanStop::TooLarge
+        };
+        self.stop = Some(stop);
+        Err(std::io::Error::other("the scan stopped"))
+    }
+}
+
+/// Whether an error means there is nothing at a path to read: it is gone, it dangles, or it is a link that loops
+/// or that `O_NOFOLLOW` did not follow.
+fn is_absent(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound || matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR))
+}
+
+/// Open `path` for reading, with the metadata of what the handle holds. A link there is followed only with
+/// `follow`, and the open never blocks (a FIFO does not wait for a writer).
+fn open_unblocked(path: &Path, follow: bool) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let flags = libc::O_NONBLOCK | libc::O_NOCTTY | if follow { 0 } else { libc::O_NOFOLLOW };
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(path)?;
+    let meta = file.metadata()?;
+    Ok((file, meta))
+}
+
 /// Add to `keep` every stored blob that a regular file below `root` names (`scan_ids`). A missing `root` is an
-/// empty tree. A link is followed only when it is an entry of `root` itself (a session or mission directory);
-/// below that, links are skipped, so the walk stays in the tree and ends whatever commands left in their
-/// scratch directories. What cannot be read is an error carrying its path.
+/// empty tree; a `root` that is not a directory, or that cannot be opened for any other reason (a link that
+/// loops, say), stops the scan. An entry of `root` itself is read through a link (a session or mission directory
+/// kept elsewhere), and is passed over only when it is gone, dangles or loops. Below that no link is followed:
+/// every entry is opened with `O_NOFOLLOW` and read as what the open handle holds, so one replaced by a link
+/// after it was listed is passed over too. Nothing blocks: FIFOs, sockets and devices are not opened, and opens
+/// do not wait. With `temp_dirs`, the `tmp` directory of each entry of `root` (a session's temp dir: the one
+/// directory of the tree a sandboxed command can change, and nothing the harness wrote) is not read. A directory
+/// is checked through its handle and then listed by its path; outside the temp dirs no command can put a link in
+/// its place in between. The scan keeps to `bounds`; when it cannot finish, the error is the sentence that says
+/// where and why.
 fn scan_tree_for_ids(
     root: &Path,
+    temp_dirs: bool,
     stored: &loom_core::blob::StoredIds,
     keep: &mut HashSet<String>,
-) -> Result<(), (PathBuf, std::io::Error)> {
-    use std::io::ErrorKind::NotFound;
-    let mut dirs = vec![root.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        let entries = match std::fs::read_dir(&dir) {
+    bounds: &ScanBounds,
+) -> Result<(), String> {
+    // What to read and its depth below `root`.
+    let mut todo = vec![(root.to_path_buf(), 0usize)];
+    while let Some((path, depth)) = todo.pop() {
+        if bounds.out_of_time() {
+            return Err(bounds.stopped(&path, ScanStop::OutOfTime));
+        }
+        let unreadable = |e: std::io::Error| bounds.stopped(&path, ScanStop::Unreadable(e));
+        // Gone meanwhile (a session directory being removed), or, below the root, a link: an entry of `root`
+        // that dangles or loops, or an entry further down that was replaced by one since it was listed.
+        let nothing_there = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound || (depth > 0 && is_absent(e));
+        let (file, meta) = match open_unblocked(&path, depth <= 1) {
+            Ok(opened) => opened,
+            Err(e) if nothing_there(&e) => continue,
+            Err(e) => return Err(unreadable(e)),
+        };
+        if depth == 0 && !meta.is_dir() {
+            return Err(unreadable(std::io::Error::from_raw_os_error(libc::ENOTDIR)));
+        }
+        if meta.is_file() {
+            if meta.len() > bounds.file_max {
+                return Err(bounds.stopped(&path, ScanStop::TooLarge));
+            }
+            let mut reader = BoundedRead { file, read: 0, bounds, stop: None };
+            if let Err(e) = loom_core::blob::scan_ids(&mut reader, stored, keep) {
+                return Err(bounds.stopped(&path, reader.stop.take().unwrap_or(ScanStop::Unreadable(e))));
+            }
+            continue;
+        }
+        // Not a directory either: a FIFO, socket or device put in the place of what was listed.
+        if !meta.is_dir() {
+            continue;
+        }
+        drop(file);
+        let entries = match std::fs::read_dir(&path) {
             Ok(e) => e,
-            // Vanished while scanning (a session directory being removed): nothing there to keep.
-            Err(e) if e.kind() == NotFound => continue,
-            Err(e) => return Err((dir, e)),
+            Err(e) if nothing_there(&e) => continue,
+            Err(e) => return Err(unreadable(e)),
         };
         for entry in entries {
-            let entry = entry.map_err(|e| (dir.clone(), e))?;
-            let path = entry.path();
-            let kind = match entry.file_type() {
-                // A dangling or looping link at the top is nothing to read.
-                Ok(t) if t.is_symlink() && dir == root => match std::fs::metadata(&path) {
-                    Ok(m) => m.file_type(),
-                    Err(_) => continue,
-                },
+            if bounds.out_of_time() {
+                return Err(bounds.stopped(&path, ScanStop::OutOfTime));
+            }
+            let entry = entry.map_err(unreadable)?;
+            let child = entry.path();
+            let listed = match entry.file_type() {
                 Ok(t) => t,
-                Err(e) if e.kind() == NotFound => continue,
-                Err(e) => return Err((path, e)),
+                Err(e) if is_absent(&e) => continue,
+                Err(e) => return Err(bounds.stopped(&child, ScanStop::Unreadable(e))),
             };
-            if kind.is_dir() {
-                dirs.push(path);
-            } else if kind.is_file() {
-                let file = match std::fs::File::open(&path) {
-                    Ok(f) => f,
-                    Err(e) if e.kind() == NotFound => continue,
-                    Err(e) => return Err((path, e)),
-                };
-                // Replaced since it was listed by a link to something that is not a regular file: not read.
-                if file.metadata().is_ok_and(|m| m.is_file()) {
-                    loom_core::blob::scan_ids(file, stored, keep).map_err(|e| (path, e))?;
+            let kind = if !listed.is_symlink() {
+                listed
+            } else if depth > 0 {
+                continue;
+            } else {
+                match std::fs::metadata(&child) {
+                    Ok(m) => m.file_type(),
+                    Err(e) if is_absent(&e) => continue,
+                    Err(e) => return Err(bounds.stopped(&child, ScanStop::Unreadable(e))),
                 }
+            };
+            if temp_dirs && depth == 1 && entry.file_name() == "tmp" {
+                continue;
+            }
+            if kind.is_dir() || kind.is_file() {
+                todo.push((child, depth.saturating_add(1)));
             }
         }
     }
@@ -5415,21 +5556,24 @@ mod tests {
         let e = env(Script::new(|_, _| finish("ok"))).await;
         let (home, store) = (e.dir.path().join("home"), e.rt.blobs().clone());
         let (in_log, outside, in_linked) = (old_blob(&store, "log\n"), old_blob(&store, "out\n"), old_blob(&store, "ln\n"));
-        // What a command can leave in its scratch directory: a link to itself, two links to `.`, a dangling
+        // Links below a session directory are not followed: a link to itself, two links to `.`, a dangling
         // link, and links to a directory and a file outside that name a blob.
         let s1 = home.join("sessions").join("s-gc1");
-        let tmp = s1.join("tmp");
-        std::fs::create_dir_all(&tmp).unwrap();
+        let sub = s1.join("jobs");
+        std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(s1.join("log.jsonl"), format!("{{\"blob\":\"{in_log}\"}}\n")).unwrap();
         let out = e.dir.path().join("outside");
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("names.txt"), &outside).unwrap();
-        symlink("loop", tmp.join("loop")).unwrap();
-        symlink(".", tmp.join("here")).unwrap();
-        symlink(".", tmp.join("again")).unwrap();
-        symlink("/nonexistent-loom-target", tmp.join("dangling")).unwrap();
-        symlink(&out, tmp.join("out")).unwrap();
-        symlink(out.join("names.txt"), tmp.join("names.txt")).unwrap();
+        symlink("loop", sub.join("loop")).unwrap();
+        symlink(".", sub.join("here")).unwrap();
+        symlink(".", sub.join("again")).unwrap();
+        symlink("/nonexistent-loom-target", sub.join("dangling")).unwrap();
+        symlink(&out, sub.join("out")).unwrap();
+        symlink(out.join("names.txt"), sub.join("names.txt")).unwrap();
+        // The temp dir, which commands write, is not read at all: what is in it names nothing.
+        std::fs::create_dir_all(s1.join("tmp")).unwrap();
+        std::fs::write(s1.join("tmp").join("names.txt"), &outside).unwrap();
         // A session directory that is itself a link is read; a looping link beside it is nothing.
         let elsewhere = e.dir.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
@@ -5442,7 +5586,7 @@ mod tests {
         assert!(store.read_all(&BlobId(outside)).is_err());
         assert!(store.read_all(&BlobId(in_log)).is_ok() && store.read_all(&BlobId(in_linked)).is_ok());
         // A file that cannot be read stops the collection, and the error names it (not when tests run as root).
-        let locked = tmp.join("locked.txt");
+        let locked = sub.join("locked.txt");
         std::fs::write(&locked, "x").unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read(&locked).is_err() {
@@ -5452,6 +5596,126 @@ mod tests {
         }
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
         e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gc_passes_over_a_dangling_top_level_link_and_stops_at_one_it_cannot_follow() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let (sessions, store) = (e.dir.path().join("home").join("sessions"), e.rt.blobs().clone());
+        let named = old_blob(&store, "named\n");
+        symlink("/nonexistent-loom-target", sessions.join("s-gone")).unwrap();
+        assert_eq!(e.rt.gc(false, None).await.unwrap().collected, 1);
+        // A session directory kept behind a directory that cannot be searched: the link cannot be followed.
+        let locked = e.dir.path().join("locked");
+        std::fs::create_dir_all(locked.join("s-gc9")).unwrap();
+        std::fs::write(locked.join("s-gc9").join("log.jsonl"), &named).unwrap();
+        let link = sessions.join("s-gc9");
+        symlink(locked.join("s-gc9"), &link).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Not when tests run as root.
+        if std::fs::metadata(&link).is_err() {
+            let err = e.rt.gc(true, None).await.unwrap_err();
+            assert!(err.starts_with(&format!("cannot read {} (", link.display())), "{err}");
+            assert!(err.contains("nothing was collected"), "{err}");
+            assert!(store.read_all(&BlobId(named.clone())).is_ok());
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Readable again: its log names the blob, which stays.
+        assert_eq!(e.rt.gc(true, None).await.unwrap().collected, 0);
+        assert!(store.read_all(&BlobId(named)).is_ok());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gc_that_cannot_finish_its_scan_says_where_and_why_and_deletes_nothing() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let (sessions, store) = (e.dir.path().join("home").join("sessions"), e.rt.blobs().clone());
+        let orphan = old_blob(&store, "orphan\n");
+        let big = sessions.join("s-gc1").join("log.jsonl");
+        std::fs::create_dir_all(sessions.join("s-gc1")).unwrap();
+        std::fs::write(&big, "x".repeat(100)).unwrap();
+        let too_large = |max: u64| {
+            format!(
+                "cannot read {} (it is larger than {max} bytes, the most a collection reads of one file); nothing was \
+                 collected. Remove it, or the session or mission it belongs to, and run it again.",
+                big.display()
+            )
+        };
+        assert_eq!(e.rt.gc_within(true, None, 64, GC_SCAN_TIME).await.unwrap_err(), too_large(64));
+        // A sparse file that claims more than the real limit is refused without being read.
+        std::fs::OpenOptions::new().write(true).open(&big).unwrap().set_len(GC_FILE_MAX + 1).unwrap();
+        assert_eq!(e.rt.gc(true, None).await.unwrap_err(), too_large(GC_FILE_MAX));
+        // Out of time before the first directory is read.
+        let err = e.rt.gc_within(true, None, GC_FILE_MAX, Duration::ZERO).await.unwrap_err();
+        assert!(err.starts_with(&format!("stopped at {}: ", sessions.display())), "{err}");
+        assert!(err.contains("took longer than 0 seconds; nothing was collected."), "{err}");
+        assert!(store.read_all(&BlobId(orphan.clone())).is_ok());
+        // Within the bounds, the orphan goes.
+        std::fs::remove_file(&big).unwrap();
+        assert_eq!(e.rt.gc(true, None).await.unwrap().collected, 1);
+        assert!(store.read_all(&BlobId(orphan)).is_err());
+        e.rt.shutdown().await;
+    }
+
+    #[test]
+    fn gc_scan_blocks_on_no_fifo_and_follows_no_link_put_in_place_of_an_entry() {
+        use std::os::unix::fs::{symlink, OpenOptionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let (root, out) = (dir.path().join("sessions"), dir.path().join("outside"));
+        let jobs = root.join("s-1").join("jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let (named, elsewhere) = ("a".repeat(64), "b".repeat(64));
+        let stored: loom_core::blob::StoredIds = [named.clone(), elsewhere.clone()].into_iter().collect();
+        std::fs::write(jobs.join("j1.out"), &named).unwrap();
+        std::fs::write(out.join("names.txt"), &elsewhere).unwrap();
+        // Under a session directory: a FIFO, a link to it, and a link to a directory outside the tree.
+        let fifo = jobs.join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        symlink(&fifo, jobs.join("pipe-link")).unwrap();
+        symlink(&out, jobs.join("out")).unwrap();
+        // Roots, which the scan opens itself: the FIFO and a link to it, a link that loops, and a missing directory.
+        // Only the missing one is an empty tree; the others stop the scan.
+        let looping = dir.path().join("looping");
+        symlink("looping", &looping).unwrap();
+        let roots = [fifo.clone(), jobs.join("pipe-link"), looping, dir.path().join("missions")];
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (fifo_in, jobs_in, roots_in) = (fifo.clone(), jobs.clone(), roots.clone());
+        std::thread::spawn(move || {
+            let bounds = ScanBounds { file_max: GC_FILE_MAX, time: GC_SCAN_TIME, started: std::time::Instant::now() };
+            let mut keep = HashSet::new();
+            let scanned = scan_tree_for_ids(&root, true, &stored, &mut keep, &bounds).map(|()| keep);
+            let as_roots = roots_in.map(|r| {
+                let mut keep = HashSet::new();
+                (scan_tree_for_ids(&r, false, &stored, &mut keep, &bounds), keep)
+            });
+            // Opened as if each had been listed as a regular file and replaced before the open.
+            let fifo_is_file = open_unblocked(&fifo_in, false).map(|(_, m)| m.is_file()).ok();
+            let refused = |n: &str| open_unblocked(&jobs_in.join(n), false).err().and_then(|e| e.raw_os_error());
+            let _ = tx.send((scanned, as_roots, fifo_is_file, [refused("pipe-link"), refused("out")]));
+        });
+        let Ok((scanned, as_roots, fifo_is_file, refused)) = rx.recv_timeout(Duration::from_secs(30)) else {
+            // A reader stuck on the FIFO gets end-of-file once a writer has come and gone, so the thread ends.
+            for _ in 0..50 {
+                if std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&fifo).is_ok() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("the scan blocked on a FIFO");
+        };
+        assert_eq!(scanned.unwrap(), HashSet::from([named]));
+        let [fifo_root, link_root, looping_root, missing_root] = as_roots;
+        for ((scanned, keep), root) in [fifo_root, link_root, looping_root].into_iter().zip(&roots) {
+            let err = scanned.unwrap_err();
+            assert!(err.starts_with(&format!("cannot read {} (", root.display())), "{err}");
+            assert!(err.contains("nothing was collected") && keep.is_empty(), "{err}");
+        }
+        assert_eq!(missing_root, (Ok(()), HashSet::new()));
+        // A link is not followed: `O_NOFOLLOW` refuses it.
+        assert_eq!((fifo_is_file, refused), (Some(false), [Some(libc::ELOOP); 2]));
     }
 
     #[tokio::test]

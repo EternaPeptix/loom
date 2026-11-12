@@ -37,7 +37,7 @@
 //! ## API (all under `/api`; JSON in, JSON out)
 //! | Route | Does | Answers |
 //! |---|---|---|
-//! | `GET /status` | `runtime.health()`, counts from `sessions(true)` and `inbox()` | `StatusView` |
+//! | `GET /status` | `runtime.health()`, counts from `sessions(true)` and `inbox()`, `statvfs` of the loom home on a blocking thread (`disk`, `null` when it cannot be read) | `StatusView` |
 //! | `GET /sessions?archived=true` | `runtime.sessions(archived)` (default false) | `[SessionInfo]` |
 //! | `POST /sessions` (`NewSession`) | `runtime.create_session` | `201` `SessionInfo` |
 //! | `GET /sessions/{id}` | the session and its children (sessions whose `parent` is it) | `SessionDetail` |
@@ -111,8 +111,8 @@
 use crate::auth;
 use crate::ui;
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, ErrorBody, GcBody, LinesView, MessageBody, RecordsPage, RuleBody,
-    SessionDetail, StatusView, WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, RecordsPage,
+    RuleBody, SessionDetail, StatusView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -462,8 +462,28 @@ async fn web_session(State(s): State<ApiState>, body: Bytes) -> Res<Response> {
 // ---------------------------------------------------------------------------------------------
 // API: sessions, missions, inbox
 
+/// Free and total bytes of the volume that holds `path` (`statvfs`); `None` when they cannot be read.
+fn disk_space(path: &std::path::Path) -> Option<DiskSpace> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` is plain integers, for which all-zero is a valid value.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a NUL-terminated string and `st` a live, exclusively borrowed `statvfs`.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    // Counts are in fragments (`f_frsize`); a file system that leaves that 0 counts in blocks.
+    let unit = u128::from(if st.f_frsize > 0 { st.f_frsize } else { st.f_bsize });
+    let free_bytes = u64::try_from(u128::from(st.f_bavail) * unit).ok()?;
+    let total_bytes = u64::try_from(u128::from(st.f_blocks) * unit).ok()?;
+    (total_bytes > 0 && free_bytes <= total_bytes).then_some(DiskSpace { free_bytes, total_bytes })
+}
+
 async fn status(State(s): State<ApiState>) -> Json<StatusView> {
     let models = s.runtime.health().await;
+    // Off the async threads: the loom home may be on a slow mount. A task that fails reads as unknown.
+    let home = s.runtime.paths().home.clone();
+    let disk = tokio::task::spawn_blocking(move || disk_space(&home)).await.ok().flatten();
     let sessions = s.runtime.sessions(true);
     let inbox_open = s.runtime.inbox().len();
     Json(StatusView {
@@ -473,6 +493,7 @@ async fn status(State(s): State<ApiState>) -> Json<StatusView> {
         bind: s.bind.clone(),
         proxy_port: s.runtime.proxy_port(),
         home: s.runtime.paths().home.display().to_string(),
+        disk,
         models,
         sessions_total: sessions.len(),
         sessions_active: sessions.iter().filter(|i| i.active).count(),
@@ -1430,6 +1451,19 @@ mod tests {
         assert_eq!(status["models"].as_array().unwrap().len(), 1);
         assert_eq!(status["models"][0]["profile"], "mock");
         assert!(status["sessions_active"].as_u64().unwrap() <= 1);
+        // The volume of the loom home, read now.
+        let disk = &status["disk"];
+        let (free, total) = (disk["free_bytes"].as_u64().unwrap(), disk["total_bytes"].as_u64().unwrap());
+        assert!(total > 0 && free <= total, "{status}");
+    }
+
+    #[test]
+    fn disk_space_reads_the_volume_and_is_none_for_a_path_that_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let here = disk_space(dir.path()).unwrap();
+        assert!(here.total_bytes > 0 && here.free_bytes <= here.total_bytes, "{here:?}");
+        assert_eq!(disk_space(&dir.path().join("missing")), None);
+        assert_eq!(disk_space(std::path::Path::new("bad\0path")), None);
     }
 
     #[tokio::test]

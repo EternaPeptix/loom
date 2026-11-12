@@ -694,6 +694,7 @@ mod tests {
             bind: "127.0.0.1:7878".into(),
             proxy_port: 9000,
             home: "/h".into(),
+            disk: Some(crate::wire::DiskSpace { free_bytes: 3 << 30, total_bytes: 1 << 40 }),
             models: vec![ModelHealth {
                 profile: "local".into(),
                 base_url: "http://m/v1".into(),
@@ -763,6 +764,10 @@ mod tests {
         let sid = SessionId::from("s-1");
 
         assert_eq!(client.status().await.unwrap(), status_view());
+        // A daemon from before the disk figure leaves it out: unknown.
+        let mut older = serde_json::to_value(status_view()).unwrap();
+        older.as_object_mut().unwrap().remove("disk");
+        assert_eq!(serde_json::from_value::<StatusView>(older).unwrap().disk, None);
         assert_eq!(client.sessions(false).await.unwrap(), vec![one.clone()]);
         assert_eq!(client.sessions(true).await.unwrap().len(), 1);
         let d = client.session(&sid).await.unwrap();

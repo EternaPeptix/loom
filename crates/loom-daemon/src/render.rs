@@ -69,8 +69,10 @@
 //!   folds at {target} down to {floor} · window {context_window or "unknown"} · last request
 //!   {prompt} in, {pct}% cached`), then per item `#{seq}  {kind}  {state}  {chars}  {pin}
 //!   {preview}`.
-//! - `status(view, style)`: the daemon line, one line per model (`✓`/`✗`, base URL, model, window,
-//!   detail when unreachable), the counts.
+//! - `status(view, style)`: the daemon line; the free space of the volume of the loom home (`{free}
+//!   GiB free of {total} GiB ({pct}%) on the volume of the loom home`, or `unknown`) and, when it is low
+//!   (`DiskSpace::is_low`), a warning that sessions will fail when the disk fills (bold yellow); one
+//!   line per model (`✓`/`✗`, base URL, model, window, detail when unreachable); the counts.
 //! - `net_table(entries, style)`: `TIME  VERDICT  METHOD  HOST:PORT  RULE` (time as `HH:MM:SS` UTC).
 //!
 //! Tests required: every record kind (the shape above, with and without colour — no escape byte
@@ -671,6 +673,15 @@ pub fn window_table(view: &WindowView, style: &Style) -> String {
     out
 }
 
+/// What `status` says when the volume of the loom home is nearly full (`DiskSpace::is_low`).
+const LOW_DISK_WARNING: &str = "! Low disk space: sessions will fail when the disk fills. Run `loom gc`.";
+
+/// Bytes in GiB with one decimal, rounded down: `0.4 GiB`, `926.4 GiB`.
+fn gib(bytes: u64) -> String {
+    let tenths = u128::from(bytes) * 10 / (1u128 << 30);
+    format!("{}.{} GiB", tenths / 10, tenths % 10)
+}
+
 pub fn status(view: &StatusView, style: &Style) -> String {
     let width = width_of(style);
     let mut out = Vec::new();
@@ -679,6 +690,18 @@ pub fn status(view: &StatusView, style: &Style) -> String {
         view.version, view.pid, view.bind, view.proxy_port, view.home
     );
     out.push(cut(&flat(&daemon), width));
+    match &view.disk {
+        Some(disk) => {
+            let (free, total) = (disk.free_bytes, disk.total_bytes);
+            let pct = percent(free, total);
+            let line = format!("{} free of {} ({pct}%) on the volume of the loom home", gib(free), gib(total));
+            out.push(cut(&line, width));
+            if disk.is_low() {
+                out.push(paint(style, BOLD_YELLOW, &cut(LOW_DISK_WARNING, width)));
+            }
+        }
+        None => out.push(cut("free space on the volume of the loom home: unknown", width)),
+    }
     if view.models.is_empty() {
         out.push("no models configured".to_string());
     }
@@ -1535,6 +1558,7 @@ mod tests {
             bind: "127.0.0.1:7878".into(),
             proxy_port: 7879,
             home: "/home/u/.loom".into(),
+            disk: Some(crate::wire::DiskSpace { free_bytes: 400 << 30, total_bytes: (1000 << 30) + (1 << 29) }),
             models: vec![health(true), health(false)],
             sessions_total: 5,
             sessions_active: 2,
@@ -1544,6 +1568,7 @@ mod tests {
         assert_eq!(
             status(&view, &MONO),
             "loom 0.1.0 · pid 42 · 127.0.0.1:7878 · proxy port 7879 · home /home/u/.loom\n\
+             400.0 GiB free of 1000.5 GiB (39%) on the volume of the loom home\n\
              ✓ http://10.0.0.1:8000/v1 · big · window 1.00M\n\
              ✗ http://10.0.0.1:8000/v1 · big · window unknown · connection refused\n\
              5 sessions · 2 active · 1 running · 3 waiting in the inbox\n"
@@ -1557,6 +1582,49 @@ mod tests {
         for line in narrow.lines() {
             assert!(line.chars().count() <= 20, "{line}");
         }
+    }
+
+    #[test]
+    fn status_warns_below_5_gib_or_5_percent_free_and_says_when_space_is_unknown() {
+        use crate::wire::DiskSpace;
+        let g = |n: u64| n << 30;
+        let with = |disk: Option<DiskSpace>| StatusView {
+            version: "0.1.0".into(),
+            pid: 42,
+            started_ms: 0,
+            bind: "127.0.0.1:7878".into(),
+            proxy_port: 7879,
+            home: "/home/u/.loom".into(),
+            disk,
+            models: vec![health(true)],
+            sessions_total: 0,
+            sessions_active: 0,
+            sessions_running: 0,
+            inbox_open: 0,
+        };
+        let warning = "! Low disk space: sessions will fail when the disk fills. Run `loom gc`.\n";
+        // (free, total, low): under 5 GiB whatever the volume, under 5 percent whatever the bytes; neither at the line.
+        let cases = [(g(5) - 1, g(20), true), (g(5), g(100), false), (g(49), g(1000), true), (g(50), g(1000), false)];
+        for (free, total, low) in cases {
+            let disk = DiskSpace { free_bytes: free, total_bytes: total };
+            assert_eq!(disk.is_low(), low, "{disk:?}");
+            let text = status(&with(Some(disk)), &MONO);
+            let lines: Vec<&str> = text.lines().collect();
+            assert!(lines[1].contains(" free of ") && lines[1].ends_with(" on the volume of the loom home"), "{text}");
+            assert_eq!(text.contains(warning), low, "{text}");
+            if low {
+                assert_eq!(format!("{}\n", lines[2]), warning);
+            }
+        }
+        let low = with(Some(DiskSpace { free_bytes: g(1), total_bytes: g(500) }));
+        assert!(status(&low, &MONO).starts_with(&format!(
+            "loom 0.1.0 · pid 42 · 127.0.0.1:7878 · proxy port 7879 · home /home/u/.loom\n\
+             1.0 GiB free of 500.0 GiB (0%) on the volume of the loom home\n{warning}"
+        )));
+        assert!(status(&low, &COLOR).contains(&format!("{BOLD_YELLOW}{}{RESET}\n", warning.trim_end())));
+        let unknown = status(&with(None), &MONO);
+        assert!(unknown.contains("\nfree space on the volume of the loom home: unknown\n"), "{unknown}");
+        assert!(!unknown.contains(warning));
     }
 
     #[test]
