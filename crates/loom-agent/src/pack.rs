@@ -17,8 +17,12 @@
 //! tools = ["bash", "read"]      # required, non-empty, no duplicates; order is the request order
 //! may_spawn = ["worker"]        # optional; each must name a role of this pack
 //! verify_finish = true          # optional, default false
+//! verifier = "verifier"         # optional; the role that attacks this role's finish (see below)
 //! read_only = false             # optional, default false
 //! ```
+//! `verifier` defaults to the pack's role named `verifier` when it has one. A role with
+//! `verify_finish = true` (or an explicit `verifier`) whose verifier is not a role of the same pack that is
+//! `read_only` and has the `verdict` tool is a load error.
 //! Unknown keys are errors. File paths must stay inside the pack directory (no absolute paths, no
 //! `..` components). Prompt and preamble files must be valid UTF-8 and are used with trailing
 //! whitespace trimmed.
@@ -71,6 +75,9 @@ pub struct RoleDef {
     pub may_spawn: Vec<String>,
     /// An accepted `finish` by this role is first attacked by an independent verifier.
     pub verify_finish: bool,
+    /// The role of this pack that attacks this role's finish and answers its `verify` tool; resolved at
+    /// load (`verifier` key, else the pack's role named `verifier`). Always `Some` when `verify_finish`.
+    pub verifier: Option<String>,
     /// The sandbox denies this role every write outside its session temp directory.
     pub read_only: bool,
 }
@@ -132,6 +139,7 @@ struct RawRole {
     may_spawn: Vec<String>,
     #[serde(default)]
     verify_finish: bool,
+    verifier: Option<String>,
     #[serde(default)]
     read_only: bool,
 }
@@ -169,6 +177,40 @@ fn levenshtein(a: &str, b: &str) -> usize {
         prev = cur;
     }
     prev.last().copied().unwrap_or(0)
+}
+
+/// The verifier role of `r`: its `verifier` key, else the pack's role named `verifier`. A role that
+/// needs one (`verify_finish`, or an explicit key) must get a read-only role that has `verdict`.
+fn resolve_verifier(
+    at: &str,
+    is_verifier: bool,
+    r: &RawRole,
+    roles: &BTreeMap<String, RawRole>,
+    role_list: &str,
+) -> Result<Option<String>, String> {
+    // The role named `verifier` is not its own default verifier.
+    let wanted = r.verifier.clone().or_else(|| (roles.contains_key("verifier") && !is_verifier).then(|| "verifier".to_string()));
+    let usable =
+        |name: &str| roles.get(name).is_some_and(|v| v.read_only && v.tools.iter().flatten().any(|t| t == "verdict"));
+    if !(r.verify_finish || r.verifier.is_some()) {
+        return Ok(wanted.filter(|n| usable(n)));
+    }
+    let Some(name) = wanted else {
+        return Err(format!(
+            "{at}: `verify_finish` = true needs a verifier role. Add a role named \"verifier\" to this pack, or set `verifier = \"<role>\"` to a read-only role that has the `verdict` tool (roles: {role_list})"
+        ));
+    };
+    if !roles.contains_key(&name) {
+        return Err(format!(
+            "{at}: `verifier` = \"{name}\" is not a role of this pack (roles: {role_list}). Name a read-only role that has the `verdict` tool"
+        ));
+    }
+    if !usable(&name) {
+        return Err(format!(
+            "{at}: the verifier role \"{name}\" must have `read_only = true` and the `verdict` tool in its `tools`. Fix that role, or point `verifier` at another role"
+        ));
+    }
+    Ok(Some(name))
 }
 
 /// Validate `pack.toml` text and assemble a pack. `read` returns the text of a file given its
@@ -266,6 +308,7 @@ fn parse_pack(
                 return Err(format!("{at}: `may_spawn` lists \"{m}\" more than once"));
             }
         }
+        let verifier = resolve_verifier(&at, rname == "verifier", r, &raw.roles, &role_list)?;
         roles.insert(
             rname.clone(),
             RoleDef {
@@ -277,6 +320,7 @@ fn parse_pack(
                 tools,
                 may_spawn: r.may_spawn.clone(),
                 verify_finish: r.verify_finish,
+                verifier,
                 read_only: r.read_only,
             },
         );
@@ -467,6 +511,7 @@ mod tests {
         assert_eq!(core.roles["chat"].termination, Termination::Free);
         assert!(core.roles["verifier"].read_only);
         assert!(core.roles["lead"].verify_finish);
+        assert_eq!(core.roles["lead"].verifier.as_deref(), Some("verifier"));
         assert_eq!(p.role(None, None).unwrap().name, "lead");
     }
 
@@ -535,6 +580,51 @@ mod tests {
         assert!(err(&GOOD.replace("\"free\"", "\"never\"")).contains("termination"));
         assert!(err(&GOOD.replace("prompt = \"a.md\"\n", "")).contains("`prompt`"));
         assert!(err("this is not toml").contains("invalid"));
+    }
+
+    #[test]
+    fn verify_finish_needs_a_resolvable_verifier() {
+        let with = |extra: &str| {
+            GOOD.replace("tools = [\"bash\"]", &format!("tools = [\"bash\"]\nverify_finish = true\n{extra}"))
+        };
+        // no role named verifier and no key
+        let e = err(&with(""));
+        assert!(e.contains("roles.a") && e.contains("needs a verifier role") && e.contains("verifier = "), "{e}");
+        // names a missing role
+        assert!(err(&with("verifier = \"zz\"")).contains("not a role of this pack"));
+        // names a role that is not read-only or has no verdict
+        let e = err(&with("verifier = \"b\""));
+        assert!(e.contains("read_only = true") && e.contains("verdict"), "{e}");
+        let ok = GOOD.replace("[\"read\", \"grep\"]", "[\"read\", \"verdict\"]\nread_only = true");
+        let ok = ok.replace("tools = [\"bash\"]", "tools = [\"bash\"]\nverify_finish = true\nverifier = \"b\"");
+        let d = mk(&ok);
+        let p = Packs::load(d.path()).unwrap();
+        assert_eq!(p.role(Some("mine"), Some("a")).unwrap().verifier.as_deref(), Some("b"));
+        // the default is the role named verifier
+        let named = "name = \"mine\"\ndefault_role = \"a\"\n[roles.a]\nprompt = \"a.md\"\ntools = [\"bash\"]\nverify_finish = true\n[roles.verifier]\nprompt = \"b.md\"\ntools = [\"verdict\"]\nread_only = true\n";
+        let d = mk(named);
+        let p = Packs::load(d.path()).unwrap();
+        assert_eq!(p.role(Some("mine"), Some("a")).unwrap().verifier.as_deref(), Some("verifier"));
+        assert_eq!(p.role(Some("mine"), Some("verifier")).unwrap().verifier.as_deref(), None);
+    }
+
+    #[test]
+    fn shipped_packs_load() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let p = Packs::load(&dir).unwrap();
+        assert!(p.names().contains(&"vr".to_string()) && p.names().contains(&"core".to_string()));
+        p.check_tools(&crate::rtools::known_tools()).unwrap();
+        let vr = p.get("vr").unwrap();
+        assert_eq!(vr.roles["researcher"].verifier.as_deref(), Some("judge"));
+        assert!(vr.roles["chat"].read_only);
+        assert!(vr.roles["scout"].may_spawn.is_empty());
+        for pack in ["core", "vr"] {
+            let pack = p.get(pack).unwrap();
+            for r in pack.roles.values().filter(|r| r.verify_finish) {
+                let v = &pack.roles[r.verifier.as_deref().unwrap()];
+                assert!(v.read_only && v.tools.iter().any(|t| t == "verdict"));
+            }
+        }
     }
 
     #[cfg(unix)]

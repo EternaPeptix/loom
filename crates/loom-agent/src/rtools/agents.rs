@@ -194,7 +194,7 @@ fn budget_for(shared: &Shared, args: &Map<String, Value>) -> (Budget, Option<Str
 
 fn request(ctx: &ToolCtx, role: String, mode: SpawnMode, brief: Brief, budget: Budget, awaited: bool) -> SpawnReq {
     let title = cut(&brief.question, 80);
-    SpawnReq { role, mode, brief, budget, call_id: ctx.call_id.clone(), title, awaited }
+    SpawnReq { role, mode, brief, budget, call_id: ctx.call_id.clone(), title, awaited, harness: false }
 }
 
 fn str_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -561,9 +561,9 @@ impl Tool for Verify {
         if claim_id.is_some() == statement.is_some() {
             return ToolOutput::error("Give exactly one of `claim` (a ledger claim id) and `statement` (the claim as text).");
         }
-        if !shared.role.may_spawn.iter().any(|r| r == "verifier") {
+        let Some(verifier) = shared.role.verifier.clone().filter(|v| shared.role.may_spawn.contains(v)) else {
             return ToolOutput::error("This role cannot start a verifier.");
-        }
+        };
         let handles: Vec<String> = args
             .get("handles")
             .and_then(Value::as_array)
@@ -625,7 +625,7 @@ impl Tool for Verify {
         };
         let budget =
             Budget { max_steps: Some(shared.agents.child_max_steps), max_minutes: Some(shared.agents.child_max_minutes) };
-        let req = request(ctx, "verifier".into(), SpawnMode::Fresh, brief, budget, true);
+        let req = request(ctx, verifier, SpawnMode::Fresh, brief, budget, true);
         let id = match shared.orch.spawn(&shared.session, req).await {
             Ok(id) => id,
             Err(e) => return ToolOutput::error(e),

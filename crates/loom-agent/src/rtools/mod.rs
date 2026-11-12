@@ -46,7 +46,8 @@ use tokio_util::sync::CancellationToken;
 
 /// A child's answer longer than this is cut in the report its parent sees (the whole answer is stored).
 pub const REPORT_MAX_CHARS: usize = 12_000;
-/// How many times a verifier may reject a lead's `finish` before the next one is delivered unverified.
+/// How many times a verifier may reject a lead's `finish` before the next one is escalated to the operator
+/// instead of verified again (counted since the operator last answered an escalation).
 pub const MAX_FINISH_REJECTIONS: u32 = 2;
 
 /// What a tool asks the step loop to do once its result is recorded.
@@ -99,6 +100,9 @@ pub struct SpawnReq {
     /// parent turn for it. When false, the settlement is delivered to the parent as an
     /// `agent-report` message and resumes the parent if it is waiting.
     pub awaited: bool,
+    /// Started by the harness itself for the finish gate: not counted against `max_children` and not
+    /// limited to the parent role's `may_spawn`. Tools the model calls always set this to false.
+    pub harness: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
