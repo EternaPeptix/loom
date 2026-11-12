@@ -6,7 +6,7 @@
 //! `MockServer::start(script)` binds `127.0.0.1:0` and serves:
 //! - `GET /v1/models` → `{"object":"list","data":[{"id":<model>,"object":"model","max_model_len":<window>}]}`
 //!   using the values set with `set_model` (defaults `mock`, 1_000_000). `set_model(_, None)` omits
-//!   `max_model_len`.
+//!   `max_model_len`. Each id added with `also_serve` follows as a further entry without a window.
 //! - `POST /v1/chat/completions` → asks the script for an [`Action`], giving it the parsed request
 //!   body and the 0-based request number, records the body (available through `requests()`), then:
 //!   - `Action::Reply(reply)`: a 200 `text/event-stream` in vLLM's chunk shapes (see
@@ -22,9 +22,9 @@
 //!   - `Action::Stall { ms }`: send headers and the first chunk, then nothing for `ms`, then close.
 //!   - `Action::Eof { reply, chunks }`: as `DropAfter` but the body ends cleanly.
 //!   - `Action::StreamError { message }`: the first chunk, then `{"error":{"message":..}}`, then a clean end.
-//! - A request whose `model` field is present and is not the served model (`set_model`) gets HTTP 404
-//!   in vLLM's shape (`{"object":"error","message":"The model `X` does not exist.","type":
-//!   "NotFoundError","param":null,"code":404}`) before the script is consulted.
+//! - A request whose `model` field is present and is not a served model (`set_model`, `also_serve`)
+//!   gets HTTP 404 in vLLM's shape (`{"object":"error","message":"The model `X` does not exist.",
+//!   "type":"NotFoundError","param":null,"code":404}`) before the script is consulted.
 //! - Usage in a reply: `reply.usage` when set; otherwise computed — `prompt_tokens` =
 //!   ceil(characters of the request's `messages` and `tools` JSON / 3.3), `cached_tokens` = the same
 //!   measure over the longest prefix of the `messages` array (whole messages, compared as JSON) that
@@ -178,6 +178,8 @@ struct State {
     auth: Vec<Option<String>>,
     model: String,
     window: Option<u64>,
+    /// Further served ids (`also_serve`).
+    also: Vec<String>,
 }
 
 struct Shared {
@@ -231,6 +233,7 @@ impl MockServer {
                 auth: Vec::new(),
                 model: "mock".to_string(),
                 window: Some(1_000_000),
+                also: Vec::new(),
             }),
         });
         let running = launch(listener, &shared);
@@ -250,6 +253,11 @@ impl MockServer {
         let mut st = lock(&self.shared.state);
         st.model = id.to_string();
         st.window = window;
+    }
+
+    /// Serve a further model id next to the one `set_model` names, as a multi-model server does.
+    pub fn also_serve(&self, id: &str) {
+        lock(&self.shared.state).also.push(id.to_string());
     }
 
     /// Bodies of every chat request received so far, in order.
@@ -307,7 +315,9 @@ async fn models(AxState(app): AxState<App>) -> Response {
     if let (Some(w), Some(obj)) = (st.window, entry.as_object_mut()) {
         obj.insert("max_model_len".to_string(), json!(w));
     }
-    axum::Json(json!({"object": "list", "data": [entry]})).into_response()
+    let mut data = vec![entry];
+    data.extend(st.also.iter().map(|id| json!({"id": id, "object": "model"})));
+    axum::Json(json!({"object": "list", "data": data})).into_response()
 }
 
 /// ceil(chars / 3.3), in integers.
@@ -369,7 +379,8 @@ async fn chat(AxState(app): AxState<App>, headers: HeaderMap, body: Bytes) -> Re
         let (prompt, cached) = prompt_usage(&request, &st.requests);
         st.requests.push(request.clone());
         st.auth.push(auth);
-        if let Some(asked) = request.get("model").and_then(Value::as_str).filter(|m| *m != st.model) {
+        let asked = request.get("model").and_then(Value::as_str);
+        if let Some(asked) = asked.filter(|m| *m != st.model && !st.also.iter().any(|a| a == m)) {
             let err = json!({
                 "object": "error",
                 "message": format!("The model `{asked}` does not exist."),
@@ -750,6 +761,12 @@ mod tests {
         assert_eq!(v["code"], 404);
         assert_eq!(*lock(&calls), 0);
         assert_eq!(post_chat(&s, msgs(&["hi"])).await.status(), 200);
+        // A further served id is accepted once it is added.
+        let mut body = msgs(&["hi"]);
+        body["model"] = json!("second");
+        assert_eq!(post_chat(&s, body.clone()).await.status(), 404);
+        s.also_serve("second");
+        assert_eq!(post_chat(&s, body).await.status(), 200);
     }
 
     #[tokio::test]
@@ -889,6 +906,8 @@ mod tests {
         assert_eq!(get_json().await["data"][0], json!({"id": "other", "object": "model", "max_model_len": 4096}));
         s.set_model("bare", None);
         assert_eq!(get_json().await["data"][0], json!({"id": "bare", "object": "model"}));
+        s.also_serve("second");
+        assert_eq!(get_json().await["data"], json!([{"id": "bare", "object": "model"}, {"id": "second", "object": "model"}]));
     }
 
     #[tokio::test]

@@ -76,7 +76,7 @@ pub struct ModelProfile {
     /// How long to keep retrying an unreachable or failing server, in seconds (default 300, long
     /// enough for a server relaunch). 0 = retry until the server comes back. Failures that waiting
     /// cannot cure (a reply that is not an event stream, a stream that ends without a finish reason,
-    /// certificate errors) are given up after a few repeats whatever this is set to.
+    /// certificate errors) end the request after 3 attempts in a row whatever this is set to.
     pub retry_window_s: u64,
     /// Longest pause between retries.
     pub retry_max_delay_s: u64,
