@@ -346,6 +346,16 @@ impl Client {
         self.call(Method::GET, &format!("/api/blobs/{}/lines", segment(handle)), &query, None).await
     }
 
+    /// A single-use code that opens the web UI (`POST /api/login-codes`).
+    pub async fn login_code(&self) -> Result<String, String> {
+        #[derive(serde::Deserialize)]
+        struct Minted {
+            code: String,
+        }
+        let minted: Minted = self.call(Method::POST, "/api/login-codes", &[], None).await?;
+        Ok(minted.code)
+    }
+
     pub async fn shutdown(&self) -> Result<(), String> {
         self.call_unit(Method::POST, "/api/shutdown", None).await
     }

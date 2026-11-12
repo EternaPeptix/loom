@@ -601,6 +601,44 @@ test("error sentence", () => {
   assert.equal(C.errorSentence(502, "bad gateway"), "bad gateway");
 });
 
+test("the login code is read from the fragment only when it is a whole hex code", () => {
+  const code = "0123456789abcdef0123456789abcdef";
+  assert.equal(C.codeFromHash("#code=" + code), code);
+  for (const h of ["", "#", "#/s/s-1", "#code=", "#code=xyz", "#code=" + code + "&x=1", "#x=1&code=" + code, "code=" + code, "#code=ABCDEF0123456789ABCDEF", "#code=" + "a".repeat(129), null, undefined])
+    assert.equal(C.codeFromHash(h), null, String(h));
+});
+
+test("reconnect delays double from one second up to fifteen", () => {
+  assert.deepEqual([0, 1, 2, 3, 4, 5, 50].map(C.reconnectDelayMs), [1000, 2000, 4000, 8000, 15000, 15000, 15000]);
+  assert.equal(C.reconnectDelayMs(-3), 1000);
+  assert.equal(C.reconnectDelayMs(NaN), 1000);
+});
+
+test("SSE parser: events, comments, CRLF and CR, multi-line data, ids, and splits anywhere", () => {
+  const feedAll = (chunks) => {
+    const p = C.createSseParser();
+    return chunks.flatMap((c) => p.feed(c));
+  };
+  const text = ': keep-alive\n\ndata: {"a":1}\n\nid: 7\ndata: one\ndata:two\ndata\n\nevent: x\ndata: after\r\n\r\ndata: cr\r\rdata:last\n\n';
+  const want = [
+    { data: '{"a":1}', id: null },
+    { data: "one\ntwo\n", id: "7" },
+    { data: "after", id: "7" },
+    { data: "cr", id: "7" },
+    { data: "last", id: "7" },
+  ];
+  assert.deepEqual(feedAll([text]), want);
+  // Cut at every position, including between CR and LF.
+  for (let i = 0; i <= text.length; i++) assert.deepEqual(feedAll([text.slice(0, i), text.slice(i)]), want, "cut at " + i);
+  // One character at a time.
+  assert.deepEqual(feedAll([...text]), want);
+  // An unfinished event is held back; a comment alone and an event without data deliver nothing.
+  assert.deepEqual(feedAll(["data: half"]), []);
+  assert.deepEqual(feedAll([": c\n\n", "id: 3\n\n", "event: e\n\n"]), []);
+  // A colon inside the value and a missing space are kept as written.
+  assert.deepEqual(feedAll(["data:a: b\n\n", "data:  two spaces\n\n"]), [{ data: "a: b", id: null }, { data: " two spaces", id: null }]);
+});
+
 // ---- safety: nothing in the shipped DOM code can turn record content into markup ----
 
 function stripComments(js) {

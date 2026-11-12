@@ -11,8 +11,8 @@
 //!   {bind}` (or `already running`). `down`: `client.shutdown()`, wait until it stops answering
 //!   (10 s), print `stopped`.
 //! - `status`: `render::status`. Exit 1 when the daemon is not running (with the usual sentence).
-//! - `open`: print and open `http://{bind}/?token={token}` (`/usr/bin/open` on macOS, `xdg-open`
-//!   elsewhere; `--print` only prints).
+//! - `open`: request a login code and open `http://{bind}/#code={code}` (`/usr/bin/open` on macOS,
+//!   `xdg-open` elsewhere); `--print` only prints it. The API token is never printed or passed on argv.
 //! - `run [options] <message…>`: start a session and follow it. The message is the arguments
 //!   joined by spaces; `-` or no message reads standard input to its end. Options → `NewSession`
 //!   (`--workspace` defaults to the current directory; `--attended` sets `unattended: false`;
@@ -366,9 +366,9 @@ pub fn follow_exit_code(reason: TurnEndReason) -> Option<i32> {
     }
 }
 
-/// `http://{bind}/?token={token}`.
-pub fn open_url(bind: &str, token: &str) -> String {
-    format!("http://{bind}/?token={token}")
+/// `http://{bind}/#code={code}`: the fragment is never sent to a server or kept in a log.
+pub fn open_url(bind: &str, code: &str) -> String {
+    format!("http://{bind}/#code={code}")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -988,14 +988,19 @@ async fn cmd_down(paths: &Paths) -> Result<i32, String> {
     outln("stopped").map(|()| 0)
 }
 
+/// The address that logs a browser in: a fresh single-use code; the API token is not in it.
+async fn login_url(c: &Client) -> Result<String, String> {
+    let bind = c.base().strip_prefix("http://").unwrap_or(c.base());
+    Ok(open_url(bind, &c.login_code().await?))
+}
+
 async fn cmd_open(paths: &Paths, a: &OpenArgs) -> Result<i32, String> {
     let c = client_of(paths)?;
     // Say "not running" here rather than hand the browser an address nothing answers on.
     c.status().await?;
-    let bind = c.base().strip_prefix("http://").unwrap_or(c.base());
-    let url = open_url(bind, c.token());
-    outln(&url)?;
+    let url = login_url(&c).await?;
     if a.print {
+        outln(&url)?;
         return Ok(0);
     }
     let program = if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
@@ -1005,11 +1010,11 @@ async fn cmd_open(paths: &Paths, a: &OpenArgs) -> Result<i32, String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map_err(|e| format!("Cannot start {program} ({e}). Open the address above in a browser yourself."))?;
+        .map_err(|e| format!("Cannot start {program} ({e}). Run `loom open --print` and open the address in a browser yourself."))?;
     if status.success() {
         Ok(0)
     } else {
-        Err(format!("{program} could not open the address. Open the address above in a browser yourself."))
+        Err(format!("{program} could not open the address. Run `loom open --print` and open it in a browser yourself."))
     }
 }
 
@@ -1349,7 +1354,19 @@ mod tests {
 
     #[test]
     fn the_browser_address() {
-        assert_eq!(open_url("127.0.0.1:7878", "abc"), "http://127.0.0.1:7878/?token=abc");
+        assert_eq!(open_url("127.0.0.1:7878", "abc"), "http://127.0.0.1:7878/#code=abc");
+    }
+
+    #[tokio::test]
+    async fn open_builds_a_code_url_without_the_token() {
+        let script = Script::default().route("POST", "/api/login-codes", 200, r#"{"code":"c0de","expires_in_s":60}"#);
+        let (c, shared) = start(script).await;
+        let url = login_url(&c).await.unwrap();
+        assert_eq!(url, format!("{}/#code=c0de", c.base()));
+        assert!(!url.contains(c.token()) && !url.contains("token="));
+        let script = shared.lock().unwrap();
+        assert_eq!((script.seen[0].method.as_str(), script.seen[0].target.as_str()), ("POST", "/api/login-codes"));
+        assert_eq!(script.seen[0].auth.as_deref(), Some("Bearer tok-123"));
     }
 
     #[test]
