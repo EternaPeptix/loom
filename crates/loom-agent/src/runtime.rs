@@ -111,6 +111,7 @@
 //! - at most `agents.max_children` unsettled children per parent: otherwise `{n} agents are already
 //!   running, which is the most allowed at once. Wait for one to finish (`wait`) or stop one
 //!   (`agent_stop`), then start this one.`
+//! - a request with `harness: true` (the finish gate's verifier) is exempt from both of the last two rules.
 //! - `SpawnMode::Fork`: the parent's status must have a `fork_point`, and every tool of the child
 //!   role must be among the parent role's tools; otherwise `A `{role}` agent cannot be forked from
 //!   this session: it needs tools this session does not have ({list}). Start it with mode `fresh`
@@ -1518,7 +1519,7 @@ impl Inner {
                 .ok_or_else(|| "Only the lead session of a mission can start agents.".to_string())?;
             let prole = self.packs.role(Some(&p.meta.pack), Some(&p.meta.role))?.clone();
             let pack = self.packs.get(&p.meta.pack).ok_or_else(|| format!("There is no pack \"{}\".", p.meta.pack))?;
-            let crole = match pack.roles.get(&req.role).filter(|_| prole.may_spawn.contains(&req.role)) {
+            let crole = match pack.roles.get(&req.role).filter(|_| req.harness || prole.may_spawn.contains(&req.role)) {
                 Some(r) => r.clone(),
                 None => {
                     let list = if prole.may_spawn.is_empty() { "none".to_string() } else { prole.may_spawn.join(", ") };
@@ -1530,7 +1531,7 @@ impl Inner {
                 .values()
                 .filter(|k| k.meta.parent.as_ref() == Some(parent) && !k.finished())
                 .count();
-            if running >= self.config.agents.max_children as usize {
+            if !req.harness && running >= self.config.agents.max_children as usize {
                 return Err(format!(
                     "{running} agents are already running, which is the most allowed at once. Wait for one to finish (`wait`) or stop one (`agent_stop`), then start this one."
                 ));
@@ -2444,8 +2445,10 @@ impl Inner {
 mod tests {
     use super::*;
     use loom_core::config::{ModelProfile, SandboxMode};
+    use loom_core::event::InboxKind;
     use loom_model::mock::{Action, MockServer, Reply, Script};
     use serde_json::{json, Value};
+    use std::sync::atomic::AtomicUsize;
 
     const WAIT: Duration = Duration::from_secs(30);
 
@@ -2586,6 +2589,42 @@ mod tests {
                 finish("child report")
             }
         })
+    }
+
+    /// Like `env_with`, but `packs` may write pack directories into the home before the runtime starts.
+    async fn env_with_packs(script: Script, tweak: impl FnOnce(&mut Config), packs: impl FnOnce(&Path)) -> Env {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let server = MockServer::start(script).await.unwrap();
+        let mut config = config_for(&server, None);
+        tweak(&mut config);
+        let paths = Paths::at(dir.path().join("home"));
+        packs(&paths.packs_dir());
+        let rt = Runtime::start(config.clone(), paths).await.unwrap();
+        Env { dir, server, rt, ws, config }
+    }
+
+    /// The handle of the latest stored output shown in a request's tool messages.
+    fn shown_handle(body: &Value) -> Option<String> {
+        body["messages"].as_array()?.iter().rev().filter(|m| m["role"] == "tool").find_map(|m| {
+            let text = m["content"].as_str()?;
+            let hex: String = text[text.find("out:")? + 4..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+            (hex.len() >= 16).then(|| format!("out:{}", &hex[..16]))
+        })
+    }
+
+    /// One step of a verifier: look at something, then give a verdict that names what it looked at.
+    fn verifier_turn(body: &Value, accept: bool) -> Action {
+        match shown_handle(body) {
+            None => call("bash", json!({"command": "echo checked"})),
+            Some(h) if accept => call("verdict", json!({"accepted": true, "opened": [h]})),
+            Some(h) => call("verdict", json!({"accepted": false, "objections": ["no test ran"], "opened": [h]})),
+        }
+    }
+
+    fn inbox_kinds(e: &Env) -> Vec<InboxKind> {
+        e.rt.inbox().iter().map(|i| i.item.kind).collect()
     }
 
     #[tokio::test]
@@ -2793,6 +2832,7 @@ mod tests {
             call_id: CallId::from("c1"),
             title: "t".into(),
             awaited: false,
+            harness: false,
         };
         let err = orch.spawn(&id, req("nobody")).await.unwrap_err();
         assert!(err.contains("is not a role this session can start"), "{err}");
@@ -2801,6 +2841,197 @@ mod tests {
         assert!(err.contains("most allowed"), "{err}");
         let err = orch.spawn(&child, req("worker")).await.unwrap_err();
         assert!(err.contains("Only the lead"), "{err}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn harness_spawn_ignores_max_children_and_may_spawn() {
+        let e = env_with(Script::new(|_, _| Action::Stall { ms: 600_000 }), false, |c| c.agents.max_children = 1).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("request", || !e.server.requests().is_empty()).await;
+        let orch = e.rt.inner.orch.clone();
+        let req = |role: &str, harness: bool| SpawnReq {
+            role: role.into(),
+            mode: SpawnMode::Fresh,
+            brief: Default::default(),
+            budget: Budget::default(),
+            call_id: CallId::from("c1"),
+            title: "t".into(),
+            awaited: false,
+            harness,
+        };
+        orch.spawn(&id, req("worker", false)).await.unwrap();
+        let err = orch.spawn(&id, req("verifier", false)).await.unwrap_err();
+        assert!(err.contains("most allowed"), "{err}");
+        orch.spawn(&id, req("verifier", true)).await.unwrap();
+        // `chat` is not in the lead's may_spawn: only the harness may start it.
+        let err = orch.spawn(&id, req("chat", false)).await.unwrap_err();
+        assert!(err.contains("is not a role this session can start"), "{err}");
+        orch.spawn(&id, req("chat", true)).await.unwrap();
+        e.rt.shutdown().await;
+        // During a shutdown even the harness gets the sentence that `finish` takes for a restart, not a failure.
+        assert_eq!(orch.spawn(&id, req("verifier", true)).await.unwrap_err(), crate::rtools::SHUTTING_DOWN);
+    }
+
+    #[tokio::test]
+    async fn verified_finish_with_real_children_is_delivered_after_an_accepting_verdict() {
+        let e = env_with(
+            Script::new(|body, _| if has_tool(body, "verdict") { verifier_turn(body, true) } else { finish("lead done") }),
+            false,
+            |c| c.agents.verify_finish = true,
+        )
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("finished item", || inbox_kinds(&e).contains(&InboxKind::Finished)).await;
+        let item = e.rt.inbox().remove(0).item;
+        assert!(item.text.starts_with("lead done") && item.text.contains("[verified by s-"), "{}", item.text);
+        let ledger = e.rt.ledger(&info.meta.mission).unwrap();
+        assert_eq!(ledger.state.finishes.len(), 1);
+        assert_eq!(ledger.state.finishes[0].accepted, Some(true));
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))).await;
+        let kids = e.children(&id);
+        assert_eq!(kids.len(), 1);
+        assert_eq!(kids[0].meta.role, "verifier");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_finish_with_real_children_returns_the_objections_and_the_work_continues() {
+        let verdicts = Arc::new(AtomicUsize::new(0));
+        let v = verdicts.clone();
+        let e = env_with(
+            Script::new(move |body, _| {
+                if !has_tool(body, "verdict") {
+                    return finish("lead done");
+                }
+                if shown_handle(body).is_some() {
+                    return verifier_turn(body, v.fetch_add(1, Ordering::SeqCst) > 0);
+                }
+                verifier_turn(body, false)
+            }),
+            false,
+            |c| c.agents.verify_finish = true,
+        )
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("finished item", || inbox_kinds(&e).contains(&InboxKind::Finished)).await;
+        let ledger = e.rt.ledger(&info.meta.mission).unwrap();
+        let verdicts: Vec<Option<bool>> = ledger.state.finishes.iter().map(|f| f.accepted).collect();
+        assert_eq!(verdicts, vec![Some(false), Some(true)]);
+        assert_eq!(ledger.state.finishes[0].objections, vec!["no test ran".to_string()]);
+        let lead_saw_objection = e.server.requests().iter().any(|b| {
+            has_tool(b, "finish") && mentions(b, "did not accept it") && mentions(b, "no test ran")
+        });
+        assert!(lead_saw_objection);
+        assert_eq!(e.children(&id).len(), 2);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn finish_whose_verifier_cannot_be_started_delivers_nothing_and_opens_a_blocking_item() {
+        let e = env_with(
+            Script::new(|body, n| {
+                if has_tool(body, "verdict") {
+                    verifier_turn(body, true)
+                } else if n == 0 {
+                    call("bash", json!({"command": "cd .. && rm -rf ws"}))
+                } else {
+                    finish("lead done")
+                }
+            }),
+            false,
+            |c| c.agents.verify_finish = true,
+        )
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("blocking item", || inbox_kinds(&e).contains(&InboxKind::Blocker)).await;
+        let item = e.rt.inbox().remove(0).item;
+        assert!(item.blocking);
+        assert!(item.text.starts_with("NOT VERIFIED - VERIFICATION COULD NOT BE RUN"), "{}", item.text);
+        assert!(item.text.contains("lead done") && item.text.contains("workspace"), "{}", item.text);
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        assert!(e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Blocked })));
+        assert!(!e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished })));
+        assert!(!inbox_kinds(&e).contains(&InboxKind::Finished));
+        assert!(e.server.requests().iter().all(|b| !has_tool(b, "verdict")));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rejection_cap_escalates_and_verification_runs_again_after_the_operator_answers() {
+        let verdicts = Arc::new(AtomicUsize::new(0));
+        let v = verdicts.clone();
+        let said = Arc::new(AtomicUsize::new(0));
+        let s = said.clone();
+        let e = env_with(
+            Script::new(move |body, _| {
+                if !has_tool(body, "verdict") {
+                    return finish(&format!("lead done {}", s.fetch_add(1, Ordering::SeqCst)));
+                }
+                if shown_handle(body).is_some() {
+                    return verifier_turn(body, v.fetch_add(1, Ordering::SeqCst) >= 2);
+                }
+                verifier_turn(body, false)
+            }),
+            false,
+            |c| c.agents.verify_finish = true,
+        )
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("escalation", || inbox_kinds(&e).contains(&InboxKind::Blocker)).await;
+        let entry = e.rt.inbox().remove(0);
+        assert!(entry.item.blocking);
+        assert!(entry.item.text.starts_with("NOT VERIFIED - REJECTED 2 TIMES"), "{}", entry.item.text);
+        assert!(entry.item.text.matches("- no test ran").count() == 2, "{}", entry.item.text);
+        assert!(entry.item.text.contains("lead done 2"), "{}", entry.item.text);
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Blocked }))).await;
+        assert!(!inbox_kinds(&e).contains(&InboxKind::Finished));
+        assert!(!e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished })));
+        assert_eq!(e.children(&id).len(), 2);
+
+        e.rt.answer(&entry.item.item_id, "Keep going: check the lexer too.").await.unwrap();
+        until("finished after the answer", || inbox_kinds(&e).contains(&InboxKind::Finished)).await;
+        assert_eq!(e.children(&id).len(), 3);
+        let ledger = e.rt.ledger(&info.meta.mission).unwrap();
+        let verdicts: Vec<Option<bool>> = ledger.state.finishes.iter().map(|f| f.accepted).collect();
+        assert_eq!(verdicts, vec![Some(false), Some(false), None, Some(true)]);
+        assert_eq!(ledger.state.questions.len(), 1);
+        assert!(ledger.state.questions[0].answer.is_some());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_pack_whose_verifier_role_has_another_name_is_used_for_the_gate() {
+        let e = env_with_packs(
+            Script::new(|body, _| if has_tool(body, "verdict") { verifier_turn(body, true) } else { finish("lead done") }),
+            |c| c.agents.verify_finish = true,
+            |packs| {
+                let dir = packs.join("jp");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("pack.toml"),
+                    "name = \"jp\"\ndefault_role = \"boss\"\n[roles.boss]\nprompt = \"boss.md\"\ntools = [\"bash\", \"finish\"]\nverify_finish = true\nverifier = \"judge\"\n[roles.judge]\nprompt = \"judge.md\"\ntools = [\"bash\", \"out_read\", \"verdict\"]\nread_only = true\n",
+                )
+                .unwrap();
+                std::fs::write(dir.join("boss.md"), "Boss.").unwrap();
+                std::fs::write(dir.join("judge.md"), "Judge.").unwrap();
+            },
+        )
+        .await;
+        let mut new = e.new_session(Some("go"));
+        new.pack = Some("jp".into());
+        let info = e.rt.create_session(new).await.unwrap();
+        let id = info.meta.id.clone();
+        until("finished item", || inbox_kinds(&e).contains(&InboxKind::Finished)).await;
+        let kids = e.children(&id);
+        assert_eq!(kids.len(), 1);
+        assert_eq!(kids[0].meta.role, "judge");
+        assert!(e.rt.inbox().remove(0).item.text.contains("[verified by s-"));
         e.rt.shutdown().await;
     }
 

@@ -71,7 +71,8 @@
 //!
 //! ## `verify`
 //! Exactly one of `claim` (a ledger claim id) and `statement` (else an error saying so).
-//! `verifier` must be in `S.role.may_spawn` (else `This role cannot start a verifier.`).
+//! The role's verifier (`S.role.verifier`, resolved at pack load; not necessarily named `verifier`)
+//! must exist and be in `S.role.may_spawn` (else `This role cannot start a verifier.`).
 //! With `claim`: read `S.ledger()`; an unknown id is an error listing the claim ids. The brief:
 //! - `question`: `Try to refute this claim: {text}`
 //! - `context` (claim form only): `Evidence recorded for it:` and per evidence record of the claim
@@ -80,7 +81,7 @@
 //!   further paragraph `Outputs to examine: {handles joined by ", "}`.
 //! - `returns`: `A verdict, delivered by calling verdict.`
 //!
-//! Spawn role `verifier`, `Fresh`, default budget, `awaited: true`; join as in `agent_spawn`.
+//! Spawn that verifier role, `Fresh`, default budget, `awaited: true`; join as in `agent_spawn`.
 //! Result body `Body::Raw(report)`; outcome `verdict: accepted` / `verdict: not accepted` from
 //! `payload.accepted`, or `no verdict ({outcome})` when the payload has none (status `Error`).
 //! When the claim form was used, a last line is appended to the body: `The verdict is not recorded
@@ -194,7 +195,7 @@ fn budget_for(shared: &Shared, args: &Map<String, Value>) -> (Budget, Option<Str
 
 fn request(ctx: &ToolCtx, role: String, mode: SpawnMode, brief: Brief, budget: Budget, awaited: bool) -> SpawnReq {
     let title = cut(&brief.question, 80);
-    SpawnReq { role, mode, brief, budget, call_id: ctx.call_id.clone(), title, awaited }
+    SpawnReq { role, mode, brief, budget, call_id: ctx.call_id.clone(), title, awaited, harness: false }
 }
 
 fn str_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -561,9 +562,9 @@ impl Tool for Verify {
         if claim_id.is_some() == statement.is_some() {
             return ToolOutput::error("Give exactly one of `claim` (a ledger claim id) and `statement` (the claim as text).");
         }
-        if !shared.role.may_spawn.iter().any(|r| r == "verifier") {
+        let Some(verifier) = shared.role.verifier.clone().filter(|v| shared.role.may_spawn.contains(v)) else {
             return ToolOutput::error("This role cannot start a verifier.");
-        }
+        };
         let handles: Vec<String> = args
             .get("handles")
             .and_then(Value::as_array)
@@ -625,7 +626,7 @@ impl Tool for Verify {
         };
         let budget =
             Budget { max_steps: Some(shared.agents.child_max_steps), max_minutes: Some(shared.agents.child_max_minutes) };
-        let req = request(ctx, "verifier".into(), SpawnMode::Fresh, brief, budget, true);
+        let req = request(ctx, verifier, SpawnMode::Fresh, brief, budget, true);
         let id = match shared.orch.spawn(&shared.session, req).await {
             Ok(id) => id,
             Err(e) => return ToolOutput::error(e),
@@ -1131,6 +1132,38 @@ mod tests {
         let r = rig_with(role, false, true, AgentsCfg::default());
         let res = r.call("verify", json!({"statement":"x"})).await;
         assert_eq!(res.status, ToolStatus::Error);
+        assert!(res.text.contains("This role cannot start a verifier."), "{}", res.text);
+        assert!(r.orch.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_uses_the_roles_resolved_verifier_whatever_its_name() {
+        // A role whose pack names its checker `judge`.
+        let mut role = core_role("lead");
+        role.verifier = Some("judge".into());
+        role.may_spawn = vec!["worker".into(), "judge".into()];
+        let r = rig_with(role.clone(), false, true, AgentsCfg::default());
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "Fine.", json!({"accepted":true}));
+        let res = r.call("verify", json!({"statement":"2+2=4"})).await;
+        assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
+        assert!(res.text.contains("verdict: accepted"), "{}", res.text);
+        assert_eq!(spawned(&r)[0].role, "judge");
+        assert!(!spawned(&r)[0].harness);
+        assert_eq!(r.orch.calls(), vec!["spawn judge".to_string(), "join s-kid1".to_string()]);
+
+        // The model-invoked tool still needs the resolved role in may_spawn; a role that happens to be
+        // called `verifier` does not stand in for it.
+        role.may_spawn = vec!["worker".into(), "verifier".into()];
+        let r = rig_with(role.clone(), false, true, AgentsCfg::default());
+        let res = r.call("verify", json!({"statement":"x"})).await;
+        assert_eq!(res.status, ToolStatus::Error);
+        assert!(res.text.contains("This role cannot start a verifier."), "{}", res.text);
+        assert!(r.orch.calls().is_empty());
+
+        // A role with no resolved verifier cannot verify either.
+        role.verifier = None;
+        let r = rig_with(role, false, true, AgentsCfg::default());
+        let res = r.call("verify", json!({"statement":"x"})).await;
         assert!(res.text.contains("This role cannot start a verifier."), "{}", res.text);
         assert!(r.orch.calls().is_empty());
     }

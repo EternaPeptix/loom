@@ -12,6 +12,7 @@ prompt = "roles/researcher.md"
 termination = "explicit"
 may_spawn = ["scout", "judge"]
 verify_finish = true
+verifier = "judge"
 tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
   "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search",
@@ -26,7 +27,6 @@ tools = [
 description = "Runs one experiment from the researcher and returns one atomic executed check with its conditions, the exact run, the observed response and a separate state check — or a blocker."
 prompt = "roles/scout.md"
 termination = "explicit"
-may_spawn = ["scout"]
 tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
   "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search",
@@ -53,6 +53,7 @@ tools = [
 description = "Interactive research assistant: answers and runs read-only checks turn by turn within the authorized scope; a reply without a tool call ends the turn."
 prompt = "roles/chat.md"
 termination = "free"
+read_only = true
 tools = [
   "bash", "job_wait", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
   "note", "pin", "log_search",
