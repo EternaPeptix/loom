@@ -2548,9 +2548,11 @@ mod tests {
         orch.spawn(&id, req("verifier", true)).await.unwrap();
         // `chat` is not in the lead's may_spawn: only the harness may start it.
         let err = orch.spawn(&id, req("chat", false)).await.unwrap_err();
-        assert!(err.contains("is not a role this session can start") || err.contains("most allowed"), "{err}");
+        assert!(err.contains("is not a role this session can start"), "{err}");
         orch.spawn(&id, req("chat", true)).await.unwrap();
         e.rt.shutdown().await;
+        // During a shutdown even the harness gets the sentence that `finish` takes for a restart, not a failure.
+        assert_eq!(orch.spawn(&id, req("verifier", true)).await.unwrap_err(), crate::rtools::SHUTTING_DOWN);
     }
 
     #[tokio::test]
@@ -2694,7 +2696,7 @@ mod tests {
                 std::fs::create_dir_all(&dir).unwrap();
                 std::fs::write(
                     dir.join("pack.toml"),
-                    "name = \"jp\"\ndefault_role = \"boss\"\n[roles.boss]\nprompt = \"boss.md\"\ntools = [\"bash\", \"finish\"]\nverify_finish = true\nverifier = \"judge\"\n[roles.judge]\nprompt = \"judge.md\"\ntools = [\"bash\", \"verdict\"]\nread_only = true\n",
+                    "name = \"jp\"\ndefault_role = \"boss\"\n[roles.boss]\nprompt = \"boss.md\"\ntools = [\"bash\", \"finish\"]\nverify_finish = true\nverifier = \"judge\"\n[roles.judge]\nprompt = \"judge.md\"\ntools = [\"bash\", \"out_read\", \"verdict\"]\nread_only = true\n",
                 )
                 .unwrap();
                 std::fs::write(dir.join("boss.md"), "Boss.").unwrap();

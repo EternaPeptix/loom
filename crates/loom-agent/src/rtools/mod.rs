@@ -47,8 +47,12 @@ use tokio_util::sync::CancellationToken;
 /// A child's answer longer than this is cut in the report its parent sees (the whole answer is stored).
 pub const REPORT_MAX_CHARS: usize = 12_000;
 /// How many times a verifier may reject a lead's `finish` before the next one is escalated to the operator
-/// instead of verified again (counted since the operator last answered an escalation).
+/// instead of verified again (counted since the operator last answered an escalation, or since the last
+/// accepted finish when that is later).
 pub const MAX_FINISH_REJECTIONS: u32 = 2;
+/// What an [`Orchestrator`] answers once the runtime is shutting down. It is not a failure of the request:
+/// the turn that made it is being cut and is resumed after the restart.
+pub const SHUTTING_DOWN: &str = "The harness is shutting down.";
 
 /// What a tool asks the step loop to do once its result is recorded.
 #[derive(Clone, Debug, PartialEq)]
@@ -136,7 +140,9 @@ pub struct Producer {
 #[async_trait]
 pub trait Orchestrator: Send + Sync {
     /// Start a child of `parent`. Refuses when `parent` is itself a child, when the role may not be
-    /// spawned by the parent's role, or when the parent already has `max_children` running.
+    /// spawned by the parent's role, or when the parent already has `max_children` running. A request
+    /// with `harness: true` (the finish gate's verifier) is exempt from the last two: it needs only a
+    /// role of the parent's pack. While the runtime shuts down the answer is [`SHUTTING_DOWN`].
     async fn spawn(&self, parent: &SessionId, req: SpawnReq) -> Result<SessionId, String>;
     /// Wait until an `awaited` child has settled and take its settlement. Returns `Err` when
     /// `cancel` fires first (the child keeps running until it is stopped), when the child is not a

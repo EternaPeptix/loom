@@ -12,6 +12,9 @@
 //! `quotes` elements are objects `{handle, start, end, text}`; an element of another shape is an
 //! error naming its position and the four fields. They are checked with `gate::check_quotes(&ctx.blobs,
 //! …)`; `Err(text)` → error `{text}\nNothing was delivered. Correct the quotes and call finish again.`
+//! Refused, in a lead and in a child session alike, while a background job of this session (`ctx.jobs`)
+//! or a child agent (`S.orch.children`) is running: the error names them and says what to do with the
+//! tools this role has (`wait`, `job_kill`, `agent_stop`). No effect is set and nothing is recorded.
 //!
 //! **In a child session** (`S.is_child()`): store the answer when it is longer than
 //! `REPORT_MAX_CHARS` characters (`ctx.blobs.put_bytes`, handle via `BlobRef::handle`), render
@@ -21,30 +24,33 @@
 //! Output: ok, outcome `delivered`, message `Your result was delivered. This session is finished.`
 //!
 //! **In a lead session** (not a child):
-//! 1. Refused while a background job of this session (`ctx.jobs`) or a child agent
-//!    (`S.orch.children`) is running; the error names them and says `wait`, `job_kill`, `agent_stop`.
-//! 2. `S.ledger()`; `gate::check_finish_lead(&state, answer)`; `Err(text)` → error `text`.
-//! 3. `S.ledger_append(false, FinishClaim { summary: answer, evidence })`; `fid` is the new finish id.
-//! 4. Verification is required when `S.role.verify_finish && S.agents.verify_finish`. When it is not,
+//! 1. `S.ledger()`; `gate::check_finish_lead(&state, answer)`; `Err(text)` → error `text`.
+//! 2. `S.ledger_append(false, FinishClaim { summary: answer, evidence })`; `fid` is the new finish id.
+//! 3. Verification is required when `S.role.verify_finish && S.agents.verify_finish`. When it is not,
 //!    deliver with the note `not verified`. When it is, the result is delivered as `Finished` only after
-//!    a verifier child returned `accepted: true`; every other outcome fails closed (step 6).
-//!    - the rejections since the operator last answered an escalation (finishes after the last answered
-//!      `Finish f{n} …` ledger question) reach `MAX_FINISH_REJECTIONS`: escalate, no verifier is spawned.
+//!    a verifier child returned `accepted: true`; every other outcome fails closed (step 5).
+//!    - the rejections counted are those of the finishes after the latest accepted finish and after the
+//!      latest finish whose escalation the operator has answered (`rejection_floor`). When they reach
+//!      `MAX_FINISH_REJECTIONS`: escalate, no verifier is spawned.
 //!    - the verifier is `S.role.verifier` (resolved at pack load), spawned with `SpawnReq { harness:
 //!      true, … }` (not limited by `may_spawn` or `max_children`), brief from [`finish_brief`].
 //!    - cancelled while spawning or joining: error `Interrupted while the result was being verified;
-//!      nothing was delivered. Call finish again to resume.`
+//!      nothing was delivered. Call finish again to resume.` The orchestrator answering
+//!      `SHUTTING_DOWN` is treated the same way (error, nothing recorded): the turn is being cut and
+//!      the finish is made, and verified, again after the restart.
 //!    - `accepted: true` → `FinishVerdict` recorded, deliver with `verified by {child}`.
 //!    - `accepted: false` → `FinishVerdict` recorded; error text with the objections and the report, no
 //!      effect (the lead deals with them and calls finish again).
-//!    - spawn or join error, or no verdict in the payload: escalate.
-//! 5. Deliver: `InboxItem { kind: Finished, text: "{answer}{support}\n\n[{note}]", blocking: false, … }`
+//!    - any other spawn or join error, or no verdict in the payload: escalate (a verifier that ended
+//!      without a verdict has its report, cut at `REPORT_MAX_CHARS`, added to the item and the result).
+//! 4. Deliver: `InboxItem { kind: Finished, text: "{answer}{support}\n\n[{note}]", blocking: false, … }`
 //!    where `support` is the lead's `not_established` and its harness-checked quotes, then
 //!    `Effect::EndTurn(Finished)`; ok, outcome `finished — {note}`.
-//! 6. Escalate: a blocking ledger question `Finish {fid} was not delivered: …` and a blocking `Blocker`
-//!    inbox item whose text says why and contains the answer labelled NOT VERIFIED (`NOT VERIFIED -
-//!    REJECTED n TIMES` with every rejection's objections, or `NOT VERIFIED - VERIFICATION COULD NOT BE
-//!    RUN` with the reason); `Effect::EndTurn(Blocked)`. Answering the item restarts the rejection count.
+//! 5. Escalate: a blocking ledger question `Finish {fid} was not delivered: NOT VERIFIED …` and a
+//!    blocking `Blocker` inbox item whose text says why and contains the answer labelled NOT VERIFIED
+//!    (`NOT VERIFIED - REJECTED n TIMES` with every rejection's objections, or `NOT VERIFIED -
+//!    VERIFICATION COULD NOT BE RUN` with the reason); `Effect::EndTurn(Blocked)`. Answering the item
+//!    restarts the rejection count.
 //!
 //! ## `verdict` (verifier role)
 //! Refused outside a child session: ``verdict` belongs to a verifier working on an assignment.``
@@ -100,23 +106,27 @@
 //!
 //! Tests required (fake `Orchestrator` with scripted spawn/join results; temp journal; calls made
 //! through `loom_tools::execute`): for `finish` — empty answer, malformed quote element, failed
-//! quote, child delivery (effect, report text, payload, long answer stored), lead with open items
-//! refused, lead accepted with verification (verdict recorded, inbox item, effect), lead rejected
-//! (no effect, objections listed, finish recorded as not accepted), third finish after two
-//! rejections delivered unverified, verifier ending without a verdict, spawn failure, cancellation;
+//! quote, child delivery (effect, report text, payload, long answer stored), refusal while a job or a
+//! child agent is running (lead and child), lead with open items refused, lead accepted with
+//! verification (verdict recorded, inbox item, effect), lead rejected (no effect, objections listed,
+//! finish recorded as not accepted), third finish after two rejections escalated (not delivered) and
+//! verified again after the operator's answer, the rejection count restarting at an accepted finish
+//! but not at a question the lead wrote, verifier ending without a verdict and spawn failure (both
+//! escalated, nothing delivered), shutdown and cancellation (error, nothing recorded);
 //! `verdict` — each refusal, the settle effect and payload; `ask_user` — blocking and not, child
 //! refusal, missing `meanwhile`, ledger question recorded and referenced; `report_blocker` — child
 //! and lead; `wait` — nothing running, a running job, a running child.
 
-use super::{Delivery, Effect, Shared, SpawnReq, MAX_FINISH_REJECTIONS, REPORT_MAX_CHARS};
+use super::{Delivery, Effect, Shared, SpawnReq, MAX_FINISH_REJECTIONS, REPORT_MAX_CHARS, SHUTTING_DOWN};
 use crate::gate::{self, Quote, ReportInput, VerifiedQuote};
+use crate::pack::RoleDef;
 use async_trait::async_trait;
 use loom_core::event::{
     Author, Brief, Budget, ChildOutcome, Event, InboxItem, InboxKind, NoteKind, SpawnMode, ToolClass, ToolSpec,
     ToolStatus, TurnEndReason, META_OF_BLOB,
 };
 use loom_core::ids::new_item_id;
-use loom_core::ledger::{ClaimStatus, LedgerOp, LedgerState};
+use loom_core::ledger::{ClaimStatus, Evidence, LedgerOp, LedgerState};
 use loom_core::log::read_records;
 use loom_core::{BlobId, BlobRef};
 use loom_tools::jobs::JobState;
@@ -154,8 +164,13 @@ pub fn quote_items() -> Value {
 ///   active constraint (omitted when none), then `The lead's summary of the result:\n{answer}`, then
 ///   `What the lead says it did not establish:` when it stated something, then
 ///   `Lines the lead quotes as support:` with one line per quote `- {handle} lines {start}-{end}:
-///   {text cut to 300 characters}` (omitted when none), then `Claims recorded as supported:` with
-///   one line per supported claim `- {id}: {text}` (omitted when none).
+///   {text cut to 300 characters}` (omitted when none), then `Evidence the lead names for the result:`
+///   with one line per record of `evidence` (the ids given to `finish`; omitted when none), then
+///   `Claims recorded as supported:` with one line per supported claim `- {id}: {text}`, each followed
+///   by its evidence records, indented (omitted when none).
+///   An evidence line has the form the `verify` tool uses: `- {id} ({supports|undermines}) {handle}
+///   lines {a}-{b}: {quote cut to 300 characters} — {note}`, so the assignment names the stored
+///   output of every piece of evidence the result rests on.
 /// - `returns`: `A verdict, delivered by calling verdict.`
 /// - `stop_when`: `You have checked the summary against the goal, each constraint, and the outputs
 ///   it relies on.`
@@ -165,6 +180,7 @@ pub fn finish_brief(
     answer: &str,
     quotes: &[crate::gate::VerifiedQuote],
     not_established: Option<&str>,
+    evidence: &[String],
 ) -> Brief {
     let goal = ledger.goal.as_deref().unwrap_or("(no goal recorded)");
     let mut parts = vec![format!("Goal (set by the operator):\n{goal}")];
@@ -189,12 +205,17 @@ pub fn finish_brief(
         parts.push(format!("Lines the lead quotes as support:\n{}", lines.join("\n")));
     }
 
-    let supported: Vec<String> = ledger
-        .claims
-        .iter()
-        .filter(|c| c.status == ClaimStatus::Supported)
-        .map(|c| format!("- {}: {}", c.id, c.text))
-        .collect();
+    let record = |id: &String| ledger.evidence.iter().find(|e| &e.id == id);
+    let named: Vec<String> = evidence.iter().filter_map(record).map(evidence_line).collect();
+    if !named.is_empty() {
+        parts.push(format!("Evidence the lead names for the result:\n{}", named.join("\n")));
+    }
+
+    let mut supported: Vec<String> = Vec::new();
+    for c in ledger.claims.iter().filter(|c| c.status == ClaimStatus::Supported) {
+        supported.push(format!("- {}: {}", c.id, c.text));
+        supported.extend(c.evidence.iter().filter_map(record).map(|e| format!("  {}", evidence_line(e))));
+    }
     if !supported.is_empty() {
         parts.push(format!("Claims recorded as supported:\n{}", supported.join("\n")));
     }
@@ -213,6 +234,17 @@ pub fn finish_brief(
 /// The handle (`out:…`) the model uses for a stored output.
 fn handle_of(id: &BlobId) -> String {
     format!("out:{}", id.0.chars().take(16).collect::<String>())
+}
+
+/// One ledger evidence record as a verifier is shown it: which way it points, the stored output and
+/// lines it rests on, the quoted text and the note.
+fn evidence_line(e: &Evidence) -> String {
+    let i = &e.input;
+    let side = if i.supports { "supports" } else { "undermines" };
+    let handle = i.blob.as_ref().map(handle_of).unwrap_or_else(|| "no stored output".to_string());
+    let range = i.lines.map(|(a, b)| format!(" lines {a}-{b}")).unwrap_or_default();
+    let quote = cut_chars(i.quote.as_deref().unwrap_or(""), 300);
+    format!("- {} ({side}) {handle}{range}: {quote} \u{2014} {}", e.id, i.note)
 }
 
 /// `s` cut to `max` characters, with `…` appended when something was removed.
@@ -349,10 +381,10 @@ impl Finish {
         ToolOutput::ok("delivered", Body::Message("Your result was delivered. This session is finished.".into()))
     }
 
-    /// What this session still has running: its background jobs and its child agents.
-    async fn running_work(&self, ctx: &ToolCtx) -> Vec<String> {
+    /// What this session still has running: its background jobs, and its child agents.
+    async fn running_work(&self, ctx: &ToolCtx) -> (Vec<String>, Vec<String>) {
         let s = &self.0;
-        let mut out: Vec<String> = ctx
+        let jobs = ctx
             .jobs
             .list()
             .await
@@ -363,10 +395,15 @@ impl Finish {
                 format!("job {} ({})", j.id, cut_chars(&command, 60))
             })
             .collect();
-        out.extend(
-            s.orch.children(&s.session).await.into_iter().filter(|c| c.running).map(|c| format!("agent {} ({})", c.id, c.role)),
-        );
-        out
+        let agents = s
+            .orch
+            .children(&s.session)
+            .await
+            .into_iter()
+            .filter(|c| c.running)
+            .map(|c| format!("agent {} ({})", c.id, c.role))
+            .collect();
+        (jobs, agents)
     }
 
     /// The lead's result goes through the ledger gate and, when required, an independent verifier. When
@@ -380,13 +417,6 @@ impl Finish {
         not_established: Option<&str>,
     ) -> ToolOutput {
         let s = &self.0;
-        let running = self.running_work(ctx).await;
-        if !running.is_empty() {
-            return ToolOutput::error(format!(
-                "finish was refused: work started by this session is still running: {}. Nothing was delivered. Wait for it to report (`wait`), or end it with `job_kill` (jobs) or `agent_stop` (agents), then call finish again.",
-                running.join(", ")
-            ));
-        }
         let state = match s.ledger() {
             Ok(st) => st,
             Err(e) => return ToolOutput::error(e),
@@ -394,7 +424,8 @@ impl Finish {
         if let Err(text) = gate::check_finish_lead(&state, answer) {
             return ToolOutput::error(text);
         }
-        let claim = LedgerOp::FinishClaim { summary: answer.to_string(), evidence: strings_of(args.get("evidence")) };
+        let evidence = strings_of(args.get("evidence"));
+        let claim = LedgerOp::FinishClaim { summary: answer.to_string(), evidence: evidence.clone() };
         let after = match s.ledger_append(false, claim) {
             Ok((_, after)) => after,
             Err(e) => return ToolOutput::error(e),
@@ -408,8 +439,9 @@ impl Finish {
 
         let mut note = "not verified".to_string();
         if s.role.verify_finish && s.agents.verify_finish {
-            let floor = answered_escalation(&after);
-            let rejections: Vec<(String, Vec<String>)> = after
+            // `state` is the ledger before this finish: only earlier finishes count or restart the count.
+            let floor = rejection_floor(&state);
+            let rejections: Vec<(String, Vec<String>)> = state
                 .finishes
                 .iter()
                 .filter(|f| f.accepted == Some(false) && finish_number(&f.id) > floor)
@@ -420,12 +452,12 @@ impl Finish {
             }
             let Some(role) = s.role.verifier.clone() else {
                 let why = format!("the role `{}` has no verifier role in its pack", s.role.name);
-                return self.escalate(ctx, &fid, Unverified::NotRun(why), answer, &support);
+                return self.escalate(ctx, &fid, Unverified::NotRun { why, report: None }, answer, &support);
             };
             let req = SpawnReq {
                 role,
                 mode: SpawnMode::Fresh,
-                brief: finish_brief(&state, answer, verified, not_established),
+                brief: finish_brief(&state, answer, verified, not_established, &evidence),
                 budget: Budget { max_steps: Some(s.agents.child_max_steps), max_minutes: Some(s.agents.child_max_minutes) },
                 call_id: ctx.call_id.clone(),
                 title: format!("verify finish {fid}"),
@@ -443,7 +475,14 @@ impl Finish {
                             "Interrupted while the result was being verified; nothing was delivered. Call finish again to resume.",
                         );
                     }
-                    return self.escalate(ctx, &fid, Unverified::NotRun(e), answer, &support);
+                    // A restart is not something for the operator to decide: the turn is being cut, and
+                    // the finish is made (and verified) again when the session is resumed.
+                    if e == SHUTTING_DOWN {
+                        return ToolOutput::error(
+                            "The harness is shutting down, so the result could not be verified; nothing was delivered. Call finish again.",
+                        );
+                    }
+                    return self.escalate(ctx, &fid, Unverified::NotRun { why: e, report: None }, answer, &support);
                 }
                 Ok((child, settled)) => match settled.payload.get("accepted").and_then(Value::as_bool) {
                     Some(true) => {
@@ -486,7 +525,8 @@ impl Finish {
                             "the verifier ({child}) ended as {} without giving a verdict",
                             outcome_word(settled.outcome)
                         );
-                        return self.escalate(ctx, &fid, Unverified::NotRun(why), answer, &support);
+                        let report = Some(settled.report.trim()).filter(|r| !r.is_empty()).map(cut_report);
+                        return self.escalate(ctx, &fid, Unverified::NotRun { why, report }, answer, &support);
                     }
                 },
             }
@@ -501,7 +541,7 @@ impl Finish {
     /// answer labelled NOT VERIFIED, and the turn ends until the operator answers it.
     fn escalate(&self, ctx: &ToolCtx, fid: &str, why: Unverified, answer: &str, support: &str) -> ToolOutput {
         let s = &self.0;
-        let (label, detail, short) = match &why {
+        let (label, mut detail, short, report) = match why {
             Unverified::Rejected(rejections) => {
                 let n = rejections.len();
                 let mut detail = format!(
@@ -513,20 +553,23 @@ impl Finish {
                         detail.push_str(&format!("\n- {o}"));
                     }
                 }
-                (format!("NOT VERIFIED - REJECTED {n} TIMES"), detail, format!("the verifier rejected it {n} times"))
+                (format!("NOT VERIFIED - REJECTED {n} TIMES"), detail, format!("the verifier rejected it {n} times"), None)
             }
-            Unverified::NotRun(e) => (
+            Unverified::NotRun { why, report } => (
                 "NOT VERIFIED - VERIFICATION COULD NOT BE RUN".to_string(),
-                format!("Verification could not be run: {e}"),
-                format!("verification could not be run: {e}"),
+                format!("Verification could not be run: {why}"),
+                format!("verification could not be run: {why}"),
+                report,
             ),
         };
+        // What the verifier itself reported (what blocked it, what it tried), for the operator and the lead.
+        let report = report.map(|r| format!("\n\nThe verifier's report:\n{r}")).unwrap_or_default();
+        detail.push_str(&report);
         let text = format!(
             "{label}\n\n{detail}\n\nThe lead's answer (NOT VERIFIED; it was not delivered as finished):\n{answer}{support}\n\nAnswer this item to tell the lead how to go on. Its next finish is verified again."
         );
         // The ledger question names the finish, which is how later finishes know where the count restarts.
-        let question = format!("Finish {fid} was not delivered: {label}. The answer and the reason are in the inbox item; reply to say how the lead should go on.");
-        let qid = match record_question(s, &question, true) {
+        let qid = match record_question(s, &escalation_question(fid, &label), true) {
             Ok(q) => q,
             Err(e) => return ToolOutput::error(e),
         };
@@ -535,7 +578,7 @@ impl Finish {
         ToolOutput::ok(
             "not verified — waiting for the operator",
             Body::Message(format!(
-                "The result could not be verified ({short}) and was NOT delivered as finished. It is in the operator's inbox, labelled NOT VERIFIED. This turn ends here; you will be resumed when the operator answers, and your next finish will be verified again."
+                "The result could not be verified ({short}) and was NOT delivered as finished. It is in the operator's inbox, labelled NOT VERIFIED. This turn ends here; you will be resumed when the operator answers, and your next finish will be verified again.{report}"
             )),
         )
     }
@@ -543,11 +586,58 @@ impl Finish {
 
 /// Why a finish that needs verification was not delivered.
 enum Unverified {
-    /// Rejected by the verifier at least `MAX_FINISH_REJECTIONS` times since the operator last answered:
-    /// the finish id and objections of each rejection.
+    /// Rejected by the verifier `MAX_FINISH_REJECTIONS` times since the count last restarted: the finish
+    /// id and objections of each rejection.
     Rejected(Vec<(String, Vec<String>)>),
-    /// The verifier could not be started or joined, or it ended without a verdict.
-    NotRun(String),
+    /// The verifier could not be started or joined, or it ended without a verdict (`report` is then what
+    /// it reported instead).
+    NotRun { why: String, report: Option<String> },
+}
+
+/// The refusal of `finish` while work this session started is still running. It names only tools the
+/// role has, and says what to do about an agent that no tool of the session can end.
+fn running_refusal(role: &RoleDef, jobs: &[String], agents: &[String]) -> String {
+    let has = |tool: &str| role.tools.iter().any(|t| t == tool);
+    let running: Vec<&str> = jobs.iter().chain(agents).map(String::as_str).collect();
+    let mut text = format!(
+        "finish was refused: work started by this session is still running: {}. Nothing was delivered.",
+        running.join(", ")
+    );
+    let mut ways: Vec<&str> = Vec::new();
+    if has("wait") {
+        ways.push("wait for it to report (`wait`)");
+    }
+    if !jobs.is_empty() && has("job_kill") {
+        ways.push("end a job with `job_kill`");
+    }
+    if !agents.is_empty() && has("agent_stop") {
+        ways.push("end an agent with `agent_stop`");
+    }
+    if ways.is_empty() {
+        text.push_str(" Call finish again when it has ended.");
+    } else {
+        text.push_str(&format!(" To go on: {}; then call finish again.", ways.join(", or ")));
+    }
+    if !agents.is_empty() {
+        text.push_str(
+            " An agent takes a moment to end after it is stopped. One that stays listed and never reports is idle, which happens after a harness restart: it cannot be stopped from here, and the operator has to resume it.",
+        );
+        let tell: Vec<String> = ["ask_user", "report_blocker"].into_iter().filter(|t| has(t)).map(String::from).collect();
+        if !tell.is_empty() {
+            text.push_str(&format!(" Tell the operator with {}.", or_list(&tell)));
+        }
+    }
+    text
+}
+
+/// A verifier's report as the operator and the lead are shown it: whole, or cut with a visible marker.
+fn cut_report(report: &str) -> String {
+    let total = report.chars().count();
+    if total <= REPORT_MAX_CHARS {
+        return report.to_string();
+    }
+    let head: String = report.chars().take(REPORT_MAX_CHARS).collect();
+    format!("{head}\n[report cut at {REPORT_MAX_CHARS} of {total} characters]")
 }
 
 /// The number in a finish id (`f3` is 3); 0 for anything else.
@@ -555,17 +645,38 @@ fn finish_number(id: &str) -> usize {
     id.strip_prefix('f').and_then(|n| n.parse().ok()).unwrap_or(0)
 }
 
-/// The number of the latest finish whose escalation the operator has answered (0 when none). An
-/// escalation is recorded as a blocking ledger question whose text starts `Finish f{n} `; rejections of
-/// finishes up to that one no longer count towards `MAX_FINISH_REJECTIONS`.
-fn answered_escalation(state: &LedgerState) -> usize {
-    state
+/// What follows `Finish {fid} ` in the ledger question of an escalation.
+const ESCALATION_MARK: &str = "was not delivered";
+
+/// The blocking ledger question an escalation of finish `fid` is recorded as.
+fn escalation_question(fid: &str, label: &str) -> String {
+    format!("Finish {fid} {ESCALATION_MARK}: {label}. The answer and the reason are in the inbox item; reply to say how the lead should go on.")
+}
+
+/// The finish id a ledger question names, when its text has the form of [`escalation_question`].
+fn escalated_finish(question: &str) -> Option<&str> {
+    let (fid, rest) = question.strip_prefix("Finish ")?.split_once(' ')?;
+    rest.starts_with(ESCALATION_MARK).then_some(fid)
+}
+
+/// The number of the latest finish in `state` at which the count of rejections restarts (0 when none):
+/// rejections of finishes up to that one no longer count towards `MAX_FINISH_REJECTIONS`. It is the
+/// later of
+/// - the latest accepted finish: what was rejected before it has been dealt with;
+/// - the latest finish whose escalation the operator has answered. An escalation is a blocking ledger
+///   question written by [`escalation_question`]; it counts only when the finish it names exists and has
+///   no verdict, which is what an escalated finish looks like. A question the lead writes with `ask_user`
+///   therefore restarts nothing by naming a finish that does not exist yet or that the verifier judged.
+fn rejection_floor(state: &LedgerState) -> usize {
+    let accepted = state.finishes.iter().filter(|f| f.accepted == Some(true)).map(|f| finish_number(&f.id));
+    let answered = state
         .questions
         .iter()
-        .filter(|q| q.answer.is_some())
-        .filter_map(|q| q.text.strip_prefix("Finish ")?.split_whitespace().next().map(finish_number))
-        .max()
-        .unwrap_or(0)
+        .filter(|q| q.blocking && q.answer.is_some())
+        .filter_map(|q| escalated_finish(&q.text))
+        .filter(|fid| state.finishes.iter().any(|f| f.id == *fid && f.accepted.is_none()))
+        .map(finish_number);
+    accepted.chain(answered).max().unwrap_or(0)
 }
 
 /// What the lead stated it did not establish and the quotes the harness checked, as paragraphs to
@@ -658,6 +769,10 @@ impl Tool for Finish {
                 return ToolOutput::error(format!("{text}\nNothing was delivered. Correct the quotes and call finish again."))
             }
         };
+        let (jobs, agents) = self.running_work(ctx).await;
+        if !jobs.is_empty() || !agents.is_empty() {
+            return ToolOutput::error(running_refusal(&self.0.role, &jobs, &agents));
+        }
         if self.0.is_child() {
             self.finish_child(ctx, answer, &verified, str_arg(args, "not_established"))
         } else {
@@ -926,6 +1041,7 @@ mod tests {
     use crate::rtools::testkit::{core_role, rig, rig_with, Rig};
     use crate::rtools::ChildInfo;
     use loom_core::event::{ToolResult, ToolStatus as Status};
+    use loom_core::ledger::{EvidenceInput, EvidenceKind};
     use loom_core::log::{Durability, SessionLog};
 
     fn map(v: Value) -> Map<String, Value> {
@@ -1158,7 +1274,24 @@ mod tests {
         assert!(items[0].text.starts_with("NOT VERIFIED - VERIFICATION COULD NOT BE RUN"), "{}", items[0].text);
         assert!(items[0].text.contains("Verification could not be run: the verifier (s-kid1) ended as budget exhausted without giving a verdict"));
         assert!(items[0].text.contains("(NOT VERIFIED; it was not delivered as finished):\nParser fixed."));
+        // What the verifier reported instead of a verdict reaches the operator and the lead.
+        assert!(items[0].text.contains("without giving a verdict\n\nThe verifier's report:\nran out\n\nThe lead's answer"), "{}", items[0].text);
+        assert!(res.text.contains("The verifier's report:\nran out"), "{}", res.text);
         assert_eq!(r.shared.ledger().unwrap().finishes[0].accepted, None);
+    }
+
+    #[tokio::test]
+    async fn a_long_verifier_report_is_cut_with_a_visible_marker() {
+        let r = lead();
+        let long = "é".repeat(REPORT_MAX_CHARS + 7);
+        r.orch.settle("s-kid1", ChildOutcome::Blocked, &long, Value::Null);
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let items = inbox_items(&r);
+        let marker = format!("\n[report cut at {REPORT_MAX_CHARS} of {} characters]", REPORT_MAX_CHARS + 7);
+        assert!(items[0].text.contains(&format!("{}{marker}", "é".repeat(REPORT_MAX_CHARS))), "marker missing");
+        assert!(!items[0].text.contains(&long));
+        assert_eq!(cut_report("short"), "short");
     }
 
     #[tokio::test]
@@ -1175,6 +1308,79 @@ mod tests {
         assert!(items[0].blocking);
         assert!(items[0].text.contains("Verification could not be run: Too many agents are running."), "{}", items[0].text);
         assert!(items[0].text.contains("NOT VERIFIED") && items[0].text.contains("Parser fixed."));
+    }
+
+    #[tokio::test]
+    async fn a_spawn_refused_by_the_shutdown_records_nothing_and_is_verified_on_the_next_finish() {
+        let r = lead();
+        r.orch.spawn_script.lock().unwrap().push_back(Err(SHUTTING_DOWN.into()));
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("The harness is shutting down") && res.text.contains("nothing was delivered. Call finish again."), "{}", res.text);
+        assert!(effect(&r).is_none());
+        assert!(inbox_items(&r).is_empty());
+        let st = r.shared.ledger().unwrap();
+        assert!(st.questions.is_empty());
+        assert_eq!(st.finishes[0].accepted, None);
+        // After the restart the same finish goes to a verifier.
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "fine", accepted_payload());
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(res.text.contains("finished — verified by s-kid1"), "{}", res.text);
+    }
+
+    #[tokio::test]
+    async fn a_question_the_lead_wrote_does_not_restart_the_rejection_count() {
+        let r = lead();
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "no", rejected_payload());
+        r.orch.settle("s-kid2", ChildOutcome::Returned, "no", rejected_payload());
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        // Questions in the escalation's own words: one names a finish that does not exist, one the
+        // finish about to be made, one a finish the verifier judged. The operator answers all three.
+        for (i, named) in ["f99", "f3", "f1"].iter().enumerate() {
+            let question = escalation_question(named, "NOT VERIFIED - REJECTED 2 TIMES");
+            let res = r.call("ask_user", json!({"question": question})).await;
+            assert_eq!(res.status, Status::Ok, "{}", res.text);
+            r.user_op(LedgerOp::QuestionAnswer { id: format!("q{}", i + 1), answer: "go on".into() });
+        }
+        assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Asked)));
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert_eq!(spawn_count(&r), 2);
+        r.shared.take_emitted();
+        // Both rejections still count: the third finish is escalated, not verified again.
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert_eq!(spawn_count(&r), 2);
+        assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Blocked)));
+        let items = inbox_items(&r);
+        assert!(items[0].text.starts_with("NOT VERIFIED - REJECTED 2 TIMES"), "{}", items[0].text);
+    }
+
+    #[tokio::test]
+    async fn rejections_before_an_accepted_finish_no_longer_count() {
+        let r = lead();
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "no", rejected_payload());
+        r.orch.settle("s-kid2", ChildOutcome::Returned, "fine", accepted_payload());
+        r.orch.settle("s-kid3", ChildOutcome::Returned, "no", rejected_payload());
+        r.orch.settle("s-kid4", ChildOutcome::Returned, "fine", accepted_payload());
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert!(res.text.contains("finished — verified by s-kid2"), "{}", res.text);
+        assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Finished)));
+        // The operator sends a follow-up; its first finish is rejected.
+        let res = r.call("finish", json!({"answer": "Lexer fixed too."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(effect(&r).is_none());
+        // One rejection since the accepted finish: the next one is verified, not escalated.
+        let res = r.call("finish", json!({"answer": "Lexer fixed too."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(res.text.contains("finished — verified by s-kid4"), "{}", res.text);
+        assert_eq!(spawn_count(&r), 4);
+        let verdicts: Vec<Option<bool>> = r.shared.ledger().unwrap().finishes.iter().map(|f| f.accepted).collect();
+        assert_eq!(verdicts, vec![Some(false), Some(true), Some(false), Some(true)]);
     }
 
     #[tokio::test]
@@ -1211,6 +1417,7 @@ mod tests {
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(res.text.contains("job j1 (sleep 30)") && res.text.contains("job_kill") && res.text.contains("wait"), "{}", res.text);
+        assert!(!res.text.contains("agent_stop"), "{}", res.text);
         assert!(effect(&r).is_none());
         assert!(r.shared.ledger().unwrap().finishes.is_empty());
         assert_eq!(spawn_count(&r), 0);
@@ -1222,15 +1429,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_finish_is_refused_while_its_job_is_running() {
+        let r = rig("worker", true, false);
+        let started = r.call("bash", json!({"command": "sleep 30", "background": true})).await;
+        assert_eq!(started.status, Status::Ok, "{}", started.text);
+        let res = r.call("finish", json!({"answer": "It is beta."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("finish was refused") && res.text.contains("job j1 (sleep 30)"), "{}", res.text);
+        assert!(res.text.contains("Nothing was delivered."), "{}", res.text);
+        assert!(res.text.contains("To go on: wait for it to report (`wait`), or end a job with `job_kill`; then call finish again."), "{}", res.text);
+        assert!(effect(&r).is_none());
+        let killed = r.call("job_kill", json!({"job": "j1"})).await;
+        assert_eq!(killed.status, Status::Ok, "{}", killed.text);
+        let res = r.call("finish", json!({"answer": "It is beta."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(matches!(effect(&r), Some(Effect::Settle(_))));
+    }
+
+    #[tokio::test]
     async fn finish_is_refused_while_a_child_agent_is_running() {
         let r = lead();
         r.orch.running_child("s-kid9", "worker");
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(res.text.contains("agent s-kid9 (worker)") && res.text.contains("agent_stop"), "{}", res.text);
+        assert!(!res.text.contains("job_kill"), "{}", res.text);
+        // An agent left idle by a restart cannot be ended with a tool; the refusal says who can.
+        assert!(res.text.contains("the operator has to resume it. Tell the operator with `ask_user` or `report_blocker`."), "{}", res.text);
         assert!(effect(&r).is_none());
         assert!(r.shared.ledger().unwrap().finishes.is_empty());
         assert_eq!(spawn_count(&r), 0);
+    }
+
+    #[test]
+    fn the_running_work_refusal_names_only_tools_the_role_has() {
+        let mut role = core_role("lead");
+        let (jobs, agents) = (vec!["job j1 (make)".to_string()], vec!["agent s-kid1 (worker)".to_string()]);
+        let all = running_refusal(&role, &jobs, &agents);
+        assert!(
+            all.contains("still running: job j1 (make), agent s-kid1 (worker). Nothing was delivered. To go on: wait for it to report (`wait`), or end a job with `job_kill`, or end an agent with `agent_stop`; then call finish again."),
+            "{all}"
+        );
+        role.tools.retain(|t| !matches!(t.as_str(), "wait" | "job_kill" | "agent_stop" | "report_blocker"));
+        let bare = running_refusal(&role, &jobs, &agents);
+        assert!(bare.contains("Nothing was delivered. Call finish again when it has ended."), "{bare}");
+        assert!(!bare.contains("`wait`") && !bare.contains("job_kill") && !bare.contains("agent_stop"), "{bare}");
+        assert!(bare.ends_with("Tell the operator with `ask_user`."), "{bare}");
+        role.tools.retain(|t| t != "ask_user");
+        assert!(running_refusal(&role, &jobs, &agents).ends_with("the operator has to resume it."));
+        assert!(!running_refusal(&role, &jobs, &[]).contains("operator"));
     }
 
     #[tokio::test]
@@ -1528,13 +1775,86 @@ mod tests {
             ..LedgerState::default()
         };
         let q = VerifiedQuote { blob: BlobId("ab".repeat(32)), start: 3, end: 4, text: "z".repeat(400) };
-        let b = finish_brief(&st, "done", &[q], None);
+        let b = finish_brief(&st, "done", &[q], None, &[]);
         assert_eq!(b.question, "Try to refute that this mission is finished as its lead describes.");
         assert_eq!(b.returns.as_deref(), Some("A verdict, delivered by calling verdict."));
         assert!(b.hypothesis.is_none() && b.scope.is_none() && b.do_not.is_none());
         let c = b.context.unwrap();
         assert!(c.contains(&format!("- out:{} lines 3-4: {}…", "ab".repeat(8), "z".repeat(300))), "{c}");
         assert!(c.contains("Claims recorded as supported:\n- c1: it works"));
-        assert!(!c.contains("open one") && !c.contains("Constraints:"));
+        assert!(!c.contains("open one") && !c.contains("Constraints:") && !c.contains("Evidence the lead names"));
+    }
+
+    #[test]
+    fn brief_names_the_stored_output_of_every_piece_of_evidence() {
+        let evidence = |id: &str, blob: Option<&str>, supports: bool| Evidence {
+            id: id.into(),
+            input: EvidenceInput {
+                claim: "c1".into(),
+                kind: EvidenceKind::Execution,
+                supports,
+                session: "s-test".into(),
+                call_id: "call-0".into(),
+                blob: blob.map(|b| BlobId(b.repeat(32))),
+                lines: blob.map(|_| (2, 3)),
+                quote: blob.map(|_| "line two".to_string()),
+                note: "shows it".into(),
+                attested: true,
+            },
+            n: 1,
+        };
+        let st = LedgerState {
+            claims: vec![loom_core::ledger::Claim {
+                id: "c1".into(),
+                text: "it works".into(),
+                status: ClaimStatus::Supported,
+                note: String::new(),
+                evidence: vec!["e1".into(), "e3".into()],
+            }],
+            evidence: vec![evidence("e1", Some("ab"), true), evidence("e2", Some("cd"), false), evidence("e3", None, true)],
+            ..LedgerState::default()
+        };
+        // `e9` is not a record of this ledger and is left out.
+        let c = finish_brief(&st, "done", &[], None, &["e2".to_string(), "e9".to_string()]).context.unwrap();
+        let (ab, cd) = ("ab".repeat(8), "cd".repeat(8));
+        assert!(
+            c.contains(&format!("Evidence the lead names for the result:\n- e2 (undermines) out:{cd} lines 2-3: line two \u{2014} shows it\n\n")),
+            "{c}"
+        );
+        assert!(
+            c.ends_with(&format!(
+                "Claims recorded as supported:\n- c1: it works\n  - e1 (supports) out:{ab} lines 2-3: line two \u{2014} shows it\n  - e3 (supports) no stored output:  \u{2014} shows it"
+            )),
+            "{c}"
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_gives_the_verifier_the_handles_of_the_evidence_it_rests_on() {
+        let r = lead();
+        r.model_op(LedgerOp::ClaimAdd { text: "the parser is fixed".into() });
+        let h = r.output("line one\nline two\n", "bash", ToolClass::Exec);
+        r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
+            claim: "c1".into(),
+            kind: EvidenceKind::Execution,
+            supports: true,
+            session: "s-test".into(),
+            call_id: "call-0".into(),
+            blob: Some(r.env.ctx.blobs.resolve(&h).unwrap()),
+            lines: Some((2, 2)),
+            quote: Some("line two".into()),
+            note: "the test passes".into(),
+            attested: true,
+        }));
+        r.model_op(LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: String::new() });
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "fine", accepted_payload());
+        // No quotes: the assignment still names the stored output, through the ledger evidence.
+        let res = r.call("finish", json!({"answer": "Parser fixed.", "evidence": ["e1"]})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let spawned = r.orch.spawned.lock().unwrap().clone();
+        let ctx_text = spawned[0].1.brief.context.clone().unwrap();
+        let line = format!("- e1 (supports) {h} lines 2-2: line two \u{2014} the test passes");
+        assert!(ctx_text.contains(&format!("Evidence the lead names for the result:\n{line}")), "{ctx_text}");
+        assert!(ctx_text.contains(&format!("Claims recorded as supported:\n- c1: the parser is fixed\n  {line}")), "{ctx_text}");
     }
 }

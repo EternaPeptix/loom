@@ -22,7 +22,8 @@
 //! ```
 //! `verifier` defaults to the pack's role named `verifier` when it has one. A role with
 //! `verify_finish = true` (or an explicit `verifier`) whose verifier is not a role of the same pack that is
-//! `read_only` and has the `verdict` tool is a load error.
+//! `read_only` and has the `verdict` tool and `out_read` or `out_grep` is a load error. (A verdict must
+//! name evidence the verifier opened, and those two tools are how it opens another session's output.)
 //! Unknown keys are errors. File paths must stay inside the pack directory (no absolute paths, no
 //! `..` components). Prompt and preamble files must be valid UTF-8 and are used with trailing
 //! whitespace trimmed.
@@ -179,8 +180,12 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev.last().copied().unwrap_or(0)
 }
 
+/// What a verifier role must be, as the load errors put it.
+const VERIFIER_NEEDS: &str = "a role with `read_only = true` whose `tools` include `verdict` and `out_read` or `out_grep`";
+
 /// The verifier role of `r`: its `verifier` key, else the pack's role named `verifier`. A role that
-/// needs one (`verify_finish`, or an explicit key) must get a read-only role that has `verdict`.
+/// needs one (`verify_finish`, or an explicit key) must get a read-only role that can give a verdict
+/// and open the stored outputs it is pointed at.
 fn resolve_verifier(
     at: &str,
     is_verifier: bool,
@@ -190,24 +195,28 @@ fn resolve_verifier(
 ) -> Result<Option<String>, String> {
     // The role named `verifier` is not its own default verifier.
     let wanted = r.verifier.clone().or_else(|| (roles.contains_key("verifier") && !is_verifier).then(|| "verifier".to_string()));
-    let usable =
-        |name: &str| roles.get(name).is_some_and(|v| v.read_only && v.tools.iter().flatten().any(|t| t == "verdict"));
+    let usable = |name: &str| {
+        roles.get(name).is_some_and(|v| {
+            let has = |tool: &str| v.tools.iter().flatten().any(|t| t == tool);
+            v.read_only && has("verdict") && (has("out_read") || has("out_grep"))
+        })
+    };
     if !(r.verify_finish || r.verifier.is_some()) {
         return Ok(wanted.filter(|n| usable(n)));
     }
     let Some(name) = wanted else {
         return Err(format!(
-            "{at}: `verify_finish` = true needs a verifier role. Add a role named \"verifier\" to this pack, or set `verifier = \"<role>\"` to a read-only role that has the `verdict` tool (roles: {role_list})"
+            "{at}: `verify_finish` = true needs a verifier role. Add a role named \"verifier\" to this pack, or set `verifier = \"<role>\"`; it must be {VERIFIER_NEEDS} (roles: {role_list})"
         ));
     };
     if !roles.contains_key(&name) {
         return Err(format!(
-            "{at}: `verifier` = \"{name}\" is not a role of this pack (roles: {role_list}). Name a read-only role that has the `verdict` tool"
+            "{at}: `verifier` = \"{name}\" is not a role of this pack (roles: {role_list}). Name {VERIFIER_NEEDS}"
         ));
     }
     if !usable(&name) {
         return Err(format!(
-            "{at}: the verifier role \"{name}\" must have `read_only = true` and the `verdict` tool in its `tools`. Fix that role, or point `verifier` at another role"
+            "{at}: the verifier role \"{name}\" must be {VERIFIER_NEEDS}: it gives the verdict, and has to open the evidence it is pointed at without being able to change the workspace. Fix that role, or point `verifier` at another role"
         ));
     }
     Ok(Some(name))
@@ -595,13 +604,19 @@ mod tests {
         // names a role that is not read-only or has no verdict
         let e = err(&with("verifier = \"b\""));
         assert!(e.contains("read_only = true") && e.contains("verdict"), "{e}");
-        let ok = GOOD.replace("[\"read\", \"grep\"]", "[\"read\", \"verdict\"]\nread_only = true");
-        let ok = ok.replace("tools = [\"bash\"]", "tools = [\"bash\"]\nverify_finish = true\nverifier = \"b\"");
-        let d = mk(&ok);
-        let p = Packs::load(d.path()).unwrap();
-        assert_eq!(p.role(Some("mine"), Some("a")).unwrap().verifier.as_deref(), Some("b"));
+        // read-only with verdict, but unable to open the evidence a verdict has to name
+        let b_as = |tools: &str| {
+            with("verifier = \"b\"").replace("[\"read\", \"grep\"]", &format!("{tools}\nread_only = true"))
+        };
+        let e = err(&b_as("[\"read\", \"verdict\"]"));
+        assert!(e.contains("the verifier role \"b\"") && e.contains("`out_read` or `out_grep`"), "{e}");
+        for tools in ["[\"out_read\", \"verdict\"]", "[\"verdict\", \"out_grep\"]"] {
+            let d = mk(&b_as(tools));
+            let p = Packs::load(d.path()).unwrap();
+            assert_eq!(p.role(Some("mine"), Some("a")).unwrap().verifier.as_deref(), Some("b"));
+        }
         // the default is the role named verifier
-        let named = "name = \"mine\"\ndefault_role = \"a\"\n[roles.a]\nprompt = \"a.md\"\ntools = [\"bash\"]\nverify_finish = true\n[roles.verifier]\nprompt = \"b.md\"\ntools = [\"verdict\"]\nread_only = true\n";
+        let named = "name = \"mine\"\ndefault_role = \"a\"\n[roles.a]\nprompt = \"a.md\"\ntools = [\"bash\"]\nverify_finish = true\n[roles.verifier]\nprompt = \"b.md\"\ntools = [\"verdict\", \"out_read\"]\nread_only = true\n";
         let d = mk(named);
         let p = Packs::load(d.path()).unwrap();
         assert_eq!(p.role(Some("mine"), Some("a")).unwrap().verifier.as_deref(), Some("verifier"));
@@ -622,7 +637,7 @@ mod tests {
             let pack = p.get(pack).unwrap();
             for r in pack.roles.values().filter(|r| r.verify_finish) {
                 let v = &pack.roles[r.verifier.as_deref().unwrap()];
-                assert!(v.read_only && v.tools.iter().any(|t| t == "verdict"));
+                assert!(v.read_only && v.tools.iter().any(|t| t == "verdict") && v.tools.iter().any(|t| t == "out_read"));
             }
         }
     }
