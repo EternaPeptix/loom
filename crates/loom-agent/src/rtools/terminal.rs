@@ -14,7 +14,8 @@
 //! …)`; `Err(text)` → error `{text}\nNothing was delivered. Correct the quotes and call finish again.`
 //! Refused, in a lead and in a child session alike, while a background job of this session (`ctx.jobs`)
 //! or a child agent (`S.orch.children`) is running: the error names them and says what to do with the
-//! tools this role has (`wait`, `job_kill`, `agent_stop`). No effect is set and nothing is recorded.
+//! tools this role has (`wait`, `job_kill`, `agent_stop`; that `job_kill` and `finish` can go in one
+//! reply, since a child at its budget has no step to spare). No effect is set and nothing is recorded.
 //!
 //! **In a child session** (`S.is_child()`): store the answer when it is longer than
 //! `REPORT_MAX_CHARS` characters (`ctx.blobs.put_bytes`, handle via `BlobRef::handle`), render
@@ -629,13 +630,24 @@ fn running_refusal(role: &RoleDef, jobs: &[String], agents: &[String]) -> String
     } else {
         text.push_str(&format!(" To go on: {}; then call finish again.", ways.join(", or ")));
     }
-    if !agents.is_empty() {
+    // A job ends before `job_kill` returns, so one reply can end it and deliver: a child whose budget is
+    // used up has no step to spare.
+    if !jobs.is_empty() && has("job_kill") {
         text.push_str(
-            " An agent takes a moment to end after it is stopped. One that stays listed and never reports is idle, which happens after a harness restart: it cannot be stopped from here, and the operator has to resume it.",
+            " `job_kill` and `finish` can go in the same reply: the calls run in order, so the job has ended when finish runs.",
         );
-        let tell: Vec<String> = ["ask_user", "report_blocker"].into_iter().filter(|t| has(t)).map(String::from).collect();
-        if !tell.is_empty() {
-            text.push_str(&format!(" Tell the operator with {}.", or_list(&tell)));
+    }
+    if !agents.is_empty() {
+        if has("agent_stop") {
+            text.push_str(
+                " An agent takes a moment to end after it is stopped: the result of `agent_stop` says whether it has ended.",
+            );
+        } else {
+            let tell: Vec<String> = ["ask_user", "report_blocker"].into_iter().filter(|t| has(t)).map(String::from).collect();
+            if !tell.is_empty() {
+                let tell = or_list(&tell);
+                text.push_str(&format!(" This session cannot stop an agent: if one does not end, tell the operator with {tell}."));
+            }
         }
     }
     text
@@ -1457,6 +1469,8 @@ mod tests {
         assert!(res.text.contains("finish was refused") && res.text.contains("job j1 (sleep 30)"), "{}", res.text);
         assert!(res.text.contains("Nothing was delivered."), "{}", res.text);
         assert!(res.text.contains("To go on: wait for it to report (`wait`), or end a job with `job_kill`; then call finish again."), "{}", res.text);
+        // A child at its budget has two steps left: ending the job and delivering fit in one.
+        assert!(res.text.contains("`job_kill` and `finish` can go in the same reply: the calls run in order"), "{}", res.text);
         assert!(effect(&r).is_none());
         let killed = r.call("job_kill", json!({"job": "j1"})).await;
         assert_eq!(killed.status, Status::Ok, "{}", killed.text);
@@ -1473,8 +1487,9 @@ mod tests {
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(res.text.contains("agent s-kid9 (worker)") && res.text.contains("agent_stop"), "{}", res.text);
         assert!(!res.text.contains("job_kill"), "{}", res.text);
-        // An agent left idle by a restart cannot be ended with a tool; the refusal says who can.
-        assert!(res.text.contains("the operator has to resume it. Tell the operator with `ask_user` or `report_blocker`."), "{}", res.text);
+        // A stopped agent, idle or not, ends by itself; `agent_stop` says when it has not yet.
+        assert!(res.text.contains("the result of `agent_stop` says whether it has ended."), "{}", res.text);
+        assert!(!res.text.contains("operator"), "{}", res.text);
         assert!(effect(&r).is_none());
         assert!(r.shared.ledger().unwrap().finishes.is_empty());
         assert_eq!(spawn_count(&r), 0);
@@ -1489,13 +1504,14 @@ mod tests {
             all.contains("still running: job j1 (make), agent s-kid1 (worker). Nothing was delivered. To go on: wait for it to report (`wait`), or end a job with `job_kill`, or end an agent with `agent_stop`; then call finish again."),
             "{all}"
         );
+        assert!(all.contains("`job_kill` and `finish` can go in the same reply"), "{all}");
         role.tools.retain(|t| !matches!(t.as_str(), "wait" | "job_kill" | "agent_stop" | "report_blocker"));
         let bare = running_refusal(&role, &jobs, &agents);
         assert!(bare.contains("Nothing was delivered. Call finish again when it has ended."), "{bare}");
         assert!(!bare.contains("`wait`") && !bare.contains("job_kill") && !bare.contains("agent_stop"), "{bare}");
-        assert!(bare.ends_with("Tell the operator with `ask_user`."), "{bare}");
+        assert!(bare.ends_with("This session cannot stop an agent: if one does not end, tell the operator with `ask_user`."), "{bare}");
         role.tools.retain(|t| t != "ask_user");
-        assert!(running_refusal(&role, &jobs, &agents).ends_with("the operator has to resume it."));
+        assert!(running_refusal(&role, &jobs, &agents).ends_with("Call finish again when it has ended."));
         assert!(!running_refusal(&role, &jobs, &[]).contains("operator"));
     }
 

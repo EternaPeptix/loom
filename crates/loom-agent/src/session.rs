@@ -57,7 +57,10 @@
 //!    turn with `Trigger::Start`.
 //! 3. Loop: wait for the next of (an [`Input`], a `JobEvent` from `deps.job_events`). Handle it as
 //!    described under *Idle*. When `inputs` is closed: kill the session's jobs
-//!    (`jobs.kill_all(kill_grace_s)`) and return `End::Closed`.
+//!    (`jobs.kill_all(kill_grace_s)`) and return `End::Closed` — except a child when the harness is
+//!    not shutting down (no `Control::stop_for_shutdown`; the session was archived): it settles as for
+//!    an idle `Input::Stop`, with `interrupted{REASON_OPERATOR}`, so that its parent is not left
+//!    waiting for it. A shutdown cuts it instead, for the next start to resume.
 //!
 //! A turn that settles a child returns `End::Settled`; see *Settling*.
 //!
@@ -961,7 +964,13 @@ impl Session {
             };
             let trigger = match ev {
                 Ev::Input(Some(Input::Stop)) if self.deps.shared.is_child() => {
-                    return Ok(End::Settled(self.stop_idle_child().await?));
+                    return Ok(End::Settled(self.stop_idle_child(texts::REASON_PARENT).await?));
+                }
+                // Closed for good (the session was archived, or its runtime let go of it): a child
+                // settles, or its parent would wait for it for ever. A shutdown closes the inputs too,
+                // but it cuts the child for the next start to resume, so nothing is settled then.
+                Ev::Input(None) if self.deps.shared.is_child() && !self.deps.control.is_shutting() => {
+                    return Ok(End::Settled(self.stop_idle_child(texts::REASON_OPERATOR).await?));
                 }
                 Ev::Input(None) => {
                     self.deps.ctx.jobs.kill_all(self.grace()).await;
@@ -1012,10 +1021,10 @@ impl Session {
         }
     }
 
-    /// A child that is between turns was stopped: end its jobs and children and settle it `Stopped`, so
-    /// that its parent is not left waiting for it.
-    async fn stop_idle_child(&mut self) -> R<Settlement> {
-        self.append(Author::Harness, Event::Interrupted { reason: texts::REASON_PARENT.to_string() })?;
+    /// A child that is between turns was stopped, or its inputs closed: end its jobs and children and
+    /// settle it `Stopped`, so that its parent is not left waiting for it. `reason` says who stopped it.
+    async fn stop_idle_child(&mut self, reason: &str) -> R<Settlement> {
+        self.append(Author::Harness, Event::Interrupted { reason: reason.to_string() })?;
         self.deps.ctx.jobs.kill_all(self.grace()).await;
         self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
         self.settle(delivery(ChildOutcome::Stopped, texts::stopped_report(self.st.step))).await
@@ -2871,6 +2880,36 @@ mod tests {
         assert!(matches!(rs.last().unwrap().event, Event::SessionEnd { outcome: SessionOutcome::Stopped, .. }));
         assert!(kid.ctx.jobs.list().await.iter().all(|j| j.state != JobState::Running));
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn an_idle_child_whose_inputs_close_settles_unless_the_harness_is_shutting_down() {
+        let script = || {
+            seq(vec![
+                Reply::tool("bash", json!({ "command": "sleep 60", "background": true }).to_string()).into(),
+                Reply::tool("wait", json!({}).to_string()).into(),
+            ])
+        };
+        let mut kid = Fx::new("worker", true, true, script()).await;
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Run it.".into())));
+        let (tx, task) = spawn_run(session);
+        wait_until(&kid.sink, "waiting", |rs| turn_ends(rs) == vec![TurnEndReason::Waiting]).await;
+        let end = finish_task(tx, task).await;
+        let End::Settled(s) = end else { panic!("expected a settlement, got {end:?}") };
+        assert_eq!((s.outcome, s.report), (ChildOutcome::Stopped, texts::stopped_report(2)));
+        let rs = kid.sink.records();
+        assert!(rs.iter().any(|r| matches!(&r.event, Event::Interrupted { reason } if reason == texts::REASON_OPERATOR)));
+        assert!(matches!(rs.last().unwrap().event, Event::SessionEnd { outcome: SessionOutcome::Stopped, .. }));
+        assert!(kid.ctx.jobs.list().await.iter().all(|j| j.state != JobState::Running));
+
+        // Closed by a shutdown: cut, for the next start to resume.
+        let mut kid = Fx::new("worker", true, true, script()).await;
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Run it.".into())));
+        let (tx, task) = spawn_run(session);
+        wait_until(&kid.sink, "waiting", |rs| turn_ends(rs) == vec![TurnEndReason::Waiting]).await;
+        kid.control.stop_for_shutdown();
+        assert_eq!(finish_task(tx, task).await, End::Closed);
+        assert_eq!(count(&kid.sink.records(), "session_end"), 0);
     }
 
     #[tokio::test]
