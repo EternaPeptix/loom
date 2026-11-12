@@ -88,8 +88,10 @@ final class Tunnel: @unchecked Sendable {
     /// port for a moment, and it must not be taken for someone else's.
     private var exiting: Process?
 
-    /// Called (on an arbitrary thread) if the ssh child exits without `close()` having been asked.
-    var onUnexpectedExit: (@Sendable (String) -> Void)?
+    /// Called (on an arbitrary thread) with the reason if the ssh child exits without `close()` having been
+    /// asked, and a check the receiver runs again when it acts on the report (after any hop to another
+    /// thread): true only while that child is still this tunnel's current one.
+    var onUnexpectedExit: (@Sendable (String, @escaping @Sendable () -> Bool) -> Void)?
 
     static let forwardDeadline: TimeInterval = 10
 
@@ -128,10 +130,13 @@ final class Tunnel: @unchecked Sendable {
             self.lock.unlock()
             if !intentional {
                 // Off Foundation's queue: let the pipe drain so the line ssh printed as it died is in.
+                let isCurrent: @Sendable () -> Bool = { [weak self] in self?.isCurrent(proc) ?? false }
                 DispatchQueue.global().async {
                     sink.waitForEnd()
+                    // A close() or a newer open() during the wait makes this exit someone else's business.
+                    guard isCurrent() else { return }
                     let msg = sink.lastLine
-                    self.onUnexpectedExit?(msg.isEmpty ? "ssh exited with status \(proc.terminationStatus)" : msg)
+                    self.onUnexpectedExit?(msg.isEmpty ? "ssh exited with status \(proc.terminationStatus)" : msg, isCurrent)
                 }
             }
         }
@@ -192,13 +197,22 @@ final class Tunnel: @unchecked Sendable {
     /// The last line the current child wrote to stderr ("" when none or no child): why it exited.
     var lastErrorLine: String { lock.withLock { stderrSink?.lastLine ?? "" } }
 
+    /// True while `p` is the current child and no `close()` has been asked.
+    private func isCurrent(_ p: Process) -> Bool { lock.withLock { ssh === p && !closing } }
+
     func close() { close(only: nil) }
 
-    /// Stops the current child; with `only`, just when that is still the current child, so a superseded
-    /// `open()` never stops the tunnel a newer `open()` started.
+    /// Stops the current child. With `only`, stops exactly that child: when it is still the current one the
+    /// tunnel is closed as usual; when it is not (a newer `open()` or a `close()` came first) just that
+    /// process is stopped and the current state is left alone, so a superseded `open()` never leaves its own
+    /// ssh running and never stops the tunnel a newer `open()` started.
     private func close(only: Process?) {
         lock.lock()
-        if let only, ssh !== only { lock.unlock(); return }
+        if let only, ssh !== only {
+            lock.unlock()
+            stop(only)
+            return
+        }
         closing = true
         let p = ssh
         ssh = nil
@@ -206,6 +220,11 @@ final class Tunnel: @unchecked Sendable {
         if let p { exiting = p }
         lock.unlock()
         guard let p else { return }
+        stop(p)
+    }
+
+    /// SIGTERM, then SIGKILL after a short grace (off the caller's thread).
+    private func stop(_ p: Process) {
         if p.isRunning {
             p.terminate()
             let pid = p.processIdentifier

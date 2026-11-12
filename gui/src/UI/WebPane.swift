@@ -12,7 +12,8 @@ enum WebState: Equatable {
 /// A `WKWebView` that shows the daemon's own web UI over the tunnel. See gui/DESIGN.md "Web pane".
 ///
 /// - each web view loads exactly one entry URL (`<baseURL>/#code=<one-time code>`: the page exchanges the
-///   code itself, no cookie is involved). A new view calls `onCreated`; AppState then mints a code, bumps
+///   code itself; the app sets no cookie and never puts the token in a URL). A new view calls `onCreated`;
+///   AppState then makes the daemon prove its identity, mints a code, bumps
 ///   `entryTick`, and the view takes the URL once through `takeEntry`. A reload builds a new view, so
 ///   every load is a full document load, never a fragment change in the old one. Reports loading /
 ///   loaded / failed through `onState`.
@@ -189,7 +190,7 @@ struct WebPane: NSViewRepresentable {
     static func selfCheck() -> [String] {
         var f: [String] = []
         func chk(_ c: Bool, _ m: String) { if !c { f.append("WebPane: " + m) } }
-        guard let a = URL(string: "http://127.0.0.1:5000/?token=x"),
+        guard let a = URL(string: "http://127.0.0.1:5000/#code=x"),
               let b = URL(string: "http://127.0.0.1:5000/app.js"),
               let c = URL(string: "http://127.0.0.1:5001/"),
               let d = URL(string: "http://localhost:5000/"),

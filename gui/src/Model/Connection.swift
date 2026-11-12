@@ -106,14 +106,29 @@ enum ConnectionStore {
         !s.isEmpty && !s.hasPrefix("-") && !s.contains(where: { $0.isWhitespace || $0.isNewline })
     }
 
-    /// An http(s) URL with a host, no credentials; used for `.direct` connections.
-    static func normalizedBaseURL(_ s: String) -> String? {
+    /// Why a `.direct` base URL cannot be used, or nil when it can. http is allowed only for a loopback
+    /// host (127.0.0.1, localhost, [::1]): the token travels in every request, so any other host must
+    /// use https.
+    static func baseURLProblem(_ s: String) -> String? {
         var t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         while t.hasSuffix("/") { t.removeLast() }
         guard let u = URL(string: t), let scheme = u.scheme?.lowercased(),
-              scheme == "http" || scheme == "https", let host = u.host, !host.isEmpty,
+              scheme == "http" || scheme == "https", let host = u.host?.lowercased(), !host.isEmpty,
               u.user == nil, u.password == nil, u.query == nil, u.fragment == nil,
-              u.path.isEmpty else { return nil }
+              u.path.isEmpty else {
+            return "Base URL must look like http://127.0.0.1:7878 or https://host:port (no path, credentials, query or fragment)."
+        }
+        if scheme == "http" && !["127.0.0.1", "localhost", "::1", "[::1]"].contains(host) {
+            return "http is allowed only for 127.0.0.1, localhost or [::1]; any other host must use https (the token would travel in clear text)."
+        }
+        return nil
+    }
+
+    /// The trimmed base URL when `baseURLProblem` has nothing to say, else nil.
+    static func normalizedBaseURL(_ s: String) -> String? {
+        guard baseURLProblem(s) == nil else { return nil }
+        var t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        while t.hasSuffix("/") { t.removeLast() }
         return t
     }
 
@@ -131,6 +146,15 @@ enum ConnectionStore {
         chk(isValidSSHHost("user@studio"), "plain host rejected")
         chk(normalizedBaseURL("http://127.0.0.1:7878/") == "http://127.0.0.1:7878", "base url normalize")
         chk(normalizedBaseURL("file:///etc") == nil, "file url accepted")
+        for ok in ["http://127.0.0.1:7878", "http://localhost:7878", "http://[::1]:7878", "https://studio.example.com:7878",
+                   "HTTP://LOCALHOST:1"] {
+            chk(baseURLProblem(ok) == nil, "rejected \(ok): \(baseURLProblem(ok) ?? "")")
+        }
+        for bad in ["http://studio.example.com:7878", "http://10.0.0.5:7878", "http://127.0.0.1.evil.com", "http://localhost.evil.com",
+                    "http://127.0.0.1@evil.com", "ftp://localhost"] {
+            chk(baseURLProblem(bad) != nil, "accepted \(bad)")
+        }
+        chk(baseURLProblem("http://10.0.0.5:7878")?.contains("https") == true, "message does not name https")
         return f
     }
     #endif

@@ -1,4 +1,6 @@
 import Foundation
+import CryptoKit
+import Security
 
 /// Read-only client to the active daemon: derives the menu-bar counts and fires notifications when a
 /// mission needs a human. See gui/DESIGN.md "Daemon client". It never writes to the daemon — answering
@@ -74,7 +76,6 @@ final class DaemonClient: @unchecked Sendable {
 
     enum LoginOutcome: Equatable {
         case code(String)       // a fresh single-use code
-        case notFound           // an older daemon without /api/login-codes: use the token URL
         case failed(String)     // a sentence for the operator
     }
 
@@ -96,12 +97,12 @@ final class DaemonClient: @unchecked Sendable {
         return c.url
     }
 
-    /// `<base>/?token=<token>`: only for daemons that have no login-codes route.
-    static func tokenEntryURL(base: String, token: String) -> URL? {
-        guard var c = URLComponents(string: base) else { return nil }
-        c.path = "/"; c.fragment = nil
-        c.queryItems = [URLQueryItem(name: "token", value: token)]
-        return c.url
+    /// The only text the app puts on the pasteboard: scheme, host and port of the daemon, nothing that
+    /// could be a code or a token (path, query, fragment and credentials are dropped).
+    static func addressForPasteboard(base: String) -> String {
+        guard var c = URLComponents(string: base) else { return "" }
+        c.user = nil; c.password = nil; c.path = ""; c.query = nil; c.fragment = nil
+        return c.string ?? ""
     }
 
     /// `POST <base>/api/login-codes` with the bearer token. A fresh code is needed for every page load.
@@ -122,13 +123,85 @@ final class DaemonClient: @unchecked Sendable {
             case 200:
                 if let c = parseLoginCode(data) { return .code(c) }
                 return .failed("the daemon answered the login request without a usable code. Update loom-desk and the daemon to matching versions.")
-            case 404: return .notFound
+            case 404:
+                return .failed("the daemon has no login-code route, so it is older than this app. Restart it on the new version.")
             case 401, 403:
                 return .failed("the daemon rejected the token (HTTP \(http.statusCode)). Edit the connection and reconnect.")
             default: return .failed("the daemon refused the login request (HTTP \(http.statusCode)). Reconnect to retry.")
             }
         } catch {
             return .failed("could not reach the daemon for a login code: \(error.localizedDescription). Reconnect to retry.")
+        }
+    }
+
+    // MARK: daemon identity (before the token is sent anywhere)
+
+    enum IdentityOutcome: Equatable {
+        case proven
+        case failed(String)     // a sentence for the operator
+    }
+
+    /// 64 random hexadecimal characters (32 bytes from the system generator), or nil if it fails.
+    static func randomNonce() -> String? {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { return nil }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// `HMAC-SHA256(key: the token's bytes, message: "loom-healthz-v1:" + nonce)` as lowercase hex.
+    static func identityProof(token: String, nonce: String) -> String {
+        let mac = HMAC<SHA256>.authenticationCode(for: Data(("loom-healthz-v1:" + nonce).utf8),
+                                                  using: SymmetricKey(data: Data(token.utf8)))
+        return mac.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Equality without an early exit on the first differing byte. Different lengths are unequal at once
+    /// (the length of a proof is public).
+    static func constantTimeEqual(_ a: String, _ b: String) -> Bool {
+        let x = Array(a.utf8), y = Array(b.utf8)
+        guard x.count == y.count else { return false }
+        var diff: UInt8 = 0
+        for i in 0..<x.count { diff |= x[i] ^ y[i] }
+        return diff == 0
+    }
+
+    /// `{"ok": true, "proof": "<hex>"}` -> the proof, nil when it is missing or `ok` is not true.
+    static func parseIdentityProof(_ data: Data) -> String? {
+        struct Answer: Decodable { var ok: Bool?; var proof: String? }
+        guard let a = try? JSONDecoder().decode(Answer.self, from: data), a.ok == true else { return nil }
+        return a.proof
+    }
+
+    static func identityMismatchMessage(_ base: String) -> String {
+        "something answered on \(base) but did not prove it is the loom daemon for this token, so the token was not sent. "
+            + "If the daemon is older than this app, restart it on the new version; otherwise check the address and the token."
+    }
+
+    /// `GET <base>/healthz?nonce=<N>` (no token is sent): the daemon must answer with the HMAC proof for
+    /// this token. Call before every use of the token.
+    static func verifyIdentity(baseURL: String, token: String) async -> IdentityOutcome {
+        guard let nonce = randomNonce() else { return .failed("could not get random bytes from the system to check the daemon") }
+        guard var c = URLComponents(string: baseURL + "/healthz") else { return .failed("the daemon address is not a valid URL") }
+        c.queryItems = [URLQueryItem(name: "nonce", value: nonce)]
+        guard let url = c.url else { return .failed("the daemon address is not a valid URL") }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 5
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 5
+        cfg.httpShouldSetCookies = false
+        cfg.httpCookieAcceptPolicy = .never
+        let session = URLSession(configuration: cfg)
+        defer { session.finishTasksAndInvalidate() }
+        do {
+            let (data, resp) = try await session.data(for: req)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let proof = parseIdentityProof(data),
+                  constantTimeEqual(proof.lowercased(), identityProof(token: token, nonce: nonce))
+            else { return .failed(identityMismatchMessage(baseURL)) }
+            return .proven
+        } catch {
+            return .failed("could not reach the daemon to check its identity: \(error.localizedDescription). Reconnect to retry.")
         }
     }
 
@@ -299,6 +372,13 @@ final class DaemonClient: @unchecked Sendable {
         func run() async {
             while !Task.isCancelled {
                 var reason = "stream ended"
+                // The token goes out only to a daemon that has just proven it holds it.
+                if let token, case .failed(let why) = await DaemonClient.verifyIdentity(baseURL: baseURL, token: token) {
+                    if Task.isCancelled { break }
+                    onMode("not connected (\(why))")
+                    try? await Task.sleep(nanoseconds: 4_000_000_000)
+                    continue
+                }
                 do {
                     try await stream()
                 } catch is CancellationError {
@@ -443,17 +523,35 @@ final class DaemonClient: @unchecked Sendable {
         if let rec { var m2 = m; chk(m2.apply(rec).contains(.inbox), "inbox_opened must refresh inbox") }
         else { f.append("DaemonClient: record event did not decode") }
 
-        // Login entry URLs: the code URL carries no token; only the fallback does.
-        let tok = String(repeating: "ab12", count: 16)
+        // Login entry URL: it carries a code and never the token.
         chk(codeEntryURL(base: "http://127.0.0.1:7878", code: "0a1b2c")?.absoluteString == "http://127.0.0.1:7878/#code=0a1b2c",
             "code url: \(codeEntryURL(base: "http://127.0.0.1:7878", code: "0a1b2c")?.absoluteString ?? "nil")")
-        chk(tokenEntryURL(base: "http://127.0.0.1:7878", token: tok)?.absoluteString == "http://127.0.0.1:7878/?token=\(tok)",
-            "fallback url")
         chk(!(codeEntryURL(base: "http://127.0.0.1:7878", code: "0a1b2c")?.absoluteString.contains("token") ?? true), "code url mentions token")
         chk(parseLoginCode(Data("{\"code\":\"00ff00ff00ff00ff\",\"expires_in_s\":60}".utf8)) == "00ff00ff00ff00ff", "login code parse")
         chk(parseLoginCode(Data("{\"code\":\"zz\",\"expires_in_s\":60}".utf8)) == nil, "short login code accepted")
         chk(parseLoginCode(Data("{\"code\":\"00ff00ff00ff00zz\",\"expires_in_s\":60}".utf8)) == nil, "non-hex login code accepted")
         chk(parseLoginCode(Data("{\"expires_in_s\":60}".utf8)) == nil, "missing login code accepted")
+
+        chk(addressForPasteboard(base: "http://127.0.0.1:7878") == "http://127.0.0.1:7878", "copied address")
+        chk(addressForPasteboard(base: "https://u:p@h.example:1/x?token=t#code=c") == "https://h.example:1", "copied address keeps a secret")
+
+        // Daemon identity proof: a known token and nonce, constant-time comparison, answer parsing.
+        let ptok = String(repeating: "ab12", count: 16)
+        let pnonce = String(repeating: "0123456789abcdef", count: 4)
+        let want = "1fc539b8ca1872003953db475a0df90e51af1a8b13dbdc634a84b28a63c46fcb"
+        chk(identityProof(token: ptok, nonce: pnonce) == want, "identity proof: \(identityProof(token: ptok, nonce: pnonce))")
+        chk(identityProof(token: ptok, nonce: pnonce + "0") != want, "proof ignores the nonce")
+        chk(constantTimeEqual(want, want), "equal proofs differ")
+        chk(!constantTimeEqual(want, String(want.dropLast()) + "c"), "near miss accepted")
+        chk(!constantTimeEqual(want, String(want.dropLast())), "shorter proof accepted")
+        chk(!constantTimeEqual(want, ""), "empty proof accepted")
+        chk(parseIdentityProof(Data("{\"ok\":true,\"proof\":\"\(want)\"}".utf8)) == want, "proof parse")
+        chk(parseIdentityProof(Data("{\"ok\":true}".utf8)) == nil, "missing proof accepted")
+        chk(parseIdentityProof(Data("{\"ok\":false,\"proof\":\"\(want)\"}".utf8)) == nil, "ok=false accepted")
+        let n1 = randomNonce(), n2 = randomNonce()
+        chk(n1?.count == 64 && n1 != n2 && n1?.utf8.allSatisfy({ ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66) }) == true,
+            "nonce: \(n1 ?? "nil")")
+        chk(identityMismatchMessage("http://127.0.0.1:7878").contains("restart it on the new version"), "mismatch message")
         return f
     }
     #endif

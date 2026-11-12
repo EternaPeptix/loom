@@ -60,16 +60,16 @@ final class AppState: ObservableObject {
     private var connectTask: Task<Void, Never>?
     private var generation = 0
     private var restored = false
-    /// `<base>/#code=<one-time code>` (or, for an old daemon, the token URL) minted for the web pane of
-    /// `paneEpoch`. Handed out once: the code is single use.
+    /// `<base>/#code=<one-time code>` minted for the web pane of `paneEpoch`. Handed out once: the code is single use.
     private var pendingEntry: URL?
 
     private static let lastKey = "loom-desk.lastConnection"
 
     init() {
         connections = ConnectionStore.load()
-        tunnel.onUnexpectedExit = { [weak self] msg in
-            Task { @MainActor in self?.tunnelDied(msg) }
+        tunnel.onUnexpectedExit = { [weak self] msg, isCurrent in
+            // Checked again on the main actor: a switch of connection in between makes this exit stale.
+            Task { @MainActor in if isCurrent() { self?.tunnelDied(msg) } }
         }
     }
 
@@ -85,43 +85,42 @@ final class AppState: ObservableObject {
 
     // MARK: URLs
 
-    /// A fresh entry URL for the live connection: asks the daemon for a one-time login code
-    /// (`POST /api/login-codes`, bearer token) and builds `<base>/#code=<code>`. A daemon that answers 404
-    /// predates the route; only then is the token placed in a URL (`<base>/?token=<token>`). Refuses when
+    /// A fresh entry URL for the live connection: first makes the daemon prove its identity (the token is
+    /// not sent to anything that cannot), then asks it for a one-time login code (`POST /api/login-codes`,
+    /// bearer token) and builds `<base>/#code=<code>`. The token is never put in a URL. Refuses when
     /// the ssh child of a tunnel connection is gone, so the web view is never pointed at a dead forward.
     private func makeEntryURL(base: String, token: String) async throws -> URL {
+        if case .failed(let m) = await DaemonClient.verifyIdentity(baseURL: base, token: token) {
+            try checkTunnelAlive()
+            throw ConnectError(m)
+        }
         let outcome = await DaemonClient.requestLoginCode(baseURL: base, token: token)
         // Before the outcome: when the request failed because the forward is gone, that is the reason.
-        if active?.mode == .sshTunnel && !tunnel.isRunning {
-            let why = tunnel.lastErrorLine
-            throw ConnectError("the SSH tunnel closed: \(why.isEmpty ? "ssh is no longer running" : why). Reconnect to open it again.")
-        }
+        try checkTunnelAlive()
         let url: URL?
         switch outcome {
         case .code(let c): url = DaemonClient.codeEntryURL(base: base, code: c)
-        case .notFound: url = DaemonClient.tokenEntryURL(base: base, token: token)
         case .failed(let m): throw ConnectError(m)
         }
         guard let url else { throw ConnectError("could not build the web address from the daemon URL") }
         return url
     }
 
-    func copyWebURL() {
-        guard let base = baseURL, let token else { return }
-        let gen = generation
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                let u = try await self.makeEntryURL(base: base, token: token)
-                guard gen == self.generation else { return }
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(u.absoluteString, forType: .string)
-                self.status = u.query == nil ? "web URL copied (single use, valid for 60 s)" : "web URL copied (it carries the token)"
-            } catch {
-                guard gen == self.generation else { return }
-                self.status = "\(error)"
-            }
+    /// Throws when the active connection is an SSH tunnel whose ssh child is gone.
+    private func checkTunnelAlive() throws {
+        if active?.mode == .sshTunnel && !tunnel.isRunning {
+            let why = tunnel.lastErrorLine
+            throw ConnectError("the SSH tunnel closed: \(why.isEmpty ? "ssh is no longer running" : why). Reconnect to open it again.")
         }
+    }
+
+    /// Copies the daemon's base address (e.g. `http://127.0.0.1:7878`) and nothing else: no login code, no
+    /// token ever reaches the pasteboard. The web UI asks for a login on its own.
+    func copyAddress() {
+        guard let base = baseURL else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(DaemonClient.addressForPasteboard(base: base), forType: .string)
+        status = "address copied"
     }
 
     /// Reload (and Retry) = a new web pane, which asks for a fresh one-time code. Loading another `#code=`
@@ -195,6 +194,7 @@ final class AppState: ObservableObject {
                         tok = ConnectionStore.token(for: connection.id)
                     }
                 case .direct:
+                    if let problem = ConnectionStore.baseURLProblem(connection.baseURL) { throw ConnectError(problem) }
                     guard let b = ConnectionStore.normalizedBaseURL(connection.baseURL) else {
                         throw ConnectError("the base URL is not a valid http(s) URL")
                     }
@@ -204,8 +204,14 @@ final class AppState: ObservableObject {
                 guard let tok, ConnectionStore.isValidToken(tok) else {
                     throw ConnectError("no valid token stored for this connection — edit it and paste the 64-character token")
                 }
+                // The token goes to nothing that cannot prove it is this token's daemon.
+                if case .failed(let m) = await DaemonClient.verifyIdentity(baseURL: base, token: tok) { throw ConnectError(m) }
                 try Task.checkCancellation()
                 guard gen == self.generation else { return }
+                if connection.mode == .sshTunnel && !self.tunnel.isRunning {
+                    let why = self.tunnel.lastErrorLine
+                    throw ConnectError("the SSH tunnel closed: \(why.isEmpty ? "ssh is no longer running" : why). Reconnect to open it again.")
+                }
                 // No await from here on: an ssh exit is either seen by open() above or, once the link
                 // is .connected, by tunnelDied. The web pane mints its login code when it is built.
                 self.token = tok
