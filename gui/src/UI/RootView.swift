@@ -117,7 +117,9 @@ struct ConnectionBar: View {
 
     private var dotColor: Color {
         switch state.link {
-        case .connected: return state.counts.waiting > 0 ? .red : .green
+        case .connected:
+            if state.daemonUnreachable { return .orange }
+            return state.counts.waiting > 0 ? .red : .green
         case .connecting: return .orange
         case .failed: return .red
         case .none: return .gray

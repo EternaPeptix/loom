@@ -138,7 +138,37 @@ final class DaemonClient: @unchecked Sendable {
 
     enum IdentityOutcome: Equatable {
         case proven
-        case failed(String)     // a sentence for the operator
+        case mismatch(String)       // answered, but did not prove it is this token's daemon (a sentence for the operator)
+        case unreachable(String)    // no usable answer (network error, 5xx, no proof JSON): the error text; retry later
+
+        /// The sentence a one-shot caller (connect, a login-code request) shows when the token must not be
+        /// sent, nil when proven. Such a caller does not retry by itself, so the operator is told to.
+        var failure: String? {
+            switch self {
+            case .proven: return nil
+            case .mismatch(let m): return m
+            case .unreachable(let e):
+                return "could not reach the daemon to check its identity: \(e). Reconnect to retry."
+            }
+        }
+    }
+
+    /// `onMode` text prefix for "the identity check could not reach the daemon" (the client's runner only:
+    /// it does retry).
+    static let unreachableModePrefix = "daemon unreachable, retrying"
+
+    static func unreachableMessage(_ error: String) -> String { "\(unreachableModePrefix) (\(error))" }
+
+    /// Sorts one answer of `/healthz?nonce=`: 5xx, or a non-200 without proof JSON (a restarting daemon behind
+    /// a TLS proxy), is unreachable; a 200 whose proof is missing or wrong, or any other non-5xx answer
+    /// carrying proof JSON (right or wrong: only a 200 proves), is a mismatch.
+    static func classifyIdentity(status: Int, data: Data, token: String, nonce: String, baseURL: String) -> IdentityOutcome {
+        let proof = parseIdentityProof(data)
+        if status >= 500 || (status != 200 && proof == nil) { return .unreachable("HTTP \(status)") }
+        guard status == 200, let proof,
+              constantTimeEqual(proof.lowercased(), identityProof(token: token, nonce: nonce))
+        else { return .mismatch(identityMismatchMessage(baseURL)) }
+        return .proven
     }
 
     /// 64 random hexadecimal characters (32 bytes from the system generator), or nil if it fails.
@@ -183,10 +213,10 @@ final class DaemonClient: @unchecked Sendable {
     /// `GET <base>/healthz?nonce=<N>` (no token is sent): the daemon must answer with the HMAC proof for
     /// this token. Call before every use of the token.
     static func verifyIdentity(baseURL: String, token: String) async -> IdentityOutcome {
-        guard let nonce = randomNonce() else { return .failed("could not get random bytes from the system to check the daemon") }
-        guard var c = URLComponents(string: baseURL + "/healthz") else { return .failed("the daemon address is not a valid URL") }
+        guard let nonce = randomNonce() else { return .unreachable("could not get random bytes from the system to check the daemon") }
+        guard var c = URLComponents(string: baseURL + "/healthz") else { return .mismatch("the daemon address is not a valid URL") }
         c.queryItems = [URLQueryItem(name: "nonce", value: nonce)]
-        guard let url = c.url else { return .failed("the daemon address is not a valid URL") }
+        guard let url = c.url else { return .mismatch("the daemon address is not a valid URL") }
         var req = URLRequest(url: url)
         req.timeoutInterval = 5
         req.cachePolicy = .reloadIgnoringLocalCacheData
@@ -198,13 +228,10 @@ final class DaemonClient: @unchecked Sendable {
         defer { session.finishTasksAndInvalidate() }
         do {
             let (data, resp) = try await session.data(for: req)
-            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
-                  let proof = parseIdentityProof(data),
-                  constantTimeEqual(proof.lowercased(), identityProof(token: token, nonce: nonce))
-            else { return .failed(identityMismatchMessage(baseURL)) }
-            return .proven
+            guard let http = resp as? HTTPURLResponse else { return .unreachable("no HTTP answer") }
+            return classifyIdentity(status: http.statusCode, data: data, token: token, nonce: nonce, baseURL: baseURL)
         } catch {
-            return .failed("could not reach the daemon to check its identity: \(error.localizedDescription). Reconnect to retry.")
+            return .unreachable(error.localizedDescription)
         }
     }
 
@@ -373,12 +400,18 @@ final class DaemonClient: @unchecked Sendable {
         }
 
         /// The token goes out only to a daemon that has just proven it holds it. On failure reports it
-        /// (a wrong answer with `identityModePrefix`, so the app can mark the link), waits, and says false.
+        /// (a wrong answer with `identityModePrefix`, so the app can mark the link; no usable answer as
+        /// `unreachableMessage`, since this loop does try again), waits, and says false.
         private func proven() async -> Bool {
             guard let token else { return true }
-            guard case .failed(let why) = await DaemonClient.verifyIdentity(baseURL: baseURL, token: token) else { return true }
+            let outcome = await DaemonClient.verifyIdentity(baseURL: baseURL, token: token)
+            if case .proven = outcome { return true }
             if Task.isCancelled { return false }
-            onMode(why.hasPrefix("something answered") ? DaemonClient.identityModePrefix + why : "not connected (\(why))")
+            switch outcome {
+            case .mismatch(let why): onMode(DaemonClient.identityModePrefix + why)
+            case .unreachable(let e): onMode(DaemonClient.unreachableMessage(e))
+            case .proven: break
+            }
             try? await Task.sleep(nanoseconds: 4_000_000_000)
             return false
         }
@@ -558,6 +591,23 @@ final class DaemonClient: @unchecked Sendable {
         chk(!constantTimeEqual(want, ""), "empty proof accepted")
         chk(parseIdentityProof(Data("{\"ok\":true,\"proof\":\"\(want)\"}".utf8)) == want, "proof parse")
         chk(parseIdentityProof(Data("{\"ok\":true}".utf8)) == nil, "missing proof accepted")
+        let okBody = Data("{\"ok\":true,\"proof\":\"\(want)\"}".utf8), noProof = Data("{\"ok\":true}".utf8)
+        func cls(_ st: Int, _ d: Data, _ n: String = pnonce) -> IdentityOutcome {
+            classifyIdentity(status: st, data: d, token: ptok, nonce: n, baseURL: "http://h")
+        }
+        chk(cls(200, okBody) == .proven, "identity 200 proof")
+        chk(cls(200, noProof) == .mismatch(identityMismatchMessage("http://h")), "identity 200 without proof")
+        chk(cls(200, okBody, pnonce + "0") == .mismatch(identityMismatchMessage("http://h")), "identity 200 wrong proof")
+        chk(cls(502, Data()) == .unreachable("HTTP 502"), "identity 502")
+        chk(cls(503, okBody) == .unreachable("HTTP 503"), "identity 503 with body")
+        chk(cls(404, Data("nope".utf8)) == .unreachable("HTTP 404"), "identity 404 no proof")
+        chk(cls(404, okBody) == .mismatch(identityMismatchMessage("http://h")), "identity 404 with a right proof")
+        chk(IdentityOutcome.unreachable("x").failure == "could not reach the daemon to check its identity: x. Reconnect to retry.",
+            "unreachable one-shot text")
+        chk(unreachableMessage("x") == "daemon unreachable, retrying (x)", "unreachable runner text")
+        chk(unreachableMessage("x").hasPrefix(unreachableModePrefix), "runner text carries its prefix")
+        chk(IdentityOutcome.mismatch("m").failure == "m", "mismatch text")
+        chk(IdentityOutcome.proven.failure == nil, "proven has no failure")
         chk(parseIdentityProof(Data("{\"ok\":false,\"proof\":\"\(want)\"}".utf8)) == nil, "ok=false accepted")
         let n1 = randomNonce(), n2 = randomNonce()
         chk(n1?.count == 64 && n1 != n2 && n1?.utf8.allSatisfy({ ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66) }) == true,

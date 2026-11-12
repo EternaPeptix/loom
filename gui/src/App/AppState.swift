@@ -35,6 +35,9 @@ final class AppState: ObservableObject {
     @Published var link: Link = .none
     @Published var counts = Counts()
     @Published var status: String = "not connected"
+    /// True while the client's identity check cannot reach the daemon (it keeps retrying); the bar then
+    /// shows the link as not connected.
+    @Published var daemonUnreachable = false
     @Published var baseURL: String? = nil
     @Published var focusSession: String? = nil
 
@@ -90,7 +93,7 @@ final class AppState: ObservableObject {
     /// bearer token) and builds `<base>/#code=<code>`. The token is never put in a URL. Refuses when
     /// the ssh child of a tunnel connection is gone, so the web view is never pointed at a dead forward.
     private func makeEntryURL(base: String, token: String) async throws -> URL {
-        if case .failed(let m) = await DaemonClient.verifyIdentity(baseURL: base, token: token) {
+        if let m = await DaemonClient.verifyIdentity(baseURL: base, token: token).failure {
             try checkTunnelAlive()
             throw ConnectError(m)
         }
@@ -205,7 +208,7 @@ final class AppState: ObservableObject {
                     throw ConnectError("no valid token stored for this connection — edit it and paste the 64-character token")
                 }
                 // The token goes to nothing that cannot prove it is this token's daemon.
-                if case .failed(let m) = await DaemonClient.verifyIdentity(baseURL: base, token: tok) {
+                if let m = await DaemonClient.verifyIdentity(baseURL: base, token: tok).failure {
                     // An ssh that died meanwhile is the real reason, with its own last error line.
                     if gen == self.generation { try self.checkTunnelAlive() }
                     throw ConnectError(m)
@@ -219,6 +222,7 @@ final class AppState: ObservableObject {
                 self.baseURL = base
                 self.link = .connected(baseURL: base)
                 self.status = "connected"
+                self.daemonUnreachable = false
                 self.startClient(base: base, token: tok, gen: gen)
             } catch is CancellationError {
                 return
@@ -282,6 +286,7 @@ final class AppState: ObservableObject {
                         // The daemon was replaced by something that cannot prove itself: stop using the token.
                         self.generation += 1
                         self.client.stop()
+                        self.tunnel.close()
                         self.token = nil
                         self.baseURL = nil
                         self.pendingEntry = nil
@@ -290,6 +295,12 @@ final class AppState: ObservableObject {
                         self.status = "daemon not verified"
                         return
                     }
+                    if mode.hasPrefix(DaemonClient.unreachableModePrefix) {
+                        self.daemonUnreachable = true
+                        self.status = mode
+                        return
+                    }
+                    self.daemonUnreachable = false
                     self.status = mode == "live" ? "connected · live" : "connected · \(mode)"
                 }
             })
