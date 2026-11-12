@@ -507,7 +507,14 @@ async fn records(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery)
     let q = params(q)?;
     let after = number(&q, "after")?;
     let limit = clamp_limit(number(&q, "limit")?, RECORDS_DEFAULT, RECORDS_MAX);
-    let records = s.runtime.records(&SessionId::from(id), after, limit).map_err(rt_err)?;
+    // The log is read from disk; keep that off the async workers.
+    let runtime = s.runtime.clone();
+    let records = tokio::task::spawn_blocking(move || runtime.records(&SessionId::from(id), after, limit))
+        .await
+        .map_err(|e| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("The records read did not finish: {e}. Try again."))
+        })?
+        .map_err(rt_err)?;
     let next_after = if records.len() >= limit { records.last().map(|r| r.seq) } else { None };
     Ok(Json(RecordsPage { records, next_after }))
 }
