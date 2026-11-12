@@ -140,26 +140,29 @@ version may add quick-answer from the notification; out of scope for v1.)
 ## Web pane (`UI/WebPane.swift`)
 
 A `WKWebView` wrapped in `NSViewRepresentable`. It logs in with a one-time code. First the daemon proves
-its identity: `GET <baseURL>/healthz?nonce=<N>` (N = 64 random hex characters, no token sent) must answer
-`{"ok": true, "proof": "<hex>"}` with proof = HMAC-SHA256 keyed with the token's bytes over the ASCII
-`loom-healthz-v1:` followed by N, compared in constant time. This is done on connect, before every login
-code request, and at the start of every attempt of the daemon client and again before the snapshot that
-follows an ended stream (a wrong answer after connect turns the link to failed with that message). When
-a 200 answer's proof is missing or wrong the token is not sent and the app says that something answered
-but did not prove it is the daemon for this token, and that a daemon older than the app must be
-restarted on the new version. A 5xx answer, a non-200 answer without proof JSON, or no answer at all
-is "daemon unreachable, retrying": the token is not sent and the check is tried again later. Then the app (which
-holds the token) sends `POST <baseURL>/api/login-codes` with `Authorization: Bearer <token>`; the answer is
-`{"code": "<hex>", "expires_in_s": 60}` and the pane loads `<baseURL>/#code=<code>`. The page exchanges
-the code itself; no cookie is involved and the token is never in a URL. A code is single use and
-short-lived, so none is minted ahead of time: each newly built web view (on connect, on reload or
-retry, and when SwiftUI builds the window's content again) asks for its own code, takes the URL once,
-and loads exactly that one URL. Reload and retry build a new web view rather than reloading the old
-one: the old document's code is spent, and loading another `#code=` URL into the same document would
-only change its fragment (WebKit does not reload for that) and run nothing. There is no fallback for
-daemons without login codes (they cannot prove their identity either): the token is never in a URL.
-Thereafter the UI drives itself (same-origin XHR/SSE to the daemon, through the
-tunnel). The pane:
+its identity: `GET <baseURL>/healthz?nonce=<N>` (N = 64 random hex characters, no token sent) must
+answer `{"ok": true, "proof": "<hex>"}` with proof = HMAC-SHA256 keyed with the token's bytes over the
+ASCII `loom-healthz-v1:` followed by N, compared in constant time. This is done on connect, before every
+login code request, and at the start of every attempt of the daemon client and again before the snapshot
+that follows an ended stream (a wrong answer after connect turns the link to failed with that message).
+When a 200 answer's proof is missing or wrong, or any other answer below 500 carries proof JSON (only a
+200 proves, even when the proof in another answer is right), the token is not sent and the app says that
+something answered but did not prove it is the daemon for this token, and that a daemon older than the
+app must be restarted on the new version. A 5xx answer, a non-200 answer without proof JSON, or no
+answer at all means the daemon is unreachable, and the token is not sent either. On connect, and before
+a login code request, that fails the attempt: the link or the pane shows the error with "Reconnect to
+retry" and the operator retries. The daemon client instead retries by itself; meanwhile the status line
+reads "daemon unreachable, retrying" with the error, and the link is not shown as connected. Then the
+app (which holds the token) sends `POST <baseURL>/api/login-codes` with `Authorization: Bearer <token>`;
+the answer is `{"code": "<hex>", "expires_in_s": 60}` and the pane loads `<baseURL>/#code=<code>`. The
+page exchanges the code itself; no cookie is involved and the token is never in a URL. A code is single
+use and short-lived, so none is minted ahead of time: each newly built web view (on connect, on reload
+or retry, and when SwiftUI builds the window's content again) asks for its own code, takes the URL once,
+and loads exactly that one URL. Reload and retry build a new web view rather than reloading the old one:
+the old document's code is spent, and loading another `#code=` URL into the same document would only
+change its fragment (WebKit does not reload for that) and run nothing. There is no fallback for daemons
+without login codes (they cannot prove their identity either): the token is never in a URL. Thereafter
+the UI drives itself (same-origin XHR/SSE to the daemon, through the tunnel). The pane:
 
 - restricts navigation to the `baseURL` origin (loopback): a navigation action to any other origin is
   cancelled and opened in the default browser instead (so links in fetched pages don't hijack the
