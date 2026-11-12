@@ -547,6 +547,18 @@ test("ledger model joins evidence to claims and keeps open obligations only", ()
   assert.equal(C.stepMark("done"), "●");
 });
 
+test("operator rule requests build their routes and refuse blank input", () => {
+  assert.deepEqual(C.ruleRequest("s-1", "  no prod "), { path: "/api/sessions/s-1/rules", body: { text: "no prod" } });
+  assert.ok(C.ruleRequest("s-1", "   ").error);
+  assert.deepEqual(C.approvalRequest("s/1", "ship", " staging "), { path: "/api/sessions/s%2F1/approvals", body: { text: "ship", scope: "staging" } });
+  assert.equal(C.approvalRequest("s-1", "ship").body.scope, "");
+  assert.ok(C.approvalRequest("s-1", "").error);
+  assert.deepEqual(C.withdrawRequest("s-1", "k1", " done "), { path: "/api/sessions/s-1/rules/k1/withdraw", body: { reason: "done" } });
+  assert.ok(C.withdrawRequest("s-1", "", "x").error);
+  const m = C.ledgerModel({ state: { entries: 1, approvals: [{ id: "a1", text: "t", scope: "", used_for: null }] } });
+  assert.deepEqual(m.approvals, [{ id: "a1", text: "t", scope: "", usedFor: null }]);
+});
+
 test("net rows and live dedupe", () => {
   const e = { ts_ms: 1, host: "h", port: 443, method: "CONNECT", allowed: false, rule: "default deny", resolved: null };
   const r = C.netRow(e);

@@ -27,6 +27,9 @@
 //! - `send <session> <text…>` (`-` = standard input), then follows unless `--detach`.
 //! - `stop <session>`, `resume <session>`, `reweave <session>`, `archive <session> [--undo]`: the
 //!   call, then one line saying what was asked (`stop requested for {id}`).
+//! - `rule <session> <text…>` (`-` = standard input): `client.add_rule`; `rule set for {id}`.
+//!   `rule <session> --withdraw <rule-id> [--reason <text>]`: `client.withdraw_rule`.
+//!   `approve <session> <text…> [--scope <text>]`: `client.approve`. A child's id reaches its lead.
 //! - `inbox`: `render::inbox_list`. `answer <item> <text…>`: `client.answer`; `answered {item}`.
 //! - `ledger <session|mission>`: the ledger's `markdown`.
 //! - `window <session>`: `render::window_table`. `net <session> [-n <limit>]`: `render::net_table`.
@@ -144,6 +147,10 @@ pub enum Command {
     Reweave(SessionArg),
     /// Hide a finished session (or bring it back with --undo)
     Archive(ArchiveArgs),
+    /// Set a standing rule for a mission (or withdraw one with --withdraw)
+    Rule(RuleArgs),
+    /// Record an approval for a mission
+    Approve(ApproveArgs),
     /// List what is waiting for you
     Inbox,
     /// Answer an inbox item
@@ -280,6 +287,31 @@ pub struct ArchiveArgs {
 #[derive(Args, Debug)]
 pub struct AnswerArgs {
     pub item: String,
+    pub text: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct RuleArgs {
+    /// A session id, the beginning of one, or `last`
+    pub session: String,
+    /// Withdraw the rule with this id (such as k1) instead of setting one
+    #[arg(long, value_name = "RULE_ID", conflicts_with = "text")]
+    pub withdraw: Option<String>,
+    /// Why the rule is withdrawn
+    #[arg(long, requires = "withdraw")]
+    pub reason: Option<String>,
+    /// The rule ("-": read standard input)
+    pub text: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ApproveArgs {
+    /// A session id, the beginning of one, or `last`
+    pub session: String,
+    /// What the approval covers
+    #[arg(long)]
+    pub scope: Option<String>,
+    /// What is approved ("-": read standard input)
     pub text: Vec<String>,
 }
 
@@ -906,6 +938,25 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             c.archive(&id, !a.undo).await?;
             outln(&format!("{} {id}", if a.undo { "restored" } else { "archived" })).map(|()| 0)
         }
+        Command::Rule(a) => {
+            let c = client_of(&paths)?;
+            if let Some(rule) = &a.withdraw {
+                let id = c.resolve(&a.session).await?;
+                c.withdraw_rule(&id, rule, a.reason.as_deref().unwrap_or("")).await?;
+                return outln(&format!("withdrawn {rule} for {id}")).map(|()| 0);
+            }
+            let text = read_message(&a.text)?;
+            let id = c.resolve(&a.session).await?;
+            c.add_rule(&id, &text).await?;
+            outln(&format!("rule set for {id}")).map(|()| 0)
+        }
+        Command::Approve(a) => {
+            let text = read_message(&a.text)?;
+            let c = client_of(&paths)?;
+            let id = c.resolve(&a.session).await?;
+            c.approve(&id, &text, a.scope.as_deref().unwrap_or("")).await?;
+            outln(&format!("approval recorded for {id}")).map(|()| 0)
+        }
         Command::Inbox => {
             let list = client_of(&paths)?.inbox().await?;
             block(&render::inbox_list(&list, loom_core::now_ms(), &style())).map(|()| 0)
@@ -1266,6 +1317,21 @@ mod tests {
         assert!(a.undo);
         let Command::Archive(a) = ok(&["archive", "s-1"]) else { panic!("not archive") };
         assert!(!a.undo);
+        let Command::Rule(a) = ok(&["rule", "s-1", "no", "prod"]) else { panic!("not rule") };
+        assert_eq!((a.session.as_str(), a.text, a.withdraw), ("s-1", words(&["no", "prod"]), None));
+        let Command::Rule(a) = ok(&["rule", "last", "--withdraw", "k2", "--reason", "done now"]) else {
+            panic!("not rule")
+        };
+        assert_eq!((a.withdraw.as_deref(), a.reason.as_deref()), (Some("k2"), Some("done now")));
+        assert!(a.text.is_empty());
+        rejected(&["rule"]);
+        rejected(&["rule", "s-1", "--withdraw", "k1", "extra words"]);
+        rejected(&["rule", "s-1", "--reason", "why"]);
+        let Command::Approve(a) = ok(&["approve", "s-1", "ship", "it", "--scope", "staging"]) else {
+            panic!("not approve")
+        };
+        assert_eq!((a.text, a.scope.as_deref()), (words(&["ship", "it"]), Some("staging")));
+        rejected(&["approve"]);
         let Command::Answer(a) = ok(&["answer", "i-1", "yes", "please"]) else { panic!("not answer") };
         assert_eq!((a.item.as_str(), a.text), ("i-1", words(&["yes", "please"])));
         let Command::Answer(a) = ok(&["answer", "i-1"]) else { panic!("not answer") };

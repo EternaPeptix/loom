@@ -62,6 +62,30 @@ pub struct MessageBody {
     pub text: String,
 }
 
+/// Body of `POST /api/sessions/{id}/rules`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleBody {
+    pub text: String,
+}
+
+/// Body of `POST /api/sessions/{id}/approvals`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalBody {
+    pub text: String,
+    #[serde(default)]
+    pub scope: String,
+}
+
+/// Body of `POST /api/sessions/{id}/rules/{rule_id}/withdraw`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WithdrawBody {
+    #[serde(default)]
+    pub reason: String,
+}
+
 /// Body of `POST /api/inbox/{item_id}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

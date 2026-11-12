@@ -39,6 +39,9 @@
 //! | `GET /sessions/{id}/records?after={seq}&limit={n}` | `runtime.records` (`limit` default 500, at most 2000) | `RecordsPage` (`next_after` = last seq of the page when the page is full, else `null`) |
 //! | `GET /sessions/{id}/stream?after={seq}` | see *Streams* | SSE |
 //! | `POST /sessions/{id}/messages` (`MessageBody`) | `runtime.send_message` | `202` `{}` |
+//! | `POST /sessions/{id}/rules` (`RuleBody`) | `runtime.add_rule` (a child's id goes to its lead) | `202` `{}` |
+//! | `POST /sessions/{id}/approvals` (`ApprovalBody`) | `runtime.approve` | `202` `{}` |
+//! | `POST /sessions/{id}/rules/{rule_id}/withdraw` (`WithdrawBody`) | `runtime.withdraw_rule` | `202` `{}` |
 //! | `POST /sessions/{id}/stop` | `runtime.stop` | `202` `{}` |
 //! | `POST /sessions/{id}/resume` | `runtime.resume` | `202` `{}` |
 //! | `POST /sessions/{id}/reweave` | `runtime.reweave` | `202` `{}` |
@@ -96,7 +99,8 @@
 use crate::auth;
 use crate::ui;
 use crate::wire::{
-    AnswerBody, ArchiveBody, ErrorBody, LinesView, MessageBody, RecordsPage, SessionDetail, StatusView,
+    AnswerBody, ApprovalBody, ArchiveBody, ErrorBody, LinesView, MessageBody, RecordsPage, RuleBody, SessionDetail,
+    StatusView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -162,6 +166,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/records", get(records))
         .route("/api/sessions/{id}/stream", get(session_stream))
         .route("/api/sessions/{id}/messages", post(message))
+        .route("/api/sessions/{id}/rules", post(add_rule))
+        .route("/api/sessions/{id}/approvals", post(approve))
+        .route("/api/sessions/{id}/rules/{rule_id}/withdraw", post(withdraw_rule))
         .route("/api/sessions/{id}/stop", post(stop))
         .route("/api/sessions/{id}/resume", post(resume))
         .route("/api/sessions/{id}/reweave", post(reweave))
@@ -461,6 +468,28 @@ async fn records(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery)
 async fn message(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
     let body: MessageBody = json_body(&body)?;
     s.runtime.send_message(&SessionId::from(id), &body.text).await.map_err(rt_err)?;
+    Ok(accepted())
+}
+
+async fn add_rule(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: RuleBody = json_body(&body)?;
+    s.runtime.add_rule(&SessionId::from(id), &body.text).await.map_err(rt_err)?;
+    Ok(accepted())
+}
+
+async fn approve(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: ApprovalBody = json_body(&body)?;
+    s.runtime.approve(&SessionId::from(id), &body.text, &body.scope).await.map_err(rt_err)?;
+    Ok(accepted())
+}
+
+async fn withdraw_rule(
+    State(s): State<ApiState>,
+    Path((id, rule_id)): Path<(String, String)>,
+    body: Bytes,
+) -> Res<Response> {
+    let body: WithdrawBody = json_body(&body)?;
+    s.runtime.withdraw_rule(&SessionId::from(id), &rule_id, &body.reason).await.map_err(rt_err)?;
     Ok(accepted())
 }
 
@@ -1234,6 +1263,50 @@ mod tests {
         assert_eq!(s, 409);
         let (s, _) = e.post(&format!("/api/sessions/{child}/archive"), json!({"archived": true})).await;
         assert_eq!(s, 409);
+    }
+
+    #[tokio::test]
+    async fn rule_routes_record_for_the_lead_refuse_bad_input_and_the_ledger_route_checks_its_id() {
+        let e = env(lead_script(json!({"question": "CHILDMARK find it"}))).await;
+        let id = e.create("go").await;
+        e.wait_turn_ends(&id, 1).await;
+        let (_, detail) = e.get(&format!("/api/sessions/{id}")).await;
+        let child = detail["children"][0]["id"].as_str().unwrap().to_string();
+        let (_, missions) = e.get("/api/missions").await;
+        let mission = missions[0]["id"].as_str().unwrap().to_string();
+
+        let (s, b) = e.post(&format!("/api/sessions/{child}/rules"), json!({"text": "no prod"})).await;
+        assert_eq!((s, b), (202, json!({})));
+        let end = tokio::time::Instant::now() + WAIT;
+        let rule_id = loop {
+            let (_, l) = e.get(&format!("/api/missions/{mission}/ledger")).await;
+            if let Some(k) = l["state"]["constraints"].get(0) {
+                break k["id"].as_str().unwrap().to_string();
+            }
+            assert!(tokio::time::Instant::now() < end, "rule never reached the ledger");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let (s, b) = e.post(&format!("/api/sessions/{id}/approvals"), json!({"text": "ship it", "scope": "staging"})).await;
+        assert_eq!((s, b), (202, json!({})));
+        let (s, b) = e.post(&format!("/api/sessions/{id}/rules/{rule_id}/withdraw"), json!({"reason": "done"})).await;
+        assert_eq!((s, b), (202, json!({})));
+
+        let (s, b) = e.post(&format!("/api/sessions/{id}/rules"), json!({"text": "  "})).await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (409, "Write the rule to set."));
+        let (s, b) = e.post(&format!("/api/sessions/{id}/approvals"), json!({"text": ""})).await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (409, "Write what is approved."));
+        let (s, b) = e.post("/api/sessions/s-nope/rules", json!({"text": "x"})).await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (404, "There is no session s-nope."));
+        let (s, _) = e.post("/api/sessions/s-nope/rules/k1/withdraw", json!({})).await;
+        assert_eq!(s, 404);
+        let (s, _) = e.post(&format!("/api/sessions/{id}/rules"), json!({"text": "x", "extra": 1})).await;
+        assert_eq!(s, 400);
+
+        for bad in ["..%2F..%2Fetc", "..%2Fsessions%2Fx", "m-nope"] {
+            let (s, b) = e.get(&format!("/api/missions/{bad}/ledger")).await;
+            assert_eq!(s, 404, "{bad}: {b}");
+            assert!(b["error"].as_str().unwrap().starts_with("There is no mission"), "{b}");
+        }
     }
 
     #[tokio::test]

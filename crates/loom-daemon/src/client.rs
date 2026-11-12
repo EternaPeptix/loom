@@ -41,7 +41,8 @@
 //! is public so the command line names the same address the client uses.
 
 use crate::wire::{
-    AnswerBody, ArchiveBody, DaemonFile, ErrorBody, LinesView, MessageBody, RecordsPage, SessionDetail, StatusView,
+    AnswerBody, ApprovalBody, ArchiveBody, DaemonFile, ErrorBody, LinesView, MessageBody, RecordsPage, RuleBody,
+    SessionDetail, StatusView, WithdrawBody,
 };
 use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, NetEntry, NewSession, SessionInfo, WindowView,
@@ -282,6 +283,25 @@ impl Client {
         let body = serde_json::to_value(MessageBody { text: text.to_string() })
             .map_err(|e| format!("The message cannot be encoded ({e})."))?;
         self.call_unit(Method::POST, &format!("/api/sessions/{}/messages", segment(id.as_str())), Some(body)).await
+    }
+
+    pub async fn add_rule(&self, id: &SessionId, text: &str) -> Result<(), String> {
+        let body = serde_json::to_value(RuleBody { text: text.to_string() })
+            .map_err(|e| format!("The rule cannot be encoded ({e})."))?;
+        self.call_unit(Method::POST, &format!("/api/sessions/{}/rules", segment(id.as_str())), Some(body)).await
+    }
+
+    pub async fn approve(&self, id: &SessionId, text: &str, scope: &str) -> Result<(), String> {
+        let body = serde_json::to_value(ApprovalBody { text: text.to_string(), scope: scope.to_string() })
+            .map_err(|e| format!("The approval cannot be encoded ({e})."))?;
+        self.call_unit(Method::POST, &format!("/api/sessions/{}/approvals", segment(id.as_str())), Some(body)).await
+    }
+
+    pub async fn withdraw_rule(&self, id: &SessionId, rule_id: &str, reason: &str) -> Result<(), String> {
+        let body = serde_json::to_value(WithdrawBody { reason: reason.to_string() })
+            .map_err(|e| format!("The withdrawal cannot be encoded ({e})."))?;
+        let path = format!("/api/sessions/{}/rules/{}/withdraw", segment(id.as_str()), segment(rule_id));
+        self.call_unit(Method::POST, &path, Some(body)).await
     }
 
     pub async fn stop(&self, id: &SessionId) -> Result<(), String> {
@@ -762,6 +782,24 @@ mod tests {
         assert_eq!(body(5), serde_json::json!({"text": "hello"}));
         assert_eq!(body(9), serde_json::json!({"archived": true}));
         assert_eq!(body(16), serde_json::json!({"answer": "yes"}));
+    }
+
+    #[tokio::test]
+    async fn rule_calls_hit_their_routes_with_their_bodies() {
+        let script = Script::default()
+            .route("POST", "/api/sessions/s-1/rules", 202, "{}")
+            .route("POST", "/api/sessions/s-1/approvals", 202, "{}")
+            .route("POST", "/api/sessions/s-1/rules/k1/withdraw", 202, "{}");
+        let (client, shared) = start(script).await;
+        let sid = SessionId::from("s-1");
+        client.add_rule(&sid, "no prod").await.unwrap();
+        client.approve(&sid, "ship", "staging").await.unwrap();
+        client.withdraw_rule(&sid, "k1", "done").await.unwrap();
+        let seen = shared.lock().unwrap().seen.clone();
+        let body = |n: usize| serde_json::from_str::<serde_json::Value>(&seen[n].body).unwrap();
+        assert_eq!(body(0), serde_json::json!({"text": "no prod"}));
+        assert_eq!(body(1), serde_json::json!({"text": "ship", "scope": "staging"}));
+        assert_eq!(body(2), serde_json::json!({"reason": "done"}));
     }
 
     #[tokio::test]

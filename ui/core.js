@@ -891,6 +891,7 @@ export function ledgerModel(view) {
     empty: !s.entries,
     goal: s.goal || null,
     constraints: (s.constraints || []).map((c) => ({ id: c.id, text: c.text, retired: c.retired || null })),
+    approvals: (s.approvals || []).map((a) => ({ id: a.id, text: a.text, scope: a.scope || "", usedFor: a.used_for || null })),
     plan: (s.plan || []).map((p) => ({ id: p.id, text: p.text, status: p.status, note: p.note || "" })),
     claims: (s.claims || []).map((c) => ({
       id: c.id,
@@ -914,6 +915,26 @@ export function ledgerModel(view) {
     deadEnds: (s.dead_ends || []).map((d) => ({ id: d.id, what: d.what, why: d.why })),
     questions: (s.questions || []).map((q) => ({ id: q.id, text: q.text, blocking: !!q.blocking, answer: q.answer ?? null })),
   };
+}
+
+/**
+ * Operator rule requests: `{ path, body }` for `api("POST", path, body)`, or `{ error }` when the
+ * input is blank. A child's id is fine: the daemon routes it to the lead of its mission.
+ */
+export function ruleRequest(session, text) {
+  const t = String(text || "").trim();
+  if (!t) return { error: "Write the rule to set." };
+  return { path: `/api/sessions/${encodeURIComponent(session)}/rules`, body: { text: t } };
+}
+export function approvalRequest(session, text, scope) {
+  const t = String(text || "").trim();
+  if (!t) return { error: "Write what is approved." };
+  return { path: `/api/sessions/${encodeURIComponent(session)}/approvals`, body: { text: t, scope: String(scope || "").trim() } };
+}
+export function withdrawRequest(session, ruleId, reason) {
+  if (!ruleId) return { error: "Choose the rule to withdraw." };
+  const path = `/api/sessions/${encodeURIComponent(session)}/rules/${encodeURIComponent(ruleId)}/withdraw`;
+  return { path, body: { reason: String(reason || "").trim() } };
 }
 
 const STEP_MARK = { todo: "○", doing: "◐", done: "●", dropped: "✕" };

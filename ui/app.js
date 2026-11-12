@@ -24,6 +24,7 @@ const S = {
   tab: "ledger",
   ledger: { mission: null, model: null, error: null, stale: true },
   win: { data: null, error: null, stale: true, hideFolded: false, from: null },
+  rules: { text: "", approval: "", scope: "" }, // drafts survive the ledger being redrawn
   net: [],
   netError: null,
   viewer: null,
@@ -936,14 +937,55 @@ function renderRight() {
   return renderSessionTab(p, info);
 }
 
+/** A labelled text input whose value is kept in `S.rules[key]`. */
+function draftInput(key, placeholder) {
+  const i = el("input", "rule-in");
+  i.type = "text";
+  i.placeholder = placeholder;
+  i.value = S.rules[key];
+  i.addEventListener("input", () => {
+    S.rules[key] = i.value;
+  });
+  return i;
+}
+
+async function sendRule(req, clear) {
+  if (req.error) return notice(req.error);
+  if (!(await act(api("POST", req.path, req.body).then(() => true)))) return;
+  for (const k of clear) S.rules[k] = "";
+  loadLedger();
+}
+
+/** Operator controls: set a rule, record an approval, withdraw a listed rule. */
+function rulesControl(m) {
+  const box = el("div", "rules");
+  box.append(h2("Rules and approvals"));
+  const id = S.openId;
+  const rule = draftInput("text", "Standing rule for this mission");
+  const addRule = btn("Add rule", "small", () => sendRule(C.ruleRequest(id, S.rules.text), ["text"]));
+  box.append(add(el("div", "rule-row"), rule, addRule));
+  const appr = draftInput("approval", "Approve something");
+  const scope = draftInput("scope", "Scope (optional)");
+  const addAppr = btn("Approve", "small", () => sendRule(C.approvalRequest(id, S.rules.approval, S.rules.scope), ["approval", "scope"]));
+  box.append(add(el("div", "rule-row"), appr, scope, addAppr));
+  const live = m ? m.constraints.filter((c) => !c.retired) : [];
+  if (live.length) {
+    box.append(ul(...live.map((c) => li(el("span", "k", c.id), document.createTextNode(c.text + " "), btn("Withdraw", "small", () => sendRule(C.withdrawRequest(id, c.id, ""), []))))));
+  }
+  if (m && m.approvals.length) {
+    box.append(ul(...m.approvals.map((a) => li(el("span", "k", a.id), document.createTextNode(a.text), a.scope ? el("span", "dim", " (scope: " + a.scope + ")") : null))));
+  }
+  return box;
+}
+
 function renderLedger(p) {
   const L = S.ledger;
   if (L.error) return p.replaceChildren(el("p", "dim", L.error));
   if (!L.model) return p.replaceChildren(el("p", "dim", "loading…"));
   const m = L.model;
-  if (m.empty) return p.replaceChildren(el("p", "dim", "This mission has no ledger entries yet."));
+  if (m.empty) return p.replaceChildren(rulesControl(m), el("p", "dim", "This mission has no ledger entries yet."));
   const frag = document.createDocumentFragment();
-  frag.append(h2("Goal"), el("div", "", m.goal || "(not set)"));
+  frag.append(rulesControl(m), h2("Goal"), el("div", "", m.goal || "(not set)"));
   if (m.constraints.length) {
     frag.append(h2("Constraints"), ul(...m.constraints.map((c) => li(el("span", "k", c.id), el("span", c.retired ? "retired" : "", c.text), c.retired ? el("span", "dim", ` (retired: ${c.retired})`) : null))));
   }

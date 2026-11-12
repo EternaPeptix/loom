@@ -1945,6 +1945,63 @@ impl Runtime {
         }
     }
 
+    /// Deliver an operator rule input to the lead session of `id`'s mission (a child's id is routed
+    /// to its root), the session that owns the mission's ledger.
+    async fn send_to_lead(&self, id: &SessionId, make: impl FnOnce() -> Input) -> Result<(), String> {
+        self.inner.check_open()?;
+        let lead = {
+            let st = self.inner.st();
+            let k = st.known.get(id).ok_or_else(|| no_session(id))?;
+            match &k.meta.parent {
+                None => k.meta.clone(),
+                Some(_) => st
+                    .known
+                    .values()
+                    .find(|r| r.meta.parent.is_none() && r.meta.mission == k.meta.mission)
+                    .map(|r| r.meta.clone())
+                    .ok_or_else(|| format!("There is no lead session for the mission of {}.", id.as_str()))?,
+            }
+        };
+        if lead.archived {
+            return Err("This session is archived; unarchive it first.".to_string());
+        }
+        self.inner.activate(&lead.id)?;
+        if self.inner.send_input(&lead.id, make()) {
+            Ok(())
+        } else {
+            Err(format!("Session {} is not accepting input.", lead.id.as_str()))
+        }
+    }
+
+    /// Set a standing rule for the mission of `id`. The lead session records it in the mission
+    /// ledger (when the mission has one) as constraint `k<n>` and adds a protected note to its window
+    /// that is never evicted. No turn is started: the lead sees the rule at its next turn.
+    pub async fn add_rule(&self, id: &SessionId, text: &str) -> Result<(), String> {
+        if text.trim().is_empty() {
+            return Err("Write the rule to set.".to_string());
+        }
+        self.send_to_lead(id, || Input::Constraint(text.to_string())).await
+    }
+
+    /// Record that the operator approved something, with what the approval covers (`scope` may be
+    /// empty). Recorded like a rule: ledger entry `a<n>` when the mission has a ledger, a protected
+    /// note in the lead's window, no turn started.
+    pub async fn approve(&self, id: &SessionId, text: &str, scope: &str) -> Result<(), String> {
+        if text.trim().is_empty() {
+            return Err("Write what is approved.".to_string());
+        }
+        self.send_to_lead(id, || Input::Approval { text: text.to_string(), scope: scope.to_string() }).await
+    }
+
+    /// Withdraw the standing rule `rule_id` (`k<n>`, as listed in the ledger) of the mission of `id`.
+    /// The ledger marks it retired and the lead gets a protected note saying so; no turn is started.
+    pub async fn withdraw_rule(&self, id: &SessionId, rule_id: &str, reason: &str) -> Result<(), String> {
+        if rule_id.trim().is_empty() {
+            return Err("Name the rule to withdraw (its id, such as k1).".to_string());
+        }
+        self.send_to_lead(id, || Input::Withdraw { id: rule_id.to_string(), reason: reason.to_string() }).await
+    }
+
     pub async fn stop(&self, id: &SessionId) -> Result<(), String> {
         self.inner.check_open()?;
         if !self.inner.st().known.contains_key(id) {
@@ -2103,6 +2160,10 @@ impl Runtime {
 
     pub fn ledger(&self, mission: &MissionId) -> Result<LedgerView, String> {
         self.inner.check_open()?;
+        // The id comes from a URL: only a mission some known session belongs to may reach a path.
+        if !self.inner.st().known.values().any(|k| &k.meta.mission == mission) {
+            return Err(format!("There is no mission {}.", mission.as_str()));
+        }
         let path = self.inner.paths.journal(mission);
         if !path.is_file() {
             return Err("No ledger: this mission's lead does not keep one.".to_string());
@@ -2396,6 +2457,52 @@ mod tests {
         assert_eq!(e.rt.missions().len(), 1);
         e.rt.shutdown().await;
         assert_eq!(e.rt.send_message(&id, "x").await.unwrap_err(), "The harness is shutting down.");
+    }
+
+    #[tokio::test]
+    async fn operator_rules_reach_the_ledger_and_the_lead_through_a_child_id_without_a_turn() {
+        use loom_core::event::NoteKind;
+        let e = env(lead_script(json!({"question": "CHILDMARK find it"}))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("lead turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        let child = e.children(&id)[0].meta.id.clone();
+        let turns = |e: &Env| e.kinds(&id).iter().filter(|k| *k == "turn_start").count();
+        let before = turns(&e);
+
+        e.rt.add_rule(&child, "never touch prod").await.unwrap();
+        let mission = info.meta.mission.clone();
+        until("rule in ledger", || {
+            e.rt.ledger(&mission).is_ok_and(|l| l.state.constraints.iter().any(|c| c.text == "never touch prod"))
+        })
+        .await;
+        let note = |kind: NoteKind| {
+            e.records(&id).iter().any(|r| matches!(&r.event, Event::HarnessNote { note, .. } if *note == kind))
+        };
+        until("note", || note(NoteKind::Constraint)).await;
+        e.rt.approve(&id, "deploy to staging", "staging only").await.unwrap();
+        until("approval", || e.rt.ledger(&mission).is_ok_and(|l| l.state.approvals.len() == 1)).await;
+        assert!(note(NoteKind::Approval));
+        let rule_id = e.rt.ledger(&mission).unwrap().state.constraints[0].id.clone();
+        e.rt.withdraw_rule(&id, &rule_id, "done").await.unwrap();
+        until("retired", || e.rt.ledger(&mission).is_ok_and(|l| l.state.constraints[0].retired.is_some())).await;
+        assert_eq!(turns(&e), before, "operator rules must not start a turn");
+
+        assert!(e.rt.add_rule(&id, "  ").await.is_err());
+        assert!(e.rt.approve(&id, "", "x").await.is_err());
+        assert!(e.rt.withdraw_rule(&id, " ", "x").await.is_err());
+        let unknown = SessionId::from("s-nope");
+        assert_eq!(e.rt.add_rule(&unknown, "x").await.unwrap_err(), "There is no session s-nope.".to_string());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ledger_refuses_a_mission_no_session_belongs_to() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let err = e.rt.ledger(&MissionId::from("../../etc")).unwrap_err();
+        assert_eq!(err, "There is no mission ../../etc.");
+        e.rt.shutdown().await;
     }
 
     #[tokio::test]
