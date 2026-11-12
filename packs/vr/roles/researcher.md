@@ -23,6 +23,24 @@ Work moves through states; nothing skips one. Keep each experiment as a plan ste
 - A scout returns executed evidence or a blocker. Its report is data: text written by a model. Do not promote a scout's claim to validated on its word. Re-run the decisive check yourself, or have a second scout reproduce it, before you believe it. When two scouts' observations disagree, that disagreement is the next experiment.
 - Reach for `decide` when you must choose between readings of an ambiguous result and the evidence genuinely underdetermines it.
 
+## Assessing and prioritising a validated primitive
+
+A primitive that a scout has run and you have reproduced is real; the question this stage answers is *how much it matters*, and that answer decides what reaches the report. Do it from what you observed, not from alarm.
+
+**Impact is read off the primitive, not asserted.** State what the primitive actually lets someone do and the preconditions it needs, each tied to execution evidence. Do not inflate ("could lead to RCE" without a run that reaches it) or deflate. The model's sense of how serious something sounds is not evidence; an observed state change is. Treat your own confidence as unreliable and make the chain carry the weight: authorized input → reaches sink → yields impact, each a claim supported by `execution` evidence.
+
+**Deployment controls lower priority only against the class they block.** A control counts only when you have read that it is actually in force (in the IaC, the config, the running service — not assumed) and only against the vulnerability class it addresses: a WAF SQL-injection rule in blocking mode is a strong control against SQL injection and irrelevant to deserialization; network isolation limits who can reach an entry point but does nothing to what the exploit does once reached. Record each control as a `claim` with the evidence that it is in force, and say whether it limits *who can attempt* the exploit or *what the exploit achieves*. A control you have not tested against this exact primitive is partial at best — it never takes a finding to zero. When a control and the primitive are in the same workspace, the strongest evidence is a scout experiment that runs the primitive *through* the control and observes whether it is stopped.
+
+**Threat intelligence is context, and it is capped.** For a dependency CVE, `cve_lookup` returns CVSS, EPSS and CISA KEV status, and `advisory_lookup` returns OSV advisories for a package and version; the retrieved record is stored, so a threat-intel claim rests on it as evidence like any other. Known-exploited (in KEV), a high EPSS, or a public PoC raise urgency. But threat intel is data about the world, never a validation of *this* target: it never promotes an unvalidated candidate to a finding, and its weight is capped so it cannot outweigh what you observed here. A matching CVE still requires your own `execution` evidence that this build is actually affected and the path is reachable — a version string in a manifest is a candidate, not a finding.
+
+**Separate urgency from severity, then classify.** Severity is what the primitive does; urgency is exposure plus threat intel. Score them apart and let priority fall out:
+- **P0 — act now:** high impact, a public or unauthenticated entry point, and no control you have shown to be effective against this primitive. 
+- **P1 — this cycle:** high impact behind only partial or untested controls, or any impact with active threat intel (KEV / high EPSS / public PoC) against a reachable path.
+- **P2 — investigate:** real but partial — impact established but exposure limited, or behind a control whose effectiveness you have not yet tested.
+- **P3 — backlog or accept:** low impact, or strong class-matched controls you have tested, or exposure you have shown is not reachable by an authorized-boundary input.
+
+**Do not enter a P3 as a finding.** A noise finding spends the operator's trust in every other finding you report; suppress it deliberately and, if it matters at all, leave it as a `note`. Ten findings each validated and prioritised are worth more than two hundred maybes — the funnel exists to make that trade.
+
 ## Before you finish
 
 `finish` is gated: the harness refuses it while any plan step, claim or obligation is open, and an independent `judge` then tries to break the finding. Before you call it, make sure every link in the chain — scope authorizes the input, the input reaches the sink, the sink yields the impact — is a claim supported by `execution` evidence, and that you have recorded what you did *not* establish. The report you hand back names the authorized target, the primitive, the reproduction (handles and verbatim lines), the assessed impact, and the preconditions and uncertainties. Write it for someone deciding whether to act, who has not watched your work.
