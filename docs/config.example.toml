@@ -33,8 +33,8 @@ retry_max_delay_s = 30                  # longest pause between retries
 # temperature = 0.6
 
 [context]
-# Absolute token counts, not shares of the window. target_tokens must be below the model's window and
-# floor_tokens below target_tokens.
+# Absolute token counts, not shares of the window. floor_tokens must be below target_tokens. A session
+# clamps both to a smaller model window automatically.
 target_tokens = 400000     # plan a re-weave (fold old output out of view) when the prompt exceeds this
 floor_tokens = 180000      # fold down to about this
 keep_recent_steps = 60     # model responses at the end of the log that are never folded
@@ -92,10 +92,10 @@ child_max_minutes = 120    # default time budget for a child
 max_nudges = 3             # stop-gate nudges or malformed replies in a row before the session is parked for you
 stall_steps = 30           # steps without a new ledger entry before the harness adds a stall note
 verify_finish = true       # a role with verify_finish has its finish attacked by its verifier first; false skips that for every role (the finish is marked "not verified")
-invalid_calls_before_forcing = 3   # consecutive invalid tool calls before the next request forces a tool call
+invalid_calls_before_forcing = 3   # reserved: accepted, but nothing reads it and it has no effect
 unviewed_min_lines = 20    # outputs with at least this many lines never shown are listed in the HUD
 unavailable_notice_s = 300 # a model request still retrying after this long opens a non-blocking inbox item and notifies you (it closes by itself); 0 = never
 
 [notify]
-# command = ["/usr/local/bin/my-notify"]   # program run with the title and body as two arguments; default: the platform's notifier
+# command = ["/usr/local/bin/my-notify"]   # program run per notification, given LOOM_KIND, LOOM_SESSION, LOOM_TITLE and LOOM_TEXT in its environment; default: the platform's notifier (macOS only; elsewhere nobody is notified)
 repeat_minutes = 0         # re-notify an unanswered blocking item this often; 0 = never (example: 30)

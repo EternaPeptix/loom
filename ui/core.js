@@ -375,6 +375,22 @@ export function healthDot({ connected, models }) {
   return { state: "green", tip: "Every model is reachable." };
 }
 
+/** Free space below which the status warns (`LOW_DISK_BYTES`, `LOW_DISK_PERCENT` of the daemon). */
+const LOW_DISK_BYTES = 5 * 1024 ** 3;
+const LOW_DISK_PERCENT = 5;
+
+/**
+ * The warning line for the `disk` of the daemon's status ({free_bytes, total_bytes}, or null when unknown):
+ * a sentence when less than 5 GiB or 5 percent of the volume is free, else null.
+ */
+export function diskWarning(disk) {
+  if (!disk || !(disk.total_bytes > 0)) return null;
+  const free = disk.free_bytes;
+  if (!(free < LOW_DISK_BYTES || free * 100 < disk.total_bytes * LOW_DISK_PERCENT)) return null;
+  const gib = (n) => (n / 1024 ** 3).toFixed(1) + " GiB";
+  return `Low disk space: ${gib(free)} free of ${gib(disk.total_bytes)}. Sessions will fail when the disk fills; run "loom gc" or free space.`;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Inbox
 

@@ -6001,6 +6001,9 @@ mod tests {
         let policy = ReweavePolicy::default();
         // 16k: 4k are kept for the reply, so the trigger and the floor stay positive.
         assert_eq!(reweave_bounds(&policy, Some(16_000), None), (12_000, 8_000));
+        // The default bounds (400k and 180k) are clamped to a 32k window, which `Config::check` accepts.
+        let (limit, floor) = reweave_bounds(&policy, Some(32_768), None);
+        assert!(limit < 32_768 && floor < limit, "{limit} {floor}");
         // A configured reply length is honoured whole; only the slack after it shrinks.
         assert_eq!(reweave_bounds(&policy, Some(16_000), Some(4_000)), (8_000, 4_000));
         // One the window cannot hold is no reply length the session can honour: it counts as none,

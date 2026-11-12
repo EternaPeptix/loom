@@ -129,7 +129,7 @@ sessions/<sid>/net.jsonl             its egress decisions, hash-chained
 sessions/<sid>/settlement.json       a child's settlement, kept for a delivery a restart cut
 sessions/<sid>/queued/               operator rules, approvals, withdrawals not recorded yet
 sessions/<sid>/jobs/                 jN.out, jN.status, jN.pid of its commands
-sessions/<sid>/tmp/                  the session temp dir ($TMPDIR of its commands)
+sessions/<sid>/tmp/                  the session temp dir ($TMPDIR of its commands); emptied when the session ends for good or is archived
 blobs/<aa>/<id>, blobs/<aa>/<id>.idx content-addressed tool output (id = SHA-256) and its line index
 blobs/tmp/                           writes in progress, and blobs a collection is removing
 missions/<mid>/journal.jsonl         the ledger journal of one mission
@@ -1116,9 +1116,15 @@ The same actions exist in the CLI (`loom send`, `rule`, `approve`, `rule --withd
 **Notifications.** Every `inbox_opened` and every session that fails notifies the operator: with
 `notify.command` set, that program is run (no shell) with `LOOM_KIND`, `LOOM_SESSION`, `LOOM_TITLE` and
 `LOOM_TEXT` (500 characters) in its environment and killed after 30 s; otherwise, on macOS, a
-notification through `osascript` with the texts as arguments. With `notify.repeat_minutes` above 0 a
-blocking item is announced again at that interval while it stays open. The text of an item a tool call
-opened (written by the model) starts with `[From the agent, unverified] `.
+notification through `osascript` with the texts as arguments; on any other platform with no
+`notify.command`, nobody is notified, and the daemon logs one warning at start saying so and how to set
+`[notify] command`. With `notify.repeat_minutes` above 0 a blocking item is announced again at that
+interval while it stays open. The text of an item a tool call opened (written by the model) starts with
+`[From the agent, unverified] `; in an item the harness opened itself, the paragraph that quotes the
+ledger carries the same label. A child's title was written by the model and starts with `unverified: `.
+When the volume of the loom home turns low (under 5 GiB or 5 percent free, checked once a minute) one
+notification of kind `disk` is raised, and no other until the disk has recovered and turned low again;
+the web UI shows a warning line while `GET /api/status` reports the disk as low.
 
 **Garbage collection.** Stored outputs are never deleted except by an explicit collection: `POST
 /api/gc {"apply": bool}` (default a dry run), `loom gc [--apply]`. A blob is kept when its full id

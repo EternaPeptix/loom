@@ -76,7 +76,7 @@ pub struct ModelProfile {
     /// How long to keep retrying an unreachable or failing server, in seconds (default 300, long
     /// enough for a server relaunch). 0 = retry until the server comes back. Failures that waiting
     /// cannot cure (a reply that is not HTTP or not an event stream, a stream that ends without a
-    /// finish reason, certificate errors) end the request after 3 attempts in a row whatever this is
+    /// finish reason, an oversized stream, certificate errors) end the request after 3 attempts in a row whatever this is
     /// set to. Every other failure is retried for the whole window, so with 0 one that never heals
     /// but looks like an outage (a server that hangs up during the TLS handshake, an error object in
     /// every stream) is retried until the request is cancelled. `agents.unavailable_notice_s` tells the
@@ -148,7 +148,8 @@ pub enum SandboxMode {
     /// macOS `sandbox-exec` profile.
     #[default]
     Seatbelt,
-    /// No OS sandbox. Reported on every session start.
+    /// No OS sandbox: commands are unconfined. The daemon logs a warning at start when this is set, and the
+    /// system prompt of every session says so.
     None,
 }
 
@@ -234,7 +235,7 @@ pub struct AgentsCfg {
     pub stall_steps: u32,
     /// Run an independent verifier before a lead's `finish` is accepted.
     pub verify_finish: bool,
-    /// Consecutive invalid tool calls before the next request forces a tool call.
+    /// Reserved: accepted so that configs that set it load, but nothing reads it and it has no effect.
     pub invalid_calls_before_forcing: u32,
     /// Outputs with at least this many lines never shown are listed in the HUD.
     pub unviewed_min_lines: u64,
@@ -263,8 +264,9 @@ impl Default for AgentsCfg {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct NotifyCfg {
-    /// Program run for each notification with the title and body as its two arguments. When empty
-    /// the daemon uses the platform's notification command.
+    /// Program (and its arguments) run for each notification. It is given `LOOM_KIND`, `LOOM_SESSION`,
+    /// `LOOM_TITLE` and `LOOM_TEXT` in its environment (the text cut to 500 characters). When empty the
+    /// daemon uses the platform's notifier on macOS and notifies nobody elsewhere.
     pub command: Vec<String>,
     /// Repeat the notification for an unanswered blocking item after this many minutes (0 = never).
     pub repeat_minutes: u32,
@@ -307,14 +309,6 @@ impl Config {
         for (name, profile) in &self.models {
             if profile.max_concurrent == 0 {
                 return Err(ConfigError::Invalid(format!("models.{name}.max_concurrent must be at least 1")));
-            }
-            if let Some(window) = profile.context_window {
-                if self.context.target_tokens >= window {
-                    return Err(ConfigError::Invalid(format!(
-                        "context.target_tokens ({}) must be below models.{name}.context_window ({window})",
-                        self.context.target_tokens
-                    )));
-                }
             }
         }
         Ok(())
@@ -523,9 +517,10 @@ allow = ["*.example.test"]
         let mut c = Config::default();
         c.context.floor_tokens = c.context.target_tokens;
         assert!(c.check().is_err());
+        // A window below the re-weave bounds is not an error: a session clamps the bounds to it.
         let mut c = Config::default();
         c.models.insert("a".into(), ModelProfile { context_window: Some(100_000), ..Default::default() });
-        assert!(c.check().is_err());
+        assert!(c.check().is_ok());
         let mut c = Config::default();
         c.models.insert("a".into(), ModelProfile::default());
         c.default_model = "b".into();

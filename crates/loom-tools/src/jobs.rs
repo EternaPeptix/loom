@@ -6,8 +6,9 @@
 //! it from `register` on. A watcher task per job waits for it to end; when it does, the watcher
 //! normalises and stores the job's complete output (`view::store_text`), marks the job ended, and
 //! sends [`JobEvent::Settled`] — exactly once per job, whether it ended by itself or was killed.
-//! `register` sends [`JobEvent::Registered`] first. The runtime turns these events into log records,
-//! ledger obligations and a wake-up for the session; this module only reports.
+//! `register` sends [`JobEvent::Registered`] first. The runtime turns these events into log records
+//! and a wake-up for the session; this module only reports. Running jobs are not ledger obligations:
+//! `finish` is refused while work is still running.
 //!
 //! - `allocate()`: the next id and its output/status file paths, `<dir>/<id>.out` and `<dir>/<id>.status`
 //!   (creates `dir`). Ids are never reused within a table; `resume_from(n)` makes the next id `j{n+1}`

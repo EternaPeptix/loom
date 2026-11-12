@@ -179,13 +179,16 @@ fn open_lines(ledger: &LedgerState) -> Vec<String> {
     lines
 }
 
+/// The first line of the open-items block, which quotes text the model wrote in the ledger.
+pub const OPEN_HEADING: &str = "Still open:";
+
 /// The open items as a block (`Still open:` and its lines, capped), or `None` when nothing is open.
 fn open_block(ledger: Option<&LedgerState>) -> Option<String> {
     let lines = open_lines(ledger?);
     if lines.is_empty() {
         return None;
     }
-    let mut out = String::from("Still open:");
+    let mut out = String::from(OPEN_HEADING);
     for l in lines.iter().take(MAX_OPEN_LINES) {
         out.push('\n');
         out.push_str(l);

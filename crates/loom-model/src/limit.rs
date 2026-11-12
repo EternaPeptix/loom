@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Priority {
-    /// Digests, titles, anything nobody is waiting on.
+    /// The lowest priority, for work nobody is waiting on. No request is sent with it yet.
     Background = 0,
     /// Child sessions.
     Child = 1,

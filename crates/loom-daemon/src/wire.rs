@@ -33,11 +33,9 @@ pub struct StatusView {
     pub inbox_open: usize,
 }
 
-/// Free space below which `loom status` warns that sessions will soon fail to write: 5 GiB …
-pub const LOW_DISK_BYTES: u64 = 5 << 30;
-
-/// … or 5 percent of the volume.
-pub const LOW_DISK_PERCENT: u64 = 5;
+/// Free space below which `loom status` warns that sessions will soon fail to write: 5 GiB, or 5 percent of the
+/// volume. The runtime raises its low-disk notification at the same point.
+pub use loom_agent::runtime::{LOW_DISK_BYTES, LOW_DISK_PERCENT};
 
 /// Space on a volume, in bytes: what the daemon's user can still write (`free_bytes`), and the volume's size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,10 +45,9 @@ pub struct DiskSpace {
 }
 
 impl DiskSpace {
-    /// Less than `LOW_DISK_BYTES`, or less than `LOW_DISK_PERCENT` of the volume, is free.
+    /// Less than `LOW_DISK_BYTES`, or less than `LOW_DISK_PERCENT` of the volume, is free (the runtime's rule).
     pub fn is_low(&self) -> bool {
-        self.free_bytes < LOW_DISK_BYTES
-            || u128::from(self.free_bytes) * 100 < u128::from(self.total_bytes) * u128::from(LOW_DISK_PERCENT)
+        loom_agent::runtime::disk_is_low(self.free_bytes, self.total_bytes)
     }
 }
 

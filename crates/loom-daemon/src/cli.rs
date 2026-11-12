@@ -104,13 +104,14 @@ bind = "127.0.0.1:7878"
 [models.local]
 base_url = "http://127.0.0.1:8000/v1"
 model = "default"
-# context_window = 1000000   # only needed when the server does not report it
+# context_window = 1000000   # only needed when the server does not report it; the context bounds below are clamped to it automatically
 max_concurrent = 4           # requests in flight at once (lead, agents and votes together)
 retry_window_s = 300         # keep retrying an unreachable server this long; 0 = until it returns
 
 [context]
 # The request is re-woven (old tool output folded out of view, never lost) when it passes
-# target_tokens, down to floor_tokens. Both must be below the model's window.
+# target_tokens, down to floor_tokens (floor below target). A session clamps both to a smaller model window
+# automatically, so a small context_window needs no change here.
 target_tokens = 400000
 floor_tokens = 180000
 
@@ -1598,6 +1599,17 @@ mod tests {
         assert_eq!(config.daemon.bind, "127.0.0.1:7878");
         assert_eq!(config.network.mode, loom_core::config::NetworkMode::DenyAll);
         assert_eq!(config.agents.unavailable_notice_s, 300);
+    }
+
+    #[test]
+    fn the_generated_config_with_a_small_window_is_accepted() {
+        let text = DEFAULT_CONFIG.replace("# context_window = 1000000", "context_window = 32768");
+        assert!(text.contains("\ncontext_window = 32768"));
+        let config = Config::parse(&text).unwrap();
+        config.check().unwrap();
+        // The session clamps the bounds to the window (`session::reweave_bounds`); the config keeps its values.
+        assert_eq!(config.models["local"].context_window, Some(32768));
+        assert!(config.context.target_tokens >= 32768);
     }
 
     #[test]
