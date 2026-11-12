@@ -229,13 +229,16 @@ pub fn question_dismissed(item_text: &str) -> String {
 }
 
 /// The budget is used up; the session gets [`BUDGET_GRACE_STEPS`] more steps. A child's budget is its
-/// assignment's, a root's is the session's own.
+/// assignment's, a root's is the session's own. A root without `finish` has no tool that ends its
+/// work (`verdict` belongs to children), so it is told to reply.
 pub fn budget_reached(steps: u32, minutes: u64, can_finish: bool, is_child: bool) -> String {
     let whose = if is_child { "The budget for this assignment" } else { "This session's budget" };
     let deliver = if can_finish {
         "Call `finish` now: give what you established, with quotes of the output that shows it, and say in `not_established` what you did not get to."
-    } else {
+    } else if is_child {
         "Deliver your result now with the tool your role ends with, covering what you established and what you did not get to."
+    } else {
+        "Wrap up now: reply with what you established and what you did not get to."
     };
     format!(
         "{whose} is used up ({steps} steps, {minutes} min). {deliver} You have {BUDGET_GRACE_STEPS} more steps; after that the {} ends without a result.",
@@ -549,6 +552,9 @@ mod tests {
         assert!(budget_reached(40, 12, true, true).starts_with("The budget for this assignment is used up"));
         let root = budget_reached(40, 12, true, false);
         assert!(root.starts_with("This session's budget is used up") && !root.contains("assignment"), "{root}");
+        // A root without `finish` has no ending tool to be pointed at: it replies.
+        let chat = budget_reached(40, 12, false, false);
+        assert!(chat.contains("Wrap up now: reply with") && !chat.contains("tool"), "{chat}");
         assert!(budget_exhausted_report(40, 12, "").ends_with("It wrote no message."));
         assert!(gave_up_report(3, "I think it is fine")
             .ends_with("Its last message, unverified (each line starts with \">\"):\n> I think it is fine"));

@@ -94,10 +94,11 @@
 //! ## Creating a root session (`create_session`)
 //! 1. `workspace` must be an existing directory (canonicalised). Role: `packs.role(pack, role)`.
 //!    Profile: `config.profile(model)`.
-//! 2. Model facts: `client.discover()` once per profile (the first success WITH A WINDOW is remembered; a discovery that finds no window
-//!    refuses the creation and is not remembered). On
+//! 2. Model facts: `client.discover()` once per profile (the first success with a window is
+//!    remembered; a discovery that finds no window refuses the creation and is not remembered). On
 //!    `Unavailable`, carry on with the profile's `model` and `context_window` (logged as coming from
-//!    the configuration); without a configured window the creation is refused. On `Rejected`/`Config`: return its message.
+//!    the configuration); without a configured window the creation is refused. On
+//!    `Rejected`/`Config`: return its message.
 //! 3. New `SessionId`, new `MissionId`. `title`: the given one, else the first line of `message` cut
 //!    to 80 characters, else `untitled`.
 //! 4. `SessionStart{session, mission, parent: None, workspace, pack, role, termination,
@@ -115,7 +116,8 @@
 //!   start agents.`
 //! - the role must exist in the parent's pack and be in the parent role's `may_spawn`: otherwise
 //!   `` `{role}` is not a role this session can start. Roles it can start: {list}. ``
-//! - at most `agents.max_children` unsettled children per parent: otherwise `{n} agents are already
+//! - at most `agents.max_children` unsettled children per parent, not counting the finish gate's
+//!   verifiers (as in `children`): otherwise `{n} agents are already
 //!   running, which is the most allowed at once. Wait for one to finish (`wait`) or stop one
 //!   (`agent_stop`), then start this one.`
 //! - a request with `harness: true` (the finish gate's verifier) is exempt from both of the last two rules.
@@ -1979,9 +1981,10 @@ impl Inner {
 
     // ---- start ------------------------------------------------------------------------------
 
-    /// Model facts of a profile: discovery once, the first success remembered. The flag is true when
-    /// the server could not be asked and the numbers come from the profile alone. Without a configured
-    /// window that is refused: a session must not start with a window nobody knows.
+    /// Model facts of a profile: discovery once, the first success with a window remembered; a
+    /// discovery that finds no window refuses the creation and is not remembered. The flag is true
+    /// when the server could not be asked and the numbers come from the profile alone. Without a
+    /// configured window that is refused: a session must not start with a window nobody knows.
     async fn facts(&self, profile_name: &str) -> Result<(String, Option<u64>, bool), String> {
         let rt = self.profiles.get(profile_name).ok_or_else(|| format!("The model profile \"{profile_name}\" is not configured."))?;
         let remembered = lock(&rt.discovered).clone();
