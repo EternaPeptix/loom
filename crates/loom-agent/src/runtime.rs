@@ -207,15 +207,19 @@
 //!    Children restored this way count as not `awaited` from now on.
 //!
 //! ## Shutdown (`Runtime::shutdown`)
-//! Mark the runtime as shutting down, then `Control::shutdown()` on every active session: a running
-//! turn ends `Stopped` with `interrupted{REASON_RESTART}` and a child is **not** settled, so the
-//! next start resumes what was running. From the moment the runtime is marked, the orchestrator's
-//! `stop_child` and `stop_children` do nothing and return `Ok` (a parent whose awaited call was cut
-//! must not end its child for good), and `spawn`/`poll` answer `The harness is shutting down.`
-//! Then wait up to `tools.kill_grace_s + 5` seconds for the turns to end, close every inputs
-//! channel, wait up to 5 more seconds for the tasks and abort the rest, shut the proxy down. After
-//! `shutdown` every public method that returns a `Result` returns `The harness is shutting down.`
-//! and the listing methods keep answering from what is known.
+//! Mark the runtime as shutting down. From that moment the orchestrator's `stop_child` and
+//! `stop_children` do nothing and return `Ok` (a parent whose awaited call was cut must not end its
+//! child for good), `spawn`/`poll` answer `The harness is shutting down.`, and every public method
+//! that returns a `Result` returns the same sentence while the listing methods keep answering from
+//! what is known. Then close every active session's inputs channel — which ends every idle session
+//! cleanly — and wait up to `SHUTDOWN_TASK_WAIT` for the running turns to finish on their own;
+//! abort the tasks that have not, wait up to `SHUTDOWN_ABORT_WAIT` more, kill the sessions' jobs
+//! (grace `tools.kill_grace_s`), abort background tasks, and shut the proxy down. A turn still
+//! running when its task is aborted is cut rather than ended: its child is not settled, and the next
+//! `Session::open` records `interrupted{REASON_RESTART}` and a `Stopped` turn end, so a later start
+//! resumes exactly what a clean stop would have left. There is deliberately no mid-turn "clean stop"
+//! signal into `session.rs`: a running turn either finishes within the grace window or is recovered
+//! from its log, and both paths leave the same durable state.
 //!
 //! ## Reading
 //! - `sessions(include_archived)`: newest first. `session(id)`.
