@@ -5,6 +5,8 @@
 //! (`Client::from_home(&Paths::from_env())`). Errors are printed to stderr as `loom: {sentence}`
 //! and the exit code is 1 unless stated. Output goes to stdout; colour only when stdout is a
 //! terminal and `NO_COLOR` is not set; width from `COLUMNS`, else `ioctl(TIOCGWINSZ)`, else 100.
+//! The global flag `--unverified-daemon` (`client::allow_unverified_daemon`) accepts, with a warning
+//! line on stderr, a listener that cannot prove it is this home's daemon (one from an older `loom`).
 //!
 //! ## Commands
 //! - `daemon`: `serve::run`. `up`: `serve::spawn_background`, then print `loom is running on

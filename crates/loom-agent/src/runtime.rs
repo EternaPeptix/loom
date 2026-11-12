@@ -244,7 +244,10 @@
 //!    key; blob store; clients and limiters; proxy.
 //! 2. Read every session's `meta.json` and `status.json` (missing status = default idle status).
 //! 3. Activate as described under *Active sessions*. A session that cannot be opened is skipped
-//!    with `tracing::error!` and a `BusEvent::Error`.
+//!    with `tracing::error!` and a `BusEvent::Error`. Before that, off the async workers, what a
+//!    previous daemon left in the `jobs/` of every other session that is not archived is cleared
+//!    (`loom_tools::jobs::clear_leftovers`, logged); a session to activate is left to its job table,
+//!    so one whose activation fails keeps its records for the next start.
 //! 4. Restored sessions with `meta.unattended` are told to carry on (`Input::Resume`) when
 //!    - `open` cut a running turn (after `open`, the last own `turn_end` is `Stopped`, the latest
 //!      own `interrupted` reason is `REASON_RESTART` or starts with `the session log was damaged`,
@@ -299,7 +302,8 @@
 //!   `TokenEstimator` over the messages plus the tool specs' JSON).
 //! - `missions()`: one per root session. `ledger(mission)`: the journal read and folded
 //!   (`No ledger: this mission's lead does not keep one.` when there is no journal file and the
-//!   lead's role keeps none; a lead that keeps one but has no journal file yet has an empty ledger). The id
+//!   lead's role keeps none or can no longer be looked up; a lead that keeps one but has no journal
+//!   file yet has an empty ledger). The id
 //!   must be the mission of a known session, checked before a path is made from it (`There is no
 //!   mission {id}.`).
 //! - `inbox()`: open items, oldest first. `net(id, limit)`: the last `limit` entries.
@@ -1238,12 +1242,14 @@ impl Inner {
 
     /// Kill what a crashed daemon left running in the jobs directories of the sessions it knows, including the ones
     /// nobody activates (a session that was idle at the crash). Runs off the async workers; logs what it did.
-    async fn clear_crash_leftovers(&self) {
+    /// `activating` are left out: their job tables clear them when built, and one whose activation fails keeps its
+    /// records, without which the next start would not read its log for a lost job (`has_unsettled_job`).
+    async fn clear_crash_leftovers(&self, activating: &[SessionId]) {
         let dirs: Vec<(SessionId, PathBuf)> = {
             let st = self.st();
             st.known
                 .iter()
-                .filter(|(_, k)| !k.meta.archived)
+                .filter(|(id, k)| !k.meta.archived && !activating.contains(id))
                 .map(|(id, _)| (id.clone(), self.paths.session_dir(id).join("jobs")))
                 .collect()
         };
@@ -2088,7 +2094,7 @@ impl Runtime {
             .map(|(id, _)| id)
             .collect();
         // After the candidates are chosen: the sweep removes the records `has_unsettled_job` looks for.
-        inner.clear_crash_leftovers().await;
+        inner.clear_crash_leftovers(&wanted).await;
         let mut cut: HashSet<SessionId> = HashSet::new();
         let mut woken: HashSet<SessionId> = HashSet::new();
         for id in wanted {
@@ -2618,12 +2624,9 @@ impl Runtime {
         let path = self.inner.paths.journal(mission);
         if !path.is_file() {
             // A lead that keeps a ledger and has recorded nothing yet has an empty one; only a lead that keeps none has no ledger.
+            // A lead whose role can no longer be looked up (its pack was removed) is taken to keep none.
             let lead = self.inner.st().known.values().find(|k| &k.meta.mission == mission && k.meta.parent.is_none()).map(|k| k.meta.clone());
-            let keeps = match lead {
-                Some(meta) => self.inner.mission_explicit(&meta)?,
-                None => false,
-            };
-            if !keeps {
+            if !lead.is_some_and(|meta| self.inner.mission_explicit(&meta).unwrap_or(false)) {
                 return Err("No ledger: this mission's lead does not keep one.".to_string());
             }
         }
@@ -3191,6 +3194,27 @@ mod tests {
         assert_eq!((view.state.constraints.len(), view.state.goal.as_deref()), (0, None));
         assert!(!journal.exists(), "reading must not create the journal");
         tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lead_whose_pack_is_gone_and_has_no_journal_file_keeps_no_ledger() {
+        let pack_toml = "name = \"gone\"\ndefault_role = \"r\"\n[roles.r]\nprompt = \"r.md\"\ntools = [\"finish\"]\ntermination = \"explicit\"\n";
+        let e = env_with_packs(Script::new(|_, _| Action::Stall { ms: 600_000 }), |_| {}, |packs| {
+            std::fs::create_dir_all(packs.join("gone")).unwrap();
+            std::fs::write(packs.join("gone/pack.toml"), pack_toml).unwrap();
+            std::fs::write(packs.join("gone/r.md"), "Role R.").unwrap();
+        })
+        .await;
+        let mut new = e.new_session(None);
+        new.pack = Some("gone".into());
+        let mission = e.rt.create_session(new).await.unwrap().meta.mission;
+        assert!(!e.rt.paths().journal(&mission).exists());
+        assert!(e.rt.ledger(&mission).is_ok(), "its role keeps a ledger: an empty one");
+        e.rt.shutdown().await;
+        std::fs::remove_dir_all(e.rt.paths().packs_dir().join("gone")).unwrap();
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert_eq!(rt2.ledger(&mission).unwrap_err(), "No ledger: this mission's lead does not keep one.");
+        rt2.shutdown().await;
     }
 
     #[tokio::test]
@@ -4147,6 +4171,59 @@ mod tests {
         assert!(mentions(&e.server.requests().pop().unwrap(), &texts::job_lost("j1", "sleep 600")));
         assert!(!jobs.join("j1.pid").exists());
         rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_restart_that_cannot_run_the_session_keeps_its_job_records_so_the_next_one_wakes_it() {
+        let (_dir, home, ws) = strict_home();
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let server = MockServer::start(Script::new(move |body, _| {
+            if flag.load(Ordering::SeqCst) {
+                Action::Reply(Reply::text("noted"))
+            } else if tool_msgs(body) == 0 {
+                call("bash", json!({"command": "sleep 600", "background": true}))
+            } else {
+                Action::Reply(Reply::text("it is running; I will look at it when it ends"))
+            }
+        }))
+        .await
+        .unwrap();
+        let (mut config, paths) = (config_for(&server, None), Paths::at(home));
+        let rt = Runtime::start(config.clone(), paths.clone()).await.unwrap();
+        let new = NewSession {
+            workspace: ws,
+            pack: Some("strict".into()),
+            message: Some("start a job".into()),
+            ..NewSession::default()
+        };
+        let id = rt.create_session(new).await.unwrap().meta.id;
+        until("yielded", || {
+            rt.records(&id, None, 2_000)
+                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Yielded })))
+        })
+        .await;
+        until("idle", || rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        rt.shutdown().await;
+        let jobs = paths.session_dir(&id).join("jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        std::fs::write(jobs.join("j1.pid"), "999999 1\nowner 1 1.000000\n").unwrap();
+        after.store(true, Ordering::SeqCst);
+        // The first restart refuses to run the session (its pack needs a restricted network) ...
+        config.network.mode = NetworkMode::Open;
+        let rt = Runtime::start(config.clone(), paths.clone()).await.unwrap();
+        assert!(!rt.session(&id).unwrap().active);
+        assert!(jobs.join("j1.pid").exists(), "the records of a session that was not activated were swept");
+        rt.shutdown().await;
+        // ... and the next one, with the network restricted again, still wakes it for its lost job.
+        let before = server.requests().len();
+        config.network.mode = NetworkMode::DenyAll;
+        let rt = Runtime::start(config, paths).await.unwrap();
+        until("a turn after the second restart", || server.requests().len() > before).await;
+        let rs = rt.records(&id, None, 2_000).unwrap();
+        assert!(rs.iter().any(|r| matches!(&r.event, Event::JobSettled { detail, .. } if detail == texts::JOB_LOST_DETAIL)));
+        assert!(mentions(&server.requests().pop().unwrap(), &texts::job_lost("j1", "sleep 600")));
+        rt.shutdown().await;
     }
 
     /// A lead and one unfinished worker, both cut by a restart, and the runtime started again. Before
