@@ -506,6 +506,14 @@ mod tests {
     }
 
     #[test]
+    fn the_vr_pack_of_this_repository_requires_a_restricted_network() {
+        // Its text tells the model that only authorized hosts are reachable.
+        let vr = load_pack(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packs/vr"))).unwrap();
+        assert_eq!(vr.name, "vr");
+        assert!(vr.requires_restricted_network);
+    }
+
+    #[test]
     fn missing_dir_is_fine_and_core_can_be_replaced() {
         let d = tempfile::tempdir().unwrap();
         assert_eq!(Packs::load(&d.path().join("nope")).unwrap().names(), vec!["core"]);

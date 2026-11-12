@@ -131,7 +131,7 @@ pub fn sentence(s: &str) -> String {
 }
 
 /// Note at the start of the turn that follows a harness restart.
-pub const AFTER_RESTART: &str = "The harness was restarted while you were working. A call shown with no recorded result may or may not have taken effect: check the state of things before repeating it. Background jobs from before the restart are no longer tracked: each one that was still running is noted above as lost. Agents you started were not ended: those still unfinished are resumed along with you and their reports reach you by themselves, so do not start them again. Then carry on with the work.";
+pub const AFTER_RESTART: &str = "The harness was restarted while you were working. A call shown with no recorded result may or may not have taken effect: check the state of things before repeating it. Background jobs from before the restart are no longer tracked: the notes above say what is known about those that had not ended, and a job without such a note has to be checked before you rely on it or start it again. Agents you started were not ended: those still unfinished have been resumed and their reports reach you by themselves, so do not start them again. Then carry on with the work.";
 
 /// Note at the start of the turn after the operator pressed stop and then resumed.
 pub const AFTER_STOP: &str = "The operator stopped the previous turn and has now resumed it. A call shown with no recorded result was interrupted: check the state of things before repeating it. Background jobs and agents from before the stop were ended. Carry on with the work.";
@@ -202,6 +202,22 @@ pub fn failed_report(why: &str, last_reply: &str) -> String {
     let mut out = format!("The agent's session failed and delivered no result. {why}");
     append_last_reply(&mut out, last_reply);
     out
+}
+
+/// Why a session stopped when its task failed inside the harness (`what` is the panic's message).
+/// For a child the sentence is the `why` of [`failed_report`], read by the agent that assigned the
+/// work: the child is settled, so the next step it names is a new agent, not a message to this one.
+pub fn task_failed(what: &str, is_child: bool) -> String {
+    let what = cut(&one_line(what), 200);
+    if is_child {
+        format!(
+            "Its task failed with an internal error in the harness ({what}), not because of the assignment. The assignment was not carried out: start a new agent for it if it is still needed."
+        )
+    } else {
+        format!(
+            "The session's task failed with an internal error ({what}). This is a fault in the harness: report it, and send the session a message to make it try again."
+        )
+    }
 }
 
 fn append_last_reply(out: &mut String, last_reply: &str) {
@@ -342,7 +358,7 @@ pub const JOB_LOST_DETAIL: &str = "The harness was restarted while this job was 
 /// A background job that was running when the harness went down.
 pub fn job_lost(id: &str, command: &str) -> String {
     format!(
-        "Background job {id} (`{}`) was running when the harness was restarted. It is no longer tracked: its outcome is unknown and it may have been cut off. Check what it left behind before relying on it, and start it again if it is still needed.",
+        "Background job {id} (`{}`) was running when the harness was restarted. It is no longer tracked and its outcome is unknown: it may have been cut off, or it may still be running. Check what it left behind and whether its process is still there before relying on it or starting it again.",
         cut(&one_line(command), 120)
     )
 }
@@ -354,7 +370,26 @@ mod tests {
     #[test]
     fn the_restart_note_does_not_call_resumed_agents_gone() {
         assert!(!AFTER_RESTART.contains("gone"));
-        assert!(AFTER_RESTART.contains("resumed"));
+        assert!(AFTER_RESTART.contains("have been resumed") && AFTER_RESTART.contains("do not start them again"));
+        // It does not promise a note for every job, and does not tell the model to start anything again.
+        assert!(!AFTER_RESTART.contains("each one") && !AFTER_RESTART.contains("start them again if"));
+    }
+
+    #[test]
+    fn a_lost_job_may_still_be_running_and_is_checked_before_it_is_started_again() {
+        let t = job_lost("j3", "make   test");
+        assert!(t.contains("job j3 (`make test`)"), "{t}");
+        assert!(t.contains("may still be running") && t.contains("whether its process is still there"), "{t}");
+        assert!(!t.contains("start it again if"), "{t}");
+    }
+
+    #[test]
+    fn a_failed_task_names_a_next_step_that_works_for_whoever_reads_it() {
+        let root = task_failed("index out of\nbounds", false);
+        assert!(root.contains("(index out of bounds)") && root.contains("send the session a message"), "{root}");
+        let child = failed_report(&task_failed("boom", true), "");
+        assert!(child.starts_with("The agent's session failed and delivered no result. Its task failed with an internal error"), "{child}");
+        assert!(child.contains("start a new agent") && !child.contains("send the session a message"), "{child}");
     }
 
     #[test]

@@ -15,6 +15,11 @@
 //! - `status.json` — the latest [`Status`](crate::session::Status), rewritten atomically whenever
 //!   the session publishes one.
 //! - `net.jsonl` — one [`NetEntry`] per line: every decision the egress proxy made for the session.
+//! - `settlement.json` — a child's [`Settlement`](crate::rtools::Settlement), written atomically
+//!   when its task ends with one. Read only when a delivery lost to a restart is recovered (see
+//!   *Start*), so that the parent gets the whole report. A child that ended without the file (a
+//!   crash between its `session_end` and the write, or a log from before the file existed) is
+//!   recovered from its log instead, with the first line of its report.
 //! - `tmp/` (`paths.session_tmp`) — the session's scratch directory; `jobs/` — its job table's files.
 //!
 //! A session directory without a readable `meta.json` is ignored (`tracing::warn!`).
@@ -28,12 +33,18 @@
 //! *Activating* a session = building its `Deps` (below), `Session::open`, spawning the task.
 //! Activating a child first activates its parent. Activation happens:
 //! - at start, for every session that is not archived and whose `status.json` says `phase ==
-//!   Running`, or `last_end == Waiting`, or `open_inbox > 0` (parents before children — session ids
-//!   sort by creation time);
+//!   Running`, or `last_end == Waiting`, or `open_inbox > 0`, or `last_end == Yielded` while its log
+//!   holds a `job_registered` with no `job_settled` (the job's end would have started a turn; the
+//!   log is read only when the session's `jobs/` directory is not empty) (parents before children —
+//!   session ids sort by creation time);
 //! - on demand, by `send_message`, `resume`, `reweave`, `answer`, and when a settlement has to be
 //!   delivered to a parent that is not active.
 //!
-//! A session whose `status.json` says `phase == Ended` is never activated.
+//! A session whose `status.json` says `phase == Ended` is never activated. Neither is a session of
+//! a pack with `requires_restricted_network` while `config.network.mode` is `Open`: its prompt
+//! says the network is restricted. Activation (and `create_session`) is refused with `The pack
+//! "{pack}" needs a restricted network, but the network mode is open, so its sessions are not run.
+//! Set [network] mode = "allowlist" (or "deny_all") in the config and restart the daemon.`
 //!
 //! When a session's task ends:
 //! - `End::Settled(s)`: the session becomes inactive; its proxy grant is revoked; the settlement is
@@ -42,10 +53,17 @@
 //! - `End::Fatal(e)`: inactive; `tracing::error!`; a [`BusEvent::Error`]; the operator is notified
 //!   (kind `error`). A child is then settled on its behalf so that nothing waits for it forever:
 //!   `Settlement{outcome: Failed, report: texts::failed_report(&e, ""), full: None, payload: Null,
-//!   steps and usage from the last status (usage: default)}`.
+//!   steps and usage from the last status (usage: default)}`, and its status becomes `Ended` /
+//!   `Failed` (published and written), so that a later start does not run it again beside the
+//!   settlement its parent was given.
+//!
+//! A panic in a session's task is caught and ends the session as `End::Fatal(texts::task_failed(
+//! <the panic's message>, <is a child>))`.
 //!
 //! ## Set-up of one session (`Deps`)
-//! - `paths`, `agents`, `context`, `admit` from the config; `client` and `limiter` of the session's
+//! - `paths`, `agents`, `context`, `admit` from the config (`agents.stall_steps` is 0 for a role
+//!   with none of the tools `note`, `claim`, `evidence`: the stall note asks for a ledger record,
+//!   and with the journal every child would otherwise be given it); `client` and `limiter` of the session's
 //!   model profile (one `ModelClient` and one `Limiter::new(profile.max_concurrent)` per profile,
 //!   made at start); `priority` `Lead` for a root session, `Child` for a child;
 //!   `context_window` from `meta`.
@@ -112,7 +130,8 @@
 //! `join(parent, child, cancel)`: `child` must be a child of `parent` (`{child} is not an agent this
 //! session started.`) spawned with `awaited` (`{child} was started in the background; its report
 //! arrives by itself.`). Waits for the settlement; `cancel` first → `Err("Interrupted before the
-//! agent finished.")`. The first successful join of a child queues
+//! agent finished.")` — except during shutdown, when the call does not return at all (see
+//! *Shutdown*). The first successful join of a child queues
 //! `parent_shared.emit(Author::Agent(child), Event::ChildSettled(ChildSettled{child, outcome,
 //! report, full, usage, steps, inline: true}))`; later joins return the same settlement and queue
 //! nothing.
@@ -176,14 +195,17 @@
 //! ## Operator actions
 //! - `send_message(id, text)`: root sessions only (`Messages go to the lead session of a mission;
 //!   {id} is one of its agents.`); empty text refused; ended session refused; activate;
-//!   `Input::User`.
+//!   `Input::User`; then its children that a restart cut are resumed as `resume` does (the lead's
+//!   turn starts with `AFTER_RESTART`, which says so).
 //! - `stop(id)`: any session. Active: `control.stop_turn()` and `Input::Stop`. Not active: nothing.
 //! - `resume(id)`: root only; activate; `Input::Resume` to it and to each of its unsettled children
-//!   whose latest status has `last_end == Stopped` (activating them).
+//!   whose latest status has `last_end == Stopped` (activating them), except one that is running a
+//!   turn already. Only a restart leaves a child that way: a child that is stopped settles.
 //! - `reweave(id)`: activate; `Input::Reweave`.
 //! - `answer(item_id, answer)`: the item must be open (`There is no open inbox item {item_id}.`);
 //!   an empty answer to a blocking item is refused (`This item is waiting for an answer; write
-//!   one.`); activate the session; `Input::Answer`. (An empty answer to a non-blocking item
+//!   one.`); activate the session; `Input::Answer`; a non-empty answer also resumes the session's
+//!   children that a restart cut, as `resume` does. (An empty answer to a non-blocking item
 //!   dismisses it: the session resolves it without starting a turn.)
 //! - `archive(id, archived)`: root only; refused while the session or one of its children is
 //!   running a turn (`Stop the session before archiving it.`). Sets `archived` in the `meta.json`
@@ -204,23 +226,43 @@
 //!      and no own `turn_start` follows it), or
 //!    - the last turn ended `Waiting` and the session has no unsettled child.
 //!
+//!    Attended or not, a restored session is told to carry on when its last turn ended `Waiting`
+//!    or `Yielded` and `open` told it of a lost job (`Session::lost_jobs() > 0`: the job's end
+//!    would have started a turn), and a child that a restart cut is told to carry on whenever its
+//!    parent is: what the lead is told about its agents (`AFTER_RESTART`) is then what happened.
+//!    A session whose last turn ended `Waiting` or `Yielded` and to which a lost delivery is
+//!    recovered (below) is not told to carry on — the delivery starts its turn — but counts as
+//!    carrying on for its children.
+//!
 //!    Children restored this way count as not `awaited` from now on.
+//!
+//!    A delivery lost to the restart is recovered: a child that has ended (not an awaited one that
+//!    was stopped) and whose parent's log holds no `child_settled` for it is delivered to the
+//!    parent as `Input::ChildSettled`, from its `settlement.json` or else from its log (see *Files*).
 //!
 //! ## Shutdown (`Runtime::shutdown`)
 //! Mark the runtime as shutting down. From that moment the orchestrator's `stop_child` and
 //! `stop_children` do nothing and return `Ok` (a parent whose awaited call was cut must not end its
 //! child for good), `spawn`/`poll` answer `The harness is shutting down.`, and every public method
 //! that returns a `Result` returns the same sentence while the listing methods keep answering from
-//! what is known. Then close every active session's inputs channel — which ends every idle session
-//! cleanly — and wait up to `SHUTDOWN_TASK_WAIT` for the running turns to finish on their own;
-//! abort the tasks that have not, wait up to `SHUTDOWN_ABORT_WAIT` more, kill the sessions' jobs
-//! (grace `tools.kill_grace_s`), abort background tasks, and shut the proxy down. A turn still
-//! running when its task is aborted is cut rather than ended: its child is not settled, and the next
+//! what is known. Then cancel every running turn through `Control::stop_for_shutdown` — a running
+//! tool is cancelled the usual way (a command gets TERM, then KILL after `tools.kill_grace_s`) and
+//! its result is recorded, and the session itself records `interrupted{REASON_RESTART}` and a
+//! `Stopped` turn end (a child is not settled) — and close every active session's inputs channel,
+//! which ends every idle session cleanly. Wait up to `tools.kill_grace_s` + `SHUTDOWN_TASK_WAIT`
+//! for the tasks to end (the grace is the cancelled tool's: a foreground command whose task is
+//! aborted before its KILL would be left running, since nothing else tracks it); abort the tasks
+//! that have not, wait up to `SHUTDOWN_ABORT_WAIT` more, kill the sessions' jobs (grace
+//! `tools.kill_grace_s`), abort background tasks, and shut the proxy down. A turn still running
+//! when its task is aborted is cut rather than ended: its child is not settled, and the next
 //! `Session::open` records `interrupted{REASON_RESTART}` and a `Stopped` turn end, so a later start
-//! resumes exactly what a clean stop would have left. Before the inputs are closed every running turn
-//! is cancelled through `Control::stop_for_shutdown`: tools get their usual TERM then KILL, the session
-//! records `interrupted{REASON_RESTART}` and a `Stopped` turn end itself (a child is not settled), and
-//! only what has not ended within the waits is aborted.
+//! resumes exactly what a clean stop would have left.
+//!
+//! A `join` whose `cancel` fires during shutdown does not return: its child is not stopped but cut
+//! and resumed by the next start, so a result saying the call was interrupted and the agent stopped
+//! would be false. The task waiting in it is aborted as soon as it is seen there (no need to wait
+//! out the deadline), the call keeps no recorded result, and after the restart the weave shows it
+//! as interrupted while the child's report arrives by itself.
 //!
 //! ## Reading
 //! - `sessions(include_archived)`: newest first. `session(id)`.
@@ -458,8 +500,11 @@ pub enum BusEvent {
 const SHUTTING: &str = "The harness is shutting down.";
 /// Most records a `records` page holds.
 const PAGE_MAX: usize = 2_000;
-/// How long tasks get to end by themselves after their inputs were closed at shutdown.
+/// How long tasks get to end by themselves after their inputs were closed at shutdown, on top of
+/// the grace a cancelled command gets between TERM and KILL.
 const SHUTDOWN_TASK_WAIT: Duration = Duration::from_secs(3);
+/// How often shutdown looks for tasks that have ended or are parked in a `join`.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 /// How long an aborted task gets to be dropped.
 const SHUTDOWN_ABORT_WAIT: Duration = Duration::from_secs(5);
 /// How long a notification command may run.
@@ -568,17 +613,13 @@ fn sandbox_cfg_for(base: &SandboxCfg, role: &RoleDef, workspace: &Path) -> Sandb
     cfg
 }
 
-/// The sentence for a session task that panicked.
-fn panic_sentence(payload: &(dyn std::any::Any + Send)) -> String {
-    let what = payload
+/// The message a panic carried.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
         .downcast_ref::<&str>()
         .map(|s| (*s).to_string())
         .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "no message".to_string());
-    format!(
-        "The session's task failed with an internal error ({}). This is a fault in the harness: report it, and send the session a message to make it try again.",
-        cut_chars(&what, 200)
-    )
+        .unwrap_or_else(|| "no message".to_string())
 }
 
 /// Titles of sessions whose task panics when it starts (tests only).
@@ -647,6 +688,8 @@ struct State {
     scanned: HashSet<MissionId>,
     /// Background tasks (net forwarder, notification repeaters).
     tasks: Vec<JoinHandle<()>>,
+    /// Sessions whose task waits in a `join` that shutdown cancelled and that will not return.
+    parked: HashSet<SessionId>,
 }
 
 /// One model profile, made at start.
@@ -765,7 +808,17 @@ impl Orchestrator for Orch {
             }
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Err("Interrupted before the agent finished.".to_string()),
+                _ = cancel.cancelled() => {
+                    if inner.shutting.load(Ordering::SeqCst) {
+                        // The child is not stopped by a shutdown: it is cut, and resumed by the next
+                        // start. A result written now would tell the model that the call was
+                        // interrupted and the agent stopped, so the call gets none: this task stays
+                        // here until `shutdown` aborts it, and `open` records the cut.
+                        inner.st().parked.insert(parent.clone());
+                        std::future::pending::<()>().await;
+                    }
+                    return Err("Interrupted before the agent finished.".to_string());
+                }
                 changed = rx.changed() => {
                     if changed.is_err() {
                         return Err(SHUTTING.to_string());
@@ -1129,6 +1182,18 @@ impl Inner {
         Ok(self.packs.role(Some(&root_meta.pack), Some(&root_meta.role))?.termination == Termination::Explicit)
     }
 
+    /// Sessions of a pack whose text says the network is restricted do not run while it is open.
+    fn check_network(&self, pack: &str) -> Result<(), String> {
+        if self.config.network.mode == NetworkMode::Open
+            && self.packs.get(pack).is_some_and(|p| p.requires_restricted_network)
+        {
+            return Err(format!(
+                "The pack \"{pack}\" needs a restricted network, but the network mode is open, so its sessions are not run. Set [network] mode = \"allowlist\" (or \"deny_all\") in the config and restart the daemon."
+            ));
+        }
+        Ok(())
+    }
+
     /// The `Deps` of a session (granting it its proxy credentials).
     fn build(&self, meta: &SessionMeta, explicit: bool) -> Result<(Deps, Parts), String> {
         let role = self.packs.role(Some(&meta.pack), Some(&meta.role))?.clone();
@@ -1169,6 +1234,12 @@ impl Inner {
         };
         // The mission journal is shared by the lead and all its children.
         let journal = explicit.then(|| Journal::new(self.paths.journal(&meta.mission), self.key.clone()));
+        // The stall note asks for a ledger record (`note`, or `claim` with `evidence`): a role that
+        // can write none (a verifier) is not given it.
+        let mut agents = self.config.agents.clone();
+        if !role.tools.iter().any(|t| matches!(t.as_str(), "note" | "claim" | "evidence")) {
+            agents.stall_steps = 0;
+        }
         let shared = Arc::new(Shared::new(
             id.clone(),
             Some(meta.mission.clone()),
@@ -1182,7 +1253,7 @@ impl Inner {
         let control = Arc::new(Control::new());
         let deps = Deps {
             paths: self.paths.clone(),
-            agents: self.config.agents.clone(),
+            agents,
             context: self.config.context.clone(),
             admit: self.config.admit.clone(),
             client: profile.client.clone(),
@@ -1244,6 +1315,7 @@ impl Inner {
         let (inputs, rx) = unbounded_channel();
         let weak = self.me.clone();
         let sid = id.clone();
+        let is_child = st.known.get(id).is_some_and(|k| k.meta.parent.is_some());
         #[cfg(test)]
         let title = st.known.get(id).map(|k| k.meta.title.clone()).unwrap_or_default();
         let task = tokio::spawn(async move {
@@ -1258,7 +1330,7 @@ impl Inner {
             // would wait for it for ever.
             let end = match std::panic::AssertUnwindSafe(run).catch_unwind().await {
                 Ok(end) => end,
-                Err(payload) => End::Fatal(panic_sentence(payload.as_ref())),
+                Err(payload) => End::Fatal(texts::task_failed(&panic_message(payload.as_ref()), is_child)),
             };
             if let Some(inner) = weak.upgrade() {
                 inner.on_end(&sid, gen, end);
@@ -1286,6 +1358,7 @@ impl Inner {
             }
             k.meta.clone()
         };
+        self.check_network(&meta.pack)?;
         if let Some(parent) = &meta.parent {
             self.activate_locked(parent)?;
         }
@@ -1334,20 +1407,13 @@ impl Inner {
     fn on_end(self: &Arc<Self>, id: &SessionId, gen: u64, end: End) {
         self.proxy.revoke(id);
         let settlement = match end {
-            End::Settled(s) => {
-                // Kept beside the log so that a delivery lost to a restart carries the whole report.
-                let dir = self.paths.session_dir(id);
-                if let Err(e) = write_json_atomic(&dir.join("settlement.json"), &s) {
-                    tracing::warn!("cannot write settlement.json of {}: {e}", id.as_str());
-                }
-                Some(s)
-            }
+            End::Settled(s) => Some(s),
             End::Closed => {
                 self.clear_active(id, gen);
                 None
             }
             End::Fatal(e) => {
-                tracing::error!("session {} stopped on a log fault: {e}", id.as_str());
+                tracing::error!("session {} stopped: {e}", id.as_str());
                 self.publish_error(Some(id), format!("Session {} stopped: {e}", id.as_str()));
                 self.clear_active(id, gen);
                 let title = self.st().known.get(id).map(|k| (k.meta.title.clone(), k.meta.parent.is_some(), k.meta.role.clone(), k.status.step));
@@ -1355,6 +1421,9 @@ impl Inner {
                     Some((title, is_child, role, steps)) => {
                         if !self.shutting.load(Ordering::SeqCst) {
                             self.notify("error", id, &title, &e);
+                        }
+                        if is_child {
+                            self.mark_failed(id);
                         }
                         is_child.then(|| Settlement {
                             child: id.clone(),
@@ -1372,8 +1441,29 @@ impl Inner {
             }
         };
         let Some(s) = settlement else { return };
+        // Kept beside the log so that a delivery lost to a restart carries the whole report.
+        if let Err(e) = write_json_atomic(&self.paths.session_dir(id).join("settlement.json"), &s) {
+            tracing::warn!("cannot write settlement.json of {}: {e}", id.as_str());
+        }
         self.clear_active(id, gen);
         self.record_settlement(id, s);
+    }
+
+    /// A child whose task ended without writing a `session_end` (a log fault, a panic) is over all
+    /// the same. Its status says so, durably, so that a later start does not run it again beside
+    /// the settlement its parent was given.
+    fn mark_failed(&self, id: &SessionId) {
+        let status = {
+            let mut st = self.st();
+            st.known.get_mut(id).map(|k| {
+                k.status.phase = Phase::Ended;
+                k.status.outcome = Some(SessionOutcome::Failed);
+                k.status.clone()
+            })
+        };
+        if let Some(status) = status {
+            self.on_status(id, &status);
+        }
     }
 
     fn clear_active(&self, id: &SessionId, gen: u64) {
@@ -1614,6 +1704,10 @@ impl Inner {
             if settled.contains(&id) {
                 continue;
             }
+            // What the child's task handed over when it ended. Without it (see *Files*) the child's
+            // log gives the outcome and the first line of the report.
+            let persisted = read_json::<Settlement>(&self.paths.session_dir(&id).join("settlement.json"))
+                .filter(|p| p.child == id);
             let Ok(report) = read_records(&self.paths.session_log(&id)) else { continue };
             let own = own_records(&report.records);
             let blocked = own
@@ -1628,23 +1722,25 @@ impl Inner {
                 Event::SessionEnd { outcome, detail } => Some((*outcome, detail.clone())),
                 _ => None,
             });
-            let Some((outcome, detail)) = end else { continue };
-            let outcome = if blocked { ChildOutcome::Blocked } else { child_outcome_of(outcome) };
-            let steps = self.st().known.get(&id).map(|k| k.status.step).unwrap_or(0);
-            let text = if detail.trim().is_empty() { texts::stopped_report(steps) } else { detail };
-            let persisted = read_json::<Settlement>(&self.paths.session_dir(&id).join("settlement.json"))
-                .filter(|p| p.child == id);
-            let s = Settlement {
-                child: id.clone(),
-                role: meta.role.clone(),
-                outcome,
-                report: text,
-                full: None,
-                payload: serde_json::Value::Null,
-                steps,
-                usage: Usage::default(),
+            let s = match (persisted, end) {
+                (Some(s), _) => s,
+                (None, Some((outcome, detail))) => {
+                    let outcome = if blocked { ChildOutcome::Blocked } else { child_outcome_of(outcome) };
+                    let steps = self.st().known.get(&id).map(|k| k.status.step).unwrap_or(0);
+                    let text = if detail.trim().is_empty() { texts::stopped_report(steps) } else { detail };
+                    Settlement {
+                        child: id.clone(),
+                        role: meta.role.clone(),
+                        outcome,
+                        report: text,
+                        full: None,
+                        payload: serde_json::Value::Null,
+                        steps,
+                        usage: Usage::default(),
+                    }
+                }
+                (None, None) => continue,
             };
-            let s = persisted.unwrap_or(s);
             {
                 let mut st = self.st();
                 if let Some(k) = st.known.get_mut(&id) {
@@ -1661,6 +1757,54 @@ impl Inner {
 
     fn has_unsettled_child(&self, id: &SessionId) -> bool {
         self.st().known.values().any(|k| k.meta.parent.as_ref() == Some(id) && !k.finished())
+    }
+
+    /// Whether the session's log holds a job that was registered and never settled. The log is
+    /// read only when the session's jobs directory holds something: a background job leaves its
+    /// output file there.
+    fn has_unsettled_job(&self, id: &SessionId) -> bool {
+        let jobs = self.paths.session_dir(id).join("jobs");
+        if !std::fs::read_dir(jobs).is_ok_and(|mut entries| entries.next().is_some()) {
+            return false;
+        }
+        let Ok(report) = read_records(&self.paths.session_log(id)) else { return false };
+        let own = own_records(&report.records);
+        let settled: HashSet<&str> = own
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::JobSettled { job_id, .. } => Some(job_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        own.iter().any(|r| matches!(&r.event, Event::JobRegistered { job_id, .. } if !settled.contains(job_id.as_str())))
+    }
+
+    /// Tell the children of `lead` that a restart cut to carry on. An unsettled child's turn ends
+    /// `Stopped` only that way: a child stopped by its parent or the operator settles. One that is
+    /// already running the turn it was resumed with (its last turn end is still that cut) is left
+    /// alone, or the second `Resume` would start a turn it did not ask for when this one ends.
+    fn resume_cut_children(self: &Arc<Self>, lead: &SessionId) {
+        let children: Vec<SessionId> = {
+            let st = self.st();
+            st.known
+                .iter()
+                .filter(|(_, k)| {
+                    k.meta.parent.as_ref() == Some(lead)
+                        && !k.finished()
+                        && k.status.last_end == Some(TurnEndReason::Stopped)
+                        && !(k.active.is_some() && k.status.phase == Phase::Running)
+                })
+                .map(|(c, _)| c.clone())
+                .collect()
+        };
+        for child in children {
+            match self.activate(&child) {
+                Ok(_) => {
+                    self.send_input(&child, Input::Resume);
+                }
+                Err(e) => tracing::warn!("child {} cannot be resumed: {e}", child.as_str()),
+            }
+        }
     }
 }
 
@@ -1787,20 +1931,27 @@ impl Runtime {
 
         inner.load_known();
         let mut restored: Vec<SessionId> = Vec::new();
-        let wanted: Vec<SessionId> = {
+        // The flag marks a session that is wanted only if a job of its was lost (its turn yielded
+        // while the job ran, and the job's end would have started the next one).
+        let candidates: Vec<(SessionId, bool)> = {
             let st = inner.st();
             st.known
                 .iter()
-                .filter(|(_, k)| {
-                    !k.meta.archived
-                        && k.status.phase != Phase::Ended
-                        && (k.status.phase == Phase::Running
-                            || k.status.last_end == Some(TurnEndReason::Waiting)
-                            || k.status.open_inbox > 0)
+                .filter(|(_, k)| !k.meta.archived && k.status.phase != Phase::Ended)
+                .filter_map(|(id, k)| {
+                    let wanted = k.status.phase == Phase::Running
+                        || k.status.last_end == Some(TurnEndReason::Waiting)
+                        || k.status.open_inbox > 0;
+                    let yielded = k.status.last_end == Some(TurnEndReason::Yielded);
+                    (wanted || yielded).then(|| (id.clone(), !wanted))
                 })
-                .map(|(id, _)| id.clone())
                 .collect()
         };
+        let wanted: Vec<SessionId> = candidates
+            .into_iter()
+            .filter(|(id, for_a_job)| !for_a_job || inner.has_unsettled_job(id))
+            .map(|(id, _)| id)
+            .collect();
         let mut cut: HashSet<SessionId> = HashSet::new();
         let mut woken: HashSet<SessionId> = HashSet::new();
         for id in wanted {
@@ -1823,27 +1974,36 @@ impl Runtime {
             }
         }
         let recovered = inner.recover_settlements();
+        // The sessions told to carry on (parents come before their children).
+        let mut going: HashSet<SessionId> = HashSet::new();
         for id in restored {
-            let (unattended, last_end, active) = {
+            let (unattended, last_end, active, parent) = {
                 let st = inner.st();
                 match st.known.get(&id) {
-                    Some(k) => (k.meta.unattended, k.status.last_end, k.active.is_some()),
+                    Some(k) => (k.meta.unattended, k.status.last_end, k.active.is_some(), k.meta.parent.clone()),
                     None => continue,
                 }
             };
             if !active {
                 continue;
             }
+            // The settlement recovered for it starts a turn by itself.
+            let turn_coming = recovered.contains(&id)
+                && matches!(last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
             // A session that waited on a job the restart lost is woken, attended or not: the job's
-            // arrival would have woken it.
-            let carry_on = woken.contains(&id)
-                || (unattended
-                    && (cut.contains(&id)
-                        || (last_end == Some(TurnEndReason::Waiting)
-                            && !inner.has_unsettled_child(&id)
-                            && !recovered.contains(&id))));
+            // arrival would have woken it. An agent the restart cut goes on whenever its lead does:
+            // the lead is told that its unfinished agents were resumed.
+            let carry_on = (!turn_coming
+                && (woken.contains(&id)
+                    || (unattended
+                        && (cut.contains(&id)
+                            || (last_end == Some(TurnEndReason::Waiting) && !inner.has_unsettled_child(&id))))))
+                || (cut.contains(&id) && parent.is_some_and(|p| going.contains(&p)));
             if carry_on {
                 inner.send_input(&id, Input::Resume);
+            }
+            if carry_on || turn_coming {
+                going.insert(id);
             }
         }
         Ok(Runtime { inner })
@@ -1879,14 +2039,7 @@ impl Runtime {
             return Err(format!("The workspace {} is not a directory.", workspace.display()));
         }
         let role = inner.packs.role(new.pack.as_deref(), new.role.as_deref())?.clone();
-        if inner.config.network.mode == NetworkMode::Open
-            && inner.packs.get(&role.pack).is_some_and(|p| p.requires_restricted_network)
-        {
-            return Err(format!(
-                "The pack \"{}\" assumes a restricted network, but the network mode is open. Set [network] mode = \"allowlist\" (or \"deny_all\") in the config and restart the daemon, then start the session again.",
-                role.pack
-            ));
-        }
+        inner.check_network(&role.pack)?;
         let profile_name = inner.config.profile(new.model.as_deref()).map_err(|e| e.to_string())?.0.to_string();
         let (model, window) = inner.facts(&profile_name).await?;
         let title = match new.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
@@ -2001,11 +2154,13 @@ impl Runtime {
             return Err("This session is archived; unarchive it first.".to_string());
         }
         self.inner.activate(id)?;
-        if self.inner.send_input(id, Input::User(text.to_string())) {
-            Ok(())
-        } else {
-            Err(format!("Session {} is not accepting input.", id.as_str()))
+        if !self.inner.send_input(id, Input::User(text.to_string())) {
+            return Err(format!("Session {} is not accepting input.", id.as_str()));
         }
+        // The lead works again, so its agents do: after a restart its turn starts with a note
+        // saying they were resumed.
+        self.inner.resume_cut_children(id);
+        Ok(())
     }
 
     pub async fn stop(&self, id: &SessionId) -> Result<(), String> {
@@ -2024,24 +2179,7 @@ impl Runtime {
         }
         self.inner.activate(id)?;
         self.inner.send_input(id, Input::Resume);
-        let children: Vec<SessionId> = {
-            let st = self.inner.st();
-            st.known
-                .iter()
-                .filter(|(_, k)| {
-                    k.meta.parent.as_ref() == Some(id) && !k.finished() && k.status.last_end == Some(TurnEndReason::Stopped)
-                })
-                .map(|(c, _)| c.clone())
-                .collect()
-        };
-        for child in children {
-            match self.inner.activate(&child) {
-                Ok(_) => {
-                    self.inner.send_input(&child, Input::Resume);
-                }
-                Err(e) => tracing::warn!("child {} cannot be resumed: {e}", child.as_str()),
-            }
-        }
+        self.inner.resume_cut_children(id);
         Ok(())
     }
 
@@ -2108,11 +2246,14 @@ impl Runtime {
             return Err("This item is waiting for an answer; write one.".to_string());
         }
         self.inner.activate(&entry.session)?;
-        if self.inner.send_input(&entry.session, Input::Answer { item_id: item_id.to_string(), answer: answer.to_string() }) {
-            Ok(())
-        } else {
-            Err(format!("Session {} is not accepting input.", entry.session.as_str()))
+        if !self.inner.send_input(&entry.session, Input::Answer { item_id: item_id.to_string(), answer: answer.to_string() }) {
+            return Err(format!("Session {} is not accepting input.", entry.session.as_str()));
         }
+        // An answer starts a turn (an empty one only dismisses the item): as for a message.
+        if !answer.trim().is_empty() {
+            self.inner.resume_cut_children(&entry.session);
+        }
+        Ok(())
     }
 
     pub fn records(&self, id: &SessionId, after: Option<Seq>, limit: usize) -> Result<Vec<Record>, String> {
@@ -2225,36 +2366,47 @@ impl Runtime {
         let (actives, background) = {
             let mut st = inner.st();
             let mut actives = Vec::new();
-            for k in st.known.values_mut() {
-                actives.extend(k.active.take());
+            for (id, k) in st.known.iter_mut() {
+                actives.extend(k.active.take().map(|a| (id.clone(), a)));
             }
             (actives, std::mem::take(&mut st.tasks))
         };
         let grace = Duration::from_secs(inner.config.tools.kill_grace_s);
         let mut tasks = Vec::new();
         let mut jobs = Vec::new();
-        for a in actives {
+        for (id, a) in actives {
             let ActiveSession { inputs, task, jobs: table, control, .. } = a;
             // A running turn is cancelled the normal way (tools get TERM, then KILL) and recorded as
             // cut by the restart; closing the inputs then ends the session. What does not end in
             // time is aborted below, which `open` recovers from.
             control.stop_for_shutdown();
             drop(inputs);
-            tasks.push(task);
+            tasks.push((id, task));
             jobs.push(table);
         }
-        let deadline = tokio::time::Instant::now() + SHUTDOWN_TASK_WAIT;
-        for task in &mut tasks {
-            if !task.is_finished() {
-                let _ = tokio::time::timeout_at(deadline, &mut *task).await;
+        // The wait covers the grace a cancelled command gets before its KILL: a foreground command
+        // is tracked by nothing but its tool call, so aborting the task earlier would leave it
+        // running. A task parked in a `join` will not end, and is aborted as soon as it is there.
+        let wait = grace.saturating_add(SHUTDOWN_TASK_WAIT);
+        let begun = tokio::time::Instant::now();
+        loop {
+            let parked = std::mem::take(&mut inner.st().parked);
+            for (id, task) in &tasks {
+                if parked.contains(id) {
+                    task.abort();
+                }
             }
+            if tasks.iter().all(|(_, task)| task.is_finished()) || begun.elapsed() >= wait {
+                break;
+            }
+            tokio::time::sleep(SHUTDOWN_POLL).await;
         }
-        for task in &tasks {
+        for (_, task) in &tasks {
             if !task.is_finished() {
                 task.abort();
             }
         }
-        for task in &mut tasks {
+        for (_, task) in &mut tasks {
             if !task.is_finished() {
                 let _ = tokio::time::timeout(SHUTDOWN_ABORT_WAIT, &mut *task).await;
             }
@@ -2320,6 +2472,15 @@ mod tests {
 
     fn tool_msgs(body: &Value) -> usize {
         body["messages"].as_array().map_or(0, |m| m.iter().filter(|m| m["role"] == "tool").count())
+    }
+
+    /// The state block of a request.
+    fn hud_of(body: &Value) -> String {
+        body["messages"]
+            .as_array()
+            .and_then(|m| m.iter().rev().find_map(|m| m["content"].as_str().filter(|c| c.starts_with("<harness-state>"))))
+            .unwrap_or("")
+            .to_string()
     }
 
     fn mentions(body: &Value, s: &str) -> bool {
@@ -2535,8 +2696,52 @@ mod tests {
             let got = results.iter().find(|(n, _)| n == name);
             assert_eq!(got.map(|(_, s)| *s), Some(loom_core::event::ToolStatus::Ok), "{name}: {results:?}");
         }
-        let child_req = e.server.requests().into_iter().rev().find(|b| !has_tool(b, "agent_spawn")).expect("child request");
-        assert!(mentions(&child_req, "CONSTRAINTMARK"), "the child's state block lacks the mission constraints");
+        // The worker's first request holds no tool result yet, and only its state block is looked at.
+        let child_first = e.server.requests().into_iter().find(|b| !has_tool(b, "agent_spawn")).expect("child request");
+        assert_eq!(tool_msgs(&child_first), 0);
+        let hud = hud_of(&child_first);
+        assert!(hud.contains("CONSTRAINTMARK"), "the child's state block lacks the mission constraints: {hud}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_stall_note_goes_to_a_child_that_can_record_and_not_to_a_verifier() {
+        let script = Script::new(|body, _| {
+            if !has_tool(body, "agent_spawn") && tool_msgs(body) < 4 {
+                call("ledger", json!({}))
+            } else {
+                Action::Stall { ms: 600_000 }
+            }
+        });
+        let e = env_with(script, false, |c| c.agents.stall_steps = 2).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("request", || !e.server.requests().is_empty()).await;
+        let req = |role: &str| SpawnReq {
+            role: role.into(),
+            mode: SpawnMode::Fresh,
+            brief: Default::default(),
+            budget: Budget::default(),
+            call_id: CallId::from("c1"),
+            title: role.into(),
+            awaited: false,
+        };
+        let worker = e.rt.inner.orch.spawn(&id, req("worker")).await.unwrap();
+        let verifier = e.rt.inner.orch.spawn(&id, req("verifier")).await.unwrap();
+        let steps = |c: &SessionId| e.records(c).iter().filter(|r| matches!(r.event, Event::ModelRequest(_))).count();
+        until("five steps each", || steps(&worker) >= 5 && steps(&verifier) >= 5).await;
+        let stall_notes = |c: &SessionId| -> Vec<String> {
+            e.records(c)
+                .into_iter()
+                .filter_map(|r| match r.event {
+                    Event::HarnessNote { note: loom_core::event::NoteKind::Stall, text } => Some(text),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Both share the journal, so both are watched; only the one with `note` is asked to use it.
+        let given = stall_notes(&worker);
+        assert!(!given.is_empty() && given.iter().all(|t| *t == texts::stall(2)), "{given:?}");
+        assert!(stall_notes(&verifier).is_empty(), "{:?}", stall_notes(&verifier));
         e.rt.shutdown().await;
     }
 
@@ -2646,9 +2851,29 @@ mod tests {
             .unwrap();
         assert_eq!(settlement.outcome, ChildOutcome::Failed);
         assert!(settlement.report.contains("internal error"), "{}", settlement.report);
-        assert!(!e.rt.session(&child).unwrap().active);
+        // The lead reads this report: the next step it names is one the lead can take.
+        assert!(settlement.report.contains("start a new agent"), "{}", settlement.report);
+        assert!(!settlement.report.contains("send the session a message"), "{}", settlement.report);
+        let info = e.rt.session(&child).unwrap();
+        assert!(!info.active);
+        assert_eq!((info.status.phase, info.status.outcome), (Phase::Ended, Some(SessionOutcome::Failed)));
         lock(&PANIC_TITLES).retain(|t| t != "PANICTITLE");
+        // The lead never recorded the settlement (it is inside a model request). A restart does not
+        // run the failed child again, and delivers what it was settled with.
         e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let rt = rt2.clone();
+        until("the failure is delivered", || {
+            rt.records(&id, None, 2_000).is_ok_and(|rs| {
+                rs.iter().any(|r| matches!(&r.event, Event::ChildSettled(c)
+                    if c.child == child && c.outcome == ChildOutcome::Failed && c.report.contains("internal error")))
+            })
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!rt2.session(&child).unwrap().active);
+        assert!(e.server.requests().iter().all(|b| has_tool(b, "agent_spawn")), "the failed child ran again");
+        rt2.shutdown().await;
     }
 
     #[tokio::test]
@@ -2847,6 +3072,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_wakes_a_session_that_yielded_while_its_job_ran() {
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let e = env(Script::new(move |body, _| {
+            if flag.load(Ordering::SeqCst) {
+                Action::Reply(Reply::text("noted"))
+            } else if tool_msgs(body) == 0 {
+                call("bash", json!({"command": "sleep 600", "background": true}))
+            } else {
+                Action::Reply(Reply::text("it is running; I will look at it when it ends"))
+            }
+        }))
+        .await;
+        // The chat role ends its turns by replying; it has no `wait`.
+        let mut chat = e.new_session(Some("start a job"));
+        chat.role = Some("chat".into());
+        let info = e.rt.create_session(chat).await.unwrap();
+        assert!(!info.meta.unattended);
+        let id = info.meta.id;
+        until("yielded", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Yielded }))).await;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        e.rt.shutdown().await;
+        let before = e.server.requests().len();
+        after.store(true, Ordering::SeqCst);
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        until("a turn after the restart", || e.server.requests().len() > before).await;
+        let rs = rt2.records(&id, None, 2_000).unwrap();
+        let lost = rs.iter().position(|r| matches!(&r.event, Event::JobSettled { detail, .. } if detail == texts::JOB_LOST_DETAIL));
+        let turn = rs.iter().rposition(|r| matches!(r.event, Event::TurnStart { trigger: loom_core::event::Trigger::Resume }));
+        assert!(lost.is_some() && lost < turn, "lost at {lost:?}, resumed at {turn:?}");
+        let last = e.server.requests().pop().unwrap();
+        assert!(mentions(&last, &texts::job_lost("j1", "sleep 600")));
+        rt2.shutdown().await;
+    }
+
+    /// A lead and one unfinished worker, both cut by a restart, and the runtime started again. Before
+    /// the restart the worker is inside a model request; the lead is inside its `agent_spawn` call
+    /// (`awaited`) or, with the worker in the background, inside a model request of its own.
+    /// Afterwards the worker delivers `CHILDREPORT` and the lead waits for it. Returns the second
+    /// runtime, the lead, and the number of requests made before the restart.
+    async fn restart_with_an_unfinished_child(awaited: bool, attended: bool) -> (Env, Runtime, SessionId, usize) {
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let e = env(Script::new(move |body, _| {
+            let lead = has_tool(body, "agent_spawn");
+            if !flag.load(Ordering::SeqCst) {
+                if lead && tool_msgs(body) == 0 {
+                    call("agent_spawn", json!({"question": "CHILDMARK", "background": !awaited}))
+                } else {
+                    Action::Stall { ms: 600_000 }
+                }
+            } else if !lead {
+                finish("CHILDREPORT done")
+            } else if mentions(body, "CHILDREPORT") {
+                finish("lead done")
+            } else {
+                call("wait", json!({}))
+            }
+        }))
+        .await;
+        let mut new = e.new_session(Some("go"));
+        new.unattended = Some(!attended);
+        let id = e.rt.create_session(new).await.unwrap().meta.id;
+        let lead_requests = if awaited { 1 } else { 2 };
+        until("both inside what the restart cuts", || {
+            let reqs = e.server.requests();
+            reqs.iter().any(|b| !has_tool(b, "agent_spawn"))
+                && reqs.iter().filter(|b| has_tool(b, "agent_spawn")).count() == lead_requests
+        })
+        .await;
+        let begun = tokio::time::Instant::now();
+        e.rt.shutdown().await;
+        if awaited {
+            // The lead's task waits in a `join` that will not return: it is not waited out.
+            assert!(begun.elapsed() < SHUTDOWN_TASK_WAIT, "shutdown took {:?}", begun.elapsed());
+        }
+        let before = e.server.requests().len();
+        after.store(true, Ordering::SeqCst);
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        (e, rt2, id, before)
+    }
+
+    /// Whenever the lead is told that its unfinished agents were resumed, they were: the worker runs
+    /// again, and its report reaches the lead by itself.
+    async fn the_child_was_resumed_as_the_lead_is_told(e: &Env, rt2: &Runtime, id: &SessionId, before: usize) {
+        let rt = rt2.clone();
+        until("the lead finished", || {
+            rt.records(id, None, 2_000)
+                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })))
+        })
+        .await;
+        let reqs = e.server.requests();
+        let (lead, child): (Vec<&Value>, Vec<&Value>) = reqs[before..].iter().partition(|b| has_tool(b, "agent_spawn"));
+        assert!(lead.iter().any(|b| mentions(b, texts::AFTER_RESTART)), "the lead was not told about the restart");
+        assert_eq!(child.len(), 1, "the worker did not run again exactly once");
+        assert!(!reqs.iter().any(|b| mentions(b, "Interrupted while waiting for")), "a resumed agent was called stopped");
+        let rs = rt2.records(id, None, 2_000).unwrap();
+        let settled: Vec<&ChildSettled> = rs
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ChildSettled(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(settled.len(), 1);
+        assert_eq!((settled[0].outcome, settled[0].inline), (ChildOutcome::Returned, false));
+        assert!(settled[0].report.contains("CHILDREPORT"), "{}", settled[0].report);
+        assert_eq!(rt2.sessions(true).iter().filter(|s| s.meta.parent.as_ref() == Some(id)).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_resumes_the_unfinished_child_of_an_unattended_lead() {
+        let (e, rt2, id, before) = restart_with_an_unfinished_child(false, false).await;
+        the_child_was_resumed_as_the_lead_is_told(&e, &rt2, &id, before).await;
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_message_to_an_attended_lead_after_a_restart_resumes_its_unfinished_child() {
+        let (e, rt2, id, before) = restart_with_an_unfinished_child(false, true).await;
+        // Attended: nothing runs until the operator says so.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(e.server.requests().len(), before);
+        rt2.send_message(&id, "carry on").await.unwrap();
+        the_child_was_resumed_as_the_lead_is_told(&e, &rt2, &id, before).await;
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_inside_an_awaited_agent_spawn_records_no_result_and_the_child_is_resumed() {
+        let (e, rt2, id, before) = restart_with_an_unfinished_child(true, false).await;
+        the_child_was_resumed_as_the_lead_is_told(&e, &rt2, &id, before).await;
+        // The call the shutdown cut has no result: the weave shows it as interrupted.
+        let rs = rt2.records(&id, None, 2_000).unwrap();
+        assert!(!rs.iter().any(|r| matches!(&r.event, Event::ToolResult(t) if t.name == "agent_spawn")));
+        let first = e.server.requests()[before..].iter().find(|b| has_tool(b, "agent_spawn")).cloned().unwrap();
+        assert!(mentions(&first, "no result recorded"), "{first}");
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_recovered_report_that_wakes_an_attended_lead_also_resumes_its_cut_child() {
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let e = env(Script::new(move |body, _| {
+            if has_tool(body, "agent_spawn") {
+                if mentions(body, "BREPORT") {
+                    finish("lead done")
+                } else if tool_msgs(body) == 0 {
+                    call("agent_spawn", json!({"question": "BMARK", "background": true}))
+                } else {
+                    call("wait", json!({}))
+                }
+            } else if mentions(body, "AMARK") {
+                finish("AREPORT")
+            } else if flag.load(Ordering::SeqCst) {
+                finish("BREPORT")
+            } else {
+                Action::Stall { ms: 600_000 }
+            }
+        }))
+        .await;
+        let mut new = e.new_session(Some("go"));
+        new.unattended = Some(false);
+        let id = e.rt.create_session(new).await.unwrap().meta.id;
+        until("the lead waits for B", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        until("B is inside a request", || e.server.requests().iter().any(|b| !has_tool(b, "agent_spawn"))).await;
+        // A ends while nobody can take its report (awaited, never joined).
+        let req = SpawnReq {
+            role: "worker".into(),
+            mode: SpawnMode::Fresh,
+            brief: loom_core::event::Brief { question: "AMARK".into(), ..Default::default() },
+            budget: Budget::default(),
+            call_id: CallId::from("c1"),
+            title: "a".into(),
+            awaited: true,
+        };
+        let a = e.rt.inner.orch.spawn(&id, req).await.unwrap();
+        let kept = e.rt.inner.paths.session_dir(&a).join("settlement.json");
+        until("A settled", || kept.is_file()).await;
+        e.rt.shutdown().await;
+        after.store(true, Ordering::SeqCst);
+        // Nothing resumes an attended mission; A's report starts the lead's turn, and B goes on with it.
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let rt = rt2.clone();
+        until("the lead finished", || {
+            rt.records(&id, None, 2_000)
+                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })))
+        })
+        .await;
+        let reports: Vec<String> = rt2
+            .records(&id, None, 2_000)
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::ChildSettled(c) => Some(c.report),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports.len(), 2, "{reports:?}");
+        assert!(reports[0].contains("AREPORT") && reports[1].contains("BREPORT"), "{reports:?}");
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn restart_restores_open_inbox_and_does_not_activate_ended_child() {
         let e = env(lead_script(json!({"question": "CHILDMARK"}))).await;
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
@@ -2864,8 +3294,10 @@ mod tests {
         rt2.shutdown().await;
     }
 
-    #[tokio::test]
-    async fn a_settlement_recovered_after_a_restart_carries_the_whole_report() {
+    /// A worker that ended while nobody could take its report: it was started `awaited`, nothing
+    /// joined it, and the runtime went down. Returns the lead, the worker, and the switch that
+    /// lets the lead's model answer.
+    async fn a_settlement_nobody_took() -> (Env, SessionId, SessionId, Arc<AtomicBool>) {
         let stall = Arc::new(AtomicBool::new(true));
         let flag = stall.clone();
         let e = env(Script::new(move |body, _| {
@@ -2890,30 +3322,54 @@ mod tests {
             budget: Budget::default(),
             call_id: CallId::from("c1"),
             title: "t".into(),
-            awaited: false,
+            awaited: true,
         };
         let child = e.rt.inner.orch.spawn(&id, req).await.unwrap();
-        until("child ended", || e.rt.session(&child).is_some_and(|c| c.status.phase == Phase::Ended)).await;
-        // The lead is inside a model request, so the delivery is still queued when the runtime goes down.
+        let kept = e.rt.inner.paths.session_dir(&child).join("settlement.json");
+        until("child settled", || kept.is_file()).await;
         e.rt.shutdown().await;
-        assert!(!e.records(&id).iter().any(|r| matches!(r.event, Event::ChildSettled(_))));
-        stall.store(false, Ordering::SeqCst);
+        // Read from the file: the runtime that was shut down answers nothing any more.
+        let log = read_records(&e.rt.inner.paths.session_log(&id)).unwrap().records;
+        assert!(!log.iter().any(|r| matches!(r.event, Event::ChildSettled(_))), "the delivery was not lost");
+        (e, id, child, stall)
+    }
+
+    /// Start again over the same home and return the settlement the lead is given.
+    async fn recovered_settlement(e: &Env, lead: &SessionId) -> (Runtime, ChildSettled) {
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         let rt = rt2.clone();
-        until("settlement delivered", || {
-            rt.records(&id, None, 2_000).is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::ChildSettled(_))))
-        })
-        .await;
-        let report = rt2
-            .records(&id, None, 2_000)
-            .unwrap()
-            .into_iter()
-            .find_map(|r| match r.event {
-                Event::ChildSettled(c) => Some(c.report),
-                _ => None,
+        let settled = move || {
+            rt.records(lead, None, 2_000).ok().and_then(|rs| {
+                rs.into_iter().find_map(|r| match r.event {
+                    Event::ChildSettled(c) => Some(c),
+                    _ => None,
+                })
             })
-            .unwrap();
-        assert!(report.starts_with("Outcome: returned\nAnswer:\nREPORTMARK"), "{report}");
+        };
+        until("settlement delivered", || settled().is_some()).await;
+        let c = settled().unwrap();
+        (rt2, c)
+    }
+
+    #[tokio::test]
+    async fn a_settlement_recovered_after_a_restart_carries_the_whole_report() {
+        let (e, id, child, stall) = a_settlement_nobody_took().await;
+        stall.store(false, Ordering::SeqCst);
+        let (rt2, c) = recovered_settlement(&e, &id).await;
+        assert_eq!((&c.child, c.outcome, c.inline), (&child, ChildOutcome::Returned, false));
+        assert!(c.report.starts_with("Outcome: returned\nAnswer:\nREPORTMARK"), "{}", c.report);
+        assert!(c.steps > 0);
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_settlement_recovered_from_a_log_without_the_kept_report_has_its_first_line() {
+        let (e, id, child, stall) = a_settlement_nobody_took().await;
+        std::fs::remove_file(e.rt.inner.paths.session_dir(&child).join("settlement.json")).unwrap();
+        stall.store(false, Ordering::SeqCst);
+        let (rt2, c) = recovered_settlement(&e, &id).await;
+        assert_eq!((&c.child, c.outcome, c.inline), (&child, ChildOutcome::Returned, false));
+        assert_eq!(c.report, "Outcome: returned");
         rt2.shutdown().await;
     }
 
@@ -2930,8 +3386,8 @@ mod tests {
         assert_eq!(sandbox_cfg_for(&base, rw, Path::new("/ws")), base);
     }
 
-    #[tokio::test]
-    async fn a_pack_that_requires_a_restricted_network_is_refused_under_open() {
+    /// A loom home with a pack `strict` that requires a restricted network, and a workspace.
+    fn strict_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let pack = home.join("packs/strict");
@@ -2944,6 +3400,17 @@ mod tests {
         std::fs::write(pack.join("r.md"), "Role R.").unwrap();
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
+        (dir, home, ws)
+    }
+
+    fn allowlist(config: &mut Config) {
+        config.network.mode = NetworkMode::Allowlist;
+        config.network.allow = vec!["example.com".into()];
+    }
+
+    #[tokio::test]
+    async fn a_pack_that_requires_a_restricted_network_is_refused_under_open() {
+        let (_dir, home, ws) = strict_home();
         let server = MockServer::start(Script::new(|_, _| finish("ok"))).await.unwrap();
         let new = || NewSession { workspace: ws.clone(), pack: Some("strict".into()), ..NewSession::default() };
         let mut config = config_for(&server, None);
@@ -2953,10 +3420,40 @@ mod tests {
         assert!(err.contains("[network] mode = \"allowlist\"") && err.contains("restart"), "{err}");
         assert!(rt.sessions(true).is_empty());
         rt.shutdown().await;
-        config.network.mode = NetworkMode::Allowlist;
-        config.network.allow = vec!["example.com".into()];
+        allowlist(&mut config);
         let rt = Runtime::start(config, Paths::at(home)).await.unwrap();
         rt.create_session(new()).await.unwrap();
+        rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_of_such_a_pack_is_not_run_when_the_daemon_comes_back_under_open() {
+        let (_dir, home, ws) = strict_home();
+        let server = MockServer::start(Script::new(|_, _| Action::Stall { ms: 600_000 })).await.unwrap();
+        let mut config = config_for(&server, None);
+        allowlist(&mut config);
+        let rt = Runtime::start(config.clone(), Paths::at(home.clone())).await.unwrap();
+        let new = NewSession {
+            workspace: ws,
+            pack: Some("strict".into()),
+            unattended: Some(true),
+            message: Some("go".into()),
+            ..NewSession::default()
+        };
+        let id = rt.create_session(new).await.unwrap().meta.id;
+        until("a turn in flight", || !server.requests().is_empty()).await;
+        rt.shutdown().await;
+        let before = server.requests().len();
+        // The operator opens the network and restarts: the session's prompt still says it is restricted.
+        config.network.mode = NetworkMode::Open;
+        let rt = Runtime::start(config, Paths::at(home)).await.unwrap();
+        assert!(!rt.session(&id).unwrap().active);
+        for err in [rt.send_message(&id, "carry on").await.unwrap_err(), rt.resume(&id).await.unwrap_err()] {
+            assert!(err.contains("[network] mode = \"allowlist\"") && err.contains("restart"), "{err}");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!rt.session(&id).unwrap().active);
+        assert_eq!(server.requests().len(), before);
         rt.shutdown().await;
     }
 
@@ -3013,16 +3510,22 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), e.rt.shutdown()).await.unwrap();
     }
 
-    #[tokio::test]
-    async fn shutdown_cancels_a_running_tool_and_records_the_turn_as_cut_by_the_restart() {
+    /// Shut the runtime down while a foreground command runs (its script writes its pid to `$PID`
+    /// once it is ready). Returns how long the shutdown took and the session's log as it left it.
+    async fn shutdown_during_a_foreground_command(script: &str, kill_grace_s: u64) -> (Duration, Vec<Record>) {
         let dir_for_pid = tempfile::tempdir().unwrap();
         let pid_file = dir_for_pid.path().join("pid");
-        let cmd = format!("echo $$ > '{}'; exec sleep 600", pid_file.display());
-        let e = env(Script::new(move |_, _| call("bash", json!({ "command": cmd })))).await;
+        let cmd = format!("PID='{}'; {script}", pid_file.display());
+        let e = env_with(Script::new(move |_, _| call("bash", json!({ "command": cmd }))), false, |c| {
+            c.tools.kill_grace_s = kill_grace_s
+        })
+        .await;
         let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
         until("the command started", || std::fs::read_to_string(&pid_file).is_ok_and(|t| !t.trim().is_empty())).await;
         let pid = std::fs::read_to_string(&pid_file).unwrap().trim().to_string();
-        tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
+        let begun = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), e.rt.shutdown()).await.unwrap();
+        let took = begun.elapsed();
         let alive = || {
             std::process::Command::new("kill")
                 .args(["-0", &pid])
@@ -3035,7 +3538,37 @@ mod tests {
             assert!(tokio::time::Instant::now() < end, "the foreground command survived the shutdown");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let records = read_records(&e.rt.inner.paths.session_log(&id)).unwrap().records;
-        assert!(cut_by_restart(&records), "the turn is not recorded as cut by the restart");
+        (took, read_records(&e.rt.inner.paths.session_log(&id)).unwrap().records)
+    }
+
+    /// The session itself recorded the cut: the command's interrupted result, then the turn's end.
+    fn assert_cut_by_the_session(records: &[Record]) {
+        let kinds: Vec<String> =
+            records.iter().map(|r| serde_json::to_value(r).unwrap()["kind"].as_str().unwrap_or("").to_string()).collect();
+        assert_eq!(&kinds[kinds.len() - 3..], ["tool_result", "interrupted", "turn_end"], "{kinds:?}");
+        let result = records.iter().rev().find_map(|r| match &r.event {
+            Event::ToolResult(t) => Some(t.status),
+            _ => None,
+        });
+        // The command's own cancellation path produced the result: its token fired.
+        assert_eq!(result, Some(loom_core::event::ToolStatus::Interrupted));
+        assert!(cut_by_restart(records), "the turn is not recorded as cut by the restart");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_running_tool_and_records_the_turn_as_cut_by_the_restart() {
+        let (_, records) = shutdown_during_a_foreground_command("echo $$ > \"$PID\"; exec sleep 600", 1).await;
+        assert_cut_by_the_session(&records);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_out_the_kill_grace_of_a_command_that_ignores_term() {
+        let grace = SHUTDOWN_TASK_WAIT.as_secs() + 1;
+        let (took, records) =
+            shutdown_during_a_foreground_command("trap '' TERM; echo $$ > \"$PID\"; sleep 600", grace).await;
+        // TERM did nothing, so the command lived until its KILL, which comes after the grace: the
+        // task was given that long, although it is more than `SHUTDOWN_TASK_WAIT`.
+        assert!(took >= Duration::from_secs(grace), "shutdown took {took:?}");
+        assert_cut_by_the_session(&records);
     }
 }
