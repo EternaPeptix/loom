@@ -1,6 +1,6 @@
 //! The sandbox: one policy, applied to commands by the OS and to in-process file access by us.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! ## Policy
 //! - writable roots: the workspace, the session temp dir, `cfg.extra_writable`, and the system temp

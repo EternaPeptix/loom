@@ -7,15 +7,28 @@ ended, so the conversation is present, browsable and searchable inside loom (CLI
 not a live session.
 
 Usage:
-    import-dsh.py --dsh ~/.dsh/sessions --loom ~/.loom [--workspace SUBSTR] [--limit N] [--dry-run]
+    import-dsh.py --dsh ~/.dsh/sessions --loom ~/.loom [--workspace SUBSTR] [--limit N] [--model NAME]
+                  [--dry-run]
+
+Requires the `zstd` command on PATH (DSH session files are zstd-compressed; install it with
+`brew install zstd`). Python 3 standard library only.
 
 It writes, per DSH session, a loom session dir under <loom>/sessions/s-dsh<id>/ with log.jsonl
-(hash-chained), meta.json and status.json. Re-running overwrites the same ids (idempotent). Restart
-the daemon afterwards so it rescans the sessions directory.
+(hash-chained), meta.json and status.json. Directories are created 0700 and files 0600; every file is
+written to a temporary file next to its final name and renamed into place, so a crash never leaves a
+half-written file. Re-running rewrites the same ids (idempotent) and keeps the `archived` flag an
+existing meta.json already has. One failing session is reported and the others still import; the
+summary line counts them and the exit code is 1 if any failed. A session whose decompressed size
+exceeds 512 MiB is refused. Restart the daemon afterwards so it rescans the sessions directory.
 """
-import argparse, hashlib, json, os, sys, glob, subprocess, datetime
+import argparse, hashlib, json, os, sys, glob, subprocess, datetime, shutil, tempfile
 
 ZERO = "0" * 64
+# Largest decompressed session accepted; a bigger one is almost certainly not a normal transcript.
+MAX_DECOMPRESSED = 512 * 1024 * 1024
+# The log schema number this importer writes (crates/loom-core/src/event.rs, SCHEMA). A log with a
+# higher number is read-only for the daemon, so this must not run ahead of it.
+SCHEMA = 1
 
 
 def sha256_hex(b: bytes) -> str:
@@ -61,27 +74,68 @@ def klass(name: str) -> str:
 
 def to_ms(v, default=0):
     if isinstance(v, (int, float)):
-        return int(v if v > 1e11 else v * 1000)  # seconds -> ms heuristic
+        return max(0, int(v if v > 1e11 else v * 1000))  # seconds -> ms heuristic; never negative
     if isinstance(v, str):
         try:
             s = v.replace("Z", "+00:00")
-            return int(datetime.datetime.fromisoformat(s).timestamp() * 1000)
+            return max(0, int(datetime.datetime.fromisoformat(s).timestamp() * 1000))
         except Exception:
             return default
     return default
 
 
+def parse_line(raw: bytes):
+    line = raw.decode("utf-8", "replace").strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except Exception:
+        return None
+
+
 def decompress(path: str):
-    out = subprocess.run(["zstd", "-dc", path], capture_output=True)
-    if out.returncode != 0:
-        raise RuntimeError(out.stderr.decode()[:200])
-    for line in out.stdout.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if line:
-            try:
-                yield json.loads(line)
-            except Exception:
-                continue
+    """Yield the JSON objects of a zstd-compressed JSONL file as a stream, refusing more than
+    MAX_DECOMPRESSED bytes of decompressed output."""
+    with tempfile.TemporaryFile() as err:
+        try:
+            proc = subprocess.Popen(["zstd", "-dc", "--", path], stdout=subprocess.PIPE, stderr=err)
+        except FileNotFoundError:
+            raise RuntimeError("the `zstd` command is not installed; install it (for example `brew install zstd`) and run again")
+        total = 0
+        too_big = False
+        try:
+            pending = b""
+            while True:
+                chunk = proc.stdout.readline(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_DECOMPRESSED:
+                    too_big = True
+                    break
+                pending += chunk
+                if pending.endswith(b"\n"):
+                    obj, pending = parse_line(pending), b""
+                    if obj is not None:
+                        yield obj
+            if not too_big and pending:
+                obj = parse_line(pending)
+                if obj is not None:
+                    yield obj
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.stdout.close()
+            rc = proc.wait()
+        if too_big:
+            raise RuntimeError(
+                f"the session is larger than {MAX_DECOMPRESSED // (1024 * 1024)} MiB decompressed, "
+                "which is more than this importer accepts; it was not imported"
+            )
+        if rc != 0:
+            err.seek(0)
+            raise RuntimeError("zstd could not decompress the file: " + err.read().decode("utf-8", "replace").strip()[:200])
 
 
 def convert(dsh_path: str, uuid: str):
@@ -134,7 +188,8 @@ def convert(dsh_path: str, uuid: str):
 
 
 def build_log(body, header, sid, mission, workspace, model, created_ms, title):
-    """Chain the records into loom log lines."""
+    """Chain the records into loom log bytes: one compact JSON object per line, each `prev` the SHA-256
+    of the previous line's bytes without its newline."""
     start_event = {
         "kind": "session_start",
         "session": sid,
@@ -154,6 +209,7 @@ def build_log(body, header, sid, mission, workspace, model, created_ms, title):
         "budget": {},
         "unattended": False,
         "title": title,
+        "schema": SCHEMA,
     }
     records = [("harness", created_ms, start_event)]
     records += body
@@ -167,19 +223,106 @@ def build_log(body, header, sid, mission, workspace, model, created_ms, title):
     for seq, (author, ts, ev) in enumerate(records):
         rec = {"seq": seq, "ts_ms": int(ts or created_ms), "author": author, "prev": prev}
         rec.update(ev)
-        line = json.dumps(rec, separators=(",", ":"), ensure_ascii=False)
-        prev = sha256_hex(line.encode("utf-8"))
+        # The bytes hashed are the bytes written: encode once, and write them in binary mode.
+        line = json.dumps(rec, separators=(",", ":"), ensure_ascii=False).encode("utf-8", "replace")
+        prev = sha256_hex(line)
         lines.append(line)
     n_steps = sum(1 for a, _, e in records if e.get("kind") == "model_response")
-    return "\n".join(lines) + "\n", n_steps
+    return b"\n".join(lines) + b"\n", n_steps
+
+
+def mkdir_private(path: str):
+    """Create `path` and any missing parents with mode 0700."""
+    if os.path.isdir(path):
+        return
+    parent = os.path.dirname(path)
+    if parent and parent != path:
+        mkdir_private(parent)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+
+
+def write_atomic(path: str, data: bytes):
+    """Write `data` to a 0600 temporary file in the same directory, then rename it over `path`."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".import-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def existing_archived(meta_path: str) -> bool:
+    """The `archived` flag of an already imported session, so a re-run does not undo an archive."""
+    try:
+        with open(meta_path, "rb") as f:
+            return json.load(f).get("archived") is True
+    except Exception:
+        return False
+
+
+def import_one(p, a, counts):
+    """Convert and write one session. Raises on any failure; the caller reports it and goes on."""
+    uuid = os.path.basename(os.path.dirname(p)).replace("session-", "")
+    sid = "s-dsh" + uuid.replace("-", "")[:13]
+    mission = "m-dsh" + uuid.replace("-", "")[:13]
+    body, header = convert(p, uuid)
+    if not body:
+        print(f"  skip {uuid[:8]}: no conversation records", file=sys.stderr)
+        counts["skipped"] += 1
+        return
+    header = header or {}
+    workspace = header.get("cwd") or "unknown"
+    created_ms = to_ms(header.get("createdAt"), body[0][1] or 0)
+    first_user = next((e["text"] for _, _, e in body if e.get("kind") == "user_message"), "")
+    title = "[DSH] " + " ".join(first_user.split())[:80]
+    log, n_steps = build_log(body, header, sid, mission, workspace, a.model, created_ms, title)
+
+    if a.dry_run:
+        print(f"  would import {uuid[:8]} -> {sid} ({len(body)} recs, {n_steps} steps) ws={workspace}", file=sys.stderr)
+        counts["done"] += 1
+        return
+
+    sdir = os.path.join(a.loom, "sessions", sid)
+    mkdir_private(os.path.join(sdir, "tmp"))
+    meta_path = os.path.join(sdir, "meta.json")
+    meta = {
+        "id": sid, "mission": mission, "parent": None, "workspace": workspace,
+        "pack": "core", "role": "chat", "profile": "imported", "model": a.model,
+        "context_window": 1048576, "title": title, "created_ms": created_ms,
+        "mode": None, "awaited": False, "unattended": False, "archived": existing_archived(meta_path),
+    }
+    status = {
+        "phase": "ended", "step": n_steps, "last_end": "finished", "outcome": "done",
+        "fork_point": None, "epoch": 0, "prompt_tokens": 0, "cached_tokens": 0,
+        "completion_tokens_total": 0, "open_inbox": 0,
+    }
+    write_atomic(os.path.join(sdir, "log.jsonl"), log)
+    write_atomic(meta_path, json.dumps(meta, indent=2).encode("utf-8"))
+    write_atomic(os.path.join(sdir, "status.json"), json.dumps(status, indent=2).encode("utf-8"))
+    counts["done"] += 1
+    print(f"  imported {uuid[:8]} -> {sid}  ({len(body)} recs, {n_steps} steps)  {title[:50]}", file=sys.stderr)
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Import DSH sessions into loom as read-only archives. Needs the `zstd` command on PATH."
+    )
     ap.add_argument("--dsh", default=os.path.expanduser("~/.dsh/sessions"))
     ap.add_argument("--loom", default=os.path.expanduser("~/.loom"))
     ap.add_argument("--workspace", default=None, help="only sessions whose DSH workspace dir contains this substring")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--model", default="dsv41", help="model name recorded in the imported sessions (default: dsv41)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
@@ -192,58 +335,22 @@ def main():
     if a.limit:
         files = files[: a.limit]
 
+    if files and shutil.which("zstd") is None:
+        print("import-dsh: the `zstd` command is not installed; install it (for example `brew install zstd`) and run again.", file=sys.stderr)
+        return 2
+
     print(f"{len(files)} DSH session(s) to import", file=sys.stderr)
-    done = 0
+    counts = {"done": 0, "skipped": 0, "failed": 0}
     for p in files:
-        uuid = os.path.basename(os.path.dirname(p)).replace("session-", "")
-        sid = "s-dsh" + uuid.replace("-", "")[:13]
-        mission = "m-dsh" + uuid.replace("-", "")[:13]
         try:
-            body, header = convert(p, uuid)
+            import_one(p, a, counts)
         except Exception as e:
-            print(f"  skip {uuid[:8]}: {e}", file=sys.stderr)
-            continue
-        if not body:
-            print(f"  skip {uuid[:8]}: no conversation records", file=sys.stderr)
-            continue
-        header = header or {}
-        workspace = header.get("cwd") or "unknown"
-        created_ms = to_ms(header.get("createdAt"), body[0][1] or 0)
-        # title from first user message
-        first_user = next((e["text"] for _, _, e in [(x[0], x[1], x[2]) for x in body] if e.get("kind") == "user_message"), "")
-        title = "[DSH] " + " ".join(first_user.split())[:80]
-        model = "dsv41"
-        log, n_steps = build_log(body, header, sid, mission, workspace, model, created_ms, title)
+            counts["failed"] += 1
+            print(f"  FAILED {os.path.basename(os.path.dirname(p))[:16]}: {e}", file=sys.stderr)
 
-        if a.dry_run:
-            print(f"  would import {uuid[:8]} -> {sid} ({len(body)} recs, {n_steps} steps) ws={workspace}", file=sys.stderr)
-            done += 1
-            continue
-
-        sdir = os.path.join(a.loom, "sessions", sid)
-        os.makedirs(os.path.join(sdir, "tmp"), exist_ok=True)
-        with open(os.path.join(sdir, "log.jsonl"), "w") as f:
-            f.write(log)
-        meta = {
-            "id": sid, "mission": mission, "parent": None, "workspace": workspace,
-            "pack": "core", "role": "chat", "profile": "imported", "model": model,
-            "context_window": 1048576, "title": title, "created_ms": created_ms,
-            "mode": None, "awaited": False, "unattended": False, "archived": False,
-        }
-        with open(os.path.join(sdir, "meta.json"), "w") as f:
-            json.dump(meta, f, indent=2)
-        status = {
-            "phase": "ended", "step": n_steps, "last_end": "finished", "outcome": "done",
-            "fork_point": None, "epoch": 0, "prompt_tokens": 0, "cached_tokens": 0,
-            "completion_tokens_total": 0, "open_inbox": 0,
-        }
-        with open(os.path.join(sdir, "status.json"), "w") as f:
-            json.dump(status, f, indent=2)
-        done += 1
-        print(f"  imported {uuid[:8]} -> {sid}  ({len(body)} recs, {n_steps} steps)  {title[:50]}", file=sys.stderr)
-
-    print(f"done: {done}/{len(files)}", file=sys.stderr)
+    print(f"done: {counts['done']} imported, {counts['skipped']} skipped, {counts['failed']} failed (of {len(files)})", file=sys.stderr)
+    return 1 if counts["failed"] else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

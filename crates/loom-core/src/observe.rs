@@ -1,6 +1,6 @@
 //! Derived facts about what a session has looked at. All functions are pure over log records.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! ## Coverage
 //! For every stored output, the set of its lines that some `tool` message in the given records put in

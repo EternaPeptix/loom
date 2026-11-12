@@ -1,6 +1,6 @@
 //! The sealed, append-only journal that stores a mission's ledger ops.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! File: `journal.jsonl`, one [`Entry`] per line (compact JSON, `\n`-terminated).
 //!

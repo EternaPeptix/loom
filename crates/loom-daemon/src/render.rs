@@ -1,6 +1,6 @@
 //! Records and listings as terminal text. Pure functions: same input, same text.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; public signatures and types are fixed).
+//! CONTRACT.
 //!
 //! ## Style
 //! `Style{color, width}`. With `color` false the output contains no escape sequence at all. With

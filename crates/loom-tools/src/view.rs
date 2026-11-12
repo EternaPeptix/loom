@@ -1,6 +1,6 @@
 //! Numbered line views of stored output, shared by `read`, `out_read` and `out_grep`.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! - [`store_text`]: normalise raw bytes (`loom_core::admit::normalize`) and store the normalised
 //!   text. Line numbers everywhere refer to this stored text.

@@ -1,7 +1,7 @@
 //! [`Limiter`]: at most N holders at a time, highest priority first, first come first served within
 //! a priority.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! - `acquire` returns as soon as a slot is free and no waiter of higher priority (or equal priority
 //!   that arrived earlier) is waiting. Dropping the [`Permit`] frees the slot and wakes the best

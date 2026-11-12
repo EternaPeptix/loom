@@ -1,6 +1,6 @@
 //! The stop gate: what happens when the model stops calling tools, and what a `finish` must satisfy.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! ## `on_yield` — the model replied without a tool call
 //! - `Termination::Free` → `Yield::End`.

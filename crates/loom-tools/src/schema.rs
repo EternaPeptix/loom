@@ -1,6 +1,6 @@
 //! Checking a call's arguments against the tool's parameter schema.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! The model writing the calls gets argument shapes slightly wrong fairly often. A call that is
 //! unambiguous is repaired and the repair is reported; anything else is refused with a message that

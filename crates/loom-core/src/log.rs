@@ -1,6 +1,6 @@
 //! Append-only, hash-chained session log (one [`Record`] per line of `log.jsonl`).
 //!
-//! CONTRACT (the bodies below are placeholders for the implementer; signatures are fixed):
+//! CONTRACT:
 //!
 //! - A line is the compact `serde_json` form of a `Record` followed by `\n`. `prev` is the lowercase
 //!   hex SHA-256 of the previous line's bytes without the newline; the first record uses [`ZERO_HASH`].

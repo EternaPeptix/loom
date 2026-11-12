@@ -1,6 +1,6 @@
 //! SSE framing and accumulation of streamed deltas into one [`Completion`].
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! ## `SseParser`
 //! Fed arbitrary byte chunks; returns the `data:` payloads completed by each chunk. Events are

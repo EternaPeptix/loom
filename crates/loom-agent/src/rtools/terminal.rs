@@ -1,6 +1,6 @@
 //! Tools that end a turn or a session: `finish`, `verdict`, `ask_user`, `report_blocker`, `wait`.
 //!
-//! CONTRACT (the `run` bodies are placeholders for the implementer; specs and types are fixed).
+//! CONTRACT.
 //!
 //! These tools decide nothing by themselves about the loop: they record, then leave an
 //! [`Effect`](super::Effect) in `Shared` for the step loop. A tool that returns an error leaves no

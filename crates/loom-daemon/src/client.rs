@@ -1,6 +1,6 @@
 //! The API as typed calls, for the command line.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; public signatures and types are fixed).
+//! CONTRACT.
 //! Routes and bodies: `crate::api`. Every error is a sentence for the operator.
 //!
 //! - `Client::new(base, token)`: `base` like `http://127.0.0.1:7878` (no trailing slash kept). The

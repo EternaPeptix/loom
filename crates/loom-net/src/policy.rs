@@ -1,6 +1,6 @@
 //! The network policy as a pure function.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! ## Patterns (`allow`, `deny`, and the name form of `allow_private`)
 //! `host`, `*.suffix`, either optionally followed by `:port`. Matching is on the lower-cased host

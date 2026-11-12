@@ -1,6 +1,6 @@
 //! The access token, and the checks every request passes before it reaches a handler.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures are fixed).
+//! CONTRACT.
 //!
 //! The API listens on a loopback address, but a loopback port is reachable by every local process
 //! and, through the operator's browser, by every web page. So:

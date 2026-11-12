@@ -1,6 +1,6 @@
 //! The HTTP API over a runtime, and the routes that serve the web UI.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; public signatures and types are fixed;
+//! CONTRACT (public signatures and types are fixed;
 //! handlers and helpers are yours). JSON types: `crate::wire` and `loom_agent::runtime`.
 //!
 //! ## Every request

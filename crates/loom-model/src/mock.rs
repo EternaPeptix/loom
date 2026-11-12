@@ -1,7 +1,7 @@
 //! A scripted OpenAI-compatible server for tests and behavioural checks. Real HTTP on a loopback
 //! port, so the client code under test is the real client code.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! `MockServer::start(script)` binds `127.0.0.1:0` and serves:
 //! - `GET /v1/models` → `{"object":"list","data":[{"id":<model>,"object":"model","max_model_len":<window>}]}`

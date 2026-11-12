@@ -1,6 +1,6 @@
 //! Ledger tools: `plan`, `step`, `note`, `claim`, `claim_update`, `evidence`, `ledger`.
 //!
-//! CONTRACT (the `run` bodies are placeholders for the implementer; specs and types are fixed).
+//! CONTRACT.
 //!
 //! Every write goes through `Shared::ledger_append(false, op)`. When it returns `Err(text)` the tool
 //! returns `ToolOutput::error(text)` — the text is already a complete message for the model (ledger

@@ -1,6 +1,6 @@
 //! The harness-state block: what the model is told, fresh at every step, about where things stand.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! The block is the last message of each request and is not part of the stored prefix, so it can
 //! change freely. It carries what a model otherwise loses track of over a long session: the mission

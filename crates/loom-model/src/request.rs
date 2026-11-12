@@ -1,6 +1,6 @@
 //! A chat request and the body sent for it.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! `body(model, profile_extra)` builds the JSON object that is POSTed. The server caches by the bytes
 //! of the rendered prompt, and some chat templates render request fields into the prompt head, so the

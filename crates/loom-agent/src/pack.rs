@@ -1,6 +1,6 @@
 //! Packs: named sets of roles. A role is a prompt, a tool list and the rules for ending.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! ## On disk
 //! A pack is a directory holding `pack.toml`:

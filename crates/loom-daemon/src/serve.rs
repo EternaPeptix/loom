@@ -1,6 +1,6 @@
 //! Running the daemon, and starting it in the background.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; public signatures are fixed).
+//! CONTRACT.
 //!
 //! ## `run(paths)` — the body of `loom daemon`
 //! 0. Raise the soft limit on open files to the smaller of the hard limit and 16384

@@ -1,6 +1,6 @@
 //! Background jobs: commands that outlive the tool call that started them.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! A job is a [`crate::proc::Running`] command with an id (`j1`, `j2`, … per table). The table owns
 //! it from `register` on. A watcher task per job waits for it to end; when it does, the watcher
