@@ -341,7 +341,8 @@ use loom_core::config::{Config, NetworkMode, Paths, SandboxCfg};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
     Author, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, Forked, InboxItem, ModelRef, NetDecision, Record,
-    Seq, SessionOutcome, SessionStart, SpawnMode, Termination, TurnEndReason, Usage,
+    Seq, SessionOutcome, SessionStart, SpawnMode, Termination, ToolClass, ToolStatus, TurnEndReason, Usage,
+    META_JOB, META_OF_BLOB,
 };
 use loom_core::journal::{self, Journal};
 use loom_core::ledger::LedgerState;
@@ -607,6 +608,38 @@ fn own_records(records: &[Record]) -> &[Record] {
     }
 }
 
+/// The stored output an event makes citable as evidence, and what produced it. A result's own
+/// output; the text a `read` showed (the result is a view, `META_OF_BLOB` names the stored file text);
+/// the complete output of a background job, attributed to the call that started it (`jobs` remembers
+/// the first result that names each job). A view of a runtime tool's output (`out_read`, `out_grep`)
+/// is not an observation and registers nothing.
+fn produced_by(
+    session: &SessionId,
+    jobs: &mut HashMap<(SessionId, String), Producer>,
+    event: &Event,
+) -> Option<(BlobId, Producer)> {
+    match event {
+        Event::ToolResult(t) => {
+            let p = Producer { session: session.clone(), call_id: t.call_id.clone(), tool: t.name.clone(), class: t.class };
+            if let Some(job) = t.meta.get(META_JOB).and_then(|v| v.as_str()) {
+                jobs.entry((session.clone(), job.to_string())).or_insert_with(|| p.clone());
+            }
+            if let Some(o) = &t.output {
+                return Some((o.id.clone(), p));
+            }
+            if t.name == "read" && t.class == ToolClass::Read && t.status == ToolStatus::Ok {
+                let of = t.meta.get(META_OF_BLOB).and_then(|v| v.as_str()).filter(|s| !s.is_empty())?;
+                return Some((BlobId::from(of), p));
+            }
+            None
+        }
+        Event::JobSettled { job_id, output: Some(o), .. } => {
+            jobs.get(&(session.clone(), job_id.clone())).map(|p| (o.id.clone(), p.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// The inbox items still open after `records`, with the time each was opened.
 fn open_items(records: &[Record]) -> Vec<(InboxItem, u64)> {
     let mut open: Vec<(InboxItem, u64)> = Vec::new();
@@ -734,6 +767,8 @@ struct State {
     inbox: Vec<InboxEntry>,
     producers: HashMap<(MissionId, BlobId), Producer>,
     scanned: HashSet<MissionId>,
+    /// The call that started each background job, by session and job id (for the job's complete output).
+    job_starts: HashMap<(SessionId, String), Producer>,
     /// Background tasks (net forwarder, notification repeaters).
     tasks: Vec<JoinHandle<()>>,
     /// Sessions whose task waits in a `join` that shutdown cancelled and that will not return.
@@ -1038,17 +1073,11 @@ impl Orchestrator for Orch {
         let paths = inner.paths.clone();
         let found = tokio::task::spawn_blocking(move || {
             let mut out: Vec<(BlobId, Producer)> = Vec::new();
+            let mut jobs: HashMap<(SessionId, String), Producer> = HashMap::new();
             for id in ids {
                 let Ok(report) = read_records(&paths.session_log(&id)) else { continue };
                 for r in own_records(&report.records) {
-                    if let Event::ToolResult(t) = &r.event {
-                        if let Some(o) = &t.output {
-                            out.push((
-                                o.id.clone(),
-                                Producer { session: id.clone(), call_id: t.call_id.clone(), tool: t.name.clone(), class: t.class },
-                            ));
-                        }
-                    }
+                    out.extend(produced_by(&id, &mut jobs, &r.event));
                 }
             }
             out
@@ -1137,14 +1166,9 @@ impl Inner {
             let found = st.known.get(session).map(|k| (k.meta.mission.clone(), k.meta.title.clone()));
             if let Some((mission, title)) = found {
                 match &record.event {
-                    Event::ToolResult(t) => {
-                        if let Some(o) = &t.output {
-                            st.producers.entry((mission.clone(), o.id.clone())).or_insert(Producer {
-                                session: session.clone(),
-                                call_id: t.call_id.clone(),
-                                tool: t.name.clone(),
-                                class: t.class,
-                            });
+                    Event::ToolResult(_) | Event::JobSettled { .. } => {
+                        if let Some((blob, p)) = produced_by(session, &mut st.job_starts, &record.event) {
+                            st.producers.entry((mission.clone(), blob)).or_insert(p);
                         }
                     }
                     Event::InboxOpened(item) => {
@@ -3722,6 +3746,116 @@ mod tests {
         let p2 = rt2.inner.orch.producer(&info.meta.mission, &blob).await.unwrap();
         assert_eq!(p2.call_id, call_id);
         rt2.shutdown().await;
+    }
+
+    /// The `out:…` handle in the header of the `n`th tool message of a request.
+    fn handle_in_tool_msg(body: &Value, n: usize) -> String {
+        let text = body["messages"]
+            .as_array()
+            .and_then(|m| m.iter().filter(|m| m["role"] == "tool").nth(n))
+            .and_then(|m| m["content"].as_str())
+            .unwrap_or("");
+        let at = text.find("out:").unwrap_or(0);
+        text[at..].chars().take_while(|c| *c == 'o' || *c == 'u' || *c == 't' || *c == ':' || c.is_ascii_hexdigit()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_file_read_can_be_cited_by_the_handle_in_its_header() {
+        let path = Arc::new(Mutex::new(String::new()));
+        let p = path.clone();
+        let e = env(Script::new(move |body, _| match tool_msgs(body) {
+            0 => call("read", json!({"path": lock(&p).clone()})),
+            1 => call("claim", json!({"text": "the file says hello"})),
+            2 => call(
+                "evidence",
+                json!({"claim": "c1", "handle": handle_in_tool_msg(body, 0), "start": 2, "end": 3, "note": "n",
+                       "quote": "line two of the file\nline three of the file"}),
+            ),
+            3 => call(
+                "evidence",
+                json!({"claim": "c1", "handle": handle_in_tool_msg(body, 0), "start": 1, "end": 3, "note": "n",
+                       "quote": "a line that is not in the file"}),
+            ),
+            4 => call("ledger", json!({})),
+            5 => call(
+                "evidence",
+                json!({"claim": "c1", "handle": handle_in_tool_msg(body, 4), "start": 1, "end": 40, "note": "n",
+                       "quote": "the file says hello"}),
+            ),
+            _ => Action::Reply(Reply::text("done")),
+        }))
+        .await;
+        let file = e.ws.join("notes.txt");
+        std::fs::write(&file, "line one of the file\nline two of the file\nline three of the file\n").unwrap();
+        *lock(&path) = file.display().to_string();
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        let evidence = |e: &Env| -> Vec<(ToolStatus, String)> {
+            e.records(&id)
+                .into_iter()
+                .filter_map(|r| match r.event {
+                    Event::ToolResult(t) if t.name == "evidence" => Some((t.status, t.text)),
+                    _ => None,
+                })
+                .collect()
+        };
+        until("three evidence calls", || evidence(&e).len() == 3).await;
+        let got = evidence(&e);
+        assert_eq!(got[0].0, ToolStatus::Ok, "{}", got[0].1);
+        assert!(got[0].1.contains("static: read call"), "{}", got[0].1);
+        assert_eq!(got[1].0, ToolStatus::Error, "{}", got[1].1);
+        assert_eq!(got[2].0, ToolStatus::Error, "{}", got[2].1);
+        assert!(got[2].1.contains("is the result of `ledger`"), "{}", got[2].1);
+        let read_call = e.records(&id).into_iter().find_map(|r| match r.event {
+            Event::ToolResult(t) if t.name == "read" => Some(t.call_id),
+            _ => None,
+        });
+        let attributed = e.rt.inner.st().producers.values().any(|p| p.tool == "read" && Some(&p.call_id) == read_call.as_ref());
+        assert!(attributed, "the read call is registered as a producer");
+        e.rt.shutdown().await;
+    }
+
+    fn tool_result(call_id: &str, name: &str, class: ToolClass, output: Option<&str>, meta: Value) -> Event {
+        Event::ToolResult(loom_core::event::ToolResult {
+            call_id: CallId::from(call_id),
+            name: name.into(),
+            status: ToolStatus::Ok,
+            text: String::new(),
+            output: output.map(|id| loom_core::BlobRef { id: BlobId::from(id), bytes: 10, lines: 2 }),
+            cut: false,
+            class,
+            meta: meta.as_object().cloned().unwrap_or_default(),
+            duration_ms: 0,
+        })
+    }
+
+    #[test]
+    fn what_makes_a_stored_output_citable() {
+        let s = SessionId::from("s-a");
+        let mut jobs = HashMap::new();
+        // A file read is a view of the text it stored; the view of a runtime tool's output is not.
+        let read = tool_result("c1", "read", ToolClass::Read, None, json!({"of_blob": "ff01", "shown": [[1, 2]]}));
+        let p = produced_by(&s, &mut jobs, &read).expect("read registers its blob");
+        assert_eq!((p.0, p.1.tool.as_str(), p.1.class), (BlobId::from("ff01"), "read", ToolClass::Read));
+        let view = tool_result("c2", "out_read", ToolClass::Read, None, json!({"of_blob": "ee02", "shown": [[1, 2]]}));
+        assert!(produced_by(&s, &mut jobs, &view).is_none());
+        let grep = tool_result("c3", "out_grep", ToolClass::Read, None, json!({"of_blob": "ee02", "shown": [[1, 2]]}));
+        assert!(produced_by(&s, &mut jobs, &grep).is_none());
+        // A background job's complete output belongs to the call that started it, not to a later wait.
+        let start = tool_result("c4", "bash", ToolClass::Exec, None, json!({"job": "j1"}));
+        assert!(produced_by(&s, &mut jobs, &start).is_none());
+        let wait = tool_result("c5", "job_wait", ToolClass::Exec, None, json!({"job": "j1"}));
+        assert!(produced_by(&s, &mut jobs, &wait).is_none());
+        let settled = Event::JobSettled {
+            job_id: "j1".into(),
+            exit_code: Some(0),
+            output: Some(loom_core::BlobRef { id: BlobId::from("dd03"), bytes: 10, lines: 2 }),
+            detail: String::new(),
+        };
+        let p = produced_by(&s, &mut jobs, &settled).expect("the job output registers");
+        assert_eq!((p.0, p.1.call_id, p.1.class), (BlobId::from("dd03"), CallId::from("c4"), ToolClass::Exec));
+        // A job nothing is known about registers nothing.
+        let other = Event::JobSettled { job_id: "j9".into(), exit_code: None, output: None, detail: String::new() };
+        assert!(produced_by(&s, &mut jobs, &other).is_none());
     }
 
     #[tokio::test]

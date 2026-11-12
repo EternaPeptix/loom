@@ -451,9 +451,12 @@ fn show_whole(ctx: &ToolCtx, given: &str, bytes: &[u8], start: Option<u64>, end:
         Ok(r) => r,
         Err(e) => return ToolOutput::error(format!("{given} could not be shown ({e}). Try again.")),
     };
+    // The handle of the stored text: `evidence` quotes it, and its lines are the numbers shown here.
+    let handle = stored.handle();
     let mut out = ToolOutput::ok("ok", Body::View { of: stored.id, text, shown: vec![(first, last)] })
         .with_more(given.to_string())
-        .with_more(view::range_fact(first, last, total));
+        .with_more(view::range_fact(first, last, total))
+        .with_more(handle);
     if shortened > 0 {
         out = out.with_more(format!("{shortened} long lines shortened"));
     }

@@ -556,13 +556,25 @@ pub fn check_quote(haystack: &str, quote: &str, first_line: u64) -> Result<Strin
     let hay = prepare_haystack(haystack);
     let lines = quote_lines(quote);
     let literal = lines.join("\n");
-    match scan_quote(&hay, &literal, None, first_line) {
-        Err(QuoteError::NotFound) => {}
+    // A literal fragment that is too short may still be a numbered quote ("3: ok" where line 3 is "ok"
+    // and the literal text also sits inside a longer line): the numbered reading gets its turn, and
+    // "too short" is the answer only when both fail.
+    let literal_short = match scan_quote(&hay, &literal, None, first_line) {
+        Err(QuoteError::NotFound) => false,
+        Err(QuoteError::TooShort) => true,
         verdict => return verdict.map(|()| literal),
+    };
+    let numbered = match strip_prefixes(&lines) {
+        Some((stripped, numbers)) => {
+            let text = stripped.join("\n");
+            scan_quote(&hay, &text, Some(numbers.as_slice()), first_line).map(|()| text)
+        }
+        None => Err(QuoteError::NotFound),
+    };
+    match numbered {
+        Err(_) if literal_short => Err(QuoteError::TooShort),
+        verdict => verdict,
     }
-    let (stripped, numbers) = strip_prefixes(&lines).ok_or(QuoteError::NotFound)?;
-    let text = stripped.join("\n");
-    scan_quote(&hay, &text, Some(numbers.as_slice()), first_line).map(|()| text)
 }
 
 /// [`check_quote`] for a haystack that starts at line 1, when only the answer matters.
@@ -1005,6 +1017,16 @@ mod tests {
         // A whole line with indentation is a whole line only when the indentation is quoted too.
         assert_eq!(check_quote("  ab\n", "ab", 1), Err(QuoteError::TooShort));
         assert!(check_quote("  ab\n", "  ab  ", 1).is_ok());
+    }
+
+    #[test]
+    fn a_numbered_short_quote_is_tried_after_the_literal_one_is_too_short() {
+        // "3: ok" occurs literally inside line 4, as a fragment; it is also line 3 with its number.
+        let hay = "first\nsecond\nok\nsee 3: ok and 5: ok today\n";
+        assert_eq!(check_quote(hay, "3: ok", 1), Ok("ok".to_string()));
+        assert_eq!(check_quote(hay, "3\tok", 1), Ok("ok".to_string()));
+        // Number 5 is not where a line "ok" is: both readings fail, and the answer is still "too short".
+        assert_eq!(check_quote(hay, "5: ok", 1), Err(QuoteError::TooShort));
     }
 
     #[test]

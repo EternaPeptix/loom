@@ -36,7 +36,10 @@
 //!      another agent, or your own words played back, not an observation. Quote the output of the
 //!      command or file read that shows it instead (an agent's report names the handles).``
 //!      A view (`out_read`, `out_grep`) stores nothing of its own: a quote taken from one cites the
-//!      output it views, and is judged by what produced that output.
+//!      output it views, and is judged by what produced that output. A file `read` is the exception
+//!      that proves it: the header of its result names the handle of the text it stored, and the
+//!      runtime registers that blob as produced by the `read` call (class `Read`, so static evidence);
+//!      the complete output of a background job is registered as produced by the call that started it.
 //!   3. `EvidenceAdd(EvidenceInput { claim, kind, supports, session, call_id, blob: Some, lines:
 //!      Some((start, end)) as verified, quote: the verified text (line-number prefixes removed),
 //!      note, attested: true })` where `kind` is `Execution` when the producer's class is `Exec`,

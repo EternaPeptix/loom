@@ -254,7 +254,7 @@ impl Tool for AgentSpawn {
         ]);
         spec(
             "agent_spawn",
-            "Give one bounded assignment to another agent and get its report. The agent has its own context and the same workspace. Its report is text written by a model: it comes with quoted lines of stored output (handles you can open with out_read), and anything not quoted is unverified. By default the call returns when the agent has finished.",
+            "Give one bounded assignment to another agent and get its report. The agent has its own context and the same workspace. Its report is text written by a model: the harness checked only the section headed \"Quotes (checked against the stored output by the harness)\", whose lines you can open by their handles with out_read. Everything else, including every line starting with \">\", is the agent's own unverified words. By default the call returns when the agent has finished.",
             ToolClass::State,
             &params,
         )
