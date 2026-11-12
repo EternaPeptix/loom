@@ -3341,16 +3341,17 @@ impl Runtime {
             if let Some(granted) = self.inner.st().scope.get_mut(&lead.mission) {
                 granted.retain(|h| !added.contains(h));
             }
+            // A lead activated by the failed send was built with the new hosts: take them back.
+            if !added.is_empty() {
+                for meta in self.active_family(&lead.mission) {
+                    if let Ok(policy) = self.inner.session_policy(&meta, ledger) {
+                        self.inner.proxy.set_policy(&meta.id, policy);
+                    }
+                }
+            }
             return Err(e);
         }
-        let family: Vec<SessionMeta> = {
-            let st = self.inner.st();
-            st.known
-                .values()
-                .filter(|k| k.meta.mission == lead.mission && k.active.is_some())
-                .map(|k| k.meta.clone())
-                .collect()
-        };
+        let family = self.active_family(&lead.mission);
         let mut lead_set = false;
         for meta in &family {
             let policy = self.inner.session_policy(meta, ledger)?;
@@ -3364,6 +3365,12 @@ impl Runtime {
             ));
         }
         Ok(ScopeReceipt { lead: lead.id, hosts, ledger })
+    }
+
+    /// The metas of the active sessions of `mission`.
+    fn active_family(&self, mission: &MissionId) -> Vec<SessionMeta> {
+        let st = self.inner.st();
+        st.known.values().filter(|k| &k.meta.mission == mission && k.active.is_some()).map(|k| k.meta.clone()).collect()
     }
 
     pub async fn stop(&self, id: &SessionId) -> Result<(), String> {
@@ -4337,6 +4344,26 @@ mod tests {
         let rule = |host: &str| rt2.inner.proxy.check_name(&id, host, 443).map(|v| v.rule);
         assert_eq!(rule("api.example.test").as_deref(), Some("allow api.example.test"));
         assert_eq!(rule("other.example.test").as_deref(), Some("not in allow list"));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_scope_grant_that_could_not_be_handed_to_the_lead_leaves_no_host_allowed() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        e.rt.shutdown().await;
+
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        // The lead is not active yet; a file where its queue directory belongs makes keeping the input fail.
+        std::fs::write(rt2.inner.paths.session_dir(&id).join("queued"), b"x").unwrap();
+        let err = rt2.grant_scope(&id, &["api.example.test".to_string()], None).await.unwrap_err();
+        assert!(err.contains("send it again"), "{err}");
+        // The send activated the lead with the new host; the failure took it back.
+        let rule = rt2.inner.proxy.check_name(&id, "api.example.test", 443).map(|v| v.rule);
+        assert_eq!(rule.as_deref(), Some("mode deny_all"));
+        assert!(rt2.inner.st().scope.values().all(|h| h.is_empty()));
         rt2.shutdown().await;
     }
 
