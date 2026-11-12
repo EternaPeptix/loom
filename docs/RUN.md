@@ -105,14 +105,19 @@ Other files are readable.
 file tools: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`,
 `~/.docker/config.json`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials(.toml)`,
 `~/.git-credentials`, `~/.config/git/credentials`, `~/.password-store`, `~/.config/op`,
-`~/Library/Keychains`, `~/Library/Cookies` and the Chrome, Firefox and Safari profile directories. A
+`~/Library/Keychains`, `~/Library/Cookies`, the Chrome, Firefox and Safari profile directories, and
+many more: model-hub, database, cloud, registry and password-manager stores (`~/.cache/huggingface`,
+`~/.pgpass`, `~/.vault-token`, `~/.m2/settings.xml`, `~/.config/rclone`, `~/Library/Mail`, ...; the list is
+in `docs/DESIGN.md`). Add other stores to `unreadable_paths`. A
 listed directory that is or contains the workspace is skipped. This needs a home directory: with
 `HOME` unset, every session fails to build its sandbox and the message names `HOME` and
 `protect_credentials = false`. Set the key to `false` to turn the protection off.
 
 Environment variables whose names look like secrets (in any case: containing `KEY`, `TOKEN`, `SECRET`,
 `PASSWORD`, `PASSWD`, `CREDENTIAL` or `COOKIE`, ending in `_PAT`, `_DSN` or `_PWD`, `DATABASE_URL`,
-`SSH_AUTH_SOCK`, anything starting `LOOM_`) are not passed to commands unless listed in `env_pass`.
+`SSH_AUTH_SOCK`, anything starting `LOOM_`, names with `SESSION`, `AUTH`, `PASS`, `JWT` or `WEBHOOK` as an
+`_`-delimited word or with `PRIVATE`, the `api_key_env` of any model profile, and any variable whose value is
+a URL with a password in it) are not passed to commands unless listed in `env_pass`.
 
 ## Start
 

@@ -65,6 +65,10 @@
 //! (allow network-inbound (local ip "localhost:*"))
 //! ```
 //!
+//! A process that leaves its command's process group (`setsid`, `daemon()`, `redis-server --daemonize
+//! yes`, `tmux new -d`) is not tracked: `job_kill`, stop, the end of the session and daemon shutdown do
+//! not stop it, although it stays under this profile.
+//!
 //! A sandboxed process can signal itself and the other processes of its sandbox, and nothing else:
 //! not the harness, not other sessions, not any other process of the same user.
 //!
@@ -98,9 +102,11 @@
 //! ## `env(parent)`
 //! The environment for commands: `parent` (the daemon's own variables) without any whose name
 //! (case-insensitive) contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`,
-//! `AUTH_TOKEN`, `COOKIE` or `SESSION_KEY`, ends in `_PAT`, `_DSN` or `_PWD` (`PWD` and `OLDPWD`
-//! stay), is `DATABASE_URL` or `SSH_AUTH_SOCK`, or starts with `LOOM_`, unless listed in
-//! `cfg.env_pass`; plus `TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`,
+//! `AUTH_TOKEN`, `COOKIE`, `SESSION_KEY` or `PRIVATE`, has `SESSION`, `AUTH`, `PASS`, `JWT` or
+//! `WEBHOOK` as a part delimited by `_` or the ends of the name, ends in `_PAT`, `_DSN` or `_PWD`
+//! (`PWD` and `OLDPWD` stay), is `DATABASE_URL`, `SSH_AUTH_SOCK` or listed in `cfg.secret_env` (the
+//! `api_key_env` of every model profile), starts with `LOOM_`, or whose value is a URL with a password
+//! in its user-info part (`scheme://user:password@host`), unless listed in `cfg.env_pass`; plus `TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`,
 //! `GIT_TERMINAL_PROMPT=0`, `TMPDIR=<session temp dir>`.
 //!
 //! ## `describe()`
@@ -137,9 +143,11 @@ const SECRET_WORDS: [&str; 9] =
     ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH_TOKEN", "COOKIE", "SESSION_KEY"];
 const SECRET_SUFFIXES: [&str; 3] = ["_PAT", "_DSN", "_PWD"];
 const SECRET_NAMES: [&str; 2] = ["DATABASE_URL", "SSH_AUTH_SOCK"];
+/// Words that withhold a variable when they are a whole `_`-delimited part of its name.
+const SECRET_PARTS: [&str; 5] = ["SESSION", "AUTH", "PASS", "JWT", "WEBHOOK"];
 
 /// Credential stores, relative to the user's home directory, that commands and file tools may not read.
-const CREDENTIAL_PATHS: [&str; 22] = [
+const CREDENTIAL_PATHS: &[&str] = &[
     ".ssh",
     ".aws",
     ".gnupg",
@@ -157,10 +165,49 @@ const CREDENTIAL_PATHS: [&str; 22] = [
     ".config/git/credentials",
     ".password-store",
     ".config/op",
+    ".cache/huggingface",
+    ".huggingface",
+    ".pgpass",
+    ".my.cnf",
+    ".vault-token",
+    ".terraform.d",
+    ".config/rclone",
+    ".s3cfg",
+    ".boto",
+    ".gem/credentials",
+    ".m2/settings.xml",
+    ".m2/settings-security.xml",
+    ".gradle/gradle.properties",
+    ".yarnrc.yml",
+    ".composer/auth.json",
+    ".codex/auth.json",
+    ".config/hub",
+    ".config/glab-cli",
+    ".oci",
+    ".config/doctl",
+    ".fly",
+    ".config/heroku",
+    ".heroku",
+    ".config/netlify",
+    ".config/sops",
+    ".age",
+    ".config/age",
+    ".bitcoin",
+    ".ethereum",
+    ".config/solana",
+    ".wrangler",
+    ".config/.wrangler",
+    ".pulumi",
     "Library/Keychains",
     "Library/Cookies",
     "Library/Application Support/Google/Chrome",
     "Library/Application Support/Firefox",
+    "Library/Application Support/Bitwarden",
+    "Library/Application Support/Bitwarden CLI",
+    "Library/Application Support/1Password",
+    "Library/Group Containers",
+    "Library/Mail",
+    "Library/Messages",
     "Library/Safari",
 ];
 
@@ -178,6 +225,7 @@ pub struct Sandbox {
     loopback_all: bool,
     unix_sockets: Vec<PathBuf>,
     env_pass: Vec<String>,
+    secret_env: Vec<String>,
 }
 
 fn invalid(msg: String) -> io::Error {
@@ -321,6 +369,23 @@ fn secret_name(name: &str) -> bool {
         || SECRET_NAMES.contains(&upper.as_str())
         || SECRET_SUFFIXES.iter().any(|s| upper.ends_with(s))
         || SECRET_WORDS.iter().any(|w| upper.contains(w))
+        || upper.contains("PRIVATE")
+        || upper.split('_').any(|part| SECRET_PARTS.contains(&part))
+}
+
+/// Whether `value` is a URL with a password in its user-info part (`scheme://user:password@host`).
+fn url_with_password(value: &str) -> bool {
+    let Some((scheme, rest)) = value.trim().split_once("://") else {
+        return false;
+    };
+    if scheme.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    match authority.rsplit_once('@') {
+        Some((userinfo, _)) => userinfo.split_once(':').is_some_and(|(_, password)| !password.is_empty()),
+        None => false,
+    }
 }
 
 fn join_list(paths: &[PathBuf]) -> String {
@@ -460,6 +525,7 @@ impl Sandbox {
             loopback_all: cfg.loopback_all,
             unix_sockets,
             env_pass: cfg.env_pass.clone(),
+            secret_env: cfg.secret_env.clone(),
         })
     }
 
@@ -663,8 +729,9 @@ impl Sandbox {
     pub fn env(&self, parent: &BTreeMap<String, String>) -> BTreeMap<String, String> {
         let mut out: BTreeMap<String, String> = parent
             .iter()
-            .filter(|(name, _)| {
-                self.env_pass.iter().any(|p| p == *name) || !secret_name(name)
+            .filter(|(name, value)| {
+                self.env_pass.iter().any(|p| p == *name)
+                    || !(secret_name(name) || self.secret_env.iter().any(|n| n == *name) || url_with_password(value))
             })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -682,11 +749,12 @@ impl Sandbox {
         let credentials = match (self.credentials.is_empty(), self.mode) {
             (true, _) => "",
             (false, SandboxMode::None) => {
-                " They also refuse to read or write credential directories (~/.ssh, ~/.aws, ~/.gnupg, keychains, \
-                 browser profiles and similar)."
+                " They also refuse to read or write credential directories (~/.ssh, ~/.aws, ~/.gnupg, cloud, \
+                 registry and model-hub tokens, password managers, mail, messages, keychains, browser profiles and similar)."
             }
             (false, SandboxMode::Seatbelt) => {
-                " Credential directories (~/.ssh, ~/.aws, ~/.gnupg, keychains, browser profiles and similar) are \
+                " Credential directories (~/.ssh, ~/.aws, ~/.gnupg, cloud, registry and model-hub tokens, \
+                 password managers, mail, messages, keychains, browser profiles and similar) are \
                  off limits to read and to write."
             }
         };
@@ -916,8 +984,24 @@ mod tests {
         assert!(sb.check_read(&fake.join(".aws/credentials")).is_err());
         assert!(sb.check_read(&fake.join("Library/Keychains/login.keychain-db")).is_err());
         assert!(sb.check_read(&fake.join("notes")).is_ok());
+        for rel in [
+            ".cache/huggingface/token", ".huggingface/token", ".pgpass", ".my.cnf", ".vault-token",
+            ".terraform.d/credentials.tfrc.json", ".config/rclone/rclone.conf", ".s3cfg", ".boto", ".gem/credentials",
+            ".m2/settings.xml", ".m2/settings-security.xml", ".gradle/gradle.properties", ".yarnrc.yml",
+            ".composer/auth.json", ".codex/auth.json", ".config/hub/hosts", ".config/glab-cli/config.yml",
+            ".oci/config", ".config/doctl/config.yaml", ".fly/config.yml", ".config/heroku/x", ".heroku/accounts",
+            ".config/netlify/config.json", ".config/sops/age/keys.txt", ".age/key", ".config/age/key", ".bitcoin/wallet.dat",
+            ".ethereum/keystore", ".config/solana/id.json", ".wrangler/config", ".config/.wrangler/config", ".pulumi/credentials.json",
+            "Library/Application Support/Bitwarden/data.json", "Library/Application Support/Bitwarden CLI/data.json",
+            "Library/Application Support/1Password/x", "Library/Group Containers/group.x/vault", "Library/Mail/V10/x",
+            "Library/Messages/chat.db",
+        ] {
+            assert!(sb.check_read(&fake.join(rel)).is_err(), "{rel} must be unreadable");
+            assert!(sb.check_write(&fake.join(rel)).is_err(), "{rel} must be unwritable");
+        }
         let p = sb.profile().expect("profile");
         assert!(p.contains(&format!("(subpath \"{}/.ssh\")", s(&fake))), "{p}");
+        assert!(p.contains(&format!("(subpath \"{}/.pgpass\")", s(&fake))), "{p}");
         assert!(sb.describe().contains("Credential directories"), "{}", sb.describe());
         // Mode none keeps the read rule for the file tools, and says that it is theirs alone.
         let none = build_home(&f, &cfg(SandboxMode::None), &fake);
@@ -1315,6 +1399,56 @@ mod tests {
         assert_eq!(env["GIT_TERMINAL_PROMPT"], "0");
         assert_eq!(env["NO_COLOR"], "1");
         assert_eq!(env["TMPDIR"], s(&f.tmp));
+    }
+
+    #[test]
+    fn env_withholds_sessions_auth_urls_with_passwords_and_profile_key_variables() {
+        let f = fx();
+        let c = SandboxCfg { secret_env: vec!["MYSERVER_ACCESS".into()], env_pass: vec!["PASSED_PASS".into()], ..cfg(SandboxMode::Seatbelt) };
+        let sb = build(&f, &c, None);
+        let withheld = [
+            ("BW_SESSION", "x"),
+            ("OP_SESSION_myaccount", "x"),
+            ("DOCKER_AUTH_CONFIG", "x"),
+            ("NPM_CONFIG__AUTH", "x"),
+            ("npm_config__auth", "x"),
+            ("REDIS_URL", "redis://:hunter2@h:6379/0"),
+            ("MONGODB_URI", "mongodb+srv://u:pw@cluster.example/db"),
+            ("TEST_DATABASE_URL", "postgres://u:pw@h/db"),
+            ("AMQP_URL", "amqp://guest:guest@h:5672"),
+            ("SLACK_WEBHOOK_URL", "https://hooks.example/x"),
+            ("SMTP_PASS", "x"),
+            ("CI_JOB_JWT", "x"),
+            ("MY_PRIVATE_THING", "x"),
+            ("TERM_SESSION_ID", "x"),
+            ("XDG_SESSION_TYPE", "tty"),
+            ("MYSERVER_ACCESS", "x"),
+            ("INNOCENT_NAME", "https://user:secret@host/path"),
+        ];
+        let kept = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/h"),
+            ("PWD", "/w"),
+            ("OLDPWD", "/o"),
+            ("LANG", "C"),
+            ("PASSED_PASS", "x"),
+            ("PASSIVE", "x"),
+            ("SERVER_URL", "https://host/path"),
+            ("REMOTE", "https://user@host/path"),
+            ("ADDR", "redis://h:6379/0"),
+        ];
+        let parent: BTreeMap<String, String> =
+            withheld.iter().chain(&kept).map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let env = sb.env(&parent);
+        for (k, _) in &withheld {
+            assert!(!env.contains_key(*k), "{k} must be withheld");
+        }
+        for (k, _) in &kept {
+            assert!(env.contains_key(*k), "{k} must be kept");
+        }
+        // `env_pass` overrides a password-bearing URL too.
+        let c = SandboxCfg { env_pass: vec!["REDIS_URL".into()], ..cfg(SandboxMode::Seatbelt) };
+        assert!(build(&f, &c, None).env(&parent).contains_key("REDIS_URL"));
     }
 
     #[test]

@@ -172,6 +172,10 @@ pub struct SandboxCfg {
     pub unix_sockets: Vec<String>,
     /// Environment variables passed to commands even though their names look like secrets.
     pub env_pass: Vec<String>,
+    /// Variable names withheld from commands whatever they are called (the model profiles' `api_key_env`
+    /// names). Filled in by the runtime; not a configuration key. `env_pass` still overrides it.
+    #[serde(skip)]
+    pub secret_env: Vec<String>,
 }
 
 impl Default for SandboxCfg {
@@ -186,6 +190,7 @@ impl Default for SandboxCfg {
             loopback_all: false,
             unix_sockets: Vec::new(),
             env_pass: Vec::new(),
+            secret_env: Vec::new(),
         }
     }
 }

@@ -747,6 +747,9 @@ evidence kind and staleness. Each module's documentation is the precise specific
     period in progress ends); only the first `max_output_bytes` are kept, and the result gives the true
     size.
   - Cancellation sends TERM to the whole group, then KILL after `tools.kill_grace_s` (5).
+  - A process that leaves its command's process group (`setsid`, `daemon()`, `redis-server --daemonize
+    yes`, `tmux new -d`) is not tracked: `job_kill`, stop, the end of the session and daemon shutdown do
+    not stop it, although it stays under the seatbelt profile.
   - In seatbelt mode a failure whose output mentions `Operation not permitted` gets a reminder fact
     about the sandbox.
 - **Jobs** (`loom-tools::jobs`, `proc`). Ids `j1`, `j2`, … per session. `job_wait` returns the output
@@ -789,7 +792,15 @@ system prompt states. The policy:
   `sandbox.protect_credentials` is on (default), the user's credential stores (`~/.ssh`, `~/.aws`,
   `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`, `~/.docker/config.json`,
   `~/.netrc`, `~/.npmrc`, `~/.pypirc`, cargo and git credentials, `~/.password-store`, `~/.config/op`,
-  `~/Library/Keychains`, `~/Library/Cookies`, Chrome, Firefox and Safari profiles). A store that is or
+  `~/.cache/huggingface`, `~/.huggingface`, `~/.pgpass`, `~/.my.cnf`, `~/.vault-token`, `~/.terraform.d`,
+  `~/.config/rclone`, `~/.s3cfg`, `~/.boto`, `~/.gem/credentials`, `~/.m2/settings.xml`,
+  `~/.m2/settings-security.xml`, `~/.gradle/gradle.properties`, `~/.yarnrc.yml`, `~/.composer/auth.json`,
+  `~/.codex/auth.json`, `~/.config/hub`, `~/.config/glab-cli`, `~/.oci`, `~/.config/doctl`, `~/.fly`,
+  `~/.config/heroku`, `~/.heroku`, `~/.config/netlify`, `~/.config/sops`, `~/.age`, `~/.config/age`,
+  `~/.bitcoin`, `~/.ethereum`, `~/.config/solana`, `~/.wrangler`, `~/.config/.wrangler`, `~/.pulumi`,
+  `~/Library/Keychains`, `~/Library/Cookies`, Chrome, Firefox and Safari profiles, `~/Library/Application
+  Support/Bitwarden`, `.../Bitwarden CLI` and `.../1Password`, `~/Library/Group Containers`,
+  `~/Library/Mail`, `~/Library/Messages`). Other stores go in `sandbox.unreadable_paths`. A store that is or
   contains the workspace is skipped; when the home directory is unknown the sandbox is refused. A path
   that a link makes differ from its canonical form is denied as written too;
 - a writable directory that holds any of these, or the session temp dir, cannot be removed or renamed,
@@ -809,8 +820,11 @@ the never-writable paths, so it can still write in its session temp dir, in the 
 (`/private/tmp`, `/private/var/folders`, which other sessions use too) and to the device files, and
 nowhere else. Commands get the daemon's environment without any variable whose name (case-insensitive)
 contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
-`CREDENTIAL`, `AUTH_TOKEN`, `COOKIE` or `SESSION_KEY`, ends in `_PAT`, `_DSN` or `_PWD`, is
-`DATABASE_URL` or `SSH_AUTH_SOCK`, or starts with `LOOM_` (unless listed in `sandbox.env_pass`), plus
+`CREDENTIAL`, `AUTH_TOKEN`, `COOKIE`, `SESSION_KEY` or `PRIVATE`, has `SESSION`, `AUTH`, `PASS`, `JWT`
+or `WEBHOOK` as a part delimited by `_` or the ends of the name, ends in `_PAT`, `_DSN` or `_PWD`, is
+`DATABASE_URL`, `SSH_AUTH_SOCK` or the `api_key_env` of any model profile, or starts with `LOOM_`, or
+whose value is a URL with a password in its user-info part (`scheme://user:password@host`)
+(unless listed in `sandbox.env_pass`), plus
 `TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR` = the temp
 dir, and the proxy variables.
 
