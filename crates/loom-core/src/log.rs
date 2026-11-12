@@ -26,12 +26,25 @@
 //! - `read_records` is the read-only variant: same stopping rule, no file is modified.
 //! - `read_page` and [`PageReader`] serve pages under the same stopping rule. A `PageReader` keeps
 //!   checkpoints of what it verified, so pages fetched in sequence cost time proportional to the page.
-//! - `fork_to` creates a new log whose first `upto_seq + 1` lines are byte-identical to this log's, and
-//!   returns it ready to append (`next_seq == upto_seq + 1`, chain continuing from the copied line).
+//!   `PageReader::read_stored` serves the same page as [`StoredRecord`]s: a record read as
+//!   `Event::Unknown` (a kind this build does not know, or an opaque record) comes with its line as
+//!   stored, so that it can be served with every field; every other record comes without one.
+//! - `record_from_value` reads one record from JSON (a record the API served) as `open` reads a line:
+//!   one whose header is sound but whose body this build cannot read is opaque (`Event::Unknown`).
+//! - `fork_file` creates a new log at `dest` whose first `upto_seq + 1` lines are byte-identical to
+//!   those of the log at `src`, and returns it ready to append (`next_seq == upto_seq + 1`, chain
+//!   continuing from the copied line) with the records copied; `fork_to` does the same from an open
+//!   log. Each line is checked as `open` checks it before it is copied: a complete line, JSON this
+//!   build reads in full (not opaque, no schema above `event::SCHEMA`), the expected `seq`, and a
+//!   `prev` equal to the hash of the line before. The first line that fails ends the fork with
+//!   [`LogError::ForkSource`], which names the record, and no file is left at `dest`.
 //! - Lines can be large (a tool result is stored inline). There is no line-length limit.
 //!
 //! Tests required: round trip; chain values; torn tail; corrupted middle line (salvage file exists,
 //! log truncated, appends continue); wrong seq; reopen-and-append; fork is byte-identical and chains;
+//! a fork whose source has a line that does not chain, is torn or is opaque is refused and leaves no
+//! file; `read_stored` keeps the line of unknown and opaque records only, and `record_from_value`
+//! reads such a line back as `Unknown`;
 //! `read_page` paging; `create` refuses an existing file; `Unknown` events survive rewrite-free;
 //! an unreadable body with an intact chain is opaque, refuses append and leaves the file alone (also
 //! in `session_start`, also as the last line); a higher schema refuses append and reads; a log from
@@ -75,6 +88,11 @@ pub enum LogError {
     #[error("fork point {upto} is beyond the last record {last}")]
     ForkPoint { upto: Seq, last: Seq },
     #[error(
+        "the session log {path} cannot be forked: its record {seq} {detail}, so a copy would not be a sound log. \
+         Start the agent with mode `fresh` and put what it needs to know in the assignment"
+    )]
+    ForkSource { path: PathBuf, seq: Seq, detail: String },
+    #[error(
         "the session log {0} was written by a newer loom (it holds records or a schema this build cannot read); \
          upgrade loom to resume this session. Reading it still works"
     )]
@@ -100,6 +118,15 @@ pub struct OpenReport {
     pub damage: Option<Damage>,
     /// Records kept as `Event::Unknown` because this build cannot deserialize their body.
     pub opaque: u64,
+}
+
+/// A record as a reader found it in the log. `line` is the line as stored (newline excluded) when the
+/// record was read as [`Event::Unknown`] (a kind this build does not know, or an opaque record), whose
+/// other fields the parsed record does not carry; `None` for every other record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredRecord {
+    pub record: Record,
+    pub line: Option<String>,
 }
 
 #[derive(Debug)]
@@ -128,7 +155,7 @@ fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> LogError + '_ {
 
 /// Outcome of reading one line.
 enum Step {
-    Record(Box<Record>),
+    Record(Box<StoredRecord>),
     End,
     /// The line at the current position ends the readable prefix; the string says why.
     Bad(String),
@@ -181,6 +208,11 @@ fn parse_line(line: &[u8]) -> Result<Parsed, serde_json::Error> {
 /// nesting deeper than `serde_json` reads) on the damage side.
 fn opaque_record(line: &[u8]) -> Option<(Record, u32)> {
     let Value::Object(map) = serde_json::from_slice::<Value>(line).ok()? else { return None };
+    opaque_header(&map)
+}
+
+/// The opaque record a JSON object with a `seq` and a `prev` stands for, plus the schema it declares.
+fn opaque_header(map: &serde_json::Map<String, Value>) -> Option<(Record, u32)> {
     let seq = map.get("seq").and_then(Value::as_u64)?;
     let prev = map.get("prev").and_then(Value::as_str)?.to_string();
     let author = map.get("author").and_then(|v| Author::deserialize(v).ok()).unwrap_or(Author::Harness);
@@ -191,6 +223,16 @@ fn opaque_record(line: &[u8]) -> Option<(Record, u32)> {
     };
     let ts_ms = map.get("ts_ms").and_then(Value::as_u64).unwrap_or(0);
     Some((Record { seq, ts_ms, author, prev, event: Event::Unknown }, schema))
+}
+
+/// Read one record from JSON already parsed (a record the API served, possibly a stored line written
+/// by a newer loom) as `open` reads a line: one whose body this build cannot read but whose header is
+/// sound comes back opaque (`Event::Unknown`). `None` when the value is not a record at all.
+pub fn record_from_value(value: &Value) -> Option<Record> {
+    match Record::deserialize(value) {
+        Ok(record) => Some(record),
+        Err(_) => value.as_object().and_then(opaque_header).map(|(record, _)| record),
+    }
 }
 
 impl<R: BufRead> Scanner<R> {
@@ -237,6 +279,8 @@ impl<R: BufRead> Scanner<R> {
             return Ok(Step::Bad(format!("line {line_no} breaks the chain")));
         }
         let hash = sha256_hex(line);
+        // The parsed form of an unknown or opaque record holds only its header; the line holds the rest.
+        let kept = matches!(record.event, Event::Unknown).then(|| String::from_utf8(line.to_vec()).ok()).flatten();
         if let Some(e) = &unreadable {
             // Only the next line can vouch for bytes this build cannot read.
             if self.next_line_disowns(&hash)? {
@@ -248,7 +292,7 @@ impl<R: BufRead> Scanner<R> {
         self.good_len = self.good_len.saturating_add(total);
         self.opaque = self.opaque.saturating_add(u64::from(unreadable.is_some()));
         self.schema = self.schema.max(schema);
-        Ok(Step::Record(Box::new(record)))
+        Ok(Step::Record(Box::new(StoredRecord { record, line: kept })))
     }
 
     /// Read the line after the current one and keep it for the next `step`. True when that line has
@@ -279,7 +323,7 @@ fn scan_file(path: &Path) -> Result<Scanned, LogError> {
     let mut records = Vec::new();
     loop {
         match scanner.step().map_err(io_err(path))? {
-            Step::Record(r) => records.push(*r),
+            Step::Record(r) => records.push(r.record),
             Step::End => return Ok((scanner, records, None)),
             Step::Bad(detail) => return Ok((scanner, records, Some(detail))),
         }
@@ -427,31 +471,46 @@ impl SessionLog {
         if upto_seq >= self.next_seq {
             return Err(LogError::ForkPoint { upto: upto_seq, last: self.next_seq.saturating_sub(1) });
         }
-        fork_file(&self.path, dest, upto_seq, durability)
+        fork_file(&self.path, dest, upto_seq, durability).map(|(log, _)| log)
     }
 
-    /// Copy the first `upto_seq + 1` stored lines of the log at `src_path` into `child` and set its
-    /// chain state.
-    fn copy_prefix(src_path: &Path, child: &mut SessionLog, upto_seq: Seq) -> Result<(), LogError> {
+    /// Copy the first `upto_seq + 1` stored lines of the log at `src_path` into `child`, set its chain
+    /// state and return the records copied. Every line is checked as the scanner checks it before it
+    /// is written, so the child never starts with a prefix its next `open` would cut back.
+    fn copy_prefix(src_path: &Path, child: &mut SessionLog, upto_seq: Seq) -> Result<Vec<Record>, LogError> {
+        let refuse =
+            |seq: Seq, detail: &str| LogError::ForkSource { path: src_path.to_path_buf(), seq, detail: detail.to_string() };
         let src = File::open(src_path).map_err(io_err(src_path))?;
         let mut reader = BufReader::new(src);
         let mut out = BufWriter::new(&child.file);
         let mut buf = Vec::new();
+        let mut records = Vec::new();
         let mut copied: u64 = 0;
         let mut last_hash = ZERO_HASH.to_string();
         let mut seq: Seq = 0;
         while seq <= upto_seq {
             buf.clear();
             let n = reader.read_until(b'\n', &mut buf).map_err(io_err(src_path))?;
+            if n == 0 {
+                return Err(refuse(seq, "is missing: the log ends before it"));
+            }
             let Some((&b'\n', line)) = buf.split_last() else {
-                return Err(io_err(src_path)(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!("log ends before record {seq}; reopen the session so the log is repaired, then fork again"),
-                )));
+                return Err(refuse(seq, "is not a complete line"));
             };
+            let parsed = parse_line(line).map_err(|e| refuse(seq, &format!("is not a record ({e})")))?;
+            if parsed.unreadable.is_some() || parsed.schema > SCHEMA {
+                return Err(refuse(seq, "was written by a newer loom and cannot be read by this one"));
+            }
+            if parsed.record.seq != seq {
+                return Err(refuse(seq, &format!("is out of place (it says seq {})", parsed.record.seq)));
+            }
+            if parsed.record.prev != last_hash {
+                return Err(refuse(seq, "does not chain to the record before it"));
+            }
             out.write_all(&buf).map_err(io_err(&child.path))?;
             last_hash = sha256_hex(line);
             copied = copied.saturating_add(n as u64);
+            records.push(parsed.record);
             seq = seq.saturating_add(1);
         }
         out.flush().map_err(io_err(&child.path))?;
@@ -462,17 +521,24 @@ impl SessionLog {
         child.next_seq = seq;
         child.last_hash = last_hash;
         child.len = copied;
-        Ok(())
+        Ok(records)
     }
 }
 
 /// Fork the log file at `src` without holding it open for writing: copy records `0..=upto_seq`
-/// byte for byte into a new log at `dest` and return that log open. `src` is only read, so this is
-/// safe while another handle is appending to it (records up to `upto_seq` must already be complete).
-pub fn fork_file(src: &Path, dest: &Path, upto_seq: Seq, durability: Durability) -> Result<SessionLog, LogError> {
+/// byte for byte into a new log at `dest` and return that log open, with the records copied. `src` is
+/// only read, so this is safe while another handle is appending to it (records up to `upto_seq` must
+/// already be complete). A line that fails the checks of the module contract ends the fork with
+/// [`LogError::ForkSource`] and nothing is left at `dest`.
+pub fn fork_file(
+    src: &Path,
+    dest: &Path,
+    upto_seq: Seq,
+    durability: Durability,
+) -> Result<(SessionLog, Vec<Record>), LogError> {
     let mut child = SessionLog::create(dest, durability)?;
     match SessionLog::copy_prefix(src, &mut child, upto_seq) {
-        Ok(()) => Ok(child),
+        Ok(records) => Ok((child, records)),
         Err(e) => {
             drop(child);
             let _ = std::fs::remove_file(dest);
@@ -512,8 +578,8 @@ pub fn read_page(path: &Path, after: Option<Seq>, limit: usize) -> Result<Vec<Re
     let mut scanner = Scanner::new(BufReader::new(file));
     // Every line is checked against the chain, but only the page is kept in memory.
     while let Step::Record(r) = scanner.step().map_err(io_err(path))? {
-        if r.seq >= first {
-            page.push(*r);
+        if r.record.seq >= first {
+            page.push(r.record);
             if page.len() >= limit {
                 break;
             }
@@ -595,6 +661,12 @@ impl PageReader {
 
     /// Up to `limit` records with `seq > after` (`None` = from the start); stops silently at damage.
     pub fn read_page(&mut self, after: Option<Seq>, limit: usize) -> Result<Vec<Record>, LogError> {
+        Ok(self.read_stored(after, limit)?.into_iter().map(|stored| stored.record).collect())
+    }
+
+    /// The page `read_page` serves, each record with its stored line when it was read as
+    /// [`Event::Unknown`].
+    pub fn read_stored(&mut self, after: Option<Seq>, limit: usize) -> Result<Vec<StoredRecord>, LogError> {
         let first = match after {
             None => 0,
             Some(a) => match a.checked_add(1) {
@@ -624,7 +696,7 @@ impl PageReader {
     /// Collect up to `limit` records from `first` on, scanning from the latest verified position at
     /// or before `first`. The flag says whether the page was filled (false: the scan reached the end
     /// of the readable log first).
-    fn scan(&mut self, mut file: File, first: Seq, limit: usize) -> std::io::Result<(Vec<Record>, bool)> {
+    fn scan(&mut self, mut file: File, first: Seq, limit: usize) -> std::io::Result<(Vec<StoredRecord>, bool)> {
         let index = usize::try_from(first / CHECKPOINT_EVERY).unwrap_or(usize::MAX);
         let mut start = self.marks.get(index).or(self.marks.last()).cloned().unwrap_or_else(Mark::origin);
         for m in [&self.cursor, &self.end] {
@@ -652,7 +724,7 @@ impl PageReader {
                     self.marks.push(self.end.clone());
                 }
             }
-            if r.seq >= first {
+            if r.record.seq >= first {
                 page.push(*r);
                 full = page.len() >= limit;
             }
@@ -847,6 +919,61 @@ mod tests {
             Err(LogError::ForkPoint { upto: 6, last: 5 })
         ));
         assert!(matches!(log.fork_to(&dest, 1, Durability::Batch), Err(LogError::Exists(_))));
+    }
+
+    #[test]
+    fn a_fork_copies_unknown_kinds_verbatim_and_returns_the_records_it_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let bytes = hand_log(&[OK_MSG, r#""kind":"from_the_future", "x": [1, 2]"#, OK_MSG, OK_MSG]);
+        std::fs::write(&path, &bytes).unwrap();
+        let dest = dir.path().join("child").join("log.jsonl");
+        let (mut child, records) = fork_file(&path, &dest, 2, Durability::Batch).unwrap();
+        assert_eq!(lines(&dest), lines(&path)[..3].to_vec());
+        assert_eq!(records, read_records(&path).unwrap().records[..3].to_vec());
+        assert_eq!(records[1].event, Event::Unknown);
+        assert_eq!(child.append(Author::Harness, msg(3)).unwrap().seq, 3);
+        assert!(read_records(&dest).unwrap().damage.is_none());
+    }
+
+    #[test]
+    fn a_fork_from_a_prefix_that_is_not_a_sound_chain_is_refused_and_leaves_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut log) = new_log(&dir);
+        fill(&mut log, 6);
+        drop(log);
+        let good = lines(&path);
+        let dest = dir.path().join("child").join("log.jsonl");
+        let fork = |upto: Seq| fork_file(&path, &dest, upto, Durability::Batch).map(|(_, records)| records.len());
+        // Record 2 points at other bytes than record 1 (an edit, bad media, a failed cut-back).
+        let first_hash = sha256_hex(&good[1][..good[1].len() - 1]);
+        let wrong_prev = String::from_utf8(good[2].clone()).unwrap().replace(&first_hash, &"f".repeat(64));
+        let mut ls = good.clone();
+        ls[2] = wrong_prev.into_bytes();
+        // Half of record 2 left in front of the record written again after it (a failed append whose
+        // cut-back failed too), and a line of a newer loom.
+        let mut torn = good.clone();
+        torn.insert(2, good[2][..good[2].len() / 2].to_vec());
+        let opaque = hand_log(&[OK_MSG, OK_MSG, FUTURE_NOTE, OK_MSG, OK_MSG]);
+        let cases: Vec<(Vec<u8>, Seq, &str)> = vec![
+            (ls.concat(), 2, "does not chain to the record before it"),
+            (torn.concat(), 2, "is not a record"),
+            (opaque, 2, "was written by a newer loom"),
+            (good[..3].concat(), 3, "is missing"),
+        ];
+        for (bytes, bad, detail) in cases {
+            std::fs::write(&path, &bytes).unwrap();
+            let err = fork_file(&path, &dest, 4, Durability::Batch).err().unwrap();
+            assert!(matches!(&err, LogError::ForkSource { seq, .. } if *seq == bad), "{err}");
+            let text = err.to_string();
+            assert!(text.contains(&format!("its record {bad} {detail}")), "{text}");
+            assert!(text.contains("Start the agent with mode `fresh`"), "{text}");
+            assert!(!dest.exists(), "{detail}: a refused fork leaves no file");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "the parent's log is only read");
+            // Up to the record before the bad one, the fork goes through.
+            assert_eq!(fork(bad - 1).unwrap(), bad as usize);
+            std::fs::remove_file(&dest).unwrap();
+        }
     }
 
     #[test]
@@ -1070,6 +1197,31 @@ mod tests {
         let (_, again) = SessionLog::open(&path, Durability::Batch).unwrap();
         assert!(again.damage.is_none());
         assert_eq!(again.records.len(), 2);
+    }
+
+    #[test]
+    fn read_stored_keeps_the_line_of_unknown_and_opaque_records_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let future = r#""kind":"from_the_future", "x": [1, 2],"y":{"z":"w"}"#;
+        let bytes = hand_log(&[OK_MSG, future, FUTURE_NOTE, OK_MSG]);
+        std::fs::write(&path, &bytes).unwrap();
+        let stored_lines: Vec<String> = String::from_utf8(bytes).unwrap().lines().map(str::to_string).collect();
+        let page = PageReader::new(&path).read_stored(None, 10).unwrap();
+        let records = read_records(&path).unwrap().records;
+        assert_eq!(page.iter().map(|s| s.record.clone()).collect::<Vec<_>>(), records);
+        let kept: Vec<Option<&str>> = page.iter().map(|s| s.line.as_deref()).collect();
+        assert_eq!(kept, vec![None, Some(stored_lines[1].as_str()), Some(stored_lines[2].as_str()), None]);
+        // A stored line served as it is reads back as the record it was read as.
+        for (stored, line) in page.iter().zip(&stored_lines) {
+            let value: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(record_from_value(&value), Some(stored.record.clone()));
+        }
+        assert_eq!(record_from_value(&serde_json::json!({"kind": "user_message"})), None);
+        // The weave behaves as if neither were there.
+        let without: Vec<Record> = records.iter().filter(|r| r.event != Event::Unknown).cloned().collect();
+        assert_eq!(without.len(), 2);
+        assert_eq!(crate::weave::weave(&records), crate::weave::weave(&without));
     }
 
     /// A chain-correct line built by hand: `body` is the JSON after `prev`, e.g. `"kind":"user_message",...`.

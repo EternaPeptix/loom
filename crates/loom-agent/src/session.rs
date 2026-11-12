@@ -30,8 +30,9 @@
 //!   specs of the session's registry (`rtools::build_registry(&deps.shared)`, in registry order).
 //!   When `assignment` is `Some((parent, text))`, the second record is
 //!   `harness_note{Assignment, text}` authored `Agent(parent)`.
-//! - `fork`: `loom_core::log::fork_file(parent_log, <own log path>, upto_seq, …)`, then appends
-//!   `Event::Forked(forked)` (author `Agent(forked.parent)`).
+//! - `fork`: `loom_core::log::fork_file(parent_log, <own log path>, upto_seq, …)`, whose checked copy
+//!   gives the session its records, then appends `Event::Forked(forked)` (author `Agent(forked.parent)`).
+//!   A parent prefix that is not a sound chain fails the fork with the copy's sentence and no log.
 //! - `open`: opens the existing log. If the log reports damage, appends
 //!   `interrupted{reason: "the session log was damaged and was cut back to its last good record
 //!   ({detail})"}`. If the own records contain a `turn_start` with no later `turn_end` and no
@@ -445,7 +446,7 @@ use loom_core::event::{
 };
 use loom_core::ids::{new_item_id, new_request_id, CallId, SessionId};
 use loom_core::ledger::{BriefOpts, LedgerOp, LedgerState};
-use loom_core::log::{fork_file, read_records, Durability, SessionLog};
+use loom_core::log::{fork_file, Durability, SessionLog};
 use loom_core::message::Message;
 use loom_core::{now_ms, BlobRef};
 use loom_core::prefix::{stable_hash, PrefixCheck, PrefixGuard};
@@ -1402,8 +1403,7 @@ impl Session {
     pub fn fork(deps: Deps, parent_log: &Path, upto_seq: Seq, forked: Forked) -> Result<Session, String> {
         let registry = Session::prepare(&deps)?;
         let path = deps.paths.session_log(&deps.shared.session);
-        let log = fork_file(parent_log, &path, upto_seq, Durability::Always).map_err(|e| e.to_string())?;
-        let records = read_records(&path).map_err(|e| e.to_string())?.records;
+        let (log, records) = fork_file(parent_log, &path, upto_seq, Durability::Always).map_err(|e| e.to_string())?;
         let mut session = Session::bare(deps, log, records, registry);
         let parent = forked.parent.clone();
         session.append(Author::Agent(parent), Event::Forked(forked)).map_err(|e| e.0)?;
@@ -3123,6 +3123,10 @@ mod tests {
         }
 
         fn fork(&mut self, parent_log: &Path, upto: Seq, budget: Budget) -> Session {
+            self.try_fork(parent_log, upto, budget).unwrap()
+        }
+
+        fn try_fork(&mut self, parent_log: &Path, upto: Seq, budget: Budget) -> Result<Session, String> {
             let forked = Forked {
                 session: SessionId::from("s-test"),
                 parent: SessionId::from("s-lead"),
@@ -3136,7 +3140,7 @@ mod tests {
                 title: "kid".into(),
             };
             let deps = self.deps();
-            Session::fork(deps, parent_log, upto, forked).unwrap()
+            Session::fork(deps, parent_log, upto, forked)
         }
 
         fn log_path(&self) -> std::path::PathBuf {
@@ -4242,6 +4246,22 @@ mod tests {
         assert_eq!(count(&rs, "model_request"), 3);
         assert_eq!(turn_ends(&rs).last(), Some(&TurnEndReason::BudgetExhausted));
         assert!(matches!(rs.last().unwrap().event, Event::SessionEnd { outcome: SessionOutcome::BudgetExhausted, .. }));
+    }
+
+    #[tokio::test]
+    async fn a_fork_from_a_parent_whose_prefix_does_not_chain_is_refused_and_leaves_no_log() {
+        let (_parent, path, upto) = parent_log().await;
+        // The parent's message altered in place: the record after it no longer chains to it.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let altered = text.replacen("parent task", "parent tasK", 1);
+        assert_ne!(altered, text);
+        std::fs::write(&path, altered).unwrap();
+        let mut kid = Fx::new("worker", true, true, seq(vec![finish_call("found it").into()])).await;
+        let Err(e) = kid.try_fork(&path, upto, Budget::default()) else { panic!("the fork went through") };
+        assert!(e.contains("cannot be forked") && e.contains("does not chain to the record before it"), "{e}");
+        assert!(e.contains("Start the agent with mode `fresh`"), "{e}");
+        assert!(!kid.log_path().exists());
+        assert!(kid.sink.records().is_empty());
     }
 
     #[tokio::test]

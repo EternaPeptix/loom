@@ -42,7 +42,7 @@
 //! | `GET /sessions?archived=true` | `runtime.sessions(archived)` (default false) | `[SessionInfo]` |
 //! | `POST /sessions` (`NewSession`) | `runtime.create_session` | `201` `SessionInfo` |
 //! | `GET /sessions/{id}` | the session and its children (sessions whose `parent` is it) | `SessionDetail` |
-//! | `GET /sessions/{id}/records?after={seq}&limit={n}` | `runtime.records` (`limit` default 500, at most 2000) | `RecordsPage` (`next_after` = last seq of the page when the page is full, else `null`) |
+//! | `GET /sessions/{id}/records?after={seq}&limit={n}` | `runtime.stored_records` (`limit` default 500, at most 2000) | `RecordsPage` (`next_after` = last seq of the page when the page is full, else `null`); a record that comes with its stored line (read as `Event::Unknown`) is that line, verbatim |
 //! | `GET /sessions/{id}/stream?after={seq}` | see *Streams* | SSE |
 //! | `POST /sessions/{id}/messages` (`MessageBody`) | `runtime.send_message` | `202` `{}` |
 //! | `POST /sessions/{id}/rules` (`RuleBody`) | `runtime.add_rule` (a child's id goes to its lead) | `202` `RuleReceipt` (`queued`: the lead is in a turn and records it at its next step) |
@@ -82,6 +82,11 @@
 //!   subscribe to the bus **before** reading the log, read the log in pages until a page is not
 //!   full, remember the last seq sent, and drop live records at or below it. Record events carry
 //!   `id: {seq}`. The stream starts with one `Status` event holding the session's current status.
+//!   The log is read with `runtime.stored_records`, and a replayed record that comes with its stored
+//!   line is sent with that line as its `record`, as the records route serves it. (Live records are
+//!   records this build has just written, which it always reads in full.)
+//! - A carriage return in a data line (whitespace between the tokens of a stored line) is sent as a
+//!   space: an SSE line cannot hold one.
 //! - A subscriber that falls behind (`RecvError::Lagged(n)`) is sent `{"type": "lagged", "missed":
 //!   n}` and the stream goes on. A stream ends when the client goes away or the daemon shuts down.
 //!
@@ -103,6 +108,9 @@
 //! - `stream`: replays from the start, then delivers a record appended after the stream opened;
 //!   `after` and `Last-Event-ID` skip what was seen; no duplicate around the replay/live boundary
 //!   (send a message while the replay is being read);
+//! - a record of a kind this build does not know and an opaque one, with extra fields and a carriage
+//!   return between tokens, are served by the records route (byte for byte, readable as a
+//!   `RecordsPage`) and by the stream replay with every field, and leave the window unchanged;
 //! - `events` without and with `deltas`;
 //! - message / stop / resume / archive / answer round trips, and their refusals as 409 with the
 //!   runtime's sentence; unknown session and unknown handle as 404; a bad body as 400;
@@ -112,8 +120,8 @@
 use crate::auth;
 use crate::ui;
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, RecordsPage,
-    RuleBody, SessionDetail, StatusView, WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, RuleBody,
+    SessionDetail, StatusView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -127,9 +135,12 @@ use axum::{Json, Router};
 use loom_agent::runtime::{BusEvent, NewSession, Runtime, SessionInfo};
 use loom_agent::session::Phase;
 use loom_core::event::Seq;
-use loom_core::{BlobRef, MissionId, SessionId};
+use loom_core::log::StoredRecord;
+use loom_core::{BlobRef, MissionId, Record, SessionId};
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::json;
+use serde_json::value::RawValue;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -575,15 +586,44 @@ async fn session_detail(State(s): State<ApiState>, Path(id): Path<String>) -> Re
     Ok(Json(SessionDetail { info, children }))
 }
 
-async fn records(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery) -> Res<Json<RecordsPage>> {
+/// A record as the records route serves it: re-encoded from what this build read, or, for one read as
+/// `Event::Unknown` (a kind this build does not know, or an opaque record), its line as stored, so that
+/// every field reaches the client.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Served {
+    Read(Box<Record>),
+    Stored(Box<RawValue>),
+}
+
+/// `GET /api/sessions/{id}/records`: the shape of `RecordsPage`, each record as [`Served`].
+#[derive(Serialize)]
+struct ServedPage {
+    records: Vec<Served>,
+    next_after: Option<Seq>,
+}
+
+/// The stored line of a record read as `Event::Unknown`, as JSON to send as it is.
+fn stored_json(stored: &mut StoredRecord) -> Option<Box<RawValue>> {
+    stored.line.take().and_then(|line| RawValue::from_string(line).ok())
+}
+
+fn served(mut stored: StoredRecord) -> Served {
+    match stored_json(&mut stored) {
+        Some(line) => Served::Stored(line),
+        None => Served::Read(Box::new(stored.record)),
+    }
+}
+
+async fn records(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery) -> Res<Json<ServedPage>> {
     let q = params(q)?;
     let after = number(&q, "after")?;
     let limit = clamp_limit(number(&q, "limit")?, RECORDS_DEFAULT, RECORDS_MAX);
     // The log is read from disk; keep that off the async workers.
     let runtime = s.runtime.clone();
-    let records = blocking(move || runtime.records(&SessionId::from(id), after, limit).map_err(rt_err)).await?;
-    let next_after = if records.len() >= limit { records.last().map(|r| r.seq) } else { None };
-    Ok(Json(RecordsPage { records, next_after }))
+    let records = blocking(move || runtime.stored_records(&SessionId::from(id), after, limit).map_err(rt_err)).await?;
+    let next_after = if records.len() >= limit { records.last().map(|r| r.record.seq) } else { None };
+    Ok(Json(ServedPage { records: records.into_iter().map(served).collect(), next_after }))
 }
 
 async fn message(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
@@ -723,19 +763,47 @@ async fn blob_lines(State(s): State<ApiState>, Path(handle): Path<String>, q: Ra
 // ---------------------------------------------------------------------------------------------
 // Streams
 
+/// An SSE event whose data line is `data`. JSON allows a carriage return only as whitespace between
+/// tokens (a stored line may hold one) and an SSE line cannot hold one, so it is sent as a space.
+fn frame(data: String) -> Event {
+    let data = if data.contains('\r') { data.replace('\r', " ") } else { data };
+    Event::default().data(data)
+}
+
 /// One bus event as an SSE event; records carry their seq as the event id.
 fn sse_event(event: &BusEvent) -> Option<Event> {
-    let data = serde_json::to_string(event).ok()?;
-    let out = Event::default().data(data);
+    let out = frame(serde_json::to_string(event).ok()?);
     Some(match event {
         BusEvent::Record { record, .. } => out.id(record.seq.to_string()),
         _ => out,
     })
 }
 
+/// A `record` bus event whose record is a stored line, framed as [`sse_event`] frames a record.
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "record")]
+struct StoredRecordEvent<'a> {
+    session: &'a SessionId,
+    record: &'a RawValue,
+}
+
+/// A replayed record as an SSE event: a record read as `Event::Unknown` is sent as its stored line.
+fn replayed_event(session: &SessionId, mut stored: StoredRecord) -> Option<Event> {
+    let Some(line) = stored_json(&mut stored) else {
+        return sse_event(&BusEvent::Record { session: session.clone(), record: Box::new(stored.record) });
+    };
+    let data = serde_json::to_string(&StoredRecordEvent { session, record: &line }).ok()?;
+    Some(frame(data).id(stored.record.seq.to_string()))
+}
+
 /// Queue `event`; false when the client has gone.
 async fn push(tx: &mpsc::Sender<Event>, event: &BusEvent) -> bool {
-    match sse_event(event) {
+    send(tx, sse_event(event)).await
+}
+
+/// Queue `event` when there is one; false when the client has gone.
+async fn send(tx: &mpsc::Sender<Event>, event: Option<Event>) -> bool {
+    match event {
         Some(e) => tx.send(e).await.is_ok(),
         None => true,
     }
@@ -813,7 +881,7 @@ async fn replay(runtime: &Runtime, id: &SessionId, after: &mut Option<Seq>, tx: 
     loop {
         let page = {
             let (runtime, sid, from) = (runtime.clone(), id.clone(), *after);
-            match tokio::task::spawn_blocking(move || runtime.records(&sid, from, REPLAY_PAGE)).await {
+            match tokio::task::spawn_blocking(move || runtime.stored_records(&sid, from, REPLAY_PAGE)).await {
                 Ok(Ok(page)) => page,
                 Ok(Err(message)) => {
                     let _ = push(tx, &BusEvent::Error { session: Some(id.clone()), message }).await;
@@ -823,10 +891,9 @@ async fn replay(runtime: &Runtime, id: &SessionId, after: &mut Option<Seq>, tx: 
             }
         };
         let full = page.len() >= REPLAY_PAGE;
-        for record in page {
-            *after = Some(record.seq);
-            let event = BusEvent::Record { session: id.clone(), record: Box::new(record) };
-            if !push(tx, &event).await {
+        for stored in page {
+            *after = Some(stored.record.seq);
+            if !send(tx, replayed_event(id, stored)).await {
                 return false;
             }
         }
@@ -1846,6 +1913,81 @@ mod tests {
         let all: Vec<u64> = log_seqs.iter().chain(live_seqs.iter()).copied().collect();
         let full_seqs: Vec<u64> = full.iter().map(|r| r["seq"].as_u64().unwrap()).collect();
         assert_eq!(all, full_seqs[..all.len()]);
+    }
+
+    #[tokio::test]
+    async fn records_this_build_cannot_read_in_full_are_served_as_stored() {
+        use std::io::Write;
+        let e = env(Script::new(|_, _| finish("all good"))).await;
+        let id = e.create("first").await;
+        e.wait_turn_ends(&id, 1).await;
+        // Once the session is idle (it writes nothing more until it is given input), add two lines a newer
+        // loom could have written, chained to the last line of the file.
+        let end = tokio::time::Instant::now() + WAIT;
+        loop {
+            let (_, detail) = e.get(&format!("/api/sessions/{id}")).await;
+            if detail["status"]["phase"] == "idle" {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < end, "timed out waiting for the session to be idle");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let before = e.records(&id).await;
+        let (_, window) = e.get(&format!("/api/sessions/{id}/window")).await;
+        let path = e.dir.path().join("home/sessions").join(&id).join("log.jsonl");
+        let bytes = std::fs::read(&path).unwrap();
+        let tip = bytes[..bytes.len() - 1].rsplit(|b| *b == b'\n').next().unwrap();
+        let n = bytes.iter().filter(|b| **b == b'\n').count() as u64;
+        assert_eq!(n, before.len() as u64, "the records route serves every line of the file");
+        // A kind this build does not know, with spaces and a carriage return between its tokens, and
+        // a known kind holding a value this build does not know (an opaque record).
+        let unknown = format!(
+            "{{\"seq\":{n},\"ts_ms\":7,\"author\":\"harness\",\"prev\":\"{}\",\"kind\":\"from_the_future\", \
+             \"x\": [1, 2],\r\"y\":{{\"z\":\"w\"}}}}",
+            loom_core::sha256_hex(tip)
+        );
+        let opaque = format!(
+            "{{\"seq\":{},\"ts_ms\":8,\"author\":\"harness\",\"prev\":\"{}\",\"kind\":\"harness_note\",\
+             \"note\":\"from_a_newer_loom\",\"text\":\"x\"}}",
+            n + 1,
+            loom_core::sha256_hex(unknown.as_bytes())
+        );
+        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(format!("{unknown}\n{opaque}\n").as_bytes()).unwrap();
+        drop(file);
+        fn stored(line: &str) -> Value {
+            serde_json::from_str(line).unwrap()
+        }
+
+        // The page: the records before as they were, then both lines with every field.
+        let records = e.records(&id).await;
+        assert_eq!(records.len() as u64, n + 2);
+        assert_eq!(records[..before.len()], before[..]);
+        assert_eq!(records[before.len()], stored(&unknown));
+        assert_eq!(records[before.len() + 1], stored(&opaque));
+        // Byte for byte, and the `loom` command reads such a page.
+        let path = format!("/api/sessions/{id}/records?after={}", n - 1);
+        let body = e.rq(Method::GET, &path).send().await.unwrap().text().await.unwrap();
+        assert!(body.contains(&unknown) && body.contains(&opaque), "{body}");
+        let page: crate::wire::RecordsPage = serde_json::from_str(&body).unwrap();
+        let read: Vec<(u64, &loom_core::Event)> = page.records.iter().map(|r| (r.seq, &r.event)).collect();
+        assert_eq!(read, vec![(n, &loom_core::Event::Unknown), (n + 1, &loom_core::Event::Unknown)]);
+
+        // The replay sends the same records.
+        let mut stream = e.sse(&format!("/api/sessions/{id}/stream?after={}", n - 1), &[]).await;
+        assert_eq!(stream.next().await.unwrap().1["type"], "status");
+        for line in [unknown.as_str(), opaque.as_str()] {
+            let (event_id, ev) = stream.next().await.unwrap();
+            assert_eq!((&ev["type"], &ev["session"]), (&json!("record"), &json!(id)), "{ev}");
+            assert_eq!(ev["record"], stored(line));
+            assert_eq!(event_id, Some(stored(line)["seq"].to_string()));
+        }
+
+        // The weave does not see them.
+        let (_, now) = e.get(&format!("/api/sessions/{id}/window")).await;
+        for key in ["epoch", "items", "est_tokens"] {
+            assert_eq!(now[key], window[key], "{key}");
+        }
     }
 
     #[tokio::test]
