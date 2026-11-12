@@ -29,6 +29,42 @@ pub fn cut(s: &str, max: usize) -> String {
     format!("{kept}…[+{} chars]", total.saturating_sub(max))
 }
 
+/// Longest part of a malformed call's arguments shown back to the model.
+pub const MALFORMED_ARGS_CHARS: usize = 600;
+
+/// A tool call whose arguments are not a JSON object was not run: the parser's error (with its
+/// position) or what the arguments hold instead, and what was received.
+pub fn malformed_call(name: &str, arguments: &str) -> String {
+    let error = match serde_json::from_str::<serde_json::Value>(arguments) {
+        Err(e) => e.to_string(),
+        Ok(v) => {
+            let kind = match v {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "a boolean",
+                serde_json::Value::Number(_) => "a number",
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Array(_) => "an array",
+                serde_json::Value::Object(_) => "an object",
+            };
+            format!("they are valid JSON but hold {kind}, not an object")
+        }
+    };
+    format!(
+        "Your call to `{name}` was not run: its arguments are not a valid JSON object ({error}).\nWhat was received:\n{}\nThe call was left out of the conversation. Send the call again with a JSON object as its arguments.",
+        cut(arguments, MALFORMED_ARGS_CHARS)
+    )
+}
+
+/// Why a session gave up: `n` replies in a row made no progress, the last with only malformed calls.
+pub fn repeated_malformed(n: u32) -> String {
+    format!("The model's replies made no progress {n} times in a row; the last one held only tool calls whose arguments were not valid JSON objects, so none of them could be run.")
+}
+
+/// Why a session gave up: `n` replies in a row made no progress, the last cut off by the output limit.
+pub fn repeated_cut(n: u32) -> String {
+    format!("The model's replies made no progress {n} times in a row; the last one reached the output limit without completing a tool call.")
+}
+
 /// The reply reached the output limit. `dropped_call` names the tool whose call was cut off, if any;
 /// `ran` is how many complete calls of the same reply were run.
 pub fn output_cut(completion_tokens: u64, dropped_call: Option<&str>, ran: usize) -> String {
@@ -162,6 +198,17 @@ pub fn inbox_answer(item_text: &str, answer: &str) -> String {
     format!("[The operator's answer to: {}]\n{answer}", cut(&one_line(item_text), 240))
 }
 
+/// The ledger answer of a question the operator dismissed without answering.
+pub const DISMISSED_ANSWER: &str = "(dismissed by the operator without an answer)";
+
+/// Note for the model when the operator dismissed its question without answering it.
+pub fn question_dismissed(item_text: &str) -> String {
+    format!(
+        "The operator dismissed your question without answering it: {}\nNo answer will come. Carry on with what you know, or ask again if the work cannot go on without one.",
+        cut(&one_line(item_text), 240)
+    )
+}
+
 /// The assignment's budget is used up; the child gets [`BUDGET_GRACE_STEPS`] more steps.
 pub fn budget_reached(steps: u32, minutes: u64, can_finish: bool) -> String {
     let deliver = if can_finish {
@@ -172,6 +219,19 @@ pub fn budget_reached(steps: u32, minutes: u64, can_finish: bool) -> String {
     format!(
         "The budget for this assignment is used up ({steps} steps, {minutes} min). {deliver} You have {BUDGET_GRACE_STEPS} more steps; after that the assignment ends without a result."
     )
+}
+
+/// The operator restarted a root session whose budget was used up: it has a fresh one of the
+/// configured size.
+pub fn budget_renewed(max_steps: Option<u32>, max_minutes: Option<u32>) -> String {
+    let steps = |s: u32| format!("{s} step{}", if s == 1 { "" } else { "s" });
+    let size = match (max_steps.filter(|n| *n > 0), max_minutes.filter(|n| *n > 0)) {
+        (Some(s), Some(m)) => format!("{} and {m} min", steps(s)),
+        (Some(s), None) => steps(s),
+        (None, Some(m)) => format!("{m} min"),
+        (None, None) => "no limit".to_string(),
+    };
+    format!("The operator has given this session a fresh budget ({size}), counted from now. The earlier note that the budget was used up no longer applies: carry on with the work.")
 }
 
 /// Report delivered to the parent for a child that used its budget without delivering.
@@ -412,6 +472,18 @@ mod tests {
     }
 
     #[test]
+    fn malformed_call_gives_the_parser_error_and_what_was_received() {
+        let a = malformed_call("bash", "{\"command\": \"ls");
+        assert!(a.starts_with("Your call to `bash` was not run: its arguments are not a valid JSON object (EOF while parsing"), "{a}");
+        assert!(a.contains(" at line 1 column ") && a.contains(").\nWhat was received:\n{\"command\": \"ls\n"), "{a}");
+        assert!(a.ends_with("Send the call again with a JSON object as its arguments."));
+        assert!(malformed_call("edit", "[1]").contains("(they are valid JSON but hold an array, not an object)"));
+        assert!(malformed_call("edit", "null").contains("hold null, not an object"));
+        let long = malformed_call("write", &"é".repeat(MALFORMED_ARGS_CHARS + 5));
+        assert!(long.contains(&format!("{}…[+5 chars]\n", "é".repeat(MALFORMED_ARGS_CHARS))));
+    }
+
+    #[test]
     fn job_arrival_forms() {
         let a = job_arrival("j1", "make test", "exit 2", "", Some("out:abc"), 120, "last line");
         assert!(a.starts_with("Background job j1 ended: exit 2.\nCommand: make test\n"));
@@ -433,6 +505,10 @@ mod tests {
         assert!(gave_up_report(3, "I think it is fine").ends_with("Its last message:\nI think it is fine"));
         assert!(failed_report("The model server refused the request.", " x ").contains("refused the request.\nIts last message:\nx"));
         assert_eq!(stopped_report(4), "The agent was stopped after 4 steps and delivered no result.");
+        assert!(budget_renewed(Some(40), Some(30)).contains("a fresh budget (40 steps and 30 min), counted from now"));
+        assert!(budget_renewed(Some(40), Some(0)).contains("(40 steps)"));
+        assert!(budget_renewed(Some(1), None).contains("(1 step)"));
+        assert!(budget_renewed(None, Some(30)).contains("(30 min)"));
     }
 
     #[test]
@@ -483,6 +559,7 @@ mod tests {
     #[test]
     fn answers_and_words() {
         assert_eq!(inbox_answer("Which\nbranch?", "main"), "[The operator's answer to: Which branch?]\nmain");
+        assert!(question_dismissed("Which\nbranch?").starts_with("The operator dismissed your question without answering it: Which branch?\nNo answer will come."));
         assert_eq!(outcome_word(ChildOutcome::BudgetExhausted), "budget_exhausted");
         assert_eq!(not_in_assignment("write", "verifier", &["read".into(), "grep".into()]),
             "`write` is not available in this assignment (role `verifier`). Nothing was executed. Available here: read, grep.");

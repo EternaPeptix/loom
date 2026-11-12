@@ -1277,9 +1277,17 @@ mod tests {
         assert_eq!(inbox[0]["session"], id.as_str());
         let (s, b) = e.post(&format!("/api/inbox/{item}"), json!({"answer": ""})).await;
         assert_eq!((s, b), (202, json!({})));
-        // The answer starts another turn, which finishes with a new item; the old one is gone.
+        // An empty answer to a finished item only dismisses it: no turn starts. The message behind it
+        // starts the fourth turn; a turn started by the dismissal would carry the `inbox_answer` trigger.
+        let (s, _) = e.post(&format!("/api/sessions/{id}/messages"), json!({"text": "third"})).await;
+        assert_eq!(s, 202);
         e.wait_turn_ends(&id, 4).await;
         assert!(e.rt.inbox().iter().all(|i| i.item.item_id != item));
+        let records = e.records(&id).await;
+        let starts = records.iter().filter(|r| r["kind"] == "turn_start");
+        let triggers: Vec<&Value> = starts.map(|r| &r["trigger"]).collect();
+        assert!(triggers.iter().all(|t| **t != "inbox_answer"), "{triggers:?}");
+        assert_eq!(triggers.last().copied(), Some(&json!("user")));
         let (s, b) = e.post("/api/inbox/i-nope", json!({"answer": "x"})).await;
         assert_eq!((s, b["error"].as_str().unwrap()), (404, "There is no open inbox item i-nope."));
     }

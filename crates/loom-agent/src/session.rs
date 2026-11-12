@@ -67,10 +67,14 @@
 //!   (`shared.take_emitted()`); a failure is logged with `tracing::warn!` and otherwise ignored.
 //!   Start a turn (`Trigger::User`).
 //! - `Input::Answer{item_id, answer}`: if no open inbox item of this session has that id, ignore.
-//!   Otherwise append `inbox_resolved{item_id, answer}`; when the item has a `reference` and the
-//!   session has a journal, `shared.ledger_append(true, QuestionAnswer{id: reference, answer})` and
-//!   append what it queued (failure: warn, ignore); append
-//!   `user_message{texts::inbox_answer(item.text, answer)}`; start a turn (`Trigger::InboxAnswer`).
+//!   Otherwise append `inbox_resolved{item_id, answer}`; when the item is a `Question` or `Blocker`
+//!   with a `reference` and the session has a journal, `shared.ledger_append(true,
+//!   QuestionAnswer{id: reference, answer})` and append what it queued (failure: warn, ignore); the
+//!   references of other kinds are not question ids. A blank answer to a non-blocking item is a
+//!   dismissal: the ledger answer is `texts::DISMISSED_ANSWER`, a dismissed `Question` or `Blocker`
+//!   gets `harness_note{Arrival, texts::question_dismissed(item.text)}`, and nothing else happens: no
+//!   user message, no turn. Any other answer: append `user_message{texts::inbox_answer(item.text,
+//!   answer)}`; start a turn (`Trigger::InboxAnswer`).
 //! - `Input::Constraint(text)`: a standing rule from the operator. Blank text is ignored. With a
 //!   journal, `shared.ledger_append(true, ConstraintAdd{text})` and append what it queued (failure:
 //!   warn, carry on without an id). Append `harness_note{Constraint, texts::constraint(id, text)}`
@@ -98,8 +102,13 @@
 //!   authored `Agent(from)`. Start a turn (`Trigger::Resume`) only if the last turn ended `Waiting`.
 //! - `Input::Resume`: start a turn (`Trigger::Resume`).
 //! - `Input::Reweave`: run the re-weave procedure with reason `operator` (forced). No turn.
-//! - `Input::Stop`: `jobs.kill_all`, `orch.stop_children(session)`. If any job or child was running,
-//!   append `interrupted{REASON_OPERATOR}`. No turn.
+//! - `Input::Stop`: a child appends `interrupted{REASON_PARENT}`, kills its jobs, stops its children
+//!   and settles `Stopped` with `texts::stopped_report(step)`, so its parent is not left waiting.
+//!   Anything else: `jobs.kill_all`, `orch.stop_children(session)`. When the last turn ended `Waiting`
+//!   or `Yielded`, append `interrupted{REASON_OPERATOR}` and `turn_end{Stopped}`: the stop is sticky,
+//!   so the settlements and job ends it causes are recorded without starting a turn, and only a user
+//!   message, an inbox answer or `Resume` runs the session again. Otherwise append
+//!   `interrupted{REASON_OPERATOR}` only if a job or child was running. No turn.
 //!
 //! ## A turn
 //! Install a fresh cancellation token (`Control::begin_turn`); append `turn_start{trigger}`. If the
@@ -127,11 +136,17 @@
 //!    published at the turn's end (`status.json` keeps `Running`, which is what makes the next
 //!    start activate the session). A turn started after that call is cancelled from birth.
 //! 2. **Arrivals.** Drain, without waiting, everything queued in `deps.job_events` and in the
-//!    inputs channel, handling each as under *Idle* except that nothing starts a turn, `Resume` and
-//!    `Stop` are ignored, and `Reweave` sets a flag that forces the re-weave in point 4. An arrival
-//!    that appended a `user_message` resets the nudge count.
+//!    inputs channel, handling each as under *Idle* except that nothing starts a turn, `Resume` is
+//!    ignored, and `Reweave` sets a flag that forces the re-weave in point 4. A `Stop` (one that
+//!    arrived while a trigger was queued or between turns) cancels the turn's token and ends the
+//!    draining: what was sent after it stays queued for the idle loop, after the turn has ended
+//!    `Stopped` (point 1). An arrival that appended a `user_message` resets the nudge count.
 //! 3. **Budget** (only when the session's budget has a non-zero `max_steps` or `max_minutes`; own
-//!    steps and minutes since `started_ms`): when either is reached and no `Budget` note has been
+//!    steps and minutes since `started_ms`, except that a turn the operator starts (`User`,
+//!    `InboxAnswer`, `Resume`) after a turn that ended `BudgetExhausted` gets a fresh budget of the
+//!    configured size: the count starts at its `turn_start`, the earlier `Budget` note no longer
+//!    counts, and the turn begins with `harness_note{Info, texts::budget_renewed(max_steps,
+//!    max_minutes)}`): when either is reached and no `Budget` note has been
 //!    given, append `harness_note{Budget, texts::budget_reached(step, minutes, can_finish)}`
 //!    (`can_finish` = the registry has `finish`). When the note was given and `BUDGET_GRACE_STEPS`
 //!    steps have run since, the child settles `BudgetExhausted` with
@@ -159,8 +174,8 @@
 //!    `client.complete`, forwarding every `StreamEvent` to `Sink::delta(session, req_id, …)` as it
 //!    arrives.
 //!    - `Err(Cancelled)`: point 1.
-//!    - `Err(ContextOverflow)`: once per step, run the re-weave procedure forced with reason
-//!      `overflow`; if it appended a `reweave`, go back to the start of this point (new weave, new
+//!    - `Err(ContextOverflow{limit, ..})`: once per step, run the re-weave procedure forced with reason
+//!      `overflow` and that `limit`; if it appended a `reweave`, go back to the start of this point (new weave, new
 //!      `model_request`). Otherwise *fail* with `texts::OVERFLOW_UNFOLDABLE`.
 //!    - any other error: *fail* with `texts::sentence(&error.to_string())`.
 //!    - `Ok(c)`: calibrate the estimator with the characters sent (every message's `chars()`
@@ -174,9 +189,19 @@
 //!    ends `Error`.
 //! 7. **Reply handling.**
 //!    - `finish` `Error` or `Aborted`: *fail* with `The model server ended the reply with an error.`
-//!    - Run the complete tool calls in order (below). If the turn ended there, stop.
-//!    - `finish == Length`: append `harness_note{OutputCut, texts::output_cut(completion_tokens,
-//!      name of the first incomplete call if any, number of calls run)}` and go to the next step.
+//!    - Run the complete tool calls in order (below). Then, unless `finish == Length`, the calls that
+//!      have a name but are not complete (their arguments are not a JSON object) get one
+//!      `harness_note{Nudge, …}` made of `texts::malformed_call(name, arguments)` for each: they are
+//!      not run, and with no `tool_call` record they are not replayed to the server. If the turn
+//!      ended there, stop.
+//!    - `finish == Length`: when no call was complete, the reply counts as a nudge, and one past
+//!      `agents.max_nudges` gives up with `texts::repeated_cut(n)`. Otherwise append
+//!      `harness_note{OutputCut, texts::output_cut(completion_tokens, name of the first incomplete
+//!      call if any, number of calls run)}` and go to the next step.
+//!    - Malformed calls and no complete one: the reply counts as a nudge, and one past `max_nudges`
+//!      gives up with `texts::repeated_malformed(n)`; otherwise next step. It never reaches the gate.
+//!      *Give up*: a child settles `Failed` with `texts::failed_report(why, reply)`; any other session
+//!      opens an inbox item (`Parked`, blocking, `texts::turn_failed(why)`) and the turn ends `Parked`.
 //!    - No complete tool call (and not `Length`): `gate::on_yield` with the reply text, the
 //!      registry's names, the ledger (when there is a journal), the nudge count,
 //!      `agents.max_nudges`, and the running job and child counts.
@@ -216,10 +241,15 @@
 //!
 //! ## Re-weave procedure (`reason`: `target`, `overflow`, `operator`)
 //! `est` = `estimator.tokens_for_messages(&weave(records).messages)` plus the tokens of the tool
-//! specs' JSON. `limit` = `deps.context.target_tokens`, lowered to `window − reserve` when
-//! `deps.context_window` is known and that is smaller (`reserve` = the profile's
-//! `max_output_tokens` or 16_384, plus 4_096). Not forced and `est <= limit`: nothing to do.
-//! A plan is *enough* when its `after_tokens_est` is at or below the midpoint between `floor_tokens`
+//! specs' JSON. `window` is `deps.context_window`; for an `overflow` re-weave it is the smaller of
+//! that and the limit the server's error stated (the estimate of the refused request when it stated
+//! none), so that a forced re-weave can be planned when the window is unknown or set too large.
+//! `limit` = `deps.context.target_tokens`, lowered (when there is a `window`) to `window − reserve`
+//! (`reserve` = the profile's `max_output_tokens` or 16_384, plus 4_096) and to four fifths of
+//! `window`; the floor used is `floor_tokens` lowered to half of `window`, and to half of `limit`
+//! when it is not below `limit`. For a 1M window the defaults (400k, 180k) are unchanged. Not
+//! forced and `est <= limit`: nothing to do.
+//! A plan is *enough* when its `after_tokens_est` is at or below the midpoint between the floor used
 //! and `limit`.
 //! 1. `plan = plan_reweave(records, estimator, &policy, false)` with `policy = deps.context`. While
 //!    the plan is not enough and `policy.keep_recent_steps` is above `MIN_KEEP_RECENT_STEPS`, halve
@@ -228,7 +258,9 @@
 //!    window, so fewer of them are protected.
 //! 2. Still not enough: `text_plan = plan_reweave(records, estimator, &policy, true)`. Not forced
 //!    and `text_plan` is not enough either: return without a record and without a digest request (see
-//!    "Why a re-weave must be worth it"). Otherwise, when `text_plan` exists, ask for a digest — a
+//!    "Why a re-weave must be worth it"). Otherwise, when `text_plan` exists and the re-weave is not
+//!    for an `overflow` (the server has just refused this prefix, and would refuse a digest request
+//!    on it as well), ask for a digest — a
 //!    request of the current stable messages plus one `user` message `texts::DIGEST_PROMPT`, same
 //!    tools, `max_tokens: DIGEST_MAX_TOKENS`, recorded as `model_request{purpose: Digest, hud: None}`
 //!    only (its reply is not appended as a record). A non-empty reply text is the digest; an error
@@ -483,6 +515,10 @@ struct State {
     ended: Option<SessionOutcome>,
     /// Own steps counted when the `Budget` note was given.
     budget_note_step: Option<u32>,
+    /// Own steps and start time from which a root's budget counts: a turn the operator starts after
+    /// the budget ran out begins a fresh one.
+    budget_step_base: u32,
+    budget_from_ms: Option<u64>,
     inbox: Vec<InboxItem>,
     last_interrupted: Option<String>,
     prompt_tokens: u64,
@@ -526,7 +562,14 @@ impl State {
             Event::HarnessNote { note: NoteKind::Budget, .. } => self.budget_note_step = Some(self.step),
             Event::InboxOpened(item) => self.inbox.push(item.clone()),
             Event::InboxResolved { item_id, .. } => self.inbox.retain(|i| &i.item_id != item_id),
-            Event::TurnStart { .. } => self.has_turn = true,
+            Event::TurnStart { trigger } => {
+                self.has_turn = true;
+                if renews_budget(*trigger, self.last_end) {
+                    self.budget_step_base = self.step;
+                    self.budget_from_ms = Some(rec.ts_ms);
+                    self.budget_note_step = None;
+                }
+            }
             Event::TurnEnd { reason } => self.last_end = Some(*reason),
             Event::SessionEnd { outcome, .. } => self.ended = Some(*outcome),
             Event::Interrupted { reason } => self.last_interrupted = Some(reason.clone()),
@@ -562,6 +605,8 @@ pub struct Session {
     inputs: Option<UnboundedReceiver<Input>>,
     jobs_open: bool,
     token: CancellationToken,
+    /// Replies in a row that made no progress: nudged by the gate, cut off by the output limit with
+    /// no complete call, or with only malformed calls.
     nudges: u32,
     phase: Phase,
     st: State,
@@ -611,6 +656,12 @@ fn count_lines(path: &Path) -> u64 {
         lines = lines.saturating_add(1);
     }
     lines
+}
+
+/// A turn the operator starts after the session's budget ran out comes with a fresh budget.
+fn renews_budget(trigger: Trigger, last_end: Option<TurnEndReason>) -> bool {
+    matches!(trigger, Trigger::User | Trigger::InboxAnswer | Trigger::Resume)
+        && last_end == Some(TurnEndReason::BudgetExhausted)
 }
 
 fn delivery(outcome: ChildOutcome, report: String) -> Delivery {
@@ -909,6 +960,9 @@ impl Session {
                 }
             };
             let trigger = match ev {
+                Ev::Input(Some(Input::Stop)) if self.deps.shared.is_child() => {
+                    return Ok(End::Settled(self.stop_idle_child().await?));
+                }
                 Ev::Input(None) => {
                     self.deps.ctx.jobs.kill_all(self.grace()).await;
                     return Ok(End::Closed);
@@ -933,7 +987,7 @@ impl Session {
             Input::Resume => Ok(Some(Trigger::Resume)),
             Input::Reweave => {
                 let token = self.deps.control.begin_turn();
-                self.reweave("operator", true, &token).await?;
+                self.reweave("operator", true, &token, None).await?;
                 Ok(None)
             }
             Input::Stop => {
@@ -941,13 +995,30 @@ impl Session {
                 let children = !self.running_children().await.is_empty();
                 self.deps.ctx.jobs.kill_all(self.grace()).await;
                 self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
-                if jobs || children {
+                // Stopped stays stopped: what the stop itself causes (a child's settlement, a job's end)
+                // must not wake a session that was waiting, only the operator can. The `interrupted`
+                // record goes with the `Stopped` end, so the next turn's note names this stop.
+                let wakeable = matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
+                if jobs || children || wakeable {
                     self.append(Author::Harness, Event::Interrupted { reason: texts::REASON_OPERATOR.to_string() })?;
+                }
+                if wakeable {
+                    self.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped })?;
+                    self.publish();
                 }
                 Ok(None)
             }
             other => Ok(self.arrival(other).await?.trigger),
         }
+    }
+
+    /// A child that is between turns was stopped: end its jobs and children and settle it `Stopped`, so
+    /// that its parent is not left waiting for it.
+    async fn stop_idle_child(&mut self) -> R<Settlement> {
+        self.append(Author::Harness, Event::Interrupted { reason: texts::REASON_PARENT.to_string() })?;
+        self.deps.ctx.jobs.kill_all(self.grace()).await;
+        self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
+        self.settle(delivery(ChildOutcome::Stopped, texts::stopped_report(self.st.step))).await
     }
 
     /// Record an input that is not a command. Whether it starts a turn is the caller's business.
@@ -963,12 +1034,22 @@ impl Session {
             Input::Answer { item_id, answer } => {
                 let Some(item) = self.st.inbox.iter().find(|i| i.item_id == item_id).cloned() else { return Ok(out) };
                 self.append(Author::User, Event::InboxResolved { item_id, answer: answer.clone() })?;
-                if let (Some(reference), true) = (&item.reference, self.deps.shared.journal.is_some()) {
-                    let op = LedgerOp::QuestionAnswer { id: reference.clone(), answer: answer.clone() };
+                // A blank answer to an item that is not waiting for one dismisses it.
+                let dismissed = answer.trim().is_empty() && !item.blocking;
+                let asked = matches!(item.kind, InboxKind::Question | InboxKind::Blocker);
+                if let (Some(reference), true, true) = (&item.reference, asked, self.deps.shared.journal.is_some()) {
+                    let answer = if dismissed { texts::DISMISSED_ANSWER.to_string() } else { answer.clone() };
+                    let op = LedgerOp::QuestionAnswer { id: reference.clone(), answer };
                     if let Err(e) = self.deps.shared.ledger_append(true, op) {
                         tracing::warn!(session = %self.deps.shared.session, "answer not recorded in the ledger: {e}");
                     }
                     self.flush_emitted()?;
+                }
+                if dismissed {
+                    if asked {
+                        self.note(Author::Harness, NoteKind::Arrival, texts::question_dismissed(&item.text))?;
+                    }
+                    return Ok(out);
                 }
                 self.append(Author::User, Event::UserMessage { text: texts::inbox_answer(&item.text, &answer) })?;
                 out.trigger = Some(Trigger::InboxAnswer);
@@ -1125,6 +1206,7 @@ impl Session {
     async fn turn(&mut self, trigger: Trigger) -> R<Option<Settlement>> {
         self.token = self.deps.control.begin_turn();
         self.nudges = 0;
+        let renewed = renews_budget(trigger, self.st.last_end);
         self.append(Author::Harness, Event::TurnStart { trigger })?;
         // A turn that starts while the harness is going down is cut at once (its token is cancelled
         // from birth): the note belongs to the first turn after the restart.
@@ -1136,6 +1218,10 @@ impl Session {
                 .is_some_and(|r| r == texts::REASON_RESTART || r.starts_with("the session log was damaged"));
             let text = if restarted { texts::AFTER_RESTART } else { texts::AFTER_STOP };
             self.note(Author::Harness, NoteKind::Interrupted, text.to_string())?;
+        }
+        if renewed {
+            let text = texts::budget_renewed(self.st.budget.max_steps, self.st.budget.max_minutes);
+            self.note(Author::Harness, NoteKind::Info, text)?;
         }
         self.phase = Phase::Running;
         self.publish();
@@ -1254,15 +1340,18 @@ impl Session {
             return self.cancelled().await;
         }
         let force = self.drain_arrivals().await?;
+        if self.token.is_cancelled() {
+            return self.cancelled().await;
+        }
         if let Some(flow) = self.check_budget().await? {
             return Ok(flow);
         }
         self.check_stall()?;
         let token = self.token.clone();
         if force {
-            self.reweave("operator", true, &token).await?;
+            self.reweave("operator", true, &token, None).await?;
         } else {
-            self.reweave("target", false, &token).await?;
+            self.reweave("target", false, &token, None).await?;
         }
         if token.is_cancelled() {
             return self.cancelled().await;
@@ -1325,10 +1414,11 @@ impl Session {
                     break (req_id, c, queue_ms, w.tools);
                 }
                 Err(ModelError::Cancelled { .. }) => return self.cancelled().await,
-                Err(ModelError::ContextOverflow { .. }) => {
+                Err(ModelError::ContextOverflow { limit, .. }) => {
                     if !overflowed {
                         overflowed = true;
-                        if self.reweave("overflow", true, &token).await? {
+                        // What the server refused bounds its window, whatever the session was told.
+                        if self.reweave("overflow", true, &token, Some(limit.unwrap_or(est_tokens))).await? {
                             continue;
                         }
                         if token.is_cancelled() {
@@ -1464,7 +1554,12 @@ impl Session {
             let Some(input) = next else { break };
             match input {
                 Input::Reweave => force = true,
-                Input::Resume | Input::Stop => {}
+                Input::Resume => {}
+                // What was sent after the stop is for the idle loop, once this turn has ended `Stopped`.
+                Input::Stop => {
+                    self.token.cancel();
+                    break;
+                }
                 other => {
                     if self.arrival(other).await?.user {
                         self.nudges = 0;
@@ -1481,8 +1576,8 @@ impl Session {
         if max_steps == 0 && max_minutes == 0 {
             return Ok(None);
         }
-        let step = self.st.step;
-        let minutes = now_ms().saturating_sub(self.st.started_ms) / 60_000;
+        let step = self.st.step.saturating_sub(self.st.budget_step_base);
+        let minutes = now_ms().saturating_sub(self.st.budget_from_ms.unwrap_or(self.st.started_ms)) / 60_000;
         let reached = (max_steps > 0 && step >= max_steps) || (max_minutes > 0 && minutes >= u64::from(max_minutes));
         match self.st.budget_note_step {
             None if reached => {
@@ -1490,7 +1585,7 @@ impl Session {
                 self.note(Author::Harness, NoteKind::Budget, texts::budget_reached(step, minutes, can_finish))?;
                 Ok(None)
             }
-            Some(at) if step.saturating_sub(at) >= texts::BUDGET_GRACE_STEPS => {
+            Some(at) if self.st.step.saturating_sub(at) >= texts::BUDGET_GRACE_STEPS => {
                 if self.deps.shared.is_child() {
                     let report = texts::budget_exhausted_report(step, minutes, &self.last_reply());
                     Ok(Some(Flow::Settle(delivery(ChildOutcome::BudgetExhausted, report))))
@@ -1549,13 +1644,30 @@ impl Session {
     }
 
     /// Fold older material out of view when the request has grown past the limit (or `forced`).
+    /// `refused_at` is the window an overflow error stated (or the size of the refused request).
     /// True when a `reweave` record was appended.
-    async fn reweave(&mut self, reason: &str, forced: bool, token: &CancellationToken) -> R<bool> {
+    async fn reweave(
+        &mut self,
+        reason: &str,
+        forced: bool,
+        token: &CancellationToken,
+        refused_at: Option<u64>,
+    ) -> R<bool> {
         let mut policy = self.deps.context.clone();
         let mut limit = policy.target_tokens;
-        if let Some(window) = self.deps.context_window {
+        let window = match (self.deps.context_window, refused_at) {
+            (Some(known), Some(refused)) => Some(known.min(refused)),
+            (known, refused) => known.or(refused),
+        };
+        if let Some(window) = window {
             let reserve = self.deps.client.profile().max_output_tokens.unwrap_or(16_384).saturating_add(4_096);
-            limit = limit.min(window.saturating_sub(reserve));
+            // The trigger stays within four fifths of the window and the floor within half of it, so
+            // that a small window can always be planned for.
+            limit = limit.min(window.saturating_sub(reserve)).min(window / 5 * 4);
+            policy.floor_tokens = policy.floor_tokens.min(window / 2);
+            if policy.floor_tokens >= limit {
+                policy.floor_tokens = limit / 2;
+            }
         }
         if !forced && self.estimate() <= limit {
             return Ok(false);
@@ -1573,11 +1685,15 @@ impl Session {
             if !forced && !enough(&text_plan) {
                 return Ok(false);
             }
-            if text_plan.is_some() {
+            // After an overflow the server has just refused this prefix: a digest request on it would be
+            // refused as well.
+            if text_plan.is_some() && refused_at.is_none() {
                 digest = self.ask_digest(token).await?;
                 if token.is_cancelled() {
                     return Ok(false);
                 }
+            }
+            if text_plan.is_some() {
                 plan = text_plan;
             }
         }
@@ -1648,6 +1764,18 @@ impl Session {
         }
         let complete: Vec<ToolCallRequest> = c.tool_calls.iter().filter(|t| t.complete).cloned().collect();
         let calls = self.run_calls(req_id, &complete, w_tools).await?;
+        // Calls that were not cut off by the limit but whose arguments are not a JSON object are not run
+        // and not replayed (the weave keeps only complete calls). The model is told why, after the
+        // results of the calls that ran and whatever the turn does next.
+        let malformed: Vec<String> = if c.finish == FinishReason::Length {
+            Vec::new()
+        } else {
+            let bad = c.tool_calls.iter().filter(|t| !t.complete && !t.name.is_empty());
+            bad.map(|t| texts::malformed_call(&t.name, &t.arguments)).collect()
+        };
+        if !malformed.is_empty() {
+            self.note(Author::Harness, NoteKind::Nudge, malformed.join("\n\n"))?;
+        }
         match calls.effect {
             Some(Effect::EndTurn(reason)) => return Ok(Flow::End(reason)),
             Some(Effect::Settle(d)) => return Ok(Flow::Settle(d)),
@@ -1657,10 +1785,18 @@ impl Session {
             return self.cancelled().await;
         }
         if c.finish == FinishReason::Length {
+            if complete.is_empty() {
+                if let Some(flow) = self.give_up_if_stuck(texts::repeated_cut, &c.text)? {
+                    return Ok(flow);
+                }
+            }
             let dropped = c.tool_calls.iter().find(|t| !t.complete).map(|t| t.name.as_str());
             let text = texts::output_cut(c.usage.completion_tokens, dropped, calls.ran);
             self.note(Author::Harness, NoteKind::OutputCut, text)?;
             return Ok(Flow::Next);
+        }
+        if !malformed.is_empty() && complete.is_empty() {
+            return Ok(self.give_up_if_stuck(texts::repeated_malformed, &c.text)?.unwrap_or(Flow::Next));
         }
         if !complete.is_empty() {
             return Ok(Flow::Next);
@@ -1697,6 +1833,23 @@ impl Session {
                     Ok(Flow::End(TurnEndReason::Parked))
                 }
             }
+        }
+    }
+
+    /// Count a reply that made no progress as a nudge. Past `agents.max_nudges` of them in a row the
+    /// session gives up: a child settles `Failed`, anything else opens a `Parked` item. `why` names the
+    /// cause.
+    fn give_up_if_stuck(&mut self, why: fn(u32) -> String, reply: &str) -> R<Option<Flow>> {
+        if self.nudges < self.deps.agents.max_nudges {
+            self.nudges = self.nudges.saturating_add(1);
+            return Ok(None);
+        }
+        let why = why(self.nudges.saturating_add(1));
+        if self.deps.shared.is_child() {
+            Ok(Some(Flow::Settle(delivery(ChildOutcome::Failed, texts::failed_report(&why, reply)))))
+        } else {
+            self.open_inbox(InboxKind::Parked, texts::turn_failed(&why))?;
+            Ok(Some(Flow::End(TurnEndReason::Parked)))
         }
     }
 
@@ -2237,6 +2390,27 @@ mod tests {
         assert_eq!(asst["tool_calls"].as_array().unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn repeated_output_limit_replies_park_and_progress_resets_the_count() {
+        let agents = AgentsCfg { max_nudges: 2, verify_finish: false, ..AgentsCfg::default() };
+        let cut = || -> Action { Reply::text("rambling").with_finish(FinishReason::Length).into() };
+        let script = seq(vec![cut(), cut(), bash("echo ok").into(), cut(), cut(), cut(), cut()]);
+        let mut fx = Fx::build("lead", false, true, agents.clone(), script).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(fx.server.requests().len(), 6, "{:?}", kinds(&rs));
+        assert_eq!(notes(&rs, NoteKind::OutputCut).len(), 4);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Parked]);
+        assert_eq!(inbox(&rs)[0].text, texts::turn_failed(&texts::repeated_cut(3)));
+
+        let mut kid = Fx::build("worker", true, true, agents, seq((0..5).map(|_| cut()).collect())).await;
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Do it.".into())));
+        let End::Settled(s) = run_with(session, vec![]).await else { panic!("expected a settlement") };
+        assert_eq!(s.outcome, ChildOutcome::Failed);
+        assert!(s.report.contains(&texts::repeated_cut(3)), "{}", s.report);
+    }
+
     // ---- several calls, effects ----------------------------------------------------------------
 
     #[tokio::test]
@@ -2290,6 +2464,111 @@ mod tests {
         let res = results(&rs);
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].status, ToolStatus::Invalid);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_call_is_not_run_not_replayed_and_never_reaches_the_gate() {
+        let bad = "{\"command\": \"ls";
+        let script = seq(vec![Reply::tool("bash", bad).into(), finish_call("done").into()]);
+        let mut fx = Fx::new("lead", false, true, script).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(count(&rs, "tool_call"), 1, "only finish was called: {:?}", kinds(&rs));
+        let n = notes(&rs, NoteKind::Nudge);
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert!(n[0].contains("`bash`") && n[0].contains("not a valid JSON object"), "{}", n[0]);
+        assert!(n[0].contains("EOF while parsing") && n[0].contains("line 1 column"), "{}", n[0]);
+        assert!(n[0].contains(bad) && n[0].contains("Send the call again"), "{}", n[0]);
+        assert!(!n[0].contains("without a tool call"));
+        let reqs = fx.server.requests();
+        assert_eq!(reqs.len(), 2);
+        assert!(all_text(&reqs[1]).contains(&n[0]));
+        for m in reqs[1]["messages"].as_array().unwrap() {
+            assert!(m.get("tool_calls").is_none(), "the malformed call must not be replayed: {m}");
+        }
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Finished]);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_call_beside_a_valid_one_leaves_the_valid_one_running() {
+        let reply = Reply::tools([
+            ("bash", json!({ "command": "echo fine" }).to_string()),
+            ("bash", "[1, 2]".to_string()),
+            ("bash", "{nope".to_string()),
+        ]);
+        let mut fx = Fx::new("chat", false, false, seq(vec![reply.into(), Reply::text("ok").into()])).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(count(&rs, "tool_call"), 1);
+        assert_eq!(results(&rs)[0].status, ToolStatus::Ok);
+        let n = notes(&rs, NoteKind::Nudge);
+        assert_eq!(n.len(), 1);
+        assert!(n[0].contains("hold an array, not an object") && n[0].contains("key must be a string"), "{}", n[0]);
+        let second = &fx.server.requests()[1];
+        let asst = second["messages"].as_array().unwrap().iter().find(|m| m["role"] == "assistant").unwrap().clone();
+        assert_eq!(asst["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_replies_in_a_row_park_a_lead_and_fail_a_child() {
+        let agents = AgentsCfg { max_nudges: 2, verify_finish: false, ..AgentsCfg::default() };
+        let script = || seq((0..5).map(|_| Reply::tool("bash", "{\"command\": ").into()).collect());
+        let mut fx = Fx::build("lead", false, true, agents.clone(), script()).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(fx.server.requests().len(), 3);
+        // Every malformed reply is explained, the last one too, before the session gives up.
+        assert_eq!(notes(&rs, NoteKind::Nudge).len(), 3);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Parked]);
+        let items = inbox(&rs);
+        assert_eq!((items.len(), items[0].kind, items[0].blocking), (1, InboxKind::Parked, true));
+        assert_eq!(items[0].text, texts::turn_failed(&texts::repeated_malformed(3)));
+        assert_eq!(count(&rs, "tool_call"), 0);
+
+        let mut kid = Fx::build("worker", true, true, agents, script()).await;
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Do it.".into())));
+        let End::Settled(s) = run_with(session, vec![]).await else { panic!("expected a settlement") };
+        assert_eq!(s.outcome, ChildOutcome::Failed);
+        assert!(s.report.contains(&texts::repeated_malformed(3)), "{}", s.report);
+    }
+
+    #[tokio::test]
+    async fn malformed_cut_and_text_only_replies_share_one_count() {
+        let agents = AgentsCfg { max_nudges: 2, verify_finish: false, ..AgentsCfg::default() };
+        let script = seq(vec![
+            Reply::tool("bash", "{nope").into(),
+            Reply::text("thinking").into(),
+            Reply::text("rambling").with_finish(FinishReason::Length).into(),
+            Reply::text("never asked").into(),
+        ]);
+        let mut fx = Fx::build("lead", false, true, agents, script).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(fx.server.requests().len(), 3, "{:?}", kinds(&rs));
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Parked]);
+        assert_eq!(inbox(&rs)[0].text, texts::turn_failed(&texts::repeated_cut(3)));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_call_beside_a_turn_ending_one_is_still_explained() {
+        let reply = Reply::tools([("bash", "{nope".to_string()), ("finish", json!({ "answer": "done" }).to_string())]);
+        let mut fx = Fx::new("lead", false, true, seq(vec![reply.into()])).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Finished]);
+        assert_eq!(count(&rs, "tool_call"), 1);
+        let n = notes(&rs, NoteKind::Nudge);
+        assert_eq!(n.len(), 1);
+        assert!(n[0].contains("`bash`") && n[0].contains("Send the call again"), "{}", n[0]);
+        // The note follows the finish call's result and comes before the turn ends.
+        let at = |k: &str| rs.iter().position(|r| kind(r) == k).unwrap();
+        let note = rs.iter().position(|r| matches!(r.event, Event::HarnessNote { note: NoteKind::Nudge, .. })).unwrap();
+        assert!(at("tool_result") < note && note < at("turn_end"), "{:?}", kinds(&rs));
     }
 
     #[tokio::test]
@@ -2392,6 +2671,34 @@ mod tests {
         assert_eq!(count(&rs, "model_request"), 3);
         assert_eq!(turn_ends(&rs).last(), Some(&TurnEndReason::BudgetExhausted));
         assert!(matches!(rs.last().unwrap().event, Event::SessionEnd { outcome: SessionOutcome::BudgetExhausted, .. }));
+    }
+
+    #[tokio::test]
+    async fn a_root_whose_budget_ran_out_gets_a_fresh_budget_when_the_operator_writes() {
+        let script = seq((0..10).map(|_| bash("echo x").into()).collect());
+        let mut fx = Fx::new("lead", false, true, script).await;
+        let session = fx.create_with(Budget { max_steps: Some(1), max_minutes: None }, None);
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "the budget end", |rs| count(rs, "turn_end") == 1).await;
+        assert_eq!(turn_ends(&fx.sink.records()), vec![TurnEndReason::BudgetExhausted]);
+        assert_eq!(fx.server.requests().len(), 3);
+        tx.send(user("keep going")).unwrap();
+        wait_until(&fx.sink, "the second budget end", |rs| count(rs, "turn_end") == 2).await;
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::BudgetExhausted; 2]);
+        assert_eq!(notes(&rs, NoteKind::Budget).len(), 2, "the new budget gets its own note");
+        assert_eq!(fx.server.requests().len(), 6, "the second turn ran its own three steps");
+        assert_eq!(inbox(&rs).len(), 2);
+        // The model is told that the budget was renewed, right at the start of the second turn.
+        assert_eq!(notes(&rs, NoteKind::Info), vec![texts::budget_renewed(Some(1), None)]);
+        let second = rs.iter().rposition(|r| kind(r) == "turn_start").unwrap();
+        assert!(matches!(&rs[second + 1].event, Event::HarnessNote { note: NoteKind::Info, .. }), "{:?}", kinds(&rs));
+        assert!(all_text(&fx.server.requests()[3]).contains(&texts::budget_renewed(Some(1), None)));
+        // Reopened from the log, the session counts the same way.
+        finish_task(tx, task).await;
+        let reopened = Session::open(fx.deps()).unwrap();
+        assert_eq!(reopened.st.budget_step_base, 3);
     }
 
     #[tokio::test]
@@ -2500,6 +2807,112 @@ mod tests {
             .collect();
         assert_eq!(reasons, vec![texts::REASON_PARENT.to_string()]);
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn an_idle_stop_is_sticky_until_the_operator_writes_again() {
+        let script = seq(vec![
+            Reply::tool("bash", json!({ "command": "sleep 60", "background": true }).to_string()).into(),
+            Reply::tool("wait", json!({}).to_string()).into(),
+            finish_call("done").into(),
+        ]);
+        let mut fx = Fx::new("lead", false, true, script).await;
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "waiting", |rs| turn_ends(rs) == vec![TurnEndReason::Waiting]).await;
+        tx.send(Input::Stop).unwrap();
+        wait_until(&fx.sink, "the stop", |rs| turn_ends(rs).len() == 2).await;
+        let settlement = Settlement {
+            child: SessionId::from("s-kid9"),
+            role: "worker".into(),
+            outcome: ChildOutcome::Stopped,
+            report: "stopped".into(),
+            full: None,
+            payload: Value::Null,
+            steps: 1,
+            usage: Usage::default(),
+        };
+        tx.send(Input::ChildSettled(settlement)).unwrap();
+        wait_until(&fx.sink, "the job end and the settlement", |rs| count(rs, "job_settled") == 1 && count(rs, "child_settled") == 1)
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Waiting, TurnEndReason::Stopped]);
+        assert_eq!(count(&rs, "turn_start"), 1, "nothing may start a turn after the stop: {:?}", kinds(&rs));
+        assert_eq!(fx.sink.last_status().unwrap().last_end, Some(TurnEndReason::Stopped));
+        assert_eq!(fx.server.requests().len(), 2);
+        // The operator writing again runs the session.
+        tx.send(user("carry on")).unwrap();
+        wait_until(&fx.sink, "the next turn", |rs| count(rs, "turn_end") == 3).await;
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs).last(), Some(&TurnEndReason::Finished));
+        assert!(notes(&rs, NoteKind::Interrupted).contains(&texts::AFTER_STOP.to_string()));
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn stopping_an_idle_child_settles_it_stopped() {
+        let script = seq(vec![
+            Reply::tool("bash", json!({ "command": "sleep 60", "background": true }).to_string()).into(),
+            Reply::tool("wait", json!({}).to_string()).into(),
+        ]);
+        let mut kid = Fx::new("worker", true, true, script).await;
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Run it.".into())));
+        let (tx, task) = spawn_run(session);
+        wait_until(&kid.sink, "waiting", |rs| turn_ends(rs) == vec![TurnEndReason::Waiting]).await;
+        tx.send(Input::Stop).unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(30), task).await.expect("the child did not settle").unwrap();
+        let End::Settled(s) = end else { panic!("expected a settlement, got {end:?}") };
+        assert_eq!(s.outcome, ChildOutcome::Stopped);
+        assert_eq!(s.report, texts::stopped_report(2));
+        let rs = kid.sink.records();
+        assert!(matches!(rs.last().unwrap().event, Event::SessionEnd { outcome: SessionOutcome::Stopped, .. }));
+        assert!(kid.ctx.jobs.list().await.iter().all(|j| j.state != JobState::Running));
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn an_idle_stop_with_nothing_running_is_what_the_next_turn_is_told_about() {
+        let script = seq(vec![Reply::text("first").into(), Reply::text("second").into()]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        let mut session = fx.create();
+        // An old restart cut, long settled: it must not be mistaken for the reason of the next stop.
+        session.append(Author::Harness, Event::Interrupted { reason: texts::REASON_RESTART.to_string() }).unwrap();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("hi")).unwrap();
+        wait_until(&fx.sink, "the yield", |rs| count(rs, "turn_end") == 1).await;
+        tx.send(Input::Stop).unwrap();
+        tx.send(user("again")).unwrap();
+        wait_until(&fx.sink, "the next turn", |rs| count(rs, "turn_end") == 3).await;
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded, TurnEndReason::Stopped, TurnEndReason::Yielded]);
+        let stop = rs.iter().position(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Stopped })).unwrap();
+        assert!(matches!(&rs[stop - 1].event, Event::Interrupted { reason } if reason == texts::REASON_OPERATOR));
+        assert_eq!(notes(&rs, NoteKind::Interrupted), vec![texts::AFTER_STOP.to_string()]);
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_lands_while_a_trigger_is_queued_is_honoured() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("after the stop").into()])).await;
+        let session = fx.create();
+        // The stop is queued behind the message that starts the turn, and another message behind it.
+        run_with(session, vec![user("go"), Input::Stop, user("again")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Stopped, TurnEndReason::Yielded], "{:?}", kinds(&rs));
+        assert_eq!(count(&rs, "interrupted"), 1);
+        let reqs = fx.server.requests();
+        assert_eq!(reqs.len(), 1, "only the message sent after the stop costs a request");
+        assert!(all_text(&reqs[0]).contains("again") && all_text(&reqs[0]).contains(texts::AFTER_STOP));
+        // A resume sent after the stop runs the session as well.
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("resumed").into()])).await;
+        let session = fx.create();
+        run_with(session, vec![user("go"), Input::Stop, Input::Resume]).await;
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Stopped, TurnEndReason::Yielded], "{:?}", kinds(&rs));
+        assert!(rs.iter().any(|r| matches!(r.event, Event::TurnStart { trigger: Trigger::Resume })));
+        assert_eq!(fx.server.requests().len(), 1);
     }
 
     // ---- open --------------------------------------------------------------------------------
@@ -2737,6 +3150,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dismissing_a_non_blocking_item_resolves_it_without_a_turn() {
+        let mut fx = Fx::new("lead", false, true, seq(vec![finish_call("first").into(), finish_call("second").into()])).await;
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "the finished item", |rs| !inbox(rs).is_empty() && count(rs, "turn_end") == 1).await;
+        let item = inbox(&fx.sink.records())[0].clone();
+        assert_eq!((item.kind, item.blocking), (InboxKind::Finished, false));
+        tx.send(Input::Answer { item_id: item.item_id.clone(), answer: "  ".into() }).unwrap();
+        // A real message behind the dismissal: by the time its turn has run, the dismissal has been
+        // handled, so any request it caused would be in the log before this one.
+        tx.send(user("next")).unwrap();
+        wait_until(&fx.sink, "the second turn", |rs| count(rs, "turn_end") == 2).await;
+        let rs = fx.sink.records();
+        assert_eq!(count(&rs, "inbox_resolved"), 1);
+        assert_eq!(count(&rs, "turn_start"), 2);
+        let reqs = fx.server.requests();
+        assert_eq!(reqs.len(), 2, "the dismissal must not cost a request");
+        assert!(!all_text(&reqs[1]).contains("The operator's answer"), "{}", all_text(&reqs[1]));
+        assert_eq!(rs.iter().filter(|r| matches!(&r.event, Event::UserMessage { .. })).count(), 2);
+        assert!(notes(&rs, NoteKind::Arrival).is_empty(), "a finished item is dismissed without a note");
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn dismissing_a_question_closes_it_in_the_ledger_and_tells_the_model() {
+        let mut fx = Fx::new("lead", false, true, seq(vec![])).await;
+        let mut session = fx.create();
+        fx.shared.ledger_append(false, LedgerOp::QuestionAsk { text: "which?".into(), blocking: false }).unwrap();
+        let item = InboxItem {
+            item_id: "i-q".into(),
+            kind: InboxKind::Question,
+            text: "which?".into(),
+            options: Vec::new(),
+            blocking: false,
+            call_id: None,
+            reference: Some("q1".into()),
+        };
+        session.append(Author::Harness, Event::InboxOpened(item)).unwrap();
+        let arrival = session.arrival(Input::Answer { item_id: "i-q".into(), answer: String::new() }).await.unwrap();
+        assert_eq!(arrival.trigger, None);
+        assert!(!arrival.user);
+        let questions = fx.shared.ledger().unwrap().questions;
+        assert_eq!(questions[0].answer.as_deref(), Some(texts::DISMISSED_ANSWER));
+        let rs = fx.sink.records();
+        assert_eq!(notes(&rs, NoteKind::Arrival), vec![texts::question_dismissed("which?")]);
+        assert_eq!(count(&rs, "user_message"), 0);
+        assert!(session.st.inbox.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_written_answer_to_a_finished_item_starts_a_turn_and_is_not_a_ledger_answer() {
+        let mut fx = Fx::new("lead", false, true, seq(vec![Reply::text("ok").into()])).await;
+        let mut session = fx.create();
+        fx.shared.ledger_append(false, LedgerOp::QuestionAsk { text: "which?".into(), blocking: false }).unwrap();
+        let item = InboxItem {
+            item_id: "i-fin".into(),
+            kind: InboxKind::Finished,
+            text: "done".into(),
+            options: Vec::new(),
+            blocking: false,
+            call_id: None,
+            reference: Some("q1".into()),
+        };
+        session.append(Author::Harness, Event::InboxOpened(item)).unwrap();
+        let arrival = session.arrival(Input::Answer { item_id: "i-fin".into(), answer: "thanks, now do more".into() }).await.unwrap();
+        assert_eq!(arrival.trigger, Some(Trigger::InboxAnswer));
+        assert!(arrival.user);
+        assert!(fx.shared.ledger().unwrap().questions.iter().all(|q| q.answer.is_none()), "a Finished item answers no question");
+    }
+
+    #[tokio::test]
     async fn input_arriving_mid_turn_is_in_the_next_request_without_starting_a_turn() {
         let script = seq(vec![bash("echo one").into(), Reply::text("done").into()]);
         let mut fx = Fx::new("chat", false, false, script).await;
@@ -2825,7 +3310,9 @@ mod tests {
         assert_eq!(count(&rs, "turn_start"), 2);
         assert_eq!(count(&rs, "child_settled"), 1);
         assert_eq!(notes(&rs, NoteKind::Arrival), vec![texts::agent_message("psst")]);
-        assert_eq!(count(&rs, "interrupted"), 0);
+        // The stop of a yielded session is recorded, so that nothing it causes wakes the session.
+        assert_eq!(count(&rs, "interrupted"), 1);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded, TurnEndReason::Yielded, TurnEndReason::Stopped]);
         assert!(all_text(&fx.server.requests()[1]).contains("kid report"));
         finish_task(tx, task).await;
     }
@@ -2970,6 +3457,42 @@ mod tests {
         assert_eq!(items.len(), 1, "{:?}", kinds(&rs));
         assert_eq!(items[0].text, texts::turn_failed(texts::OVERFLOW_UNFOLDABLE));
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error]);
+    }
+
+    #[tokio::test]
+    async fn a_small_window_re_weaves_instead_of_failing_when_it_overflows() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
+        fx.server.set_model("mock", Some(32_000));
+        fx.window = Some(32_000);
+        // The configured floor (180k) is far above this window.
+        fx.context = ReweavePolicy { target_tokens: 400_000, floor_tokens: 180_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let rw = reweave_records(&rs);
+        assert!(!rw.is_empty(), "{:?}", kinds(&rs));
+        assert_eq!(rw[0].reason, "overflow");
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+        assert!(inbox(&rs).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_overflow_re_weaves_by_the_servers_limit_when_the_window_is_unknown() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
+        fx.server.set_model("mock", Some(32_000));
+        // No window known to the session, and the default policy, whose floor (180k) is far above it.
+        fx.window = None;
+        fx.context = ReweavePolicy::default();
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let rw = reweave_records(&rs);
+        assert!(!rw.is_empty(), "{:?}", kinds(&rs));
+        assert!(rw.iter().all(|w| w.reason == "overflow" && w.digest.is_none()));
+        // No digest is asked for on a prefix the server has just refused.
+        assert!(!rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest)));
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+        assert!(inbox(&rs).is_empty());
     }
 
     #[tokio::test]

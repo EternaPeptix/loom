@@ -2965,10 +2965,24 @@ mod tests {
         assert_eq!(entry.session, id);
         let nf = e.dir.path().join("notified.txt");
         until("notification", || std::fs::read_to_string(&nf).is_ok_and(|t| t.contains("finished"))).await;
-        let before = e.server.requests().len();
         e.rt.answer(&entry.item.item_id, "").await.unwrap();
         until("resolved", || e.rt.inbox().is_empty()).await;
-        assert_eq!(e.server.requests().len(), before);
+        // A message behind the dismissal starts the second turn. A turn started by the dismissal would
+        // have come before it, with its own trigger and the answer as a user message.
+        e.rt.send_message(&id, "and now something else").await.unwrap();
+        let turn_ends = || e.records(&id).iter().filter(|r| matches!(r.event, Event::TurnEnd { .. })).count();
+        until("the next turn", || turn_ends() == 2).await;
+        let records = e.records(&id);
+        let triggers: Vec<_> = records
+            .iter()
+            .filter_map(|r| match r.event {
+                Event::TurnStart { trigger } => Some(trigger),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(triggers, vec![loom_core::event::Trigger::User; 2]);
+        let answered = |r: &Record| matches!(&r.event, Event::UserMessage { text } if text.starts_with("[The operator's"));
+        assert!(!records.iter().any(answered));
         assert!(e.rt.answer("i-nothing", "x").await.is_err());
         e.rt.shutdown().await;
     }
