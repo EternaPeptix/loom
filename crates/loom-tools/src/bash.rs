@@ -254,6 +254,12 @@ impl Tool for JobList {
 
 fn remove_files(running: &Running) {
     let _ = std::fs::remove_file(&running.out_path);
+    remove_records(running);
+}
+
+/// Removes the status file and the pid record of a command that is over, and leaves its output file:
+/// a record left behind would make the next daemon start take the command for a crashed one.
+fn remove_records(running: &Running) {
     let _ = std::fs::remove_file(&running.exit_path);
     let _ = std::fs::remove_file(proc::pid_path(&running.out_path));
 }
@@ -404,7 +410,11 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
                     ))
                     .with_meta(META_JOB, json!(id));
                 }
-                Err(e) => return ToolOutput::error(e),
+                Err(e) => {
+                    // The message names the output file, which stays.
+                    remove_records(&running);
+                    return ToolOutput::error(e);
+                }
             };
             let status = if ended == Ended::Exit(0) { ToolStatus::Ok } else { ToolStatus::Error };
             let mut facts: Vec<String> = note.into_iter().collect();
@@ -452,7 +462,10 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
             let ended = if end == WaitEnd::TooMuchOutput { running.kill().await } else { running.terminate_within(grace, limit).await };
             let (output, note) = match read_all(&running, limit) {
                 Ok(o) => o,
-                Err(e) => return ToolOutput::error(e),
+                Err(e) => {
+                    remove_records(&running);
+                    return ToolOutput::error(e);
+                }
             };
             remove_files(&running);
             let (status, outcome) = match end {
@@ -667,7 +680,15 @@ mod tests {
     #[tokio::test]
     async fn a_helper_that_ends_just_after_the_command_is_waited_for_and_is_no_job() {
         let e = env();
-        let r = e.call("bash", json!({"command": "echo first; (sleep 0.05; echo helper) &"})).await;
+        // The helper ends when the harness has seen the command end and waits for the rest of its group:
+        // only then does the pid record gain `member` lines. It runs shell builtins alone, so no sleep or
+        // program start has to fit into the settle window.
+        let record = e.dir.path().join("home/jobs/j1.pid");
+        let helper = format!(
+            "while :; do while read -r kind _; do [ \"$kind\" = member ] && break 2; done < {}; done 2>/dev/null; echo helper",
+            record.display()
+        );
+        let r = e.call("bash", json!({"command": format!("echo first; ({helper}) &")})).await;
         assert_eq!(r.status, ToolStatus::Ok);
         assert!(!r.text.contains("now job"), "{}", r.text);
         assert!(r.meta.get(META_JOB).is_none());
@@ -698,6 +719,31 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("the child outlived job_kill");
+    }
+
+    #[tokio::test]
+    async fn an_output_that_cannot_be_read_leaves_the_output_file_and_no_records() {
+        let e = env();
+        let jobs = e.dir.path().canonicalize().expect("canonical").join("home/jobs");
+        // A directory in place of the output file cannot be read as one; the command goes on writing to
+        // the file it was given, which is gone from the directory. Once when it ends, once when stopped.
+        let replace = |id: &str| format!("rm {0} && mkdir {0}; echo gone", jobs.join(format!("{id}.out")).display());
+        let calls = [
+            ("j1", json!({"command": replace("j1")})),
+            ("j2", json!({"command": format!("{}; sleep 300", replace("j2")), "timeout_s": 1})),
+        ];
+        for (id, args) in calls {
+            let out = jobs.join(format!("{id}.out"));
+            let r = e.call("bash", args).await;
+            assert_eq!(r.status, ToolStatus::Error, "{}", r.text);
+            assert!(r.text.contains("could not be read back") && r.text.contains(&out.display().to_string()), "{}", r.text);
+            // The output file the message names stays; the status file and the pid record, which would
+            // make the next daemon start take the command for a crashed one, are gone.
+            assert!(out.is_dir(), "{id}");
+            for left in ["pid", "status"] {
+                assert!(!jobs.join(format!("{id}.{left}")).exists(), "{id}.{left} is left behind");
+            }
+        }
     }
 
     #[tokio::test]
