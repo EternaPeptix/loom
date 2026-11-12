@@ -75,6 +75,16 @@ impl PrefixGuard {
         self.seen_any = true;
         result
     }
+
+    /// Take `stable` as the stable messages of the previous request, sent in `epoch`, without
+    /// checking them: how a session reopened from its log learns what it sent before the restart, so
+    /// that its next request is checked like any other.
+    pub fn prime(&mut self, epoch: u32, stable: &[Message]) {
+        self.epoch = epoch;
+        self.hashes = stable.iter().map(message_hash).collect();
+        self.last = stable.last().cloned();
+        self.seen_any = true;
+    }
 }
 
 /// `new` is `old` with text appended and nothing else changed.
@@ -167,6 +177,24 @@ mod tests {
         g.check(0, &msgs(&["a", "b"]));
         assert_eq!(g.check(1, &msgs(&["z"])), PrefixCheck::NewEpoch);
         assert_eq!(g.check(1, &msgs(&["z", "y"])), PrefixCheck::Ok);
+    }
+
+    #[test]
+    fn a_primed_guard_checks_the_first_request_after_it() {
+        let mut g = PrefixGuard::new();
+        g.prime(2, &msgs(&["sys", "do it"]));
+        assert_eq!(g.check(2, &msgs(&["sys", "do it", "more"])), PrefixCheck::Ok);
+        let mut g = PrefixGuard::new();
+        g.prime(2, &msgs(&["sys", "do it"]));
+        assert!(matches!(g.check(2, &msgs(&["SYS", "do it", "more"])), PrefixCheck::Break { first_diff_message: 0, .. }));
+        // The final message may still grow, as after any request without a reply.
+        let mut g = PrefixGuard::new();
+        g.prime(2, &msgs(&["sys", "do it"]));
+        assert_eq!(g.check(2, &msgs(&["sys", "do it\n\nnote"])), PrefixCheck::Ok);
+        // A re-weave since then starts a new epoch.
+        let mut g = PrefixGuard::new();
+        g.prime(2, &msgs(&["sys", "do it"]));
+        assert_eq!(g.check(3, &msgs(&["SYS"])), PrefixCheck::NewEpoch);
     }
 
     #[test]

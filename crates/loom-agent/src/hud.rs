@@ -6,7 +6,7 @@
 //! change freely. It carries what a model otherwise loses track of over a long session: the mission
 //! state, what it has not looked at, what is running. It never mentions context size, message
 //! counts, or how long the session has run — those are not the model's concern (DESIGN §2.2). The
-//! only budget shown is a child's own step/time budget.
+//! only budget shown is the session's own step/time budget.
 //!
 //! `render(input)` is pure and deterministic. Output, sections in this order, each omitted when it
 //! has nothing to show, separated by one blank line:
@@ -52,8 +52,10 @@
 //!   (`<1 min` below one).
 //! - Waiting on the operator: ledger questions with no answer (id and text), only when
 //!   `input.ledger` is `Some`.
-//! - Budget: only when `input.is_child` and the budget has a limit. Steps: `step {step} of {max}`.
-//!   Minutes: whole minutes left, from `started_ms`, floor at 0. Both parts when both limits exist.
+//! - Budget: only when the budget has a limit; named `Budget` for a child (its assignment's) and
+//!   `Session budget` for a root. Steps: `step {step} of {max}`. Minutes: whole minutes left, from
+//!   `started_ms`, floor at 0. Both parts when both limits exist. `step` and `started_ms` count from
+//!   where the budget was granted: the session's start, or the turn that gave a root a fresh one.
 //! - Every list shows at most `MAX_ITEMS` entries, then `- (+{k} more)`. Every entry is one line,
 //!   cut to `MAX_LINE` characters with `…`; newlines inside values are replaced by spaces.
 //! - When nothing at all would be shown except `Now`, the output is just the `Now` line.
@@ -157,19 +159,18 @@ pub fn render(input: &HudInput<'_>) -> String {
         push_list(&mut sections, "Waiting on the operator", "", waiting);
     }
 
-    if input.is_child {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(max) = input.budget.max_steps {
-            parts.push(format!("step {} of {}", input.step, max));
-        }
-        if let Some(max) = input.budget.max_minutes {
-            let elapsed = input.now_ms.saturating_sub(input.started_ms) / 60_000;
-            let left = u64::from(max).saturating_sub(elapsed);
-            parts.push(format!("{left} of {max} minutes left"));
-        }
-        if !parts.is_empty() {
-            sections.push(format!("Budget: {}", parts.join("; ")));
-        }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(max) = input.budget.max_steps {
+        parts.push(format!("step {} of {}", input.step, max));
+    }
+    if let Some(max) = input.budget.max_minutes {
+        let elapsed = input.now_ms.saturating_sub(input.started_ms) / 60_000;
+        let left = u64::from(max).saturating_sub(elapsed);
+        parts.push(format!("{left} of {max} minutes left"));
+    }
+    if !parts.is_empty() {
+        let name = if input.is_child { "Budget" } else { "Session budget" };
+        sections.push(format!("{name}: {}", parts.join("; ")));
     }
 
     sections.join("\n\n")
@@ -536,7 +537,21 @@ mod tests {
         assert_eq!(render(&i), "Now: 1970-01-01 00:36 UTC");
         i.budget = Budget { max_steps: Some(5), max_minutes: None };
         i.is_child = false;
-        assert!(!render(&i).contains("Budget"));
+        assert!(render(&i).ends_with("\n\nSession budget: step 37 of 5"));
+    }
+
+    #[test]
+    fn a_root_budget_is_named_and_counted_from_where_it_was_granted() {
+        // A root whose fresh budget was granted by the turn that started at minute 30, two steps ago.
+        let mut i = input(EMPTY);
+        i.step = 2;
+        i.started_ms = 30 * 60_000;
+        i.now_ms = 36 * 60_000;
+        i.budget = Budget { max_steps: Some(10), max_minutes: Some(20) };
+        assert!(render(&i).ends_with("\n\nSession budget: step 2 of 10; 14 of 20 minutes left"), "{}", render(&i));
+        // No limit, no line.
+        i.budget = Budget::default();
+        assert_eq!(render(&i), "Now: 1970-01-01 00:36 UTC");
     }
 
     #[test]
