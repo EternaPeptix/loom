@@ -876,7 +876,7 @@ mod tests {
             prompt_tokens: 5,
             cached_tokens: 4,
         };
-        let ledger = loom_agent::runtime::LedgerView { state: Default::default(), markdown: "# ledger".into() };
+        let ledger = loom_agent::runtime::LedgerView { markdown: "# ledger".into(), ..Default::default() };
         let blob = BlobRef { id: BlobId("ab".into()), bytes: 9, lines: 3 };
         let lines = LinesView { text: "a\nb\n".into(), first: 1, last: 2, total: 3 };
         let page = RecordsPage { records: vec![], next_after: Some(7) };

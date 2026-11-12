@@ -12,6 +12,11 @@
 //! `quotes` elements are objects `{handle, start, end, text}`; an element of another shape is an
 //! error naming its position and the four fields. They are checked with `gate::check_quotes(&ctx.blobs,
 //! …)`; `Err(text)` → error `{text}\nNothing was delivered. Correct the quotes and call finish again.`
+//! Every quote must also be an observation, by the rule `evidence` applies (`rtools::observed_producer`):
+//! the output of a command run or a file read; a quote of the output of a runtime tool (`ledger`,
+//! `log_search`, an agent's report, ...), of a `write` or `edit`, or of an output no tool call of the
+//! mission produced is refused with that sentence and `Nothing was delivered.` A session without a
+//! mission has no producers to consult and is not checked.
 //! Refused, in a lead and in a child session alike, while a background job of this session (`ctx.jobs`)
 //! or a child agent (`S.orch.children`) is running: the error names them and says what to do with the
 //! tools this role has (`wait`, `job_kill`, `agent_stop`; that `job_kill` and `finish` can go in one
@@ -59,6 +64,9 @@
 //!   (``accepted: true cannot come with objections — either they are objections, or it is accepted``).
 //! - `opened` must not be empty: ``List in `opened` the outputs you examined (their out:… handles).
 //!   A verdict that examined nothing is not a verdict.``
+//! - refused while a background job of the verifier is running (`ctx.jobs`; a foreground command promoted to
+//!   a job counts): the error names the jobs and, of `job_wait` and `job_kill`, those the role has; nothing
+//!   is recorded.
 //! - every handle in `opened` must resolve (`ctx.blobs.resolve`) and must be an output this session
 //!   itself produced or opened: some `tool_result` record in `S.log_path` has that blob as `output`
 //!   or names it in `meta[META_OF_BLOB]`. Otherwise: ``You listed {handle} as examined, but this
@@ -136,6 +144,7 @@ use loom_core::event::{
 use loom_core::ids::new_item_id;
 use loom_core::ledger::{ClaimStatus, Evidence, LedgerOp, LedgerState};
 use loom_core::log::read_records;
+use loom_core::observe::QUOTE_RECORD_CHARS;
 use loom_core::{BlobId, BlobRef};
 use loom_tools::jobs::JobState;
 use loom_tools::params::{opt, req, spec};
@@ -176,7 +185,8 @@ pub fn quote_items() -> Value {
 ///   active constraint (omitted when none), then `The lead's summary of the result:\n{answer}`, then
 ///   `What the lead says it did not establish:` when it stated something, then
 ///   `Lines the lead quotes as support:` with one line per quote `- {handle} lines {start}-{end}:
-///   {text cut to 300 characters}` (omitted when none), then `Evidence the lead names for the result:`
+///   {text cut to observe::QUOTE_RECORD_CHARS (300) characters}` (omitted when none; an excerpt the quote
+///   check recorded of a long line is never longer), then `Evidence the lead names for the result:`
 ///   with one line per record of `evidence` (the ids given to `finish`; omitted when none), then
 ///   `Claims recorded as supported:` with one line per supported claim `- {id}: {text}`, each followed
 ///   by its evidence records, indented (omitted when none).
@@ -210,9 +220,13 @@ pub fn finish_brief(
     }
 
     if !quotes.is_empty() {
+        // The cut is the size of a recorded quote, so an excerpt of a long line is shown whole.
         let lines: Vec<String> = quotes
             .iter()
-            .map(|q| format!("- {} lines {}-{}: {}", handle_of(&q.blob), q.start, q.end, cut_chars(&q.text, 300)))
+            .map(|q| {
+                let text = cut_chars(&q.text, QUOTE_RECORD_CHARS);
+                format!("- {} lines {}-{}: {text}", handle_of(&q.blob), q.start, q.end)
+            })
             .collect();
         parts.push(format!("Lines the lead quotes as support:\n{}", lines.join("\n")));
     }
@@ -255,7 +269,7 @@ fn evidence_line(e: &Evidence) -> String {
     let side = if i.supports { "supports" } else { "undermines" };
     let handle = i.blob.as_ref().map(handle_of).unwrap_or_else(|| "no stored output".to_string());
     let range = i.lines.map(|(a, b)| format!(" lines {a}-{b}")).unwrap_or_default();
-    let quote = cut_chars(i.quote.as_deref().unwrap_or(""), 300);
+    let quote = cut_chars(i.quote.as_deref().unwrap_or(""), QUOTE_RECORD_CHARS);
     format!("- {} ({side}) {handle}{range}: {quote} \u{2014} {}", e.id, i.note)
 }
 
@@ -653,6 +667,28 @@ fn running_refusal(role: &RoleDef, jobs: &[String], agents: &[String]) -> String
     text
 }
 
+/// The refusal of `verdict` while a job of the verifier is still running; names only tools the role has.
+fn running_verdict_refusal(role: &RoleDef, jobs: &[String]) -> String {
+    let has = |tool: &str| role.tools.iter().any(|t| t == tool);
+    let mut text = format!(
+        "verdict was refused: a job of yours is still running: {}. It would be killed when you finish, and a verdict must rest on a check you have seen end. Nothing was recorded.",
+        jobs.join(", ")
+    );
+    let mut ways: Vec<&str> = Vec::new();
+    if has("job_wait") {
+        ways.push("wait for it with `job_wait`");
+    }
+    if has("job_kill") {
+        ways.push("end it with `job_kill` if you do not need its result");
+    }
+    if ways.is_empty() {
+        text.push_str(" Call verdict again when it has ended.");
+    } else {
+        text.push_str(&format!(" To go on: {}; then call verdict again.", ways.join(", or ")));
+    }
+    text
+}
+
 /// A verifier's report as the operator and the lead are shown it: whole, or cut with a visible marker.
 fn cut_report(report: &str) -> String {
     let total = report.chars().count();
@@ -792,6 +828,14 @@ impl Tool for Finish {
                 return ToolOutput::error(format!("{text}\nNothing was delivered. Correct the quotes and call finish again."))
             }
         };
+        // A quote is attested support, so it comes from an observation, as evidence does.
+        if let Some(mission) = self.0.mission.as_ref() {
+            for (q, v) in quotes.iter().zip(&verified) {
+                if let Err(text) = super::observed_producer(&self.0, mission, &q.handle, &v.blob).await {
+                    return ToolOutput::error(format!("{text}\nNothing was delivered."));
+                }
+            }
+        }
         let (jobs, agents) = self.running_work(ctx).await;
         if !jobs.is_empty() || !agents.is_empty() {
             return ToolOutput::error(running_refusal(&self.0.role, &jobs, &agents));
@@ -841,6 +885,12 @@ impl Tool for Verdict {
             return ToolOutput::error(
                 "List in `opened` the outputs you examined (their out:… handles). A verdict that examined nothing is not a verdict.",
             );
+        }
+
+        // The verifier's own checks end when it settles: one still running has not been seen to finish.
+        let (jobs, _) = Finish(s.clone()).running_work(ctx).await;
+        if !jobs.is_empty() {
+            return ToolOutput::error(running_verdict_refusal(&s.role, &jobs));
         }
 
         let seen = outputs_seen(&s.log_path);
@@ -1143,6 +1193,97 @@ mod tests {
         assert!(res.text.contains("Nothing was delivered. Correct the quotes and call finish again."));
         assert!(effect(&r).is_none());
         assert!(r.shared.ledger().unwrap().finishes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn finish_quotes_only_observations() {
+        // A child: its own log search and its own ledger are its words played back, not observations.
+        let r = rig("worker", true, true);
+        for tool in ["log_search", "ledger"] {
+            let h = r.output("#12 you: All 212 tests pass\n", tool, ToolClass::Read);
+            let quotes = json!([{"handle": h, "start": 1, "end": 1, "text": "#12 you: All 212 tests pass"}]);
+            let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
+            assert_eq!(res.status, Status::Error, "{tool}: {}", res.text);
+            assert!(res.text.contains(&format!("is the result of `{tool}`")) && res.text.contains("not an observation"), "{}", res.text);
+            assert!(res.text.contains("Nothing was delivered."), "{}", res.text);
+            assert!(effect(&r).is_none());
+        }
+        // An output no tool call of the mission produced.
+        let blob = r.env.ctx.blobs.put_bytes(b"orphan line of output\n").unwrap();
+        let quotes = json!([{"handle": blob.handle(), "start": 1, "end": 1, "text": "orphan line of output"}]);
+        let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("was not produced by a tool call of this mission") && res.text.contains("Nothing was delivered."), "{}", res.text);
+
+        // A command's output and a file read are observations.
+        let bash = r.output("running 3 tests\ntest result: ok\n", "bash", ToolClass::Exec);
+        let file = r.output("fn main() {}\n", "read", ToolClass::Read);
+        let quotes = json!([
+            {"handle": bash, "start": 2, "end": 2, "text": "test result: ok"},
+            {"handle": file, "start": 1, "end": 1, "text": "fn main() {}"}
+        ]);
+        let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(matches!(effect(&r), Some(Effect::Settle(_))));
+
+        // A lead: an agent's report is another agent's words.
+        let r = lead();
+        let h = r.output("Outcome: returned\n\nAll 212 tests pass\n", "agent_spawn", ToolClass::Exec);
+        let quotes = json!([{"handle": h, "start": 3, "end": 3, "text": "All 212 tests pass"}]);
+        let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("is the result of `agent_spawn`") && res.text.contains("Nothing was delivered."), "{}", res.text);
+        assert!(effect(&r).is_none());
+        assert!(r.shared.ledger().unwrap().finishes.is_empty());
+        assert_eq!(spawn_count(&r), 0);
+    }
+
+    #[tokio::test]
+    async fn a_fragment_quote_is_on_token_boundaries_and_recorded_as_its_line() {
+        let r = rig("worker", true, true);
+        let h = r.output("test result: FAILED. 5 passed; 10 failed; 0 ignored\n0 of 40 tests passed\n", "bash", ToolClass::Exec);
+        let quotes = json!([{"handle": h, "start": 1, "end": 2, "text": "0 failed; 0 ignored"}]);
+        let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains(&format!("occurs on line 1 of {h} only inside a longer word or number")), "{}", res.text);
+        assert!(effect(&r).is_none());
+        let quotes = json!([{"handle": h, "start": 1, "end": 2, "text": "40 tests passed"}]);
+        let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let Some(Effect::Settle(d)) = effect(&r) else { panic!("settle expected") };
+        assert!(d.report.contains("lines 2-2: 0 of 40 tests passed"), "{}", d.report);
+        assert_eq!(d.payload["quotes"][0]["text"], json!("0 of 40 tests passed"));
+        assert_eq!(d.payload["quotes"][0]["start"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn a_fragment_of_a_long_line_stays_visible_where_the_quote_is_shown() {
+        let fragment = "versions before 2.4.1 are affected";
+        let line = format!("{}{fragment}, and {}\n", "lorem ".repeat(150), "ipsum ".repeat(50).trim_end());
+        let max = loom_core::observe::QUOTE_RECORD_CHARS;
+        // A child's report and payload: an excerpt of the line around the fragment, past character 900.
+        let r = rig("worker", true, true);
+        let h = r.output(&line, "read", ToolClass::Read);
+        let quotes = json!([{"handle": h, "start": 1, "end": 1, "text": fragment}]);
+        let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let Some(Effect::Settle(d)) = effect(&r) else { panic!("settle expected") };
+        let shown = d.payload["quotes"][0]["text"].as_str().unwrap().to_string();
+        assert!(shown.contains(fragment) && shown.starts_with('…') && shown.chars().count() <= max, "{shown}");
+        assert!(d.report.contains(&format!("{h} lines 1-1: {shown}\n")), "{}", d.report);
+        // A lead: the verifier's brief and the operator's item show it too.
+        let r = lead();
+        let h = r.output(&line, "read", ToolClass::Read);
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "fine", accepted_payload());
+        let quotes = json!([{"handle": h, "start": 1, "end": 1, "text": fragment}]);
+        let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let spawned = r.orch.spawned.lock().unwrap().clone();
+        let brief = spawned[0].1.brief.context.clone().unwrap();
+        assert!(brief.contains(&format!("- {h} lines 1-1: {shown}")), "{brief}");
+        let items = inbox_items(&r);
+        let item = items.iter().find(|i| i.kind == InboxKind::Finished).unwrap();
+        assert!(item.text.contains(&format!("- {h} lines 1-1: {shown}")), "{}", item.text);
     }
 
     #[tokio::test]
@@ -1634,6 +1775,27 @@ mod tests {
         let Some(Effect::Settle(d)) = effect(&r) else { panic!("settle expected") };
         assert_eq!(d.report, format!("Verdict: accepted\nExamined: {produced}"));
         assert_eq!(d.payload["accepted"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn verdict_is_refused_while_a_job_is_running() {
+        let (r, produced, _) = verifier_with_log();
+        let started = r.call("bash", json!({"command": "sleep 30", "background": true})).await;
+        assert_eq!(started.status, Status::Ok, "{}", started.text);
+        let res = r.call("verdict", json!({"accepted": true, "opened": [produced]})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("job j1 (sleep 30)") && res.text.contains("job_wait") && res.text.contains("job_kill"), "{}", res.text);
+        assert!(res.text.contains("Nothing was recorded."), "{}", res.text);
+        assert!(effect(&r).is_none());
+        let killed = r.call("job_kill", json!({"job": "j1"})).await;
+        assert_eq!(killed.status, Status::Ok, "{}", killed.text);
+        let res = r.call("verdict", json!({"accepted": true, "opened": [produced]})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        // A role without `job_kill` is not told to use it.
+        let mut role = core_role("verifier");
+        role.tools.retain(|t| t != "job_kill");
+        let text = running_verdict_refusal(&role, &["job j1 (make)".to_string()]);
+        assert!(text.contains("job_wait") && !text.contains("job_kill"), "{text}");
     }
 
     #[tokio::test]

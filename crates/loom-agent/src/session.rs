@@ -2165,16 +2165,16 @@ impl Session {
             .into_iter()
             .map(|c| HudChild { id: c.id.to_string(), role: c.role, title: c.title, step: c.step })
             .collect();
-        let ledger = if shared.journal.is_some() {
-            match shared.ledger() {
-                Ok(l) => Some(l),
+        let (ledger, ledger_skipped) = if shared.journal.is_some() {
+            match shared.ledger_with_skipped() {
+                Ok((l, skipped)) => (Some(l), skipped),
                 Err(e) => {
                     tracing::warn!(session = %shared.session, "ledger unreadable for the state block: {e}");
-                    None
+                    (None, 0)
                 }
             }
         } else {
-            None
+            (None, 0)
         };
         let budget = Budget {
             max_steps: self.st.budget.max_steps.filter(|n| *n > 0),
@@ -2184,6 +2184,7 @@ impl Session {
             now_ms: now_ms(),
             records: self.own(),
             ledger: ledger.as_ref(),
+            ledger_skipped,
             brief: BriefOpts::default(),
             unviewed_min_lines: self.deps.agents.unviewed_min_lines,
             jobs: &jobs,

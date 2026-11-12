@@ -1113,8 +1113,14 @@ function renderLedger(p) {
   if (L.error) return showLedger(p, el("p", "dim", L.error));
   if (!L.model) return showLedger(p, el("p", "dim", "loading…"));
   const m = L.model;
-  if (m.empty) return showLedger(p, el("p", "dim", "This mission has no ledger entries yet."));
+  if (m.empty) {
+    const empty = document.createDocumentFragment();
+    for (const n of m.notices) empty.append(el("p", "warn", n));
+    empty.append(el("p", "dim", "This mission has no ledger entries yet."));
+    return showLedger(p, empty);
+  }
   const frag = document.createDocumentFragment();
+  for (const n of m.notices) frag.append(el("p", "warn", n));
   frag.append(h2("Goal"), el("div", "", m.goal || "(not set)"));
   if (m.constraints.length) {
     frag.append(h2("Constraints"), ul(...m.constraints.map((c) => li(el("span", "k", c.id), el("span", c.retired ? "retired" : "", c.text), c.retired ? el("span", "dim", ` (retired: ${c.retired})`) : null))));

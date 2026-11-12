@@ -368,7 +368,10 @@ zeros before the first entry. Verification recomputes over the bytes on disk.
   `Tampered`: every ledger write refuses and the ledger view reports it; the agent cannot repair it.
 - **Newer entries.** An entry with a valid seal whose op this build cannot parse is kept in the chain
   and skipped when folding; appends are refused (`NewerVersion`) and the model is told that loom must
-  be upgraded before the mission can continue.
+  be upgraded before the mission can continue. Reads do not hide this: the ledger view (`LedgerView`:
+  `skipped`, `skipped_detail`, `torn_tail`, `ahead_of_head`) reports skipped entries, an ignored torn
+  tail and entries the head record does not vouch for; `loom ledger` and the web UI show a line for each
+  that is present, and the state block tells the model how many entries are not shown.
 - **Key.** `keys/journal.key`: 32 random bytes as hex, created 0600 (inside `keys/`, which is 0700 like the loom home) by
   publishing a synced temporary file under the final name with a hard link and syncing the directory,
   so a crash never leaves a partial key and two creators end with the same one. An existing file that
@@ -409,19 +412,30 @@ output by handle, a line range, a quote and a note. The harness:
 3. accepts only observations: an output produced by a runtime tool (everything in `rtools::NAMES`:
    the ledger tools and `log_search` play the model's own words back, the agent tools return another
    agent's text) or by a tool of class `State`, `Terminal` or `Write` (the diff `write` and `edit`
-   return) is refused;
+   return) is refused. The rule is one function, applied to every quote of `finish` too (a child's and a
+   lead's): a quote of a ledger, a log search, an agent's report or a diff of the model's own edit is
+   refused with `Nothing was delivered.`;
 4. records `{claim, kind, supports, session, call_id, blob, lines, quote, note, attested: true}`, where
    `kind` is `execution` when the producer is of class `Exec` and `static` otherwise, and `quote` is
-   the verified text without line-number prefixes.
+   the verified text without line-number prefixes. A quote that is a part of a line is recorded as the
+   complete line or lines it lies on, with their numbers (a window of them on long lines, below).
 
 **Quote check** (`observe::check_quote`, also used for the quotes of `finish`). Both sides are prepared
 the same way: trailing whitespace is removed from every line, and blank lines at either end of the
 quote are ignored. The quote is looked for as written. Only when that fails (or finds only a fragment
-that is too short) and every non-blank line of the quote starts with a line-number prefix as the read
-tools print them (`N:`, `N-`, `N|`, `N│` or `N<TAB>`, the numbers increasing), the prefixes are removed
+that is too short or inside a word) and every non-blank line of the quote starts with a line-number
+prefix as the read tools print them (`N:`, `N-`, `N|`, `N│` or `N<TAB>`, the numbers increasing), the
+prefixes are removed
 and the rest is looked for, and each number must then be the real number of the line its text is on.
-An occurrence counts only when it spans whole lines or has at least 8 non-whitespace characters. There
-is no other leniency: case, indentation, inner spacing and punctuation must match.
+An occurrence counts only when it spans whole lines or has at least 8 non-whitespace characters and sits
+on token boundaries: when the quote begins (ends) with a letter or digit, the character before (after) it
+in the line is not one: `0 failed; 0 ignored` is not found inside `10 failed; 0 ignored`, and the model is
+told that the text occurs only inside a longer word or number. The text recorded and shown as the
+attested quote is the complete line or lines the accepted occurrence lies on when they have at most 300
+characters (`observe::QUOTE_RECORD_CHARS`); on longer lines it is the occurrence, whole, with as much of
+the lines around it as fits in 300 characters and `…` where text was left out, so the quoted text is
+always shown and the record stays bounded. There is no other leniency: case, indentation, inner spacing
+and punctuation must match.
 
 **Views.** `LedgerState::render_markdown()` is the full Markdown view (the `ledger` tool, the API's
 `markdown`, `loom ledger`). A mission whose lead keeps a ledger but has written nothing yet has an
@@ -531,12 +545,14 @@ Terminating tools: `finish {answer, quotes?, not_established?, evidence?}`, `ask
 options?, blocking?, meanwhile?}` (leads only; `blocking` defaults to true, and `meanwhile` is required
 when it is false), `report_blocker {class, what, tried, needs}` (class `needs_approval`, `needs_input`,
 `environment` or `impossible`; there is no class for context or elapsed time), `wait {reason?}` (refused when no job or agent is running), and for verifiers
-`verdict {accepted, objections?, opened}`.
+`verdict {accepted, objections?, opened}`. `verdict` is refused while the verifier has a running job
+(`job_wait`, or `job_kill` where the role has it): a check it has not seen end cannot support a verdict.
 
 **Finish gate** (`rtools::terminal`). It fails closed: a lead's result reaches the operator as finished
 only when every check passes and, where verification is required, a verifier accepted it.
 
-- `answer` must not be blank, and each quote (`{handle, start, end, text}`) must pass the quote check.
+- `answer` must not be blank, and each quote (`{handle, start, end, text}`) must pass the quote check and
+  quote an observation (the rule of `evidence`, §7).
 - `finish` is refused, in a lead and in a child alike, while a background job of the session or an
   agent it started is running; the refusal names them and says what to do (`wait`, `job_kill`,
   `agent_stop`; `job_kill` and `finish` can go in one reply). This is live state, not ledger
@@ -970,7 +986,7 @@ POST /api/sessions/{id}/archive               {archived} → 200 {}
 GET  /api/sessions/{id}/window                → WindowView
 GET  /api/sessions/{id}/net?limit=            → [NetEntry], the last `limit` (default 200, at most 2000)
 GET  /api/missions                            → [MissionInfo]
-GET  /api/missions/{id}/ledger                → LedgerView {state, markdown}
+GET  /api/missions/{id}/ledger                → LedgerView {state, markdown, skipped, skipped_detail, torn_tail, ahead_of_head}
 GET  /api/inbox                               → [InboxEntry], oldest first
 POST /api/inbox/{item_id}                     {answer} → 202 {}
 GET  /api/blobs/{handle}                      → BlobRef {id, bytes, lines}

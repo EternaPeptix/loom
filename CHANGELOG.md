@@ -100,6 +100,9 @@ upgrade" first; the rest says what behaves differently.
   secret. The page reads its event streams with `fetch`, not `EventSource`, and says `Run "loom open"
   again` when its secret is gone. Web-session secrets live in the daemon's memory, so a daemon restart
   needs `loom open` again.
+- The ledger view (`loom ledger`, the web UI, the model's state block) says when entries written by a
+  newer loom are not shown, when a torn tail was ignored and when entries are not covered by the head
+  record.
 - Start-up sweeps the process groups a previous daemon left running and notifies you again of inbox
   items that were still waiting.
 
@@ -166,6 +169,13 @@ upgrade" first; the rest says what behaves differently.
   call is not run and is nudged; repeated malformed or cut replies park the lead.
 - Text from tool results, files and agent reports is neutralised where it could pass for a harness
   block. Reports show the agent's own words with every line prefixed `> `.
+- The quotes of `finish` must come from observations (a command's output or a file read), as evidence
+  does: a quote of a ledger, a log search or an agent's report is refused.
+- A quote that is part of a line must start and end on word boundaries (the model is told when it
+  occurs only inside a longer word or number) and is recorded as its whole line, or as a window of at
+  most 300 characters around it on a longer line.
+- `verdict` is refused while the verifier has a running job.
+- The received arguments in the note about a malformed call are quoted line by line.
 
 ### Logs, journal and storage
 
@@ -184,6 +194,7 @@ upgrade" first; the rest says what behaves differently.
 
 ### Packs and documents
 
+- The `vr` chat role no longer lists `note`, which a session without a ledger cannot use.
 - The shipped prompts no longer promise hooks, no longer let a scout start agents, and say that the
   judge delivers a scope check through `verdict`. `vr` documents its network policy.
 - `README.md`, `docs/RUN.md`, `docs/config.example.toml` and `docs/IMPLEMENTING.md` were rewritten to

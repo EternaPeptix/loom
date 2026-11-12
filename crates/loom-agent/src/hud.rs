@@ -40,7 +40,9 @@
 //! Details:
 //! - `Now`: `input.now_ms` as UTC, minute precision (implement the civil-date arithmetic here; no
 //!   date crate).
-//! - Mission state: only when `input.ledger` is `Some` and the brief is non-empty.
+//! - Mission state: only when `input.ledger` is `Some` and the brief is non-empty. Followed, when
+//!   `input.ledger_skipped` is `n > 0`, by its own line `{n} ledger entries written by a newer loom are
+//!   not shown` (`1 ledger entry … is not shown`): the ledger as read lacks entries this build cannot parse.
 //! - Not looked at: `observe::unviewed(records, input.unviewed_min_lines)`; gaps as `a-b` joined by
 //!   `, `, at most 4 gaps then `, …`.
 //! - Repeated: `observe::repetitions(records, 3)`.
@@ -95,6 +97,8 @@ pub struct HudInput<'a> {
     pub now_ms: u64,
     pub records: &'a [Record],
     pub ledger: Option<&'a LedgerState>,
+    /// Entries of the ledger written by a newer loom, which `ledger` leaves out.
+    pub ledger_skipped: u64,
     pub brief: BriefOpts,
     pub unviewed_min_lines: u64,
     pub jobs: &'a [HudJob],
@@ -112,6 +116,14 @@ pub fn render(input: &HudInput<'_>) -> String {
         let brief = ledger.brief(&input.brief);
         if !brief.trim().is_empty() {
             sections.push(format!("Mission state (from the ledger — the ledger tools change it):\n{}", brief.trim_end()));
+        }
+        if input.ledger_skipped > 0 {
+            let n = input.ledger_skipped;
+            sections.push(if n == 1 {
+                "1 ledger entry written by a newer loom is not shown".to_string()
+            } else {
+                format!("{n} ledger entries written by a newer loom are not shown")
+            });
         }
     }
 
@@ -347,6 +359,7 @@ mod tests {
             now_ms: 0,
             records,
             ledger: None,
+            ledger_skipped: 0,
             brief: BriefOpts::default(),
             unviewed_min_lines: 1,
             jobs: &[],
@@ -398,6 +411,22 @@ mod tests {
             ],
             ..LedgerState::default()
         }
+    }
+
+    #[test]
+    fn skipped_ledger_entries_are_said_in_the_state_block() {
+        let l = ledger();
+        let mut i = input(EMPTY);
+        i.ledger = Some(&l);
+        assert!(!render(&i).contains("newer loom"));
+        i.ledger_skipped = 3;
+        let text = render(&i);
+        assert!(text.contains("\n\n3 ledger entries written by a newer loom are not shown\n\n"), "{text}");
+        i.ledger_skipped = 1;
+        assert!(render(&i).contains("1 ledger entry written by a newer loom is not shown"));
+        // Without a ledger there is nothing to qualify.
+        i.ledger = None;
+        assert!(!render(&i).contains("newer loom"));
     }
 
     #[test]
