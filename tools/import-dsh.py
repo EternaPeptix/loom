@@ -35,6 +35,12 @@ def sha256_hex(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def clean(s: str) -> str:
+    """`s` with every character UTF-8 cannot encode (a lone surrogate) replaced by '?', so the log and
+    meta.json store the same text and neither holds an escape the daemon's JSON reader refuses."""
+    return s.encode("utf-8", "replace").decode("utf-8")
+
+
 def text_of(content) -> str:
     if isinstance(content, str):
         return content
@@ -282,11 +288,12 @@ def import_one(p, a, counts):
         counts["skipped"] += 1
         return
     header = header or {}
-    workspace = header.get("cwd") or "unknown"
+    workspace = clean(str(header.get("cwd") or "unknown"))
     created_ms = to_ms(header.get("createdAt"), body[0][1] or 0)
     first_user = next((e["text"] for _, _, e in body if e.get("kind") == "user_message"), "")
-    title = "[DSH] " + " ".join(first_user.split())[:80]
-    log, n_steps = build_log(body, header, sid, mission, workspace, a.model, created_ms, title)
+    title = clean("[DSH] " + " ".join(first_user.split())[:80])
+    model = clean(a.model)
+    log, n_steps = build_log(body, header, sid, mission, workspace, model, created_ms, title)
 
     if a.dry_run:
         print(f"  would import {uuid[:8]} -> {sid} ({len(body)} recs, {n_steps} steps) ws={workspace}", file=sys.stderr)
@@ -298,7 +305,7 @@ def import_one(p, a, counts):
     meta_path = os.path.join(sdir, "meta.json")
     meta = {
         "id": sid, "mission": mission, "parent": None, "workspace": workspace,
-        "pack": "core", "role": "chat", "profile": "imported", "model": a.model,
+        "pack": "core", "role": "chat", "profile": "imported", "model": model,
         "context_window": 1048576, "title": title, "created_ms": created_ms,
         "mode": None, "awaited": False, "unattended": False, "archived": existing_archived(meta_path),
     }

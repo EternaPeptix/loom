@@ -9,11 +9,16 @@
 #   LOOM_BUILD_HOST=<host or local> ./x --pull-bin     build release and copy the `loom` binary to ./bin/loom
 #
 # LOOM_BUILD_HOST has no default: set it to an ssh host name (key-based login, no prompts) or to "local".
+# In local mode --pull-bin takes the binary from $CARGO_TARGET_DIR (default ./target).
 #
 # The tree this script sits in is pushed with rsync before every run, to a directory that belongs to
 # the lane. A new lane starts from a copy-on-write clone of the main lane's target dir, so it does not
 # rebuild third-party crates. Cargo.lock is tracked; if the build host changes it, the changed file is
 # copied back and one line says so.
+#
+# Exit codes of its own: 2 bad settings, 88 the build host was reached but the source directory could not
+# be created there, 89 the build host cannot be reached over ssh, 90 rsync failed, 91 the binary could not
+# be installed in ./bin. Any other code is cargo's.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 HOST="${LOOM_BUILD_HOST:-}"
@@ -31,23 +36,45 @@ resign() {
     if command -v codesign >/dev/null; then codesign --force --sign - "$1" 2>/dev/null || true; fi
 }
 
+# Install a built binary as ./bin/loom. The arguments are a copy command; the destination it is given is
+# a file named `loom` in a fresh temporary directory inside ./bin. That copy is made executable and
+# re-signed there and then renamed over ./bin/loom, so a daemon running from the old file is never
+# rewritten in place.
+install_bin() {
+    local dir
+    mkdir -p "$ROOT/bin" && dir="$(mktemp -d "$ROOT/bin/.install.XXXXXX")" || return 91
+    if "$@" "$dir/loom" && chmod 755 "$dir/loom" && resign "$dir/loom" && mv -f "$dir/loom" "$ROOT/bin/loom"; then
+        rmdir "$dir" 2>/dev/null
+        ls -la "$ROOT/bin/loom"
+        return 0
+    fi
+    rm -f "$dir/loom"
+    rmdir "$dir" 2>/dev/null
+    return 91
+}
+
 if [ "$HOST" = "local" ]; then
     cd "$ROOT" || exit 2
     if [ "${1:-}" = "--pull-bin" ]; then
         cargo build --release -p loom-daemon || exit $?
-        mkdir -p "$ROOT/bin"
-        cp "$ROOT/target/release/loom" "$ROOT/bin/loom" || exit 91
-        resign "$ROOT/bin/loom"
-        ls -la "$ROOT/bin/loom"
+        built="${CARGO_TARGET_DIR:-$ROOT/target}/release/loom"
+        if ! install_bin cp "$built"; then
+            echo "x: could not copy $built to $ROOT/bin/loom. If cargo's target directory is configured elsewhere, set CARGO_TARGET_DIR to it and run again." >&2
+            exit 91
+        fi
         exit 0
     fi
     exec cargo "$@"
 fi
 
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST")
+ssh_rc=0
 
 push() {
-    "${SSH[@]}" "mkdir -p \$HOME/$REMOTE/src-$LANE" || return 89
+    "${SSH[@]}" "mkdir -p \$HOME/$REMOTE/src-$LANE"
+    ssh_rc=$?
+    # ssh exits 255 only when it cannot connect or log in; any other failure is the remote mkdir's.
+    if [ "$ssh_rc" -eq 255 ]; then return 89; elif [ "$ssh_rc" -ne 0 ]; then return 88; fi
     rsync -a --delete \
         --exclude '/target' --exclude '/.git' --exclude '/.claude' --exclude '/bin' --exclude '.DS_Store' \
         "$ROOT/" "$HOST:$REMOTE/src-$LANE/" || return 90
@@ -72,6 +99,9 @@ rc=$?
 if [ "$rc" -eq 89 ]; then
     echo "x: cannot reach $HOST over ssh (key-based login without prompts is required). Check the host name, the network and your ssh key, or set LOOM_BUILD_HOST=local." >&2
     exit 89
+elif [ "$rc" -eq 88 ]; then
+    echo "x: reached $HOST over ssh, but could not create ~/$REMOTE/src-$LANE there (remote exit $ssh_rc). Check the permissions of the home directory and the free disk space on $HOST." >&2
+    exit 88
 elif [ "$rc" -ne 0 ]; then
     echo "x: rsync to $HOST failed. Check that rsync is installed on both machines and that $HOST has free disk space." >&2
     exit 90
@@ -79,11 +109,11 @@ fi
 
 if [ "${1:-}" = "--pull-bin" ]; then
     remote "cargo build --release -p loom-daemon" || exit $?
-    mkdir -p "$ROOT/bin"
-    rsync -a "$HOST:$REMOTE/target-$LANE/release/loom" "$ROOT/bin/loom" || exit 91
-    resign "$ROOT/bin/loom"
+    if ! install_bin rsync -a "$HOST:$REMOTE/target-$LANE/release/loom"; then
+        echo "x: could not copy the release binary from $HOST to $ROOT/bin/loom. Check the free disk space here and run again." >&2
+        exit 91
+    fi
     pull_lock
-    ls -la "$ROOT/bin/loom"
     exit 0
 fi
 
