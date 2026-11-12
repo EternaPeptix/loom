@@ -606,7 +606,17 @@ fn read_key(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut text = String::new();
     std::fs::File::open(path)?.read_to_string(&mut text)?;
     let text = text.trim();
-    let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{} must hold 64 hexadecimal characters", path.display()));
+    let bad = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "the journal key file {} does not hold a 64-character hexadecimal key; if no mission journals exist yet, \
+                 delete it and loom will create a new key, otherwise restore the key from a backup \
+                 (journals sealed with another key cannot be verified)",
+                path.display()
+            ),
+        )
+    };
     if text.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1260,6 +1270,7 @@ mod tests {
     }
 
     #[test]
+    // Note: the planted name only guards against a fixed-name temporary file; real temporaries are random.
     fn concurrent_creators_agree_and_a_leftover_temporary_file_is_harmless() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let path = dir.path().join("keys").join("journal.key");
@@ -1319,7 +1330,15 @@ mod tests {
             let err = load_or_create_key(&path);
             assert!(matches!(&err, Err(e) if e.kind() == std::io::ErrorKind::InvalidData), "{content:?}: {err:?}");
             assert_eq!(std::fs::read_to_string(&path).unwrap_or_default(), content);
+            if !content.is_empty() {
+                let msg = err.map(|_| ()).unwrap_err().to_string();
+                assert!(msg.contains("delete it") && msg.contains("restore the key from a backup"), "{msg}");
+            }
         }
+        // A file that reached full size but was never written reads back as NUL bytes.
+        std::fs::write(&path, "\0".repeat(64)).unwrap_or_default();
+        let msg = load_or_create_key(&path).map(|_| ()).unwrap_err().to_string();
+        assert!(msg.contains("delete it") && msg.contains("restore the key from a backup"), "{msg}");
         // A trailing newline is tolerated.
         std::fs::write(&path, format!("{}\n", "ab".repeat(32))).unwrap_or_default();
         assert_eq!(load_or_create_key(&path).map(|k| k.len()).ok(), Some(32));

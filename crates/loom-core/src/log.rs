@@ -66,8 +66,8 @@ pub enum LogError {
     #[error("log already exists: {0}")]
     Exists(PathBuf),
     #[error(
-        "another loom process has the session log {0} open; stop it (or wait until it finishes) before opening \
-         this session again"
+        "the session log {0} is already open for writing (by this daemon or another loom process); wait until \
+         that session stops, then try again"
     )]
     Locked(PathBuf),
     #[error("cannot encode record: {0}")]
@@ -992,7 +992,7 @@ mod tests {
         log.append(Author::Harness, msg(0)).unwrap();
         let err = SessionLog::open(&path, Durability::Batch).unwrap_err();
         assert!(matches!(err, LogError::Locked(_)), "{err}");
-        assert!(err.to_string().contains("another loom process has the session log"), "{err}");
+        assert!(err.to_string().contains("is already open for writing"), "{err}");
         // Reading takes no lock.
         assert_eq!(read_records(&path).unwrap().records.len(), 1);
         drop(log);
