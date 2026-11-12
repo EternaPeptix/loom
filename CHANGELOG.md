@@ -1,0 +1,160 @@
+# Changelog
+
+## Unreleased
+
+These changes follow a review of the first version of loom. They are grouped by area. Read "Before you
+upgrade" first; the rest says what behaves differently.
+
+### Before you upgrade
+
+1. **The network is closed by default.** `[network] mode` now defaults to `deny_all`: bash, `web_fetch`
+   and the vulnerability lookups reach no host through the egress proxy. Before, the default was `open`.
+   Requests to your model server are not affected. To keep the old behaviour, set
+   `[network] mode = "open"`; to reach only some hosts, set `mode = "allowlist"` and list them in
+   `allow`. The `vr` pack refuses to run when the mode is `open`.
+2. **Credential directories are unreadable to commands by default.** `~/.ssh`, `~/.aws`, `~/.gnupg`,
+   `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`, `~/.docker/config.json`, `~/.netrc`, `~/.npmrc`,
+   `~/.pypirc`, cargo and git credential files, `~/.password-store`, `~/.config/op`, the Keychains and
+   Cookies folders and the Chrome, Firefox and Safari profiles can no longer be read or written by
+   commands or the file tools. If a workflow needs one of them (a `git push` over SSH, for example), set
+   `[sandbox] protect_credentials = false`, or run that step yourself. A listed directory that is or
+   contains the workspace stays readable. The key needs a home directory: with `HOME` unset, sessions
+   fail with a message that names it.
+3. **Replace installed packs.** Pack loading is stricter: unknown keys are errors, a role whose
+   `finish` is verified must have a verifier role of the same pack that is read-only and has `verdict`
+   and `out_read` or `out_grep`, and the researcher in `vr` now says `verifier = "judge"`. A copy of a
+   shipped pack in `~/.loom/packs` (for example `~/.loom/packs/vr`) from the first version no longer
+   loads, and the daemon refuses to start with it. Replace it with the shipped one:
+   `rm -rf ~/.loom/packs/vr && cp -R packs/vr ~/.loom/packs/vr`. Prompts changed too, and a session
+   keeps the system text it started with, so only new sessions get them.
+4. **Restart the old daemon, then rebuild the desktop app.** The daemon now proves it holds the token
+   (`GET /healthz?nonce=...`) before the `loom` command or `loom-desk` sends the token to it. A new
+   client refuses a daemon from the first version, naming the address and saying the token was not
+   sent. Stop the old one with `loom --unverified-daemon down`, then start the new one with `loom up`.
+   `loom-desk` must be rebuilt (`LOOM_BUILD_HOST=<host> gui/build.sh --pull`): the new app logs in with
+   a one-time code and does not fall back to a token in the URL, so it cannot use an older daemon; and
+   the first version's app, which relied on the daemon's cookie, is not supported against the new daemon.
+5. **Web login changed; old browser cookies are void.** The web UI no longer uses a cookie. Open it with
+   `loom open` (it prints the address only with `--print`). The first version stored your API token in
+   a `loom_token` cookie for `127.0.0.1` and `localhost`; the new daemon tells a browser that still
+   sends it to forget it the next time the page loads, but you should clear those cookies yourself, or
+   rotate the token (stop the daemon, delete `~/.loom/token`, start it; copies of the old token, such
+   as one kept by `loom-desk` or in a remote client's `LOOM_HOME`, must be replaced). A bookmarked
+   `/?token=...` address redirects to a login-code address and sets no cookie.
+6. **The model retry window defaults to 300 seconds.** `retry_window_s` used to default to `0`, which
+   retried an unreachable server until it came back. It now gives up after five minutes (long enough
+   for a server relaunch). Set `retry_window_s = 0` for the old behaviour.
+7. **Speculative tool calling is on.** `[tools] speculate = true` (new, default `true`) starts a reply's
+   leading read-only calls (`read`, `glob`, `grep`, `out_read`, `out_grep`) while the reply is still
+   streaming. Records, their order and what the model sees are the same except timings, the ids of
+   calls started early, and an `early_ms` entry in a result's metadata. Set `speculate = false` to
+   turn it off.
+8. **`LOOM_BUILD_HOST` is required by `gui/build.sh`** (a host, or `local`); it has no default host. Set
+   it explicitly for `./x` too; `./x` is optional and `cargo build --release -p loom-daemon` is the
+   normal way to build. `./x` reads `LOOM_LANE` for separate build copies.
+9. **On non-macOS systems the daemon refuses to start** unless `[sandbox] mode = "none"`, because the
+   OS sandbox exists only on macOS. That mode leaves commands unconfined.
+10. **Sessions and journals from a newer loom cannot be opened by an older one**: a session log with
+    a newer `schema`, or a journal with an operation the older loom does not know, is refused with a
+    sentence telling you to upgrade. Reading and the UI still work. Do not go back to the first version
+    on a home that the new one has used for new sessions.
+
+### New commands and options
+
+- `loom open [--print]` opens the web UI with a one-time login code.
+- `loom rule <session> <text>`, `loom rule <session> --withdraw <rule-id> [--reason <text>]` and
+  `loom approve <session> <text> [--scope <text>]` set and withdraw standing rules and record
+  approvals. They are also available in the API and in the Ledger tab of the web UI. Inputs given while
+  the lead is in a turn are kept on disk until it records them.
+- `loom gc [--apply]` deletes stored outputs that no session or mission refers to (dry run by
+  default).
+- `loom --unverified-daemon` (global flag) sends the token to a daemon that cannot prove its identity,
+  with a warning; meant only for moving off a first-version daemon.
+- `loom status` shows free space on the volume of the loom home and warns below 5 GiB or 5 percent.
+- New config keys: `[sandbox] protect_credentials`, `[tools] speculate`. Changed defaults:
+  `[network] mode` (`deny_all`) and `retry_window_s` (300).
+- Pack keys: `requires_restricted_network` (top level) and `verifier` (per role).
+- API additions: `POST /api/login-codes`, `POST /api/web-sessions`, `POST /api/sessions/{id}/rules`,
+  `/approvals`, `/rules/{rule_id}/withdraw`, `POST /api/gc`, `GET /healthz?nonce=`, and a `disk` field
+  in `GET /api/status`.
+
+### Daemon and web UI
+
+- The daemon takes `<home>/daemon.lock` first, so two daemons cannot start on one home. It binds only
+  loopback addresses, and creates the token and keys atomically.
+- `/` and the page assets need no login; every `/api` route needs the bearer token or a web-session
+  secret. The page reads its event streams with `fetch`, not `EventSource`, and says `Run "loom open"
+  again` when its secret is gone. Web-session secrets live in the daemon's memory, so a daemon restart
+  needs `loom open` again.
+- Start-up sweeps the process groups a previous daemon left running and notifies you again of inbox
+  items that were still waiting.
+
+### Sandbox and tools
+
+- Commands cannot write to credential stores, the temp directory entry cannot be removed or replaced,
+  and LaunchServices opens, Apple Events and launchd jobs are denied. More environment variables are
+  withheld (names ending `_PAT`, `_DSN`, `_PWD`, `DATABASE_URL`, `SSH_AUTH_SOCK`, names containing
+  `AUTH_TOKEN`, `COOKIE`, `SESSION_KEY`). Path rules that refuse ignore case on macOS.
+- A command is over only when its whole process group is empty. A command whose leader exits while
+  others run returns at once with the output so far and a job id. Exit codes above 128 are reported as
+  exit codes with a note that 128+N usually means signal N. A command whose output passes
+  `max_output_bytes` is killed at once and only the first part is kept.
+- `read`, `write` and `edit` work on regular files only; `read` loads at most 64 MiB (use a line range
+  for larger files); `grep` skips files over 16 MiB and says so. `grep` and `glob` list at most
+  `search_max_results` entries and 4 MiB of text, and say when a result is cut.
+- Evidence can be cited from a `read` result (its header now ends with an `out:` handle) and from a
+  finished background job's complete output. Output produced by the runtime's own tools (ledger,
+  agent reports, `finish`, ...) can no longer be cited as evidence. A quote copied with line numbers
+  must carry the real line numbers, and a partial-line quote needs at least 8 non-space characters.
+
+### Network and egress
+
+- The deny list also matches the resolved address and accepts IP addresses and CIDR blocks, in every
+  mode. IPv6 forms that carry an IPv4 address are judged by that address; Teredo and other special IPv6
+  ranges are refused unless listed in `allow_private`.
+- Every allowed connection is written to the session's `net.jsonl` (now a hash chain) before it is used;
+  if the write fails the client gets 502. The proxy has fixed limits on connections, lookups and idle
+  time. `web_fetch` and the CVE tools check the policy before https requests.
+
+### Model client
+
+- The client follows no redirects: a 3xx fails with the `Location` and tells you to fix `base_url`.
+- Requests carry the model id the server reports; a 404 for an unserved model makes the client look at
+  `/models` once. If several models are served and yours is not among them, that is a configuration
+  error listing them.
+- Failures waiting cannot cure end the request after three attempts in a row. Streams over fixed size
+  limits fail as malformed.
+- A session is not created when the server cannot be reached and the profile sets no `context_window`.
+
+### Sessions, agents and finishing
+
+- A child agent always settles exactly once and its lead receives the settlement, including after a
+  restart. `agent_stop` waits for the agent to end. Archiving settles the mission's agents.
+- On shutdown running turns are cancelled first; after a restart, jobs that were running are recorded
+  as lost and sessions that were waiting on them resume.
+- A verified role's `finish` is delivered only after the verifier accepts it. After two rejections, or
+  when the verifier cannot be run, you get a blocking `NOT VERIFIED` inbox item. `finish` is refused
+  while the session has running jobs or agents.
+- `stop` is sticky: after an idle stop, settlements and job ends do not start a turn until you send a
+  message, answer or resume. An empty answer to a non-blocking inbox item dismisses it. A root session
+  whose budget ran out gets a fresh budget when you start its next turn.
+- The re-weave trigger uses the prompt size the server reported. A model reply with a malformed tool
+  call is not run and is nudged; repeated malformed or cut replies park the lead.
+- Text from tool results, files and agent reports is neutralised where it could pass for a harness
+  block. Reports show the agent's own words with every line prefixed `> `.
+
+### Logs, journal and storage
+
+- The mission journal has a sealed `journal.head` beside it; a torn last line is repaired by the next
+  append instead of counting as tampering, and truncation, deletion and substitution are detected.
+- Session logs are locked while open for writing, and an unreadable line with a sound chain header is
+  kept as an opaque record instead of being treated as damage.
+- The blob store removes stale temporary files, repairs missing indexes, and is cleaned only by
+  `loom gc`.
+
+### Packs and documents
+
+- The shipped prompts no longer promise hooks, no longer let a scout start agents, and say that the
+  judge delivers a scope check through `verdict`. `vr` documents its network policy.
+- `README.md`, `docs/RUN.md`, `docs/config.example.toml` and `docs/IMPLEMENTING.md` were rewritten to
+  match the code. `SECURITY.md` was added. `docs/REVIEW-COVERAGE.md` is a dated record.

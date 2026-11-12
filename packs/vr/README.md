@@ -1,53 +1,63 @@
-# The `vr` pack — vulnerability research
+# The `vr` pack: vulnerability research
 
-`vr` is a domain pack for vulnerability research on local and authorized targets. It replaces the
-`dsh-vr` plugin: everything that plugin bolted onto a general harness as tools and hooks, `vr`
-expresses with loom's own mechanisms, so there is less to go wrong and nothing to fail open.
+`vr` is a domain pack for vulnerability research on local and authorized targets. It expresses the
+research discipline (scope first, evidence tiers, an independent check of every finding) with loom's
+own mechanisms: the sandbox and egress proxy, the sealed ledger, and the finish gate with a verifier.
+There is no hook mechanism and no text-matching of shell commands anywhere in it.
 
 ## Roles
 
 | Role | Ends by | Writes files | Spawns | Job |
 |---|---|---|---|---|
 | `researcher` | `finish` (judge-gated) | yes | `scout`, `judge` | Owns the engagement; routes it into experiments; gates every result. |
-| `scout` | `finish` | yes | `scout` | Runs one experiment; returns executed evidence or a blocker. |
-| `judge` | `verdict` | no (read-only) | — | Qualifies a scope, or refutes a finding. Never judges its own work. |
-| `chat` | a reply with no tool call | no (read-only) | — | Interactive, turn-by-turn assistant. |
+| `scout` | `finish` | yes | nothing | Runs one experiment; returns executed evidence or a blocker. |
+| `judge` | `verdict` | no (read-only) | nothing | Checks a proposed scope against its source, or tries to refute a finding. Never judges its own work. |
+| `chat` | a reply with no tool call | no (read-only) | nothing | Interactive, turn-by-turn assistant. |
 
 Start one with:
 
 ```
 loom run --pack vr --role researcher -w <workspace> "…the engagement…"
-loom chat --pack vr -w <workspace>            # interactive, uses the default role unless --role
+loom chat --pack vr -w <workspace>            # interactive; uses the pack's default role unless --role
 ```
+
+## Network policy
+
+The pack sets `requires_restricted_network = true`. loom's default network mode is `deny_all`, under
+which the tools reach no host, so a `vr` session works out of the box and can touch no target
+host. A `vr` session is refused when the config says `[network] mode = "open"`; the message tells the
+operator to use `allowlist` or `deny_all` and restart the daemon. The check runs when a session is
+created and each time one is restored.
+
+To let an engagement reach its targets, set `[network] mode = "allowlist"` with `allow` listing exactly
+the authorized hosts, restart the daemon, and record the authorization as a standing rule
+(`loom rule <session> "..."`). Names are resolved by the proxy itself; private, loopback and
+link-local addresses are refused unless `allow_private` lists them. Every decision is in
+`loom net <session>`. The policy applies to the whole daemon, not to one session.
 
 ## How the research standards map onto loom
 
-The standards in `~/Documents/Security/Hackerone/AGENTS.md` were written for a plugin that steered a
-general harness. Here is where each one lives in `vr`, and why the loom version is stronger.
-
-- **Scope must be qualified before anything else; authorization boundary.** In `dsh-vr` this was a
-  pre-execute hook that parsed shell text and an allow/deny host list that, by the review, *failed
-  open* when the deny list was empty and could be slipped with a newline. In `vr` the boundary is not
-  text-matched at all: outbound traffic goes through loom's egress proxy under an OS sandbox that
-  permits no other route, the proxy resolves each name itself and refuses private/loopback/link-local
-  unless named, and the default policy (`deny_all`, which loom uses unless the config says otherwise) reaches
-  nothing; a `vr` session is refused outright under `mode = "open"`. An unqualified engagement simply
-  cannot touch a target. The researcher qualifies scope by having a **judge** read the programme and
-  enumerate the authorized hosts; the operator sets the matching network policy and records it as a
-  standing **constraint**. Widening scope is `ask_user` → operator → constraint, never the agent's call.
-- **The judge is a different agent.** `verify_finish = true` on the researcher, and a `read_only`
-  `judge` role: a finding is attacked by an agent that did not produce it, and the finish gate is
-  mechanical (nothing open) before it is adversarial (judge refutes).
-- **Pipeline: candidate → validated → assessed → ready.** Plan steps and claim statuses. Evidence
-  carries loom's built-in `execution` / `static` kinds; the roles forbid a `static`-only finding, so
-  "reading the code again is not validation" is a rule the harness can see, not a reminder.
+- **Scope must be qualified before anything else.** The boundary is not text-matched. Outbound
+  traffic goes through loom's egress proxy under an OS sandbox that permits no other route, and the
+  default policy reaches nothing. The researcher has a **judge** check a proposed scope against the
+  programme or authorization the operator named; the operator sets the matching network policy and
+  records it as a standing **constraint**. Widening scope is `ask_user`, then the operator, then a
+  constraint, never the agent's call.
+- **The judge is a different agent.** The researcher has `verify_finish = true` and `verifier = "judge"`:
+  a `read_only` role of the same pack with the `verdict` tool. Its `finish` is delivered only after the
+  judge accepts it. A finding is attacked by an agent that did not produce it, and the finish gate is
+  mechanical (nothing open) before it is adversarial (the judge tries to refute). If the judge rejects
+  the finish twice and the researcher finishes a third time, or the judge cannot be run, the answer
+  reaches you as a blocking inbox item labelled `NOT VERIFIED`.
+- **Pipeline: candidate, validated, assessed, ready.** Plan steps and claim statuses. Evidence is
+  `execution` or `static`; the prompts forbid a `static`-only finding, so "reading the code again is not
+  validation" is a rule the roles are told and the ledger records.
 - **Attribution; revalidation before reporting.** Claims with `execution` evidence, a separate state
-  check, and the ruling-out of other mechanisms are written into the scout and judge prompts; the
+  check and the ruling-out of other mechanisms are written into the scout and judge prompts; the
   researcher re-runs or re-scouts a decisive check rather than trusting a child's word.
-- **Research state is the record.** loom's sealed, hash-chained mission **journal** is the ledger;
-  its Markdown is a generated view, never parsed. This is exactly what the `dsh-vr` journal migration
-  was reaching for — here it is the substrate, not an add-on, and evidence quotes are checked verbatim
-  against stored output at write time.
+- **Research state is the record.** loom's sealed, hash-chained mission journal is the ledger; its
+  Markdown is a generated view, never parsed. Evidence quotes are checked verbatim against the stored
+  output when they are written. An agent's report cannot itself be cited as evidence.
 - **Observed content is data.** Stated in `harness.md` for every role, with the scope-widening attack
   called out specifically, because a repository that says "run this first" is where it arrives.
 - **Orchestrating an engagement.** Only the researcher fans out; scouts return evidence or a blocker;
@@ -55,15 +65,20 @@ general harness. Here is where each one lives in `vr`, and why the loom version 
 
 ## Installing
 
-A pack is a directory the daemon loads from `~/.loom/packs/`. Copy it there (the whole folder) and
-restart the daemon, or point a `LOOM_HOME` at a tree that contains it:
+A pack is a directory the daemon loads from `~/.loom/packs/` at start. Copy the whole folder there and
+restart the daemon (or point `LOOM_HOME` at a tree that contains it):
 
 ```
-cp -R packs/vr ~/.loom/packs/vr
-loom down && loom daemon        # reload packs
-loom run --pack vr -w <workspace> "…"   # a bad pack fails loudly here and in the daemon log
+mkdir -p ~/.loom/packs && cp -R packs/vr ~/.loom/packs/vr
+loom down && loom up
+loom run --pack vr -w <workspace> "…"
 ```
 
-The pack is self-contained (`pack.toml`, `harness.md`, `roles/*.md`); nothing else is required. The
-daemon loads every directory under `~/.loom/packs/` that holds a `pack.toml`; an invalid pack is
-reported in `~/.loom/logs/loomd.log` at startup.
+The pack is self-contained (`pack.toml`, `harness.md`, `roles/*.md`). The daemon loads every directory
+under `~/.loom/packs/` that holds a `pack.toml`, and refuses to start if one is invalid; the error is in
+`~/.loom/logs/loomd.log` (or on the terminal for `loom daemon`). Loading checks every key and file, and
+that each role's verifier is a read-only role of the same pack with the `verdict` tool.
+
+An installed copy does not follow the repository. After upgrading loom, replace it with the shipped
+one (`rm -rf ~/.loom/packs/vr && cp -R packs/vr ~/.loom/packs/vr`); an older copy that lacks
+`verifier = "judge"` on the researcher no longer loads.

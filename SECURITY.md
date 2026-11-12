@@ -1,0 +1,119 @@
+# Security
+
+## Reporting a vulnerability
+
+Use GitHub's private vulnerability reporting for this repository: open the repository's Security tab
+and choose "Report a vulnerability" (a security advisory). Please do not open a public issue for
+something exploitable. Say which version or commit you ran, what you did, and what you saw. If
+private reporting is not enabled on the repository you are looking at, open an issue that asks for a
+private channel and contains no details.
+
+## What loom is built to resist
+
+loom is a tool for **one operator** who runs it on their own machine against a model server they
+trust with their prompts. It assumes the operator is not an adversary and the other local accounts are
+not trusted. The adversary it is built against is the **model and the content the model reads**: tool
+output, files, web pages and other agents' reports can all contain instructions, and the model can make
+mistakes or be talked into harmful commands. loom limits what a command the model runs can do, keeps
+the records the model cannot edit, and does not let model text pass as the operator's or the
+harness's.
+
+### The daemon and its API
+
+- The daemon listens on a loopback address only. It refuses to start on a name that resolves to a
+  non-loopback address.
+- Every API request must carry the API token as `Authorization: Bearer <token>`, or a web-session
+  secret obtained with it. There are no cookies. The token is 32 random bytes in `~/.loom/token`
+  (mode 0600), created atomically. Anyone who can read that file as your user can drive the daemon,
+  so the protection is that of your account.
+- Requests must name the daemon's own address in `Host` and, for anything that changes state, an
+  allowed `Origin`. This stops a web page you visit from reaching the API through your browser.
+- The web page is opened with `loom open`, which trades the token for a single-use login code (valid
+  60 seconds) and then a web-session secret kept in memory by the daemon and in the tab's session
+  storage. The token is never put on a command line or in a URL.
+- Before the `loom` command or the desktop app sends the token to a listener, the listener must prove it
+  holds the token (an HMAC answer on `/healthz`). A different program on the daemon's port cannot
+  collect the token this way.
+- To use a daemon on another machine, forward its port over SSH. Do not change the bind address to a
+  non-loopback one; the daemon will not accept it.
+
+### What a command run by the model can and cannot do
+
+On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `sandbox-exec`:
+
+- **Writes** are allowed only in the session's workspace, the session's temporary directory, the
+  system temporary locations and any `extra_writable` directories. `~/.loom` (including the token, keys,
+  logs and every session record) and `<workspace>/.loom` are never writable, and a directory that holds
+  a protected path cannot be renamed or removed.
+- **Credential stores are unreadable and unwritable** by default (`protect_credentials = true`): `~/.ssh`,
+  `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`,
+  `~/.docker/config.json`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, cargo and git credential files, password
+  stores, the macOS Keychains and Cookies folders and the Chrome, Firefox and Safari profiles. So are
+  the loom token and keys and your `unreadable_paths`. A listed directory that is or contains the
+  workspace is skipped.
+- **The network** is closed except for loopback connections to the egress proxy (and any ports or sockets
+  you list). The proxy applies `[network]`: by default (`deny_all`) it forwards nothing. It resolves
+  names itself, refuses private, loopback and link-local addresses (including IPv4 addresses hidden in
+  IPv6 forms) unless you list them, applies the deny list to the resolved address, and records every
+  decision in a hash-chained audit file. Commands that listen on loopback can be reached by other
+  local processes.
+- **No LaunchServices opens, Apple Events or launchd jobs**, so a command cannot start a program
+  outside the sandbox that way.
+- **Signals** can reach only processes inside the sandbox.
+- Environment variables whose names look like secrets are not passed to commands.
+
+Commands run with your user id. The sandbox is the only barrier between them and everything your user
+can read.
+
+### Records
+
+Sessions are append-only logs in which each record names the hash of the previous one, and mission
+state is a journal sealed with an HMAC key kept outside the workspace. These make tampering and
+truncation detectable, not impossible: see the limits below.
+
+## Known limits
+
+These are the places where loom does less than the text above might suggest.
+
+- **Reads are allowed by default.** The sandbox denies reads of the credential list, the loom token
+  and keys, and `unreadable_paths`. Everything else your user can read, a command can read: your
+  documents, shell history, other projects, source trees, tokens kept in files that are not on the
+  list, and anything under a directory that is or contains the workspace. Set the workspace to the
+  smallest directory that works, and add paths to `unreadable_paths`.
+- **The seatbelt profile starts from allow-everything and subtracts.** It denies writes, the listed
+  reads, the network and the launch routes above. What it does not name is allowed: running programs,
+  reading system information, local inter-process communication. A new macOS facility is open until the
+  profile is extended. `sandbox-exec` is deprecated by Apple, though it still works. The denials of
+  LaunchServices, Apple Events and launchd jobs were checked to compile into the profile but have
+  not been exercised from a graphical login session.
+- **The file tools run in the daemon, outside the OS sandbox.** `read`, `write`, `edit`, `glob` and
+  `grep` check the resolved path against the same rules before they act, but the check and the use are
+  separate steps; a command that swaps a link between them can in principle win a race. They refuse
+  to touch anything that is not a regular file.
+- **Without macOS there is no sandbox.** On other systems the daemon starts only with
+  `[sandbox] mode = "none"`, and then commands are unconfined. The file tools still refuse the protected
+  and credential paths, and the network proxy still exists, but a command can ignore it. Do not run
+  loom in that mode on a machine or account you care about.
+- **Environment scrubbing is by name.** A secret in a variable called something that does not look
+  like one is passed through. `env_pass` passes more.
+- **Network policy is per daemon, not per session**, and is read at start. In `allowlist` mode a
+  listed host can be used by every session. Data can be sent to an allowed host.
+- **A command can talk to anything on loopback that you allow** (`loopback_ports`, `loopback_all`,
+  `unix_sockets`), including services that run as you.
+- **Tamper evidence has gaps.** Deleting a session's records together with their directory, deleting a
+  mission journal and its `journal.head` together, or restoring an older matching pair, cannot be
+  detected. A process running as you outside the sandbox can read the journal key and forge entries.
+  The audit file for requests that name no known session (`logs/net-unattributed.jsonl`) has no reader
+  in the API yet.
+- **The verifier is another model.** A `finish` that passes the verifier has been checked against
+  stored output, with its quotes compared byte for byte, but the verdict is still a model's judgement.
+- **The web UI trusts the daemon.** It is served with a strict content-security policy and no inline
+  script, but a bug in it would be a bug in a page that holds a bearer secret.
+- **The operator's machine and account are trusted.** Another process of your user, or anyone who can
+  read `~/.loom/token`, has the daemon's full power. Disk encryption, account separation and keeping the
+  token file private are your job.
+
+## Telemetry
+
+loom makes no network requests of its own. Model requests go to the server in your configuration, and
+tool traffic goes through the egress proxy under your `[network]` policy.

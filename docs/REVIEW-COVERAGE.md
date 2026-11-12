@@ -1,10 +1,17 @@
 # What loom does about the DSH and dsh-vr findings
 
+> **A dated record, not maintained.** This is the account of one verification run on 2026-11-11, against
+> the code as it was then. The "live" evidence below comes from sessions of that run on a local
+> OpenAI-compatible model server; those sessions are not kept in this repository. The code has changed
+> since, so a mechanism described here may now work differently: `docs/DESIGN.md` and the module
+> contracts describe the current behaviour, and `CHANGELOG.md` lists what changed in behaviour. The test
+> counts and session ids below are as of that run.
+
 loom was designed after auditing DeepSeek Harness (DSH) source and the dsh-vr research plugin, and
 measuring their behaviour on real session logs. This document takes the findings of those reviews,
 grouped by theme, and for each says the mechanism in loom that answers it and the evidence that it
-works. "Live" evidence is from missions run against the real dsv41 server on the LAN on 2026-11-11;
-session ids are under `~/.loom/sessions/` on the build host.
+works. "Live" evidence is from missions run against a local model server on 2026-11-11; the session ids
+are those of the run's own loom home.
 
 The through-line: in DSH the *model* is asked to manage context, judge its own certainty, and not
 leak — all by prompt. In loom those are mechanisms the model cannot see or skip, so a small model
@@ -110,7 +117,7 @@ started (`tick 1`…`tick 8`) **survived the crash** with its stored output inta
 | Writes not confined to the workspace; token/keys readable. | A macOS seatbelt sandbox allows writes only under the workspace and the session temp dir, denies writes under `~/.loom` and `<workspace>/.loom`, and denies reads of `~/.loom/token` and `~/.loom/keys`. File tools also refuse writes to content changed since the session last read it (staleness guard). |
 | dsh-vr: allowlist fails open; host guard not installed when the deny list is empty; a judge can't see the URL it judges. | Network scope is an egress proxy plus an OS sandbox that permits no other route — not shell-text parsing. Every decision is attributed to a session and logged as a `net` event; the proxy resolves the name itself and connects to the address it resolved. |
 
-**Live:** sandbox profile verified in isolation on the host — writes outside the workspace denied,
+**Live:** sandbox profile verified in isolation on the test machine — writes outside the workspace denied,
 writes under `.loom` denied, `~/.loom/token` unreadable, direct network denied except the proxy
 port, symlink escape denied, signalling processes outside the sandbox denied. The edit mission showed
 the read-before-write staleness guard in use.
@@ -131,12 +138,13 @@ quote-checking rejected a misaligned quote; finishes were gated on open items.
 
 ## What is proven, and what is not yet
 
-**Exercised live against dsv41:** single-task missions, a 3-worker code-review fan-out with
+**Exercised live against a local model server (2026-11-11):** single-task missions, a 3-worker code-review fan-out with
 independent re-verification, a multi-file edit with staleness guard and verifier, an 18-re-weave
 compaction stress run with needle retrieval, hard-crash restart recovery with job survival, and
-deny-all egress. 680 tests pass; clippy is clean.
+deny-all egress. The suite had 680 tests at that run, all passing, with clippy clean; it has grown since
+and its size is not tracked here.
 
 **Not yet exercised:** a digest-backed re-weave on genuinely huge single outputs (the stress run
 evicted by stub before a digest was needed); the notification repeat timer; a long (hours) autonomous
-run; a domain pack mirroring the research workspace (`AGENTS.md`) rather than the general `core` pack.
+run; a domain pack, rather than the general `core` pack, on a long run.
 These are the next missions, not gaps in the design.

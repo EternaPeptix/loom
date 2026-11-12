@@ -1,5 +1,5 @@
 name = "vr"
-description = "Vulnerability research on local and authorized targets: a researcher that routes an engagement into narrow experiments, scouts that run one experiment each and return executed evidence, and a judge that qualifies scope and refutes findings."
+description = "Vulnerability research on local and authorized targets: a researcher that routes an engagement into narrow experiments, scouts that run one experiment each and return executed evidence, and a judge that checks scope and refutes findings."
 default_role = "researcher"
 preamble = "harness.md"
 requires_restricted_network = true
@@ -34,10 +34,10 @@ tools = [
   "finish", "report_blocker", "wait",
 ]
 
-# The independent check. Qualifies a scope (enumerates the hosts a page authorizes), and refutes a
+# The independent check. Checks a proposed scope against the page that authorizes it, and refutes a
 # finding or a finished engagement. Cannot modify the workspace and never judges its own submission.
 [roles.judge]
-description = "Qualifies scope and refutes claims: enumerates authorized hosts from a programme page, or tries to break a finding, citing only what it examined. Read-only."
+description = "Checks a proposed scope against its programme page or tries to break a finding, citing only what it examined. Read-only."
 prompt = "roles/judge.md"
 termination = "explicit"
 read_only = true
