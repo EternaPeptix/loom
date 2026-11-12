@@ -168,8 +168,8 @@
 //!    max_minutes)}`): when either is reached and no `Budget` note has been
 //!    given, append `harness_note{Budget, texts::budget_reached(step, minutes, can_finish,
 //!    is_child)}` (`can_finish` = the registry has `finish`; `is_child` selects the wording, an
-//!    assignment's budget for a child, the session's own for a root). When the note was given and `BUDGET_GRACE_STEPS`
-//!    steps have run since, the child settles `BudgetExhausted` with
+//!    assignment's budget for a child, the session's own for a root). When the note was given and
+//!    `BUDGET_GRACE_STEPS` steps have run since, the child settles `BudgetExhausted` with
 //!    `texts::budget_exhausted_report(step, minutes, last_reply)` (`last_reply` = text of the last
 //!    own model response); a session that is not a child instead opens an inbox item (`Parked`,
 //!    blocking, text `texts::turn_failed("The session's budget is used up.")`) and the turn ends

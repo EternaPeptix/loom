@@ -117,9 +117,9 @@
 //! - the role must exist in the parent's pack and be in the parent role's `may_spawn`: otherwise
 //!   `` `{role}` is not a role this session can start. Roles it can start: {list}. ``
 //! - at most `agents.max_children` unsettled children per parent, not counting the finish gate's
-//!   verifiers (as in `children`): otherwise `{n} agents are already
-//!   running, which is the most allowed at once. Wait for one to finish (`wait`) or stop one
-//!   (`agent_stop`), then start this one.`
+//!   verifiers (as in `children`): otherwise `{n} agents are already running, which is the most
+//!   allowed at once. Wait for one to finish (`wait`) or stop one (`agent_stop`), then start this
+//!   one.`
 //! - a request with `harness: true` (the finish gate's verifier) is exempt from both of the last two rules.
 //! - `SpawnMode::Fork`: the parent's status must have a `fork_point`, and every tool of the child
 //!   role must be among the parent role's tools; otherwise `A `{role}` agent cannot be forked from
