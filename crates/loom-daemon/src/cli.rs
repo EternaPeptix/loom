@@ -5,6 +5,8 @@
 //! (`Client::from_home(&Paths::from_env())`). Errors are printed to stderr as `loom: {sentence}`
 //! and the exit code is 1 unless stated. Output goes to stdout; colour only when stdout is a
 //! terminal and `NO_COLOR` is not set; width from `COLUMNS`, else `ioctl(TIOCGWINSZ)`, else 100.
+//! The global flag `--unverified-daemon` (`client::allow_unverified_daemon`) accepts, with a warning
+//! line on stderr, a listener that cannot prove it is this home's daemon (one from an older `loom`).
 //!
 //! ## Commands
 //! - `daemon`: `serve::run`. `up`: `serve::spawn_background`, then print `loom is running on
@@ -125,6 +127,9 @@ verify_finish = true
 #[derive(Parser, Debug)]
 #[command(name = "loom", version, about = "An agent harness for long, unattended work on a local model")]
 pub struct Cli {
+    /// Talk to a daemon that cannot prove it is this home's (one started by an older loom); the token is sent anyway
+    #[arg(long, global = true)]
+    pub unverified_daemon: bool,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -371,6 +376,9 @@ pub enum ServiceAction {
 }
 /// Run one command; the result is the process's exit code.
 pub async fn run(cli: Cli) -> i32 {
+    if cli.unverified_daemon {
+        client::allow_unverified_daemon();
+    }
     match dispatch(cli.command).await {
         Ok(code) => code,
         Err(e) => {
@@ -1316,6 +1324,13 @@ mod tests {
 
     fn rejected(args: &[&str]) {
         assert!(parse(args).is_err(), "{args:?} should be rejected");
+    }
+
+    #[test]
+    fn the_unverified_daemon_flag_is_global() {
+        assert!(!parse(&["status"]).unwrap().unverified_daemon);
+        assert!(parse(&["--unverified-daemon", "down"]).unwrap().unverified_daemon);
+        assert!(parse(&["down", "--unverified-daemon"]).unwrap().unverified_daemon);
     }
 
     #[test]

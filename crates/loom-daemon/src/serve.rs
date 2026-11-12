@@ -33,7 +33,10 @@
 //! It calls `ready(bind)` once, after step 6.
 //!
 //! ## `spawn_background(paths)` — the body of `loom up`
-//! If the daemon already answers (`healthz` on the configured bind): `Ok(Already)`. Otherwise start
+//! If the daemon already answers (`healthz` on the configured bind; when the token file exists the listener must also
+//! prove it holds the token, `/healthz?nonce=`, unless `--unverified-daemon`): `Ok(Already)`. A listener that answers
+//! without the proof is refused with the identity sentence (no child is started, `daemon.json` is left alone; the
+//! same in `run_until`). Otherwise start
 //! `std::env::current_exe()` with the single argument `daemon`, `LOOM_HOME` set to `paths.home`,
 //! stdin `/dev/null`, stdout and stderr appended to `{logs}/loomd.log`, in its own session
 //! (`pre_exec` + `libc::setsid`) so it outlives the terminal. Then poll `healthz` every 100 ms for
@@ -120,13 +123,20 @@ pub async fn run_until(
     loom_tools::sandbox::preflight(&config.sandbox)?;
 
     if let Some(file) = read_daemon_file(&paths) {
-        if pid_alive(file.pid) && healthy(&file.bind, PROBE_TIMEOUT).await {
-            return Err(format!(
-                "A loom daemon is already running for {} (pid {}, {}).",
-                paths.home.display(),
-                file.pid,
-                file.bind
-            ));
+        if pid_alive(file.pid) {
+            match probe(&paths, &file.bind, PROBE_TIMEOUT).await {
+                Probe::Daemon => {
+                    return Err(format!(
+                        "A loom daemon is already running for {} (pid {}, {}).",
+                        paths.home.display(),
+                        file.pid,
+                        file.bind
+                    ));
+                }
+                // Something live holds the address and may be an older daemon: leave its `daemon.json` alone.
+                Probe::Unproven => return Err(crate::client::unproven_message(&file.bind)),
+                Probe::Nothing => {}
+            }
         }
         // The process that wrote it is gone, or it no longer serves.
         let _ = std::fs::remove_file(daemon_file_path(&paths));
@@ -197,7 +207,7 @@ pub async fn run_until(
 /// Start the daemon in the background and wait until it answers.
 pub async fn spawn_background(paths: &Paths) -> Result<Spawned, String> {
     let config = load_config(paths)?;
-    if answering(paths, &config).await {
+    if answering(paths, &config).await? {
         return Ok(Spawned::Already);
     }
     std::fs::DirBuilder::new()
@@ -231,14 +241,14 @@ pub async fn spawn_background(paths: &Paths) -> Result<Spawned, String> {
     let deadline = Instant::now() + UP_TIMEOUT;
     loop {
         if let Some(file) = read_daemon_file(paths) {
-            if file.pid == child.id() && healthy(&file.bind, PROBE_TIMEOUT).await {
+            if file.pid == child.id() && probe(paths, &file.bind, PROBE_TIMEOUT).await == Probe::Daemon {
                 return Ok(Spawned::Started);
             }
         }
         match child.try_wait() {
             Ok(Some(_)) => {
                 // It may have lost a race with another daemon that is now up.
-                if answering(paths, &config).await {
+                if answering(paths, &config).await? {
                     return Ok(Spawned::Already);
                 }
                 return Err(did_not_come_up(&log));
@@ -382,23 +392,62 @@ fn pid_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// True when `GET http://{bind}/healthz` is answered with a success within `timeout`.
-async fn healthy(bind: &str, timeout: Duration) -> bool {
-    let Ok(client) = reqwest::Client::builder().no_proxy().timeout(timeout).build() else { return false };
-    match client.get(format!("http://{bind}/healthz")).send().await {
-        Ok(response) => response.status().is_success(),
-        Err(_) => false,
+/// What answers on an address, as far as this home's daemon goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Probe {
+    /// This home's daemon (or, with `--unverified-daemon`, a listener that cannot prove it is not).
+    Daemon,
+    /// Something answers `/healthz` but did not prove it holds this home's access token.
+    Unproven,
+    /// Nothing answers.
+    Nothing,
+}
+
+/// Ask `GET http://{bind}/healthz` within `timeout`. When this home has an access token the listener must prove it
+/// holds it (`/healthz?nonce=`): any other listener on the address is not "the daemon". `allow_unverified`
+/// (`--unverified-daemon`) accepts one that cannot prove it (a daemon from before the proof), with a warning.
+async fn probe_with(paths: &Paths, bind: &str, timeout: Duration, allow_unverified: bool) -> Probe {
+    let Ok(client) = reqwest::Client::builder().no_proxy().timeout(timeout).build() else { return Probe::Nothing };
+    let token = std::fs::read_to_string(paths.token_file()).map(|t| t.trim().to_string()).unwrap_or_default();
+    if token.is_empty() {
+        return match client.get(format!("http://{bind}/healthz")).send().await {
+            Ok(response) if response.status().is_success() => Probe::Daemon,
+            _ => Probe::Nothing,
+        };
+    }
+    match crate::client::daemon_proves_identity(&client, &format!("http://{bind}"), &token, timeout).await {
+        Ok(true) => Probe::Daemon,
+        Ok(false) if allow_unverified => {
+            crate::client::warn_unverified(bind);
+            Probe::Daemon
+        }
+        Ok(false) => Probe::Unproven,
+        Err(_) => Probe::Nothing,
     }
 }
 
-/// True when a daemon for this home answers: at the address in `daemon.json`, or the configured one.
-async fn answering(paths: &Paths, config: &Config) -> bool {
+async fn probe(paths: &Paths, bind: &str, timeout: Duration) -> Probe {
+    probe_with(paths, bind, timeout, crate::client::unverified_daemon_allowed()).await
+}
+
+/// Whether this home's daemon answers: at the address in `daemon.json`, or the configured one. `Err` is the sentence
+/// for a listener that answers but would not prove itself, when no proven daemon answers anywhere.
+async fn answering(paths: &Paths, config: &Config) -> Result<bool, String> {
+    let mut unproven = None;
     if let Some(file) = read_daemon_file(paths) {
-        if pid_alive(file.pid) && healthy(&file.bind, PROBE_TIMEOUT).await {
-            return true;
+        if pid_alive(file.pid) {
+            match probe(paths, &file.bind, PROBE_TIMEOUT).await {
+                Probe::Daemon => return Ok(true),
+                Probe::Unproven => unproven = Some(file.bind),
+                Probe::Nothing => {}
+            }
         }
     }
-    healthy(&config.daemon.bind, PROBE_TIMEOUT).await
+    match probe(paths, &config.daemon.bind, PROBE_TIMEOUT).await {
+        Probe::Daemon => Ok(true),
+        Probe::Unproven => Err(crate::client::unproven_message(&config.daemon.bind)),
+        Probe::Nothing => unproven.map_or(Ok(false), |bind| Err(crate::client::unproven_message(&bind))),
+    }
 }
 
 /// Take the exclusive lock on `<home>/daemon.lock`; the returned file holds it until it is dropped. A lock that
@@ -586,6 +635,58 @@ mod tests {
         assert!(h.paths.home.join("daemon.json").exists());
         assert_eq!(spawn_background(&h.paths).await, Ok(Spawned::Already));
         stop_and_join(running).await;
+    }
+
+    /// A listener that answers `ok` to every path, as an impostor on the daemon's port would.
+    async fn impostor() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let app = axum::Router::new().fallback(|| async { "ok" });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn only_a_listener_that_proves_the_token_counts_as_the_daemon() {
+        let h = home_with("").await;
+        let running = start(&h.paths).await;
+        let other = impostor().await;
+        assert_eq!(probe_with(&h.paths, &running.2, PROBE_TIMEOUT, false).await, Probe::Daemon);
+        assert_eq!(probe_with(&h.paths, &other, PROBE_TIMEOUT, false).await, Probe::Unproven);
+        // `--unverified-daemon` accepts it, and says so.
+        assert_eq!(probe_with(&h.paths, &other, PROBE_TIMEOUT, true).await, Probe::Daemon);
+        let warnings = crate::client::WARNINGS.lock().unwrap().clone();
+        assert!(warnings.contains(&crate::client::unverified_warning(&other)), "{warnings:?}");
+        // Without a token file there is nothing to prove with: any 200 will do, as before.
+        std::fs::remove_file(h.paths.token_file()).unwrap();
+        assert_eq!(probe_with(&h.paths, &other, PROBE_TIMEOUT, false).await, Probe::Daemon);
+        stop_and_join(running).await;
+    }
+
+    #[tokio::test]
+    async fn loom_up_and_a_second_daemon_refuse_an_unproven_listener_and_leave_daemon_json_alone() {
+        let h = home_with("").await;
+        auth::load_or_create_token(&h.paths.token_file()).unwrap();
+        let other = impostor().await;
+        let config = std::fs::read_to_string(h.paths.config_file()).unwrap().replace("127.0.0.1:0", &other);
+        std::fs::write(h.paths.config_file(), config).unwrap();
+
+        // `loom up`: no child is started (nothing is logged) and the operator gets the identity sentence.
+        let err = spawn_background(&h.paths).await.unwrap_err();
+        assert_eq!(err, crate::client::unproven_message(&other));
+        assert!(err.contains("older daemon") || err.contains("older than this"), "{err}");
+        assert!(!h.paths.logs_dir().join("loomd.log").exists(), "a child daemon was started");
+
+        // The same through a `daemon.json` of a live pid: the file stays, the listener is not called a daemon.
+        let file = DaemonFile { pid: std::process::id(), bind: other.clone(), started_ms: 1 };
+        std::fs::write(h.paths.home.join("daemon.json"), serde_json::to_string(&file).unwrap()).unwrap();
+        let err = spawn_background(&h.paths).await.unwrap_err();
+        assert_eq!(err, crate::client::unproven_message(&other));
+        let err = run_until(h.paths.clone(), CancellationToken::new(), |_| {}).await.unwrap_err();
+        assert_eq!(err, crate::client::unproven_message(&other));
+        assert!(h.paths.home.join("daemon.json").exists());
     }
 
     #[tokio::test]
