@@ -135,8 +135,9 @@
 //! `join(parent, child, cancel)`: `child` must be a child of `parent` (`{child} is not an agent this
 //! session started.`) spawned with `awaited` (`{child} was started in the background; its report
 //! arrives by itself.`). Waits for the settlement; `cancel` first → `Err("Interrupted before the
-//! agent finished.")` — except during shutdown, when the call does not return at all (see
-//! *Shutdown*). The first successful join of a child queues
+//! agent finished.")`, and the settlement counts as taken (the call's result says what happened) —
+//! except during shutdown, when the call does not return at all (see *Shutdown*). The first
+//! successful join of a child queues
 //! `parent_shared.emit(Author::Agent(child), Event::ChildSettled(ChildSettled{child, outcome,
 //! report, full, usage, steps, inline: true}))`; later joins return the same settlement and queue
 //! nothing.
@@ -146,9 +147,10 @@
 //! parent if necessary. Each settlement is delivered once; one that cannot be delivered (the lead is
 //! archived) is delivered when the lead is unarchived or by the next start. A verifier the finish
 //! gate started (`harness: true`) is never delivered: its verdict belongs to the `finish` that joins it.
-//! A `harness` spawn whose parent has a verifier with the same assignment that no `join` took (a
-//! `finish` that a restart cut, made again) gets that verifier's id instead of a new one; the
-//! parent's other verifiers that nothing will take are stopped.
+//! A `harness` spawn whose parent has a verifier of the same role and assignment that a shutdown cut
+//! (no `join` took it, and it has a task and has not ended, or it ended with a verdict) gets that
+//! verifier's id instead of a new one (a `finish` that a restart cut, made again); the parent's other
+//! verifiers that no `join` took are given up, and stopped if they have not ended.
 //!
 //! `stop_child(parent, child)`: not its child → the sentence above; already settled → `{child} has
 //! already finished ({outcome word}).`; else `control.stop_turn()` and `Input::Stop`, then wait for
@@ -231,7 +233,9 @@
 //! - `resume(id)`: root only; activate; `Input::Resume` to it and to each of its unsettled children
 //!   that a restart left idle and that have not been resumed since (activating them): each gets one
 //!   `Resume` for the restart, however many operator actions follow before its turn starts. Only a
-//!   restart leaves a child idle that way: a child that is stopped settles.
+//!   restart leaves a child idle that way: a child that is stopped settles. Unsettled children that
+//!   have no task (the lead could not be opened at start) are first restored as an unarchive does,
+//!   and what children ended with while the lead could not take it is delivered.
 //! - `reweave(id)`: activate; `Input::Reweave`.
 //! - `answer(item_id, answer)`: the item must be open (`There is no open inbox item {item_id}.`);
 //!   an empty answer to a blocking item is refused (`This item is waiting for an answer; write
@@ -241,9 +245,10 @@
 //! - `archive(id, archived)`: root only; refused while the session or one of its children is
 //!   running a turn (`Stop the session before archiving it.`). Sets `archived` in the `meta.json`
 //!   of the session and its children; archiving closes their inputs (the lead's task ends `Closed`,
-//!   each child settles `Stopped`; a task keeps its place until it has ended). Unarchiving delivers
-//!   what the children settled with in the meantime, and restores those that had not settled as the
-//!   start does.
+//!   each child settles `Stopped`; a task keeps its place until it has ended). Unarchiving waits for
+//!   those tasks to end (at most `tools.kill_grace_s` + `SHUTDOWN_TASK_WAIT`), delivers what the
+//!   children settled with in the meantime, and restores those that had not settled as the start
+//!   does (an unattended mission's go on at once).
 //!   Archived sessions are listed only by `sessions(true)` and are not activated at start;
 //!   `send_message`/`resume` on one are refused (`This session is archived; unarchive it first.`).
 //!
@@ -272,17 +277,19 @@
 //!    A restored child that has had a turn is idle (the restart cut its turn, or it was between
 //!    turns) and is *held*: it is told to carry on now when it was told of a lost job, when its
 //!    mission is unattended, or when its parent carries on, and otherwise as soon as its parent is
-//!    (a message, a resume or an answer to the lead): what the lead is told about its agents
-//!    (`AFTER_RESTART`) is then what happened. A child that never had a turn starts its first one by
-//!    itself. So every child of a mission that is not archived is, after this pass, running, held
-//!    for its lead, or settled.
+//!    (a message, a resume or an answer to the lead, or any turn the lead starts, such as one a
+//!    report starts): what the lead is told about its agents (`AFTER_RESTART`) is then what
+//!    happened. A child that never had a turn starts its first one by itself. So every child of a
+//!    mission that is not archived is, after this pass, running, held for its lead (an attended
+//!    mission whose lead waits for the operator), or settled.
 //!
 //!    Children restored this way count as not `awaited` from now on.
 //!
 //!    A delivery lost to the restart is recovered: a child that has ended and whose parent's log
 //!    holds no `child_settled` for it is delivered to the parent as `Input::ChildSettled`, from its
-//!    `settlement.json` or else from its log (see *Files*) — unless the call that started it was
-//!    `awaited` and has a recorded result (which told the lead how it ended), or it is a verifier of
+//!    `settlement.json` or else from its log (see *Files*) — unless it had ended and the call that
+//!    started it was `awaited` and has a recorded result (which told the lead how it ended; an agent
+//!    that a shutdown cut instead of stopping goes on, and is delivered), or it is a verifier of
 //!    the finish gate (known from the `child_spawned` record of a `finish` call). A settlement made
 //!    during this pass is left to this recovery.
 //!
@@ -311,7 +318,12 @@
 //! as interrupted while the child's report arrives by itself. What the call queued for the parent's
 //! log (`child_spawned`, `ledger`) is appended to it before the task parks, so that the next start
 //! knows what the call started: a `finish` made again after the restart joins the verifier it had
-//! started (or takes the verdict that verifier gave) instead of starting a second one.
+//! started (or takes the verdict that verifier gave) instead of starting a second one. A report that
+//! another `join` of the same call took (`agent_fanout`) is appended with `inline: false`, so that the
+//! lead is shown it although the call has no result.
+//!
+//! A runtime dropped without `shutdown` (the daemon unwinding) lets go of its tasks the same way
+//! (`Control::stop_for_shutdown` before their inputs close): no agent is settled because of it.
 //!
 //! ## Reading
 //! - `sessions(include_archived)`: newest first. `session(id)`.
@@ -844,6 +856,17 @@ struct Inner {
     pagers: Mutex<Vec<(SessionId, Arc<Mutex<PageReader>>)>>,
 }
 
+impl Drop for Inner {
+    /// Let go of the tasks without `shutdown` (the daemon unwinding) as a shutdown does, before their
+    /// inputs close: an agent is then cut for the next start, not settled as stopped by the operator.
+    fn drop(&mut self) {
+        let st = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
+        for a in st.known.values().filter_map(|k| k.active.as_ref()) {
+            a.control.stop_for_shutdown();
+        }
+    }
+}
+
 struct SinkImpl(Weak<Inner>);
 
 impl Sink for SinkImpl {
@@ -897,11 +920,9 @@ impl Orchestrator for Orch {
         if !req.harness {
             return inner.spawn_child(parent, req);
         }
-        if let Some(verifier) = inner.cut_verifier(parent, &req.brief) {
+        if let Some(verifier) = inner.cut_verifier(parent, &req.role, &req.brief) {
             // The finish waits for it now: one the restart left idle goes on (an ended one has its verdict).
-            if inner.activate(&verifier).is_ok() {
-                inner.resume_held(&verifier);
-            }
+            inner.resume_held(&verifier);
             return Ok(verifier);
         }
         let brief = req.brief.clone();
@@ -947,6 +968,11 @@ impl Orchestrator for Orch {
                         }
                         inner.st().parked.insert(parent.clone());
                         std::future::pending::<()>().await;
+                    }
+                    // The call's result says that it was interrupted: nothing takes this settlement any
+                    // more (a `finish` made again starts a new verifier).
+                    if let Some(k) = inner.st().known.get_mut(child) {
+                        k.joined = true;
                     }
                     return Err("Interrupted before the agent finished.".to_string());
                 }
@@ -1211,6 +1237,26 @@ impl Inner {
         let _ = tokio::time::timeout(wait, all).await;
     }
 
+    /// Wait until no task of `ids` is ending after its inputs were closed (an archive), up to the kill
+    /// grace of its jobs plus [`SHUTDOWN_TASK_WAIT`], as a shutdown waits for its tasks.
+    async fn until_closed(&self, ids: &[SessionId]) {
+        let wait = Duration::from_secs(self.config.tools.kill_grace_s).saturating_add(SHUTDOWN_TASK_WAIT);
+        let begun = tokio::time::Instant::now();
+        loop {
+            let closing = {
+                let st = self.st();
+                let closed = |id: &SessionId| {
+                    st.known.get(id).and_then(|k| k.active.as_ref()).is_some_and(|a| a.inputs.is_closed())
+                };
+                ids.iter().any(closed)
+            };
+            if !closing || begun.elapsed() >= wait {
+                return;
+            }
+            tokio::time::sleep(SHUTDOWN_POLL).await;
+        }
+    }
+
     /// `child` must be an unsettled child of `parent`; the error is a sentence for the model.
     fn check_child(&self, parent: &SessionId, child: &SessionId) -> Result<(), String> {
         let st = self.st();
@@ -1272,14 +1318,29 @@ impl Inner {
     }
 
     fn on_status(&self, session: &SessionId, status: &Status) {
-        {
+        let held: Vec<SessionId> = {
             let mut st = self.st();
-            if let Some(k) = st.known.get_mut(session) {
-                k.status = status.clone();
-                if status.phase == Phase::Running {
-                    k.held = false;
+            let started = match st.known.get_mut(session) {
+                Some(k) => {
+                    let started = k.status.phase != Phase::Running && status.phase == Phase::Running;
+                    k.status = status.clone();
+                    if status.phase == Phase::Running {
+                        k.held = false;
+                    }
+                    started
                 }
+                None => false,
+            };
+            // A lead that starts a turn, whatever started it, takes the agents a restart left idle along.
+            if started {
+                let mine = |k: &Known| k.held && k.meta.parent.as_ref() == Some(session);
+                st.known.iter().filter(|(_, k)| mine(k)).map(|(id, _)| id.clone()).collect()
+            } else {
+                Vec::new()
             }
+        };
+        for id in &held {
+            self.resume_held(id);
         }
         let dir = self.paths.session_dir(session);
         if dir.is_dir() {
@@ -1842,17 +1903,18 @@ impl Inner {
         })
     }
 
-    /// Deliveries lost to a restart, or to a lead that was archived when its agents settled: an agent
-    /// of a live lead (of those `scope` selects) has ended, its settlement did not reach the lead, and
-    /// the lead's log holds no `child_settled` for it. It is delivered as `Input::ChildSettled`, from the
-    /// settlement kept in memory or in `settlement.json`, or else from its log (see *Files*), unless
-    /// the lead was told already: the call that started an `awaited` agent has a recorded result,
-    /// which said that the agent was stopped. A verifier of the finish gate is not delivered: its
-    /// settlement is kept for the `finish` made again ([`Inner::cut_verifier`]). Marks the agents the
-    /// finish gate started. Returns the leads something was delivered to.
+    /// Deliveries lost to a restart, or to a lead that was archived or not running when its agents
+    /// settled: an agent of a live lead (of those `scope` selects) has ended, its settlement did not
+    /// reach the lead, and the lead's log holds no `child_settled` for it. It is delivered as
+    /// `Input::ChildSettled`, from the settlement kept in memory or in `settlement.json`, or else from
+    /// its log (see *Files*), unless the lead was told already: the call that started an `awaited`
+    /// agent that had ended has a recorded result, which said that the agent was stopped. A verifier
+    /// of the finish gate is not delivered: its settlement is kept for the `finish` made again
+    /// ([`Inner::cut_verifier`]). Marks the agents the finish gate started. Returns the leads something
+    /// was delivered to.
     fn recover_settlements(self: &Arc<Self>, scope: impl Fn(&Known) -> bool) -> HashSet<SessionId> {
         let mut delivered_to = HashSet::new();
-        let candidates: Vec<(SessionId, SessionId, SessionMeta)> = {
+        let candidates: Vec<(SessionId, SessionId, SessionMeta, bool)> = {
             let st = self.st();
             st.known
                 .iter()
@@ -1860,20 +1922,22 @@ impl Inner {
                     let parent = k.meta.parent.clone()?;
                     let parent_ok = st.known.get(&parent).is_some_and(|p| !p.meta.archived && p.status.phase != Phase::Ended);
                     let wanted = scope(k) && !k.joined && !k.meta.archived && parent_ok;
-                    wanted.then(|| (id.clone(), parent, k.meta.clone()))
+                    wanted.then(|| (id.clone(), parent, k.meta.clone(), k.finished()))
                 })
                 .collect()
         };
         // First what the leads' logs say about each agent; then the deliveries.
         let mut seen: HashMap<SessionId, Spawns> = HashMap::new();
         let mut open: Vec<(SessionId, SessionId, SessionMeta, bool)> = Vec::new();
-        for (id, parent, meta) in candidates {
+        for (id, parent, meta, ended) in candidates {
             let spawns = seen.entry(parent.clone()).or_insert_with(|| {
                 read_records(&self.paths.session_log(&parent)).map(|r| Spawns::of(&r.records)).unwrap_or_default()
             });
             let gate = spawns.gate.get(&id).cloned();
-            // The lead had it: nothing is delivered, and a `finish` made again does not take it.
-            let had = spawns.settled.contains(&id) || (meta.awaited && spawns.answered.contains(&id));
+            // The lead had it: nothing is delivered, and a `finish` made again does not take it. A result
+            // of the call told the lead how the agent ended only if it had: one that a shutdown cut
+            // instead of stopping goes on, and its report is delivered.
+            let had = spawns.settled.contains(&id) || (meta.awaited && ended && spawns.answered.contains(&id));
             if let Some(k) = self.st().known.get_mut(&id) {
                 k.joined |= had;
                 if gate.is_some() {
@@ -1986,8 +2050,23 @@ impl Inner {
 
     /// Tell the children of `lead` that a restart left idle to carry on (see `held`). An agent gets one
     /// `Resume` for the cut: a second one would start a turn it did not ask for once the resumed one
-    /// ends.
+    /// ends. Agents without a task (their lead could not be opened when the runtime started) are
+    /// restored first, and what they ended with meanwhile is delivered.
     fn resume_cut_children(self: &Arc<Self>, lead: &SessionId) {
+        let (restore, recover) = {
+            let st = self.st();
+            let mine: Vec<&Known> = st.known.values().filter(|k| k.meta.parent.as_ref() == Some(lead)).collect();
+            (
+                mine.iter().any(|k| !k.finished() && k.active.is_none()),
+                mine.iter().any(|k| k.finished() && k.restored && !k.joined && k.gate.is_none()),
+            )
+        };
+        if restore {
+            self.restore_children(|p| p == lead);
+        }
+        if restore || recover {
+            self.recover_settlements(|k| k.meta.parent.as_ref() == Some(lead) && k.restored);
+        }
         let children: Vec<SessionId> = {
             let st = self.st();
             st.known
@@ -2015,9 +2094,10 @@ impl Inner {
         }
     }
 
-    /// The agents of `leads` that have not settled, after a restart or an unarchive: each is
-    /// activated, so that a stop or an archive reaches it, and becomes `held` when it will not run by
-    /// itself (a restart cut its turn, or left it idle): it is resumed when its lead goes on. One
+    /// The agents of `leads` that have not settled and have no task, after a restart or an unarchive:
+    /// each is activated, so that a stop or an archive reaches it, and becomes `held` when it will not
+    /// run by itself (a restart cut its turn, or left it idle). As at the start, it is resumed now when
+    /// it was told of a lost job or its mission is unattended, and otherwise when its lead goes on. One
     /// that cannot be opened any more is settled `Failed` on its behalf, with what went wrong, so
     /// that its lead is not left waiting for it; a recovery delivers that.
     fn restore_children(self: &Arc<Self>, leads: impl Fn(&SessionId) -> bool) {
@@ -2030,17 +2110,22 @@ impl Inner {
                         leads(p) && st.known.get(p).is_some_and(|p| !p.meta.archived && p.status.phase != Phase::Ended)
                     }) && !k.meta.archived
                         && !k.finished()
+                        && k.active.is_none()
                 })
                 .map(|(id, _)| id.clone())
                 .collect()
         };
         for id in children {
             match self.activate(&id) {
-                Ok(_) => {
-                    let mut st = self.st();
-                    if let Some(k) = st.known.get_mut(&id) {
+                Ok(a) if a.already => {}
+                Ok(a) => {
+                    let resume = self.st().known.get_mut(&id).is_some_and(|k| {
                         // An agent that never started a turn starts its first one by itself.
                         k.held = !k.finished() && k.status.phase != Phase::Running && k.status.last_end.is_some();
+                        k.held && (a.woken || k.meta.unattended)
+                    });
+                    if resume {
+                        self.resume_held(&id);
                     }
                 }
                 Err(e) => {
@@ -2091,22 +2176,29 @@ impl Inner {
         }
     }
 
-    /// The verifier that a finish of `parent` started for `brief` and that no `join` took, for the
-    /// finish made again after a restart cut it: the gate joins that one (or takes the verdict it
-    /// already gave) instead of starting a second. The other verifiers of `parent` that nothing will
-    /// take any more are stopped.
-    fn cut_verifier(&self, parent: &SessionId, brief: &Brief) -> Option<SessionId> {
+    /// The verifier of `role` that a finish of `parent` started for `brief` and that a shutdown cut, for
+    /// the finish made again after the restart: the gate joins that one (or takes the verdict it
+    /// already gave) instead of starting a second. Only one that has a task and has not ended, or that
+    /// ended with a verdict, is taken. The other verifiers of `parent` that no `join` took are given up:
+    /// nothing takes them any more, and one that has not ended is stopped.
+    fn cut_verifier(&self, parent: &SessionId, role: &str, brief: &Brief) -> Option<SessionId> {
         let (found, stale) = {
-            let st = self.st();
+            let mut st = self.st();
             let mut found = None;
             let mut stale = Vec::new();
-            for (id, k) in st.known.iter().filter(|(_, k)| k.meta.parent.as_ref() == Some(parent) && !k.joined) {
+            for (id, k) in st.known.iter_mut().filter(|(_, k)| k.meta.parent.as_ref() == Some(parent) && !k.joined) {
                 let Some(given) = &k.gate else { continue };
-                // An ended verifier whose settlement could not be read gives nothing to take.
-                let usable = k.settlement.is_some() || !k.finished();
-                if found.is_none() && usable && given == brief {
+                // One that was stopped, failed, or ended without a verdict gives nothing to take.
+                let verdict = k.settlement.as_ref().is_some_and(|s| {
+                    s.payload.get("accepted").is_some_and(serde_json::Value::is_boolean)
+                });
+                let usable = verdict || (!k.finished() && k.active.is_some());
+                if found.is_none() && usable && given == brief && k.meta.role == role {
                     found = Some(id.clone());
-                } else if !k.finished() {
+                    continue;
+                }
+                k.joined = true;
+                if !k.finished() {
                     stale.push(id.clone());
                 }
             }
@@ -2134,7 +2226,12 @@ impl Inner {
                 return;
             }
         };
-        for (author, event) in queued {
+        for (author, mut event) in queued {
+            // A report a `join` of the call took has no result to be shown in: it is shown as one that
+            // arrived by itself.
+            if let Event::ChildSettled(c) = &mut event {
+                c.inline = false;
+            }
             match log.append(author, event) {
                 Ok(record) => self.on_record(parent, &record),
                 Err(e) => {
@@ -2151,8 +2248,8 @@ impl Inner {
 struct Spawns {
     /// Agents whose settlement the log holds.
     settled: HashSet<SessionId>,
-    /// Agents whose starting call has a recorded result: the lead of an `awaited` one was told how
-    /// it ended (its report, or that it was stopped).
+    /// Agents whose starting call has a recorded result: the lead of an `awaited` one that had ended
+    /// was told how it ended (its report, or that it was stopped).
     answered: HashSet<SessionId>,
     /// Verifiers of the finish gate (started by a `finish` call), with the assignment each was given.
     gate: HashMap<SessionId, Brief>,
@@ -2775,6 +2872,9 @@ impl Runtime {
         // which reaches the lead when the mission is unarchived.
         drop(closing);
         if !archived {
+            // A task an archive closed keeps its place until it has ended, and what is handed to it is
+            // lost: those of the family end first.
+            self.inner.until_closed(&family).await;
             // What the agents settled with while the mission was archived is delivered now, and an
             // agent that had not settled goes on with its lead (or is settled, if it cannot be opened).
             self.inner.restore_children(|p| p == id);
@@ -3770,11 +3870,14 @@ mod tests {
         orch.spawn(&id, req("worker", false)).await.unwrap();
         let err = orch.spawn(&id, req("verifier", false)).await.unwrap_err();
         assert!(err.contains("most allowed"), "{err}");
-        orch.spawn(&id, req("verifier", true)).await.unwrap();
+        let verifier = orch.spawn(&id, req("verifier", true)).await.unwrap();
         // `chat` is not in the lead's may_spawn: only the harness may start it.
         let err = orch.spawn(&id, req("chat", false)).await.unwrap_err();
         assert!(err.contains("is not a role this session can start"), "{err}");
-        orch.spawn(&id, req("chat", true)).await.unwrap();
+        // Started, not the verifier with the same assignment handed back.
+        let chat = orch.spawn(&id, req("chat", true)).await.unwrap();
+        assert_ne!(chat, verifier);
+        assert_eq!(e.rt.session(&chat).unwrap().meta.role, "chat");
         e.rt.shutdown().await;
         // During a shutdown even the harness gets the sentence that `finish` takes for a restart, not a failure.
         assert_eq!(orch.spawn(&id, req("verifier", true)).await.unwrap_err(), crate::rtools::SHUTTING_DOWN);
@@ -4047,27 +4150,39 @@ mod tests {
             if !has_tool(body, "agent_spawn") {
                 return idle_worker(body);
             }
-            match tool_msgs(body) {
-                0 => call("agent_spawn", json!({"question": "CHILDMARK", "background": true})),
-                // By the time this reply arrives the worker is waiting for its job.
-                1 => Action::Reply(
-                    Reply::tool("agent_stop", json!({"agent": started_agent(body)}).to_string()).with_delay_ms(2_000),
-                ),
-                _ => finish("lead done"),
+            if mentions(body, "STOPMARK") {
+                // One reply: finish runs as soon as agent_stop has returned.
+                let stop = json!({"agent": started_agent(body)}).to_string();
+                let done = json!({"answer": "lead done"}).to_string();
+                return Action::Reply(Reply::tools([("agent_stop", stop), ("finish", done)]));
+            }
+            if tool_msgs(body) == 0 {
+                call("agent_spawn", json!({"question": "CHILDMARK", "background": true}))
+            } else {
+                call("wait", json!({}))
             }
         }))
         .await;
         let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
-        until("the lead finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished })))
-            .await;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
         let child = e.children(&id)[0].meta.id.clone();
+        until_idle(&e, &child).await;
+        e.rt.send_message(&id, "STOPMARK").await.unwrap();
+        let turn_ends = || e.records(&id).iter().filter(|r| matches!(r.event, Event::TurnEnd { .. })).count();
+        until("the lead's turn ended", || turn_ends() >= 2).await;
         assert!(stopped_while_idle(&e, &child, texts::REASON_PARENT), "{:?}", e.kinds(&child));
         assert_eq!(e.rt.session(&child).unwrap().status.outcome, Some(SessionOutcome::Stopped));
-        let reqs = e.server.requests();
-        let stopped = format!("{child} was stopped; anything it had not delivered is in its record");
-        assert!(reqs.iter().any(|b| mentions(b, &stopped)), "the result did not say the agent was stopped");
-        assert!(!reqs.iter().any(|b| mentions(b, "has not ended yet")));
-        assert!(!reqs.iter().any(|b| mentions(b, "finish was refused")), "finish was refused for a stopped agent");
+        let result = |name: &str| {
+            e.records(&id).into_iter().find_map(|r| match r.event {
+                Event::ToolResult(t) if t.name == name => Some(t),
+                _ => None,
+            })
+        };
+        let stopped = result("agent_stop").unwrap();
+        assert!(stopped.text.contains(&format!("{child} was stopped; anything it had not delivered")), "{}", stopped.text);
+        let finished = result("finish").unwrap();
+        assert_eq!(finished.status, loom_core::event::ToolStatus::Ok, "{}", finished.text);
+        assert!(e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished })));
         e.rt.shutdown().await;
     }
 
@@ -4372,6 +4487,15 @@ mod tests {
     /// Afterwards the worker delivers `CHILDREPORT` and the lead waits for it. Returns the second
     /// runtime, the lead, and the number of requests made before the restart.
     async fn restart_with_an_unfinished_child(awaited: bool, attended: bool) -> (Env, Runtime, SessionId, usize) {
+        restart_with_an_unfinished_child_and(awaited, attended, |_, _| {}).await
+    }
+
+    /// The same, with `between` done to the home (given the lead) while the runtime is down.
+    async fn restart_with_an_unfinished_child_and(
+        awaited: bool,
+        attended: bool,
+        between: impl FnOnce(&Env, &SessionId),
+    ) -> (Env, Runtime, SessionId, usize) {
         let after = Arc::new(AtomicBool::new(false));
         let flag = after.clone();
         let e = env(Script::new(move |body, _| {
@@ -4409,6 +4533,7 @@ mod tests {
         }
         let before = e.server.requests().len();
         after.store(true, Ordering::SeqCst);
+        between(&e, &id);
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         (e, rt2, id, before)
     }
@@ -4472,6 +4597,39 @@ mod tests {
         rt2.shutdown().await;
     }
 
+    /// Move the workspace away while the runtime is down: the mission's sessions cannot be opened.
+    fn without_the_workspace(e: &Env, _: &SessionId) {
+        std::fs::rename(&e.ws, e.dir.path().join("ws-away")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lead_that_could_not_be_opened_at_start_takes_its_cut_child_along_when_the_operator_writes() {
+        let (e, rt2, id, before) = restart_with_an_unfinished_child_and(false, true, without_the_workspace).await;
+        assert!(rt2.sessions(true).iter().all(|s| !s.active && s.status.phase != Phase::Ended));
+        std::fs::rename(e.dir.path().join("ws-away"), &e.ws).unwrap();
+        rt2.send_message(&id, "carry on").await.unwrap();
+        the_child_was_resumed_as_the_lead_is_told(&e, &rt2, &id, before).await;
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unarchiving_an_unattended_mission_resumes_the_agent_a_restart_cut() {
+        let (e, rt2, id, before) = restart_with_an_unfinished_child_and(false, false, without_the_workspace).await;
+        rt2.archive(&id, true).await.unwrap();
+        std::fs::rename(e.dir.path().join("ws-away"), &e.ws).unwrap();
+        rt2.archive(&id, false).await.unwrap();
+        // As the start would have: the worker goes on by itself, and its report reaches the lead.
+        let rt = rt2.clone();
+        until("the report reached the lead", || {
+            rt.records(&id, None, 2_000).is_ok_and(|rs| {
+                rs.iter().any(|r| matches!(&r.event, Event::ChildSettled(c) if c.report.contains("CHILDREPORT")))
+            })
+        })
+        .await;
+        assert_eq!(e.server.requests()[before..].iter().filter(|b| !has_tool(b, "agent_spawn")).count(), 1);
+        rt2.shutdown().await;
+    }
+
     #[tokio::test]
     async fn shutdown_inside_an_awaited_agent_spawn_records_no_result_and_the_child_is_resumed() {
         let (e, rt2, id, before) = restart_with_an_unfinished_child(true, false).await;
@@ -4483,6 +4641,99 @@ mod tests {
         assert!(mentions(&first, "no result recorded"), "{first}");
         // What the call queued was written before it parked: the restart knew the agent it started.
         assert!(rs.iter().any(|r| matches!(&r.event, Event::ChildSpawned(c) if c.call_id.is_some())));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_awaited_agent_whose_call_has_a_result_but_that_a_shutdown_cut_still_reports() {
+        // What a shutdown inside agent_fanout's spawn loop leaves: the call's result says that no agent
+        // was left running, but the agent it had started was cut, not stopped, and goes on.
+        let answer = |e: &Env, id: &SessionId| {
+            let path = e.rt.paths().session_log(id);
+            let records = read_records(&path).unwrap().records;
+            let call_id = records.into_iter().find_map(|r| match r.event {
+                Event::ChildSpawned(c) => c.call_id,
+                _ => None,
+            });
+            let (mut log, _) = SessionLog::open(&path, Durability::Always).unwrap();
+            let result = loom_core::event::ToolResult {
+                call_id: call_id.unwrap(),
+                name: "agent_spawn".into(),
+                status: loom_core::event::ToolStatus::Error,
+                text: format!("{SHUTTING} No agent was left running."),
+                output: None,
+                cut: false,
+                class: loom_core::event::ToolClass::State,
+                meta: Default::default(),
+                duration_ms: 0,
+            };
+            log.append(Author::Tool, Event::ToolResult(result)).unwrap();
+        };
+        let (e, rt2, id, before) = restart_with_an_unfinished_child_and(true, false, answer).await;
+        the_child_was_resumed_as_the_lead_is_told(&e, &rt2, &id, before).await;
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_report_a_cut_agent_fanout_had_taken_reaches_the_lead_once_after_the_restart() {
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let e = env(Script::new(move |body, _| {
+            let go = flag.load(Ordering::SeqCst);
+            if has_tool(body, "agent_spawn") {
+                if go && mentions(body, "BREPORT") {
+                    finish("lead done")
+                } else if go {
+                    call("wait", json!({}))
+                } else if tool_msgs(body) == 0 {
+                    call("agent_fanout", json!({"agents": [{"question": "AMARK"}, {"question": "BMARK"}]}))
+                } else {
+                    Action::Stall { ms: 600_000 }
+                }
+            } else if mentions(body, "AMARK") {
+                finish("AREPORT")
+            } else if go {
+                finish("BREPORT")
+            } else {
+                Action::Stall { ms: 600_000 }
+            }
+        }))
+        .await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("both agents started", || e.children(&id).len() == 2).await;
+        let a = e.children(&id).into_iter().find(|c| c.meta.title == "AMARK").unwrap().meta.id;
+        until("A ended", || e.rt.session(&a).is_some_and(|s| s.status.phase == Phase::Ended)).await;
+        let b_asked = || e.server.requests().iter().any(|b| mentions(b, "BMARK") && !has_tool(b, "agent_spawn"));
+        until("B is inside a request", b_asked).await;
+        // The fanout's join takes A's report before the shutdown cuts the call.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        e.rt.shutdown().await;
+        let before = e.server.requests().len();
+        after.store(true, Ordering::SeqCst);
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let rt = rt2.clone();
+        until("the lead finished", || {
+            rt.records(&id, None, 2_000)
+                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })))
+        })
+        .await;
+        let reqs = e.server.requests();
+        let lead: Vec<&Value> = reqs[before..].iter().filter(|b| has_tool(b, "agent_spawn")).collect();
+        assert!(!lead.is_empty());
+        for body in &lead {
+            assert_eq!(body.to_string().matches("AREPORT").count(), 1, "{body}");
+        }
+        let of_a: Vec<ChildSettled> = rt2
+            .records(&id, None, 2_000)
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::ChildSettled(c) if c.child == a => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(of_a.len(), 1);
+        assert!(!of_a[0].inline);
         rt2.shutdown().await;
     }
 
@@ -4533,6 +4784,47 @@ mod tests {
         assert_eq!(settled.len(), 1);
         assert_eq!((&settled[0].child, settled[0].inline), (&verifier, true));
         rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_finish_made_again_after_an_operator_stop_cut_its_verification_starts_a_new_verifier() {
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let e = env_with(
+            Script::new(move |body, _| {
+                if !has_tool(body, "verdict") {
+                    finish("lead done")
+                } else if flag.load(Ordering::SeqCst) {
+                    verifier_turn(body, true)
+                } else {
+                    Action::Stall { ms: 600_000 }
+                }
+            }),
+            false,
+            |c| c.agents.verify_finish = true,
+        )
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("the verifier's request", || e.server.requests().iter().any(|b| has_tool(b, "verdict"))).await;
+        e.rt.stop(&id).await.unwrap();
+        let stopped = |ev: &Event| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Stopped });
+        until("the lead stopped", || e.has(&id, stopped)).await;
+        let first = e.children(&id)[0].meta.id.clone();
+        until("the verifier stopped", || e.rt.session(&first).is_some_and(|s| s.status.phase == Phase::Ended)).await;
+        after.store(true, Ordering::SeqCst);
+        // The same answer again: the stopped verifier gave no verdict, so a new one runs.
+        e.rt.resume(&id).await.unwrap();
+        until("delivered", || inbox_kinds(&e).contains(&InboxKind::Finished)).await;
+        let kids = e.children(&id);
+        assert_eq!(kids.len(), 2);
+        let second = kids.iter().map(|k| k.meta.id.clone()).find(|k| *k != first).unwrap();
+        let item = e.rt.inbox().into_iter().find(|i| i.item.kind == InboxKind::Finished).unwrap().item;
+        assert!(item.text.contains(&format!("[verified by {second}]")), "{}", item.text);
+        assert!(!inbox_kinds(&e).contains(&InboxKind::Blocker));
+        let finishes = e.rt.ledger(&info.meta.mission).unwrap().state.finishes;
+        assert_eq!(finishes.iter().map(|f| f.accepted).collect::<Vec<_>>(), vec![None, Some(true)]);
+        e.rt.shutdown().await;
     }
 
     #[tokio::test]
@@ -4597,6 +4889,63 @@ mod tests {
             .collect();
         assert_eq!(reports.len(), 2, "{reports:?}");
         assert!(reports[0].contains("AREPORT") && reports[1].contains("BREPORT"), "{reports:?}");
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_agent_held_after_a_restart_goes_on_when_a_report_starts_its_leads_turn() {
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let e = env(Script::new(move |body, _| {
+            let go = flag.load(Ordering::SeqCst);
+            if has_tool(body, "agent_spawn") {
+                if mentions(body, "AREPORT") && mentions(body, "BREPORT") {
+                    finish("lead done")
+                } else if tool_msgs(body) < 2 {
+                    let question = if tool_msgs(body) == 0 { "AMARK" } else { "BMARK" };
+                    call("agent_spawn", json!({"question": question, "background": true}))
+                } else {
+                    call("wait", json!({}))
+                }
+            } else if mentions(body, "AMARK") {
+                if go { finish("AREPORT") } else { Action::Stall { ms: 600_000 } }
+            } else if go {
+                finish("BREPORT")
+            } else {
+                idle_worker(body)
+            }
+        }))
+        .await;
+        let mut new = e.new_session(Some("go"));
+        new.unattended = Some(false);
+        let id = e.rt.create_session(new).await.unwrap().meta.id;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        let b = e.children(&id).into_iter().find(|c| c.meta.title == "BMARK").unwrap().meta.id;
+        until_idle(&e, &b).await;
+        let a_asked = || e.server.requests().iter().any(|r| mentions(r, "AMARK") && !has_tool(r, "agent_spawn"));
+        until("A is inside a request", a_asked).await;
+        e.rt.shutdown().await;
+        after.store(true, Ordering::SeqCst);
+        // Attended: A is held. B was told of its lost job and reports; that report starts the lead's
+        // turn, and A goes on with it.
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let rt = rt2.clone();
+        until("the lead finished", || {
+            rt.records(&id, None, 2_000)
+                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })))
+        })
+        .await;
+        let reports: Vec<String> = rt2
+            .records(&id, None, 2_000)
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::ChildSettled(c) => Some(c.report),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports.len(), 2, "{reports:?}");
+        assert!(reports[0].contains("BREPORT") && reports[1].contains("AREPORT"), "{reports:?}");
         rt2.shutdown().await;
     }
 
@@ -4883,18 +5232,22 @@ mod tests {
 
     #[tokio::test]
     async fn an_agent_whose_inputs_close_outside_a_shutdown_settles_and_its_lead_gets_the_settlement() {
-        let e = env(Script::new(|body, _| {
+        let script = Script::new(|body, _| {
             if !has_tool(body, "agent_spawn") {
-                idle_worker(body)
-            } else if mentions(body, "was stopped after") {
-                finish("lead done")
-            } else if tool_msgs(body) == 0 {
-                call("agent_spawn", json!({"question": "CHILDMARK", "background": true}))
-            } else {
-                call("wait", json!({}))
+                return idle_worker(body);
             }
-        }))
-        .await;
+            if mentions(body, "was stopped after") {
+                return finish("lead done");
+            }
+            match tool_msgs(body) {
+                // The lead's own job ignores TERM: its task is still ending (until the KILL after the
+                // grace) when the mission is unarchived.
+                0 => call("bash", json!({"command": "trap '' TERM; sleep 600", "background": true})),
+                1 => call("agent_spawn", json!({"question": "CHILDMARK", "background": true})),
+                _ => call("wait", json!({})),
+            }
+        });
+        let e = env_with(script, false, |c| c.tools.kill_grace_s = 3).await;
         let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
         until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
         let child = e.children(&id)[0].meta.id.clone();
@@ -4914,6 +5267,33 @@ mod tests {
         assert_eq!(settled.len(), 1);
         assert!(matches!(&settled[0].event, Event::ChildSettled(c) if c.outcome == ChildOutcome::Stopped && !c.inline));
         e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_runtime_dropped_without_shutdown_cuts_its_idle_agent_instead_of_settling_it() {
+        let e = env(Script::new(|body, _| {
+            if !has_tool(body, "agent_spawn") {
+                idle_worker(body)
+            } else if tool_msgs(body) == 0 {
+                call("agent_spawn", json!({"question": "CHILDMARK", "background": true}))
+            } else {
+                call("wait", json!({}))
+            }
+        }))
+        .await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        let child = e.children(&id)[0].meta.id.clone();
+        until_idle(&e, &child).await;
+        let log = e.rt.paths().session_log(&child);
+        // The daemon unwinding drops its runtime: the sessions' inputs close without a shutdown.
+        let Env { dir, server, rt, .. } = e;
+        drop(rt);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let rs = read_records(&log).unwrap().records;
+        assert!(!rs.iter().any(|r| matches!(r.event, Event::SessionEnd { .. })), "the agent was settled");
+        assert!(!rs.iter().any(|r| matches!(&r.event, Event::Interrupted { reason } if reason == texts::REASON_OPERATOR)));
+        drop((dir, server));
     }
 
     /// Store `data` and make the blob two hours old.
