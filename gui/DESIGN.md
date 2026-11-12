@@ -115,7 +115,9 @@ child is still the current one at the moment it is delivered on the main actor.
 
 ## Daemon client (`Net/DaemonClient.swift`)
 
-Talks to the active `baseURL` with `Authorization: Bearer <token>`. Two jobs:
+Talks to the active `baseURL` with `Authorization: Bearer <token>`. Every attempt, and the snapshot after
+an ended stream, is preceded by the `/healthz` nonce proof; a wrong proof fails the link and an
+unreachable daemon is retried without the token being sent. Two jobs:
 
 - **Counts**, for the menu bar and status line: subscribe to `GET /api/events` (SSE). Frames carry
   only `data:` (no `event:` line); the kind is the JSON `type` (`session`, `status`, `record`,
@@ -141,9 +143,12 @@ A `WKWebView` wrapped in `NSViewRepresentable`. It logs in with a one-time code.
 its identity: `GET <baseURL>/healthz?nonce=<N>` (N = 64 random hex characters, no token sent) must answer
 `{"ok": true, "proof": "<hex>"}` with proof = HMAC-SHA256 keyed with the token's bytes over the ASCII
 `loom-healthz-v1:` followed by N, compared in constant time. This is done on connect, before every login
-code request, and at the start of every attempt of the daemon client and again before the snapshot that follows an ended stream (a wrong answer after connect turns the link to failed with that message); when the proof is missing or wrong
-the token is not sent and the app says that something answered but did not prove it is the daemon for this
-token, and that a daemon older than the app must be restarted on the new version. Then the app (which
+code request, and at the start of every attempt of the daemon client and again before the snapshot that
+follows an ended stream (a wrong answer after connect turns the link to failed with that message). When
+a 200 answer's proof is missing or wrong the token is not sent and the app says that something answered
+but did not prove it is the daemon for this token, and that a daemon older than the app must be
+restarted on the new version. A 5xx answer, a non-200 answer without proof JSON, or no answer at all
+is "daemon unreachable, retrying": the token is not sent and the check is tried again later. Then the app (which
 holds the token) sends `POST <baseURL>/api/login-codes` with `Authorization: Bearer <token>`; the answer is
 `{"code": "<hex>", "expires_in_s": 60}` and the pane loads `<baseURL>/#code=<code>`. The page exchanges
 the code itself; no cookie is involved and the token is never in a URL. A code is single use and
