@@ -118,6 +118,8 @@
 //! - `Input::Withdraw{id, reason}`: `shared.ledger_append(true, ConstraintRetire{id, reason})`; on
 //!   success append what it queued and `harness_note{Constraint, texts::constraint_withdrawn(id,
 //!   reason)}` with author `User`; on refusal (or without a journal) warn and append nothing.
+//! - `Input::Release{reason}`: the operator closed the mission short of its goal. Blank reason is
+//!   ignored. Records `OperatorRelease` in the ledger and a protected note; no turn is started.
 //! - `Input::Scope{hosts, note}`: network access the operator authorized. With a journal,
 //!   `shared.ledger_append(true, ScopeGrant{hosts, note})` and append what it queued (failure: warn,
 //!   carry on). Append `harness_note{Approval, texts::scope_granted(hosts, note)}` with author `User`.
@@ -488,6 +490,8 @@ pub enum Input {
     Withdraw { id: String, reason: String },
     /// The operator authorized network access to `hosts` for the mission.
     Scope { hosts: Vec<String>, note: Option<String> },
+    /// The operator closed the mission short of its goal, with a reason.
+    Release { reason: String },
     /// A child that nobody was waiting for has settled.
     ChildSettled(Settlement),
     /// The agent that assigned this session's work sent it a message.
@@ -512,6 +516,7 @@ enum KeptInput {
     Approval { text: String, scope: String },
     Withdraw { id: String, reason: String },
     Scope { hosts: Vec<String>, note: Option<String> },
+    Release { reason: String },
 }
 
 impl KeptInput {
@@ -521,6 +526,7 @@ impl KeptInput {
             KeptInput::Approval { text, scope } => Input::Approval { text, scope },
             KeptInput::Withdraw { id, reason } => Input::Withdraw { id, reason },
             KeptInput::Scope { hosts, note } => Input::Scope { hosts, note },
+            KeptInput::Release { reason } => Input::Release { reason },
         }
     }
 }
@@ -541,6 +547,7 @@ pub fn queue_input(paths: &Paths, session: &SessionId, input: Input) -> Result<I
         Input::Approval { text, scope } => KeptInput::Approval { text: text.clone(), scope: scope.clone() },
         Input::Withdraw { id, reason } => KeptInput::Withdraw { id: id.clone(), reason: reason.clone() },
         Input::Scope { hosts, note } => KeptInput::Scope { hosts: hosts.clone(), note: note.clone() },
+        Input::Release { reason } => KeptInput::Release { reason: reason.clone() },
         _ => return Ok(input),
     };
     let file = write_kept(&queue_dir(paths, session), &kept)
@@ -1957,6 +1964,15 @@ impl Session {
                 }
                 self.operator_op(LedgerOp::ScopeGrant { hosts: hosts.clone(), note: note.clone() })?;
                 self.note(Author::User, NoteKind::Approval, texts::scope_granted(&hosts, note.as_deref()))?;
+            }
+            Input::Release { reason } => {
+                if reason.trim().is_empty() {
+                    return Ok(out);
+                }
+                // The operator ends the work short of the goal. The finish gate stops blocking (it
+                // reads the ledger release); no turn is started, and the session is not forced to stop.
+                self.operator_op(LedgerOp::OperatorRelease { reason: reason.clone() })?;
+                self.note(Author::User, NoteKind::Approval, texts::released(&reason))?;
             }
             Input::ChildSettled(s) => {
                 let child = s.child.clone();

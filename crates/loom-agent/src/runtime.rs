@@ -3250,6 +3250,21 @@ impl Runtime {
         self.send_to_lead(&lead.id, Input::Constraint(text.to_string()), ledger, None)
     }
 
+    /// Close the mission of `id` short of its goal, with the operator's `reason`. Handed to the lead
+    /// and recorded like a rule (see [`Runtime::add_rule`]): an `OperatorRelease` ledger entry when
+    /// the mission keeps a ledger, a protected note in the lead's window, no turn started. After it
+    /// the finish gate no longer holds a finish for the goal. The session is not forced to stop; the
+    /// operator stops it separately if they want it to end now.
+    pub async fn release(&self, id: &SessionId, reason: &str) -> Result<RuleReceipt, String> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err("Write why the mission is closed without the goal established.".to_string());
+        }
+        let lead = self.lead_of(id)?;
+        let ledger = self.inner.mission_explicit(&lead)?;
+        self.send_to_lead(&lead.id, Input::Release { reason: reason.to_string() }, ledger, None)
+    }
+
     /// Record that the operator approved something, with what the approval covers. Handed to the
     /// lead and recorded like a rule (see [`Runtime::add_rule`]): ledger entry `a<n>` when the
     /// mission keeps a ledger, a protected note in the lead's window, no turn started. In a mission

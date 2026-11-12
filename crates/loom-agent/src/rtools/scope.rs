@@ -13,7 +13,8 @@
 //!   `loom_net::policy::check_hosts` (at least one, none blank, one host per entry, each a valid host
 //!   pattern); a failure is returned as the error, and nothing is opened.
 //! - emits one `InboxOpened(InboxItem { kind: Question, text: texts::scope_request(hosts, why),
-//!   blocking: false, options: [], call_id: Some(ctx.call_id), reference: None })`. The text names the
+//!   blocking: false, options: hosts, call_id: Some(ctx.call_id), reference: None })`. The surfaces read
+//!   the hosts from `options` and show an approve action. The text names the
 //!   hosts and the reason and says the operator can authorize them.
 //! - ok, outcome `scope requested`, message `texts::scope_requested(hosts)`: the request is with the
 //!   operator, nothing is authorized yet, carry on without it, and do not try the host until the
@@ -73,9 +74,9 @@ impl Tool for RequestScope {
             Author::Harness,
             Event::InboxOpened(InboxItem {
                 item_id: new_item_id(),
-                kind: InboxKind::Question,
+                kind: InboxKind::Approval,
                 text: texts::scope_request(&hosts, why),
-                options: Vec::new(),
+                options: hosts.clone(),
                 blocking: false,
                 call_id: Some(ctx.call_id.clone()),
                 reference: None,
@@ -118,7 +119,8 @@ mod tests {
         let opened = items(&r);
         assert_eq!(opened.len(), 1, "{opened:?}");
         let item = &opened[0];
-        assert_eq!((item.kind, item.blocking), (InboxKind::Question, false));
+        assert_eq!((item.kind, item.blocking), (InboxKind::Approval, false));
+        assert_eq!(item.options, vec!["api.example.test", "*.cdn.example.test"], "surfaces read the hosts from options");
         assert!(item.text.contains("api.example.test, *.cdn.example.test") && item.text.contains("the API is the target"), "{}", item.text);
         assert!(item.text.contains("Authorize"), "{}", item.text);
         // Nothing ended the turn and nothing was recorded in the ledger.

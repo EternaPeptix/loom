@@ -160,6 +160,14 @@ pub fn scope_granted(hosts: &[String], note: Option<&str>) -> String {
     )
 }
 
+/// The protected note recorded when the operator closes a mission short of its goal.
+pub fn released(reason: &str) -> String {
+    format!(
+        "The operator closed this mission without the goal established: {} The finish gate no longer          holds a finish for this goal; wrap up and report what stands.",
+        sentence(reason.trim())
+    )
+}
+
 /// The inbox text of an agent's request for network scope; the operator authorizes the hosts to grant it.
 pub fn scope_request(hosts: &[String], why: &str) -> String {
     format!(
