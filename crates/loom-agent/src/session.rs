@@ -370,6 +370,9 @@ pub struct Status {
 #[derive(Debug, Default)]
 pub struct Control {
     turn: Mutex<CancellationToken>,
+    /// The harness is going down: a cancelled turn is recorded as cut by the restart, and a child is
+    /// not settled by it.
+    shutting: std::sync::atomic::AtomicBool,
 }
 
 impl Control {
@@ -382,9 +385,23 @@ impl Control {
         self.turn.lock().unwrap_or_else(|p| p.into_inner()).cancel();
     }
 
+    /// Cancel the running turn because the harness is shutting down. The session records the cut as
+    /// a restart (not as an operator stop), so the next start resumes it; no later turn starts.
+    pub fn stop_for_shutdown(&self) {
+        self.shutting.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop_turn();
+    }
+
+    fn is_shutting(&self) -> bool {
+        self.shutting.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Install and return the token of a new turn.
     pub(crate) fn begin_turn(&self) -> CancellationToken {
         let token = CancellationToken::new();
+        if self.is_shutting() {
+            token.cancel();
+        }
         *self.turn.lock().unwrap_or_else(|p| p.into_inner()) = token.clone();
         token
     }
@@ -532,6 +549,8 @@ pub struct Session {
     phase: Phase,
     st: State,
     published: Option<Status>,
+    /// Jobs that `open` found registered and never settled, and recorded as lost.
+    lost_jobs: usize,
 }
 
 /// Longest `session_end` detail.
@@ -602,6 +621,7 @@ impl Session {
             phase,
             st,
             published: None,
+            lost_jobs: 0,
         }
     }
 
@@ -670,11 +690,51 @@ impl Session {
                 .append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped })
                 .map_err(|e| e.0)?;
         }
+        session.record_lost_jobs()?;
         if let Some(n) = top {
             // `resume_from` only takes a lock; it never waits.
             let _ = session.deps.ctx.jobs.resume_from(n).now_or_never();
         }
         Ok(session)
+    }
+
+    /// Jobs that were running when the harness went down and were recorded as lost by `open`.
+    pub fn lost_jobs(&self) -> usize {
+        self.lost_jobs
+    }
+
+    /// A job registered and never settled belonged to a process that is gone: settle it in the log
+    /// and tell the model, so that a session waiting on it wakes knowing.
+    fn record_lost_jobs(&mut self) -> Result<(), String> {
+        if self.st.ended.is_some() {
+            return Ok(());
+        }
+        let own = self.own();
+        let settled: std::collections::HashSet<&str> = own
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::JobSettled { job_id, .. } => Some(job_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let lost: Vec<(String, String)> = own
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::JobRegistered { job_id, command, .. } if !settled.contains(job_id.as_str()) => {
+                    Some((job_id.clone(), command.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (job_id, command) in lost {
+            let note = texts::job_lost(&job_id, &command);
+            let detail = texts::JOB_LOST_DETAIL.to_string();
+            self.append(Author::Harness, Event::JobSettled { job_id, exit_code: None, output: None, detail })
+                .map_err(|e| e.0)?;
+            self.note(Author::Harness, NoteKind::Arrival, note).map_err(|e| e.0)?;
+            self.lost_jobs = self.lost_jobs.saturating_add(1);
+        }
+        Ok(())
     }
 
     pub fn id(&self) -> &SessionId {
@@ -1082,6 +1142,10 @@ impl Session {
 
     fn end_turn(&mut self, reason: TurnEndReason) -> R<()> {
         self.append(Author::Harness, Event::TurnEnd { reason })?;
+        if self.deps.control.is_shutting() {
+            // The published status stays `running`, which is what makes the next start restore the session.
+            return Ok(());
+        }
         self.phase = Phase::Idle;
         self.publish();
         Ok(())
@@ -1119,8 +1183,15 @@ impl Session {
     /// The turn's token fired: record it, stop what the session started, and end the turn (or settle
     /// the child as stopped).
     async fn cancelled(&mut self) -> R<Flow> {
-        let child = self.deps.shared.is_child();
-        let reason = if child { texts::REASON_PARENT } else { texts::REASON_OPERATOR };
+        let shutting = self.deps.control.is_shutting();
+        let child = self.deps.shared.is_child() && !shutting;
+        let reason = if shutting {
+            texts::REASON_RESTART
+        } else if child {
+            texts::REASON_PARENT
+        } else {
+            texts::REASON_OPERATOR
+        };
         self.append(Author::Harness, Event::Interrupted { reason: reason.to_string() })?;
         self.deps.ctx.jobs.kill_all(self.grace()).await;
         self.deps.shared.orch.stop_children(&self.deps.shared.session).await;

@@ -217,9 +217,10 @@
 //! (grace `tools.kill_grace_s`), abort background tasks, and shut the proxy down. A turn still
 //! running when its task is aborted is cut rather than ended: its child is not settled, and the next
 //! `Session::open` records `interrupted{REASON_RESTART}` and a `Stopped` turn end, so a later start
-//! resumes exactly what a clean stop would have left. There is deliberately no mid-turn "clean stop"
-//! signal into `session.rs`: a running turn either finishes within the grace window or is recovered
-//! from its log, and both paths leave the same durable state.
+//! resumes exactly what a clean stop would have left. Before the inputs are closed every running turn
+//! is cancelled through `Control::stop_for_shutdown`: tools get their usual TERM then KILL, the session
+//! records `interrupted{REASON_RESTART}` and a `Stopped` turn end itself (a child is not settled), and
+//! only what has not ended within the waits is aborted.
 //!
 //! ## Reading
 //! - `sessions(include_archived)`: newest first. `session(id)`.
@@ -267,6 +268,7 @@ use crate::rtools::{self, ChildInfo, Orchestrator, Producer, Settlement, Shared,
 use crate::session::{Control, Deps, End, Input, Phase, Session, Sink, Status};
 use crate::texts;
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use loom_core::config::{Config, NetworkMode, Paths, SandboxCfg};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
@@ -566,6 +568,23 @@ fn sandbox_cfg_for(base: &SandboxCfg, role: &RoleDef, workspace: &Path) -> Sandb
     cfg
 }
 
+/// The sentence for a session task that panicked.
+fn panic_sentence(payload: &(dyn std::any::Any + Send)) -> String {
+    let what = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_string());
+    format!(
+        "The session's task failed with an internal error ({}). This is a fault in the harness: report it, and send the session a message to make it try again.",
+        cut_chars(&what, 200)
+    )
+}
+
+/// Titles of sessions whose task panics when it starts (tests only).
+#[cfg(test)]
+static PANIC_TITLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 fn network_text(config: &Config) -> String {
     let mode = match config.network.mode {
         NetworkMode::Open => "open",
@@ -650,6 +669,8 @@ struct Activation {
     already: bool,
     /// `open` cut a running turn.
     cut: bool,
+    /// `open` recorded lost jobs for a session that was waiting (it has to be woken).
+    woken: bool,
 }
 
 /// Private state; its fields are the implementer's.
@@ -1146,7 +1167,8 @@ impl Inner {
             jobs: jobs.clone(),
             cancel: CancellationToken::new(),
         };
-        let journal = (explicit && meta.parent.is_none()).then(|| Journal::new(self.paths.journal(&meta.mission), self.key.clone()));
+        // The mission journal is shared by the lead and all its children.
+        let journal = explicit.then(|| Journal::new(self.paths.journal(&meta.mission), self.key.clone()));
         let shared = Arc::new(Shared::new(
             id.clone(),
             Some(meta.mission.clone()),
@@ -1222,8 +1244,22 @@ impl Inner {
         let (inputs, rx) = unbounded_channel();
         let weak = self.me.clone();
         let sid = id.clone();
+        #[cfg(test)]
+        let title = st.known.get(id).map(|k| k.meta.title.clone()).unwrap_or_default();
         let task = tokio::spawn(async move {
-            let end = session.run(rx).await;
+            let run = async move {
+                #[cfg(test)]
+                if lock(&PANIC_TITLES).contains(&title) {
+                    panic!("test hook: this session's task panics");
+                }
+                session.run(rx).await
+            };
+            // A panic must still reach `on_end`, or the session would stay active and its parent
+            // would wait for it for ever.
+            let end = match std::panic::AssertUnwindSafe(run).catch_unwind().await {
+                Ok(end) => end,
+                Err(payload) => End::Fatal(panic_sentence(payload.as_ref())),
+            };
             if let Some(inner) = weak.upgrade() {
                 inner.on_end(&sid, gen, end);
             }
@@ -1240,7 +1276,7 @@ impl Inner {
             let st = self.st();
             let k = st.known.get(id).ok_or_else(|| no_session(id))?;
             if k.active.is_some() {
-                return Ok(Activation { already: true, cut: false });
+                return Ok(Activation { already: true, cut: false, woken: false });
             }
             if k.meta.archived {
                 return Err("This session is archived; unarchive it first.".to_string());
@@ -1265,6 +1301,7 @@ impl Inner {
         let cut = cut_by_restart(session.records());
         let open = open_items(session.records());
         let status = session.status();
+        let woken = session.lost_jobs() > 0 && matches!(status.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
         {
             let mut st = self.st();
             for (item, opened_ms) in open {
@@ -1283,7 +1320,7 @@ impl Inner {
             }
             self.launch(&mut st, id, session, parts);
         }
-        Ok(Activation { already: false, cut })
+        Ok(Activation { already: false, cut, woken })
     }
 
     /// `activate_locked` for callers that do not hold the lock.
@@ -1297,7 +1334,14 @@ impl Inner {
     fn on_end(self: &Arc<Self>, id: &SessionId, gen: u64, end: End) {
         self.proxy.revoke(id);
         let settlement = match end {
-            End::Settled(s) => Some(s),
+            End::Settled(s) => {
+                // Kept beside the log so that a delivery lost to a restart carries the whole report.
+                let dir = self.paths.session_dir(id);
+                if let Err(e) = write_json_atomic(&dir.join("settlement.json"), &s) {
+                    tracing::warn!("cannot write settlement.json of {}: {e}", id.as_str());
+                }
+                Some(s)
+            }
             End::Closed => {
                 self.clear_active(id, gen);
                 None
@@ -1588,6 +1632,8 @@ impl Inner {
             let outcome = if blocked { ChildOutcome::Blocked } else { child_outcome_of(outcome) };
             let steps = self.st().known.get(&id).map(|k| k.status.step).unwrap_or(0);
             let text = if detail.trim().is_empty() { texts::stopped_report(steps) } else { detail };
+            let persisted = read_json::<Settlement>(&self.paths.session_dir(&id).join("settlement.json"))
+                .filter(|p| p.child == id);
             let s = Settlement {
                 child: id.clone(),
                 role: meta.role.clone(),
@@ -1598,6 +1644,7 @@ impl Inner {
                 steps,
                 usage: Usage::default(),
             };
+            let s = persisted.unwrap_or(s);
             {
                 let mut st = self.st();
                 if let Some(k) = st.known.get_mut(&id) {
@@ -1755,11 +1802,15 @@ impl Runtime {
                 .collect()
         };
         let mut cut: HashSet<SessionId> = HashSet::new();
+        let mut woken: HashSet<SessionId> = HashSet::new();
         for id in wanted {
             match inner.activate(&id) {
                 Ok(a) => {
                     if a.cut {
                         cut.insert(id.clone());
+                    }
+                    if a.woken {
+                        woken.insert(id.clone());
                     }
                     if !a.already {
                         restored.push(id);
@@ -1780,13 +1831,17 @@ impl Runtime {
                     None => continue,
                 }
             };
-            if !unattended || !active {
+            if !active {
                 continue;
             }
-            let carry_on = cut.contains(&id)
-                || (last_end == Some(TurnEndReason::Waiting)
-                    && !inner.has_unsettled_child(&id)
-                    && !recovered.contains(&id));
+            // A session that waited on a job the restart lost is woken, attended or not: the job's
+            // arrival would have woken it.
+            let carry_on = woken.contains(&id)
+                || (unattended
+                    && (cut.contains(&id)
+                        || (last_end == Some(TurnEndReason::Waiting)
+                            && !inner.has_unsettled_child(&id)
+                            && !recovered.contains(&id))));
             if carry_on {
                 inner.send_input(&id, Input::Resume);
             }
@@ -1824,6 +1879,14 @@ impl Runtime {
             return Err(format!("The workspace {} is not a directory.", workspace.display()));
         }
         let role = inner.packs.role(new.pack.as_deref(), new.role.as_deref())?.clone();
+        if inner.config.network.mode == NetworkMode::Open
+            && inner.packs.get(&role.pack).is_some_and(|p| p.requires_restricted_network)
+        {
+            return Err(format!(
+                "The pack \"{}\" assumes a restricted network, but the network mode is open. Set [network] mode = \"allowlist\" (or \"deny_all\") in the config and restart the daemon, then start the session again.",
+                role.pack
+            ));
+        }
         let profile_name = inner.config.profile(new.model.as_deref()).map_err(|e| e.to_string())?.0.to_string();
         let (model, window) = inner.facts(&profile_name).await?;
         let title = match new.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
@@ -2171,9 +2234,11 @@ impl Runtime {
         let mut tasks = Vec::new();
         let mut jobs = Vec::new();
         for a in actives {
-            let ActiveSession { inputs, task, jobs: table, .. } = a;
-            // Closing the inputs ends every idle session; a running turn is cut below, which is
-            // what the next start recovers from (`open` records the restart).
+            let ActiveSession { inputs, task, jobs: table, control, .. } = a;
+            // A running turn is cancelled the normal way (tools get TERM, then KILL) and recorded as
+            // cut by the restart; closing the inputs then ends the session. What does not end in
+            // time is aborted below, which `open` recovers from.
+            control.stop_for_shutdown();
             drop(inputs);
             tasks.push(task);
             jobs.push(table);
@@ -2251,6 +2316,10 @@ mod tests {
             .and_then(|m| m["role"].as_str())
             .unwrap_or("")
             .to_string()
+    }
+
+    fn tool_msgs(body: &Value) -> usize {
+        body["messages"].as_array().map_or(0, |m| m.iter().filter(|m| m["role"] == "tool").count())
     }
 
     fn mentions(body: &Value, s: &str) -> bool {
@@ -2427,6 +2496,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn children_share_the_mission_journal() {
+        let e = env(Script::new(|body, _| {
+            if has_tool(body, "agent_spawn") {
+                if last_role(body) == "tool" {
+                    finish("lead done")
+                } else {
+                    call("agent_spawn", json!({"question": "CHILDMARK work"}))
+                }
+            } else {
+                match tool_msgs(body) {
+                    0 => call("note", json!({"kind": "decision", "text": "worker note", "why": "because"})),
+                    1 => call("ledger", json!({})),
+                    _ => finish("child report"),
+                }
+            }
+        }))
+        .await;
+        let info = e.rt.create_session(e.new_session(None)).await.unwrap();
+        let id = info.meta.id.clone();
+        // An operator constraint, written before the worker exists.
+        let journal = Journal::new(e.rt.inner.paths.journal(&info.meta.mission), e.rt.inner.key.clone());
+        let op = loom_core::ledger::LedgerOp::ConstraintAdd { text: "CONSTRAINTMARK never touch prod".into() };
+        journal.append(&id, true, op, &|_| Ok(())).unwrap();
+        e.rt.send_message(&id, "go").await.unwrap();
+        until("lead turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let kids = e.children(&id);
+        assert_eq!(kids.len(), 1);
+        let results: Vec<(String, loom_core::event::ToolStatus)> = e
+            .records(&kids[0].meta.id)
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::ToolResult(t) => Some((t.name, t.status)),
+                _ => None,
+            })
+            .collect();
+        for name in ["note", "ledger"] {
+            let got = results.iter().find(|(n, _)| n == name);
+            assert_eq!(got.map(|(_, s)| *s), Some(loom_core::event::ToolStatus::Ok), "{name}: {results:?}");
+        }
+        let child_req = e.server.requests().into_iter().rev().find(|b| !has_tool(b, "agent_spawn")).expect("child request");
+        assert!(mentions(&child_req, "CONSTRAINTMARK"), "the child's state block lacks the mission constraints");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn fork_child_starts_with_the_parents_messages() {
         let e = env(Script::new(|body, _| {
             if mentions(body, "You are now a separate agent") {
@@ -2505,6 +2619,35 @@ mod tests {
             !kids.is_empty() && kids.iter().all(|c| c.status.outcome == Some(SessionOutcome::Stopped))
         })
         .await;
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_panicking_session_task_ends_the_session_and_settles_the_child() {
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("request", || !e.server.requests().is_empty()).await;
+        lock(&PANIC_TITLES).push("PANICTITLE".to_string());
+        let orch = e.rt.inner.orch.clone();
+        let req = SpawnReq {
+            role: "worker".into(),
+            mode: SpawnMode::Fresh,
+            brief: Default::default(),
+            budget: Budget::default(),
+            call_id: CallId::from("c1"),
+            title: "PANICTITLE".into(),
+            awaited: true,
+        };
+        let child = orch.spawn(&id, req).await.unwrap();
+        let settlement = tokio::time::timeout(WAIT, orch.join(&id, &child, &CancellationToken::new()))
+            .await
+            .expect("the join must not hang")
+            .unwrap();
+        assert_eq!(settlement.outcome, ChildOutcome::Failed);
+        assert!(settlement.report.contains("internal error"), "{}", settlement.report);
+        assert!(!e.rt.session(&child).unwrap().active);
+        lock(&PANIC_TITLES).retain(|t| t != "PANICTITLE");
         e.rt.shutdown().await;
     }
 
@@ -2663,6 +2806,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_records_lost_jobs_and_wakes_the_session_that_waited_on_them() {
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let e = env(Script::new(move |body, _| {
+            if flag.load(Ordering::SeqCst) {
+                finish("after the loss")
+            } else if tool_msgs(body) == 0 {
+                call("bash", json!({"command": "sleep 600", "background": true}))
+            } else {
+                call("wait", json!({}))
+            }
+        }))
+        .await;
+        let mut att = e.new_session(Some("start a job"));
+        att.unattended = Some(false);
+        let id = e.rt.create_session(att).await.unwrap().meta.id;
+        until("waiting", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        e.rt.shutdown().await;
+        after.store(true, Ordering::SeqCst);
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let rt = rt2.clone();
+        until("woken and finished", || {
+            rt.records(&id, None, 2_000)
+                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })))
+        })
+        .await;
+        let rs = rt2.records(&id, None, 2_000).unwrap();
+        let settled = rs.iter().find_map(|r| match &r.event {
+            Event::JobSettled { job_id, exit_code, detail, .. } => Some((job_id.clone(), *exit_code, detail.clone())),
+            _ => None,
+        });
+        let (job_id, exit_code, detail) = settled.expect("the lost job is settled in the log");
+        assert_eq!((exit_code, detail.as_str()), (None, texts::JOB_LOST_DETAIL));
+        let lost = texts::job_lost(&job_id, "sleep 600");
+        assert!(rs.iter().any(|r| matches!(&r.event, Event::HarnessNote { text, .. } if *text == lost)));
+        let last = e.server.requests().pop().expect("a request after the restart");
+        assert!(mentions(&last, &lost));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn restart_restores_open_inbox_and_does_not_activate_ended_child() {
         let e = env(lead_script(json!({"question": "CHILDMARK"}))).await;
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
@@ -2680,6 +2864,59 @@ mod tests {
         rt2.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn a_settlement_recovered_after_a_restart_carries_the_whole_report() {
+        let stall = Arc::new(AtomicBool::new(true));
+        let flag = stall.clone();
+        let e = env(Script::new(move |body, _| {
+            if has_tool(body, "agent_spawn") {
+                if flag.load(Ordering::SeqCst) {
+                    Action::Stall { ms: 600_000 }
+                } else {
+                    finish("lead done")
+                }
+            } else {
+                finish("REPORTMARK the answer on the second line")
+            }
+        }))
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("lead request", || e.server.requests().iter().any(|b| has_tool(b, "agent_spawn"))).await;
+        let req = SpawnReq {
+            role: "worker".into(),
+            mode: SpawnMode::Fresh,
+            brief: Default::default(),
+            budget: Budget::default(),
+            call_id: CallId::from("c1"),
+            title: "t".into(),
+            awaited: false,
+        };
+        let child = e.rt.inner.orch.spawn(&id, req).await.unwrap();
+        until("child ended", || e.rt.session(&child).is_some_and(|c| c.status.phase == Phase::Ended)).await;
+        // The lead is inside a model request, so the delivery is still queued when the runtime goes down.
+        e.rt.shutdown().await;
+        assert!(!e.records(&id).iter().any(|r| matches!(r.event, Event::ChildSettled(_))));
+        stall.store(false, Ordering::SeqCst);
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let rt = rt2.clone();
+        until("settlement delivered", || {
+            rt.records(&id, None, 2_000).is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::ChildSettled(_))))
+        })
+        .await;
+        let report = rt2
+            .records(&id, None, 2_000)
+            .unwrap()
+            .into_iter()
+            .find_map(|r| match r.event {
+                Event::ChildSettled(c) => Some(c.report),
+                _ => None,
+            })
+            .unwrap();
+        assert!(report.starts_with("Outcome: returned\nAnswer:\nREPORTMARK"), "{report}");
+        rt2.shutdown().await;
+    }
+
     #[test]
     fn read_only_roles_protect_the_workspace() {
         let packs = Packs::builtin().unwrap();
@@ -2691,6 +2928,36 @@ mod tests {
         assert!(cfg.protected_paths.contains(&"/ws".to_string()));
         let rw = packs.role(None, Some("worker")).unwrap();
         assert_eq!(sandbox_cfg_for(&base, rw, Path::new("/ws")), base);
+    }
+
+    #[tokio::test]
+    async fn a_pack_that_requires_a_restricted_network_is_refused_under_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let pack = home.join("packs/strict");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("pack.toml"),
+            "name = \"strict\"\ndefault_role = \"r\"\nrequires_restricted_network = true\n[roles.r]\nprompt = \"r.md\"\ntools = [\"bash\"]\ntermination = \"free\"\n",
+        )
+        .unwrap();
+        std::fs::write(pack.join("r.md"), "Role R.").unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let server = MockServer::start(Script::new(|_, _| finish("ok"))).await.unwrap();
+        let new = || NewSession { workspace: ws.clone(), pack: Some("strict".into()), ..NewSession::default() };
+        let mut config = config_for(&server, None);
+        config.network.mode = NetworkMode::Open;
+        let rt = Runtime::start(config.clone(), Paths::at(home.clone())).await.unwrap();
+        let err = rt.create_session(new()).await.unwrap_err();
+        assert!(err.contains("[network] mode = \"allowlist\"") && err.contains("restart"), "{err}");
+        assert!(rt.sessions(true).is_empty());
+        rt.shutdown().await;
+        config.network.mode = NetworkMode::Allowlist;
+        config.network.allow = vec!["example.com".into()];
+        let rt = Runtime::start(config, Paths::at(home)).await.unwrap();
+        rt.create_session(new()).await.unwrap();
+        rt.shutdown().await;
     }
 
     #[tokio::test]
@@ -2744,5 +3011,31 @@ mod tests {
         until("request", || !e.server.requests().is_empty()).await;
         tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), e.rt.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_running_tool_and_records_the_turn_as_cut_by_the_restart() {
+        let dir_for_pid = tempfile::tempdir().unwrap();
+        let pid_file = dir_for_pid.path().join("pid");
+        let cmd = format!("echo $$ > '{}'; exec sleep 600", pid_file.display());
+        let e = env(Script::new(move |_, _| call("bash", json!({ "command": cmd })))).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("the command started", || std::fs::read_to_string(&pid_file).is_ok_and(|t| !t.trim().is_empty())).await;
+        let pid = std::fs::read_to_string(&pid_file).unwrap().trim().to_string();
+        tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
+        let alive = || {
+            std::process::Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let end = tokio::time::Instant::now() + Duration::from_secs(10);
+        while alive() {
+            assert!(tokio::time::Instant::now() < end, "the foreground command survived the shutdown");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let records = read_records(&e.rt.inner.paths.session_log(&id)).unwrap().records;
+        assert!(cut_by_restart(&records), "the turn is not recorded as cut by the restart");
     }
 }

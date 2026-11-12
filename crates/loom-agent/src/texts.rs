@@ -131,7 +131,7 @@ pub fn sentence(s: &str) -> String {
 }
 
 /// Note at the start of the turn that follows a harness restart.
-pub const AFTER_RESTART: &str = "The harness was restarted while you were working. A call shown with no recorded result may or may not have taken effect: check the state of things before repeating it. Background jobs and agents from before the restart are gone; start them again if their results are still needed. Then carry on with the work.";
+pub const AFTER_RESTART: &str = "The harness was restarted while you were working. A call shown with no recorded result may or may not have taken effect: check the state of things before repeating it. Background jobs from before the restart are no longer tracked: each one that was still running is noted above as lost. Agents you started were not ended: those still unfinished are resumed along with you and their reports reach you by themselves, so do not start them again. Then carry on with the work.";
 
 /// Note at the start of the turn after the operator pressed stop and then resumed.
 pub const AFTER_STOP: &str = "The operator stopped the previous turn and has now resumed it. A call shown with no recorded result was interrupted: check the state of things before repeating it. Background jobs and agents from before the stop were ended. Carry on with the work.";
@@ -336,6 +336,9 @@ pub fn network_sentence(mode: &str, allow: &[String], deny: &[String], allow_pri
     s
 }
 
+/// `job_settled` detail of a job that was running when the harness went down.
+pub const JOB_LOST_DETAIL: &str = "The harness was restarted while this job was running; its outcome is unknown.";
+
 /// A background job that was running when the harness went down.
 pub fn job_lost(id: &str, command: &str) -> String {
     format!(
@@ -347,6 +350,12 @@ pub fn job_lost(id: &str, command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_restart_note_does_not_call_resumed_agents_gone() {
+        assert!(!AFTER_RESTART.contains("gone"));
+        assert!(AFTER_RESTART.contains("resumed"));
+    }
 
     #[test]
     fn cut_counts_characters() {

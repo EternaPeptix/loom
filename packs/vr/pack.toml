@@ -2,6 +2,7 @@ name = "vr"
 description = "Vulnerability research on local and authorized targets: a researcher that routes an engagement into narrow experiments, scouts that run one experiment each and return executed evidence, and a judge that qualifies scope and refutes findings."
 default_role = "researcher"
 preamble = "harness.md"
+requires_restricted_network = true
 
 # The engagement lead. Turns a broad scope into narrow experiments and hands them to scouts; does not
 # run experiments or write findings prose itself. Finishing is gated by an independent judge.

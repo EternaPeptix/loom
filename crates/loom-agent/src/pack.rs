@@ -9,6 +9,7 @@
 //! description = "…"             # optional
 //! default_role = "lead"         # required; must name a role
 //! preamble = "harness.md"       # optional file; when absent the built-in preamble is used
+//! requires_restricted_network = false  # optional; true = refuse to start sessions while the network mode is open
 //!
 //! [roles.lead]
 //! description = "…"             # optional
@@ -82,6 +83,9 @@ pub struct Pack {
     pub default_role: String,
     /// The shared text that starts every system prompt of this pack.
     pub preamble: String,
+    /// The pack's text says the network is restricted: sessions of it are refused while the
+    /// daemon's network mode is `open`.
+    pub requires_restricted_network: bool,
     pub roles: BTreeMap<String, RoleDef>,
 }
 
@@ -117,6 +121,8 @@ struct RawPack {
     description: Option<String>,
     default_role: Option<String>,
     preamble: Option<String>,
+    #[serde(default)]
+    requires_restricted_network: bool,
     #[serde(default)]
     roles: BTreeMap<String, RawRole>,
 }
@@ -286,6 +292,7 @@ fn parse_pack(
         description: raw.description.unwrap_or_default(),
         default_role,
         preamble,
+        requires_restricted_network: raw.requires_restricted_network,
         roles,
     })
 }
@@ -483,6 +490,19 @@ mod tests {
         assert_eq!(a.may_spawn, vec!["b".to_string()]);
         assert_eq!(p.get("mine").unwrap().preamble, p.get("core").unwrap().preamble);
         assert_eq!(p.role(Some("mine"), Some("b")).unwrap().termination, Termination::Free);
+    }
+
+    #[test]
+    fn requires_restricted_network_is_a_top_level_key_defaulting_to_false() {
+        let d = mk(GOOD);
+        assert!(!Packs::load(d.path()).unwrap().get("mine").unwrap().requires_restricted_network);
+        let d = mk(&format!("requires_restricted_network = true\n{GOOD}"));
+        let p = Packs::load(d.path()).unwrap();
+        assert!(p.get("mine").unwrap().requires_restricted_network);
+        assert!(!p.get("core").unwrap().requires_restricted_network);
+        // unknown keys are still rejected
+        let e = err(&format!("requires_restricted_networks = true\n{GOOD}"));
+        assert!(e.contains("requires_restricted_networks"), "{e}");
     }
 
     #[test]
