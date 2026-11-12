@@ -554,9 +554,30 @@ test("operator rule requests build their routes and refuse blank input", () => {
   assert.equal(C.approvalRequest("s-1", "ship").body.scope, "");
   assert.ok(C.approvalRequest("s-1", "").error);
   assert.deepEqual(C.withdrawRequest("s-1", "k1", " done "), { path: "/api/sessions/s-1/rules/k1/withdraw", body: { reason: "done" } });
+  assert.deepEqual(C.withdrawRequest("s-1", "k 1", "").body, { reason: "" }, "one click, no reason: the daemon records a stock one");
+  assert.equal(C.withdrawRequest("s-1", "k 1", "").path, "/api/sessions/s-1/rules/k%201/withdraw");
   assert.ok(C.withdrawRequest("s-1", "", "x").error);
-  const m = C.ledgerModel({ state: { entries: 1, approvals: [{ id: "a1", text: "t", scope: "", used_for: null }] } });
-  assert.deepEqual(m.approvals, [{ id: "a1", text: "t", scope: "", usedFor: null }]);
+});
+
+test("the rules control lists the rules in force and marks used approvals", () => {
+  const m = C.ledgerModel({
+    state: {
+      entries: 5,
+      constraints: [{ id: "k1", text: "old rule", retired: "lifted" }, { id: "k2", text: "no prod", retired: null }],
+      approvals: [{ id: "a1", text: "ok to push", scope: "git push", used_for: "pushed v2" }, { id: "a2", text: "deploy", scope: "staging", used_for: null }],
+    },
+  });
+  assert.deepEqual(m.approvals[1], { id: "a2", text: "deploy", scope: "staging", usedFor: null });
+  assert.deepEqual(C.ruleLists(m), {
+    rules: [{ id: "k2", text: "no prod" }],
+    approvals: [
+      { id: "a1", text: "ok to push", used: true, note: "used for: pushed v2" },
+      { id: "a2", text: "deploy", used: false, note: "scope: staging" },
+    ],
+  });
+  // No ledger (the request failed, or the mission keeps none): nothing to list, the inputs remain.
+  assert.deepEqual(C.ruleLists(null), { rules: [], approvals: [] });
+  assert.deepEqual(C.ruleLists(C.ledgerModel({ state: { entries: 0 } })), { rules: [], approvals: [] });
 });
 
 test("net rows and live dedupe", () => {

@@ -74,6 +74,7 @@ pub struct RuleBody {
 #[serde(deny_unknown_fields)]
 pub struct ApprovalBody {
     pub text: String,
+    /// What the approval covers. Left out or blank, the runtime records a stock scope in its place.
     #[serde(default)]
     pub scope: String,
 }
@@ -82,6 +83,7 @@ pub struct ApprovalBody {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WithdrawBody {
+    /// Why the rule is withdrawn. Left out or blank, the runtime records a stock reason in its place.
     #[serde(default)]
     pub reason: String,
 }

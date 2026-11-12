@@ -24,7 +24,7 @@ const S = {
   tab: "ledger",
   ledger: { mission: null, model: null, error: null, stale: true },
   win: { data: null, error: null, stale: true, hideFolded: false, from: null },
-  rules: { text: "", approval: "", scope: "" }, // drafts survive the ledger being redrawn
+  rules: null, // the rules form of the open session: {session, box, lists, shown}
   net: [],
   netError: null,
   viewer: null,
@@ -213,6 +213,7 @@ function openSession(id) {
   S.liveEl = null;
   S.win = { ...S.win, data: null, error: null, stale: true, from: null };
   S.ledger = { mission: null, model: null, error: null, stale: true };
+  S.rules = null;
   const opened = S.sessions.byId.get(id);
   S.ledger.mission = opened ? opened.mission : null;
   clear($("blocks"));
@@ -937,55 +938,83 @@ function renderRight() {
   return renderSessionTab(p, info);
 }
 
-/** A labelled text input whose value is kept in `S.rules[key]`. */
-function draftInput(key, placeholder) {
+function ruleInput(placeholder) {
   const i = el("input", "rule-in");
   i.type = "text";
   i.placeholder = placeholder;
-  i.value = S.rules[key];
-  i.addEventListener("input", () => {
-    S.rules[key] = i.value;
-  });
   return i;
 }
 
-async function sendRule(req, clear) {
+/**
+ * Send an operator rule request. `b`, the button pressed, is disabled until the daemon has answered,
+ * so a double click sends once; `inputs` are emptied when the daemon accepted the request.
+ */
+async function sendRule(b, req, inputs = []) {
   if (req.error) return notice(req.error);
-  if (!(await act(api("POST", req.path, req.body).then(() => true)))) return;
-  for (const k of clear) S.rules[k] = "";
+  b.disabled = true;
+  const ok = await act(api("POST", req.path, req.body).then(() => true));
+  b.disabled = false;
+  if (!ok) return;
+  for (const i of inputs) i.value = "";
   loadLedger();
 }
 
-/** Operator controls: set a rule, record an approval, withdraw a listed rule. */
-function rulesControl(m) {
-  const box = el("div", "rules");
-  box.append(h2("Rules and approvals"));
+/**
+ * The operator's controls for the mission of the open session: set a rule, record an approval and,
+ * in `lists`, withdraw a rule in force. Built once per open session and kept: the ledger is redrawn
+ * on every entry a running mission writes, and nodes that stay in the page keep the focus, the caret
+ * and the text being typed. Opening another session starts an empty form.
+ */
+function rulesForm() {
   const id = S.openId;
-  const rule = draftInput("text", "Standing rule for this mission");
-  const addRule = btn("Add rule", "small", () => sendRule(C.ruleRequest(id, S.rules.text), ["text"]));
-  box.append(add(el("div", "rule-row"), rule, addRule));
-  const appr = draftInput("approval", "Approve something");
-  const scope = draftInput("scope", "Scope (optional)");
-  const addAppr = btn("Approve", "small", () => sendRule(C.approvalRequest(id, S.rules.approval, S.rules.scope), ["approval", "scope"]));
-  box.append(add(el("div", "rule-row"), appr, scope, addAppr));
-  const live = m ? m.constraints.filter((c) => !c.retired) : [];
-  if (live.length) {
-    box.append(ul(...live.map((c) => li(el("span", "k", c.id), document.createTextNode(c.text + " "), btn("Withdraw", "small", () => sendRule(C.withdrawRequest(id, c.id, ""), []))))));
+  if (S.rules && S.rules.session === id) return S.rules;
+  const rule = ruleInput("Standing rule for this mission");
+  const addRule = btn("Add rule", "small", () => sendRule(addRule, C.ruleRequest(id, rule.value), [rule]));
+  const appr = ruleInput("Approve something");
+  const scope = ruleInput("What it covers (optional)");
+  const addAppr = btn("Approve", "small", () => sendRule(addAppr, C.approvalRequest(id, appr.value, scope.value), [appr, scope]));
+  const lists = el("div");
+  const box = add(el("div", "rules"), h2("Rules and approvals"), add(el("div", "rule-row"), rule, addRule), add(el("div", "rule-row"), appr, scope, addAppr), lists);
+  S.rules = { session: id, box, lists, shown: "" };
+  return S.rules;
+}
+
+/** Under the form: the rules in force, each with its Withdraw button, and the approvals. */
+function renderRuleLists(form, model) {
+  const lists = C.ruleLists(model);
+  const shown = JSON.stringify(lists);
+  if (form.shown === shown) return;
+  form.shown = shown;
+  const nodes = [];
+  if (lists.rules.length) {
+    nodes.push(ul(...lists.rules.map((r) => {
+      const w = btn("Withdraw", "small", () => sendRule(w, C.withdrawRequest(form.session, r.id, "")));
+      return li(el("span", "k", r.id), document.createTextNode(r.text + " "), w);
+    })));
   }
-  if (m && m.approvals.length) {
-    box.append(ul(...m.approvals.map((a) => li(el("span", "k", a.id), document.createTextNode(a.text), a.scope ? el("span", "dim", " (scope: " + a.scope + ")") : null))));
+  if (lists.approvals.length) {
+    nodes.push(ul(...lists.approvals.map((a) => li(el("span", "k", a.id), el("span", a.used ? "retired" : "", a.text), a.note ? el("span", "dim", ` (${a.note})`) : null))));
   }
-  return box;
+  form.lists.replaceChildren(...nodes);
+}
+
+/** Fill the ledger tab: the rules form, then `nodes`. A form already in place is not taken out. */
+function showLedger(p, ...nodes) {
+  const form = rulesForm();
+  renderRuleLists(form, S.ledger.model);
+  if (p.firstChild !== form.box) p.replaceChildren(form.box);
+  while (form.box.nextSibling) form.box.nextSibling.remove();
+  p.append(...nodes);
 }
 
 function renderLedger(p) {
   const L = S.ledger;
-  if (L.error) return p.replaceChildren(el("p", "dim", L.error));
-  if (!L.model) return p.replaceChildren(el("p", "dim", "loading…"));
+  if (L.error) return showLedger(p, el("p", "dim", L.error));
+  if (!L.model) return showLedger(p, el("p", "dim", "loading…"));
   const m = L.model;
-  if (m.empty) return p.replaceChildren(rulesControl(m), el("p", "dim", "This mission has no ledger entries yet."));
+  if (m.empty) return showLedger(p, el("p", "dim", "This mission has no ledger entries yet."));
   const frag = document.createDocumentFragment();
-  frag.append(rulesControl(m), h2("Goal"), el("div", "", m.goal || "(not set)"));
+  frag.append(h2("Goal"), el("div", "", m.goal || "(not set)"));
   if (m.constraints.length) {
     frag.append(h2("Constraints"), ul(...m.constraints.map((c) => li(el("span", "k", c.id), el("span", c.retired ? "retired" : "", c.text), c.retired ? el("span", "dim", ` (retired: ${c.retired})`) : null))));
   }
@@ -1013,7 +1042,7 @@ function renderLedger(p) {
   if (m.decisions.length) frag.append(h2("Decisions"), ul(...m.decisions.map((d) => li(el("span", "k", d.id), document.createTextNode(d.text), el("div", "dim", d.reason)))));
   if (m.deadEnds.length) frag.append(h2("Dead ends"), ul(...m.deadEnds.map((d) => li(el("span", "k", d.id), document.createTextNode(d.what), el("div", "dim", d.why)))));
   if (m.questions.length) frag.append(h2("Questions"), ul(...m.questions.map((q) => li(el("span", "k", q.id), document.createTextNode(q.text + (q.blocking ? " (blocking)" : "")), q.answer !== null ? el("div", "okc", "answer: " + q.answer) : el("div", "warn", "unanswered")))));
-  p.replaceChildren(frag);
+  showLedger(p, frag);
 }
 
 function meterEl(m) {

@@ -27,9 +27,11 @@
 //! - `send <session> <text…>` (`-` = standard input), then follows unless `--detach`.
 //! - `stop <session>`, `resume <session>`, `reweave <session>`, `archive <session> [--undo]`: the
 //!   call, then one line saying what was asked (`stop requested for {id}`).
-//! - `rule <session> <text…>` (`-` = standard input): `client.add_rule`; `rule set for {id}`.
-//!   `rule <session> --withdraw <rule-id> [--reason <text>]`: `client.withdraw_rule`.
-//!   `approve <session> <text…> [--scope <text>]`: `client.approve`. A child's id reaches its lead.
+//! - `rule <session> <text…>` (`-` = standard input): `client.add_rule`; `rule sent to {id}`.
+//!   `rule <session> --withdraw <rule-id> [--reason <text>]`: `client.withdraw_rule`; `withdrawal of
+//!   {rule-id} sent to {id}`. `approve <session> <text…> [--scope <text>]`: `client.approve`;
+//!   `approval sent to {id}`. A child's id reaches its lead. The lines say what was sent, not that
+//!   it is recorded: the lead records it when idle, or at the next step of the turn it is running.
 //! - `inbox`: `render::inbox_list`. `answer <item> <text…>`: `client.answer`; `answered {item}`.
 //! - `ledger <session|mission>`: the ledger's `markdown`.
 //! - `window <session>`: `render::window_table`. `net <session> [-n <limit>]`: `render::net_table`.
@@ -297,7 +299,7 @@ pub struct RuleArgs {
     /// Withdraw the rule with this id (such as k1) instead of setting one
     #[arg(long, value_name = "RULE_ID", conflicts_with = "text")]
     pub withdraw: Option<String>,
-    /// Why the rule is withdrawn
+    /// Why the rule is withdrawn (left out: recorded as "no reason given")
     #[arg(long, requires = "withdraw")]
     pub reason: Option<String>,
     /// The rule ("-": read standard input)
@@ -308,7 +310,7 @@ pub struct RuleArgs {
 pub struct ApproveArgs {
     /// A session id, the beginning of one, or `last`
     pub session: String,
-    /// What the approval covers
+    /// What the approval covers (left out: recorded as "only what the approval says")
     #[arg(long)]
     pub scope: Option<String>,
     /// What is approved ("-": read standard input)
@@ -943,19 +945,19 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             if let Some(rule) = &a.withdraw {
                 let id = c.resolve(&a.session).await?;
                 c.withdraw_rule(&id, rule, a.reason.as_deref().unwrap_or("")).await?;
-                return outln(&format!("withdrawn {rule} for {id}")).map(|()| 0);
+                return outln(&format!("withdrawal of {rule} sent to {id}")).map(|()| 0);
             }
             let text = read_message(&a.text)?;
             let id = c.resolve(&a.session).await?;
             c.add_rule(&id, &text).await?;
-            outln(&format!("rule set for {id}")).map(|()| 0)
+            outln(&format!("rule sent to {id}")).map(|()| 0)
         }
         Command::Approve(a) => {
             let text = read_message(&a.text)?;
             let c = client_of(&paths)?;
             let id = c.resolve(&a.session).await?;
             c.approve(&id, &text, a.scope.as_deref().unwrap_or("")).await?;
-            outln(&format!("approval recorded for {id}")).map(|()| 0)
+            outln(&format!("approval sent to {id}")).map(|()| 0)
         }
         Command::Inbox => {
             let list = client_of(&paths)?.inbox().await?;
@@ -1327,6 +1329,11 @@ mod tests {
         rejected(&["rule"]);
         rejected(&["rule", "s-1", "--withdraw", "k1", "extra words"]);
         rejected(&["rule", "s-1", "--reason", "why"]);
+        // The reason and the scope are optional; the runtime records a stock one in their place.
+        let Command::Rule(a) = ok(&["rule", "s-1", "--withdraw", "k1"]) else { panic!("not rule") };
+        assert_eq!((a.withdraw.as_deref(), a.reason), (Some("k1"), None));
+        let Command::Approve(a) = ok(&["approve", "s-1", "ship", "it"]) else { panic!("not approve") };
+        assert_eq!((a.text, a.scope), (words(&["ship", "it"]), None));
         let Command::Approve(a) = ok(&["approve", "s-1", "ship", "it", "--scope", "staging"]) else {
             panic!("not approve")
         };

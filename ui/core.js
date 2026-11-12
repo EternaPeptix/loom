@@ -918,8 +918,26 @@ export function ledgerModel(view) {
 }
 
 /**
+ * What the rules control lists under its inputs: the rules in force (the ones that can be
+ * withdrawn) and every approval, a used one marked so that it does not read as still available.
+ */
+export function ruleLists(model) {
+  const m = model || {};
+  return {
+    rules: (m.constraints || []).filter((c) => !c.retired).map((c) => ({ id: c.id, text: c.text })),
+    approvals: (m.approvals || []).map((a) => ({
+      id: a.id,
+      text: a.text,
+      used: !!a.usedFor,
+      note: a.usedFor ? `used for: ${a.usedFor}` : a.scope ? `scope: ${a.scope}` : "",
+    })),
+  };
+}
+
+/**
  * Operator rule requests: `{ path, body }` for `api("POST", path, body)`, or `{ error }` when the
- * input is blank. A child's id is fine: the daemon routes it to the lead of its mission.
+ * input is blank. A child's id is fine: the daemon routes it to the lead of its mission. The scope
+ * of an approval and the reason of a withdrawal may be blank: the daemon records a stock one.
  */
 export function ruleRequest(session, text) {
   const t = String(text || "").trim();
