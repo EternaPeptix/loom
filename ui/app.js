@@ -24,7 +24,7 @@ const S = {
   tab: "ledger",
   ledger: { mission: null, model: null, error: null, stale: true },
   win: { data: null, error: null, stale: true, hideFolded: false, from: null },
-  rules: null, // the rules form of the open session: {session, box, lists, shown}
+  rules: null, // the rules form of the open session: {session, box, note, hint, lists, reason, asking, shown}
   net: [],
   netError: null,
   viewer: null,
@@ -946,17 +946,25 @@ function ruleInput(placeholder) {
 }
 
 /**
- * Send an operator rule request. `b`, the button pressed, is disabled until the daemon has answered,
- * so a double click sends once; `inputs` are emptied when the daemon accepted the request.
+ * Send an operator rule request of `form`. `b`, the button pressed, is disabled until the daemon has
+ * answered, so a double click sends once. When the daemon accepted the request, `inputs` are emptied
+ * and the form's note says what its receipt means: a lead in a turn has only queued it, a mission
+ * without a ledger never lists it. True when it was accepted.
  */
-async function sendRule(b, req, inputs = []) {
-  if (req.error) return notice(req.error);
+async function sendRule(form, b, req, inputs = []) {
+  if (req.error) {
+    notice(req.error);
+    return false;
+  }
   b.disabled = true;
-  const ok = await act(api("POST", req.path, req.body).then(() => true));
+  form.note.textContent = "";
+  const receipt = await act(api("POST", req.path, req.body));
   b.disabled = false;
-  if (!ok) return;
+  if (!receipt) return false;
   for (const i of inputs) i.value = "";
+  form.note.textContent = C.ruleNotice(receipt);
   loadLedger();
+  return true;
 }
 
 /**
@@ -968,39 +976,58 @@ async function sendRule(b, req, inputs = []) {
 function rulesForm() {
   const id = S.openId;
   if (S.rules && S.rules.session === id) return S.rules;
+  const form = { session: id, box: el("div", "rules"), note: el("div", "rule-note warn"), hint: el("div", "rule-note dim"), lists: el("div"), reason: ruleInput("Why it is withdrawn (optional)"), asking: null, shown: "" };
   const rule = ruleInput("Standing rule for this mission");
-  const addRule = btn("Add rule", "small", () => sendRule(addRule, C.ruleRequest(id, rule.value), [rule]));
+  const addRule = btn("Add rule", "small", () => sendRule(form, addRule, C.ruleRequest(id, rule.value), [rule]));
   const appr = ruleInput("Approve something");
   const scope = ruleInput("What it covers (optional)");
-  const addAppr = btn("Approve", "small", () => sendRule(addAppr, C.approvalRequest(id, appr.value, scope.value), [appr, scope]));
-  const lists = el("div");
-  const box = add(el("div", "rules"), h2("Rules and approvals"), add(el("div", "rule-row"), rule, addRule), add(el("div", "rule-row"), appr, scope, addAppr), lists);
-  S.rules = { session: id, box, lists, shown: "" };
-  return S.rules;
+  const addAppr = btn("Approve", "small", () => sendRule(form, addAppr, C.approvalRequest(id, appr.value, scope.value), [appr, scope]));
+  add(form.box, h2("Rules and approvals"), add(el("div", "rule-row"), rule, addRule), add(el("div", "rule-row"), appr, scope, addAppr), form.note, form.hint, form.lists);
+  S.rules = form;
+  return form;
 }
 
-/** Under the form: the rules in force, each with its Withdraw button, and the approvals. */
+/**
+ * Under the form: the rules in force and the approvals. Withdrawing a rule takes two steps, so that
+ * a stray click lifts nothing: `Withdraw` opens a row asking for the reason (`form.asking` is that
+ * rule), and only the row's `Withdraw k<n>` sends; `Keep` closes the row.
+ */
 function renderRuleLists(form, model) {
-  const lists = C.ruleLists(model);
+  const lists = C.ruleLists(model, form.asking);
+  form.asking = lists.asking;
   const shown = JSON.stringify(lists);
   if (form.shown === shown) return;
   form.shown = shown;
+  const ask = (ruleId) => {
+    form.asking = ruleId;
+    form.reason.value = "";
+    renderRuleLists(form, S.ledger.model);
+    if (ruleId) form.reason.focus();
+  };
+  // The reason field is one node that outlives the redraws, so the text typed in it is kept.
+  const typing = document.activeElement === form.reason;
   const nodes = [];
   if (lists.rules.length) {
     nodes.push(ul(...lists.rules.map((r) => {
-      const w = btn("Withdraw", "small", () => sendRule(w, C.withdrawRequest(form.session, r.id, "")));
-      return li(el("span", "k", r.id), document.createTextNode(r.text + " "), w);
+      const item = li(el("span", "k", r.id), document.createTextNode(r.text + " "));
+      if (r.id !== lists.asking) return add(item, btn("Withdraw", "small", () => ask(r.id)));
+      const go = btn("Withdraw " + r.id, "small", async () => {
+        if (await sendRule(form, go, C.withdrawRequest(form.session, r.id, form.reason.value))) ask(null);
+      });
+      return add(item, add(el("div", "rule-row"), form.reason, go, btn("Keep", "small", () => ask(null))));
     })));
   }
   if (lists.approvals.length) {
     nodes.push(ul(...lists.approvals.map((a) => li(el("span", "k", a.id), el("span", a.used ? "retired" : "", a.text), a.note ? el("span", "dim", ` (${a.note})`) : null))));
   }
   form.lists.replaceChildren(...nodes);
+  if (typing && lists.asking) form.reason.focus();
 }
 
 /** Fill the ledger tab: the rules form, then `nodes`. A form already in place is not taken out. */
 function showLedger(p, ...nodes) {
   const form = rulesForm();
+  form.hint.textContent = C.rulesHint(S.ledger.error);
   renderRuleLists(form, S.ledger.model);
   if (p.firstChild !== form.box) p.replaceChildren(form.box);
   while (form.box.nextSibling) form.box.nextSibling.remove();

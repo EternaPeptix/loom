@@ -45,7 +45,7 @@ use crate::wire::{
     SessionDetail, StatusView, WithdrawBody,
 };
 use loom_agent::runtime::{
-    BusEvent, InboxEntry, LedgerView, MissionInfo, NetEntry, NewSession, SessionInfo, WindowView,
+    BusEvent, InboxEntry, LedgerView, MissionInfo, NetEntry, NewSession, RuleReceipt, SessionInfo, WindowView,
 };
 use loom_core::config::{Config, Paths};
 use loom_core::event::Seq;
@@ -285,23 +285,24 @@ impl Client {
         self.call_unit(Method::POST, &format!("/api/sessions/{}/messages", segment(id.as_str())), Some(body)).await
     }
 
-    pub async fn add_rule(&self, id: &SessionId, text: &str) -> Result<(), String> {
+    /// The receipt says which lead the rule went to and whether it is recorded yet (`queued`).
+    pub async fn add_rule(&self, id: &SessionId, text: &str) -> Result<RuleReceipt, String> {
         let body = serde_json::to_value(RuleBody { text: text.to_string() })
             .map_err(|e| format!("The rule cannot be encoded ({e})."))?;
-        self.call_unit(Method::POST, &format!("/api/sessions/{}/rules", segment(id.as_str())), Some(body)).await
+        self.call(Method::POST, &format!("/api/sessions/{}/rules", segment(id.as_str())), &[], Some(body)).await
     }
 
-    pub async fn approve(&self, id: &SessionId, text: &str, scope: &str) -> Result<(), String> {
+    pub async fn approve(&self, id: &SessionId, text: &str, scope: &str) -> Result<RuleReceipt, String> {
         let body = serde_json::to_value(ApprovalBody { text: text.to_string(), scope: scope.to_string() })
             .map_err(|e| format!("The approval cannot be encoded ({e})."))?;
-        self.call_unit(Method::POST, &format!("/api/sessions/{}/approvals", segment(id.as_str())), Some(body)).await
+        self.call(Method::POST, &format!("/api/sessions/{}/approvals", segment(id.as_str())), &[], Some(body)).await
     }
 
-    pub async fn withdraw_rule(&self, id: &SessionId, rule_id: &str, reason: &str) -> Result<(), String> {
+    pub async fn withdraw_rule(&self, id: &SessionId, rule_id: &str, reason: &str) -> Result<RuleReceipt, String> {
         let body = serde_json::to_value(WithdrawBody { reason: reason.to_string() })
             .map_err(|e| format!("The withdrawal cannot be encoded ({e})."))?;
         let path = format!("/api/sessions/{}/rules/{}/withdraw", segment(id.as_str()), segment(rule_id));
-        self.call_unit(Method::POST, &path, Some(body)).await
+        self.call(Method::POST, &path, &[], Some(body)).await
     }
 
     pub async fn stop(&self, id: &SessionId) -> Result<(), String> {
@@ -786,15 +787,21 @@ mod tests {
 
     #[tokio::test]
     async fn rule_calls_hit_their_routes_with_their_bodies() {
+        let receipt = |queued: bool, stock: Option<&str>| {
+            serde_json::json!({"lead": "s-0", "queued": queued, "ledger": true, "stock": stock}).to_string()
+        };
         let script = Script::default()
-            .route("POST", "/api/sessions/s-1/rules", 202, "{}")
-            .route("POST", "/api/sessions/s-1/approvals", 202, "{}")
-            .route("POST", "/api/sessions/s-1/rules/k1/withdraw", 202, "{}");
+            .route("POST", "/api/sessions/s-1/rules", 202, receipt(true, None))
+            .route("POST", "/api/sessions/s-1/approvals", 202, receipt(false, Some("only what the approval says")))
+            .route("POST", "/api/sessions/s-1/rules/k1/withdraw", 202, receipt(false, None));
         let (client, shared) = start(script).await;
         let sid = SessionId::from("s-1");
-        client.add_rule(&sid, "no prod").await.unwrap();
-        client.approve(&sid, "ship", "staging").await.unwrap();
-        client.withdraw_rule(&sid, "k1", "done").await.unwrap();
+        let lead = SessionId::from("s-0");
+        let got = client.add_rule(&sid, "no prod").await.unwrap();
+        assert_eq!(got, RuleReceipt { lead: lead.clone(), queued: true, ledger: true, stock: None });
+        let got = client.approve(&sid, "ship", "staging").await.unwrap();
+        assert_eq!((got.queued, got.stock.as_deref()), (false, Some("only what the approval says")));
+        assert_eq!(client.withdraw_rule(&sid, "k1", "done").await.unwrap().lead, lead);
         let seen = shared.lock().unwrap().seen.clone();
         let body = |n: usize| serde_json::from_str::<serde_json::Value>(&seen[n].body).unwrap();
         assert_eq!(body(0), serde_json::json!({"text": "no prod"}));

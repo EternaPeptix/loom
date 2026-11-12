@@ -179,17 +179,22 @@
 //!   `Input::User`.
 //! - `add_rule(id, text)`, `approve(id, text, scope)`, `withdraw_rule(id, rule_id, reason)`: any
 //!   session; the input goes to the lead (root) session of its mission, which owns the ledger.
-//!   Blank `text` or `rule_id` is refused (`Write the rule to set.`, `Write what is approved.`,
-//!   `Name the rule to withdraw (its id, such as k1).`), an archived lead as for `send_message`.
-//!   `withdraw_rule` reads the mission's journal first, because the session drops a withdrawal its
-//!   ledger refuses: `There is no rule {rule_id} to withdraw: this mission has no ledger.`, `There
-//!   is no rule {rule_id} in this mission; its rules are {ids in force}.` (none in force: `…; it has
-//!   no rules in force.`), `Rule {rule_id} is already withdrawn.` Then activate the lead;
-//!   `Input::Constraint`, `Input::Approval` or `Input::Withdraw`. A blank `scope` is sent as `only
-//!   what the approval says` and a blank `reason` as `no reason given` (the ledger refuses blank
-//!   ones). The lead records the input at once when idle and at the next step of a running turn: a
-//!   ledger entry when the mission has a ledger, and a protected note in its window. No turn is
-//!   started.
+//!   `text`, `scope`, `rule_id` and `reason` are trimmed. Blank `text` or `rule_id` is refused
+//!   (`Write the rule to set.`, `Write what is approved.`, `Name the rule to withdraw (its id, such
+//!   as k1).`), an archived lead as for `send_message`. The mission keeps a ledger when its lead's
+//!   role ends explicitly. `withdraw_rule` reads the mission's journal first, because the session
+//!   drops a withdrawal its ledger refuses: `There is no rule {rule_id} to withdraw: this mission
+//!   keeps no ledger, so its rules have no ids. Tell the lead in a message that the rule no longer
+//!   applies.`, `There is no rule {rule_id} in this mission; its rules are {ids in force}.` (none
+//!   in force: `…; it has no rules in force.`), `Rule {rule_id} is already withdrawn.` Then
+//!   activate the lead; `Input::Constraint`, `Input::Approval` or `Input::Withdraw`. When the
+//!   mission keeps a ledger, a blank `scope` is sent as `only what the approval says` and a blank
+//!   `reason` as `no reason given` (the ledger refuses blank ones); without a ledger a blank scope
+//!   stays blank and the note words it itself. The lead records the input at once when idle and at
+//!   the next step of a running turn: a ledger entry when the mission keeps a ledger (the lead's
+//!   state block then lists it), and a protected note in the lead's window. No turn is started.
+//!   The answer is a [`RuleReceipt`]: the lead, whether it was in a turn (`queued`), whether the
+//!   mission keeps a ledger, and the stock text when one was used.
 //! - `stop(id)`: any session. Active: `control.stop_turn()` and `Input::Stop`. Not active: nothing.
 //! - `resume(id)`: root only; activate; `Input::Resume` to it and to each of its unsettled children
 //!   whose latest status has `last_end == Stopped` (activating them).
@@ -423,6 +428,26 @@ pub struct LedgerView {
     pub state: LedgerState,
     pub markdown: String,
 }
+
+/// What became of a rule, an approval or a withdrawal the operator sent (see [`Runtime::add_rule`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleReceipt {
+    /// The lead session it was handed to.
+    pub lead: SessionId,
+    /// The lead was running a turn: it records this at its next step, and until then it is only
+    /// queued in memory.
+    pub queued: bool,
+    /// The mission keeps a ledger, so this is recorded there (a rule or an approval under an id) as
+    /// well as in a note. Without one it is a note in the lead's window only.
+    pub ledger: bool,
+    /// The stock scope or reason recorded because none was given.
+    pub stock: Option<String>,
+}
+
+/// The scope recorded in the ledger for an approval given without one.
+const STOCK_SCOPE: &str = "only what the approval says";
+/// The reason recorded in the ledger for a rule withdrawn without one.
+const STOCK_REASON: &str = "no reason given";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModelHealth {
@@ -1982,11 +2007,22 @@ impl Runtime {
     }
 
     /// Hand `input` to the lead session `lead`, activating it. The session handles it at once when
-    /// it is idle and at the next step of a running turn; until then it is only queued in memory.
-    fn send_to_lead(&self, lead: &SessionId, input: Input) -> Result<(), String> {
+    /// it is idle and at the next step of a running turn; until then it is only queued in memory,
+    /// which the receipt says (`queued`). `ledger`: the mission keeps one; `stock`: the text put in
+    /// place of a blank scope or reason.
+    fn send_to_lead(
+        &self,
+        lead: &SessionId,
+        input: Input,
+        ledger: bool,
+        stock: Option<&str>,
+    ) -> Result<RuleReceipt, String> {
         self.inner.activate(lead)?;
-        if self.inner.send_input(lead, input) {
-            Ok(())
+        let st = self.inner.st();
+        let k = st.known.get(lead).ok_or_else(|| no_session(lead))?;
+        let queued = k.status.phase == Phase::Running;
+        if k.active.as_ref().is_some_and(|a| a.inputs.send(input).is_ok()) {
+            Ok(RuleReceipt { lead: lead.clone(), queued, ledger, stock: stock.map(str::to_string) })
         } else {
             Err(format!("Session {} is not accepting input.", lead.as_str()))
         }
@@ -1996,49 +2032,61 @@ impl Runtime {
     /// `Ok` means the rule was handed to the lead, not that it is recorded yet: the lead records it
     /// at once when it is idle, and at the next step of a running turn otherwise (so not while a
     /// tool call, such as an awaited agent, is still running; a daemon stop before that loses it).
-    /// Recording is a ledger entry, constraint `k<n>`, when the mission has a ledger (which puts the
-    /// rule in the state block of every agent of the mission), and a protected note in the lead's
-    /// window that is never folded out of view. No turn is started: the lead reads the rule with its
-    /// next request to the model.
-    pub async fn add_rule(&self, id: &SessionId, text: &str) -> Result<(), String> {
-        if text.trim().is_empty() {
+    /// The receipt's `queued` says which of the two it was. Recording is a ledger entry, constraint
+    /// `k<n>`, when the mission keeps a ledger (the lead's state block then lists the rule), and in
+    /// every mission a protected note in the lead's window that is never folded out of view; the
+    /// note tells the lead that the rule also binds the work it assigns to its agents. No turn is
+    /// started: the lead reads the rule with its next request to the model. Without a ledger
+    /// (receipt `ledger: false`) the rule has no id, is listed nowhere and cannot be withdrawn by id.
+    pub async fn add_rule(&self, id: &SessionId, text: &str) -> Result<RuleReceipt, String> {
+        let text = text.trim();
+        if text.is_empty() {
             return Err("Write the rule to set.".to_string());
         }
         let lead = self.lead_of(id)?;
-        self.send_to_lead(&lead.id, Input::Constraint(text.to_string()))
+        let ledger = self.inner.mission_explicit(&lead)?;
+        self.send_to_lead(&lead.id, Input::Constraint(text.to_string()), ledger, None)
     }
 
     /// Record that the operator approved something, with what the approval covers. Handed to the
     /// lead and recorded like a rule (see [`Runtime::add_rule`]): ledger entry `a<n>` when the
-    /// mission has a ledger, a protected note in the lead's window, no turn started. A blank `scope`
-    /// is recorded as `only what the approval says`.
-    pub async fn approve(&self, id: &SessionId, text: &str, scope: &str) -> Result<(), String> {
-        if text.trim().is_empty() {
+    /// mission keeps a ledger, a protected note in the lead's window, no turn started. In a mission
+    /// with a ledger a blank `scope` is recorded as `only what the approval says` (receipt `stock`);
+    /// without one it stays blank and the note says that the approval covers only what it says.
+    pub async fn approve(&self, id: &SessionId, text: &str, scope: &str) -> Result<RuleReceipt, String> {
+        let (text, scope) = (text.trim(), scope.trim());
+        if text.is_empty() {
             return Err("Write what is approved.".to_string());
         }
-        // The ledger refuses an approval without a scope, which would leave it a note without an id.
-        let scope = if scope.trim().is_empty() { "only what the approval says" } else { scope };
         let lead = self.lead_of(id)?;
-        self.send_to_lead(&lead.id, Input::Approval { text: text.to_string(), scope: scope.to_string() })
+        let ledger = self.inner.mission_explicit(&lead)?;
+        // The ledger refuses an approval without a scope, which would leave it a note without an id.
+        let stock = (ledger && scope.is_empty()).then_some(STOCK_SCOPE);
+        let input = Input::Approval { text: text.to_string(), scope: stock.unwrap_or(scope).to_string() };
+        self.send_to_lead(&lead.id, input, ledger, stock)
     }
 
     /// Withdraw the standing rule `rule_id` (`k<n>`, as listed in the ledger) of the mission of `id`.
-    /// Refused unless the mission's ledger lists that rule as in force. Then handed to the lead like
-    /// a rule (see [`Runtime::add_rule`]): the ledger marks the rule retired with `reason` and the
-    /// lead gets a protected note saying so; no turn is started. A blank `reason` is recorded as
-    /// `no reason given`.
-    pub async fn withdraw_rule(&self, id: &SessionId, rule_id: &str, reason: &str) -> Result<(), String> {
-        let rule_id = rule_id.trim();
+    /// Refused unless the mission's ledger lists that rule as in force; a mission that keeps no
+    /// ledger has no rule ids, and the refusal says to tell the lead in a message instead. Then
+    /// handed to the lead like a rule (see [`Runtime::add_rule`]): the ledger marks the rule retired
+    /// with `reason` and the lead gets a protected note saying so; no turn is started. A blank
+    /// `reason` is recorded as `no reason given` (receipt `stock`).
+    pub async fn withdraw_rule(&self, id: &SessionId, rule_id: &str, reason: &str) -> Result<RuleReceipt, String> {
+        let (rule_id, reason) = (rule_id.trim(), reason.trim());
         if rule_id.is_empty() {
             return Err("Name the rule to withdraw (its id, such as k1).".to_string());
         }
         let lead = self.lead_of(id)?;
         // The session drops a withdrawal its ledger refuses and tells nobody, so what the ledger
         // would refuse is refused here, where the operator is told why.
-        let path = self.inner.paths.journal(&lead.mission);
-        if !path.is_file() {
-            return Err(format!("There is no rule {rule_id} to withdraw: this mission has no ledger."));
+        if !self.inner.mission_explicit(&lead)? {
+            return Err(format!(
+                "There is no rule {rule_id} to withdraw: this mission keeps no ledger, so its rules have no ids. Tell the lead in a message that the rule no longer applies."
+            ));
         }
+        // A journal not written yet reads as an empty ledger.
+        let path = self.inner.paths.journal(&lead.mission);
         let rules = Journal::new(path, self.inner.key.clone()).state().map_err(|e| e.to_string())?.constraints;
         match rules.iter().find(|c| c.id == rule_id) {
             Some(c) if c.retired.is_none() => {}
@@ -2053,8 +2101,9 @@ impl Runtime {
             }
         }
         // The ledger refuses a retirement without a reason.
-        let reason = if reason.trim().is_empty() { "no reason given" } else { reason };
-        self.send_to_lead(&lead.id, Input::Withdraw { id: rule_id.to_string(), reason: reason.to_string() })
+        let stock = reason.is_empty().then_some(STOCK_REASON);
+        let input = Input::Withdraw { id: rule_id.to_string(), reason: stock.unwrap_or(reason).to_string() };
+        self.send_to_lead(&lead.id, input, true, stock)
     }
 
     pub async fn stop(&self, id: &SessionId) -> Result<(), String> {
@@ -2526,7 +2575,9 @@ mod tests {
         let turns = |e: &Env| e.kinds(&id).iter().filter(|k| *k == "turn_start").count();
         let before = turns(&e);
 
-        e.rt.add_rule(&child, "never touch prod").await.unwrap();
+        // Sent through a child, with stray white space: it goes to the idle lead, trimmed.
+        let receipt = e.rt.add_rule(&child, "  never touch prod\n").await.unwrap();
+        assert_eq!(receipt, RuleReceipt { lead: id.clone(), queued: false, ledger: true, stock: None });
         let mission = info.meta.mission.clone();
         until("rule in ledger", || {
             e.rt.ledger(&mission).is_ok_and(|l| l.state.constraints.iter().any(|c| c.text == "never touch prod"))
@@ -2536,12 +2587,16 @@ mod tests {
             e.records(&id).iter().any(|r| matches!(&r.event, Event::HarnessNote { note, .. } if *note == kind))
         };
         until("note", || note(NoteKind::Constraint)).await;
-        e.rt.approve(&id, "deploy to staging", "staging only").await.unwrap();
+        let receipt = e.rt.approve(&id, "deploy to staging\n", " staging only\n").await.unwrap();
+        assert_eq!(receipt.stock, None);
         until("approval", || e.rt.ledger(&mission).is_ok_and(|l| l.state.approvals.len() == 1)).await;
         assert!(note(NoteKind::Approval));
+        let approval = e.rt.ledger(&mission).unwrap().state.approvals[0].clone();
+        assert_eq!((approval.text.as_str(), approval.scope.as_str()), ("deploy to staging", "staging only"));
         let rule_id = e.rt.ledger(&mission).unwrap().state.constraints[0].id.clone();
-        e.rt.withdraw_rule(&id, &rule_id, "done").await.unwrap();
+        e.rt.withdraw_rule(&id, &rule_id, " done\n").await.unwrap();
         until("retired", || e.rt.ledger(&mission).is_ok_and(|l| l.state.constraints[0].retired.is_some())).await;
+        assert_eq!(e.rt.ledger(&mission).unwrap().state.constraints[0].retired.as_deref(), Some("done"));
         assert_eq!(turns(&e), before, "operator rules must not start a turn");
 
         assert!(e.rt.add_rule(&id, "  ").await.is_err());
@@ -2555,10 +2610,10 @@ mod tests {
     #[tokio::test]
     async fn a_blank_scope_or_reason_is_still_recorded_and_a_withdrawal_the_ledger_would_drop_is_refused() {
         let e = env(Script::new(|_, _| finish("ok"))).await;
-        // No first message: the lead is idle and its mission has no journal file yet.
+        // No first message: the lead is idle and its mission's journal is not written yet.
         let info = e.rt.create_session(e.new_session(None)).await.unwrap();
         let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
-        let refused = "There is no rule k1 to withdraw: this mission has no ledger.";
+        let refused = "There is no rule k1 in this mission; it has no rules in force.";
         assert_eq!(e.rt.withdraw_rule(&id, "k1", "").await.unwrap_err(), refused);
         let noted = |needle: &str| {
             e.has(&id, |ev| matches!(ev, Event::HarnessNote { text, .. } if text.contains(needle)))
@@ -2566,7 +2621,9 @@ mod tests {
 
         e.rt.add_rule(&id, "first rule").await.unwrap();
         e.rt.add_rule(&id, "second rule").await.unwrap();
-        e.rt.approve(&id, "ship it", "  ").await.unwrap();
+        // The receipt names the stock text that stands in for the blank scope or reason.
+        let receipt = e.rt.approve(&id, "ship it", "  ").await.unwrap();
+        assert_eq!((receipt.ledger, receipt.stock.as_deref()), (true, Some("only what the approval says")));
         until("approval", || e.rt.ledger(&mission).is_ok_and(|l| l.state.approvals.len() == 1)).await;
         let approval = e.rt.ledger(&mission).unwrap().state.approvals[0].clone();
         assert_eq!((approval.id.as_str(), approval.scope.as_str()), ("a1", "only what the approval says"));
@@ -2579,7 +2636,8 @@ mod tests {
         ] {
             assert_eq!(e.rt.withdraw_rule(&id, rule, "why").await.unwrap_err(), sentence);
         }
-        e.rt.withdraw_rule(&id, " k1 ", "").await.unwrap();
+        let receipt = e.rt.withdraw_rule(&id, " k1 ", "").await.unwrap();
+        assert_eq!(receipt.stock.as_deref(), Some("no reason given"));
         until("k1 retired", || e.rt.ledger(&mission).is_ok_and(|l| l.state.constraints[0].retired.is_some())).await;
         let rules = e.rt.ledger(&mission).unwrap().state.constraints;
         assert_eq!((rules[0].retired.as_deref(), rules[1].retired.as_deref()), (Some("no reason given"), None));
@@ -2589,7 +2647,7 @@ mod tests {
             e.rt.withdraw_rule(&id, "k7", "").await.unwrap_err(),
             "There is no rule k7 in this mission; its rules are k2."
         );
-        e.rt.withdraw_rule(&id, "k2", "lifted").await.unwrap();
+        assert_eq!(e.rt.withdraw_rule(&id, "k2", "lifted").await.unwrap().stock, None);
         until("k2 retired", || e.rt.ledger(&mission).is_ok_and(|l| l.state.constraints[1].retired.is_some())).await;
         assert_eq!(
             e.rt.withdraw_rule(&id, "k3", "").await.unwrap_err(),
@@ -2597,6 +2655,55 @@ mod tests {
         );
         assert!(!e.kinds(&id).iter().any(|k| k == "turn_start"), "operator rules must not start a turn");
         e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_mission_without_a_ledger_takes_rules_as_notes_only_and_says_so() {
+        use loom_core::event::NoteKind;
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        // The `chat` role ends its turns freely: its mission keeps no ledger.
+        let new = NewSession { role: Some("chat".into()), ..e.new_session(None) };
+        let info = e.rt.create_session(new).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        let note = |kind: NoteKind, start: &str, end: &str| {
+            e.has(&id, |ev| match ev {
+                Event::HarnessNote { note, text } => *note == kind && text.starts_with(start) && text.ends_with(end),
+                _ => false,
+            })
+        };
+
+        let receipt = e.rt.add_rule(&id, " no prod\n").await.unwrap();
+        assert_eq!(receipt, RuleReceipt { lead: id.clone(), queued: false, ledger: false, stock: None });
+        until("rule note", || note(NoteKind::Constraint, "The operator set a standing rule. ", "\nno prod")).await;
+        // No stock scope: nothing would record it, and the note has its own words for a blank one.
+        let receipt = e.rt.approve(&id, "ship it", " ").await.unwrap();
+        assert_eq!((receipt.ledger, receipt.stock), (false, None));
+        let covers = "The operator gave an approval. It covers what is written here and nothing beyond it. ";
+        until("approval note", || note(NoteKind::Approval, covers, "\nship it")).await;
+        assert_eq!(
+            e.rt.withdraw_rule(&id, "k1", "").await.unwrap_err(),
+            "There is no rule k1 to withdraw: this mission keeps no ledger, so its rules have no ids. Tell the lead in a message that the rule no longer applies."
+        );
+        assert!(e.rt.ledger(&mission).unwrap_err().starts_with("No ledger"));
+        assert!(!e.kinds(&id).iter().any(|k| k == "turn_start"), "operator rules must not start a turn");
+        tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rule_sent_to_a_lead_in_a_turn_is_reported_as_queued_and_not_recorded_yet() {
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("request", || !e.server.requests().is_empty()).await;
+        until("running", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Running)).await;
+
+        let receipt = e.rt.add_rule(&id, "no prod").await.unwrap();
+        assert_eq!(receipt, RuleReceipt { lead: id.clone(), queued: true, ledger: true, stock: None });
+        assert!(e.rt.approve(&id, "ship it", "staging").await.unwrap().queued);
+        // The lead is waiting for the model: the rule is in its queue, not in the ledger.
+        let state = e.rt.ledger(&mission).unwrap().state;
+        assert_eq!((state.goal.as_deref(), state.constraints.len(), state.approvals.len()), (Some("go"), 0, 0));
+        tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
     }
 
     #[tokio::test]

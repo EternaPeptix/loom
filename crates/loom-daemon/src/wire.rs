@@ -2,7 +2,7 @@
 //!
 //! Everything else on the wire is the serde form of a type from `loom_agent::runtime`
 //! (`SessionInfo`, `NewSession`, `InboxEntry`, `WindowView`, `LedgerView`, `MissionInfo`, `NetEntry`,
-//! `ModelHealth`, `BusEvent`) or `loom_core` (`Record`, `BlobRef`).
+//! `ModelHealth`, `RuleReceipt`, `BusEvent`) or `loom_core` (`Record`, `BlobRef`).
 
 use loom_agent::runtime::{ModelHealth, SessionInfo};
 use loom_core::event::{Record, Seq};
@@ -74,7 +74,8 @@ pub struct RuleBody {
 #[serde(deny_unknown_fields)]
 pub struct ApprovalBody {
     pub text: String,
-    /// What the approval covers. Left out or blank, the runtime records a stock scope in its place.
+    /// What the approval covers. Left out or blank, a mission that keeps a ledger records a stock
+    /// scope in its place (the answer's `stock`).
     #[serde(default)]
     pub scope: String,
 }

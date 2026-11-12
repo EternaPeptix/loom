@@ -554,7 +554,7 @@ test("operator rule requests build their routes and refuse blank input", () => {
   assert.equal(C.approvalRequest("s-1", "ship").body.scope, "");
   assert.ok(C.approvalRequest("s-1", "").error);
   assert.deepEqual(C.withdrawRequest("s-1", "k1", " done "), { path: "/api/sessions/s-1/rules/k1/withdraw", body: { reason: "done" } });
-  assert.deepEqual(C.withdrawRequest("s-1", "k 1", "").body, { reason: "" }, "one click, no reason: the daemon records a stock one");
+  assert.deepEqual(C.withdrawRequest("s-1", "k 1", "").body, { reason: "" }, "no reason typed: the daemon records a stock one");
   assert.equal(C.withdrawRequest("s-1", "k 1", "").path, "/api/sessions/s-1/rules/k%201/withdraw");
   assert.ok(C.withdrawRequest("s-1", "", "x").error);
 });
@@ -570,14 +570,37 @@ test("the rules control lists the rules in force and marks used approvals", () =
   assert.deepEqual(m.approvals[1], { id: "a2", text: "deploy", scope: "staging", usedFor: null });
   assert.deepEqual(C.ruleLists(m), {
     rules: [{ id: "k2", text: "no prod" }],
+    asking: null,
     approvals: [
       { id: "a1", text: "ok to push", used: true, note: "used for: pushed v2" },
       { id: "a2", text: "deploy", used: false, note: "scope: staging" },
     ],
   });
   // No ledger (the request failed, or the mission keeps none): nothing to list, the inputs remain.
-  assert.deepEqual(C.ruleLists(null), { rules: [], approvals: [] });
-  assert.deepEqual(C.ruleLists(C.ledgerModel({ state: { entries: 0 } })), { rules: [], approvals: [] });
+  assert.deepEqual(C.ruleLists(null), { rules: [], asking: null, approvals: [] });
+  assert.deepEqual(C.ruleLists(C.ledgerModel({ state: { entries: 0 } })), { rules: [], asking: null, approvals: [] });
+  // The withdrawal being confirmed stays open across redraws only while its rule is in force.
+  assert.equal(C.ruleLists(m, "k2").asking, "k2");
+  assert.equal(C.ruleLists(m, "k1").asking, null, "k1 is already retired");
+  assert.equal(C.ruleLists(m, "k9").asking, null);
+  assert.equal(C.ruleLists(null, "k2").asking, null);
+});
+
+test("the rules control says when a request is only queued or will never be listed", () => {
+  // An idle lead of a mission with a ledger: the lists show it, nothing more to say.
+  assert.equal(C.ruleNotice({ lead: "s-1", queued: false, ledger: true, stock: null }), "");
+  const queued = C.ruleNotice({ lead: "s-1", queued: true, ledger: true, stock: null });
+  assert.match(queued, /^Sent, not recorded yet: the lead was in a turn/);
+  assert.match(queued, /no need to send it again\.$/);
+  const noLedger = C.ruleNotice({ lead: "s-1", queued: false, ledger: false, stock: null });
+  assert.match(noLedger, /^This mission keeps no ledger: .* nothing is listed here\.$/);
+  const both = C.ruleNotice({ lead: "s-1", queued: true, ledger: false, stock: null });
+  assert.ok(both.startsWith("Sent, not recorded yet") && both.endsWith(noLedger) && !both.includes("shows here"));
+  assert.equal(C.ruleNotice(null), "");
+
+  assert.match(C.rulesHint("No ledger: this mission's lead does not keep one."), /^Nothing is listed while this mission has no ledger\./);
+  assert.equal(C.rulesHint(null), "");
+  assert.equal(C.rulesHint("There is no mission m-1."), "");
 });
 
 test("net rows and live dedupe", () => {
