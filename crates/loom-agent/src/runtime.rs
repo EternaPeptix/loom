@@ -2752,30 +2752,26 @@ fn is_absent(e: &std::io::Error) -> bool {
 }
 
 /// Open `path` for reading, with the metadata of what the handle holds. A link there is followed only with
-/// `follow`, and the open never blocks (a FIFO does not wait for a writer). `None`: nothing to read (`is_absent`).
-fn open_unblocked(path: &Path, follow: bool) -> std::io::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+/// `follow`, and the open never blocks (a FIFO does not wait for a writer).
+fn open_unblocked(path: &Path, follow: bool) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     use std::os::unix::fs::OpenOptionsExt;
     let flags = libc::O_NONBLOCK | libc::O_NOCTTY | if follow { 0 } else { libc::O_NOFOLLOW };
-    match std::fs::OpenOptions::new().read(true).custom_flags(flags).open(path) {
-        Ok(file) => {
-            let meta = file.metadata()?;
-            Ok(Some((file, meta)))
-        }
-        Err(e) if is_absent(&e) => Ok(None),
-        Err(e) => Err(e),
-    }
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(path)?;
+    let meta = file.metadata()?;
+    Ok((file, meta))
 }
 
 /// Add to `keep` every stored blob that a regular file below `root` names (`scan_ids`). A missing `root` is an
-/// empty tree. A link is followed only when it is an entry of `root` itself (a session or mission directory kept
-/// elsewhere), and is passed over there only when it dangles or loops. Below that no link is followed: every
-/// entry is opened with `O_NOFOLLOW` and read as what the open handle holds, so one replaced by a link after it
-/// was listed is passed over too. Nothing blocks: FIFOs, sockets and devices are not opened, and opens do not
-/// wait. With `temp_dirs`, the `tmp` directory of each entry of `root` (a session's temp dir: the one directory
-/// of the tree a sandboxed command can change, and nothing the harness wrote) is not read. A directory is checked
-/// through its handle and then listed by its path; outside the temp dirs no command can put a link in its place
-/// in between. The scan keeps to `bounds`; when it cannot finish, the error is the sentence that says where and
-/// why.
+/// empty tree; a `root` that is not a directory, or that cannot be opened for any other reason (a link that
+/// loops, say), stops the scan. An entry of `root` itself is read through a link (a session or mission directory
+/// kept elsewhere), and is passed over only when it is gone, dangles or loops. Below that no link is followed:
+/// every entry is opened with `O_NOFOLLOW` and read as what the open handle holds, so one replaced by a link
+/// after it was listed is passed over too. Nothing blocks: FIFOs, sockets and devices are not opened, and opens
+/// do not wait. With `temp_dirs`, the `tmp` directory of each entry of `root` (a session's temp dir: the one
+/// directory of the tree a sandboxed command can change, and nothing the harness wrote) is not read. A directory
+/// is checked through its handle and then listed by its path; outside the temp dirs no command can put a link in
+/// its place in between. The scan keeps to `bounds`; when it cannot finish, the error is the sentence that says
+/// where and why.
 fn scan_tree_for_ids(
     root: &Path,
     temp_dirs: bool,
@@ -2783,15 +2779,24 @@ fn scan_tree_for_ids(
     keep: &mut HashSet<String>,
     bounds: &ScanBounds,
 ) -> Result<(), String> {
-    // What to read, its depth below `root`, and whether a link there is followed.
-    let mut todo = vec![(root.to_path_buf(), 0usize, true)];
-    while let Some((path, depth, follow)) = todo.pop() {
+    // What to read and its depth below `root`.
+    let mut todo = vec![(root.to_path_buf(), 0usize)];
+    while let Some((path, depth)) = todo.pop() {
         if bounds.out_of_time() {
             return Err(bounds.stopped(&path, ScanStop::OutOfTime));
         }
         let unreadable = |e: std::io::Error| bounds.stopped(&path, ScanStop::Unreadable(e));
-        // Vanished meanwhile (a session directory being removed), or a link now: nothing to keep there.
-        let Some((file, meta)) = open_unblocked(&path, follow).map_err(unreadable)? else { continue };
+        // Gone meanwhile (a session directory being removed), or, below the root, a link: an entry of `root`
+        // that dangles or loops, or an entry further down that was replaced by one since it was listed.
+        let nothing_there = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound || (depth > 0 && is_absent(e));
+        let (file, meta) = match open_unblocked(&path, depth <= 1) {
+            Ok(opened) => opened,
+            Err(e) if nothing_there(&e) => continue,
+            Err(e) => return Err(unreadable(e)),
+        };
+        if depth == 0 && !meta.is_dir() {
+            return Err(unreadable(std::io::Error::from_raw_os_error(libc::ENOTDIR)));
+        }
         if meta.is_file() {
             if meta.len() > bounds.file_max {
                 return Err(bounds.stopped(&path, ScanStop::TooLarge));
@@ -2809,7 +2814,7 @@ fn scan_tree_for_ids(
         drop(file);
         let entries = match std::fs::read_dir(&path) {
             Ok(e) => e,
-            Err(e) if is_absent(&e) => continue,
+            Err(e) if nothing_there(&e) => continue,
             Err(e) => return Err(unreadable(e)),
         };
         for entry in entries {
@@ -2823,13 +2828,13 @@ fn scan_tree_for_ids(
                 Err(e) if is_absent(&e) => continue,
                 Err(e) => return Err(bounds.stopped(&child, ScanStop::Unreadable(e))),
             };
-            let (kind, is_link) = if !listed.is_symlink() {
-                (listed, false)
+            let kind = if !listed.is_symlink() {
+                listed
             } else if depth > 0 {
                 continue;
             } else {
                 match std::fs::metadata(&child) {
-                    Ok(m) => (m.file_type(), true),
+                    Ok(m) => m.file_type(),
                     Err(e) if is_absent(&e) => continue,
                     Err(e) => return Err(bounds.stopped(&child, ScanStop::Unreadable(e))),
                 }
@@ -2838,7 +2843,7 @@ fn scan_tree_for_ids(
                 continue;
             }
             if kind.is_dir() || kind.is_file() {
-                todo.push((child, depth.saturating_add(1), is_link));
+                todo.push((child, depth.saturating_add(1)));
             }
         }
     }
@@ -4603,19 +4608,27 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         symlink(&fifo, jobs.join("pipe-link")).unwrap();
         symlink(&out, jobs.join("out")).unwrap();
+        // Roots, which the scan opens itself: the FIFO and a link to it, a link that loops, and a missing directory.
+        // Only the missing one is an empty tree; the others stop the scan.
+        let looping = dir.path().join("looping");
+        symlink("looping", &looping).unwrap();
+        let roots = [fifo.clone(), jobs.join("pipe-link"), looping, dir.path().join("missions")];
         let (tx, rx) = std::sync::mpsc::channel();
-        let (fifo_in, jobs_in) = (fifo.clone(), jobs.clone());
+        let (fifo_in, jobs_in, roots_in) = (fifo.clone(), jobs.clone(), roots.clone());
         std::thread::spawn(move || {
             let bounds = ScanBounds { file_max: GC_FILE_MAX, time: GC_SCAN_TIME, started: std::time::Instant::now() };
             let mut keep = HashSet::new();
             let scanned = scan_tree_for_ids(&root, true, &stored, &mut keep, &bounds).map(|()| keep);
+            let as_roots = roots_in.map(|r| {
+                let mut keep = HashSet::new();
+                (scan_tree_for_ids(&r, false, &stored, &mut keep, &bounds), keep)
+            });
             // Opened as if each had been listed as a regular file and replaced before the open.
-            let fifo_is_file = open_unblocked(&fifo_in, false).map(|o| o.map(|(_, m)| m.is_file())).ok();
-            let through_link = open_unblocked(&jobs_in.join("pipe-link"), false).map(|o| o.is_some()).ok();
-            let into_link = open_unblocked(&jobs_in.join("out"), false).map(|o| o.is_some()).ok();
-            let _ = tx.send((scanned, fifo_is_file, through_link, into_link));
+            let fifo_is_file = open_unblocked(&fifo_in, false).map(|(_, m)| m.is_file()).ok();
+            let refused = |n: &str| open_unblocked(&jobs_in.join(n), false).err().and_then(|e| e.raw_os_error());
+            let _ = tx.send((scanned, as_roots, fifo_is_file, [refused("pipe-link"), refused("out")]));
         });
-        let Ok((scanned, fifo_is_file, through_link, into_link)) = rx.recv_timeout(Duration::from_secs(30)) else {
+        let Ok((scanned, as_roots, fifo_is_file, refused)) = rx.recv_timeout(Duration::from_secs(30)) else {
             // A reader stuck on the FIFO gets end-of-file once a writer has come and gone, so the thread ends.
             for _ in 0..50 {
                 if std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&fifo).is_ok() {
@@ -4626,7 +4639,15 @@ mod tests {
             panic!("the scan blocked on a FIFO");
         };
         assert_eq!(scanned.unwrap(), HashSet::from([named]));
-        assert_eq!((fifo_is_file, through_link, into_link), (Some(Some(false)), Some(false), Some(false)));
+        let [fifo_root, link_root, looping_root, missing_root] = as_roots;
+        for ((scanned, keep), root) in [fifo_root, link_root, looping_root].into_iter().zip(&roots) {
+            let err = scanned.unwrap_err();
+            assert!(err.starts_with(&format!("cannot read {} (", root.display())), "{err}");
+            assert!(err.contains("nothing was collected") && keep.is_empty(), "{err}");
+        }
+        assert_eq!(missing_root, (Ok(()), HashSet::new()));
+        // A link is not followed: `O_NOFOLLOW` refuses it.
+        assert_eq!((fifo_is_file, refused), (Some(false), [Some(libc::ELOOP); 2]));
     }
 
     #[tokio::test]

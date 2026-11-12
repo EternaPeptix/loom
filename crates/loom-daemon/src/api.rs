@@ -37,7 +37,7 @@
 //! ## API (all under `/api`; JSON in, JSON out)
 //! | Route | Does | Answers |
 //! |---|---|---|
-//! | `GET /status` | `runtime.health()`, counts from `sessions(true)` and `inbox()`, `statvfs` of the loom home (`disk`, `null` when it cannot be read) | `StatusView` |
+//! | `GET /status` | `runtime.health()`, counts from `sessions(true)` and `inbox()`, `statvfs` of the loom home on a blocking thread (`disk`, `null` when it cannot be read) | `StatusView` |
 //! | `GET /sessions?archived=true` | `runtime.sessions(archived)` (default false) | `[SessionInfo]` |
 //! | `POST /sessions` (`NewSession`) | `runtime.create_session` | `201` `SessionInfo` |
 //! | `GET /sessions/{id}` | the session and its children (sessions whose `parent` is it) | `SessionDetail` |
@@ -481,6 +481,9 @@ fn disk_space(path: &std::path::Path) -> Option<DiskSpace> {
 
 async fn status(State(s): State<ApiState>) -> Json<StatusView> {
     let models = s.runtime.health().await;
+    // Off the async threads: the loom home may be on a slow mount. A task that fails reads as unknown.
+    let home = s.runtime.paths().home.clone();
+    let disk = tokio::task::spawn_blocking(move || disk_space(&home)).await.ok().flatten();
     let sessions = s.runtime.sessions(true);
     let inbox_open = s.runtime.inbox().len();
     Json(StatusView {
@@ -490,7 +493,7 @@ async fn status(State(s): State<ApiState>) -> Json<StatusView> {
         bind: s.bind.clone(),
         proxy_port: s.runtime.proxy_port(),
         home: s.runtime.paths().home.display().to_string(),
-        disk: disk_space(&s.runtime.paths().home),
+        disk,
         models,
         sessions_total: sessions.len(),
         sessions_active: sessions.iter().filter(|i| i.active).count(),
