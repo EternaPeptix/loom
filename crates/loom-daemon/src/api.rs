@@ -1278,14 +1278,16 @@ mod tests {
         let (s, b) = e.post(&format!("/api/inbox/{item}"), json!({"answer": ""})).await;
         assert_eq!((s, b), (202, json!({})));
         // An empty answer to a finished item only dismisses it: no turn starts. The message behind it
-        // does start one, which would be the fifth if the dismissal had started the fourth.
+        // starts the fourth turn; a turn started by the dismissal would carry the `inbox_answer` trigger.
         let (s, _) = e.post(&format!("/api/sessions/{id}/messages"), json!({"text": "third"})).await;
         assert_eq!(s, 202);
         e.wait_turn_ends(&id, 4).await;
         assert!(e.rt.inbox().iter().all(|i| i.item.item_id != item));
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let turn_ends = e.records(&id).await.iter().filter(|r| r["kind"] == "turn_end").count();
-        assert_eq!(turn_ends, 4);
+        let records = e.records(&id).await;
+        let starts = records.iter().filter(|r| r["kind"] == "turn_start");
+        let triggers: Vec<&Value> = starts.map(|r| &r["trigger"]).collect();
+        assert!(triggers.iter().all(|t| **t != "inbox_answer"), "{triggers:?}");
+        assert_eq!(triggers.last().copied(), Some(&json!("user")));
         let (s, b) = e.post("/api/inbox/i-nope", json!({"answer": "x"})).await;
         assert_eq!((s, b["error"].as_str().unwrap()), (404, "There is no open inbox item i-nope."));
     }
