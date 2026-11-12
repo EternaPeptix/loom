@@ -9,7 +9,7 @@ import Security
 /// Wire facts (checked against the daemon source and a live daemon, they differ from the design text):
 /// - `/api/events` frames carry only `data:` lines (no `event:`); the kind is the JSON `type` field:
 ///   `session` {info: SessionInfo}, `status` {session, status}, `record` {session, record{kind,…}},
-///   `settled`, `error`, `lagged`, and (only with `?deltas=true`) `delta`/`net`.
+///   `settled`, `error`, `lagged`, and (only with `?deltas=true`) `delta`. `net` events are always sent.
 /// - There is NO inbox event. An inbox item opens as a `record` whose `kind` is `inbox_opened` and
 ///   closes as `inbox_resolved`; a `status` carries `open_inbox`. So an inbox change is a trigger to
 ///   re-read `GET /api/inbox` (entries: {session, mission, title, opened_ms, item{item_id, item_kind,
@@ -163,6 +163,7 @@ final class DaemonClient: @unchecked Sendable {
     /// a TLS proxy), is unreachable; a 200 whose proof is missing or wrong, or any other non-5xx answer
     /// carrying proof JSON (right or wrong: only a 200 proves), is a mismatch.
     static func classifyIdentity(status: Int, data: Data, token: String, nonce: String, baseURL: String) -> IdentityOutcome {
+        if status == 403 { return .mismatch(refusedAddressMessage(data)) }
         let proof = parseIdentityProof(data)
         if status >= 500 || (status != 200 && proof == nil) { return .unreachable("HTTP \(status)") }
         guard status == 200, let proof,
@@ -208,6 +209,16 @@ final class DaemonClient: @unchecked Sendable {
     static func identityMismatchMessage(_ base: String) -> String {
         "something answered on \(base) but did not prove it is the loom daemon for this token, so the token was not sent. "
             + "If the daemon is older than this app, restart it on the new version; otherwise check the address and the token."
+    }
+
+    /// A 403 from `/healthz`: the daemon refused the address (its Host check: the local port differs from its
+    /// own). The daemon's own message when the body has one (`{"error": ...}` or `{"message": ...}`).
+    static func refusedAddressMessage(_ data: Data) -> String {
+        struct Body: Decodable { var error: String?; var message: String? }
+        let said = (try? JSONDecoder().decode(Body.self, from: data)).flatMap { $0.error ?? $0.message }
+        let base = "the daemon refused this address: the local port must be the same as the daemon's port"
+        if let said, !said.isEmpty { return base + " (\(said)). The token was not sent." }
+        return base + ". The token was not sent."
     }
 
     /// `GET <base>/healthz?nonce=<N>` (no token is sent): the daemon must answer with the HMAC proof for
@@ -612,6 +623,10 @@ final class DaemonClient: @unchecked Sendable {
         let n1 = randomNonce(), n2 = randomNonce()
         chk(n1?.count == 64 && n1 != n2 && n1?.utf8.allSatisfy({ ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66) }) == true,
             "nonce: \(n1 ?? "nil")")
+        chk(cls(403, Data()) == .mismatch(refusedAddressMessage(Data())), "identity 403 refused")
+        chk(cls(403, okBody) == .mismatch(refusedAddressMessage(Data())), "identity 403 never proves")
+        chk(!refusedAddressMessage(Data()).contains("older than this app"), "403 is not a version problem")
+        chk(refusedAddressMessage(Data("{\"error\":\"bad Host\"}".utf8)).contains("(bad Host)"), "403 daemon message")
         chk(identityMismatchMessage("http://127.0.0.1:7878").contains("restart it on the new version"), "mismatch message")
         return f
     }

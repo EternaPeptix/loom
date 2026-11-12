@@ -164,7 +164,7 @@ and loads exactly that one URL. Reload and retry build a new web view rather tha
 the old document's code is spent, and loading another `#code=` URL into the same document would only
 change its fragment (WebKit does not reload for that) and run nothing. There is no fallback for daemons
 without login codes (they cannot prove their identity either): the token is never in a URL. Thereafter
-the UI drives itself (same-origin XHR/SSE to the daemon, through the tunnel). The pane:
+the UI drives itself (`fetch` with a bearer secret, and the event stream read with `fetch`, not `EventSource`, to the daemon through the tunnel). The pane:
 
 - restricts navigation to the `baseURL` origin (loopback): a navigation action to any other origin is
   cancelled and opened in the default browser instead (so links in fetched pages don't hijack the

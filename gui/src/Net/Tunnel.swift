@@ -31,9 +31,10 @@ final class Tunnel: @unchecked Sendable {
             case .badToken(let s): return "could not read the daemon token: \(s)"
             case .portBusy(let p):
                 return "local port \(p) is already in use. loom-desk needs 127.0.0.1:\(p) free for this connection "
-                    + "(the tunnel must use the daemon's own port number). Close whatever is using port \(p) "
+                    + "(the tunnel must use the daemon's own port number). The daemon accepts only its own port number, "
+                    + "so any forward must use port \(p) on both ends. Stop whatever is listening on port \(p) "
                     + "(`lsof -nP -iTCP:\(p) -sTCP:LISTEN` names it; a leftover ssh from an earlier loom-desk run "
-                    + "can hold it), or use a Direct connection with your own ssh -L."
+                    + "can hold it), or move one of the daemons to another port with [daemon] bind in its config."
             case .exited(let s): return "the SSH tunnel closed: \(s)"
             }
         }
