@@ -1,61 +1,100 @@
-# Example ~/.loom/config.toml for a DeepSeek V4.1 (dsv41) server on the LAN.
-# Every field has a default, so you only need the parts you want to change. Unknown keys are an error.
+# Example ~/.loom/config.toml.
+#
+# Every key has a default, so an empty file is a valid config and you only need the parts you want to
+# change. Unknown keys are an error. The daemon reads this file only when it starts: restart it
+# (`loom down`, then `loom up`) after editing, and check the file first with `loom config check`.
+# Values shown uncommented are the defaults unless a comment says "example".
 
-# The profile a session uses when it names none.
-default_model = "dsv41"
+# The profile a session uses when it names none. Example: the default is empty, which means the only
+# profile when there is just one (with several profiles and none named, a session cannot be created).
+default_model = "local"
 
 [daemon]
-bind = "127.0.0.1:7878"   # the API and web UI; must be loopback
+bind = "127.0.0.1:7878"   # the API and web UI; must be a loopback address
 proxy_port = 0            # egress proxy on 127.0.0.1; 0 = pick a free port
 
-[models.dsv41]
-base_url = "http://your-server.local:8000/v1"
-model = "dsv41"
-# context_window is discovered from the server's /models (max_model_len) when omitted.
-max_output_tokens = 32768
-reasoning_replay = "all"       # the dsv41 template keeps replayed reasoning in the prefix (cache-safe)
-max_concurrent = 6             # concurrent requests across all sessions
-stall_timeout_s = 240          # abort and retry a stream that stalls this long
-retry_window_s = 300           # keep retrying an unreachable server this long (0 = until it returns)
-retry_max_delay_s = 30
+# One table per model server. base_url is an OpenAI-compatible endpoint, including /v1.
+[models.local]
+base_url = "http://127.0.0.1:8000/v1"   # example: replace with your server
+model = "default"                       # example: the id the server serves (a single served model is found automatically)
+# api_key_env = "MY_SERVER_KEY"         # name of an environment variable holding the API key, if the server wants one
+# context_window = 1000000              # discovered from the server's model list when omitted; set it if the server does not report one
+# max_output_tokens = 32768             # max_tokens sent with each request; omitted = the server's default
+reasoning_replay = "all"                # "all" sends reasoning back with its response (cache-safe on templates that keep it); "none" never does
+max_concurrent = 4                      # concurrent requests to this server across all sessions
+stall_timeout_s = 240                   # abort and retry a stream that delivers nothing this long
+retry_window_s = 300                    # keep retrying an unreachable or failing server this long; 0 = until it returns
+retry_max_delay_s = 30                  # longest pause between retries
 
-# Request fields sent verbatim on every call. Fixed for a session's life, because the template
-# renders reasoning_effort into the prompt head and changing it would break the cache.
-[models.dsv41.extra_body]
-reasoning_effort = "max"
+# Request fields sent verbatim on every call. Fixed for a session's life: some chat templates render
+# them into the prompt head, and changing one would break the prompt cache.
+# [models.local.extra_body]
+# reasoning_effort = "high"
+# temperature = 0.6
 
 [context]
-# Absolute token counts per the model window, not shares of it. The working set is sized for
-# latency and quality; the rest of the 1M window is burst capacity.
-target_tokens = 400000     # plan a re-weave when the server-reported prompt exceeds this
-floor_tokens = 180000      # evict down to this
-keep_recent_steps = 60
+# Absolute token counts, not shares of the window. target_tokens must be below the model's window and
+# floor_tokens below target_tokens.
+target_tokens = 400000     # plan a re-weave (fold old output out of view) when the prompt exceeds this
+floor_tokens = 180000      # fold down to about this
+keep_recent_steps = 60     # model responses at the end of the log that are never folded
+stub_tail_lines = 12       # trailing lines of a folded command result kept in its stub
 
-[agents]
-max_children = 6
-child_max_steps = 60
-child_max_minutes = 30
-max_nudges = 3
-stall_steps = 12
-verify_finish = true       # attack a lead's finish with an independent verifier first
-unviewed_min_lines = 80
+[admit]
+# How much of a tool output the model sees inline. The whole output is always stored and can be paged.
+max_inline_tokens = 60000  # outputs up to about this size are shown whole
+head_lines = 400           # a larger output shows this many lines from the start ...
+tail_lines = 400           # ... and this many from the end
+max_line_chars = 4000      # longest line shown inside a cut output
+salient_max = 40           # most lines listed from the omitted part by the error/warning scan
+# salient_patterns = [...]  # regular expressions for that scan; the built-in list covers errors, warnings, HTTP and exit codes
 
 [tools]
-# Run the read-only calls at the start of a reply (read, glob, grep, out_read, out_grep) as soon as
-# each has streamed in, while the model is still writing the rest; results are still recorded in
-# call order and are only used if the finished reply holds the same call. false = run calls only
-# after the whole reply has arrived.
+bash_foreground_s = 300    # a foreground command still running after this long continues as a background job
+kill_grace_s = 5           # seconds between TERM and KILL when a command is cancelled
+read_max_lines = 2000      # most lines one read/out_read call returns
+search_max_results = 200   # most entries grep/glob/out_grep list (their text is also capped at 4 MiB)
+web_fetch_timeout_s = 60
+web_fetch_max_bytes = 20971520   # 20 MiB
+max_output_bytes = 67108864      # a command whose output passes this (64 MiB) is stopped; the first part is kept
+job_wait_s = 120           # how long job_wait waits when the call gives no time
+# Start a reply's leading read-only calls (read, glob, grep, out_read, out_grep) while the model is
+# still writing the rest. Results are recorded in call order and used only if the finished reply holds
+# the same call. false = run calls only after the whole reply has arrived.
 speculate = true
 
 [sandbox]
-mode = "seatbelt"          # "seatbelt" (macOS) or "none" (reported loudly)
-loopback_all = false
-protect_credentials = true # ~/.ssh, ~/.aws, ~/.gnupg, keychains, browser profiles ... are unreadable to commands and file tools
+mode = "seatbelt"          # "seatbelt" (macOS only) or "none". "none" leaves commands unconfined and is the only mode other systems can use.
+protect_credentials = true # ~/.ssh, ~/.aws, ~/.gnupg, keychains, browser profiles ... are unreadable and unwritable to commands and file tools; false turns this off
+# unreadable_paths = ["~/private"]       # more paths commands and file tools cannot read or write ("~" is expanded)
+# extra_writable = ["/path/to/scratch"]  # more directories commands may write to (absolute)
+# protected_paths = ["secrets"]          # never writable, even inside the workspace (absolute, or relative to it)
+# loopback_ports = [5432]                # loopback TCP ports commands may connect to directly
+loopback_all = false       # true lets commands connect to any loopback port
+# unix_sockets = ["/var/run/docker.sock"]  # unix sockets commands may connect to
+# env_pass = ["MY_TOKEN"]  # environment variables passed to commands although their names look like secrets
 
 [network]
-mode = "deny_all"          # the default: tools reach no host through the egress proxy (model requests are not affected). "allowlist" reaches only `allow`; "open" any public host.
-                           # web_fetch needs a route (allowlist or open)
-# allow = ["*.rust-lang.org", "docs.rs", "crates.io"]
+# What tools (bash, web_fetch, the vulnerability lookups) can reach through the egress proxy.
+# Requests to your model server are not affected by this section.
+#   "deny_all"  (the default) no host is reachable
+#   "allowlist" only hosts matching `allow` are reachable
+#   "open"      any public host is reachable
+mode = "deny_all"
+# allow = ["*.rust-lang.org", "docs.rs", "crates.io", "api.example.test:443"]   # used by "allowlist"; example
+# deny = ["169.254.0.0/16", "tracker.example.test"]   # always refused, in every mode: host patterns, IP addresses or CIDR blocks
+# allow_private = ["10.1.2.3"]   # private, loopback or link-local destinations that are permitted (host pattern, IP or CIDR)
+
+[agents]
+max_children = 6           # child sessions running at once within one mission
+child_max_steps = 200      # default step budget for a child spawned without one
+child_max_minutes = 120    # default time budget for a child
+max_nudges = 3             # stop-gate nudges or malformed replies in a row before the session is parked for you
+stall_steps = 30           # steps without a new ledger entry before the harness adds a stall note
+verify_finish = true       # a role with verify_finish has its finish attacked by its verifier first; false skips that for every role (the finish is marked "not verified")
+invalid_calls_before_forcing = 3   # consecutive invalid tool calls before the next request forces a tool call
+unviewed_min_lines = 20    # outputs with at least this many lines never shown are listed in the HUD
 
 [notify]
-repeat_minutes = 30        # re-notify an unanswered blocking item this often (0 = never)
+# command = ["/usr/local/bin/my-notify"]   # program run with the title and body as two arguments; default: the platform's notifier
+repeat_minutes = 0         # re-notify an unanswered blocking item this often; 0 = never (example: 30)

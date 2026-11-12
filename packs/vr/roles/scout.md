@@ -17,7 +17,7 @@ Record as you go, not at the end:
 - `evidence` for each decisive output — handle, line range, verbatim quote. Mark it `execution` when you ran the target, `static` when you only read source. The harness checks your quote against the stored bytes, so copy, do not paraphrase. A `static` record is a lead, never a validation.
 - `note` a dead end and why it failed, so the engagement does not repeat it.
 
-You may spawn a scout of your own for a sub-experiment that is genuinely separate, but prefer to do one bounded thing well and return.
+If a sub-experiment is genuinely separate, say so in your answer and let the researcher assign it; you cannot start agents. Do one bounded thing well and return.
 
 ## Ending
 
