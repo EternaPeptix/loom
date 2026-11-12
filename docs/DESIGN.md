@@ -237,6 +237,14 @@ verdict. Rules enforced on write:
 
 `LedgerState::brief()` renders the HUD/resume text; `render_views(dir)` writes Markdown views.
 
+Children read the same current mission journal through `ledger` and their request HUD, including
+fresh children whose assignment omits the goal or constraints. A worker may append notes and create
+claims, then update and attach attested evidence to claims created by that child. The journal's append
+lock protects this ownership check. Mission plans, shared obligations, standing instructions and
+approvals remain with the lead; operator input addressed to a child cannot change that shared state.
+A verifier has read-only ledger access and returns its observations through its report or verdict.
+An unreadable mission journal stops a child before another model request.
+
 ## 8. Agent loop and stop gate (`loom-agent`)
 
 One task per session:
@@ -290,6 +298,12 @@ in the mission; a test/build result older than a later edit.
   not_established, evidence}`. The harness verifies each quote against the blob; a failed quote is
   returned to the child as an error. The parent receives a framed, capped, explicitly unverified
   report with a handle to the full text.
+- Before a child is marked ended or delivered, its own log syncs a `child_completed` outbox record
+  containing the typed outcome, report, full-answer blob pointer, payload, steps and token usage.
+  Recovery uses this record even if the later terminal/status writes were interrupted; a completed
+  child does not act again. The parent's `child_settled` receipt acknowledges that child id, and
+  replayed delivery neither appends a duplicate receipt nor wakes another turn. Legacy terminal
+  logs without a typed result recover as explicitly incomplete rather than successful summaries.
 - `decide {question, options, k}` forks k voters (different seeds), each must answer with one option
   and a one-paragraph reason; the tally and reasons come back as one result.
 - `verify {claim, evidence}` runs the verifier role on demand.
@@ -329,6 +343,14 @@ plus runtime-owned tools (ledger, agents, termination, `log_search`). Rules:
   grace period, to the whole group. A foreground call that exceeds its timeout is promoted to a
   background job (an obligation in the ledger) rather than killed. stdout and stderr are both stored;
   exit code, duration and stderr line count are in the result header.
+  A shell leader exiting does not complete the call while live descendants remain in that group:
+  late output is retained, output limits and cancellation still apply, and the known leader status
+  is preserved. Zombie-only groups are complete. Restored wrappers carry a persisted inert ownership
+  marker so an unrelated live replacement leader is not signalled; failed inspection or ownership
+  checks produce an explicit tracking failure. Tracking covers the original process group, so a
+  descendant that starts a separate session/group is outside that scope. Numeric process-group ids
+  alone cannot establish generation identity if a replacement group has also lost its leader during
+  downtime.
 - The tool set is frozen at session start. External MCP servers are supported as tool providers;
   their instructions are never given system authority.
 

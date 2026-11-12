@@ -71,7 +71,7 @@ fn add_ended_meta(out: ToolOutput, ended: &Ended) -> ToolOutput {
     match ended {
         Ended::Exit(n) => out.with_meta(META_EXIT_CODE, json!(n)),
         Ended::Signal(s) => out.with_meta(META_SIGNAL, json!(s)),
-        Ended::Unknown | Ended::Failed(_) => out,
+        Ended::Unknown | Ended::Failed(_) | Ended::TrackingFailed(_) => out,
     }
 }
 
@@ -208,6 +208,7 @@ impl Tool for JobList {
 fn remove_files(running: &Running) {
     let _ = std::fs::remove_file(&running.out_path);
     let _ = std::fs::remove_file(&running.exit_path);
+    running.remove_owner();
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -251,6 +252,9 @@ fn finish(f: Finish<'_>) -> ToolOutput {
     let Finish { ctx, status, outcome, ended, mut output, elapsed, facts } = f;
     if let Ended::Failed(text) = ended {
         output.extend_from_slice(format!("\n[the command could not be started: {text}]\n").as_bytes());
+    }
+    if let Ended::TrackingFailed(text) = ended {
+        output.extend_from_slice(format!("\n[process tracking failed: {text}]\n").as_bytes());
     }
     let mut out = ToolOutput { status, outcome, more: Vec::new(), body: Body::Raw(Vec::new()), meta: Map::new() };
     out = out.with_more(format!("{:.1}s", elapsed.as_secs_f64()));

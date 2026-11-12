@@ -74,15 +74,21 @@ when stored, goes to the login Keychain (`kSecClassGenericPassword`, service `co
 
 For a `.sshTunnel` connection, `connect()`:
 
-1. picks a free local TCP port on 127.0.0.1 (bind port 0, read it back, close);
+1. uses the remote daemon's port as the local TCP port on 127.0.0.1. The daemon checks the exact
+   port in `Host` and `Origin`, so the two ports must match. It waits up to 3 s for a prior forward
+   being closed by this app to release the listener, then reports an actionable local-port conflict;
+   it never falls back to an arbitrary local port;
 2. spawns `ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
-   -L 127.0.0.1:<localPort>:127.0.0.1:<remotePort> <sshHost>` as a `Process`, keeping the handle;
+   -L 127.0.0.1:<remotePort>:127.0.0.1:<remotePort> <sshHost>` as a `Process`, keeping the handle;
 3. waits (poll-connect to the local port, up to ~10 s) until the forward is up; a dead child or a
    timeout is an error whose message includes the ssh stderr;
 4. if `tokenSource == .fetchOverSsh`, runs `ssh -o BatchMode=yes <sshHost> cat ~/.loom/token`, trims
    it, and stores it (Keychain + memory). A token that is not 64 lowercase-hex characters is an error.
 
-`baseURL` is then `http://127.0.0.1:<localPort>`. `disconnect()` terminates the ssh process (SIGTERM,
+`baseURL` is then `http://127.0.0.1:<remotePort>`. If another local service uses that port, stop it
+before connecting, or use Direct mode when it is already the desired daemon/tunnel. To use a different
+port, the remote daemon must be configured to listen on that same port. The daemon's Host/Origin
+checks remain unchanged. `disconnect()` terminates the ssh process (SIGTERM,
 then SIGKILL after a short grace) and forgets the local port. The tunnel is torn down on disconnect,
 on switching connections, and on app quit (`applicationWillTerminate`). Exactly one tunnel at a time.
 

@@ -140,3 +140,29 @@ deny-all egress. 680 tests pass; clippy is clean.
 evicted by stub before a digest was needed); the notification repeat timer; a long (hours) autonomous
 run; a domain pack mirroring the research workspace (`AGENTS.md`) rather than the general `core` pack.
 These are the next missions, not gaps in the design.
+
+## Runtime regression coverage added on 2026-11-12
+
+The runtime recovery changes were checked with 740 passing Rust workspace tests on an isolated
+build-host lane, 42 passing browser-core tests, and a native desktop DEBUG build with passing
+self-checks. These are regression and mock-model checks, not additional live dsv41 evidence.
+
+- Child results: full typed reports, long-answer handles, payloads and usage survive interruption
+  after the outbox or before parent acknowledgement. Repeated delivery produces one child-id
+  receipt; stopped awaited children and archived-family joins retain their results. A crash between
+  an awaited tool result and its inline acknowledgement can still repeat report text on recovery.
+- Mission state: fresh and forked workers and fresh verifiers receive the current mission state
+  independently of their brief. Protected text stays verbatim; workers write only notes and their
+  own claims/evidence, verifiers cannot write, and an unreadable journal stops child execution.
+- Processes: tests retain leaderless descendants, late output, cancellation and output limits;
+  zombie-only groups complete, and mismatched restored leaders are refused. This covers the original
+  process group, not descendants that escape it or universal identity across numeric PGID reuse.
+- Desktop SSH: endpoint/argument and occupied-port self-checks enforce matching local/remote ports
+  without relaxing daemon Host/Origin checks. No new live desktop-to-daemon SSH integration run is
+  claimed by these checks.
+- [Guarded continuations](HARNESSMM.md): the opt-in prototype demonstrably omits actor callbacks
+  while preserving literal native calls, budgets, output records and fallback. Failed/incomplete
+  receipts, changed inputs/rules, new instructions, cancellation and restart are covered. Deferred
+  controller output is not credited as model-observed before a completed actor request includes it.
+  Real-model quality and performance, including comparison with ordinary tool/shell batching,
+  remain unmeasured.

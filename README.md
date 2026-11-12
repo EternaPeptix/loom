@@ -142,6 +142,9 @@ A pack is a set of roles. `core` (built in) is general. `vr` (`packs/vr/`) is a 
 pipeline — scope gate, evidence tiers, threads with verdicts, a report-readiness gate — expressed as
 native roles, ledger records and hooks rather than a plugin over a transcript.
 
+`harnessmm` is an opt-in experimental pack for bounded guarded continuations. See
+[`docs/HARNESSMM.md`](docs/HARNESSMM.md) for its limits and evaluation protocol.
+
 ## Building
 
 The build runs on a separate host so the operator's machine stays idle (see `./x`). To build

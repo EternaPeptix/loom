@@ -224,7 +224,8 @@ impl Rig {
 
     /// Write an op to the mission journal as the operator (`from_user`), bypassing the tools.
     pub fn user_op(&self, op: LedgerOp) -> LedgerState {
-        let (_, state) = self.shared.ledger_append(true, op).expect("operator ledger op");
+        let journal = self.shared.journal.as_ref().expect("mission journal");
+        let (_, state) = journal.append(&SessionId::from("s-operator"), true, op, &|_| Ok(())).expect("operator ledger op");
         self.shared.take_emitted();
         state
     }

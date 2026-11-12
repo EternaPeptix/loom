@@ -22,6 +22,7 @@
 //! This file is complete; the sub-modules carry their own contracts.
 
 pub mod agents;
+pub mod continuation;
 pub mod ledger;
 pub mod misc;
 pub mod terminal;
@@ -164,6 +165,7 @@ pub trait Orchestrator: Send + Sync {
 struct Slots {
     emitted: Vec<(Author, Event)>,
     effect: Option<Effect>,
+    continuation: Option<crate::continuation::Plan>,
 }
 
 /// One session's handle for its runtime tools. Created by the runtime, shared by `Arc`.
@@ -222,6 +224,14 @@ impl Shared {
         self.slots().effect.take()
     }
 
+    pub fn set_continuation(&self, plan: crate::continuation::Plan) {
+        self.slots().continuation = Some(plan);
+    }
+
+    pub fn take_continuation(&self) -> Option<crate::continuation::Plan> {
+        self.slots().continuation.take()
+    }
+
     /// The folded ledger. The error is a sentence for the model.
     pub fn ledger(&self) -> Result<LedgerState, String> {
         let journal = self.journal.as_ref().ok_or_else(|| NO_MISSION.to_string())?;
@@ -232,8 +242,29 @@ impl Shared {
     /// refusal comes back verbatim (it is already addressed to the model).
     pub fn ledger_append(&self, from_user: bool, op: LedgerOp) -> Result<(Entry, LedgerState), String> {
         let journal = self.journal.as_ref().ok_or_else(|| NO_MISSION.to_string())?;
+        if self.is_child() && from_user {
+            return Err("Operator instructions and approvals must be recorded through the mission lead, not a child session.".to_string());
+        }
+        if self.role.read_only && !from_user {
+            return Err("This role has read-only access to the mission ledger. Return observations through its report or verdict.".to_string());
+        }
         let summary = LedgerState::summarize(&op);
-        let (entry, state) = journal.append(&self.session, from_user, op, &|_| Ok(())).map_err(|e| journal_sentence(&e))?;
+        let checked_op = op.clone();
+        let (entry, state) = journal.append(&self.session, from_user, op, &|_| {
+            if !self.is_child() { return Ok(()); }
+            let claim = match &checked_op {
+                LedgerOp::Decision { .. } | LedgerOp::DeadEnd { .. } | LedgerOp::ClaimAdd { .. } => return Ok(()),
+                LedgerOp::ClaimUpdate { id, .. } => id,
+                LedgerOp::EvidenceAdd(input) => &input.claim,
+                _ => return Err("A child may record notes and its own claims and evidence. Mission plans, approvals and other shared obligations belong to the lead.".to_string()),
+            };
+            // This runs under the journal's append lock, so creation order cannot race another
+            // writer when resolving the claim id to its originating session.
+            let entries = journal.read().map_err(|e| journal_sentence(&e))?;
+            let own = entries.iter().filter(|e| matches!(e.op, LedgerOp::ClaimAdd { .. })).enumerate()
+                .any(|(i, e)| format!("c{}", i.saturating_add(1)) == *claim && e.session == self.session);
+            if own { Ok(()) } else { Err(format!("Claim {claim} belongs to another session. Add evidence and update status only on claims created by this child; return other observations to the lead.")) }
+        }).map_err(|e| journal_sentence(&e))?;
         let author = if from_user { Author::User } else { Author::Model };
         self.emit(author, Event::Ledger { n: entry.n, summary });
         Ok((entry, state))
@@ -256,6 +287,7 @@ pub fn tool(name: &str, shared: &Arc<Shared>) -> Option<Arc<dyn loom_tools::Tool
     let s = shared.clone();
     Some(match name {
         "plan" => Arc::new(ledger::Plan(s)),
+        "guarded_plan" => Arc::new(continuation::GuardedPlan(s)),
         "step" => Arc::new(ledger::Step(s)),
         "note" => Arc::new(ledger::Note(s)),
         "claim" => Arc::new(ledger::Claim(s)),
@@ -307,6 +339,7 @@ pub fn known_tools() -> Vec<String> {
 
 /// The names [`tool`] knows.
 pub const NAMES: &[&str] = &[
+    "guarded_plan",
     "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "finish", "verdict",
     "ask_user", "report_blocker", "wait", "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "decide",
     "verify",

@@ -136,6 +136,14 @@ pub const AFTER_RESTART: &str = "The harness was restarted while you were workin
 /// Note at the start of the turn after the operator pressed stop and then resumed.
 pub const AFTER_STOP: &str = "The operator stopped the previous turn and has now resumed it. A call shown with no recorded result was interrupted: check the state of things before repeating it. Background jobs and agents from before the stop were ended. Carry on with the work.";
 
+pub fn continuation_dispatch(id: &str, node: usize) -> String {
+    format!("Stored plan {id}, node {node}: the controller is dispatching your previously authored literal native call after its mechanical guards passed. This omitted one actor callback; it establishes no semantic claim and does not mean you have read the resulting output.")
+}
+
+pub fn continuation_stopped(id: &str, reason: &str) -> String {
+    format!("Stored plan {id} returned control to the actor: {reason}. Inspect the native receipts and current state before deciding what follows. An action without a recorded result may have taken effect; never repeat it blindly.")
+}
+
 /// A background job ended while the session was doing something else (or waiting).
 pub fn job_arrival(id: &str, command: &str, outcome: &str, detail: &str, handle: Option<&str>, lines: u64, tail: &str) -> String {
     let mut out = format!("Background job {id} ended: {outcome}.");

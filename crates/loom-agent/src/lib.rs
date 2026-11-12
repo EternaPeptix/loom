@@ -10,6 +10,7 @@
 //! - [`runtime`] every session of a loom home: starting, restoring, parents and children, the operator's actions
 
 pub mod gate;
+pub mod continuation;
 pub mod hud;
 pub mod pack;
 pub mod rtools;

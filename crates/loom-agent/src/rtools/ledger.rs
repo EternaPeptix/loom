@@ -598,6 +598,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_reads_mission_state_and_only_writes_its_own_claims() {
+        let rig = rig("worker", true, true);
+        rig.user_op(LedgerOp::GoalSet { text: "keep the operator's mission".into() });
+        rig.user_op(LedgerOp::ConstraintAdd { text: "do not deploy".into() });
+        rig.user_op(LedgerOp::ApprovalGrant { text: "inspect staging".into(), scope: "staging reads".into() });
+        let journal = rig.shared.journal.as_ref().unwrap();
+        journal.append(&loom_core::ids::SessionId::from("s-lead"), false,
+            LedgerOp::ClaimAdd { text: "the lead's claim".into() }, &|_| Ok(())).unwrap();
+        let view = ok(&rig, "ledger", json!({})).await;
+        for text in ["keep the operator's mission", "do not deploy", "inspect staging", "the lead's claim"] {
+            assert!(view.contains(text), "missing {text}: {view}");
+        }
+        let before = journal.read().unwrap();
+        let protected = [
+            (false, LedgerOp::PlanSet { steps: vec!["replace the mission plan".into()] }),
+            (false, LedgerOp::ApprovalUse { id: "a1".into(), used_for: "deploy".into() }),
+            (true, LedgerOp::GoalSet { text: "replace the mission".into() }),
+            (true, LedgerOp::ConstraintAdd { text: "pretend operator instruction".into() }),
+            (true, LedgerOp::ApprovalGrant { text: "pretend permission".into(), scope: "all".into() }),
+        ];
+        for (from_user, op) in protected {
+            assert!(rig.shared.ledger_append(from_user, op).is_err());
+        }
+        assert!(refused(&rig, "claim_update", json!({"id": "c1", "status": "withdrawn", "note": "not mine"})).await.contains("another session"));
+        let h = rig.output("observed result\n", "bash", ToolClass::Exec);
+        let quote = |claim: &str| json!({"claim": claim, "handle": h, "start": 1, "end": 1, "quote": "observed result", "note": "observed directly"});
+        assert!(refused(&rig, "evidence", quote("c1")).await.contains("another session"));
+        assert_eq!(journal.read().unwrap(), before, "refused writes must leave the journal unchanged");
+
+        ok(&rig, "note", json!({"kind": "decision", "text": "inspect the failing test", "why": "narrow the cause"})).await;
+        ok(&rig, "claim", json!({"text": "the child observed a result"})).await;
+        ok(&rig, "evidence", quote("c2")).await;
+        ok(&rig, "claim_update", json!({"id": "c2", "status": "supported"})).await;
+        let state = rig.shared.ledger().unwrap();
+        assert_eq!(state.claims[0].status, loom_core::ledger::ClaimStatus::Open);
+        assert_eq!(state.claims[1].status, loom_core::ledger::ClaimStatus::Supported);
+        assert_eq!(state.evidence[0].input.session, rig.shared.session);
+        assert!(state.evidence[0].input.attested);
+        let entries = journal.read().unwrap();
+        assert!(entries[before.len()..].iter().all(|e| e.session == rig.shared.session && !e.from_user));
+    }
+
+    #[tokio::test]
+    async fn verifier_can_read_but_cannot_write_mission_state() {
+        let rig = rig("verifier", true, true);
+        rig.user_op(LedgerOp::GoalSet { text: "verify this mission".into() });
+        let before = rig.shared.journal.as_ref().unwrap().read().unwrap();
+        assert!(ok(&rig, "ledger", json!({})).await.contains("verify this mission"));
+        for op in [
+            LedgerOp::ClaimAdd { text: "my finding".into() },
+            LedgerOp::Decision { text: "accept".into(), reason: "looks right".into() },
+            LedgerOp::DeadEnd { what: "try again".into(), why: "failed".into() },
+        ] {
+            assert!(rig.shared.ledger_append(false, op).unwrap_err().contains("read-only"));
+        }
+        assert_eq!(rig.shared.journal.as_ref().unwrap().read().unwrap(), before);
+        assert!(rig.shared.take_emitted().is_empty());
+    }
+
+    #[tokio::test]
     async fn no_mission_is_reported_by_every_tool() {
         let rig = rig("lead", false, false);
         let h = rig.output("x\n", "bash", ToolClass::Exec);

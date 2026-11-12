@@ -23,8 +23,10 @@
 //!
 //! ## `poll`
 //! Non-blocking. If we are the parent, reap the child when it has exited (`try_wait`). The command
-//! has ended when the child was reaped or — adopted commands — `kill(pid, 0)` says the process is
-//! gone. Then the status comes from `exit_path`: a number `n < 128` → `Exit(n)`; `n >= 128` →
+//! has ended only when the leader has exited and its process group has no live members. The
+//! leader's status is retained while descendants finish, including descendants that keep writing
+//! after the shell exits. Zombie-only groups are complete: their file descriptors are closed.
+//! The status comes from `exit_path`: a number `n < 128` → `Exit(n)`; `n >= 128` →
 //! `Signal(n - 128)`; empty → `Signal(sig)` if the reaped status carries a signal, else `Unknown`;
 //! other text → `Failed(text)`. Until then `None`. Once it has returned `Some`, it keeps returning
 //! the same value.
@@ -35,9 +37,11 @@
 //! which. It never kills anything.
 //!
 //! ## `terminate`
-//! Sends TERM to the process group; polls for up to `grace`; if anything in the group is still alive
-//! (`kill(-pgid, 0)`), sends KILL to the group and waits for the leader to go. Returns what `poll`
-//! then reports. Safe to call on a command that has already ended (does nothing).
+//! Sends TERM to the process group; polls for up to `grace`; if anything in the group is still alive,
+//! sends KILL to the group and waits for live members to disappear. Returns what `poll`
+//! then reports. Safe to call after the leader exits while descendants remain. A persisted owner
+//! marker refuses a replacement leader when adopting an old pid; an uninspectable group is never
+//! signalled blindly. Safe to call on a group that has already ended (does nothing).
 //!
 //! ## Output
 //! `output_len` is the current size of the output file; `read_output(from)` returns its bytes from
@@ -56,6 +60,7 @@ use std::io;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
@@ -82,6 +87,8 @@ pub enum Ended {
     Unknown,
     /// The command could not be started; the text says why.
     Failed(String),
+    /// Ownership or process inspection failed after the command started; its effects may continue.
+    TrackingFailed(String),
 }
 
 fn signal_name(sig: i32) -> Option<&'static str> {
@@ -106,7 +113,7 @@ fn signal_name(sig: i32) -> Option<&'static str> {
 }
 
 impl Ended {
-    /// `exit 0`, `exit 3`, `killed by signal 9 (KILL)`, `ended without a status`, `could not start`.
+    /// An exit, signal, missing status, start failure, or explicit process-tracking failure.
     pub fn outcome(&self) -> String {
         match self {
             Ended::Exit(n) => format!("exit {n}"),
@@ -116,6 +123,7 @@ impl Ended {
             },
             Ended::Unknown => "ended without a status".to_string(),
             Ended::Failed(_) => "could not start".to_string(),
+            Ended::TrackingFailed(_) => "process tracking failed".to_string(),
         }
     }
 }
@@ -135,7 +143,9 @@ pub struct Running {
     pub exit_path: PathBuf,
     pub started_ms: u64,
     child: Option<tokio::process::Child>,
+    leader_ended: Option<Ended>,
     ended: Option<Ended>,
+    owner: Option<String>,
 }
 
 /// The pid as a signal target; pids 0 and 1 are never targets (0 would mean our own group).
@@ -157,17 +167,103 @@ fn group_alive(pgid: u32) -> bool {
     target(pgid).is_some_and(|p| kill_ok(-p, 0))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroupState {
+    Gone,
+    Live,
+    Replaced,
+    Unknown,
+}
+
+fn owner_path(exit_path: &std::path::Path) -> PathBuf {
+    let mut path = exit_path.as_os_str().to_os_string();
+    path.push(".owner");
+    PathBuf::from(path)
+}
+
+/// The marker is an inert argument of the wrapper, not an environment variable or command text.
+/// It distinguishes a restored wrapper from an unrelated process that later received its pid.
+fn new_owner(spec: &Spawn) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nonce = format!("{}:{:?}:{}:{}", std::process::id(), SystemTime::now(), NEXT.fetch_add(1, Ordering::Relaxed), spec.exit_path.display());
+    format!("loom-owner-{}", loom_core::sha256_hex(nonce.as_bytes()))
+}
+
+/// `kill(-pgid, 0)` counts unreaped zombies. Query only ids and states until a live group leader
+/// needs an ownership check; other processes' command lines are never read.
+fn group_state(pgid: u32, owner: Option<&str>, own_leader: bool) -> GroupState {
+    if !group_alive(pgid) {
+        return GroupState::Gone;
+    }
+    let output = match std::process::Command::new("/bin/ps").args(["-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="]).output() {
+        Ok(output) if output.status.success() => output,
+        _ => return GroupState::Unknown,
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut live = false;
+    let mut leader = false;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let pid = fields.next().and_then(|p| p.parse::<u32>().ok());
+        let group = fields.next().and_then(|p| p.parse::<u32>().ok());
+        let state = fields.next();
+        if group == Some(pgid) && state.is_some_and(|s| !s.starts_with('Z')) {
+            live = true;
+            leader |= pid == Some(pgid);
+        }
+    }
+    if !live {
+        return GroupState::Gone;
+    }
+    if !leader || own_leader {
+        return GroupState::Live;
+    }
+    let Some(owner) = owner else { return GroupState::Replaced };
+    let args = match std::process::Command::new("/bin/ps").args(["-ww", "-p", &pgid.to_string(), "-o", "stat=", "-o", "command="]).output() {
+        Ok(output) if output.status.success() => output,
+        // The wrapper can disappear between the membership snapshot and this lookup. A missing
+        // leader cannot be a replacement leader; the next poll checks remaining members again.
+        _ if !process_alive(pgid) => return GroupState::Live,
+        _ => return GroupState::Unknown,
+    };
+    let text = String::from_utf8_lossy(&args.stdout);
+    let mut fields = text.split_whitespace();
+    // A leader can exit after the membership snapshot: zombies have no original argv, and do not
+    // mean its pid was reused. The next poll inspects any remaining live descendants.
+    if fields.next().is_some_and(|state| state.starts_with('Z')) || fields.any(|argument| argument == owner) {
+        GroupState::Live
+    } else {
+        GroupState::Replaced
+    }
+}
+
 fn signal_group(pgid: u32, sig: i32) {
     if let Some(p) = target(pgid) {
         kill_ok(-p, sig);
     }
 }
 
+/// A last-chance stop when the job table is dropped. Keep the same replacement-leader check as
+/// normal cancellation instead of signalling an unchecked numeric pid from an old record.
+pub(crate) fn kill_recorded_group(pid: u32, exit_path: &std::path::Path) {
+    let owner = std::fs::read_to_string(owner_path(exit_path)).ok();
+    if group_state(pid, owner.as_deref(), false) == GroupState::Live {
+        signal_group(pid, libc::SIGKILL);
+    }
+}
+
 pub fn spawn(sandbox: &Sandbox, spec: &Spawn) -> io::Result<Running> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let out = std::fs::OpenOptions::new().create(true).append(true).open(&spec.out_path)?;
     let exit = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&spec.exit_path)?;
+    let owner = new_owner(spec);
+    let mut marker = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(owner_path(&spec.exit_path))?;
+    marker.write_all(owner.as_bytes())?;
+    marker.sync_data()?;
     let (program, mut args) = sandbox.command(WRAPPER);
     args.push(spec.script.clone());
+    args.push(owner.clone());
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .env_clear()
@@ -178,7 +274,13 @@ pub fn spawn(sandbox: &Sandbox, spec: &Spawn) -> io::Result<Running> {
         .stderr(Stdio::from(exit))
         .process_group(0)
         .kill_on_drop(false);
-    let child = cmd.spawn()?;
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(owner_path(&spec.exit_path));
+            return Err(error);
+        }
+    };
     let pid = child.id().ok_or_else(|| io::Error::other("the command exited before it could be tracked; run it again"))?;
     let started_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)).unwrap_or(0);
     Ok(Running {
@@ -187,14 +289,17 @@ pub fn spawn(sandbox: &Sandbox, spec: &Spawn) -> io::Result<Running> {
         exit_path: spec.exit_path.clone(),
         started_ms,
         child: Some(child),
+        leader_ended: None,
         ended: None,
+        owner: Some(owner),
     })
 }
 
 impl Running {
     /// A command started by an earlier run of this program.
     pub fn adopt(pid: u32, out_path: PathBuf, exit_path: PathBuf, started_ms: u64) -> Running {
-        Running { pid, out_path, exit_path, started_ms, child: None, ended: None }
+        let owner = std::fs::read_to_string(owner_path(&exit_path)).ok().filter(|s| s.starts_with("loom-owner-") && !s.chars().any(char::is_whitespace));
+        Running { pid, out_path, exit_path, started_ms, child: None, leader_ended: None, ended: None, owner }
     }
 
     /// The status the exit file holds; `signal` is the signal of the reaped leader, if any.
@@ -226,12 +331,26 @@ impl Running {
             },
             None => (!process_alive(self.pid), None),
         };
-        if !gone {
+        if gone && self.leader_ended.is_none() {
+            self.leader_ended = Some(self.read_status(signal));
+            self.child = None;
+        }
+        if !gone && self.child.is_some() {
             return None;
         }
-        let e = self.read_status(signal);
-        self.ended = Some(e.clone());
-        Some(e)
+        match group_state(self.pid, self.owner.as_deref(), self.child.is_some()) {
+            GroupState::Gone => {
+                let end = self.leader_ended.clone().unwrap_or_else(|| self.read_status(signal));
+                self.ended = Some(end.clone());
+                Some(end)
+            }
+            GroupState::Replaced => {
+                let end = Ended::TrackingFailed("the recorded process-group id now belongs to a different leader; it was not signalled".to_string());
+                self.ended = Some(end.clone());
+                Some(end)
+            }
+            GroupState::Live | GroupState::Unknown => None,
+        }
     }
 
     pub async fn wait(&mut self, cancel: &CancellationToken, deadline: Option<Duration>, max_bytes: u64) -> WaitEnd {
@@ -262,27 +381,43 @@ impl Running {
         if let Some(e) = self.poll() {
             return e;
         }
-        signal_group(self.pid, libc::SIGTERM);
+        if !self.signal(libc::SIGTERM) {
+            return Ended::TrackingFailed("the process group could not be inspected safely; it may still be running and was not signalled".to_string());
+        }
         let until = Instant::now() + grace;
         loop {
-            let ended = self.poll().is_some();
-            if (ended && !group_alive(self.pid)) || Instant::now() >= until {
+            if let Some(end) = self.poll() {
+                return end;
+            }
+            if Instant::now() >= until {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if group_alive(self.pid) {
-            signal_group(self.pid, libc::SIGKILL);
-            let limit = Instant::now() + KILL_SETTLE;
-            loop {
-                let ended = self.poll().is_some();
-                if (ended && !group_alive(self.pid)) || Instant::now() >= limit {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        if !self.signal(libc::SIGKILL) {
+            return Ended::TrackingFailed("the process group could not be inspected safely; it may still be running and was not signalled".to_string());
         }
-        self.poll().unwrap_or(Ended::Unknown)
+        let limit = Instant::now() + KILL_SETTLE;
+        loop {
+            if let Some(end) = self.poll() {
+                return end;
+            }
+            if Instant::now() >= limit { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.poll().unwrap_or_else(|| Ended::TrackingFailed("the process group has not stopped after KILL; its effects may still continue".to_string()))
+    }
+
+    fn signal(&mut self, signal: i32) -> bool {
+        match group_state(self.pid, self.owner.as_deref(), self.child.is_some()) {
+            GroupState::Gone => true,
+            GroupState::Live => { signal_group(self.pid, signal); true }
+            GroupState::Replaced | GroupState::Unknown => false,
+        }
+    }
+
+    pub(crate) fn remove_owner(&self) {
+        let _ = std::fs::remove_file(owner_path(&self.exit_path));
     }
 
     pub fn output_len(&self) -> u64 {
@@ -390,6 +525,127 @@ mod tests {
         panic!("processes survived: {left:?}");
     }
 
+    struct GroupCleanup {
+        pid: u32,
+        status: PathBuf,
+    }
+
+    impl GroupCleanup {
+        fn for_running(running: &Running) -> Self {
+            Self { pid: running.pid, status: running.exit_path.clone() }
+        }
+    }
+
+    impl Drop for GroupCleanup {
+        fn drop(&mut self) {
+            kill_recorded_group(self.pid, &self.status);
+        }
+    }
+
+    async fn leader_exited(running: &mut Running) {
+        for _ in 0..200 {
+            running.poll();
+            if running.leader_ended.is_some() { return; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the wrapper did not exit");
+    }
+
+    #[tokio::test]
+    async fn leader_exit_does_not_finish_a_live_group_or_lose_late_output() {
+        let f = fx();
+        let mut running = f.start("(sleep 1; echo late) & echo first; exit 7");
+        let _cleanup = GroupCleanup::for_running(&running);
+        leader_exited(&mut running).await;
+        assert_eq!(running.leader_ended, Some(Ended::Exit(7)));
+        assert_eq!(running.poll(), None, "a surviving descendant still owns the output");
+        assert_eq!(finish(&mut running).await, Ended::Exit(7));
+        assert_eq!(running.read_output(0).expect("read"), b"first\nlate\n");
+    }
+
+    #[tokio::test]
+    async fn termination_still_reaches_descendants_after_the_wrapper_exits() {
+        let f = fx();
+        let script = format!("(trap '' TERM; sleep 300) & echo $! > {}; exit 4", f.pidfile().display());
+        let mut running = f.start(&script);
+        let _cleanup = GroupCleanup::for_running(&running);
+        let pids = read_pids(&f.pidfile(), 1).await;
+        leader_exited(&mut running).await;
+        assert_eq!(running.poll(), None);
+        let end = running.terminate(Duration::from_millis(100)).await;
+        assert_eq!(end, Ended::Exit(4), "retain the already known shell status");
+        assert_gone(&pids).await;
+        assert!(running.poll().is_some());
+    }
+
+    #[tokio::test]
+    async fn late_descendant_output_is_still_subject_to_the_output_limit() {
+        let f = fx();
+        let script = format!("(sleep 0.4; head -c 5000 /dev/zero; sleep 300) & echo $! > {}; exit 0", f.pidfile().display());
+        let mut running = f.start(&script);
+        let _cleanup = GroupCleanup::for_running(&running);
+        let pids = read_pids(&f.pidfile(), 1).await;
+        leader_exited(&mut running).await;
+        assert_eq!(running.wait(&never(), Some(Duration::from_secs(10)), 2000).await, WaitEnd::TooMuchOutput);
+        assert_eq!(running.terminate(Duration::from_millis(100)).await, Ended::Exit(0));
+        assert_gone(&pids).await;
+    }
+
+    #[tokio::test]
+    async fn adopted_group_keeps_late_output_after_its_leader_is_reaped() {
+        let f = fx();
+        let mut running = f.start("(sleep 1; echo late) & echo first; exit 6");
+        let _cleanup = GroupCleanup::for_running(&running);
+        leader_exited(&mut running).await;
+        let mut adopted = Running::adopt(running.pid, running.out_path.clone(), running.exit_path.clone(), running.started_ms);
+        drop(running);
+        assert_eq!(adopted.poll(), None);
+        assert_eq!(finish(&mut adopted).await, Ended::Exit(6));
+        assert_eq!(adopted.read_output(0).expect("read"), b"first\nlate\n");
+    }
+
+    #[tokio::test]
+    async fn adopting_a_replacement_group_leader_never_signals_it() {
+        use std::os::unix::process::CommandExt;
+        struct Other(std::process::Child);
+        impl Drop for Other {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let f = fx();
+        let mut other = Other(std::process::Command::new("/bin/sleep").arg("300").process_group(0).spawn().expect("spawn unrelated"));
+        let spec = f.spec("");
+        std::fs::write(&spec.out_path, "").expect("output");
+        std::fs::write(&spec.exit_path, "0\n").expect("status");
+        std::fs::write(owner_path(&spec.exit_path), "loom-owner-old-job").expect("owner");
+        let mut adopted = Running::adopt(other.0.id(), spec.out_path, spec.exit_path, 0);
+        assert!(matches!(adopted.poll(), Some(Ended::TrackingFailed(reason)) if reason.contains("different leader")));
+        assert!(matches!(adopted.terminate(Duration::ZERO).await, Ended::TrackingFailed(_)));
+        assert!(other.0.try_wait().expect("probe unrelated").is_none(), "the unrelated leader was not signalled");
+    }
+
+    #[tokio::test]
+    async fn a_zombie_only_group_is_complete_without_waiting_for_its_reaper() {
+        use std::os::unix::process::CommandExt;
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+        }
+        let f = fx();
+        let child = Reap(std::process::Command::new("/usr/bin/true").process_group(0).spawn().expect("spawn"));
+        let pid = child.0.id();
+        for _ in 0..100 {
+            if group_state(pid, None, false) == GroupState::Gone { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(group_alive(pid), "the unreaped zombie still owns a numeric process-group id");
+        assert_eq!(group_state(pid, None, false), GroupState::Gone);
+        let spec = f.spec("");
+        std::fs::write(&spec.out_path, "").expect("output");
+        std::fs::write(&spec.exit_path, "0\n").expect("status");
+        let mut adopted = Running::adopt(pid, spec.out_path, spec.exit_path, 0);
+        assert_eq!(adopted.poll(), Some(Ended::Exit(0)));
+    }
+
     /// Background children and grandchildren, then `tail`. Their pids go to the pid file.
     fn tree(f: &Fx, tail: &str) -> String {
         let p = f.pidfile();
@@ -422,6 +678,7 @@ mod tests {
         assert_eq!(Ended::Signal(40).outcome(), "killed by signal 40");
         assert_eq!(Ended::Unknown.outcome(), "ended without a status");
         assert_eq!(Ended::Failed("x".into()).outcome(), "could not start");
+        assert_eq!(Ended::TrackingFailed("x".into()).outcome(), "process tracking failed");
     }
 
     #[tokio::test]
