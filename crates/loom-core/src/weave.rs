@@ -729,6 +729,7 @@ mod tests {
                     }],
                     budget: Budget::default(),
                     unattended: false,
+                    schema: crate::event::SCHEMA,
                     title: String::new(),
                 }),
             );

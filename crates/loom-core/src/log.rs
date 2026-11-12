@@ -8,8 +8,12 @@
 //!   `write_all`, and with [`Durability::Always`] calls `sync_data` before returning. The file is
 //!   opened in append mode. `Durability::Batch` skips the sync (tests, bulk import).
 //! - `open` never fails because of damaged content. It reads lines in order and stops at the first
-//!   line that is incomplete (no trailing newline), does not parse as a `Record`, has the wrong `seq`,
-//!   or has a `prev` that does not match. If anything follows the good prefix, those bytes are moved to
+//!   line that is incomplete (no trailing newline), is not a JSON object with a `seq` and a `prev`, has
+//!   the wrong `seq`, or has a `prev` that does not match. A line whose chain header is right but whose
+//!   body this build cannot deserialize (written by a newer loom) is not damage: it is kept as an
+//!   opaque record (`Event::Unknown`), advances the chain and is counted in `OpenReport::opaque`.
+//!   `open` then refuses to append (`LogError::Newer`) without touching the file, and so does a log
+//!   whose `session_start` carries a schema above `event::SCHEMA`; reading such a log works. If anything follows the good prefix, those bytes are moved to
 //!   `<path>.damaged-<now_ms>` and the log file is truncated to the good prefix; `OpenReport::damage`
 //!   says what happened. A torn final line alone (crash mid-append) is the same case.
 //! - `read_records` is the read-only variant: same stopping rule, no file is modified.
@@ -21,10 +25,11 @@
 //! log truncated, appends continue); wrong seq; reopen-and-append; fork is byte-identical and chains;
 //! `read_page` paging; `create` refuses an existing file; `Unknown` events survive rewrite-free.
 
-use crate::event::{Author, Event, Record, Seq};
+use crate::event::{Author, Event, Record, Seq, SCHEMA};
 use crate::{now_ms, sha256_hex};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 pub const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -48,6 +53,11 @@ pub enum LogError {
     Encode(#[from] serde_json::Error),
     #[error("fork point {upto} is beyond the last record {last}")]
     ForkPoint { upto: Seq, last: Seq },
+    #[error(
+        "the session log {0} was written by a newer loom (it holds records or a schema this build cannot read); \
+         upgrade loom to resume this session. Reading it still works"
+    )]
+    Newer(PathBuf),
 }
 
 /// What `open` found past the readable prefix.
@@ -67,6 +77,8 @@ pub struct Damage {
 pub struct OpenReport {
     pub records: Vec<Record>,
     pub damage: Option<Damage>,
+    /// Records kept as `Event::Unknown` because this build cannot deserialize their body.
+    pub opaque: u64,
 }
 
 #[derive(Debug)]
@@ -101,11 +113,46 @@ struct Scanner<R> {
     last_hash: String,
     /// Bytes of the good prefix, newlines included.
     good_len: u64,
+    /// Records whose chain header was right but whose body this build could not read.
+    opaque: u64,
+    /// Highest schema number a `session_start` line declared (1 when none did).
+    schema: u32,
+}
+
+/// The part of a line every build can read: enough to place it in the chain.
+#[derive(serde::Deserialize)]
+struct Header {
+    seq: Seq,
+    prev: String,
+    #[serde(default)]
+    ts_ms: Option<Value>,
+    #[serde(default)]
+    author: Option<Value>,
+    #[serde(default)]
+    kind: Option<Value>,
+    #[serde(default)]
+    schema: Option<Value>,
+}
+
+/// Read a line this build cannot fully deserialize as an opaque record, plus the schema it declares.
+fn opaque_record(line: &[u8]) -> Option<(Record, u32)> {
+    if line.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
+        return None;
+    }
+    let h: Header = serde_json::from_slice(line).ok()?;
+    let author = h.author.and_then(|v| serde_json::from_value::<Author>(v).ok()).unwrap_or(Author::Harness);
+    let is_start = h.kind.as_ref().and_then(Value::as_str) == Some("session_start");
+    let schema = match (is_start, h.schema.as_ref().and_then(Value::as_u64)) {
+        (true, Some(n)) => u32::try_from(n).unwrap_or(u32::MAX),
+        _ => 1,
+    };
+    let ts_ms = h.ts_ms.as_ref().and_then(Value::as_u64).unwrap_or(0);
+    Some((Record { seq: h.seq, ts_ms, author, prev: h.prev, event: Event::Unknown }, schema))
 }
 
 impl<R: BufRead> Scanner<R> {
     fn new(reader: R) -> Self {
-        Scanner { reader, buf: Vec::new(), next_seq: 0, last_hash: ZERO_HASH.to_string(), good_len: 0 }
+        Scanner { reader, buf: Vec::new(), next_seq: 0, last_hash: ZERO_HASH.to_string(), good_len: 0, opaque: 0, schema: 1 }
     }
 
     fn step(&mut self) -> std::io::Result<Step> {
@@ -118,9 +165,15 @@ impl<R: BufRead> Scanner<R> {
         };
         let total = self.buf.len() as u64;
         let line_no = self.next_seq.saturating_add(1);
-        let record: Record = match serde_json::from_slice(line) {
-            Ok(r) => r,
-            Err(e) => return Ok(Step::Bad(format!("line {line_no} is not a record: {e}"))),
+        let (record, is_opaque, schema) = match serde_json::from_slice::<Record>(line) {
+            Ok(r) => {
+                let schema = if let Event::SessionStart(s) = &r.event { s.schema } else { 1 };
+                (r, false, schema)
+            }
+            Err(e) => match opaque_record(line) {
+                Some((r, schema)) => (r, true, schema),
+                None => return Ok(Step::Bad(format!("line {line_no} is not a record: {e}"))),
+            },
         };
         if record.seq != self.next_seq {
             return Ok(Step::Bad(format!(
@@ -134,6 +187,8 @@ impl<R: BufRead> Scanner<R> {
         self.last_hash = sha256_hex(line);
         self.next_seq = self.next_seq.saturating_add(1);
         self.good_len = self.good_len.saturating_add(total);
+        self.opaque = self.opaque.saturating_add(u64::from(is_opaque));
+        self.schema = self.schema.max(schema);
         Ok(Step::Record(Box::new(record)))
     }
 }
@@ -196,6 +251,9 @@ impl SessionLog {
     /// Open an existing log for appending, salvaging damage as described in the module contract.
     pub fn open(path: &Path, durability: Durability) -> Result<(SessionLog, OpenReport), LogError> {
         let (scanner, records, cause) = scan_file(path)?;
+        if scanner.opaque > 0 || scanner.schema > SCHEMA {
+            return Err(LogError::Newer(path.to_path_buf()));
+        }
         let file_len = std::fs::metadata(path).map_err(io_err(path))?.len();
         let good_len = scanner.good_len;
         let file = OpenOptions::new().append(true).open(path).map_err(io_err(path))?;
@@ -228,7 +286,7 @@ impl SessionLog {
             durability,
             len: good_len,
         };
-        Ok((log, OpenReport { records, damage }))
+        Ok((log, OpenReport { records, damage, opaque: 0 }))
     }
 
     /// Append one event and return the record as written.
@@ -330,7 +388,7 @@ pub fn read_records(path: &Path) -> Result<OpenReport, LogError> {
         moved_to: None,
         detail: cause.unwrap_or_else(|| "unreadable bytes after the last record".to_string()),
     });
-    Ok(OpenReport { records, damage })
+    Ok(OpenReport { records, damage, opaque: scanner.opaque })
 }
 
 /// Read up to `limit` records with `seq > after` (`None` = from the start), as stored lines parsed
@@ -359,6 +417,130 @@ pub fn read_page(path: &Path, after: Option<Seq>, limit: usize) -> Result<Vec<Re
         }
     }
     Ok(page)
+}
+
+/// Records between two checkpoints of a [`PageReader`].
+const CHECKPOINT_EVERY: u64 = 256;
+
+/// Verified chain state at a line boundary: the seq of the next line, its byte offset, and the hash
+/// of the line before it.
+#[derive(Clone, Debug)]
+struct Mark {
+    seq: Seq,
+    offset: u64,
+    hash: String,
+}
+
+impl Mark {
+    fn origin() -> Mark {
+        Mark { seq: 0, offset: 0, hash: ZERO_HASH.to_string() }
+    }
+}
+
+/// Pages through one log file and remembers how far it has verified the chain, so that fetching
+/// pages in sequence costs time proportional to the page, not to the log. Every record it serves
+/// was chain-verified. It starts over when the file got shorter or its last verified line changed.
+#[derive(Debug)]
+pub struct PageReader {
+    path: PathBuf,
+    /// Verified state at every `CHECKPOINT_EVERY`-th record; `marks[i].seq == i * CHECKPOINT_EVERY`.
+    marks: Vec<Mark>,
+    /// Verified end of the log.
+    end: Mark,
+    /// Verified state after the last record served.
+    cursor: Mark,
+    /// Start offset and length (newline excluded) of the last verified line.
+    tail: Option<(u64, u64)>,
+    /// Lines hashed so far (chain steps and prefix checks); lets tests see that paging is not rescanning.
+    pub lines_hashed: u64,
+}
+
+impl PageReader {
+    pub fn new(path: &Path) -> PageReader {
+        PageReader {
+            path: path.to_path_buf(),
+            marks: vec![Mark::origin()],
+            end: Mark::origin(),
+            cursor: Mark::origin(),
+            tail: None,
+            lines_hashed: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = PageReader { lines_hashed: self.lines_hashed, ..PageReader::new(&self.path) };
+    }
+
+    /// True when the file still holds the prefix verified earlier.
+    fn prefix_holds(&mut self, file: &mut File) -> std::io::Result<bool> {
+        if file.metadata()?.len() < self.end.offset {
+            return Ok(false);
+        }
+        let Some((start, len)) = self.tail else { return Ok(true) };
+        let Ok(size) = usize::try_from(len.saturating_add(1)) else { return Ok(false) };
+        let mut line = vec![0u8; size];
+        file.seek(SeekFrom::Start(start))?;
+        if file.read_exact(&mut line).is_err() {
+            return Ok(false);
+        }
+        self.lines_hashed = self.lines_hashed.saturating_add(1);
+        Ok(line.pop() == Some(b'\n') && sha256_hex(&line) == self.end.hash)
+    }
+
+    /// Up to `limit` records with `seq > after` (`None` = from the start); stops silently at damage.
+    pub fn read_page(&mut self, after: Option<Seq>, limit: usize) -> Result<Vec<Record>, LogError> {
+        let mut page = Vec::new();
+        let first = match after {
+            None => 0,
+            Some(a) => match a.checked_add(1) {
+                Some(f) => f,
+                None => return Ok(page),
+            },
+        };
+        if limit == 0 {
+            return Ok(page);
+        }
+        let path = self.path.clone();
+        let mut file = File::open(&path).map_err(io_err(&path))?;
+        if !self.prefix_holds(&mut file).map_err(io_err(&path))? {
+            self.reset();
+        }
+        // Resume from the latest verified position at or before the first wanted record.
+        let index = usize::try_from(first / CHECKPOINT_EVERY).unwrap_or(usize::MAX);
+        let mut start = self.marks.get(index).or(self.marks.last()).cloned().unwrap_or_else(Mark::origin);
+        for m in [&self.cursor, &self.end] {
+            if m.seq <= first && m.seq > start.seq {
+                start = m.clone();
+            }
+        }
+        file.seek(SeekFrom::Start(start.offset)).map_err(io_err(&path))?;
+        let mut scanner = Scanner::new(BufReader::new(file));
+        scanner.next_seq = start.seq;
+        scanner.last_hash = start.hash;
+        scanner.good_len = start.offset;
+        loop {
+            let before = scanner.good_len;
+            let Step::Record(r) = scanner.step().map_err(io_err(&path))? else { break };
+            self.lines_hashed = self.lines_hashed.saturating_add(1);
+            if scanner.next_seq > self.end.seq {
+                self.end = Mark { seq: scanner.next_seq, offset: scanner.good_len, hash: scanner.last_hash.clone() };
+                self.tail = Some((before, scanner.good_len.saturating_sub(before).saturating_sub(1)));
+                if u64::try_from(self.marks.len()).ok().and_then(|n| n.checked_mul(CHECKPOINT_EVERY))
+                    == Some(scanner.next_seq)
+                {
+                    self.marks.push(self.end.clone());
+                }
+            }
+            if r.seq >= first {
+                page.push(*r);
+                if page.len() >= limit {
+                    break;
+                }
+            }
+        }
+        self.cursor = Mark { seq: scanner.next_seq, offset: scanner.good_len, hash: scanner.last_hash };
+        Ok(page)
+    }
 }
 
 #[cfg(test)]
@@ -557,6 +739,84 @@ mod tests {
     }
 
     #[test]
+    fn page_reader_matches_read_page_for_every_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut log) = new_log(&dir);
+        fill(&mut log, 600);
+        let mut shared = PageReader::new(&path);
+        let afters: Vec<Option<Seq>> =
+            [None, Some(0), Some(1), Some(254), Some(255), Some(256), Some(300), Some(510), Some(511), Some(598), Some(599), Some(600), Some(u64::MAX)]
+                .into_iter()
+                .chain((0..600).step_by(37).map(Some))
+                .collect();
+        for after in afters {
+            for limit in [0usize, 1, 7, 256, 1000] {
+                let want = read_page(&path, after, limit).unwrap();
+                assert_eq!(shared.read_page(after, limit).unwrap(), want, "shared reader, after {after:?} limit {limit}");
+                assert_eq!(PageReader::new(&path).read_page(after, limit).unwrap(), want, "fresh reader, after {after:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn page_reader_follows_appends_and_resets_after_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut log) = new_log(&dir);
+        fill(&mut log, 10);
+        let mut reader = PageReader::new(&path);
+        assert_eq!(reader.read_page(None, 100).unwrap().len(), 10);
+        assert!(reader.read_page(Some(9), 100).unwrap().is_empty());
+        fill(&mut log, 5);
+        let more = reader.read_page(Some(9), 100).unwrap();
+        assert_eq!(more.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![10, 11, 12, 13, 14]);
+        // Cut back to eight records (a shorter file).
+        let ls = lines(&path);
+        let keep: Vec<u8> = ls[..8].concat();
+        std::fs::write(&path, &keep).unwrap();
+        let after_cut = reader.read_page(None, 100).unwrap();
+        assert_eq!(after_cut.len(), 8);
+        // Same length, different content: the verified prefix changed.
+        let other = dir.path().join("other.jsonl");
+        let mut o = SessionLog::create(&other, Durability::Batch).unwrap();
+        for i in 0..8 {
+            o.append(Author::Model, msg(1000 + i)).unwrap();
+        }
+        std::fs::write(&path, std::fs::read(&other).unwrap()).unwrap();
+        let swapped = reader.read_page(None, 100).unwrap();
+        assert_eq!(swapped, read_page(&path, None, 100).unwrap());
+        assert_eq!(swapped[0].event, msg(1000));
+        // Truncated to nothing.
+        std::fs::write(&path, b"").unwrap();
+        assert!(reader.read_page(None, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sequential_paging_does_not_rescan_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut log) = new_log(&dir);
+        fill(&mut log, 1000);
+        let mut reader = PageReader::new(&path);
+        let mut after = None;
+        let mut total = 0;
+        let mut pages = 0u64;
+        loop {
+            let page = reader.read_page(after, 10).unwrap();
+            let Some(last) = page.last() else { break };
+            after = Some(last.seq);
+            total += page.len();
+            pages += 1;
+        }
+        assert_eq!(total, 1000);
+        // One hash per record plus one prefix check per call; the old reader hashed ~50 000 lines.
+        assert!(reader.lines_hashed <= 1000 + 2 * (pages + 1), "hashed {} lines", reader.lines_hashed);
+        // Following new appends costs the new lines only.
+        let before = reader.lines_hashed;
+        fill(&mut log, 3);
+        assert_eq!(reader.read_page(after, 10).unwrap().len(), 3);
+        assert!(reader.lines_hashed - before <= 3 + 2, "hashed {} lines", reader.lines_hashed - before);
+    }
+
+    #[test]
     fn create_refuses_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let (path, log) = new_log(&dir);
@@ -583,6 +843,152 @@ mod tests {
         let (_, again) = SessionLog::open(&path, Durability::Batch).unwrap();
         assert!(again.damage.is_none());
         assert_eq!(again.records.len(), 2);
+    }
+
+    /// A chain-correct line built by hand: `body` is the JSON after `prev`, e.g. `"kind":"user_message",...`.
+    fn hand_line(seq: u64, prev: &str, body: &str) -> String {
+        format!("{{\"seq\":{seq},\"ts_ms\":5,\"author\":\"harness\",\"prev\":\"{prev}\",{body}}}")
+    }
+
+    /// Lines for the bodies, chained, newline-terminated.
+    fn hand_log(bodies: &[&str]) -> Vec<u8> {
+        let mut out = String::new();
+        let mut prev = ZERO_HASH.to_string();
+        for (i, body) in bodies.iter().enumerate() {
+            let line = hand_line(i as u64, &prev, body);
+            prev = sha256_hex(line.as_bytes());
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out.into_bytes()
+    }
+
+    const OK_MSG: &str = r#""kind":"user_message","text":"hi""#;
+    const FUTURE_NOTE: &str = r#""kind":"harness_note","note":"from_a_newer_loom","text":"x""#;
+
+    fn no_salvage_files(path: &Path) -> bool {
+        let dir = path.parent().unwrap();
+        std::fs::read_dir(dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains("damaged"))
+    }
+
+    #[test]
+    fn unreadable_body_with_intact_chain_is_an_opaque_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let bytes = hand_log(&[OK_MSG, OK_MSG, FUTURE_NOTE, OK_MSG, OK_MSG]);
+        std::fs::write(&path, &bytes).unwrap();
+        let report = read_records(&path).unwrap();
+        assert!(report.damage.is_none());
+        assert_eq!((report.records.len(), report.opaque), (5, 1));
+        assert_eq!(report.records[2].event, Event::Unknown);
+        assert_eq!(report.records[2].seq, 2);
+        assert_eq!(report.records[4].event, Event::UserMessage { text: "hi".into() });
+        // The weave behaves as if the record were not there.
+        let without: Vec<Record> = report.records.iter().filter(|r| r.seq != 2).cloned().collect();
+        assert_eq!(crate::weave::weave(&report.records), crate::weave::weave(&without));
+        // Appending is refused with the newer-loom sentence and the file is untouched.
+        let err = SessionLog::open(&path, Durability::Batch).unwrap_err();
+        assert!(matches!(err, LogError::Newer(_)));
+        assert!(err.to_string().contains("newer loom") && err.to_string().contains("upgrade"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(no_salvage_files(&path));
+    }
+
+    #[test]
+    fn unknown_variant_in_session_start_does_not_truncate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let start = r#""kind":"session_start","session":"s-1","mission":"m-1","workspace":"/w","pack":"p","role":"r","termination":"quantum","model":{"profile":"p","model":"m","context_window":1},"system_prompt":"s","tools":[]"#;
+        let bytes = hand_log(&[start, OK_MSG]);
+        std::fs::write(&path, &bytes).unwrap();
+        let report = read_records(&path).unwrap();
+        assert!(report.damage.is_none());
+        assert_eq!((report.records.len(), report.opaque), (2, 1));
+        assert!(matches!(SessionLog::open(&path, Durability::Batch), Err(LogError::Newer(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(no_salvage_files(&path));
+    }
+
+    fn start_event(schema: u32) -> Event {
+        use crate::event::{Budget, ModelRef, ReasoningReplay, SessionStart, Termination};
+        use crate::ids::{MissionId, SessionId};
+        Event::SessionStart(SessionStart {
+            session: SessionId::from("s-1"),
+            mission: MissionId::from("m-1"),
+            parent: None,
+            workspace: "/w".into(),
+            pack: "p".into(),
+            role: "r".into(),
+            termination: Termination::Free,
+            model: ModelRef { profile: "p".into(), model: "m".into(), context_window: 1 },
+            reasoning_replay: ReasoningReplay::All,
+            system_prompt: "s".into(),
+            tools: vec![],
+            budget: Budget::default(),
+            unattended: false,
+            title: String::new(),
+            schema,
+        })
+    }
+
+    #[test]
+    fn higher_schema_refuses_append_but_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut log) = new_log(&dir);
+        log.append(Author::Harness, start_event(SCHEMA + 1)).unwrap();
+        log.append(Author::User, msg(1)).unwrap();
+        drop(log);
+        let bytes = std::fs::read(&path).unwrap();
+        let report = read_records(&path).unwrap();
+        assert!(report.damage.is_none());
+        assert_eq!((report.records.len(), report.opaque), (2, 0));
+        assert!(matches!(SessionLog::open(&path, Durability::Batch), Err(LogError::Newer(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        // The current schema opens, and the number is written.
+        let dir2 = tempfile::tempdir().unwrap();
+        let (path2, mut log2) = new_log(&dir2);
+        log2.append(Author::Harness, start_event(SCHEMA)).unwrap();
+        drop(log2);
+        assert!(std::fs::read_to_string(&path2).unwrap().contains("\"schema\":1"));
+        assert!(SessionLog::open(&path2, Durability::Batch).is_ok());
+    }
+
+    #[test]
+    fn log_written_by_the_base_version_opens_and_real_damage_is_still_salvaged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        // session_start as the base build wrote it: no schema field.
+        let start = r##""kind":"session_start","session":"s-1","mission":"m-1","parent":null,"workspace":"/w","pack":"p","role":"r","termination":"free","model":{"profile":"p","model":"m","context_window":1},"reasoning_replay":"all","system_prompt":"s","tools":[],"budget":{"max_steps":null,"max_minutes":null},"unattended":false,"title":"""##;
+        let good = hand_log(&[start, OK_MSG]);
+        std::fs::write(&path, &good).unwrap();
+        let (mut log, report) = SessionLog::open(&path, Durability::Batch).unwrap();
+        assert!(report.damage.is_none());
+        assert_eq!(report.opaque, 0);
+        let Event::SessionStart(s) = &report.records[0].event else { panic!("not a session start") };
+        assert_eq!(s.schema, 1);
+        log.append(Author::User, msg(2)).unwrap();
+        drop(log);
+
+        // Real damage: not JSON, JSON without seq/prev, a JSON array, a broken chain, a torn tail.
+        let mut chain_break = good.clone();
+        chain_break.extend_from_slice(hand_line(2, &"f".repeat(64), OK_MSG).as_bytes());
+        chain_break.push(b'\n');
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("is not a record", [good.clone(), b"this is not json\n".to_vec()].concat()),
+            ("is not a record", [good.clone(), b"{\"x\":1}\n".to_vec()].concat()),
+            ("is not a record", [good.clone(), b"[2,\"abc\"]\n".to_vec()].concat()),
+            ("breaks the chain", chain_break),
+            ("torn final line", [good.clone(), b"{\"seq\":2".to_vec()].concat()),
+        ];
+        for (detail, bytes) in cases {
+            std::fs::write(&path, &bytes).unwrap();
+            let (log, report) = SessionLog::open(&path, Durability::Batch).unwrap();
+            let d = report.damage.unwrap();
+            assert!(d.detail.contains(detail), "{} / {detail}", d.detail);
+            assert_eq!((report.records.len(), log.next_seq()), (2, 2));
+            assert_eq!(std::fs::read(&path).unwrap(), good);
+            assert!(d.moved_to.unwrap().exists());
+        }
     }
 
     #[test]

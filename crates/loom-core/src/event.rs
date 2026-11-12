@@ -160,6 +160,17 @@ pub struct SessionStart {
     pub unattended: bool,
     #[serde(default)]
     pub title: String,
+    /// Log format version; absent in logs written before the field existed (version 1). A log with
+    /// a higher number is read-only for this build.
+    #[serde(default = "schema_v1")]
+    pub schema: u32,
+}
+
+/// The log schema version this build writes and supports.
+pub const SCHEMA: u32 = 1;
+
+fn schema_v1() -> u32 {
+    1
 }
 
 /// A fork: the child's log begins with a byte-for-byte copy of the parent's log up to and including
@@ -729,6 +740,7 @@ mod tests {
                     }],
                     budget: budget(),
                     unattended: true,
+                    schema: SCHEMA,
                     title: "t".into(),
                 }),
             ),

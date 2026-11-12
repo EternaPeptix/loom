@@ -1790,6 +1790,7 @@ mod tests {
                 tools: Vec::new(),
                 budget,
                 unattended: false,
+                schema: loom_core::event::SCHEMA,
                 title: "test".into(),
             }
         }

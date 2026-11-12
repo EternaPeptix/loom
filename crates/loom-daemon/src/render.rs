@@ -791,6 +791,7 @@ mod tests {
                 tools: vec![],
                 budget: budget.clone(),
                 unattended: true,
+                schema: loom_core::event::SCHEMA,
                 title: s.into(),
             }),
             Event::Forked(Forked {
@@ -1020,6 +1021,7 @@ mod tests {
             tools: vec![],
             budget: Budget::default(),
             unattended: false,
+            schema: loom_core::event::SCHEMA,
             title: String::new(),
         });
         assert_eq!(render(start, &MONO), "● session s-a · lead · mm · /w\n");

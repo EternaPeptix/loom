@@ -275,7 +275,7 @@ use loom_core::event::{
 };
 use loom_core::journal::{self, Journal};
 use loom_core::ledger::LedgerState;
-use loom_core::log::{read_page, read_records};
+use loom_core::log::{read_records, PageReader};
 use loom_core::weave::{render_brief, weave, WindowItem};
 use loom_core::{now_ms, BlobId, BlobStore, CallId, MissionId, SessionId};
 use loom_model::{ChatRequest, Discovered, Limiter, ModelClient, ModelError, Priority, StreamEvent, ToolChoice};
@@ -456,6 +456,8 @@ pub enum BusEvent {
 const SHUTTING: &str = "The harness is shutting down.";
 /// Most records a `records` page holds.
 const PAGE_MAX: usize = 2_000;
+/// Sessions whose log paging state is kept; the least recently paged one is dropped beyond this.
+const PAGERS_MAX: usize = 16;
 /// How long tasks get to end by themselves after their inputs were closed at shutdown.
 const SHUTDOWN_TASK_WAIT: Duration = Duration::from_secs(3);
 /// How long an aborted task gets to be dropped.
@@ -670,6 +672,8 @@ struct Inner {
     next_gen: AtomicU64,
     orch: Arc<dyn Orchestrator>,
     sink: Arc<dyn Sink>,
+    /// Paging state per recently viewed session, least recently used first.
+    pagers: Mutex<Vec<(SessionId, Arc<Mutex<PageReader>>)>>,
 }
 
 struct SinkImpl(Weak<Inner>);
@@ -1210,6 +1214,7 @@ impl Inner {
             tools: Vec::new(),
             budget,
             unattended: meta.unattended,
+            schema: loom_core::event::SCHEMA,
             title: meta.title.clone(),
         })
     }
@@ -1725,6 +1730,7 @@ impl Runtime {
             next_gen: AtomicU64::new(1),
             orch: Arc::new(Orch(me.clone())),
             sink: Arc::new(SinkImpl(me.clone())),
+            pagers: Mutex::new(Vec::new()),
         });
 
         let weak = Arc::downgrade(&inner);
@@ -2057,7 +2063,20 @@ impl Runtime {
         if !self.inner.st().known.contains_key(id) {
             return Err(no_session(id));
         }
-        read_page(&self.inner.paths.session_log(id), after, limit.min(PAGE_MAX)).map_err(|e| e.to_string())
+        let reader = {
+            let mut pagers = lock(&self.inner.pagers);
+            let reader = match pagers.iter().position(|(s, _)| s == id) {
+                Some(i) => pagers.remove(i),
+                None => (id.clone(), Arc::new(Mutex::new(PageReader::new(&self.inner.paths.session_log(id))))),
+            };
+            pagers.push(reader.clone());
+            if pagers.len() > PAGERS_MAX {
+                pagers.remove(0);
+            }
+            reader.1
+        };
+        let mut reader = lock(&reader);
+        reader.read_page(after, limit.min(PAGE_MAX)).map_err(|e| e.to_string())
     }
 
     pub fn window(&self, id: &SessionId) -> Result<WindowView, String> {
