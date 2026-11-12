@@ -141,7 +141,7 @@ pub enum SandboxMode {
     None,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SandboxCfg {
     pub mode: SandboxMode,
@@ -151,6 +151,9 @@ pub struct SandboxCfg {
     pub protected_paths: Vec<String>,
     /// Paths that are not readable (absolute; `~` is expanded).
     pub unreadable_paths: Vec<String>,
+    /// Also make the user's credential stores unreadable (`~/.ssh`, `~/.aws`, `~/.gnupg`, keychains,
+    /// browser profiles, …). A listed directory that is or contains the workspace stays readable.
+    pub protect_credentials: bool,
     /// Loopback TCP ports commands may connect to directly (local test services).
     pub loopback_ports: Vec<u16>,
     /// Allow commands to connect to any loopback port (needed to talk to servers they start).
@@ -159,6 +162,22 @@ pub struct SandboxCfg {
     pub unix_sockets: Vec<String>,
     /// Environment variables passed to commands even though their names look like secrets.
     pub env_pass: Vec<String>,
+}
+
+impl Default for SandboxCfg {
+    fn default() -> Self {
+        Self {
+            mode: SandboxMode::default(),
+            extra_writable: Vec::new(),
+            protected_paths: Vec::new(),
+            unreadable_paths: Vec::new(),
+            protect_credentials: true,
+            loopback_ports: Vec::new(),
+            loopback_all: false,
+            unix_sockets: Vec::new(),
+            env_pass: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]

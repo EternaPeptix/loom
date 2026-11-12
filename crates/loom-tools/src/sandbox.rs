@@ -89,7 +89,36 @@ const DEVICE_LITERALS: [&str; 3] = ["/dev/null", "/dev/tty", "/dev/dtracehelper"
 /// System temp locations that commands need.
 const SYSTEM_WRITABLE: [&str; 2] = ["/private/tmp", "/private/var/folders"];
 
-const SECRET_WORDS: [&str; 6] = ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"];
+const SECRET_WORDS: [&str; 9] =
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH_TOKEN", "COOKIE", "SESSION_KEY"];
+const SECRET_SUFFIXES: [&str; 3] = ["_PAT", "_DSN", "_PWD"];
+const SECRET_NAMES: [&str; 2] = ["DATABASE_URL", "SSH_AUTH_SOCK"];
+
+/// Credential stores, relative to the user's home directory, that commands and file tools may not read.
+const CREDENTIAL_PATHS: [&str; 22] = [
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".config/gh",
+    ".config/gcloud",
+    ".azure",
+    ".kube",
+    ".docker/config.json",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".git-credentials",
+    ".config/git/credentials",
+    ".password-store",
+    ".config/op",
+    "Library/Keychains",
+    "Library/Cookies",
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Firefox",
+    "Library/Safari",
+];
 
 #[derive(Clone, Debug)]
 pub struct Sandbox {
@@ -100,6 +129,7 @@ pub struct Sandbox {
     writable: Vec<PathBuf>,
     protected: Vec<PathBuf>,
     unreadable: Vec<PathBuf>,
+    credentials: Vec<PathBuf>,
     loopback_ports: Vec<u16>,
     loopback_all: bool,
     unix_sockets: Vec<PathBuf>,
@@ -182,6 +212,54 @@ fn expand_home(given: &str, home: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
+/// Whether `path` is `rule` or lies under it. Volumes on macOS are case-insensitive by default, so
+/// there the comparison ignores case (over-blocking is acceptable); elsewhere it is bytewise.
+fn under(path: &Path, rule: &Path) -> bool {
+    if !cfg!(target_os = "macos") {
+        return path.starts_with(rule);
+    }
+    let fold = |c: Component| c.as_os_str().to_string_lossy().to_lowercase();
+    let mut p = path.components();
+    rule.components().all(|r| p.next().is_some_and(|c| fold(c) == fold(r)))
+}
+
+/// Why `mode` cannot work on this host, if it cannot (`exec` is the seatbelt launcher).
+fn preflight_at(mode: SandboxMode, exec: &Path, macos: bool) -> Result<(), String> {
+    if mode != SandboxMode::Seatbelt {
+        return Ok(());
+    }
+    let runnable = exec.metadata().map(|m| {
+        use std::os::unix::fs::PermissionsExt;
+        m.is_file() && m.permissions().mode() & 0o111 != 0
+    });
+    if macos && runnable.unwrap_or(false) {
+        return Ok(());
+    }
+    let why = if macos {
+        format!("{} is missing or not executable", exec.display())
+    } else {
+        "this host is not macOS".to_string()
+    };
+    Err(format!(
+        "[sandbox] mode = \"seatbelt\" cannot work here: {why}. Run the daemon on macOS, or set [sandbox] mode = \"none\" \
+         in the configuration knowing that commands are then not confined and can read and write anything this user can."
+    ))
+}
+
+/// Checks that the configured sandbox mode can work on this host; the daemon refuses to start otherwise.
+pub fn preflight(cfg: &SandboxCfg) -> Result<(), String> {
+    preflight_at(cfg.mode, Path::new(SANDBOX_EXEC), cfg!(target_os = "macos"))
+}
+
+/// Whether the environment variable `name` looks like it holds a secret and is withheld from commands.
+fn secret_name(name: &str) -> bool {
+    let upper = name.to_uppercase();
+    upper.starts_with("LOOM_")
+        || SECRET_NAMES.contains(&upper.as_str())
+        || SECRET_SUFFIXES.iter().any(|s| upper.ends_with(s))
+        || SECRET_WORDS.iter().any(|w| upper.contains(w))
+}
+
 fn join_list(paths: &[PathBuf]) -> String {
     paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
 }
@@ -195,13 +273,29 @@ impl Sandbox {
         loom_home: &Path,
         proxy_port: Option<u16>,
     ) -> io::Result<Sandbox> {
+        let home = match std::env::var_os("HOME") {
+            Some(h) if !h.is_empty() => Some(PathBuf::from(h)),
+            _ => None,
+        };
+        Self::with_home(cfg, workspace, tmp_dir, loom_home, proxy_port, home)
+    }
+
+    /// `new` with the user's home directory given instead of read from `HOME`.
+    fn with_home(
+        cfg: &SandboxCfg,
+        workspace: &Path,
+        tmp_dir: &Path,
+        loom_home: &Path,
+        proxy_port: Option<u16>,
+        home: Option<PathBuf>,
+    ) -> io::Result<Sandbox> {
         let canon = |p: &Path| resolve_path(p, true).map_err(invalid);
         let workspace = canon(workspace)?;
         let tmp_dir = canon(tmp_dir)?;
         let loom_home = canon(loom_home)?;
-        let home = match std::env::var_os("HOME") {
-            Some(h) if !h.is_empty() => Some(canon(Path::new(&h))?),
-            _ => None,
+        let home = match home {
+            Some(h) => Some(canon(&h)?),
+            None => None,
         };
         // A configured path: `~` expanded, relative ones taken from the workspace, then canonical.
         let anchored = |given: &str| -> io::Result<PathBuf> {
@@ -235,6 +329,17 @@ impl Sandbox {
             push_unique(&mut unreadable, anchored(p)?);
         }
 
+        // The workspace stays readable: a credential path that is or contains it is skipped.
+        let mut credentials = Vec::new();
+        if let (true, Some(h)) = (cfg.protect_credentials, &home) {
+            for rel in CREDENTIAL_PATHS {
+                let p = canon(&h.join(rel))?;
+                if !under(&workspace, &p) {
+                    push_unique(&mut credentials, p);
+                }
+            }
+        }
+
         let mut loopback_ports = Vec::new();
         if let Some(p) = proxy_port {
             loopback_ports.push(p);
@@ -249,7 +354,7 @@ impl Sandbox {
         }
 
         // Every path that can reach a profile must be writable as a literal, whatever the mode.
-        for p in writable.iter().chain(&protected).chain(&unreadable).chain(&unix_sockets) {
+        for p in writable.iter().chain(&protected).chain(&unreadable).chain(&credentials).chain(&unix_sockets) {
             sbpl(p)?;
         }
         Ok(Sandbox {
@@ -260,6 +365,7 @@ impl Sandbox {
             writable,
             protected,
             unreadable,
+            credentials,
             loopback_ports,
             loopback_all: cfg.loopback_all,
             unix_sockets,
@@ -295,9 +401,19 @@ impl Sandbox {
         if !self.protected.is_empty() {
             out.push_str(&format!("(deny file-write*{})\n", subpaths(&self.protected)));
         }
-        if !self.unreadable.is_empty() {
-            out.push_str(&format!("(deny file-read*{})\n", subpaths(&self.unreadable)));
+        // The session temp dir may lie inside a protected directory; this later rule wins.
+        out.push_str(&format!("(allow file-write*{})\n", subpaths(std::slice::from_ref(&self.tmp_dir))));
+        let inside_tmp = self.inside_tmp_protected();
+        if !inside_tmp.is_empty() {
+            out.push_str(&format!("(deny file-write*{})\n", subpaths(&inside_tmp)));
         }
+        let unreadable: Vec<PathBuf> = self.unreadable.iter().chain(&self.credentials).cloned().collect();
+        if !unreadable.is_empty() {
+            out.push_str(&format!("(deny file-read*{})\n", subpaths(&unreadable)));
+        }
+        // Opening an application or URL through LaunchServices, or driving one with Apple Events, runs
+        // code outside the sandbox.
+        out.push_str("(deny lsopen)\n(deny appleevent-send)\n");
         out.push_str("(deny network*)\n");
         if self.loopback_all {
             out.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
@@ -312,6 +428,11 @@ impl Sandbox {
         out.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
         out.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
         Some(out)
+    }
+
+    /// Protected paths that lie strictly inside the session temp dir; they stay protected.
+    fn inside_tmp_protected(&self) -> Vec<PathBuf> {
+        self.protected.iter().filter(|p| **p != self.tmp_dir && under(p, &self.tmp_dir)).cloned().collect()
     }
 
     pub fn command(&self, script: &str) -> (String, Vec<String>) {
@@ -337,7 +458,7 @@ impl Sandbox {
 
     pub fn check_read(&self, path: &Path) -> Result<PathBuf, String> {
         let r = self.resolved(path)?;
-        if let Some(rule) = self.unreadable.iter().find(|u| r.starts_with(u)) {
+        if let Some(rule) = self.unreadable.iter().chain(&self.credentials).find(|u| under(&r, u)) {
             return Err(format!(
                 "{} is not readable: {} is off limits to commands and file tools. Read something else, or ask the user to change `sandbox.unreadable_paths` if this is wrong.",
                 r.display(),
@@ -349,7 +470,11 @@ impl Sandbox {
 
     pub fn check_write(&self, path: &Path) -> Result<PathBuf, String> {
         let r = self.resolved(path)?;
-        if let Some(rule) = self.protected.iter().find(|p| r.starts_with(p)) {
+        // The session temp dir is writable even when it lies inside a protected directory.
+        if under(&r, &self.tmp_dir) && !self.inside_tmp_protected().iter().any(|p| under(&r, p)) {
+            return Ok(r);
+        }
+        if let Some(rule) = self.protected.iter().find(|p| under(&r, p)) {
             return Err(format!(
                 "{} is protected: nothing under {} can be written by commands or file tools. Write elsewhere in the workspace.",
                 r.display(),
@@ -358,7 +483,7 @@ impl Sandbox {
         }
         if self.mode == SandboxMode::Seatbelt {
             let device = DEVICE_LITERALS.iter().any(|d| r == Path::new(d));
-            if !device && !self.writable.iter().any(|w| r.starts_with(w)) {
+            if !device && !self.writable.iter().any(|w| under(&r, w)) {
                 let shown = if r == path { String::new() } else { format!(" (resolved from {})", path.display()) };
                 return Err(format!(
                     "{}{shown} is outside the writable areas. Writes are allowed only under: {}. Choose a path under one of them.",
@@ -381,11 +506,7 @@ impl Sandbox {
         let mut out: BTreeMap<String, String> = parent
             .iter()
             .filter(|(name, _)| {
-                if self.env_pass.iter().any(|p| p == *name) {
-                    return true;
-                }
-                let upper = name.to_uppercase();
-                !upper.starts_with("LOOM_") && !SECRET_WORDS.iter().any(|w| upper.contains(w))
+                self.env_pass.iter().any(|p| p == *name) || !secret_name(name)
             })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -399,10 +520,15 @@ impl Sandbox {
     pub fn describe(&self) -> String {
         let protected = join_list(&self.protected);
         let unreadable = join_list(&self.unreadable);
+        let credentials = if self.credentials.is_empty() {
+            ""
+        } else {
+            " Credential directories (~/.ssh, ~/.aws, ~/.gnupg, keychains, browser profiles and similar) are off limits to read."
+        };
         if self.mode == SandboxMode::None {
             return format!(
                 "Commands are not confined by an operating-system sandbox: they can read and write anything this user can. \
-                 File tools still refuse to write under {protected} and to read {unreadable}."
+                 File tools still refuse to write under {protected} and to read {unreadable}.{credentials}"
             );
         }
         let ports = if self.loopback_all {
@@ -419,7 +545,7 @@ impl Sandbox {
         };
         format!(
             "Commands and file tools may write only under {}; writes under {protected} are refused even there. \
-             {unreadable} cannot be read. \
+             {unreadable} cannot be read.{credentials} \
              Direct network access is blocked except connections to {ports}{sockets}; reach other hosts through the proxy named in the environment, if there is one.",
             join_list(&self.writable)
         )
@@ -453,6 +579,20 @@ mod tests {
         Fx { _dir: dir, root, ws, tmp, home }
     }
 
+    /// The production layout: the session temp dir lies inside the loom home.
+    fn fx_prod() -> Fx {
+        let mut f = fx();
+        f.tmp = f.home.join("sessions").join("s1").join("tmp");
+        std::fs::create_dir_all(&f.tmp).expect("mkdir");
+        std::fs::write(f.home.join("sessions/s1/log.jsonl"), "{}").expect("write");
+        f
+    }
+
+    /// A sandbox whose user home directory is `fake_home` instead of the real one.
+    fn build_home(f: &Fx, c: &SandboxCfg, fake_home: &Path) -> Sandbox {
+        Sandbox::with_home(c, &f.ws, &f.tmp, &f.home, None, Some(fake_home.to_path_buf())).expect("sandbox")
+    }
+
     fn cfg(mode: SandboxMode) -> SandboxCfg {
         SandboxCfg { mode, ..SandboxCfg::default() }
     }
@@ -474,6 +614,7 @@ mod tests {
             unreadable_paths: vec![format!("{}/hidden", s(&f.root))],
             loopback_ports: vec![9000, 8080],
             unix_sockets: vec![format!("{}/run.sock", s(&f.root))],
+            protect_credentials: false,
             ..cfg(SandboxMode::Seatbelt)
         };
         let sb = build(&f, &c, Some(8080));
@@ -482,7 +623,9 @@ mod tests {
             "(version 1)\n(allow default)\n(deny signal)\n(allow signal (target same-sandbox))\n(deny file-write*)\n\
              (allow file-write* (subpath \"{r}/ws\") (subpath \"{r}/tmp\") (subpath \"{r}/extra\") (subpath \"/private/tmp\") (subpath \"/private/var/folders\") (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\"))\n\
              (deny file-write* (subpath \"{r}/ws/.loom\") (subpath \"{r}/home\") (subpath \"{r}/ws/secrets\"))\n\
+             (allow file-write* (subpath \"{r}/tmp\"))\n\
              (deny file-read* (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\") (subpath \"{r}/hidden\"))\n\
+             (deny lsopen)\n(deny appleevent-send)\n\
              (deny network*)\n\
              (allow network-outbound (remote ip \"localhost:8080\"))\n\
              (allow network-outbound (remote ip \"localhost:9000\"))\n\
@@ -496,6 +639,104 @@ mod tests {
         assert_eq!(args[0], "-p");
         assert_eq!(args[1], expected);
         assert_eq!(&args[2..], ["/bin/bash", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn profile_denies_launch_services_and_apple_events() {
+        let f = fx();
+        let p = build(&f, &cfg(SandboxMode::Seatbelt), None).profile().expect("profile");
+        assert!(p.contains("(deny lsopen)\n") && p.contains("(deny appleevent-send)\n"), "{p}");
+    }
+
+    #[test]
+    fn temp_dir_inside_the_loom_home_is_writable_but_nothing_else_there() {
+        let f = fx_prod();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let p = sb.profile().expect("profile");
+        let deny = p.find("(deny file-write* (subpath \"").expect("protected deny");
+        let allow = p.rfind(&format!("(allow file-write* (subpath \"{}\"))\n", s(&f.tmp))).expect("tmp allow");
+        assert!(allow > deny, "the temp-dir allow must come after the protected deny: {p}");
+        for mode in [SandboxMode::Seatbelt, SandboxMode::None] {
+            let sb = build(&f, &cfg(mode), None);
+            assert!(sb.check_write(&f.tmp.join("x")).is_ok());
+            assert!(sb.check_write(&f.tmp.join("new/dir/x")).is_ok());
+            assert!(sb.check_write(&f.home.join("sessions/s1/log.jsonl")).is_err());
+            assert!(sb.check_write(&f.home.join("sessions/s1/tmpx")).is_err());
+            assert!(sb.check_write(&f.home.join("sessions/s1/x")).is_err());
+            assert!(sb.check_write(&f.home.join("other")).is_err());
+        }
+    }
+
+    #[test]
+    fn protected_path_inside_the_temp_dir_stays_protected() {
+        let f = fx();
+        // A temp dir that is the workspace itself must not unprotect `.loom`.
+        let sb = Sandbox::new(&cfg(SandboxMode::Seatbelt), &f.ws, &f.ws, &f.home, None).expect("sandbox");
+        assert!(sb.check_write(&f.ws.join("a")).is_ok());
+        assert!(sb.check_write(&f.ws.join(".loom/x")).is_err());
+        let p = sb.profile().expect("profile");
+        let last_allow = p.rfind("(allow file-write*").expect("allow");
+        let last_deny = p.rfind(&format!("(deny file-write* (subpath \"{}/.loom\"))", s(&f.ws))).expect("deny");
+        assert!(last_deny > last_allow, "{p}");
+    }
+
+    #[test]
+    fn credentials_are_unreadable_by_default() {
+        let f = fx();
+        let fake = f.root.join("fakehome");
+        std::fs::create_dir_all(fake.join(".ssh")).expect("mkdir");
+        std::fs::write(fake.join(".ssh/id"), "private").expect("write");
+        std::fs::write(fake.join(".netrc"), "machine x").expect("write");
+        std::fs::write(fake.join("notes"), "fine").expect("write");
+        let sb = build_home(&f, &cfg(SandboxMode::Seatbelt), &fake);
+        let e = sb.check_read(&fake.join(".ssh/id")).expect_err("ssh");
+        assert!(e.contains("not readable"), "{e}");
+        assert!(sb.check_read(&fake.join(".netrc")).is_err());
+        assert!(sb.check_read(&fake.join(".aws/credentials")).is_err());
+        assert!(sb.check_read(&fake.join("Library/Keychains/login.keychain-db")).is_err());
+        assert!(sb.check_read(&fake.join("notes")).is_ok());
+        let p = sb.profile().expect("profile");
+        assert!(p.contains(&format!("(subpath \"{}/.ssh\")", s(&fake))), "{p}");
+        assert!(sb.describe().contains("Credential directories"), "{}", sb.describe());
+        // Mode none keeps the read rule for the file tools.
+        assert!(build_home(&f, &cfg(SandboxMode::None), &fake).check_read(&fake.join(".ssh/id")).is_err());
+        // Switched off, nothing is added.
+        let off = SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) };
+        let sb = build_home(&f, &off, &fake);
+        assert!(sb.check_read(&fake.join(".ssh/id")).is_ok());
+        assert!(!sb.profile().expect("profile").contains(".ssh"));
+        assert!(!sb.describe().contains("Credential directories"));
+    }
+
+    #[test]
+    fn a_workspace_inside_a_credential_directory_stays_readable() {
+        let f = fx();
+        let fake = f.root.join("fakehome2");
+        let ws = fake.join(".config/gh/project");
+        std::fs::create_dir_all(&ws).expect("mkdir");
+        std::fs::create_dir_all(fake.join(".ssh")).expect("mkdir");
+        let sb = Sandbox::with_home(&cfg(SandboxMode::Seatbelt), &ws, &f.tmp, &f.home, None, Some(fake.clone()))
+            .expect("sandbox");
+        assert!(sb.check_read(&ws.join("src.rs")).is_ok());
+        assert!(sb.check_read(&fake.join(".config/gh/hosts.yml")).is_ok());
+        assert!(sb.check_read(&fake.join(".ssh/id")).is_err());
+        assert!(!sb.profile().expect("profile").contains(&format!("(subpath \"{}/.config/gh\")", s(&fake))));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn protected_and_unreadable_rules_ignore_case_on_macos() {
+        let f = fx();
+        let fake = f.root.join("fakehome3");
+        std::fs::create_dir_all(&fake).expect("mkdir");
+        let sb = build_home(&f, &cfg(SandboxMode::Seatbelt), &fake);
+        // `.loom` could just as well not exist yet; the rule is on the spelling.
+        assert!(sb.check_write(&f.ws.join(".LOOM/x")).is_err());
+        assert!(sb.check_write(&f.ws.join(".Loom")).is_err());
+        assert!(sb.check_write(&f.ws.join(".loomy")).is_ok());
+        assert!(sb.check_read(&fake.join(".SSH/id")).is_err());
+        assert!(sb.check_read(&f.home.join("TOKEN")).is_err());
+        assert!(sb.check_write(&f.ws.join("WS-ok")).is_ok());
     }
 
     #[test]
@@ -634,6 +875,24 @@ mod tests {
     }
 
     #[test]
+    fn preflight_checks_the_launcher_and_the_platform() {
+        let f = fx();
+        let missing = f.root.join("no-sandbox-exec");
+        let e = preflight_at(SandboxMode::Seatbelt, &missing, true).expect_err("missing");
+        assert!(e.contains("missing or not executable") && e.contains("macOS") && e.contains("mode = \"none\""), "{e}");
+        let plain = f.root.join("plain-file");
+        std::fs::write(&plain, "x").expect("write");
+        assert!(preflight_at(SandboxMode::Seatbelt, &plain, true).is_err());
+        let e = preflight_at(SandboxMode::Seatbelt, Path::new("/bin/sh"), false).expect_err("not macOS");
+        assert!(e.contains("not macOS") && e.contains("mode = \"none\""), "{e}");
+        assert!(preflight_at(SandboxMode::None, &missing, false).is_ok());
+        assert!(preflight_at(SandboxMode::Seatbelt, Path::new("/bin/sh"), true).is_ok());
+        if available() {
+            assert!(preflight(&cfg(SandboxMode::Seatbelt)).is_ok());
+        }
+    }
+
+    #[test]
     fn resolve_expands_home_and_joins_relative_paths() {
         let f = fx();
         let sb = build(&f, &cfg(SandboxMode::None), None);
@@ -666,6 +925,17 @@ mod tests {
             ("loom_x", "x"),
             ("TERM", "xterm"),
             ("PAGER", "less"),
+            ("GH_PAT", "x"),
+            ("SENTRY_DSN", "x"),
+            ("MYSQL_PWD", "x"),
+            ("PWD", "/w"),
+            ("OLDPWD", "/o"),
+            ("DATABASE_URL", "x"),
+            ("SSH_AUTH_SOCK", "x"),
+            ("GITHUB_AUTH_TOKEN_X", "x"),
+            ("SESSION_COOKIE_JAR", "x"),
+            ("MY_SESSION_KEY_V", "x"),
+            ("DATABASE_HOST", "kept-host"),
         ]
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -674,9 +944,26 @@ mod tests {
         let keys: Vec<&str> = env.keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            ["GIT_PAGER", "GIT_TERMINAL_PROMPT", "HOME", "MY_API_KEY", "NO_COLOR", "PAGER", "PATH", "TERM", "TMPDIR"]
+            [
+                "DATABASE_HOST",
+                "GIT_PAGER",
+                "GIT_TERMINAL_PROMPT",
+                "HOME",
+                "MY_API_KEY",
+                "NO_COLOR",
+                "OLDPWD",
+                "PAGER",
+                "PATH",
+                "PWD",
+                "TERM",
+                "TMPDIR"
+            ]
         );
         assert_eq!(env["MY_API_KEY"], "kept");
+        // `env_pass` overrides the new rules too.
+        let c = SandboxCfg { env_pass: vec!["GH_PAT".into(), "SSH_AUTH_SOCK".into()], ..cfg(SandboxMode::Seatbelt) };
+        let passed = build(&f, &c, None).env(&parent);
+        assert_eq!((passed["GH_PAT"].as_str(), passed["SSH_AUTH_SOCK"].as_str()), ("x", "x"));
         assert_eq!(env["TERM"], "dumb");
         assert_eq!(env["PAGER"], "cat");
         assert_eq!(env["GIT_TERMINAL_PROMPT"], "0");
@@ -760,6 +1047,62 @@ mod tests {
     }
 
     #[test]
+    fn commands_write_to_a_temp_dir_inside_the_loom_home() {
+        if !available() {
+            return;
+        }
+        let f = fx_prod();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let env = sb.env(&BTreeMap::new());
+        assert_eq!(env["TMPDIR"], s(&f.tmp));
+        let (ok, text) = run(&sb, &f.ws, &format!("echo x > {}/t.txt && mktemp {}/m.XXXXXX", s(&f.tmp), s(&f.tmp)));
+        assert!(ok, "{text}");
+        assert!(f.tmp.join("t.txt").exists());
+        // Nothing else in the loom home became writable.
+        let log = f.home.join("sessions/s1/log.jsonl");
+        let (ok, text) = run(&sb, &f.ws, &format!("echo x >> {}", s(&log)));
+        assert!(!ok && text.contains("Operation not permitted"), "{text}");
+        assert_eq!(std::fs::read_to_string(&log).expect("read"), "{}");
+        assert!(!run(&sb, &f.ws, &format!("echo x > {}/sessions/s1/new", s(&f.home))).0);
+    }
+
+    #[test]
+    fn commands_cannot_read_credentials_unless_protection_is_off() {
+        if !available() {
+            return;
+        }
+        let f = fx();
+        let fake = f.root.join("fakehome4");
+        std::fs::create_dir_all(fake.join(".ssh")).expect("mkdir");
+        std::fs::write(fake.join(".ssh/id"), "private-key").expect("write");
+        let sb = build_home(&f, &cfg(SandboxMode::Seatbelt), &fake);
+        let id = format!("{}/.ssh/id", s(&fake));
+        let (ok, text) = run(&sb, &f.ws, &format!("cat {id}"));
+        assert!(!ok && text.contains("Operation not permitted") && !text.contains("private-key"), "{text}");
+        assert!(!run(&sb, &f.ws, &format!("ls {}/.ssh", s(&fake))).0);
+        let off = SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) };
+        let (ok, text) = run(&build_home(&f, &off, &fake), &f.ws, &format!("cat {id}"));
+        assert!(ok && text == "private-key", "{text}");
+    }
+
+    #[test]
+    fn launch_services_open_is_refused_under_the_profile() {
+        if !available() || !Path::new("/usr/bin/open").exists() {
+            return;
+        }
+        let f = fx();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        // The profile compiles with the new rules and bash runs under it.
+        assert!(run(&sb, &f.ws, "true").0);
+        let marker = f.ws.join("opened.command");
+        std::fs::write(&marker, format!("#!/bin/sh\ntouch {}/ran\n", s(&f.ws))).expect("write");
+        let (ok, _) = run(&sb, &f.ws, &format!("/usr/bin/open -g {}", s(&marker)));
+        assert!(!ok);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!f.ws.join("ran").exists());
+    }
+
+    #[test]
     fn commands_cannot_read_denied_paths() {
         if !available() {
             return;
@@ -816,16 +1159,59 @@ mod tests {
         // Outside the sandbox both are reachable, so the refusal above is the profile's doing.
         let none = build(&f, &cfg(SandboxMode::None), None);
         assert!(connects(&none, &f.ws, "127.0.0.1", po));
-        // An external address (TEST-NET-1, never routed) and name resolution are refused.
-        assert!(!connects(&sb, &f.ws, "192.0.2.1", 80));
-        let (ok, _) = run(&sb, &f.ws, "/usr/bin/nc -z -w 2 localhost.invalid 80");
-        assert!(!ok);
         // The proxy port counts as an allowed port, and loopback_all opens every loopback port.
         let via_proxy = build(&f, &cfg(SandboxMode::Seatbelt), Some(po));
         assert!(connects(&via_proxy, &f.ws, "127.0.0.1", po));
         assert!(!connects(&via_proxy, &f.ws, "127.0.0.1", pa));
         let all = build(&f, &SandboxCfg { loopback_all: true, ..cfg(SandboxMode::Seatbelt) }, None);
         assert!(connects(&all, &f.ws, "127.0.0.1", pa) && connects(&all, &f.ws, "127.0.0.1", po));
+    }
+
+    /// An address of this host that is not loopback, found without sending anything.
+    fn host_address() -> Option<std::net::IpAddr> {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        sock.connect("192.0.2.1:9").ok()?;
+        let ip = sock.local_addr().ok()?.ip();
+        (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+    }
+
+    #[test]
+    fn non_loopback_addresses_are_refused_under_seatbelt() {
+        if !available() {
+            return;
+        }
+        let Some(ip) = host_address() else { return };
+        let Ok(listener) = std::net::TcpListener::bind((ip, 0)) else { return };
+        let port = listener.local_addr().expect("addr").port();
+        let f = fx();
+        let host = ip.to_string();
+        // Control: outside the sandbox the host's own address is reachable.
+        let none = build(&f, &cfg(SandboxMode::None), None);
+        if !connects(&none, &f.ws, &host, port) {
+            return;
+        }
+        // (With `loopback_all` the host's own address counts as localhost to the profile; that is not tested.)
+        assert!(!connects(&build(&f, &cfg(SandboxMode::Seatbelt), None), &f.ws, &host, port));
+    }
+
+    #[test]
+    fn names_that_resolve_outside_the_sandbox_do_not_resolve_under_seatbelt() {
+        if !available() {
+            return;
+        }
+        let Ok(out) = Command::new("/bin/hostname").arg("-s").output() else { return };
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if name.is_empty() || name.contains(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+            return;
+        }
+        let f = fx();
+        let script = format!("/usr/bin/dscacheutil -q host -a name {name}");
+        let (_, plain) = run(&build(&f, &cfg(SandboxMode::None), None), &f.ws, &script);
+        if !plain.contains("ip_address") {
+            return; // this host's own name does not resolve here, so there is nothing to compare
+        }
+        let (_, boxed) = run(&build(&f, &cfg(SandboxMode::Seatbelt), None), &f.ws, &script);
+        assert!(!boxed.contains("ip_address"), "{boxed}");
     }
 
     #[test]

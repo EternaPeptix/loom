@@ -923,6 +923,7 @@ dependencies = [
  "loom-agent",
  "loom-core",
  "loom-model",
+ "loom-tools",
  "rand 0.9.5",
  "reqwest",
  "serde",
