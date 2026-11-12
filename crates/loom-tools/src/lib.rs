@@ -19,6 +19,7 @@
 //! - [`bash`], [`fstools`], [`search`], [`outview`], [`web`]: the built-in tools
 
 pub mod bash;
+pub mod cve;
 pub mod files;
 pub mod fstools;
 pub mod jobs;
@@ -160,6 +161,9 @@ impl Registry {
         r.add(Arc::new(outview::OutRead));
         r.add(Arc::new(outview::OutGrep));
         r.add(Arc::new(web::WebFetch));
+        r.add(Arc::new(cve::CveLookup));
+        r.add(Arc::new(cve::CveSearch));
+        r.add(Arc::new(cve::AdvisoryLookup));
         r
     }
 
