@@ -172,18 +172,25 @@ per line:
   Everything after the good prefix (a torn final line included) is moved to
   `log.jsonl.damaged-<ms>`, the file is truncated to the prefix, and the session records an
   `interrupted` event describing the damage and continues from the last good record.
-- A line whose chain header is right but whose body this build cannot read (a kind written by a newer
-  loom) is not damage: it is kept as an opaque record (`Event::Unknown`), advances the chain, and is
-  ignored by the weave and by every fold of session state — unless the next line has the next `seq`
-  but does not chain to it, in which case it is damage. A log with opaque records, or whose
-  `session_start` carries a higher schema than this build's, can be read but is refused for writing
-  (`LogError::Newer`) and left untouched, so the session is not run.
+- A record of a kind this build does not know is read as `Event::Unknown`: it stays in the file as
+  written, advances the chain, and is ignored by the weave and by every fold of session state.
+- A line whose chain header is right but whose body this build cannot read otherwise (a value written
+  by a newer loom) is not damage: it is kept as an opaque record (also `Event::Unknown`), advances the
+  chain, and is ignored the same way — unless the next line has the next `seq` but does not chain to
+  it, in which case it is damage. A log with opaque records, or whose `session_start` carries a
+  higher schema than this build's, can be read but is refused for writing (`LogError::Newer`) and
+  left untouched, so the session is not run.
 - `read_records`, `read_page` and `PageReader` read under the same stopping rule and change nothing.
   A `PageReader` keeps checkpoints of what it has verified, so that pages fetched in sequence cost
   time proportional to the page; the runtime keeps one per session for the 16 most recently paged
-  sessions.
+  sessions. A `PageReader` also hands out the stored line of every record it reads as
+  `Event::Unknown`, and the API serves that line in place of the parsed record (§12), so such a
+  record reaches clients with every field.
 - A forked child's log starts with a byte-identical copy of its parent's lines up to the fork point,
-  followed by its own `forked` record.
+  followed by its own `forked` record. Each line is checked as `open` checks it before it is copied
+  (a whole line, not opaque, the expected `seq`, a `prev` that matches); when one fails, the fork is
+  refused with a sentence naming that record and no child log is left, so a child never inherits a
+  prefix that its next open would cut back together with its own records.
 
 ## 5. The weave (`loom-core::weave`)
 
@@ -358,8 +365,12 @@ zeros before the first entry. Verification recomputes over the bytes on disk.
   entries, deleting the journal, or putting another mission's journal (and head) in its place is
   detected. The journal may be ahead of its head by entries that verify (a crash between the two
   writes); the next append repairs it. A journal without a head (written before heads existed) is
-  accepted and gets one at its next append. Not protected: deleting `journal.head` alone, putting back
-  an older head, deleting journal and head together, and anyone who holds the key.
+  accepted at any length and gets one at its next append. So the head detects truncation and
+  substitution only while it is in place: deleting `journal.head` together with the last entries (or
+  putting another mission's journal in place without a head) is not detected, deleting the journal
+  and the head together reads as a mission that never had a ledger, and restoring an older journal
+  together with its older head rolls the mission back unnoticed. Anyone who holds the key can forge
+  everything.
 - **Torn tail.** Bytes after the last newline (a crash or full disk mid-append) are ignored on read
   and removed by the next append. A complete line that fails verification makes the journal
   `Tampered`: every ledger write refuses and the ledger view reports it; the agent cannot repair it.
@@ -955,9 +966,11 @@ POST /api/shutdown                            → 202 {}
 
 The wire types are `crate::wire` and the serde form of the runtime's types; `docs/UI.md` lists the
 conventions. **Records** are served as this build reads them: a known record is re-encoded field for
-field (fields an older line lacked appear with their defaults), and an opaque record is served with
-`"kind": "unknown"` and only its header. The stored line is the record of truth; `prev` verifies against
-the file, not against the served JSON.
+field (fields an older line lacked appear with their defaults), and a record read as `Event::Unknown`
+(a kind this build does not know, or an opaque record) is served as its stored line, verbatim, by the
+records route and by a session stream's replay (a carriage return between its tokens goes out as a
+space on a stream). The stored line is the record of truth; `prev` verifies against the file, not
+against re-encoded JSON.
 
 **Errors.** Every non-2xx answer has the body `{"error": "<sentence>"}`. `400`: a body or query that is
 not valid; `401`: a missing or wrong bearer; `403`: the Host or Origin gate; `404`: an unknown path, a

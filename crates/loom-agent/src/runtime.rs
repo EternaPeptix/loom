@@ -348,7 +348,8 @@
 //! - `records(id, after, limit)`: a page of at most `min(limit, 2_000)` records with `seq > after`
 //!   from the session's `log::PageReader` over `paths.session_log(id)`. One reader is kept per
 //!   session so that paging in sequence does not rescan the log; only the `PAGERS_MAX` (16) most
-//!   recently paged sessions keep theirs.
+//!   recently paged sessions keep theirs. `stored_records(id, after, limit)`: the same page from
+//!   `PageReader::read_stored`, so that a record read as `Event::Unknown` keeps its stored line.
 //! - `window(id)`: `log::read_records` → `weave` → [`WindowView`] (`est_tokens` with a default
 //!   `TokenEstimator` over the messages plus the tool specs' JSON).
 //! - `missions()`: one per root session. `ledger(mission)`: the journal read and folded
@@ -406,7 +407,7 @@ use loom_core::event::{
 };
 use loom_core::journal::{self, Journal};
 use loom_core::ledger::LedgerState;
-use loom_core::log::{read_records, Durability, PageReader, SessionLog};
+use loom_core::log::{read_records, Durability, PageReader, SessionLog, StoredRecord};
 use loom_core::weave::{render_brief, weave, WindowItem};
 use loom_core::{now_ms, BlobId, BlobStore, CallId, MissionId, SessionId};
 use loom_model::{ChatRequest, Discovered, Limiter, ModelClient, ModelError, Priority, StreamEvent, ToolChoice};
@@ -3117,6 +3118,11 @@ impl Runtime {
     }
 
     pub fn records(&self, id: &SessionId, after: Option<Seq>, limit: usize) -> Result<Vec<Record>, String> {
+        Ok(self.stored_records(id, after, limit)?.into_iter().map(|stored| stored.record).collect())
+    }
+
+    /// The page `records` gives, each record with its stored line when it was read as `Event::Unknown`.
+    pub fn stored_records(&self, id: &SessionId, after: Option<Seq>, limit: usize) -> Result<Vec<StoredRecord>, String> {
         self.inner.check_open()?;
         if !self.inner.st().known.contains_key(id) {
             return Err(no_session(id));
@@ -3134,7 +3140,7 @@ impl Runtime {
             reader.1
         };
         let mut reader = lock(&reader);
-        reader.read_page(after, limit.min(PAGE_MAX)).map_err(|e| e.to_string())
+        reader.read_stored(after, limit.min(PAGE_MAX)).map_err(|e| e.to_string())
     }
 
     pub fn window(&self, id: &SessionId) -> Result<WindowView, String> {

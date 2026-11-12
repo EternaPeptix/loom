@@ -102,6 +102,9 @@ upgrade" first; the rest says what behaves differently.
   needs `loom open` again.
 - Start-up sweeps the process groups a previous daemon left running and notifies you again of inbox
   items that were still waiting.
+- A session record this build cannot read in full (a kind or value written by a newer loom) is served
+  by `/api/sessions/{id}/records` and the session stream as it is stored, with every field, instead of
+  as `"kind": "unknown"` with only its header.
 
 ### Sandbox and tools
 
@@ -160,11 +163,17 @@ upgrade" first; the rest says what behaves differently.
 ### Logs, journal and storage
 
 - The mission journal has a sealed `journal.head` beside it; a torn last line is repaired by the next
-  append instead of counting as tampering, and truncation, deletion and substitution are detected.
+  append instead of counting as tampering, and truncation, deletion and substitution are detected while
+  the head is in place (`SECURITY.md` lists what it cannot detect).
 - Session logs are locked while open for writing, and an unreadable line with a sound chain header is
   kept as an opaque record instead of being treated as damage.
+- A fork checks every line it copies from its parent's log and is refused, naming the record, when
+  that part of the log is not a sound chain; before, the child took the damage with it and lost its
+  own records at its next open.
 - The blob store removes stale temporary files, repairs missing indexes, and is cleaned only by
   `loom gc`.
+- Reading lines of a stored output reads only the line-index entries it needs, so a page costs the
+  same however many lines the output has.
 
 ### Packs and documents
 

@@ -6,7 +6,9 @@
 
 use loom_agent::runtime::{ModelHealth, SessionInfo};
 use loom_core::event::{Record, Seq};
-use serde::{Deserialize, Serialize};
+use loom_core::log::record_from_value;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// `GET /api/status`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -64,9 +66,19 @@ pub struct SessionDetail {
 /// `GET /api/sessions/{id}/records`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecordsPage {
+    /// A record served as stored because the daemon could not read it in full (written by a newer loom)
+    /// is read as the log reader reads it: `Event::Unknown` when its header is sound.
+    #[serde(deserialize_with = "records_as_stored")]
     pub records: Vec<Record>,
     /// Pass as `after` to get the next page; `null` when this page reached the end of the log.
     pub next_after: Option<Seq>,
+}
+
+fn records_as_stored<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Record>, D::Error> {
+    Vec::<serde_json::Value>::deserialize(deserializer)?
+        .iter()
+        .map(|value| record_from_value(value).ok_or_else(|| D::Error::custom("an entry of `records` is not a record")))
+        .collect()
 }
 
 /// `GET /api/blobs/{id}/lines`.
