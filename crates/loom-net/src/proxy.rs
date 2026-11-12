@@ -10,8 +10,18 @@
 //!   default), sends the request with an origin-form target, drops `Proxy-Authorization` and
 //!   `Proxy-Connection`, adds `Connection: close`, and copies the request body and the response
 //!   through unchanged. One request per client connection.
+//! - a check, method [`CHECK_METHOD`] with the destination as `host:port` or as an absolute
+//!   `http://host:port/` URI (see *Checks*);
 //! - anything else (origin-form target, `https://` absolute URI, unparseable head, a head larger than
 //!   64 KiB, no head within the head timeout of [`Limits`]) → `400` with a sentence.
+//!
+//! ## Checks
+//! A check asks for the policy's verdict on a destination without using it: the proxy applies the
+//! policy to the name, resolves it and checks the addresses as for a connection, but connects to
+//! nothing. It answers `200` (allowed), `403` (refused, with the refusal text) or `502` (the name does
+//! not resolve), with the rule in header [`RULE_HEADER`], and records the decision with method
+//! `LOOM-CHECK` and the rule suffixed ` (check only)`. Tools ask it before an https request, because an
+//! HTTP client does not show what the proxy answered to its CONNECT.
 //!
 //! ## Sessions
 //! `grant(session, policy)` returns a [`SessionGrant`] with fresh random credentials (user = the
@@ -31,10 +41,18 @@
 //! first one that `policy.check_addr` allows (10 s connect timeout each). The connection is made to
 //! that checked address, never by name, so a second lookup cannot change the destination. If every
 //! address is refused the decision is the first refusal.
-//! Every request produces exactly one `NetDecision` sent to `sink` together with the session id:
+//! Every request produces exactly one `NetDecision` (and a second one when it fails after an allow,
+//! see below) sent to `sink` together with the session id:
 //! `host`, `port`, `method` (`CONNECT` or the request method), `allowed`, `rule`, `resolved` (the
 //! address connected to, or the refused address, when there is one). Resolution or connect failures
 //! after an allow are reported as allowed with the rule suffixed ` (unreachable: {why})`.
+//! A connection on record as allowed that then fails gets a second decision: the same destination,
+//! address and rule, allowed, with the rule suffixed ` (failed after the allow: {why})`. For a tunnel
+//! that is when its client is gone before the `200`, the bytes it sent ahead cannot be written, or it
+//! ends (closed, failed on either side, or idle) before the destination sent a byte; once bytes have
+//! come from the destination the proxy cannot tell a cut-off encrypted stream from a routine close, so
+//! the tunnel is not judged further. For a forwarded request it is when the request cannot be written,
+//! the destination answers nothing usable or stalls, or the relay fails on either side.
 //! Refusals answer `403` with header `X-Loom-Proxy: 1` and a plain-text body that states the
 //! destination, the rule, and that the network policy is set by the operator in the loom config
 //! (`[network]`) — a command cannot change it. Unreachable destinations answer `502` with
@@ -75,8 +93,8 @@
 //! ## Limits ([`Limits`], defaults)
 //! - 256 connections in all. A connection that has not sent a complete head within 10 s gets `400`.
 //!   At the limit a new connection takes the slot of the oldest connection that has not sent a
-//!   complete head yet (that one is closed); when there is none it is answered `503` with
-//!   `Retry-After: 5`.
+//!   complete head yet, or that is only being answered by the proxy itself and drained (that one is
+//!   closed); when there is none it is answered `503` with `Retry-After: 5`.
 //! - 64 connections per session; over it `429` with `Retry-After: 5`.
 //! - 16 name lookups at once, at most 4 of them for one session; a lookup waits up to 10 s for a turn.
 //! - The two directions of a tunnel or forwarded request are relayed independently. With no byte
@@ -126,6 +144,10 @@ const UNATTRIBUTED_PER_MINUTE: u32 = 10;
 const MAX_DISCARD: usize = 1024 * 1024;
 /// The header that marks a response the proxy generated itself.
 const MARKER: &str = "x-loom-proxy";
+/// The method of a check (see *Checks*).
+pub const CHECK_METHOD: &str = "LOOM-CHECK";
+/// The header of a check's answer that carries the rule.
+pub const RULE_HEADER: &str = "X-Loom-Rule";
 
 /// The audit hook: called with the session (`None` for an answer that names no granted session) and
 /// the decision, it must have recorded the decision durably when it returns `Ok`. It may block (it
@@ -218,8 +240,9 @@ struct Entry {
     lookups: Arc<Semaphore>,
 }
 
-/// Connections that have not sent a complete request head yet, oldest first, each with its
-/// connection permit and the token that closes it.
+/// Connections that have not sent a complete request head yet, or that are only being drained after
+/// an answer of the proxy itself, oldest first, each with its connection permit and the token that
+/// closes it.
 #[derive(Default)]
 struct Pending {
     next: u64,
@@ -573,11 +596,45 @@ fn response_bytes(status: &str, extra: &str, body: &str) -> String {
 /// Writes a proxy-generated response and closes. Unread input is drained briefly so that closing
 /// does not reset the connection before the client has read the response.
 async fn respond(client: &mut TcpStream, status: &str, extra: &str, body: &str) {
-    let msg = response_bytes(status, extra, body);
-    if client.write_all(msg.as_bytes()).await.is_err() {
+    if send(client, status, extra, body).await {
+        drain(client).await;
+    }
+}
+
+/// Like [`respond`], for a connection that holds the global `slot`: before the drain the slot is
+/// pending again, so at the limit a new connection takes it over (and this one is closed) rather than
+/// wait for a connection that has nothing left to serve.
+async fn answer(
+    client: &mut TcpStream,
+    shared: &Shared,
+    slot: OwnedSemaphorePermit,
+    status: &str,
+    extra: &str,
+    body: &str,
+) {
+    if !send(client, status, extra, body).await {
         return;
     }
+    let (id, evicted) = shared.add_pending(slot);
+    let _pending = PendingGuard { shared, id };
+    tokio::select! {
+        _ = drain(client) => {}
+        _ = evicted.cancelled() => {}
+    }
+}
+
+/// Writes a proxy-generated response and ends the writing side; false when the client is gone.
+async fn send(client: &mut TcpStream, status: &str, extra: &str, body: &str) -> bool {
+    let msg = response_bytes(status, extra, body);
+    if client.write_all(msg.as_bytes()).await.is_err() {
+        return false;
+    }
     let _ = client.shutdown().await;
+    true
+}
+
+/// Reads and drops what the client still sends, for up to 500 ms.
+async fn drain(client: &mut TcpStream) {
     let drain = async {
         let mut sink = [0u8; 4096];
         let mut total = 0usize;
@@ -591,11 +648,11 @@ async fn respond(client: &mut TcpStream, status: &str, extra: &str, body: &str) 
     let _ = tokio::time::timeout(Duration::from_millis(500), drain).await;
 }
 
-async fn bad_request(client: &mut TcpStream, why: &str) {
+async fn bad_request(client: &mut TcpStream, shared: &Shared, slot: OwnedSemaphorePermit, why: &str) {
     let body = format!(
         "loom proxy: {why}. This proxy accepts `CONNECT host:port` and `GET http://host/path`-style requests with an absolute http:// URI; use CONNECT for https.\n"
     );
-    respond(client, "400 Bad Request", "", &body).await;
+    answer(client, shared, slot, "400 Bad Request", "", &body).await;
 }
 
 /// Records a decision: the audit hook first (on a blocking thread, so file I/O never stalls a worker).
@@ -668,10 +725,11 @@ fn local_decision(head: Option<&Head>, rule: &str) -> NetDecision {
 /// The destination a request names, when its target parses as one.
 fn destination(head: &Head) -> Option<(String, u16)> {
     let t = head.target.as_str();
-    if head.method == "CONNECT" {
+    let http = t.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"));
+    if head.method == "CONNECT" || (head.method == CHECK_METHOD && !http) {
         return parse_authority(t, None).ok();
     }
-    if t.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://")) {
+    if http {
         return plain_target(t).ok().map(|(host, port, _, _)| (host, port));
     }
     let rest = t.get(..8).filter(|p| p.eq_ignore_ascii_case("https://")).and_then(|_| t.get(8..))?;
@@ -789,6 +847,14 @@ impl Ctx<'_> {
         }
     }
 
+    /// Records that a connection on record as allowed failed before or while its request was relayed:
+    /// the allow's rule and address again, with the failure, so the trail never ends at a bare allow
+    /// for traffic that did not flow. Best effort.
+    async fn failed_after_allow(&self, allowed: &Allowed, why: &str) {
+        let rule = format!("{} (failed after the allow: {why})", allowed.rule);
+        self.record_best_effort(true, rule, Some(allowed.ip)).await;
+    }
+
     fn dest(&self) -> String {
         if self.host.contains(':') {
             format!("[{}]:{}", self.host, self.port)
@@ -802,7 +868,7 @@ impl Ctx<'_> {
             "403 Forbidden",
             format!(
                 "loom network policy: {} to {} was refused by rule `{rule}`. The network policy is set by the operator in the loom config ([network]); a command cannot change it. Use a destination the policy allows, or ask the operator to change the config.\n",
-                self.method,
+                if self.method == CHECK_METHOD { "a connection" } else { self.method },
                 self.dest()
             ),
         )
@@ -870,10 +936,17 @@ async fn resolve(cx: &Ctx<'_>) -> Result<Vec<IpAddr>, String> {
     }
 }
 
+/// The rule and the address of a connection that is on record as allowed.
+struct Allowed {
+    rule: String,
+    ip: IpAddr,
+}
+
 /// Applies the policy to the name, resolves it, and connects to the first address the policy allows.
-/// Reports exactly one decision; for the connection it returns, the audit hook has succeeded first.
-/// On failure returns the status line and body to send.
-async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<TcpStream, (&'static str, String)> {
+/// Reports exactly one decision; for the connection it returns, the audit hook has succeeded first, and
+/// the rule and address it was recorded with come along. On failure returns the status line and body
+/// to send.
+async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<(TcpStream, Allowed), (&'static str, String)> {
     let v = policy.check_name(cx.host, cx.port);
     if !v.allowed {
         cx.record_best_effort(false, v.rule.clone(), None).await;
@@ -904,8 +977,8 @@ async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<TcpStream, (&'st
             Ok(Ok(s)) => {
                 let _ = s.set_nodelay(true);
                 // Nothing has been sent upstream yet; the connection is used only once it is on record.
-                return match cx.record(true, cv.rule, Some(ip)).await {
-                    Ok(()) => Ok(s),
+                return match cx.record(true, cv.rule.clone(), Some(ip)).await {
+                    Ok(()) => Ok((s, Allowed { rule: cv.rule, ip })),
                     Err(e) => {
                         tracing::warn!("cannot write the egress audit record of {}: {e}", cx.session.as_str());
                         Err(cx.audit_failed(&e))
@@ -937,10 +1010,47 @@ async fn unreachable_decision(cx: &Ctx<'_>, rule: &str, ip: Option<IpAddr>, why:
     cx.unreachable(why)
 }
 
+/// Answers a check (see *Checks*): the decision `open_upstream` would make, without connecting.
+async fn check(client: &mut TcpStream, cx: &Ctx<'_>, policy: &Policy, slot: OwnedSemaphorePermit) {
+    let name = policy.check_name(cx.host, cx.port);
+    let found = if name.allowed {
+        let addrs = match cx.host.parse::<IpAddr>() {
+            Ok(ip) => Ok(vec![ip]),
+            Err(_) => resolve(cx).await,
+        };
+        // The first address the policy allows, else the first refusal.
+        addrs.and_then(|addrs| {
+            let mut checked = addrs.into_iter().map(|ip| (policy.check_addr(cx.host, cx.port, ip, &name.rule), Some(ip)));
+            let first = checked.next().ok_or("the name has no addresses")?;
+            Ok(if first.0.allowed { first } else { checked.find(|(v, _)| v.allowed).unwrap_or(first) })
+        })
+    } else {
+        Ok((name.clone(), None))
+    };
+    let (allowed, rule, resolved, (status, body)) = match found {
+        Ok((v, ip)) if v.allowed => {
+            let body = format!("loom network policy: a connection to {} is allowed by rule `{}`.\n", cx.dest(), v.rule);
+            (true, v.rule, ip, ("200 OK", body))
+        }
+        Ok((v, ip)) => (false, v.rule.clone(), ip, cx.refused(&v.rule)),
+        Err(why) => (true, format!("{} (unreachable: {why})", name.rule), None, cx.unreachable(&why)),
+    };
+    let header: String = rule.chars().map(|c| if c == ' ' || c.is_ascii_graphic() { c } else { '?' }).collect();
+    cx.record_best_effort(allowed, format!("{rule} (check only)"), resolved).await;
+    answer(client, cx.shared, slot, status, &format!("{RULE_HEADER}: {header}\r\n"), &body).await;
+}
+
 /// Answers a request of a session that the proxy rejects itself with 400, after auditing it.
-async fn reject(client: &mut TcpStream, shared: &Shared, session: &SessionId, head: &Head, why: &str) {
+async fn reject(
+    client: &mut TcpStream,
+    shared: &Shared,
+    slot: OwnedSemaphorePermit,
+    session: &SessionId,
+    head: &Head,
+    why: &str,
+) {
     audit_local(shared, Some(session), local_decision(Some(head), &format!("bad request: {why}"))).await;
-    bad_request(client, why).await;
+    bad_request(client, shared, slot, why).await;
 }
 
 /// Serves one connection. It is pending (`id`, closed through `evicted`) until its head is complete.
@@ -960,17 +1070,17 @@ async fn handle(
         _ = cancel.cancelled() => return,
     };
     // From here the connection holds its slot itself; when a newer one was given it meanwhile, it ends.
-    let Some(_slot) = pending.claim() else { return };
+    let Some(slot) = pending.claim() else { return };
     let (head, extra) = match read {
         Err(_) => {
             let why = format!("no complete request head arrived within {}", human(wait));
             audit_local(&shared, None, local_decision(None, &format!("bad request: {why}"))).await;
-            return bad_request(&mut client, &why).await;
+            return bad_request(&mut client, &shared, slot, &why).await;
         }
         Ok(Err(HeadError::Closed)) => return,
         Ok(Err(HeadError::Bad(m))) => {
             audit_local(&shared, None, local_decision(None, &format!("bad request: {m}"))).await;
-            return bad_request(&mut client, &m).await;
+            return bad_request(&mut client, &shared, slot, &m).await;
         }
         Ok(Ok(x)) => x,
     };
@@ -980,8 +1090,8 @@ async fn handle(
             let rule = format!("proxy authentication failed: {why}");
             audit_local(&shared, None, local_decision(Some(&head), &rule)).await;
             let body = "loom proxy: missing or unknown proxy credentials. Use the proxy settings from the command's environment (HTTP_PROXY / HTTPS_PROXY), which carry this session's credentials.\n";
-            return respond(&mut client, "407 Proxy Authentication Required", "Proxy-Authenticate: Basic realm=\"loom\"\r\n", body)
-                .await;
+            let challenge = "Proxy-Authenticate: Basic realm=\"loom\"\r\n";
+            return answer(&mut client, &shared, slot, "407 Proxy Authentication Required", challenge, body).await;
         }
     };
     let Authed { session, policy, permits, lookups } = auth;
@@ -991,35 +1101,48 @@ async fn handle(
             shared.limits.max_per_session
         );
         audit_local(&shared, Some(&session), local_decision(Some(&head), "connection limit (per session)")).await;
-        return respond(&mut client, "429 Too Many Requests", "Retry-After: 5\r\n", &body).await;
+        return answer(&mut client, &shared, slot, "429 Too Many Requests", "Retry-After: 5\r\n", &body).await;
     };
-    if head.method == "CONNECT" {
-        match parse_authority(&head.target, None) {
+    let connect = head.method == "CONNECT";
+    if connect || head.method == CHECK_METHOD {
+        // A check may name its destination as an absolute http:// URI, which HTTP clients send as is.
+        let dest = match head.target.get(..7) {
+            Some(s) if !connect && s.eq_ignore_ascii_case("http://") => {
+                plain_target(&head.target).map(|(host, port, _, _)| (host, port))
+            }
+            _ => parse_authority(&head.target, None),
+        };
+        match dest {
             Ok((host, port)) => {
                 let (shared, session, lookups) = (&*shared, &session, &lookups);
-                let cx = Ctx { shared, session, lookups, method: "CONNECT", host: &host, port };
-                tunnel(client, extra, &cx, &policy, cancel).await;
+                let method = if connect { "CONNECT" } else { CHECK_METHOD };
+                let cx = Ctx { shared, session, lookups, method, host: &host, port };
+                if connect {
+                    tunnel(client, extra, &cx, &policy, slot, cancel).await;
+                } else {
+                    check(&mut client, &cx, &policy, slot).await;
+                }
             }
-            Err(m) => reject(&mut client, &shared, &session, &head, &m).await,
+            Err(m) => reject(&mut client, &shared, slot, &session, &head, &m).await,
         }
         return;
     }
     let lower = head.target.get(..8).map(str::to_ascii_lowercase);
     if lower.as_deref() == Some("https://") {
         let why = "https:// absolute URIs are not proxied; use CONNECT host:443 for https";
-        return reject(&mut client, &shared, &session, &head, why).await;
+        return reject(&mut client, &shared, slot, &session, &head, why).await;
     }
     if !matches!(head.target.get(..7), Some(p) if p.eq_ignore_ascii_case("http://")) {
         let why = "the request target is not an absolute http:// URI or a CONNECT destination";
-        return reject(&mut client, &shared, &session, &head, why).await;
+        return reject(&mut client, &shared, slot, &session, &head, why).await;
     }
     match plain_target(&head.target) {
         Ok((host, port, authority, path)) => {
             let (shared, session, lookups) = (&*shared, &session, &lookups);
             let cx = Ctx { shared, session, lookups, method: &head.method, host: &host, port };
-            forward(client, extra, &head, &cx, &policy, &authority, &path, cancel).await;
+            forward(client, extra, &head, &cx, &policy, &authority, &path, slot, cancel).await;
         }
-        Err(m) => reject(&mut client, &shared, &session, &head, &m).await,
+        Err(m) => reject(&mut client, &shared, slot, &session, &head, &m).await,
     }
 }
 
@@ -1040,22 +1163,39 @@ fn plain_target(target: &str) -> Result<(String, u16, String, String), String> {
     Ok((host, port, authority.to_string(), path))
 }
 
-async fn tunnel(mut client: TcpStream, extra: Vec<u8>, cx: &Ctx<'_>, policy: &Policy, cancel: CancellationToken) {
+async fn tunnel(
+    mut client: TcpStream,
+    extra: Vec<u8>,
+    cx: &Ctx<'_>,
+    policy: &Policy,
+    slot: OwnedSemaphorePermit,
+    cancel: CancellationToken,
+) {
     let idle = cx.shared.limits.idle_timeout;
-    let mut up = match open_upstream(cx, policy).await {
+    let (mut up, allowed) = match open_upstream(cx, policy).await {
         Ok(s) => s,
-        Err((status, body)) => return respond(&mut client, status, "", &body).await,
+        Err((status, body)) => return answer(&mut client, cx.shared, slot, status, "", &body).await,
     };
+    let _slot = slot;
     if client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.is_err() {
-        return;
+        return cx.failed_after_allow(&allowed, "the client closed the connection before the tunnel was open").await;
     }
     if !extra.is_empty() && !write_within(&mut up, &extra, idle).await {
-        return;
+        let why = "the bytes the client sent ahead could not be written to the destination";
+        return cx.failed_after_allow(&allowed, why).await;
     }
-    tokio::select! {
-        _ = relay(&mut client, &mut up, idle, None) => {}
-        _ = cancel.cancelled() => {}
-    }
+    let end = tokio::select! {
+        end = relay(&mut client, &mut up, idle, None) => end,
+        _ = cancel.cancelled() => return,
+    };
+    // Once bytes have come from the destination, a failure cannot be told from a routine close.
+    let why = match end {
+        RelayEnd::Done(false) => "the tunnel closed".to_string(),
+        RelayEnd::Failed(why, false) => why.to_string(),
+        RelayEnd::Idle(false, after) => format!("the tunnel was idle for {}", human(after)),
+        RelayEnd::Done(true) | RelayEnd::Failed(_, true) | RelayEnd::Idle(true, _) | RelayEnd::BadUpstream(..) => return,
+    };
+    cx.failed_after_allow(&allowed, &format!("{why} before the destination sent a byte")).await;
 }
 
 /// Writes all of `bytes` within `idle`; false when the peer is gone or too slow.
@@ -1166,8 +1306,12 @@ struct Fwd {
     grace: Duration,
 }
 
+/// How a relay ended. The flag says whether anything from the destination had been sent to the client.
 enum RelayEnd {
-    Done,
+    /// Both sides are done (a forwarded request: the response ended).
+    Done(bool),
+    /// A peer failed, or the client sent too much: why.
+    Failed(&'static str, bool),
     /// No byte moved for the period given; whether anything had been sent to the client.
     Idle(bool, Duration),
     /// The destination's response was unusable; whether anything had been sent to the client.
@@ -1201,8 +1345,8 @@ impl Flow {
 enum Pump {
     /// Its source ended cleanly.
     Ended,
-    /// The relay must stop: a peer failed, or the client sent too much.
-    Stop,
+    /// The relay must stop: a peer failed, or the client sent too much; why.
+    Stop(&'static str),
     /// The destination's response was unusable.
     Bad(String),
 }
@@ -1231,7 +1375,7 @@ async fn upload(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, forwar
     loop {
         let n = match r.read(&mut buf).await {
             Ok(n) => n,
-            Err(_) => return Pump::Stop,
+            Err(_) => return Pump::Stop("the client's connection failed"),
         };
         flow.touch();
         if n == 0 {
@@ -1245,14 +1389,14 @@ async fn upload(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, forwar
         let take = if sending { budget.map_or(n, |b| usize::try_from(b).map_or(n, |b| b.min(n))) } else { 0 };
         discarded = discarded.saturating_add(n.saturating_sub(take));
         if discarded > MAX_DISCARD {
-            return Pump::Stop;
+            return Pump::Stop("the client sent more than 1 MiB past the request body");
         }
         if take == 0 {
             continue;
         }
         if write_counted(w, buf.get(..take).unwrap_or(&[]), flow).await.is_err() {
             if forward.is_none() {
-                return Pump::Stop;
+                return Pump::Stop("writing to the destination failed");
             }
             // The destination stopped reading; its answer may still come.
             sending = false;
@@ -1277,7 +1421,7 @@ async fn download(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, mut 
                 return Pump::Ended;
             }
             Ok(n) => n,
-            Err(_) => return Pump::Stop,
+            Err(_) => return Pump::Stop("the connection to the destination failed"),
         };
         flow.touch();
         let chunk = buf.get(..n).unwrap_or(&[]);
@@ -1293,7 +1437,7 @@ async fn download(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, mut 
         }
         flow.wrote.store(true, Ordering::Relaxed);
         if write_counted(w, &out, flow).await.is_err() {
-            return Pump::Stop;
+            return Pump::Stop("writing to the client failed");
         }
     }
 }
@@ -1343,18 +1487,19 @@ async fn relay(client: &mut TcpStream, up: &mut TcpStream, idle: Duration, forwa
         tokio::select! {
             r = &mut to_up, if up_open => match r {
                 Pump::Ended => up_open = false,
-                Pump::Stop | Pump::Bad(_) => return RelayEnd::Done,
+                Pump::Stop(why) => return RelayEnd::Failed(why, wrote()),
+                Pump::Bad(_) => return RelayEnd::Done(wrote()),
             },
             r = &mut to_client, if down_open => match r {
-                Pump::Ended if is_forward => return RelayEnd::Done,
+                Pump::Ended if is_forward => return RelayEnd::Done(wrote()),
                 Pump::Ended => down_open = false,
-                Pump::Stop => return RelayEnd::Done,
+                Pump::Stop(why) => return RelayEnd::Failed(why, wrote()),
                 Pump::Bad(why) => return RelayEnd::BadUpstream(why, wrote()),
             },
             after = &mut quiet => return RelayEnd::Idle(wrote(), after),
         }
     }
-    RelayEnd::Done
+    RelayEnd::Done(wrote())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1366,16 +1511,17 @@ async fn forward(
     policy: &Policy,
     authority: &str,
     path: &str,
+    slot: OwnedSemaphorePermit,
     cancel: CancellationToken,
 ) {
     let idle = cx.shared.limits.idle_timeout;
     let body = match body_kind(head) {
         Ok(b) => b,
-        Err(m) => return reject(&mut client, cx.shared, cx.session, head, &m).await,
+        Err(m) => return reject(&mut client, cx.shared, slot, cx.session, head, &m).await,
     };
-    let mut up = match open_upstream(cx, policy).await {
+    let (mut up, allowed) = match open_upstream(cx, policy).await {
         Ok(s) => s,
-        Err((status, text)) => return respond(&mut client, status, "", &text).await,
+        Err((status, text)) => return answer(&mut client, cx.shared, slot, status, "", &text).await,
     };
 
     let mut out: Vec<u8> = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", head.method, path, authority).into_bytes();
@@ -1403,22 +1549,32 @@ async fn forward(
     };
     out.extend_from_slice(already);
     if !write_within(&mut up, &out, idle).await {
-        let (status, text) = cx.unreachable("sending the request failed");
-        return respond(&mut client, status, "", &text).await;
+        let why = "sending the request to the destination failed";
+        cx.failed_after_allow(&allowed, why).await;
+        let (status, text) = cx.unreachable(why);
+        return answer(&mut client, cx.shared, slot, status, "", &text).await;
     }
 
     let fwd = Fwd { budget: owed, grace: cx.shared.limits.forward_grace };
     let end = tokio::select! {
         r = relay(&mut client, &mut up, idle, Some(fwd)) => r,
-        _ = cancel.cancelled() => RelayEnd::Done,
+        _ = cancel.cancelled() => return,
     };
-    let answer = match end {
-        RelayEnd::BadUpstream(why, false) => Some(cx.unreachable(&why)),
-        RelayEnd::Idle(false, after) => Some(cx.silent(after)),
-        _ => None,
+    let (why, reply) = match end {
+        RelayEnd::Done(_) => return,
+        RelayEnd::Failed(why, wrote) => {
+            let when = if wrote { "while the response was relayed" } else { "before the destination answered" };
+            (format!("{why} {when}"), None)
+        }
+        RelayEnd::BadUpstream(why, wrote) => (why.clone(), (!wrote).then(|| cx.unreachable(&why))),
+        RelayEnd::Idle(false, after) => {
+            (format!("the destination sent no response for {}", human(after)), Some(cx.silent(after)))
+        }
+        RelayEnd::Idle(true, after) => (format!("the destination's response stalled for {}", human(after)), None),
     };
-    if let Some((status, text)) = answer {
-        respond(&mut client, status, "", &text).await;
+    cx.failed_after_allow(&allowed, &why).await;
+    if let Some((status, text)) = reply {
+        answer(&mut client, cx.shared, slot, status, "", &text).await;
     }
 }
 
@@ -1553,6 +1709,12 @@ mod tests {
 
     fn connect_req(g: &SessionGrant, dest: &str) -> String {
         format!("CONNECT {dest} HTTP/1.1\r\nHost: {dest}\r\n{}\r\n", auth(g))
+    }
+
+    /// Asks the proxy on `port` for its verdict on `dest`; returns the status and the decision sent.
+    async fn check_on(port: u16, g: &SessionGrant, dest: &str, rx: &mut Rx) -> (u16, NetDecision) {
+        let r = raw(port, format!("{CHECK_METHOD} {dest} HTTP/1.1\r\n{}\r\n", auth(g)).as_bytes()).await;
+        (status(&r), decision(rx).await.1)
     }
 
     async fn read_until(s: &mut TcpStream, end: &str) -> String {
@@ -1722,8 +1884,10 @@ mod tests {
         let mut out = Vec::new();
         timeout(T, slow.read_to_end(&mut out)).await.unwrap().unwrap();
         assert_eq!(status(&String::from_utf8_lossy(&out)), 400);
+        let check = format!("{CHECK_METHOD} 127.0.0.1:9 HTTP/1.1\r\n\r\n");
+        assert_eq!(status(&raw(p.port(), check.as_bytes()).await), 407);
         let seen = lock(&seen).clone();
-        assert_eq!(seen.len(), 7, "{seen:?}");
+        assert_eq!(seen.len(), 8, "{seen:?}");
         assert!(seen.iter().all(|(_, d)| !d.allowed));
         let rule = |i: usize| seen[i].1.rule.as_str();
         assert_eq!(row(&seen[0]), (Some("s-aud"), "GET", "example.test", 443));
@@ -1739,6 +1903,8 @@ mod tests {
         assert!(rule(5).starts_with("bad request: the request head could not be parsed"), "{seen:?}");
         assert_eq!(row(&seen[6]), (None, "-", "-", 0));
         assert_eq!(rule(6), "bad request: no complete request head arrived within 300 ms");
+        // A check names its destination as `host:port`, like a CONNECT.
+        assert_eq!(row(&seen[7]), (None, CHECK_METHOD, "127.0.0.1", 9));
         // None of these reached the policy, so the sink gets none of them.
         no_more(&mut rx);
     }
@@ -1868,6 +2034,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipv6_forms_that_carry_a_private_ipv4_address_are_refused_by_name_and_as_literals() {
+        // NAT64 (both prefixes) and 6to4 forms of each address, each reachable through a name of its own.
+        let carried = |v4: &str| {
+            let n = u32::from(v4.parse::<std::net::Ipv4Addr>().unwrap());
+            [format!("64:ff9b::{v4}"), format!("64:ff9b:1::{v4}"), format!("2002:{:x}:{:x}::1", n >> 16, n & 0xffff)]
+        };
+        let teredo = "2001:0:4136:e378:8000:63bf:3fff:fdd2";
+        let mut table: Vec<(String, String)> = vec![("teredo.test".into(), teredo.into())];
+        for v4 in ["10.0.0.5", "127.0.0.1", "169.254.169.254", "8.8.8.8"] {
+            for (i, a) in carried(v4).into_iter().enumerate() {
+                table.push((format!("f{i}-{v4}.test"), a));
+            }
+        }
+        let names = table.clone();
+        let resolver: Resolver =
+            Arc::new(move |name: &str| names.iter().filter(|(n, _)| n == name).map(|(_, a)| a.parse().unwrap()).collect());
+        let (tx, mut rx) = unbounded_channel();
+        let p = Proxy::start_inner(0, tx, None, Limits::default(), Some(resolver)).await.unwrap();
+        let open = p.grant(&SessionId::from("s-c-open"), policy(NetworkMode::Open, &[], &[], &[]));
+        let al = p.grant(&SessionId::from("s-c-al"), policy(NetworkMode::Allowlist, &["*"], &[], &[]));
+        let listed = p.grant(&SessionId::from("s-c-ls"), policy(NetworkMode::Open, &[], &[], &["10.0.0.5", "8.8.8.8"]));
+        let deny = ["10.0.0.5", "8.8.8.0/24"];
+        let denied = p.grant(&SessionId::from("s-c-dn"), policy(NetworkMode::Open, &[], &deny, &["10.0.0.0/8"]));
+        for (name, addr) in &table {
+            let v4 = name.split_once('-').map_or("", |(_, rest)| rest.trim_end_matches(".test"));
+            let shown = addr.parse::<IpAddr>().unwrap().to_string();
+            for dest in [format!("{name}:443"), format!("[{addr}]:443")] {
+                for g in [&open, &al] {
+                    let (code, d) = check_on(p.port(), g, &dest, &mut rx).await;
+                    if v4 == "8.8.8.8" {
+                        assert_eq!(code, 200, "{dest}: {d:?}");
+                    } else {
+                        assert_eq!((code, d.rule), (403, format!("deny private-address {shown} (check only)")), "{dest}");
+                        assert_eq!(d.resolved.as_deref(), Some(shown.as_str()), "{dest}");
+                    }
+                }
+                let (code, d) = check_on(p.port(), &listed, &dest, &mut rx).await;
+                assert_eq!(code == 200, matches!(v4, "10.0.0.5" | "8.8.8.8"), "{dest}: {d:?}");
+                if v4 == "10.0.0.5" {
+                    assert_eq!(d.rule, "allow_private 10.0.0.5 (check only)", "{dest}");
+                }
+                let (code, d) = check_on(p.port(), &denied, &dest, &mut rx).await;
+                match v4 {
+                    "10.0.0.5" => assert_eq!((code, d.rule.as_str()), (403, "deny 10.0.0.5 (check only)"), "{dest}"),
+                    "8.8.8.8" => assert_eq!((code, d.rule.as_str()), (403, "deny 8.8.8.0/24 (check only)"), "{dest}"),
+                    _ => assert_eq!(code, 403, "{dest}: {d:?}"),
+                }
+            }
+        }
+        // A real connection through a name to such an address is refused before connecting.
+        let r = raw(p.port(), connect_req(&open, "f2-127.0.0.1.test:443").as_bytes()).await;
+        assert_eq!(status(&r), 403, "{r}");
+        assert_eq!(decision(&mut rx).await.1.rule, "deny private-address 2002:7f00:1::1");
+        no_more(&mut rx);
+    }
+
+    #[tokio::test]
     async fn name_lookups_are_bounded_per_session_and_in_all() {
         use std::sync::atomic::AtomicUsize;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1933,6 +2156,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_check_answers_the_verdict_and_the_rule_without_connecting() {
+        let resolver: Resolver = Arc::new(|name: &str| match name {
+            "lab.test" => vec!["127.0.0.1".parse().unwrap()],
+            _ => Vec::new(),
+        });
+        let (tx, mut rx) = unbounded_channel();
+        let p = Proxy::start_inner(0, tx, None, Limits::default(), Some(resolver)).await.unwrap();
+        let sid = SessionId::from("s-check");
+        let g = p.grant(&sid, policy(NetworkMode::Open, &[], &["blocked.test"], &["127.0.0.1"]));
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let ask = |target: String| format!("{CHECK_METHOD} {target} HTTP/1.1\r\n{}\r\n", auth(&g));
+        let rule = |r: &str| r.lines().find_map(|l| l.strip_prefix("X-Loom-Rule: ")).map(str::to_string);
+        // Allowed, as host:port and as the absolute URI an HTTP client sends; nothing connects.
+        for target in [format!("lab.test:{port}"), format!("http://lab.test:{port}/")] {
+            let r = raw(p.port(), ask(target).as_bytes()).await;
+            assert_eq!(status(&r), 200, "{r}");
+            assert!(r.contains("X-Loom-Proxy: 1\r\n"), "{r}");
+            assert_eq!(rule(&r).as_deref(), Some("allow_private 127.0.0.1"), "{r}");
+            let (who, d) = decision(&mut rx).await;
+            assert_eq!((who, d.method.as_str(), d.allowed), (sid.clone(), CHECK_METHOD, true));
+            assert_eq!((d.rule.as_str(), d.resolved.as_deref()), ("allow_private 127.0.0.1 (check only)", Some("127.0.0.1")));
+        }
+        assert!(timeout(Duration::from_millis(200), l.accept()).await.is_err(), "a check connected to the destination");
+        // Refused, with the refusal text and the rule.
+        let r = raw(p.port(), ask("blocked.test:443".into()).as_bytes()).await;
+        assert_eq!(status(&r), 403, "{r}");
+        assert_eq!(rule(&r).as_deref(), Some("deny blocked.test"), "{r}");
+        assert!(r.contains("refused by rule `deny blocked.test`"), "{r}");
+        assert_eq!(decision(&mut rx).await.1.rule, "deny blocked.test (check only)");
+        // A name that does not resolve.
+        let r = raw(p.port(), ask("nowhere.test:443".into()).as_bytes()).await;
+        assert_eq!(status(&r), 502, "{r}");
+        let (_, d) = decision(&mut rx).await;
+        assert!(d.allowed && d.rule.starts_with("mode open (unreachable: ") && d.rule.ends_with("(check only)"), "{d:?}");
+        // A check needs the session's credentials like any request.
+        let r = raw(p.port(), format!("{CHECK_METHOD} blocked.test:443 HTTP/1.1\r\n\r\n").as_bytes()).await;
+        assert_eq!(status(&r), 407, "{r}");
+        no_more(&mut rx);
+    }
+
+    #[tokio::test]
     async fn set_policy_changes_what_the_same_credentials_may_reach() {
         let (p, mut rx) = start().await;
         let sid = SessionId::from("s-sp");
@@ -1973,6 +2238,91 @@ mod tests {
         assert!(d.rule.starts_with("allow_private 127.0.0.1 (unreachable: "), "{}", d.rule);
         assert_eq!(d.resolved.as_deref(), Some("127.0.0.1"));
         no_more(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_an_allow_is_recorded_after_it_in_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net.jsonl");
+        let (writer, file) = (Arc::new(crate::netlog::NetLogWriter::new()), path.clone());
+        // Allows announce themselves and are slow to record, so that what a peer does meanwhile has
+        // happened when the proxy goes on.
+        let (allowing, mut allows) = unbounded_channel::<String>();
+        let audit: AuditFn = Arc::new(move |_: Option<&SessionId>, d: &NetDecision| {
+            if d.allowed && !d.rule.contains("(failed after the allow: ") {
+                let _ = allowing.send(d.method.clone());
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            writer.append(&file, d)
+        });
+        let (tx, _rx) = unbounded_channel();
+        let p = Proxy::start_inner(0, tx, Some(audit), Limits::default(), None).await.unwrap();
+        let g = p.grant(&SessionId::from("s-after"), lab());
+        let lines = |n: usize| {
+            let path = path.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + T;
+                loop {
+                    let text = std::fs::read_to_string(&path).unwrap_or_default();
+                    if text.lines().count() >= n {
+                        return text;
+                    }
+                    assert!(tokio::time::Instant::now() < deadline, "not recorded: {text}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        // A destination that resets each connection as soon as it has accepted it.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                s.set_zero_linger().unwrap();
+            }
+        });
+        // A forwarded request: the destination is gone before the request head can be written to it.
+        let r = raw(p.port(), format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await;
+        assert_eq!(status(&r), 502, "{r}");
+        assert_eq!(timeout(T, allows.recv()).await.unwrap().as_deref(), Some("GET"));
+        // A tunnel whose client resets while its allow is being recorded, before the proxy can answer.
+        let echo = echo_server().await;
+        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        assert_eq!(timeout(T, allows.recv()).await.unwrap().as_deref(), Some("CONNECT"));
+        s.set_zero_linger().unwrap();
+        drop(s);
+        lines(4).await;
+        // A tunnel whose destination resets before it sends a byte, while the client stays.
+        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        s.write_all(connect_req(&g, &format!("127.0.0.1:{port}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
+        let mut rest = Vec::new();
+        let _ = timeout(T, s.read_to_end(&mut rest)).await.unwrap();
+        assert!(rest.is_empty(), "{rest:?}");
+        lines(6).await;
+        // A tunnel both sides close before the destination sent a byte.
+        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
+        s.shutdown().await.unwrap();
+        let _ = timeout(T, s.read_to_end(&mut rest)).await.unwrap();
+        let text = lines(8).await;
+        assert_eq!(crate::netlog::verify(&text), Ok(()));
+        let rows: Vec<NetDecision> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let rules: Vec<(&str, bool, &str)> = rows.iter().map(|d| (d.method.as_str(), d.allowed, d.rule.as_str())).collect();
+        assert_eq!(rules.len(), 8, "{rules:?}");
+        let failures = [
+            ("GET", "sending the request to the destination failed"),
+            ("CONNECT", "the client closed the connection before the tunnel was open"),
+            ("CONNECT", "the connection to the destination failed before the destination sent a byte"),
+            ("CONNECT", "the tunnel closed before the destination sent a byte"),
+        ];
+        for (i, (method, why)) in failures.into_iter().enumerate() {
+            assert_eq!(rules[2 * i], (method, true, "allow_private 127.0.0.1"), "{rules:?}");
+            let failed = format!("allow_private 127.0.0.1 (failed after the allow: {why})");
+            assert_eq!(rules[2 * i + 1], (method, true, failed.as_str()), "{rules:?}");
+            assert_eq!(rows[2 * i + 1].resolved.as_deref(), Some("127.0.0.1"));
+        }
     }
 
     #[tokio::test]
@@ -2131,10 +2481,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connections_the_proxy_has_answered_itself_do_not_hold_their_slot() {
+        let echo = echo_server().await;
+        let limits = Limits { max_connections: 2, ..Limits::default() };
+        let (p, _rx, _seen) = start_audited(false, limits, None).await;
+        let g = p.grant(&SessionId::from("s-drain"), lab());
+        // Each client reads its answer (407, 400, 403) and keeps the connection open, so the proxy is
+        // left waiting for it to close.
+        let mut held = Vec::new();
+        let requests = [
+            "CONNECT 127.0.0.1:9 HTTP/1.1\r\n\r\n".to_string(),
+            "garbage\r\n\r\n".to_string(),
+            connect_req(&g, "127.0.0.1:1"),
+            connect_req(&p.grant(&SessionId::from("s-drain-2"), policy(NetworkMode::DenyAll, &[], &[], &[])), "x.test:1"),
+        ];
+        for req in requests.iter().cycle().take(12) {
+            let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+            s.write_all(req.as_bytes()).await.unwrap();
+            let head = read_until(&mut s, "\r\n\r\n").await;
+            assert!(matches!(status(&head), 400 | 403 | 407 | 502), "{head}");
+            held.push(s);
+        }
+        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
+    }
+
+    #[tokio::test]
     async fn idle_tunnels_and_idle_forwards_are_closed() {
         let idle = Duration::from_secs(1);
         let limits = Limits { idle_timeout: idle, ..Limits::default() };
-        let (p, _rx, _seen) = start_audited(false, limits, None).await;
+        let (p, _rx, seen) = start_audited(false, limits, None).await;
         let g = p.grant(&SessionId::from("s-idle"), lab());
         // A tunnel to a peer that never speaks (and would hold its side open for a minute).
         let (port, server) = silent_server().await;
@@ -2149,6 +2526,10 @@ mod tests {
         assert!(waited >= idle - Duration::from_millis(100) && waited < Duration::from_secs(3), "{waited:?}");
         let (_, closed) = timeout(T, server).await.unwrap().unwrap();
         assert!(closed.is_some_and(|at| at.duration_since(started) < Duration::from_secs(3)));
+        // Nothing came from the destination, so the allow is followed by a record that says so.
+        let rules: Vec<String> = lock(&seen).iter().map(|(_, d)| d.rule.clone()).collect();
+        let idled = "(failed after the allow: the tunnel was idle for 1 second before the destination sent a byte)";
+        assert_eq!(rules, ["allow_private 127.0.0.1".to_string(), format!("allow_private 127.0.0.1 {idled}")]);
         // A forwarded request whose upstream never answers gets a 504 that says so.
         let (port, server) = silent_server().await;
         let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));

@@ -3046,8 +3046,9 @@ impl Runtime {
             return Err(no_session(id));
         }
         let path = self.inner.paths.session_dir(id).join("net.jsonl");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
+        // Lossy, so an append torn inside a character does not hide the lines before it.
+        let text = match std::fs::read(&path) {
+            Ok(t) => String::from_utf8_lossy(&t).into_owned(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
@@ -3056,6 +3057,9 @@ impl Runtime {
                 "The egress audit log {} is damaged at {b}. Do not trust it: it was edited, truncated or written by something else. Keep a copy for review and move it aside to start a new chain.",
                 path.display()
             ));
+        }
+        if let Some(torn) = loom_net::netlog::torn_tail(&text) {
+            tracing::warn!("the egress audit log {} ends in a torn append: {torn}", path.display());
         }
         let mut entries: Vec<NetEntry> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
         if entries.len() > limit {
@@ -3652,6 +3656,10 @@ mod tests {
         assert_eq!(hosts, ["old.test", "a.test", "b.test"]);
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("\"prev\"").count(), 2);
+        // An append torn by a crash, here inside a character, does not hide the lines before it.
+        std::fs::write(&path, [text.as_bytes(), &"{\"rule\":\"…".as_bytes()[..10]].concat()).unwrap();
+        let hosts: Vec<String> = e.rt.net(&id, 10).unwrap().into_iter().map(|n| n.decision.host).collect();
+        assert_eq!(hosts, ["old.test", "a.test", "b.test"]);
         // A modified line is reported, not served.
         std::fs::write(&path, text.replace("a.test", "z.test")).unwrap();
         let err = e.rt.net(&id, 10).unwrap_err();

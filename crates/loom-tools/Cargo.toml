@@ -8,6 +8,7 @@ description = "loom: tool execution pipeline, built-in tools, process control, s
 
 [dependencies]
 loom-core.workspace = true
+loom-net.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

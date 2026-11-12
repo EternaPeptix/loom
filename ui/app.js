@@ -1226,15 +1226,18 @@ function numItem(label, value) {
 }
 
 function renderNetwork(p) {
-  if (S.netError && S.net.length === 0) return p.replaceChildren(el("p", "dim", S.netError));
-  if (S.net.length === 0) return p.replaceChildren(el("p", "dim", "No network decisions recorded for this session."));
+  // A failed load (a damaged audit log among them) stays in view next to the decisions that arrive live.
+  const error = S.netError ? [el("p", "error", S.netError)] : [];
+  if (S.net.length === 0) {
+    return p.replaceChildren(...(error.length ? error : [el("p", "dim", "No network decisions recorded for this session.")]));
+  }
   const t = el("table", "net");
   for (const e of S.net.slice(-500).reverse().map(C.netRow)) {
     const tr = el("tr", e.verdict);
     add(tr, el("td", "", clock(e.ts)), el("td", "", e.verdict), el("td", "", e.method), el("td", "", e.target), el("td", "", e.rule));
     t.append(tr);
   }
-  p.replaceChildren(t);
+  p.replaceChildren(...error, t);
 }
 
 function budgetWords(b) {
