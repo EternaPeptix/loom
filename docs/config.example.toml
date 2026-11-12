@@ -9,7 +9,7 @@ bind = "127.0.0.1:7878"   # the API and web UI; must be loopback
 proxy_port = 0            # egress proxy on 127.0.0.1; 0 = pick a free port
 
 [models.dsv41]
-base_url = "http://spark-one.tail91699.ts.net:8000/v1"
+base_url = "http://your-server.local:8000/v1"
 model = "dsv41"
 # context_window is discovered from the server's /models (max_model_len) when omitted.
 max_output_tokens = 32768

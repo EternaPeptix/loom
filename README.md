@@ -102,13 +102,45 @@ assignment, returns quoted evidence), `verifier` (read-only; tries to refute a c
 plain turn-by-turn assistant). Domain discipline — say, a research pipeline with its own stages and
 evidence tiers — is a pack, not core.
 
-## Status
+## Running
 
-The engine is built and tested: `loom-core`, `loom-model`, `loom-tools`, `loom-net`, the whole
-`loom-agent` session loop and runtime tools, the daemon's client, command line, terminal rendering
-and access control, and the web UI. The live client check against the target server
-(`cargo run -p loom-model --example live`) confirms the caching behaviour the design turns on. The
-HTTP server and the daemon lifecycle are the last pieces being wired in.
+```
+loom daemon                               # start the long-lived local process
+loom config init                          # write a starting ~/.loom/config.toml, then edit base_url
+loom run -w /path/to/workspace "your task in one sentence"
+loom ls                                   # sessions, their state and context size
+loom tail <session-id>                    # follow a session's transcript
+loom inbox                                # questions, approvals and blockers waiting for you
+loom answer <item-id> "…"                 # answer one
+```
+
+The daemon binds `127.0.0.1` and every request carries a bearer token, so it is reachable only from
+the machine it runs on. To reach a daemon on another host (the usual case — the daemon runs where the
+model and the work are), forward the port over SSH:
+
+```
+ssh -N -L 7878:127.0.0.1:7878 your-host  # then loom/the UI talk to 127.0.0.1:7878
+```
+
+`docs/RUN.md` is the full first-run runbook; `docs/REVIEW-COVERAGE.md` records, finding by finding
+with live session evidence, what loom does about the problems its audit turned up.
+
+## Seeing it: the web UI and the desktop app
+
+The daemon serves a web UI at `/` (three columns — missions, the live transcript, and the mission
+state: ledger, context window with each item's standing, inbox, network decisions). It is static,
+strict-CSP, no build step, and updates live over SSE.
+
+**loom-desk** (`gui/`) is a small native desktop app around that UI, for leaving missions running and
+glancing at them. It manages connections (a named host, an SSH tunnel it opens for you, the token it
+fetches), shows running and waiting counts in the menu bar, and raises an OS notification the moment a
+mission needs you. See `gui/README.md`.
+
+## Packs
+
+A pack is a set of roles. `core` (built in) is general. `vr` (`packs/vr/`) is a vulnerability-research
+pipeline — scope gate, evidence tiers, threads with verdicts, a report-readiness gate — expressed as
+native roles, ledger records and hooks rather than a plugin over a transcript.
 
 ## Building
 
