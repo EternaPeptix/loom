@@ -118,6 +118,8 @@ enum Fail {
     Io(std::io::Error),
     NotRegular(FileType),
     TooLarge(u64),
+    /// The file was within the cap when opened but grew past it (the cap) while being read.
+    Grew(u64),
     Cancelled,
 }
 
@@ -199,7 +201,7 @@ fn read_open(mut file: File, len: u64, cap: u64, cancel: &CancellationToken) -> 
         };
         bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
         if bytes.len() as u64 > cap {
-            return Err(Fail::TooLarge(bytes.len() as u64));
+            return Err(Fail::Grew(cap));
         }
     }
     Ok(bytes)
@@ -250,6 +252,9 @@ fn fail_output(fail: Fail, given: &str, tool: &str, advice: &str) -> ToolOutput 
         Fail::NotRegular(kind) => not_regular(given, tool, &kind),
         Fail::TooLarge(n) => ToolOutput::error(format!(
             "{given} is {n} bytes, above the {READ_CAP} byte limit `{tool}` loads into memory. {advice}"
+        )),
+        Fail::Grew(cap) => ToolOutput::error(format!(
+            "{given} grew while it was being read and is now above the {cap} byte limit `{tool}` loads into memory. {advice}"
         )),
         Fail::Cancelled => cancelled(tool),
     }
@@ -742,7 +747,7 @@ fn write_file(ctx: &ToolCtx, given: &str, path: &Path, content: &str) -> Worked 
     let old = if fresh == Freshness::Current {
         match read_bounded(path, READ_CAP, &ctx.cancel) {
             Ok(b) => Some(b),
-            Err(Fail::TooLarge(_)) => {
+            Err(Fail::TooLarge(_) | Fail::Grew(_)) => {
                 diff_omitted = true;
                 None
             }
@@ -957,6 +962,18 @@ mod tests {
 
     fn numbered_file(n: usize) -> String {
         (1..=n).map(|i| format!("row {i}\n")).collect()
+    }
+
+    #[test]
+    fn a_file_that_grows_during_the_read_names_the_limit_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("grow.txt");
+        std::fs::write(&p, vec![b'x'; 100]).unwrap();
+        // The size seen at open time (1) was within the cap (10); the read finds more.
+        let fail = read_open(File::open(&p).unwrap(), 1, 10, &CancellationToken::new()).unwrap_err();
+        let Body::Message(text) = fail_output(fail, "grow.txt", "read", "Use a range.").body else { panic!("not a message") };
+        assert!(text.contains("grew while it was being read") && text.contains("above the 10 byte limit"), "{text}");
+        assert!(!text.contains("is 11 bytes") && !text.contains(&READ_CAP.to_string()), "{text}");
     }
 
     #[tokio::test]

@@ -51,6 +51,13 @@
 //! two parallel tool calls with interleaved argument pieces; missing ids; duplicate ids; empty
 //! arguments; arguments cut by `length` (complete == false); usage-only final chunk; error object;
 //! early end.
+//!
+//! ## Limits
+//! A misbehaving server cannot make the client buffer without bound. `SseParser::feed` fails with
+//! `AssembleError::Oversize` for one line above `MAX_LINE_BYTES` (8 MiB) and for one event whose data
+//! lines add up to more than `MAX_EVENT_BYTES` (16 MiB); `Assembler::push` fails the same way when the
+//! accumulated content, the reasoning, or the tool-call names and arguments together pass
+//! `MAX_COMPLETION_BYTES` (64 MiB) each. The parser is unusable after such an error.
 
 use loom_core::event::{FinishReason, Timing, ToolCallRequest, Usage};
 use loom_core::CallId;
@@ -93,16 +100,34 @@ pub enum AssembleError {
     Server(String),
     #[error("unreadable stream chunk: {0}")]
     Malformed(String),
+    #[error("the stream is too large: {0}")]
+    Oversize(String),
     #[error("the stream ended before the response was finished")]
     Incomplete,
+}
+
+/// Longest single line of an event stream (8 MiB).
+pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// Largest single event: its `data:` lines together (16 MiB).
+pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
+/// Most bytes of content, of reasoning, and of tool-call names and arguments one completion may accumulate (64 MiB each).
+pub const MAX_COMPLETION_BYTES: usize = 64 * 1024 * 1024;
+
+fn oversize(what: &str, limit: usize) -> AssembleError {
+    AssembleError::Oversize(format!(
+        "{what} exceeds the limit of {} MiB",
+        limit / (1024 * 1024)
+    ))
 }
 
 #[derive(Debug, Default)]
 pub struct SseParser {
     /// Bytes of the line being received (no complete line is ever kept here).
     buf: Vec<u8>,
-    /// `data:` values of the event being received.
-    data: Vec<String>,
+    /// `data:` values of the event being received, joined with `\n`.
+    data: String,
+    /// Whether the event being received has any `data:` line (its payload may still be empty).
+    has_data: bool,
 }
 
 impl SseParser {
@@ -110,14 +135,28 @@ impl SseParser {
         SseParser::default()
     }
 
-    /// Feed bytes; get the data payloads of the events they complete.
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+    /// Feed bytes; get the data payloads of the events they complete. A line or an event above its limit
+    /// is an `Oversize` error and the buffers are released.
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<String>, AssembleError> {
+        let result = self.feed_inner(chunk);
+        if result.is_err() {
+            self.buf = Vec::new();
+            self.data = String::new();
+            self.has_data = false;
+        }
+        result
+    }
+
+    fn feed_inner(&mut self, chunk: &[u8]) -> Result<Vec<String>, AssembleError> {
         let mut out = Vec::new();
         self.buf.extend_from_slice(chunk);
         let mut start = 0usize;
         while let Some(rel) = self.buf.get(start..).and_then(|rest| rest.iter().position(|&b| b == b'\n')) {
             let end = start + rel;
             let mut line = self.buf.get(start..end).unwrap_or_default();
+            if line.len() > MAX_LINE_BYTES {
+                return Err(oversize("a line of the event stream", MAX_LINE_BYTES));
+            }
             if let Some(stripped) = line.strip_suffix(b"\r") {
                 line = stripped;
             }
@@ -125,20 +164,32 @@ impl SseParser {
             let line = String::from_utf8_lossy(line).into_owned();
             start = end + 1;
             if line.is_empty() {
-                if !self.data.is_empty() {
-                    let payload = self.data.join("\n");
-                    self.data.clear();
+                if self.has_data {
+                    let payload = std::mem::take(&mut self.data);
+                    self.has_data = false;
                     if !payload.is_empty() {
                         out.push(payload);
                     }
                 }
             } else if let Some(value) = line.strip_prefix("data:") {
-                self.data.push(value.strip_prefix(' ').unwrap_or(value).to_string());
+                let value = value.strip_prefix(' ').unwrap_or(value);
+                let separator = usize::from(self.has_data);
+                if self.data.len().saturating_add(separator).saturating_add(value.len()) > MAX_EVENT_BYTES {
+                    return Err(oversize("an event of the event stream", MAX_EVENT_BYTES));
+                }
+                if self.has_data {
+                    self.data.push('\n');
+                }
+                self.data.push_str(value);
+                self.has_data = true;
             }
             // Comments (`:`) and every other field are ignored.
         }
         self.buf.drain(..start);
-        out
+        if self.buf.len() > MAX_LINE_BYTES {
+            return Err(oversize("a line of the event stream", MAX_LINE_BYTES));
+        }
+        Ok(out)
     }
 }
 
@@ -160,6 +211,16 @@ pub struct Assembler {
     finish: Option<FinishReason>,
     usage: Usage,
     done: bool,
+    /// Bytes of tool-call names and arguments accumulated (a new call counts `CALL_OVERHEAD`).
+    call_bytes: usize,
+}
+
+/// What an empty tool-call entry is counted as, so that endless new indices are bounded too.
+const CALL_OVERHEAD: usize = 64;
+
+/// `used + add` if it stays within `MAX_COMPLETION_BYTES`.
+fn grow(used: usize, add: usize, what: &str) -> Result<usize, AssembleError> {
+    used.checked_add(add).filter(|n| *n <= MAX_COMPLETION_BYTES).ok_or_else(|| oversize(what, MAX_COMPLETION_BYTES))
 }
 
 fn str_member<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -211,7 +272,7 @@ impl Assembler {
         let mut events = Vec::new();
         if let Some(choice) = v.get("choices").and_then(|c| c.get(0)) {
             if let Some(delta) = choice.get("delta") {
-                self.apply_delta(delta, &mut events);
+                self.apply_delta(delta, &mut events)?;
             }
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
                 self.finish = Some(match reason {
@@ -232,8 +293,9 @@ impl Assembler {
         Ok(events)
     }
 
-    fn apply_delta(&mut self, delta: &Value, events: &mut Vec<StreamEvent>) {
+    fn apply_delta(&mut self, delta: &Value, events: &mut Vec<StreamEvent>) -> Result<(), AssembleError> {
         if let Some(s) = str_member(delta, "content").filter(|s| !s.is_empty()) {
+            grow(self.text.len(), s.len(), "the response content")?;
             self.text.push_str(s);
             events.push(StreamEvent::Text(s.to_string()));
         }
@@ -241,10 +303,11 @@ impl Assembler {
         let b = str_member(delta, "reasoning_content");
         let pieces: &[Option<&str>] = if a.is_some() && a == b { &[a] } else { &[a, b] };
         for s in pieces.iter().flatten().filter(|s| !s.is_empty()) {
+            grow(self.reasoning.len(), s.len(), "the response reasoning")?;
             self.reasoning.push_str(s);
             events.push(StreamEvent::Reasoning((*s).to_string()));
         }
-        let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) else { return };
+        let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) else { return Ok(()) };
         for (pos, tc) in calls.iter().enumerate() {
             let index = tc
                 .get("index")
@@ -260,12 +323,19 @@ impl Assembler {
                     events.push(StreamEvent::ToolCallReady { index: *i, id, name, arguments });
                 }
             }
+            if !self.calls.contains_key(&index) {
+                self.call_bytes = grow(self.call_bytes, CALL_OVERHEAD, "the tool-call arguments")?;
+            }
             let acc = self.calls.entry(index).or_default();
             if acc.id.is_none() {
-                acc.id = str_member(tc, "id").filter(|s| !s.is_empty()).map(str::to_string);
+                if let Some(id) = str_member(tc, "id").filter(|s| !s.is_empty()) {
+                    self.call_bytes = grow(self.call_bytes, id.len(), "the tool-call arguments")?;
+                    acc.id = Some(id.to_string());
+                }
             }
             let function = tc.get("function");
             if let Some(name) = function.and_then(|f| str_member(f, "name")).filter(|s| !s.is_empty()) {
+                self.call_bytes = grow(self.call_bytes, name.len(), "the tool-call arguments")?;
                 acc.name.push_str(name);
                 if !acc.started {
                     acc.started = true;
@@ -273,10 +343,12 @@ impl Assembler {
                 }
             }
             if let Some(args) = function.and_then(|f| str_member(f, "arguments")).filter(|s| !s.is_empty()) {
+                self.call_bytes = grow(self.call_bytes, args.len(), "the tool-call arguments")?;
                 acc.arguments.push_str(args);
                 events.push(StreamEvent::ToolCallArgs { index, delta: args.to_string() });
             }
         }
+        Ok(())
     }
 
     /// True once `[DONE]` or a `finish_reason` has been seen.
@@ -369,7 +441,7 @@ mod tests {
 
     fn feed_all(chunks: &[&[u8]]) -> Vec<String> {
         let mut p = SseParser::new();
-        chunks.iter().flat_map(|c| p.feed(c)).collect()
+        chunks.iter().flat_map(|c| p.feed(c).unwrap()).collect()
     }
 
     fn sample_stream() -> (Vec<u8>, Vec<String>) {
@@ -398,7 +470,7 @@ mod tests {
     fn parser_one_byte_chunks() {
         let (bytes, payloads) = sample_stream();
         let mut p = SseParser::new();
-        let got: Vec<String> = bytes.chunks(1).flat_map(|c| p.feed(c)).collect();
+        let got: Vec<String> = bytes.chunks(1).flat_map(|c| p.feed(c).unwrap()).collect();
         assert_eq!(got, payloads);
     }
 
@@ -416,7 +488,7 @@ mod tests {
                 seed ^= seed << 17;
                 let n = usize::try_from(seed % 40).unwrap_or(1) + 1;
                 let (head, tail) = rest.split_at(n.min(rest.len()));
-                got.extend(p.feed(head));
+                got.extend(p.feed(head).unwrap());
                 rest = tail;
             }
             assert_eq!(got, payloads);
@@ -447,8 +519,115 @@ mod tests {
     #[test]
     fn parser_incomplete_event_is_held_back() {
         let mut p = SseParser::new();
-        assert!(p.feed(b"data: partial\n").is_empty());
-        assert_eq!(p.feed(b"\n"), vec!["partial"]);
+        assert!(p.feed(b"data: partial\n").unwrap().is_empty());
+        assert_eq!(p.feed(b"\n").unwrap(), vec!["partial"]);
+    }
+
+    #[test]
+    fn parser_refuses_an_endless_line_after_bounded_buffering() {
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut p = SseParser::new();
+        let mut fed = 0usize;
+        let err = loop {
+            fed += chunk.len();
+            match p.feed(&chunk) {
+                Ok(out) => assert!(out.is_empty()),
+                Err(e) => break e,
+            }
+            assert!(p.buf.len() <= MAX_LINE_BYTES, "held {} bytes", p.buf.len());
+            assert!(fed <= MAX_LINE_BYTES + chunk.len(), "no error after {fed} bytes");
+        };
+        assert!(matches!(&err, AssembleError::Oversize(m) if m.contains("a line") && m.contains("8 MiB")), "{err}");
+        assert!(fed > MAX_LINE_BYTES && p.buf.is_empty());
+        // One chunk holding a whole oversized line is refused as well.
+        let mut p = SseParser::new();
+        let mut big = vec![b'y'; MAX_LINE_BYTES + 1];
+        big.push(b'\n');
+        assert!(matches!(p.feed(&big), Err(AssembleError::Oversize(_))));
+    }
+
+    #[test]
+    fn parser_refuses_an_endless_event_after_bounded_buffering() {
+        let line = format!("data: {}\n", "y".repeat(1000));
+        let chunk = line.repeat(64).into_bytes();
+        let mut p = SseParser::new();
+        let mut fed = 0usize;
+        let err = loop {
+            fed += chunk.len();
+            match p.feed(&chunk) {
+                Ok(out) => assert!(out.is_empty()),
+                Err(e) => break e,
+            }
+            assert!(p.data.len() <= MAX_EVENT_BYTES && p.buf.len() <= chunk.len(), "held {} + {}", p.data.len(), p.buf.len());
+            assert!(fed <= MAX_EVENT_BYTES + chunk.len(), "no error after {fed} bytes");
+        };
+        assert!(matches!(&err, AssembleError::Oversize(m) if m.contains("an event") && m.contains("16 MiB")), "{err}");
+        assert!(p.data.capacity() == 0 && !p.has_data);
+        // Events that do end do not add up.
+        let mut p = SseParser::new();
+        let ended = format!("{line}\n").repeat(64).into_bytes();
+        for _ in 0..1000 {
+            assert_eq!(p.feed(&ended).unwrap().len(), 64);
+        }
+    }
+
+    #[test]
+    fn parser_memory_for_an_endless_event_of_tiny_lines_is_bounded() {
+        // Empty `data:` lines cost one byte each in the single event buffer, not an allocation each.
+        let chunk = "data:\n".repeat(64 * 1024).into_bytes();
+        let mut p = SseParser::new();
+        let mut fed = 0usize;
+        let err = loop {
+            fed += chunk.len();
+            match p.feed(&chunk) {
+                Ok(out) => assert!(out.is_empty()),
+                Err(e) => break e,
+            }
+            assert!(p.data.capacity() <= 2 * MAX_EVENT_BYTES, "capacity {}", p.data.capacity());
+            assert!(fed <= 8 * MAX_EVENT_BYTES, "no error after {fed} bytes");
+        };
+        assert!(matches!(&err, AssembleError::Oversize(m) if m.contains("an event")), "{err}");
+    }
+
+    #[test]
+    fn assembler_counts_tool_call_ids_toward_the_limit() {
+        let id = "i".repeat(1024 * 1024);
+        let mut a = Assembler::new();
+        let mut accepted = 0usize;
+        let err = loop {
+            let delta = format!(r#"{{"tool_calls":[{{"index":{accepted},"id":"{id}"}}]}}"#);
+            match a.push(&chunk(&delta, "null")) {
+                Ok(_) => accepted += 1,
+                Err(e) => break e,
+            }
+            assert!(accepted <= 70, "no error after {accepted} ids");
+        };
+        assert!(accepted <= 64 && matches!(err, AssembleError::Oversize(_)), "{accepted} {err}");
+    }
+
+    #[test]
+    fn assembler_refuses_a_completion_over_the_limit() {
+        let piece = "z".repeat(1024 * 1024);
+        let deltas = [
+            (r#"{"content":"P"}"#, "the response content"),
+            (r#"{"reasoning":"P"}"#, "the response reasoning"),
+            (r#"{"tool_calls":[{"index":0,"function":{"name":"n","arguments":"P"}}]}"#, "the tool-call arguments"),
+        ];
+        for (delta, what) in deltas {
+            let payload = chunk(&delta.replace('P', &piece), "null");
+            let mut a = Assembler::new();
+            let mut accepted = 0usize;
+            let err = loop {
+                match a.push(&payload) {
+                    Ok(_) => accepted += 1,
+                    Err(e) => break e,
+                }
+                assert!(accepted <= 64, "{what}: no error after {accepted} MiB");
+            };
+            assert!((63..=64).contains(&accepted), "{what}: {accepted}");
+            assert!(matches!(&err, AssembleError::Oversize(m) if m.contains(what) && m.contains("64 MiB")), "{what}: {err}");
+            assert!(a.text.len() <= MAX_COMPLETION_BYTES && a.reasoning.len() <= MAX_COMPLETION_BYTES && a.call_bytes <= MAX_COMPLETION_BYTES);
+        }
     }
 
     // ---- Assembler ----
@@ -758,7 +937,7 @@ mod tests {
         let mut p = SseParser::new();
         let mut a = Assembler::new();
         for b in bytes.chunks(3) {
-            for payload in p.feed(b) {
+            for payload in p.feed(b).unwrap() {
                 a.push(&payload).unwrap();
             }
         }

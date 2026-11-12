@@ -14,7 +14,9 @@
 //! `pattern` is matched (`globset`, `literal_separator` on, so `*` does not cross `/`) against each
 //! file's path relative to the search root; a pattern without `/` also matches against the file
 //! name alone (`*.rs` finds files at any depth). Output: one relative path per line, most recently
-//! modified first (ties by path), as `Body::Raw` — so a long list is stored whole and admitted.
+//! modified first (ties by path), as `Body::Raw`. At most `cfg.search_max_results` paths and `MAX_BODY_BYTES` of body are kept; a cut result
+//! carries a `Showing N of [at least] M files found` notice at both ends (the totals keep counting; "at least"
+//! when the search was interrupted).
 //! Outcome `{n} files`; with no match: outcome `no match` and a body that says how many files were
 //! searched and, when `hidden`/`no_ignore` were not set and would have changed the result, how many
 //! more match with them.
@@ -27,8 +29,12 @@
 //! few), and the result says the search is not complete and to search it with `bash`. Cancellation is
 //! checked between files. Files are visited in path order. Output as `Body::Raw`:
 //! - default: `path:line:text` per match; with `context` > 0 (at most 20), context lines are
-//!   `path-line-text` and groups are separated by `--`;
+//!   `path-line-text` and groups are separated by `--`; matching lines past the bound inside the context of
+//!   the last kept match keep their `:` marker;
 //! - `files_only`: one path per line with its match count, `path (n)`.
+//!   At most `cfg.search_max_results` entries (matching lines, or files for `files_only`) and
+//!   `MAX_BODY_BYTES` of body are kept; a cut result (also one whose trailing context the byte limit cut) carries
+//!   the same `Showing N of [at least] M` notice at both ends, and the counts stay exact.
 //!   Lines longer than 2000 characters are shown as the 2000 characters around the first match with
 //!   `…` at the cut ends. Outcome `{m} matches in {f} files`; facts: `{k} binary files skipped` when
 //!   any; `no match` handled as for `glob`. The "what would hidden/ignored files add" pass of a no-match
@@ -72,6 +78,85 @@ const MAX_GREP_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const HINT_MAX_FILES: usize = 20_000;
 /// ... and runs for at most this long; when either limit is reached the hint says it was cut short.
 const HINT_MAX_TIME: Duration = Duration::from_secs(10);
+/// Most bytes of result text `glob` and `grep` collect (4 MiB); the rest is counted, not kept.
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// How much result text a search keeps: at most `max_results` entries and `max_bytes` bytes.
+#[derive(Clone, Copy)]
+struct Bound {
+    max_results: usize,
+    max_bytes: usize,
+}
+
+impl Bound {
+    fn new(max_results: usize) -> Bound {
+        Bound { max_results: max_results.max(1), max_bytes: MAX_BODY_BYTES }
+    }
+}
+
+/// The result text being collected. Lines that do not fit are refused, and so is everything after.
+struct Sink {
+    body: String,
+    /// Entries (matches, paths or files) kept.
+    shown: usize,
+    full: bool,
+    bound: Bound,
+}
+
+impl Sink {
+    fn new(bound: Bound) -> Sink {
+        Sink { body: String::new(), shown: 0, full: false, bound }
+    }
+
+    /// Entries that may still be added before the count bound is reached.
+    fn room(&self) -> usize {
+        if self.full {
+            0
+        } else {
+            self.bound.max_results.saturating_sub(self.shown)
+        }
+    }
+
+    /// Keep `line` (which carries its own newline) if the byte bound allows; `entry` lines are counted as shown.
+    fn push(&mut self, line: &str, entry: bool) -> bool {
+        if self.full || (entry && self.shown >= self.bound.max_results) {
+            return false;
+        }
+        if self.body.len().saturating_add(line.len()) > self.bound.max_bytes {
+            self.full = true;
+            return false;
+        }
+        self.body.push_str(line);
+        if entry {
+            self.shown += 1;
+        }
+        true
+    }
+
+    /// The body, with a notice before and after it when the bound cut the result (`total` found).
+    /// `advice` says how to narrow the search with the arguments this tool has.
+    fn finish(self, total: usize, lower_bound: bool, unit: &str, advice: &str) -> String {
+        if self.shown >= total && !self.full {
+            return self.body;
+        }
+        let at_least = if lower_bound { "at least " } else { "" };
+        let found = if lower_bound { "found before the search was interrupted" } else { "found" };
+        let rest = if self.shown >= total {
+            "the byte limit cut the context after the last one"
+        } else {
+            "the rest were counted but not listed"
+        };
+        let notice = format!(
+            "[Showing {} of {at_least}{total} {unit} {found}; {rest}. Narrow the search ({advice}) to see them.]\n",
+            self.shown
+        );
+        format!("{notice}{}{notice}", self.body)
+    }
+}
+
+const GLOB_ADVICE: &str = "a more specific `pattern` or `path`";
+const GREP_ADVICE: &str = "a more specific `pattern`, `path` or `glob`, or `files_only`";
+const GREP_FILES_ADVICE: &str = "a more specific `pattern`, `path` or `glob`";
 
 pub struct Glob;
 pub struct Grep;
@@ -265,11 +350,17 @@ struct Budget {
     too_large: HashSet<PathBuf>,
 }
 
+/// A deadline that is never reached in practice, for a time limit too large to add.
+fn far_future() -> Instant {
+    let now = Instant::now();
+    now.checked_add(Duration::from_secs(365 * 24 * 3600)).unwrap_or(now)
+}
+
 impl Budget {
     fn new(cancel: CancellationToken, limits: HintLimits) -> Budget {
         Budget {
             cancel,
-            deadline: Instant::now() + limits.max_time,
+            deadline: Instant::now().checked_add(limits.max_time).unwrap_or_else(far_future),
             files_left: limits.max_files,
             max_files: limits.max_files,
             cut: None,
@@ -345,6 +436,9 @@ fn widened_hint(
         }
     }
     let mut hint = match (gains.is_empty(), &budget.cut) {
+        (true, None) if !budget.too_large.is_empty() => {
+            " Hidden and git-ignored files that could be read would not change this, but some could not be checked.".to_string()
+        }
         (true, None) => " Including hidden and git-ignored files would not change this.".to_string(),
         (true, Some(why)) => format!(" Whether hidden and git-ignored files would change this could not be fully checked ({why})."),
         (false, None) => format!(" {}.", gains.join("; ")),
@@ -399,7 +493,8 @@ impl Tool for Glob {
             Err(out) => return *out,
         };
         let (hidden, no_ignore) = (flag(args, "hidden"), flag(args, "no_ignore"));
-        let job = tokio::task::spawn_blocking(move || glob_job(&scan, &glob, &pattern, hidden, no_ignore));
+        let bound = Bound::new(ctx.cfg.search_max_results);
+        let job = tokio::task::spawn_blocking(move || glob_job(&scan, &glob, &pattern, hidden, no_ignore, bound));
         match job.await {
             Ok(out) => out,
             Err(e) => ToolOutput::error(format!(
@@ -409,7 +504,7 @@ impl Tool for Glob {
     }
 }
 
-fn glob_job(scan: &Scan, glob: &PathGlob, pattern: &str, hidden: bool, no_ignore: bool) -> ToolOutput {
+fn glob_job(scan: &Scan, glob: &PathGlob, pattern: &str, hidden: bool, no_ignore: bool, bound: Bound) -> ToolOutput {
     let found = scan.collect(hidden, no_ignore);
     let searched = found.files.len();
     let mut hits: Vec<(SystemTime, &Entry)> = found
@@ -443,12 +538,15 @@ fn glob_job(scan: &Scan, glob: &PathGlob, pattern: &str, hidden: bool, no_ignore
         );
         ToolOutput::ok(outcome, Body::Message(msg))
     } else {
-        let mut body = String::new();
+        let mut sink = Sink::new(bound);
         for (_, e) in &hits {
-            body.push_str(&e.rel);
-            body.push('\n');
+            if !sink.push(&format!("{}\n", e.rel), true) {
+                break;
+            }
         }
-        ToolOutput::ok(format!("{} files", hits.len()), Body::Raw(body.into_bytes()))
+        let total = hits.len();
+        let body = sink.finish(total, found.interrupted, "files", GLOB_ADVICE);
+        ToolOutput::ok(format!("{total} files"), Body::Raw(body.into_bytes()))
     };
     out.more = more;
     with_status(status, out)
@@ -513,6 +611,7 @@ impl Tool for Grep {
             files_only: flag(args, "files_only"),
             hidden: flag(args, "hidden"),
             no_ignore: flag(args, "no_ignore"),
+            bound: Bound::new(ctx.cfg.search_max_results),
         };
         match tokio::task::spawn_blocking(move || grep_job(&scan, &opts, HintLimits::STANDARD)).await {
             Ok(out) => out,
@@ -532,6 +631,7 @@ struct GrepOpts {
     files_only: bool,
     hidden: bool,
     no_ignore: bool,
+    bound: Bound,
 }
 
 enum Read {
@@ -602,7 +702,7 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
     let candidates: Vec<&Entry> =
         found.files.iter().filter(|e| opts.filter.as_ref().is_none_or(|g| g.matches(&e.rel))).collect();
 
-    let mut body = String::new();
+    let mut sink = Sink::new(opts.bound);
     let mut groups_written = false;
     let (mut matches, mut files_with, mut scanned, mut binary, mut unreadable) = (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut too_large: Vec<&str> = Vec::new();
@@ -636,16 +736,22 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
         matches += hits.len();
         files_with += 1;
         if opts.files_only {
-            body.push_str(&format!("{} ({})\n", entry.rel, hits.len()));
-        } else if opts.context == 0 {
-            for &i in &hits {
+            sink.push(&format!("{} ({})\n", entry.rel, hits.len()), true);
+            continue;
+        }
+        // Only as many matches as the bound still allows are written; the rest are counted above.
+        let allowed = hits.get(..hits.len().min(sink.room())).unwrap_or_default();
+        if opts.context == 0 {
+            for &i in allowed {
                 let line = lines.get(i).copied().unwrap_or_default();
-                body.push_str(&format!("{}:{}:{}\n", entry.rel, i + 1, windowed(line, &opts.re)));
+                if !sink.push(&format!("{}:{}:{}\n", entry.rel, i + 1, windowed(line, &opts.re)), true) {
+                    break;
+                }
             }
         } else {
             let last_line = lines.len().saturating_sub(1);
             let mut ranges: Vec<(usize, usize)> = Vec::new();
-            for &i in &hits {
+            for &i in allowed {
                 let (lo, hi) = (i.saturating_sub(opts.context), i.saturating_add(opts.context).min(last_line));
                 match ranges.last_mut() {
                     Some(last) if lo <= last.1.saturating_add(1) => last.1 = last.1.max(hi),
@@ -653,14 +759,18 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
                 }
             }
             for (lo, hi) in ranges {
-                if groups_written {
-                    body.push_str("--\n");
+                if groups_written && !sink.push("--\n", false) {
+                    break;
                 }
                 groups_written = true;
                 for j in lo..=hi {
+                    // A match is marked as one even when it lies beyond the bound (inside the context of
+                    // the last allowed match); only the allowed ones count as shown.
                     let sep = if hits.binary_search(&j).is_ok() { ':' } else { '-' };
                     let line = lines.get(j).copied().unwrap_or_default();
-                    body.push_str(&format!("{}{sep}{}{sep}{}\n", entry.rel, j + 1, windowed(line, &opts.re)));
+                    if !sink.push(&format!("{}{sep}{}{sep}{}\n", entry.rel, j + 1, windowed(line, &opts.re)), allowed.binary_search(&j).is_ok()) {
+                        break;
+                    }
                 }
             }
         }
@@ -735,6 +845,9 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
         );
         ToolOutput::ok(outcome, Body::Message(msg))
     } else {
+        let (total, unit) = if opts.files_only { (files_with, "files with matches") } else { (matches, "matching lines") };
+        let advice = if opts.files_only { GREP_FILES_ADVICE } else { GREP_ADVICE };
+        let body = sink.finish(total, interrupted, unit, advice);
         ToolOutput::ok(format!("{matches} matches in {files_with} files"), Body::Raw(body.into_bytes()))
     };
     out.more = more;
@@ -843,6 +956,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn glob_stops_listing_at_the_result_bound_and_keeps_counting() {
+        let e = capped(2);
+        for i in 0..5 {
+            put(&e, &format!("f{i}.txt"), "x");
+        }
+        let r = e.call("glob", json!({"pattern": "*.txt"})).await;
+        assert!(r.text.contains("5 files"), "{}", r.text);
+        let stored = e.stored(&r);
+        let notice = "[Showing 2 of 5 files found; the rest were counted but not listed. Narrow the search (a more specific `pattern` or `path`) to see them.]\n";
+        assert!(stored.starts_with(notice) && stored.ends_with(notice), "{stored}");
+        assert_eq!(stored.lines().filter(|l| l.ends_with(".txt")).count(), 2, "{stored}");
+
+        // The byte bound holds too, and a result under both bounds is just the paths.
+        let scan = Scan::new(&e.ctx, None).unwrap();
+        let glob = PathGlob::new("*.txt").unwrap();
+        let out = glob_job(&scan, &glob, "*.txt", false, false, Bound { max_results: 100, max_bytes: 12 });
+        let body = raw(&out);
+        assert!(body.len() < 12 + 2 * 300 && body.starts_with("[Showing 1 of 5 files"), "{body}");
+        let out = glob_job(&scan, &glob, "*.txt", false, false, Bound::new(5));
+        assert_eq!(raw(&out).lines().count(), 5);
+        assert!(!raw(&out).contains("Showing"));
+    }
+
+    #[tokio::test]
     async fn no_match_says_how_many_files_and_what_hidden_would_add() {
         let e = env();
         tree(&e);
@@ -892,6 +1029,146 @@ mod tests {
         assert_eq!(e.stored(&r), "g.txt:1:hit here\n");
         let r = e.call("grep", json!({"pattern": "HIT"})).await;
         assert!(r.text.contains("no match"), "{}", r.text);
+    }
+
+    fn capped(max_results: usize) -> TestEnv {
+        env_with(
+            ToolsCfg { search_max_results: max_results, ..ToolsCfg::default() },
+            SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() },
+        )
+    }
+
+    fn raw(out: &ToolOutput) -> String {
+        match &out.body {
+            Body::Raw(b) => String::from_utf8_lossy(b).into_owned(),
+            other => panic!("not raw: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn grep_stops_listing_at_the_result_bound_and_keeps_counting() {
+        let e = capped(3);
+        put(&e, "a.txt", &"hit\n".repeat(4));
+        put(&e, "b.txt", &"hit\n".repeat(6));
+        let r = e.call("grep", json!({"pattern": "hit"})).await;
+        assert!(r.text.contains("10 matches in 2 files"), "{}", r.text);
+        let stored = e.stored(&r);
+        let notice = "[Showing 3 of 10 matching lines found; the rest were counted but not listed. Narrow the search (a more specific `pattern`, `path` or `glob`, or `files_only`) to see them.]\n";
+        assert_eq!(stored, format!("{notice}a.txt:1:hit\na.txt:2:hit\na.txt:3:hit\n{notice}"));
+
+        // With context, only the allowed matches (and their context) are written.
+        let e1 = capped(1);
+        put(&e1, "c.txt", "hit\nx\nx\nx\nx\nx\nhit\n");
+        let r = e1.call("grep", json!({"pattern": "hit", "path": "c.txt", "context": 1})).await;
+        let stored = e1.stored(&r);
+        assert!(stored.starts_with("[Showing 1 of 2 matching lines found;"), "{stored}");
+        assert_eq!(stored.matches("c.txt:1:hit\nc.txt-2-x\n").count(), 1, "{stored}");
+        assert_eq!(stored.matches("c.txt:7:").count(), 0, "{stored}");
+
+        // files_only counts files.
+        let e = capped(1);
+        put(&e, "a.txt", "hit\n");
+        put(&e, "b.txt", "hit\n");
+        let r = e.call("grep", json!({"pattern": "hit", "files_only": true})).await;
+        let stored = e.stored(&r);
+        assert!(stored.starts_with("[Showing 1 of 2 files with matches found;") && stored.contains("\na.txt (1)\n[Showing 1 of 2"), "{stored}");
+    }
+
+    #[tokio::test]
+    async fn grep_body_is_bounded_in_bytes() {
+        let e = capped(1_000_000);
+        put(&e, "big.txt", &format!("{}\n", "x".repeat(1000)).repeat(500));
+        let scan = Scan::new(&e.ctx, None).unwrap();
+        let mut opts = GrepOpts {
+            re: Regex::new("x").unwrap(),
+            pattern: "x".into(),
+            filter: None,
+            context: 0,
+            context_clamped: false,
+            files_only: false,
+            hidden: false,
+            no_ignore: false,
+            bound: Bound { max_results: 1_000_000, max_bytes: 10_000 },
+        };
+        let out = grep_job(&scan, &opts, HintLimits::STANDARD);
+        assert_eq!(out.outcome, "500 matches in 1 files");
+        let body = raw(&out);
+        assert!(body.len() < 10_000 + 2 * 300, "{}", body.len());
+        assert!(body.starts_with("[Showing 9 of 500 matching lines found;") && body.ends_with("to see them.]\n"), "{}", &body[..80]);
+        // The same bound with context.
+        opts.context = 1;
+        let body = raw(&grep_job(&scan, &opts, HintLimits::STANDARD));
+        assert!(body.len() < 10_000 + 2 * 300 && body.starts_with("[Showing "), "{}", body.len());
+    }
+
+    #[tokio::test]
+    async fn a_byte_limit_inside_trailing_context_is_announced() {
+        let e = capped(100);
+        put(&e, "f", "a\nhit\nb\n");
+        let scan = Scan::new(&e.ctx, None).unwrap();
+        let opts = GrepOpts {
+            re: Regex::new("hit").unwrap(),
+            pattern: "hit".into(),
+            filter: None,
+            context: 1,
+            context_clamped: false,
+            files_only: false,
+            hidden: false,
+            no_ignore: false,
+            bound: Bound { max_results: 100, max_bytes: 16 },
+        };
+        let body = raw(&grep_job(&scan, &opts, HintLimits::STANDARD));
+        assert!(body.starts_with("[Showing 1 of 1 matching lines found; the byte limit cut the context"), "{body}");
+        assert!(body.contains("f-1-a\nf:2:hit\n") && !body.contains("f-3-b"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_match_inside_the_context_of_the_last_kept_one_keeps_its_marker() {
+        let e = capped(1);
+        put(&e, "f", "hit\nhit\nx\n");
+        let r = e.call("grep", json!({"pattern": "hit", "context": 1})).await;
+        let stored = e.stored(&r);
+        assert!(stored.contains("f:1:hit\nf:2:hit\n") && !stored.contains("f-2-hit") && stored.starts_with("[Showing 1 of 2 "), "{stored}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_grep_and_glob_report_a_lower_bound() {
+        let e = capped(1);
+        put(&e, "a.txt", "hit\nhit\n");
+        put(&e, "b.txt", "hit\n");
+        let scan = Scan::new(&e.ctx, None).unwrap();
+        let opts = GrepOpts {
+            re: Regex::new("hit").unwrap(),
+            pattern: "hit".into(),
+            filter: None,
+            context: 0,
+            context_clamped: false,
+            files_only: false,
+            hidden: false,
+            no_ignore: false,
+            bound: Bound::new(1),
+        };
+        // Cancel after a first pass has proven the cut; the second search is interrupted before its first file.
+        let mut sink = Sink::new(Bound::new(1));
+        sink.push("x\n", true);
+        sink.push("y\n", true);
+        assert!(sink.finish(2, true, "files", GLOB_ADVICE).contains("of at least 2 files found before the search was interrupted"));
+        e.ctx.cancel.cancel();
+        let out = grep_job(&scan, &opts, HintLimits::STANDARD);
+        assert_eq!(out.status, ToolStatus::Interrupted);
+    }
+
+    #[test]
+    fn a_cut_by_an_interrupted_search_reports_a_lower_bound() {
+        let mut sink = Sink::new(Bound::new(2));
+        assert!(sink.push("a\n", true) && sink.push("b\n", true) && !sink.push("c\n", true));
+        let text = sink.finish(9, true, "matching lines", GREP_ADVICE);
+        assert!(text.starts_with("[Showing 2 of at least 9 matching lines found before the search was interrupted;"), "{text}");
+        assert!(text.ends_with("to see them.]\n"), "{text}");
+        // Under the bound the body is returned unchanged.
+        let mut sink = Sink::new(Bound::new(2));
+        sink.push("a\n", true);
+        assert_eq!(sink.finish(1, true, "files", GLOB_ADVICE), "a\n");
     }
 
     #[tokio::test]
@@ -1007,6 +1284,7 @@ mod tests {
             files_only: false,
             hidden: false,
             no_ignore: false,
+            bound: Bound::new(200),
         };
         let scan = Scan::new(&e.ctx, None).unwrap();
         let hint_of = |limits| match grep_job(&scan, &opts, limits).body {
@@ -1021,6 +1299,22 @@ mod tests {
         // A deadline that has passed ends the pass before any wider walk.
         let m = hint_of(HintLimits { max_files: 100, max_time: Duration::ZERO });
         assert!(m.contains("the time limit was reached"), "{m}");
+    }
+
+    #[tokio::test]
+    async fn hint_does_not_claim_no_change_when_wider_files_were_too_large() {
+        let e = env();
+        put(&e, "plain.txt", "nothing\n");
+        put(&e, ".gitignore", "ignored_big.bin\n");
+        let big = std::fs::File::create(e.ctx.workspace.join("ignored_big.bin")).unwrap();
+        big.set_len(MAX_GREP_FILE_BYTES + 1).unwrap();
+        let r = e.call("grep", json!({"pattern": "zzz"})).await;
+        assert!(!r.text.contains("Including hidden and git-ignored files would not change this"), "{}", r.text);
+        assert!(r.text.contains("that could be read would not change this, but some could not be checked"), "{}", r.text);
+        assert!(r.text.contains("1 of those files are over the"), "{}", r.text);
+        // The time limit is added without the panicking operator.
+        let budget = Budget::new(CancellationToken::new(), HintLimits { max_files: 1, max_time: Duration::MAX });
+        assert!(budget.deadline > Instant::now());
     }
 
     #[tokio::test]
