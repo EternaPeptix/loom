@@ -8,7 +8,10 @@
 //!    started by launchd or over ssh gets 256, and every running session holds a log, pipes for
 //!    its commands and sockets to the model server, so a busy daemon would otherwise start failing
 //!    with "Too many open files" in the middle of missions.
-//! 1. Create `paths.home` (0700) and `paths.logs_dir()`. `Config::load(paths.config_file())`, then
+//! 1. Create `paths.home` (0700). Take an exclusive, non-blocking lock on `<home>/daemon.lock` and hold it
+//!    until `run` returns (the process exits): when it is taken, another daemon drives this home and the
+//!    answer is the "already running" sentence below (pid and address from `daemon.json` when readable).
+//!    Create `paths.logs_dir()`. `Config::load(paths.config_file())`, then
 //!    `check()`; an error is returned as `{path}: {error}`.
 //! 2. If `daemon.json` exists and its `pid` is alive (`libc::kill(pid, 0)` succeeds or fails with
 //!    `EPERM`) and `GET http://{bind}/healthz` answers within 2 s: return `A loom daemon is already
@@ -79,6 +82,7 @@ const UP_TIMEOUT: Duration = Duration::from_secs(20);
 const UP_POLL: Duration = Duration::from_millis(100);
 const LOG_TAIL_LINES: usize = 15;
 const DAEMON_FILE: &str = "daemon.json";
+const LOCK_FILE: &str = "daemon.lock";
 
 /// launchd label of the daemon's LaunchAgent.
 pub const SERVICE_LABEL: &str = "dev.loom.daemon";
@@ -110,6 +114,7 @@ pub async fn run_until(
         .mode(0o700)
         .create(&paths.home)
         .map_err(|e| format!("Cannot create {}: {e}.", paths.home.display()))?;
+    let _home_lock = take_home_lock(&paths)?;
     std::fs::create_dir_all(paths.logs_dir()).map_err(|e| format!("Cannot create {}: {e}.", paths.logs_dir().display()))?;
     let config = load_config(&paths)?;
     loom_tools::sandbox::preflight(&config.sandbox)?;
@@ -396,16 +401,58 @@ async fn answering(paths: &Paths, config: &Config) -> bool {
     healthy(&config.daemon.bind, PROBE_TIMEOUT).await
 }
 
-/// Bind with `SO_REUSEADDR`, preferring an IPv4 address when the name has several.
+/// Take the exclusive lock on `<home>/daemon.lock`; the returned file holds it until it is dropped. A lock that
+/// another daemon holds is answered with the "already running" sentence.
+fn take_home_lock(paths: &Paths) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd;
+    let path = paths.home.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("Cannot open {}: {e}.", path.display()))?;
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(file);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+        return Err(format!("Cannot lock {}: {err}.", path.display()));
+    }
+    Err(match read_daemon_file(paths) {
+        Some(f) => format!("A loom daemon is already running for {} (pid {}, {}).", paths.home.display(), f.pid, f.bind),
+        None => format!(
+            "A loom daemon is already running for {} (it is starting; its address is not written yet).",
+            paths.home.display()
+        ),
+    })
+}
+
+/// The address to bind among those `bind` resolved to: a loopback one, IPv4 preferred. When none is loopback the
+/// answer names the first address the name resolved to.
+fn pick_loopback(bind: &str, addrs: &[SocketAddr]) -> Result<SocketAddr, String> {
+    let loopback = |a: &&SocketAddr| a.ip().is_loopback();
+    addrs.iter().filter(loopback).find(|a| a.is_ipv4()).or_else(|| addrs.iter().find(loopback)).copied().ok_or_else(|| {
+        match addrs.first() {
+            Some(a) => format!(
+                "Cannot listen on {bind}: it resolves to {}, which is not a loopback address. Set [daemon] bind to \
+                 127.0.0.1:<port> (or [::1]:<port>); the API must not be reachable from other machines.",
+                a.ip()
+            ),
+            None => format!("Cannot listen on {bind}: the address does not resolve."),
+        }
+    })
+}
+
+/// Bind with `SO_REUSEADDR`, preferring an IPv4 address when the name has several. Only loopback addresses are
+/// bound, whatever name was configured.
 async fn bind_listener(bind: &str) -> Result<tokio::net::TcpListener, String> {
     let fail = |why: &dyn std::fmt::Display| format!("Cannot listen on {bind}: {why}.");
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host(bind).await.map_err(|e| fail(&e))?.collect();
-    let addr = addrs
-        .iter()
-        .find(|a| a.is_ipv4())
-        .or_else(|| addrs.first())
-        .copied()
-        .ok_or_else(|| fail(&"the address does not resolve"))?;
+    let addr = pick_loopback(bind, &addrs)?;
     let socket = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }
         .map_err(|e| fail(&e))?;
     socket.set_reuseaddr(true).map_err(|e| fail(&e))?;
@@ -590,6 +637,42 @@ mod tests {
         std::fs::write(h.paths.config_file(), config).unwrap();
         let err = run_until(h.paths.clone(), CancellationToken::new(), |_| {}).await.unwrap_err();
         assert!(err.starts_with(&format!("Cannot listen on {addr}: ")) && err.ends_with('.'), "{err}");
+    }
+
+    #[test]
+    fn the_home_lock_is_exclusive_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path());
+        let first = take_home_lock(&paths).unwrap();
+        let err = take_home_lock(&paths).unwrap_err();
+        assert!(err.starts_with(&format!("A loom daemon is already running for {}", paths.home.display())), "{err}");
+        let file = DaemonFile { pid: 4242, bind: "127.0.0.1:9".to_string(), started_ms: 1 };
+        write_daemon_file(&paths, &file).unwrap();
+        assert_eq!(
+            take_home_lock(&paths).unwrap_err(),
+            format!("A loom daemon is already running for {} (pid 4242, 127.0.0.1:9).", paths.home.display())
+        );
+        drop(first);
+        assert!(take_home_lock(&paths).is_ok());
+    }
+
+    #[test]
+    fn only_loopback_addresses_are_bound() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert_eq!(pick_loopback("localhost:1", &[a("[::1]:1"), a("127.0.0.1:1")]), Ok(a("127.0.0.1:1")));
+        assert_eq!(pick_loopback("localhost:1", &[a("[::1]:1")]), Ok(a("[::1]:1")));
+        let err = pick_loopback("evil.example:1", &[a("10.1.2.3:1"), a("127.0.0.1:1")]).unwrap();
+        assert_eq!(err, a("127.0.0.1:1"));
+        let err = pick_loopback("evil.example:1", &[a("10.1.2.3:1")]).unwrap_err();
+        assert!(err.contains("evil.example:1") && err.contains("10.1.2.3") && err.contains("not a loopback address"), "{err}");
+        assert!(pick_loopback("x:1", &[]).unwrap_err().contains("does not resolve"));
+    }
+
+    #[tokio::test]
+    async fn bind_listener_refuses_an_address_that_is_not_loopback() {
+        let err = bind_listener("0.0.0.0:0").await.unwrap_err();
+        assert!(err.contains("0.0.0.0") && err.contains("not a loopback address"), "{err}");
+        assert!(bind_listener("127.0.0.1:0").await.is_ok());
     }
 
     #[test]

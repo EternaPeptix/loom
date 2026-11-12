@@ -20,6 +20,9 @@
 //!   such a log works. If anything follows the good prefix, those bytes are moved to
 //!   `<path>.damaged-<now_ms>` and the log file is truncated to the good prefix; `OpenReport::damage`
 //!   says what happened. A torn final line alone (crash mid-append) is the same case.
+//! - `create` syncs the parent directory, and `create` and `open` take an exclusive, non-blocking advisory
+//!   lock on the log file that the [`SessionLog`] holds until it is dropped: a second writer, in this
+//!   process or another, gets [`LogError::Locked`]. The read-only functions take no lock.
 //! - `read_records` is the read-only variant: same stopping rule, no file is modified.
 //! - `read_page` and [`PageReader`] serve pages under the same stopping rule. A `PageReader` keeps
 //!   checkpoints of what it verified, so pages fetched in sequence cost time proportional to the page.
@@ -62,6 +65,11 @@ pub enum LogError {
     Io { path: PathBuf, #[source] source: std::io::Error },
     #[error("log already exists: {0}")]
     Exists(PathBuf),
+    #[error(
+        "another loom process has the session log {0} open; stop it (or wait until it finishes) before opening \
+         this session again"
+    )]
+    Locked(PathBuf),
     #[error("cannot encode record: {0}")]
     Encode(#[from] serde_json::Error),
     #[error("fork point {upto} is beyond the last record {last}")]
@@ -103,6 +111,15 @@ pub struct SessionLog {
     durability: Durability,
     /// Length in bytes of the readable log; a failed append is cut back to it.
     len: u64,
+}
+
+/// Take the exclusive advisory lock on a log file; a lock someone else holds is [`LogError::Locked`].
+fn lock_log(file: &File, path: &Path) -> Result<(), LogError> {
+    match fs2::FileExt::try_lock_exclusive(file) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Err(LogError::Locked(path.to_path_buf())),
+        Err(e) => Err(io_err(path)(e)),
+    }
 }
 
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> LogError + '_ {
@@ -297,6 +314,10 @@ impl SessionLog {
             }
             Err(e) => return Err(io_err(path)(e)),
         };
+        lock_log(&file, path)?;
+        // The new name must survive a crash, or the first records would be written to a file that is gone.
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        File::open(dir).and_then(|d| d.sync_all()).map_err(io_err(dir))?;
         Ok(SessionLog {
             path: path.to_path_buf(),
             file,
@@ -309,13 +330,15 @@ impl SessionLog {
 
     /// Open an existing log for appending, salvaging damage as described in the module contract.
     pub fn open(path: &Path, durability: Durability) -> Result<(SessionLog, OpenReport), LogError> {
+        // The lock comes first: what is scanned below must not change before it is appended to.
+        let file = OpenOptions::new().append(true).open(path).map_err(io_err(path))?;
+        lock_log(&file, path)?;
         let (scanner, records, cause) = scan_file(path)?;
         if scanner.opaque > 0 || scanner.schema > SCHEMA {
             return Err(LogError::Newer(path.to_path_buf()));
         }
         let file_len = std::fs::metadata(path).map_err(io_err(path))?.len();
         let good_len = scanner.good_len;
-        let file = OpenOptions::new().append(true).open(path).map_err(io_err(path))?;
         let mut damage = None;
         if file_len > good_len {
             let moved_to = damaged_name(path);
@@ -960,6 +983,22 @@ mod tests {
         let (path, log) = new_log(&dir);
         drop(log);
         assert!(matches!(SessionLog::create(&path, Durability::Batch), Err(LogError::Exists(_))));
+    }
+
+    #[test]
+    fn a_log_open_for_append_cannot_be_opened_again_until_it_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut log) = new_log(&dir);
+        log.append(Author::Harness, msg(0)).unwrap();
+        let err = SessionLog::open(&path, Durability::Batch).unwrap_err();
+        assert!(matches!(err, LogError::Locked(_)), "{err}");
+        assert!(err.to_string().contains("another loom process has the session log"), "{err}");
+        // Reading takes no lock.
+        assert_eq!(read_records(&path).unwrap().records.len(), 1);
+        drop(log);
+        let (mut again, report) = SessionLog::open(&path, Durability::Batch).unwrap();
+        assert_eq!(report.records.len(), 1);
+        again.append(Author::Harness, msg(1)).unwrap();
     }
 
     #[test]

@@ -55,7 +55,9 @@
 //!
 //! Key: `load_or_create_key(path)` returns the 32-byte key stored at `path` as 64 hex characters,
 //! creating it (random, file mode 0600, parent dirs 0700) when missing. A file that exists but does
-//! not hold 64 hex characters is an error (never overwritten).
+//! not hold 64 hex characters is an error (never overwritten). The key is published atomically (a synced
+//! temporary file hard-linked under the final name), so a crash never leaves a partial key file and two
+//! creators end up with the same key.
 //!
 //! Tests required: append/read round trip; ids consecutive; tamper detection for an edited body, a
 //! removed line, a reordered pair, a truncated tail; wrong key; rule refusal writes nothing; `check`
@@ -564,20 +566,40 @@ pub fn load_or_create_key(path: &Path) -> std::io::Result<Vec<u8>> {
     }
     let mut key = [0u8; 32];
     rand::Rng::fill(&mut rand::rng(), &mut key[..]);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    match options.open(path) {
-        Ok(mut f) => {
-            f.write_all(hex::encode(key).as_bytes())?;
-            f.sync_all()?;
-            Ok(key.to_vec())
+    // A concurrent creator's file wins; whichever file is published is the one read back.
+    publish_new_file(path, hex::encode(key).as_bytes())?;
+    read_key(path)
+}
+
+/// Publish `content` at `path` (mode 0600) unless `path` exists, so that a reader sees either no file or the
+/// whole file. The bytes go to a synced temporary file in the same directory, which is hard-linked to `path`
+/// (a link fails when the name exists, so an earlier file is never replaced), then removed; the directory is
+/// synced. Returns `Ok` also when another file already holds the name: the caller reads `path` afterwards.
+pub fn publish_new_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut attempt = 0u8;
+    let (tmp, mut file) = loop {
+        let tmp = dir.join(format!(".{name}.{}.tmp", hex::encode(rand::random::<u64>().to_le_bytes())));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&tmp) {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 8 => attempt += 1,
+            Err(e) => return Err(e),
         }
-        // Another process created it first: use theirs.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_key(path),
-        Err(e) => Err(e),
-    }
+    };
+    let written = file.write_all(content).and_then(|()| file.sync_all());
+    drop(file);
+    let linked = written.and_then(|()| match std::fs::hard_link(&tmp, path) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e),
+        _ => Ok(()),
+    });
+    let _ = std::fs::remove_file(&tmp);
+    linked?;
+    std::fs::File::open(dir)?.sync_all()
 }
 
 fn read_key(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -585,6 +607,16 @@ fn read_key(path: &Path) -> std::io::Result<Vec<u8>> {
     std::fs::File::open(path)?.read_to_string(&mut text)?;
     let text = text.trim();
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{} must hold 64 hexadecimal characters", path.display()));
+    if text.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "the journal key file {} is empty; delete it if no mission journals exist yet and loom will create a new key, \
+                 otherwise restore the key from a backup (journals sealed with the lost key cannot be verified)",
+                path.display()
+            ),
+        ));
+    }
     if text.len() != 64 {
         return Err(bad());
     }
@@ -1225,6 +1257,57 @@ mod tests {
         }
         let k2 = load_or_create_key(&path).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn concurrent_creators_agree_and_a_leftover_temporary_file_is_harmless() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let path = dir.path().join("keys").join("journal.key");
+        std::fs::create_dir_all(path.parent().unwrap_or(dir.path())).unwrap_or_default();
+        std::fs::write(path.with_file_name(".journal.key.tmp"), "junk").unwrap_or_default();
+        let keys: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || load_or_create_key(&path).unwrap_or_default())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect();
+        assert_eq!(keys[0].len(), 32);
+        assert!(keys.iter().all(|k| *k == keys[0]));
+        let entries = std::fs::read_dir(path.parent().unwrap_or(dir.path())).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(entries, 2, "the key and the planted file only");
+    }
+
+    #[test]
+    fn a_key_file_is_never_seen_partial() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        for round in 0..200 {
+            let path = dir.path().join(format!("k{round}"));
+            let reader = {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..2000 {
+                        if let Ok(text) = std::fs::read_to_string(&path) {
+                            assert_eq!(text.len(), 64, "partial key file");
+                        }
+                    }
+                })
+            };
+            assert_eq!(load_or_create_key(&path).map(|k| k.len()).ok(), Some(32));
+            assert!(reader.join().is_ok());
+        }
+    }
+
+    #[test]
+    fn an_empty_key_file_says_what_to_do() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let path = dir.path().join("journal.key");
+        std::fs::write(&path, "").unwrap_or_default();
+        let err = load_or_create_key(&path).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(err.contains("is empty; delete it if no mission journals exist yet"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap_or_default(), "");
     }
 
     #[test]

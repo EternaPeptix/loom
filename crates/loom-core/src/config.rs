@@ -319,6 +319,25 @@ impl Config {
     }
 }
 
+/// Directory (inside `sessions/` or `missions/`) that loom never creates. An id that is not a plain name maps to
+/// a name below it, so a lookup for such an id finds nothing.
+const UNSAFE_ID_DIR: &str = ".unsafe-ids";
+
+/// The path, relative to the sessions or missions directory, that stands for `id`. Ids of ASCII letters, digits,
+/// `-`, `_` and `.` (not starting with `.`, 1 to 128 bytes) are used as they are; any other id (separators,
+/// parent references, NUL, empty, ...) maps to `.unsafe-ids/<sha256 of the id>`, which stays inside the tree.
+fn id_dir(id: &str) -> PathBuf {
+    let plain = !id.is_empty()
+        && id.len() <= 128
+        && !id.starts_with('.')
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    if plain {
+        PathBuf::from(id)
+    } else {
+        Path::new(UNSAFE_ID_DIR).join(crate::sha256_hex(id.as_bytes()))
+    }
+}
+
 /// Where everything lives on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Paths {
@@ -355,7 +374,7 @@ impl Paths {
         self.home.join("sessions")
     }
     pub fn session_dir(&self, id: &SessionId) -> PathBuf {
-        self.sessions_dir().join(id.as_str())
+        self.sessions_dir().join(id_dir(id.as_str()))
     }
     pub fn session_log(&self, id: &SessionId) -> PathBuf {
         self.session_dir(id).join("log.jsonl")
@@ -371,7 +390,7 @@ impl Paths {
         self.home.join("missions")
     }
     pub fn mission_dir(&self, id: &MissionId) -> PathBuf {
-        self.missions_dir().join(id.as_str())
+        self.missions_dir().join(id_dir(id.as_str()))
     }
     pub fn journal(&self, id: &MissionId) -> PathBuf {
         self.mission_dir(id).join("journal.jsonl")
@@ -470,5 +489,33 @@ allow = ["*.example.test"]
         let sid = SessionId::from("s-1");
         assert!(p.session_log(&sid).ends_with("sessions/s-1/log.jsonl"));
         assert!(p.journal(&MissionId::from("m-1")).ends_with("missions/m-1/journal.jsonl"));
+    }
+
+    #[test]
+    fn ids_never_map_outside_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths::at(dir.path());
+        std::fs::create_dir_all(p.session_dir(&SessionId::from("s-real"))).unwrap();
+        std::fs::create_dir_all(p.mission_dir(&MissionId::from("m-real"))).unwrap();
+        // Ids loom generates and the importer writes pass unchanged.
+        for ok in ["s-0123456789abcdef", "s-dsh0123456789abcdef", "m-x_y.z", &"a".repeat(128)] {
+            assert_eq!(p.session_dir(&SessionId::from(ok)), p.sessions_dir().join(ok));
+            assert_eq!(p.mission_dir(&MissionId::from(ok)), p.missions_dir().join(ok));
+        }
+        let generated = SessionId::generate();
+        assert_eq!(p.session_dir(&generated), p.sessions_dir().join(generated.as_str()));
+        let long = "a".repeat(129);
+        for bad in ["", ".", "..", "../s-real", "s-real/..", "a/b", "/etc", ".hidden", "s-real\0", "s\0", "a b", "é", &long] {
+            let s = p.session_dir(&SessionId::from(bad));
+            let m = p.mission_dir(&MissionId::from(bad));
+            assert!(s.starts_with(p.sessions_dir().join(UNSAFE_ID_DIR)), "{bad:?} -> {}", s.display());
+            assert!(m.starts_with(p.missions_dir().join(UNSAFE_ID_DIR)), "{bad:?} -> {}", m.display());
+            assert!(!s.exists() && !m.exists(), "{bad:?}");
+            assert!(!s.components().any(|c| matches!(c, std::path::Component::ParentDir)));
+            assert_eq!(s, p.session_dir(&SessionId::from(bad)), "deterministic");
+            assert!(p.session_log(&SessionId::from(bad)).starts_with(p.sessions_dir()));
+            assert!(p.journal(&MissionId::from(bad)).starts_with(p.missions_dir()));
+        }
+        assert_ne!(p.session_dir(&SessionId::from("a/b")), p.session_dir(&SessionId::from("a\\b")));
     }
 }
