@@ -210,11 +210,18 @@
 //!   to 500 characters); stdin closed; killed after 30 s; failure is a `tracing::warn!`.
 //! - empty, on macOS: `/usr/bin/osascript -e 'on run argv' -e 'display notification (item 2 of
 //!   argv) with title (item 1 of argv)' -e 'end run' "loom: {kind} — {title}" "{text cut to 200}"`
-//!   (the texts are arguments, never part of the script). Elsewhere: nothing.
+//!   (the texts are arguments, never part of the script). Elsewhere: nothing, and `start` logs one warning
+//!   saying so and how to set `[notify] command`.
 //! - `config.notify.repeat_minutes > 0`: while a blocking item stays open, notify again every that
 //!   many minutes.
 //! - The text of an item opened by a tool call (a question, blocker or finish the model wrote)
-//!   starts with `[From the agent, unverified] `; items the harness opened itself are unchanged.
+//!   starts with `[From the agent, unverified] `. In an item the harness opened itself, the paragraph
+//!   that quotes the ledger (`Still open:`, written by the model) starts with that label; the rest is
+//!   unchanged. The title of a child session was written by the model: it starts with `unverified: `
+//!   in the notification title (`LOOM_TITLE` too).
+//! - Low disk: when the volume of the loom home turns low (`LOW_DISK_BYTES`, `LOW_DISK_PERCENT`; checked
+//!   once a minute) one notification of kind `disk` is raised, and no other until the disk has
+//!   recovered and turned low again.
 //! - At start, every restored open blocking item is notified once (`Still waiting: {text}`) and its
 //!   repeat notice is armed as for a live one.
 //!
@@ -397,7 +404,7 @@ use crate::session::{queue_input, Control, Deps, End, Input, Phase, Session, Sin
 use crate::texts;
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use loom_core::config::{Config, NetworkMode, Paths, SandboxCfg};
+use loom_core::config::{Config, NetworkMode, Paths, SandboxCfg, SandboxMode};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
     Author, Brief, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, Forked, InboxItem, ModelRef, NetDecision,
@@ -904,6 +911,8 @@ struct Inner {
     /// Held while sessions are activated (never across an `.await`).
     activation: Mutex<()>,
     shutting: AtomicBool,
+    /// The volume of the loom home was low at the last check (see `note_disk`).
+    disk_low: AtomicBool,
     /// The start-up pass has not looked at the leads' logs yet: a settlement made until then is left
     /// for its recovery to deliver (see `record_settlement`).
     restoring: AtomicBool,
@@ -1401,8 +1410,27 @@ impl Inner {
 
     fn notify(&self, kind: &str, session: &SessionId, title: &str, text: &str) {
         let command = self.config.notify.command.clone();
-        let (kind, session, title, text) = (kind.to_string(), session.as_str().to_string(), title.to_string(), text.to_string());
+        // A child's title is the question the model gave when it started it.
+        let child = self.st().known.get(session).is_some_and(|k| k.meta.parent.is_some());
+        let title = notice_title(title, child);
+        let (kind, session, text) = (kind.to_string(), session.as_str().to_string(), text.to_string());
         tokio::spawn(async move { run_notify(command, kind, session, title, text).await });
+    }
+
+    /// The result of a disk check. Raises one notification when the disk turns low, and none again until a check
+    /// found it recovered and it turned low once more.
+    fn note_disk(&self, low: bool) {
+        if self.disk_low.swap(low, Ordering::SeqCst) != low && low {
+            self.notify("disk", &SessionId::from(""), "Low disk space", LOW_DISK_NOTICE);
+        }
+    }
+
+    /// Empty the scratch directory of a session that can no longer run commands. Failures are warnings.
+    fn clear_scratch(&self, id: &SessionId) {
+        let dir = self.paths.session_tmp(id);
+        if let Err(e) = empty_dir(&dir) {
+            tracing::warn!("cannot empty the scratch directory {}: {e}", dir.display());
+        }
     }
 
     fn repeat_notice(self: &Arc<Self>, kind: &str, session: &SessionId, title: &str, item: &InboxItem) {
@@ -1716,6 +1744,11 @@ impl Inner {
 
     fn on_end(self: &Arc<Self>, id: &SessionId, gen: u64, end: End) {
         self.proxy.revoke(id);
+        let end_kind = match &end {
+            End::Settled(_) => EndKind::Settled,
+            End::Closed => EndKind::Closed,
+            End::Fatal(_) => EndKind::Failed,
+        };
         let settlement = match end {
             End::Settled(s) => Some(s),
             // A child ends `Closed` only at a shutdown, which the next start resumes it from: a child
@@ -1753,6 +1786,19 @@ impl Inner {
                 }
             }
         };
+        // The task is gone: nothing can run a command of this session again when it is a child that ended
+        // for good, a root whose log had ended, or a session an archive closed.
+        let over = {
+            let st = self.st();
+            st.known.get(id).is_some_and(|k| match end_kind {
+                EndKind::Settled => true,
+                EndKind::Failed => k.meta.parent.is_some(),
+                EndKind::Closed => k.meta.archived || k.status.phase == Phase::Ended,
+            })
+        };
+        if over {
+            self.clear_scratch(id);
+        }
         let Some(s) = settlement else { return };
         // Kept beside the log so that a delivery lost to a restart carries the whole report.
         if let Err(e) = write_json_atomic(&self.paths.session_dir(id).join("settlement.json"), &s) {
@@ -2000,6 +2046,10 @@ impl Inner {
                     ));
                 }
                 Ok(d) => {
+                    // Remembered once, so this is the one warning of the profile.
+                    if let Some(w) = window_warning(profile_name, profile.context_window, d.server_window) {
+                        tracing::warn!("{w}");
+                    }
                     *lock(&rt.discovered) = Some(d.clone());
                     Some(d)
                 }
@@ -2412,18 +2462,140 @@ impl Spawns {
     }
 }
 
+/// How a session's task ended, as far as its scratch directory is concerned.
+#[derive(Clone, Copy)]
+enum EndKind {
+    Settled,
+    Closed,
+    Failed,
+}
+
+/// Remove everything inside `dir` (not `dir` itself; a symbolic link is removed, never followed). A missing
+/// directory is empty already.
+fn empty_dir(dir: &Path) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut first_error = None;
+    for entry in entries {
+        let result = entry.and_then(|entry| {
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
+        });
+        if let Err(e) = result {
+            first_error.get_or_insert(e);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Free space below which the disk counts as low: 5 GiB …
+pub const LOW_DISK_BYTES: u64 = 5 << 30;
+
+/// … or 5 percent of the volume.
+pub const LOW_DISK_PERCENT: u64 = 5;
+
+/// What the low-disk notification says.
+const LOW_DISK_NOTICE: &str =
+    "The disk that holds the loom home is nearly full, so sessions will fail when it fills. Free space, or run `loom gc`.";
+
+/// How often the disk is checked.
+#[cfg(not(test))]
+const DISK_CHECK_EVERY: Duration = Duration::from_secs(60);
+
+/// Free and total bytes of the volume that holds `path` (`statvfs`); `None` when they cannot be read.
+pub fn volume_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `statvfs` is plain integers, for which all-zero is a valid value.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a NUL-terminated string and `st` a live, exclusively borrowed `statvfs`.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    // Counts are in fragments (`f_frsize`); a file system that leaves that 0 counts in blocks.
+    let unit = u128::from(if st.f_frsize > 0 { st.f_frsize } else { st.f_bsize });
+    let free = u64::try_from(u128::from(st.f_bavail) * unit).ok()?;
+    let total = u64::try_from(u128::from(st.f_blocks) * unit).ok()?;
+    (total > 0 && free <= total).then_some((free, total))
+}
+
+/// Whether `free` of `total` bytes is low: under `LOW_DISK_BYTES`, or under `LOW_DISK_PERCENT` of the volume.
+#[cfg(not(test))]
+fn disk_is_low(free: u64, total: u64) -> bool {
+    free < LOW_DISK_BYTES || u128::from(free) * 100 < u128::from(total) * u128::from(LOW_DISK_PERCENT)
+}
+
+/// What `start` warns about in the configuration, one sentence each.
+fn start_warnings(config: &Config, macos: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    if config.notify.command.is_empty() && !macos {
+        out.push(
+            "Notifications are off on this platform: inbox items and fatal errors notify nobody. Set [notify] command in the config to a program that shows them, and restart the daemon."
+                .to_string(),
+        );
+    }
+    if config.sandbox.mode == SandboxMode::None {
+        out.push(
+            "The sandbox is off ([sandbox] mode = \"none\"): the commands of every session run unconfined. Set mode = \"seatbelt\" on macOS to confine them."
+                .to_string(),
+        );
+    }
+    out
+}
+
+/// The warning for a profile whose configured window is larger than the one its server reports.
+fn window_warning(profile: &str, configured: Option<u64>, server: Option<u64>) -> Option<String> {
+    match (configured, server) {
+        (Some(c), Some(s)) if c > s => Some(format!(
+            "The profile \"{profile}\" sets context_window = {c}, but its server reports a window of {s}: requests may be refused. Lower context_window in [models.{profile}] of the config, or remove it to use the server's, and restart the daemon."
+        )),
+        _ => None,
+    }
+}
+
+/// The notification title: the model wrote a child's, so it is marked.
+fn notice_title(title: &str, child: bool) -> String {
+    if child {
+        format!("{UNVERIFIED_TITLE}{title}")
+    } else {
+        title.to_string()
+    }
+}
+
+/// Starts the title of a notification whose session title the model wrote.
+const UNVERIFIED_TITLE: &str = "unverified: ";
+
+/// Starts the text of a notification the model wrote.
+const UNVERIFIED_TEXT: &str = "[From the agent, unverified] ";
+
 /// The inbox kind in snake case, as notifications name it.
 fn inbox_kind_word(item: &InboxItem) -> String {
     serde_json::to_value(item.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "question".to_string())
 }
 
 /// What a notification says about an inbox item. An item opened by a tool call (`call_id` set: a question, a
-/// blocker or a finish the model wrote) starts with a fixed label saying so; one the harness opened itself
-/// (`call_id` unset) is unchanged. `still_waiting` is the restart notice for an item that is still open.
+/// blocker or a finish the model wrote) starts with a fixed label saying so. In one the harness opened itself
+/// (`call_id` unset) only the paragraph that quotes the ledger, which the model wrote, carries the label.
+/// `still_waiting` is the restart notice for an item that is still open.
 fn notice_text(item: &InboxItem, still_waiting: bool) -> String {
-    let label = if item.call_id.is_some() { "[From the agent, unverified] " } else { "" };
     let waiting = if still_waiting { "Still waiting: " } else { "" };
-    format!("{label}{waiting}{}", item.text)
+    if item.call_id.is_some() {
+        return format!("{UNVERIFIED_TEXT}{waiting}{}", item.text);
+    }
+    let text = item
+        .text
+        .split("\n\n")
+        .map(|p| if p.starts_with(crate::gate::OPEN_HEADING) { format!("{UNVERIFIED_TEXT}{p}") } else { p.to_string() })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!("{waiting}{text}")
 }
 
 /// Run the notification for one event. Failures are warnings.
@@ -2527,6 +2699,9 @@ impl Runtime {
                 },
             );
         }
+        for warning in start_warnings(&config, cfg!(target_os = "macos")) {
+            tracing::warn!("{warning}");
+        }
         let (bus, _) = broadcast::channel(BUS_CAPACITY);
         let (net_tx, mut net_rx) = unbounded_channel();
         let audit = net_audit(paths.clone(), bus.clone());
@@ -2546,6 +2721,7 @@ impl Runtime {
             state: Mutex::new(State::default()),
             activation: Mutex::new(()),
             shutting: AtomicBool::new(false),
+            disk_low: AtomicBool::new(false),
             restoring: AtomicBool::new(true),
             next_gen: AtomicU64::new(1),
             orch: Arc::new(Orch(me.clone())),
@@ -2563,6 +2739,26 @@ impl Runtime {
             }
         });
         inner.st().tasks.push(forwarder);
+        // Not under test: whether the disk of the machine that runs the tests is low must not change them.
+        #[cfg(not(test))]
+        {
+            let weak = Arc::downgrade(&inner);
+            let watcher = tokio::spawn(async move {
+                loop {
+                    let Some(inner) = weak.upgrade() else { return };
+                    let home = inner.paths.home.clone();
+                    drop(inner);
+                    let space = tokio::task::spawn_blocking(move || volume_space(&home)).await.ok().flatten();
+                    let Some(inner) = weak.upgrade() else { return };
+                    if let Some((free, total)) = space {
+                        inner.note_disk(disk_is_low(free, total));
+                    }
+                    drop(inner);
+                    tokio::time::sleep(DISK_CHECK_EVERY).await;
+                }
+            });
+            inner.st().tasks.push(watcher);
+        }
 
         inner.load_known();
         let mut restored: Vec<SessionId> = Vec::new();
@@ -3032,6 +3228,16 @@ impl Runtime {
         // Dropping the inputs ends the tasks: the lead's `Closed`, each agent's with its settlement,
         // which reaches the lead when the mission is unarchived.
         drop(closing);
+        if archived {
+            // A session with a task gets its scratch directory emptied when the task has ended (`on_end`).
+            let idle: Vec<&SessionId> = {
+                let st = self.inner.st();
+                family.iter().filter(|sid| st.known.get(*sid).is_some_and(|k| k.active.is_none())).collect()
+            };
+            for sid in idle {
+                self.inner.clear_scratch(sid);
+            }
+        }
         if !archived {
             // A task an archive closed keeps its place until it has ended, and what is handed to it is
             // lost: those of the family end first.
@@ -4978,6 +5184,120 @@ mod tests {
         assert_eq!(notice_text(&forged, false), "[From the agent, unverified] x");
     }
 
+    #[test]
+    fn the_ledger_lines_in_a_harness_opened_item_are_labelled_and_the_rest_is_not() {
+        let parked = InboxItem {
+            item_id: "i-1".into(),
+            kind: InboxKind::Parked,
+            text: "The session replied 3 times in a row without calling a tool.\n\nStill open:\nobligation o1: run the tests\n\nSend the session a message to resume it."
+                .into(),
+            options: Vec::new(),
+            blocking: true,
+            call_id: None,
+            reference: None,
+        };
+        assert_eq!(
+            notice_text(&parked, false),
+            "The session replied 3 times in a row without calling a tool.\n\n[From the agent, unverified] Still open:\nobligation o1: run the tests\n\nSend the session a message to resume it."
+        );
+        assert!(notice_text(&parked, true).starts_with("Still waiting: The session replied"));
+    }
+
+    #[test]
+    fn the_title_of_an_agent_is_labelled_and_a_lead_s_is_not() {
+        assert_eq!(notice_title("Which index?", true), "unverified: Which index?");
+        assert_eq!(notice_title("Fix the build", false), "Fix the build");
+    }
+
+    #[tokio::test]
+    async fn the_notification_of_an_agent_s_item_labels_its_model_written_title() {
+        let out = tempfile::tempdir().unwrap();
+        let file = out.path().join("n.txt");
+        let command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo \"$LOOM_KIND|$LOOM_TITLE\" >> '{}'", file.display()),
+        ];
+        let script = Script::new(|body, _| {
+            if !has_tool(body, "agent_spawn") {
+                return idle_worker(body);
+            }
+            match tool_msgs(body) {
+                0 => call("agent_spawn", json!({"question": "CHILDQ", "background": true})),
+                _ => call("wait", json!({})),
+            }
+        });
+        let e = env_with(script, false, move |c| c.notify.command = command).await;
+        let lead = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("the agent waits", || !e.children(&lead).is_empty()).await;
+        let child = e.children(&lead)[0].clone();
+        e.rt.inner.notify("error", &child.meta.id, &child.meta.title, "text");
+        e.rt.inner.notify("error", &lead, "Plain lead title", "text");
+        until("both notifications", || lines_of(&file).len() == 2).await;
+        let lines = lines_of(&file);
+        assert!(lines.iter().any(|l| l.starts_with("error|unverified: ") && l.contains("CHILDQ")), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "error|Plain lead title"), "{lines:?}");
+        e.rt.shutdown().await;
+    }
+
+    #[test]
+    fn start_warns_about_what_the_operator_must_know() {
+        let mut c = Config::default();
+        assert!(start_warnings(&c, true).is_empty());
+        let off = start_warnings(&c, false);
+        assert_eq!(off.len(), 1);
+        assert!(off[0].contains("Notifications are off") && off[0].contains("[notify] command"), "{off:?}");
+        c.notify.command = vec!["/bin/true".into()];
+        assert!(start_warnings(&c, false).is_empty());
+        c.sandbox.mode = SandboxMode::None;
+        let none = start_warnings(&c, true);
+        assert_eq!(none.len(), 1);
+        assert!(none[0].contains("unconfined"), "{none:?}");
+    }
+
+    #[test]
+    fn a_window_larger_than_the_server_s_is_warned_about() {
+        assert!(window_warning("local", Some(1_000_000), Some(32_768)).is_some_and(|w| w.contains("local") && w.contains("32768")));
+        assert_eq!(window_warning("local", Some(32_768), Some(32_768)), None);
+        assert_eq!(window_warning("local", Some(16_000), Some(32_768)), None);
+        assert_eq!(window_warning("local", Some(1_000_000), None), None);
+        assert_eq!(window_warning("local", None, Some(32_768)), None);
+    }
+
+    #[tokio::test]
+    async fn a_low_disk_is_notified_once_until_it_has_recovered() {
+        let out = tempfile::tempdir().unwrap();
+        let file = out.path().join("n.txt");
+        let e = env_with(Script::new(|_, _| finish("x")), false, text_logging_notify(&file)).await;
+        e.rt.inner.note_disk(false);
+        e.rt.inner.note_disk(true);
+        e.rt.inner.note_disk(true);
+        until("the notification", || !lines_of(&file).is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(lines_of(&file).len(), 1, "{:?}", lines_of(&file));
+        assert!(lines_of(&file)[0].starts_with("disk|"));
+        e.rt.inner.note_disk(false);
+        e.rt.inner.note_disk(true);
+        until("the second notification", || lines_of(&file).len() == 2).await;
+        e.rt.shutdown().await;
+    }
+
+    #[test]
+    fn emptying_a_directory_keeps_it_and_never_follows_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = dir.path().join("keep");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::write(keep.join("precious"), "x").unwrap();
+        let tmp = dir.path().join("tmp");
+        std::fs::create_dir_all(tmp.join("a/b")).unwrap();
+        std::fs::write(tmp.join("a/b/f"), "x").unwrap();
+        std::os::unix::fs::symlink(&keep, tmp.join("link")).unwrap();
+        empty_dir(&tmp).unwrap();
+        assert!(tmp.is_dir() && std::fs::read_dir(&tmp).unwrap().next().is_none());
+        assert!(keep.join("precious").exists());
+        empty_dir(&dir.path().join("missing")).unwrap();
+    }
+
     #[tokio::test]
     async fn a_question_the_model_wrote_is_notified_with_the_unverified_label() {
         let out = tempfile::tempdir().unwrap();
@@ -6032,7 +6352,15 @@ mod tests {
         let id = info.meta.id.clone();
         until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
         until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        // The scratch directory is kept while the session can still run commands, and emptied by the archive.
+        let tmp = e.rt.paths().session_tmp(&id);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join("sub").join("f"), "x").unwrap();
+        std::fs::write(tmp.join("g"), "x").unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(tmp.join("g").exists());
         e.rt.archive(&id, true).await.unwrap();
+        until("scratch emptied", || std::fs::read_dir(&tmp).is_ok_and(|mut d| d.next().is_none())).await;
         assert!(e.rt.sessions(false).is_empty());
         assert_eq!(e.rt.sessions(true).len(), 1);
         assert!(e.rt.send_message(&id, "hi").await.is_err());
@@ -6068,9 +6396,13 @@ mod tests {
         until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
         let child = e.children(&id)[0].meta.id.clone();
         until_idle(&e, &child).await;
+        let child_tmp = e.rt.paths().session_tmp(&child);
+        std::fs::write(child_tmp.join("scratch"), "x").unwrap();
         // Archiving closes the inputs of the lead and of its agent for good.
         e.rt.archive(&id, true).await.unwrap();
         until("the agent settled", || e.rt.session(&child).is_some_and(|s| s.status.phase == Phase::Ended)).await;
+        // A settled agent can run no more commands: its scratch directory is emptied.
+        until("the agent's scratch emptied", || !child_tmp.join("scratch").exists()).await;
         assert_eq!(e.rt.session(&child).unwrap().status.outcome, Some(SessionOutcome::Stopped));
         assert!(stopped_while_idle(&e, &child, texts::REASON_OPERATOR), "{:?}", e.kinds(&child));
         assert!(!e.has(&id, |ev| matches!(ev, Event::ChildSettled(_))), "an archived lead was given a settlement");

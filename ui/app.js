@@ -216,6 +216,13 @@ function renderDot() {
   dot.title = d.tip;
 }
 
+function renderDiskWarning() {
+  const box = $("disk-warning");
+  const text = C.diskWarning(S.status && S.status.disk);
+  box.textContent = text || "";
+  box.hidden = !text;
+}
+
 function updateInboxBadge() {
   const c = C.inboxCounts(S.inbox);
   const b = $("btn-inbox");
@@ -456,6 +463,7 @@ async function loadStatus() {
   try {
     S.status = await api("GET", "/api/status");
     renderDot();
+    renderDiskWarning();
   } catch {
     // the dot shows the stream; a failed status poll changes nothing
   }

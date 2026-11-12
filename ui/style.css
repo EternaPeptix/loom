@@ -117,6 +117,7 @@ input:focus, select:focus, textarea:focus, .btn:focus-visible, a:focus-visible {
 .dot-green { background: var(--ok); }
 .dot-amber { background: var(--warn); }
 .dot-red { background: var(--bad); }
+.disk-warning { padding: 6px 12px; font-size: 12px; color: var(--warn); border-bottom: 1px solid var(--warn); }
 .sessions { flex: 1 1 auto; overflow-y: auto; }
 .row { display: block; padding: 6px 10px; border-bottom: 1px solid var(--line); color: var(--fg); text-decoration: none; }
 .row:hover { background: var(--bg-3); text-decoration: none; }

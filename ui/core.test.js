@@ -240,6 +240,17 @@ test("row detail and health dot", () => {
   assert.match(amber.tip, /p: refused/);
 });
 
+test("diskWarning: a sentence below 5 GiB or 5 percent free, null otherwise or when unknown", () => {
+  const GiB = 1024 ** 3;
+  assert.equal(C.diskWarning(null), null);
+  assert.equal(C.diskWarning(undefined), null);
+  assert.equal(C.diskWarning({ free_bytes: 400 * GiB, total_bytes: 1000 * GiB }), null);
+  assert.equal(C.diskWarning({ free_bytes: 5 * GiB, total_bytes: 40 * GiB }), null);
+  assert.match(C.diskWarning({ free_bytes: 3 * GiB, total_bytes: 1000 * GiB }), /^Low disk space: 3\.0 GiB free of 1000\.0 GiB\..*loom gc/);
+  assert.match(C.diskWarning({ free_bytes: 40 * GiB, total_bytes: 1000 * GiB }), /Low disk space/);
+  assert.equal(C.diskWarning({ free_bytes: 0, total_bytes: 0 }), null);
+});
+
 // ---- inbox ----
 
 test("inbox: records open and resolve items, blocking first, titles", () => {

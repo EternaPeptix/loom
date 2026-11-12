@@ -495,6 +495,7 @@ async fn login_code(State(s): State<ApiState>, headers: HeaderMap) -> Response {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CodeBody {
     code: String,
 }
@@ -513,19 +514,7 @@ async fn web_session(State(s): State<ApiState>, body: Bytes) -> Res<Response> {
 
 /// Free and total bytes of the volume that holds `path` (`statvfs`); `None` when they cannot be read.
 fn disk_space(path: &std::path::Path) -> Option<DiskSpace> {
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `statvfs` is plain integers, for which all-zero is a valid value.
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c_path` is a NUL-terminated string and `st` a live, exclusively borrowed `statvfs`.
-    if unsafe { libc::statvfs(c_path.as_ptr(), &mut st) } != 0 {
-        return None;
-    }
-    // Counts are in fragments (`f_frsize`); a file system that leaves that 0 counts in blocks.
-    let unit = u128::from(if st.f_frsize > 0 { st.f_frsize } else { st.f_bsize });
-    let free_bytes = u64::try_from(u128::from(st.f_bavail) * unit).ok()?;
-    let total_bytes = u64::try_from(u128::from(st.f_blocks) * unit).ok()?;
-    (total_bytes > 0 && free_bytes <= total_bytes).then_some(DiskSpace { free_bytes, total_bytes })
+    loom_agent::runtime::volume_space(path).map(|(free_bytes, total_bytes)| DiskSpace { free_bytes, total_bytes })
 }
 
 async fn status(State(s): State<ApiState>) -> Json<StatusView> {
@@ -1336,6 +1325,15 @@ mod tests {
         assert_eq!((s, b["error"].as_str().unwrap()), (401, message));
         let (s, b) = exchange("0".repeat(32)).await;
         assert_eq!((s, b["error"].as_str().unwrap()), (401, message));
+        // A body with a field the exchange does not know is refused as malformed, as for the other routes, and
+        // does not spend the code.
+        let (s, b) = e.post("/api/login-codes", json!({})).await;
+        let fresh = b["code"].as_str().unwrap().to_string();
+        let req = e.http.post(e.url("/api/web-sessions")).json(&json!({ "code": fresh, "extra": 1 }));
+        let (s_extra, _) = json_of(req.send().await.unwrap()).await;
+        assert_eq!((s, s_extra), (200, 400));
+        let (s, _) = exchange(fresh).await;
+        assert_eq!(s, 200);
 
         // The secret opens the API but cannot mint codes.
         let as_web = |m: Method, p: &str| e.http.request(m, e.url(p)).bearer_auth(&secret);

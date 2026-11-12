@@ -92,9 +92,9 @@ child_max_minutes = 120    # default time budget for a child
 max_nudges = 3             # stop-gate nudges or malformed replies in a row before the session is parked for you
 stall_steps = 30           # steps without a new ledger entry before the harness adds a stall note
 verify_finish = true       # a role with verify_finish has its finish attacked by its verifier first; false skips that for every role (the finish is marked "not verified")
-invalid_calls_before_forcing = 3   # consecutive invalid tool calls before the next request forces a tool call
+invalid_calls_before_forcing = 3   # reserved: accepted, but nothing reads it and it has no effect
 unviewed_min_lines = 20    # outputs with at least this many lines never shown are listed in the HUD
 
 [notify]
-# command = ["/usr/local/bin/my-notify"]   # program run with the title and body as two arguments; default: the platform's notifier
+# command = ["/usr/local/bin/my-notify"]   # program run per notification, given LOOM_KIND, LOOM_SESSION, LOOM_TITLE and LOOM_TEXT in its environment; default: the platform's notifier (macOS only; elsewhere nobody is notified)
 repeat_minutes = 0         # re-notify an unanswered blocking item this often; 0 = never (example: 30)

@@ -94,6 +94,17 @@ upgrade" first; the rest says what behaves differently.
 
 ### Daemon and web UI
 
+- The web UI shows a warning line when the disk of the loom home is low, and the daemon raises one
+  notification when it turns low (and again only after it has recovered).
+- A session's scratch directory (`tmp/`) is emptied when the session ends for good or is archived.
+- Where notifications are off (no `[notify] command` off macOS) the daemon logs a warning at start; a
+  start with `[sandbox] mode = "none"` or a configured `context_window` larger than the server's logs one too.
+- Notifications mark model-written text: a child's title starts with `unverified: ` and the ledger lines
+  of a parked session carry the `[From the agent, unverified]` label.
+- A config with a `context_window` below `context.target_tokens` loads; a session clamps the bounds to the window.
+- `agents.invalid_calls_before_forcing` is documented as reserved (it has no effect); the login-code exchange
+  rejects unknown fields.
+
 - The daemon takes `<home>/daemon.lock` first, so two daemons cannot start on one home. It binds only
   loopback addresses, and creates the token and keys atomically.
 - `/` and the page assets need no login; every `/api` route needs the bearer token or a web-session
