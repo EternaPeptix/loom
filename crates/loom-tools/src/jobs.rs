@@ -17,12 +17,19 @@
 //!   (`new_output`, raw bytes; the read position advances), the byte offset it starts at, and the
 //!   state. Unknown id → a sentence listing the known job ids (or saying there are none).
 //! - `peek(id)`: like `wait` with no waiting.
+//! - A job is running until its whole process group is empty, not only until its leader has exited;
+//!   its exit status is the leader's. `kill`, `kill_all` and `Drop` act on the group whether or not the
+//!   leader is still there.
 //! - `kill(id, grace)`: `Running::terminate`; the job settles as `Killed`. Killing an ended job is not
 //!   an error: the view simply shows its state.
 //! - `kill_all(grace)`: every running job, concurrently; returns when all have settled.
 //! - `list()`: all jobs, in id order.
-//! - A job whose output passes `max_output_bytes` is killed by its watcher and settles as
-//!   `Killed` with `detail` saying the output limit was reached.
+//! - A job whose output passes `max_output_bytes` is killed (SIGKILL, no grace) by its watcher and
+//!   settles as `Killed` with `detail` saying the output limit was reached. Output is never read back
+//!   beyond its first `max_output_bytes`; `detail` says when the rest was discarded.
+//! - `JobTable::new` clears what a crashed daemon left in `dir`: for every `jN.pid` record it kills the
+//!   recorded process group if the leader is still the same process (same start time), then removes
+//!   the pid, output and status files. `leftovers()` says what was found.
 //!
 //! Additions beyond the contract (this file only): `register_from` (a job whose first bytes the model
 //! was already shown), `output_blob` and `elapsed_ms` (what the job tools report). A table that is
@@ -33,7 +40,7 @@
 //! timeout; successive waits return disjoint, contiguous output; `kill`; `kill_all` with several
 //! jobs; output-limit kill; unknown id; `list`; `resume_from`; no event is sent twice.
 
-use crate::proc::{Ended, Running, WaitEnd};
+use crate::proc::{self, Ended, Running, WaitEnd};
 use loom_core::{BlobRef, BlobStore, CallId};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -93,9 +100,6 @@ pub enum JobEvent {
     },
 }
 
-/// Longest a job gets between TERM and KILL when the harness stops it for its output size.
-const OUTPUT_LIMIT_GRACE: Duration = Duration::from_secs(2);
-
 /// How long `kill` waits, beyond the grace period, for the watcher to report the job settled.
 const KILL_REPORT_SLACK: Duration = Duration::from_secs(15);
 
@@ -119,16 +123,17 @@ fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-/// The bytes of `path` from offset `from` to the end.
-fn read_from(path: &Path, from: u64) -> std::io::Result<Vec<u8>> {
+/// The bytes of `path` from offset `from` up to offset `max` (or the end, when that comes first).
+fn read_from(path: &Path, from: u64, max: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path)?;
-    if from >= f.metadata()?.len() {
+    let end = f.metadata()?.len().min(max);
+    if from >= end {
         return Ok(Vec::new());
     }
     f.seek(SeekFrom::Start(from))?;
     let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
+    f.take(end.saturating_sub(from)).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
@@ -147,6 +152,43 @@ struct Shared {
     /// Cancelled to ask the watcher to stop the job.
     stop: CancellationToken,
     grace: Mutex<Duration>,
+    /// Output is read back only up to this many bytes.
+    limit: u64,
+}
+
+/// A command record found in the jobs directory when the table was created: the previous daemon's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Leftover {
+    pub id: String,
+    /// The recorded leader pid (0 when the record was unreadable).
+    pub pid: u32,
+    /// Whether its process group was alive, the leader still the recorded process, and was killed.
+    pub killed: bool,
+}
+
+/// Kills what an earlier daemon left running in `dir` (only processes whose identity is confirmed) and
+/// removes the files of every command recorded there.
+fn clear_leftovers(dir: &Path) -> Vec<Leftover> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut found = Vec::new();
+    for path in entries.flatten().map(|e| e.path()) {
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|s| id_number(s).is_some()).map(str::to_string) else {
+            continue;
+        };
+        if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+            continue;
+        }
+        let (pid, killed) = match proc::read_pid_record(&path) {
+            Some((pid, start)) => (pid, proc::kill_recorded_group(pid, start.as_deref())),
+            None => (0, false),
+        };
+        for name in [format!("{id}.pid"), format!("{id}.out"), format!("{id}.status")] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        found.push(Leftover { id, pid, killed });
+    }
+    found.sort_by_key(|l| id_order(&l.id));
+    found
 }
 
 pub struct JobTable {
@@ -155,6 +197,7 @@ pub struct JobTable {
     events: UnboundedSender<JobEvent>,
     max_output_bytes: u64,
     inner: Mutex<Inner>,
+    leftovers: Vec<Leftover>,
 }
 
 #[derive(Default)]
@@ -174,7 +217,15 @@ fn unknown(id: &str, known: &[String]) -> String {
 
 impl JobTable {
     pub fn new(dir: PathBuf, blobs: BlobStore, events: UnboundedSender<JobEvent>, max_output_bytes: u64) -> JobTable {
-        JobTable { dir, blobs, events, max_output_bytes, inner: Mutex::new(Inner::default()) }
+        let leftovers = clear_leftovers(&dir);
+        // Ids of the previous daemon's commands are not handed out again.
+        let last = leftovers.iter().filter_map(|l| id_number(&l.id)).max().unwrap_or(0);
+        JobTable { dir, blobs, events, max_output_bytes, inner: Mutex::new(Inner { last, jobs: Vec::new() }), leftovers }
+    }
+
+    /// The commands of a previous daemon found when this table was created (and cleared).
+    pub fn leftovers(&self) -> &[Leftover] {
+        &self.leftovers
     }
 
     /// The next id will be `j{n+1}` (never lower than ids already handed out).
@@ -200,7 +251,9 @@ impl JobTable {
 
     /// Like [`JobTable::register`], for a job whose first `read_from` bytes of output the model has
     /// already been shown: the first `job_wait` starts after them.
-    pub async fn register_from(&self, id: &str, call_id: &CallId, command: &str, running: Running, read_from: u64) -> JobInfo {
+    pub async fn register_from(&self, id: &str, call_id: &CallId, command: &str, mut running: Running, read_from: u64) -> JobInfo {
+        // From here on the table (its watcher and its Drop) is responsible for the group.
+        running.disarm();
         let info = JobInfo {
             id: id.to_string(),
             call_id: call_id.clone(),
@@ -218,6 +271,7 @@ impl JobTable {
             ended,
             stop: CancellationToken::new(),
             grace: Mutex::new(Duration::from_secs(5)),
+            limit: self.max_output_bytes,
         });
         {
             let mut inner = lock(&self.inner);
@@ -339,7 +393,7 @@ fn view_of(j: &Shared) -> JobView {
         st.info.output_bytes = file_len(&st.info.out_path);
     }
     let from = st.read_pos;
-    let new_output = read_from(&st.info.out_path, from).unwrap_or_default();
+    let new_output = read_from(&st.info.out_path, from, j.limit).unwrap_or_default();
     st.read_pos = from.saturating_add(new_output.len() as u64);
     JobView { info: st.info.clone(), new_output, from }
 }
@@ -347,7 +401,8 @@ fn view_of(j: &Shared) -> JobView {
 /// Owns the process until it is over, then stores the output and reports, once.
 async fn watch(shared: Arc<Shared>, mut running: Running, blobs: BlobStore, events: UnboundedSender<JobEvent>, max_output_bytes: u64) {
     let mut detail = String::new();
-    let end = running.wait(&shared.stop, None, max_output_bytes).await;
+    // The job is over when its group is empty; the leader's status is the job's.
+    let end = running.wait_group(&shared.stop, None, max_output_bytes).await;
     let state = match end {
         WaitEnd::Ended(e) => JobState::Ended(e),
         WaitEnd::Cancelled | WaitEnd::Deadline => {
@@ -356,14 +411,23 @@ async fn watch(shared: Arc<Shared>, mut running: Running, blobs: BlobStore, even
             JobState::Killed
         }
         WaitEnd::TooMuchOutput => {
-            running.terminate(OUTPUT_LIMIT_GRACE).await;
+            // No grace: a command that ignores TERM would otherwise keep writing.
+            running.kill().await;
             detail = format!("stopped by the harness: the output passed the limit of {max_output_bytes} bytes");
             JobState::Killed
         }
     };
     // The process group is gone (or `terminate` gave up on it); the files are final.
     let path = lock(&shared.st).info.out_path.clone();
-    let stored = read_from(&path, 0)
+    let total = file_len(&path);
+    if total > max_output_bytes {
+        if !detail.is_empty() {
+            detail.push_str("; ");
+        }
+        detail.push_str(&format!("the output was {total} bytes; only the first {max_output_bytes} bytes were stored and the rest was discarded"));
+    }
+    let _ = std::fs::remove_file(proc::pid_path(&path));
+    let stored = read_from(&path, 0, max_output_bytes)
         .and_then(|raw| crate::view::store_text(&blobs, &raw).map(|(b, _)| b))
         .map_err(|e| format!("the complete output could not be stored ({e}); it is still in the file {}", path.display()));
     let output = match stored {
@@ -562,6 +626,65 @@ mod tests {
         assert_eq!(v.info.state, JobState::Killed);
     }
 
+    async fn gone(pid: i32) -> bool {
+        for _ in 0..200 {
+            // SAFETY: signal 0 only tests for existence.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    async fn child_pid(path: &Path) -> i32 {
+        for _ in 0..200 {
+            if let Some(p) = std::fs::read_to_string(path).ok().and_then(|t| t.trim().parse().ok()) {
+                return p;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no pid in {}", path.display());
+    }
+
+    #[tokio::test]
+    async fn a_job_stays_running_while_a_child_of_its_group_runs() {
+        let mut f = fx();
+        f.start("sleep 1 & echo leader-done").await;
+        let _ = f.event().await;
+        // The leader is gone within milliseconds; the job is not over.
+        let v = f.table.wait("j1", Duration::from_millis(500), &never()).await.expect("wait");
+        assert_eq!(v.info.state, JobState::Running);
+        assert_eq!(v.new_output, b"leader-done\n");
+        let v = f.table.wait("j1", Duration::from_secs(20), &never()).await.expect("wait");
+        assert_eq!(v.info.state, JobState::Ended(Ended::Exit(0)));
+        let JobEvent::Settled { info, .. } = f.event().await else { panic!("Settled") };
+        assert_eq!(info.state, JobState::Ended(Ended::Exit(0)));
+    }
+
+    #[tokio::test]
+    async fn kill_and_drop_reach_a_group_whose_leader_has_ended() {
+        let f = fx();
+        let pidfile = f.root.join("child.pid");
+        f.start(&format!("sleep 300 & echo $! > {}", pidfile.display())).await;
+        let child = child_pid(&pidfile).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let v = f.table.peek("j1").await.expect("peek");
+        assert_eq!(v.info.state, JobState::Running);
+        let v = f.table.kill("j1", Duration::from_secs(2)).await.expect("kill");
+        assert_eq!(v.info.state, JobState::Killed);
+        assert!(gone(child).await, "the child outlived job_kill");
+
+        let f = fx();
+        let pidfile = f.root.join("child2.pid");
+        f.start(&format!("sleep 300 & echo $! > {}", pidfile.display())).await;
+        let child = child_pid(&pidfile).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let Fx { table, .. } = f;
+        drop(table);
+        assert!(gone(child).await, "the child outlived the table");
+    }
+
     #[tokio::test]
     async fn kill_all_stops_every_running_job() {
         let mut f = fx();
@@ -603,6 +726,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_term_ignoring_writer_is_stopped_at_once_and_only_the_limit_is_stored() {
+        let mut f = fx_with(2_000);
+        let info = f.start("trap '' TERM; yes").await;
+        let _ = f.event().await;
+        let JobEvent::Settled { info: settled, output, detail } = f.event().await else { panic!("Settled") };
+        assert_eq!(settled.state, JobState::Killed);
+        assert!(gone(i32::try_from(info.pid).expect("pid")).await);
+        // `yes` prints two bytes per line, so exactly the first 2000 bytes were stored.
+        assert_eq!(f.stored(&output.expect("stored")).len(), 2_000);
+        assert!(detail.contains("only the first 2000 bytes"), "{detail}");
+        let v = f.table.peek("j1").await.expect("peek");
+        assert!(v.new_output.len() <= 2_000);
+        assert!(v.info.output_bytes >= 2_000);
+    }
+
+    #[tokio::test]
     async fn unknown_ids_get_a_sentence_that_names_the_known_ones() {
         let f = fx();
         let e = f.table.peek("j9").await.expect_err("unknown");
@@ -629,6 +768,70 @@ mod tests {
         assert_eq!(f.table.allocate().await.expect("allocate").0, "j42");
         f.table.resume_from(3).await;
         assert_eq!(f.table.allocate().await.expect("allocate").0, "j43");
+    }
+
+    /// A command of a "previous daemon": spawned with its record in the jobs directory, never registered.
+    fn orphan(f: &Fx, id: &str) -> u32 {
+        let dir = f.root.join("home/jobs");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let env = [("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let spec = Spawn {
+            script: "sleep 300".to_string(),
+            cwd: f.root.clone(),
+            env,
+            out_path: dir.join(format!("{id}.out")),
+            exit_path: dir.join(format!("{id}.status")),
+        };
+        let mut running = spawn(&f.sb, &spec).expect("spawn");
+        running.disarm();
+        running.pid
+    }
+
+    fn table_over(f: &Fx) -> (JobTable, UnboundedReceiver<JobEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (JobTable::new(f.root.join("home/jobs"), f.blobs.clone(), tx, 1 << 20), rx)
+    }
+
+    fn no_files_left(f: &Fx, id: &str) {
+        for ext in ["pid", "out", "status"] {
+            assert!(!f.root.join(format!("home/jobs/{id}.{ext}")).exists(), "{id}.{ext} was not removed");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_table_kills_the_previous_daemons_confirmed_group_and_clears_its_files() {
+        let f = fx();
+        let pid = orphan(&f, "j7");
+        assert!(alive(pid));
+        let (table, _rx) = table_over(&f);
+        assert_eq!(table.leftovers(), [Leftover { id: "j7".to_string(), pid, killed: true }]);
+        assert!(gone(i32::try_from(pid).expect("pid")).await, "the orphaned group was not killed");
+        no_files_left(&f, "j7");
+        // Its id is not handed out again.
+        assert_eq!(table.allocate().await.expect("allocate").0, "j8");
+    }
+
+    #[tokio::test]
+    async fn a_record_whose_start_time_does_not_match_is_not_signalled() {
+        let f = fx();
+        let pid = orphan(&f, "j3");
+        // The pid now "belongs" to a different process: the recorded start time is wrong.
+        std::fs::write(f.root.join("home/jobs/j3.pid"), format!("{pid} 1.000000\n")).expect("write");
+        let (table, _rx) = table_over(&f);
+        assert_eq!(table.leftovers(), [Leftover { id: "j3".to_string(), pid, killed: false }]);
+        assert!(alive(pid));
+        no_files_left(&f, "j3");
+        // A record without a start time is not enough to signal either.
+        let pid2 = orphan(&f, "j4");
+        std::fs::write(f.root.join("home/jobs/j4.pid"), format!("{pid2} -\n")).expect("write");
+        let (table2, _rx2) = table_over(&f);
+        assert_eq!(table2.leftovers(), [Leftover { id: "j4".to_string(), pid: pid2, killed: false }]);
+        assert!(alive(pid2));
+        // SAFETY: cleaning up the test's own sleeping processes.
+        unsafe {
+            libc::kill(-i32::try_from(pid).expect("pid"), libc::SIGKILL);
+            libc::kill(-i32::try_from(pid2).expect("pid"), libc::SIGKILL);
+        }
     }
 
     #[tokio::test]

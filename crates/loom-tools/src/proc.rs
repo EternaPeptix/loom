@@ -14,8 +14,8 @@
 //! /bin/bash -c "$0" 2>&1; echo $? >&2
 //! ```
 //!
-//! with stdin `/dev/null`, stdout = `out_path` (created, append), stderr = `exit_path` (created,
-//! truncated), working directory `spec.cwd`, environment exactly `spec.env` (cleared first), and its
+//! with stdin `/dev/null`, stdout = `out_path` and stderr = `exit_path` (both created fresh: a
+//! leftover file of that name is removed first, never appended to), working directory `spec.cwd`, environment exactly `spec.env` (cleared first), and its
 //! own process group (`process_group(0)`). So `out_path` holds stdout and stderr of the command in
 //! the order they were written, and `exit_path` ends up holding the status as a decimal number.
 //! Anything else in `exit_path` (the sandbox launcher or the shell complaining) means the command did
@@ -24,15 +24,21 @@
 //! ## `poll`
 //! Non-blocking. If we are the parent, reap the child when it has exited (`try_wait`). The command
 //! has ended when the child was reaped or — adopted commands — `kill(pid, 0)` says the process is
-//! gone. Then the status comes from `exit_path`: a number `n < 128` → `Exit(n)`; `n >= 128` →
-//! `Signal(n - 128)`; empty → `Signal(sig)` if the reaped status carries a signal, else `Unknown`;
-//! other text → `Failed(text)`. Until then `None`. Once it has returned `Some`, it keeps returning
+//! gone. Then the status comes from `exit_path`: a number `0..=255` → `Exit(n)` (a code above 128 is
+//! only conventionally a signal; see [`Ended::fact`]); empty → `Signal(sig)` if the reaped leader
+//! itself reports a signal, else `Unknown`; other text → `Failed(text)`. Until then `None`. Once it has returned `Some`, it keeps returning
 //! the same value.
 //!
 //! ## `wait`
 //! Polls every 50 ms (25 ms for the first second) until the command ends, `cancel` fires, `deadline`
 //! elapses, or the output file is larger than `max_bytes` — whichever happens first — and says
 //! which. It never kills anything.
+//!
+//! ## Process groups
+//! A command is not over while its group has live members. `poll` and `wait` report the leader;
+//! `group_alive` and `wait_group` look at the whole group. `spawn` records `<job>.pid` (pid and start
+//! time) beside the output file for crash recovery. A `Running` that is dropped while armed (not
+//! `disarm`ed, as `JobTable::register` does) SIGKILLs its group.
 //!
 //! ## `terminate`
 //! Sends TERM to the process group; polls for up to `grace`; if anything in the group is still alive
@@ -54,7 +60,7 @@ use crate::sandbox::Sandbox;
 use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
@@ -106,6 +112,18 @@ fn signal_name(sig: i32) -> Option<&'static str> {
 }
 
 impl Ended {
+    /// A line explaining an exit code above 128, which conventionally means death by signal `code - 128`.
+    pub fn fact(&self) -> Option<String> {
+        match self {
+            Ended::Exit(n) if *n > 128 => {
+                let sig = n - 128;
+                let name = signal_name(sig).map(|s| format!(" ({s})")).unwrap_or_default();
+                Some(format!("exit code {n}: 128+N conventionally means the command was killed by signal N, here signal {sig}{name}"))
+            }
+            _ => None,
+        }
+    }
+
     /// `exit 0`, `exit 3`, `killed by signal 9 (KILL)`, `ended without a status`, `could not start`.
     pub fn outcome(&self) -> String {
         match self {
@@ -136,6 +154,69 @@ pub struct Running {
     pub started_ms: u64,
     child: Option<tokio::process::Child>,
     ended: Option<Ended>,
+    /// While set, dropping this value kills the command's process group.
+    armed: bool,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if self.armed && group_alive(self.pid) {
+            signal_group(self.pid, libc::SIGKILL);
+        }
+    }
+}
+
+/// Where `spawn` records the leader's pid and start time for a command whose output goes to `out_path`.
+pub fn pid_path(out_path: &Path) -> PathBuf {
+    out_path.with_extension("pid")
+}
+
+/// The start time of process `pid` as the OS reports it (text, comparable only with itself), or `None`
+/// when it cannot be read or the process is gone.
+pub fn process_start(pid: u32) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let p = i32::try_from(pid).ok()?;
+        let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+        // SAFETY: proc_bsdinfo is plain integers, for which all-zero is a valid value.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        // SAFETY: the buffer is `size` bytes of a live, exclusively borrowed struct.
+        let n = unsafe { libc::proc_pidinfo(p, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) };
+        (n == size).then(|| format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Field 22 (start time in ticks); fields after the parenthesised name begin at field 3.
+        let rest = stat.rsplit_once(')')?.1;
+        rest.split_whitespace().nth(19).map(str::to_string)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// What a pid record left by an earlier run says: the leader's pid and its recorded start time.
+pub fn read_pid_record(path: &Path) -> Option<(u32, Option<String>)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut parts = text.split_whitespace();
+    let pid = parts.next()?.parse().ok()?;
+    let start = parts.next().filter(|s| *s != "-").map(str::to_string);
+    Some((pid, start))
+}
+
+/// SIGKILLs the group led by `pid` when that process is still the one recorded (same start time) and
+/// its group is alive. A pid whose identity cannot be confirmed is never signalled. Returns whether
+/// the group was signalled.
+pub fn kill_recorded_group(pid: u32, recorded_start: Option<&str>) -> bool {
+    let Some(recorded) = recorded_start else { return false };
+    if process_start(pid).as_deref() != Some(recorded) || !group_alive(pid) {
+        return false;
+    }
+    signal_group(pid, libc::SIGKILL);
+    true
 }
 
 /// The pid as a signal target; pids 0 and 1 are never targets (0 would mean our own group).
@@ -163,9 +244,21 @@ fn signal_group(pgid: u32, sig: i32) {
     }
 }
 
+/// Removes a leftover file of an earlier command so that the new one starts from nothing.
+fn remove_stale(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
 pub fn spawn(sandbox: &Sandbox, spec: &Spawn) -> io::Result<Running> {
-    let out = std::fs::OpenOptions::new().create(true).append(true).open(&spec.out_path)?;
-    let exit = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&spec.exit_path)?;
+    let pid_file = pid_path(&spec.out_path);
+    for stale in [&spec.out_path, &spec.exit_path, &pid_file] {
+        remove_stale(stale)?;
+    }
+    let out = std::fs::OpenOptions::new().create_new(true).append(true).open(&spec.out_path)?;
+    let exit = std::fs::OpenOptions::new().create_new(true).write(true).open(&spec.exit_path)?;
     let (program, mut args) = sandbox.command(WRAPPER);
     args.push(spec.script.clone());
     let mut cmd = tokio::process::Command::new(program);
@@ -180,6 +273,8 @@ pub fn spawn(sandbox: &Sandbox, spec: &Spawn) -> io::Result<Running> {
         .kill_on_drop(false);
     let child = cmd.spawn()?;
     let pid = child.id().ok_or_else(|| io::Error::other("the command exited before it could be tracked; run it again"))?;
+    // Best effort: without the record a crash leaves the group for the operator to clean up.
+    let _ = std::fs::write(&pid_file, format!("{pid} {}\n", process_start(pid).as_deref().unwrap_or("-")));
     let started_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)).unwrap_or(0);
     Ok(Running {
         pid,
@@ -188,13 +283,24 @@ pub fn spawn(sandbox: &Sandbox, spec: &Spawn) -> io::Result<Running> {
         started_ms,
         child: Some(child),
         ended: None,
+        armed: true,
     })
 }
 
 impl Running {
     /// A command started by an earlier run of this program.
     pub fn adopt(pid: u32, out_path: PathBuf, exit_path: PathBuf, started_ms: u64) -> Running {
-        Running { pid, out_path, exit_path, started_ms, child: None, ended: None }
+        Running { pid, out_path, exit_path, started_ms, child: None, ended: None, armed: false }
+    }
+
+    /// Ends the drop guard: the command's group is now somebody else's to stop.
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Whether any process of the command's group is alive, the leader or not.
+    pub fn group_alive(&self) -> bool {
+        group_alive(self.pid)
     }
 
     /// The status the exit file holds; `signal` is the signal of the reaped leader, if any.
@@ -208,8 +314,7 @@ impl Running {
         // start; what precedes it is the shell's own notice (`Killed: 9`) and is not a failure.
         let last = text.lines().next_back().unwrap_or_default().trim();
         match last.parse::<i32>() {
-            Ok(n) if (0..128).contains(&n) => Ended::Exit(n),
-            Ok(n) if n >= 128 => Ended::Signal(n - 128),
+            Ok(n) if (0..=255).contains(&n) => Ended::Exit(n),
             _ => Ended::Failed(text.to_string()),
         }
     }
@@ -235,9 +340,19 @@ impl Running {
     }
 
     pub async fn wait(&mut self, cancel: &CancellationToken, deadline: Option<Duration>, max_bytes: u64) -> WaitEnd {
+        self.wait_with(cancel, deadline, max_bytes, false).await
+    }
+
+    /// Like [`Running::wait`], but the command is over only when its whole process group is gone;
+    /// `Ended` then carries the leader's status.
+    pub async fn wait_group(&mut self, cancel: &CancellationToken, deadline: Option<Duration>, max_bytes: u64) -> WaitEnd {
+        self.wait_with(cancel, deadline, max_bytes, true).await
+    }
+
+    async fn wait_with(&mut self, cancel: &CancellationToken, deadline: Option<Duration>, max_bytes: u64, whole_group: bool) -> WaitEnd {
         let start = Instant::now();
         loop {
-            if let Some(e) = self.poll() {
+            if let Some(e) = self.poll().filter(|_| !whole_group || !group_alive(self.pid)) {
                 return WaitEnd::Ended(e);
             }
             if cancel.is_cancelled() {
@@ -259,7 +374,7 @@ impl Running {
     }
 
     pub async fn terminate(&mut self, grace: Duration) -> Ended {
-        if let Some(e) = self.poll() {
+        if let Some(e) = self.poll().filter(|_| !group_alive(self.pid)) {
             return e;
         }
         signal_group(self.pid, libc::SIGTERM);
@@ -272,21 +387,40 @@ impl Running {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         if group_alive(self.pid) {
+            return self.kill().await;
+        }
+        self.poll().unwrap_or(Ended::Unknown)
+    }
+
+    /// SIGKILLs the whole group at once (no TERM, no grace: used when the command must stop writing
+    /// now) and waits for the leader and the group to go.
+    pub async fn kill(&mut self) -> Ended {
+        if group_alive(self.pid) {
             signal_group(self.pid, libc::SIGKILL);
-            let limit = Instant::now() + KILL_SETTLE;
-            loop {
-                let ended = self.poll().is_some();
-                if (ended && !group_alive(self.pid)) || Instant::now() >= limit {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let limit = Instant::now() + KILL_SETTLE;
+        loop {
+            let ended = self.poll().is_some();
+            if (ended && !group_alive(self.pid)) || Instant::now() >= limit {
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         self.poll().unwrap_or(Ended::Unknown)
     }
 
     pub fn output_len(&self) -> u64 {
         std::fs::metadata(&self.out_path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// The first `max` bytes of the output file and the file's size when it was opened.
+    pub fn read_output_capped(&self, max: u64) -> io::Result<(Vec<u8>, u64)> {
+        use std::io::Read;
+        let f = std::fs::File::open(&self.out_path)?;
+        let len = f.metadata()?.len();
+        let mut buf = Vec::new();
+        f.take(max).read_to_end(&mut buf)?;
+        Ok((buf, len))
     }
 
     pub fn read_output(&self, from: u64) -> io::Result<Vec<u8>> {
@@ -425,6 +559,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exit_128_and_255_are_exit_codes_and_above_128_has_a_fact() {
+        for (code, want_fact) in [(128, false), (255, true)] {
+            let f = fx();
+            let mut r = f.start(&format!("exit {code}"));
+            let end = finish(&mut r).await;
+            assert_eq!(end, Ended::Exit(code));
+            assert_eq!(end.outcome(), format!("exit {code}"));
+            assert_eq!(end.fact().is_some(), want_fact);
+        }
+        let fact = Ended::Exit(137).fact().expect("fact");
+        assert!(fact.contains("128+N") && fact.contains("signal 9 (KILL)"), "{fact}");
+        assert!(Ended::Exit(200).fact().expect("fact").contains("signal 72"));
+        assert!(Ended::Signal(9).fact().is_none() && Ended::Exit(3).fact().is_none());
+    }
+
+    #[tokio::test]
     async fn output_is_interleaved_in_write_order() {
         let f = fx();
         let mut r = f.start("echo one; echo two >&2; echo three; echo four >&2");
@@ -435,7 +585,13 @@ mod tests {
     #[tokio::test]
     async fn killed_by_signal_and_missing_command() {
         let f = fx();
+        // The inner shell dies of the signal; the wrapper survives and reports 137 as an exit code.
         let mut r = f.start("kill -9 $$");
+        assert_eq!(finish(&mut r).await, Ended::Exit(137));
+
+        // The leader itself killed by a signal is a signal.
+        let f = fx();
+        let mut r = f.start("kill -9 $PPID");
         assert_eq!(finish(&mut r).await, Ended::Signal(9));
 
         let f = fx();
@@ -469,10 +625,13 @@ mod tests {
             ("0\n", Ended::Exit(0)),
             ("5\n", Ended::Exit(5)),
             ("127\n", Ended::Exit(127)),
-            ("130\n", Ended::Signal(2)),
-            ("137\n", Ended::Signal(9)),
+            ("128\n", Ended::Exit(128)),
+            ("130\n", Ended::Exit(130)),
+            ("137\n", Ended::Exit(137)),
+            ("255\n", Ended::Exit(255)),
+            ("256\n", Ended::Failed("256".into())),
             ("sandbox-exec: bad profile\n", Ended::Failed("sandbox-exec: bad profile".into())),
-            ("bash: line 1: 77 Killed: 9  /bin/bash -c \"$0\"\n137\n", Ended::Signal(9)),
+            ("bash: line 1: 77 Killed: 9  /bin/bash -c \"$0\"\n137\n", Ended::Exit(137)),
         ];
         for (text, want) in cases {
             std::fs::write(&exit, text).expect("write");
@@ -512,6 +671,73 @@ mod tests {
         assert!(r.poll().is_none());
         r.terminate(Duration::from_secs(2)).await;
         assert!(r.poll().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_term_ignoring_writer_is_killed_at_once_and_the_read_is_bounded() {
+        let f = fx();
+        let script = "trap '' TERM; while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done";
+        let mut r = f.start(script);
+        assert_eq!(r.wait(&never(), Some(Duration::from_secs(20)), 5_000).await, WaitEnd::TooMuchOutput);
+        let t = Instant::now();
+        r.kill().await;
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(!r.group_alive());
+        let (kept, size) = r.read_output_capped(5_000).expect("read");
+        assert_eq!(kept.len(), 5_000);
+        assert!(size >= 5_000);
+    }
+
+    #[tokio::test]
+    async fn the_group_outlives_its_leader_and_is_still_tracked() {
+        let f = fx();
+        let p = f.pidfile();
+        let mut r = f.start(&format!("sleep 300 & echo $! >> {}", p.display()));
+        let pids = read_pids(&p, 1).await;
+        assert_eq!(finish(&mut r).await, Ended::Exit(0));
+        assert!(r.group_alive());
+        // `wait_group` does not report the end while the child lives.
+        assert_eq!(r.wait_group(&never(), Some(Duration::from_millis(300)), u64::MAX).await, WaitEnd::Deadline);
+        // terminate acts on the group although the leader is gone.
+        r.terminate(Duration::from_secs(2)).await;
+        assert_gone(&pids).await;
+        assert!(!r.group_alive());
+
+        let mut r = f.start("sleep 0.5 & exit 3");
+        assert_eq!(r.wait_group(&never(), Some(Duration::from_secs(20)), u64::MAX).await, WaitEnd::Ended(Ended::Exit(3)));
+        assert!(!r.group_alive());
+    }
+
+    #[tokio::test]
+    async fn dropping_an_armed_running_kills_its_group_and_a_disarmed_one_does_not() {
+        let f = fx();
+        let r = f.start(&tree(&f, "wait"));
+        let pids = read_pids(&f.pidfile(), 2).await;
+        drop(r);
+        assert_gone(&pids).await;
+
+        let f = fx();
+        let mut r = f.start(&tree(&f, "wait"));
+        let pids = read_pids(&f.pidfile(), 2).await;
+        r.disarm();
+        let pid = r.pid;
+        drop(r);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(pids.iter().all(|p| alive(*p)));
+        let mut adopted = Running::adopt(pid, f.root.join("out"), f.root.join("exit"), 0);
+        adopted.terminate(Duration::from_secs(2)).await;
+        assert_gone(&pids).await;
+    }
+
+    #[tokio::test]
+    async fn the_pid_record_names_the_leader_and_its_start_time() {
+        let f = fx();
+        let mut r = f.start("sleep 300");
+        let (pid, start) = read_pid_record(&pid_path(&r.out_path)).expect("record");
+        assert_eq!(pid, r.pid);
+        assert_eq!(start, process_start(r.pid));
+        assert!(start.is_some());
+        r.terminate(Duration::from_secs(2)).await;
     }
 
     #[tokio::test]
@@ -624,8 +850,9 @@ mod tests {
     #[tokio::test]
     async fn adopt_picks_up_a_running_command() {
         let f = fx();
-        let r = f.start("echo started; sleep 1; echo done; exit 5");
+        let mut r = f.start("echo started; sleep 1; echo done; exit 5");
         let (pid, out, exit, ms) = (r.pid, r.out_path.clone(), r.exit_path.clone(), r.started_ms);
+        r.disarm();
         drop(r);
         let mut adopted = Running::adopt(pid, out, exit, ms);
         assert!(adopted.poll().is_none());
@@ -637,9 +864,10 @@ mod tests {
     #[tokio::test]
     async fn adopted_commands_can_be_terminated_as_a_group() {
         let f = fx();
-        let r = f.start(&tree(&f, "wait"));
+        let mut r = f.start(&tree(&f, "wait"));
         let pids = read_pids(&f.pidfile(), 2).await;
         let (pid, out, exit, ms) = (r.pid, r.out_path.clone(), r.exit_path.clone(), r.started_ms);
+        r.disarm();
         drop(r);
         let mut adopted = Running::adopt(pid, out, exit, ms);
         assert!(adopted.poll().is_none());
@@ -658,13 +886,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_is_appended_and_exit_file_truncated() {
+    async fn leftover_files_of_the_same_name_are_never_appended_to() {
         let f = fx();
         let mut r = f.start("echo one; exit 1");
         assert_eq!(finish(&mut r).await, Ended::Exit(1));
         let mut r = f.start("echo two");
         assert_eq!(finish(&mut r).await, Ended::Exit(0));
-        assert_eq!(r.read_output(0).expect("read"), b"one\ntwo\n");
+        assert_eq!(r.read_output(0).expect("read"), b"two\n");
+        // Even a stale file that holds a plausible status does not leak into the new command.
+        let f = fx();
+        std::fs::write(f.root.join("out"), "stale output\n").expect("write");
+        std::fs::write(f.root.join("exit"), "9\n").expect("write");
+        let mut r = f.start("echo fresh");
+        assert_eq!(finish(&mut r).await, Ended::Exit(0));
+        assert_eq!(r.read_output(0).expect("read"), b"fresh\n");
     }
 
     #[tokio::test]
