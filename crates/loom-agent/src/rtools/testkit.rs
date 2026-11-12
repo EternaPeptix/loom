@@ -219,7 +219,18 @@ impl Rig {
     /// Run a call the way the runtime does: through `execute`, arguments as JSON text.
     pub async fn call(&self, name: &str, args: Value) -> ToolResult {
         let admission = Admission { policy: &self.env.policy, estimator: &self.env.estimator };
-        execute(&self.registry, &self.env.ctx, name, &args.to_string(), &admission).await
+        let result = execute(&self.registry, &self.env.ctx, name, &args.to_string(), &admission).await;
+        // As the runtime does for every recorded result: the call that stored an output produced it.
+        // (A view such as `out_read` stores nothing; it leaves the output it views with its producer.)
+        if let Some(out) = &result.output {
+            lock(&self.orch.producers).entry(out.id.clone()).or_insert(Producer {
+                session: self.shared.session.clone(),
+                call_id: result.call_id.clone(),
+                tool: result.name.clone(),
+                class: result.class,
+            });
+        }
+        result
     }
 
     /// Write an op to the mission journal as the operator (`from_user`), bypassing the tools.
