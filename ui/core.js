@@ -1091,4 +1091,83 @@ export function errorSentence(status, bodyText) {
   return bodyText && bodyText.trim() ? oneLine(bodyText, 300) : `The request failed (${status}).`;
 }
 
-export const LOST_TOKEN = 'This page lost its access token. Run "loom open" again.';
+export const LOST_TOKEN = 'This page is not signed in. Run "loom open" again.';
+
+/** The login code of a URL fragment (`#code=<hex>`), or null. Anything else in the fragment is not a code. */
+export function codeFromHash(hash) {
+  const m = /^#code=([0-9a-f]{16,128})$/.exec(String(hash || ""));
+  return m ? m[1] : null;
+}
+
+/** Milliseconds to wait before reconnecting a dropped stream: 1 s, doubling, at most 15 s. */
+export function reconnectDelayMs(attempt) {
+  const n = Math.max(0, Math.min(Number.isFinite(attempt) ? Math.floor(attempt) : 0, 10));
+  return Math.min(1000 * 2 ** n, 15000);
+}
+
+/**
+ * A server-sent-events parser for text arriving in arbitrary chunks. `feed(text)` returns the events
+ * completed by it, each `{data, id}` (`id` is the last `id:` field seen, or null). Lines end in LF,
+ * CRLF or CR; lines starting with `:` are comments; several `data:` lines join with a newline;
+ * an event with no `data:` line is not delivered.
+ */
+export function createSseParser() {
+  let pieces = []; // the unfinished line, in the pieces it arrived in; joined once, when it ends
+  let heldCr = false;
+  let data = [];
+  let id = null;
+  return {
+    feed(chunk) {
+      let text = (heldCr ? "\r" : "") + String(chunk);
+      // A CR at the very end may be half of a CRLF: wait for the next chunk to know.
+      heldCr = text.endsWith("\r");
+      if (heldCr) text = text.slice(0, -1);
+      // Only the new text is searched for line ends, so a long line costs its length once.
+      const lines = text.replace(/\r\n?/g, "\n").split("\n");
+      const rest = lines.pop();
+      if (lines.length) {
+        pieces.push(lines[0]);
+        lines[0] = pieces.join("");
+        pieces = [];
+      }
+      if (rest) pieces.push(rest);
+      const out = [];
+      for (const line of lines) {
+        if (line === "") {
+          if (data.length) out.push({ data: data.join("\n"), id });
+          data = [];
+          continue;
+        }
+        if (line.startsWith(":")) continue;
+        const colon = line.indexOf(":");
+        const field = colon < 0 ? line : line.slice(0, colon);
+        let value = colon < 0 ? "" : line.slice(colon + 1);
+        if (value.startsWith(" ")) value = value.slice(1);
+        if (field === "data") data.push(value);
+        else if (field === "id" && !value.includes("\0")) id = value;
+      }
+      return out;
+    },
+  };
+}
+
+/**
+ * Hand the JSON object in each parsed event to `handle`. Data that is not JSON is skipped. What
+ * `handle` throws goes to `report` and the events after it are still delivered: an event the page
+ * cannot show is not a dropped connection.
+ */
+export function deliverEvents(events, handle, report) {
+  for (const m of events) {
+    let ev;
+    try {
+      ev = JSON.parse(m.data);
+    } catch {
+      continue;
+    }
+    try {
+      handle(ev);
+    } catch (e) {
+      report(e);
+    }
+  }
+}

@@ -657,6 +657,128 @@ test("error sentence", () => {
   assert.equal(C.errorSentence(502, "bad gateway"), "bad gateway");
 });
 
+test("the login code is read from the fragment only when it is a whole hex code", () => {
+  const code = "0123456789abcdef0123456789abcdef";
+  assert.equal(C.codeFromHash("#code=" + code), code);
+  for (const h of ["", "#", "#/s/s-1", "#code=", "#code=xyz", "#code=" + code + "&x=1", "#x=1&code=" + code, "code=" + code, "#code=ABCDEF0123456789ABCDEF", "#code=" + "a".repeat(129), null, undefined])
+    assert.equal(C.codeFromHash(h), null, String(h));
+});
+
+test("reconnect delays double from one second up to fifteen", () => {
+  assert.deepEqual([0, 1, 2, 3, 4, 5, 50].map(C.reconnectDelayMs), [1000, 2000, 4000, 8000, 15000, 15000, 15000]);
+  assert.equal(C.reconnectDelayMs(-3), 1000);
+  assert.equal(C.reconnectDelayMs(NaN), 1000);
+});
+
+test("SSE parser: events, comments, CRLF and CR, multi-line data, ids, and splits anywhere", () => {
+  const feedAll = (chunks) => {
+    const p = C.createSseParser();
+    return chunks.flatMap((c) => p.feed(c));
+  };
+  const text = ': keep-alive\n\ndata: {"a":1}\n\nid: 7\ndata: one\ndata:two\ndata\n\nevent: x\ndata: after\r\n\r\ndata: cr\r\rdata:last\n\n';
+  const want = [
+    { data: '{"a":1}', id: null },
+    { data: "one\ntwo\n", id: "7" },
+    { data: "after", id: "7" },
+    { data: "cr", id: "7" },
+    { data: "last", id: "7" },
+  ];
+  assert.deepEqual(feedAll([text]), want);
+  // Cut at every position, including between CR and LF.
+  for (let i = 0; i <= text.length; i++) assert.deepEqual(feedAll([text.slice(0, i), text.slice(i)]), want, "cut at " + i);
+  // One character at a time.
+  assert.deepEqual(feedAll([...text]), want);
+  // An unfinished event is held back; a comment alone and an event without data deliver nothing.
+  assert.deepEqual(feedAll(["data: half"]), []);
+  assert.deepEqual(feedAll([": c\n\n", "id: 3\n\n", "event: e\n\n"]), []);
+  // A colon inside the value and a missing space are kept as written.
+  assert.deepEqual(feedAll(["data:a: b\n\n", "data:  two spaces\n\n"]), [{ data: "a: b", id: null }, { data: " two spaces", id: null }]);
+});
+
+test("SSE parser: a long line arriving in small chunks costs its length once", () => {
+  // 8 MB in 1 KB chunks. Searching the whole unfinished line again on every chunk is ten seconds
+  // of work or more; searching only what arrived is some tens of milliseconds.
+  const body = "x".repeat(8 << 20);
+  const text = "data: " + body + "\r\n\r\ndata: next\n\n";
+  const p = C.createSseParser();
+  const out = [];
+  const began = performance.now();
+  for (let i = 0; i < text.length; i += 1024) out.push(...p.feed(text.slice(i, i + 1024)));
+  const took = performance.now() - began;
+  assert.equal(out.length, 2);
+  assert.ok(out[0].data === body, "the long line arrives whole");
+  assert.deepEqual(out[1], { data: "next", id: null });
+  assert.ok(took < 2000, `took ${Math.round(took)} ms`);
+});
+
+test("events are handed on one by one: bad JSON is skipped and a handler that throws is reported, not fatal", () => {
+  const events = [{ data: '{"n":1}' }, { data: "not json" }, { data: '{"n":2}' }, { data: "" }, { data: '{"n":3}' }];
+  const handled = [];
+  const reported = [];
+  C.deliverEvents(events, (ev) => {
+    if (ev.n === 2) throw new Error("cannot show 2");
+    handled.push(ev.n);
+  }, (e) => reported.push(e.message));
+  assert.deepEqual(handled, [1, 3]);
+  assert.deepEqual(reported, ["cannot show 2"]);
+  C.deliverEvents([], () => assert.fail("nothing to hand on"), () => assert.fail("nothing to report"));
+});
+
+// ---- app.js where it runs without a real page: a tab that is not signed in ----
+
+/** Load a fresh copy of app.js at `hash` against a daemon that refuses every login code. */
+async function loadSignedOutPage(t, hash) {
+  const page = { shown: [], hashchange: [], reloads: 0, requests: [], replaced: [] };
+  const fake = {
+    document: {
+      createElement: (tag) => ({ tag }),
+      body: { replaceChildren: (...kids) => (page.shown = kids.map((k) => k.textContent)) },
+    },
+    window: { addEventListener: (type, fn) => type === "hashchange" && page.hashchange.push(fn) },
+    location: { hash, pathname: "/", search: "", reload: () => page.reloads++ },
+    history: { replaceState: (_state, _title, url) => page.replaced.push(url) },
+    sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    fetch: async (url, init) => {
+      page.requests.push({ url, ...init });
+      return { ok: false, status: 401 };
+    },
+  };
+  for (const [name, value] of Object.entries(fake)) {
+    const before = Object.getOwnPropertyDescriptor(globalThis, name);
+    Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+    t.after(() => (before ? Object.defineProperty(globalThis, name, before) : delete globalThis[name]));
+  }
+  await import("./app.js?page=" + encodeURIComponent(t.name + hash));
+  await new Promise((resolve) => setImmediate(resolve));
+  return page;
+}
+
+test("app.js: with no code and no stored secret the page says to run loom open, and a login address arriving in that tab loads it again", async (t) => {
+  const page = await loadSignedOutPage(t, "");
+  assert.deepEqual(page.requests, []);
+  assert.deepEqual(page.shown, [C.LOST_TOKEN]);
+  // Pasting an address into the tab changes only the fragment; the page is not loaded by the browser.
+  const arrive = (hash) => {
+    globalThis.location.hash = hash;
+    for (const fn of page.hashchange) fn();
+  };
+  arrive("#/inbox");
+  arrive("#code=xyz");
+  assert.equal(page.reloads, 0);
+  arrive("#code=0123456789abcdef0123456789abcdef");
+  assert.equal(page.reloads, 1);
+});
+
+test("app.js: a code the daemon refuses is sent once without credentials, leaves the address, and the page says to run loom open", async (t) => {
+  const code = "0123456789abcdef0123456789abcdef";
+  const page = await loadSignedOutPage(t, "#code=" + code);
+  assert.deepEqual(page.requests, [
+    { url: "/api/web-sessions", method: "POST", credentials: "omit", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }) },
+  ]);
+  assert.deepEqual(page.replaced, ["/"]);
+  assert.deepEqual(page.shown, [C.LOST_TOKEN]);
+});
+
 // ---- safety: nothing in the shipped DOM code can turn record content into markup ----
 
 function stripComments(js) {

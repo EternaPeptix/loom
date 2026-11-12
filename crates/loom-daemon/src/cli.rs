@@ -11,8 +11,8 @@
 //!   {bind}` (or `already running`). `down`: `client.shutdown()`, wait until it stops answering
 //!   (10 s), print `stopped`.
 //! - `status`: `render::status`. Exit 1 when the daemon is not running (with the usual sentence).
-//! - `open`: print and open `http://{bind}/?token={token}` (`/usr/bin/open` on macOS, `xdg-open`
-//!   elsewhere; `--print` only prints).
+//! - `open`: request a login code and open `http://{bind}/#code={code}` (`/usr/bin/open` on macOS,
+//!   `xdg-open` elsewhere); `--print` only prints it. The API token is never printed or passed on argv.
 //! - `run [options] <message…>`: start a session and follow it. The message is the arguments
 //!   joined by spaces; `-` or no message reads standard input to its end. Options → `NewSession`
 //!   (`--workspace` defaults to the current directory; `--attended` sets `unattended: false`;
@@ -70,7 +70,7 @@
 //! client's tests): every command parses with its options and rejects a missing argument; `run`
 //! and `send` message joining and `-`; `--lines` parsing (`10:20`, `10:`, `:20`, bad forms);
 //! `follow_exit_code` for every turn end; `DEFAULT_CONFIG` parses with `Config::parse` and passes
-//! `check()`; `open_url`.
+//! `check()`; `open_url`; `open` hands the address to the browser and writes it only with `--print`.
 
 use crate::client::{self, Client};
 use crate::render::{self, RecordOpts, Style};
@@ -404,9 +404,9 @@ pub fn follow_exit_code(reason: TurnEndReason) -> Option<i32> {
     }
 }
 
-/// `http://{bind}/?token={token}`.
-pub fn open_url(bind: &str, token: &str) -> String {
-    format!("http://{bind}/?token={token}")
+/// `http://{bind}/#code={code}`: the fragment is never sent to a server or kept in a log.
+pub fn open_url(bind: &str, code: &str) -> String {
+    format!("http://{bind}/#code={code}")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1073,29 +1073,51 @@ async fn cmd_down(paths: &Paths) -> Result<i32, String> {
     outln("stopped").map(|()| 0)
 }
 
-async fn cmd_open(paths: &Paths, a: &OpenArgs) -> Result<i32, String> {
-    let c = client_of(paths)?;
-    // Say "not running" here rather than hand the browser an address nothing answers on.
-    c.status().await?;
+/// The address that logs a browser in: a fresh single-use code; the API token is not in it.
+async fn login_url(c: &Client) -> Result<String, String> {
     let bind = c.base().strip_prefix("http://").unwrap_or(c.base());
-    let url = open_url(bind, c.token());
-    outln(&url)?;
+    Ok(open_url(bind, &c.login_code().await?))
+}
+
+/// `open` against a daemon that answers: the address goes to the browser through `launch` and
+/// nothing is written; with `--print` it is written to `out` and nothing is started.
+async fn open_with(
+    c: &Client,
+    a: &OpenArgs,
+    out: &mut dyn Write,
+    launch: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<i32, String> {
+    let url = login_url(c).await?;
     if a.print {
-        return Ok(0);
+        put(out, &format!("{url}\n"))?;
+    } else {
+        launch(&url)?;
     }
+    Ok(0)
+}
+
+/// Hand `url` to the desktop's opener.
+fn launch_browser(url: &str) -> Result<(), String> {
     let program = if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
     let status = std::process::Command::new(program)
-        .arg(&url)
+        .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map_err(|e| format!("Cannot start {program} ({e}). Open the address above in a browser yourself."))?;
+        .map_err(|e| format!("Cannot start {program} ({e}). Run `loom open --print` and open the address in a browser yourself."))?;
     if status.success() {
-        Ok(0)
+        Ok(())
     } else {
-        Err(format!("{program} could not open the address. Open the address above in a browser yourself."))
+        Err(format!("{program} could not open the address. Run `loom open --print` and open it in a browser yourself."))
     }
+}
+
+async fn cmd_open(paths: &Paths, a: &OpenArgs) -> Result<i32, String> {
+    let c = client_of(paths)?;
+    // Say "not running" here rather than hand the browser an address nothing answers on.
+    c.status().await?;
+    open_with(&c, a, &mut StdoutSink, launch_browser).await
 }
 
 async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
@@ -1490,7 +1512,56 @@ mod tests {
 
     #[test]
     fn the_browser_address() {
-        assert_eq!(open_url("127.0.0.1:7878", "abc"), "http://127.0.0.1:7878/?token=abc");
+        assert_eq!(open_url("127.0.0.1:7878", "abc"), "http://127.0.0.1:7878/#code=abc");
+    }
+
+    #[tokio::test]
+    async fn open_builds_a_code_url_without_the_token() {
+        let script = Script::default().route("POST", "/api/login-codes", 200, r#"{"code":"c0de","expires_in_s":60}"#);
+        let (c, shared) = start(script).await;
+        let url = login_url(&c).await.unwrap();
+        assert_eq!(url, format!("{}/#code=c0de", c.base()));
+        assert!(!url.contains(c.token()) && !url.contains("token="));
+        let script = shared.lock().unwrap();
+        assert_eq!((script.seen[0].method.as_str(), script.seen[0].target.as_str()), ("POST", "/api/login-codes"));
+        assert_eq!(script.seen[0].auth.as_deref(), Some("Bearer tok-123"));
+    }
+
+    #[tokio::test]
+    async fn open_writes_the_address_only_with_print() {
+        let script = Script::default().route("POST", "/api/login-codes", 200, r#"{"code":"c0de","expires_in_s":60}"#);
+        let (c, _) = start(script).await;
+        let url = format!("{}/#code=c0de", c.base());
+
+        // Without --print the browser gets the address and nothing is written.
+        let mut out = Vec::new();
+        let mut launched = Vec::new();
+        let code = open_with(&c, &OpenArgs { print: false }, &mut out, |u| {
+            launched.push(u.to_string());
+            Ok(())
+        })
+        .await;
+        assert_eq!(code, Ok(0));
+        assert_eq!(launched, [url.as_str()]);
+        assert_eq!(String::from_utf8(out).unwrap(), "");
+
+        // With --print it is written and nothing is started.
+        let mut out = Vec::new();
+        let code = open_with(&c, &OpenArgs { print: true }, &mut out, |_| Err("--print starts nothing".into())).await;
+        assert_eq!(code, Ok(0));
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{url}\n"));
+
+        // A browser that cannot be started is the command's error, still with nothing written.
+        let mut out: Vec<u8> = Vec::new();
+        let code = open_with(&c, &OpenArgs { print: false }, &mut out, |_| Err("no browser".into())).await;
+        assert_eq!(code, Err("no browser".to_string()));
+        assert!(out.is_empty());
+
+        // A daemon that issues no code is the command's error before anything is written or started.
+        let (c, _) = start(Script::default().route("POST", "/api/login-codes", 401, r#"{"error":"Refused."}"#)).await;
+        let code = open_with(&c, &OpenArgs { print: true }, &mut out, |_| Err("nothing to open".into())).await;
+        assert_eq!(code, Err("Refused.".to_string()));
+        assert!(out.is_empty());
     }
 
     #[test]

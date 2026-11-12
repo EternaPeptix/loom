@@ -154,6 +154,7 @@ pub async fn run_until(
         port,
         started_ms,
         shutdown: shutdown.clone(),
+        logins: Arc::new(auth::Logins::new()),
     };
     let begin = CancellationToken::new();
     let server = axum::serve(listener, api::router(state)).with_graceful_shutdown({

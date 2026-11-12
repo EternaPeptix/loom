@@ -17,6 +17,8 @@
 //!   - a non-2xx answer without one: `The daemon answered {status} to {METHOD} {path}.`
 //!   - a body that does not parse: `The daemon's answer to {METHOD} {path} was not understood
 //!     ({why}); the `loom` command and the daemon may be different versions.`
+//! - `login_code()`: `POST /api/login-codes`, the `code` of the answer. A daemon from before login
+//!   codes has no such route; its refusal becomes a sentence that says to restart the daemon.
 //! - `resolve(word)`: the session a word on the command line means. `last` → the most recently
 //!   created session that is not archived (`There are no sessions yet.`). Otherwise among all
 //!   sessions (archived included): the one whose id equals `word`; else those whose id starts with
@@ -60,6 +62,9 @@ const ALIVE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The daemon sends a keep-alive comment every 15 s; a stream silent for this long is dead.
 const STREAM_IDLE: Duration = Duration::from_secs(60);
 const LOST: &str = "The connection to the daemon was lost.";
+/// What every daemon has answered to a path it does not have (`404`).
+const NO_SUCH_PATH: &str = "There is no such path on the loom daemon.";
+const OLDER_DAEMON: &str = "The running daemon is older than this `loom` and cannot issue login codes. Restart it (`loom down`, then `loom up`) and run `loom open` again.";
 
 /// A connection to one daemon.
 #[derive(Clone)]
@@ -365,6 +370,20 @@ impl Client {
     pub async fn blob_lines(&self, handle: &str, start: u64, end: u64) -> Result<LinesView, String> {
         let query = [("start", start.to_string()), ("end", end.to_string())];
         self.call(Method::GET, &format!("/api/blobs/{}/lines", segment(handle)), &query, None).await
+    }
+
+    /// A single-use code that opens the web UI (`POST /api/login-codes`).
+    pub async fn login_code(&self) -> Result<String, String> {
+        #[derive(serde::Deserialize)]
+        struct Minted {
+            code: String,
+        }
+        match self.call::<Minted>(Method::POST, "/api/login-codes", &[], None).await {
+            Ok(minted) => Ok(minted.code),
+            // Only a daemon from before login codes has no such route.
+            Err(e) if e == NO_SUCH_PATH => Err(OLDER_DAEMON.to_string()),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
@@ -862,6 +881,29 @@ mod tests {
         let e = client.shutdown().await.unwrap_err();
         assert!(!e.contains("tok-123"));
         assert_eq!(e, "The daemon answered 401 Unauthorized to POST /api/shutdown.");
+    }
+
+    #[tokio::test]
+    async fn a_login_code_is_asked_for_with_the_token_and_an_older_daemon_is_told_apart() {
+        let script = Script::default().route("POST", "/api/login-codes", 200, r#"{"code":"c0de","expires_in_s":60}"#);
+        let (client, shared) = start(script).await;
+        assert_eq!(client.login_code().await.unwrap(), "c0de");
+        let seen = shared.lock().unwrap().seen.clone();
+        assert_eq!((seen[0].method.as_str(), seen[0].target.as_str()), ("POST", "/api/login-codes"));
+        assert_eq!(seen[0].auth.as_deref(), Some("Bearer tok-123"));
+
+        // A daemon from before login codes answers as it does to any unknown path: say what to do.
+        let unknown = json(&ErrorBody { error: "There is no such path on the loom daemon.".into() });
+        let (client, _) = start(Script::default().route("POST", "/api/login-codes", 404, unknown)).await;
+        assert_eq!(
+            client.login_code().await.unwrap_err(),
+            "The running daemon is older than this `loom` and cannot issue login codes. Restart it (`loom down`, then `loom up`) and run `loom open` again."
+        );
+
+        // Any other refusal is the daemon's own sentence.
+        let refused = json(&ErrorBody { error: "Missing or wrong access token.".into() });
+        let (client, _) = start(Script::default().route("POST", "/api/login-codes", 401, refused)).await;
+        assert_eq!(client.login_code().await.unwrap_err(), "Missing or wrong access token.");
     }
 
     #[tokio::test]

@@ -9,9 +9,12 @@
 //!   characters; if the file is missing, 32 random bytes as hex written to it (file mode 0600,
 //!   created with that mode — not chmod-ed afterwards; parent directories created 0700). A file
 //!   with any other content is an error (`InvalidData`) — never silently replaced.
-//! - **`presented_token(authorization, cookie)`**: the token of `Authorization: Bearer <token>`
-//!   (scheme case-insensitive, surrounding spaces ignored); else the value of the cookie named
-//!   [`COOKIE`] in a `Cookie` header (`a=1; loom_token=…; b=2`); else `None`.
+//! - **`bearer_token(authorization)`**: the secret of `Authorization: Bearer <secret>` (scheme
+//!   case-insensitive, surrounding spaces ignored), else `None`. There are no authentication
+//!   cookies: a cookie is sent to every port on the host, including a dev server an agent started.
+//! - **`names_legacy_cookie(cookie)`**: whether a `Cookie` header (`a=1; loom_token=…; b=2`) names
+//!   [`LEGACY_COOKIE`], in which older daemons kept the API token. Its value is never read; the
+//!   index page answers such a browser with [`FORGET_LEGACY_COOKIE`] so it stops sending the token.
 //! - **`token_matches(expected, presented)`**: equal, compared without an early exit (fold the XOR
 //!   of the bytes; different lengths are unequal).
 //! - **`host_allowed(host, port)`**: the `Host` header must be exactly `127.0.0.1:{port}`,
@@ -19,18 +22,33 @@
 //!   This is what stops a web page that points a name of its own at 127.0.0.1 from reading the API.
 //! - **`origin_allowed(origin, port)`**: absent is allowed (not a browser). Present: must be
 //!   `http://` followed by one of the three allowed hosts. `null` and everything else is refused.
-//! - **`session_cookie(token)`**: `loom_token={token}; Path=/; HttpOnly; SameSite=Strict`.
+//! - **[`Logins`]**: the web UI's way in. `POST /api/login-codes` (API token) mints a single-use code
+//!   valid for [`CODE_TTL`]; `POST /api/web-sessions` exchanges it for a web-session secret that the
+//!   UI sends as a bearer. Both live in memory only and are bounded ([`MAX_CODES`], [`MAX_SESSIONS`]).
 //!
 //! Tests required: token created once with mode 0600 and reused; bad content is an error; bearer
-//! and cookie parsing (several cookies, odd spacing, wrong scheme); matching; every host and origin
-//! case above, including a wrong port and a host with a suffix (`127.0.0.1:7878.evil.example`).
+//! parsing (odd spacing, wrong scheme); the legacy cookie by name (several cookies, odd spacing,
+//! look-alike names); matching; login codes and web sessions; every host and origin case above,
+//! including a wrong port and a host with a suffix (`127.0.0.1:7878.evil.example`).
 
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
-/// Name of the cookie the web UI authenticates with.
-pub const COOKIE: &str = "loom_token";
+/// How long a login code can be exchanged.
+pub const CODE_TTL: Duration = Duration::from_secs(60);
+/// Login codes that may be outstanding at once; minting past it drops the oldest.
+pub const MAX_CODES: usize = 16;
+/// Web-session secrets kept at once; creating past it drops the oldest.
+pub const MAX_SESSIONS: usize = 32;
+/// The cookie older daemons kept the API token in. It is not a credential.
+pub const LEGACY_COOKIE: &str = "loom_token";
+/// The `Set-Cookie` value that removes [`LEGACY_COOKIE`] from a browser: the name and path it was
+/// set with, no value, already expired.
+pub const FORGET_LEGACY_COOKIE: &str = "loom_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict";
 
 /// Length of a token in characters: 32 random bytes as lowercase hex.
 const TOKEN_LEN: usize = 64;
@@ -82,21 +100,16 @@ pub fn load_or_create_token(path: &Path) -> std::io::Result<String> {
     }
 }
 
-/// The token a request presents: a bearer token, else the session cookie.
-pub fn presented_token(authorization: Option<&str>, cookie: Option<&str>) -> Option<String> {
-    if let Some(value) = authorization {
-        if let Some((scheme, rest)) = value.trim().split_once(char::is_whitespace) {
-            let rest = rest.trim();
-            if scheme.eq_ignore_ascii_case("bearer") && !rest.is_empty() {
-                return Some(rest.to_string());
-            }
-        }
-    }
-    cookie?.split(';').find_map(|pair| {
-        let (name, value) = pair.trim().split_once('=')?;
-        let value = value.trim();
-        (name.trim() == COOKIE && !value.is_empty()).then(|| value.to_string())
-    })
+/// The secret a request presents: the value of `Authorization: Bearer <secret>`.
+pub fn bearer_token(authorization: Option<&str>) -> Option<String> {
+    let (scheme, rest) = authorization?.trim().split_once(char::is_whitespace)?;
+    let rest = rest.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !rest.is_empty()).then(|| rest.to_string())
+}
+
+/// Whether a `Cookie` header names [`LEGACY_COOKIE`]. Only the name is looked at.
+pub fn names_legacy_cookie(cookie: &str) -> bool {
+    cookie.split(';').any(|pair| pair.split('=').next().is_some_and(|name| name.trim() == LEGACY_COOKIE))
 }
 
 /// Compares two tokens without an early exit. The work depends on the length of `expected` only.
@@ -135,9 +148,82 @@ pub fn origin_allowed(origin: Option<&str>, port: u16) -> bool {
     }
 }
 
-/// The `Set-Cookie` value that carries the token for the web UI.
-pub fn session_cookie(token: &str) -> String {
-    format!("{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict")
+/// A random 128-bit value as 32 lowercase hex characters.
+fn random_hex() -> String {
+    let bytes: [u8; 16] = rand::random();
+    hex::encode(bytes)
+}
+
+#[derive(Default)]
+struct LoginState {
+    codes: VecDeque<(String, Instant)>,
+    sessions: VecDeque<String>,
+}
+
+/// Login codes and web-session secrets, in memory only (they die with the daemon).
+#[derive(Default)]
+pub struct Logins {
+    state: Mutex<LoginState>,
+}
+
+impl Logins {
+    pub fn new() -> Logins {
+        Logins::default()
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, LoginState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A fresh single-use code, valid for [`CODE_TTL`].
+    pub fn mint_code(&self) -> String {
+        self.mint_code_at(Instant::now())
+    }
+
+    pub fn mint_code_at(&self, now: Instant) -> String {
+        let code = random_hex();
+        let mut state = self.locked();
+        state.codes.retain(|(_, born)| now.saturating_duration_since(*born) < CODE_TTL);
+        while state.codes.len() >= MAX_CODES {
+            state.codes.pop_front();
+        }
+        state.codes.push_back((code.clone(), now));
+        code
+    }
+
+    /// Exchanges a code for a web-session secret. A code works once, and only within [`CODE_TTL`].
+    pub fn redeem(&self, code: &str) -> Option<String> {
+        self.redeem_at(code, Instant::now())
+    }
+
+    pub fn redeem_at(&self, code: &str, now: Instant) -> Option<String> {
+        let mut state = self.locked();
+        state.codes.retain(|(_, born)| now.saturating_duration_since(*born) < CODE_TTL);
+        // Compare against every outstanding code without an early exit.
+        let mut found = None;
+        for (i, (candidate, _)) in state.codes.iter().enumerate() {
+            if token_matches(candidate, code) {
+                found = Some(i);
+            }
+        }
+        state.codes.remove(found?)?;
+        let secret = random_hex();
+        while state.sessions.len() >= MAX_SESSIONS {
+            state.sessions.pop_front();
+        }
+        state.sessions.push_back(secret.clone());
+        Some(secret)
+    }
+
+    /// Whether `secret` is a live web-session secret.
+    pub fn session_ok(&self, secret: &str) -> bool {
+        let state = self.locked();
+        let mut ok = false;
+        for candidate in &state.sessions {
+            ok |= token_matches(candidate, secret);
+        }
+        ok
+    }
 }
 
 #[cfg(test)]
@@ -186,25 +272,31 @@ mod tests {
     }
 
     #[test]
-    fn bearer_and_cookie_parsing() {
+    fn bearer_parsing() {
         let some = |s: &str| Some(s.to_string());
-        assert_eq!(presented_token(Some("Bearer abc"), None), some("abc"));
-        assert_eq!(presented_token(Some("bearer   abc  "), None), some("abc"));
-        assert_eq!(presented_token(Some("  BEARER\tabc"), None), some("abc"));
-        assert_eq!(presented_token(Some("Basic abc"), None), None);
-        assert_eq!(presented_token(Some("Bearer"), None), None);
-        assert_eq!(presented_token(Some("Bearer  "), None), None);
-        assert_eq!(presented_token(Some("abc"), None), None);
-        assert_eq!(presented_token(None, Some("a=1; loom_token=xyz; b=2")), some("xyz"));
-        assert_eq!(presented_token(None, Some("loom_token=xyz")), some("xyz"));
-        assert_eq!(presented_token(None, Some("  a=1 ;loom_token = xyz ;b=2")), some("xyz"));
-        assert_eq!(presented_token(None, Some("xloom_token=xyz; loom_tokens=q")), None);
-        assert_eq!(presented_token(None, Some("loom_token=")), None);
-        assert_eq!(presented_token(None, Some("garbage")), None);
-        assert_eq!(presented_token(None, None), None);
-        // A bearer token wins; a wrong scheme falls through to the cookie.
-        assert_eq!(presented_token(Some("Bearer abc"), Some("loom_token=xyz")), some("abc"));
-        assert_eq!(presented_token(Some("Basic abc"), Some("loom_token=xyz")), some("xyz"));
+        assert_eq!(bearer_token(Some("Bearer abc")), some("abc"));
+        assert_eq!(bearer_token(Some("bearer   abc  ")), some("abc"));
+        assert_eq!(bearer_token(Some("  BEARER\tabc")), some("abc"));
+        assert_eq!(bearer_token(Some("Basic abc")), None);
+        assert_eq!(bearer_token(Some("Bearer")), None);
+        assert_eq!(bearer_token(Some("Bearer  ")), None);
+        assert_eq!(bearer_token(Some("abc")), None);
+        assert_eq!(bearer_token(None), None);
+    }
+
+    #[test]
+    fn the_legacy_cookie_is_found_by_name_only() {
+        assert!(names_legacy_cookie("loom_token=xyz"));
+        assert!(names_legacy_cookie("a=1; loom_token=xyz; b=2"));
+        assert!(names_legacy_cookie("  a=1 ;loom_token = xyz ;b=2"));
+        assert!(names_legacy_cookie("loom_token="));
+        assert!(names_legacy_cookie("a=1; loom_token"));
+        assert!(!names_legacy_cookie("xloom_token=xyz; loom_tokens=q"));
+        assert!(!names_legacy_cookie("a=loom_token; b=loom_token=1"));
+        assert!(!names_legacy_cookie("garbage"));
+        assert!(!names_legacy_cookie(""));
+        // What forgets it is the cookie as it was set, emptied and expired.
+        assert_eq!(FORGET_LEGACY_COOKIE, format!("{LEGACY_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"));
     }
 
     #[test]
@@ -287,7 +379,44 @@ mod tests {
     }
 
     #[test]
-    fn cookie_value() {
-        assert_eq!(session_cookie("tok"), "loom_token=tok; Path=/; HttpOnly; SameSite=Strict");
+    fn a_code_works_once_and_gives_a_session() {
+        let logins = Logins::new();
+        let code = logins.mint_code();
+        assert_eq!(code.len(), 32);
+        assert!(logins.redeem(&"0".repeat(32)).is_none());
+        let secret = logins.redeem(&code).unwrap();
+        assert_ne!(secret, code);
+        assert!(logins.session_ok(&secret));
+        assert!(!logins.session_ok(&code));
+        assert!(logins.redeem(&code).is_none());
+        assert!(logins.redeem("").is_none());
+    }
+
+    #[test]
+    fn a_code_expires_after_the_ttl() {
+        let logins = Logins::new();
+        let t0 = Instant::now();
+        let code = logins.mint_code_at(t0);
+        assert!(logins.redeem_at(&code, t0 + CODE_TTL).is_none());
+        let code = logins.mint_code_at(t0);
+        assert!(logins.redeem_at(&code, t0 + CODE_TTL - Duration::from_secs(1)).is_some());
+    }
+
+    #[test]
+    fn codes_and_sessions_are_bounded() {
+        let logins = Logins::new();
+        let now = Instant::now();
+        let codes: Vec<String> = (0..=MAX_CODES).map(|_| logins.mint_code_at(now)).collect();
+        assert!(logins.redeem_at(&codes[0], now).is_none(), "the oldest code is dropped");
+        assert!(logins.redeem_at(&codes[MAX_CODES], now).is_some());
+        let secrets: Vec<String> = (0..=MAX_SESSIONS)
+            .map(|_| {
+                let code = logins.mint_code_at(now);
+                logins.redeem_at(&code, now).unwrap()
+            })
+            .collect();
+        assert!(!logins.session_ok(&secrets[0]), "the oldest session is dropped");
+        assert!(logins.session_ok(&secrets[1]));
+        assert!(logins.session_ok(&secrets[MAX_SESSIONS]));
     }
 }

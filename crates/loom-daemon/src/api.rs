@@ -9,8 +9,9 @@
 //!    daemon's own (Host header)."}`.
 //! 2. For every method other than GET and HEAD: `auth::origin_allowed(Origin, state.port)`, else
 //!    `403` `{"error": "Requests from other origins are refused."}`.
-//! 3. Token: `auth::presented_token(Authorization, Cookie)` must match `state.token`
-//!    (`auth::token_matches`). Exceptions: `GET /` (below) and `GET /healthz`. Otherwise `401`
+//! 3. Token: `auth::bearer_token(Authorization)` must match `state.token` (`auth::token_matches`)
+//!    or be a live web-session secret (`state.logins`); there are no cookies. Exceptions: `GET /`,
+//!    `GET /healthz`, the three static assets and `POST /api/web-sessions`. Otherwise `401`
 //!    `{"error": "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token."}`.
 //!
 //! Every response carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
@@ -20,12 +21,16 @@
 //! panics; a handler never holds a lock across an await.
 //!
 //! ## Web UI
-//! - `GET /`: with a valid cookie → `ui::INDEX_HTML` (`text/html; charset=utf-8`). With
-//!   `?token=<token>` that matches → `303` to `/` with `Set-Cookie: auth::session_cookie(token)`.
-//!   Otherwise `401` with a small plain-text page: `Open the UI with `loom open` (it carries the
-//!   access token).`
+//! - `GET /`: `ui::INDEX_HTML` (`text/html; charset=utf-8`), no authentication. With
+//!   `?token=<token>` that matches → `303` to `/#code=<fresh login code>` (no cookie); with a
+//!   wrong token → `401` with a small plain-text page: `Open the UI with `loom open` (it carries
+//!   the access token).` The page itself (not the redirect, not the 401) answers a request that
+//!   still carries the token cookie of an older daemon (`auth::LEGACY_COOKIE`) with
+//!   `Set-Cookie: auth::FORGET_LEGACY_COOKIE`, which removes it; the cookie is never a credential.
 //! - `GET /app.js` and `GET /core.js` (`text/javascript; charset=utf-8`), `GET /style.css`
-//!   (`text/css; charset=utf-8`). These need the token like everything else.
+//!   (`text/css; charset=utf-8`). No authentication.
+//! - `POST /api/login-codes` (API token only) → `{"code", "expires_in_s"}`; `POST /api/web-sessions`
+//!   `{"code"}` (no Authorization) → `{"secret"}`, a bearer for the other `/api` routes.
 //! - All of them carry `Content-Security-Policy: ui::CSP` and `Referrer-Policy: no-referrer`.
 //! - `GET /healthz` → `200` `ok` (no token; says nothing else).
 //!
@@ -82,9 +87,15 @@
 //! as the model and `SandboxMode::None`; requests through `tower::ServiceExt::oneshot` or a bound
 //! listener and `reqwest`; no real network):
 //! - the three gates: wrong Host, foreign Origin on POST (and allowed on GET), missing/wrong token,
-//!   token by header and by cookie; `GET /?token=` sets the cookie and redirects; a wrong token on
-//!   `/?token=` is 401; `/healthz` needs nothing;
-//! - UI files carry the CSP; every response has `no-store` and `nosniff`;
+//!   token by header; a cookie carrying the token is refused; `/`, the static assets and `/healthz`
+//!   need nothing; `GET /?token=` redirects to `/#code=` and sets no cookie; a wrong token on
+//!   `/?token=` is 401; the index page expires the token cookie of an older daemon and nothing
+//!   else ever sends `Set-Cookie`;
+//! - login codes: minted with the API token only, exchanged once, refused when wrong, used or
+//!   expired; a web-session secret opens `/api` but cannot mint codes; the Host and Origin checks
+//!   apply to the exchange; outstanding codes and web sessions are bounded;
+//! - UI files, the 401 page and the redirect carry the CSP; every response has `no-store` and
+//!   `nosniff`;
 //! - create a session with a message, then: it is listed; its records page (`limit=2` pages through
 //!   with `next_after`); its detail has children after a spawn; `window`; `status` counts;
 //! - `stream`: replays from the start, then delivers a record appended after the stream opened;
@@ -136,6 +147,8 @@ pub struct ApiState {
     pub started_ms: u64,
     /// Cancelled by `POST /api/shutdown`; the server stops when it is.
     pub shutdown: CancellationToken,
+    /// Login codes and web-session secrets of the web UI.
+    pub logins: Arc<auth::Logins>,
 }
 
 /// Records per page while a stream replays the log.
@@ -160,6 +173,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/core.js", get(|| async { asset("text/javascript; charset=utf-8", ui::CORE_JS) }))
         .route("/style.css", get(|| async { asset("text/css; charset=utf-8", ui::STYLE_CSS) }))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/api/login-codes", post(login_code))
+        .route("/api/web-sessions", post(web_session))
         .route("/api/status", get(status))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/{id}", get(session_detail))
@@ -298,15 +313,21 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Res<T> + Send + 'static
 // The gates
 
 fn presented(headers: &HeaderMap) -> Option<String> {
-    let authorization = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
-    let mut cookies = headers.get_all(header::COOKIE).iter().map(|v| v.to_str().unwrap_or("")).peekable();
-    let cookie = cookies.peek().is_some().then(|| cookies.collect::<Vec<_>>().join("; "));
-    auth::presented_token(authorization, cookie.as_deref())
+    auth::bearer_token(headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()))
 }
 
+/// Whether the request carries the API token itself.
 fn token_ok(state: &ApiState, headers: &HeaderMap) -> bool {
     presented(headers).is_some_and(|t| auth::token_matches(&state.token, &t))
 }
+
+/// Whether the request carries the API token or a web-session secret.
+fn bearer_ok(state: &ApiState, headers: &HeaderMap) -> bool {
+    presented(headers).is_some_and(|t| auth::token_matches(&state.token, &t) || state.logins.session_ok(&t))
+}
+
+const UNAUTHORIZED: &str =
+    "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token.";
 
 fn refusal(status: StatusCode, message: &str) -> Response {
     ApiError::new(status, message).into_response()
@@ -333,12 +354,12 @@ async fn admit(state: &ApiState, req: Request, next: Next) -> Response {
             return refusal(StatusCode::FORBIDDEN, "Requests from other origins are refused.");
         }
     }
-    let exempt = method == Method::GET && matches!(req.uri().path(), "/" | "/healthz");
-    if !exempt && !token_ok(state, headers) {
-        return refusal(
-            StatusCode::UNAUTHORIZED,
-            "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token.",
-        );
+    // The page and its scripts hold no secret; a login code is its own credential.
+    let path = req.uri().path();
+    let exempt = (method == Method::GET && matches!(path, "/" | "/healthz" | "/app.js" | "/core.js" | "/style.css"))
+        || (method == Method::POST && path == "/api/web-sessions");
+    if !exempt && !bearer_ok(state, headers) {
+        return refusal(StatusCode::UNAUTHORIZED, UNAUTHORIZED);
     }
     next.run(req).await
 }
@@ -391,22 +412,48 @@ fn unauthorized_page() -> Response {
 
 async fn index(State(s): State<ApiState>, headers: HeaderMap, q: RawQuery) -> Response {
     let query = q.map(|Query(m)| m).unwrap_or_default();
+    // Older clients open `/?token=`: trade the token for a login code in the fragment, which the
+    // browser never sends anywhere, and set no cookie.
     if let Some(token) = query.get("token") {
         if !auth::token_matches(&s.token, token) {
             return unauthorized_page();
         }
         let mut response = Response::new(Body::empty());
         *response.status_mut() = StatusCode::SEE_OTHER;
-        response.headers_mut().insert(header::LOCATION, HeaderValue::from_static("/"));
-        if let Ok(cookie) = HeaderValue::from_str(&auth::session_cookie(token)) {
-            response.headers_mut().insert(header::SET_COOKIE, cookie);
+        if let Ok(location) = HeaderValue::from_str(&format!("/#code={}", s.logins.mint_code())) {
+            response.headers_mut().insert(header::LOCATION, location);
         }
         return with_ui_headers(response);
     }
-    if token_ok(&s, &headers) {
-        asset("text/html; charset=utf-8", ui::INDEX_HTML)
-    } else {
-        unauthorized_page()
+    let mut response = asset("text/html; charset=utf-8", ui::INDEX_HTML);
+    // A browser that signed in to an older daemon still holds the API token in a cookie and sends
+    // it to every port on this host. It opens nothing here; tell the browser to drop it.
+    if headers.get_all(header::COOKIE).iter().any(|v| v.to_str().is_ok_and(auth::names_legacy_cookie)) {
+        response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static(auth::FORGET_LEGACY_COOKIE));
+    }
+    response
+}
+
+/// `POST /api/login-codes`: a single-use code for the web UI. Only the API token may ask.
+async fn login_code(State(s): State<ApiState>, headers: HeaderMap) -> Response {
+    if !token_ok(&s, &headers) {
+        return refusal(StatusCode::UNAUTHORIZED, UNAUTHORIZED);
+    }
+    let code = s.logins.mint_code();
+    Json(json!({ "code": code, "expires_in_s": auth::CODE_TTL.as_secs() })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct CodeBody {
+    code: String,
+}
+
+/// `POST /api/web-sessions`: a login code for a web-session secret.
+async fn web_session(State(s): State<ApiState>, body: Bytes) -> Res<Response> {
+    let body: CodeBody = json_body(&body)?;
+    match s.logins.redeem(&body.code) {
+        Some(secret) => Ok(Json(json!({ "secret": secret })).into_response()),
+        None => Ok(refusal(StatusCode::UNAUTHORIZED, UNAUTHORIZED)),
     }
 }
 
@@ -783,6 +830,7 @@ mod tests {
         http: reqwest::Client,
         shutdown: CancellationToken,
         ws: PathBuf,
+        logins: Arc<auth::Logins>,
         serve: tokio::task::JoinHandle<()>,
     }
 
@@ -847,6 +895,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let token = "ab".repeat(32);
         let shutdown = CancellationToken::new();
+        let logins = Arc::new(auth::Logins::new());
         let state = ApiState {
             runtime: rt.clone(),
             token: Arc::new(token.clone()),
@@ -854,6 +903,7 @@ mod tests {
             port,
             started_ms: 1_234,
             shutdown: shutdown.clone(),
+            logins: logins.clone(),
         };
         let app = router(state);
         let serve = tokio::spawn(async move {
@@ -864,7 +914,7 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
-        Env { dir, _server: server, rt, port, token, http, shutdown, ws, serve }
+        Env { dir, _server: server, rt, port, token, http, shutdown, ws, logins, serve }
     }
 
     async fn json_of(response: reqwest::Response) -> (u16, Value) {
@@ -1074,52 +1124,161 @@ mod tests {
         let (s, _) = json_of(anon(Method::POST, "/api/shutdown").send().await.unwrap()).await;
         assert_eq!(s, 401);
         assert!(!e.shutdown.is_cancelled());
-        // Header and cookie both carry it.
+        // The header carries it.
         let (s, _) = json_of(anon(Method::GET, "/api/status").bearer_auth(&e.token).send().await.unwrap()).await;
         assert_eq!(s, 200);
-        let cookie = auth::session_cookie(&e.token);
-        let pair = cookie.split(';').next().unwrap().to_string();
+        // A cookie, even one carrying the token, is not a credential.
+        let pair = format!("loom_token={}", e.token);
         let (s, _) = json_of(anon(Method::GET, "/api/status").header("Cookie", pair.clone()).send().await.unwrap()).await;
-        assert_eq!(s, 200);
-        let (s, _) = json_of(anon(Method::GET, "/api/status").header("Cookie", "loom_session=wrong").send().await.unwrap()).await;
         assert_eq!(s, 401);
-        // The UI files need it too.
+        let (s, _) = json_of(anon(Method::POST, "/api/shutdown").header("Cookie", pair).send().await.unwrap()).await;
+        assert_eq!(s, 401);
+        assert!(!e.shutdown.is_cancelled());
+        // The page and its scripts need nothing.
         let (s, _) = json_of(anon(Method::GET, "/app.js").send().await.unwrap()).await;
-        assert_eq!(s, 401);
+        assert_eq!(s, 200);
     }
 
     #[tokio::test]
-    async fn the_index_sets_the_cookie_and_healthz_needs_nothing() {
+    async fn the_index_redirects_to_a_code_without_a_cookie_and_healthz_needs_nothing() {
         let e = env(Script::new(|_, _| finish("x"))).await;
         let anon = |p: &str| e.http.get(e.url(p));
 
+        for path in ["/", "/app.js", "/core.js", "/style.css"] {
+            let r = anon(path).send().await.unwrap();
+            assert_eq!(r.status(), 200, "{path}");
+            assert!(r.headers().get("set-cookie").is_none(), "{path}");
+        }
         let r = anon("/").send().await.unwrap();
-        assert_eq!(r.status(), 401);
-        assert!(r.headers()["content-type"].to_str().unwrap().starts_with("text/plain"));
-        assert_eq!(r.text().await.unwrap(), "Open the UI with `loom open` (it carries the access token).");
+        assert!(r.headers()["content-type"].to_str().unwrap().starts_with("text/html; charset=utf-8"));
+        assert_eq!(r.text().await.unwrap(), ui::INDEX_HTML);
 
         let r = anon(&format!("/?token={}", e.token)).send().await.unwrap();
         assert_eq!(r.status(), 303);
-        assert_eq!(r.headers()["location"], "/");
-        let set = r.headers()["set-cookie"].to_str().unwrap().to_string();
-        assert_eq!(set, auth::session_cookie(&e.token));
+        assert!(r.headers().get("set-cookie").is_none());
+        assert_eq!(r.headers()["content-security-policy"], ui::CSP);
+        assert_eq!(r.headers()["referrer-policy"], "no-referrer");
+        let location = r.headers()["location"].to_str().unwrap().to_string();
+        let code = location.strip_prefix("/#code=").unwrap();
+        assert!(!location.contains(&e.token));
+        // The code in the fragment is a working one.
+        let (s, b) = json_of(e.http.post(e.url("/api/web-sessions")).json(&json!({ "code": code })).send().await.unwrap()).await;
+        assert_eq!(s, 200, "{b}");
 
         let r = anon("/?token=wrong").send().await.unwrap();
         assert_eq!(r.status(), 401);
         assert!(r.headers().get("set-cookie").is_none());
+        assert_eq!(r.text().await.unwrap(), "Open the UI with `loom open` (it carries the access token).");
         let r = anon(&format!("/?token={}", "0".repeat(64))).send().await.unwrap();
         assert_eq!(r.status(), 401);
 
-        let pair = set.split(';').next().unwrap().to_string();
-        let r = anon("/").header("Cookie", pair).send().await.unwrap();
-        assert_eq!(r.status(), 200);
-        assert!(r.headers()["content-type"].to_str().unwrap().starts_with("text/html; charset=utf-8"));
-        assert_eq!(r.text().await.unwrap(), ui::INDEX_HTML);
-        let r = anon("/").bearer_auth(&e.token).send().await.unwrap();
-        assert_eq!(r.status(), 200);
-
         let r = anon("/healthz").send().await.unwrap();
         assert_eq!((r.status().as_u16(), r.text().await.unwrap()), (200, "ok".to_string()));
+    }
+
+    #[tokio::test]
+    async fn the_index_expires_the_token_cookie_of_an_older_daemon_and_nothing_else_sets_one() {
+        let e = env(Script::new(|_, _| finish("x"))).await;
+        let stale = format!("theme=dark; loom_token={}", e.token);
+        let with_cookie = |p: &str| e.http.get(e.url(p)).header("Cookie", stale.clone());
+
+        // The page tells the browser to drop it: same name and path, no value, already expired.
+        let r = with_cookie("/").send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let set: Vec<&str> = r.headers().get_all("set-cookie").iter().map(|v| v.to_str().unwrap()).collect();
+        assert_eq!(set, ["loom_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"]);
+        assert_eq!(r.text().await.unwrap(), ui::INDEX_HTML);
+
+        // Nothing is sent to a browser that does not hold it.
+        let r = e.http.get(e.url("/")).header("Cookie", "theme=dark; loom_tokens=1").send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.headers().get("set-cookie").is_none());
+
+        // Only the page does it: not the redirect, the refusals, the assets or the API, and the
+        // cookie opens nothing.
+        let redirect = format!("/?token={}", e.token);
+        for (path, status) in [(redirect.as_str(), 303u16), ("/?token=wrong", 401), ("/app.js", 200), ("/api/status", 401)] {
+            let r = with_cookie(path).send().await.unwrap();
+            assert_eq!(r.status(), status, "{path}");
+            assert!(r.headers().get("set-cookie").is_none(), "{path}");
+        }
+        let r = with_cookie("/api/status").bearer_auth(&e.token).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.headers().get("set-cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn login_codes_are_minted_once_exchanged_once_and_expire() {
+        let e = env(Script::new(|_, _| finish("x"))).await;
+        let exchange = |code: String| {
+            let req = e.http.post(e.url("/api/web-sessions")).json(&json!({ "code": code }));
+            async move { json_of(req.send().await.unwrap()).await }
+        };
+        let message = "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token.";
+
+        // Minting needs the API token.
+        let (s, _) = json_of(e.http.post(e.url("/api/login-codes")).send().await.unwrap()).await;
+        assert_eq!(s, 401);
+        let (s, b) = e.post("/api/login-codes", json!({})).await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!(b["expires_in_s"], 60);
+        let code = b["code"].as_str().unwrap().to_string();
+
+        // The code is exchanged once.
+        let (s, b) = exchange(code.clone()).await;
+        assert_eq!(s, 200, "{b}");
+        let secret = b["secret"].as_str().unwrap().to_string();
+        let (s, b) = exchange(code).await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (401, message));
+        let (s, b) = exchange("0".repeat(32)).await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (401, message));
+
+        // The secret opens the API but cannot mint codes.
+        let as_web = |m: Method, p: &str| e.http.request(m, e.url(p)).bearer_auth(&secret);
+        let (s, _) = json_of(as_web(Method::GET, "/api/status").send().await.unwrap()).await;
+        assert_eq!(s, 200);
+        let (s, _) = json_of(as_web(Method::POST, "/api/login-codes").send().await.unwrap()).await;
+        assert_eq!(s, 401);
+
+        // An expired code is refused.
+        let old = std::time::Instant::now().checked_sub(auth::CODE_TTL + Duration::from_secs(1)).unwrap();
+        let (s, b) = exchange(e.logins.mint_code_at(old)).await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (401, message));
+
+        // The exchange still has the Host and Origin checks.
+        let code = e.logins.mint_code();
+        let r = e.http.post(e.url("/api/web-sessions")).header("Origin", "http://evil.example").json(&json!({ "code": code }));
+        assert_eq!(json_of(r.send().await.unwrap()).await.0, 403);
+        let r = e.http.post(e.url("/api/web-sessions")).header("Host", "evil.example").json(&json!({ "code": code }));
+        assert_eq!(json_of(r.send().await.unwrap()).await.0, 403);
+        assert_eq!(exchange(code).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn outstanding_codes_and_sessions_are_bounded() {
+        let e = env(Script::new(|_, _| finish("x"))).await;
+        let exchange = |code: String| {
+            let req = e.http.post(e.url("/api/web-sessions")).json(&json!({ "code": code }));
+            async move { json_of(req.send().await.unwrap()).await }
+        };
+        let mut codes = Vec::new();
+        for _ in 0..=auth::MAX_CODES {
+            codes.push(e.post("/api/login-codes", json!({})).await.1["code"].as_str().unwrap().to_string());
+        }
+        assert_eq!(exchange(codes[0].clone()).await.0, 401, "the oldest code was dropped");
+        let mut secrets = Vec::new();
+        for code in &codes[1..] {
+            let (s, b) = exchange(code.clone()).await;
+            assert_eq!(s, 200);
+            secrets.push(b["secret"].as_str().unwrap().to_string());
+        }
+        for _ in 0..auth::MAX_SESSIONS {
+            let (_, b) = exchange(e.logins.mint_code()).await;
+            secrets.push(b["secret"].as_str().unwrap().to_string());
+        }
+        let status = |secret: &str| e.http.get(e.url("/api/status")).bearer_auth(secret).send();
+        assert_eq!(status(&secrets[0]).await.unwrap().status(), 401, "the oldest session was dropped");
+        assert_eq!(status(secrets.last().unwrap()).await.unwrap().status(), 200);
     }
 
     #[tokio::test]
@@ -1138,8 +1297,10 @@ mod tests {
             assert_eq!(r.headers()["referrer-policy"], "no-referrer", "{path}");
             assert_eq!(r.text().await.unwrap(), body, "{path}");
         }
-        let unauthorized = e.http.get(e.url("/")).send().await.unwrap();
+        let unauthorized = e.http.get(e.url("/?token=wrong")).send().await.unwrap();
+        assert_eq!(unauthorized.status(), 401);
         assert_eq!(unauthorized.headers()["content-security-policy"], ui::CSP);
+        assert_eq!(unauthorized.headers()["referrer-policy"], "no-referrer");
 
         let wrong_method = e.rq(Method::DELETE, "/api/status").send().await.unwrap();
         let responses = [
@@ -1154,7 +1315,7 @@ mod tests {
             wrong_method,
         ];
         let statuses: Vec<u16> = responses.iter().map(|r| r.status().as_u16()).collect();
-        assert_eq!(statuses, vec![200, 401, 403, 404, 404, 200, 200, 401, 405]);
+        assert_eq!(statuses, vec![200, 401, 403, 404, 404, 200, 200, 200, 405]);
         for r in responses {
             assert_eq!(r.headers()["cache-control"], "no-store");
             assert_eq!(r.headers()["x-content-type-options"], "nosniff");

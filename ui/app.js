@@ -71,15 +71,71 @@ const clock = (ms) => new Date(ms).toLocaleTimeString();
 // ---------------------------------------------------------------------------------------------
 // Network
 
-let es = null;
+// The page signs in with a single-use code from the URL fragment, trades it for a web-session
+// secret and sends that as a bearer on every request. No cookie is involved.
+const SECRET_KEY = "loom_web_secret";
+let secret = null; // also kept in sessionStorage when the browser allows it
+let streamCtl = null;
+let streamStopped = false;
+
+function storedSecret() {
+  try {
+    return sessionStorage.getItem(SECRET_KEY);
+  } catch {
+    return null;
+  }
+}
+function keepSecret(value) {
+  secret = value;
+  try {
+    if (value) sessionStorage.setItem(SECRET_KEY, value);
+    else sessionStorage.removeItem(SECRET_KEY);
+  } catch {
+    // storage is blocked; the secret stays in memory for this page load
+  }
+}
+
+/** Exchange the code in the fragment (if any) for a secret; true when the page has one. */
+async function signIn() {
+  const code = C.codeFromHash(location.hash);
+  if (code) {
+    try {
+      history.replaceState(null, "", location.pathname + location.search);
+    } catch {
+      // the fragment stays visible; the code is single use anyway
+    }
+    try {
+      const r = await fetch("/api/web-sessions", {
+        method: "POST",
+        credentials: "omit",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code }),
+      });
+      if (r.ok) {
+        const j = await r.json();
+        if (j && typeof j.secret === "string") keepSecret(j.secret);
+      }
+    } catch {
+      // unreachable or refused: fall back to a stored secret, else the "run loom open" page
+    }
+  }
+  if (!secret) secret = storedSecret();
+  return !!secret;
+}
+
+function authHeaders(extra) {
+  return { ...(extra || {}), Authorization: "Bearer " + secret };
+}
 
 function lost() {
-  if (es) es.close();
+  streamStopped = true;
+  if (streamCtl) streamCtl.abort();
+  keepSecret(null);
   document.body.replaceChildren(el("p", "pad", C.LOST_TOKEN));
 }
 
 async function api(method, path, body) {
-  const init = { method, credentials: "same-origin", headers: {} };
+  const init = { method, credentials: "omit", headers: authHeaders() };
   if (body !== undefined) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(body);
@@ -324,35 +380,53 @@ function handleEvent(ev) {
   }
 }
 
-function connect() {
-  es = new EventSource("/api/events?deltas=true");
-  es.addEventListener("open", () => {
-    const again = S.everConnected;
-    S.connected = true;
-    S.everConnected = true;
-    renderDot();
-    if (again) refetchAll();
-  });
-  es.addEventListener("message", (m) => {
-    let ev;
+// EventSource cannot send an Authorization header, so the stream is read with fetch.
+async function connect() {
+  let attempt = 0;
+  while (!streamStopped) {
+    streamCtl = new AbortController();
+    // The daemon sends a keep-alive every 15 s; silence for 45 s means the connection is dead.
+    let idle = 0;
+    const watch = () => {
+      clearTimeout(idle);
+      idle = setTimeout(() => streamCtl.abort(), 45000);
+    };
     try {
-      ev = JSON.parse(m.data);
+      watch();
+      const r = await fetch("/api/events?deltas=true", {
+        credentials: "omit",
+        headers: authHeaders({ Accept: "text/event-stream" }),
+        signal: streamCtl.signal,
+      });
+      if (r.status === 401) return lost();
+      if (!r.ok || !r.body) throw new Error("The event stream answered " + r.status + ".");
+      const again = S.everConnected;
+      S.connected = true;
+      S.everConnected = true;
+      attempt = 0;
+      renderDot();
+      if (again) refetchAll();
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      const parser = C.createSseParser();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        watch();
+        C.deliverEvents(parser.feed(decoder.decode(value, { stream: true })), handleEvent, (e) => console.error(e));
+      }
     } catch {
-      return;
+      // dropped or aborted: reconnect below
     }
-    handleEvent(ev);
-  });
-  es.addEventListener("error", () => {
+    clearTimeout(idle);
+    // However the read ended, let go of the connection before another is opened.
+    streamCtl.abort();
+    // After lost() the page is the sign-in sentence: there is no dot to update.
+    if (streamStopped) return;
     S.connected = false;
     renderDot();
-    if (es.readyState === 2) {
-      // The browser gave up; the likely reason is a missing token.
-      fetch("/api/status", { credentials: "same-origin" }).then((r) => {
-        if (r.status === 401) lost();
-        else setTimeout(connect, 3000);
-      }).catch(() => setTimeout(connect, 3000));
-    }
-  });
+    await new Promise((resolve) => setTimeout(resolve, C.reconnectDelayMs(attempt++)));
+  }
 }
 
 function refetchAll() {
@@ -1339,6 +1413,15 @@ function wire() {
 }
 
 async function start() {
+  // A login address opened in a tab that already has the page changes only the fragment: load the
+  // page again, so that the code is exchanged and leaves the address bar. Also on the lost() page.
+  window.addEventListener("hashchange", () => {
+    if (C.codeFromHash(location.hash)) location.reload();
+  });
+  if (!(await signIn())) {
+    lost();
+    return;
+  }
   wire();
   setTab("ledger");
   renderDot();
