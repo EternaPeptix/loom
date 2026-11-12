@@ -1,17 +1,28 @@
 import SwiftUI
+import UserNotifications
 
 /// loom-desk: a menu-bar macOS app around a loom daemon's web UI. See gui/DESIGN.md (normative).
-///
-/// This skeleton compiles and shows a menu-bar item and a window. The implementer fills in the
-/// connection flow (`Tunnel`, `DaemonClient`, `Connection` persistence), the web pane's real
-/// navigation, and notifications, per DESIGN.md. Keep it building at every step.
 @main
 struct LoomDeskApp: App {
-    @StateObject private var state = AppState()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    @ObservedObject private var state = AppState.shared
+
+    init() {
+        #if DEBUG
+        if CommandLine.arguments.contains("--self-check") { exit(SelfCheck.run()) }
+        if let i = CommandLine.arguments.firstIndex(of: "--tunnel-check"), i + 1 < CommandLine.arguments.count {
+            exit(SelfCheck.tunnel(host: CommandLine.arguments[i + 1]))
+        }
+        if let i = CommandLine.arguments.firstIndex(of: "--live-check"), i + 1 < CommandLine.arguments.count {
+            exit(SelfCheck.live(baseURL: CommandLine.arguments[i + 1], token: ProcessInfo.processInfo.environment["LOOM_TOKEN"]))
+        }
+        #endif
+    }
 
     var body: some Scene {
-        // The main window, opened on demand and on first launch.
-        WindowGroup("loom", id: "main") {
+        // The main window, opened on demand and on first launch. A single `Window`, so "Open loom"
+        // and notification activation always find the same one.
+        Window("loom", id: "main") {
             RootView()
                 .environmentObject(state)
                 .frame(minWidth: 900, minHeight: 600)
@@ -23,13 +34,41 @@ struct LoomDeskApp: App {
             MenuBarMenu()
                 .environmentObject(state)
         } label: {
-            Text(state.counts.menuLabel)
+            MenuBarLabel().environmentObject(state)
         }
     }
 }
 
-/// The menu-bar dropdown. CONTRACT: show the active connection and `state.status`; an "Open loom"
-/// item that focuses the window; a connections submenu that switches connection; Disconnect; Quit.
+/// The menu-bar label. It is alive for the whole run, so it also owns "open the window" requests
+/// that come from AppKit callbacks (notification activation) where `openWindow` is not reachable.
+struct MenuBarLabel: View {
+    @EnvironmentObject var state: AppState
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        content
+            .onChange(of: state.openWindowTick) { _, _ in openWindow(id: "main") }
+    }
+
+    @ViewBuilder private var content: some View {
+        let text = state.counts.menuLabel
+        if state.counts.waiting > 0 {
+            // The menu bar tints plain text as a template; a rendered, non-template image keeps the red.
+            let r = ImageRenderer(content: Text(text).font(.system(size: 13, weight: .semibold)).foregroundColor(.red).padding(.horizontal, 2))
+            let _ = { r.scale = NSScreen.main?.backingScaleFactor ?? 2 }()
+            if let img = r.nsImage {
+                let _ = { img.isTemplate = false }()
+                Image(nsImage: img)
+            } else {
+                Text(text).foregroundStyle(.red)
+            }
+        } else {
+            Text(text)
+        }
+    }
+}
+
+/// The menu-bar dropdown: connection + status, Open, switch, Disconnect, Quit.
 struct MenuBarMenu: View {
     @EnvironmentObject var state: AppState
     @Environment(\.openWindow) private var openWindow
@@ -37,14 +76,57 @@ struct MenuBarMenu: View {
     var body: some View {
         Group {
             Text(state.active.map { "Connection: \($0.name)" } ?? "No connection")
-            Text(state.status).font(.caption)
+            Text(state.status)
             Divider()
             Button("Open loom") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
-            if case .connected = state.link {
+            if !state.connections.isEmpty {
+                Menu("Connections") {
+                    ForEach(state.connections) { c in
+                        Button(c.name.isEmpty ? c.sshHost : c.name) { state.connect(c) }
+                    }
+                }
+            }
+            if state.link != .none {
                 Button("Disconnect") { state.disconnect() }
             }
             Divider()
             Button("Quit loom-desk") { NSApp.terminate(nil) }
+        }
+    }
+}
+
+/// Lifecycle: notification setup, restore the last connection, tear the tunnel down on quit.
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if Bundle.main.bundleURL.pathExtension == "app" {
+            UNUserNotificationCenter.current().delegate = self
+        }
+        Notifier.requestAuthorization()
+        Task { @MainActor in AppState.shared.restoreLast() }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // Runs on the main thread; kill the ssh child before the process goes.
+        MainActor.assumeIsolated { AppState.shared.shutdown() }
+    }
+
+    // Show banners even while the app is frontmost.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    // Activation: foreground the window and navigate the pane to the session.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let session = response.notification.request.content.userInfo["session"] as? String
+        Task { @MainActor in
+            AppState.shared.openWindow(focus: session)
+            completionHandler()
         }
     }
 }

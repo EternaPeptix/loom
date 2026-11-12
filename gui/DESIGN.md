@@ -93,8 +93,11 @@ Keychain or a prompt.
 
 Talks to the active `baseURL` with `Authorization: Bearer <token>`. Two jobs:
 
-- **Counts**, for the menu bar and status line: subscribe to `GET /api/events` (SSE) — the daemon
-  pushes `session` (a `SessionSummary`) and `inbox` (an `InboxItem`) events. Maintain a local map of
+- **Counts**, for the menu bar and status line: subscribe to `GET /api/events` (SSE). Frames carry
+  only `data:` (no `event:` line); the kind is the JSON `type` (`session`, `status`, `record`,
+  `settled`, `lagged`, …). There is no `inbox` event: an inbox change shows up as a `record` of kind
+  `inbox_opened` / `inbox_resolved` or a `status` whose `open_inbox` changed, and is answered by
+  re-reading `GET /api/inbox`, the source of truth for the open set. Maintain a local map of
   sessions by id and a set of open inbox items; derive `running` (sessions whose phase is running),
   `waiting` (open blocking inbox items) and `active` (not ended/archived). If the SSE stream drops,
   fall back to polling `GET /api/sessions` and `GET /api/inbox` every few seconds and keep retrying
@@ -111,8 +114,8 @@ version may add quick-answer from the notification; out of scope for v1.)
 ## Web pane (`UI/WebPane.swift`)
 
 A `WKWebView` wrapped in `NSViewRepresentable`. On connect (or when the operator picks a connection),
-it loads `"<baseURL>/?token=<token>"` — the daemon GET / token-to-cookie login (303 + Set-Cookie), which sets the
-session cookie and redirects to `/`. Thereafter the UI drives itself (same-origin XHR/SSE to the
+it loads `"<baseURL>/?token=<token>"` — the daemon answers 303 to `/` with the `loom_token` session
+cookie (there is no `/auth` route). Thereafter the UI drives itself (same-origin XHR/SSE to the
 daemon, through the tunnel). The pane:
 
 - restricts navigation to the `baseURL` origin (loopback): a navigation action to any other origin is

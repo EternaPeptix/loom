@@ -7,6 +7,7 @@
 #   gui/build.sh              build on the host
 #   gui/build.sh --pull       build, then copy dist/loom-desk.app back to this gui/dist
 #   LOOM_BUILD_HOST=local gui/build.sh   build right here (needs swiftc)
+#   LOOM_SWIFTFLAGS=-DDEBUG gui/build.sh  debug variant: `loom-desk --self-check` runs the pure-helper checks
 #
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -26,7 +27,7 @@ build_local() {
     srcs=$(find src -name '*.swift' | sort)
     if [ -z "$srcs" ]; then echo "build.sh: no Swift sources under src/" >&2; return 2; fi
     # shellcheck disable=SC2086
-    xcrun swiftc -O -target "$TARGET" \
+    xcrun swiftc -O ${LOOM_SWIFTFLAGS:-} -target "$TARGET" \
         -framework SwiftUI -framework AppKit -framework WebKit -framework UserNotifications \
         -o "$out/Contents/MacOS/$APP" $srcs || return $?
     cp Info.plist "$out/Contents/Info.plist"
@@ -45,7 +46,7 @@ SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST")
 "${SSH[@]}" "mkdir -p \$HOME/$REMOTE" || { echo "build.sh: cannot reach $HOST" >&2; exit 90; }
 rsync -a --delete --exclude '/dist' "$HERE/" "$HOST:$REMOTE/" || { echo "build.sh: rsync failed" >&2; exit 91; }
 # Build on the host (LOOM_BUILD_HOST=local makes that invocation compile in place, no further ssh).
-"${SSH[@]}" "cd \$HOME/$REMOTE && LOOM_BUILD_HOST=local bash build.sh" || exit $?
+"${SSH[@]}" "cd \$HOME/$REMOTE && LOOM_BUILD_HOST=local LOOM_SWIFTFLAGS='${LOOM_SWIFTFLAGS:-}' bash build.sh" || exit $?
 
 if [ "${1:-}" = "--pull" ]; then
     mkdir -p "$HERE/dist"
