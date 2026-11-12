@@ -35,7 +35,8 @@ gui/
   DESIGN.md            this file (normative)
   README.md            how to build, install, first connect
   build.sh             swiftc → assemble loom-desk.app → ad-hoc codesign
-  Info.plist           the app bundle's Info.plist (LSUIElement = true: menu-bar app, no Dock icon by default)
+  Info.plist           the app bundle's Info.plist (LSUIElement = false: a Dock icon as well as the menu-bar item)
+  Resources/AppIcon.icns   the app icon; icon/make_icon.py draws it and icon/build_icns.sh packs it
   src/
     App/LoomDeskApp.swift     @main: MenuBarExtra (counts + actions), the Window, app lifecycle, notifications
     App/AppState.swift        the observable app state: connections, the active connection, counts, status line
@@ -196,9 +197,9 @@ Do not inject scripts into the page or read its contents; the pane only navigate
 - a `MenuBarExtra` whose label is a short glyph plus counts (e.g. `◆ 2▸ 1!` meaning 2 running, 1
   waiting), red when anything is waiting. Its menu: `Connection: <name>` (or `No connection`) and the
   status line; **Open loom** (show / focus the window); a **Connections** submenu to switch (when any
-  are saved); **Disconnect** (while a link exists); **Quit loom-desk**. `LSUIElement` is true so the
-  app lives in the menu bar; the main `Window` is opened on demand and on first launch, and closing it
-  does not quit the app.
+  are saved); **Disconnect** (while a link exists); **Quit loom-desk**. `LSUIElement` is false, so
+  the app also has a Dock icon (`Resources/AppIcon.icns`) and appears in the app switcher; the main
+  `Window` is opened on demand, on first launch and from the Dock, and closing it does not quit the app.
 - the main `Window` hosting `RootView` (a connection bar — active connection, state, reload — above
   the `WebPane`).
 - notification setup (authorization, delegate that foregrounds the window and routes to a session).

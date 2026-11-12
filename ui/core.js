@@ -162,6 +162,44 @@ export function shownOfTotal(result) {
   return { blob, shown, total, cut, ranges, ofBlob: !!ofBlob, words, complete };
 }
 
+/** Generation speed of a reply in tokens per second: the tokens after the first, over the time from
+ *  the first streamed token to the end of the stream (so the wait for the first token, where the
+ *  prompt is read, is left out). Null when the record cannot support a figure. */
+export function tokensPerSecond(r) {
+  const n = Number(r && r.usage && r.usage.completion_tokens) || 0;
+  const t = (r && r.timing) || {};
+  const first = Number(t.ttft_ms) || 0;
+  const gen = (Number(t.total_ms) || 0) - first;
+  if (n < 2 || first <= 0 || gen <= 0) return null;
+  return (n - 1) / (gen / 1000);
+}
+
+/** "46.2 tok/s"; whole numbers from 100 up; "" for null. */
+export function speedText(v) {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "";
+  return (v >= 100 ? String(Math.round(v)) : v.toFixed(1)) + " tok/s";
+}
+
+/** Speed of a session for its header: the latest reply that has a figure, and the rate over the
+ *  latest `span` such replies together (their tokens over their generation time). */
+export function sessionSpeed(blocks, span = 10) {
+  let last = null, tokens = 0, ms = 0, used = 0;
+  for (let i = (blocks || []).length - 1; i >= 0 && used < span; i--) {
+    const b = blocks[i];
+    if (!b || b.kind !== "response") continue;
+    const v = tokensPerSecond(b);
+    if (v === null) continue;
+    if (last === null) last = v;
+    tokens += b.usage.completion_tokens - 1;
+    ms += b.timing.total_ms - b.timing.ttft_ms;
+    used++;
+  }
+  if (last === null) return { last: null, mean: null, replies: 0, label: "" };
+  const mean = tokens / (ms / 1000);
+  const label = used > 1 ? `${speedText(last)} · ${speedText(mean)} over ${used} replies` : speedText(last);
+  return { last, mean, replies: used, label };
+}
+
 /** Footer line of a model response. */
 export function responseFooter(r) {
   const u = r.usage || {};
@@ -170,6 +208,8 @@ export function responseFooter(r) {
   const share = cachedShare(u.cached_tokens || 0, u.prompt_tokens || 0);
   if (share) parts.push(`${share} cached`);
   parts.push(`completion ${tokens(u.completion_tokens || 0)}`);
+  const speed = speedText(tokensPerSecond(r));
+  if (speed) parts.push(speed);
   const total = r.timing && r.timing.total_ms;
   if (total) parts.push(seconds(total));
   if ((r.attempts || 0) > 1) parts.push(`${r.attempts} attempts`);

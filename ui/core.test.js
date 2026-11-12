@@ -134,10 +134,32 @@ test("mergeRanges merges overlapping and adjacent ranges, drops nonsense", () =>
   assert.deepEqual(C.mergeRanges(undefined), []);
 });
 
+test("tokensPerSecond counts the tokens after the first over the time after the first", () => {
+  const r = (n, first, total) => ({ kind: "response", usage: { completion_tokens: n }, timing: { ttft_ms: first, total_ms: total } });
+  assert.equal(C.tokensPerSecond(r(201, 500, 4500)), 50);
+  assert.equal(C.tokensPerSecond(r(1, 500, 4500)), null);        // one token has no rate
+  assert.equal(C.tokensPerSecond(r(201, 0, 4500)), null);        // no first-token time recorded
+  assert.equal(C.tokensPerSecond(r(201, 4500, 4500)), null);     // no time after the first token
+  assert.equal(C.tokensPerSecond({}), null);
+  assert.equal(C.speedText(46.24), "46.2 tok/s");
+  assert.equal(C.speedText(131.6), "132 tok/s");
+  assert.equal(C.speedText(null), "");
+  const one = C.sessionSpeed([{ kind: "user" }, r(201, 500, 4500)]);
+  assert.equal(one.label, "50.0 tok/s");
+  // The latest reply first, then all counted replies together: (200 + 100) tokens over (4 + 4) seconds.
+  const two = C.sessionSpeed([r(201, 500, 4500), { kind: "tool" }, r(1, 100, 200), r(101, 1000, 5000)]);
+  assert.equal(two.label, "25.0 tok/s · 37.5 tok/s over 2 replies");
+  assert.equal(C.sessionSpeed([{ kind: "user" }]).label, "");
+  assert.equal(C.sessionSpeed(undefined).label, "");
+});
+
 test("responseFooter", () => {
   const f = C.responseFooter({ usage: { prompt_tokens: 12345, cached_tokens: 9876, completion_tokens: 340 }, timing: { total_ms: 4200 }, attempts: 1 });
   assert.equal(f, "prompt 12.3k · 80% cached · completion 340 · 4.2s");
   assert.match(C.responseFooter({ usage: {}, timing: {}, attempts: 3 }), /3 attempts$/);
+  // With a first-token time the footer also gives the generation speed.
+  const g = C.responseFooter({ usage: { prompt_tokens: 100, completion_tokens: 201 }, timing: { ttft_ms: 500, total_ms: 4500 } });
+  assert.equal(g, "prompt 100 · 0% cached · completion 201 · 50.0 tok/s · 4.5s");
   assert.equal(C.finishWarning("length").level, "warn");
   assert.equal(C.finishWarning("stop"), null);
 });
@@ -336,7 +358,7 @@ test("one record of each kind: shown kinds produce blocks, hidden kinds do not",
   assert.equal(store.blocks[2].detail, true);
   const r = store.blocks.find((b) => b.kind === "response");
   assert.equal(r.reasoningLines, 2);
-  assert.equal(r.footer, "prompt 5 · 80% cached · completion 3 · 3.0s");
+  assert.equal(r.footer, "prompt 5 · 80% cached · completion 3 · 0.7 tok/s · 3.0s");
   const inbox = store.blocks.find((b) => b.kind === "inbox");
   assert.equal(inbox.resolved.answer, "a");
   assert.equal(store.blocks.find((b) => b.kind === "child_settled").inline, true);

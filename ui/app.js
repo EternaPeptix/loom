@@ -510,6 +510,7 @@ function renderHeader() {
   const meter = C.statusMeter(info);
   $("s-meter").firstElementChild.style.setProperty("width", meter.inViewPct + "%");
   $("s-meter-label").textContent = meter.label;
+  $("s-speed").textContent = S.rec ? C.sessionSpeed(S.rec.blocks).label : "";
   const a = C.sessionActions(info);
   $("b-stop").hidden = !a.stop;
   $("b-resume").hidden = !a.resume;
@@ -699,6 +700,7 @@ function renderBlocks() {
   const store = S.rec;
   const R = S.r;
   if (!store || !R || S.view !== "session") return;
+  $("s-speed").textContent = C.sessionSpeed(store.blocks).label;
   const holder = $("blocks");
   const scroller = $("scroller");
   const total = store.blocks.length;
