@@ -454,6 +454,18 @@ pub fn network_sentence(mode: &str, allow: &[String], deny: &[String], allow_pri
 /// `job_settled` detail of a job that was running when the harness went down.
 pub const JOB_LOST_DETAIL: &str = "The harness was restarted while this job was running; its outcome is unknown.";
 
+/// `job_settled` detail of a background job that finished by itself while the harness was down, read
+/// back from the files it left. `output` is what there is to say about its stored output (the rest
+/// discarded past the limit, storing failed), or empty.
+pub fn job_ended_while_down(output: &str) -> String {
+    let base = "It finished while the harness was down; its exit status and output were read back when the harness started again.";
+    let mut more = output.trim().chars();
+    match more.next() {
+        Some(first) => format!("{base} {}", sentence(&first.to_uppercase().chain(more).collect::<String>())),
+        None => base.to_string(),
+    }
+}
+
 /// A background job that was running when the harness went down.
 pub fn job_lost(id: &str, command: &str) -> String {
     format!(
@@ -480,6 +492,14 @@ mod tests {
         assert!(t.contains("job j3 (`make test`)"), "{t}");
         assert!(t.contains("may still be running") && t.contains("whether its process is still there"), "{t}");
         assert!(!t.contains("start it again if"), "{t}");
+    }
+
+    #[test]
+    fn a_job_that_finished_while_the_harness_was_down_says_so_and_what_became_of_its_output() {
+        let t = job_ended_while_down("");
+        assert!(t.starts_with("It finished while the harness was down;") && t.ends_with("started again."), "{t}");
+        let t = job_ended_while_down("the output was 9 bytes; only the first 8 bytes were stored");
+        assert!(t.ends_with("started again. The output was 9 bytes; only the first 8 bytes were stored."), "{t}");
     }
 
     #[test]

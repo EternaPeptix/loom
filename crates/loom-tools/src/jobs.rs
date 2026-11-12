@@ -33,10 +33,20 @@
 //! - `JobTable::new` clears what a crashed daemon left in `dir` (`clear_leftovers`, which can also be
 //!   called for a directory without building a table): for every `jN.pid` record it kills the recorded
 //!   process group if that group is confirmed to be the recorded one (`proc::kill_recorded_group`), then
-//!   removes the pid, output and status files. `leftovers()` says what was found, including a group
-//!   that is alive but could not be confirmed and was therefore left running; each is logged. Records
+//!   reads the status file and removes the pid record. A command whose group was already gone and whose
+//!   status file holds an exit code ended by itself while no daemon watched it: its output and status
+//!   files are kept until the session has taken them (`ended_while_down`, then `discard`). The output
+//!   and status files of every other command are removed. `leftovers()` says what was found: the id,
+//!   whether the group was killed, or was alive but could not be confirmed and was therefore left
+//!   running, the exit code the status file holds, and the output file; each is logged. Records
 //!   written by this very process (a table of it that is still winding down) are left alone, and no id
 //!   that has files in `dir` is handed out again.
+//! - `ended_while_down(id)`: for a job of an earlier daemon that has no pid record left (the sweep
+//!   removed it, or its watcher did before the daemon went down) and whose status file holds an exit
+//!   code, that code and its output stored as a settled job's is (at most `max_output_bytes`; `detail`
+//!   says when the rest was discarded or storing failed). `discard(id)` removes such a job's output
+//!   and status files once the session has recorded its end. Both leave alone the files of a job this
+//!   table runs and of a command that still has a pid record.
 //!
 //! Additions beyond the contract (this file only): `register_from` (a job whose first bytes the model
 //! was already shown), `output_blob`, `elapsed_ms`, `leader_status` and `detail` (what the job tools
@@ -45,7 +55,9 @@
 //! Tests required (real processes, sandbox mode `none`, tempfile): a job that finishes sends
 //! Registered then Settled with its stored output and exit status; `wait` returns early on end and on
 //! timeout; successive waits return disjoint, contiguous output; `kill`; `kill_all` with several
-//! jobs; output-limit kill; unknown id; `list`; `resume_from`; no event is sent twice.
+//! jobs; output-limit kill; unknown id; `list`; `resume_from`; no event is sent twice; a previous
+//! daemon's job that ended by itself is reported with its exit code, keeps its files until `discard`,
+//! and `ended_while_down` stores its output.
 
 use crate::proc::{self, Ended, RecordedGroup, Running, WaitEnd};
 use loom_core::{BlobRef, BlobStore, CallId};
@@ -179,13 +191,35 @@ pub struct Leftover {
     /// Whether a process group with the recorded id was alive but could not be confirmed to be the
     /// recorded one. It was not signalled; if it is the command's, it is still running.
     pub left_running: bool,
+    /// The exit code its status file holds: the command itself had exited.
+    pub exit_code: Option<i32>,
+    /// Its output file.
+    pub out_path: PathBuf,
+}
+
+impl Leftover {
+    /// Whether the command ended by itself while no daemon watched it: nothing of its group was left
+    /// and its status file holds its exit code. Its output and status files are then kept.
+    pub fn ended_by_itself(&self) -> bool {
+        !self.killed && !self.left_running && self.exit_code.is_some()
+    }
+}
+
+/// The exit code a command's status file holds: the number the wrapper writes last, after the command
+/// has exited. `None` when the file is missing, empty (the command was stopped before it could be
+/// written) or holds something else.
+fn exit_code_in(path: &Path) -> Option<i32> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let last = text.trim().lines().next_back()?.trim().parse::<i32>().ok()?;
+    (0..=255).contains(&last).then_some(last)
 }
 
 /// Kills what an earlier daemon left running in the jobs directory `dir` (only process groups whose
-/// identity is confirmed), removes the files of every command recorded there, and logs each one.
-/// Records written by this process itself are left alone. `JobTable::new` does this for its
-/// directory; a caller may also run it for a directory no table is created for, for example for
-/// every session at start.
+/// identity is confirmed), removes every pid record found there, keeps the output and status files of a
+/// command that ended by itself (see [`Leftover::ended_by_itself`]) for its session to take, removes
+/// those of every other command, and logs each one. Records written by this process itself are left
+/// alone. `JobTable::new` does this for its directory; a caller may also run it for a directory no
+/// table is created for, for example for every session at start.
 pub fn clear_leftovers(dir: &Path) -> Vec<Leftover> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut found = Vec::new();
@@ -205,10 +239,23 @@ pub fn clear_leftovers(dir: &Path) -> Vec<Leftover> {
             Some(record) => (record.pid, proc::kill_recorded_group(&record)),
             None => (0, RecordedGroup::Gone),
         };
-        for name in [format!("{id}.pid"), format!("{id}.out"), format!("{id}.status")] {
-            let _ = std::fs::remove_file(dir.join(name));
+        // Read after the group was dealt with: once nothing of it is left, the status file is final.
+        let (out_path, status_path) = (dir.join(format!("{id}.out")), dir.join(format!("{id}.status")));
+        let exit_code = exit_code_in(&status_path);
+        let left = Leftover {
+            id,
+            pid,
+            killed: group == RecordedGroup::Killed,
+            left_running: group == RecordedGroup::Unconfirmed,
+            exit_code,
+            out_path,
+        };
+        // The group is never probed again: its id may be reused from now on.
+        let _ = std::fs::remove_file(&path);
+        if !left.ended_by_itself() {
+            let _ = std::fs::remove_file(&left.out_path);
+            let _ = std::fs::remove_file(&status_path);
         }
-        let left = Leftover { id, pid, killed: group == RecordedGroup::Killed, left_running: group == RecordedGroup::Unconfirmed };
         if left.left_running {
             tracing::warn!(
                 job = %left.id,
@@ -216,6 +263,8 @@ pub fn clear_leftovers(dir: &Path) -> Vec<Leftover> {
                 "a previous daemon's command in {}: process group {pid} is alive but could not be confirmed to be that command; it was not signalled and may still be running",
                 dir.display()
             );
+        } else if left.ended_by_itself() {
+            tracing::warn!(job = %left.id, pid, exit_code, "a previous daemon's command in {} ended by itself; its output is kept for its session", dir.display());
         } else {
             tracing::warn!(job = %left.id, pid, killed = left.killed, "cleared a previous daemon's command in {}", dir.display());
         }
@@ -223,6 +272,40 @@ pub fn clear_leftovers(dir: &Path) -> Vec<Leftover> {
     }
     found.sort_by_key(|l| id_order(&l.id));
     found
+}
+
+/// Adds a clause to a `detail` sentence.
+fn add_detail(detail: &mut String, clause: &str) {
+    if !detail.is_empty() {
+        detail.push_str("; ");
+    }
+    detail.push_str(clause);
+}
+
+/// Stores the first `max` bytes of the output file `path` as a job's complete output; `None` when that
+/// failed. What needs saying about it (the rest discarded, the failure) is added to `detail`.
+fn store_output(blobs: &BlobStore, path: &Path, max: u64, detail: &mut String) -> Option<BlobRef> {
+    let total = file_len(path);
+    if total > max {
+        add_detail(detail, &format!("the output was {total} bytes; only the first {max} bytes were stored and the rest was discarded"));
+    }
+    match read_from(path, 0, max).and_then(|raw| crate::view::store_text(blobs, &raw).map(|(b, _)| b)) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            add_detail(detail, &format!("the complete output could not be stored ({e}); it is still in the file {}", path.display()));
+            None
+        }
+    }
+}
+
+/// What a job of an earlier daemon that ended by itself while no daemon watched it left behind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EndedLeftover {
+    pub exit_code: i32,
+    /// Its output, stored as a settled job's is. `None` only when storing failed.
+    pub output: Option<BlobRef>,
+    /// What needs saying about the output (the rest discarded past the limit, storing failed), or empty.
+    pub detail: String,
 }
 
 /// The highest job number among the files in `dir` (0 when there are none).
@@ -266,6 +349,36 @@ impl JobTable {
     /// The commands of a previous daemon found when this table was created (and cleared).
     pub fn leftovers(&self) -> &[Leftover] {
         &self.leftovers
+    }
+
+    /// The output and status files of job `id` of an earlier daemon, when it may be read as over: it is
+    /// not this table's, and no pid record says that a process (of this daemon: the sweep removed the
+    /// earlier one's) may still be running it.
+    fn left_files(&self, id: &str) -> Option<(PathBuf, PathBuf)> {
+        if id_number(id).is_none() || lock(&self.inner).jobs.iter().any(|j| lock(&j.st).info.id == id) {
+            return None;
+        }
+        let out = self.dir.join(format!("{id}.out"));
+        (!proc::pid_path(&out).exists()).then(|| (out, self.dir.join(format!("{id}.status"))))
+    }
+
+    /// How job `id` of an earlier daemon ended, when it ended by itself while no daemon watched it: its
+    /// status file holds its exit code (see the module contract). Its output is stored on each call.
+    pub fn ended_while_down(&self, id: &str) -> Option<EndedLeftover> {
+        let (out, status) = self.left_files(id)?;
+        let exit_code = exit_code_in(&status)?;
+        let mut detail = String::new();
+        let output = store_output(&self.blobs, &out, self.max_output_bytes, &mut detail);
+        Some(EndedLeftover { exit_code, output, detail })
+    }
+
+    /// Removes the output and status files of job `id` of an earlier daemon, once its session has
+    /// recorded how it ended. Its id is still not handed out again.
+    pub fn discard(&self, id: &str) {
+        if let Some((out, status)) = self.left_files(id) {
+            let _ = std::fs::remove_file(out);
+            let _ = std::fs::remove_file(status);
+        }
     }
 
     /// The next id will be `j{n+1}` (never lower than ids already handed out).
@@ -506,27 +619,8 @@ async fn watch(shared: Arc<Shared>, mut running: Running, blobs: BlobStore, even
     };
     // The process group is gone (or `terminate` gave up on it); the files are final.
     let path = lock(&shared.st).info.out_path.clone();
-    let total = file_len(&path);
-    if total > max_output_bytes {
-        if !detail.is_empty() {
-            detail.push_str("; ");
-        }
-        detail.push_str(&format!("the output was {total} bytes; only the first {max_output_bytes} bytes were stored and the rest was discarded"));
-    }
     let _ = std::fs::remove_file(proc::pid_path(&path));
-    let stored = read_from(&path, 0, max_output_bytes)
-        .and_then(|raw| crate::view::store_text(&blobs, &raw).map(|(b, _)| b))
-        .map_err(|e| format!("the complete output could not be stored ({e}); it is still in the file {}", path.display()));
-    let output = match stored {
-        Ok(b) => Some(b),
-        Err(msg) => {
-            if !detail.is_empty() {
-                detail.push_str("; ");
-            }
-            detail.push_str(&msg);
-            None
-        }
-    };
+    let output = store_output(&blobs, &path, max_output_bytes, &mut detail);
     let info = {
         let mut st = lock(&shared.st);
         st.info.state = state;
@@ -968,13 +1062,18 @@ mod tests {
         }
     }
 
+    fn leftover(f: &Fx, id: &str, pid: u32, killed: bool, left_running: bool, exit_code: Option<i32>) -> Leftover {
+        let out_path = f.root.join(format!("home/jobs/{id}.out"));
+        Leftover { id: id.to_string(), pid, killed, left_running, exit_code, out_path }
+    }
+
     #[tokio::test]
     async fn a_new_table_kills_the_previous_daemons_confirmed_group_and_clears_its_files() {
         let f = fx();
         let pid = orphan(&f, "j7");
         assert!(alive(pid));
         let (table, _rx) = table_over(&f);
-        assert_eq!(table.leftovers(), [Leftover { id: "j7".to_string(), pid, killed: true, left_running: false }]);
+        assert_eq!(table.leftovers(), [leftover(&f, "j7", pid, true, false, None)]);
         assert!(gone(i32::try_from(pid).expect("pid")).await, "the orphaned group was not killed");
         no_files_left(&f, "j7");
         // Its id is not handed out again.
@@ -993,9 +1092,58 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert_eq!(clear_leftovers(&f.root.join("home/jobs")), [Leftover { id: "j9".to_string(), pid, killed: false, left_running: false }]);
+        assert_eq!(clear_leftovers(&f.root.join("home/jobs")), [leftover(&f, "j9", pid, false, false, None)]);
         no_files_left(&f, "j9");
         assert!(clear_leftovers(&f.root.join("home/jobs")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_previous_daemons_job_that_ended_by_itself_keeps_its_status_and_output_until_taken() {
+        let f = fx();
+        let dir = f.root.join("home/jobs");
+        // It ran on, unwatched, after its daemon went down, and exited 3.
+        let mut running = orphan_running(&f, "j4", "echo built; echo failed; exit 3");
+        assert_eq!(running.wait(&never(), Some(Duration::from_secs(20)), u64::MAX).await, WaitEnd::Ended(Ended::Exit(3)));
+        assert!(!running.group_alive());
+        running.disarm();
+        as_previous_daemons(&f, "j4");
+        let pid = running.pid;
+        drop(running);
+        let (table, _rx) = table_over(&f);
+        assert_eq!(table.leftovers(), [leftover(&f, "j4", pid, false, false, Some(3))]);
+        assert!(table.leftovers().iter().all(Leftover::ended_by_itself));
+        // The record is gone; the output and status are kept for the session.
+        assert!(!dir.join("j4.pid").exists());
+        assert!(dir.join("j4.out").exists() && dir.join("j4.status").exists());
+        let end = table.ended_while_down("j4").expect("it ended by itself");
+        assert_eq!((end.exit_code, end.detail.as_str()), (3, ""));
+        assert_eq!(f.stored(&end.output.expect("stored")), "built\nfailed\n");
+        // A later table (one whose session did not take it) finds no leftover, but still how it ended,
+        // with its output stored under that table's limit.
+        let (tx, _rx8) = tokio::sync::mpsc::unbounded_channel();
+        let later = JobTable::new(dir.clone(), f.blobs.clone(), tx, 8);
+        assert!(later.leftovers().is_empty());
+        let end = later.ended_while_down("j4").expect("it ended by itself");
+        assert_eq!(f.stored(&end.output.expect("stored")), "built\nfa");
+        assert_eq!(end.detail, "the output was 13 bytes; only the first 8 bytes were stored and the rest was discarded");
+        // Taken: its files go, and its id is still not handed out again.
+        later.discard("j4");
+        no_files_left(&f, "j4");
+        assert!(later.ended_while_down("j4").is_none());
+        assert_eq!(later.allocate().await.expect("allocate").0, "j5");
+        // The files of a command that still has a pid record (this process's), of a job a table runs, and
+        // of an id that is not one, are neither read nor removed.
+        let mut mine = orphan_running(&f, "j7", "exit 0");
+        assert_eq!(mine.wait(&never(), Some(Duration::from_secs(20)), u64::MAX).await, WaitEnd::Ended(Ended::Exit(0)));
+        assert!(later.ended_while_down("j7").is_none());
+        later.discard("j7");
+        assert!(dir.join("j7.pid").exists() && dir.join("j7.status").exists());
+        f.start("exit 0").await;
+        f.table.wait("j1", Duration::from_secs(20), &never()).await.expect("wait");
+        assert!(f.table.ended_while_down("j1").is_none());
+        f.table.discard("j1");
+        assert!(dir.join("j1.out").exists() && dir.join("j1.status").exists());
+        assert!(later.ended_while_down("../j4").is_none());
     }
 
     #[tokio::test]
@@ -1021,8 +1169,8 @@ mod tests {
 
         let (table, _rx) = table_over(&f);
         let want = [
-            Leftover { id: "j5".to_string(), pid: leaders[0], killed: true, left_running: false },
-            Leftover { id: "j6".to_string(), pid: leaders[1], killed: false, left_running: true },
+            leftover(&f, "j5", leaders[0], true, false, Some(0)),
+            leftover(&f, "j6", leaders[1], false, true, Some(0)),
         ];
         assert_eq!(table.leftovers(), want);
         assert!(gone(children[0]).await, "the group that outlived its leader was not killed");
@@ -1043,14 +1191,14 @@ mod tests {
         std::fs::write(f.root.join("home/jobs/j3.pid"), format!("{pid} 1.000000\n")).expect("write");
         let (table, _rx) = table_over(&f);
         // It is reported as still there, so that the caller can say that something may be running.
-        assert_eq!(table.leftovers(), [Leftover { id: "j3".to_string(), pid, killed: false, left_running: true }]);
+        assert_eq!(table.leftovers(), [leftover(&f, "j3", pid, false, true, None)]);
         assert!(alive(pid));
         no_files_left(&f, "j3");
         // A record without a start time is not enough to signal either.
         let pid2 = orphan(&f, "j4");
         std::fs::write(f.root.join("home/jobs/j4.pid"), format!("{pid2} -\n")).expect("write");
         let (table2, _rx2) = table_over(&f);
-        assert_eq!(table2.leftovers(), [Leftover { id: "j4".to_string(), pid: pid2, killed: false, left_running: true }]);
+        assert_eq!(table2.leftovers(), [leftover(&f, "j4", pid2, false, true, None)]);
         assert!(alive(pid2));
         // SAFETY: cleaning up the test's own sleeping processes.
         unsafe {

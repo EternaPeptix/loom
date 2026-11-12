@@ -1367,6 +1367,7 @@ mod tests {
             awaited: false,
             unattended: false,
             archived: false,
+            gate: None,
         }
     }
 
