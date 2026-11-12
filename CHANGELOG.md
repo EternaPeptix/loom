@@ -224,6 +224,10 @@ upgrade" first; the rest says what behaves differently.
   umask. The daemon tightens the home, `keys/`, `sessions/`, `missions/`, `blobs/` and `logs/` at start; files
   from earlier versions keep their mode but other accounts can no longer open them. `chmod -R go-rwx ~/.loom`
   tightens them too.
+- The ledger has three new records (nothing writes them yet): a goal-met claim (open once a goal is set,
+  then `supported` or `refuted` on execution evidence, never withdrawn), an operator-only release
+  ("goal not established") and operator-only scope grants (`authorized hosts: …`); the brief and the
+  Markdown view show them. Older journals fold unchanged.
 - A finish verifier's `meta.json` has a new optional `gate` field (its assignment); files without it
   load as before.
 - Reading lines of a stored output reads only the line-index entries it needs, so a page costs the
