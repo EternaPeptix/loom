@@ -45,6 +45,8 @@ if [ "${1:-}" = "--pull-bin" ]; then
     remote "cargo build --release -p loom-daemon" || exit $?
     mkdir -p "$ROOT/bin"
     rsync -a "$HOST:$REMOTE/target-$LANE/release/loom" "$ROOT/bin/loom" || exit 91
+    # A binary copied across machines must be re-signed ad-hoc or Gatekeeper SIGKILLs it on launch.
+    command -v codesign >/dev/null && codesign --force --sign - "$ROOT/bin/loom" 2>/dev/null || true
     pull_lock
     ls -la "$ROOT/bin/loom"
     exit 0
