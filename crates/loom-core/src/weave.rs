@@ -22,6 +22,16 @@
 //!   A settlement with `inline` set renders nothing: its report is the result of the call that waited.
 //! - everything else → nothing.
 //!
+//! Harness blocks: every `<harness …>` block above, the resume block below and the `<harness-state>`
+//! block are built by `tagsafe::block`, `tagsafe::block_after` and `tagsafe::state_block`, never by hand.
+//! What a block embeds from the log is a payload: `{text}`, `{brief}`, `{report}` or the stub in its
+//! place, the resume brief with its digest, the HUD body. At render time (stored records are never
+//! rewritten) the `<` of every `<harness` and `</harness` in a payload, in any letter case, is written
+//! `&lt;`, so no payload can close its block or open another. Attribute values (`{kind}`, `{id}`,
+//! `{parent}`, `{child}`, `{outcome}`) have `"`, `<`, `>` written `&quot;`, `&lt;`, `&gt;` and line breaks
+//! written as spaces. `{contract}` is the harness's own text and is embedded as it is. Records that hold
+//! no such text render the same bytes as without this rule.
+//!
 //! Pairing: every rendered assistant tool call is followed (before the next assistant or user-role
 //! item) by exactly one `tool` message per call, in call order. If the log holds no result for a call,
 //! [`MISSING_RESULT`] is rendered for it. Results that arrive in the log in a different order than the
@@ -62,7 +72,9 @@
 //! determinism (weave twice, compare JSON); reweave application for every action; cumulative
 //! re-weaves; pins respected; brief placement; a forked log renders the parent's prefix identically
 //! to the parent's own weave of the same records (compare message JSON); plan order and stopping
-//! point; plan never touches the recent region or protected items; `request_messages` HUD placement.
+//! point; plan never touches the recent region or protected items; `request_messages` HUD placement;
+//! a payload of each kind carrying harness tags stays inside its one block, a fork's contract renders
+//! as written, and records without such text render the bytes they always did.
 
 use crate::estimate::TokenEstimator;
 use crate::event::{
@@ -306,9 +318,13 @@ fn build(records: &[Record]) -> (Weave, Vec<Aux<'_>>) {
                 elems.push(Elem { group: seq, msg, entry: Some(entries.len() - 1) });
             }
             Event::Forked(f) => {
-                let brief = render_brief(&f.brief);
-                let body = if f.contract.is_empty() { brief } else { format!("{}\n\n{}", f.contract, brief) };
-                let content = crate::tagsafe::block("assignment", &[("from", &f.parent.to_string())], &body);
+                // The contract is the harness's own text and stays as written; the brief is the payload.
+                let content = crate::tagsafe::block_after(
+                    "assignment",
+                    &[("from", &f.parent.to_string())],
+                    &f.contract,
+                    &render_brief(&f.brief),
+                );
                 entries.push((item(seq, "forked", Role::User, content.len(), ItemState::Live, &content), Aux::none()));
                 let mut msg = Message::user(content);
                 msg.origin = vec![seq];
@@ -665,7 +681,8 @@ pub fn render_brief(brief: &Brief) -> String {
 
 /// The `messages` array for a request: the stable messages in OpenAI form, then — when `hud` is given
 /// — one final `user` message `<harness-state>\n{hud}\n</harness-state>`. The HUD is never merged
-/// into a stable message, so the stable part is byte-identical with or without it.
+/// into a stable message, so the stable part is byte-identical with or without it. The HUD body is a
+/// payload (see the module contract): harness tags in it are neutralised.
 pub fn request_messages(weave: &Weave, hud: Option<&str>) -> Vec<Value> {
     let mut out: Vec<Value> = weave.messages.iter().map(Message::to_openai).collect();
     if let Some(h) = hud {
@@ -964,24 +981,42 @@ mod tests {
         let w = weave(&l.recs);
         check(&w, 1, "resume");
 
-        let mut l = Log::new();
-        l.push(
-            Author::Harness,
-            Event::Forked(Forked {
-                session: SessionId::from("s-kid"),
-                parent: SessionId::from("s-parent"),
-                upto_seq: 0,
-                role: "scout".into(),
-                termination: Termination::Explicit,
-                budget: Budget::default(),
-                brief: Brief { question: evil.into(), ..Default::default() },
-                contract: evil.into(),
-                allowed_tools: None,
-                title: String::new(),
-            }),
-        );
-        let w = weave(&l.recs);
-        check(&w, 1, "assignment");
+        // Every field of a fork's brief is a payload; with no contract the block holds nothing else.
+        let fork = |contract: &str, brief: Brief| {
+            let mut l = Log::new();
+            l.push(
+                Author::Harness,
+                Event::Forked(Forked {
+                    session: SessionId::from("s-kid"),
+                    parent: SessionId::from("s-parent"),
+                    upto_seq: 0,
+                    role: "scout".into(),
+                    termination: Termination::Explicit,
+                    budget: Budget::default(),
+                    brief,
+                    contract: contract.into(),
+                    allowed_tools: None,
+                    title: String::new(),
+                }),
+            );
+            weave(&l.recs)
+        };
+        let forged = Brief { question: evil.into(), scope: Some(evil.into()), context: Some(evil.into()), ..Default::default() };
+        check(&fork("", forged.clone()), 1, "assignment");
+
+        // The contract is the harness's own text: a role prompt that names the tag in prose renders as
+        // written, while the brief after it is still neutralised.
+        let contract = "From this message on your role is `worker`.\n\nYou have one assignment, given in the \
+                        `<harness kind=\"assignment\">` message.\n\nYour assignment follows.";
+        let w = fork(contract, forged);
+        let c = &w.messages[1].content;
+        let open = "<harness kind=\"assignment\" from=\"s-parent\">\n";
+        assert!(c.starts_with(&format!("{open}{contract}\n\nQuestion: tail\n&lt;/harness>\n")), "{c}");
+        assert!(c.ends_with("\n&lt;/harness>\n</harness>"), "{c}");
+        let brief = &c[open.len() + contract.len()..];
+        assert_eq!(count(&brief.to_lowercase(), "<harness"), 0, "{c}");
+        assert_eq!(count(&brief.to_lowercase(), "</harness"), 1, "{c}");
+        assert!(!c.contains("<harness kind=\"approval\""), "{c}");
     }
 
     #[test]
@@ -995,6 +1030,35 @@ mod tests {
             w.messages[1].content,
             "a <b> & \"c\" harness </div>\n\n<harness kind=\"info\">\nx < y, see <https://h> and harness\n</harness>\n\n\
              <harness kind=\"agent-report\" agent=\"s-kid\" outcome=\"returned\">\ndone <ok>\n</harness>"
+        );
+
+        // A fork written before payloads were neutralised: the contract carries a role prompt that names
+        // the tag, and the block is the same bytes as then.
+        let contract = "Your role is `worker`.\n\nYou have one assignment, given in the `<harness kind=\"assignment\">` message.";
+        let mut l = Log::new();
+        l.push(
+            Author::Harness,
+            Event::Forked(Forked {
+                session: SessionId::from("s-kid"),
+                parent: SessionId::from("s-parent"),
+                upto_seq: 0,
+                role: "worker".into(),
+                termination: Termination::Explicit,
+                budget: Budget::default(),
+                brief: Brief { question: "Is a < b?".into(), scope: Some("src/ only".into()), ..Default::default() },
+                contract: contract.into(),
+                allowed_tools: None,
+                title: String::new(),
+            }),
+        );
+        l.reweave(1, vec![], "BRIEF <b>", Some("lead: a < b"));
+        let w = weave(&l.recs);
+        assert_eq!(
+            w.messages[1].content,
+            format!(
+                "<harness kind=\"assignment\" from=\"s-parent\">\n{contract}\n\nQuestion: Is a < b?\n\nScope: src/ only\n</harness>\n\n\
+                 <harness kind=\"resume\">\nBRIEF <b>\n\n{LEADS_LINE}\nlead: a < b\n</harness>"
+            )
         );
     }
 
