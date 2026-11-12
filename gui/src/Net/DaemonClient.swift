@@ -451,7 +451,8 @@ final class DaemonClient: @unchecked Sendable {
             "fallback url")
         chk(!(codeEntryURL(base: "http://127.0.0.1:7878", code: "0a1b2c")?.absoluteString.contains("token") ?? true), "code url mentions token")
         chk(parseLoginCode(Data("{\"code\":\"00ff00ff00ff00ff\",\"expires_in_s\":60}".utf8)) == "00ff00ff00ff00ff", "login code parse")
-        chk(parseLoginCode(Data("{\"code\":\"zz\",\"expires_in_s\":60}".utf8)) == nil, "bad login code accepted")
+        chk(parseLoginCode(Data("{\"code\":\"zz\",\"expires_in_s\":60}".utf8)) == nil, "short login code accepted")
+        chk(parseLoginCode(Data("{\"code\":\"00ff00ff00ff00zz\",\"expires_in_s\":60}".utf8)) == nil, "non-hex login code accepted")
         chk(parseLoginCode(Data("{\"expires_in_s\":60}".utf8)) == nil, "missing login code accepted")
         return f
     }

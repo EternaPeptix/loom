@@ -4,15 +4,16 @@ import Darwin
 /// Manages the SSH port-forward to a daemon that binds loopback on another host, and the token fetch.
 /// See gui/DESIGN.md "Tunnel". Exactly one tunnel is alive at a time.
 ///
-/// - `open(_:)` for a `.sshTunnel` connection: spawn
-///   `ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
-///    -L 127.0.0.1:<port>:127.0.0.1:<port> <sshHost>` (the SAME port number at both ends, because the
-///   daemon only accepts its own port in the Host/Origin headers; a busy port is an error, never a
-///   different port), wait (poll-connect, ~10 s) until the
-///   forward answers, then (if `.fetchOverSsh`) `ssh -o BatchMode=yes <sshHost> cat ~/.loom/token`,
-///   trim and validate it. Returns `Ready(baseURL: "http://127.0.0.1:<port>", token:)` or throws a
-///   `TunnelError` whose message includes ssh stderr.
-/// - `close()` SIGTERMs the ssh child, SIGKILLs after a short grace, forgets the port. Idempotent.
+/// - `open(_:)` for a `.sshTunnel` connection: wait for the child the last `close()` stopped to exit, then
+///   spawn `ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
+///    -o ControlMaster=no -o ControlPath=none -L 127.0.0.1:<port>:127.0.0.1:<port> <sshHost>` (the SAME
+///   port number at both ends, because the daemon only accepts its own port in the Host/Origin headers;
+///   a busy port is an error, never a different port), wait (poll-connect, ~10 s) until the
+///   forward answers, then (if `.fetchOverSsh`) `ssh -o BatchMode=yes <sshHost> cat ~/.loom/token`
+///   (multiplexing off too), trim and validate it, and check the child is still running. Returns
+///   `Ready(baseURL: "http://127.0.0.1:<port>", token:)` or throws a `TunnelError` whose message
+///   includes ssh stderr.
+/// - `close()` SIGTERMs the ssh child, SIGKILLs after a short grace. Idempotent.
 /// - A `.direct` connection does not use this type.
 final class Tunnel: @unchecked Sendable {
     struct Ready { let baseURL: String; let token: String? }
@@ -22,6 +23,7 @@ final class Tunnel: @unchecked Sendable {
         case forwardTimedOut(String)
         case badToken(String)
         case portBusy(Int)
+        case exited(String)
         var description: String {
             switch self {
             case .spawnFailed(let s): return "could not start the SSH tunnel: \(s)"
@@ -29,8 +31,10 @@ final class Tunnel: @unchecked Sendable {
             case .badToken(let s): return "could not read the daemon token: \(s)"
             case .portBusy(let p):
                 return "local port \(p) is already in use. loom-desk needs 127.0.0.1:\(p) free for this connection "
-                    + "(the tunnel must use the daemon's own port number). Close whatever is using port \(p), "
-                    + "or use a Direct connection with your own ssh -L."
+                    + "(the tunnel must use the daemon's own port number). Close whatever is using port \(p) "
+                    + "(`lsof -nP -iTCP:\(p) -sTCP:LISTEN` names it; a leftover ssh from an earlier loom-desk run "
+                    + "can hold it), or use a Direct connection with your own ssh -L."
+            case .exited(let s): return "the SSH tunnel closed: \(s)"
             }
         }
     }
@@ -39,7 +43,24 @@ final class Tunnel: @unchecked Sendable {
     private final class Sink: @unchecked Sendable {
         private let lock = NSLock()
         private var data = Data()
+        private var ended = false
         func append(_ d: Data) { lock.lock(); data.append(d); if data.count > 65_536 { data = data.suffix(32_768) }; lock.unlock() }
+        /// The pipe reached end-of-file: everything the child printed is in.
+        func end() { lock.withLock { ended = true } }
+        /// Blocks up to ~0.5 s for end-of-file, so the line ssh prints as it exits is not missed.
+        func waitForEnd() {
+            for _ in 0..<50 {
+                if lock.withLock({ ended }) { return }
+                usleep(10_000)
+            }
+        }
+        /// `waitForEnd()` for async callers.
+        func awaitEnd() async {
+            for _ in 0..<50 {
+                if lock.withLock({ ended }) || Task.isCancelled { return }
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
         /// The last non-empty line, for a one-line disconnect reason.
         var lastLine: String {
             lock.lock(); defer { lock.unlock() }
@@ -63,6 +84,9 @@ final class Tunnel: @unchecked Sendable {
     private var ssh: Process?
     private var stderrSink: Sink?
     private var closing = false
+    /// The child the last `close()` stopped, until `open()` has seen it exit: its listener may hold the
+    /// port for a moment, and it must not be taken for someone else's.
+    private var exiting: Process?
 
     /// Called (on an arbitrary thread) if the ssh child exits without `close()` having been asked.
     var onUnexpectedExit: (@Sendable (String) -> Void)?
@@ -80,22 +104,19 @@ final class Tunnel: @unchecked Sendable {
             throw TunnelError.spawnFailed("the remote port is out of range")
         }
         close()
+        await waitForExitingChild()
+        if Task.isCancelled { throw CancellationError() }
         let local = connection.remotePort
         if Tunnel.canConnect(port: local) { throw TunnelError.portBusy(local) }
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        p.arguments = ["-N",
-                       "-o", "BatchMode=yes",
-                       "-o", "ExitOnForwardFailure=yes",
-                       "-o", "ServerAliveInterval=15",
-                       "-L", Tunnel.forwardSpec(port: local),
-                       "--", connection.sshHost]
+        p.arguments = Tunnel.tunnelArguments(host: connection.sshHost, port: local)
         let err = Pipe()
         let sink = Sink()
         err.fileHandleForReading.readabilityHandler = { h in
             let d = h.availableData
-            if d.isEmpty { h.readabilityHandler = nil } else { sink.append(d) }
+            if d.isEmpty { h.readabilityHandler = nil; sink.end() } else { sink.append(d) }
         }
         p.standardError = err
         p.standardOutput = FileHandle.nullDevice
@@ -106,8 +127,12 @@ final class Tunnel: @unchecked Sendable {
             let intentional = self.closing || self.ssh !== proc
             self.lock.unlock()
             if !intentional {
-                let msg = sink.lastLine
-                self.onUnexpectedExit?(msg.isEmpty ? "ssh exited with status \(proc.terminationStatus)" : msg)
+                // Off Foundation's queue: let the pipe drain so the line ssh printed as it died is in.
+                DispatchQueue.global().async {
+                    sink.waitForEnd()
+                    let msg = sink.lastLine
+                    self.onUnexpectedExit?(msg.isEmpty ? "ssh exited with status \(proc.terminationStatus)" : msg)
+                }
             }
         }
         lock.withLock { closing = false; ssh = p; stderrSink = sink }
@@ -120,12 +145,11 @@ final class Tunnel: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(Tunnel.forwardDeadline)
         var portUp = false
         while true {
-            if Task.isCancelled { close(); throw CancellationError() }
+            if Task.isCancelled { close(only: p); throw CancellationError() }
             if !p.isRunning {
-                // Give the stderr pipe a moment to drain.
-                try? await Task.sleep(nanoseconds: 100_000_000)
+                await sink.awaitEnd()
                 let msg = sink.text
-                close()
+                close(only: p)
                 if Tunnel.isBindFailure(msg) { throw TunnelError.portBusy(local) }
                 throw TunnelError.forwardTimedOut(msg.isEmpty ? "ssh exited with status \(p.terminationStatus)" : msg)
             }
@@ -135,7 +159,7 @@ final class Tunnel: @unchecked Sendable {
             }
             if Date() >= deadline {
                 let msg = sink.text
-                close()
+                close(only: p)
                 let why = portUp
                     ? "the forward is up but nothing answered on \(connection.sshHost):\(connection.remotePort) (is the daemon running?)"
                     : "no answer within \(Int(Tunnel.forwardDeadline)) s"
@@ -147,9 +171,17 @@ final class Tunnel: @unchecked Sendable {
         var token: String? = nil
         if connection.tokenSource == .fetchOverSsh {
             do { token = try await fetchToken(host: connection.sshHost) } catch {
-                close()
+                close(only: p)
                 throw error
             }
+        }
+        if Task.isCancelled { close(only: p); throw CancellationError() }
+        // The forward may have died during the token fetch; the caller only learns of an exit from here.
+        if !p.isRunning {
+            await sink.awaitEnd()
+            let msg = sink.lastLine
+            close(only: p)
+            throw TunnelError.exited(msg.isEmpty ? "ssh exited with status \(p.terminationStatus)" : msg)
         }
         return Ready(baseURL: "http://127.0.0.1:\(local)", token: token)
     }
@@ -157,12 +189,21 @@ final class Tunnel: @unchecked Sendable {
     /// True while the ssh child of the current tunnel is still running.
     var isRunning: Bool { lock.withLock { ssh?.isRunning ?? false } }
 
-    func close() {
+    /// The last line the current child wrote to stderr ("" when none or no child): why it exited.
+    var lastErrorLine: String { lock.withLock { stderrSink?.lastLine ?? "" } }
+
+    func close() { close(only: nil) }
+
+    /// Stops the current child; with `only`, just when that is still the current child, so a superseded
+    /// `open()` never stops the tunnel a newer `open()` started.
+    private func close(only: Process?) {
         lock.lock()
+        if let only, ssh !== only { lock.unlock(); return }
         closing = true
         let p = ssh
         ssh = nil
         stderrSink = nil
+        if let p { exiting = p }
         lock.unlock()
         guard let p else { return }
         if p.isRunning {
@@ -196,11 +237,22 @@ final class Tunnel: @unchecked Sendable {
         if p.isRunning { kill(pid, SIGKILL) }
     }
 
+    /// Waits for the child the last `close()` stopped to exit (bounded: `close()` SIGKILLs it after ~2 s),
+    /// so that only a listener that is not loom-desk's own is reported as a busy port.
+    private func waitForExitingChild() async {
+        guard let p = lock.withLock({ exiting }) else { return }
+        for _ in 0..<60 where p.isRunning && !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        lock.withLock { if exiting === p && !p.isRunning { exiting = nil } }
+    }
+
     // MARK: token
 
     private func fetchToken(host: String) async throws -> String {
         let r = await Tunnel.runCapture("/usr/bin/ssh",
-                                        ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host, "cat ~/.loom/token"],
+                                        ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"] + Tunnel.noMultiplexing
+                                            + ["--", host, "cat ~/.loom/token"],
                                         timeout: 20)
         guard r.status == 0 else {
             let m = r.stderr.isEmpty ? "ssh exited with status \(r.status)" : r.stderr
@@ -258,11 +310,20 @@ final class Tunnel: @unchecked Sendable {
     /// presents are the ones the daemon accepts.
     static func forwardSpec(port: Int) -> String { "127.0.0.1:\(port):127.0.0.1:\(port)" }
 
-    /// True when ssh's stderr says it could not bind the local end of the forward.
+    /// No connection sharing: with a ControlMaster/ControlPersist from the operator's ssh config the
+    /// forward's listener would live in a master that outlives the child loom-desk tracks and stops.
+    static let noMultiplexing = ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+
+    /// The tunnel child's arguments.
+    static func tunnelArguments(host: String, port: Int) -> [String] {
+        ["-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15"]
+            + noMultiplexing + ["-L", forwardSpec(port: port), "--", host]
+    }
+
+    /// True when ssh's stderr says the local end of the forward is taken. Other bind failures (e.g. a
+    /// port below 1024: "Permission denied") are not a busy port and are reported with ssh's own words.
     static func isBindFailure(_ stderr: String) -> Bool {
-        let l = stderr.lowercased()
-        return l.contains("address already in use") || l.contains("cannot listen to port")
-            || l.contains("could not request local forwarding")
+        stderr.lowercased().contains("address already in use")
     }
 
     /// One blocking connect attempt to 127.0.0.1:port (loopback: returns immediately).
@@ -302,9 +363,17 @@ final class Tunnel: @unchecked Sendable {
     static func selfCheck() -> [String] {
         var f: [String] = []
         if forwardSpec(port: 7878) != "127.0.0.1:7878:127.0.0.1:7878" { f.append("Tunnel: forwardSpec \(forwardSpec(port: 7878))") }
+        let args = tunnelArguments(host: "studio", port: 7979)
+        if let i = args.firstIndex(of: "-L"), i + 1 < args.count {
+            if args[i + 1] != "127.0.0.1:7979:127.0.0.1:7979" { f.append("Tunnel: -L \(args[i + 1]) (ports must be equal)") }
+        } else { f.append("Tunnel: no -L in the arguments") }
+        if Array(args.suffix(2)) != ["--", "studio"] { f.append("Tunnel: host is not last after --") }
+        if !args.contains("ControlPath=none") || !args.contains("ControlMaster=no") { f.append("Tunnel: multiplexing not off") }
         if !isBindFailure("bind [127.0.0.1]:7878: Address already in use") { f.append("Tunnel: bind failure not recognised") }
         if isBindFailure("Permission denied (publickey).") { f.append("Tunnel: auth failure taken for bind failure") }
-        if !Tunnel.TunnelError.portBusy(7878).description.contains("7878") { f.append("Tunnel: portBusy message lacks the port") }
+        if isBindFailure("bind [127.0.0.1]:80: Permission denied; channel_setup_fwd_listener_tcpip: cannot listen to port: 80; "
+                         + "Could not request local forwarding.") { f.append("Tunnel: privileged port taken for a busy one") }
+        if !Tunnel.TunnelError.portBusy(7878).description.contains("port 7878") { f.append("Tunnel: portBusy message lacks the port") }
         return f
     }
     #endif

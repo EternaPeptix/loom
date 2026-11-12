@@ -10,11 +10,15 @@ struct RootView: View {
             Divider()
             switch state.link {
             case .connected:
+                // A new epoch builds a new pane; reports from the one it replaced are dropped.
+                let epoch = state.paneEpoch
                 ZStack {
-                    WebPane(url: state.webEntryURL,
+                    WebPane(entryTick: state.entryTick,
+                            takeEntry: { state.takeEntryURL() },
+                            onCreated: { state.requestWebEntry(for: epoch) },
                             focusSession: $state.focusSession,
-                            onState: { state.webState = $0 })
-                        .id(state.connectionEpoch)
+                            onState: { s in if state.paneEpoch == epoch { state.webState = s } })
+                        .id(epoch)
                     overlay
                 }
             case .connecting(let phrase):
@@ -63,7 +67,8 @@ struct RootView: View {
         }
     }
 
-    // A reload of an already-shown page keeps the page visible; only the first load blanks it.
+    // Only a pane's first load is covered (a reload builds a new pane); the page's own later navigations
+    // keep it visible.
     private var pageEverLoaded: Bool { state.webLoadedOnce }
 
     private func centered(_ icon: some View, _ text: String) -> some View {
@@ -99,7 +104,7 @@ struct ConnectionBar: View {
                 Button { state.reload() } label: { Image(systemName: "arrow.clockwise") }
                     .help("Reload the page")
                 Button { state.copyWebURL() } label: { Image(systemName: "link") }
-                    .help("Copy web URL (includes the token)")
+                    .help("Copy a one-time web link (valid for 60 s)")
             }
             if state.link != .none {
                 Button { state.disconnect() } label: { Image(systemName: "xmark.circle") }

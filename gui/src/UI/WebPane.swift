@@ -11,9 +11,12 @@ enum WebState: Equatable {
 
 /// A `WKWebView` that shows the daemon's own web UI over the tunnel. See gui/DESIGN.md "Web pane".
 ///
-/// - loads `url` (`<baseURL>/#code=<one-time code>`: the page exchanges the code itself, no cookie is
-///   involved; AppState supplies a fresh URL for every load or reload) when it changes; reports loading / loaded / failed through `onState`.
-/// - restricts navigation to `url`'s origin (loopback); any other http(s) origin is cancelled and
+/// - each web view loads exactly one entry URL (`<baseURL>/#code=<one-time code>`: the page exchanges the
+///   code itself, no cookie is involved). A new view calls `onCreated`; AppState then mints a code, bumps
+///   `entryTick`, and the view takes the URL once through `takeEntry`. A reload builds a new view, so
+///   every load is a full document load, never a fragment change in the old one. Reports loading /
+///   loaded / failed through `onState`.
+/// - restricts navigation to the entry URL's origin (loopback); any other http(s) origin is cancelled and
 ///   opened in the default browser, other schemes are just cancelled.
 /// - navigates to `#/s/<id>` when `focusSession` is set (then clears it).
 /// - never injects scripts or reads page contents (it does look at the HTTP status of the main
@@ -21,9 +24,13 @@ enum WebState: Equatable {
 /// - uses a non-persistent data store, so nothing the page stores touches disk and nothing from another
 ///   daemon on the same loopback host can be replayed.
 struct WebPane: NSViewRepresentable {
-    let url: URL?
+    /// Bumped when a fresh entry URL waits in `takeEntry`.
+    let entryTick: Int
+    /// Hands out the entry URL once (nil when there is none).
+    var takeEntry: () -> URL? = { nil }
+    /// Called once per created web view, which needs a fresh one-time code before it can load.
+    var onCreated: () -> Void = {}
     @Binding var focusSession: String?
-    var reloadTick: Int = 0
     var onState: (WebState) -> Void = { _ in }
 
     func makeNSView(context: Context) -> WKWebView {
@@ -33,16 +40,17 @@ struct WebPane: NSViewRepresentable {
         view.navigationDelegate = context.coordinator
         view.uiDelegate = context.coordinator
         view.allowsBackForwardNavigationGestures = true
+        let created = onCreated
+        DispatchQueue.main.async { created() }   // after this view update, which must not publish changes
         return view
     }
 
     func updateNSView(_ view: WKWebView, context: Context) {
         let c = context.coordinator
         c.onState = onState
-        c.load(url, into: view)
-        if reloadTick != c.lastReloadTick {
-            c.lastReloadTick = reloadTick
-            c.reload(view)
+        if entryTick != c.entryTick {
+            c.entryTick = entryTick
+            if let url = takeEntry() { c.load(url, into: view) }
         }
         if let id = focusSession {
             c.focus(session: id, in: view)
@@ -50,7 +58,8 @@ struct WebPane: NSViewRepresentable {
         }
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    // The coordinator starts at the current tick: a URL minted for an earlier view is not this view's.
+    func makeCoordinator() -> Coordinator { Coordinator(entryTick: entryTick) }
 
     // MARK: pure helpers
 
@@ -71,35 +80,29 @@ struct WebPane: NSViewRepresentable {
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
-        private var loaded: URL?
         private var origin: URL?
         private var pageLoaded = false
         private var pendingFocus: String?
-        var lastReloadTick = 0
+        /// The `entryTick` this view has seen; a URL is taken only when it moves on.
+        var entryTick: Int
         var onState: (WebState) -> Void = { _ in }
 
-        func load(_ url: URL?, into view: WKWebView) {
-            guard let url else { return }
+        init(entryTick: Int) {
+            self.entryTick = entryTick
+            super.init()
+        }
+
+        /// The view's one load: a fresh view has no document, so this is always a full load.
+        func load(_ url: URL, into view: WKWebView) {
+            guard origin == nil else { return }
             origin = url
-            guard url != loaded else { return }
-            loaded = url
-            pageLoaded = false
             report(.loading)
             view.load(URLRequest(url: url))
         }
 
-        func reload(_ view: WKWebView) {
-            report(.loading)
-            if view.url == nil || !pageLoaded, let l = loaded {
-                view.load(URLRequest(url: l))
-            } else {
-                view.reload()
-            }
-        }
-
+        /// Until the page has loaded (the URL may still be on its way) the id waits for `didFinish`.
         func focus(session id: String, in view: WKWebView) {
-            guard let origin else { return }
-            if !pageLoaded { pendingFocus = id; return }
+            guard pageLoaded, let origin else { pendingFocus = id; return }
             if let u = WebPane.sessionURL(origin: origin, session: id) { view.load(URLRequest(url: u)) }
         }
 
