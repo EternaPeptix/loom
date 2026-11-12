@@ -16,7 +16,7 @@ max_output_tokens = 32768
 reasoning_replay = "all"       # the dsv41 template keeps replayed reasoning in the prefix (cache-safe)
 max_concurrent = 6             # concurrent requests across all sessions
 stall_timeout_s = 240          # abort and retry a stream that stalls this long
-retry_window_s = 0             # keep retrying an unreachable server until it returns
+retry_window_s = 300           # keep retrying an unreachable server this long (0 = until it returns)
 retry_max_delay_s = 30
 
 # Request fields sent verbatim on every call. Fixed for a session's life, because the template

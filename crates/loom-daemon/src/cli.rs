@@ -90,6 +90,7 @@ base_url = "http://127.0.0.1:8000/v1"
 model = "default"
 # context_window = 1000000   # only needed when the server does not report it
 max_concurrent = 4           # requests in flight at once (lead, agents and votes together)
+retry_window_s = 300         # keep retrying an unreachable server this long; 0 = until it returns
 
 [context]
 # The request is re-woven (old tool output folded out of view, never lost) when it passes

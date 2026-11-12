@@ -20,6 +20,11 @@
 //!   - `Action::DropAfter { reply, chunks }`: as `Reply` but the connection is closed after that
 //!     many chunks, without `[DONE]`.
 //!   - `Action::Stall { ms }`: send headers and the first chunk, then nothing for `ms`, then close.
+//!   - `Action::Eof { reply, chunks }`: as `DropAfter` but the body ends cleanly.
+//!   - `Action::StreamError { message }`: the first chunk, then `{"error":{"message":..}}`, then a clean end.
+//! - A request whose `model` field is present and is not the served model (`set_model`) gets HTTP 404
+//!   in vLLM's shape (`{"object":"error","message":"The model `X` does not exist.","type":
+//!   "NotFoundError","param":null,"code":404}`) before the script is consulted.
 //! - Usage in a reply: `reply.usage` when set; otherwise computed — `prompt_tokens` =
 //!   ceil(characters of the request's `messages` and `tools` JSON / 3.3), `cached_tokens` = the same
 //!   measure over the longest prefix of the `messages` array (whole messages, compared as JSON) that
@@ -133,6 +138,12 @@ pub enum Action {
     Status { status: u16, body: String, retry_after_s: Option<u64> },
     DropAfter { reply: Reply, chunks: usize },
     Stall { ms: u64 },
+    /// As `DropAfter`, but the stream ends cleanly (a terminating chunk, no `[DONE]`, no
+    /// `finish_reason` unless it is among the kept chunks).
+    Eof { reply: Reply, chunks: usize },
+    /// A first chunk, then an error object as a data event (vLLM's shape for a failure mid-stream),
+    /// then a clean end.
+    StreamError { message: String },
 }
 
 impl From<Reply> for Action {
@@ -358,6 +369,16 @@ async fn chat(AxState(app): AxState<App>, headers: HeaderMap, body: Bytes) -> Re
         let (prompt, cached) = prompt_usage(&request, &st.requests);
         st.requests.push(request.clone());
         st.auth.push(auth);
+        if let Some(asked) = request.get("model").and_then(Value::as_str).filter(|m| *m != st.model) {
+            let err = json!({
+                "object": "error",
+                "message": format!("The model `{asked}` does not exist."),
+                "type": "NotFoundError",
+                "param": null,
+                "code": 404,
+            });
+            return error_response(StatusCode::NOT_FOUND, err.to_string(), None);
+        }
         if let Some(window) = st.window {
             if prompt > window {
                 let message = format!(
@@ -389,6 +410,17 @@ async fn chat(AxState(app): AxState<App>, headers: HeaderMap, body: Bytes) -> Re
             steps.push_back(Step::Sleep(25));
             steps.push_back(Step::Fail);
             sse(steps, &app.token)
+        }
+        Action::Eof { reply, chunks } => {
+            let all = payloads(&reply, prompt, cached, &model, n);
+            let kept = all.get(..chunks.min(all.len())).unwrap_or(&[]);
+            sse(plan(kept, reply.delay_ms), &app.token)
+        }
+        Action::StreamError { message } => {
+            let first = payloads(&Reply::text(""), prompt, cached, &model, n);
+            let mut all: Vec<String> = first.into_iter().take(1).collect();
+            all.push(json!({"error": {"message": message, "type": "InternalServerError", "code": 500}}).to_string());
+            sse(plan(&all, 0), &app.token)
         }
         Action::Stall { ms } => {
             let first = payloads(&Reply::text(""), prompt, cached, &model, n);
@@ -677,6 +709,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eof_and_stream_error_end_cleanly() {
+        let mut r = Reply::text("0123456789012345678901234567890123456789");
+        r.piece_chars = 5;
+        let s = server(vec![
+            Action::Eof { reply: r, chunks: 3 },
+            Action::StreamError { message: "engine overloaded".into() },
+        ])
+        .await;
+        let (body, clean) = read_all(post_chat(&s, msgs(&["hi"])).await).await;
+        assert!(clean);
+        assert!(!body.contains("[DONE]") && !body.contains("finish_reason\":\"stop"));
+        assert_eq!(events(&body).len(), 3);
+        let (body, clean) = read_all(post_chat(&s, msgs(&["hi"])).await).await;
+        assert!(clean);
+        let evs = events(&body);
+        assert_eq!(evs.len(), 2);
+        let err: Value = serde_json::from_str(&evs[1]).expect("json");
+        assert_eq!(err["error"]["message"], "engine overloaded");
+    }
+
+    #[tokio::test]
+    async fn a_model_that_is_not_served_is_a_vllm_style_404_before_the_script() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
+        let s = MockServer::start(Script::new(move |_, _| {
+            *lock(&seen) += 1;
+            Reply::text("ok").into()
+        }))
+        .await
+        .expect("start");
+        let mut body = msgs(&["hi"]);
+        body["model"] = json!("not-served");
+        let r = post_chat(&s, body).await;
+        assert_eq!(r.status(), 404);
+        let v: Value = r.json().await.expect("json");
+        assert_eq!(v["object"], "error");
+        assert_eq!(v["message"], "The model `not-served` does not exist.");
+        assert_eq!(v["type"], "NotFoundError");
+        assert_eq!(v["code"], 404);
+        assert_eq!(*lock(&calls), 0);
+        assert_eq!(post_chat(&s, msgs(&["hi"])).await.status(), 200);
+    }
+
+    #[tokio::test]
     async fn stall_sends_first_chunk_then_goes_quiet_then_closes() {
         let s = server(vec![Action::Stall { ms: 300 }]).await;
         let started = Instant::now();
@@ -779,7 +855,7 @@ mod tests {
         }))
         .await
         .expect("start");
-        s.set_model("small", Some(10));
+        s.set_model("mock", Some(10));
         let big = msgs(&["this message is certainly longer than ten tokens of thirty-three characters"]);
         let n = tokens(json_chars(&big["messages"]));
         let r = post_chat(&s, big).await;
