@@ -22,6 +22,8 @@
 //!   crash between its `session_end` and the write, or a log from before the file existed) is
 //!   recovered from its log instead, with the first line of its report.
 //! - `tmp/` (`paths.session_tmp`) — the session's scratch directory; `jobs/` — its job table's files.
+//! - `queued/` — operator rules, approvals and withdrawals handed to the session and not recorded
+//!   yet, one JSON file each (`session::queue_input`); the session deletes each once recorded.
 //!
 //! A session directory without a readable `meta.json` is ignored (`tracing::warn!`).
 //!
@@ -224,8 +226,10 @@
 //!   activate the lead; `Input::Constraint`, `Input::Approval` or `Input::Withdraw`. When the
 //!   mission keeps a ledger, a blank `scope` is sent as `only what the approval says` and a blank
 //!   `reason` as `no reason given` (the ledger refuses blank ones); without a ledger a blank scope
-//!   stays blank and the note words it itself. The lead records the input at once when idle and at
-//!   the next step of a running turn: a ledger entry when the mission keeps a ledger (the lead's
+//!   stays blank and the note words it itself. The input is sent as `session::queue_input` makes it,
+//!   kept on disk until the lead has recorded it (deleted again when the lead refuses input). The
+//!   lead records the input at once when idle and at the next step of a running turn (a lead started
+//!   after a daemon stop, first): a ledger entry when the mission keeps a ledger (the lead's
 //!   state block then lists it), and a protected note in the lead's window. No turn is started.
 //!   The answer is a [`RuleReceipt`]: the lead, whether it was in a turn (`queued`), whether the
 //!   mission keeps a ledger, and the stock text when one was used.
@@ -373,7 +377,7 @@
 
 use crate::pack::{self, PromptEnv, RoleDef, Packs};
 use crate::rtools::{self, ChildInfo, Orchestrator, Producer, Settlement, Shared, SpawnReq, Vote};
-use crate::session::{Control, Deps, End, Input, Phase, Session, Sink, Status};
+use crate::session::{queue_input, Control, Deps, End, Input, Phase, Session, Sink, Status};
 use crate::texts;
 use async_trait::async_trait;
 use futures_util::FutureExt;
@@ -524,8 +528,8 @@ pub struct LedgerView {
 pub struct RuleReceipt {
     /// The lead session it was handed to.
     pub lead: SessionId,
-    /// The lead was running a turn: it records this at its next step, and until then it is only
-    /// queued in memory.
+    /// The lead was running a turn: it records this at its next step. Until then it is queued, and
+    /// kept on disk so that a daemon stop does not lose it.
     pub queued: bool,
     /// The mission keeps a ledger, so this is recorded there (a rule or an approval under an id) as
     /// well as in a note. Without one it is a note in the lead's window only.
@@ -2708,9 +2712,10 @@ impl Runtime {
     }
 
     /// Hand `input` to the lead session `lead`, activating it. The session handles it at once when
-    /// it is idle and at the next step of a running turn; until then it is only queued in memory,
-    /// which the receipt says (`queued`). `ledger`: the mission keeps one; `stock`: the text put in
-    /// place of a blank scope or reason.
+    /// it is idle and at the next step of a running turn; until then it is queued, which the receipt
+    /// says (`queued`), and kept on disk (`session::queue_input`), so that a daemon stop before then
+    /// does not lose it. `ledger`: the mission keeps one; `stock`: the text put in place of a blank
+    /// scope or reason.
     fn send_to_lead(
         &self,
         lead: &SessionId,
@@ -2719,22 +2724,36 @@ impl Runtime {
         stock: Option<&str>,
     ) -> Result<RuleReceipt, String> {
         self.inner.activate(lead)?;
-        let st = self.inner.st();
-        let k = st.known.get(lead).ok_or_else(|| no_session(lead))?;
-        let queued = k.status.phase == Phase::Running;
-        if k.active.as_ref().is_some_and(|a| a.inputs.send(input).is_ok()) {
-            Ok(RuleReceipt { lead: lead.clone(), queued, ledger, stock: stock.map(str::to_string) })
-        } else {
-            Err(format!("Session {} is not accepting input.", lead.as_str()))
+        let input = queue_input(&self.inner.paths, lead, input)?;
+        let kept = match &input {
+            Input::Queued { file, .. } => Some(file.clone()),
+            _ => None,
+        };
+        let sent = match self.inner.st().known.get(lead) {
+            None => Err(no_session(lead)),
+            Some(k) => {
+                let queued = k.status.phase == Phase::Running;
+                if k.active.as_ref().is_some_and(|a| a.inputs.send(input).is_ok()) {
+                    Ok(RuleReceipt { lead: lead.clone(), queued, ledger, stock: stock.map(str::to_string) })
+                } else {
+                    Err(format!("Session {} is not accepting input.", lead.as_str()))
+                }
+            }
+        };
+        if let (Err(_), Some(file)) = (&sent, kept) {
+            // Refused: the operator is told to send it again, so it must not be recorded later as well.
+            let _ = std::fs::remove_file(file);
         }
+        sent
     }
 
     /// Set a standing rule for the mission of `id` (any of its sessions; the rule goes to the lead).
     /// `Ok` means the rule was handed to the lead, not that it is recorded yet: the lead records it
     /// at once when it is idle, and at the next step of a running turn otherwise (so not while a
-    /// tool call, such as an awaited agent, is still running; a daemon stop before that loses it).
-    /// The receipt's `queued` says which of the two it was. Recording is a ledger entry, constraint
-    /// `k<n>`, when the mission keeps a ledger (the lead's state block then lists the rule), and in
+    /// tool call, such as an awaited agent, is still running; it is kept on disk until then, and a
+    /// lead started after a daemon stop records it first). The receipt's `queued` says which of the
+    /// two it was. Recording is a ledger entry, constraint `k<n>`, when the mission keeps a ledger
+    /// (the lead's state block then lists the rule), and in
     /// every mission a protected note in the lead's window that is never folded out of view; the
     /// note tells the lead that the rule also binds the work it assigns to its agents. No turn is
     /// started: the lead reads the rule with its next request to the model. Without a ledger
@@ -3565,6 +3584,37 @@ mod tests {
         let state = e.rt.ledger(&mission).unwrap().state;
         assert_eq!((state.goal.as_deref(), state.constraints.len(), state.approvals.len()), (Some("go"), 0, 0));
         tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rule_queued_for_a_lead_in_a_turn_is_kept_on_disk_until_it_is_recorded() {
+        let stall = Arc::new(AtomicBool::new(true));
+        let flag = stall.clone();
+        let e = env(Script::new(move |_, _| {
+            if flag.load(Ordering::SeqCst) {
+                Action::Stall { ms: 600_000 }
+            } else {
+                finish("done")
+            }
+        }))
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("running", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Running)).await;
+        until("request", || !e.server.requests().is_empty()).await;
+        assert!(e.rt.add_rule(&id, "no prod").await.unwrap().queued);
+        let queue = e.rt.paths().session_dir(&id).join("queued");
+        assert_eq!(std::fs::read_dir(&queue).unwrap().count(), 1, "kept on disk while the lead is busy");
+        e.rt.shutdown().await;
+        stall.store(false, Ordering::SeqCst);
+        // Recorded exactly once, whether the lead took it on its way down or after the restart.
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let r2 = rt2.clone();
+        until("the rule", || r2.ledger(&mission).is_ok_and(|l| l.state.constraints.len() == 1)).await;
+        until("the queue emptied", || std::fs::read_dir(&queue).map_or(0, |d| d.count()) == 0).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(rt2.ledger(&mission).unwrap().state.constraints.len(), 1);
+        rt2.shutdown().await;
     }
 
     #[tokio::test]

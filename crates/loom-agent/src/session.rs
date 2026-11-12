@@ -42,7 +42,13 @@
 //!   `harness_note{Arrival, texts::job_lost(job_id, command)}`. `lost_jobs()` is the number of
 //!   those notes; the runtime starts a turn for a session that was waiting. Calls
 //!   `deps.ctx.jobs.resume_from(n)` with the highest job number in the log's `job_registered`
-//!   records (`j7` → 7).
+//!   records (`j7` → 7). Last, unless the session has ended, the prefix guard is primed
+//!   (`PrefixGuard::prime`) with the weave of the records up to the last `model_request` and that
+//!   record's epoch, so that the first request after a restart is checked like any other. When the
+//!   stable hash of those messages differs from the one stored on the record (the rendering of the
+//!   existing log changed, e.g. with an upgrade), `cache_break{req_id: that request's,
+//!   first_diff_message: 0, detail: texts::rendering_changed(..)}` is appended, unless a
+//!   `cache_break` already follows that record (an earlier open reported it).
 //!
 //! All three use `Durability::Always`, build the registry, and compute the state below from the
 //! log, so that a session opened from its log behaves as the one that wrote it would:
@@ -52,7 +58,13 @@
 //! open inbox items (`inbox_opened` without a matching `inbox_resolved`).
 //!
 //! ## `run`
-//! 1. If the session has ended (`session_end` in the log): return `End::Closed`.
+//! 1. If the session has ended (`session_end` in the log): return `End::Closed`. Otherwise record,
+//!    as arrivals, the operator inputs left in the session's `queued/` directory (see
+//!    [`queue_input`]), oldest first. A `{stem}.{seq}.taking` file was being recorded when the
+//!    harness stopped: when the record at `seq` is an operator's (author `User`) `ledger` record or
+//!    `Constraint`/`Approval` note, the recording reached the log and the file is only deleted;
+//!    otherwise it is recorded like the others. Each input is so recorded once, except when the
+//!    harness stops between the ledger entry and its `ledger` record in the log.
 //! 2. If the session is a child (`deps.shared.is_child()`) and has no own `turn_start` yet: run a
 //!    turn with `Trigger::Start`.
 //! 3. Loop: wait for the next of (an [`Input`], a `JobEvent` from `deps.job_events`). Handle it as
@@ -89,6 +101,9 @@
 //! - `Input::Withdraw{id, reason}`: `shared.ledger_append(true, ConstraintRetire{id, reason})`; on
 //!   success append what it queued and `harness_note{Constraint, texts::constraint_withdrawn(id,
 //!   reason)}` with author `User`; on refusal (or without a journal) warn and append nothing.
+//! - `Input::Queued{file, input}`: rename `file` to `{stem}.{seq}.taking`, `seq` being the log's
+//!   next seq; then `input` as above, then delete the renamed file. When `file` is gone it was taken
+//!   already (at the start of `run`), and nothing happens.
 //! - `Input::ChildSettled(s)`: append `child_settled{child, outcome, report, full, usage, steps,
 //!   inline: false}`. Start a turn (`Trigger::ChildSettled`) only if the last turn ended `Waiting`
 //!   or `Yielded`.
@@ -117,9 +132,10 @@
 //! Install a fresh cancellation token (`Control::begin_turn`); append `turn_start{trigger}`. If the
 //! previous own turn ended `Stopped`, append `harness_note{Interrupted, …}` with
 //! `texts::AFTER_RESTART` when the most recent own `interrupted` record's reason is
-//! `REASON_RESTART` or starts with `the session log was damaged`, else `texts::AFTER_STOP` (no note
-//! for a turn that starts after `Control::stop_for_shutdown`: it is cut at once, and the note
-//! belongs to the first turn after the restart).
+//! `REASON_RESTART` or starts with `the session log was damaged`, else `texts::AFTER_IDLE_STOP` when
+//! that record was written while no turn was open (a stop between turns), else `texts::AFTER_STOP`
+//! (no note for a turn that starts after `Control::stop_for_shutdown`: it is cut at once, and the
+//! note belongs to the first turn after the restart).
 //! Publish status (`Phase::Running`). Then repeat *steps* until the turn ends. Whenever the turn
 //! ends, append `turn_end{reason}` and publish status (`Phase::Idle`, or `Ended` after settling).
 //!
@@ -161,12 +177,16 @@
 //!    when the last `stall_steps` own steps contain no `ledger` record, no `tool_result` of class
 //!    `Write` with status `Ok`, and no `child_spawned`/`child_settled`, and no `Stall` note was given
 //!    within those steps, append `harness_note{Stall, texts::stall(stall_steps)}`.
-//! 5. **Re-weave.** See below. Forced when the flag from point 2 is set.
-//! 6. **Request.** `w = weave(all records)`. `PrefixGuard::check(w.epoch, &w.messages)`: on `Break`
+//! 5. **Re-weave.** `w = weave(all records)` (a `Woven`, which planning uses as it is), computed
+//!    here once and again only after a record that changes it (a `reweave`); points 5 and 6 and the
+//!    digest request all use it. See below. Forced when the flag from point 2 is set.
+//! 6. **Request.** `PrefixGuard::check(w.epoch, &w.messages)`: on `Break`
 //!    append `cache_break{req_id, first_diff_message, detail}` and carry on. Render the HUD
-//!    (`hud::render`, over own records, with `jobs.list()` entries that are running,
-//!    `orch.children(session)` entries that are running, the ledger when there is a journal,
-//!    `BriefOpts::default()`, `agents.unviewed_min_lines`, own step count, `started_ms`, budget).
+//!    (`hud::render`, over own records, with `jobs.list()` entries that are running — their output
+//!    lines counted on from where the previous request's count stopped —, `orch.children(session)`
+//!    entries that are running, the ledger when there is a journal, `BriefOpts::default()`,
+//!    `agents.unviewed_min_lines`, own steps and start time counted from where the budget was granted
+//!    (see point 3), budget).
 //!    Store the HUD text (`blobs.put_bytes`; a failure gives `hud: None`). Append
 //!    `model_request{req_id: ids::new_request_id(), step (1-based), epoch, purpose: Step,
 //!    n_messages, stable_hash: prefix::stable_hash(&w.messages), hud, est_tokens}`. Publish status
@@ -243,36 +263,47 @@
 //! itself, `full` is `None` and `payload` is `Value::Null`.
 //!
 //! ## Re-weave procedure (`reason`: `target`, `overflow`, `operator`)
-//! `est` = `estimator.tokens_for_messages(&weave(records).messages)` plus the tokens of the tool
-//! specs' JSON. `window` is `deps.context_window`; for an `overflow` re-weave it is the smaller of
-//! that and the limit the server's error stated (the estimate of the refused request when it stated
-//! none), so that a forced re-weave can be planned when the window is unknown or set too large.
-//! `limit` = `deps.context.target_tokens`, lowered (when there is a `window`) to `window − reserve`
-//! (`reserve` = the profile's `max_output_tokens` or 16_384, plus 4_096) and to four fifths of
-//! `window`; the floor used is `floor_tokens` lowered to half of `window`, and to half of `limit`
-//! when it is not below `limit`. For a 1M window the defaults (400k, 180k) are unchanged. Not
-//! forced and `est <= limit`: nothing to do.
-//! A plan is *enough* when its `after_tokens_est` is at or below the midpoint between the floor used
-//! and `limit`.
-//! 1. `plan = plan_reweave(records, estimator, &policy, false)` with `policy = deps.context`. While
+//! `est = estimator.tokens_for_messages(&w.messages)` plus the tokens of the tool specs' JSON.
+//! `size` is the size of the next request as the server counts it, when it has counted one in this
+//! epoch: with `m` the latest own-or-inherited step `model_request` of epoch `w.epoch` whose
+//! response reported `prompt_tokens > 0` and `n = m.n_messages`, `size = m's prompt_tokens +
+//! estimator.tokens(Σ (item.chars + 2) over the items merged into w.messages[n − 1] from records
+//! after m) + estimator.tokens_for_messages(&w.messages[n..])`. Before the first such response of
+//! an epoch, `size = est`. `window` is `deps.context_window`; for an `overflow` re-weave it
+//! is the smaller of that and the limit the server's error stated (the estimate of the refused
+//! request when it stated none), so that a forced re-weave can be planned when the window is unknown
+//! or set too large. `limit` = `deps.context.target_tokens`, lowered (when there is a `window`) to
+//! `window − reserve` and to four fifths of `window`; the floor used is `floor_tokens` lowered to
+//! half of `window`, and to half of `limit` when it is not below `limit`. `reserve` is the profile's
+//! `max_output_tokens` plus `min(4_096, window / 4)`, or `min(20_480, window / 4)` without one (or
+//! with one that leaves no room in `window`): the reply asked for always fits, and a small window
+//! keeps a positive trigger. For windows of 81_920 tokens and more the reserve is never cut, and for
+//! a 1M window the defaults (400k, 180k) are unchanged. Not forced and `size <= limit`: nothing to
+//! do. The plan counts in the estimator's units: it is made with the floor used × `est / size`, and
+//! is *enough* when its `after_tokens_est` is at or below the midpoint between the floor used and
+//! `limit`, × `est / size`.
+//! 1. `plan = w.plan(records, estimator, &policy, false)` (`plan_reweave` on the step's weave) with
+//!    `policy = deps.context`. While
 //!    the plan is not enough and `policy.keep_recent_steps` is above `MIN_KEEP_RECENT_STEPS`, halve
 //!    `keep_recent_steps` (not below the minimum) and plan again: when folding what lies outside the
 //!    protected recent steps does not make room, it is the output of recent steps that fills the
 //!    window, so fewer of them are protected.
-//! 2. Still not enough: `text_plan = plan_reweave(records, estimator, &policy, true)`. Not forced
+//! 2. Still not enough: `text_plan = w.plan(records, estimator, &policy, true)`. Not forced
 //!    and `text_plan` is not enough either: return without a record and without a digest request (see
 //!    "Why a re-weave must be worth it"). Otherwise, when `text_plan` exists and the re-weave is not
 //!    for an `overflow` (the server has just refused this prefix, and would refuse a digest request
 //!    on it as well), ask for a digest — a
 //!    request of the current stable messages plus one `user` message `texts::DIGEST_PROMPT`, same
 //!    tools, `max_tokens: DIGEST_MAX_TOKENS`, recorded as `model_request{purpose: Digest, hud: None}`
-//!    only (its reply is not appended as a record). A non-empty reply text is the digest; an error
+//!    only (its reply is not appended as a record), and sent once the limiter grants it at
+//!    `deps.priority` (the step waits for it). A non-empty reply text is the digest; an error
 //!    or an empty text gives none. A cancellation returns without a record (the step handles it).
 //!    The plan becomes `text_plan`, with or without a digest: the ledger brief is the durable state,
 //!    the digest an addition to it.
 //! 3. No plan: return without a record. Otherwise append `reweave{epoch: current + 1, upto_seq,
 //!    evictions, brief: texts::reweave_brief(<ledger.brief(default) or "">), digest, reason,
-//!    before_tokens: plan.before_tokens_est, after_tokens_est}`.
+//!    before_tokens: size, after_tokens_est: size − (plan.before_tokens_est − plan.after_tokens_est)
+//!    × size / est}`.
 //!
 //! Why a re-weave must be worth it: every re-weave starts a new epoch, and the server's cache of
 //! the conversation is lost with the old one. A re-weave that frees little is needed again one step
@@ -339,7 +370,7 @@ use loom_core::log::{fork_file, read_records, Durability, SessionLog};
 use loom_core::message::Message;
 use loom_core::now_ms;
 use loom_core::prefix::{stable_hash, PrefixCheck, PrefixGuard};
-use loom_core::weave::{hud_message, plan_reweave, weave, ReweavePolicy};
+use loom_core::weave::{hud_message, weave, ReweavePolicy, Weave, Woven};
 use loom_model::assemble::{Completion, StreamEvent};
 use loom_model::client::{ModelClient, ModelError};
 use loom_model::limit::{Limiter, Priority};
@@ -349,8 +380,8 @@ use loom_tools::proc::Ended;
 use loom_tools::{execute, refused, Admission, Registry, ToolCtx};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
@@ -380,6 +411,89 @@ pub enum Input {
     /// The operator pressed stop. The runtime also cancels the running turn through [`Control`];
     /// this input covers what is left when no turn is running.
     Stop,
+    /// A `Constraint`, `Approval` or `Withdraw` kept on disk at `file` until it is recorded (see
+    /// [`queue_input`]).
+    Queued { file: PathBuf, input: Box<Input> },
+}
+
+/// One input of a session's `queued/` directory.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum KeptInput {
+    Constraint { text: String },
+    Approval { text: String, scope: String },
+    Withdraw { id: String, reason: String },
+}
+
+impl KeptInput {
+    fn into_input(self) -> Input {
+        match self {
+            KeptInput::Constraint { text } => Input::Constraint(text),
+            KeptInput::Approval { text, scope } => Input::Approval { text, scope },
+            KeptInput::Withdraw { id, reason } => Input::Withdraw { id, reason },
+        }
+    }
+}
+
+/// Where a session's operator inputs wait on disk until it records them.
+fn queue_dir(paths: &Paths, session: &SessionId) -> PathBuf {
+    paths.session_dir(session).join("queued")
+}
+
+/// Keep an operator rule, approval or withdrawal for `session` on disk until the session has
+/// recorded it: a session takes inputs between steps, not while a tool call runs, and a harness that
+/// stops before then must not lose one. Returns the [`Input::Queued`] to send to the session, which
+/// records the input and then deletes the file; a session that starts finds what is left on disk and
+/// records it first. Any other input is returned as it is.
+pub fn queue_input(paths: &Paths, session: &SessionId, input: Input) -> Result<Input, String> {
+    let kept = match &input {
+        Input::Constraint(text) => KeptInput::Constraint { text: text.clone() },
+        Input::Approval { text, scope } => KeptInput::Approval { text: text.clone(), scope: scope.clone() },
+        Input::Withdraw { id, reason } => KeptInput::Withdraw { id: id.clone(), reason: reason.clone() },
+        _ => return Ok(input),
+    };
+    let file = write_kept(&queue_dir(paths, session), &kept)
+        .map_err(|e| format!("Could not keep the input for session {} on disk ({e}); send it again.", session.as_str()))?;
+    Ok(Input::Queued { file, input: Box::new(input) })
+}
+
+/// Write `kept` durably as the next file of `dir`; file names sort in the order they were written.
+fn write_kept(dir: &Path, kept: &KeptInput) -> std::io::Result<PathBuf> {
+    fn write_synced(dir: &Path, tmp: &Path, path: &Path, kept: &KeptInput) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(tmp)?;
+        file.write_all(&serde_json::to_vec(kept).map_err(std::io::Error::other)?)?;
+        file.sync_all()?;
+        std::fs::rename(tmp, path)?;
+        std::fs::File::open(dir)?.sync_all()
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::fs::create_dir_all(dir)?;
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!("{:016}-{n:010}.json", now_ms());
+    let path = dir.join(&name);
+    let tmp = dir.join(format!(".{name}.tmp"));
+    if let Err(e) = write_synced(dir, &tmp, &path, kept) {
+        // The operator is told to send it again, so it must not be recorded later as well.
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
+    Ok(path)
+}
+
+/// The name a kept input's `file` takes while the session records it: `{stem}.{seq}.taking`, where
+/// `seq` is the seq the first record of the recording gets.
+fn taking_path(file: &Path, seq: Seq) -> PathBuf {
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = name.split('.').next().unwrap_or_default();
+    file.with_file_name(format!("{stem}.{seq}.taking"))
+}
+
+/// The seq a name made by [`taking_path`] carries.
+fn taking_seq(file: &Path) -> Option<Seq> {
+    let name = file.file_name()?.to_str()?.strip_suffix(".taking")?;
+    name.rsplit_once('.')?.1.parse().ok()
 }
 
 /// Receives everything a session produces, as it happens. Calls must return quickly.
@@ -524,10 +638,30 @@ struct State {
     budget_from_ms: Option<u64>,
     inbox: Vec<InboxItem>,
     last_interrupted: Option<String>,
+    /// The latest `interrupted` was recorded while no turn was open: a stop between turns.
+    stopped_idle: bool,
+    /// A `turn_start` with no `turn_end` after it.
+    in_turn: bool,
     prompt_tokens: u64,
     cached_tokens: u64,
     usage: Usage,
     fork_point: Option<Seq>,
+    /// The latest step request (records of the parent's included: they are part of the weave).
+    requested: Option<Measured>,
+    /// The latest step request whose reply carried the prompt size the server counted.
+    measured: Option<Measured>,
+}
+
+/// A step request as the re-weave check needs it.
+#[derive(Clone, Debug, Default)]
+struct Measured {
+    req_id: String,
+    /// Seq of the `model_request` record.
+    seq: Seq,
+    epoch: u32,
+    n_messages: u32,
+    /// What the server counted for the request; 0 until its reply is in.
+    prompt_tokens: u64,
 }
 
 impl State {
@@ -546,14 +680,26 @@ impl State {
                     epoch: self.epoch,
                     termination: Some(f.termination),
                     budget: f.budget.clone(),
+                    requested: self.requested.take(),
+                    measured: self.measured.take(),
                     ..State::default()
                 };
             }
             Event::ModelRequest(m) if m.purpose == Purpose::Step => {
                 self.step = self.step.saturating_add(1);
                 self.fork_point = rec.seq.checked_sub(1);
+                self.requested = Some(Measured {
+                    req_id: m.req_id.clone(),
+                    seq: rec.seq,
+                    epoch: m.epoch,
+                    n_messages: m.n_messages,
+                    prompt_tokens: 0,
+                });
             }
             Event::ModelResponse(r) => {
+                if let Some(q) = self.requested.as_ref().filter(|q| q.req_id == r.req_id && r.usage.prompt_tokens > 0) {
+                    self.measured = Some(Measured { prompt_tokens: r.usage.prompt_tokens, ..q.clone() });
+                }
                 self.prompt_tokens = r.usage.prompt_tokens;
                 self.cached_tokens = r.usage.cached_tokens;
                 self.usage.prompt_tokens = self.usage.prompt_tokens.saturating_add(r.usage.prompt_tokens);
@@ -567,15 +713,22 @@ impl State {
             Event::InboxResolved { item_id, .. } => self.inbox.retain(|i| &i.item_id != item_id),
             Event::TurnStart { trigger } => {
                 self.has_turn = true;
+                self.in_turn = true;
                 if renews_budget(*trigger, self.last_end) {
                     self.budget_step_base = self.step;
                     self.budget_from_ms = Some(rec.ts_ms);
                     self.budget_note_step = None;
                 }
             }
-            Event::TurnEnd { reason } => self.last_end = Some(*reason),
+            Event::TurnEnd { reason } => {
+                self.last_end = Some(*reason);
+                self.in_turn = false;
+            }
             Event::SessionEnd { outcome, .. } => self.ended = Some(*outcome),
-            Event::Interrupted { reason } => self.last_interrupted = Some(reason.clone()),
+            Event::Interrupted { reason } => {
+                self.last_interrupted = Some(reason.clone());
+                self.stopped_idle = !self.in_turn;
+            }
             _ => {}
         }
     }
@@ -616,6 +769,10 @@ pub struct Session {
     published: Option<Status>,
     /// Jobs that `open` found registered and never settled, and told the model were lost.
     lost_jobs: usize,
+    line_counts: LineCounts,
+    /// Weaves computed so far (see `woven`).
+    #[cfg(test)]
+    weaves: u32,
 }
 
 /// Longest `session_end` detail.
@@ -638,27 +795,96 @@ fn tools_chars(tools: &[ToolSpec]) -> usize {
     tools.iter().map(|t| t.to_openai().to_string().len()).sum()
 }
 
-/// The newline count of a file, i.e. the lines of a running job's output so far.
-fn count_lines(path: &Path) -> u64 {
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else { return 0 };
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut lines: u64 = 0;
-    let mut last: Option<u8> = None;
-    loop {
-        match file.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                let chunk = buf.get(..n).unwrap_or_default();
-                lines = lines.saturating_add(chunk.iter().filter(|b| **b == b'\n').count() as u64);
-                last = chunk.last().copied();
-            }
+/// The trigger and the floor of a re-weave (see the module contract): `policy`'s, lowered for a
+/// known `window` so that a request at the trigger leaves room for the reply. That room is
+/// `max_output` plus 4_096, or 20_480 without one. What the harness chooses itself (the 4_096, the
+/// 20_480) is at most a quarter of the window, so that a small window keeps a positive trigger and
+/// floor; a configured `max_output` is never cut, since every request asks for that much. One the
+/// window cannot hold with its 4_096 cannot be honoured, and counts as none. From a window of
+/// 81_920 tokens up nothing is cut.
+fn reweave_bounds(policy: &ReweavePolicy, window: Option<u64>, max_output: Option<u64>) -> (u64, u64) {
+    let (mut limit, mut floor) = (policy.target_tokens, policy.floor_tokens);
+    if let Some(window) = window {
+        let slack = 4_096_u64.min(window / 4);
+        let reserve = match max_output.map(|m| m.saturating_add(slack)) {
+            Some(reserve) if reserve < window => reserve,
+            _ => 20_480_u64.min(window / 4),
+        };
+        // The trigger stays within four fifths of the window and the floor within half of it, so
+        // that a small window can always be planned for.
+        limit = limit.min(window.saturating_sub(reserve)).min(window / 5 * 4);
+        floor = floor.min(window / 2);
+        if floor >= limit {
+            floor = limit / 2;
         }
     }
-    if last.is_some_and(|b| b != b'\n') {
-        lines = lines.saturating_add(1);
+    (limit, floor)
+}
+
+/// `x × num / den`: a token count carried from units where a request measures `den` into units where
+/// it measures `num`.
+fn scaled(x: u64, num: u64, den: u64) -> u64 {
+    let v = u128::from(x).saturating_mul(u128::from(num)) / u128::from(den.max(1));
+    u64::try_from(v).unwrap_or(u64::MAX)
+}
+
+/// The lines of running jobs' output files, counted on from where the previous count stopped, so
+/// that each request reads only what a file gained since the one before.
+#[derive(Default)]
+struct LineCounts {
+    files: HashMap<String, Counted>,
+    /// Bytes read so far, over all files.
+    #[cfg(test)]
+    read: u64,
+}
+
+/// How far one file has been counted.
+#[derive(Clone, Copy, Default)]
+struct Counted {
+    bytes: u64,
+    newlines: u64,
+    last: Option<u8>,
+}
+
+impl LineCounts {
+    /// The lines of job `job`'s output file at `path` so far (a final line without a newline
+    /// counts). A file that shrank is counted again from its start; a file that is gone counts 0.
+    fn count(&mut self, job: &str, path: &Path) -> u64 {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut file) = std::fs::File::open(path) else {
+            self.files.remove(job);
+            return 0;
+        };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut c = self.files.get(job).copied().filter(|c| c.bytes <= len).unwrap_or_default();
+        if c.bytes > 0 && file.seek(SeekFrom::Start(c.bytes)).is_err() {
+            c = Counted::default();
+        }
+        // Nothing new: nothing to read.
+        let mut buf = if c.bytes < len { vec![0u8; 64 * 1024] } else { Vec::new() };
+        while !buf.is_empty() {
+            match file.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = buf.get(..n).unwrap_or_default();
+                    c.newlines = c.newlines.saturating_add(chunk.iter().filter(|b| **b == b'\n').count() as u64);
+                    c.last = chunk.last().copied();
+                    c.bytes = c.bytes.saturating_add(n as u64);
+                    #[cfg(test)]
+                    {
+                        self.read = self.read.saturating_add(n as u64);
+                    }
+                }
+            }
+        }
+        self.files.insert(job.to_string(), c);
+        c.newlines.saturating_add(u64::from(c.last.is_some_and(|b| b != b'\n')))
     }
-    lines
+
+    /// Forget the files of jobs that are no longer running.
+    fn retain(&mut self, running: &[JobInfo]) {
+        self.files.retain(|id, _| running.iter().any(|j| &j.id == id));
+    }
 }
 
 /// A turn the operator starts after the session's budget ran out comes with a fresh budget.
@@ -693,6 +919,9 @@ impl Session {
             st,
             published: None,
             lost_jobs: 0,
+            line_counts: LineCounts::default(),
+            #[cfg(test)]
+            weaves: 0,
         }
     }
 
@@ -766,7 +995,31 @@ impl Session {
             // `resume_from` only takes a lock; it never waits.
             let _ = session.deps.ctx.jobs.resume_from(n).now_or_never();
         }
+        session.seed_guard().map_err(|e| e.0)?;
         Ok(session)
+    }
+
+    /// Prime the prefix guard with the stable messages of the last request in the log, as they render
+    /// now (the weave is a function of the log), so that the first request after a restart is checked
+    /// like any other. When they no longer match the hash stored with that request (an upgrade changed
+    /// the rendering), the server's cache of the session is lost: one `cache_break` says so.
+    fn seed_guard(&mut self) -> R<()> {
+        if self.st.ended.is_some() {
+            return Ok(());
+        }
+        let Some(at) = self.records.iter().rposition(|r| matches!(r.event, Event::ModelRequest(_))) else {
+            return Ok(());
+        };
+        let Some(Event::ModelRequest(sent)) = self.records.get(at).map(|r| r.event.clone()) else { return Ok(()) };
+        let messages = weave(self.records.get(..=at).unwrap_or_default()).messages;
+        self.guard.prime(sent.epoch, &messages);
+        // Reported by an earlier open, with no request since.
+        let reported = self.records.iter().skip(at).any(|r| matches!(r.event, Event::CacheBreak { .. }));
+        if stable_hash(&messages) != sent.stable_hash && !reported {
+            let detail = texts::rendering_changed(sent.n_messages, messages.len());
+            self.append(Author::Harness, Event::CacheBreak { req_id: sent.req_id, first_diff_message: 0, detail })?;
+        }
+        Ok(())
     }
 
     /// Jobs that were running when the harness went down and that `open` told the model were lost.
@@ -944,6 +1197,9 @@ impl Session {
             return Ok(End::Closed);
         }
         self.publish();
+        for input in self.kept_inputs() {
+            self.arrival(input).await?;
+        }
         if self.deps.shared.is_child() && !self.st.has_turn {
             if let Some(settled) = self.turn(Trigger::Start).await? {
                 return Ok(End::Settled(settled));
@@ -996,7 +1252,8 @@ impl Session {
             Input::Resume => Ok(Some(Trigger::Resume)),
             Input::Reweave => {
                 let token = self.deps.control.begin_turn();
-                self.reweave("operator", true, &token, None).await?;
+                let woven = self.woven();
+                self.reweave(&woven, "operator", true, &token, None).await?;
                 Ok(None)
             }
             Input::Stop => {
@@ -1030,8 +1287,76 @@ impl Session {
         self.settle(delivery(ChildOutcome::Stopped, texts::stopped_report(self.st.step))).await
     }
 
-    /// Record an input that is not a command. Whether it starts a turn is the caller's business.
+    /// The operator inputs left on disk by a harness that stopped before this session recorded them
+    /// (see [`queue_input`]), in the order they were handed over. A file left while it was being
+    /// recorded is deleted instead when its recording reached the log (see [`Session::recorded_from`]).
+    /// A file that cannot be read is left where it is.
+    fn kept_inputs(&self) -> Vec<Input> {
+        let dir = queue_dir(&self.deps.paths, &self.deps.shared.session);
+        let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "json" || x == "taking"))
+            .collect();
+        // `{stem}.json` and `{stem}.{seq}.taking` sort by their stems, which sort by time.
+        files.sort();
+        files
+            .into_iter()
+            .filter_map(|file| {
+                if taking_seq(&file).is_some_and(|seq| self.recorded_from(seq)) {
+                    if let Err(e) = std::fs::remove_file(&file) {
+                        tracing::warn!(session = %self.deps.shared.session, "queued input {} not deleted: {e}", file.display());
+                    }
+                    return None;
+                }
+                let kept = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<KeptInput>(&b).ok());
+                if kept.is_none() {
+                    tracing::warn!(session = %self.deps.shared.session, "unreadable queued input {}", file.display());
+                }
+                kept.map(|k| Input::Queued { file, input: Box::new(k.into_input()) })
+            })
+            .collect()
+    }
+
+    /// Whether the record at `seq` begins an operator input's recording: the operator's ledger entry
+    /// or note, which [`Session::record_input`] appends first. A file renamed for recording names
+    /// that seq ([`taking_path`]), and nothing else writes such a record there after the rename.
+    fn recorded_from(&self, seq: Seq) -> bool {
+        let at = self.records.binary_search_by_key(&seq, |r| r.seq).ok().and_then(|i| self.records.get(i));
+        at.is_some_and(|r| {
+            r.author == Author::User
+                && matches!(
+                    r.event,
+                    Event::Ledger { .. } | Event::HarnessNote { note: NoteKind::Constraint | NoteKind::Approval, .. }
+                )
+        })
+    }
+
+    /// Record an input that is not a command. Whether it starts a turn is the caller's business. An
+    /// input kept on disk is recorded as the input it holds, unless its file is gone (it was taken
+    /// already, e.g. when the session started). Its file is first renamed to name the seq where its
+    /// records start ([`taking_path`]), and deleted once it is recorded, so that a harness that stops
+    /// in between records it once: see [`Session::kept_inputs`].
     async fn arrival(&mut self, input: Input) -> R<Arrival> {
+        let Input::Queued { file, input } = input else { return self.record_input(input).await };
+        let marker = taking_path(&file, self.log.next_seq());
+        let held = match std::fs::rename(&file, &marker) {
+            Ok(()) => marker,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Arrival::default()),
+            Err(e) => {
+                tracing::warn!(session = %self.deps.shared.session, "queued input {} not marked: {e}", file.display());
+                file
+            }
+        };
+        let out = self.record_input(*input).await?;
+        if let Err(e) = std::fs::remove_file(&held) {
+            tracing::warn!(session = %self.deps.shared.session, "queued input {} not deleted: {e}", held.display());
+        }
+        Ok(out)
+    }
+
+    /// [`Session::arrival`] for an input that is not kept on disk.
+    async fn record_input(&mut self, input: Input) -> R<Arrival> {
         let mut out = Arrival::default();
         match input {
             Input::User(text) => {
@@ -1108,7 +1433,7 @@ impl Session {
                     out.trigger = Some(Trigger::Resume);
                 }
             }
-            Input::Resume | Input::Reweave | Input::Stop => {}
+            Input::Resume | Input::Reweave | Input::Stop | Input::Queued { .. } => {}
         }
         Ok(out)
     }
@@ -1225,7 +1550,13 @@ impl Session {
                 .last_interrupted
                 .as_deref()
                 .is_some_and(|r| r == texts::REASON_RESTART || r.starts_with("the session log was damaged"));
-            let text = if restarted { texts::AFTER_RESTART } else { texts::AFTER_STOP };
+            let text = if restarted {
+                texts::AFTER_RESTART
+            } else if self.st.stopped_idle {
+                texts::AFTER_IDLE_STOP
+            } else {
+                texts::AFTER_STOP
+            };
             self.note(Author::Harness, NoteKind::Interrupted, text.to_string())?;
         }
         if renewed {
@@ -1357,10 +1688,11 @@ impl Session {
         }
         self.check_stall()?;
         let token = self.token.clone();
-        if force {
-            self.reweave("operator", true, &token, None).await?;
-        } else {
-            self.reweave("target", false, &token, None).await?;
+        // The weave of this step, rendered again only after a record that changes it.
+        let mut woven = self.woven();
+        let (reason, forced) = if force { ("operator", true) } else { ("target", false) };
+        if self.reweave(&woven, reason, forced, &token, None).await? {
+            woven = self.woven();
         }
         if token.is_cancelled() {
             return self.cancelled().await;
@@ -1369,7 +1701,7 @@ impl Session {
         let mut overflowed = false;
         let (req_id, completion, queue_ms, tools) = loop {
             let req_id = new_request_id();
-            let w = weave(&self.records);
+            let w = &woven.weave;
             if let PrefixCheck::Break { first_diff_message, detail } = self.guard.check(w.epoch, &w.messages) {
                 self.append(
                     Author::Harness,
@@ -1420,14 +1752,16 @@ impl Session {
                     if c.usage.prompt_tokens > 0 {
                         self.estimator.calibrate(sent_chars, c.usage.prompt_tokens);
                     }
-                    break (req_id, c, queue_ms, w.tools);
+                    break (req_id, c, queue_ms, request.tools);
                 }
                 Err(ModelError::Cancelled { .. }) => return self.cancelled().await,
                 Err(ModelError::ContextOverflow { limit, .. }) => {
                     if !overflowed {
                         overflowed = true;
                         // What the server refused bounds its window, whatever the session was told.
-                        if self.reweave("overflow", true, &token, Some(limit.unwrap_or(est_tokens))).await? {
+                        let refused_at = Some(limit.unwrap_or(est_tokens));
+                        if self.reweave(&woven, "overflow", true, &token, refused_at).await? {
+                            woven = self.woven();
                             continue;
                         }
                         if token.is_cancelled() {
@@ -1503,19 +1837,19 @@ impl Session {
         completion
     }
 
-    async fn render_hud(&self) -> String {
-        let shared = &self.deps.shared;
-        let jobs: Vec<HudJob> = self
-            .running_jobs()
-            .await
+    async fn render_hud(&mut self) -> String {
+        let running = self.running_jobs().await;
+        self.line_counts.retain(&running);
+        let jobs: Vec<HudJob> = running
             .into_iter()
             .map(|j| HudJob {
-                lines: count_lines(&j.out_path),
+                lines: self.line_counts.count(&j.id, &j.out_path),
                 id: j.id,
                 command: j.command,
                 started_ms: j.started_ms,
             })
             .collect();
+        let shared = &self.deps.shared;
         let children: Vec<HudChild> = self
             .running_children()
             .await
@@ -1546,8 +1880,9 @@ impl Session {
             jobs: &jobs,
             children: &children,
             is_child: shared.is_child(),
-            step: self.st.step,
-            started_ms: self.st.started_ms,
+            // Counted from where the budget was granted: a root's fresh budget starts at its turn.
+            step: self.st.step.saturating_sub(self.st.budget_step_base),
+            started_ms: self.st.budget_from_ms.unwrap_or(self.st.started_ms),
             budget,
         })
     }
@@ -1644,60 +1979,82 @@ impl Session {
 
     // ---- re-weave ------------------------------------------------------------------------------
 
-    /// Estimated size of the request the session would send now, in tokens.
-    fn estimate(&self) -> u64 {
-        let w = weave(&self.records);
+    /// The weave of the records as they are now, with what planning needs. Every weave a step uses
+    /// is computed here, once, and again only after a record that changes it.
+    fn woven(&mut self) -> Woven {
+        #[cfg(test)]
+        {
+            self.weaves = self.weaves.saturating_add(1);
+        }
+        Woven::new(&self.records)
+    }
+
+    /// Estimated size of a request carrying `w`, in tokens (without the HUD).
+    fn estimate(&self, w: &Weave) -> u64 {
         self.estimator
             .tokens_for_messages(&w.messages)
             .saturating_add(self.estimator.tokens(tools_chars(&w.tools)))
     }
 
+    /// Size of the request the session would send now with `w`, in tokens, as the server counts it:
+    /// the size it counted for the latest request of this epoch it answered with one, plus the
+    /// estimate of what `w` has beyond the `n_messages` that request carried — the items merged into
+    /// its last message since (with the blank line joining each), and the messages after it. `None`
+    /// before the first such answer of the epoch.
+    fn measured_size(&self, w: &Weave) -> Option<u64> {
+        let m = self.st.measured.as_ref().filter(|m| m.epoch == w.epoch)?;
+        let n = usize::try_from(m.n_messages).unwrap_or(usize::MAX);
+        let merged = n.checked_sub(1).and_then(|i| w.messages.get(i)).map_or(0, |last| {
+            let item = |seq: Seq| w.items.binary_search_by_key(&seq, |i| i.seq).ok().and_then(|i| w.items.get(i));
+            let since = last.origin.iter().filter(|s| **s > m.seq);
+            since.fold(0usize, |sum, s| sum.saturating_add(item(*s).map_or(0, |i| i.chars)).saturating_add(2))
+        });
+        let added = self.estimator.tokens(merged);
+        let after = self.estimator.tokens_for_messages(w.messages.get(n..).unwrap_or_default());
+        Some(m.prompt_tokens.saturating_add(added).saturating_add(after))
+    }
+
     /// Fold older material out of view when the request has grown past the limit (or `forced`).
-    /// `refused_at` is the window an overflow error stated (or the size of the refused request).
-    /// True when a `reweave` record was appended.
+    /// `woven` is the weave of the records as they are. `refused_at` is the window an overflow error
+    /// stated (or the size of the refused request). True when a `reweave` record was appended.
     async fn reweave(
         &mut self,
+        woven: &Woven,
         reason: &str,
         forced: bool,
         token: &CancellationToken,
         refused_at: Option<u64>,
     ) -> R<bool> {
-        let mut policy = self.deps.context.clone();
-        let mut limit = policy.target_tokens;
         let window = match (self.deps.context_window, refused_at) {
             (Some(known), Some(refused)) => Some(known.min(refused)),
             (known, refused) => known.or(refused),
         };
-        if let Some(window) = window {
-            let reserve = self.deps.client.profile().max_output_tokens.unwrap_or(16_384).saturating_add(4_096);
-            // The trigger stays within four fifths of the window and the floor within half of it, so
-            // that a small window can always be planned for.
-            limit = limit.min(window.saturating_sub(reserve)).min(window / 5 * 4);
-            policy.floor_tokens = policy.floor_tokens.min(window / 2);
-            if policy.floor_tokens >= limit {
-                policy.floor_tokens = limit / 2;
-            }
-        }
-        if !forced && self.estimate() <= limit {
+        let mut policy = self.deps.context.clone();
+        let (limit, floor) = reweave_bounds(&policy, window, self.deps.client.profile().max_output_tokens);
+        let est = self.estimate(&woven.weave);
+        let size = self.measured_size(&woven.weave).unwrap_or(est);
+        if !forced && size <= limit {
             return Ok(false);
         }
-        let midpoint = policy.floor_tokens.saturating_add(limit) / 2;
+        // The plan counts in the estimator's units, the check in the server's when it has counted.
+        policy.floor_tokens = scaled(floor, est, size);
+        let midpoint = scaled(floor.saturating_add(limit) / 2, est, size);
         let enough = |p: &Option<loom_core::weave::ReweavePlan>| p.as_ref().is_some_and(|p| p.after_tokens_est <= midpoint);
-        let mut plan = plan_reweave(&self.records, &self.estimator, &policy, false);
+        let mut plan = woven.plan(&self.records, &self.estimator, &policy, false);
         while !enough(&plan) && policy.keep_recent_steps > MIN_KEEP_RECENT_STEPS {
             policy.keep_recent_steps = (policy.keep_recent_steps / 2).max(MIN_KEEP_RECENT_STEPS);
-            plan = plan_reweave(&self.records, &self.estimator, &policy, false);
+            plan = woven.plan(&self.records, &self.estimator, &policy, false);
         }
         let mut digest = None;
         if !enough(&plan) {
-            let text_plan = plan_reweave(&self.records, &self.estimator, &policy, true);
+            let text_plan = woven.plan(&self.records, &self.estimator, &policy, true);
             if !forced && !enough(&text_plan) {
                 return Ok(false);
             }
             // After an overflow the server has just refused this prefix: a digest request on it would be
             // refused as well.
             if text_plan.is_some() && refused_at.is_none() {
-                digest = self.ask_digest(token).await?;
+                digest = self.ask_digest(&woven.weave, token).await?;
                 if token.is_cancelled() {
                     return Ok(false);
                 }
@@ -1707,6 +2064,7 @@ impl Session {
             }
         }
         let Some(plan) = plan else { return Ok(false) };
+        let freed = scaled(plan.before_tokens_est.saturating_sub(plan.after_tokens_est), size, est);
         let ledger_brief = if self.deps.shared.journal.is_some() {
             self.deps.shared.ledger().map(|l| l.brief(&BriefOpts::default())).unwrap_or_default()
         } else {
@@ -1721,17 +2079,17 @@ impl Session {
                 brief: texts::reweave_brief(&ledger_brief),
                 digest,
                 reason: reason.to_string(),
-                before_tokens: plan.before_tokens_est,
-                after_tokens_est: plan.after_tokens_est,
+                before_tokens: size,
+                after_tokens_est: size.saturating_sub(freed),
             }),
         )?;
         self.publish();
         Ok(true)
     }
 
-    /// Ask the model, on the existing prefix, for notes about what is about to be folded away.
-    async fn ask_digest(&mut self, token: &CancellationToken) -> R<Option<String>> {
-        let w = weave(&self.records);
+    /// Ask the model, on the existing prefix `w`, for notes about what is about to be folded away.
+    /// The request waits for the limiter at the session's own priority: the step waits for it.
+    async fn ask_digest(&mut self, w: &Weave, token: &CancellationToken) -> R<Option<String>> {
         let req_id = new_request_id();
         self.append(
             Author::Harness,
@@ -1743,15 +2101,15 @@ impl Session {
                 n_messages: to_u32(w.messages.len()),
                 stable_hash: stable_hash(&w.messages),
                 hud: None,
-                est_tokens: self.estimate(),
+                est_tokens: self.estimate(w),
             }),
         )?;
-        let Some(permit) = self.deps.limiter.acquire(Priority::Background, token).await else { return Ok(None) };
+        let Some(permit) = self.deps.limiter.acquire(self.deps.priority, token).await else { return Ok(None) };
         let mut messages = w.messages.clone();
         messages.push(Message::user(texts::DIGEST_PROMPT));
         let request = ChatRequest {
             messages,
-            tools: w.tools,
+            tools: w.tools.clone(),
             tool_choice: ToolChoice::Auto,
             max_tokens: Some(texts::DIGEST_MAX_TOKENS),
             seed: None,
@@ -2291,6 +2649,34 @@ mod tests {
         assert!(stored.contains("Mission state"));
     }
 
+    #[test]
+    fn job_line_counts_read_only_what_the_file_gained_since_the_last_request() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j1.out");
+        let append = |text: &str| std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(text.as_bytes()).unwrap();
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let mut counts = LineCounts::default();
+        assert_eq!((counts.count("j1", &path), counts.read), (2, 8));
+        // The next request reads the new bytes only; a last line without its newline counts.
+        append("three\nfo");
+        assert_eq!((counts.count("j1", &path), counts.read), (4, 16));
+        assert_eq!((counts.count("j1", &path), counts.read), (4, 16), "nothing new, nothing read");
+        append("ur\nfive\n");
+        assert_eq!((counts.count("j1", &path), counts.read), (5, 24));
+        // A file that shrank is counted again from its start.
+        std::fs::write(&path, "x\ny\n").unwrap();
+        assert_eq!((counts.count("j1", &path), counts.read), (2, 28));
+        // A file that is gone counts nothing and is forgotten; so is a job that no longer runs.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(counts.count("j1", &path), 0);
+        assert!(counts.files.is_empty());
+        std::fs::write(&path, "z\n").unwrap();
+        assert_eq!(counts.count("j1", &path), 1);
+        counts.retain(&[]);
+        assert!(counts.files.is_empty());
+    }
+
     #[tokio::test]
     async fn stream_events_reach_the_sink() {
         let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("hello there").into()])).await;
@@ -2705,6 +3091,11 @@ mod tests {
         let second = rs.iter().rposition(|r| kind(r) == "turn_start").unwrap();
         assert!(matches!(&rs[second + 1].event, Event::HarnessNote { note: NoteKind::Info, .. }), "{:?}", kinds(&rs));
         assert!(all_text(&fx.server.requests()[3]).contains(&texts::budget_renewed(Some(1), None)));
+        // The state block shows the root's budget, counted from the turn that granted it.
+        let huds: Vec<String> = fx.server.requests().iter().map(last_text).collect();
+        assert!(huds[0].contains("\nSession budget: step 0 of 1\n"), "{}", huds[0]);
+        assert!(huds[2].contains("\nSession budget: step 2 of 1\n"), "{}", huds[2]);
+        assert!(huds[3].contains("\nSession budget: step 0 of 1\n"), "{}", huds[3]);
         // Reopened from the log, the session counts the same way.
         finish_task(tx, task).await;
         let reopened = Session::open(fx.deps()).unwrap();
@@ -2857,7 +3248,7 @@ mod tests {
         wait_until(&fx.sink, "the next turn", |rs| count(rs, "turn_end") == 3).await;
         let rs = fx.sink.records();
         assert_eq!(turn_ends(&rs).last(), Some(&TurnEndReason::Finished));
-        assert!(notes(&rs, NoteKind::Interrupted).contains(&texts::AFTER_STOP.to_string()));
+        assert_eq!(notes(&rs, NoteKind::Interrupted), vec![texts::AFTER_IDLE_STOP.to_string()]);
         finish_task(tx, task).await;
     }
 
@@ -2929,8 +3320,12 @@ mod tests {
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded, TurnEndReason::Stopped, TurnEndReason::Yielded]);
         let stop = rs.iter().position(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Stopped })).unwrap();
         assert!(matches!(&rs[stop - 1].event, Event::Interrupted { reason } if reason == texts::REASON_OPERATOR));
-        assert_eq!(notes(&rs, NoteKind::Interrupted), vec![texts::AFTER_STOP.to_string()]);
-        finish_task(tx, task).await;
+        // Nothing was running: the next turn is not told that a call was interrupted.
+        assert_eq!(notes(&rs, NoteKind::Interrupted), vec![texts::AFTER_IDLE_STOP.to_string()]);
+        assert!(!texts::AFTER_IDLE_STOP.contains("interrupted"));
+        // A session opened from the log reads the stop the same way.
+        assert_eq!(finish_task(tx, task).await, End::Closed);
+        assert!(Session::open(fx.deps()).unwrap().st.stopped_idle);
     }
 
     #[tokio::test]
@@ -2971,6 +3366,72 @@ mod tests {
         got.phase = written.phase;
         assert_eq!(got, written);
         assert_eq!(reopened.records().len(), fx.sink.records().len());
+    }
+
+    #[tokio::test]
+    async fn a_reopened_session_checks_its_first_request_against_the_one_before_the_restart() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("first").into(), Reply::text("second").into()])).await;
+        let session = fx.create();
+        run_with(session, vec![user("hi")]).await;
+        let reopened = Session::open(fx.deps()).unwrap();
+        assert_eq!(count(reopened.records(), "cache_break"), 0);
+        // Primed: a first request that changed what was sent before the restart would be a break.
+        let mut changed = weave(reopened.records()).messages;
+        changed[0] = Message::system("another system prompt");
+        let mut probe = reopened.guard.clone();
+        assert!(matches!(probe.check(0, &changed), PrefixCheck::Break { first_diff_message: 0, .. }));
+        // The log is unchanged, so the real first request extends the last one.
+        run_with(reopened, vec![user("again")]).await;
+        assert_eq!(fx.server.requests().len(), 2);
+        assert_no_cache_break(&fx.sink.records());
+    }
+
+    #[tokio::test]
+    async fn a_log_that_renders_differently_after_a_restart_gets_one_cache_break() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("after").into()])).await;
+        let mut session = fx.create();
+        session.append(Author::User, Event::UserMessage { text: "hi".into() }).unwrap();
+        session.append(Author::Harness, Event::TurnStart { trigger: Trigger::User }).unwrap();
+        let sent = weave(session.records()).messages;
+        // What an older build sent for these records hashed differently.
+        let request = ModelRequest {
+            req_id: "r-old".into(),
+            step: 1,
+            epoch: 0,
+            purpose: Purpose::Step,
+            n_messages: to_u32(sent.len()),
+            stable_hash: "0".repeat(64),
+            hud: None,
+            est_tokens: 0,
+        };
+        session.append(Author::Harness, Event::ModelRequest(request)).unwrap();
+        let reply = ModelResponse {
+            req_id: "r-old".into(),
+            text: "hello".into(),
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            finish: FinishReason::Stop,
+            usage: Usage::default(),
+            timing: Timing::default(),
+            attempts: 1,
+        };
+        session.append(Author::Model, Event::ModelResponse(reply)).unwrap();
+        session.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Yielded }).unwrap();
+        drop(session);
+        let reopened = Session::open(fx.deps()).unwrap();
+        let breaks: Vec<Record> = reopened.records().iter().filter(|r| kind(r) == "cache_break").cloned().collect();
+        assert_eq!(breaks.len(), 1);
+        let Event::CacheBreak { req_id, first_diff_message, detail } = &breaks[0].event else { panic!("a cache_break") };
+        assert_eq!((req_id.as_str(), *first_diff_message), ("r-old", 0));
+        assert_eq!(detail, &texts::rendering_changed(to_u32(sent.len()), sent.len()));
+        assert!(detail.contains("changed across the restart"));
+        // Reported once: opening again with no request since adds nothing.
+        drop(reopened);
+        let again = Session::open(fx.deps()).unwrap();
+        assert_eq!(count(again.records(), "cache_break"), 1);
+        // The session carries on, and its next request extends the prefix as it renders now.
+        run_with(again, vec![user("more")]).await;
+        assert_eq!(count(&read_records(&fx.log_path()).unwrap().records, "cache_break"), 1);
     }
 
     #[tokio::test]
@@ -3322,6 +3783,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rule_kept_on_disk_is_recorded_once_even_after_the_harness_stopped_first() {
+        let mut fx = Fx::new("lead", false, true, seq(vec![])).await;
+        drop(fx.create());
+        let id = SessionId::from("s-test");
+        let queue = queue_dir(&fx.paths, &id);
+        // Handed over while the lead was in a tool call, then lost from memory with the harness.
+        let lost = queue_input(&fx.paths, &id, Input::Constraint("never push to main".into())).unwrap();
+        let Input::Queued { file, .. } = &lost else { panic!("a rule is kept on disk") };
+        assert!(file.exists());
+        // Other inputs are not kept.
+        assert!(matches!(queue_input(&fx.paths, &id, user("hi")).unwrap(), Input::User(_)));
+        // The session started from its log records it before anything else, and deletes the file.
+        let (tx, task) = spawn_run(Session::open(fx.deps()).unwrap());
+        wait_until(&fx.sink, "the rule", |rs| notes(rs, NoteKind::Constraint).len() == 1).await;
+        assert!(!file.exists());
+        // The same input arriving late over the channel is not recorded again; a new one is, and its
+        // file goes once it is.
+        tx.send(lost.clone()).unwrap();
+        let approval = Input::Approval { text: "you may restart staging".into(), scope: "staging".into() };
+        tx.send(queue_input(&fx.paths, &id, approval).unwrap()).unwrap();
+        wait_until(&fx.sink, "the approval", |rs| notes(rs, NoteKind::Approval).len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let rs = fx.sink.records();
+        assert_eq!(notes(&rs, NoteKind::Constraint).len(), 1, "{:?}", kinds(&rs));
+        let ledger = fx.shared.ledger().unwrap();
+        assert_eq!((ledger.constraints.len(), ledger.approvals.len()), (1, 1));
+        assert_eq!(count(&rs, "turn_start"), 0);
+        assert_eq!(std::fs::read_dir(&queue).unwrap().count(), 0, "nothing is left on disk");
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn a_rule_left_on_disk_while_it_was_being_recorded_is_recorded_once() {
+        let mut fx = Fx::new("lead", false, true, seq(vec![])).await;
+        let mut session = fx.create();
+        let id = SessionId::from("s-test");
+        let queue = queue_dir(&fx.paths, &id);
+        let take = |session: &Session, input: Input| {
+            let Input::Queued { file, .. } = queue_input(&fx.paths, &id, input).unwrap() else { panic!("kept") };
+            let marker = taking_path(&file, session.log.next_seq());
+            std::fs::rename(&file, &marker).unwrap();
+            marker
+        };
+        // The harness stopped after recording this rule and before deleting its file ...
+        let rule = take(&session, Input::Constraint("never push to main".into()));
+        session.record_input(Input::Constraint("never push to main".into())).await.unwrap();
+        // ... and before recording this approval, after something else took the seq it named.
+        let approval = Input::Approval { text: "you may restart staging".into(), scope: "staging".into() };
+        let pending = take(&session, approval);
+        session.note(Author::Harness, NoteKind::Info, "the harness went down".into()).unwrap();
+        assert_eq!(taking_seq(&rule), Some(taking_seq(&pending).unwrap() - 2));
+        drop(session);
+        let (tx, task) = spawn_run(Session::open(fx.deps()).unwrap());
+        wait_until(&fx.sink, "the approval", |rs| notes(rs, NoteKind::Approval).len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let rs = fx.sink.records();
+        assert_eq!(notes(&rs, NoteKind::Constraint).len(), 1, "{:?}", kinds(&rs));
+        let ledger = fx.shared.ledger().unwrap();
+        assert_eq!((ledger.constraints.len(), ledger.approvals.len()), (1, 1));
+        assert_eq!(std::fs::read_dir(&queue).unwrap().count(), 0, "nothing is left on disk");
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
     async fn child_settled_agent_message_resume_and_stop_inputs() {
         let script = seq(vec![Reply::text("a").into(), Reply::text("b").into()]);
         let mut fx = Fx::new("chat", false, false, script).await;
@@ -3405,6 +3930,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_reweave_check_uses_the_prompt_size_the_server_reported() {
+        // The server counts a token per character of the request, more than the estimator can be
+        // calibrated to (it counts at least 1.5 characters a token), so the estimate trails it.
+        let mut answered = 0;
+        let script = Script::new(move |body, _| {
+            let counted = body["messages"].to_string().len() + body["tools"].to_string().len();
+            let usage = Usage { prompt_tokens: counted as u64, completion_tokens: 10, ..Usage::default() };
+            answered += 1;
+            let reply = if answered <= 8 { bash(BIG) } else { Reply::text("ok") };
+            reply.with_usage(usage).into()
+        });
+        let mut fx = Fx::new("chat", false, false, script).await;
+        let target = 150_000;
+        fx.context = ReweavePolicy { target_tokens: target, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = read_records(&fx.log_path()).unwrap().records;
+        let rw = reweave_records(&rs);
+        assert!(!rw.is_empty(), "{:?}", kinds(&rs));
+        assert_eq!(rw[0].reason, "target");
+        // Started by the size the server counted ...
+        assert!(rw[0].before_tokens > target, "{}", rw[0].before_tokens);
+        assert!(rw[0].after_tokens_est < rw[0].before_tokens);
+        // ... where the estimate, tool specs included, had not reached the target yet.
+        let first = rs.iter().position(|r| matches!(r.event, Event::Reweave(_))).unwrap();
+        let w = weave(&rs[..first]);
+        let most = TokenEstimator::with_ratio(1.5);
+        let estimate = most.tokens_for_messages(&w.messages) + most.tokens(tools_chars(&w.tools));
+        assert!(estimate < target, "{estimate}");
+        assert_no_cache_break(&rs);
+    }
+
+    #[tokio::test]
+    async fn the_measured_size_counts_only_what_was_merged_into_the_last_message_since() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("first").into()])).await;
+        let mut session = fx.create();
+        // A long paste, which the server has counted already.
+        session.append(Author::User, Event::UserMessage { text: "u ".repeat(10_000) }).unwrap();
+        let w = session.woven().weave;
+        let n = w.messages.len();
+        let request = ModelRequest {
+            req_id: "r-1".into(),
+            step: 1,
+            epoch: 0,
+            purpose: Purpose::Step,
+            n_messages: to_u32(n),
+            stable_hash: stable_hash(&w.messages),
+            hud: None,
+            est_tokens: 0,
+        };
+        session.append(Author::Harness, Event::ModelRequest(request)).unwrap();
+        // Cut off before any text: nothing renders, so later notes merge into the last user message.
+        let reply = ModelResponse {
+            req_id: "r-1".into(),
+            text: String::new(),
+            reasoning: "x".repeat(5_000),
+            tool_calls: Vec::new(),
+            finish: FinishReason::Length,
+            usage: Usage { prompt_tokens: 50_000, ..Usage::default() },
+            timing: Timing::default(),
+            attempts: 1,
+        };
+        session.append(Author::Model, Event::ModelResponse(reply)).unwrap();
+        let w = session.woven().weave;
+        assert_eq!(session.measured_size(&w), Some(50_000), "nothing new");
+        let note = "n".repeat(3_000);
+        session.note(Author::Harness, NoteKind::OutputCut, note.clone()).unwrap();
+        let w = session.woven().weave;
+        assert_eq!(w.messages.len(), n, "merged into the last message the request carried");
+        let item = w.items.last().unwrap().chars;
+        assert!(item > note.len());
+        // The server's count plus the note and the blank line before it, not the whole message again.
+        let added = session.estimator.tokens(item + 2);
+        assert_eq!(session.measured_size(&w), Some(50_000 + added));
+        assert!(session.estimator.tokens(w.messages[n - 1].chars()) > added + 4_000);
+        // Another epoch has not been counted yet.
+        let mut later = w.clone();
+        later.epoch = 1;
+        assert_eq!(session.measured_size(&later), None);
+    }
+
+    #[tokio::test]
+    async fn a_re_weave_the_servers_count_starts_is_planned_and_recorded_in_its_units() {
+        fn answered(session: &mut Session, req_id: &str, text: &str, prompt_tokens: u64) {
+            let w = weave(session.records());
+            let request = ModelRequest {
+                req_id: req_id.into(),
+                step: 1,
+                epoch: 0,
+                purpose: Purpose::Step,
+                n_messages: to_u32(w.messages.len()),
+                stable_hash: stable_hash(&w.messages),
+                hud: None,
+                est_tokens: 0,
+            };
+            session.append(Author::Harness, Event::ModelRequest(request)).unwrap();
+            let reply = ModelResponse {
+                req_id: req_id.into(),
+                text: text.into(),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+                finish: FinishReason::Stop,
+                usage: Usage { prompt_tokens, ..Usage::default() },
+                timing: Timing::default(),
+                attempts: 1,
+            };
+            session.append(Author::Model, Event::ModelResponse(reply)).unwrap();
+        }
+        let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
+        fx.context = ReweavePolicy { target_tokens: 400_000, floor_tokens: 300_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let mut session = fx.create();
+        let kid = SessionId::from("s-kid");
+        let report = |text: &str| {
+            let report = text.repeat(30_000);
+            let usage = Usage::default();
+            let settled = ChildSettled { child: kid.clone(), outcome: ChildOutcome::Returned, report, full: None, usage, steps: 1, inline: false };
+            Event::ChildSettled(settled)
+        };
+        session.append(Author::User, Event::UserMessage { text: "go".into() }).unwrap();
+        answered(&mut session, "r-1", "a", 10_000);
+        session.append(Author::Agent(kid.clone()), report("first ")).unwrap();
+        answered(&mut session, "r-2", "b", 500_000);
+        session.append(Author::Agent(kid.clone()), report("second")).unwrap();
+        answered(&mut session, "r-3", "c", 1_000_000);
+        let woven = session.woven();
+        // Counted by the estimator, the log is below the floor: a plan in its units folds nothing ...
+        let est = session.estimate(&woven.weave);
+        assert!(est < 300_000);
+        assert!(woven.plan(session.records(), &session.estimator, &fx.context, true).is_none());
+        // ... while the server counts it far above the target, and the plan is made for that.
+        let size = session.measured_size(&woven.weave).unwrap();
+        assert!(size > 1_000_000);
+        assert!(session.reweave(&woven, "target", false, &CancellationToken::new(), None).await.unwrap());
+        let rw = reweave_records(session.records());
+        assert_eq!(rw.len(), 1);
+        assert_eq!(rw[0].evictions.len(), 2, "both reports are folded");
+        assert_eq!(rw[0].before_tokens, size, "the size that started it");
+        assert!(rw[0].after_tokens_est < 400_000, "{}", rw[0].after_tokens_est);
+    }
+
+    #[tokio::test]
     async fn reweave_protects_fewer_recent_steps_when_they_are_what_fills_the_context() {
         // Every step is inside the protected recent region, so nothing could be folded without
         // shrinking it.
@@ -3468,6 +4134,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_step_renders_its_weave_once_and_again_only_after_a_reweave() {
+        let long = || Reply::tool("bash", json!({ "command": BIG }).to_string()).with_text("t".repeat(40_000));
+        let script = with_digest(vec![long().into(), long().into(), long().into(), Reply::text("ok").into()], Some("lead A"));
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context = ReweavePolicy { target_tokens: 60_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let mut session = fx.create();
+        session.append(Author::User, Event::UserMessage { text: "go".into() }).unwrap();
+        assert!(session.turn(Trigger::User).await.unwrap().is_none());
+        let rs = session.records().to_vec();
+        let requests = |p: Purpose| rs.iter().filter(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == p)).count();
+        let (steps, digests, reweaves) = (requests(Purpose::Step), requests(Purpose::Digest), reweave_records(&rs).len());
+        assert!(reweaves >= 1 && digests >= 1, "{:?}", kinds(&rs));
+        // The check, every plan, the digest request and the request share one weave per step; only
+        // a re-weave makes another.
+        assert_eq!(session.weaves as usize, steps + reweaves);
+    }
+
+    #[tokio::test]
+    async fn the_digest_request_waits_at_the_sessions_own_priority() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("leads").into()])).await;
+        let mut session = fx.create();
+        let limiter = Arc::new(Limiter::new(1));
+        session.deps.limiter = limiter.clone();
+        assert_eq!(session.deps.priority, Priority::Lead);
+        let never = CancellationToken::new();
+        let held = limiter.acquire(Priority::Lead, &never).await.unwrap();
+        // A child's request waits for the slot first, and keeps it once it has it.
+        let child = {
+            let limiter = limiter.clone();
+            tokio::spawn(async move {
+                let _permit = limiter.acquire(Priority::Child, &CancellationToken::new()).await;
+                std::future::pending::<()>().await;
+            })
+        };
+        while limiter.waiting() < 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let w = session.woven().weave;
+        let digest = session.ask_digest(&w, &never);
+        tokio::pin!(digest);
+        tokio::select! {
+            _ = &mut digest => panic!("the digest request did not wait for the limiter"),
+            _ = async { while limiter.waiting() < 2 { tokio::time::sleep(Duration::from_millis(5)).await } } => {}
+        }
+        // The lead's own step is waiting for the digest: it goes before the child.
+        drop(held);
+        let got = tokio::time::timeout(Duration::from_secs(10), digest).await.expect("the digest waited behind the child");
+        assert_eq!(got.unwrap().as_deref(), Some("leads"));
+        child.abort();
+    }
+
+    #[tokio::test]
     async fn context_overflow_forces_a_reweave_and_a_retry() {
         let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), Reply::text("ok").into()])).await;
         fx.server.set_model("mock", Some(16_000));
@@ -3500,7 +4218,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_small_window_re_weaves_instead_of_failing_when_it_overflows() {
+    async fn a_small_window_is_folded_at_its_trigger_before_the_server_refuses_it() {
         let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
         fx.server.set_model("mock", Some(32_000));
         fx.window = Some(32_000);
@@ -3511,9 +4229,66 @@ mod tests {
         let rs = fx.sink.records();
         let rw = reweave_records(&rs);
         assert!(!rw.is_empty(), "{:?}", kinds(&rs));
-        assert_eq!(rw[0].reason, "overflow");
+        // The room kept for the reply is a quarter of this window, so the trigger (24k) lies below the
+        // window and the context is folded before the server refuses it.
+        assert_eq!(rw[0].reason, "target");
+        assert_eq!(count(&rs, "model_request"), count(&rs, "model_response"), "no request was refused");
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
         assert!(inbox(&rs).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_small_window_re_weaves_instead_of_failing_when_it_overflows() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
+        // The session is told twice the window the server enforces, so the server refuses first.
+        fx.server.set_model("mock", Some(32_000));
+        fx.window = Some(64_000);
+        // The configured floor (180k) is far above both windows.
+        fx.context = ReweavePolicy { target_tokens: 400_000, floor_tokens: 180_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let rw = reweave_records(&rs);
+        assert!(!rw.is_empty(), "{:?}", kinds(&rs));
+        assert!(rw.iter().all(|w| w.reason == "overflow"), "{rw:?}");
+        assert!(count(&rs, "model_request") > count(&rs, "model_response"), "a request was refused");
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+        assert!(inbox(&rs).is_empty());
+    }
+
+    #[test]
+    fn the_reply_reserve_is_at_most_a_quarter_of_the_window() {
+        let policy = ReweavePolicy::default();
+        // 16k: 4k are kept for the reply, so the trigger and the floor stay positive.
+        assert_eq!(reweave_bounds(&policy, Some(16_000), None), (12_000, 8_000));
+        // A configured reply length is honoured whole; only the slack after it shrinks.
+        assert_eq!(reweave_bounds(&policy, Some(16_000), Some(4_000)), (8_000, 4_000));
+        // One the window cannot hold is no reply length the session can honour: it counts as none,
+        // not as a trigger of 0 that would re-weave at every step.
+        assert_eq!(reweave_bounds(&policy, Some(16_000), Some(32_768)), (12_000, 8_000));
+        assert_eq!(reweave_bounds(&policy, Some(16_000), Some(14_000)), (12_000, 8_000));
+        // A request at the trigger leaves room for the reply it asks for, and the 4_096 after it.
+        let (limit, floor) = reweave_bounds(&policy, Some(65_536), Some(32_768));
+        assert_eq!((limit, floor), (28_672, 14_336));
+        assert!(limit + 32_768 + 4_096 <= 65_536);
+        // From 81_920 tokens up the whole reserve (the reply or 16_384, plus 4_096) is kept, as it
+        // always was.
+        let whole = |w: u64, reply: u64| {
+            let limit = 400_000u64.min(w - reply - 4_096).min(w / 5 * 4);
+            let floor = 180_000u64.min(w / 2);
+            (limit, if floor >= limit { limit / 2 } else { floor })
+        };
+        for w in [81_920, 82_000, 131_072, 200_000, 1_000_000] {
+            assert_eq!(reweave_bounds(&policy, Some(w), None), whole(w, 16_384), "window {w}");
+            assert_eq!(reweave_bounds(&policy, Some(w), Some(32_768)), whole(w, 32_768), "window {w}");
+        }
+        assert_eq!(reweave_bounds(&policy, Some(131_072), Some(32_768)), (94_208, 65_536));
+        assert_eq!(reweave_bounds(&policy, Some(82_000), Some(32_768)).0, 45_136);
+        assert_eq!(reweave_bounds(&policy, Some(1_000_000), None), (400_000, 180_000));
+        assert_eq!(reweave_bounds(&policy, None, None), (400_000, 180_000));
+        // Below it the reserve shrinks with the window instead of swallowing it.
+        let (limit, floor) = reweave_bounds(&policy, Some(40_000), None);
+        assert_eq!((limit, floor), (30_000, 20_000));
     }
 
     #[tokio::test]

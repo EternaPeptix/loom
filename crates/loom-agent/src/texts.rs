@@ -172,6 +172,17 @@ pub const AFTER_RESTART: &str = "The harness was restarted while you were workin
 /// Note at the start of the turn after the operator pressed stop and then resumed.
 pub const AFTER_STOP: &str = "The operator stopped the previous turn and has now resumed it. A call shown with no recorded result was interrupted: check the state of things before repeating it. Background jobs and agents from before the stop were ended. Carry on with the work.";
 
+/// Note at the start of the turn after the operator stopped the session between turns.
+pub const AFTER_IDLE_STOP: &str = "The operator stopped the session between turns, while no call was running, and has now resumed it. Background jobs and agents that were still running at the stop, if any, were ended: the notes above say how. Carry on with the work.";
+
+/// `cache_break` detail for a session whose existing log renders differently since the harness was
+/// restarted (an upgrade changed the rendering): the server's cache of its prefix is lost.
+pub fn rendering_changed(sent: u32, now: usize) -> String {
+    format!(
+        "the rendering of the existing log changed across the restart: the {sent} stable messages of the last request before it render differently now ({now} messages), so the server's cached prefix of this session is lost once"
+    )
+}
+
 /// A background job ended while the session was doing something else (or waiting).
 pub fn job_arrival(id: &str, command: &str, outcome: &str, detail: &str, handle: Option<&str>, lines: u64, tail: &str) -> String {
     let mut out = format!("Background job {id} ended: {outcome}.");

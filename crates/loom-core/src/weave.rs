@@ -58,8 +58,13 @@
 //!
 //! `plan_reweave` chooses evictions for a new re-weave so that the estimated size falls to
 //! `floor_tokens` or below, stopping as soon as it does. `upto_seq` is the seq of the last record
-//! before the protected recent region (the most recent `keep_recent_steps` model responses and
-//! everything after the first of them). Order of sacrifice, each class oldest first unless stated:
+//! before the protected recent region: the most recent `keep_recent_steps` `model_response` records,
+//! rendered or not, and everything after the first of them. With fewer responses than that, the
+//! region starts at the first response or at the last `keep_recent_steps` records that render other
+//! than tool results, whichever is later (at the latter alone when there is no response; records
+//! that render nothing are not counted). [`Woven`] plans on a weave
+//! already rendered, so that a step renders its records once. Order of sacrifice, each class oldest
+//! first unless stated:
 //!   1. `DropReasoning` on model responses;
 //!   2. stub `ToolClass::Nav` results;
 //!   3. stub `ToolClass::Read` results, largest first;
@@ -492,34 +497,121 @@ pub fn plan_reweave(
     policy: &ReweavePolicy,
     allow_text_eviction: bool,
 ) -> Option<ReweavePlan> {
-    let (w, aux) = build(records);
+    Woven::new(records).plan(records, estimator, policy, allow_text_eviction)
+}
+
+/// A weave together with what re-weave planning needs to know about its items, so that one
+/// rendering serves a request and every plan made for it.
+#[derive(Clone, Debug)]
+pub struct Woven {
+    pub weave: Weave,
+    facts: Vec<Facts>,
+}
+
+/// What planning needs to know about one item of a [`Woven`] (see [`Aux`]).
+#[derive(Clone, Copy, Debug)]
+struct Facts {
+    msg: Option<usize>,
+    reasoning: usize,
+    text: usize,
+    payload: usize,
+    has_calls: bool,
+    /// Seq of the `tool_result` record shown by this item.
+    result: Option<Seq>,
+}
+
+impl Woven {
+    /// Render `records` (see [`weave`]), keeping what planning needs.
+    pub fn new(records: &[Record]) -> Woven {
+        let (weave, aux) = build(records);
+        let facts = weave
+            .items
+            .iter()
+            .zip(&aux)
+            .map(|(it, a)| Facts {
+                msg: a.msg,
+                reasoning: a.reasoning,
+                text: a.text,
+                payload: a.payload,
+                has_calls: a.has_calls,
+                result: a.result.map(|_| it.seq),
+            })
+            .collect();
+        Woven { weave, facts }
+    }
+
+    /// [`plan_reweave`] without rendering again. `records` are those this weave was rendered from,
+    /// possibly followed by records that render nothing.
+    pub fn plan(
+        &self,
+        records: &[Record],
+        estimator: &TokenEstimator,
+        policy: &ReweavePolicy,
+        allow_text_eviction: bool,
+    ) -> Option<ReweavePlan> {
+        plan_on(&self.weave, &self.facts, records, estimator, policy, allow_text_eviction)
+    }
+}
+
+fn plan_on(
+    w: &Weave,
+    aux: &[Facts],
+    records: &[Record],
+    estimator: &TokenEstimator,
+    policy: &ReweavePolicy,
+    allow_text_eviction: bool,
+) -> Option<ReweavePlan> {
     let before = estimator.tokens_for_messages(&w.messages);
     if before <= policy.floor_tokens {
         return None;
     }
 
-    // The protected recent region starts at the first of the last `keep_recent_steps` responses.
-    let responses: Vec<Seq> = w.items.iter().filter(|i| i.kind == "model_response").map(|i| i.seq).collect();
-    let upto = if policy.keep_recent_steps == 0 {
+    // The protected recent region starts at the first of the last `keep_recent_steps` steps: model
+    // responses, rendered or not (a reply cut off or aborted was a step as well). With fewer steps
+    // than that, it starts at the first step or at the last `keep_recent_steps` records that render
+    // (a call's results counted with the step that made it), whichever is later, so that what
+    // arrived after a few early steps can still be folded.
+    let keep = usize::try_from(policy.keep_recent_steps).unwrap_or(usize::MAX);
+    let upto = if keep == 0 {
         records.last()?.seq
     } else {
-        let keep = usize::try_from(policy.keep_recent_steps).unwrap_or(usize::MAX);
-        let first_recent = *responses.get(responses.len().saturating_sub(keep))?;
-        let at = records.iter().position(|r| r.seq == first_recent)?;
-        records.get(at.checked_sub(1)?)?.seq
+        let steps: Vec<usize> = (0..records.len())
+            .filter(|&i| records.get(i).is_some_and(|r| matches!(r.event, Event::ModelResponse(_))))
+            .collect();
+        let first_recent = match steps.len().checked_sub(keep) {
+            Some(k) => *steps.get(k)?,
+            None => {
+                let rendered: HashSet<Seq> =
+                    w.items.iter().filter(|i| i.kind != "tool_result").map(|i| i.seq).collect();
+                let tail = (0..records.len())
+                    .rev()
+                    .filter(|&i| records.get(i).is_some_and(|r| rendered.contains(&r.seq)))
+                    .nth(keep.saturating_sub(1))
+                    .unwrap_or(0);
+                steps.first().map_or(tail, |&s| s.max(tail))
+            }
+        };
+        records.get(first_recent.checked_sub(1)?)?.seq
     };
 
     let mut calls: HashMap<&str, &ToolCall> = HashMap::new();
+    let mut results: HashMap<Seq, &ToolResult> = HashMap::new();
     for r in records {
-        if let Event::ToolCall(c) = &r.event {
-            calls.entry(c.call_id.as_str()).or_insert(c);
+        match &r.event {
+            Event::ToolCall(c) => {
+                calls.entry(c.call_id.as_str()).or_insert(c);
+            }
+            Event::ToolResult(t) => {
+                results.insert(r.seq, t);
+            }
+            _ => {}
         }
     }
 
     let stub_for = |i: usize| -> Option<EvictAction> {
         let (it, a) = (w.items.get(i)?, aux.get(i)?);
         if it.kind == "tool_result" {
-            let t = a.result?;
+            let t = *results.get(&a.result?)?;
             let text = stub_text(calls.get(t.call_id.as_str()).copied(), t, policy.stub_tail_lines);
             (text.len() < a.payload).then_some(EvictAction::Stub { text })
         } else {
@@ -1491,6 +1583,100 @@ mod tests {
         let one = stepped(&[Exec], &[50]);
         let keep3 = ReweavePolicy { keep_recent_steps: 3, ..FLOOR_ZERO };
         assert!(plan_reweave(&one.recs, &est, &keep3, true).is_none());
+    }
+
+    #[test]
+    fn plan_without_a_model_response_protects_the_last_records_that_render() {
+        use ToolClass::*;
+        let mut l = Log::new();
+        let ask = l.user(&"the task ".repeat(100));
+        let rule = l.note(NoteKind::Constraint, &"never evict me ".repeat(100));
+        let old = l.child(&"findings ".repeat(400));
+        // A call whose reply was never recorded renders nothing, its output included.
+        l.call("a", Exec);
+        l.result("a", Exec, &exec_text(80));
+        let report = l.child(&"more findings ".repeat(300));
+        // Nor does this record, and it is not counted.
+        l.push(Author::Harness, Event::Interrupted { reason: "x".into() });
+        let recent = l.child(&"recent findings ".repeat(200));
+        let w = weave(&l.recs);
+        assert!(w.items.iter().all(|i| i.kind != "model_response" && i.kind != "tool_result"));
+        let est = TokenEstimator::with_ratio(4.0);
+        // The recent region is the last record that renders: the older reports are folded.
+        let plan = plan_reweave(&l.recs, &est, &FLOOR_ZERO, true).expect("a plan");
+        assert_eq!(plan.upto_seq, recent - 1);
+        let seqs: Vec<Seq> = plan.evictions.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, [report, old], "largest first");
+        assert!(!seqs.contains(&ask) && !seqs.contains(&rule));
+        let stubbed = |e: &Eviction| matches!(&e.action, EvictAction::Stub { text } if text.contains("agent report evicted"));
+        assert!(plan.evictions.iter().all(stubbed));
+        let after = with_plan(&l, &plan);
+        assert!(after.messages.iter().any(|m| m.content.contains("the task the task")), "the user message stays");
+        assert!(after.messages.iter().any(|m| m.content.contains("never evict me")), "the rule stays");
+        assert!(after.messages.iter().any(|m| m.content.contains("recent findings")));
+        assert_eq!(plan.after_tokens_est, est.tokens_for_messages(&after.messages));
+        // Two records that render: the report before the newest one is protected as well.
+        let keep2 = ReweavePolicy { keep_recent_steps: 2, ..FLOOR_ZERO };
+        let plan = plan_reweave(&l.recs, &est, &keep2, true).expect("a plan");
+        assert_eq!(plan.evictions.iter().map(|e| e.seq).collect::<Vec<_>>(), [old]);
+        // A region as large as everything that renders leaves nothing to fold.
+        let all = ReweavePolicy { keep_recent_steps: w.items.len() as u32, ..FLOOR_ZERO };
+        assert!(plan_reweave(&l.recs, &est, &all, true).is_none());
+    }
+
+    #[test]
+    fn plan_counts_unrendered_replies_as_steps_and_folds_what_arrived_after_a_few() {
+        use ToolClass::*;
+        let mut l = Log::new();
+        let ask = l.user(&"the task ".repeat(100));
+        let rule = l.note(NoteKind::Constraint, &"never evict me ".repeat(100));
+        // One early reply that renders, then only agent reports.
+        l.resp("", "", &[("a", "bash", "{}")]);
+        l.call("a", Exec);
+        let out = l.result("a", Exec, &exec_text(80));
+        let first = l.child(&"findings ".repeat(400));
+        let second = l.child(&"more findings ".repeat(300));
+        let third = l.child(&"latest findings ".repeat(300));
+        let est = TokenEstimator::with_ratio(4.0);
+        let keep2 = ReweavePolicy { keep_recent_steps: 2, ..FLOOR_ZERO };
+        // Fewer replies than the region keeps: it starts at the last two records that render.
+        let plan = plan_reweave(&l.recs, &est, &keep2, true).expect("a plan");
+        assert_eq!(plan.upto_seq, first);
+        let seqs: Vec<Seq> = plan.evictions.iter().map(|e| e.seq).collect();
+        assert!(seqs.contains(&out) && seqs.contains(&first) && !seqs.contains(&second), "{seqs:?}");
+        assert!(!seqs.contains(&ask) && !seqs.contains(&rule));
+        // Replies that render nothing (cut off before any text, aborted) are steps as well.
+        let cut = l.resp_with("", "thinking", &[], FinishReason::Length);
+        l.note(NoteKind::OutputCut, "cut");
+        l.resp_with("", "", &[("b", "bash", "{}")], FinishReason::Aborted);
+        assert_eq!(weave(&l.recs).items.iter().filter(|i| i.kind == "model_response").count(), 1);
+        let plan = plan_reweave(&l.recs, &est, &keep2, true).expect("a plan");
+        assert_eq!(plan.upto_seq, cut - 1);
+        let seqs: Vec<Seq> = plan.evictions.iter().map(|e| e.seq).collect();
+        assert!([out, first, second, third].iter().all(|s| seqs.contains(s)), "{seqs:?}");
+        assert!(!seqs.contains(&ask) && !seqs.contains(&rule));
+    }
+
+    #[test]
+    fn a_woven_plans_like_a_fresh_render_and_ignores_records_that_render_nothing() {
+        use ToolClass::*;
+        let l = stepped(&[Exec, Nav, Read, Exec, Exec], &[30, 40, 20, 60, 10]);
+        let est = TokenEstimator::with_ratio(4.0);
+        let woven = Woven::new(&l.recs);
+        assert_eq!(woven.weave, weave(&l.recs));
+        for allow in [false, true] {
+            assert_eq!(woven.plan(&l.recs, &est, &FLOOR_ZERO, allow), plan_reweave(&l.recs, &est, &FLOOR_ZERO, allow));
+        }
+        // A request record appended after the render changes nothing.
+        let mut more = l.recs.clone();
+        more.push(Record {
+            seq: more.len() as Seq,
+            ts_ms: 0,
+            author: Author::Harness,
+            prev: "0".repeat(64),
+            event: Event::Interrupted { reason: "x".into() },
+        });
+        assert_eq!(woven.plan(&more, &est, &FLOOR_ZERO, true), plan_reweave(&l.recs, &est, &FLOOR_ZERO, true));
     }
 
     #[test]
