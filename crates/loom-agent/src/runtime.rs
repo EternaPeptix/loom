@@ -94,7 +94,8 @@
 //! ## Creating a root session (`create_session`)
 //! 1. `workspace` must be an existing directory (canonicalised). Role: `packs.role(pack, role)`.
 //!    Profile: `config.profile(model)`.
-//! 2. Model facts: `client.discover()` once per profile (the first success is remembered). On
+//! 2. Model facts: `client.discover()` once per profile (the first success WITH A WINDOW is remembered; a discovery that finds no window
+//!    refuses the creation and is not remembered). On
 //!    `Unavailable`, carry on with the profile's `model` and `context_window` (logged as coming from
 //!    the configuration); without a configured window the creation is refused. On `Rejected`/`Config`: return its message.
 //! 3. New `SessionId`, new `MissionId`. `title`: the given one, else the first line of `message` cut
@@ -1860,7 +1861,7 @@ impl Inner {
             let running = st
                 .known
                 .values()
-                .filter(|k| k.meta.parent.as_ref() == Some(parent) && !k.finished())
+                .filter(|k| k.meta.parent.as_ref() == Some(parent) && !k.finished() && k.gate.is_none())
                 .count();
             if !req.harness && running >= self.config.agents.max_children as usize {
                 return Err(format!(
@@ -1991,7 +1992,7 @@ impl Inner {
                 Ok(d) if d.context_window.is_none() => {
                     // Not remembered: every creation is refused until the profile sets a window.
                     return Err(format!(
-                        "The model server at {} answered but reports no context window for the model, so the session would start without knowing it. Set context_window in [models.{profile_name}] of the config.",
+                        "The model server at {} answered but reports no context window for the model, so the session would start without knowing it. Set context_window in [models.{profile_name}] of the config and restart the daemon: the config is read only at start.",
                         profile.base_url
                     ));
                 }
@@ -2002,7 +2003,7 @@ impl Inner {
                 Err(ModelError::Unavailable { last, .. }) => {
                     if profile.context_window.is_none() {
                         return Err(format!(
-                            "The model server at {} could not be asked for its models ({last}), and the profile \"{profile_name}\" sets no context_window, so the session would start without knowing the model's window. Start the model server, or set context_window in [models.{profile_name}] of the config.",
+                            "The model server at {} could not be asked for its models ({last}), and the profile \"{profile_name}\" sets no context_window, so the session would start without knowing the model's window. Start the model server, or set context_window in [models.{profile_name}] of the config and restart the daemon: the config is read only at start.",
                             profile.base_url
                         ));
                     }
@@ -4262,6 +4263,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_held_gate_verifier_does_not_use_a_slot_of_max_children() {
+        let e = env_with(Script::new(|_, _| Action::Stall { ms: 600_000 }), false, |c| c.agents.max_children = 1).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("request", || !e.server.requests().is_empty()).await;
+        let orch = e.rt.inner.orch.clone();
+        let req = |role: &str, harness: bool| SpawnReq {
+            role: role.into(),
+            mode: SpawnMode::Fresh,
+            brief: Default::default(),
+            budget: Budget::default(),
+            call_id: CallId::from("c1"),
+            title: "t".into(),
+            awaited: false,
+            harness,
+        };
+        orch.spawn(&id, req("verifier", true)).await.unwrap();
+        orch.spawn(&id, req("worker", false)).await.expect("a gate verifier is not counted against max_children");
+        let err = orch.spawn(&id, req("worker", false)).await.unwrap_err();
+        assert!(err.starts_with("1 agents are already running"), "{err}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn harness_spawn_ignores_max_children_and_may_spawn() {
         let e = env_with(Script::new(|_, _| Action::Stall { ms: 600_000 }), false, |c| c.agents.max_children = 1).await;
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
@@ -5021,11 +5045,13 @@ mod tests {
         let item = e.rt.inbox().remove(0).item.item_id;
         e.rt.answer(&item, "").await.unwrap();
         until("resolved", || e.rt.inbox().is_empty()).await;
-        e.rt.shutdown().await;
-        // (The status file keeps the count from before the dismissal; the idle session this test needs has none open.)
+        // The dismissal is published at once, so the restart below does not see an open item.
         let status_file = e.rt.paths().session_dir(&id).join("status.json");
-        let status = std::fs::read_to_string(&status_file).unwrap();
-        std::fs::write(&status_file, status.replace("\"open_inbox\": 1", "\"open_inbox\": 0")).unwrap();
+        until("status published", || {
+            std::fs::read_to_string(&status_file).is_ok_and(|s| s.contains("\"open_inbox\": 0"))
+        })
+        .await;
+        e.rt.shutdown().await;
         // The crash left a command running in its own process group, recorded as an earlier daemon's.
         let mut child = std::process::Command::new("sleep").arg("300").process_group(0).spawn().unwrap();
         let start = loom_tools::proc::process_start(child.id()).unwrap();

@@ -1072,8 +1072,10 @@ fn reweave_bounds(policy: &ReweavePolicy, window: Option<u64>, max_output: Optio
     let (mut limit, mut floor) = (policy.target_tokens, policy.floor_tokens);
     if let Some(window) = window {
         let slack = 4_096_u64.min(window / 4);
-        let reserve = match max_output.map(|m| m.saturating_add(slack)) {
-            Some(reserve) if reserve < window => reserve,
+        // A reply length the window cannot hold counts as none; one it can hold is kept, with the slack
+        // shrunk to what is left, because `step` sends it as max_tokens.
+        let reserve = match max_output {
+            Some(max) if max < window => max + slack.min(window - max - 1),
             _ => 20_480_u64.min(window / 4),
         };
         // The trigger stays within four fifths of the window and the floor within half of it, so
@@ -1635,6 +1637,8 @@ impl Session {
             Input::Answer { item_id, answer } => {
                 let Some(item) = self.st.inbox.iter().find(|i| i.item_id == item_id).cloned() else { return Ok(out) };
                 self.append(Author::User, Event::InboxResolved { item_id, answer: answer.clone() })?;
+                // Published now, not with the next turn: a restart in between reads status.json.
+                self.publish();
                 // A blank answer to an item that is not waiting for one dismisses it.
                 let dismissed = answer.trim().is_empty() && !item.blocking;
                 let asked = matches!(item.kind, InboxKind::Question | InboxKind::Blocker);
@@ -2221,7 +2225,7 @@ impl Session {
         match self.st.budget_note_step {
             None if reached => {
                 let can_finish = self.registry.get("finish").is_some();
-                self.note(Author::Harness, NoteKind::Budget, texts::budget_reached(step, minutes, can_finish))?;
+                self.note(Author::Harness, NoteKind::Budget, texts::budget_reached(step, minutes, can_finish, self.deps.shared.is_child()))?;
                 Ok(None)
             }
             Some(at) if self.st.step.saturating_sub(at) >= texts::BUDGET_GRACE_STEPS => {
@@ -4408,14 +4412,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_that_ends_while_waiting_resumes_the_session_with_an_arrival_note() {
+        let release = std::env::temp_dir().join(format!("loom-job-release-{}", std::process::id()));
+        let _ = std::fs::remove_file(&release);
+        let command = format!("while [ ! -f {} ]; do sleep 0.1; done; echo job-output", release.display());
         let script = seq(vec![
-            Reply::tool("bash", json!({ "command": "sleep 1; echo job-output", "background": true }).to_string()).into(),
+            Reply::tool("bash", json!({ "command": command, "background": true }).to_string()).into(),
             Reply::tool("wait", json!({}).to_string()).into(),
             finish_call("done").into(),
         ]);
         let mut kid = Fx::new("worker", true, true, script).await;
         let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Run it.".into())));
         let (tx, task) = spawn_run(session);
+        // The job ends only once the turn is waiting, however slow the machine is.
+        wait_until(&kid.sink, "the turn waits", |rs| count(rs, "turn_end") == 1).await;
+        std::fs::write(&release, "").unwrap();
         let end = tokio::time::timeout(Duration::from_secs(60), task).await.expect("the child did not settle").unwrap();
         let End::Settled(s) = end else { panic!("expected a settlement, got {end:?}") };
         assert_eq!(s.outcome, ChildOutcome::Returned);
@@ -4428,6 +4438,7 @@ mod tests {
         assert_eq!(count(&rs, "job_settled"), 1);
         assert!(rs.iter().any(|r| matches!(&r.event, Event::TurnStart { trigger: Trigger::JobSettled })));
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Waiting, TurnEndReason::Finished]);
+        let _ = std::fs::remove_file(&release);
     }
 
     #[tokio::test]
@@ -4524,6 +4535,8 @@ mod tests {
         assert_eq!(notes(&rs, NoteKind::Arrival), vec![texts::question_dismissed("which?")]);
         assert_eq!(count(&rs, "user_message"), 0);
         assert!(session.st.inbox.is_empty());
+        // The status is out before any turn: a restart reads it and must not see the item open.
+        assert_eq!(fx.sink.last_status().unwrap().open_inbox, 0);
     }
 
     #[tokio::test]
@@ -5091,7 +5104,13 @@ mod tests {
         // One the window cannot hold is no reply length the session can honour: it counts as none,
         // not as a trigger of 0 that would re-weave at every step.
         assert_eq!(reweave_bounds(&policy, Some(16_000), Some(32_768)), (12_000, 8_000));
-        assert_eq!(reweave_bounds(&policy, Some(16_000), Some(14_000)), (12_000, 8_000));
+        // One the window can hold is kept even when little is left after it: the request still fits.
+        assert_eq!(reweave_bounds(&policy, Some(16_000), Some(14_000)), (1, 0));
+        assert_eq!(reweave_bounds(&policy, Some(32_768), Some(30_000)), (1, 0));
+        for (window, max) in [(16_000, Some(4_000)), (16_000, Some(14_000)), (32_768, Some(30_000)), (65_536, Some(32_768))] {
+            let (limit, _) = reweave_bounds(&policy, Some(window), max);
+            assert!(limit + max.unwrap_or(0) <= window, "window {window} max {max:?}");
+        }
         // A request at the trigger leaves room for the reply it asks for, and the 4_096 after it.
         let (limit, floor) = reweave_bounds(&policy, Some(65_536), Some(32_768));
         assert_eq!((limit, floor), (28_672, 14_336));
