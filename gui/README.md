@@ -11,14 +11,18 @@ reaches it, authenticates, watches `/api/events` for the counts, and shows the p
 
 An SSH-tunnel connection forwards `127.0.0.1:<port>` to `127.0.0.1:<port>` on the remote host, with
 the SAME port number at both ends (the daemon only accepts its own port in the `Host`/`Origin`
-headers). If that local port is busy the connection fails and names the port: close whatever uses it
-(`lsof -nP -iTCP:<port> -sTCP:LISTEN`), or use a Direct connection. The tunnel's ssh runs with
-connection sharing off (`ControlMaster=no`, `ControlPath=none`), so the forward ends with it. The app
-keeps the token in the Keychain. Before the token is sent anywhere the daemon must prove it holds it
-(`GET /healthz?nonce=<64 hex>` answers an HMAC-SHA256 proof); the app then asks for a one-time code
-(`POST /api/login-codes`, bearer token) and loads `<base>/#code=<code>`; every web view, including
-the one Reload builds, gets its own fresh code. A daemon that cannot prove its identity (one older
-than the app: restart it on the new version) gets no token, and there is no token-in-URL fallback.
+headers). If that local port is busy the connection fails and names the port. Any forward, made by
+loom-desk or by hand, must use the daemon's own port number on both ends, so stop whatever listens on
+that port (`lsof -nP -iTCP:<port> -sTCP:LISTEN` names it), or move one of the daemons to another port
+with `[daemon] bind` in its config (if you move the remote one, change the connection's port to
+match). The tunnel's ssh runs with connection sharing off (`ControlMaster=no`, `ControlPath=none`),
+so the forward ends with it. The app keeps the token in the Keychain. Before the token is sent
+anywhere the daemon must prove it holds it (`GET /healthz?nonce=<64 hex>` answers an HMAC-SHA256
+proof); the app then asks for a one-time code (`POST /api/login-codes`, bearer token) and loads
+`<base>/#code=<code>`; every web view, including the one Reload builds, gets its own fresh code. A
+daemon that cannot prove its identity (one older than the app: restart it on the new version) gets
+no token, and there is no token-in-URL fallback. A daemon that refuses the address (HTTP 403: the
+local port is not its own) gets no token either; the connection fails and says so.
 A Direct connection may use http only for 127.0.0.1, localhost or [::1]; any other host needs https.
 The link button copies the daemon's base address only, never a code or token. A tunnel whose ssh
 process ends is shown as disconnected with ssh's last error line.

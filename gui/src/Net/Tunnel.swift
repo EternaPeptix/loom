@@ -30,10 +30,11 @@ final class Tunnel: @unchecked Sendable {
             case .forwardTimedOut(let s): return "the SSH tunnel did not come up: \(s)"
             case .badToken(let s): return "could not read the daemon token: \(s)"
             case .portBusy(let p):
-                return "local port \(p) is already in use. loom-desk needs 127.0.0.1:\(p) free for this connection "
-                    + "(the tunnel must use the daemon's own port number). Close whatever is using port \(p) "
-                    + "(`lsof -nP -iTCP:\(p) -sTCP:LISTEN` names it; a leftover ssh from an earlier loom-desk run "
-                    + "can hold it), or use a Direct connection with your own ssh -L."
+                return "local port \(p) is already in use. loom-desk needs 127.0.0.1:\(p) free for this connection: "
+                    + "the daemon accepts only its own port number, so any forward must use port \(p) on both ends. "
+                    + "Stop whatever is listening on port \(p) (`lsof -nP -iTCP:\(p) -sTCP:LISTEN` names it; a leftover "
+                    + "ssh from an earlier loom-desk run can hold it), or move one of the daemons to another port with "
+                    + "[daemon] bind in its config (if you move the remote one, change this connection's port to match)."
             case .exited(let s): return "the SSH tunnel closed: \(s)"
             }
         }
@@ -392,7 +393,15 @@ final class Tunnel: @unchecked Sendable {
         if isBindFailure("Permission denied (publickey).") { f.append("Tunnel: auth failure taken for bind failure") }
         if isBindFailure("bind [127.0.0.1]:80: Permission denied; channel_setup_fwd_listener_tcpip: cannot listen to port: 80; "
                          + "Could not request local forwarding.") { f.append("Tunnel: privileged port taken for a busy one") }
-        if !Tunnel.TunnelError.portBusy(7878).description.contains("port 7878") { f.append("Tunnel: portBusy message lacks the port") }
+        let busy = Tunnel.TunnelError.portBusy(7878).description
+        if !busy.contains("port 7878") { f.append("Tunnel: portBusy message lacks the port") }
+        // A forward on another local port is always refused (the daemon checks the port in Host), so the
+        // message must not suggest one, and must say how to free or change the port.
+        if busy.contains("ssh -L") || busy.contains("Direct connection") { f.append("Tunnel: portBusy suggests a forward on another port") }
+        if !busy.contains("port 7878 on both ends") { f.append("Tunnel: portBusy does not say both ends use the daemon's port") }
+        if !busy.contains("[daemon] bind") || !busy.contains("change this connection's port") {
+            f.append("Tunnel: portBusy does not say how to move a daemon")
+        }
         return f
     }
     #endif
