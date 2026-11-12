@@ -22,8 +22,26 @@
 //! 6. returns the entry and the state after applying it.
 //!    Two processes appending concurrently therefore get distinct, consecutive `n`.
 //!
-//! `read` verifies and returns all entries. An incomplete final line (no newline) is reported as
-//! `Tampered` — the journal is never silently repaired.
+//! `read` takes a shared lock, verifies and returns all entries it understands. Bytes after the last
+//! newline are a torn tail (a crash or full disk in the middle of an append): they are ignored,
+//! reported by [`Journal::read_report`], and removed by the next `append`. A complete line that fails
+//! verification is `Tampered`. An entry with a valid seal whose op this build cannot parse (written by
+//! a newer loom) is skipped for folding but kept in the chain; `append` is refused with
+//! [`JournalError::NewerVersion`].
+//!
+//! `append` is atomic from the caller's view: the file length is remembered, and any write or sync
+//! error truncates back to it before the error is returned.
+//!
+//! Head record: `<journal>.head` (`journal.head`) holds `{n, mac, seal}` for the last entry, rewritten
+//! atomically (temp file, sync, rename, sync of the directory) after every append while the lock is
+//! held; `seal = HMAC(key, label, mission directory name, n, mac)`. On read, a head with a valid seal
+//! requires entry `n` to exist with exactly that mac, so removing the last entries, deleting the
+//! journal, or substituting another mission's journal (and head) is `Tampered`. The journal may be
+//! ahead of the head by entries that verify (crash between the two writes); the next append repairs
+//! it. A head whose seal fails is `Tampered`. A journal without a head (written before heads existed)
+//! is accepted and gets one at its next append. NOT protected: deleting the journal and the head
+//! together, or restoring an older journal together with its older head, looks like a journal that
+//! never had more entries; anyone holding the key can forge everything.
 //!
 //! Key: `load_or_create_key(path)` returns the 32-byte key stored at `path` as 64 hex characters,
 //! creating it (random, file mode 0600, parent dirs 0700) when missing. A file that exists but does
@@ -64,6 +82,56 @@ pub enum JournalError {
     Rule(String),
     #[error("cannot encode journal entry: {0}")]
     Encode(#[from] serde_json::Error),
+    /// The journal holds a validly sealed entry whose op this build does not know.
+    #[error("the mission journal was written by a newer loom (entry {n} has an op this build does not know); upgrade loom to record to this mission")]
+    NewerVersion { n: u64 },
+}
+
+/// What a verified read found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalRead {
+    /// The entries this build understands, in order.
+    pub entries: Vec<Entry>,
+    /// Bytes after the last newline were ignored (an interrupted append); the next append removes them.
+    pub torn_tail: bool,
+    /// Number of validly sealed entries skipped because their op is unknown to this build.
+    pub unknown: u64,
+}
+
+/// A fully verified journal file.
+struct Loaded {
+    entries: Vec<Entry>,
+    macs: Vec<String>,
+    last_mac: String,
+    first_unknown: Option<u64>,
+    unknown: u64,
+    valid_len: u64,
+    torn: bool,
+}
+
+const HEAD_LABEL: &[u8] = b"loom-journal-head-v1\0";
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: 1 = fail halfway through the line write, 2 = fail the sync after a full write.
+    static FAIL_WRITE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+fn write_line(file: &mut std::fs::File, line: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    match FAIL_WRITE.with(|f| f.get()) {
+        1 => {
+            file.write_all(line.get(..line.len() / 2).unwrap_or(&[]))?;
+            return Err(std::io::Error::other("injected write failure"));
+        }
+        2 => {
+            file.write_all(line)?;
+            return Err(std::io::Error::other("injected sync failure"));
+        }
+        _ => {}
+    }
+    file.write_all(line)?;
+    file.sync_data()
 }
 
 #[derive(Clone, Debug)]
@@ -82,14 +150,120 @@ impl Journal {
         &self.path
     }
 
-    /// Verify and return every entry. A missing file is an empty journal.
+    /// Verify and return every entry this build understands. A missing file is an empty journal.
     pub fn read(&self) -> Result<Vec<Entry>, JournalError> {
+        Ok(self.read_report()?.entries)
+    }
+
+    /// Like [`Journal::read`], also reporting an ignored torn tail and skipped unknown entries.
+    /// Holds a shared lock for the duration of the read.
+    pub fn read_report(&self) -> Result<JournalRead, JournalError> {
+        let lock_path = self.lock_path();
+        let lock = match std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path) {
+            Ok(l) => l,
+            // No mission directory yet: nothing can have been written.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(JournalRead { entries: Vec::new(), torn_tail: false, unknown: 0 });
+            }
+            Err(source) => return Err(JournalError::Io { path: lock_path, source }),
+        };
+        fs2::FileExt::lock_shared(&lock).map_err(|source| JournalError::Io { path: lock_path, source })?;
+        let loaded = self.load()?;
+        drop(lock);
+        Ok(JournalRead { entries: loaded.entries, torn_tail: loaded.torn, unknown: loaded.unknown })
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let mut p = self.path.clone().into_os_string();
+        p.push(".lock");
+        PathBuf::from(p)
+    }
+
+    fn head_path(&self) -> PathBuf {
+        self.path.with_extension("head")
+    }
+
+    /// Read the file, verify the chain and the head record. The caller holds the lock.
+    fn load(&self) -> Result<Loaded, JournalError> {
         let bytes = match std::fs::read(&self.path) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(self.io(e)),
         };
-        verify_all(&self.key, &bytes)
+        let loaded = verify_all(&self.key, &bytes)?;
+        self.check_head(&loaded)?;
+        Ok(loaded)
+    }
+
+    fn head_mac(&self, n: u64, mac: &str) -> std::io::Result<HmacSha256> {
+        let dir = self.path.parent().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut m = new_mac(&self.key)?;
+        m.update(HEAD_LABEL);
+        m.update(dir.as_bytes());
+        m.update(b"\0");
+        m.update(n.to_string().as_bytes());
+        m.update(b"\0");
+        m.update(mac.as_bytes());
+        Ok(m)
+    }
+
+    fn check_head(&self, loaded: &Loaded) -> Result<(), JournalError> {
+        let head_path = self.head_path();
+        let text = match std::fs::read(&head_path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(JournalError::Io { path: head_path, source }),
+        };
+        let bad = |why: &str| tampered(0, format!("the head record {} {why}; the journal's length can no longer be vouched for", head_path.display()));
+        let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&text) else {
+            return Err(bad("is not a JSON object"));
+        };
+        let (Some(n), Some(mac), Some(seal)) = (
+            map.get("n").and_then(|v| v.as_u64()),
+            map.get("mac").and_then(|v| v.as_str()),
+            map.get("seal").and_then(|v| v.as_str()).and_then(|s| hex::decode(s).ok()),
+        ) else {
+            return Err(bad("is missing `n`, `mac` or `seal`"));
+        };
+        let m = self.head_mac(n, mac).map_err(|e| tampered(0, format!("unusable key: {e}")))?;
+        if m.verify_slice(&seal).is_err() {
+            return Err(bad("does not verify (it was altered, copied from another mission, or sealed with a different key)"));
+        }
+        let idx = usize::try_from(n).ok().and_then(|n| n.checked_sub(1));
+        let found = idx.and_then(|i| loaded.macs.get(i));
+        if found.map(String::as_str) != Some(mac) {
+            return Err(tampered(
+                n,
+                format!(
+                    "the journal was truncated or replaced: the sealed head says entry {n} exists with a given seal, but the journal has {} complete entries and entry {n} does not match",
+                    loaded.macs.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Atomically record `{n, mac, seal}` of the last entry beside the journal.
+    fn write_head(&self, n: u64, mac: &str) -> std::io::Result<()> {
+        let seal = hex::encode(self.head_mac(n, mac)?.finalize().into_bytes());
+        let body = serde_json::to_vec(&serde_json::json!({ "n": n, "mac": mac, "seal": seal }))?;
+        let head = self.head_path();
+        let tmp = head.with_extension("head.tmp");
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut f = options.open(&tmp)?;
+        f.write_all(&body)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &head)?;
+        if let Some(dir) = head.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::File::open(dir)?.sync_all()?;
+            }
+        }
+        Ok(())
     }
 
     /// Verify, fold and return the current state.
@@ -110,9 +284,7 @@ impl Journal {
                 std::fs::create_dir_all(parent).map_err(|e| self.io(e))?;
             }
         }
-        let mut lock_path = self.path.clone().into_os_string();
-        lock_path.push(".lock");
-        let lock_path = PathBuf::from(lock_path);
+        let lock_path = self.lock_path();
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -122,15 +294,16 @@ impl Journal {
         fs2::FileExt::lock_exclusive(&lock).map_err(|source| JournalError::Io { path: lock_path.clone(), source })?;
         // The lock is released when `lock` is dropped, on every return path.
 
-        let entries = self.read()?;
-        let mut state = LedgerState::fold(&entries);
+        let loaded = self.load()?;
+        if let Some(n) = loaded.first_unknown {
+            return Err(JournalError::NewerVersion { n });
+        }
+        let mut state = LedgerState::fold(&loaded.entries);
         state.validate(&op, from_user).map_err(JournalError::Rule)?;
         check(&state).map_err(JournalError::Rule)?;
 
-        let (prev_mac, prev_n) = match entries.last() {
-            Some(e) => (e.mac.as_str(), e.n),
-            None => (ZERO_MAC, 0),
-        };
+        let prev_mac = loaded.last_mac.as_str();
+        let prev_n = u64::try_from(loaded.macs.len()).unwrap_or(u64::MAX);
         let mut entry = Entry {
             n: prev_n.saturating_add(1),
             ts_ms: crate::now_ms(),
@@ -153,8 +326,19 @@ impl Journal {
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let mut file = options.open(&self.path).map_err(|e| self.io(e))?;
-        file.write_all(&line).map_err(|e| self.io(e))?;
-        file.sync_data().map_err(|e| self.io(e))?;
+        if loaded.torn {
+            // Remove the bytes of an interrupted append before writing after them.
+            file.set_len(loaded.valid_len).map_err(|e| self.io(e))?;
+            file.sync_data().map_err(|e| self.io(e))?;
+        }
+        if let Err(e) = write_line(&mut file, &line) {
+            // Leave no partial or unreported bytes behind: the caller is told nothing was recorded.
+            let _ = file.set_len(loaded.valid_len).and_then(|()| file.sync_data());
+            return Err(self.io(e));
+        }
+        // The entry is durable. A failed head write only leaves the journal ahead of its head, which
+        // reads accept and the next append repairs; reporting it would make the caller retry the op.
+        let _ = self.write_head(entry.n, &entry.mac);
         drop(lock);
 
         state.apply(&entry);
@@ -198,7 +382,8 @@ fn encode_body(entry: &Entry) -> Result<Vec<u8>, serde_json::Error> {
 }
 
 /// Parse a stored line (with its `mac`) back into an `Entry`.
-fn decode_line(line: &[u8], mac: &str) -> Result<Entry, String> {
+/// `None` as the entry means the seal is fine but the op is unknown to this build.
+fn decode_line(line: &[u8], mac: &str) -> Result<(u64, Option<Entry>), String> {
     let Value::Object(mut map) = serde_json::from_slice::<Value>(line).map_err(|e| format!("line is not valid JSON: {e}"))? else {
         return Err("line is not a JSON object".to_string());
     };
@@ -217,20 +402,32 @@ fn decode_line(line: &[u8], mac: &str) -> Result<Entry, String> {
     if let Some(v) = map.remove(EVIDENCE_SESSION_KEY) {
         map.insert("session".into(), v);
     }
-    let op: LedgerOp = serde_json::from_value(Value::Object(map)).map_err(|e| format!("unrecognised op: {e}"))?;
-    Ok(Entry { n, ts_ms, session, from_user, op, mac: mac.to_string() })
+    Ok(match serde_json::from_value::<LedgerOp>(Value::Object(map)) {
+        Ok(op) => (n, Some(Entry { n, ts_ms, session, from_user, op, mac: mac.to_string() })),
+        Err(_) => (n, None),
+    })
 }
 
 /// Verify the chain over the bytes of the file and return the entries.
-fn verify_all(key: &[u8], bytes: &[u8]) -> Result<Vec<Entry>, JournalError> {
-    let mut entries: Vec<Entry> = Vec::new();
+fn verify_all(key: &[u8], bytes: &[u8]) -> Result<Loaded, JournalError> {
+    let mut loaded = Loaded {
+        entries: Vec::new(),
+        macs: Vec::new(),
+        last_mac: ZERO_MAC.to_string(),
+        first_unknown: None,
+        unknown: 0,
+        valid_len: 0,
+        torn: false,
+    };
     let mut prev_mac = ZERO_MAC.to_string();
     let mut rest = bytes;
     let mut n: u64 = 0;
     while !rest.is_empty() {
         n = n.saturating_add(1);
         let Some(end) = rest.iter().position(|b| *b == b'\n') else {
-            return Err(tampered(n, "the last line is incomplete (no newline); the journal is never repaired automatically"));
+            // An interrupted append: ignored here, removed by the next append.
+            loaded.torn = true;
+            break;
         };
         let (line, after) = rest.split_at(end);
         rest = after.get(1..).unwrap_or(&[]);
@@ -253,14 +450,24 @@ fn verify_all(key: &[u8], bytes: &[u8]) -> Result<Vec<Entry>, JournalError> {
         if m.verify_slice(&mac_bytes).is_err() {
             return Err(tampered(n, "the seal does not match: the entry was altered, removed, reordered, or sealed with a different key"));
         }
-        let entry = decode_line(line, &mac_str.to_ascii_lowercase()).map_err(|d| tampered(n, d))?;
-        if entry.n != n {
-            return Err(tampered(n, format!("entry numbered {} where {n} was expected", entry.n)));
+        let mac_lower = mac_str.to_ascii_lowercase();
+        let (entry_n, entry) = decode_line(line, &mac_lower).map_err(|d| tampered(n, d))?;
+        if entry_n != n {
+            return Err(tampered(n, format!("entry numbered {entry_n} where {n} was expected")));
         }
-        prev_mac = entry.mac.clone();
-        entries.push(entry);
+        match entry {
+            Some(e) => loaded.entries.push(e),
+            None => {
+                loaded.unknown = loaded.unknown.saturating_add(1);
+                loaded.first_unknown.get_or_insert(n);
+            }
+        }
+        loaded.macs.push(mac_lower.clone());
+        prev_mac = mac_lower;
+        loaded.valid_len = loaded.valid_len.saturating_add(u64::try_from(line.len()).unwrap_or(0)).saturating_add(1);
     }
-    Ok(entries)
+    loaded.last_mac = prev_mac;
+    Ok(loaded)
 }
 
 /// Load the journal key, creating it when missing. See the module contract.
@@ -492,6 +699,144 @@ mod tests {
         assert_eq!(std::fs::read(j.path()).unwrap_or_default(), before);
     }
 
+    fn plus_op(j: &Journal) -> Result<(Entry, LedgerState), JournalError> {
+        j.append(&sid(), false, LedgerOp::PlanAdd { text: "x".into() }, &ok)
+    }
+
+    fn head_file(j: &Journal) -> PathBuf {
+        j.path().with_extension("head")
+    }
+
+    /// A stored line built by hand in the original format (no head involved).
+    fn forge(key: &[u8], prev_mac: &str, body: &str) -> (String, String) {
+        let mac = mac_hex(key, prev_mac, body.as_bytes()).unwrap_or_default();
+        (format!("{},\"mac\":\"{mac}\"}}", &body[..body.len() - 1]), mac)
+    }
+
+    fn fail_next_write(mode: u8) {
+        FAIL_WRITE.with(|f| f.set(mode));
+    }
+
+    #[test]
+    fn failed_append_leaves_the_file_untouched_and_the_next_succeeds() {
+        for mode in [1u8, 2] {
+            let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let j = journal(&dir);
+            fill(&j, 2);
+            let before = std::fs::read(j.path()).unwrap_or_default();
+            let head_before = std::fs::read(head_file(&j)).unwrap_or_default();
+            fail_next_write(mode);
+            let r = plus_op(&j);
+            fail_next_write(0);
+            assert!(matches!(r, Err(JournalError::Io { .. })), "{r:?}");
+            assert_eq!(std::fs::read(j.path()).unwrap_or_default(), before, "mode {mode}");
+            assert_eq!(std::fs::read(head_file(&j)).unwrap_or_default(), head_before);
+            assert_eq!(plus_op(&j).map(|(e, _)| e.n).ok(), Some(3));
+            assert_eq!(j.read().map(|v| v.len()).ok(), Some(3));
+        }
+    }
+
+    #[test]
+    fn torn_tail_is_ignored_reported_and_removed_by_the_next_append() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let j = journal(&dir);
+        fill(&j, 3);
+        // A legacy journal (no head) whose last append was cut mid-line.
+        let _ = std::fs::remove_file(head_file(&j));
+        let bytes = std::fs::read(j.path()).unwrap_or_default();
+        std::fs::write(j.path(), &bytes[..bytes.len() - 10]).unwrap_or_default();
+        let r = j.read_report().unwrap_or_else(|e| panic!("{e}"));
+        assert!(r.torn_tail);
+        assert_eq!(r.entries.len(), 2);
+        assert!(plus_op(&j).is_ok());
+        let r = j.read_report().unwrap_or_else(|e| panic!("{e}"));
+        assert!(!r.torn_tail);
+        assert_eq!(r.entries.iter().map(|e| e.n).collect::<Vec<_>>(), [1, 2, 3]);
+        assert!(std::fs::read(j.path()).unwrap_or_default().ends_with(b"\n"));
+    }
+
+    #[test]
+    fn tail_removal_deletion_and_substitution_are_detected() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let j = journal(&dir);
+        fill(&j, 4);
+        let orig = lines(&j);
+        for keep in [3usize, 1] {
+            write_lines(&j, &orig[..keep]);
+            let r = j.read();
+            assert!(matches!(&r, Err(JournalError::Tampered { detail, .. }) if detail.contains("truncated or replaced")), "{keep}: {r:?}");
+            assert!(matches!(plus_op(&j), Err(JournalError::Tampered { .. })));
+        }
+        // Deleting the journal while the head remains.
+        let _ = std::fs::remove_file(j.path());
+        assert!(matches!(j.read(), Err(JournalError::Tampered { .. })));
+        // Another mission's journal and head, sealed with the same key.
+        let other = Journal::new(dir.path().join("m-2").join("journal.jsonl"), vec![7u8; 32]);
+        fill(&other, 6);
+        let _ = std::fs::copy(other.path(), j.path());
+        let _ = std::fs::copy(head_file(&other), head_file(&j));
+        assert!(matches!(j.read(), Err(JournalError::Tampered { .. })));
+        // A tampered head fails its own seal.
+        let ok_j = Journal::new(dir.path().join("m-3").join("journal.jsonl"), vec![7u8; 32]);
+        fill(&ok_j, 2);
+        let head = std::fs::read_to_string(head_file(&ok_j)).unwrap_or_default();
+        std::fs::write(head_file(&ok_j), head.replacen("\"n\":2", "\"n\":1", 1)).unwrap_or_default();
+        assert!(matches!(ok_j.read(), Err(JournalError::Tampered { .. })));
+    }
+
+    #[test]
+    fn journal_ahead_of_its_head_is_accepted_and_repaired() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let j = journal(&dir);
+        fill(&j, 2);
+        let old_head = std::fs::read(head_file(&j)).unwrap_or_default();
+        fill(&j, 1);
+        std::fs::write(head_file(&j), &old_head).unwrap_or_default();
+        assert_eq!(j.read().map(|v| v.len()).ok(), Some(3));
+        assert!(plus_op(&j).is_ok());
+        assert_ne!(std::fs::read(head_file(&j)).unwrap_or_default(), old_head);
+        // Now truncating to the old length is detected.
+        let v = lines(&j);
+        write_lines(&j, &v[..2]);
+        assert!(matches!(j.read(), Err(JournalError::Tampered { .. })));
+    }
+
+    #[test]
+    fn legacy_journal_without_a_head_loads_and_gains_one() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let j = journal(&dir);
+        let key = vec![7u8; 32];
+        let (l1, m1) = forge(&key, ZERO_MAC, r#"{"n":1,"ts_ms":10,"session":"s-lead","from_user":false,"op":"plan_add","text":"old a"}"#);
+        let (l2, _) = forge(&key, &m1, r#"{"n":2,"ts_ms":11,"session":"s-lead","from_user":false,"op":"plan_add","text":"old b"}"#);
+        std::fs::create_dir_all(j.path().parent().unwrap_or(dir.path())).unwrap_or_default();
+        write_lines(&j, &[l1, l2]);
+        assert!(!head_file(&j).exists());
+        assert_eq!(j.state().map(|s| s.plan.len()).ok(), Some(2));
+        assert_eq!(plus_op(&j).map(|(e, _)| e.n).ok(), Some(3));
+        assert!(head_file(&j).exists());
+        assert_eq!(j.read().map(|v| v.len()).ok(), Some(3));
+    }
+
+    #[test]
+    fn unknown_op_is_skipped_on_read_and_refuses_appends() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let j = journal(&dir);
+        let key = vec![7u8; 32];
+        let (l1, m1) = forge(&key, ZERO_MAC, r#"{"n":1,"ts_ms":10,"session":"s-lead","from_user":false,"op":"plan_add","text":"a"}"#);
+        let (l2, m2) = forge(&key, &m1, r#"{"n":2,"ts_ms":11,"session":"s-lead","from_user":false,"op":"hologram_set","depth":3}"#);
+        let (l3, _) = forge(&key, &m2, r#"{"n":3,"ts_ms":12,"session":"s-lead","from_user":false,"op":"plan_add","text":"c"}"#);
+        std::fs::create_dir_all(j.path().parent().unwrap_or(dir.path())).unwrap_or_default();
+        write_lines(&j, &[l1, l2, l3]);
+        let r = j.read_report().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((r.entries.iter().map(|e| e.n).collect::<Vec<_>>(), r.unknown), (vec![1, 3], 1));
+        let before = std::fs::read(j.path()).unwrap_or_default();
+        match plus_op(&j) {
+            Err(JournalError::NewerVersion { n }) => assert_eq!(n, 2),
+            other => panic!("expected NewerVersion, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(j.path()).unwrap_or_default(), before);
+    }
+
     #[test]
     fn garbage_lines_are_detected() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
@@ -579,6 +924,34 @@ mod tests {
         let ns: Vec<u64> = entries.iter().map(|e| e.n).collect();
         assert_eq!(ns, (1..=100).collect::<Vec<u64>>());
         assert_eq!(j.state().unwrap_or_default().plan.len(), 100);
+    }
+
+    #[test]
+    fn readers_never_see_a_partial_append() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let path = dir.path().join("m-1").join("journal.jsonl");
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let j = Journal::new(path.clone(), vec![3u8; 32]);
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                        let r = j.read_report();
+                        assert!(matches!(&r, Ok(rep) if !rep.torn_tail), "{r:?}");
+                    }
+                })
+            })
+            .collect();
+        let writer = Journal::new(path, vec![3u8; 32]);
+        for i in 0..60 {
+            let r = writer.append(&sid(), false, LedgerOp::PlanAdd { text: format!("i{i}") }, &ok);
+            assert!(r.is_ok(), "{r:?}");
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        for h in readers {
+            assert!(h.join().is_ok());
+        }
     }
 
     #[test]

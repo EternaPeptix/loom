@@ -245,6 +245,9 @@ pub const NO_MISSION: &str = "This session has no mission ledger, so there is no
 fn journal_sentence(e: &JournalError) -> String {
     match e {
         JournalError::Rule(text) => text.clone(),
+        JournalError::NewerVersion { .. } => {
+            "This mission's journal was written by a newer loom than this one, so nothing was recorded. Ask the operator to upgrade loom, then repeat the call.".to_string()
+        }
         other => format!(
             "The mission journal could not be used ({other}). This is a harness fault, not a problem with the call; nothing was recorded."
         ),
