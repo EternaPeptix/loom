@@ -27,6 +27,7 @@
 //! - `send <session> <text…>` (`-` = standard input), then follows unless `--detach`.
 //! - `stop <session>`, `resume <session>`, `reweave <session>`, `archive <session> [--undo]`: the
 //!   call, then one line saying what was asked (`stop requested for {id}`).
+//! - `gc [--apply]`: `client.gc`; one line with what was examined, kept and would be (or was) deleted.
 //! - `inbox`: `render::inbox_list`. `answer <item> <text…>`: `client.answer`; `answered {item}`.
 //! - `ledger <session|mission>`: the ledger's `markdown`.
 //! - `window <session>`: `render::window_table`. `net <session> [-n <limit>]`: `render::net_table`.
@@ -146,8 +147,9 @@ pub enum Command {
     Archive(ArchiveArgs),
     /// Delete stored tool outputs that no session or mission refers to any more (dry run unless --apply)
     ///
-    /// Collects blobs that appear nowhere in the files under the sessions and missions directories and are
-    /// older than one hour. Removing a session's directory is what makes its outputs collectable.
+    /// Collects stored outputs older than one hour whose id or `out:` handle appears in no file under the
+    /// sessions and missions directories. Removing a session's directory is what makes its outputs
+    /// collectable; an output that another session or a mission still names is kept.
     Gc(GcArgs),
     /// List what is waiting for you
     Inbox,

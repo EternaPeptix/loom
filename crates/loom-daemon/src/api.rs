@@ -1372,13 +1372,18 @@ mod tests {
     #[tokio::test]
     async fn gc_route_reports_dry_run_by_default_and_deletes_on_apply() {
         let e = env(Script::new(|_, _| slow_finish("ok", 0))).await;
-        let b = e.rt.blobs().put_bytes(b"orphan\n").unwrap();
+        let blobs = e.rt.blobs();
+        let (orphan, young) = (blobs.put_bytes(b"orphan\n").unwrap(), blobs.put_bytes(b"young\n").unwrap());
+        let f = std::fs::OpenOptions::new().write(true).open(blobs.root().join(&orphan.id.0[..2]).join(&orphan.id.0)).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)).unwrap();
+        let fields = |r: &Value| [r["applied"].clone(), r["examined"].clone(), r["kept"].clone(), r["collected"].clone()];
         let (s, r) = e.post("/api/gc", json!({})).await;
-        assert_eq!((s, r["applied"].clone(), r["examined"].clone(), r["collected"].clone()), (200, json!(false), json!(1), json!(0)));
-        // Young blobs are never collected, so even --apply keeps this one.
+        assert_eq!((s, fields(&r)), (200, [json!(false), json!(2), json!(1), json!(1)]));
+        assert!(blobs.read_all(&orphan.id).is_ok());
+        // The old orphan goes; a young blob is never collected.
         let (s, r) = e.post("/api/gc", json!({"apply": true})).await;
-        assert_eq!((s, r["applied"].clone(), r["kept"].clone()), (200, json!(true), json!(1)));
-        assert!(e.rt.blobs().read_all(&b.id).is_ok());
+        assert_eq!((s, fields(&r)), (200, [json!(true), json!(2), json!(1), json!(1)]));
+        assert!(blobs.read_all(&orphan.id).is_err() && blobs.read_all(&young.id).is_ok());
         let (s, r) = e.post_text("/api/gc", "{\"apply\": \"yes\"}").await;
         assert_eq!(s, 400, "{r}");
     }

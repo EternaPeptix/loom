@@ -2025,21 +2025,29 @@ impl Runtime {
         Ok(())
     }
 
-    /// Garbage-collect stored outputs. Keeps every blob whose id appears anywhere in the text of any file under
-    /// the sessions and missions directories (logs, damaged-log remainders, meta, status, net audit, journals),
-    /// and every blob younger than `min_age` (default one hour). Only the rest is deleted, and only with
-    /// `apply`; otherwise the report says what would be. Removing a session's directory is what makes its
-    /// outputs collectable. Any file that cannot be read aborts the collection before anything is deleted.
+    /// Garbage-collect stored outputs. Keeps every blob whose id, or `out:` handle, appears anywhere in the text
+    /// of any file under the sessions and missions directories (logs, damaged-log remainders, meta, status, net
+    /// audit, journals, job output), and every blob younger than `min_age` (default one hour) when the scan
+    /// began. Only the rest is deleted, and only with `apply`; otherwise the report says what would be.
+    /// Removing a session's directory is what makes its outputs collectable (those that another session's or a
+    /// mission's files still name stay). Links below a session or mission directory are not followed. Any
+    /// file that cannot be read aborts the collection before anything is deleted.
     pub async fn gc(&self, apply: bool, min_age: Option<Duration>) -> Result<loom_core::blob::SweepReport, String> {
         let blobs = self.inner.blobs.clone();
         let roots = [self.inner.paths.sessions_dir(), self.inner.paths.missions_dir()];
         let min_age = min_age.unwrap_or(loom_core::blob::DEFAULT_GC_MIN_AGE);
         tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let stored = blobs.ids().map_err(|e| format!("cannot list the blob store ({e}); nothing was collected."))?;
             let mut keep = HashSet::new();
             for root in &roots {
-                scan_tree_for_ids(root, &mut keep, 0)
-                    .map_err(|e| format!("cannot read {} ({e}); nothing was collected. Fix that and run it again.", root.display()))?;
+                scan_tree_for_ids(root, &stored, &mut keep).map_err(|(path, e)| {
+                    format!("cannot read {} ({e}); nothing was collected. Fix or remove it and run it again.", path.display())
+                })?;
             }
+            // Ages count from the start of the scan: a blob stored since then (so not in `stored`), or stored
+            // again, is kept whatever names it.
+            let min_age = min_age.saturating_add(started.elapsed());
             blobs.sweep(&keep, min_age, apply).map_err(|e| format!("cannot sweep the blob store: {e}"))
         })
         .await
@@ -2224,31 +2232,49 @@ impl Runtime {
     }
 }
 
-/// Add every 64-hex token in every file below `dir` to `keep`. A missing `dir` is an empty tree.
-fn scan_tree_for_ids(dir: &Path, keep: &mut HashSet<String>, depth: usize) -> std::io::Result<()> {
-    if depth > 16 {
-        return Ok(());
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    for entry in entries {
-        let path = entry?.path();
-        let meta = match std::fs::metadata(&path) {
-            Ok(m) => m,
+/// Add to `keep` every stored blob that a regular file below `root` names (`scan_ids`). A missing `root` is an
+/// empty tree. A link is followed only when it is an entry of `root` itself (a session or mission directory);
+/// below that, links are skipped, so the walk stays in the tree and ends whatever commands left in their
+/// scratch directories. What cannot be read is an error carrying its path.
+fn scan_tree_for_ids(
+    root: &Path,
+    stored: &loom_core::blob::StoredIds,
+    keep: &mut HashSet<String>,
+) -> Result<(), (PathBuf, std::io::Error)> {
+    use std::io::ErrorKind::NotFound;
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
             // Vanished while scanning (a session directory being removed): nothing there to keep.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
+            Err(e) if e.kind() == NotFound => continue,
+            Err(e) => return Err((dir, e)),
         };
-        if meta.is_dir() {
-            scan_tree_for_ids(&path, keep, depth + 1)?;
-        } else if meta.is_file() {
-            match std::fs::File::open(&path) {
-                Ok(f) => loom_core::blob::scan_ids(f, keep)?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+        for entry in entries {
+            let entry = entry.map_err(|e| (dir.clone(), e))?;
+            let path = entry.path();
+            let kind = match entry.file_type() {
+                // A dangling or looping link at the top is nothing to read.
+                Ok(t) if t.is_symlink() && dir == root => match std::fs::metadata(&path) {
+                    Ok(m) => m.file_type(),
+                    Err(_) => continue,
+                },
+                Ok(t) => t,
+                Err(e) if e.kind() == NotFound => continue,
+                Err(e) => return Err((path, e)),
+            };
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if kind.is_file() {
+                let file = match std::fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == NotFound => continue,
+                    Err(e) => return Err((path, e)),
+                };
+                // Replaced since it was listed by a link to something that is not a regular file: not read.
+                if file.metadata().is_ok_and(|m| m.is_file()) {
+                    loom_core::blob::scan_ids(file, stored, keep).map_err(|e| (path, e))?;
+                }
             }
         }
     }
@@ -2789,20 +2815,27 @@ mod tests {
         rt2.shutdown().await;
     }
 
+    /// Store `data` and make the blob two hours old.
+    fn old_blob(store: &BlobStore, data: &str) -> String {
+        let b = store.put_bytes(data.as_bytes()).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(store.root().join(&b.id.0[..2]).join(&b.id.0)).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)).unwrap();
+        b.id.0
+    }
+
     #[tokio::test]
     async fn gc_keeps_everything_referenced_anywhere_and_young_blobs() {
         let e = env(Script::new(|_, _| finish("ok"))).await;
         let home = e.dir.path().join("home");
         let store = e.rt.blobs().clone();
-        let old = |data: &str| {
-            let b = store.put_bytes(data.as_bytes()).unwrap();
-            let f = std::fs::OpenOptions::new().write(true).open(store.root().join(&b.id.0[..2]).join(&b.id.0)).unwrap();
-            f.set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)).unwrap();
-            b.id.0
-        };
-        let (in_log, in_journal, in_damaged, in_raw, orphan) =
-            (old("log\n"), old("journal\n"), old("damaged\n"), old("raw\n"), old("orphan\n"));
+        let old = |data: &str| old_blob(&store, data);
+        let (in_log, in_journal, in_damaged, in_raw, by_handle, orphan) =
+            (old("log\n"), old("journal\n"), old("damaged\n"), old("raw\n"), old("handle\n"), old("orphan\n"));
         let young = store.put_bytes(b"young\n").unwrap().id.0;
+        // A parent's copy of a child's report names the child's output by its handle only.
+        let s2 = home.join("sessions").join("s-gc2");
+        std::fs::create_dir_all(&s2).unwrap();
+        std::fs::write(s2.join("log.jsonl"), format!("{{\"text\":\"see out:{}\"}}\n", &by_handle[..16])).unwrap();
         let s1 = home.join("sessions").join("s-gc1");
         let m1 = home.join("missions").join("m-gc1");
         std::fs::create_dir_all(&s1).unwrap();
@@ -2817,20 +2850,66 @@ mod tests {
         std::fs::write(m1.join("journal.jsonl"), format!("{{\"ref\":\"out:{in_journal}\"}}\n")).unwrap();
 
         let dry = e.rt.gc(false, None).await.unwrap();
-        assert_eq!((dry.examined, dry.kept, dry.collected, dry.applied), (6, 5, 1, false));
+        assert_eq!((dry.examined, dry.kept, dry.collected, dry.applied), (7, 6, 1, false));
         assert!(store.read_all(&BlobId(orphan.clone())).is_ok());
         let done = e.rt.gc(true, None).await.unwrap();
-        assert_eq!((done.collected, done.collected_bytes), (1, 7));
+        // Seven bytes and the eight of its one-line index.
+        assert_eq!((done.collected, done.collected_bytes), (1, 15));
         assert!(store.read_all(&BlobId(orphan)).is_err());
-        for id in [&in_log, &in_journal, &in_damaged, &in_raw, &young] {
+        for id in [&in_log, &in_journal, &in_damaged, &in_raw, &by_handle, &young] {
             assert!(store.read_all(&BlobId(id.clone())).is_ok(), "{id} was collected");
         }
         // The session directory goes: its blobs become collectable (the young one still is not).
         std::fs::remove_dir_all(&s1).unwrap();
         let after = e.rt.gc(false, None).await.unwrap();
-        assert_eq!((after.examined, after.kept, after.collected), (5, 2, 3));
+        assert_eq!((after.examined, after.kept, after.collected), (6, 3, 3));
         let zero_age = e.rt.gc(false, Some(Duration::ZERO)).await.unwrap();
         assert_eq!(zero_age.collected, 4);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gc_follows_no_link_below_a_session_directory_and_names_what_it_cannot_read() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let (home, store) = (e.dir.path().join("home"), e.rt.blobs().clone());
+        let (in_log, outside, in_linked) = (old_blob(&store, "log\n"), old_blob(&store, "out\n"), old_blob(&store, "ln\n"));
+        // What a command can leave in its scratch directory: a link to itself, two links to `.`, a dangling
+        // link, and links to a directory and a file outside that name a blob.
+        let s1 = home.join("sessions").join("s-gc1");
+        let tmp = s1.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(s1.join("log.jsonl"), format!("{{\"blob\":\"{in_log}\"}}\n")).unwrap();
+        let out = e.dir.path().join("outside");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("names.txt"), &outside).unwrap();
+        symlink("loop", tmp.join("loop")).unwrap();
+        symlink(".", tmp.join("here")).unwrap();
+        symlink(".", tmp.join("again")).unwrap();
+        symlink("/nonexistent-loom-target", tmp.join("dangling")).unwrap();
+        symlink(&out, tmp.join("out")).unwrap();
+        symlink(out.join("names.txt"), tmp.join("names.txt")).unwrap();
+        // A session directory that is itself a link is read; a looping link beside it is nothing.
+        let elsewhere = e.dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("log.jsonl"), format!("{{\"blob\":\"{in_linked}\"}}\n")).unwrap();
+        symlink(&elsewhere, home.join("sessions").join("s-gc2")).unwrap();
+        symlink("loop", home.join("sessions").join("loop")).unwrap();
+
+        let r = e.rt.gc(true, None).await.unwrap();
+        assert_eq!((r.examined, r.kept, r.collected), (3, 2, 1));
+        assert!(store.read_all(&BlobId(outside)).is_err());
+        assert!(store.read_all(&BlobId(in_log)).is_ok() && store.read_all(&BlobId(in_linked)).is_ok());
+        // A file that cannot be read stops the collection, and the error names it (not when tests run as root).
+        let locked = tmp.join("locked.txt");
+        std::fs::write(&locked, "x").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&locked).is_err() {
+            let err = e.rt.gc(true, None).await.unwrap_err();
+            assert!(err.starts_with(&format!("cannot read {} (", locked.display())), "{err}");
+            assert!(err.contains("nothing was collected"), "{err}");
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
         e.rt.shutdown().await;
     }
 
