@@ -51,6 +51,37 @@ pub enum LedgerOp {
     /// The agent says the goal is met.
     FinishClaim { summary: String, #[serde(default)] evidence: Vec<String> },
     FinishVerdict { claim: String, accepted: bool, #[serde(default)] objections: Vec<String>, #[serde(default)] verifier: Option<SessionId> },
+    /// The agent concludes that the goal is met (`supported`) or cannot be met as stated (`refuted`),
+    /// citing execution evidence. `open` is never a write target and there is no way back to nothing.
+    GoalMetSet {
+        status: GoalMetStatus,
+        #[serde(default)]
+        note: String,
+        #[serde(default)]
+        evidence: Vec<String>,
+    },
+    /// The operator accepts the result short of the goal and the work may stop. Operator only.
+    OperatorRelease { reason: String },
+    /// Network hosts the operator has authorized for this mission, one host per entry. Operator only.
+    ScopeGrant {
+        hosts: Vec<String>,
+        #[serde(default)]
+        note: Option<String>,
+    },
+}
+
+/// Where the goal-met claim stands. There is deliberately no `Withdrawn`: once concluded it can only
+/// move to the other terminal state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalMetStatus {
+    /// Not yet concluded.
+    #[default]
+    Open,
+    /// The goal is met.
+    Supported,
+    /// The goal cannot be met as stated.
+    Refuted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,9 +248,38 @@ pub struct FinishRecord {
     pub objections: Vec<String>,
 }
 
+/// The harness-held claim about whether the goal is met. A singleton, not one of `claims`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalMet {
+    pub status: GoalMetStatus,
+    pub note: String,
+    /// Evidence ids cited for the current status.
+    pub evidence: Vec<String>,
+    /// Journal position of the entry that set the current status; 0 while open.
+    pub n: u64,
+}
+
+/// The operator's acceptance of the result short of the goal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release {
+    pub reason: String,
+    /// Journal position of the release entry.
+    pub n: u64,
+}
+
+/// One operator grant of network hosts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeGrantRecord {
+    pub id: String,
+    /// The hosts as written.
+    pub hosts: Vec<String>,
+    pub note: Option<String>,
+    pub n: u64,
+}
+
 /// The folded state of a mission. Ids are assigned by `fold`: constraints `k1…`, plan steps `p1…`,
 /// decisions `d1…`, dead ends `x1…`, claims `c1…`, evidence `e1…`, obligations `o1…`,
-/// approvals `a1…`, questions `q1…`, finish claims `f1…`.
+/// approvals `a1…`, questions `q1…`, finish claims `f1…`, scope grants `s1…`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerState {
     pub goal: Option<String>,
@@ -233,6 +293,15 @@ pub struct LedgerState {
     pub approvals: Vec<Approval>,
     pub questions: Vec<Question>,
     pub finishes: Vec<FinishRecord>,
+    /// The goal-met claim: `None` until a goal is set, then `Open` or terminal.
+    #[serde(default)]
+    pub goal_met: Option<GoalMet>,
+    /// The operator's release, if given. Never evicted.
+    #[serde(default)]
+    pub release: Option<Release>,
+    /// Operator grants of network hosts, in order. Never evicted.
+    #[serde(default)]
+    pub scope_grants: Vec<ScopeGrantRecord>,
     /// Number of entries folded.
     pub entries: u64,
 }
@@ -271,6 +340,29 @@ pub struct LedgerState {
 // - `FinishVerdict` may be written with either value of `from_user`; the finish id must exist and
 //   must not have a verdict yet.
 //
+// Goal-met claim (`GoalMetSet`, model-authored). `LedgerState.goal_met` is `None` before any goal is
+// set and `Open` from the `GoalSet` that sets one; it is a singleton and is not in `claims`, so
+// `open_items()` never counts it. Its status is `Open`, `Supported` (the goal is met) or `Refuted` (the
+// goal cannot be met as stated). There is NO withdrawn state: `Open` is never a write target (a
+// `GoalMetSet` with `Open` is refused by `validate` and ignored by `apply`), so the model can move the
+// claim toward a conclusion but never retract it. `validate` requires: a goal is set; the target is
+// `Supported` or `Refuted`; a non-blank `note`; at least one named evidence id, every id existing, every
+// one attested and supporting; at least one of them of kind `Execution` (reading source alone is
+// refused: run the target and cite the run). Once terminal it may be written again only with the OTHER
+// terminal status and at least one execution evidence record added after the entry that set the current
+// status (`GoalMet.n`); repeating the current status is refused. `apply` replaces status, note and
+// evidence and records the entry position.
+//
+// Operator release (`OperatorRelease`, `from_user` only): sets `LedgerState.release` (reason, entry
+// position) once; refused for a model, with a blank reason, before a goal is set, or when already
+// released. It does not touch `goal_met`: the views say "released by the operator (goal not established)".
+//
+// Scope grant (`ScopeGrant`, `from_user` only): appends a `ScopeGrantRecord` with id `s{i}` (the i-th
+// grant; the letter `s` is used for nothing else). Hosts are kept as written and are not parsed; `validate`
+// requires a non-empty list, no blank entry, and no entry containing whitespace or a comma (one host per
+// entry). `granted_hosts()` returns every host granted so far, de-duplicated ignoring ASCII case, in
+// first-seen order. Release and grants are never evicted.
+//
 // `open_items()`: plan steps `Todo`/`Doing`; obligations with no outcome; claims with status `Open`;
 // questions with `blocking` and no answer.
 //
@@ -281,7 +373,11 @@ pub struct LedgerState {
 // `Dead ends:` (last `opts.max_dead_ends`) — each of these two starts, right under its heading, with the
 // line `(N older not shown: {first id}–{last id}, or the one id when N is 1; call `ledger` to read them)` when older items were left out —,
 // `Approvals:` (unused ones, verbatim, with scope),
-// `Unanswered questions:`. Evidence quotes are not included. Each line is cut at `opts.max_line`
+// `Unanswered questions:`. Right after `Goal:` (when a goal is set, or grants exist) comes a section of
+// lines: `Goal status: open (not yet concluded)` / `Goal status: met — note (evidence: ids)` /
+// `Goal status: cannot be met as stated — note (evidence: ids)`; when released `released by the operator
+// (goal not established): reason`; and `authorized hosts: a, b, c` or `authorized hosts: none granted`.
+// The reason and the hosts are the operator's words and are never cut. Evidence quotes are not included. Each line is cut at `opts.max_line`
 // characters with `…`. The output is deterministic.
 //
 // `render_markdown()` renders everything (all sections, all records including evidence with handle,
@@ -410,7 +506,12 @@ impl LedgerState {
         self.entries = self.entries.saturating_add(1);
         let n = entry.n;
         match &entry.op {
-            LedgerOp::GoalSet { text } => self.goal = Some(text.clone()),
+            LedgerOp::GoalSet { text } => {
+                self.goal = Some(text.clone());
+                if self.goal_met.is_none() {
+                    self.goal_met = Some(GoalMet { status: GoalMetStatus::Open, note: String::new(), evidence: Vec::new(), n: 0 });
+                }
+            }
             LedgerOp::ConstraintAdd { text } => {
                 let id = next_id("k", self.constraints.len());
                 self.constraints.push(Constraint { id, text: text.clone(), retired: None });
@@ -503,7 +604,35 @@ impl LedgerState {
                     f.objections = objections.clone();
                 }
             }
+            LedgerOp::GoalMetSet { status, note, evidence } => {
+                // `Open` is never a write target: ignoring it keeps a forged entry from retracting a conclusion.
+                if *status != GoalMetStatus::Open {
+                    if let Some(gm) = self.goal_met.as_mut() {
+                        *gm = GoalMet { status: *status, note: note.clone(), evidence: evidence.clone(), n };
+                    }
+                }
+            }
+            LedgerOp::OperatorRelease { reason } => {
+                if self.release.is_none() {
+                    self.release = Some(Release { reason: reason.clone(), n });
+                }
+            }
+            LedgerOp::ScopeGrant { hosts, note } => {
+                let id = next_id("s", self.scope_grants.len());
+                self.scope_grants.push(ScopeGrantRecord { id, hosts: hosts.clone(), note: note.clone(), n });
+            }
         }
+    }
+
+    /// Every host the operator has granted so far, de-duplicated (ignoring ASCII case) in first-seen order.
+    pub fn granted_hosts(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for host in self.scope_grants.iter().flat_map(|g| g.hosts.iter()) {
+            if !out.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+                out.push(host.clone());
+            }
+        }
+        out
     }
 
     fn push_step(&mut self, text: &str) {
@@ -701,6 +830,69 @@ impl LedgerState {
                     return Err(format!("Finish claim {claim} already has a verdict ({}). Verdicts are final; a new finish claim gets its own verdict.", if acc { "accepted" } else { "rejected" }));
                 }
             }
+            LedgerOp::GoalMetSet { status, note, evidence } => self.validate_goal_met(*status, note, evidence)?,
+            LedgerOp::OperatorRelease { reason } => {
+                if !from_user {
+                    return Err(user_only("A release"));
+                }
+                if self.goal.is_none() {
+                    return Err("There is no goal to release the mission from: no goal has been set yet. Set the goal first.".to_string());
+                }
+                if let Some(r) = &self.release {
+                    return Err(format!("The mission was already released (reason: {}). Records are never edited.", line(&r.reason, 120)));
+                }
+                if blank(reason) {
+                    return Err(needs_text("the release", "reason"));
+                }
+            }
+            LedgerOp::ScopeGrant { hosts, .. } => {
+                if !from_user {
+                    return Err(user_only("A network scope grant"));
+                }
+                if hosts.is_empty() {
+                    return Err("A scope grant needs at least one host. List the hosts to authorize in `hosts`, one host per entry.".to_string());
+                }
+                for h in hosts {
+                    if blank(h) {
+                        return Err(needs_text("a scope grant host", "entry"));
+                    }
+                    if h.chars().any(|c| c.is_whitespace() || c == ',') {
+                        return Err(format!("The host entry `{h}` contains whitespace or a comma. Give one host per entry in `hosts`, for example [\"a.example\", \"b.example\"]."));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The rules for writing the goal-met claim (see CONTRACT).
+    fn validate_goal_met(&self, status: GoalMetStatus, note: &str, evidence: &[String]) -> Result<(), String> {
+        let Some(current) = &self.goal_met else {
+            return Err("There is no goal yet, so there is nothing to conclude. The operator sets the goal; wait for it.".to_string());
+        };
+        if status == GoalMetStatus::Open {
+            return Err("The goal-met status can only be set to supported (the goal is met) or refuted (the goal cannot be met as stated); it cannot be reopened or withdrawn. Run the target, record the run with `evidence`, then conclude.".to_string());
+        }
+        if current.status == status {
+            return Err(format!("The goal is already recorded as {}. Change it only to the other conclusion, with new execution evidence recorded after that.", goal_met_label(status)));
+        }
+        if blank(note) {
+            return Err(needs_text("the goal-met conclusion", "note") + " Say what the evidence shows about the goal.");
+        }
+        if evidence.is_empty() {
+            return Err("The goal-met conclusion needs evidence. Run the target, record the run with the `evidence` tool, and cite its id in `evidence`.".to_string());
+        }
+        self.check_evidence_ids(evidence, "the goal-met conclusion")?;
+        let cited: Vec<&Evidence> = self.evidence.iter().filter(|e| evidence.contains(&e.id)).collect();
+        if let Some(e) = cited.iter().find(|e| !(e.input.supports && e.input.attested)) {
+            return Err(format!("Evidence {} is not attested evidence that supports the conclusion, so it cannot back it. Cite only attested, supporting evidence records.", e.id));
+        }
+        let executed: Vec<&&Evidence> = cited.iter().filter(|e| e.input.kind == EvidenceKind::Execution).collect();
+        if executed.is_empty() {
+            return Err("The cited evidence is static only (something was read, nothing was run). Reading source does not show the goal is met or unmeetable: run the target, record the run with `evidence`, and cite that execution.".to_string());
+        }
+        if current.status != GoalMetStatus::Open && !executed.iter().any(|e| e.n > current.n) {
+            return Err(format!("The goal is recorded as {}. To change it, run the target again and cite execution evidence recorded after that conclusion (entry {}).", goal_met_label(current.status), current.n));
         }
         Ok(())
     }
@@ -760,6 +952,35 @@ impl LedgerState {
 
         if let Some(goal) = &self.goal {
             sections.push(format!("Goal: {goal}"));
+        }
+
+        if self.goal.is_some() || !self.scope_grants.is_empty() {
+            let mut s = String::new();
+            if let Some(gm) = &self.goal_met {
+                if gm.status == GoalMetStatus::Open {
+                    s.push_str("Goal status: open (not yet concluded)");
+                } else {
+                    let mut l = format!("Goal status: {}", goal_met_label(gm.status));
+                    if !blank(&gm.note) {
+                        l.push_str(&format!(" — {}", gm.note));
+                    }
+                    if !gm.evidence.is_empty() {
+                        l.push_str(&format!(" (evidence: {})", gm.evidence.join(", ")));
+                    }
+                    s.push_str(&line(&l, max));
+                }
+            }
+            if let Some(r) = &self.release {
+                if !s.is_empty() {
+                    s.push('\n');
+                }
+                s.push_str(&format!("released by the operator (goal not established): {}", r.reason));
+            }
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&authorized_hosts_line(&self.granted_hosts()));
+            sections.push(s);
         }
 
         let active: Vec<&Constraint> = self.constraints.iter().filter(|c| c.retired.is_none()).collect();
@@ -876,6 +1097,25 @@ impl LedgerState {
         match &self.goal {
             Some(g) => o.push_str(&format!("{g}\n")),
             None => o.push_str("(not set)\n"),
+        }
+
+        o.push_str("\n## Goal status\n\n");
+        match &self.goal_met {
+            None => o.push_str("(no goal set)\n"),
+            Some(gm) if gm.status == GoalMetStatus::Open => o.push_str("open (not yet concluded)\n"),
+            Some(gm) => {
+                o.push_str(goal_met_label(gm.status));
+                if !blank(&gm.note) {
+                    o.push_str(&format!(" — {}", md_inline(&gm.note)));
+                }
+                if !gm.evidence.is_empty() {
+                    o.push_str(&format!(" (evidence: {})", gm.evidence.join(", ")));
+                }
+                o.push_str(&format!(" (entry {})\n", gm.n));
+            }
+        }
+        if let Some(r) = &self.release {
+            o.push_str(&format!("\nreleased by the operator (goal not established): {} (entry {})\n", md_inline(&r.reason), r.n));
         }
 
         o.push_str("\n## Constraints\n\n");
@@ -1019,6 +1259,17 @@ impl LedgerState {
             o.push('\n');
         }
 
+        o.push_str("\n## Network scope\n\n");
+        o.push_str(&authorized_hosts_line(&self.granted_hosts()));
+        o.push('\n');
+        for g in &self.scope_grants {
+            o.push_str(&format!("- **{}** (entry {}): {}", g.id, g.n, md_inline(&g.hosts.join(", "))));
+            if let Some(note) = g.note.as_deref().filter(|n| !blank(n)) {
+                o.push_str(&format!(" — {}", md_inline(note)));
+            }
+            o.push('\n');
+        }
+
         o.push_str("\n## Finish claims\n\n");
         if self.finishes.is_empty() {
             o.push_str("(none)\n");
@@ -1073,6 +1324,9 @@ impl LedgerState {
             LedgerOp::QuestionAnswer { id, answer } => format!("question {id} answered: {answer}"),
             LedgerOp::FinishClaim { summary, .. } => format!("finish claimed: {summary}"),
             LedgerOp::FinishVerdict { claim, accepted, .. } => format!("finish {claim} {}", if *accepted { "accepted" } else { "rejected" }),
+            LedgerOp::GoalMetSet { status, note, .. } => format!("goal {}{}", goal_met_label(*status), suffix(note)),
+            LedgerOp::OperatorRelease { reason } => format!("released by the operator (goal not established): {reason}"),
+            LedgerOp::ScopeGrant { hosts, note } => format!("scope granted: {}{}", hosts.join(", "), suffix(note.as_deref().unwrap_or(""))),
         };
         line(&s, 200)
     }
@@ -1101,6 +1355,23 @@ fn claim_status(s: ClaimStatus) -> &'static str {
         ClaimStatus::Supported => "supported",
         ClaimStatus::Refuted => "refuted",
         ClaimStatus::Withdrawn => "withdrawn",
+    }
+}
+
+/// The single line that shows the agent its network scope.
+fn authorized_hosts_line(hosts: &[String]) -> String {
+    if hosts.is_empty() {
+        "authorized hosts: none granted".to_string()
+    } else {
+        format!("authorized hosts: {}", hosts.join(", "))
+    }
+}
+
+fn goal_met_label(s: GoalMetStatus) -> &'static str {
+    match s {
+        GoalMetStatus::Open => "open",
+        GoalMetStatus::Supported => "met",
+        GoalMetStatus::Refuted => "cannot be met as stated",
     }
 }
 
@@ -1190,6 +1461,9 @@ mod tests {
             LedgerOp::QuestionAnswer { id: "q1".into(), answer: "this".into() },
             LedgerOp::FinishClaim { summary: "done".into(), evidence: vec!["e1".into()] },
             LedgerOp::FinishVerdict { claim: "f1".into(), accepted: false, objections: vec!["no".into()], verifier: Some(SessionId::from("s-v")) },
+            LedgerOp::GoalMetSet { status: GoalMetStatus::Supported, note: "ran it".into(), evidence: vec!["e1".into()] },
+            LedgerOp::OperatorRelease { reason: "good enough".into() },
+            LedgerOp::ScopeGrant { hosts: vec!["a.example".into(), "b.example".into()], note: Some("for the crawl".into()) },
         ]
     }
 
@@ -1586,7 +1860,7 @@ mod tests {
         assert_eq!(b, rich_state().brief(&BriefOpts::default()));
         assert_eq!(LedgerState::default().brief(&BriefOpts::default()), "");
         let only_goal = build(vec![LedgerOp::GoalSet { text: "g".into() }]).brief(&BriefOpts::default());
-        assert_eq!(only_goal, "Goal: g");
+        assert_eq!(only_goal, "Goal: g\n\nGoal status: open (not yet concluded)\nauthorized hosts: none granted");
     }
 
     #[test]
@@ -1689,5 +1963,236 @@ mod tests {
         let state = rich_state();
         let json = serde_json::to_string(&state).unwrap_or_default();
         assert_eq!(serde_json::from_str::<LedgerState>(&json).ok(), Some(state));
+    }
+
+    fn static_ev(claim: &str) -> EvidenceInput {
+        EvidenceInput { kind: EvidenceKind::Static, ..ev(claim, true, true) }
+    }
+
+    /// A goal, an ordinary claim `c1`, and execution evidence `e1` (entry 3).
+    fn with_goal_and_run() -> LedgerState {
+        build(vec![LedgerOp::GoalSet { text: "g".into() }, LedgerOp::ClaimAdd { text: "it runs".into() }, LedgerOp::EvidenceAdd(ev("c1", true, true))])
+    }
+
+    fn conclude(status: GoalMetStatus, evidence: &[&str]) -> LedgerOp {
+        LedgerOp::GoalMetSet { status, note: "ran the target".into(), evidence: evidence.iter().map(|e| e.to_string()).collect() }
+    }
+
+    #[test]
+    fn goal_met_is_absent_before_a_goal_and_open_after() {
+        assert_eq!(LedgerState::default().goal_met, None);
+        assert_eq!(build(vec![LedgerOp::ClaimAdd { text: "c".into() }]).goal_met, None);
+        let s = build(vec![LedgerOp::GoalSet { text: "g".into() }]);
+        assert_eq!(s.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Open));
+        // Setting the goal again does not reopen a conclusion.
+        let s = build(vec![
+            LedgerOp::GoalSet { text: "g".into() },
+            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::EvidenceAdd(ev("c1", true, true)),
+            conclude(GoalMetStatus::Supported, &["e1"]),
+            LedgerOp::GoalSet { text: "g2".into() },
+        ]);
+        assert_eq!(s.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Supported));
+    }
+
+    #[test]
+    fn goal_met_needs_a_goal_and_execution_evidence() {
+        // before any goal
+        let s = build(vec![LedgerOp::ClaimAdd { text: "c".into() }, LedgerOp::EvidenceAdd(ev("c1", true, true))]);
+        for st in [GoalMetStatus::Supported, GoalMetStatus::Refuted] {
+            assert!(refusal(&s, conclude(st, &["e1"]), false).contains("no goal yet"));
+        }
+        let s = with_goal_and_run();
+        // model-authored: accepted from a tool call
+        assert!(s.validate(&conclude(GoalMetStatus::Supported, &["e1"]), false).is_ok());
+        assert!(s.validate(&conclude(GoalMetStatus::Refuted, &["e1"]), false).is_ok());
+        let folded = build(vec![
+            LedgerOp::GoalSet { text: "g".into() },
+            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::EvidenceAdd(ev("c1", true, true)),
+            conclude(GoalMetStatus::Refuted, &["e1"]),
+        ]);
+        let gm = folded.goal_met.unwrap_or_else(|| panic!("goal_met"));
+        assert_eq!((gm.status, gm.evidence, gm.n), (GoalMetStatus::Refuted, vec!["e1".to_string()], 4));
+        // no evidence, unknown evidence, blank note
+        assert!(refusal(&s, conclude(GoalMetStatus::Supported, &[]), false).contains("needs evidence"));
+        assert!(refusal(&s, conclude(GoalMetStatus::Supported, &["e9"]), false).contains("Existing evidence record ids: e1"));
+        let blank_note = LedgerOp::GoalMetSet { status: GoalMetStatus::Supported, note: " ".into(), evidence: vec!["e1".into()] };
+        assert!(refusal(&s, blank_note, false).contains("note"));
+        // static-only basis
+        let s = build(vec![
+            LedgerOp::GoalSet { text: "g".into() },
+            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::EvidenceAdd(static_ev("c1")),
+            LedgerOp::EvidenceAdd(ev("c1", true, true)),
+        ]);
+        for st in [GoalMetStatus::Supported, GoalMetStatus::Refuted] {
+            let m = refusal(&s, conclude(st, &["e1"]), false);
+            assert!(m.contains("static only") && m.contains("run the target"), "{m}");
+        }
+        // static plus execution is enough
+        assert!(s.validate(&conclude(GoalMetStatus::Supported, &["e1", "e2"]), false).is_ok());
+        // evidence that does not support, or is not attested, is refused
+        let s = build(vec![
+            LedgerOp::GoalSet { text: "g".into() },
+            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::EvidenceAdd(ev("c1", false, true)),
+            LedgerOp::EvidenceAdd(ev("c1", true, false)),
+        ]);
+        assert!(refusal(&s, conclude(GoalMetStatus::Supported, &["e1"]), false).contains("not attested evidence that supports"));
+        assert!(refusal(&s, conclude(GoalMetStatus::Supported, &["e2"]), false).contains("not attested evidence that supports"));
+    }
+
+    #[test]
+    fn goal_met_cannot_be_withdrawn_or_repeated() {
+        let s = with_goal_and_run();
+        let m = refusal(&s, conclude(GoalMetStatus::Open, &["e1"]), false);
+        assert!(m.contains("cannot be reopened or withdrawn"), "{m}");
+        // No wire spelling of a withdrawn status exists.
+        let w: Result<LedgerOp, _> = serde_json::from_str(r#"{"op":"goal_met_set","status":"withdrawn"}"#);
+        assert!(w.is_err());
+        // A forged Open entry cannot retract a conclusion.
+        let mut s = build(vec![
+            LedgerOp::GoalSet { text: "g".into() },
+            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::EvidenceAdd(ev("c1", true, true)),
+            conclude(GoalMetStatus::Supported, &["e1"]),
+        ]);
+        s.apply(&entry(5, LedgerOp::GoalMetSet { status: GoalMetStatus::Open, note: String::new(), evidence: vec![] }));
+        assert_eq!(s.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Supported));
+        // The same conclusion again is refused; the other one needs execution evidence recorded after it.
+        assert!(refusal(&s, conclude(GoalMetStatus::Supported, &["e1"]), false).contains("already recorded as met"));
+        let m = refusal(&s, conclude(GoalMetStatus::Refuted, &["e1"]), false);
+        assert!(m.contains("run the target again") && m.contains("entry 4"), "{m}");
+        s.apply(&entry(5, LedgerOp::EvidenceAdd(static_ev("c1"))));
+        assert!(refusal(&s, conclude(GoalMetStatus::Refuted, &["e2"]), false).contains("static only"));
+        s.apply(&entry(6, LedgerOp::EvidenceAdd(ev("c1", true, true))));
+        assert!(s.validate(&conclude(GoalMetStatus::Refuted, &["e3"]), false).is_ok());
+        s.apply(&entry(7, conclude(GoalMetStatus::Refuted, &["e3"])));
+        assert_eq!(s.goal_met.as_ref().map(|g| (g.status, g.n)), Some((GoalMetStatus::Refuted, 7)));
+    }
+
+    #[test]
+    fn goal_met_is_not_an_ordinary_open_claim() {
+        let s = build(vec![
+            LedgerOp::GoalSet { text: "g".into() },
+            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::EvidenceAdd(ev("c1", true, true)),
+            LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: String::new() },
+        ]);
+        assert_eq!(s.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Open));
+        assert!(s.open_items().claims.is_empty());
+        assert!(s.open_items().is_empty());
+        assert_eq!(s.claims.len(), 1);
+        assert!(s.validate(&LedgerOp::FinishClaim { summary: "done".into(), evidence: vec![] }, false).is_ok());
+    }
+
+    #[test]
+    fn goal_met_is_rendered_in_brief_and_markdown() {
+        let open = build(vec![LedgerOp::GoalSet { text: "g".into() }]);
+        assert!(open.brief(&BriefOpts::default()).contains("Goal status: open (not yet concluded)"));
+        assert!(open.render_markdown().contains("## Goal status\n\nopen (not yet concluded)"));
+        assert!(LedgerState::default().render_markdown().contains("(no goal set)"));
+        let ops = |st| {
+            vec![
+                LedgerOp::GoalSet { text: "g".into() },
+                LedgerOp::ClaimAdd { text: "c".into() },
+                LedgerOp::EvidenceAdd(ev("c1", true, true)),
+                conclude(st, &["e1"]),
+            ]
+        };
+        let met = build(ops(GoalMetStatus::Supported));
+        assert!(met.brief(&BriefOpts::default()).contains("Goal status: met — ran the target (evidence: e1)"));
+        assert!(met.render_markdown().contains("met — ran the target (evidence: e1) (entry 4)"));
+        let no = build(ops(GoalMetStatus::Refuted));
+        assert!(no.brief(&BriefOpts::default()).contains("Goal status: cannot be met as stated — ran the target (evidence: e1)"));
+        assert!(!no.brief(&BriefOpts::default()).contains("not yet concluded"));
+    }
+
+    #[test]
+    fn release_is_operator_only_and_never_reads_as_success() {
+        let with_goal = build(vec![LedgerOp::GoalSet { text: "g".into() }]);
+        let op = LedgerOp::OperatorRelease { reason: "good enough for now".into() };
+        let m = refusal(&with_goal, op.clone(), false);
+        assert!(m.contains("operator's own words") && m.contains("cannot be written by a tool call"), "{m}");
+        assert!(with_goal.validate(&op, true).is_ok());
+        let blank_reason = LedgerOp::OperatorRelease { reason: "  ".into() };
+        assert!(refusal(&with_goal, blank_reason, true).contains("reason"));
+        let m = refusal(&LedgerState::default(), op.clone(), true);
+        assert!(m.contains("no goal has been set"), "{m}");
+        let released = build(vec![LedgerOp::GoalSet { text: "g".into() }, op.clone()]);
+        assert_eq!(released.release, Some(Release { reason: "good enough for now".into(), n: 2 }));
+        assert!(refusal(&released, op, true).contains("already released"));
+        let b = released.brief(&BriefOpts::default());
+        assert!(b.contains("released by the operator (goal not established): good enough for now"), "{b}");
+        assert!(b.contains("Goal status: open (not yet concluded)"), "{b}");
+        let md = released.render_markdown();
+        assert!(md.contains("released by the operator (goal not established): good enough for now (entry 2)"), "{md}");
+        // A release leaves the goal-met claim alone.
+        assert_eq!(released.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Open));
+    }
+
+    #[test]
+    fn scope_grants_are_operator_only_and_listed() {
+        let s = build(vec![LedgerOp::GoalSet { text: "g".into() }]);
+        let grant = |hosts: &[&str]| LedgerOp::ScopeGrant { hosts: hosts.iter().map(|h| h.to_string()).collect(), note: None };
+        let m = refusal(&s, grant(&["a.example"]), false);
+        assert!(m.contains("operator's own words") && m.contains("cannot be written by a tool call"), "{m}");
+        assert!(s.validate(&grant(&["a.example", "*.b.example", "10.0.0.1:8080"]), true).is_ok());
+        assert!(refusal(&s, grant(&[]), true).contains("at least one host"));
+        assert!(refusal(&s, grant(&["a.example", " "]), true).contains("entry"));
+        assert!(refusal(&s, grant(&[""]), true).contains("entry"));
+        for bad in ["a.example,b.example", "a.example b.example", " a.example", "a.example\n"] {
+            let m = refusal(&s, grant(&[bad]), true);
+            assert!(m.contains("one host per entry"), "{bad:?}: {m}");
+        }
+        // none granted
+        let b = s.brief(&BriefOpts::default());
+        assert!(b.contains("authorized hosts: none granted"), "{b}");
+        assert!(s.granted_hosts().is_empty());
+        // grants accumulate, de-duplicated, first-seen order
+        let s = build(vec![
+            LedgerOp::GoalSet { text: "g".into() },
+            LedgerOp::ScopeGrant { hosts: vec!["b.example".into(), "a.example".into()], note: Some("crawl".into()) },
+            LedgerOp::ScopeGrant { hosts: vec!["A.example".into(), "c.example".into(), "b.example".into()], note: None },
+        ]);
+        assert_eq!(s.granted_hosts(), ["b.example", "a.example", "c.example"]);
+        assert_eq!(s.scope_grants.iter().map(|g| (g.id.as_str(), g.n)).collect::<Vec<_>>(), [("s1", 2), ("s2", 3)]);
+        let b = s.brief(&BriefOpts::default());
+        assert!(b.contains("authorized hosts: b.example, a.example, c.example"), "{b}");
+        let md = s.render_markdown();
+        assert!(md.contains("authorized hosts: b.example, a.example, c.example"), "{md}");
+        assert!(md.contains("- **s1** (entry 2): b.example, a.example — crawl"), "{md}");
+        assert!(md.contains("- **s2** (entry 3): A.example, c.example, b.example"), "{md}");
+        assert!(build(vec![LedgerOp::GoalSet { text: "g".into() }]).render_markdown().contains("authorized hosts: none granted"));
+    }
+
+    #[test]
+    fn a_journal_written_before_these_records_still_folds() {
+        // The entries as the base version wrote them: no goal-met, release or scope-grant fields anywhere.
+        let lines = [
+            r#"{"n":1,"ts_ms":1,"session":"s-1","from_user":true,"op":"goal_set","text":"g","mac":""}"#,
+            r#"{"n":2,"ts_ms":2,"session":"s-1","op":"claim_add","text":"c","mac":""}"#,
+            r#"{"n":3,"ts_ms":3,"session":"s-1","op":"plan_add","text":"p","mac":""}"#,
+        ];
+        let entries: Vec<Entry> = lines.iter().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        assert_eq!(entries.len(), 3);
+        let s = LedgerState::fold(&entries);
+        assert_eq!(s.entries, 3);
+        assert_eq!(s.release, None);
+        assert!(s.scope_grants.is_empty());
+        assert_eq!(s.granted_hosts(), Vec::<String>::new());
+        // A goal opens the goal-met claim; that is the only non-empty new field.
+        assert_eq!(s.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Open));
+        let goalless = LedgerState::fold(&entries[1..]);
+        assert_eq!((goalless.goal_met, goalless.release, goalless.scope_grants), (None, None, vec![]));
+        // A persisted state without the new keys deserializes with the empty defaults.
+        let old = r#"{"goal":"g","constraints":[],"plan":[],"decisions":[],"dead_ends":[],"claims":[],"evidence":[],"obligations":[],"approvals":[],"questions":[],"finishes":[],"entries":1}"#;
+        let st: Result<LedgerState, _> = serde_json::from_str(old);
+        let st = st.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((st.goal_met, st.release, st.scope_grants), (None, None, vec![]));
+        // Optional fields may be absent on the wire for the new ops.
+        let op: Result<LedgerOp, _> = serde_json::from_str(r#"{"op":"scope_grant","hosts":["a.example"]}"#);
+        assert!(matches!(op, Ok(LedgerOp::ScopeGrant { note: None, .. })));
     }
 }

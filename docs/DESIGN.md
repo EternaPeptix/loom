@@ -410,6 +410,36 @@ enforced on write (`LedgerState::validate`):
   unanswered blocking questions (and open obligations);
 - records are never edited: updates are new ops.
 
+Three further records. None has a model-facing id except the scope grant's `s1…` in the Markdown view;
+the first two are singletons.
+
+- **Goal-met claim** (`goal_met`, written by `GoalMetSet`, model-authored). A harness-held claim about
+  whether the goal is met, separate from the goal text (operator only) and from `claims`: it is never
+  counted among open claims and never blocks `finish`. It is absent before a goal is set and `open` from
+  the `GoalSet` on; its other states are `supported` (the goal is met) and `refuted` (the goal cannot be
+  met as stated). There is no withdrawn state and `open` is never a write target, so the model can move
+  it toward a conclusion but never retract it. A write needs a goal, a note, and cited evidence ids that
+  all exist and are attested and supporting, at least one of kind `execution` (a static-only basis is
+  refused: run the target and cite the run). A concluded claim may be written again only with the other
+  terminal state and at least one execution evidence record added after the entry that set the current
+  state. A later gate and verifier check the claim; the ledger only holds it.
+- **Operator release** (`release`, written by `OperatorRelease`, operator only). The operator accepts the
+  result short of the goal and the work may stop. A reason is required, a goal must be set, and only one
+  release is recorded. It never changes `goal_met`; the views show it as `released by the operator (goal
+  not established): <reason>`. Never evicted.
+- **Scope grant** (`scope_grants`, written by `ScopeGrant`, operator only). The network hosts the
+  operator authorized for the mission, with an optional note: the ledger's audit account, not the
+  enforcement (the proxy and the configuration own host syntax and policy). The list must be non-empty,
+  each entry non-blank and free of whitespace and commas (one host per entry); hosts are kept as
+  written. `LedgerState::granted_hosts()` returns all hosts granted so far, de-duplicated ignoring ASCII
+  case, in first-seen order. Never evicted.
+
+`brief()` shows, right after the goal, `Goal status: open (not yet concluded)` / `met — <note>
+(evidence: …)` / `cannot be met as stated — <note> (evidence: …)`, the release line when present, and
+`authorized hosts: a, b, c` (or `none granted`). `render_markdown()` has the sections Goal status and
+Network scope. A journal written before these records existed folds unchanged; the new state fields
+default to empty.
+
 **Evidence** (the `evidence` tool, `loom-agent::rtools::ledger`). The model names a claim, a stored
 output by handle, a line range, a quote and a note. The harness:
 
