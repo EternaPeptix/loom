@@ -22,7 +22,8 @@
 //!   error object inside a 200 stream);
 //! - **retry, until 3 attempts in a row have failed this way** (the third is the last: it returns
 //!   `ModelError::Unavailable` whatever the window): a failure waiting cannot cure — a 200 whose body
-//!   is not an event stream, `AssembleError::Malformed`, a clean end of stream with no
+//!   is not an event stream, `AssembleError::Malformed`, `AssembleError::Oversize` (a stream line, event
+//!   or completion over its size limit), a clean end of stream with no
 //!   `finish_reason`, and send errors that are not about reaching the server (request building, TLS
 //!   certificate or protocol, an answer that is not HTTP). A send error is sorted by its causes, never
 //!   by its own text, which carries the request URL. These count together; a failure of the plain

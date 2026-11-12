@@ -106,7 +106,7 @@ pub const MAX_COMPLETION_BYTES: usize = 64 * 1024 * 1024;
 
 fn oversize(what: &str, limit: usize) -> AssembleError {
     AssembleError::Oversize(format!(
-        "{what} exceeds the limit of {} MiB; the server is not sending a well-formed OpenAI-compatible stream",
+        "{what} exceeds the limit of {} MiB",
         limit / (1024 * 1024)
     ))
 }
@@ -115,10 +115,10 @@ fn oversize(what: &str, limit: usize) -> AssembleError {
 pub struct SseParser {
     /// Bytes of the line being received (no complete line is ever kept here).
     buf: Vec<u8>,
-    /// `data:` values of the event being received.
-    data: Vec<String>,
-    /// Bytes held in `data`, each line counted with its separator.
-    data_bytes: usize,
+    /// `data:` values of the event being received, joined with `\n`.
+    data: String,
+    /// Whether the event being received has any `data:` line (its payload may still be empty).
+    has_data: bool,
 }
 
 impl SseParser {
@@ -132,8 +132,8 @@ impl SseParser {
         let result = self.feed_inner(chunk);
         if result.is_err() {
             self.buf = Vec::new();
-            self.data = Vec::new();
-            self.data_bytes = 0;
+            self.data = String::new();
+            self.has_data = false;
         }
         result
     }
@@ -155,21 +155,24 @@ impl SseParser {
             let line = String::from_utf8_lossy(line).into_owned();
             start = end + 1;
             if line.is_empty() {
-                if !self.data.is_empty() {
-                    let payload = self.data.join("\n");
-                    self.data.clear();
-                    self.data_bytes = 0;
+                if self.has_data {
+                    let payload = std::mem::take(&mut self.data);
+                    self.has_data = false;
                     if !payload.is_empty() {
                         out.push(payload);
                     }
                 }
             } else if let Some(value) = line.strip_prefix("data:") {
                 let value = value.strip_prefix(' ').unwrap_or(value);
-                self.data_bytes = self.data_bytes.saturating_add(value.len()).saturating_add(1);
-                if self.data_bytes > MAX_EVENT_BYTES {
+                let separator = usize::from(self.has_data);
+                if self.data.len().saturating_add(separator).saturating_add(value.len()) > MAX_EVENT_BYTES {
                     return Err(oversize("an event of the event stream", MAX_EVENT_BYTES));
                 }
-                self.data.push(value.to_string());
+                if self.has_data {
+                    self.data.push('\n');
+                }
+                self.data.push_str(value);
+                self.has_data = true;
             }
             // Comments (`:`) and every other field are ignored.
         }
@@ -306,7 +309,10 @@ impl Assembler {
             }
             let acc = self.calls.entry(index).or_default();
             if acc.id.is_none() {
-                acc.id = str_member(tc, "id").filter(|s| !s.is_empty()).map(str::to_string);
+                if let Some(id) = str_member(tc, "id").filter(|s| !s.is_empty()) {
+                    self.call_bytes = grow(self.call_bytes, id.len(), "the tool-call arguments")?;
+                    acc.id = Some(id.to_string());
+                }
             }
             let function = tc.get("function");
             if let Some(name) = function.and_then(|f| str_member(f, "name")).filter(|s| !s.is_empty()) {
@@ -533,17 +539,51 @@ mod tests {
                 Ok(out) => assert!(out.is_empty()),
                 Err(e) => break e,
             }
-            assert!(p.data_bytes <= MAX_EVENT_BYTES && p.buf.len() <= chunk.len(), "held {} + {}", p.data_bytes, p.buf.len());
+            assert!(p.data.len() <= MAX_EVENT_BYTES && p.buf.len() <= chunk.len(), "held {} + {}", p.data.len(), p.buf.len());
             assert!(fed <= MAX_EVENT_BYTES + chunk.len(), "no error after {fed} bytes");
         };
         assert!(matches!(&err, AssembleError::Oversize(m) if m.contains("an event") && m.contains("16 MiB")), "{err}");
-        assert!(p.data.is_empty() && p.data_bytes == 0);
+        assert!(p.data.capacity() == 0 && !p.has_data);
         // Events that do end do not add up.
         let mut p = SseParser::new();
         let ended = format!("{line}\n").repeat(64).into_bytes();
         for _ in 0..1000 {
             assert_eq!(p.feed(&ended).unwrap().len(), 64);
         }
+    }
+
+    #[test]
+    fn parser_memory_for_an_endless_event_of_tiny_lines_is_bounded() {
+        // Empty `data:` lines cost one byte each in the single event buffer, not an allocation each.
+        let chunk = "data:\n".repeat(64 * 1024).into_bytes();
+        let mut p = SseParser::new();
+        let mut fed = 0usize;
+        let err = loop {
+            fed += chunk.len();
+            match p.feed(&chunk) {
+                Ok(out) => assert!(out.is_empty()),
+                Err(e) => break e,
+            }
+            assert!(p.data.capacity() <= 2 * MAX_EVENT_BYTES, "capacity {}", p.data.capacity());
+            assert!(fed <= 8 * MAX_EVENT_BYTES, "no error after {fed} bytes");
+        };
+        assert!(matches!(&err, AssembleError::Oversize(m) if m.contains("an event")), "{err}");
+    }
+
+    #[test]
+    fn assembler_counts_tool_call_ids_toward_the_limit() {
+        let id = "i".repeat(1024 * 1024);
+        let mut a = Assembler::new();
+        let mut accepted = 0usize;
+        let err = loop {
+            let delta = format!(r#"{{"tool_calls":[{{"index":{accepted},"id":"{id}"}}]}}"#);
+            match a.push(&chunk(&delta, "null")) {
+                Ok(_) => accepted += 1,
+                Err(e) => break e,
+            }
+            assert!(accepted <= 70, "no error after {accepted} ids");
+        };
+        assert!(accepted <= 64 && matches!(err, AssembleError::Oversize(_)), "{accepted} {err}");
     }
 
     #[test]
