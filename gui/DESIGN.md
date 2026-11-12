@@ -81,8 +81,11 @@ For a `.sshTunnel` connection, `connect()`:
    request refused. First it waits (bounded, ~3 s) for the ssh child of the previous tunnel to exit,
    so that loom-desk's own dying listener is not taken for someone else's. If something then listens
    on 127.0.0.1:<port> (or ssh reports "Address already in use") the connection fails with a message
-   naming the port, saying loom-desk needs it free for this connection, and what to do (close what
-   uses it, or use a Direct connection). There is no random port and no pick-then-release. Other bind
+   naming the port, saying loom-desk needs it free for this connection, and what to do: any forward
+   must use the daemon's own port number on both ends, so stop whatever listens on that port, or move
+   one of the daemons to another port with `[daemon] bind` in its config (if the remote one moves,
+   change the connection's port to match). It suggests no forward on another local port: the daemon
+   would refuse every request through it. There is no random port and no pick-then-release. Other bind
    failures (e.g. "Permission denied" for a port below 1024) are reported with ssh's own words;
 2. spawns `ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
    -o ControlMaster=no -o ControlPath=none -L 127.0.0.1:<port>:127.0.0.1:<port> -- <sshHost>` as a
@@ -118,8 +121,9 @@ child is still the current one at the moment it is delivered on the main actor.
 ## Daemon client (`Net/DaemonClient.swift`)
 
 Talks to the active `baseURL` with `Authorization: Bearer <token>`. Every attempt, and the snapshot after
-an ended stream, is preceded by the `/healthz` nonce proof; a wrong proof fails the link and an
-unreachable daemon is retried without the token being sent. Two jobs:
+an ended stream, is preceded by the `/healthz` nonce proof; a wrong proof, or a 403 refusing the address
+(the local port differs from the daemon's own), fails the link, and an unreachable daemon is retried;
+the token is not sent in any of these cases. Two jobs:
 
 - **Counts**, for the menu bar and status line: subscribe to `GET /api/events` (SSE). Frames carry
   only `data:` (no `event:` line); the kind is the JSON `type` (`session`, `status`, `record`,
@@ -147,12 +151,20 @@ answer `{"ok": true, "proof": "<hex>"}` with proof = HMAC-SHA256 keyed with the 
 ASCII `loom-healthz-v1:` followed by N, compared in constant time. This is done on connect, before every
 login code request, and at the start of every attempt of the daemon client and again before the snapshot
 that follows an ended stream (a wrong answer after connect turns the link to failed with that message).
-When a 200 answer's proof is missing or wrong, or any other answer below 500 carries proof JSON (only a
-200 proves, even when the proof in another answer is right), the token is not sent and the app says that
-something answered but did not prove it is the daemon for this token, and that a daemon older than the
-app must be restarted on the new version. A 5xx answer, a non-200 answer without proof JSON, or no
-answer at all means the daemon is unreachable, and the token is not sent either. On connect, and before
-a login code request, that fails the attempt: the link or the pane shows the error with "Reconnect to
+A 403 answer means the daemon refused the address: its `Host` check failed because the local port
+differs from its own. The token is not sent and the link fails (it is not retried, whatever the body
+says). For a loopback http address the app says the local port must be the same as the daemon's port
+(when the answer lacks the daemon's `{"error": ...}` body: that something refused the address, and that
+if it is the daemon the port must match); for any other address, where a proxy or another server may be
+the one refusing, it says only that something refused the request (HTTP 403). The daemon's `error`
+sentence, when there is one, is quoted after a cut to 200 characters with control and format
+characters removed (the responder has proven nothing). Otherwise, when a 200 answer's proof is missing
+or wrong, or any other answer below 500 carries proof JSON (only a 200 proves, even when the proof in
+another answer is right), the token is not sent and the app says that something answered but did not
+prove it is the daemon for this token, and that a daemon older than the app must be restarted on the
+new version. A 5xx answer, a non-200 answer without proof JSON, or no answer at all means the daemon is
+unreachable, and the token is not sent either. On connect, and before a login code request, that fails
+the attempt: the link or the pane shows the error with "Reconnect to
 retry" and the operator retries. The daemon client instead retries by itself; meanwhile the status line
 reads "daemon unreachable, retrying" with the error, and the link is not shown as connected. Then the
 app (which holds the token) sends `POST <baseURL>/api/login-codes` with `Authorization: Bearer <token>`;
@@ -164,7 +176,8 @@ and loads exactly that one URL. Reload and retry build a new web view rather tha
 the old document's code is spent, and loading another `#code=` URL into the same document would only
 change its fragment (WebKit does not reload for that) and run nothing. There is no fallback for daemons
 without login codes (they cannot prove their identity either): the token is never in a URL. Thereafter
-the UI drives itself (`fetch` with a bearer secret, and the event stream read with `fetch`, not `EventSource`, to the daemon through the tunnel). The pane:
+the UI drives itself: it calls the daemon with `fetch` and a bearer secret, and reads the event stream
+with `fetch` too (not `EventSource`), through the tunnel. The pane:
 
 - restricts navigation to the `baseURL` origin (loopback): a navigation action to any other origin is
   cancelled and opened in the default browser instead (so links in fetched pages don't hijack the

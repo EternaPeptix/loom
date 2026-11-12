@@ -138,7 +138,8 @@ final class DaemonClient: @unchecked Sendable {
 
     enum IdentityOutcome: Equatable {
         case proven
-        case mismatch(String)       // answered, but did not prove it is this token's daemon (a sentence for the operator)
+        case mismatch(String)       // answered, but did not prove it is this token's daemon, or refused the address
+                                    // (a 403): a sentence for the operator; the link fails, no retry
         case unreachable(String)    // no usable answer (network error, 5xx, no proof JSON): the error text; retry later
 
         /// The sentence a one-shot caller (connect, a login-code request) shows when the token must not be
@@ -159,11 +160,14 @@ final class DaemonClient: @unchecked Sendable {
 
     static func unreachableMessage(_ error: String) -> String { "\(unreachableModePrefix) (\(error))" }
 
-    /// Sorts one answer of `/healthz?nonce=`: 5xx, or a non-200 without proof JSON (a restarting daemon behind
-    /// a TLS proxy), is unreachable; a 200 whose proof is missing or wrong, or any other non-5xx answer
-    /// carrying proof JSON (right or wrong: only a 200 proves), is a mismatch.
+    /// Sorts one answer of `/healthz?nonce=`. A 403 means the daemon refused the address (its Host check:
+    /// the local port differs from its own); it is a mismatch with `refusedAddressMessage`, so the link
+    /// fails and is not retried, whatever the body says. Otherwise 5xx, or a non-200 without proof JSON (a
+    /// restarting daemon behind a TLS proxy), is unreachable; a 200 whose proof is missing or wrong, or any
+    /// other non-5xx answer carrying proof JSON (right or wrong: only a 200 proves), is a mismatch. The token
+    /// is sent in none of these cases.
     static func classifyIdentity(status: Int, data: Data, token: String, nonce: String, baseURL: String) -> IdentityOutcome {
-        if status == 403 { return .mismatch(refusedAddressMessage(data)) }
+        if status == 403 { return .mismatch(refusedAddressMessage(data, baseURL: baseURL)) }
         let proof = parseIdentityProof(data)
         if status >= 500 || (status != 200 && proof == nil) { return .unreachable("HTTP \(status)") }
         guard status == 200, let proof,
@@ -211,14 +215,51 @@ final class DaemonClient: @unchecked Sendable {
             + "If the daemon is older than this app, restart it on the new version; otherwise check the address and the token."
     }
 
-    /// A 403 from `/healthz`: the daemon refused the address (its Host check: the local port differs from its
-    /// own). The daemon's own message when the body has one (`{"error": ...}` or `{"message": ...}`).
-    static func refusedAddressMessage(_ data: Data) -> String {
-        struct Body: Decodable { var error: String?; var message: String? }
-        let said = (try? JSONDecoder().decode(Body.self, from: data)).flatMap { $0.error ?? $0.message }
-        let base = "the daemon refused this address: the local port must be the same as the daemon's port"
-        if let said, !said.isEmpty { return base + " (\(said)). The token was not sent." }
-        return base + ". The token was not sent."
+    /// A 403 from `/healthz`. The daemon sends one, with `{"error": "<sentence>"}`, when the `Host` names a
+    /// port other than its own (an address on a different local port). The port is blamed only for a
+    /// loopback http address (a tunnel, or a Direct connection to this machine): behind an https proxy the
+    /// cause is the Host the proxy forwards, and anything else may answer 403 too. The responder has proven
+    /// nothing, so its words are quoted only through `refusalText` (bounded, no control characters).
+    static func refusedAddressMessage(_ data: Data, baseURL: String) -> String {
+        let said = refusalText(data)
+        let quote = said.map { s in " It said: \"\(s)\"" + (s.last.map { ".!?".contains($0) } == true ? "" : ".") } ?? ""
+        if isLoopbackHTTP(baseURL) {
+            if said != nil {
+                return "the daemon refused this address (HTTP 403): the local port must be the same as the daemon's port, "
+                    + "so the token was not sent." + quote
+            }
+            return "something on \(baseURL) refused this address (HTTP 403), so the token was not sent. "
+                + "If it is the loom daemon, the local port must be the same as the daemon's port."
+        }
+        return "something on \(baseURL) refused the request (HTTP 403), so the token was not sent. Check the address." + quote
+    }
+
+    /// The most of a refusal's text that is shown.
+    static let refusalTextLimit = 200
+
+    /// The `error` sentence of a `{"error": "..."}` body, made safe to show: control and format characters
+    /// (newlines, escapes, bidirectional overrides) become spaces, runs of whitespace one space, and the
+    /// result is cut to `refusalTextLimit` characters (then "…"). Nil when there is no such text.
+    static func refusalText(_ data: Data) -> String? {
+        struct Body: Decodable { var error: String? }
+        guard let raw = (try? JSONDecoder().decode(Body.self, from: data))?.error else { return nil }
+        var shown = String.UnicodeScalarView()
+        for s in raw.unicodeScalars {
+            switch s.properties.generalCategory {
+            case .control, .format, .lineSeparator, .paragraphSeparator: shown.append(" ")
+            default: shown.append(s)
+            }
+        }
+        let text = String(shown).split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        if text.isEmpty { return nil }
+        return text.count > refusalTextLimit ? String(text.prefix(refusalTextLimit)) + "…" : text
+    }
+
+    /// Plain http to this machine (127.0.0.1, localhost, [::1]): a tunnel's address, or a Direct
+    /// connection to a daemon here.
+    static func isLoopbackHTTP(_ base: String) -> Bool {
+        guard let u = URL(string: base), u.scheme?.lowercased() == "http", let h = u.host?.lowercased() else { return false }
+        return ["127.0.0.1", "localhost", "::1", "[::1]"].contains(h)
     }
 
     /// `GET <base>/healthz?nonce=<N>` (no token is sent): the daemon must answer with the HMAC proof for
@@ -623,10 +664,38 @@ final class DaemonClient: @unchecked Sendable {
         let n1 = randomNonce(), n2 = randomNonce()
         chk(n1?.count == 64 && n1 != n2 && n1?.utf8.allSatisfy({ ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66) }) == true,
             "nonce: \(n1 ?? "nil")")
-        chk(cls(403, Data()) == .mismatch(refusedAddressMessage(Data())), "identity 403 refused")
-        chk(cls(403, okBody) == .mismatch(refusedAddressMessage(Data())), "identity 403 never proves")
-        chk(!refusedAddressMessage(Data()).contains("older than this app"), "403 is not a version problem")
-        chk(refusedAddressMessage(Data("{\"error\":\"bad Host\"}".utf8)).contains("(bad Host)"), "403 daemon message")
+        // A 403: the address is refused, the link fails (a mismatch, never retried), whatever the body says.
+        let hostRefusal = Data("{\"error\":\"This address is not the loom daemon's own (Host header).\"}".utf8)
+        let lo = "http://127.0.0.1:7878"
+        chk(cls(403, Data()) == .mismatch(refusedAddressMessage(Data(), baseURL: "http://h")), "identity 403 refused")
+        chk(cls(403, okBody) == .mismatch(refusedAddressMessage(okBody, baseURL: "http://h")), "identity 403 never proves")
+        chk(classifyIdentity(status: 403, data: hostRefusal, token: ptok, nonce: pnonce, baseURL: lo)
+            == .mismatch(refusedAddressMessage(hostRefusal, baseURL: lo)), "identity 403 from the daemon")
+        let r403 = refusedAddressMessage(hostRefusal, baseURL: lo)
+        chk(r403.hasPrefix("the daemon refused this address (HTTP 403): the local port must be the same as the daemon's port")
+            && r403.contains("the token was not sent"), "403 on loopback: \(r403)")
+        chk(r403.hasSuffix(" It said: \"This address is not the loom daemon's own (Host header).\""), "403 quote: \(r403)")
+        chk(!r403.contains(".\".") && !r403.contains(".)."), "403 doubled period: \(r403)")
+        chk(!r403.contains("older than this app"), "403 is not a version problem")
+        chk(refusedAddressMessage(Data("{\"error\":\"bad Host\"}".utf8), baseURL: lo).hasSuffix(" It said: \"bad Host\"."),
+            "403 quote without a period")
+        let r403bare = refusedAddressMessage(Data(), baseURL: lo)
+        chk(r403bare.contains("If it is the loom daemon, the local port must be the same") && !r403bare.contains("It said"),
+            "403 on loopback without the daemon's body: \(r403bare)")
+        let r403proxy = refusedAddressMessage(hostRefusal, baseURL: "https://studio.example.com")
+        chk(!r403proxy.contains("local port") && r403proxy.contains("refused the request (HTTP 403)"), "403 over https: \(r403proxy)")
+        // What a 403's body says is bounded and stripped of control characters before it is shown.
+        let longBody = Data("{\"error\":\"\(String(repeating: "x", count: 1000))\"}".utf8)
+        let longText = refusalText(longBody)
+        chk(longText?.count == refusalTextLimit + 1 && longText?.hasSuffix("…") == true, "refusal text not bounded: \(longText?.count ?? -1)")
+        chk(refusedAddressMessage(longBody, baseURL: lo).count < refusalTextLimit + 200, "403 message not bounded")
+        let odd = refusalText(Data("{\"error\":\"a\\nb\\u001b[31mc\\u202ed\\t e\\u2028f\"}".utf8))
+        chk(odd == "a b [31mc d e f", "refusal text not cleaned: \(odd ?? "nil")")
+        chk(refusalText(Data("{\"error\":\" \\n \"}".utf8)) == nil, "blank refusal text kept")
+        chk(refusalText(Data("{\"message\":\"m\"}".utf8)) == nil && refusalText(Data("<html>".utf8)) == nil, "not the daemon's body")
+        chk(isLoopbackHTTP(lo) && isLoopbackHTTP("http://[::1]:7878") && isLoopbackHTTP("http://LOCALHOST:1"), "loopback http")
+        chk(!isLoopbackHTTP("https://127.0.0.1:7878") && !isLoopbackHTTP("http://127.0.0.1.evil.com") && !isLoopbackHTTP("http://h"),
+            "not loopback http")
         chk(identityMismatchMessage("http://127.0.0.1:7878").contains("restart it on the new version"), "mismatch message")
         return f
     }
