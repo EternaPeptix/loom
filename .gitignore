@@ -2,3 +2,6 @@
 /bin
 /.claude
 .DS_Store
+
+# built app bundle
+gui/dist/
