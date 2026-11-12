@@ -56,6 +56,6 @@ termination = "free"
 read_only = true
 tools = [
   "bash", "job_wait", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
-  "note", "pin", "log_search",
+  "pin", "log_search",
   "cve_lookup", "cve_search", "advisory_lookup",
 ]

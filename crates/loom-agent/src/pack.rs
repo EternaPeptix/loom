@@ -660,6 +660,8 @@ mod tests {
         let vr = p.get("vr").unwrap();
         assert_eq!(vr.roles["researcher"].verifier.as_deref(), Some("judge"));
         assert!(vr.roles["chat"].read_only);
+        // A chat session keeps no ledger, so `note` could only fail.
+        assert!(!vr.roles["chat"].tools.iter().any(|t| t == "note") && vr.roles["chat"].tools.iter().any(|t| t == "pin"));
         assert!(vr.roles["scout"].may_spawn.is_empty());
         for pack in ["core", "vr"] {
             let pack = p.get(pack).unwrap();

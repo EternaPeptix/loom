@@ -238,6 +238,14 @@ impl Shared {
         journal.state().map_err(|e| journal_sentence(&e))
     }
 
+    /// The ledger, and how many of its entries this build could not read (sealed by a newer loom) and so
+    /// left out of it.
+    pub fn ledger_with_skipped(&self) -> Result<(LedgerState, u64), String> {
+        let journal = self.journal.as_ref().ok_or_else(|| NO_MISSION.to_string())?;
+        let read = journal.read_report().map_err(|e| journal_sentence(&e))?;
+        Ok((LedgerState::fold(&read.entries), read.unknown))
+    }
+
     /// Append one op to the mission journal as this session and emit the `ledger` record. A rule
     /// refusal comes back verbatim (it is already addressed to the model).
     pub fn ledger_append(&self, from_user: bool, op: LedgerOp) -> Result<(Entry, LedgerState), String> {
@@ -265,6 +273,33 @@ fn journal_sentence(e: &JournalError) -> String {
             "The mission journal could not be used ({other}). This is a harness fault, not a problem with the call; nothing was recorded."
         ),
     }
+}
+
+/// The producer of the stored output `blob` (cited as `handle`) when it is an observation, so that a quote
+/// from it may be recorded as support: the output of a command run or a file read. Refused, with a sentence
+/// for the model, when no tool call of the mission produced it, or when the producer is a runtime tool (the
+/// ledger or a log search play the model's own words back, the agent tools return another agent's) or of
+/// class `State`, `Terminal` or `Write` (the diff of the model's own `write` or `edit`). A view stores
+/// nothing of its own and is judged by the output it views.
+pub(crate) async fn observed_producer(
+    shared: &Shared,
+    mission: &MissionId,
+    handle: &str,
+    blob: &BlobId,
+) -> Result<Producer, String> {
+    let Some(producer) = shared.orch.producer(mission, blob).await else {
+        return Err(format!(
+            "{handle} was not produced by a tool call of this mission, so it cannot be used as evidence. Evidence is a quote from the output of a command you ran or a file you read."
+        ));
+    };
+    let not_observed = matches!(producer.class, ToolClass::State | ToolClass::Terminal | ToolClass::Write);
+    if not_observed || NAMES.contains(&producer.tool.as_str()) {
+        return Err(format!(
+            "{handle} is the result of `{}`, which is a message from the harness or from another agent, or your own words played back, not an observation. Quote the output of the command or file read that shows it instead (an agent's report names the handles).",
+            producer.tool
+        ));
+    }
+    Ok(producer)
 }
 
 /// The runtime tool called `name`, bound to `shared`; `None` when `name` is not a runtime tool.

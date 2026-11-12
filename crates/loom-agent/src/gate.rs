@@ -47,7 +47,7 @@
 //! For each quote, in order: resolve `handle` with `BlobStore::resolve` (failure → `quote {i}: there
 //! is no stored output {handle}; handles are the out:… ids in result headers`); `start`/`end` must be
 //! `1 <= start <= end` and `start <= total lines` (else a sentence giving the output's line count);
-//! read the lines (`end` clamped to the last line) and check them with `observe::check_quote(lines,
+//! read the lines (`end` clamped to the last line) and check them with `observe::check_quote_at(lines,
 //! text, start)`, whose errors become these sentences:
 //! - `NotFound`: `quote {i}: the text does not occur in {handle} lines {start}-{end}.` followed, when
 //!   `observe::nearest_line` finds one in that range, by ` The closest line there is {n}: {line}`
@@ -59,8 +59,9 @@
 //!   characters. Quote more of the line, or the whole line with its indentation.`
 //!
 //! An empty `text` is a mismatch with the sentence `quote {i}: the text is empty.`
-//! Returns `Ok(verified)` when every quote passes (blob id, the clamped range, and the text as
-//! `check_quote` returned it: without line-number prefixes), else `Err(all sentences, one per line)`.
+//! Returns `Ok(verified)` when every quote passes (blob id, and the complete line or lines the accepted
+//! text lies on with their range, as `check_quote_at` returned them: without line-number prefixes, a
+//! fragment recorded with the rest of its line), else `Err(all sentences, one per line)`.
 //!
 //! ## `render_report` — what a parent sees of a child's result
 //! ```text
@@ -407,8 +408,12 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize) -> Result<VerifiedQuote, St
     let slice = blobs
         .read_lines(&id, q.start, end)
         .map_err(|e| format!("quote {i}: the stored output {handle} could not be read ({e}); try again."))?;
-    match observe::check_quote(&slice.text, &q.text, q.start) {
-        Ok(text) => return Ok(VerifiedQuote { blob: id, start: q.start, end, text }),
+    match observe::check_quote_at(&slice.text, &q.text, q.start) {
+        Ok((text, first)) => {
+            // What is recorded is the complete line or lines the accepted text lies on.
+            let last = first.saturating_add((text.split('\n').count() as u64).saturating_sub(1));
+            return Ok(VerifiedQuote { blob: id, start: first, end: last, text });
+        }
         Err(observe::QuoteError::WrongLine { quoted, actual }) => {
             return Err(format!(
                 "quote {i}: the text is on line {actual} of {handle}, not line {quoted}. Fix the line number, or quote the text without line numbers."

@@ -887,7 +887,17 @@ export function ledgerModel(view) {
   const s = (view && view.state) || {};
   const evById = new Map((s.evidence || []).map((e) => [e.id, e]));
   const lines = (e) => (Array.isArray(e.lines) ? `lines ${e.lines[0]}–${e.lines[1]}` : "");
+  const n = (view && view.skipped) || 0;
+  const ahead = (view && view.ahead_of_head) || 0;
+  const notices = [];
+  if (n > 0) {
+    const detail = view.skipped_detail ? ` (first: ${view.skipped_detail})` : "";
+    notices.push(`${n} ledger ${n === 1 ? "entry" : "entries"} written by a newer loom ${n === 1 ? "is" : "are"} not shown${detail}. Upgrade loom to see ${n === 1 ? "it" : "them"}.`);
+  }
+  if (view && view.torn_tail) notices.push("The ledger ends in an interrupted write, which is ignored; the next entry written removes it.");
+  if (ahead > 0) notices.push(`${ahead} ledger ${ahead === 1 ? "entry is" : "entries are"} not vouched for by the ledger's head record, so removing ${ahead === 1 ? "it" : "them"} would go unnoticed.`);
   return {
+    notices,
     empty: !s.entries,
     goal: s.goal || null,
     constraints: (s.constraints || []).map((c) => ({ id: c.id, text: c.text, retired: c.retired || null })),

@@ -42,7 +42,8 @@
 //!   one, and says when the mission keeps no ledger (the rule is then a note without an id).
 //! - `gc [--apply]`: `client.gc`; one line with what was examined, kept and would be (or was) deleted.
 //! - `inbox`: `render::inbox_list`. `answer <item> <text…>`: `client.answer`; `answered {item}`.
-//! - `ledger <session|mission>`: the ledger's `markdown`.
+//! - `ledger <session|mission>`: the ledger's `markdown`, then one line for each of `LedgerView::notices`
+//!   (entries written by a newer loom that are not shown, an ignored torn tail, entries past the head record).
 //! - `window <session>`: `render::window_table`. `net <session> [-n <limit>]`: `render::net_table`.
 //! - `out <handle> [--lines <a>:<b>]`: the stored output's lines (all of it, paged 5 000 lines at a
 //!   time, without `--lines`), passed through `render::clean`.
@@ -1047,7 +1048,11 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             let c = client_of(&paths)?;
             let mission = c.mission_of(&a.session).await?;
             let view = c.ledger(&mission).await?;
-            block(&view.markdown).map(|()| 0)
+            let mut text = view.markdown.clone();
+            for notice in view.notices() {
+                text.push_str(&format!("\n{notice}"));
+            }
+            block(&text).map(|()| 0)
         }
         Command::Window(a) => {
             let c = client_of(&paths)?;

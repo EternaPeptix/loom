@@ -61,7 +61,7 @@
 //! when the quote is copied from a view of a command's output; a session without a mission gets
 //! `NO_MISSION` from every tool.
 
-use super::{Shared, NAMES, NO_MISSION};
+use super::{observed_producer, Shared, NO_MISSION};
 use crate::gate::{check_quotes, Quote};
 use async_trait::async_trait;
 use loom_core::event::{ToolClass, ToolSpec};
@@ -322,21 +322,11 @@ impl Tool for Evidence {
                 "The quote could not be checked, so nothing was attached. Check `handle`, `start` and `end`.",
             );
         };
-        let Some(producer) = shared.orch.producer(mission, &v.blob).await else {
-            return ToolOutput::error(format!(
-                "{handle} was not produced by a tool call of this mission, so it cannot be used as evidence. Evidence is a quote from the output of a command you ran or a file you read."
-            ));
+        // Only observations are evidence.
+        let producer = match observed_producer(shared, mission, &handle, &v.blob).await {
+            Ok(p) => p,
+            Err(text) => return ToolOutput::error(text),
         };
-        // Only observations are evidence. Every runtime tool (the ledger rendered back, a log search, an
-        // agent's report, ...) returns words of the model, the harness or another agent, and the diff a
-        // `write` or `edit` returns shows what the model itself just wrote.
-        let not_observed = matches!(producer.class, ToolClass::State | ToolClass::Terminal | ToolClass::Write);
-        if not_observed || NAMES.contains(&producer.tool.as_str()) {
-            return ToolOutput::error(format!(
-                "{handle} is the result of `{}`, which is a message from the harness or from another agent, or your own words played back, not an observation. Quote the output of the command or file read that shows it instead (an agent's report names the handles).",
-                producer.tool
-            ));
-        }
         let kind = if producer.class == ToolClass::Exec { EvidenceKind::Execution } else { EvidenceKind::Static };
         let input = EvidenceInput {
             claim: claim.clone(),
@@ -717,8 +707,20 @@ mod tests {
         ok(&rig, "evidence", ev(1, 1, "1\ttests passed")).await;
         ok(&rig, "evidence", ev(3, 3, "ok")).await;
         let state = rig.shared.ledger().unwrap();
-        assert_eq!(state.evidence[0].input.quote.as_deref(), Some("tests passed"));
+        // A fragment is recorded as the whole line it lies on.
+        assert_eq!(state.evidence[0].input.quote.as_deref(), Some("0 of 40 tests passed"));
         assert_eq!(state.evidence[1].input.quote.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn an_evidence_fragment_cannot_start_inside_a_token() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let h = rig.output("test result: FAILED. 5 passed; 10 failed; 0 ignored\n", "bash", ToolClass::Exec);
+        let ev = |quote: &str| json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "quote": quote, "note": "n"});
+        let t = refused(&rig, "evidence", ev("0 failed; 0 ignored")).await;
+        assert!(t.contains("does not occur"), "{t}");
+        assert!(rig.shared.ledger().unwrap().evidence.is_empty());
     }
 
     #[tokio::test]

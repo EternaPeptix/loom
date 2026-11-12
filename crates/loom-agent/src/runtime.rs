@@ -534,10 +534,55 @@ pub struct WindowView {
     pub cached_tokens: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// A mission's ledger as the operator sees it, with what the read could not show.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LedgerView {
     pub state: LedgerState,
     pub markdown: String,
+    /// Entries sealed by a newer loom that this build cannot read: they are not in `state`.
+    #[serde(default)]
+    pub skipped: u64,
+    /// The first of them: its number and why it could not be read.
+    #[serde(default)]
+    pub skipped_detail: Option<String>,
+    /// The journal ends in an interrupted write, which was ignored.
+    #[serde(default)]
+    pub torn_tail: bool,
+    /// Entries after the ones the journal's head record vouches for: removing them would go unnoticed.
+    #[serde(default)]
+    pub ahead_of_head: u64,
+}
+
+impl LedgerView {
+    /// One sentence for each thing that makes `state` less than the whole ledger; empty when it is whole.
+    pub fn notices(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.skipped > 0 {
+            let detail = self.skipped_detail.as_deref().map(|d| format!(" (first: {d})")).unwrap_or_default();
+            out.push(format!(
+                "{} ledger {} written by a newer loom {} not shown{detail}. Upgrade loom to see {}.",
+                self.skipped,
+                if self.skipped == 1 { "entry" } else { "entries" },
+                if self.skipped == 1 { "is" } else { "are" },
+                if self.skipped == 1 { "it" } else { "them" },
+            ));
+        }
+        if self.torn_tail {
+            out.push(
+                "The ledger ends in an interrupted write, which is ignored; the next entry written removes it."
+                    .to_string(),
+            );
+        }
+        if self.ahead_of_head > 0 {
+            out.push(format!(
+                "{} ledger {} not vouched for by the ledger's head record, so removing {} would go unnoticed.",
+                self.ahead_of_head,
+                if self.ahead_of_head == 1 { "entry is" } else { "entries are" },
+                if self.ahead_of_head == 1 { "it" } else { "them" },
+            ));
+        }
+        out
+    }
 }
 
 /// What became of a rule, an approval or a withdrawal the operator sent (see [`Runtime::add_rule`]).
@@ -3193,9 +3238,17 @@ impl Runtime {
                 return Err("No ledger: this mission's lead does not keep one.".to_string());
             }
         }
-        let state = Journal::new(path, self.inner.key.clone()).state().map_err(|e| e.to_string())?;
+        let read = Journal::new(path, self.inner.key.clone()).read_report().map_err(|e| e.to_string())?;
+        let state = LedgerState::fold(&read.entries);
         let markdown = state.render_markdown();
-        Ok(LedgerView { state, markdown })
+        Ok(LedgerView {
+            state,
+            markdown,
+            skipped: read.unknown,
+            skipped_detail: read.unknown_detail,
+            torn_tail: read.torn_tail,
+            ahead_of_head: read.ahead_of_head,
+        })
     }
 
     pub fn net(&self, id: &SessionId, limit: usize) -> Result<Vec<NetEntry>, String> {
@@ -3956,6 +4009,55 @@ mod tests {
         assert_eq!((view.state.constraints.len(), view.state.goal.as_deref()), (0, None));
         assert!(!journal.exists(), "reading must not create the journal");
         tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_ledger_view_reports_what_the_read_could_not_show() {
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let info = e.rt.create_session(e.new_session(None)).await.unwrap();
+        let mission = info.meta.mission.clone();
+        let journal = Journal::new(e.rt.paths().journal(&mission), e.rt.inner.key.clone());
+        journal.append(&info.meta.id, true, loom_core::ledger::LedgerOp::GoalSet { text: "ship it".into() }, &|_| Ok(())).unwrap();
+        let view = e.rt.ledger(&mission).unwrap();
+        assert_eq!((view.skipped, view.torn_tail, view.ahead_of_head), (0, false, 0));
+        assert!(view.notices().is_empty(), "{:?}", view.notices());
+
+        // An interrupted append is ignored, and a journal whose head record is gone is ahead of it.
+        let path = e.rt.paths().journal(&mission);
+        std::fs::remove_file(path.with_extension("head")).unwrap();
+        let mut text = std::fs::read(&path).unwrap();
+        text.extend_from_slice(b"{\"n\":2,\"ts_ms\"");
+        std::fs::write(&path, text).unwrap();
+        let view = e.rt.ledger(&mission).unwrap();
+        assert_eq!(view.state.goal.as_deref(), Some("ship it"));
+        assert_eq!((view.skipped, view.torn_tail, view.ahead_of_head), (0, true, 1));
+        let notices = view.notices();
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices[0].contains("interrupted write"), "{notices:?}");
+        assert!(notices[1].contains("1 ledger entry is not vouched for"), "{notices:?}");
+        tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
+    }
+
+    #[test]
+    fn skipped_ledger_entries_are_named_in_the_view() {
+        let view = LedgerView {
+            skipped: 2,
+            skipped_detail: Some("entry 4: op `hologram_set`: unknown variant".into()),
+            ..LedgerView::default()
+        };
+        let notices = view.notices();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].starts_with("2 ledger entries written by a newer loom are not shown (first: entry 4: op `hologram_set`"),
+            "{notices:?}"
+        );
+        // A view from a daemon that does not report them still reads.
+        let mut wire = serde_json::to_value(LedgerView::default()).unwrap();
+        for key in ["skipped", "skipped_detail", "torn_tail", "ahead_of_head"] {
+            wire.as_object_mut().unwrap().remove(key);
+        }
+        let old: LedgerView = serde_json::from_value(wire).unwrap();
+        assert!(old.notices().is_empty());
     }
 
     #[tokio::test]

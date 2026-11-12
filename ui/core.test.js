@@ -547,6 +547,17 @@ test("ledger model joins evidence to claims and keeps open obligations only", ()
   assert.equal(C.stepMark("done"), "●");
 });
 
+test("the ledger model carries a notice for what the read could not show", () => {
+  assert.deepEqual(C.ledgerModel({ state: { entries: 1 } }).notices, []);
+  const m = C.ledgerModel({
+    state: { entries: 0 }, skipped: 2, skipped_detail: "entry 4: op `x`", torn_tail: true, ahead_of_head: 1,
+  });
+  assert.equal(m.notices.length, 3);
+  assert.match(m.notices[0], /^2 ledger entries written by a newer loom are not shown \(first: entry 4: op `x`\)/);
+  assert.match(m.notices[1], /interrupted write/);
+  assert.match(m.notices[2], /^1 ledger entry is not vouched for/);
+});
+
 test("operator rule requests build their routes and refuse blank input", () => {
   assert.deepEqual(C.ruleRequest("s-1", "  no prod "), { path: "/api/sessions/s-1/rules", body: { text: "no prod" } });
   assert.ok(C.ruleRequest("s-1", "   ").error);

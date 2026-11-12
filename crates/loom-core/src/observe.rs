@@ -42,8 +42,10 @@
 //! - if the quote carried line numbers, each number is the number of the line its text is on;
 //! - it spans whole lines, or has at least `MIN_PARTIAL_QUOTE_CHARS` (8) non-whitespace characters.
 //!
-//! The first accepted occurrence wins and `Ok(text)` is the text to record: the quote's lines joined
-//! by `\n`, without the prefixes. Otherwise `Err`: `NotFound` (the text does not occur; also an empty
+//! A fragment (not whole lines) must also sit on token boundaries: when its first (last) character is
+//! alphanumeric, the character before (after) it in the line is not.
+//! The first accepted occurrence wins and `Ok(text)` is the text to record: the complete line or lines
+//! the occurrence lies on (trailing whitespace removed), without line-number prefixes. Otherwise `Err`: `NotFound` (the text does not occur; also an empty
 //! or whitespace-only quote), `WrongLine { quoted, actual }` (it occurs, but never on the lines the
 //! quote numbers: for the first occurrence, the first wrong number and the line that text is on), or
 //! `TooShort` (it occurs where the numbers allow, but only as a fragment of fewer than 8 characters).
@@ -505,13 +507,20 @@ pub enum QuoteError {
 /// are the numbers of the lines it is on, and it spans whole lines or is long enough. `first_line` is the
 /// number of the first line of `hay`. One pass: the line count is carried from one occurrence to the next,
 /// so the lines of `hay` are counted once however many occurrences are passed over.
-fn scan_quote(hay: &str, text: &str, numbers: Option<&[Option<u64>]>, first_line: u64) -> Result<(), QuoteError> {
+fn scan_quote(
+    hay: &str,
+    text: &str,
+    numbers: Option<&[Option<u64>]>,
+    first_line: u64,
+) -> Result<std::ops::Range<usize>, QuoteError> {
     if text.is_empty() {
         return Err(QuoteError::NotFound);
     }
     let long_enough = text.chars().filter(|c| !c.is_whitespace()).count() >= MIN_PARTIAL_QUOTE_CHARS;
     let mut wrong: Option<QuoteError> = None;
     let mut short = false;
+    let first_alnum = text.chars().next().is_some_and(char::is_alphanumeric);
+    let last_alnum = text.chars().next_back().is_some_and(char::is_alphanumeric);
     // `line` is the number of the line that byte `counted` of `hay` is on.
     let (mut line, mut counted) = (first_line, 0usize);
     let mut from = 0usize;
@@ -533,10 +542,21 @@ fn scan_quote(hay: &str, text: &str, numbers: Option<&[Option<u64>]>, first_line
         let starts_line = off == 0 || hay.get(..off).is_some_and(|before| before.ends_with('\n'));
         let after = hay.get(off.saturating_add(text.len())..);
         let ends_line = after.is_some_and(|after| after.is_empty() || after.starts_with('\n'));
-        if (starts_line && ends_line) || long_enough {
-            return Ok(());
+        if starts_line && ends_line {
+            return Ok(off..off.saturating_add(text.len()));
         }
-        short = true;
+        if !long_enough {
+            short = true;
+            continue;
+        }
+        // A fragment sits on token boundaries: it does not begin or end inside a word or a number.
+        let before = hay.get(..off).and_then(|b| b.chars().next_back());
+        let next = after.and_then(|a| a.chars().next());
+        let inside_token = (first_alnum && before.is_some_and(char::is_alphanumeric))
+            || (last_alnum && next.is_some_and(char::is_alphanumeric));
+        if !inside_token {
+            return Ok(off..off.saturating_add(text.len()));
+        }
     }
     match wrong {
         _ if short => Err(QuoteError::TooShort),
@@ -545,11 +565,26 @@ fn scan_quote(hay: &str, text: &str, numbers: Option<&[Option<u64>]>, first_line
     }
 }
 
+/// The complete lines of `hay` that the byte range `at` lies on, and the number of the first of them
+/// (`first_line` is the number of the first line of `hay`).
+fn whole_lines(hay: &str, at: &std::ops::Range<usize>, first_line: u64) -> (String, u64) {
+    let start = hay.get(..at.start).and_then(|b| b.rfind('\n')).map_or(0, |i| i.saturating_add(1));
+    let end = hay.get(at.end..).and_then(|a| a.find('\n')).map_or(hay.len(), |i| at.end.saturating_add(i));
+    let before = hay.get(..start).map_or(0, |b| b.matches('\n').count());
+    (hay.get(start..end).unwrap_or_default().to_string(), first_line.saturating_add(before as u64))
+}
+
 /// Check `quote` against `haystack`, whose first line is line `first_line` of the stored output. Returns
-/// the quoted text as it is to be recorded: with line-number prefixes removed. Prefixes, when present,
-/// must be the real line numbers; a quote that is not whole lines needs [`MIN_PARTIAL_QUOTE_CHARS`]
-/// non-whitespace characters.
+/// the text to record: the complete line or lines the accepted occurrence lies on, so a fragment is
+/// recorded with its context. Prefixes, when present, must be the real line numbers; a quote that is not
+/// whole lines needs [`MIN_PARTIAL_QUOTE_CHARS`] non-whitespace characters and must begin and end on token
+/// boundaries.
 pub fn check_quote(haystack: &str, quote: &str, first_line: u64) -> Result<String, QuoteError> {
+    check_quote_at(haystack, quote, first_line).map(|(text, _)| text)
+}
+
+/// [`check_quote`], also giving the number of the first line of the text to record.
+pub fn check_quote_at(haystack: &str, quote: &str, first_line: u64) -> Result<(String, u64), QuoteError> {
     if quote.trim().is_empty() {
         return Err(QuoteError::NotFound);
     }
@@ -562,12 +597,12 @@ pub fn check_quote(haystack: &str, quote: &str, first_line: u64) -> Result<Strin
     let literal_short = match scan_quote(&hay, &literal, None, first_line) {
         Err(QuoteError::NotFound) => false,
         Err(QuoteError::TooShort) => true,
-        verdict => return verdict.map(|()| literal),
+        verdict => return verdict.map(|at| whole_lines(&hay, &at, first_line)),
     };
     let numbered = match strip_prefixes(&lines) {
         Some((stripped, numbers)) => {
             let text = stripped.join("\n");
-            scan_quote(&hay, &text, Some(numbers.as_slice()), first_line).map(|()| text)
+            scan_quote(&hay, &text, Some(numbers.as_slice()), first_line).map(|at| whole_lines(&hay, &at, first_line))
         }
         None => Err(QuoteError::NotFound),
     };
@@ -947,8 +982,8 @@ mod tests {
         let hay = "0 of 40 tests passed\nsecond line here\n";
         assert_eq!(check_quote(hay, "40: tests passed", 1), Err(QuoteError::WrongLine { quoted: 40, actual: 1 }));
         assert_eq!(check_quote(hay, "2: tests passed", 1), Err(QuoteError::WrongLine { quoted: 2, actual: 1 }));
-        assert_eq!(check_quote(hay, "1: tests passed", 1), Ok("tests passed".to_string()));
-        assert_eq!(check_quote(hay, "40: tests passed", 40), Ok("tests passed".to_string()));
+        assert_eq!(check_quote(hay, "1: tests passed", 1), Ok("0 of 40 tests passed".to_string()));
+        assert_eq!(check_quote(hay, "40: tests passed", 40), Ok("0 of 40 tests passed".to_string()));
         // Every separator style, TAB included, is accepted and the stored text is stripped.
         let hay = "alpha line\n    beta line\n\ngamma line\n";
         for q in [
@@ -1017,6 +1052,27 @@ mod tests {
         // A whole line with indentation is a whole line only when the indentation is quoted too.
         assert_eq!(check_quote("  ab\n", "ab", 1), Err(QuoteError::TooShort));
         assert!(check_quote("  ab\n", "  ab  ", 1).is_ok());
+    }
+
+    #[test]
+    fn a_fragment_sits_on_token_boundaries_and_is_recorded_as_its_whole_line() {
+        let hay = "test result: FAILED. 5 passed; 10 failed; 0 ignored\n0 of 40 tests passed\n";
+        // Inside "10" and inside "0 of 40": not a quote of those lines.
+        assert_eq!(check_quote(hay, "0 failed; 0 ignored", 1), Err(QuoteError::NotFound));
+        // A cut inside the last word is not on a boundary either.
+        assert_eq!(check_quote(hay, "5 passed; 10 fail", 1), Err(QuoteError::NotFound));
+        // On boundaries it is accepted, and the record is the whole line: "40 tests passed" is not
+        // recorded without the "0 of" before it.
+        assert_eq!(check_quote(hay, "40 tests passed", 1), Ok("0 of 40 tests passed".to_string()));
+        assert_eq!(check_quote_at(hay, "40 tests passed", 1), Ok(("0 of 40 tests passed".to_string(), 2)));
+        assert_eq!(check_quote(hay, "5 passed; 10 failed", 1), Ok(hay.lines().next().unwrap_or("").to_string()));
+        assert_eq!(check_quote(hay, "of 40 tests passed", 1), Ok("0 of 40 tests passed".to_string()));
+        // A later occurrence on a boundary is still found.
+        let hay = "10 failed; 0 ignored\nresult: 0 failed; 0 ignored\n";
+        assert_eq!(check_quote(hay, "0 failed; 0 ignored", 1), Ok("result: 0 failed; 0 ignored".to_string()));
+        // A fragment across two lines is recorded as both lines.
+        let hay = "first part of it\nsecond part of it\n";
+        assert_eq!(check_quote(hay, "of it\nsecond part", 1), Ok(hay.trim_end().to_string()));
     }
 
     #[test]
