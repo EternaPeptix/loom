@@ -114,11 +114,11 @@ upgrade" first; the rest says what behaves differently.
   exit codes with a note that 128+N usually means signal N. A command whose output passes
   `max_output_bytes` is killed at once and only the first part is kept.
 - `read`, `write` and `edit` work on regular files only; `read` loads at most 64 MiB (use a line range
-  for larger files); `grep` skips files over 16 MiB and says so.
+  for larger files); `grep` skips files over 16 MiB and says so. `grep` and `glob` list at most
+  `search_max_results` entries and 4 MiB of text, and say when a result is cut.
 - `read`, `write` and `edit` check the real path of the file or directory they opened, and write
   relative to the opened directory, so a command that swaps a directory for a link during a call can
-  no longer make them read a protected file or write outside the writable areas. `grep` and `glob` list at most
-  `search_max_results` entries and 4 MiB of text, and say when a result is cut.
+  no longer make them read a protected file or write outside the writable areas.
 - Evidence can be cited from a `read` result (its header now ends with an `out:` handle) and from a
   finished background job's complete output. Output produced by the runtime's own tools (ledger,
   agent reports, `finish`, ...) can no longer be cited as evidence. A quote copied with line numbers

@@ -812,11 +812,11 @@ directory without following a link in its last component (missing directories ar
 below an open ancestor, each checked first and opened without following a link), checks the real
 path of that directory joined with the file name, and creates, syncs and renames the temporary file
 relative to that descriptor. A file name that is itself a link is read and followed by the writer, at
-most 8 links, so the directory checked is the target's. A role with `read_only` gets no `extra_writable` and its workspace is added to
-the never-writable paths, so it can still write in its session temp dir, in the system temp locations
-(`/private/tmp`, `/private/var/folders`, which other sessions use too) and to the device files, and
-nowhere else. Commands get the daemon's environment without any variable whose name (case-insensitive)
-contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
+most 8 links, so the directory checked is the target's. A role with `read_only` gets no `extra_writable`
+and its workspace is added to the never-writable paths, so it can still write in its session temp dir,
+in the system temp locations (`/private/tmp`, `/private/var/folders`, which other sessions use too) and
+to the device files, and nowhere else. Commands get the daemon's environment without any variable whose
+name (case-insensitive) contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
 `CREDENTIAL`, `AUTH_TOKEN`, `COOKIE` or `SESSION_KEY`, ends in `_PAT`, `_DSN` or `_PWD`, is
 `DATABASE_URL` or `SSH_AUTH_SOCK`, or starts with `LOOM_` (unless listed in `sandbox.env_pass`), plus
 `TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR` = the temp

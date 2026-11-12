@@ -89,11 +89,12 @@
 //! refused by each tool without hanging; a file above the cap refused whole and read by range
 //! (normalised, stored, cut by size); cancellation of a stuck read, and of a write and an edit before
 //! they write; an interrupted read is not recorded; a path through a link into what the policy refuses
-//! is refused by each tool after the check (and no similar names are listed from there); a directory
-//! swapped for a link and back in a tight loop during reads and writes: no protected content returned,
-//! nothing created outside, no temporary file left; missing directories made, a link in their place
-//! not followed; a file name that is a link written through to a file the policy allows, refused
-//! towards one it does not, and a cycle of links refused.
+//! is refused by each tool after the check (and no similar names are listed from there); on macOS, a
+//! refused path named through `/System/Volumes/Data` refused by each tool; a directory swapped for a
+//! link and back in a tight loop during reads and writes, until enough calls met both states: no
+//! protected content returned, nothing created outside, no temporary file left; missing directories
+//! made, a link in their place not followed; a file name that is a link written through to a file the
+//! policy allows, refused towards one it does not, and a cycle of links refused.
 
 use crate::files::{describe_type, open_readable, real_path, Freshness, NotOpened, Readable, Seen};
 use crate::outview::{string, uint};
@@ -1987,98 +1988,193 @@ mod tests {
         assert_eq!(std::fs::read_dir(&secret).unwrap().count(), 1);
     }
 
-    /// Swap the entries `dir` and `link` in place (`renamex_np` with `RENAME_SWAP`, atomic: the name
-    /// `dir` always exists) over and over until `stop` is set, so that `dir` names a directory and a
-    /// link by turns. Returns how many swaps were made; `dir` names the directory again when it returns.
-    #[cfg(target_os = "macos")]
-    fn swap_until(
-        dir: PathBuf,
-        link: PathBuf,
-        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> std::thread::JoinHandle<u64> {
-        use std::os::unix::ffi::OsStrExt;
-        std::thread::spawn(move || {
-            let a = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
-            let b = std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
-            let mut swaps = 0u64;
-            while !stop.load(Ordering::SeqCst) || swaps % 2 == 1 {
-                // SAFETY: both arguments are NUL-terminated strings that live until the call returns.
-                let rc = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
-                assert_eq!(rc, 0, "swap: {}", std::io::Error::last_os_error());
-                swaps += 1;
-            }
-            swaps
-        })
-    }
-
-    /// A command of the session swaps a directory of the workspace for a link to a directory the
-    /// policy makes unreadable, again and again, while the model reads a file under it. The check of
-    /// the path and the open of the file are separate steps; only the file actually opened is judged,
-    /// so no call ever returns the protected content. (Against code that checked the path and then
-    /// opened it again by name, this loop returned the protected file within the first few calls.)
+    /// macOS also names the folders of the data volume under `/System/Volumes/Data`. Resolving links
+    /// keeps that form, which the rules are not written in, but the system names an open file or
+    /// directory in the usual form, so each tool still refuses what the rules refuse.
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    async fn a_refused_path_named_through_the_data_volume_is_refused() {
+        let data = |p: &Path| format!("/System/Volumes/Data{}", p.display());
+        let dir = tempfile::tempdir().unwrap();
+        let (e, secret) = env_with_secret(&dir, "k.txt");
+        let key = data(&secret.join("k.txt"));
+        if !Path::new(&key).exists() {
+            return; // the temp directory is not on the data volume
+        }
+        let refusal = format!("{} is not readable", secret.join("k.txt").display());
+        for (tool, args) in [
+            ("read", json!({"path": key})),
+            ("write", json!({"path": key, "content": "x"})),
+            ("edit", json!({"path": key, "old": "PRIVATE", "new": "x"})),
+        ] {
+            let r = e.call(tool, args).await;
+            assert!(r.status == ToolStatus::Denied && r.text.contains(&refusal) && !r.text.contains("PRIVATE"), "{tool}: {}", r.text);
+        }
+        assert_eq!(std::fs::read(secret.join("k.txt")).unwrap(), b"PRIVATE");
+
+        let other = tempfile::tempdir().unwrap();
+        let (e, outside) = env_with_outside(&other);
+        let r = e.call("write", json!({"path": data(&outside.join("new.txt")), "content": "x"})).await;
+        let refusal = format!("{} is protected", outside.join("new.txt").display());
+        assert!(r.status == ToolStatus::Denied && r.text.contains(&refusal), "{}", r.text);
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    /// A thread that turns the directory `dir` into the link `link` and back, over and over: each turn
+    /// renames the directory to `<dir>.real`, the link to `dir`, and both back, so `dir` names the
+    /// directory, nothing, the link, nothing and the directory again. Plain renames, because they are
+    /// fast: an atomic `RENAME_SWAP` of a directory and a link is slow on APFS, down to a few a second
+    /// while other tests sync files, too few for the calls to meet the race often. A directory that a
+    /// write makes at `dir` while it names nothing is moved aside to a new name first.
+    struct Flipper {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        turns: std::sync::Arc<AtomicU64>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Flipper {
+        fn start(dir: PathBuf, link: PathBuf) -> Flipper {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let turns = std::sync::Arc::new(AtomicU64::new(0));
+            let (stopped, turned) = (stop.clone(), turns.clone());
+            let thread = std::thread::spawn(move || {
+                let real = dir.with_extension("real");
+                let mut strays = 0u64;
+                let mut rename = |from: &Path, to: &Path| {
+                    let mut tries = 0;
+                    while let Err(e) = std::fs::rename(from, to) {
+                        tries += 1;
+                        assert!(tries < 1000, "{} cannot be renamed to {}: {e}", from.display(), to.display());
+                        strays += 1;
+                        let _ = std::fs::rename(to, to.with_extension(format!("stray{strays}")));
+                    }
+                };
+                while !stopped.load(Ordering::SeqCst) {
+                    rename(&dir, &real);
+                    rename(&link, &dir);
+                    rename(&dir, &link);
+                    rename(&real, &dir);
+                    turned.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            Flipper { stop, turns, thread: Some(thread) }
+        }
+
+        /// How many times `dir` has been the link.
+        fn turns(&self) -> u64 {
+            self.turns.load(Ordering::SeqCst)
+        }
+
+        /// Stop at the end of the turn, so that `dir` is the directory again, and pass on a failure.
+        fn finish(mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    impl Drop for Flipper {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// How one call of a race went.
+    enum Raced {
+        Done,
+        Refused,
+        /// Neither, as when the path named nothing at that moment.
+        Other,
+    }
+
+    /// Flip `dir` and `link` (see `Flipper`) while `call` is made with 0, 1, 2, … and panics on what
+    /// the race must never give. It ends on counts, not on time, because renames and syncs slow down a
+    /// great deal while other tests run: once at least 200 calls have been made while `dir` became the
+    /// link at least 200 times, and at least one call succeeded and one was refused, so the calls met
+    /// both states. Not getting there within 30 seconds fails the test.
+    async fn race<F, Fut>(dir: PathBuf, link: PathBuf, mut call: F)
+    where
+        F: FnMut(u64) -> Fut,
+        Fut: std::future::Future<Output = Raced>,
+    {
+        let flipper = Flipper::start(dir, link);
+        let started = std::time::Instant::now();
+        let (mut calls, mut done, mut refused) = (0u64, 0u64, 0u64);
+        while calls < 200 || flipper.turns() < 200 || done == 0 || refused == 0 {
+            if started.elapsed() > std::time::Duration::from_secs(30) {
+                let turns = flipper.turns();
+                panic!("the race did not run within 30 s: {turns} turns, {calls} calls, {done} succeeded, {refused} refused");
+            }
+            match call(calls).await {
+                Raced::Done => done += 1,
+                Raced::Refused => refused += 1,
+                Raced::Other => {}
+            }
+            calls += 1;
+        }
+        flipper.finish();
+    }
+
+    /// A command of the session turns a directory of the workspace into a link to a directory the
+    /// policy makes unreadable and back, again and again, while the model reads a file under it. The
+    /// check of the path and the open of the file are separate steps; only the file actually opened is
+    /// judged, so no call ever returns the protected content. (Against the code that checked the path
+    /// and then opened it again by name, this loop returned the protected file in each of six runs, by
+    /// the 54th call at the latest, well before `race` lets it end.)
+    #[tokio::test]
     async fn a_directory_swapped_for_a_link_during_a_read_reveals_nothing() {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
         let (e, secret) = env_with_secret(&dir, "id");
         std::fs::create_dir(ws(&e, "d")).unwrap();
         put(&e, "d/id", b"public");
         std::os::unix::fs::symlink(&secret, ws(&e, "d.link")).unwrap();
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let swapper = swap_until(ws(&e, "d"), ws(&e, "d.link"), stop.clone());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let (mut calls, mut public) = (0u64, 0u64);
-        while std::time::Instant::now() < deadline {
+        let e = &e;
+        race(ws(e, "d"), ws(e, "d.link"), move |n| async move {
             let r = e.call("read", json!({"path": "d/id"})).await;
-            calls += 1;
-            if r.text.contains("PRIVATE") {
-                stop.store(true, Ordering::SeqCst);
-                panic!("call {calls} returned the content of the unreadable file: {}", r.text);
+            assert!(!r.text.contains("PRIVATE"), "call {n} returned the content of the unreadable file: {}", r.text);
+            if r.text.contains("1\tpublic") {
+                Raced::Done
+            } else if r.status == ToolStatus::Denied {
+                Raced::Refused
+            } else {
+                Raced::Other
             }
-            public += u64::from(r.text.contains("1\tpublic"));
-        }
-        stop.store(true, Ordering::SeqCst);
-        let swaps = swapper.join().unwrap();
-        assert!(swaps > 100 && public > 0, "the race did not run: {swaps} swaps, {public} of {calls} reads succeeded");
+        })
+        .await;
     }
 
-    /// As above for `write`: the directory is swapped for a link to a directory where the policy allows
+    /// As above for `write`: the directory is turned into a link to a directory where the policy allows
     /// no writes (a protected path: on macOS every temp directory lies under a writable root), while the
     /// model writes files under it, some in directories that do not exist yet. Nothing ever appears in
-    /// that directory, and no temporary file is left behind. (Against code that checked the path and
-    /// then wrote by name, files appeared there within the first few calls.)
-    #[cfg(target_os = "macos")]
+    /// that directory, and no temporary file is left behind. (Against the code that checked the path and
+    /// then wrote by name, an entry appeared there in each of six runs, by the 19th call at the latest.)
     #[tokio::test]
     async fn a_directory_swapped_for_a_link_during_a_write_gets_no_file_outside() {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
         let (e, outside) = env_with_outside(&dir);
         std::fs::create_dir(ws(&e, "d")).unwrap();
         std::os::unix::fs::symlink(&outside, ws(&e, "d.link")).unwrap();
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let swapper = swap_until(ws(&e, "d"), ws(&e, "d.link"), stop.clone());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let (mut calls, mut written) = (0u64, 0u64);
-        while std::time::Instant::now() < deadline {
-            let path = if calls % 2 == 0 { "d/evil.plist".to_string() } else { format!("d/n{calls}/evil.plist") };
-            let r = e.call("write", json!({"path": path, "content": format!("call {calls}\n")})).await;
-            calls += 1;
-            written += u64::from(r.status == ToolStatus::Ok);
-            if std::fs::read_dir(&outside).unwrap().next().is_some() {
-                stop.store(true, Ordering::SeqCst);
-                panic!("call {calls} made an entry in the protected directory: {}", r.text);
+        let (e, out) = (&e, &outside);
+        race(ws(e, "d"), ws(e, "d.link"), move |n| async move {
+            let path = if n % 2 == 0 { "d/evil.plist".to_string() } else { format!("d/n{n}/evil.plist") };
+            let r = e.call("write", json!({"path": path, "content": format!("call {n}\n")})).await;
+            let made = std::fs::read_dir(out).unwrap().next().is_some();
+            assert!(!made, "call {n} made an entry in the protected directory: {}", r.text);
+            if r.status == ToolStatus::Ok {
+                Raced::Done
+            } else if r.status == ToolStatus::Denied || r.text.contains("is a symbolic link") {
+                Raced::Refused
+            } else {
+                Raced::Other
             }
-        }
-        stop.store(true, Ordering::SeqCst);
-        let swaps = swapper.join().unwrap();
-        assert!(swaps > 100 && written > 0, "the race did not run: {swaps} swaps, {written} of {calls} writes succeeded");
+        })
+        .await;
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
-        assert_eq!(temp_files(&e), Vec::<PathBuf>::new());
+        assert_eq!(temp_files(e), Vec::<PathBuf>::new());
     }
 
     #[tokio::test]

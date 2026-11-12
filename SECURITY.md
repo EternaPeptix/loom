@@ -99,7 +99,11 @@ These are the places where loom does less than the text above might suggest.
   relative to that open directory. A command that swaps a directory for a link during such a call gets
   no content and no file out of it; it can still learn whether a path there exists and what kind of
   file it is. `glob` and `grep` check each path and then open it by name, so a command that swaps a
-  link in between can in principle make them list or read through it. All of them refuse to touch
+  link in between can in principle make them list or read through it. They also judge a path in the
+  form it was given, with links resolved: macOS shows `/Users`, `/private` and the other folders of the
+  data volume under `/System/Volumes/Data` too, and given a path in that form, which the rules are not
+  written in, `glob` and `grep` list and read what the rules refuse; `read`, `write` and `edit` judge
+  the name the system gives for the open file, which is the usual one. All of them refuse to touch
   anything that is not a regular file.
 - **Without macOS there is no sandbox.** On other systems the daemon starts only with
   `[sandbox] mode = "none"`, and then commands are unconfined. The file tools still refuse the protected
