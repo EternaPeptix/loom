@@ -101,13 +101,15 @@
 //!
 //! ## `env(parent)`
 //! The environment for commands: `parent` (the daemon's own variables) without any whose name
-//! (case-insensitive) contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`,
-//! `AUTH_TOKEN`, `COOKIE`, `SESSION_KEY` or `PRIVATE`, has `SESSION`, `AUTH`, `PASS`, `JWT` or
-//! `WEBHOOK` as a part delimited by `_` or the ends of the name, ends in `_PAT`, `_DSN` or `_PWD`
-//! (`PWD` and `OLDPWD` stay), is `DATABASE_URL`, `SSH_AUTH_SOCK` or listed in `cfg.secret_env` (the
-//! `api_key_env` of every model profile), starts with `LOOM_`, or whose value is a URL with a password
-//! in its user-info part (`scheme://user:password@host`), unless listed in `cfg.env_pass`; plus `TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`,
-//! `GIT_TERMINAL_PROMPT=0`, `TMPDIR=<session temp dir>`.
+//! (case-insensitive) contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`,
+//! `CREDENTIAL`, `AUTH_TOKEN`, `COOKIE`, `SESSION_KEY` or `PRIVATE`, has `SESSION`, `AUTH`, `PASS`,
+//! `JWT` or `WEBHOOK` as a part delimited by `_` or the ends of the name, ends in `_PAT`, `_DSN`,
+//! `_PWD` or `_PW` (`PWD` and `OLDPWD` stay), is `DATABASE_URL`, `SSH_AUTH_SOCK` or listed in
+//! `cfg.secret_env` (the `api_key_env` of every model profile), or starts with `LOOM_`, and without
+//! any whose value holds a URL with a password in its user-info part (`scheme://user:password@host`):
+//! every `://` in the value starts an authority that ends at `/`, `?`, `#`, `"`, `]` or white space.
+//! A variable listed in `cfg.env_pass` is passed whatever its name and value. Added: `TERM=dumb`,
+//! `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR=<session temp dir>`.
 //!
 //! ## `describe()`
 //! Two or three plain sentences for the system prompt: where commands may write, what they may not
@@ -139,9 +141,9 @@ const DEVICE_LITERALS: [&str; 3] = ["/dev/null", "/dev/tty", "/dev/dtracehelper"
 /// System temp locations that commands need.
 const SYSTEM_WRITABLE: [&str; 2] = ["/private/tmp", "/private/var/folders"];
 
-const SECRET_WORDS: [&str; 9] =
-    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH_TOKEN", "COOKIE", "SESSION_KEY"];
-const SECRET_SUFFIXES: [&str; 3] = ["_PAT", "_DSN", "_PWD"];
+const SECRET_WORDS: [&str; 10] =
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASSPHRASE", "CREDENTIAL", "AUTH_TOKEN", "COOKIE", "SESSION_KEY"];
+const SECRET_SUFFIXES: [&str; 4] = ["_PAT", "_DSN", "_PWD", "_PW"];
 const SECRET_NAMES: [&str; 2] = ["DATABASE_URL", "SSH_AUTH_SOCK"];
 /// Words that withhold a variable when they are a whole `_`-delimited part of its name.
 const SECRET_PARTS: [&str; 5] = ["SESSION", "AUTH", "PASS", "JWT", "WEBHOOK"];
@@ -169,6 +171,7 @@ const CREDENTIAL_PATHS: &[&str] = &[
     ".huggingface",
     ".pgpass",
     ".my.cnf",
+    ".mylogin.cnf",
     ".vault-token",
     ".terraform.d",
     ".config/rclone",
@@ -181,6 +184,9 @@ const CREDENTIAL_PATHS: &[&str] = &[
     ".yarnrc.yml",
     ".composer/auth.json",
     ".codex/auth.json",
+    ".claude.json",
+    ".claude/.credentials.json",
+    ".config/github-copilot",
     ".config/hub",
     ".config/glab-cli",
     ".oci",
@@ -201,10 +207,26 @@ const CREDENTIAL_PATHS: &[&str] = &[
     "Library/Keychains",
     "Library/Cookies",
     "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Google/Chrome Beta",
+    "Library/Application Support/Google/Chrome Canary",
+    "Library/Application Support/Chromium",
+    "Library/Application Support/BraveSoftware",
+    "Library/Application Support/Microsoft Edge",
+    "Library/Application Support/Arc",
+    "Library/Application Support/Vivaldi",
+    "Library/Application Support/com.operasoftware.Opera",
     "Library/Application Support/Firefox",
     "Library/Application Support/Bitwarden",
     "Library/Application Support/Bitwarden CLI",
+    "Library/Containers/com.bitwarden.desktop",
     "Library/Application Support/1Password",
+    "Library/Application Support/Telegram Desktop",
+    "Library/Application Support/Claude/claude_desktop_config.json",
+    // Where tools that also keep an XDG location above store their logins on macOS.
+    "Library/Application Support/doctl",
+    "Library/Application Support/sops",
+    "Library/Preferences/netlify",
+    "Library/Preferences/.wrangler",
     "Library/Group Containers",
     "Library/Mail",
     "Library/Messages",
@@ -373,19 +395,17 @@ fn secret_name(name: &str) -> bool {
         || upper.split('_').any(|part| SECRET_PARTS.contains(&part))
 }
 
-/// Whether `value` is a URL with a password in its user-info part (`scheme://user:password@host`).
+/// Whether `value` holds a URL with a password in its user-info part (`scheme://user:password@host`)
+/// anywhere: every `://` starts an authority, which ends at `/`, `?`, `#`, `"`, `]` or white space. A
+/// `,` does not end it, since a password may hold one; a list of URLs is caught at the `://` of each.
 fn url_with_password(value: &str) -> bool {
-    let Some((scheme, rest)) = value.trim().split_once("://") else {
-        return false;
-    };
-    if scheme.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
-        return false;
-    }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    match authority.rsplit_once('@') {
-        Some((userinfo, _)) => userinfo.split_once(':').is_some_and(|(_, password)| !password.is_empty()),
-        None => false,
-    }
+    value.split("://").skip(1).any(|rest| {
+        let end = |c: char| matches!(c, '/' | '?' | '#' | '"' | ']') || c.is_whitespace();
+        let authority = rest.split(end).next().unwrap_or_default();
+        authority
+            .rsplit_once('@')
+            .is_some_and(|(userinfo, _)| userinfo.split_once(':').is_some_and(|(_, password)| !password.is_empty()))
+    })
 }
 
 fn join_list(paths: &[PathBuf]) -> String {
@@ -746,16 +766,15 @@ impl Sandbox {
         let protected = join_list(&self.protected);
         let unreadable = join_list(&self.unreadable);
         // In mode `none` nothing confines commands, so the credential rule is stated as the file tools' own.
+        let stores = "~/.ssh, ~/.aws, ~/.gnupg, cloud, registry, database, model-hub and AI-tool logins, password \
+                      managers, wallets, keychains, the profiles of common browsers, mail and chat data, and similar";
         let credentials = match (self.credentials.is_empty(), self.mode) {
-            (true, _) => "",
+            (true, _) => String::new(),
             (false, SandboxMode::None) => {
-                " They also refuse to read or write credential directories (~/.ssh, ~/.aws, ~/.gnupg, cloud, \
-                 registry and model-hub tokens, password managers, mail, messages, keychains, browser profiles and similar)."
+                format!(" They also refuse to read or write credential directories ({stores}).")
             }
             (false, SandboxMode::Seatbelt) => {
-                " Credential directories (~/.ssh, ~/.aws, ~/.gnupg, cloud, registry and model-hub tokens, \
-                 password managers, mail, messages, keychains, browser profiles and similar) are \
-                 off limits to read and to write."
+                format!(" Credential directories ({stores}) are off limits to read and to write.")
             }
         };
         // In the production layout the temp dir lies inside the loom home, which is protected.
@@ -984,16 +1003,39 @@ mod tests {
         assert!(sb.check_read(&fake.join(".aws/credentials")).is_err());
         assert!(sb.check_read(&fake.join("Library/Keychains/login.keychain-db")).is_err());
         assert!(sb.check_read(&fake.join("notes")).is_ok());
+        // A store named by its file leaves the rest of its directory readable.
+        assert!(sb.check_read(&fake.join(".claude/settings.json")).is_ok());
+        assert!(sb.check_read(&fake.join("Library/Application Support/Claude/logs/main.log")).is_ok());
         for rel in [
-            ".cache/huggingface/token", ".huggingface/token", ".pgpass", ".my.cnf", ".vault-token",
-            ".terraform.d/credentials.tfrc.json", ".config/rclone/rclone.conf", ".s3cfg", ".boto", ".gem/credentials",
-            ".m2/settings.xml", ".m2/settings-security.xml", ".gradle/gradle.properties", ".yarnrc.yml",
-            ".composer/auth.json", ".codex/auth.json", ".config/hub/hosts", ".config/glab-cli/config.yml",
-            ".oci/config", ".config/doctl/config.yaml", ".fly/config.yml", ".config/heroku/x", ".heroku/accounts",
-            ".config/netlify/config.json", ".config/sops/age/keys.txt", ".age/key", ".config/age/key", ".bitcoin/wallet.dat",
-            ".ethereum/keystore", ".config/solana/id.json", ".wrangler/config", ".config/.wrangler/config", ".pulumi/credentials.json",
-            "Library/Application Support/Bitwarden/data.json", "Library/Application Support/Bitwarden CLI/data.json",
-            "Library/Application Support/1Password/x", "Library/Group Containers/group.x/vault", "Library/Mail/V10/x",
+            ".cache/huggingface/token", ".huggingface/token", ".pgpass", ".my.cnf", ".mylogin.cnf", ".vault-token",
+            ".terraform.d/credentials.tfrc.json", ".config/rclone/rclone.conf", ".s3cfg", ".boto",
+            ".gem/credentials", ".m2/settings.xml", ".m2/settings-security.xml", ".gradle/gradle.properties",
+            ".yarnrc.yml", ".composer/auth.json", ".codex/auth.json", ".claude.json", ".claude/.credentials.json",
+            ".config/github-copilot/apps.json", ".config/hub/hosts", ".config/glab-cli/config.yml", ".oci/config",
+            ".config/doctl/config.yaml", ".fly/config.yml", ".config/heroku/x", ".heroku/accounts",
+            ".config/netlify/config.json", ".config/sops/age/keys.txt", ".age/key", ".config/age/key",
+            ".bitcoin/wallet.dat", ".ethereum/keystore", ".config/solana/id.json", ".wrangler/config",
+            ".config/.wrangler/config", ".pulumi/credentials.json",
+            "Library/Application Support/doctl/config.yaml",
+            "Library/Application Support/sops/age/keys.txt",
+            "Library/Preferences/netlify/config.json",
+            "Library/Preferences/.wrangler/config/default.toml",
+            "Library/Application Support/Google/Chrome Beta/Default/Cookies",
+            "Library/Application Support/Google/Chrome Canary/Default/Cookies",
+            "Library/Application Support/Chromium/Default/Login Data",
+            "Library/Application Support/BraveSoftware/Brave-Browser/Default/Cookies",
+            "Library/Application Support/Microsoft Edge/Default/Login Data",
+            "Library/Application Support/Arc/User Data/Default/Cookies",
+            "Library/Application Support/Vivaldi/Default/Cookies",
+            "Library/Application Support/com.operasoftware.Opera/Cookies",
+            "Library/Application Support/Bitwarden/data.json",
+            "Library/Application Support/Bitwarden CLI/data.json",
+            "Library/Containers/com.bitwarden.desktop/Data/Library/Application Support/Bitwarden/data.json",
+            "Library/Application Support/1Password/x",
+            "Library/Application Support/Telegram Desktop/tdata/key_datas",
+            "Library/Application Support/Claude/claude_desktop_config.json",
+            "Library/Group Containers/group.x/vault",
+            "Library/Mail/V10/x",
             "Library/Messages/chat.db",
         ] {
             assert!(sb.check_read(&fake.join(rel)).is_err(), "{rel} must be unreadable");
@@ -1002,7 +1044,8 @@ mod tests {
         let p = sb.profile().expect("profile");
         assert!(p.contains(&format!("(subpath \"{}/.ssh\")", s(&fake))), "{p}");
         assert!(p.contains(&format!("(subpath \"{}/.pgpass\")", s(&fake))), "{p}");
-        assert!(sb.describe().contains("Credential directories"), "{}", sb.describe());
+        let d = sb.describe();
+        assert!(d.contains("Credential directories") && d.contains("the profiles of common browsers"), "{d}");
         // Mode none keeps the read rule for the file tools, and says that it is theirs alone.
         let none = build_home(&f, &cfg(SandboxMode::None), &fake);
         assert!(none.check_read(&fake.join(".ssh/id")).is_err());
@@ -1404,7 +1447,11 @@ mod tests {
     #[test]
     fn env_withholds_sessions_auth_urls_with_passwords_and_profile_key_variables() {
         let f = fx();
-        let c = SandboxCfg { secret_env: vec!["MYSERVER_ACCESS".into()], env_pass: vec!["PASSED_PASS".into()], ..cfg(SandboxMode::Seatbelt) };
+        let c = SandboxCfg {
+            secret_env: vec!["MYSERVER_ACCESS".into()],
+            env_pass: vec!["PASSED_PASS".into()],
+            ..cfg(SandboxMode::Seatbelt)
+        };
         let sb = build(&f, &c, None);
         let withheld = [
             ("BW_SESSION", "x"),
@@ -1423,7 +1470,17 @@ mod tests {
             ("TERM_SESSION_ID", "x"),
             ("XDG_SESSION_TYPE", "tty"),
             ("MYSERVER_ACCESS", "x"),
+            ("BORG_PASSPHRASE", "x"),
+            ("GPG_PASSPHRASE", "x"),
+            ("PASSPHRASE", "x"),
+            ("DB_PW", "x"),
+            ("ADMIN_PW", "x"),
             ("INNOCENT_NAME", "https://user:secret@host/path"),
+            // The password is found wherever a URL starts in the value, and a `,` in it does not hide it.
+            ("JDBC", "jdbc:mysql://root:pw@db:3306/app"),
+            ("ES_HOSTS", "[\"https://elastic:pw@es:9200\"]"),
+            ("SENTINELS", "redis://s1:26379,redis://:pw@s2:26379"),
+            ("PG", "postgres://u:p,w@h/db"),
         ];
         let kept = [
             ("PATH", "/usr/bin"),
@@ -1436,6 +1493,8 @@ mod tests {
             ("SERVER_URL", "https://host/path"),
             ("REMOTE", "https://user@host/path"),
             ("ADDR", "redis://h:6379/0"),
+            ("MIRRORS", "https://a.example:443,https://u@b.example"),
+            ("NEXT", "https://a.example/x?to=http://b.example"),
         ];
         let parent: BTreeMap<String, String> =
             withheld.iter().chain(&kept).map(|(k, v)| (k.to_string(), v.to_string())).collect();

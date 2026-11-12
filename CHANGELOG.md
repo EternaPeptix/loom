@@ -109,11 +109,13 @@ upgrade" first; the rest says what behaves differently.
   and LaunchServices opens, Apple Events and launchd jobs are denied. More environment variables are
   withheld (names ending `_PAT`, `_DSN` or `_PWD`, `DATABASE_URL`, `SSH_AUTH_SOCK`, and names
   containing `COOKIE`). Path rules that refuse ignore case on macOS.
-- More credential stores are unreadable to commands by default (model-hub, database, cloud, registry,
-  password-manager, wallet, Mail and Messages stores; see `docs/DESIGN.md`), and more environment
-  variables are withheld: names with a session, auth, pass, jwt, webhook or private part, every model
-  profile's `api_key_env`, and any value that is a URL with a password. A process that leaves its
-  command's process group (`setsid`, `daemonize`) is still not stopped by `job_kill` or session end.
+- More credential stores are unreadable to commands by default (model-hub, AI-tool, database, cloud,
+  registry, password-manager, wallet, browser, chat, Mail and Messages stores; see `docs/DESIGN.md`;
+  whole directories such as `~/.cache/huggingface` and `~/.fly`, with what else they hold), and more
+  environment variables are withheld: names with a session, auth, pass, jwt, webhook or private part,
+  names containing `PASSPHRASE` or ending `_PW`, every model profile's `api_key_env`, and any value that
+  holds a URL with a password. A process that leaves its command's process group (`setsid`,
+  `daemonize`) is still not stopped by `job_kill` or session end.
 - A command is over only when its whole process group is empty. A command whose leader exits while
   others run returns at once with the output so far and a job id. Exit codes above 128 are reported as
   exit codes with a note that 128+N usually means signal N. A command whose output passes

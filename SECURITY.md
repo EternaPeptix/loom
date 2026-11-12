@@ -54,10 +54,11 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
 - **Credential stores are unreadable and unwritable** by default (`protect_credentials = true`): `~/.ssh`,
   `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`,
   `~/.docker/config.json`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, cargo and git credential files, password
-  stores and password-manager data, cloud, registry, model-hub and database client credentials
-  (`~/.cache/huggingface`, `~/.pgpass`, `~/.vault-token`, `~/.m2/settings.xml`, `~/.config/rclone`, and
-  more), wallets, the macOS Keychains and Cookies folders, Mail, Messages, Group Containers and the
-  Chrome, Firefox and Safari profiles. So are
+  stores and password-manager data, cloud, registry, model-hub, AI-tool and database client credentials
+  (`~/.cache/huggingface`, `~/.claude.json`, `~/.pgpass`, `~/.vault-token`, `~/.m2/settings.xml`,
+  `~/.config/rclone`, and more), wallets, the macOS Keychains and Cookies folders, Mail, Messages,
+  Telegram, Group Containers and the Chrome, Chromium, Brave, Edge, Arc, Vivaldi, Opera, Firefox and
+  Safari profiles. So are
   the loom token and keys and your `unreadable_paths`. A listed directory that is or contains the
   workspace is skipped.
 - **The network** is closed except for loopback connections to the egress proxy (and any ports or sockets

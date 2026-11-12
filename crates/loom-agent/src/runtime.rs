@@ -5949,7 +5949,8 @@ mod tests {
         let packs = Packs::builtin().unwrap();
         let rw = packs.role(None, Some("worker")).unwrap();
         let mut models = BTreeMap::new();
-        for (name, var) in [("a", Some("MYSERVER_ACCESS")), ("b", Some("MYSERVER_ACCESS")), ("c", None), ("d", Some("OTHER"))] {
+        let vars = [("a", Some("MYSERVER_ACCESS")), ("b", Some("MYSERVER_ACCESS")), ("c", None), ("d", Some("OTHER"))];
+        for (name, var) in vars {
             let p = loom_core::config::ModelProfile { api_key_env: var.map(str::to_string), ..Default::default() };
             models.insert(name.to_string(), p);
         }
