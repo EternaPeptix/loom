@@ -891,6 +891,7 @@ export function ledgerModel(view) {
     empty: !s.entries,
     goal: s.goal || null,
     constraints: (s.constraints || []).map((c) => ({ id: c.id, text: c.text, retired: c.retired || null })),
+    approvals: (s.approvals || []).map((a) => ({ id: a.id, text: a.text, scope: a.scope || "", usedFor: a.used_for || null })),
     plan: (s.plan || []).map((p) => ({ id: p.id, text: p.text, status: p.status, note: p.note || "" })),
     claims: (s.claims || []).map((c) => ({
       id: c.id,
@@ -914,6 +915,68 @@ export function ledgerModel(view) {
     deadEnds: (s.dead_ends || []).map((d) => ({ id: d.id, what: d.what, why: d.why })),
     questions: (s.questions || []).map((q) => ({ id: q.id, text: q.text, blocking: !!q.blocking, answer: q.answer ?? null })),
   };
+}
+
+/**
+ * What the rules control lists under its inputs: the rules in force (the ones that can be
+ * withdrawn) and every approval, a used one marked so that it does not read as still available.
+ * `asking` is the rule whose withdrawal the operator was asked to confirm; it is kept only while
+ * that rule is still in force.
+ */
+export function ruleLists(model, asking) {
+  const m = model || {};
+  const rules = (m.constraints || []).filter((c) => !c.retired).map((c) => ({ id: c.id, text: c.text }));
+  return {
+    rules,
+    asking: rules.some((r) => r.id === asking) ? asking : null,
+    approvals: (m.approvals || []).map((a) => ({
+      id: a.id,
+      text: a.text,
+      used: !!a.usedFor,
+      note: a.usedFor ? `used for: ${a.usedFor}` : a.scope ? `scope: ${a.scope}` : "",
+    })),
+  };
+}
+
+/**
+ * Operator rule requests: `{ path, body }` for `api("POST", path, body)`, or `{ error }` when the
+ * input is blank. A child's id is fine: the daemon routes it to the lead of its mission. The scope
+ * of an approval and the reason of a withdrawal may be blank: a mission's ledger records a stock one.
+ */
+export function ruleRequest(session, text) {
+  const t = String(text || "").trim();
+  if (!t) return { error: "Write the rule to set." };
+  return { path: `/api/sessions/${encodeURIComponent(session)}/rules`, body: { text: t } };
+}
+export function approvalRequest(session, text, scope) {
+  const t = String(text || "").trim();
+  if (!t) return { error: "Write what is approved." };
+  return { path: `/api/sessions/${encodeURIComponent(session)}/approvals`, body: { text: t, scope: String(scope || "").trim() } };
+}
+export function withdrawRequest(session, ruleId, reason) {
+  if (!ruleId) return { error: "Choose the rule to withdraw." };
+  const path = `/api/sessions/${encodeURIComponent(session)}/rules/${encodeURIComponent(ruleId)}/withdraw`;
+  return { path, body: { reason: String(reason || "").trim() } };
+}
+
+/**
+ * What the rules control says once the daemon accepted a request, from its receipt (`queued`: the
+ * lead was in a turn; `ledger`: the mission keeps one). Nothing when the lists are about to show it;
+ * otherwise why they do not yet, or never will, so that the operator does not send it twice.
+ */
+export function ruleNotice(receipt) {
+  const r = receipt || {};
+  const said = [];
+  if (r.queued) said.push("Sent, not recorded yet: the lead was in a turn and records this at its next step, not while a tool call is running.");
+  if (r.ledger === false) said.push("This mission keeps no ledger: the lead gets this as a note that stays in its context, and nothing is listed here.");
+  else if (r.queued) said.push("It shows here once it is recorded; there is no need to send it again.");
+  return said.join(" ");
+}
+
+/** The line under the rules control while the mission has no ledger to list rules and approvals from. */
+export function rulesHint(ledgerError) {
+  if (!String(ledgerError || "").startsWith("No ledger")) return "";
+  return "Nothing is listed while this mission has no ledger. A lead that keeps none still gets every rule and approval as a note that stays in its context.";
 }
 
 const STEP_MARK = { todo: "○", doing: "◐", done: "●", dropped: "✕" };

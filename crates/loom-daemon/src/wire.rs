@@ -2,7 +2,7 @@
 //!
 //! Everything else on the wire is the serde form of a type from `loom_agent::runtime`
 //! (`SessionInfo`, `NewSession`, `InboxEntry`, `WindowView`, `LedgerView`, `MissionInfo`, `NetEntry`,
-//! `ModelHealth`, `BusEvent`) or `loom_core` (`Record`, `BlobRef`).
+//! `ModelHealth`, `RuleReceipt`, `BusEvent`) or `loom_core` (`Record`, `BlobRef`).
 
 use loom_agent::runtime::{ModelHealth, SessionInfo};
 use loom_core::event::{Record, Seq};
@@ -60,6 +60,33 @@ pub struct LinesView {
 #[serde(deny_unknown_fields)]
 pub struct MessageBody {
     pub text: String,
+}
+
+/// Body of `POST /api/sessions/{id}/rules`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleBody {
+    pub text: String,
+}
+
+/// Body of `POST /api/sessions/{id}/approvals`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalBody {
+    pub text: String,
+    /// What the approval covers. Left out or blank, a mission that keeps a ledger records a stock
+    /// scope in its place (the answer's `stock`).
+    #[serde(default)]
+    pub scope: String,
+}
+
+/// Body of `POST /api/sessions/{id}/rules/{rule_id}/withdraw`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WithdrawBody {
+    /// Why the rule is withdrawn. Left out or blank, the runtime records a stock reason in its place.
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// Body of `POST /api/inbox/{item_id}`.

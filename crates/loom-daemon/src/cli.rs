@@ -27,6 +27,15 @@
 //! - `send <session> <text…>` (`-` = standard input), then follows unless `--detach`.
 //! - `stop <session>`, `resume <session>`, `reweave <session>`, `archive <session> [--undo]`: the
 //!   call, then one line saying what was asked (`stop requested for {id}`).
+//! - `rule <session> <text…>` (`-` = standard input): `client.add_rule`; `rule sent to {lead}`.
+//!   `rule <session> --withdraw <rule-id> [--reason <text>]`: `client.withdraw_rule`; `withdrawal of
+//!   {rule-id} sent to {lead}`. `approve <session> <text…> [--scope <text>]`: `client.approve`;
+//!   `approval sent to {lead}`. A child's id reaches its lead, which the line names. The line is
+//!   made from the daemon's receipt (`receipt_line`): `sent to` an idle lead, which records it at
+//!   once; `queued for` a lead in a turn, which records it at its next step (`… queued for {lead}:
+//!   the lead is in a turn and records it at its next step, not while a tool call is running; check
+//!   with loom ledger {lead}`). It also names a stock scope or reason that was recorded for a blank
+//!   one, and says when the mission keeps no ledger (the rule is then a note without an id).
 //! - `inbox`: `render::inbox_list`. `answer <item> <text…>`: `client.answer`; `answered {item}`.
 //! - `ledger <session|mission>`: the ledger's `markdown`.
 //! - `window <session>`: `render::window_table`. `net <session> [-n <limit>]`: `render::net_table`.
@@ -66,7 +75,7 @@
 use crate::client::{self, Client};
 use crate::render::{self, RecordOpts, Style};
 use clap::{Args, Parser, Subcommand};
-use loom_agent::runtime::{BusEvent, Delta, NewSession};
+use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt};
 use loom_agent::session::Phase;
 use loom_core::config::{Config, Paths};
 use loom_core::event::{Budget, Event, Record, Seq, SessionOutcome, TurnEndReason};
@@ -144,6 +153,10 @@ pub enum Command {
     Reweave(SessionArg),
     /// Hide a finished session (or bring it back with --undo)
     Archive(ArchiveArgs),
+    /// Set a standing rule for a mission (or withdraw one with --withdraw)
+    Rule(RuleArgs),
+    /// Record an approval for a mission
+    Approve(ApproveArgs),
     /// List what is waiting for you
     Inbox,
     /// Answer an inbox item
@@ -280,6 +293,31 @@ pub struct ArchiveArgs {
 #[derive(Args, Debug)]
 pub struct AnswerArgs {
     pub item: String,
+    pub text: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct RuleArgs {
+    /// A session id, the beginning of one, or `last`
+    pub session: String,
+    /// Withdraw the rule with this id (such as k1) instead of setting one; say why with --reason
+    #[arg(long, value_name = "RULE_ID", conflicts_with = "text")]
+    pub withdraw: Option<String>,
+    /// Why the rule is withdrawn (left out: recorded as "no reason given")
+    #[arg(long, requires = "withdraw")]
+    pub reason: Option<String>,
+    /// The rule ("-": read standard input)
+    pub text: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ApproveArgs {
+    /// A session id, the beginning of one, or `last`
+    pub session: String,
+    /// What the approval covers (left out: a ledger records "only what the approval says")
+    #[arg(long)]
+    pub scope: Option<String>,
+    /// What is approved ("-": read standard input)
     pub text: Vec<String>,
 }
 
@@ -442,22 +480,49 @@ fn read_stdin() -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "Standard input is not valid text (UTF-8).".to_string())
 }
 
-/// The message of `run` and `send`: the words, or standard input for `-`. Reading from a terminal
-/// happens only when asked for with `-`; with no words at all it is an error, never a silent wait.
-fn read_message(words: &[String]) -> Result<String, String> {
+/// The text of `run`, `send`, `rule` and `approve`: the words, or standard input for `-`. Reading
+/// from a terminal happens only when asked for with `-`; with no words at all it is an error, never
+/// a silent wait. `noun` is what the text is (`message`, `rule`, `approval`), for the refusals.
+fn read_message(words: &[String], noun: &str) -> Result<String, String> {
     let text = match message_from_args(words) {
         Some(t) => t,
         None => {
             if words.is_empty() && std::io::stdin().is_terminal() {
-                return Err("There is no message. Put it after the command, pipe it in, or give `-` to type it (end with Ctrl-D).".to_string());
+                return Err(format!(
+                    "There is no {noun}. Put it after the command, pipe it in, or give `-` to type it (end with Ctrl-D)."
+                ));
             }
             read_stdin()?
         }
     };
     if text.trim().is_empty() {
-        return Err("The message is empty.".to_string());
+        return Err(format!("The {noun} is empty."));
     }
     Ok(text)
+}
+
+/// The line printed once the daemon accepted a rule, an approval or a withdrawal. `what` names it
+/// (`rule`, `withdrawal of k1`) and `stock_of` what a stock text stands in for (`scope`, `reason`;
+/// a rule has neither). It says whether the lead records it at once (`sent to` an idle lead) or has
+/// it only in its queue.
+fn receipt_line(what: &str, stock_of: &str, r: &RuleReceipt) -> String {
+    let lead = r.lead.as_str();
+    let mut parts = vec![if r.queued {
+        format!(
+            "{what} queued for {lead}: the lead is in a turn and records it at its next step, not while a tool call is running"
+        )
+    } else {
+        format!("{what} sent to {lead}")
+    }];
+    if let Some(stock) = &r.stock {
+        parts.push(format!("{stock_of} recorded as \"{stock}\""));
+    }
+    if !r.ledger {
+        parts.push("this mission keeps no ledger, so it is a note in the lead's window without an id".to_string());
+    } else if r.queued {
+        parts.push(format!("check with loom ledger {lead}"));
+    }
+    parts.join("; ")
 }
 
 fn non_zero(n: u32) -> Option<u32> {
@@ -873,7 +938,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             tail_with(&c, &a, &cfg, &mut StdoutSink).await
         }
         Command::Send(a) => {
-            let text = read_message(&a.text)?;
+            let text = read_message(&a.text, "message")?;
             let c = client_of(&paths)?;
             let id = c.resolve(&a.session).await?;
             let style = style();
@@ -905,6 +970,26 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             let id = c.resolve(&a.session).await?;
             c.archive(&id, !a.undo).await?;
             outln(&format!("{} {id}", if a.undo { "restored" } else { "archived" })).map(|()| 0)
+        }
+        Command::Rule(a) => {
+            let c = client_of(&paths)?;
+            if let Some(rule) = &a.withdraw {
+                let id = c.resolve(&a.session).await?;
+                let receipt = c.withdraw_rule(&id, rule, a.reason.as_deref().unwrap_or("")).await?;
+                let what = format!("withdrawal of {}", rule.trim());
+                return outln(&receipt_line(&what, "reason", &receipt)).map(|()| 0);
+            }
+            let text = read_message(&a.text, "rule")?;
+            let id = c.resolve(&a.session).await?;
+            let receipt = c.add_rule(&id, &text).await?;
+            outln(&receipt_line("rule", "", &receipt)).map(|()| 0)
+        }
+        Command::Approve(a) => {
+            let text = read_message(&a.text, "approval")?;
+            let c = client_of(&paths)?;
+            let id = c.resolve(&a.session).await?;
+            let receipt = c.approve(&id, &text, a.scope.as_deref().unwrap_or("")).await?;
+            outln(&receipt_line("approval", "scope", &receipt)).map(|()| 0)
         }
         Command::Inbox => {
             let list = client_of(&paths)?.inbox().await?;
@@ -1014,7 +1099,7 @@ async fn cmd_open(paths: &Paths, a: &OpenArgs) -> Result<i32, String> {
 }
 
 async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
-    let message = read_message(&a.message)?;
+    let message = read_message(&a.message, "message")?;
     let c = client_of(paths)?;
     let cwd = std::env::current_dir().map_err(|e| format!("Cannot find the current directory ({e}). Pass --workspace."))?;
     let info = c.create(&new_session(&a.start, Some(message), &cwd)).await?;
@@ -1266,6 +1351,26 @@ mod tests {
         assert!(a.undo);
         let Command::Archive(a) = ok(&["archive", "s-1"]) else { panic!("not archive") };
         assert!(!a.undo);
+        let Command::Rule(a) = ok(&["rule", "s-1", "no", "prod"]) else { panic!("not rule") };
+        assert_eq!((a.session.as_str(), a.text, a.withdraw), ("s-1", words(&["no", "prod"]), None));
+        let Command::Rule(a) = ok(&["rule", "last", "--withdraw", "k2", "--reason", "done now"]) else {
+            panic!("not rule")
+        };
+        assert_eq!((a.withdraw.as_deref(), a.reason.as_deref()), (Some("k2"), Some("done now")));
+        assert!(a.text.is_empty());
+        rejected(&["rule"]);
+        rejected(&["rule", "s-1", "--withdraw", "k1", "extra words"]);
+        rejected(&["rule", "s-1", "--reason", "why"]);
+        // The reason and the scope are optional; a mission's ledger records a stock one in their place.
+        let Command::Rule(a) = ok(&["rule", "s-1", "--withdraw", "k1"]) else { panic!("not rule") };
+        assert_eq!((a.withdraw.as_deref(), a.reason), (Some("k1"), None));
+        let Command::Approve(a) = ok(&["approve", "s-1", "ship", "it"]) else { panic!("not approve") };
+        assert_eq!((a.text, a.scope), (words(&["ship", "it"]), None));
+        let Command::Approve(a) = ok(&["approve", "s-1", "ship", "it", "--scope", "staging"]) else {
+            panic!("not approve")
+        };
+        assert_eq!((a.text, a.scope.as_deref()), (words(&["ship", "it"]), Some("staging")));
+        rejected(&["approve"]);
         let Command::Answer(a) = ok(&["answer", "i-1", "yes", "please"]) else { panic!("not answer") };
         assert_eq!((a.item.as_str(), a.text), ("i-1", words(&["yes", "please"])));
         let Command::Answer(a) = ok(&["answer", "i-1"]) else { panic!("not answer") };
@@ -1301,6 +1406,42 @@ mod tests {
         assert_eq!(message_from_args(&words(&["-", "x"])).as_deref(), Some("- x"));
         assert_eq!(message_from_args(&words(&["-"])), None);
         assert_eq!(message_from_args(&[]), None);
+        // The refusal names what was asked for: a rule or an approval is not a message.
+        assert_eq!(read_message(&words(&["no", "prod"]), "rule").as_deref(), Ok("no prod"));
+        assert_eq!(read_message(&words(&["  "]), "rule").unwrap_err(), "The rule is empty.");
+        assert_eq!(read_message(&words(&[" ", ""]), "approval").unwrap_err(), "The approval is empty.");
+        assert_eq!(read_message(&words(&[""]), "message").unwrap_err(), "The message is empty.");
+    }
+
+    #[test]
+    fn receipt_lines_say_whether_the_lead_has_recorded_it() {
+        let receipt = |queued: bool, ledger: bool, stock: Option<&str>| RuleReceipt {
+            lead: SessionId::from("s-1"),
+            queued,
+            ledger,
+            stock: stock.map(str::to_string),
+        };
+        assert_eq!(receipt_line("rule", "", &receipt(false, true, None)), "rule sent to s-1");
+        assert_eq!(
+            receipt_line("rule", "", &receipt(true, true, None)),
+            "rule queued for s-1: the lead is in a turn and records it at its next step, not while a tool call is running; check with loom ledger s-1"
+        );
+        assert_eq!(
+            receipt_line("approval", "scope", &receipt(false, true, Some("only what the approval says"))),
+            "approval sent to s-1; scope recorded as \"only what the approval says\""
+        );
+        assert_eq!(
+            receipt_line("withdrawal of k2", "reason", &receipt(true, true, Some("no reason given"))),
+            "withdrawal of k2 queued for s-1: the lead is in a turn and records it at its next step, not while a tool call is running; reason recorded as \"no reason given\"; check with loom ledger s-1"
+        );
+        assert_eq!(
+            receipt_line("rule", "", &receipt(false, false, None)),
+            "rule sent to s-1; this mission keeps no ledger, so it is a note in the lead's window without an id"
+        );
+        // Words after --withdraw are refused by the parser; the help says where they belong.
+        let help = parse(&["rule", "--help"]).unwrap_err().to_string();
+        let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(help.contains("say why with --reason"), "{help}");
     }
 
     #[test]

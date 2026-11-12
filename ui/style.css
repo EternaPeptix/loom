@@ -243,6 +243,10 @@ details.reasoning > pre { color: var(--dim); border-left: 2px solid var(--line);
 .panel .ev { margin: 3px 0 3px 14px; padding-left: 8px; border-left: 2px solid var(--line); font-size: 12px; }
 .panel .ev.no { border-left-color: var(--bad); }
 .panel .ev pre { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--dim); }
+.panel .rule-row { display: flex; gap: 4px; margin: 3px 0; }
+.panel .rule-in { flex: 1 1 auto; min-width: 0; font: inherit; padding: 3px 5px; }
+.panel .rule-note { margin: 3px 0; font-size: 12px; }
+.panel .rule-note:empty { display: none; }
 .panel .retired { text-decoration: line-through; color: var(--dim); }
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 10px; }
 .kv dt { color: var(--dim); }

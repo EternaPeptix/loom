@@ -39,6 +39,9 @@
 //! | `GET /sessions/{id}/records?after={seq}&limit={n}` | `runtime.records` (`limit` default 500, at most 2000) | `RecordsPage` (`next_after` = last seq of the page when the page is full, else `null`) |
 //! | `GET /sessions/{id}/stream?after={seq}` | see *Streams* | SSE |
 //! | `POST /sessions/{id}/messages` (`MessageBody`) | `runtime.send_message` | `202` `{}` |
+//! | `POST /sessions/{id}/rules` (`RuleBody`) | `runtime.add_rule` (a child's id goes to its lead) | `202` `RuleReceipt` (`queued`: the lead is in a turn and records it at its next step) |
+//! | `POST /sessions/{id}/approvals` (`ApprovalBody`; `scope` may be left out) | `runtime.approve` | `202` `RuleReceipt` |
+//! | `POST /sessions/{id}/rules/{rule_id}/withdraw` (`WithdrawBody`; `reason` may be left out) | `runtime.withdraw_rule` (`404` when the mission has no such rule, `409` when it is already withdrawn) | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/stop` | `runtime.stop` | `202` `{}` |
 //! | `POST /sessions/{id}/resume` | `runtime.resume` | `202` `{}` |
 //! | `POST /sessions/{id}/reweave` | `runtime.reweave` | `202` `{}` |
@@ -96,7 +99,8 @@
 use crate::auth;
 use crate::ui;
 use crate::wire::{
-    AnswerBody, ArchiveBody, ErrorBody, LinesView, MessageBody, RecordsPage, SessionDetail, StatusView,
+    AnswerBody, ApprovalBody, ArchiveBody, ErrorBody, LinesView, MessageBody, RecordsPage, RuleBody, SessionDetail,
+    StatusView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -162,6 +166,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/records", get(records))
         .route("/api/sessions/{id}/stream", get(session_stream))
         .route("/api/sessions/{id}/messages", post(message))
+        .route("/api/sessions/{id}/rules", post(add_rule))
+        .route("/api/sessions/{id}/approvals", post(approve))
+        .route("/api/sessions/{id}/rules/{rule_id}/withdraw", post(withdraw_rule))
         .route("/api/sessions/{id}/stop", post(stop))
         .route("/api/sessions/{id}/resume", post(resume))
         .route("/api/sessions/{id}/reweave", post(reweave))
@@ -462,6 +469,28 @@ async fn message(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes)
     let body: MessageBody = json_body(&body)?;
     s.runtime.send_message(&SessionId::from(id), &body.text).await.map_err(rt_err)?;
     Ok(accepted())
+}
+
+async fn add_rule(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: RuleBody = json_body(&body)?;
+    let receipt = s.runtime.add_rule(&SessionId::from(id), &body.text).await.map_err(rt_err)?;
+    Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
+}
+
+async fn approve(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: ApprovalBody = json_body(&body)?;
+    let receipt = s.runtime.approve(&SessionId::from(id), &body.text, &body.scope).await.map_err(rt_err)?;
+    Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
+}
+
+async fn withdraw_rule(
+    State(s): State<ApiState>,
+    Path((id, rule_id)): Path<(String, String)>,
+    body: Bytes,
+) -> Res<Response> {
+    let body: WithdrawBody = json_body(&body)?;
+    let receipt = s.runtime.withdraw_rule(&SessionId::from(id), &rule_id, &body.reason).await.map_err(rt_err)?;
+    Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
 }
 
 async fn stop(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
@@ -890,6 +919,19 @@ mod tests {
             }
         }
 
+        /// The state of the mission's ledger once `done` holds for it.
+        async fn ledger_state(&self, mission: &str, what: &str, done: impl Fn(&Value) -> bool) -> Value {
+            let end = tokio::time::Instant::now() + WAIT;
+            loop {
+                let (_, ledger) = self.get(&format!("/api/missions/{mission}/ledger")).await;
+                if done(&ledger["state"]) {
+                    return ledger["state"].clone();
+                }
+                assert!(tokio::time::Instant::now() < end, "timed out waiting for {what} in the ledger");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
         async fn sse(&self, path: &str, headers: &[(&str, &str)]) -> Sse {
             let mut request = self.rq(Method::GET, path);
             for (k, v) in headers {
@@ -1234,6 +1276,96 @@ mod tests {
         assert_eq!(s, 409);
         let (s, _) = e.post(&format!("/api/sessions/{child}/archive"), json!({"archived": true})).await;
         assert_eq!(s, 409);
+    }
+
+    #[tokio::test]
+    async fn rule_routes_record_for_the_lead_refuse_bad_input_and_the_ledger_route_checks_its_id() {
+        let e = env(lead_script(json!({"question": "CHILDMARK find it"}))).await;
+        let id = e.create("go").await;
+        e.wait_turn_ends(&id, 1).await;
+        // Once the runtime has seen the lead's turn end, a receipt says the lead took the input at once.
+        let end = tokio::time::Instant::now() + WAIT;
+        let detail = loop {
+            let (_, detail) = e.get(&format!("/api/sessions/{id}")).await;
+            if detail["status"]["phase"] == "idle" {
+                break detail;
+            }
+            assert!(tokio::time::Instant::now() < end, "timed out waiting for the lead to be idle");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let child = detail["children"][0]["id"].as_str().unwrap().to_string();
+        let (_, missions) = e.get("/api/missions").await;
+        let mission = missions[0]["id"].as_str().unwrap().to_string();
+        // What every accepted request answers: the lead it went to, whatever session was named.
+        let receipt = |stock: Value| json!({"lead": id, "queued": false, "ledger": true, "stock": stock});
+
+        let (s, b) = e.post(&format!("/api/sessions/{child}/rules"), json!({"text": " no prod\n"})).await;
+        assert_eq!((s, b), (202, receipt(Value::Null)));
+        let state = e.ledger_state(&mission, "the rule", |s| s["constraints"].get(0).is_some()).await;
+        assert_eq!(state["constraints"][0]["text"], "no prod");
+        let rule_id = state["constraints"][0]["id"].as_str().unwrap().to_string();
+
+        // The scope of an approval and the reason of a withdrawal may be left out, as the command
+        // line and the page do: both are recorded all the same.
+        let (s, b) = e.post(&format!("/api/sessions/{id}/approvals"), json!({"text": "ship it", "scope": "staging"})).await;
+        assert_eq!((s, b), (202, receipt(Value::Null)));
+        let (s, b) = e.post(&format!("/api/sessions/{id}/approvals"), json!({"text": "run the tests"})).await;
+        assert_eq!((s, b), (202, receipt(json!("only what the approval says"))));
+        let two = |s: &Value| s["approvals"].as_array().is_some_and(|a| a.len() == 2);
+        let approvals = e.ledger_state(&mission, "the approvals", two).await["approvals"].clone();
+        assert_eq!((&approvals[0]["text"], &approvals[0]["scope"]), (&json!("ship it"), &json!("staging")));
+        assert_eq!(approvals[1]["id"], "a2");
+        assert_eq!(approvals[1]["text"], "run the tests");
+        assert_eq!(approvals[1]["scope"], "only what the approval says");
+
+        let withdraw = format!("/api/sessions/{id}/rules/{rule_id}/withdraw");
+        let (s, b) = e.post(&withdraw, json!({"reason": "done"})).await;
+        assert_eq!((s, b), (202, receipt(Value::Null)));
+        let state = e.ledger_state(&mission, "the withdrawal", |s| !s["constraints"][0]["retired"].is_null()).await;
+        assert_eq!(state["constraints"][0]["retired"], "done");
+        let (s, b) = e.post(&format!("/api/sessions/{child}/rules"), json!({"text": "ask first"})).await;
+        assert_eq!((s, b), (202, receipt(Value::Null)));
+        e.ledger_state(&mission, "the second rule", |s| s["constraints"].get(1).is_some()).await;
+        let (s, b) = e.post(&format!("/api/sessions/{child}/rules/k2/withdraw"), json!({})).await;
+        assert_eq!((s, b), (202, receipt(json!("no reason given"))));
+        let retired = |s: &Value| !s["constraints"][1]["retired"].is_null();
+        let state = e.ledger_state(&mission, "the second withdrawal", retired).await;
+        assert_eq!(state["constraints"][1]["retired"], "no reason given");
+
+        // A withdrawal that would change nothing is refused rather than accepted and dropped.
+        let (s, b) = e.post(&withdraw, json!({})).await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (409, "Rule k1 is already withdrawn."));
+        let (s, b) = e.post(&format!("/api/sessions/{id}/rules/k9/withdraw"), json!({"reason": "typo"})).await;
+        let none = "There is no rule k9 in this mission; it has no rules in force.";
+        assert_eq!((s, b["error"].as_str().unwrap()), (404, none));
+
+        let (s, b) = e.post(&format!("/api/sessions/{id}/rules"), json!({"text": "  "})).await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (409, "Write the rule to set."));
+        let (s, b) = e.post(&format!("/api/sessions/{id}/approvals"), json!({"text": ""})).await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (409, "Write what is approved."));
+        let (s, b) = e.post("/api/sessions/s-nope/rules", json!({"text": "x"})).await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (404, "There is no session s-nope."));
+        let (s, _) = e.post("/api/sessions/s-nope/rules/k1/withdraw", json!({})).await;
+        assert_eq!(s, 404);
+        let (s, _) = e.post(&format!("/api/sessions/{id}/rules"), json!({"text": "x", "extra": 1})).await;
+        assert_eq!(s, 400);
+
+        // A mission whose lead keeps no ledger: the receipt says the rule is a note only, and a
+        // withdrawal by id is refused with what to do instead.
+        let (s, chat) = e.post("/api/sessions", json!({"workspace": e.ws, "role": "chat"})).await;
+        assert_eq!(s, 201, "{chat}");
+        let chat = chat["id"].as_str().unwrap().to_string();
+        let (s, b) = e.post(&format!("/api/sessions/{chat}/rules"), json!({"text": "no prod"})).await;
+        assert_eq!((s, b), (202, json!({"lead": chat, "queued": false, "ledger": false, "stock": null})));
+        let (s, b) = e.post(&format!("/api/sessions/{chat}/rules/k1/withdraw"), json!({})).await;
+        assert_eq!(s, 404, "{b}");
+        assert!(b["error"].as_str().unwrap().ends_with("Tell the lead in a message that the rule no longer applies."), "{b}");
+
+        for bad in ["..%2F..%2Fetc", "..%2Fsessions%2Fx", "m-nope"] {
+            let (s, b) = e.get(&format!("/api/missions/{bad}/ledger")).await;
+            assert_eq!(s, 404, "{bad}: {b}");
+            assert!(b["error"].as_str().unwrap().starts_with("There is no mission"), "{b}");
+        }
     }
 
     #[tokio::test]
