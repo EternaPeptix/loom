@@ -28,15 +28,18 @@
 //!   `resolve(word)` and that session's mission.
 //! - `stream(id, after)` / `events(deltas)`: open the event stream and return an [`EventStream`].
 //!   `EventStream::next()` yields each event as a `BusEvent` (`loom_model::assemble::SseParser` over
-//!   the body's chunks, each payload parsed as `BusEvent`; a payload that does not parse is skipped
-//!   with `tracing::debug!`), `None` when the server closes the stream, `Some(Err(sentence))` when
-//!   the connection breaks (`The connection to the daemon was lost.`).
+//!   the body's chunks, each payload parsed as `BusEvent`; a `record` event whose record does not
+//!   parse, one served as stored, has it read with `loom_core::log::record_from_value`, as
+//!   `wire::RecordsPage` does; a payload that does not parse is skipped with `tracing::debug!`),
+//!   `None` when the server closes the stream, `Some(Err(sentence))` when the connection breaks
+//!   (`The connection to the daemon was lost.`).
 //!
 //! Tests required (against a small `axum` server in the test that plays the daemon — no runtime
 //! needed): the bearer header is sent; each call hits the documented method and path and parses the
 //! documented body; the four error forms; `resolve` (exact, prefix with and without `s-`, `last`,
 //! none, several); `mission_of`; a stream delivering events split across chunks, a comment line and
-//! an unparsable payload in between, then end of stream; `from_home` preferring `daemon.json`.
+//! an unparsable payload in between, then end of stream; a stream's record served as stored (an
+//! opaque one) arriving as `Event::Unknown`; `from_home` preferring `daemon.json`.
 //!
 //! Beyond the contract: a stream that is silent for 60 s (the daemon sends a comment every 15 s) is
 //! treated as a lost connection, so a daemon that hangs cannot hang a follower; `bind_from_home`
@@ -62,9 +65,11 @@ use loom_agent::runtime::{
 };
 use loom_core::config::{Config, Paths};
 use loom_core::event::Seq;
+use loom_core::log::record_from_value;
 use loom_core::{BlobRef, MissionId, SessionId};
 use reqwest::Method;
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use std::io::Write;
 use std::time::Duration;
 
@@ -179,7 +184,7 @@ impl EventStream {
                         }
                     };
                     for payload in payloads {
-                        match serde_json::from_str::<BusEvent>(&payload) {
+                        match bus_event(&payload) {
                             Ok(event) => self.ready.push_back(event),
                             Err(e) => tracing::debug!("skipping an event that did not parse: {e}"),
                         }
@@ -196,6 +201,24 @@ impl EventStream {
             }
         }
     }
+}
+
+/// One stream payload as a `BusEvent`, or as [`stored_record`] reads it.
+fn bus_event(payload: &str) -> Result<BusEvent, serde_json::Error> {
+    serde_json::from_str::<BusEvent>(payload).or_else(|error| stored_record(payload).ok_or(error))
+}
+
+/// A `record` event whose record does not parse as one (a record the daemon served as stored because it could not
+/// read it in full), with its record read as the log reader reads it, as `wire::RecordsPage` does:
+/// `Event::Unknown` when its header is sound.
+fn stored_record(payload: &str) -> Option<BusEvent> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("record") {
+        return None;
+    }
+    let session = SessionId::deserialize(value.get("session")?).ok()?;
+    let record = record_from_value(value.get("record")?)?;
+    Some(BusEvent::Record { session, record: Box::new(record) })
 }
 
 /// The address the daemon listens on: `daemon.json` when it exists, else the configuration.
@@ -1279,6 +1302,30 @@ mod tests {
         let seen = shared.lock().unwrap().seen.clone();
         assert_eq!(seen[0].target, "/api/sessions/s-1/stream?after=4");
         assert_eq!(seen[0].auth.as_deref(), Some("Bearer tok-123"));
+    }
+
+    #[tokio::test]
+    async fn a_streamed_record_served_as_stored_arrives_as_the_log_reader_reads_it() {
+        // A known kind holding a value this build does not know (an opaque record), as a replay sends it.
+        let line = concat!(
+            r#"{"seq":7,"ts_ms":8,"author":"harness","prev":"abc","kind":"harness_note","#,
+            r#""note":"from_a_newer_loom","text":"x","more":[1]}"#
+        );
+        let stored = format!("data: {{\"type\":\"record\",\"session\":\"s-1\",\"record\":{line}}}\n\n");
+        let not_a_record = "data: {\"type\":\"record\",\"session\":\"s-1\",\"record\":{\"kind\":\"user_message\"}}\n\n";
+        let script = Script::default().stream(vec![
+            Piece::Data(stored),
+            Piece::Data(not_a_record.into()),
+            Piece::Data(sse(&lagged(3))),
+        ]);
+        let (client, _) = start(script).await;
+        let mut stream = client.stream(&SessionId::from("s-1"), None).await.unwrap();
+        let Some(Ok(BusEvent::Record { session, record })) = stream.next().await else { panic!("no record came") };
+        assert_eq!(session, SessionId::from("s-1"));
+        let read = (record.seq, record.ts_ms, record.prev.as_str(), &record.event);
+        assert_eq!(read, (7, 8, "abc", &loom_core::Event::Unknown));
+        assert_eq!(stream.next().await.unwrap().unwrap(), lagged(3));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

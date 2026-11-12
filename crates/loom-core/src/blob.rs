@@ -338,8 +338,8 @@ impl BlobStore {
 
     /// The blob's line index, opened for reading single entries, when it passes the checks that cost the same
     /// however long it is: a whole number of 8-byte entries, none for an empty blob, the first 0, and the last
-    /// inside the blob and starting its last line (so a truncated index is noticed). `None` when it is missing
-    /// or fails them.
+    /// above the first (when there are two or more), inside the blob and starting its last line (so a truncated
+    /// index is noticed). `None` when it is missing or fails them.
     fn line_index(&self, id: &BlobId, blob: &Path, size: u64) -> io::Result<Option<LineIndex>> {
         let Ok(file) = File::open(self.idx_path(id)) else { return Ok(None) };
         let Ok(len) = file.metadata().map(|m| m.len()) else { return Ok(None) };
@@ -352,7 +352,7 @@ impl BlobStore {
         }
         let last = index.lines.saturating_sub(1);
         let (Some(0), Some(last_start)) = (index.entry(0), index.entry(last)) else { return Ok(None) };
-        if last_start >= size || !starts_last_line(blob, last_start)? {
+        if (last > 0 && last_start == 0) || last_start >= size || !starts_last_line(blob, last_start)? {
             return Ok(None);
         }
         index.last_start = last_start;
@@ -362,6 +362,8 @@ impl BlobStore {
     /// Rebuild the line index from the blob (a missing, short or garbage index: a crash, a bad disk; the blob
     /// is the truth) and return its entries. Writing the new index is best effort.
     fn rebuild_index(&self, id: &BlobId, blob: &Path) -> io::Result<Vec<u64>> {
+        #[cfg(test)]
+        INDEX_REBUILDS.with(|rebuilds| rebuilds.set(rebuilds.get().saturating_add(1)));
         let offsets = scan_offsets(blob)?;
         let tmp = self.root.join("tmp").join(format!("rebuild-{}-{}.idx", crate::now_ms(), rand::random::<u64>()));
         if write_index(&tmp, &self.idx_path(id), &offsets).is_ok() {
@@ -375,31 +377,21 @@ impl BlobStore {
     }
 
     /// Lines `start..=end` (1-based). Out-of-range bounds are clamped; an empty range gives empty text. Only
-    /// the index entries the range needs are read; an index that fails their checks is rebuilt from the blob.
+    /// the index entries the range needs are read; an index that fails their checks, or whose entries do not
+    /// bound whole lines (see `read_span`), is rebuilt from the blob.
     pub fn read_lines(&self, id: &BlobId, start: u64, end: u64) -> io::Result<LineSlice> {
         let blob = self.path_of(&id.0);
         let size = fs::metadata(&blob)?.len();
         let first = start.max(1);
-        let found = match self.line_index(id, &blob, size)? {
-            Some(mut index) => index.span(first, end, size),
-            None => None,
-        };
-        let span = match found {
-            Some(span) => span,
-            None => span_of(&self.rebuild_index(id, &blob)?, first, end, size).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("the line index of {} is inconsistent", id.0))
-            })?,
-        };
-        let Some((from, to)) = span.bytes else {
-            return Ok(LineSlice { text: String::new(), first, last: span.last, total: span.total });
-        };
-        let len = usize::try_from(to.saturating_sub(from))
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the requested lines do not fit in memory"))?;
-        let mut file = File::open(&blob)?;
-        file.seek(SeekFrom::Start(from))?;
-        let mut buf = vec![0u8; len];
-        file.read_exact(&mut buf)?;
-        Ok(LineSlice { text: String::from_utf8_lossy(&buf).into_owned(), first, last: span.last, total: span.total })
+        if let Some(span) = self.line_index(id, &blob, size)?.and_then(|mut index| index.span(first, end, size)) {
+            if let Some(slice) = read_span(&blob, &span, first, size)? {
+                return Ok(slice);
+            }
+        }
+        let span = span_of(&self.rebuild_index(id, &blob)?, first, end, size);
+        span.map(|span| read_span(&blob, &span, first, size)).transpose()?.flatten().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("the line index of {} is inconsistent", id.0))
+        })
     }
 
     /// Search line by line. Returns up to `max_matches` excerpts and the total number of matching lines.
@@ -589,6 +581,8 @@ fn scan_offsets(blob: &Path) -> io::Result<Vec<u64>> {
 thread_local! {
     /// Bytes of line index read on this thread, so that tests can see a page read leave the rest unread.
     static INDEX_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Line indexes rebuilt on this thread, so that tests can see a sound index used as it is.
+    static INDEX_REBUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// A blob's line index on disk, read one entry at a time.
@@ -656,6 +650,37 @@ fn locate(total: u64, first: u64, end: u64, size: u64, mut entry: impl FnMut(u64
 fn span_of(offsets: &[u64], first: u64, end: u64, size: u64) -> Option<Span> {
     let entry = |n: u64| usize::try_from(n).ok().and_then(|n| offsets.get(n)).copied();
     locate(offsets.len() as u64, first, end, size, entry).filter(|span| span.bytes.is_none_or(|(from, to)| from <= to))
+}
+
+/// Lines `first..=span.last` read from the blob, when the bytes `span` names are whole lines and as many as the
+/// range has: the byte before them (if any) is a newline, and they end with a newline holding one per line, or
+/// end the blob holding one fewer (a last line without its own). `None` when they are not, which an index entry
+/// that is wrong but still in order gives.
+fn read_span(blob: &Path, span: &Span, first: u64, size: u64) -> io::Result<Option<LineSlice>> {
+    let lines = |text: String| LineSlice { text, first, last: span.last, total: span.total };
+    let Some((from, to)) = span.bytes else { return Ok(Some(lines(String::new()))) };
+    // From the byte before the range, which has to end the line before it.
+    let at = from.saturating_sub(1);
+    let len = usize::try_from(to.saturating_sub(at))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the requested lines do not fit in memory"))?;
+    let mut file = File::open(blob)?;
+    file.seek(SeekFrom::Start(at))?;
+    let mut buf = vec![0u8; len];
+    file.read_exact(&mut buf)?;
+    let range = if from == 0 {
+        buf.as_slice()
+    } else {
+        let Some((&b'\n', rest)) = buf.split_first() else { return Ok(None) };
+        rest
+    };
+    let newlines = range.iter().filter(|b| **b == b'\n').count() as u64;
+    let wanted = span.last.saturating_sub(first).saturating_add(1);
+    let whole = match range.last() {
+        Some(&b'\n') => newlines == wanted,
+        Some(_) => to == size && newlines.saturating_add(1) == wanted,
+        None => false,
+    };
+    Ok(whole.then(|| lines(String::from_utf8_lossy(range).into_owned())))
 }
 
 /// Whether the blob's last line starts at `start`: the byte before it (if any) is a newline and no newline
@@ -821,6 +846,10 @@ mod tests {
         INDEX_BYTES_READ.with(|read| read.get())
     }
 
+    fn index_rebuilds() -> u64 {
+        INDEX_REBUILDS.with(|rebuilds| rebuilds.get())
+    }
+
     #[test]
     fn a_page_reads_only_the_index_entries_it_needs() {
         let (_d, s) = store();
@@ -830,6 +859,7 @@ mod tests {
         let idx = s.idx_path(&b.id);
         assert_eq!(fs::metadata(&idx).unwrap().len(), 8 * n);
         let pristine = fs::read(&idx).unwrap();
+        let rebuilds = index_rebuilds();
         for (first, last) in [(1, 3), (n / 2, n / 2 + 4), (n - 2, n), (n - 1, n + 50)] {
             let before = index_bytes_read();
             let page = s.read_lines(&b.id, first, last).unwrap();
@@ -841,24 +871,26 @@ mod tests {
         let before = index_bytes_read();
         assert_eq!(s.meta(&b.id).unwrap(), b);
         assert!(index_bytes_read() - before <= 16);
+        assert_eq!(index_rebuilds(), rebuilds, "a sound index is used as it is, not rebuilt from the blob");
         assert_eq!(fs::read(&idx).unwrap(), pristine, "a sound index is not rewritten");
 
-        // An entry the page needs out of order: the index is rebuilt, and the page is right.
-        let mut damaged = pristine.clone();
-        let at = usize::try_from(n / 2 - 1).unwrap() * 8;
-        damaged[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
-        fs::write(&idx, &damaged).unwrap();
-        let page = s.read_lines(&b.id, n / 2, n / 2 + 1).unwrap();
-        assert_eq!(page.text, format!("{}{}", line(n / 2), line(n / 2 + 1)));
-        assert_eq!(fs::read(&idx).unwrap(), pristine);
-        // The last entry pointing into the middle of the last line.
-        let mut damaged = pristine.clone();
-        let last = u64::from_le_bytes(damaged[damaged.len() - 8..].try_into().unwrap());
-        let tail = damaged.len() - 8;
-        damaged[tail..].copy_from_slice(&(last + 2).to_le_bytes());
-        fs::write(&idx, &damaged).unwrap();
-        assert_eq!(s.read_lines(&b.id, n, n).unwrap().text, line(n));
-        assert_eq!(fs::read(&idx).unwrap(), pristine);
+        // An entry the page needs out of order, one in order that points into the middle of its line, and the
+        // last entry pointing into the middle of the last line: each time the index is rebuilt, and the page
+        // is right.
+        let entry = |line: u64| usize::try_from(line - 1).unwrap() * 8;
+        let start_of = |line: u64| u64::from_le_bytes(pristine[entry(line)..entry(line) + 8].try_into().unwrap());
+        for (damaged_line, value, first) in
+            [(n / 2, u64::MAX, n / 2), (n / 2, start_of(n / 2) + 2, n / 2), (n, start_of(n) + 2, n)]
+        {
+            let mut damaged = pristine.clone();
+            damaged[entry(damaged_line)..entry(damaged_line) + 8].copy_from_slice(&value.to_le_bytes());
+            fs::write(&idx, &damaged).unwrap();
+            let rebuilds = index_rebuilds();
+            let page = s.read_lines(&b.id, first, first + 1).unwrap();
+            assert_eq!(page.text, (first..=(first + 1).min(n)).map(line).collect::<String>());
+            assert_eq!(index_rebuilds(), rebuilds + 1, "line {damaged_line} starting at {value}");
+            assert_eq!(fs::read(&idx).unwrap(), pristine);
+        }
     }
 
     #[test]
@@ -964,6 +996,12 @@ mod tests {
         fs::remove_file(&idx).unwrap();
         assert!(s.contains_in_range(&b.id, 3, 3, "three").unwrap());
         assert!(idx.exists());
+        // Two entries for one line, both 0: the count `meta` takes from the index's length would be wrong, so
+        // the index is rebuilt.
+        let one = s.put_bytes(b"hello\n").unwrap();
+        fs::write(s.idx_path(&one.id), [0u64.to_le_bytes(), 0u64.to_le_bytes()].concat()).unwrap();
+        assert_eq!(s.meta(&one.id).unwrap().lines, 1);
+        assert_eq!(fs::metadata(s.idx_path(&one.id)).unwrap().len(), 8);
     }
 
     #[test]

@@ -118,7 +118,8 @@ These are the places where loom does less than the text above might suggest.
   `unix_sockets`), including services that run as you.
 - **Tamper evidence has gaps.** Deleting a session's records together with their directory, deleting
   `journal.head` together with the last entries of its mission journal, deleting a mission journal and
-  its `journal.head` together, or restoring an older matching pair, cannot be detected. A process running as you outside the sandbox can read the journal key and forge entries.
+  its `journal.head` together, or restoring an older matching pair, cannot be detected. A process
+  running as you outside the sandbox can read the journal key and forge entries.
   The audit file for requests that name no known session (`logs/net-unattributed.jsonl`) has no reader
   in the API yet.
 - **The verifier is another model.** A `finish` that passes the verifier has been checked against

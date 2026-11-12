@@ -1921,23 +1921,24 @@ mod tests {
         let e = env(Script::new(|_, _| finish("all good"))).await;
         let id = e.create("first").await;
         e.wait_turn_ends(&id, 1).await;
-        // Once the session has stopped writing, add two lines a newer loom could have written.
+        // Once the session is idle (it writes nothing more until it is given input), add two lines a newer
+        // loom could have written, chained to the last line of the file.
         let end = tokio::time::Instant::now() + WAIT;
-        let mut before = e.records(&id).await;
         loop {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let now = e.records(&id).await;
-            if now == before {
+            let (_, detail) = e.get(&format!("/api/sessions/{id}")).await;
+            if detail["status"]["phase"] == "idle" {
                 break;
             }
-            assert!(tokio::time::Instant::now() < end, "the session kept writing");
-            before = now;
+            assert!(tokio::time::Instant::now() < end, "timed out waiting for the session to be idle");
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        let before = e.records(&id).await;
         let (_, window) = e.get(&format!("/api/sessions/{id}/window")).await;
         let path = e.dir.path().join("home/sessions").join(&id).join("log.jsonl");
         let bytes = std::fs::read(&path).unwrap();
         let tip = bytes[..bytes.len() - 1].rsplit(|b| *b == b'\n').next().unwrap();
-        let n = before.len() as u64;
+        let n = bytes.iter().filter(|b| **b == b'\n').count() as u64;
+        assert_eq!(n, before.len() as u64, "the records route serves every line of the file");
         // A kind this build does not know, with spaces and a carriage return between its tokens, and
         // a known kind holding a value this build does not know (an opaque record).
         let unknown = format!(
