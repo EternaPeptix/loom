@@ -7,12 +7,14 @@ struct Counts: Equatable {
     var running = 0
     var waiting = 0   // open blocking inbox items
     var active = 0    // sessions not ended/archived
+    var requests = 0  // open scope requests: agents asking for hosts, which do not stop the session
 
     /// Menu-bar label, e.g. "◆ 2▸ 1!". Red when `waiting > 0` (the caller decides colour).
     var menuLabel: String {
         var s = "◆"
         if running > 0 { s += " \(running)▸" }
         if waiting > 0 { s += " \(waiting)!" }
+        if requests > 0 { s += " \(requests)?" }
         return s
     }
 }
@@ -430,6 +432,7 @@ enum SelfCheck {
         failures += DaemonClient.selfCheck()
         failures += WebPane.selfCheck()
         if Counts(running: 2, waiting: 1, active: 3).menuLabel != "◆ 2▸ 1!" { failures.append("Counts.menuLabel") }
+        if Counts(running: 0, waiting: 0, active: 1, requests: 2).menuLabel != "◆ 2?" { failures.append("Counts.menuLabel requests") }
         if Counts().menuLabel != "◆" { failures.append("Counts.menuLabel empty") }
         if Notifier.cut("a\nb", 10) != "a b" || Notifier.cut(String(repeating: "x", count: 20), 5).count != 5 {
             failures.append("Notifier.cut")

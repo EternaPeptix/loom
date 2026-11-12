@@ -131,7 +131,8 @@ it); `glob` and `grep`; `out_read` and `out_grep` (page and search any stored ou
 (through the egress proxy); and `cve_lookup`, `cve_search` and `advisory_lookup` (public vulnerability
 databases, through the same proxy). The runtime adds the ledger tools (`plan`, `step`, `note`, `claim`,
 `claim_update`, `evidence`, `ledger`, `pin`, `log_search`), the agent tools (`agent_spawn`,
-`agent_fanout`, `agent_message`, `agent_stop`, `decide`, `verify`) and the terminating tools (`finish`,
+`agent_fanout`, `agent_message`, `agent_stop`, `decide`, `verify`), `request_scope` (ask the operator for
+hosts) and `conclude` (state that the goal is met or cannot be met, with evidence) and the terminating tools (`finish`,
 `verdict`, `ask_user`, `report_blocker`, `wait`). Which of them a session has depends on its role.
 
 A **pack** is a set of roles; a role is a prompt, a tool list and how it ends. The built-in `core`
@@ -154,6 +155,8 @@ loom answer <item> "..."                  answer one
 loom rule <session> "text"                set a standing rule for the mission
 loom rule <session> --withdraw <rule-id> [--reason "..."]
 loom approve <session> "text" [--scope "..."]
+loom scope <session> <host>...            let the mission's tools reach these hosts (a session asks with request_scope)
+loom release <session> "reason"           accept a blocked mission as it is and close it
 loom ledger <session>                     the mission ledger
 loom window <session>                     what is in the model's context right now
 loom net <session>                        every network request and how it was decided
@@ -173,6 +176,10 @@ daemon's egress proxy, and the proxy's policy comes from `[network]` in the conf
 - `allowlist`: only hosts matching `allow` are reachable.
 - `open`: any public host is reachable. Private, loopback and link-local addresses are still refused
   unless listed in `allow_private`.
+
+Whatever the config says, you can let one session reach more: an agent that needs a host asks, the request
+waits in your inbox without stopping it, and `loom scope <session> <host>...` (or the Approve button)
+grants it for that session only.
 
 `web_fetch` and the vulnerability-lookup tools need a route, so with the default they fail with a
 refusal that names the policy. `docs/config.example.toml` shows an allowlist.

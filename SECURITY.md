@@ -78,6 +78,10 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   IPv6 forms) unless you list them, applies the deny list to the resolved address, and records every
   decision in a hash-chained audit file. Commands that listen on loopback can be reached by other
   local processes.
+- **Scope is the operator's.** The agent can ask for hosts with `request_scope`, which opens an inbox
+  item and changes nothing. Hosts are granted only by the operator, per session, with a record in the
+  ledger; a grant dies with the session. `loom release` records that the operator closed a mission
+  without the goal established, with a reason, and it is shown as that, not as finished.
 - **No LaunchServices opens, Apple Events or launchd jobs**, so a command cannot start a program
   outside the sandbox that way.
 - **Signals** can reach only processes inside the sandbox.
@@ -131,8 +135,11 @@ These are the places where loom does less than the text above might suggest.
 - **A process that leaves its command's process group is not tracked.** After `setsid`, `daemon()`,
   `redis-server --daemonize yes` or `tmux new -d`, `job_kill`, stop, the end of the session and daemon
   shutdown do not stop it, although it stays under the seatbelt profile.
-- **Network policy is per daemon, not per session**, and is read at start. In `allowlist` mode a
-  listed host can be used by every session. Data can be sent to an allowed host.
+- **The configured network policy is per daemon**, and is read at start. In `allowlist` mode a
+  listed host can be used by every session. Data can be sent to an allowed host. On top of it the
+  operator can grant a session more hosts while it runs (`loom scope`): a grant is per session,
+  recorded in the mission's ledger, and ends with the session. The agent can ask (`request_scope`) but
+  cannot grant; only an operator request reaches the grant, and the model's tools cannot make one.
 - **A network-specific NAT64 prefix is an ordinary IPv6 prefix to the proxy.** The proxy looks through
   the well-known NAT64 prefix `64:ff9b::/96` (and `64:ff9b:1::/96`) to the IPv4 address it carries, but
   not through a prefix your network chose for itself. Listing such a prefix in `allow_private` admits

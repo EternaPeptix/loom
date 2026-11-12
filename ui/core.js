@@ -513,6 +513,83 @@ export function inboxKindWords(kind) {
   return { approval: "approval", question: "question", blocker: "blocker", parked: "parked", finished: "finished" }[kind] || kind;
 }
 
+/**
+ * The hosts a scope request asks for, or null when the item is not one. A scope request is the
+ * non-blocking approval item the `request_scope` tool opens: its options are the hosts, its text says why.
+ */
+export function scopeRequestHosts(item) {
+  const hosts = Array.isArray(item && item.options) ? item.options.filter((h) => typeof h === "string" && h.trim()) : [];
+  return item && item.item_kind === "approval" && !item.blocking && hosts.length ? hosts : null;
+}
+
+/** The kind label of an inbox card: a scope request reads as one, not as an approval. */
+export function inboxCardKind(item) {
+  return scopeRequestHosts(item) ? "scope request" : inboxKindWords(item.item_kind);
+}
+
+/** The operator's grant of hosts: `{ path, body }`, or `{ error }` when there are none. */
+export function scopeRequest(session, hosts, note) {
+  const list = (hosts || []).map((h) => String(h).trim()).filter(Boolean);
+  if (!list.length) return { error: "Name the hosts to grant." };
+  const body = { hosts: list };
+  const n = String(note || "").trim();
+  if (n) body.note = n;
+  return { path: `/api/sessions/${encodeURIComponent(session)}/scope`, body };
+}
+
+/** What the card says once the grant is accepted, from the daemon's receipt. */
+export function scopeNotice(receipt) {
+  const r = receipt || {};
+  const hosts = (r.hosts || []).join(", ");
+  return r.ledger === false ? `Granted: ${hosts}. This mission keeps no ledger, so the grant is not listed.` : `Granted: ${hosts}.`;
+}
+
+/** The choice that closes a blocked session without the goal established. */
+export const PARK_ACCEPT = "Accept as blocked and close";
+const PARK_KEEP = "Keep working";
+const PARK_MORE = "Keep working (more budget)";
+const PARK_PROVIDE = "Provide what's missing";
+
+/** Said under the park choices: how to answer so that the session does a next step. */
+export const PARK_HELP = "To answer, point it at the next step, for example \"run the build and read the first error\". A yes or no question tends to end in a stop.";
+
+/**
+ * The choices for a blocking blocker or park, cheapest first; null for any other item. Each is
+ * `{ label, action, answer? }`: `answer` sends `answer` as the operator's answer, `provide` opens the
+ * answer box, `release` asks for a reason and closes the mission as blocked. Options the item carries
+ * are used as they are (the label `PARK_ACCEPT` closes, "Provide what's missing" opens the box, any
+ * other is sent as the answer); without any, the stock choices apply, with the budget one only for a
+ * budget stop.
+ */
+export function parkChoices(item) {
+  if (!item || !item.blocking || (item.item_kind !== "blocker" && item.item_kind !== "parked")) return null;
+  const given = (item.options || []).map(String).filter((o) => o.trim());
+  if (given.length) {
+    return given.map((label) => {
+      if (label === PARK_ACCEPT) return { label, action: "release" };
+      if (label === PARK_PROVIDE) return { label, action: "provide" };
+      return { label, action: "answer", answer: label };
+    });
+  }
+  const out = [{ label: PARK_KEEP, action: "answer", answer: "Keep working on the goal." }];
+  if (item.item_kind === "parked" && /budget/i.test(item.text || "")) {
+    out.push({ label: PARK_MORE, action: "answer", answer: "Keep working on the goal. Your budget is renewed." });
+  }
+  if (item.item_kind === "blocker") out.push({ label: PARK_PROVIDE, action: "provide" });
+  out.push({ label: PARK_ACCEPT, action: "release" });
+  return out;
+}
+
+/** Closing a mission as blocked: `{ path, body }`, or `{ error }` when no reason was typed. */
+export function releaseRequest(session, reason) {
+  const r = String(reason || "").trim();
+  if (!r) return { error: "Write why the mission is closed without the goal established." };
+  return { path: `/api/sessions/${encodeURIComponent(session)}/release`, body: { reason: r } };
+}
+
+/** The outcome a released mission shows, in place of "finished". */
+export const RELEASED_WORDS = "Closed by operator, goal not established";
+
 // ---------------------------------------------------------------------------------------------
 // The record store of the open session
 
@@ -980,7 +1057,44 @@ export function ledgerModel(view) {
     decisions: (s.decisions || []).map((d) => ({ id: d.id, text: d.text, reason: d.reason })),
     deadEnds: (s.dead_ends || []).map((d) => ({ id: d.id, what: d.what, why: d.why })),
     questions: (s.questions || []).map((q) => ({ id: q.id, text: q.text, blocking: !!q.blocking, answer: q.answer ?? null })),
+    scope: grantedHosts(s.scope_grants),
+    outcome: outcomeOf(s),
   };
+}
+
+/** Every host the operator granted, each once (ignoring case), in the order first granted. */
+export function grantedHosts(grants) {
+  const seen = new Set();
+  const out = [];
+  for (const g of grants || []) {
+    for (const h of g.hosts || []) {
+      const key = String(h).toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push(h);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * How the mission stands on its goal, for the operator: a release (the operator closed it, goal not
+ * established) wins, then the model's claim that the goal is met or cannot be met. Null while open.
+ */
+export function outcomeOf(state) {
+  const s = state || {};
+  if (s.release) return { words: RELEASED_WORDS, detail: s.release.reason || "" };
+  const g = s.goal_met;
+  if (g && g.status === "supported") return { words: "Goal met (claimed by the model)", detail: g.note || "" };
+  if (g && g.status === "refuted") return { words: "Goal shown unreachable (claimed by the model)", detail: g.note || "" };
+  return null;
+}
+
+/** The line the Network tab shows above the decisions. */
+export function scopeLine(model) {
+  const hosts = (model && model.scope) || [];
+  return hosts.length ? `Hosts granted by the operator: ${hosts.join(", ")}` : "No hosts granted by the operator.";
 }
 
 /**

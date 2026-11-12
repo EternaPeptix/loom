@@ -24,6 +24,8 @@
 //!   sessions (archived included): the one whose id equals `word`; else those whose id starts with
 //!   `word` or with `s-{word}`. One → it. None → `No session matches `{word}`.` Several → `` `{word}`
 //!   matches {n} sessions: {ids, at most 5, then "…"}. Give more of the id. ``
+//! - `grant_scope(id, hosts, note)`: `POST /api/sessions/{id}/scope`, the `ScopeReceipt`. `release(id, reason)`:
+//!   `POST /api/sessions/{id}/release`, the `RuleReceipt`. Both are the operator's, like `add_rule`.
 //! - `mission_of(word)`: a word starting with `m-` is taken as a mission id as it is; otherwise
 //!   `resolve(word)` and that session's mission.
 //! - `stream(id, after)` / `events(deltas)`: open the event stream and return an [`EventStream`].
@@ -58,7 +60,7 @@
 
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody, RecordsPage,
-    RuleBody, SessionDetail, StatusView, WithdrawBody,
+    ReleaseBody, RuleBody, ScopeBody, ScopeReceipt, SessionDetail, StatusView, WithdrawBody,
 };
 use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, NetEntry, NewSession, RuleReceipt, SessionInfo, WindowView,
@@ -469,6 +471,20 @@ impl Client {
             .map_err(|e| format!("The withdrawal cannot be encoded ({e})."))?;
         let path = format!("/api/sessions/{}/rules/{}/withdraw", segment(id.as_str()), segment(rule_id));
         self.call(Method::POST, &path, &[], Some(body)).await
+    }
+
+    /// Let the mission of `id` reach `hosts` (the operator's grant). The receipt names the lead it went to.
+    pub async fn grant_scope(&self, id: &SessionId, hosts: &[String], note: Option<&str>) -> Result<ScopeReceipt, String> {
+        let body = serde_json::to_value(ScopeBody { hosts: hosts.to_vec(), note: note.map(str::to_string) })
+            .map_err(|e| format!("The grant cannot be encoded ({e})."))?;
+        self.call(Method::POST, &format!("/api/sessions/{}/scope", segment(id.as_str())), &[], Some(body)).await
+    }
+
+    /// Close the mission of `id` without the goal established, for `reason`.
+    pub async fn release(&self, id: &SessionId, reason: &str) -> Result<RuleReceipt, String> {
+        let body = serde_json::to_value(ReleaseBody { reason: reason.to_string() })
+            .map_err(|e| format!("The release cannot be encoded ({e})."))?;
+        self.call(Method::POST, &format!("/api/sessions/{}/release", segment(id.as_str())), &[], Some(body)).await
     }
 
     pub async fn stop(&self, id: &SessionId) -> Result<(), String> {
@@ -1012,6 +1028,24 @@ mod tests {
         assert_eq!(body(0), serde_json::json!({"text": "no prod"}));
         assert_eq!(body(1), serde_json::json!({"text": "ship", "scope": "staging"}));
         assert_eq!(body(2), serde_json::json!({"reason": "done"}));
+    }
+
+    #[tokio::test]
+    async fn scope_and_release_calls_hit_their_routes_with_their_bodies() {
+        let script = Script::default()
+            .route("POST", "/api/sessions/s-1/scope", 202, serde_json::json!({"lead": "s-0", "hosts": ["a.test"], "ledger": true}).to_string())
+            .route("POST", "/api/sessions/s-1/release", 202, serde_json::json!({"lead": "s-0", "queued": false, "ledger": true, "stock": null}).to_string());
+        let (client, shared) = start(script).await;
+        let sid = SessionId::from("s-1");
+        let got = client.grant_scope(&sid, &["a.test".to_string()], Some("docs")).await.unwrap();
+        assert_eq!((got.lead.as_str(), got.hosts, got.ledger), ("s-0", vec!["a.test".to_string()], true));
+        client.grant_scope(&sid, &["a.test".to_string()], None).await.unwrap();
+        assert_eq!(client.release(&sid, "gone").await.unwrap().lead.as_str(), "s-0");
+        let seen = shared.lock().unwrap().seen.clone();
+        let body = |n: usize| serde_json::from_str::<serde_json::Value>(&seen[n].body).unwrap();
+        assert_eq!(body(0), serde_json::json!({"hosts": ["a.test"], "note": "docs"}));
+        assert_eq!(body(1), serde_json::json!({"hosts": ["a.test"], "note": null}));
+        assert_eq!(body(2), serde_json::json!({"reason": "gone"}));
     }
 
     #[tokio::test]

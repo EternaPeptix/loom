@@ -89,8 +89,23 @@ upgrade" first; the rest says what behaves differently.
   `[network] mode` (`deny_all`) and `retry_window_s` (300).
 - Pack keys: `requires_restricted_network` (top level) and `verifier` (per role).
 - API additions: `POST /api/login-codes`, `POST /api/web-sessions`, `POST /api/sessions/{id}/rules`,
-  `/approvals`, `/rules/{rule_id}/withdraw`, `POST /api/gc`, `GET /healthz?nonce=`, and a `disk` field
+  `/approvals`, `/rules/{rule_id}/withdraw`, `/scope`, `/release`, `POST /api/gc`, `GET /healthz?nonce=`, and a `disk` field
   in `GET /api/status`.
+
+### Scope, conclusions and release
+
+- `loom scope <session> <host>... [--note <text>]` (and `POST /api/sessions/{id}/scope`) lets one session
+  reach more hosts while it runs. An agent asks with the new `request_scope` tool; the request waits in
+  `loom inbox`, the web UI and the app without stopping the session, and you approve it there. Grants are
+  per session and recorded in the ledger. `loom net` and the Ledger and Network tabs list them.
+- `loom release <session> <reason...>` (and `POST /api/sessions/{id}/release`) accepts a blocked mission
+  and closes it as "closed by operator, goal not established". A blocker or used-up budget now offers
+  choices in the UI and the app: keep working, keep working with more budget, provide what is missing,
+  or accept as blocked and close (a typed reason and a confirmation).
+- The `core` lead and the `vr` researcher and scout have a `conclude` tool, and the `core` lead and chat
+  and the `vr` researcher, scout and chat have `request_scope`; their prompts say finishing needs a run
+  that shows the goal met or an established "cannot be met", and that scope is widened only by you.
+  Replace installed copies of the packs to get them.
 
 ### Daemon and web UI
 

@@ -19,11 +19,15 @@ Record as you go, not at the end:
 
 If a sub-experiment is genuinely separate, say so in your answer and let the researcher assign it; you cannot start agents. Do one bounded thing well and return.
 
+## Scope
+
+If the experiment needs a host that is not in the authorized scope, call `request_scope` with the host and why, and go on with what the scope allows. Only the operator widens it; you never widen it yourself.
+
 ## Ending
 
-Deliver by calling `finish`:
+If the run shows what the assignment asked, call `conclude` with `met`, a note and the ids of your execution evidence; if you establish that it cannot be done as stated, `unreachable`. Not there yet is a `note`, not a finish. Then deliver by calling `finish`:
 - `answer` — what you established and what you did not, written for someone who has not seen your work: the conditions, the exact input, the observed response, the state check, and the mechanism.
 - `quotes` — the exact stored lines that support the answer (handle, line range, text copied character for character). The harness refuses a quote that does not match, so copy it.
 - `not_established` — what you could not determine, what you did not try, and what would settle it.
 
-If the experiment cannot run for a reason outside the assignment — the target will not build, a needed host is not in the authorized scope — call `report_blocker` with what you tried and what is needed, rather than widening the scope yourself or inventing a result. A reply with no tool call delivers nothing.
+If the experiment cannot run for a reason outside the assignment — the target will not build, a needed host is not in the authorized scope and the operator has not granted it — call `report_blocker` with what you tried and what is needed, rather than widening the scope yourself or inventing a result. A reply with no tool call delivers nothing.

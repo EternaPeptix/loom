@@ -882,3 +882,73 @@ test("the files the daemon embeds exist and the stylesheet carries no remote loa
   assert.ok(!/@import|url\(\s*["']?https?:/i.test(css));
   assert.ok(/prefers-color-scheme:\s*light/.test(css));
 });
+
+// ---- scope requests, park choices, granted hosts ----
+
+const scopeItem = (over = {}) => ({ item_id: "i-9", item_kind: "approval", text: "Needs docs.example.test for the API reference.", options: ["docs.example.test", "*.cdn.test"], blocking: false, ...over });
+
+test("a scope request is a non-blocking approval whose options are the hosts", () => {
+  assert.deepEqual(C.scopeRequestHosts(scopeItem()), ["docs.example.test", "*.cdn.test"]);
+  assert.equal(C.inboxCardKind(scopeItem()), "scope request");
+  // an approval that blocks, or names no hosts, or another kind, is not one
+  assert.equal(C.scopeRequestHosts(scopeItem({ blocking: true })), null);
+  assert.equal(C.scopeRequestHosts(scopeItem({ options: [] })), null);
+  assert.equal(C.scopeRequestHosts(scopeItem({ item_kind: "question" })), null);
+  assert.equal(C.inboxCardKind(scopeItem({ blocking: true })), "approval");
+});
+
+test("approving hosts builds the /scope request, refusing an empty list", () => {
+  assert.deepEqual(C.scopeRequest("s-1", [" a.test ", "*.b.test"], "approved from the inbox"), {
+    path: "/api/sessions/s-1/scope",
+    body: { hosts: ["a.test", "*.b.test"], note: "approved from the inbox" },
+  });
+  assert.deepEqual(C.scopeRequest("s/1", ["a.test"]).body, { hosts: ["a.test"] });
+  assert.equal(C.scopeRequest("s/1", ["a.test"]).path, "/api/sessions/s%2F1/scope");
+  assert.deepEqual(C.scopeRequest("s-1", [" ", ""]), { error: "Name the hosts to grant." });
+  assert.equal(C.scopeNotice({ hosts: ["a.test"], ledger: true }), "Granted: a.test.");
+  assert.match(C.scopeNotice({ hosts: ["a.test"], ledger: false }), /keeps no ledger/);
+});
+
+test("a blocking blocker or park offers its choices, cheapest first, and closing needs a reason", () => {
+  const labels = (item) => C.parkChoices(item).map((c) => c.label);
+  const blocker = { item_id: "i-1", item_kind: "blocker", text: "Stuck.", options: [], blocking: true };
+  assert.deepEqual(labels(blocker), ["Keep working", "Provide what's missing", "Accept as blocked and close"]);
+  const budget = { item_id: "i-2", item_kind: "parked", text: "The session could not continue. The session's budget is used up.", options: [], blocking: true };
+  assert.deepEqual(labels(budget), ["Keep working", "Keep working (more budget)", "Accept as blocked and close"]);
+  const other = { item_id: "i-3", item_kind: "parked", text: "The model server did not answer.", options: [], blocking: true };
+  assert.deepEqual(labels(other), ["Keep working", "Accept as blocked and close"]);
+  const [keep] = C.parkChoices(blocker);
+  assert.deepEqual([keep.action, keep.answer], ["answer", "Keep working on the goal."]);
+  assert.equal(C.parkChoices(blocker)[1].action, "provide");
+  assert.equal(C.parkChoices(blocker).at(-1).action, "release");
+  // choices the item carries are used as they are
+  const given = { ...blocker, options: ["Keep working", "Provide what's missing", C.PARK_ACCEPT] };
+  assert.deepEqual(C.parkChoices(given).map((c) => c.action), ["answer", "provide", "release"]);
+  // other items have none
+  assert.equal(C.parkChoices({ ...blocker, blocking: false }), null);
+  assert.equal(C.parkChoices({ ...blocker, item_kind: "question" }), null);
+  assert.equal(C.parkChoices({ ...blocker, item_kind: "finished" }), null);
+  assert.match(C.PARK_HELP, /next step/);
+
+  assert.deepEqual(C.releaseRequest("s-1", "  target is gone "), { path: "/api/sessions/s-1/release", body: { reason: "target is gone" } });
+  assert.deepEqual(C.releaseRequest("s-1", "   "), { error: "Write why the mission is closed without the goal established." });
+  assert.deepEqual(C.releaseRequest("s-1"), { error: "Write why the mission is closed without the goal established." });
+});
+
+test("granted hosts and the outcome come from the ledger state", () => {
+  const grants = [{ id: "s1", hosts: ["a.test", "B.test"] }, { id: "s2", hosts: ["b.TEST", "c.test"] }];
+  assert.deepEqual(C.grantedHosts(grants), ["a.test", "B.test", "c.test"]);
+  assert.deepEqual(C.grantedHosts(undefined), []);
+  const model = C.ledgerModel({ state: { entries: 3, scope_grants: grants, goal_met: null, release: null } });
+  assert.deepEqual(model.scope, ["a.test", "B.test", "c.test"]);
+  assert.equal(model.outcome, null);
+  assert.equal(C.scopeLine(model), "Hosts granted by the operator: a.test, B.test, c.test");
+  assert.equal(C.scopeLine({ scope: [] }), "No hosts granted by the operator.");
+  assert.equal(C.scopeLine(null), "No hosts granted by the operator.");
+  // a release reads as closed by the operator, never as finished
+  const released = C.ledgerModel({ state: { entries: 4, release: { reason: "target gone", n: 4 }, goal_met: { status: "supported", note: "x", evidence: [], n: 2 } } });
+  assert.deepEqual(released.outcome, { words: "Closed by operator, goal not established", detail: "target gone" });
+  assert.match(C.ledgerModel({ state: { entries: 1, goal_met: { status: "supported", note: "ran it", evidence: ["e1"], n: 1 } } }).outcome.words, /^Goal met/);
+  assert.match(C.ledgerModel({ state: { entries: 1, goal_met: { status: "refuted", note: "n", evidence: ["e1"], n: 1 } } }).outcome.words, /unreachable/);
+  assert.equal(C.outcomeOf({ goal_met: { status: "open", note: "", evidence: [], n: 0 } }), null);
+});

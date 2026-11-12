@@ -1054,6 +1054,8 @@ POST /api/sessions/{id}/messages              {text} → 202 {}
 POST /api/sessions/{id}/rules                 {text} → 202 RuleReceipt
 POST /api/sessions/{id}/approvals             {text, scope?} → 202 RuleReceipt
 POST /api/sessions/{id}/rules/{rule_id}/withdraw   {reason?} → 202 RuleReceipt
+POST /api/sessions/{id}/scope                 {hosts, note?} → 202 ScopeReceipt {lead, hosts, ledger}
+POST /api/sessions/{id}/release               {reason} → 202 RuleReceipt
 POST /api/sessions/{id}/stop                  → 202 {}
 POST /api/sessions/{id}/resume                → 202 {}
 POST /api/sessions/{id}/reweave               → 202 {}
@@ -1143,6 +1145,19 @@ session; `resume` and `archive` roots only; archiving is refused while the missi
 The same actions exist in the CLI (`loom send`, `rule`, `approve`, `rule --withdraw`, `stop`,
 `resume`, `reweave`, `archive`, `answer`) and in the web UI.
 
+**Scope and release.** `POST /scope` (`loom scope`) is the only way a session's reachable hosts grow
+while it runs, and only the operator can call it: it goes to the mission's lead like a rule and is
+recorded as a `scope_grant` (and a standing rule); the grant lasts as long as the session. An agent asks
+with the `request_scope` tool, which opens a non-blocking inbox item (kind `approval`, the hosts as its
+`options`, the reason as its text) and does not stop the session; the UI and app show the hosts with an
+Approve button that calls `/scope` and then resolves the item, and `loom inbox` prints the `loom scope`
+command to run. Nothing is granted without that call. `POST /release` (`loom release`) takes a reason,
+which must not be blank, records an `operator_release` and closes the mission; the outcome reads "closed
+by operator, goal not established", never "finished". A blocking blocker or park offers the choices
+"Keep working", "Keep working (more budget)" (budget parks), "Provide what's missing" (blockers) and
+"Accept as blocked and close"; the last needs a typed reason and a confirmation. `GET /api/missions/{id}/ledger`
+carries `scope_grants`, `goal_met` and `release`, which the UI shows as the granted hosts and the outcome.
+
 **Notifications.** Every `inbox_opened` and every session that fails notifies the operator: with
 `notify.command` set, that program is run (no shell) with `LOOM_KIND`, `LOOM_SESSION`, `LOOM_TITLE` and
 `LOOM_TEXT` (500 characters) in its environment and killed after 30 s; otherwise, on macOS, a
@@ -1207,6 +1222,13 @@ of the same pack that is `read_only` and has `verdict` and `out_read` or `out_gr
 are refused at creation and at every activation while the network mode is `open`. The system prompt is
 the preamble, the role prompt and an `# Environment` section, joined by blank lines and identical for
 identical inputs.
+
+Two tools belong to roles that may need them. `request_scope {hosts, why}` asks the operator for hosts
+(see section 12); `core` `lead` and `chat` and `vr` `researcher`, `scout` and `chat` have it. `conclude
+{status: "met" | "unreachable", note, evidence}` records the goal-met claim in the ledger; a role finishes
+only after it, and `chat`, which keeps no ledger, does not have it. The prompts say that not being there
+yet is a note, not a finish, that a rejection is answered with new execution evidence, and that an
+operator message is input, not permission to finish.
 
 The repository also ships `packs/vr` (vulnerability research: `researcher`, `scout`, `judge`, `chat`;
 the researcher's finish is verified by `judge`). Domain discipline is a pack, not core.

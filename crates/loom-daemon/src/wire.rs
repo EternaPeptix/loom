@@ -2,7 +2,7 @@
 //!
 //! Everything else on the wire is the serde form of a type from `loom_agent::runtime`
 //! (`SessionInfo`, `NewSession`, `InboxEntry`, `WindowView`, `LedgerView`, `MissionInfo`, `NetEntry`,
-//! `ModelHealth`, `RuleReceipt`, `BusEvent`) or `loom_core` (`Record`, `BlobRef`).
+//! `ModelHealth`, `RuleReceipt`, `ScopeReceipt`, `BusEvent`) or `loom_core` (`Record`, `BlobRef`).
 
 use loom_agent::runtime::{ModelHealth, SessionInfo};
 use loom_core::event::{Record, Seq};
@@ -119,6 +119,28 @@ pub struct ApprovalBody {
 pub struct WithdrawBody {
     /// Why the rule is withdrawn. Left out or blank, the runtime records a stock reason in its place.
     #[serde(default)]
+    pub reason: String,
+}
+
+/// Body of `POST /api/sessions/{id}/scope`: hosts the operator lets the mission's tools reach.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeBody {
+    /// One host per entry, as the egress rules write them (`api.example.com`, `*.example.com`).
+    pub hosts: Vec<String>,
+    /// Why, for the ledger. Left out, nothing is recorded with the grant.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// The answer to `POST /api/sessions/{id}/scope`.
+pub use loom_agent::runtime::ScopeReceipt;
+
+/// Body of `POST /api/sessions/{id}/release`: the operator closes the mission without the goal established.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseBody {
+    /// Why the result is accepted short of the goal. Required.
     pub reason: String,
 }
 

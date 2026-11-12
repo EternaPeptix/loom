@@ -48,6 +48,8 @@
 //! | `POST /sessions/{id}/rules` (`RuleBody`) | `runtime.add_rule` (a child's id goes to its lead) | `202` `RuleReceipt` (`queued`: the lead is in a turn and records it at its next step) |
 //! | `POST /sessions/{id}/approvals` (`ApprovalBody`; `scope` may be left out) | `runtime.approve` | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/rules/{rule_id}/withdraw` (`WithdrawBody`; `reason` may be left out) | `runtime.withdraw_rule` (`404` when the mission has no such rule, `409` when it is already withdrawn) | `202` `RuleReceipt` |
+//! | `POST /sessions/{id}/scope` (`ScopeBody`; `note` may be left out) | `runtime.grant_scope` (operator only; a child's id goes to its lead; `409` for no hosts or a host that is not a plain name) | `202` `ScopeReceipt` |
+//! | `POST /sessions/{id}/release` (`ReleaseBody`; `reason` required) | `runtime.release` (operator only; closes the mission without the goal established; `409` for a blank reason) | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/stop` | `runtime.stop` | `202` `{}` |
 //! | `POST /sessions/{id}/resume` | `runtime.resume` | `202` `{}` |
 //! | `POST /sessions/{id}/reweave` | `runtime.reweave` | `202` `{}` |
@@ -120,8 +122,8 @@
 use crate::auth;
 use crate::ui;
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, RuleBody,
-    SessionDetail, StatusView, WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, ReleaseBody,
+    RuleBody, ScopeBody, SessionDetail, StatusView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -197,6 +199,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/rules", post(add_rule))
         .route("/api/sessions/{id}/approvals", post(approve))
         .route("/api/sessions/{id}/rules/{rule_id}/withdraw", post(withdraw_rule))
+        .route("/api/sessions/{id}/scope", post(grant_scope))
+        .route("/api/sessions/{id}/release", post(release))
         .route("/api/sessions/{id}/stop", post(stop))
         .route("/api/sessions/{id}/resume", post(resume))
         .route("/api/sessions/{id}/reweave", post(reweave))
@@ -640,6 +644,18 @@ async fn withdraw_rule(
 ) -> Res<Response> {
     let body: WithdrawBody = json_body(&body)?;
     let receipt = s.runtime.withdraw_rule(&SessionId::from(id), &rule_id, &body.reason).await.map_err(rt_err)?;
+    Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
+}
+
+async fn grant_scope(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: ScopeBody = json_body(&body)?;
+    let receipt = s.runtime.grant_scope(&SessionId::from(id), &body.hosts, body.note.as_deref()).await.map_err(rt_err)?;
+    Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
+}
+
+async fn release(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: ReleaseBody = json_body(&body)?;
+    let receipt = s.runtime.release(&SessionId::from(id), &body.reason).await.map_err(rt_err)?;
     Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
 }
 
@@ -1708,6 +1724,52 @@ mod tests {
             let (s, b) = e.get(&format!("/api/missions/{bad}/ledger")).await;
             assert_eq!(s, 404, "{bad}: {b}");
             assert!(b["error"].as_str().unwrap().starts_with("There is no mission"), "{b}");
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_and_release_routes_answer_for_the_lead_and_refuse_bad_input() {
+        let e = env(lead_script(json!({"question": "CHILDMARK find it"}))).await;
+        let id = e.create("go").await;
+        e.wait_turn_ends(&id, 1).await;
+        let (_, detail) = e.get(&format!("/api/sessions/{id}")).await;
+        let child = detail["children"][0]["id"].as_str().unwrap().to_string();
+
+        // A child's id reaches its lead, which the receipt names.
+        let (s, b) = e.post(&format!("/api/sessions/{child}/scope"), json!({"hosts": ["a.example.test", "*.b.test"], "note": "docs"})).await;
+        assert_eq!((s, &b["lead"], &b["hosts"]), (202, &json!(id), &json!(["a.example.test", "*.b.test"])), "{b}");
+        assert!(b["ledger"].is_boolean(), "{b}");
+        let (s, b) = e.post(&format!("/api/sessions/{id}/scope"), json!({"hosts": ["c.test"]})).await;
+        assert_eq!((s, &b["lead"]), (202, &json!(id)), "{b}");
+
+        // Refused: no hosts, a host with a space, an unknown session; unknown fields and a missing list are bad bodies.
+        for hosts in [json!([]), json!(["a b"]), json!([" "])] {
+            let (s, b) = e.post(&format!("/api/sessions/{id}/scope"), json!({"hosts": hosts})).await;
+            assert_eq!(s, 409, "{b}");
+            assert!(b["error"].is_string());
+        }
+        let (s, b) = e.post("/api/sessions/s-nope/scope", json!({"hosts": ["a.test"]})).await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (404, "There is no session s-nope."));
+        let (s, _) = e.post(&format!("/api/sessions/{id}/scope"), json!({"hosts": ["a.test"], "extra": 1})).await;
+        assert_eq!(s, 400);
+        let (s, _) = e.post(&format!("/api/sessions/{id}/scope"), json!({})).await;
+        assert_eq!(s, 400);
+
+        let (s, b) = e.post(&format!("/api/sessions/{child}/release"), json!({"reason": "the target is gone"})).await;
+        assert_eq!((s, &b["lead"]), (202, &json!(id)), "{b}");
+        let (s, b) = e.post(&format!("/api/sessions/{id}/release"), json!({"reason": "  "})).await;
+        assert_eq!(s, 409, "{b}");
+        let (s, _) = e.post(&format!("/api/sessions/{id}/release"), json!({})).await;
+        assert_eq!(s, 400);
+        let (s, _) = e.post(&format!("/api/sessions/{id}/release"), json!({"reason": "x", "extra": 1})).await;
+        assert_eq!(s, 400);
+        let (s, b) = e.post("/api/sessions/s-nope/release", json!({"reason": "x"})).await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (404, "There is no session s-nope."));
+
+        // The ledger route still refuses an id that is a path.
+        for bad in ["..%2F..%2Fetc", "..%2Fsessions%2Fx"] {
+            let (s, b) = e.get(&format!("/api/missions/{bad}/ledger")).await;
+            assert_eq!(s, 404, "{bad}: {b}");
         }
     }
 
