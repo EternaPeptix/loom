@@ -302,20 +302,85 @@ export function sessionRows(store, { showArchived = false } = {}) {
   return rows;
 }
 
+/** Open inbox items classified by operator action, without treating results as blockers. */
+export function attentionFor(inbox, sessionId) {
+  const attention = { open: 0, blocking: 0, questions: 0, results: 0 };
+  for (const entry of inbox.items.values()) {
+    if (entry.session !== sessionId) continue;
+    attention.open++;
+    if (entry.item.blocking) attention.blocking++;
+    else if (entry.item.item_kind === "finished") attention.results++;
+    else attention.questions++;
+  }
+  return attention;
+}
+
+/**
+ * Mission navigation, with stable creation order inside attention groups. Root rows carry
+ * aggregate attention; child rows keep their own attention and appear only when expanded.
+ */
+export function missionGroups(store, inbox, { showArchived = false, expanded = new Set() } = {}) {
+  const groups = [
+    { key: "needs_answer", label: "Needs your answer", rows: [] },
+    { key: "running", label: "Running", rows: [] },
+    { key: "ready", label: "Ready to review", rows: [] },
+    { key: "other", label: "Other missions", rows: [] },
+  ];
+  const byKey = new Map(groups.map((g) => [g.key, g]));
+  const ordered = sessionRows(store, { showArchived });
+  let mission = null;
+  let members = [];
+  const publish = () => {
+    if (!mission) return;
+    const attention = { open: 0, blocking: 0, questions: 0, results: 0 };
+    for (const row of members) {
+      const own = attentionFor(inbox, row.info.id);
+      for (const key of Object.keys(attention)) attention[key] += own[key];
+    }
+    const executing = members.some(({ info }) => {
+      const mark = stateMark(info, attentionFor(inbox, info.id));
+      return mark === "running" || mark === "waiting";
+    });
+    const rootMark = stateMark(mission, attentionFor(inbox, mission.id));
+    const key = attention.blocking ? "needs_answer" : executing ? "running"
+      : attention.results || attention.questions || rootMark === "finished" || rootMark === "failed" ? "ready" : "other";
+    const agentCount = members.length - 1;
+    byKey.get(key).rows.push({ info: mission, depth: 0, mission: mission.id, agentCount, expanded: expanded.has(mission.id), attention });
+    if (expanded.has(mission.id)) {
+      for (const row of members.slice(1)) byKey.get(key).rows.push({ ...row, mission: mission.id, agentCount: 0, expanded: false, attention: attentionFor(inbox, row.info.id) });
+    }
+  };
+  for (const row of ordered) {
+    if (row.depth === 0) {
+      publish();
+      mission = row.info;
+      members = [];
+    }
+    members.push(row);
+  }
+  publish();
+  return groups.filter((g) => g.rows.length);
+}
+
 /**
  * The state mark of a session: needs_you, running, waiting, stopped, finished, failed or idle.
- * `openInbox` is the number of open inbox items of the session (when unknown, the status says).
+ * Pass classified attention to distinguish nonblocking questions and available results. A numeric
+ * count is retained for older callers, which cannot classify their open inbox items.
  */
 export function stateMark(info, openInbox) {
   const st = (info && info.status) || {};
-  const open = typeof openInbox === "number" ? openInbox : st.open_inbox || 0;
-  if (open > 0 && st.phase !== "ended") return "needs_you";
+  const classified = openInbox && typeof openInbox === "object";
+  const blocking = classified ? openInbox.blocking || 0 : typeof openInbox === "number" ? openInbox : st.open_inbox || 0;
+  if (blocking > 0 && st.phase !== "ended") return "needs_you";
   if (st.phase === "running") return "running";
   if (st.phase === "ended") {
     if (st.outcome === "stopped") return "stopped";
     if (st.outcome === "failed" || st.outcome === "budget_exhausted") return "failed";
+    if (classified && openInbox.results > 0) return "result_ready";
     return "finished";
   }
+  if (classified && openInbox.questions > 0) return "question";
+  if (classified && openInbox.results > 0) return "result_ready";
   switch (st.last_end) {
     case "waiting": return "waiting";
     case "stopped": return "stopped";
@@ -334,6 +399,8 @@ const MARK_WORDS = {
   finished: "finished",
   failed: "failed",
   idle: "idle",
+  result_ready: "result ready",
+  question: "question — work can continue",
 };
 export function markWords(mark) {
   return MARK_WORDS[mark] || mark;
@@ -363,6 +430,144 @@ export function rowDetail(info, now) {
   if (st.prompt_tokens) parts.push(tokens(st.prompt_tokens));
   parts.push(age(now, info.created_ms));
   return parts.join(" · ");
+}
+
+/** Human-readable activity from one recorded event; null for background bookkeeping. */
+export function recordActivity(record) {
+  if (!record) return null;
+  const name = oneLine(record.name || "tool", 50);
+  switch (record.kind) {
+    case "user_message": return "Operator message received";
+    case "model_request": return "Model request started";
+    case "model_response": return record.finish === "length" ? "Model reply reached its output limit" : "Model replied";
+    case "tool_call": return `${name} started${record.args && record.args.path ? ": " + oneLine(record.args.path, 90) : ""}`;
+    case "tool_result": return `${name}: ${record.status === "ok" ? "completed" : oneLine(record.status || "result recorded", 50)}`;
+    case "child_spawned": return `${oneLine(record.role || "Worker", 40)} agent started`;
+    case "child_settled": return `Agent ${outcomeWords(record.outcome)}`;
+    case "job_registered": return `Job ${oneLine(record.job_id, 30)} started`;
+    case "job_settled": return `Job ${oneLine(record.job_id, 30)} settled${Number.isInteger(record.exit_code) ? " (exit " + record.exit_code + ")" : ""}`;
+    case "ledger": return "Mission state updated";
+    case "inbox_opened": return record.blocking ? "Waiting for an operator answer" : record.item_kind === "finished" ? "Result ready to review" : "Nonblocking question opened";
+    case "inbox_resolved": return "Operator answered an inbox item";
+    case "interrupted": return "Execution interrupted";
+    case "turn_end": return turnEndWords(record.reason);
+    case "session_end": return `Session ${outcomeWords(record.outcome)}`;
+    default: return null;
+  }
+}
+
+/** A creation timestamp is never presented as proof of recent execution activity. */
+export function rowActivity(info, lastRecord, now) {
+  const activity = recordActivity(lastRecord);
+  if (activity && Number.isFinite(lastRecord.ts_ms)) {
+    const when = age(now, lastRecord.ts_ms);
+    return `${activity} · ${when === "now" ? "just now" : when + " ago"}`;
+  }
+  return `${markWords(stateMark(info, { blocking: 0 }))} · activity not loaded`;
+}
+
+/** Recorded mission changes and ledger state; it does not infer semantic success from receipts. */
+export function missionOverview(records, ledgerState, inboxEntries, sinceSeq = null) {
+  const source = records instanceof Map ? records.values() : records || [];
+  const ordered = [...source].filter((r) => r && Number.isInteger(r.seq)).sort((a, b) => a.seq - b.seq);
+  const ledger = ledgerState || {};
+  const entries = [...(inboxEntries || [])];
+  const pendingDecisions = entries.filter((e) => e.item && e.item.blocking);
+  const changes = [];
+  let lastActivity = null;
+  let failedChecks = 0;
+  for (const record of ordered) {
+    const activity = recordActivity(record);
+    if (activity) lastActivity = { seq: record.seq, ts: record.ts_ms, text: activity, kind: record.kind };
+    let text = null;
+    if (record.kind === "tool_result" && record.status !== "ok") {
+      failedChecks++;
+      text = `${oneLine(record.name || "Tool", 50)} returned ${oneLine(record.status || "an unknown status", 50)}`;
+    } else if (record.kind === "tool_result" && record.status === "ok" && record.class === "write") {
+      text = `Write tool completed${record.meta && record.meta.path ? ": " + oneLine(record.meta.path, 100) : ""}`;
+    } else if (record.kind === "ledger") {
+      text = `Ledger updated${record.summary ? ": " + oneLine(record.summary, 200) : ""}`;
+    } else if (["child_settled", "job_settled", "inbox_opened", "inbox_resolved", "interrupted", "session_end"].includes(record.kind)) {
+      text = activity;
+    }
+    if (text && (sinceSeq === null || record.seq > sinceSeq)) changes.push({ seq: record.seq, ts: record.ts_ms, text, kind: record.kind });
+  }
+  const plan = ledger.plan || [];
+  const claims = ledger.claims || [];
+  return {
+    activeSteps: plan.filter((s) => s.status === "doing"),
+    changes,
+    lastActivity,
+    pendingDecisions,
+    counts: {
+      planTotal: plan.length,
+      planDone: plan.filter((s) => s.status === "done").length,
+      claimsOpen: claims.filter((c) => c.status === "open").length,
+      claimsSupported: claims.filter((c) => c.status === "supported").length,
+      openObligations: (ledger.obligations || []).filter((o) => o.outcome === null || o.outcome === undefined).length,
+      pendingDecisions: pendingDecisions.length,
+      failedChecks,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Operator drafts and navigation
+
+/** Drafts stay in memory and are namespaced by the caller, e.g. session:<id> / inbox:<item-id>. */
+export function createDraftStore() { return new Map(); }
+export function getDraft(store, key) { return store.get(key) || ""; }
+export function setDraft(store, key, text) {
+  const value = String(text ?? "");
+  if (value) store.set(key, value);
+  else store.delete(key);
+  return value;
+}
+export function clearDraft(store, key) { return store.delete(key); }
+/** A completed request must not discard text edited while it was in flight. */
+export function clearDraftIfUnchanged(store, key, sentText) {
+  if (getDraft(store, key) !== sentText) return false;
+  store.delete(key);
+  return true;
+}
+
+/** A missing HTTP acknowledgement cannot undo an independently recorded delivery receipt. */
+export function sendFailure(state, message, { rejected = false } = {}) {
+  const previous = state || {};
+  const detail = oneLine(message || "The request did not return an acknowledgement.", 400);
+  if (Number.isInteger(previous.recordedSeq) && previous.recordedSeq >= 0) {
+    const delivered = previous.state === "delivered";
+    return {
+      ...previous,
+      state: delivered ? "delivered" : "queued",
+      text: `${delivered ? "Delivered to a model step" : "Message recorded"} · HTTP acknowledgement unavailable: ${detail}`,
+    };
+  }
+  return {
+    ...previous,
+    accepted: false,
+    state: rejected ? "failed" : "uncertain",
+    text: rejected ? `Message rejected: ${detail}` : `Sending could not be confirmed. Check the record before retrying. ${detail}`,
+  };
+}
+
+const SESSION_SECTIONS = new Set(["overview", "record", "evidence"]);
+export function sessionHash(session, section = "overview") {
+  return `#/s/${encodeURIComponent(session)}/${SESSION_SECTIONS.has(section) ? section : "overview"}`;
+}
+/** Decode identifiers after splitting the route so encoded punctuation remains part of an id. */
+export function parseRoute(hash) {
+  const parts = String(hash || "").replace(/^#/, "").split("/");
+  if (parts[1] === "inbox" && parts.length === 2) return { view: "inbox" };
+  if (parts[1] === "new" && parts.length === 2) return { view: "new" };
+  if (parts[1] !== "s" || !parts[2] || parts.length > 4) return { view: "empty" };
+  try {
+    const session = decodeURIComponent(parts[2]);
+    const section = parts[3] || "overview";
+    return SESSION_SECTIONS.has(section) ? { view: "session", session, section } : { view: "empty" };
+  } catch {
+    return { view: "empty" };
+  }
 }
 
 /** The dot in the left header: green, amber or red, and what the tooltip says. */
@@ -463,6 +668,7 @@ export function inboxKindWords(kind) {
 export function createRecordStore(session) {
   return {
     session,
+    records: new Map(), // raw, applied records for source-linked operator views
     next: 0, // the seq expected next
     ahead: new Map(), // records that arrived before their turn
     blocks: [],
@@ -548,6 +754,7 @@ function base(rec) {
 }
 
 function step(store, rec) {
+  store.records.set(rec.seq, rec);
   switch (rec.kind) {
     case "user_message":
       push(store, { ...base(rec), kind: "user", text: rec.text || "" });
@@ -907,6 +1114,7 @@ export function ledgerModel(view) {
         lines: lines(e),
         note: e.note || "",
         call_id: e.call_id,
+        session: e.session || null,
       })),
     })),
     obligations: (s.obligations || []).filter((o) => o.outcome === null || o.outcome === undefined).map((o) => ({ id: o.id, kind: o.kind, text: o.text })),

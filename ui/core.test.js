@@ -212,6 +212,157 @@ test("state mark", () => {
   assert.equal(C.stateMark(info("a", { status: st({ open_inbox: 2 }) }), 0), "idle");
 });
 
+test("classified attention separates blockers, nonblocking questions and results", () => {
+  const inbox = C.createInbox();
+  const entries = [
+    { session: "s-1", item: { item_id: "i-result", item_kind: "finished", blocking: false } },
+    { session: "s-1", item: { item_id: "i-question", item_kind: "question", blocking: false } },
+    { session: "s-2", item: { item_id: "i-block", item_kind: "question", blocking: true } },
+  ];
+  C.applyInboxList(inbox, entries);
+  const first = C.attentionFor(inbox, "s-1");
+  assert.deepEqual(first, { open: 2, blocking: 0, questions: 1, results: 1 });
+  assert.deepEqual(C.attentionFor(inbox, "s-2"), { open: 1, blocking: 1, questions: 0, results: 0 });
+  assert.deepEqual(C.attentionFor(inbox, "missing"), { open: 0, blocking: 0, questions: 0, results: 0 });
+  assert.equal(C.stateMark(info("s-1"), first), "question");
+  assert.equal(C.stateMark(info("s-1", { status: st({ phase: "running" }) }), first), "running");
+  assert.equal(C.stateMark(info("s-1"), { ...first, questions: 0 }), "result_ready");
+  assert.equal(C.stateMark(info("s-1", { status: st({ phase: "ended", outcome: "done" }) }), first), "result_ready");
+  assert.equal(C.stateMark(info("s-1", { status: st({ phase: "ended", outcome: "failed" }) }), first), "failed");
+  assert.equal(C.stateMark(info("s-2", { status: st({ phase: "running" }) }), C.attentionFor(inbox, "s-2")), "needs_you");
+  assert.equal(C.markWords("result_ready"), "result ready");
+  assert.match(C.markWords("question"), /work can continue/);
+});
+
+test("mission groups aggregate descendant attention and collapse agents", () => {
+  const store = C.createSessionStore();
+  C.applySessionList(store, [
+    info("old", { created_ms: 100, status: st({ phase: "running" }) }),
+    info("new", { created_ms: 300, status: st({ phase: "running" }) }),
+    info("needs", { created_ms: 200 }),
+    info("worker", { parent: "needs", created_ms: 210 }),
+    info("grandchild", { parent: "worker", created_ms: 220 }),
+    info("ready", { status: st({ last_end: "finished" }) }),
+    info("archived", { archived: true }),
+  ]);
+  const inbox = C.createInbox();
+  C.applyInboxList(inbox, [{ session: "grandchild", item: { item_id: "i", item_kind: "question", blocking: true } }]);
+  let groups = C.missionGroups(store, inbox);
+  assert.deepEqual(groups.map((g) => g.key), ["needs_answer", "running", "ready"]);
+  assert.deepEqual(groups[0].rows.map((r) => r.info.id), ["needs"]);
+  assert.equal(groups[0].rows[0].agentCount, 2);
+  assert.equal(groups[0].rows[0].attention.blocking, 1);
+  assert.deepEqual(groups[1].rows.map((r) => r.info.id), ["new", "old"]);
+  groups = C.missionGroups(store, inbox, { expanded: new Set(["needs"]) });
+  assert.deepEqual(groups[0].rows.map((r) => [r.info.id, r.depth, r.mission]), [["needs", 0, "needs"], ["worker", 1, "needs"], ["grandchild", 2, "needs"]]);
+  C.applyStatus(store, "old", st({ phase: "running", step: 900 }));
+  assert.deepEqual(C.missionGroups(store, inbox)[1].rows.map((r) => r.info.id), ["new", "old"], "step updates do not reorder peers");
+  groups = C.missionGroups(store, inbox, { showArchived: true });
+  assert(groups.flatMap((g) => g.rows).some((r) => r.info.id === "archived"));
+});
+
+test("row activity uses recorded update time, never creation age", () => {
+  const session = info("s", { created_ms: 0, status: st({ phase: "running", step: 999 }) });
+  assert.equal(C.rowActivity(session, null, 86400000), "running · activity not loaded");
+  const record = { kind: "tool_call", name: "read", args: { path: "src/a.rs" }, ts_ms: 1000 };
+  assert.equal(C.rowActivity(session, record, 61000), "read started: src/a.rs · 1m ago");
+  assert.equal(C.rowActivity(session, record, 2000), "read started: src/a.rs · just now");
+  assert.match(C.rowActivity(session, { kind: "pin", ts_ms: 61000 }, 62000), /activity not loaded/);
+});
+
+test("mission overview derives factual changes without treating a tool pass as verified work", () => {
+  const records = [
+    { seq: 5, ts_ms: 5000, kind: "inbox_opened", item_kind: "question", blocking: true },
+    { seq: 1, ts_ms: 1000, kind: "tool_result", name: "bash", status: "ok", class: "exec", text: "tests passed" },
+    { seq: 2, ts_ms: 2000, kind: "ledger", summary: "Added source claim." },
+    { seq: 3, ts_ms: 3000, kind: "tool_result", name: "edit", status: "ok", class: "write", meta: { path: "src/a.rs" } },
+    { seq: 4, ts_ms: 4000, kind: "tool_result", name: "bash", status: "error", class: "exec" },
+    { seq: 6, ts_ms: 6000, kind: "model_request" },
+  ];
+  const state = {
+    plan: [{ id: "p1", status: "done" }, { id: "p2", status: "doing" }, { id: "p3", status: "todo" }],
+    claims: [{ status: "open" }, { status: "supported" }, { status: "refuted" }],
+    obligations: [{ id: "o1", outcome: null }, { id: "o2", outcome: "done" }],
+  };
+  const entries = [{ item: { item_id: "q1", blocking: true } }, { item: { item_id: "q2", blocking: false } }];
+  const view = C.missionOverview(new Map(records.map((r) => [r.seq, r])), state, entries, 2);
+  assert.deepEqual(view.activeSteps, [{ id: "p2", status: "doing" }]);
+  assert.deepEqual(view.changes.map((c) => c.seq), [3, 4, 5]);
+  assert.equal(view.changes[0].text, "Write tool completed: src/a.rs");
+  assert.deepEqual(view.lastActivity, { seq: 6, ts: 6000, text: "Model request started", kind: "model_request" });
+  assert.deepEqual(view.counts, { planTotal: 3, planDone: 1, claimsOpen: 1, claimsSupported: 1, openObligations: 1, pendingDecisions: 1, failedChecks: 1 });
+  assert.equal(view.pendingDecisions[0].item.item_id, "q1");
+  assert(!JSON.stringify(view).includes("verified"));
+  assert.equal(C.missionOverview([], null, []).lastActivity, null);
+});
+
+test("draft destinations are isolated and completing a send preserves subsequent edits", () => {
+  const drafts = C.createDraftStore();
+  C.setDraft(drafts, "session:s-one", "first mission draft");
+  C.setDraft(drafts, "session:s-two", "second mission draft");
+  C.setDraft(drafts, "inbox:i-one", "answer draft");
+  assert.equal(C.getDraft(drafts, "session:s-one"), "first mission draft");
+  assert.equal(C.getDraft(drafts, "session:s-two"), "second mission draft");
+  assert.equal(C.getDraft(drafts, "session:missing"), "");
+  const submitted = C.getDraft(drafts, "session:s-one");
+  C.setDraft(drafts, "session:s-one", "new text while sending");
+  assert.equal(C.clearDraftIfUnchanged(drafts, "session:s-one", submitted), false);
+  assert.equal(C.getDraft(drafts, "session:s-one"), "new text while sending");
+  assert.equal(C.clearDraftIfUnchanged(drafts, "inbox:i-one", "answer draft"), true);
+  assert.equal(C.getDraft(drafts, "inbox:i-one"), "");
+  assert.equal(C.getDraft(drafts, "session:s-two"), "second mission draft");
+  C.setDraft(drafts, "session:s-two", "");
+  assert.equal(drafts.has("session:s-two"), false);
+  assert.equal(C.clearDraft(drafts, "session:s-one"), true);
+});
+
+test("failed HTTP acknowledgement preserves independently recorded message delivery", () => {
+  const sending = { state: "delivered", accepted: false, sentText: "continue", afterSeq: 10, recordedSeq: 11, text: "Delivered to a model step." };
+  const result = C.sendFailure(sending, "Connection closed");
+  assert.equal(result.state, "delivered");
+  assert.equal(result.recordedSeq, 11);
+  assert.equal(result.sentText, "continue");
+  assert.equal(result.afterSeq, 10);
+  assert.match(result.text, /Delivered to a model step.*HTTP acknowledgement unavailable/);
+  assert.equal(sending.text, "Delivered to a model step.", "the state reducer does not mutate its input");
+  const recorded = C.sendFailure({ ...sending, state: "queued", recordedSeq: 0 }, "Request timed out");
+  assert.equal(recorded.state, "queued");
+  assert.equal(recorded.recordedSeq, 0);
+  assert.match(recorded.text, /Message recorded.*HTTP acknowledgement unavailable/);
+});
+
+test("unconfirmed sends retain their correlation baseline for a late receipt", () => {
+  const sending = { state: "sending", accepted: true, sentText: "continue", afterSeq: 50 };
+  const result = C.sendFailure(sending, "Network unavailable");
+  assert.equal(result.state, "uncertain");
+  assert.equal(result.accepted, false);
+  assert.equal(result.sentText, "continue");
+  assert.equal(result.afterSeq, 50);
+  assert.match(result.text, /could not be confirmed.*Check the record before retrying/);
+  assert(!result.text.includes("Not sent"));
+  assert.equal(result.recordedSeq, undefined);
+});
+
+test("a definite request rejection fails an unrecorded send", () => {
+  const result = C.sendFailure({ state: "sending", sentText: "continue", afterSeq: 3 }, "This session has ended.", { rejected: true });
+  assert.equal(result.state, "failed");
+  assert.equal(result.accepted, false);
+  assert.equal(result.sentText, "continue");
+  assert.equal(result.afterSeq, 3);
+  assert.equal(result.text, "Message rejected: This session has ended.");
+});
+
+test("mission routes preserve destination and view across navigation", () => {
+  assert.deepEqual(C.parseRoute("#/s/s-one"), { view: "session", session: "s-one", section: "overview" });
+  for (const section of ["overview", "record", "evidence"]) {
+    assert.deepEqual(C.parseRoute(C.sessionHash("s/one ?#", section)), { view: "session", session: "s/one ?#", section });
+  }
+  assert.deepEqual(C.parseRoute("#/inbox"), { view: "inbox" });
+  assert.deepEqual(C.parseRoute("#/new"), { view: "new" });
+  for (const hash of ["", "#/s/", "#/s/%XX/record", "#/s/s-one/unknown", "#/s/s-one/record/extra"]) assert.deepEqual(C.parseRoute(hash), { view: "empty" });
+  assert.equal(C.sessionHash("s-one", "unknown"), "#/s/s-one/overview");
+});
+
 test("session actions", () => {
   assert.deepEqual(
     Object.entries(C.sessionActions(info("a", { status: st({ phase: "running" }) }))).filter(([, v]) => v).map(([k]) => k),
@@ -304,6 +455,8 @@ test("page fetch and live stream overlapping give the same transcript", () => {
   assert.equal(store.next, 28);
   C.applyRecords(store, recs.slice(28));
   assert.deepEqual(store.blocks.map((b) => b.seq), [...Array(30).keys()]);
+  assert.deepEqual([...store.records.keys()], [...Array(30).keys()], "only applied records enter the overview source");
+  assert.strictEqual(store.records.get(8), recs[8]);
 });
 
 test("a duplicate buffered record is ignored", () => {
@@ -541,6 +694,9 @@ test("ledger model joins evidence to claims and keeps open obligations only", ()
   assert.equal(m.empty, false);
   assert.equal(m.claims[0].evidence[0].lines, "lines 3–9");
   assert.equal(m.claims[0].evidence[0].attested, true);
+  assert.equal(m.claims[0].evidence[0].session, "s", "source navigation retains the producer session");
+  delete view.state.evidence[0].session;
+  assert.equal(C.ledgerModel(view).claims[0].evidence[0].session, null, "older evidence has no invented producer");
   assert.deepEqual(m.obligations.map((o) => o.id), ["o1"]);
   assert.equal(m.questions[0].answer, null);
   assert.equal(C.ledgerModel({ state: { entries: 0 } }).empty, true);
