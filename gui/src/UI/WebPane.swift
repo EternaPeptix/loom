@@ -4,7 +4,7 @@ import WebKit
 /// A `WKWebView` that shows the daemon's own web UI over the tunnel. See gui/DESIGN.md "Web pane".
 ///
 /// CONTRACT for the implementer:
-/// - loads `url` (which is `<baseURL>/auth?token=<token>`) when it changes; shows connecting /
+/// - loads `url` (which is `<baseURL>/?token=<token>`) when it changes; shows connecting /
 ///   unreachable / no-connection states instead of a blank view.
 /// - restricts navigation to `url`'s origin (loopback); any other origin is cancelled and opened in
 ///   the default browser (`NSWorkspace.shared.open`).

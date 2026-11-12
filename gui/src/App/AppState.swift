@@ -44,7 +44,7 @@ final class AppState: ObservableObject {
     @Published var focusSession: String? = nil
 
     /// The URL the web pane should load for the current connection, token included
-    /// (`<baseURL>/auth?token=<token>`), or nil when not connected.
+    /// (`<baseURL>/?token=<token>`), or nil when not connected.
     var webEntryURL: URL? {
         // Implemented alongside Tunnel/DaemonClient; see DESIGN.md "Web pane".
         nil

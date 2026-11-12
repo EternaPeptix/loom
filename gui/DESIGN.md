@@ -111,7 +111,7 @@ version may add quick-answer from the notification; out of scope for v1.)
 ## Web pane (`UI/WebPane.swift`)
 
 A `WKWebView` wrapped in `NSViewRepresentable`. On connect (or when the operator picks a connection),
-it loads `"<baseURL>/auth?token=<token>"` — the daemon's token-to-cookie endpoint, which sets the
+it loads `"<baseURL>/?token=<token>"` — the daemon GET / token-to-cookie login (303 + Set-Cookie), which sets the
 session cookie and redirects to `/`. Thereafter the UI drives itself (same-origin XHR/SSE to the
 daemon, through the tunnel). The pane:
 
