@@ -9,7 +9,10 @@
 //! - a request with an absolute `http://` URI → the proxy connects to that host (port 80 by
 //!   default), sends the request with an origin-form target, drops `Proxy-Authorization` and
 //!   `Proxy-Connection`, adds `Connection: close`, and copies the request body and the response
-//!   through unchanged. One request per client connection.
+//!   through. The final response head loses the destination's `Connection`, `Keep-Alive` and
+//!   `Proxy-Connection` headers and ends in `Connection: close`. One request and one response per
+//!   client connection: when the response length is announced the relay ends after that many bytes, and
+//!   once the client sends anything after its request no further destination bytes are relayed.
 //! - a check, method [`CHECK_METHOD`] with the destination as `host:port` or as an absolute
 //!   `http://host:port/` URI (see *Checks*);
 //! - anything else (origin-form target, `https://` absolute URI, unparseable head, a head larger than
@@ -1288,27 +1291,45 @@ fn body_kind(head: &Head) -> Result<Body, String> {
 }
 
 /// Response heads from the destination, written again without any `X-Loom-Proxy` header (see
-/// [`response_head`]). Interim (1xx) heads are treated the same way.
-#[derive(Default)]
+/// [`response_head`]). Interim (1xx) heads are treated the same way. The final head also loses the
+/// destination's connection headers and says `Connection: close`; when its length is known, bytes
+/// past the body are dropped and [`HeadFilter::finished`] turns true at the body's end.
 struct HeadFilter {
     buf: Vec<u8>,
     done: bool,
+    /// The request was `HEAD`: the response has no body whatever its headers say.
+    head_request: bool,
+    /// Body bytes still to come after the final head, when the head fixes them.
+    remaining: Option<u64>,
+    finished: bool,
 }
 
 impl HeadFilter {
+    fn new(head_request: bool) -> Self {
+        Self { buf: Vec::new(), done: false, head_request, remaining: None, finished: false }
+    }
+
+    /// The response is complete; nothing further from the destination is relayed.
+    fn finished(&self) -> bool {
+        self.finished
+    }
+
     /// Takes the next bytes from the destination; returns what may be sent to the client now.
     fn push(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
         if self.done {
-            return Ok(data.to_vec());
+            return Ok(self.body(data));
         }
         self.buf.extend_from_slice(data);
         let mut out = Vec::new();
-        while let Some((code, head, n)) = response_head(&self.buf)? {
-            out.extend_from_slice(&head);
-            self.buf.drain(..n.min(self.buf.len()));
-            if !(100..200).contains(&code) || code == 101 {
+        while let Some(h) = response_head(&self.buf)? {
+            out.extend_from_slice(&h.head);
+            self.buf.drain(..h.len.min(self.buf.len()));
+            if !(100..200).contains(&h.code) || h.code == 101 {
                 self.done = true;
-                out.append(&mut self.buf);
+                let no_body = self.head_request || matches!(h.code, 204 | 304);
+                self.remaining = if no_body { Some(0) } else { h.length };
+                let rest = std::mem::take(&mut self.buf);
+                out.append(&mut self.body(&rest));
                 return Ok(out);
             }
         }
@@ -1317,12 +1338,38 @@ impl HeadFilter {
         }
         Ok(out)
     }
+
+    /// Body bytes to pass on: all of them when the length is unknown, else up to the announced length.
+    fn body(&mut self, data: &[u8]) -> Vec<u8> {
+        match self.remaining {
+            None => data.to_vec(),
+            Some(r) => {
+                let take = usize::try_from(r).map_or(data.len(), |r| r.min(data.len()));
+                self.remaining = Some(r.saturating_sub(take as u64));
+                self.finished = self.remaining == Some(0);
+                data.get(..take).unwrap_or(&[]).to_vec()
+            }
+        }
+    }
 }
 
-/// The response head at the start of `buf`, parsed as an HTTP client parses it: its status code, the
-/// head written again with CRLF line ends and without `X-Loom-Proxy` headers, and its length in `buf`.
-/// `None` while it is incomplete.
-fn response_head(buf: &[u8]) -> Result<Option<(u16, Vec<u8>, usize)>, String> {
+/// A response head read from the destination.
+struct RespHead {
+    code: u16,
+    /// The head written again with CRLF line ends and without `X-Loom-Proxy` headers. A final head
+    /// has no `Connection`, `Keep-Alive` or `Proxy-Connection` header of the destination and ends in
+    /// `Connection: close`.
+    head: Vec<u8>,
+    /// Its length in the buffer it was read from.
+    len: usize,
+    /// The body length it announces with `Content-Length`; `None` when it is not a single clear
+    /// number or the body is framed some other way.
+    length: Option<u64>,
+}
+
+/// The response head at the start of `buf`, parsed as an HTTP client parses it. `None` while it is
+/// incomplete.
+fn response_head(buf: &[u8]) -> Result<Option<RespHead>, String> {
     let mut headers = vec![httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
     let mut resp = httparse::Response::new(&mut headers);
     let parsed = httparse::ParserConfig::default()
@@ -1338,15 +1385,35 @@ fn response_head(buf: &[u8]) -> Result<Option<(u16, Vec<u8>, usize)>, String> {
     let (Some(version), Some(code)) = (resp.version, resp.code) else {
         return Err("the destination did not answer with a valid HTTP response".into());
     };
+    let is_final = !(100..200).contains(&code) || code == 101;
     let mut head = format!("HTTP/1.{version} {code} {}\r\n", resp.reason.unwrap_or("")).into_bytes();
+    let (mut length, mut clear, mut framed) = (None::<u64>, true, false);
     for h in resp.headers.iter().filter(|h| !h.name.eq_ignore_ascii_case(MARKER)) {
+        if is_final {
+            if ["connection", "keep-alive", "proxy-connection"].iter().any(|d| h.name.eq_ignore_ascii_case(d)) {
+                continue;
+            }
+            if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                framed = true;
+            } else if h.name.eq_ignore_ascii_case("content-length") {
+                let v = std::str::from_utf8(h.value).ok().map(str::trim).filter(|v| v.bytes().all(|b| b.is_ascii_digit()));
+                match v.and_then(|v| v.parse::<u64>().ok()) {
+                    Some(v) if length.is_none() || length == Some(v) => length = Some(v),
+                    _ => clear = false,
+                }
+            }
+        }
         head.extend_from_slice(h.name.as_bytes());
         head.extend_from_slice(b": ");
         head.extend_from_slice(h.value);
         head.extend_from_slice(b"\r\n");
     }
+    if is_final {
+        head.extend_from_slice(b"Connection: close\r\n");
+    }
     head.extend_from_slice(b"\r\n");
-    Ok(Some((code, head, n)))
+    let length = if clear && !framed { length } else { None };
+    Ok(Some(RespHead { code, head, len: n, length }))
 }
 
 /// What the relay of a forwarded request needs.
@@ -1355,6 +1422,8 @@ struct Fwd {
     budget: Option<u64>,
     /// After the client has ended its side, how long a silent destination is waited for.
     grace: Duration,
+    /// The request method is `HEAD`.
+    head_request: bool,
 }
 
 /// How a relay ended. The flag says whether anything from the destination had been sent to the client.
@@ -1376,6 +1445,8 @@ struct Flow {
     last_ms: AtomicU64,
     /// The client of a forwarded request has ended its side.
     client_done: AtomicBool,
+    /// The client of a forwarded request sent bytes after the end of its request.
+    extra_request: AtomicBool,
     /// Something has been sent to the client.
     wrote: AtomicBool,
 }
@@ -1437,6 +1508,11 @@ async fn upload(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, forwar
             }
             return Pump::Ended;
         }
+        if budget == Some(0) {
+            // The client sends a further request on a connection that carries one: no later destination
+            // bytes may be read as its answer.
+            flow.extra_request.store(true, Ordering::Relaxed);
+        }
         let take = if sending { budget.map_or(n, |b| usize::try_from(b).map_or(n, |b| b.min(n))) } else { 0 };
         discarded = discarded.saturating_add(n.saturating_sub(take));
         if discarded > MAX_DISCARD {
@@ -1475,20 +1551,28 @@ async fn download(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, mut 
             Err(_) => return Pump::Stop("the connection to the destination failed"),
         };
         flow.touch();
+        if !head_pending && flow.extra_request.load(Ordering::Relaxed) {
+            // One request, one response: what follows is not relayed.
+            let _ = w.shutdown().await;
+            return Pump::Ended;
+        }
         let chunk = buf.get(..n).unwrap_or(&[]);
         let out = match filter.as_mut() {
-            Some(f) if head_pending => match f.push(chunk) {
+            Some(f) => match f.push(chunk) {
                 Ok(v) => Cow::Owned(v),
                 Err(m) => return Pump::Bad(m),
             },
-            _ => Cow::Borrowed(chunk),
+            None => Cow::Borrowed(chunk),
         };
-        if out.is_empty() {
-            continue;
+        if !out.is_empty() {
+            flow.wrote.store(true, Ordering::Relaxed);
+            if write_counted(w, &out, flow).await.is_err() {
+                return Pump::Stop("writing to the client failed");
+            }
         }
-        flow.wrote.store(true, Ordering::Relaxed);
-        if write_counted(w, &out, flow).await.is_err() {
-            return Pump::Stop("writing to the client failed");
+        if filter.as_ref().is_some_and(HeadFilter::finished) {
+            let _ = w.shutdown().await;
+            return Pump::Ended;
         }
     }
 }
@@ -1525,11 +1609,12 @@ async fn relay(client: &mut TcpStream, up: &mut TcpStream, idle: Duration, forwa
         start: tokio::time::Instant::now(),
         last_ms: AtomicU64::new(0),
         client_done: AtomicBool::new(false),
+        extra_request: AtomicBool::new(false),
         wrote: AtomicBool::new(false),
     };
     let is_forward = forward.is_some();
     let to_up = upload(&mut cr, &mut uw, &flow, forward.as_ref().map(|f| f.budget));
-    let to_client = download(&mut ur, &mut cw, &flow, is_forward.then(HeadFilter::default));
+    let to_client = download(&mut ur, &mut cw, &flow, forward.as_ref().map(|f| HeadFilter::new(f.head_request)));
     let quiet = watchdog(&flow, idle, forward.as_ref().map(|f| f.grace.min(idle)));
     tokio::pin!(to_up, to_client, quiet);
     let wrote = || flow.wrote.load(Ordering::Relaxed);
@@ -1606,7 +1691,11 @@ async fn forward(
         return answer(&mut client, cx.shared, slot, status, "", &text).await;
     }
 
-    let fwd = Fwd { budget: owed, grace: cx.shared.limits.forward_grace };
+    let fwd = Fwd {
+        budget: owed,
+        grace: cx.shared.limits.forward_grace,
+        head_request: head.method.eq_ignore_ascii_case("HEAD"),
+    };
     let end = tokio::select! {
         r = relay(&mut client, &mut up, idle, Some(fwd)) => r,
         _ = cancel.cancelled() => return cx.failed_after_allow(&allowed, SHUTDOWN).await,

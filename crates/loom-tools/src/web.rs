@@ -119,7 +119,7 @@ impl Tool for WebFetch {
 /// A client that never follows redirects itself, uses the session's proxy if there is one, and
 /// reads nothing from the process environment.
 fn build_client(ctx: &ToolCtx) -> Result<Client, String> {
-    let mut builder = Client::builder().redirect(redirect::Policy::none()).no_proxy().user_agent("loom-web-fetch/0.1");
+    let mut builder = Client::builder().redirect(redirect::Policy::none()).no_proxy().pool_max_idle_per_host(0).user_agent("loom-web-fetch/0.1");
     if let Some(p) = session_proxy(ctx) {
         let proxy = Proxy::all(p).map_err(|e| {
             format!("The session's proxy setting is not usable ({e}); this is a harness configuration fault. Use `bash` with `curl` if the fetch is urgent, and report it.")

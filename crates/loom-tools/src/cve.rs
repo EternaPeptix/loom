@@ -220,7 +220,7 @@ struct Reply {
 /// A client that never follows redirects, uses the session's proxy if there is one, and reads
 /// nothing from the process environment.
 fn build_client(ctx: &ToolCtx) -> Result<Client, String> {
-    let mut builder = Client::builder().redirect(redirect::Policy::none()).no_proxy().user_agent("loom-cve/0.1");
+    let mut builder = Client::builder().redirect(redirect::Policy::none()).no_proxy().pool_max_idle_per_host(0).user_agent("loom-cve/0.1");
     let proxy = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
         .iter()
         .find_map(|k| ctx.env.get(*k).filter(|v| !v.trim().is_empty()));

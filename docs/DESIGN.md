@@ -847,8 +847,12 @@ head within 10 s gets `400`.
 - **Answers.** A refusal is `403` with `X-Loom-Proxy: 1` and a text naming the destination, the rule,
   and that the operator sets the policy; an unreachable destination is `502`. Every response the proxy
   generates carries `X-Loom-Proxy: 1` and `Connection: close`; a destination's plain-HTTP response head
-  is re-written with CRLF line ends and without any `X-Loom-Proxy` header (one that does not parse gets
-  `502`). `LOOM-CHECK host:port` (or `http://host:port/`) applies the policy and resolves the name but
+  is re-written with CRLF line ends, without any `X-Loom-Proxy` header, and with the destination's
+  `Connection`, `Keep-Alive` and `Proxy-Connection` headers replaced by `Connection: close` (one that
+  does not parse gets `502`). A forwarded connection carries one request and one response: the relay
+  ends after the announced body length, and bytes the client sends after its request stop any further
+  relaying of destination bytes, so a destination cannot answer a later request on the connection.
+  The tools' HTTP clients also keep no idle connections. `LOOM-CHECK host:port` (or `http://host:port/`) applies the policy and resolves the name but
   connects to nothing: `200` allowed, `403` refused, `502` the name does not resolve, with the rule in
   `X-Loom-Rule`.
 - **Limits** (`loom_net::Limits` defaults, not configurable): 256 connections in all — at the limit a
