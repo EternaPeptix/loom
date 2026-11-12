@@ -61,6 +61,7 @@
 //! | `GET /blobs/{handle}/raw` | the stored bytes | `application/octet-stream`, `Content-Disposition: attachment` |
 //! | `GET /blobs/{handle}/lines?start={a}&end={b}` | `blobs.read_lines` (1-based inclusive; default `1..=2000`; at most 5000 lines per call) | `LinesView` |
 //! | `GET /events?deltas=true` | see *Streams* | SSE |
+//! | `POST /gc` (`GcBody`) | `runtime.gc(apply, None)` | `200` `SweepReport` |
 //! | `POST /shutdown` | cancels `state.shutdown` | `202` `{}` |
 //!
 //! A session id that no session has is `404` `{"error": "There is no session {id}."}`; a handle
@@ -110,8 +111,8 @@
 use crate::auth;
 use crate::ui;
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, ErrorBody, LinesView, MessageBody, RecordsPage, RuleBody, SessionDetail,
-    StatusView, WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, ErrorBody, GcBody, LinesView, MessageBody, RecordsPage, RuleBody,
+    SessionDetail, StatusView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -198,6 +199,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/blobs/{handle}/raw", get(blob_raw))
         .route("/api/blobs/{handle}/lines", get(blob_lines))
         .route("/api/events", get(events))
+        .route("/api/gc", post(gc))
         .route("/api/shutdown", post(shutdown))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(state.clone(), gate))
@@ -596,6 +598,12 @@ async fn answer(State(s): State<ApiState>, Path(item_id): Path<String>, body: By
     let body: AnswerBody = json_body(&body)?;
     s.runtime.answer(&item_id, &body.answer).await.map_err(rt_err)?;
     Ok(accepted())
+}
+
+async fn gc(State(s): State<ApiState>, body: Bytes) -> Res<Response> {
+    let body: GcBody = json_body(&body)?;
+    let report = s.runtime.gc(body.apply, None).await.map_err(rt_err)?;
+    Ok(Json(report).into_response())
 }
 
 async fn shutdown(State(s): State<ApiState>) -> Response {
@@ -1667,6 +1675,25 @@ mod tests {
         // A limit above the maximum is clamped rather than refused.
         let (s, _) = e.get(&format!("/api/sessions/{id}/records?limit=99999")).await;
         assert_eq!(s, 200);
+    }
+
+    #[tokio::test]
+    async fn gc_route_reports_dry_run_by_default_and_deletes_on_apply() {
+        let e = env(Script::new(|_, _| slow_finish("ok", 0))).await;
+        let blobs = e.rt.blobs();
+        let (orphan, young) = (blobs.put_bytes(b"orphan\n").unwrap(), blobs.put_bytes(b"young\n").unwrap());
+        let f = std::fs::OpenOptions::new().write(true).open(blobs.root().join(&orphan.id.0[..2]).join(&orphan.id.0)).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)).unwrap();
+        let fields = |r: &Value| [r["applied"].clone(), r["examined"].clone(), r["kept"].clone(), r["collected"].clone()];
+        let (s, r) = e.post("/api/gc", json!({})).await;
+        assert_eq!((s, fields(&r)), (200, [json!(false), json!(2), json!(1), json!(1)]));
+        assert!(blobs.read_all(&orphan.id).is_ok());
+        // The old orphan goes; a young blob is never collected.
+        let (s, r) = e.post("/api/gc", json!({"apply": true})).await;
+        assert_eq!((s, fields(&r)), (200, [json!(true), json!(2), json!(1), json!(1)]));
+        assert!(blobs.read_all(&orphan.id).is_err() && blobs.read_all(&young.id).is_ok());
+        let (s, r) = e.post_text("/api/gc", "{\"apply\": \"yes\"}").await;
+        assert_eq!(s, 400, "{r}");
     }
 
     // --- streams -------------------------------------------------------------------------------

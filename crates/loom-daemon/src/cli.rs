@@ -36,6 +36,7 @@
 //!   the lead is in a turn and records it at its next step, not while a tool call is running; check
 //!   with loom ledger {lead}`). It also names a stock scope or reason that was recorded for a blank
 //!   one, and says when the mission keeps no ledger (the rule is then a note without an id).
+//! - `gc [--apply]`: `client.gc`; one line with what was examined, kept and would be (or was) deleted.
 //! - `inbox`: `render::inbox_list`. `answer <item> <text…>`: `client.answer`; `answered {item}`.
 //! - `ledger <session|mission>`: the ledger's `markdown`.
 //! - `window <session>`: `render::window_table`. `net <session> [-n <limit>]`: `render::net_table`.
@@ -158,6 +159,12 @@ pub enum Command {
     Rule(RuleArgs),
     /// Record an approval for a mission
     Approve(ApproveArgs),
+    /// Delete stored tool outputs that no session or mission refers to any more (dry run unless --apply)
+    ///
+    /// Collects stored outputs older than one hour whose id or `out:` handle appears in no file under the
+    /// sessions and missions directories. Removing a session's directory is what makes its outputs
+    /// collectable; an output that another session or a mission still names is kept.
+    Gc(GcArgs),
     /// List what is waiting for you
     Inbox,
     /// Answer an inbox item
@@ -289,6 +296,13 @@ pub struct ArchiveArgs {
     pub session: String,
     #[arg(long)]
     pub undo: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct GcArgs {
+    /// Delete them (the default only reports what would be deleted)
+    #[arg(long)]
+    pub apply: bool,
 }
 
 #[derive(Args, Debug)]
@@ -992,6 +1006,15 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             let receipt = c.approve(&id, &text, a.scope.as_deref().unwrap_or("")).await?;
             outln(&receipt_line("approval", "scope", &receipt)).map(|()| 0)
         }
+        Command::Gc(a) => {
+            let r = client_of(&paths)?.gc(a.apply).await?;
+            let (verb, hint) = if a.apply { ("deleted", "") } else { ("would delete", "\nRun `loom gc --apply` to delete them.") };
+            outln(&format!(
+                "examined {} stored outputs ({} bytes); kept {} ({} bytes); {verb} {} ({} bytes).{hint}",
+                r.examined, r.examined_bytes, r.kept, r.kept_bytes, r.collected, r.collected_bytes
+            ))
+            .map(|()| 0)
+        }
         Command::Inbox => {
             let list = client_of(&paths)?.inbox().await?;
             block(&render::inbox_list(&list, loom_core::now_ms(), &style())).map(|()| 0)
@@ -1394,6 +1417,9 @@ mod tests {
         };
         assert_eq!((a.text, a.scope.as_deref()), (words(&["ship", "it"]), Some("staging")));
         rejected(&["approve"]);
+        assert!(matches!(ok(&["gc"]), Command::Gc(GcArgs { apply: false })));
+        assert!(matches!(ok(&["gc", "--apply"]), Command::Gc(GcArgs { apply: true })));
+        rejected(&["gc", "--force"]);
         let Command::Answer(a) = ok(&["answer", "i-1", "yes", "please"]) else { panic!("not answer") };
         assert_eq!((a.item.as_str(), a.text), ("i-1", words(&["yes", "please"])));
         let Command::Answer(a) = ok(&["answer", "i-1"]) else { panic!("not answer") };

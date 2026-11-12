@@ -43,8 +43,8 @@
 //! is public so the command line names the same address the client uses.
 
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, DaemonFile, ErrorBody, LinesView, MessageBody, RecordsPage, RuleBody,
-    SessionDetail, StatusView, WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody, RecordsPage,
+    RuleBody, SessionDetail, StatusView, WithdrawBody,
 };
 use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, NetEntry, NewSession, RuleReceipt, SessionInfo, WindowView,
@@ -241,7 +241,18 @@ impl Client {
         query: &[(&str, String)],
         body: Option<serde_json::Value>,
     ) -> Result<T, String> {
-        let response = self.send_raw(method.clone(), path, query, body, Some(REQUEST_TIMEOUT)).await?;
+        self.call_with_timeout(method, path, query, body, REQUEST_TIMEOUT).await
+    }
+
+    async fn call_with_timeout<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<T, String> {
+        let response = self.send_raw(method.clone(), path, query, body, Some(timeout)).await?;
         let bytes = response.bytes().await.map_err(|e| self.transport_error(&method, path, e))?;
         serde_json::from_slice(&bytes).map_err(|e| {
             format!(
@@ -384,6 +395,12 @@ impl Client {
             Err(e) if e == NO_SUCH_PATH => Err(OLDER_DAEMON.to_string()),
             Err(e) => Err(e),
         }
+    }
+
+    /// Collect unreferenced stored outputs; a dry run unless `apply`. Walking a large store takes a while.
+    pub async fn gc(&self, apply: bool) -> Result<loom_core::blob::SweepReport, String> {
+        let body = serde_json::to_value(GcBody { apply }).map_err(|e| format!("The request cannot be encoded ({e})."))?;
+        self.call_with_timeout(Method::POST, "/api/gc", &[], Some(body), Duration::from_secs(600)).await
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
@@ -826,6 +843,19 @@ mod tests {
         assert_eq!(body(0), serde_json::json!({"text": "no prod"}));
         assert_eq!(body(1), serde_json::json!({"text": "ship", "scope": "staging"}));
         assert_eq!(body(2), serde_json::json!({"reason": "done"}));
+    }
+
+    #[tokio::test]
+    async fn gc_posts_apply_and_reads_the_report() {
+        let report = loom_core::blob::SweepReport { examined: 3, kept: 2, collected: 1, applied: true, ..Default::default() };
+        let (client, shared) = start(Script::default().route("POST", "/api/gc", 200, json(&report))).await;
+        assert_eq!(client.gc(true).await.unwrap(), report);
+        let seen = shared.lock().unwrap().seen.clone();
+        assert_eq!((seen[0].method.as_str(), seen[0].target.as_str()), ("POST", "/api/gc"));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&seen[0].body).unwrap(), serde_json::json!({"apply": true}));
+        let refused = ErrorBody { error: "cannot read /h/sessions/s-1/x (denied); nothing was collected.".into() };
+        let (client, _) = start(Script::default().route("POST", "/api/gc", 500, json(&refused))).await;
+        assert_eq!(client.gc(false).await.unwrap_err(), refused.error);
     }
 
     #[tokio::test]
