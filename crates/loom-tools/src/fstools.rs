@@ -5,8 +5,25 @@
 //! Paths: `ctx.sandbox.resolve(path)`, then `check_read` / `check_write`; a refusal is a `denied`
 //! result carrying the sandbox's sentence. Every result has meta `META_PATH` = the resolved path.
 //!
+//! A command may swap a directory along the path for a link once it has been checked, so the rules are
+//! applied again to the object actually used, never to a path checked earlier, and that refusal is a
+//! `denied` result too:
+//! - every read (of `read`, of the freshness check and of the diff of `write` and `edit`) opens the
+//!   file and then judges the real path of the open descriptor with `check_read`
+//!   (`files::open_readable`); the names a missing file's hint lists are read from the opened
+//!   directory, and only when `check_read` accepts its real path;
+//! - a write opens the directory without following a link in its last component, making missing
+//!   directories one at a time below the nearest one that exists (each made only after `check_write`
+//!   accepts the real path of the open directory joined with its name, and opened without following
+//!   a link, so a link put in its place is refused with a sentence); `check_write` then judges the real
+//!   path of the open directory joined with the file name, and the temporary file is created
+//!   (`O_EXCL`, no link followed), written, synced, given the old file's permissions and renamed into
+//!   place relative to that descriptor. A file name that is itself a link is read and the procedure
+//!   runs again for the file it names (relative to the link's directory), at most `MAX_LINKS` (8)
+//!   times, so the target's directory is the one judged; more links → error sentence.
+//!
 //! All three tools work only on regular files. A device, FIFO or socket → error sentence naming what
-//! the path is and what to use instead; it is never opened (`files::open_regular`). At most `READ_CAP`
+//! the path is and what to use instead; it is never opened (`files::open_readable`). At most `READ_CAP`
 //! (64 MiB) of a file is loaded into memory.
 //!
 //! The file work runs on a blocking thread. A cancelled call returns `interrupted` at once, even
@@ -71,18 +88,28 @@
 //! sandbox denial for read and write; `shown` ranges of read are exact; a device, a FIFO and a socket
 //! refused by each tool without hanging; a file above the cap refused whole and read by range
 //! (normalised, stored, cut by size); cancellation of a stuck read, and of a write and an edit before
-//! they write; an interrupted read is not recorded.
+//! they write; an interrupted read is not recorded; a path through a link into what the policy refuses
+//! is refused by each tool after the check (and no similar names are listed from there); a directory
+//! swapped for a link and back in a tight loop during reads and writes: no protected content returned,
+//! nothing created outside, no temporary file left; missing directories made, a link in their place
+//! not followed; a file name that is a link written through to a file the policy allows, refused
+//! towards one it does not, and a cycle of links refused.
 
-use crate::files::{describe_type, open_regular, Freshness, NotOpened, Seen};
+use crate::files::{describe_type, open_readable, real_path, Freshness, NotOpened, Readable, Seen};
 use crate::outview::{string, uint};
+use crate::sandbox::Sandbox;
 use crate::{params, schema, view, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
 use loom_core::admit::normalize;
 use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_PATH};
 use serde_json::{json, Map, Value};
 use similar::TextDiff;
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{File, FileType, Metadata};
 use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
@@ -115,10 +142,15 @@ struct ReadLimits {
 
 const READ_LIMITS: ReadLimits = ReadLimits { whole: READ_CAP, window: WINDOW_BYTES };
 
+/// Most symbolic links `write_atomic` follows from the path it was given to the file it replaces.
+const MAX_LINKS: usize = 8;
+
 /// Why a bounded read of a file did not produce its bytes.
 enum Fail {
     Io(std::io::Error),
     NotRegular(FileType),
+    /// The sandbox refused the real path of the file that was opened: its sentence.
+    Denied(String),
     TooLarge(u64),
     /// The file was within the cap when opened but grew past it (the cap) while being read.
     Grew(u64),
@@ -130,8 +162,30 @@ impl From<NotOpened> for Fail {
         match e {
             NotOpened::Io(e) => Fail::Io(e),
             NotOpened::NotRegular(kind) => Fail::NotRegular(kind),
+            NotOpened::Denied(why) => Fail::Denied(why),
         }
     }
+}
+
+/// Why `write_atomic` wrote nothing.
+#[derive(Debug)]
+enum WriteFail {
+    /// The sandbox refused the real path the file would have been written at: its sentence.
+    Denied(String),
+    /// A link where none is followed, or too many links: a sentence that says what to do.
+    Refused(String),
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for WriteFail {
+    fn from(e: std::io::Error) -> WriteFail {
+        WriteFail::Io(e)
+    }
+}
+
+/// The sandbox's read rule, as the judge of the real path of a file the tools opened.
+fn readable_in(ctx: &ToolCtx) -> impl Fn(&Path) -> Result<(), String> + '_ {
+    move |real: &Path| ctx.sandbox.check_read(real).map(|_| ())
 }
 
 /// What the blocking part of a call did: its result and, when the file was read or written, what the
@@ -209,9 +263,9 @@ fn read_open(mut file: File, len: u64, cap: u64, cancel: &CancellationToken) -> 
     Ok(bytes)
 }
 
-/// Open `path`, require a regular file of at most `cap` bytes, and read it.
-fn read_bounded(path: &Path, cap: u64, cancel: &CancellationToken) -> Result<Vec<u8>, Fail> {
-    let (file, meta) = open_regular(path)?;
+/// Open `path`, require a regular file of at most `cap` bytes that `readable` accepts, and read it.
+fn read_bounded(path: &Path, cap: u64, cancel: &CancellationToken, readable: Readable<'_>) -> Result<Vec<u8>, Fail> {
+    let (file, meta) = open_readable(path, readable)?;
     if meta.len() > cap {
         return Err(Fail::TooLarge(meta.len()));
     }
@@ -252,6 +306,7 @@ fn fail_output(fail: Fail, given: &str, tool: &str, advice: &str) -> ToolOutput 
     match fail {
         Fail::Io(e) => ToolOutput::error(format!("{given} cannot be read ({e}). Check the path and its permissions.")),
         Fail::NotRegular(kind) => not_regular(given, tool, &kind),
+        Fail::Denied(why) => ToolOutput::denied(why),
         Fail::TooLarge(n) => ToolOutput::error(format!(
             "{given} is {n} bytes, above the {READ_CAP} byte limit `{tool}` loads into memory. {advice}"
         )),
@@ -266,7 +321,21 @@ fn fail_output(fail: Fail, given: &str, tool: &str, advice: &str) -> ToolOutput 
 fn check_failed(given: &str, tool: &str, doing: &str, e: NotOpened) -> ToolOutput {
     match e {
         NotOpened::NotRegular(kind) => not_regular(given, tool, &kind),
+        NotOpened::Denied(why) => ToolOutput::denied(why),
         NotOpened::Io(e) => ToolOutput::error(format!("{given} cannot be checked before {doing} ({e}). Check the path and its permissions.")),
+    }
+}
+
+/// The error for a write that did not happen; `advice` ends the sentence for an I/O failure.
+fn write_failed(given: &str, fail: WriteFail, advice: &str) -> ToolOutput {
+    match fail {
+        WriteFail::Denied(why) => ToolOutput::denied(why),
+        WriteFail::Refused(why) => {
+            ToolOutput::error(format!("{given} was not written, and nothing was changed: {why}"))
+        }
+        WriteFail::Io(e) => {
+            ToolOutput::error(format!("{given} could not be written ({e}). Nothing was changed; {advice}"))
+        }
     }
 }
 
@@ -312,42 +381,283 @@ fn unified_diff(given: &str, old: &str, new: &str) -> String {
     }
 }
 
-/// Write `bytes` to `path` through a temporary file in the same directory, so that readers see the
-/// old content or the new content and a failure leaves no partial file.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    std::fs::create_dir_all(parent)?;
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = parent.join(format!(".{name}.loom-{}-{}.tmp", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_data()?;
-        drop(file);
-        if let Ok(meta) = std::fs::metadata(path) {
-            std::fs::set_permissions(&tmp, meta.permissions())?;
+/// Write `bytes` to the file at the absolute `path` through a temporary file in the same directory, so
+/// that readers see the old content or the new content and a failure leaves no partial file.
+///
+/// After the path was checked, a command may have swapped a directory along it for a link, so every
+/// step works on descriptors. The directory is opened without following a link in its last component
+/// (missing ones are made one at a time, see `open_dir_creating`); the sandbox judges the real path of
+/// that open directory joined with the file name; the temporary file is then created, written, synced
+/// and renamed into place relative to the same descriptor, and nothing is done by path. A file name
+/// that is a link is read and the whole procedure starts again for the file it names, at most
+/// `MAX_LINKS` times, so the directory judged is always the one written in.
+fn write_atomic(sandbox: &Sandbox, path: &Path, bytes: &[u8]) -> Result<(), WriteFail> {
+    let mut target = path.to_path_buf();
+    for _ in 0..=MAX_LINKS {
+        let (Some(name), Some(parent)) = (target.file_name(), target.parent()) else {
+            return Err(WriteFail::Refused(format!(
+                "{} does not end in a file name. Give the path of the file to write and try again.",
+                target.display()
+            )));
+        };
+        let name = name.to_os_string();
+        let dir = open_dir_creating(sandbox, parent)?;
+        match entry_at(&dir, &name)? {
+            // A relative target is taken from the directory that holds the link.
+            Entry::Link => target = real_path(dir.as_fd())?.join(read_link_at(&dir, &name)?),
+            Entry::Missing => return replace_in(sandbox, &dir, &name, None, bytes),
+            Entry::Present(mode) => return replace_in(sandbox, &dir, &name, Some(mode), bytes),
         }
-        std::fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
     }
-    result
+    Err(WriteFail::Refused(format!(
+        "{} leads through more than {MAX_LINKS} symbolic links. Name the real file and try again.",
+        path.display()
+    )))
 }
 
-/// Names in the directory of `path` that are close to its file name.
-fn similar_names(path: &Path) -> Vec<String> {
+/// Replace the entry `name` of the open directory `dir` with a new file holding `bytes`, once the
+/// sandbox allows writing at the real path of `dir` joined with `name`. `mode` is the permission bits
+/// of the entry replaced, when there is one; the new file gets them. The temporary file is removed on
+/// every failure after it was made.
+fn replace_in(sandbox: &Sandbox, dir: &File, name: &OsStr, mode: Option<u32>, bytes: &[u8]) -> Result<(), WriteFail> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let real = real_path(dir.as_fd())?;
+    sandbox.check_write(&real.join(name)).map_err(WriteFail::Denied)?;
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = OsString::from(format!(".{}.loom-{}-{n}.tmp", name.to_string_lossy(), std::process::id()));
+    let mut file = create_new_at(dir, &tmp)?;
+    let written = (|| {
+        file.write_all(bytes)?;
+        file.sync_data()?;
+        if let Some(mode) = mode {
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        rename_at(dir, &tmp, name)
+    })();
+    if written.is_err() {
+        let _ = remove_at(dir, &tmp);
+    }
+    written.map_err(WriteFail::Io)
+}
+
+/// Open the directory `dir` without following a link in its last component. When it is missing, the
+/// nearest directory above it that exists is opened and the missing ones are made below it one at a
+/// time: each only after the sandbox has judged the real path of the open directory it is made in
+/// joined with its name, and each opened relative to that descriptor without following a link, so a
+/// link put in the place of one is never followed.
+fn open_dir_creating(sandbox: &Sandbox, dir: &Path) -> Result<File, WriteFail> {
+    let mut missing: Vec<&OsStr> = Vec::new();
+    let mut at = dir;
+    let mut open = loop {
+        match open_dir(at) {
+            Ok(open) => break open,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match (at.file_name(), at.parent()) {
+                (Some(name), Some(up)) => {
+                    missing.push(name);
+                    at = up;
+                }
+                _ => return Err(WriteFail::Io(e)),
+            },
+            // Whether a link is in the way only chooses the sentence; the open has already refused it.
+            Err(e) => {
+                return Err(not_followed(at, e, || std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_symlink())))
+            }
+        }
+    };
+    for name in missing.into_iter().rev() {
+        let made = real_path(open.as_fd())?.join(name);
+        sandbox.check_write(&made).map_err(WriteFail::Denied)?;
+        match make_dir_at(&open, name) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(WriteFail::Io(e)),
+            _ => {}
+        }
+        open = descend(&open, name, &made)?;
+    }
+    Ok(open)
+}
+
+/// Open the directory `name` of the open directory `dir`, whose path with that name is `path`,
+/// without following a link: a link there is refused with a sentence.
+fn descend(dir: &File, name: &OsStr, path: &Path) -> Result<File, WriteFail> {
+    open_dir_at(dir, name).map_err(|e| not_followed(path, e, || matches!(entry_at(dir, name), Ok(Entry::Link))))
+}
+
+/// A failure to open the directory `dir` without following a link: a sentence when `is_link` says a
+/// link was in the way (reported as `ELOOP`, or by macOS as `ENOTDIR` when a directory was asked for).
+fn not_followed(dir: &Path, e: std::io::Error, is_link: impl FnOnce() -> bool) -> WriteFail {
+    if !matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) || !is_link() {
+        return WriteFail::Io(e);
+    }
+    WriteFail::Refused(format!(
+        "{} is a symbolic link where `write` and `edit` expect a directory, and they follow no link there. Name \
+         the file by its real path and try again.",
+        dir.display()
+    ))
+}
+
+/// What a directory holds under a name, not following a link.
+enum Entry {
+    Missing,
+    Link,
+    /// Anything else, with its permission bits.
+    Present(u32),
+}
+
+/// A file name for the `*at` calls.
+fn c_name(name: &OsStr) -> std::io::Result<CString> {
+    CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a file name contains a NUL byte"))
+}
+
+/// The result of a call that returns a new descriptor or -1, as an owned file. It must be called
+/// right after that call, while `errno` is still its.
+fn owned(fd: libc::c_int) -> std::io::Result<File> {
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the call that returned `fd` made a new descriptor, which nothing else owns.
+    Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+/// The result of a call that returns 0 or -1. It must be called right after that call.
+fn done(rc: libc::c_int) -> std::io::Result<()> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Open the directory `path` for reading without following a link in its last component.
+fn open_dir(path: &Path) -> std::io::Result<File> {
+    std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(path)
+}
+
+/// Open the directory `name` of the open directory `dir` without following a link.
+fn open_dir_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
+    let c = c_name(name)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    owned(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) })
+}
+
+/// Make the directory `name` in the open directory `dir`, with permissions 0777 less the umask.
+fn make_dir_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
+    let c = c_name(name)?;
+    let mode: libc::mode_t = 0o777;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    done(unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), mode) })
+}
+
+/// Create the file `name` in the open directory `dir` for writing, with permissions 0666 less the
+/// umask. Nothing may exist under that name; a link there is not followed.
+fn create_new_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
+    let c = c_name(name)?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let mode: libc::c_uint = 0o666;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    // With O_CREAT, openat reads one more argument, the mode, which a C caller passes as an unsigned int.
+    owned(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, mode) })
+}
+
+/// What the open directory `dir` holds under `name`.
+fn entry_at(dir: &File, name: &OsStr) -> std::io::Result<Entry> {
+    let c = c_name(name)?;
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, `dir` is an open descriptor, and `st`
+    // is writable memory the size of the `stat` that fstatat fills.
+    let rc = unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        return if e.kind() == std::io::ErrorKind::NotFound { Ok(Entry::Missing) } else { Err(e) };
+    }
+    // SAFETY: fstatat returned 0, so it filled `st`.
+    let st = unsafe { st.assume_init() };
+    if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return Ok(Entry::Link);
+    }
+    // `mode_t` is 16 bits wide on macOS and 32 on Linux.
+    #[allow(clippy::useless_conversion)]
+    let bits = u32::from(st.st_mode & 0o7777);
+    Ok(Entry::Present(bits))
+}
+
+/// The target of the link `name` in the open directory `dir`, as written in the link.
+fn read_link_at(dir: &File, name: &OsStr) -> std::io::Result<PathBuf> {
+    let c = c_name(name)?;
+    let mut buf = vec![0u8; 4096];
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, `dir` is an open descriptor, and
+    // readlinkat writes at most `buf.len()` bytes into `buf`.
+    let n = unsafe { libc::readlinkat(dir.as_raw_fd(), c.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    let n = usize::try_from(n).map_err(|_| std::io::Error::last_os_error())?;
+    if n >= buf.len() {
+        let why = "the target of a link is longer than a path can be";
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, why));
+    }
+    buf.truncate(n);
+    Ok(PathBuf::from(OsString::from_vec(buf)))
+}
+
+/// Rename `from` to `to`, both in the open directory `dir`, replacing what `to` was.
+fn rename_at(dir: &File, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+    let (f, t) = (c_name(from)?, c_name(to)?);
+    // SAFETY: `f` and `t` are NUL-terminated names that outlive the call, and `dir` is an open descriptor.
+    done(unsafe { libc::renameat(dir.as_raw_fd(), f.as_ptr(), dir.as_raw_fd(), t.as_ptr()) })
+}
+
+/// Remove the file `name` from the open directory `dir`.
+fn remove_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
+    let c = c_name(name)?;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    done(unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) })
+}
+
+/// The names in the open directory `dir`, without `.` and `..`. An entry that cannot be read ends the
+/// list early.
+fn list_dir(dir: File) -> std::io::Result<Vec<OsString>> {
+    let fd = dir.into_raw_fd();
+    // SAFETY: `fd` is an open directory descriptor owned here; fdopendir takes it over when it succeeds.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: fdopendir failed, so `fd` is still owned here; it is closed once, when this drops.
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+        return Err(e);
+    }
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: `stream` is the open stream fdopendir returned; it is closed only after this loop.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: readdir returned an entry whose `d_name` is a NUL-terminated name, valid until the
+        // next readdir or closedir on this stream; it is copied before either.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(OsStr::from_bytes(name).to_os_string());
+        }
+    }
+    // SAFETY: `stream` came from fdopendir and is closed once; that also closes `fd`.
+    unsafe { libc::closedir(stream) };
+    Ok(names)
+}
+
+/// Names in the directory of `path` that are close to its file name. The directory is opened, and
+/// its names are read from that open directory only when `readable` accepts its real path.
+fn similar_names(path: &Path, readable: Readable<'_>) -> Vec<String> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name().map(|n| n.to_string_lossy().into_owned())) else {
         return Vec::new();
     };
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let flags = libc::O_DIRECTORY | libc::O_NONBLOCK;
+    let Ok(open) = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(dir) else { return Vec::new() };
+    if !real_path(open.as_fd()).is_ok_and(|real| readable(&real).is_ok()) {
+        return Vec::new();
+    }
+    let Ok(entries) = list_dir(open) else { return Vec::new() };
     let mut near: Vec<(usize, String)> = entries
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .iter()
+        .map(|n| n.to_string_lossy().into_owned())
         .filter(|n| *n != name)
         .map(|n| (schema::distance(&name, &n), n))
         .filter(|(d, _)| *d <= 2)
@@ -388,13 +698,14 @@ impl Tool for Read {
     }
 }
 
-/// Open the file `read` was asked for, or say why it cannot be read.
-fn open_to_read(given: &str, path: &Path) -> Result<(File, Metadata), Box<ToolOutput>> {
-    let refusal = match open_regular(path) {
+/// Open the file `read` was asked for, once `readable` accepts the file opened, or say why it cannot
+/// be read.
+fn open_to_read(given: &str, path: &Path, readable: Readable<'_>) -> Result<(File, Metadata), Box<ToolOutput>> {
+    let refusal = match open_readable(path, readable) {
         Ok(x) => return Ok(x),
         Err(NotOpened::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut msg = format!("{given} does not exist.");
-            let near = similar_names(path);
+            let near = similar_names(path, readable);
             if !near.is_empty() {
                 msg.push_str(&format!(" Files with a similar name in that directory: {}.", near.join(", ")));
             }
@@ -412,7 +723,7 @@ fn open_to_read(given: &str, path: &Path) -> Result<(File, Metadata), Box<ToolOu
 
 /// The blocking part of `read`. A file above `limits.whole` is read only by line range, streamed.
 fn read_file(ctx: &ToolCtx, given: &str, path: &Path, start: Option<u64>, end: Option<u64>, limits: ReadLimits) -> Worked {
-    let (file, meta) = match open_to_read(given, path) {
+    let (file, meta) = match open_to_read(given, path, &readable_in(ctx)) {
         Ok(x) => x,
         Err(refusal) => return (*refusal).into(),
     };
@@ -741,7 +1052,8 @@ fn write_file(ctx: &ToolCtx, given: &str, path: &Path, content: &str) -> Worked 
     if path.is_dir() {
         return ToolOutput::error(format!("{given} is a directory. Give the path of a file to write.")).into();
     }
-    let fresh = match ctx.files.freshness(path) {
+    let readable = readable_in(ctx);
+    let fresh = match ctx.files.freshness(path, &readable) {
         Ok(f) => f,
         Err(e) => return check_failed(given, "write", "writing", e).into(),
     };
@@ -751,7 +1063,7 @@ fn write_file(ctx: &ToolCtx, given: &str, path: &Path, content: &str) -> Worked 
     // The previous content is needed only for the diff; a file above the cap is replaced without one.
     let mut diff_omitted = false;
     let old = if fresh == Freshness::Current {
-        match read_bounded(path, READ_CAP, &ctx.cancel) {
+        match read_bounded(path, READ_CAP, &ctx.cancel, &readable) {
             Ok(b) => Some(b),
             Err(Fail::TooLarge(_) | Fail::Grew(_)) => {
                 diff_omitted = true;
@@ -766,8 +1078,8 @@ fn write_file(ctx: &ToolCtx, given: &str, path: &Path, content: &str) -> Worked 
     if ctx.cancel.is_cancelled() {
         return cancelled("write").into();
     }
-    if let Err(e) = write_atomic(path, content.as_bytes()) {
-        return ToolOutput::error(format!("{given} could not be written ({e}). Nothing was changed; check that the directory is writable and try again.")).into();
+    if let Err(fail) = write_atomic(&ctx.sandbox, path, content.as_bytes()) {
+        return write_failed(given, fail, "check that the directory is writable and try again.").into();
     }
     let facts = [format!("{} lines", count_lines(content)), format!("{} bytes", content.len())];
     let mut out = match old {
@@ -829,7 +1141,8 @@ fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all:
     if path.is_dir() {
         return ToolOutput::error(format!("{given} is a directory. Give the path of a file to edit.")).into();
     }
-    let fresh = match ctx.files.freshness(path) {
+    let readable = readable_in(ctx);
+    let fresh = match ctx.files.freshness(path, &readable) {
         Ok(f) => f,
         Err(e) => return check_failed(given, "edit", "editing", e).into(),
     };
@@ -839,7 +1152,7 @@ fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all:
     if let Some(refusal) = freshness_refusal(&fresh, given, "edit") {
         return refusal.into();
     }
-    let bytes = match read_bounded(path, READ_CAP, &ctx.cancel) {
+    let bytes = match read_bounded(path, READ_CAP, &ctx.cancel, &readable) {
         Ok(b) => b,
         Err(f) => return fail_output(f, given, "edit", "Use `bash` for a change to a file this large.").into(),
     };
@@ -876,8 +1189,8 @@ fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all:
     if ctx.cancel.is_cancelled() {
         return cancelled("edit").into();
     }
-    if let Err(e) = write_atomic(path, updated.as_bytes()) {
-        return ToolOutput::error(format!("{given} could not be written ({e}). Nothing was changed; check that the file is writable and try again.")).into();
+    if let Err(fail) = write_atomic(&ctx.sandbox, path, updated.as_bytes()) {
+        return write_failed(given, fail, "check that the file is writable and try again.").into();
     }
     let n = positions.len();
     let count = if n == 1 { "1 replacement".to_string() } else { format!("{n} replacements") };
@@ -1423,6 +1736,106 @@ mod tests {
         assert_eq!(names, vec!["run.sh".to_string()]);
     }
 
+    /// An environment whose policy protects `<dir>/outside`, a directory beside the workspace where no
+    /// write is allowed, and that directory.
+    fn env_with_outside(dir: &tempfile::TempDir) -> (TestEnv, PathBuf) {
+        let outside = dir.path().canonicalize().unwrap().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let protected_paths = vec![outside.display().to_string()];
+        (env_with(ToolsCfg::default(), SandboxCfg { mode: SandboxMode::None, protected_paths, ..SandboxCfg::default() }), outside)
+    }
+
+    /// An environment whose policy makes `<dir>/secret`, beside the workspace, unreadable, and that
+    /// directory, holding the file `name` with the content `PRIVATE`.
+    fn env_with_secret(dir: &tempfile::TempDir, name: &str) -> (TestEnv, PathBuf) {
+        let secret = dir.path().canonicalize().unwrap().join("secret");
+        std::fs::create_dir(&secret).unwrap();
+        std::fs::write(secret.join(name), "PRIVATE").unwrap();
+        let unreadable_paths = vec![secret.display().to_string()];
+        (env_with(ToolsCfg::default(), SandboxCfg { mode: SandboxMode::None, unreadable_paths, ..SandboxCfg::default() }), secret)
+    }
+
+    /// The names in the workspace, at any depth, that are temporary files of `write_atomic`.
+    fn temp_files(e: &TestEnv) -> Vec<PathBuf> {
+        let (mut found, mut dirs) = (Vec::new(), vec![e.ctx.workspace.clone()]);
+        while let Some(d) = dirs.pop() {
+            for entry in std::fs::read_dir(&d).unwrap().flatten() {
+                if entry.file_type().unwrap().is_dir() {
+                    dirs.push(entry.path());
+                } else if entry.file_name().to_string_lossy().contains(".loom-") {
+                    found.push(entry.path());
+                }
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn a_file_name_that_is_a_link_is_written_through_only_where_writes_are_allowed() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let (e, outside) = env_with_outside(&dir);
+        put(&e, "real.txt", b"old\n");
+        symlink("real.txt", ws(&e, "link.txt")).unwrap();
+        symlink(outside.join("x.txt"), ws(&e, "out.txt")).unwrap();
+
+        // Through the tools: the check resolves the link, and the file it names is the one written.
+        e.call("read", json!({"path": "link.txt"})).await;
+        let r = e.call("write", json!({"path": "link.txt", "content": "new\n"})).await;
+        assert!(r.text.contains("replaced"), "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "real.txt")).unwrap(), b"new\n");
+        assert!(std::fs::symlink_metadata(ws(&e, "link.txt")).unwrap().file_type().is_symlink());
+        let r = e.call("write", json!({"path": "out.txt", "content": "x"})).await;
+        assert_eq!(r.status, ToolStatus::Denied, "{}", r.text);
+
+        // A link the writer meets after the check (a relative one is taken from its own directory) is
+        // followed by the writer itself, and the directory of its target is the one judged.
+        write_atomic(&e.ctx.sandbox, &ws(&e, "link.txt"), b"again\n").unwrap();
+        assert_eq!(std::fs::read(ws(&e, "real.txt")).unwrap(), b"again\n");
+        assert!(std::fs::symlink_metadata(ws(&e, "link.txt")).unwrap().file_type().is_symlink());
+        let fail = write_atomic(&e.ctx.sandbox, &ws(&e, "out.txt"), b"x").unwrap_err();
+        let protected = format!("{} is protected", outside.join("x.txt").display());
+        assert!(matches!(&fail, WriteFail::Denied(why) if why.starts_with(&protected)), "{fail:?}");
+        symlink("b", ws(&e, "a")).unwrap();
+        symlink("a", ws(&e, "b")).unwrap();
+        let fail = write_atomic(&e.ctx.sandbox, &ws(&e, "a"), b"x").unwrap_err();
+        assert!(matches!(&fail, WriteFail::Refused(why) if why.contains("more than 8 symbolic links")), "{fail:?}");
+
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert_eq!(temp_files(&e), Vec::<PathBuf>::new());
+    }
+
+    #[tokio::test]
+    async fn missing_directories_are_made_and_a_link_in_their_place_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let (e, outside) = env_with_outside(&dir);
+        write_atomic(&e.ctx.sandbox, &ws(&e, "x/y/z/f.txt"), b"deep").unwrap();
+        assert_eq!(std::fs::read(ws(&e, "x/y/z/f.txt")).unwrap(), b"deep");
+
+        // A link where a directory of the path is missing or expected, whether it leads where writes
+        // are refused or to a directory that does not exist yet, is refused and makes nothing.
+        symlink(&outside, ws(&e, "l")).unwrap();
+        symlink(ws(&e, "notyet"), ws(&e, "m")).unwrap();
+        for (path, link) in [("l/new/f.txt", "l"), ("l/f.txt", "l"), ("m/f.txt", "m"), ("m/sub/f.txt", "m")] {
+            let fail = write_atomic(&e.ctx.sandbox, &ws(&e, path), b"x").unwrap_err();
+            let sentence = format!("{} is a symbolic link where `write` and `edit` expect a directory", ws(&e, link).display());
+            assert!(matches!(&fail, WriteFail::Refused(why) if why.starts_with(&sentence)), "{path}: {fail:?}");
+        }
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(!ws(&e, "notyet").exists());
+
+        // A directory made below an open one is opened from it without following a link, so a link put
+        // in its place after it was found missing is refused the same way.
+        let open = open_dir(&e.ctx.workspace).unwrap();
+        let fail = descend(&open, OsStr::new("l"), &ws(&e, "l")).unwrap_err();
+        let sentence = format!("{} is a symbolic link where `write` and `edit` expect a directory", ws(&e, "l").display());
+        assert!(matches!(&fail, WriteFail::Refused(why) if why.starts_with(&sentence)), "{fail:?}");
+        put(&e, "plain", b"x");
+        assert!(matches!(descend(&open, OsStr::new("plain"), &ws(&e, "plain")), Err(WriteFail::Io(_))));
+        assert_eq!(temp_files(&e), Vec::<PathBuf>::new());
+    }
+
     #[tokio::test]
     async fn write_to_a_directory_is_refused() {
         let e = env();
@@ -1538,6 +1951,134 @@ mod tests {
         assert!(!is_err(&r), "{}", r.text);
         assert_eq!(std::fs::read(ws(&e, "n.txt")).unwrap(), b"keep\nend");
         assert!(r.text.contains("No newline at end of file"), "{}", r.text);
+    }
+
+    /// What a swap after the check leads to, made to happen every time: the work is handed a path in the
+    /// workspace (as the check returns it) that now leads through a link into a directory the policy
+    /// makes unreadable. Each tool refuses what it opened, or the directory it would write in, and
+    /// nothing there is returned, listed or changed.
+    #[tokio::test]
+    async fn a_path_that_leads_through_a_link_after_the_check_is_judged_where_it_leads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (e, secret) = env_with_secret(&dir, "k.txt");
+        std::os::unix::fs::symlink(&secret, ws(&e, "d")).unwrap();
+        let key = ws(&e, "d/k.txt");
+        let refused = [
+            read_file(&e.ctx, "d/k.txt", &key, None, None, READ_LIMITS),
+            write_file(&e.ctx, "d/k.txt", &key, "x"),
+            edit_file(&e.ctx, "d/k.txt", &key, "PRIVATE", "x", false),
+        ];
+        for done in &refused {
+            assert!(done.out.status == ToolStatus::Denied && done.seen.is_none(), "{:?}", done.out);
+            let m = message(&done.out);
+            let refusal = format!("{} is not readable", secret.join("k.txt").display());
+            assert!(m.contains(&refusal) && !m.contains("PRIVATE"), "{m}");
+        }
+        // A new file is not made there: the directory is a link where the write expects a directory.
+        let made = write_file(&e.ctx, "d/new.txt", &ws(&e, "d/new.txt"), "x").out;
+        assert_eq!(made.status, ToolStatus::Error, "{made:?}");
+        let m = message(&made);
+        assert!(m.starts_with("d/new.txt was not written, and nothing was changed: ") && m.contains("is a symbolic link"), "{m}");
+        // A missing file's hint lists no names from there.
+        let missing = read_file(&e.ctx, "d/k.txx", &ws(&e, "d/k.txx"), None, None, READ_LIMITS).out;
+        let m = message(&missing);
+        assert!(m.contains("does not exist") && !m.contains("similar name"), "{m}");
+        assert_eq!(std::fs::read(secret.join("k.txt")).unwrap(), b"PRIVATE");
+        assert_eq!(std::fs::read_dir(&secret).unwrap().count(), 1);
+    }
+
+    /// Swap the entries `dir` and `link` in place (`renamex_np` with `RENAME_SWAP`, atomic: the name
+    /// `dir` always exists) over and over until `stop` is set, so that `dir` names a directory and a
+    /// link by turns. Returns how many swaps were made; `dir` names the directory again when it returns.
+    #[cfg(target_os = "macos")]
+    fn swap_until(
+        dir: PathBuf,
+        link: PathBuf,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<u64> {
+        use std::os::unix::ffi::OsStrExt;
+        std::thread::spawn(move || {
+            let a = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+            let b = std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+            let mut swaps = 0u64;
+            while !stop.load(Ordering::SeqCst) || swaps % 2 == 1 {
+                // SAFETY: both arguments are NUL-terminated strings that live until the call returns.
+                let rc = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
+                assert_eq!(rc, 0, "swap: {}", std::io::Error::last_os_error());
+                swaps += 1;
+            }
+            swaps
+        })
+    }
+
+    /// A command of the session swaps a directory of the workspace for a link to a directory the
+    /// policy makes unreadable, again and again, while the model reads a file under it. The check of
+    /// the path and the open of the file are separate steps; only the file actually opened is judged,
+    /// so no call ever returns the protected content. (Against code that checked the path and then
+    /// opened it again by name, this loop returned the protected file within the first few calls.)
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_directory_swapped_for_a_link_during_a_read_reveals_nothing() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let (e, secret) = env_with_secret(&dir, "id");
+        std::fs::create_dir(ws(&e, "d")).unwrap();
+        put(&e, "d/id", b"public");
+        std::os::unix::fs::symlink(&secret, ws(&e, "d.link")).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = swap_until(ws(&e, "d"), ws(&e, "d.link"), stop.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (mut calls, mut public) = (0u64, 0u64);
+        while std::time::Instant::now() < deadline {
+            let r = e.call("read", json!({"path": "d/id"})).await;
+            calls += 1;
+            if r.text.contains("PRIVATE") {
+                stop.store(true, Ordering::SeqCst);
+                panic!("call {calls} returned the content of the unreadable file: {}", r.text);
+            }
+            public += u64::from(r.text.contains("1\tpublic"));
+        }
+        stop.store(true, Ordering::SeqCst);
+        let swaps = swapper.join().unwrap();
+        assert!(swaps > 100 && public > 0, "the race did not run: {swaps} swaps, {public} of {calls} reads succeeded");
+    }
+
+    /// As above for `write`: the directory is swapped for a link to a directory where the policy allows
+    /// no writes (a protected path: on macOS every temp directory lies under a writable root), while the
+    /// model writes files under it, some in directories that do not exist yet. Nothing ever appears in
+    /// that directory, and no temporary file is left behind. (Against code that checked the path and
+    /// then wrote by name, files appeared there within the first few calls.)
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_directory_swapped_for_a_link_during_a_write_gets_no_file_outside() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let (e, outside) = env_with_outside(&dir);
+        std::fs::create_dir(ws(&e, "d")).unwrap();
+        std::os::unix::fs::symlink(&outside, ws(&e, "d.link")).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = swap_until(ws(&e, "d"), ws(&e, "d.link"), stop.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (mut calls, mut written) = (0u64, 0u64);
+        while std::time::Instant::now() < deadline {
+            let path = if calls % 2 == 0 { "d/evil.plist".to_string() } else { format!("d/n{calls}/evil.plist") };
+            let r = e.call("write", json!({"path": path, "content": format!("call {calls}\n")})).await;
+            calls += 1;
+            written += u64::from(r.status == ToolStatus::Ok);
+            if std::fs::read_dir(&outside).unwrap().next().is_some() {
+                stop.store(true, Ordering::SeqCst);
+                panic!("call {calls} made an entry in the protected directory: {}", r.text);
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        let swaps = swapper.join().unwrap();
+        assert!(swaps > 100 && written > 0, "the race did not run: {swaps} swaps, {written} of {calls} writes succeeded");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert_eq!(temp_files(&e), Vec::<PathBuf>::new());
     }
 
     #[tokio::test]
