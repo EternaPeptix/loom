@@ -34,6 +34,15 @@
 //! protocol assignments `2001::/23` (Teredo `2001::/32`, benchmarking, ORCHID, ORCHIDv2, DETs) except
 //! the globally reachable anycast addresses `2001:1::1`..`2001:1::3`, AMT `2001:3::/32` and AS112
 //! `2001:4:112::/48`; documentation `2001:db8::/32` and `3fff::/20`; SRv6 SIDs `5f00::/16`.
+//! `deny` and `allow_private` entries written in the mapped, compatible or NAT64 /96 form stand for
+//! the IPv4 block they carry, so they cover the plain IPv4 addresses too (a `deny` entry
+//! `64:ff9b::/96` is `0.0.0.0/0` and refuses every IPv4 destination); `Policy::new` refuses such an
+//! `allow_private` entry wider than /8, which would open most private IPv4 addresses. Entries written
+//! in 6to4 form are IPv6 blocks and match 6to4 addresses only (an IPv4 entry covers the 6to4 form).
+//! The other /96 subnets and the /48, /56 and /64 layouts of the local-use prefix `64:ff9b:1::/48` are
+//! not unwrapped, and a network-specific NAT64 prefix (RFC 6052) is an ordinary IPv6 prefix here: the
+//! IPv4 address behind such a prefix is not seen. Listing one in `allow_private` admits every IPv4
+//! address behind it, private ones included, and IPv4 `deny` entries do not cover addresses inside it.
 //!
 //! `Verdict::allowed` + `rule` are what the proxy reports. Everything here is deterministic and does
 //! no I/O.
@@ -235,6 +244,22 @@ impl PrivEntry {
         }
         Pattern::parse(text).map(PrivEntry::Name)
     }
+
+    /// An `allow_private` entry: as [`PrivEntry::parse`], but a block written in an IPv6 form that
+    /// stands for an IPv4 block wider than /8 is refused.
+    fn parse_private(entry: &str) -> Result<PrivEntry, String> {
+        let e = PrivEntry::parse(entry)?;
+        if let PrivEntry::Net { text, net: IpNet::V4 { base, mask } } = &e {
+            let prefix = mask.count_ones();
+            if prefix < 8 && text.contains(':') {
+                return Err(format!(
+                    "it stands for the IPv4 block {}/{prefix} (an IPv6 address in this form is judged by the IPv4 address it carries), so it would allow most private IPv4 addresses; list the IPv4 blocks that are meant instead",
+                    Ipv4Addr::from(*base)
+                ));
+            }
+        }
+        Ok(e)
+    }
 }
 
 /// A parsed, validated network policy.
@@ -267,7 +292,7 @@ impl Policy {
             mode: cfg.mode,
             allow: parse_list("allow", &cfg.allow, Pattern::parse)?,
             deny: parse_list("deny", &cfg.deny, PrivEntry::parse)?,
-            allow_private: parse_list("allow_private", &cfg.allow_private, PrivEntry::parse)?,
+            allow_private: parse_list("allow_private", &cfg.allow_private, PrivEntry::parse_private)?,
         })
     }
 
@@ -614,6 +639,20 @@ mod tests {
         let p = pol(NetworkMode::Open, &[], &["64:ff9b::10.0.0.5", "64:ff9b::a01:0/112"], &[]);
         assert_eq!(p.check_addr("x.test", 80, ip("10.0.0.5"), "r").rule, "deny 64:ff9b::10.0.0.5");
         assert_eq!(p.check_addr("x.test", 80, ip("2002:a01:203::1"), "r").rule, "deny 64:ff9b::a01:0/112");
+        // So a NAT64 or mapped /96 is all of IPv4: refused in allow_private, every IPv4 address in deny.
+        for entry in ["64:ff9b::/96", "64:ff9b:1::/96", "::ffff:0:0/96", "64:ff9b::/100"] {
+            let e = Policy::new(&cfg(NetworkMode::Open, &[], &[], &[entry])).unwrap_err();
+            assert!(e.contains("network.allow_private") && e.contains("stands for the IPv4 block 0.0.0.0/"), "{e}");
+        }
+        let p = pol(NetworkMode::Open, &[], &["64:ff9b::/96"], &[]);
+        assert_eq!(p.check_addr("x.test", 80, ip("8.8.8.8"), "r").rule, "deny 64:ff9b::/96");
+        let p = pol(NetworkMode::Open, &[], &[], &["64:ff9b::a00:0/104"]);
+        assert_eq!(p.check_addr("x.test", 80, ip("10.1.2.3"), "r").rule, "allow_private 64:ff9b::a00:0/104");
+        assert!(!p.check_addr("x.test", 80, ip("127.0.0.1"), "r").allowed);
+        // An entry in 6to4 form is an IPv6 block: it matches 6to4 addresses only.
+        let p = pol(NetworkMode::Open, &[], &["2002:a00:5::/48"], &["10.0.0.0/8"]);
+        assert_eq!(p.check_addr("x.test", 80, ip("2002:a00:5::1"), "r").rule, "deny 2002:a00:5::/48");
+        assert_eq!(p.check_addr("x.test", 80, ip("10.0.0.5"), "r").rule, "allow_private 10.0.0.0/8");
         // Teredo, and local-use NAT64 addresses outside the /96 form, carry nothing the policy reads.
         let teredo = "2001:0:4136:e378:8000:63bf:3fff:fdd2";
         for a in [teredo, "64:ff9b:1:1::808:808", "64:ff9b:2::808:808"] {

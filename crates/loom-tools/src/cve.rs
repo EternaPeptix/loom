@@ -14,7 +14,8 @@
 //! `Interrupted`). A `407`/`403` carrying header `X-Loom-Proxy: 1` is `denied` with the proxy body
 //! (the host is not on the daemon's network allowlist — the message says so and names the host).
 //! Refusals are recognised as `web.rs` does: the marker only on the answer to an http:// URL through
-//! the proxy, and for an https:// URL the proxy's verdict asked for before the request.
+//! the proxy, and for an https:// URL the proxy's verdict asked for before the request and again when
+//! the request fails to connect.
 //!
 //! The daemon must allow these hosts (config `[network]` allowlist) or every call is denied:
 //! `services.nvd.nist.gov` (NVD), `api.first.org` (EPSS), `api.osv.dev` (OSV). The tools never
@@ -79,7 +80,7 @@
 //! advisory_lookup with and without version and the empty case; a proxy `403` with `X-Loom-Proxy`
 //! reads as `denied` naming the host; a bad CVE id is refused with the expected shape; cancellation.
 
-use crate::web::ProxyVerdict;
+use crate::web::{ProxyVerdict, Tunnel};
 use crate::{Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -246,9 +247,10 @@ fn describe(e: &(dyn std::error::Error + 'static)) -> String {
     parts.join(": ")
 }
 
-/// `allowed_by`: the rule by which the egress proxy said it would allow the host, when asked. The
-/// stage is read from the causes of the error, not from its own text, which names the URL.
-fn request_failure(e: &reqwest::Error, what: &str, host: &str, allowed_by: Option<&str>) -> Failure {
+/// `tunnel`: for an https request through the egress proxy that failed to connect, what the proxy
+/// said about the host afterwards. The stage is read from the causes of the error, not from its own
+/// text, which names the URL.
+fn request_failure(e: &reqwest::Error, what: &str, host: &str, tunnel: Option<&Tunnel>) -> Failure {
     let detail = describe(e);
     let lower = crate::web::causes(e).to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| lower.contains(w));
@@ -258,9 +260,8 @@ fn request_failure(e: &reqwest::Error, what: &str, host: &str, allowed_by: Optio
         ("could not resolve the host name".to_string(), "Check the network and try again.")
     } else if has(&["certificate", "tls", "ssl", "handshake"]) {
         ("failed the TLS handshake".to_string(), "The server's certificate or protocol was not acceptable.")
-    } else if let (Some(rule), true) = (allowed_by, e.is_connect()) {
-        let stage = format!("could not be reached through the egress proxy, which allows it by rule `{rule}`");
-        (stage, "The service may be down; try again later.")
+    } else if let (Some(t), true) = (tunnel, e.is_connect()) {
+        t.failure()
     } else if e.is_connect() {
         ("could not connect".to_string(), "The service may be down; try again later.")
     } else {
@@ -275,6 +276,19 @@ fn refused(text: &str, status: u16, what: &str, host: &str) -> Failure {
     Failure::Denied(format!(
         "{message}\nThe session's egress proxy refused the {what} request (HTTP {status}): {host} is not on the daemon's network allowlist. Do not retry; ask the user to add {host} to the daemon's `[network]` allowlist if this lookup is needed."
     ))
+}
+
+/// The proxy's verdict on the host, asked before the request and again when it fails to connect: an
+/// error when the proxy refuses the host or cannot look it up.
+fn verdict(v: Option<ProxyVerdict>, what: &str, host: &str) -> Result<Tunnel, Failure> {
+    match v {
+        Some(ProxyVerdict::Allowed(rule)) => Ok(Tunnel::Allowed(rule)),
+        None => Ok(Tunnel::Unknown),
+        Some(ProxyVerdict::Refused(status, text)) => Err(refused(&text, status, what, host)),
+        Some(ProxyVerdict::Unreachable(text)) => Err(Failure::Error(format!(
+            "The {what} request to {host} failed: the egress proxy could not look up the host. {text}"
+        ))),
+    }
 }
 
 /// The body up to `limit` bytes; the flag says the response was larger.
@@ -303,20 +317,19 @@ async fn exchange(ctx: &ToolCtx, req: RequestBuilder, url: &Url, what: &str) -> 
         let (client, req) = req.build_split();
         let req = req.map_err(|e| request_failure(&e, what, &host, None))?;
         // The proxy answers the CONNECT of an https URL out of the client's sight, so it is asked first.
-        let mut allowed_by = None;
-        if proxied && url.scheme() == "https" {
-            match crate::web::proxy_verdict(&client, url).await {
-                Some(ProxyVerdict::Refused(status, text)) => return Err(refused(&text, status, what, &host)),
-                Some(ProxyVerdict::Unreachable(text)) => {
-                    return Err(Failure::Error(format!(
-                        "The {what} request to {host} failed: the egress proxy could not look up the host. {text}"
-                    )))
-                }
-                Some(ProxyVerdict::Allowed(rule)) => allowed_by = Some(rule),
-                None => {}
-            }
+        let tunnelled = proxied && url.scheme() == "https";
+        if tunnelled {
+            verdict(crate::web::proxy_verdict(&client, url).await, what, &host)?;
         }
-        let resp = client.execute(req).await.map_err(|e| request_failure(&e, what, &host, allowed_by.as_deref()))?;
+        let resp = match client.execute(req).await {
+            Ok(r) => r,
+            // A refused CONNECT looks like any failure to connect: the proxy is asked again (see `Tunnel`).
+            Err(e) if tunnelled && e.is_connect() => {
+                let tunnel = verdict(crate::web::proxy_verdict(&client, url).await, what, &host)?;
+                return Err(request_failure(&e, what, &host, Some(&tunnel)));
+            }
+            Err(e) => return Err(request_failure(&e, what, &host, None)),
+        };
         let status = resp.status().as_u16();
         if crate::web::marked_by_proxy(proxied, url, resp.headers()) && matches!(status, 403 | 407) {
             let (body, _) = read_limited(resp, PROXY_BODY_MAX).await.unwrap_or_default();
@@ -1581,6 +1594,49 @@ mod tests {
         assert_eq!(r.status, ToolStatus::Error, "{}", r.text);
         assert!(r.text.contains("which allows it by rule `allow_private 127.0.0.1`"), "{}", r.text);
         drop(proxy);
+    }
+
+    #[tokio::test]
+    async fn an_https_request_that_fails_to_connect_after_the_check_puts_the_question_again() {
+        use loom_core::config::{NetworkCfg, NetworkMode};
+        use loom_core::{event::NetDecision, SessionId};
+        let private = vec!["127.0.0.1".to_string()];
+        let cfg = NetworkCfg { mode: NetworkMode::Open, allow_private: private, ..NetworkCfg::default() };
+        let deny_all = NetworkCfg { mode: NetworkMode::DenyAll, ..NetworkCfg::default() };
+        // The policy changes between the check and the CONNECT, which is refused; asked again, the
+        // proxy says so.
+        let cell: Arc<std::sync::OnceLock<loom_net::Proxy>> = Arc::default();
+        let handle = cell.clone();
+        let audit: loom_net::AuditFn = Arc::new(move |s: Option<&SessionId>, d: &NetDecision| {
+            if let (Some(p), Some(s), true) = (handle.get(), s, d.method == loom_net::CHECK_METHOD && d.allowed) {
+                p.set_policy(s, loom_net::Policy::new(&deny_all).unwrap());
+            }
+            Ok(())
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let proxy = loom_net::Proxy::start_with(0, tx, Some(audit), loom_net::Limits::default()).await.unwrap();
+        let _ = cell.set(proxy.clone());
+        let grant = proxy.grant(&SessionId::from("s-cve-again"), loom_net::Policy::new(&cfg).unwrap());
+        let mut e = env();
+        e.ctx.env = Arc::new(grant.env());
+        seamed(&mut e, "https://127.0.0.1:9");
+        let r = e.call("cve_lookup", json!({"id": "CVE-2021-44228"})).await;
+        assert_eq!(r.status, ToolStatus::Denied, "{}", r.text);
+        assert!(r.text.contains("refused by rule `mode deny_all`"), "{}", r.text);
+        proxy.shutdown();
+        // A proxy that gives no verdict (here every connection of the session is over its limit) is
+        // named as what stopped the request, not a service that may be down.
+        let limits = loom_net::Limits { max_per_session: 0, ..loom_net::Limits::default() };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let proxy = loom_net::Proxy::start_with(0, tx, None, limits).await.unwrap();
+        let grant = proxy.grant(&SessionId::from("s-cve-busy"), loom_net::Policy::new(&cfg).unwrap());
+        let mut e = env();
+        e.ctx.env = Arc::new(grant.env());
+        seamed(&mut e, "https://127.0.0.1:9");
+        let r = e.call("cve_lookup", json!({"id": "CVE-2021-44228"})).await;
+        assert_eq!(r.status, ToolStatus::Error, "{}", r.text);
+        let expected = "the egress proxy did not open a tunnel to the destination and gave no verdict on it";
+        assert!(r.text.contains(expected) && !r.text.contains("could not connect"), "{}", r.text);
     }
 
     #[tokio::test]
