@@ -94,9 +94,11 @@
 //! ## Creating a root session (`create_session`)
 //! 1. `workspace` must be an existing directory (canonicalised). Role: `packs.role(pack, role)`.
 //!    Profile: `config.profile(model)`.
-//! 2. Model facts: `client.discover()` once per profile (the first success is remembered). On
+//! 2. Model facts: `client.discover()` once per profile (the first success with a window is
+//!    remembered; a discovery that finds no window refuses the creation and is not remembered). On
 //!    `Unavailable`, carry on with the profile's `model` and `context_window` (logged as coming from
-//!    the configuration); without a configured window the creation is refused. On `Rejected`/`Config`: return its message.
+//!    the configuration); without a configured window the creation is refused. On
+//!    `Rejected`/`Config`: return its message.
 //! 3. New `SessionId`, new `MissionId`. `title`: the given one, else the first line of `message` cut
 //!    to 80 characters, else `untitled`.
 //! 4. `SessionStart{session, mission, parent: None, workspace, pack, role, termination,
@@ -114,9 +116,10 @@
 //!   start agents.`
 //! - the role must exist in the parent's pack and be in the parent role's `may_spawn`: otherwise
 //!   `` `{role}` is not a role this session can start. Roles it can start: {list}. ``
-//! - at most `agents.max_children` unsettled children per parent: otherwise `{n} agents are already
-//!   running, which is the most allowed at once. Wait for one to finish (`wait`) or stop one
-//!   (`agent_stop`), then start this one.`
+//! - at most `agents.max_children` unsettled children per parent, not counting the finish gate's
+//!   verifiers (as in `children`): otherwise `{n} agents are already running, which is the most
+//!   allowed at once. Wait for one to finish (`wait`) or stop one (`agent_stop`), then start this
+//!   one.`
 //! - a request with `harness: true` (the finish gate's verifier) is exempt from both of the last two rules.
 //! - `SpawnMode::Fork`: the parent's status must have a `fork_point`, and every tool of the child
 //!   role must be among the parent role's tools; otherwise `A `{role}` agent cannot be forked from
@@ -1860,7 +1863,7 @@ impl Inner {
             let running = st
                 .known
                 .values()
-                .filter(|k| k.meta.parent.as_ref() == Some(parent) && !k.finished())
+                .filter(|k| k.meta.parent.as_ref() == Some(parent) && !k.finished() && k.gate.is_none())
                 .count();
             if !req.harness && running >= self.config.agents.max_children as usize {
                 return Err(format!(
@@ -1978,9 +1981,10 @@ impl Inner {
 
     // ---- start ------------------------------------------------------------------------------
 
-    /// Model facts of a profile: discovery once, the first success remembered. The flag is true when
-    /// the server could not be asked and the numbers come from the profile alone. Without a configured
-    /// window that is refused: a session must not start with a window nobody knows.
+    /// Model facts of a profile: discovery once, the first success with a window remembered; a
+    /// discovery that finds no window refuses the creation and is not remembered. The flag is true
+    /// when the server could not be asked and the numbers come from the profile alone. Without a
+    /// configured window that is refused: a session must not start with a window nobody knows.
     async fn facts(&self, profile_name: &str) -> Result<(String, Option<u64>, bool), String> {
         let rt = self.profiles.get(profile_name).ok_or_else(|| format!("The model profile \"{profile_name}\" is not configured."))?;
         let remembered = lock(&rt.discovered).clone();
@@ -1991,7 +1995,7 @@ impl Inner {
                 Ok(d) if d.context_window.is_none() => {
                     // Not remembered: every creation is refused until the profile sets a window.
                     return Err(format!(
-                        "The model server at {} answered but reports no context window for the model, so the session would start without knowing it. Set context_window in [models.{profile_name}] of the config.",
+                        "The model server at {} answered but reports no context window for the model, so the session would start without knowing it. Set context_window in [models.{profile_name}] of the config and restart the daemon: the config is read only at start.",
                         profile.base_url
                     ));
                 }
@@ -2002,7 +2006,7 @@ impl Inner {
                 Err(ModelError::Unavailable { last, .. }) => {
                     if profile.context_window.is_none() {
                         return Err(format!(
-                            "The model server at {} could not be asked for its models ({last}), and the profile \"{profile_name}\" sets no context_window, so the session would start without knowing the model's window. Start the model server, or set context_window in [models.{profile_name}] of the config.",
+                            "The model server at {} could not be asked for its models ({last}), and the profile \"{profile_name}\" sets no context_window, so the session would start without knowing the model's window. Start the model server, or set context_window in [models.{profile_name}] of the config and restart the daemon: the config is read only at start.",
                             profile.base_url
                         ));
                     }
@@ -4262,6 +4266,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_held_gate_verifier_does_not_use_a_slot_of_max_children() {
+        let e = env_with(Script::new(|_, _| Action::Stall { ms: 600_000 }), false, |c| c.agents.max_children = 1).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("request", || !e.server.requests().is_empty()).await;
+        let orch = e.rt.inner.orch.clone();
+        let req = |role: &str, harness: bool| SpawnReq {
+            role: role.into(),
+            mode: SpawnMode::Fresh,
+            brief: Default::default(),
+            budget: Budget::default(),
+            call_id: CallId::from("c1"),
+            title: "t".into(),
+            awaited: false,
+            harness,
+        };
+        orch.spawn(&id, req("verifier", true)).await.unwrap();
+        orch.spawn(&id, req("worker", false)).await.expect("a gate verifier is not counted against max_children");
+        let err = orch.spawn(&id, req("worker", false)).await.unwrap_err();
+        assert!(err.starts_with("1 agents are already running"), "{err}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn harness_spawn_ignores_max_children_and_may_spawn() {
         let e = env_with(Script::new(|_, _| Action::Stall { ms: 600_000 }), false, |c| c.agents.max_children = 1).await;
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
@@ -5021,11 +5048,13 @@ mod tests {
         let item = e.rt.inbox().remove(0).item.item_id;
         e.rt.answer(&item, "").await.unwrap();
         until("resolved", || e.rt.inbox().is_empty()).await;
-        e.rt.shutdown().await;
-        // (The status file keeps the count from before the dismissal; the idle session this test needs has none open.)
+        // The dismissal is published at once, so the restart below does not see an open item.
         let status_file = e.rt.paths().session_dir(&id).join("status.json");
-        let status = std::fs::read_to_string(&status_file).unwrap();
-        std::fs::write(&status_file, status.replace("\"open_inbox\": 1", "\"open_inbox\": 0")).unwrap();
+        until("status published", || {
+            std::fs::read_to_string(&status_file).is_ok_and(|s| s.contains("\"open_inbox\": 0"))
+        })
+        .await;
+        e.rt.shutdown().await;
         // The crash left a command running in its own process group, recorded as an earlier daemon's.
         let mut child = std::process::Command::new("sleep").arg("300").process_group(0).spawn().unwrap();
         let start = loom_tools::proc::process_start(child.id()).unwrap();

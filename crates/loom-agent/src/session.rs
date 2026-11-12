@@ -166,9 +166,10 @@
 //!    configured size: the count starts at its `turn_start`, the earlier `Budget` note no longer
 //!    counts, and the turn begins with `harness_note{Info, texts::budget_renewed(max_steps,
 //!    max_minutes)}`): when either is reached and no `Budget` note has been
-//!    given, append `harness_note{Budget, texts::budget_reached(step, minutes, can_finish)}`
-//!    (`can_finish` = the registry has `finish`). When the note was given and `BUDGET_GRACE_STEPS`
-//!    steps have run since, the child settles `BudgetExhausted` with
+//!    given, append `harness_note{Budget, texts::budget_reached(step, minutes, can_finish,
+//!    is_child)}` (`can_finish` = the registry has `finish`; `is_child` selects the wording, an
+//!    assignment's budget for a child, the session's own for a root). When the note was given and
+//!    `BUDGET_GRACE_STEPS` steps have run since, the child settles `BudgetExhausted` with
 //!    `texts::budget_exhausted_report(step, minutes, last_reply)` (`last_reply` = text of the last
 //!    own model response); a session that is not a child instead opens an inbox item (`Parked`,
 //!    blocking, text `texts::turn_failed("The session's budget is used up.")`) and the turn ends
@@ -295,11 +296,15 @@
 //! request when it stated none), so that a forced re-weave can be planned when the window is unknown
 //! or set too large. `limit` = `deps.context.target_tokens`, lowered (when there is a `window`) to
 //! `window − reserve` and to four fifths of `window`; the floor used is `floor_tokens` lowered to
-//! half of `window`, and to half of `limit` when it is not below `limit`. `reserve` is the profile's
-//! `max_output_tokens` plus `min(4_096, window / 4)`, or `min(20_480, window / 4)` without one (or
-//! with one that leaves no room in `window`): the reply asked for always fits, and a small window
-//! keeps a positive trigger. For windows of 81_920 tokens and more the reserve is never cut, and for
-//! a 1M window the defaults (400k, 180k) are unchanged. Not forced and `size <= limit`: nothing to
+//! half of `window`, and to half of `limit` when it is not below `limit`. `reserve` is, for a
+//! profile `max_output_tokens` (`max`) below `window`,
+//! `max + min(min(4_096, window / 4), window − max − 1)`: the reply asked for is always kept, so a
+//! request at the trigger plus the `max_tokens` it sends fits the window, and when the reply leaves
+//! little room the trigger can drop to 1 and the floor to 0. A `max_output_tokens` at or above
+//! `window` cannot be honoured and counts as none; without one `reserve` is
+//! `min(20_480, window / 4)`, so a small window keeps a positive trigger. For windows of 81_920
+//! tokens and more the quarter of the window never cuts the 4_096 or the 20_480, and for a 1M
+//! window the defaults (400k, 180k) are unchanged. Not forced and `size <= limit`: nothing to
 //! do. The plan counts in the estimator's units: it is made with the floor used × `est / size`, and
 //! is *enough* when its `after_tokens_est` is at or below the midpoint between the floor used and
 //! `limit`, × `est / size`.
@@ -1065,15 +1070,19 @@ fn tools_chars(tools: &[ToolSpec]) -> usize {
 /// known `window` so that a request at the trigger leaves room for the reply. That room is
 /// `max_output` plus 4_096, or 20_480 without one. What the harness chooses itself (the 4_096, the
 /// 20_480) is at most a quarter of the window, so that a small window keeps a positive trigger and
-/// floor; a configured `max_output` is never cut, since every request asks for that much. One the
-/// window cannot hold with its 4_096 cannot be honoured, and counts as none. From a window of
-/// 81_920 tokens up nothing is cut.
+/// floor. A `max_output` below the window is never cut, since every request asks for that much as
+/// `max_tokens`: the 4_096 after it shrinks to what the window has left (`window − max − 1`), so
+/// the trigger can drop to 1 and the floor to 0. A `max_output` at or above the window cannot be
+/// honoured and counts as none. From a window of 81_920 tokens up the quarter of the window cuts
+/// nothing.
 fn reweave_bounds(policy: &ReweavePolicy, window: Option<u64>, max_output: Option<u64>) -> (u64, u64) {
     let (mut limit, mut floor) = (policy.target_tokens, policy.floor_tokens);
     if let Some(window) = window {
         let slack = 4_096_u64.min(window / 4);
-        let reserve = match max_output.map(|m| m.saturating_add(slack)) {
-            Some(reserve) if reserve < window => reserve,
+        // A reply length the window cannot hold counts as none; one it can hold is kept, with the slack
+        // shrunk to what is left, because `step` sends it as max_tokens.
+        let reserve = match max_output {
+            Some(max) if max < window => max + slack.min(window - max - 1),
             _ => 20_480_u64.min(window / 4),
         };
         // The trigger stays within four fifths of the window and the floor within half of it, so
@@ -1635,6 +1644,8 @@ impl Session {
             Input::Answer { item_id, answer } => {
                 let Some(item) = self.st.inbox.iter().find(|i| i.item_id == item_id).cloned() else { return Ok(out) };
                 self.append(Author::User, Event::InboxResolved { item_id, answer: answer.clone() })?;
+                // Published now, not with the next turn: a restart in between reads status.json.
+                self.publish();
                 // A blank answer to an item that is not waiting for one dismisses it.
                 let dismissed = answer.trim().is_empty() && !item.blocking;
                 let asked = matches!(item.kind, InboxKind::Question | InboxKind::Blocker);
@@ -2221,7 +2232,7 @@ impl Session {
         match self.st.budget_note_step {
             None if reached => {
                 let can_finish = self.registry.get("finish").is_some();
-                self.note(Author::Harness, NoteKind::Budget, texts::budget_reached(step, minutes, can_finish))?;
+                self.note(Author::Harness, NoteKind::Budget, texts::budget_reached(step, minutes, can_finish, self.deps.shared.is_child()))?;
                 Ok(None)
             }
             Some(at) if self.st.step.saturating_sub(at) >= texts::BUDGET_GRACE_STEPS => {
@@ -4408,14 +4419,24 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_that_ends_while_waiting_resumes_the_session_with_an_arrival_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("release");
+        // Bounded, so that a failed run leaves no loop behind.
+        let command = format!(
+            "i=0; while [ ! -f '{}' ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done; echo job-output",
+            release.display()
+        );
         let script = seq(vec![
-            Reply::tool("bash", json!({ "command": "sleep 1; echo job-output", "background": true }).to_string()).into(),
+            Reply::tool("bash", json!({ "command": command, "background": true }).to_string()).into(),
             Reply::tool("wait", json!({}).to_string()).into(),
             finish_call("done").into(),
         ]);
         let mut kid = Fx::new("worker", true, true, script).await;
         let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Run it.".into())));
         let (tx, task) = spawn_run(session);
+        // The job ends only once the turn is waiting, however slow the machine is.
+        wait_until(&kid.sink, "the turn waits", |rs| count(rs, "turn_end") == 1).await;
+        std::fs::write(&release, "").unwrap();
         let end = tokio::time::timeout(Duration::from_secs(60), task).await.expect("the child did not settle").unwrap();
         let End::Settled(s) = end else { panic!("expected a settlement, got {end:?}") };
         assert_eq!(s.outcome, ChildOutcome::Returned);
@@ -4524,6 +4545,8 @@ mod tests {
         assert_eq!(notes(&rs, NoteKind::Arrival), vec![texts::question_dismissed("which?")]);
         assert_eq!(count(&rs, "user_message"), 0);
         assert!(session.st.inbox.is_empty());
+        // The status is out before any turn: a restart reads it and must not see the item open.
+        assert_eq!(fx.sink.last_status().unwrap().open_inbox, 0);
     }
 
     #[tokio::test]
@@ -5091,7 +5114,13 @@ mod tests {
         // One the window cannot hold is no reply length the session can honour: it counts as none,
         // not as a trigger of 0 that would re-weave at every step.
         assert_eq!(reweave_bounds(&policy, Some(16_000), Some(32_768)), (12_000, 8_000));
-        assert_eq!(reweave_bounds(&policy, Some(16_000), Some(14_000)), (12_000, 8_000));
+        // One the window can hold is kept even when little is left after it: the request still fits.
+        assert_eq!(reweave_bounds(&policy, Some(16_000), Some(14_000)), (1, 0));
+        assert_eq!(reweave_bounds(&policy, Some(32_768), Some(30_000)), (1, 0));
+        for (window, max) in [(16_000, Some(4_000)), (16_000, Some(14_000)), (32_768, Some(30_000)), (65_536, Some(32_768))] {
+            let (limit, _) = reweave_bounds(&policy, Some(window), max);
+            assert!(limit + max.unwrap_or(0) <= window, "window {window} max {max:?}");
+        }
         // A request at the trigger leaves room for the reply it asks for, and the 4_096 after it.
         let (limit, floor) = reweave_bounds(&policy, Some(65_536), Some(32_768));
         assert_eq!((limit, floor), (28_672, 14_336));
