@@ -144,6 +144,7 @@ use loom_core::event::{
 use loom_core::ids::new_item_id;
 use loom_core::ledger::{ClaimStatus, Evidence, LedgerOp, LedgerState};
 use loom_core::log::read_records;
+use loom_core::observe::QUOTE_RECORD_CHARS;
 use loom_core::{BlobId, BlobRef};
 use loom_tools::jobs::JobState;
 use loom_tools::params::{opt, req, spec};
@@ -184,7 +185,8 @@ pub fn quote_items() -> Value {
 ///   active constraint (omitted when none), then `The lead's summary of the result:\n{answer}`, then
 ///   `What the lead says it did not establish:` when it stated something, then
 ///   `Lines the lead quotes as support:` with one line per quote `- {handle} lines {start}-{end}:
-///   {text cut to 300 characters}` (omitted when none), then `Evidence the lead names for the result:`
+///   {text cut to observe::QUOTE_RECORD_CHARS (300) characters}` (omitted when none; an excerpt the quote
+///   check recorded of a long line is never longer), then `Evidence the lead names for the result:`
 ///   with one line per record of `evidence` (the ids given to `finish`; omitted when none), then
 ///   `Claims recorded as supported:` with one line per supported claim `- {id}: {text}`, each followed
 ///   by its evidence records, indented (omitted when none).
@@ -218,9 +220,13 @@ pub fn finish_brief(
     }
 
     if !quotes.is_empty() {
+        // The cut is the size of a recorded quote, so an excerpt of a long line is shown whole.
         let lines: Vec<String> = quotes
             .iter()
-            .map(|q| format!("- {} lines {}-{}: {}", handle_of(&q.blob), q.start, q.end, cut_chars(&q.text, 300)))
+            .map(|q| {
+                let text = cut_chars(&q.text, QUOTE_RECORD_CHARS);
+                format!("- {} lines {}-{}: {text}", handle_of(&q.blob), q.start, q.end)
+            })
             .collect();
         parts.push(format!("Lines the lead quotes as support:\n{}", lines.join("\n")));
     }
@@ -263,7 +269,7 @@ fn evidence_line(e: &Evidence) -> String {
     let side = if i.supports { "supports" } else { "undermines" };
     let handle = i.blob.as_ref().map(handle_of).unwrap_or_else(|| "no stored output".to_string());
     let range = i.lines.map(|(a, b)| format!(" lines {a}-{b}")).unwrap_or_default();
-    let quote = cut_chars(i.quote.as_deref().unwrap_or(""), 300);
+    let quote = cut_chars(i.quote.as_deref().unwrap_or(""), QUOTE_RECORD_CHARS);
     format!("- {} ({side}) {handle}{range}: {quote} \u{2014} {}", e.id, i.note)
 }
 
@@ -1239,7 +1245,8 @@ mod tests {
         let quotes = json!([{"handle": h, "start": 1, "end": 2, "text": "0 failed; 0 ignored"}]);
         let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
-        assert!(res.text.contains("does not occur"), "{}", res.text);
+        assert!(res.text.contains(&format!("occurs on line 1 of {h} only inside a longer word or number")), "{}", res.text);
+        assert!(effect(&r).is_none());
         let quotes = json!([{"handle": h, "start": 1, "end": 2, "text": "40 tests passed"}]);
         let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
@@ -1247,6 +1254,36 @@ mod tests {
         assert!(d.report.contains("lines 2-2: 0 of 40 tests passed"), "{}", d.report);
         assert_eq!(d.payload["quotes"][0]["text"], json!("0 of 40 tests passed"));
         assert_eq!(d.payload["quotes"][0]["start"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn a_fragment_of_a_long_line_stays_visible_where_the_quote_is_shown() {
+        let fragment = "versions before 2.4.1 are affected";
+        let line = format!("{}{fragment}, and {}\n", "lorem ".repeat(150), "ipsum ".repeat(50).trim_end());
+        let max = loom_core::observe::QUOTE_RECORD_CHARS;
+        // A child's report and payload: an excerpt of the line around the fragment, past character 900.
+        let r = rig("worker", true, true);
+        let h = r.output(&line, "read", ToolClass::Read);
+        let quotes = json!([{"handle": h, "start": 1, "end": 1, "text": fragment}]);
+        let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let Some(Effect::Settle(d)) = effect(&r) else { panic!("settle expected") };
+        let shown = d.payload["quotes"][0]["text"].as_str().unwrap().to_string();
+        assert!(shown.contains(fragment) && shown.starts_with('…') && shown.chars().count() <= max, "{shown}");
+        assert!(d.report.contains(&format!("{h} lines 1-1: {shown}\n")), "{}", d.report);
+        // A lead: the verifier's brief and the operator's item show it too.
+        let r = lead();
+        let h = r.output(&line, "read", ToolClass::Read);
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "fine", accepted_payload());
+        let quotes = json!([{"handle": h, "start": 1, "end": 1, "text": fragment}]);
+        let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let spawned = r.orch.spawned.lock().unwrap().clone();
+        let brief = spawned[0].1.brief.context.clone().unwrap();
+        assert!(brief.contains(&format!("- {h} lines 1-1: {shown}")), "{brief}");
+        let items = inbox_items(&r);
+        let item = items.iter().find(|i| i.kind == InboxKind::Finished).unwrap();
+        assert!(item.text.contains(&format!("- {h} lines 1-1: {shown}")), "{}", item.text);
     }
 
     #[tokio::test]

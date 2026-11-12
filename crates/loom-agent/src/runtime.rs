@@ -4038,6 +4038,49 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
     }
 
+    /// The seal the journal gives an entry: HMAC-SHA256 under `key` of the previous seal followed by the body.
+    fn seal(key: &[u8], prev: &str, body: &str) -> String {
+        let bytes = |hex: String| -> Vec<u8> {
+            (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+        };
+        let mut k = if key.len() > 64 { bytes(loom_core::sha256_hex(key)) } else { key.to_vec() };
+        k.resize(64, 0);
+        let padded = |x: u8| k.iter().map(|b| b ^ x).collect::<Vec<u8>>();
+        let inner = [padded(0x36), prev.as_bytes().to_vec(), body.as_bytes().to_vec()].concat();
+        loom_core::sha256_hex(&[padded(0x5c), bytes(loom_core::sha256_hex(&inner))].concat())
+    }
+
+    #[tokio::test]
+    async fn ledger_entries_of_a_newer_loom_are_counted_in_the_view_and_the_state_block() {
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let info = e.rt.create_session(e.new_session(None)).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        let path = e.rt.paths().journal(&mission);
+        let op = loom_core::ledger::LedgerOp::ConstraintAdd { text: "CONSTRAINTMARK never touch prod".into() };
+        Journal::new(&path, e.rt.inner.key.clone()).append(&id, true, op, &|_| Ok(())).unwrap();
+        // An entry sealed with the mission's key whose op this build does not know.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        let body = format!(r#"{{"n":2,"ts_ms":11,"session":"{id}","from_user":false,"op":"hologram_set","depth":3}}"#);
+        let mac = seal(&e.rt.inner.key, first["mac"].as_str().unwrap(), &body);
+        std::fs::write(&path, format!("{text}{},\"mac\":\"{mac}\"}}\n", &body[..body.len() - 1])).unwrap();
+
+        let view = e.rt.ledger(&mission).unwrap();
+        assert_eq!((view.state.constraints.len(), view.skipped, view.torn_tail), (1, 1, false));
+        let detail = view.skipped_detail.clone().unwrap_or_default();
+        assert!(detail.starts_with("entry 2: op `hologram_set`"), "{detail}");
+        let notices = view.notices();
+        assert!(notices[0].starts_with("1 ledger entry written by a newer loom is not shown (first: entry 2"), "{notices:?}");
+
+        // The model's state block says so as well.
+        e.rt.send_message(&id, "go").await.unwrap();
+        until("request", || !e.server.requests().is_empty()).await;
+        let hud = hud_of(&e.server.requests()[0]);
+        assert!(hud.contains("CONSTRAINTMARK"), "{hud}");
+        assert!(hud.contains("\n\n1 ledger entry written by a newer loom is not shown"), "{hud}");
+        tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
+    }
+
     #[test]
     fn skipped_ledger_entries_are_named_in_the_view() {
         let view = LedgerView {

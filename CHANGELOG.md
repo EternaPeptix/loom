@@ -160,10 +160,12 @@ upgrade" first; the rest says what behaves differently.
 - Text from tool results, files and agent reports is neutralised where it could pass for a harness
   block. Reports show the agent's own words with every line prefixed `> `.
 - The quotes of `finish` must come from observations (a command's output or a file read), as evidence
-  does: a quote of a ledger, a log search or an agent's report is refused. A quote that is part of a
-  line must start and end on word boundaries and is recorded as the whole line. `verdict` is refused
-  while the verifier has a running job. The received arguments in the note about a malformed call are
-  quoted line by line.
+  does: a quote of a ledger, a log search or an agent's report is refused.
+- A quote that is part of a line must start and end on word boundaries (the model is told when it
+  occurs only inside a longer word or number) and is recorded as its whole line, or as a window of at
+  most 300 characters around it on a longer line.
+- `verdict` is refused while the verifier has a running job.
+- The received arguments in the note about a malformed call are quoted line by line.
 
 ### Logs, journal and storage
 
@@ -177,7 +179,6 @@ upgrade" first; the rest says what behaves differently.
 ### Packs and documents
 
 - The `vr` chat role no longer lists `note`, which a session without a ledger cannot use.
-
 - The shipped prompts no longer promise hooks, no longer let a scout start agents, and say that the
   judge delivers a scope check through `verdict`. `vr` documents its network policy.
 - `README.md`, `docs/RUN.md`, `docs/config.example.toml` and `docs/IMPLEMENTING.md` were rewritten to

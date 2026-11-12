@@ -416,18 +416,24 @@ output by handle, a line range, a quote and a note. The harness:
 4. records `{claim, kind, supports, session, call_id, blob, lines, quote, note, attested: true}`, where
    `kind` is `execution` when the producer is of class `Exec` and `static` otherwise, and `quote` is
    the verified text without line-number prefixes. A quote that is a part of a line is recorded as the
-   complete line or lines it lies on, with their numbers.
+   complete line or lines it lies on, with their numbers (a window of them on long lines, below).
 
 **Quote check** (`observe::check_quote`, also used for the quotes of `finish`). Both sides are prepared
 the same way: trailing whitespace is removed from every line, and blank lines at either end of the
 quote are ignored. The quote is looked for as written. Only when that fails (or finds only a fragment
-that is too short) and every non-blank line of the quote starts with a line-number prefix as the read
-tools print them (`N:`, `N-`, `N|`, `N│` or `N<TAB>`, the numbers increasing), the prefixes are removed
+that is too short or inside a word) and every non-blank line of the quote starts with a line-number
+prefix as the read tools print them (`N:`, `N-`, `N|`, `N│` or `N<TAB>`, the numbers increasing), the
+prefixes are removed
 and the rest is looked for, and each number must then be the real number of the line its text is on.
 An occurrence counts only when it spans whole lines or has at least 8 non-whitespace characters and sits
 on token boundaries: when the quote begins (ends) with a letter or digit, the character before (after) it
-in the line is not one. `0 failed` is not found inside `10 failed`. The text recorded and shown as the
-attested quote is the complete line or lines the accepted occurrence lies on. There is no other leniency: case, indentation, inner spacing and punctuation must match.
+in the line is not one: `0 failed; 0 ignored` is not found inside `10 failed; 0 ignored`, and the model is
+told that the text occurs only inside a longer word or number. The text recorded and shown as the
+attested quote is the complete line or lines the accepted occurrence lies on when they have at most 300
+characters (`observe::QUOTE_RECORD_CHARS`); on longer lines it is the occurrence, whole, with as much of
+the lines around it as fits in 300 characters and `…` where text was left out, so the quoted text is
+always shown and the record stays bounded. There is no other leniency: case, indentation, inner spacing
+and punctuation must match.
 
 **Views.** `LedgerState::render_markdown()` is the full Markdown view (the `ledger` tool, the API's
 `markdown`, `loom ledger`). A mission whose lead keeps a ledger but has written nothing yet has an

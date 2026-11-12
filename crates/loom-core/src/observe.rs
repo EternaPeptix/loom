@@ -44,11 +44,16 @@
 //!
 //! A fragment (not whole lines) must also sit on token boundaries: when its first (last) character is
 //! alphanumeric, the character before (after) it in the line is not.
-//! The first accepted occurrence wins and `Ok(text)` is the text to record: the complete line or lines
-//! the occurrence lies on (trailing whitespace removed), without line-number prefixes. Otherwise `Err`: `NotFound` (the text does not occur; also an empty
+//! The first accepted occurrence wins and `Ok(text)` is the text to record, without line-number prefixes:
+//! the complete line or lines the occurrence lies on (trailing whitespace removed) when they have at most
+//! `QUOTE_RECORD_CHARS` (300) characters; otherwise the occurrence, whole, with as much of those lines
+//! before and after it as fits in that many characters, and `…` on each side where text was left out.
+//! Otherwise `Err`: `NotFound` (the text does not occur; also an empty
 //! or whitespace-only quote), `WrongLine { quoted, actual }` (it occurs, but never on the lines the
-//! quote numbers: for the first occurrence, the first wrong number and the line that text is on), or
-//! `TooShort` (it occurs where the numbers allow, but only as a fragment of fewer than 8 characters).
+//! quote numbers: for the first occurrence, the first wrong number and the line that text is on),
+//! `TooShort` (it occurs where the numbers allow, but only as a fragment of fewer than 8 characters), or
+//! `InsideToken { line }` (it occurs where the numbers allow, but only beginning or ending inside a word
+//! or number; `line` is where the first such occurrence starts).
 //! The haystack is walked once, whatever the number of occurrences.
 //! `quote_matches(haystack, quote)` is `check_quote(haystack, quote, 1).is_ok()`.
 //! `nearest_line(haystack, quote)` returns the 1-based number and text of the haystack line sharing
@@ -490,6 +495,10 @@ fn strip_prefixes<'a>(lines: &[&'a str]) -> Option<(Vec<&'a str>, Vec<Option<u64
 /// A quote that does not span whole lines must have at least this many non-whitespace characters.
 pub const MIN_PARTIAL_QUOTE_CHARS: usize = 8;
 
+/// Longest text, in characters, recorded for an accepted quote whose text is shorter: the lines it lies on
+/// when they fit, else a window of them around it.
+pub const QUOTE_RECORD_CHARS: usize = 300;
+
 /// Why a quote was not accepted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QuoteError {
@@ -500,13 +509,17 @@ pub enum QuoteError {
     WrongLine { quoted: u64, actual: u64 },
     /// The text occurs but is a fragment of fewer than [`MIN_PARTIAL_QUOTE_CHARS`] characters.
     TooShort,
+    /// The text occurs, but only beginning or ending inside a longer word or number; the first such
+    /// occurrence starts on line `line`.
+    InsideToken { line: u64 },
 }
 
 /// Walk the occurrences of `text` in `hay` front to back, overlapping ones included, and accept the first
 /// that is a valid quote: the numbers the quote gave its lines (`numbers`, one entry per line of `text`)
-/// are the numbers of the lines it is on, and it spans whole lines or is long enough. `first_line` is the
-/// number of the first line of `hay`. One pass: the line count is carried from one occurrence to the next,
-/// so the lines of `hay` are counted once however many occurrences are passed over.
+/// are the numbers of the lines it is on, and it spans whole lines or is long enough and on token
+/// boundaries. Returns the bytes of `hay` it occupies. `first_line` is the number of the first line of
+/// `hay`. One pass: the line count is carried from one occurrence to the next, so the lines of `hay` are
+/// counted once however many occurrences are passed over.
 fn scan_quote(
     hay: &str,
     text: &str,
@@ -519,6 +532,7 @@ fn scan_quote(
     let long_enough = text.chars().filter(|c| !c.is_whitespace()).count() >= MIN_PARTIAL_QUOTE_CHARS;
     let mut wrong: Option<QuoteError> = None;
     let mut short = false;
+    let mut inside: Option<u64> = None;
     let first_alnum = text.chars().next().is_some_and(char::is_alphanumeric);
     let last_alnum = text.chars().next_back().is_some_and(char::is_alphanumeric);
     // `line` is the number of the line that byte `counted` of `hay` is on.
@@ -557,28 +571,56 @@ fn scan_quote(
         if !inside_token {
             return Ok(off..off.saturating_add(text.len()));
         }
+        inside = inside.or(Some(line));
     }
-    match wrong {
-        _ if short => Err(QuoteError::TooShort),
-        Some(e) => Err(e),
-        None => Err(QuoteError::NotFound),
+    if short {
+        return Err(QuoteError::TooShort);
     }
+    if let Some(line) = inside {
+        return Err(QuoteError::InsideToken { line });
+    }
+    Err(wrong.unwrap_or(QuoteError::NotFound))
 }
 
-/// The complete lines of `hay` that the byte range `at` lies on, and the number of the first of them
-/// (`first_line` is the number of the first line of `hay`).
-fn whole_lines(hay: &str, at: &std::ops::Range<usize>, first_line: u64) -> (String, u64) {
+/// What is recorded for the occurrence at bytes `at` of `hay`, and the number of the line it starts with
+/// (`first_line` is the number of the first line of `hay`): the complete lines the occurrence lies on when
+/// they have at most [`QUOTE_RECORD_CHARS`] characters. Otherwise the occurrence, whole, with as much of
+/// those lines on either side as fits in that many characters (what one side does not use goes to the
+/// other), and `…` on each side where text was left out, so the quoted text is never cut off and the
+/// record stays bounded however long the line.
+fn recorded(hay: &str, at: &std::ops::Range<usize>, first_line: u64) -> (String, u64) {
     let start = hay.get(..at.start).and_then(|b| b.rfind('\n')).map_or(0, |i| i.saturating_add(1));
     let end = hay.get(at.end..).and_then(|a| a.find('\n')).map_or(hay.len(), |i| at.end.saturating_add(i));
-    let before = hay.get(..start).map_or(0, |b| b.matches('\n').count());
-    (hay.get(start..end).unwrap_or_default().to_string(), first_line.saturating_add(before as u64))
+    let number = first_line.saturating_add(hay.get(..start).map_or(0, |b| b.matches('\n').count()) as u64);
+    let whole = hay.get(start..end).unwrap_or_default();
+    if whole.chars().count() <= QUOTE_RECORD_CHARS {
+        return (whole.to_string(), number);
+    }
+    let quoted = hay.get(at.clone()).unwrap_or_default();
+    let (before, after) = (hay.get(start..at.start).unwrap_or_default(), hay.get(at.end..end).unwrap_or_default());
+    let (nb, na) = (before.chars().count(), after.chars().count());
+    // Two characters are kept for the `…` marks.
+    let room = QUOTE_RECORD_CHARS.saturating_sub(quoted.chars().count()).saturating_sub(2);
+    let ta = na.min(room.saturating_sub(nb.min(room / 2)));
+    let tb = nb.min(room.saturating_sub(ta));
+    let mut out = String::new();
+    if tb < nb {
+        out.push('…');
+    }
+    out.extend(before.chars().skip(nb.saturating_sub(tb)));
+    out.push_str(quoted);
+    out.extend(after.chars().take(ta));
+    if ta < na {
+        out.push('…');
+    }
+    (out, number)
 }
 
 /// Check `quote` against `haystack`, whose first line is line `first_line` of the stored output. Returns
 /// the text to record: the complete line or lines the accepted occurrence lies on, so a fragment is
-/// recorded with its context. Prefixes, when present, must be the real line numbers; a quote that is not
-/// whole lines needs [`MIN_PARTIAL_QUOTE_CHARS`] non-whitespace characters and must begin and end on token
-/// boundaries.
+/// recorded with its context, or a window of them around it when they are long (see [`QUOTE_RECORD_CHARS`]).
+/// Prefixes, when present, must be the real line numbers; a quote that is not whole lines needs
+/// [`MIN_PARTIAL_QUOTE_CHARS`] non-whitespace characters and must begin and end on token boundaries.
 pub fn check_quote(haystack: &str, quote: &str, first_line: u64) -> Result<String, QuoteError> {
     check_quote_at(haystack, quote, first_line).map(|(text, _)| text)
 }
@@ -591,24 +633,24 @@ pub fn check_quote_at(haystack: &str, quote: &str, first_line: u64) -> Result<(S
     let hay = prepare_haystack(haystack);
     let lines = quote_lines(quote);
     let literal = lines.join("\n");
-    // A literal fragment that is too short may still be a numbered quote ("3: ok" where line 3 is "ok"
-    // and the literal text also sits inside a longer line): the numbered reading gets its turn, and
-    // "too short" is the answer only when both fail.
-    let literal_short = match scan_quote(&hay, &literal, None, first_line) {
-        Err(QuoteError::NotFound) => false,
-        Err(QuoteError::TooShort) => true,
-        verdict => return verdict.map(|at| whole_lines(&hay, &at, first_line)),
+    // A literal fragment that is too short, or found only inside longer words, may still be a numbered
+    // quote ("3: ok" where line 3 is "ok" and the literal text also sits inside a longer line): the
+    // numbered reading gets its turn, and the literal reading's answer stands when both fail.
+    let literal_error = match scan_quote(&hay, &literal, None, first_line) {
+        Ok(at) => return Ok(recorded(&hay, &at, first_line)),
+        Err(QuoteError::NotFound) => None,
+        Err(e) => Some(e),
     };
     let numbered = match strip_prefixes(&lines) {
         Some((stripped, numbers)) => {
             let text = stripped.join("\n");
-            scan_quote(&hay, &text, Some(numbers.as_slice()), first_line).map(|at| whole_lines(&hay, &at, first_line))
+            scan_quote(&hay, &text, Some(numbers.as_slice()), first_line).map(|at| recorded(&hay, &at, first_line))
         }
         None => Err(QuoteError::NotFound),
     };
-    match numbered {
-        Err(_) if literal_short => Err(QuoteError::TooShort),
-        verdict => verdict,
+    match (numbered, literal_error) {
+        (Err(_), Some(e)) => Err(e),
+        (verdict, _) => verdict,
     }
 }
 
@@ -1058,9 +1100,11 @@ mod tests {
     fn a_fragment_sits_on_token_boundaries_and_is_recorded_as_its_whole_line() {
         let hay = "test result: FAILED. 5 passed; 10 failed; 0 ignored\n0 of 40 tests passed\n";
         // Inside "10" and inside "0 of 40": not a quote of those lines.
-        assert_eq!(check_quote(hay, "0 failed; 0 ignored", 1), Err(QuoteError::NotFound));
+        assert_eq!(check_quote(hay, "0 failed; 0 ignored", 1), Err(QuoteError::InsideToken { line: 1 }));
+        assert_eq!(check_quote(hay, "0 failed; 0 ignored", 7), Err(QuoteError::InsideToken { line: 7 }));
         // A cut inside the last word is not on a boundary either.
-        assert_eq!(check_quote(hay, "5 passed; 10 fail", 1), Err(QuoteError::NotFound));
+        assert_eq!(check_quote(hay, "5 passed; 10 fail", 1), Err(QuoteError::InsideToken { line: 1 }));
+        assert_eq!(check_quote(hay, "0 tests passed", 1), Err(QuoteError::InsideToken { line: 2 }));
         // On boundaries it is accepted, and the record is the whole line: "40 tests passed" is not
         // recorded without the "0 of" before it.
         assert_eq!(check_quote(hay, "40 tests passed", 1), Ok("0 of 40 tests passed".to_string()));
@@ -1073,6 +1117,44 @@ mod tests {
         // A fragment across two lines is recorded as both lines.
         let hay = "first part of it\nsecond part of it\n";
         assert_eq!(check_quote(hay, "of it\nsecond part", 1), Ok(hay.trim_end().to_string()));
+    }
+
+    #[test]
+    fn a_fragment_of_a_long_line_is_recorded_with_a_bounded_window_around_it() {
+        let fragment = "versions before 2.4.1 are affected";
+        let line = format!("{}{fragment}, and {}", "lorem ".repeat(150), "ipsum ".repeat(50).trim_end());
+        let hay = format!("short first line\n{line}\nlast\n");
+        let (text, first) = check_quote_at(&hay, fragment, 1).unwrap_or_default();
+        assert_eq!(first, 2);
+        // The fragment, past character 900 of the line, is in the record, which says it is an excerpt.
+        assert!(text.contains(fragment) && text.starts_with('…') && text.ends_with('…'), "{text}");
+        assert_eq!(text.chars().count(), QUOTE_RECORD_CHARS, "{text}");
+        assert!(line.contains(text.trim_matches('…')), "{text}");
+        // Context on both sides of it, as evenly as there is.
+        let (before, after) = text.split_once(fragment).unwrap_or_default();
+        assert!(before.chars().count().abs_diff(after.chars().count()) <= 1, "{text}");
+        // At the end of the line, the room after it goes before it.
+        let hay = format!("{}{fragment}\n", "lorem ".repeat(150));
+        let text = check_quote(&hay, fragment, 1).unwrap_or_default();
+        assert!(text.starts_with('…') && text.ends_with(fragment), "{text}");
+        assert_eq!(text.chars().count(), QUOTE_RECORD_CHARS - 1, "{text}");
+        // A line of several megabytes still gives a bounded record.
+        let (x, y) = ("x".repeat(2_000_000), "y".repeat(2_000_000));
+        let hay = format!("{{\"a\": \"{x}\", \"vulnerable\": true, \"b\": \"{y}\"}}\n");
+        let text = check_quote(&hay, "\"vulnerable\": true", 1).unwrap_or_default();
+        assert!(text.contains("\"vulnerable\": true") && text.chars().count() <= QUOTE_RECORD_CHARS, "{}", text.len());
+        // A quoted text longer than the window is kept whole.
+        let long = "word ".repeat(80);
+        let hay = format!("{}{}{}\n", "a ".repeat(200), long.trim_end(), " z".repeat(200));
+        let text = check_quote(&hay, long.trim_end(), 1).unwrap_or_default();
+        assert_eq!(text, format!("…{}…", long.trim_end()));
+        // A line that fits, and a whole long line quoted whole, are recorded as they are.
+        let fits = format!("{fragment} {}", "z".repeat(QUOTE_RECORD_CHARS - fragment.len() - 1));
+        let got = check_quote(&format!("{fits}\n"), fragment, 1);
+        assert_eq!(got, Ok(fits));
+        let whole = "w".repeat(QUOTE_RECORD_CHARS * 3);
+        let got = check_quote(&format!("{whole}\n"), &whole, 1);
+        assert_eq!(got, Ok(whole));
     }
 
     #[test]

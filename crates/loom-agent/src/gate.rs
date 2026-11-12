@@ -57,11 +57,14 @@
 //!   quote the text without line numbers.`
 //! - `TooShort`: `quote {i}: a quote that is only part of a line needs at least 8 non-space
 //!   characters. Quote more of the line, or the whole line with its indentation.`
+//! - `InsideToken { line }`: `quote {i}: the text occurs on line {line} of {handle} only inside a longer
+//!   word or number. Quote from the start of that word or number to its end, or quote the whole line.`
 //!
 //! An empty `text` is a mismatch with the sentence `quote {i}: the text is empty.`
-//! Returns `Ok(verified)` when every quote passes (blob id, and the complete line or lines the accepted
-//! text lies on with their range, as `check_quote_at` returned them: without line-number prefixes, a
-//! fragment recorded with the rest of its line), else `Err(all sentences, one per line)`.
+//! Returns `Ok(verified)` when every quote passes (blob id, the text `check_quote_at` records for it and
+//! the range of the lines that text is on: without line-number prefixes, a fragment with the rest of its
+//! line, or with a window of it of at most `observe::QUOTE_RECORD_CHARS` characters when the line is
+//! long), else `Err(all sentences, one per line)`.
 //!
 //! ## `render_report` — what a parent sees of a child's result
 //! ```text
@@ -410,7 +413,7 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize) -> Result<VerifiedQuote, St
         .map_err(|e| format!("quote {i}: the stored output {handle} could not be read ({e}); try again."))?;
     match observe::check_quote_at(&slice.text, &q.text, q.start) {
         Ok((text, first)) => {
-            // What is recorded is the complete line or lines the accepted text lies on.
+            // What is recorded is the line or lines the accepted text lies on (a window of them when long).
             let last = first.saturating_add((text.split('\n').count() as u64).saturating_sub(1));
             return Ok(VerifiedQuote { blob: id, start: first, end: last, text });
         }
@@ -423,6 +426,11 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize) -> Result<VerifiedQuote, St
             return Err(format!(
                 "quote {i}: a quote that is only part of a line needs at least {} non-space characters. Quote more of the line, or the whole line with its indentation.",
                 observe::MIN_PARTIAL_QUOTE_CHARS
+            ));
+        }
+        Err(observe::QuoteError::InsideToken { line }) => {
+            return Err(format!(
+                "quote {i}: the text occurs on line {line} of {handle} only inside a longer word or number. Quote from the start of that word or number to its end, or quote the whole line."
             ));
         }
         Err(observe::QuoteError::NotFound) => {}
@@ -830,6 +838,19 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         // The whole of a short line counts with its indentation only.
         let e = check_quotes(&store, &[q(&h, 3, 3, "ok")]).err().unwrap_or_default();
         assert!(e.contains("the whole line with its indentation"), "{e}");
+    }
+
+    #[test]
+    fn a_fragment_found_only_inside_a_word_or_number_is_told_so() {
+        let (_d, store, h) = store_with("ok\ntest result: FAILED. 5 passed; 10 failed; 0 ignored\n");
+        let e = check_quotes(&store, &[q(&h, 1, 2, "0 failed; 0 ignored")]).err().unwrap_or_default();
+        assert_eq!(
+            e,
+            format!("quote 1: the text occurs on line 2 of {h} only inside a longer word or number. Quote from the start of that word or number to its end, or quote the whole line.")
+        );
+        // Quoted from the start of the number, it is accepted, and recorded as its whole line.
+        let ok = check_quotes(&store, &[q(&h, 1, 2, "10 failed; 0 ignored")]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((ok[0].start, ok[0].end, ok[0].text.as_str()), (2, 2, "test result: FAILED. 5 passed; 10 failed; 0 ignored"));
     }
 
     #[test]

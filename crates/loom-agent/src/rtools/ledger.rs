@@ -26,7 +26,8 @@
 //! - `evidence`:
 //!   1. `gate::check_quotes(&ctx.blobs, &[Quote { handle, start, end, text: quote }])`; on `Err(text)`
 //!      → error `{text}\nNothing was attached.`
-//!   2. `shared.orch.producer(mission, blob)`; `None` → error ``{handle} was not produced by a tool
+//!   2. `rtools::observed_producer` (the rule `finish` applies to its quotes as well):
+//!      `shared.orch.producer(mission, blob)`; `None` → error ``{handle} was not produced by a tool
 //!      call of this mission, so it cannot be used as evidence. Evidence is a quote from the output
 //!      of a command you ran or a file you read.``
 //!      Only an observation is evidence. A producer that is a runtime tool (any of `NAMES`: `ledger`
@@ -41,9 +42,11 @@
 //!      runtime registers that blob as produced by the `read` call (class `Read`, so static evidence);
 //!      the complete output of a background job is registered as produced by the call that started it.
 //!   3. `EvidenceAdd(EvidenceInput { claim, kind, supports, session, call_id, blob: Some, lines:
-//!      Some((start, end)) as verified, quote: the verified text (line-number prefixes removed),
-//!      note, attested: true })` where `kind` is `Execution` when the producer's class is `Exec`,
-//!      else `Static`.
+//!      Some((start, end)) as verified, quote: the verified text, note, attested: true })` where `kind`
+//!      is `Execution` when the producer's class is `Exec`, else `Static`. The verified text has no
+//!      line-number prefixes; a fragment is recorded as the complete line or lines it lies on, and `lines`
+//!      are their numbers (on lines longer than `observe::QUOTE_RECORD_CHARS` characters, a window of them
+//!      around the fragment, `…` marking what was left out).
 //!
 //!   Outcome `evidence {id} attached to {claim}`. Text: `{id} ({supports|undermines}; {execution|static}:
 //!   {tool} call in {session}) attached to {claim}.` and, when the claim is still `Open`, the line
@@ -719,8 +722,24 @@ mod tests {
         let h = rig.output("test result: FAILED. 5 passed; 10 failed; 0 ignored\n", "bash", ToolClass::Exec);
         let ev = |quote: &str| json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "quote": quote, "note": "n"});
         let t = refused(&rig, "evidence", ev("0 failed; 0 ignored")).await;
-        assert!(t.contains("does not occur"), "{t}");
+        assert!(t.contains("occurs on line 1") && t.contains("only inside a longer word or number"), "{t}");
         assert!(rig.shared.ledger().unwrap().evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_evidence_fragment_of_a_long_line_is_recorded_as_a_window_around_it() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let fragment = "versions before 2.4.1 are affected";
+        let line = format!("{}{fragment}, {}", "lorem ".repeat(150), "ipsum ".repeat(5_000));
+        let h = rig.output(&format!("{}\n", line.trim_end()), "web_fetch", ToolClass::Read);
+        ok(&rig, "evidence", json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "quote": fragment, "note": "n"}))
+            .await;
+        let state = rig.shared.ledger().unwrap();
+        let quote = state.evidence[0].input.quote.clone().unwrap_or_default();
+        assert!(quote.contains(fragment) && quote.starts_with('…') && quote.ends_with('…'), "{quote}");
+        assert!(quote.chars().count() <= loom_core::observe::QUOTE_RECORD_CHARS, "{quote}");
+        assert_eq!(state.evidence[0].input.lines, Some((1, 1)));
     }
 
     #[tokio::test]
