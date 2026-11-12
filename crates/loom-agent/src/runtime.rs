@@ -4047,6 +4047,28 @@ mod tests {
         c
     }
 
+    /// The built-in `core` pack with a lead that cannot `conclude` or `request_scope`, written into `packs` so it
+    /// replaces the built-in one. These tests use `finish` only to end a turn; a lead without `conclude` is not held
+    /// by the goal-met claim (gate.rs), so `finish` ends the turn as it did before the finish gate asked for a
+    /// conclusion. The gate, conclude and scope behaviours are covered where they belong (rtools/terminal.rs,
+    /// ledger.rs, gate.rs), on a role that has the tools.
+    fn plain_core_pack(packs: &Path) {
+        let core = packs.join("core");
+        std::fs::create_dir_all(core.join("roles")).unwrap();
+        let toml = include_str!("../../../packs/core/pack.toml").replacen("\"request_scope\", \"conclude\", ", "", 1);
+        assert!(!toml.contains("\"conclude\""), "the lead's tool list changed shape");
+        std::fs::write(core.join("pack.toml"), toml).unwrap();
+        std::fs::write(core.join("harness.md"), include_str!("../../../packs/core/harness.md")).unwrap();
+        for (name, text) in [
+            ("lead", include_str!("../../../packs/core/roles/lead.md")),
+            ("worker", include_str!("../../../packs/core/roles/worker.md")),
+            ("verifier", include_str!("../../../packs/core/roles/verifier.md")),
+            ("chat", include_str!("../../../packs/core/roles/chat.md")),
+        ] {
+            std::fs::write(core.join("roles").join(format!("{name}.md")), text).unwrap();
+        }
+    }
+
     async fn env_with(script: Script, notify: bool, tweak: impl FnOnce(&mut Config)) -> Env {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws");
@@ -4055,7 +4077,9 @@ mod tests {
         let nf = dir.path().join("notified.txt");
         let mut config = config_for(&server, notify.then_some(nf.as_path()));
         tweak(&mut config);
-        let rt = Runtime::start(config.clone(), Paths::at(dir.path().join("home"))).await.unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        plain_core_pack(&paths.packs_dir());
+        let rt = Runtime::start(config.clone(), paths).await.unwrap();
         Env { dir, server, rt, ws, config }
     }
 
@@ -4111,6 +4135,7 @@ mod tests {
         let mut config = config_for(&server, None);
         tweak(&mut config);
         let paths = Paths::at(dir.path().join("home"));
+        plain_core_pack(&paths.packs_dir());
         packs(&paths.packs_dir());
         let rt = Runtime::start(config.clone(), paths).await.unwrap();
         Env { dir, server, rt, ws, config }
@@ -5939,13 +5964,18 @@ mod tests {
     async fn a_job_given_to_the_model_but_never_registered_is_settled_from_what_it_left_and_wakes_the_session() {
         let after = Arc::new(AtomicBool::new(false));
         let flag = after.clone();
+        let first = Arc::new(AtomicBool::new(true));
         let e = env(Script::new(move |_, _| {
             if flag.load(Ordering::SeqCst) {
                 finish("seen it")
-            } else {
+            } else if first.swap(false, Ordering::SeqCst) {
                 // The job and the wait in one reply: the turn ends before the job's registration is recorded.
                 let bash = json!({"command": "make all", "background": true}).to_string();
                 Action::Reply(Reply::tools([("bash", bash), ("wait", "{}".to_string())]))
+            } else {
+                // The job may end at once on a fast host and wake the session before the restart: the turn then
+                // yields, so that the session settles idle instead of starting the job again and again.
+                Action::Reply(Reply::text("waiting"))
             }
         }))
         .await;
