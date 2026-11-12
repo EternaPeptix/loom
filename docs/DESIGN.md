@@ -366,11 +366,12 @@ zeros before the first entry. Verification recomputes over the bytes on disk.
 - **Newer entries.** An entry with a valid seal whose op this build cannot parse is kept in the chain
   and skipped when folding; appends are refused (`NewerVersion`) and the model is told that loom must
   be upgraded before the mission can continue.
-- **Key.** `keys/journal.key`: 32 random bytes as hex, created 0600 (parent 0700) by publishing a
-  synced temporary file under the final name with a hard link and syncing the directory, so a crash
-  never leaves a partial key and two creators end with the same one. An existing file that does not
-  hold 64 hex characters is an error and is never replaced; an empty one tells the operator to delete it
-  only if no mission journals exist, otherwise to restore it from a backup.
+- **Key.** `keys/journal.key`: 32 random bytes as hex, created 0600 (inside the loom home, which a
+  daemon that creates it makes 0700; the runtime creates `keys/` itself with the process's umask) by
+  publishing a synced temporary file under the final name with a hard link and syncing the directory,
+  so a crash never leaves a partial key and two creators end with the same one. An existing file that
+  does not hold 64 hex characters is an error and is never replaced; an empty one tells the operator to
+  delete it only if no mission journals exist, otherwise to restore it from a backup.
 
 **Who writes it.** A mission keeps a journal when its lead's role ends explicitly (`termination =
 "explicit"`); the lead and every agent it starts write to the same journal, each entry naming its
@@ -525,9 +526,9 @@ debug level at the end of each turn.
   inbox item (with notification) and the turn ends `parked`; a child settles `failed`.
 
 Terminating tools: `finish {answer, quotes?, not_established?, evidence?}`, `ask_user {question,
-options?, blocking, meanwhile?}` (leads only), `report_blocker {class, what, tried, needs}` (class
-`needs_approval`, `needs_input`, `environment` or `impossible`; there is no class for context or
-elapsed time), `wait {reason?}` (refused when no job or agent is running), and for verifiers
+options?, blocking?, meanwhile?}` (leads only; `blocking` defaults to true, and `meanwhile` is required
+when it is false), `report_blocker {class, what, tried, needs}` (class `needs_approval`, `needs_input`,
+`environment` or `impossible`; there is no class for context or elapsed time), `wait {reason?}` (refused when no job or agent is running), and for verifiers
 `verdict {accepted, objections?, opened}`.
 
 **Finish gate** (`rtools::terminal`). It fails closed: a lead's result reaches the operator as finished
@@ -633,9 +634,11 @@ the precise specification.
   sessions (and their digests) above `Child` for agents and votes.
 - **Restart.** A child that a shutdown cut is resumed, not settled: at start every unsettled child of a
   mission that is not archived is activated; one that had a turn is held and gets exactly one resume
-  (at once when its mission is unattended, when it was told of a lost job, or when its lead carries on;
-  otherwise when the operator next acts on the lead); one that never had a turn starts by itself; one
-  whose log cannot be opened while its lead's can is settled `failed` on its behalf. A settlement whose
+  (at once when its mission is unattended, when it was told of a lost job, or when its lead is told to
+  carry on; otherwise as soon as its lead next carries on: an operator message, resume or answer to the
+  lead, or any turn the lead starts, such as one an agent's report starts); one that never had a turn
+  starts by itself; one whose log cannot be opened while its lead's can is settled `failed` on its
+  behalf. A settlement whose
   delivery a restart cut is delivered from `settlement.json` (or from the child's log), unless the
   lead's waiting call has a recorded result for an agent that had ended. A finish verifier is never
   delivered as a report.
@@ -723,7 +726,9 @@ evidence kind and staleness. Each module's documentation is the precise specific
 - `write` and `edit` are atomic (temporary file, sync, rename; permissions kept) and refuse when the
   file exists and this session has not read it, or when it changed on disk since (the refusal says
   what changed). `edit` replaces one unique occurrence, or all with `all`, and explains a miss without
-  guessing. Both return the unified diff. Files above 64 MiB are not edited.
+  guessing. `edit`, and a `write` that replaces a file, return the unified diff; a `write` that creates
+  a file returns `(new file)`, and one that replaces a file above 64 MiB says that there is no diff and
+  why. Files above 64 MiB are not edited.
 - `out_read` / `out_grep` page and search a stored output by handle and record what they showed.
 - `bash` runs the command with `/bin/bash -c` under the sandbox, in its own process group, stdin
   `/dev/null`, stdout and stderr interleaved into one output file. It is over only when its whole
@@ -734,9 +739,10 @@ evidence kind and staleness. Each module's documentation is the precise specific
   - When the shell exits while other processes of its group are still alive 200 ms later, the result
     carries the shell's status and the output so far, and the rest continues as a job whose end is
     reported like any other.
-  - The status the wrapper writes is always reported as an exit code (`exit N`); for N above 128 a fact
-    says that 128+N conventionally means death by signal N, naming the signal, or saying N is not a
-    signal number. `killed by signal` appears only when the shell itself died of a signal.
+  - The status the wrapper writes is always reported as an exit code (`exit <code>`); for a code above
+    128 a fact says that 128+N conventionally means death by signal N, then names signal `code − 128`
+    (with its name when known), or says that `code − 128` is not a signal number and so the code is the
+    command's own. `killed by signal` appears only when the shell itself died of a signal.
   - Output past `tools.max_output_bytes` (64 MiB) kills the group at once (SIGKILL, and any grace
     period in progress ends); only the first `max_output_bytes` are kept, and the result gives the true
     size.
@@ -798,9 +804,11 @@ Paths are made canonical when the sandbox is built. On macOS the rules that refu
 regard to case (volumes are case-insensitive by default); the rules that allow are compared exactly. The
 file tools apply the same policy in-process (`check_read`, `check_write`) to the path resolved through
 links, so a link inside the workspace grants nothing; in mode `none` they still apply the never-writable
-and not-readable rules. A role with `read_only` gets no `extra_writable` and its workspace becomes
-protected: it can write only in its temp dir. Commands get the daemon's environment without any
-variable whose name (case-insensitive) contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
+and not-readable rules. A role with `read_only` gets no `extra_writable` and its workspace is added to
+the never-writable paths, so it can still write in its session temp dir, in the system temp locations
+(`/private/tmp`, `/private/var/folders`, which other sessions use too) and to the device files, and
+nowhere else. Commands get the daemon's environment without any variable whose name (case-insensitive)
+contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
 `CREDENTIAL`, `AUTH_TOKEN`, `COOKIE` or `SESSION_KEY`, ends in `_PAT`, `_DSN` or `_PWD`, is
 `DATABASE_URL` or `SSH_AUTH_SOCK`, or starts with `LOOM_` (unless listed in `sandbox.env_pass`), plus
 `TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR` = the temp
@@ -857,8 +865,8 @@ head within 10 s gets `400`.
   allowed that then fails gets a second decision with the rule suffixed `(failed after the allow:
   …)`; a check is recorded with method `LOOM-CHECK` and the rule suffixed `(check only)`. Answers that
   name no granted session go to `logs/net-unattributed.jsonl`, at most 10 a minute, the next one saying
-  how many were left out; the API has no reader for that file. Each decision is also published as a
-  `net` event.
+  how many were left out; the API has no reader for that file, and these decisions are not published.
+  Each decision attributed to a session is also published as a `net` event once its record is written.
 - **The audit file is a chain** (`loom-net::netlog`). Each line's `prev` is the SHA-256 of the previous
   line's bytes (64 zeros for the first); appends are serialised and each is synced. Lines written
   before the chain existed (no `prev`) still load, and the chain starts at the first line that has it.
@@ -901,7 +909,9 @@ up`). The global flag `--unverified-daemon` sends the token anyway with a warnin
 daemon` do not take an unproven listener for the running daemon. loom-desk proves the daemon the same
 way (gui/DESIGN.md).
 
-**Routes.** JSON unless noted; request bodies reject unknown fields.
+**Routes.** JSON unless noted. The bodies of `crate::wire` and `NewSession` (at its top level) reject
+unknown fields; the `{code}` body of `POST /api/web-sessions` and the `budget` object inside
+`NewSession` ignore them.
 
 ```
 Open (no bearer):
@@ -957,12 +967,12 @@ up to 5 candidate ids), an unreadable blob; `500`: a read that could not be fini
 carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`; the page and assets also carry
 the content security policy (`ui::CSP`) and `Referrer-Policy: no-referrer`.
 
-**Event streams.** Server-sent events whose frames carry only `data:` lines: one JSON `BusEvent` with a
-`type` — `session` {info}, `record` {session, record}, `delta` {session, req_id, delta}, `status`
-{session, status}, `net` {session, entry}, `settled` {session, settlement}, `error` {session?,
-message}, `lagged` {missed}. There are no `event:` names; record frames carry `id: <seq>`. A comment is
-sent every 15 s. A `delta` is `attempt_start`, `text`, `reasoning`, `tool_call_start`, `tool_call_args`
-or `retrying`. `/api/events` sends every event of the daemon, deltas only with `deltas=true`.
+**Event streams.** Server-sent events. No frame has an `event:` field; each has one `data:` line with
+a JSON `BusEvent` whose `type` is the kind — `session` {info}, `record` {session, record}, `delta`
+{session, req_id, delta}, `status` {session, status}, `net` {session, entry}, `settled` {session,
+settlement}, `error` {session?, message}, `lagged` {missed}. A record frame adds `id: <seq>`; the
+others carry `data:` only. A comment is sent every 15 s. A `delta` is `attempt_start`, `text`,
+`reasoning`, `tool_call_start`, `tool_call_args` or `retrying`. `/api/events` sends every event of the daemon, deltas only with `deltas=true`.
 `/api/sessions/{id}/stream` sends the session's status first, then its records after `after` from the
 log, then its live records, deltas and statuses, without duplicates. A subscriber that falls more than
 8 192 events behind gets `lagged` (a session stream then replays the records it missed from the log).
@@ -1083,7 +1093,8 @@ the researcher's finish is verified by `judge`). Domain discipline is a pack, no
   `cargo clippy --workspace --all-targets -- -D warnings`. The UI's pure module is tested with
   `node --test ui/core.test.js`. `./x` is an optional wrapper that copies the tree to another host
   named by `LOOM_BUILD_HOST` and runs cargo there (`LOOM_BUILD_HOST=local` runs it in place;
-  `LOOM_LANE` gives a run its own source copy and target directory on that host).
+  `LOOM_LANE` gives a run its own source copy and target directory on that host). Set
+  `LOOM_BUILD_HOST` before using it: unset, the script falls back to a host name of its author's.
 
 ## Roadmap (not implemented)
 

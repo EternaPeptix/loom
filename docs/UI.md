@@ -22,7 +22,8 @@ to make the record, the context and the things waiting for the operator *visible
   Markdown-to-HTML conversion, no linkifying into `<a href>` except for links the UI itself builds
   to its own routes. Images are never rendered from record content.
 - **Authentication** is a bearer secret; there is no cookie. The page and its three assets need no
-  authentication; every `/api` request does. `loom open` (or loom-desk) opens the page as
+  authentication; every `/api` request does, except the code exchange `POST /api/web-sessions`, where
+  the login code is the credential. `loom open` (or loom-desk) opens the page as
   `/#code=<login code>`: at load the page takes the single-use code from the fragment, removes the
   fragment with `history.replaceState`, and trades the code for a web-session secret
   (`POST /api/web-sessions {code}` → `{secret}`). The secret is kept in `sessionStorage` (in memory
@@ -51,10 +52,11 @@ kind is `item_kind` on the wire (in an `inbox_opened` record and in `InboxEntry.
 - At load: `GET /api/sessions?archived=true`, `GET /api/inbox`, `GET /api/status`; then one stream
   on `/api/events?deltas=true` for everything live. `EventSource` cannot send an `Authorization`
   header, so the stream is read with `fetch` and a streaming reader, and `core.js` parses the
-  server-sent events. Every frame carries only `data:` lines with one JSON object that has a `type`:
-  `session`, `record`, `delta`, `status`, `net`, `settled`, `error`, `lagged`. The daemon sends a
-  comment every 15 s; a stream silent for 45 s is dropped. A dropped stream is opened again after
-  1 s, doubling up to 15 s; the header's dot is red meanwhile.
+  server-sent events. No frame has an `event:` field: each has a `data:` line with one JSON object
+  whose `type` is the kind (`session`, `record`, `delta`, `status`, `net`, `settled`, `error`,
+  `lagged`), and a `record` frame also has `id: <seq>`. The daemon sends a comment every 15 s; a
+  stream silent for 45 s is dropped. A dropped stream is opened again after 1 s, doubling up to 15 s;
+  the header's dot is red meanwhile.
 - Opening a session: `GET /api/sessions/{id}/records` page by page (`after`, `next_after`) until
   the end, then keep it current from the event stream (records carry `seq`: apply one only if it
   is the next one; a gap means fetch the missing page). Sessions not open are not fetched.

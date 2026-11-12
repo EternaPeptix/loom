@@ -24,8 +24,9 @@ This document is normative. Where it and the code disagree, one is a bug.
 - Swift 6, SwiftUI + AppKit + WebKit + UserNotifications, **system frameworks only — no SPM
   dependencies**, so it builds with `swiftc` against the system SDK with nothing to fetch.
 - Deployment target `MACOSX_DEPLOYMENT_TARGET=14.0`.
-- Built on the build host (`swiftc`), assembled into `loom-desk.app` by `gui/build.sh` (no Xcode
-  project), ad-hoc codesigned, and copied to the operator's Mac. Never built on the operator's Mac.
+- Normally built on the build host (`swiftc`), assembled into `loom-desk.app` by `gui/build.sh` (no
+  Xcode project), ad-hoc codesigned, and copied to the operator's Mac. `LOOM_BUILD_HOST=local` builds
+  in place wherever the script runs and `swiftc` is available.
 
 ## Shape
 
