@@ -907,6 +907,13 @@ impl Tool for AskUser {
         let Some(question) = str_arg(args, "question").filter(|q| !q.trim().is_empty()) else {
             return ToolOutput::error("ask_user needs a `question`, with everything needed to answer it.");
         };
+        // The finish gate recognises an answered escalation by the words of its ledger question, so a
+        // question in those words would restart the count of rejections.
+        if escalated_finish(question.trim_start()).is_some() {
+            return ToolOutput::error(
+                "That question is worded like a finish escalation, which the harness writes itself. Nothing was asked. Word your question differently: say what you need to know, without starting it with `Finish` and a finish id.",
+            );
+        }
         let blocking = args.get("blocking").and_then(Value::as_bool).unwrap_or(true);
         let meanwhile = str_arg(args, "meanwhile").map(str::trim).filter(|m| !m.is_empty());
         if !blocking && meanwhile.is_none() {
@@ -1371,11 +1378,10 @@ mod tests {
         // finish about to be made, one a finish the verifier judged. The operator answers all three.
         for (i, named) in ["f99", "f3", "f1"].iter().enumerate() {
             let question = escalation_question(named, "NOT VERIFIED - REJECTED 2 TIMES");
-            let res = r.call("ask_user", json!({"question": question})).await;
-            assert_eq!(res.status, Status::Ok, "{}", res.text);
+            // `ask_user` refuses such a question; one that got into the ledger by another way is still no escalation.
+            r.model_op(LedgerOp::QuestionAsk { text: question, blocking: true });
             r.user_op(LedgerOp::QuestionAnswer { id: format!("q{}", i + 1), answer: "go on".into() });
         }
-        assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Asked)));
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert_eq!(spawn_count(&r), 2);
@@ -1387,6 +1393,23 @@ mod tests {
         assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Blocked)));
         let items = inbox_items(&r);
         assert!(items[0].text.starts_with("NOT VERIFIED - REJECTED 2 TIMES"), "{}", items[0].text);
+    }
+
+    #[tokio::test]
+    async fn ask_user_refuses_a_question_worded_like_an_escalation() {
+        let r = lead();
+        let question = escalation_question("f1", "NOT VERIFIED - REJECTED 2 TIMES");
+        for q in [question.clone(), format!("  \n{question}")] {
+            let res = r.call("ask_user", json!({"question": q})).await;
+            assert_eq!(res.status, Status::Error, "{}", res.text);
+            assert!(res.text.contains("Word your question differently"), "{}", res.text);
+        }
+        assert!(r.shared.ledger().unwrap().questions.is_empty());
+        assert!(inbox_items(&r).is_empty());
+        assert!(effect(&r).is_none());
+        // An ordinary question that mentions a finish is fine.
+        let res = r.call("ask_user", json!({"question": "Should Finish f1 be redone?"})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
     }
 
     #[tokio::test]

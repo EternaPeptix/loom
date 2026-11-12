@@ -278,7 +278,9 @@ pub struct LedgerState {
 // omitting empty sections: `Goal:` (full text), `Constraints:` (active only, verbatim), `Plan:` (one
 // line per non-dropped step: `[x] p1 text — note` / `[>] doing` / `[ ] todo`), `Open obligations:`,
 // `Claims:` (id, status, text, evidence ids), `Decisions:` (last `opts.max_decisions`),
-// `Dead ends:` (last `opts.max_dead_ends`), `Approvals:` (unused ones, verbatim, with scope),
+// `Dead ends:` (last `opts.max_dead_ends`) — each of these two starts, right under its heading, with the
+// line `(N older not shown: {first id}–{last id}, or the one id when N is 1; call `ledger` to read them)` when older items were left out —,
+// `Approvals:` (unused ones, verbatim, with scope),
 // `Unanswered questions:`. Evidence quotes are not included. Each line is cut at `opts.max_line`
 // characters with `…`. The output is deterministic.
 //
