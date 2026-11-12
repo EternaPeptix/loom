@@ -895,6 +895,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_events_come_once_per_attempt_and_never_for_the_last_call() {
+        let calls = || Reply::tools([("read", r#"{"path": "a"}"#), ("glob", r#"{"pattern": "*"}"#), ("bash", "{}")]);
+        // The first attempt breaks right after the second call has begun.
+        let s = server(vec![Action::DropAfter { reply: calls(), chunks: 4 }, calls().into()]).await;
+        let (tx, mut rx) = unbounded_channel();
+        let c = client(&s.base_url()).complete(&req("x"), Some(&tx), &CancellationToken::new()).await.unwrap();
+        assert_eq!(c.attempts, 2);
+        let evs = drain(&mut rx);
+        let second = evs.iter().position(|e| matches!(e, StreamEvent::AttemptStart { attempt: 2 })).unwrap();
+        let ready = |evs: &[StreamEvent]| -> Vec<(u32, String, String)> {
+            evs.iter()
+                .filter_map(|e| match e {
+                    StreamEvent::ToolCallReady { index, name, arguments } => Some((*index, name.clone(), arguments.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let read = (0, "read".to_string(), r#"{"path": "a"}"#.to_string());
+        assert_eq!(ready(&evs[..second]), std::slice::from_ref(&read));
+        assert_eq!(ready(&evs[second..]), [read, (1, "glob".to_string(), r#"{"pattern": "*"}"#.to_string())]);
+        assert_eq!(c.tool_calls.len(), 3);
+    }
+
+    #[tokio::test]
     async fn stream_ending_without_finish_reason_is_retried() {
         // The connection ends after the text chunks, before any finish_reason.
         let s = server(vec![

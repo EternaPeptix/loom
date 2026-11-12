@@ -120,6 +120,9 @@ pub struct ToolsCfg {
     pub max_output_bytes: u64,
     /// How long `job_wait` waits when the call gives no time.
     pub job_wait_s: u64,
+    /// Start a reply's leading read-only calls (`read`, `glob`, `grep`, `out_read`, `out_grep`) while
+    /// the rest of the reply is still streaming. What is recorded and shown is the same either way.
+    pub speculate: bool,
 }
 
 impl Default for ToolsCfg {
@@ -133,6 +136,7 @@ impl Default for ToolsCfg {
             web_fetch_max_bytes: 20 * 1024 * 1024,
             max_output_bytes: 64 * 1024 * 1024,
             job_wait_s: 120,
+            speculate: true,
         }
     }
 }
@@ -425,6 +429,12 @@ allow = ["*.example.test"]
         assert_eq!(p.reasoning_replay, ReasoningReplay::All);
         assert_eq!(c.context.keep_recent_steps, 60);
         assert_eq!(c.network.mode, NetworkMode::Allowlist);
+    }
+
+    #[test]
+    fn speculation_is_on_unless_switched_off() {
+        assert!(Config::parse("").unwrap().tools.speculate);
+        assert!(!Config::parse("[tools]\nspeculate = false").unwrap().tools.speculate);
     }
 
     #[test]

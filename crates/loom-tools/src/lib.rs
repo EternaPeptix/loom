@@ -9,6 +9,10 @@
 //! 3. raw output is normalised without changing its line count, stored whole, and admitted — the
 //!    result records which stored lines its text shows.
 //!
+//! The three steps are also public on their own ([`prepare`], [`Prepared::run`], [`Ran::finish`]), so
+//! that a call of a [`Tool::speculative`] tool can run before its turn and be finished — stored and
+//! admitted with the admission of that moment — only when the session claims it.
+//!
 //! Modules:
 //! - [`schema`]  argument checking with unambiguous coercions
 //! - [`sandbox`] the OS sandbox profile and the same policy for in-process file access
@@ -43,7 +47,7 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Everything a tool may use while it runs one call.
@@ -131,6 +135,14 @@ pub trait Tool: Send + Sync {
     /// Name, description, argument schema and class. Must return the same value every time.
     fn spec(&self) -> ToolSpec;
 
+    /// True when a call may be started while the reply that holds it is still streaming, before it
+    /// is certain the finished reply holds it: the tool only reads local state, has no effect outside
+    /// the harness, and records what it saw only through `ctx.files` (which the caller may stage).
+    /// Nothing that runs commands, writes, reaches the network or belongs to the runtime says yes.
+    fn speculative(&self) -> bool {
+        false
+    }
+
     /// Run one call. `args` has passed [`schema::check`] against `spec().parameters`.
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput;
 }
@@ -212,27 +224,73 @@ pub async fn execute(
     arguments: &str,
     admission: &Admission<'_>,
 ) -> ToolResult {
+    match prepare(registry, ctx, name, arguments) {
+        Ok(call) => call.run(ctx).await.finish(ctx, admission),
+        Err(refusal) => *refusal,
+    }
+}
+
+/// A call whose tool was found and whose arguments passed checking: [`execute`] up to running it.
+pub struct Prepared {
+    tool: Arc<dyn Tool>,
+    spec: ToolSpec,
+    checked: schema::Checked,
+    started: Instant,
+}
+
+/// What a prepared call produced, before it is stored and admitted ([`Ran::finish`]).
+pub struct Ran {
+    spec: ToolSpec,
+    output: ToolOutput,
+    /// From the call's preparation to the end of its run.
+    pub took: Duration,
+}
+
+/// Look the tool up and check the arguments: the first part of [`execute`]. `Err` is the record of
+/// the refused call, exactly as `execute` returns it.
+pub fn prepare(registry: &Registry, ctx: &ToolCtx, name: &str, arguments: &str) -> Result<Prepared, Box<ToolResult>> {
     let started = Instant::now();
     let Some(tool) = registry.get(name) else {
-        return refused(ctx, name, ToolClass::State, unknown_tool_message(name, &registry.names()), started);
+        let message = unknown_tool_message(name, &registry.names());
+        return Err(Box::new(refused(ctx, name, ToolClass::State, message, started)));
     };
     let spec = tool.spec();
-    let checked = match check_arguments(&spec, arguments) {
-        Ok(c) => c,
-        Err(msg) => return refused(ctx, name, spec.class, msg, started),
-    };
-
-    let ran = std::panic::AssertUnwindSafe(tool.run(ctx, &checked.args)).catch_unwind().await;
-    let mut output = match ran {
-        Ok(o) => o,
-        Err(_) => ToolOutput::error(format!(
-            "The `{name}` tool failed internally while handling this call (a harness fault, not a problem with the arguments). Its effects, if any, are unknown — check the state it would have changed before repeating the call."
-        )),
-    };
-    for note in checked.notes {
-        output.more.push(note);
+    match check_arguments(&spec, arguments) {
+        Ok(checked) => Ok(Prepared { tool, spec, checked, started }),
+        Err(msg) => Err(Box::new(refused(ctx, name, spec.class, msg, started))),
     }
-    finalize(ctx, &spec, output, admission, started)
+}
+
+impl Prepared {
+    /// See [`Tool::speculative`].
+    pub fn speculative(&self) -> bool {
+        self.tool.speculative()
+    }
+
+    /// Run the tool. A panic inside it becomes an error output.
+    pub async fn run(self, ctx: &ToolCtx) -> Ran {
+        let Prepared { tool, spec, checked, started } = self;
+        let ran = std::panic::AssertUnwindSafe(tool.run(ctx, &checked.args)).catch_unwind().await;
+        let mut output = match ran {
+            Ok(o) => o,
+            Err(_) => ToolOutput::error(format!(
+                "The `{}` tool failed internally while handling this call (a harness fault, not a problem with the arguments). Its effects, if any, are unknown — check the state it would have changed before repeating the call.",
+                spec.name
+            )),
+        };
+        for note in checked.notes {
+            output.more.push(note);
+        }
+        Ran { spec, output, took: started.elapsed() }
+    }
+}
+
+impl Ran {
+    /// Store and admit the output: the last part of [`execute`]. The record's duration is the run's.
+    pub fn finish(self, ctx: &ToolCtx, admission: &Admission<'_>) -> ToolResult {
+        let started = Instant::now().checked_sub(self.took).unwrap_or_else(Instant::now);
+        finalize(ctx, &self.spec, self.output, admission, started)
+    }
 }
 
 /// Parse a call's raw arguments text and check it against the tool's parameters. The error is the
@@ -461,5 +519,31 @@ mod tests {
     #[test]
     fn ranges_serialise_as_pairs() {
         assert_eq!(ranges_json(&[(1, 3), (9, 9)]).to_string(), "[[1,3],[9,9]]");
+    }
+
+    #[test]
+    fn exactly_the_local_read_only_tools_may_start_early() {
+        let r = Registry::builtin();
+        let early: Vec<String> = r.names().into_iter().filter(|n| r.get(n).is_some_and(|t| t.speculative())).collect();
+        assert_eq!(early, ["read", "glob", "grep", "out_read", "out_grep"]);
+    }
+
+    #[tokio::test]
+    async fn the_parts_of_execute_make_the_same_record() {
+        let e = testutil::env();
+        std::fs::write(e.ctx.workspace.join("a.txt"), "one\ntwo\n").unwrap();
+        let admission = Admission { policy: &e.policy, estimator: &e.estimator };
+        let whole = execute(&e.registry, &e.ctx, "read", r#"{"path": "a.txt"}"#, &admission).await;
+        let parts = match prepare(&e.registry, &e.ctx, "read", r#"{"path": "a.txt"}"#) {
+            Ok(p) => p.run(&e.ctx).await.finish(&e.ctx, &admission),
+            Err(r) => *r,
+        };
+        assert_eq!(ToolResult { duration_ms: 0, ..parts }, ToolResult { duration_ms: 0, ..whole });
+        for (name, args) in [("reed", "{}"), ("read", "{}"), ("read", "{nope")] {
+            let refused = prepare(&e.registry, &e.ctx, name, args).err().unwrap();
+            let direct = execute(&e.registry, &e.ctx, name, args, &admission).await;
+            assert_eq!(refused.text, direct.text);
+            assert_eq!(refused.status, ToolStatus::Invalid);
+        }
     }
 }

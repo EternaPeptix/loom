@@ -384,6 +384,10 @@ impl Tool for Glob {
         )
     }
 
+    fn speculative(&self) -> bool {
+        true
+    }
+
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let pattern = text(args, "pattern").unwrap_or_default().to_string();
         let glob = match PathGlob::new(&pattern) {
@@ -472,6 +476,10 @@ impl Tool for Grep {
                 params::opt("no_ignore", "boolean", "Include files that .gitignore excludes (default false)."),
             ],
         )
+    }
+
+    fn speculative(&self) -> bool {
+        true
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
