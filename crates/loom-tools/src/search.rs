@@ -21,14 +21,20 @@
 //!
 //! ## `grep`
 //! `pattern` is a regex (`regex` crate; `ignore_case` → case-insensitive) matched per line. `glob`
-//! filters files as above. Files that are binary (a NUL in the first 8 KiB) or not valid UTF-8 are
-//! skipped and counted. Files are visited in path order. Output as `Body::Raw`:
+//! filters files as above. Only regular files are opened. The first 8 KiB of a file are read and
+//! checked for a NUL before the rest is read; files that are binary or not valid UTF-8 are skipped and
+//! counted. A file above `MAX_GREP_FILE_BYTES` (16 MiB) is not read: it is counted, named (the first
+//! few), and the result says the search is not complete and to search it with `bash`. Cancellation is
+//! checked between files. Files are visited in path order. Output as `Body::Raw`:
 //! - default: `path:line:text` per match; with `context` > 0 (at most 20), context lines are
 //!   `path-line-text` and groups are separated by `--`;
 //! - `files_only`: one path per line with its match count, `path (n)`.
 //!   Lines longer than 2000 characters are shown as the 2000 characters around the first match with
 //!   `…` at the cut ends. Outcome `{m} matches in {f} files`; facts: `{k} binary files skipped` when
-//!   any; `no match` handled as for `glob`. An invalid regex or glob is an error sentence carrying the
+//!   any; `no match` handled as for `glob`. The "what would hidden/ignored files add" pass of a no-match
+//!   result visits each wider combination of the two flags once, reads at most `HINT_MAX_FILES` files
+//!   and runs for at most `HINT_MAX_TIME` (the walks included); when it is cut short, or by
+//!   cancellation, the hint says so. An invalid regex or glob is an error sentence carrying the
 //!   library's message.
 //!
 //! Tests required: the same tree searched by both tools yields the same file set under each
@@ -38,7 +44,7 @@
 //! with the "would match with hidden/no_ignore" count; invalid patterns; a single file as `path`;
 //! sandbox-unreadable entries skipped; cancellation.
 
-use crate::files::open_probe;
+use crate::files::open_regular;
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
 use globset::{GlobBuilder, GlobMatcher};
@@ -115,6 +121,11 @@ impl Scan {
 
     /// Every regular file under the root for the given options, sorted by relative path.
     fn collect(&self, hidden: bool, no_ignore: bool) -> Found {
+        self.collect_until(hidden, no_ignore, None)
+    }
+
+    /// [`Scan::collect`] that also stops (as `interrupted`) once `deadline` has passed.
+    fn collect_until(&self, hidden: bool, no_ignore: bool, deadline: Option<Instant>) -> Found {
         if self.is_file {
             let rel = self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             return Found {
@@ -154,7 +165,7 @@ impl Scan {
         }
         let mut found = Found { files: Vec::new(), interrupted: false, unreadable: 0, errors: 0 };
         for item in builder.build() {
-            if self.cancel.is_cancelled() {
+            if self.cancel.is_cancelled() || deadline.is_some_and(|d| Instant::now() >= d) {
                 found.interrupted = true;
                 break;
             }
@@ -250,8 +261,8 @@ struct Budget {
     max_files: usize,
     /// Why the pass was cut short, once it was.
     cut: Option<String>,
-    /// Files the pass did not read because they are over the size limit.
-    too_large: usize,
+    /// Files the pass did not read because they are over the size limit (each counted once).
+    too_large: HashSet<PathBuf>,
 }
 
 impl Budget {
@@ -262,7 +273,7 @@ impl Budget {
             files_left: limits.max_files,
             max_files: limits.max_files,
             cut: None,
-            too_large: 0,
+            too_large: HashSet::new(),
         }
     }
 
@@ -314,9 +325,13 @@ fn widened_hint(
         if budget.cut.is_some() {
             break;
         }
-        let wider = scan.collect(h, n);
+        if Instant::now() >= budget.deadline {
+            budget.cut = Some("the time limit was reached".to_string());
+            break;
+        }
+        let wider = scan.collect_until(h, n, Some(budget.deadline));
         if wider.interrupted && budget.cut.is_none() {
-            budget.cut = Some("interrupted".to_string());
+            budget.cut = Some(if scan.cancel.is_cancelled() { "interrupted" } else { "the time limit was reached" }.to_string());
         }
         let extra: Vec<&Entry> = wider.files.iter().filter(|e| !have.contains(e.abs.as_path())).collect();
         let k = count_new(&extra, &mut budget);
@@ -335,8 +350,11 @@ fn widened_hint(
         (false, None) => format!(" {}.", gains.join("; ")),
         (false, Some(why)) => format!(" {}. (That check was cut short — {why} — so the counts may be low.)", gains.join("; ")),
     };
-    if budget.too_large > 0 {
-        hint.push_str(&format!(" {} of those files are over the {MAX_GREP_FILE_BYTES} byte size limit and were not read.", budget.too_large));
+    if !budget.too_large.is_empty() {
+        hint.push_str(&format!(
+            " {} of those files are over the {MAX_GREP_FILE_BYTES} byte size limit and were not read; search them with `bash` (`grep -n PATTERN FILE`).",
+            budget.too_large.len()
+        ));
     }
     hint
 }
@@ -488,7 +506,7 @@ impl Tool for Grep {
             hidden: flag(args, "hidden"),
             no_ignore: flag(args, "no_ignore"),
         };
-        match tokio::task::spawn_blocking(move || grep_job(&scan, &opts)).await {
+        match tokio::task::spawn_blocking(move || grep_job(&scan, &opts, HintLimits::STANDARD)).await {
             Ok(out) => out,
             Err(e) => ToolOutput::error(format!(
                 "The search failed internally ({e}). Call `grep` again; if it repeats, use `bash` with `rg` or `grep -rn`."
@@ -519,10 +537,8 @@ enum Read {
 /// The text of a regular file of at most `cap` bytes. The first `BINARY_PROBE` bytes are read and
 /// checked for a NUL before the rest is read, and a file over the cap is never read at all.
 fn read_text(path: &Path, cap: u64) -> Read {
-    let Ok((mut file, meta)) = open_probe(path) else { return Read::Unreadable };
-    if !meta.is_file() {
-        return Read::Unreadable;
-    }
+    // Only a regular file is opened (never a FIFO, device or socket), and the open does not block.
+    let Ok((mut file, meta)) = open_regular(path) else { return Read::Unreadable };
     if meta.len() > cap {
         return Read::TooLarge;
     }
@@ -566,7 +582,14 @@ fn windowed(line: &str, re: &Regex) -> String {
     out
 }
 
-fn grep_job(scan: &Scan, opts: &GrepOpts) -> ToolOutput {
+/// The skipped files for a sentence: the first few by name, then a count, and what to do instead.
+fn too_large_names(names: &[&str]) -> String {
+    let shown = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
+    let more = if names.len() > 5 { format!(" and {} more", names.len() - 5) } else { String::new() };
+    format!("{shown}{more}; search them with `bash` (`grep -n PATTERN FILE`) or read them by line range with `read`")
+}
+
+fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput {
     let found = scan.collect(opts.hidden, opts.no_ignore);
     let candidates: Vec<&Entry> =
         found.files.iter().filter(|e| opts.filter.as_ref().is_none_or(|g| g.matches(&e.rel))).collect();
@@ -574,7 +597,7 @@ fn grep_job(scan: &Scan, opts: &GrepOpts) -> ToolOutput {
     let mut body = String::new();
     let mut groups_written = false;
     let (mut matches, mut files_with, mut scanned, mut binary, mut unreadable) = (0usize, 0usize, 0usize, 0usize, 0usize);
-    let mut too_large = 0usize;
+    let mut too_large: Vec<&str> = Vec::new();
     let mut interrupted = found.interrupted;
     for entry in &candidates {
         if scan.cancel.is_cancelled() {
@@ -588,7 +611,7 @@ fn grep_job(scan: &Scan, opts: &GrepOpts) -> ToolOutput {
                 continue;
             }
             Read::TooLarge => {
-                too_large += 1;
+                too_large.push(&entry.rel);
                 continue;
             }
             Read::Unreadable => {
@@ -639,8 +662,12 @@ fn grep_job(scan: &Scan, opts: &GrepOpts) -> ToolOutput {
     if binary > 0 {
         more.push(format!("{binary} binary files skipped"));
     }
-    if too_large > 0 {
-        more.push(format!("{too_large} files skipped as too large (over {MAX_GREP_FILE_BYTES} bytes); they were not searched, so the search is not complete"));
+    if !too_large.is_empty() {
+        more.push(format!(
+            "{} files skipped as too large (over {MAX_GREP_FILE_BYTES} bytes); they were not searched, so the search is not complete: {}",
+            too_large.len(),
+            too_large_names(&too_large)
+        ));
     }
     if unreadable > 0 {
         more.push(format!("{unreadable} files could not be read"));
@@ -653,7 +680,7 @@ fn grep_job(scan: &Scan, opts: &GrepOpts) -> ToolOutput {
     if interrupted {
         more.push(format!(
             "interrupted: {} of the {} files found were searched; results are partial",
-            scanned + binary + unreadable + too_large,
+            scanned + binary + unreadable + too_large.len(),
             candidates.len()
         ));
     }
@@ -663,7 +690,7 @@ fn grep_job(scan: &Scan, opts: &GrepOpts) -> ToolOutput {
         let hint = if interrupted {
             String::new()
         } else {
-            widened_hint(scan, opts.hidden, opts.no_ignore, &found, HintLimits::STANDARD, &|extra, budget| {
+            widened_hint(scan, opts.hidden, opts.no_ignore, &found, hint_limits, &|extra, budget| {
                 extra
                     .iter()
                     .filter(|e| opts.filter.as_ref().is_none_or(|g| g.matches(&e.rel)))
@@ -674,7 +701,7 @@ fn grep_job(scan: &Scan, opts: &GrepOpts) -> ToolOutput {
                         match read_text(&e.abs, MAX_GREP_FILE_BYTES) {
                             Read::Text(t) => t.lines().any(|l| opts.re.is_match(l)),
                             Read::TooLarge => {
-                                budget.too_large += 1;
+                                budget.too_large.insert(e.abs.clone());
                                 false
                             }
                             _ => false,
@@ -684,8 +711,12 @@ fn grep_job(scan: &Scan, opts: &GrepOpts) -> ToolOutput {
             })
         };
         let mut skipped = if binary > 0 { format!(", {binary} binary files skipped and not searched") } else { String::new() };
-        if too_large > 0 {
-            skipped.push_str(&format!(", {too_large} files over {MAX_GREP_FILE_BYTES} bytes skipped as too large and not searched"));
+        if !too_large.is_empty() {
+            skipped.push_str(&format!(
+                ", {} files over {MAX_GREP_FILE_BYTES} bytes skipped as too large and not searched ({})",
+                too_large.len(),
+                too_large_names(&too_large)
+            ));
         }
         let filtered = if opts.filter.is_some() { " matching the glob" } else { "" };
         let msg = format!(
@@ -889,6 +920,7 @@ mod tests {
         let r = e.call("grep", json!({"pattern": "needle"})).await;
         assert!(r.text.contains("1 matches in 1 files"), "{}", r.text);
         assert!(r.text.contains("1 files skipped as too large") && r.text.contains("search is not complete"), "{}", r.text);
+        assert!(r.text.contains("model.bin") && r.text.contains("`bash`"), "{}", r.text);
         assert!(r.text.contains("1 binary files skipped"), "{}", r.text);
         let r = e.call("grep", json!({"pattern": "absent"})).await;
         assert!(r.text.contains("1 files over") && r.text.contains("skipped as too large and not searched"), "{}", r.text);
@@ -914,8 +946,8 @@ mod tests {
             assert_eq!(r.text.matches("more would match").count(), 1, "{}", r.text);
             assert!(r.text.contains("1 more would match with `no_ignore: true`"), "{}", r.text);
         }
-        let r = e.call("grep", json!({"pattern": "zzz", "no_ignore": true})).await;
-        assert!(r.text.contains("would not change this"), "{}", r.text);
+        let r = e.call("grep", json!({"pattern": "qqq", "no_ignore": true})).await;
+        assert_eq!(r.text.matches("would not change this").count(), 1, "{}", r.text);
         let r = e.call("glob", json!({"pattern": "only.txt", "hidden": true})).await;
         assert_eq!(r.text.matches("more would match").count(), 1, "{}", r.text);
     }
@@ -946,6 +978,41 @@ mod tests {
         });
         assert_eq!(spent.get(), 0, "{hint}");
         assert!(hint.contains("interrupted"), "{hint}");
+    }
+
+    #[tokio::test]
+    async fn grep_hint_honours_its_file_budget_and_counts_a_large_file_once() {
+        let e = env();
+        put(&e, "plain.txt", "nothing\n");
+        for i in 0..4 {
+            put(&e, &format!(".hidden/h{i}.txt"), "x\n");
+        }
+        let big = std::fs::File::create(e.ctx.workspace.join("ignored_big.bin")).unwrap();
+        big.set_len(MAX_GREP_FILE_BYTES + 1).unwrap();
+        put(&e, ".gitignore", "ignored_big.bin\n");
+        let opts = GrepOpts {
+            re: Regex::new("zzz").unwrap(),
+            pattern: "zzz".into(),
+            filter: None,
+            context: 0,
+            context_clamped: false,
+            files_only: false,
+            hidden: false,
+            no_ignore: false,
+        };
+        let scan = Scan::new(&e.ctx, None).unwrap();
+        let hint_of = |limits| match grep_job(&scan, &opts, limits).body {
+            Body::Message(m) => m,
+            other => panic!("not a message: {other:?}"),
+        };
+        let m = hint_of(HintLimits { max_files: 2, max_time: Duration::from_secs(60) });
+        assert!(m.contains("limit of 2 files was reached"), "{m}");
+        // The large file is in two of the wider combinations, and is counted once.
+        let m = hint_of(HintLimits::STANDARD);
+        assert!(m.contains("1 of those files are over the"), "{m}");
+        // A deadline that has passed ends the pass before any wider walk.
+        let m = hint_of(HintLimits { max_files: 100, max_time: Duration::ZERO });
+        assert!(m.contains("the time limit was reached"), "{m}");
     }
 
     #[tokio::test]
