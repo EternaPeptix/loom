@@ -109,8 +109,12 @@ target_tokens = 400000
 floor_tokens = 180000
 
 [network]
-# open | allowlist | deny_all. Private and local addresses are refused unless listed.
-mode = "open"
+# deny_all (the default): tool commands reach no host at all.
+# To let them reach chosen hosts, use:  mode = "allowlist"  with  allow = ["*.example.com"]
+#   (allowlist: only hosts matching `allow` are reachable.)
+# To let them reach any public host, use:  mode = "open"   (open: every public destination is reachable.)
+# Private and local addresses are refused unless listed in allow_private.
+mode = "deny_all"
 allow_private = []
 
 [agents]
@@ -1535,6 +1539,7 @@ mod tests {
         let config = Config::parse(DEFAULT_CONFIG).unwrap();
         config.check().unwrap();
         assert_eq!(config.daemon.bind, "127.0.0.1:7878");
+        assert_eq!(config.network.mode, loom_core::config::NetworkMode::DenyAll);
     }
 
     #[test]

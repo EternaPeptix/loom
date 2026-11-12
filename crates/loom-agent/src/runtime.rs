@@ -90,8 +90,8 @@
 //! 1. `workspace` must be an existing directory (canonicalised). Role: `packs.role(pack, role)`.
 //!    Profile: `config.profile(model)`.
 //! 2. Model facts: `client.discover()` once per profile (the first success is remembered). On
-//!    `Unavailable`, carry on with the profile's `model` and `context_window` (unknown → `None`,
-//!    `0` in `ModelRef`). On `Rejected`/`Config`: return its message.
+//!    `Unavailable`, carry on with the profile's `model` and `context_window` (logged as coming from
+//!    the configuration); without a configured window the creation is refused. On `Rejected`/`Config`: return its message.
 //! 3. New `SessionId`, new `MissionId`. `title`: the given one, else the first line of `message` cut
 //!    to 80 characters, else `untitled`.
 //! 4. `SessionStart{session, mission, parent: None, workspace, pack, role, termination,
@@ -1697,8 +1697,10 @@ impl Inner {
 
     // ---- start ------------------------------------------------------------------------------
 
-    /// Model facts of a profile: discovery once, the first success remembered.
-    async fn facts(&self, profile_name: &str) -> Result<(String, Option<u64>), String> {
+    /// Model facts of a profile: discovery once, the first success remembered. The flag is true when
+    /// the server could not be asked and the numbers come from the profile alone. Without a configured
+    /// window that is refused: a session must not start with a window nobody knows.
+    async fn facts(&self, profile_name: &str) -> Result<(String, Option<u64>, bool), String> {
         let rt = self.profiles.get(profile_name).ok_or_else(|| format!("The model profile \"{profile_name}\" is not configured."))?;
         let remembered = lock(&rt.discovered).clone();
         let found = match remembered {
@@ -1713,10 +1715,14 @@ impl Inner {
             },
         };
         let profile = rt.client.profile();
-        Ok(match found {
-            Some(d) => (d.served_model, d.context_window),
-            None => (profile.model.clone(), profile.context_window),
-        })
+        match found {
+            Some(d) => Ok((d.served_model, d.context_window, false)),
+            None if profile.context_window.is_some() => Ok((profile.model.clone(), profile.context_window, true)),
+            None => Err(format!(
+                "The model server at {} did not answer, and the profile \"{profile_name}\" sets no context_window, so the session would start without knowing the model's window. Start the model server, or set context_window in [models.{profile_name}] of the config.",
+                profile.base_url
+            )),
+        }
     }
 
     /// A delivery lost to a restart: the child ended but its parent never recorded it.
@@ -2108,7 +2114,7 @@ impl Runtime {
         let role = inner.packs.role(new.pack.as_deref(), new.role.as_deref())?.clone();
         inner.check_network(&role.pack)?;
         let profile_name = inner.config.profile(new.model.as_deref()).map_err(|e| e.to_string())?.0.to_string();
-        let (model, window) = inner.facts(&profile_name).await?;
+        let (model, window, from_config) = inner.facts(&profile_name).await?;
         let title = match new.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
             Some(t) => t.to_string(),
             None => {
@@ -2120,6 +2126,12 @@ impl Runtime {
             }
         };
         let id = SessionId::generate();
+        if from_config {
+            tracing::info!(
+                session = %id.as_str(), profile = %profile_name, context_window = ?window,
+                "the model server did not answer; this session's context window comes from the configuration"
+            );
+        }
         let explicit = role.termination == Termination::Explicit;
         let meta = SessionMeta {
             id: id.clone(),
@@ -2953,6 +2965,29 @@ mod tests {
         assert_eq!(e.rt.missions().len(), 1);
         e.rt.shutdown().await;
         assert_eq!(e.rt.send_message(&id, "x").await.unwrap_err(), "The harness is shutting down.");
+    }
+
+    #[tokio::test]
+    async fn creation_with_the_model_server_down_needs_a_configured_window() {
+        // No configured window: refused, naming the base URL and both remedies.
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            if let Some(p) = c.models.get_mut("mock") {
+                p.context_window = None;
+            }
+        })
+        .await;
+        e.server.shutdown().await;
+        let err = e.rt.create_session(e.new_session(None)).await.unwrap_err();
+        assert!(err.contains(&e.server.base_url()), "{err}");
+        assert!(err.contains("Start the model server") && err.contains("context_window"), "{err}");
+        assert!(e.rt.sessions(true).is_empty());
+        e.rt.shutdown().await;
+        // A configured window: the session starts with it.
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        e.server.shutdown().await;
+        let info = e.rt.create_session(e.new_session(None)).await.unwrap();
+        assert_eq!(info.meta.context_window, Some(1_000_000));
+        e.rt.shutdown().await;
     }
 
     #[tokio::test]

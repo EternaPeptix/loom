@@ -35,9 +35,13 @@
 //!   has selected an id in this process before:
 //!   - it has not (a session restored after a daemon restart, or begun while the server was down):
 //!     the id is remembered and the request is sent again at once with it, once per call;
-//!   - it has, so the server was relaunched with another model: the 404 is **rejected** with a
-//!     sentence naming the id now served, and the remembered id stays. What a session recorded at its
-//!     start (model id, context window) describes the old model, so the move is the operator's.
+//!   - it has (a successful `discover`, or an id learned through this 404 path in the same process, since
+//!     the id is shared by all clones), so the server was relaunched with another model: the 404 is
+//!     **rejected** with a sentence naming the id now served, and the remembered id stays. What a
+//!     session recorded at its start (model id, context window) describes the old model, so the move
+//!     is the operator's: loom never follows the new id on its own once an id is remembered, and only a
+//!     daemon restart (or a new successful `discover`, which replaces the remembered id for every
+//!     clone of the client) moves on to it.
 //!
 //!   In every other case the 404 is **rejected** as below;
 //! - **context overflow** (no retry): HTTP 400 or 413 whose message matches the server's wording for
@@ -260,7 +264,8 @@ pub struct ModelClient {
     profile: ModelProfile,
     http: reqwest::Client,
     pacing: Pacing,
-    /// The model id `discover` last selected; shared by clones. Requests carry it in place of
+    /// The model id `discover` last selected (or a 404 lookup learned); shared by all clones, and replaced
+    /// by every successful `discover`. Requests carry it in place of
     /// `profile.model` once it is known. While it is not, a 404 has it looked up.
     served: Arc<Mutex<Option<String>>>,
 }
@@ -566,6 +571,9 @@ impl ModelClient {
         Ok(done)
     }
 
+    /// Asks the server what it serves (see *discover* above). A success replaces the remembered served
+    /// id for this client and every clone of it, whatever id was remembered before; a failure leaves
+    /// the remembered id as it was.
     pub async fn discover(&self) -> Result<Discovered, ModelError> {
         let found = self.lookup().await?;
         self.remember(&found.served_model);

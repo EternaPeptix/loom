@@ -30,7 +30,8 @@ general harness. Here is where each one lives in `vr`, and why the loom version 
   open* when the deny list was empty and could be slipped with a newline. In `vr` the boundary is not
   text-matched at all: outbound traffic goes through loom's egress proxy under an OS sandbox that
   permits no other route, the proxy resolves each name itself and refuses private/loopback/link-local
-  unless named, and the default policy (`deny_all`) reaches nothing. An unqualified engagement simply
+  unless named, and the default policy (`deny_all`, which loom uses unless the config says otherwise) reaches
+  nothing; a `vr` session is refused outright under `mode = "open"`. An unqualified engagement simply
   cannot touch a target. The researcher qualifies scope by having a **judge** read the programme and
   enumerate the authorized hosts; the operator sets the matching network policy and records it as a
   standing **constraint**. Widening scope is `ask_user` → operator → constraint, never the agent's call.

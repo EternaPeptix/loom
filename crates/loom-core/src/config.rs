@@ -190,10 +190,11 @@ impl Default for SandboxCfg {
 #[serde(rename_all = "snake_case")]
 pub enum NetworkMode {
     /// Any public destination.
-    #[default]
     Open,
     /// Only destinations matching `allow`.
     Allowlist,
+    /// Nothing leaves the machine; the default.
+    #[default]
     DenyAll,
 }
 
@@ -395,6 +396,13 @@ mod tests {
         c.check().unwrap();
         assert_eq!(c.daemon.bind, "127.0.0.1:7878");
         assert_eq!(c.admit.max_inline_tokens, 60_000);
+    }
+
+    #[test]
+    fn network_is_closed_by_default() {
+        assert_eq!(Config::default().network.mode, NetworkMode::DenyAll);
+        assert_eq!(Config::parse("[agents]\nmax_children = 2\n").unwrap().network.mode, NetworkMode::DenyAll);
+        assert_eq!(Config::parse("").unwrap().network.mode, NetworkMode::DenyAll);
     }
 
     #[test]
