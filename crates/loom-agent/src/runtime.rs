@@ -3299,6 +3299,7 @@ mod tests {
             call_id: CallId::from("c1"),
             title: role.into(),
             awaited: false,
+            harness: false,
         };
         let worker = e.rt.inner.orch.spawn(&id, req("worker")).await.unwrap();
         let verifier = e.rt.inner.orch.spawn(&id, req("verifier")).await.unwrap();
@@ -3610,6 +3611,7 @@ mod tests {
             call_id: CallId::from("c1"),
             title: "PANICTITLE".into(),
             awaited: true,
+            harness: false,
         };
         let child = orch.spawn(&id, req).await.unwrap();
         let settlement = tokio::time::timeout(WAIT, orch.join(&id, &child, &CancellationToken::new()))
@@ -4029,6 +4031,7 @@ mod tests {
             call_id: CallId::from("c1"),
             title: "a".into(),
             awaited: true,
+            harness: false,
         };
         let a = e.rt.inner.orch.spawn(&id, req).await.unwrap();
         let kept = e.rt.inner.paths.session_dir(&a).join("settlement.json");
@@ -4104,6 +4107,7 @@ mod tests {
             call_id: CallId::from("c1"),
             title: "t".into(),
             awaited: true,
+            harness: false,
         };
         let child = e.rt.inner.orch.spawn(&id, req).await.unwrap();
         let kept = e.rt.inner.paths.session_dir(&child).join("settlement.json");
@@ -4138,7 +4142,9 @@ mod tests {
         stall.store(false, Ordering::SeqCst);
         let (rt2, c) = recovered_settlement(&e, &id).await;
         assert_eq!((&c.child, c.outcome, c.inline), (&child, ChildOutcome::Returned, false));
-        assert!(c.report.starts_with("Outcome: returned\nAnswer:\nREPORTMARK"), "{}", c.report);
+        // The whole report, not its first line: the outcome and the child's own (quoted) words.
+        assert!(c.report.starts_with("Outcome: returned\n"), "{}", c.report);
+        assert!(c.report.contains("\n> REPORTMARK the answer on the second line"), "{}", c.report);
         assert!(c.steps > 0);
         rt2.shutdown().await;
     }
