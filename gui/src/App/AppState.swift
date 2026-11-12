@@ -205,13 +205,14 @@ final class AppState: ObservableObject {
                     throw ConnectError("no valid token stored for this connection — edit it and paste the 64-character token")
                 }
                 // The token goes to nothing that cannot prove it is this token's daemon.
-                if case .failed(let m) = await DaemonClient.verifyIdentity(baseURL: base, token: tok) { throw ConnectError(m) }
+                if case .failed(let m) = await DaemonClient.verifyIdentity(baseURL: base, token: tok) {
+                    // An ssh that died meanwhile is the real reason, with its own last error line.
+                    if gen == self.generation { try self.checkTunnelAlive() }
+                    throw ConnectError(m)
+                }
                 try Task.checkCancellation()
                 guard gen == self.generation else { return }
-                if connection.mode == .sshTunnel && !self.tunnel.isRunning {
-                    let why = self.tunnel.lastErrorLine
-                    throw ConnectError("the SSH tunnel closed: \(why.isEmpty ? "ssh is no longer running" : why). Reconnect to open it again.")
-                }
+                try self.checkTunnelAlive()
                 // No await from here on: an ssh exit is either seen by open() above or, once the link
                 // is .connected, by tunnelDied. The web pane mints its login code when it is built.
                 self.token = tok
@@ -277,6 +278,18 @@ final class AppState: ObservableObject {
             onMode: { [weak self] mode in
                 Task { @MainActor in
                     guard let self, self.generation == gen else { return }
+                    if mode.hasPrefix(DaemonClient.identityModePrefix) {
+                        // The daemon was replaced by something that cannot prove itself: stop using the token.
+                        self.generation += 1
+                        self.client.stop()
+                        self.token = nil
+                        self.baseURL = nil
+                        self.pendingEntry = nil
+                        self.counts = Counts()
+                        self.link = .failed(String(mode.dropFirst(DaemonClient.identityModePrefix.count)))
+                        self.status = "daemon not verified"
+                        return
+                    }
                     self.status = mode == "live" ? "connected · live" : "connected · \(mode)"
                 }
             })

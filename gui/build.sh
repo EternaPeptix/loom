@@ -5,9 +5,9 @@
 # the operator's Mac) and leaves the .app there. Pass --pull to also rsync the bundle to ./dist here.
 #
 #   LOOM_BUILD_HOST=<host> gui/build.sh   build on the host (required: a host name, or "local")
-#   gui/build.sh --pull       build, then copy dist/loom-desk.app back to this gui/dist
+#   LOOM_BUILD_HOST=<host> gui/build.sh --pull       build, then copy dist/loom-desk.app back to this gui/dist
 #   LOOM_BUILD_HOST=local gui/build.sh   build right here (needs swiftc)
-#   LOOM_SWIFTFLAGS=-DDEBUG gui/build.sh  debug variant: `loom-desk --self-check` runs the pure-helper checks
+#   LOOM_BUILD_HOST=<host> LOOM_SWIFTFLAGS=-DDEBUG gui/build.sh  debug variant: `loom-desk --self-check` runs the pure-helper checks
 #
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

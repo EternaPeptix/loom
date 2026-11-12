@@ -141,7 +141,7 @@ A `WKWebView` wrapped in `NSViewRepresentable`. It logs in with a one-time code.
 its identity: `GET <baseURL>/healthz?nonce=<N>` (N = 64 random hex characters, no token sent) must answer
 `{"ok": true, "proof": "<hex>"}` with proof = HMAC-SHA256 keyed with the token's bytes over the ASCII
 `loom-healthz-v1:` followed by N, compared in constant time. This is done on connect, before every login
-code request, and at the start of every attempt of the daemon client; when the proof is missing or wrong
+code request, and at the start of every attempt of the daemon client and again before the snapshot that follows an ended stream (a wrong answer after connect turns the link to failed with that message); when the proof is missing or wrong
 the token is not sent and the app says that something answered but did not prove it is the daemon for this
 token, and that a daemon older than the app must be restarted on the new version. Then the app (which
 holds the token) sends `POST <baseURL>/api/login-codes` with `Authorization: Bearer <token>`; the answer is

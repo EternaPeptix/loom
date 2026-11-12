@@ -21,7 +21,7 @@ enum WebState: Equatable {
 ///   opened in the default browser, other schemes are just cancelled.
 /// - navigates to `#/s/<id>` when `focusSession` is set (then clears it).
 /// - never injects scripts or reads page contents (it does look at the HTTP status of the main
-///   frame response, which is navigation metadata, to report a rejected token).
+///   frame response, which is navigation metadata, to report a page the daemon refused).
 /// - uses a non-persistent data store, so nothing the page stores touches disk and nothing from another
 ///   daemon on the same loopback host can be replayed.
 struct WebPane: NSViewRepresentable {
@@ -129,7 +129,7 @@ struct WebPane: NSViewRepresentable {
                      decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
             if navigationResponse.isForMainFrame, let http = navigationResponse.response as? HTTPURLResponse,
                http.statusCode == 401 || http.statusCode == 403 {
-                report(.failed("the daemon rejected the token (HTTP \(http.statusCode)). Edit the connection and reconnect."))
+                report(.failed("the daemon refused the page (HTTP \(http.statusCode)). Reconnect for a fresh login code."))
             }
             decisionHandler(.allow)
         }

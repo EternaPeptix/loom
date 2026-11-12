@@ -26,7 +26,7 @@ process ends is shown as disconnected with ssh's last error line.
 ## Build
 
 ```
-gui/build.sh --pull          # build on the build host, copy gui/dist/loom-desk.app here
+LOOM_BUILD_HOST=<host> gui/build.sh --pull          # build on the build host, copy gui/dist/loom-desk.app here
 xattr -dr com.apple.quarantine gui/dist/loom-desk.app   # first run only
 open gui/dist/loom-desk.app
 ```

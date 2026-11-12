@@ -172,6 +172,9 @@ final class DaemonClient: @unchecked Sendable {
         return a.proof
     }
 
+    /// `onMode` text prefix for "the address no longer belongs to this token's daemon".
+    static let identityModePrefix = "identity: "
+
     static func identityMismatchMessage(_ base: String) -> String {
         "something answered on \(base) but did not prove it is the loom daemon for this token, so the token was not sent. "
             + "If the daemon is older than this app, restart it on the new version; otherwise check the address and the token."
@@ -369,16 +372,21 @@ final class DaemonClient: @unchecked Sendable {
             var description: String { status == 401 ? "the daemon rejected the token (401)" : "HTTP \(status)" }
         }
 
+        /// The token goes out only to a daemon that has just proven it holds it. On failure reports it
+        /// (a wrong answer with `identityModePrefix`, so the app can mark the link), waits, and says false.
+        private func proven() async -> Bool {
+            guard let token else { return true }
+            guard case .failed(let why) = await DaemonClient.verifyIdentity(baseURL: baseURL, token: token) else { return true }
+            if Task.isCancelled { return false }
+            onMode(why.hasPrefix("something answered") ? DaemonClient.identityModePrefix + why : "not connected (\(why))")
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            return false
+        }
+
         func run() async {
             while !Task.isCancelled {
                 var reason = "stream ended"
-                // The token goes out only to a daemon that has just proven it holds it.
-                if let token, case .failed(let why) = await DaemonClient.verifyIdentity(baseURL: baseURL, token: token) {
-                    if Task.isCancelled { break }
-                    onMode("not connected (\(why))")
-                    try? await Task.sleep(nanoseconds: 4_000_000_000)
-                    continue
-                }
+                if !(await proven()) { continue }
                 do {
                     try await stream()
                 } catch is CancellationError {
@@ -387,6 +395,9 @@ final class DaemonClient: @unchecked Sendable {
                     reason = (error as? HTTPError)?.description ?? error.localizedDescription
                 }
                 if Task.isCancelled { break }
+                // Whatever ended the stream may have freed the port for another listener: prove the daemon
+                // again before the snapshot below sends the token.
+                if !(await proven()) { continue }
                 onMode("polling (\(reason))")
                 await refresh(sessions: true, inbox: true)
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
