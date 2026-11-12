@@ -7,7 +7,8 @@
 //!
 //! CONTRACT.
 //! Follow `web.rs` for how a native tool reaches the network: build one `reqwest::Client` with
-//! [`build_client`] — redirects off, `.no_proxy()`, and the session's egress proxy from `ctx.env`
+//! [`build_client`] — redirects off, `.no_proxy()`, no idle connection kept (every request opens a
+//! connection of its own), and the session's egress proxy from `ctx.env`
 //! (`HTTPS_PROXY`/`https_proxy`/`HTTP_PROXY`/`http_proxy`) when present, so every request passes the
 //! proxy's allowlist and is logged as a `net` decision. Read nothing from the process environment.
 //! Timeout each whole exchange at `ctx.cfg.web_fetch_timeout_s`; `ctx.cancel` aborts (status
@@ -217,10 +218,14 @@ struct Reply {
     body: Vec<u8>,
 }
 
-/// A client that never follows redirects, uses the session's proxy if there is one, and reads
-/// nothing from the process environment.
+/// A client that never follows redirects, keeps no idle connection, uses the session's proxy if there
+/// is one, and reads nothing from the process environment.
 fn build_client(ctx: &ToolCtx) -> Result<Client, String> {
-    let mut builder = Client::builder().redirect(redirect::Policy::none()).no_proxy().user_agent("loom-cve/0.1");
+    let mut builder = Client::builder()
+        .redirect(redirect::Policy::none())
+        .no_proxy()
+        .pool_max_idle_per_host(0)
+        .user_agent("loom-cve/0.1");
     let proxy = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
         .iter()
         .find_map(|k| ctx.env.get(*k).filter(|v| !v.trim().is_empty()));
@@ -1567,6 +1572,37 @@ mod tests {
         let r = e.call("advisory_lookup", json!({"name": "x", "ecosystem": "npm"})).await;
         assert_eq!(r.status, ToolStatus::Denied, "{}", r.text);
         assert!(r.text.contains("osv.blocked.invalid"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn every_request_opens_a_connection_of_its_own() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A server that keeps its connections open and answers each request on them; it counts them.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut b = [0u8; 4096];
+                    while let Ok(n) = s.read(&mut b).await {
+                        if n == 0 || s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let e = env();
+        let client = build_client(&e.ctx).unwrap();
+        for _ in 0..2 {
+            let resp = client.get(&url).send().await.unwrap();
+            assert_eq!(resp.text().await.unwrap(), "ok");
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
