@@ -31,8 +31,8 @@
 //! look-alike names); matching; login codes and web sessions; every host and origin case above,
 //! including a wrong port and a host with a suffix (`127.0.0.1:7878.evil.example`).
 
-use std::io::{ErrorKind, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::io::ErrorKind;
+use std::os::unix::fs::DirBuilderExt;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
@@ -83,21 +83,9 @@ pub fn load_or_create_token(path: &Path) -> std::io::Result<String> {
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
     }
     let bytes: [u8; 32] = rand::random();
-    let token = hex::encode(bytes);
-    let created = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
-    match created {
-        Ok(mut file) => {
-            file.write_all(format!("{token}\n").as_bytes())?;
-            file.sync_all()?;
-            Ok(token)
-        }
-        // Another process created it between our read and our create: use theirs.
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-            let content = std::fs::read_to_string(path)?;
-            read_token(path, &content)
-        }
-        Err(e) => Err(e),
-    }
+    // Published atomically; when a concurrent creator got there first, its token is the one read back.
+    loom_core::journal::publish_new_file(path, format!("{}\n", hex::encode(bytes)).as_bytes())?;
+    read_token(path, &std::fs::read_to_string(path)?)
 }
 
 /// The secret a request presents: the value of `Authorization: Bearer <secret>`.
@@ -246,6 +234,54 @@ mod tests {
         assert_eq!(load_or_create_token(&path).unwrap(), first);
         let other = load_or_create_token(&dir.path().join("token2")).unwrap();
         assert_ne!(other, first);
+    }
+
+    #[test]
+    fn concurrent_creators_agree_and_a_leftover_temporary_file_is_harmless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(dir.path().join(".token.tmp"), "junk").unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || load_or_create_token(&path).unwrap())
+            })
+            .collect();
+        let tokens: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(is_token(&tokens[0]));
+        assert!(tokens.iter().all(|t| *t == tokens[0]));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn a_token_file_is_never_seen_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        for round in 0..200 {
+            let path = dir.path().join(format!("t{round}"));
+            let reader = {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..2000 {
+                        if let Ok(text) = std::fs::read_to_string(&path) {
+                            assert!(is_token(text.trim()), "partial token file: {text:?}");
+                        }
+                    }
+                })
+            };
+            assert!(is_token(&load_or_create_token(&path).unwrap()));
+            reader.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn an_empty_token_file_is_an_error_that_says_what_to_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "").unwrap();
+        let err = load_or_create_token(&path).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("delete it and loom will create a new one"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
     }
 
     #[test]
