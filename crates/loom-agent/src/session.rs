@@ -251,7 +251,28 @@
 //! Append the `tool_result`, then every record the call queued (`shared.take_emitted()`), then take
 //! the effect (`shared.take_effect()`). After the last call, apply the first effect that was set:
 //! `EndTurn(reason)` ends the turn with that reason; `Settle(delivery)` settles the child (below).
-//! Calls run one at a time.
+//! Calls run one at a time, but for the early starts below.
+//!
+//! ### Early starts
+//! With `tools.speculate` (default true) a call of a tool whose `Tool::speculative` is true can be
+//! started before its turn. While the reply streams, `StreamEvent::ToolCallReady{index, ..}` starts
+//! the call when every call before it in this attempt was ready and is of such a tool (the first that
+//! is not, or a gap, ends early starts for the attempt), its arguments are a JSON object that
+//! `loom_tools::prepare` accepts, and fewer than `MAX_EARLY` early tasks are running (those of
+//! discarded calls count until they have ended). It runs (`prepare`, `Prepared::run`) in a task with
+//! the id the call will keep (the server's when `with_fresh_ids` would keep it, else a fresh one), a
+//! child of the turn's token and a `FileTracker` of its own; nothing of it counts until it is
+//! claimed. A new attempt or a failed request cancels every early call of the request. When the reply
+//! is in, its calls take the ids of the early calls they hold byte for byte (same index, name and
+//! arguments) unless the log or an earlier call already has that id; the others are cancelled,
+//! and the complete calls of the reply's leading run of such tools that were not started early are
+//! started together. In the in-order loop, a call with an early run of the same index, name, arguments
+//! and id takes that run's result (awaited; a stop interrupts it as it would a call run in place) in
+//! place of `execute`: its file records move into the session's tracker, `Ran::finish` stores and
+//! admits it, and its `tool_result` gets `meta[META_EARLY_MS]`. Early calls left unclaimed when the
+//! loop ends are cancelled and awaited, so none outlives the step. Records and what the model sees are
+//! those of running every call in place, but for timings, fresh call ids and that key. Counts (started,
+//! claimed, discarded, ms saved) are logged at debug level at the end of each turn.
 //!
 //! ## Settling (children)
 //! Append `turn_end{reason}` and `session_end{outcome, detail}` per the table, kill the session's
@@ -375,16 +396,18 @@ use loom_model::assemble::{Completion, StreamEvent};
 use loom_model::client::{ModelClient, ModelError};
 use loom_model::limit::{Limiter, Priority};
 use loom_model::request::{ChatRequest, ToolChoice};
+use loom_tools::files::FileTracker;
 use loom_tools::jobs::{JobEvent, JobInfo, JobState};
 use loom_tools::proc::Ended;
-use loom_tools::{execute, refused, Admission, Registry, ToolCtx};
+use loom_tools::{execute, prepare, refused, Admission, Ran, Registry, ToolCtx};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Something that happens to a session from outside.
@@ -751,6 +774,248 @@ struct Calls {
     cancelled: bool,
 }
 
+/// Most early calls that run at once; a call that is ready beyond that runs in its turn.
+const MAX_EARLY: usize = 8;
+
+/// `tool_result` meta key: the call was started early, this many milliseconds before the in-order
+/// loop reached it. Not shown to the model.
+pub const META_EARLY_MS: &str = "early_ms";
+
+/// What the session's early starts came to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EarlyCounts {
+    started: u64,
+    claimed: u64,
+    discarded: u64,
+    /// Over claimed calls: how long before the end of the reply each started, capped by its run time.
+    saved_ms: u64,
+}
+
+/// The task of a call started early. Dropped before it has ended (a step that ends on a failed
+/// append, or a session future dropped while a claim awaits it), it is stopped but not awaited: it
+/// ends at its next await, and a blocking read it handed to a thread finishes there unobserved.
+struct EarlyTask {
+    handle: JoinHandle<Ran>,
+    /// The call's own token.
+    cancel: CancellationToken,
+}
+
+impl EarlyTask {
+    fn stop(&self) {
+        self.cancel.cancel();
+        self.handle.abort();
+    }
+}
+
+impl Drop for EarlyTask {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.stop();
+        }
+    }
+}
+
+/// One call started before its turn.
+struct EarlyRun {
+    name: String,
+    arguments: String,
+    /// Its own call id, its own token (a child of the turn's) and its own file tracker.
+    ctx: ToolCtx,
+    started: Instant,
+    task: EarlyTask,
+}
+
+impl EarlyRun {
+    fn holds(&self, call: &ToolCallRequest) -> bool {
+        call.name == self.name && call.arguments == self.arguments
+    }
+}
+
+/// The calls of one model request that were started early. See *Early starts* above. Dropped
+/// without `discard` (a step that ends on a failed append), its tasks are stopped, not awaited.
+struct Early {
+    on: bool,
+    registry: Registry,
+    template: ToolCtx,
+    turn: CancellationToken,
+    /// The call ids of the session's log.
+    logged: HashSet<String>,
+    runs: BTreeMap<usize, EarlyRun>,
+    /// Calls `0..clear` of this attempt were ready and are of tools that may start early.
+    clear: usize,
+    /// A call that may not start early came before: nothing more starts in this attempt.
+    blocked: bool,
+    /// Indexes started early in this attempt, whatever became of them.
+    tried: BTreeSet<usize>,
+    /// The server's ids of the calls of this attempt that were ready.
+    ready_ids: HashSet<String>,
+    /// When the finished reply arrived.
+    reply_end: Option<Instant>,
+    /// Tasks of discarded runs, still to be awaited.
+    dropped: Vec<EarlyTask>,
+    counts: Arc<Mutex<EarlyCounts>>,
+}
+
+impl Early {
+    fn new(
+        on: bool,
+        registry: Registry,
+        template: ToolCtx,
+        turn: &CancellationToken,
+        logged: HashSet<String>,
+        counts: Arc<Mutex<EarlyCounts>>,
+    ) -> Early {
+        Early {
+            on,
+            registry,
+            template,
+            turn: turn.clone(),
+            logged,
+            runs: BTreeMap::new(),
+            clear: 0,
+            blocked: false,
+            tried: BTreeSet::new(),
+            ready_ids: HashSet::new(),
+            reply_end: None,
+            dropped: Vec::new(),
+            counts,
+        }
+    }
+
+    fn count(&self, f: impl FnOnce(&mut EarlyCounts)) {
+        f(&mut self.counts.lock().unwrap_or_else(|p| p.into_inner()));
+    }
+
+    fn may_start(&self, name: &str) -> bool {
+        self.registry.get(name).is_some_and(|t| t.speculative())
+    }
+
+    /// Follow the stream: a ready call may start; a new attempt voids what the earlier ones started.
+    fn on_event(&mut self, event: &StreamEvent) {
+        match event {
+            StreamEvent::AttemptStart { .. } => {
+                for run in std::mem::take(&mut self.runs).into_values() {
+                    self.drop_run(run);
+                }
+                self.clear = 0;
+                self.blocked = false;
+                self.tried.clear();
+                self.ready_ids.clear();
+            }
+            StreamEvent::ToolCallReady { index, id, name, arguments } if self.on && !self.blocked => {
+                // A call after one of a tool that may not start early must see what that call did.
+                if usize::try_from(*index).ok() != Some(self.clear) || !self.may_start(name) {
+                    self.blocked = true;
+                    return;
+                }
+                // The id the call will keep (see `with_fresh_ids`): the server's, unless it is empty
+                // or the log or an earlier call of this attempt has it.
+                let server = id.as_deref().filter(|s| !s.is_empty());
+                let kept = server.filter(|s| !self.logged.contains(*s) && self.ready_ids.insert((*s).to_string()));
+                self.start(self.clear, name, arguments, kept.map(CallId::from).as_ref());
+                self.clear = self.clear.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    /// Start call `index` unless it has a run, the turn is cancelled, `MAX_EARLY` tasks are running
+    /// (counting those of discarded runs until they have ended), or its arguments are not a JSON
+    /// object the tool accepts (its turn reports that). `id` is the call's final id when it is known.
+    fn start(&mut self, index: usize, name: &str, arguments: &str, id: Option<&CallId>) {
+        let tasks = self.runs.values().map(|r| &r.task).chain(&self.dropped);
+        let running = tasks.filter(|t| !t.handle.is_finished()).count();
+        if self.runs.contains_key(&index) || self.turn.is_cancelled() || running >= MAX_EARLY {
+            return;
+        }
+        if !matches!(serde_json::from_str::<Value>(arguments), Ok(Value::Object(_))) {
+            return;
+        }
+        let mut ctx = self.template.clone();
+        ctx.call_id = id.cloned().unwrap_or_else(fresh_call_id);
+        ctx.cancel = self.turn.child_token();
+        ctx.files = Arc::new(FileTracker::new());
+        let Ok(call) = prepare(&self.registry, &ctx, name, arguments) else { return };
+        if !call.speculative() {
+            return;
+        }
+        let (run_ctx, cancel) = (ctx.clone(), ctx.cancel.clone());
+        let task = EarlyTask { handle: tokio::spawn(async move { call.run(&run_ctx).await }), cancel };
+        let run = EarlyRun { name: name.to_string(), arguments: arguments.to_string(), ctx, started: Instant::now(), task };
+        self.runs.insert(index, run);
+        self.tried.insert(index);
+        self.count(|c| c.started = c.started.saturating_add(1));
+    }
+
+    fn drop_run(&mut self, run: EarlyRun) {
+        run.task.stop();
+        self.dropped.push(run.task);
+        self.count(|c| c.discarded = c.discarded.saturating_add(1));
+    }
+
+    /// The ids of the runs that `calls` (the finished reply) hold byte for byte, by index.
+    fn ids(&self, calls: &[ToolCallRequest]) -> BTreeMap<usize, CallId> {
+        let held = self.runs.iter().filter(|(i, r)| calls.get(**i).is_some_and(|c| r.holds(c)));
+        held.map(|(i, r)| (*i, r.ctx.call_id.clone())).collect()
+    }
+
+    /// The reply is in, with its final ids: drop the runs it does not hold as they were started, or
+    /// that follow a call of a tool that may not start early, then start the complete calls of its
+    /// leading run of tools that may that were not started early, so that they run together.
+    fn settle(&mut self, calls: &[ToolCallRequest]) {
+        let head = calls.iter().take_while(|c| self.may_start(&c.name)).count();
+        let stale: Vec<usize> = self
+            .runs
+            .iter()
+            .filter(|(i, r)| **i >= head || !calls.get(**i).is_some_and(|c| r.holds(c) && c.call_id == r.ctx.call_id))
+            .map(|(i, _)| *i)
+            .collect();
+        for i in stale {
+            if let Some(run) = self.runs.remove(&i) {
+                self.drop_run(run);
+            }
+        }
+        if !self.on {
+            return;
+        }
+        for (i, c) in calls.iter().enumerate().take(head) {
+            if c.complete && !self.tried.contains(&i) {
+                self.start(i, &c.name, &c.arguments, Some(&c.call_id));
+            }
+        }
+    }
+
+    /// The run of call `index` of the reply, when it was started for exactly that call.
+    fn claim(&mut self, index: usize, call: &ToolCallRequest) -> Option<EarlyRun> {
+        let held = self.runs.get(&index).is_some_and(|r| r.holds(call) && r.ctx.call_id == call.call_id);
+        if held {
+            self.runs.remove(&index)
+        } else {
+            None
+        }
+    }
+
+    /// Cancel and forget every run left, and wait until none of their tasks is running.
+    async fn discard(mut self) {
+        for run in std::mem::take(&mut self.runs).into_values() {
+            self.drop_run(run);
+        }
+        for mut task in std::mem::take(&mut self.dropped) {
+            // Aborted: it ends at its next await, if it had not ended already.
+            let _ = (&mut task.handle).await;
+        }
+    }
+}
+
+/// A call id of the session's own.
+fn fresh_call_id() -> CallId {
+    CallId::from(format!("call-{}", new_request_id().trim_start_matches("r-")))
+}
+
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
 pub struct Session {
     deps: Deps,
     log: SessionLog,
@@ -773,6 +1038,7 @@ pub struct Session {
     /// Weaves computed so far (see `woven`).
     #[cfg(test)]
     weaves: u32,
+    early_counts: Arc<Mutex<EarlyCounts>>,
 }
 
 /// Longest `session_end` detail.
@@ -922,6 +1188,7 @@ impl Session {
             line_counts: LineCounts::default(),
             #[cfg(test)]
             weaves: 0,
+            early_counts: Arc::default(),
         }
     }
 
@@ -1571,6 +1838,9 @@ impl Session {
                 other => break other,
             }
         };
+        let c = *self.early_counts.lock().unwrap_or_else(|p| p.into_inner());
+        tracing::debug!(session = %self.deps.shared.session, started = c.started, claimed = c.claimed,
+            discarded = c.discarded, saved_ms = c.saved_ms, "calls started early, over the session");
         match flow {
             Flow::Next => Ok(None),
             Flow::End(reason) => {
@@ -1699,7 +1969,7 @@ impl Session {
         }
 
         let mut overflowed = false;
-        let (req_id, completion, queue_ms, tools) = loop {
+        let (req_id, completion, queue_ms, tools, early) = loop {
             let req_id = new_request_id();
             let w = &woven.weave;
             if let PrefixCheck::Break { first_diff_message, detail } = self.guard.check(w.epoch, &w.messages) {
@@ -1748,11 +2018,11 @@ impl Session {
             let queue_ms = permit.waited_ms;
             drop(permit);
             match result {
-                Ok(c) => {
+                Ok((c, early)) => {
                     if c.usage.prompt_tokens > 0 {
                         self.estimator.calibrate(sent_chars, c.usage.prompt_tokens);
                     }
-                    break (req_id, c, queue_ms, request.tools);
+                    break (req_id, c, queue_ms, request.tools, early);
                 }
                 Err(ModelError::Cancelled { .. }) => return self.cancelled().await,
                 Err(ModelError::ContextOverflow { limit, .. }) => {
@@ -1774,7 +2044,8 @@ impl Session {
             }
         };
 
-        let completion = self.with_fresh_ids(completion);
+        let early_ids = early.ids(&completion.tool_calls);
+        let completion = self.with_fresh_ids(completion, &early_ids);
         self.append(
             Author::Model,
             Event::ModelResponse(ModelResponse {
@@ -1789,48 +2060,72 @@ impl Session {
             }),
         )?;
         self.publish();
-        self.handle_reply(&req_id, &completion, &tools).await
+        self.handle_reply(&req_id, &completion, &tools, early).await
     }
 
-    /// One request, with every stream event forwarded to the sink as it arrives.
+    /// One request, with every stream event forwarded to the sink as it arrives, and the calls it
+    /// started early (see *Early starts*). A failed request leaves none running.
     async fn complete_streaming(
         &self,
         request: &ChatRequest,
         req_id: &str,
         token: &CancellationToken,
-    ) -> Result<Completion, ModelError> {
+    ) -> Result<(Completion, Early), ModelError> {
         let client = self.deps.client.clone();
         let sink = self.deps.sink.clone();
         let session = &self.deps.shared.session;
+        let on = self.deps.ctx.cfg.speculate;
+        let logged = if on { self.logged_call_ids() } else { HashSet::new() };
+        let (registry, template, counts) = (self.registry.clone(), self.deps.ctx.clone(), self.early_counts.clone());
+        let mut early = Early::new(on, registry, template, token, logged, counts);
         let (tx, mut rx) = unbounded_channel();
         let call = client.complete(request, Some(&tx), token);
         tokio::pin!(call);
         let result = loop {
             tokio::select! {
                 r = &mut call => break r,
-                Some(event) = rx.recv() => sink.delta(session, req_id, &event),
+                Some(event) = rx.recv() => {
+                    sink.delta(session, req_id, &event);
+                    early.on_event(&event);
+                }
             }
         };
         while let Ok(event) = rx.try_recv() {
             sink.delta(session, req_id, &event);
+            early.on_event(&event);
         }
-        result
+        match result {
+            Ok(c) => {
+                early.reply_end = Some(Instant::now());
+                Ok((c, early))
+            }
+            Err(e) => {
+                early.discard().await;
+                Err(e)
+            }
+        }
     }
 
-    /// Calls whose id is empty or already used in this log get a fresh one.
-    fn with_fresh_ids(&self, mut completion: Completion) -> Completion {
-        let mut used: HashSet<String> = self
-            .records
+    /// The call ids of this session's log.
+    fn logged_call_ids(&self) -> HashSet<String> {
+        self.records
             .iter()
             .filter_map(|r| match &r.event {
                 Event::ToolCall(c) => Some(c.call_id.0.clone()),
                 _ => None,
             })
-            .collect();
-        for call in &mut completion.tool_calls {
-            if call.call_id.0.is_empty() || used.contains(&call.call_id.0) {
-                let fresh = format!("call-{}", new_request_id().trim_start_matches("r-"));
-                call.call_id = CallId::from(fresh);
+            .collect()
+    }
+
+    /// Calls whose id is empty or already used in this log get a fresh one; a call started early
+    /// keeps the id it was started with (`early`, by index) unless the log or an earlier call has it.
+    fn with_fresh_ids(&self, mut completion: Completion, early: &BTreeMap<usize, CallId>) -> Completion {
+        let mut used = self.logged_call_ids();
+        for (i, call) in completion.tool_calls.iter_mut().enumerate() {
+            match early.get(&i) {
+                Some(id) if !used.contains(&id.0) => call.call_id = id.clone(),
+                _ if call.call_id.0.is_empty() || used.contains(&call.call_id.0) => call.call_id = fresh_call_id(),
+                _ => {}
             }
             used.insert(call.call_id.0.clone());
         }
@@ -2125,12 +2420,13 @@ impl Session {
 
     // ---- the reply -----------------------------------------------------------------------------
 
-    async fn handle_reply(&mut self, req_id: &str, c: &Completion, w_tools: &[ToolSpec]) -> R<Flow> {
+    async fn handle_reply(&mut self, req_id: &str, c: &Completion, w_tools: &[ToolSpec], early: Early) -> R<Flow> {
         if matches!(c.finish, FinishReason::Error | FinishReason::Aborted) {
+            early.discard().await;
             return self.fail("The model server ended the reply with an error.");
         }
         let complete: Vec<ToolCallRequest> = c.tool_calls.iter().filter(|t| t.complete).cloned().collect();
-        let calls = self.run_calls(req_id, &complete, w_tools).await?;
+        let calls = self.run_calls(req_id, &c.tool_calls, w_tools, early).await?;
         // Calls that were not cut off by the limit but whose arguments are not a JSON object are not run
         // and not replayed (the weave keeps only complete calls). The model is told why, after the
         // results of the calls that ran and whatever the turn does next.
@@ -2220,11 +2516,19 @@ impl Session {
         }
     }
 
-    /// Run the complete calls of a reply one at a time, each recorded before and after it runs.
-    async fn run_calls(&mut self, req_id: &str, calls: &[ToolCallRequest], w_tools: &[ToolSpec]) -> R<Calls> {
+    /// Run the complete ones of a reply's calls one at a time, each recorded before and after it runs;
+    /// a call started early is claimed in its turn (see *Early starts*).
+    async fn run_calls(
+        &mut self,
+        req_id: &str,
+        calls: &[ToolCallRequest],
+        w_tools: &[ToolSpec],
+        mut early: Early,
+    ) -> R<Calls> {
         let mut out = Calls::default();
         let mut ender: Option<String> = None;
-        for call in calls {
+        early.settle(calls);
+        for (index, call) in calls.iter().enumerate().filter(|(_, c)| c.complete) {
             if out.effect.is_none() && self.token.is_cancelled() {
                 out.cancelled = true;
                 break;
@@ -2253,6 +2557,8 @@ impl Session {
                 let message =
                     texts::not_in_assignment(&call.name, &self.deps.shared.role.name, &self.registry.names());
                 refused(&ctx, &call.name, class, message, started)
+            } else if let Some(run) = early.claim(index, call) {
+                self.claim_early(run, &early, &ctx, call).await
             } else {
                 let admission = Admission { policy: &self.deps.admit, estimator: &self.estimator };
                 execute(&self.registry, &ctx, &call.name, &call.arguments, &admission).await
@@ -2271,7 +2577,42 @@ impl Session {
             }
             out.ran = out.ran.saturating_add(1);
         }
+        early.discard().await;
         Ok(out)
+    }
+
+    /// The result of a call that was started early, as if it had just run in place: awaited (its token
+    /// is a child of the turn's, so a stop interrupts it; dropped while it waits, its task is stopped),
+    /// what it saw of files counted from now on, stored and admitted now.
+    async fn claim_early(
+        &self,
+        mut run: EarlyRun,
+        early: &Early,
+        ctx: &ToolCtx,
+        call: &ToolCallRequest,
+    ) -> loom_core::event::ToolResult {
+        let reached = Instant::now();
+        let admission = Admission { policy: &self.deps.admit, estimator: &self.estimator };
+        let ran = match (&mut run.task.handle).await {
+            Ok(ran) => ran,
+            // Only a discard aborts a task, and a claimed run is never discarded; the call runs in place.
+            Err(e) => {
+                let session = &self.deps.shared.session;
+                tracing::warn!(%session, call = %call.call_id.0, "a call started early failed ({e}); it runs again");
+                early.count(|c| c.discarded = c.discarded.saturating_add(1));
+                return execute(&self.registry, ctx, &call.name, &call.arguments, &admission).await;
+            }
+        };
+        run.ctx.files.move_into(&self.deps.ctx.files);
+        let before_end = early.reply_end.map_or(Duration::ZERO, |end| end.saturating_duration_since(run.started));
+        early.count(|c| {
+            c.claimed = c.claimed.saturating_add(1);
+            c.saved_ms = c.saved_ms.saturating_add(millis(before_end.min(ran.took)));
+        });
+        let mut result = ran.finish(&run.ctx, &admission);
+        let ahead = millis(reached.saturating_duration_since(run.started));
+        result.meta.insert(META_EARLY_MS.into(), Value::from(ahead));
+        result
     }
 }
 
@@ -2286,6 +2627,7 @@ mod tests {
     use loom_core::log::read_records;
     use loom_model::mock::{Action, MockServer, Reply, Script};
     use loom_tools::testutil::TestEnv;
+    use loom_tools::Tool;
     use serde_json::json;
     use tokio::sync::mpsc::UnboundedSender;
 
@@ -2993,12 +3335,495 @@ mod tests {
             timing: Timing::default(),
             attempts: 1,
         };
-        let fixed = session.with_fresh_ids(completion);
+        let fixed = session.with_fresh_ids(completion.clone(), &BTreeMap::new());
         let ids: Vec<String> = fixed.tool_calls.iter().map(|c| c.call_id.0.clone()).collect();
         assert!(ids[0].starts_with("call-") && ids[1].starts_with("call-"));
         assert_eq!(ids[2], "fresh");
         assert!(ids[3].starts_with("call-"));
         assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 4);
+
+        // A call started early keeps the id it was started with, whatever the server sent.
+        let early = BTreeMap::from([(2, CallId::from("call-early"))]);
+        let fixed = session.with_fresh_ids(completion.clone(), &early);
+        let ids: Vec<String> = fixed.tool_calls.iter().map(|c| c.call_id.0.clone()).collect();
+        assert_eq!(ids[2], "call-early");
+        // The server's id at index 2 is no longer taken, so the one at index 3 is kept.
+        assert_eq!(ids[3], "fresh");
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 4);
+
+        // Unless the log or an earlier call already has it: then the call is given an id as if it had
+        // not started early (and the early run, which it no longer matches, is dropped).
+        let early = BTreeMap::from([(1, CallId::from("dup")), (3, CallId::from("fresh"))]);
+        let fixed = session.with_fresh_ids(completion, &early);
+        let ids: Vec<String> = fixed.tool_calls.iter().map(|c| c.call_id.0.clone()).collect();
+        assert!(ids[1].starts_with("call-") && ids[3].starts_with("call-"), "{ids:?}");
+        assert_eq!(ids[2], "fresh");
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 4);
+    }
+
+    // ---- early starts ------------------------------------------------------------------------
+
+    /// What probe calls did: per call, its path and how many replies were recorded and how many stream
+    /// events the sink had been given when it began; how many were running, and the most at once.
+    #[derive(Clone, Default)]
+    struct Witness {
+        began: Arc<Mutex<Vec<(String, usize, usize)>>>,
+        live: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Witness {
+        fn paths(&self) -> Vec<String> {
+            self.began.lock().unwrap().iter().map(|(p, _, _)| p.clone()).collect()
+        }
+        fn live(&self) -> usize {
+            self.live.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// Counts a probe call as running until it is dropped, however it ends.
+    struct Alive(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for Alive {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The real `read`, telling the witness when each call begins; with `hold`, a call waits for its
+    /// cancellation instead of reading.
+    struct Probe {
+        sink: Option<Arc<Collect>>,
+        witness: Witness,
+        hold: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Probe {
+        fn spec(&self) -> ToolSpec {
+            loom_tools::fstools::Read.spec()
+        }
+        fn speculative(&self) -> bool {
+            true
+        }
+        async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> loom_tools::ToolOutput {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.witness.live.fetch_add(1, SeqCst) + 1;
+            let _alive = Alive(self.witness.live.clone());
+            self.witness.peak.fetch_max(now, SeqCst);
+            let replies = self.sink.as_ref().map_or(0, |s| count(&s.records(), "model_response"));
+            let deltas = self.sink.as_ref().map_or(0, |s| s.deltas.lock().unwrap().len());
+            self.witness.began.lock().unwrap().push((args["path"].as_str().unwrap_or("").to_string(), replies, deltas));
+            if self.hold {
+                ctx.cancel.cancelled().await;
+                return loom_tools::ToolOutput::error("held until cancelled");
+            }
+            loom_tools::fstools::Read.run(ctx, args).await
+        }
+    }
+
+    fn read_call(path: &str) -> (String, String) {
+        ("read".to_string(), json!({ "path": path }).to_string())
+    }
+
+    fn other_call(name: &str, args: Value) -> (String, String) {
+        (name.to_string(), args.to_string())
+    }
+
+    /// A `chat` session over `a.txt`, `b.txt`, `c.txt`, whose `read` is a probe, run on `script` for
+    /// one user message.
+    async fn early_run(speculate: bool, script: Vec<Action>) -> (Fx, Witness, Arc<Mutex<EarlyCounts>>) {
+        let mut fx = Fx::new("chat", false, false, seq(script)).await;
+        fx.ctx.cfg = Arc::new(loom_core::config::ToolsCfg { speculate, ..(*fx.ctx.cfg).clone() });
+        for (file, text) in [("a.txt", "alpha\n"), ("b.txt", "beta\n"), ("c.txt", "gamma\n")] {
+            std::fs::write(fx.ctx.workspace.join(file), text).unwrap();
+        }
+        let witness = Witness::default();
+        let mut session = fx.create();
+        session.registry.add(Arc::new(Probe { sink: Some(fx.sink.clone()), witness: witness.clone(), hold: false }));
+        let counts = session.early_counts.clone();
+        run_with(session, vec![user("go")]).await;
+        (fx, witness, counts)
+    }
+
+    fn counts_of(counts: &Arc<Mutex<EarlyCounts>>) -> (u64, u64, u64) {
+        let c = *counts.lock().unwrap();
+        (c.started, c.claimed, c.discarded)
+    }
+
+    fn early_marks(rs: &[Record]) -> Vec<bool> {
+        results(rs).iter().map(|r| r.meta.contains_key(META_EARLY_MS)).collect()
+    }
+
+    /// Request and call ids, in order of first appearance.
+    fn ids_of(rs: &[Record]) -> Vec<String> {
+        let mut ids = Vec::new();
+        for r in rs {
+            match &r.event {
+                Event::ModelRequest(m) => ids.push(m.req_id.clone()),
+                Event::ModelResponse(m) => ids.extend(m.tool_calls.iter().map(|c| c.call_id.0.clone())),
+                _ => {}
+            }
+        }
+        ids
+    }
+
+    /// `text` with what differs between two runs of one script made alike: the temp directory, the
+    /// ids (numbered by first appearance) and the run time a command's header states.
+    fn alike(fx: &Fx, ids: &[String], text: &str) -> Value {
+        let mut text = text.replace(&fx.ctx.workspace.parent().unwrap().display().to_string(), "#root");
+        for (n, id) in ids.iter().enumerate() {
+            text = text.replace(id.as_str(), &format!("#id{n}"));
+        }
+        let text = regex::Regex::new(r" · [0-9.]+s · ").unwrap().replace_all(&text, " · #s · ");
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// The records, alike between runs, without times, hashes, the HUD and the early-start key.
+    fn comparable(fx: &Fx) -> Vec<Value> {
+        let rs = fx.sink.records();
+        let ids = ids_of(&rs);
+        rs.iter()
+            .map(|r| {
+                let mut v = serde_json::to_value(r).unwrap();
+                let o = v.as_object_mut().unwrap();
+                for k in ["ts_ms", "prev", "duration_ms", "timing", "hud", "stable_hash"] {
+                    o.remove(k);
+                }
+                if let Some(meta) = o.get_mut("meta").and_then(Value::as_object_mut) {
+                    meta.remove(META_EARLY_MS);
+                }
+                alike(fx, &ids, &v.to_string())
+            })
+            .collect()
+    }
+
+    /// What the model is shown from the records, alike between runs.
+    fn woven(fx: &Fx) -> Value {
+        let rs = fx.sink.records();
+        alike(fx, &ids_of(&rs), &serde_json::to_string(&weave(&rs).messages).unwrap())
+    }
+
+    #[tokio::test]
+    async fn reads_start_while_the_reply_streams_and_nothing_recorded_changes() {
+        // The bash call's arguments come in three pieces, 60 ms apart, after a pause.
+        let bash = other_call("bash", json!({ "command": "echo reads-start-while-the-reply-streams-in" }));
+        let reply = || {
+            Reply::tools([read_call("a.txt"), read_call("b.txt"), bash.clone()])
+                .with_pause_before_call(2, 400)
+                .with_delay_ms(60)
+        };
+        let script = || vec![reply().into(), Reply::text("done").into()];
+        let (on, seen_on, counts_on) = early_run(true, script()).await;
+        let (off, seen_off, counts_off) = early_run(false, script()).await;
+        // Pieces of the bash call's arguments among the first `upto` stream events the sink was given.
+        let bash_pieces = |fx: &Fx, upto: usize| {
+            let deltas = fx.sink.deltas.lock().unwrap();
+            deltas.iter().take(upto).filter(|(_, e)| matches!(e, StreamEvent::ToolCallArgs { index: 2, .. })).count()
+        };
+        let whole = bash_pieces(&on, usize::MAX);
+        assert_eq!((whole, bash_pieces(&off, usize::MAX)), (3, 3));
+        // Both reads began while the bash call was still streaming in, so before the reply was complete
+        // and recorded; without early starts, after it was recorded.
+        assert_eq!(seen_on.paths(), ["a.txt", "b.txt"]);
+        for (path, replies, deltas) in seen_on.began.lock().unwrap().iter() {
+            assert_eq!(*replies, 0, "{path}");
+            assert!(bash_pieces(&on, *deltas) < whole, "{path} began once the bash call had streamed in");
+        }
+        assert_eq!(seen_off.paths(), ["a.txt", "b.txt"]);
+        assert!(seen_off.began.lock().unwrap().iter().all(|(_, replies, _)| *replies == 1));
+        assert_eq!(counts_of(&counts_on), (2, 2, 0));
+        assert_eq!(counts_of(&counts_off), (0, 0, 0));
+        let rs = on.sink.records();
+        assert_eq!(early_marks(&rs), [true, true, false]);
+        assert!(early_marks(&off.sink.records()).iter().all(|m| !m));
+        // The records and what the model sees are those of the run without early starts.
+        assert_eq!(comparable(&on), comparable(&off));
+        assert_eq!(woven(&on), woven(&off));
+        let calls: Vec<ToolCall> = rs
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ToolCall(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        let res = results(&rs);
+        for (call, result) in calls.iter().zip(&res) {
+            assert_eq!(call.call_id, result.call_id);
+            // The server's id, which the call keeps without early starts too.
+            assert!(call.call_id.0.starts_with("chatcmpl-tool-"), "{}", call.call_id.0);
+        }
+        assert!(res[0].text.contains("alpha") && res[1].text.contains("beta"), "{}", res[0].text);
+        assert_no_cache_break(&rs);
+        assert_no_cache_break(&off.sink.records());
+        // What the early reads saw counts once they are claimed.
+        for f in ["a.txt", "b.txt"] {
+            assert_eq!(on.ctx.files.check(&on.ctx.workspace.join(f)).unwrap(), loom_tools::files::Freshness::Current);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_voids_the_early_calls_of_the_broken_attempt() {
+        let write = other_call("write", json!({ "path": "a.txt", "content": "changed\n" }));
+        let after = || vec![Reply::tools([write.clone()]).into(), Reply::text("ok").into()];
+        // The first attempt breaks just after the second call has begun, which makes the first ready.
+        let broken = Action::DropAfter { reply: Reply::tools([read_call("a.txt"), read_call("c.txt")]), chunks: 4 };
+        let mut script = vec![broken, Reply::tools([read_call("b.txt")]).into()];
+        script.extend(after());
+        let (fx, witness, counts) = early_run(true, script).await;
+        assert!(witness.paths().contains(&"a.txt".to_string()), "a.txt was read early: {:?}", witness.paths());
+        assert_eq!(counts_of(&counts), (2, 1, 1));
+        let rs = fx.sink.records();
+        let resp = rs.iter().find_map(|r| match &r.event {
+            Event::ModelResponse(m) => Some(m.clone()),
+            _ => None,
+        });
+        assert_eq!(resp.unwrap().attempts, 2);
+        let calls: Vec<String> = rs
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ToolCall(c) => Some(format!("{} {}", c.name, c.args)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[0].starts_with("read") && calls[0].contains("b.txt"), "{calls:?}");
+        let res = results(&rs);
+        assert_eq!(res[1].status, ToolStatus::Error);
+        assert_eq!(std::fs::read_to_string(fx.ctx.workspace.join("a.txt")).unwrap(), "alpha\n");
+        let a = fx.ctx.workspace.join("a.txt");
+        assert_eq!(fx.ctx.files.check(&a).unwrap(), loom_tools::files::Freshness::Unread);
+        // Refused exactly as in a session that never read a.txt.
+        let mut script = vec![Reply::tools([read_call("b.txt")]).into()];
+        script.extend(after());
+        let (plain, _, _) = early_run(true, script).await;
+        assert_eq!(results(&plain.sink.records())[1].text, res[1].text);
+    }
+
+    #[tokio::test]
+    async fn a_call_after_one_that_may_not_start_early_waits_for_its_turn() {
+        let bash = other_call("bash", json!({ "command": "echo x" }));
+        let write = other_call("write", json!({ "path": "new.txt", "content": "n\n" }));
+        // The first read is ready while the reply streams, but it must see what bash did.
+        let reply = Reply::tools([bash, read_call("a.txt"), read_call("b.txt")]).with_delay_ms(20);
+        let (fx, _, counts) = early_run(true, vec![reply.into(), Reply::text("ok").into()]).await;
+        assert_eq!(counts_of(&counts), (0, 0, 0));
+        assert_eq!(early_marks(&fx.sink.records()), [false, false, false]);
+        let reply = Reply::tools([read_call("a.txt"), write, read_call("b.txt")]).with_delay_ms(20);
+        let (fx, _, counts) = early_run(true, vec![reply.into(), Reply::text("ok").into()]).await;
+        assert_eq!(counts_of(&counts), (1, 1, 0));
+        assert_eq!(early_marks(&fx.sink.records()), [true, false, false]);
+    }
+
+    #[tokio::test]
+    async fn an_early_call_the_finished_reply_holds_differently_is_dropped_and_runs_in_place() {
+        // The first call's arguments get one more character after the second call has begun.
+        let reply = || Reply::tools([read_call("a.txt"), read_call("b.txt")]).with_late_args(0, " ").with_delay_ms(20);
+        let (on, witness, counts) = early_run(true, vec![reply().into(), Reply::text("ok").into()]).await;
+        let (off, _, _) = early_run(false, vec![reply().into(), Reply::text("ok").into()]).await;
+        // a.txt early and dropped, then in place; b.txt with the rest of the reply's reads.
+        assert_eq!(counts_of(&counts), (2, 1, 1));
+        assert_eq!(early_marks(&on.sink.records()), [false, true]);
+        assert_eq!(witness.paths().iter().filter(|p| *p == "a.txt").count(), 2, "{:?}", witness.paths());
+        let rs = on.sink.records();
+        let args = rs.iter().find_map(|r| match &r.event {
+            Event::ModelResponse(m) => Some(m.tool_calls[0].arguments.clone()),
+            _ => None,
+        });
+        assert_eq!(args.unwrap(), format!("{} ", json!({ "path": "a.txt" })));
+        assert_eq!(comparable(&on), comparable(&off));
+    }
+
+    #[tokio::test]
+    async fn unknown_tools_and_invalid_arguments_are_not_started_early_and_answer_as_before() {
+        let reply = || {
+            Reply::tools([
+                other_call("read", json!({})),
+                read_call("a.txt"),
+                other_call("nosuch", json!({ "x": 1 })),
+                other_call("glob", json!({ "pattern": "*" })),
+                other_call("bash", json!({ "command": "echo x" })),
+            ])
+            .with_delay_ms(20)
+        };
+        let (on, _, counts) = early_run(true, vec![reply().into(), Reply::text("ok").into()]).await;
+        let (off, _, _) = early_run(false, vec![reply().into(), Reply::text("ok").into()]).await;
+        // Only the valid read: the invalid one is answered in its turn, and nothing after the unknown
+        // tool starts early.
+        assert_eq!(counts_of(&counts), (1, 1, 0));
+        let rs = on.sink.records();
+        assert_eq!(early_marks(&rs), [false, true, false, false, false]);
+        let res = results(&rs);
+        assert_eq!((res[0].status, res[2].status), (ToolStatus::Invalid, ToolStatus::Invalid));
+        assert!(res[2].text.contains("There is no tool named `nosuch`"), "{}", res[2].text);
+        assert_eq!(comparable(&on), comparable(&off));
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_the_reply_streams_ends_its_early_calls_with_the_turn() {
+        let calls = [read_call("a.txt"), read_call("b.txt"), other_call("bash", json!({ "command": "echo x" }))];
+        let reply = Reply::tools(calls).with_pause_before_call(2, 20_000);
+        let mut fx = Fx::new("chat", false, false, seq(vec![reply.into()])).await;
+        let witness = Witness::default();
+        let mut session = fx.create();
+        session.registry.add(Arc::new(Probe { sink: None, witness: witness.clone(), hold: true }));
+        let counts = session.early_counts.clone();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        for _ in 0..800 {
+            if witness.live() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(witness.paths(), ["a.txt"], "the first read runs while the reply streams");
+        fx.control.stop_turn();
+        wait_until(&fx.sink, "turn end", |rs| count(rs, "turn_end") == 1).await;
+        assert_eq!(witness.live(), 0, "no early call outlives the turn");
+        let rs = fx.sink.records();
+        assert_eq!(&kinds(&rs)[rs.len() - 2..], ["interrupted", "turn_end"]);
+        assert_eq!(count(&rs, "tool_call") + count(&rs, "tool_result"), 0);
+        assert_eq!(counts_of(&counts), (1, 0, 1));
+        assert_eq!(finish_task(tx, task).await, End::Closed);
+    }
+
+    /// The early calls of one request, over a registry whose `read` is a probe that holds until it is
+    /// cancelled, in a session whose log has the call id `logged`.
+    fn held_early(witness: &Witness) -> (Early, Arc<Mutex<EarlyCounts>>, TestEnv) {
+        let env = loom_tools::testutil::env();
+        let mut registry = Registry::new();
+        registry.add(Arc::new(Probe { sink: None, witness: witness.clone(), hold: true }));
+        let counts = Arc::default();
+        let logged = HashSet::from(["logged".to_string()]);
+        let early = Early::new(true, registry, env.ctx.clone(), &CancellationToken::new(), logged, Arc::clone(&counts));
+        (early, counts, env)
+    }
+
+    fn ready(index: u32) -> StreamEvent {
+        ready_as(index, None)
+    }
+
+    /// `read` of `f{index}` is ready, with the server's id `id`.
+    fn ready_as(index: u32, id: Option<&str>) -> StreamEvent {
+        let arguments = json!({ "path": format!("f{index}") }).to_string();
+        StreamEvent::ToolCallReady { index, id: id.map(str::to_string), name: "read".into(), arguments }
+    }
+
+    /// Wait, four seconds at most, until `f` holds.
+    async fn until(f: impl Fn() -> bool) {
+        for _ in 0..800 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_attempt_voids_what_the_earlier_one_started() {
+        let witness = Witness::default();
+        let (mut early, counts, _env) = held_early(&witness);
+        early.on_event(&StreamEvent::AttemptStart { attempt: 1 });
+        early.on_event(&ready(0));
+        let first = early.runs[&0].ctx.call_id.clone();
+        early.on_event(&StreamEvent::AttemptStart { attempt: 2 });
+        assert!(early.runs.is_empty());
+        assert_eq!(counts_of(&counts), (1, 0, 1));
+        // The new attempt starts again from its own first call, under a new id.
+        early.on_event(&ready(0));
+        assert_ne!(early.runs[&0].ctx.call_id, first);
+        early.discard().await;
+        assert_eq!(witness.live(), 0);
+        assert_eq!(counts_of(&counts), (2, 0, 2));
+    }
+
+    #[tokio::test]
+    async fn at_most_eight_early_calls_run_at_once() {
+        let witness = Witness::default();
+        let (mut early, counts, _env) = held_early(&witness);
+        for i in 0..10 {
+            early.on_event(&ready(i));
+        }
+        assert_eq!(early.runs.keys().copied().collect::<Vec<_>>(), (0..8).collect::<Vec<_>>());
+        until(|| witness.live() == 8).await;
+        assert_eq!(witness.peak.load(std::sync::atomic::Ordering::SeqCst), 8);
+        // Once one has ended, a call that is ready next starts.
+        early.runs[&0].ctx.cancel.cancel();
+        until(|| early.runs[&0].task.handle.is_finished()).await;
+        early.on_event(&ready(10));
+        assert!(early.runs.contains_key(&10));
+        assert_eq!(counts_of(&counts), (9, 0, 0));
+        early.discard().await;
+        assert_eq!(witness.live(), 0);
+        assert_eq!(counts_of(&counts), (9, 0, 9));
+    }
+
+    #[tokio::test]
+    async fn early_calls_a_new_attempt_dropped_count_until_they_have_ended() {
+        let witness = Witness::default();
+        let (mut early, counts, _env) = held_early(&witness);
+        for i in 0..8 {
+            early.on_event(&ready(i));
+        }
+        until(|| witness.live() == 8).await;
+        // The new attempt stops them, but none has ended before the runtime gets to it.
+        early.on_event(&StreamEvent::AttemptStart { attempt: 2 });
+        early.on_event(&ready(0));
+        assert!(early.runs.is_empty());
+        until(|| early.dropped.iter().all(|t| t.handle.is_finished())).await;
+        early.on_event(&ready(1));
+        assert_eq!(early.runs.keys().copied().collect::<Vec<_>>(), [1]);
+        early.discard().await;
+        assert_eq!(witness.live(), 0);
+        assert_eq!(counts_of(&counts), (9, 0, 9));
+    }
+
+    #[tokio::test]
+    async fn an_early_call_starts_under_the_id_it_will_keep() {
+        let witness = Witness::default();
+        let (mut early, _, _env) = held_early(&witness);
+        for (i, id) in [Some("s0"), Some("logged"), Some("s0"), None, Some("")].into_iter().enumerate() {
+            early.on_event(&ready_as(u32::try_from(i).unwrap(), id));
+        }
+        let ids: Vec<String> = early.runs.values().map(|r| r.ctx.call_id.0.clone()).collect();
+        // The server's id, unless the log or an earlier call of the attempt has it, or there is none.
+        assert_eq!(ids.len(), 5);
+        assert_eq!(ids[0], "s0");
+        assert!(ids[1..].iter().all(|id| id.starts_with("call-")), "{ids:?}");
+        assert_eq!(ids.iter().collect::<HashSet<_>>().len(), 5);
+        // A new attempt may use the server's id again.
+        early.on_event(&StreamEvent::AttemptStart { attempt: 2 });
+        until(|| early.dropped.iter().all(|t| t.handle.is_finished())).await;
+        early.on_event(&ready_as(0, Some("s0")));
+        assert_eq!(early.runs[&0].ctx.call_id.0, "s0");
+        early.discard().await;
+    }
+
+    #[tokio::test]
+    async fn a_claim_given_up_while_it_waits_stops_the_early_call() {
+        let witness = Witness::default();
+        let (mut early, _, env) = held_early(&witness);
+        early.on_event(&ready(0));
+        until(|| witness.live() == 1).await;
+        let run = early.runs.remove(&0).unwrap();
+        let call =
+            ToolCallRequest { call_id: run.ctx.call_id.clone(), name: "read".into(), arguments: run.arguments.clone(), complete: true };
+        let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
+        let session = fx.create();
+        // The claim waits on a call that holds until it is cancelled; the session's future is dropped
+        // (as when the runtime shuts down) and the turn's token is never cancelled.
+        let claim = session.claim_early(run, &early, &env.ctx, &call);
+        assert!(tokio::time::timeout(Duration::from_millis(50), claim).await.is_err());
+        until(|| witness.live() == 0).await;
+        assert_eq!(witness.live(), 0, "the early call was left running");
+    }
+
+    #[test]
+    fn no_runtime_tool_starts_early() {
+        let rig = crate::rtools::testkit::rig("lead", false, true);
+        for name in crate::rtools::NAMES {
+            assert!(!crate::rtools::tool(name, &rig.shared).unwrap().speculative(), "{name}");
+        }
     }
 
     // ---- children ----------------------------------------------------------------------------

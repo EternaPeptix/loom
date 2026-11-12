@@ -109,6 +109,10 @@ impl Tool for OutRead {
         )
     }
 
+    fn speculative(&self) -> bool {
+        true
+    }
+
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let handle = string(args, "handle");
         let id = match resolve(ctx, handle) {
@@ -151,6 +155,10 @@ impl Tool for OutGrep {
                 params::opt("ignore_case", "boolean", "Match case-insensitively (default false)."),
             ],
         )
+    }
+
+    fn speculative(&self) -> bool {
+        true
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {

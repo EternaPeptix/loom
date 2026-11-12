@@ -364,6 +364,10 @@ impl Tool for Read {
         )
     }
 
+    fn speculative(&self) -> bool {
+        true
+    }
+
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let given = string(args, "path");
         let path = match checked(ctx, given, false) {

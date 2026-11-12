@@ -13,9 +13,11 @@
 //!     `assemble::fixtures`): a first chunk with `{"role":"assistant","content":""}`; reasoning split
 //!     into pieces under `reasoning`; text split into pieces under `content`; each tool call as a
 //!     chunk carrying `id`/`type`/`index`/`function.name` followed by its arguments split into
-//!     pieces; a chunk with `finish_reason`; a usage-only chunk; `data: [DONE]`. Pieces are at most
+//!     pieces; the pieces of `reply.late_args`, each for the call it names, after every call has
+//!     begun; a chunk with `finish_reason`; a usage-only chunk; `data: [DONE]`. Pieces are at most
 //!     `reply.piece_chars` characters (default 24), split on character boundaries, with
-//!     `reply.delay_ms` between chunks (default 0).
+//!     `reply.delay_ms` between chunks (default 0) and `reply.call_pauses` before the first chunk of
+//!     the calls they name.
 //!   - `Action::Status { status, body, retry_after_s }`: that HTTP status with the body verbatim.
 //!   - `Action::DropAfter { reply, chunks }`: as `Reply` but the connection is closed after that
 //!     many chunks, without `[DONE]`.
@@ -79,6 +81,11 @@ pub struct Reply {
     pub usage: Option<Usage>,
     pub piece_chars: usize,
     pub delay_ms: u64,
+    /// `(index of a tool call, ms)`: a pause before that call's first chunk.
+    pub call_pauses: Vec<(usize, u64)>,
+    /// `(index of a tool call, piece)`: arguments sent for that call once every call has begun, just
+    /// before the finish chunk. The call's arguments are its text in `tool_calls` followed by these.
+    pub late_args: Vec<(usize, String)>,
 }
 
 impl Reply {
@@ -91,6 +98,8 @@ impl Reply {
             usage: None,
             piece_chars: 24,
             delay_ms: 0,
+            call_pauses: Vec::new(),
+            late_args: Vec::new(),
         }
     }
 
@@ -128,6 +137,18 @@ impl Reply {
 
     pub fn with_delay_ms(mut self, delay_ms: u64) -> Reply {
         self.delay_ms = delay_ms;
+        self
+    }
+
+    /// Pause `ms` before the first chunk of tool call `index`.
+    pub fn with_pause_before_call(mut self, index: usize, ms: u64) -> Reply {
+        self.call_pauses.push((index, ms));
+        self
+    }
+
+    /// Send `piece` for tool call `index` after every call has begun (see `late_args`).
+    pub fn with_late_args(mut self, index: usize, piece: impl Into<String>) -> Reply {
+        self.late_args.push((index, piece.into()));
         self
     }
 }
@@ -409,13 +430,13 @@ async fn chat(AxState(app): AxState<App>, headers: HeaderMap, body: Bytes) -> Re
             error_response(status, body, retry_after_s)
         }
         Action::Reply(reply) => {
-            let all = payloads(&reply, prompt, cached, &model, n);
-            sse(plan(&all, reply.delay_ms), &app.token)
+            let (all, pauses) = payloads(&reply, prompt, cached, &model, n);
+            sse(plan(&all, reply.delay_ms, &pauses), &app.token)
         }
         Action::DropAfter { reply, chunks } => {
-            let all = payloads(&reply, prompt, cached, &model, n);
+            let (all, pauses) = payloads(&reply, prompt, cached, &model, n);
             let kept = all.get(..chunks.min(all.len())).unwrap_or(&[]);
-            let mut steps = plan(kept, reply.delay_ms);
+            let mut steps = plan(kept, reply.delay_ms, &pauses);
             // Let the status line and the chunks already queued reach the wire before the abort, so
             // the client sees a truncated body rather than a failed request.
             steps.push_back(Step::Sleep(25));
@@ -423,19 +444,19 @@ async fn chat(AxState(app): AxState<App>, headers: HeaderMap, body: Bytes) -> Re
             sse(steps, &app.token)
         }
         Action::Eof { reply, chunks } => {
-            let all = payloads(&reply, prompt, cached, &model, n);
+            let (all, pauses) = payloads(&reply, prompt, cached, &model, n);
             let kept = all.get(..chunks.min(all.len())).unwrap_or(&[]);
-            sse(plan(kept, reply.delay_ms), &app.token)
+            sse(plan(kept, reply.delay_ms, &pauses), &app.token)
         }
         Action::StreamError { message } => {
-            let first = payloads(&Reply::text(""), prompt, cached, &model, n);
+            let (first, _) = payloads(&Reply::text(""), prompt, cached, &model, n);
             let mut all: Vec<String> = first.into_iter().take(1).collect();
             all.push(json!({"error": {"message": message, "type": "InternalServerError", "code": 500}}).to_string());
-            sse(plan(&all, 0), &app.token)
+            sse(plan(&all, 0, &[]), &app.token)
         }
         Action::Stall { ms } => {
-            let first = payloads(&Reply::text(""), prompt, cached, &model, n);
-            let mut steps = plan(first.get(..1).unwrap_or(&[]), 0);
+            let (first, _) = payloads(&Reply::text(""), prompt, cached, &model, n);
+            let mut steps = plan(first.get(..1).unwrap_or(&[]), 0, &[]);
             steps.push_back(Step::Sleep(ms));
             steps.push_back(Step::Fail);
             sse(steps, &app.token)
@@ -450,11 +471,16 @@ enum Step {
     Fail,
 }
 
-fn plan(payloads: &[String], delay_ms: u64) -> VecDeque<Step> {
+/// The steps that send `payloads`: `delay_ms` between them, and each pause of `pauses` (position of the
+/// payload it precedes, ms) before its payload.
+fn plan(payloads: &[String], delay_ms: u64, pauses: &[(usize, u64)]) -> VecDeque<Step> {
     let mut steps = VecDeque::new();
     for (i, p) in payloads.iter().enumerate() {
         if i > 0 && delay_ms > 0 {
             steps.push_back(Step::Sleep(delay_ms));
+        }
+        for (_, ms) in pauses.iter().filter(|(at, _)| *at == i) {
+            steps.push_back(Step::Sleep(*ms));
         }
         steps.push_back(Step::Data(Bytes::from(format!("data: {p}\n\n"))));
     }
@@ -497,8 +523,9 @@ fn finish_name(f: FinishReason) -> String {
     serde_json::to_value(f).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "stop".to_string())
 }
 
-/// The data payloads of a full reply stream, in order, ending with `[DONE]`.
-fn payloads(reply: &Reply, prompt: u64, cached: u64, model: &str, n: usize) -> Vec<String> {
+/// The data payloads of a full reply stream, in order, ending with `[DONE]`, and the reply's call
+/// pauses as (position of the payload they precede, ms).
+fn payloads(reply: &Reply, prompt: u64, cached: u64, model: &str, n: usize) -> (Vec<String>, Vec<(usize, u64)>) {
     let id = format!("chatcmpl-mock-{n}");
     let chunk = |delta: Value, finish: Option<String>| -> String {
         json!({
@@ -514,8 +541,10 @@ fn payloads(reply: &Reply, prompt: u64, cached: u64, model: &str, n: usize) -> V
     for p in pieces(&reply.text, reply.piece_chars) {
         out.push(chunk(json!({"content": p}), None));
     }
+    let mut pauses = Vec::new();
     for (index, (name, args)) in reply.tool_calls.iter().enumerate() {
         let call_id = format!("chatcmpl-tool-{:016x}", rand::random::<u64>());
+        pauses.extend(reply.call_pauses.iter().filter(|(at, _)| *at == index).map(|(_, ms)| (out.len(), *ms)));
         out.push(chunk(
             json!({"tool_calls": [{"id": call_id, "type": "function", "index": index, "function": {"name": name}}]}),
             None,
@@ -524,13 +553,17 @@ fn payloads(reply: &Reply, prompt: u64, cached: u64, model: &str, n: usize) -> V
             out.push(chunk(json!({"tool_calls": [{"index": index, "function": {"arguments": p}}]}), None));
         }
     }
+    for (index, piece) in &reply.late_args {
+        out.push(chunk(json!({"tool_calls": [{"index": index, "function": {"arguments": piece}}]}), None));
+    }
     let default_finish = if reply.tool_calls.is_empty() { FinishReason::Stop } else { FinishReason::ToolCalls };
     out.push(chunk(json!({}), Some(finish_name(reply.finish.unwrap_or(default_finish)))));
 
     let usage = reply.usage.unwrap_or_else(|| {
         let output: usize = reply.text.chars().count()
             + reply.reasoning.chars().count()
-            + reply.tool_calls.iter().map(|(a, b)| a.chars().count() + b.chars().count()).sum::<usize>();
+            + reply.tool_calls.iter().map(|(a, b)| a.chars().count() + b.chars().count()).sum::<usize>()
+            + reply.late_args.iter().map(|(_, p)| p.chars().count()).sum::<usize>();
         Usage {
             prompt_tokens: prompt,
             cached_tokens: cached,
@@ -552,7 +585,7 @@ fn payloads(reply: &Reply, prompt: u64, cached: u64, model: &str, n: usize) -> V
         .to_string(),
     );
     out.push("[DONE]".to_string());
-    out
+    (out, pauses)
 }
 
 #[cfg(test)]
@@ -795,6 +828,48 @@ mod tests {
         // role + 3 content + finish + usage + DONE = 7 chunks, 6 gaps.
         assert_eq!(events(&body).len(), 7);
         assert!(started.elapsed() >= Duration::from_millis(230));
+    }
+
+    #[tokio::test]
+    async fn a_pause_before_a_call_and_late_arguments() {
+        let reply = Reply::tools([("read", r#"{"path": "a"}"#), ("bash", "{}")])
+            .with_pause_before_call(1, 300)
+            .with_late_args(0, " ")
+            .with_late_args(1, "\n");
+        let s = server(vec![reply.into()]).await;
+        let started = Instant::now();
+        let mut resp = post_chat(&s, msgs(&["hi"])).await;
+        let mut text = String::new();
+        // The body chunk (counted from 1) in which the first call is whole, and the one in which the
+        // second call begins.
+        let (mut chunks, mut first_call_done, mut second_call_begun) = (0usize, None, None);
+        while let Some(c) = resp.chunk().await.expect("chunk") {
+            chunks += 1;
+            text.push_str(std::str::from_utf8(&c).expect("utf8"));
+            if first_call_done.is_none() && text.contains(r#"\"a\"}"#) {
+                first_call_done = Some(chunks);
+            }
+            if second_call_begun.is_none() && text.contains(r#""name":"bash""#) {
+                second_call_begun = Some(chunks);
+            }
+        }
+        let total = started.elapsed();
+        // The first call is whole before the pause; the second call starts after it.
+        let (done, begun) = (first_call_done.expect("first call"), second_call_begun.expect("second call"));
+        assert!(done < begun, "the first call was whole in body chunk {done}, the second began in {begun}");
+        assert!(total >= Duration::from_millis(290), "{total:?}");
+        let mut args = [String::new(), String::new()];
+        let mut order = Vec::new();
+        for c in parsed(&text) {
+            for tc in c["choices"][0]["delta"]["tool_calls"].as_array().into_iter().flatten() {
+                let i = usize::try_from(tc["index"].as_u64().expect("index")).expect("usize");
+                order.push(i);
+                args[i].push_str(tc["function"]["arguments"].as_str().unwrap_or(""));
+            }
+        }
+        assert_eq!(args, [r#"{"path": "a"} "#.to_string(), "{}\n".to_string()]);
+        // The late pieces come after both calls have begun, in the order given.
+        assert_eq!(&order[order.len() - 2..], [0, 1]);
     }
 
     async fn usage_of(s: &MockServer, body: Value) -> Value {

@@ -20,7 +20,9 @@
 //! `note(path, bytes)` records the content just read or written; `note_stat(path, meta)` records a
 //! file read by range. `Seen::of_bytes` / `Seen::of_stat` make the same records without storing them
 //! and `record(path, seen)` stores one, for a caller that reads on one thread and decides on another
-//! whether the read counts. `forget(path)` drops the entry.
+//! whether the read counts. `forget(path)` drops the entry. `move_into(other)` moves every entry into
+//! another tracker: a call run ahead of its turn reads into a tracker of its own, and what it saw
+//! counts for the session only once the call is claimed.
 //! State is in memory only: after a restart every file is `Unread` until read again.
 //!
 //! `open_regular` is how the file tools open a file to read it: only a regular file is opened, and
@@ -158,6 +160,15 @@ impl FileTracker {
 
     pub fn forget(&self, path: &Path) {
         self.map().remove(path);
+    }
+
+    /// Move every record of this tracker into `into`, in no particular order (a tracker holds one
+    /// record per path), as if each had been recorded there now. This tracker is left empty.
+    pub fn move_into(&self, into: &FileTracker) {
+        let staged: Vec<(PathBuf, Seen)> = self.map().drain().collect();
+        for (path, seen) in staged {
+            into.record(&path, seen);
+        }
     }
 
     /// [`FileTracker::freshness`] with the failure as an `io::Error`. A path that is not a regular
@@ -314,6 +325,25 @@ mod tests {
         t.forget(&p);
         assert_eq!(t.check(&p).unwrap(), Freshness::Unread);
         t.forget(&p);
+    }
+
+    #[test]
+    fn staged_records_count_only_once_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
+        std::fs::write(&a, "new").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let session = FileTracker::new();
+        session.note(&a, b"old");
+        let staged = FileTracker::new();
+        staged.note(&a, b"new");
+        staged.note(&b, b"b");
+        assert_eq!(session.check(&a).unwrap(), Freshness::Changed { was_bytes: 3, now_bytes: 3 });
+        assert_eq!(session.check(&b).unwrap(), Freshness::Unread);
+        staged.move_into(&session);
+        assert_eq!(session.check(&a).unwrap(), Freshness::Current);
+        assert_eq!(session.check(&b).unwrap(), Freshness::Current);
+        assert_eq!(staged.check(&b).unwrap(), Freshness::Unread);
     }
 
     #[test]

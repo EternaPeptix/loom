@@ -891,6 +891,8 @@ impl Sink for SinkImpl {
                 StreamEvent::Retrying { attempt, after_ms, reason } => {
                     Delta::Retrying { attempt: *attempt, after_ms: *after_ms, reason: reason.clone() }
                 }
+                // For the session only: viewers already have the call from its start and arguments.
+                StreamEvent::ToolCallReady { .. } => return,
             };
             inner.publish(BusEvent::Delta { session: session.clone(), req_id: req_id.to_string(), delta });
         }

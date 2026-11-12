@@ -40,6 +40,13 @@ stall_steps = 12
 verify_finish = true       # attack a lead's finish with an independent verifier first
 unviewed_min_lines = 80
 
+[tools]
+# Run the read-only calls at the start of a reply (read, glob, grep, out_read, out_grep) as soon as
+# each has streamed in, while the model is still writing the rest; results are still recorded in
+# call order and are only used if the finished reply holds the same call. false = run calls only
+# after the whole reply has arrived.
+speculate = true
+
 [sandbox]
 mode = "seatbelt"          # "seatbelt" (macOS) or "none" (reported loudly)
 loopback_all = false
