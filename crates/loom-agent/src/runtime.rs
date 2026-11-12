@@ -3945,7 +3945,6 @@ mod tests {
     use loom_core::event::InboxKind;
     use loom_model::mock::{Action, MockServer, Reply, Script};
     use serde_json::{json, Value};
-    use std::sync::atomic::AtomicUsize;
 
     const WAIT: Duration = Duration::from_secs(30);
 
@@ -4991,17 +4990,13 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_finish_with_real_children_returns_the_objections_and_the_work_continues() {
-        let verdicts = Arc::new(AtomicUsize::new(0));
-        let v = verdicts.clone();
         let e = env_with(
             Script::new(move |body, _| {
-                if !has_tool(body, "verdict") {
-                    return finish("lead done");
+                if has_tool(body, "verdict") {
+                    return verifier_turn(body, false);
                 }
-                if shown_handle(body).is_some() {
-                    return verifier_turn(body, v.fetch_add(1, Ordering::SeqCst) > 0);
-                }
-                verifier_turn(body, false)
+                // The lead finishes once, reads the rejection, and goes on working.
+                if tool_msgs(body) == 0 { finish("lead done") } else { Action::Stall { ms: 600_000 } }
             }),
             false,
             |c| c.agents.verify_finish = true,
@@ -5009,29 +5004,35 @@ mod tests {
         .await;
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         let id = info.meta.id.clone();
-        until("finished item", || inbox_kinds(&e).contains(&InboxKind::Finished)).await;
+        until("the lead saw the objection", || {
+            e.server.requests().iter().any(|b| has_tool(b, "finish") && mentions(b, "did not accept it") && mentions(b, "no test ran"))
+        })
+        .await;
         let ledger = e.rt.ledger(&info.meta.mission).unwrap();
         let verdicts: Vec<Option<bool>> = ledger.state.finishes.iter().map(|f| f.accepted).collect();
-        assert_eq!(verdicts, vec![Some(false), Some(true)]);
+        assert_eq!(verdicts, vec![Some(false)]);
         assert_eq!(ledger.state.finishes[0].objections, vec!["no test ran".to_string()]);
-        let lead_saw_objection = e.server.requests().iter().any(|b| {
-            has_tool(b, "finish") && mentions(b, "did not accept it") && mentions(b, "no test ran")
-        });
-        assert!(lead_saw_objection);
-        assert_eq!(e.children(&id).len(), 2);
+        // The objection is an open obligation until new execution evidence is recorded after it.
+        assert_eq!(ledger.state.obligations.len(), 1);
+        assert_eq!(ledger.state.obligations[0].kind, loom_core::ledger::ObligationKind::Objection);
+        assert!(ledger.state.obligations[0].outcome.is_none());
+        assert!(e.rt.inbox().is_empty(), "a rejection never reaches the operator");
+        assert_eq!(e.children(&id).len(), 1);
         e.rt.shutdown().await;
     }
 
     #[tokio::test]
-    async fn finish_whose_verifier_cannot_be_started_delivers_nothing_and_opens_a_blocking_item() {
+    async fn finish_whose_verifier_cannot_be_started_is_held_and_never_opens_a_blocking_item() {
         let e = env_with(
-            Script::new(|body, n| {
+            Script::new(|body, _| {
                 if has_tool(body, "verdict") {
                     verifier_turn(body, true)
-                } else if n == 0 {
-                    call("bash", json!({"command": "cd .. && rm -rf ws"}))
                 } else {
-                    finish("lead done")
+                    match tool_msgs(body) {
+                        0 => call("bash", json!({"command": "cd .. && rm -rf ws"})),
+                        1 => finish("lead done"),
+                        _ => Action::Stall { ms: 600_000 },
+                    }
                 }
             }),
             false,
@@ -5040,60 +5041,14 @@ mod tests {
         .await;
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         let id = info.meta.id.clone();
-        until("blocking item", || inbox_kinds(&e).contains(&InboxKind::Blocker)).await;
-        let item = e.rt.inbox().remove(0).item;
-        assert!(item.blocking);
-        assert!(item.text.starts_with("NOT VERIFIED - VERIFICATION COULD NOT BE RUN"), "{}", item.text);
-        assert!(item.text.contains("lead done") && item.text.contains("workspace"), "{}", item.text);
-        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
-        assert!(e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Blocked })));
+        until("the lead was told the verifier could not be run", || {
+            e.server.requests().iter().any(|b| mentions(b, "could not be verified") && mentions(b, "workspace"))
+        })
+        .await;
+        assert!(e.rt.inbox().is_empty(), "verification trouble never reaches the operator: {:?}", inbox_kinds(&e));
+        assert!(!e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Blocked })));
         assert!(!e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished })));
-        assert!(!inbox_kinds(&e).contains(&InboxKind::Finished));
         assert!(e.server.requests().iter().all(|b| !has_tool(b, "verdict")));
-        e.rt.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn rejection_cap_escalates_and_verification_runs_again_after_the_operator_answers() {
-        let verdicts = Arc::new(AtomicUsize::new(0));
-        let v = verdicts.clone();
-        let said = Arc::new(AtomicUsize::new(0));
-        let s = said.clone();
-        let e = env_with(
-            Script::new(move |body, _| {
-                if !has_tool(body, "verdict") {
-                    return finish(&format!("lead done {}", s.fetch_add(1, Ordering::SeqCst)));
-                }
-                if shown_handle(body).is_some() {
-                    return verifier_turn(body, v.fetch_add(1, Ordering::SeqCst) >= 2);
-                }
-                verifier_turn(body, false)
-            }),
-            false,
-            |c| c.agents.verify_finish = true,
-        )
-        .await;
-        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
-        let id = info.meta.id.clone();
-        until("escalation", || inbox_kinds(&e).contains(&InboxKind::Blocker)).await;
-        let entry = e.rt.inbox().remove(0);
-        assert!(entry.item.blocking);
-        assert!(entry.item.text.starts_with("NOT VERIFIED - REJECTED 2 TIMES"), "{}", entry.item.text);
-        assert!(entry.item.text.matches("- no test ran").count() == 2, "{}", entry.item.text);
-        assert!(entry.item.text.contains("lead done 2"), "{}", entry.item.text);
-        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Blocked }))).await;
-        assert!(!inbox_kinds(&e).contains(&InboxKind::Finished));
-        assert!(!e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished })));
-        assert_eq!(e.children(&id).len(), 2);
-
-        e.rt.answer(&entry.item.item_id, "Keep going: check the lexer too.").await.unwrap();
-        until("finished after the answer", || inbox_kinds(&e).contains(&InboxKind::Finished)).await;
-        assert_eq!(e.children(&id).len(), 3);
-        let ledger = e.rt.ledger(&info.meta.mission).unwrap();
-        let verdicts: Vec<Option<bool>> = ledger.state.finishes.iter().map(|f| f.accepted).collect();
-        assert_eq!(verdicts, vec![Some(false), Some(false), None, Some(true)]);
-        assert_eq!(ledger.state.questions.len(), 1);
-        assert!(ledger.state.questions[0].answer.is_some());
         e.rt.shutdown().await;
     }
 

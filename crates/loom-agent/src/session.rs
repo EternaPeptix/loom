@@ -2544,6 +2544,8 @@ impl Session {
             step: self.st.step.saturating_sub(self.st.budget_step_base),
             started_ms: self.st.budget_from_ms.unwrap_or(self.st.started_ms),
             budget,
+            finish_gated: shared.role.termination == loom_core::event::Termination::Explicit
+                && shared.role.tools.iter().any(|t| t == "conclude"),
         })
     }
 

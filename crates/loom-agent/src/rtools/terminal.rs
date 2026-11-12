@@ -30,33 +30,59 @@
 //! Output: ok, outcome `delivered`, message `Your result was delivered. This session is finished.`
 //!
 //! **In a lead session** (not a child):
-//! 1. `S.ledger()`; `gate::check_finish_lead(&state, answer)`; `Err(text)` → error `text`.
-//! 2. `S.ledger_append(false, FinishClaim { summary: answer, evidence })`; `fid` is the new finish id.
-//! 3. Verification is required when `S.role.verify_finish && S.agents.verify_finish`. When it is not,
-//!    deliver with the note `not verified`. When it is, the result is delivered as `Finished` only after
-//!    a verifier child returned `accepted: true`; every other outcome fails closed (step 5).
-//!    - the rejections counted are those of the finishes after the latest accepted finish and after the
-//!      latest finish whose escalation the operator has answered (`rejection_floor`). When they reach
-//!      `MAX_FINISH_REJECTIONS`: escalate, no verifier is spawned.
-//!    - the verifier is `S.role.verifier` (resolved at pack load), spawned with `SpawnReq { harness:
-//!      true, … }` (not limited by `may_spawn` or `max_children`), brief from [`finish_brief`].
+//! 1. `S.ledger()`. The goal-met pre-gate: when the role's termination is `Explicit` and a goal is set whose
+//!    goal-met claim is `None` or `Open` and the operator has not released the mission
+//!    (`gate::goal_unconcluded`), finish is refused in this step: a `harness_note{Nudge}` and an error with
+//!    `texts::finish_unavailable` (conclude when a run shows the goal met or it cannot be met as stated;
+//!    otherwise note where you are and take the next step; `report_blocker` for what only the operator can
+//!    supply; naming only tools the role has). No finish is recorded, no verifier is started, no inbox item
+//!    is opened, no effect is set. A mission without a goal, and a role with termination `Free`, are not gated.
+//! 2. Open objections are settled (see Objections), then `gate::check_finish_lead(&state, answer)`; `Err(text)`
+//!    -> error `text`.
+//! 3. `S.ledger_append(false, FinishClaim { summary: answer, evidence })`; `fid` is the new finish id.
+//! 4. Verification is required when `S.role.verify_finish && S.agents.verify_finish`. When it is not,
+//!    deliver with the note `not verified`. When the operator released the mission and the goal was never
+//!    concluded, no verifier is started and the note is `closed by operator, goal not established`. When it is
+//!    required, the result is delivered as `Finished` only after a verifier child returned `accepted: true`;
+//!    every other outcome fails closed (step 6), and none of them asks the operator.
+//!    - the verifier is `S.role.verifier` (resolved at pack load), spawned with `SpawnReq {
+//!      harness: true, ... }` (not limited by `may_spawn` or `max_children`), brief from [`finish_brief`].
 //!    - cancelled while spawning or joining: error `Interrupted while the result was being verified;
 //!      nothing was delivered. Call finish again to resume.` The orchestrator answering
 //!      `SHUTTING_DOWN` is treated the same way (error, nothing recorded): the turn is being cut and
 //!      the finish is made, and verified, again after the restart.
-//!    - `accepted: true` → `FinishVerdict` recorded, deliver with `verified by {child}`.
-//!    - `accepted: false` → `FinishVerdict` recorded; error text with the objections and the report, no
-//!      effect (the lead deals with them and calls finish again).
-//!    - any other spawn or join error, or no verdict in the payload: escalate (a verifier that ended
-//!      without a verdict has its report, cut at `REPORT_MAX_CHARS`, added to the item and the result).
-//! 4. Deliver: `InboxItem { kind: Finished, text: "{answer}{support}\n\n[{note}]", blocking: false, … }`
+//!    - `accepted: true` -> `FinishVerdict` recorded, deliver with `verified by {child}`.
+//!    - `accepted: false` -> `FinishVerdict` recorded; one `ObligationOpen { kind: Objection, text: the
+//!      objection, reference: "{fid} (verifier {child})" }` per objection; error text with the objections,
+//!      the report and `texts::FINISH_NOT_ACCEPTED_TAIL`; no effect. When the rejections since the latest
+//!      accepted finish (`rejection_floor`: only an accepted finish moves it) reach `MAX_FINISH_REJECTIONS`,
+//!      a `harness_note{Verdict}` `finish rejected {n} times; continuing` is also written. It is a record,
+//!      not an inbox item: nothing is asked of the operator and the session works on. The verifier is
+//!      still started for later finishes.
+//!    - any other spawn or join error, or no verdict in the payload, is a fault of the harness: a fresh
+//!      verifier is started up to `VERIFIER_RETRIES` (2) more times, waiting `VERIFIER_RETRY_WAIT_MS` between
+//!      attempts. When none could be run, step 6.
+//! 5. Deliver: `InboxItem { kind: Finished, text: "{answer}{support}\n\n[{note}]", blocking: false, ... }`
 //!    where `support` is the lead's `not_established` and its harness-checked quotes, then
-//!    `Effect::EndTurn(Finished)`; ok, outcome `finished — {note}`.
-//! 5. Escalate: a blocking ledger question `Finish {fid} was not delivered: NOT VERIFIED …` and a
-//!    blocking `Blocker` inbox item whose text says why and contains the answer labelled NOT VERIFIED
-//!    (`NOT VERIFIED - REJECTED n TIMES` with every rejection's objections, or `NOT VERIFIED -
-//!    VERIFICATION COULD NOT BE RUN` with the reason); `Effect::EndTurn(Blocked)`. Answering the item
-//!    restarts the rejection count.
+//!    `Effect::EndTurn(Finished)`; ok, outcome `finished - {note}`.
+//! 6. Hold as unverified: the finish stays recorded without a verdict; a `harness_note{Verdict}` labelled an
+//!    infrastructure fault (`texts::verification_fault_notice`) is written; the result is an error
+//!    (`texts::verification_fault_result`, with the verifier's report cut at `REPORT_MAX_CHARS` when it ended
+//!    without a verdict) and no effect. No inbox item and no ledger question is opened, and nothing is
+//!    delivered as verified.
+//!
+//! **Objections.** Before the open-items check, each open `Objection` obligation is settled (`ObligationSettle`)
+//! when an attested evidence record of kind `Execution` was added after it (by journal entry order); the
+//! outcome names the record. When the operator released the mission every open objection is settled. Nothing
+//! else settles one: answering an inbox item, a question, or calling finish again does not. While one is open
+//! `check_finish_lead` refuses finish.
+//!
+//! ## `conclude` (lead)
+//! `status` `met` | `unreachable`, `note`, `evidence`. Refused in a child session. `unreachable` is refused,
+//! with a sentence listing them, while a plan step is open. Writes `GoalMetSet { Supported | Refuted, note,
+//! evidence }`; the ledger's own rules refuse a missing goal, a blank note, evidence that is missing,
+//! unattested, not supporting or static only, and a repeat. Output: ok, outcome `goal concluded: ...`, saying
+//! that `finish` may now be called.
 //!
 //! ## `verdict` (verifier role)
 //! Refused outside a child session: ``verdict` belongs to a verifier working on an assignment.``
@@ -125,27 +151,29 @@
 //! quote, child delivery (effect, report text, payload, long answer stored), refusal while a job or a
 //! child agent is running (lead and child), lead with open items refused, lead accepted with
 //! verification (verdict recorded, inbox item, effect), lead rejected (no effect, objections listed,
-//! finish recorded as not accepted), third finish after two rejections escalated (not delivered) and
-//! verified again after the operator's answer, the rejection count restarting at an accepted finish
-//! but not at a question the lead wrote, verifier ending without a verdict and spawn failure (both
-//! escalated, nothing delivered), shutdown and cancellation (error, nothing recorded);
+//! finish recorded as not accepted, objections opened), the rejection cap (a notice, no inbox item), the
+//! count restarting at an accepted finish only, an answered inbox item changing nothing, the goal-met
+//! pre-gate, objections settled by new execution evidence, an operator release, verifier ending without a
+//! verdict and spawn failure (retried, then held with a notice, no inbox item), shutdown and cancellation
+//! (error, nothing recorded); `conclude` - met, unreachable with and without open plan steps, a child;
 //! `verdict` — each refusal, the settle effect and payload; `ask_user` — blocking and not, child
 //! refusal, missing `meanwhile`, ledger question recorded and referenced; `report_blocker` — child
 //! and lead; `wait` — nothing running, a running job, a running child.
 
-use super::{Delivery, Effect, Shared, SpawnReq, MAX_FINISH_REJECTIONS, REPORT_MAX_CHARS, SHUTTING_DOWN};
+use super::{Delivery, Effect, Settlement, Shared, SpawnReq, MAX_FINISH_REJECTIONS, REPORT_MAX_CHARS, SHUTTING_DOWN};
 use crate::gate::{self, Quote, ReportInput, VerifiedQuote};
 use crate::pack::RoleDef;
+use crate::texts;
 use async_trait::async_trait;
 use loom_core::event::{
     Author, Brief, Budget, ChildOutcome, Event, InboxItem, InboxKind, NoteKind, SpawnMode, ToolClass, ToolSpec,
-    ToolStatus, TurnEndReason, META_OF_BLOB,
+    Termination, ToolStatus, TurnEndReason, META_OF_BLOB,
 };
 use loom_core::ids::new_item_id;
-use loom_core::ledger::{ClaimStatus, Evidence, LedgerOp, LedgerState};
+use loom_core::ledger::{ClaimStatus, Evidence, EvidenceKind, GoalMetStatus, LedgerOp, LedgerState, ObligationKind};
 use loom_core::log::read_records;
 use loom_core::observe::QUOTE_RECORD_CHARS;
-use loom_core::{BlobId, BlobRef};
+use loom_core::{BlobId, BlobRef, SessionId};
 use loom_tools::jobs::JobState;
 use loom_tools::params::{opt, req, spec};
 use loom_tools::{Body, Tool, ToolCtx, ToolOutput};
@@ -158,6 +186,13 @@ pub struct Verdict(pub Arc<Shared>);
 pub struct AskUser(pub Arc<Shared>);
 pub struct ReportBlocker(pub Arc<Shared>);
 pub struct Wait(pub Arc<Shared>);
+pub struct Conclude(pub Arc<Shared>);
+
+/// How many more times a finish verifier is started when one could not be run (so at most
+/// `1 + VERIFIER_RETRIES` attempts).
+const VERIFIER_RETRIES: u32 = 2;
+/// Milliseconds waited between attempts to run a finish verifier.
+const VERIFIER_RETRY_WAIT_MS: u64 = if cfg!(test) { 5 } else { 3_000 };
 
 /// Characters of `what` kept in the first line of a child's blocker report. With the longest class name
 /// the line stays within what a session's end detail keeps.
@@ -180,7 +215,12 @@ pub fn quote_items() -> Value {
 
 /// The assignment given to the verifier of a lead's `finish`.
 ///
-/// - `question`: `Try to refute that this mission is finished as its lead describes.`
+/// - `question`: `Try to refute that this mission is finished as its lead describes.` When the goal-met
+///   claim is `Refuted` (the lead concluded the goal cannot be met as stated) it is instead `The lead says
+///   this goal cannot be met as stated. Name one route to it that was not tried, or get one step further
+///   toward the goal yourself. Do not confirm that it is impossible: accept only if you tried and found no
+///   untried route.`, and `context` has, after the goal, `The lead concluded the goal cannot be met as
+///   stated (evidence: {ids}):\n{note}`.
 /// - `context`: `Goal (set by the operator):\n{goal}`, then `Constraints:` with one `- ` line per
 ///   active constraint (omitted when none), then `The lead's summary of the result:\n{answer}`, then
 ///   `What the lead says it did not establish:` when it stated something, then
@@ -206,6 +246,16 @@ pub fn finish_brief(
 ) -> Brief {
     let goal = ledger.goal.as_deref().unwrap_or("(no goal recorded)");
     let mut parts = vec![format!("Goal (set by the operator):\n{goal}")];
+    // A lead that concluded the goal cannot be met is not asked to prove an impossibility: the verifier is
+    // asked to find a route it has not tried.
+    let unreachable = ledger.goal_met.as_ref().filter(|g| g.status == GoalMetStatus::Refuted);
+    if let Some(g) = unreachable {
+        parts.push(format!(
+            "The lead concluded the goal cannot be met as stated (evidence: {}):\n{}",
+            g.evidence.join(", "),
+            g.note
+        ));
+    }
 
     let constraints: Vec<String> =
         ledger.constraints.iter().filter(|c| c.retired.is_none()).map(|c| format!("- {}", c.text)).collect();
@@ -246,8 +296,13 @@ pub fn finish_brief(
         parts.push(format!("Claims recorded as supported:\n{}", supported.join("\n")));
     }
 
+    let question = if unreachable.is_some() {
+        "The lead says this goal cannot be met as stated. Name one route to it that was not tried, or get one step further toward the goal yourself. Do not confirm that it is impossible: accept only if you tried and found no untried route."
+    } else {
+        "Try to refute that this mission is finished as its lead describes."
+    };
     Brief {
-        question: "Try to refute that this mission is finished as its lead describes.".to_string(),
+        question: question.to_string(),
         returns: Some("A verdict, delivered by calling verdict.".to_string()),
         stop_when: Some(
             "You have checked the summary against the goal, each constraint, and the outputs it relies on.".to_string(),
@@ -443,7 +498,21 @@ impl Finish {
         not_established: Option<&str>,
     ) -> ToolOutput {
         let s = &self.0;
-        let state = match s.ledger() {
+        let mut state = match s.ledger() {
+            Ok(st) => st,
+            Err(e) => return ToolOutput::error(e),
+        };
+        // The goal-met pre-gate: the ledger, not prose, decides whether a stop is a deliverable. It refuses
+        // in this step, before a finish is recorded, a verifier is started or anything reaches the operator.
+        // A role without `conclude` cannot make the conclusion the gate waits for, so it is not gated.
+        let has = |tool: &str| s.role.tools.iter().any(|t| t == tool);
+        if s.role.termination == Termination::Explicit && has("conclude") && gate::goal_unconcluded(&state) {
+            let text = texts::finish_unavailable(has("conclude"), has("report_blocker"));
+            s.emit(Author::Harness, Event::HarnessNote { note: NoteKind::Nudge, text: text.clone() });
+            return ToolOutput::error(text);
+        }
+        let released = state.release.is_some();
+        state = match self.settle_objections(state, released) {
             Ok(st) => st,
             Err(e) => return ToolOutput::error(e),
         };
@@ -464,21 +533,22 @@ impl Finish {
         let support = support_text(not_established, verified);
 
         let mut note = "not verified".to_string();
-        if s.role.verify_finish && s.agents.verify_finish {
+        // The operator's release closes the mission short of the goal: there is no goal claim for a verifier
+        // to attack, and the result says so.
+        let closed_by_release = released && gate::goal_unconcluded_ignoring_release(&state);
+        if closed_by_release {
+            note = "closed by operator, goal not established".to_string();
+        } else if s.role.verify_finish && s.agents.verify_finish {
             // `state` is the ledger before this finish: only earlier finishes count or restart the count.
             let floor = rejection_floor(&state);
-            let rejections: Vec<(String, Vec<String>)> = state
+            let earlier_rejections = state
                 .finishes
                 .iter()
                 .filter(|f| f.accepted == Some(false) && finish_number(&f.id) > floor)
-                .map(|f| (f.id.clone(), f.objections.clone()))
-                .collect();
-            if rejections.len() >= usize::try_from(MAX_FINISH_REJECTIONS).unwrap_or(usize::MAX) {
-                return self.escalate(ctx, &fid, Unverified::Rejected(rejections), answer, &support);
-            }
+                .count();
             let Some(role) = s.role.verifier.clone() else {
                 let why = format!("the role `{}` has no verifier role in its pack", s.role.name);
-                return self.escalate(ctx, &fid, Unverified::NotRun { why, report: None }, answer, &support);
+                return self.hold_unverified(&why, None);
             };
             let req = SpawnReq {
                 role,
@@ -490,71 +560,111 @@ impl Finish {
                 awaited: true,
                 harness: true,
             };
-            let settled = match s.orch.spawn(&s.session, req).await {
-                Ok(child) => s.orch.join(&s.session, &child, &ctx.cancel).await.map(|st| (child, st)),
-                Err(e) => Err(e),
-            };
-            match settled {
-                Err(e) => {
-                    if ctx.cancel.is_cancelled() {
-                        return ToolOutput::error(
-                            "Interrupted while the result was being verified; nothing was delivered. Call finish again to resume.",
-                        );
+            // A verifier that cannot be run is a fault of the harness: it is retried with a fresh one, and when
+            // it still cannot be run the finish is held, never escalated and never delivered as verified.
+            let mut fault = String::new();
+            let mut fault_report: Option<String> = None;
+            let mut verdict: Option<(SessionId, Settlement, bool)> = None;
+            for attempt in 0..=VERIFIER_RETRIES {
+                if attempt > 0 {
+                    tokio::select! {
+                        () = ctx.cancel.cancelled() => {
+                            return ToolOutput::error(
+                                "Interrupted while the result was being verified; nothing was delivered. Call finish again to resume.",
+                            );
+                        }
+                        () = tokio::time::sleep(std::time::Duration::from_millis(VERIFIER_RETRY_WAIT_MS)) => {}
                     }
-                    // A restart is not something for the operator to decide: the turn is being cut, and
-                    // the finish is made (and verified) again when the session is resumed.
-                    if e == SHUTTING_DOWN {
-                        return ToolOutput::error(
-                            "The harness is shutting down, so the result could not be verified; nothing was delivered. Call finish again.",
-                        );
-                    }
-                    return self.escalate(ctx, &fid, Unverified::NotRun { why: e, report: None }, answer, &support);
                 }
-                Ok((child, settled)) => match settled.payload.get("accepted").and_then(Value::as_bool) {
-                    Some(true) => {
-                        let op = LedgerOp::FinishVerdict {
-                            claim: fid.clone(),
-                            accepted: true,
-                            objections: Vec::new(),
-                            verifier: Some(child.clone()),
-                        };
-                        if let Err(e) = s.ledger_append(false, op) {
-                            return ToolOutput::error(e);
+                let settled = match s.orch.spawn(&s.session, req.clone()).await {
+                    Ok(child) => s.orch.join(&s.session, &child, &ctx.cancel).await.map(|st| (child, st)),
+                    Err(e) => Err(e),
+                };
+                match settled {
+                    Err(e) => {
+                        if ctx.cancel.is_cancelled() {
+                            return ToolOutput::error(
+                                "Interrupted while the result was being verified; nothing was delivered. Call finish again to resume.",
+                            );
                         }
-                        note = format!("verified by {child}");
-                    }
-                    Some(false) => {
-                        let objections = strings_of(settled.payload.get("objections"));
-                        let op = LedgerOp::FinishVerdict {
-                            claim: fid.clone(),
-                            accepted: false,
-                            objections: objections.clone(),
-                            verifier: Some(child.clone()),
-                        };
-                        if let Err(e) = s.ledger_append(false, op) {
-                            return ToolOutput::error(e);
+                        // A restart is not something to retry: the turn is being cut, and the finish is made
+                        // (and verified) again when the session is resumed.
+                        if e == SHUTTING_DOWN {
+                            return ToolOutput::error(
+                                "The harness is shutting down, so the result could not be verified; nothing was delivered. Call finish again.",
+                            );
                         }
-                        let mut text = format!("An independent verifier ({child}) examined the result and did not accept it.");
-                        for o in &objections {
-                            text.push_str(&format!("\n- {o}"));
+                        fault = e;
+                        fault_report = None;
+                    }
+                    Ok((child, st)) => match st.payload.get("accepted").and_then(Value::as_bool) {
+                        Some(accepted) => {
+                            verdict = Some((child, st, accepted));
+                            break;
                         }
-                        text.push_str(&format!(
-                            "\n\n{}\n\nThe mission is not finished. Deal with each objection — fix it, or show with evidence that it is wrong — then call finish again.",
-                            settled.report
-                        ));
-                        let mut out = ToolOutput::ok("not accepted", Body::Raw(text.into_bytes()));
-                        out.status = ToolStatus::Error;
-                        return out;
+                        None => {
+                            fault = format!(
+                                "the verifier ({child}) ended as {} without giving a verdict",
+                                outcome_word(st.outcome)
+                            );
+                            fault_report = Some(st.report.trim()).filter(|r| !r.is_empty()).map(cut_report);
+                        }
+                    },
+                }
+            }
+            let Some((child, settled, accepted)) = verdict else {
+                return self.hold_unverified(&fault, fault_report);
+            };
+            if accepted {
+                let op = LedgerOp::FinishVerdict {
+                    claim: fid.clone(),
+                    accepted: true,
+                    objections: Vec::new(),
+                    verifier: Some(child.clone()),
+                };
+                if let Err(e) = s.ledger_append(false, op) {
+                    return ToolOutput::error(e);
+                }
+                note = format!("verified by {child}");
+            } else {
+                let objections = strings_of(settled.payload.get("objections"));
+                let op = LedgerOp::FinishVerdict {
+                    claim: fid.clone(),
+                    accepted: false,
+                    objections: objections.clone(),
+                    verifier: Some(child.clone()),
+                };
+                if let Err(e) = s.ledger_append(false, op) {
+                    return ToolOutput::error(e);
+                }
+                // Each objection becomes an obligation: it holds every later finish until new execution
+                // evidence is recorded after it, so a rejection cannot be answered by finishing again.
+                for o in objections.iter().map(|o| o.trim()).filter(|o| !o.is_empty()) {
+                    let open = LedgerOp::ObligationOpen {
+                        kind: ObligationKind::Objection,
+                        text: o.to_string(),
+                        reference: format!("{fid} (verifier {child})"),
+                    };
+                    if let Err(e) = s.ledger_append(false, open) {
+                        return ToolOutput::error(e);
                     }
-                    None => {
-                        let why = format!(
-                            "the verifier ({child}) ended as {} without giving a verdict",
-                            outcome_word(settled.outcome)
-                        );
-                        let report = Some(settled.report.trim()).filter(|r| !r.is_empty()).map(cut_report);
-                        return self.escalate(ctx, &fid, Unverified::NotRun { why, report }, answer, &support);
-                    }
-                },
+                }
+                let rejected = earlier_rejections.saturating_add(1);
+                if rejected >= usize::try_from(MAX_FINISH_REJECTIONS).unwrap_or(usize::MAX) {
+                    // Not a summons: the operator is told, nothing is asked, and the session keeps working.
+                    s.emit(
+                        Author::Harness,
+                        Event::HarnessNote { note: NoteKind::Verdict, text: texts::finish_rejected_notice(rejected) },
+                    );
+                }
+                let mut text = format!("An independent verifier ({child}) examined the result and did not accept it.");
+                for o in &objections {
+                    text.push_str(&format!("\n- {o}"));
+                }
+                text.push_str(&format!("\n\n{}\n\n{}", settled.report, texts::FINISH_NOT_ACCEPTED_TAIL));
+                let mut out = ToolOutput::ok("not accepted", Body::Raw(text.into_bytes()));
+                out.status = ToolStatus::Error;
+                return out;
             }
         }
 
@@ -563,61 +673,59 @@ impl Finish {
         ToolOutput::ok(format!("finished — {note}"), Body::Message("The result was delivered to the operator.".into()))
     }
 
-    /// The result could not be verified: nothing is delivered as finished. A blocking item carries the
-    /// answer labelled NOT VERIFIED, and the turn ends until the operator answers it.
-    fn escalate(&self, ctx: &ToolCtx, fid: &str, why: Unverified, answer: &str, support: &str) -> ToolOutput {
+    /// Settle the open objections of earlier rejections that new work has answered: an objection is settled
+    /// by an attested execution evidence record whose journal entry comes after the
+    /// objection's own. With `all` (the operator released the mission) every open objection is settled.
+    /// Answering an inbox item, rewording the result or a finish does not settle one.
+    fn settle_objections(&self, state: LedgerState, all: bool) -> Result<LedgerState, String> {
         let s = &self.0;
-        let (label, mut detail, short, report) = match why {
-            Unverified::Rejected(rejections) => {
-                let n = rejections.len();
-                let mut detail = format!(
-                    "An independent verifier rejected the lead's finish {n} times, so the harness stopped asking it. Objections:"
-                );
-                for (i, (id, objections)) in rejections.iter().enumerate() {
-                    detail.push_str(&format!("\nRejection {} ({id}):", i.saturating_add(1)));
-                    for o in objections {
-                        detail.push_str(&format!("\n- {o}"));
-                    }
-                }
-                (format!("NOT VERIFIED - REJECTED {n} TIMES"), detail, format!("the verifier rejected it {n} times"), None)
-            }
-            Unverified::NotRun { why, report } => (
-                "NOT VERIFIED - VERIFICATION COULD NOT BE RUN".to_string(),
-                format!("Verification could not be run: {why}"),
-                format!("verification could not be run: {why}"),
-                report,
-            ),
-        };
-        // What the verifier itself reported (what blocked it, what it tried), for the operator and the lead.
-        let report = report.map(|r| format!("\n\nThe verifier's report:\n{r}")).unwrap_or_default();
-        detail.push_str(&report);
-        let text = format!(
-            "{label}\n\n{detail}\n\nThe lead's answer (NOT VERIFIED; it was not delivered as finished):\n{answer}{support}\n\nAnswer this item to tell the lead how to go on. Its next finish is verified again."
-        );
-        // The ledger question names the finish, which is how later finishes know where the count restarts.
-        let qid = match record_question(s, &escalation_question(fid, &label), true) {
-            Ok(q) => q,
-            Err(e) => return ToolOutput::error(e),
-        };
-        s.emit(Author::Harness, inbox(InboxKind::Blocker, text, Vec::new(), true, ctx, qid));
-        s.set_effect(Effect::EndTurn(TurnEndReason::Blocked));
-        ToolOutput::ok(
-            "not verified — waiting for the operator",
-            Body::Message(format!(
-                "The result could not be verified ({short}) and was NOT delivered as finished. It is in the operator's inbox, labelled NOT VERIFIED. This turn ends here; you will be resumed when the operator answers, and your next finish will be verified again.{report}"
-            )),
-        )
+        let open: Vec<usize> = state
+            .obligations
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.kind == ObligationKind::Objection && o.outcome.is_none())
+            .map(|(i, _)| i)
+            .collect();
+        if open.is_empty() {
+            return Ok(state);
+        }
+        // The journal position of each obligation, in the order they were opened.
+        let Some(journal) = s.journal.as_ref() else { return Ok(state) };
+        let entries = journal.read().map_err(|e| format!("The mission journal could not be read ({e}); this is a harness fault. Nothing was delivered. Call finish again."))?;
+        let opened_at: Vec<u64> =
+            entries.iter().filter(|e| matches!(e.op, LedgerOp::ObligationOpen { .. })).map(|e| e.n).collect();
+        let mut current = state;
+        for i in open {
+            let Some(opened) = opened_at.get(i).copied() else { continue };
+            let answered = current
+                .evidence
+                .iter()
+                .find(|e| e.n > opened && e.input.kind == EvidenceKind::Execution && e.input.attested)
+                .map(|e| e.id.clone());
+            let outcome = match (answered, all) {
+                (Some(id), _) => format!("new execution evidence {id} was recorded after the objection"),
+                (None, true) => "the operator released the mission".to_string(),
+                (None, false) => continue,
+            };
+            let Some(id) = current.obligations.get(i).map(|o| o.id.clone()) else { continue };
+            let (_, next) = s.ledger_append(false, LedgerOp::ObligationSettle { id, outcome })?;
+            current = next;
+        }
+        Ok(current)
     }
-}
 
-/// Why a finish that needs verification was not delivered.
-enum Unverified {
-    /// Rejected by the verifier `MAX_FINISH_REJECTIONS` times since the count last restarted: the finish
-    /// id and objections of each rejection.
-    Rejected(Vec<(String, Vec<String>)>),
-    /// The verifier could not be started or joined, or it ended without a verdict (`report` is then what
-    /// it reported instead).
-    NotRun { why: String, report: Option<String> },
+    /// Verification could not be run (after retries): a fault of the harness. The finish stays recorded
+    /// without a verdict, nothing is delivered as finished, the operator is only informed (a note, not an
+    /// inbox item) and the session goes on.
+    fn hold_unverified(&self, why: &str, report: Option<String>) -> ToolOutput {
+        let s = &self.0;
+        s.emit(Author::Harness, Event::HarnessNote { note: NoteKind::Verdict, text: texts::verification_fault_notice(why) });
+        let mut text = texts::verification_fault_result(why);
+        if let Some(r) = report {
+            text.push_str(&format!("\n\nThe verifier's report:\n{r}"));
+        }
+        ToolOutput::error(text)
+    }
 }
 
 /// The refusal of `finish` while work this session started is still running. It names only tools the
@@ -704,38 +812,11 @@ fn finish_number(id: &str) -> usize {
     id.strip_prefix('f').and_then(|n| n.parse().ok()).unwrap_or(0)
 }
 
-/// What follows `Finish {fid} ` in the ledger question of an escalation.
-const ESCALATION_MARK: &str = "was not delivered";
-
-/// The blocking ledger question an escalation of finish `fid` is recorded as.
-fn escalation_question(fid: &str, label: &str) -> String {
-    format!("Finish {fid} {ESCALATION_MARK}: {label}. The answer and the reason are in the inbox item; reply to say how the lead should go on.")
-}
-
-/// The finish id a ledger question names, when its text has the form of [`escalation_question`].
-fn escalated_finish(question: &str) -> Option<&str> {
-    let (fid, rest) = question.strip_prefix("Finish ")?.split_once(' ')?;
-    rest.starts_with(ESCALATION_MARK).then_some(fid)
-}
-
-/// The number of the latest finish in `state` at which the count of rejections restarts (0 when none):
-/// rejections of finishes up to that one no longer count towards `MAX_FINISH_REJECTIONS`. It is the
-/// later of
-/// - the latest accepted finish: what was rejected before it has been dealt with;
-/// - the latest finish whose escalation the operator has answered. An escalation is a blocking ledger
-///   question written by [`escalation_question`]; it counts only when the finish it names exists and has
-///   no verdict, which is what an escalated finish looks like. A question the lead writes with `ask_user`
-///   therefore restarts nothing by naming a finish that does not exist yet or that the verifier judged.
+/// The number of the latest accepted finish in `state` (0 when none): rejections of finishes up to that
+/// one no longer count towards `MAX_FINISH_REJECTIONS`. Nothing the operator does moves it; answering an
+/// inbox item is not an acceptance.
 fn rejection_floor(state: &LedgerState) -> usize {
-    let accepted = state.finishes.iter().filter(|f| f.accepted == Some(true)).map(|f| finish_number(&f.id));
-    let answered = state
-        .questions
-        .iter()
-        .filter(|q| q.blocking && q.answer.is_some())
-        .filter_map(|q| escalated_finish(&q.text))
-        .filter(|fid| state.finishes.iter().any(|f| f.id == *fid && f.accepted.is_none()))
-        .map(finish_number);
-    accepted.chain(answered).max().unwrap_or(0)
+    state.finishes.iter().filter(|f| f.accepted == Some(true)).map(|f| finish_number(&f.id)).max().unwrap_or(0)
 }
 
 /// What the lead stated it did not establish and the quotes the harness checked, as paragraphs to
@@ -849,6 +930,66 @@ impl Tool for Finish {
 }
 
 #[async_trait]
+impl Tool for Conclude {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "conclude",
+            "Record whether the mission's goal is met. This is what makes `finish` available: a finish is refused until the goal is concluded. Use `met` once a run of the target shows the goal achieved; use `unreachable` only once you have established that the goal cannot be met as stated: every plan step closed (done or dropped), every route tried, with execution evidence for it. Cite evidence records (ids from `evidence`) that are attested and show a run; reading source alone is refused. Not being there yet is neither: keep working. After concluding, call `finish` with the result; a verifier checks it.",
+            ToolClass::State,
+            &[
+                req("status", "string", "met: the goal is achieved. unreachable: it cannot be met as stated.").one_of(&["met", "unreachable"]),
+                req("note", "string", "What the evidence shows about the goal."),
+                req("evidence", "array", "Ids of evidence records (e1, e2) that show it: attested, and at least one a run of the target.").items("string"),
+            ],
+        )
+    }
+    async fn run(&self, _ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        let s = &self.0;
+        if s.is_child() {
+            return ToolOutput::error(
+                "Only the lead concludes the goal. Say what you established in your result (`finish`), and what you did not in `not_established`.",
+            );
+        }
+        let status = match str_arg(args, "status") {
+            Some("met") => GoalMetStatus::Supported,
+            Some("unreachable") => GoalMetStatus::Refuted,
+            _ => return ToolOutput::error("`status` must be `met` (the goal is achieved) or `unreachable` (it cannot be met as stated)."),
+        };
+        if status == GoalMetStatus::Refuted {
+            let state = match s.ledger() {
+                Ok(st) => st,
+                Err(e) => return ToolOutput::error(e),
+            };
+            let open = state.open_items().plan;
+            if !open.is_empty() {
+                let mut text = String::from("conclude unreachable was refused: the plan still has open steps, so not every route is closed:");
+                for id in &open {
+                    if let Some(p) = state.plan.iter().find(|p| &p.id == id) {
+                        text.push_str(&format!("\n- {} ({}): {}", p.id, if p.status == loom_core::ledger::StepStatus::Doing { "doing" } else { "todo" }, cut_chars(&p.text, 120)));
+                    }
+                }
+                text.push_str("\nClose each route with `step`: status done (say what showed it) or dropped (say why). Then call conclude again.");
+                return ToolOutput::error(text);
+            }
+        }
+        let note = str_arg(args, "note").unwrap_or("").trim().to_string();
+        let op = LedgerOp::GoalMetSet { status, note, evidence: strings_of(args.get("evidence")) };
+        if let Err(e) = s.ledger_append(false, op) {
+            return ToolOutput::error(e);
+        }
+        let (outcome, next) = if status == GoalMetStatus::Supported {
+            ("goal concluded: met", "A verifier will check the result.")
+        } else {
+            ("goal concluded: cannot be met as stated", "A verifier will look for one route you did not try, so name every route you closed.")
+        };
+        ToolOutput::ok(
+            outcome,
+            Body::Message(format!("The conclusion is recorded in the ledger. You may now call `finish` with the result, written for someone who has not seen your work. {next}")),
+        )
+    }
+}
+
+#[async_trait]
 impl Tool for Verdict {
     fn spec(&self) -> ToolSpec {
         spec(
@@ -957,13 +1098,6 @@ impl Tool for AskUser {
         let Some(question) = str_arg(args, "question").filter(|q| !q.trim().is_empty()) else {
             return ToolOutput::error("ask_user needs a `question`, with everything needed to answer it.");
         };
-        // The finish gate recognises an answered escalation by the words of its ledger question, so a
-        // question in those words would restart the count of rejections.
-        if escalated_finish(question.trim_start()).is_some() {
-            return ToolOutput::error(
-                "That question is worded like a finish escalation, which the harness writes itself. Nothing was asked. Word your question differently: say what you need to know, without starting it with `Finish` and a finish id.",
-            );
-        }
         let blocking = args.get("blocking").and_then(Value::as_bool).unwrap_or(true);
         let meanwhile = str_arg(args, "meanwhile").map(str::trim).filter(|m| !m.is_empty());
         if !blocking && meanwhile.is_none() {
@@ -1337,6 +1471,12 @@ mod tests {
         let r = lead();
         r.user_op(LedgerOp::GoalSet { text: "fix the parser".into() });
         r.user_op(LedgerOp::ConstraintAdd { text: "do not touch the lexer".into() });
+        let run = record_run(&r);
+        r.model_op(LedgerOp::GoalMetSet {
+            status: loom_core::ledger::GoalMetStatus::Supported,
+            note: "the run passes".into(),
+            evidence: vec![run],
+        });
         r.orch.settle("s-kid1", ChildOutcome::Returned, "looked fine", accepted_payload());
         let h = r.output("alpha\nbeta\n", "bash", ToolClass::Exec);
         let res = r
@@ -1394,99 +1534,403 @@ mod tests {
         r.orch.calls().iter().filter(|c| c.starts_with("spawn")).count()
     }
 
-    #[tokio::test]
-    async fn third_finish_after_two_rejections_is_escalated_and_verified_again_after_the_answer() {
-        let r = lead();
-        r.orch.settle("s-kid1", ChildOutcome::Returned, "no", rejected_payload());
-        r.orch.settle("s-kid2", ChildOutcome::Returned, "no", rejected_payload());
-        for _ in 0..2 {
-            let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
-            assert_eq!(res.status, Status::Error, "{}", res.text);
+    /// What the last call(s) queued: the inbox items and the harness notes, in order.
+    fn drain(r: &Rig) -> (Vec<InboxItem>, Vec<(NoteKind, String)>) {
+        let mut items = Vec::new();
+        let mut notes = Vec::new();
+        for (_, e) in r.shared.take_emitted() {
+            match e {
+                Event::InboxOpened(i) => items.push(i),
+                Event::HarnessNote { note, text } => notes.push((note, text)),
+                _ => {}
+            }
         }
-        assert_eq!(spawn_count(&r), 2);
-        r.shared.take_emitted();
-        let res = r.call("finish", json!({"answer": "Parser fixed.", "not_established": "the lexer"})).await;
+        (items, notes)
+    }
+
+    /// A lead whose role also has `conclude`, with a goal set by the operator.
+    fn lead_with_goal() -> Rig {
+        let mut role = core_role("lead");
+        if !role.tools.iter().any(|t| t == "conclude") {
+            role.tools.push("conclude".into());
+        }
+        let r = rig_with(role, false, true, loom_core::config::AgentsCfg::default());
+        r.user_op(LedgerOp::GoalSet { text: "fix the parser".into() });
+        r
+    }
+
+    /// Record a run of the target: a supported claim with attested execution evidence. Returns the evidence id.
+    fn record_run(r: &Rig) -> String {
+        let claim = format!("c{}", r.shared.ledger().unwrap().claims.len() + 1);
+        r.model_op(LedgerOp::ClaimAdd { text: "the target runs".into() });
+        r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
+            claim: claim.clone(),
+            kind: EvidenceKind::Execution,
+            supports: true,
+            session: "s-test".into(),
+            call_id: "call-0".into(),
+            blob: None,
+            lines: None,
+            quote: None,
+            note: "ran the target".into(),
+            attested: true,
+        }));
+        r.model_op(LedgerOp::ClaimUpdate { id: claim, status: ClaimStatus::Supported, note: String::new() });
+        format!("e{}", r.shared.ledger().unwrap().evidence.len())
+    }
+
+    /// Conclude the goal as met through the tool, after a recorded run.
+    async fn conclude_met(r: &Rig) {
+        let e = record_run(r);
+        let res = r.call("conclude", json!({"status": "met", "note": "the run passes", "evidence": [e]})).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
-        assert!(res.text.contains("NOT delivered as finished") && res.text.contains("rejected it 2 times"), "{}", res.text);
-        assert_eq!(spawn_count(&r), 2);
-        assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Blocked)));
-        let items = inbox_items(&r);
-        assert_eq!(items.len(), 1);
-        assert_eq!((items[0].kind, items[0].blocking), (InboxKind::Blocker, true));
-        let t = &items[0].text;
-        assert!(t.starts_with("NOT VERIFIED - REJECTED 2 TIMES"), "{t}");
-        assert!(t.contains("Rejection 1 (f1):\n- no test ran\n- line 4 is wrong\nRejection 2 (f2):\n- no test ran"), "{t}");
-        assert!(t.contains("(NOT VERIFIED; it was not delivered as finished):\nParser fixed."), "{t}");
-        assert!(t.contains("Not established (stated by the lead):\nthe lexer"), "{t}");
-        assert_eq!(items[0].reference.as_deref(), Some("q1"));
+    }
+
+    fn open_objections(r: &Rig) -> usize {
+        r.shared
+            .ledger()
+            .unwrap()
+            .obligations
+            .iter()
+            .filter(|o| o.kind == ObligationKind::Objection && o.outcome.is_none())
+            .count()
+    }
+
+    #[tokio::test]
+    async fn the_incident_a_lead_that_finishes_with_the_goal_open_is_refused_in_step_and_never_reaches_the_operator() {
+        let r = lead_with_goal();
+        for _ in 0..13 {
+            let res = r.call("finish", json!({"answer": "No result: the objective was not reached."})).await;
+            assert_eq!(res.status, Status::Error, "{}", res.text);
+            assert!(res.text.contains("finish is not available yet: the goal is not concluded"), "{}", res.text);
+            assert!(res.text.contains("Call conclude once a run shows the goal met"), "{}", res.text);
+            assert!(res.text.contains("record where you are with a note"), "{}", res.text);
+            assert!(res.text.contains("call report_blocker"), "{}", res.text);
+            let (items, notes) = drain(&r);
+            assert!(items.is_empty(), "{items:?}");
+            assert_eq!(notes.iter().filter(|(k, _)| *k == NoteKind::Nudge).count(), 1, "{notes:?}");
+            assert!(effect(&r).is_none());
+        }
+        assert_eq!(spawn_count(&r), 0);
         let st = r.shared.ledger().unwrap();
-        assert_eq!(st.finishes.len(), 3);
-        assert_eq!(st.finishes[2].accepted, None);
-        assert!(st.questions[0].blocking && st.questions[0].text.starts_with("Finish f3 "));
+        assert!(st.finishes.is_empty() && st.questions.is_empty() && st.obligations.is_empty());
+    }
 
-        // Until the operator answers, the open question keeps finish closed.
-        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+    #[tokio::test]
+    async fn the_pre_gate_names_only_tools_the_role_has() {
+        let mut role = core_role("lead");
+        role.tools.retain(|t| t != "report_blocker");
+        if !role.tools.iter().any(|t| t == "conclude") {
+            role.tools.push("conclude".into());
+        }
+        let r = rig_with(role, false, true, loom_core::config::AgentsCfg::default());
+        r.user_op(LedgerOp::GoalSet { text: "g".into() });
+        let res = r.call("finish", json!({"answer": "done"})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
-        assert!(effect(&r).is_none());
+        assert!(res.text.contains("Call conclude") && !res.text.contains("report_blocker"), "{}", res.text);
+    }
 
-        // After the answer the rejections no longer count: the next finish is verified again.
-        r.user_op(LedgerOp::QuestionAnswer { id: "q1".into(), answer: "go on".into() });
-        r.orch.settle("s-kid3", ChildOutcome::Returned, "fine", accepted_payload());
-        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+    #[tokio::test]
+    async fn a_role_without_conclude_is_not_held_by_the_goal_claim() {
+        let mut role = core_role("lead");
+        role.tools.retain(|t| t != "conclude");
+        let r = rig_with(role, false, true, loom_core::config::AgentsCfg::default());
+        r.user_op(LedgerOp::GoalSet { text: "g".into() });
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "fine", accepted_payload());
+        let res = r.call("finish", json!({"answer": "done"})).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
-        assert!(res.text.contains("finished — verified by s-kid3"), "{}", res.text);
-        assert_eq!(spawn_count(&r), 3);
+        assert_eq!(spawn_count(&r), 1);
+    }
+
+    #[tokio::test]
+    async fn concluding_met_opens_finish_to_the_verifier() {
+        let r = lead_with_goal();
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "fine", accepted_payload());
+        let res = r.call("finish", json!({"answer": "done"})).await;
+        assert_eq!(res.status, Status::Error);
+        assert_eq!(spawn_count(&r), 0);
+        // Reading source is not a run.
+        let weak = r.call("conclude", json!({"status": "met", "note": "looks right", "evidence": []})).await;
+        assert_eq!(weak.status, Status::Error, "{}", weak.text);
+        conclude_met(&r).await;
+        let st = r.shared.ledger().unwrap();
+        assert_eq!(st.goal_met.as_ref().map(|g| g.status), Some(loom_core::ledger::GoalMetStatus::Supported));
+        let res = r.call("finish", json!({"answer": "done"})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(res.text.contains("finished — verified by s-kid1"), "{}", res.text);
+        assert_eq!(spawn_count(&r), 1);
         assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Finished)));
     }
 
     #[tokio::test]
-    async fn verifier_ending_without_a_verdict_is_escalated_not_delivered() {
-        let r = lead();
-        r.orch.settle("s-kid1", ChildOutcome::BudgetExhausted, "ran out", Value::Null);
+    async fn concluding_unreachable_needs_every_route_closed_and_execution_evidence() {
+        let r = lead_with_goal();
+        r.model_op(LedgerOp::PlanAdd { text: "try the other parser".into() });
+        let e = record_run(&r);
+        let args = json!({"status": "unreachable", "note": "every route fails", "evidence": [e.clone()]});
+        let res = r.call("conclude", args.clone()).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("p1 (todo): try the other parser"), "{}", res.text);
+        assert!(res.text.contains("Close each route with `step`"), "{}", res.text);
+        assert_eq!(r.shared.ledger().unwrap().goal_met.map(|g| g.status), Some(loom_core::ledger::GoalMetStatus::Open));
+        // With the routes closed, the conclusion is accepted.
+        r.model_op(LedgerOp::PlanUpdate {
+            id: "p1".into(),
+            status: loom_core::ledger::StepStatus::Dropped,
+            note: "it needs the same library".into(),
+            evidence: vec![],
+        });
+        let res = r.call("conclude", args).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(res.text.contains("You may now call `finish`"), "{}", res.text);
+        assert_eq!(r.shared.ledger().unwrap().goal_met.map(|g| g.status), Some(loom_core::ledger::GoalMetStatus::Refuted));
+        // The finish now goes to the verifier, which is asked for an untried route, not for a proof.
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "no route found", accepted_payload());
+        let res = r.call("finish", json!({"answer": "The goal cannot be met: the target rejects every input."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let spawned = r.orch.spawned.lock().unwrap().clone();
+        let brief = &spawned[0].1.brief;
+        assert!(brief.question.contains("Name one route to it that was not tried"), "{}", brief.question);
+        let context = brief.context.clone().unwrap();
+        assert!(context.contains("The lead concluded the goal cannot be met as stated (evidence: e1):\nevery route fails"), "{context}");
+    }
+
+    #[tokio::test]
+    async fn conclude_is_the_leads_and_takes_two_statuses() {
+        let mut role = core_role("worker");
+        role.tools.push("conclude".into());
+        let r = rig_with(role, true, true, loom_core::config::AgentsCfg::default());
+        let res = r.call("conclude", json!({"status": "met", "note": "n", "evidence": ["e1"]})).await;
+        assert_eq!(res.status, Status::Error);
+        assert!(res.text.contains("Only the lead concludes the goal"), "{}", res.text);
+        let r = lead_with_goal();
+        let res = r.call("conclude", json!({"status": "done", "note": "n", "evidence": ["e1"]})).await;
+        assert_eq!(res.status, Status::Invalid, "{}", res.text);
+    }
+
+    #[tokio::test]
+    async fn a_rejection_opens_objections_that_only_new_execution_evidence_settles() {
+        let r = lead_with_goal();
+        conclude_met(&r).await;
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "I could not reproduce the fix.", rejected_payload());
+        r.orch.settle("s-kid2", ChildOutcome::Returned, "fine", accepted_payload());
+        r.shared.take_emitted();
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        let (items, notes) = drain(&r);
+        assert!(items.is_empty(), "a rejection opens no inbox item: {items:?}");
+        assert!(notes.iter().all(|(_, t)| !t.contains("rejected 2 times")), "{notes:?}");
+        let st = r.shared.ledger().unwrap();
+        let objections: Vec<_> = st.obligations.iter().filter(|o| o.kind == ObligationKind::Objection).collect();
+        assert_eq!(objections.len(), 2);
+        assert_eq!(objections[0].text, "no test ran");
+        assert_eq!(objections[1].text, "line 4 is wrong");
+        assert!(objections[0].reference.starts_with("f1 (verifier s-kid1)"), "{}", objections[0].reference);
+        assert!(res.text.contains("settled only by new execution evidence"), "{}", res.text);
+
+        // Finishing again does nothing: no verifier, the objections are named.
+        for _ in 0..2 {
+            let res = r.call("finish", json!({"answer": "Parser fixed, really."})).await;
+            assert_eq!(res.status, Status::Error, "{}", res.text);
+            assert!(res.text.contains("obligation o1 (objection): no test ran"), "{}", res.text);
+            assert!(res.text.contains("An objection is settled only by new work"), "{}", res.text);
+            assert!(effect(&r).is_none());
+        }
+        assert_eq!(spawn_count(&r), 1);
+        assert_eq!(open_objections(&r), 2);
+        // Static evidence and unattested records settle nothing; an execution record after them does.
+        r.model_op(LedgerOp::ClaimAdd { text: "read the source".into() });
+        r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
+            claim: "c2".into(),
+            kind: EvidenceKind::Static,
+            supports: true,
+            session: "s-test".into(),
+            call_id: "call-0".into(),
+            blob: None,
+            lines: None,
+            quote: None,
+            note: "read it".into(),
+            attested: true,
+        }));
+        r.model_op(LedgerOp::ClaimUpdate { id: "c2".into(), status: ClaimStatus::Withdrawn, note: "not needed".into() });
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert_eq!(spawn_count(&r), 1);
+        let new_run = record_run(&r);
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
-        assert!(res.text.contains("could not be verified") && res.text.contains("ended as budget exhausted"), "{}", res.text);
-        assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Blocked)));
-        let items = inbox_items(&r);
+        assert!(res.text.contains("finished — verified by s-kid2"), "{}", res.text);
+        assert_eq!(open_objections(&r), 0);
+        let st = r.shared.ledger().unwrap();
+        assert!(st.obligations[0].outcome.clone().unwrap().contains(&new_run));
+    }
+
+    #[tokio::test]
+    async fn the_rejection_cap_is_a_notice_not_a_summons() {
+        let r = lead_with_goal();
+        conclude_met(&r).await;
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "no", rejected_payload());
+        r.orch.settle("s-kid2", ChildOutcome::Returned, "no", rejected_payload());
+        r.orch.settle("s-kid3", ChildOutcome::Returned, "fine", accepted_payload());
+        r.shared.take_emitted();
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        record_run(&r);
+        r.shared.take_emitted();
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        // The second rejection reaches the cap: a non-blocking record, no inbox item, no turn end, no question.
+        let (items, notes) = drain(&r);
+        assert!(items.is_empty(), "{items:?}");
+        assert!(notes.iter().any(|(k, t)| *k == NoteKind::Verdict && t.starts_with("finish rejected 2 times; continuing")), "{notes:?}");
+        assert!(effect(&r).is_none());
+        assert!(r.shared.ledger().unwrap().questions.is_empty());
+        // The session works on and can still finish with new evidence: nothing is stuck.
+        record_run(&r);
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(res.text.contains("verified by s-kid3"), "{}", res.text);
+    }
+
+    #[tokio::test]
+    async fn an_answered_inbox_item_changes_nothing_about_the_goal_or_the_objections() {
+        let r = lead_with_goal();
+        conclude_met(&r).await;
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "no", rejected_payload());
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        // The lead asks, the operator answers: the way an inbox answer reaches the ledger.
+        let res = r.call("ask_user", json!({"question": "Is the lexer in scope?"})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        r.user_op(LedgerOp::QuestionAnswer { id: "q1".into(), answer: "just go on".into() });
+        let st = r.shared.ledger().unwrap();
+        assert_eq!(st.goal_met.as_ref().map(|g| g.status), Some(loom_core::ledger::GoalMetStatus::Supported));
+        assert_eq!(open_objections(&r), 2);
+        assert_eq!(rejection_floor(&st), 0);
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("objection"), "{}", res.text);
+        assert_eq!(spawn_count(&r), 1);
+        // A goal still open stays open after an answer: the pre-gate holds.
+        let r = lead_with_goal();
+        let res = r.call("ask_user", json!({"question": "Is it fine to stop?"})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        r.user_op(LedgerOp::QuestionAnswer { id: "q1".into(), answer: "yes, stop".into() });
+        let res = r.call("finish", json!({"answer": "Stopping."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("finish is not available yet"), "{}", res.text);
+        assert_eq!(spawn_count(&r), 0);
+    }
+
+    #[tokio::test]
+    async fn a_free_termination_role_is_not_gated_by_the_goal_claim() {
+        let mut role = core_role("lead");
+        role.termination = Termination::Free;
+        let r = rig_with(role, false, true, loom_core::config::AgentsCfg::default());
+        r.user_op(LedgerOp::GoalSet { text: "g".into() });
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "fine", accepted_payload());
+        let res = r.call("finish", json!({"answer": "done"})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(res.text.contains("verified by s-kid1"), "{}", res.text);
+    }
+
+    #[tokio::test]
+    async fn after_an_operator_release_finish_is_delivered_as_closed_by_the_operator() {
+        let r = lead_with_goal();
+        r.user_op(LedgerOp::OperatorRelease { reason: "out of time".into() });
+        // An objection that was open when the operator released the mission does not hold the finish.
+        r.model_op(LedgerOp::ObligationOpen { kind: ObligationKind::Objection, text: "no run".into(), reference: "f0".into() });
+        let res = r.call("finish", json!({"answer": "Not established; see notes."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(res.text.contains("finished — closed by operator, goal not established"), "{}", res.text);
+        assert_eq!(spawn_count(&r), 0);
+        let (items, _) = drain(&r);
         assert_eq!(items.len(), 1);
-        assert_eq!((items[0].kind, items[0].blocking), (InboxKind::Blocker, true));
-        assert!(items[0].text.starts_with("NOT VERIFIED - VERIFICATION COULD NOT BE RUN"), "{}", items[0].text);
-        assert!(items[0].text.contains("Verification could not be run: the verifier (s-kid1) ended as budget exhausted without giving a verdict"));
-        assert!(items[0].text.contains("(NOT VERIFIED; it was not delivered as finished):\nParser fixed."));
-        // What the verifier reported instead of a verdict reaches the operator and the lead.
-        assert!(items[0].text.contains("without giving a verdict\n\nThe verifier's report:\nran out\n\nThe lead's answer"), "{}", items[0].text);
+        assert_eq!((items[0].kind, items[0].blocking), (InboxKind::Finished, false));
+        assert!(items[0].text.ends_with("[closed by operator, goal not established]"), "{}", items[0].text);
+        assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Finished)));
+        assert_eq!(open_objections(&r), 0);
+    }
+
+    #[tokio::test]
+    async fn a_verifier_that_cannot_be_run_is_retried_and_then_held_without_asking_the_operator() {
+        let r = lead();
+        {
+            let mut script = r.orch.spawn_script.lock().unwrap();
+            for _ in 0..3 {
+                script.push_back(Err("Too many agents are running.".into()));
+            }
+        }
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("could not be verified: Too many agents are running."), "{}", res.text);
+        assert!(res.text.contains("fault of the harness, not a problem with your work"), "{}", res.text);
+        assert!(res.text.contains("NOT delivered as finished"), "{}", res.text);
+        assert_eq!(spawn_count(&r), 3);
+        assert!(effect(&r).is_none());
+        let (items, notes) = drain(&r);
+        assert!(items.is_empty(), "{items:?}");
+        assert!(notes.iter().any(|(k, t)| *k == NoteKind::Verdict && t.starts_with("Infrastructure fault, not an agent problem")), "{notes:?}");
+        let st = r.shared.ledger().unwrap();
+        assert_eq!(st.finishes[0].accepted, None);
+        assert!(st.questions.is_empty() && st.obligations.is_empty());
+
+        // One failure and then a verifier that runs: the retry delivers, verified.
+        let r = lead();
+        r.orch.spawn_script.lock().unwrap().push_back(Err("Too many agents are running.".into()));
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "fine", accepted_payload());
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(res.text.contains("finished — verified by s-kid1"), "{}", res.text);
+        assert_eq!(spawn_count(&r), 2);
+    }
+
+    #[tokio::test]
+    async fn a_verifier_ending_without_a_verdict_is_retried_then_held_with_its_report() {
+        let r = lead();
+        for k in 1..=3 {
+            r.orch.settle(&format!("s-kid{k}"), ChildOutcome::BudgetExhausted, "ran out", Value::Null);
+        }
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("ended as budget exhausted without giving a verdict"), "{}", res.text);
         assert!(res.text.contains("The verifier's report:\nran out"), "{}", res.text);
+        assert_eq!(spawn_count(&r), 3);
+        assert!(effect(&r).is_none());
+        let (items, _) = drain(&r);
+        assert!(items.is_empty());
         assert_eq!(r.shared.ledger().unwrap().finishes[0].accepted, None);
+        // The next finish verifies again.
+        r.orch.settle("s-kid4", ChildOutcome::Returned, "fine", accepted_payload());
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(res.text.contains("verified by s-kid4"), "{}", res.text);
     }
 
     #[tokio::test]
     async fn a_long_verifier_report_is_cut_with_a_visible_marker() {
         let r = lead();
         let long = "é".repeat(REPORT_MAX_CHARS + 7);
-        r.orch.settle("s-kid1", ChildOutcome::Blocked, &long, Value::Null);
+        for k in 1..=3 {
+            r.orch.settle(&format!("s-kid{k}"), ChildOutcome::Blocked, &long, Value::Null);
+        }
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
-        assert_eq!(res.status, Status::Ok, "{}", res.text);
-        let items = inbox_items(&r);
+        assert_eq!(res.status, Status::Error, "{}", res.text);
         let marker = format!("\n[report cut at {REPORT_MAX_CHARS} of {} characters]", REPORT_MAX_CHARS + 7);
-        assert!(items[0].text.contains(&format!("{}{marker}", "é".repeat(REPORT_MAX_CHARS))), "marker missing");
-        assert!(!items[0].text.contains(&long));
+        assert!(res.text.contains(&format!("{}{marker}", "é".repeat(REPORT_MAX_CHARS))), "marker missing");
+        assert!(!res.text.contains(&long));
         assert_eq!(cut_report("short"), "short");
     }
 
     #[tokio::test]
-    async fn spawn_failure_is_escalated_not_delivered() {
-        let r = lead();
-        r.orch.spawn_script.lock().unwrap().push_back(Err("Too many agents are running.".into()));
+    async fn spawn_failure_with_a_dead_verifier_role_is_held_not_delivered() {
+        let mut role = core_role("lead");
+        role.verifier = None;
+        let r = rig_with(role, false, true, loom_core::config::AgentsCfg::default());
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
-        assert_eq!(res.status, Status::Ok, "{}", res.text);
-        assert!(res.text.contains("verification could not be run: Too many agents are running."), "{}", res.text);
-        assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Blocked)));
-        let items = inbox_items(&r);
-        assert_eq!(items.len(), 1);
-        assert_ne!(items[0].kind, InboxKind::Finished);
-        assert!(items[0].blocking);
-        assert!(items[0].text.contains("Verification could not be run: Too many agents are running."), "{}", items[0].text);
-        assert!(items[0].text.contains("NOT VERIFIED") && items[0].text.contains("Parser fixed."));
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("has no verifier role in its pack"), "{}", res.text);
+        assert!(effect(&r).is_none());
     }
 
     #[tokio::test]
@@ -1498,6 +1942,7 @@ mod tests {
         assert!(res.text.contains("The harness is shutting down") && res.text.contains("nothing was delivered. Call finish again."), "{}", res.text);
         assert!(effect(&r).is_none());
         assert!(inbox_items(&r).is_empty());
+        assert_eq!(spawn_count(&r), 1);
         let st = r.shared.ledger().unwrap();
         assert!(st.questions.is_empty());
         assert_eq!(st.finishes[0].accepted, None);
@@ -1509,67 +1954,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_question_the_lead_wrote_does_not_restart_the_rejection_count() {
-        let r = lead();
-        r.orch.settle("s-kid1", ChildOutcome::Returned, "no", rejected_payload());
-        r.orch.settle("s-kid2", ChildOutcome::Returned, "no", rejected_payload());
-        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
-        assert_eq!(res.status, Status::Error, "{}", res.text);
-        // Questions in the escalation's own words: one names a finish that does not exist, one the
-        // finish about to be made, one a finish the verifier judged. The operator answers all three.
-        for (i, named) in ["f99", "f3", "f1"].iter().enumerate() {
-            let question = escalation_question(named, "NOT VERIFIED - REJECTED 2 TIMES");
-            // `ask_user` refuses such a question; one that got into the ledger by another way is still no escalation.
-            r.model_op(LedgerOp::QuestionAsk { text: question, blocking: true });
-            r.user_op(LedgerOp::QuestionAnswer { id: format!("q{}", i + 1), answer: "go on".into() });
-        }
-        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
-        assert_eq!(res.status, Status::Error, "{}", res.text);
-        assert_eq!(spawn_count(&r), 2);
-        r.shared.take_emitted();
-        // Both rejections still count: the third finish is escalated, not verified again.
-        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
-        assert_eq!(res.status, Status::Ok, "{}", res.text);
-        assert_eq!(spawn_count(&r), 2);
-        assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Blocked)));
-        let items = inbox_items(&r);
-        assert!(items[0].text.starts_with("NOT VERIFIED - REJECTED 2 TIMES"), "{}", items[0].text);
-    }
-
-    #[tokio::test]
-    async fn ask_user_refuses_a_question_worded_like_an_escalation() {
-        let r = lead();
-        let question = escalation_question("f1", "NOT VERIFIED - REJECTED 2 TIMES");
-        for q in [question.clone(), format!("  \n{question}")] {
-            let res = r.call("ask_user", json!({"question": q})).await;
-            assert_eq!(res.status, Status::Error, "{}", res.text);
-            assert!(res.text.contains("Word your question differently"), "{}", res.text);
-        }
-        assert!(r.shared.ledger().unwrap().questions.is_empty());
-        assert!(inbox_items(&r).is_empty());
-        assert!(effect(&r).is_none());
-        // An ordinary question that mentions a finish is fine.
-        let res = r.call("ask_user", json!({"question": "Should Finish f1 be redone?"})).await;
-        assert_eq!(res.status, Status::Ok, "{}", res.text);
-    }
-
-    #[tokio::test]
     async fn rejections_before_an_accepted_finish_no_longer_count() {
         let r = lead();
         r.orch.settle("s-kid1", ChildOutcome::Returned, "no", rejected_payload());
         r.orch.settle("s-kid2", ChildOutcome::Returned, "fine", accepted_payload());
         r.orch.settle("s-kid3", ChildOutcome::Returned, "no", rejected_payload());
         r.orch.settle("s-kid4", ChildOutcome::Returned, "fine", accepted_payload());
+        r.shared.take_emitted();
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
+        record_run(&r);
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert!(res.text.contains("finished — verified by s-kid2"), "{}", res.text);
         assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Finished)));
         // The operator sends a follow-up; its first finish is rejected.
+        r.shared.take_emitted();
         let res = r.call("finish", json!({"answer": "Lexer fixed too."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(effect(&r).is_none());
-        // One rejection since the accepted finish: the next one is verified, not escalated.
+        // One rejection since the accepted finish: no cap notice.
+        let (_, notes) = drain(&r);
+        assert!(notes.iter().all(|(_, t)| !t.contains("rejected")), "{notes:?}");
+        record_run(&r);
         let res = r.call("finish", json!({"answer": "Lexer fixed too."})).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         assert!(res.text.contains("finished — verified by s-kid4"), "{}", res.text);

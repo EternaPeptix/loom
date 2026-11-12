@@ -7,7 +7,7 @@
 //! - [`ledger`]   `plan`, `step`, `note`, `claim`, `claim_update`, `evidence`, `ledger`
 //! - [`misc`]     `pin`, `log_search`
 //! - [`scope`]    `request_scope`
-//! - [`terminal`] `finish`, `verdict`, `ask_user`, `report_blocker`, `wait`
+//! - [`terminal`] `finish`, `verdict`, `ask_user`, `report_blocker`, `wait`, `conclude`
 //! - [`agents`]   `agent_spawn`, `agent_fanout`, `agent_message`, `agent_stop`, `decide`, `verify`
 //!
 //! ## How a runtime tool acts on its session
@@ -48,9 +48,8 @@ use tokio_util::sync::CancellationToken;
 
 /// A child's answer longer than this is cut in the report its parent sees (the whole answer is stored).
 pub const REPORT_MAX_CHARS: usize = 12_000;
-/// How many times a verifier may reject a lead's `finish` before the next one is escalated to the operator
-/// instead of verified again (counted since the operator last answered an escalation, or since the last
-/// accepted finish when that is later).
+/// How many rejections of a lead's `finish`, counted since the latest accepted finish, make the harness record
+/// that a finish was rejected that many times and that the session continues. It never asks the operator.
 pub const MAX_FINISH_REJECTIONS: u32 = 2;
 /// What an [`Orchestrator`] answers once the runtime is shutting down. It is not a failure of the request:
 /// the turn that made it is being cut and is resumed after the restart.
@@ -323,6 +322,7 @@ pub fn tool(name: &str, shared: &Arc<Shared>) -> Option<Arc<dyn loom_tools::Tool
         "report_blocker" => Arc::new(terminal::ReportBlocker(s)),
         "wait" => Arc::new(terminal::Wait(s)),
         "request_scope" => Arc::new(scope::RequestScope(s)),
+        "conclude" => Arc::new(terminal::Conclude(s)),
         "agent_spawn" => Arc::new(agents::AgentSpawn(s)),
         "agent_fanout" => Arc::new(agents::AgentFanout(s)),
         "agent_message" => Arc::new(agents::AgentMessage(s)),
@@ -362,7 +362,7 @@ pub fn known_tools() -> Vec<String> {
 /// The names [`tool`] knows.
 pub const NAMES: &[&str] = &[
     "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "finish", "verdict",
-    "ask_user", "report_blocker", "wait", "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "decide",
+    "ask_user", "report_blocker", "wait", "conclude", "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "decide",
     "verify", "request_scope",
 ];
 

@@ -179,6 +179,11 @@ upgrade" first; the rest says what behaves differently.
 
 ### Sessions, agents and finishing
 
+- A lead can no longer finish by conceding: `finish` is refused in the same step while the goal is not
+  concluded, and a new `conclude` tool (`met` or `unreachable`, with execution evidence) records the
+  conclusion. A verifier's objections become obligations that only new execution evidence settles. A
+  rejected or unrunnable verification no longer opens a blocking item for the operator: it writes a note
+  and the session works on (an unrunnable verifier is retried twice first).
 - A child agent always settles exactly once and its lead receives the settlement, including after a
   restart. `agent_stop` waits for the agent to end. Archiving settles the mission's agents.
 - On shutdown running turns are cancelled first, and the jobs the shutdown kills are recorded as

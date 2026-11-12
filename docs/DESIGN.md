@@ -599,6 +599,17 @@ only when every check passes and, where verification is required, a verifier acc
   `agent_stop`; `job_kill` and `finish` can go in one reply). This is live state, not ledger
   obligations; the finish gate's own verifier does not count.
 - A child's `finish` delivers its report to its parent (§9).
+- The goal-met pre-gate. In a role with explicit termination, `finish` is refused in the same step,
+  before a finish is recorded, a verifier started or an inbox item opened, while the mission has a goal
+  and the goal-met claim (§7) is not concluded; a nudge note says to run the target and call `conclude`
+  once a run shows the goal met or the goal is established unreachable, or `report_blocker` for what only
+  the operator can supply. The ledger, not the wording of a reply, decides whether a stop is a
+  deliverable. `conclude {status: met|unreachable, note, evidence}` writes the goal-met claim (the
+  ledger checks the evidence, §7); `unreachable` is also refused while a plan step is open, so every route
+  is closed first, and the verifier is then told to name one untried route or get one step further, not to
+  confirm impossibility. A mission the operator released (`OperatorRelease`) may finish without a
+  conclusion; it is delivered as `[closed by operator, goal not established]` and is not verified. Free
+  termination roles are not gated.
 - A lead's `finish` is refused while the ledger has open items (§7); otherwise a finish claim `f{n}` is
   recorded. Verification is required when the role has `verify_finish` and the config's
   `agents.verify_finish` is on (default). Without it the result is delivered marked `[not verified]`.
@@ -613,18 +624,25 @@ only when every check passes and, where verification is required, a verifier acc
     `[verified by s-…]`; the turn ends `finished`;
   - rejected: the verdict is recorded and `finish` returns the objections as an error; the lead works
     on;
-  - after `MAX_FINISH_REJECTIONS` (2) rejections counted since the latest accepted finish or the latest
-    escalation the operator answered, the next finish is escalated without a verifier; a verifier
-    that cannot be started or ends without a verdict escalates too. An escalation records a blocking
-    ledger question `Finish f{n} was not delivered: NOT VERIFIED …` and opens a blocking `blocker`
-    inbox item holding the answer labelled `NOT VERIFIED - REJECTED n TIMES` (with every rejection's
-    objections) or `NOT VERIFIED - VERIFICATION COULD NOT BE RUN` (with the reason); the turn ends
-    `blocked`. Answering it restarts the count, and the next finish is verified again. `ask_user`
-    refuses a question worded like an escalation, so a lead cannot restart the count by itself.
+  - rejected, continued: each objection is opened as an `objection` obligation, which holds every later
+    finish until execution evidence is recorded after it (the harness settles it then, at the next
+    finish); answering an inbox item, rewording the result or finishing again settles nothing. From
+    `MAX_FINISH_REJECTIONS` (2) rejections counted since the latest accepted finish, each rejection also
+    writes a non-blocking note (`finish rejected n times; continuing`); nobody is asked and the session
+    works on until its budget;
+  - a verifier that cannot be started, or ends without a verdict, is a fault of the harness: a fresh
+    one is started up to two more times; if none runs, the finish stays recorded without a verdict, a
+    non-blocking note labelled an infrastructure fault is written, `finish` returns an error saying so,
+    and nothing is delivered as finished or opened for the operator;
   - a shutdown or a crash during verification records nothing for the call; after the restart a
     `finish` made again with the same brief joins the verifier that was cut, or takes the verdict it
     gave, instead of starting another. The verifier is marked as the gate's, with its brief, in its
     own `meta.json` before its first turn, so a crash cannot turn it into an ordinary agent.
+
+Only `report_blocker` (objective class), budget exhaustion and the operator's own release can park the
+operator: a rejected or unrunnable verification never opens a blocking item, and an operator's answer to
+an inbox item is never a release: it does not conclude the goal, settle an objection or move the count
+of rejections.
 
 **Budget.** A session's budget is `max_steps` and/or `max_minutes` (a child's from its assignment, at
 most `agents.child_max_steps` / `child_max_minutes`, 200 / 120 by default; a root's from its creation,
