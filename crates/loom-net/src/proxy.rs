@@ -94,9 +94,10 @@
 //!
 //! ## Limits ([`Limits`], defaults)
 //! - 256 connections in all. A connection that has not sent a complete head within 10 s gets `400`.
-//!   At the limit a new connection takes the slot of the oldest connection that has not sent a
-//!   complete head yet, or that is only being answered by the proxy itself and drained (that one is
-//!   closed); when there is none it is answered `503` with `Retry-After: 5`.
+//!   At the limit a new connection takes the slot of the oldest connection that is only being
+//!   answered by the proxy itself and drained, or, when there is none, of the oldest connection that
+//!   has not sent a complete head yet (that one is closed); when there is neither it is answered `503`
+//!   with `Retry-After: 5`.
 //! - 64 connections per session; over it `429` with `Retry-After: 5`.
 //! - 16 name lookups at once, at most 4 of them for one session; a lookup waits up to 10 s for a turn.
 //! - The two directions of a tunnel or forwarded request are relayed independently. With no byte
@@ -129,6 +130,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 const MAX_HEAD: usize = 64 * 1024;
 const MAX_HEADERS: usize = 100;
@@ -242,13 +244,17 @@ struct Entry {
     lookups: Arc<Semaphore>,
 }
 
-/// Connections that have not sent a complete request head yet, or that are only being drained after
-/// an answer of the proxy itself, oldest first, each with its connection permit and the token that
-/// closes it.
+/// A pending connection: its id, the token that closes it and its connection permit.
+type PendingEntry = (u64, CancellationToken, OwnedSemaphorePermit);
+
+/// The connections whose slot a new one may take at the limit, each queue oldest first: those only
+/// being drained after an answer of the proxy itself, and those that have not sent a complete request
+/// head yet.
 #[derive(Default)]
 struct Pending {
     next: u64,
-    queue: VecDeque<(u64, CancellationToken, OwnedSemaphorePermit)>,
+    draining: VecDeque<PendingEntry>,
+    heads: VecDeque<PendingEntry>,
 }
 
 /// Records of answers that name no granted session: how many were written in the current minute,
@@ -272,42 +278,58 @@ struct Shared {
     pending: Mutex<Pending>,
     refusals: Arc<Semaphore>,
     unattributed: Mutex<Budget>,
+    /// The tasks that serve or refuse a connection.
+    tasks: TaskTracker,
 }
 
 impl Shared {
-    /// Registers a new connection as pending; returns its id and the token that closes it.
+    /// Registers a new connection, which has not sent its head yet, as pending; returns its id and the
+    /// token that closes it.
     fn add_pending(&self, permit: OwnedSemaphorePermit) -> (u64, CancellationToken) {
-        let mut p = lock(&self.pending);
+        self.enqueue(permit, false)
+    }
+
+    /// Registers a connection that is only being drained after an answer of the proxy itself as
+    /// pending. It has nothing left to serve, so eviction closes it before any connection still sending
+    /// its head; among those drained, the oldest goes first, as its client has had the longest to read
+    /// the answer.
+    fn add_draining(&self, permit: OwnedSemaphorePermit) -> (u64, CancellationToken) {
+        self.enqueue(permit, true)
+    }
+
+    fn enqueue(&self, permit: OwnedSemaphorePermit, draining: bool) -> (u64, CancellationToken) {
+        let mut guard = lock(&self.pending);
+        let p = &mut *guard;
         let id = p.next;
         p.next = p.next.wrapping_add(1);
         let token = CancellationToken::new();
-        p.queue.push_back((id, token.clone(), permit));
+        let queue = if draining { &mut p.draining } else { &mut p.heads };
+        queue.push_back((id, token.clone(), permit));
         (id, token)
     }
 
-    /// Like [`Shared::add_pending`], but at the front of the queue, so eviction closes it first. For a
-    /// connection that is only being drained: it has nothing left to serve.
-    fn add_pending_front(&self, permit: OwnedSemaphorePermit) -> (u64, CancellationToken) {
-        let mut p = lock(&self.pending);
-        let id = p.next;
-        p.next = p.next.wrapping_add(1);
-        let token = CancellationToken::new();
-        p.queue.push_front((id, token.clone(), permit));
-        (id, token)
-    }
-
-    /// Closes the oldest pending connection and returns its permit.
+    /// Closes the oldest connection being drained, or else the oldest one still sending its head, and
+    /// returns its permit.
     fn evict_pending(&self) -> Option<OwnedSemaphorePermit> {
-        let (_, token, permit) = lock(&self.pending).queue.pop_front()?;
+        let (_, token, permit) = {
+            let mut guard = lock(&self.pending);
+            let p = &mut *guard;
+            p.draining.pop_front().or_else(|| p.heads.pop_front())?
+        };
         token.cancel();
         Some(permit)
     }
 
     /// Takes a pending connection's permit back; `None` when a newer connection was given it.
     fn claim_pending(&self, id: u64) -> Option<OwnedSemaphorePermit> {
-        let mut p = lock(&self.pending);
-        let i = p.queue.iter().position(|(x, _, _)| *x == id)?;
-        p.queue.remove(i).map(|(_, _, permit)| permit)
+        let mut guard = lock(&self.pending);
+        let p = &mut *guard;
+        for queue in [&mut p.draining, &mut p.heads] {
+            if let Some(i) = queue.iter().position(|(x, _, _)| *x == id) {
+                return queue.remove(i).map(|(_, _, permit)| permit);
+            }
+        }
+        None
     }
 
     /// Whether a record of an answer that names no session may be written now; if so, how many such
@@ -415,6 +437,7 @@ impl Proxy {
             pending: Mutex::new(Pending::default()),
             refusals: semaphore(REFUSALS),
             unattributed: Mutex::new(Budget { since: std::time::Instant::now(), used: 0, left_out: 0 }),
+            tasks: TaskTracker::new(),
         });
         let cancel = CancellationToken::new();
         tokio::spawn(accept_loop(listener, shared.clone(), cancel.clone()));
@@ -460,6 +483,16 @@ impl Proxy {
     pub fn shutdown(&self) {
         self.inner.cancel.cancel();
     }
+
+    /// Like [`Proxy::shutdown`], then waits up to `within` for the connections to end, so that the records
+    /// they write on the way out (the second decision of one on record as allowed) are written before the
+    /// caller goes on, e.g. to exit the process.
+    pub async fn stop(&self, within: Duration) {
+        self.shutdown();
+        let tasks = &self.inner.shared.tasks;
+        tasks.close();
+        let _ = tokio::time::timeout(within, tasks.wait()).await;
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -472,12 +505,13 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>, cancel: Cancell
             _ = cancel.cancelled() => break,
             r = listener.accept() => match r {
                 Ok((stream, _)) => {
-                    // At the limit, the slot of the oldest connection still without a head is taken over.
+                    // At the limit, the slot of a connection being drained, or else of the oldest one still
+                    // without a head, is taken over.
                     let slot = shared.connections.clone().try_acquire_owned().ok().or_else(|| shared.evict_pending());
                     match slot {
                         Some(permit) => {
                             let (id, evicted) = shared.add_pending(permit);
-                            tokio::spawn(handle(stream, shared.clone(), cancel.clone(), id, evicted));
+                            shared.tasks.spawn(handle(stream, shared.clone(), cancel.clone(), id, evicted));
                         }
                         None => refuse(stream, &shared),
                     }
@@ -499,10 +533,10 @@ fn refuse(stream: TcpStream, shared: &Arc<Shared>) {
     let (status, extra) = ("503 Service Unavailable", "Retry-After: 5\r\n");
     match shared.refusals.clone().try_acquire_owned() {
         Ok(permit) => {
-            let shared = shared.clone();
-            tokio::spawn(async move {
+            let owner = shared.clone();
+            shared.tasks.spawn(async move {
                 let mut stream = stream;
-                audit_local(&shared, None, local_decision(None, "connection limit (all sessions)")).await;
+                audit_local(&owner, None, local_decision(None, "connection limit (all sessions)")).await;
                 respond(&mut stream, status, extra, &body).await;
                 drop(permit);
             });
@@ -619,7 +653,8 @@ async fn respond(client: &mut TcpStream, status: &str, extra: &str, body: &str) 
 
 /// Like [`respond`], for a connection that holds the global `slot`: before the drain the slot is
 /// pending again, so at the limit a new connection takes it over (and this one is closed) rather than
-/// wait for a connection that has nothing left to serve.
+/// wait for a connection that has nothing left to serve; it is taken before the slot of any
+/// connection still sending its head (see [`Shared::add_draining`]).
 async fn answer(
     client: &mut TcpStream,
     shared: &Shared,
@@ -631,7 +666,7 @@ async fn answer(
     if !send(client, status, extra, body).await {
         return;
     }
-    let (id, evicted) = shared.add_pending_front(slot);
+    let (id, evicted) = shared.add_draining(slot);
     let _pending = PendingGuard { shared, id };
     tokio::select! {
         _ = drain(client) => {}
@@ -2261,12 +2296,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("net.jsonl");
         let (writer, file) = (Arc::new(crate::netlog::NetLogWriter::new()), path.clone());
+        // A destination that resets each connection it accepts once the proxy, connected to it, is
+        // recording its allow: a reset any earlier could fail the proxy's connect instead.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (reset, mut resets) = unbounded_channel::<()>();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                let _ = resets.recv().await;
+                s.set_zero_linger().unwrap();
+            }
+        });
         // Allows announce themselves and are slow to record, so that what a peer does meanwhile has
         // happened when the proxy goes on.
         let (allowing, mut allows) = unbounded_channel::<String>();
         let audit: AuditFn = Arc::new(move |_: Option<&SessionId>, d: &NetDecision| {
             if d.allowed && !d.rule.contains("(failed after the allow: ") {
                 let _ = allowing.send(d.method.clone());
+                if d.port == port {
+                    let _ = reset.send(());
+                }
                 std::thread::sleep(Duration::from_millis(300));
             }
             writer.append(&file, d)
@@ -2288,14 +2337,6 @@ mod tests {
                 }
             }
         };
-        // A destination that resets each connection as soon as it has accepted it.
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = l.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((s, _)) = l.accept().await {
-                s.set_zero_linger().unwrap();
-            }
-        });
         // A forwarded request: the destination is gone before the request head can be written to it.
         let r = raw(p.port(), format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await;
         assert_eq!(status(&r), 502, "{r}");
@@ -2524,6 +2565,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eviction_closes_the_oldest_draining_connection_before_any_still_sending_a_head() {
+        let (p, _rx) = start().await;
+        let shared = &p.inner.shared;
+        let permit = || shared.connections.clone().try_acquire_owned().unwrap();
+        let (_, waiting) = shared.add_pending(permit());
+        let (_, older) = shared.add_draining(permit());
+        let (_, newer) = shared.add_draining(permit());
+        let (_, later) = shared.add_pending(permit());
+        let order = [&older, &newer, &waiting, &later];
+        for (i, closed) in order.iter().enumerate() {
+            assert!(shared.evict_pending().is_some());
+            assert!(closed.is_cancelled(), "{i}");
+            assert!(order.iter().skip(i + 1).all(|t| !t.is_cancelled()), "{i}");
+        }
+        assert!(shared.evict_pending().is_none());
+    }
+
+    #[tokio::test]
+    async fn at_the_limit_a_new_connection_takes_the_slot_of_a_drained_one_before_a_silent_one() {
+        let echo = echo_server().await;
+        let limits = Limits { max_connections: 3, ..Limits::default() };
+        let (p, _rx, _seen) = start_audited(false, limits, None).await;
+        let g = p.grant(&SessionId::from("s-order"), lab());
+        let shared = p.inner.shared.clone();
+        // The ids of the connections being drained, or of those still sending a head, oldest first.
+        let queued = move |draining: bool| -> Vec<u64> {
+            let p = lock(&shared.pending);
+            let queue = if draining { &p.draining } else { &p.heads };
+            queue.iter().map(|(id, _, _)| *id).collect()
+        };
+        async fn until(what: &str, done: impl Fn() -> bool) {
+            let deadline = tokio::time::Instant::now() + T;
+            while !done() {
+                assert!(tokio::time::Instant::now() < deadline, "{what}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        // The oldest connection has not sent its head.
+        let mut silent = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        until("the silent connection was never accepted", || queued(false).len() == 1).await;
+        // Two newer ones are answered 407 and stay open, so the proxy drains them.
+        let mut answered = Vec::new();
+        let mut drained: Vec<u64> = Vec::new();
+        for _ in 0..2 {
+            let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+            s.write_all(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\n\r\n").await.unwrap();
+            assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 407);
+            let new = || queued(true).into_iter().filter(|id| !drained.contains(id)).collect::<Vec<u64>>();
+            until("the answered connection was never drained", || !new().is_empty()).await;
+            let new = new();
+            drained.extend(new);
+            answered.push(s);
+        }
+        // Every slot is taken; a new connection gets the one of the older drained connection. A drain
+        // lasts 500 ms, so that one may also have ended by itself; either way it is gone.
+        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
+        assert!(!queued(true).contains(&drained[0]), "the newer drained connection was closed first: {drained:?}");
+        let mut b = [0u8; 1];
+        assert!(timeout(Duration::from_millis(200), silent.read(&mut b)).await.is_err(), "the silent connection was closed");
+    }
+
+    #[tokio::test]
     async fn idle_tunnels_and_idle_forwards_are_closed() {
         let idle = Duration::from_secs(1);
         let limits = Limits { idle_timeout: idle, ..Limits::default() };
@@ -2721,19 +2826,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eviction_closes_draining_connections_before_older_ones_still_sending_a_head() {
-        let (p, _rx) = start().await;
-        let shared = &p.inner.shared;
-        let permit = || shared.connections.clone().try_acquire_owned().unwrap();
-        let (_, waiting) = shared.add_pending(permit());
-        let (_, draining) = shared.add_pending_front(permit());
-        assert!(shared.evict_pending().is_some());
-        assert!(draining.is_cancelled() && !waiting.is_cancelled());
-        assert!(shared.evict_pending().is_some());
-        assert!(waiting.is_cancelled());
-    }
-
-    #[tokio::test]
     async fn shutdown_during_a_tunnel_or_forward_is_recorded_after_the_allow() {
         let (p, _rx, seen) = start_audited(false, Limits::default(), None).await;
         let g = p.grant(&SessionId::from("s-down"), lab());
@@ -2744,18 +2836,25 @@ mod tests {
         let (port2, _server2) = silent_server().await;
         let mut f = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
         f.write_all(format!("GET http://127.0.0.1:{port2}/ HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        p.shutdown();
+        // The methods of the allowed requests recorded with `rule`, sorted.
+        let methods = |rule: &str| -> Vec<String> {
+            let seen = lock(&seen);
+            let mut m: Vec<String> =
+                seen.iter().filter(|(_, d)| d.allowed && d.rule == rule).map(|(_, d)| d.method.clone()).collect();
+            m.sort();
+            m
+        };
+        // Both are on record as allowed before the proxy shuts down; from there nothing is checked before
+        // the relay, which sees the shutdown even when it starts after it.
         let deadline = tokio::time::Instant::now() + T;
-        loop {
-            let rules: Vec<String> = lock(&seen).iter().map(|(_, d)| d.rule.clone()).collect();
-            let n = rules.iter().filter(|r| r.ends_with("(failed after the allow: the egress proxy shut down)")).count();
-            if n == 2 {
-                break;
-            }
-            assert!(tokio::time::Instant::now() < deadline, "{rules:?}");
+        while methods("allow_private 127.0.0.1") != ["CONNECT", "GET"] {
+            assert!(tokio::time::Instant::now() < deadline, "{:?}", lock(&seen));
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        // `stop` returns once the connections have ended, their records written.
+        timeout(T, p.stop(T)).await.unwrap();
+        let shut = "allow_private 127.0.0.1 (failed after the allow: the egress proxy shut down)";
+        assert_eq!(methods(shut), ["CONNECT", "GET"], "{:?}", lock(&seen));
     }
 
     #[tokio::test]

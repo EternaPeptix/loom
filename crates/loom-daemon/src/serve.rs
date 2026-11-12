@@ -10,7 +10,8 @@
 //!    with "Too many open files" in the middle of missions.
 //! 1. Create `paths.home` (0700). Take an exclusive, non-blocking lock on `<home>/daemon.lock` and hold it
 //!    until `run` returns (the process exits): when it is taken, another daemon drives this home and the
-//!    answer is the "already running" sentence below (pid and address from `daemon.json` when readable).
+//!    answer is the "already running" sentence below (pid and address from `daemon.json` when it is readable
+//!    and its pid is alive; otherwise the sentence says the daemon is starting and its address is not written yet).
 //!    Create `paths.logs_dir()`. `Config::load(paths.config_file())`, then
 //!    `check()`; an error is returned as `{path}: {error}`.
 //! 2. If `daemon.json` exists and its `pid` is alive (`libc::kill(pid, 0)` succeeds or fails with
@@ -392,6 +393,11 @@ fn pid_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// The pid `daemon.json` names, when that process is alive.
+pub(crate) fn live_daemon_pid(paths: &Paths) -> Option<u32> {
+    read_daemon_file(paths).map(|f| f.pid).filter(|&pid| pid_alive(pid))
+}
+
 /// What answers on an address, as far as this home's daemon goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Probe {
@@ -452,7 +458,7 @@ async fn answering(paths: &Paths, config: &Config) -> Result<bool, String> {
 
 /// Take the exclusive lock on `<home>/daemon.lock`; the returned file holds it until it is dropped. A lock that
 /// another daemon holds is answered with the "already running" sentence.
-fn take_home_lock(paths: &Paths) -> Result<std::fs::File, String> {
+pub(crate) fn take_home_lock(paths: &Paths) -> Result<std::fs::File, String> {
     use std::os::fd::AsRawFd;
     let path = paths.home.join(LOCK_FILE);
     let file = std::fs::OpenOptions::new()
@@ -498,9 +504,10 @@ pub(crate) fn home_lock_free(paths: &Paths) -> bool {
 /// Waits until the daemon of this home has let go of `<home>/daemon.lock` (its shutdown has finished);
 /// false when `within` passes first.
 pub(crate) async fn wait_home_lock_free(paths: &Paths, within: Duration) -> bool {
-    let deadline = std::time::Instant::now() + within;
+    // A bound too far ahead to be a time is no bound.
+    let deadline = std::time::Instant::now().checked_add(within);
     while !home_lock_free(paths) {
-        if std::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

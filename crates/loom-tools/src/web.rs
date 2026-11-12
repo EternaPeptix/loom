@@ -203,10 +203,22 @@ impl Tunnel {
     }
 }
 
-/// The causes of a request error as one line, without the error's own text: that names the URL,
-/// whose words say nothing about the stage that failed.
-pub(crate) fn causes(e: &reqwest::Error) -> String {
-    std::error::Error::source(e).map(describe).unwrap_or_default()
+/// The causes of an error as one line, without the error's own text: for a request error that names
+/// the URL, whose words say nothing about the stage that failed.
+pub(crate) fn causes(e: &(dyn std::error::Error + 'static)) -> String {
+    e.source().map(describe).unwrap_or_default()
+}
+
+/// Whether lowercased error causes (see [`causes`]) name a TLS or certificate failure.
+pub(crate) fn names_tls(lower_causes: &str) -> bool {
+    ["certificate", "tls", "ssl", "handshake"].iter().any(|w| lower_causes.contains(w))
+}
+
+/// Whether one of the error's causes names a TLS or certificate failure; its own text, which names the
+/// URL, is not read. reqwest reports these failures as connect errors, but they are not a refused
+/// CONNECT, so the proxy need not be asked again about them.
+pub(crate) fn names_tls_failure(e: &(dyn std::error::Error + 'static)) -> bool {
+    names_tls(&causes(e).to_lowercase())
 }
 
 /// A refusal by the session's egress proxy, with its text.
@@ -231,13 +243,6 @@ fn describe(e: &(dyn std::error::Error + 'static)) -> String {
     parts.join(": ")
 }
 
-/// Whether the error or one of its causes names a TLS or certificate failure. reqwest reports those as
-/// connect errors, but they are not a refused CONNECT, so the proxy need not be asked again about them.
-pub(crate) fn names_tls_failure(e: &(dyn std::error::Error + 'static)) -> bool {
-    let lower = describe(e).to_lowercase();
-    ["certificate", "tls", "ssl", "handshake"].iter().any(|w| lower.contains(w))
-}
-
 /// `tunnel`: for an https request through the egress proxy that failed to connect, what the proxy
 /// said about the destination afterwards.
 fn request_error(e: &reqwest::Error, url: &Url, hops: &[Url], tunnel: Option<&Tunnel>) -> ToolOutput {
@@ -248,7 +253,7 @@ fn request_error(e: &reqwest::Error, url: &Url, hops: &[Url], tunnel: Option<&Tu
         ("timed out".to_string(), "Try again later.")
     } else if has(&["dns", "resolve", "lookup", "name or service", "nodename", "no such host"]) {
         ("could not resolve the host name".to_string(), "Check the spelling of the host.")
-    } else if has(&["certificate", "tls", "ssl", "handshake"]) {
+    } else if names_tls(&lower) {
         ("failed the TLS handshake".to_string(), "The server's certificate or protocol was not acceptable.")
     } else if let (Some(t), true) = (tunnel, e.is_connect()) {
         t.failure()
@@ -448,12 +453,17 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    /// An error with `text`, caused by the next hop.
     #[derive(Debug)]
-    struct Hop(&'static str, Option<Box<Hop>>);
+    struct Hop(String, Option<Box<Hop>>);
+
+    fn hop(text: &str, cause: Option<Hop>) -> Hop {
+        Hop(text.to_string(), cause.map(Box::new))
+    }
 
     impl std::fmt::Display for Hop {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(self.0)
+            f.write_str(&self.0)
         }
     }
 
@@ -465,10 +475,18 @@ mod tests {
 
     #[test]
     fn a_certificate_failure_in_the_chain_is_named() {
-        let cert = Hop("error trying to connect", Some(Box::new(Hop("invalid peer certificate: UnknownIssuer", None))));
+        let cert = hop("error trying to connect", Some(hop("invalid peer certificate: UnknownIssuer", None)));
         assert!(names_tls_failure(&cert));
-        let refused = Hop("error trying to connect", Some(Box::new(Hop("tcp connect error: Connection refused", None))));
+        let refused = hop("error trying to connect", Some(hop("tcp connect error: Connection refused", None)));
         assert!(!names_tls_failure(&refused));
+        // The error's own text names the URL, whose words say nothing about the stage that failed.
+        for url in ["https://github.com/rustls/rustls", "https://www.openssl.org/", "https://badssl.com/"] {
+            let top = format!("error sending request for url ({url})");
+            let tunnel = hop(&top, Some(hop("client error (Connect)", Some(hop("unsuccessful tunnel", None)))));
+            assert!(!names_tls_failure(&tunnel), "{url}");
+            let cert = hop(&top, Some(hop("invalid peer certificate: UnknownIssuer", None)));
+            assert!(names_tls_failure(&cert), "{url}");
+        }
     }
 
     async fn serve(app: Router) -> String {

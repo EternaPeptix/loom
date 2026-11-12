@@ -11,7 +11,9 @@
 //! ## Commands
 //! - `daemon`: `serve::run`. `up`: `serve::spawn_background`, then print `loom is running on
 //!   {bind}` (or `already running`). `down`: `client.shutdown()`, wait until it stops answering
-//!   (10 s), print `stopped`.
+//!   (10 s), then until the old process lets go of `<home>/daemon.lock` (2 × `tools.kill_grace_s` + 30 s;
+//!   past that an error names its pid), print `stopped`. When nothing answers, the lock is held and
+//!   `daemon.json` names a live pid (a daemon still shutting down), only the second wait.
 //! - `status`: `render::status`. Exit 1 when the daemon is not running (with the usual sentence).
 //! - `open`: request a login code and open `http://{bind}/#code={code}` (`/usr/bin/open` on macOS,
 //!   `xdg-open` elsewhere); `--print` only prints it. The API token is never printed or passed on argv.
@@ -1094,22 +1096,42 @@ async fn cmd_up(paths: &Paths) -> Result<i32, String> {
 }
 
 async fn cmd_down(paths: &Paths) -> Result<i32, String> {
+    // A shutdown gives running commands the TERM-to-KILL grace twice (those of turns, then the sessions'
+    // jobs); the 30 s more cover the HTTP grace, tasks that have to be aborted and the proxy's connections.
+    let grace = Config::load(&paths.config_file()).unwrap_or_default().tools.kill_grace_s;
+    down(paths, Duration::from_secs(grace.saturating_mul(2).saturating_add(30))).await
+}
+
+/// `loom down`, waiting up to `within` for the old process to let go of the home once it no longer answers.
+async fn down(paths: &Paths, within: Duration) -> Result<i32, String> {
     let c = client_of(paths)?;
-    c.shutdown().await?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while c.alive().await {
-        if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "The daemon was asked to stop but still answers after 10 seconds. See {}.",
-                paths.logs_dir().join("loomd.log").display()
-            ));
+    if let Err(e) = c.shutdown().await {
+        // Nothing answers. A daemon still shutting down (an earlier `loom down` stopped waiting for it) is
+        // named, alive, in `daemon.json` and holds the home until it exits: that is waited for below. A
+        // daemon that is starting has not written `daemon.json` yet, or answers once it has.
+        let shutting_down = !crate::serve::home_lock_free(paths) && crate::serve::live_daemon_pid(paths).is_some();
+        if !shutting_down || c.alive().await {
+            return Err(e);
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    } else {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while c.alive().await {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "The daemon was asked to stop but still answers after 10 seconds. See {}.",
+                    paths.logs_dir().join("loomd.log").display()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
     // /healthz stops first; the old process keeps the home's lock until its shutdown is done.
-    if !crate::serve::wait_home_lock_free(paths, Duration::from_secs(30)).await {
+    if !crate::serve::wait_home_lock_free(paths, within).await {
+        let who = crate::serve::live_daemon_pid(paths).map_or("it".to_string(), |pid| format!("process {pid}"));
         return Err(format!(
-            "The daemon stopped answering but has not finished shutting down after 30 seconds, so `loom up` would be refused. Wait a little, then run `loom down` again; see {}.",
+            "The loom daemon for {} no longer answers but is still shutting down after {} seconds, so `loom up` would be refused until {who} exits. Run `loom down` again to keep waiting, then `loom up`; see {}.",
+            paths.home.display(),
+            within.as_secs(),
             paths.logs_dir().join("loomd.log").display()
         ));
     }
@@ -1616,6 +1638,42 @@ mod tests {
         let code = open_with(&c, &OpenArgs { print: true }, &mut out, |_| Err("nothing to open".into())).await;
         assert_eq!(code, Err("Refused.".to_string()));
         assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn down_waits_for_a_daemon_that_no_longer_answers_to_let_go_of_the_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        std::fs::create_dir_all(&paths.home).unwrap();
+        std::fs::write(paths.token_file(), "t").unwrap();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let write = |pid: u32| {
+            let file = crate::wire::DaemonFile { pid, bind: closed.to_string(), started_ms: 1 };
+            std::fs::write(paths.home.join("daemon.json"), serde_json::to_string(&file).unwrap()).unwrap();
+            file
+        };
+        let held = crate::serve::take_home_lock(&paths).unwrap();
+        // A daemon that is starting holds the home before it writes `daemon.json` (here a stale one naming
+        // a pid no process can have): it is not waited for.
+        write(4_000_000_000);
+        let err = tokio::time::timeout(Duration::from_secs(2), down(&paths, Duration::from_secs(60))).await.unwrap().unwrap_err();
+        assert!(err.starts_with("The loom daemon is not running"), "{err}");
+        // `daemon.json` names a live process (this one) where nothing answers: a daemon shutting down. Still
+        // holding the home when the wait runs out, the error names the process to wait for.
+        let file = write(std::process::id());
+        let err = down(&paths, Duration::from_millis(200)).await.unwrap_err();
+        assert!(err.contains(&format!("until process {} exits", file.pid)), "{err}");
+        assert!(err.contains("Run `loom down` again to keep waiting"), "{err}");
+        // Let go during the wait: `stopped`.
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(held);
+        });
+        assert_eq!(down(&paths, Duration::from_secs(5)).await, Ok(0));
+        release.await.unwrap();
+        // Nothing answers and nothing holds the home: the daemon is not running.
+        let err = down(&paths, Duration::from_secs(5)).await.unwrap_err();
+        assert!(err.starts_with("The loom daemon is not running"), "{err}");
     }
 
     #[test]
