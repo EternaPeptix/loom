@@ -160,9 +160,12 @@
 //! options.len())`; a failed request is `Vote{option: None, reason: texts::sentence(&error)}`.
 //! `cancel` → `Err("Interrupted before the votes were in.")`. Votes are returned in seed order.
 //!
-//! `producer(mission, blob)`: the first `tool_result` record with `output.id == blob` among the
-//! sessions of the mission (a session's own records only — a fork's copied records belong to its
-//! parent): `Producer{session, call_id, tool: name, class}`. Kept as an in-memory index fed by
+//! `producer(mission, blob)`: the first record that stores `blob` among the sessions of the mission (a
+//! session's own records only — a fork's copied records belong to its parent): a `tool_result` with
+//! `output.id == blob`; a successful `read` result whose `META_OF_BLOB` is `blob` (the file text it
+//! stored); a `job_settled` whose output is `blob`, credited to the call named by the `job_registered`
+//! of that job (`bash`, class `Exec`). Views of runtime tools register nothing.
+//! `Producer{session, call_id, tool: name, class}`. Kept as an in-memory index fed by
 //! every record that passes through the sink; on a miss for a mission whose logs have not been
 //! scanned since start, scan the logs of all its sessions once, then answer.
 //!
@@ -342,7 +345,7 @@ use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
     Author, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, Forked, InboxItem, ModelRef, NetDecision, Record,
     Seq, SessionOutcome, SessionStart, SpawnMode, Termination, ToolClass, ToolStatus, TurnEndReason, Usage,
-    META_JOB, META_OF_BLOB,
+    META_OF_BLOB,
 };
 use loom_core::journal::{self, Journal};
 use loom_core::ledger::LedgerState;
@@ -610,9 +613,9 @@ fn own_records(records: &[Record]) -> &[Record] {
 
 /// The stored output an event makes citable as evidence, and what produced it. A result's own
 /// output; the text a `read` showed (the result is a view, `META_OF_BLOB` names the stored file text);
-/// the complete output of a background job, attributed to the call that started it (`jobs` remembers
-/// the first result that names each job). A view of a runtime tool's output (`out_read`, `out_grep`)
-/// is not an observation and registers nothing.
+/// the complete output of a background job, attributed to the call that started it (`jobs` is filled by
+/// `job_registered`, which states that call, and emptied by `job_settled`; only `bash` starts jobs). A
+/// view of a runtime tool's output (`out_read`, `out_grep`) is not an observation and registers nothing.
 fn produced_by(
     session: &SessionId,
     jobs: &mut HashMap<(SessionId, String), Producer>,
@@ -621,9 +624,6 @@ fn produced_by(
     match event {
         Event::ToolResult(t) => {
             let p = Producer { session: session.clone(), call_id: t.call_id.clone(), tool: t.name.clone(), class: t.class };
-            if let Some(job) = t.meta.get(META_JOB).and_then(|v| v.as_str()) {
-                jobs.entry((session.clone(), job.to_string())).or_insert_with(|| p.clone());
-            }
             if let Some(o) = &t.output {
                 return Some((o.id.clone(), p));
             }
@@ -633,8 +633,14 @@ fn produced_by(
             }
             None
         }
-        Event::JobSettled { job_id, output: Some(o), .. } => {
-            jobs.get(&(session.clone(), job_id.clone())).map(|p| (o.id.clone(), p.clone()))
+        Event::JobRegistered { job_id, call_id, .. } => {
+            let p = Producer { session: session.clone(), call_id: call_id.clone(), tool: "bash".into(), class: ToolClass::Exec };
+            jobs.insert((session.clone(), job_id.clone()), p);
+            None
+        }
+        Event::JobSettled { job_id, output, .. } => {
+            let p = jobs.remove(&(session.clone(), job_id.clone()))?;
+            output.as_ref().map(|o| (o.id.clone(), p))
         }
         _ => None,
     }
@@ -1166,7 +1172,7 @@ impl Inner {
             let found = st.known.get(session).map(|k| (k.meta.mission.clone(), k.meta.title.clone()));
             if let Some((mission, title)) = found {
                 match &record.event {
-                    Event::ToolResult(_) | Event::JobSettled { .. } => {
+                    Event::ToolResult(_) | Event::JobRegistered { .. } | Event::JobSettled { .. } => {
                         if let Some((blob, p)) = produced_by(session, &mut st.job_starts, &record.event) {
                             st.producers.entry((mission.clone(), blob)).or_insert(p);
                         }
@@ -3814,6 +3820,51 @@ mod tests {
         e.rt.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn a_finished_jobs_complete_output_can_be_cited_as_execution_evidence() {
+        let path = Arc::new(Mutex::new(String::new()));
+        let p = path.clone();
+        let e = env(Script::new(move |body, _| match tool_msgs(body) {
+            0 => call("read", json!({"path": lock(&p).clone()})),
+            1 => call("claim", json!({"text": "the job printed two lines"})),
+            // This evidence call makes the runtime scan the mission's logs, so the job below is registered live.
+            2 => call(
+                "evidence",
+                json!({"claim": "c1", "handle": handle_in_tool_msg(body, 0), "start": 1, "end": 1, "note": "n", "quote": "line one of the file"}),
+            ),
+            3 => call("bash", json!({"command": "printf 'alpha line one\\nbeta line two\\n'", "background": true})),
+            4 => call("job_wait", json!({"job": "j1", "timeout_s": 30})),
+            5 => call(
+                "evidence",
+                json!({"claim": "c1", "handle": handle_in_tool_msg(body, 4), "start": 1, "end": 2, "note": "n",
+                       "quote": "alpha line one\nbeta line two"}),
+            ),
+            _ => Action::Reply(Reply::text("done")),
+        }))
+        .await;
+        let file = e.ws.join("notes.txt");
+        std::fs::write(&file, "line one of the file\nline two of the file\n").unwrap();
+        *lock(&path) = file.display().to_string();
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        let evidence = |e: &Env| -> Vec<(ToolStatus, String)> {
+            e.records(&id)
+                .into_iter()
+                .filter_map(|r| match r.event {
+                    Event::ToolResult(t) if t.name == "evidence" => Some((t.status, t.text)),
+                    _ => None,
+                })
+                .collect()
+        };
+        until("two evidence calls", || evidence(&e).len() == 2).await;
+        let got = evidence(&e);
+        assert_eq!(got[0].0, ToolStatus::Ok, "{}", got[0].1);
+        assert_eq!(got[1].0, ToolStatus::Ok, "{}", got[1].1);
+        // The blob is content-addressed: the wait that returned the whole output may be the first call to
+        // store it, so the producer is that wait or the starting bash call. Either way it is execution.
+        assert!(got[1].1.contains("execution: "), "{}", got[1].1);
+        e.rt.shutdown().await;
+    }
+
     fn tool_result(call_id: &str, name: &str, class: ToolClass, output: Option<&str>, meta: Value) -> Event {
         Event::ToolResult(loom_core::event::ToolResult {
             call_id: CallId::from(call_id),
@@ -3840,9 +3891,11 @@ mod tests {
         assert!(produced_by(&s, &mut jobs, &view).is_none());
         let grep = tool_result("c3", "out_grep", ToolClass::Read, None, json!({"of_blob": "ee02", "shown": [[1, 2]]}));
         assert!(produced_by(&s, &mut jobs, &grep).is_none());
-        // A background job's complete output belongs to the call that started it, not to a later wait.
-        let start = tool_result("c4", "bash", ToolClass::Exec, None, json!({"job": "j1"}));
-        assert!(produced_by(&s, &mut jobs, &start).is_none());
+        // A background job's complete output belongs to the call that started it (named by `job_registered`),
+        // not to a later wait, and a reused job id is credited to its latest start.
+        let reg = |call: &str| Event::JobRegistered { job_id: "j1".into(), call_id: CallId::from(call), command: "make".into() };
+        assert!(produced_by(&s, &mut jobs, &reg("c0")).is_none());
+        assert!(produced_by(&s, &mut jobs, &reg("c4")).is_none());
         let wait = tool_result("c5", "job_wait", ToolClass::Exec, None, json!({"job": "j1"}));
         assert!(produced_by(&s, &mut jobs, &wait).is_none());
         let settled = Event::JobSettled {
@@ -3852,7 +3905,8 @@ mod tests {
             detail: String::new(),
         };
         let p = produced_by(&s, &mut jobs, &settled).expect("the job output registers");
-        assert_eq!((p.0, p.1.call_id, p.1.class), (BlobId::from("dd03"), CallId::from("c4"), ToolClass::Exec));
+        assert_eq!((p.0, p.1.call_id, p.1.class, p.1.tool.as_str()), (BlobId::from("dd03"), CallId::from("c4"), ToolClass::Exec, "bash"));
+        assert!(jobs.is_empty(), "a settled job is forgotten");
         // A job nothing is known about registers nothing.
         let other = Event::JobSettled { job_id: "j9".into(), exit_code: None, output: None, detail: String::new() };
         assert!(produced_by(&s, &mut jobs, &other).is_none());

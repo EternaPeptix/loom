@@ -20,7 +20,8 @@
 //! a similar name exist in the same directory (edit distance ≤ 2, or same name ignoring case), name
 //! up to 3 of them. Otherwise: read the bytes, record them as seen, `view::store_text`, then exactly
 //! as `out_read` (window with `cfg.read_max_lines`, numbered lines, `max_line_chars` 20_000) and
-//! return `Body::View` of the stored text. Facts: the path as given, `view::range_fact`, the
+//! return `Body::View` of the stored text. Facts: the path as given, `view::range_fact`, the handle of
+//! the stored text (`out:…`, whose line numbers are the ones shown; `evidence` quotes it), the
 //! normalisation notes when there are any. Binary content: the body is the one-line description from
 //! `normalize`. An empty file: body `(empty file)`.
 //!
@@ -28,7 +29,8 @@
 //! range or to search it with `bash` (`grep` skips files of that size). With a range the file is
 //! streamed and only the lines of the window are kept: at most 80_000 bytes of each line, and at most
 //! `WINDOW_BYTES` (4 MiB) in all — a window that reaches that size ends after the line that reached it
-//! and the range fact says so and where to continue. The kept lines are normalised and stored like a
+//! and the range fact says so and where to continue. The window has no handle (its stored lines are
+//! numbered from 1, the text shows the file's own numbers): a fact says to quote it from `bash`. The kept lines are normalised and stored like a
 //! whole read and returned as `Body::View` of that stored window: the text numbers the lines as in
 //! the file, `shown` counts them in the stored window. The file is then recorded as seen by size and
 //! modification time. The lines of such a file are counted only when the scan reaches its end. A
@@ -671,7 +673,8 @@ fn read_large_range(ctx: &ToolCtx, given: &str, file: File, meta: &Metadata, sta
     };
     let mut out = ToolOutput::ok("ok", Body::View { of: stored.id, text, shown: vec![(1, w.count)] })
         .with_more(given.to_string())
-        .with_more(range);
+        .with_more(range)
+        .with_more("this window of a large file has no handle: to cite lines of it as evidence, quote them from a bounded `bash` command instead");
     if shortened > 0 {
         out = out.with_more(format!("{shortened} long lines shortened"));
     }
@@ -1206,6 +1209,8 @@ mod tests {
         let facts = out.more.join(" · ");
         assert!(facts.contains("lines 10-12 — more below") && facts.contains("before line 50"), "{facts}");
         assert!(facts.contains("size limit of 20 bytes") && facts.contains("continue with `start` 13"), "{facts}");
+        // The stored window is numbered from 1 while the text shows the file's numbers: no handle, and it says so.
+        assert!(facts.contains("has no handle") && facts.contains("bounded `bash` command") && !facts.contains("out:"), "{facts}");
         // A window that ends at the line asked for, or with the file, was not cut by its size.
         let out = read_limited(&e, "rows.txt", Some(10), Some(12), limits);
         assert!(view_of(&e, &out).0.ends_with("12\trow 12") && !out.more.join(" · ").contains("size limit"), "{:?}", out.more);
