@@ -2556,16 +2556,24 @@ impl Runtime {
             return Err(no_session(id));
         }
         let path = self.inner.paths.session_dir(id).join("net.jsonl");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
+        // Lossy, so an append torn inside a character does not hide the lines before it.
+        let text = match std::fs::read(&path) {
+            Ok(t) => String::from_utf8_lossy(&t).into_owned(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
-        if let Err(b) = loom_net::netlog::verify(&text) {
-            return Err(format!(
-                "The egress audit log {} is damaged at {b}. Do not trust it: it was edited, truncated or written by something else. Keep a copy for review and move it aside to start a new chain.",
-                path.display()
-            ));
+        match loom_net::netlog::verify(&text) {
+            Err(b) => {
+                return Err(format!(
+                    "The egress audit log {} is damaged at {b}. Do not trust it: it was edited, truncated or written by something else. Keep a copy for review and move it aside to start a new chain.",
+                    path.display()
+                ))
+            }
+            Ok(v) => {
+                if let Some(torn) = v.torn_tail {
+                    tracing::warn!("the egress audit log {} ends in a torn append: {torn}", path.display());
+                }
+            }
         }
         let mut entries: Vec<NetEntry> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
         if entries.len() > limit {
@@ -3131,6 +3139,10 @@ mod tests {
         assert_eq!(hosts, ["old.test", "a.test", "b.test"]);
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("\"prev\"").count(), 2);
+        // An append torn by a crash, here inside a character, does not hide the lines before it.
+        std::fs::write(&path, [text.as_bytes(), &"{\"rule\":\"…".as_bytes()[..10]].concat()).unwrap();
+        let hosts: Vec<String> = e.rt.net(&id, 10).unwrap().into_iter().map(|n| n.decision.host).collect();
+        assert_eq!(hosts, ["old.test", "a.test", "b.test"]);
         // A modified line is reported, not served.
         std::fs::write(&path, text.replace("a.test", "z.test")).unwrap();
         let err = e.rt.net(&id, 10).unwrap_err();
@@ -3142,7 +3154,7 @@ mod tests {
         audit(None, &decision("v.test")).unwrap();
         let text = std::fs::read_to_string(e.rt.paths().logs_dir().join(UNATTRIBUTED_NET)).unwrap();
         assert_eq!(text.lines().count(), 2);
-        assert_eq!(loom_net::netlog::verify(&text), Ok(()));
+        assert_eq!(loom_net::netlog::verify(&text), Ok(Default::default()));
     }
 
     /// Standard base64, for a Basic credential in a test.
@@ -3198,7 +3210,7 @@ mod tests {
         // A request that names no session lands in the daemon's own file.
         assert!(ask("garbage\r\n\r\n".to_string()).await.starts_with("HTTP/1.1 400 "));
         let text = std::fs::read_to_string(e.rt.paths().logs_dir().join(UNATTRIBUTED_NET)).unwrap();
-        assert_eq!(loom_net::netlog::verify(&text), Ok(()));
+        assert_eq!(loom_net::netlog::verify(&text), Ok(Default::default()));
         assert!(text.contains("bad request: the request head could not be parsed"), "{text}");
         e.rt.shutdown().await;
     }

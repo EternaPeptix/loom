@@ -26,6 +26,14 @@
 //! Special addresses: IPv4 0.0.0.0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0.0/24,
 //! 192.168/16, 198.18/15, 224/4 and above; IPv6 `::`, `::1`, fc00::/7, fe80::/10, ff00::/8, and
 //! IPv4-mapped/compatible forms of any special IPv4 address (check the embedded address).
+//! IPv6 forms that carry an IPv4 address are judged by that address, and the deny list and
+//! `allow_private` see it too: IPv4-mapped, IPv4-compatible, NAT64 (`64:ff9b::/96`, and the local-use
+//! `64:ff9b:1::/48` in its /96 form `64:ff9b:1::a.b.c.d`) and 6to4 (`2002:aabb:ccdd::/48` carries
+//! `aa.bb.cc.dd`). Also special: the rest of `64:ff9b::/32` (a translator could read an IPv4 address
+//! from it in another layout), discard-only `100::/64` and the dummy prefix `100:0:0:1::/64`, the IETF
+//! protocol assignments `2001::/23` (Teredo `2001::/32`, benchmarking, ORCHID, ORCHIDv2, DETs) except
+//! the globally reachable anycast addresses `2001:1::1`..`2001:1::3`, AMT `2001:3::/32` and AS112
+//! `2001:4:112::/48`; documentation `2001:db8::/32` and `3fff::/20`; SRv6 SIDs `5f00::/16`.
 //!
 //! `Verdict::allowed` + `rule` are what the proxy reports. Everything here is deterministic and does
 //! no I/O.
@@ -185,14 +193,15 @@ impl IpNet {
         }
     }
 
-    /// A block inside the IPv4-mapped range (`::ffff:0:0/96`), or inside the IPv4-compatible range with a
-    /// non-zero first octet, as the IPv4 block it stands for; any other block as it is.
+    /// A block inside the IPv4-mapped range (`::ffff:0:0/96`), inside the IPv4-compatible range with a
+    /// non-zero first octet, or inside a NAT64 /96 (`64:ff9b::/96`, `64:ff9b:1::/96`), as the IPv4 block
+    /// it stands for; any other block as it is.
     fn canonical(self) -> IpNet {
         let IpNet::V6 { base, mask } = self else { return self };
         let Some(v4_prefix) = mask.count_ones().checked_sub(96) else { return self };
         let v4 = Ipv4Addr::from(u32::try_from(base & u128::from(u32::MAX)).unwrap_or(0));
         let high = base >> 32;
-        let mapped = high == 0xffff;
+        let mapped = high == 0xffff || high == NAT64_WKP || high == NAT64_LOCAL;
         let compatible = high == 0 && v4_prefix >= 8 && v4.octets().first().is_some_and(|o| *o != 0);
         match u8::try_from(v4_prefix) {
             Ok(p) if mapped || compatible => IpNet::new(IpAddr::V4(v4), p),
@@ -327,26 +336,34 @@ impl Policy {
     }
 }
 
-/// The IPv4 address inside an IPv4-mapped (`::ffff:a.b.c.d`) or IPv4-compatible (`::a.b.c.d`) address.
+/// The first 96 bits of the NAT64 well-known prefix `64:ff9b::/96`.
+const NAT64_WKP: u128 = 0x0064_ff9b_0000_0000_0000_0000;
+/// The first 96 bits of `64:ff9b:1::/96`, the /96 form of the local-use NAT64 prefix `64:ff9b:1::/48`.
+const NAT64_LOCAL: u128 = 0x0064_ff9b_0001_0000_0000_0000;
+
+/// The IPv4 address an IPv6 address carries: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible
+/// (`::a.b.c.d`), NAT64 (`64:ff9b::a.b.c.d`, `64:ff9b:1::a.b.c.d`) or 6to4 (`2002:aabb:ccdd::/48`).
 fn embedded_v4(a: Ipv6Addr) -> Option<Ipv4Addr> {
-    let [s0, s1, s2, s3, s4, s5, s6, s7] = a.segments();
-    let head_zero = s0 == 0 && s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0;
-    if !head_zero || (s5 != 0xffff && s5 != 0) {
-        return None;
+    let v4 = |hi: u16, lo: u16| {
+        let ([a0, a1], [a2, a3]) = (hi.to_be_bytes(), lo.to_be_bytes());
+        Ipv4Addr::new(a0, a1, a2, a3)
+    };
+    match a.segments() {
+        [0, 0, 0, 0, 0, 0 | 0xffff, hi, lo] | [0x64, 0xff9b, 0 | 1, 0, 0, 0, hi, lo] | [0x2002, hi, lo, ..] => {
+            Some(v4(hi, lo))
+        }
+        _ => None,
     }
-    let [a0, a1] = s6.to_be_bytes();
-    let [a2, a3] = s7.to_be_bytes();
-    Some(Ipv4Addr::new(a0, a1, a2, a3))
 }
 
-/// IPv4-mapped and IPv4-compatible IPv6 addresses as the IPv4 address they carry (`::` and `::1` stay).
+/// IPv6 addresses that carry an IPv4 address (see [`embedded_v4`]) as that address; `::`, `::1` and the
+/// other IPv4-compatible addresses in `::/104` stay IPv6 addresses.
 fn canonical_ip(addr: IpAddr) -> IpAddr {
     match addr {
-        IpAddr::V6(a) => match embedded_v4(a) {
-            Some(v4) if v4.octets().first().is_some_and(|o| *o != 0) || a.segments().get(5) == Some(&0xffff) => {
-                IpAddr::V4(v4)
-            }
-            _ => addr,
+        IpAddr::V6(a) => match (embedded_v4(a), a.segments()) {
+            (Some(v4), [0, 0, 0, 0, 0, 0, ..]) if v4.octets().first() == Some(&0) => addr,
+            (Some(v4), _) => IpAddr::V4(v4),
+            (None, _) => addr,
         },
         IpAddr::V4(_) => addr,
     }
@@ -376,10 +393,27 @@ pub fn is_special(addr: IpAddr) -> bool {
             if let Some(v4) = embedded_v4(a) {
                 return special_v4(v4);
             }
-            let [s0, ..] = a.segments();
-            (s0 & 0xfe00) == 0xfc00 || (s0 & 0xffc0) == 0xfe80 || (s0 & 0xff00) == 0xff00
+            special_v6(a)
         }
     }
+}
+
+/// The IPv6 ranges of the module contract that carry no IPv4 address [`embedded_v4`] can read.
+fn special_v6(a: Ipv6Addr) -> bool {
+    let [s0, s1, s2, s3, s4, s5, s6, s7] = a.segments();
+    // The globally reachable parts of 2001::/23: the PCP, TURN and DNS-SD SRP anycast addresses
+    // (2001:1::1 to 2001:1::3), AMT (2001:3::/32) and AS112-v6 (2001:4:112::/48).
+    let anycast = s1 == 1 && s2 == 0 && s3 == 0 && s4 == 0 && s5 == 0 && s6 == 0 && (1..=3).contains(&s7);
+    let global_ietf = anycast || s1 == 3 || (s1 == 4 && s2 == 0x112);
+    (s0 & 0xfe00) == 0xfc00
+        || (s0 & 0xffc0) == 0xfe80
+        || (s0 & 0xff00) == 0xff00
+        || (s0 == 0x64 && s1 == 0xff9b)
+        || (s0 == 0x100 && s1 == 0 && s2 == 0 && s3 <= 1)
+        || (s0 == 0x2001 && s1 < 0x200 && !global_ietf)
+        || (s0 == 0x2001 && s1 == 0xdb8)
+        || (s0 == 0x3fff && s1 < 0x1000)
+        || s0 == 0x5f00
 }
 
 #[cfg(test)]
@@ -531,8 +565,78 @@ mod tests {
         let no = [
             "1.0.0.0", "9.255.255.255", "11.0.0.0", "100.63.255.255", "100.128.0.0", "126.255.255.255", "128.0.0.0",
             "169.253.255.255", "169.255.0.0", "172.15.255.255", "172.32.0.0", "192.0.1.0", "192.167.255.255", "192.169.0.0",
-            "198.17.255.255", "198.20.0.0", "223.255.255.255", "8.8.8.8", "2001:db8::1", "2606:4700::1", "fbff::1", "fec0::1",
+            "198.17.255.255", "198.20.0.0", "223.255.255.255", "8.8.8.8", "2606:4700::1", "fbff::1", "fec0::1",
             "feff::1", "::ffff:8.8.8.8", "::8.8.8.8", "fe00::1",
+        ];
+        for a in no {
+            assert!(!is_special(ip(a)), "{a} should not be special");
+        }
+    }
+
+    /// `v4` as NAT64 (well-known and local-use prefix) and 6to4 addresses.
+    fn carried(v4: &str) -> [String; 3] {
+        let n = u32::from(v4.parse::<Ipv4Addr>().unwrap());
+        [format!("64:ff9b::{v4}"), format!("64:ff9b:1::{v4}"), format!("2002:{:x}:{:x}::1", n >> 16, n & 0xffff)]
+    }
+
+    #[test]
+    fn ipv6_forms_that_carry_an_ipv4_address_are_judged_by_it() {
+        let open = pol(NetworkMode::Open, &[], &[], &[]);
+        let al = pol(NetworkMode::Allowlist, &["x.test"], &[], &[]);
+        for v4 in ["10.0.0.5", "127.0.0.1", "169.254.169.254"] {
+            let listed = pol(NetworkMode::Allowlist, &["x.test"], &[], &[v4]);
+            for a in carried(v4) {
+                assert!(is_special(ip(&a)), "{a}");
+                assert_eq!(canonical_ip(ip(&a)), ip(v4), "{a}");
+                let v = open.check_addr("x.test", 443, ip(&a), "mode open");
+                assert_eq!(v, Verdict { allowed: false, rule: format!("deny private-address {}", ip(&a)) }, "{a}");
+                assert!(!al.check_addr("x.test", 443, ip(&a), &al.check_name("x.test", 443).rule).allowed, "{a}");
+                assert_eq!(listed.check_addr("x.test", 443, ip(&a), "allow x.test").rule, format!("allow_private {v4}"));
+            }
+        }
+        // A public address inside them keeps the name rule.
+        for a in carried("8.8.8.8") {
+            assert!(!is_special(ip(&a)), "{a}");
+            assert_eq!(open.check_addr("x.test", 443, ip(&a), "mode open"), Verdict::yes("mode open"), "{a}");
+            assert_eq!(al.check_addr("x.test", 443, ip(&a), "allow x.test"), Verdict::yes("allow x.test"), "{a}");
+        }
+        // A deny entry on the carried address wins, also over allow_private and before resolving a literal.
+        let p = pol(NetworkMode::Open, &[], &["10.0.0.5", "8.8.8.0/24"], &["10.0.0.0/8"]);
+        for a in carried("10.0.0.5") {
+            assert_eq!(p.check_addr("x.test", 80, ip(&a), "mode open").rule, "deny 10.0.0.5", "{a}");
+            assert_eq!(p.check_name(&format!("[{a}]"), 80).rule, "deny 10.0.0.5", "{a}");
+        }
+        for a in carried("8.8.8.8") {
+            assert_eq!(p.check_addr("x.test", 80, ip(&a), "mode open").rule, "deny 8.8.8.0/24", "{a}");
+        }
+        assert!(p.check_addr("x.test", 80, ip("64:ff9b::10.0.0.6"), "mode open").allowed);
+        // Entries written in these forms cover the plain IPv4 address.
+        let p = pol(NetworkMode::Open, &[], &["64:ff9b::10.0.0.5", "64:ff9b::a01:0/112"], &[]);
+        assert_eq!(p.check_addr("x.test", 80, ip("10.0.0.5"), "r").rule, "deny 64:ff9b::10.0.0.5");
+        assert_eq!(p.check_addr("x.test", 80, ip("2002:a01:203::1"), "r").rule, "deny 64:ff9b::a01:0/112");
+        // Teredo, and local-use NAT64 addresses outside the /96 form, carry nothing the policy reads.
+        let teredo = "2001:0:4136:e378:8000:63bf:3fff:fdd2";
+        for a in [teredo, "64:ff9b:1:1::808:808", "64:ff9b:2::808:808"] {
+            assert!(!open.check_addr("x.test", 443, ip(a), "mode open").allowed, "{a}");
+        }
+        let listed = pol(NetworkMode::Open, &[], &[], &["2001::/32"]);
+        assert_eq!(listed.check_addr("x.test", 443, ip(teredo), "mode open").rule, "allow_private 2001::/32");
+    }
+
+    #[test]
+    fn other_special_ipv6_ranges_at_edges() {
+        let yes = [
+            "100::", "100::1:0:0:0", "100:0:0:1:ffff:ffff:ffff:ffff", "2001::", "2001:0:ffff::1", "2001:1::4", "2001:2::1",
+            "2001:10::1", "2001:20::1", "2001:3f::1", "2001:1ff:ffff::1", "2001:db8::", "2001:db8:ffff::1", "3fff::",
+            "3fff:fff:ffff::1", "5f00::", "5f00:ffff::1", "64:ff9b:1:1::1", "64:ff9b:2::1", "64:ff9b:ffff::1",
+        ];
+        for a in yes {
+            assert!(is_special(ip(a)), "{a} should be special");
+        }
+        let no = [
+            "100:0:0:2::", "ff::1", "101::1", "2001:1::1", "2001:1::2", "2001:1::3", "2001:3::1", "2001:4:112::1",
+            "2001:200::", "2001:db7:ffff::1", "2001:db9::", "3ffe:ffff::1", "3fff:1000::", "5eff:ffff::1", "5f01::",
+            "64:ff9a::1", "64:ff9c::1", "2620:4f:8000::1", "2003::1",
         ];
         for a in no {
             assert!(!is_special(ip(a)), "{a} should not be special");

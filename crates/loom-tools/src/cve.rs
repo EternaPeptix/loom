@@ -13,6 +13,8 @@
 //! Timeout each whole exchange at `ctx.cfg.web_fetch_timeout_s`; `ctx.cancel` aborts (status
 //! `Interrupted`). A `407`/`403` carrying header `X-Loom-Proxy: 1` is `denied` with the proxy body
 //! (the host is not on the daemon's network allowlist — the message says so and names the host).
+//! Refusals are recognised as `web.rs` does: the marker only on the answer to an http:// URL through
+//! the proxy, and for an https:// URL the proxy's verdict asked for before the request.
 //!
 //! The daemon must allow these hosts (config `[network]` allowlist) or every call is denied:
 //! `services.nvd.nist.gov` (NVD), `api.first.org` (EPSS), `api.osv.dev` (OSV). The tools never
@@ -77,6 +79,7 @@
 //! advisory_lookup with and without version and the empty case; a proxy `403` with `X-Loom-Proxy`
 //! reads as `denied` naming the host; a bad CVE id is refused with the expected shape; cancellation.
 
+use crate::web::ProxyVerdict;
 use crate::{Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -243,24 +246,35 @@ fn describe(e: &(dyn std::error::Error + 'static)) -> String {
     parts.join(": ")
 }
 
-fn request_failure(e: &reqwest::Error, what: &str, host: &str) -> Failure {
+/// `allowed_by`: the rule by which the egress proxy said it would allow the host, when asked. The
+/// stage is read from the causes of the error, not from its own text, which names the URL.
+fn request_failure(e: &reqwest::Error, what: &str, host: &str, allowed_by: Option<&str>) -> Failure {
     let detail = describe(e);
-    let lower = detail.to_lowercase();
+    let lower = crate::web::causes(e).to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| lower.contains(w));
     let (stage, advice) = if e.is_timeout() {
-        ("timed out", "Try again later.")
-    } else if has(&["proxy", "tunnel"]) {
-        ("was refused by the egress proxy", "The session's network policy probably does not allow this host; do not retry.")
+        ("timed out".to_string(), "Try again later.")
     } else if has(&["dns", "resolve", "lookup", "name or service", "nodename", "no such host"]) {
-        ("could not resolve the host name", "Check the network and try again.")
+        ("could not resolve the host name".to_string(), "Check the network and try again.")
     } else if has(&["certificate", "tls", "ssl", "handshake"]) {
-        ("failed the TLS handshake", "The server's certificate or protocol was not acceptable.")
+        ("failed the TLS handshake".to_string(), "The server's certificate or protocol was not acceptable.")
+    } else if let (Some(rule), true) = (allowed_by, e.is_connect()) {
+        let stage = format!("could not be reached through the egress proxy, which allows it by rule `{rule}`");
+        (stage, "The service may be down; try again later.")
     } else if e.is_connect() {
-        ("could not connect", "The service may be down; try again later.")
+        ("could not connect".to_string(), "The service may be down; try again later.")
     } else {
-        ("failed", "Try again later.")
+        ("failed".to_string(), "Try again later.")
     };
     Failure::Error(format!("The {what} request to {host} {stage}: {detail}. {advice}"))
+}
+
+/// A refusal by the session's egress proxy, with its text.
+fn refused(text: &str, status: u16, what: &str, host: &str) -> Failure {
+    let message = if text.is_empty() { "(the proxy gave no reason)" } else { text };
+    Failure::Denied(format!(
+        "{message}\nThe session's egress proxy refused the {what} request (HTTP {status}): {host} is not on the daemon's network allowlist. Do not retry; ask the user to add {host} to the daemon's `[network]` allowlist if this lookup is needed."
+    ))
 }
 
 /// The body up to `limit` bytes; the flag says the response was larger.
@@ -284,17 +298,29 @@ async fn exchange(ctx: &ToolCtx, req: RequestBuilder, url: &Url, what: &str) -> 
     let host = url.host_str().unwrap_or("the host").to_string();
     let limit = Duration::from_secs(ctx.cfg.web_fetch_timeout_s.max(1));
     let max = usize::try_from(ctx.cfg.web_fetch_max_bytes).unwrap_or(usize::MAX);
+    let proxied = crate::web::session_proxy(ctx).is_some();
     let work = async {
-        let resp = req.send().await.map_err(|e| request_failure(&e, what, &host))?;
+        let (client, req) = req.build_split();
+        let req = req.map_err(|e| request_failure(&e, what, &host, None))?;
+        // The proxy answers the CONNECT of an https URL out of the client's sight, so it is asked first.
+        let mut allowed_by = None;
+        if proxied && url.scheme() == "https" {
+            match crate::web::proxy_verdict(&client, url).await {
+                Some(ProxyVerdict::Refused(status, text)) => return Err(refused(&text, status, what, &host)),
+                Some(ProxyVerdict::Unreachable(text)) => {
+                    return Err(Failure::Error(format!(
+                        "The {what} request to {host} failed: the egress proxy could not look up the host. {text}"
+                    )))
+                }
+                Some(ProxyVerdict::Allowed(rule)) => allowed_by = Some(rule),
+                None => {}
+            }
+        }
+        let resp = client.execute(req).await.map_err(|e| request_failure(&e, what, &host, allowed_by.as_deref()))?;
         let status = resp.status().as_u16();
-        let from_proxy = resp.headers().get("x-loom-proxy").and_then(|v| v.to_str().ok()) == Some("1");
-        if from_proxy && matches!(status, 403 | 407) {
+        if crate::web::marked_by_proxy(proxied, url, resp.headers()) && matches!(status, 403 | 407) {
             let (body, _) = read_limited(resp, PROXY_BODY_MAX).await.unwrap_or_default();
-            let message = String::from_utf8_lossy(&body).trim().to_string();
-            let message = if message.is_empty() { "(the proxy gave no reason)".to_string() } else { message };
-            return Err(Failure::Denied(format!(
-                "{message}\nThe session's egress proxy refused the {what} request (HTTP {status}): {host} is not on the daemon's network allowlist. Do not retry; ask the user to add {host} to the daemon's `[network]` allowlist if this lookup is needed."
-            )));
+            return Err(refused(String::from_utf8_lossy(&body).trim(), status, what, &host));
         }
         match read_limited(resp, max).await {
             Ok((body, false)) => Ok(Reply { status, body }),
@@ -1528,6 +1554,33 @@ mod tests {
         let r = e.call("advisory_lookup", json!({"name": "x", "ecosystem": "npm"})).await;
         assert_eq!(r.status, ToolStatus::Denied, "{}", r.text);
         assert!(r.text.contains("osv.blocked.invalid"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn an_https_refusal_by_the_real_proxy_names_its_rule_and_an_unreachable_host_is_not_one() {
+        use loom_core::config::{NetworkCfg, NetworkMode};
+        let deny = vec!["*.blocked.test".to_string()];
+        let cfg = NetworkCfg { mode: NetworkMode::Open, allow: Vec::new(), deny, allow_private: vec!["127.0.0.1".into()] };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let proxy = loom_net::Proxy::start(0, tx).await.unwrap();
+        let grant = proxy.grant(&loom_core::SessionId::from("s-cve"), loom_net::Policy::new(&cfg).unwrap());
+        let mut e = env();
+        e.ctx.env = Arc::new(grant.env());
+        seamed(&mut e, "https://nvd.blocked.test");
+        let r = e.call("cve_lookup", json!({"id": "CVE-2021-44228"})).await;
+        assert_eq!(r.status, ToolStatus::Denied, "{}", r.text);
+        assert!(r.text.contains("refused by rule `deny *.blocked.test`") && r.text.contains("nvd.blocked.test"), "{}", r.text);
+        // Allowed, but nothing listens there: an error naming the proxy's rule, not a refusal.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut e = env();
+        e.ctx.env = Arc::new(grant.env());
+        seamed(&mut e, &format!("https://127.0.0.1:{port}"));
+        let r = e.call("cve_lookup", json!({"id": "CVE-2021-44228"})).await;
+        assert_eq!(r.status, ToolStatus::Error, "{}", r.text);
+        assert!(r.text.contains("which allows it by rule `allow_private 127.0.0.1`"), "{}", r.text);
+        drop(proxy);
     }
 
     #[tokio::test]

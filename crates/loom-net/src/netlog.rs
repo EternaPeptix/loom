@@ -7,7 +7,8 @@
 //!
 //! An append that fails leaves the file as it was. A file that ends in an unterminated fragment that
 //! is not a JSON object (an append cut short by a crash) has the fragment cut off before the next
-//! append, so the chain goes on from the last whole line.
+//! append, so the chain goes on from the last whole line; until then [`verify`] checks the lines
+//! before it and reports the fragment as a torn tail, not as a break of the chain.
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -31,16 +32,57 @@ impl std::fmt::Display for ChainBreak {
     }
 }
 
+/// The file ends in an unterminated fragment that is not a JSON object: an append cut short by a crash.
+/// It is not part of the chain, and the writer cuts it off before its next append.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TornTail {
+    /// The fragment's line (1-based).
+    pub line: usize,
+    /// Its length in bytes.
+    pub bytes: usize,
+}
+
+impl std::fmt::Display for TornTail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "line {} is {} bytes of an append that did not finish; it is not part of the chain and is cut off before the next append",
+            self.line, self.bytes
+        )
+    }
+}
+
+/// What [`verify`] reports about a file whose chain holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Verified {
+    /// The torn fragment the file ends in, if it does; the lines before it were verified.
+    pub torn_tail: Option<TornTail>,
+}
+
 fn hash_line(line: &str) -> String {
     loom_core::sha256_hex(line.as_bytes())
 }
 
-/// Checks the chain of a whole file. `Ok(())` when every chained line names the hash of the line
-/// before it; otherwise the first line at which it does not.
-pub fn verify(text: &str) -> Result<(), ChainBreak> {
+/// `text` without an unterminated last fragment that is not a JSON object, and that fragment. An
+/// unterminated last fragment that is a JSON object is a whole line without its newline.
+fn split_torn(text: &str) -> (&str, Option<TornTail>) {
+    let end = text.rfind('\n').map_or(0, |i| i.saturating_add(1));
+    let fragment = text.get(end..).unwrap_or("");
+    if fragment.is_empty() || serde_json::from_str::<serde_json::Value>(fragment).is_ok_and(|v| v.is_object()) {
+        return (text, None);
+    }
+    let whole = text.get(..end).unwrap_or("");
+    (whole, Some(TornTail { line: whole.lines().count().saturating_add(1), bytes: fragment.len() }))
+}
+
+/// Checks the chain of a whole file. `Ok` when every chained line names the hash of the line before
+/// it, with the torn tail the file ends in, if any (see [`TornTail`]); otherwise the first line at
+/// which the chain does not hold.
+pub fn verify(text: &str) -> Result<Verified, ChainBreak> {
+    let (whole, torn_tail) = split_torn(text);
     let mut previous: Option<&str> = None;
     let mut chained = false;
-    for (i, line) in text.lines().enumerate() {
+    for (i, line) in whole.lines().enumerate() {
         let n = i.saturating_add(1);
         if line.trim().is_empty() {
             continue;
@@ -66,7 +108,7 @@ pub fn verify(text: &str) -> Result<(), ChainBreak> {
         }
         previous = Some(line);
     }
-    Ok(())
+    Ok(Verified { torn_tail })
 }
 
 /// (file length, hash of its last line) as this writer left a file; `None` when it must be read.
@@ -170,10 +212,10 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(first["prev"], GENESIS);
-        assert_eq!(verify(&text), Ok(()));
+        assert_eq!(verify(&text), Ok(Verified::default()));
         // A second writer continues the same chain.
         NetLogWriter::new().append(&path, &json!({"n": 3})).unwrap();
-        assert_eq!(verify(&std::fs::read_to_string(&path).unwrap()), Ok(()));
+        assert_eq!(verify(&std::fs::read_to_string(&path).unwrap()), Ok(Verified::default()));
     }
 
     #[test]
@@ -187,7 +229,7 @@ mod tests {
         std::fs::write(&path, format!("{whole}{{\"n\":1,\"pr")).unwrap();
         NetLogWriter::new().append(&path, &json!({"n": 2})).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(verify(&text), Ok(()), "{text}");
+        assert_eq!(verify(&text), Ok(Verified::default()), "{text}");
         assert_eq!(text.lines().count(), 2, "{text}");
         assert!(!text.contains("\"pr\n") && text.ends_with('\n'));
         // A whole object that only lacks its newline is kept and chained from.
@@ -195,8 +237,33 @@ mod tests {
         std::fs::write(&path, &unterminated).unwrap();
         NetLogWriter::new().append(&path, &json!({"n": 3})).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(verify(&text), Ok(()), "{text}");
+        assert_eq!(verify(&text), Ok(Verified::default()), "{text}");
         assert_eq!(text.lines().count(), 3, "{text}");
+    }
+
+    #[test]
+    fn a_torn_last_line_is_reported_apart_from_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net.jsonl");
+        let w = NetLogWriter::new();
+        for i in 0..3 {
+            w.append(&path, &json!({"n": i})).unwrap();
+        }
+        let whole = std::fs::read_to_string(&path).unwrap();
+        // A crash in the middle of the fourth append: the three lines before it still verify.
+        let torn = format!("{whole}{{\"n\":3,\"pr");
+        let report = verify(&torn).unwrap();
+        assert_eq!(report.torn_tail, Some(TornTail { line: 4, bytes: 10 }));
+        assert!(report.torn_tail.unwrap().to_string().starts_with("line 4 is 10 bytes of an append that did not finish"));
+        assert_eq!(verify(&format!("{whole}  ")).unwrap().torn_tail, Some(TornTail { line: 4, bytes: 2 }));
+        assert_eq!(verify("{\"n\":").unwrap().torn_tail, Some(TornTail { line: 1, bytes: 5 }));
+        // A whole object without its newline is a line of the chain, and is checked as one.
+        let unterminated = whole.trim_end().to_string();
+        assert_eq!(verify(&unterminated), Ok(Verified::default()));
+        assert_eq!(verify(&unterminated.replacen("\"n\":1", "\"n\":9", 1)).unwrap_err().line, 3);
+        // A broken chain before a torn tail is still a break.
+        let tampered = torn.replacen("\"n\":1", "\"n\":7", 1);
+        assert_eq!(verify(&tampered).unwrap_err().line, 3);
     }
 
     #[test]
@@ -220,7 +287,7 @@ mod tests {
         for p in &paths {
             let text = std::fs::read_to_string(p).unwrap();
             assert_eq!(text.lines().count(), 40);
-            assert_eq!(verify(&text), Ok(()));
+            assert_eq!(verify(&text), Ok(Verified::default()));
         }
     }
 
@@ -247,8 +314,8 @@ mod tests {
         w.append(&path, &json!({"n": 2})).unwrap();
         w.append(&path, &json!({"n": 3})).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(verify(&text), Ok(()));
-        assert_eq!(verify("{\"n\":0}\n{\"n\":1}\n"), Ok(()));
+        assert_eq!(verify(&text), Ok(Verified::default()));
+        assert_eq!(verify("{\"n\":0}\n{\"n\":1}\n"), Ok(Verified::default()));
         let tampered = text.replacen("\"n\":1", "\"n\":7", 1);
         assert_eq!(verify(&tampered).unwrap_err().line, 3);
     }

@@ -984,6 +984,7 @@ dependencies = [
  "ignore",
  "libc",
  "loom-core",
+ "loom-net",
  "regex",
  "reqwest",
  "serde",
