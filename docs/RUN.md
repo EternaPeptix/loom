@@ -60,7 +60,7 @@ default. Unknown keys are errors, so a typo does not go unnoticed. The values th
   until the server returns. A failure waiting cannot cure (a reply that is not an event stream, for
   example) ends the request after three attempts in a row whatever this is set to.
 - `[context] target_tokens` and `floor_tokens`: a re-weave folds old output out of view when the prompt
-  passes the target, down to the floor. The target must be below the model's window.
+  passes the target, down to the floor. A session clamps both to a smaller model window automatically.
 - `[network] mode`: `deny_all` (the default), `allowlist` or `open`; see below.
 - `[sandbox] protect_credentials` (default `true`): see below.
 - `[tools] speculate` (default `true`): the leading read-only calls of a reply (`read`, `glob`, `grep`,

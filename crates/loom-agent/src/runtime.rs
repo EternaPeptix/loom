@@ -21,7 +21,8 @@
 //!   *Start*), so that the parent gets the whole report. A child that ended without the file (a
 //!   crash between its `session_end` and the write, or a log from before the file existed) is
 //!   recovered from its log instead, with the first line of its report.
-//! - `tmp/` (`paths.session_tmp`) — the session's scratch directory; `jobs/` — its job table's files.
+//! - `tmp/` (`paths.session_tmp`) — the session's scratch directory, emptied once the session can run no
+//!   command again (see *When a session's task ends*, `archive` and *Start*); `jobs/` — its job table's files.
 //! - `queued/` — operator rules, approvals and withdrawals handed to the session and not recorded
 //!   yet, one JSON file each (`session::queue_input`); the session deletes each once recorded.
 //!
@@ -62,6 +63,13 @@
 //!   steps and usage from the last status (usage: default)}`, and its status becomes `Ended` /
 //!   `Failed` (published and written), so that a later start does not run it again beside the
 //!   settlement its parent was given.
+//!
+//! A child that settled or failed, a session an archive closed and one whose log had ended can run no
+//! command again: its scratch directory (`tmp/`) is emptied, off the async workers (a command may have
+//! left many files there). A child's is emptied after its settlement has been recorded and delivered; a
+//! session that ended `Closed` has its emptied before its task gives up its place, so that an unarchive
+//! cannot start it again while the removal runs. A session that ended just before a crash, before its task
+//! got this far, keeps its scratch directory until it is archived.
 //!
 //! A panic in a session's task is caught and ends the session as `End::Fatal(texts::task_failed(
 //! <the panic's message>, <is a child>))`.
@@ -219,9 +227,9 @@
 //!   that quotes the ledger (`Still open:`, written by the model) starts with that label; the rest is
 //!   unchanged. The title of a child session was written by the model: it starts with `unverified: `
 //!   in the notification title (`LOOM_TITLE` too).
-//! - Low disk: when the volume of the loom home turns low (`LOW_DISK_BYTES`, `LOW_DISK_PERCENT`; checked
-//!   once a minute) one notification of kind `disk` is raised, and no other until the disk has
-//!   recovered and turned low again.
+//! - Low disk: when the volume of the loom home turns low ([`disk_is_low`]: under `LOW_DISK_BYTES` or
+//!   `LOW_DISK_PERCENT` free; checked once a minute, off the async workers) one notification of kind
+//!   `disk` is raised, and no other until the disk has recovered and turned low again.
 //! - At start, every restored open blocking item is notified once (`Still waiting: {text}`) and its
 //!   repeat notice is armed as for a live one.
 //!
@@ -269,7 +277,8 @@
 //!   each child settles `Stopped`; a task keeps its place until it has ended). Unarchiving waits for
 //!   those tasks to end (at most `tools.kill_grace_s` + `SHUTDOWN_TASK_WAIT`), delivers what the
 //!   children settled with in the meantime, and restores those that had not settled as the start
-//!   does (an unattended mission's go on at once).
+//!   does (an unattended mission's go on at once). Archiving empties the scratch directories of the
+//!   sessions of the family that have no task before it returns; the others' are emptied as their tasks end.
 //!   Archived sessions are listed only by `sessions(true)` and are not activated at start;
 //!   `send_message`/`resume` on one are refused (`This session is archived; unarchive it first.`).
 //!
@@ -281,9 +290,9 @@
 //! 3. Activate as described under *Active sessions*. A session that cannot be opened is skipped
 //!    with `tracing::error!` and a `BusEvent::Error`; a child that cannot be opened while its lead
 //!    can will never run again, and is settled on its behalf: `Failed`, report
-//!    `texts::unopenable_report(error)`, kept in `settlement.json`, status `Ended`/`Failed`. Before
-//!    that, off the async workers, what a previous daemon left in the `jobs/` of every other session
-//!    that is not archived is cleared (`loom_tools::jobs::clear_leftovers`, logged); a session to
+//!    `texts::unopenable_report(error)`, kept in `settlement.json`, status `Ended`/`Failed` (and its
+//!    scratch directory is emptied, off the async workers). Before that, off the async workers, what
+//!    a previous daemon left in the `jobs/` of every other session that is not archived is cleared (`loom_tools::jobs::clear_leftovers`, logged); a session to
 //!    activate is left to its job table, so one whose activation fails keeps its records for the
 //!    next start.
 //! 4. Restored root sessions with `meta.unattended` are told to carry on (`Input::Resume`) when
@@ -1425,12 +1434,17 @@ impl Inner {
         }
     }
 
-    /// Empty the scratch directory of a session that can no longer run commands. Failures are warnings.
-    fn clear_scratch(&self, id: &SessionId) {
-        let dir = self.paths.session_tmp(id);
-        if let Err(e) = empty_dir(&dir) {
-            tracing::warn!("cannot empty the scratch directory {}: {e}", dir.display());
-        }
+    /// Empty the scratch directory of a session that can no longer run commands (see `clear_scratch_dir`).
+    fn clear_scratch(&self, id: &SessionId) -> tokio::task::JoinHandle<()> {
+        clear_scratch_dir(self.paths.session_tmp(id))
+    }
+
+    /// The scratch directory of `id`, whose task ended `Closed`, when it can run no command again: an archive
+    /// closed it, or its log had ended. `None` otherwise (a shutdown, which the next start goes on from).
+    fn scratch_after_close(&self, id: &SessionId) -> Option<PathBuf> {
+        let st = self.st();
+        let over = st.known.get(id).is_some_and(|k| k.meta.archived || k.status.phase == Phase::Ended);
+        over.then(|| self.paths.session_tmp(id))
     }
 
     fn repeat_notice(self: &Arc<Self>, kind: &str, session: &SessionId, title: &str, item: &InboxItem) {
@@ -1670,6 +1684,13 @@ impl Inner {
                 Ok(end) => end,
                 Err(payload) => End::Fatal(texts::task_failed(&panic_message(payload.as_ref()), is_child)),
             };
+            // Emptied while the task still holds the session's place, so that nothing starts it again (an
+            // unarchive waits for the task) while the removal runs.
+            if matches!(end, End::Closed) {
+                if let Some(dir) = weak.upgrade().and_then(|inner| inner.scratch_after_close(&sid)) {
+                    let _ = clear_scratch_dir(dir).await;
+                }
+            }
             if let Some(inner) = weak.upgrade() {
                 inner.on_end(&sid, gen, end);
             }
@@ -1744,11 +1765,6 @@ impl Inner {
 
     fn on_end(self: &Arc<Self>, id: &SessionId, gen: u64, end: End) {
         self.proxy.revoke(id);
-        let end_kind = match &end {
-            End::Settled(_) => EndKind::Settled,
-            End::Closed => EndKind::Closed,
-            End::Fatal(_) => EndKind::Failed,
-        };
         let settlement = match end {
             End::Settled(s) => Some(s),
             // A child ends `Closed` only at a shutdown, which the next start resumes it from: a child
@@ -1786,19 +1802,6 @@ impl Inner {
                 }
             }
         };
-        // The task is gone: nothing can run a command of this session again when it is a child that ended
-        // for good, a root whose log had ended, or a session an archive closed.
-        let over = {
-            let st = self.st();
-            st.known.get(id).is_some_and(|k| match end_kind {
-                EndKind::Settled => true,
-                EndKind::Failed => k.meta.parent.is_some(),
-                EndKind::Closed => k.meta.archived || k.status.phase == Phase::Ended,
-            })
-        };
-        if over {
-            self.clear_scratch(id);
-        }
         let Some(s) = settlement else { return };
         // Kept beside the log so that a delivery lost to a restart carries the whole report.
         if let Err(e) = write_json_atomic(&self.paths.session_dir(id).join("settlement.json"), &s) {
@@ -1806,6 +1809,9 @@ impl Inner {
         }
         self.clear_active(id, gen);
         self.record_settlement(id, s);
+        // A child that settled or failed is never activated again: its scratch directory is emptied once its
+        // report is on its way, without waiting for the removal.
+        self.clear_scratch(id);
     }
 
     /// A child whose task ended without writing a `session_end` (a log fault, a panic), or whose
@@ -2336,12 +2342,16 @@ impl Inner {
             tracing::warn!("cannot write settlement.json of {}: {e}", id.as_str());
         }
         self.mark_failed(id);
-        let mut st = self.st();
-        if let Some(k) = st.known.get_mut(id) {
-            k.settlement = Some(s.clone());
-            k.settled_tx.send_replace(Some(s));
-            k.restored = true;
+        {
+            let mut st = self.st();
+            if let Some(k) = st.known.get_mut(id) {
+                k.settlement = Some(s.clone());
+                k.settled_tx.send_replace(Some(s));
+                k.restored = true;
+            }
         }
+        // It will never run a command again; nobody waits for the removal.
+        self.clear_scratch(id);
     }
 
     /// The verifier of `role` that a finish of `parent` started for `brief` and that a shutdown cut, for
@@ -2462,20 +2472,32 @@ impl Spawns {
     }
 }
 
-/// How a session's task ended, as far as its scratch directory is concerned.
-#[derive(Clone, Copy)]
-enum EndKind {
-    Settled,
-    Closed,
-    Failed,
+/// Empty the scratch directory `dir` of a session that can no longer run commands, off the async workers: a
+/// command may have left many files there. Failures are warnings. The handle ends when the removal has.
+fn clear_scratch_dir(dir: PathBuf) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = empty_dir(&dir) {
+            tracing::warn!("cannot empty the scratch directory {}: {e}", dir.display());
+        }
+    })
 }
 
-/// Remove everything inside `dir` (not `dir` itself; a symbolic link is removed, never followed). A missing
-/// directory is empty already.
+/// Remove everything inside the directory `dir` (not `dir` itself). Links are removed, never followed: one inside
+/// `dir` is removed as a file, and a `dir` that is itself a link (or anything but a directory) is left alone with
+/// an error. A missing directory, and an entry something else removed meanwhile, are empty already.
 fn empty_dir(dir: &Path) -> std::io::Result<()> {
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            return Err(std::io::Error::other("it is not a directory (a symbolic link, say), so it was left alone"));
+        }
+        Err(e) if gone(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if gone(&e) => return Ok(()),
         Err(e) => return Err(e),
     };
     let mut first_error = None;
@@ -2488,7 +2510,7 @@ fn empty_dir(dir: &Path) -> std::io::Result<()> {
                 std::fs::remove_file(&path)
             }
         });
-        if let Err(e) = result {
+        if let Some(e) = result.err().filter(|e| !gone(e)) {
             first_error.get_or_insert(e);
         }
     }
@@ -2526,9 +2548,9 @@ pub fn volume_space(path: &Path) -> Option<(u64, u64)> {
     (total > 0 && free <= total).then_some((free, total))
 }
 
-/// Whether `free` of `total` bytes is low: under `LOW_DISK_BYTES`, or under `LOW_DISK_PERCENT` of the volume.
-#[cfg(not(test))]
-fn disk_is_low(free: u64, total: u64) -> bool {
+/// Whether `free` of `total` bytes is low: under `LOW_DISK_BYTES`, or under `LOW_DISK_PERCENT` of the volume. The
+/// one rule for the low-disk notification and for what the daemon's status says.
+pub fn disk_is_low(free: u64, total: u64) -> bool {
     free < LOW_DISK_BYTES || u128::from(free) * 100 < u128::from(total) * u128::from(LOW_DISK_PERCENT)
 }
 
@@ -3229,13 +3251,13 @@ impl Runtime {
         // which reaches the lead when the mission is unarchived.
         drop(closing);
         if archived {
-            // A session with a task gets its scratch directory emptied when the task has ended (`on_end`).
+            // A session with a task has its scratch directory emptied as the task ends (`launch`, `on_end`).
             let idle: Vec<&SessionId> = {
                 let st = self.inner.st();
                 family.iter().filter(|sid| st.known.get(*sid).is_some_and(|k| k.active.is_none())).collect()
             };
             for sid in idle {
-                self.inner.clear_scratch(sid);
+                let _ = self.inner.clear_scratch(sid).await;
             }
         }
         if !archived {
@@ -5296,6 +5318,23 @@ mod tests {
         assert!(tmp.is_dir() && std::fs::read_dir(&tmp).unwrap().next().is_none());
         assert!(keep.join("precious").exists());
         empty_dir(&dir.path().join("missing")).unwrap();
+        // A scratch directory that is itself a link is left alone, and so is what it points at.
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&keep, &linked).unwrap();
+        let err = empty_dir(&linked).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        assert!(keep.join("precious").exists() && linked.is_symlink());
+    }
+
+    #[test]
+    fn the_disk_is_low_under_5_gib_or_5_percent_free() {
+        const GIB: u64 = 1 << 30;
+        assert!(!disk_is_low(400 * GIB, 1000 * GIB));
+        assert!(!disk_is_low(5 * GIB, 40 * GIB));
+        assert!(disk_is_low(5 * GIB - 1, 40 * GIB));
+        assert!(disk_is_low(49 * GIB, 1000 * GIB));
+        assert!(!disk_is_low(50 * GIB, 1000 * GIB));
+        assert!(!disk_is_low(u64::MAX / 10, u64::MAX));
     }
 
     #[tokio::test]
@@ -6103,10 +6142,16 @@ mod tests {
         until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
         let child = e.children(&id)[0].meta.id.clone();
         until_idle(&e, &child).await;
+        let child_tmp = e.rt.paths().session_tmp(&child);
+        std::fs::write(child_tmp.join("scratch"), "x").unwrap();
         e.rt.shutdown().await;
+        // A shutdown keeps the scratch directory of an agent the next start goes on with.
+        assert!(child_tmp.join("scratch").exists());
         // The worker's log is lost while the harness is down: it will never run again.
         std::fs::write(e.rt.paths().session_log(&child), "not a log\n").unwrap();
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        // Settled on its behalf, it can run no command again: its scratch directory is emptied.
+        until("the worker's scratch emptied", || !child_tmp.join("scratch").exists()).await;
         let rt = rt2.clone();
         until("the lead finished", || {
             rt.records(&id, None, 2_000)
@@ -6371,6 +6416,23 @@ mod tests {
         assert!(!rt2.session(&id).unwrap().active);
         rt2.archive(&id, false).await.unwrap();
         assert_eq!(rt2.sessions(false).len(), 1);
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn archiving_a_session_without_a_task_empties_its_scratch_directory_before_it_returns() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let id = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        e.rt.shutdown().await;
+        // An idle session is not activated by the next start: archiving it ends no task.
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert!(!rt2.session(&id).unwrap().active);
+        let tmp = rt2.paths().session_tmp(&id);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join("sub").join("f"), "x").unwrap();
+        std::fs::write(tmp.join("g"), "x").unwrap();
+        rt2.archive(&id, true).await.unwrap();
+        assert!(tmp.is_dir() && std::fs::read_dir(&tmp).unwrap().next().is_none());
         rt2.shutdown().await;
     }
 

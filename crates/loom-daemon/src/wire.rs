@@ -43,10 +43,9 @@ pub struct DiskSpace {
 }
 
 impl DiskSpace {
-    /// Less than `LOW_DISK_BYTES`, or less than `LOW_DISK_PERCENT` of the volume, is free.
+    /// Less than `LOW_DISK_BYTES`, or less than `LOW_DISK_PERCENT` of the volume, is free (the runtime's rule).
     pub fn is_low(&self) -> bool {
-        self.free_bytes < LOW_DISK_BYTES
-            || u128::from(self.free_bytes) * 100 < u128::from(self.total_bytes) * u128::from(LOW_DISK_PERCENT)
+        loom_agent::runtime::disk_is_low(self.free_bytes, self.total_bytes)
     }
 }
 
