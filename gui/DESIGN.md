@@ -24,8 +24,9 @@ This document is normative. Where it and the code disagree, one is a bug.
 - Swift 6, SwiftUI + AppKit + WebKit + UserNotifications, **system frameworks only — no SPM
   dependencies**, so it builds with `swiftc` against the system SDK with nothing to fetch.
 - Deployment target `MACOSX_DEPLOYMENT_TARGET=14.0`.
-- Built on the build host (`swiftc`), assembled into `loom-desk.app` by `gui/build.sh` (no Xcode
-  project), ad-hoc codesigned, and copied to the operator's Mac. Never built on the operator's Mac.
+- Normally built on the build host (`swiftc`), assembled into `loom-desk.app` by `gui/build.sh` (no
+  Xcode project), ad-hoc codesigned, and copied to the operator's Mac. `LOOM_BUILD_HOST=local` builds
+  in place wherever the script runs and `swiftc` is available.
 
 ## Shape
 
@@ -44,8 +45,9 @@ gui/
     UI/RootView.swift         the window: a connection bar on top, the web pane filling the rest
     UI/ConnectionsView.swift  add / edit / pick / connect a connection
     UI/WebPane.swift          NSViewRepresentable around WKWebView; loads the tunneled daemon UI
-  Resources/                  optional icon assets
 ```
+
+A `Resources/` directory, when present, is copied into the bundle by `build.sh`; none ships today.
 
 ## Connection model (`Model/Connection.swift`)
 
@@ -83,14 +85,14 @@ For a `.sshTunnel` connection, `connect()`:
    uses it, or use a Direct connection). There is no random port and no pick-then-release. Other bind
    failures (e.g. "Permission denied" for a port below 1024) are reported with ssh's own words;
 2. spawns `ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
-   -o ControlMaster=no -o ControlPath=none -L 127.0.0.1:<port>:127.0.0.1:<port> <sshHost>` as a
+   -o ControlMaster=no -o ControlPath=none -L 127.0.0.1:<port>:127.0.0.1:<port> -- <sshHost>` as a
    `Process`, keeping the handle. Multiplexing is off so the listener always lives in this child,
    never in a ControlPersist master from the operator's ssh config that would outlive it and keep the
    port;
 3. waits (poll-connect to the local port, up to ~10 s) until the forward is up and `/healthz` answers;
    a dead child or a timeout is an error whose message includes the ssh stderr;
-4. if `tokenSource == .fetchOverSsh`, runs `ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none
-   <sshHost> cat ~/.loom/token`, trims it, and stores it (Keychain + memory). A token that is not 64
+4. if `tokenSource == .fetchOverSsh`, runs `ssh -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=no
+   -o ControlPath=none -- <sshHost> cat ~/.loom/token`, trims it, and stores it (Keychain + memory). A token that is not 64
    lowercase-hex characters is an error. The child is checked again afterwards: if it exited during the
    fetch, the connect fails with ssh's last stderr line.
 
@@ -179,16 +181,18 @@ Do not inject scripts into the page or read its contents; the pane only navigate
 `@main` `App` with:
 
 - a `MenuBarExtra` whose label is a short glyph plus counts (e.g. `◆ 2▸ 1!` meaning 2 running, 1
-  waiting), red when anything is waiting. Its menu: the connection name and status; **Open loom** (show
-  / focus the window); a connections submenu to switch; **Disconnect**; **Quit**. `LSUIElement` is
-  true so the app lives in the menu bar; the main `Window` is opened on demand and on first launch.
+  waiting), red when anything is waiting. Its menu: `Connection: <name>` (or `No connection`) and the
+  status line; **Open loom** (show / focus the window); a **Connections** submenu to switch (when any
+  are saved); **Disconnect** (while a link exists); **Quit loom-desk**. `LSUIElement` is true so the
+  app lives in the menu bar; the main `Window` is opened on demand and on first launch, and closing it
+  does not quit the app.
 - the main `Window` hosting `RootView` (a connection bar — active connection, state, reload — above
   the `WebPane`).
 - notification setup (authorization, delegate that foregrounds the window and routes to a session).
 - lifecycle: restore the last-used connection on launch and connect to it; tear the tunnel down on
   quit.
 
-`AppState` is an `@MainActor @Observable` (or `ObservableObject`) holding: the connection list, the
+`AppState` is an `@MainActor` `ObservableObject` holding: the connection list, the
 active connection, the live counts, a human status string, and the current `baseURL`/token. The
 tunnel and client write counts/status back into it on the main actor.
 
@@ -199,14 +203,18 @@ tunnel and client write counts/status back into it on the main actor.
 1. `swiftc` all of `src/**/*.swift` into one executable, `-O`, `-target arm64-apple-macos14.0`,
    linking SwiftUI/AppKit/WebKit/UserNotifications (they come from the SDK; no extra flags beyond the
    frameworks). Treat warnings as warnings, not errors.
-2. assemble `dist/loom-desk.app/Contents/{MacOS/loom-desk, Info.plist, Resources/…}`.
-3. `codesign --force --deep --sign - --options runtime dist/loom-desk.app` (ad-hoc).
+2. assemble `dist/loom-desk.app/Contents/{MacOS/loom-desk, Info.plist, Resources/…}` and check the
+   plist with `plutil -lint`.
+3. `codesign --force --deep --sign - --options runtime dist/loom-desk.app` (ad-hoc), then
+   `codesign --verify --deep --strict`.
 4. print the bundle path and size.
 
 `LOOM_BUILD_HOST` is required (a build host, or `local`); the script stops with a message otherwise.
-`LOOM_SWIFTFLAGS` reaches the host quoted with `printf %q`, so a quote or `;` in it runs nothing there.
+Against a host it syncs `gui/` there and runs itself there with `LOOM_BUILD_HOST=local`; `--pull`
+copies the bundle back to `gui/dist/`. `LOOM_SWIFTFLAGS` (for example `-DDEBUG`) reaches the host
+quoted with `printf %q`, so a quote or `;` in it runs nothing there.
 
-The app is copied to the operator's Mac with rsync; because it is ad-hoc signed and crosses machines,
+The app is copied to the operator's Mac with rsync (`--pull`); because it is ad-hoc signed and crosses machines,
 `README.md` tells the operator to clear the quarantine attribute (`xattr -dr com.apple.quarantine`)
 or open it once via right-click. No notarization (personal tool).
 
@@ -225,4 +233,8 @@ implementer verifies by hand on the build host where possible (a headless build 
 window, so: confirm it compiles and the bundle is well-formed with `codesign --verify` and
 `plutil -lint Info.plist`, and that `Tunnel` and `DaemonClient`'s pure parsing helpers — token
 validation, SSE line parsing, counts derivation — have small `#if DEBUG` self-checks or are factored
-so they can be exercised). State in the report what was and was not run.
+so they can be exercised). A build with `LOOM_SWIFTFLAGS=-DDEBUG` has three such entry points:
+`loom-desk --self-check` (the pure helpers, the identity proof against a known answer, the
+http/https host rule, the copied address), `--tunnel-check <sshHost>` (a real tunnel), and
+`--live-check <baseURL>` (the daemon client against a live daemon for a few seconds, token from
+`$LOOM_TOKEN`). State in the report what was and was not run.
