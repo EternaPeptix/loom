@@ -174,7 +174,9 @@ fn decode_utf8(raw: &[u8]) -> (String, u64) {
 
 /// Count characters that are ASCII but neither printable, whitespace nor ESC.
 fn count_ascii_bad(s: &str) -> usize {
-    s.chars().filter(|c| c.is_ascii() && !c.is_ascii_graphic() && !c.is_ascii_whitespace() && *c != ' ' && *c != '\u{1b}').count()
+    s.chars()
+        .filter(|c| c.is_ascii() && !c.is_ascii_graphic() && !c.is_ascii_whitespace() && *c != ' ' && *c != '\u{1b}')
+        .count()
 }
 
 /// True when the input is binary: it has a NUL byte, or more than 30% of its first 8 KiB is neither
@@ -277,7 +279,15 @@ pub fn normalize(raw: &[u8]) -> Normalized {
     if looks_binary(raw) {
         let hex: String = raw.iter().take(32).map(|b| format!("{b:02x}")).collect();
         let text = format!("binary data, {} bytes, starts with {}", raw.len(), hex);
-        return Normalized { changed: text.as_bytes() != raw, text, binary: true, invalid_utf8: 0, ansi_removed: 0, cr_collapsed: 0, controls_escaped: 0 };
+        return Normalized {
+            changed: text.as_bytes() != raw,
+            text,
+            binary: true,
+            invalid_utf8: 0,
+            ansi_removed: 0,
+            cr_collapsed: 0,
+            controls_escaped: 0,
+        };
     }
     let (decoded, invalid_utf8) = decode_utf8(raw);
     let (stripped, ansi_removed) = strip_ansi(&decoded);
@@ -369,13 +379,18 @@ pub fn admit(
             at = at.saturating_add(l.len() + 1).min(text.len());
         }
         starts.push(text.len());
-        let regexes: Vec<Regex> = policy.salient_patterns.iter().filter_map(|p| RegexBuilder::new(p).case_insensitive(true).build().ok()).collect();
+        let regexes: Vec<Regex> = policy
+            .salient_patterns
+            .iter()
+            .filter_map(|p| RegexBuilder::new(p).case_insensitive(true).build().ok())
+            .collect();
         let matching: Vec<usize> = if regexes.is_empty() || policy.salient_max == 0 {
             Vec::new()
         } else {
             lines.iter().enumerate().filter(|(_, l)| regexes.iter().any(|r| r.is_match(l))).map(|(i, _)| i).collect()
         };
-        let inp = CutInput { text: &text, lines: &lines, starts: &starts, matching: &matching, handle: &handle, policy };
+        let inp =
+            CutInput { text: &text, lines: &lines, starts: &starts, matching: &matching, handle: &handle, policy };
         let mut head = usize::try_from(policy.head_lines).unwrap_or(usize::MAX);
         let mut tail = usize::try_from(policy.tail_lines).unwrap_or(usize::MAX);
         // Halve head and tail until something is omitted and the body fits (never below one line each).
@@ -477,22 +492,23 @@ fn render_cut(inp: &CutInput<'_>, head: usize, tail: usize) -> Rendered {
     let mut shown = Vec::new();
     let mut long_cut = 0u64;
     let mut listed = 0u64;
-    let push_line = |out: &mut Vec<String>, shown: &mut Vec<usize>, long_cut: &mut u64, idx: usize, prefix: Option<usize>| {
-        let line = inp.lines.get(idx).copied().unwrap_or("");
-        let (text, was_cut) = match cut_line(line, max) {
-            Some(c) => (c, true),
-            None => (line.to_string(), false),
+    let push_line =
+        |out: &mut Vec<String>, shown: &mut Vec<usize>, long_cut: &mut u64, idx: usize, prefix: Option<usize>| {
+            let line = inp.lines.get(idx).copied().unwrap_or("");
+            let (text, was_cut) = match cut_line(line, max) {
+                Some(c) => (c, true),
+                None => (line.to_string(), false),
+            };
+            if was_cut {
+                *long_cut += 1;
+            } else {
+                shown.push(idx);
+            }
+            out.push(match prefix {
+                Some(no) => format!("{no}: {text}"),
+                None => text,
+            });
         };
-        if was_cut {
-            *long_cut += 1;
-        } else {
-            shown.push(idx);
-        }
-        out.push(match prefix {
-            Some(no) => format!("{no}: {text}"),
-            None => text,
-        });
-    };
     for idx in 0..head {
         push_line(&mut out, &mut shown, &mut long_cut, idx, None);
     }
@@ -509,7 +525,8 @@ fn render_cut(inp: &CutInput<'_>, head: usize, tail: usize) -> Rendered {
             omitted_bytes,
             h = inp.handle
         ));
-        let hits: Vec<usize> = inp.matching.iter().copied().filter(|i| *i >= first_omitted && *i < end_omitted).collect();
+        let hits: Vec<usize> =
+            inp.matching.iter().copied().filter(|i| *i >= first_omitted && *i < end_omitted).collect();
         let m = hits.len();
         let k = m.min(inp.policy.salient_max);
         if k > 0 {
@@ -578,7 +595,13 @@ mod tests {
     }
 
     fn small_policy(head: u64, tail: u64) -> AdmitPolicy {
-        AdmitPolicy { max_inline_tokens: 1000, head_lines: head, tail_lines: tail, salient_patterns: vec![], ..AdmitPolicy::default() }
+        AdmitPolicy {
+            max_inline_tokens: 1000,
+            head_lines: head,
+            tail_lines: tail,
+            salient_patterns: vec![],
+            ..AdmitPolicy::default()
+        }
     }
 
     fn newlines(s: &str) -> usize {
@@ -588,7 +611,15 @@ mod tests {
     #[test]
     fn notes_list_non_zero_counts() {
         assert_eq!(normalize(b"clean\n").notes(), None);
-        let n = Normalized { text: String::new(), binary: true, changed: true, invalid_utf8: 2, ansi_removed: 1, cr_collapsed: 3, controls_escaped: 4 };
+        let n = Normalized {
+            text: String::new(),
+            binary: true,
+            changed: true,
+            invalid_utf8: 2,
+            ansi_removed: 1,
+            cr_collapsed: 3,
+            controls_escaped: 4,
+        };
         assert_eq!(
             n.notes().unwrap(),
             "1 terminal escape sequences removed, 3 overwritten lines collapsed, 2 invalid bytes replaced, 4 control characters escaped, binary"
@@ -672,7 +703,28 @@ mod tests {
     #[test]
     fn line_count_is_preserved_on_generated_inputs() {
         let pieces: [&[u8]; 22] = [
-            b"abc", b" ", b"\n", b"\n", b"\r", b"\r\n", b"\x1b", b"\x1b[", b"\x1b[31m", b"\x1b]0;t", b"\x07", b"\x1b\\", b"\xff", b"\xc3", b"\xe2\x82", "é".as_bytes(), "日".as_bytes(), b"\x01", b"\x7f", b"\t", b";", b"\x1b[1;",
+            b"abc",
+            b" ",
+            b"\n",
+            b"\n",
+            b"\r",
+            b"\r\n",
+            b"\x1b",
+            b"\x1b[",
+            b"\x1b[31m",
+            b"\x1b]0;t",
+            b"\x07",
+            b"\x1b\\",
+            b"\xff",
+            b"\xc3",
+            b"\xe2\x82",
+            "é".as_bytes(),
+            "日".as_bytes(),
+            b"\x01",
+            b"\x7f",
+            b"\t",
+            b";",
+            b"\x1b[1;",
         ];
         let mut rng = Lcg(42);
         let mut checked = 0;
@@ -717,14 +769,20 @@ mod tests {
     #[test]
     fn empty_output_and_envelope_shape() {
         let (a, b) = admit_text("", &AdmitPolicy::default());
-        assert_eq!(a.text, format!("[bash · exit 1 · 2.4s · 0 lines · {}]\n(no output)\n[end of bash output · exit 1]", b.handle()));
+        assert_eq!(
+            a.text,
+            format!("[bash · exit 1 · 2.4s · 0 lines · {}]\n(no output)\n[end of bash output · exit 1]", b.handle())
+        );
         assert!(a.shown.is_empty() && !a.cut);
         let (_d, s) = store();
         let b = s.put_bytes(b"x\n").unwrap();
         let mut f = Facts { tool: "grep".into(), ..Facts::default() };
         f.notes = Some("1 invalid bytes replaced".into());
         let a = admit(&s, &b, &f, &AdmitPolicy::default(), &TokenEstimator::default()).unwrap();
-        assert_eq!(a.text, format!("[grep · 1 lines · 1 invalid bytes replaced · {}]\nx\n[end of grep output · ]", b.handle()));
+        assert_eq!(
+            a.text,
+            format!("[grep · 1 lines · 1 invalid bytes replaced · {}]\nx\n[end of grep output · ]", b.handle())
+        );
         let p = envelope_plain(&facts(), "bad arguments: pass a path.");
         assert_eq!(p, "[bash · exit 1 · 2.4s]\nbad arguments: pass a path.\n[end of bash output · exit 1]");
     }
@@ -749,7 +807,13 @@ mod tests {
     fn head_and_tail_halve_when_they_would_cover_everything() {
         // 40 lines of 10 chars: over the budget, and 30 + 30 covers all of it.
         let text: String = (0..40).map(|i| format!("row {i:05}\n")).collect();
-        let policy = AdmitPolicy { max_inline_tokens: 100, head_lines: 30, tail_lines: 30, salient_patterns: vec![], ..AdmitPolicy::default() };
+        let policy = AdmitPolicy {
+            max_inline_tokens: 100,
+            head_lines: 30,
+            tail_lines: 30,
+            salient_patterns: vec![],
+            ..AdmitPolicy::default()
+        };
         let (a, _) = admit_text(&text, &policy);
         assert!(a.cut);
         // 30/30 -> 15/15 fits 100 tokens (150 chars) with marker? 30 lines * 10 > 150 chars, so it halves again.
@@ -766,7 +830,14 @@ mod tests {
     fn huge_lines_leave_one_line_each_side() {
         let long = "x".repeat(3000);
         let text: String = (0..10).map(|_| format!("{long}\n")).collect();
-        let policy = AdmitPolicy { max_inline_tokens: 100, head_lines: 4, tail_lines: 4, max_line_chars: 50, salient_patterns: vec![], ..AdmitPolicy::default() };
+        let policy = AdmitPolicy {
+            max_inline_tokens: 100,
+            head_lines: 4,
+            tail_lines: 4,
+            max_line_chars: 50,
+            salient_patterns: vec![],
+            ..AdmitPolicy::default()
+        };
         let (a, _) = admit_text(&text, &policy);
         assert!(a.cut);
         assert!(a.text.contains("lines 2-9 of 10"));
@@ -781,21 +852,40 @@ mod tests {
         let mut text = "é".repeat(60);
         text.push('\n');
         text.push_str(&numbered(500));
-        let policy = AdmitPolicy { max_inline_tokens: 1000, head_lines: 2, tail_lines: 2, max_line_chars: 10, salient_patterns: vec![], ..AdmitPolicy::default() };
+        let policy = AdmitPolicy {
+            max_inline_tokens: 1000,
+            head_lines: 2,
+            tail_lines: 2,
+            max_line_chars: 10,
+            salient_patterns: vec![],
+            ..AdmitPolicy::default()
+        };
         let (a, _) = admit_text(&text, &policy);
         assert!(a.text.contains(&format!("\n{}…[+50 chars]\n", "é".repeat(10))));
         assert_eq!(a.long_lines_cut, 1);
         assert_eq!(a.shown, vec![(2, 2), (500, 501)]);
-        let (a, _) = admit_text(&text[..200], &AdmitPolicy { max_inline_tokens: 1000, max_line_chars: 10, ..AdmitPolicy::default() });
+        let (a, _) = admit_text(
+            &text[..200],
+            &AdmitPolicy { max_inline_tokens: 1000, max_line_chars: 10, ..AdmitPolicy::default() },
+        );
         assert!(!a.cut && a.text.contains(&"é".repeat(60)));
     }
 
     fn scan_policy(max: usize) -> AdmitPolicy {
-        AdmitPolicy { max_inline_tokens: 1000, head_lines: 2, tail_lines: 2, salient_max: max, salient_patterns: vec!["BOOM".into(), "(unclosed".into()], ..AdmitPolicy::default() }
+        AdmitPolicy {
+            max_inline_tokens: 1000,
+            head_lines: 2,
+            tail_lines: 2,
+            salient_max: max,
+            salient_patterns: vec!["BOOM".into(), "(unclosed".into()],
+            ..AdmitPolicy::default()
+        }
     }
 
     fn scan_text() -> String {
-        (1..=300).map(|i| if i % 10 == 0 && i != 300 { format!("Boom at {i}\n") } else { format!("line {i}\n") }).collect()
+        (1..=300)
+            .map(|i| if i % 10 == 0 && i != 300 { format!("Boom at {i}\n") } else { format!("line {i}\n") })
+            .collect()
     }
 
     #[test]
@@ -813,7 +903,12 @@ mod tests {
     fn scan_is_capped_and_evenly_spread() {
         let (a, _) = admit_text(&scan_text(), &scan_policy(5));
         assert!(a.text.contains("5 of 29 matching lines"));
-        let listed: Vec<u64> = a.text.lines().filter(|l| l.contains(": Boom at")).map(|l| l.split(':').next().unwrap().parse().unwrap()).collect();
+        let listed: Vec<u64> = a
+            .text
+            .lines()
+            .filter(|l| l.contains(": Boom at"))
+            .map(|l| l.split(':').next().unwrap().parse().unwrap())
+            .collect();
         // Indexes 0, 7, 14, 21, 28 of the 29 matches.
         assert_eq!(listed, vec![10, 80, 150, 220, 290]);
         assert_eq!((a.scan_listed, a.scan_matched), (5, 29));
@@ -834,14 +929,24 @@ mod tests {
         assert_eq!(a.scan_matched, 0);
         // The invalid pattern in scan_policy was skipped, the valid one still worked above; and the
         // default patterns are case-insensitive.
-        let (a, _) = admit_text(&format!("a\nb\n{}ERROR: Failed to open\nz\ny\n", numbered(300)), &AdmitPolicy { max_inline_tokens: 1000, head_lines: 2, tail_lines: 2, ..AdmitPolicy::default() });
+        let (a, _) = admit_text(
+            &format!("a\nb\n{}ERROR: Failed to open\nz\ny\n", numbered(300)),
+            &AdmitPolicy { max_inline_tokens: 1000, head_lines: 2, tail_lines: 2, ..AdmitPolicy::default() },
+        );
         assert!(a.text.contains("1 of 1 matching lines"));
     }
 
     #[test]
     fn multibyte_text_is_never_split() {
         let text: String = (0..300).map(|i| format!("{i} 日本語日本語日本語日本語日本語\n")).collect();
-        let policy = AdmitPolicy { max_inline_tokens: 1000, head_lines: 2, tail_lines: 2, max_line_chars: 7, salient_patterns: vec![], ..AdmitPolicy::default() };
+        let policy = AdmitPolicy {
+            max_inline_tokens: 1000,
+            head_lines: 2,
+            tail_lines: 2,
+            max_line_chars: 7,
+            salient_patterns: vec![],
+            ..AdmitPolicy::default()
+        };
         let (a, _) = admit_text(&text, &policy);
         assert!(a.cut);
         assert!(a.text.contains("0 日本語日本…[+"));
@@ -851,7 +956,13 @@ mod tests {
     #[test]
     fn cut_bodies_fit_when_they_can() {
         let text = numbered(5000);
-        let policy = AdmitPolicy { max_inline_tokens: 500, head_lines: 400, tail_lines: 400, salient_patterns: vec![], ..AdmitPolicy::default() };
+        let policy = AdmitPolicy {
+            max_inline_tokens: 500,
+            head_lines: 400,
+            tail_lines: 400,
+            salient_patterns: vec![],
+            ..AdmitPolicy::default()
+        };
         let (a, _) = admit_text(&text, &policy);
         assert!(a.cut);
         assert!(TokenEstimator::with_ratio(1.5).tokens(a.text.chars().count()) <= 500 + 60);

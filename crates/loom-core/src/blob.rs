@@ -7,9 +7,9 @@ use crate::ids::BlobId;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -258,7 +258,15 @@ impl BlobStore {
         let name = format!("{}-{}", crate::now_ms(), rand::random::<u64>());
         let tmp = self.root.join("tmp").join(name);
         let file = create_private(&tmp)?;
-        Ok(BlobWriter { store: self.clone(), tmp, file, hasher: Sha256::new(), bytes: 0, offsets: Vec::new(), at_line_start: true })
+        Ok(BlobWriter {
+            store: self.clone(),
+            tmp,
+            file,
+            hasher: Sha256::new(),
+            bytes: 0,
+            offsets: Vec::new(),
+            at_line_start: true,
+        })
     }
 
     pub fn put_bytes(&self, data: &[u8]) -> io::Result<BlobRef> {
@@ -289,7 +297,10 @@ impl BlobStore {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if name.len() == 64 && name.starts_with(&id) {
                     if found.is_some() {
-                        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("ambiguous output handle: {handle}")));
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("ambiguous output handle: {handle}"),
+                        ));
                     }
                     found = Some(name);
                 }
@@ -637,7 +648,13 @@ impl LineIndex {
         }
         entries.push((total.saturating_sub(1), last_start));
         let rises = entries.windows(2).all(|pair| match pair {
-            [(i, a), (j, b)] => if i == j { a == b } else { a < b },
+            [(i, a), (j, b)] => {
+                if i == j {
+                    a == b
+                } else {
+                    a < b
+                }
+            }
             _ => false,
         });
         rises.then_some(span)
@@ -1119,10 +1136,16 @@ mod tests {
         let a = "a".repeat(64);
         let b = "0123456789abcdef".repeat(4);
         // Two blobs that share a handle: a handle keeps both.
-        let (c1, c2) = (format!("{}{}", "c".repeat(16), "1".repeat(48)), format!("{}{}", "c".repeat(16), "2".repeat(48)));
+        let (c1, c2) =
+            (format!("{}{}", "c".repeat(16), "1".repeat(48)), format!("{}{}", "c".repeat(16), "2".repeat(48)));
         let d = "d".repeat(64);
         let stored: StoredIds = [&a, &b, &c1, &c2, &d].into_iter().cloned().collect();
-        let text = format!("{{\"x\":\"{a}\"}} id={}\\n\"out:{}\" 12345 {} out:dddddd", b.to_uppercase(), &c1[..16], "f".repeat(63));
+        let text = format!(
+            "{{\"x\":\"{a}\"}} id={}\\n\"out:{}\" 12345 {} out:dddddd",
+            b.to_uppercase(),
+            &c1[..16],
+            "f".repeat(63)
+        );
         let mut found = HashSet::new();
         scan_ids(text.as_bytes(), &stored, &mut found).unwrap();
         assert_eq!(found, set(&[&a, &b, &c1, &c2]), "a 6-character handle is not one");

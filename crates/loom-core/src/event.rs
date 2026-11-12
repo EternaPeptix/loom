@@ -905,7 +905,8 @@ mod tests {
             assert_eq!(v["kind"], name, "tag of {name}: {line}");
             assert_eq!(v["seq"], 3, "seq of {name}");
             assert_eq!(v["author"], "harness", "author of {name}");
-            let back: Record = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{name} does not read back: {e}\n{line}"));
+            let back: Record =
+                serde_json::from_str(&line).unwrap_or_else(|e| panic!("{name} does not read back: {e}\n{line}"));
             assert_eq!(back, r, "{name}");
             assert_ne!(back.event, Event::Unknown, "{name}");
         }

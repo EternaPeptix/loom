@@ -229,7 +229,8 @@ pub fn clear_leftovers(dir: &Path) -> Vec<Leftover> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut found = Vec::new();
     for path in entries.flatten().map(|e| e.path()) {
-        let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|s| id_number(s).is_some()).map(str::to_string) else {
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|s| id_number(s).is_some()).map(str::to_string)
+        else {
             continue;
         };
         if path.extension().and_then(|e| e.to_str()) != Some("pid") {
@@ -292,12 +293,18 @@ fn add_detail(detail: &mut String, clause: &str) {
 fn store_output(blobs: &BlobStore, path: &Path, max: u64, detail: &mut String) -> Option<BlobRef> {
     let total = file_len(path);
     if total > max {
-        add_detail(detail, &format!("the output was {total} bytes; only the first {max} bytes were stored and the rest was discarded"));
+        add_detail(
+            detail,
+            &format!("the output was {total} bytes; only the first {max} bytes were stored and the rest was discarded"),
+        );
     }
     match read_from(path, 0, max).and_then(|raw| crate::view::store_text(blobs, &raw).map(|(b, _)| b)) {
         Ok(b) => Some(b),
         Err(e) => {
-            add_detail(detail, &format!("the complete output could not be stored ({e}); it is still in the file {}", path.display()));
+            add_detail(
+                detail,
+                &format!("the complete output could not be stored ({e}); it is still in the file {}", path.display()),
+            );
             None
         }
     }
@@ -348,7 +355,14 @@ impl JobTable {
         // Ids with files in the directory (a previous daemon's, or a winding-down table's) are not handed out again.
         let last = highest_id(&dir);
         let leftovers = clear_leftovers(&dir);
-        JobTable { dir, blobs, events, max_output_bytes, inner: Mutex::new(Inner { last, jobs: Vec::new() }), leftovers }
+        JobTable {
+            dir,
+            blobs,
+            events,
+            max_output_bytes,
+            inner: Mutex::new(Inner { last, jobs: Vec::new() }),
+            leftovers,
+        }
     }
 
     /// The commands of a previous daemon found when this table was created (and cleared).
@@ -409,7 +423,14 @@ impl JobTable {
 
     /// Like [`JobTable::register`], for a job whose first `read_from` bytes of output the model has
     /// already been shown: the first `job_wait` starts after them.
-    pub async fn register_from(&self, id: &str, call_id: &CallId, command: &str, mut running: Running, read_from: u64) -> JobInfo {
+    pub async fn register_from(
+        &self,
+        id: &str,
+        call_id: &CallId,
+        command: &str,
+        mut running: Running,
+        read_from: u64,
+    ) -> JobInfo {
         // From here on the table (its watcher and its Drop) is responsible for the group.
         running.disarm();
         // A command that has already exited and left processes behind (bash hands those over) is known
@@ -595,7 +616,13 @@ fn view_of(j: &Shared) -> JobView {
 }
 
 /// Owns the process until it is over, then stores the output and reports, once.
-async fn watch(shared: Arc<Shared>, mut running: Running, blobs: BlobStore, events: UnboundedSender<JobEvent>, max_output_bytes: u64) {
+async fn watch(
+    shared: Arc<Shared>,
+    mut running: Running,
+    blobs: BlobStore,
+    events: UnboundedSender<JobEvent>,
+    max_output_bytes: u64,
+) {
     let mut detail = String::new();
     // The leader's status is the job's and is known when the leader exits; the job is over only when
     // its group is empty.
@@ -628,7 +655,10 @@ async fn watch(shared: Arc<Shared>, mut running: Running, blobs: BlobStore, even
     let state = match (state, leader) {
         (JobState::Killed, Some(e)) => {
             let how = if detail.is_empty() { "stopped".to_string() } else { std::mem::take(&mut detail) };
-            detail = format!("the command itself had already exited ({}); the processes it left running were {how}", e.outcome());
+            detail = format!(
+                "the command itself had already exited ({}); the processes it left running were {how}",
+                e.outcome()
+            );
             JobState::Ended(e)
         }
         (state, _) => state,
@@ -692,14 +722,20 @@ mod tests {
 
         async fn start_from(&self, script: &str, read_from: u64) -> JobInfo {
             let (id, out_path, exit_path) = self.table.allocate().await.expect("allocate");
-            let env = [("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            let env = [("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
             let spec = Spawn { script: script.to_string(), cwd: self.root.clone(), env, out_path, exit_path };
             let running = spawn(&self.sb, &spec).expect("spawn");
             self.table.register_from(&id, &CallId::from("call-1"), script, running, read_from).await
         }
 
         async fn event(&mut self) -> JobEvent {
-            tokio::time::timeout(Duration::from_secs(20), self.rx.recv()).await.expect("event in time").expect("channel open")
+            tokio::time::timeout(Duration::from_secs(20), self.rx.recv())
+                .await
+                .expect("event in time")
+                .expect("channel open")
         }
 
         fn stored(&self, blob: &BlobRef) -> String {
@@ -894,7 +930,10 @@ mod tests {
         assert!(gone(child).await, "the child outlived job_kill");
         let JobEvent::Settled { info, detail, .. } = f.event().await else { panic!("Settled") };
         assert_eq!(info.state, JobState::Ended(Ended::Exit(7)));
-        assert_eq!(detail, "the command itself had already exited (exit 7); the processes it left running were stopped");
+        assert_eq!(
+            detail,
+            "the command itself had already exited (exit 7); the processes it left running were stopped"
+        );
 
         let f = fx();
         let pidfile = f.root.join("child2.pid");
@@ -955,7 +994,8 @@ mod tests {
             // It had ended by itself: the stop did not reach it.
             ("j3", String::new()),
         ];
-        let want: std::collections::BTreeMap<String, String> = want.into_iter().map(|(id, d)| (id.to_string(), d)).collect();
+        let want: std::collections::BTreeMap<String, String> =
+            want.into_iter().map(|(id, d)| (id.to_string(), d)).collect();
         assert_eq!(details, want);
         assert_eq!(f.table.detail("j1").as_deref(), Some(why));
     }
@@ -1021,18 +1061,26 @@ mod tests {
     async fn a_job_that_ends_by_itself_over_the_limit_keeps_the_first_bytes_and_says_so() {
         let mut f = fx_with(2_000);
         let (id, out_path, exit_path) = f.table.allocate().await.expect("allocate");
-        let env = [("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        let spec = Spawn { script: "printf '%05000d' 0; exit 3".to_string(), cwd: f.root.clone(), env, out_path, exit_path };
+        let env =
+            [("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let spec =
+            Spawn { script: "printf '%05000d' 0; exit 3".to_string(), cwd: f.root.clone(), env, out_path, exit_path };
         let mut running = spawn(&f.sb, &spec).expect("spawn");
         // Over, with more output than the limit, before any watcher could have stopped it.
-        assert_eq!(running.wait(&never(), Some(Duration::from_secs(20)), u64::MAX).await, WaitEnd::Ended(Ended::Exit(3)));
+        assert_eq!(
+            running.wait(&never(), Some(Duration::from_secs(20)), u64::MAX).await,
+            WaitEnd::Ended(Ended::Exit(3))
+        );
         f.table.register(&id, &CallId::from("call-1"), "printf", running).await;
         let _ = f.event().await;
         let JobEvent::Settled { info, output, detail } = f.event().await else { panic!("Settled") };
         assert_eq!(info.state, JobState::Ended(Ended::Exit(3)));
         assert_eq!(info.output_bytes, 5_000);
         assert_eq!(f.stored(&output.expect("stored")).len(), 2_000);
-        assert_eq!(detail, "the output was 5000 bytes; only the first 2000 bytes were stored and the rest was discarded");
+        assert_eq!(
+            detail,
+            "the output was 5000 bytes; only the first 2000 bytes were stored and the rest was discarded"
+        );
     }
 
     #[tokio::test]
@@ -1086,7 +1134,8 @@ mod tests {
     fn orphan_running(f: &Fx, id: &str, script: &str) -> Running {
         let dir = f.root.join("home/jobs");
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let env = [("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let env =
+            [("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         let spec = Spawn {
             script: script.to_string(),
             cwd: f.root.clone(),
@@ -1150,7 +1199,9 @@ mod tests {
         }
         for _ in 0..400 {
             // SAFETY: signal 0 only tests for existence. Nothing is left of the group, zombies included, at ESRCH.
-            if unsafe { libc::kill(group, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            if unsafe { libc::kill(group, 0) } != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1166,7 +1217,10 @@ mod tests {
         let dir = f.root.join("home/jobs");
         // It ran on, unwatched, after its daemon went down, and exited 3.
         let mut running = orphan_running(&f, "j4", "echo built; echo failed; exit 3");
-        assert_eq!(running.wait(&never(), Some(Duration::from_secs(20)), u64::MAX).await, WaitEnd::Ended(Ended::Exit(3)));
+        assert_eq!(
+            running.wait(&never(), Some(Duration::from_secs(20)), u64::MAX).await,
+            WaitEnd::Ended(Ended::Exit(3))
+        );
         assert!(!running.group_alive());
         running.disarm();
         as_previous_daemons(&f, "j4");
@@ -1188,7 +1242,10 @@ mod tests {
         assert!(later.leftovers().is_empty());
         let end = later.ended_while_down("j4").expect("it ended by itself");
         assert_eq!(f.stored(&end.output.expect("stored")), "built\nfa");
-        assert_eq!(end.detail, "the output was 13 bytes; only the first 8 bytes were stored and the rest was discarded");
+        assert_eq!(
+            end.detail,
+            "the output was 13 bytes; only the first 8 bytes were stored and the rest was discarded"
+        );
         // Taken: its files go, and its id is still not handed out again.
         later.discard("j4");
         no_files_left(&f, "j4");
@@ -1218,8 +1275,14 @@ mod tests {
             let pidfile = f.root.join(format!("{id}.child"));
             let mut running = orphan_running(&f, id, &format!("sleep 300 & echo $! > {}", pidfile.display()));
             // The previous daemon saw the leader exit and recorded who was left in its group.
-            assert_eq!(running.wait(&never(), Some(Duration::from_secs(20)), u64::MAX).await, WaitEnd::Ended(Ended::Exit(0)));
-            assert_eq!(running.wait_group(&never(), Some(Duration::from_millis(50)), u64::MAX).await, WaitEnd::Deadline);
+            assert_eq!(
+                running.wait(&never(), Some(Duration::from_secs(20)), u64::MAX).await,
+                WaitEnd::Ended(Ended::Exit(0))
+            );
+            assert_eq!(
+                running.wait_group(&never(), Some(Duration::from_millis(50)), u64::MAX).await,
+                WaitEnd::Deadline
+            );
             running.disarm();
             as_previous_daemons(&f, id);
             leaders.push(running.pid);

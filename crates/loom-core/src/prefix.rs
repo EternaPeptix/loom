@@ -29,7 +29,10 @@ pub enum PrefixCheck {
     Ok,
     /// First request, or the epoch changed (a re-weave): nothing to compare.
     NewEpoch,
-    Break { first_diff_message: u32, detail: String },
+    Break {
+        first_diff_message: u32,
+        detail: String,
+    },
 }
 
 /// Hash of one message as sent.
@@ -186,7 +189,10 @@ mod tests {
         assert_eq!(g.check(2, &msgs(&["sys", "do it", "more"])), PrefixCheck::Ok);
         let mut g = PrefixGuard::new();
         g.prime(2, &msgs(&["sys", "do it"]));
-        assert!(matches!(g.check(2, &msgs(&["SYS", "do it", "more"])), PrefixCheck::Break { first_diff_message: 0, .. }));
+        assert!(matches!(
+            g.check(2, &msgs(&["SYS", "do it", "more"])),
+            PrefixCheck::Break { first_diff_message: 0, .. }
+        ));
         // The final message may still grow, as after any request without a reply.
         let mut g = PrefixGuard::new();
         g.prime(2, &msgs(&["sys", "do it"]));

@@ -437,9 +437,8 @@ impl Proxy {
         limits: Limits,
         resolver: Option<Resolver>,
     ) -> Result<Proxy, ProxyError> {
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .await
-            .map_err(|source| ProxyError::Bind { port, source })?;
+        let listener =
+            TcpListener::bind(("127.0.0.1", port)).await.map_err(|source| ProxyError::Bind { port, source })?;
         let bound = listener.local_addr().map_err(|source| ProxyError::Bind { port, source })?.port();
         let shared = Arc::new(Shared {
             sessions: Mutex::new(HashMap::new()),
@@ -1092,7 +1091,8 @@ async fn check(client: &mut TcpStream, cx: &Ctx<'_>, policy: &Policy, slot: Owne
         };
         // The first address the policy allows, else the first refusal.
         addrs.and_then(|addrs| {
-            let mut checked = addrs.into_iter().map(|ip| (policy.check_addr(cx.host, cx.port, ip, &name.rule), Some(ip)));
+            let mut checked =
+                addrs.into_iter().map(|ip| (policy.check_addr(cx.host, cx.port, ip, &name.rule), Some(ip)));
             let first = checked.next().ok_or("the name has no addresses")?;
             Ok(if first.0.allowed { first } else { checked.find(|(v, _)| v.allowed).unwrap_or(first) })
         })
@@ -1265,7 +1265,9 @@ async fn tunnel(
         RelayEnd::Done(false) => "the tunnel closed".to_string(),
         RelayEnd::Failed(why, false) => why.to_string(),
         RelayEnd::Idle(false, after) => format!("the tunnel was idle for {}", human(after)),
-        RelayEnd::Done(true) | RelayEnd::Failed(_, true) | RelayEnd::Idle(true, _) | RelayEnd::BadUpstream(..) => return,
+        RelayEnd::Done(true) | RelayEnd::Failed(_, true) | RelayEnd::Idle(true, _) | RelayEnd::BadUpstream(..) => {
+            return
+        }
     };
     cx.failed_after_allow(&allowed, &format!("{why} before the destination sent a byte")).await;
 }
@@ -2013,7 +2015,11 @@ mod tests {
                 if let Some(i) = text.find("\r\n\r\n") {
                     let want = text
                         .lines()
-                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
                         .unwrap_or(0);
                     if got.len() >= i + 4 + want {
                         break;
@@ -2182,10 +2188,7 @@ mod tests {
         let (p, _rx) = start().await;
         let (port, server) = http_server("HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n").await;
         let g = p.grant(&SessionId::from("s-post"), lab());
-        let req = format!(
-            "POST http://127.0.0.1:{port} HTTP/1.1\r\n{}Content-Length: 11\r\n\r\nhello world",
-            auth(&g)
-        );
+        let req = format!("POST http://127.0.0.1:{port} HTTP/1.1\r\n{}Content-Length: 11\r\n\r\nhello world", auth(&g));
         let resp = raw(p.port(), req.as_bytes()).await;
         assert_eq!(status(&resp), 201, "{resp}");
         let got = String::from_utf8(server.await.unwrap()).unwrap();
@@ -2208,7 +2211,11 @@ mod tests {
         let started = tokio::time::Instant::now();
         let mut rest = Vec::new();
         let _ = timeout(T, s.read_to_end(&mut rest)).await;
-        assert!(started.elapsed() < Duration::from_secs(1), "the proxy waited for the destination: {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the proxy waited for the destination: {:?}",
+            started.elapsed()
+        );
         assert!(begun.ends_with("\r\n\r\nfirst") && rest.is_empty(), "{begun:?} {:?}", String::from_utf8_lossy(&rest));
         let got = String::from_utf8(server.await.unwrap()).unwrap();
         assert!(got.ends_with("\r\n\r\n4\r\nbody\r\n0\r\n\r\n") && !got.contains("GET "), "{got}");
@@ -2222,7 +2229,10 @@ mod tests {
         let req = format!("GET http://127.0.0.1:{port}/x HTTP/1.1\r\n{}\r\n", auth(&g));
         let resp = raw(p.port(), req.as_bytes()).await;
         assert_eq!(status(&resp), 502, "{resp}");
-        assert!(resp.contains("X-Loom-Proxy: 1\r\n") && resp.contains("egress audit log could not be written"), "{resp}");
+        assert!(
+            resp.contains("X-Loom-Proxy: 1\r\n") && resp.contains("egress audit log could not be written"),
+            "{resp}"
+        );
         let (got, closed) = server.await.unwrap();
         assert!(got.is_empty() && closed.is_some(), "the upstream must not receive bytes: {got:?}");
         assert!(lock(&seen).is_empty());
@@ -2453,8 +2463,9 @@ mod tests {
             }
         }
         let names = table.clone();
-        let resolver: Resolver =
-            Arc::new(move |name: &str| names.iter().filter(|(n, _)| n == name).map(|(_, a)| a.parse().unwrap()).collect());
+        let resolver: Resolver = Arc::new(move |name: &str| {
+            names.iter().filter(|(n, _)| n == name).map(|(_, a)| a.parse().unwrap()).collect()
+        });
         let (tx, mut rx) = unbounded_channel();
         let p = Proxy::start_inner(0, tx, None, Limits::default(), Some(resolver)).await.unwrap();
         let open = p.grant(&SessionId::from("s-c-open"), policy(NetworkMode::Open, &[], &[], &[]));
@@ -2471,7 +2482,11 @@ mod tests {
                     if v4 == "8.8.8.8" {
                         assert_eq!(code, 200, "{dest}: {d:?}");
                     } else {
-                        assert_eq!((code, d.rule), (403, format!("deny private-address {shown} (check only)")), "{dest}");
+                        assert_eq!(
+                            (code, d.rule),
+                            (403, format!("deny private-address {shown} (check only)")),
+                            "{dest}"
+                        );
                         assert_eq!(d.resolved.as_deref(), Some(shown.as_str()), "{dest}");
                     }
                 }
@@ -2582,7 +2597,10 @@ mod tests {
             assert_eq!(rule(&r).as_deref(), Some("allow_private 127.0.0.1"), "{r}");
             let (who, d) = decision(&mut rx).await;
             assert_eq!((who, d.method.as_str(), d.allowed), (sid.clone(), CHECK_METHOD, true));
-            assert_eq!((d.rule.as_str(), d.resolved.as_deref()), ("allow_private 127.0.0.1 (check only)", Some("127.0.0.1")));
+            assert_eq!(
+                (d.rule.as_str(), d.resolved.as_deref()),
+                ("allow_private 127.0.0.1 (check only)", Some("127.0.0.1"))
+            );
         }
         assert!(timeout(Duration::from_millis(200), l.accept()).await.is_err(), "a check connected to the destination");
         // Refused, with the refusal text and the rule.
@@ -2595,7 +2613,10 @@ mod tests {
         let r = raw(p.port(), ask("nowhere.test:443".into()).as_bytes()).await;
         assert_eq!(status(&r), 502, "{r}");
         let (_, d) = decision(&mut rx).await;
-        assert!(d.allowed && d.rule.starts_with("mode open (unreachable: ") && d.rule.ends_with("(check only)"), "{d:?}");
+        assert!(
+            d.allowed && d.rule.starts_with("mode open (unreachable: ") && d.rule.ends_with("(check only)"),
+            "{d:?}"
+        );
         // A check needs the session's credentials like any request.
         let r = raw(p.port(), format!("{CHECK_METHOD} blocked.test:443 HTTP/1.1\r\n\r\n").as_bytes()).await;
         assert_eq!(status(&r), 407, "{r}");
@@ -2720,7 +2741,8 @@ mod tests {
         let text = lines(8).await;
         assert_eq!(crate::netlog::verify(&text), Ok(()));
         let rows: Vec<NetDecision> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        let rules: Vec<(&str, bool, &str)> = rows.iter().map(|d| (d.method.as_str(), d.allowed, d.rule.as_str())).collect();
+        let rules: Vec<(&str, bool, &str)> =
+            rows.iter().map(|d| (d.method.as_str(), d.allowed, d.rule.as_str())).collect();
         assert_eq!(rules.len(), 8, "{rules:?}");
         let failures = [
             ("GET", "sending the request to the destination failed"),
@@ -2788,7 +2810,7 @@ mod tests {
         ];
         for c in cases {
             let r = raw(p.port(), c.as_bytes()).await;
-            
+
             assert_eq!(status(&r), 400, "request {c:?} got {r}");
             assert!(r.contains("X-Loom-Proxy: 1\r\n"), "{r}");
         }
@@ -2904,7 +2926,10 @@ mod tests {
             "CONNECT 127.0.0.1:9 HTTP/1.1\r\n\r\n".to_string(),
             "garbage\r\n\r\n".to_string(),
             connect_req(&g, "127.0.0.1:1"),
-            connect_req(&p.grant(&SessionId::from("s-drain-2"), policy(NetworkMode::DenyAll, &[], &[], &[])), "x.test:1"),
+            connect_req(
+                &p.grant(&SessionId::from("s-drain-2"), policy(NetworkMode::DenyAll, &[], &[], &[])),
+                "x.test:1",
+            ),
         ];
         for req in requests.iter().cycle().take(12) {
             let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
@@ -2979,7 +3004,10 @@ mod tests {
         assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
         assert!(!queued(true).contains(&drained[0]), "the newer drained connection was closed first: {drained:?}");
         let mut b = [0u8; 1];
-        assert!(timeout(Duration::from_millis(200), silent.read(&mut b)).await.is_err(), "the silent connection was closed");
+        assert!(
+            timeout(Duration::from_millis(200), silent.read(&mut b)).await.is_err(),
+            "the silent connection was closed"
+        );
     }
 
     #[tokio::test]
@@ -3120,8 +3148,11 @@ mod tests {
             Ok(httparse::Status::Complete(n)) => n,
             other => panic!("the client cannot read {resp:?}: {other:?}"),
         };
-        let headers =
-            r.headers.iter().map(|h| (h.name.to_ascii_lowercase(), String::from_utf8_lossy(h.value).to_string())).collect();
+        let headers = r
+            .headers
+            .iter()
+            .map(|h| (h.name.to_ascii_lowercase(), String::from_utf8_lossy(h.value).to_string()))
+            .collect();
         (r.code.unwrap(), headers, resp[n..].to_string())
     }
 
@@ -3130,7 +3161,8 @@ mod tests {
         let (p, _rx) = start().await;
         let g = p.grant(&SessionId::from("s-mark"), lab());
         let (port, _server) =
-            http_server("HTTP/1.1 403 Forbidden\r\nx-loom-proxy: 1\r\nX-Other: kept\r\nContent-Length: 4\r\n\r\nnope").await;
+            http_server("HTTP/1.1 403 Forbidden\r\nx-loom-proxy: 1\r\nX-Other: kept\r\nContent-Length: 4\r\n\r\nnope")
+                .await;
         let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
         let resp = raw(p.port(), req.as_bytes()).await;
         assert_eq!(status(&resp), 403, "{resp}");
@@ -3178,7 +3210,11 @@ mod tests {
         let lower = head.to_ascii_lowercase();
         assert!(!lower.contains("keep-alive") && !lower.contains("proxy-connection"), "{head}");
         assert!(rest.is_empty(), "{:?}", String::from_utf8_lossy(&rest));
-        assert!(started.elapsed() < Duration::from_secs(1), "the proxy waited for the destination: {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the proxy waited for the destination: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -3218,7 +3254,8 @@ mod tests {
         let g = p.grant(&SessionId::from("s-chunked"), lab());
         let body = "2\r\nok\r\n3;note=x\r\nabc\r\n0\r\nX-Trailer: t\r\n\r\n";
         // The forged answer comes in the same segment as the last chunk, or later on the same connection.
-        let together = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n{body}{FORGED}");
+        let together =
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n{body}{FORGED}");
         let apart = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n{body}");
         for (first, second) in [(together.as_str(), ""), (apart.as_str(), FORGED)] {
             for pipelined in [false, true] {
@@ -3269,7 +3306,10 @@ mod tests {
             let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
             let resp = raw(p.port(), req.as_bytes()).await;
             assert_eq!(status(&resp), 502, "{first:?} -> {resp:?}");
-            assert!(resp.contains("X-Loom-Proxy: 1\r\n") && resp.contains("invalid or conflicting Content-Length"), "{resp}");
+            assert!(
+                resp.contains("X-Loom-Proxy: 1\r\n") && resp.contains("invalid or conflicting Content-Length"),
+                "{resp}"
+            );
         }
     }
 
@@ -3297,7 +3337,11 @@ mod tests {
         s.write_all(format!("dy{}", get(port)).as_bytes()).await.unwrap();
         let mut rest = Vec::new();
         let _ = timeout(T, s.read_to_end(&mut rest)).await;
-        assert!(started.elapsed() < Duration::from_secs(1), "the proxy waited for the destination: {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the proxy waited for the destination: {:?}",
+            started.elapsed()
+        );
         assert!(begun.ends_with("\r\n\r\nfirst") && rest.is_empty(), "{begun:?} {:?}", String::from_utf8_lossy(&rest));
         let got = String::from_utf8(server.await.unwrap()).unwrap();
         assert!(got.ends_with("\r\n\r\nbody") && !got.contains("GET "), "{got}");

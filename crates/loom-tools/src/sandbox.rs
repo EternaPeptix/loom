@@ -322,11 +322,13 @@ fn lexical(path: &Path) -> Option<PathBuf> {
 
 /// A path as an SBPL string literal body; refuses what cannot be written safely.
 fn sbpl(path: &Path) -> io::Result<String> {
-    let s = path
-        .to_str()
-        .ok_or_else(|| invalid(format!("sandbox path {} is not valid UTF-8; use a path made of plain text.", path.display())))?;
+    let s = path.to_str().ok_or_else(|| {
+        invalid(format!("sandbox path {} is not valid UTF-8; use a path made of plain text.", path.display()))
+    })?;
     if s.chars().any(char::is_control) {
-        return Err(invalid(format!("sandbox path {s:?} contains a control character; remove it from the configuration.")));
+        return Err(invalid(format!(
+            "sandbox path {s:?} contains a control character; remove it from the configuration."
+        )));
     }
     Ok(s.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -460,8 +462,8 @@ impl Sandbox {
                 Some(p) => p,
                 None if given == "~" || given.starts_with("~/") => {
                     return Err(invalid(format!(
-                        "the sandbox path {given:?} needs the home directory, but HOME is not set; write the path in full."
-                    )))
+                    "the sandbox path {given:?} needs the home directory, but HOME is not set; write the path in full."
+                )))
                 }
                 None => PathBuf::from(given),
             };
@@ -638,7 +640,10 @@ impl Sandbox {
         let refused = |a: &Path| {
             a == self.tmp_dir.as_path()
                 || self.unreadable.iter().chain(&self.credentials).any(|p| under(a, p))
-                || self.protected.iter().any(|p| under(a, p) && (!a.starts_with(&self.tmp_dir) || under(p, &self.tmp_dir)))
+                || self
+                    .protected
+                    .iter()
+                    .any(|p| under(a, p) && (!a.starts_with(&self.tmp_dir) || under(p, &self.tmp_dir)))
         };
         let guarded = self.protected.iter().chain(&self.unreadable).chain(&self.credentials).chain([&self.tmp_dir]);
         let mut out = std::collections::BTreeSet::new();
@@ -755,7 +760,9 @@ impl Sandbox {
             })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        for (k, v) in [("TERM", "dumb"), ("NO_COLOR", "1"), ("PAGER", "cat"), ("GIT_PAGER", "cat"), ("GIT_TERMINAL_PROMPT", "0")] {
+        for (k, v) in
+            [("TERM", "dumb"), ("NO_COLOR", "1"), ("PAGER", "cat"), ("GIT_PAGER", "cat"), ("GIT_TERMINAL_PROMPT", "0")]
+        {
             out.insert(k.to_string(), v.to_string());
         }
         out.insert("TMPDIR".to_string(), self.tmp_dir.display().to_string());
@@ -1007,15 +1014,43 @@ mod tests {
         assert!(sb.check_read(&fake.join(".claude/settings.json")).is_ok());
         assert!(sb.check_read(&fake.join("Library/Application Support/Claude/logs/main.log")).is_ok());
         for rel in [
-            ".cache/huggingface/token", ".huggingface/token", ".pgpass", ".my.cnf", ".mylogin.cnf", ".vault-token",
-            ".terraform.d/credentials.tfrc.json", ".config/rclone/rclone.conf", ".s3cfg", ".boto",
-            ".gem/credentials", ".m2/settings.xml", ".m2/settings-security.xml", ".gradle/gradle.properties",
-            ".yarnrc.yml", ".composer/auth.json", ".codex/auth.json", ".claude.json", ".claude/.credentials.json",
-            ".config/github-copilot/apps.json", ".config/hub/hosts", ".config/glab-cli/config.yml", ".oci/config",
-            ".config/doctl/config.yaml", ".fly/config.yml", ".config/heroku/x", ".heroku/accounts",
-            ".config/netlify/config.json", ".config/sops/age/keys.txt", ".age/key", ".config/age/key",
-            ".bitcoin/wallet.dat", ".ethereum/keystore", ".config/solana/id.json", ".wrangler/config",
-            ".config/.wrangler/config", ".pulumi/credentials.json",
+            ".cache/huggingface/token",
+            ".huggingface/token",
+            ".pgpass",
+            ".my.cnf",
+            ".mylogin.cnf",
+            ".vault-token",
+            ".terraform.d/credentials.tfrc.json",
+            ".config/rclone/rclone.conf",
+            ".s3cfg",
+            ".boto",
+            ".gem/credentials",
+            ".m2/settings.xml",
+            ".m2/settings-security.xml",
+            ".gradle/gradle.properties",
+            ".yarnrc.yml",
+            ".composer/auth.json",
+            ".codex/auth.json",
+            ".claude.json",
+            ".claude/.credentials.json",
+            ".config/github-copilot/apps.json",
+            ".config/hub/hosts",
+            ".config/glab-cli/config.yml",
+            ".oci/config",
+            ".config/doctl/config.yaml",
+            ".fly/config.yml",
+            ".config/heroku/x",
+            ".heroku/accounts",
+            ".config/netlify/config.json",
+            ".config/sops/age/keys.txt",
+            ".age/key",
+            ".config/age/key",
+            ".bitcoin/wallet.dat",
+            ".ethereum/keystore",
+            ".config/solana/id.json",
+            ".wrangler/config",
+            ".config/.wrangler/config",
+            ".pulumi/credentials.json",
             "Library/Application Support/doctl/config.yaml",
             "Library/Application Support/sops/age/keys.txt",
             "Library/Preferences/netlify/config.json",
@@ -1050,7 +1085,10 @@ mod tests {
         let none = build_home(&f, &cfg(SandboxMode::None), &fake);
         assert!(none.check_read(&fake.join(".ssh/id")).is_err());
         let d = none.describe();
-        assert!(d.contains("They also refuse to read or write credential directories") && !d.contains("off limits"), "{d}");
+        assert!(
+            d.contains("They also refuse to read or write credential directories") && !d.contains("off limits"),
+            "{d}"
+        );
         // Switched off, nothing is added.
         let off = SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) };
         let sb = build_home(&f, &off, &fake);
@@ -1228,7 +1266,10 @@ mod tests {
     #[test]
     fn check_read_refuses_credentials_and_configured_paths() {
         let f = fx();
-        let c = SandboxCfg { unreadable_paths: vec![format!("{}/hidden", s(&f.root)), "~/.loomtest-ssh".into()], ..cfg(SandboxMode::Seatbelt) };
+        let c = SandboxCfg {
+            unreadable_paths: vec![format!("{}/hidden", s(&f.root)), "~/.loomtest-ssh".into()],
+            ..cfg(SandboxMode::Seatbelt)
+        };
         let sb = build(&f, &c, None);
         assert!(sb.check_read(&f.home.join("token")).expect_err("token").contains("not readable"));
         assert!(sb.check_read(&f.home.join("keys/k")).is_err());
@@ -1277,13 +1318,23 @@ mod tests {
         }
         let sb = Sandbox::with_home(&c, &f.ws, &f.tmp, &f.home, None, Some(f.ws.clone())).expect("sandbox");
         let p = sb.profile().expect("profile");
-        let writes = p.lines().find(|l| l.starts_with("(deny file-write* (subpath") && l.contains("/hidden\"")).expect("write deny");
-        for denied in [format!("{ws}/hidden"), format!("{root}/extra/deny"), format!("{ws}/.ssh"), format!("{ws}/.config/gh")] {
+        let writes = p
+            .lines()
+            .find(|l| l.starts_with("(deny file-write* (subpath") && l.contains("/hidden\""))
+            .expect("write deny");
+        for denied in
+            [format!("{ws}/hidden"), format!("{root}/extra/deny"), format!("{ws}/.ssh"), format!("{ws}/.config/gh")]
+        {
             assert!(writes.contains(&format!("(subpath \"{denied}\")")), "{denied}: {p}");
         }
         // Nor can the directories that hold them be moved: the workspace, `.config`, `Library`, the extra root.
         let held = p.lines().rfind(|l| l.starts_with("(deny file-write-unlink")).expect("holders");
-        for dir in [ws.to_string(), format!("{ws}/.config"), format!("{ws}/Library/Application Support"), format!("{root}/extra")] {
+        for dir in [
+            ws.to_string(),
+            format!("{ws}/.config"),
+            format!("{ws}/Library/Application Support"),
+            format!("{root}/extra"),
+        ] {
             assert!(held.contains(&format!("(literal \"{dir}\")")), "{dir}: {p}");
         }
         // A directory that a rule of its own already covers is not listed: a denied one, the loom home.
@@ -1311,7 +1362,8 @@ mod tests {
         // Removed, the link could be replaced by a directory of the command's own: both spellings are denied.
         for rule in ["(deny file-write* (subpath", "(deny file-read* (subpath"] {
             let line = p.lines().find(|l| l.starts_with(rule) && l.contains("/Sync/ssh\"")).expect(rule);
-            for denied in [".ssh", "Sync/ssh", ".cargo/credentials", "Sync/cargo/credentials", "hidden", "Sync/hidden"] {
+            for denied in [".ssh", "Sync/ssh", ".cargo/credentials", "Sync/cargo/credentials", "hidden", "Sync/hidden"]
+            {
                 assert_eq!(line.matches(&format!("(subpath \"{ws}/{denied}\")")).count(), 1, "{denied}: {p}");
             }
             // A path that no link makes differ is listed once.
@@ -1527,13 +1579,15 @@ mod tests {
     #[test]
     fn describe_names_the_temp_dir_as_the_exception_in_the_production_layout() {
         let f = fx_prod();
-        let exception = format!("The one exception is the session temp dir {}: what is in it can be written.", s(&f.tmp));
+        let exception =
+            format!("The one exception is the session temp dir {}: what is in it can be written.", s(&f.tmp));
         for mode in [SandboxMode::Seatbelt, SandboxMode::None] {
             let d = build(&f, &cfg(mode), None).describe();
             assert!(d.contains(s(&f.home)) && d.contains(&exception), "{d}");
         }
         let d = build(&f, &cfg(SandboxMode::Seatbelt), None).describe();
-        let (writable, refused) = (d.find(s(&f.tmp)).expect("writable"), d.find("are refused even there").expect("refused"));
+        let (writable, refused) =
+            (d.find(s(&f.tmp)).expect("writable"), d.find("are refused even there").expect("refused"));
         assert!(writable < refused && d.find(&exception).is_some_and(|e| e > refused), "{d}");
         // A temp dir that is itself protected has no exception.
         let dot = f.ws.join(".loom");
@@ -1833,9 +1887,14 @@ mod tests {
         assert!(!ok && f.ws.join("hidden/f").exists(), "{text}");
         // A link to a credential store, or above one, cannot be removed or moved to make way for a
         // directory of the command's own.
-        for script in [format!("rm {ws}/.kube && mkdir {ws}/.kube"), format!("mv {ws}/.cargo {ws}/c3 && mkdir {ws}/.cargo")] {
+        for script in
+            [format!("rm {ws}/.kube && mkdir {ws}/.kube"), format!("mv {ws}/.cargo {ws}/c3 && mkdir {ws}/.cargo")]
+        {
             let (ok, text) = run(&sb, &f.ws, &script);
-            assert!(!ok && text.contains("Operation not permitted") && !text.contains("linked-secret"), "{script}: {text}");
+            assert!(
+                !ok && text.contains("Operation not permitted") && !text.contains("linked-secret"),
+                "{script}: {text}"
+            );
         }
         assert!(f.ws.join(".kube").is_symlink() && f.ws.join(".cargo").is_symlink() && !f.ws.join("c3").exists());
         // A missing directory above one (`.docker` holds `.docker/config.json`) cannot be made as a link that
@@ -1858,7 +1917,11 @@ mod tests {
         }
         let f = fx();
         let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
-        let (ok, text) = run(&sb, &f.ws, "echo hidden > /dev/null; echo abc | tr a-c A-C | cat; ls /nonexistent-dir 2>/dev/null; true");
+        let (ok, text) = run(
+            &sb,
+            &f.ws,
+            "echo hidden > /dev/null; echo abc | tr a-c A-C | cat; ls /nonexistent-dir 2>/dev/null; true",
+        );
         assert!(ok && text == "ABC\n", "{text}");
     }
 

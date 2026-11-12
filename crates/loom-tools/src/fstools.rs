@@ -279,7 +279,9 @@ fn not_regular(given: &str, tool: &str, kind: &FileType) -> ToolOutput {
     let instead = if tool != "read" {
         "to send data to it on purpose, use `bash`".to_string()
     } else if kind.is_socket() {
-        format!("a socket has no content to read: to talk to it, connect to it from `bash` (for example `nc -U {given}`)")
+        format!(
+            "a socket has no content to read: to talk to it, connect to it from `bash` (for example `nc -U {given}`)"
+        )
     } else {
         format!("to look at it on purpose, use `bash` with a bounded command (for example `head -c 1000 {given}`)")
     };
@@ -299,7 +301,9 @@ fn too_large_advice(given: &str) -> String {
 
 /// The result of work that found the call cancelled before it had any effect.
 fn cancelled(tool: &str) -> ToolOutput {
-    interrupted(format!("The `{tool}` call was interrupted before it changed anything. Call `{tool}` again if you still need it."))
+    interrupted(format!(
+        "The `{tool}` call was interrupted before it changed anything. Call `{tool}` again if you still need it."
+    ))
 }
 
 /// The error for a failed bounded read; `advice` says what to do about a file that is too large.
@@ -323,7 +327,9 @@ fn check_failed(given: &str, tool: &str, doing: &str, e: NotOpened) -> ToolOutpu
     match e {
         NotOpened::NotRegular(kind) => not_regular(given, tool, &kind),
         NotOpened::Denied(why) => ToolOutput::denied(why),
-        NotOpened::Io(e) => ToolOutput::error(format!("{given} cannot be checked before {doing} ({e}). Check the path and its permissions.")),
+        NotOpened::Io(e) => ToolOutput::error(format!(
+            "{given} cannot be checked before {doing} ({e}). Check the path and its permissions."
+        )),
     }
 }
 
@@ -461,7 +467,9 @@ fn open_dir_creating(sandbox: &Sandbox, dir: &Path) -> Result<File, WriteFail> {
             },
             // Whether a link is in the way only chooses the sentence; the open has already refused it.
             Err(e) => {
-                return Err(not_followed(at, e, || std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_symlink())))
+                return Err(not_followed(at, e, || {
+                    std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_symlink())
+                }))
             }
         }
     };
@@ -694,7 +702,8 @@ impl Tool for Read {
         };
         let (given, start, end) = (given.to_string(), uint(args, "start"), uint(args, "end"));
         let target = path.clone();
-        let out = off_thread(ctx, "read", &path, move |c| read_file(&c, &given, &target, start, end, READ_LIMITS)).await;
+        let out =
+            off_thread(ctx, "read", &path, move |c| read_file(&c, &given, &target, start, end, READ_LIMITS)).await;
         with_path(out, &path)
     }
 }
@@ -723,7 +732,14 @@ fn open_to_read(given: &str, path: &Path, readable: Readable<'_>) -> Result<(Fil
 }
 
 /// The blocking part of `read`. A file above `limits.whole` is read only by line range, streamed.
-fn read_file(ctx: &ToolCtx, given: &str, path: &Path, start: Option<u64>, end: Option<u64>, limits: ReadLimits) -> Worked {
+fn read_file(
+    ctx: &ToolCtx,
+    given: &str,
+    path: &Path,
+    start: Option<u64>,
+    end: Option<u64>,
+    limits: ReadLimits,
+) -> Worked {
     let (file, meta) = match open_to_read(given, path, &readable_in(ctx)) {
         Ok(x) => x,
         Err(refusal) => return (*refusal).into(),
@@ -754,11 +770,14 @@ fn show_whole(ctx: &ToolCtx, given: &str, bytes: &[u8], start: Option<u64>, end:
     }
     let (stored, norm) = match view::store_text(&ctx.blobs, bytes) {
         Ok(r) => r,
-        Err(e) => return ToolOutput::error(format!("{given} was read but could not be stored for display ({e}). Try again.")),
+        Err(e) => {
+            return ToolOutput::error(format!("{given} was read but could not be stored for display ({e}). Try again."))
+        }
     };
     if norm.binary {
         let notes = norm.notes();
-        let mut out = ToolOutput::ok("ok", Body::View { of: stored.id, text: norm.text, shown: vec![(1, 1)] }).with_more(given.to_string());
+        let mut out = ToolOutput::ok("ok", Body::View { of: stored.id, text: norm.text, shown: vec![(1, 1)] })
+            .with_more(given.to_string());
         if let Some(notes) = notes {
             out = out.with_more(notes);
         }
@@ -842,7 +861,13 @@ fn end_line(w: &mut Window, line_start: usize, full_bytes: u64) {
 
 /// Stream `file`, keeping only lines `first..=last`: at most `KEEP_LINE_BYTES` bytes of each, and no
 /// further line once `max_bytes` are kept.
-fn stream_window(file: File, cancel: &CancellationToken, first: u64, last: u64, max_bytes: usize) -> Result<Window, Fail> {
+fn stream_window(
+    file: File,
+    cancel: &CancellationToken,
+    first: u64,
+    last: u64,
+    max_bytes: usize,
+) -> Result<Window, Fail> {
     let mut reader = BufReader::with_capacity(1 << 16, file);
     let mut w = Window { raw: Vec::new(), count: 0, cut: Vec::new(), total: None, full: false, binary: false };
     let mut lineno = 1u64;
@@ -924,7 +949,8 @@ fn number_window(text: &str, first: u64, cut: &[(u64, u64)]) -> (String, u64) {
         }
         out.push_str(&first.saturating_add(i as u64).to_string());
         out.push('\t');
-        let full_bytes = cut.binary_search_by_key(&(i as u64), |(at, _)| *at).ok().and_then(|j| cut.get(j)).map(|(_, bytes)| *bytes);
+        let full_bytes =
+            cut.binary_search_by_key(&(i as u64), |(at, _)| *at).ok().and_then(|j| cut.get(j)).map(|(_, bytes)| *bytes);
         let (head, rest) = match line.char_indices().nth(MAX_LINE_CHARS) {
             Some((at, _)) => line.split_at(at),
             None => (line, ""),
@@ -945,10 +971,20 @@ fn number_window(text: &str, first: u64, cut: &[(u64, u64)]) -> (String, u64) {
 /// the same normalisation and store as a whole read, so what is shown is a view of stored text: the
 /// text numbers the lines as in the file, and `shown` counts them in the stored window, which is
 /// what coverage of that stored text is kept in.
-fn read_large_range(ctx: &ToolCtx, given: &str, file: File, meta: &Metadata, start: Option<u64>, end: Option<u64>, max_bytes: usize) -> Worked {
+fn read_large_range(
+    ctx: &ToolCtx,
+    given: &str,
+    file: File,
+    meta: &Metadata,
+    start: Option<u64>,
+    end: Option<u64>,
+    max_bytes: usize,
+) -> Worked {
     let (first, last) = match view::window(start, end, u64::MAX, ctx.cfg.read_max_lines) {
         Ok(Some(w)) => w,
-        Ok(None) => return ToolOutput::error("There is nothing to show for this range. Give a `start` of 1 or more.").into(),
+        Ok(None) => {
+            return ToolOutput::error("There is nothing to show for this range. Give a `start` of 1 or more.").into()
+        }
         Err(e) => return ToolOutput::error(e).into(),
     };
     let w = match stream_window(file, &ctx.cancel, first, last, max_bytes) {
@@ -972,7 +1008,10 @@ fn read_large_range(ctx: &ToolCtx, given: &str, file: File, meta: &Metadata, sta
     let shown_last = first.saturating_add(w.count - 1);
     let (stored, norm) = match view::store_text(&ctx.blobs, &w.raw) {
         Ok(r) => r,
-        Err(e) => return ToolOutput::error(format!("{given} was read but could not be stored for display ({e}). Try again.")).into(),
+        Err(e) => {
+            return ToolOutput::error(format!("{given} was read but could not be stored for display ({e}). Try again."))
+                .into()
+        }
     };
     if norm.binary {
         return ToolOutput::error(format!(
@@ -1137,7 +1176,10 @@ fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all:
         return ToolOutput::error("`old` is empty, so there is nothing to find. Give the exact text to replace; to add text to an empty or new file use `write`.").into();
     }
     if old == new {
-        return ToolOutput::error("`old` and `new` are identical, so the edit would change nothing. Give a `new` that differs from `old`.").into();
+        return ToolOutput::error(
+            "`old` and `new` are identical, so the edit would change nothing. Give a `new` that differs from `old`.",
+        )
+        .into();
     }
     if path.is_dir() {
         return ToolOutput::error(format!("{given} is a directory. Give the path of a file to edit.")).into();
@@ -1159,13 +1201,22 @@ fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all:
     };
     let text = match String::from_utf8(bytes) {
         Ok(t) => t,
-        Err(_) => return ToolOutput::error(format!("{given} is not valid UTF-8 text, and binary files are not edited. Use `bash` for a binary change.")).into(),
+        Err(_) => {
+            return ToolOutput::error(format!(
+                "{given} is not valid UTF-8 text, and binary files are not edited. Use `bash` for a binary change."
+            ))
+            .into()
+        }
     };
 
     // A file that uses CRLF throughout shows the model lines without the CRs; the text it gives is
     // matched, and what it puts in, with the file's own line endings.
-    let crlf = text.contains("\r\n") && text.matches('\n').count() == text.matches("\r\n").count() && !old.contains('\r') && !new.contains('\r');
-    let (old, new) = if crlf { (old.replace('\n', "\r\n"), new.replace('\n', "\r\n")) } else { (old.to_string(), new.to_string()) };
+    let crlf = text.contains("\r\n")
+        && text.matches('\n').count() == text.matches("\r\n").count()
+        && !old.contains('\r')
+        && !new.contains('\r');
+    let (old, new) =
+        if crlf { (old.replace('\n', "\r\n"), new.replace('\n', "\r\n")) } else { (old.to_string(), new.to_string()) };
 
     let positions: Vec<usize> = text.match_indices(old.as_str()).map(|(i, _)| i).collect();
     if positions.is_empty() {
@@ -1291,7 +1342,9 @@ mod tests {
         std::fs::write(&p, vec![b'x'; 100]).unwrap();
         // The size seen at open time (1) was within the cap (10); the read finds more.
         let fail = read_open(File::open(&p).unwrap(), 1, 10, &CancellationToken::new()).unwrap_err();
-        let Body::Message(text) = fail_output(fail, "grow.txt", "read", "Use a range.").body else { panic!("not a message") };
+        let Body::Message(text) = fail_output(fail, "grow.txt", "read", "Use a range.").body else {
+            panic!("not a message")
+        };
         assert!(text.contains("grew while it was being read") && text.contains("above the 10 byte limit"), "{text}");
         assert!(!text.contains("is 11 bytes") && !text.contains(&READ_CAP.to_string()), "{text}");
     }
@@ -1406,7 +1459,11 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         // The device last: a read of it that is not refused never ends, and nothing can release it.
-        let targets = [(fifo.display().to_string(), "FIFO"), (sock.display().to_string(), "a socket"), ("/dev/zero".to_string(), "character device")];
+        let targets = [
+            (fifo.display().to_string(), "FIFO"),
+            (sock.display().to_string(), "a socket"),
+            ("/dev/zero".to_string(), "character device"),
+        ];
 
         let given_up = Arc::new(AtomicBool::new(false));
         let (paths, stop) = (targets.clone().map(|(path, _)| path), given_up.clone());
@@ -1414,7 +1471,9 @@ mod tests {
             let e = env();
             let mut results = Vec::new();
             for path in &paths {
-                for (tool, mut args) in [("read", json!({})), ("write", json!({"content": "x"})), ("edit", json!({"old": "a", "new": "b"}))] {
+                for (tool, mut args) in
+                    [("read", json!({})), ("write", json!({"content": "x"})), ("edit", json!({"old": "a", "new": "b"}))]
+                {
                     if stop.load(Ordering::SeqCst) {
                         return results;
                     }
@@ -1445,7 +1504,11 @@ mod tests {
             for r in calls {
                 assert!(is_err(r), "{}", r.text);
                 assert!(r.text.contains(&format!("{path} is ")) && r.text.contains(kind), "{}", r.text);
-                assert!(r.text.contains(&format!("not a regular file, and `{}` works only on regular files", r.name)), "{}", r.text);
+                assert!(
+                    r.text.contains(&format!("not a regular file, and `{}` works only on regular files", r.name)),
+                    "{}",
+                    r.text
+                );
                 assert!(r.text.contains("`bash`") && !r.text.contains("permissions"), "{}", r.text);
             }
         }
@@ -1461,7 +1524,12 @@ mod tests {
         // what the path is.
         let nul = std::io::Error::new(std::io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte");
         let m = message(&check_failed("a.txt", "write", "writing", NotOpened::Io(nul)));
-        assert!(m.contains("a.txt cannot be checked before writing") && m.contains("NUL byte") && !m.contains("regular file"), "{m}");
+        assert!(
+            m.contains("a.txt cannot be checked before writing")
+                && m.contains("NUL byte")
+                && !m.contains("regular file"),
+            "{m}"
+        );
     }
 
     #[tokio::test]
@@ -1520,15 +1588,24 @@ mod tests {
         assert_eq!(shown, vec![(1, 5)]);
         assert_eq!(stored, "plain line\nbold\nbell\\x07 here\nprogress 2\ncaf\u{fffd}\n");
         let facts = out.more.join(" · ");
-        assert!(facts.contains("2 terminal escape sequences removed") && facts.contains("1 overwritten lines collapsed"), "{facts}");
-        assert!(facts.contains("1 invalid bytes replaced") && facts.contains("1 control characters escaped"), "{facts}");
+        assert!(
+            facts.contains("2 terminal escape sequences removed") && facts.contains("1 overwritten lines collapsed"),
+            "{facts}"
+        );
+        assert!(
+            facts.contains("1 invalid bytes replaced") && facts.contains("1 control characters escaped"),
+            "{facts}"
+        );
 
         // A NUL in the window: the lines are refused as binary, not shown raw, and it is not a read.
         e.ctx.files.forget(&path);
         let out = read_limited(&e, "log.txt", Some(1004), Some(1006), cap(100));
         assert_eq!(out.status, ToolStatus::Error);
         let m = message(&out);
-        assert!(m.contains("Lines 1004-1006 of log.txt are binary data") && m.contains("`bash`") && !m.contains('\0'), "{m}");
+        assert!(
+            m.contains("Lines 1004-1006 of log.txt are binary data") && m.contains("`bash`") && !m.contains('\0'),
+            "{m}"
+        );
         assert_eq!(e.ctx.files.check(&path).unwrap(), Freshness::Unread);
     }
 
@@ -1545,10 +1622,17 @@ mod tests {
         assert!(facts.contains("lines 10-12 — more below") && facts.contains("before line 50"), "{facts}");
         assert!(facts.contains("size limit of 20 bytes") && facts.contains("continue with `start` 13"), "{facts}");
         // The stored window is numbered from 1 while the text shows the file's numbers: no handle, and it says so.
-        assert!(facts.contains("has no handle") && facts.contains("bounded `bash` command") && !facts.contains("out:"), "{facts}");
+        assert!(
+            facts.contains("has no handle") && facts.contains("bounded `bash` command") && !facts.contains("out:"),
+            "{facts}"
+        );
         // A window that ends at the line asked for, or with the file, was not cut by its size.
         let out = read_limited(&e, "rows.txt", Some(10), Some(12), limits);
-        assert!(view_of(&e, &out).0.ends_with("12\trow 12") && !out.more.join(" · ").contains("size limit"), "{:?}", out.more);
+        assert!(
+            view_of(&e, &out).0.ends_with("12\trow 12") && !out.more.join(" · ").contains("size limit"),
+            "{:?}",
+            out.more
+        );
         let out = read_limited(&e, "rows.txt", Some(198), Some(900), limits);
         assert!(out.more.iter().any(|f| f.starts_with("lines 198-200 of 200")), "{:?}", out.more);
 
@@ -1559,10 +1643,17 @@ mod tests {
         assert_eq!(shown, vec![(1, 3)]);
         let lines: Vec<&str> = text.split('\n').collect();
         assert_eq!((lines[0], lines[2], lines.len()), ("1\tshort", "3\tend", 3));
-        assert!(lines[1].starts_with("2\taéé") && lines[1].ends_with("é…[line is 120001 bytes; the rest is not shown]"), "{} bytes", lines[1].len());
+        assert!(
+            lines[1].starts_with("2\taéé") && lines[1].ends_with("é…[line is 120001 bytes; the rest is not shown]"),
+            "{} bytes",
+            lines[1].len()
+        );
         assert_eq!(lines[1].chars().filter(|c| *c == 'é').count(), 19_999);
         assert_eq!(stored.len(), "short\n".len() + 79_999 + "\nend\n".len());
-        assert_eq!(out.more.iter().filter(|f| f.contains("shortened") || f.contains("invalid")).collect::<Vec<_>>(), vec!["1 long lines shortened"]);
+        assert_eq!(
+            out.more.iter().filter(|f| f.contains("shortened") || f.contains("invalid")).collect::<Vec<_>>(),
+            vec!["1 long lines shortened"]
+        );
     }
 
     #[tokio::test]
@@ -1703,7 +1794,14 @@ mod tests {
     async fn write_creates_and_refuses_unread_and_changed() {
         let e = env();
         let r = e.call("write", json!({"path": "new/dir/a.txt", "content": "hi\nthere\n"})).await;
-        assert!(r.text.contains("created") && r.text.contains("2 lines") && r.text.contains("9 bytes") && r.text.contains("(new file)"), "{}", r.text);
+        assert!(
+            r.text.contains("created")
+                && r.text.contains("2 lines")
+                && r.text.contains("9 bytes")
+                && r.text.contains("(new file)"),
+            "{}",
+            r.text
+        );
         assert_eq!(std::fs::read(ws(&e, "new/dir/a.txt")).unwrap(), b"hi\nthere\n");
 
         put(&e, "b.txt", b"existing\n");
@@ -1733,7 +1831,11 @@ mod tests {
         let r = e.call("write", json!({"path": "run.sh", "content": "#!/bin/sh\necho hi\n"})).await;
         assert!(!is_err(&r), "{}", r.text);
         assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o755);
-        let names: Vec<String> = std::fs::read_dir(&e.ctx.workspace).unwrap().flatten().map(|d| d.file_name().to_string_lossy().into_owned()).collect();
+        let names: Vec<String> = std::fs::read_dir(&e.ctx.workspace)
+            .unwrap()
+            .flatten()
+            .map(|d| d.file_name().to_string_lossy().into_owned())
+            .collect();
         assert_eq!(names, vec!["run.sh".to_string()]);
     }
 
@@ -1743,7 +1845,13 @@ mod tests {
         let outside = dir.path().canonicalize().unwrap().join("outside");
         std::fs::create_dir(&outside).unwrap();
         let protected_paths = vec![outside.display().to_string()];
-        (env_with(ToolsCfg::default(), SandboxCfg { mode: SandboxMode::None, protected_paths, ..SandboxCfg::default() }), outside)
+        (
+            env_with(
+                ToolsCfg::default(),
+                SandboxCfg { mode: SandboxMode::None, protected_paths, ..SandboxCfg::default() },
+            ),
+            outside,
+        )
     }
 
     /// An environment whose policy makes `<dir>/secret`, beside the workspace, unreadable, and that
@@ -1753,7 +1861,13 @@ mod tests {
         std::fs::create_dir(&secret).unwrap();
         std::fs::write(secret.join(name), "PRIVATE").unwrap();
         let unreadable_paths = vec![secret.display().to_string()];
-        (env_with(ToolsCfg::default(), SandboxCfg { mode: SandboxMode::None, unreadable_paths, ..SandboxCfg::default() }), secret)
+        (
+            env_with(
+                ToolsCfg::default(),
+                SandboxCfg { mode: SandboxMode::None, unreadable_paths, ..SandboxCfg::default() },
+            ),
+            secret,
+        )
     }
 
     /// The names in the workspace, at any depth, that are temporary files of `write_atomic`.
@@ -1820,7 +1934,8 @@ mod tests {
         symlink(ws(&e, "notyet"), ws(&e, "m")).unwrap();
         for (path, link) in [("l/new/f.txt", "l"), ("l/f.txt", "l"), ("m/f.txt", "m"), ("m/sub/f.txt", "m")] {
             let fail = write_atomic(&e.ctx.sandbox, &ws(&e, path), b"x").unwrap_err();
-            let sentence = format!("{} is a symbolic link where `write` and `edit` expect a directory", ws(&e, link).display());
+            let sentence =
+                format!("{} is a symbolic link where `write` and `edit` expect a directory", ws(&e, link).display());
             assert!(matches!(&fail, WriteFail::Refused(why) if why.starts_with(&sentence)), "{path}: {fail:?}");
         }
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
@@ -1830,7 +1945,8 @@ mod tests {
         // in its place after it was found missing is refused the same way.
         let open = open_dir(&e.ctx.workspace).unwrap();
         let fail = descend(&open, OsStr::new("l"), &ws(&e, "l")).unwrap_err();
-        let sentence = format!("{} is a symbolic link where `write` and `edit` expect a directory", ws(&e, "l").display());
+        let sentence =
+            format!("{} is a symbolic link where `write` and `edit` expect a directory", ws(&e, "l").display());
         assert!(matches!(&fail, WriteFail::Refused(why) if why.starts_with(&sentence)), "{fail:?}");
         put(&e, "plain", b"x");
         assert!(matches!(descend(&open, OsStr::new("plain"), &ws(&e, "plain")), Err(WriteFail::Io(_))));
@@ -1884,11 +2000,22 @@ mod tests {
         e.call("read", json!({"path": "c.txt"})).await;
 
         let r = e.call("edit", json!({"path": "c.txt", "old": "alpha", "new": "A"})).await;
-        assert!(is_err(&r) && r.text.contains("2 times") && r.text.contains("lines 1, 3") && r.text.contains("`all`"), "{}", r.text);
+        assert!(
+            is_err(&r) && r.text.contains("2 times") && r.text.contains("lines 1, 3") && r.text.contains("`all`"),
+            "{}",
+            r.text
+        );
         assert_eq!(std::fs::read(ws(&e, "c.txt")).unwrap(), b"alpha\nbeta\nalpha\ngamma\n");
 
         let r = e.call("edit", json!({"path": "c.txt", "old": "beta", "new": "BETA"})).await;
-        assert!(r.text.contains("edited") && r.text.contains("1 replacement") && r.text.contains("-beta") && r.text.contains("+BETA"), "{}", r.text);
+        assert!(
+            r.text.contains("edited")
+                && r.text.contains("1 replacement")
+                && r.text.contains("-beta")
+                && r.text.contains("+BETA"),
+            "{}",
+            r.text
+        );
         assert_eq!(std::fs::read(ws(&e, "c.txt")).unwrap(), b"alpha\nBETA\nalpha\ngamma\n");
 
         // The edit refreshed what the session has seen, so the next one needs no new read.
@@ -1903,7 +2030,11 @@ mod tests {
         put(&e, "m.txt", "x\n".repeat(12).as_bytes());
         e.call("read", json!({"path": "m.txt"})).await;
         let r = e.call("edit", json!({"path": "m.txt", "old": "x", "new": "y"})).await;
-        assert!(r.text.contains("12 times") && r.text.contains("1, 2, 3, 4, 5, 6, 7, 8, 9, 10 (the first 10 of 12)"), "{}", r.text);
+        assert!(
+            r.text.contains("12 times") && r.text.contains("1, 2, 3, 4, 5, 6, 7, 8, 9, 10 (the first 10 of 12)"),
+            "{}",
+            r.text
+        );
     }
 
     #[tokio::test]
@@ -1997,7 +2128,10 @@ mod tests {
         let made = write_file(&e.ctx, "d/new.txt", &ws(&e, "d/new.txt"), "x").out;
         assert_eq!(made.status, ToolStatus::Error, "{made:?}");
         let m = message(&made);
-        assert!(m.starts_with("d/new.txt was not written, and nothing was changed: ") && m.contains("is a symbolic link"), "{m}");
+        assert!(
+            m.starts_with("d/new.txt was not written, and nothing was changed: ") && m.contains("is a symbolic link"),
+            "{m}"
+        );
         // A missing file's hint lists no names from there.
         let missing = read_file(&e.ctx, "d/k.txx", &ws(&e, "d/k.txx"), None, None, READ_LIMITS).out;
         let m = message(&missing);
@@ -2026,7 +2160,11 @@ mod tests {
             ("edit", json!({"path": key, "old": "PRIVATE", "new": "x"})),
         ] {
             let r = e.call(tool, args).await;
-            assert!(r.status == ToolStatus::Denied && r.text.contains(&refusal) && !r.text.contains("PRIVATE"), "{tool}: {}", r.text);
+            assert!(
+                r.status == ToolStatus::Denied && r.text.contains(&refusal) && !r.text.contains("PRIVATE"),
+                "{tool}: {}",
+                r.text
+            );
         }
         assert_eq!(std::fs::read(secret.join("k.txt")).unwrap(), b"PRIVATE");
 

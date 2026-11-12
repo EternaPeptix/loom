@@ -94,13 +94,18 @@ pub fn verify(text: &str) -> Result<(), ChainBreak> {
                 if p != expected {
                     return Err(ChainBreak {
                         line: n,
-                        why: "its `prev` does not match the line before it; the file was edited, truncated or reordered".into(),
+                        why:
+                            "its `prev` does not match the line before it; the file was edited, truncated or reordered"
+                                .into(),
                     });
                 }
                 chained = true;
             }
             None if chained => {
-                return Err(ChainBreak { line: n, why: "it has no valid `prev` inside the chained part of the file".into() });
+                return Err(ChainBreak {
+                    line: n,
+                    why: "it has no valid `prev` inside the chained part of the file".into(),
+                });
             }
             None => {}
         }
@@ -315,7 +320,8 @@ mod tests {
         }
         let text = std::fs::read_to_string(&path).unwrap().replacen("\"n\":1", "\"n\":9", 1);
         assert_eq!(verify(&text).unwrap_err().line, 3);
-        let dropped: String = std::fs::read_to_string(&path).unwrap().lines().skip(1).map(|l| format!("{l}\n")).collect();
+        let dropped: String =
+            std::fs::read_to_string(&path).unwrap().lines().skip(1).map(|l| format!("{l}\n")).collect();
         assert_eq!(verify(&dropped).unwrap_err().line, 1);
     }
 

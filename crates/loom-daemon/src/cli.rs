@@ -1092,7 +1092,8 @@ async fn dispatch(command: Command) -> Result<i32, String> {
         }
         Command::Gc(a) => {
             let r = client_of(&paths)?.gc(a.apply).await?;
-            let (verb, hint) = if a.apply { ("deleted", "") } else { ("would delete", "\nRun `loom gc --apply` to delete them.") };
+            let (verb, hint) =
+                if a.apply { ("deleted", "") } else { ("would delete", "\nRun `loom gc --apply` to delete them.") };
             outln(&format!(
                 "examined {} stored outputs ({} bytes); kept {} ({} bytes); {verb} {} ({} bytes).{hint}",
                 r.examined, r.examined_bytes, r.kept, r.kept_bytes, r.collected, r.collected_bytes
@@ -1147,11 +1148,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
     }
 }
 
-fn terminal_cfg<'a>(
-    render_record: &'a dyn Fn(&Record) -> String,
-    style: &Style,
-    floor: Option<Seq>,
-) -> FollowCfg<'a> {
+fn terminal_cfg<'a>(render_record: &'a dyn Fn(&Record) -> String, style: &Style, floor: Option<Seq>) -> FollowCfg<'a> {
     FollowCfg {
         render: render_record,
         clean: &render::clean,
@@ -1248,7 +1245,9 @@ fn launch_browser(url: &str) -> Result<(), String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map_err(|e| format!("Cannot start {program} ({e}). Run `loom open --print` and open the address in a browser yourself."))?;
+        .map_err(|e| {
+            format!("Cannot start {program} ({e}). Run `loom open --print` and open the address in a browser yourself.")
+        })?;
     if status.success() {
         Ok(())
     } else {
@@ -1266,7 +1265,8 @@ async fn cmd_open(paths: &Paths, a: &OpenArgs) -> Result<i32, String> {
 async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
     let message = read_message(&a.message, "message")?;
     let c = client_of(paths)?;
-    let cwd = std::env::current_dir().map_err(|e| format!("Cannot find the current directory ({e}). Pass --workspace."))?;
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("Cannot find the current directory ({e}). Pass --workspace."))?;
     let info = c.create(&new_session(&a.start, Some(message), &cwd)).await?;
     let id = info.meta.id;
     errln(&format!("session {id}"));
@@ -1376,7 +1376,9 @@ fn cmd_service(paths: &Paths, action: ServiceAction) -> Result<i32, String> {
         return Err("This command is for macOS (launchd).".to_string());
     }
     use crate::serve::SERVICE_LABEL;
-    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("HOME is not set, so there is no LaunchAgents folder to use.")?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("HOME is not set, so there is no LaunchAgents folder to use.")?;
     let plist = home.join("Library/LaunchAgents").join(format!("{SERVICE_LABEL}.plist"));
     // SAFETY: getuid has no preconditions and cannot fail.
     let uid = unsafe { libc::getuid() };
@@ -1466,8 +1468,29 @@ mod tests {
     #[test]
     fn run_parses_every_option() {
         let Command::Run(a) = ok(&[
-            "run", "-w", "/work", "--pack", "p", "--role", "r", "-m", "big", "-t", "T", "--attended", "--max-steps", "5",
-            "--max-minutes", "9", "-d", "--reasoning", "--full", "-v", "fix", "the", "bug",
+            "run",
+            "-w",
+            "/work",
+            "--pack",
+            "p",
+            "--role",
+            "r",
+            "-m",
+            "big",
+            "-t",
+            "T",
+            "--attended",
+            "--max-steps",
+            "5",
+            "--max-minutes",
+            "9",
+            "-d",
+            "--reasoning",
+            "--full",
+            "-v",
+            "fix",
+            "the",
+            "bug",
         ]) else {
             panic!("not run");
         };
@@ -1499,7 +1522,8 @@ mod tests {
         let Command::Chat(a) = ok(&["chat"]) else { panic!("not chat") };
         assert!(a.session.is_none());
 
-        let Command::Tail(a) = ok(&["tail", "s-1", "--since", "40", "--no-follow", "--reasoning", "--full", "-v"]) else {
+        let Command::Tail(a) = ok(&["tail", "s-1", "--since", "40", "--no-follow", "--reasoning", "--full", "-v"])
+        else {
             panic!("not tail")
         };
         assert_eq!((a.session.as_str(), a.since, a.no_follow), ("s-1", Some(40), true));
@@ -1648,7 +1672,8 @@ mod tests {
         );
         let release = |queued: bool| RuleReceipt { lead: SessionId::from("s-1"), queued, ledger: true, stock: None };
         assert_eq!(release_line(&release(false)), "closed by operator, goal not established: release sent to s-1");
-        assert!(release_line(&release(true)).starts_with("closed by operator, goal not established: release queued for s-1"));
+        assert!(release_line(&release(true))
+            .starts_with("closed by operator, goal not established: release queued for s-1"));
         // A blank reason is refused before anything is sent.
         assert_eq!(read_message(&words(&["  "]), "reason").unwrap_err(), "The reason is empty.");
     }
@@ -1780,7 +1805,10 @@ mod tests {
         // A daemon that is starting holds the home before it writes `daemon.json` (here a stale one naming
         // a pid no process can have): it is not waited for.
         write(4_000_000_000);
-        let err = tokio::time::timeout(Duration::from_secs(2), down(&paths, Duration::from_secs(60))).await.unwrap().unwrap_err();
+        let err = tokio::time::timeout(Duration::from_secs(2), down(&paths, Duration::from_secs(60)))
+            .await
+            .unwrap()
+            .unwrap_err();
         assert!(err.starts_with("The loom daemon is not running"), "{err}");
         // `daemon.json` names a live process (this one) where nothing answers: a daemon shutting down. Still
         // holding the home when the wait runs out, the error names the process to wait for.
@@ -1852,7 +1880,10 @@ mod tests {
         };
         let n = new_session(&opts, None, cwd);
         assert_eq!(n.workspace, PathBuf::from("/w"));
-        assert_eq!((n.pack.as_deref(), n.role.as_deref(), n.model.as_deref(), n.title.as_deref()), (Some("p"), Some("r"), Some("m"), Some("t")));
+        assert_eq!(
+            (n.pack.as_deref(), n.role.as_deref(), n.model.as_deref(), n.title.as_deref()),
+            (Some("p"), Some("r"), Some("m"), Some("t"))
+        );
         assert_eq!(n.unattended, Some(false));
         assert_eq!(n.budget, Budget { max_steps: Some(7), max_minutes: Some(3) });
         assert!(n.message.is_none());
@@ -1993,11 +2024,7 @@ mod tests {
         assert_eq!(out, "#0\n#1\n#2\n#3\n#4\n");
         assert_eq!(
             targets(&shared),
-            [
-                "/api/sessions/s-1/stream",
-                "/api/sessions/s-1/stream?after=1",
-                "/api/sessions/s-1/stream?after=2"
-            ]
+            ["/api/sessions/s-1/stream", "/api/sessions/s-1/stream?after=1", "/api/sessions/s-1/stream?after=2"]
         );
     }
 
@@ -2206,7 +2233,8 @@ mod tests {
         let (r, out, _) = run_tail(script, tail_args(None, false)).await;
         assert_eq!(r.unwrap(), 2);
         assert_eq!(out, "#0\n#1\n#2\n#3\n");
-        let script = base_script(detail_with(Phase::Ended, Some(TurnEndReason::Finished), Some(SessionOutcome::Failed)));
+        let script =
+            base_script(detail_with(Phase::Ended, Some(TurnEndReason::Finished), Some(SessionOutcome::Failed)));
         let (r, _, _) = run_tail(script, tail_args(None, false)).await;
         assert_eq!(r.unwrap(), 1);
     }

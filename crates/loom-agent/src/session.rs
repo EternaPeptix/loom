@@ -446,17 +446,17 @@ use loom_core::config::{AgentsCfg, Paths};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
     Author, Budget, ChildOutcome, ChildSettled, Event, FinishReason, Forked, InboxItem, InboxKind, ModelRequest,
-    ModelResponse, NoteKind, Purpose, Record, Reweave, Seq, SessionOutcome, SessionStart, Termination, Timing, ToolCall,
-    ToolCallRequest, ToolClass, ToolSpec, ToolStatus, TurnEndReason, Trigger, Usage, META_EXIT_CODE, META_JOB,
-    META_SIGNAL,
+    ModelResponse, NoteKind, Purpose, Record, Reweave, Seq, SessionOutcome, SessionStart, Termination, Timing,
+    ToolCall, ToolCallRequest, ToolClass, ToolSpec, ToolStatus, Trigger, TurnEndReason, Usage, META_EXIT_CODE,
+    META_JOB, META_SIGNAL,
 };
 use loom_core::ids::{new_item_id, new_request_id, CallId, SessionId};
 use loom_core::ledger::{BriefOpts, LedgerOp, LedgerState};
 use loom_core::log::{fork_file, Durability, SessionLog};
 use loom_core::message::Message;
-use loom_core::{now_ms, BlobRef};
 use loom_core::prefix::{stable_hash, PrefixCheck, PrefixGuard};
 use loom_core::weave::{hud_message, weave, ReweavePolicy, Weave, Woven};
+use loom_core::{now_ms, BlobRef};
 use loom_model::assemble::{Completion, StreamEvent};
 use loom_model::client::{ModelClient, ModelError};
 use loom_model::limit::{Limiter, Priority};
@@ -550,8 +550,9 @@ pub fn queue_input(paths: &Paths, session: &SessionId, input: Input) -> Result<I
         Input::Release { reason } => KeptInput::Release { reason: reason.clone() },
         _ => return Ok(input),
     };
-    let file = write_kept(&queue_dir(paths, session), &kept)
-        .map_err(|e| format!("Could not keep the input for session {} on disk ({e}); send it again.", session.as_str()))?;
+    let file = write_kept(&queue_dir(paths, session), &kept).map_err(|e| {
+        format!("Could not keep the input for session {} on disk ({e}); send it again.", session.as_str())
+    })?;
     Ok(Input::Queued { file, input: Box::new(input) })
 }
 
@@ -1019,7 +1020,8 @@ impl Early {
         }
         let (run_ctx, cancel) = (ctx.clone(), ctx.cancel.clone());
         let task = EarlyTask { handle: tokio::spawn(async move { call.run(&run_ctx).await }), cancel };
-        let run = EarlyRun { name: name.to_string(), arguments: arguments.to_string(), ctx, started: Instant::now(), task };
+        let run =
+            EarlyRun { name: name.to_string(), arguments: arguments.to_string(), ctx, started: Instant::now(), task };
         self.runs.insert(index, run);
         self.tried.insert(index);
         self.count(|c| c.started = c.started.saturating_add(1));
@@ -1444,9 +1446,7 @@ impl Session {
             session
                 .append(Author::Harness, Event::Interrupted { reason: texts::REASON_RESTART.to_string() })
                 .map_err(|e| e.0)?;
-            session
-                .append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped })
-                .map_err(|e| e.0)?;
+            session.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped }).map_err(|e| e.0)?;
         }
         session.record_left_jobs()?;
         // After the jobs above are registered: an id they were given is not handed out again either.
@@ -1583,7 +1583,10 @@ impl Session {
         }
         let Some(end) = self.deps.ctx.jobs.ended_while_down(&job_id) else {
             let detail = texts::JOB_LOST_DETAIL.to_string();
-            self.append(Author::Tool, Event::JobSettled { job_id: job_id.clone(), exit_code: None, output: None, detail })?;
+            self.append(
+                Author::Tool,
+                Event::JobSettled { job_id: job_id.clone(), exit_code: None, output: None, detail },
+            )?;
             if !told {
                 self.note(Author::Harness, NoteKind::Arrival, texts::job_lost(&job_id, &command))?;
             }
@@ -1599,7 +1602,8 @@ impl Session {
         };
         self.append(Author::Tool, settled)?;
         if !self.end_shown(&job_id) {
-            let text = self.job_note(&job_id, &command, &Ended::Exit(end.exit_code).outcome(), &detail, end.output.as_ref());
+            let text =
+                self.job_note(&job_id, &command, &Ended::Exit(end.exit_code).outcome(), &detail, end.output.as_ref());
             self.note(Author::Harness, NoteKind::Arrival, text)?;
         }
         Ok(stored)
@@ -2054,7 +2058,12 @@ impl Session {
                 };
                 self.append(
                     Author::Tool,
-                    Event::JobSettled { job_id: info.id.clone(), exit_code, output: output.clone(), detail: detail.clone() },
+                    Event::JobSettled {
+                        job_id: info.id.clone(),
+                        exit_code,
+                        output: output.clone(),
+                        detail: detail.clone(),
+                    },
                 )?;
                 if self.end_shown(&info.id) {
                     return Ok(false);
@@ -2175,7 +2184,8 @@ impl Session {
     async fn settle(&mut self, d: Delivery) -> R<Settlement> {
         let (reason, outcome) = match d.outcome {
             ChildOutcome::Returned | ChildOutcome::Blocked => {
-                let r = if d.outcome == ChildOutcome::Returned { TurnEndReason::Finished } else { TurnEndReason::Blocked };
+                let r =
+                    if d.outcome == ChildOutcome::Returned { TurnEndReason::Finished } else { TurnEndReason::Blocked };
                 (r, SessionOutcome::Done)
             }
             ChildOutcome::BudgetExhausted => (TurnEndReason::BudgetExhausted, SessionOutcome::BudgetExhausted),
@@ -2271,17 +2281,13 @@ impl Session {
             let req_id = new_request_id();
             let w = &woven.weave;
             if let PrefixCheck::Break { first_diff_message, detail } = self.guard.check(w.epoch, &w.messages) {
-                self.append(
-                    Author::Harness,
-                    Event::CacheBreak { req_id: req_id.clone(), first_diff_message, detail },
-                )?;
+                self.append(Author::Harness, Event::CacheBreak { req_id: req_id.clone(), first_diff_message, detail })?;
             }
             let hud_text = self.render_hud().await;
             let hud_blob = self.deps.ctx.blobs.put_bytes(hud_text.as_bytes()).ok();
             let mut messages = w.messages.clone();
             messages.push(hud_message(&hud_text));
-            let sent_chars =
-                messages.iter().map(Message::chars).sum::<usize>().saturating_add(tools_chars(&w.tools));
+            let sent_chars = messages.iter().map(Message::chars).sum::<usize>().saturating_add(tools_chars(&w.tools));
             let est_tokens = self
                 .estimator
                 .tokens_for_messages(&messages)
@@ -2604,7 +2610,11 @@ impl Session {
         match self.st.budget_note_step {
             None if reached => {
                 let can_finish = self.registry.get("finish").is_some();
-                self.note(Author::Harness, NoteKind::Budget, texts::budget_reached(step, minutes, can_finish, self.deps.shared.is_child()))?;
+                self.note(
+                    Author::Harness,
+                    NoteKind::Budget,
+                    texts::budget_reached(step, minutes, can_finish, self.deps.shared.is_child()),
+                )?;
                 Ok(None)
             }
             Some(at) if self.st.step.saturating_sub(at) >= texts::BUDGET_GRACE_STEPS => {
@@ -2669,9 +2679,7 @@ impl Session {
 
     /// Estimated size of a request carrying `w`, in tokens (without the HUD).
     fn estimate(&self, w: &Weave) -> u64 {
-        self.estimator
-            .tokens_for_messages(&w.messages)
-            .saturating_add(self.estimator.tokens(tools_chars(&w.tools)))
+        self.estimator.tokens_for_messages(&w.messages).saturating_add(self.estimator.tokens(tools_chars(&w.tools)))
     }
 
     /// Size of the request the session would send now with `w`, in tokens, as the server counts it:
@@ -2717,7 +2725,8 @@ impl Session {
         // The plan counts in the estimator's units, the check in the server's when it has counted.
         policy.floor_tokens = scaled(floor, est, size);
         let midpoint = scaled(floor.saturating_add(limit) / 2, est, size);
-        let enough = |p: &Option<loom_core::weave::ReweavePlan>| p.as_ref().is_some_and(|p| p.after_tokens_est <= midpoint);
+        let enough =
+            |p: &Option<loom_core::weave::ReweavePlan>| p.as_ref().is_some_and(|p| p.after_tokens_est <= midpoint);
         let mut plan = woven.plan(&self.records, &self.estimator, &policy, false);
         while !enough(&plan) && policy.keep_recent_steps > MIN_KEEP_RECENT_STEPS {
             policy.keep_recent_steps = (policy.keep_recent_steps / 2).max(MIN_KEEP_RECENT_STEPS);
@@ -2938,8 +2947,7 @@ impl Session {
             let result = if let Some(first) = &ender {
                 refused(&ctx, &call.name, class, texts::not_run_after(first), started)
             } else if tool.is_none() && w_tools.iter().any(|t| t.name == call.name) {
-                let message =
-                    texts::not_in_assignment(&call.name, &self.deps.shared.role.name, &self.registry.names());
+                let message = texts::not_in_assignment(&call.name, &self.deps.shared.role.name, &self.registry.names());
                 refused(&ctx, &call.name, class, message, started)
             } else if let Some(run) = early.claim(index, call) {
                 self.claim_early(run, &early, &ctx, call).await
@@ -3005,9 +3013,9 @@ impl Session {
 mod tests {
     use super::*;
     use crate::rtools::testkit::{core_role, rig_with, FakeOrch, Rig};
+    use loom_core::config::ModelProfile;
     use loom_core::event::{Brief, ModelRef, ReasoningReplay};
     use loom_core::ids::MissionId;
-    use loom_core::config::ModelProfile;
     use loom_core::log::read_records;
     use loom_model::mock::{Action, MockServer, Reply, Script};
     use loom_tools::testutil::TestEnv;
@@ -3298,7 +3306,13 @@ mod tests {
     }
 
     fn all_text(body: &Value) -> String {
-        body["messages"].as_array().unwrap().iter().map(|m| m["content"].as_str().unwrap_or("")).collect::<Vec<_>>().join("\n")
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn stable(body: &Value) -> Vec<Value> {
@@ -3320,7 +3334,11 @@ mod tests {
             if is_digest {
                 return match digest {
                     Some(t) => Reply::text(t).into(),
-                    None => Action::Status { status: 400, body: "{\"error\":{\"message\":\"no\"}}".into(), retry_after_s: None },
+                    None => Action::Status {
+                        status: 400,
+                        body: "{\"error\":{\"message\":\"no\"}}".into(),
+                        retry_after_s: None,
+                    },
                 };
             }
             actions.pop_front().unwrap_or_else(|| Reply::text("(script exhausted)").into())
@@ -3343,8 +3361,20 @@ mod tests {
         assert_eq!(
             kinds(&rs),
             [
-                "session_start", "user_message", "ledger", "turn_start", "model_request", "model_response", "tool_call",
-                "tool_result", "model_request", "model_response", "tool_call", "tool_result", "ledger", "inbox_opened",
+                "session_start",
+                "user_message",
+                "ledger",
+                "turn_start",
+                "model_request",
+                "model_response",
+                "tool_call",
+                "tool_result",
+                "model_request",
+                "model_response",
+                "tool_call",
+                "tool_result",
+                "ledger",
+                "inbox_opened",
                 "turn_end"
             ]
         );
@@ -3400,7 +3430,9 @@ mod tests {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("j1.out");
-        let append = |text: &str| std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(text.as_bytes()).unwrap();
+        let append = |text: &str| {
+            std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(text.as_bytes()).unwrap()
+        };
         std::fs::write(&path, "one\ntwo\n").unwrap();
         let mut counts = LineCounts::default();
         assert_eq!((counts.count("j1", &path), counts.read), (2, 8));
@@ -3487,17 +3519,29 @@ mod tests {
 
     #[tokio::test]
     async fn output_cut_without_an_incomplete_call() {
-        let script = seq(vec![Reply::text("partial thought").with_finish(FinishReason::Length).into(), Reply::text("ok").into()]);
+        let script = seq(vec![
+            Reply::text("partial thought").with_finish(FinishReason::Length).into(),
+            Reply::text("ok").into(),
+        ]);
         let mut fx = Fx::new("chat", false, false, script).await;
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
         let n = notes(&rs, NoteKind::OutputCut);
         assert_eq!(n.len(), 1);
-        assert_eq!(n[0], texts::output_cut(rs.iter().find_map(|r| match &r.event {
-            Event::ModelResponse(m) => Some(m.usage.completion_tokens),
-            _ => None,
-        }).unwrap(), None, 0));
+        assert_eq!(
+            n[0],
+            texts::output_cut(
+                rs.iter()
+                    .find_map(|r| match &r.event {
+                        Event::ModelResponse(m) => Some(m.usage.completion_tokens),
+                        _ => None,
+                    })
+                    .unwrap(),
+                None,
+                0
+            )
+        );
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
         assert_eq!(fx.server.requests().len(), 2);
     }
@@ -3570,8 +3614,19 @@ mod tests {
         assert_eq!(
             kinds(&rs)[5..],
             [
-                "model_response", "tool_call", "tool_result", "tool_call", "tool_result", "ledger", "tool_call", "tool_result",
-                "ledger", "inbox_opened", "tool_call", "tool_result", "turn_end"
+                "model_response",
+                "tool_call",
+                "tool_result",
+                "tool_call",
+                "tool_result",
+                "ledger",
+                "tool_call",
+                "tool_result",
+                "ledger",
+                "inbox_opened",
+                "tool_call",
+                "tool_result",
+                "turn_end"
             ]
         );
         let res = results(&rs);
@@ -3729,7 +3784,12 @@ mod tests {
                 }),
             )
             .unwrap();
-        let call = |id: &str| ToolCallRequest { call_id: CallId::from(id), name: "bash".into(), arguments: "{}".into(), complete: true };
+        let call = |id: &str| ToolCallRequest {
+            call_id: CallId::from(id),
+            name: "bash".into(),
+            arguments: "{}".into(),
+            complete: true,
+        };
         let completion = Completion {
             text: String::new(),
             reasoning: String::new(),
@@ -4210,8 +4270,12 @@ mod tests {
         early.on_event(&ready(0));
         until(|| witness.live() == 1).await;
         let run = early.runs.remove(&0).unwrap();
-        let call =
-            ToolCallRequest { call_id: run.ctx.call_id.clone(), name: "read".into(), arguments: run.arguments.clone(), complete: true };
+        let call = ToolCallRequest {
+            call_id: run.ctx.call_id.clone(),
+            name: "read".into(),
+            arguments: run.arguments.clone(),
+            complete: true,
+        };
         let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
         let session = fx.create();
         // The claim waits on a call that holds until it is cancelled; the session's future is dropped
@@ -4238,13 +4302,7 @@ mod tests {
         let mut fx = Fx::new("lead", false, true, lead_script()).await;
         let session = fx.create();
         run_with(session, vec![user("parent task")]).await;
-        let upto = fx
-            .sink
-            .records()
-            .iter()
-            .find(|r| matches!(r.event, Event::ToolResult(_)))
-            .map(|r| r.seq)
-            .unwrap();
+        let upto = fx.sink.records().iter().find(|r| matches!(r.event, Event::ToolResult(_))).map(|r| r.seq).unwrap();
         let path = fx.log_path();
         (fx, path, upto)
     }
@@ -4361,14 +4419,16 @@ mod tests {
         let rs = kid.sink.records();
         assert_eq!(&kinds(&rs)[..4], ["session_start", "harness_note", "turn_start", "model_request"]);
         assert_eq!(rs[1].author, Author::Agent(SessionId::from("s-lead")));
-        assert!(all_text(&kid.server.requests()[0]).contains("<harness kind=\"assignment\" from=\"s-lead\">\nCount the files.\n</harness>"));
+        assert!(all_text(&kid.server.requests()[0])
+            .contains("<harness kind=\"assignment\" from=\"s-lead\">\nCount the files.\n</harness>"));
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error]);
         assert!(matches!(rs.last().unwrap().event, Event::SessionEnd { outcome: SessionOutcome::Failed, .. }));
     }
 
     #[tokio::test]
     async fn model_error_parks_a_lead_and_fails_a_child() {
-        let bad = || Action::Status { status: 400, body: "{\"error\":{\"message\":\"nope\"}}".into(), retry_after_s: None };
+        let bad =
+            || Action::Status { status: 400, body: "{\"error\":{\"message\":\"nope\"}}".into(), retry_after_s: None };
         let mut lead = Fx::new("lead", false, true, seq(vec![bad()])).await;
         let session = lead.create();
         run_with(session, vec![user("go")]).await;
@@ -4714,8 +4774,10 @@ mod tests {
             usage: Usage::default(),
         };
         tx.send(Input::ChildSettled(settlement)).unwrap();
-        wait_until(&fx.sink, "the job end and the settlement", |rs| count(rs, "job_settled") == 1 && count(rs, "child_settled") == 1)
-            .await;
+        wait_until(&fx.sink, "the job end and the settlement", |rs| {
+            count(rs, "job_settled") == 1 && count(rs, "child_settled") == 1
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         let rs = fx.sink.records();
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Waiting, TurnEndReason::Stopped]);
@@ -4768,7 +4830,9 @@ mod tests {
         let End::Settled(s) = end else { panic!("expected a settlement, got {end:?}") };
         assert_eq!((s.outcome, s.report), (ChildOutcome::Stopped, texts::stopped_report(2)));
         let rs = kid.sink.records();
-        assert!(rs.iter().any(|r| matches!(&r.event, Event::Interrupted { reason } if reason == texts::REASON_OPERATOR)));
+        assert!(rs
+            .iter()
+            .any(|r| matches!(&r.event, Event::Interrupted { reason } if reason == texts::REASON_OPERATOR)));
         assert!(matches!(rs.last().unwrap().event, Event::SessionEnd { outcome: SessionOutcome::Stopped, .. }));
         assert!(kid.ctx.jobs.list().await.iter().all(|j| j.state != JobState::Running));
 
@@ -4797,7 +4861,8 @@ mod tests {
         wait_until(&fx.sink, "the next turn", |rs| count(rs, "turn_end") == 3).await;
         let rs = fx.sink.records();
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded, TurnEndReason::Stopped, TurnEndReason::Yielded]);
-        let stop = rs.iter().position(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Stopped })).unwrap();
+        let stop =
+            rs.iter().position(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Stopped })).unwrap();
         assert!(matches!(&rs[stop - 1].event, Event::Interrupted { reason } if reason == texts::REASON_OPERATOR));
         // Nothing was running: the next turn is not told that a call was interrupted.
         assert_eq!(notes(&rs, NoteKind::Interrupted), vec![texts::AFTER_IDLE_STOP.to_string()]);
@@ -4834,7 +4899,8 @@ mod tests {
     #[tokio::test]
     async fn open_reproduces_the_state_of_the_session_that_wrote_the_log() {
         let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), Reply::text("ok").into()])).await;
-        fx.context = ReweavePolicy { target_tokens: 12_000, floor_tokens: 10_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        fx.context =
+            ReweavePolicy { target_tokens: 12_000, floor_tokens: 10_000, keep_recent_steps: 1, stub_tail_lines: 3 };
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let written = fx.sink.last_status().unwrap();
@@ -4849,7 +4915,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_reopened_session_checks_its_first_request_against_the_one_before_the_restart() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("first").into(), Reply::text("second").into()])).await;
+        let mut fx =
+            Fx::new("chat", false, false, seq(vec![Reply::text("first").into(), Reply::text("second").into()])).await;
         let session = fx.create();
         run_with(session, vec![user("hi")]).await;
         let reopened = Session::open(fx.deps()).unwrap();
@@ -4900,7 +4967,9 @@ mod tests {
         let reopened = Session::open(fx.deps()).unwrap();
         let breaks: Vec<Record> = reopened.records().iter().filter(|r| kind(r) == "cache_break").cloned().collect();
         assert_eq!(breaks.len(), 1);
-        let Event::CacheBreak { req_id, first_diff_message, detail } = &breaks[0].event else { panic!("a cache_break") };
+        let Event::CacheBreak { req_id, first_diff_message, detail } = &breaks[0].event else {
+            panic!("a cache_break")
+        };
         assert_eq!((req_id.as_str(), *first_diff_message), ("r-old", 0));
         assert_eq!(detail, &texts::rendering_changed(to_u32(sent.len()), sent.len()));
         assert!(detail.contains("changed across the restart"));
@@ -5004,8 +5073,11 @@ mod tests {
         assert_eq!(kinds(&added), ["job_settled", "job_settled", "harness_note"]);
         for (r, id) in added.iter().zip(["j1", "j2"]) {
             assert_eq!(r.author, Author::Tool);
-            assert!(matches!(&r.event, Event::JobSettled { job_id, exit_code: None, output: None, detail }
-                if job_id == id && detail == texts::JOB_LOST_DETAIL), "{r:?}");
+            assert!(
+                matches!(&r.event, Event::JobSettled { job_id, exit_code: None, output: None, detail }
+                if job_id == id && detail == texts::JOB_LOST_DETAIL),
+                "{r:?}"
+            );
         }
         assert_eq!(notes(&added, NoteKind::Arrival), vec![texts::job_lost("j2", "sleep 600")]);
         let len = reopened.records().len();
@@ -5067,7 +5139,8 @@ mod tests {
         // j1 was registered. j2 was given to the model by its call's result, but the harness went down
         // before its registration reached the log. j3 was a foreground command, never a job.
         session.append(Author::Harness, Event::TurnStart { trigger: Trigger::User }).unwrap();
-        let registered = Event::JobRegistered { job_id: "j1".into(), call_id: CallId::from("c1"), command: "make test".into() };
+        let registered =
+            Event::JobRegistered { job_id: "j1".into(), call_id: CallId::from("c1"), command: "make test".into() };
         session.append(Author::Harness, registered).unwrap();
         give_job(&mut session, "c2", "j2", "make all");
         session.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Waiting }).unwrap();
@@ -5088,13 +5161,27 @@ mod tests {
         assert_eq!(fx.ctx.blobs.read_all(&blob.id).unwrap(), b"built\nfailed\n");
         assert_eq!(added[0].author, Author::Tool);
         let arrivals = notes(&added, NoteKind::Arrival);
-        assert!(arrivals[0].starts_with("Background job j1 ended: exit 3. It finished while the harness was down"), "{}", arrivals[0]);
+        assert!(
+            arrivals[0].starts_with("Background job j1 ended: exit 3. It finished while the harness was down"),
+            "{}",
+            arrivals[0]
+        );
         assert!(arrivals[0].contains("make test") && arrivals[0].contains("failed"), "{}", arrivals[0]);
         assert_eq!(added[2].author, Author::Harness);
-        assert!(matches!(&added[2].event, Event::JobRegistered { job_id, call_id, command }
-            if job_id == "j2" && *call_id == CallId::from("c2") && command == "make all"), "{:?}", added[2]);
-        assert!(matches!(&added[3].event, Event::JobSettled { job_id, exit_code: Some(0), output: Some(_), .. } if job_id == "j2"));
-        assert!(arrivals[1].starts_with("Background job j2 ended: exit 0.") && arrivals[1].contains("all done"), "{}", arrivals[1]);
+        assert!(
+            matches!(&added[2].event, Event::JobRegistered { job_id, call_id, command }
+            if job_id == "j2" && *call_id == CallId::from("c2") && command == "make all"),
+            "{:?}",
+            added[2]
+        );
+        assert!(
+            matches!(&added[3].event, Event::JobSettled { job_id, exit_code: Some(0), output: Some(_), .. } if job_id == "j2")
+        );
+        assert!(
+            arrivals[1].starts_with("Background job j2 ended: exit 0.") && arrivals[1].contains("all done"),
+            "{}",
+            arrivals[1]
+        );
         // A session that was waiting is woken for them.
         assert_eq!(reopened.pending_job_ends(), 2);
         // Taken: their files are gone, the foreground command's too, and no id with files is handed out again.
@@ -5138,12 +5225,24 @@ mod tests {
         let added = reopened.records()[before..].to_vec();
         let (registered, settled, note) = ("job_registered", "job_settled", "harness_note");
         assert_eq!(kinds(&added), [registered, settled, registered, settled, note, registered, settled, note]);
-        assert!(matches!(&added[0].event, Event::JobRegistered { job_id, call_id, command }
-            if job_id == "j2" && *call_id == CallId::from("c2") && command == "make old"), "{:?}", added[0]);
-        assert!(matches!(&added[1].event, Event::JobSettled { job_id, exit_code: None, detail, .. }
-            if job_id == "j2" && detail == texts::JOB_LOST_DETAIL), "{:?}", added[1]);
-        assert!(matches!(&added[2].event, Event::JobRegistered { job_id, call_id, command }
-            if job_id == "j3" && *call_id == CallId::from("c3") && command == "make all"), "{:?}", added[2]);
+        assert!(
+            matches!(&added[0].event, Event::JobRegistered { job_id, call_id, command }
+            if job_id == "j2" && *call_id == CallId::from("c2") && command == "make old"),
+            "{:?}",
+            added[0]
+        );
+        assert!(
+            matches!(&added[1].event, Event::JobSettled { job_id, exit_code: None, detail, .. }
+            if job_id == "j2" && detail == texts::JOB_LOST_DETAIL),
+            "{:?}",
+            added[1]
+        );
+        assert!(
+            matches!(&added[2].event, Event::JobRegistered { job_id, call_id, command }
+            if job_id == "j3" && *call_id == CallId::from("c3") && command == "make all"),
+            "{:?}",
+            added[2]
+        );
         let Event::JobSettled { exit_code: Some(0), output: Some(blob), .. } = &added[3].event else {
             panic!("{:?}", added[3])
         };
@@ -5166,7 +5265,8 @@ mod tests {
         let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
         let mut session = fx.create();
         session.append(Author::Harness, Event::TurnStart { trigger: Trigger::User }).unwrap();
-        let registered = Event::JobRegistered { job_id: "j1".into(), call_id: CallId::from("c1"), command: "sleep 300".into() };
+        let registered =
+            Event::JobRegistered { job_id: "j1".into(), call_id: CallId::from("c1"), command: "sleep 300".into() };
         session.append(Author::Harness, registered).unwrap();
         session.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Waiting }).unwrap();
         drop(session);
@@ -5201,8 +5301,12 @@ mod tests {
         assert!(killed, "the previous daemon's command was not killed");
         let added = reopened.records()[before..].to_vec();
         assert_eq!(kinds(&added), ["job_settled", "harness_note"]);
-        assert!(matches!(&added[0].event, Event::JobSettled { job_id, exit_code: None, output: None, detail }
-            if job_id == "j1" && detail == texts::JOB_LOST_DETAIL), "{:?}", added[0]);
+        assert!(
+            matches!(&added[0].event, Event::JobSettled { job_id, exit_code: None, output: None, detail }
+            if job_id == "j1" && detail == texts::JOB_LOST_DETAIL),
+            "{:?}",
+            added[0]
+        );
         assert_eq!(notes(&added, NoteKind::Arrival), vec![texts::job_lost("j1", "sleep 300")]);
         assert_eq!(reopened.pending_job_ends(), 1);
         for ext in ["pid", "out", "status"] {
@@ -5281,7 +5385,8 @@ mod tests {
         let session = fx.create();
         let (tx, task) = spawn_run(session);
         tx.send(user("start it")).unwrap();
-        wait_until(&fx.sink, "the turn yields", |rs| count(rs, "turn_end") == 1 && count(rs, "job_registered") == 1).await;
+        wait_until(&fx.sink, "the turn yields", |rs| count(rs, "turn_end") == 1 && count(rs, "job_registered") == 1)
+            .await;
         // The command has written its first line before the shutdown stops it.
         let out = fx.jobs_dir().join("j1.out");
         for _ in 0..400 {
@@ -5295,7 +5400,9 @@ mod tests {
         let rs = fx.sink.records();
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
         let settled = rs.iter().find_map(|r| match &r.event {
-            Event::JobSettled { job_id, exit_code, output, detail } => Some((job_id.clone(), *exit_code, output.clone(), detail.clone())),
+            Event::JobSettled { job_id, exit_code, output, detail } => {
+                Some((job_id.clone(), *exit_code, output.clone(), detail.clone()))
+            }
             _ => None,
         });
         let (job_id, exit_code, output, detail) = settled.expect("the killed job is settled in the log");
@@ -5397,10 +5504,18 @@ mod tests {
         wait_until(&fx.sink, "second turn end", |rs| count(rs, "turn_end") == 2).await;
         let rs = fx.sink.records();
         assert_eq!(count(&rs, "inbox_resolved"), 1);
-        assert!(rs.iter().any(|r| matches!(&r.event, Event::UserMessage { text } if *text == texts::inbox_answer("which branch?", "main"))));
+        assert!(rs.iter().any(
+            |r| matches!(&r.event, Event::UserMessage { text } if *text == texts::inbox_answer("which branch?", "main"))
+        ));
         assert!(rs.iter().any(|r| matches!(&r.event, Event::TurnStart { trigger: Trigger::InboxAnswer })));
         let ledger = fx.shared.ledger().unwrap();
-        assert!(ledger.questions.iter().all(|q| q.answer.is_some()), "{:?} // {:?} // {:?}", ledger.questions, kinds(&rs), turn_ends(&rs));
+        assert!(
+            ledger.questions.iter().all(|q| q.answer.is_some()),
+            "{:?} // {:?} // {:?}",
+            ledger.questions,
+            kinds(&rs),
+            turn_ends(&rs)
+        );
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Asked, TurnEndReason::Finished]);
         assert_eq!(fx.sink.last_status().unwrap().open_inbox, 1); // the Finished item
         finish_task(tx, task).await;
@@ -5408,7 +5523,8 @@ mod tests {
 
     #[tokio::test]
     async fn dismissing_a_non_blocking_item_resolves_it_without_a_turn() {
-        let mut fx = Fx::new("lead", false, true, seq(vec![finish_call("first").into(), finish_call("second").into()])).await;
+        let mut fx =
+            Fx::new("lead", false, true, seq(vec![finish_call("first").into(), finish_call("second").into()])).await;
         let session = fx.create();
         let (tx, task) = spawn_run(session);
         tx.send(user("go")).unwrap();
@@ -5474,10 +5590,16 @@ mod tests {
             reference: Some("q1".into()),
         };
         session.append(Author::Harness, Event::InboxOpened(item)).unwrap();
-        let arrival = session.arrival(Input::Answer { item_id: "i-fin".into(), answer: "thanks, now do more".into() }).await.unwrap();
+        let arrival = session
+            .arrival(Input::Answer { item_id: "i-fin".into(), answer: "thanks, now do more".into() })
+            .await
+            .unwrap();
         assert_eq!(arrival.trigger, Some(Trigger::InboxAnswer));
         assert!(arrival.user);
-        assert!(fx.shared.ledger().unwrap().questions.iter().all(|q| q.answer.is_none()), "a Finished item answers no question");
+        assert!(
+            fx.shared.ledger().unwrap().questions.iter().all(|q| q.answer.is_none()),
+            "a Finished item answers no question"
+        );
     }
 
     #[tokio::test]
@@ -5507,7 +5629,8 @@ mod tests {
         let (tx, task) = spawn_run(session);
         tx.send(Input::Constraint("never push to main".into())).unwrap();
         tx.send(Input::Constraint("   ".into())).unwrap();
-        tx.send(Input::Approval { text: "you may restart the staging database".into(), scope: "staging only".into() }).unwrap();
+        tx.send(Input::Approval { text: "you may restart the staging database".into(), scope: "staging only".into() })
+            .unwrap();
         tx.send(Input::Constraint("temporary rule".into())).unwrap();
         tx.send(Input::Withdraw { id: "k2".into(), reason: "no longer needed".into() }).unwrap();
         tx.send(Input::Withdraw { id: "k9".into(), reason: "no such rule".into() }).unwrap();
@@ -5528,7 +5651,10 @@ mod tests {
         let ledger = fx.shared.ledger().unwrap();
         assert_eq!(ledger.constraints.len(), 2);
         assert!(ledger.constraints[0].retired.is_none() && ledger.constraints[1].retired.is_some());
-        assert_eq!((ledger.approvals[0].scope.as_str(), ledger.approvals[0].used_for.is_none()), ("staging only", true));
+        assert_eq!(
+            (ledger.approvals[0].scope.as_str(), ledger.approvals[0].used_for.is_none()),
+            ("staging only", true)
+        );
         // The next request carries them, and the state block lists the active rule.
         tx.send(user("go")).unwrap();
         wait_until(&fx.sink, "a reply", |rs| count(rs, "model_response") >= 1).await;
@@ -5678,7 +5804,8 @@ mod tests {
     #[tokio::test]
     async fn reweave_at_target_raises_the_epoch_and_the_next_request_drops_the_old_output() {
         let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), Reply::text("ok").into()])).await;
-        fx.context = ReweavePolicy { target_tokens: 12_000, floor_tokens: 10_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        fx.context =
+            ReweavePolicy { target_tokens: 12_000, floor_tokens: 10_000, keep_recent_steps: 1, stub_tail_lines: 3 };
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
@@ -5697,7 +5824,9 @@ mod tests {
             lines(1) >= 600,
             "the first output is shown whole before the re-weave: lines per request {:?}, re-weaves {:?}",
             (0..reqs.len()).map(lines).collect::<Vec<_>>(),
-            rw.iter().map(|w| (w.epoch, w.upto_seq, w.evictions.len(), w.before_tokens, w.after_tokens_est)).collect::<Vec<_>>()
+            rw.iter()
+                .map(|w| (w.epoch, w.upto_seq, w.evictions.len(), w.before_tokens, w.after_tokens_est))
+                .collect::<Vec<_>>()
         );
         assert!(lines(2) < 700, "after the re-weave only the newest output is whole, got {}", lines(2));
         assert_no_cache_break(&rs);
@@ -5718,7 +5847,8 @@ mod tests {
         });
         let mut fx = Fx::new("chat", false, false, script).await;
         let target = 150_000;
-        fx.context = ReweavePolicy { target_tokens: target, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        fx.context =
+            ReweavePolicy { target_tokens: target, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = read_records(&fx.log_path()).unwrap().records;
@@ -5814,13 +5944,22 @@ mod tests {
             session.append(Author::Model, Event::ModelResponse(reply)).unwrap();
         }
         let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
-        fx.context = ReweavePolicy { target_tokens: 400_000, floor_tokens: 300_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        fx.context =
+            ReweavePolicy { target_tokens: 400_000, floor_tokens: 300_000, keep_recent_steps: 1, stub_tail_lines: 3 };
         let mut session = fx.create();
         let kid = SessionId::from("s-kid");
         let report = |text: &str| {
             let report = text.repeat(30_000);
             let usage = Usage::default();
-            let settled = ChildSettled { child: kid.clone(), outcome: ChildOutcome::Returned, report, full: None, usage, steps: 1, inline: false };
+            let settled = ChildSettled {
+                child: kid.clone(),
+                outcome: ChildOutcome::Returned,
+                report,
+                full: None,
+                usage,
+                steps: 1,
+                inline: false,
+            };
             Event::ChildSettled(settled)
         };
         session.append(Author::User, Event::UserMessage { text: "go".into() }).unwrap();
@@ -5851,7 +5990,8 @@ mod tests {
         // shrinking it.
         let script = seq(vec![big(), big(), big(), big(), big(), big(), Reply::text("ok").into()]);
         let mut fx = Fx::new("chat", false, false, script).await;
-        fx.context = ReweavePolicy { target_tokens: 40_000, floor_tokens: 10_000, keep_recent_steps: 64, stub_tail_lines: 3 };
+        fx.context =
+            ReweavePolicy { target_tokens: 40_000, floor_tokens: 10_000, keep_recent_steps: 64, stub_tail_lines: 3 };
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
@@ -5871,8 +6011,10 @@ mod tests {
     async fn a_reweave_that_would_free_little_is_not_done() {
         // Two recent steps alone are larger than the target: folding the rest cannot make room for
         // long, so the context is left alone rather than re-woven at every step.
-        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), Reply::text("ok").into()])).await;
-        fx.context = ReweavePolicy { target_tokens: 12_000, floor_tokens: 10_000, keep_recent_steps: 64, stub_tail_lines: 3 };
+        let mut fx =
+            Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), Reply::text("ok").into()])).await;
+        fx.context =
+            ReweavePolicy { target_tokens: 12_000, floor_tokens: 10_000, keep_recent_steps: 64, stub_tail_lines: 3 };
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
@@ -5886,19 +6028,27 @@ mod tests {
     async fn reweave_asks_for_a_digest_when_the_plan_is_not_enough_and_survives_its_failure() {
         for digest in [Some("lead A: check the config"), None] {
             let long = || Reply::tool("bash", json!({ "command": BIG }).to_string()).with_text("t".repeat(40_000));
-            let script = with_digest(vec![long().into(), long().into(), long().into(), Reply::text("ok").into()], digest);
+            let script =
+                with_digest(vec![long().into(), long().into(), long().into(), Reply::text("ok").into()], digest);
             let mut fx = Fx::new("chat", false, false, script).await;
             // Three steps of long text and output pass the target; folding the old output alone
             // does not make enough room, folding the old text as well does.
-            fx.context = ReweavePolicy { target_tokens: 60_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+            fx.context =
+                ReweavePolicy { target_tokens: 60_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
             let session = fx.create();
             run_with(session, vec![user("go")]).await;
             let rs = fx.sink.records();
             let rw = reweave_records(&rs);
             assert!(!rw.is_empty(), "{:?}", kinds(&rs));
             assert_eq!(rw[0].digest.as_deref(), digest);
-            assert!(rw[0].evictions.iter().any(|e| matches!(e.action, loom_core::event::EvictAction::Drop)), "text was folded");
-            let digests = rs.iter().filter(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest)).count();
+            assert!(
+                rw[0].evictions.iter().any(|e| matches!(e.action, loom_core::event::EvictAction::Drop)),
+                "text was folded"
+            );
+            let digests = rs
+                .iter()
+                .filter(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest))
+                .count();
             assert!(digests >= 1);
             // The digest request is only a request record: no response record follows it.
             assert_eq!(count(&rs, "model_response") + digests, count(&rs, "model_request"));
@@ -5911,15 +6061,19 @@ mod tests {
     #[tokio::test]
     async fn a_step_renders_its_weave_once_and_again_only_after_a_reweave() {
         let long = || Reply::tool("bash", json!({ "command": BIG }).to_string()).with_text("t".repeat(40_000));
-        let script = with_digest(vec![long().into(), long().into(), long().into(), Reply::text("ok").into()], Some("lead A"));
+        let script =
+            with_digest(vec![long().into(), long().into(), long().into(), Reply::text("ok").into()], Some("lead A"));
         let mut fx = Fx::new("chat", false, false, script).await;
-        fx.context = ReweavePolicy { target_tokens: 60_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        fx.context =
+            ReweavePolicy { target_tokens: 60_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
         let mut session = fx.create();
         session.append(Author::User, Event::UserMessage { text: "go".into() }).unwrap();
         assert!(session.turn(Trigger::User).await.unwrap().is_none());
         let rs = session.records().to_vec();
-        let requests = |p: Purpose| rs.iter().filter(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == p)).count();
-        let (steps, digests, reweaves) = (requests(Purpose::Step), requests(Purpose::Digest), reweave_records(&rs).len());
+        let requests =
+            |p: Purpose| rs.iter().filter(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == p)).count();
+        let (steps, digests, reweaves) =
+            (requests(Purpose::Step), requests(Purpose::Digest), reweave_records(&rs).len());
         assert!(reweaves >= 1 && digests >= 1, "{:?}", kinds(&rs));
         // The check, every plan, the digest request and the request share one weave per step; only
         // a re-weave makes another.
@@ -5955,7 +6109,8 @@ mod tests {
         }
         // The lead's own step is waiting for the digest: it goes before the child.
         drop(held);
-        let got = tokio::time::timeout(Duration::from_secs(10), digest).await.expect("the digest waited behind the child");
+        let got =
+            tokio::time::timeout(Duration::from_secs(10), digest).await.expect("the digest waited behind the child");
         assert_eq!(got.unwrap().as_deref(), Some("leads"));
         child.abort();
     }
@@ -5981,7 +6136,8 @@ mod tests {
     async fn context_overflow_forces_a_reweave_and_a_retry() {
         let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), Reply::text("ok").into()])).await;
         fx.server.set_model("mock", Some(16_000));
-        fx.context = ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        fx.context =
+            ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
@@ -6011,11 +6167,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_small_window_is_folded_at_its_trigger_before_the_server_refuses_it() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
+        let mut fx =
+            Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
         fx.server.set_model("mock", Some(32_000));
         fx.window = Some(32_000);
         // The configured floor (180k) is far above this window.
-        fx.context = ReweavePolicy { target_tokens: 400_000, floor_tokens: 180_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        fx.context =
+            ReweavePolicy { target_tokens: 400_000, floor_tokens: 180_000, keep_recent_steps: 1, stub_tail_lines: 3 };
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
@@ -6031,12 +6189,14 @@ mod tests {
 
     #[tokio::test]
     async fn a_small_window_re_weaves_instead_of_failing_when_it_overflows() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
+        let mut fx =
+            Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
         // The session is told twice the window the server enforces, so the server refuses first.
         fx.server.set_model("mock", Some(32_000));
         fx.window = Some(64_000);
         // The configured floor (180k) is far above both windows.
-        fx.context = ReweavePolicy { target_tokens: 400_000, floor_tokens: 180_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        fx.context =
+            ReweavePolicy { target_tokens: 400_000, floor_tokens: 180_000, keep_recent_steps: 1, stub_tail_lines: 3 };
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
@@ -6064,7 +6224,9 @@ mod tests {
         // One the window can hold is kept even when little is left after it: the request still fits.
         assert_eq!(reweave_bounds(&policy, Some(16_000), Some(14_000)), (1, 0));
         assert_eq!(reweave_bounds(&policy, Some(32_768), Some(30_000)), (1, 0));
-        for (window, max) in [(16_000, Some(4_000)), (16_000, Some(14_000)), (32_768, Some(30_000)), (65_536, Some(32_768))] {
+        for (window, max) in
+            [(16_000, Some(4_000)), (16_000, Some(14_000)), (32_768, Some(30_000)), (65_536, Some(32_768))]
+        {
             let (limit, _) = reweave_bounds(&policy, Some(window), max);
             assert!(limit + max.unwrap_or(0) <= window, "window {window} max {max:?}");
         }
@@ -6094,7 +6256,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_overflow_re_weaves_by_the_servers_limit_when_the_window_is_unknown() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
+        let mut fx =
+            Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
         fx.server.set_model("mock", Some(32_000));
         // No window known to the session, and the default policy, whose floor (180k) is far above it.
         fx.window = None;
@@ -6113,8 +6276,11 @@ mod tests {
 
     #[tokio::test]
     async fn an_operator_reweave_while_idle_and_one_queued_mid_turn() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), Reply::text("ok").into(), Reply::text("ok").into()])).await;
-        fx.context = ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let mut fx =
+            Fx::new("chat", false, false, seq(vec![big(), big(), Reply::text("ok").into(), Reply::text("ok").into()]))
+                .await;
+        fx.context =
+            ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
         let session = fx.create();
         let (tx, task) = spawn_run(session);
         tx.send(user("go")).unwrap();

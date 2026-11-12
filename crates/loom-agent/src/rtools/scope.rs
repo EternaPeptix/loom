@@ -59,7 +59,9 @@ impl Tool for RequestScope {
         }
         let why = args.get("why").and_then(Value::as_str).unwrap_or("").trim();
         if why.is_empty() {
-            return ToolOutput::error("request_scope needs `why`: say what the work needs the hosts for. Nothing was requested.");
+            return ToolOutput::error(
+                "request_scope needs `why`: say what the work needs the hosts for. Nothing was requested.",
+            );
         }
         let listed: Vec<String> = args
             .get("hosts")
@@ -111,7 +113,12 @@ mod tests {
     #[tokio::test]
     async fn a_request_opens_one_non_blocking_item_naming_the_hosts_and_grants_nothing() {
         let r = with_tool(false);
-        let res = r.call("request_scope", json!({"hosts": [" api.example.test ", "*.cdn.example.test"], "why": "the API is the target"})).await;
+        let res = r
+            .call(
+                "request_scope",
+                json!({"hosts": [" api.example.test ", "*.cdn.example.test"], "why": "the API is the target"}),
+            )
+            .await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         assert!(res.text.contains("Nothing is authorized yet") && res.text.contains("Carry on"), "{}", res.text);
         assert!(res.text.contains("api.example.test, *.cdn.example.test"), "{}", res.text);
@@ -120,8 +127,16 @@ mod tests {
         assert_eq!(opened.len(), 1, "{opened:?}");
         let item = &opened[0];
         assert_eq!((item.kind, item.blocking), (InboxKind::Approval, false));
-        assert_eq!(item.options, vec!["api.example.test", "*.cdn.example.test"], "surfaces read the hosts from options");
-        assert!(item.text.contains("api.example.test, *.cdn.example.test") && item.text.contains("the API is the target"), "{}", item.text);
+        assert_eq!(
+            item.options,
+            vec!["api.example.test", "*.cdn.example.test"],
+            "surfaces read the hosts from options"
+        );
+        assert!(
+            item.text.contains("api.example.test, *.cdn.example.test") && item.text.contains("the API is the target"),
+            "{}",
+            item.text
+        );
         assert!(item.text.contains("Authorize"), "{}", item.text);
         // Nothing ended the turn and nothing was recorded in the ledger.
         assert!(r.shared.take_effect().is_none());

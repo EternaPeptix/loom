@@ -129,7 +129,18 @@ mod tests {
         let body = full().body("m", &map(json!({"temperature": 0.1})));
         assert_eq!(
             keys(&body),
-            ["model", "messages", "tools", "tool_choice", "stream", "stream_options", "max_tokens", "seed", "temperature", "top_p"]
+            [
+                "model",
+                "messages",
+                "tools",
+                "tool_choice",
+                "stream",
+                "stream_options",
+                "max_tokens",
+                "seed",
+                "temperature",
+                "top_p"
+            ]
         );
         assert_eq!(body["model"], "m");
         assert_eq!(body["messages"][1]["content"], "u");
@@ -158,7 +169,8 @@ mod tests {
 
     #[test]
     fn tool_choice_forms() {
-        let mk = |tc| ChatRequest { tools: vec![spec("a")], tool_choice: tc, ..Default::default() }.body("m", &Map::new());
+        let mk =
+            |tc| ChatRequest { tools: vec![spec("a")], tool_choice: tc, ..Default::default() }.body("m", &Map::new());
         assert_eq!(mk(ToolChoice::Required)["tool_choice"], "required");
         assert_eq!(mk(ToolChoice::None)["tool_choice"], "none");
         assert_eq!(
@@ -169,7 +181,8 @@ mod tests {
 
     #[test]
     fn reserved_keys_skipped() {
-        let profile = map(json!({"model": "x", "messages": [], "tools": [1], "stream": false, "stream_options": {}, "ok": 1}));
+        let profile =
+            map(json!({"model": "x", "messages": [], "tools": [1], "stream": false, "stream_options": {}, "ok": 1}));
         let mut r = full();
         r.extra = map(json!({"model": "y", "stream": false, "ok2": 2}));
         let body = r.body("m", &profile);

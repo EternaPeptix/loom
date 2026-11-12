@@ -265,7 +265,9 @@ mod tests {
 
     #[tokio::test]
     async fn priority_order() {
-        let got = serve_order(&[Priority::Background, Priority::Child, Priority::Lead, Priority::Child, Priority::Lead]).await;
+        let got =
+            serve_order(&[Priority::Background, Priority::Child, Priority::Lead, Priority::Child, Priority::Lead])
+                .await;
         assert_eq!(got, vec![2, 4, 1, 3, 0]);
     }
 

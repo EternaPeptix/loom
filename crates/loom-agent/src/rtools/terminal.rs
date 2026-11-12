@@ -166,8 +166,8 @@ use crate::pack::RoleDef;
 use crate::texts;
 use async_trait::async_trait;
 use loom_core::event::{
-    Author, Brief, Budget, ChildOutcome, Event, InboxItem, InboxKind, NoteKind, SpawnMode, ToolClass, ToolSpec,
-    Termination, ToolStatus, TurnEndReason, META_OF_BLOB,
+    Author, Brief, Budget, ChildOutcome, Event, InboxItem, InboxKind, NoteKind, SpawnMode, Termination, ToolClass,
+    ToolSpec, ToolStatus, TurnEndReason, META_OF_BLOB,
 };
 use loom_core::ids::new_item_id;
 use loom_core::ledger::{ClaimStatus, Evidence, EvidenceKind, GoalMetStatus, LedgerOp, LedgerState, ObligationKind};
@@ -177,8 +177,8 @@ use loom_core::{BlobId, BlobRef, SessionId};
 use loom_tools::jobs::JobState;
 use loom_tools::params::{opt, req, spec};
 use loom_tools::{Body, Tool, ToolCtx, ToolOutput};
-use std::collections::HashSet;
 use serde_json::{json, Map, Value};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub struct Finish(pub Arc<Shared>);
@@ -398,7 +398,14 @@ fn quotes_json(quotes: &[VerifiedQuote]) -> Value {
     )
 }
 
-fn inbox(kind: InboxKind, text: String, options: Vec<String>, blocking: bool, ctx: &ToolCtx, reference: Option<String>) -> Event {
+fn inbox(
+    kind: InboxKind,
+    text: String,
+    options: Vec<String>,
+    blocking: bool,
+    ctx: &ToolCtx,
+    reference: Option<String>,
+) -> Event {
     Event::InboxOpened(InboxItem {
         item_id: new_item_id(),
         kind,
@@ -431,7 +438,13 @@ fn or_list(names: &[String]) -> String {
 
 impl Finish {
     /// A child hands its answer to the agent that assigned the work.
-    fn finish_child(&self, ctx: &ToolCtx, answer: &str, verified: &[VerifiedQuote], not_established: Option<&str>) -> ToolOutput {
+    fn finish_child(
+        &self,
+        ctx: &ToolCtx,
+        answer: &str,
+        verified: &[VerifiedQuote],
+        not_established: Option<&str>,
+    ) -> ToolOutput {
         let full: Option<BlobRef> = if answer.chars().count() > REPORT_MAX_CHARS {
             match ctx.blobs.put_bytes(answer.as_bytes()) {
                 Ok(b) => Some(b),
@@ -541,11 +554,8 @@ impl Finish {
         } else if s.role.verify_finish && s.agents.verify_finish {
             // `state` is the ledger before this finish: only earlier finishes count or restart the count.
             let floor = rejection_floor(&state);
-            let earlier_rejections = state
-                .finishes
-                .iter()
-                .filter(|f| f.accepted == Some(false) && finish_number(&f.id) > floor)
-                .count();
+            let earlier_rejections =
+                state.finishes.iter().filter(|f| f.accepted == Some(false) && finish_number(&f.id) > floor).count();
             let Some(role) = s.role.verifier.clone() else {
                 let why = format!("the role `{}` has no verifier role in its pack", s.role.name);
                 return self.hold_unverified(&why, None);
@@ -554,7 +564,10 @@ impl Finish {
                 role,
                 mode: SpawnMode::Fresh,
                 brief: finish_brief(&state, answer, verified, not_established, &evidence),
-                budget: Budget { max_steps: Some(s.agents.child_max_steps), max_minutes: Some(s.agents.child_max_minutes) },
+                budget: Budget {
+                    max_steps: Some(s.agents.child_max_steps),
+                    max_minutes: Some(s.agents.child_max_minutes),
+                },
                 call_id: ctx.call_id.clone(),
                 title: format!("verify finish {fid}"),
                 awaited: true,
@@ -668,7 +681,10 @@ impl Finish {
             }
         }
 
-        s.emit(Author::Harness, inbox(InboxKind::Finished, format!("{answer}{support}\n\n[{note}]"), Vec::new(), false, ctx, Some(fid)));
+        s.emit(
+            Author::Harness,
+            inbox(InboxKind::Finished, format!("{answer}{support}\n\n[{note}]"), Vec::new(), false, ctx, Some(fid)),
+        );
         s.set_effect(Effect::EndTurn(TurnEndReason::Finished));
         ToolOutput::ok(format!("finished — {note}"), Body::Message("The result was delivered to the operator.".into()))
     }
@@ -719,7 +735,10 @@ impl Finish {
     /// inbox item) and the session goes on.
     fn hold_unverified(&self, why: &str, report: Option<String>) -> ToolOutput {
         let s = &self.0;
-        s.emit(Author::Harness, Event::HarnessNote { note: NoteKind::Verdict, text: texts::verification_fault_notice(why) });
+        s.emit(
+            Author::Harness,
+            Event::HarnessNote { note: NoteKind::Verdict, text: texts::verification_fault_notice(why) },
+        );
         let mut text = texts::verification_fault_result(why);
         if let Some(r) = report {
             text.push_str(&format!("\n\nThe verifier's report:\n{r}"));
@@ -765,10 +784,13 @@ fn running_refusal(role: &RoleDef, jobs: &[String], agents: &[String]) -> String
                 " An agent takes a moment to end after it is stopped: the result of `agent_stop` says whether it has ended.",
             );
         } else {
-            let tell: Vec<String> = ["ask_user", "report_blocker"].into_iter().filter(|t| has(t)).map(String::from).collect();
+            let tell: Vec<String> =
+                ["ask_user", "report_blocker"].into_iter().filter(|t| has(t)).map(String::from).collect();
             if !tell.is_empty() {
                 let tell = or_list(&tell);
-                text.push_str(&format!(" This session cannot stop an agent: if one does not end, tell the operator with {tell}."));
+                text.push_str(&format!(
+                    " This session cannot stop an agent: if one does not end, tell the operator with {tell}."
+                ));
             }
         }
     }
@@ -859,8 +881,13 @@ fn assigned_outputs(log_path: &std::path::Path, blobs: &loom_core::BlobStore) ->
     for record in report.records {
         let Event::HarnessNote { note: NoteKind::Assignment, text } = record.event else { continue };
         for (at, _) in text.match_indices("out:") {
-            let hex: String =
-                text.get(at.saturating_add(4)..).unwrap_or("").chars().take_while(char::is_ascii_hexdigit).take(64).collect();
+            let hex: String = text
+                .get(at.saturating_add(4)..)
+                .unwrap_or("")
+                .chars()
+                .take_while(char::is_ascii_hexdigit)
+                .take(64)
+                .collect();
             if hex.len() < 8 {
                 continue;
             }
@@ -906,7 +933,9 @@ impl Tool for Finish {
         let verified = match gate::check_quotes(&ctx.blobs, &quotes) {
             Ok(v) => v,
             Err(text) => {
-                return ToolOutput::error(format!("{text}\nNothing was delivered. Correct the quotes and call finish again."))
+                return ToolOutput::error(format!(
+                    "{text}\nNothing was delivered. Correct the quotes and call finish again."
+                ))
             }
         };
         // A quote is attested support, so it comes from an observation, as evidence does.
@@ -953,7 +982,11 @@ impl Tool for Conclude {
         let status = match str_arg(args, "status") {
             Some("met") => GoalMetStatus::Supported,
             Some("unreachable") => GoalMetStatus::Refuted,
-            _ => return ToolOutput::error("`status` must be `met` (the goal is achieved) or `unreachable` (it cannot be met as stated)."),
+            _ => {
+                return ToolOutput::error(
+                    "`status` must be `met` (the goal is achieved) or `unreachable` (it cannot be met as stated).",
+                )
+            }
         };
         if status == GoalMetStatus::Refuted {
             let state = match s.ledger() {
@@ -962,10 +995,17 @@ impl Tool for Conclude {
             };
             let open = state.open_items().plan;
             if !open.is_empty() {
-                let mut text = String::from("conclude unreachable was refused: the plan still has open steps, so not every route is closed:");
+                let mut text = String::from(
+                    "conclude unreachable was refused: the plan still has open steps, so not every route is closed:",
+                );
                 for id in &open {
                     if let Some(p) = state.plan.iter().find(|p| &p.id == id) {
-                        text.push_str(&format!("\n- {} ({}): {}", p.id, if p.status == loom_core::ledger::StepStatus::Doing { "doing" } else { "todo" }, cut_chars(&p.text, 120)));
+                        text.push_str(&format!(
+                            "\n- {} ({}): {}",
+                            p.id,
+                            if p.status == loom_core::ledger::StepStatus::Doing { "doing" } else { "todo" },
+                            cut_chars(&p.text, 120)
+                        ));
                     }
                 }
                 text.push_str("\nClose each route with `step`: status done (say what showed it) or dropped (say why). Then call conclude again.");
@@ -980,7 +1020,10 @@ impl Tool for Conclude {
         let (outcome, next) = if status == GoalMetStatus::Supported {
             ("goal concluded: met", "A verifier will check the result.")
         } else {
-            ("goal concluded: cannot be met as stated", "A verifier will look for one route you did not try, so name every route you closed.")
+            (
+                "goal concluded: cannot be met as stated",
+                "A verifier will look for one route you did not try, so name every route you closed.",
+            )
         };
         ToolOutput::ok(
             outcome,
@@ -1009,8 +1052,11 @@ impl Tool for Verdict {
             return ToolOutput::error("`verdict` belongs to a verifier working on an assignment.");
         }
         let accepted = args.get("accepted").and_then(Value::as_bool).unwrap_or(false);
-        let objections: Vec<String> =
-            strings_of(args.get("objections")).into_iter().map(|o| o.trim().to_string()).filter(|o| !o.is_empty()).collect();
+        let objections: Vec<String> = strings_of(args.get("objections"))
+            .into_iter()
+            .map(|o| o.trim().to_string())
+            .filter(|o| !o.is_empty())
+            .collect();
         if !accepted && objections.is_empty() {
             return ToolOutput::error(
                 "accepted: false needs at least one objection: one specific, checkable statement of what is wrong or unproven.",
@@ -1069,7 +1115,10 @@ impl Tool for Verdict {
             full: None,
             payload: json!({ "accepted": accepted, "objections": objections, "opened": opened }),
         }));
-        ToolOutput::ok("verdict delivered", Body::Message("Your verdict was delivered. This session is finished.".into()))
+        ToolOutput::ok(
+            "verdict delivered",
+            Body::Message("Your verdict was delivered. This session is finished.".into()),
+        )
     }
 }
 
@@ -1174,10 +1223,17 @@ impl Tool for ReportBlocker {
             let summary = cut_chars(&crate::texts::one_line(what), BLOCKER_SUMMARY_CHARS);
             let text =
                 format!("Blocked ({class}): {summary}\nWhat:\n{}\nTried:\n{}\nNeeds:\n{}", q(what), q(tried), q(needs));
-            s.set_effect(Effect::Settle(Delivery { outcome: ChildOutcome::Blocked, report: text, full: None, payload: Value::Null }));
+            s.set_effect(Effect::Settle(Delivery {
+                outcome: ChildOutcome::Blocked,
+                report: text,
+                full: None,
+                payload: Value::Null,
+            }));
             return ToolOutput::ok(
                 "blocker reported",
-                Body::Message("The blocker was reported to the agent that assigned this work. This session is finished.".into()),
+                Body::Message(
+                    "The blocker was reported to the agent that assigned this work. This session is finished.".into(),
+                ),
             );
         }
         let qid = match record_question(s, &text, true) {
@@ -1239,7 +1295,9 @@ impl Tool for Wait {
             } else {
                 format!("Carry on with the work, or end with {}.", or_list(&enders))
             };
-            return ToolOutput::error(format!("Nothing is running: no background job and no agent to wait for. {tail}"));
+            return ToolOutput::error(format!(
+                "Nothing is running: no background job and no agent to wait for. {tail}"
+            ));
         }
         let mut groups = Vec::new();
         if !jobs.is_empty() {
@@ -1251,7 +1309,10 @@ impl Tool for Wait {
         s.set_effect(Effect::EndTurn(TurnEndReason::Waiting));
         ToolOutput::ok(
             "waiting",
-            Body::Message(format!("Waiting for: {}. You will be resumed as soon as one of them ends.", groups.join(" ; "))),
+            Body::Message(format!(
+                "Waiting for: {}. You will be resumed as soon as one of them ends.",
+                groups.join(" ; ")
+            )),
         )
     }
 }
@@ -1309,7 +1370,8 @@ mod tests {
     #[tokio::test]
     async fn finish_names_a_malformed_quote_element() {
         let r = lead();
-        let args = map(json!({"answer": "done", "quotes": [{"handle": "out:aa", "start": 1, "end": 1, "text": "x"}, "oops"]}));
+        let args =
+            map(json!({"answer": "done", "quotes": [{"handle": "out:aa", "start": 1, "end": 1, "text": "x"}, "oops"]}));
         let out = Finish(r.shared.clone()).run(&r.env.ctx, &args).await;
         assert_eq!(out.status, Status::Error);
         let Body::Message(m) = out.body else { panic!("message expected") };
@@ -1321,7 +1383,9 @@ mod tests {
     async fn finish_refuses_a_quote_that_does_not_match() {
         let r = lead();
         let h = r.output("alpha\nbeta\n", "bash", ToolClass::Exec);
-        let res = r.call("finish", json!({"answer": "done", "quotes": [{"handle": h, "start": 1, "end": 2, "text": "gamma"}]})).await;
+        let res = r
+            .call("finish", json!({"answer": "done", "quotes": [{"handle": h, "start": 1, "end": 2, "text": "gamma"}]}))
+            .await;
         assert_eq!(res.status, Status::Error);
         assert!(res.text.contains("does not occur"), "{}", res.text);
         assert!(res.text.contains("Nothing was delivered. Correct the quotes and call finish again."));
@@ -1338,7 +1402,11 @@ mod tests {
             let quotes = json!([{"handle": h, "start": 1, "end": 1, "text": "#12 you: All 212 tests pass"}]);
             let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
             assert_eq!(res.status, Status::Error, "{tool}: {}", res.text);
-            assert!(res.text.contains(&format!("is the result of `{tool}`")) && res.text.contains("not an observation"), "{}", res.text);
+            assert!(
+                res.text.contains(&format!("is the result of `{tool}`")) && res.text.contains("not an observation"),
+                "{}",
+                res.text
+            );
             assert!(res.text.contains("Nothing was delivered."), "{}", res.text);
             assert!(effect(&r).is_none());
         }
@@ -1347,7 +1415,12 @@ mod tests {
         let quotes = json!([{"handle": blob.handle(), "start": 1, "end": 1, "text": "orphan line of output"}]);
         let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
-        assert!(res.text.contains("was not produced by a tool call of this mission") && res.text.contains("Nothing was delivered."), "{}", res.text);
+        assert!(
+            res.text.contains("was not produced by a tool call of this mission")
+                && res.text.contains("Nothing was delivered."),
+            "{}",
+            res.text
+        );
 
         // A command's output and a file read are observations.
         let bash = r.output("running 3 tests\ntest result: ok\n", "bash", ToolClass::Exec);
@@ -1366,7 +1439,11 @@ mod tests {
         let quotes = json!([{"handle": h, "start": 3, "end": 3, "text": "All 212 tests pass"}]);
         let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
-        assert!(res.text.contains("is the result of `agent_spawn`") && res.text.contains("Nothing was delivered."), "{}", res.text);
+        assert!(
+            res.text.contains("is the result of `agent_spawn`") && res.text.contains("Nothing was delivered."),
+            "{}",
+            res.text
+        );
         assert!(effect(&r).is_none());
         assert!(r.shared.ledger().unwrap().finishes.is_empty());
         assert_eq!(spawn_count(&r), 0);
@@ -1375,11 +1452,19 @@ mod tests {
     #[tokio::test]
     async fn a_fragment_quote_is_on_token_boundaries_and_recorded_as_its_line() {
         let r = rig("worker", true, true);
-        let h = r.output("test result: FAILED. 5 passed; 10 failed; 0 ignored\n0 of 40 tests passed\n", "bash", ToolClass::Exec);
+        let h = r.output(
+            "test result: FAILED. 5 passed; 10 failed; 0 ignored\n0 of 40 tests passed\n",
+            "bash",
+            ToolClass::Exec,
+        );
         let quotes = json!([{"handle": h, "start": 1, "end": 2, "text": "0 failed; 0 ignored"}]);
         let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
-        assert!(res.text.contains(&format!("occurs on line 1 of {h} only inside a longer word or number")), "{}", res.text);
+        assert!(
+            res.text.contains(&format!("occurs on line 1 of {h} only inside a longer word or number")),
+            "{}",
+            res.text
+        );
         assert!(effect(&r).is_none());
         let quotes = json!([{"handle": h, "start": 1, "end": 2, "text": "40 tests passed"}]);
         let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
@@ -1431,12 +1516,21 @@ mod tests {
             )
             .await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
-        assert!(res.text.contains("delivered") && res.text.contains("Your result was delivered. This session is finished."));
+        assert!(
+            res.text.contains("delivered") && res.text.contains("Your result was delivered. This session is finished.")
+        );
         let Some(Effect::Settle(d)) = effect(&r) else { panic!("settle expected") };
         assert_eq!(d.outcome, ChildOutcome::Returned);
         assert!(d.full.is_none());
-        assert!(d.report.starts_with("Outcome: returned\n") && d.report.contains("\n> Answer:\n> It is beta."), "{}", d.report);
-        assert!(d.report.contains("lines 2-2: beta") && d.report.contains("> Not established (stated by the agent):\n> gamma"));
+        assert!(
+            d.report.starts_with("Outcome: returned\n") && d.report.contains("\n> Answer:\n> It is beta."),
+            "{}",
+            d.report
+        );
+        assert!(
+            d.report.contains("lines 2-2: beta")
+                && d.report.contains("> Not established (stated by the agent):\n> gamma")
+        );
         assert_eq!(d.payload, json!({"quotes": [{"handle": h, "start": 2, "end": 2, "text": "beta"}]}));
         assert!(inbox_items(&r).is_empty());
     }
@@ -1480,7 +1574,10 @@ mod tests {
         r.orch.settle("s-kid1", ChildOutcome::Returned, "looked fine", accepted_payload());
         let h = r.output("alpha\nbeta\n", "bash", ToolClass::Exec);
         let res = r
-            .call("finish", json!({"answer": "Parser fixed.", "quotes": [{"handle": h, "start": 1, "end": 1, "text": "alpha"}]}))
+            .call(
+                "finish",
+                json!({"answer": "Parser fixed.", "quotes": [{"handle": h, "start": 1, "end": 1, "text": "alpha"}]}),
+            )
             .await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         assert!(res.text.contains("finished — verified by s-kid1"), "{}", res.text);
@@ -1683,7 +1780,10 @@ mod tests {
         let res = r.call("conclude", args).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         assert!(res.text.contains("You may now call `finish`"), "{}", res.text);
-        assert_eq!(r.shared.ledger().unwrap().goal_met.map(|g| g.status), Some(loom_core::ledger::GoalMetStatus::Refuted));
+        assert_eq!(
+            r.shared.ledger().unwrap().goal_met.map(|g| g.status),
+            Some(loom_core::ledger::GoalMetStatus::Refuted)
+        );
         // The finish now goes to the verifier, which is asked for an untried route, not for a proof.
         r.orch.settle("s-kid1", ChildOutcome::Returned, "no route found", accepted_payload());
         let res = r.call("finish", json!({"answer": "The goal cannot be met: the target rejects every input."})).await;
@@ -1692,7 +1792,10 @@ mod tests {
         let brief = &spawned[0].1.brief;
         assert!(brief.question.contains("Name one route to it that was not tried"), "{}", brief.question);
         let context = brief.context.clone().unwrap();
-        assert!(context.contains("The lead concluded the goal cannot be met as stated (evidence: e1):\nevery route fails"), "{context}");
+        assert!(
+            context.contains("The lead concluded the goal cannot be met as stated (evidence: e1):\nevery route fails"),
+            "{context}"
+        );
     }
 
     #[tokio::test]
@@ -1752,7 +1855,11 @@ mod tests {
             note: "read it".into(),
             attested: true,
         }));
-        r.model_op(LedgerOp::ClaimUpdate { id: "c2".into(), status: ClaimStatus::Withdrawn, note: "not needed".into() });
+        r.model_op(LedgerOp::ClaimUpdate {
+            id: "c2".into(),
+            status: ClaimStatus::Withdrawn,
+            note: "not needed".into(),
+        });
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert_eq!(spawn_count(&r), 1);
@@ -1782,7 +1889,10 @@ mod tests {
         // The second rejection reaches the cap: a non-blocking record, no inbox item, no turn end, no question.
         let (items, notes) = drain(&r);
         assert!(items.is_empty(), "{items:?}");
-        assert!(notes.iter().any(|(k, t)| *k == NoteKind::Verdict && t.starts_with("finish rejected 2 times; continuing")), "{notes:?}");
+        assert!(
+            notes.iter().any(|(k, t)| *k == NoteKind::Verdict && t.starts_with("finish rejected 2 times; continuing")),
+            "{notes:?}"
+        );
         assert!(effect(&r).is_none());
         assert!(r.shared.ledger().unwrap().questions.is_empty());
         // The session works on and can still finish with new evidence: nothing is stuck.
@@ -1839,7 +1949,11 @@ mod tests {
         let r = lead_with_goal();
         r.user_op(LedgerOp::OperatorRelease { reason: "out of time".into() });
         // An objection that was open when the operator released the mission does not hold the finish.
-        r.model_op(LedgerOp::ObligationOpen { kind: ObligationKind::Objection, text: "no run".into(), reference: "f0".into() });
+        r.model_op(LedgerOp::ObligationOpen {
+            kind: ObligationKind::Objection,
+            text: "no run".into(),
+            reference: "f0".into(),
+        });
         let res = r.call("finish", json!({"answer": "Not established; see notes."})).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         assert!(res.text.contains("finished — closed by operator, goal not established"), "{}", res.text);
@@ -1870,7 +1984,12 @@ mod tests {
         assert!(effect(&r).is_none());
         let (items, notes) = drain(&r);
         assert!(items.is_empty(), "{items:?}");
-        assert!(notes.iter().any(|(k, t)| *k == NoteKind::Verdict && t.starts_with("Infrastructure fault, not an agent problem")), "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|(k, t)| *k == NoteKind::Verdict && t.starts_with("Infrastructure fault, not an agent problem")),
+            "{notes:?}"
+        );
         let st = r.shared.ledger().unwrap();
         assert_eq!(st.finishes[0].accepted, None);
         assert!(st.questions.is_empty() && st.obligations.is_empty());
@@ -1939,7 +2058,12 @@ mod tests {
         r.orch.spawn_script.lock().unwrap().push_back(Err(SHUTTING_DOWN.into()));
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
-        assert!(res.text.contains("The harness is shutting down") && res.text.contains("nothing was delivered. Call finish again."), "{}", res.text);
+        assert!(
+            res.text.contains("The harness is shutting down")
+                && res.text.contains("nothing was delivered. Call finish again."),
+            "{}",
+            res.text
+        );
         assert!(effect(&r).is_none());
         assert!(inbox_items(&r).is_empty());
         assert_eq!(spawn_count(&r), 1);
@@ -1986,7 +2110,12 @@ mod tests {
 
     #[tokio::test]
     async fn finish_without_required_verification_still_says_not_verified() {
-        let r = rig_with(core_role("lead"), false, true, loom_core::config::AgentsCfg { verify_finish: false, ..Default::default() });
+        let r = rig_with(
+            core_role("lead"),
+            false,
+            true,
+            loom_core::config::AgentsCfg { verify_finish: false, ..Default::default() },
+        );
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         assert!(res.text.contains("finished — not verified"), "{}", res.text);
@@ -1998,7 +2127,8 @@ mod tests {
     async fn finish_carries_not_established_and_quotes_to_the_verifier_and_the_operator() {
         let r = lead();
         r.orch.settle("s-kid1", ChildOutcome::Returned, "fine", accepted_payload());
-        let res = r.call("finish", json!({"answer": "Parser fixed.", "not_established": "the lexer was not run"})).await;
+        let res =
+            r.call("finish", json!({"answer": "Parser fixed.", "not_established": "the lexer was not run"})).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         let spawned = r.orch.spawned.lock().unwrap().clone();
         let ctx_text = spawned[0].1.brief.context.clone().unwrap();
@@ -2017,7 +2147,11 @@ mod tests {
         assert_eq!(started.status, Status::Ok, "{}", started.text);
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
-        assert!(res.text.contains("job j1 (sleep 30)") && res.text.contains("job_kill") && res.text.contains("wait"), "{}", res.text);
+        assert!(
+            res.text.contains("job j1 (sleep 30)") && res.text.contains("job_kill") && res.text.contains("wait"),
+            "{}",
+            res.text
+        );
         assert!(!res.text.contains("agent_stop"), "{}", res.text);
         assert!(effect(&r).is_none());
         assert!(r.shared.ledger().unwrap().finishes.is_empty());
@@ -2038,9 +2172,19 @@ mod tests {
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(res.text.contains("finish was refused") && res.text.contains("job j1 (sleep 30)"), "{}", res.text);
         assert!(res.text.contains("Nothing was delivered."), "{}", res.text);
-        assert!(res.text.contains("To go on: wait for it to report (`wait`), or end a job with `job_kill`; then call finish again."), "{}", res.text);
+        assert!(
+            res.text.contains(
+                "To go on: wait for it to report (`wait`), or end a job with `job_kill`; then call finish again."
+            ),
+            "{}",
+            res.text
+        );
         // A child at its budget has two steps left: ending the job and delivering fit in one.
-        assert!(res.text.contains("`job_kill` and `finish` can go in the same reply: the calls run in order"), "{}", res.text);
+        assert!(
+            res.text.contains("`job_kill` and `finish` can go in the same reply: the calls run in order"),
+            "{}",
+            res.text
+        );
         assert!(effect(&r).is_none());
         let killed = r.call("job_kill", json!({"job": "j1"})).await;
         assert_eq!(killed.status, Status::Ok, "{}", killed.text);
@@ -2079,7 +2223,12 @@ mod tests {
         let bare = running_refusal(&role, &jobs, &agents);
         assert!(bare.contains("Nothing was delivered. Call finish again when it has ended."), "{bare}");
         assert!(!bare.contains("`wait`") && !bare.contains("job_kill") && !bare.contains("agent_stop"), "{bare}");
-        assert!(bare.ends_with("This session cannot stop an agent: if one does not end, tell the operator with `ask_user`."), "{bare}");
+        assert!(
+            bare.ends_with(
+                "This session cannot stop an agent: if one does not end, tell the operator with `ask_user`."
+            ),
+            "{bare}"
+        );
         role.tools.retain(|t| t != "ask_user");
         assert!(running_refusal(&role, &jobs, &agents).ends_with("Call finish again when it has ended."));
         assert!(!running_refusal(&role, &jobs, &[]).contains("operator"));
@@ -2137,7 +2286,8 @@ mod tests {
     #[tokio::test]
     async fn verdict_is_refused_outside_a_child_session() {
         let r = lead();
-        let out = Verdict(r.shared.clone()).run(&r.env.ctx, &map(json!({"accepted": true, "opened": ["out:aa"]}))).await;
+        let out =
+            Verdict(r.shared.clone()).run(&r.env.ctx, &map(json!({"accepted": true, "opened": ["out:aa"]}))).await;
         assert_eq!(out.status, Status::Error);
         assert_eq!(out.body, Body::Message("`verdict` belongs to a verifier working on an assignment.".into()));
     }
@@ -2155,7 +2305,11 @@ mod tests {
         let res = r.call("verdict", json!({"accepted": true, "opened": []})).await;
         assert!(res.text.contains("A verdict that examined nothing is not a verdict."), "{}", res.text);
         let res = r.call("verdict", json!({"accepted": true, "opened": ["out:deadbeef00"]})).await;
-        assert!(res.text.contains("You listed out:deadbeef00 as examined, but this session never opened it."), "{}", res.text);
+        assert!(
+            res.text.contains("You listed out:deadbeef00 as examined, but this session never opened it."),
+            "{}",
+            res.text
+        );
         // Stored, but not by this session.
         let other = r.env.ctx.blobs.put_bytes(b"someone else's\n").unwrap().handle();
         let res = r.call("verdict", json!({"accepted": true, "opened": [other]})).await;
@@ -2173,7 +2327,10 @@ mod tests {
         assert!(res.text.contains("verdict delivered"));
         let Some(Effect::Settle(d)) = effect(&r) else { panic!("settle expected") };
         assert_eq!(d.outcome, ChildOutcome::Returned);
-        assert_eq!(d.report, format!("Verdict: not accepted\nObjections:\n- no test ran\nExamined: {produced}, {viewed}"));
+        assert_eq!(
+            d.report,
+            format!("Verdict: not accepted\nObjections:\n- no test ran\nExamined: {produced}, {viewed}")
+        );
         assert_eq!(d.payload, json!({"accepted": false, "objections": ["no test ran"], "opened": [produced, viewed]}));
 
         let res = r.call("verdict", json!({"accepted": true, "opened": [produced]})).await;
@@ -2190,7 +2347,11 @@ mod tests {
         assert_eq!(started.status, Status::Ok, "{}", started.text);
         let res = r.call("verdict", json!({"accepted": true, "opened": [produced]})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
-        assert!(res.text.contains("job j1 (sleep 30)") && res.text.contains("job_wait") && res.text.contains("job_kill"), "{}", res.text);
+        assert!(
+            res.text.contains("job j1 (sleep 30)") && res.text.contains("job_wait") && res.text.contains("job_kill"),
+            "{}",
+            res.text
+        );
         assert!(res.text.contains("Nothing was recorded."), "{}", res.text);
         assert!(effect(&r).is_none());
         let killed = r.call("job_kill", json!({"job": "j1"})).await;
@@ -2208,12 +2369,17 @@ mod tests {
     async fn verdict_must_open_the_evidence_its_assignment_names() {
         let (r, produced, viewed) = verifier_with_log();
         let (mut log, _) = SessionLog::open(&r.shared.log_path, Durability::Batch).unwrap();
-        let text = format!("Question: Try to refute it.\n\nContext: Lines the lead quotes:\n- {viewed} lines 1-1: viewed");
+        let text =
+            format!("Question: Try to refute it.\n\nContext: Lines the lead quotes:\n- {viewed} lines 1-1: viewed");
         log.append(Author::Agent("s-lead".into()), Event::HarnessNote { note: NoteKind::Assignment, text }).unwrap();
         // The verifier opened something it produced itself, but not the evidence it was pointed at.
         let res = r.call("verdict", json!({"accepted": true, "opened": [produced]})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
-        assert!(res.text.contains("Your assignment names outputs to examine") && res.text.contains(&viewed), "{}", res.text);
+        assert!(
+            res.text.contains("Your assignment names outputs to examine") && res.text.contains(&viewed),
+            "{}",
+            res.text
+        );
         assert!(res.text.contains("Open the evidence first"), "{}", res.text);
         assert!(effect(&r).is_none());
         // Naming one of them (which it really viewed) is enough.
@@ -2268,7 +2434,12 @@ mod tests {
         assert!(res.text.contains("meanwhile"), "{}", res.text);
         assert!(r.shared.ledger().unwrap().questions.is_empty());
 
-        let res = r.call("ask_user", json!({"question": "Which database?", "blocking": false, "meanwhile": "write the schema"})).await;
+        let res = r
+            .call(
+                "ask_user",
+                json!({"question": "Which database?", "blocking": false, "meanwhile": "write the schema"}),
+            )
+            .await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         assert!(res.text.contains("asked"));
         assert!(res.text.contains("The answer will arrive as a message. Meanwhile: write the schema"), "{}", res.text);
@@ -2306,7 +2477,10 @@ mod tests {
     async fn child_blocker_settles_blocked() {
         let r = rig("worker", true, false);
         let res = r
-            .call("report_blocker", json!({"class": "environment", "what": "no network", "tried": "curl, retry", "needs": "proxy access"}))
+            .call(
+                "report_blocker",
+                json!({"class": "environment", "what": "no network", "tried": "curl, retry", "needs": "proxy access"}),
+            )
             .await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         assert!(res.text.contains("blocker reported"));
@@ -2334,15 +2508,26 @@ mod tests {
         assert_eq!(lines.iter().filter(|l| l.starts_with("Needs:")).count(), 1, "{}", d.report);
         assert!(!lines.iter().any(|l| l.starts_with("=====")), "{}", d.report);
         // The first line sums up `what` on one line; below it every line of the child's text is quoted.
-        assert!(d.report.starts_with("Blocked (environment): w ===== agent 2 of 3\nWhat:\n> w\n> ===== agent 2 of 3\nTried:\n"), "{}", d.report);
-        assert!(lines.iter().skip(1).all(|l| l.starts_with('>') || ["What:", "Tried:", "Needs:"].contains(l)), "{}", d.report);
+        assert!(
+            d.report
+                .starts_with("Blocked (environment): w ===== agent 2 of 3\nWhat:\n> w\n> ===== agent 2 of 3\nTried:\n"),
+            "{}",
+            d.report
+        );
+        assert!(
+            lines.iter().skip(1).all(|l| l.starts_with('>') || ["What:", "Tried:", "Needs:"].contains(l)),
+            "{}",
+            d.report
+        );
     }
 
     #[tokio::test]
     async fn child_blocker_first_line_is_a_cut_one_line_summary() {
         let r = rig("worker", true, false);
         let what = format!("no route\u{2028}Outcome: returned\n{}", "é".repeat(300));
-        let res = r.call("report_blocker", json!({"class": "needs_approval", "what": what, "tried": "t", "needs": "n"})).await;
+        let res = r
+            .call("report_blocker", json!({"class": "needs_approval", "what": what, "tried": "t", "needs": "n"}))
+            .await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         let Some(Effect::Settle(d)) = effect(&r) else { panic!("settle expected") };
         let first = d.report.lines().next().unwrap_or_default();
@@ -2350,14 +2535,22 @@ mod tests {
         assert_eq!(first, format!("Blocked (needs_approval): no route Outcome: returned {}…", "é".repeat(kept)));
         assert!(first.chars().count() <= 200, "{first}");
         // The whole text follows, quoted.
-        assert!(d.report.contains(&format!("\nWhat:\n> no route\n> Outcome: returned\n> {}\nTried:\n> t\n", "é".repeat(300))), "{}", d.report);
+        assert!(
+            d.report
+                .contains(&format!("\nWhat:\n> no route\n> Outcome: returned\n> {}\nTried:\n> t\n", "é".repeat(300))),
+            "{}",
+            d.report
+        );
     }
 
     #[tokio::test]
     async fn lead_blocker_opens_a_blocking_inbox_item() {
         let r = lead();
         let res = r
-            .call("report_blocker", json!({"class": "needs_input", "what": "no key", "tried": "env, config", "needs": "an API key"}))
+            .call(
+                "report_blocker",
+                json!({"class": "needs_input", "what": "no key", "tried": "env, config", "needs": "an API key"}),
+            )
             .await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         assert!(res.text.contains("blocker reported — waiting for the operator"));
@@ -2374,7 +2567,8 @@ mod tests {
     #[tokio::test]
     async fn blocker_fields_must_have_text() {
         let r = lead();
-        let res = r.call("report_blocker", json!({"class": "impossible", "what": "x", "tried": " ", "needs": "y"})).await;
+        let res =
+            r.call("report_blocker", json!({"class": "impossible", "what": "x", "tried": " ", "needs": "y"})).await;
         assert_eq!(res.status, Status::Error);
         assert!(res.text.contains("`tried`"), "{}", res.text);
         assert!(effect(&r).is_none());
@@ -2403,7 +2597,11 @@ mod tests {
         let res = r.call("wait", json!({"reason": "the job"})).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         assert!(res.text.contains("waiting"));
-        assert!(res.text.contains("Waiting for: job j1 (sleep 30). You will be resumed as soon as one of them ends."), "{}", res.text);
+        assert!(
+            res.text.contains("Waiting for: job j1 (sleep 30). You will be resumed as soon as one of them ends."),
+            "{}",
+            res.text
+        );
         assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Waiting)));
         let killed = r.call("job_kill", json!({"job": "j1"})).await;
         assert_eq!(killed.status, Status::Ok, "{}", killed.text);
@@ -2489,7 +2687,11 @@ mod tests {
                 note: String::new(),
                 evidence: vec!["e1".into(), "e3".into()],
             }],
-            evidence: vec![evidence("e1", Some("ab"), true), evidence("e2", Some("cd"), false), evidence("e3", None, true)],
+            evidence: vec![
+                evidence("e1", Some("ab"), true),
+                evidence("e2", Some("cd"), false),
+                evidence("e3", None, true),
+            ],
             ..LedgerState::default()
         };
         // `e9` is not a record of this ledger and is left out.
@@ -2533,6 +2735,9 @@ mod tests {
         let ctx_text = spawned[0].1.brief.context.clone().unwrap();
         let line = format!("- e1 (supports) {h} lines 2-2: line two \u{2014} the test passes");
         assert!(ctx_text.contains(&format!("Evidence the lead names for the result:\n{line}")), "{ctx_text}");
-        assert!(ctx_text.contains(&format!("Claims recorded as supported:\n- c1: the parser is fixed\n  {line}")), "{ctx_text}");
+        assert!(
+            ctx_text.contains(&format!("Claims recorded as supported:\n- c1: the parser is fixed\n  {line}")),
+            "{ctx_text}"
+        );
     }
 }

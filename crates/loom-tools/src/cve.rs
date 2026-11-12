@@ -200,7 +200,9 @@ impl Failure {
     /// One short clause, for tools that carry on without this source.
     fn short(&self) -> String {
         match self {
-            Failure::Denied(_) => "the egress proxy refused the request (the host is not on the daemon's network allowlist)".to_string(),
+            Failure::Denied(_) => {
+                "the egress proxy refused the request (the host is not on the daemon's network allowlist)".to_string()
+            }
             Failure::Error(m) => m.clone(),
         }
     }
@@ -361,7 +363,9 @@ async fn exchange(ctx: &ToolCtx, req: RequestBuilder, url: &Url, what: &str) -> 
 
 /// `base` + `path` with the given query pairs and valueless flags.
 fn endpoint(base: &str, path: &str, pairs: &[(&str, &str)], flags: &[&str]) -> Result<Url, String> {
-    let mut url = Url::parse(base).map_err(|e| format!("The upstream address `{base}` is not a valid URL ({e}); this is a harness configuration fault."))?;
+    let mut url = Url::parse(base).map_err(|e| {
+        format!("The upstream address `{base}` is not a valid URL ({e}); this is a harness configuration fault.")
+    })?;
     url.set_path(path);
     {
         let mut q = url.query_pairs_mut();
@@ -519,13 +523,16 @@ impl Cvss {
 /// The best CVSS score on a cve object: v4.0, else v3.1, else v3.0, else v2.
 fn best_cvss(cve: &Value) -> Option<Cvss> {
     let metrics = cve.get("metrics")?;
-    for (key, default_version) in [("cvssMetricV40", "4.0"), ("cvssMetricV31", "3.1"), ("cvssMetricV30", "3.0"), ("cvssMetricV2", "2.0")] {
+    for (key, default_version) in
+        [("cvssMetricV40", "4.0"), ("cvssMetricV31", "3.1"), ("cvssMetricV30", "3.0"), ("cvssMetricV2", "2.0")]
+    {
         let list: Vec<&Value> = items(metrics, key).collect();
         let pick = list.iter().find(|m| text(m, "type") == Some("Primary")).or_else(|| list.first());
         let Some(metric) = pick else { continue };
         let Some(data) = metric.get("cvssData") else { continue };
         let Some(score) = data.get("baseScore").and_then(number) else { continue };
-        let severity = text(data, "baseSeverity").or_else(|| text(metric, "baseSeverity")).map(|s| clean(s).to_uppercase());
+        let severity =
+            text(data, "baseSeverity").or_else(|| text(metric, "baseSeverity")).map(|s| clean(s).to_uppercase());
         return Some(Cvss {
             version: text(data, "version").map(clean).unwrap_or_else(|| default_version.to_string()),
             score,
@@ -572,7 +579,12 @@ fn affected(cve: &Value) -> Vec<String> {
                 }
                 let Some(criteria) = text(m, "criteria") else { continue };
                 let mut bounds: Vec<String> = Vec::new();
-                for (key, op) in [("versionStartIncluding", ">="), ("versionStartExcluding", ">"), ("versionEndIncluding", "<="), ("versionEndExcluding", "<")] {
+                for (key, op) in [
+                    ("versionStartIncluding", ">="),
+                    ("versionStartExcluding", ">"),
+                    ("versionEndIncluding", "<="),
+                    ("versionEndExcluding", "<"),
+                ] {
                     if let Some(v) = text(m, key) {
                         bounds.push(format!("{op} {}", clean(v)));
                     }
@@ -707,7 +719,9 @@ async fn lookup_run(ctx: &ToolCtx, client: &Client, ep: &Endpoints, id: &str) ->
         Err(m) => (Err(m), String::new()),
         Ok(u) => match exchange(ctx, client.get(u.clone()), &u, "EPSS").await {
             Err(f) => (Err(f.short()), String::new()),
-            Ok(r) if !(200..300).contains(&r.status) => (Err(format!("EPSS answered HTTP {}", r.status)), String::new()),
+            Ok(r) if !(200..300).contains(&r.status) => {
+                (Err(format!("EPSS answered HTTP {}", r.status)), String::new())
+            }
             Ok(r) => match serde_json::from_slice::<Value>(&r.body) {
                 Ok(v) => (Ok(epss_rows(&v).remove(id)), now_stamp()),
                 Err(e) => (Err(format!("EPSS gave an unreadable answer ({e})")), String::new()),
@@ -730,7 +744,10 @@ async fn lookup_run(ctx: &ToolCtx, client: &Client, ep: &Endpoints, id: &str) ->
 
     let mut r = String::new();
     r.push_str(&format!("{id} — CVSS {cvss_head} · EPSS {epss_head} · KEV {kev_head}\n"));
-    r.push_str(&format!("Description: {}\n", english(cve, "descriptions").unwrap_or_else(|| "(NVD gives no description)".to_string())));
+    r.push_str(&format!(
+        "Description: {}\n",
+        english(cve, "descriptions").unwrap_or_else(|| "(NVD gives no description)".to_string())
+    ));
     r.push_str(&format!("CVSS: {}\n", cvss.as_ref().map(Cvss::long).unwrap_or_else(|| "not scored".to_string())));
     let weak = cwes(cve);
     r.push_str(&format!("CWE: {}\n", if weak.is_empty() { "none listed".to_string() } else { weak.join(", ") }));
@@ -776,7 +793,8 @@ async fn lookup_run(ctx: &ToolCtx, client: &Client, ep: &Endpoints, id: &str) ->
         Ok(None) => r.push_str("EPSS: EPSS not available\n"),
         Err(why) => r.push_str(&format!("EPSS: EPSS lookup failed: {why}\n")),
     }
-    let refs: Vec<String> = items(cve, "references").filter_map(|x| text(x, "url")).map(clean).filter(|u| !u.is_empty()).collect();
+    let refs: Vec<String> =
+        items(cve, "references").filter_map(|x| text(x, "url")).map(clean).filter(|u| !u.is_empty()).collect();
     if refs.is_empty() {
         r.push_str("References: none listed\n");
     } else {
@@ -794,7 +812,8 @@ async fn lookup_run(ctx: &ToolCtx, client: &Client, ep: &Endpoints, id: &str) ->
         text(cve, "published").map(clean).unwrap_or_else(|| "unknown".into()),
         text(cve, "lastModified").map(clean).unwrap_or_else(|| "unknown".into()),
     ));
-    let epss_retrieved = if epss_time.is_empty() { "EPSS unavailable".to_string() } else { format!("EPSS {epss_time}") };
+    let epss_retrieved =
+        if epss_time.is_empty() { "EPSS unavailable".to_string() } else { format!("EPSS {epss_time}") };
     r.push_str(&format!("Retrieved: NVD {nvd_time}, {epss_retrieved} (a snapshot; sources: NVD, FIRST EPSS)"));
 
     let mut out = ToolOutput::ok(format!("CVE {id}"), Body::Raw(r.into_bytes()));
@@ -823,7 +842,8 @@ struct Hit {
 }
 
 async fn cve_search(ctx: &ToolCtx, args: &Map<String, Value>, ep: &Endpoints) -> ToolOutput {
-    let arg_text = |k: &str| args.get(k).and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let arg_text =
+        |k: &str| args.get(k).and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let query = arg_text("query");
     let vendor = arg_text("vendor");
     let kev = args.get("kev").and_then(Value::as_bool).unwrap_or(false);
@@ -833,7 +853,9 @@ async fn cve_search(ctx: &ToolCtx, args: &Map<String, Value>, ep: &Endpoints) ->
         return ToolOutput::error("cve_search needs at least one of `query` (keywords), `vendor`, or `kev: true` — min_cvss and min_epss only narrow a search, they cannot start one. Call again with one of those.");
     }
     if min_cvss.is_some_and(|v| !(0.0..=10.0).contains(&v)) {
-        return ToolOutput::error("`min_cvss` is a CVSS base score between 0 and 10. Call cve_search again with a value in that range.");
+        return ToolOutput::error(
+            "`min_cvss` is a CVSS base score between 0 and 10. Call cve_search again with a value in that range.",
+        );
     }
     if min_epss.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
         return ToolOutput::error("`min_epss` is an EPSS probability between 0 and 1 (for example 0.5, not 50). Call cve_search again with a value in that range.");
@@ -913,7 +935,8 @@ async fn cve_search(ctx: &ToolCtx, args: &Map<String, Value>, ep: &Endpoints) ->
                 Ok(u) => match exchange(ctx, client.get(u.clone()), &u, "EPSS").await {
                     Err(f) => Err(f.short()),
                     Ok(r) if !(200..300).contains(&r.status) => Err(format!("EPSS answered HTTP {}", r.status)),
-                    Ok(r) => serde_json::from_slice::<Value>(&r.body).map_err(|e| format!("EPSS gave an unreadable answer ({e})")),
+                    Ok(r) => serde_json::from_slice::<Value>(&r.body)
+                        .map_err(|e| format!("EPSS gave an unreadable answer ({e})")),
                 },
             };
             match fetched {
@@ -928,7 +951,9 @@ async fn cve_search(ctx: &ToolCtx, args: &Map<String, Value>, ep: &Endpoints) ->
                         "EPSS lookup failed ({why}), so `min_epss` cannot be applied. Call cve_search again in a moment, or without `min_epss`."
                     ));
                 }
-                Err(why) => epss_note = Some(format!("EPSS lookup failed ({why}); rows are ranked by CVSS then recency")),
+                Err(why) => {
+                    epss_note = Some(format!("EPSS lookup failed ({why}); rows are ranked by CVSS then recency"))
+                }
             }
         }
         if let Some(m) = min_epss {
@@ -983,7 +1008,8 @@ async fn cve_search(ctx: &ToolCtx, args: &Map<String, Value>, ep: &Endpoints) ->
 // advisory_lookup
 
 async fn advisory_lookup(ctx: &ToolCtx, args: &Map<String, Value>, ep: &Endpoints) -> ToolOutput {
-    let arg_text = |k: &str| args.get(k).and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let arg_text =
+        |k: &str| args.get(k).and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let (Some(name), Some(ecosystem)) = (arg_text("name"), arg_text("ecosystem")) else {
         return ToolOutput::error("advisory_lookup needs both `name` (the package name) and `ecosystem` (for example PyPI, npm, Maven, Go, crates.io, RubyGems). Call again with both.");
     };
@@ -1013,7 +1039,8 @@ async fn advisory_lookup(ctx: &ToolCtx, args: &Map<String, Value>, ep: &Endpoint
         if !(200..300).contains(&reply.status) {
             return match parsed {
                 Ok(v) if reply.status < 500 => {
-                    let why = text(&v, "message").map(|m| one_line(m, 300)).unwrap_or_else(|| "no reason given".to_string());
+                    let why =
+                        text(&v, "message").map(|m| one_line(m, 300)).unwrap_or_else(|| "no reason given".to_string());
                     attach_raw(
                         ctx,
                         ToolOutput::ok(
@@ -1023,12 +1050,19 @@ async fn advisory_lookup(ctx: &ToolCtx, args: &Map<String, Value>, ep: &Endpoint
                         &reply.body,
                     )
                 }
-                _ => ToolOutput::error(format!("OSV answered HTTP {} without a usable result. Try again in a moment.", reply.status)),
+                _ => ToolOutput::error(format!(
+                    "OSV answered HTTP {} without a usable result. Try again in a moment.",
+                    reply.status
+                )),
             };
         }
         let v = match parsed {
             Ok(v) => v,
-            Err(e) => return ToolOutput::error(format!("OSV answered but the response was not valid JSON ({e}). Try again in a moment.")),
+            Err(e) => {
+                return ToolOutput::error(format!(
+                    "OSV answered but the response was not valid JSON ({e}). Try again in a moment."
+                ))
+            }
         };
         let vulns: Vec<&Value> = items(&v, "vulns").collect();
         let total = vulns.len();
@@ -1073,7 +1107,10 @@ async fn advisory_lookup(ctx: &ToolCtx, args: &Map<String, Value>, ep: &Endpoint
                 .and_then(|s| s.lines().next().map(str::to_string))
                 .map(|s| one_line(&s, 160))
                 .unwrap_or_default();
-            r.push_str(&format!("{id}  {severity}  {}  {summary}\n", if aliases.is_empty() { "-".to_string() } else { aliases.join(",") }));
+            r.push_str(&format!(
+                "{id}  {severity}  {}  {summary}\n",
+                if aliases.is_empty() { "-".to_string() } else { aliases.join(",") }
+            ));
         }
         attach_raw(ctx, ToolOutput::ok(format!("{total} advisories"), Body::Raw(r.into_bytes())), &reply.body)
     };
@@ -1333,10 +1370,7 @@ mod tests {
     #[tokio::test]
     async fn epss_failure_keeps_the_nvd_record() {
         let app = Router::new()
-            .route(
-                "/rest/json/cves/2.0",
-                get(|| async { Json(nvd_page(vec![cve_json("CVE-2024-0001", json!({}))])) }),
-            )
+            .route("/rest/json/cves/2.0", get(|| async { Json(nvd_page(vec![cve_json("CVE-2024-0001", json!({}))])) }))
             .route("/data/v1/epss", get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }));
         let e = env_up(app).await;
         let r = e.call("cve_lookup", json!({"id": "CVE-2024-0001"})).await;
@@ -1352,13 +1386,21 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
-        let live = serve(Router::new().route("/rest/json/cves/2.0", get(|| async { Json(nvd_page(vec![cve_json("CVE-2024-0001", json!({}))])) }))).await;
+        let live = serve(Router::new().route(
+            "/rest/json/cves/2.0",
+            get(|| async { Json(nvd_page(vec![cve_json("CVE-2024-0001", json!({}))])) }),
+        ))
+        .await;
         let mut e = env();
         let ep = Endpoints { nvd: live, epss: dead, osv: String::new() };
         e.registry.add(Arc::new(Seam { ep, which: 0 }));
         let r = e.call("cve_lookup", json!({"id": "CVE-2024-0001"})).await;
         assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
-        assert!(e.stored(&r).contains("EPSS lookup failed: The EPSS request to 127.0.0.1 could not connect"), "{}", e.stored(&r));
+        assert!(
+            e.stored(&r).contains("EPSS lookup failed: The EPSS request to 127.0.0.1 could not connect"),
+            "{}",
+            e.stored(&r)
+        );
     }
 
     #[tokio::test]
@@ -1412,13 +1454,15 @@ mod tests {
 
         let r = e.call("cve_search", json!({"query": "thing", "min_cvss": 7})).await;
         let t = e.stored(&r);
-        let ids: Vec<&str> = t.lines().filter(|l| l.starts_with("CVE-")).map(|l| l.split_whitespace().next().unwrap()).collect();
+        let ids: Vec<&str> =
+            t.lines().filter(|l| l.starts_with("CVE-")).map(|l| l.split_whitespace().next().unwrap()).collect();
         assert_eq!(ids, ["CVE-2024-1003", "CVE-2024-1002"], "{t}");
         assert!(t.contains("CVSS >= 7"), "{t}");
 
         let r = e.call("cve_search", json!({"query": "thing", "min_epss": 0.4})).await;
         let t = e.stored(&r);
-        let ids: Vec<&str> = t.lines().filter(|l| l.starts_with("CVE-")).map(|l| l.split_whitespace().next().unwrap()).collect();
+        let ids: Vec<&str> =
+            t.lines().filter(|l| l.starts_with("CVE-")).map(|l| l.split_whitespace().next().unwrap()).collect();
         assert_eq!(ids, ["CVE-2024-1001", "CVE-2024-1003"], "{t}");
 
         let r = e.call("cve_search", json!({"vendor": "acme", "kev": true, "min_cvss": 10})).await;
@@ -1446,7 +1490,10 @@ mod tests {
         assert!(r.text.contains("no matches"), "{}", r.text);
         let q = seen.lock().unwrap().first().cloned().unwrap();
         assert!(q.contains("keywordSearch=heap+overflow") || q.contains("keywordSearch=heap%20overflow"), "{q}");
-        assert!(q.contains("virtualMatchString=cpe%3A2.3%3A*%3Aacme") || q.contains("virtualMatchString=cpe:2.3:*:acme"), "{q}");
+        assert!(
+            q.contains("virtualMatchString=cpe%3A2.3%3A*%3Aacme") || q.contains("virtualMatchString=cpe:2.3:*:acme"),
+            "{q}"
+        );
         assert!(q.contains("resultsPerPage=40") && q.contains("noRejected") && q.contains("hasKev"), "{q}");
     }
 
@@ -1465,10 +1512,7 @@ mod tests {
     #[tokio::test]
     async fn search_survives_an_epss_outage_unless_min_epss_needs_it() {
         let app = Router::new()
-            .route(
-                "/rest/json/cves/2.0",
-                get(|| async { Json(nvd_page(vec![cve_json("CVE-2024-0001", json!({}))])) }),
-            )
+            .route("/rest/json/cves/2.0", get(|| async { Json(nvd_page(vec![cve_json("CVE-2024-0001", json!({}))])) }))
             .route("/data/v1/epss", get(|| async { StatusCode::SERVICE_UNAVAILABLE }));
         let e = env_up(app).await;
         let r = e.call("cve_search", json!({"query": "thing"})).await;
@@ -1559,7 +1603,11 @@ mod tests {
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("HTTP_PROXY".to_string(), proxy);
         e.ctx.env = Arc::new(vars);
-        let ep = Endpoints { nvd: "http://nvd.blocked.invalid".into(), epss: "http://epss.blocked.invalid".into(), osv: "http://osv.blocked.invalid".into() };
+        let ep = Endpoints {
+            nvd: "http://nvd.blocked.invalid".into(),
+            epss: "http://epss.blocked.invalid".into(),
+            osv: "http://osv.blocked.invalid".into(),
+        };
         for which in 0..3 {
             e.registry.add(Arc::new(Seam { ep: ep.clone(), which }));
         }
@@ -1609,7 +1657,8 @@ mod tests {
     async fn an_https_refusal_by_the_real_proxy_names_its_rule_and_an_unreachable_host_is_not_one() {
         use loom_core::config::{NetworkCfg, NetworkMode};
         let deny = vec!["*.blocked.test".to_string()];
-        let cfg = NetworkCfg { mode: NetworkMode::Open, allow: Vec::new(), deny, allow_private: vec!["127.0.0.1".into()] };
+        let cfg =
+            NetworkCfg { mode: NetworkMode::Open, allow: Vec::new(), deny, allow_private: vec!["127.0.0.1".into()] };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = loom_net::Proxy::start(0, tx).await.unwrap();
         let grant = proxy.grant(&loom_core::SessionId::from("s-cve"), loom_net::Policy::new(&cfg).unwrap());
@@ -1618,7 +1667,11 @@ mod tests {
         seamed(&mut e, "https://nvd.blocked.test");
         let r = e.call("cve_lookup", json!({"id": "CVE-2021-44228"})).await;
         assert_eq!(r.status, ToolStatus::Denied, "{}", r.text);
-        assert!(r.text.contains("refused by rule `deny *.blocked.test`") && r.text.contains("nvd.blocked.test"), "{}", r.text);
+        assert!(
+            r.text.contains("refused by rule `deny *.blocked.test`") && r.text.contains("nvd.blocked.test"),
+            "{}",
+            r.text
+        );
         // Allowed, but nothing listens there: an error naming the proxy's rule, not a refusal.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

@@ -115,7 +115,9 @@ impl Pattern {
         } else {
             let h = normalize_host(host);
             if !valid_name(&h) && h.parse::<IpAddr>().is_err() {
-                return Err("the host is not a valid name or address (`*` may only appear as `*` or a leading `*.`)".into());
+                return Err(
+                    "the host is not a valid name or address (`*` may only appear as `*` or a leading `*.`)".into()
+                );
             }
             Kind::Exact(h)
         };
@@ -293,13 +295,16 @@ fn grant_pattern(host: &str) -> Result<Pattern, String> {
 /// pattern. Returned trimmed. The errors are sentences for the operator or the model.
 pub fn check_hosts(hosts: &[String]) -> Result<Vec<String>, String> {
     if hosts.is_empty() {
-        return Err("Name at least one host, one per entry, such as `api.example.test` or `*.example.test`.".to_string());
+        return Err(
+            "Name at least one host, one per entry, such as `api.example.test` or `*.example.test`.".to_string()
+        );
     }
     let mut out = Vec::new();
     for h in hosts {
         let h = h.trim();
         if h.is_empty() {
-            return Err("A host is blank. Give one host per entry, such as `api.example.test`, and no empty entries.".to_string());
+            return Err("A host is blank. Give one host per entry, such as `api.example.test`, and no empty entries."
+                .to_string());
         }
         if h.chars().any(|c| c.is_whitespace() || c == ',') {
             return Err(format!("The host entry \"{h}\" contains whitespace or a comma. Give one host per entry."));
@@ -553,7 +558,17 @@ mod tests {
 
     #[test]
     fn good_entries_parse() {
-        for e in ["example.test", "*.example.test", "example.test:443", "*", "*:80", "[::1]:8080", "::1", "10.0.0.1", "*.a-b.c_d"] {
+        for e in [
+            "example.test",
+            "*.example.test",
+            "example.test:443",
+            "*",
+            "*:80",
+            "[::1]:8080",
+            "::1",
+            "10.0.0.1",
+            "*.a-b.c_d",
+        ] {
             assert!(Policy::new(&cfg(NetworkMode::Open, &[e], &[e], &[])).is_ok(), "{e}");
         }
         for e in ["10.0.0.0/8", "fd00::/8", "1.2.3.4", "0.0.0.0/0", "::/0", "::1/128"] {
@@ -569,7 +584,22 @@ mod tests {
         assert!(e.contains("network.deny"), "{e}");
         let e = Policy::new(&cfg(NetworkMode::Open, &[], &[], &["10.0.0.0/33"])).unwrap_err();
         assert!(e.contains("network.allow_private"), "{e}");
-        for e in ["", "  ", "a*b.test", "*.", "*.*.test", "ex.test:", "ex.test:x", "[::1", "[::1]x", "[abc]:1", "a/b", "1.2.3.4/x", "fd00::/129", "x/8"] {
+        for e in [
+            "",
+            "  ",
+            "a*b.test",
+            "*.",
+            "*.*.test",
+            "ex.test:",
+            "ex.test:x",
+            "[::1",
+            "[::1]x",
+            "[abc]:1",
+            "a/b",
+            "1.2.3.4/x",
+            "fd00::/129",
+            "x/8",
+        ] {
             let r = Policy::new(&cfg(NetworkMode::Open, &[], &[], &[e]));
             assert!(r.is_err(), "{e:?} should be rejected");
         }
@@ -656,7 +686,12 @@ mod tests {
         assert!(!p.check_addr("x.test", 80, ip("::1"), "r").allowed);
         assert!(p.check_addr("x.test", 80, ip("::ffff:127.0.0.1"), "r").allowed);
         // CIDR deny entries, public addresses included; the port form only matches its port.
-        let p = pol(NetworkMode::Open, &[], &["10.1.0.0/16", "203.0.113.0/24", "8.8.8.8:53", "fd00::/8"], &["10.0.0.0/8", "fd00::/8"]);
+        let p = pol(
+            NetworkMode::Open,
+            &[],
+            &["10.1.0.0/16", "203.0.113.0/24", "8.8.8.8:53", "fd00::/8"],
+            &["10.0.0.0/8", "fd00::/8"],
+        );
         assert_eq!(p.check_addr("x.test", 80, ip("10.1.2.3"), "r").rule, "deny 10.1.0.0/16");
         assert!(!p.check_addr("x.test", 80, ip("203.0.113.9"), "r").allowed);
         assert!(!p.check_addr("x.test", 80, ip("::ffff:203.0.113.9"), "r").allowed);
@@ -673,20 +708,71 @@ mod tests {
     #[test]
     fn special_ranges_at_edges() {
         let yes = [
-            "0.0.0.0", "0.255.255.255", "10.0.0.0", "10.255.255.255", "100.64.0.0", "100.127.255.255", "127.0.0.0",
-            "127.255.255.255", "169.254.0.0", "169.254.255.255", "172.16.0.0", "172.31.255.255", "192.0.0.0", "192.0.0.255",
-            "192.168.0.0", "192.168.255.255", "198.18.0.0", "198.19.255.255", "224.0.0.0", "239.255.255.255", "240.0.0.0",
-            "255.255.255.255", "::", "::1", "fc00::", "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "fe80::", "febf:ffff::1",
-            "ff00::", "ffff::1", "::ffff:127.0.0.1", "::ffff:10.1.2.3", "::ffff:a9fe:1", "::127.0.0.1", "::ffff:224.0.0.1",
+            "0.0.0.0",
+            "0.255.255.255",
+            "10.0.0.0",
+            "10.255.255.255",
+            "100.64.0.0",
+            "100.127.255.255",
+            "127.0.0.0",
+            "127.255.255.255",
+            "169.254.0.0",
+            "169.254.255.255",
+            "172.16.0.0",
+            "172.31.255.255",
+            "192.0.0.0",
+            "192.0.0.255",
+            "192.168.0.0",
+            "192.168.255.255",
+            "198.18.0.0",
+            "198.19.255.255",
+            "224.0.0.0",
+            "239.255.255.255",
+            "240.0.0.0",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "fc00::",
+            "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "fe80::",
+            "febf:ffff::1",
+            "ff00::",
+            "ffff::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.1.2.3",
+            "::ffff:a9fe:1",
+            "::127.0.0.1",
+            "::ffff:224.0.0.1",
         ];
         for a in yes {
             assert!(is_special(ip(a)), "{a} should be special");
         }
         let no = [
-            "1.0.0.0", "9.255.255.255", "11.0.0.0", "100.63.255.255", "100.128.0.0", "126.255.255.255", "128.0.0.0",
-            "169.253.255.255", "169.255.0.0", "172.15.255.255", "172.32.0.0", "192.0.1.0", "192.167.255.255", "192.169.0.0",
-            "198.17.255.255", "198.20.0.0", "223.255.255.255", "8.8.8.8", "2606:4700::1", "fbff::1", "fec0::1",
-            "feff::1", "::ffff:8.8.8.8", "::8.8.8.8", "fe00::1",
+            "1.0.0.0",
+            "9.255.255.255",
+            "11.0.0.0",
+            "100.63.255.255",
+            "100.128.0.0",
+            "126.255.255.255",
+            "128.0.0.0",
+            "169.253.255.255",
+            "169.255.0.0",
+            "172.15.255.255",
+            "172.32.0.0",
+            "192.0.1.0",
+            "192.167.255.255",
+            "192.169.0.0",
+            "198.17.255.255",
+            "198.20.0.0",
+            "223.255.255.255",
+            "8.8.8.8",
+            "2606:4700::1",
+            "fbff::1",
+            "fec0::1",
+            "feff::1",
+            "::ffff:8.8.8.8",
+            "::8.8.8.8",
+            "fe00::1",
         ];
         for a in no {
             assert!(!is_special(ip(a)), "{a} should not be special");
@@ -711,7 +797,10 @@ mod tests {
                 let v = open.check_addr("x.test", 443, ip(&a), "mode open");
                 assert_eq!(v, Verdict { allowed: false, rule: format!("deny private-address {}", ip(&a)) }, "{a}");
                 assert!(!al.check_addr("x.test", 443, ip(&a), &al.check_name("x.test", 443).rule).allowed, "{a}");
-                assert_eq!(listed.check_addr("x.test", 443, ip(&a), "allow x.test").rule, format!("allow_private {v4}"));
+                assert_eq!(
+                    listed.check_addr("x.test", 443, ip(&a), "allow x.test").rule,
+                    format!("allow_private {v4}")
+                );
             }
         }
         // A public address inside them keeps the name rule.
@@ -760,17 +849,50 @@ mod tests {
     #[test]
     fn other_special_ipv6_ranges_at_edges() {
         let yes = [
-            "100::", "100::1:0:0:0", "100:0:0:1:ffff:ffff:ffff:ffff", "2001::", "2001:0:ffff::1", "2001:1::4", "2001:2::1",
-            "2001:10::1", "2001:20::1", "2001:3f::1", "2001:1ff:ffff::1", "2001:db8::", "2001:db8:ffff::1", "3fff::",
-            "3fff:fff:ffff::1", "5f00::", "5f00:ffff::1", "64:ff9b:1:1::1", "64:ff9b:2::1", "64:ff9b:ffff::1",
+            "100::",
+            "100::1:0:0:0",
+            "100:0:0:1:ffff:ffff:ffff:ffff",
+            "2001::",
+            "2001:0:ffff::1",
+            "2001:1::4",
+            "2001:2::1",
+            "2001:10::1",
+            "2001:20::1",
+            "2001:3f::1",
+            "2001:1ff:ffff::1",
+            "2001:db8::",
+            "2001:db8:ffff::1",
+            "3fff::",
+            "3fff:fff:ffff::1",
+            "5f00::",
+            "5f00:ffff::1",
+            "64:ff9b:1:1::1",
+            "64:ff9b:2::1",
+            "64:ff9b:ffff::1",
         ];
         for a in yes {
             assert!(is_special(ip(a)), "{a} should be special");
         }
         let no = [
-            "100:0:0:2::", "ff::1", "101::1", "2001:1::1", "2001:1::2", "2001:1::3", "2001:3::1", "2001:4:112::1",
-            "2001:200::", "2001:db7:ffff::1", "2001:db9::", "3ffe:ffff::1", "3fff:1000::", "5eff:ffff::1", "5f01::",
-            "64:ff9a::1", "64:ff9c::1", "2620:4f:8000::1", "2003::1",
+            "100:0:0:2::",
+            "ff::1",
+            "101::1",
+            "2001:1::1",
+            "2001:1::2",
+            "2001:1::3",
+            "2001:3::1",
+            "2001:4:112::1",
+            "2001:200::",
+            "2001:db7:ffff::1",
+            "2001:db9::",
+            "3ffe:ffff::1",
+            "3fff:1000::",
+            "5eff:ffff::1",
+            "5f01::",
+            "64:ff9a::1",
+            "64:ff9c::1",
+            "2620:4f:8000::1",
+            "2003::1",
         ];
         for a in no {
             assert!(!is_special(ip(a)), "{a} should not be special");
@@ -790,7 +912,8 @@ mod tests {
 
     #[test]
     fn allow_private_by_name_cidr_and_address() {
-        let p = pol(NetworkMode::Open, &[], &[], &["lab.test:8080", "*.corp.test", "10.0.0.0/8", "fd00::/8", "127.0.0.1"]);
+        let p =
+            pol(NetworkMode::Open, &[], &[], &["lab.test:8080", "*.corp.test", "10.0.0.0/8", "fd00::/8", "127.0.0.1"]);
         let r = |h: &str, port: u16, a: &str| p.check_addr(h, port, ip(a), "mode open");
         assert_eq!(r("lab.test", 8080, "192.168.1.1").rule, "allow_private lab.test:8080");
         assert!(!r("lab.test", 80, "192.168.1.1").allowed);

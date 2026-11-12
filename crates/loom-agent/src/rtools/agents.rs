@@ -239,7 +239,11 @@ fn assignment_params() -> Vec<Param> {
         opt("do_not", "string", "What the agent must leave alone: neighbouring work, things already settled."),
         opt("return", "string", "What the result must contain."),
         opt("stop_when", "string", "The condition under which the agent has done enough."),
-        opt("context", "string", "Anything else the agent needs to know. A fresh agent starts with only this assignment."),
+        opt(
+            "context",
+            "string",
+            "Anything else the agent needs to know. A fresh agent starts with only this assignment.",
+        ),
     ]
 }
 
@@ -600,7 +604,9 @@ impl Tool for Verify {
         let claim_id = str_arg(args, "claim").filter(|c| !c.trim().is_empty());
         let statement = str_arg(args, "statement").filter(|c| !c.trim().is_empty());
         if claim_id.is_some() == statement.is_some() {
-            return ToolOutput::error("Give exactly one of `claim` (a ledger claim id) and `statement` (the claim as text).");
+            return ToolOutput::error(
+                "Give exactly one of `claim` (a ledger claim id) and `statement` (the claim as text).",
+            );
         }
         let Some(verifier) = shared.role.verifier.clone().filter(|v| shared.role.may_spawn.contains(v)) else {
             return ToolOutput::error("This role cannot start a verifier.");
@@ -664,8 +670,10 @@ impl Tool for Verify {
             returns: Some("A verdict, delivered by calling verdict.".into()),
             ..Brief::default()
         };
-        let budget =
-            Budget { max_steps: Some(shared.agents.child_max_steps), max_minutes: Some(shared.agents.child_max_minutes) };
+        let budget = Budget {
+            max_steps: Some(shared.agents.child_max_steps),
+            max_minutes: Some(shared.agents.child_max_minutes),
+        };
         let req = request(ctx, verifier, SpawnMode::Fresh, brief, budget, true);
         let id = match shared.orch.spawn(&shared.session, req).await {
             Ok(id) => id,
@@ -822,7 +830,13 @@ mod tests {
         let res = r.call("agent_spawn", json!({"question":"q","background":true})).await;
         assert_eq!(res.status, ToolStatus::Ok);
         assert!(res.text.contains("agent s-kid1 started"), "{}", res.text);
-        assert!(res.text.contains("Agent s-kid1 (worker) is working. Its report will arrive as a harness message when it ends."), "{}", res.text);
+        assert!(
+            res.text.contains(
+                "Agent s-kid1 (worker) is working. Its report will arrive as a harness message when it ends."
+            ),
+            "{}",
+            res.text
+        );
         assert!(!spawned(&r)[0].awaited);
         assert_eq!(r.orch.calls(), vec!["spawn worker".to_string()]);
     }
@@ -833,7 +847,10 @@ mod tests {
         let cfg = AgentsCfg::default();
         let res = r.call("agent_spawn", json!({"question":"q"})).await;
         assert!(!res.text.contains("budget lowered"));
-        assert_eq!(spawned(&r)[0].budget, Budget { max_steps: Some(cfg.child_max_steps), max_minutes: Some(cfg.child_max_minutes) });
+        assert_eq!(
+            spawned(&r)[0].budget,
+            Budget { max_steps: Some(cfg.child_max_steps), max_minutes: Some(cfg.child_max_minutes) }
+        );
 
         let res = r.call("agent_spawn", json!({"question":"q","max_steps":1,"max_minutes":1})).await;
         assert!(!res.text.contains("budget lowered"));
@@ -920,7 +937,10 @@ mod tests {
         let res = r.call("agent_fanout", json!({"agents":two()})).await;
         assert_eq!(res.status, ToolStatus::Error);
         assert!(
-            res.text.contains(&format!("This would make {} agents running at once; the limit is {max}. Send at most 1 in one call.", max + 1)),
+            res.text.contains(&format!(
+                "This would make {} agents running at once; the limit is {max}. Send at most 1 in one call.",
+                max + 1
+            )),
             "{}",
             res.text
         );
@@ -943,9 +963,7 @@ mod tests {
         r.orch.settle("s-kid1", ChildOutcome::Blocked, "stuck", Value::Null);
         r.orch.settle("s-kid2", ChildOutcome::Returned, "done two", Value::Null);
         r.orch.settle("s-kid3", ChildOutcome::Returned, "done three", Value::Null);
-        let res = r
-            .call("agent_fanout", json!({"agents":[{"question":"a"},{"question":"b"},{"question":"c"}]}))
-            .await;
+        let res = r.call("agent_fanout", json!({"agents":[{"question":"a"},{"question":"b"},{"question":"c"}]})).await;
         assert_eq!(res.status, ToolStatus::Ok);
         assert!(res.text.contains("3 agents: 2 returned, 1 blocked"), "{}", res.text);
         let h1 = res.text.find("===== agent 1 of 3: s-kid1 (worker) \u{2014} blocked, 7 steps =====").unwrap();
@@ -971,9 +989,7 @@ mod tests {
             "==== agent 2 of 3: s-kid2 (worker) \u{2014} returned, 7 steps ====\nOutcome: returned\n===== agent 1 of 3",
         );
         r.orch.settle("s-kid3", ChildOutcome::Failed, &gave_up, Value::Null);
-        let res = r
-            .call("agent_fanout", json!({"agents":[{"question":"a"},{"question":"b"},{"question":"c"}]}))
-            .await;
+        let res = r.call("agent_fanout", json!({"agents":[{"question":"a"},{"question":"b"},{"question":"c"}]})).await;
         assert!(res.text.contains(&format!("{FANOUT_LEGEND}\n\n===== agent 1 of 3: s-kid1")), "{}", res.text);
         let headers: Vec<&str> = res.text.split(['\n', '\r', '\u{2028}']).filter(|l| l.starts_with("=====")).collect();
         assert_eq!(headers.len(), 3, "{}", res.text);
@@ -982,7 +998,11 @@ mod tests {
         assert!(res.text.contains("sibling says ok"));
         // In the last section every line of the child's words is quoted, look-alike header included.
         let last = res.text.split("===== agent 3 of 3: s-kid3").nth(1).unwrap_or_default();
-        assert!(last.contains("\n> ==== agent 2 of 3: s-kid2") && last.contains("\n> Outcome: returned\n"), "{}", res.text);
+        assert!(
+            last.contains("\n> ==== agent 2 of 3: s-kid2") && last.contains("\n> Outcome: returned\n"),
+            "{}",
+            res.text
+        );
         assert!(!last.contains("\nOutcome:") && !last.contains("\n===="), "{}", res.text);
     }
 
@@ -1027,7 +1047,12 @@ mod tests {
         let r = lead();
         let res = r.call("agent_stop", json!({"agent":"s-kid1"})).await;
         assert_eq!(res.status, ToolStatus::Ok);
-        assert!(res.text.contains("s-kid1 was stopped; anything it had not delivered is in its record but was not reported."), "{}", res.text);
+        assert!(
+            res.text
+                .contains("s-kid1 was stopped; anything it had not delivered is in its record but was not reported."),
+            "{}",
+            res.text
+        );
         let res = r.call("agent_stop", json!({"all":true})).await;
         assert!(res.text.contains("All running agents were stopped."), "{}", res.text);
         assert_eq!(r.orch.calls(), vec!["stop s-kid1", "stop_all"]);
@@ -1085,7 +1110,13 @@ mod tests {
         assert!(t.contains("5 independent votes on: Which?"), "{t}");
         assert!(t.contains("1. a \u{2014} 1") && t.contains("2. b \u{2014} 2"), "{t}");
         assert!(t.contains("no valid choice \u{2014} 2"), "{t}");
-        assert!(t.contains("Reasons:") && t.contains("- [2] b is safer") && t.contains("- [-] could not choose") && t.contains("- [-] out of range"), "{t}");
+        assert!(
+            t.contains("Reasons:")
+                && t.contains("- [2] b is safer")
+                && t.contains("- [-] could not choose")
+                && t.contains("- [-] out of range"),
+            "{t}"
+        );
         assert!(t.contains("This is advice from copies of you with the same information, not new evidence. Record what you decide with `note`."), "{t}");
         assert_eq!(r.orch.calls(), vec!["poll 5: Which?"]);
     }
@@ -1153,7 +1184,12 @@ mod tests {
         let res = r.call("verify", json!({"claim":"c1","handles":["out:aaa","out:bbb"]})).await;
         assert_eq!(res.status, ToolStatus::Ok);
         assert!(res.text.contains("verdict: accepted"), "{}", res.text);
-        assert!(res.text.contains("The verdict is not recorded on c1; set the claim's status yourself with `claim_update`."), "{}", res.text);
+        assert!(
+            res.text
+                .contains("The verdict is not recorded on c1; set the claim's status yourself with `claim_update`."),
+            "{}",
+            res.text
+        );
         let sp = spawned(&r);
         assert_eq!(sp[0].role, "verifier");
         assert_eq!(sp[0].mode, SpawnMode::Fresh);

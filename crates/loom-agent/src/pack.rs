@@ -187,7 +187,8 @@ fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 /// What a verifier role must be, as the load errors put it.
-const VERIFIER_NEEDS: &str = "a role with `read_only = true` whose `tools` include `verdict` and `out_read` or `out_grep`";
+const VERIFIER_NEEDS: &str =
+    "a role with `read_only = true` whose `tools` include `verdict` and `out_read` or `out_grep`";
 
 /// The verifier role of `r`: its `verifier` key, else the pack's role named `verifier`. A role that
 /// needs one (`verify_finish`, or an explicit key) must get a read-only role that can give a verdict
@@ -200,7 +201,8 @@ fn resolve_verifier(
     role_list: &str,
 ) -> Result<Option<String>, String> {
     // The role named `verifier` is not its own default verifier.
-    let wanted = r.verifier.clone().or_else(|| (roles.contains_key("verifier") && !is_verifier).then(|| "verifier".to_string()));
+    let wanted =
+        r.verifier.clone().or_else(|| (roles.contains_key("verifier") && !is_verifier).then(|| "verifier".to_string()));
     let usable = |name: &str| {
         roles.get(name).is_some_and(|v| {
             let has = |tool: &str| v.tools.iter().flatten().any(|t| t == tool);
@@ -236,19 +238,14 @@ fn parse_pack(
     builtin_preamble: &str,
     read: &dyn Fn(&str) -> Result<String, String>,
 ) -> Result<Pack, String> {
-    let raw: RawPack =
-        toml::from_str(toml_text).map_err(|e| format!("pack {label}: pack.toml is invalid: {e}"))?;
-    let name = raw
-        .name
-        .ok_or_else(|| format!("pack {label}: pack.toml is missing the required key `name`"))?;
+    let raw: RawPack = toml::from_str(toml_text).map_err(|e| format!("pack {label}: pack.toml is invalid: {e}"))?;
+    let name = raw.name.ok_or_else(|| format!("pack {label}: pack.toml is missing the required key `name`"))?;
     if !valid_name(&name) {
-        return Err(format!(
-            "pack {label}: `name` = \"{name}\" is not valid; use only a-z, 0-9 and `-`"
-        ));
+        return Err(format!("pack {label}: `name` = \"{name}\" is not valid; use only a-z, 0-9 and `-`"));
     }
-    let default_role = raw.default_role.ok_or_else(|| {
-        format!("pack {label}: pack.toml is missing the required key `default_role`")
-    })?;
+    let default_role = raw
+        .default_role
+        .ok_or_else(|| format!("pack {label}: pack.toml is missing the required key `default_role`"))?;
     if raw.roles.is_empty() {
         return Err(format!("pack {label}: pack.toml defines no `[roles.*]` tables"));
     }
@@ -273,15 +270,10 @@ fn parse_pack(
     let mut roles = BTreeMap::new();
     for (rname, r) in &raw.roles {
         if !valid_name(rname) {
-            return Err(format!(
-                "pack {label}: role name \"{rname}\" is not valid; use only a-z, 0-9 and `-`"
-            ));
+            return Err(format!("pack {label}: role name \"{rname}\" is not valid; use only a-z, 0-9 and `-`"));
         }
         let at = format!("pack {label}: roles.{rname}");
-        let prompt_rel = r
-            .prompt
-            .as_deref()
-            .ok_or_else(|| format!("{at} is missing the required key `prompt`"))?;
+        let prompt_rel = r.prompt.as_deref().ok_or_else(|| format!("{at} is missing the required key `prompt`"))?;
         check_rel(label, &format!("roles.{rname}.prompt"), prompt_rel)?;
         let prompt = read(prompt_rel)?.trim_end().to_string();
         if prompt.is_empty() {
@@ -291,15 +283,10 @@ fn parse_pack(
             None | Some("explicit") => Termination::Explicit,
             Some("free") => Termination::Free,
             Some(other) => {
-                return Err(format!(
-                    "{at}: `termination` = \"{other}\" is not valid; use \"explicit\" or \"free\""
-                ))
+                return Err(format!("{at}: `termination` = \"{other}\" is not valid; use \"explicit\" or \"free\""))
             }
         };
-        let tools = r
-            .tools
-            .clone()
-            .ok_or_else(|| format!("{at} is missing the required key `tools`"))?;
+        let tools = r.tools.clone().ok_or_else(|| format!("{at} is missing the required key `tools`"))?;
         if tools.is_empty() {
             return Err(format!("{at}: `tools` is empty; a role needs at least one tool"));
         }
@@ -375,12 +362,11 @@ impl Packs {
         if !dir.exists() {
             return Ok(out);
         }
-        let rd = std::fs::read_dir(dir)
-            .map_err(|e| format!("pack directory {}: cannot be read: {e}", dir.display()))?;
+        let rd =
+            std::fs::read_dir(dir).map_err(|e| format!("pack directory {}: cannot be read: {e}", dir.display()))?;
         let mut dirs = Vec::new();
         for entry in rd {
-            let entry = entry
-                .map_err(|e| format!("pack directory {}: cannot be listed: {e}", dir.display()))?;
+            let entry = entry.map_err(|e| format!("pack directory {}: cannot be listed: {e}", dir.display()))?;
             let path = entry.path();
             if path.is_dir() && path.join("pack.toml").is_file() {
                 dirs.push(path);
@@ -414,9 +400,10 @@ impl Packs {
 
     pub fn role(&self, pack: Option<&str>, role: Option<&str>) -> Result<&RoleDef, String> {
         let pname = pack.unwrap_or("core");
-        let p = self.packs.get(pname).ok_or_else(|| {
-            format!("unknown pack \"{pname}\"; packs available: {}", self.names().join(", "))
-        })?;
+        let p = self
+            .packs
+            .get(pname)
+            .ok_or_else(|| format!("unknown pack \"{pname}\"; packs available: {}", self.names().join(", ")))?;
         let rname = role.unwrap_or(&p.default_role);
         p.roles.get(rname).ok_or_else(|| {
             format!(
@@ -455,13 +442,11 @@ pub fn load_pack(dir: &Path) -> Result<Pack, String> {
     let toml_path = dir.join("pack.toml");
     let text = std::fs::read_to_string(&toml_path)
         .map_err(|e| format!("pack {label}: pack.toml cannot be read as UTF-8 text: {e}"))?;
-    let root = std::fs::canonicalize(dir)
-        .map_err(|e| format!("pack {label}: directory cannot be resolved: {e}"))?;
+    let root = std::fs::canonicalize(dir).map_err(|e| format!("pack {label}: directory cannot be resolved: {e}"))?;
     let read = |rel: &str| -> Result<String, String> {
         let path = dir.join(rel);
         // Symlinks must not lead out of the pack directory.
-        let real = std::fs::canonicalize(&path)
-            .map_err(|e| format!("pack {label}: file {rel} cannot be read: {e}"))?;
+        let real = std::fs::canonicalize(&path).map_err(|e| format!("pack {label}: file {rel} cannot be read: {e}"))?;
         if !real.starts_with(&root) {
             return Err(format!("pack {label}: file {rel} resolves outside the pack directory"));
         }
@@ -508,12 +493,7 @@ mod tests {
     }
 
     fn env() -> PromptEnv {
-        PromptEnv {
-            workspace: "/w".into(),
-            platform: "linux".into(),
-            sandbox: "sb".into(),
-            network: "net".into(),
-        }
+        PromptEnv { workspace: "/w".into(), platform: "linux".into(), sandbox: "sb".into(), network: "net".into() }
     }
 
     #[test]
@@ -661,26 +641,25 @@ mod tests {
         assert_eq!(vr.roles["researcher"].verifier.as_deref(), Some("judge"));
         assert!(vr.roles["chat"].read_only);
         // A chat session keeps no ledger, so `note` could only fail.
-        assert!(!vr.roles["chat"].tools.iter().any(|t| t == "note") && vr.roles["chat"].tools.iter().any(|t| t == "pin"));
+        assert!(
+            !vr.roles["chat"].tools.iter().any(|t| t == "note") && vr.roles["chat"].tools.iter().any(|t| t == "pin")
+        );
         assert!(vr.roles["scout"].may_spawn.is_empty());
         for pack in ["core", "vr"] {
             let pack = p.get(pack).unwrap();
             for r in pack.roles.values().filter(|r| r.verify_finish) {
                 let v = &pack.roles[r.verifier.as_deref().unwrap()];
-                assert!(v.read_only && v.tools.iter().any(|t| t == "verdict") && v.tools.iter().any(|t| t == "out_read"));
+                assert!(
+                    v.read_only && v.tools.iter().any(|t| t == "verdict") && v.tools.iter().any(|t| t == "out_read")
+                );
             }
         }
     }
 
     /// The backticked words of `text` that name a tool in `known`.
     fn tools_named(text: &str, known: &[String]) -> Vec<String> {
-        let mut out: Vec<String> = text
-            .split('`')
-            .skip(1)
-            .step_by(2)
-            .filter(|w| known.iter().any(|k| k == w))
-            .map(str::to_string)
-            .collect();
+        let mut out: Vec<String> =
+            text.split('`').skip(1).step_by(2).filter(|w| known.iter().any(|k| k == w)).map(str::to_string).collect();
         out.sort();
         out.dedup();
         out
@@ -707,7 +686,11 @@ mod tests {
         for pack in ["core", "vr"] {
             for role in p.get(pack).unwrap().roles.values() {
                 for tool in tools_named(&role.prompt, &known) {
-                    assert!(role.tools.contains(&tool), "{pack}/{}: its prompt names `{tool}`, which it does not have", role.name);
+                    assert!(
+                        role.tools.contains(&tool),
+                        "{pack}/{}: its prompt names `{tool}`, which it does not have",
+                        role.name
+                    );
                 }
                 assert!(role.tools.iter().all(|t| known.contains(t)), "{pack}/{}", role.name);
             }
@@ -718,7 +701,11 @@ mod tests {
         let chat = &p.get("vr").unwrap().roles["chat"].prompt;
         assert!(chat.contains("`request_scope`") && !chat.contains("`conclude`"));
         let vr = &p.get("vr").unwrap().preamble;
-        assert!(vr.contains("`request_scope`") && vr.contains("`conclude`") && vr.contains("Only the operator grants scope"));
+        assert!(
+            vr.contains("`request_scope`")
+                && vr.contains("`conclude`")
+                && vr.contains("Only the operator grants scope")
+        );
     }
 
     #[cfg(unix)]
@@ -746,8 +733,7 @@ mod tests {
     #[test]
     fn check_tools_names_nearest() {
         let p = Packs::builtin().unwrap();
-        let mut known: Vec<String> =
-            p.get("core").unwrap().roles.values().flat_map(|r| r.tools.clone()).collect();
+        let mut known: Vec<String> = p.get("core").unwrap().roles.values().flat_map(|r| r.tools.clone()).collect();
         assert!(p.check_tools(&known).is_ok());
         known.retain(|t| t != "grep");
         known.push("grap".into());

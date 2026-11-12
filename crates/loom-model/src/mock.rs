@@ -156,15 +156,29 @@ impl Reply {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Reply(Reply),
-    Status { status: u16, body: String, retry_after_s: Option<u64> },
-    DropAfter { reply: Reply, chunks: usize },
-    Stall { ms: u64 },
+    Status {
+        status: u16,
+        body: String,
+        retry_after_s: Option<u64>,
+    },
+    DropAfter {
+        reply: Reply,
+        chunks: usize,
+    },
+    Stall {
+        ms: u64,
+    },
     /// As `DropAfter`, but the stream ends cleanly (a terminating chunk, no `[DONE]`, no
     /// `finish_reason` unless it is among the kept chunks).
-    Eof { reply: Reply, chunks: usize },
+    Eof {
+        reply: Reply,
+        chunks: usize,
+    },
     /// A first chunk, then an error object as a data event (vLLM's shape for a failure mid-stream),
     /// then a clean end.
-    StreamError { message: String },
+    StreamError {
+        message: String,
+    },
 }
 
 impl From<Reply> for Action {
@@ -232,10 +246,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 fn launch(listener: TcpListener, shared: &Arc<Shared>) -> Running {
     let token = CancellationToken::new();
     let app = App { shared: Arc::clone(shared), token: token.clone() };
-    let router = Router::new()
-        .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat))
-        .with_state(app);
+    let router =
+        Router::new().route("/v1/models", get(models)).route("/v1/chat/completions", post(chat)).with_state(app);
     let stop = token.clone();
     let task = tokio::spawn(async move {
         let _ = axum::serve(listener, router).with_graceful_shutdown(async move { stop.cancelled().await }).await;
@@ -685,8 +697,7 @@ mod tests {
         let (body, clean) = read_all(post_chat(&s, msgs(&["hi"])).await).await;
         assert!(clean);
         let chunks = parsed(&body);
-        let reasoning: String =
-            chunks.iter().filter_map(|c| c["choices"][0]["delta"]["reasoning"].as_str()).collect();
+        let reasoning: String = chunks.iter().filter_map(|c| c["choices"][0]["delta"]["reasoning"].as_str()).collect();
         assert_eq!(reasoning, "We need a note and a read.");
         let mut args = [String::new(), String::new()];
         let mut names = Vec::new();
@@ -903,7 +914,8 @@ mod tests {
         let u2 = usage_of(&s, r2).await;
         assert_eq!(u2["prompt_tokens_details"]["cached_tokens"], u1["prompt_tokens"]);
         assert!(
-            u2["prompt_tokens"].as_u64().expect("p") > u2["prompt_tokens_details"]["cached_tokens"].as_u64().expect("c")
+            u2["prompt_tokens"].as_u64().expect("p")
+                > u2["prompt_tokens_details"]["cached_tokens"].as_u64().expect("c")
         );
 
         // Editing the second message keeps only the first.
@@ -919,8 +931,9 @@ mod tests {
     #[tokio::test]
     async fn tools_count_towards_prompt_and_explicit_usage_wins() {
         let fixed = Usage { prompt_tokens: 111, cached_tokens: 22, completion_tokens: 33, reasoning_tokens: 4 };
-        let s = server(vec![Reply::text("x").into(), Reply::text("x").into(), Reply::text("x").with_usage(fixed).into()])
-            .await;
+        let s =
+            server(vec![Reply::text("x").into(), Reply::text("x").into(), Reply::text("x").with_usage(fixed).into()])
+                .await;
         let plain = msgs(&["hello"]);
         let mut with_tools = msgs(&["other"]);
         with_tools["tools"] = json!([{"type": "function", "function": {"name": "note", "parameters": {}}}]);
@@ -982,7 +995,10 @@ mod tests {
         s.set_model("bare", None);
         assert_eq!(get_json().await["data"][0], json!({"id": "bare", "object": "model"}));
         s.also_serve("second");
-        assert_eq!(get_json().await["data"], json!([{"id": "bare", "object": "model"}, {"id": "second", "object": "model"}]));
+        assert_eq!(
+            get_json().await["data"],
+            json!([{"id": "bare", "object": "model"}, {"id": "second", "object": "model"}])
+        );
     }
 
     #[tokio::test]

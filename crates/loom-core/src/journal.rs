@@ -85,7 +85,11 @@ const EVIDENCE_SESSION_KEY: &str = "evidence_session";
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
     #[error("journal i/o on {path}: {source}")]
-    Io { path: PathBuf, #[source] source: std::io::Error },
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     /// The journal on disk does not verify. Ledger writes stay refused until the operator looks at it.
     #[error("the mission journal failed verification at entry {n}: {detail}")]
     Tampered { n: u64, detail: String },
@@ -101,7 +105,13 @@ pub enum JournalError {
     /// An append failed after its bytes were written and they could not be removed again, so entry
     /// `n` may or may not be in the journal. Read the journal before repeating the op.
     #[error("journal i/o on {path}: {source}; removing the unconfirmed entry {n} failed as well ({undo}), so it may still be in the journal")]
-    Unconfirmed { path: PathBuf, n: u64, #[source] source: std::io::Error, undo: std::io::Error },
+    Unconfirmed {
+        path: PathBuf,
+        n: u64,
+        #[source]
+        source: std::io::Error,
+        undo: std::io::Error,
+    },
 }
 
 /// What a verified read found.
@@ -276,7 +286,12 @@ impl Journal {
     }
 
     fn head_mac(&self, n: u64, mac: &str) -> std::io::Result<HmacSha256> {
-        let dir = self.path.parent().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let dir = self
+            .path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let mut m = new_mac(&self.key)?;
         m.update(HEAD_LABEL);
         m.update(dir.as_bytes());
@@ -290,7 +305,15 @@ impl Journal {
     /// Check the journal against the bytes of its head record; returns the `n` the head vouches for.
     fn check_head(&self, loaded: &Loaded, text: &[u8]) -> Result<u64, JournalError> {
         let head_path = self.head_path();
-        let bad = |why: &str| tampered(0, format!("the head record {} {why}; the journal's length can no longer be vouched for", head_path.display()));
+        let bad = |why: &str| {
+            tampered(
+                0,
+                format!(
+                    "the head record {} {why}; the journal's length can no longer be vouched for",
+                    head_path.display()
+                ),
+            )
+        };
         let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(text) else {
             return Err(bad("is not a JSON object"));
         };
@@ -303,7 +326,9 @@ impl Journal {
         };
         let m = self.head_mac(n, mac).map_err(|e| tampered(0, format!("unusable key: {e}")))?;
         if m.verify_slice(&seal).is_err() {
-            return Err(bad("does not verify (it was altered, copied from another mission, or sealed with a different key)"));
+            return Err(bad(
+                "does not verify (it was altered, copied from another mission, or sealed with a different key)",
+            ));
         }
         let idx = usize::try_from(n).ok().and_then(|n| n.checked_sub(1));
         let found = idx.and_then(|i| loaded.macs.get(i));
@@ -365,9 +390,8 @@ impl Journal {
         lock_options.create(true).truncate(false).write(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut lock_options, 0o600);
-        let lock = lock_options
-            .open(&lock_path)
-            .map_err(|source| JournalError::Io { path: lock_path.clone(), source })?;
+        let lock =
+            lock_options.open(&lock_path).map_err(|source| JournalError::Io { path: lock_path.clone(), source })?;
         fs2::FileExt::lock_exclusive(&lock).map_err(|source| JournalError::Io { path: lock_path.clone(), source })?;
         // The lock is released when `lock` is dropped, on every return path.
 
@@ -455,7 +479,11 @@ fn encode_body(entry: &Entry) -> Result<Vec<u8>, serde_json::Error> {
     map.insert("from_user".into(), Value::from(entry.from_user));
     if let Value::Object(op) = serde_json::to_value(&entry.op)? {
         for (k, v) in op {
-            let k = if k == "session" && matches!(entry.op, LedgerOp::EvidenceAdd(_)) { EVIDENCE_SESSION_KEY.to_string() } else { k };
+            let k = if k == "session" && matches!(entry.op, LedgerOp::EvidenceAdd(_)) {
+                EVIDENCE_SESSION_KEY.to_string()
+            } else {
+                k
+            };
             map.insert(k, v);
         }
     }
@@ -466,7 +494,9 @@ fn encode_body(entry: &Entry) -> Result<Vec<u8>, serde_json::Error> {
 /// `Err` as the entry means the line is well formed but this build cannot parse its op; the text
 /// names the op and gives the parse error.
 fn decode_line(line: &[u8], mac: &str) -> Result<(u64, Result<Entry, String>), String> {
-    let Value::Object(mut map) = serde_json::from_slice::<Value>(line).map_err(|e| format!("line is not valid JSON: {e}"))? else {
+    let Value::Object(mut map) =
+        serde_json::from_slice::<Value>(line).map_err(|e| format!("line is not valid JSON: {e}"))?
+    else {
         return Err("line is not a JSON object".to_string());
     };
     map.remove("mac");
@@ -523,7 +553,10 @@ fn verify_all(key: &[u8], bytes: &[u8]) -> Result<Loaded, JournalError> {
         if !tail_ok {
             return Err(tampered(n, "the line does not end in a seal"));
         }
-        let mac_str = line.get(len - 66..len - 2).and_then(|b| std::str::from_utf8(b).ok()).ok_or_else(|| tampered(n, "the seal is not text"))?;
+        let mac_str = line
+            .get(len - 66..len - 2)
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .ok_or_else(|| tampered(n, "the seal is not text"))?;
         let mac_bytes = hex::decode(mac_str).map_err(|_| tampered(n, "the seal is not hexadecimal"))?;
         let mut body = line.get(..len - MAC_TAIL_LEN).unwrap_or(&[]).to_vec();
         body.push(b'}');
@@ -532,7 +565,10 @@ fn verify_all(key: &[u8], bytes: &[u8]) -> Result<Loaded, JournalError> {
         m.update(prev_mac.as_bytes());
         m.update(&body);
         if m.verify_slice(&mac_bytes).is_err() {
-            return Err(tampered(n, "the seal does not match: the entry was altered, removed, reordered, or sealed with a different key"));
+            return Err(tampered(
+                n,
+                "the seal does not match: the entry was altered, removed, reordered, or sealed with a different key",
+            ));
         }
         let mac_lower = mac_str.to_ascii_lowercase();
         let (entry_n, entry) = decode_line(line, &mac_lower).map_err(|d| tampered(n, d))?;
@@ -693,10 +729,13 @@ mod tests {
         assert!(j.read().unwrap_or_default().is_empty());
         assert_eq!(j.state().unwrap_or_default(), LedgerState::default());
         let user = SessionId::from("s-user");
-        let (e1, s1) = j.append(&user, true, LedgerOp::GoalSet { text: "ship it".into() }, &ok).unwrap_or_else(|e| panic!("{e}"));
+        let (e1, s1) =
+            j.append(&user, true, LedgerOp::GoalSet { text: "ship it".into() }, &ok).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((e1.n, e1.from_user, e1.session.as_str()), (1, true, "s-user"));
         assert_eq!(s1.goal.as_deref(), Some("ship it"));
-        let (e2, s2) = j.append(&sid(), false, LedgerOp::PlanSet { steps: vec!["a".into(), "b".into()] }, &ok).unwrap_or_else(|e| panic!("{e}"));
+        let (e2, s2) = j
+            .append(&sid(), false, LedgerOp::PlanSet { steps: vec!["a".into(), "b".into()] }, &ok)
+            .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(s2.plan.len(), 2);
         assert_eq!(s2.entries, 2);
         let read = j.read().unwrap_or_default();
@@ -757,7 +796,10 @@ mod tests {
         assert!(matches!(j.state(), Err(JournalError::Tampered { n: 2, .. })));
         // Writes are refused and leave the file as it is.
         let before = std::fs::read(j.path()).unwrap_or_default();
-        assert!(matches!(j.append(&sid(), false, LedgerOp::PlanAdd { text: "x".into() }, &ok), Err(JournalError::Tampered { .. })));
+        assert!(matches!(
+            j.append(&sid(), false, LedgerOp::PlanAdd { text: "x".into() }, &ok),
+            Err(JournalError::Tampered { .. })
+        ));
         assert_eq!(std::fs::read(j.path()).unwrap_or_default(), before);
     }
 
@@ -819,7 +861,10 @@ mod tests {
         std::fs::write(j.path(), &bytes[..bytes.len() - 1]).unwrap_or_default();
         assert_eq!(tampered_at(j.read()), 3);
         let before = std::fs::read(j.path()).unwrap_or_default();
-        assert!(matches!(j.append(&sid(), false, LedgerOp::PlanAdd { text: "x".into() }, &ok), Err(JournalError::Tampered { .. })));
+        assert!(matches!(
+            j.append(&sid(), false, LedgerOp::PlanAdd { text: "x".into() }, &ok),
+            Err(JournalError::Tampered { .. })
+        ));
         assert_eq!(std::fs::read(j.path()).unwrap_or_default(), before);
     }
 
@@ -840,7 +885,8 @@ mod tests {
     /// Two lines in the original format for key `[7; 32]`, sealed outside this module (HMAC-SHA256
     /// over the previous mac's 64 hex characters, zeros for the first line, followed by the body).
     /// A change to what the per-entry MAC covers or to the line layout no longer verifies them.
-    const GOLDEN_BODY_1: &str = r#"{"n":1,"ts_ms":10,"session":"s-lead","from_user":false,"op":"plan_add","text":"old a"}"#;
+    const GOLDEN_BODY_1: &str =
+        r#"{"n":1,"ts_ms":10,"session":"s-lead","from_user":false,"op":"plan_add","text":"old a"}"#;
     const GOLDEN_MAC_1: &str = "5cd8f498637502216122bfe874639bc769fe8ee0ba200be9f4972e4d4e23d07d";
     const GOLDEN_MAC_2: &str = "0744ce1bb0aebc84383e157b6df9988f482a605174353033d28f6656340ce120";
     const GOLDEN: &str = concat!(
@@ -965,7 +1011,10 @@ mod tests {
         // The head now vouches for entry 3: going back to the two entries is detected.
         std::fs::write(j.path(), &complete).unwrap_or_default();
         let r = j.read();
-        assert!(matches!(&r, Err(JournalError::Tampered { detail, .. }) if detail.contains("truncated or replaced")), "{r:?}");
+        assert!(
+            matches!(&r, Err(JournalError::Tampered { detail, .. }) if detail.contains("truncated or replaced")),
+            "{r:?}"
+        );
     }
 
     #[test]
@@ -979,7 +1028,10 @@ mod tests {
         for keep in [3usize, 1] {
             write_lines(&j, &orig[..keep]);
             let r = j.read();
-            assert!(matches!(&r, Err(JournalError::Tampered { detail, .. }) if detail.contains("truncated or replaced")), "{keep}: {r:?}");
+            assert!(
+                matches!(&r, Err(JournalError::Tampered { detail, .. }) if detail.contains("truncated or replaced")),
+                "{keep}: {r:?}"
+            );
             assert!(matches!(plus_op(&j), Err(JournalError::Tampered { .. })));
         }
         // Deleting the journal while the head remains: the mission still counts as having a ledger.
@@ -1064,9 +1116,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let j = journal(&dir);
         let key = vec![7u8; 32];
-        let (l1, m1) = forge(&key, ZERO_MAC, r#"{"n":1,"ts_ms":10,"session":"s-lead","from_user":false,"op":"plan_add","text":"a"}"#);
-        let (l2, m2) = forge(&key, &m1, r#"{"n":2,"ts_ms":11,"session":"s-lead","from_user":false,"op":"hologram_set","depth":3}"#);
-        let (l3, _) = forge(&key, &m2, r#"{"n":3,"ts_ms":12,"session":"s-lead","from_user":false,"op":"plan_add","text":"c"}"#);
+        let (l1, m1) = forge(
+            &key,
+            ZERO_MAC,
+            r#"{"n":1,"ts_ms":10,"session":"s-lead","from_user":false,"op":"plan_add","text":"a"}"#,
+        );
+        let (l2, m2) = forge(
+            &key,
+            &m1,
+            r#"{"n":2,"ts_ms":11,"session":"s-lead","from_user":false,"op":"hologram_set","depth":3}"#,
+        );
+        let (l3, _) =
+            forge(&key, &m2, r#"{"n":3,"ts_ms":12,"session":"s-lead","from_user":false,"op":"plan_add","text":"c"}"#);
         std::fs::create_dir_all(j.path().parent().unwrap_or(dir.path())).unwrap_or_default();
         write_lines(&j, &[l1, l2, l3]);
         let r = j.read_report().unwrap_or_else(|e| panic!("{e}"));
@@ -1077,7 +1138,10 @@ mod tests {
         match plus_op(&j) {
             Err(e @ JournalError::NewerVersion { n: 2, .. }) => {
                 let text = e.to_string();
-                assert!(text.contains("newer loom") && text.contains("entry 2") && text.contains("`hologram_set`"), "{text}");
+                assert!(
+                    text.contains("newer loom") && text.contains("entry 2") && text.contains("`hologram_set`"),
+                    "{text}"
+                );
             }
             other => panic!("expected NewerVersion at entry 2, got {other:?}"),
         }
@@ -1090,7 +1154,11 @@ mod tests {
         let j = journal(&dir);
         let key = vec![7u8; 32];
         // `plan_add` without its `text`: the op name is known, the fields are not what this build reads.
-        let (l1, _) = forge(&key, ZERO_MAC, r#"{"n":1,"ts_ms":10,"session":"s-lead","from_user":false,"op":"plan_add","words":"a"}"#);
+        let (l1, _) = forge(
+            &key,
+            ZERO_MAC,
+            r#"{"n":1,"ts_ms":10,"session":"s-lead","from_user":false,"op":"plan_add","words":"a"}"#,
+        );
         std::fs::create_dir_all(j.path().parent().unwrap_or(dir.path())).unwrap_or_default();
         write_lines(&j, &[l1]);
         let r = j.read_report().unwrap_or_else(|e| panic!("{e}"));
@@ -1113,7 +1181,9 @@ mod tests {
         fill(&j, 2);
         let mission = j.path().parent().unwrap_or(dir.path()).to_path_buf();
         let lock = j.lock_path();
-        let set = |p: &Path, mode: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap_or_default();
+        let set = |p: &Path, mode: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap_or_default()
+        };
 
         // The lock file is there but cannot be opened for writing: it is held through a read-only descriptor.
         set(&lock, 0o444);
@@ -1158,7 +1228,10 @@ mod tests {
         fill(&j, 2);
         let other = Journal::new(j.path(), vec![8u8; 32]);
         assert_eq!(tampered_at(other.read()), 1);
-        assert!(matches!(other.append(&sid(), false, LedgerOp::PlanAdd { text: "x".into() }, &ok), Err(JournalError::Tampered { n: 1, .. })));
+        assert!(matches!(
+            other.append(&sid(), false, LedgerOp::PlanAdd { text: "x".into() }, &ok),
+            Err(JournalError::Tampered { n: 1, .. })
+        ));
         assert_eq!(j.read().unwrap_or_default().len(), 2);
     }
 
@@ -1172,7 +1245,12 @@ mod tests {
             Err(JournalError::Rule(m)) => assert!(m.contains("cannot be written by a tool call"), "{m}"),
             other => panic!("expected Rule, got {other:?}"),
         }
-        match j.append(&sid(), false, LedgerOp::PlanUpdate { id: "p9".into(), status: StepStatus::Doing, note: String::new(), evidence: vec![] }, &ok) {
+        match j.append(
+            &sid(),
+            false,
+            LedgerOp::PlanUpdate { id: "p9".into(), status: StepStatus::Doing, note: String::new(), evidence: vec![] },
+            &ok,
+        ) {
             Err(JournalError::Rule(m)) => assert!(m.contains("p1"), "{m}"),
             other => panic!("expected Rule, got {other:?}"),
         }
@@ -1211,7 +1289,12 @@ mod tests {
                 let j = Journal::new(path.clone(), vec![3u8; 32]);
                 std::thread::spawn(move || {
                     for i in 0..50 {
-                        let r = j.append(&SessionId::from(format!("s-{t}")), false, LedgerOp::PlanAdd { text: format!("t{t} i{i}") }, &ok);
+                        let r = j.append(
+                            &SessionId::from(format!("s-{t}")),
+                            false,
+                            LedgerOp::PlanAdd { text: format!("t{t} i{i}") },
+                            &ok,
+                        );
                         assert!(r.is_ok(), "{r:?}");
                     }
                 })

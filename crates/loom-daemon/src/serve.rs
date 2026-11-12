@@ -109,11 +109,7 @@ pub async fn run(paths: Paths) -> Result<(), String> {
 }
 
 /// `run`, also stopping when `stop` is cancelled; `ready` is called with the bound address.
-pub async fn run_until(
-    paths: Paths,
-    stop: CancellationToken,
-    ready: impl FnOnce(&str) + Send,
-) -> Result<(), String> {
+pub async fn run_until(paths: Paths, stop: CancellationToken, ready: impl FnOnce(&str) + Send) -> Result<(), String> {
     raise_open_files_limit();
     init_logging();
 
@@ -207,7 +203,9 @@ pub async fn run_until(
 /// Create the home and its top-level directories as private (0700), tightening ones left looser by an earlier
 /// version or by an operator who created them first.
 pub fn prepare_home(paths: &Paths) -> Result<(), String> {
-    paths.ensure_private_layout().map_err(|e| format!("Cannot prepare {} as a private directory: {e}.", paths.home.display()))
+    paths
+        .ensure_private_layout()
+        .map_err(|e| format!("Cannot prepare {} as a private directory: {e}.", paths.home.display()))
 }
 
 /// The daemon's log, `{logs}/loomd.log`, opened for appending and created 0600 when it is missing. Returns its path
@@ -237,13 +235,7 @@ pub async fn spawn_background(paths: &Paths) -> Result<Spawned, String> {
     command.arg("daemon").env("LOOM_HOME", &paths.home).stdin(Stdio::null()).stdout(out).stderr(err);
     // SAFETY: the closure only calls `setsid`, which is async-signal-safe.
     unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
+        command.pre_exec(|| if libc::setsid() < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
     }
     let mut child = command.spawn().map_err(|e| format!("Cannot start {}: {e}.", exe.display()))?;
 
@@ -301,7 +293,11 @@ pub fn launch_agent_plist(exe: &Path, home: &Path) -> String {
         string("/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin")
     ));
     out.push_str(&format!("  {}\n  <true/>\n", key("RunAtLoad")));
-    out.push_str(&format!("  {}\n  <dict>\n    {}\n    <false/>\n  </dict>\n", key("KeepAlive"), key("SuccessfulExit")));
+    out.push_str(&format!(
+        "  {}\n  <dict>\n    {}\n    <false/>\n  </dict>\n",
+        key("KeepAlive"),
+        key("SuccessfulExit")
+    ));
     out.push_str(&format!("  {}\n  {}\n", key("ProcessType"), string("Background")));
     out.push_str(&format!(
         "  {}\n  <dict>\n    {}\n    <integer>{NOFILE_TARGET}</integer>\n  </dict>\n",
@@ -487,7 +483,9 @@ pub(crate) fn take_home_lock(paths: &Paths) -> Result<std::fs::File, String> {
     }
     // A daemon.json left by a crashed daemon names a process that is gone; only a live pid is reported.
     Err(match read_daemon_file(paths).filter(|f| pid_alive(f.pid)) {
-        Some(f) => format!("A loom daemon is already running for {} (pid {}, {}).", paths.home.display(), f.pid, f.bind),
+        Some(f) => {
+            format!("A loom daemon is already running for {} (pid {}, {}).", paths.home.display(), f.pid, f.bind)
+        }
         None => format!(
             "A loom daemon is already running for {} (it is starting; its address is not written yet).",
             paths.home.display()
@@ -527,16 +525,16 @@ pub(crate) async fn wait_home_lock_free(paths: &Paths, within: Duration) -> bool
 /// answer names the first address the name resolved to.
 fn pick_loopback(bind: &str, addrs: &[SocketAddr]) -> Result<SocketAddr, String> {
     let loopback = |a: &&SocketAddr| a.ip().is_loopback();
-    addrs.iter().filter(loopback).find(|a| a.is_ipv4()).or_else(|| addrs.iter().find(loopback)).copied().ok_or_else(|| {
-        match addrs.first() {
+    addrs.iter().filter(loopback).find(|a| a.is_ipv4()).or_else(|| addrs.iter().find(loopback)).copied().ok_or_else(
+        || match addrs.first() {
             Some(a) => format!(
                 "Cannot listen on {bind}: it resolves to {}, which is not a loopback address. Set [daemon] bind to \
                  127.0.0.1:<port> (or [::1]:<port>); the API must not be reachable from other machines.",
                 a.ip()
             ),
             None => format!("Cannot listen on {bind}: the address does not resolve."),
-        }
-    })
+        },
+    )
 }
 
 /// Bind with `SO_REUSEADDR`, preferring an IPv4 address when the name has several. Only loopback addresses are
@@ -615,7 +613,14 @@ mod tests {
             std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         prepare_home(&paths).unwrap();
-        for d in [paths.home.clone(), paths.keys_dir(), paths.sessions_dir(), paths.missions_dir(), paths.blobs_dir(), paths.logs_dir()] {
+        for d in [
+            paths.home.clone(),
+            paths.keys_dir(),
+            paths.sessions_dir(),
+            paths.missions_dir(),
+            paths.blobs_dir(),
+            paths.logs_dir(),
+        ] {
             let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{}", d.display());
         }
@@ -647,7 +652,8 @@ mod tests {
         let port: u16 = bind.rsplit_once(':').unwrap().1.parse().unwrap();
         assert_ne!(port, 0);
 
-        let file: DaemonFile = serde_json::from_str(&std::fs::read_to_string(h.paths.home.join("daemon.json")).unwrap()).unwrap();
+        let file: DaemonFile =
+            serde_json::from_str(&std::fs::read_to_string(h.paths.home.join("daemon.json")).unwrap()).unwrap();
         assert_eq!(file.bind, bind);
         assert_eq!(file.pid, std::process::id());
         let mode = std::fs::metadata(h.paths.token_file()).unwrap().permissions().mode() & 0o777;
@@ -857,7 +863,10 @@ mod tests {
         let err = pick_loopback("evil.example:1", &[a("10.1.2.3:1"), a("127.0.0.1:1")]).unwrap();
         assert_eq!(err, a("127.0.0.1:1"));
         let err = pick_loopback("evil.example:1", &[a("10.1.2.3:1")]).unwrap_err();
-        assert!(err.contains("evil.example:1") && err.contains("10.1.2.3") && err.contains("not a loopback address"), "{err}");
+        assert!(
+            err.contains("evil.example:1") && err.contains("10.1.2.3") && err.contains("not a loopback address"),
+            "{err}"
+        );
         assert!(pick_loopback("x:1", &[]).unwrap_err().contains("does not resolve"));
     }
 

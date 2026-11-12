@@ -50,7 +50,14 @@ pub struct Message {
 
 impl Message {
     pub fn new(role: Role, content: impl Into<String>) -> Self {
-        Self { role, content: content.into(), tool_calls: Vec::new(), tool_call_id: None, reasoning: None, origin: Vec::new() }
+        Self {
+            role,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            reasoning: None,
+            origin: Vec::new(),
+        }
     }
 
     pub fn system(content: impl Into<String>) -> Self {
@@ -109,7 +116,11 @@ mod tests {
     #[test]
     fn openai_shape() {
         let mut m = Message::assistant("thinking aloud");
-        m.tool_calls.push(ToolCallMsg { id: "c1".into(), name: "bash".into(), arguments: "{\"command\":\"ls\"}".into() });
+        m.tool_calls.push(ToolCallMsg {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: "{\"command\":\"ls\"}".into(),
+        });
         let v = m.to_openai();
         assert_eq!(v["role"], "assistant");
         assert_eq!(v["tool_calls"][0]["function"]["name"], "bash");

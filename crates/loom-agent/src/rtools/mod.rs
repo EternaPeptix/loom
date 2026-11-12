@@ -33,9 +33,7 @@ pub(crate) mod testkit;
 use crate::pack::RoleDef;
 use async_trait::async_trait;
 use loom_core::config::AgentsCfg;
-use loom_core::event::{
-    Author, Brief, Budget, ChildOutcome, Event, SpawnMode, ToolClass, TurnEndReason, Usage,
-};
+use loom_core::event::{Author, Brief, Budget, ChildOutcome, Event, SpawnMode, ToolClass, TurnEndReason, Usage};
 use loom_core::journal::{Journal, JournalError};
 use loom_core::ledger::{Entry, LedgerOp, LedgerState};
 use loom_core::{BlobId, BlobRef, CallId, MissionId, SessionId};
@@ -149,7 +147,12 @@ pub trait Orchestrator: Send + Sync {
     /// `cancel` fires first (the child keeps running until it is stopped), when the child is not a
     /// child of `parent`, or when it was not spawned as `awaited`. Works whether the child settles
     /// before or after this call.
-    async fn join(&self, parent: &SessionId, child: &SessionId, cancel: &CancellationToken) -> Result<Settlement, String>;
+    async fn join(
+        &self,
+        parent: &SessionId,
+        child: &SessionId,
+        cancel: &CancellationToken,
+    ) -> Result<Settlement, String>;
     /// Stop one child (it settles as `stopped`).
     async fn stop_child(&self, parent: &SessionId, child: &SessionId) -> Result<(), String>;
     /// Stop every running child of `parent`.
@@ -252,7 +255,8 @@ impl Shared {
     pub fn ledger_append(&self, from_user: bool, op: LedgerOp) -> Result<(Entry, LedgerState), String> {
         let journal = self.journal.as_ref().ok_or_else(|| NO_MISSION.to_string())?;
         let summary = LedgerState::summarize(&op);
-        let (entry, state) = journal.append(&self.session, from_user, op, &|_| Ok(())).map_err(|e| journal_sentence(&e))?;
+        let (entry, state) =
+            journal.append(&self.session, from_user, op, &|_| Ok(())).map_err(|e| journal_sentence(&e))?;
         let author = if from_user { Author::User } else { Author::Model };
         self.emit(author, Event::Ledger { n: entry.n, summary });
         Ok((entry, state))
@@ -361,9 +365,28 @@ pub fn known_tools() -> Vec<String> {
 
 /// The names [`tool`] knows.
 pub const NAMES: &[&str] = &[
-    "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "finish", "verdict",
-    "ask_user", "report_blocker", "wait", "conclude", "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "decide",
-    "verify", "request_scope",
+    "plan",
+    "step",
+    "note",
+    "claim",
+    "claim_update",
+    "evidence",
+    "ledger",
+    "pin",
+    "log_search",
+    "finish",
+    "verdict",
+    "ask_user",
+    "report_blocker",
+    "wait",
+    "conclude",
+    "agent_spawn",
+    "agent_fanout",
+    "agent_message",
+    "agent_stop",
+    "decide",
+    "verify",
+    "request_scope",
 ];
 
 #[cfg(test)]

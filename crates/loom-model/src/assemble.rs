@@ -67,18 +67,35 @@ use std::collections::{BTreeMap, HashSet};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamEvent {
     /// An attempt is starting. Everything emitted for an earlier attempt of this request is void.
-    AttemptStart { attempt: u32 },
+    AttemptStart {
+        attempt: u32,
+    },
     Text(String),
     Reasoning(String),
-    ToolCallStart { index: u32, name: String },
-    ToolCallArgs { index: u32, delta: String },
+    ToolCallStart {
+        index: u32,
+        name: String,
+    },
+    ToolCallArgs {
+        index: u32,
+        delta: String,
+    },
     /// The call at `index` is complete as far as this attempt goes: a later call has begun. `id` (the
     /// server's, as received so far), `name` and `arguments` are everything received for it. The final
     /// completion holds the call only if nothing more arrives for it; whoever acts on this event
     /// compares the two.
-    ToolCallReady { index: u32, id: Option<String>, name: String, arguments: String },
+    ToolCallReady {
+        index: u32,
+        id: Option<String>,
+        name: String,
+        arguments: String,
+    },
     /// The attempt failed and another will follow after `after_ms`.
-    Retrying { attempt: u32, after_ms: u64, reason: String },
+    Retrying {
+        attempt: u32,
+        after_ms: u64,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -114,10 +131,7 @@ pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_COMPLETION_BYTES: usize = 64 * 1024 * 1024;
 
 fn oversize(what: &str, limit: usize) -> AssembleError {
-    AssembleError::Oversize(format!(
-        "{what} exceeds the limit of {} MiB",
-        limit / (1024 * 1024)
-    ))
+    AssembleError::Oversize(format!("{what} exceeds the limit of {} MiB", limit / (1024 * 1024)))
 }
 
 #[derive(Debug, Default)]
@@ -374,8 +388,11 @@ impl Assembler {
                 },
             };
             used.insert(id.clone());
-            let arguments =
-                if acc.arguments.trim().is_empty() && recorded != FinishReason::Length { "{}".to_string() } else { acc.arguments };
+            let arguments = if acc.arguments.trim().is_empty() && recorded != FinishReason::Length {
+                "{}".to_string()
+            } else {
+                acc.arguments
+            };
             let complete = matches!(serde_json::from_str::<Value>(&arguments), Ok(Value::Object(_)));
             tool_calls.push(ToolCallRequest { call_id: CallId(id), name: acc.name, arguments, complete });
         }
@@ -558,7 +575,12 @@ mod tests {
                 Ok(out) => assert!(out.is_empty()),
                 Err(e) => break e,
             }
-            assert!(p.data.len() <= MAX_EVENT_BYTES && p.buf.len() <= chunk.len(), "held {} + {}", p.data.len(), p.buf.len());
+            assert!(
+                p.data.len() <= MAX_EVENT_BYTES && p.buf.len() <= chunk.len(),
+                "held {} + {}",
+                p.data.len(),
+                p.buf.len()
+            );
             assert!(fed <= MAX_EVENT_BYTES + chunk.len(), "no error after {fed} bytes");
         };
         assert!(matches!(&err, AssembleError::Oversize(m) if m.contains("an event") && m.contains("16 MiB")), "{err}");
@@ -625,8 +647,15 @@ mod tests {
                 assert!(accepted <= 64, "{what}: no error after {accepted} MiB");
             };
             assert!((63..=64).contains(&accepted), "{what}: {accepted}");
-            assert!(matches!(&err, AssembleError::Oversize(m) if m.contains(what) && m.contains("64 MiB")), "{what}: {err}");
-            assert!(a.text.len() <= MAX_COMPLETION_BYTES && a.reasoning.len() <= MAX_COMPLETION_BYTES && a.call_bytes <= MAX_COMPLETION_BYTES);
+            assert!(
+                matches!(&err, AssembleError::Oversize(m) if m.contains(what) && m.contains("64 MiB")),
+                "{what}: {err}"
+            );
+            assert!(
+                a.text.len() <= MAX_COMPLETION_BYTES
+                    && a.reasoning.len() <= MAX_COMPLETION_BYTES
+                    && a.call_bytes <= MAX_COMPLETION_BYTES
+            );
         }
     }
 
@@ -655,7 +684,10 @@ mod tests {
         assert_eq!(c.reasoning, "We need a note.");
         assert_eq!(c.finish, FinishReason::ToolCalls);
         assert_eq!(c.attempts, 1);
-        assert_eq!(c.usage, Usage { prompt_tokens: 306, cached_tokens: 0, completion_tokens: 79, reasoning_tokens: 41 });
+        assert_eq!(
+            c.usage,
+            Usage { prompt_tokens: 306, cached_tokens: 0, completion_tokens: 79, reasoning_tokens: 41 }
+        );
         assert_eq!(c.tool_calls.len(), 1);
         let t = &c.tool_calls[0];
         assert_eq!(t.call_id.as_str(), "chatcmpl-tool-83");
@@ -814,13 +846,17 @@ mod tests {
     #[test]
     fn empty_arguments_become_an_empty_object() {
         for args in ["", "  \n"] {
-            let body = format!(r#"[{{"index":0,"id":"A","function":{{"name":"t","arguments":{}}}}}]"#, Value::String(args.into()));
+            let body = format!(
+                r#"[{{"index":0,"id":"A","function":{{"name":"t","arguments":{}}}}}]"#,
+                Value::String(args.into())
+            );
             let c = run(&[&tc_chunk(&body), &chunk("{}", r#""tool_calls""#)]).unwrap();
             assert_eq!(c.tool_calls[0].arguments, "{}");
             assert!(c.tool_calls[0].complete);
         }
         // No arguments member at all.
-        let c = run(&[&tc_chunk(r#"[{"index":0,"id":"A","function":{"name":"t"}}]"#), &chunk("{}", r#""tool_calls""#)]).unwrap();
+        let c = run(&[&tc_chunk(r#"[{"index":0,"id":"A","function":{"name":"t"}}]"#), &chunk("{}", r#""tool_calls""#)])
+            .unwrap();
         assert_eq!(c.tool_calls[0].arguments, "{}");
     }
 
@@ -838,7 +874,10 @@ mod tests {
     #[test]
     fn non_object_or_invalid_arguments_are_incomplete() {
         for args in ["[1]", "\"s\"", "12", "{\"a\":", "{\"a\":1} x", "nonsense"] {
-            let body = format!(r#"[{{"index":0,"id":"A","function":{{"name":"t","arguments":{}}}}}]"#, Value::String(args.into()));
+            let body = format!(
+                r#"[{{"index":0,"id":"A","function":{{"name":"t","arguments":{}}}}}]"#,
+                Value::String(args.into())
+            );
             let c = run(&[&tc_chunk(&body), &chunk("{}", r#""tool_calls""#)]).unwrap();
             assert!(!c.tool_calls[0].complete, "{args}");
             assert_eq!(c.tool_calls[0].arguments, args);
@@ -859,7 +898,8 @@ mod tests {
         assert_eq!(c.tool_calls[0].arguments, "{\"path\": \"x\", \"content\": \"abc");
 
         // Empty arguments under `length` are not turned into `{}`.
-        let c = run(&[&tc_chunk(r#"[{"index":0,"id":"A","function":{"name":"t"}}]"#), &chunk("{}", r#""length""#)]).unwrap();
+        let c = run(&[&tc_chunk(r#"[{"index":0,"id":"A","function":{"name":"t"}}]"#), &chunk("{}", r#""length""#)])
+            .unwrap();
         assert_eq!(c.tool_calls[0].arguments, "");
         assert!(!c.tool_calls[0].complete);
     }

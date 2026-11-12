@@ -163,7 +163,11 @@ impl Tool for LogSearch {
         };
         let re = match Regex::new(pattern) {
             Ok(re) => re,
-            Err(e) => return ToolOutput::error(format!("The pattern is not a valid regular expression: {e}\nNothing was searched.")),
+            Err(e) => {
+                return ToolOutput::error(format!(
+                    "The pattern is not a valid regular expression: {e}\nNothing was searched."
+                ))
+            }
         };
         let report = match read_records(&self.0.log_path) {
             Ok(r) => r,
@@ -209,7 +213,8 @@ impl Tool for LogSearch {
                             let body = body.strip_prefix(&prefix).unwrap_or(body);
                             lines.push(cut(&format!("#{seq} {handle} line {}: {body}", m.line)));
                         }
-                        uncollected = uncollected.saturating_add(found.total_matches.saturating_sub(found.matches.len() as u64));
+                        uncollected =
+                            uncollected.saturating_add(found.total_matches.saturating_sub(found.matches.len() as u64));
                     }
                     None => {
                         let name = &tr.name;
@@ -293,7 +298,8 @@ mod tests {
 
     /// A log with one record of every kind `log_search` reads. Returns the blob of call c1's output.
     fn build(rig: &Rig) -> BlobRef {
-        let blob = rig.env.ctx.blobs.put_bytes(b"compiling\nerror: needle in output\nwarning: none\nneedle again\n").unwrap();
+        let blob =
+            rig.env.ctx.blobs.put_bytes(b"compiling\nerror: needle in output\nwarning: none\nneedle again\n").unwrap();
         let mut log = SessionLog::create(&rig.shared.log_path, Durability::Batch).unwrap();
         let mut put = |author: Author, event: Event| {
             log.append(author, event).unwrap();
@@ -381,7 +387,13 @@ mod tests {
         build(&rig);
         let r = rig.call("pin", json!({"handle": "out:0123456789abcdef", "reason": "r"})).await;
         assert_eq!(r.status, ToolStatus::Error);
-        assert!(r.text.contains("There is no stored output out:0123456789abcdef; handles are the out:… ids in result headers."), "{}", r.text);
+        assert!(
+            r.text.contains(
+                "There is no stored output out:0123456789abcdef; handles are the out:… ids in result headers."
+            ),
+            "{}",
+            r.text
+        );
 
         let elsewhere = rig.env.ctx.blobs.put_bytes(b"from another session\n").unwrap();
         let r = rig.call("pin", json!({"handle": elsewhere.handle(), "reason": "r"})).await;

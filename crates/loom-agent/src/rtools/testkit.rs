@@ -99,7 +99,12 @@ impl Orchestrator for FakeOrch {
         Ok(id)
     }
 
-    async fn join(&self, _parent: &SessionId, child: &SessionId, cancel: &CancellationToken) -> Result<Settlement, String> {
+    async fn join(
+        &self,
+        _parent: &SessionId,
+        child: &SessionId,
+        cancel: &CancellationToken,
+    ) -> Result<Settlement, String> {
         self.record(format!("join {child}"));
         let hangs = *lock(&self.hang_all) || lock(&self.hang).contains(child);
         if hangs {

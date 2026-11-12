@@ -168,7 +168,11 @@ fn open_lines(ledger: &LedgerState) -> Vec<String> {
     }
     for id in &open.claims {
         if let Some(c) = ledger.claims.iter().find(|c| &c.id == id) {
-            let state = if c.evidence.is_empty() { "no evidence attached" } else { "evidence attached, not yet marked supported" };
+            let state = if c.evidence.is_empty() {
+                "no evidence attached"
+            } else {
+                "evidence attached, not yet marked supported"
+            };
             lines.push(format!("claim {} ({state}): {}", c.id, cut(&c.text, OPEN_TEXT_CHARS)));
         }
     }
@@ -298,7 +302,8 @@ pub fn on_yield(ctx: &YieldCtx<'_>) -> Yield {
         return Yield::Park(text);
     }
 
-    let subject = if ctx.reply.trim().is_empty() { "Your reply was empty" } else { "Your reply ended without a tool call" };
+    let subject =
+        if ctx.reply.trim().is_empty() { "Your reply was empty" } else { "Your reply ended without a tool call" };
     let mut first = format!("{subject}, so nothing was delivered and the turn has not ended.");
     if looks_like_call(ctx.reply) {
         first.push_str(" The reply contains text shaped like a tool call; text is never executed — send it as an actual tool call.");
@@ -342,7 +347,8 @@ pub fn looks_like_call(text: &str) -> bool {
         let Some(rest) = text.get(i..) else { return false };
         match serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>().next() {
             Some(Ok(serde_json::Value::Object(m))) => {
-                m.get("name").is_some_and(serde_json::Value::is_string) && (m.contains_key("arguments") || m.contains_key("parameters"))
+                m.get("name").is_some_and(serde_json::Value::is_string)
+                    && (m.contains_key("arguments") || m.contains_key("parameters"))
             }
             _ => false,
         }
@@ -378,7 +384,9 @@ pub fn check_finish_lead(ledger: &LedgerState, answer: &str) -> Result<(), Strin
         }
         text.push_str("\n\nHow to close them:");
         if !open.plan.is_empty() {
-            text.push_str("\n- Plan steps: call `step` with status done (say in the note what showed it) or dropped (say why).");
+            text.push_str(
+                "\n- Plan steps: call `step` with status done (say in the note what showed it) or dropped (say why).",
+            );
         }
         let objections = ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind == ObligationKind::Objection);
         if objections {
@@ -395,7 +403,9 @@ pub fn check_finish_lead(ledger: &LedgerState, answer: &str) -> Result<(), Strin
             );
         }
         if !open.questions.is_empty() {
-            text.push_str("\n- Questions: they wait for the operator; `ask_user` ends the turn until they are answered.");
+            text.push_str(
+                "\n- Questions: they wait for the operator; `ask_user` ends the turn until they are answered.",
+            );
         }
         parts.push(text);
     }
@@ -601,9 +611,27 @@ mod tests {
     fn ledger() -> LedgerState {
         LedgerState {
             plan: vec![
-                PlanStep { id: "p1".into(), text: "done".into(), status: StepStatus::Done, note: "ok".into(), evidence: vec![] },
-                PlanStep { id: "p2".into(), text: "Fix the parser".into(), status: StepStatus::Doing, note: String::new(), evidence: vec![] },
-                PlanStep { id: "p3".into(), text: "Add tests".into(), status: StepStatus::Todo, note: String::new(), evidence: vec![] },
+                PlanStep {
+                    id: "p1".into(),
+                    text: "done".into(),
+                    status: StepStatus::Done,
+                    note: "ok".into(),
+                    evidence: vec![],
+                },
+                PlanStep {
+                    id: "p2".into(),
+                    text: "Fix the parser".into(),
+                    status: StepStatus::Doing,
+                    note: String::new(),
+                    evidence: vec![],
+                },
+                PlanStep {
+                    id: "p3".into(),
+                    text: "Add tests".into(),
+                    status: StepStatus::Todo,
+                    note: String::new(),
+                    evidence: vec![],
+                },
             ],
             obligations: vec![Obligation {
                 id: "o1".into(),
@@ -613,8 +641,20 @@ mod tests {
                 outcome: None,
             }],
             claims: vec![
-                Claim { id: "c1".into(), text: "settled".into(), status: ClaimStatus::Supported, note: String::new(), evidence: vec!["e1".into()] },
-                Claim { id: "c3".into(), text: "Parser handles nesting".into(), status: ClaimStatus::Open, note: String::new(), evidence: vec![] },
+                Claim {
+                    id: "c1".into(),
+                    text: "settled".into(),
+                    status: ClaimStatus::Supported,
+                    note: String::new(),
+                    evidence: vec!["e1".into()],
+                },
+                Claim {
+                    id: "c3".into(),
+                    text: "Parser handles nesting".into(),
+                    status: ClaimStatus::Open,
+                    note: String::new(),
+                    evidence: vec![],
+                },
             ],
             questions: vec![Question { id: "q1".into(), text: "Which branch?".into(), blocking: true, answer: None }],
             ..LedgerState::default()
@@ -652,7 +692,9 @@ To keep working, call a tool. To end the turn, call finish (the goal is met), as
     fn empty_reply_and_call_shaped_reply() {
         let t = tools(&LEAD_TOOLS);
         let c = ctx(&t, None, "  \n");
-        assert!(nudge(&c).starts_with("Your reply was empty, so nothing was delivered and the turn has not ended.\n\nTo keep working"));
+        assert!(nudge(&c).starts_with(
+            "Your reply was empty, so nothing was delivered and the turn has not ended.\n\nTo keep working"
+        ));
         let c = ctx(&t, None, "<tool_call>{}</tool_call>");
         assert!(nudge(&c).contains(
             "has not ended. The reply contains text shaped like a tool call; text is never executed — send it as an actual tool call."
@@ -668,8 +710,9 @@ To keep working, call a tool. To end the turn, call finish (the goal is met), as
         let two = tools(&["finish", "wait"]);
         assert!(nudge(&ctx(&two, None, "x")).ends_with("call finish (the goal is met) or wait (things are running)."));
         let three = tools(&["finish", "ask_user", "wait"]);
-        assert!(nudge(&ctx(&three, None, "x"))
-            .ends_with("call finish (the goal is met), ask_user (you need the operator), or wait (things are running)."));
+        assert!(nudge(&ctx(&three, None, "x")).ends_with(
+            "call finish (the goal is met), ask_user (you need the operator), or wait (things are running)."
+        ));
         let no_wait = tools(&["finish", "ask_user", "report_blocker"]);
         let mut c = ctx(&no_wait, None, "x");
         c.running_jobs = 1;
@@ -697,7 +740,9 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         t = tools(&["report_blocker"]);
         let mut c = ctx(&t, None, "x");
         c.is_child = true;
-        assert!(nudge(&c).ends_with("To keep working, call a tool. If the assignment cannot be done, call report_blocker."));
+        assert!(
+            nudge(&c).ends_with("To keep working, call a tool. If the assignment cannot be done, call report_blocker.")
+        );
         t = tools(&["verdict", "report_blocker"]);
         let mut c = ctx(&t, None, "x");
         c.is_child = true;
@@ -765,9 +810,20 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
 
     fn with_goal(open_step: bool) -> LedgerState {
         let mut l = LedgerState { goal: Some("fix it".into()), ..LedgerState::default() };
-        l.goal_met = Some(loom_core::ledger::GoalMet { status: GoalMetStatus::Open, note: String::new(), evidence: vec![], n: 0 });
+        l.goal_met = Some(loom_core::ledger::GoalMet {
+            status: GoalMetStatus::Open,
+            note: String::new(),
+            evidence: vec![],
+            n: 0,
+        });
         if open_step {
-            l.plan.push(PlanStep { id: "p1".into(), text: "try".into(), status: StepStatus::Todo, note: String::new(), evidence: vec![] });
+            l.plan.push(PlanStep {
+                id: "p1".into(),
+                text: "try".into(),
+                status: StepStatus::Todo,
+                note: String::new(),
+                evidence: vec![],
+            });
         }
         l
     }
@@ -786,7 +842,10 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         // Without report_blocker that sentence is left out; without conclude the session is not gated at all.
         let no_blocker = tools(&["finish", "conclude"]);
         let text = nudge(&ctx(&no_blocker, Some(&l), "x"));
-        assert!(text.contains("no plan step is open") && text.contains("Call conclude") && !text.contains("report_blocker"), "{text}");
+        assert!(
+            text.contains("no plan step is open") && text.contains("Call conclude") && !text.contains("report_blocker"),
+            "{text}"
+        );
         let bare = tools(&["finish"]);
         assert!(!nudge(&ctx(&bare, Some(&l), "x")).contains("not an exit"));
         // An open plan step, a concluded goal, a released mission, no goal and a child: not mentioned.
@@ -822,7 +881,13 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         assert!(text.contains("obligation o1 (objection): no test ran"), "{text}");
         assert!(text.contains("- Objections: a verifier rejected an earlier finish."), "{text}");
         assert!(!text.contains("Obligations: wait for the job"), "{text}");
-        l.obligations.push(Obligation { id: "o2".into(), kind: ObligationKind::Job, text: "j".into(), reference: String::new(), outcome: None });
+        l.obligations.push(Obligation {
+            id: "o2".into(),
+            kind: ObligationKind::Job,
+            text: "j".into(),
+            reference: String::new(),
+            outcome: None,
+        });
         let Err(text) = check_finish_lead(&l, "done") else { panic!("expected refusal") };
         assert!(text.contains("Objections:") && text.contains("Obligations: wait for the job"), "{text}");
     }
@@ -862,7 +927,13 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
     #[test]
     fn finish_lead_only_present_groups_and_answer() {
         let mut l = LedgerState::default();
-        l.plan.push(PlanStep { id: "p1".into(), text: "x".into(), status: StepStatus::Todo, note: String::new(), evidence: vec![] });
+        l.plan.push(PlanStep {
+            id: "p1".into(),
+            text: "x".into(),
+            status: StepStatus::Todo,
+            note: String::new(),
+            evidence: vec![],
+        });
         let Err(text) = check_finish_lead(&l, "ok") else { panic!("expected refusal") };
         assert!(text.contains("`step`"));
         assert!(!text.contains("Obligations:") && !text.contains("Claims:") && !text.contains("Questions:"));
@@ -896,10 +967,14 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
     fn quotes_succeed_and_clamp() {
         let (_d, store, h) = store_with(OUT);
         let id = store.resolve(&h).unwrap_or_else(|e| panic!("{e}"));
-        let ok = check_quotes(&store, &[q(&h, 2, 3, "beta line two\ngamma line three"), q(&h, 4, 99, "delta line four")])
-            .unwrap_or_else(|e| panic!("{e}"));
+        let ok =
+            check_quotes(&store, &[q(&h, 2, 3, "beta line two\ngamma line three"), q(&h, 4, 99, "delta line four")])
+                .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(ok.len(), 2);
-        assert_eq!(ok[0], VerifiedQuote { blob: id.clone(), start: 2, end: 3, text: "beta line two\ngamma line three".into() });
+        assert_eq!(
+            ok[0],
+            VerifiedQuote { blob: id.clone(), start: 2, end: 3, text: "beta line two\ngamma line three".into() }
+        );
         assert_eq!((ok[1].start, ok[1].end), (4, 4));
         // Line-number prefixes copied from a read are accepted.
         assert!(check_quotes(&store, &[q(&h, 1, 2, "1: alpha line one\n2: beta line two")]).is_ok());
@@ -922,14 +997,18 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         let e = check_quotes(&store, &[q(&h, 1, 2, "  ")]).err().unwrap_or_default();
         assert_eq!(e, "quote 1: the text is empty.");
         let e = check_quotes(&store, &[q(&h, 1, 2, "nothing like it")]).err().unwrap_or_default();
-        assert_eq!(e, format!("quote 1: the text does not occur in {h} lines 1-2. Copy the text exactly from the output."));
+        assert_eq!(
+            e,
+            format!("quote 1: the text does not occur in {h} lines 1-2. Copy the text exactly from the output.")
+        );
     }
 
     #[test]
     fn quote_line_numbers_are_checked_and_stripped() {
         let (_d, store, h) = store_with(OUT);
         // The numbers are absolute line numbers of the stored output, and the stored text is stripped.
-        let ok = check_quotes(&store, &[q(&h, 2, 3, "2\tbeta line two\n3\tgamma line three")]).unwrap_or_else(|e| panic!("{e}"));
+        let ok = check_quotes(&store, &[q(&h, 2, 3, "2\tbeta line two\n3\tgamma line three")])
+            .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(ok[0].text, "beta line two\ngamma line three");
         let e = check_quotes(&store, &[q(&h, 2, 3, "7: beta line two")]).err().unwrap_or_default();
         assert_eq!(
@@ -960,7 +1039,10 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         );
         // Quoted from the start of the number, it is accepted, and recorded as its whole line.
         let ok = check_quotes(&store, &[q(&h, 1, 2, "10 failed; 0 ignored")]).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!((ok[0].start, ok[0].end, ok[0].text.as_str()), (2, 2, "test result: FAILED. 5 passed; 10 failed; 0 ignored"));
+        assert_eq!(
+            (ok[0].start, ok[0].end, ok[0].text.as_str()),
+            (2, 2, "test result: FAILED. 5 passed; 10 failed; 0 ignored")
+        );
     }
 
     #[test]
@@ -1064,7 +1146,14 @@ The agent's own words follow, unverified. Every line of them starts with \">\"; 
 
     #[test]
     fn report_minimal_and_outcomes() {
-        let mk = |o, a| ReportInput { outcome: o, answer: a, quotes: &[], not_established: None, max_chars: 100, full_handle: "out:1" };
+        let mk = |o, a| ReportInput {
+            outcome: o,
+            answer: a,
+            quotes: &[],
+            not_established: None,
+            max_chars: 100,
+            full_handle: "out:1",
+        };
         assert_eq!(
             render_report(&mk(ChildOutcome::Returned, "ok")),
             "Outcome: returned\n\nThis report was written by a sub-agent. The quotes are verbatim; everything else is unverified.\n\n\
@@ -1093,7 +1182,8 @@ The agent's own words follow, unverified. Every line of them starts with \">\"; 
             max_chars: 20,
             full_handle: "out:feed",
         });
-        let want_answer = format!("> Answer:\n> {}\n[report cut at 20 characters; the full text is out:feed]", "é".repeat(20));
+        let want_answer =
+            format!("> Answer:\n> {}\n[report cut at 20 characters; the full text is out:feed]", "é".repeat(20));
         assert!(r.ends_with(&want_answer), "{r}");
         assert!(r.contains(&format!("lines 1-2: {}…", "漢".repeat(400))));
         // The marker follows the answer it belongs to, before what the agent did not establish.

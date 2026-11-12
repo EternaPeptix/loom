@@ -536,8 +536,12 @@ mod tests {
         let p = bad(json!({"path": "p", "star": 1}));
         assert_eq!(p, ["unknown argument `star` — did you mean `start`?"]);
         let p = bad(json!({"path": "p", "zzzzzzzz": 1}));
-        assert_eq!(p, ["unknown argument `zzzzzzzz`; this tool takes: path, start, limit, ratio, force, mode, names, opts"]);
-        let p = check(&json!({"properties": {"a": {"type": "string"}, "b": {"type": "string"}}}), &json!({"c": 1})).unwrap_err();
+        assert_eq!(
+            p,
+            ["unknown argument `zzzzzzzz`; this tool takes: path, start, limit, ratio, force, mode, names, opts"]
+        );
+        let p = check(&json!({"properties": {"a": {"type": "string"}, "b": {"type": "string"}}}), &json!({"c": 1}))
+            .unwrap_err();
         assert_eq!(p, ["unknown argument `c`; this tool takes: a, b"]);
     }
 

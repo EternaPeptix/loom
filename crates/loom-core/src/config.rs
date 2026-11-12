@@ -15,7 +15,11 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read {path}: {source}")]
-    Io { path: PathBuf, #[source] source: std::io::Error },
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("{path}: {message}")]
     Parse { path: PathBuf, message: String },
     #[error("config: {0}")]
@@ -280,7 +284,8 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
             Err(source) => return Err(ConfigError::Io { path: path.to_path_buf(), source }),
         };
-        let config = Config::parse(&text).map_err(|message| ConfigError::Parse { path: path.to_path_buf(), message })?;
+        let config =
+            Config::parse(&text).map_err(|message| ConfigError::Parse { path: path.to_path_buf(), message })?;
         config.check()?;
         Ok(config)
     }
@@ -301,7 +306,10 @@ impl Config {
         }
         let host = self.daemon.bind.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
         if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
-            return Err(ConfigError::Invalid(format!("daemon.bind must be a loopback address, got \"{}\"", self.daemon.bind)));
+            return Err(ConfigError::Invalid(format!(
+                "daemon.bind must be a loopback address, got \"{}\"",
+                self.daemon.bind
+            )));
         }
         if self.context.floor_tokens >= self.context.target_tokens {
             return Err(ConfigError::Invalid("context.floor_tokens must be below context.target_tokens".into()));
@@ -593,7 +601,9 @@ allow = ["*.example.test"]
         let generated = SessionId::generate();
         assert_eq!(p.session_dir(&generated), p.sessions_dir().join(generated.as_str()));
         let long = "a".repeat(129);
-        for bad in ["", ".", "..", "../s-real", "s-real/..", "a/b", "/etc", ".hidden", "s-real\0", "s\0", "a b", "é", &long] {
+        for bad in
+            ["", ".", "..", "../s-real", "s-real/..", "a/b", "/etc", ".hidden", "s-real\0", "s\0", "a b", "é", &long]
+        {
             let s = p.session_dir(&SessionId::from(bad));
             let m = p.mission_dir(&MissionId::from(bad));
             assert!(s.starts_with(p.sessions_dir().join(UNSAFE_ID_DIR)), "{bad:?} -> {}", s.display());

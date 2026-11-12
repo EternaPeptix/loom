@@ -83,7 +83,9 @@ fn secs_text(ms: u64) -> String {
 }
 
 fn missing_job() -> ToolOutput {
-    ToolOutput::error("No job id was given. Call the tool again with `job` set to a job id such as `j1` (job_list shows them).")
+    ToolOutput::error(
+        "No job id was given. Call the tool again with `job` set to a job id such as `j1` (job_list shows them).",
+    )
 }
 
 fn add_ended_meta(out: ToolOutput, ended: &Ended) -> ToolOutput {
@@ -103,14 +105,22 @@ fn render(ctx: &ToolCtx, view: JobView, outcome: Option<String>) -> ToolOutput {
         JobState::Ended(e) if *e != Ended::Exit(0) => ToolStatus::Error,
         _ => ToolStatus::Ok,
     };
-    let body = if new_output.is_empty() { Body::Message("(no new output)".to_string()) } else { Body::Raw(new_output.clone()) };
-    let mut out = ToolOutput { status, outcome: outcome.unwrap_or(state_text), more: Vec::new(), body, meta: Map::new() };
+    let body = if new_output.is_empty() {
+        Body::Message("(no new output)".to_string())
+    } else {
+        Body::Raw(new_output.clone())
+    };
+    let mut out =
+        ToolOutput { status, outcome: outcome.unwrap_or(state_text), more: Vec::new(), body, meta: Map::new() };
     out = out.with_more(format!("job {}", info.id)).with_more(format!("{} new bytes", new_output.len()));
     if info.state == JobState::Running {
         let elapsed = ctx.jobs.elapsed_ms(&info.id).unwrap_or(0);
         out = out.with_more(format!("{}s so far", secs_text(elapsed)));
         if let Some(leader) = ctx.jobs.leader_status(&info.id) {
-            out = out.with_more(format!("the command itself has exited: {}; other processes it started are still running", leader.outcome()));
+            out = out.with_more(format!(
+                "the command itself has exited: {}; other processes it started are still running",
+                leader.outcome()
+            ));
         }
     }
     out = out.with_more(format!("{} bytes of output in all", info.output_bytes));
@@ -278,7 +288,10 @@ fn read_all(running: &Running, limit: u64) -> Result<(Vec<u8>, Option<String>), 
         )
     })?;
     let note = (size > bytes.len() as u64).then(|| {
-        format!("the command wrote {size} bytes in all; only the first {} bytes were kept and the rest was discarded", bytes.len())
+        format!(
+            "the command wrote {size} bytes in all; only the first {} bytes were kept and the rest was discarded",
+            bytes.len()
+        )
     });
     Ok((bytes, note))
 }
@@ -337,7 +350,9 @@ fn finish(f: Finish<'_>) -> ToolOutput {
 
 async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
     let Some(command) = args.get("command").and_then(Value::as_str) else {
-        return ToolOutput::error("No command was given. Call bash again with `command` set to the command line to run.");
+        return ToolOutput::error(
+            "No command was given. Call bash again with `command` set to the command line to run.",
+        );
     };
     let timeout_s = args.get("timeout_s").and_then(Value::as_u64);
     let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
@@ -363,7 +378,9 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         Err(e) => {
             let _ = std::fs::remove_file(&spec.out_path);
             let _ = std::fs::remove_file(&spec.exit_path);
-            return ToolOutput::error(format!("The command could not be started ({e}). Nothing ran; try the call again."));
+            return ToolOutput::error(format!(
+                "The command could not be started ({e}). Nothing ran; try the call again."
+            ));
         }
     };
 
@@ -424,7 +441,16 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
                 facts.push(format!(
                     "other processes it started are still running, not finished — now job {id}; follow them with job_wait(\"{id}\"), stop them with job_kill(\"{id}\")"
                 ));
-                return finish(Finish { ctx, status, outcome: ended.outcome(), ended: &ended, output, elapsed, facts, job: Some(&id) });
+                return finish(Finish {
+                    ctx,
+                    status,
+                    outcome: ended.outcome(),
+                    ended: &ended,
+                    output,
+                    elapsed,
+                    facts,
+                    job: Some(&id),
+                });
             }
             remove_files(&running);
             finish(Finish { ctx, status, outcome: ended.outcome(), ended: &ended, output, elapsed, facts, job: None })
@@ -435,7 +461,10 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
                 Ok(o) => o,
                 Err(e) => {
                     ctx.jobs.register(&id, &ctx.call_id, command, running).await;
-                    return ToolOutput::error(format!("{e} The command is still running as job {id}; job_wait(\"{id}\") returns its output.")).with_meta(META_JOB, json!(id));
+                    return ToolOutput::error(format!(
+                        "{e} The command is still running as job {id}; job_wait(\"{id}\") returns its output."
+                    ))
+                    .with_meta(META_JOB, json!(id));
                 }
             };
             ctx.jobs.register_from(&id, &ctx.call_id, command, running, shown.len() as u64).await;
@@ -459,7 +488,11 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         WaitEnd::Deadline | WaitEnd::Cancelled | WaitEnd::TooMuchOutput => {
             // Past the output limit the group is killed outright: a command that ignores TERM would go on
             // writing for the whole grace period. The same holds when it passes the limit during the grace.
-            let ended = if end == WaitEnd::TooMuchOutput { running.kill().await } else { running.terminate_within(grace, limit).await };
+            let ended = if end == WaitEnd::TooMuchOutput {
+                running.kill().await
+            } else {
+                running.terminate_within(grace, limit).await
+            };
             let (output, note) = match read_all(&running, limit) {
                 Ok(o) => o,
                 Err(e) => {
@@ -620,7 +653,11 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(10));
         assert_eq!(r.status, ToolStatus::Ok);
         assert!(r.text.contains("exit 0"), "{}", r.text);
-        assert!(r.text.contains("now job j1") && r.text.contains("job_wait(\"j1\")") && r.text.contains("job_kill(\"j1\")"), "{}", r.text);
+        assert!(
+            r.text.contains("now job j1") && r.text.contains("job_wait(\"j1\")") && r.text.contains("job_kill(\"j1\")"),
+            "{}",
+            r.text
+        );
         // The job id only: exit meta beside it would tell the session that the job's end was already shown.
         assert_eq!(r.meta.get(META_JOB), Some(&json!("j1")));
         assert!(r.meta.get(META_EXIT_CODE).is_none() && r.meta.get(META_SIGNAL).is_none(), "{:?}", r.meta);
@@ -668,7 +705,8 @@ mod tests {
         assert_eq!(r.meta.get(META_JOB), Some(&json!("j1")));
         assert!(r.meta.get(META_EXIT_CODE).is_none() && r.meta.get(META_SIGNAL).is_none(), "{:?}", r.meta);
         assert!(matches!(e.job_events.recv().await, Some(JobEvent::Registered(_))));
-        let settled = tokio::time::timeout(Duration::from_secs(20), e.job_events.recv()).await.expect("event").expect("open");
+        let settled =
+            tokio::time::timeout(Duration::from_secs(20), e.job_events.recv()).await.expect("event").expect("open");
         let JobEvent::Settled { info, output, detail } = settled else { panic!("Settled") };
         assert_eq!(info.state, JobState::Ended(Ended::Exit(3)));
         assert_eq!(detail, "");
@@ -736,7 +774,11 @@ mod tests {
             let out = jobs.join(format!("{id}.out"));
             let r = e.call("bash", args).await;
             assert_eq!(r.status, ToolStatus::Error, "{}", r.text);
-            assert!(r.text.contains("could not be read back") && r.text.contains(&out.display().to_string()), "{}", r.text);
+            assert!(
+                r.text.contains("could not be read back") && r.text.contains(&out.display().to_string()),
+                "{}",
+                r.text
+            );
             // The output file the message names stays; the status file and the pid record, which would
             // make the next daemon start take the command for a crashed one, are gone.
             assert!(out.is_dir(), "{id}");
@@ -780,7 +822,8 @@ mod tests {
 
         let k = e.call("job_kill", json!({"job": "j1"})).await;
         assert!(k.text.contains("killed"), "{}", k.text);
-        let settled = tokio::time::timeout(Duration::from_secs(10), e.job_events.recv()).await.expect("event").expect("open");
+        let settled =
+            tokio::time::timeout(Duration::from_secs(10), e.job_events.recv()).await.expect("event").expect("open");
         let JobEvent::Settled { output, .. } = settled else { panic!("Settled") };
         let whole = e.ctx.blobs.read_all(&output.expect("stored").id).expect("read");
         assert_eq!(whole, b"first\nsecond\n");
@@ -893,7 +936,13 @@ mod tests {
         e.ctx.jobs.register(&id, &e.ctx.call_id, "printf", running).await;
         let w = e.call("job_wait", json!({"job": id, "timeout_s": 30})).await;
         assert!(w.text.contains("exit 3") && w.text.contains("5000 bytes of output in all"), "{}", w.text);
-        assert!(w.text.contains("the output was 5000 bytes; only the first 2000 bytes were stored and the rest was discarded"), "{}", w.text);
+        assert!(
+            w.text.contains(
+                "the output was 5000 bytes; only the first 2000 bytes were stored and the rest was discarded"
+            ),
+            "{}",
+            w.text
+        );
         assert!(w.text.contains("the first 2000 bytes of output are stored as out:"), "{}", w.text);
         assert!(!w.text.contains("complete output"), "{}", w.text);
     }
@@ -932,7 +981,13 @@ mod tests {
         let lines: Vec<&str> = l.text.lines().filter(|l| l.starts_with('j')).collect();
         assert_eq!(lines.len(), 2, "{}", l.text);
         assert!(lines[0].starts_with("j1  running  ") && lines[0].ends_with("0 bytes  sleep 300"), "{}", lines[0]);
-        assert!(lines[1].starts_with("j2  exit 2  ") && lines[1].contains("4 bytes") && lines[1].ends_with("echo x\\necho y; exit 2"), "{}", lines[1]);
+        assert!(
+            lines[1].starts_with("j2  exit 2  ")
+                && lines[1].contains("4 bytes")
+                && lines[1].ends_with("echo x\\necho y; exit 2"),
+            "{}",
+            lines[1]
+        );
 
         let k = e.call("job_kill", json!({"job": "j1"})).await;
         assert_eq!(k.status, ToolStatus::Ok);
@@ -970,7 +1025,11 @@ mod tests {
         let target = outside.path().join("f");
         let r = e.call("bash", json!({"command": format!("echo x > {}", target.display())})).await;
         assert_eq!(r.status, ToolStatus::Error);
-        assert!(r.text.contains("sandboxed: writes only under the workspace and temp dir; network only via proxy"), "{}", r.text);
+        assert!(
+            r.text.contains("sandboxed: writes only under the workspace and temp dir; network only via proxy"),
+            "{}",
+            r.text
+        );
         let r = e.call("bash", json!({"command": "echo fine; echo more > ok.txt"})).await;
         assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
         assert!(!r.text.contains("sandboxed:"));

@@ -422,7 +422,8 @@ fn widened_hint(
         }
         let wider = scan.collect_until(h, n, Some(budget.deadline));
         if wider.interrupted && budget.cut.is_none() {
-            budget.cut = Some(if scan.cancel.is_cancelled() { "interrupted" } else { "the time limit was reached" }.to_string());
+            budget.cut =
+                Some(if scan.cancel.is_cancelled() { "interrupted" } else { "the time limit was reached" }.to_string());
         }
         let extra: Vec<&Entry> = wider.files.iter().filter(|e| !have.contains(e.abs.as_path())).collect();
         let k = count_new(&extra, &mut budget);
@@ -437,12 +438,17 @@ fn widened_hint(
     }
     let mut hint = match (gains.is_empty(), &budget.cut) {
         (true, None) if !budget.too_large.is_empty() => {
-            " Hidden and git-ignored files that could be read would not change this, but some could not be checked.".to_string()
+            " Hidden and git-ignored files that could be read would not change this, but some could not be checked."
+                .to_string()
         }
         (true, None) => " Including hidden and git-ignored files would not change this.".to_string(),
-        (true, Some(why)) => format!(" Whether hidden and git-ignored files would change this could not be fully checked ({why})."),
+        (true, Some(why)) => {
+            format!(" Whether hidden and git-ignored files would change this could not be fully checked ({why}).")
+        }
         (false, None) => format!(" {}.", gains.join("; ")),
-        (false, Some(why)) => format!(" {}. (That check was cut short — {why} — so the counts may be low.)", gains.join("; ")),
+        (false, Some(why)) => {
+            format!(" {}. (That check was cut short — {why} — so the counts may be low.)", gains.join("; "))
+        }
     };
     if !budget.too_large.is_empty() {
         hint.push_str(&format!(
@@ -704,7 +710,8 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
 
     let mut sink = Sink::new(opts.bound);
     let mut groups_written = false;
-    let (mut matches, mut files_with, mut scanned, mut binary, mut unreadable) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut matches, mut files_with, mut scanned, mut binary, mut unreadable) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut too_large: Vec<&str> = Vec::new();
     let mut interrupted = found.interrupted;
     for entry in &candidates {
@@ -768,7 +775,10 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
                     // the last allowed match); only the allowed ones count as shown.
                     let sep = if hits.binary_search(&j).is_ok() { ':' } else { '-' };
                     let line = lines.get(j).copied().unwrap_or_default();
-                    if !sink.push(&format!("{}{sep}{}{sep}{}\n", entry.rel, j + 1, windowed(line, &opts.re)), allowed.binary_search(&j).is_ok()) {
+                    if !sink.push(
+                        &format!("{}{sep}{}{sep}{}\n", entry.rel, j + 1, windowed(line, &opts.re)),
+                        allowed.binary_search(&j).is_ok(),
+                    ) {
                         break;
                     }
                 }
@@ -828,7 +838,8 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
                     .count()
             })
         };
-        let mut skipped = if binary > 0 { format!(", {binary} binary files skipped and not searched") } else { String::new() };
+        let mut skipped =
+            if binary > 0 { format!(", {binary} binary files skipped and not searched") } else { String::new() };
         if !too_large.is_empty() {
             skipped.push_str(&format!(
                 ", {} files over {MAX_GREP_FILE_BYTES} bytes skipped as too large and not searched ({})",
@@ -845,7 +856,8 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
         );
         ToolOutput::ok(outcome, Body::Message(msg))
     } else {
-        let (total, unit) = if opts.files_only { (files_with, "files with matches") } else { (matches, "matching lines") };
+        let (total, unit) =
+            if opts.files_only { (files_with, "files with matches") } else { (matches, "matching lines") };
         let advice = if opts.files_only { GREP_FILES_ADVICE } else { GREP_ADVICE };
         let body = sink.finish(total, interrupted, unit, advice);
         ToolOutput::ok(format!("{matches} matches in {files_with} files"), Body::Raw(body.into_bytes()))
@@ -907,7 +919,12 @@ mod tests {
             let want = set(&want);
             let g = e.call("glob", json!({"pattern": "**", "hidden": hidden, "no_ignore": no_ignore})).await;
             let got_glob: BTreeSet<String> = lines(&e.stored(&g)).into_iter().collect();
-            let r = e.call("grep", json!({"pattern": "needle", "files_only": true, "hidden": hidden, "no_ignore": no_ignore})).await;
+            let r = e
+                .call(
+                    "grep",
+                    json!({"pattern": "needle", "files_only": true, "hidden": hidden, "no_ignore": no_ignore}),
+                )
+                .await;
             let got_grep: BTreeSet<String> =
                 lines(&e.stored(&r)).into_iter().map(|l| l.rsplit_once(" (").unwrap().0.to_string()).collect();
             assert_eq!(got_glob, want, "glob hidden={hidden} no_ignore={no_ignore}");
@@ -1071,7 +1088,11 @@ mod tests {
         put(&e, "b.txt", "hit\n");
         let r = e.call("grep", json!({"pattern": "hit", "files_only": true})).await;
         let stored = e.stored(&r);
-        assert!(stored.starts_with("[Showing 1 of 2 files with matches found;") && stored.contains("\na.txt (1)\n[Showing 1 of 2"), "{stored}");
+        assert!(
+            stored.starts_with("[Showing 1 of 2 files with matches found;")
+                && stored.contains("\na.txt (1)\n[Showing 1 of 2"),
+            "{stored}"
+        );
     }
 
     #[tokio::test]
@@ -1094,7 +1115,11 @@ mod tests {
         assert_eq!(out.outcome, "500 matches in 1 files");
         let body = raw(&out);
         assert!(body.len() < 10_000 + 2 * 300, "{}", body.len());
-        assert!(body.starts_with("[Showing 9 of 500 matching lines found;") && body.ends_with("to see them.]\n"), "{}", &body[..80]);
+        assert!(
+            body.starts_with("[Showing 9 of 500 matching lines found;") && body.ends_with("to see them.]\n"),
+            "{}",
+            &body[..80]
+        );
         // The same bound with context.
         opts.context = 1;
         let body = raw(&grep_job(&scan, &opts, HintLimits::STANDARD));
@@ -1128,7 +1153,12 @@ mod tests {
         put(&e, "f", "hit\nhit\nx\n");
         let r = e.call("grep", json!({"pattern": "hit", "context": 1})).await;
         let stored = e.stored(&r);
-        assert!(stored.contains("f:1:hit\nf:2:hit\n") && !stored.contains("f-2-hit") && stored.starts_with("[Showing 1 of 2 "), "{stored}");
+        assert!(
+            stored.contains("f:1:hit\nf:2:hit\n")
+                && !stored.contains("f-2-hit")
+                && stored.starts_with("[Showing 1 of 2 "),
+            "{stored}"
+        );
     }
 
     #[tokio::test]
@@ -1152,7 +1182,9 @@ mod tests {
         let mut sink = Sink::new(Bound::new(1));
         sink.push("x\n", true);
         sink.push("y\n", true);
-        assert!(sink.finish(2, true, "files", GLOB_ADVICE).contains("of at least 2 files found before the search was interrupted"));
+        assert!(sink
+            .finish(2, true, "files", GLOB_ADVICE)
+            .contains("of at least 2 files found before the search was interrupted"));
         e.ctx.cancel.cancel();
         let out = grep_job(&scan, &opts, HintLimits::STANDARD);
         assert_eq!(out.status, ToolStatus::Interrupted);
@@ -1163,7 +1195,10 @@ mod tests {
         let mut sink = Sink::new(Bound::new(2));
         assert!(sink.push("a\n", true) && sink.push("b\n", true) && !sink.push("c\n", true));
         let text = sink.finish(9, true, "matching lines", GREP_ADVICE);
-        assert!(text.starts_with("[Showing 2 of at least 9 matching lines found before the search was interrupted;"), "{text}");
+        assert!(
+            text.starts_with("[Showing 2 of at least 9 matching lines found before the search was interrupted;"),
+            "{text}"
+        );
         assert!(text.ends_with("to see them.]\n"), "{text}");
         // Under the bound the body is returned unchanged.
         let mut sink = Sink::new(Bound::new(2));
@@ -1204,11 +1239,19 @@ mod tests {
         std::fs::write(e.ctx.workspace.join("bin.dat"), [0u8; 4096]).unwrap();
         let r = e.call("grep", json!({"pattern": "needle"})).await;
         assert!(r.text.contains("1 matches in 1 files"), "{}", r.text);
-        assert!(r.text.contains("1 files skipped as too large") && r.text.contains("search is not complete"), "{}", r.text);
+        assert!(
+            r.text.contains("1 files skipped as too large") && r.text.contains("search is not complete"),
+            "{}",
+            r.text
+        );
         assert!(r.text.contains("model.bin") && r.text.contains("`bash`"), "{}", r.text);
         assert!(r.text.contains("1 binary files skipped"), "{}", r.text);
         let r = e.call("grep", json!({"pattern": "absent"})).await;
-        assert!(r.text.contains("1 files over") && r.text.contains("skipped as too large and not searched"), "{}", r.text);
+        assert!(
+            r.text.contains("1 files over") && r.text.contains("skipped as too large and not searched"),
+            "{}",
+            r.text
+        );
         // read_text never returns the contents of a file over its cap.
         assert!(matches!(read_text(&e.ctx.workspace.join("model.bin"), MAX_GREP_FILE_BYTES), Read::TooLarge));
         assert!(matches!(read_text(&e.ctx.workspace.join("text.txt"), 3), Read::TooLarge));
@@ -1310,7 +1353,11 @@ mod tests {
         big.set_len(MAX_GREP_FILE_BYTES + 1).unwrap();
         let r = e.call("grep", json!({"pattern": "zzz"})).await;
         assert!(!r.text.contains("Including hidden and git-ignored files would not change this"), "{}", r.text);
-        assert!(r.text.contains("that could be read would not change this, but some could not be checked"), "{}", r.text);
+        assert!(
+            r.text.contains("that could be read would not change this, but some could not be checked"),
+            "{}",
+            r.text
+        );
         assert!(r.text.contains("1 of those files are over the"), "{}", r.text);
         // The time limit is added without the panicking operator.
         let budget = Budget::new(CancellationToken::new(), HintLimits { max_files: 1, max_time: Duration::MAX });

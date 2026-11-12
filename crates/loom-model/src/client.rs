@@ -190,7 +190,11 @@ impl Pacing {
 /// Why an attempt did not produce a completion.
 enum Fail {
     /// `sticky`: waiting cannot cure this failure, so attempts in a row that end this way are capped.
-    Retry { reason: String, retry_after: Option<Duration>, sticky: bool },
+    Retry {
+        reason: String,
+        retry_after: Option<Duration>,
+        sticky: bool,
+    },
     Fatal(ModelError),
     Cancelled(Option<Box<Completion>>),
 }
@@ -283,12 +287,14 @@ impl ModelClient {
                 profile.base_url
             )));
         }
-        let http = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT)
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
             // A redirect would re-post the whole conversation to another host.
             .redirect(reqwest::redirect::Policy::none())
-            .build().map_err(|e| {
-            ModelError::Config(format!("model profile '{name}': cannot build an HTTP client: {}", describe(&e)))
-        })?;
+            .build()
+            .map_err(|e| {
+                ModelError::Config(format!("model profile '{name}': cannot build an HTTP client: {}", describe(&e)))
+            })?;
         let pacing = Pacing::from_profile(&profile);
         Ok(ModelClient { name: name.to_string(), profile, http, pacing, served: Arc::new(Mutex::new(None)) })
     }
@@ -355,7 +361,10 @@ impl ModelClient {
                 return Err(ModelError::Cancelled { partial: None });
             }
             attempts = attempts.saturating_add(1);
-            let (reason, retry_after, sticky) = match self.attempt(&url, &body, key.as_deref(), attempts, events, cancel).await {
+            let (reason, retry_after, sticky) = match self
+                .attempt(&url, &body, key.as_deref(), attempts, events, cancel)
+                .await
+            {
                 Ok(mut done) => {
                     done.attempts = attempts;
                     return Ok(done);
@@ -385,8 +394,9 @@ impl ModelClient {
                     // Discovery has selected nothing in this process yet: the session was restored
                     // after a daemon restart, or it began while the server was down.
                     self.remember(&id);
-                    let reason =
-                        format!("the server does not serve model '{model}' but '{id}'; sending the request again with that id");
+                    let reason = format!(
+                        "the server does not serve model '{model}' but '{id}'; sending the request again with that id"
+                    );
                     tracing::info!(model = %self.name, attempt = attempts, %reason, "model id corrected");
                     send(events, StreamEvent::Retrying { attempt: attempts, after_ms: 0, reason });
                     body = encode(&id)?;
@@ -533,7 +543,8 @@ impl ModelClient {
             if head.len() < HEAD_BYTES {
                 head.extend(chunk.iter().take(HEAD_BYTES - head.len()));
             }
-            let classify = |e: AssembleError| match e {
+            let classify = |e: AssembleError| {
+                match e {
                 AssembleError::Malformed(m) => sticky(format!(
                     "the server sent a stream chunk that is not valid JSON ({m}). Check that base_url points at an OpenAI-compatible /v1 endpoint."
                 )),
@@ -542,6 +553,7 @@ impl ModelClient {
                     "the server sent a malformed stream: {m}. Check that base_url points at an OpenAI-compatible /v1 endpoint."
                 )),
                 other => retry(other.to_string()),
+            }
             };
             for payload in parser.feed(&chunk).map_err(classify)? {
                 payloads = payloads.saturating_add(1);
@@ -666,7 +678,9 @@ fn redirect_message(base: &str, path: &str, location: Option<&str>) -> String {
     let url = format!("{base}/{path}");
     let refusal = "loom does not follow redirects, so that nothing is sent to a host the profile does not name";
     let Some(to) = location else {
-        return format!("{url} answered with a redirect without a Location; {refusal}. Check base_url in the model profile.");
+        return format!(
+            "{url} answered with a redirect without a Location; {refusal}. Check base_url in the model profile."
+        );
     };
     // A relative Location is resolved against the request's address.
     let target = reqwest::Url::parse(&url).and_then(|u| u.join(to)).map_or_else(|_| to.to_string(), String::from);
@@ -833,7 +847,8 @@ mod tests {
 
     #[tokio::test]
     async fn plain_reply() {
-        let s = server(vec![Reply::text("hello there, this is a reply").with_reasoning("thinking it over").into()]).await;
+        let s =
+            server(vec![Reply::text("hello there, this is a reply").with_reasoning("thinking it over").into()]).await;
         let c = client(&s.base_url()).complete(&req("hi"), None, &CancellationToken::new()).await.unwrap();
         assert_eq!(c.text, "hello there, this is a reply");
         assert_eq!(c.reasoning, "thinking it over");
@@ -863,10 +878,8 @@ mod tests {
         let c = client(&s.base_url()).complete(&req("x"), Some(&tx), &CancellationToken::new()).await.unwrap();
         let evs = drain(&mut rx);
         assert_eq!(evs.first(), Some(&StreamEvent::AttemptStart { attempt: 1 }));
-        let joined: String = evs
-            .iter()
-            .filter_map(|e| if let StreamEvent::Text(t) = e { Some(t.as_str()) } else { None })
-            .collect();
+        let joined: String =
+            evs.iter().filter_map(|e| if let StreamEvent::Text(t) = e { Some(t.as_str()) } else { None }).collect();
         assert_eq!(joined, c.text);
         assert_eq!(evs.iter().filter(|e| matches!(e, StreamEvent::AttemptStart { .. })).count(), 1);
     }
@@ -937,11 +950,9 @@ mod tests {
     #[tokio::test]
     async fn stream_ending_without_finish_reason_is_retried() {
         // The connection ends after the text chunks, before any finish_reason.
-        let s = server(vec![
-            Action::DropAfter { reply: Reply::text("abc"), chunks: 2 },
-            Reply::text("complete").into(),
-        ])
-        .await;
+        let s =
+            server(vec![Action::DropAfter { reply: Reply::text("abc"), chunks: 2 }, Reply::text("complete").into()])
+                .await;
         let c = client(&s.base_url()).complete(&req("x"), None, &CancellationToken::new()).await.unwrap();
         assert_eq!(c.text, "complete");
         assert_eq!(c.attempts, 2);
@@ -950,7 +961,8 @@ mod tests {
     #[tokio::test]
     async fn clean_end_of_stream_without_finish_reason_is_retried() {
         // Unlike DropAfter, the body ends with a proper terminating chunk.
-        let s = server(vec![Action::Eof { reply: Reply::text("abc"), chunks: 2 }, Reply::text("complete").into()]).await;
+        let s =
+            server(vec![Action::Eof { reply: Reply::text("abc"), chunks: 2 }, Reply::text("complete").into()]).await;
         let c = client(&s.base_url()).complete(&req("x"), None, &CancellationToken::new()).await.unwrap();
         assert_eq!(c.text, "complete");
         assert_eq!(c.attempts, 2);
@@ -978,11 +990,17 @@ mod tests {
         let (err, s) = fails_with(Action::Status { status: 200, body: html.into(), retry_after_s: None }).await;
         // The sentence does not claim that a server which answered did not answer.
         let shown = err.to_string();
-        assert!(shown.starts_with("the model request failed after 3 attempts: the server answered HTTP 200"), "{shown}");
+        assert!(
+            shown.starts_with("the model request failed after 3 attempts: the server answered HTTP 200"),
+            "{shown}"
+        );
         match err {
             ModelError::Unavailable { attempts, last } => {
                 assert_eq!(attempts, 3);
-                assert!(last.contains("not an event stream") && last.contains("<html>") && last.contains("base_url"), "{last}");
+                assert!(
+                    last.contains("not an event stream") && last.contains("<html>") && last.contains("base_url"),
+                    "{last}"
+                );
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -1004,7 +1022,8 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_chunk_fails_after_three_attempts() {
-        let (err, _s) = fails_with(Action::Status { status: 200, body: "data: {not json\n\n".into(), retry_after_s: None }).await;
+        let (err, _s) =
+            fails_with(Action::Status { status: 200, body: "data: {not json\n\n".into(), retry_after_s: None }).await;
         match err {
             ModelError::Unavailable { attempts, last } => {
                 assert_eq!(attempts, 3);
@@ -1021,7 +1040,10 @@ mod tests {
         match err {
             ModelError::Unavailable { attempts, last } => {
                 assert_eq!(attempts, 3);
-                assert!(last.contains("malformed stream") && last.contains("a line") && last.contains("8 MiB"), "{last}");
+                assert!(
+                    last.contains("malformed stream") && last.contains("a line") && last.contains("8 MiB"),
+                    "{last}"
+                );
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -1097,15 +1119,23 @@ mod tests {
 
     #[tokio::test]
     async fn error_object_in_the_stream_stays_retryable_within_the_window() {
-        let s = server(vec![Action::StreamError { message: "engine overloaded".into() }, Reply::text("ok").into()]).await;
+        let s =
+            server(vec![Action::StreamError { message: "engine overloaded".into() }, Reply::text("ok").into()]).await;
         let (tx, mut rx) = unbounded_channel();
         let c = client(&s.base_url()).complete(&req("x"), Some(&tx), &CancellationToken::new()).await.unwrap();
         assert_eq!((c.text.as_str(), c.attempts), ("ok", 2));
-        assert!(drain(&mut rx).iter().any(|e| matches!(e, StreamEvent::Retrying { reason, .. } if reason.contains("engine overloaded"))));
+        assert!(drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Retrying { reason, .. } if reason.contains("engine overloaded"))));
 
-        let s = MockServer::start(Script::new(|_, _| Action::StreamError { message: "engine overloaded".into() })).await.unwrap();
+        let s = MockServer::start(Script::new(|_, _| Action::StreamError { message: "engine overloaded".into() }))
+            .await
+            .unwrap();
         let pacing = Pacing { window: Some(Duration::from_millis(250)), ..fast_pacing() };
-        let err = client_with(profile(&s.base_url()), pacing).complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
+        let err = client_with(profile(&s.base_url()), pacing)
+            .complete(&req("x"), None, &CancellationToken::new())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ModelError::Unavailable { attempts, .. } if attempts > 3), "{err:?}");
     }
 
@@ -1114,7 +1144,10 @@ mod tests {
         let s = server(vec![]).await;
         s.shutdown().await;
         let pacing = Pacing { window: Some(Duration::from_millis(300)), ..fast_pacing() };
-        let err = client_with(profile(&s.base_url()), pacing).complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
+        let err = client_with(profile(&s.base_url()), pacing)
+            .complete(&req("x"), None, &CancellationToken::new())
+            .await
+            .unwrap_err();
         match err {
             ModelError::Unavailable { attempts, last } => {
                 assert!(attempts > 3, "{attempts}");
@@ -1131,7 +1164,8 @@ mod tests {
         s.shutdown().await;
         let base = s.base_url().replacen("/v1", "/certificate/v1", 1);
         let pacing = Pacing { window: Some(Duration::from_millis(300)), ..fast_pacing() };
-        let err = client_with(profile(&base), pacing).complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
+        let err =
+            client_with(profile(&base), pacing).complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
         match err {
             ModelError::Unavailable { attempts, last } => {
                 assert!(attempts > 3, "{attempts}");
@@ -1158,9 +1192,15 @@ mod tests {
             "received unexpected handshake message: got Finished when expecting ServerHello",
             "received corrupt message of type InvalidContentType",
         ] {
-            assert!(is_local_failure(false, &format!("error sending request: client error (Connect): {text}")), "{text}");
+            assert!(
+                is_local_failure(false, &format!("error sending request: client error (Connect): {text}")),
+                "{text}"
+            );
         }
-        assert!(!is_local_failure(false, "error trying to connect: tcp connect error: Connection refused (os error 61)"));
+        assert!(!is_local_failure(
+            false,
+            "error trying to connect: tcp connect error: Connection refused (os error 61)"
+        ));
         assert!(!is_local_failure(false, "connection reset by peer"));
     }
 
@@ -1169,7 +1209,8 @@ mod tests {
         assert_eq!(ModelProfile::default().retry_window_s, 300);
         assert_eq!(Pacing::from_profile(&ModelProfile::default()).window, Some(Duration::from_secs(300)));
         let parse = |toml: &str| {
-            let cfg = loom_core::config::Config::parse(&format!("default_model = \"a\"\n[models.a]\n{toml}\n")).unwrap();
+            let cfg =
+                loom_core::config::Config::parse(&format!("default_model = \"a\"\n[models.a]\n{toml}\n")).unwrap();
             cfg.models["a"].clone()
         };
         assert_eq!(parse("").retry_window_s, 300);
@@ -1208,7 +1249,9 @@ mod tests {
                         let Some(end) = text.find("\r\n\r\n") else { continue };
                         let want = text
                             .lines()
-                            .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                            .find_map(|l| {
+                                l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())
+                            })
                             .unwrap_or(0);
                         if buf.len() >= end + 4 + want {
                             break;
@@ -1226,18 +1269,25 @@ mod tests {
         let other = server(vec![Reply::text("must never be asked").into()]).await;
         let location = format!("{}/chat/completions", other.base_url());
         let (url, task) = redirector(location.clone()).await;
-        let err = client(&url).complete(&req("secret conversation"), None, &CancellationToken::new()).await.unwrap_err();
+        let err =
+            client(&url).complete(&req("secret conversation"), None, &CancellationToken::new()).await.unwrap_err();
         match err {
             ModelError::Rejected { status: 307, message } => {
                 assert!(message.contains(&format!("redirected to {location};")), "{message}");
                 // The address to set is the base, not the endpoint the Location names.
-                assert!(message.contains(&format!("set base_url in the model profile to {} (", other.base_url())), "{message}");
+                assert!(
+                    message.contains(&format!("set base_url in the model profile to {} (", other.base_url())),
+                    "{message}"
+                );
             }
             other => panic!("unexpected {other:?}"),
         }
         assert!(other.requests().is_empty());
         let err = client(&url).discover().await.unwrap_err();
-        assert!(matches!(err, ModelError::Rejected { status: 307, ref message } if message.contains(&location)), "{err:?}");
+        assert!(
+            matches!(err, ModelError::Rejected { status: 307, ref message } if message.contains(&location)),
+            "{err:?}"
+        );
         task.abort();
     }
 
@@ -1245,10 +1295,16 @@ mod tests {
     fn redirect_message_suggests_the_base_and_never_the_endpoint() {
         let m = redirect_message("http://a:8000/v1/", "chat/completions", Some("https://b/v1/chat/completions"));
         assert!(m.starts_with("http://a:8000/v1/chat/completions redirected to https://b/v1/chat/completions;"), "{m}");
-        assert!(m.contains("set base_url in the model profile to https://b/v1 (that address without /chat/completions)"), "{m}");
+        assert!(
+            m.contains("set base_url in the model profile to https://b/v1 (that address without /chat/completions)"),
+            "{m}"
+        );
         // A relative Location is resolved against the request; a query string is not part of the base.
         let m = redirect_message("http://a:8000/v1", "models", Some("/api/v1/models?x=1"));
-        assert!(m.contains("set base_url in the model profile to http://a:8000/api/v1 (that address without /models)"), "{m}");
+        assert!(
+            m.contains("set base_url in the model profile to http://a:8000/api/v1 (that address without /models)"),
+            "{m}"
+        );
         // Nothing sensible to strip (a login page, the same address with a slash, no header): no address is suggested.
         for location in [Some("https://sso.example/login"), Some("http://a:8000/v1/models/"), None] {
             let m = redirect_message("http://a:8000/v1", "models", location);
@@ -1288,8 +1344,10 @@ mod tests {
     #[tokio::test]
     async fn waiting_for_headers_counts_as_a_stall() {
         let (url, task) = silent_listener().await;
-        let pacing = Pacing { window: Some(Duration::from_millis(250)), stall: Duration::from_millis(100), ..fast_pacing() };
-        let err = client_with(profile(&url), pacing).complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
+        let pacing =
+            Pacing { window: Some(Duration::from_millis(250)), stall: Duration::from_millis(100), ..fast_pacing() };
+        let err =
+            client_with(profile(&url), pacing).complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
         match err {
             ModelError::Unavailable { attempts, last } => {
                 assert!(attempts >= 2);
@@ -1341,7 +1399,10 @@ mod tests {
         .await
         .unwrap();
         let pacing = Pacing { window: Some(Duration::from_millis(200)), ..fast_pacing() };
-        let err = client_with(profile(&s.base_url()), pacing).complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
+        let err = client_with(profile(&s.base_url()), pacing)
+            .complete(&req("x"), None, &CancellationToken::new())
+            .await
+            .unwrap_err();
         match err {
             ModelError::Unavailable { attempts, last } => {
                 assert!(attempts >= 2);
@@ -1360,7 +1421,10 @@ mod tests {
         }])
         .await;
         let err = client(&s.base_url()).complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
-        assert!(matches!(err, ModelError::Rejected { status: 400, ref message } if message == "tool schema is invalid"), "{err:?}");
+        assert!(
+            matches!(err, ModelError::Rejected { status: 400, ref message } if message == "tool schema is invalid"),
+            "{err:?}"
+        );
         assert_eq!(s.requests().len(), 1);
     }
 
@@ -1440,10 +1504,15 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_during_the_retry_sleep_is_prompt() {
-        let s = MockServer::start(Script::new(|_, _| Action::Status { status: 500, body: String::new(), retry_after_s: None }))
-            .await
-            .unwrap();
-        let pacing = Pacing { base_delay: Duration::from_secs(30), max_delay: Duration::from_secs(30), ..fast_pacing() };
+        let s = MockServer::start(Script::new(|_, _| Action::Status {
+            status: 500,
+            body: String::new(),
+            retry_after_s: None,
+        }))
+        .await
+        .unwrap();
+        let pacing =
+            Pacing { base_delay: Duration::from_secs(30), max_delay: Duration::from_secs(30), ..fast_pacing() };
         let c = client_with(profile(&s.base_url()), pacing);
         let cancel = CancellationToken::new();
         let canceller = cancel.clone();
@@ -1504,7 +1573,10 @@ mod tests {
         reply.piece_chars = 10;
         let s = server(vec![reply.into()]).await;
         let pacing = Pacing { stall: Duration::from_secs(5), ..fast_pacing() };
-        let c = client_with(profile(&s.base_url()), pacing).complete(&req("x"), None, &CancellationToken::new()).await.unwrap();
+        let c = client_with(profile(&s.base_url()), pacing)
+            .complete(&req("x"), None, &CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(c.timing.queue_ms, 0);
         assert!(c.timing.ttft_ms <= c.timing.total_ms);
         assert!(c.timing.total_ms >= 100, "{:?}", c.timing);
@@ -1516,7 +1588,15 @@ mod tests {
         let s = server(vec![]).await;
         s.set_model("mock", Some(32768));
         let d = client(&s.base_url()).discover().await.unwrap();
-        assert_eq!(d, Discovered { served_model: "mock".into(), context_window: Some(32768), source: WindowSource::Server, server_window: Some(32768) });
+        assert_eq!(
+            d,
+            Discovered {
+                served_model: "mock".into(),
+                context_window: Some(32768),
+                source: WindowSource::Server,
+                server_window: Some(32768)
+            }
+        );
 
         let mut p = profile(&s.base_url());
         p.context_window = Some(16000);
@@ -1563,9 +1643,7 @@ mod tests {
         assert_eq!((done.text.as_str(), done.attempts), ("hello", 2));
         assert_eq!(models_sent(&s), ["mock", "the-served-name"]);
         let evs = drain(&mut rx);
-        let told = |e: &StreamEvent| {
-            matches!(e, StreamEvent::Retrying { attempt: 1, after_ms: 0, reason } if reason.contains("'the-served-name'"))
-        };
+        let told = |e: &StreamEvent| matches!(e, StreamEvent::Retrying { attempt: 1, after_ms: 0, reason } if reason.contains("'the-served-name'"));
         assert!(evs.iter().any(told), "{evs:?}");
         // The id is remembered, by clones too: the next request is right the first time.
         let done = c.clone().complete(&req("x"), None, &CancellationToken::new()).await.unwrap();
@@ -1574,7 +1652,10 @@ mod tests {
         // The id found this way counts as discovered: a later change of model is not followed.
         s.set_model("yet-another", Some(32768));
         let err = c.complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
-        assert!(matches!(err, ModelError::Rejected { status: 404, ref message } if message.contains("'yet-another'")), "{err:?}");
+        assert!(
+            matches!(err, ModelError::Rejected { status: 404, ref message } if message.contains("'yet-another'")),
+            "{err:?}"
+        );
         assert_eq!(models_sent(&s).len(), 4);
     }
 
@@ -1608,7 +1689,10 @@ mod tests {
         let err = c.complete(&req("x"), Some(&tx), &CancellationToken::new()).await.unwrap_err();
         match err {
             ModelError::Rejected { status: 404, message } => {
-                assert!(message.contains("no longer serves 'first'") && message.contains("now serves 'mock'"), "{message}");
+                assert!(
+                    message.contains("no longer serves 'first'") && message.contains("now serves 'mock'"),
+                    "{message}"
+                );
                 assert!(message.contains("restart the loom daemon"), "{message}");
                 // What the server itself said is kept.
                 assert!(message.ends_with("The server said: The model `first` does not exist."), "{message}");
@@ -1647,7 +1731,9 @@ mod tests {
         let p = profile("http://x/v1");
         let j = json!({"data": [{"id": "alpha"}, {"id": "beta"}]});
         match pick_model("t", &p, &j) {
-            Err(ModelError::Config(m)) => assert!(m.contains("'mock'") && m.contains("alpha, beta") && m.contains("Set `model`"), "{m}"),
+            Err(ModelError::Config(m)) => {
+                assert!(m.contains("'mock'") && m.contains("alpha, beta") && m.contains("Set `model`"), "{m}")
+            }
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -1689,7 +1775,12 @@ mod tests {
 
     #[test]
     fn backoff_doubles_caps_and_jitters() {
-        let p = Pacing { base_delay: FIRST_DELAY, max_delay: Duration::from_secs(4), stall: Duration::from_secs(1), window: None };
+        let p = Pacing {
+            base_delay: FIRST_DELAY,
+            max_delay: Duration::from_secs(4),
+            stall: Duration::from_secs(1),
+            window: None,
+        };
         let within = |d: Duration, centre: f64| {
             let s = d.as_secs_f64();
             s >= centre * 0.9 - 1e-9 && s <= centre * 1.1 + 1e-9

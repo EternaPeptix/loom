@@ -135,7 +135,8 @@ impl Ended {
         match self {
             Ended::Exit(n) if *n > 128 => {
                 let sig = n - 128;
-                let convention = format!("exit code {n}: 128+N conventionally means the command was killed by signal N");
+                let convention =
+                    format!("exit code {n}: 128+N conventionally means the command was killed by signal N");
                 Some(if sig <= MAX_SIGNAL {
                     let name = signal_name(sig).map(|s| format!(" ({s})")).unwrap_or_default();
                     format!("{convention}, here signal {sig}{name}")
@@ -210,7 +211,9 @@ pub fn process_start(pid: u32) -> Option<String> {
         // SAFETY: proc_bsdinfo is plain integers, for which all-zero is a valid value.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         // SAFETY: the buffer is `size` bytes of a live, exclusively borrowed struct.
-        let n = unsafe { libc::proc_pidinfo(p, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size) };
+        let n = unsafe {
+            libc::proc_pidinfo(p, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size)
+        };
         (n == size).then(|| format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec))
     }
     #[cfg(target_os = "linux")]
@@ -353,7 +356,8 @@ fn group_pids(pgid: u32) -> Vec<u32> {
 
 /// The live processes of group `pgid` with their start times: what identifies a group whose leader is gone.
 fn group_members(pgid: u32) -> Vec<(u32, String)> {
-    let mut members: Vec<(u32, String)> = group_pids(pgid).into_iter().filter_map(|pid| Some((pid, process_start(pid)?))).collect();
+    let mut members: Vec<(u32, String)> =
+        group_pids(pgid).into_iter().filter_map(|pid| Some((pid, process_start(pid)?))).collect();
     members.sort();
     members.truncate(MAX_RECORDED_MEMBERS);
     members
@@ -432,8 +436,12 @@ pub fn spawn(sandbox: &Sandbox, spec: &Spawn) -> io::Result<Running> {
         .process_group(0)
         .kill_on_drop(false);
     let child = cmd.spawn()?;
-    let pid = child.id().ok_or_else(|| io::Error::other("the command exited before it could be tracked; run it again"))?;
-    let started_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)).unwrap_or(0);
+    let pid =
+        child.id().ok_or_else(|| io::Error::other("the command exited before it could be tracked; run it again"))?;
+    let started_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
     let running = Running {
         pid,
         out_path: spec.out_path.clone(),
@@ -452,7 +460,8 @@ pub fn spawn(sandbox: &Sandbox, spec: &Spawn) -> io::Result<Running> {
 /// Writes the command's pid record. A command that cannot be recorded would be unknown after a crash,
 /// so it is not left running: dropping the armed `Running` kills its group, and the spawn fails.
 fn recorded(running: Running, pid_file: &Path) -> io::Result<Running> {
-    let record = PidRecord { pid: running.pid, start: running.start.clone(), members: Vec::new(), owner: this_process() };
+    let record =
+        PidRecord { pid: running.pid, start: running.start.clone(), members: Vec::new(), owner: this_process() };
     match write_pid_record(pid_file, &record) {
         Ok(()) => Ok(running),
         Err(e) => {
@@ -505,7 +514,10 @@ impl Running {
         let record = PidRecord { pid: self.pid, start: self.start.clone(), members, owner: this_process() };
         if let Err(e) = write_pid_record(&pid_file, &record) {
             let path = pid_file.display();
-            tracing::warn!(pid = self.pid, "pid record {path} not updated ({e}); after a crash this group would not be recognised");
+            tracing::warn!(
+                pid = self.pid,
+                "pid record {path} not updated ({e}); after a crash this group would not be recognised"
+            );
         }
         self.members = record.members;
     }
@@ -552,11 +564,22 @@ impl Running {
 
     /// Like [`Running::wait`], but the command is over only when its whole process group is gone;
     /// `Ended` then carries the leader's status.
-    pub async fn wait_group(&mut self, cancel: &CancellationToken, deadline: Option<Duration>, max_bytes: u64) -> WaitEnd {
+    pub async fn wait_group(
+        &mut self,
+        cancel: &CancellationToken,
+        deadline: Option<Duration>,
+        max_bytes: u64,
+    ) -> WaitEnd {
         self.wait_with(cancel, deadline, max_bytes, true).await
     }
 
-    async fn wait_with(&mut self, cancel: &CancellationToken, deadline: Option<Duration>, max_bytes: u64, whole_group: bool) -> WaitEnd {
+    async fn wait_with(
+        &mut self,
+        cancel: &CancellationToken,
+        deadline: Option<Duration>,
+        max_bytes: u64,
+        whole_group: bool,
+    ) -> WaitEnd {
         let start = Instant::now();
         loop {
             if let Some(e) = self.poll() {
@@ -682,7 +705,10 @@ mod tests {
 
     impl Fx {
         fn spec(&self, script: &str) -> Spawn {
-            let env = [("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            let env = [("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
             Spawn {
                 script: script.to_string(),
                 cwd: self.root.clone(),
@@ -927,7 +953,10 @@ mod tests {
         assert!(!r.group_alive());
 
         let mut r = f.start("sleep 0.5 & exit 3");
-        assert_eq!(r.wait_group(&never(), Some(Duration::from_secs(20)), u64::MAX).await, WaitEnd::Ended(Ended::Exit(3)));
+        assert_eq!(
+            r.wait_group(&never(), Some(Duration::from_secs(20)), u64::MAX).await,
+            WaitEnd::Ended(Ended::Exit(3))
+        );
         assert!(!r.group_alive());
     }
 
@@ -995,7 +1024,10 @@ mod tests {
 
         // When the recorded members are gone and the group is not, the record names who is in it now.
         let sleeper = read_pids(&p, 2).await[1];
-        let want = vec![(u32::try_from(sleeper).expect("pid"), process_start(u32::try_from(sleeper).expect("pid")).expect("start"))];
+        let want = vec![(
+            u32::try_from(sleeper).expect("pid"),
+            process_start(u32::try_from(sleeper).expect("pid")).expect("start"),
+        )];
         let mut record = record;
         for _ in 0..100 {
             if record.members == want {
@@ -1137,7 +1169,10 @@ mod tests {
         spec.cwd = f.root.join("ws");
         let mut r = spawn(&f.sb, &spec).expect("spawn");
         assert_eq!(finish(&mut r).await, Ended::Exit(0));
-        assert_eq!(String::from_utf8(r.read_output(0).expect("read")).expect("utf-8"), format!("{}\n", f.root.join("ws").display()));
+        assert_eq!(
+            String::from_utf8(r.read_output(0).expect("read")).expect("utf-8"),
+            format!("{}\n", f.root.join("ws").display())
+        );
         let mut spec = f.spec("true");
         spec.cwd = f.root.join("missing");
         assert!(spawn(&f.sb, &spec).is_err());

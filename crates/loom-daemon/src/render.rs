@@ -674,14 +674,19 @@ pub fn inbox_list(list: &[InboxEntry], now_ms: u64, style: &Style) -> String {
             let shown: Vec<String> = hosts.iter().map(|h| flat(h)).collect();
             out.push(format!("  hosts: {}", shown.join(", ")));
             let args: Vec<String> = shown.iter().map(|h| shell_word(h)).collect();
-            out.push(dim(format!("  approve: loom scope {} {}", shell_word(&flat(entry.session.as_str())), args.join(" "))));
+            out.push(dim(format!(
+                "  approve: loom scope {} {}",
+                shell_word(&flat(entry.session.as_str())),
+                args.join(" ")
+            )));
             continue;
         }
         for (i, option) in item.options.iter().enumerate() {
             out.push(format!("  {}. {}", i + 1, flat(option)));
         }
         if item.blocking && matches!(item.kind, InboxKind::Blocker | InboxKind::Parked) {
-            let next = if item.kind == InboxKind::Blocker { " (name the next step, not a yes or no question)" } else { "" };
+            let next =
+                if item.kind == InboxKind::Blocker { " (name the next step, not a yes or no question)" } else { "" };
             out.push(dim(format!("  answer: loom answer {} \"…\"{next}", flat(&item.item_id))));
             let session = shell_word(&flat(entry.session.as_str()));
             out.push(dim(format!("  close as blocked: loom release {session} \"why\"")));
@@ -1128,43 +1133,59 @@ mod tests {
             render(Event::HarnessNote { note: NoteKind::OutputCut, text: "cut".into() }, &MONO),
             "▌ harness · output_cut\ncut\n"
         );
-        let by_agent = rec(Author::Agent(SessionId::from("s-x")), Event::HarnessNote { note: NoteKind::Info, text: "t".into() });
+        let by_agent =
+            rec(Author::Agent(SessionId::from("s-x")), Event::HarnessNote { note: NoteKind::Info, text: "t".into() });
         assert_eq!(record(&by_agent, &MONO, &RecordOpts::default()), "▌ agent s-x · info\nt\n");
         assert_eq!(
-            render(Event::Reweave(Reweave {
-                epoch: 1,
-                upto_seq: 7,
-                evictions: vec![
-                    Eviction { seq: 1, action: EvictAction::Drop },
-                    Eviction { seq: 2, action: EvictAction::Drop },
-                ],
-                brief: String::new(),
-                digest: None,
-                reason: "target".into(),
-                before_tokens: 12_345,
-                after_tokens_est: 800,
-            }), &MONO),
+            render(
+                Event::Reweave(Reweave {
+                    epoch: 1,
+                    upto_seq: 7,
+                    evictions: vec![
+                        Eviction { seq: 1, action: EvictAction::Drop },
+                        Eviction { seq: 2, action: EvictAction::Drop },
+                    ],
+                    brief: String::new(),
+                    digest: None,
+                    reason: "target".into(),
+                    before_tokens: 12_345,
+                    after_tokens_est: 800,
+                }),
+                &MONO
+            ),
             "⟲ context re-woven (target): 2 items folded out of view, about 12.3k → 800 tokens\n"
         );
-        assert_eq!(render(Event::Pin { call_id: CallId::from("c1"), reason: "keep".into() }, &MONO), "∙ pinned c1: keep\n");
+        assert_eq!(
+            render(Event::Pin { call_id: CallId::from("c1"), reason: "keep".into() }, &MONO),
+            "∙ pinned c1: keep\n"
+        );
         assert_eq!(render(Event::Unpin { call_id: CallId::from("c1") }, &MONO), "∙ unpinned c1\n");
         assert_eq!(
-            render(Event::ChildSpawned(ChildSpawned {
-                child: sid.clone(),
-                role: "worker".into(),
-                mode: SpawnMode::Fresh,
-                brief: brief("find it"),
-                budget: Budget::default(),
-                call_id: None,
-            }), &MONO),
+            render(
+                Event::ChildSpawned(ChildSpawned {
+                    child: sid.clone(),
+                    role: "worker".into(),
+                    mode: SpawnMode::Fresh,
+                    brief: brief("find it"),
+                    budget: Budget::default(),
+                    call_id: None,
+                }),
+                &MONO
+            ),
             "⇢ agent s-a (worker, fresh): find it\n"
         );
         assert_eq!(
-            render(Event::JobRegistered { job_id: "j1".into(), call_id: CallId::from("c"), command: "make".into() }, &MONO),
+            render(
+                Event::JobRegistered { job_id: "j1".into(), call_id: CallId::from("c"), command: "make".into() },
+                &MONO
+            ),
             "⚙ job j1: make\n"
         );
         assert_eq!(
-            render(Event::JobSettled { job_id: "j1".into(), exit_code: Some(1), output: None, detail: "exit 1".into() }, &MONO),
+            render(
+                Event::JobSettled { job_id: "j1".into(), exit_code: Some(1), output: None, detail: "exit 1".into() },
+                &MONO
+            ),
             "⚙ job j1 ended: exit 1\n"
         );
         assert_eq!(render(Event::Ledger { n: 4, summary: "claim".into() }, &MONO), "▪ ledger #4: claim\n");
@@ -1173,7 +1194,10 @@ mod tests {
             "! cache break at message 7: d\n"
         );
         assert_eq!(render(Event::Interrupted { reason: "restart".into() }, &MONO), "! interrupted: restart\n");
-        assert_eq!(render(Event::SessionEnd { outcome: SessionOutcome::Done, detail: String::new() }, &MONO), "● session ended: done\n");
+        assert_eq!(
+            render(Event::SessionEnd { outcome: SessionOutcome::Done, detail: String::new() }, &MONO),
+            "● session ended: done\n"
+        );
         assert_eq!(
             render(Event::SessionEnd { outcome: SessionOutcome::Failed, detail: "oops".into() }, &MONO),
             "● session ended: failed: oops\n"
@@ -1184,13 +1208,16 @@ mod tests {
         );
         assert_eq!(render(Event::InboxResolved { item_id: "i".into(), answer: String::new() }, &MONO), "✉ dismissed\n");
         assert_eq!(
-            render(Event::ToolCall(ToolCall {
-                call_id: CallId::from("c1"),
-                req_id: "r".into(),
-                name: "bash".into(),
-                args: serde_json::json!({"command": "ls"}),
-                class: ToolClass::Exec,
-            }), &MONO),
+            render(
+                Event::ToolCall(ToolCall {
+                    call_id: CallId::from("c1"),
+                    req_id: "r".into(),
+                    name: "bash".into(),
+                    args: serde_json::json!({"command": "ls"}),
+                    class: ToolClass::Exec,
+                }),
+                &MONO
+            ),
             "→ bash {\"command\":\"ls\"}\n"
         );
     }
@@ -1220,10 +1247,7 @@ mod tests {
             render(Event::HarnessNote { note: NoteKind::Info, text: "a\nb".into() }, &COLOR),
             "\x1b[2m▌ harness · info\x1b[0m\n\x1b[2ma\x1b[0m\n\x1b[2mb\x1b[0m\n"
         );
-        assert_eq!(
-            render(Event::Interrupted { reason: "r".into() }, &COLOR),
-            "\x1b[33m! interrupted: r\x1b[0m\n"
-        );
+        assert_eq!(render(Event::Interrupted { reason: "r".into() }, &COLOR), "\x1b[33m! interrupted: r\x1b[0m\n");
         assert_eq!(
             render(Event::SessionEnd { outcome: SessionOutcome::Done, detail: String::new() }, &COLOR),
             "\x1b[1m● session ended: done\x1b[0m\n"
@@ -1502,7 +1526,12 @@ mod tests {
     fn sessions_table_rows_and_children() {
         assert_eq!(sessions_table(&[], 0, &MONO), "No sessions.\n");
         let list = vec![
-            info("s-child", Some("s-root"), "look into it", status_of(Phase::Idle, Some(TurnEndReason::Finished), None, 0)),
+            info(
+                "s-child",
+                Some("s-root"),
+                "look into it",
+                status_of(Phase::Idle, Some(TurnEndReason::Finished), None, 0),
+            ),
             info("s-root", None, "main job", status_of(Phase::Running, None, None, 1)),
             info("s-grand", Some("s-child"), "deeper", status_of(Phase::Ended, None, Some(SessionOutcome::Done), 0)),
             info("s-other", None, "second\nline", status_of(Phase::Idle, None, None, 0)),
@@ -1546,12 +1575,8 @@ mod tests {
 
     #[test]
     fn rows_never_exceed_the_width() {
-        let list = vec![info(
-            "s-root",
-            None,
-            &"a very long title ".repeat(20),
-            status_of(Phase::Running, None, None, 0),
-        )];
+        let list =
+            vec![info("s-root", None, &"a very long title ".repeat(20), status_of(Phase::Running, None, None, 0))];
         for width in [10, 30, 60, 120] {
             let style = Style { color: false, width };
             for line in sessions_table(&list, 5_000, &style).lines() {

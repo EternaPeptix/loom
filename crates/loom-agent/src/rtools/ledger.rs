@@ -212,14 +212,17 @@ impl Tool for Note {
         let text = str_arg(args, "text").unwrap_or("").to_string();
         let why = str_arg(args, "why").unwrap_or("").to_string();
         let dead_end = str_arg(args, "kind") == Some("dead_end");
-        let op = if dead_end { LedgerOp::DeadEnd { what: text, why } } else { LedgerOp::Decision { text, reason: why } };
+        let op =
+            if dead_end { LedgerOp::DeadEnd { what: text, why } } else { LedgerOp::Decision { text, reason: why } };
         match self.0.ledger_append(false, op) {
             Ok((_, state)) => {
                 if dead_end {
-                    let (id, what) = state.dead_ends.last().map(|d| (d.id.as_str(), d.what.as_str())).unwrap_or(("", ""));
+                    let (id, what) =
+                        state.dead_ends.last().map(|d| (d.id.as_str(), d.what.as_str())).unwrap_or(("", ""));
                     ToolOutput::ok(format!("dead end {id} recorded"), Body::Message(format!("{id}: {what}")))
                 } else {
-                    let (id, what) = state.decisions.last().map(|d| (d.id.as_str(), d.text.as_str())).unwrap_or(("", ""));
+                    let (id, what) =
+                        state.decisions.last().map(|d| (d.id.as_str(), d.text.as_str())).unwrap_or(("", ""));
                     ToolOutput::ok(format!("decision {id} recorded"), Body::Message(format!("{id}: {what}")))
                 }
             }
@@ -448,12 +451,15 @@ mod tests {
         assert!(refused(&rig, "step", json!({"id": "p1", "status": "done", "text": "x"})).await.contains(want));
 
         // A ledger rule refusal comes through verbatim.
-        let rule = rig.shared.ledger_append(false, LedgerOp::PlanUpdate {
-            id: "p1".into(),
-            status: loom_core::ledger::StepStatus::Done,
-            note: String::new(),
-            evidence: vec![],
-        });
+        let rule = rig.shared.ledger_append(
+            false,
+            LedgerOp::PlanUpdate {
+                id: "p1".into(),
+                status: loom_core::ledger::StepStatus::Done,
+                note: String::new(),
+                evidence: vec![],
+            },
+        );
         let rule = rule.expect_err("rule refusal");
         rig.shared.take_emitted();
         let t = refused(&rig, "step", json!({"id": "p1", "status": "done"})).await;
@@ -615,9 +621,7 @@ mod tests {
         let blob = r.output.clone().unwrap();
         let n = line_of(&rig, &blob, quote);
         let h = blob.handle();
-        let ev = |handle: &str, n: u64, quote: &str| {
-            json!({"claim": "c1", "handle": handle, "start": n, "end": n, "quote": quote, "note": "n"})
-        };
+        let ev = |handle: &str, n: u64, quote: &str| json!({"claim": "c1", "handle": handle, "start": n, "end": n, "quote": quote, "note": "n"});
         let t = refused(&rig, "evidence", ev(&h, n, quote)).await;
         assert!(t.contains("is the result of `ledger`") && t.contains("not an observation"), "{t}");
 
@@ -644,7 +648,8 @@ mod tests {
         assert!(t.contains("is the result of `edit`") && t.contains("not an observation"), "{t}");
 
         // A search of the session log finds the model's words and the claim's.
-        let mut log = loom_core::log::SessionLog::create(&rig.shared.log_path, loom_core::log::Durability::Batch).unwrap();
+        let mut log =
+            loom_core::log::SessionLog::create(&rig.shared.log_path, loom_core::log::Durability::Batch).unwrap();
         let said: loom_core::event::Event = serde_json::from_value(json!({
             "kind": "model_response", "req_id": "r1", "text": quote, "reasoning": "", "finish": "stop"
         }))
@@ -699,9 +704,7 @@ mod tests {
         let rig = rig("lead", false, true);
         ok(&rig, "claim", json!({"text": "c"})).await;
         let h = rig.output("0 of 40 tests passed\nsecond line here\nok\n", "bash", ToolClass::Exec);
-        let ev = |start: u64, end: u64, quote: &str| {
-            json!({"claim": "c1", "handle": h, "start": start, "end": end, "quote": quote, "note": "n"})
-        };
+        let ev = |start: u64, end: u64, quote: &str| json!({"claim": "c1", "handle": h, "start": start, "end": end, "quote": quote, "note": "n"});
         let t = refused(&rig, "evidence", ev(1, 1, "40: tests passed")).await;
         assert!(t.contains("the text is on line 1") && t.contains("not line 40"), "{t}");
         let t = refused(&rig, "evidence", ev(1, 3, "pass")).await;
@@ -755,15 +758,23 @@ mod tests {
             refused(&rig, "step", json!({"id": "p1", "status": "done"})).await,
             refused(&rig, "step", json!({"id": "p1", "status": "done", "evidence": ["e9"]})).await,
             refused(&rig, "claim_update", json!({"id": "c1", "status": "supported"})).await,
-            refused(&rig, "evidence", json!({"claim": "c9", "handle": "x", "start": 1, "end": 1, "quote": "q", "note": "n"}))
-                .await,
+            refused(
+                &rig,
+                "evidence",
+                json!({"claim": "c9", "handle": "x", "start": 1, "end": 1, "quote": "q", "note": "n"}),
+            )
+            .await,
             refused(&rig, "note", json!({"kind": "dead_end", "text": "  ", "why": "x"})).await,
             refused(&rig, "note", json!({"kind": "decision", "text": "x", "why": "  "})).await,
         ];
         let h = rig.output("some output line\n", "bash", ToolClass::Exec);
         sentences.push(
-            refused(&rig, "evidence", json!({"claim": "c9", "handle": h, "start": 1, "end": 1, "quote": "some output", "note": "n"}))
-                .await,
+            refused(
+                &rig,
+                "evidence",
+                json!({"claim": "c9", "handle": h, "start": 1, "end": 1, "quote": "some output", "note": "n"}),
+            )
+            .await,
         );
         for text in sentences {
             for dead in ["plan_update", "evidence_add", "claim_add", "obligation_open", "obligation_settle"] {

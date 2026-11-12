@@ -56,9 +56,9 @@
 use crate::event::{Author, Event, Record, Seq, SCHEMA};
 use crate::{now_ms, sha256_hex};
 use serde::Deserialize;
+use serde_json::Value;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 pub const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -75,7 +75,11 @@ pub enum Durability {
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
     #[error("log i/o on {path}: {source}")]
-    Io { path: PathBuf, #[source] source: std::io::Error },
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("log already exists: {0}")]
     Exists(PathBuf),
     #[error(
@@ -144,7 +148,9 @@ pub struct SessionLog {
 fn lock_log(file: &File, path: &Path) -> Result<(), LogError> {
     match fs2::FileExt::try_lock_exclusive(file) {
         Ok(()) => Ok(()),
-        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Err(LogError::Locked(path.to_path_buf())),
+        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Err(LogError::Locked(path.to_path_buf()))
+        }
         Err(e) => Err(io_err(path)(e)),
     }
 }
@@ -409,11 +415,7 @@ impl SessionLog {
             let moved_to = damaged_name(path);
             let mut src = File::open(path).map_err(io_err(path))?;
             src.seek(SeekFrom::Start(good_len)).map_err(io_err(path))?;
-            let mut dst = private_options()
-                .write(true)
-                .create_new(true)
-                .open(&moved_to)
-                .map_err(io_err(&moved_to))?;
+            let mut dst = private_options().write(true).create_new(true).open(&moved_to).map_err(io_err(&moved_to))?;
             std::io::copy(&mut src.take(file_len - good_len), &mut dst).map_err(io_err(&moved_to))?;
             dst.sync_all().map_err(io_err(&moved_to))?;
             file.set_len(good_len).map_err(io_err(path))?;
@@ -478,8 +480,11 @@ impl SessionLog {
     /// state and return the records copied. Every line is checked as the scanner checks it before it
     /// is written, so the child never starts with a prefix its next `open` would cut back.
     fn copy_prefix(src_path: &Path, child: &mut SessionLog, upto_seq: Seq) -> Result<Vec<Record>, LogError> {
-        let refuse =
-            |seq: Seq, detail: &str| LogError::ForkSource { path: src_path.to_path_buf(), seq, detail: detail.to_string() };
+        let refuse = |seq: Seq, detail: &str| LogError::ForkSource {
+            path: src_path.to_path_buf(),
+            seq,
+            detail: detail.to_string(),
+        };
         let src = File::open(src_path).map_err(io_err(src_path))?;
         let mut reader = BufReader::new(src);
         let mut out = BufWriter::new(&child.file);
@@ -1001,16 +1006,37 @@ mod tests {
         let (path, mut log) = new_log(&dir);
         fill(&mut log, 600);
         let mut shared = PageReader::new(&path);
-        let afters: Vec<Option<Seq>> =
-            [None, Some(0), Some(1), Some(254), Some(255), Some(256), Some(300), Some(510), Some(511), Some(598), Some(599), Some(600), Some(u64::MAX)]
-                .into_iter()
-                .chain((0..600).step_by(37).map(Some))
-                .collect();
+        let afters: Vec<Option<Seq>> = [
+            None,
+            Some(0),
+            Some(1),
+            Some(254),
+            Some(255),
+            Some(256),
+            Some(300),
+            Some(510),
+            Some(511),
+            Some(598),
+            Some(599),
+            Some(600),
+            Some(u64::MAX),
+        ]
+        .into_iter()
+        .chain((0..600).step_by(37).map(Some))
+        .collect();
         for after in afters {
             for limit in [0usize, 1, 7, 256, 1000] {
                 let want = read_page(&path, after, limit).unwrap();
-                assert_eq!(shared.read_page(after, limit).unwrap(), want, "shared reader, after {after:?} limit {limit}");
-                assert_eq!(PageReader::new(&path).read_page(after, limit).unwrap(), want, "fresh reader, after {after:?}");
+                assert_eq!(
+                    shared.read_page(after, limit).unwrap(),
+                    want,
+                    "shared reader, after {after:?} limit {limit}"
+                );
+                assert_eq!(
+                    PageReader::new(&path).read_page(after, limit).unwrap(),
+                    want,
+                    "fresh reader, after {after:?}"
+                );
             }
         }
     }
@@ -1332,7 +1358,13 @@ mod tests {
         for _ in 0..127 {
             args = Value::Array(vec![args]);
         }
-        let call = ToolCall { call_id: CallId::from("c1"), req_id: "r1".into(), name: "t".into(), args, class: ToolClass::Exec };
+        let call = ToolCall {
+            call_id: CallId::from("c1"),
+            req_id: "r1".into(),
+            name: "t".into(),
+            args,
+            class: ToolClass::Exec,
+        };
         log.append(Author::Model, Event::ToolCall(call)).unwrap();
         fill(&mut log, 1);
         drop(log);

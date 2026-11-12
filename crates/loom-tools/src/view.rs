@@ -55,7 +55,13 @@ pub fn window(start: Option<u64>, end: Option<u64>, total: u64, max_lines: u64) 
 }
 
 /// Lines `first..=last` of a stored output as `{n}\t{line}`, long lines shortened.
-pub fn numbered(blobs: &BlobStore, id: &BlobId, first: u64, last: u64, max_line_chars: usize) -> io::Result<(String, u64)> {
+pub fn numbered(
+    blobs: &BlobStore,
+    id: &BlobId,
+    first: u64,
+    last: u64,
+    max_line_chars: usize,
+) -> io::Result<(String, u64)> {
     let slice = blobs.read_lines(id, first, last)?;
     if slice.text.is_empty() {
         return Ok((String::new(), 0));
@@ -86,7 +92,8 @@ pub fn numbered(blobs: &BlobStore, id: &BlobId, first: u64, last: u64, max_line_
 
 /// `lines 3-9 of 40 — 31 more below — 2 above`.
 pub fn range_fact(first: u64, last: u64, total: u64) -> String {
-    let mut s = if first == last { format!("line {first} of {total}") } else { format!("lines {first}-{last} of {total}") };
+    let mut s =
+        if first == last { format!("line {first} of {total}") } else { format!("lines {first}-{last} of {total}") };
     if last < total {
         s.push_str(&format!(" — {} more below", total - last));
     }

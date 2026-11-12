@@ -161,7 +161,8 @@ pub fn real_path(fd: BorrowedFd<'_>) -> io::Result<PathBuf> {
     if rc == -1 {
         return Err(io::Error::last_os_error());
     }
-    let len = buf.iter().position(|b| *b == 0).ok_or_else(|| io::Error::other("F_GETPATH gave a path without an end"))?;
+    let len =
+        buf.iter().position(|b| *b == 0).ok_or_else(|| io::Error::other("F_GETPATH gave a path without an end"))?;
     Ok(PathBuf::from(std::ffi::OsString::from_vec(buf.get(..len).unwrap_or_default().to_vec())))
 }
 
@@ -246,7 +247,9 @@ impl FileTracker {
     pub fn check(&self, path: &Path) -> io::Result<Freshness> {
         self.freshness(path, &|_| Ok(())).map_err(|e| match e {
             NotOpened::Io(e) => e,
-            NotOpened::NotRegular(t) => io::Error::new(io::ErrorKind::InvalidInput, format!("is {}, not a regular file", describe_type(&t))),
+            NotOpened::NotRegular(t) => {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("is {}, not a regular file", describe_type(&t)))
+            }
             NotOpened::Denied(why) => io::Error::new(io::ErrorKind::PermissionDenied, why),
         })
     }
@@ -352,7 +355,9 @@ mod tests {
         let e = t.check(Path::new("/dev/zero")).unwrap_err();
         assert!(e.kind() == io::ErrorKind::InvalidInput && e.to_string().contains("character device"), "{e}");
         let any = |_: &Path| -> Result<(), String> { Ok(()) };
-        assert!(matches!(t.freshness(Path::new("/dev/zero"), &any), Err(NotOpened::NotRegular(kind)) if kind.is_char_device()));
+        assert!(
+            matches!(t.freshness(Path::new("/dev/zero"), &any), Err(NotOpened::NotRegular(kind)) if kind.is_char_device())
+        );
 
         let fifo = dir.path().join("pipe");
         let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
@@ -368,8 +373,12 @@ mod tests {
 
         // A failure that is not about the kind of file stays an I/O error, whatever its kind: a NUL in
         // the path is `InvalidInput` from the standard library and says nothing about what the path is.
-        assert!(matches!(open_regular(&dir.path().join("none")), Err(NotOpened::Io(e)) if e.kind() == io::ErrorKind::NotFound));
-        assert!(matches!(t.freshness(Path::new("a\0b"), &any), Err(NotOpened::Io(e)) if e.kind() == io::ErrorKind::InvalidInput));
+        assert!(
+            matches!(open_regular(&dir.path().join("none")), Err(NotOpened::Io(e)) if e.kind() == io::ErrorKind::NotFound)
+        );
+        assert!(
+            matches!(t.freshness(Path::new("a\0b"), &any), Err(NotOpened::Io(e)) if e.kind() == io::ErrorKind::InvalidInput)
+        );
     }
 
     #[test]
@@ -391,10 +400,17 @@ mod tests {
         let judged = std::sync::Mutex::new(Vec::new());
         let refuse_real = |p: &Path| {
             judged.lock().unwrap().push(p.to_path_buf());
-            if p.starts_with(&real) { Err(format!("{} is off limits", p.display())) } else { Ok(()) }
+            if p.starts_with(&real) {
+                Err(format!("{} is off limits", p.display()))
+            } else {
+                Ok(())
+            }
         };
         let e = open_readable(&via_link, &refuse_real).unwrap_err();
-        assert!(matches!(&e, NotOpened::Denied(why) if why == &format!("{} is off limits", real.join("f").display())), "{e:?}");
+        assert!(
+            matches!(&e, NotOpened::Denied(why) if why == &format!("{} is off limits", real.join("f").display())),
+            "{e:?}"
+        );
         assert_eq!(*judged.lock().unwrap(), vec![real.join("f")]);
         let (mut file, meta) = open_readable(&via_link, &|_| Ok(())).unwrap();
         let mut text = String::new();

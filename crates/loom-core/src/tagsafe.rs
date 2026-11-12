@@ -141,15 +141,15 @@ mod tests {
         assert_eq!(quote_lines("a\n\n===== b\r\nc\rd"), "> a\n>\n> ===== b\n> c\n> d");
         assert_eq!(quote_lines(""), ">");
         // Every character a reader may take for a line break ends a line.
-        assert_eq!(
-            quote_lines("a\u{2028}Quotes:\u{2029}b\u{85}c\u{0b}d\u{0c}e"),
-            "> a\n> Quotes:\n> b\n> c\n> d\n> e"
-        );
+        assert_eq!(quote_lines("a\u{2028}Quotes:\u{2029}b\u{85}c\u{0b}d\u{0c}e"), "> a\n> Quotes:\n> b\n> c\n> d\n> e");
     }
 
     #[test]
     fn quoting_marked_lines_only() {
-        assert_eq!(quote_lines_starting("a\n===== x\r  ===== y\nz ===== w", "====="), "a\n> ===== x\n>   ===== y\nz ===== w");
+        assert_eq!(
+            quote_lines_starting("a\n===== x\r  ===== y\nz ===== w", "====="),
+            "a\n> ===== x\n>   ===== y\nz ===== w"
+        );
         assert_eq!(quote_lines_starting("plain", "====="), "plain");
         assert_eq!(
             quote_lines_starting("x\u{2028}===== a\u{0c}===== b\r\ny\u{85}===== c", "====="),

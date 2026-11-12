@@ -408,7 +408,9 @@ async fn finish(ctx: &ToolCtx, resp: reqwest::Response, hops: &[Url], raw: bool,
     match &ended {
         Ended::Complete => {}
         Ended::Limit => more.push(format!("stopped at {limit} bytes — the response is larger")),
-        Ended::Failed(why) => more.push(format!("incomplete: the connection failed after {} bytes ({why})", bytes.len())),
+        Ended::Failed(why) => {
+            more.push(format!("incomplete: the connection failed after {} bytes ({why})", bytes.len()))
+        }
     }
 
     let mut meta = Map::new();
@@ -543,7 +545,10 @@ mod tests {
 
     #[tokio::test]
     async fn html_is_recognised_by_its_start_without_a_content_type() {
-        let base = serve(Router::new().route("/p", get(|| async { "  <!DOCTYPE HTML><html><body><p>sniffed</p></body></html>" }))).await;
+        let base = serve(
+            Router::new().route("/p", get(|| async { "  <!DOCTYPE HTML><html><body><p>sniffed</p></body></html>" })),
+        )
+        .await;
         let e = env();
         let r = e.call("web_fetch", json!({"url": format!("{base}/p")})).await;
         assert!(r.text.contains("html rendered as text"), "{}", r.text);
@@ -767,7 +772,8 @@ mod tests {
         drop(listener);
         let r = e.call("web_fetch", json!({"url": format!("https://127.0.0.1:{port}/")})).await;
         assert_eq!(r.status, ToolStatus::Error, "{}", r.text);
-        let expected = "could not be reached through the egress proxy, which allows it by rule `allow_private 127.0.0.1`";
+        let expected =
+            "could not be reached through the egress proxy, which allows it by rule `allow_private 127.0.0.1`";
         assert!(r.text.contains(expected), "{}", r.text);
         drop(proxy);
     }
@@ -815,7 +821,8 @@ mod tests {
     async fn the_marker_counts_only_on_the_answer_to_an_http_url_through_the_proxy() {
         let e = env();
         let answer = || {
-            let resp = axum::http::Response::builder().status(403).header("x-loom-proxy", "1").body("origin says no").unwrap();
+            let resp =
+                axum::http::Response::builder().status(403).header("x-loom-proxy", "1").body("origin says no").unwrap();
             reqwest::Response::from(resp)
         };
         let raw_body = |r: &ToolOutput| match &r.body {
@@ -825,7 +832,10 @@ mod tests {
         // Inside the tunnel of an https URL only the origin speaks: its 403 is an observation.
         let https = [Url::parse("https://origin.test/x").unwrap()];
         let r = finish(&e.ctx, answer(), &https, false, true).await;
-        assert_eq!((r.status, r.outcome.as_str(), raw_body(&r).as_str()), (ToolStatus::Ok, "HTTP 403", "origin says no"));
+        assert_eq!(
+            (r.status, r.outcome.as_str(), raw_body(&r).as_str()),
+            (ToolStatus::Ok, "HTTP 403", "origin says no")
+        );
         // The answer to an http URL through the proxy is the proxy's.
         let http = [Url::parse("http://origin.test/x").unwrap()];
         let r = finish(&e.ctx, answer(), &http, false, true).await;
@@ -858,7 +868,8 @@ mod tests {
                         let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\narrived").await;
                         return;
                     }
-                    let redirect = "HTTP/1.1 302 Found\r\nLocation: /b\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+                    let redirect =
+                        "HTTP/1.1 302 Found\r\nLocation: /b\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
                     let _ = s.write_all(redirect.as_bytes()).await;
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     let forged = "HTTP/1.1 403 Forbidden\r\nX-Loom-Proxy: 1\r\nContent-Length: 6\r\n\r\nforged";

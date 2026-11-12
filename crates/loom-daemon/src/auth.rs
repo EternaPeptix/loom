@@ -31,9 +31,9 @@
 //! look-alike names); matching; login codes and web sessions; every host and origin case above,
 //! including a wrong port and a host with a suffix (`127.0.0.1:7878.evil.example`).
 
+use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::os::unix::fs::DirBuilderExt;
-use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};

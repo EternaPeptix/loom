@@ -122,8 +122,8 @@
 use crate::auth;
 use crate::ui;
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, ReleaseBody,
-    RuleBody, ScopeBody, SessionDetail, StatusView, WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, ReleaseBody, RuleBody,
+    ScopeBody, SessionDetail, StatusView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -470,9 +470,7 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
 fn unauthorized_page() -> Response {
     let mut response = Response::new(Body::from(UI_NOT_OPENED));
     *response.status_mut() = StatusCode::UNAUTHORIZED;
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+    response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
     with_ui_headers(response)
 }
 
@@ -649,7 +647,8 @@ async fn withdraw_rule(
 
 async fn grant_scope(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
     let body: ScopeBody = json_body(&body)?;
-    let receipt = s.runtime.grant_scope(&SessionId::from(id), &body.hosts, body.note.as_deref()).await.map_err(rt_err)?;
+    let receipt =
+        s.runtime.grant_scope(&SessionId::from(id), &body.hosts, body.note.as_deref()).await.map_err(rt_err)?;
     Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
 }
 
@@ -822,12 +821,13 @@ async fn send(tx: &mpsc::Sender<Event>, event: Option<Event>) -> bool {
 }
 
 fn sse_response(rx: mpsc::Receiver<Event>) -> Response {
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|e| (Ok::<Event, Infallible>(e), rx))
-    });
-    let mut response = Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(KEEP_ALIVE).text("keep-alive"))
-        .into_response();
+    let stream =
+        futures_util::stream::unfold(
+            rx,
+            |mut rx| async move { rx.recv().await.map(|e| (Ok::<Event, Infallible>(e), rx)) },
+        );
+    let mut response =
+        Sse::new(stream).keep_alive(KeepAlive::new().interval(KEEP_ALIVE).text("keep-alive")).into_response();
     response.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
     response
 }
@@ -873,10 +873,7 @@ async fn session_stream(
     let q = params(q)?;
     let after: Option<Seq> = match number(&q, "after")? {
         Some(a) => Some(a),
-        None => headers
-            .get("last-event-id")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<Seq>().ok()),
+        None => headers.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<Seq>().ok()),
     };
     // Subscribe before the log is read: whatever is appended from here on arrives on the bus, and
     // what the log already holds is replayed.
@@ -1092,11 +1089,7 @@ mod tests {
         let serve = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .unwrap();
+        let http = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap();
         Env { dir, _server: server, rt, port, token, http, shutdown, ws, logins, serve }
     }
 
@@ -1231,7 +1224,11 @@ mod tests {
     }
 
     fn record_seqs(events: &[(Option<String>, Value)]) -> Vec<u64> {
-        events.iter().filter(|(_, e)| e["type"] == "record").map(|(_, e)| e["record"]["seq"].as_u64().unwrap()).collect()
+        events
+            .iter()
+            .filter(|(_, e)| e["type"] == "record")
+            .map(|(_, e)| e["record"]["seq"].as_u64().unwrap())
+            .collect()
     }
 
     fn assert_contiguous_from(seqs: &[u64], first: u64) {
@@ -1261,8 +1258,12 @@ mod tests {
         let anon = |m: Method, p: &str| e.http.request(m, e.url(p));
 
         // Host first, whatever else is wrong.
-        let (s, b) = json_of(anon(Method::GET, "/api/status").header("Host", "evil.example").send().await.unwrap()).await;
-        assert_eq!((s, b["error"].as_str().unwrap()), (403, "This address is not the loom daemon's own (Host header)."));
+        let (s, b) =
+            json_of(anon(Method::GET, "/api/status").header("Host", "evil.example").send().await.unwrap()).await;
+        assert_eq!(
+            (s, b["error"].as_str().unwrap()),
+            (403, "This address is not the loom daemon's own (Host header).")
+        );
         let wrong_port = format!("127.0.0.1:{}", e.port.wrapping_add(1));
         let (s, _) = json_of(e.rq(Method::GET, "/api/status").header("Host", wrong_port).send().await.unwrap()).await;
         assert_eq!(s, 403);
@@ -1292,14 +1293,18 @@ mod tests {
         .await;
         assert_eq!(s, 403);
         let own = format!("http://127.0.0.1:{}", e.port);
-        let (s, b) = json_of(e.rq(Method::POST, "/api/sessions/s-x/stop").header("Origin", own).send().await.unwrap()).await;
+        let (s, b) =
+            json_of(e.rq(Method::POST, "/api/sessions/s-x/stop").header("Origin", own).send().await.unwrap()).await;
         assert_eq!((s, b["error"].as_str().unwrap()), (404, "There is no session s-x."));
         // GET is not subject to the Origin check.
-        let (s, _) = json_of(e.rq(Method::GET, "/api/status").header("Origin", "http://evil.example").send().await.unwrap()).await;
+        let (s, _) =
+            json_of(e.rq(Method::GET, "/api/status").header("Origin", "http://evil.example").send().await.unwrap())
+                .await;
         assert_eq!(s, 200);
 
         // Then the token.
-        let message = "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token.";
+        let message =
+            "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token.";
         let (s, b) = json_of(anon(Method::GET, "/api/status").send().await.unwrap()).await;
         assert_eq!((s, b["error"].as_str().unwrap()), (401, message));
         let (s, _) = json_of(anon(Method::GET, "/api/status").bearer_auth("nope").send().await.unwrap()).await;
@@ -1312,7 +1317,8 @@ mod tests {
         assert_eq!(s, 200);
         // A cookie, even one carrying the token, is not a credential.
         let pair = format!("loom_token={}", e.token);
-        let (s, _) = json_of(anon(Method::GET, "/api/status").header("Cookie", pair.clone()).send().await.unwrap()).await;
+        let (s, _) =
+            json_of(anon(Method::GET, "/api/status").header("Cookie", pair.clone()).send().await.unwrap()).await;
         assert_eq!(s, 401);
         let (s, _) = json_of(anon(Method::POST, "/api/shutdown").header("Cookie", pair).send().await.unwrap()).await;
         assert_eq!(s, 401);
@@ -1345,7 +1351,8 @@ mod tests {
         let code = location.strip_prefix("/#code=").unwrap();
         assert!(!location.contains(&e.token));
         // The code in the fragment is a working one.
-        let (s, b) = json_of(e.http.post(e.url("/api/web-sessions")).json(&json!({ "code": code })).send().await.unwrap()).await;
+        let (s, b) =
+            json_of(e.http.post(e.url("/api/web-sessions")).json(&json!({ "code": code })).send().await.unwrap()).await;
         assert_eq!(s, 200, "{b}");
 
         let r = anon("/?token=wrong").send().await.unwrap();
@@ -1404,7 +1411,9 @@ mod tests {
         // Only the page does it: not the redirect, the refusals, the assets or the API, and the
         // cookie opens nothing.
         let redirect = format!("/?token={}", e.token);
-        for (path, status) in [(redirect.as_str(), 303u16), ("/?token=wrong", 401), ("/app.js", 200), ("/api/status", 401)] {
+        for (path, status) in
+            [(redirect.as_str(), 303u16), ("/?token=wrong", 401), ("/app.js", 200), ("/api/status", 401)]
+        {
             let r = with_cookie(path).send().await.unwrap();
             assert_eq!(r.status(), status, "{path}");
             assert!(r.headers().get("set-cookie").is_none(), "{path}");
@@ -1421,7 +1430,8 @@ mod tests {
             let req = e.http.post(e.url("/api/web-sessions")).json(&json!({ "code": code }));
             async move { json_of(req.send().await.unwrap()).await }
         };
-        let message = "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token.";
+        let message =
+            "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token.";
 
         // Minting needs the API token.
         let (s, _) = json_of(e.http.post(e.url("/api/login-codes")).send().await.unwrap()).await;
@@ -1463,7 +1473,11 @@ mod tests {
 
         // The exchange still has the Host and Origin checks.
         let code = e.logins.mint_code();
-        let r = e.http.post(e.url("/api/web-sessions")).header("Origin", "http://evil.example").json(&json!({ "code": code }));
+        let r = e
+            .http
+            .post(e.url("/api/web-sessions"))
+            .header("Origin", "http://evil.example")
+            .json(&json!({ "code": code }));
         assert_eq!(json_of(r.send().await.unwrap()).await.0, 403);
         let r = e.http.post(e.url("/api/web-sessions")).header("Host", "evil.example").json(&json!({ "code": code }));
         assert_eq!(json_of(r.send().await.unwrap()).await.0, 403);
@@ -1697,7 +1711,8 @@ mod tests {
 
         // The scope of an approval and the reason of a withdrawal may be left out, as the command
         // line and the page do: both are recorded all the same.
-        let (s, b) = e.post(&format!("/api/sessions/{id}/approvals"), json!({"text": "ship it", "scope": "staging"})).await;
+        let (s, b) =
+            e.post(&format!("/api/sessions/{id}/approvals"), json!({"text": "ship it", "scope": "staging"})).await;
         assert_eq!((s, b), (202, receipt(Value::Null)));
         let (s, b) = e.post(&format!("/api/sessions/{id}/approvals"), json!({"text": "run the tests"})).await;
         assert_eq!((s, b), (202, receipt(json!("only what the approval says"))));
@@ -1749,7 +1764,10 @@ mod tests {
         assert_eq!((s, b), (202, json!({"lead": chat, "queued": false, "ledger": false, "stock": null})));
         let (s, b) = e.post(&format!("/api/sessions/{chat}/rules/k1/withdraw"), json!({})).await;
         assert_eq!(s, 404, "{b}");
-        assert!(b["error"].as_str().unwrap().ends_with("Tell the lead in a message that the rule no longer applies."), "{b}");
+        assert!(
+            b["error"].as_str().unwrap().ends_with("Tell the lead in a message that the rule no longer applies."),
+            "{b}"
+        );
 
         for bad in ["..%2F..%2Fetc", "..%2Fsessions%2Fx", "m-nope"] {
             let (s, b) = e.get(&format!("/api/missions/{bad}/ledger")).await;
@@ -1767,7 +1785,12 @@ mod tests {
         let child = detail["children"][0]["id"].as_str().unwrap().to_string();
 
         // A child's id reaches its lead, which the receipt names.
-        let (s, b) = e.post(&format!("/api/sessions/{child}/scope"), json!({"hosts": ["a.example.test", "*.b.test"], "note": "docs"})).await;
+        let (s, b) = e
+            .post(
+                &format!("/api/sessions/{child}/scope"),
+                json!({"hosts": ["a.example.test", "*.b.test"], "note": "docs"}),
+            )
+            .await;
         assert_eq!((s, &b["lead"], &b["hosts"]), (202, &json!(id), &json!(["a.example.test", "*.b.test"])), "{b}");
         assert!(b["ledger"].is_boolean(), "{b}");
         let (s, b) = e.post(&format!("/api/sessions/{id}/scope"), json!({"hosts": ["c.test"]})).await;
@@ -1862,7 +1885,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_blocking_item_refuses_an_empty_answer_with_409() {
-        let e = env(Script::new(|_, n| if n == 0 { call("ask_user", json!({"question": "which one?"})) } else { finish("fine") }))
+        let e =
+            env(Script::new(
+                |_, n| if n == 0 { call("ask_user", json!({"question": "which one?"})) } else { finish("fine") },
+            ))
             .await;
         let id = e.create("go").await;
         let end = tokio::time::Instant::now() + WAIT;
@@ -1942,9 +1968,13 @@ mod tests {
         let e = env(Script::new(|_, _| slow_finish("ok", 0))).await;
         let blobs = e.rt.blobs();
         let (orphan, young) = (blobs.put_bytes(b"orphan\n").unwrap(), blobs.put_bytes(b"young\n").unwrap());
-        let f = std::fs::OpenOptions::new().write(true).open(blobs.root().join(&orphan.id.0[..2]).join(&orphan.id.0)).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(blobs.root().join(&orphan.id.0[..2]).join(&orphan.id.0))
+            .unwrap();
         f.set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)).unwrap();
-        let fields = |r: &Value| [r["applied"].clone(), r["examined"].clone(), r["kept"].clone(), r["collected"].clone()];
+        let fields =
+            |r: &Value| [r["applied"].clone(), r["examined"].clone(), r["kept"].clone(), r["collected"].clone()];
         let (s, r) = e.post("/api/gc", json!({})).await;
         assert_eq!((s, fields(&r)), (200, [json!(false), json!(2), json!(1), json!(1)]));
         assert!(blobs.read_all(&orphan.id).is_ok());
@@ -1960,8 +1990,10 @@ mod tests {
 
     #[tokio::test]
     async fn the_stream_replays_the_log_then_delivers_what_is_appended() {
-        let e = env(Script::new(|_, n| slow_finish("an answer long enough to arrive in several pieces", if n == 0 { 0 } else { 60 })))
-            .await;
+        let e = env(Script::new(|_, n| {
+            slow_finish("an answer long enough to arrive in several pieces", if n == 0 { 0 } else { 60 })
+        }))
+        .await;
         let id = e.create("first").await;
         e.wait_turn_ends(&id, 1).await;
         let log = e.records(&id).await;
@@ -2122,7 +2154,10 @@ mod tests {
 
     #[tokio::test]
     async fn no_record_is_skipped_or_repeated_across_the_replay_and_live_boundary() {
-        let e = env(Script::new(|_, n| slow_finish("a reply split into a number of small pieces", if n == 0 { 0 } else { 30 }))).await;
+        let e = env(Script::new(|_, n| {
+            slow_finish("a reply split into a number of small pieces", if n == 0 { 0 } else { 30 })
+        }))
+        .await;
         let id = e.create("first").await;
         e.wait_turn_ends(&id, 1).await;
 
@@ -2294,7 +2329,10 @@ mod tests {
         let big: String = (1..=6_000).map(|n| format!("line {n}\n")).collect();
         let big = e.rt.blobs().put_bytes(big.as_bytes()).unwrap();
         let (_, first) = e.get(&format!("/api/blobs/{}/lines", big.handle())).await;
-        assert_eq!((first["first"].clone(), first["last"].clone(), first["total"].clone()), (json!(1), json!(2000), json!(6000)));
+        assert_eq!(
+            (first["first"].clone(), first["last"].clone(), first["total"].clone()),
+            (json!(1), json!(2000), json!(6000))
+        );
         let (_, capped) = e.get(&format!("/api/blobs/{}/lines?start=1&end=100000", big.handle())).await;
         assert_eq!(capped["last"], 5000);
         let (_, tail) = e.get(&format!("/api/blobs/{}/lines?start=5500&end=100000", big.handle())).await;

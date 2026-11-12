@@ -422,7 +422,7 @@
 //! - `archive` hides, refuses messages, and survives a restart;
 //! - `records` paging and `window` totals; `ledger` after a goal was set by the first message.
 
-use crate::pack::{self, PromptEnv, RoleDef, Packs};
+use crate::pack::{self, Packs, PromptEnv, RoleDef};
 use crate::rtools::{self, ChildInfo, Orchestrator, Producer, Settlement, Shared, SpawnReq, Vote};
 use crate::session::{queue_input, Control, Deps, End, Input, Phase, Session, Sink, Status};
 use crate::texts;
@@ -681,19 +681,41 @@ pub enum Delta {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BusEvent {
     /// A session was created.
-    Session { info: Box<SessionInfo> },
-    Record { session: SessionId, record: Box<Record> },
-    Delta { session: SessionId, req_id: String, delta: Delta },
-    Status { session: SessionId, status: Status },
-    Net { session: SessionId, entry: NetEntry },
+    Session {
+        info: Box<SessionInfo>,
+    },
+    Record {
+        session: SessionId,
+        record: Box<Record>,
+    },
+    Delta {
+        session: SessionId,
+        req_id: String,
+        delta: Delta,
+    },
+    Status {
+        session: SessionId,
+        status: Status,
+    },
+    Net {
+        session: SessionId,
+        entry: NetEntry,
+    },
     /// A child settled (also visible as records; this is for listings).
-    Settled { session: SessionId, settlement: Box<Settlement> },
-    Error { session: Option<SessionId>, message: String },
+    Settled {
+        session: SessionId,
+        settlement: Box<Settlement>,
+    },
+    Error {
+        session: Option<SessionId>,
+        message: String,
+    },
     /// Never published by the runtime. The API sends it to a subscriber that fell behind and
     /// missed `missed` events; the subscriber should fetch what it shows again.
-    Lagged { missed: u64 },
+    Lagged {
+        missed: u64,
+    },
 }
-
 
 /// What every public method answers once `shutdown` has begun.
 const SHUTTING: &str = "The harness is shutting down.";
@@ -778,7 +800,8 @@ fn produced_by(
 ) -> Option<(BlobId, Producer)> {
     match event {
         Event::ToolResult(t) => {
-            let p = Producer { session: session.clone(), call_id: t.call_id.clone(), tool: t.name.clone(), class: t.class };
+            let p =
+                Producer { session: session.clone(), call_id: t.call_id.clone(), tool: t.name.clone(), class: t.class };
             if let Some(o) = &t.output {
                 return Some((o.id.clone(), p));
             }
@@ -789,7 +812,12 @@ fn produced_by(
             None
         }
         Event::JobRegistered { job_id, call_id, .. } => {
-            let p = Producer { session: session.clone(), call_id: call_id.clone(), tool: "bash".into(), class: ToolClass::Exec };
+            let p = Producer {
+                session: session.clone(),
+                call_id: call_id.clone(),
+                tool: "bash".into(),
+                class: ToolClass::Exec,
+            };
             jobs.insert((session.clone(), job_id.clone()), p);
             None
         }
@@ -1054,8 +1082,12 @@ impl Sink for SinkImpl {
                 StreamEvent::AttemptStart { attempt } => Delta::AttemptStart { attempt: *attempt },
                 StreamEvent::Text(t) => Delta::Text { text: t.clone() },
                 StreamEvent::Reasoning(t) => Delta::Reasoning { text: t.clone() },
-                StreamEvent::ToolCallStart { index, name } => Delta::ToolCallStart { index: *index, name: name.clone() },
-                StreamEvent::ToolCallArgs { index, delta } => Delta::ToolCallArgs { index: *index, text: delta.clone() },
+                StreamEvent::ToolCallStart { index, name } => {
+                    Delta::ToolCallStart { index: *index, name: name.clone() }
+                }
+                StreamEvent::ToolCallArgs { index, delta } => {
+                    Delta::ToolCallArgs { index: *index, text: delta.clone() }
+                }
                 StreamEvent::Retrying { attempt, after_ms, reason } => {
                     Delta::Retrying { attempt: *attempt, after_ms: *after_ms, reason: reason.clone() }
                 }
@@ -1103,7 +1135,12 @@ impl Orchestrator for Orch {
         inner.spawn_child(parent, req)
     }
 
-    async fn join(&self, parent: &SessionId, child: &SessionId, cancel: &CancellationToken) -> Result<Settlement, String> {
+    async fn join(
+        &self,
+        parent: &SessionId,
+        child: &SessionId,
+        cancel: &CancellationToken,
+    ) -> Result<Settlement, String> {
         let inner = self.0.upgrade().ok_or_else(|| SHUTTING.to_string())?;
         let (mut rx, parent_shared) = {
             let st = inner.st();
@@ -1251,9 +1288,12 @@ impl Orchestrator for Orch {
             (known.status.fork_point, known.meta.profile.clone())
         };
         let Some(fork_point) = fork_point else {
-            return Err("Nothing has been sent to the model in this session yet, so there is nothing to vote on.".to_string());
+            return Err(
+                "Nothing has been sent to the model in this session yet, so there is nothing to vote on.".to_string()
+            );
         };
-        let rt = inner.profiles.get(&profile).ok_or_else(|| format!("model profile \"{profile}\" is not configured."))?;
+        let rt =
+            inner.profiles.get(&profile).ok_or_else(|| format!("model profile \"{profile}\" is not configured."))?;
         let records = read_records(&inner.paths.session_log(session)).map_err(|e| e.to_string())?.records;
         let upto: Vec<Record> = records.into_iter().filter(|r| r.seq <= fork_point).collect();
         let w = weave(&upto);
@@ -1758,12 +1798,7 @@ impl Inner {
             sandbox: deps.ctx.sandbox.describe(),
             network: network_text(&self.config),
         };
-        let replay = self
-            .config
-            .models
-            .get(&meta.profile)
-            .map(|p| p.reasoning_replay)
-            .unwrap_or_default();
+        let replay = self.config.models.get(&meta.profile).map(|p| p.reasoning_replay).unwrap_or_default();
         Ok(SessionStart {
             session: meta.id.clone(),
             mission: meta.mission.clone(),
@@ -1861,8 +1896,8 @@ impl Inner {
         let cut = cut_by_restart(session.records());
         let open = open_items(session.records());
         let status = session.status();
-        let woken =
-            session.pending_job_ends() > 0 && matches!(status.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
+        let woken = session.pending_job_ends() > 0
+            && matches!(status.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
         {
             let mut st = self.st();
             for (item, opened_ms) in open {
@@ -1907,7 +1942,11 @@ impl Inner {
                 tracing::error!("session {} stopped: {e}", id.as_str());
                 self.publish_error(Some(id), format!("Session {} stopped: {e}", id.as_str()));
                 self.clear_active(id, gen);
-                let title = self.st().known.get(id).map(|k| (k.meta.title.clone(), k.meta.parent.is_some(), k.meta.role.clone(), k.status.step));
+                let title = self
+                    .st()
+                    .known
+                    .get(id)
+                    .map(|k| (k.meta.title.clone(), k.meta.parent.is_some(), k.meta.role.clone(), k.status.step));
                 match title {
                     Some((title, is_child, role, steps)) => {
                         if !self.shutting.load(Ordering::SeqCst) {
@@ -2002,7 +2041,11 @@ impl Inner {
     fn deliver(self: &Arc<Self>, parent: &SessionId, s: Settlement) {
         let handed = match self.activate(parent) {
             Err(e) => {
-                tracing::warn!("the settlement of {} cannot be delivered to {}: {e}", s.child.as_str(), parent.as_str());
+                tracing::warn!(
+                    "the settlement of {} cannot be delivered to {}: {e}",
+                    s.child.as_str(),
+                    parent.as_str()
+                );
                 false
             }
             Ok(_) => {
@@ -2038,7 +2081,10 @@ impl Inner {
                 Some(r) => r.clone(),
                 None => {
                     let list = if prole.may_spawn.is_empty() { "none".to_string() } else { prole.may_spawn.join(", ") };
-                    return Err(format!("`{}` is not a role this session can start. Roles it can start: {list}.", req.role));
+                    return Err(format!(
+                        "`{}` is not a role this session can start. Roles it can start: {list}.",
+                        req.role
+                    ));
                 }
             };
             let running = st
@@ -2168,7 +2214,10 @@ impl Inner {
     /// when the server could not be asked and the numbers come from the profile alone. Without a
     /// configured window that is refused: a session must not start with a window nobody knows.
     async fn facts(&self, profile_name: &str) -> Result<(String, Option<u64>, bool), String> {
-        let rt = self.profiles.get(profile_name).ok_or_else(|| format!("The model profile \"{profile_name}\" is not configured."))?;
+        let rt = self
+            .profiles
+            .get(profile_name)
+            .ok_or_else(|| format!("The model profile \"{profile_name}\" is not configured."))?;
         let remembered = lock(&rt.discovered).clone();
         let profile = rt.client.profile();
         let found = match remembered {
@@ -2224,7 +2273,8 @@ impl Inner {
                 .iter()
                 .filter_map(|(id, k)| {
                     let parent = k.meta.parent.clone()?;
-                    let parent_ok = st.known.get(&parent).is_some_and(|p| !p.meta.archived && p.status.phase != Phase::Ended);
+                    let parent_ok =
+                        st.known.get(&parent).is_some_and(|p| !p.meta.archived && p.status.phase != Phase::Ended);
                     let wanted = scope(k) && !k.joined && !k.meta.archived && parent_ok;
                     wanted.then(|| (id.clone(), parent, k.meta.clone(), k.finished()))
                 })
@@ -2490,9 +2540,10 @@ impl Inner {
             for (id, k) in st.known.iter_mut().filter(|(_, k)| k.meta.parent.as_ref() == Some(parent) && !k.joined) {
                 let Some(given) = &k.gate else { continue };
                 // One that was stopped, failed, or ended without a verdict gives nothing to take.
-                let verdict = k.settlement.as_ref().is_some_and(|s| {
-                    s.payload.get("accepted").is_some_and(serde_json::Value::is_boolean)
-                });
+                let verdict = k
+                    .settlement
+                    .as_ref()
+                    .is_some_and(|s| s.payload.get("accepted").is_some_and(serde_json::Value::is_boolean));
                 let usable = verdict || (!k.finished() && k.active.is_some());
                 if found.is_none() && usable && given == brief && k.meta.role == role {
                     found = Some(id.clone());
@@ -2722,7 +2773,10 @@ const UNVERIFIED_TEXT: &str = "[From the agent, unverified] ";
 
 /// The inbox kind in snake case, as notifications name it.
 fn inbox_kind_word(item: &InboxItem) -> String {
-    serde_json::to_value(item.kind).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "question".to_string())
+    serde_json::to_value(item.kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "question".to_string())
 }
 
 /// What a notification says about an inbox item. An item opened by a tool call (`call_id` set: a question, a
@@ -2991,8 +3045,8 @@ impl Runtime {
                 continue;
             }
             // The settlement recovered for it starts a turn by itself.
-            let turn_coming = recovered.contains(&id)
-                && matches!(last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
+            let turn_coming =
+                recovered.contains(&id) && matches!(last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
             // A session that waited on a job the restart lost is woken, attended or not: the job's
             // arrival would have woken it. A lead that waits for its agents is woken by their reports.
             let carry_on = !turn_coming
@@ -3146,9 +3200,15 @@ impl Runtime {
         let k = st.known.get(id).ok_or_else(|| no_session(id))?;
         if let (Some(_), Some(_)) = (root, &k.meta.parent) {
             return Err(match root {
-                Some("message") => format!("Messages go to the lead session of a mission; {} is one of its agents.", id.as_str()),
-                Some("resume") => format!("Resume goes to the lead session of a mission; {} is one of its agents.", id.as_str()),
-                _ => format!("Only the lead session of a mission can be archived; {} is one of its agents.", id.as_str()),
+                Some("message") => {
+                    format!("Messages go to the lead session of a mission; {} is one of its agents.", id.as_str())
+                }
+                Some("resume") => {
+                    format!("Resume goes to the lead session of a mission; {} is one of its agents.", id.as_str())
+                }
+                _ => {
+                    format!("Only the lead session of a mission can be archived; {} is one of its agents.", id.as_str())
+                }
             });
         }
         Ok(k.meta.clone())
@@ -3333,7 +3393,12 @@ impl Runtime {
     /// restored session gets its grants back from the ledger. The configured `deny` list and private
     /// address rules still apply to a granted host. Refused: an unknown or archived session, no host,
     /// a blank or invalid host, a session that is not running.
-    pub async fn grant_scope(&self, id: &SessionId, hosts: &[String], note: Option<&str>) -> Result<ScopeReceipt, String> {
+    pub async fn grant_scope(
+        &self,
+        id: &SessionId,
+        hosts: &[String],
+        note: Option<&str>,
+    ) -> Result<ScopeReceipt, String> {
         let hosts = loom_net::policy::check_hosts(hosts)?;
         let note = note.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
         let lead = self.lead_of(id)?;
@@ -3425,7 +3490,9 @@ impl Runtime {
             let mut ids = vec![id.clone()];
             ids.extend(st.known.iter().filter(|(_, k)| k.meta.parent.as_ref() == Some(id)).map(|(c, _)| c.clone()));
             if archived
-                && ids.iter().any(|i| st.known.get(i).is_some_and(|k| k.active.is_some() && k.status.phase == Phase::Running))
+                && ids
+                    .iter()
+                    .any(|i| st.known.get(i).is_some_and(|k| k.active.is_some() && k.status.phase == Phase::Running))
             {
                 return Err("Stop the session before archiving it.".to_string());
             }
@@ -3502,7 +3569,8 @@ impl Runtime {
         tokio::task::spawn_blocking(move || {
             let started = std::time::Instant::now();
             let bounds = ScanBounds { file_max, time, started };
-            let stored = blobs.ids().map_err(|e| format!("cannot list the blob store ({e}); nothing was collected."))?;
+            let stored =
+                blobs.ids().map_err(|e| format!("cannot list the blob store ({e}); nothing was collected."))?;
             let mut keep = HashSet::new();
             for (root, temp_dirs) in &roots {
                 scan_tree_for_ids(root, *temp_dirs, &stored, &mut keep, &bounds)?;
@@ -3536,7 +3604,10 @@ impl Runtime {
             return Err("This item is waiting for an answer; write one.".to_string());
         }
         self.inner.activate(&entry.session)?;
-        if !self.inner.send_input(&entry.session, Input::Answer { item_id: item_id.to_string(), answer: answer.to_string() }) {
+        if !self
+            .inner
+            .send_input(&entry.session, Input::Answer { item_id: item_id.to_string(), answer: answer.to_string() })
+        {
             return Err(format!("Session {} is not accepting input.", entry.session.as_str()));
         }
         // An answer starts a turn (an empty one only dismisses the item): as for a message.
@@ -3551,7 +3622,12 @@ impl Runtime {
     }
 
     /// The page `records` gives, each record with its stored line when it was read as `Event::Unknown`.
-    pub fn stored_records(&self, id: &SessionId, after: Option<Seq>, limit: usize) -> Result<Vec<StoredRecord>, String> {
+    pub fn stored_records(
+        &self,
+        id: &SessionId,
+        after: Option<Seq>,
+        limit: usize,
+    ) -> Result<Vec<StoredRecord>, String> {
         self.inner.check_open()?;
         if !self.inner.st().known.contains_key(id) {
             return Err(no_session(id));
@@ -3623,7 +3699,13 @@ impl Runtime {
         if !path.is_file() {
             // A lead that keeps a ledger and has recorded nothing yet has an empty one; only a lead that keeps none has no ledger.
             // A lead whose role can no longer be looked up (its pack was removed) is taken to keep none.
-            let lead = self.inner.st().known.values().find(|k| &k.meta.mission == mission && k.meta.parent.is_none()).map(|k| k.meta.clone());
+            let lead = self
+                .inner
+                .st()
+                .known
+                .values()
+                .find(|k| &k.meta.mission == mission && k.meta.parent.is_none())
+                .map(|k| k.meta.clone());
             if !lead.is_some_and(|meta| self.inner.mission_explicit(&meta).unwrap_or(false)) {
                 return Err("No ledger: this mission's lead does not keep one.".to_string());
             }
@@ -3684,7 +3766,11 @@ impl Runtime {
                 base_url: profile.base_url.clone(),
                 model,
                 reachable,
-                detail: if reachable { String::new() } else { format!("{} did not answer a request for its models.", profile.base_url) },
+                detail: if reachable {
+                    String::new()
+                } else {
+                    format!("{} did not answer a request for its models.", profile.base_url)
+                },
                 context_window: window,
                 max_concurrent: rt.limiter.capacity(),
             });
@@ -3871,7 +3957,8 @@ fn scan_tree_for_ids(
         let unreadable = |e: std::io::Error| bounds.stopped(&path, ScanStop::Unreadable(e));
         // Gone meanwhile (a session directory being removed), or, below the root, a link: an entry of `root`
         // that dangles or loops, or an entry further down that was replaced by one since it was listed.
-        let nothing_there = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound || (depth > 0 && is_absent(e));
+        let nothing_there =
+            |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound || (depth > 0 && is_absent(e));
         let (file, meta) = match open_unblocked(&path, depth <= 1) {
             Ok(opened) => opened,
             Err(e) if nothing_there(&e) => continue,
@@ -3992,7 +4079,9 @@ mod tests {
     fn hud_of(body: &Value) -> String {
         body["messages"]
             .as_array()
-            .and_then(|m| m.iter().rev().find_map(|m| m["content"].as_str().filter(|c| c.starts_with("<harness-state>"))))
+            .and_then(|m| {
+                m.iter().rev().find_map(|m| m["content"].as_str().filter(|c| c.starts_with("<harness-state>")))
+            })
             .unwrap_or("")
             .to_string()
     }
@@ -4038,11 +4127,8 @@ mod tests {
         c.agents.verify_finish = false;
         c.tools.kill_grace_s = 1;
         if let Some(f) = notify_file {
-            c.notify.command = vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                format!("echo \"$LOOM_KIND $LOOM_SESSION\" >> '{}'", f.display()),
-            ];
+            c.notify.command =
+                vec!["/bin/sh".into(), "-c".into(), format!("echo \"$LOOM_KIND $LOOM_SESSION\" >> '{}'", f.display())];
         }
         c
     }
@@ -4167,12 +4253,16 @@ mod tests {
     #[tokio::test]
     async fn a_looser_existing_home_is_tightened_and_new_session_files_are_private() {
         use std::os::unix::fs::PermissionsExt;
-        let e = env_with_packs(Script::new(|_, _| finish("ok")), |_| {}, |packs| {
-            std::fs::create_dir_all(packs).unwrap();
-            for d in [packs.parent().unwrap(), packs] {
-                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-        })
+        let e = env_with_packs(
+            Script::new(|_, _| finish("ok")),
+            |_| {},
+            |packs| {
+                std::fs::create_dir_all(packs).unwrap();
+                for d in [packs.parent().unwrap(), packs] {
+                    std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+                }
+            },
+        )
         .await;
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let home = e.dir.path().join("home");
@@ -4336,7 +4426,10 @@ mod tests {
         let grants = e.rt.ledger(&mission).unwrap().state.scope_grants;
         assert_eq!(grants[0].note.as_deref(), Some("the target"));
         let noted = |needle: &str| {
-            e.has(&id, |ev| matches!(ev, Event::HarnessNote { note: NoteKind::Approval, text } if text.contains(needle)))
+            e.has(
+                &id,
+                |ev| matches!(ev, Event::HarnessNote { note: NoteKind::Approval, text } if text.contains(needle)),
+            )
         };
         until("note", || noted("The operator authorized network access to: api.example.test.")).await;
         assert!(noted("a standing authorization for this session"));
@@ -4355,7 +4448,12 @@ mod tests {
         let none: [String; 0] = [];
         assert!(e.rt.grant_scope(&id, &none, None).await.unwrap_err().contains("at least one host"));
         assert!(e.rt.grant_scope(&id, &["  ".to_string()], None).await.unwrap_err().contains("blank"));
-        assert!(e.rt.grant_scope(&id, &["a*b.test".to_string()], None).await.unwrap_err().contains("cannot be authorized"));
+        assert!(e
+            .rt
+            .grant_scope(&id, &["a*b.test".to_string()], None)
+            .await
+            .unwrap_err()
+            .contains("cannot be authorized"));
         let unknown = SessionId::from("s-nope");
         let err = e.rt.grant_scope(&unknown, &["a.test".to_string()], None).await.unwrap_err();
         assert_eq!(err, "There is no session s-nope.");
@@ -4414,9 +4512,8 @@ mod tests {
         let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
         let refused = "There is no rule k1 in this mission; it has no rules in force.";
         assert_eq!(e.rt.withdraw_rule(&id, "k1", "").await.unwrap_err(), refused);
-        let noted = |needle: &str| {
-            e.has(&id, |ev| matches!(ev, Event::HarnessNote { text, .. } if text.contains(needle)))
-        };
+        let noted =
+            |needle: &str| e.has(&id, |ev| matches!(ev, Event::HarnessNote { text, .. } if text.contains(needle)));
 
         e.rt.add_rule(&id, "first rule").await.unwrap();
         e.rt.add_rule(&id, "second rule").await.unwrap();
@@ -4509,14 +4606,17 @@ mod tests {
     async fn a_rule_queued_for_a_lead_in_a_turn_is_kept_on_disk_until_it_is_recorded() {
         let stall = Arc::new(AtomicBool::new(true));
         let flag = stall.clone();
-        let e = env(Script::new(move |_, _| {
-            if flag.load(Ordering::SeqCst) {
-                Action::Stall { ms: 600_000 }
-            } else {
-                finish("done")
-            }
-        }))
-        .await;
+        let e =
+            env(Script::new(
+                move |_, _| {
+                    if flag.load(Ordering::SeqCst) {
+                        Action::Stall { ms: 600_000 }
+                    } else {
+                        finish("done")
+                    }
+                },
+            ))
+            .await;
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
         until("running", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Running)).await;
@@ -4555,7 +4655,9 @@ mod tests {
         let info = e.rt.create_session(e.new_session(None)).await.unwrap();
         let mission = info.meta.mission.clone();
         let journal = Journal::new(e.rt.paths().journal(&mission), e.rt.inner.key.clone());
-        journal.append(&info.meta.id, true, loom_core::ledger::LedgerOp::GoalSet { text: "ship it".into() }, &|_| Ok(())).unwrap();
+        journal
+            .append(&info.meta.id, true, loom_core::ledger::LedgerOp::GoalSet { text: "ship it".into() }, &|_| Ok(()))
+            .unwrap();
         let view = e.rt.ledger(&mission).unwrap();
         assert_eq!((view.skipped, view.torn_tail, view.ahead_of_head), (0, false, 0));
         assert!(view.notices().is_empty(), "{:?}", view.notices());
@@ -4608,7 +4710,10 @@ mod tests {
         let detail = view.skipped_detail.clone().unwrap_or_default();
         assert!(detail.starts_with("entry 2: op `hologram_set`"), "{detail}");
         let notices = view.notices();
-        assert!(notices[0].starts_with("1 ledger entry written by a newer loom is not shown (first: entry 2"), "{notices:?}");
+        assert!(
+            notices[0].starts_with("1 ledger entry written by a newer loom is not shown (first: entry 2"),
+            "{notices:?}"
+        );
 
         // The model's state block says so as well.
         e.rt.send_message(&id, "go").await.unwrap();
@@ -4629,7 +4734,9 @@ mod tests {
         let notices = view.notices();
         assert_eq!(notices.len(), 1);
         assert!(
-            notices[0].starts_with("2 ledger entries written by a newer loom are not shown (first: entry 4: op `hologram_set`"),
+            notices[0].starts_with(
+                "2 ledger entries written by a newer loom are not shown (first: entry 4: op `hologram_set`"
+            ),
             "{notices:?}"
         );
         // A view from a daemon that does not report them still reads.
@@ -4644,11 +4751,15 @@ mod tests {
     #[tokio::test]
     async fn a_lead_whose_pack_is_gone_and_has_no_journal_file_keeps_no_ledger() {
         let pack_toml = "name = \"gone\"\ndefault_role = \"r\"\n[roles.r]\nprompt = \"r.md\"\ntools = [\"finish\"]\ntermination = \"explicit\"\n";
-        let e = env_with_packs(Script::new(|_, _| Action::Stall { ms: 600_000 }), |_| {}, |packs| {
-            std::fs::create_dir_all(packs.join("gone")).unwrap();
-            std::fs::write(packs.join("gone/pack.toml"), pack_toml).unwrap();
-            std::fs::write(packs.join("gone/r.md"), "Role R.").unwrap();
-        })
+        let e = env_with_packs(
+            Script::new(|_, _| Action::Stall { ms: 600_000 }),
+            |_| {},
+            |packs| {
+                std::fs::create_dir_all(packs.join("gone")).unwrap();
+                std::fs::write(packs.join("gone/pack.toml"), pack_toml).unwrap();
+                std::fs::write(packs.join("gone/r.md"), "Role R.").unwrap();
+            },
+        )
         .await;
         let mut new = e.new_session(None);
         new.pack = Some("gone".into());
@@ -5008,7 +5119,9 @@ mod tests {
     #[tokio::test]
     async fn verified_finish_with_real_children_is_delivered_after_an_accepting_verdict() {
         let e = env_with(
-            Script::new(|body, _| if has_tool(body, "verdict") { verifier_turn(body, true) } else { finish("lead done") }),
+            Script::new(
+                |body, _| if has_tool(body, "verdict") { verifier_turn(body, true) } else { finish("lead done") },
+            ),
             false,
             |c| c.agents.verify_finish = true,
         )
@@ -5036,7 +5149,11 @@ mod tests {
                     return verifier_turn(body, false);
                 }
                 // The lead finishes once, reads the rejection, and goes on working.
-                if tool_msgs(body) == 0 { finish("lead done") } else { Action::Stall { ms: 600_000 } }
+                if tool_msgs(body) == 0 {
+                    finish("lead done")
+                } else {
+                    Action::Stall { ms: 600_000 }
+                }
             }),
             false,
             |c| c.agents.verify_finish = true,
@@ -5045,7 +5162,10 @@ mod tests {
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         let id = info.meta.id.clone();
         until("the lead saw the objection", || {
-            e.server.requests().iter().any(|b| has_tool(b, "finish") && mentions(b, "did not accept it") && mentions(b, "no test ran"))
+            e.server
+                .requests()
+                .iter()
+                .any(|b| has_tool(b, "finish") && mentions(b, "did not accept it") && mentions(b, "no test ran"))
         })
         .await;
         let ledger = e.rt.ledger(&info.meta.mission).unwrap();
@@ -5136,7 +5256,8 @@ mod tests {
         let id = info.meta.id.clone();
         until("child request", || e.server.requests().iter().any(|b| !has_tool(b, "agent_spawn"))).await;
         e.rt.stop(&id).await.unwrap();
-        until("lead stopped", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Stopped }))).await;
+        until("lead stopped", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Stopped })))
+            .await;
         until("child stopped", || {
             let kids = e.children(&id);
             !kids.is_empty() && kids.iter().all(|c| c.status.outcome == Some(SessionOutcome::Stopped))
@@ -5156,15 +5277,18 @@ mod tests {
 
     /// Until `child` is between turns, waiting for its own background job.
     async fn until_idle(e: &Env, child: &SessionId) {
-        until("the worker waits", || e.has(child, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting })))
-            .await;
+        until("the worker waits", || {
+            e.has(child, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))
+        })
+        .await;
         until("the worker is idle", || e.rt.session(child).is_some_and(|s| s.status.phase == Phase::Idle)).await;
     }
 
     /// The stop reached `child` between turns: its `interrupted` follows a `Waiting` turn end directly.
     fn stopped_while_idle(e: &Env, child: &SessionId, reason: &str) -> bool {
         let rs = e.records(child);
-        let Some(at) = rs.iter().position(|r| matches!(&r.event, Event::Interrupted { reason: why } if why == reason)) else {
+        let Some(at) = rs.iter().position(|r| matches!(&r.event, Event::Interrupted { reason: why } if why == reason))
+        else {
             return false;
         };
         at > 0 && matches!(rs[at - 1].event, Event::TurnEnd { reason: TurnEndReason::Waiting })
@@ -5189,7 +5313,8 @@ mod tests {
         )
         .await;
         let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
-        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting })))
+            .await;
         let child = e.children(&id)[0].meta.id.clone();
         until_idle(&e, &child).await;
         let orch = e.rt.inner.orch.clone();
@@ -5211,7 +5336,8 @@ mod tests {
         };
         orch.spawn(&id, again).await.expect("a stopped agent does not count toward max_children");
         let settled = |c: &ChildSettled| c.child == child && c.outcome == ChildOutcome::Stopped && !c.inline;
-        until("the lead got the settlement", || e.has(&id, |ev| matches!(ev, Event::ChildSettled(c) if settled(c)))).await;
+        until("the lead got the settlement", || e.has(&id, |ev| matches!(ev, Event::ChildSettled(c) if settled(c))))
+            .await;
         e.rt.shutdown().await;
     }
 
@@ -5242,7 +5368,8 @@ mod tests {
         }))
         .await;
         let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
-        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting })))
+            .await;
         let child = e.children(&id)[0].meta.id.clone();
         until_idle(&e, &child).await;
         e.rt.send_message(&id, "STOPMARK").await.unwrap();
@@ -5257,7 +5384,11 @@ mod tests {
             })
         };
         let stopped = result("agent_stop").unwrap();
-        assert!(stopped.text.contains(&format!("{child} was stopped; anything it had not delivered")), "{}", stopped.text);
+        assert!(
+            stopped.text.contains(&format!("{child} was stopped; anything it had not delivered")),
+            "{}",
+            stopped.text
+        );
         let finished = result("finish").unwrap();
         assert_eq!(finished.status, loom_core::event::ToolStatus::Ok, "{}", finished.text);
         assert!(e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished })));
@@ -5303,8 +5434,10 @@ mod tests {
         let rt = rt2.clone();
         until("the failure is delivered", || {
             rt.records(&id, None, 2_000).is_ok_and(|rs| {
-                rs.iter().any(|r| matches!(&r.event, Event::ChildSettled(c)
-                    if c.child == child && c.outcome == ChildOutcome::Failed && c.report.contains("internal error")))
+                rs.iter().any(|r| {
+                    matches!(&r.event, Event::ChildSettled(c)
+                    if c.child == child && c.outcome == ChildOutcome::Failed && c.report.contains("internal error"))
+                })
             })
         })
         .await;
@@ -5332,7 +5465,8 @@ mod tests {
         .await;
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         let id = info.meta.id.clone();
-        until("lead finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))).await;
+        until("lead finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished })))
+            .await;
         let settled = e.records(&id).into_iter().filter(|r| matches!(r.event, Event::ChildSettled(_))).count();
         assert_eq!(settled, 1);
         e.rt.shutdown().await;
@@ -5351,13 +5485,12 @@ mod tests {
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         let id = info.meta.id.clone();
         until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
-        let votes = e
-            .rt
-            .inner
-            .orch
-            .poll(&id, "which?", &["a".to_string(), "b".to_string()], 3, &CancellationToken::new())
-            .await
-            .unwrap();
+        let votes =
+            e.rt.inner
+                .orch
+                .poll(&id, "which?", &["a".to_string(), "b".to_string()], 3, &CancellationToken::new())
+                .await
+                .unwrap();
         assert_eq!(votes.len(), 3);
         assert!(votes.iter().all(|v| v.option == Some(2)));
         let seeds: HashSet<u64> = e.server.requests().iter().filter_map(|b| b["seed"].as_u64()).collect();
@@ -5401,7 +5534,10 @@ mod tests {
             .and_then(|m| m["content"].as_str())
             .unwrap_or("");
         let at = text.find("out:").unwrap_or(0);
-        text[at..].chars().take_while(|c| *c == 'o' || *c == 'u' || *c == 't' || *c == ':' || c.is_ascii_hexdigit()).collect()
+        text[at..]
+            .chars()
+            .take_while(|c| *c == 'o' || *c == 'u' || *c == 't' || *c == ':' || c.is_ascii_hexdigit())
+            .collect()
     }
 
     #[tokio::test]
@@ -5454,7 +5590,8 @@ mod tests {
             Event::ToolResult(t) if t.name == "read" => Some(t.call_id),
             _ => None,
         });
-        let attributed = e.rt.inner.st().producers.values().any(|p| p.tool == "read" && Some(&p.call_id) == read_call.as_ref());
+        let attributed =
+            e.rt.inner.st().producers.values().any(|p| p.tool == "read" && Some(&p.call_id) == read_call.as_ref());
         assert!(attributed, "the read call is registered as a producer");
         e.rt.shutdown().await;
     }
@@ -5532,7 +5669,11 @@ mod tests {
         assert!(produced_by(&s, &mut jobs, &grep).is_none());
         // A background job's complete output belongs to the call that started it (named by `job_registered`),
         // not to a later wait, and a reused job id is credited to its latest start.
-        let reg = |call: &str| Event::JobRegistered { job_id: "j1".into(), call_id: CallId::from(call), command: "make".into() };
+        let reg = |call: &str| Event::JobRegistered {
+            job_id: "j1".into(),
+            call_id: CallId::from(call),
+            command: "make".into(),
+        };
         assert!(produced_by(&s, &mut jobs, &reg("c0")).is_none());
         assert!(produced_by(&s, &mut jobs, &reg("c4")).is_none());
         let wait = tool_result("c5", "job_wait", ToolClass::Exec, None, json!({"job": "j1"}));
@@ -5544,7 +5685,10 @@ mod tests {
             detail: String::new(),
         };
         let p = produced_by(&s, &mut jobs, &settled).expect("the job output registers");
-        assert_eq!((p.0, p.1.call_id, p.1.class, p.1.tool.as_str()), (BlobId::from("dd03"), CallId::from("c4"), ToolClass::Exec, "bash"));
+        assert_eq!(
+            (p.0, p.1.call_id, p.1.class, p.1.tool.as_str()),
+            (BlobId::from("dd03"), CallId::from("c4"), ToolClass::Exec, "bash")
+        );
         assert!(jobs.is_empty(), "a settled job is forgotten");
         // A job nothing is known about registers nothing.
         let other = Event::JobSettled { job_id: "j9".into(), exit_code: None, output: None, detail: String::new() };
@@ -5577,7 +5721,8 @@ mod tests {
             })
             .collect();
         assert_eq!(triggers, vec![loom_core::event::Trigger::User; 2]);
-        let answered = |r: &Record| matches!(&r.event, Event::UserMessage { text } if text.starts_with("[The operator's"));
+        let answered =
+            |r: &Record| matches!(&r.event, Event::UserMessage { text } if text.starts_with("[The operator's"));
         assert!(!records.iter().any(answered));
         assert!(e.rt.answer("i-nothing", "x").await.is_err());
         e.rt.shutdown().await;
@@ -5690,7 +5835,8 @@ mod tests {
 
     #[test]
     fn a_window_larger_than_the_server_s_is_warned_about() {
-        assert!(window_warning("local", Some(1_000_000), Some(32_768)).is_some_and(|w| w.contains("local") && w.contains("32768")));
+        assert!(window_warning("local", Some(1_000_000), Some(32_768))
+            .is_some_and(|w| w.contains("local") && w.contains("32768")));
         assert_eq!(window_warning("local", Some(32_768), Some(32_768)), None);
         assert_eq!(window_warning("local", Some(16_000), Some(32_768)), None);
         assert_eq!(window_warning("local", Some(1_000_000), None), None);
@@ -5753,7 +5899,13 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         let file = out.path().join("n.txt");
         let e = env_with(
-            Script::new(|_, n| if n == 0 { call("ask_user", json!({"question": "which one?"})) } else { Action::Stall { ms: 600_000 } }),
+            Script::new(|_, n| {
+                if n == 0 {
+                    call("ask_user", json!({"question": "which one?"}))
+                } else {
+                    Action::Stall { ms: 600_000 }
+                }
+            }),
             false,
             text_logging_notify(&file),
         )
@@ -5786,7 +5938,13 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         let file = out.path().join("n.txt");
         let e = env_with(
-            Script::new(|_, n| if n == 0 { call("ask_user", json!({"question": "which one?"})) } else { Action::Stall { ms: 600_000 } }),
+            Script::new(|_, n| {
+                if n == 0 {
+                    call("ask_user", json!({"question": "which one?"}))
+                } else {
+                    Action::Stall { ms: 600_000 }
+                }
+            }),
             false,
             |c| {
                 text_logging_notify(&file)(c);
@@ -5847,14 +6005,17 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_item_refuses_an_empty_answer() {
-        let e = env(Script::new(|_, n| {
-            if n == 0 {
-                call("ask_user", json!({"question": "which one?"}))
-            } else {
-                finish("fine")
-            }
-        }))
-        .await;
+        let e =
+            env(Script::new(
+                |_, n| {
+                    if n == 0 {
+                        call("ask_user", json!({"question": "which one?"}))
+                    } else {
+                        finish("fine")
+                    }
+                },
+            ))
+            .await;
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         until("inbox", || !e.rt.inbox().is_empty()).await;
         let item = e.rt.inbox().remove(0);
@@ -5889,8 +6050,9 @@ mod tests {
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         let ra = rt2.clone();
         until("unattended resumed", || {
-            ra.records(&a, None, 2_000)
-                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })))
+            ra.records(&a, None, 2_000).is_ok_and(|rs| {
+                rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished }))
+            })
         })
         .await;
         let after = e.server.requests().into_iter().filter(|b| mentions(b, texts::AFTER_RESTART)).count();
@@ -5942,8 +6104,9 @@ mod tests {
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         let rt = rt2.clone();
         until("woken and finished", || {
-            rt.records(&id, None, 2_000)
-                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })))
+            rt.records(&id, None, 2_000).is_ok_and(|rs| {
+                rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished }))
+            })
         })
         .await;
         let rs = rt2.records(&id, None, 2_000).unwrap();
@@ -6012,7 +6175,8 @@ mod tests {
             matches!(&r.event, Event::JobSettled { job_id, exit_code: Some(0), output: Some(_), detail }
                 if job_id == "j1" && *detail == texts::job_ended_while_down(""))
         });
-        let turn = rs.iter().rposition(|r| matches!(r.event, Event::TurnStart { trigger: loom_core::event::Trigger::Resume }));
+        let turn =
+            rs.iter().rposition(|r| matches!(r.event, Event::TurnStart { trigger: loom_core::event::Trigger::Resume }));
         assert!(registered.is_some() && registered < settled && settled < turn, "{rs:?}");
         let last = e.server.requests().pop().unwrap();
         assert!(mentions(&last, "Background job j1 ended: exit 0") && mentions(&last, "all done"));
@@ -6057,9 +6221,12 @@ mod tests {
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         until("a turn after the restart", || e.server.requests().len() > before).await;
         let rs = rt2.records(&id, None, 2_000).unwrap();
-        assert!(!rs.iter().any(|r| matches!(&r.event, Event::JobSettled { detail, .. } if detail == texts::JOB_LOST_DETAIL)));
+        assert!(!rs
+            .iter()
+            .any(|r| matches!(&r.event, Event::JobSettled { detail, .. } if detail == texts::JOB_LOST_DETAIL)));
         assert_eq!(rs.iter().filter(|r| matches!(r.event, Event::JobSettled { .. })).count(), 1);
-        let turn = rs.iter().rposition(|r| matches!(r.event, Event::TurnStart { trigger: loom_core::event::Trigger::Resume }));
+        let turn =
+            rs.iter().rposition(|r| matches!(r.event, Event::TurnStart { trigger: loom_core::event::Trigger::Resume }));
         assert!(killed < turn, "settled at {killed:?}, resumed at {turn:?}");
         let last = e.server.requests().pop().unwrap();
         assert!(mentions(&last, &format!("Background job j1 ended: killed. {}", texts::JOB_SHUTDOWN_DETAIL)));
@@ -6132,8 +6299,11 @@ mod tests {
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         until("a turn after the restart", || e.server.requests().len() > before).await;
         let rs = rt2.records(&id, None, 2_000).unwrap();
-        let lost = rs.iter().position(|r| matches!(&r.event, Event::JobSettled { detail, .. } if detail == texts::JOB_LOST_DETAIL));
-        let turn = rs.iter().rposition(|r| matches!(r.event, Event::TurnStart { trigger: loom_core::event::Trigger::Resume }));
+        let lost = rs
+            .iter()
+            .position(|r| matches!(&r.event, Event::JobSettled { detail, .. } if detail == texts::JOB_LOST_DETAIL));
+        let turn =
+            rs.iter().rposition(|r| matches!(r.event, Event::TurnStart { trigger: loom_core::event::Trigger::Resume }));
         assert!(lost.is_some() && lost < turn, "lost at {lost:?}, resumed at {turn:?}");
         assert!(mentions(&e.server.requests().pop().unwrap(), &texts::job_lost("j1", "sleep 600")));
         assert!(!jobs.join("j1.pid").exists());
@@ -6191,7 +6361,9 @@ mod tests {
         let rt = Runtime::start(config, paths).await.unwrap();
         until("a turn after the second restart", || server.requests().len() > before).await;
         let rs = rt.records(&id, None, 2_000).unwrap();
-        assert!(rs.iter().any(|r| matches!(&r.event, Event::JobSettled { detail, .. } if detail == texts::JOB_LOST_DETAIL)));
+        assert!(rs
+            .iter()
+            .any(|r| matches!(&r.event, Event::JobSettled { detail, .. } if detail == texts::JOB_LOST_DETAIL)));
         assert!(mentions(&server.requests().pop().unwrap(), &texts::job_lost("j1", "sleep 600")));
         rt.shutdown().await;
     }
@@ -6258,15 +6430,19 @@ mod tests {
     async fn the_child_was_resumed_as_the_lead_is_told(e: &Env, rt2: &Runtime, id: &SessionId, before: usize) {
         let rt = rt2.clone();
         until("the lead finished", || {
-            rt.records(id, None, 2_000)
-                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })))
+            rt.records(id, None, 2_000).is_ok_and(|rs| {
+                rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished }))
+            })
         })
         .await;
         let reqs = e.server.requests();
         let (lead, child): (Vec<&Value>, Vec<&Value>) = reqs[before..].iter().partition(|b| has_tool(b, "agent_spawn"));
         assert!(lead.iter().any(|b| mentions(b, texts::AFTER_RESTART)), "the lead was not told about the restart");
         assert_eq!(child.len(), 1, "the worker did not run again exactly once");
-        assert!(!reqs.iter().any(|b| mentions(b, "Interrupted while waiting for")), "a resumed agent was called stopped");
+        assert!(
+            !reqs.iter().any(|b| mentions(b, "Interrupted while waiting for")),
+            "a resumed agent was called stopped"
+        );
         let rs = rt2.records(id, None, 2_000).unwrap();
         let settled: Vec<&ChildSettled> = rs
             .iter()
@@ -6428,8 +6604,9 @@ mod tests {
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         let rt = rt2.clone();
         until("the lead finished", || {
-            rt.records(&id, None, 2_000)
-                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })))
+            rt.records(&id, None, 2_000).is_ok_and(|rs| {
+                rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished }))
+            })
         })
         .await;
         let reqs = e.server.requests();
@@ -6479,7 +6656,8 @@ mod tests {
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         let rt = rt2.clone();
         until("delivered", || rt.inbox().iter().any(|i| i.item.kind == InboxKind::Finished)).await;
-        let kids: Vec<SessionInfo> = rt2.sessions(true).into_iter().filter(|s| s.meta.parent.as_ref() == Some(&id)).collect();
+        let kids: Vec<SessionInfo> =
+            rt2.sessions(true).into_iter().filter(|s| s.meta.parent.as_ref() == Some(&id)).collect();
         assert_eq!(kids.len(), 1, "a second verifier was started");
         let verifier = kids[0].meta.id.clone();
         let item = rt2.inbox().into_iter().find(|i| i.item.kind == InboxKind::Finished).unwrap().item;
@@ -6539,7 +6717,8 @@ mod tests {
         let rt = rt2.clone();
         // The lead (unattended) calls finish again; it is not refused, and it takes the first verifier.
         until("delivered", || rt.inbox().iter().any(|i| i.item.kind == InboxKind::Finished)).await;
-        let kids: Vec<SessionInfo> = rt2.sessions(true).into_iter().filter(|s| s.meta.parent.as_ref() == Some(&id)).collect();
+        let kids: Vec<SessionInfo> =
+            rt2.sessions(true).into_iter().filter(|s| s.meta.parent.as_ref() == Some(&id)).collect();
         assert_eq!(kids.len(), 1, "a second verifier was started");
         let item = rt2.inbox().into_iter().find(|i| i.item.kind == InboxKind::Finished).unwrap().item;
         assert!(item.text.contains(&format!("[verified by {first}]")), "{}", item.text);
@@ -6626,7 +6805,10 @@ mod tests {
         let mut new = e.new_session(Some("go"));
         new.unattended = Some(false);
         let id = e.rt.create_session(new).await.unwrap().meta.id;
-        until("the lead waits for B", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        until("the lead waits for B", || {
+            e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))
+        })
+        .await;
         until("B is inside a request", || e.server.requests().iter().any(|b| !has_tool(b, "agent_spawn"))).await;
         // A ends while nobody can take its report (awaited, never joined).
         let req = SpawnReq {
@@ -6648,8 +6830,9 @@ mod tests {
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         let rt = rt2.clone();
         until("the lead finished", || {
-            rt.records(&id, None, 2_000)
-                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })))
+            rt.records(&id, None, 2_000).is_ok_and(|rs| {
+                rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished }))
+            })
         })
         .await;
         let reports: Vec<String> = rt2
@@ -6682,7 +6865,11 @@ mod tests {
                     call("wait", json!({}))
                 }
             } else if mentions(body, "AMARK") {
-                if go { finish("AREPORT") } else { Action::Stall { ms: 600_000 } }
+                if go {
+                    finish("AREPORT")
+                } else {
+                    Action::Stall { ms: 600_000 }
+                }
             } else if go {
                 finish("BREPORT")
             } else {
@@ -6693,7 +6880,8 @@ mod tests {
         let mut new = e.new_session(Some("go"));
         new.unattended = Some(false);
         let id = e.rt.create_session(new).await.unwrap().meta.id;
-        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting })))
+            .await;
         let b = e.children(&id).into_iter().find(|c| c.meta.title == "BMARK").unwrap().meta.id;
         until_idle(&e, &b).await;
         let a_asked = || e.server.requests().iter().any(|r| mentions(r, "AMARK") && !has_tool(r, "agent_spawn"));
@@ -6705,8 +6893,9 @@ mod tests {
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         let rt = rt2.clone();
         until("the lead finished", || {
-            rt.records(&id, None, 2_000)
-                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })))
+            rt.records(&id, None, 2_000).is_ok_and(|rs| {
+                rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished }))
+            })
         })
         .await;
         let reports: Vec<String> = rt2
@@ -6738,7 +6927,8 @@ mod tests {
         }))
         .await;
         let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
-        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting })))
+            .await;
         let child = e.children(&id)[0].meta.id.clone();
         until_idle(&e, &child).await;
         let child_tmp = e.rt.paths().session_tmp(&child);
@@ -6753,8 +6943,9 @@ mod tests {
         until("the worker's scratch emptied", || !child_tmp.join("scratch").exists()).await;
         let rt = rt2.clone();
         until("the lead finished", || {
-            rt.records(&id, None, 2_000)
-                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })))
+            rt.records(&id, None, 2_000).is_ok_and(|rs| {
+                rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished }))
+            })
         })
         .await;
         let settled = |rt: &Runtime| -> Vec<ChildSettled> {
@@ -6772,7 +6963,10 @@ mod tests {
         assert_eq!((&got[0].child, got[0].outcome, got[0].inline), (&child, ChildOutcome::Failed, false));
         assert!(got[0].report.contains("could not be opened again after the harness restarted"), "{}", got[0].report);
         let info = rt2.session(&child).unwrap();
-        assert_eq!((info.status.phase, info.status.outcome, info.active), (Phase::Ended, Some(SessionOutcome::Failed), false));
+        assert_eq!(
+            (info.status.phase, info.status.outcome, info.active),
+            (Phase::Ended, Some(SessionOutcome::Failed), false)
+        );
         rt2.shutdown().await;
         // Settled once: the next start neither runs it nor delivers it again.
         let rt3 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
@@ -6795,7 +6989,8 @@ mod tests {
         let kids: Vec<_> = rt2.sessions(true).into_iter().filter(|s| s.meta.parent.is_some()).collect();
         assert_eq!(kids.len(), 1);
         assert!(!kids[0].active);
-        let n = rt2.records(&id, None, 2_000).unwrap().iter().filter(|r| matches!(r.event, Event::ChildSettled(_))).count();
+        let n =
+            rt2.records(&id, None, 2_000).unwrap().iter().filter(|r| matches!(r.event, Event::ChildSettled(_))).count();
         assert_eq!(n, 1);
         rt2.shutdown().await;
     }
@@ -7069,7 +7264,8 @@ mod tests {
         });
         let e = env_with(script, false, |c| c.tools.kill_grace_s = 3).await;
         let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
-        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting })))
+            .await;
         let child = e.children(&id)[0].meta.id.clone();
         until_idle(&e, &child).await;
         let child_tmp = e.rt.paths().session_tmp(&child);
@@ -7084,10 +7280,15 @@ mod tests {
         assert!(!e.has(&id, |ev| matches!(ev, Event::ChildSettled(_))), "an archived lead was given a settlement");
         // Unarchived, the lead gets the settlement, which wakes it.
         e.rt.archive(&id, false).await.unwrap();
-        until("the lead finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished })))
-            .await;
-        let settled: Vec<Record> =
-            e.records(&id).into_iter().filter(|r| matches!(&r.event, Event::ChildSettled(c) if c.child == child)).collect();
+        until("the lead finished", || {
+            e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))
+        })
+        .await;
+        let settled: Vec<Record> = e
+            .records(&id)
+            .into_iter()
+            .filter(|r| matches!(&r.event, Event::ChildSettled(c) if c.child == child))
+            .collect();
         assert_eq!(settled.len(), 1);
         assert!(matches!(&settled[0].event, Event::ChildSettled(c) if c.outcome == ChildOutcome::Stopped && !c.inline));
         e.rt.shutdown().await;
@@ -7106,7 +7307,8 @@ mod tests {
         }))
         .await;
         let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
-        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting })))
+            .await;
         let child = e.children(&id)[0].meta.id.clone();
         until_idle(&e, &child).await;
         let log = e.rt.paths().session_log(&child);
@@ -7116,7 +7318,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let rs = read_records(&log).unwrap().records;
         assert!(!rs.iter().any(|r| matches!(r.event, Event::SessionEnd { .. })), "the agent was settled");
-        assert!(!rs.iter().any(|r| matches!(&r.event, Event::Interrupted { reason } if reason == texts::REASON_OPERATOR)));
+        assert!(!rs
+            .iter()
+            .any(|r| matches!(&r.event, Event::Interrupted { reason } if reason == texts::REASON_OPERATOR)));
         drop((dir, server));
     }
 
@@ -7178,7 +7382,8 @@ mod tests {
         use std::os::unix::fs::{symlink, PermissionsExt};
         let e = env(Script::new(|_, _| finish("ok"))).await;
         let (home, store) = (e.dir.path().join("home"), e.rt.blobs().clone());
-        let (in_log, outside, in_linked) = (old_blob(&store, "log\n"), old_blob(&store, "out\n"), old_blob(&store, "ln\n"));
+        let (in_log, outside, in_linked) =
+            (old_blob(&store, "log\n"), old_blob(&store, "out\n"), old_blob(&store, "ln\n"));
         // Links below a session directory are not followed: a link to itself, two links to `.`, a dangling
         // link, and links to a directory and a file outside that name a blob.
         let s1 = home.join("sessions").join("s-gc1");
@@ -7383,8 +7588,10 @@ mod tests {
 
     /// The session itself recorded the cut: the command's interrupted result, then the turn's end.
     fn assert_cut_by_the_session(records: &[Record]) {
-        let kinds: Vec<String> =
-            records.iter().map(|r| serde_json::to_value(r).unwrap()["kind"].as_str().unwrap_or("").to_string()).collect();
+        let kinds: Vec<String> = records
+            .iter()
+            .map(|r| serde_json::to_value(r).unwrap()["kind"].as_str().unwrap_or("").to_string())
+            .collect();
         assert_eq!(&kinds[kinds.len() - 3..], ["tool_result", "interrupted", "turn_end"], "{kinds:?}");
         let result = records.iter().rev().find_map(|r| match &r.event {
             Event::ToolResult(t) => Some(t.status),

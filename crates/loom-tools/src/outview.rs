@@ -121,11 +121,17 @@ impl Tool for OutRead {
         };
         let total = match ctx.blobs.meta(&id) {
             Ok(m) => m.lines,
-            Err(e) => return ToolOutput::error(format!("The output `{handle}` could not be read ({e}). Check the handle and try again.")),
+            Err(e) => {
+                return ToolOutput::error(format!(
+                    "The output `{handle}` could not be read ({e}). Check the handle and try again."
+                ))
+            }
         };
         let (first, last) = match view::window(uint(args, "start"), uint(args, "end"), total, ctx.cfg.read_max_lines) {
             Ok(Some(w)) => w,
-            Ok(None) => return ToolOutput::ok("ok", Body::View { of: id, text: "(no output)".into(), shown: Vec::new() }),
+            Ok(None) => {
+                return ToolOutput::ok("ok", Body::View { of: id, text: "(no output)".into(), shown: Vec::new() })
+            }
             Err(e) => return ToolOutput::error(e),
         };
         let (text, shortened) = match view::numbered(&ctx.blobs, &id, first, last, MAX_LINE_CHARS) {
@@ -181,19 +187,30 @@ impl Tool for OutGrep {
         let context = uint(args, "context").unwrap_or(DEFAULT_CONTEXT).min(MAX_CONTEXT);
         let total_lines = match ctx.blobs.meta(&id) {
             Ok(m) => m.lines,
-            Err(e) => return ToolOutput::error(format!("The output `{handle}` could not be read ({e}). Check the handle and try again.")),
+            Err(e) => {
+                return ToolOutput::error(format!(
+                    "The output `{handle}` could not be read ({e}). Check the handle and try again."
+                ))
+            }
         };
         let found = match ctx.blobs.grep(&id, &re, context as usize, ctx.cfg.search_max_results) {
             Ok(r) => r,
-            Err(e) => return ToolOutput::error(format!("The output `{handle}` could not be searched ({e}). Try again.")),
+            Err(e) => {
+                return ToolOutput::error(format!("The output `{handle}` could not be searched ({e}). Try again."))
+            }
         };
         if found.matches.is_empty() {
-            return ToolOutput::ok("no match", Body::View { of: id, text: "(no line matches)".into(), shown: Vec::new() });
+            return ToolOutput::ok(
+                "no match",
+                Body::View { of: id, text: "(no line matches)".into(), shown: Vec::new() },
+            );
         }
         let ranges: Vec<(u64, u64)> = found
             .matches
             .iter()
-            .map(|m| (m.line.saturating_sub(context).max(1), m.line.saturating_add(context).min(total_lines.max(m.line))))
+            .map(|m| {
+                (m.line.saturating_sub(context).max(1), m.line.saturating_add(context).min(total_lines.max(m.line)))
+            })
             .collect();
         let groups: Vec<String> = found.matches.iter().map(|m| shorten_lines(&m.excerpt)).collect();
         let shown_count = found.matches.len() as u64;
@@ -244,7 +261,11 @@ mod tests {
             let ranges = shown(&r);
             let (a, b) = (ranges[0][0].as_u64().unwrap(), ranges[0][1].as_u64().unwrap());
             assert_eq!(ranges.as_array().unwrap().len(), 1);
-            assert!(r.text.contains(&format!("{a}\tline {a}")) && r.text.contains(&format!("{b}\tline {b}")), "{}", r.text);
+            assert!(
+                r.text.contains(&format!("{a}\tline {a}")) && r.text.contains(&format!("{b}\tline {b}")),
+                "{}",
+                r.text
+            );
             seen.extend(a..=b);
             start = b + 1;
         }
@@ -325,7 +346,12 @@ mod tests {
         let e = small_pages();
         let h = put(&e, &lines(30));
         let r = e.call("out_grep", json!({"handle": h, "pattern": "LINE 1", "ignore_case": true, "context": 0})).await;
-        assert!(r.text.contains("3 of 11 matching lines") && r.text.contains("narrow the pattern or read ranges with out_read"), "{}", r.text);
+        assert!(
+            r.text.contains("3 of 11 matching lines")
+                && r.text.contains("narrow the pattern or read ranges with out_read"),
+            "{}",
+            r.text
+        );
         assert_eq!(shown(&r), json!([[1, 1], [10, 11]]));
         let r = e.call("out_grep", json!({"handle": h, "pattern": "LINE 1", "context": 0})).await;
         assert!(r.text.contains("no match") && r.text.contains("(no line matches)"), "{}", r.text);

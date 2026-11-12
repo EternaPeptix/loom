@@ -116,11 +116,10 @@ impl Coverage {
         if self.total_lines == 0 {
             return 0;
         }
-        let seen_in_total = self
-            .seen
-            .iter()
-            .filter(|&&(a, _)| a <= self.total_lines)
-            .fold(0u64, |acc, &(a, b)| acc.saturating_add(b.min(self.total_lines).saturating_sub(a).saturating_add(1)));
+        let seen_in_total =
+            self.seen.iter().filter(|&&(a, _)| a <= self.total_lines).fold(0u64, |acc, &(a, b)| {
+                acc.saturating_add(b.min(self.total_lines).saturating_sub(a).saturating_add(1))
+            });
         self.total_lines.saturating_sub(seen_in_total)
     }
 
@@ -724,13 +723,7 @@ mod tests {
     fn call(seq: Seq, id: &str, name: &str, args: Value, class: ToolClass) -> Record {
         rec(
             seq,
-            Event::ToolCall(ToolCall {
-                call_id: CallId::from(id),
-                req_id: "r".into(),
-                name: name.into(),
-                args,
-                class,
-            }),
+            Event::ToolCall(ToolCall { call_id: CallId::from(id), req_id: "r".into(), name: name.into(), args, class }),
         )
     }
 
@@ -829,7 +822,13 @@ mod tests {
         let recs = vec![
             exec(1, "a", Some(blob("aa", 50)), true, json!({ "shown": "all" })),
             exec(2, "b", Some(blob("bb", 50)), false, json!({ "shown": 7 })),
-            exec(3, "c", Some(blob("cc", 50)), true, json!({ "shown": [[1], "x", [3, "y"], [-1, 4], [5, 2], [0, 3], [7, 9]] })),
+            exec(
+                3,
+                "c",
+                Some(blob("cc", 50)),
+                true,
+                json!({ "shown": [[1], "x", [3, "y"], [-1, 4], [5, 2], [0, 3], [7, 9]] }),
+            ),
             exec(4, "d", Some(blob("dd", 50)), false, json!({ "of_blob": 12, "shown": [[1, 50]] })),
             exec(5, "e", Some(blob("ee", 50)), false, json!({ "of_blob": "", "shown": [[1, 50]] })),
             exec(6, "f", Some(blob("ff", 10)), true, json!({ "shown": [[1, 1000]] })),
@@ -949,10 +948,7 @@ mod tests {
     fn read_before_write_and_its_absence_after_reread() {
         let mut recs = vec![read(1, "/a"), read(2, "/b"), write(3, "/a")];
         let s = stale(&recs);
-        assert_eq!(
-            s,
-            vec![Stale { kind: StaleKind::ReadBeforeWrite, seq: 1, write_seq: 3, path: "/a".into() }]
-        );
+        assert_eq!(s, vec![Stale { kind: StaleKind::ReadBeforeWrite, seq: 1, write_seq: 3, path: "/a".into() }]);
         recs.push(read(4, "/a"));
         assert!(stale(&recs).is_empty());
         recs.push(write(6, "/a"));
@@ -974,16 +970,9 @@ mod tests {
 
     #[test]
     fn exec_before_write_and_its_absence_after_rerun() {
-        let mut recs = vec![
-            exec(1, "e1", None, false, json!({})),
-            write(2, "/x"),
-            write(3, "/y"),
-        ];
+        let mut recs = vec![exec(1, "e1", None, false, json!({})), write(2, "/x"), write(3, "/y")];
         let s = stale(&recs);
-        assert_eq!(
-            s,
-            vec![Stale { kind: StaleKind::ExecBeforeWrite, seq: 1, write_seq: 2, path: "/x".into() }]
-        );
+        assert_eq!(s, vec![Stale { kind: StaleKind::ExecBeforeWrite, seq: 1, write_seq: 2, path: "/x".into() }]);
         recs.push(result(5, "e2", ToolClass::Exec, ToolStatus::Error, None, false, json!({})));
         assert!(stale(&recs).is_empty());
         // A run that timed out does not count as a run.

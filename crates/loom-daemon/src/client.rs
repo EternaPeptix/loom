@@ -130,7 +130,8 @@ pub(crate) async fn daemon_proves_identity(
     timeout: Duration,
 ) -> Result<bool, reqwest::Error> {
     let nonce = hex::encode(rand::random::<[u8; 32]>());
-    let response = http.get(format!("{base}/healthz")).query(&[("nonce", nonce.as_str())]).timeout(timeout).send().await?;
+    let response =
+        http.get(format!("{base}/healthz")).query(&[("nonce", nonce.as_str())]).timeout(timeout).send().await?;
     if !response.status().is_success() {
         return Ok(false);
     }
@@ -252,11 +253,7 @@ impl Client {
     pub fn new(base: &str, token: &str) -> Client {
         // A builder that cannot be built (no TLS backend, say) falls back to the defaults, which
         // still have the 60 s per-request timeout set on every call below.
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .unwrap_or_default();
+        let http = reqwest::Client::builder().no_proxy().connect_timeout(CONNECT_TIMEOUT).build().unwrap_or_default();
         Client {
             base: base.trim_end_matches('/').to_string(),
             token: token.to_string(),
@@ -474,7 +471,12 @@ impl Client {
     }
 
     /// Let the mission of `id` reach `hosts` (the operator's grant). The receipt names the lead it went to.
-    pub async fn grant_scope(&self, id: &SessionId, hosts: &[String], note: Option<&str>) -> Result<ScopeReceipt, String> {
+    pub async fn grant_scope(
+        &self,
+        id: &SessionId,
+        hosts: &[String],
+        note: Option<&str>,
+    ) -> Result<ScopeReceipt, String> {
         let body = serde_json::to_value(ScopeBody { hosts: hosts.to_vec(), note: note.map(str::to_string) })
             .map_err(|e| format!("The grant cannot be encoded ({e})."))?;
         self.call(Method::POST, &format!("/api/sessions/{}/scope", segment(id.as_str())), &[], Some(body)).await
@@ -565,7 +567,8 @@ impl Client {
 
     /// Collect unreferenced stored outputs; a dry run unless `apply`. Walking a large store takes a while.
     pub async fn gc(&self, apply: bool) -> Result<loom_core::blob::SweepReport, String> {
-        let body = serde_json::to_value(GcBody { apply }).map_err(|e| format!("The request cannot be encoded ({e})."))?;
+        let body =
+            serde_json::to_value(GcBody { apply }).map_err(|e| format!("The request cannot be encoded ({e})."))?;
         self.call_with_timeout(Method::POST, "/api/gc", &[], Some(body), Duration::from_secs(600)).await
     }
 
@@ -862,9 +865,9 @@ mod tests {
     use super::testkit::*;
     use super::*;
     use crate::wire::ErrorBody;
-    use std::sync::{Arc, Mutex};
     use loom_agent::runtime::ModelHealth;
     use loom_core::BlobId;
+    use std::sync::{Arc, Mutex};
 
     fn status_view() -> StatusView {
         StatusView {
@@ -995,8 +998,7 @@ mod tests {
             ("GET", "/api/blobs/out:ab/lines?start=1&end=5"),
             ("POST", "/api/shutdown"),
         ];
-        let expected: Vec<(String, String)> =
-            expected.iter().map(|(m, t)| (m.to_string(), t.to_string())).collect();
+        let expected: Vec<(String, String)> = expected.iter().map(|(m, t)| (m.to_string(), t.to_string())).collect();
         assert_eq!(calls, expected);
         assert!(seen.iter().all(|s| s.auth.as_deref() == Some("Bearer tok-123")));
         let body = |n: usize| serde_json::from_str::<serde_json::Value>(&seen[n].body).unwrap();
@@ -1033,8 +1035,18 @@ mod tests {
     #[tokio::test]
     async fn scope_and_release_calls_hit_their_routes_with_their_bodies() {
         let script = Script::default()
-            .route("POST", "/api/sessions/s-1/scope", 202, serde_json::json!({"lead": "s-0", "hosts": ["a.test"], "ledger": true}).to_string())
-            .route("POST", "/api/sessions/s-1/release", 202, serde_json::json!({"lead": "s-0", "queued": false, "ledger": true, "stock": null}).to_string());
+            .route(
+                "POST",
+                "/api/sessions/s-1/scope",
+                202,
+                serde_json::json!({"lead": "s-0", "hosts": ["a.test"], "ledger": true}).to_string(),
+            )
+            .route(
+                "POST",
+                "/api/sessions/s-1/release",
+                202,
+                serde_json::json!({"lead": "s-0", "queued": false, "ledger": true, "stock": null}).to_string(),
+            );
         let (client, shared) = start(script).await;
         let sid = SessionId::from("s-1");
         let got = client.grant_scope(&sid, &["a.test".to_string()], Some("docs")).await.unwrap();
@@ -1050,12 +1062,16 @@ mod tests {
 
     #[tokio::test]
     async fn gc_posts_apply_and_reads_the_report() {
-        let report = loom_core::blob::SweepReport { examined: 3, kept: 2, collected: 1, applied: true, ..Default::default() };
+        let report =
+            loom_core::blob::SweepReport { examined: 3, kept: 2, collected: 1, applied: true, ..Default::default() };
         let (client, shared) = start(Script::default().route("POST", "/api/gc", 200, json(&report))).await;
         assert_eq!(client.gc(true).await.unwrap(), report);
         let seen = shared.lock().unwrap().seen.clone();
         assert_eq!((seen[0].method.as_str(), seen[0].target.as_str()), ("POST", "/api/gc"));
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&seen[0].body).unwrap(), serde_json::json!({"apply": true}));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&seen[0].body).unwrap(),
+            serde_json::json!({"apply": true})
+        );
         let refused = ErrorBody { error: "cannot read /h/sessions/s-1/x (denied); nothing was collected.".into() };
         let (client, _) = start(Script::default().route("POST", "/api/gc", 500, json(&refused))).await;
         assert_eq!(client.gc(false).await.unwrap_err(), refused.error);
@@ -1074,10 +1090,7 @@ mod tests {
         let mut b = client.events(false).await.unwrap();
         assert!(b.next().await.is_none());
         let targets: Vec<String> = shared.lock().unwrap().seen.iter().map(|s| s.target.clone()).collect();
-        assert_eq!(
-            targets,
-            ["/api/sessions/s-1/records?limit=2", "/api/events?deltas=true", "/api/events"]
-        );
+        assert_eq!(targets, ["/api/sessions/s-1/records?limit=2", "/api/events?deltas=true", "/api/events"]);
     }
 
     #[tokio::test]
@@ -1104,7 +1117,10 @@ mod tests {
         let e = client.missions().await.unwrap_err();
         assert!(e.starts_with("The daemon's answer to GET /api/missions was not understood ("), "{e}");
         assert!(e.ends_with("the `loom` command and the daemon may be different versions."), "{e}");
-        assert_eq!(client.window(&SessionId::from("s-1")).await.unwrap_err(), "The daemon answered 404 Not Found to GET /api/sessions/s-1/window.");
+        assert_eq!(
+            client.window(&SessionId::from("s-1")).await.unwrap_err(),
+            "The daemon answered 404 Not Found to GET /api/sessions/s-1/window."
+        );
     }
 
     #[tokio::test]
@@ -1158,11 +1174,19 @@ mod tests {
         // Answers 200 to everything, as a plain `ok`, with no proof field, or with a wrong proof.
         let wrong = format!("{{\"ok\":true,\"proof\":\"{}\"}}", "0".repeat(64));
         for healthz in ["ok", "{\"ok\":true}", wrong.as_str()] {
-            let script = Script::default().route("GET", "/healthz", 200, healthz).route("GET", "/api/status", 200, status_ok.clone());
+            let script = Script::default().route("GET", "/healthz", 200, healthz).route(
+                "GET",
+                "/api/status",
+                200,
+                status_ok.clone(),
+            );
             let (client, shared) = start(script).await;
             let client = client.verifying();
             let e = client.status().await.unwrap_err();
-            assert!(e.contains("did not prove it is this home's loom daemon") && e.contains("--unverified-daemon"), "{e}");
+            assert!(
+                e.contains("did not prove it is this home's loom daemon") && e.contains("--unverified-daemon"),
+                "{e}"
+            );
             assert!(e.contains("older daemon") || e.contains("older than this"), "{e}");
             // A second call asks again and is refused again; no request ever carried the token.
             assert!(client.sessions(false).await.is_err());
@@ -1174,8 +1198,13 @@ mod tests {
     #[tokio::test]
     async fn the_override_sends_the_token_to_an_unproven_listener_and_a_proof_proceeds() {
         let status_ok = json(&status_view());
-        let (client, shared) =
-            start(Script::default().route("GET", "/healthz", 200, "ok").route("GET", "/api/status", 200, status_ok.clone())).await;
+        let (client, shared) = start(Script::default().route("GET", "/healthz", 200, "ok").route(
+            "GET",
+            "/api/status",
+            200,
+            status_ok.clone(),
+        ))
+        .await;
         let bind = client.base().trim_start_matches("http://").to_string();
         let client = client.verifying().allowing_unverified();
         let warned = || WARNINGS.lock().unwrap().iter().filter(|w| **w == unverified_warning(&bind)).count();

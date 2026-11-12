@@ -45,7 +45,13 @@ fn show(label: &str, c: &Completion) {
         println!("   text: {}", cut(&c.text, 200));
     }
     for t in &c.tool_calls {
-        println!("   call {} {}({}){}", t.call_id, t.name, t.arguments, if t.complete { "" } else { "  [arguments incomplete]" });
+        println!(
+            "   call {} {}({}){}",
+            t.call_id,
+            t.name,
+            t.arguments,
+            if t.complete { "" } else { "  [arguments incomplete]" }
+        );
     }
 }
 
@@ -90,7 +96,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("usage: live <base_url> <model> [reasoning_effort]");
         std::process::exit(2);
     };
-    let mut profile = ModelProfile { base_url: base_url.clone(), model: model.clone(), retry_window_s: 60, ..ModelProfile::default() };
+    let mut profile = ModelProfile {
+        base_url: base_url.clone(),
+        model: model.clone(),
+        retry_window_s: 60,
+        ..ModelProfile::default()
+    };
     if let Some(effort) = args.get(2) {
         profile.extra_body.insert("reasoning_effort".into(), Value::String(effort.clone()));
     }
@@ -108,7 +119,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          After the note is recorded, reply with the single word: done.\n\nReference material (not needed for the task):\n",
     );
     for i in 0..1500 {
-        system.push_str(&format!("Entry {i}: the quick brown fox number {i} jumps over lazy dog number {}.\n", i * 7 % 311));
+        system.push_str(&format!(
+            "Entry {i}: the quick brown fox number {i} jumps over lazy dog number {}.\n",
+            i * 7 % 311
+        ));
     }
     let tools = vec![
         tool("lookup", "Look up the value of a key.", "key", "The key to look up."),
@@ -136,7 +150,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stable.push(replay(&c3));
 
     // Three requests at once over the same prefix, each with its own last message.
-    stable.push(Message::user("One more question: which entry number in the reference material mentions dog number 0 first?"));
+    stable.push(Message::user(
+        "One more question: which entry number in the reference material mentions dog number 0 first?",
+    ));
     let reqs: Vec<ChatRequest> =
         (1..=3).map(|i| request(&stable, &tools, &format!("Now: 2026-01-01 10:03 UTC\nStep: 4\nVoter: {i}"))).collect();
     let (a, b, c) = tokio::join!(

@@ -355,7 +355,9 @@ pub fn finalize(
             facts.notes = normalized.notes();
             let stored = match ctx.blobs.put_bytes(normalized.text.as_bytes()) {
                 Ok(b) => b,
-                Err(e) => return base(ToolStatus::Error, storage_failure(&facts, &normalized.text, &e), None, true, meta),
+                Err(e) => {
+                    return base(ToolStatus::Error, storage_failure(&facts, &normalized.text, &e), None, true, meta)
+                }
             };
             if normalized.changed {
                 if let Ok(raw) = ctx.blobs.put_bytes(&bytes) {
@@ -367,7 +369,9 @@ pub fn finalize(
                     meta.insert(META_SHOWN.into(), ranges_json(&admitted.shown));
                     base(status, admitted.text, Some(stored), admitted.cut, meta)
                 }
-                Err(e) => base(ToolStatus::Error, storage_failure(&facts, &normalized.text, &e), Some(stored), true, meta),
+                Err(e) => {
+                    base(ToolStatus::Error, storage_failure(&facts, &normalized.text, &e), Some(stored), true, meta)
+                }
             }
         }
     }

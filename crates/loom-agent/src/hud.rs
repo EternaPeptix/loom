@@ -126,7 +126,8 @@ pub fn render(input: &HudInput<'_>) -> String {
     if let Some(ledger) = input.ledger {
         let brief = ledger.brief(&input.brief);
         if !brief.trim().is_empty() {
-            sections.push(format!("Mission state (from the ledger — the ledger tools change it):\n{}", brief.trim_end()));
+            sections
+                .push(format!("Mission state (from the ledger — the ledger tools change it):\n{}", brief.trim_end()));
         }
         if !input.is_child {
             if let Some(line) = finish_line(ledger, input.finish_gated) {
@@ -306,7 +307,9 @@ fn exec_command(records: &[Record], seq: u64) -> String {
         _ => return String::new(),
     };
     let command = records.iter().find_map(|r| match &r.event {
-        Event::ToolCall(c) if &c.call_id == call_id => c.args.get("command").and_then(Value::as_str).map(str::to_string),
+        Event::ToolCall(c) if &c.call_id == call_id => {
+            c.args.get("command").and_then(Value::as_str).map(str::to_string)
+        }
         _ => None,
     });
     match command {
@@ -357,10 +360,21 @@ mod tests {
     }
 
     fn call(seq: u64, id: &str, name: &str, args: Value, class: ToolClass) -> Record {
-        rec(seq, Event::ToolCall(ToolCall { call_id: CallId::from(id), req_id: "r".into(), name: name.into(), args, class }))
+        rec(
+            seq,
+            Event::ToolCall(ToolCall { call_id: CallId::from(id), req_id: "r".into(), name: name.into(), args, class }),
+        )
     }
 
-    fn result(seq: u64, id: &str, name: &str, class: ToolClass, out: Option<BlobRef>, cut: bool, meta: Value) -> Record {
+    fn result(
+        seq: u64,
+        id: &str,
+        name: &str,
+        class: ToolClass,
+        out: Option<BlobRef>,
+        cut: bool,
+        meta: Value,
+    ) -> Record {
         rec(
             seq,
             Event::ToolResult(ToolResult {
@@ -435,7 +449,12 @@ mod tests {
             }],
             questions: vec![
                 Question { id: "q1".into(), text: "done one".into(), blocking: true, answer: Some("x".into()) },
-                Question { id: "q2".into(), text: "Which branch should this target?".into(), blocking: true, answer: None },
+                Question {
+                    id: "q2".into(),
+                    text: "Which branch should this target?".into(),
+                    blocking: true,
+                    answer: None,
+                },
             ],
             ..LedgerState::default()
         }
@@ -477,7 +496,15 @@ mod tests {
     #[test]
     fn unviewed_section_with_gap_cap() {
         let recs = vec![
-            result(1, "a", "bash", ToolClass::Exec, Some(blob("7f3a9c1e00000000aa", 18412)), true, json!({ "shown": [[1, 400], [18013, 18412]] })),
+            result(
+                1,
+                "a",
+                "bash",
+                ToolClass::Exec,
+                Some(blob("7f3a9c1e00000000aa", 18412)),
+                true,
+                json!({ "shown": [[1, 400], [18013, 18412]] }),
+            ),
             result(
                 2,
                 "b",
@@ -560,10 +587,20 @@ mod tests {
     #[test]
     fn running_section_and_ages() {
         let jobs = vec![
-            HudJob { id: "j3".into(), command: "cargo build --release".into(), started_ms: 1_000_000 - 4 * 60_000 - 5, lines: 220 },
+            HudJob {
+                id: "j3".into(),
+                command: "cargo build --release".into(),
+                started_ms: 1_000_000 - 4 * 60_000 - 5,
+                lines: 220,
+            },
             HudJob { id: "j4".into(), command: "sleep 9".into(), started_ms: 1_000_000 - 59_999, lines: 0 },
         ];
-        let kids = vec![HudChild { id: "s-01jabc".into(), role: "worker".into(), title: "Find the callers of parse()".into(), step: 12 }];
+        let kids = vec![HudChild {
+            id: "s-01jabc".into(),
+            role: "worker".into(),
+            title: "Find the callers of parse()".into(),
+            step: 12,
+        }];
         let mut i = input(EMPTY);
         i.now_ms = 1_000_000;
         i.jobs = &jobs;
@@ -589,7 +626,11 @@ mod tests {
         // Last 15% of the steps: one heads-up, and no number in it.
         i.step = 170;
         let out = render(&i);
-        assert!(out.ends_with("do not rush the work that remains.") && out.contains("this assignment's budget is nearly used"), "{out}");
+        assert!(
+            out.ends_with("do not rush the work that remains.")
+                && out.contains("this assignment's budget is nearly used"),
+            "{out}"
+        );
         assert!(!out.contains("170") && !out.contains(" of "), "{out}");
         // Last 15% of the minutes triggers it too.
         i.step = 0;
@@ -648,7 +689,8 @@ mod tests {
             objections: vec!["o".into()],
         };
         let mut done = l.clone();
-        done.goal_met = Some(GoalMet { status: GoalMetStatus::Supported, note: "ran".into(), evidence: vec!["e1".into()], n: 4 });
+        done.goal_met =
+            Some(GoalMet { status: GoalMetStatus::Supported, note: "ran".into(), evidence: vec!["e1".into()], n: 4 });
         done.finishes = vec![rejected("f1", false), rejected("f2", true), rejected("f3", false), rejected("f4", false)];
         done.obligations.push(Obligation {
             id: "o1".into(),
@@ -679,7 +721,15 @@ mod tests {
     fn all_sections_together() {
         let l = ledger();
         let mut recs = stale_records();
-        recs.push(result(0, "u", "bash", ToolClass::Exec, Some(blob("dd00000000000000", 50)), true, json!({ "shown": [[1, 10]] })));
+        recs.push(result(
+            0,
+            "u",
+            "bash",
+            ToolClass::Exec,
+            Some(blob("dd00000000000000", 50)),
+            true,
+            json!({ "shown": [[1, 10]] }),
+        ));
         let jobs = vec![HudJob { id: "j1".into(), command: "make".into(), started_ms: 0, lines: 1 }];
         let mut i = input(&recs);
         i.ledger = Some(&l);
