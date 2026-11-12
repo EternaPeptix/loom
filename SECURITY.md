@@ -65,7 +65,11 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
 - **Credential stores are unreadable and unwritable** by default (`protect_credentials = true`): `~/.ssh`,
   `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`,
   `~/.docker/config.json`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, cargo and git credential files, password
-  stores, the macOS Keychains and Cookies folders and the Chrome, Firefox and Safari profiles. So are
+  stores and password-manager data, cloud, registry, model-hub, AI-tool and database client credentials
+  (`~/.cache/huggingface`, `~/.claude.json`, `~/.pgpass`, `~/.vault-token`, `~/.m2/settings.xml`,
+  `~/.config/rclone`, and more), wallets, the macOS Keychains and Cookies folders, Mail, Messages,
+  Telegram, Group Containers and the Chrome, Chromium, Brave, Edge, Arc, Vivaldi, Opera, Firefox and
+  Safari profiles. So are
   the loom token and keys and your `unreadable_paths`. A listed directory that is or contains the
   workspace is skipped.
 - **The network** is closed except for loopback connections to the egress proxy (and any ports or sockets
@@ -111,8 +115,13 @@ These are the places where loom does less than the text above might suggest.
   `[sandbox] mode = "none"`, and then commands are unconfined. The file tools still refuse the protected
   and credential paths, and the network proxy still exists, but a command can ignore it. Do not run
   loom in that mode on a machine or account you care about.
-- **Environment scrubbing is by name.** A secret in a variable called something that does not look
-  like one is passed through. `env_pass` passes more.
+- **Environment scrubbing is by name and by URL.** Names with a secret word, session, auth, pass, jwt,
+  webhook or private parts, every model profile's `api_key_env`, and values that are URLs with a
+  password in them are withheld. A secret in a variable called something else, in another form, is
+  passed through. `env_pass` passes more.
+- **A process that leaves its command's process group is not tracked.** After `setsid`, `daemon()`,
+  `redis-server --daemonize yes` or `tmux new -d`, `job_kill`, stop, the end of the session and daemon
+  shutdown do not stop it, although it stays under the seatbelt profile.
 - **Network policy is per daemon, not per session**, and is read at start. In `allowlist` mode a
   listed host can be used by every session. Data can be sent to an allowed host.
 - **A network-specific NAT64 prefix is an ordinary IPv6 prefix to the proxy.** The proxy looks through

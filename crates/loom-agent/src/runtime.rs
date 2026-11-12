@@ -85,7 +85,8 @@
 //!   tools.max_output_bytes), cancel: new token}`.
 //!   - `sandbox`: `Sandbox::new(&cfg, workspace, tmp_dir, paths.home, Some(proxy port))` with the
 //!     config's `SandboxCfg`; for a role with `read_only`, `extra_writable` is emptied and the
-//!     workspace is added to `protected_paths`.
+//!     workspace is added to `protected_paths`; every model profile's `api_key_env` name is added to
+//!     `secret_env`, so commands never see it.
 //!   - `env`: the session's proxy grant (`proxy.grant(id, Policy::new(&config.network))`), `env()`.
 //!     Every session gets a grant, also under `deny_all` (in-process fetches go through the proxy
 //!     too, so the policy is what refuses them).
@@ -754,8 +755,19 @@ fn child_outcome_of(outcome: SessionOutcome) -> ChildOutcome {
 }
 
 /// The sandbox configuration a session of `role` runs under.
-fn sandbox_cfg_for(base: &SandboxCfg, role: &RoleDef, workspace: &Path) -> SandboxCfg {
+/// Every model profile's `api_key_env` name is withheld from its commands.
+fn sandbox_cfg_for(
+    base: &SandboxCfg,
+    role: &RoleDef,
+    workspace: &Path,
+    models: &BTreeMap<String, loom_core::config::ModelProfile>,
+) -> SandboxCfg {
     let mut cfg = base.clone();
+    for name in models.values().filter_map(|p| p.api_key_env.as_deref()).filter(|n| !n.is_empty()) {
+        if !cfg.secret_env.iter().any(|n| n == name) {
+            cfg.secret_env.push(name.to_string());
+        }
+    }
     if role.read_only {
         cfg.extra_writable.clear();
         cfg.protected_paths.push(workspace.display().to_string());
@@ -1519,7 +1531,7 @@ impl Inner {
         let tmp = self.paths.session_tmp(id);
         loom_core::config::ensure_private_dir(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
         let tmp = std::fs::canonicalize(&tmp).map_err(|e| format!("cannot resolve {}: {e}", tmp.display()))?;
-        let cfg = sandbox_cfg_for(&self.config.sandbox, &role, &workspace);
+        let cfg = sandbox_cfg_for(&self.config.sandbox, &role, &workspace, &self.config.models);
         let sandbox = Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, Some(self.proxy.port()))
             .map_err(|e| format!("The sandbox for this session cannot be set up: {e}"))?;
         let policy = Policy::new(&self.config.network)?;
@@ -5955,11 +5967,26 @@ mod tests {
         let ro = packs.role(None, Some("verifier")).unwrap();
         let mut base = SandboxCfg::default();
         base.extra_writable.push("/somewhere".into());
-        let cfg = sandbox_cfg_for(&base, ro, Path::new("/ws"));
+        let none = BTreeMap::new();
+        let cfg = sandbox_cfg_for(&base, ro, Path::new("/ws"), &none);
         assert!(cfg.extra_writable.is_empty());
         assert!(cfg.protected_paths.contains(&"/ws".to_string()));
         let rw = packs.role(None, Some("worker")).unwrap();
-        assert_eq!(sandbox_cfg_for(&base, rw, Path::new("/ws")), base);
+        assert_eq!(sandbox_cfg_for(&base, rw, Path::new("/ws"), &none), base);
+    }
+
+    #[test]
+    fn every_profiles_api_key_variable_is_withheld_from_commands() {
+        let packs = Packs::builtin().unwrap();
+        let rw = packs.role(None, Some("worker")).unwrap();
+        let mut models = BTreeMap::new();
+        let vars = [("a", Some("MYSERVER_ACCESS")), ("b", Some("MYSERVER_ACCESS")), ("c", None), ("d", Some("OTHER"))];
+        for (name, var) in vars {
+            let p = loom_core::config::ModelProfile { api_key_env: var.map(str::to_string), ..Default::default() };
+            models.insert(name.to_string(), p);
+        }
+        let cfg = sandbox_cfg_for(&SandboxCfg::default(), rw, Path::new("/ws"), &models);
+        assert_eq!(cfg.secret_env, ["MYSERVER_ACCESS", "OTHER"]);
     }
 
     /// A loom home with a pack `strict` that requires a restricted network, and a workspace.

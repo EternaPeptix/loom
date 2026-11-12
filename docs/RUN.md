@@ -105,14 +105,28 @@ Other files are readable.
 file tools: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`,
 `~/.docker/config.json`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials(.toml)`,
 `~/.git-credentials`, `~/.config/git/credentials`, `~/.password-store`, `~/.config/op`,
-`~/Library/Keychains`, `~/Library/Cookies` and the Chrome, Firefox and Safari profile directories. A
+`~/Library/Keychains`, `~/Library/Cookies`, the profile directories of Chrome, Chromium, Brave, Edge,
+Arc, Vivaldi, Opera, Firefox and Safari, and many more: model-hub, AI-tool, database, cloud, registry,
+password-manager, wallet and chat stores (`~/.cache/huggingface`, `~/.claude.json`, `~/.pgpass`,
+`~/.vault-token`, `~/.m2/settings.xml`, `~/.config/rclone`, `~/Library/Mail`, ...; the list is in
+`docs/DESIGN.md`). Add other stores to `unreadable_paths`. A
 listed directory that is or contains the workspace is skipped. This needs a home directory: with
 `HOME` unset, every session fails to build its sandbox and the message names `HOME` and
 `protect_credentials = false`. Set the key to `false` to turn the protection off.
 
+Several of these are whole directories, so what else they hold is off limits too: commands cannot load
+models from the Hugging Face cache in `~/.cache/huggingface/hub` (set `HF_HUB_CACHE` to a directory
+elsewhere; moving `HF_HOME` moves the token out of protection too), run `flyctl` from `~/.fly/bin` or
+`pulumi` from `~/.pulumi/bin` (install them elsewhere), or use Terraform's plugin cache in
+`~/.terraform.d`. The only switch is `protect_credentials = false`, which lifts the protection of every
+store.
+
 Environment variables whose names look like secrets (in any case: containing `KEY`, `TOKEN`, `SECRET`,
-`PASSWORD`, `PASSWD`, `CREDENTIAL` or `COOKIE`, ending in `_PAT`, `_DSN` or `_PWD`, `DATABASE_URL`,
-`SSH_AUTH_SOCK`, anything starting `LOOM_`) are not passed to commands unless listed in `env_pass`.
+`PASSWORD`, `PASSWD`, `PASSPHRASE`, `CREDENTIAL` or `COOKIE`, ending in `_PAT`, `_DSN`, `_PWD` or `_PW`,
+`DATABASE_URL`, `SSH_AUTH_SOCK`, anything starting `LOOM_`, names with `SESSION`, `AUTH`, `PASS`, `JWT` or
+`WEBHOOK` as an `_`-delimited word or with `PRIVATE`, the `api_key_env` of any model profile, and any
+variable whose value holds a URL with a password in it) are not passed to commands unless listed in
+`env_pass`.
 
 ## Start
 
