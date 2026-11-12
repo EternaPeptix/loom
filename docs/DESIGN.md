@@ -664,13 +664,26 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
 - Connecting has a 10 s timeout; waiting more than `stall_timeout_s` (240) for the headers or the next
   bytes fails the attempt as a stall.
 - **Retry.** Transport errors, stalls, HTTP 408, 425, 429 and 5xx, and an error object inside a 200
-  stream are retried for up to `retry_window_s` (default 300, long enough for a server relaunch; 0 =
-  until the server returns). Failures that waiting cannot cure — a 200 that is not an event stream, a
-  malformed or oversized stream, a stream that ends cleanly without a `finish_reason`, TLS and protocol
-  errors — end the request after 3 such attempts in a row whatever the window. Delays are 0.5 s
-  doubling to `retry_max_delay_s` (30) with ±10% jitter; a larger `Retry-After` (up to 600 s) wins.
-  Viewers see each retry as a `retrying` delta. A partial attempt is never committed, and a
-  cancellation returns promptly with the text streamed so far.
+  stream are retried for up to `retry_window_s` from the request's first failure (default 300, long
+  enough for a server relaunch). 0 retries them until the server returns or the step is stopped, so
+  such a failure that never heals is retried for ever. Failures that waiting cannot cure — a 200 that
+  is not an event stream, a malformed or oversized stream, a stream that ends cleanly without a
+  `finish_reason`, and send errors that are not about reaching the server (the request cannot be
+  built, a TLS certificate or protocol error, an answer that is not HTTP) — end the request after 3
+  such attempts in a row whatever the window; a failure of the other kind in between starts the count
+  again. Delays are 0.5 s doubling to `retry_max_delay_s` (30) with ±10% jitter; a larger
+  `Retry-After` (up to 600 s) wins. Viewers see each retry as a `retrying` delta. A partial attempt
+  is never committed, and a cancellation returns promptly with the text streamed so far.
+- **Unavailable notice.** When one model request of a session (a step's or a digest's) is retrying
+  and its first failure lies `agents.unavailable_notice_s` back (default 300; 0 = never), the session
+  opens a non-blocking `blocker` inbox item, notified like every other: the server's
+  address, since when it has been unavailable, the last error, and until when the request is retried
+  (or that it is retried until the server answers), with the note that nothing needs an answer. At
+  most one is open per session. When the request ends the harness resolves the item itself, saying
+  whether the server answered, the request failed (the step then fails, §8) or the step was
+  stopped; an item a session left open when the daemon stopped is resolved when the session is next
+  activated. Neither record reaches the model's context or starts a turn, and the request being
+  retried is sent unchanged.
 - **Redirects** are not followed: a 3xx is refused with a sentence naming `Location` and the base URL
   it implies.
 - **Model id.** `GET {base_url}/models` selects the served id: the entry equal to the profile's `model`,

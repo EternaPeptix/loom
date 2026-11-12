@@ -139,6 +139,9 @@ upgrade" first; the rest says what behaves differently.
 - Failures waiting cannot cure end the request after three attempts in a row. Streams over fixed size
   limits fail as malformed.
 - A session is not created when the server cannot be reached and the profile sets no `context_window`.
+- A model request still retrying after `[agents] unavailable_notice_s` (new, default 300; 0 = never)
+  opens a non-blocking inbox item, with a notification, naming the server, since when it is down and
+  the last error; the item closes by itself when the request ends.
 
 ### Sessions, agents and finishing
 

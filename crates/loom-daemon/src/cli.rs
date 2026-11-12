@@ -124,6 +124,7 @@ allow_private = []
 [agents]
 max_children = 6
 verify_finish = true
+unavailable_notice_s = 300   # tell you (inbox item, notification) when a request has retried this long; 0 = never
 "#;
 
 #[derive(Parser, Debug)]
@@ -1584,6 +1585,7 @@ mod tests {
         config.check().unwrap();
         assert_eq!(config.daemon.bind, "127.0.0.1:7878");
         assert_eq!(config.network.mode, loom_core::config::NetworkMode::DenyAll);
+        assert_eq!(config.agents.unavailable_notice_s, 300);
     }
 
     #[test]

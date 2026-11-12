@@ -14,7 +14,8 @@
 //! `turn_start`, `turn_end`, `model_request`, `reweave`, `cache_break`, `interrupted`, `session_end`,
 //! `job_registered`, and the `harness_note`/`inbox_opened` records this file writes: `Harness`.
 //! `model_response`, `tool_call`: `Model`. `tool_result`, `job_settled`: `Tool`. `user_message`,
-//! `inbox_resolved`: `User`. `child_settled`: `Agent(child)`. A note carrying an agent's message:
+//! `inbox_resolved`: `User`, except the resolution of a model-unavailable notice (see *Model server
+//! unavailable*): `Harness`. `child_settled`: `Agent(child)`. A note carrying an agent's message:
 //! `Agent(sender)`. Records queued by tools (`Shared::take_emitted`) keep the author they were
 //! queued with.
 //!
@@ -58,7 +59,9 @@
 //! open inbox items (`inbox_opened` without a matching `inbox_resolved`).
 //!
 //! ## `run`
-//! 1. If the session has ended (`session_end` in the log): return `End::Closed`. Otherwise record,
+//! 1. If the session has ended (`session_end` in the log): return `End::Closed`. Otherwise resolve
+//!    every open model-unavailable notice (the session stopped while a request was retrying, and none
+//!    is now) with `inbox_resolved{item_id, texts::UNAVAILABLE_LEFT_OPEN}`, authored `Harness`. Record,
 //!    as arrivals, the operator inputs left in the session's `queued/` directory (see
 //!    [`queue_input`]), oldest first. A `{stem}.{seq}.taking` file was being recorded when the
 //!    harness stopped: when the record at `seq` is an operator's (author `User`) `ledger` record or
@@ -196,7 +199,7 @@
 //!    `ChatRequest{messages: w.messages + weave::hud_message(hud), tools: w.tools, tool_choice:
 //!    Auto, max_tokens: client.profile().max_output_tokens, seed: None, extra: empty}` with
 //!    `client.complete`, forwarding every `StreamEvent` to `Sink::delta(session, req_id, …)` as it
-//!    arrives.
+//!    arrives, and watching it as *Model server unavailable* says.
 //!    - `Err(Cancelled)`: point 1.
 //!    - `Err(ContextOverflow{limit, ..})`: once per step, run the re-weave procedure forced with reason
 //!      `overflow` and that `limit`; if it appended a `reweave`, go back to the start of this point (new weave, new
@@ -275,6 +278,24 @@
 //! those of running every call in place, but for timings, fresh call ids and that key. Counts (started,
 //! claimed, discarded, ms saved) are logged at debug level at the end of each turn.
 //!
+//! ### Model server unavailable
+//! Every model request of a session (a step's, a digest's) is watched through its stream events. Its
+//! first failure is the time of its first `StreamEvent::Retrying` (about when the client's retry window
+//! starts). It is *retrying* from a `Retrying` until the next event that came from the server (any but
+//! `AttemptStart` and `Retrying`). When it is retrying and its first failure lies
+//! `agents.unavailable_notice_s` back (0 = never) — at once on a failure that comes later than that —
+//! the session appends `inbox_opened` (author `Harness`) of a *model-unavailable notice* — `kind:
+//! Blocker`, `blocking: false`, no `call_id`, no `reference`, the only item of that shape — with
+//! `texts::model_unavailable(base_url, since, last, until)`: `since` is the first failure, `last` the
+//! latest `Retrying` reason, `until` (when `retry_window_s` is not 0) the first failure plus the window,
+//! times by `texts::clock`. Status is published. At most one notice is opened per request (so one per
+//! session at a time; a later request opens its own). When the request ends, its notice is resolved:
+//! `inbox_resolved{item_id, answer}` authored `Harness`, `answer` being `texts::unavailable_answered(now)`
+//! for a completion, `texts::unavailable_stopped(now)` for `Cancelled` and `texts::unavailable_failed(now,
+//! error)` for any other error; then the result is handled as it would be without the notice. Neither
+//! record is rendered by the weave or starts a turn, and the request is never rebuilt: every attempt
+//! sends the body the client encoded once.
+//!
 //! ## Settling (children)
 //! Append `turn_end{reason}` and `session_end{outcome, detail}` per the table, kill the session's
 //! jobs, publish status (`Phase::Ended`), and return `End::Settled(Settlement{child: id, role,
@@ -322,8 +343,10 @@
 //!    request of the current stable messages plus one `user` message `texts::DIGEST_PROMPT`, same
 //!    tools, `max_tokens: DIGEST_MAX_TOKENS`, recorded as `model_request{purpose: Digest, hud: None}`
 //!    only (its reply is not appended as a record), and sent once the limiter grants it at
-//!    `deps.priority` (the step waits for it). A non-empty reply text is the digest; an error
-//!    or an empty text gives none. A cancellation returns without a record (the step handles it).
+//!    `deps.priority` (the step waits for it), watched as a step's request is (*Model server
+//!    unavailable*) but with its stream events kept from the sink. A non-empty reply text is the
+//!    digest; an error or an empty text gives none. A cancellation returns without a record (the step
+//!    handles it).
 //!    The plan becomes `text_plan`, with or without a digest: the ledger brief is the durable state,
 //!    the digest an addition to it.
 //! 3. No plan: return without a record. Otherwise append `reweave{epoch: current + 1, upto_seq,
@@ -374,6 +397,11 @@
 //!   `ContextOverflow` from the server triggers a forced re-weave and a retry; unfoldable overflow
 //!   fails the turn with an inbox item;
 //! - a model error (`Rejected`) parks a lead with `turn_failed` and settles a child `Failed`;
+//! - a request retrying (503s) past `unavailable_notice_s` opens one notice with the address and the last
+//!   error, resolved by the harness when the reply arrives, which is handled as usual; the retried
+//!   bodies are identical and the weave holds nothing of it; a request that gives up resolves it before
+//!   the step fails; a stop resolves it; 0 opens none; a digest request is watched too; a notice left
+//!   open is resolved when `run` starts;
 //! - stall note after `stall_steps` steps of read-only calls, and not again until progress.
 
 use crate::gate::{self, Yield, YieldCtx};
@@ -1021,6 +1049,50 @@ fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// What the stream events of one model request say about the server being unavailable (see *Model
+/// server unavailable*).
+#[derive(Default)]
+struct Outage {
+    /// The request's first failed attempt, on the step's clock and on the wall clock (about when the
+    /// client's retry window starts).
+    first: Option<(tokio::time::Instant, u64)>,
+    /// An attempt failed and the server has sent nothing since.
+    retrying: bool,
+    /// Why the latest attempt failed.
+    last: String,
+}
+
+impl Outage {
+    fn on_event(&mut self, event: &StreamEvent) {
+        match event {
+            StreamEvent::Retrying { reason, .. } => {
+                self.first.get_or_insert_with(|| (tokio::time::Instant::now(), now_ms()));
+                self.retrying = true;
+                self.last.clone_from(reason);
+            }
+            StreamEvent::AttemptStart { .. } => {}
+            // Everything else came from the server: it is answering.
+            _ => self.retrying = false,
+        }
+    }
+
+    /// When the notice is due: `after` past the request's first failure, while it is retrying (a
+    /// deadline that passed while the server was answering is due at the next failure). `None` when
+    /// it is not retrying, and when `after` is zero (the notice is off).
+    fn due(&self, after: Duration) -> Option<tokio::time::Instant> {
+        if after.is_zero() || !self.retrying {
+            return None;
+        }
+        self.first.and_then(|(at, _)| at.checked_add(after))
+    }
+}
+
+/// Whether `item` is a model-unavailable notice: the harness opens no other non-blocking `Blocker`
+/// item, and every item a tool opens carries its call's id.
+fn is_unavailable_notice(item: &InboxItem) -> bool {
+    item.kind == InboxKind::Blocker && !item.blocking && item.call_id.is_none()
+}
+
 pub struct Session {
     deps: Deps,
     log: SessionLog,
@@ -1472,6 +1544,7 @@ impl Session {
             self.publish();
             return Ok(End::Closed);
         }
+        self.resolve_stale_notices()?;
         self.publish();
         for input in self.kept_inputs() {
             self.arrival(input).await?;
@@ -2025,7 +2098,7 @@ impl Session {
                 seed: None,
                 extra: Map::new(),
             };
-            let result = self.complete_streaming(&request, &req_id, &token).await;
+            let result = self.complete_streaming(&request, &req_id, &token).await?;
             let queue_ms = permit.waited_ms;
             drop(permit);
             match result {
@@ -2077,35 +2150,24 @@ impl Session {
     /// One request, with every stream event forwarded to the sink as it arrives, and the calls it
     /// started early (see *Early starts*). A failed request leaves none running.
     async fn complete_streaming(
-        &self,
+        &mut self,
         request: &ChatRequest,
         req_id: &str,
         token: &CancellationToken,
-    ) -> Result<(Completion, Early), ModelError> {
-        let client = self.deps.client.clone();
+    ) -> R<Result<(Completion, Early), ModelError>> {
         let sink = self.deps.sink.clone();
-        let session = &self.deps.shared.session;
+        let session = self.deps.shared.session.clone();
         let on = self.deps.ctx.cfg.speculate;
         let logged = if on { self.logged_call_ids() } else { HashSet::new() };
         let (registry, template, counts) = (self.registry.clone(), self.deps.ctx.clone(), self.early_counts.clone());
         let mut early = Early::new(on, registry, template, token, logged, counts);
-        let (tx, mut rx) = unbounded_channel();
-        let call = client.complete(request, Some(&tx), token);
-        tokio::pin!(call);
-        let result = loop {
-            tokio::select! {
-                r = &mut call => break r,
-                Some(event) = rx.recv() => {
-                    sink.delta(session, req_id, &event);
-                    early.on_event(&event);
-                }
-            }
-        };
-        while let Ok(event) = rx.try_recv() {
-            sink.delta(session, req_id, &event);
-            early.on_event(&event);
-        }
-        match result {
+        let result = self
+            .complete_watched(request, token, |event| {
+                sink.delta(&session, req_id, event);
+                early.on_event(event);
+            })
+            .await?;
+        Ok(match result {
             Ok(c) => {
                 early.reply_end = Some(Instant::now());
                 Ok((c, early))
@@ -2114,7 +2176,97 @@ impl Session {
                 early.discard().await;
                 Err(e)
             }
+        })
+    }
+
+    /// `client.complete` for one request of this session, with every stream event handed to
+    /// `on_event` as it arrives. A request that keeps retrying is reported to the operator (see
+    /// *Model server unavailable*); nothing about it changes the request.
+    async fn complete_watched(
+        &mut self,
+        request: &ChatRequest,
+        token: &CancellationToken,
+        mut on_event: impl FnMut(&StreamEvent),
+    ) -> R<Result<Completion, ModelError>> {
+        let client = self.deps.client.clone();
+        let after = Duration::from_secs(self.deps.agents.unavailable_notice_s);
+        let (tx, mut rx) = unbounded_channel();
+        let call = client.complete(request, Some(&tx), token);
+        tokio::pin!(call);
+        let mut outage = Outage::default();
+        // The notice opened during this request; at most one, whatever happens after it.
+        let mut notice: Option<String> = None;
+        let result = loop {
+            let due = if notice.is_none() { outage.due(after) } else { None };
+            tokio::select! {
+                biased;
+                r = &mut call => break r,
+                Some(event) = rx.recv() => {
+                    on_event(&event);
+                    outage.on_event(&event);
+                }
+                () = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {
+                    notice = Some(self.open_unavailable_notice(&outage)?);
+                }
+            }
+        };
+        while let Ok(event) = rx.try_recv() {
+            on_event(&event);
         }
+        if let Some(item_id) = notice {
+            let at = texts::clock(now_ms());
+            let answer = match &result {
+                Ok(_) => texts::unavailable_answered(&at),
+                Err(ModelError::Cancelled { .. }) => texts::unavailable_stopped(&at),
+                Err(e) => texts::unavailable_failed(&at, &e.to_string()),
+            };
+            self.resolve_notice(item_id, answer)?;
+        }
+        Ok(result)
+    }
+
+    /// Tell the operator that the model server has not answered a request of this session for
+    /// `agents.unavailable_notice_s`: a non-blocking `Blocker` item (see [`is_unavailable_notice`]).
+    /// Returns its id.
+    fn open_unavailable_notice(&mut self, outage: &Outage) -> R<String> {
+        let profile = self.deps.client.profile();
+        let since = outage.first.map_or_else(now_ms, |(_, ms)| ms);
+        let until = (profile.retry_window_s > 0)
+            .then(|| texts::clock(since.saturating_add(profile.retry_window_s.saturating_mul(1000))));
+        let text = texts::model_unavailable(&profile.base_url, &texts::clock(since), &outage.last, until.as_deref());
+        tracing::warn!(session = %self.deps.shared.session, base_url = %profile.base_url, last = %outage.last,
+            "the model server has been unavailable for a while; the operator is told");
+        let item = InboxItem {
+            item_id: new_item_id(),
+            kind: InboxKind::Blocker,
+            text,
+            options: Vec::new(),
+            blocking: false,
+            call_id: None,
+            reference: None,
+        };
+        let item_id = item.item_id.clone();
+        self.append(Author::Harness, Event::InboxOpened(item))?;
+        self.publish();
+        Ok(item_id)
+    }
+
+    /// Resolve a model-unavailable notice in the operator's place.
+    fn resolve_notice(&mut self, item_id: String, answer: String) -> R<()> {
+        self.append(Author::Harness, Event::InboxResolved { item_id, answer })?;
+        self.publish();
+        Ok(())
+    }
+
+    /// Resolve the model-unavailable notices a session left open when it stopped during a request:
+    /// none of its requests is retrying now.
+    fn resolve_stale_notices(&mut self) -> R<()> {
+        let stale: Vec<String> =
+            self.st.inbox.iter().filter(|i| is_unavailable_notice(i)).map(|i| i.item_id.clone()).collect();
+        for item_id in stale {
+            self.resolve_notice(item_id, texts::UNAVAILABLE_LEFT_OPEN.to_string())?;
+        }
+        Ok(())
     }
 
     /// The call ids of this session's log.
@@ -2421,7 +2573,8 @@ impl Session {
             seed: None,
             extra: Map::new(),
         };
-        let result = self.deps.client.complete(&request, None, token).await;
+        // Its events are not shown to viewers: they would read as the step's reply.
+        let result = self.complete_watched(&request, token, |_| {}).await?;
         drop(permit);
         Ok(match result {
             Ok(c) if !c.text.trim().is_empty() => Some(c.text.trim().to_string()),
@@ -3975,6 +4128,170 @@ mod tests {
         assert!(s.report.contains("nope"), "{}", s.report);
     }
 
+    /// The bodies a script was sent, each with the wall-clock time it arrived.
+    type Seen = Arc<Mutex<Vec<(u64, Value)>>>;
+
+    /// A script that answers the first `down` requests with 503 and then plays `actions`, keeping
+    /// every body it is sent.
+    fn down_then(down: usize, actions: Vec<Action>) -> (Script, Seen) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kept = seen.clone();
+        let mut actions = std::collections::VecDeque::from(actions);
+        let script = Script::new(move |body, n| {
+            kept.lock().unwrap().push((now_ms(), body.clone()));
+            if n < down {
+                let body = r#"{"error":{"message":"the model is loading"}}"#.to_string();
+                return Action::Status { status: 503, body, retry_after_s: None };
+            }
+            actions.pop_front().unwrap_or_else(|| Reply::text("(script exhausted)").into())
+        });
+        (script, seen)
+    }
+
+    /// Every `inbox_resolved` of `rs`: author, item id, answer.
+    fn resolutions(rs: &[Record]) -> Vec<(Author, String, String)> {
+        rs.iter()
+            .filter_map(|r| match &r.event {
+                Event::InboxResolved { item_id, answer } => Some((r.author.clone(), item_id.clone(), answer.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A fixture whose requests retry for `window_s` (0 = until the server answers) and whose sessions
+    /// report a request that has retried for `notice_s`.
+    async fn retrying_fx(script: Script, notice_s: u64, window_s: u64) -> Fx {
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.profile.retry_window_s = window_s;
+        fx.agents.unavailable_notice_s = notice_s;
+        fx
+    }
+
+    #[tokio::test]
+    async fn a_request_retrying_past_the_notice_time_opens_one_notice_that_closes_itself_when_the_reply_comes() {
+        let (script, _) = down_then(3, vec![bash("echo hi").into(), Reply::text("done").into()]);
+        let mut fx = retrying_fx(script, 1, 0).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let items = inbox(&rs);
+        assert_eq!(items.len(), 1, "{:?}", kinds(&rs));
+        let item = &items[0];
+        assert_eq!((item.kind, item.blocking), (InboxKind::Blocker, false));
+        assert!(item.call_id.is_none() && item.reference.is_none());
+        let opening = format!("The model server at {} has been unavailable since ", fx.server.base_url());
+        assert!(item.text.starts_with(&opening), "{}", item.text);
+        assert!(item.text.contains("the model is loading"), "{}", item.text);
+        assert!(item.text.contains("until the server answers"), "{}", item.text);
+        // Resolved by the harness once the reply was in, before the reply was recorded.
+        let k = kinds(&rs);
+        let at = |what: &str| k.iter().position(|x| x == what).unwrap();
+        assert!(at("model_request") < at("inbox_opened") && at("inbox_opened") < at("inbox_resolved"), "{k:?}");
+        assert!(at("inbox_resolved") < at("model_response"), "{k:?}");
+        let resolved = resolutions(&rs);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!((&resolved[0].0, &resolved[0].1), (&Author::Harness, &item.item_id));
+        let answer = &resolved[0].2;
+        assert!(answer.starts_with("Answered automatically: the model server answered again at "), "{answer}");
+        // The reply was handled as usual, and nothing else started a turn or is left open.
+        assert_eq!(results(&rs).len(), 1);
+        assert_eq!(count(&rs, "turn_start"), 1);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+        assert_eq!(fx.sink.last_status().unwrap().open_inbox, 0);
+        // The model's context holds nothing of it.
+        let woven = serde_json::to_string(&weave(&rs).messages).unwrap();
+        let next = serde_json::to_string(fx.server.requests().last().unwrap()).unwrap();
+        for text in [woven, next] {
+            assert!(!text.contains("has been unavailable since") && !text.contains("Answered automatically"), "{text}");
+            assert!(!text.contains(&fx.server.base_url()), "{text}");
+        }
+        assert_no_cache_break(&rs);
+    }
+
+    #[tokio::test]
+    async fn a_request_whose_attempts_keep_breaking_after_some_output_is_reported_too() {
+        let broken = || Action::DropAfter { reply: Reply::text("x".repeat(200)), chunks: 2 };
+        let mut fx = retrying_fx(seq(vec![broken(), broken(), broken(), Reply::text("done").into()]), 1, 0).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let items = inbox(&rs);
+        assert_eq!(items.len(), 1, "{:?}", kinds(&rs));
+        assert!(items[0].text.contains("mid-stream"), "{}", items[0].text);
+        assert_eq!(resolutions(&rs).len(), 1);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+    }
+
+    #[tokio::test]
+    async fn a_long_reply_after_an_early_failure_opens_no_notice() {
+        let refused = Action::Status { status: 503, body: "loading".into(), retry_after_s: None };
+        // The reply streams for about two seconds, past the time a notice would be due.
+        let slow = Reply::text("y".repeat(72)).with_delay_ms(400);
+        let mut fx = retrying_fx(seq(vec![refused, slow.into()]), 1, 0).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert!(inbox(&rs).is_empty(), "{:?}", kinds(&rs));
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+    }
+
+    #[tokio::test]
+    async fn the_retried_request_is_sent_unchanged_after_the_notice_opened() {
+        let (script, seen) = down_then(3, vec![Reply::text("done").into()]);
+        let mut fx = retrying_fx(script, 1, 0).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let opened = rs.iter().find(|r| kind(r) == "inbox_opened").expect("a notice").ts_ms;
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 4, "three refusals and the reply");
+        assert!(seen.iter().any(|(t, _)| *t < opened), "an attempt before the notice");
+        assert!(seen.iter().any(|(t, _)| *t > opened), "an attempt after the notice");
+        let first = serde_json::to_vec(&seen[0].1).unwrap();
+        for (_, body) in &seen[1..] {
+            assert_eq!(serde_json::to_vec(body).unwrap(), first);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_that_gives_up_resolves_its_notice_and_the_step_fails_as_before() {
+        let (script, _) = down_then(usize::MAX, Vec::new());
+        let mut fx = retrying_fx(script, 1, 2).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let items = inbox(&rs);
+        assert_eq!(items.len(), 2, "{:?}", kinds(&rs));
+        let (notice, parked) = (&items[0], &items[1]);
+        assert_eq!((notice.kind, notice.blocking), (InboxKind::Blocker, false));
+        assert!(notice.text.contains("until about ") && notice.text.contains("the step fails"), "{}", notice.text);
+        let resolved = resolutions(&rs);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!((&resolved[0].0, &resolved[0].1), (&Author::Harness, &notice.item_id));
+        let answer = &resolved[0].2;
+        assert!(answer.starts_with("Answered automatically: the request ended without a reply at "), "{answer}");
+        assert!(answer.contains("the model is loading"), "{answer}");
+        // The failure is handled as it always was: a blocking parked item, and the turn ends in error.
+        assert_eq!((parked.kind, parked.blocking), (InboxKind::Parked, true));
+        assert!(parked.text.contains("the model is loading"), "{}", parked.text);
+        let k = kinds(&rs);
+        assert_eq!(&k[k.len() - 4..], ["inbox_opened", "inbox_resolved", "inbox_opened", "turn_end"]);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error]);
+        assert_eq!(fx.sink.last_status().unwrap().open_inbox, 1);
+    }
+
+    #[tokio::test]
+    async fn no_notice_is_opened_when_unavailable_notice_s_is_zero() {
+        let (script, seen) = down_then(3, vec![Reply::text("done").into()]);
+        let mut fx = retrying_fx(script, 0, 0).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(seen.lock().unwrap().len(), 4, "the request retried past where a notice would open");
+        assert!(inbox(&rs).is_empty() && resolutions(&rs).is_empty(), "{:?}", kinds(&rs));
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+    }
+
     // ---- stop --------------------------------------------------------------------------------
 
     #[tokio::test]
@@ -4000,6 +4317,29 @@ mod tests {
         // The unanswered request ended in a user message that the next user message was merged
         // into. That only appends to the final message, which the guard counts as growth.
         assert_no_cache_break(&fx.sink.records());
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_the_request_retries_resolves_its_notice() {
+        let (script, _) = down_then(usize::MAX, Vec::new());
+        let mut fx = retrying_fx(script, 1, 0).await;
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "the notice", |rs| count(rs, "inbox_opened") == 1).await;
+        fx.control.stop_turn();
+        wait_until(&fx.sink, "turn end", |rs| count(rs, "turn_end") == 1).await;
+        let rs = fx.sink.records();
+        let k = kinds(&rs);
+        assert_eq!(&k[k.len() - 3..], ["inbox_resolved", "interrupted", "turn_end"]);
+        let resolved = resolutions(&rs);
+        assert_eq!((&resolved[0].0, &resolved[0].1), (&Author::Harness, &inbox(&rs)[0].item_id));
+        let answer = &resolved[0].2;
+        let stopped = "Answered automatically: the step that was waiting for the model server was stopped";
+        assert!(answer.starts_with(stopped), "{answer}");
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Stopped]);
+        assert_eq!(fx.sink.last_status().unwrap().open_inbox, 0);
+        assert_eq!(finish_task(tx, task).await, End::Closed);
     }
 
     #[tokio::test]
@@ -4302,6 +4642,36 @@ mod tests {
         let rs = fx.sink.records();
         assert_eq!(notes(&rs, NoteKind::Interrupted), vec![texts::AFTER_RESTART.to_string()]);
         assert!(all_text(&fx.server.requests()[0]).contains(texts::AFTER_RESTART));
+    }
+
+    #[tokio::test]
+    async fn a_notice_left_open_when_the_session_stopped_is_resolved_when_it_runs_again() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
+        let mut session = fx.create();
+        let item = |id: &str, kind: InboxKind, blocking: bool, text: String| InboxItem {
+            item_id: id.into(),
+            kind,
+            text,
+            options: Vec::new(),
+            blocking,
+            call_id: None,
+            reference: None,
+        };
+        let text = texts::model_unavailable("http://127.0.0.1:9/v1", "then", "refused", None);
+        session.append(Author::Harness, Event::InboxOpened(item("i-down", InboxKind::Blocker, false, text))).unwrap();
+        // An item waiting for the operator stays open.
+        let parked = item("i-parked", InboxKind::Parked, true, texts::turn_failed("It broke."));
+        session.append(Author::Harness, Event::InboxOpened(parked)).unwrap();
+        drop(session);
+        let reopened = Session::open(fx.deps()).unwrap();
+        assert_eq!(reopened.status().open_inbox, 2);
+        assert_eq!(run_with(reopened, vec![]).await, End::Closed);
+        let rs = read_records(&fx.log_path()).unwrap().records;
+        let left_open = texts::UNAVAILABLE_LEFT_OPEN.to_string();
+        assert_eq!(resolutions(&rs), vec![(Author::Harness, "i-down".to_string(), left_open)]);
+        assert_eq!(count(&rs, "turn_start"), 0);
+        assert_eq!(fx.sink.last_status().unwrap().open_inbox, 1);
+        assert!(fx.server.requests().is_empty());
     }
 
     #[tokio::test]
@@ -5031,6 +5401,23 @@ mod tests {
         let got = tokio::time::timeout(Duration::from_secs(10), digest).await.expect("the digest waited behind the child");
         assert_eq!(got.unwrap().as_deref(), Some("leads"));
         child.abort();
+    }
+
+    #[tokio::test]
+    async fn a_digest_request_that_keeps_retrying_is_reported_like_a_step_request() {
+        let (script, _) = down_then(3, vec![Reply::text("leads").into()]);
+        let mut fx = retrying_fx(script, 1, 0).await;
+        let mut session = fx.create();
+        let w = session.woven().weave;
+        let got = session.ask_digest(&w, &CancellationToken::new()).await.unwrap();
+        assert_eq!(got.as_deref(), Some("leads"));
+        let rs = session.records().to_vec();
+        assert_eq!(&kinds(&rs)[rs.len() - 3..], ["model_request", "inbox_opened", "inbox_resolved"]);
+        assert!(inbox(&rs)[0].text.contains("the model is loading"), "{}", inbox(&rs)[0].text);
+        let answer = &resolutions(&rs)[0].2;
+        assert!(answer.starts_with("Answered automatically: the model server answered again at "), "{answer}");
+        // Its stream is not shown to viewers.
+        assert!(fx.sink.deltas.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
