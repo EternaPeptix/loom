@@ -63,6 +63,10 @@
 //! Exactly one of `agent` and `all: true` (else an error saying so). `agent` → `stop_child`; outcome
 //! `stopped`, message `{agent} was stopped; anything it had not delivered is in its record but was
 //! not reported.` `all` → `stop_children`; outcome `stopped`, message `All running agents were stopped.`
+//! The orchestrator waits a bounded time for a stopped agent to end. An agent that `S.orch.children`
+//! still lists as running afterwards is still ending: the outcome is then `stopping` and the message
+//! says that it was told to stop, has not ended yet, stays listed as running until it has, and that
+//! its report says how it ended (with `all`, naming those agents).
 //!
 //! ## `decide`
 //! `options` must hold 2 to 6 non-empty strings. `S.orch.poll(&S.session, question, options, k,
@@ -461,19 +465,47 @@ impl Tool for AgentStop {
         let shared = &*self.0;
         let agent = str_arg(args, "agent").filter(|a| !a.trim().is_empty());
         let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+        // The orchestrator waits a while for a stopped agent to end; one that is still listed as running
+        // afterwards was asked to stop and is still ending, which the result says.
+        let still_running = || async {
+            let children = shared.orch.children(&shared.session).await;
+            children.into_iter().filter(|c| c.running).map(|c| c.id).collect::<Vec<_>>()
+        };
         match (agent, all) {
-            (Some(agent), false) => match shared.orch.stop_child(&shared.session, &SessionId::from(agent)).await {
-                Ok(()) => ToolOutput::ok(
+            (Some(agent), false) => {
+                let id = SessionId::from(agent);
+                if let Err(e) = shared.orch.stop_child(&shared.session, &id).await {
+                    return ToolOutput::error(e);
+                }
+                if still_running().await.contains(&id) {
+                    return ToolOutput::ok(
+                        "stopping",
+                        Body::Message(format!(
+                            "{agent} was told to stop and has not ended yet. It stays listed as running until it has; its report then says how it ended."
+                        )),
+                    );
+                }
+                ToolOutput::ok(
                     "stopped",
                     Body::Message(format!(
                         "{agent} was stopped; anything it had not delivered is in its record but was not reported."
                     )),
-                ),
-                Err(e) => ToolOutput::error(e),
-            },
+                )
+            }
             (None, true) => {
                 shared.orch.stop_children(&shared.session).await;
-                ToolOutput::ok("stopped", Body::Message("All running agents were stopped.".into()))
+                let left = still_running().await;
+                if left.is_empty() {
+                    return ToolOutput::ok("stopped", Body::Message("All running agents were stopped.".into()));
+                }
+                let names: Vec<&str> = left.iter().map(SessionId::as_str).collect();
+                ToolOutput::ok(
+                    "stopping",
+                    Body::Message(format!(
+                        "All running agents were told to stop. Not ended yet, and listed as running until they have: {}. The report of each says how it ended.",
+                        names.join(", ")
+                    )),
+                )
             }
             _ => ToolOutput::error("Give exactly one of `agent` (an agent's id) and `all: true`."),
         }
@@ -1009,6 +1041,25 @@ mod tests {
         let res = r.call("agent_stop", json!({"agent":"s-x"})).await;
         assert_eq!(res.status, ToolStatus::Error);
         assert!(res.text.contains("Not your agent."));
+    }
+
+    #[tokio::test]
+    async fn stop_says_when_an_agent_has_not_ended_yet() {
+        let r = lead();
+        // Still listed as running once the orchestrator's wait is over: asked to stop, still ending.
+        r.orch.running_child("s-kid1", "worker");
+        let res = r.call("agent_stop", json!({"agent":"s-kid1"})).await;
+        assert_eq!(res.status, ToolStatus::Ok);
+        assert!(res.text.contains("stopping"), "{}", res.text);
+        assert!(res.text.contains("s-kid1 was told to stop and has not ended yet."), "{}", res.text);
+        assert!(!res.text.contains("was stopped"), "{}", res.text);
+        r.orch.running_child("s-kid2", "worker");
+        let res = r.call("agent_stop", json!({"all":true})).await;
+        assert!(res.text.contains("listed as running until they have: s-kid1, s-kid2."), "{}", res.text);
+        assert!(!res.text.contains("were stopped"), "{}", res.text);
+        // Another agent that is running does not change what is said about this one.
+        let res = r.call("agent_stop", json!({"agent":"s-kid3"})).await;
+        assert!(res.text.contains("s-kid3 was stopped;"), "{}", res.text);
     }
 
     // ---- decide ----

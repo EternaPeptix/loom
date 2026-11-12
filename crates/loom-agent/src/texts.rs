@@ -288,6 +288,15 @@ pub fn task_failed(what: &str, is_child: bool) -> String {
     }
 }
 
+/// Report delivered to the parent for a child whose session could not be opened again after a harness
+/// restart (`error` says why): it will never run again, so it is settled on its behalf.
+pub fn unopenable_report(error: &str) -> String {
+    format!(
+        "The agent's session could not be opened again after the harness restarted ({}), so it delivered no result. What it did before the restart is only in its record. Start a new agent for the assignment if it is still needed.",
+        cut(&one_line(error), 300)
+    )
+}
+
 /// The child's last reply is its own words: every line is quote-prefixed, so none of them can pass for a
 /// line of the report the harness wrote, or for a heading in a result that holds several reports.
 fn append_last_reply(out: &mut String, last_reply: &str) {

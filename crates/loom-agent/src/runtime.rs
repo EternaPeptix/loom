@@ -36,8 +36,9 @@
 //! - at start, for every session that is not archived and whose `status.json` says `phase ==
 //!   Running`, or `last_end == Waiting`, or `open_inbox > 0`, or `last_end == Yielded` while its log
 //!   holds a `job_registered` with no `job_settled` (the job's end would have started a turn; the
-//!   log is read only when the session's `jobs/` directory is not empty) (parents before children —
-//!   session ids sort by creation time);
+//!   log is read only when the session's `jobs/` directory is not empty), and for every child that
+//!   has not ended, whatever it was doing (parents before children — session ids sort by creation
+//!   time);
 //! - on demand, by `send_message`, `resume`, `reweave`, `answer`, and when a settlement has to be
 //!   delivered to a parent that is not active.
 //!
@@ -50,7 +51,9 @@
 //! When a session's task ends:
 //! - `End::Settled(s)`: the session becomes inactive; its proxy grant is revoked; the settlement is
 //!   kept (for `join`, `children`) — see *Children*.
-//! - `End::Closed`: inactive.
+//! - `End::Closed`: inactive. A child ends this way only at a shutdown (it is cut, and resumed by the
+//!   next start) or when its log had ended already: a child whose inputs close otherwise settles
+//!   itself (`Stopped`), so that every child that stops taking part has exactly one settlement.
 //! - `End::Fatal(e)`: inactive; `tracing::error!`; a [`BusEvent::Error`]; the operator is notified
 //!   (kind `error`). A child is then settled on its behalf so that nothing waits for it forever:
 //!   `Settlement{outcome: Failed, report: texts::failed_report(&e, ""), full: None, payload: Null,
@@ -140,15 +143,21 @@
 //!
 //! When a child settles and it was not `awaited`, or it was restored after a restart (nobody can be
 //! waiting for it any more): send `Input::ChildSettled(settlement)` to its parent, activating the
-//! parent if necessary.
+//! parent if necessary. Each settlement is delivered once; one that cannot be delivered (the lead is
+//! archived) is delivered when the lead is unarchived or by the next start. A verifier the finish
+//! gate started (`harness: true`) is never delivered: its verdict belongs to the `finish` that joins it.
+//! A `harness` spawn whose parent has a verifier with the same assignment that no `join` took (a
+//! `finish` that a restart cut, made again) gets that verifier's id instead of a new one; the
+//! parent's other verifiers that nothing will take are stopped.
 //!
 //! `stop_child(parent, child)`: not its child → the sentence above; already settled → `{child} has
-//! already finished ({outcome word}).`; else `control.stop_turn()` and `Input::Stop`.
+//! already finished ({outcome word}).`; else `control.stop_turn()` and `Input::Stop`, then wait for
+//! it to settle, at most `tools.kill_grace_s` + [`STOP_SETTLE_WAIT`] (an idle child settles at once).
 //! `stop_children(parent)`: the same for every unsettled child, without errors.
 //! `message_child(parent, child, text)`: same two refusals; else `Input::AgentMessage{from: parent,
 //! text}`.
-//! `children(parent)`: every child of `parent` in creation order: `ChildInfo{id, role, title, step:
-//! latest status, running: not settled}`.
+//! `children(parent)`: every child of `parent` in creation order except the finish gate's verifiers:
+//! `ChildInfo{id, role, title, step: latest status, running: not settled}`.
 //!
 //! `poll(session, question, options, k, cancel)`: the session's status must have a `fork_point`
 //! (`Nothing has been sent to the model in this session yet, so there is nothing to vote on.`).
@@ -220,8 +229,9 @@
 //!   mission keeps a ledger, and the stock text when one was used.
 //! - `stop(id)`: any session. Active: `control.stop_turn()` and `Input::Stop`. Not active: nothing.
 //! - `resume(id)`: root only; activate; `Input::Resume` to it and to each of its unsettled children
-//!   whose latest status has `last_end == Stopped` (activating them), except one that is running a
-//!   turn already. Only a restart leaves a child that way: a child that is stopped settles.
+//!   that a restart left idle and that have not been resumed since (activating them): each gets one
+//!   `Resume` for the restart, however many operator actions follow before its turn starts. Only a
+//!   restart leaves a child idle that way: a child that is stopped settles.
 //! - `reweave(id)`: activate; `Input::Reweave`.
 //! - `answer(item_id, answer)`: the item must be open (`There is no open inbox item {item_id}.`);
 //!   an empty answer to a blocking item is refused (`This item is waiting for an answer; write
@@ -230,7 +240,10 @@
 //!   dismisses it: the session resolves it without starting a turn.)
 //! - `archive(id, archived)`: root only; refused while the session or one of its children is
 //!   running a turn (`Stop the session before archiving it.`). Sets `archived` in the `meta.json`
-//!   of the session and its children; archiving closes their inputs (their tasks end `Closed`).
+//!   of the session and its children; archiving closes their inputs (the lead's task ends `Closed`,
+//!   each child settles `Stopped`; a task keeps its place until it has ended). Unarchiving delivers
+//!   what the children settled with in the meantime, and restores those that had not settled as the
+//!   start does.
 //!   Archived sessions are listed only by `sessions(true)` and are not activated at start;
 //!   `send_message`/`resume` on one are refused (`This session is archived; unarchive it first.`).
 //!
@@ -240,26 +253,38 @@
 //!    key; blob store; clients and limiters; proxy.
 //! 2. Read every session's `meta.json` and `status.json` (missing status = default idle status).
 //! 3. Activate as described under *Active sessions*. A session that cannot be opened is skipped
-//!    with `tracing::error!` and a `BusEvent::Error`.
-//! 4. Restored sessions with `meta.unattended` are told to carry on (`Input::Resume`) when
+//!    with `tracing::error!` and a `BusEvent::Error`; a child that cannot be opened while its lead
+//!    can will never run again, and is settled on its behalf: `Failed`, report
+//!    `texts::unopenable_report(error)`, kept in `settlement.json`, status `Ended`/`Failed`.
+//! 4. Restored root sessions with `meta.unattended` are told to carry on (`Input::Resume`) when
 //!    - `open` cut a running turn (after `open`, the last own `turn_end` is `Stopped`, the latest
 //!      own `interrupted` reason is `REASON_RESTART` or starts with `the session log was damaged`,
 //!      and no own `turn_start` follows it), or
-//!    - the last turn ended `Waiting` and the session has no unsettled child.
+//!    - the last turn ended `Waiting` and the session has no unsettled child (other than a verifier
+//!      of the finish gate): a lead waiting for its agents is woken by their reports.
 //!
 //!    Attended or not, a restored session is told to carry on when its last turn ended `Waiting`
 //!    or `Yielded` and `open` told it of a lost job (`Session::lost_jobs() > 0`: the job's end
-//!    would have started a turn), and a child that a restart cut is told to carry on whenever its
-//!    parent is: what the lead is told about its agents (`AFTER_RESTART`) is then what happened.
-//!    A session whose last turn ended `Waiting` or `Yielded` and to which a lost delivery is
-//!    recovered (below) is not told to carry on — the delivery starts its turn — but counts as
-//!    carrying on for its children.
+//!    would have started a turn). A session whose last turn ended `Waiting` or `Yielded` and to which
+//!    a lost delivery is recovered (below) is not told to carry on — the delivery starts its turn —
+//!    but counts as carrying on for its children.
+//!
+//!    A restored child that has had a turn is idle (the restart cut its turn, or it was between
+//!    turns) and is *held*: it is told to carry on now when it was told of a lost job, when its
+//!    mission is unattended, or when its parent carries on, and otherwise as soon as its parent is
+//!    (a message, a resume or an answer to the lead): what the lead is told about its agents
+//!    (`AFTER_RESTART`) is then what happened. A child that never had a turn starts its first one by
+//!    itself. So every child of a mission that is not archived is, after this pass, running, held
+//!    for its lead, or settled.
 //!
 //!    Children restored this way count as not `awaited` from now on.
 //!
-//!    A delivery lost to the restart is recovered: a child that has ended (not an awaited one that
-//!    was stopped) and whose parent's log holds no `child_settled` for it is delivered to the
-//!    parent as `Input::ChildSettled`, from its `settlement.json` or else from its log (see *Files*).
+//!    A delivery lost to the restart is recovered: a child that has ended and whose parent's log
+//!    holds no `child_settled` for it is delivered to the parent as `Input::ChildSettled`, from its
+//!    `settlement.json` or else from its log (see *Files*) — unless the call that started it was
+//!    `awaited` and has a recorded result (which told the lead how it ended), or it is a verifier of
+//!    the finish gate (known from the `child_spawned` record of a `finish` call). A settlement made
+//!    during this pass is left to this recovery.
 //!
 //! ## Shutdown (`Runtime::shutdown`)
 //! Mark the runtime as shutting down. From that moment the orchestrator's `stop_child` and
@@ -283,7 +308,10 @@
 //! and resumed by the next start, so a result saying the call was interrupted and the agent stopped
 //! would be false. The task waiting in it is aborted as soon as it is seen there (no need to wait
 //! out the deadline), the call keeps no recorded result, and after the restart the weave shows it
-//! as interrupted while the child's report arrives by itself.
+//! as interrupted while the child's report arrives by itself. What the call queued for the parent's
+//! log (`child_spawned`, `ledger`) is appended to it before the task parks, so that the next start
+//! knows what the call started: a `finish` made again after the restart joins the verifier it had
+//! started (or takes the verdict that verifier gave) instead of starting a second one.
 //!
 //! ## Reading
 //! - `sessions(include_archived)`: newest first. `session(id)`.
@@ -340,12 +368,12 @@ use futures_util::FutureExt;
 use loom_core::config::{Config, NetworkMode, Paths, SandboxCfg};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
-    Author, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, Forked, InboxItem, ModelRef, NetDecision, Record,
-    Seq, SessionOutcome, SessionStart, SpawnMode, Termination, TurnEndReason, Usage,
+    Author, Brief, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, Forked, InboxItem, ModelRef, NetDecision,
+    Record, Seq, SessionOutcome, SessionStart, SpawnMode, Termination, TurnEndReason, Usage,
 };
 use loom_core::journal::{self, Journal};
 use loom_core::ledger::LedgerState;
-use loom_core::log::{read_records, PageReader};
+use loom_core::log::{read_records, Durability, PageReader, SessionLog};
 use loom_core::weave::{render_brief, weave, WindowItem};
 use loom_core::{now_ms, BlobId, BlobStore, CallId, MissionId, SessionId};
 use loom_model::{ChatRequest, Discovered, Limiter, ModelClient, ModelError, Priority, StreamEvent, ToolChoice};
@@ -555,6 +583,9 @@ const SHUTDOWN_TASK_WAIT: Duration = Duration::from_secs(3);
 const SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 /// How long an aborted task gets to be dropped.
 const SHUTDOWN_ABORT_WAIT: Duration = Duration::from_secs(5);
+/// How long `stop_child` and `stop_children` wait for a stopped agent to settle, on top of the grace
+/// its running commands get between TERM and KILL.
+const STOP_SETTLE_WAIT: Duration = Duration::from_secs(2);
 /// How long a notification command may run.
 const NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -674,6 +705,10 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 #[cfg(test)]
 static PANIC_TITLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// Every agent a `Resume` was sent to, once per `Resume` (tests only).
+#[cfg(test)]
+static RESUMES: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
+
 fn network_text(config: &Config) -> String {
     let mode = match config.network.mode {
         NetworkMode::Open => "open",
@@ -703,16 +738,36 @@ struct Known {
     /// A child's settlement, once there is one.
     settlement: Option<Settlement>,
     settled_tx: watch::Sender<Option<Settlement>>,
-    /// The settlement was handed to a `join` (and recorded in the parent's log).
+    /// The settlement reached the parent: a `join` took it (and recorded it in the parent's log), or it
+    /// was handed to the parent as input. Whoever sets it delivers; a delivery that fails clears it.
     joined: bool,
     /// Activated from disk: nobody can be waiting for this session any more.
     restored: bool,
+    /// An agent that a restart left idle (its turn cut, or between turns with nothing that would wake
+    /// it): only a `Resume` runs it again, and it gets one when its lead goes on. Cleared when that
+    /// `Resume` is sent and when the agent publishes that it is running, so that a second operator
+    /// action before its turn starts sends no second one.
+    held: bool,
+    /// The finish gate of its parent started it, with this assignment (known from the parent's log
+    /// for an agent restored from disk). Its settlement belongs to the `finish` that waits for it: it
+    /// is never delivered as an agent report, and the parent's agent listing leaves it out.
+    gate: Option<Brief>,
 }
 
 impl Known {
     fn new(meta: SessionMeta, status: Status) -> Known {
         let (settled_tx, _) = watch::channel(None);
-        Known { meta, status, active: None, settlement: None, settled_tx, joined: false, restored: false }
+        Known {
+            meta,
+            status,
+            active: None,
+            settlement: None,
+            settled_tx,
+            joined: false,
+            restored: false,
+            held: false,
+            gate: None,
+        }
     }
 
     fn finished(&self) -> bool {
@@ -779,6 +834,9 @@ struct Inner {
     /// Held while sessions are activated (never across an `.await`).
     activation: Mutex<()>,
     shutting: AtomicBool,
+    /// The start-up pass has not looked at the leads' logs yet: a settlement made until then is left
+    /// for its recovery to deliver (see `record_settlement`).
+    restoring: AtomicBool,
     next_gen: AtomicU64,
     orch: Arc<dyn Orchestrator>,
     sink: Arc<dyn Sink>,
@@ -835,12 +893,28 @@ const NOT_YOURS: &str = "is not an agent this session started.";
 #[async_trait]
 impl Orchestrator for Orch {
     async fn spawn(&self, parent: &SessionId, req: SpawnReq) -> Result<SessionId, String> {
-        self.up()?.spawn_child(parent, req)
+        let inner = self.up()?;
+        if !req.harness {
+            return inner.spawn_child(parent, req);
+        }
+        if let Some(verifier) = inner.cut_verifier(parent, &req.brief) {
+            // The finish waits for it now: one the restart left idle goes on (an ended one has its verdict).
+            if inner.activate(&verifier).is_ok() {
+                inner.resume_held(&verifier);
+            }
+            return Ok(verifier);
+        }
+        let brief = req.brief.clone();
+        let child = inner.spawn_child(parent, req)?;
+        if let Some(k) = inner.st().known.get_mut(&child) {
+            k.gate = Some(brief);
+        }
+        Ok(child)
     }
 
     async fn join(&self, parent: &SessionId, child: &SessionId, cancel: &CancellationToken) -> Result<Settlement, String> {
         let inner = self.0.upgrade().ok_or_else(|| SHUTTING.to_string())?;
-        let mut rx = {
+        let (mut rx, parent_shared) = {
             let st = inner.st();
             let k = st.known.get(child).filter(|k| k.meta.parent.as_ref() == Some(parent));
             let Some(k) = k else {
@@ -849,7 +923,9 @@ impl Orchestrator for Orch {
             if !k.meta.awaited {
                 return Err(format!("{} was started in the background; its report arrives by itself.", child.as_str()));
             }
-            k.settled_tx.subscribe()
+            // Taken now: a shutdown takes the parent's active state away before this call parks.
+            let parent_shared = st.known.get(parent).and_then(|p| p.active.as_ref()).map(|a| a.shared.clone());
+            (k.settled_tx.subscribe(), parent_shared)
         };
         let settlement = loop {
             let current = rx.borrow_and_update().clone();
@@ -863,7 +939,12 @@ impl Orchestrator for Orch {
                         // The child is not stopped by a shutdown: it is cut, and resumed by the next
                         // start. A result written now would tell the model that the call was
                         // interrupted and the agent stopped, so the call gets none: this task stays
-                        // here until `shutdown` aborts it, and `open` records the cut.
+                        // here until `shutdown` aborts it, and `open` records the cut. What the call
+                        // queued for the log is written first, so that the restart knows the agents
+                        // it started.
+                        if let Some(shared) = &parent_shared {
+                            inner.write_for_parked(parent, shared);
+                        }
                         inner.st().parked.insert(parent.clone());
                         std::future::pending::<()>().await;
                     }
@@ -876,22 +957,14 @@ impl Orchestrator for Orch {
                 }
             }
         };
-        let shared = {
-            let mut st = inner.st();
-            let first = match st.known.get_mut(child) {
-                Some(k) if !k.joined => {
-                    k.joined = true;
-                    true
-                }
-                _ => false,
-            };
-            if first {
-                st.known.get(parent).and_then(|p| p.active.as_ref()).map(|a| a.shared.clone())
-            } else {
-                None
+        let first = match inner.st().known.get_mut(child) {
+            Some(k) if !k.joined => {
+                k.joined = true;
+                true
             }
+            _ => false,
         };
-        if let Some(shared) = shared {
+        if let Some(shared) = parent_shared.filter(|_| first) {
             shared.emit(
                 Author::Agent(child.clone()),
                 Event::ChildSettled(ChildSettled {
@@ -914,7 +987,7 @@ impl Orchestrator for Orch {
             return Ok(());
         }
         inner.check_child(parent, child)?;
-        inner.stop_one(child);
+        inner.stop_and_wait(std::slice::from_ref(child)).await;
         Ok(())
     }
 
@@ -931,9 +1004,7 @@ impl Orchestrator for Orch {
                 .map(|(id, _)| id.clone())
                 .collect()
         };
-        for id in running {
-            inner.stop_one(&id);
-        }
+        inner.stop_and_wait(&running).await;
     }
 
     async fn message_child(&self, parent: &SessionId, child: &SessionId, text: &str) -> Result<(), String> {
@@ -954,9 +1025,11 @@ impl Orchestrator for Orch {
     async fn children(&self, parent: &SessionId) -> Vec<ChildInfo> {
         let Some(inner) = self.0.upgrade() else { return Vec::new() };
         let st = inner.st();
+        // The finish gate's verifiers are the harness's, not agents the session started: nothing waits
+        // for them or is refused because of them, and their verdicts go to `finish` only.
         st.known
             .iter()
-            .filter(|(_, k)| k.meta.parent.as_ref() == Some(parent))
+            .filter(|(_, k)| k.meta.parent.as_ref() == Some(parent) && k.gate.is_none())
             .map(|(id, k)| ChildInfo {
                 id: id.clone(),
                 role: k.meta.role.clone(),
@@ -1116,6 +1189,28 @@ impl Inner {
         }
     }
 
+    /// Stop the agents `ids` and wait until they have settled, up to the kill grace of their running
+    /// commands plus [`STOP_SETTLE_WAIT`]. An agent settles in its own task: an idle one at once, a
+    /// working one when its turn has unwound. Waiting lets the caller say what really happened.
+    async fn stop_and_wait(&self, ids: &[SessionId]) {
+        // Only an agent with a task can settle: one without is not waited for.
+        let settled: Vec<watch::Receiver<Option<Settlement>>> = {
+            let st = self.st();
+            ids.iter()
+                .filter_map(|id| st.known.get(id).filter(|k| k.active.is_some()).map(|k| k.settled_tx.subscribe()))
+                .collect()
+        };
+        for id in ids {
+            self.stop_one(id);
+        }
+        let wait = Duration::from_secs(self.config.tools.kill_grace_s).saturating_add(STOP_SETTLE_WAIT);
+        let all = futures_util::future::join_all(settled.into_iter().map(|mut rx| async move {
+            // The `Ref` is dropped at once: one held would block the next send on its channel.
+            rx.wait_for(Option::is_some).await.is_ok()
+        }));
+        let _ = tokio::time::timeout(wait, all).await;
+    }
+
     /// `child` must be an unsettled child of `parent`; the error is a sentence for the model.
     fn check_child(&self, parent: &SessionId, child: &SessionId) -> Result<(), String> {
         let st = self.st();
@@ -1181,6 +1276,9 @@ impl Inner {
             let mut st = self.st();
             if let Some(k) = st.known.get_mut(session) {
                 k.status = status.clone();
+                if status.phase == Phase::Running {
+                    k.held = false;
+                }
             }
         }
         let dir = self.paths.session_dir(session);
@@ -1459,6 +1557,9 @@ impl Inner {
         self.proxy.revoke(id);
         let settlement = match end {
             End::Settled(s) => Some(s),
+            // A child ends `Closed` only at a shutdown, which the next start resumes it from: a child
+            // whose inputs close otherwise settles itself, and one whose log had already ended is
+            // `Ended` from its activation on, so the recovery of the start delivers what it ended with.
             End::Closed => {
                 self.clear_active(id, gen);
                 None
@@ -1500,9 +1601,9 @@ impl Inner {
         self.record_settlement(id, s);
     }
 
-    /// A child whose task ended without writing a `session_end` (a log fault, a panic) is over all
-    /// the same. Its status says so, durably, so that a later start does not run it again beside
-    /// the settlement its parent was given.
+    /// A child whose task ended without writing a `session_end` (a log fault, a panic), or whose
+    /// session cannot be opened again after a restart, is over all the same. Its status says so,
+    /// durably, so that a later start does not run it again beside the settlement its parent was given.
     fn mark_failed(&self, id: &SessionId) {
         let status = {
             let mut st = self.st();
@@ -1527,31 +1628,53 @@ impl Inner {
     }
 
     /// Keep a child's settlement, wake whoever waits for it, and deliver it to the parent when
-    /// nobody can be waiting.
+    /// nobody can be waiting. A verifier of the finish gate is never delivered: its verdict is the
+    /// `finish`'s, which takes it with a `join` (after a restart, the `finish` made again).
     fn record_settlement(self: &Arc<Self>, id: &SessionId, s: Settlement) {
         let (parent, deliver) = {
             let mut st = self.st();
             let Some(k) = st.known.get_mut(id) else { return };
             k.settlement = Some(s.clone());
             k.settled_tx.send_replace(Some(s.clone()));
-            (k.meta.parent.clone(), !k.meta.awaited || k.restored)
+            // During the start-up pass the recovery that ends it delivers what settled before then: it
+            // is the one that knows which agents the finish gate started.
+            let deliver = (!k.meta.awaited || k.restored)
+                && k.gate.is_none()
+                && !k.joined
+                && !self.shutting.load(Ordering::SeqCst)
+                && !self.restoring.load(Ordering::SeqCst);
+            if deliver {
+                k.joined = true;
+            }
+            (k.meta.parent.clone(), deliver)
         };
         self.publish(BusEvent::Settled { session: id.clone(), settlement: Box::new(s.clone()) });
         if let (Some(parent), true) = (parent, deliver) {
-            if !self.shutting.load(Ordering::SeqCst) {
-                self.deliver(&parent, s);
-            }
+            self.deliver(&parent, s);
         }
     }
 
-    /// Hand a settlement to its parent as input, activating the parent if need be.
+    /// Hand a settlement to its parent as input, activating the parent if need be. The caller has
+    /// claimed the delivery (`joined`); one that fails gives the claim back, so that a recovery (after
+    /// a restart, or when an archived lead is unarchived) makes it later.
     fn deliver(self: &Arc<Self>, parent: &SessionId, s: Settlement) {
-        if let Err(e) = self.activate(parent) {
-            tracing::warn!("the settlement of {} cannot be delivered to {}: {e}", s.child.as_str(), parent.as_str());
-            return;
-        }
-        if !self.send_input(parent, Input::ChildSettled(s.clone())) {
-            tracing::warn!("the settlement of {} was not accepted by {}", s.child.as_str(), parent.as_str());
+        let handed = match self.activate(parent) {
+            Err(e) => {
+                tracing::warn!("the settlement of {} cannot be delivered to {}: {e}", s.child.as_str(), parent.as_str());
+                false
+            }
+            Ok(_) => {
+                let sent = self.send_input(parent, Input::ChildSettled(s.clone()));
+                if !sent {
+                    tracing::warn!("the settlement of {} was not accepted by {}", s.child.as_str(), parent.as_str());
+                }
+                sent
+            }
+        };
+        if !handed {
+            if let Some(k) = self.st().known.get_mut(&s.child) {
+                k.joined = false;
+            }
         }
     }
 
@@ -1719,8 +1842,15 @@ impl Inner {
         })
     }
 
-    /// A delivery lost to a restart: the child ended but its parent never recorded it.
-    fn recover_settlements(self: &Arc<Self>) -> HashSet<SessionId> {
+    /// Deliveries lost to a restart, or to a lead that was archived when its agents settled: an agent
+    /// of a live lead (of those `scope` selects) has ended, its settlement did not reach the lead, and
+    /// the lead's log holds no `child_settled` for it. It is delivered as `Input::ChildSettled`, from the
+    /// settlement kept in memory or in `settlement.json`, or else from its log (see *Files*), unless
+    /// the lead was told already: the call that started an `awaited` agent has a recorded result,
+    /// which said that the agent was stopped. A verifier of the finish gate is not delivered: its
+    /// settlement is kept for the `finish` made again ([`Inner::cut_verifier`]). Marks the agents the
+    /// finish gate started. Returns the leads something was delivered to.
+    fn recover_settlements(self: &Arc<Self>, scope: impl Fn(&Known) -> bool) -> HashSet<SessionId> {
         let mut delivered_to = HashSet::new();
         let candidates: Vec<(SessionId, SessionId, SessionMeta)> = {
             let st = self.st();
@@ -1729,53 +1859,65 @@ impl Inner {
                 .filter_map(|(id, k)| {
                     let parent = k.meta.parent.clone()?;
                     let parent_ok = st.known.get(&parent).is_some_and(|p| !p.meta.archived && p.status.phase != Phase::Ended);
-                    (k.status.phase == Phase::Ended
-                        && !k.meta.archived
-                        && parent_ok
-                        && !(k.meta.awaited && k.status.outcome == Some(SessionOutcome::Stopped)))
-                    .then(|| (id.clone(), parent, k.meta.clone()))
+                    let wanted = scope(k) && !k.joined && !k.meta.archived && parent_ok;
+                    wanted.then(|| (id.clone(), parent, k.meta.clone()))
                 })
                 .collect()
         };
-        let mut seen: HashMap<SessionId, HashSet<SessionId>> = HashMap::new();
+        // First what the leads' logs say about each agent; then the deliveries.
+        let mut seen: HashMap<SessionId, Spawns> = HashMap::new();
+        let mut open: Vec<(SessionId, SessionId, SessionMeta, bool)> = Vec::new();
         for (id, parent, meta) in candidates {
-            let settled = seen.entry(parent.clone()).or_insert_with(|| {
-                read_records(&self.paths.session_log(&parent))
-                    .map(|r| {
-                        own_records(&r.records)
-                            .iter()
-                            .filter_map(|rec| match &rec.event {
-                                Event::ChildSettled(c) => Some(c.child.clone()),
-                                _ => None,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
+            let spawns = seen.entry(parent.clone()).or_insert_with(|| {
+                read_records(&self.paths.session_log(&parent)).map(|r| Spawns::of(&r.records)).unwrap_or_default()
             });
-            if settled.contains(&id) {
+            let gate = spawns.gate.get(&id).cloned();
+            // The lead had it: nothing is delivered, and a `finish` made again does not take it.
+            let had = spawns.settled.contains(&id) || (meta.awaited && spawns.answered.contains(&id));
+            if let Some(k) = self.st().known.get_mut(&id) {
+                k.joined |= had;
+                if gate.is_some() {
+                    k.gate = gate.clone();
+                }
+            }
+            if !had {
+                open.push((id, parent, meta, gate.is_some()));
+            }
+        }
+        // From here on a settlement is delivered as it is made; what settled before is delivered
+        // below. The claim each delivery takes under the state lock makes it one.
+        self.restoring.store(false, Ordering::SeqCst);
+        for (id, parent, meta, gate) in open {
+            let (kept, ended) = match self.st().known.get(&id) {
+                Some(k) => (k.settlement.clone(), k.status.phase == Phase::Ended || k.settlement.is_some()),
+                None => continue,
+            };
+            if !ended {
                 continue;
             }
             // What the child's task handed over when it ended. Without it (see *Files*) the child's
             // log gives the outcome and the first line of the report.
-            let persisted = read_json::<Settlement>(&self.paths.session_dir(&id).join("settlement.json"))
-                .filter(|p| p.child == id);
-            let Ok(report) = read_records(&self.paths.session_log(&id)) else { continue };
-            let own = own_records(&report.records);
-            let blocked = own
-                .iter()
-                .rev()
-                .find_map(|r| match &r.event {
-                    Event::TurnEnd { reason } => Some(*reason == TurnEndReason::Blocked),
-                    _ => None,
-                })
-                .unwrap_or(false);
-            let end = own.iter().rev().find_map(|r| match &r.event {
-                Event::SessionEnd { outcome, detail } => Some((*outcome, detail.clone())),
-                _ => None,
+            let persisted = kept.or_else(|| {
+                read_json::<Settlement>(&self.paths.session_dir(&id).join("settlement.json")).filter(|p| p.child == id)
             });
-            let s = match (persisted, end) {
-                (Some(s), _) => s,
-                (None, Some((outcome, detail))) => {
+            let s = match persisted {
+                Some(s) => s,
+                None => {
+                    let Ok(report) = read_records(&self.paths.session_log(&id)) else { continue };
+                    let own = own_records(&report.records);
+                    let blocked = own
+                        .iter()
+                        .rev()
+                        .find_map(|r| match &r.event {
+                            Event::TurnEnd { reason } => Some(*reason == TurnEndReason::Blocked),
+                            _ => None,
+                        })
+                        .unwrap_or(false);
+                    let end = own.iter().rev().find_map(|r| match &r.event {
+                        Event::SessionEnd { outcome, detail } => Some((*outcome, detail.clone())),
+                        _ => None,
+                    });
+                    let Some((outcome, detail)) = end else { continue };
                     let outcome = if blocked { ChildOutcome::Blocked } else { child_outcome_of(outcome) };
                     let steps = self.st().known.get(&id).map(|k| k.status.step).unwrap_or(0);
                     let text = if detail.trim().is_empty() { texts::stopped_report(steps) } else { detail };
@@ -1790,29 +1932,41 @@ impl Inner {
                         usage: Usage::default(),
                     }
                 }
-                (None, None) => continue,
             };
-            {
+            // Claimed under the lock: the settlement of an agent that ends now is delivered once.
+            let claimed = {
                 let mut st = self.st();
-                if let Some(k) = st.known.get_mut(&id) {
-                    k.settlement = Some(s.clone());
-                    k.settled_tx.send_replace(Some(s.clone()));
-                    k.restored = true;
+                match st.known.get_mut(&id) {
+                    Some(k) if !k.joined => {
+                        if k.settlement.is_none() {
+                            k.settlement = Some(s.clone());
+                            k.settled_tx.send_replace(Some(s.clone()));
+                        }
+                        k.restored = true;
+                        k.joined = !gate;
+                        true
+                    }
+                    _ => false,
                 }
+            };
+            if claimed && !gate {
+                self.deliver(&parent, s);
+                delivered_to.insert(parent);
             }
-            self.deliver(&parent, s);
-            delivered_to.insert(parent);
         }
         delivered_to
     }
 
+    /// Whether `id` has an agent that has not settled. The finish gate's verifiers do not count: they
+    /// never wake their lead.
     fn has_unsettled_child(&self, id: &SessionId) -> bool {
-        self.st().known.values().any(|k| k.meta.parent.as_ref() == Some(id) && !k.finished())
+        self.st().known.values().any(|k| k.meta.parent.as_ref() == Some(id) && !k.finished() && k.gate.is_none())
     }
 
-    /// Whether the session's log holds a job that was registered and never settled. The log is
-    /// read only when the session's jobs directory holds something: a background job leaves its
-    /// output file there.
+    /// Whether the session's log holds a job that was registered and never settled. The log is read
+    /// only when the session's jobs directory holds something. Every command leaves its files there,
+    /// a foreground one as well as a background job, so this passes over only the sessions that never
+    /// ran a command; for the others the log decides.
     fn has_unsettled_job(&self, id: &SessionId) -> bool {
         let jobs = self.paths.session_dir(id).join("jobs");
         if !std::fs::read_dir(jobs).is_ok_and(|mut entries| entries.next().is_some()) {
@@ -1830,32 +1984,215 @@ impl Inner {
         own.iter().any(|r| matches!(&r.event, Event::JobRegistered { job_id, .. } if !settled.contains(job_id.as_str())))
     }
 
-    /// Tell the children of `lead` that a restart cut to carry on. An unsettled child's turn ends
-    /// `Stopped` only that way: a child stopped by its parent or the operator settles. One that is
-    /// already running the turn it was resumed with (its last turn end is still that cut) is left
-    /// alone, or the second `Resume` would start a turn it did not ask for when this one ends.
+    /// Tell the children of `lead` that a restart left idle to carry on (see `held`). An agent gets one
+    /// `Resume` for the cut: a second one would start a turn it did not ask for once the resumed one
+    /// ends.
     fn resume_cut_children(self: &Arc<Self>, lead: &SessionId) {
         let children: Vec<SessionId> = {
             let st = self.st();
             st.known
                 .iter()
-                .filter(|(_, k)| {
-                    k.meta.parent.as_ref() == Some(lead)
-                        && !k.finished()
-                        && k.status.last_end == Some(TurnEndReason::Stopped)
-                        && !(k.active.is_some() && k.status.phase == Phase::Running)
-                })
+                .filter(|(_, k)| k.meta.parent.as_ref() == Some(lead) && k.held && !k.finished())
                 .map(|(c, _)| c.clone())
                 .collect()
         };
         for child in children {
             match self.activate(&child) {
-                Ok(_) => {
-                    self.send_input(&child, Input::Resume);
-                }
+                Ok(_) => self.resume_held(&child),
                 Err(e) => tracing::warn!("child {} cannot be resumed: {e}", child.as_str()),
             }
         }
+    }
+
+    /// Send the one `Resume` of an agent that a restart left idle.
+    fn resume_held(&self, id: &SessionId) {
+        let mut st = self.st();
+        let Some(k) = st.known.get_mut(id).filter(|k| k.held) else { return };
+        if k.active.as_ref().is_some_and(|a| a.inputs.send(Input::Resume).is_ok()) {
+            k.held = false;
+            #[cfg(test)]
+            lock(&RESUMES).push(id.clone());
+        }
+    }
+
+    /// The agents of `leads` that have not settled, after a restart or an unarchive: each is
+    /// activated, so that a stop or an archive reaches it, and becomes `held` when it will not run by
+    /// itself (a restart cut its turn, or left it idle): it is resumed when its lead goes on. One
+    /// that cannot be opened any more is settled `Failed` on its behalf, with what went wrong, so
+    /// that its lead is not left waiting for it; a recovery delivers that.
+    fn restore_children(self: &Arc<Self>, leads: impl Fn(&SessionId) -> bool) {
+        let children: Vec<SessionId> = {
+            let st = self.st();
+            st.known
+                .iter()
+                .filter(|(_, k)| {
+                    k.meta.parent.as_ref().is_some_and(|p| {
+                        leads(p) && st.known.get(p).is_some_and(|p| !p.meta.archived && p.status.phase != Phase::Ended)
+                    }) && !k.meta.archived
+                        && !k.finished()
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in children {
+            match self.activate(&id) {
+                Ok(_) => {
+                    let mut st = self.st();
+                    if let Some(k) = st.known.get_mut(&id) {
+                        // An agent that never started a turn starts its first one by itself.
+                        k.held = !k.finished() && k.status.phase != Phase::Running && k.status.last_end.is_some();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("session {} cannot be restored: {e}", id.as_str());
+                    self.publish_error(Some(&id), format!("Session {} cannot be restored: {e}", id.as_str()));
+                    if self.lead_is_active(&id) {
+                        self.settle_unopenable(&id, &e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether `id` is an agent whose lead has a task. An agent that cannot be opened while its lead
+    /// can will never run again; when the lead cannot be opened either, the mission is not running.
+    fn lead_is_active(&self, id: &SessionId) -> bool {
+        let st = self.st();
+        let parent = st.known.get(id).and_then(|k| k.meta.parent.clone());
+        parent.and_then(|p| st.known.get(&p)).is_some_and(|p| p.active.is_some())
+    }
+
+    /// Settle an agent whose session cannot be opened: it will never run again. Its log is left as it
+    /// is; its status says `Ended`/`Failed` and `settlement.json` keeps what its lead is told.
+    fn settle_unopenable(&self, id: &SessionId, error: &str) {
+        let s = {
+            let st = self.st();
+            let Some(k) = st.known.get(id) else { return };
+            Settlement {
+                child: id.clone(),
+                role: k.meta.role.clone(),
+                outcome: ChildOutcome::Failed,
+                report: texts::unopenable_report(error),
+                full: None,
+                payload: serde_json::Value::Null,
+                steps: k.status.step,
+                usage: Usage::default(),
+            }
+        };
+        if let Err(e) = write_json_atomic(&self.paths.session_dir(id).join("settlement.json"), &s) {
+            tracing::warn!("cannot write settlement.json of {}: {e}", id.as_str());
+        }
+        self.mark_failed(id);
+        let mut st = self.st();
+        if let Some(k) = st.known.get_mut(id) {
+            k.settlement = Some(s.clone());
+            k.settled_tx.send_replace(Some(s));
+            k.restored = true;
+        }
+    }
+
+    /// The verifier that a finish of `parent` started for `brief` and that no `join` took, for the
+    /// finish made again after a restart cut it: the gate joins that one (or takes the verdict it
+    /// already gave) instead of starting a second. The other verifiers of `parent` that nothing will
+    /// take any more are stopped.
+    fn cut_verifier(&self, parent: &SessionId, brief: &Brief) -> Option<SessionId> {
+        let (found, stale) = {
+            let st = self.st();
+            let mut found = None;
+            let mut stale = Vec::new();
+            for (id, k) in st.known.iter().filter(|(_, k)| k.meta.parent.as_ref() == Some(parent) && !k.joined) {
+                let Some(given) = &k.gate else { continue };
+                // An ended verifier whose settlement could not be read gives nothing to take.
+                let usable = k.settlement.is_some() || !k.finished();
+                if found.is_none() && usable && given == brief {
+                    found = Some(id.clone());
+                } else if !k.finished() {
+                    stale.push(id.clone());
+                }
+            }
+            (found, stale)
+        };
+        for id in &stale {
+            self.stop_one(id);
+        }
+        found
+    }
+
+    /// Append to the log of `parent`, whose task is about to park in a `join` that a shutdown
+    /// cancelled, what its call queued (`child_spawned`, `ledger`): the step loop that would have
+    /// appended it after the call's result never runs again, and the next start needs it to know
+    /// what the call started. The parked task writes nothing more, so the log keeps one writer.
+    fn write_for_parked(self: &Arc<Self>, parent: &SessionId, shared: &Shared) {
+        let queued = shared.take_emitted();
+        if queued.is_empty() {
+            return;
+        }
+        let mut log = match SessionLog::open(&self.paths.session_log(parent), Durability::Always) {
+            Ok((log, _)) => log,
+            Err(e) => {
+                tracing::warn!("cannot record what the cut call of {} queued: {e}", parent.as_str());
+                return;
+            }
+        };
+        for (author, event) in queued {
+            match log.append(author, event) {
+                Ok(record) => self.on_record(parent, &record),
+                Err(e) => {
+                    tracing::warn!("cannot record what the cut call of {} queued: {e}", parent.as_str());
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// What a lead's log says about the agents it started.
+#[derive(Default)]
+struct Spawns {
+    /// Agents whose settlement the log holds.
+    settled: HashSet<SessionId>,
+    /// Agents whose starting call has a recorded result: the lead of an `awaited` one was told how
+    /// it ended (its report, or that it was stopped).
+    answered: HashSet<SessionId>,
+    /// Verifiers of the finish gate (started by a `finish` call), with the assignment each was given.
+    gate: HashMap<SessionId, Brief>,
+}
+
+impl Spawns {
+    fn of(records: &[Record]) -> Spawns {
+        let own = own_records(records);
+        let mut finishes: HashSet<&CallId> = HashSet::new();
+        let mut results: HashSet<&CallId> = HashSet::new();
+        for r in own {
+            match &r.event {
+                Event::ToolCall(c) if c.name == "finish" => {
+                    finishes.insert(&c.call_id);
+                }
+                Event::ToolResult(t) => {
+                    results.insert(&t.call_id);
+                }
+                _ => {}
+            }
+        }
+        let mut out = Spawns::default();
+        for r in own {
+            match &r.event {
+                Event::ChildSettled(c) => {
+                    out.settled.insert(c.child.clone());
+                }
+                Event::ChildSpawned(c) => {
+                    let Some(call) = &c.call_id else { continue };
+                    if results.contains(call) {
+                        out.answered.insert(c.child.clone());
+                    }
+                    if finishes.contains(call) {
+                        out.gate.insert(c.child.clone(), c.brief.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 }
 
@@ -1979,6 +2316,7 @@ impl Runtime {
             state: Mutex::new(State::default()),
             activation: Mutex::new(()),
             shutting: AtomicBool::new(false),
+            restoring: AtomicBool::new(true),
             next_gen: AtomicU64::new(1),
             orch: Arc::new(Orch(me.clone())),
             sink: Arc::new(SinkImpl(me.clone())),
@@ -2006,9 +2344,12 @@ impl Runtime {
                 .iter()
                 .filter(|(_, k)| !k.meta.archived && k.status.phase != Phase::Ended)
                 .filter_map(|(id, k)| {
+                    // An agent of a mission that is not archived is restored whatever it was doing:
+                    // it goes on, or it is settled now, so that its lead is never left waiting for it.
                     let wanted = k.status.phase == Phase::Running
                         || k.status.last_end == Some(TurnEndReason::Waiting)
-                        || k.status.open_inbox > 0;
+                        || k.status.open_inbox > 0
+                        || k.meta.parent.is_some();
                     let yielded = k.status.last_end == Some(TurnEndReason::Yielded);
                     (wanted || yielded).then(|| (id.clone(), !wanted))
                 })
@@ -2037,35 +2378,53 @@ impl Runtime {
                 Err(e) => {
                     tracing::error!("session {} cannot be restored: {e}", id.as_str());
                     inner.publish_error(Some(&id), format!("Session {} cannot be restored: {e}", id.as_str()));
+                    // An agent whose lead runs but that cannot be opened itself will never run again.
+                    if inner.lead_is_active(&id) {
+                        inner.settle_unopenable(&id, &e);
+                    }
                 }
             }
         }
-        let recovered = inner.recover_settlements();
+        let recovered = inner.recover_settlements(|_| true);
         // The sessions told to carry on (parents come before their children).
         let mut going: HashSet<SessionId> = HashSet::new();
         for id in restored {
-            let (unattended, last_end, active, parent) = {
+            let (unattended, last_end, active, parent, finished) = {
                 let st = inner.st();
                 match st.known.get(&id) {
-                    Some(k) => (k.meta.unattended, k.status.last_end, k.active.is_some(), k.meta.parent.clone()),
+                    Some(k) => {
+                        (k.meta.unattended, k.status.last_end, k.active.is_some(), k.meta.parent.clone(), k.finished())
+                    }
                     None => continue,
                 }
             };
-            if !active {
+            if !active || finished {
+                continue;
+            }
+            if let Some(parent) = parent {
+                // An agent that has had a turn is idle now (the restart cut its turn, or it was between
+                // turns): it is held until its lead goes on, the lead being told that its unfinished
+                // agents were resumed. One that never had a turn starts its first one by itself.
+                if last_end.is_some() {
+                    if let Some(k) = inner.st().known.get_mut(&id) {
+                        k.held = true;
+                    }
+                    if woken.contains(&id) || unattended || going.contains(&parent) {
+                        inner.resume_held(&id);
+                    }
+                }
                 continue;
             }
             // The settlement recovered for it starts a turn by itself.
             let turn_coming = recovered.contains(&id)
                 && matches!(last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
             // A session that waited on a job the restart lost is woken, attended or not: the job's
-            // arrival would have woken it. An agent the restart cut goes on whenever its lead does:
-            // the lead is told that its unfinished agents were resumed.
-            let carry_on = (!turn_coming
+            // arrival would have woken it. A lead that waits for its agents is woken by their reports.
+            let carry_on = !turn_coming
                 && (woken.contains(&id)
                     || (unattended
                         && (cut.contains(&id)
-                            || (last_end == Some(TurnEndReason::Waiting) && !inner.has_unsettled_child(&id))))))
-                || (cut.contains(&id) && parent.is_some_and(|p| going.contains(&p)));
+                            || (last_end == Some(TurnEndReason::Waiting) && !inner.has_unsettled_child(&id)))));
             if carry_on {
                 inner.send_input(&id, Input::Resume);
             }
@@ -2394,14 +2753,17 @@ impl Runtime {
             }
             ids
         };
-        let mut closing: Vec<ActiveSession> = Vec::new();
+        let mut closing: Vec<UnboundedSender<Input>> = Vec::new();
         for sid in &family {
             let meta = {
                 let mut st = self.inner.st();
                 let Some(k) = st.known.get_mut(sid) else { continue };
                 k.meta.archived = archived;
-                if archived {
-                    closing.extend(k.active.take());
+                if let Some(a) = k.active.as_mut().filter(|_| archived) {
+                    // The task keeps its place until it has ended, so that nothing opens the session
+                    // beside it while it settles.
+                    let (closed, _) = unbounded_channel();
+                    closing.push(std::mem::replace(&mut a.inputs, closed));
                 }
                 k.meta.clone()
             };
@@ -2409,8 +2771,15 @@ impl Runtime {
                 return Err(format!("cannot write the meta.json of {}: {e}", sid.as_str()));
             }
         }
-        // Dropping the inputs ends the tasks (`Closed`).
+        // Dropping the inputs ends the tasks: the lead's `Closed`, each agent's with its settlement,
+        // which reaches the lead when the mission is unarchived.
         drop(closing);
+        if !archived {
+            // What the agents settled with while the mission was archived is delivered now, and an
+            // agent that had not settled goes on with its lead (or is settled, if it cannot be opened).
+            self.inner.restore_children(|p| p == id);
+            self.inner.recover_settlements(|k| k.meta.parent.as_ref() == Some(id));
+        }
         Ok(())
     }
 
@@ -3595,6 +3964,113 @@ mod tests {
         e.rt.shutdown().await;
     }
 
+    /// A worker's script: start a background job, then wait for it.
+    fn idle_worker(body: &Value) -> Action {
+        if tool_msgs(body) == 0 {
+            call("bash", json!({"command": "sleep 600", "background": true}))
+        } else {
+            call("wait", json!({}))
+        }
+    }
+
+    /// Until `child` is between turns, waiting for its own background job.
+    async fn until_idle(e: &Env, child: &SessionId) {
+        until("the worker waits", || e.has(child, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting })))
+            .await;
+        until("the worker is idle", || e.rt.session(child).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+    }
+
+    /// The stop reached `child` between turns: its `interrupted` follows a `Waiting` turn end directly.
+    fn stopped_while_idle(e: &Env, child: &SessionId, reason: &str) -> bool {
+        let rs = e.records(child);
+        let Some(at) = rs.iter().position(|r| matches!(&r.event, Event::Interrupted { reason: why } if why == reason)) else {
+            return false;
+        };
+        at > 0 && matches!(rs[at - 1].event, Event::TurnEnd { reason: TurnEndReason::Waiting })
+    }
+
+    #[tokio::test]
+    async fn stop_child_settles_an_idle_child_before_it_returns() {
+        let e = env_with(
+            Script::new(|body, _| {
+                if !has_tool(body, "agent_spawn") {
+                    idle_worker(body)
+                } else if mentions(body, "was stopped after") {
+                    Action::Stall { ms: 600_000 }
+                } else if tool_msgs(body) == 0 {
+                    call("agent_spawn", json!({"question": "CHILDMARK", "background": true}))
+                } else {
+                    call("wait", json!({}))
+                }
+            }),
+            false,
+            |c| c.agents.max_children = 1,
+        )
+        .await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        let child = e.children(&id)[0].meta.id.clone();
+        until_idle(&e, &child).await;
+        let orch = e.rt.inner.orch.clone();
+        orch.stop_child(&id, &child).await.unwrap();
+        // Settled before the call returned: it is no longer listed as running, and no longer counts.
+        let info = e.rt.session(&child).unwrap();
+        assert_eq!((info.status.phase, info.status.outcome), (Phase::Ended, Some(SessionOutcome::Stopped)));
+        assert!(stopped_while_idle(&e, &child, texts::REASON_PARENT));
+        assert_eq!(orch.children(&id).await.iter().filter(|c| c.running).count(), 0);
+        let again = SpawnReq {
+            role: "worker".into(),
+            mode: SpawnMode::Fresh,
+            brief: Brief { question: "AGAIN".into(), ..Default::default() },
+            budget: Budget::default(),
+            call_id: CallId::from("c9"),
+            title: "again".into(),
+            awaited: false,
+            harness: false,
+        };
+        orch.spawn(&id, again).await.expect("a stopped agent does not count toward max_children");
+        let settled = |c: &ChildSettled| c.child == child && c.outcome == ChildOutcome::Stopped && !c.inline;
+        until("the lead got the settlement", || e.has(&id, |ev| matches!(ev, Event::ChildSettled(c) if settled(c)))).await;
+        e.rt.shutdown().await;
+    }
+
+    /// The agent a background `agent_spawn` result in the request names.
+    fn started_agent(body: &Value) -> String {
+        let text = body.to_string();
+        let at = text.find("Agent s-").map_or(0, |i| i + "Agent ".len());
+        text[at..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect()
+    }
+
+    #[tokio::test]
+    async fn agent_stop_settles_an_idle_worker_says_so_and_finish_is_not_refused_for_it() {
+        let e = env(Script::new(|body, _| {
+            if !has_tool(body, "agent_spawn") {
+                return idle_worker(body);
+            }
+            match tool_msgs(body) {
+                0 => call("agent_spawn", json!({"question": "CHILDMARK", "background": true})),
+                // By the time this reply arrives the worker is waiting for its job.
+                1 => Action::Reply(
+                    Reply::tool("agent_stop", json!({"agent": started_agent(body)}).to_string()).with_delay_ms(2_000),
+                ),
+                _ => finish("lead done"),
+            }
+        }))
+        .await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("the lead finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished })))
+            .await;
+        let child = e.children(&id)[0].meta.id.clone();
+        assert!(stopped_while_idle(&e, &child, texts::REASON_PARENT), "{:?}", e.kinds(&child));
+        assert_eq!(e.rt.session(&child).unwrap().status.outcome, Some(SessionOutcome::Stopped));
+        let reqs = e.server.requests();
+        let stopped = format!("{child} was stopped; anything it had not delivered is in its record");
+        assert!(reqs.iter().any(|b| mentions(b, &stopped)), "the result did not say the agent was stopped");
+        assert!(!reqs.iter().any(|b| mentions(b, "has not ended yet")));
+        assert!(!reqs.iter().any(|b| mentions(b, "finish was refused")), "finish was refused for a stopped agent");
+        e.rt.shutdown().await;
+    }
+
     #[tokio::test]
     async fn a_panicking_session_task_ends_the_session_and_settles_the_child() {
         let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
@@ -3984,6 +4460,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operator_actions_in_quick_succession_send_a_cut_child_one_resume() {
+        let (e, rt2, id, before) = restart_with_an_unfinished_child(false, true).await;
+        let child = rt2.sessions(true).into_iter().find(|s| s.meta.parent.as_ref() == Some(&id)).unwrap().meta.id;
+        // Before the worker has published that it runs its resumed turn.
+        rt2.send_message(&id, "carry on").await.unwrap();
+        rt2.resume(&id).await.unwrap();
+        rt2.send_message(&id, "and on").await.unwrap();
+        the_child_was_resumed_as_the_lead_is_told(&e, &rt2, &id, before).await;
+        assert_eq!(lock(&RESUMES).iter().filter(|c| **c == child).count(), 1);
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn shutdown_inside_an_awaited_agent_spawn_records_no_result_and_the_child_is_resumed() {
         let (e, rt2, id, before) = restart_with_an_unfinished_child(true, false).await;
         the_child_was_resumed_as_the_lead_is_told(&e, &rt2, &id, before).await;
@@ -3992,6 +4481,57 @@ mod tests {
         assert!(!rs.iter().any(|r| matches!(&r.event, Event::ToolResult(t) if t.name == "agent_spawn")));
         let first = e.server.requests()[before..].iter().find(|b| has_tool(b, "agent_spawn")).cloned().unwrap();
         assert!(mentions(&first, "no result recorded"), "{first}");
+        // What the call queued was written before it parked: the restart knew the agent it started.
+        assert!(rs.iter().any(|r| matches!(&r.event, Event::ChildSpawned(c) if c.call_id.is_some())));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_finish_made_again_after_a_restart_cut_its_verification_uses_the_same_verifier() {
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let e = env_with(
+            Script::new(move |body, _| {
+                if !has_tool(body, "verdict") {
+                    finish("lead done")
+                } else if flag.load(Ordering::SeqCst) {
+                    verifier_turn(body, true)
+                } else {
+                    Action::Stall { ms: 600_000 }
+                }
+            }),
+            false,
+            |c| c.agents.verify_finish = true,
+        )
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("the verifier's request", || e.server.requests().iter().any(|b| has_tool(b, "verdict"))).await;
+        e.rt.shutdown().await;
+        after.store(true, Ordering::SeqCst);
+        // The lead is resumed (unattended), calls finish again, and that finish takes the first verifier.
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let rt = rt2.clone();
+        until("delivered", || rt.inbox().iter().any(|i| i.item.kind == InboxKind::Finished)).await;
+        let kids: Vec<SessionInfo> = rt2.sessions(true).into_iter().filter(|s| s.meta.parent.as_ref() == Some(&id)).collect();
+        assert_eq!(kids.len(), 1, "a second verifier was started");
+        let verifier = kids[0].meta.id.clone();
+        let item = rt2.inbox().into_iter().find(|i| i.item.kind == InboxKind::Finished).unwrap().item;
+        assert!(item.text.contains(&format!("[verified by {verifier}]")), "{}", item.text);
+        let finishes = rt2.ledger(&info.meta.mission).unwrap().state.finishes;
+        assert_eq!(finishes.iter().map(|f| f.accepted).collect::<Vec<_>>(), vec![None, Some(true)]);
+        // Its verdict went to the finish only, not to the lead as an agent's report.
+        let settled: Vec<ChildSettled> = rt2
+            .records(&id, None, 2_000)
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::ChildSettled(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(settled.len(), 1);
+        assert_eq!((&settled[0].child, settled[0].inline), (&verifier, true));
         rt2.shutdown().await;
     }
 
@@ -4058,6 +4598,59 @@ mod tests {
         assert_eq!(reports.len(), 2, "{reports:?}");
         assert!(reports[0].contains("AREPORT") && reports[1].contains("BREPORT"), "{reports:?}");
         rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_waiting_lead_whose_worker_cannot_be_opened_after_a_restart_is_given_its_failure_and_goes_on() {
+        let e = env(Script::new(|body, _| {
+            if !has_tool(body, "agent_spawn") {
+                idle_worker(body)
+            } else if mentions(body, "could not be opened again") {
+                finish("lead done")
+            } else if tool_msgs(body) == 0 {
+                call("agent_spawn", json!({"question": "CHILDMARK", "background": true}))
+            } else {
+                call("wait", json!({}))
+            }
+        }))
+        .await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        let child = e.children(&id)[0].meta.id.clone();
+        until_idle(&e, &child).await;
+        e.rt.shutdown().await;
+        // The worker's log is lost while the harness is down: it will never run again.
+        std::fs::write(e.rt.paths().session_log(&child), "not a log\n").unwrap();
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let rt = rt2.clone();
+        until("the lead finished", || {
+            rt.records(&id, None, 2_000)
+                .is_ok_and(|rs| rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })))
+        })
+        .await;
+        let settled = |rt: &Runtime| -> Vec<ChildSettled> {
+            rt.records(&id, None, 2_000)
+                .unwrap()
+                .into_iter()
+                .filter_map(|r| match r.event {
+                    Event::ChildSettled(c) => Some(c),
+                    _ => None,
+                })
+                .collect()
+        };
+        let got = settled(&rt2);
+        assert_eq!(got.len(), 1);
+        assert_eq!((&got[0].child, got[0].outcome, got[0].inline), (&child, ChildOutcome::Failed, false));
+        assert!(got[0].report.contains("could not be opened again after the harness restarted"), "{}", got[0].report);
+        let info = rt2.session(&child).unwrap();
+        assert_eq!((info.status.phase, info.status.outcome, info.active), (Phase::Ended, Some(SessionOutcome::Failed), false));
+        rt2.shutdown().await;
+        // Settled once: the next start neither runs it nor delivers it again.
+        let rt3 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(settled(&rt3).len(), 1);
+        assert!(!rt3.session(&child).unwrap().active);
+        rt3.shutdown().await;
     }
 
     #[tokio::test]
@@ -4286,6 +4879,41 @@ mod tests {
         rt2.archive(&id, false).await.unwrap();
         assert_eq!(rt2.sessions(false).len(), 1);
         rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_agent_whose_inputs_close_outside_a_shutdown_settles_and_its_lead_gets_the_settlement() {
+        let e = env(Script::new(|body, _| {
+            if !has_tool(body, "agent_spawn") {
+                idle_worker(body)
+            } else if mentions(body, "was stopped after") {
+                finish("lead done")
+            } else if tool_msgs(body) == 0 {
+                call("agent_spawn", json!({"question": "CHILDMARK", "background": true}))
+            } else {
+                call("wait", json!({}))
+            }
+        }))
+        .await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        let child = e.children(&id)[0].meta.id.clone();
+        until_idle(&e, &child).await;
+        // Archiving closes the inputs of the lead and of its agent for good.
+        e.rt.archive(&id, true).await.unwrap();
+        until("the agent settled", || e.rt.session(&child).is_some_and(|s| s.status.phase == Phase::Ended)).await;
+        assert_eq!(e.rt.session(&child).unwrap().status.outcome, Some(SessionOutcome::Stopped));
+        assert!(stopped_while_idle(&e, &child, texts::REASON_OPERATOR), "{:?}", e.kinds(&child));
+        assert!(!e.has(&id, |ev| matches!(ev, Event::ChildSettled(_))), "an archived lead was given a settlement");
+        // Unarchived, the lead gets the settlement, which wakes it.
+        e.rt.archive(&id, false).await.unwrap();
+        until("the lead finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished })))
+            .await;
+        let settled: Vec<Record> =
+            e.records(&id).into_iter().filter(|r| matches!(&r.event, Event::ChildSettled(c) if c.child == child)).collect();
+        assert_eq!(settled.len(), 1);
+        assert!(matches!(&settled[0].event, Event::ChildSettled(c) if c.outcome == ChildOutcome::Stopped && !c.inline));
+        e.rt.shutdown().await;
     }
 
     /// Store `data` and make the blob two hours old.
