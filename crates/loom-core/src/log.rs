@@ -330,9 +330,22 @@ impl SessionLog {
 
     /// Open an existing log for appending, salvaging damage as described in the module contract.
     pub fn open(path: &Path, durability: Durability) -> Result<(SessionLog, OpenReport), LogError> {
+        Self::open_with(path, durability, true)
+    }
+
+    /// Open a log that another handle of this same process holds locked and will never write to
+    /// again (a session task parked for good at shutdown). No lock is taken: the caller vouches that
+    /// it is the only writer left. Everything else is as in [`SessionLog::open`].
+    pub fn open_beside(path: &Path, durability: Durability) -> Result<(SessionLog, OpenReport), LogError> {
+        Self::open_with(path, durability, false)
+    }
+
+    fn open_with(path: &Path, durability: Durability, lock: bool) -> Result<(SessionLog, OpenReport), LogError> {
         // The lock comes first: what is scanned below must not change before it is appended to.
         let file = OpenOptions::new().append(true).open(path).map_err(io_err(path))?;
-        lock_log(&file, path)?;
+        if lock {
+            lock_log(&file, path)?;
+        }
         let (scanner, records, cause) = scan_file(path)?;
         if scanner.opaque > 0 || scanner.schema > SCHEMA {
             return Err(LogError::Newer(path.to_path_buf()));
@@ -999,6 +1012,24 @@ mod tests {
         let (mut again, report) = SessionLog::open(&path, Durability::Batch).unwrap();
         assert_eq!(report.records.len(), 1);
         again.append(Author::Harness, msg(1)).unwrap();
+    }
+
+    #[test]
+    fn a_log_can_be_opened_beside_a_holder_that_writes_no_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut held) = new_log(&dir);
+        held.append(Author::Harness, msg(0)).unwrap();
+        // The holder keeps its lock and never writes again; the second handle continues the chain.
+        let (mut beside, report) = SessionLog::open_beside(&path, Durability::Batch).unwrap();
+        assert_eq!(report.records.len(), 1);
+        beside.append(Author::Harness, msg(1)).unwrap();
+        drop(beside);
+        // The lock still belongs to the holder.
+        assert!(matches!(SessionLog::open(&path, Durability::Batch).unwrap_err(), LogError::Locked(_)));
+        drop(held);
+        let read = read_records(&path).unwrap();
+        assert_eq!(read.records.len(), 2);
+        assert!(read.damage.is_none());
     }
 
     #[test]

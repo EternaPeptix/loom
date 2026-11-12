@@ -536,7 +536,10 @@ mod tests {
         let prepared = prepare(&e.registry, &e.ctx, "read", r#"{"path": "a.txt"}"#).map_err(|r| r.text).unwrap();
         let r = prepared.run(&e.ctx).await.finish(&e.ctx, &admission);
         assert_eq!((r.status, r.name.as_str(), &r.call_id), (ToolStatus::Ok, "read", &e.ctx.call_id));
-        assert_eq!(r.text, "[read · ok · a.txt · lines 1-2 of 2]\n1\tone\n2\ttwo\n[end of read output · ok]");
+        // The header ends with the handle of what was shown, which evidence can cite.
+        let (head, body) = r.text.split_once('\n').unwrap_or_default();
+        assert!(head.starts_with("[read · ok · a.txt · lines 1-2 of 2 · out:") && head.ends_with(']'), "{head}");
+        assert_eq!(body, "1\tone\n2\ttwo\n[end of read output · ok]");
         assert_eq!(r.meta.get(META_SHOWN), Some(&json!([[1, 2]])));
         for (name, args, says) in [
             ("reed", "{}", "There is no tool named `reed`."),

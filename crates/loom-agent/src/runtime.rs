@@ -2333,7 +2333,8 @@ impl Inner {
         if queued.is_empty() {
             return;
         }
-        let mut log = match SessionLog::open(&self.paths.session_log(parent), Durability::Always) {
+        // The parked task still holds the log's lock and will not write again: open beside it.
+        let mut log = match SessionLog::open_beside(&self.paths.session_log(parent), Durability::Always) {
             Ok((log, _)) => log,
             Err(e) => {
                 tracing::warn!("cannot record what the cut call of {} queued: {e}", parent.as_str());
