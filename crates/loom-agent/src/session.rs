@@ -3067,12 +3067,28 @@ mod tests {
     impl Fx {
         async fn new(role: &str, child: bool, mission: bool, script: Script) -> Fx {
             let agents = AgentsCfg { verify_finish: false, ..AgentsCfg::default() };
-            Fx::build(role, child, mission, agents, script).await
+            // The default lead cannot `conclude` or `request_scope`: its `finish` is not held by the goal-met
+            // claim, so a test that uses `finish` only to end a turn ends it as it did before the finish gate
+            // asked for a conclusion. `Fx::build` keeps the role as the core pack has it.
+            let mut role_def = core_role(role);
+            role_def.tools.retain(|t| t != "conclude" && t != "request_scope");
+            Fx::build_with(role_def, role, child, mission, agents, script).await
         }
 
         async fn build(role: &str, child: bool, mission: bool, agents: AgentsCfg, script: Script) -> Fx {
+            Fx::build_with(core_role(role), role, child, mission, agents, script).await
+        }
+
+        async fn build_with(
+            role_def: crate::pack::RoleDef,
+            role: &str,
+            child: bool,
+            mission: bool,
+            agents: AgentsCfg,
+            script: Script,
+        ) -> Fx {
             let server = MockServer::start(script).await.unwrap();
-            let Rig { env, orch, shared, registry: _ } = rig_with(core_role(role), child, mission, agents.clone());
+            let Rig { env, orch, shared, registry: _ } = rig_with(role_def, child, mission, agents.clone());
             let TestEnv { dir, ctx, job_events, policy, .. } = env;
             let paths = Paths::at(dir.path().join("home"));
             let profile = ModelProfile {
@@ -6116,7 +6132,10 @@ mod tests {
         let agents = AgentsCfg { stall_steps: 3, verify_finish: false, ..AgentsCfg::default() };
         let mut actions: Vec<Action> = (0..5).map(|_| bash("echo hi").into()).collect();
         actions.push(finish_call("done").into());
-        let mut fx = Fx::build("lead", false, true, agents, seq(actions)).await;
+        // A lead without `conclude`: its closing `finish` is not refused for an unconcluded goal.
+        let mut role = core_role("lead");
+        role.tools.retain(|t| t != "conclude" && t != "request_scope");
+        let mut fx = Fx::build_with(role, "lead", false, true, agents, seq(actions)).await;
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();

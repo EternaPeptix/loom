@@ -1025,6 +1025,28 @@ mod tests {
         Action::Reply(Reply::tool("finish", json!({ "answer": answer }).to_string()).with_delay_ms(delay_ms))
     }
 
+    /// The built-in `core` pack with a lead that cannot `conclude` or `request_scope`, written into `packs` so it
+    /// replaces the built-in one. These tests use `finish` only to end a turn; a lead without `conclude` is not held
+    /// by the goal-met claim (gate.rs), so `finish` ends the turn as it did before the finish gate asked for a
+    /// conclusion. The gate, conclude and scope behaviours are covered where they belong (rtools/terminal.rs,
+    /// ledger.rs, gate.rs), on a role that has the tools.
+    fn plain_core_pack(packs: &std::path::Path) {
+        let core = packs.join("core");
+        std::fs::create_dir_all(core.join("roles")).unwrap();
+        let toml = include_str!("../../../packs/core/pack.toml").replacen("\"request_scope\", \"conclude\", ", "", 1);
+        assert!(!toml.contains("\"conclude\""), "the lead's tool list changed shape");
+        std::fs::write(core.join("pack.toml"), toml).unwrap();
+        std::fs::write(core.join("harness.md"), include_str!("../../../packs/core/harness.md")).unwrap();
+        for (name, text) in [
+            ("lead", include_str!("../../../packs/core/roles/lead.md")),
+            ("worker", include_str!("../../../packs/core/roles/worker.md")),
+            ("verifier", include_str!("../../../packs/core/roles/verifier.md")),
+            ("chat", include_str!("../../../packs/core/roles/chat.md")),
+        ] {
+            std::fs::write(core.join("roles").join(format!("{name}.md")), text).unwrap();
+        }
+    }
+
     async fn env(script: Script) -> Env {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws");
@@ -1049,7 +1071,9 @@ mod tests {
         config.network.mode = NetworkMode::DenyAll;
         config.agents.verify_finish = false;
         config.tools.kill_grace_s = 1;
-        let rt = Runtime::start(config, Paths::at(dir.path().join("home"))).await.unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        plain_core_pack(&paths.packs_dir());
+        let rt = Runtime::start(config, paths).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let token = "ab".repeat(32);
