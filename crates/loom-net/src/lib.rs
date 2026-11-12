@@ -5,8 +5,9 @@
 //! policy, resolves names itself, and reports every decision so it lands in that session's log.
 //! See `docs/DESIGN.md` §11.
 
+pub mod netlog;
 pub mod policy;
 pub mod proxy;
 
 pub use policy::{Policy, Verdict};
-pub use proxy::{Proxy, ProxyError, SessionGrant};
+pub use proxy::{AuditFn, Limits, Proxy, ProxyError, SessionGrant};

@@ -14,7 +14,8 @@
 //!   [`Runtime::archive`]. Writes are atomic (temporary file in the same directory, then rename).
 //! - `status.json` — the latest [`Status`](crate::session::Status), rewritten atomically whenever
 //!   the session publishes one.
-//! - `net.jsonl` — one [`NetEntry`] per line: every decision the egress proxy made for the session.
+//! - `net.jsonl` — one [`NetEntry`] per line, hash-chained (`prev`): every decision the egress proxy
+//!   made for the session.
 //! - `settlement.json` — a child's [`Settlement`](crate::rtools::Settlement), written atomically
 //!   when its task ends with one. Read only when a delivery lost to a restart is recovered (see
 //!   *Start*), so that the parent gets the whole report. A child that ended without the file (a
@@ -179,7 +180,8 @@
 //!
 //! ## Network decisions
 //! One `loom_net::Proxy` for the runtime (`config.daemon.proxy_port`). Every decision it reports is
-//! appended to the session's `net.jsonl` and published as [`BusEvent::Net`].
+//! appended to the session's `net.jsonl` and published as [`BusEvent::Net`]. Decisions that name no
+//! session are appended to `logs/net-unattributed.jsonl`.
 //!
 //! ## Notifying the operator
 //! For every `inbox_opened` and every `End::Fatal`. `kind` is the inbox kind in snake case
@@ -1887,25 +1889,37 @@ async fn run_notify(command: Vec<String>, kind: String, session: String, title: 
     }
 }
 
-/// Append one proxy decision to the session's `net.jsonl` and publish it.
+/// Publish a proxy decision that the audit hook (`net_audit`) could not put on record; the proxy sends
+/// only those here.
 fn record_net(inner: &Inner, session: SessionId, decision: NetDecision) {
     let entry = NetEntry { ts_ms: now_ms(), decision };
-    let dir = inner.paths.session_dir(&session);
-    if dir.is_dir() {
-        if let Ok(mut line) = serde_json::to_string(&entry) {
-            line.push('\n');
-            use std::io::Write;
-            let written = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("net.jsonl"))
-                .and_then(|mut f| f.write_all(line.as_bytes()));
-            if let Err(e) = written {
-                tracing::warn!("cannot append to net.jsonl of {}: {e}", session.as_str());
-            }
-        }
-    }
     inner.publish(BusEvent::Net { session, entry });
+}
+
+/// Where the proxy's decisions that name no session are kept, under `logs/`.
+const UNATTRIBUTED_NET: &str = "net-unattributed.jsonl";
+
+/// The proxy's audit hook: appends the decision to the session's `net.jsonl` as a chained line, syncs
+/// it to disk, and then publishes the same entry as [`BusEvent::Net`]; so an allowed connection is on
+/// record before it is used. A decision that names no session goes to `logs/net-unattributed.jsonl`.
+fn net_audit(paths: Paths, bus: broadcast::Sender<BusEvent>) -> loom_net::AuditFn {
+    let writer = loom_net::netlog::NetLogWriter::new();
+    Arc::new(move |session: Option<&SessionId>, decision: &NetDecision| {
+        let entry = NetEntry { ts_ms: now_ms(), decision: decision.clone() };
+        let Some(session) = session else {
+            return writer.append(&paths.logs_dir().join(UNATTRIBUTED_NET), &entry);
+        };
+        let dir = paths.session_dir(session);
+        if !dir.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("the session directory {} does not exist", dir.display()),
+            ));
+        }
+        writer.append(&dir.join("net.jsonl"), &entry)?;
+        let _ = bus.send(BusEvent::Net { session: session.clone(), entry });
+        Ok(())
+    })
 }
 
 /// The runtime. Cheap to clone; all clones are the same runtime.
@@ -1938,9 +1952,12 @@ impl Runtime {
                 },
             );
         }
-        let (net_tx, mut net_rx) = unbounded_channel();
-        let proxy = Proxy::start(config.daemon.proxy_port, net_tx).await.map_err(|e| e.to_string())?;
         let (bus, _) = broadcast::channel(BUS_CAPACITY);
+        let (net_tx, mut net_rx) = unbounded_channel();
+        let audit = net_audit(paths.clone(), bus.clone());
+        let proxy = Proxy::start_with(config.daemon.proxy_port, net_tx, Some(audit), Default::default())
+            .await
+            .map_err(|e| e.to_string())?;
         let inner = Arc::new_cyclic(|me: &Weak<Inner>| Inner {
             me: me.clone(),
             config,
@@ -2493,6 +2510,12 @@ impl Runtime {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
+        if let Err(b) = loom_net::netlog::verify(&text) {
+            return Err(format!(
+                "The egress audit log {} is damaged at {b}. Do not trust it: it was edited, truncated or written by something else. Keep a copy for review and move it aside to start a new chain.",
+                path.display()
+            ));
+        }
         let mut entries: Vec<NetEntry> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
         if entries.len() > limit {
             entries.drain(..entries.len() - limit);
@@ -2980,6 +3003,103 @@ mod tests {
         let e = env(Script::new(|_, _| finish("ok"))).await;
         let err = e.rt.ledger(&MissionId::from("../../etc")).unwrap_err();
         assert_eq!(err, "There is no mission ../../etc.");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn net_audit_hook_chains_the_session_net_file() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("net"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let audit = net_audit(e.rt.paths().clone(), e.rt.inner.bus.clone());
+        let decision = |host: &str| NetDecision {
+            host: host.into(),
+            port: 443,
+            method: "CONNECT".into(),
+            allowed: true,
+            rule: "mode open".into(),
+            resolved: None,
+        };
+        let path = e.rt.paths().session_dir(&id).join("net.jsonl");
+        // Lines written before the chain existed still load; new lines chain after them.
+        let old = serde_json::to_string(&NetEntry { ts_ms: 1, decision: decision("old.test") }).unwrap();
+        std::fs::write(&path, format!("{old}\n")).unwrap();
+        audit(Some(&id), &decision("a.test")).unwrap();
+        audit(Some(&id), &decision("b.test")).unwrap();
+        let hosts: Vec<String> = e.rt.net(&id, 10).unwrap().into_iter().map(|n| n.decision.host).collect();
+        assert_eq!(hosts, ["old.test", "a.test", "b.test"]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("\"prev\"").count(), 2);
+        // A modified line is reported, not served.
+        std::fs::write(&path, text.replace("a.test", "z.test")).unwrap();
+        let err = e.rt.net(&id, 10).unwrap_err();
+        assert!(err.contains("damaged at line 3"), "{err}");
+        // No session directory: the hook fails, so the proxy refuses the connection.
+        assert!(audit(Some(&SessionId::from("s-missing")), &decision("c.test")).is_err());
+        // A decision that names no session goes to a chained file of its own.
+        audit(None, &decision("u.test")).unwrap();
+        audit(None, &decision("v.test")).unwrap();
+        let text = std::fs::read_to_string(e.rt.paths().logs_dir().join(UNATTRIBUTED_NET)).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert_eq!(loom_net::netlog::verify(&text), Ok(()));
+    }
+
+    /// Standard base64, for a Basic credential in a test.
+    fn base64(s: &str) -> String {
+        const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in s.as_bytes().chunks(3) {
+            let n = c.iter().enumerate().fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+            for i in 0..4 {
+                out.push(if i <= c.len() { ABC[((n >> (18 - 6 * i)) & 63) as usize] as char } else { '=' });
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn the_runtime_proxy_records_each_decision_once_in_the_file_and_on_the_bus() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        assert_eq!(base64("s-x:00ff"), "cy14OjAwZmY=");
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("net"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let grant = e.rt.inner.proxy.grant(&id, Policy::new(&e.config.network).unwrap());
+        let mut bus = e.rt.subscribe();
+        let port = e.rt.proxy_port();
+        let ask = move |req: String| async move {
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut resp = Vec::new();
+            tokio::time::timeout(WAIT, s.read_to_end(&mut resp)).await.unwrap().unwrap();
+            String::from_utf8_lossy(&resp).to_string()
+        };
+        let creds = base64(&format!("{}:{}", grant.user, grant.password));
+        let req = format!("CONNECT example.test:443 HTTP/1.1\r\nProxy-Authorization: Basic {creds}\r\n\r\n");
+        let resp = ask(req).await;
+        assert!(resp.starts_with("HTTP/1.1 403 "), "{resp}");
+        // On disk, chained, and served by the session net view.
+        let net = e.rt.net(&id, 10).unwrap();
+        assert_eq!(net.len(), 1, "{net:?}");
+        assert_eq!((net[0].decision.host.as_str(), net[0].decision.rule.as_str()), ("example.test", "mode deny_all"));
+        let text = std::fs::read_to_string(e.rt.paths().session_dir(&id).join("net.jsonl")).unwrap();
+        assert!(text.contains(&format!("\"prev\":\"{}\"", loom_net::netlog::GENESIS)), "{text}");
+        // On the bus: the same entry, once.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut published = Vec::new();
+        while let Ok(ev) = bus.try_recv() {
+            if let BusEvent::Net { session, entry } = ev {
+                published.push((session, entry));
+            }
+        }
+        assert_eq!(published, [(id.clone(), net[0].clone())]);
+        // A request that names no session lands in the daemon's own file.
+        assert!(ask("garbage\r\n\r\n".to_string()).await.starts_with("HTTP/1.1 400 "));
+        let text = std::fs::read_to_string(e.rt.paths().logs_dir().join(UNATTRIBUTED_NET)).unwrap();
+        assert_eq!(loom_net::netlog::verify(&text), Ok(()));
+        assert!(text.contains("bad request: the request head could not be parsed"), "{text}");
         e.rt.shutdown().await;
     }
 
