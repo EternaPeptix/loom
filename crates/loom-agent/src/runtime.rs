@@ -40,7 +40,7 @@
 //!   Running`, or `last_end == Waiting`, or `open_inbox > 0`, or `last_end == Yielded` while its log
 //!   holds a `job_registered` with no `job_settled`, or a job end it was told of that no turn has
 //!   followed (`session::has_job_news`: the job's end would have started a turn; the log is read only
-//!   when the session's `jobs/` directory is not empty), and for every child that
+//!   when the session has a `jobs/` directory), and for every child that
 //!   has not ended, whatever it was doing (parents before children — session ids sort by creation
 //!   time);
 //! - on demand, by `send_message`, `resume`, `reweave`, `answer`, and when a settlement has to be
@@ -1455,8 +1455,8 @@ impl Inner {
     /// Kill what a crashed daemon left running in the jobs directories of the sessions it knows, including the ones
     /// nobody activates (a session that was idle at the crash). Runs off the async workers; logs what it did.
     /// `activating` are left out: their job tables clear them when built, and one whose activation fails keeps its
-    /// records, without which the next start would not read its log for a lost job (`has_job_news`). The output and
-    /// status of a command that ended by itself stay for its session to take when it is next opened.
+    /// records for the next start. The output and status of a command that ended by itself stay for its session to
+    /// take when it is next opened.
     async fn clear_crash_leftovers(&self, activating: &[SessionId]) {
         let dirs: Vec<(SessionId, PathBuf)> = {
             let st = self.st();
@@ -2165,12 +2165,11 @@ impl Inner {
 
     /// Whether the session's log holds a job that was registered and never settled, or a job end it
     /// was told of that no turn has followed (`session::has_job_news`). The log is read only when the
-    /// session's jobs directory holds something. Every command leaves its files there, a foreground
-    /// one as well as a background job, so this passes over only the sessions that never ran a
-    /// command; for the others the log decides.
+    /// session has a jobs directory. Every command creates it, a foreground one as well as a background
+    /// job, and nothing removes it (even when `open` has taken every file in it), so this passes over
+    /// only the sessions that never ran a command; for the others the log decides.
     fn has_job_news(&self, id: &SessionId) -> bool {
-        let jobs = self.paths.session_dir(id).join("jobs");
-        if !std::fs::read_dir(jobs).is_ok_and(|mut entries| entries.next().is_some()) {
+        if !self.paths.session_dir(id).join("jobs").is_dir() {
             return false;
         }
         let Ok(report) = read_records(&self.paths.session_log(id)) else { return false };
@@ -2577,8 +2576,8 @@ impl Runtime {
 
         inner.load_known();
         let mut restored: Vec<SessionId> = Vec::new();
-        // The flag marks a session that is wanted only if a job of its was lost (its turn yielded
-        // while the job ran, and the job's end would have started the next one).
+        // The flag marks a session that is wanted only for a job (its turn yielded while the job ran,
+        // or before it was told how the job ended, and the job's end would have started the next one).
         let candidates: Vec<(SessionId, bool)> = {
             let st = inner.st();
             st.known
@@ -2601,7 +2600,7 @@ impl Runtime {
             .filter(|(id, for_a_job)| !for_a_job || inner.has_job_news(id))
             .map(|(id, _)| id)
             .collect();
-        // After the candidates are chosen: the sweep removes the records `has_job_news` looks for.
+        // After the candidates are chosen: the sweep leaves the sessions to activate to their job tables.
         inner.clear_crash_leftovers(&wanted).await;
         let mut cut: HashSet<SessionId> = HashSet::new();
         let mut woken: HashSet<SessionId> = HashSet::new();
@@ -5282,11 +5281,11 @@ mod tests {
         until("yielded", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Yielded }))).await;
         until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
         e.rt.shutdown().await;
-        // The idle session recorded how the job it killed ended: the next start has nothing to call lost.
+        // The idle session recorded how the job it killed ended, and why: the next start has nothing to call lost.
         let rs = read_records(&e.rt.paths().session_log(&id)).unwrap().records;
         let killed = rs.iter().position(|r| {
             matches!(&r.event, Event::JobSettled { job_id, exit_code: None, output: Some(_), detail }
-                if job_id == "j1" && detail.is_empty())
+                if job_id == "j1" && detail == texts::JOB_SHUTDOWN_DETAIL)
         });
         assert!(killed.is_some(), "{rs:?}");
         let before = e.server.requests().len();
@@ -5299,7 +5298,41 @@ mod tests {
         let turn = rs.iter().rposition(|r| matches!(r.event, Event::TurnStart { trigger: loom_core::event::Trigger::Resume }));
         assert!(killed < turn, "settled at {killed:?}, resumed at {turn:?}");
         let last = e.server.requests().pop().unwrap();
-        assert!(mentions(&last, "Background job j1 ended: killed"));
+        assert!(mentions(&last, &format!("Background job j1 ended: killed. {}", texts::JOB_SHUTDOWN_DETAIL)));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_restart_wakes_a_session_told_of_a_job_end_even_when_nothing_is_left_in_its_jobs_directory() {
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let e = env(Script::new(move |body, _| {
+            if flag.load(Ordering::SeqCst) {
+                Action::Reply(Reply::text("noted"))
+            } else if tool_msgs(body) == 0 {
+                call("bash", json!({"command": "sleep 600", "background": true}))
+            } else {
+                Action::Reply(Reply::text("it is running; I will look at it when it ends"))
+            }
+        }))
+        .await;
+        let mut chat = e.new_session(Some("start a job"));
+        chat.role = Some("chat".into());
+        let id = e.rt.create_session(chat).await.unwrap().meta.id;
+        until("yielded", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Yielded }))).await;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        e.rt.shutdown().await;
+        // What an `open` that recorded how the job ended and took its files leaves when the harness goes
+        // down again before the turn it owes the session: the end in the log, an empty jobs directory.
+        let jobs = e.rt.paths().session_dir(&id).join("jobs");
+        for entry in std::fs::read_dir(&jobs).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        let before = e.server.requests().len();
+        after.store(true, Ordering::SeqCst);
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        until("a turn after the restart", || e.server.requests().len() > before).await;
+        assert!(mentions(&e.server.requests().pop().unwrap(), "Background job j1 ended: killed"));
         rt2.shutdown().await;
     }
 

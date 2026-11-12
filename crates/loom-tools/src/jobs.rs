@@ -26,6 +26,8 @@
 //!   passes `max_output_bytes`); the job settles as `Killed` when its leader was still running.
 //!   Killing an ended job is not an error: the view simply shows its state.
 //! - `kill_all(grace)`: every running job, concurrently; returns when all have settled.
+//!   `kill_all_because(grace, why)` does the same, and a job it stops settles with `why` as its `detail`
+//!   (in place of `stopped` in the detail of a job whose command had already exited).
 //! - `list()`: all jobs, in id order.
 //! - A job whose output passes `max_output_bytes` is killed (SIGKILL, no grace) by its watcher and
 //!   settles as `Killed` with `detail` saying the output limit was reached. Output is never read back
@@ -55,9 +57,9 @@
 //! Tests required (real processes, sandbox mode `none`, tempfile): a job that finishes sends
 //! Registered then Settled with its stored output and exit status; `wait` returns early on end and on
 //! timeout; successive waits return disjoint, contiguous output; `kill`; `kill_all` with several
-//! jobs; output-limit kill; unknown id; `list`; `resume_from`; no event is sent twice; a previous
-//! daemon's job that ended by itself is reported with its exit code, keeps its files until `discard`,
-//! and `ended_while_down` stores its output.
+//! jobs, and the detail `kill_all_because` gives; output-limit kill; unknown id; `list`; `resume_from`;
+//! no event is sent twice; a previous daemon's job that ended by itself is reported with its exit
+//! code, keeps its files until `discard`, and `ended_while_down` stores its output.
 
 use crate::proc::{self, Ended, RecordedGroup, Running, WaitEnd};
 use loom_core::{BlobRef, BlobStore, CallId};
@@ -175,6 +177,8 @@ struct Shared {
     /// Cancelled to ask the watcher to stop the job.
     stop: CancellationToken,
     grace: Mutex<Duration>,
+    /// Why a stop asked for it, for the `detail` of its `Settled` event (`kill_all_because`); empty otherwise.
+    why: Mutex<String>,
     /// Output is read back only up to this many bytes.
     limit: u64,
 }
@@ -434,6 +438,7 @@ impl JobTable {
             ended,
             stop: CancellationToken::new(),
             grace: Mutex::new(Duration::from_secs(5)),
+            why: Mutex::new(String::new()),
             limit: self.max_output_bytes,
         });
         {
@@ -517,14 +522,20 @@ impl JobTable {
 
     pub async fn kill(&self, id: &str, grace: Duration) -> Result<JobView, String> {
         let j = self.find(id)?;
-        stop(&j, grace).await;
+        stop(&j, grace, "").await;
         Ok(view_of(&j))
     }
 
     /// Stops every running job at once and returns when each has settled.
     pub async fn kill_all(&self, grace: Duration) {
+        self.kill_all_because(grace, "").await;
+    }
+
+    /// Like [`JobTable::kill_all`]; a job it stops settles with `why` (a clause such as "stopped by …")
+    /// as the `detail` of its `Settled` event.
+    pub async fn kill_all_because(&self, grace: Duration, why: &str) {
         let jobs: Vec<Arc<Shared>> = lock(&self.inner).jobs.clone();
-        futures_util::future::join_all(jobs.iter().map(|j| stop(j, grace))).await;
+        futures_util::future::join_all(jobs.iter().map(|j| stop(j, grace, why))).await;
     }
 }
 
@@ -549,12 +560,15 @@ impl Drop for JobTable {
     }
 }
 
-async fn stop(j: &Arc<Shared>, grace: Duration) {
+async fn stop(j: &Arc<Shared>, grace: Duration, why: &str) {
     let mut rx = j.ended.subscribe();
     if *rx.borrow() {
         return;
     }
     *lock(&j.grace) = grace;
+    if !why.is_empty() {
+        *lock(&j.why) = why.to_string();
+    }
     j.stop.cancel();
     let _ = tokio::time::timeout(grace + KILL_REPORT_SLACK, rx.wait_for(|ended| *ended)).await;
 }
@@ -599,6 +613,7 @@ async fn watch(shared: Arc<Shared>, mut running: Running, blobs: BlobStore, even
             let grace = *lock(&shared.grace);
             // A command that ignores TERM does not get to write past the limit during the grace period.
             running.terminate_within(grace, max_output_bytes).await;
+            detail = std::mem::take(&mut *lock(&shared.why));
             JobState::Killed
         }
         WaitEnd::TooMuchOutput => {
@@ -913,6 +928,35 @@ mod tests {
             }
         }
         assert_eq!((registered, settled), (4, 4));
+    }
+
+    #[tokio::test]
+    async fn kill_all_because_says_why_in_the_detail_of_each_job_it_stops() {
+        let mut f = fx();
+        f.start("sleep 300").await;
+        let pidfile = f.root.join("child.pid");
+        f.start(&format!("sleep 300 & echo $! > {}; exit 7", pidfile.display())).await;
+        child_pid(&pidfile).await;
+        assert_eq!(leader_exit(&f, "j2").await, Ended::Exit(7));
+        f.start("exit 0").await;
+        f.table.wait("j3", Duration::from_secs(20), &never()).await.expect("wait");
+        let why = "stopped by the harness when it was shut down";
+        f.table.kill_all_because(Duration::from_secs(2), why).await;
+        let mut details = std::collections::BTreeMap::new();
+        while let Ok(Some(e)) = tokio::time::timeout(Duration::from_millis(300), f.rx.recv()).await {
+            if let JobEvent::Settled { info, detail, .. } = e {
+                details.insert(info.id, detail);
+            }
+        }
+        let want = [
+            ("j1", why.to_string()),
+            ("j2", format!("the command itself had already exited (exit 7); the processes it left running were {why}")),
+            // It had ended by itself: the stop did not reach it.
+            ("j3", String::new()),
+        ];
+        let want: std::collections::BTreeMap<String, String> = want.into_iter().map(|(id, d)| (id.to_string(), d)).collect();
+        assert_eq!(details, want);
+        assert_eq!(f.table.detail("j1").as_deref(), Some(why));
     }
 
     #[tokio::test]

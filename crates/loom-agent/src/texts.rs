@@ -454,6 +454,10 @@ pub fn network_sentence(mode: &str, allow: &[String], deny: &[String], allow_pri
 /// `job_settled` detail of a job that was running when the harness went down.
 pub const JOB_LOST_DETAIL: &str = "The harness was restarted while this job was running; its outcome is unknown.";
 
+/// Why a job that a shutdown stopped while its session was between turns ended (no `interrupted`
+/// note says so then): a clause, like the other details of the job table (`kill_all_because`).
+pub const JOB_SHUTDOWN_DETAIL: &str = "stopped by the harness when it was shut down";
+
 /// `job_settled` detail of a background job that finished by itself while the harness was down, read
 /// back from the files it left. `output` is what there is to say about its stored output (the rest
 /// discarded past the limit, storing failed), or empty.

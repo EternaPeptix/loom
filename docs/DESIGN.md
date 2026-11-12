@@ -765,8 +765,9 @@ evidence kind and staleness. Each module's documentation is the precise specific
   No id that has files on disk is handed out again. When the session is opened, a job the log shows as
   unsettled, or one a call's result gave the model but whose registration never reached the log (it
   is registered then), is settled: with its exit status and stored output when it ended by itself (the
-  note says it finished while the harness was down), else with an unknown outcome; either way the
-  model is told, and a session that was waiting or yielded starts a turn.
+  note says it finished while the harness was down), else with an unknown outcome. The model is told
+  unless it already saw the job end, or an earlier `interrupted` note covered a lost job; a session
+  that was waiting or yielded starts a turn.
 - `web_fetch` fetches an `http`/`https` URL through the session's proxy, following up to 10 redirects
   itself so each hop passes the policy, within `tools.web_fetch_timeout_s` (60) and
   `tools.web_fetch_max_bytes` (20 MiB, with a fact when the response is larger). HTML is rendered to
@@ -997,10 +998,11 @@ serves until SIGINT, SIGTERM or `POST /api/shutdown` (`loom down`), giving open 
 **Start** (`Runtime::start`). Packs are loaded and every role's tools checked (a broken pack stops the
 daemon); then the journal key, blob store, model clients and proxy. Every session's `meta.json` and
 `status.json` are read. Activated: sessions that are not archived, not ended, and were running a turn,
-waiting, holding open inbox items, or ended a turn `yielded` while a job they started was unsettled;
-and every unsettled child of a mission that is not archived (parents first). Before activation, off
-the async workers, a previous daemon's leftover process groups are cleared for every other session that
-is not archived (the output and status of a command that ended by itself stay for its session).
+waiting, holding open inbox items, or ended a turn `yielded` while a job they started was unsettled
+or was told how a job ended with no turn since; and every unsettled child of a mission that is not
+archived (parents first). Before activation, off the async workers, a previous daemon's leftover
+process groups are cleared for every other session that is not archived (the output and status of a
+command that ended by itself stay for its session).
 Opening a session's log records a cut turn as `interrupted` (the harness was restarted) with a
 `stopped` turn end, and settles the previous daemon's jobs (§11, Jobs). Then: an unattended root whose
 turn was cut, or that was waiting with no unsettled agent, is resumed; any root that was waiting or
@@ -1013,9 +1015,9 @@ created) while the network mode is `open`.
 **Shutdown.** Every running turn is cancelled first: a running tool gets TERM, then KILL after
 `tools.kill_grace_s`, its result is recorded, and the session records `interrupted` (the harness was
 restarted) and a `stopped` turn end; a child is not settled, so the next start resumes it. Idle
-sessions end when their inputs close, after killing their jobs and recording how those ended. The
-runtime waits up to `kill_grace_s` + 3 s for the tasks, then
-aborts the rest, kills the jobs and stops the proxy. A lead blocked in a call that waits for an agent
+sessions end when their inputs close, after killing their jobs and recording how those ended (each
+end says that the shutdown stopped the job). The runtime waits up to `kill_grace_s` + 3 s for the
+tasks, then aborts the rest, kills the jobs and stops the proxy. A lead blocked in a call that waits for an agent
 is let go at once and the call keeps no result; what the call had started is already in its log.
 
 **Operator actions.** Messages go to root sessions only. Rules, approvals and withdrawals may name any

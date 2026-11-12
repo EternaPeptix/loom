@@ -36,24 +36,25 @@
 //!   ({detail})"}`. If the own records contain a `turn_start` with no later `turn_end` and no
 //!   `session_end`, appends `interrupted{REASON_RESTART}` and `turn_end{Stopped}`. Then, unless the
 //!   session has ended, the jobs of the harness process that is gone are settled: every own
-//!   `job_registered` with no `job_settled`, in log order, and then every command its job table found
-//!   left by that process (`jobs.leftovers()`) that an own `tool_result` gave the model as a job
-//!   (`meta[META_JOB]`) but that has no `job_registered`: for such a job `job_registered{job_id,
-//!   call_id: that result's, command: the `command` argument of that call}` is appended first (author
-//!   `Harness`). A job that ended by itself while no harness watched it (`jobs.ended_while_down`)
-//!   gets `job_settled{exit_code, output: its stored output, detail: texts::job_ended_while_down(what
-//!   the table said about the output)}` and, unless the model saw its end, `harness_note{Arrival,
-//!   texts::job_arrival(..)}` as under *Idle*.
+//!   `job_registered` with no `job_settled`, in log order, and then every job an own `tool_result`
+//!   gave the model (`meta[META_JOB]`, the first such result) that has neither `job_registered` nor
+//!   `job_settled` (whether or not its job table found the command among `jobs.leftovers()`): for such
+//!   a job `job_registered{job_id, call_id: that result's, command: the `command` argument of that
+//!   call}` is appended first (author `Harness`). A job that ended by itself while no harness watched
+//!   it (`jobs.ended_while_down`) gets `job_settled{exit_code, output: its stored output, detail:
+//!   texts::job_ended_while_down(what the table said about the output)}` and, unless the model saw
+//!   its end, `harness_note{Arrival, texts::job_arrival(..)}` as under *Idle*.
 //!   Any other is lost: `job_settled{exit_code: None, output: None, detail: texts::JOB_LOST_DETAIL}`
-//!   and, unless an own `Interrupted` note follows the registration (the model was then already told
-//!   that jobs from before it are gone), `harness_note{Arrival, texts::job_lost(job_id, command)}`.
+//!   and, unless an own `Interrupted` note follows the registration or that result (the model was
+//!   then already told that jobs from before it are gone), `harness_note{Arrival,
+//!   texts::job_lost(job_id, command)}`.
 //!   Then the files of the leftovers and of the jobs settled here are removed (`jobs.discard`), but
 //!   for a job whose output could not be stored. `pending_job_ends()` is the number of job ends the
 //!   model was told of since the last own `turn_end` (a `job_settled` with its note right after it)
 //!   with no `turn_start` since; the runtime starts a turn for a session that was waiting. Calls
 //!   `deps.ctx.jobs.resume_from(n)` with the highest job number in the log's `job_registered`
-//!   records (`j7` → 7). Last, unless the session has ended, the prefix guard is primed
-//!   (`PrefixGuard::prime`) with the weave of the records up to the last `model_request` and that
+//!   records, those just appended included (`j7` → 7). Last, unless the session has ended, the
+//!   prefix guard is primed (`PrefixGuard::prime`) with the weave of the records up to the last `model_request` and that
 //!   record's epoch, so that the first request after a restart is checked like any other. When the
 //!   stable hash of those messages differs from the one stored on the record (the rendering of the
 //!   existing log changed, e.g. with an upgrade), `cache_break{req_id: that request's,
@@ -79,8 +80,9 @@
 //!    turn with `Trigger::Start`.
 //! 3. Loop: wait for the next of (an [`Input`], a `JobEvent` from `deps.job_events`). Handle it as
 //!    described under *Idle*. When `inputs` is closed: kill the session's jobs
-//!    (`jobs.kill_all(kill_grace_s)`), record what `deps.job_events` holds then as under *Idle*
-//!    (without starting a turn), and return `End::Closed` — except a child when the harness is
+//!    (`jobs.kill_all_because(kill_grace_s, why)`, `why` being `texts::JOB_SHUTDOWN_DETAIL` after
+//!    `Control::stop_for_shutdown` and empty otherwise), record what `deps.job_events` holds then as
+//!    under *Idle* (without starting a turn), and return `End::Closed` — except a child when the harness is
 //!    not shutting down (no `Control::stop_for_shutdown`; the session was archived): it settles as for
 //!    an idle `Input::Stop`, with `interrupted{REASON_OPERATOR}`, so that its parent is not left
 //!    waiting for it. A shutdown cuts it instead, for the next start to resume.
@@ -379,8 +381,9 @@
 //!   a job whose end the model already saw through `job_wait` produces no note;
 //! - `open` after a crash: a job that ended by itself while the harness was down is settled with its
 //!   exit code and stored output, and one given to the model but never registered is registered
-//!   first; a job the sweep killed is lost; an idle session whose inputs a shutdown closes records
-//!   the end of the jobs it killed;
+//!   first, also when its watcher had ended it before the crash; a job the sweep killed is lost; an
+//!   idle session whose inputs a shutdown closes records the end of the jobs it killed, saying that
+//!   the shutdown stopped them;
 //! - inputs arriving mid-turn are in the next request; an inbox answer resolves the item, answers
 //!   the ledger question and starts a turn;
 //! - re-weave: with a small `target_tokens`, a `reweave` record appears, the epoch rises, the next
@@ -1191,8 +1194,8 @@ struct LeftJob {
     command: String,
     /// The call whose result gave the job to the model, when its registration never reached the log.
     unregistered: Option<CallId>,
-    /// An own `Interrupted` note after its registration told the model that the jobs from before it
-    /// are gone: when it is lost, it is settled without a note.
+    /// An own `Interrupted` note after its registration (or the result that gave it to the model) told
+    /// the model that the jobs from before it are gone: when it is lost, it is settled without a note.
     told: bool,
 }
 
@@ -1304,14 +1307,6 @@ impl Session {
         if report.records.is_empty() {
             return Err(format!("the session log {} holds no readable record", path.display()));
         }
-        let top = report
-            .records
-            .iter()
-            .filter_map(|r| match &r.event {
-                Event::JobRegistered { job_id, .. } => job_id.strip_prefix('j').and_then(|n| n.parse::<u64>().ok()),
-                _ => None,
-            })
-            .max();
         let mut session = Session::bare(deps, log, report.records, registry);
         if let Some(damage) = &report.damage {
             let reason =
@@ -1327,6 +1322,15 @@ impl Session {
                 .map_err(|e| e.0)?;
         }
         session.record_left_jobs()?;
+        // After the jobs above are registered: an id they were given is not handed out again either.
+        let top = session
+            .records
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::JobRegistered { job_id, .. } => job_id.strip_prefix('j').and_then(|n| n.parse::<u64>().ok()),
+                _ => None,
+            })
+            .max();
         if let Some(n) = top {
             // `resume_from` only takes a lock; it never waits.
             let _ = session.deps.ctx.jobs.resume_from(n).now_or_never();
@@ -1374,7 +1378,7 @@ impl Session {
         let jobs = self.deps.ctx.jobs.clone();
         let mut taken: Vec<String> = jobs.leftovers().iter().map(|l| l.id.clone()).collect();
         if self.st.ended.is_none() {
-            for left in self.left_jobs(&taken) {
+            for left in self.left_jobs() {
                 let id = left.job_id.clone();
                 if !self.record_left_job(left).map_err(|e| e.0)? {
                     taken.retain(|t| *t != id);
@@ -1390,10 +1394,11 @@ impl Session {
     }
 
     /// The jobs `open` settles, in log order: every own `job_registered` with no `job_settled`, then
-    /// every command an earlier harness left (`leftovers`, ids) that a result gave the model as a job
-    /// but whose registration never reached the log. Any other leftover was a foreground command whose
-    /// call the restart cut: the weave shows that call without a result.
-    fn left_jobs(&self, leftovers: &[String]) -> Vec<LeftJob> {
+    /// every job an own result gave the model whose registration never reached the log (the harness
+    /// went down first, whether the sweep found its command or its watcher had already ended it). A
+    /// command the sweep found that no result names was a foreground one whose call the restart cut:
+    /// the weave shows that call without a result.
+    fn left_jobs(&self) -> Vec<LeftJob> {
         let own = self.own();
         let mut settled: HashSet<&str> = HashSet::new();
         let mut registered: HashSet<&str> = HashSet::new();
@@ -1418,20 +1423,23 @@ impl Session {
                 _ => None,
             })
             .collect();
-        for id in leftovers.iter().filter(|id| !registered.contains(id.as_str()) && !settled.contains(id.as_str())) {
-            let call = own.iter().find_map(|r| match &r.event {
-                Event::ToolResult(t) if t.meta.get(META_JOB).and_then(Value::as_str) == Some(id.as_str()) => Some(t.call_id.clone()),
-                _ => None,
-            });
-            let Some(call_id) = call else { continue };
+        for (i, r) in own.iter().enumerate() {
+            let Event::ToolResult(t) = &r.event else { continue };
+            let Some(id) = t.meta.get(META_JOB).and_then(Value::as_str) else { continue };
+            if registered.contains(id) || settled.contains(id) || left.iter().any(|l| l.job_id == id) {
+                continue;
+            }
             let command = own
                 .iter()
                 .find_map(|r| match &r.event {
-                    Event::ToolCall(c) if c.call_id == call_id => c.args.get("command").and_then(Value::as_str).map(str::to_string),
+                    Event::ToolCall(c) if c.call_id == t.call_id => {
+                        c.args.get("command").and_then(Value::as_str).map(str::to_string)
+                    }
                     _ => None,
                 })
                 .unwrap_or_default();
-            left.push(LeftJob { job_id: id.clone(), command, unregistered: Some(call_id), told: false });
+            let unregistered = Some(t.call_id.clone());
+            left.push(LeftJob { job_id: id.to_string(), command, unregistered, told: told.is_some_and(|n| i < n) });
         }
         left
     }
@@ -1631,7 +1639,9 @@ impl Session {
                     return Ok(End::Settled(self.stop_idle_child(texts::REASON_OPERATOR).await?));
                 }
                 Ev::Input(None) => {
-                    self.deps.ctx.jobs.kill_all(self.grace()).await;
+                    // Between turns no `interrupted` note goes with the jobs a shutdown stops: their ends say why.
+                    let why = if self.deps.control.is_shutting() { texts::JOB_SHUTDOWN_DETAIL } else { "" };
+                    self.deps.ctx.jobs.kill_all_because(self.grace(), why).await;
                     // Nothing reads the job events after this task: what the jobs reported (killed just
                     // now, or ended before) is recorded now, or the next `open` would take them for lost.
                     while let Ok(event) = self.deps.job_events.try_recv() {
@@ -4499,6 +4509,27 @@ mod tests {
         std::fs::write(dir.join(format!("{id}.status")), status).unwrap();
     }
 
+    /// The `bash` call `call` that started `command` as job `id`, and its result, which gives the job
+    /// to the model.
+    fn give_job(session: &mut Session, call: &str, id: &str, command: &str) {
+        let args = json!({ "command": command, "background": true });
+        let (call_id, class) = (CallId::from(call), ToolClass::Exec);
+        let c = ToolCall { call_id, req_id: "r-1".into(), name: "bash".into(), args, class };
+        session.append(Author::Model, Event::ToolCall(c)).unwrap();
+        let result = loom_core::event::ToolResult {
+            call_id: CallId::from(call),
+            name: "bash".into(),
+            status: ToolStatus::Ok,
+            text: format!("started as job {id}"),
+            output: None,
+            cut: false,
+            class: ToolClass::Exec,
+            meta: [(META_JOB.to_string(), json!(id))].into_iter().collect(),
+            duration_ms: 1,
+        };
+        session.append(Author::Tool, Event::ToolResult(result)).unwrap();
+    }
+
     #[tokio::test]
     async fn open_settles_jobs_that_finished_while_the_harness_was_down_with_their_status_and_output() {
         let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
@@ -4508,21 +4539,7 @@ mod tests {
         session.append(Author::Harness, Event::TurnStart { trigger: Trigger::User }).unwrap();
         let registered = Event::JobRegistered { job_id: "j1".into(), call_id: CallId::from("c1"), command: "make test".into() };
         session.append(Author::Harness, registered).unwrap();
-        let args = json!({ "command": "make all", "background": true });
-        let call = ToolCall { call_id: CallId::from("c2"), req_id: "r-1".into(), name: "bash".into(), args, class: ToolClass::Exec };
-        session.append(Author::Model, Event::ToolCall(call)).unwrap();
-        let result = loom_core::event::ToolResult {
-            call_id: CallId::from("c2"),
-            name: "bash".into(),
-            status: ToolStatus::Ok,
-            text: "started as job j2".into(),
-            output: None,
-            cut: false,
-            class: ToolClass::Exec,
-            meta: [(META_JOB.to_string(), json!("j2"))].into_iter().collect(),
-            duration_ms: 1,
-        };
-        session.append(Author::Tool, Event::ToolResult(result)).unwrap();
+        give_job(&mut session, "c2", "j2", "make all");
         session.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Waiting }).unwrap();
         drop(session);
         // All three ended while no harness was there to see it.
@@ -4562,6 +4579,56 @@ mod tests {
         fx.restart_jobs();
         let again = Session::open(fx.deps()).unwrap();
         assert_eq!((again.pending_job_ends(), again.records().len()), (2, len));
+    }
+
+    #[tokio::test]
+    async fn open_registers_and_settles_a_job_its_watcher_ended_before_either_record_reached_the_log() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
+        let mut session = fx.create();
+        // j2 was given to the model before a restart it was told about; j3 and j4 in the turn that waits.
+        session.append(Author::Harness, Event::TurnStart { trigger: Trigger::User }).unwrap();
+        give_job(&mut session, "c2", "j2", "make old");
+        session.append(Author::Harness, Event::Interrupted { reason: texts::REASON_RESTART.into() }).unwrap();
+        session.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped }).unwrap();
+        session.append(Author::Harness, Event::TurnStart { trigger: Trigger::Resume }).unwrap();
+        session.note(Author::Harness, NoteKind::Interrupted, "told about the restart".into()).unwrap();
+        give_job(&mut session, "c3", "j3", "make all");
+        give_job(&mut session, "c4", "j4", "make docs");
+        session.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Waiting }).unwrap();
+        drop(session);
+        // j3 ended while the harness was still up: its watcher removed its pid record, so the next table's
+        // sweep does not find it. Nothing is left of j2 and j4.
+        let dir = fx.jobs_dir();
+        left_behind(&dir, "j3", "all done\n", "0\n");
+        std::fs::remove_file(dir.join("j3.pid")).unwrap();
+        fx.restart_jobs();
+        assert!(fx.ctx.jobs.leftovers().is_empty());
+        let before = fx.sink.records().len();
+        let reopened = Session::open(fx.deps()).unwrap();
+        let added = reopened.records()[before..].to_vec();
+        let (registered, settled, note) = ("job_registered", "job_settled", "harness_note");
+        assert_eq!(kinds(&added), [registered, settled, registered, settled, note, registered, settled, note]);
+        assert!(matches!(&added[0].event, Event::JobRegistered { job_id, call_id, command }
+            if job_id == "j2" && *call_id == CallId::from("c2") && command == "make old"), "{:?}", added[0]);
+        assert!(matches!(&added[1].event, Event::JobSettled { job_id, exit_code: None, detail, .. }
+            if job_id == "j2" && detail == texts::JOB_LOST_DETAIL), "{:?}", added[1]);
+        assert!(matches!(&added[2].event, Event::JobRegistered { job_id, call_id, command }
+            if job_id == "j3" && *call_id == CallId::from("c3") && command == "make all"), "{:?}", added[2]);
+        let Event::JobSettled { exit_code: Some(0), output: Some(blob), .. } = &added[3].event else {
+            panic!("{:?}", added[3])
+        };
+        assert_eq!(fx.ctx.blobs.read_all(&blob.id).unwrap(), b"all done\n");
+        let arrivals = notes(&added, NoteKind::Arrival);
+        let ended = "Background job j3 ended: exit 0. It finished while the harness was down";
+        assert!(arrivals[0].starts_with(ended), "{arrivals:?}");
+        let lost = matches!(&added[6].event, Event::JobSettled { job_id, exit_code: None, .. } if job_id == "j4");
+        assert!(lost, "{:?}", added[6]);
+        assert_eq!(arrivals[1], texts::job_lost("j4", "make docs"));
+        // The session that waits for them is woken; j2 was covered by the note on the earlier restart.
+        assert_eq!(reopened.pending_job_ends(), 2);
+        assert!(["out", "status"].iter().all(|x| !dir.join(format!("j3.{x}")).exists()));
+        // j4 left no file, but its registration is in the log now: its id is not handed out again.
+        assert_eq!(fx.ctx.jobs.allocate().await.unwrap().0, "j5");
     }
 
     #[tokio::test]
@@ -4685,6 +4752,14 @@ mod tests {
         let (tx, task) = spawn_run(session);
         tx.send(user("start it")).unwrap();
         wait_until(&fx.sink, "the turn yields", |rs| count(rs, "turn_end") == 1 && count(rs, "job_registered") == 1).await;
+        // The command has written its first line before the shutdown stops it.
+        let out = fx.jobs_dir().join("j1.out");
+        for _ in 0..400 {
+            if std::fs::read_to_string(&out).is_ok_and(|t| t.contains("started")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         fx.control.stop_for_shutdown();
         assert_eq!(finish_task(tx, task).await, End::Closed);
         let rs = fx.sink.records();
@@ -4694,9 +4769,12 @@ mod tests {
             _ => None,
         });
         let (job_id, exit_code, output, detail) = settled.expect("the killed job is settled in the log");
-        assert_eq!((job_id.as_str(), exit_code, detail.as_str()), ("j1", None, ""));
+        assert_eq!((job_id.as_str(), exit_code, detail.as_str()), ("j1", None, texts::JOB_SHUTDOWN_DETAIL));
         assert_eq!(fx.ctx.blobs.read_all(&output.expect("stored").id).unwrap(), b"started\n");
-        assert!(notes(&rs, NoteKind::Arrival).iter().any(|n| n.starts_with("Background job j1 ended: killed.")));
+        // The note says what stopped it: no `interrupted` record goes with a shutdown between turns.
+        let killed = format!("Background job j1 ended: killed. {}", texts::JOB_SHUTDOWN_DETAIL);
+        let arrivals = notes(&rs, NoteKind::Arrival);
+        assert!(arrivals.iter().any(|n| n.starts_with(&killed)), "{arrivals:?}");
         // The next open finds nothing lost, and owes the yielded session the turn the job's end would have started.
         fx.control = Arc::new(Control::new());
         let before = fx.sink.records().len();
