@@ -43,6 +43,11 @@
 //! - Mission state: only when `input.ledger` is `Some` and the brief is non-empty. Followed, when
 //!   `input.ledger_skipped` is `n > 0`, by its own line `{n} ledger entries written by a newer loom are
 //!   not shown` (`1 ledger entry … is not shown`): the ledger as read lacks entries this build cannot parse.
+//! - Finish: a line of its own after the mission state, in a lead only (`!input.is_child`): `Finish: rejected
+//!   {n}; needs new execution evidence` while an objection of a finish verifier is an open obligation (n = the
+//!   rejected finishes since the latest accepted one), else `Finish: unavailable — goal not concluded` while a
+//!   goal is set, its goal-met claim is not concluded and the operator has not released the mission. The
+//!   goal status itself is a line of the mission state.
 //! - Not looked at: `observe::unviewed(records, input.unviewed_min_lines)`; gaps as `a-b` joined by
 //!   `, `, at most 4 gaps then `, …`.
 //! - Repeated: `observe::repetitions(records, 3)`.
@@ -67,8 +72,9 @@
 //! (epoch, a leap day, end of year); child budget variants and floor at 0; stale de-duplication and
 //! the re-read rule; determinism.
 
+use crate::texts;
 use loom_core::event::{Budget, Event, Record, ToolClass, ToolStatus, META_PATH};
-use loom_core::ledger::{BriefOpts, LedgerState};
+use loom_core::ledger::{BriefOpts, LedgerState, ObligationKind};
 use loom_core::observe::{self, StaleKind};
 use serde_json::Value;
 
@@ -107,6 +113,9 @@ pub struct HudInput<'a> {
     pub step: u32,
     pub started_ms: u64,
     pub budget: Budget,
+    /// The session's `finish` waits for a conclusion of the goal-met claim (an explicit-termination role that
+    /// has `conclude`); only then is the state of that claim said.
+    pub finish_gated: bool,
 }
 
 pub fn render(input: &HudInput<'_>) -> String {
@@ -116,6 +125,11 @@ pub fn render(input: &HudInput<'_>) -> String {
         let brief = ledger.brief(&input.brief);
         if !brief.trim().is_empty() {
             sections.push(format!("Mission state (from the ledger — the ledger tools change it):\n{}", brief.trim_end()));
+        }
+        if !input.is_child {
+            if let Some(line) = finish_line(ledger, input.finish_gated) {
+                sections.push(line);
+            }
         }
         if input.ledger_skipped > 0 {
             let n = input.ledger_skipped;
@@ -186,6 +200,20 @@ pub fn render(input: &HudInput<'_>) -> String {
     }
 
     sections.join("\n\n")
+}
+
+/// Why `finish` is closed, from the ledger: `Finish: rejected {n}; needs new execution evidence` while an
+/// objection of a verifier is open (n = rejections since the latest accepted finish), else `Finish:
+/// unavailable — goal not concluded` while the goal claim is open and the operator has not released.
+fn finish_line(ledger: &LedgerState, gated: bool) -> Option<String> {
+    let objected = ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind == ObligationKind::Objection);
+    let rejected = if objected {
+        let since = ledger.finishes.iter().rposition(|f| f.accepted == Some(true)).map_or(0, |i| i.saturating_add(1));
+        ledger.finishes.iter().skip(since).filter(|f| f.accepted == Some(false)).count()
+    } else {
+        0
+    };
+    texts::finish_status_line(gated && crate::gate::goal_unconcluded(ledger), rejected)
 }
 
 /// One section: `{title} ({n}){suffix}:` and its entries, capped at `MAX_ITEMS`. Omitted when empty.
@@ -368,6 +396,7 @@ mod tests {
             step: 0,
             started_ms: 0,
             budget: Budget::default(),
+            finish_gated: true,
         }
     }
 
@@ -435,7 +464,7 @@ mod tests {
         let mut i = input(EMPTY);
         i.ledger = Some(&l);
         let expected = format!(
-            "Now: 1970-01-01 00:00 UTC\n\nMission state (from the ledger — the ledger tools change it):\n{}\n\nWaiting on the operator (1):\n- q2: Which branch should this target?",
+            "Now: 1970-01-01 00:00 UTC\n\nMission state (from the ledger — the ledger tools change it):\n{}\n\nFinish: unavailable — goal not concluded\n\nWaiting on the operator (1):\n- q2: Which branch should this target?",
             l.brief(&BriefOpts::default())
         );
         assert_eq!(render(&i), expected);
@@ -581,6 +610,50 @@ mod tests {
         // No limit, no line.
         i.budget = Budget::default();
         assert_eq!(render(&i), "Now: 1970-01-01 00:36 UTC");
+    }
+
+    #[test]
+    fn the_finish_line_says_why_finish_is_closed() {
+        use loom_core::ledger::{FinishRecord, GoalMet, GoalMetStatus, Obligation, Release};
+        let mut l = LedgerState { goal: Some("fix it".into()), ..LedgerState::default() };
+        l.goal_met = Some(GoalMet { status: GoalMetStatus::Open, note: String::new(), evidence: vec![], n: 0 });
+        let mut i = input(EMPTY);
+        i.ledger = Some(&l);
+        assert!(render(&i).contains("\n\nFinish: unavailable — goal not concluded"), "{}", render(&i));
+        // A child is not told about finish.
+        i.is_child = true;
+        assert!(!render(&i).contains("Finish:"));
+        i.is_child = false;
+
+        // An open objection of a verifier: the count of rejections since the latest accepted finish.
+        let rejected = |id: &str, accepted: bool| FinishRecord {
+            id: id.into(),
+            summary: "s".into(),
+            evidence: vec![],
+            accepted: Some(accepted),
+            objections: vec!["o".into()],
+        };
+        let mut done = l.clone();
+        done.goal_met = Some(GoalMet { status: GoalMetStatus::Supported, note: "ran".into(), evidence: vec!["e1".into()], n: 4 });
+        done.finishes = vec![rejected("f1", false), rejected("f2", true), rejected("f3", false), rejected("f4", false)];
+        done.obligations.push(Obligation {
+            id: "o1".into(),
+            kind: ObligationKind::Objection,
+            text: "no run".into(),
+            reference: "f4".into(),
+            outcome: None,
+        });
+        i.ledger = Some(&done);
+        assert!(render(&i).contains("\n\nFinish: rejected 2; needs new execution evidence"), "{}", render(&i));
+        // Settled objection and a concluded goal: no line. Neither with a release.
+        let mut settled = done.clone();
+        settled.obligations[0].outcome = Some("settled".into());
+        i.ledger = Some(&settled);
+        assert!(!render(&i).contains("Finish:"), "{}", render(&i));
+        let mut released = l.clone();
+        released.release = Some(Release { reason: "stop".into(), n: 2 });
+        i.ledger = Some(&released);
+        assert!(!render(&i).contains("Finish:"), "{}", render(&i));
     }
 
     #[test]

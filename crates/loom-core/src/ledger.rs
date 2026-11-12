@@ -119,6 +119,8 @@ pub enum ObligationKind {
     Question,
     UnverifiedEdit,
     Promise,
+    /// An objection a finish verifier raised. Settled by execution evidence recorded after it.
+    Objection,
 }
 
 /// What `evidence_add` records. `blob` and `attested` are filled in by the runtime, never by the model.
@@ -1382,6 +1384,7 @@ fn obligation_kind(k: ObligationKind) -> &'static str {
         ObligationKind::Question => "question",
         ObligationKind::UnverifiedEdit => "unverified_edit",
         ObligationKind::Promise => "promise",
+        ObligationKind::Objection => "objection",
     }
 }
 
@@ -1803,6 +1806,23 @@ mod tests {
         assert_eq!(o.questions, ["q1"]);
         assert!(!o.is_empty());
         assert!(LedgerState::default().open_items().is_empty());
+    }
+
+    #[test]
+    fn an_objection_obligation_is_open_until_settled_and_is_labelled() {
+        let s = build(vec![LedgerOp::ObligationOpen {
+            kind: ObligationKind::Objection,
+            text: "no test ran".into(),
+            reference: "f1".into(),
+        }]);
+        assert_eq!(s.open_items().obligations, ["o1"]);
+        assert_eq!(LedgerState::summarize(&LedgerOp::ObligationOpen {
+            kind: ObligationKind::Objection,
+            text: "no test ran".into(),
+            reference: String::new(),
+        }), "obligation opened (objection): no test ran");
+        assert_eq!(serde_json::to_string(&ObligationKind::Objection).unwrap_or_default(), "\"objection\"");
+        assert!(s.brief(&BriefOpts::default()).contains("(objection) no test ran"));
     }
 
     fn rich_state() -> LedgerState {

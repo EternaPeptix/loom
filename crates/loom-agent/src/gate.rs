@@ -98,7 +98,7 @@
 //! `render_report` full, minimal, and cut.
 
 use loom_core::event::{ChildOutcome, Termination};
-use loom_core::ledger::{LedgerState, ObligationKind, StepStatus};
+use loom_core::ledger::{GoalMetStatus, LedgerState, ObligationKind, StepStatus};
 use loom_core::observe;
 use loom_core::{BlobId, BlobStore};
 use serde::{Deserialize, Serialize};
@@ -161,6 +161,7 @@ fn open_lines(ledger: &LedgerState) -> Vec<String> {
                 ObligationKind::Question => "question",
                 ObligationKind::UnverifiedEdit => "unverified_edit",
                 ObligationKind::Promise => "promise",
+                ObligationKind::Objection => "objection",
             };
             lines.push(format!("obligation {} ({kind}): {}", o.id, cut(&o.text, OPEN_TEXT_CHARS)));
         }
@@ -247,6 +248,37 @@ fn closing(ctx: &YieldCtx<'_>) -> String {
     out
 }
 
+/// True when the mission has a goal that no `conclude` has settled and the operator has not released.
+pub fn goal_unconcluded(ledger: &LedgerState) -> bool {
+    ledger.release.is_none() && goal_unconcluded_ignoring_release(ledger)
+}
+
+/// True when the mission has a goal whose goal-met claim is not concluded, released or not.
+pub fn goal_unconcluded_ignoring_release(ledger: &LedgerState) -> bool {
+    ledger.goal.is_some() && ledger.goal_met.as_ref().is_none_or(|g| g.status == GoalMetStatus::Open)
+}
+
+/// The nudge paragraph for a lead that stopped while the goal claim is open and no plan step is: with
+/// nothing planned, an idle reply would be a silent way out. `None` in every other case.
+fn idle_goal_paragraph(ctx: &YieldCtx<'_>) -> Option<String> {
+    let ledger = ctx.ledger?;
+    if !has(ctx.tools, "conclude") || !goal_unconcluded(ledger) || !ledger.open_items().plan.is_empty() {
+        return None;
+    }
+    let mut p = String::from(
+        "The goal is not concluded and no plan step is open, so stopping here is not an exit. Add a plan step for the next route and take it, or run the target again.",
+    );
+    if has(ctx.tools, "conclude") {
+        p.push_str(
+            " Call conclude once a run shows the goal met, or once you have established that it cannot be met as stated (every route closed, with execution evidence).",
+        );
+    }
+    if has(ctx.tools, "report_blocker") {
+        p.push_str(" If something only the operator can supply is blocking you, call report_blocker.");
+    }
+    Some(p)
+}
+
 pub fn on_yield(ctx: &YieldCtx<'_>) -> Yield {
     if ctx.termination == Termination::Free {
         return Yield::End;
@@ -274,6 +306,11 @@ pub fn on_yield(ctx: &YieldCtx<'_>) -> Yield {
     let mut paragraphs = vec![first];
     if let Some(block) = open {
         paragraphs.push(block);
+    }
+    if !ctx.is_child {
+        if let Some(p) = idle_goal_paragraph(ctx) {
+            paragraphs.push(p);
+        }
     }
     if ctx.running_jobs + ctx.running_children > 0 {
         let mut what = Vec::new();
@@ -343,7 +380,13 @@ pub fn check_finish_lead(ledger: &LedgerState, answer: &str) -> Result<(), Strin
         if !open.plan.is_empty() {
             text.push_str("\n- Plan steps: call `step` with status done (say in the note what showed it) or dropped (say why).");
         }
-        if !open.obligations.is_empty() {
+        let objections = ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind == ObligationKind::Objection);
+        if objections {
+            text.push_str(
+                "\n- Objections: a verifier rejected an earlier finish. An objection is settled only by new work: run the target again, record the run with `evidence` (kind execution), then call finish again. Answering the operator or rewording the result settles nothing.",
+            );
+        }
+        if ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind != ObligationKind::Objection) {
             text.push_str("\n- Obligations: wait for the job or agent to report, or stop it.");
         }
         if !open.claims.is_empty() {
@@ -718,6 +761,70 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
             text,
             "The session replied 5 times in a row without calling a tool or ending its turn.\n\nSend the session a message to resume it."
         );
+    }
+
+    fn with_goal(open_step: bool) -> LedgerState {
+        let mut l = LedgerState { goal: Some("fix it".into()), ..LedgerState::default() };
+        l.goal_met = Some(loom_core::ledger::GoalMet { status: GoalMetStatus::Open, note: String::new(), evidence: vec![], n: 0 });
+        if open_step {
+            l.plan.push(PlanStep { id: "p1".into(), text: "try".into(), status: StepStatus::Todo, note: String::new(), evidence: vec![] });
+        }
+        l
+    }
+
+    #[test]
+    fn an_open_goal_claim_with_no_open_step_is_named_at_the_stop_gate() {
+        let t = tools(&["finish", "conclude", "report_blocker"]);
+        let l = with_goal(false);
+        let text = nudge(&ctx(&t, Some(&l), "I am done."));
+        assert!(
+            text.contains("The goal is not concluded and no plan step is open, so stopping here is not an exit."),
+            "{text}"
+        );
+        assert!(text.contains("Call conclude once a run shows the goal met"), "{text}");
+        assert!(text.contains("call report_blocker"), "{text}");
+        // Without report_blocker that sentence is left out; without conclude the session is not gated at all.
+        let no_blocker = tools(&["finish", "conclude"]);
+        let text = nudge(&ctx(&no_blocker, Some(&l), "x"));
+        assert!(text.contains("no plan step is open") && text.contains("Call conclude") && !text.contains("report_blocker"), "{text}");
+        let bare = tools(&["finish"]);
+        assert!(!nudge(&ctx(&bare, Some(&l), "x")).contains("not an exit"));
+        // An open plan step, a concluded goal, a released mission, no goal and a child: not mentioned.
+        let open = with_goal(true);
+        assert!(!nudge(&ctx(&t, Some(&open), "x")).contains("not an exit"));
+        let mut met = with_goal(false);
+        met.goal_met = met.goal_met.map(|g| loom_core::ledger::GoalMet { status: GoalMetStatus::Supported, ..g });
+        assert!(!nudge(&ctx(&t, Some(&met), "x")).contains("not an exit"));
+        let mut released = with_goal(false);
+        released.release = Some(loom_core::ledger::Release { reason: "stop".into(), n: 3 });
+        assert!(!nudge(&ctx(&t, Some(&released), "x")).contains("not an exit"));
+        assert!(!nudge(&ctx(&t, Some(&LedgerState::default()), "x")).contains("not an exit"));
+        let mut c = ctx(&t, Some(&l), "x");
+        c.is_child = true;
+        assert!(!nudge(&c).contains("not an exit"));
+        // A free-termination session just ends.
+        let mut c = ctx(&t, Some(&l), "x");
+        c.termination = Termination::Free;
+        assert_eq!(on_yield(&c), Yield::End);
+    }
+
+    #[test]
+    fn finish_lead_says_an_objection_is_settled_only_by_new_work() {
+        let mut l = LedgerState::default();
+        l.obligations.push(Obligation {
+            id: "o1".into(),
+            kind: ObligationKind::Objection,
+            text: "no test ran".into(),
+            reference: "f1".into(),
+            outcome: None,
+        });
+        let Err(text) = check_finish_lead(&l, "done") else { panic!("expected refusal") };
+        assert!(text.contains("obligation o1 (objection): no test ran"), "{text}");
+        assert!(text.contains("- Objections: a verifier rejected an earlier finish."), "{text}");
+        assert!(!text.contains("Obligations: wait for the job"), "{text}");
+        l.obligations.push(Obligation { id: "o2".into(), kind: ObligationKind::Job, text: "j".into(), reference: String::new(), outcome: None });
+        let Err(text) = check_finish_lead(&l, "done") else { panic!("expected refusal") };
+        assert!(text.contains("Objections:") && text.contains("Obligations: wait for the job"), "{text}");
     }
 
     #[test]

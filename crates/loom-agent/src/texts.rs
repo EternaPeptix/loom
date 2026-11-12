@@ -548,6 +548,54 @@ pub fn job_lost(id: &str, command: &str) -> String {
     )
 }
 
+/// The refusal of `finish` while the goal claim is not concluded (the goal-met pre-gate). `can_conclude`
+/// and `can_block` say whether the role has `conclude` and `report_blocker`, so only real tools are named.
+pub fn finish_unavailable(can_conclude: bool, can_block: bool) -> String {
+    let mut out = String::from(
+        "finish is not available yet: the goal is not concluded, and not being there yet is not a finish. Nothing was delivered and no verifier was started.",
+    );
+    if can_conclude {
+        out.push_str(
+            " Call conclude once a run shows the goal met, or once you have established that it cannot be met as stated (every plan route closed, with execution evidence).",
+        );
+    }
+    out.push_str(
+        " Until then, record where you are with a note and take the next step: run the target, read what it did, change the approach.",
+    );
+    if can_block {
+        out.push_str(" If something only the operator can supply is blocking you, call report_blocker.");
+    }
+    out
+}
+
+/// What follows the objections in the result of a `finish` the verifier did not accept.
+pub const FINISH_NOT_ACCEPTED_TAIL: &str = "The mission is not finished. Each objection is now an open obligation: it is settled only by new execution evidence recorded after it (run the target again and record the run with `evidence`). Fix the problem, or show with a new run that the objection is wrong, then call finish again.";
+
+/// A non-blocking record that a finish was rejected `n` times since the last accepted one. Nothing is
+/// asked of the operator.
+pub fn finish_rejected_notice(n: usize) -> String {
+    format!("finish rejected {n} times; continuing. The session keeps working; its next finish needs new execution evidence.")
+}
+
+/// A non-blocking record that verification could not be run: a fault of the harness, not of the agent.
+pub fn verification_fault_notice(why: &str) -> String {
+    format!("Infrastructure fault, not an agent problem: the finish could not be verified ({why}). It is held as unverified and was not delivered as finished. Nobody is asked to act.")
+}
+
+/// The tool result when verification could not be run after the retries.
+pub fn verification_fault_result(why: &str) -> String {
+    format!("The result could not be verified: {why}. This is a fault of the harness, not a problem with your work. The result is recorded as unverified and was NOT delivered as finished. Keep working, or call finish again later: it is verified again.")
+}
+
+/// The HUD line saying why `finish` is closed, or `None` when it is not. `rejected` is the number of
+/// rejected finishes whose objections are still open.
+pub fn finish_status_line(goal_unconcluded: bool, rejected: usize) -> Option<String> {
+    if rejected > 0 {
+        return Some(format!("Finish: rejected {rejected}; needs new execution evidence"));
+    }
+    goal_unconcluded.then(|| "Finish: unavailable — goal not concluded".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
