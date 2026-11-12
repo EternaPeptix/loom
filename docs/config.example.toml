@@ -43,6 +43,7 @@ unviewed_min_lines = 80
 [sandbox]
 mode = "seatbelt"          # "seatbelt" (macOS) or "none" (reported loudly)
 loopback_all = false
+protect_credentials = true # ~/.ssh, ~/.aws, ~/.gnupg, keychains, browser profiles ... are unreadable to commands and file tools
 
 [network]
 mode = "deny_all"          # "open", "allowlist" or "deny_all"; web_fetch needs a route

@@ -112,6 +112,7 @@ pub async fn run_until(
         .map_err(|e| format!("Cannot create {}: {e}.", paths.home.display()))?;
     std::fs::create_dir_all(paths.logs_dir()).map_err(|e| format!("Cannot create {}: {e}.", paths.logs_dir().display()))?;
     let config = load_config(&paths)?;
+    loom_tools::sandbox::preflight(&config.sandbox)?;
 
     if let Some(file) = read_daemon_file(&paths) {
         if pid_alive(file.pid) && healthy(&file.bind, PROBE_TIMEOUT).await {
