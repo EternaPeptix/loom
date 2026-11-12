@@ -15,7 +15,8 @@
 //!    - ended → outcome `Ended::outcome()`, fact `{seconds:.1}s`, `Body::Raw(whole output)`, meta
 //!      `META_EXIT_CODE` or `META_SIGNAL`. Status `Ok` for exit 0, `Error` otherwise. The output and
 //!      status files are deleted.
-//!    - `timeout_s` was given and elapsed → `terminate(cfg.kill_grace_s)`; status `Timeout`, outcome
+//!    - `timeout_s` was given and elapsed → `terminate_within(cfg.kill_grace_s, cfg.max_output_bytes)`
+//!      (the grace period ends early when the output passes the limit); status `Timeout`, outcome
 //!      `stopped after {n}s (timeout_s)`, the output so far as `Body::Raw`.
 //!    - no `timeout_s` and the foreground limit elapsed → register as a job; status `Ok`, outcome
 //!      `still running after {n}s — now job {id}`, `Body::Raw(output so far)`, meta `META_JOB`. The
@@ -25,8 +26,12 @@
 //!      writing through a grace period); status `Error`, outcome `stopped: output passed {limit}
 //!      bytes`, the first `{limit}` bytes of the output (a fact gives the file's true size). No output
 //!      is ever read back beyond `max_output_bytes`.
-//!    - ended while other processes of its group still run → the leader's status and the output so
-//!      far, and the rest continues as a job (fact with the job id, `job_wait`, `job_kill`).
+//!    - ended while other processes of its group still run, and they are still there after a short
+//!      settle window (`GROUP_SETTLE`, for helpers bash does not wait for) → the leader's status in
+//!      the outcome and the output so far, and the rest continues as a job (fact with the job id,
+//!      `job_wait`, `job_kill`). Meta is `META_JOB` only, as for the foreground limit: a result that
+//!      also carried `META_EXIT_CODE` or `META_SIGNAL` would tell the session that the end of this job
+//!      has already been shown, and its settlement would then not be reported.
 //!    - spawn failure → error sentence with the OS error.
 //! 5. When the exit status is not 0, the sandbox is in seatbelt mode and the output contains
 //!    `Operation not permitted`, add the fact `sandboxed: writes only under the workspace and temp
@@ -36,10 +41,16 @@
 //! `job_wait`: `ctx.jobs.wait(job, timeout_s or cfg.job_wait_s, ctx.cancel)`. Outcome: the state's
 //! outcome (`running`, `exit 0`, …); facts: `job {id}`, `{bytes} new bytes` and, while running,
 //! `{elapsed}s so far`; `Body::Raw(new_output)`, or `Body::Message("(no new output)")` when there is
-//! none. Status `Ok` unless the job ended with a non-zero status (`Error`).
+//! none. Status `Ok` unless the job ended with a non-zero status (`Error`). While a job runs on after
+//! its own command has exited, a fact gives that command's status. Once the job has settled a fact
+//! names the stored output: `complete output stored as …`, or, when the job wrote more than
+//! `max_output_bytes`, `the first {limit} bytes of output are stored as …`; and the settled job's
+//! `detail`, when it has one, is a fact too (stopped for the output limit, the rest of the output
+//! discarded, storage failure).
 //! `job_kill`: `ctx.jobs.kill`, same rendering, outcome prefixed by what happened.
 //! `job_list`: one line per job: `{id}  {state}  {elapsed}s  {output_bytes} bytes  {command (≤ 120
-//! chars)}`, or `(no jobs)`.
+//! chars)}`, or `(no jobs)`; the state of a job that runs on after its own command has exited is
+//! `running (the command itself has exited: {status})`.
 //! An unknown job id is an error result carrying the table's sentence.
 //!
 //! Tests required (real processes, sandbox mode `none`, through `crate::execute` so that the
@@ -61,6 +72,10 @@ use std::time::{Duration, Instant};
 
 /// Shown when a command failed under the seatbelt profile with a permission error.
 const SANDBOX_REMINDER: &str = "sandboxed: writes only under the workspace and temp dir; network only via proxy";
+
+/// How long a foreground command's process group gets to empty after its leader has exited before
+/// what is left of it is handed over as a job.
+const GROUP_SETTLE: Duration = Duration::from_millis(200);
 
 /// Milliseconds as seconds with one decimal.
 fn secs_text(ms: u64) -> String {
@@ -94,10 +109,23 @@ fn render(ctx: &ToolCtx, view: JobView, outcome: Option<String>) -> ToolOutput {
     if info.state == JobState::Running {
         let elapsed = ctx.jobs.elapsed_ms(&info.id).unwrap_or(0);
         out = out.with_more(format!("{}s so far", secs_text(elapsed)));
+        if let Some(leader) = ctx.jobs.leader_status(&info.id) {
+            out = out.with_more(format!("the command itself has exited: {}; other processes it started are still running", leader.outcome()));
+        }
     }
     out = out.with_more(format!("{} bytes of output in all", info.output_bytes));
     if let Some(blob) = ctx.jobs.output_blob(&info.id) {
-        out = out.with_more(format!("complete output stored as {}", blob.handle()));
+        let limit = ctx.cfg.max_output_bytes;
+        out = out.with_more(if info.output_bytes > limit {
+            // The detail below says that the rest was discarded.
+            format!("the first {limit} bytes of output are stored as {}", blob.handle())
+        } else {
+            format!("complete output stored as {}", blob.handle())
+        });
+    }
+    // Why it ended, when that needs saying: stopped for its output, output discarded, storage failure.
+    if let Some(detail) = ctx.jobs.detail(&info.id) {
+        out = out.with_more(detail);
     }
     out = out.with_meta(META_JOB, json!(info.id));
     match &info.state {
@@ -176,11 +204,16 @@ impl Tool for JobKill {
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let Some(id) = args.get("job").and_then(Value::as_str) else { return missing_job() };
         let was_running = ctx.jobs.list().await.iter().any(|j| j.id == id && j.state == JobState::Running);
+        // Its own command had already exited and only what that left running is there to stop.
+        let leftovers_only = was_running && ctx.jobs.leader_status(id).is_some();
         match ctx.jobs.kill(id, Duration::from_secs(ctx.cfg.kill_grace_s)).await {
             Ok(view) => {
                 let outcome = match (&view.info.state, was_running) {
                     (JobState::Running, _) => "kill sent, but the job is still running".to_string(),
                     (JobState::Killed, true) => "killed by job_kill".to_string(),
+                    (state, true) if leftovers_only => {
+                        format!("stopped by job_kill; the command itself had already exited: {}", state.outcome())
+                    }
                     (state, true) => format!("had just ended on its own: {}", state.outcome()),
                     (state, false) => format!("already ended: {}", state.outcome()),
                 };
@@ -208,7 +241,11 @@ impl Tool for JobList {
             .map(|j| {
                 let elapsed = secs_text(ctx.jobs.elapsed_ms(&j.id).unwrap_or(0));
                 let command = crate::preview(&j.command.replace('\n', "\\n"), 120);
-                format!("{}  {}  {}s  {} bytes  {}", j.id, j.state.outcome(), elapsed, j.output_bytes, command)
+                let state = match ctx.jobs.leader_status(&j.id).filter(|_| j.state == JobState::Running) {
+                    Some(leader) => format!("running (the command itself has exited: {})", leader.outcome()),
+                    None => j.state.outcome(),
+                };
+                format!("{}  {}  {}s  {} bytes  {}", j.id, state, elapsed, j.output_bytes, command)
             })
             .collect();
         ToolOutput::ok(format!("{} jobs", jobs.len()), Body::Message(lines.join("\n")))
@@ -260,10 +297,12 @@ struct Finish<'a> {
     output: Vec<u8>,
     elapsed: Duration,
     facts: Vec<String>,
+    /// The job that the rest of the command's process group continues as, when it left one running.
+    job: Option<&'a str>,
 }
 
 fn finish(f: Finish<'_>) -> ToolOutput {
-    let Finish { ctx, status, outcome, ended, mut output, elapsed, facts } = f;
+    let Finish { ctx, status, outcome, ended, mut output, elapsed, facts, job } = f;
     if let Ended::Failed(text) = ended {
         output.extend_from_slice(format!("\n[the command could not be started: {text}]\n").as_bytes());
     }
@@ -282,7 +321,12 @@ fn finish(f: Finish<'_>) -> ToolOutput {
         out = out.with_more(SANDBOX_REMINDER);
     }
     out.body = Body::Raw(output);
-    add_ended_meta(out, ended)
+    match job {
+        // No exit meta beside the job id: that pair means "the end of this job has been shown", and
+        // the session would then not report the job when it settles.
+        Some(id) => out.with_meta(META_JOB, json!(id)),
+        None => add_ended_meta(out, ended),
+    }
 }
 
 async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
@@ -341,10 +385,25 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
 
     match end {
         WaitEnd::Ended(ended) => {
+            // What bash does not wait for (a process substitution, a helper that takes milliseconds) gets
+            // a moment to finish: only a group that is still there afterwards goes on as a job, and the
+            // output read below includes what those processes were still writing.
+            if running.group_alive() {
+                let _ = running.wait_group(&ctx.cancel, Some(GROUP_SETTLE), limit).await;
+            }
             // Asked before the read so that the output shown is final when no process is left.
             let group_runs = running.group_alive();
             let (output, note) = match read_all(&running, limit) {
                 Ok(o) => o,
+                Err(e) if group_runs => {
+                    // Not dropped, which would kill them unannounced: what is left goes on as a job.
+                    ctx.jobs.register(&id, &ctx.call_id, command, running).await;
+                    return ToolOutput::error(format!(
+                        "{e} The command itself has ended ({}); other processes it started are still running as job {id}: job_wait(\"{id}\") returns their output, job_kill(\"{id}\") stops them.",
+                        ended.outcome()
+                    ))
+                    .with_meta(META_JOB, json!(id));
+                }
                 Err(e) => return ToolOutput::error(e),
             };
             let status = if ended == Ended::Exit(0) { ToolStatus::Ok } else { ToolStatus::Error };
@@ -355,11 +414,10 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
                 facts.push(format!(
                     "other processes it started are still running, not finished — now job {id}; follow them with job_wait(\"{id}\"), stop them with job_kill(\"{id}\")"
                 ));
-                return finish(Finish { ctx, status, outcome: ended.outcome(), ended: &ended, output, elapsed, facts })
-                    .with_meta(META_JOB, json!(id));
+                return finish(Finish { ctx, status, outcome: ended.outcome(), ended: &ended, output, elapsed, facts, job: Some(&id) });
             }
             remove_files(&running);
-            finish(Finish { ctx, status, outcome: ended.outcome(), ended: &ended, output, elapsed, facts })
+            finish(Finish { ctx, status, outcome: ended.outcome(), ended: &ended, output, elapsed, facts, job: None })
         }
         WaitEnd::Deadline if timeout_s.is_none() => {
             // Not stopped: the command goes on as a job, and the first job_wait starts after what is shown here.
@@ -390,8 +448,8 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         }
         WaitEnd::Deadline | WaitEnd::Cancelled | WaitEnd::TooMuchOutput => {
             // Past the output limit the group is killed outright: a command that ignores TERM would go on
-            // writing for the whole grace period.
-            let ended = if end == WaitEnd::TooMuchOutput { running.kill().await } else { running.terminate(grace).await };
+            // writing for the whole grace period. The same holds when it passes the limit during the grace.
+            let ended = if end == WaitEnd::TooMuchOutput { running.kill().await } else { running.terminate_within(grace, limit).await };
             let (output, note) = match read_all(&running, limit) {
                 Ok(o) => o,
                 Err(e) => return ToolOutput::error(e),
@@ -404,19 +462,21 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
             };
             let mut facts = vec![format!("the command's own status after it was stopped: {}", ended.outcome())];
             facts.extend(note);
-            finish(Finish { ctx, status, outcome, ended: &ended, output, elapsed, facts })
+            finish(Finish { ctx, status, outcome, ended: &ended, output, elapsed, facts, job: None })
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::jobs::JobEvent;
+    use crate::jobs::{JobEvent, JobState};
+    use crate::proc::{self, Ended, Spawn, WaitEnd};
     use crate::testutil::{env, env_with, TestEnv};
     use loom_core::config::{SandboxCfg, SandboxMode, ToolsCfg};
     use loom_core::event::{ToolResult, ToolStatus, META_EXIT_CODE, META_JOB, META_SIGNAL};
     use serde_json::json;
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     fn bash_env(cfg: ToolsCfg) -> TestEnv {
         env_with(cfg, SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() })
@@ -548,17 +608,18 @@ mod tests {
         assert_eq!(r.status, ToolStatus::Ok);
         assert!(r.text.contains("exit 0"), "{}", r.text);
         assert!(r.text.contains("now job j1") && r.text.contains("job_wait(\"j1\")") && r.text.contains("job_kill(\"j1\")"), "{}", r.text);
+        // The job id only: exit meta beside it would tell the session that the job's end was already shown.
         assert_eq!(r.meta.get(META_JOB), Some(&json!("j1")));
-        assert_eq!(r.meta.get(META_EXIT_CODE), Some(&json!(0)));
+        assert!(r.meta.get(META_EXIT_CODE).is_none() && r.meta.get(META_SIGNAL).is_none(), "{:?}", r.meta);
         assert_eq!(e.stored(&r), "leader\n");
         assert!(matches!(e.job_events.try_recv(), Ok(JobEvent::Registered(_))));
         let child = pid_from(&pidfile).await;
         assert!(alive(child));
 
         let l = e.call("job_list", json!({})).await;
-        assert!(l.text.contains("j1  running  "), "{}", l.text);
+        assert!(l.text.contains("j1  running (the command itself has exited: exit 0)  "), "{}", l.text);
         let k = e.call("job_kill", json!({"job": "j1"})).await;
-        assert!(k.text.contains("killed by job_kill"), "{}", k.text);
+        assert!(k.text.contains("stopped by job_kill; the command itself had already exited: exit 0"), "{}", k.text);
         for _ in 0..100 {
             if !alive(child) {
                 break;
@@ -582,6 +643,61 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("the child outlived the table");
+    }
+
+    #[tokio::test]
+    async fn a_job_left_behind_by_a_command_settles_with_the_commands_status() {
+        let mut e = env();
+        let r = e.call("bash", json!({"command": "echo leader; (sleep 1; echo late) & exit 3"})).await;
+        assert_eq!(r.status, ToolStatus::Error);
+        assert!(r.text.contains("exit 3") && r.text.contains("now job j1"), "{}", r.text);
+        // Nothing in the result says how the job ended, so its settlement is news for the session.
+        assert_eq!(r.meta.get(META_JOB), Some(&json!("j1")));
+        assert!(r.meta.get(META_EXIT_CODE).is_none() && r.meta.get(META_SIGNAL).is_none(), "{:?}", r.meta);
+        assert!(matches!(e.job_events.recv().await, Some(JobEvent::Registered(_))));
+        let settled = tokio::time::timeout(Duration::from_secs(20), e.job_events.recv()).await.expect("event").expect("open");
+        let JobEvent::Settled { info, output, detail } = settled else { panic!("Settled") };
+        assert_eq!(info.state, JobState::Ended(Ended::Exit(3)));
+        assert_eq!(detail, "");
+        assert_eq!(e.ctx.blobs.read_all(&output.expect("stored").id).expect("read"), b"leader\nlate\n");
+        let w = e.call("job_wait", json!({"job": "j1"})).await;
+        assert!(w.text.contains("exit 3") && w.text.contains("late"), "{}", w.text);
+    }
+
+    #[tokio::test]
+    async fn a_helper_that_ends_just_after_the_command_is_waited_for_and_is_no_job() {
+        let e = env();
+        let r = e.call("bash", json!({"command": "echo first; (sleep 0.05; echo helper) &"})).await;
+        assert_eq!(r.status, ToolStatus::Ok);
+        assert!(!r.text.contains("now job"), "{}", r.text);
+        assert!(r.meta.get(META_JOB).is_none());
+        assert_eq!(r.meta.get(META_EXIT_CODE), Some(&json!(0)));
+        assert_eq!(e.stored(&r), "first\nhelper\n");
+        let left: Vec<_> = std::fs::read_dir(e.dir.path().join("home/jobs")).expect("jobs dir").collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[tokio::test]
+    async fn processes_left_running_become_a_job_even_when_the_output_cannot_be_read() {
+        let e = env();
+        let pidfile = e.ctx.tmp_dir.join("pid");
+        let out = e.dir.path().join("home/jobs/j1.out");
+        let script = format!("rm {}; sleep 300 & echo $! > {}", out.display(), pidfile.display());
+        let r = e.call("bash", json!({"command": script})).await;
+        assert_eq!(r.status, ToolStatus::Error);
+        assert!(r.text.contains("could not be read back") && r.text.contains("still running as job j1"), "{}", r.text);
+        assert_eq!(r.meta.get(META_JOB), Some(&json!("j1")));
+        let child = pid_from(&pidfile).await;
+        assert!(alive(child), "the processes it left were stopped unannounced");
+        let k = e.call("job_kill", json!({"job": "j1"})).await;
+        assert!(k.text.contains("stopped by job_kill"), "{}", k.text);
+        for _ in 0..100 {
+            if !alive(child) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the child outlived job_kill");
     }
 
     #[tokio::test]
@@ -705,6 +821,35 @@ mod tests {
         assert!(r.text.contains("stopped: output passed 2000 bytes"), "{}", r.text);
         assert!(r.text.contains("only the first 2000 bytes were kept and the rest was discarded"), "{}", r.text);
         assert_eq!(e.stored(&r).len(), 2_000);
+    }
+
+    #[tokio::test]
+    async fn job_results_say_when_only_the_first_bytes_of_the_output_were_kept() {
+        let cfg = ToolsCfg { max_output_bytes: 2_000, ..ToolsCfg::default() };
+        let e = bash_env(cfg);
+        // Stopped by the harness for its output.
+        e.call("bash", json!({"command": "yes", "background": true})).await;
+        let w = e.call("job_wait", json!({"job": "j1", "timeout_s": 30})).await;
+        assert!(w.text.contains("killed"), "{}", w.text);
+        assert!(w.text.contains("stopped by the harness: the output passed the limit of 2000 bytes"), "{}", w.text);
+        assert!(w.text.contains("only the first 2000 bytes were stored and the rest was discarded"), "{}", w.text);
+        assert!(w.text.contains("the first 2000 bytes of output are stored as out:"), "{}", w.text);
+        assert!(!w.text.contains("complete output"), "{}", w.text);
+
+        // Past the limit in one burst, and over before anything could stop it.
+        let (id, out_path, exit_path) = e.ctx.jobs.allocate().await.expect("allocate");
+        let vars = [("PATH".to_string(), "/usr/bin:/bin".to_string())].into_iter().collect();
+        let script = "printf '%05000d' 0; exit 3".to_string();
+        let spec = Spawn { script, cwd: e.ctx.workspace.clone(), env: vars, out_path, exit_path };
+        let mut running = proc::spawn(&e.ctx.sandbox, &spec).expect("spawn");
+        let end = running.wait(&CancellationToken::new(), Some(Duration::from_secs(20)), u64::MAX).await;
+        assert_eq!(end, WaitEnd::Ended(Ended::Exit(3)));
+        e.ctx.jobs.register(&id, &e.ctx.call_id, "printf", running).await;
+        let w = e.call("job_wait", json!({"job": id, "timeout_s": 30})).await;
+        assert!(w.text.contains("exit 3") && w.text.contains("5000 bytes of output in all"), "{}", w.text);
+        assert!(w.text.contains("the output was 5000 bytes; only the first 2000 bytes were stored and the rest was discarded"), "{}", w.text);
+        assert!(w.text.contains("the first 2000 bytes of output are stored as out:"), "{}", w.text);
+        assert!(!w.text.contains("complete output"), "{}", w.text);
     }
 
     #[tokio::test]
