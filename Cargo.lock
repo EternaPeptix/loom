@@ -879,6 +879,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures-util",
+ "libc",
  "loom-core",
  "loom-model",
  "loom-net",

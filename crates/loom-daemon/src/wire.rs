@@ -19,6 +19,9 @@ pub struct StatusView {
     pub proxy_port: u16,
     /// The loom home directory.
     pub home: String,
+    /// Space on the volume that holds the loom home; `null` when it cannot be read.
+    #[serde(default)]
+    pub disk: Option<DiskSpace>,
     pub models: Vec<ModelHealth>,
     pub sessions_total: usize,
     /// Sessions a task is driving.
@@ -26,6 +29,27 @@ pub struct StatusView {
     /// Sessions in the middle of a turn.
     pub sessions_running: usize,
     pub inbox_open: usize,
+}
+
+/// Free space below which `loom status` warns that sessions will soon fail to write: 5 GiB …
+pub const LOW_DISK_BYTES: u64 = 5 << 30;
+
+/// … or 5 percent of the volume.
+pub const LOW_DISK_PERCENT: u64 = 5;
+
+/// Space on a volume, in bytes: what the daemon's user can still write (`free_bytes`), and the volume's size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskSpace {
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl DiskSpace {
+    /// Less than `LOW_DISK_BYTES`, or less than `LOW_DISK_PERCENT` of the volume, is free.
+    pub fn is_low(&self) -> bool {
+        self.free_bytes < LOW_DISK_BYTES
+            || u128::from(self.free_bytes) * 100 < u128::from(self.total_bytes) * u128::from(LOW_DISK_PERCENT)
+    }
 }
 
 /// `GET /api/sessions/{id}`.

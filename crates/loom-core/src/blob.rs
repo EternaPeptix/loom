@@ -146,9 +146,10 @@ impl BlobStore {
     /// and index files older than `min_age` whose blob is gone. With `apply == false` only counts. Anything
     /// that cannot be deleted is kept.
     ///
-    /// Storing bytes that are already here refreshes the blob's age (`BlobWriter::finish`), and a blob is moved
-    /// out of the way before its age is read again and it is deleted (`remove_if_still_old`), so a blob that a
-    /// store has just returned is never deleted.
+    /// Storing bytes that are already here refreshes the blob's age, or stores the blob again as a new file when
+    /// the age cannot be refreshed (`BlobWriter::finish`), and a blob is moved out of the way before its age is
+    /// read again and it is deleted (`remove_if_still_old`), so a blob that a store has just returned is never
+    /// deleted.
     pub fn sweep(&self, keep: &HashSet<String>, min_age: Duration, apply: bool) -> io::Result<SweepReport> {
         let mut report = SweepReport { applied: apply, ..SweepReport::default() };
         let now = SystemTime::now();
@@ -629,11 +630,11 @@ impl BlobWriter {
                 }
             }
             // Refresh the age so a collection running now does not take a blob that is about to be referenced.
-            if let Ok(f) = fs::OpenOptions::new().write(true).open(&dest) {
-                let _ = f.set_modified(SystemTime::now());
-            }
-            // Still here after the refresh: done. Gone: a sweep took it meanwhile, so it is stored again below.
-            if dest.exists() {
+            let refreshed =
+                fs::OpenOptions::new().write(true).open(&dest).and_then(|f| f.set_modified(SystemTime::now())).is_ok();
+            // Still here after the refresh: done. Gone (a sweep took it meanwhile), or its age could not be
+            // refreshed (a read-only file, say): stored again below, as a new file whose age is now.
+            if refreshed && dest.exists() {
                 let _ = fs::remove_file(&self.tmp);
                 return Ok(blob);
             }
@@ -857,6 +858,26 @@ mod tests {
         assert!(tmp_files(&s).is_empty());
         // Already gone (another sweep took it): nothing to do.
         assert!(!s.remove_if_still_old(&b.id.0, DEFAULT_GC_MIN_AGE));
+    }
+
+    #[test]
+    fn storing_bytes_whose_old_blob_cannot_be_refreshed_stores_them_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, s) = store();
+        let b = s.put_bytes(b"pinned\n").unwrap();
+        let path = s.path_of(&b.id.0);
+        let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(7200)).unwrap();
+        drop(f);
+        // Read-only: its age cannot be refreshed through it (unless the tests run as root).
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(s.put_bytes(b"pinned\n").unwrap(), b);
+        // What was returned is a blob that a sweep sees as young, whole, with its index.
+        let r = s.sweep(&HashSet::new(), DEFAULT_GC_MIN_AGE, true).unwrap();
+        assert_eq!((r.kept, r.collected), (1, 0));
+        assert_eq!(s.read_all(&b.id).unwrap(), b"pinned\n");
+        assert_eq!(s.meta(&b.id).unwrap(), b);
+        assert!(tmp_files(&s).is_empty());
     }
 
     fn set(ids: &[&String]) -> HashSet<String> {
