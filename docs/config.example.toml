@@ -5,7 +5,8 @@
 # (`loom down`, then `loom up`) after editing, and check the file first with `loom config check`.
 # Values shown uncommented are the defaults unless a comment says "example".
 
-# The profile a session uses when it names none (and the only profile if there is just one).
+# The profile a session uses when it names none. Example: the default is empty, which means the only
+# profile when there is just one (with several profiles and none named, a session cannot be created).
 default_model = "local"
 
 [daemon]
@@ -90,7 +91,7 @@ child_max_steps = 200      # default step budget for a child spawned without one
 child_max_minutes = 120    # default time budget for a child
 max_nudges = 3             # stop-gate nudges or malformed replies in a row before the session is parked for you
 stall_steps = 30           # steps without a new ledger entry before the harness adds a stall note
-verify_finish = true       # an independent verifier attacks a lead's finish first
+verify_finish = true       # a role with verify_finish has its finish attacked by its verifier first; false skips that for every role (the finish is marked "not verified")
 invalid_calls_before_forcing = 3   # consecutive invalid tool calls before the next request forces a tool call
 unviewed_min_lines = 20    # outputs with at least this many lines never shown are listed in the HUD
 

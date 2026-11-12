@@ -17,15 +17,19 @@ cargo build --release -p loom-daemon
 ```
 
 The binary is `target/release/loom`. Put it on your `PATH`, for example
-`install -m 755 target/release/loom ~/.local/bin/loom`. `loom up` starts the daemon by running the same
-binary again, so do not move or replace it while the daemon runs without restarting the daemon.
+`mkdir -p ~/.local/bin && install -m 755 target/release/loom ~/.local/bin/loom` (with `~/.local/bin` on
+your `PATH`), or `/usr/local/bin`. `loom up` starts the daemon by running the same binary again, so do
+not move or replace it while the daemon runs without restarting the daemon.
 
 `./x` is optional. It copies the tree to another machine and runs cargo there; the machine is named by
 `LOOM_BUILD_HOST` (`LOOM_BUILD_HOST=local ./x ...` runs cargo here) and `LOOM_LANE` picks a separate
-source copy on that host. `./x --pull-bin` builds a release binary there and copies it to `./bin/loom`.
-The desktop app is built with `gui/build.sh`, which also requires `LOOM_BUILD_HOST` (a host, or `local`).
+source copy on that host. Set `LOOM_BUILD_HOST` every time: when it is unset, `./x` does not stop but
+falls back to a host name written into the script, which is not a machine of yours. `./x --pull-bin`
+builds a release binary there and copies it to `./bin/loom`. The desktop app is built with
+`gui/build.sh`, which requires `LOOM_BUILD_HOST` (a host, or `local`) and stops when it is unset.
 
-Tests:
+Tests (the UI test needs Node.js 22.12 or newer: `ui/core.test.js` is an ES module with no
+`package.json` beside it, which older releases may not load):
 
 ```
 cargo test --workspace
@@ -83,11 +87,19 @@ A pack that sets `requires_restricted_network` (`vr` does) is refused while the 
 
 ### Sandbox
 
-With `[sandbox] mode = "seatbelt"` (the default) commands run under a macOS sandbox profile: they can
-write only in the workspace, the session's temp directory and `extra_writable`; `~/.loom` and
-`<workspace>/.loom` are never writable; the loom token and keys and `unreadable_paths` are not
-readable; no network except the egress proxy (plus `loopback_ports`, `loopback_all`, `unix_sockets`);
-no LaunchServices opens, Apple Events or launchd jobs. Other files are readable.
+With `[sandbox] mode = "seatbelt"` (the default) commands run under a macOS sandbox profile:
+
+- they can write only in the workspace, the session's temp directory, `extra_writable`, the system
+  temp locations `/private/tmp` (`/tmp`) and `/private/var/folders` (the per-user temp folders), and
+  the device files `/dev/null`, `/dev/tty` and `/dev/dtracehelper`;
+- `~/.loom`, `<workspace>/.loom` and `protected_paths` are never writable, with one exception: the
+  session's temp directory is `~/.loom/sessions/<id>/tmp`, and everything inside it is writable (the
+  directory entry itself cannot be removed, renamed or replaced);
+- the loom token and keys and `unreadable_paths` are neither readable nor writable;
+- no network except the egress proxy (plus `loopback_ports`, `loopback_all`, `unix_sockets`);
+- no LaunchServices opens, Apple Events or launchd jobs.
+
+Other files are readable.
 
 `protect_credentials = true` (the default) also makes these unreadable and unwritable to commands and
 file tools: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`,
@@ -98,23 +110,27 @@ listed directory that is or contains the workspace is skipped. This needs a home
 `HOME` unset, every session fails to build its sandbox and the message names `HOME` and
 `protect_credentials = false`. Set the key to `false` to turn the protection off.
 
-Environment variables whose names look like secrets (containing `KEY`, `TOKEN`, `SECRET`, `PASSWORD`,
-`CREDENTIAL`, `COOKIE`, ending in `_PAT`, `_DSN` or `_PWD`, `DATABASE_URL`, `SSH_AUTH_SOCK`, anything
-starting `LOOM_`) are not passed to commands unless listed in `env_pass`.
+Environment variables whose names look like secrets (in any case: containing `KEY`, `TOKEN`, `SECRET`,
+`PASSWORD`, `PASSWD`, `CREDENTIAL` or `COOKIE`, ending in `_PAT`, `_DSN` or `_PWD`, `DATABASE_URL`,
+`SSH_AUTH_SOCK`, anything starting `LOOM_`) are not passed to commands unless listed in `env_pass`.
 
 ## Start
 
 ```
 loom up                # start the daemon in the background; log: ~/.loom/logs/loomd.log
 loom daemon            # or run it in the foreground
-loom status            # the daemon, the model it found, what is running, free disk space
+loom status            # the daemon, each model server and whether it answered, what is running, free disk space
 loom down              # stop it; sessions resume when it starts again
 ```
 
 The first start creates `~/.loom/token` (the API token, mode 0600). `LOOM_LOG` sets the log level
-(default `info`). A
-second daemon on the same home is refused. `loom status` prints the free space on the volume of the
-loom home and warns when it is under 5 GiB or 5 percent.
+(default `info`). A second daemon on the same home is refused.
+
+`loom status` marks each model server with ✓ or ✗ (whether it answered a request for its models just
+now). The model and window it prints come from the config until a session of that profile has been
+created since the daemon started (`window unknown` when `context_window` is not set); from then on
+they are the model id the server serves and the window it reported. It also prints the free space on
+the volume of the loom home and warns when it is under 5 GiB or 5 percent.
 
 On macOS `loom service install` makes the daemon a login service (a LaunchAgent) and
 `loom service uninstall` removes it; `loom service status` says whether it is loaded.
@@ -142,7 +158,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | command | does |
 |---|---|
 | `loom daemon` / `up` / `down` | run the daemon in the foreground / in the background / stop it |
-| `loom status` | the daemon, the model, counts, free disk space |
+| `loom status` | the daemon, each model server and whether it answered, counts, free disk space |
 | `loom open [--print]` | open the web UI in the browser (`--print` prints the address instead) |
 | `loom run [options] <task...>` | start a session and follow it; `-d` starts it and returns |
 | `loom chat [options]` | turn-by-turn `chat` session; `--session <id>` continues one; `/quit` leaves |
@@ -234,6 +250,8 @@ has `verify_finish` has its `finish` checked by the verifier. If the verifier re
 finishes a third time, or the verifier cannot be run, the answer is not delivered as finished: you get
 a blocking inbox item whose answer is labelled `NOT VERIFIED`, and the next `finish` after you answer is
 verified again. `finish` is also refused while the session has running jobs or running agents.
+`[agents] verify_finish = false` in the config turns verification off for every role: the finish is
+then delivered at once, marked `not verified`.
 
 ## Files
 
@@ -245,11 +263,12 @@ to a path outside the home.
 
 ## First run checklist
 
-1. `loom config check` prints `ok`, then `loom up`, then `loom status` shows the model and a non-zero
-   context window discovered from the server.
+1. `loom config check` prints `ok`, then `loom up`, then `loom status` shows ✓ beside your server's
+   URL (it answered a request for its models).
 2. `loom run -w <a tiny workspace> "how many .rs files are here and how many lines in total?"` (or a
    question about your own files). Confirm: the lead calls `bash`, the result carries the
    `[tool · exit 0 · … · out:…]` header, the lead records a claim with a quote that matches, `finish`
-   passes the verifier, and `loom ledger last` shows the goal and the claim.
+   passes the verifier, and `loom ledger last` shows the goal and the claim. Now `loom status` shows
+   the model id the server serves and the window it reported (or the `context_window` you set).
 3. `loom window last`: the stable prefix is the system prompt, your message and the turns; the
    `<harness-state>` block is not part of it.

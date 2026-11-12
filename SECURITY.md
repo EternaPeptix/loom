@@ -33,7 +33,9 @@ harness's.
   storage. The token is never put on a command line or in a URL.
 - Before the `loom` command or the desktop app sends the token to a listener, the listener must prove it
   holds the token (an HMAC answer on `/healthz`). A different program on the daemon's port cannot
-  collect the token this way.
+  collect the token this way. The exception is the global flag `--unverified-daemon`: with it, the
+  `loom` command sends the token to a listener that gave no proof (it prints a warning). It exists only
+  to stop a daemon from a version that cannot give the proof; do not use it otherwise.
 - To use a daemon on another machine, forward its port over SSH. Do not change the bind address to a
   non-loopback one; the daemon will not accept it.
 
@@ -42,9 +44,13 @@ harness's.
 On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `sandbox-exec`:
 
 - **Writes** are allowed only in the session's workspace, the session's temporary directory, the
-  system temporary locations and any `extra_writable` directories. `~/.loom` (including the token, keys,
-  logs and every session record) and `<workspace>/.loom` are never writable, and a directory that holds
-  a protected path cannot be renamed or removed.
+  system temporary locations (`/private/tmp` and `/private/var/folders`), any `extra_writable`
+  directories, and the device files `/dev/null`, `/dev/tty` and `/dev/dtracehelper`. `~/.loom`
+  (including the token, keys, logs and every session record), `<workspace>/.loom` and your
+  `protected_paths` are never writable, with one exception: the session's temporary directory lies in
+  `~/.loom` (`sessions/<id>/tmp`), and everything inside it is writable, though the directory entry
+  itself cannot be removed, renamed or replaced. A directory that holds a protected path cannot be
+  renamed or removed.
 - **Credential stores are unreadable and unwritable** by default (`protect_credentials = true`): `~/.ssh`,
   `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`,
   `~/.docker/config.json`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, cargo and git credential files, password
@@ -98,6 +104,16 @@ These are the places where loom does less than the text above might suggest.
   like one is passed through. `env_pass` passes more.
 - **Network policy is per daemon, not per session**, and is read at start. In `allowlist` mode a
   listed host can be used by every session. Data can be sent to an allowed host.
+- **A network-specific NAT64 prefix is an ordinary IPv6 prefix to the proxy.** The proxy looks through
+  the well-known NAT64 prefix `64:ff9b::/96` (and `64:ff9b:1::/96`) to the IPv4 address it carries, but
+  not through a prefix your network chose for itself. Listing such a prefix in `allow_private` admits
+  every IPv4 address behind it, private ones included, and IPv4 `deny` entries do not cover addresses
+  inside it.
+- **A missing holder directory can still be moved into place.** A writable directory that holds a
+  protected or unreadable path cannot be removed, renamed or made as a link. If it does not exist yet,
+  a command can still create it by moving another directory into its place, and a link already inside
+  that moved directory then decides where a file written below it later, by something outside the
+  sandbox, lands.
 - **A command can talk to anything on loopback that you allow** (`loopback_ports`, `loopback_all`,
   `unix_sockets`), including services that run as you.
 - **Tamper evidence has gaps.** Deleting a session's records together with their directory, deleting a

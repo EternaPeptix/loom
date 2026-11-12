@@ -50,7 +50,7 @@ cargo build --release -p loom-daemon                  # the `loom` binary
 cargo test --workspace                                # everything
 cargo test -p loom-tools sandbox::                    # one crate, one module
 cargo clippy --workspace --all-targets -- -D warnings # must be clean
-node --test ui/core.test.js                           # the web UI's logic
+node --test ui/core.test.js                           # the web UI's logic (Node.js 22.12 or newer)
 ```
 
 Tests live next to the code in `#[cfg(test)] mod tests` blocks; `crates/loom-model/examples/live.rs` is a
@@ -64,8 +64,10 @@ manual check against a real server. Rules for tests:
 
 `./x` is an optional wrapper that copies the tree to another machine and runs cargo there, for when you
 would rather not build on your own. It runs `cargo` with the arguments you give it, on the host named
-by `LOOM_BUILD_HOST` (set it to `local` to run cargo in place). `LOOM_LANE=<name>` gives your builds a
-separate source copy and target directory on that host so parallel work does not wait on a lock:
+by `LOOM_BUILD_HOST` (set it to `local` to run cargo in place). Always set `LOOM_BUILD_HOST`: when it is
+unset, `./x` does not stop but falls back to a host name written into the script, which is not a
+machine you have. `LOOM_LANE=<name>` gives your builds a separate source copy and target directory on
+that host so parallel work does not wait on a lock:
 
 ```
 LOOM_BUILD_HOST=<host> LOOM_LANE=<lane> ./x test -p <crate> <module>::
@@ -73,7 +75,7 @@ LOOM_BUILD_HOST=<host> LOOM_LANE=<lane> ./x clippy --workspace --all-targets -- 
 ```
 
 The lane name may contain letters, digits, `-` and `_` only. `gui/build.sh` builds the desktop app the
-same way and also requires `LOOM_BUILD_HOST`.
+same way; it requires `LOOM_BUILD_HOST` and stops with a message when it is unset.
 
 ## Committing
 

@@ -12,19 +12,29 @@ upgrade" first; the rest says what behaves differently.
    Requests to your model server are not affected. To keep the old behaviour, set
    `[network] mode = "open"`; to reach only some hosts, set `mode = "allowlist"` and list them in
    `allow`. The `vr` pack refuses to run when the mode is `open`.
+
+   **Check your existing config file.** The new default applies only where the file does not set the
+   mode. A `~/.loom/config.toml` written by the first version's `loom config init` says
+   `mode = "open"` under `[network]`, so after upgrading its network is still open and `vr` sessions are
+   refused. Change that line to `mode = "deny_all"` (or `"allowlist"` with an `allow` list) to get the
+   new default and to run the `vr` pack, then restart the daemon.
 2. **Credential directories are unreadable to commands by default.** `~/.ssh`, `~/.aws`, `~/.gnupg`,
    `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`, `~/.docker/config.json`, `~/.netrc`, `~/.npmrc`,
    `~/.pypirc`, cargo and git credential files, `~/.password-store`, `~/.config/op`, the Keychains and
    Cookies folders and the Chrome, Firefox and Safari profiles can no longer be read or written by
-   commands or the file tools. If a workflow needs one of them (a `git push` over SSH, for example), set
-   `[sandbox] protect_credentials = false`, or run that step yourself. A listed directory that is or
-   contains the workspace stays readable. The key needs a home directory: with `HOME` unset, sessions
-   fail with a message that names it.
-3. **Replace installed packs.** Pack loading is stricter: unknown keys are errors, a role whose
-   `finish` is verified must have a verifier role of the same pack that is read-only and has `verdict`
-   and `out_read` or `out_grep`, and the researcher in `vr` now says `verifier = "judge"`. A copy of a
-   shipped pack in `~/.loom/packs` (for example `~/.loom/packs/vr`) from the first version no longer
-   loads, and the daemon refuses to start with it. Replace it with the shipped one:
+   commands or the file tools. If a workflow needs one of them (a package manager that reads a registry
+   token from `~/.npmrc`, or a tool that reads `~/.netrc`, to reach a host your `[network]` policy allows
+   through the proxy, for example), set `[sandbox] protect_credentials = false`, or run that step
+   yourself. Turning the key off does not by itself make a `git push` over SSH work: commands reach the
+   network only through the egress proxy, which `ssh` does not use on its own, and `SSH_AUTH_SOCK` is
+   not passed to them. A listed directory that is or contains the workspace stays readable. The key
+   needs a home directory: with `HOME` unset, sessions fail with a message that names it.
+3. **Replace installed packs.** Pack loading is stricter: a role whose `finish` is verified must have a
+   verifier role of the same pack that is read-only and has `verdict` and `out_read` or `out_grep`
+   (unknown keys were already errors and still are), and the researcher in `vr` now says
+   `verifier = "judge"`. A copy of a shipped pack in `~/.loom/packs` (for example `~/.loom/packs/vr`)
+   from the first version no longer loads, and the daemon refuses to start with it. Replace it with
+   the shipped one:
    `rm -rf ~/.loom/packs/vr && cp -R packs/vr ~/.loom/packs/vr`. Prompts changed too, and a session
    keeps the system text it started with, so only new sessions get them.
 4. **Restart the old daemon, then rebuild the desktop app.** The daemon now proves it holds the token
@@ -49,15 +59,19 @@ upgrade" first; the rest says what behaves differently.
    streaming. Records, their order and what the model sees are the same except timings, the ids of
    calls started early, and an `early_ms` entry in a result's metadata. Set `speculate = false` to
    turn it off.
-8. **`LOOM_BUILD_HOST` is required by `gui/build.sh`** (a host, or `local`); it has no default host. Set
-   it explicitly for `./x` too; `./x` is optional and `cargo build --release -p loom-daemon` is the
-   normal way to build. `./x` reads `LOOM_LANE` for separate build copies.
+8. **`LOOM_BUILD_HOST` is required by `gui/build.sh`** (a host, or `local`); it has no default host and
+   the script stops when it is unset. Set it every time you run `./x` too: `./x` does not stop when it
+   is unset but falls back to a host name written into the script, which is not a machine of yours.
+   `./x` is optional and `cargo build --release -p loom-daemon` is the normal way to build. `./x` reads
+   `LOOM_LANE` for separate build copies.
 9. **On non-macOS systems the daemon refuses to start** unless `[sandbox] mode = "none"`, because the
    OS sandbox exists only on macOS. That mode leaves commands unconfined.
-10. **Sessions and journals from a newer loom cannot be opened by an older one**: a session log with
-    a newer `schema`, or a journal with an operation the older loom does not know, is refused with a
-    sentence telling you to upgrade. Reading and the UI still work. Do not go back to the first version
-    on a home that the new one has used for new sessions.
+10. **Going back to the first version is unsafe.** This version and later ones refuse to add to a
+    session log that has a newer `schema` or records they cannot read, or to a mission journal with an
+    operation they do not know, with a sentence telling you to upgrade; reading such a session still
+    works. The first version has no such check: it keeps adding to a session log whose records it
+    cannot read, and it reports a journal entry it cannot read as tampering. Do not go back to it on a
+    home that this version has used.
 
 ### New commands and options
 
@@ -93,8 +107,8 @@ upgrade" first; the rest says what behaves differently.
 
 - Commands cannot write to credential stores, the temp directory entry cannot be removed or replaced,
   and LaunchServices opens, Apple Events and launchd jobs are denied. More environment variables are
-  withheld (names ending `_PAT`, `_DSN`, `_PWD`, `DATABASE_URL`, `SSH_AUTH_SOCK`, names containing
-  `AUTH_TOKEN`, `COOKIE`, `SESSION_KEY`). Path rules that refuse ignore case on macOS.
+  withheld (names ending `_PAT`, `_DSN` or `_PWD`, `DATABASE_URL`, `SSH_AUTH_SOCK`, and names
+  containing `COOKIE`). Path rules that refuse ignore case on macOS.
 - A command is over only when its whole process group is empty. A command whose leader exits while
   others run returns at once with the output so far and a job id. Exit codes above 128 are reported as
   exit codes with a note that 128+N usually means signal N. A command whose output passes

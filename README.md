@@ -36,14 +36,20 @@ It inverts the cloud assumptions:
 
 ```
 cargo build --release -p loom-daemon      # the binary is target/release/loom
-install -m 755 target/release/loom ~/.local/bin/loom     # any directory on your PATH
+mkdir -p ~/.local/bin                     # or use any other directory on your PATH
+install -m 755 target/release/loom ~/.local/bin/loom
 loom config init                          # writes ~/.loom/config.toml
 $EDITOR ~/.loom/config.toml               # set base_url and model for your server
 loom config check                         # prints "ok", or what is wrong
 loom up                                   # start the daemon in the background
-loom status                               # the daemon, the model it found, what is running
+loom status                               # the daemon, ✓ or ✗ for your model server, what is running
 loom run -w /path/to/workspace "your task in one sentence"
 ```
+
+`~/.local/bin` must be on your `PATH` (add `export PATH="$HOME/.local/bin:$PATH"` to your shell's
+startup file if it is not). Until a session has been created since the daemon started, `loom status`
+shows the model and window written in the config; after that, the model id the server serves and the
+window it reported.
 
 The daemon reads the config file only when it starts, so write and edit the config before `loom up`,
 and run `loom down` then `loom up` after changing it. `loom up` starts the program it was run from,
@@ -190,7 +196,7 @@ mission needs you. See `gui/README.md`.
 ## Packs
 
 A pack is a set of roles. `core` (built in) is general. `vr` (`packs/vr/`) is a vulnerability-research
-pipeline (scope gate, evidence tiers, a judge that attacks every finish, a report-readiness gate)
+pipeline (scope gate, evidence tiers, a judge that attacks the researcher's finish, a report-readiness gate)
 expressed as roles, ledger records and the harness's own checks. It is not installed by default; see
 `packs/vr/README.md`.
 
@@ -200,12 +206,14 @@ expressed as roles, ledger records and the harness's own checks. It is not insta
 cargo build --release -p loom-daemon      # the `loom` binary, target/release/loom
 cargo test --workspace                    # the Rust suite
 cargo clippy --workspace --all-targets -- -D warnings
-node --test ui/core.test.js               # the web UI's logic
+node --test ui/core.test.js               # the web UI's logic; needs Node.js 22.12 or newer
 ```
 
 `./x` is an optional wrapper that runs cargo on another machine named by `LOOM_BUILD_HOST` (and
-`LOOM_BUILD_HOST=local` runs it here); you do not need it. The desktop app builds with
-`gui/build.sh`, which also needs `LOOM_BUILD_HOST`. `docs/IMPLEMENTING.md` is the contributor guide.
+`LOOM_BUILD_HOST=local` runs it here); you do not need it. Set `LOOM_BUILD_HOST` whenever you use it:
+when it is unset, `./x` falls back to a host name written into the script instead of stopping. The
+desktop app builds with `gui/build.sh`, which requires `LOOM_BUILD_HOST`. `docs/IMPLEMENTING.md` is
+the contributor guide.
 
 ## Reporting a vulnerability
 

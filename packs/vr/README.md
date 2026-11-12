@@ -18,8 +18,10 @@ Start one with:
 
 ```
 loom run --pack vr --role researcher -w <workspace> "…the engagement…"
-loom chat --pack vr -w <workspace>            # interactive; uses the pack's default role unless --role
+loom chat --pack vr -w <workspace>            # interactive; starts the pack's read-only `chat` role unless --role names another
 ```
+
+`loom run --pack vr` without `--role` starts the pack's default role, `researcher`.
 
 ## Network policy
 
@@ -48,7 +50,9 @@ link-local addresses are refused unless `allow_private` lists them. Every decisi
   judge accepts it. A finding is attacked by an agent that did not produce it, and the finish gate is
   mechanical (nothing open) before it is adversarial (the judge tries to refute). If the judge rejects
   the finish twice and the researcher finishes a third time, or the judge cannot be run, the answer
-  reaches you as a blocking inbox item labelled `NOT VERIFIED`.
+  reaches you as a blocking inbox item labelled `NOT VERIFIED`. `[agents] verify_finish = false` in the
+  config turns this off for every pack: the researcher's finish is then delivered at once, marked
+  `not verified`.
 - **Pipeline: candidate, validated, assessed, ready.** Plan steps and claim statuses. Evidence is
   `execution` or `static`; the prompts forbid a `static`-only finding, so "reading the code again is not
   validation" is a rule the roles are told and the ledger records.
