@@ -236,15 +236,22 @@ impl ApiError {
         ApiError::new(StatusCode::NOT_FOUND, format!("There is no stored output {handle}."))
     }
 
+    /// `candidates` holds at most `BLOB_CANDIDATES + 1` ids; the extra one only says there are more than are listed.
     fn ambiguous_blob(handle: &str, candidates: &[loom_core::BlobId]) -> ApiError {
-        let ids: Vec<String> = candidates.iter().map(|c| c.as_str().chars().take(16).collect()).collect();
+        let listed = &candidates[..candidates.len().min(BLOB_CANDIDATES)];
+        // Long enough to tell the listed ones apart: past what they share, and never under the usual 16.
+        let shared = listed
+            .iter()
+            .skip(1)
+            .map(|c| c.as_str().bytes().zip(listed[0].as_str().bytes()).take_while(|(a, b)| a == b).count())
+            .min()
+            .unwrap_or(0);
+        let width = (shared + 4).clamp(16, 64);
+        let ids: Vec<String> = listed.iter().map(|c| c.as_str().chars().take(width).collect()).collect();
+        let count = if candidates.len() > BLOB_CANDIDATES { "several".to_string() } else { listed.len().to_string() };
         ApiError::new(
             StatusCode::CONFLICT,
-            format!(
-                "The handle {handle} matches {} stored outputs ({}). Give more of the id.",
-                if candidates.len() >= BLOB_CANDIDATES { "several".to_string() } else { candidates.len().to_string() },
-                ids.join(", ")
-            ),
+            format!("The handle {handle} matches {count} stored outputs ({}). Give more of the id.", ids.join(", ")),
         )
     }
 
@@ -319,7 +326,7 @@ const BLOB_CANDIDATES: usize = 5;
 /// The stored output a handle means; an ambiguous handle is a 409 that lists the candidates, anything else 404.
 fn resolve_blob(blobs: &loom_core::blob::BlobStore, handle: &str) -> Res<loom_core::BlobId> {
     blobs.resolve(handle).map_err(|_| {
-        let candidates = blobs.candidates(handle, BLOB_CANDIDATES);
+        let candidates = blobs.candidates(handle, BLOB_CANDIDATES + 1);
         if candidates.len() > 1 {
             ApiError::ambiguous_blob(handle, &candidates)
         } else {
@@ -2050,6 +2057,29 @@ mod tests {
         // A prefix that names none is still a 404.
         let (s, _) = e.get("/api/blobs/abcdef99").await;
         assert_eq!(s, 404);
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_long_handle_lists_candidates_that_differ_and_several_means_more_than_listed() {
+        let e = env(Script::new(|_, _| finish("x"))).await;
+        let root = e.rt.blobs().root().join("cd");
+        std::fs::create_dir_all(&root).unwrap();
+        // Ids that share their first 20 characters: a 16-character shortening would show the same string.
+        let id = |n: usize| format!("cd{}{n:02}{}", "7".repeat(18), "0".repeat(42));
+        for n in 0..BLOB_CANDIDATES {
+            std::fs::write(root.join(id(n)), b"x\n").unwrap();
+        }
+        let handle = &id(0)[..20];
+        let (s, b) = e.get(&format!("/api/blobs/{handle}")).await;
+        let text = b["error"].as_str().unwrap();
+        assert_eq!(s, 409, "{text}");
+        assert!(text.contains(&format!("matches {BLOB_CANDIDATES} stored outputs")), "{text}");
+        for n in 0..BLOB_CANDIDATES {
+            assert!(text.contains(&id(n)[..22]), "{text}");
+        }
+        std::fs::write(root.join(id(BLOB_CANDIDATES)), b"x\n").unwrap();
+        let (_, b) = e.get(&format!("/api/blobs/{handle}")).await;
+        assert!(b["error"].as_str().unwrap().contains("matches several stored outputs"), "{b}");
     }
 
     #[tokio::test]

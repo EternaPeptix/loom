@@ -124,29 +124,6 @@ pub fn token_matches(expected: &str, presented: &str) -> bool {
     std::hint::black_box(diff) == 0
 }
 
-/// The domain prefix of an identity proof (`GET /healthz?nonce=`): the proof is bound to this use of the token.
-const HEALTHZ_PROOF_PREFIX: &str = "loom-healthz-v1:";
-
-/// A nonce is 32 to 128 hexadecimal characters.
-pub fn valid_nonce(nonce: &str) -> bool {
-    (32..=128).contains(&nonce.len()) && nonce.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-/// `hex(HMAC-SHA256(key = token bytes, "loom-healthz-v1:" + nonce))`: what a daemon that holds the token answers to
-/// `GET /healthz?nonce=<nonce>`. `None` only when the key cannot be used.
-pub fn healthz_proof(token: &str, nonce: &str) -> Option<String> {
-    use hmac::{Hmac, Mac};
-    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(token.as_bytes()).ok()?;
-    mac.update(HEALTHZ_PROOF_PREFIX.as_bytes());
-    mac.update(nonce.as_bytes());
-    Some(hex::encode(mac.finalize().into_bytes()))
-}
-
-/// True when `proof` is the proof of `nonce` for `token` (compared without an early exit).
-pub fn healthz_proof_ok(token: &str, nonce: &str, proof: &str) -> bool {
-    healthz_proof(token, nonce).is_some_and(|expected| token_matches(&expected, proof))
-}
-
 /// True when `authority` (a `Host` header value, or the part of an `Origin` after `http://`) is
 /// exactly one of the three loopback spellings with this port.
 fn authority_allowed(authority: &str, port: u16) -> bool {
@@ -247,6 +224,29 @@ impl Logins {
         }
         ok
     }
+}
+
+/// The domain prefix of an identity proof (`GET /healthz?nonce=`): the proof is bound to this use of the token.
+const HEALTHZ_PROOF_PREFIX: &str = "loom-healthz-v1:";
+
+/// A nonce is 32 to 128 hexadecimal characters.
+pub fn valid_nonce(nonce: &str) -> bool {
+    (32..=128).contains(&nonce.len()) && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `hex(HMAC-SHA256(key = token bytes, "loom-healthz-v1:" + nonce))`: what a daemon that holds the token answers to
+/// `GET /healthz?nonce=<nonce>`. `None` only when the key cannot be used.
+pub fn healthz_proof(token: &str, nonce: &str) -> Option<String> {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(token.as_bytes()).ok()?;
+    mac.update(HEALTHZ_PROOF_PREFIX.as_bytes());
+    mac.update(nonce.as_bytes());
+    Some(hex::encode(mac.finalize().into_bytes()))
+}
+
+/// True when `proof` is the proof of `nonce` for `token` (compared without an early exit).
+pub fn healthz_proof_ok(token: &str, nonce: &str, proof: &str) -> bool {
+    healthz_proof(token, nonce).is_some_and(|expected| token_matches(&expected, proof))
 }
 
 #[cfg(test)]

@@ -2065,7 +2065,6 @@ impl Runtime {
         inner.st().tasks.push(forwarder);
 
         inner.load_known();
-        inner.clear_crash_leftovers().await;
         let mut restored: Vec<SessionId> = Vec::new();
         // The flag marks a session that is wanted only if a job of its was lost (its turn yielded
         // while the job ran, and the job's end would have started the next one).
@@ -2088,6 +2087,8 @@ impl Runtime {
             .filter(|(id, for_a_job)| !for_a_job || inner.has_unsettled_job(id))
             .map(|(id, _)| id)
             .collect();
+        // After the candidates are chosen: the sweep removes the records `has_unsettled_job` looks for.
+        inner.clear_crash_leftovers().await;
         let mut cut: HashSet<SessionId> = HashSet::new();
         let mut woken: HashSet<SessionId> = HashSet::new();
         for id in wanted {
@@ -2109,8 +2110,9 @@ impl Runtime {
                 }
             }
         }
-        inner.renotify_open_blocking();
         let recovered = inner.recover_settlements();
+        // After the settlements: delivering one activates a parent, which restores its open items too.
+        inner.renotify_open_blocking();
         // The sessions told to carry on (parents come before their children).
         let mut going: HashSet<SessionId> = HashSet::new();
         for id in restored {
@@ -3900,6 +3902,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_item_the_harness_opened_is_notified_without_the_label() {
+        let out = tempfile::tempdir().unwrap();
+        let file = out.path().join("n.txt");
+        // A lead that never ends its turn explicitly is nudged and then parked by the harness.
+        let e = env_with(Script::new(|_, _| Action::Reply(Reply::text("hm"))), false, |c| {
+            text_logging_notify(&file)(c);
+            c.agents.max_nudges = 1;
+        })
+        .await;
+        e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        until("notification", || !lines_of(&file).is_empty()).await;
+        let lines = lines_of(&file);
+        assert!(lines[0].starts_with("parked|") && !lines[0].contains("[From the agent"), "{lines:?}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_restart_notifies_a_restored_blocking_item_once_and_arms_its_repeat() {
         let out = tempfile::tempdir().unwrap();
         let file = out.path().join("n.txt");
@@ -4092,6 +4111,41 @@ mod tests {
         assert!(lost.is_some() && lost < turn, "lost at {lost:?}, resumed at {turn:?}");
         let last = e.server.requests().pop().unwrap();
         assert!(mentions(&last, &texts::job_lost("j1", "sleep 600")));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_crash_left_record_does_not_stop_the_restart_of_a_session_that_yielded_while_its_job_ran() {
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let e = env(Script::new(move |body, _| {
+            if flag.load(Ordering::SeqCst) {
+                Action::Reply(Reply::text("noted"))
+            } else if tool_msgs(body) == 0 {
+                call("bash", json!({"command": "sleep 600", "background": true}))
+            } else {
+                Action::Reply(Reply::text("it is running; I will look at it when it ends"))
+            }
+        }))
+        .await;
+        let mut chat = e.new_session(Some("start a job"));
+        chat.role = Some("chat".into());
+        let id = e.rt.create_session(chat).await.unwrap().meta.id;
+        until("yielded", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Yielded }))).await;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        e.rt.shutdown().await;
+        // A crash, not a graceful shutdown, leaves the command's pid record behind, owned by another daemon.
+        let jobs = e.rt.paths().session_dir(&id).join("jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        std::fs::write(jobs.join("j1.pid"), "999999 1\nowner 1 1.000000\n").unwrap();
+        let before = e.server.requests().len();
+        after.store(true, Ordering::SeqCst);
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        until("a turn after the restart", || e.server.requests().len() > before).await;
+        let rs = rt2.records(&id, None, 2_000).unwrap();
+        assert!(rs.iter().any(|r| matches!(&r.event, Event::JobSettled { detail, .. } if detail == texts::JOB_LOST_DETAIL)));
+        assert!(mentions(&e.server.requests().pop().unwrap(), &texts::job_lost("j1", "sleep 600")));
+        assert!(!jobs.join("j1.pid").exists());
         rt2.shutdown().await;
     }
 

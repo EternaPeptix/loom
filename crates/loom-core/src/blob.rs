@@ -274,10 +274,9 @@ impl BlobStore {
 
     /// Resolve a full id or an unambiguous prefix (the handle carries 16 chars). `out:` is accepted.
     pub fn resolve(&self, handle: &str) -> io::Result<BlobId> {
-        let id = handle.trim().strip_prefix("out:").unwrap_or(handle.trim()).to_ascii_lowercase();
-        if id.len() < MIN_HANDLE_LEN || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let Some(id) = handle_prefix(handle) else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("not an output handle: {handle}")));
-        }
+        };
         if id.len() == 64 {
             return if self.path_of(&id).exists() { Ok(BlobId(id)) } else { Err(not_found(handle)) };
         }
@@ -300,10 +299,7 @@ impl BlobStore {
     /// The stored outputs a handle (full id or prefix, `out:` accepted) could mean, sorted; at most `limit`.
     /// More than one means `resolve` refused the handle as ambiguous.
     pub fn candidates(&self, handle: &str, limit: usize) -> Vec<BlobId> {
-        let id = handle.trim().strip_prefix("out:").unwrap_or(handle.trim()).to_ascii_lowercase();
-        if id.len() < MIN_HANDLE_LEN || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Vec::new();
-        }
+        let Some(id) = handle_prefix(handle) else { return Vec::new() };
         let mut found: Vec<String> = Vec::new();
         if let Ok(entries) = fs::read_dir(self.root.join(&id[..2])) {
             for entry in entries.flatten() {
@@ -582,6 +578,12 @@ fn index_matches(blob: &Path, offsets: &[u64], size: u64) -> io::Result<bool> {
         reader.consume(n);
     }
     Ok(newlines == 0 || (newlines == 1 && final_byte == b'\n'))
+}
+
+/// The lowercase hex a handle (`out:` accepted) stands for, when it is long enough to be one.
+fn handle_prefix(handle: &str) -> Option<String> {
+    let id = handle.trim().strip_prefix("out:").unwrap_or(handle.trim()).to_ascii_lowercase();
+    (id.len() >= MIN_HANDLE_LEN && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id)
 }
 
 fn not_found(handle: &str) -> io::Error {

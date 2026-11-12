@@ -79,6 +79,29 @@ pub(crate) fn unverified_daemon_allowed() -> bool {
     UNVERIFIED_DAEMON.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// What the operator is told when a listener on `bind` does not prove it is this home's daemon.
+pub(crate) fn unproven_message(bind: &str) -> String {
+    format!(
+        "Something is listening on {bind} but it did not prove it is this home's loom daemon, so the access token was not sent. If the daemon is older than this `loom`, restart it with `loom --unverified-daemon down` and then `loom up`; otherwise find what holds the port. To carry on without the proof, add --unverified-daemon."
+    )
+}
+
+/// The warning line printed when `--unverified-daemon` lets the token go to a listener that did not prove itself.
+pub(crate) fn unverified_warning(bind: &str) -> String {
+    format!("loom: warning: the listener on {bind} did not prove it is this home's loom daemon; sending the access token anyway (--unverified-daemon).")
+}
+
+/// Print [`unverified_warning`] (tests also collect it).
+pub(crate) fn warn_unverified(bind: &str) {
+    let line = unverified_warning(bind);
+    let _ = writeln!(std::io::stderr(), "{line}");
+    #[cfg(test)]
+    WARNINGS.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+}
+
+#[cfg(test)]
+pub(crate) static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// Ask the listener at `base` to prove it holds `token`: a fresh nonce to `/healthz?nonce=`, the answer's `proof`
 /// compared in constant time. `Ok(false)` when it answers without a right proof; `Err` when it cannot be reached.
 /// The token itself is never sent.
@@ -110,8 +133,9 @@ pub struct Client {
     verify: bool,
     /// Carry on when it does not (`--unverified-daemon`), with a warning.
     allow_unverified: bool,
-    /// Filled once the listener has been accepted; shared by clones.
-    proven: std::sync::Arc<tokio::sync::OnceCell<()>>,
+    /// Set once the listener has been accepted, cleared when the connection to it is lost (a request or a stream
+    /// failed), so the next request proves it again; shared by clones and streams.
+    proven: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// An open event stream.
@@ -119,6 +143,8 @@ pub struct EventStream {
     response: reqwest::Response,
     parser: loom_model::assemble::SseParser,
     ready: std::collections::VecDeque<BusEvent>,
+    /// The client's proven flag; cleared when this stream ends or breaks.
+    proven: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Longest silence tolerated between two chunks.
     idle: Duration,
     /// The stream ended or broke; nothing more will come.
@@ -146,10 +172,12 @@ impl EventStream {
                 }
                 Ok(Ok(None)) => {
                     self.done = true;
+                    self.proven.store(false, std::sync::atomic::Ordering::SeqCst);
                     return None;
                 }
                 Ok(Err(_)) | Err(_) => {
                     self.done = true;
+                    self.proven.store(false, std::sync::atomic::Ordering::SeqCst);
                     return Some(Err(LOST.to_string()));
                 }
             }
@@ -214,6 +242,10 @@ impl Client {
     }
 
     pub fn from_home(paths: &Paths) -> Result<Client, String> {
+        Client::from_home_allowing(paths, unverified_daemon_allowed())
+    }
+
+    fn from_home_allowing(paths: &Paths, allow_unverified: bool) -> Result<Client, String> {
         let bind = bind_from_home(paths)?;
         let token_file = paths.token_file();
         let token = match std::fs::read_to_string(&token_file) {
@@ -227,34 +259,25 @@ impl Client {
             Err(e) => return Err(format!("Cannot read the access token at {}: {e}.", token_file.display())),
         };
         let client = Client::new(&format!("http://{bind}"), &token).verifying();
-        Ok(if unverified_daemon_allowed() { client.allowing_unverified() } else { client })
+        Ok(if allow_unverified { client.allowing_unverified() } else { client })
     }
 
-    /// Before the first request of this process that would carry the token: the listener must prove it holds it.
+    /// Before a request that would carry the token, unless the listener already proved itself on a connection that
+    /// has not been lost since: the listener must prove it holds the token.
     async fn ensure_proven(&self) -> Result<(), String> {
-        if !self.verify {
+        use std::sync::atomic::Ordering;
+        if !self.verify || self.proven.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.proven
-            .get_or_try_init(|| async {
-                let bind = self.base.strip_prefix("http://").unwrap_or(&self.base);
-                match daemon_proves_identity(&self.http, &self.base, &self.token, CONNECT_TIMEOUT).await {
-                    Ok(true) => Ok(()),
-                    Ok(false) if self.allow_unverified => {
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "loom: warning: the listener on {bind} did not prove it is this home's loom daemon; sending the access token anyway (--unverified-daemon)."
-                        );
-                        Ok(())
-                    }
-                    Ok(false) => Err(format!(
-                        "Something is listening on {bind} but it did not prove it is this home's loom daemon, so the access token was not sent. If the daemon is older than this `loom`, restart it with `loom --unverified-daemon down` and then `loom up`; otherwise find what holds the port. To carry on without the proof, add --unverified-daemon."
-                    )),
-                    Err(e) => Err(self.transport_error(&Method::GET, "/healthz", e)),
-                }
-            })
-            .await
-            .map(|_| ())
+        let bind = self.base.strip_prefix("http://").unwrap_or(&self.base);
+        match daemon_proves_identity(&self.http, &self.base, &self.token, CONNECT_TIMEOUT).await {
+            Ok(true) => {}
+            Ok(false) if self.allow_unverified => warn_unverified(bind),
+            Ok(false) => return Err(unproven_message(bind)),
+            Err(e) => return Err(self.transport_error(&Method::GET, "/healthz", e)),
+        }
+        self.proven.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     /// `http://127.0.0.1:7878`.
@@ -272,6 +295,8 @@ impl Client {
     }
 
     fn transport_error(&self, method: &Method, path: &str, e: reqwest::Error) -> String {
+        // Whatever answers next has to prove itself again before it is sent the token.
+        self.proven.store(false, std::sync::atomic::Ordering::SeqCst);
         let e = e.without_url();
         if e.is_connect() {
             self.not_running()
@@ -501,6 +526,7 @@ impl Client {
             response,
             parser: loom_model::assemble::SseParser::new(),
             ready: std::collections::VecDeque::new(),
+            proven: self.proven.clone(),
             idle: STREAM_IDLE,
             done: false,
         })
@@ -783,6 +809,7 @@ mod tests {
     use super::testkit::*;
     use super::*;
     use crate::wire::ErrorBody;
+    use std::sync::{Arc, Mutex};
     use loom_agent::runtime::ModelHealth;
     use loom_core::BlobId;
 
@@ -1073,9 +1100,12 @@ mod tests {
         let status_ok = json(&status_view());
         let (client, shared) =
             start(Script::default().route("GET", "/healthz", 200, "ok").route("GET", "/api/status", 200, status_ok.clone())).await;
+        let bind = client.base().trim_start_matches("http://").to_string();
         let client = client.verifying().allowing_unverified();
         client.status().await.unwrap();
         assert_eq!(auth_headers_seen(&shared), vec![None, Some("Bearer tok-123".to_string())]);
+        let warnings = WARNINGS.lock().unwrap().clone();
+        assert!(warnings.contains(&unverified_warning(&bind)), "{warnings:?}");
 
         // A correct proof: one check for the first request, none for the later ones, and the token goes along.
         let script = Script::default().healthz_key("tok-123").route("GET", "/api/status", 200, status_ok);
@@ -1092,6 +1122,60 @@ mod tests {
         let (client, shared) = start(Script::default().healthz_key("other")).await;
         assert!(client.verifying().status().await.is_err());
         assert!(auth_headers_seen(&shared).iter().all(Option::is_none));
+    }
+
+    /// A stand-in listener on `addr`: answers `/healthz?nonce=` with a proof of `key` when it has one, and every
+    /// other path `{}`; the `Authorization` header of each request it gets goes to `seen`. Stops on `stop`.
+    async fn listener_on(
+        addr: std::net::SocketAddr,
+        key: Option<&'static str>,
+        seen: Arc<Mutex<Vec<Option<String>>>>,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let app = axum::Router::new().fallback(move |req: axum::http::Request<axum::body::Body>| {
+            let seen = seen.clone();
+            async move {
+                let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
+                seen.lock().unwrap().push(auth);
+                let nonce = req.uri().query().and_then(|q| q.strip_prefix("nonce=")).map(str::to_string);
+                match (key, nonce) {
+                    (Some(key), Some(nonce)) => {
+                        let proof = crate::auth::healthz_proof(key, &nonce).unwrap_or_default();
+                        format!("{{\"ok\":true,\"proof\":\"{proof}\"}}")
+                    }
+                    _ => "ok".to_string(),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).with_graceful_shutdown(async move { stop.cancelled().await }).await;
+        })
+    }
+
+    #[tokio::test]
+    async fn a_listener_that_takes_the_port_after_the_daemon_went_away_is_asked_for_a_proof_again() {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let (daemon_seen, impostor_seen) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
+        let stop = tokio_util::sync::CancellationToken::new();
+        let daemon = listener_on(addr, Some("tok-123"), daemon_seen.clone(), stop.clone()).await;
+        let client = Client::new(&format!("http://{addr}"), "tok-123").verifying();
+        // The daemon proves itself and gets the token (its answer is not a status, which does not matter here).
+        let _ = client.status().await;
+        assert_eq!(*daemon_seen.lock().unwrap(), vec![None, Some("Bearer tok-123".to_string())]);
+
+        // The daemon goes away; the client notices the lost connection ...
+        stop.cancel();
+        daemon.await.unwrap();
+        assert!(client.status().await.is_err());
+        // ... and whatever binds the port next never sees the token.
+        let impostor = listener_on(addr, None, impostor_seen.clone(), tokio_util::sync::CancellationToken::new()).await;
+        let e = client.status().await.unwrap_err();
+        assert!(e.contains("did not prove it is this home's loom daemon"), "{e}");
+        assert!(impostor_seen.lock().unwrap().iter().all(Option::is_none), "{:?}", impostor_seen.lock().unwrap());
+        impostor.abort();
     }
 
     fn listing() -> Script {
@@ -1218,6 +1302,8 @@ mod tests {
         assert_eq!(c.base(), "http://127.0.0.1:7878");
         assert_eq!(c.token(), "tok-abc");
         assert!(c.verify, "a client for a home must ask the listener for its proof before sending the token");
+        assert!(!c.allow_unverified);
+        assert!(Client::from_home_allowing(&paths, true).unwrap().allow_unverified, "the flag reaches the client");
         std::fs::write(paths.config_file(), "[daemon]\nbind = \"127.0.0.1:1111\"\n").unwrap();
         assert_eq!(Client::from_home(&paths).unwrap().base(), "http://127.0.0.1:1111");
         let file = DaemonFile { pid: 1, bind: "127.0.0.1:9999".into(), started_ms: 0 };
