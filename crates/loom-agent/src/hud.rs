@@ -203,10 +203,11 @@ pub fn render(input: &HudInput<'_>) -> String {
 }
 
 /// Why `finish` is closed, from the ledger: `Finish: rejected {n}; needs new execution evidence` while an
-/// objection of a verifier is open (n = rejections since the latest accepted finish), else `Finish:
+/// objection of a verifier is open and the operator has not released (n = rejections since the latest accepted finish), else `Finish:
 /// unavailable — goal not concluded` while the goal claim is open and the operator has not released.
 fn finish_line(ledger: &LedgerState, gated: bool) -> Option<String> {
-    let objected = ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind == ObligationKind::Objection);
+    let objected = ledger.release.is_none()
+        && ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind == ObligationKind::Objection);
     let rejected = if objected {
         let since = ledger.finishes.iter().rposition(|f| f.accepted == Some(true)).map_or(0, |i| i.saturating_add(1));
         ledger.finishes.iter().skip(since).filter(|f| f.accepted == Some(false)).count()
@@ -653,6 +654,11 @@ mod tests {
         let mut released = l.clone();
         released.release = Some(Release { reason: "stop".into(), n: 2 });
         i.ledger = Some(&released);
+        assert!(!render(&i).contains("Finish:"), "{}", render(&i));
+        // A release also hides an open objection: finish will be allowed.
+        let mut released_objected = done.clone();
+        released_objected.release = Some(Release { reason: "stop".into(), n: 9 });
+        i.ledger = Some(&released_objected);
         assert!(!render(&i).contains("Finish:"), "{}", render(&i));
     }
 
