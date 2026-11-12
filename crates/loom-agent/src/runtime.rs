@@ -3308,7 +3308,8 @@ impl Runtime {
         for task in background {
             task.abort();
         }
-        inner.proxy.shutdown();
+        // The proxy's connections record how they ended; the process may exit right after this returns.
+        inner.proxy.stop(SHUTDOWN_TASK_WAIT).await;
     }
 }
 

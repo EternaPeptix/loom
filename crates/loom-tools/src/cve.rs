@@ -258,7 +258,7 @@ fn request_failure(e: &reqwest::Error, what: &str, host: &str, tunnel: Option<&T
         ("timed out".to_string(), "Try again later.")
     } else if has(&["dns", "resolve", "lookup", "name or service", "nodename", "no such host"]) {
         ("could not resolve the host name".to_string(), "Check the network and try again.")
-    } else if has(&["certificate", "tls", "ssl", "handshake"]) {
+    } else if crate::web::names_tls(&lower) {
         ("failed the TLS handshake".to_string(), "The server's certificate or protocol was not acceptable.")
     } else if let (Some(t), true) = (tunnel, e.is_connect()) {
         t.failure()
@@ -324,7 +324,7 @@ async fn exchange(ctx: &ToolCtx, req: RequestBuilder, url: &Url, what: &str) -> 
         let resp = match client.execute(req).await {
             Ok(r) => r,
             // A refused CONNECT looks like any failure to connect: the proxy is asked again (see `Tunnel`).
-            Err(e) if tunnelled && e.is_connect() => {
+            Err(e) if tunnelled && e.is_connect() && !crate::web::names_tls_failure(&e) => {
                 let tunnel = verdict(crate::web::proxy_verdict(&client, url).await, what, &host)?;
                 return Err(request_failure(&e, what, &host, Some(&tunnel)));
             }
