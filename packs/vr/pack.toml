@@ -1,0 +1,55 @@
+name = "vr"
+description = "Vulnerability research on local and authorized targets: a researcher that routes an engagement into narrow experiments, scouts that run one experiment each and return executed evidence, and a judge that qualifies scope and refutes findings."
+default_role = "researcher"
+preamble = "harness.md"
+
+# The engagement lead. Turns a broad scope into narrow experiments and hands them to scouts; does not
+# run experiments or write findings prose itself. Finishing is gated by an independent judge.
+[roles.researcher]
+description = "Owns an engagement: qualifies scope through a judge, decomposes into one-hypothesis experiments, delegates them, and gates every result before believing it."
+prompt = "roles/researcher.md"
+termination = "explicit"
+may_spawn = ["scout", "judge"]
+verify_finish = true
+tools = [
+  "bash", "job_wait", "job_kill", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search",
+  "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "decide", "verify",
+  "finish", "ask_user", "report_blocker", "wait",
+]
+
+# One experiment per scout: one hypothesis, one input, one observation, the smallest harness that
+# establishes the primitive. Returns executed evidence or a blocker, never a narrative.
+[roles.scout]
+description = "Runs one experiment from the researcher and returns one atomic executed check with its conditions, the exact run, the observed response and a separate state check — or a blocker."
+prompt = "roles/scout.md"
+termination = "explicit"
+may_spawn = ["scout"]
+tools = [
+  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search",
+  "finish", "report_blocker", "wait",
+]
+
+# The independent check. Qualifies a scope (enumerates the hosts a page authorizes), and refutes a
+# finding or a finished engagement. Cannot modify the workspace and never judges its own submission.
+[roles.judge]
+description = "Qualifies scope and refutes claims: enumerates authorized hosts from a programme page, or tries to break a finding, citing only what it examined. Read-only."
+prompt = "roles/judge.md"
+termination = "explicit"
+read_only = true
+tools = [
+  "bash", "job_wait", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "ledger", "log_search",
+  "verdict", "report_blocker",
+]
+
+# Interactive research assistant for working alongside the operator, turn by turn.
+[roles.chat]
+description = "Interactive research assistant: answers and runs read-only checks turn by turn within the authorized scope; a reply without a tool call ends the turn."
+prompt = "roles/chat.md"
+termination = "free"
+tools = [
+  "bash", "job_wait", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "note", "pin", "log_search",
+]
