@@ -54,7 +54,7 @@ A `Connection` is what the operator needs to reach one daemon:
 ```
 struct Connection: Codable, Identifiable {
     var id: UUID
-    var name: String            // "512S1", shown in the sidebar and menu bar
+    var name: String            // "studio", shown in the sidebar and menu bar
     var mode: Mode              // .sshTunnel or .direct
     // .sshTunnel:
     var sshHost: String         // an ssh(1) destination: a Host alias or user@host
@@ -74,16 +74,32 @@ when stored, goes to the login Keychain (`kSecClassGenericPassword`, service `co
 
 For a `.sshTunnel` connection, `connect()`:
 
-1. picks a free local TCP port on 127.0.0.1 (bind port 0, read it back, close);
+1. uses the daemon's own port number for the local end too (`<port>` = `remotePort`). The daemon only
+   accepts its own port in the `Host` and `Origin` headers, so a different local port would have every
+   request refused. First it waits (bounded, ~3 s) for the ssh child of the previous tunnel to exit,
+   so that loom-desk's own dying listener is not taken for someone else's. If something then listens
+   on 127.0.0.1:<port> (or ssh reports "Address already in use") the connection fails with a message
+   naming the port, saying loom-desk needs it free for this connection, and what to do (close what
+   uses it, or use a Direct connection). There is no random port and no pick-then-release. Other bind
+   failures (e.g. "Permission denied" for a port below 1024) are reported with ssh's own words;
 2. spawns `ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
-   -L 127.0.0.1:<localPort>:127.0.0.1:<remotePort> <sshHost>` as a `Process`, keeping the handle;
-3. waits (poll-connect to the local port, up to ~10 s) until the forward is up; a dead child or a
-   timeout is an error whose message includes the ssh stderr;
-4. if `tokenSource == .fetchOverSsh`, runs `ssh -o BatchMode=yes <sshHost> cat ~/.loom/token`, trims
-   it, and stores it (Keychain + memory). A token that is not 64 lowercase-hex characters is an error.
+   -o ControlMaster=no -o ControlPath=none -L 127.0.0.1:<port>:127.0.0.1:<port> <sshHost>` as a
+   `Process`, keeping the handle. Multiplexing is off so the listener always lives in this child,
+   never in a ControlPersist master from the operator's ssh config that would outlive it and keep the
+   port;
+3. waits (poll-connect to the local port, up to ~10 s) until the forward is up and `/healthz` answers;
+   a dead child or a timeout is an error whose message includes the ssh stderr;
+4. if `tokenSource == .fetchOverSsh`, runs `ssh -o BatchMode=yes -o ControlMaster=no -o ControlPath=none
+   <sshHost> cat ~/.loom/token`, trims it, and stores it (Keychain + memory). A token that is not 64
+   lowercase-hex characters is an error. The child is checked again afterwards: if it exited during the
+   fetch, the connect fails with ssh's last stderr line.
 
-`baseURL` is then `http://127.0.0.1:<localPort>`. `disconnect()` terminates the ssh process (SIGTERM,
-then SIGKILL after a short grace) and forgets the local port. The tunnel is torn down on disconnect,
+`baseURL` is then `http://127.0.0.1:<port>`. The app watches the ssh child for the whole life of the
+link: if it exits while connecting or connected, the link becomes "disconnected" with ssh's last
+stderr line (read once the stderr pipe has drained), and the web view is never loaded against a
+forward whose ssh is gone (the child is re-checked immediately before every page load). A connect
+that a newer one superseded never stops the newer one's ssh child. `disconnect()` terminates the ssh
+process (SIGTERM, then SIGKILL after a short grace). The tunnel is torn down on disconnect,
 on switching connections, and on app quit (`applicationWillTerminate`). Exactly one tunnel at a time.
 
 A `.direct` connection skips all of this: `baseURL` is the configured URL and the token comes from the
@@ -113,16 +129,26 @@ version may add quick-answer from the notification; out of scope for v1.)
 
 ## Web pane (`UI/WebPane.swift`)
 
-A `WKWebView` wrapped in `NSViewRepresentable`. On connect (or when the operator picks a connection),
-it loads `"<baseURL>/?token=<token>"` — the daemon answers 303 to `/` with the `loom_token` session
-cookie (there is no `/auth` route). Thereafter the UI drives itself (same-origin XHR/SSE to the
-daemon, through the tunnel). The pane:
+A `WKWebView` wrapped in `NSViewRepresentable`. It logs in with a one-time code: the app (which holds
+the token) sends `POST <baseURL>/api/login-codes` with `Authorization: Bearer <token>`; the answer is
+`{"code": "<hex>", "expires_in_s": 60}` and the pane loads `<baseURL>/#code=<code>`. The page exchanges
+the code itself; no cookie is involved and the token is never in a URL. A code is single use and
+short-lived, so none is minted ahead of time: each newly built web view (on connect, on reload or
+retry, and when SwiftUI builds the window's content again) asks for its own code, takes the URL once,
+and loads exactly that one URL. Reload and retry build a new web view rather than reloading the old
+one: the old document's code is spent, and loading another `#code=` URL into the same document would
+only change its fragment (WebKit does not reload for that) and run nothing. Fallback for older
+daemons: if the POST answers 404 the pane loads the old entry URL `<baseURL>/?token=<token>` (newer
+daemons also still accept it by redirecting to a code URL); this is the only case where the token
+appears in a URL. Thereafter the UI drives itself (same-origin XHR/SSE to the daemon, through the
+tunnel). The pane:
 
 - restricts navigation to the `baseURL` origin (loopback): a navigation action to any other origin is
   cancelled and opened in the default browser instead (so links in fetched pages don't hijack the
-  pane). Requests only ever leave for `127.0.0.1:<localPort>`.
-- exposes reload and a "copy web URL" affordance (the `baseURL` + token, for opening in a real
-  browser if wanted);
+  pane). Requests only ever leave for `127.0.0.1:<port>`.
+- exposes reload (a new web view with a fresh code) and a "copy web URL" affordance (a fresh
+  single-use code URL, valid for 60 s, for opening in a real browser if wanted; the token URL only on
+  the 404 fallback);
 - shows a clear state when there is no connection, when the tunnel is connecting, and when the daemon
   is unreachable (with the error and a retry), rather than a blank white view.
 

@@ -20,7 +20,7 @@ struct Counts: Equatable {
 /// How the app is currently attached to a daemon.
 enum Link: Equatable {
     case none
-    case connecting(String)       // a human phrase: "opening tunnel to 512S1…"
+    case connecting(String)       // a human phrase: "opening tunnel to studio…"
     case connected(baseURL: String)
     case failed(String)           // the error to show, with a retry affordance
 }
@@ -43,10 +43,11 @@ final class AppState: ObservableObject {
         didSet { if webState == .loaded { webLoadedOnce = true } }
     }
     @Published var webLoadedOnce = false
-    /// Bumped by the reload button; the web pane reloads when it changes.
-    @Published var reloadTick = 0
-    /// Bumped on every connect so the web pane is rebuilt with a fresh data store.
-    @Published var connectionEpoch = 0
+    /// Bumped on every connect and every reload so the web pane is rebuilt: a fresh WKWebView and data
+    /// store, which asks for its own one-time code (`requestWebEntry`) before it loads anything.
+    @Published var paneEpoch = 0
+    /// Bumped when a fresh entry URL waits for the web pane in `takeEntryURL()`.
+    @Published private(set) var entryTick = 0
     /// Bumped to ask the always-alive menu-bar label to open the main window.
     @Published var openWindowTick = 0
     /// The last problem saving connections / the Keychain, shown by the editor.
@@ -59,6 +60,9 @@ final class AppState: ObservableObject {
     private var connectTask: Task<Void, Never>?
     private var generation = 0
     private var restored = false
+    /// `<base>/#code=<one-time code>` (or, for an old daemon, the token URL) minted for the web pane of
+    /// `paneEpoch`. Handed out once: the code is single use.
+    private var pendingEntry: URL?
 
     private static let lastKey = "loom-desk.lastConnection"
 
@@ -81,25 +85,83 @@ final class AppState: ObservableObject {
 
     // MARK: URLs
 
-    /// The URL the web pane should load for the current connection, token included
-    /// (`<baseURL>/?token=<token>`), or nil when not connected. The daemon turns it into the session
-    /// cookie with a 303 to `/`.
-    var webEntryURL: URL? {
-        guard let base = baseURL, let token, ConnectionStore.isValidToken(token),
-              var c = URLComponents(string: base) else { return nil }
-        c.path = "/"
-        c.queryItems = [URLQueryItem(name: "token", value: token)]
-        return c.url
+    /// A fresh entry URL for the live connection: asks the daemon for a one-time login code
+    /// (`POST /api/login-codes`, bearer token) and builds `<base>/#code=<code>`. A daemon that answers 404
+    /// predates the route; only then is the token placed in a URL (`<base>/?token=<token>`). Refuses when
+    /// the ssh child of a tunnel connection is gone, so the web view is never pointed at a dead forward.
+    private func makeEntryURL(base: String, token: String) async throws -> URL {
+        let outcome = await DaemonClient.requestLoginCode(baseURL: base, token: token)
+        // Before the outcome: when the request failed because the forward is gone, that is the reason.
+        if active?.mode == .sshTunnel && !tunnel.isRunning {
+            let why = tunnel.lastErrorLine
+            throw ConnectError("the SSH tunnel closed: \(why.isEmpty ? "ssh is no longer running" : why). Reconnect to open it again.")
+        }
+        let url: URL?
+        switch outcome {
+        case .code(let c): url = DaemonClient.codeEntryURL(base: base, code: c)
+        case .notFound: url = DaemonClient.tokenEntryURL(base: base, token: token)
+        case .failed(let m): throw ConnectError(m)
+        }
+        guard let url else { throw ConnectError("could not build the web address from the daemon URL") }
+        return url
     }
 
     func copyWebURL() {
-        guard let u = webEntryURL else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(u.absoluteString, forType: .string)
-        status = "web URL copied (it carries the token)"
+        guard let base = baseURL, let token else { return }
+        let gen = generation
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let u = try await self.makeEntryURL(base: base, token: token)
+                guard gen == self.generation else { return }
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(u.absoluteString, forType: .string)
+                self.status = u.query == nil ? "web URL copied (single use, valid for 60 s)" : "web URL copied (it carries the token)"
+            } catch {
+                guard gen == self.generation else { return }
+                self.status = "\(error)"
+            }
+        }
     }
 
-    func reload() { reloadTick += 1 }
+    /// Reload (and Retry) = a new web pane, which asks for a fresh one-time code. Loading another `#code=`
+    /// URL into the old view would change only its fragment and run nothing; a new view always loads.
+    func reload() {
+        guard case .connected = link else { return }
+        paneEpoch += 1
+    }
+
+    /// Called once by every newly created web pane (connect, reload, the window built again): asks the
+    /// daemon for a one-time code and hands the entry URL to that pane. Nothing is minted ahead of time,
+    /// so a pane never gets a spent or expired code.
+    func requestWebEntry(for epoch: Int) {
+        guard case .connected = link, epoch == paneEpoch, let base = baseURL, let token else { return }
+        let gen = generation
+        pendingEntry = nil
+        webLoadedOnce = false
+        webState = .loading
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let u = try await self.makeEntryURL(base: base, token: token)
+                guard gen == self.generation, epoch == self.paneEpoch else { return }
+                self.pendingEntry = u
+                self.entryTick += 1
+            } catch {
+                guard gen == self.generation, epoch == self.paneEpoch else { return }
+                self.webState = .failed("\(error)")
+            }
+        }
+    }
+
+    /// The minted entry URL, once. Nil when there is none, or when the tunnel's ssh has exited since:
+    /// checked right before the pane loads, so it never loads against a forward whose ssh is gone
+    /// (`tunnelDied` reports that). Called from the pane's update: changes nothing published.
+    func takeEntryURL() -> URL? {
+        defer { pendingEntry = nil }
+        if active?.mode == .sshTunnel && !tunnel.isRunning { return nil }
+        return pendingEntry
+    }
 
     // MARK: connect / disconnect
 
@@ -107,7 +169,7 @@ final class AppState: ObservableObject {
         teardown()
         generation += 1
         let gen = generation
-        connectionEpoch += 1
+        paneEpoch += 1
         active = connection
         counts = Counts()
         webState = .idle
@@ -144,6 +206,8 @@ final class AppState: ObservableObject {
                 }
                 try Task.checkCancellation()
                 guard gen == self.generation else { return }
+                // No await from here on: an ssh exit is either seen by open() above or, once the link
+                // is .connected, by tunnelDied. The web pane mints its login code when it is built.
                 self.token = tok
                 self.baseURL = base
                 self.link = .connected(baseURL: base)
@@ -186,6 +250,7 @@ final class AppState: ObservableObject {
         tunnel.close()
         token = nil
         baseURL = nil
+        pendingEntry = nil
     }
 
     private func startClient(base: String, token: String, gen: Int) {
@@ -212,10 +277,13 @@ final class AppState: ObservableObject {
     }
 
     private func tunnelDied(_ msg: String) {
+        // While connecting, open() reports the exit itself (with a better message, e.g. a busy port).
         guard case .connected = link else { return }
+        generation += 1          // drops in-flight code requests and late client callbacks
         client.stop()
         token = nil
         baseURL = nil
+        pendingEntry = nil
         counts = Counts()
         link = .failed("the SSH tunnel closed: \(msg)")
         status = "tunnel closed"

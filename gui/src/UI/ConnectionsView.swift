@@ -121,7 +121,7 @@ struct ConnectionEditor: View {
         VStack(alignment: .leading, spacing: 12) {
             Text(isNew ? "Add connection" : "Edit connection").font(.title3)
             Form {
-                TextField("Name", text: $draft.name, prompt: Text("512S1"))
+                TextField("Name", text: $draft.name, prompt: Text("studio"))
                 Picker("Reach it", selection: $draft.mode) {
                     Text("Over SSH").tag(Connection.Mode.sshTunnel)
                     Text("Direct URL").tag(Connection.Mode.direct)

@@ -128,7 +128,7 @@ enum ConnectionStore {
         chk(!isValidToken(String(repeating: "g", count: 64)), "non-hex accepted")
         chk(!isValidToken(good + "\n"), "trailing newline accepted")
         chk(!isValidSSHHost("-oProxyCommand=x"), "option-like host accepted")
-        chk(isValidSSHHost("user@512S1"), "plain host rejected")
+        chk(isValidSSHHost("user@studio"), "plain host rejected")
         chk(normalizedBaseURL("http://127.0.0.1:7878/") == "http://127.0.0.1:7878", "base url normalize")
         chk(normalizedBaseURL("file:///etc") == nil, "file url accepted")
         return f
