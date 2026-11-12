@@ -8,8 +8,8 @@
 //! - never writable, even inside a writable root: `<workspace>/.loom`, the loom home directory, and
 //!   `cfg.protected_paths` (relative entries are relative to the workspace). One exception: the
 //!   session temp dir lies inside the loom home (`<loom home>/sessions/<id>/tmp`) and what is in it
-//!   is writable all the same — but not the directory entry itself (it cannot be removed, renamed
-//!   or replaced by a link, yet tests as writable), and not a protected path that is the temp dir or
+//!   is writable all the same — but not the directory entry itself (it cannot be removed, renamed,
+//!   replaced or made anew, yet tests as writable), and not a protected path that is the temp dir or
 //!   lies inside it. A temp dir that is `/`, or is or contains the loom home, is refused at construction;
 //! - not readable: `<loom home>/token`, `<loom home>/keys`, `cfg.unreadable_paths` (`~` expands to
 //!   the home directory) and, unless `cfg.protect_credentials` is off, the user's credential stores
@@ -18,7 +18,10 @@
 //!   stores cannot be located and construction is refused. What is not readable is not writable
 //!   either, wherever it lies (a command could otherwise rename it and read it under the new name);
 //! - a directory where writes are allowed that holds a never-writable or not-readable path, or the
-//!   session temp dir, cannot be removed or renamed: that would carry what it holds out of its rule;
+//!   session temp dir, cannot be removed or renamed, nor made as a link where it does not exist yet:
+//!   that would carry what it holds out of its rule. A missing one can still be made by moving a
+//!   directory into place, and a link already inside that directory then decides where a file
+//!   written below it later from outside the sandbox lands;
 //! - starting something outside the sandbox is denied: LaunchServices opens, Apple Events, launchd
 //!   jobs;
 //! - network: denied, except loopback connections to the egress proxy port (when there is one), to
@@ -29,7 +32,9 @@
 //! configured path that does not exist is kept as written after resolving its deepest existing
 //! ancestor. On macOS, where volumes are case-insensitive by default, the rules that refuse (never
 //! writable, not readable) are compared without regard to case; the rules that allow are compared
-//! exactly, as they are everywhere else.
+//! exactly, as they are everywhere else. A not-readable path that a link along it makes differ from
+//! its canonical form is denied as written too, so the link cannot be swapped for a directory of a
+//! command's own.
 //!
 //! ## `profile()`
 //! The seatbelt profile text, `None` in mode `none`. This form is verified on macOS 27 — keep its
@@ -44,11 +49,12 @@
 //! (allow file-write* (subpath "<writable root>") …)
 //! (deny file-write* (subpath "<protected>") …)
 //! (allow file-write* (subpath "<session temp dir>"))
-//! (deny file-write-unlink (literal "<session temp dir>"))
+//! (deny file-write-unlink file-write-create (literal "<session temp dir>"))
 //! (deny file-write* (subpath "<protected, at or inside the temp dir>") …)
 //! (deny file-write* (subpath "<unreadable or credential store>") …)
 //! (deny file-read* (subpath "<unreadable or credential store>") …)
 //! (deny file-write-unlink (literal "<writable directory that holds one of the above>") …)
+//! (deny file-write-create (require-all (vnode-type SYMLINK) (require-any (literal "<same directory>") …)))
 //! (deny lsopen)
 //! (deny appleevent-send)
 //! (deny job-creation)
@@ -63,9 +69,10 @@
 //! not the harness, not other sessions, not any other process of the same user.
 //!
 //! `file-write-unlink` covers removing and renaming an entry, and renaming or swapping
-//! (`renamex_np(RENAME_SWAP)`) another entry onto it; the other writes stay allowed, so
-//! `test -w "$TMPDIR"` holds, and the tools that check the temp dir with `access(2)` before they use
-//! it (bash's heredocs among them) put their files there.
+//! (`renamex_np(RENAME_SWAP)`) another entry onto it; `file-write-create` covers making one where there
+//! is none (a link, a rename, a clone). The other writes stay allowed, so `test -w "$TMPDIR"` holds,
+//! and the tools that check the temp dir with `access(2)` before they use it (bash's heredocs among
+//! them) put their files there.
 //!
 //! Paths are written as SBPL string literals: `\` and `"` are backslash-escaped; a path containing a
 //! control character is an error at construction.
@@ -80,9 +87,9 @@
 //! `..` components that remain are an error) and the *resolved* path is tested, so a symlink inside
 //! the workspace that points outside it does not grant access. Returns the resolved path, or a
 //! sentence: which path, which rule refused it, and what is allowed (for writes, the writable roots).
-//! `check_write` refuses what is not readable and the temp dir entry itself, then tests the session
-//! temp dir before the never-writable rules, as the profile does. In mode `none` only the
-//! never-writable and not-readable rules apply.
+//! `check_write` lets the session temp dir through the never-writable rules, as the profile does, and
+//! refuses what is not readable and the temp dir entry itself wherever they lie. In mode `none` only
+//! the never-writable and not-readable rules apply.
 //!
 //! ## `resolve(given)`
 //! A path as the model wrote it → absolute: `~`/`~/x` expand to the home directory, a relative path
@@ -229,6 +236,20 @@ fn resolve_path(path: &Path, lenient: bool) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// An absolute `path` as written, with `.` dropped and no link resolved; `None` when it has a `..`,
+/// which only the canonical form resolves as the file system does.
+fn lexical(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => return None,
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
+}
+
 /// A path as an SBPL string literal body; refuses what cannot be written safely.
 fn sbpl(path: &Path) -> io::Result<String> {
     let s = path
@@ -348,8 +369,8 @@ impl Sandbox {
             Some(h) => Some(canon(&h)?),
             None => None,
         };
-        // A configured path: `~` expanded, relative ones taken from the workspace, then canonical.
-        let anchored = |given: &str| -> io::Result<PathBuf> {
+        // A configured path: `~` expanded, relative ones taken from the workspace; `anchored` makes it canonical.
+        let absolute = |given: &str| -> io::Result<PathBuf> {
             let p = match expand_home(given, home.as_deref()) {
                 Some(p) => p,
                 None if given == "~" || given.starts_with("~/") => {
@@ -359,8 +380,9 @@ impl Sandbox {
                 }
                 None => PathBuf::from(given),
             };
-            canon(&workspace.join(p))
+            Ok(workspace.join(p))
         };
+        let anchored = |given: &str| -> io::Result<PathBuf> { canon(&absolute(given)?) };
 
         let mut writable = vec![workspace.clone(), tmp_dir.clone()];
         for p in &cfg.extra_writable {
@@ -375,12 +397,19 @@ impl Sandbox {
             push_unique(&mut protected, anchored(p)?);
         }
 
+        // A not-readable path is kept as written as well when a link along it makes that differ: removed,
+        // the link could be replaced by a directory of a command's own, which the canonical rule misses.
         let mut unreadable = vec![loom_home.join("token"), loom_home.join("keys")];
         for p in &cfg.unreadable_paths {
-            push_unique(&mut unreadable, anchored(p)?);
+            let written = absolute(p)?;
+            push_unique(&mut unreadable, canon(&written)?);
+            if let Some(w) = lexical(&written) {
+                push_unique(&mut unreadable, w);
+            }
         }
 
-        // The workspace stays readable: a credential path that is or contains it is skipped.
+        // The workspace stays readable: a credential path that is or contains it is skipped. The others are
+        // kept as written too, as above.
         let mut credentials = Vec::new();
         if cfg.protect_credentials {
             let Some(h) = &home else {
@@ -392,9 +421,11 @@ impl Sandbox {
                 ));
             };
             for rel in CREDENTIAL_PATHS {
-                let p = canon(&h.join(rel))?;
+                let written = h.join(rel);
+                let p = canon(&written)?;
                 if !workspace.starts_with(&p) {
                     push_unique(&mut credentials, p);
+                    push_unique(&mut credentials, written);
                 }
             }
         }
@@ -461,10 +492,12 @@ impl Sandbox {
             out.push_str(&format!("(deny file-write*{})\n", subpaths(&self.protected)));
         }
         // The session temp dir may lie inside a protected directory; this later rule wins. The directory
-        // entry itself cannot be removed, renamed or replaced by a link that the next activation of the
-        // session would follow; a write deny would also make it test as unwritable.
+        // entry itself cannot be removed, renamed, replaced, or made anew once gone, so the next activation
+        // of the session follows no link put there; a write deny would also make it test as unwritable.
         if let Ok(t) = sbpl(&self.tmp_dir) {
-            out.push_str(&format!("(allow file-write* (subpath \"{t}\"))\n(deny file-write-unlink (literal \"{t}\"))\n"));
+            out.push_str(&format!(
+                "(allow file-write* (subpath \"{t}\"))\n(deny file-write-unlink file-write-create (literal \"{t}\"))\n"
+            ));
         }
         let inside_tmp = self.inside_tmp_protected();
         if !inside_tmp.is_empty() {
@@ -477,11 +510,15 @@ impl Sandbox {
             let denied = subpaths(&unreadable);
             out.push_str(&format!("(deny file-write*{denied})\n(deny file-read*{denied})\n"));
         }
+        // Nor can a directory that holds one be moved, or made as a link where it is missing.
         let holders = self.holders();
         if !holders.is_empty() {
             let literals: String =
                 holders.iter().filter_map(|p| sbpl(p).ok()).map(|s| format!(" (literal \"{s}\")")).collect();
-            out.push_str(&format!("(deny file-write-unlink{literals})\n"));
+            out.push_str(&format!(
+                "(deny file-write-unlink{literals})\n\
+                 (deny file-write-create (require-all (vnode-type SYMLINK) (require-any{literals})))\n"
+            ));
         }
         // Opening an application or URL through LaunchServices, driving one with Apple Events, or handing
         // launchd a job, runs code outside the sandbox.
@@ -508,9 +545,9 @@ impl Sandbox {
     }
 
     /// The directories above a never-writable or not-readable path, or above the temp dir, that a
-    /// command could otherwise remove or rename (they lie where writes are allowed and no rule of the
-    /// profile refuses them already): moving one would take what it holds out from under its rule.
-    /// Sorted, so that the same policy gives the same profile.
+    /// command could otherwise remove or rename, or make as a link while missing (they lie where writes
+    /// are allowed and no rule of the profile refuses them already): moving one would take what it holds
+    /// out from under its rule. Sorted, so that the same policy gives the same profile.
     fn holders(&self) -> Vec<PathBuf> {
         let refused = |a: &Path| {
             a == self.tmp_dir.as_path()
@@ -569,6 +606,15 @@ impl Sandbox {
 
     pub fn check_write(&self, path: &Path) -> Result<PathBuf, String> {
         let r = self.resolved(path)?;
+        // The session temp dir is writable even when it lies inside a protected directory.
+        let in_tmp = r.starts_with(&self.tmp_dir) && !self.inside_tmp_protected().iter().any(|p| under(&r, p));
+        if let Some(rule) = self.protected.iter().find(|p| !in_tmp && under(&r, p)) {
+            return Err(format!(
+                "{} is protected: nothing under {} can be written by commands or file tools. Write elsewhere in the workspace.",
+                r.display(),
+                rule.display()
+            ));
+        }
         // What cannot be read cannot be written either, wherever it lies, as in the profile.
         if let Some(rule) = self.unreadable.iter().find(|u| under(&r, u)) {
             return Err(format!(
@@ -592,17 +638,7 @@ impl Sandbox {
                 self.tmp_dir.join("name").display()
             ));
         }
-        // The session temp dir is writable even when it lies inside a protected directory.
-        if r.starts_with(&self.tmp_dir) && !self.inside_tmp_protected().iter().any(|p| under(&r, p)) {
-            return Ok(r);
-        }
-        if let Some(rule) = self.protected.iter().find(|p| under(&r, p)) {
-            return Err(format!(
-                "{} is protected: nothing under {} can be written by commands or file tools. Write elsewhere in the workspace.",
-                r.display(),
-                rule.display()
-            ));
-        }
+        // The temp dir is a writable root, so what lies in it passes here.
         if self.mode == SandboxMode::Seatbelt {
             let device = DEVICE_LITERALS.iter().any(|d| r == Path::new(d));
             if !device && !self.writable.iter().any(|w| r.starts_with(w)) {
@@ -768,10 +804,11 @@ mod tests {
              (allow file-write* (subpath \"{r}/ws\") (subpath \"{r}/tmp\") (subpath \"{r}/extra\") (subpath \"/private/tmp\") (subpath \"/private/var/folders\") (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\"))\n\
              (deny file-write* (subpath \"{r}/ws/.loom\") (subpath \"{r}/home\") (subpath \"{r}/ws/secrets\"))\n\
              (allow file-write* (subpath \"{r}/tmp\"))\n\
-             (deny file-write-unlink (literal \"{r}/tmp\"))\n\
+             (deny file-write-unlink file-write-create (literal \"{r}/tmp\"))\n\
              (deny file-write* (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\") (subpath \"{r}/hidden\"))\n\
              (deny file-read* (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\") (subpath \"{r}/hidden\"))\n\
              (deny file-write-unlink{holders})\n\
+             (deny file-write-create (require-all (vnode-type SYMLINK) (require-any{holders})))\n\
              (deny lsopen)\n(deny appleevent-send)\n(deny job-creation)\n\
              (deny network*)\n\
              (allow network-outbound (remote ip \"localhost:8080\"))\n\
@@ -805,9 +842,11 @@ mod tests {
         let deny = p.find("(deny file-write* (subpath \"").expect("protected deny");
         let allow = p.rfind(&format!("(allow file-write* (subpath \"{}\"))\n", s(&f.tmp))).expect("tmp allow");
         assert!(allow > deny, "the temp-dir allow must come after the protected deny: {p}");
-        let entry = p.rfind(&format!("(deny file-write-unlink (literal \"{}\"))\n", s(&f.tmp))).expect("tmp entry deny");
+        let entry = p
+            .rfind(&format!("(deny file-write-unlink file-write-create (literal \"{}\"))\n", s(&f.tmp)))
+            .expect("tmp entry deny");
         assert!(entry > allow, "the deny for the temp dir entry must come after its allow: {p}");
-        // Only removing and renaming it is refused: a write deny would make it test as unwritable.
+        // Only removing, renaming and making it anew are refused: a write deny would make it test as unwritable.
         assert!(!p.contains(&format!("(deny file-write* (literal \"{}\"))", s(&f.tmp))), "{p}");
         for mode in [SandboxMode::Seatbelt, SandboxMode::None] {
             let sb = build(&f, &cfg(mode), None);
@@ -1103,6 +1142,11 @@ mod tests {
             assert!(sb.check_write(&f.ws.join(".config/gh/hosts.yml")).is_err());
             assert!(sb.check_write(&f.ws.join(".config/other")).is_ok());
             assert!(sb.check_write(&f.root.join("extra/ok")).is_ok());
+            // The loom home's own entries keep its message: `sandbox.unreadable_paths` does not govern them.
+            for entry in ["token", "keys/k"] {
+                let e = sb.check_write(&f.home.join(entry)).expect_err("loom home entry");
+                assert!(e.contains("is protected") && !e.contains("unreadable_paths"), "{e}");
+            }
         }
         let sb = Sandbox::with_home(&c, &f.ws, &f.tmp, &f.home, None, Some(f.ws.clone())).expect("sandbox");
         let p = sb.profile().expect("profile");
@@ -1119,6 +1163,46 @@ mod tests {
         for dir in [format!("{ws}/hidden"), s(&f.home).to_string()] {
             assert!(!held.contains(&format!("(literal \"{dir}\")")), "{dir}: {p}");
         }
+    }
+
+    #[test]
+    fn a_denied_path_reached_through_a_link_is_denied_as_written_too() {
+        let f = fx();
+        // The workspace is the home directory: `.ssh` and a configured path are links, and so is `.cargo`,
+        // which holds `.cargo/credentials`.
+        for d in ["Sync/ssh", "Sync/cargo", "Sync/hidden"] {
+            std::fs::create_dir_all(f.ws.join(d)).expect("mkdir");
+        }
+        let links = [(".ssh", "Sync/ssh"), (".cargo", "Sync/cargo"), ("hidden", "Sync/hidden")];
+        for (link, target) in links {
+            symlink(f.ws.join(target), f.ws.join(link)).expect("symlink");
+        }
+        let c = SandboxCfg { unreadable_paths: vec!["./hidden".into()], ..cfg(SandboxMode::Seatbelt) };
+        let sb = Sandbox::with_home(&c, &f.ws, &f.tmp, &f.home, None, Some(f.ws.clone())).expect("sandbox");
+        let p = sb.profile().expect("profile");
+        let ws = s(&f.ws);
+        // Removed, the link could be replaced by a directory of the command's own: both spellings are denied.
+        for rule in ["(deny file-write* (subpath", "(deny file-read* (subpath"] {
+            let line = p.lines().find(|l| l.starts_with(rule) && l.contains("/Sync/ssh\"")).expect(rule);
+            for denied in [".ssh", "Sync/ssh", ".cargo/credentials", "Sync/cargo/credentials", "hidden", "Sync/hidden"] {
+                assert_eq!(line.matches(&format!("(subpath \"{ws}/{denied}\")")).count(), 1, "{denied}: {p}");
+            }
+            // A path that no link makes differ is listed once.
+            assert_eq!(line.matches(&format!("(subpath \"{ws}/.aws\")")).count(), 1, "{p}");
+        }
+        // The link above a denied path is a directory that holds one, as is its target.
+        let unlink = p.lines().rfind(|l| l.starts_with("(deny file-write-unlink")).expect("holders");
+        let create = p.lines().find(|l| l.contains("(vnode-type SYMLINK)")).expect("holders");
+        for held in [unlink, create] {
+            for dir in [format!("{ws}/.cargo"), format!("{ws}/Sync/cargo")] {
+                assert!(held.contains(&format!("(literal \"{dir}\")")), "{dir}: {p}");
+            }
+        }
+        // The file tools see the same: once the link is gone, the name as written is still refused.
+        std::fs::remove_file(f.ws.join(".ssh")).expect("rm");
+        std::fs::create_dir(f.ws.join(".ssh")).expect("mkdir");
+        assert!(sb.check_read(&f.ws.join(".ssh/id")).is_err() && sb.check_write(&f.ws.join(".ssh/id")).is_err());
+        assert!(sb.check_read(&f.ws.join("Sync/hidden/x")).is_err() && sb.check_read(&f.ws.join("Sync/other")).is_ok());
     }
 
     #[test]
@@ -1339,10 +1423,11 @@ mod tests {
         let (ok, text) = run(&sb, &f.ws, &format!("echo x > {}/t.txt && mktemp {}/m.XXXXXX", s(&f.tmp), s(&f.tmp)));
         assert!(ok, "{text}");
         assert!(f.tmp.join("t.txt").exists());
-        // It tests as writable (`access(2)`), so the tools that check it so before they use it do use it.
+        // It tests as writable (`access(2)`), so the tools that check it so before they use it do use it,
+        // and `mkdir -p` of it succeeds although making it anew is refused.
         let tmp = s(&f.tmp);
         let script = format!(
-            "export TMPDIR={tmp}; test -w \"$TMPDIR\" || {{ echo 'TMPDIR is not writable'; exit 3; }}\n\
+            "export TMPDIR={tmp}; mkdir -p \"$TMPDIR\" && test -w \"$TMPDIR\" || {{ echo 'TMPDIR is not writable'; exit 3; }}\n\
              f=$(mktemp \"$TMPDIR/h.XXXXXX\") && cat > \"$f\" <<EOF\nheredoc\nEOF\ncat \"$f\""
         );
         let (ok, text) = run(&sb, &f.ws, &script);
@@ -1398,6 +1483,14 @@ mod tests {
         );
         let (ok, text) = run(&sb, &f.ws, &inside);
         assert!(ok, "{text}");
+        // Gone, it cannot be made anew from inside: not as a link, and not by moving something into place.
+        std::fs::remove_dir_all(&f.tmp).expect("rm");
+        std::fs::create_dir(f.ws.join("d")).expect("mkdir");
+        for script in [format!("ln -s {ws} {tmp}"), format!("mv {ws}/d {tmp}"), format!("mkdir {tmp}")] {
+            let (ok, text) = run(&sb, &f.ws, &script);
+            assert!(!ok && text.contains("Operation not permitted"), "{script}: {text}");
+            assert!(std::fs::symlink_metadata(&f.tmp).is_err(), "{script} made the temp dir");
+        }
     }
 
     #[test]
@@ -1518,6 +1611,12 @@ mod tests {
         std::fs::write(f.ws.join("hidden/f"), "secret").expect("write");
         std::fs::write(f.ws.join(".ssh/id"), "private-key").expect("write");
         std::fs::write(f.ws.join(".config/gh/hosts.yml"), "gh-token").expect("write");
+        // `.kube` is a link to a credential store, `.cargo` a link above one.
+        for (link, file) in [(".kube", "config"), (".cargo", "credentials")] {
+            std::fs::create_dir_all(f.ws.join("Sync").join(link)).expect("mkdir");
+            std::fs::write(f.ws.join("Sync").join(link).join(file), "linked-secret").expect("write");
+            symlink(f.ws.join("Sync").join(link), f.ws.join(link)).expect("symlink");
+        }
         let c = SandboxCfg { unreadable_paths: vec!["hidden".into()], ..cfg(SandboxMode::Seatbelt) };
         let sb = build_home(&f, &c, &f.ws);
         for (dir, file, content) in [("hidden", "f", "secret"), (".ssh", "id", "private-key")] {
@@ -1539,6 +1638,20 @@ mod tests {
         assert!(!ok && text.contains("Operation not permitted") && !text.contains("gh-token"), "{text}");
         let (ok, text) = run(&sb, &f.ws, &format!("mv {ws} {}/ws2", s(&f.root)));
         assert!(!ok && f.ws.join("hidden/f").exists(), "{text}");
+        // A link to a credential store, or above one, cannot be removed or moved to make way for a
+        // directory of the command's own.
+        for script in [format!("rm {ws}/.kube && mkdir {ws}/.kube"), format!("mv {ws}/.cargo {ws}/c3 && mkdir {ws}/.cargo")] {
+            let (ok, text) = run(&sb, &f.ws, &script);
+            assert!(!ok && text.contains("Operation not permitted") && !text.contains("linked-secret"), "{script}: {text}");
+        }
+        assert!(f.ws.join(".kube").is_symlink() && f.ws.join(".cargo").is_symlink() && !f.ws.join("c3").exists());
+        // A missing directory above one (`.docker` holds `.docker/config.json`) cannot be made as a link that
+        // would send the store elsewhere; as a directory it can, and the store in it stays denied.
+        std::fs::create_dir(f.ws.join("elsewhere")).expect("mkdir");
+        let (ok, text) = run(&sb, &f.ws, &format!("ln -s {ws}/elsewhere {ws}/.docker"));
+        assert!(!ok && text.contains("Operation not permitted") && !f.ws.join(".docker").exists(), "{text}");
+        let (ok, text) = run(&sb, &f.ws, &format!("mkdir {ws}/.docker && echo x > {ws}/.docker/config.json"));
+        assert!(!ok && f.ws.join(".docker").is_dir() && !f.ws.join(".docker/config.json").exists(), "{text}");
         // What is not denied stays free to move.
         std::fs::create_dir_all(f.ws.join(".config/other")).expect("mkdir");
         let (ok, text) = run(&sb, &f.ws, &format!("mv {ws}/.config/other {ws}/other && rm -r {ws}/other"));
