@@ -13,7 +13,6 @@ struct RootView: View {
                 ZStack {
                     WebPane(url: state.webEntryURL,
                             focusSession: $state.focusSession,
-                            reloadTick: state.reloadTick,
                             onState: { state.webState = $0 })
                         .id(state.connectionEpoch)
                     overlay

@@ -11,15 +11,15 @@ enum WebState: Equatable {
 
 /// A `WKWebView` that shows the daemon's own web UI over the tunnel. See gui/DESIGN.md "Web pane".
 ///
-/// - loads `url` (`<baseURL>/?token=<token>`: the daemon answers 303 + `Set-Cookie: loom_token` and
-///   redirects to `/`) when it changes; reports loading / loaded / failed through `onState`.
+/// - loads `url` (`<baseURL>/#code=<one-time code>`: the page exchanges the code itself, no cookie is
+///   involved; AppState supplies a fresh URL for every load or reload) when it changes; reports loading / loaded / failed through `onState`.
 /// - restricts navigation to `url`'s origin (loopback); any other http(s) origin is cancelled and
 ///   opened in the default browser, other schemes are just cancelled.
 /// - navigates to `#/s/<id>` when `focusSession` is set (then clears it).
 /// - never injects scripts or reads page contents (it does look at the HTTP status of the main
 ///   frame response, which is navigation metadata, to report a rejected token).
-/// - uses a non-persistent data store, so the session cookie never touches disk and a stale cookie
-///   from another daemon on the same loopback host can never be replayed.
+/// - uses a non-persistent data store, so nothing the page stores touches disk and nothing from another
+///   daemon on the same loopback host can be replayed.
 struct WebPane: NSViewRepresentable {
     let url: URL?
     @Binding var focusSession: String?

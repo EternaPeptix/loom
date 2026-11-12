@@ -70,6 +70,68 @@ final class DaemonClient: @unchecked Sendable {
         return boxes.compactMap { $0.value }
     }
 
+    // MARK: web login (one-time code)
+
+    enum LoginOutcome: Equatable {
+        case code(String)       // a fresh single-use code
+        case notFound           // an older daemon without /api/login-codes: use the token URL
+        case failed(String)     // a sentence for the operator
+    }
+
+    /// `{"code": "<hex>", "expires_in_s": 60}` -> the code, or nil when it is missing or not hex.
+    static func parseLoginCode(_ data: Data) -> String? {
+        struct Answer: Decodable { var code: String? }
+        guard let a = try? JSONDecoder().decode(Answer.self, from: data), let c = a.code,
+              (8...256).contains(c.utf8.count),
+              c.utf8.allSatisfy({ ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66) || ($0 >= 0x41 && $0 <= 0x46) })
+        else { return nil }
+        return c
+    }
+
+    /// `<base>/#code=<code>`: the page exchanges the code itself; no token is in the URL.
+    static func codeEntryURL(base: String, code: String) -> URL? {
+        guard var c = URLComponents(string: base) else { return nil }
+        c.path = "/"; c.query = nil
+        c.fragment = "code=" + code
+        return c.url
+    }
+
+    /// `<base>/?token=<token>`: only for daemons that have no login-codes route.
+    static func tokenEntryURL(base: String, token: String) -> URL? {
+        guard var c = URLComponents(string: base) else { return nil }
+        c.path = "/"; c.fragment = nil
+        c.queryItems = [URLQueryItem(name: "token", value: token)]
+        return c.url
+    }
+
+    /// `POST <base>/api/login-codes` with the bearer token. A fresh code is needed for every page load.
+    static func requestLoginCode(baseURL: String, token: String) async -> LoginOutcome {
+        guard let url = URL(string: baseURL + "/api/login-codes") else { return .failed("the daemon address is not a valid URL") }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 5
+        req.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 5
+        let session = URLSession(configuration: cfg)
+        defer { session.finishTasksAndInvalidate() }
+        do {
+            let (data, resp) = try await session.data(for: req)
+            guard let http = resp as? HTTPURLResponse else { return .failed("the daemon sent no HTTP answer") }
+            switch http.statusCode {
+            case 200:
+                if let c = parseLoginCode(data) { return .code(c) }
+                return .failed("the daemon answered the login request without a usable code. Update loom-desk and the daemon to matching versions.")
+            case 404: return .notFound
+            case 401, 403:
+                return .failed("the daemon rejected the token (HTTP \(http.statusCode)). Edit the connection and reconnect.")
+            default: return .failed("the daemon refused the login request (HTTP \(http.statusCode)). Reconnect to retry.")
+            }
+        } catch {
+            return .failed("could not reach the daemon for a login code: \(error.localizedDescription). Reconnect to retry.")
+        }
+    }
+
     // MARK: model (pure)
 
     struct Model: Equatable {
@@ -380,6 +442,17 @@ final class DaemonClient: @unchecked Sendable {
             "{\"type\":\"record\",\"session\":\"s1\",\"record\":{\"seq\":3,\"kind\":\"inbox_opened\",\"x\":1}}".utf8))
         if let rec { var m2 = m; chk(m2.apply(rec).contains(.inbox), "inbox_opened must refresh inbox") }
         else { f.append("DaemonClient: record event did not decode") }
+
+        // Login entry URLs: the code URL carries no token; only the fallback does.
+        let tok = String(repeating: "ab12", count: 16)
+        chk(codeEntryURL(base: "http://127.0.0.1:7878", code: "0a1b2c")?.absoluteString == "http://127.0.0.1:7878/#code=0a1b2c",
+            "code url: \(codeEntryURL(base: "http://127.0.0.1:7878", code: "0a1b2c")?.absoluteString ?? "nil")")
+        chk(tokenEntryURL(base: "http://127.0.0.1:7878", token: tok)?.absoluteString == "http://127.0.0.1:7878/?token=\(tok)",
+            "fallback url")
+        chk(!(codeEntryURL(base: "http://127.0.0.1:7878", code: "0a1b2c")?.absoluteString.contains("token") ?? true), "code url mentions token")
+        chk(parseLoginCode(Data("{\"code\":\"00ff00ff00ff00ff\",\"expires_in_s\":60}".utf8)) == "00ff00ff00ff00ff", "login code parse")
+        chk(parseLoginCode(Data("{\"code\":\"zz\",\"expires_in_s\":60}".utf8)) == nil, "bad login code accepted")
+        chk(parseLoginCode(Data("{\"expires_in_s\":60}".utf8)) == nil, "missing login code accepted")
         return f
     }
     #endif
