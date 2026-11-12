@@ -1,6 +1,6 @@
 //! `web_fetch`.
 //!
-//! CONTRACT (the body of `run` is a placeholder for the implementer; `spec` is fixed).
+//! CONTRACT.
 //!
 //! - `url` must parse as `http` or `https` (else an error sentence showing what was received).
 //! - The request goes through the session's egress proxy when `ctx.env` has `HTTPS_PROXY` /

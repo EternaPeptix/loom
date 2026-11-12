@@ -1,6 +1,6 @@
 //! The `loom` command.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; the command-line shape below is fixed).
+//! CONTRACT.
 //! Every command except `daemon`, `up`, `config` and `service` is a client of the daemon
 //! (`Client::from_home(&Paths::from_env())`). Errors are printed to stderr as `loom: {sentence}`
 //! and the exit code is 1 unless stated. Output goes to stdout; colour only when stdout is a

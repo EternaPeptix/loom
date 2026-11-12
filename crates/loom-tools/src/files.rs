@@ -1,6 +1,6 @@
 //! What a session has read, so a write never lands on content the model has not seen.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! The tracker maps a resolved path to what this session last saw of the file (a [`Seen`]): the
 //! SHA-256 and size of its bytes as last read whole or written, or, for a file too large to load that

@@ -1,6 +1,6 @@
 //! `bash` and the job tools.
 //!
-//! CONTRACT (bodies of `run` are placeholders for the implementer; `spec` is fixed).
+//! CONTRACT.
 //!
 //! ## `bash`
 //! 1. `cwd`: `ctx.sandbox.resolve`, must be an existing directory (else an error sentence); default

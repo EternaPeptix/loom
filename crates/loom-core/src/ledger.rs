@@ -238,7 +238,7 @@ pub struct LedgerState {
 }
 
 // ---------------------------------------------------------------------------------------------
-// CONTRACT for the implementer (bodies below are placeholders; signatures and types are fixed).
+// CONTRACT.
 //
 // Ids are assigned by position: the i-th `ConstraintAdd` is `k{i}`, plan steps `p{i}` (a `PlanSet`
 // REPLACES the plan: earlier steps not `Done` become `Dropped` with note "replaced by a new plan" and

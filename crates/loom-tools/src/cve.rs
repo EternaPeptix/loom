@@ -5,7 +5,7 @@
 //! than the model's memory. Each result is admitted and stored like any tool output, so `evidence`
 //! can quote it verbatim.
 //!
-//! CONTRACT (the body of each `run` is a placeholder for the implementer; every `spec()` is fixed).
+//! CONTRACT.
 //! Follow `web.rs` for how a native tool reaches the network: build one `reqwest::Client` with
 //! [`build_client`] — redirects off, `.no_proxy()`, and the session's egress proxy from `ctx.env`
 //! (`HTTPS_PROXY`/`https_proxy`/`HTTP_PROXY`/`http_proxy`) when present, so every request passes the

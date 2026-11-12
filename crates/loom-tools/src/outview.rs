@@ -1,6 +1,6 @@
 //! `out_read` and `out_grep`: looking at stored tool output again.
 //!
-//! CONTRACT (bodies of `run` are placeholders for the implementer; `spec` is fixed).
+//! CONTRACT.
 //!
 //! Both resolve `handle` with `BlobStore::resolve` (an unknown or ambiguous handle is an error
 //! sentence that repeats the handle and says handles look like `out:1a2b3c4d`), and return

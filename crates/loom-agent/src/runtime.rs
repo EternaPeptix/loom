@@ -1,7 +1,7 @@
 //! The runtime: owns every session of this loom home, starts and restores them, connects parents and
 //! children, and is the one thing the daemon talks to.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; public signatures and types are fixed;
+//! CONTRACT (public signatures and types are fixed;
 //! private fields, types and helpers are yours). `docs/DESIGN.md` §3, §8, §9 and §12 are the base
 //! text; where this file is more specific, this file wins. Every text shown to the model comes from
 //! `crate::texts`, `loom_core::weave` or the sentences quoted in this contract. Errors returned by

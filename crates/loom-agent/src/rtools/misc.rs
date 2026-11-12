@@ -1,6 +1,6 @@
 //! `pin` and `log_search`.
 //!
-//! CONTRACT (the `run` bodies are placeholders for the implementer; specs and types are fixed).
+//! CONTRACT.
 //!
 //! Both read this session's log with `loom_core::log::read_records(&shared.log_path)`.
 //!

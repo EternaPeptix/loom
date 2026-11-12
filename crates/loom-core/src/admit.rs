@@ -1,6 +1,6 @@
 //! Admission: what the model is shown of a tool output.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! The caller stores the complete output first (`BlobStore`), then calls [`admit`] to build the text
 //! of the `tool` message. Nothing here discards anything; the stored output is always complete.

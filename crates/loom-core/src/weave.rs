@@ -1,6 +1,6 @@
 //! The weave: session log → the stable request prefix, and re-weave planning.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //! `docs/DESIGN.md` §5 is the base text; where this file is more specific, this file wins.
 //!
 //! `weave(records)` is a pure function: same records, same output, byte for byte.

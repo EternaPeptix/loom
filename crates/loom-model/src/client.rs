@@ -1,7 +1,7 @@
 //! [`ModelClient`]: one streamed chat completion, retried until it succeeds, is refused, or is
 //! cancelled.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! ## `complete`
 //! One call = one logical completion. Per attempt:

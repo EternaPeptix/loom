@@ -1,6 +1,6 @@
 //! The proxy server.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! `Proxy::start(port, sink)` binds `127.0.0.1:{port}` (0 = any free port) and serves until
 //! `shutdown` or drop. It speaks HTTP/1.1 proxying only:

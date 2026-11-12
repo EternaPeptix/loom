@@ -1,6 +1,6 @@
 //! `glob` and `grep`: both search the same set of files.
 //!
-//! CONTRACT (bodies of `run` are placeholders for the implementer; `spec` is fixed).
+//! CONTRACT.
 //!
 //! ## The file set
 //! Walk `path` (default: the workspace; `ctx.sandbox.resolve` + `check_read`; a file is allowed and

@@ -1,6 +1,6 @@
 //! `read`, `write`, `edit`.
 //!
-//! CONTRACT (bodies of `run` are placeholders for the implementer; `spec` is fixed).
+//! CONTRACT.
 //!
 //! Paths: `ctx.sandbox.resolve(path)`, then `check_read` / `check_write`; a refusal is a `denied`
 //! result carrying the sandbox's sentence. Every result has meta `META_PATH` = the resolved path.

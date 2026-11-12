@@ -1,6 +1,6 @@
 //! One session: its log, its step loop, and what it does with everything that can happen to it.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; public signatures and types are fixed;
+//! CONTRACT (public signatures and types are fixed;
 //! private fields and helpers are yours). `docs/DESIGN.md` §5, §8 and §9 are the base text; where this
 //! file is more specific, this file wins. Every text shown to the model comes from `crate::texts`,
 //! `crate::gate`, `crate::hud` or a tool — never write a new model-facing sentence here.

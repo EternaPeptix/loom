@@ -1,7 +1,7 @@
 //! Tools that start and steer other agents: `agent_spawn`, `agent_fanout`, `agent_message`,
 //! `agent_stop`, `decide`, `verify`.
 //!
-//! CONTRACT (the `run` bodies are placeholders for the implementer; specs and types are fixed).
+//! CONTRACT.
 //!
 //! Everything goes through `S.orch` (`S` = `self.0`, the `Shared`); every `Err(text)` from it is
 //! returned as `ToolOutput::error(text)` unless stated otherwise. Nothing here panics.

@@ -1,6 +1,6 @@
 //! Running a command so that its output and exit status survive whatever happens to this process.
 //!
-//! CONTRACT (bodies are placeholders for the implementer; signatures and types are fixed).
+//! CONTRACT.
 //!
 //! A command writes its output to a file and its exit status to another, both opened by us and
 //! inherited as file descriptors (so they can live where the sandbox forbids the command to open
