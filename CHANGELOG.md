@@ -156,6 +156,9 @@ upgrade" first; the rest says what behaves differently.
 - Every allowed connection is written to the session's `net.jsonl` (now a hash chain) before it is used;
   if the write fails the client gets 502. The proxy has fixed limits on connections, lookups and idle
   time. `web_fetch` and the CVE tools check the policy before https requests.
+- The operator can authorize more hosts for a running mission without a restart; the grant is recorded
+  in the mission ledger, applies to the mission's running sessions at once and is re-applied after a
+  restart. A lead can ask for hosts with the new `request_scope` tool, which only opens an inbox item.
 - A forwarded plain-HTTP response says `Connection: close` and ends the connection where the response
   ends, so a destination cannot pass a later answer off as one of the proxy's; `web_fetch` and the CVE
   tools open a new connection for every request.

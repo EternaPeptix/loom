@@ -946,6 +946,17 @@ head within 10 s gets `400`.
   connection is made to the first allowed address, never by name again, so a second lookup cannot
   change the destination. Rules are reported as `deny {entry}`, `mode deny_all`, `not in allow list`,
   `allow {pattern}`, `mode open`, `allow_private {entry}` or `deny private-address {addr}`.
+- **Per-session scope grants.** The operator can authorize more hosts for a running mission without a
+  restart (`Runtime::grant_scope`, `POST /api/sessions/{id}/scope`, `loom scope`). The egress policy of
+  every running session of the mission becomes the configured network plus the granted hosts: under
+  `deny_all` the granted hosts become an allowlist, under `allowlist` they are added to `allow`, under
+  `open` nothing changes. The configured `deny` list and the private-address rules still bind a granted
+  host. The lead records the grant in the ledger (`ScopeGrant`, when the mission keeps one) and gets a
+  protected note; no turn starts. A grant lives as long as the mission's sessions: a session started
+  or restored later is built from the configured network plus the ledger's `granted_hosts()`, so
+  grants survive a daemon restart. A lead asks with the `request_scope` tool (`hosts`, `why`), which
+  opens a non-blocking inbox question and grants nothing; the agent carries on and may use the hosts
+  once they appear in its state block as authorized.
 - **Special addresses**: IPv4 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24,
   192.168/16, 198.18/15, 224/4 and above; IPv6 `::`, `::1`, fc00::/7, fe80::/10, ff00::/8, 100::/64,
   100:0:0:1::/64, 2001::/23 (Teredo among them) except 2001:1::1–3, 2001:3::/32 and 2001:4:112::/48,
