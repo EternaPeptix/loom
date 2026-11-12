@@ -107,10 +107,19 @@ These are the places where loom does less than the text above might suggest.
   profile is extended. `sandbox-exec` is deprecated by Apple, though it still works. The denials of
   LaunchServices, Apple Events and launchd jobs were checked to compile into the profile but have
   not been exercised from a graphical login session.
-- **The file tools run in the daemon, outside the OS sandbox.** `read`, `write`, `edit`, `glob` and
-  `grep` check the resolved path against the same rules before they act, but the check and the use are
-  separate steps; a command that swaps a link between them can in principle win a race. They refuse
-  to touch anything that is not a regular file.
+- **The file tools run in the daemon, outside the OS sandbox.** They apply the same rules themselves.
+  `read`, `write` and `edit` check the real path of what they actually opened, not a path checked
+  earlier: a file is opened and then judged by the path the system gives for the open file, and a write
+  opens the directory, judges its real path with the file name, and creates and renames the file
+  relative to that open directory. A command that swaps a directory for a link during such a call gets
+  no content and no file out of it; it can still learn whether a path there exists and what kind of
+  file it is. `glob` and `grep` check each path and then open it by name, so a command that swaps a
+  link in between can in principle make them list or read through it. They also judge a path in the
+  form it was given, with links resolved: macOS shows `/Users`, `/private` and the other folders of the
+  data volume under `/System/Volumes/Data` too, and given a path in that form, which the rules are not
+  written in, `glob` and `grep` list and read what the rules refuse; `read`, `write` and `edit` judge
+  the name the system gives for the open file, which is the usual one. All of them refuse to touch
+  anything that is not a regular file.
 - **Without macOS there is no sandbox.** On other systems the daemon starts only with
   `[sandbox] mode = "none"`, and then commands are unconfined. The file tools still refuse the protected
   and credential paths, and the network proxy still exists, but a command can ignore it. Do not run

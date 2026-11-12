@@ -4,18 +4,20 @@
 //!
 //! The tracker maps a resolved path to what this session last saw of the file (a [`Seen`]): the
 //! SHA-256 and size of its bytes as last read whole or written, or, for a file too large to load that
-//! was read by line range, its size and modification time. `freshness(path)` compares that with the
-//! file on disk now:
+//! was read by line range, its size and modification time. `freshness(path, readable)` opens the file
+//! as `open_readable` does and compares that record with what it opened:
 //! - the file does not exist → `Missing`;
 //! - it is not a regular file (device, FIFO, socket, directory) → `Err(NotOpened::NotRegular)`;
+//! - `readable` refuses the real path of the file opened → `Err(NotOpened::Denied(sentence))`;
 //! - it exists and was never read or written by this session → `Unread`;
 //! - its bytes differ from what was recorded (for a size-and-time record: its size or modification
 //!   time differs) → `Changed { was_bytes, now_bytes }`;
 //! - otherwise `Current`.
 //!
-//! `check(path)` is `freshness` with the failure as an `io::Error` (`InvalidInput` for a path that is
-//! not a regular file). Neither loads the file: a different size decides at once, otherwise the
-//! content is hashed in 1 MiB chunks; a size-and-time record is compared without reading at all.
+//! `check(path)` is `freshness` that accepts every file it opens, for callers that confine nothing
+//! (tests), with the failure as an `io::Error` (`InvalidInput` for a path that is not a regular file).
+//! Neither loads the file: a different size decides at once, otherwise the content is hashed in 1 MiB
+//! chunks; a size-and-time record is compared without reading at all.
 //!
 //! `note(path, bytes)` records the content just read or written; `note_stat(path, meta)` records a
 //! file read by range. `Seen::of_bytes` / `Seen::of_stat` make the same records without storing them
@@ -25,18 +27,27 @@
 //! counts for the session only once the call is claimed.
 //! State is in memory only: after a restart every file is `Unread` until read again.
 //!
-//! `open_regular` is how the file tools open a file to read it: only a regular file is opened, and
-//! the open never blocks.
+//! `open_readable(path, readable)` is how the file tools open a file to read it: only a regular file
+//! is opened, and the open never blocks. Links are followed, so the path that was checked before is
+//! not what decides: once the file is open, `readable` judges `real_path` of the open descriptor, and
+//! the kind of file is judged on the descriptor too. A refusal is `NotOpened::Denied` with the judge's
+//! sentence, and the file is closed unread. `open_regular(path)` is the same open with no judge.
+//!
+//! `real_path(fd)` asks the operating system which file an open descriptor is: macOS `F_GETPATH`,
+//! Linux the link `/proc/self/fd/N`. Elsewhere it fails with a sentence saying that the file tools
+//! are not supported there, so nothing is read unjudged.
 //!
 //! Tests required: each state; a rewrite with identical bytes stays `Current`; same size with
 //! different bytes is `Changed`; a size-and-time record with the same size and a different time is
 //! `Changed`; devices, FIFOs, sockets and directories are refused by kind; `forget`; use from several
-//! threads.
+//! threads; `real_path` of a file opened through a link names the target; a file opened through a link
+//! is judged by that real path, by `open_readable` and by `freshness`.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{File, FileType, Metadata};
 use std::io::{self, Read};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -82,23 +93,41 @@ pub struct FileTracker {
     seen: Mutex<HashMap<PathBuf, Seen>>,
 }
 
-/// Why [`open_regular`] did not open a file.
+/// Why [`open_regular`] or [`open_readable`] did not open a file.
 #[derive(Debug)]
 pub enum NotOpened {
     /// The path could not be examined or opened; it may not exist.
     Io(io::Error),
     /// The path is this kind of thing, not a regular file.
     NotRegular(FileType),
+    /// The file that was opened may not be read: the judge's sentence, which names its real path.
+    Denied(String),
 }
 
+/// Judges whether the session may read the file at a real path (`real_path` of an open file); `Err`
+/// is the sentence that says why not.
+pub type Readable<'a> = &'a dyn Fn(&Path) -> Result<(), String>;
+
 /// Open the regular file at `path` for reading and return it with the metadata of the open file.
-/// Symlinks are followed. The path is examined first, so that a device, FIFO, socket or directory is
-/// refused without being opened: opening a FIFO or a device has effects of its own, and a socket
-/// cannot be opened at all. The open never blocks (the path may have become a FIFO in between, which
-/// would wait for a writer) and never takes a controlling terminal, and the type is judged again from
-/// the open file: that metadata describes what is actually read, so the type cannot change between
-/// the check and the read.
+/// [`open_readable`] without a judge.
 pub fn open_regular(path: &Path) -> Result<(File, Metadata), NotOpened> {
+    open_judged(path, None)
+}
+
+/// Open the regular file at `path` for reading, once `readable` accepts the real path of the file
+/// that was opened, and return it with the metadata of the open file. Symlinks are followed: what is
+/// judged is the file that the descriptor is, wherever the path led when it was opened, so a link
+/// swapped into the path after an earlier check of it reaches nothing that `readable` refuses.
+pub fn open_readable(path: &Path, readable: Readable<'_>) -> Result<(File, Metadata), NotOpened> {
+    open_judged(path, Some(readable))
+}
+
+/// The path is examined first, so that a device, FIFO, socket or directory is refused without being
+/// opened: opening a FIFO or a device has effects of its own, and a socket cannot be opened at all.
+/// The open never blocks (the path may have become a FIFO in between, which would wait for a writer)
+/// and never takes a controlling terminal. The real path and the type are then judged from the open
+/// file: they describe what is actually read, so neither can change between the check and the read.
+fn open_judged(path: &Path, readable: Option<Readable<'_>>) -> Result<(File, Metadata), NotOpened> {
     let before = std::fs::metadata(path).map_err(NotOpened::Io)?;
     if !before.is_file() {
         return Err(NotOpened::NotRegular(before.file_type()));
@@ -108,11 +137,51 @@ pub fn open_regular(path: &Path) -> Result<(File, Metadata), NotOpened> {
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(path)
         .map_err(NotOpened::Io)?;
+    if let Some(readable) = readable {
+        let real = real_path(file.as_fd()).map_err(NotOpened::Io)?;
+        readable(&real).map_err(NotOpened::Denied)?;
+    }
     let meta = file.metadata().map_err(NotOpened::Io)?;
     if !meta.is_file() {
         return Err(NotOpened::NotRegular(meta.file_type()));
     }
     Ok((file, meta))
+}
+
+/// The path of the file or directory that the open descriptor `fd` is, as the kernel knows it: links
+/// resolved, and the current name if it was renamed since it was opened.
+#[cfg(target_os = "macos")]
+pub fn real_path(fd: BorrowedFd<'_>) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+    let mut buf = [0u8; libc::MAXPATHLEN as usize];
+    // SAFETY: the descriptor stays open while it is borrowed, and F_GETPATH writes at most MAXPATHLEN
+    // bytes, a NUL-terminated path, into `buf`, which is that long.
+    let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = buf.iter().position(|b| *b == 0).ok_or_else(|| io::Error::other("F_GETPATH gave a path without an end"))?;
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(buf.get(..len).unwrap_or_default().to_vec())))
+}
+
+/// The path of the file or directory that the open descriptor `fd` is, as the kernel knows it: links
+/// resolved, and the current name if it was renamed since it was opened.
+#[cfg(target_os = "linux")]
+pub fn real_path(fd: BorrowedFd<'_>) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+}
+
+/// No way is known here to ask which file an open descriptor is, so nothing can be judged after it is
+/// opened, and the file tools refuse to work.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn real_path(_fd: BorrowedFd<'_>) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the file tools are not supported on this operating system, because it cannot tell which file an open \
+         descriptor is, so what was opened cannot be checked against the sandbox; use `bash` instead",
+    ))
 }
 
 /// What a file that is not a regular file is, for a sentence ("a FIFO (named pipe)").
@@ -171,19 +240,21 @@ impl FileTracker {
         }
     }
 
-    /// [`FileTracker::freshness`] with the failure as an `io::Error`. A path that is not a regular
-    /// file (device, FIFO, socket, directory) is an `InvalidInput` error whose message completes the
-    /// sentence "{path} {message}".
+    /// [`FileTracker::freshness`] accepting every file it opens, with the failure as an `io::Error`.
+    /// A path that is not a regular file (device, FIFO, socket, directory) is an `InvalidInput` error
+    /// whose message completes the sentence "{path} {message}".
     pub fn check(&self, path: &Path) -> io::Result<Freshness> {
-        self.freshness(path).map_err(|e| match e {
+        self.freshness(path, &|_| Ok(())).map_err(|e| match e {
             NotOpened::Io(e) => e,
             NotOpened::NotRegular(t) => io::Error::new(io::ErrorKind::InvalidInput, format!("is {}, not a regular file", describe_type(&t))),
+            NotOpened::Denied(why) => io::Error::new(io::ErrorKind::PermissionDenied, why),
         })
     }
 
-    /// Compare the file on disk with what this session last saw.
-    pub fn freshness(&self, path: &Path) -> Result<Freshness, NotOpened> {
-        let (mut file, meta) = match open_regular(path) {
+    /// Compare the file on disk with what this session last saw. The file is opened as
+    /// [`open_readable`] opens it, so `readable` judges the file actually compared.
+    pub fn freshness(&self, path: &Path, readable: Readable<'_>) -> Result<Freshness, NotOpened> {
+        let (mut file, meta) = match open_readable(path, readable) {
             Ok(x) => x,
             Err(NotOpened::Io(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(Freshness::Missing),
             Err(e) => return Err(e),
@@ -280,7 +351,8 @@ mod tests {
         assert!(e.to_string().contains("a directory"), "{e}");
         let e = t.check(Path::new("/dev/zero")).unwrap_err();
         assert!(e.kind() == io::ErrorKind::InvalidInput && e.to_string().contains("character device"), "{e}");
-        assert!(matches!(t.freshness(Path::new("/dev/zero")), Err(NotOpened::NotRegular(kind)) if kind.is_char_device()));
+        let any = |_: &Path| -> Result<(), String> { Ok(()) };
+        assert!(matches!(t.freshness(Path::new("/dev/zero"), &any), Err(NotOpened::NotRegular(kind)) if kind.is_char_device()));
 
         let fifo = dir.path().join("pipe");
         let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
@@ -297,7 +369,46 @@ mod tests {
         // A failure that is not about the kind of file stays an I/O error, whatever its kind: a NUL in
         // the path is `InvalidInput` from the standard library and says nothing about what the path is.
         assert!(matches!(open_regular(&dir.path().join("none")), Err(NotOpened::Io(e)) if e.kind() == io::ErrorKind::NotFound));
-        assert!(matches!(t.freshness(Path::new("a\0b")), Err(NotOpened::Io(e)) if e.kind() == io::ErrorKind::InvalidInput));
+        assert!(matches!(t.freshness(Path::new("a\0b"), &any), Err(NotOpened::Io(e)) if e.kind() == io::ErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn a_file_opened_through_a_link_is_judged_by_its_real_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (real, ws) = (root.join("real"), root.join("ws"));
+        std::fs::create_dir(&real).unwrap();
+        std::fs::create_dir(&ws).unwrap();
+        std::fs::write(real.join("f"), "content").unwrap();
+        std::os::unix::fs::symlink(&real, ws.join("d")).unwrap();
+        let via_link = ws.join("d/f");
+
+        // The kernel names the file the descriptor is, not the path it was opened by.
+        let (file, _) = open_regular(&via_link).unwrap();
+        assert_eq!(real_path(file.as_fd()).unwrap(), real.join("f"));
+
+        // The judge sees that real path, and its refusal is the result; the file is not handed out.
+        let judged = std::sync::Mutex::new(Vec::new());
+        let refuse_real = |p: &Path| {
+            judged.lock().unwrap().push(p.to_path_buf());
+            if p.starts_with(&real) { Err(format!("{} is off limits", p.display())) } else { Ok(()) }
+        };
+        let e = open_readable(&via_link, &refuse_real).unwrap_err();
+        assert!(matches!(&e, NotOpened::Denied(why) if why == &format!("{} is off limits", real.join("f").display())), "{e:?}");
+        assert_eq!(*judged.lock().unwrap(), vec![real.join("f")]);
+        let (mut file, meta) = open_readable(&via_link, &|_| Ok(())).unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        assert_eq!((text.as_str(), meta.len()), ("content", 7));
+
+        // The tracker compares only a file the judge accepts.
+        let t = FileTracker::new();
+        t.note(&via_link, b"content");
+        assert!(matches!(t.freshness(&via_link, &refuse_real), Err(NotOpened::Denied(_))));
+        assert_eq!(t.freshness(&via_link, &|_| Ok(())).unwrap(), Freshness::Current);
+        assert_eq!(t.freshness(&ws.join("none"), &refuse_real).unwrap(), Freshness::Missing);
+        let e = t.check(&ws.join("d")).unwrap_err();
+        assert!(e.to_string().contains("a directory"), "{e}");
     }
 
     #[test]

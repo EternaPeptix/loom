@@ -821,11 +821,19 @@ Paths are made canonical when the sandbox is built. On macOS the rules that refu
 regard to case (volumes are case-insensitive by default); the rules that allow are compared exactly. The
 file tools apply the same policy in-process (`check_read`, `check_write`) to the path resolved through
 links, so a link inside the workspace grants nothing; in mode `none` they still apply the never-writable
-and not-readable rules. A role with `read_only` gets no `extra_writable` and its workspace is added to
-the never-writable paths, so it can still write in its session temp dir, in the system temp locations
-(`/private/tmp`, `/private/var/folders`, which other sessions use too) and to the device files, and
-nowhere else. Commands get the daemon's environment without any variable whose name (case-insensitive)
-contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`,
+and not-readable rules. `read`, `write` and `edit` apply it again to the real path of the object they
+opened, never only to a path checked earlier, so a directory swapped for a link during a call grants
+nothing either: a file is opened and the real path of the open descriptor is checked (macOS
+`F_GETPATH`, Linux `/proc/self/fd`; elsewhere the file tools refuse to work); a write opens the
+directory without following a link in its last component (missing directories are made one at a time
+below an open ancestor, each checked first and opened without following a link), checks the real
+path of that directory joined with the file name, and creates, syncs and renames the temporary file
+relative to that descriptor. A file name that is itself a link is read and followed by the writer, at
+most 8 links, so the directory checked is the target's. A role with `read_only` gets no `extra_writable`
+and its workspace is added to the never-writable paths, so it can still write in its session temp dir,
+in the system temp locations (`/private/tmp`, `/private/var/folders`, which other sessions use too) and
+to the device files, and nowhere else. Commands get the daemon's environment without any variable whose
+name (case-insensitive) contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`,
 `CREDENTIAL`, `AUTH_TOKEN`, `COOKIE`, `SESSION_KEY` or `PRIVATE`, has `SESSION`, `AUTH`, `PASS`, `JWT`
 or `WEBHOOK` as a part delimited by `_` or the ends of the name, ends in `_PAT`, `_DSN`, `_PWD` or `_PW`,
 is `DATABASE_URL`, `SSH_AUTH_SOCK` or the `api_key_env` of any model profile, or starts with `LOOM_`, or
