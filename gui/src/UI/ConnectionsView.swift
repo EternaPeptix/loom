@@ -30,11 +30,13 @@ struct ConnectionsView: View {
                         VStack(alignment: .leading) {
                             Text(c.name.isEmpty ? "(unnamed)" : c.name)
                             Text(subtitle(c)).font(.caption).foregroundStyle(.secondary)
+                            if let bad = invalidReason(c) { Text(bad).font(.caption).foregroundStyle(.red) }
                         }
                         Spacer()
                         Button("Edit") { editing = c }
                         Button("Delete", role: .destructive) { deleting = c }
                         Button("Connect") { state.connect(c) }.buttonStyle(.borderedProminent)
+                            .disabled(invalidReason(c) != nil)
                     }
                     .padding(.vertical, 2)
                 }
@@ -63,6 +65,11 @@ struct ConnectionsView: View {
         } message: { _ in
             Text("This also removes its token from the Keychain.")
         }
+    }
+
+    /// A saved Direct connection whose URL breaks the http/https host rule is shown as invalid, not used.
+    private func invalidReason(_ c: Connection) -> String? {
+        c.mode == .direct ? ConnectionStore.baseURLProblem(c.baseURL) : nil
     }
 
     private func subtitle(_ c: Connection) -> String {
@@ -105,9 +112,7 @@ struct ConnectionEditor: View {
             }
             if port == nil { return "Remote port must be 1–65535." }
         case .direct:
-            if ConnectionStore.normalizedBaseURL(draft.baseURL) == nil {
-                return "Base URL must look like http://127.0.0.1:7878"
-            }
+            if let m = ConnectionStore.baseURLProblem(draft.baseURL) { return m }
         }
         if needsToken {
             let t = token.trimmingCharacters(in: .whitespacesAndNewlines)

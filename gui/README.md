@@ -14,21 +14,25 @@ the SAME port number at both ends (the daemon only accepts its own port in the `
 headers). If that local port is busy the connection fails and names the port: close whatever uses it
 (`lsof -nP -iTCP:<port> -sTCP:LISTEN`), or use a Direct connection. The tunnel's ssh runs with
 connection sharing off (`ControlMaster=no`, `ControlPath=none`), so the forward ends with it. The app
-keeps the token in the Keychain and shows the UI by asking the daemon for a one-time code
-(`POST /api/login-codes`, bearer token) and loading `<base>/#code=<code>`; every web view, including
-the one Reload builds, gets its own fresh code. Daemons without that route (404) get the older
-`<base>/?token=<token>` URL instead. A tunnel whose ssh process ends is shown as disconnected with
-ssh's last error line.
+keeps the token in the Keychain. Before the token is sent anywhere the daemon must prove it holds it
+(`GET /healthz?nonce=<64 hex>` answers an HMAC-SHA256 proof); the app then asks for a one-time code
+(`POST /api/login-codes`, bearer token) and loads `<base>/#code=<code>`; every web view, including
+the one Reload builds, gets its own fresh code. A daemon that cannot prove its identity (one older
+than the app: restart it on the new version) gets no token, and there is no token-in-URL fallback.
+A Direct connection may use http only for 127.0.0.1, localhost or [::1]; any other host needs https.
+The link button copies the daemon's base address only, never a code or token. A tunnel whose ssh
+process ends is shown as disconnected with ssh's last error line.
 
 ## Build
 
 ```
-gui/build.sh --pull          # build on the build host, copy gui/dist/loom-desk.app here
+LOOM_BUILD_HOST=<host> gui/build.sh --pull          # build on the build host, copy gui/dist/loom-desk.app here
 xattr -dr com.apple.quarantine gui/dist/loom-desk.app   # first run only
 open gui/dist/loom-desk.app
 ```
 
-`LOOM_BUILD_HOST=local gui/build.sh` builds in place if you have the Xcode toolchain on this machine.
+`LOOM_BUILD_HOST` must be set (the build host, or `local`, which builds in place if you have the Xcode
+toolchain on this machine). `LOOM_SWIFTFLAGS` is passed to the host quoted with `printf %q`.
 
 ## Design
 

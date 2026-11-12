@@ -103,7 +103,15 @@ process (SIGTERM, then SIGKILL after a short grace). The tunnel is torn down on 
 on switching connections, and on app quit (`applicationWillTerminate`). Exactly one tunnel at a time.
 
 A `.direct` connection skips all of this: `baseURL` is the configured URL and the token comes from the
-Keychain or a prompt.
+Keychain or a prompt. The URL may use http only when its host is 127.0.0.1, localhost or [::1]; any other
+host must use https, because the token travels in every request. A saved connection that breaks this is
+shown as invalid, with the reason, and cannot be connected. `Info.plist` declares
+`NSAppTransportSecurity` / `NSAllowsLocalNetworking` = true (nothing broader), so loopback http works for
+names as well as IP literals.
+
+Tunnel exit reports: `close(only:)` stops exactly the process it is given, even when a newer open() has
+replaced it (without touching the current state). An unexpected-exit report is acted on only if its ssh
+child is still the current one at the moment it is delivered on the main actor.
 
 ## Daemon client (`Net/DaemonClient.swift`)
 
@@ -129,26 +137,30 @@ version may add quick-answer from the notification; out of scope for v1.)
 
 ## Web pane (`UI/WebPane.swift`)
 
-A `WKWebView` wrapped in `NSViewRepresentable`. It logs in with a one-time code: the app (which holds
-the token) sends `POST <baseURL>/api/login-codes` with `Authorization: Bearer <token>`; the answer is
+A `WKWebView` wrapped in `NSViewRepresentable`. It logs in with a one-time code. First the daemon proves
+its identity: `GET <baseURL>/healthz?nonce=<N>` (N = 64 random hex characters, no token sent) must answer
+`{"ok": true, "proof": "<hex>"}` with proof = HMAC-SHA256 keyed with the token's bytes over the ASCII
+`loom-healthz-v1:` followed by N, compared in constant time. This is done on connect, before every login
+code request, and at the start of every attempt of the daemon client and again before the snapshot that follows an ended stream (a wrong answer after connect turns the link to failed with that message); when the proof is missing or wrong
+the token is not sent and the app says that something answered but did not prove it is the daemon for this
+token, and that a daemon older than the app must be restarted on the new version. Then the app (which
+holds the token) sends `POST <baseURL>/api/login-codes` with `Authorization: Bearer <token>`; the answer is
 `{"code": "<hex>", "expires_in_s": 60}` and the pane loads `<baseURL>/#code=<code>`. The page exchanges
 the code itself; no cookie is involved and the token is never in a URL. A code is single use and
 short-lived, so none is minted ahead of time: each newly built web view (on connect, on reload or
 retry, and when SwiftUI builds the window's content again) asks for its own code, takes the URL once,
 and loads exactly that one URL. Reload and retry build a new web view rather than reloading the old
 one: the old document's code is spent, and loading another `#code=` URL into the same document would
-only change its fragment (WebKit does not reload for that) and run nothing. Fallback for older
-daemons: if the POST answers 404 the pane loads the old entry URL `<baseURL>/?token=<token>` (newer
-daemons also still accept it by redirecting to a code URL); this is the only case where the token
-appears in a URL. Thereafter the UI drives itself (same-origin XHR/SSE to the daemon, through the
+only change its fragment (WebKit does not reload for that) and run nothing. There is no fallback for
+daemons without login codes (they cannot prove their identity either): the token is never in a URL.
+Thereafter the UI drives itself (same-origin XHR/SSE to the daemon, through the
 tunnel). The pane:
 
 - restricts navigation to the `baseURL` origin (loopback): a navigation action to any other origin is
   cancelled and opened in the default browser instead (so links in fetched pages don't hijack the
   pane). Requests only ever leave for `127.0.0.1:<port>`.
-- exposes reload (a new web view with a fresh code) and a "copy web URL" affordance (a fresh
-  single-use code URL, valid for 60 s, for opening in a real browser if wanted; the token URL only on
-  the 404 fallback);
+- exposes reload (a new web view with a fresh code) and a "copy address" affordance that copies the
+  daemon's base address only (scheme, host, port): no login code and no token reach the pasteboard;
 - shows a clear state when there is no connection, when the tunnel is connecting, and when the daemon
   is unreachable (with the error and a retry), rather than a blank white view.
 
@@ -182,6 +194,9 @@ tunnel and client write counts/status back into it on the main actor.
 2. assemble `dist/loom-desk.app/Contents/{MacOS/loom-desk, Info.plist, Resources/…}`.
 3. `codesign --force --deep --sign - --options runtime dist/loom-desk.app` (ad-hoc).
 4. print the bundle path and size.
+
+`LOOM_BUILD_HOST` is required (a build host, or `local`); the script stops with a message otherwise.
+`LOOM_SWIFTFLAGS` reaches the host quoted with `printf %q`, so a quote or `;` in it runs nothing there.
 
 The app is copied to the operator's Mac with rsync; because it is ad-hoc signed and crosses machines,
 `README.md` tells the operator to clear the quarantine attribute (`xattr -dr com.apple.quarantine`)

@@ -12,7 +12,8 @@ enum WebState: Equatable {
 /// A `WKWebView` that shows the daemon's own web UI over the tunnel. See gui/DESIGN.md "Web pane".
 ///
 /// - each web view loads exactly one entry URL (`<baseURL>/#code=<one-time code>`: the page exchanges the
-///   code itself, no cookie is involved). A new view calls `onCreated`; AppState then mints a code, bumps
+///   code itself; the app sets no cookie and never puts the token in a URL). A new view calls `onCreated`;
+///   AppState then makes the daemon prove its identity, mints a code, bumps
 ///   `entryTick`, and the view takes the URL once through `takeEntry`. A reload builds a new view, so
 ///   every load is a full document load, never a fragment change in the old one. Reports loading /
 ///   loaded / failed through `onState`.
@@ -20,7 +21,7 @@ enum WebState: Equatable {
 ///   opened in the default browser, other schemes are just cancelled.
 /// - navigates to `#/s/<id>` when `focusSession` is set (then clears it).
 /// - never injects scripts or reads page contents (it does look at the HTTP status of the main
-///   frame response, which is navigation metadata, to report a rejected token).
+///   frame response, which is navigation metadata, to report a page the daemon refused).
 /// - uses a non-persistent data store, so nothing the page stores touches disk and nothing from another
 ///   daemon on the same loopback host can be replayed.
 struct WebPane: NSViewRepresentable {
@@ -128,7 +129,7 @@ struct WebPane: NSViewRepresentable {
                      decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
             if navigationResponse.isForMainFrame, let http = navigationResponse.response as? HTTPURLResponse,
                http.statusCode == 401 || http.statusCode == 403 {
-                report(.failed("the daemon rejected the token (HTTP \(http.statusCode)). Edit the connection and reconnect."))
+                report(.failed("the daemon refused the page (HTTP \(http.statusCode)). Reconnect for a fresh login code."))
             }
             decisionHandler(.allow)
         }
@@ -189,7 +190,7 @@ struct WebPane: NSViewRepresentable {
     static func selfCheck() -> [String] {
         var f: [String] = []
         func chk(_ c: Bool, _ m: String) { if !c { f.append("WebPane: " + m) } }
-        guard let a = URL(string: "http://127.0.0.1:5000/?token=x"),
+        guard let a = URL(string: "http://127.0.0.1:5000/#code=x"),
               let b = URL(string: "http://127.0.0.1:5000/app.js"),
               let c = URL(string: "http://127.0.0.1:5001/"),
               let d = URL(string: "http://localhost:5000/"),

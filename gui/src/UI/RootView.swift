@@ -77,7 +77,7 @@ struct RootView: View {
     }
 }
 
-/// The bar above the web pane: active connection name, link status, reload, copy web URL.
+/// The bar above the web pane: active connection name, link status, reload, copy address.
 struct ConnectionBar: View {
     @EnvironmentObject var state: AppState
 
@@ -103,8 +103,8 @@ struct ConnectionBar: View {
             if case .connected = state.link {
                 Button { state.reload() } label: { Image(systemName: "arrow.clockwise") }
                     .help("Reload the page")
-                Button { state.copyWebURL() } label: { Image(systemName: "link") }
-                    .help("Copy a one-time web link (valid for 60 s)")
+                Button { state.copyAddress() } label: { Image(systemName: "link") }
+                    .help("Copy the daemon's address (no login code, no token)")
             }
             if state.link != .none {
                 Button { state.disconnect() } label: { Image(systemName: "xmark.circle") }
