@@ -79,7 +79,8 @@ pub struct ModelProfile {
     /// finish reason, certificate errors) end the request after 3 attempts in a row whatever this is
     /// set to. Every other failure is retried for the whole window, so with 0 one that never heals
     /// but looks like an outage (a server that hangs up during the TLS handshake, an error object in
-    /// every stream) is retried until the request is cancelled.
+    /// every stream) is retried until the request is cancelled. `agents.unavailable_notice_s` tells the
+    /// operator about a request that keeps retrying.
     pub retry_window_s: u64,
     /// Longest pause between retries.
     pub retry_max_delay_s: u64,
@@ -237,6 +238,10 @@ pub struct AgentsCfg {
     pub invalid_calls_before_forcing: u32,
     /// Outputs with at least this many lines never shown are listed in the HUD.
     pub unviewed_min_lines: u64,
+    /// Seconds a model request of a session may keep retrying an unavailable server before the
+    /// session tells the operator in a non-blocking inbox item (0 = never). None is opened when the
+    /// request's retry window ends first: the request then fails at its next failed attempt.
+    pub unavailable_notice_s: u64,
 }
 
 impl Default for AgentsCfg {
@@ -250,6 +255,7 @@ impl Default for AgentsCfg {
             verify_finish: true,
             invalid_calls_before_forcing: 3,
             unviewed_min_lines: 20,
+            unavailable_notice_s: 300,
         }
     }
 }

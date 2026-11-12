@@ -357,6 +357,67 @@ pub fn turn_failed(why: &str) -> String {
     format!("The session could not continue. {why} Nothing was lost: answer here, or send the session a message, to make it try again.")
 }
 
+/// Longest part of the last error quoted in a model-unavailable notice.
+pub const UNAVAILABLE_ERROR_CHARS: usize = 600;
+
+/// A wall-clock time for the operator, in UTC: `2026-11-12 14:03:07 UTC`. `ms` is since the Unix epoch.
+pub fn clock(ms: u64) -> String {
+    let secs = ms / 1000;
+    let rem = secs % 86_400;
+    // Days since 1970-01-01 to a civil date (proleptic Gregorian). `days` is below 2^38, so none of
+    // the steps below can overflow.
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC", rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
+/// Inbox text: a model request of the session has been retrying for a while. `since` is the request's
+/// first failure, `last` the latest one, `until` when the request gives up (`None`: it retries until
+/// the server answers).
+pub fn model_unavailable(base_url: &str, since: &str, last: &str, until: Option<&str>) -> String {
+    let retrying = match until {
+        Some(t) => format!(
+            "The session keeps retrying the request until about {t}; if the server has not answered by then, the request fails."
+        ),
+        None => "The session keeps retrying the request until the server answers or the session is stopped (retry_window_s = 0).".to_string(),
+    };
+    format!(
+        "The model server at {base_url} has been unavailable since {since}. Last error: {} {retrying} Nothing needs to be answered: this item closes by itself when the request ends. Check that the server is running and reachable at that address.",
+        sentence(&cut(&one_line(last), UNAVAILABLE_ERROR_CHARS))
+    )
+}
+
+/// How a model-unavailable notice was resolved: the server answered again at `at`.
+pub fn unavailable_answered(at: &str) -> String {
+    format!("Answered automatically: the model server answered again at {at}, and the session carries on.")
+}
+
+/// How a model-unavailable notice was resolved: the request ended without a reply at `at` (`why`
+/// is the error).
+pub fn unavailable_failed(at: &str, why: &str) -> String {
+    format!(
+        "Answered automatically: the request ended without a reply at {at}: {} The session handles that as any failed request.",
+        sentence(&cut(&one_line(why), UNAVAILABLE_ERROR_CHARS))
+    )
+}
+
+/// How a model-unavailable notice was resolved: the step waiting for the server was stopped at `at`.
+pub fn unavailable_stopped(at: &str) -> String {
+    format!("Answered automatically: the step that was waiting for the model server was stopped at {at}.")
+}
+
+/// How a model-unavailable notice that the session left open when it stopped is resolved when the
+/// session is next activated.
+pub const UNAVAILABLE_LEFT_OPEN: &str = "Answered automatically: the session stopped while its request was waiting for the model server, so nothing is waiting any more.";
+
 /// The question put to each `decide` voter, after the session's stable prefix.
 pub fn vote_prompt(question: &str, options: &[String]) -> String {
     let mut out = format!(
@@ -522,6 +583,27 @@ mod tests {
         let child = failed_report(&task_failed("boom", true), "");
         assert!(child.starts_with("The agent's session failed and delivered no result. Its task failed with an internal error"), "{child}");
         assert!(child.contains("start a new agent") && !child.contains("send the session a message"), "{child}");
+    }
+
+    #[test]
+    fn a_model_unavailable_notice_says_where_since_when_why_and_until_when() {
+        assert_eq!(clock(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(clock(951_782_400_000), "2000-02-29 00:00:00 UTC");
+        assert_eq!(clock(1_794_492_187_999), "2026-11-12 14:03:07 UTC");
+        let finite = model_unavailable("http://h:8000/v1", "A", "cannot reach the server:\nrefused", Some("B"));
+        assert!(finite.starts_with("The model server at http://h:8000/v1 has been unavailable since A. "), "{finite}");
+        assert!(finite.contains("Last error: cannot reach the server: refused. "), "{finite}");
+        assert!(finite.contains("until about B; if the server has not answered by then, the request fails."), "{finite}");
+        assert!(finite.contains("Nothing needs to be answered"), "{finite}");
+        let open = model_unavailable("http://h:8000/v1", "A", "HTTP 503.", None);
+        assert!(open.contains("Last error: HTTP 503. "), "{open}");
+        assert!(open.contains("until the server answers or the session is stopped"), "{open}");
+        let failed = unavailable_failed("C", "the model request failed after 4 attempts: HTTP 503");
+        assert!(failed.contains("at C: the model request failed after 4 attempts: HTTP 503. The session"), "{failed}");
+        let answers = [unavailable_answered("C"), unavailable_failed("C", "x"), unavailable_stopped("C")];
+        for answer in answers.into_iter().chain([UNAVAILABLE_LEFT_OPEN.to_string()]) {
+            assert!(answer.starts_with("Answered automatically: "), "{answer}");
+        }
     }
 
     #[test]

@@ -94,6 +94,7 @@ stall_steps = 30           # steps without a new ledger entry before the harness
 verify_finish = true       # a role with verify_finish has its finish attacked by its verifier first; false skips that for every role (the finish is marked "not verified")
 invalid_calls_before_forcing = 3   # consecutive invalid tool calls before the next request forces a tool call
 unviewed_min_lines = 20    # outputs with at least this many lines never shown are listed in the HUD
+unavailable_notice_s = 300 # a model request still retrying after this long opens a non-blocking inbox item and notifies you (it closes by itself); 0 = never
 
 [notify]
 # command = ["/usr/local/bin/my-notify"]   # program run with the title and body as two arguments; default: the platform's notifier

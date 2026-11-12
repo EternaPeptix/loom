@@ -58,7 +58,11 @@ default. Unknown keys are errors, so a typo does not go unnoticed. The values th
   new session is refused with a sentence naming the URL.
 - `retry_window_s` (default 300): how long a request keeps retrying an unreachable server. `0` retries
   until the server returns. A failure waiting cannot cure (a reply that is not an event stream, for
-  example) ends the request after three attempts in a row whatever this is set to.
+  example) ends the request after three attempts in a row whatever this is set to. A request still
+  retrying after `[agents] unavailable_notice_s` (default 300; `0` = never) opens a non-blocking inbox
+  item and notifies you; the item closes by itself when the request ends. A request whose window ends
+  first opens none (it fails at its next failed attempt, and a failed step opens its own item), so
+  with both at 300 the notice matters only for a longer window or `retry_window_s = 0`.
 - `[context] target_tokens` and `floor_tokens`: a re-weave folds old output out of view when the prompt
   passes the target, down to the floor. The target must be below the model's window.
 - `[network] mode`: `deny_all` (the default), `allowlist` or `open`; see below.
