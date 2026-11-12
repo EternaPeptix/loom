@@ -1250,11 +1250,8 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
             outln("ok").map(|()| 0)
         }
         ConfigAction::Init => {
-            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&paths.home)
+            use std::os::unix::fs::OpenOptionsExt;
+            loom_core::config::ensure_private_dir(&paths.home)
                 .map_err(|e| format!("Cannot create {} ({e}).", paths.home.display()))?;
             let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&file) {
                 Ok(f) => f,
@@ -1296,9 +1293,10 @@ fn cmd_service(paths: &Paths, action: ServiceAction) -> Result<i32, String> {
     match action {
         ServiceAction::Install => {
             let exe = std::env::current_exe().map_err(|e| format!("Cannot find this program's path ({e})."))?;
-            for dir in [plist.parent(), Some(paths.logs_dir().as_path())].into_iter().flatten() {
+            if let Some(dir) = plist.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create {} ({e}).", dir.display()))?;
             }
+            crate::serve::prepare_home(paths)?;
             std::fs::write(&plist, launch_agent_plist(&exe, &paths.home))
                 .map_err(|e| format!("Cannot write {} ({e}).", plist.display()))?;
             launchctl(&["bootstrap", &domain, &plist.display().to_string()])?;

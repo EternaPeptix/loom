@@ -133,7 +133,10 @@ impl NetLogWriter {
     pub fn append<T: Serialize>(&self, path: &Path, entry: &T) -> std::io::Result<()> {
         let slot = lock(&self.files).entry(path.to_path_buf()).or_default().clone();
         let mut tail = lock(&slot);
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).read(true).open(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true).read(true);
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(path)?;
         let mut len = file.metadata()?.len();
         let (prev, needs_newline) = match tail.as_ref() {
             Some((l, h)) if *l == len => (h.clone(), false),
@@ -214,6 +217,16 @@ mod tests {
         // A second writer continues the same chain.
         NetLogWriter::new().append(&path, &json!({"n": 3})).unwrap();
         assert_eq!(verify(&std::fs::read_to_string(&path).unwrap()), Ok(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_audit_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("net.jsonl");
+        NetLogWriter::new().append(&path, &json!({"n": 0})).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

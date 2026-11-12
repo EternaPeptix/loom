@@ -276,7 +276,7 @@ impl JobTable {
 
     /// The next id and the paths of its output and status files.
     pub async fn allocate(&self) -> std::io::Result<(String, PathBuf, PathBuf)> {
-        std::fs::create_dir_all(&self.dir)?;
+        loom_core::config::ensure_private_dir(&self.dir)?;
         let mut inner = lock(&self.inner);
         inner.last = inner.last.saturating_add(1);
         let id = format!("j{}", inner.last);

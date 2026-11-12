@@ -301,13 +301,21 @@ fn damaged_name(path: &Path) -> PathBuf {
     candidate
 }
 
+/// Options for a file only the owner may read or write (mode 0600 on Unix, set at creation).
+fn private_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+}
+
 impl SessionLog {
     /// Create a new, empty log. Parent directories are created. Fails if the file exists.
     pub fn create(path: &Path, durability: Durability) -> Result<SessionLog, LogError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(io_err(parent))?;
+            crate::config::ensure_private_dir(parent).map_err(io_err(parent))?;
         }
-        let file = match OpenOptions::new().append(true).create_new(true).open(path) {
+        let file = match private_options().append(true).create_new(true).open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(LogError::Exists(path.to_path_buf()))
@@ -357,7 +365,7 @@ impl SessionLog {
             let moved_to = damaged_name(path);
             let mut src = File::open(path).map_err(io_err(path))?;
             src.seek(SeekFrom::Start(good_len)).map_err(io_err(path))?;
-            let mut dst = OpenOptions::new()
+            let mut dst = private_options()
                 .write(true)
                 .create_new(true)
                 .open(&moved_to)
@@ -671,6 +679,17 @@ mod tests {
         let path = dir.path().join("s").join("log.jsonl");
         let log = SessionLog::create(&path, Durability::Batch).unwrap();
         (path, log)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_log_is_private_in_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _log) = new_log(&dir);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
     }
 
     fn lines(path: &Path) -> Vec<Vec<u8>> {

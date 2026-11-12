@@ -65,7 +65,7 @@ use loom_agent::runtime::Runtime;
 use loom_core::config::{Config, ConfigError, Paths};
 use std::future::IntoFuture;
 use std::net::SocketAddr;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -113,13 +113,8 @@ pub async fn run_until(
     raise_open_files_limit();
     init_logging();
 
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&paths.home)
-        .map_err(|e| format!("Cannot create {}: {e}.", paths.home.display()))?;
+    prepare_home(&paths)?;
     let _home_lock = take_home_lock(&paths)?;
-    std::fs::create_dir_all(paths.logs_dir()).map_err(|e| format!("Cannot create {}: {e}.", paths.logs_dir().display()))?;
     let config = load_config(&paths)?;
     loom_tools::sandbox::preflight(&config.sandbox)?;
 
@@ -205,17 +200,19 @@ pub async fn run_until(
     Ok(())
 }
 
+/// Create the home and its top-level directories as private (0700), tightening ones left looser by an earlier
+/// version or by an operator who created them first.
+pub fn prepare_home(paths: &Paths) -> Result<(), String> {
+    paths.ensure_private_layout().map_err(|e| format!("Cannot prepare {} as a private directory: {e}.", paths.home.display()))
+}
+
 /// Start the daemon in the background and wait until it answers.
 pub async fn spawn_background(paths: &Paths) -> Result<Spawned, String> {
     let config = load_config(paths)?;
     if answering(paths, &config).await? {
         return Ok(Spawned::Already);
     }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(paths.logs_dir())
-        .map_err(|e| format!("Cannot create {}: {e}.", paths.logs_dir().display()))?;
+    prepare_home(paths)?;
     let log = paths.logs_dir().join("loomd.log");
     let out = std::fs::OpenOptions::new()
         .create(true)
@@ -596,6 +593,21 @@ mod tests {
         );
         std::fs::write(home.join("config.toml"), config).unwrap();
         Home { paths: Paths::at(home), dir, _server: server }
+    }
+
+    #[test]
+    fn preparing_a_looser_home_tightens_it_and_its_top_level_directories() {
+        let h = tempfile::tempdir().unwrap();
+        let paths = Paths::at(h.path().join(".loom"));
+        std::fs::create_dir_all(paths.logs_dir()).unwrap();
+        for d in [&paths.home, &paths.logs_dir()] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        prepare_home(&paths).unwrap();
+        for d in [paths.home.clone(), paths.keys_dir(), paths.sessions_dir(), paths.missions_dir(), paths.blobs_dir(), paths.logs_dir()] {
+            let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", d.display());
+        }
     }
 
     type Running = (tokio::task::JoinHandle<Result<(), String>>, CancellationToken, String);

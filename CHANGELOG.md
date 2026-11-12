@@ -165,6 +165,10 @@ upgrade" first; the rest says what behaves differently.
   kept as an opaque record instead of being treated as damage.
 - The blob store removes stale temporary files, repairs missing indexes, and is cleaned only by
   `loom gc`.
+- The loom home and every directory under it are created 0700 and every file 0600, also when the home
+  already existed (after `loom service install`, say). The daemon tightens the home, `keys/`, `sessions/`,
+  `missions/`, `blobs/` and `logs/` at start; files from earlier versions keep their mode but are no longer
+  reachable by other accounts. `chmod -R go-rwx ~/.loom` tightens them too.
 
 ### Packs and documents
 

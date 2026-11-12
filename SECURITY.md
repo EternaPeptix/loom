@@ -18,6 +18,15 @@ mistakes or be talked into harmful commands. loom limits what a command the mode
 the records the model cannot edit, and does not let model text pass as the operator's or the
 harness's.
 
+### Files on disk
+
+- The loom home and every directory the harness creates under it are mode 0700, and every file it creates
+  there (session logs, status and meta files, blobs and their indexes, job output, the egress audit file,
+  journals, the daemon file, the log) is mode 0600, set at creation. At start the daemon tightens the home,
+  `keys/`, `sessions/`, `missions/`, `blobs/` and `logs/` to 0700 if an earlier version or the operator left
+  them looser, which cuts other local accounts off. Files written by earlier versions are not rewritten
+  and keep their mode behind those directories; `chmod -R go-rwx ~/.loom` tightens them as well.
+
 ### The daemon and its API
 
 - The daemon listens on a loopback address only. It refuses to start on a name that resolves to a

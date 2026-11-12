@@ -122,7 +122,8 @@ pub struct BlobWriter {
 impl BlobStore {
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
-        fs::create_dir_all(root.join("tmp"))?;
+        crate::config::ensure_private_dir(&root)?;
+        crate::config::ensure_private_dir(&root.join("tmp"))?;
         remove_stale_tmp(&root.join("tmp"), STALE_TMP_AGE);
         Ok(Self { root })
     }
@@ -256,7 +257,7 @@ impl BlobStore {
     pub fn writer(&self) -> io::Result<BlobWriter> {
         let name = format!("{}-{}", crate::now_ms(), rand::random::<u64>());
         let tmp = self.root.join("tmp").join(name);
-        let file = File::create(&tmp)?;
+        let file = create_private(&tmp)?;
         Ok(BlobWriter { store: self.clone(), tmp, file, hasher: Sha256::new(), bytes: 0, offsets: Vec::new(), at_line_start: true })
     }
 
@@ -525,13 +526,22 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// Create or truncate `path` as a file only the owner may read or write (mode 0600 on Unix, set at creation).
+fn create_private(path: &Path) -> io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
 /// Write the index through `tmp` (synced) and rename it over `idx`.
 fn write_index(tmp: &Path, idx: &Path, offsets: &[u64]) -> io::Result<()> {
     let mut raw = Vec::with_capacity(offsets.len().saturating_mul(8));
     for off in offsets {
         raw.extend_from_slice(&off.to_le_bytes());
     }
-    let mut f = File::create(tmp)?;
+    let mut f = create_private(tmp)?;
     f.write_all(&raw)?;
     f.sync_all()?;
     drop(f);
@@ -634,7 +644,7 @@ impl BlobWriter {
         let id = hex::encode(std::mem::take(&mut self.hasher).finalize());
         let dest = self.store.path_of(&id);
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+            crate::config::ensure_private_dir(parent)?;
         }
         let blob = BlobRef { id: BlobId(id), bytes: self.bytes, lines: self.offsets.len() as u64 };
         let idx = self.store.idx_path(&blob.id);
@@ -678,6 +688,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::open(dir.path().join("blobs")).unwrap();
         (dir, store)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blob_index_and_directories_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, s) = store();
+        let b = s.put_bytes(b"one\ntwo\n").unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let blob = s.path_of(&b.id.0);
+        assert_eq!(mode(&blob), 0o600);
+        assert_eq!(mode(&s.idx_path(&b.id)), 0o600);
+        for dir in [s.root.clone(), s.root.join("tmp"), blob.parent().unwrap().to_path_buf()] {
+            assert_eq!(mode(&dir), 0o700, "{}", dir.display());
+        }
     }
 
     #[test]

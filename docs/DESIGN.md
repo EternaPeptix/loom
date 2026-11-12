@@ -109,7 +109,10 @@ The command line (`loom --help`): `daemon`, `up`, `down`, `status`, `open`, `run
 `ledger`, `window`, `net`, `out`, `config`, `service` (the module documentation of
 `loom_daemon::cli` is its specification).
 
-The state root is `~/.loom/` (override `LOOM_HOME`), never inside a workspace:
+The state root is `~/.loom/` (override `LOOM_HOME`), never inside a workspace. Every directory the harness
+creates under it is 0700 and every file 0600, set at creation (the process umask is not changed, so commands
+keep the user's umask in the workspace); at start the daemon also tightens the home, `keys/`, `sessions/`,
+`missions/`, `blobs/` and `logs/` to 0700 when they exist with group or other access.
 
 ```
 config.toml                          optional; every key has a default, unknown keys are errors
@@ -366,8 +369,7 @@ zeros before the first entry. Verification recomputes over the bytes on disk.
 - **Newer entries.** An entry with a valid seal whose op this build cannot parse is kept in the chain
   and skipped when folding; appends are refused (`NewerVersion`) and the model is told that loom must
   be upgraded before the mission can continue.
-- **Key.** `keys/journal.key`: 32 random bytes as hex, created 0600 (inside the loom home, which a
-  daemon that creates it makes 0700; the runtime creates `keys/` itself with the process's umask) by
+- **Key.** `keys/journal.key`: 32 random bytes as hex, created 0600 (inside `keys/`, which is 0700 like the loom home) by
   publishing a synced temporary file under the final name with a hard link and syncing the directory,
   so a crash never leaves a partial key and two creators end with the same one. An existing file that
   does not hold 64 hex characters is an error and is never replaced; an empty one tells the operator to
@@ -979,7 +981,7 @@ log, then its live records, deltas and statuses, without duplicates. A subscribe
 Streams end when the daemon stops.
 
 **Running.** `loom daemon` (and `loom up`, which starts it in the background, or `loom service install`,
-a launchd agent that restarts it after a crash) raises its open-file limit, creates the home (0700) and
+a launchd agent that restarts it after a crash) raises its open-file limit, creates the home and its top-level directories (0700, tightened if they exist looser) and
 takes an exclusive lock on `daemon.lock` for its lifetime, so a second daemon on the same home is
 refused (`A loom daemon is already running for <home> (pid N, <addr>).`) even when both start at once.
 It then loads and checks the config, checks that the sandbox mode can work on this host, creates or
