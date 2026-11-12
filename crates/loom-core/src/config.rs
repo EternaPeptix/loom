@@ -234,7 +234,8 @@ pub struct AgentsCfg {
     /// Outputs with at least this many lines never shown are listed in the HUD.
     pub unviewed_min_lines: u64,
     /// Seconds a model request of a session may keep retrying an unavailable server before the
-    /// session tells the operator in a non-blocking inbox item (0 = never).
+    /// session tells the operator in a non-blocking inbox item (0 = never). None is opened when the
+    /// request's retry window ends first: the request then fails at its next failed attempt.
     pub unavailable_notice_s: u64,
 }
 

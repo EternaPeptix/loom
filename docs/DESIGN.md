@@ -675,15 +675,20 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   `Retry-After` (up to 600 s) wins. Viewers see each retry as a `retrying` delta. A partial attempt
   is never committed, and a cancellation returns promptly with the text streamed so far.
 - **Unavailable notice.** When one model request of a session (a step's or a digest's) is retrying
-  and its first failure lies `agents.unavailable_notice_s` back (default 300; 0 = never), the session
+  and its outage began `agents.unavailable_notice_s` ago (default 300; 0 = never), the session
   opens a non-blocking `blocker` inbox item, notified like every other: the server's
   address, since when it has been unavailable, the last error, and until when the request is retried
-  (or that it is retried until the server answers), with the note that nothing needs an answer. At
-  most one is open per session. When the request ends the harness resolves the item itself, saying
-  whether the server answered, the request failed (the step then fails, §8) or the step was
-  stopped; an item a session left open when the daemon stopped is resolved when the session is next
-  activated. Neither record reaches the model's context or starts a turn, and the request being
-  retried is sent unchanged.
+  (or that it is retried until the server answers), with the note that nothing needs an answer. The
+  outage begins at the request's first failure, and again at a failure that ends an attempt the
+  server had been answering for at least that long. No item is opened when the retry window ends
+  first: the request then fails at its next failed attempt (a failed step opens its own item, §8), so
+  with both values at their defaults the notice serves a longer window or `retry_window_s = 0`. At
+  most one is open per session. When the request ends the harness resolves
+  the item itself, saying whether the server answered, the request failed (it is then handled as any
+  failed request, §8) or the step was stopped; an item a session left open when the daemon stopped is
+  resolved when the session is next activated. Neither record reaches the model's context or starts
+  a turn, and the request being retried is sent unchanged. The votes of `decide` (§9) are not
+  watched: a vote that keeps retrying holds the call until its window ends or the step is stopped.
 - **Redirects** are not followed: a 3xx is refused with a sentence naming `Location` and the base URL
   it implies.
 - **Model id.** `GET {base_url}/models` selects the served id: the entry equal to the profile's `model`,

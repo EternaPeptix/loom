@@ -376,7 +376,7 @@ pub fn clock(ms: u64) -> String {
 pub fn model_unavailable(base_url: &str, since: &str, last: &str, until: Option<&str>) -> String {
     let retrying = match until {
         Some(t) => format!(
-            "The session keeps retrying the request until about {t}; if the server has not answered by then, the step fails."
+            "The session keeps retrying the request until about {t}; if the server has not answered by then, the request fails."
         ),
         None => "The session keeps retrying the request until the server answers or the session is stopped (retry_window_s = 0).".to_string(),
     };
@@ -560,7 +560,8 @@ mod tests {
         let finite = model_unavailable("http://h:8000/v1", "A", "cannot reach the server:\nrefused", Some("B"));
         assert!(finite.starts_with("The model server at http://h:8000/v1 has been unavailable since A. "), "{finite}");
         assert!(finite.contains("Last error: cannot reach the server: refused. "), "{finite}");
-        assert!(finite.contains("until about B;") && finite.contains("Nothing needs to be answered"), "{finite}");
+        assert!(finite.contains("until about B; if the server has not answered by then, the request fails."), "{finite}");
+        assert!(finite.contains("Nothing needs to be answered"), "{finite}");
         let open = model_unavailable("http://h:8000/v1", "A", "HTTP 503.", None);
         assert!(open.contains("Last error: HTTP 503. "), "{open}");
         assert!(open.contains("until the server answers or the session is stopped"), "{open}");

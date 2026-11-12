@@ -279,17 +279,23 @@
 //! claimed, discarded, ms saved) are logged at debug level at the end of each turn.
 //!
 //! ### Model server unavailable
-//! Every model request of a session (a step's, a digest's) is watched through its stream events. Its
-//! first failure is the time of its first `StreamEvent::Retrying` (about when the client's retry window
-//! starts). It is *retrying* from a `Retrying` until the next event that came from the server (any but
-//! `AttemptStart` and `Retrying`). When it is retrying and its first failure lies
-//! `agents.unavailable_notice_s` back (0 = never) — at once on a failure that comes later than that —
-//! the session appends `inbox_opened` (author `Harness`) of a *model-unavailable notice* — `kind:
-//! Blocker`, `blocking: false`, no `call_id`, no `reference`, the only item of that shape — with
-//! `texts::model_unavailable(base_url, since, last, until)`: `since` is the first failure, `last` the
-//! latest `Retrying` reason, `until` (when `retry_window_s` is not 0) the first failure plus the window,
-//! times by `texts::clock`. Status is published. At most one notice is opened per request (so one per
-//! session at a time; a later request opens its own). When the request ends, its notice is resolved:
+//! Every model request of a session (a step's, a digest's) is watched through its stream events (the
+//! votes of `decide`, which the runtime sends, are not). A *failure* is a `StreamEvent::Retrying`; a
+//! *server event* is any event but `AttemptStart` and `Retrying`. The request's first failure is about
+//! when the client's retry window starts. It is *retrying* from a failure until the next server
+//! event. Its *outage* starts at its first failure, and again at a failure that ends an attempt whose
+//! server events began at least `agents.unavailable_notice_s` (`after`) before it (the server was
+//! answering, not unavailable). With `after` not 0, a notice is due when the request is retrying and
+//! its outage started `after` back — at once on a failure that comes later than that — unless
+//! `retry_window_s` is not 0 and the request's first failure plus the window is not later than that
+//! time (the request then fails at its next failed attempt, and that failure is handled as usual).
+//! Then the session appends `inbox_opened` (author `Harness`) of a *model-unavailable notice* —
+//! `kind: Blocker`, `blocking: false`, no `call_id`, no `reference`, the only item of that shape —
+//! with `texts::model_unavailable(base_url, since, last, until)`: `since` is the start of the outage,
+//! `last` the latest `Retrying` reason, `until` (when `retry_window_s` is not 0) the request's first
+//! failure plus the window, times by `texts::clock`. Status is published. At most one notice is
+//! opened per request (so one per session at a time; a later request opens its own). When the
+//! request ends, its notice is resolved:
 //! `inbox_resolved{item_id, answer}` authored `Harness`, `answer` being `texts::unavailable_answered(now)`
 //! for a completion, `texts::unavailable_stopped(now)` for `Cancelled` and `texts::unavailable_failed(now,
 //! error)` for any other error; then the result is handled as it would be without the notice. Neither
@@ -400,8 +406,9 @@
 //! - a request retrying (503s) past `unavailable_notice_s` opens one notice with the address and the last
 //!   error, resolved by the harness when the reply arrives, which is handled as usual; the retried
 //!   bodies are identical and the weave holds nothing of it; a request that gives up resolves it before
-//!   the step fails; a stop resolves it; 0 opens none; a digest request is watched too; a notice left
-//!   open is resolved when `run` starts;
+//!   the step fails; none is opened when the window ends first; a reply that streams past the notice
+//!   time and then breaks starts a new outage; a stop resolves it; 0 opens none; a digest request is
+//!   watched too; a notice left open is resolved when `run` starts;
 //! - stall note after `stall_steps` steps of read-only calls, and not again until progress.
 
 use crate::gate::{self, Yield, YieldCtx};
@@ -1049,41 +1056,70 @@ fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// A moment on the step's clock and on the wall clock (ms since the Unix epoch).
+type Moment = (tokio::time::Instant, u64);
+
 /// What the stream events of one model request say about the server being unavailable (see *Model
 /// server unavailable*).
-#[derive(Default)]
 struct Outage {
-    /// The request's first failed attempt, on the step's clock and on the wall clock (about when the
-    /// client's retry window starts).
-    first: Option<(tokio::time::Instant, u64)>,
-    /// An attempt failed and the server has sent nothing since.
-    retrying: bool,
+    /// `agents.unavailable_notice_s`; zero turns the notice off.
+    after: Duration,
+    /// The client's retry window; `None` retries until the server answers.
+    window: Option<Duration>,
+    /// The request's first failed attempt (about when the client's retry window starts).
+    first: Option<Moment>,
+    /// The first failure of the current outage: the request's first, or the first after an attempt
+    /// the server answered for at least `after`.
+    since: Option<Moment>,
+    /// When the server began answering since the latest failure (or since the request began); `None`
+    /// while the request is retrying.
+    answering: Option<tokio::time::Instant>,
     /// Why the latest attempt failed.
     last: String,
 }
 
 impl Outage {
+    fn new(after: Duration, window: Option<Duration>) -> Outage {
+        Outage { after, window, first: None, since: None, answering: None, last: String::new() }
+    }
+
     fn on_event(&mut self, event: &StreamEvent) {
         match event {
             StreamEvent::Retrying { reason, .. } => {
-                self.first.get_or_insert_with(|| (tokio::time::Instant::now(), now_ms()));
-                self.retrying = true;
+                let now: Moment = (tokio::time::Instant::now(), now_ms());
+                self.first.get_or_insert(now);
+                // A server that answered for that long was not unavailable: this failure starts a new
+                // outage.
+                if self.answering.take().is_some_and(|began| now.0.saturating_duration_since(began) >= self.after) {
+                    self.since = None;
+                }
+                self.since.get_or_insert(now);
                 self.last.clone_from(reason);
             }
             StreamEvent::AttemptStart { .. } => {}
             // Everything else came from the server: it is answering.
-            _ => self.retrying = false,
+            _ => {
+                self.answering.get_or_insert_with(tokio::time::Instant::now);
+            }
         }
     }
 
-    /// When the notice is due: `after` past the request's first failure, while it is retrying (a
-    /// deadline that passed while the server was answering is due at the next failure). `None` when
-    /// it is not retrying, and when `after` is zero (the notice is off).
-    fn due(&self, after: Duration) -> Option<tokio::time::Instant> {
-        if after.is_zero() || !self.retrying {
+    /// When the notice is due: `after` past the outage's first failure, while the request is retrying
+    /// (a deadline that passed while the server was answering briefly is due at the next failure).
+    /// `None` when it is not retrying, when `after` is zero (the notice is off), and when the retry
+    /// window has ended by then: the request fails at its next failed attempt and is handled as any
+    /// failed request.
+    fn due(&self) -> Option<tokio::time::Instant> {
+        if self.after.is_zero() || self.answering.is_some() {
             return None;
         }
-        self.first.and_then(|(at, _)| at.checked_add(after))
+        let at = self.since?.0.checked_add(self.after)?;
+        if let (Some(window), Some((first, _))) = (self.window, self.first) {
+            if first.checked_add(window).is_some_and(|end| at >= end) {
+                return None;
+            }
+        }
+        Some(at)
     }
 }
 
@@ -2190,14 +2226,15 @@ impl Session {
     ) -> R<Result<Completion, ModelError>> {
         let client = self.deps.client.clone();
         let after = Duration::from_secs(self.deps.agents.unavailable_notice_s);
+        let window_s = client.profile().retry_window_s;
+        let mut outage = Outage::new(after, (window_s > 0).then(|| Duration::from_secs(window_s)));
         let (tx, mut rx) = unbounded_channel();
         let call = client.complete(request, Some(&tx), token);
         tokio::pin!(call);
-        let mut outage = Outage::default();
         // The notice opened during this request; at most one, whatever happens after it.
         let mut notice: Option<String> = None;
         let result = loop {
-            let due = if notice.is_none() { outage.due(after) } else { None };
+            let due = if notice.is_none() { outage.due() } else { None };
             tokio::select! {
                 biased;
                 r = &mut call => break r,
@@ -2230,9 +2267,11 @@ impl Session {
     /// Returns its id.
     fn open_unavailable_notice(&mut self, outage: &Outage) -> R<String> {
         let profile = self.deps.client.profile();
-        let since = outage.first.map_or_else(now_ms, |(_, ms)| ms);
+        let since = outage.since.map_or_else(now_ms, |(_, ms)| ms);
+        // The client's window runs from the request's first failure.
+        let first = outage.first.map_or(since, |(_, ms)| ms);
         let until = (profile.retry_window_s > 0)
-            .then(|| texts::clock(since.saturating_add(profile.retry_window_s.saturating_mul(1000))));
+            .then(|| texts::clock(first.saturating_add(profile.retry_window_s.saturating_mul(1000))));
         let text = texts::model_unavailable(&profile.base_url, &texts::clock(since), &outage.last, until.as_deref());
         tracing::warn!(session = %self.deps.shared.session, base_url = %profile.base_url, last = %outage.last,
             "the model server has been unavailable for a while; the operator is told");
@@ -4225,13 +4264,41 @@ mod tests {
     #[tokio::test]
     async fn a_long_reply_after_an_early_failure_opens_no_notice() {
         let refused = Action::Status { status: 503, body: "loading".into(), retry_after_s: None };
-        // The reply streams for about two seconds, past the time a notice would be due.
-        let slow = Reply::text("y".repeat(72)).with_delay_ms(400);
-        let mut fx = retrying_fx(seq(vec![refused, slow.into()]), 1, 0).await;
+        // The reply begins about 0.6 s after the failure, well before the notice is due at 2 s, and
+        // streams for about three seconds, past that time.
+        let slow = Reply::text("y".repeat(24 * 30)).with_delay_ms(100);
+        let mut fx = retrying_fx(seq(vec![refused, slow.into()]), 2, 0).await;
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
         assert!(inbox(&rs).is_empty(), "{:?}", kinds(&rs));
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_streams_past_the_notice_time_and_then_breaks_starts_a_new_outage() {
+        let refused = || Action::Status { status: 503, body: "loading".into(), retry_after_s: None };
+        // About 3.2 s of text, then the connection breaks.
+        let long = Action::DropAfter { reply: Reply::text("z".repeat(24 * 32)).with_delay_ms(100), chunks: 33 };
+        let (script, seen) =
+            down_then(0, vec![refused(), long, refused(), refused(), refused(), Reply::text("done").into()]);
+        let mut fx = retrying_fx(script, 2, 0).await;
+        // Retries a second apart after the break: 1 s, 2 s, 3 s, then the reply at about 4 s.
+        fx.profile.retry_max_delay_s = 1;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let items = inbox(&rs);
+        assert_eq!(items.len(), 1, "{:?}", kinds(&rs));
+        // Not at the break, although the request's first failure lay more than 2 s back by then: two
+        // seconds after it, while the server was still refusing.
+        let opened = rs.iter().find(|r| kind(r) == "inbox_opened").expect("a notice").ts_ms;
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 6);
+        let times: Vec<u64> = seen.iter().map(|s| s.0).collect();
+        assert!(opened > times[2], "the notice opened at the break: {opened} vs {times:?}");
+        assert!(!items[0].text.contains(&texts::clock(seen[0].0)), "{}", items[0].text);
+        assert_eq!(resolutions(&rs).len(), 1);
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
     }
 
@@ -4264,7 +4331,7 @@ mod tests {
         assert_eq!(items.len(), 2, "{:?}", kinds(&rs));
         let (notice, parked) = (&items[0], &items[1]);
         assert_eq!((notice.kind, notice.blocking), (InboxKind::Blocker, false));
-        assert!(notice.text.contains("until about ") && notice.text.contains("the step fails"), "{}", notice.text);
+        assert!(notice.text.contains("until about ") && notice.text.contains("the request fails"), "{}", notice.text);
         let resolved = resolutions(&rs);
         assert_eq!(resolved.len(), 1);
         assert_eq!((&resolved[0].0, &resolved[0].1), (&Author::Harness, &notice.item_id));
@@ -4278,6 +4345,23 @@ mod tests {
         assert_eq!(&k[k.len() - 4..], ["inbox_opened", "inbox_resolved", "inbox_opened", "turn_end"]);
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error]);
         assert_eq!(fx.sink.last_status().unwrap().open_inbox, 1);
+    }
+
+    #[tokio::test]
+    async fn no_notice_is_opened_when_the_retry_window_ends_first() {
+        let (script, seen) = down_then(usize::MAX, Vec::new());
+        // The notice would be due as the window ends; the request fails at the attempt after that.
+        let mut fx = retrying_fx(script, 1, 1).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert!(seen.lock().unwrap().len() >= 3, "the request retried past the notice time");
+        let items = inbox(&rs);
+        assert_eq!(items.len(), 1, "{:?}", kinds(&rs));
+        assert_eq!((items[0].kind, items[0].blocking), (InboxKind::Parked, true));
+        assert!(items[0].text.contains("the model is loading"), "{}", items[0].text);
+        assert!(resolutions(&rs).is_empty());
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error]);
     }
 
     #[tokio::test]

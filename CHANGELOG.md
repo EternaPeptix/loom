@@ -141,7 +141,8 @@ upgrade" first; the rest says what behaves differently.
 - A session is not created when the server cannot be reached and the profile sets no `context_window`.
 - A model request still retrying after `[agents] unavailable_notice_s` (new, default 300; 0 = never)
   opens a non-blocking inbox item, with a notification, naming the server, since when it is down and
-  the last error; the item closes by itself when the request ends.
+  the last error; the item closes by itself when the request ends. None opens when the retry window
+  ends first.
 
 ### Sessions, agents and finishing
 
