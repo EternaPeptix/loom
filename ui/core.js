@@ -1049,16 +1049,25 @@ export function reconnectDelayMs(attempt) {
  * an event with no `data:` line is not delivered.
  */
 export function createSseParser() {
-  let buf = "";
+  let pieces = []; // the unfinished line, in the pieces it arrived in; joined once, when it ends
+  let heldCr = false;
   let data = [];
   let id = null;
   return {
     feed(chunk) {
-      buf += String(chunk);
+      let text = (heldCr ? "\r" : "") + String(chunk);
       // A CR at the very end may be half of a CRLF: wait for the next chunk to know.
-      const tail = buf.endsWith("\r") ? "\r" : "";
-      const lines = (tail ? buf.slice(0, -1) : buf).replace(/\r\n?/g, "\n").split("\n");
-      buf = lines.pop() + tail;
+      heldCr = text.endsWith("\r");
+      if (heldCr) text = text.slice(0, -1);
+      // Only the new text is searched for line ends, so a long line costs its length once.
+      const lines = text.replace(/\r\n?/g, "\n").split("\n");
+      const rest = lines.pop();
+      if (lines.length) {
+        pieces.push(lines[0]);
+        lines[0] = pieces.join("");
+        pieces = [];
+      }
+      if (rest) pieces.push(rest);
       const out = [];
       for (const line of lines) {
         if (line === "") {
@@ -1077,4 +1086,25 @@ export function createSseParser() {
       return out;
     },
   };
+}
+
+/**
+ * Hand the JSON object in each parsed event to `handle`. Data that is not JSON is skipped. What
+ * `handle` throws goes to `report` and the events after it are still delivered: an event the page
+ * cannot show is not a dropped connection.
+ */
+export function deliverEvents(events, handle, report) {
+  for (const m of events) {
+    let ev;
+    try {
+      ev = JSON.parse(m.data);
+    } catch {
+      continue;
+    }
+    try {
+      handle(ev);
+    } catch (e) {
+      report(e);
+    }
+  }
 }

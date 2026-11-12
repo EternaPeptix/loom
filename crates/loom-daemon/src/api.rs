@@ -24,7 +24,9 @@
 //! - `GET /`: `ui::INDEX_HTML` (`text/html; charset=utf-8`), no authentication. With
 //!   `?token=<token>` that matches → `303` to `/#code=<fresh login code>` (no cookie); with a
 //!   wrong token → `401` with a small plain-text page: `Open the UI with `loom open` (it carries
-//!   the access token).`
+//!   the access token).` The page itself (not the redirect, not the 401) answers a request that
+//!   still carries the token cookie of an older daemon (`auth::LEGACY_COOKIE`) with
+//!   `Set-Cookie: auth::FORGET_LEGACY_COOKIE`, which removes it; the cookie is never a credential.
 //! - `GET /app.js` and `GET /core.js` (`text/javascript; charset=utf-8`), `GET /style.css`
 //!   (`text/css; charset=utf-8`). No authentication.
 //! - `POST /api/login-codes` (API token only) → `{"code", "expires_in_s"}`; `POST /api/web-sessions`
@@ -82,9 +84,15 @@
 //! as the model and `SandboxMode::None`; requests through `tower::ServiceExt::oneshot` or a bound
 //! listener and `reqwest`; no real network):
 //! - the three gates: wrong Host, foreign Origin on POST (and allowed on GET), missing/wrong token,
-//!   token by header and by cookie; `GET /?token=` sets the cookie and redirects; a wrong token on
-//!   `/?token=` is 401; `/healthz` needs nothing;
-//! - UI files carry the CSP; every response has `no-store` and `nosniff`;
+//!   token by header; a cookie carrying the token is refused; `/`, the static assets and `/healthz`
+//!   need nothing; `GET /?token=` redirects to `/#code=` and sets no cookie; a wrong token on
+//!   `/?token=` is 401; the index page expires the token cookie of an older daemon and nothing
+//!   else ever sends `Set-Cookie`;
+//! - login codes: minted with the API token only, exchanged once, refused when wrong, used or
+//!   expired; a web-session secret opens `/api` but cannot mint codes; the Host and Origin checks
+//!   apply to the exchange; outstanding codes and web sessions are bounded;
+//! - UI files, the 401 page and the redirect carry the CSP; every response has `no-store` and
+//!   `nosniff`;
 //! - create a session with a message, then: it is listed; its records page (`limit=2` pages through
 //!   with `next_after`); its detail has children after a spawn; `window`; `status` counts;
 //! - `stream`: replays from the start, then delivers a record appended after the stream opened;
@@ -395,7 +403,7 @@ fn unauthorized_page() -> Response {
     with_ui_headers(response)
 }
 
-async fn index(State(s): State<ApiState>, q: RawQuery) -> Response {
+async fn index(State(s): State<ApiState>, headers: HeaderMap, q: RawQuery) -> Response {
     let query = q.map(|Query(m)| m).unwrap_or_default();
     // Older clients open `/?token=`: trade the token for a login code in the fragment, which the
     // browser never sends anywhere, and set no cookie.
@@ -410,7 +418,13 @@ async fn index(State(s): State<ApiState>, q: RawQuery) -> Response {
         }
         return with_ui_headers(response);
     }
-    asset("text/html; charset=utf-8", ui::INDEX_HTML)
+    let mut response = asset("text/html; charset=utf-8", ui::INDEX_HTML);
+    // A browser that signed in to an older daemon still holds the API token in a cookie and sends
+    // it to every port on this host. It opens nothing here; tell the browser to drop it.
+    if headers.get_all(header::COOKIE).iter().any(|v| v.to_str().is_ok_and(auth::names_legacy_cookie)) {
+        response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static(auth::FORGET_LEGACY_COOKIE));
+    }
+    response
 }
 
 /// `POST /api/login-codes`: a single-use code for the web UI. Only the API token may ask.
@@ -1100,6 +1114,8 @@ mod tests {
         let r = anon(&format!("/?token={}", e.token)).send().await.unwrap();
         assert_eq!(r.status(), 303);
         assert!(r.headers().get("set-cookie").is_none());
+        assert_eq!(r.headers()["content-security-policy"], ui::CSP);
+        assert_eq!(r.headers()["referrer-policy"], "no-referrer");
         let location = r.headers()["location"].to_str().unwrap().to_string();
         let code = location.strip_prefix("/#code=").unwrap();
         assert!(!location.contains(&e.token));
@@ -1116,6 +1132,37 @@ mod tests {
 
         let r = anon("/healthz").send().await.unwrap();
         assert_eq!((r.status().as_u16(), r.text().await.unwrap()), (200, "ok".to_string()));
+    }
+
+    #[tokio::test]
+    async fn the_index_expires_the_token_cookie_of_an_older_daemon_and_nothing_else_sets_one() {
+        let e = env(Script::new(|_, _| finish("x"))).await;
+        let stale = format!("theme=dark; loom_token={}", e.token);
+        let with_cookie = |p: &str| e.http.get(e.url(p)).header("Cookie", stale.clone());
+
+        // The page tells the browser to drop it: same name and path, no value, already expired.
+        let r = with_cookie("/").send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let set: Vec<&str> = r.headers().get_all("set-cookie").iter().map(|v| v.to_str().unwrap()).collect();
+        assert_eq!(set, ["loom_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"]);
+        assert_eq!(r.text().await.unwrap(), ui::INDEX_HTML);
+
+        // Nothing is sent to a browser that does not hold it.
+        let r = e.http.get(e.url("/")).header("Cookie", "theme=dark; loom_tokens=1").send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.headers().get("set-cookie").is_none());
+
+        // Only the page does it: not the redirect, the refusals, the assets or the API, and the
+        // cookie opens nothing.
+        let redirect = format!("/?token={}", e.token);
+        for (path, status) in [(redirect.as_str(), 303u16), ("/?token=wrong", 401), ("/app.js", 200), ("/api/status", 401)] {
+            let r = with_cookie(path).send().await.unwrap();
+            assert_eq!(r.status(), status, "{path}");
+            assert!(r.headers().get("set-cookie").is_none(), "{path}");
+        }
+        let r = with_cookie("/api/status").bearer_auth(&e.token).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.headers().get("set-cookie").is_none());
     }
 
     #[tokio::test]
@@ -1208,8 +1255,10 @@ mod tests {
             assert_eq!(r.headers()["referrer-policy"], "no-referrer", "{path}");
             assert_eq!(r.text().await.unwrap(), body, "{path}");
         }
-        let unauthorized = e.http.get(e.url("/")).send().await.unwrap();
+        let unauthorized = e.http.get(e.url("/?token=wrong")).send().await.unwrap();
+        assert_eq!(unauthorized.status(), 401);
         assert_eq!(unauthorized.headers()["content-security-policy"], ui::CSP);
+        assert_eq!(unauthorized.headers()["referrer-policy"], "no-referrer");
 
         let wrong_method = e.rq(Method::DELETE, "/api/status").send().await.unwrap();
         let responses = [

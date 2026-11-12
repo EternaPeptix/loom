@@ -12,6 +12,9 @@
 //! - **`bearer_token(authorization)`**: the secret of `Authorization: Bearer <secret>` (scheme
 //!   case-insensitive, surrounding spaces ignored), else `None`. There are no authentication
 //!   cookies: a cookie is sent to every port on the host, including a dev server an agent started.
+//! - **`names_legacy_cookie(cookie)`**: whether a `Cookie` header (`a=1; loom_token=…; b=2`) names
+//!   [`LEGACY_COOKIE`], in which older daemons kept the API token. Its value is never read; the
+//!   index page answers such a browser with [`FORGET_LEGACY_COOKIE`] so it stops sending the token.
 //! - **`token_matches(expected, presented)`**: equal, compared without an early exit (fold the XOR
 //!   of the bytes; different lengths are unequal).
 //! - **`host_allowed(host, port)`**: the `Host` header must be exactly `127.0.0.1:{port}`,
@@ -24,8 +27,9 @@
 //!   UI sends as a bearer. Both live in memory only and are bounded ([`MAX_CODES`], [`MAX_SESSIONS`]).
 //!
 //! Tests required: token created once with mode 0600 and reused; bad content is an error; bearer
-//! parsing (odd spacing, wrong scheme); matching; login codes and web sessions; every host and origin
-//! case above, including a wrong port and a host with a suffix (`127.0.0.1:7878.evil.example`).
+//! parsing (odd spacing, wrong scheme); the legacy cookie by name (several cookies, odd spacing,
+//! look-alike names); matching; login codes and web sessions; every host and origin case above,
+//! including a wrong port and a host with a suffix (`127.0.0.1:7878.evil.example`).
 
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -40,6 +44,11 @@ pub const CODE_TTL: Duration = Duration::from_secs(60);
 pub const MAX_CODES: usize = 16;
 /// Web-session secrets kept at once; creating past it drops the oldest.
 pub const MAX_SESSIONS: usize = 32;
+/// The cookie older daemons kept the API token in. It is not a credential.
+pub const LEGACY_COOKIE: &str = "loom_token";
+/// The `Set-Cookie` value that removes [`LEGACY_COOKIE`] from a browser: the name and path it was
+/// set with, no value, already expired.
+pub const FORGET_LEGACY_COOKIE: &str = "loom_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict";
 
 /// Length of a token in characters: 32 random bytes as lowercase hex.
 const TOKEN_LEN: usize = 64;
@@ -96,6 +105,11 @@ pub fn bearer_token(authorization: Option<&str>) -> Option<String> {
     let (scheme, rest) = authorization?.trim().split_once(char::is_whitespace)?;
     let rest = rest.trim();
     (scheme.eq_ignore_ascii_case("bearer") && !rest.is_empty()).then(|| rest.to_string())
+}
+
+/// Whether a `Cookie` header names [`LEGACY_COOKIE`]. Only the name is looked at.
+pub fn names_legacy_cookie(cookie: &str) -> bool {
+    cookie.split(';').any(|pair| pair.split('=').next().is_some_and(|name| name.trim() == LEGACY_COOKIE))
 }
 
 /// Compares two tokens without an early exit. The work depends on the length of `expected` only.
@@ -268,6 +282,21 @@ mod tests {
         assert_eq!(bearer_token(Some("Bearer  ")), None);
         assert_eq!(bearer_token(Some("abc")), None);
         assert_eq!(bearer_token(None), None);
+    }
+
+    #[test]
+    fn the_legacy_cookie_is_found_by_name_only() {
+        assert!(names_legacy_cookie("loom_token=xyz"));
+        assert!(names_legacy_cookie("a=1; loom_token=xyz; b=2"));
+        assert!(names_legacy_cookie("  a=1 ;loom_token = xyz ;b=2"));
+        assert!(names_legacy_cookie("loom_token="));
+        assert!(names_legacy_cookie("a=1; loom_token"));
+        assert!(!names_legacy_cookie("xloom_token=xyz; loom_tokens=q"));
+        assert!(!names_legacy_cookie("a=loom_token; b=loom_token=1"));
+        assert!(!names_legacy_cookie("garbage"));
+        assert!(!names_legacy_cookie(""));
+        // What forgets it is the cookie as it was set, emptied and expired.
+        assert_eq!(FORGET_LEGACY_COOKIE, format!("{LEGACY_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"));
     }
 
     #[test]

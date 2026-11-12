@@ -411,23 +411,18 @@ async function connect() {
         const { done, value } = await reader.read();
         if (done) break;
         watch();
-        for (const m of parser.feed(decoder.decode(value, { stream: true }))) {
-          let ev;
-          try {
-            ev = JSON.parse(m.data);
-          } catch {
-            continue;
-          }
-          handleEvent(ev);
-        }
+        C.deliverEvents(parser.feed(decoder.decode(value, { stream: true })), handleEvent, (e) => console.error(e));
       }
     } catch {
       // dropped or aborted: reconnect below
     }
     clearTimeout(idle);
+    // However the read ended, let go of the connection before another is opened.
+    streamCtl.abort();
+    // After lost() the page is the sign-in sentence: there is no dot to update.
+    if (streamStopped) return;
     S.connected = false;
     renderDot();
-    if (streamStopped) return;
     await new Promise((resolve) => setTimeout(resolve, C.reconnectDelayMs(attempt++)));
   }
 }
@@ -1320,6 +1315,11 @@ function wire() {
 }
 
 async function start() {
+  // A login address opened in a tab that already has the page changes only the fragment: load the
+  // page again, so that the code is exchanged and leaves the address bar. Also on the lost() page.
+  window.addEventListener("hashchange", () => {
+    if (C.codeFromHash(location.hash)) location.reload();
+  });
   if (!(await signIn())) {
     lost();
     return;
