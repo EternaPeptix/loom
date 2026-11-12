@@ -160,8 +160,16 @@ upgrade" first; the rest says what behaves differently.
 
 - A child agent always settles exactly once and its lead receives the settlement, including after a
   restart. `agent_stop` waits for the agent to end. Archiving settles the mission's agents.
-- On shutdown running turns are cancelled first; after a restart, jobs that were running are recorded
-  as lost and sessions that were waiting on them resume.
+- On shutdown running turns are cancelled first, and the jobs the shutdown kills are recorded as
+  killed, with their output and a note that the shutdown stopped them. Sessions that were waiting on
+  them resume after the restart.
+- A background job that finishes while the daemon is down (after a crash) is reported after the
+  restart with its real exit status and output, also when the crash came before its start was
+  recorded; only a job whose outcome is unknown is reported as lost. A session told of such job ends
+  is resumed even when the daemon goes down again before that turn.
+- A finish verifier cut by a crash (not only by a shutdown) is still the finish's after the restart: it
+  does not block the next `finish`, its verdict never arrives as an agent report, and the `finish`
+  made again uses it instead of starting a second one.
 - A verified role's `finish` is delivered only after the verifier accepts it. After two rejections, or
   when the verifier cannot be run, you get a blocking `NOT VERIFIED` inbox item. `finish` is refused
   while the session has running jobs or agents.
@@ -194,6 +202,8 @@ upgrade" first; the rest says what behaves differently.
   umask. The daemon tightens the home, `keys/`, `sessions/`, `missions/`, `blobs/` and `logs/` at start; files
   from earlier versions keep their mode but other accounts can no longer open them. `chmod -R go-rwx ~/.loom`
   tightens them too.
+- A finish verifier's `meta.json` has a new optional `gate` field (its assignment); files without it
+  load as before.
 
 ### Packs and documents
 

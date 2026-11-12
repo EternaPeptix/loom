@@ -580,9 +580,10 @@ only when every check passes and, where verification is required, a verifier acc
     objections) or `NOT VERIFIED - VERIFICATION COULD NOT BE RUN` (with the reason); the turn ends
     `blocked`. Answering it restarts the count, and the next finish is verified again. `ask_user`
     refuses a question worded like an escalation, so a lead cannot restart the count by itself.
-  - a shutdown during verification records nothing for the call; after the restart a `finish` made
-    again with the same brief joins the verifier the shutdown cut, or takes the verdict it gave,
-    instead of starting another.
+  - a shutdown or a crash during verification records nothing for the call; after the restart a
+    `finish` made again with the same brief joins the verifier that was cut, or takes the verdict it
+    gave, instead of starting another. The verifier is marked as the gate's, with its brief, in its
+    own `meta.json` before its first turn, so a crash cannot turn it into an ordinary agent.
 
 **Budget.** A session's budget is `max_steps` and/or `max_minutes` (a child's from its assignment, at
 most `agents.child_max_steps` / `child_max_minutes`, 200 / 120 by default; a root's from its creation,
@@ -652,14 +653,15 @@ the precise specification.
   sessions (and their digests) above `Child` for agents and votes.
 - **Restart.** A child that a shutdown cut is resumed, not settled: at start every unsettled child of a
   mission that is not archived is activated; one that had a turn is held and gets exactly one resume
-  (at once when its mission is unattended, when it was told of a lost job, or when its lead is told to
+  (at once when its mission is unattended, when it was told how a job ended, or when its lead is told to
   carry on; otherwise as soon as its lead next carries on: an operator message, resume or answer to the
   lead, or any turn the lead starts, such as one an agent's report starts); one that never had a turn
   starts by itself; one whose log cannot be opened while its lead's can is settled `failed` on its
   behalf. A settlement whose
   delivery a restart cut is delivered from `settlement.json` (or from the child's log), unless the
-  lead's waiting call has a recorded result for an agent that had ended. A finish verifier is never
-  delivered as a report.
+  lead's waiting call has a recorded result for an agent that had ended. A finish verifier (known
+  from its `meta.json`) is never delivered as a report, listed among the lead's agents, or counted as
+  its running work.
 
 ## 10. Model access (`loom-model`)
 
@@ -778,8 +780,15 @@ evidence kind and staleness. Each module's documentation is the precise specific
   Every command writes `jobs/jN.out`, `jN.status` and `jN.pid` (created fresh); the pid record holds the
   shell's pid and start time, the members of a group that outlived it, and the owning daemon. At the
   next start a previous daemon's process group is killed only when its leader or a recorded member is
-  confirmed by start time; the files are then removed and their ids are not reused. A job the log shows
-  as unsettled after a restart is recorded as settled with an unknown outcome, and the model is told.
+  confirmed by start time, and its pid record is removed. A command whose group was already gone and
+  whose status file holds an exit code ended by itself while no daemon watched it: its output and
+  status are kept until its session has recorded them; the files of every other command are removed.
+  No id that has files on disk is handed out again. When the session is opened, a job the log shows as
+  unsettled, or one a call's result gave the model but whose registration never reached the log (it
+  is registered then), is settled: with its exit status and stored output when it ended by itself (the
+  note says it finished while the harness was down), else with an unknown outcome. The model is told
+  unless it already saw the job end, or an earlier `interrupted` note covered a lost job; a session
+  that was waiting or yielded starts a turn.
 - `web_fetch` fetches an `http`/`https` URL through the session's proxy, following up to 10 redirects
   itself so each hop passes the policy, within `tools.web_fetch_timeout_s` (60) and
   `tools.web_fetch_max_bytes` (20 MiB, with a fact when the response is larger). HTML is rendered to
@@ -1040,13 +1049,16 @@ serves until SIGINT, SIGTERM or `POST /api/shutdown` (`loom down`), giving open 
 **Start** (`Runtime::start`). Packs are loaded and every role's tools checked (a broken pack stops the
 daemon); then the journal key, blob store, model clients and proxy. Every session's `meta.json` and
 `status.json` are read. Activated: sessions that are not archived, not ended, and were running a turn,
-waiting, holding open inbox items, or ended a turn `yielded` while a job they started was unsettled;
-and every unsettled child of a mission that is not archived (parents first). Before activation, off
-the async workers, a previous daemon's leftover process groups are cleared for every other session that
-is not archived. Opening a session's log records a cut turn as `interrupted` (the harness was
-restarted) with a `stopped` turn end, and every unsettled job as lost. Then: an unattended root whose
+waiting, holding open inbox items, or ended a turn `yielded` while a job they started was unsettled
+or was told how a job ended with no turn since; and every unsettled child of a mission that is not
+archived (parents first). Before activation, off the async workers, a previous daemon's leftover
+process groups are cleared for every other session that is not archived (the output and status of a
+command that ended by itself stay for its session).
+Opening a session's log records a cut turn as `interrupted` (the harness was restarted) with a
+`stopped` turn end, and settles the previous daemon's jobs (§11, Jobs). Then: an unattended root whose
 turn was cut, or that was waiting with no unsettled agent, is resumed; any root that was waiting or
-yielded and lost a job is resumed, attended or not; children are held or resumed as in §9; deliveries a
+yielded and was told how a job ended with no turn since is resumed, attended or not; children are held
+or resumed as in §9; deliveries a
 restart cut are recovered; and every open blocking inbox item is notified again (`Still waiting: …`)
 with its repeat armed. A session of a pack that requires a restricted network is not activated (nor
 created) while the network mode is `open`.
@@ -1054,8 +1066,9 @@ created) while the network mode is `open`.
 **Shutdown.** Every running turn is cancelled first: a running tool gets TERM, then KILL after
 `tools.kill_grace_s`, its result is recorded, and the session records `interrupted` (the harness was
 restarted) and a `stopped` turn end; a child is not settled, so the next start resumes it. Idle
-sessions end when their inputs close. The runtime waits up to `kill_grace_s` + 3 s for the tasks, then
-aborts the rest, kills the jobs and stops the proxy. A lead blocked in a call that waits for an agent
+sessions end when their inputs close, after killing their jobs and recording how those ended (each
+end says that the shutdown stopped the job). The runtime waits up to `kill_grace_s` + 3 s for the
+tasks, then aborts the rest, kills the jobs and stops the proxy. A lead blocked in a call that waits for an agent
 is let go at once and the call keeps no result; what the call had started is already in its log.
 
 **Operator actions.** Messages go to root sessions only. Rules, approvals and withdrawals may name any

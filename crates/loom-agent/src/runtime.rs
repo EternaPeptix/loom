@@ -10,8 +10,9 @@
 //!
 //! ## Files (under `paths.session_dir(id)`)
 //! - `log.jsonl` — the session's log; written only by its [`Session`](crate::session::Session).
-//! - `meta.json` — [`SessionMeta`], written when the session is created; rewritten only by
-//!   [`Runtime::archive`]. Writes are atomic (temporary file in the same directory, then rename).
+//! - `meta.json` — [`SessionMeta`], written when the session is created (for a verifier the finish
+//!   gate starts, with `gate`, before its first turn); rewritten only by [`Runtime::archive`]. Writes
+//!   are atomic (temporary file in the same directory, then rename).
 //! - `status.json` — the latest [`Status`](crate::session::Status), rewritten atomically whenever
 //!   the session publishes one.
 //! - `net.jsonl` — one [`NetEntry`] per line, hash-chained (`prev`): every decision the egress proxy
@@ -37,8 +38,9 @@
 //! Activating a child first activates its parent. Activation happens:
 //! - at start, for every session that is not archived and whose `status.json` says `phase ==
 //!   Running`, or `last_end == Waiting`, or `open_inbox > 0`, or `last_end == Yielded` while its log
-//!   holds a `job_registered` with no `job_settled` (the job's end would have started a turn; the
-//!   log is read only when the session's `jobs/` directory is not empty), and for every child that
+//!   holds a `job_registered` with no `job_settled`, or a job end it was told of that no turn has
+//!   followed (`session::has_job_news`: the job's end would have started a turn; the log is read only
+//!   when the session has a `jobs/` directory), and for every child that
 //!   has not ended, whatever it was doing (parents before children — session ids sort by creation
 //!   time);
 //! - on demand, by `send_message`, `resume`, `reweave`, `answer`, and when a settlement has to be
@@ -133,8 +135,9 @@
 //!   role and system prompt, parent: Some(parent), the parent's mission, workspace, model and
 //!   `unattended`, budget: req.budget, title: req.title}, Some((parent,
 //!   weave::render_brief(&req.brief))))`.
-//! - Then: `meta.json` (`mode`, `awaited`), spawn the task (a child starts its first turn by
-//!   itself), publish `BusEvent::Session`, and queue in the parent's log
+//! - Then: `meta.json` (`mode`, `awaited`, and `gate: Some(req.brief)` for a `harness` request),
+//!   spawn the task (a child starts its first turn by itself), publish `BusEvent::Session`, and queue
+//!   in the parent's log
 //!   `parent_shared.emit(Author::Harness, Event::ChildSpawned(ChildSpawned{child, role, mode, brief,
 //!   budget, call_id}))`. Return the child's id.
 //!
@@ -277,7 +280,8 @@
 //!    can will never run again, and is settled on its behalf: `Failed`, report
 //!    `texts::unopenable_report(error)`, kept in `settlement.json`, status `Ended`/`Failed`. Before
 //!    that, off the async workers, what a previous daemon left in the `jobs/` of every other session
-//!    that is not archived is cleared (`loom_tools::jobs::clear_leftovers`, logged); a session to
+//!    that is not archived is cleared (`loom_tools::jobs::clear_leftovers`, logged: the output and
+//!    status of a command that ended by itself stay for its session's next `open`); a session to
 //!    activate is left to its job table, so one whose activation fails keeps its records for the
 //!    next start.
 //! 4. Restored root sessions with `meta.unattended` are told to carry on (`Input::Resume`) when
@@ -288,13 +292,15 @@
 //!      of the finish gate): a lead waiting for its agents is woken by their reports.
 //!
 //!    Attended or not, a restored session is told to carry on when its last turn ended `Waiting`
-//!    or `Yielded` and `open` told it of a lost job (`Session::lost_jobs() > 0`: the job's end
-//!    would have started a turn). A session whose last turn ended `Waiting` or `Yielded` and to which
+//!    or `Yielded` and it was told of job ends that no turn has followed (`Session::pending_job_ends`
+//!    is not 0: those `open` recorded for the previous daemon's jobs, or a shutdown for the jobs it
+//!    killed; the job's end would have started a turn). A session whose last turn ended `Waiting` or
+//!    `Yielded` and to which
 //!    a lost delivery is recovered (below) is not told to carry on — the delivery starts its turn —
 //!    but counts as carrying on for its children.
 //!
 //!    A restored child that has had a turn is idle (the restart cut its turn, or it was between
-//!    turns) and is *held*: it is told to carry on now when it was told of a lost job, when its
+//!    turns) and is *held*: it is told to carry on now when it was told of job ends as above, when its
 //!    mission is unattended, or when its parent carries on, and otherwise as soon as its parent is
 //!    (a message, a resume or an answer to the lead, or any turn the lead starts, such as one a
 //!    report starts): what the lead is told about its agents (`AFTER_RESTART`) is then what
@@ -309,8 +315,9 @@
 //!    `settlement.json` or else from its log (see *Files*) — unless it had ended and the call that
 //!    started it was `awaited` and has a recorded result (which told the lead how it ended; an agent
 //!    that a shutdown cut instead of stopping goes on, and is delivered), or it is a verifier of
-//!    the finish gate (known from the `child_spawned` record of a `finish` call). A settlement made
-//!    during this pass is left to this recovery.
+//!    the finish gate (known from its `meta.json`'s `gate`, so also after a crash that lost the
+//!    queued `child_spawned`; for an agent written before that field, from the `child_spawned` record
+//!    of a `finish` call). A settlement made during this pass is left to this recovery.
 //!
 //! ## Shutdown (`Runtime::shutdown`)
 //! Mark the runtime as shutting down. From that moment the orchestrator's `stop_child` and
@@ -321,7 +328,8 @@
 //! tool is cancelled the usual way (a command gets TERM, then KILL after `tools.kill_grace_s`) and
 //! its result is recorded, and the session itself records `interrupted{REASON_RESTART}` and a
 //! `Stopped` turn end (a child is not settled) — and close every active session's inputs channel,
-//! which ends every idle session cleanly. Wait up to `tools.kill_grace_s` + `SHUTDOWN_TASK_WAIT`
+//! which ends every idle session cleanly (it kills its jobs and records how they ended, so that the
+//! next start does not take them for lost). Wait up to `tools.kill_grace_s` + `SHUTDOWN_TASK_WAIT`
 //! for the tasks to end (the grace is the cancelled tool's: a foreground command whose task is
 //! aborted before its KILL would be left running, since nothing else tracks it); abort the tasks
 //! that have not, wait up to `SHUTDOWN_ABORT_WAIT` more, kill the sessions' jobs (grace
@@ -386,7 +394,8 @@
 //!   blocking one;
 //! - restart: a runtime shut down mid-turn and started again over the same home resumes an
 //!   unattended session by itself (next request carries the `AFTER_RESTART` note) and leaves an
-//!   attended one idle; open inbox items are back; an ended child is not activated;
+//!   attended one idle; open inbox items are back; an ended child is not activated; a finish
+//!   verifier whose `child_spawned` a crash kept out of the lead's log is still the gate's;
 //! - a read-only role's sandbox configuration protects the workspace; every session's environment
 //!   names the proxy;
 //! - `archive` hides, refuses messages, and survives a restart;
@@ -478,6 +487,11 @@ pub struct SessionMeta {
     pub unattended: bool,
     #[serde(default)]
     pub archived: bool,
+    /// A verifier the finish gate of its parent started, with the assignment it was given. Its
+    /// settlement belongs to that `finish`, or to a `finish` made again with the same assignment after
+    /// a restart, never to the parent as an agent's report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<Brief>,
 }
 
 /// A session as listed.
@@ -876,15 +890,17 @@ struct Known {
     /// `Resume` is sent and when the agent publishes that it is running, so that a second operator
     /// action before its turn starts sends no second one.
     held: bool,
-    /// The finish gate of its parent started it, with this assignment (known from the parent's log
-    /// for an agent restored from disk). Its settlement belongs to the `finish` that waits for it: it
-    /// is never delivered as an agent report, and the parent's agent listing leaves it out.
+    /// The finish gate of its parent started it, with this assignment (`meta.gate`; for an agent written
+    /// before that field, known from the parent's log once restored). Its settlement belongs to the
+    /// `finish` that waits for it: it is never delivered as an agent report, and the parent's agent
+    /// listing leaves it out.
     gate: Option<Brief>,
 }
 
 impl Known {
     fn new(meta: SessionMeta, status: Status) -> Known {
         let (settled_tx, _) = watch::channel(None);
+        let gate = meta.gate.clone();
         Known {
             meta,
             status,
@@ -894,7 +910,7 @@ impl Known {
             joined: false,
             restored: false,
             held: false,
-            gate: None,
+            gate,
         }
     }
 
@@ -945,7 +961,8 @@ struct Activation {
     already: bool,
     /// `open` cut a running turn.
     cut: bool,
-    /// `open` recorded lost jobs for a session that was waiting (it has to be woken).
+    /// The session was waiting and has been told of job ends no turn has followed (`open` recorded
+    /// those of the previous daemon, or a shutdown those of the jobs it killed): it has to be woken.
     woken: bool,
 }
 
@@ -1045,12 +1062,8 @@ impl Orchestrator for Orch {
             inner.resume_held(&verifier);
             return Ok(verifier);
         }
-        let brief = req.brief.clone();
-        let child = inner.spawn_child(parent, req)?;
-        if let Some(k) = inner.st().known.get_mut(&child) {
-            k.gate = Some(brief);
-        }
-        Ok(child)
+        // Marked as the gate's in its `meta.json`, written before its first turn: a crash cannot lose that.
+        inner.spawn_child(parent, req)
     }
 
     async fn join(&self, parent: &SessionId, child: &SessionId, cancel: &CancellationToken) -> Result<Settlement, String> {
@@ -1502,7 +1515,8 @@ impl Inner {
     /// Kill what a crashed daemon left running in the jobs directories of the sessions it knows, including the ones
     /// nobody activates (a session that was idle at the crash). Runs off the async workers; logs what it did.
     /// `activating` are left out: their job tables clear them when built, and one whose activation fails keeps its
-    /// records, without which the next start would not read its log for a lost job (`has_unsettled_job`).
+    /// records for the next start. The output and status of a command that ended by itself stay for its session to
+    /// take when it is next opened.
     async fn clear_crash_leftovers(&self, activating: &[SessionId]) {
         let dirs: Vec<(SessionId, PathBuf)> = {
             let st = self.st();
@@ -1529,9 +1543,10 @@ impl Inner {
                 for (id, found) in swept.into_iter().filter(|(_, f)| !f.is_empty()) {
                     let killed = found.iter().filter(|l| l.killed).count();
                     let left = found.iter().filter(|l| l.left_running).count();
+                    let ended = found.iter().filter(|l| l.ended_by_itself()).count();
                     tracing::warn!(
                         session = id.as_str(),
-                        "cleared {} command(s) a previous daemon left behind: {killed} killed, {left} left alone because their process group could not be confirmed",
+                        "cleared {} command(s) a previous daemon left behind: {killed} killed, {left} left alone because their process group could not be confirmed, {ended} had ended by themselves (their status and output are kept for the session)",
                         found.len()
                     );
                 }
@@ -1744,7 +1759,8 @@ impl Inner {
         let cut = cut_by_restart(session.records());
         let open = open_items(session.records());
         let status = session.status();
-        let woken = session.lost_jobs() > 0 && matches!(status.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
+        let woken =
+            session.pending_job_ends() > 0 && matches!(status.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
         {
             let mut st = self.st();
             for (item, opened_ms) in open {
@@ -1961,6 +1977,7 @@ impl Inner {
                 awaited: req.awaited,
                 unattended: p.meta.unattended,
                 archived: false,
+                gate: req.harness.then(|| req.brief.clone()),
             };
             let explicit = prole.termination == Termination::Explicit;
             st.known.insert(child_id.clone(), Known::new(meta.clone(), idle_status()));
@@ -2111,7 +2128,8 @@ impl Inner {
             let spawns = seen.entry(parent.clone()).or_insert_with(|| {
                 read_records(&self.paths.session_log(&parent)).map(|r| Spawns::of(&r.records)).unwrap_or_default()
             });
-            let gate = spawns.gate.get(&id).cloned();
+            // A verifier written before `meta.gate` existed is known from the lead's log only.
+            let gate = meta.gate.clone().or_else(|| spawns.gate.get(&id).cloned());
             // The lead had it: nothing is delivered, and a `finish` made again does not take it. A result
             // of the call told the lead how the agent ended only if it had: one that a shutdown cut
             // instead of stopping goes on, and its report is delivered.
@@ -2205,25 +2223,17 @@ impl Inner {
         self.st().known.values().any(|k| k.meta.parent.as_ref() == Some(id) && !k.finished() && k.gate.is_none())
     }
 
-    /// Whether the session's log holds a job that was registered and never settled. The log is read
-    /// only when the session's jobs directory holds something. Every command leaves its files there,
-    /// a foreground one as well as a background job, so this passes over only the sessions that never
-    /// ran a command; for the others the log decides.
-    fn has_unsettled_job(&self, id: &SessionId) -> bool {
-        let jobs = self.paths.session_dir(id).join("jobs");
-        if !std::fs::read_dir(jobs).is_ok_and(|mut entries| entries.next().is_some()) {
+    /// Whether the session's log holds a job that was registered and never settled, or a job end it
+    /// was told of that no turn has followed (`session::has_job_news`). The log is read only when the
+    /// session has a jobs directory. Every command creates it, a foreground one as well as a background
+    /// job, and nothing removes it (even when `open` has taken every file in it), so this passes over
+    /// only the sessions that never ran a command; for the others the log decides.
+    fn has_job_news(&self, id: &SessionId) -> bool {
+        if !self.paths.session_dir(id).join("jobs").is_dir() {
             return false;
         }
         let Ok(report) = read_records(&self.paths.session_log(id)) else { return false };
-        let own = own_records(&report.records);
-        let settled: HashSet<&str> = own
-            .iter()
-            .filter_map(|r| match &r.event {
-                Event::JobSettled { job_id, .. } => Some(job_id.as_str()),
-                _ => None,
-            })
-            .collect();
-        own.iter().any(|r| matches!(&r.event, Event::JobRegistered { job_id, .. } if !settled.contains(job_id.as_str())))
+        crate::session::has_job_news(own_records(&report.records))
     }
 
     /// Tell the children of `lead` that a restart left idle to carry on (see `held`). An agent gets one
@@ -2275,7 +2285,7 @@ impl Inner {
     /// The agents of `leads` that have not settled and have no task, after a restart or an unarchive:
     /// each is activated, so that a stop or an archive reaches it, and becomes `held` when it will not
     /// run by itself (a restart cut its turn, or left it idle). As at the start, it is resumed now when
-    /// it was told of a lost job or its mission is unattended, and otherwise when its lead goes on. One
+    /// it was told of job ends no turn has followed or its mission is unattended, and otherwise when its lead goes on. One
     /// that cannot be opened any more is settled `Failed` on its behalf, with what went wrong, so
     /// that its lead is not left waiting for it; a recovery delivers that.
     fn restore_children(self: &Arc<Self>, leads: impl Fn(&SessionId) -> bool) {
@@ -2626,8 +2636,8 @@ impl Runtime {
 
         inner.load_known();
         let mut restored: Vec<SessionId> = Vec::new();
-        // The flag marks a session that is wanted only if a job of its was lost (its turn yielded
-        // while the job ran, and the job's end would have started the next one).
+        // The flag marks a session that is wanted only for a job (its turn yielded while the job ran,
+        // or before it was told how the job ended, and the job's end would have started the next one).
         let candidates: Vec<(SessionId, bool)> = {
             let st = inner.st();
             st.known
@@ -2647,10 +2657,10 @@ impl Runtime {
         };
         let wanted: Vec<SessionId> = candidates
             .into_iter()
-            .filter(|(id, for_a_job)| !for_a_job || inner.has_unsettled_job(id))
+            .filter(|(id, for_a_job)| !for_a_job || inner.has_job_news(id))
             .map(|(id, _)| id)
             .collect();
-        // After the candidates are chosen: the sweep removes the records `has_unsettled_job` looks for.
+        // After the candidates are chosen: the sweep leaves the sessions to activate to their job tables.
         inner.clear_crash_leftovers(&wanted).await;
         let mut cut: HashSet<SessionId> = HashSet::new();
         let mut woken: HashSet<SessionId> = HashSet::new();
@@ -2790,6 +2800,7 @@ impl Runtime {
             awaited: false,
             unattended: new.unattended.unwrap_or(explicit),
             archived: false,
+            gate: None,
         };
         inner.st().known.insert(id.clone(), Known::new(meta.clone(), idle_status()));
         let forget = |inner: &Inner| {
@@ -5320,6 +5331,20 @@ mod tests {
         rt2.shutdown().await;
     }
 
+    /// What a crash leaves instead of a clean shutdown: the records the session wrote from the first
+    /// one of `kind` on (the shutdown's) are cut off its log. The log is hash-chained line by line, so
+    /// what is left is a sound log.
+    fn crash_log(path: &Path, kind: &str) {
+        let text = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| serde_json::from_str::<Value>(l).is_ok_and(|v| v["kind"] == kind))
+            .unwrap_or_else(|| panic!("no {kind} record in {}", path.display()));
+        let kept: String = lines[..at].iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(path, kept).unwrap();
+    }
+
     #[tokio::test]
     async fn restart_records_lost_jobs_and_wakes_the_session_that_waited_on_them() {
         let after = Arc::new(AtomicBool::new(false));
@@ -5339,6 +5364,9 @@ mod tests {
         let id = e.rt.create_session(att).await.unwrap().meta.id;
         until("waiting", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
         e.rt.shutdown().await;
+        // A crash: the job's end was never recorded, and the sweep found nothing to say how it ended.
+        crash_log(&e.rt.paths().session_log(&id), "job_settled");
+        std::fs::write(e.rt.paths().session_dir(&id).join("jobs/j1.status"), "").unwrap();
         after.store(true, Ordering::SeqCst);
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         let rt = rt2.clone();
@@ -5362,7 +5390,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_wakes_a_session_that_yielded_while_its_job_ran() {
+    async fn a_job_given_to_the_model_but_never_registered_is_settled_from_what_it_left_and_wakes_the_session() {
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let e = env(Script::new(move |_, _| {
+            if flag.load(Ordering::SeqCst) {
+                finish("seen it")
+            } else {
+                // The job and the wait in one reply: the turn ends before the job's registration is recorded.
+                let bash = json!({"command": "make all", "background": true}).to_string();
+                Action::Reply(Reply::tools([("bash", bash), ("wait", "{}".to_string())]))
+            }
+        }))
+        .await;
+        let mut att = e.new_session(Some("build it"));
+        att.unattended = Some(false);
+        let id = e.rt.create_session(att).await.unwrap().meta.id;
+        until("waiting", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting }))).await;
+        let call_id = e
+            .records(&id)
+            .iter()
+            .find_map(|r| match &r.event {
+                Event::ToolCall(c) if c.name == "bash" => Some(c.call_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        e.rt.shutdown().await;
+        // A crash before the registration reached the log; the job went on and finished while the harness was down.
+        crash_log(&e.rt.paths().session_log(&id), "job_registered");
+        let jobs = e.rt.paths().session_dir(&id).join("jobs");
+        std::fs::write(jobs.join("j1.pid"), "999999 1\nowner 1 1.000000\n").unwrap();
+        std::fs::write(jobs.join("j1.out"), "compiled\nall done\n").unwrap();
+        std::fs::write(jobs.join("j1.status"), "0\n").unwrap();
+        let before = e.server.requests().len();
+        after.store(true, Ordering::SeqCst);
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        until("a turn after the restart", || e.server.requests().len() > before).await;
+        let rs = rt2.records(&id, None, 2_000).unwrap();
+        let registered = rs.iter().position(|r| {
+            matches!(&r.event, Event::JobRegistered { job_id, call_id: c, command }
+                if job_id == "j1" && *c == call_id && command == "make all")
+        });
+        let settled = rs.iter().position(|r| {
+            matches!(&r.event, Event::JobSettled { job_id, exit_code: Some(0), output: Some(_), detail }
+                if job_id == "j1" && *detail == texts::job_ended_while_down(""))
+        });
+        let turn = rs.iter().rposition(|r| matches!(r.event, Event::TurnStart { trigger: loom_core::event::Trigger::Resume }));
+        assert!(registered.is_some() && registered < settled && settled < turn, "{rs:?}");
+        let last = e.server.requests().pop().unwrap();
+        assert!(mentions(&last, "Background job j1 ended: exit 0") && mentions(&last, "all done"));
+        assert!(mentions(&last, "It finished while the harness was down"));
+        // Taken: nothing of it is left to be found again.
+        assert!(["pid", "out", "status"].iter().all(|x| !jobs.join(format!("j1.{x}")).exists()));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_clean_shutdown_records_the_jobs_it_kills_and_the_restart_wakes_a_session_that_yielded_while_they_ran() {
         let after = Arc::new(AtomicBool::new(false));
         let flag = after.clone();
         let e = env(Script::new(move |body, _| {
@@ -5384,16 +5469,58 @@ mod tests {
         until("yielded", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Yielded }))).await;
         until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
         e.rt.shutdown().await;
+        // The idle session recorded how the job it killed ended, and why: the next start has nothing to call lost.
+        let rs = read_records(&e.rt.paths().session_log(&id)).unwrap().records;
+        let killed = rs.iter().position(|r| {
+            matches!(&r.event, Event::JobSettled { job_id, exit_code: None, output: Some(_), detail }
+                if job_id == "j1" && detail == texts::JOB_SHUTDOWN_DETAIL)
+        });
+        assert!(killed.is_some(), "{rs:?}");
         let before = e.server.requests().len();
         after.store(true, Ordering::SeqCst);
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         until("a turn after the restart", || e.server.requests().len() > before).await;
         let rs = rt2.records(&id, None, 2_000).unwrap();
-        let lost = rs.iter().position(|r| matches!(&r.event, Event::JobSettled { detail, .. } if detail == texts::JOB_LOST_DETAIL));
+        assert!(!rs.iter().any(|r| matches!(&r.event, Event::JobSettled { detail, .. } if detail == texts::JOB_LOST_DETAIL)));
+        assert_eq!(rs.iter().filter(|r| matches!(r.event, Event::JobSettled { .. })).count(), 1);
         let turn = rs.iter().rposition(|r| matches!(r.event, Event::TurnStart { trigger: loom_core::event::Trigger::Resume }));
-        assert!(lost.is_some() && lost < turn, "lost at {lost:?}, resumed at {turn:?}");
+        assert!(killed < turn, "settled at {killed:?}, resumed at {turn:?}");
         let last = e.server.requests().pop().unwrap();
-        assert!(mentions(&last, &texts::job_lost("j1", "sleep 600")));
+        assert!(mentions(&last, &format!("Background job j1 ended: killed. {}", texts::JOB_SHUTDOWN_DETAIL)));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_restart_wakes_a_session_told_of_a_job_end_even_when_nothing_is_left_in_its_jobs_directory() {
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let e = env(Script::new(move |body, _| {
+            if flag.load(Ordering::SeqCst) {
+                Action::Reply(Reply::text("noted"))
+            } else if tool_msgs(body) == 0 {
+                call("bash", json!({"command": "sleep 600", "background": true}))
+            } else {
+                Action::Reply(Reply::text("it is running; I will look at it when it ends"))
+            }
+        }))
+        .await;
+        let mut chat = e.new_session(Some("start a job"));
+        chat.role = Some("chat".into());
+        let id = e.rt.create_session(chat).await.unwrap().meta.id;
+        until("yielded", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Yielded }))).await;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        e.rt.shutdown().await;
+        // What an `open` that recorded how the job ended and took its files leaves when the harness goes
+        // down again before the turn it owes the session: the end in the log, an empty jobs directory.
+        let jobs = e.rt.paths().session_dir(&id).join("jobs");
+        for entry in std::fs::read_dir(&jobs).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        let before = e.server.requests().len();
+        after.store(true, Ordering::SeqCst);
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        until("a turn after the restart", || e.server.requests().len() > before).await;
+        assert!(mentions(&e.server.requests().pop().unwrap(), "Background job j1 ended: killed"));
         rt2.shutdown().await;
     }
 
@@ -5417,16 +5544,21 @@ mod tests {
         until("yielded", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Yielded }))).await;
         until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
         e.rt.shutdown().await;
-        // A crash, not a graceful shutdown, leaves the command's pid record behind, owned by another daemon.
+        // A crash, not a graceful shutdown: the job's end is not in the log, and the command's pid record
+        // is left behind, owned by another daemon, with no status.
+        crash_log(&e.rt.paths().session_log(&id), "job_settled");
         let jobs = e.rt.paths().session_dir(&id).join("jobs");
         std::fs::create_dir_all(&jobs).unwrap();
         std::fs::write(jobs.join("j1.pid"), "999999 1\nowner 1 1.000000\n").unwrap();
+        std::fs::write(jobs.join("j1.status"), "").unwrap();
         let before = e.server.requests().len();
         after.store(true, Ordering::SeqCst);
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         until("a turn after the restart", || e.server.requests().len() > before).await;
         let rs = rt2.records(&id, None, 2_000).unwrap();
-        assert!(rs.iter().any(|r| matches!(&r.event, Event::JobSettled { detail, .. } if detail == texts::JOB_LOST_DETAIL)));
+        let lost = rs.iter().position(|r| matches!(&r.event, Event::JobSettled { detail, .. } if detail == texts::JOB_LOST_DETAIL));
+        let turn = rs.iter().rposition(|r| matches!(r.event, Event::TurnStart { trigger: loom_core::event::Trigger::Resume }));
+        assert!(lost.is_some() && lost < turn, "lost at {lost:?}, resumed at {turn:?}");
         assert!(mentions(&e.server.requests().pop().unwrap(), &texts::job_lost("j1", "sleep 600")));
         assert!(!jobs.join("j1.pid").exists());
         rt2.shutdown().await;
@@ -5464,9 +5596,12 @@ mod tests {
         .await;
         until("idle", || rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
         rt.shutdown().await;
+        // A crash: see `a_crash_left_record_does_not_stop_the_restart_of_a_session_that_yielded_while_its_job_ran`.
+        crash_log(&paths.session_log(&id), "job_settled");
         let jobs = paths.session_dir(&id).join("jobs");
         std::fs::create_dir_all(&jobs).unwrap();
         std::fs::write(jobs.join("j1.pid"), "999999 1\nowner 1 1.000000\n").unwrap();
+        std::fs::write(jobs.join("j1.status"), "").unwrap();
         after.store(true, Ordering::SeqCst);
         // The first restart refuses to run the session (its pack needs a restricted network) ...
         config.network.mode = NetworkMode::Open;
@@ -5791,6 +5926,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_verifier_whose_spawn_record_a_crash_lost_is_still_the_finish_gates() {
+        let after = Arc::new(AtomicBool::new(false));
+        let flag = after.clone();
+        let e = env_with(
+            Script::new(move |body, _| {
+                if !has_tool(body, "verdict") {
+                    finish("lead done")
+                } else if flag.load(Ordering::SeqCst) {
+                    verifier_turn(body, true)
+                } else {
+                    Action::Stall { ms: 600_000 }
+                }
+            }),
+            false,
+            |c| c.agents.verify_finish = true,
+        )
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("the verifier's request", || e.server.requests().iter().any(|b| has_tool(b, "verdict"))).await;
+        let first = e.children(&id)[0].meta.id.clone();
+        assert!(e.rt.inner.st().known.get(&first).is_some_and(|k| k.gate.is_some()));
+        e.rt.shutdown().await;
+        // A crash: the `child_spawned` that the finish call queued never reached the lead's log.
+        let log = e.rt.paths().session_log(&id);
+        crash_log(&log, "child_spawned");
+        let rs = read_records(&log).unwrap().records;
+        assert!(rs.iter().any(|r| matches!(&r.event, Event::ToolCall(c) if c.name == "finish")));
+        assert!(!rs.iter().any(|r| matches!(r.event, Event::ChildSpawned(_))));
+        after.store(true, Ordering::SeqCst);
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        // Known as the gate's from its own meta.json: not an agent of the lead, nor running work of it.
+        assert!(rt2.inner.st().known.get(&first).is_some_and(|k| k.gate.is_some()));
+        assert!(rt2.inner.orch.children(&id).await.is_empty());
+        let rt = rt2.clone();
+        // The lead (unattended) calls finish again; it is not refused, and it takes the first verifier.
+        until("delivered", || rt.inbox().iter().any(|i| i.item.kind == InboxKind::Finished)).await;
+        let kids: Vec<SessionInfo> = rt2.sessions(true).into_iter().filter(|s| s.meta.parent.as_ref() == Some(&id)).collect();
+        assert_eq!(kids.len(), 1, "a second verifier was started");
+        let item = rt2.inbox().into_iter().find(|i| i.item.kind == InboxKind::Finished).unwrap().item;
+        assert!(item.text.contains(&format!("[verified by {first}]")), "{}", item.text);
+        let finishes = rt2.ledger(&info.meta.mission).unwrap().state.finishes;
+        assert_eq!(finishes.iter().map(|f| f.accepted).collect::<Vec<_>>(), vec![None, Some(true)]);
+        // Its verdict went to the finish only, never to the lead as an agent's report.
+        let settled: Vec<ChildSettled> = rt2
+            .records(&id, None, 2_000)
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::ChildSettled(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(settled.len(), 1);
+        assert_eq!((&settled[0].child, settled[0].inline), (&first, true));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_finish_made_again_after_an_operator_stop_cut_its_verification_starts_a_new_verifier() {
         let after = Arc::new(AtomicBool::new(false));
         let flag = after.clone();
@@ -5930,8 +6124,8 @@ mod tests {
         until("A is inside a request", a_asked).await;
         e.rt.shutdown().await;
         after.store(true, Ordering::SeqCst);
-        // Attended: A is held. B was told of its lost job and reports; that report starts the lead's
-        // turn, and A goes on with it.
+        // Attended: A is held. B was told how the shutdown ended its job and reports; that report starts
+        // the lead's turn, and A goes on with it.
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         let rt = rt2.clone();
         until("the lead finished", || {

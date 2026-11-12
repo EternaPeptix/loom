@@ -801,6 +801,7 @@ pub(crate) mod testkit {
                 awaited: false,
                 unattended: true,
                 archived,
+                gate: None,
             },
             active: false,
             status: status(Phase::Idle),
