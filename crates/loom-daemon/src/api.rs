@@ -653,6 +653,13 @@ async fn grant_scope(State(s): State<ApiState>, Path(id): Path<String>, body: By
     Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
 }
 
+/// NEEDS `Runtime::release` (not in this slice, which may not edit runtime.rs and session.rs): the one
+/// runtime method the finish/scope slice must add, exactly
+/// `pub async fn release(&self, id: &SessionId, reason: &str) -> Result<RuleReceipt, String>`.
+/// It trims `reason`, refuses a blank one with a sentence that says to write why, routes to the mission's
+/// lead like `add_rule` (`lead_of`, `mission_explicit`, `send_to_lead`), records `LedgerOp::OperatorRelease`
+/// from the user (a new `Input` variant kept on disk like `Withdraw`), and ends the mission's work so the
+/// session shows closed by the operator, not finished. Until it exists this crate does not build.
 async fn release(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
     let body: ReleaseBody = json_body(&body)?;
     let receipt = s.runtime.release(&SessionId::from(id), &body.reason).await.map_err(rt_err)?;

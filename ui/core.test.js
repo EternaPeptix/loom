@@ -921,9 +921,12 @@ test("a blocking blocker or park offers its choices, cheapest first, and closing
   assert.deepEqual([keep.action, keep.answer], ["answer", "Keep working on the goal."]);
   assert.equal(C.parkChoices(blocker)[1].action, "provide");
   assert.equal(C.parkChoices(blocker).at(-1).action, "release");
-  // choices the item carries are used as they are
-  const given = { ...blocker, options: ["Keep working", "Provide what's missing", C.PARK_ACCEPT] };
-  assert.deepEqual(C.parkChoices(given).map((c) => c.action), ["answer", "provide", "release"]);
+  // labels the item carries do not change the choices or what is sent
+  const given = { ...blocker, options: ["Whatever", "Do it"] };
+  assert.deepEqual(labels(given), labels(blocker));
+  assert.equal(C.parkChoices(given)[0].answer, "Keep working on the goal.");
+  const named = { ...other, options: ["Keep working (more budget)"] };
+  assert.deepEqual(labels(named), ["Keep working", "Keep working (more budget)", "Accept as blocked and close"]);
   // other items have none
   assert.equal(C.parkChoices({ ...blocker, blocking: false }), null);
   assert.equal(C.parkChoices({ ...blocker, item_kind: "question" }), null);

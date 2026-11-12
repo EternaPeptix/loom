@@ -556,23 +556,16 @@ export const PARK_HELP = "To answer, point it at the next step, for example \"ru
 /**
  * The choices for a blocking blocker or park, cheapest first; null for any other item. Each is
  * `{ label, action, answer? }`: `answer` sends `answer` as the operator's answer, `provide` opens the
- * answer box, `release` asks for a reason and closes the mission as blocked. Options the item carries
- * are used as they are (the label `PARK_ACCEPT` closes, "Provide what's missing" opens the box, any
- * other is sent as the answer); without any, the stock choices apply, with the budget one only for a
- * budget stop.
+ * answer box, `release` asks for a reason and closes the mission as blocked. The choices are always
+ * the stock ones, whatever labels the item carries, so the wording the operator sees and sends is this
+ * file's. "Keep working (more budget)" is offered for a park when the item's options name it or its text
+ * says the budget is used up (the item has no field for the reason it parked).
  */
 export function parkChoices(item) {
   if (!item || !item.blocking || (item.item_kind !== "blocker" && item.item_kind !== "parked")) return null;
-  const given = (item.options || []).map(String).filter((o) => o.trim());
-  if (given.length) {
-    return given.map((label) => {
-      if (label === PARK_ACCEPT) return { label, action: "release" };
-      if (label === PARK_PROVIDE) return { label, action: "provide" };
-      return { label, action: "answer", answer: label };
-    });
-  }
   const out = [{ label: PARK_KEEP, action: "answer", answer: "Keep working on the goal." }];
-  if (item.item_kind === "parked" && /budget/i.test(item.text || "")) {
+  const budget = (item.options || []).some((o) => String(o).trim() === PARK_MORE) || /budget/i.test(item.text || "");
+  if (item.item_kind === "parked" && budget) {
     out.push({ label: PARK_MORE, action: "answer", answer: "Keep working on the goal. Your budget is renewed." });
   }
   if (item.item_kind === "blocker") out.push({ label: PARK_PROVIDE, action: "provide" });

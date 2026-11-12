@@ -300,7 +300,9 @@ fn inbox_kind_word(kind: InboxKind) -> &'static str {
 }
 
 /// The hosts a scope request asks for, when `item` is one. A scope request is the non-blocking `Approval`
-/// item the `request_scope` tool opens: its options are the requested hosts, its text says why. Any other
+/// item the `request_scope` tool opens: its options are the requested hosts, in order, its text says why.
+/// The ui (`scopeRequestHosts`) and the app (`isScopeRequest`) detect it the same way; the mechanism must
+/// open the item with `InboxKind::Approval`, `blocking: false` and the hosts as `options`. Any other
 /// item, and an `Approval` with no hosts, is not one.
 pub fn scope_request_hosts(item: &InboxItem) -> Option<&[String]> {
     (item.kind == InboxKind::Approval && !item.blocking && !item.options.is_empty()).then_some(item.options.as_slice())
