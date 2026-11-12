@@ -584,16 +584,17 @@ impl LedgerState {
                 if blank(text) {
                     return Err(needs_text("the decision", "text"));
                 }
+                // Named as the `note` tool names them: a decision's reason is `why`, a dead end's what is `text`.
                 if blank(reason) {
-                    return Err(needs_text("the decision", "reason"));
+                    return Err(needs_text("the decision", "`why`"));
                 }
             }
             LedgerOp::DeadEnd { what, why } => {
                 if blank(what) {
-                    return Err(needs_text("the dead end", "what"));
+                    return Err(needs_text("the dead end", "`text`"));
                 }
                 if blank(why) {
-                    return Err(needs_text("the dead end", "why"));
+                    return Err(needs_text("the dead end", "`why`"));
                 }
             }
             LedgerOp::ClaimAdd { text } => {
@@ -1375,6 +1376,13 @@ mod tests {
         }
         refusal(&s, LedgerOp::GoalSet { text: " ".into() }, true);
         refusal(&s, LedgerOp::ConstraintAdd { text: "".into() }, true);
+        // The sentence names the parameter of the `note` tool that was empty, not the field of the record.
+        let m = refusal(&s, LedgerOp::DeadEnd { what: "\t".into(), why: "y".into() }, false);
+        assert!(m.starts_with("The `text` of the dead end is empty."), "{m}");
+        let m = refusal(&s, LedgerOp::DeadEnd { what: "w".into(), why: "".into() }, false);
+        assert!(m.starts_with("The `why` of the dead end is empty."), "{m}");
+        let m = refusal(&s, LedgerOp::Decision { text: "t".into(), reason: " ".into() }, false);
+        assert!(m.starts_with("The `why` of the decision is empty."), "{m}");
         assert!(s.validate(&LedgerOp::PlanSet { steps: vec!["x".into()] }, false).is_ok());
     }
 

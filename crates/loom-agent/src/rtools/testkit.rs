@@ -220,31 +220,17 @@ impl Rig {
     pub async fn call(&self, name: &str, args: Value) -> ToolResult {
         let admission = Admission { policy: &self.env.policy, estimator: &self.env.estimator };
         let result = execute(&self.registry, &self.env.ctx, name, &args.to_string(), &admission).await;
-        self.index_producer(&result);
-        result
-    }
-
-    /// Feed the producer index the way the runtime does for every stored result: the result's own
-    /// call produced its output, except that a view of another output is a view of that one's producer.
-    pub fn index_producer(&self, result: &ToolResult) {
-        let Some(out) = &result.output else { return };
-        let of = result.meta.get(loom_core::event::META_OF_BLOB).and_then(Value::as_str);
-        let inherited = of.and_then(|of| lock(&self.orch.producers).get(&BlobId::from(of)).cloned());
-        match (of, inherited) {
-            (Some(_), None) => {}
-            (Some(_), Some(p)) => {
-                lock(&self.orch.producers).entry(out.id.clone()).or_insert(p);
-            }
-            (None, _) => {
-                let p = Producer {
-                    session: self.shared.session.clone(),
-                    call_id: result.call_id.clone(),
-                    tool: result.name.clone(),
-                    class: result.class,
-                };
-                lock(&self.orch.producers).entry(out.id.clone()).or_insert(p);
-            }
+        // As the runtime does for every recorded result: the call that stored an output produced it.
+        // (A view such as `out_read` stores nothing; it leaves the output it views with its producer.)
+        if let Some(out) = &result.output {
+            lock(&self.orch.producers).entry(out.id.clone()).or_insert(Producer {
+                session: self.shared.session.clone(),
+                call_id: result.call_id.clone(),
+                tool: result.name.clone(),
+                class: result.class,
+            });
         }
+        result
     }
 
     /// Write an op to the mission journal as the operator (`from_user`), bypassing the tools.

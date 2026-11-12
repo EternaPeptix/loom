@@ -30,19 +30,33 @@
 //!   Records are compared by `seq`.
 //!
 //! ## Quote check
-//! `quote_matches(haystack, quote)` — true when `quote` occurs in `haystack` after both are prepared
-//! the same way: each line has trailing whitespace removed, and in `quote` only, a leading line-number
-//! prefix as produced by the read tools (`^\s*\d+[:\-│|]\s?`) is removed from each line when removing
-//! it from every line of the quote makes the match succeed. Leading/trailing blank lines of the quote
-//! are ignored. An empty or whitespace-only quote never matches. No other leniency: case, inner
-//! spacing and punctuation must be exact.
+//! `check_quote(haystack, quote, first_line)` — `haystack` is a range of lines of a stored output and
+//! `first_line` the number its first line has in that output. Both sides are prepared the same way:
+//! each line has trailing whitespace removed; leading/trailing blank lines of the quote are ignored.
+//! The quote is looked for as it is. Only when it does not occur that way, and every non-blank line
+//! of it starts with a line-number prefix as produced by the read tools (`^\s*\d+[:\-│|\t]\s?`, the
+//! numbers increasing; a line of digits alone is the number of a blank line), the prefixes are removed
+//! and the rest is looked for (blank lines at either end of it are ignored again). No other leniency:
+//! case, indentation, inner spacing and punctuation must be exact.
+//! An occurrence is accepted when both hold:
+//! - if the quote carried line numbers, each number is the number of the line its text is on;
+//! - it spans whole lines, or has at least `MIN_PARTIAL_QUOTE_CHARS` (8) non-whitespace characters.
+//!
+//! The first accepted occurrence wins and `Ok(text)` is the text to record: the quote's lines joined
+//! by `\n`, without the prefixes. Otherwise `Err`: `NotFound` (the text does not occur; also an empty
+//! or whitespace-only quote), `WrongLine { quoted, actual }` (it occurs, but never on the lines the
+//! quote numbers: for the first occurrence, the first wrong number and the line that text is on), or
+//! `TooShort` (it occurs where the numbers allow, but only as a fragment of fewer than 8 characters).
+//! The haystack is walked once, whatever the number of occurrences.
+//! `quote_matches(haystack, quote)` is `check_quote(haystack, quote, 1).is_ok()`.
 //! `nearest_line(haystack, quote)` returns the 1-based number and text of the haystack line sharing
 //! the longest common prefix with the first non-blank quote line (for error messages), if any shares
 //! at least 8 characters.
 //!
 //! Tests required: coverage from own output, from views, merged ranges, malformed meta; unviewed
 //! ordering and threshold; repetition counting across different outputs; both staleness kinds and
-//! their absence after a re-read / re-run; quote_matches positive, prefix-stripping, and negatives.
+//! their absence after a re-read / re-run; check_quote positives, prefix stripping in every separator
+//! style, wrong line numbers, the minimum length, and negatives.
 
 use crate::event::{
     Event, Record, Seq, ToolCall, ToolClass, ToolResult, ToolStatus, META_OF_BLOB, META_PATH, META_SHOWN,
@@ -397,8 +411,8 @@ pub fn stale(records: &[Record]) -> Vec<Stale> {
     out
 }
 
-/// Split a read-tool line number prefix (`^\s*\d+[:\-│|\t]\s?`) off `line`, giving the number and the rest. A line
-/// of digits alone is a number with an empty rest (a blank line of a numbered listing).
+/// Split a read-tool line number prefix (`^\s*\d+[:\-│|\t]\s?`) off `line`, giving the number and the
+/// rest. A line of digits alone is a number with an empty rest (a blank line of a numbered listing).
 fn split_line_prefix(line: &str) -> Option<(u64, &str)> {
     let t = line.trim_start();
     let digits = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
@@ -443,7 +457,8 @@ fn quote_lines(quote: &str) -> Vec<&str> {
 
 /// The quote with line-number prefixes removed, and the number each line carried (`None` for a blank
 /// line), or `None` when it does not consistently carry them: every non-blank line needs one and the
-/// numbers must increase.
+/// numbers must increase. Lines at either end that are empty once stripped are left out, as
+/// [`quote_lines`] leaves them out of a quote without numbers.
 fn strip_prefixes<'a>(lines: &[&'a str]) -> Option<(Vec<&'a str>, Vec<Option<u64>>)> {
     let mut out = Vec::with_capacity(lines.len());
     let mut numbers = Vec::with_capacity(lines.len());
@@ -462,7 +477,12 @@ fn strip_prefixes<'a>(lines: &[&'a str]) -> Option<(Vec<&'a str>, Vec<Option<u64
         out.push(rest);
         numbers.push(Some(n));
     }
-    Some((out, numbers))
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+        numbers.pop();
+    }
+    let lead = out.iter().take_while(|l| l.is_empty()).count();
+    Some((out.into_iter().skip(lead).collect(), numbers.into_iter().skip(lead).collect()))
 }
 
 /// A quote that does not span whole lines must have at least this many non-whitespace characters.
@@ -480,18 +500,49 @@ pub enum QuoteError {
     TooShort,
 }
 
-/// Byte offsets at which `needle` occurs in `hay`, overlapping ones included.
-fn find_all(hay: &str, needle: &str) -> Vec<usize> {
-    let mut out = Vec::new();
-    let mut from = 0usize;
-    while let Some(rest) = hay.get(from..) {
-        let Some(at) = rest.find(needle) else { break };
-        let off = from.saturating_add(at);
-        out.push(off);
-        let step = rest.get(at..).and_then(|r| r.chars().next()).map_or(1, char::len_utf8);
-        from = off.saturating_add(step);
+/// Walk the occurrences of `text` in `hay` front to back, overlapping ones included, and accept the first
+/// that is a valid quote: the numbers the quote gave its lines (`numbers`, one entry per line of `text`)
+/// are the numbers of the lines it is on, and it spans whole lines or is long enough. `first_line` is the
+/// number of the first line of `hay`. One pass: the line count is carried from one occurrence to the next,
+/// so the lines of `hay` are counted once however many occurrences are passed over.
+fn scan_quote(hay: &str, text: &str, numbers: Option<&[Option<u64>]>, first_line: u64) -> Result<(), QuoteError> {
+    if text.is_empty() {
+        return Err(QuoteError::NotFound);
     }
-    out
+    let long_enough = text.chars().filter(|c| !c.is_whitespace()).count() >= MIN_PARTIAL_QUOTE_CHARS;
+    let mut wrong: Option<QuoteError> = None;
+    let mut short = false;
+    // `line` is the number of the line that byte `counted` of `hay` is on.
+    let (mut line, mut counted) = (first_line, 0usize);
+    let mut from = 0usize;
+    while let Some(off) = hay.get(from..).and_then(|rest| rest.find(text)).map(|at| from.saturating_add(at)) {
+        let newlines = hay.get(counted..off).map_or(0, |between| between.matches('\n').count());
+        line = line.saturating_add(newlines as u64);
+        counted = off;
+        from = off.saturating_add(hay.get(off..).and_then(|r| r.chars().next()).map_or(1, char::len_utf8));
+        if let Some(numbers) = numbers {
+            let bad = numbers.iter().enumerate().find_map(|(k, n)| {
+                let actual = line.saturating_add(k as u64);
+                n.filter(|n| *n != actual).map(|n| QuoteError::WrongLine { quoted: n, actual })
+            });
+            if bad.is_some() {
+                wrong = wrong.or(bad);
+                continue;
+            }
+        }
+        let starts_line = off == 0 || hay.get(..off).is_some_and(|before| before.ends_with('\n'));
+        let after = hay.get(off.saturating_add(text.len())..);
+        let ends_line = after.is_some_and(|after| after.is_empty() || after.starts_with('\n'));
+        if (starts_line && ends_line) || long_enough {
+            return Ok(());
+        }
+        short = true;
+    }
+    match wrong {
+        _ if short => Err(QuoteError::TooShort),
+        Some(e) => Err(e),
+        None => Err(QuoteError::NotFound),
+    }
 }
 
 /// Check `quote` against `haystack`, whose first line is line `first_line` of the stored output. Returns
@@ -505,50 +556,16 @@ pub fn check_quote(haystack: &str, quote: &str, first_line: u64) -> Result<Strin
     let hay = prepare_haystack(haystack);
     let lines = quote_lines(quote);
     let literal = lines.join("\n");
-    let (text, numbers) = if hay.contains(&literal) {
-        (literal, None)
-    } else {
-        let (stripped, numbers) = strip_prefixes(&lines).ok_or(QuoteError::NotFound)?;
-        let joined = stripped.join("\n");
-        if joined.trim().is_empty() {
-            return Err(QuoteError::NotFound);
-        }
-        (joined, Some(numbers))
-    };
-    let found = find_all(&hay, &text);
-    if found.is_empty() {
-        return Err(QuoteError::NotFound);
+    match scan_quote(&hay, &literal, None, first_line) {
+        Err(QuoteError::NotFound) => {}
+        verdict => return verdict.map(|()| literal),
     }
-    let long_enough = text.chars().filter(|c| !c.is_whitespace()).count() >= MIN_PARTIAL_QUOTE_CHARS;
-    let mut wrong: Option<QuoteError> = None;
-    let mut short = false;
-    for off in found {
-        let before = hay.get(..off).unwrap_or("");
-        let base = first_line.saturating_add(before.matches('\n').count() as u64);
-        if let Some(numbers) = &numbers {
-            let bad = numbers.iter().enumerate().find_map(|(k, n)| {
-                let actual = base.saturating_add(k as u64);
-                n.filter(|n| *n != actual).map(|n| QuoteError::WrongLine { quoted: n, actual })
-            });
-            if bad.is_some() {
-                wrong = wrong.or(bad);
-                continue;
-            }
-        }
-        let end = off.saturating_add(text.len());
-        let starts_line = before.is_empty() || before.ends_with('\n');
-        let ends_line = hay.get(end..).is_some_and(|r| r.is_empty() || r.starts_with('\n'));
-        if (starts_line && ends_line) || long_enough {
-            return Ok(text);
-        }
-        short = true;
-    }
-    match wrong {
-        Some(e) if !short => Err(e),
-        _ => Err(QuoteError::TooShort),
-    }
+    let (stripped, numbers) = strip_prefixes(&lines).ok_or(QuoteError::NotFound)?;
+    let text = stripped.join("\n");
+    scan_quote(&hay, &text, Some(numbers.as_slice()), first_line).map(|()| text)
 }
 
+/// [`check_quote`] for a haystack that starts at line 1, when only the answer matters.
 pub fn quote_matches(haystack: &str, quote: &str) -> bool {
     check_quote(haystack, quote, 1).is_ok()
 }
@@ -932,10 +949,46 @@ mod tests {
         ] {
             assert_eq!(check_quote(hay, q, 1), Ok("alpha line\n    beta line".to_string()), "{q:?}");
         }
-        assert_eq!(check_quote(hay, "3\t\n4\tgamma line", 1), Ok("\ngamma line".to_string()));
-        assert!(check_quote(hay, "1\talpha line\n3\t    beta line", 1).is_err());
+        assert_eq!(
+            check_quote(hay, "1\talpha line\n3\t    beta line", 1),
+            Err(QuoteError::WrongLine { quoted: 3, actual: 2 })
+        );
         // Unprefixed quotes are returned as they are.
         assert_eq!(check_quote(hay, "gamma line", 1), Ok("gamma line".to_string()));
+    }
+
+    #[test]
+    fn numbered_blank_lines_at_the_ends_of_a_quote_are_left_out() {
+        let hay = "alpha line\n    beta line\n\ngamma line\n";
+        // As for a quote without numbers, where blank lines at either end are ignored.
+        assert_eq!(check_quote(hay, "\n\ngamma line\n", 1), Ok("gamma line".to_string()));
+        assert_eq!(check_quote(hay, "3\t\n4\tgamma line", 1), Ok("gamma line".to_string()));
+        assert_eq!(check_quote(hay, "2:     beta line\n3:", 1), Ok("    beta line".to_string()));
+        // A blank line at an end is not recorded, so nothing is claimed about the line next to the text.
+        assert_eq!(check_quote(hay, "1\t\n2\t    beta line", 1), Ok("    beta line".to_string()));
+        // A blank line inside the quote is part of the text and has to be there.
+        let inside = check_quote(hay, "2\t    beta line\n3\t\n4\tgamma line", 1);
+        assert_eq!(inside, Ok("    beta line\n\ngamma line".to_string()));
+        assert_eq!(check_quote(hay, "1\talpha line\n2\t\n3\t    beta line", 1), Err(QuoteError::NotFound));
+        // Nothing but numbers is not a quote.
+        assert_eq!(check_quote(hay, "3\t\n4\t", 1), Err(QuoteError::NotFound));
+    }
+
+    #[test]
+    fn quote_check_walks_a_large_output_once() {
+        let started = std::time::Instant::now();
+        // Every one of 200 000 lines ends in the fragment, and no occurrence of it is acceptable.
+        let hay: String = (1..=200_000).map(|i| format!("run {i} ... ok\n")).collect();
+        assert_eq!(check_quote(&hay, "... ok", 1), Err(QuoteError::TooShort));
+        // The same line 200 000 times: the numbers decide which occurrence is quoted.
+        let hay = "same line of output\n".repeat(200_000);
+        assert_eq!(check_quote(&hay, "200000\tsame line of output", 1), Ok("same line of output".to_string()));
+        assert_eq!(
+            check_quote(&hay, "200001: same line of output", 1),
+            Err(QuoteError::WrongLine { quoted: 200_001, actual: 1 })
+        );
+        // Counting the lines again from the top for each occurrence takes minutes here.
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "took {:?}", started.elapsed());
     }
 
     #[test]

@@ -47,13 +47,20 @@
 //! For each quote, in order: resolve `handle` with `BlobStore::resolve` (failure → `quote {i}: there
 //! is no stored output {handle}; handles are the out:… ids in result headers`); `start`/`end` must be
 //! `1 <= start <= end` and `start <= total lines` (else a sentence giving the output's line count);
-//! read the lines (`end` clamped to the last line) and require `observe::quote_matches(lines, text)`.
-//! On a mismatch the sentence is `quote {i}: the text does not occur in {handle} lines {start}-{end}.`
-//! followed, when `observe::nearest_line` finds one in that range, by ` The closest line there is
-//! {n}: {line}` (line cut to 200 characters) and always by ` Copy the text exactly from the output.`
+//! read the lines (`end` clamped to the last line) and check them with `observe::check_quote(lines,
+//! text, start)`, whose errors become these sentences:
+//! - `NotFound`: `quote {i}: the text does not occur in {handle} lines {start}-{end}.` followed, when
+//!   `observe::nearest_line` finds one in that range, by ` The closest line there is {n}: {line}`
+//!   (line cut to 200 characters) and always by ` Copy the text exactly from the output.`
+//! - `WrongLine { quoted, actual }` (the quote carries line numbers that are not those of its lines):
+//!   `quote {i}: the text is on line {actual} of {handle}, not line {quoted}. Fix the line number, or
+//!   quote the text without line numbers.`
+//! - `TooShort`: `quote {i}: a quote that is only part of a line needs at least 8 non-space
+//!   characters. Quote more of the line, or the whole line with its indentation.`
+//!
 //! An empty `text` is a mismatch with the sentence `quote {i}: the text is empty.`
-//! Returns `Ok(verified)` when every quote passes (blob id, the clamped range, the text), else
-//! `Err(all sentences, one per line)`.
+//! Returns `Ok(verified)` when every quote passes (blob id, the clamped range, and the text as
+//! `check_quote` returned it: without line-number prefixes), else `Err(all sentences, one per line)`.
 //!
 //! ## `render_report` — what a parent sees of a child's result
 //! ```text
@@ -403,7 +410,7 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize) -> Result<VerifiedQuote, St
         }
         Err(observe::QuoteError::TooShort) => {
             return Err(format!(
-                "quote {i}: a quote that is only part of a line needs at least {} non-space characters. Quote more of the line, or the whole line.",
+                "quote {i}: a quote that is only part of a line needs at least {} non-space characters. Quote more of the line, or the whole line with its indentation.",
                 observe::MIN_PARTIAL_QUOTE_CHARS
             ));
         }
@@ -792,7 +799,17 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
             format!("quote 1: the text is on line 2 of {h}, not line 7. Fix the line number, or quote the text without line numbers.")
         );
         let e = check_quotes(&store, &[q(&h, 1, 4, "line")]).err().unwrap_or_default();
-        assert!(e.starts_with("quote 1: ") && e.contains("at least 8 non-space characters"), "{e}");
+        assert_eq!(
+            e,
+            "quote 1: a quote that is only part of a line needs at least 8 non-space characters. Quote more of the line, or the whole line with its indentation."
+        );
+        // A numbered blank line at an end of the quote is not part of the recorded text.
+        let (_d, store, h) = store_with("first\n\n  ok\n");
+        let ok = check_quotes(&store, &[q(&h, 1, 3, "2\t\n3\t  ok")]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ok[0].text, "  ok");
+        // The whole of a short line counts with its indentation only.
+        let e = check_quotes(&store, &[q(&h, 3, 3, "ok")]).err().unwrap_or_default();
+        assert!(e.contains("the whole line with its indentation"), "{e}");
     }
 
     #[test]
