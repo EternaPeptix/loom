@@ -14,7 +14,7 @@
 //!   [`Runtime::archive`]. Writes are atomic (temporary file in the same directory, then rename).
 //! - `status.json` — the latest [`Status`](crate::session::Status), rewritten atomically whenever
 //!   the session publishes one.
-//! - `net.jsonl` — one [`NetEntry`] per line: every decision the egress proxy made for the session.
+//! - `net.jsonl` — one [`NetEntry`] per line, hash-chained (`prev`): every decision the egress proxy made for the session.
 //! - `tmp/` (`paths.session_tmp`) — the session's scratch directory; `jobs/` — its job table's files.
 //!
 //! A session directory without a readable `meta.json` is ignored (`tracing::warn!`).
@@ -1655,25 +1655,26 @@ async fn run_notify(command: Vec<String>, kind: String, session: String, title: 
     }
 }
 
-/// Append one proxy decision to the session's `net.jsonl` and publish it.
+/// Publish one proxy decision. The audit hook (`net_audit`) has already put it in `net.jsonl`.
 fn record_net(inner: &Inner, session: SessionId, decision: NetDecision) {
     let entry = NetEntry { ts_ms: now_ms(), decision };
-    let dir = inner.paths.session_dir(&session);
-    if dir.is_dir() {
-        if let Ok(mut line) = serde_json::to_string(&entry) {
-            line.push('\n');
-            use std::io::Write;
-            let written = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("net.jsonl"))
-                .and_then(|mut f| f.write_all(line.as_bytes()));
-            if let Err(e) = written {
-                tracing::warn!("cannot append to net.jsonl of {}: {e}", session.as_str());
-            }
-        }
-    }
     inner.publish(BusEvent::Net { session, entry });
+}
+
+/// The proxy's audit hook: appends the decision to the session's `net.jsonl` as a chained line and
+/// syncs it to disk before returning, so an allowed connection is on record before it is used.
+fn net_audit(paths: Paths) -> loom_net::AuditFn {
+    let writer = loom_net::netlog::NetLogWriter::new();
+    Arc::new(move |session: &SessionId, decision: &NetDecision| {
+        let dir = paths.session_dir(session);
+        if !dir.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("the session directory {} does not exist", dir.display()),
+            ));
+        }
+        writer.append(&dir.join("net.jsonl"), &NetEntry { ts_ms: now_ms(), decision: decision.clone() })
+    })
 }
 
 /// The runtime. Cheap to clone; all clones are the same runtime.
@@ -1707,7 +1708,9 @@ impl Runtime {
             );
         }
         let (net_tx, mut net_rx) = unbounded_channel();
-        let proxy = Proxy::start(config.daemon.proxy_port, net_tx).await.map_err(|e| e.to_string())?;
+        let proxy = Proxy::start_with(config.daemon.proxy_port, net_tx, Some(net_audit(paths.clone())), Default::default())
+            .await
+            .map_err(|e| e.to_string())?;
         let (bus, _) = broadcast::channel(BUS_CAPACITY);
         let inner = Arc::new_cyclic(|me: &Weak<Inner>| Inner {
             me: me.clone(),
@@ -2123,6 +2126,12 @@ impl Runtime {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
+        if let Err(b) = loom_net::netlog::verify(&text) {
+            return Err(format!(
+                "The egress audit log {} is damaged at {b}. Do not trust it: it was edited, truncated or written by something else. Keep a copy for review and move it aside to start a new chain.",
+                path.display()
+            ));
+        }
         let mut entries: Vec<NetEntry> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
         if entries.len() > limit {
             entries.drain(..entries.len() - limit);
@@ -2396,6 +2405,39 @@ mod tests {
         assert_eq!(e.rt.missions().len(), 1);
         e.rt.shutdown().await;
         assert_eq!(e.rt.send_message(&id, "x").await.unwrap_err(), "The harness is shutting down.");
+    }
+
+    #[tokio::test]
+    async fn net_audit_hook_chains_the_session_net_file() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("net"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let audit = net_audit(e.rt.paths().clone());
+        let decision = |host: &str| NetDecision {
+            host: host.into(),
+            port: 443,
+            method: "CONNECT".into(),
+            allowed: true,
+            rule: "mode open".into(),
+            resolved: None,
+        };
+        let path = e.rt.paths().session_dir(&id).join("net.jsonl");
+        // Lines written before the chain existed still load; new lines chain after them.
+        let old = serde_json::to_string(&NetEntry { ts_ms: 1, decision: decision("old.test") }).unwrap();
+        std::fs::write(&path, format!("{old}\n")).unwrap();
+        audit(&id, &decision("a.test")).unwrap();
+        audit(&id, &decision("b.test")).unwrap();
+        let hosts: Vec<String> = e.rt.net(&id, 10).unwrap().into_iter().map(|n| n.decision.host).collect();
+        assert_eq!(hosts, ["old.test", "a.test", "b.test"]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("\"prev\"").count(), 2);
+        // A modified line is reported, not served.
+        std::fs::write(&path, text.replace("a.test", "z.test")).unwrap();
+        let err = e.rt.net(&id, 10).unwrap_err();
+        assert!(err.contains("damaged at line 3"), "{err}");
+        // No session directory: the hook fails, so the proxy refuses the connection.
+        assert!(audit(&SessionId::from("s-missing"), &decision("c.test")).is_err());
     }
 
     #[tokio::test]

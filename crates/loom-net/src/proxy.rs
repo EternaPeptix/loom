@@ -53,6 +53,18 @@
 //! allowed decision with the suffix; exactly one decision per request and the right session id on
 //! each when two sessions use the proxy at once; malformed heads → 400 and the server keeps serving;
 //! oversized head; `env()` contents; shutdown stops accepting.
+//!
+//! ## Audit, limits, and the response marker (added by the egress audit fixes)
+//! - An audit hook ([`AuditFn`]) records every decision. For an allowed connection it runs after the
+//!   upstream connect and before anything is sent either way; when it fails the client gets `502` (with
+//!   the marker) and the connection is closed. Refusals, `400`, `407` (when the credentials name a
+//!   granted session) and over-limit answers are audited best effort; a failure is logged.
+//! - `check_addr` applies the `deny` list to the resolved address too (see `policy.rs`).
+//! - [`Limits`]: 256 connections in all (over it: `503` written at once), 64 per session (`429`), 10
+//!   minutes without a byte in either direction on a tunnel or forwarded request, 16 concurrent name
+//!   lookups. A forwarded request ends when the client goes away.
+//! - A plain-HTTP response head from the destination is relayed without any `X-Loom-Proxy` header; only
+//!   responses the proxy generates carry it.
 
 use crate::policy::{normalize_host, Policy};
 use base64::Engine as _;
@@ -66,6 +78,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 const MAX_HEAD: usize = 64 * 1024;
@@ -75,6 +88,40 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Addresses of one name that are examined; a name with more is cut here.
 const MAX_ADDRS: usize = 32;
+
+/// The audit hook: called with the session and the decision, it must have recorded the decision
+/// durably when it returns `Ok`. It may block (it runs on a blocking thread). For an allowed
+/// connection the proxy calls it before the upstream socket is used and refuses the connection (502)
+/// when it fails.
+pub type AuditFn = Arc<dyn Fn(&SessionId, &NetDecision) -> std::io::Result<()> + Send + Sync>;
+
+/// Test hook: name to addresses, instead of a system lookup.
+type Resolver = Arc<dyn Fn(&str) -> Vec<IpAddr> + Send + Sync>;
+
+/// Resource limits of one proxy.
+#[derive(Clone, Debug)]
+pub struct Limits {
+    /// Concurrent client connections, all sessions together. Default 256.
+    pub max_connections: usize,
+    /// Concurrent client connections of one session. Default 64.
+    pub max_per_session: usize,
+    /// A tunnel or forwarded request with no bytes in either direction for this long is closed.
+    /// Default 10 minutes.
+    pub idle_timeout: Duration,
+    /// Concurrent name lookups. Default 16.
+    pub max_lookups: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            max_connections: 256,
+            max_per_session: 64,
+            idle_timeout: Duration::from_secs(600),
+            max_lookups: 16,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
@@ -113,6 +160,8 @@ struct Entry {
     session: SessionId,
     password: String,
     policy: Arc<Policy>,
+    /// One permit per open client connection of the session.
+    permits: Arc<Semaphore>,
 }
 
 /// State shared with every connection task (tasks never hold `Inner`, so dropping the last `Proxy`
@@ -120,6 +169,11 @@ struct Entry {
 struct Shared {
     sessions: Mutex<HashMap<String, Entry>>,
     sink: UnboundedSender<(SessionId, NetDecision)>,
+    audit: Option<AuditFn>,
+    limits: Limits,
+    connections: Arc<Semaphore>,
+    lookups: Arc<Semaphore>,
+    resolver: Option<Resolver>,
 }
 
 struct Inner {
@@ -140,12 +194,42 @@ pub struct Proxy {
 }
 
 impl Proxy {
+    /// A proxy without an audit hook and with the default limits.
     pub async fn start(port: u16, sink: UnboundedSender<(SessionId, NetDecision)>) -> Result<Proxy, ProxyError> {
+        Proxy::start_with(port, sink, None, Limits::default()).await
+    }
+
+    /// `audit` records every decision before it takes effect (see [`AuditFn`]); `sink` still receives
+    /// the decisions of requests that reached the policy, for display.
+    pub async fn start_with(
+        port: u16,
+        sink: UnboundedSender<(SessionId, NetDecision)>,
+        audit: Option<AuditFn>,
+        limits: Limits,
+    ) -> Result<Proxy, ProxyError> {
+        Proxy::start_inner(port, sink, audit, limits, None).await
+    }
+
+    async fn start_inner(
+        port: u16,
+        sink: UnboundedSender<(SessionId, NetDecision)>,
+        audit: Option<AuditFn>,
+        limits: Limits,
+        resolver: Option<Resolver>,
+    ) -> Result<Proxy, ProxyError> {
         let listener = TcpListener::bind(("127.0.0.1", port))
             .await
             .map_err(|source| ProxyError::Bind { port, source })?;
         let bound = listener.local_addr().map_err(|source| ProxyError::Bind { port, source })?.port();
-        let shared = Arc::new(Shared { sessions: Mutex::new(HashMap::new()), sink });
+        let shared = Arc::new(Shared {
+            sessions: Mutex::new(HashMap::new()),
+            sink,
+            audit,
+            connections: Arc::new(Semaphore::new(limits.max_connections)),
+            lookups: Arc::new(Semaphore::new(limits.max_lookups)),
+            limits,
+            resolver,
+        });
         let cancel = CancellationToken::new();
         tokio::spawn(accept_loop(listener, shared.clone(), cancel.clone()));
         Ok(Proxy { inner: Arc::new(Inner { port: bound, shared, cancel }) })
@@ -158,7 +242,12 @@ impl Proxy {
 
     pub fn grant(&self, session: &SessionId, policy: Policy) -> SessionGrant {
         let password = format!("{:032x}", rand::rng().random::<u128>());
-        let entry = Entry { session: session.clone(), password: password.clone(), policy: Arc::new(policy) };
+        let entry = Entry {
+            session: session.clone(),
+            password: password.clone(),
+            policy: Arc::new(policy),
+            permits: Arc::new(Semaphore::new(self.inner.shared.limits.max_per_session)),
+        };
         lock(&self.inner.shared.sessions).insert(session.as_str().to_string(), entry);
         SessionGrant { port: self.inner.port, user: session.as_str().to_string(), password }
     }
@@ -194,14 +283,26 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>, cancel: Cancell
         tokio::select! {
             _ = cancel.cancelled() => break,
             r = listener.accept() => match r {
-                Ok((stream, _)) => {
-                    tokio::spawn(handle(stream, shared.clone(), cancel.clone()));
-                }
+                Ok((stream, _)) => match shared.connections.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        tokio::spawn(handle(stream, shared.clone(), cancel.clone(), permit));
+                    }
+                    Err(_) => refuse_at_once(&stream, &shared),
+                },
                 // Out of descriptors or a connection reset before accept: keep serving.
                 Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
             },
         }
     }
+}
+
+/// Answers a connection over the global cap without a task: one non-blocking write, then close.
+fn refuse_at_once(stream: &TcpStream, shared: &Shared) {
+    let body = format!(
+        "loom proxy: too many open proxy connections (limit {}). Wait for running commands to finish, or retry shortly.\n",
+        shared.limits.max_connections
+    );
+    let _ = stream.try_write(response_bytes("503 Service Unavailable", "Retry-After: 5\r\n", &body).as_bytes());
 }
 
 struct Head {
@@ -269,13 +370,18 @@ fn too_large() -> String {
     format!("the request head is larger than {} KiB; send a smaller head", MAX_HEAD / 1024)
 }
 
+/// A proxy-generated response. These, and only these, carry `X-Loom-Proxy: 1`.
+fn response_bytes(status: &str, extra: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nX-Loom-Proxy: 1\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n{extra}Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
 /// Writes a proxy-generated response and closes. Unread input is drained briefly so that closing
 /// does not reset the connection before the client has read the response.
 async fn respond(client: &mut TcpStream, status: &str, extra: &str, body: &str) {
-    let msg = format!(
-        "HTTP/1.1 {status}\r\nX-Loom-Proxy: 1\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n{extra}Content-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
+    let msg = response_bytes(status, extra, body);
     if client.write_all(msg.as_bytes()).await.is_err() {
         return;
     }
@@ -300,6 +406,45 @@ async fn bad_request(client: &mut TcpStream, why: &str) {
     respond(client, "400 Bad Request", "", &body).await;
 }
 
+/// Records a decision: the audit hook first (on a blocking thread, so file I/O never stalls a worker),
+/// then, when `to_sink`, the display sink. A failing hook is returned; the sink then gets the decision
+/// as a refusal so the operator sees what happened.
+async fn audit_decision(shared: &Shared, session: &SessionId, d: NetDecision, to_sink: bool) -> std::io::Result<()> {
+    let result = match &shared.audit {
+        None => Ok(()),
+        Some(f) => {
+            let (f, s, dd) = (f.clone(), session.clone(), d.clone());
+            match tokio::task::spawn_blocking(move || f(&s, &dd)).await {
+                Ok(r) => r,
+                Err(e) => Err(std::io::Error::other(format!("the audit task failed: {e}"))),
+            }
+        }
+    };
+    if to_sink {
+        let shown = match &result {
+            Ok(()) => d,
+            Err(_) => NetDecision { allowed: false, rule: format!("{} (refused: egress audit log not written)", d.rule), ..d },
+        };
+        let _ = shared.sink.send((session.clone(), shown));
+    }
+    result
+}
+
+/// Audits a request the proxy answers itself (400, 407, over a limit). Best effort: a failure is logged.
+async fn audit_local(shared: &Shared, session: &SessionId, method: &str, target: &str, rule: String) {
+    let d = NetDecision {
+        host: target.chars().take(200).collect(),
+        port: 0,
+        method: method.chars().take(32).collect(),
+        allowed: false,
+        rule,
+        resolved: None,
+    };
+    if let Err(e) = audit_decision(shared, session, d, false).await {
+        tracing::warn!("cannot write the egress audit record of {}: {e}", session.as_str());
+    }
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -307,20 +452,34 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// The session whose Basic credentials the request carries.
-fn authenticate(shared: &Shared, head: &Head) -> Option<(SessionId, Arc<Policy>)> {
-    let value = std::str::from_utf8(head.header("proxy-authorization")?).ok()?;
-    let (scheme, encoded) = value.trim().split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("basic") {
-        return None;
-    }
-    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded.trim()).ok()?;
-    let decoded = String::from_utf8(decoded).ok()?;
+struct Authed {
+    session: SessionId,
+    policy: Arc<Policy>,
+    permits: Arc<Semaphore>,
+}
+
+/// The session whose Basic credentials the request carries. On failure, the session the request
+/// claimed to be (a known user with a wrong password), for the audit record.
+fn authenticate(shared: &Shared, head: &Head) -> Result<Authed, Option<SessionId>> {
+    let decoded = (|| {
+        let value = std::str::from_utf8(head.header("proxy-authorization")?).ok()?;
+        let (scheme, encoded) = value.trim().split_once(' ')?;
+        if !scheme.eq_ignore_ascii_case("basic") {
+            return None;
+        }
+        let decoded = base64::engine::general_purpose::STANDARD.decode(encoded.trim()).ok()?;
+        String::from_utf8(decoded).ok()
+    })();
+    let Some(decoded) = decoded else { return Err(None) };
     // Passwords are hex, so the last colon separates the two.
-    let (user, password) = decoded.rsplit_once(':')?;
+    let Some((user, password)) = decoded.rsplit_once(':') else { return Err(None) };
     let sessions = lock(&shared.sessions);
-    let e = sessions.get(user)?;
-    constant_time_eq(e.password.as_bytes(), password.as_bytes()).then(|| (e.session.clone(), e.policy.clone()))
+    let Some(e) = sessions.get(user) else { return Err(None) };
+    if constant_time_eq(e.password.as_bytes(), password.as_bytes()) {
+        Ok(Authed { session: e.session.clone(), policy: e.policy.clone(), permits: e.permits.clone() })
+    } else {
+        Err(Some(e.session.clone()))
+    }
 }
 
 /// `host[:port]` or `[v6][:port]`, without credentials. The host is returned normalized.
@@ -371,7 +530,8 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    fn emit(&self, allowed: bool, rule: String, resolved: Option<IpAddr>) {
+    /// Audits and publishes this request's decision.
+    async fn record(&self, allowed: bool, rule: String, resolved: Option<IpAddr>) -> std::io::Result<()> {
         let d = NetDecision {
             host: self.host.to_string(),
             port: self.port,
@@ -380,7 +540,14 @@ impl Ctx<'_> {
             rule,
             resolved: resolved.map(|a| a.to_string()),
         };
-        let _ = self.shared.sink.send((self.session.clone(), d));
+        audit_decision(self.shared, self.session, d, true).await
+    }
+
+    /// Like `record`, for decisions that need no audit to succeed: a failure is only logged.
+    async fn record_best_effort(&self, allowed: bool, rule: String, resolved: Option<IpAddr>) {
+        if let Err(e) = self.record(allowed, rule, resolved).await {
+            tracing::warn!("cannot write the egress audit record of {}: {e}", self.session.as_str());
+        }
     }
 
     fn dest(&self) -> String {
@@ -411,28 +578,62 @@ impl Ctx<'_> {
             ),
         )
     }
+
+    fn audit_failed(&self, e: &std::io::Error) -> (&'static str, String) {
+        (
+            "502 Bad Gateway",
+            format!(
+                "loom proxy: the egress audit log could not be written ({e}), so the connection to {} was refused. Tell the operator to check the session directory and the disk, then retry.\n",
+                self.dest()
+            ),
+        )
+    }
+}
+
+/// Name to addresses: the test hook, or a system lookup on its own task. Lookups are bounded: a
+/// permit is held until the lookup itself ends, even when the caller has given up waiting for it.
+async fn resolve(shared: &Shared, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
+    if let Some(r) = &shared.resolver {
+        return Ok(r(host).into_iter().take(MAX_ADDRS).collect());
+    }
+    let permit = match tokio::time::timeout(RESOLVE_TIMEOUT, shared.lookups.clone().acquire_owned()).await {
+        Ok(Ok(p)) => p,
+        _ => return Err("too many name lookups are in progress".to_string()),
+    };
+    let name = host.to_string();
+    let task = tokio::spawn(async move {
+        let found = tokio::net::lookup_host((name.as_str(), port)).await;
+        drop(permit);
+        found.map(|it| it.map(|a| a.ip()).take(MAX_ADDRS).collect::<Vec<_>>())
+    });
+    match tokio::time::timeout(RESOLVE_TIMEOUT, task).await {
+        Ok(Ok(Ok(v))) => Ok(v),
+        Ok(Ok(Err(e))) => Err(format!("name lookup failed: {e}")),
+        Ok(Err(_)) => Err("name lookup failed".to_string()),
+        Err(_) => Err("name lookup timed out".to_string()),
+    }
 }
 
 /// Applies the policy to the name, resolves it, and connects to the first address the policy allows.
-/// Reports exactly one decision. On failure returns the status line and body to send.
+/// Reports exactly one decision; for the connection it returns, the audit hook has succeeded first.
+/// On failure returns the status line and body to send.
 async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<TcpStream, (&'static str, String)> {
     let v = policy.check_name(cx.host, cx.port);
     if !v.allowed {
-        cx.emit(false, v.rule.clone(), None);
+        cx.record_best_effort(false, v.rule.clone(), None).await;
         return Err(cx.refused(&v.rule));
     }
     let name_rule = v.rule;
 
     let addrs: Vec<IpAddr> = match cx.host.parse::<IpAddr>() {
         Ok(ip) => vec![ip],
-        Err(_) => match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((cx.host, cx.port))).await {
-            Ok(Ok(it)) => it.map(|a| a.ip()).take(MAX_ADDRS).collect(),
-            Ok(Err(e)) => return Err(unreachable_decision(cx, &name_rule, None, &format!("name lookup failed: {e}"))),
-            Err(_) => return Err(unreachable_decision(cx, &name_rule, None, "name lookup timed out")),
+        Err(_) => match resolve(cx.shared, cx.host, cx.port).await {
+            Ok(a) => a,
+            Err(why) => return Err(unreachable_decision(cx, &name_rule, None, &why).await),
         },
     };
     if addrs.is_empty() {
-        return Err(unreachable_decision(cx, &name_rule, None, "the name has no addresses"));
+        return Err(unreachable_decision(cx, &name_rule, None, "the name has no addresses").await);
     }
 
     let mut first_refusal: Option<(String, IpAddr)> = None;
@@ -446,8 +647,14 @@ async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<TcpStream, (&'st
         match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(SocketAddr::new(ip, cx.port))).await {
             Ok(Ok(s)) => {
                 let _ = s.set_nodelay(true);
-                cx.emit(true, cv.rule, Some(ip));
-                return Ok(s);
+                // Nothing has been sent upstream yet; the connection is used only once it is on record.
+                return match cx.record(true, cv.rule, Some(ip)).await {
+                    Ok(()) => Ok(s),
+                    Err(e) => {
+                        tracing::warn!("cannot write the egress audit record of {}: {e}", cx.session.as_str());
+                        Err(cx.audit_failed(&e))
+                    }
+                };
             }
             Ok(Err(e)) => {
                 first_failure.get_or_insert((cv.rule, ip, e.to_string()));
@@ -458,23 +665,29 @@ async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<TcpStream, (&'st
         }
     }
     if let Some((rule, ip, why)) = first_failure {
-        return Err(unreachable_decision(cx, &rule, Some(ip), &why));
+        return Err(unreachable_decision(cx, &rule, Some(ip), &why).await);
     }
     match first_refusal {
         Some((rule, ip)) => {
-            cx.emit(false, rule.clone(), Some(ip));
+            cx.record_best_effort(false, rule.clone(), Some(ip)).await;
             Err(cx.refused(&rule))
         }
-        None => Err(unreachable_decision(cx, &name_rule, None, "the name has no addresses")),
+        None => Err(unreachable_decision(cx, &name_rule, None, "the name has no addresses").await),
     }
 }
 
-fn unreachable_decision(cx: &Ctx<'_>, rule: &str, ip: Option<IpAddr>, why: &str) -> (&'static str, String) {
-    cx.emit(true, format!("{rule} (unreachable: {why})"), ip);
+async fn unreachable_decision(cx: &Ctx<'_>, rule: &str, ip: Option<IpAddr>, why: &str) -> (&'static str, String) {
+    cx.record_best_effort(true, format!("{rule} (unreachable: {why})"), ip).await;
     cx.unreachable(why)
 }
 
-async fn handle(mut client: TcpStream, shared: Arc<Shared>, cancel: CancellationToken) {
+/// Answers a request the proxy rejects itself with 400, after auditing it.
+async fn reject(client: &mut TcpStream, shared: &Shared, session: &SessionId, head: &Head, why: &str) {
+    audit_local(shared, session, &head.method, &head.target, format!("bad request: {why}")).await;
+    bad_request(client, why).await;
+}
+
+async fn handle(mut client: TcpStream, shared: Arc<Shared>, cancel: CancellationToken, _slot: OwnedSemaphorePermit) {
     let _ = client.set_nodelay(true);
     let read = tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut client)).await;
     let (head, extra) = match read {
@@ -483,10 +696,25 @@ async fn handle(mut client: TcpStream, shared: Arc<Shared>, cancel: Cancellation
         Ok(Err(HeadError::Bad(m))) => return bad_request(&mut client, &m).await,
         Ok(Ok(x)) => x,
     };
-    let Some((session, policy)) = authenticate(&shared, &head) else {
-        let body = "loom proxy: missing or unknown proxy credentials. Use the proxy settings from the command's environment (HTTP_PROXY / HTTPS_PROXY), which carry this session's credentials.\n";
-        return respond(&mut client, "407 Proxy Authentication Required", "Proxy-Authenticate: Basic realm=\"loom\"\r\n", body)
-            .await;
+    let auth = match authenticate(&shared, &head) {
+        Ok(a) => a,
+        Err(claimed) => {
+            if let Some(session) = claimed {
+                audit_local(&shared, &session, &head.method, &head.target, "proxy authentication failed".to_string()).await;
+            }
+            let body = "loom proxy: missing or unknown proxy credentials. Use the proxy settings from the command's environment (HTTP_PROXY / HTTPS_PROXY), which carry this session's credentials.\n";
+            return respond(&mut client, "407 Proxy Authentication Required", "Proxy-Authenticate: Basic realm=\"loom\"\r\n", body)
+                .await;
+        }
+    };
+    let Authed { session, policy, permits } = auth;
+    let Ok(_session_slot) = permits.try_acquire_owned() else {
+        let body = format!(
+            "loom proxy: this session already has {} open proxy connections, the limit. Let running requests finish before starting more.\n",
+            shared.limits.max_per_session
+        );
+        audit_local(&shared, &session, &head.method, &head.target, "connection limit (per session)".to_string()).await;
+        return respond(&mut client, "429 Too Many Requests", "Retry-After: 5\r\n", &body).await;
     };
     if head.method == "CONNECT" {
         match parse_authority(&head.target, None) {
@@ -494,23 +722,25 @@ async fn handle(mut client: TcpStream, shared: Arc<Shared>, cancel: Cancellation
                 let cx = Ctx { shared: &shared, session: &session, method: "CONNECT", host: &host, port };
                 tunnel(client, extra, &cx, &policy, cancel).await;
             }
-            Err(m) => bad_request(&mut client, &m).await,
+            Err(m) => reject(&mut client, &shared, &session, &head, &m).await,
         }
         return;
     }
     let lower = head.target.get(..8).map(str::to_ascii_lowercase);
     if lower.as_deref() == Some("https://") {
-        return bad_request(&mut client, "https:// absolute URIs are not proxied; use CONNECT host:443 for https").await;
+        let why = "https:// absolute URIs are not proxied; use CONNECT host:443 for https";
+        return reject(&mut client, &shared, &session, &head, why).await;
     }
     if !matches!(head.target.get(..7), Some(p) if p.eq_ignore_ascii_case("http://")) {
-        return bad_request(&mut client, "the request target is not an absolute http:// URI or a CONNECT destination").await;
+        let why = "the request target is not an absolute http:// URI or a CONNECT destination";
+        return reject(&mut client, &shared, &session, &head, why).await;
     }
     match plain_target(&head.target) {
         Ok((host, port, authority, path)) => {
             let cx = Ctx { shared: &shared, session: &session, method: &head.method, host: &host, port };
             forward(client, extra, &head, &cx, &policy, &authority, &path, cancel).await;
         }
-        Err(m) => bad_request(&mut client, &m).await,
+        Err(m) => reject(&mut client, &shared, &session, &head, &m).await,
     }
 }
 
@@ -532,6 +762,7 @@ fn plain_target(target: &str) -> Result<(String, u16, String, String), String> {
 }
 
 async fn tunnel(mut client: TcpStream, extra: Vec<u8>, cx: &Ctx<'_>, policy: &Policy, cancel: CancellationToken) {
+    let idle = cx.shared.limits.idle_timeout;
     let mut up = match open_upstream(cx, policy).await {
         Ok(s) => s,
         Err((status, body)) => return respond(&mut client, status, "", &body).await,
@@ -539,15 +770,21 @@ async fn tunnel(mut client: TcpStream, extra: Vec<u8>, cx: &Ctx<'_>, policy: &Po
     if client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.is_err() {
         return;
     }
-    if !extra.is_empty() && up.write_all(&extra).await.is_err() {
+    if !extra.is_empty() && !write_within(&mut up, &extra, idle).await {
         return;
     }
     tokio::select! {
-        _ = tokio::io::copy_bidirectional(&mut client, &mut up) => {}
+        _ = relay(&mut client, &mut up, idle, None) => {}
         _ = cancel.cancelled() => {}
     }
 }
 
+/// Writes all of `bytes` within `idle`; false when the peer is gone or too slow.
+async fn write_within<W: AsyncWriteExt + Unpin>(w: &mut W, bytes: &[u8], idle: Duration) -> bool {
+    matches!(tokio::time::timeout(idle, w.write_all(bytes)).await, Ok(Ok(())))
+}
+
+/// How the request body of a forwarded request is framed.
 enum Body {
     None,
     Length(u64),
@@ -580,6 +817,155 @@ fn body_kind(head: &Head) -> Result<Body, String> {
     }
 }
 
+/// Response heads from the destination, with any `X-Loom-Proxy` header removed: only the proxy's own
+/// responses may carry that marker. Interim (1xx) heads are filtered too.
+struct HeadFilter {
+    buf: Vec<u8>,
+    done: bool,
+}
+
+impl HeadFilter {
+    /// Takes the next bytes from the destination; returns what may be sent to the client now.
+    fn push(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        if self.done {
+            return Ok(data.to_vec());
+        }
+        self.buf.extend_from_slice(data);
+        let mut out = Vec::new();
+        loop {
+            let Some(end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                if self.buf.len() > MAX_HEAD {
+                    return Err(format!(
+                        "the destination sent a response head larger than {} KiB",
+                        MAX_HEAD / 1024
+                    ));
+                }
+                return Ok(out);
+            };
+            let rest = self.buf.split_off(end.saturating_add(4));
+            let head = std::mem::replace(&mut self.buf, rest);
+            let code = status_code(&head).ok_or("the destination did not answer with a valid HTTP response")?;
+            out.extend_from_slice(&strip_marker(&head));
+            if (100..200).contains(&code) && code != 101 {
+                continue;
+            }
+            self.done = true;
+            out.append(&mut self.buf);
+            return Ok(out);
+        }
+    }
+}
+
+fn status_code(head: &[u8]) -> Option<u16> {
+    let line_end = head.windows(2).position(|w| w == b"\r\n")?;
+    let line = std::str::from_utf8(head.get(..line_end)?).ok()?;
+    let mut parts = line.split(' ');
+    if !parts.next()?.starts_with("HTTP/") {
+        return None;
+    }
+    parts.next()?.parse().ok()
+}
+
+/// A response head without its `X-Loom-Proxy` lines (and their continuation lines).
+fn strip_marker(head: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(head.len());
+    let mut dropping = false;
+    let mut rest = head;
+    while !rest.is_empty() {
+        let n = rest.windows(2).position(|w| w == b"\r\n").map_or(rest.len(), |p| p.saturating_add(2));
+        let (line, tail) = rest.split_at(n);
+        rest = tail;
+        let folded = matches!(line.first(), Some(b' ' | b'\t'));
+        let name = line.split(|b| *b == b':').next().unwrap_or(&[]).trim_ascii();
+        dropping = if folded { dropping } else { name.eq_ignore_ascii_case(b"x-loom-proxy") && line.contains(&b':') };
+        if !dropping {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}
+
+enum RelayEnd {
+    Done,
+    /// The destination's response was unusable; whether anything has been sent to the client yet.
+    BadUpstream(String, bool),
+}
+
+/// Copies bytes both ways until both sides are done, `idle` passes with no byte moving in either
+/// direction, or a write stalls for `idle`.
+///
+/// With `forward` (a forwarded plain request, its request body budget in bytes, `None` for no limit)
+/// the destination's response head is filtered, bytes of the client past the body are discarded, the
+/// relay ends when the response ends, and it ends when the client goes away.
+async fn relay(client: &mut TcpStream, up: &mut TcpStream, idle: Duration, forward: Option<Option<u64>>) -> RelayEnd {
+    let (mut cr, mut cw) = client.split();
+    let (mut ur, mut uw) = up.split();
+    let mut cbuf = vec![0u8; 16 * 1024];
+    let mut ubuf = vec![0u8; 16 * 1024];
+    let (mut c_open, mut u_open) = (true, true);
+    let mut budget = forward.flatten();
+    let is_forward = forward.is_some();
+    let mut filter = is_forward.then(|| HeadFilter { buf: Vec::new(), done: false });
+    let mut wrote = false;
+    let mut discarded: usize = 0;
+    while c_open || u_open {
+        tokio::select! {
+            r = cr.read(&mut cbuf), if c_open => {
+                let n = r.unwrap_or(0);
+                if n == 0 {
+                    if is_forward {
+                        return RelayEnd::Done;
+                    }
+                    c_open = false;
+                    let _ = tokio::time::timeout(idle, uw.shutdown()).await;
+                    continue;
+                }
+                let take = budget.map_or(n, |b| usize::try_from(b).map_or(n, |b| b.min(n)));
+                if take == 0 {
+                    discarded = discarded.saturating_add(n);
+                    if discarded > 1024 * 1024 {
+                        return RelayEnd::Done;
+                    }
+                    continue;
+                }
+                if !write_within(&mut uw, cbuf.get(..take).unwrap_or(&[]), idle).await {
+                    return RelayEnd::Done;
+                }
+                budget = budget.map(|b| b.saturating_sub(take as u64));
+            }
+            r = ur.read(&mut ubuf), if u_open => {
+                let chunk = ubuf.get(..r.unwrap_or(0)).unwrap_or(&[]);
+                if chunk.is_empty() {
+                    u_open = false;
+                    if filter.as_ref().is_some_and(|f| !f.done) {
+                        return RelayEnd::BadUpstream("the destination closed the connection before it answered".to_string(), wrote);
+                    }
+                    let _ = tokio::time::timeout(idle, cw.shutdown()).await;
+                    if is_forward {
+                        return RelayEnd::Done;
+                    }
+                    continue;
+                }
+                let out = match filter.as_mut() {
+                    Some(f) => match f.push(chunk) {
+                        Ok(v) => v,
+                        Err(m) => return RelayEnd::BadUpstream(m, wrote),
+                    },
+                    None => chunk.to_vec(),
+                };
+                if !out.is_empty() {
+                    if !write_within(&mut cw, &out, idle).await {
+                        return RelayEnd::Done;
+                    }
+                    wrote = true;
+                }
+            }
+            _ = tokio::time::sleep(idle) => return RelayEnd::Done,
+        }
+    }
+    RelayEnd::Done
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward(
     mut client: TcpStream,
@@ -591,9 +977,10 @@ async fn forward(
     path: &str,
     cancel: CancellationToken,
 ) {
+    let idle = cx.shared.limits.idle_timeout;
     let body = match body_kind(head) {
         Ok(b) => b,
-        Err(m) => return bad_request(&mut client, &m).await,
+        Err(m) => return reject(&mut client, cx.shared, cx.session, head, &m).await,
     };
     let mut up = match open_upstream(cx, policy).await {
         Ok(s) => s,
@@ -614,49 +1001,31 @@ async fn forward(
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"Connection: close\r\n\r\n");
-    if let Err(e) = up.write_all(&out).await {
-        let (status, text) = cx.unreachable(&format!("sending the request failed: {e}"));
+    // Bytes of the body that arrived with the head, and how many more the client still owes.
+    let (already, owed): (&[u8], Option<u64>) = match body {
+        Body::None => (&[] as &[u8], Some(0)),
+        Body::Length(n) => {
+            let k = usize::try_from(n).map_or(extra.len(), |n| n.min(extra.len()));
+            (extra.get(..k).unwrap_or(&[]), Some(n.saturating_sub(k as u64)))
+        }
+        Body::Stream => (extra.as_slice(), None),
+    };
+    out.extend_from_slice(already);
+    if !write_within(&mut up, &out, idle).await {
+        let (status, text) = cx.unreachable("sending the request failed");
         return respond(&mut client, status, "", &text).await;
     }
 
-    let (mut cr, mut cw) = client.into_split();
-    let (mut ur, mut uw) = up.into_split();
-    let response = async {
-        let _ = tokio::io::copy(&mut ur, &mut cw).await;
-        let _ = cw.shutdown().await;
+    let end = tokio::select! {
+        r = relay(&mut client, &mut up, idle, Some(owed)) => r,
+        _ = cancel.cancelled() => RelayEnd::Done,
     };
-    // Finishes with an error when the request body cannot be relayed; otherwise waits for the response.
-    let request = async {
-        let sent: std::io::Result<()> = async {
-            match body {
-                Body::None => {}
-                Body::Length(n) => {
-                    let k = usize::try_from(n).map_or(extra.len(), |n| n.min(extra.len()));
-                    uw.write_all(extra.get(..k).unwrap_or(&[])).await?;
-                    let remaining = n.saturating_sub(k as u64);
-                    if remaining > 0 {
-                        let mut limited = (&mut cr).take(remaining);
-                        tokio::io::copy(&mut limited, &mut uw).await?;
-                    }
-                }
-                Body::Stream => {
-                    uw.write_all(&extra).await?;
-                    tokio::io::copy(&mut cr, &mut uw).await?;
-                }
-            }
-            Ok(())
-        }
-        .await;
-        if sent.is_ok() {
-            std::future::pending::<()>().await;
-        }
-    };
-    tokio::select! {
-        _ = response => {}
-        _ = request => {}
-        _ = cancel.cancelled() => {}
+    if let RelayEnd::BadUpstream(why, false) = end {
+        let (status, text) = cx.unreachable(&why);
+        respond(&mut client, status, "", &text).await;
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -671,6 +1040,36 @@ mod tests {
     async fn start() -> (Proxy, Rx) {
         let (tx, rx) = unbounded_channel();
         (Proxy::start(0, tx).await.unwrap(), rx)
+    }
+
+    type Seen = Arc<Mutex<Vec<(SessionId, NetDecision)>>>;
+
+    /// A proxy whose audit hook records into the returned list (and fails when `fail` is set).
+    async fn start_audited(fail: bool, limits: Limits, resolver: Option<Resolver>) -> (Proxy, Rx, Seen) {
+        let (tx, rx) = unbounded_channel();
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let audit: AuditFn = Arc::new(move |s, d| {
+            if fail {
+                return Err(std::io::Error::other("disk full"));
+            }
+            lock(&log).push((s.clone(), d.clone()));
+            Ok(())
+        });
+        (Proxy::start_inner(0, tx, Some(audit), limits, resolver).await.unwrap(), rx, seen)
+    }
+
+    /// Accepts one connection and returns what it received until the peer closes.
+    async fn silent_server() -> (u16, tokio::task::JoinHandle<Vec<u8>>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut got = Vec::new();
+            let _ = timeout(T, s.read_to_end(&mut got)).await;
+            got
+        });
+        (port, h)
     }
 
     fn policy(mode: NetworkMode, allow: &[&str], deny: &[&str], private: &[&str]) -> Policy {
@@ -852,6 +1251,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failing_audit_refuses_the_connection_and_nothing_reaches_the_upstream() {
+        let (p, mut rx, seen) = start_audited(true, Limits::default(), None).await;
+        let (port, server) = silent_server().await;
+        let g = p.grant(&SessionId::from("s-af"), lab());
+        let req = format!("GET http://127.0.0.1:{port}/x HTTP/1.1\r\n{}\r\n", auth(&g));
+        let resp = raw(p.port(), req.as_bytes()).await;
+        assert_eq!(status(&resp), 502, "{resp}");
+        assert!(resp.contains("X-Loom-Proxy: 1\r\n") && resp.contains("egress audit log could not be written"), "{resp}");
+        assert!(server.await.unwrap().is_empty(), "the upstream must not receive bytes");
+        assert!(lock(&seen).is_empty());
+        let (_, d) = decision(&mut rx).await;
+        assert!(!d.allowed && d.rule.contains("audit log not written"), "{d:?}");
+        // CONNECT is refused before the 200 as well.
+        let (port, server) = silent_server().await;
+        let r = raw(p.port(), connect_req(&g, &format!("127.0.0.1:{port}")).as_bytes()).await;
+        assert_eq!(status(&r), 502, "{r}");
+        assert!(server.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn audit_is_written_before_the_upstream_sees_the_request() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, _rx) = unbounded_channel();
+        let f2 = flag.clone();
+        let audit: AuditFn = Arc::new(move |_, d| {
+            assert!(d.allowed);
+            std::thread::sleep(Duration::from_millis(150));
+            f2.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        let p = Proxy::start_inner(0, tx, Some(audit), Limits::default(), None).await.unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let f3 = flag.clone();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut b = [0u8; 1];
+            let n = timeout(T, s.read(&mut b)).await.unwrap().unwrap();
+            let audited = f3.load(std::sync::atomic::Ordering::SeqCst);
+            let _ = s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await;
+            (n, audited)
+        });
+        let g = p.grant(&SessionId::from("s-ord"), lab());
+        let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
+        let resp = raw(p.port(), req.as_bytes()).await;
+        assert_eq!(status(&resp), 204, "{resp}");
+        assert_eq!(server.await.unwrap(), (1, true), "the upstream saw bytes before the audit record was written");
+    }
+
+    #[tokio::test]
+    async fn bad_requests_and_failed_authentication_are_audited() {
+        let (p, _rx, seen) = start_audited(false, Limits::default(), None).await;
+        let sid = SessionId::from("s-aud");
+        let g = p.grant(&sid, lab());
+        let r = raw(p.port(), format!("GET https://example.test/ HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await;
+        assert_eq!(status(&r), 400);
+        let wrong = SessionGrant { password: "0".repeat(32), ..g.clone() };
+        let r = raw(p.port(), connect_req(&wrong, "127.0.0.1:9").as_bytes()).await;
+        assert_eq!(status(&r), 407);
+        let r = raw(p.port(), connect_req(&g, "nohostport").as_bytes()).await;
+        assert_eq!(status(&r), 400);
+        let seen = lock(&seen).clone();
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert!(seen.iter().all(|(s, d)| *s == sid && !d.allowed));
+        assert!(seen[0].1.rule.starts_with("bad request: https://"), "{:?}", seen[0]);
+        assert_eq!(seen[1].1.rule, "proxy authentication failed");
+        assert_eq!((seen[1].1.method.as_str(), seen[1].1.host.as_str()), ("CONNECT", "127.0.0.1:9"));
+        assert!(seen[2].1.rule.starts_with("bad request: "), "{:?}", seen[2]);
+    }
+
+    #[tokio::test]
     async fn missing_wrong_and_revoked_credentials_get_407() {
         let (p, mut rx) = start().await;
         let sid = SessionId::from("s-auth");
@@ -909,6 +1379,38 @@ mod tests {
         assert_eq!(status(&r), 403, "{r}");
         let (_, d) = decision(&mut rx).await;
         assert_eq!(d.rule, "deny private-address ::ffff:127.0.0.1");
+        no_more(&mut rx);
+    }
+
+    #[tokio::test]
+    async fn deny_list_applies_to_resolved_addresses() {
+        let resolver: Resolver = Arc::new(|name: &str| {
+            let ip = match name {
+                "lab.test" => "10.0.0.5",
+                "mapped.test" => "::ffff:10.0.0.5",
+                "cidr.test" => "10.1.2.3",
+                "pub.test" => "203.0.113.7",
+                _ => return Vec::new(),
+            };
+            vec![ip.parse().unwrap()]
+        });
+        let (tx, mut rx) = unbounded_channel();
+        let p = Proxy::start_inner(0, tx, None, Limits::default(), Some(resolver)).await.unwrap();
+        let deny = ["10.0.0.5", "10.1.0.0/16", "203.0.113.7"];
+        let g = p.grant(&SessionId::from("s-dr"), policy(NetworkMode::Open, &[], &deny, &["10.0.0.0/8"]));
+        for (dest, rule) in [
+            ("lab.test:80", "deny 10.0.0.5"),
+            ("mapped.test:80", "deny 10.0.0.5"),
+            ("[::ffff:10.0.0.5]:80", "deny 10.0.0.5"),
+            ("cidr.test:80", "deny 10.1.0.0/16"),
+            ("pub.test:443", "deny 203.0.113.7"),
+        ] {
+            let r = raw(p.port(), connect_req(&g, dest).as_bytes()).await;
+            assert_eq!(status(&r), 403, "{dest}: {r}");
+            let (_, d) = decision(&mut rx).await;
+            assert!(!d.allowed, "{dest}: {d:?}");
+            assert_eq!(d.rule, rule, "{dest}");
+        }
         no_more(&mut rx);
     }
 
@@ -1050,6 +1552,123 @@ mod tests {
         assert!(r.contains("64 KiB"));
         // Still serving.
         assert_eq!(status(&raw(p.port(), b"x\r\n\r\n").await), 400);
+    }
+
+    #[tokio::test]
+    async fn connection_caps_apply_globally_and_per_session() {
+        let echo = echo_server().await;
+        let dest = format!("127.0.0.1:{echo}");
+        let tunnel = |p: &Proxy, g: &SessionGrant| {
+            let (port, req) = (p.port(), connect_req(g, &dest));
+            async move {
+                let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                s.write_all(req.as_bytes()).await.unwrap();
+                let head = read_until(&mut s, "\r\n\r\n").await;
+                (s, status(&head))
+            }
+        };
+        // Per session: the second tunnel of a session at its cap gets 429; another session is unaffected.
+        let limits = Limits { max_per_session: 1, ..Limits::default() };
+        let (p, _rx, seen) = start_audited(false, limits, None).await;
+        let (ga, gb) = (p.grant(&SessionId::from("s-ca"), lab()), p.grant(&SessionId::from("s-cb"), lab()));
+        let (held, st) = tunnel(&p, &ga).await;
+        assert_eq!(st, 200);
+        let r = raw(p.port(), connect_req(&ga, &dest).as_bytes()).await;
+        assert_eq!(status(&r), 429, "{r}");
+        assert!(r.contains("X-Loom-Proxy: 1\r\n"));
+        assert!(lock(&seen).iter().any(|(_, d)| d.rule == "connection limit (per session)"));
+        let (_other, st) = tunnel(&p, &gb).await;
+        assert_eq!(st, 200);
+        // The permit comes back when the tunnel closes.
+        drop(held);
+        let deadline = tokio::time::Instant::now() + T;
+        loop {
+            let (_s, st) = tunnel(&p, &ga).await;
+            if st == 200 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "the session cap was never released");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Globally: connections past the cap are answered 503 at once.
+        let limits = Limits { max_connections: 2, ..Limits::default() };
+        let (p, _rx, _seen) = start_audited(false, limits, None).await;
+        let _a = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let _b = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut c = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut out = Vec::new();
+        let _ = timeout(T, c.read_to_end(&mut out)).await.unwrap();
+        let r = String::from_utf8_lossy(&out).to_string();
+        assert_eq!(status(&r), 503, "{r}");
+        assert!(r.contains("X-Loom-Proxy: 1\r\n") && r.contains("limit 2"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn idle_tunnels_and_idle_forwards_are_closed() {
+        let limits = Limits { idle_timeout: Duration::from_millis(300), ..Limits::default() };
+        let (p, _rx, _seen) = start_audited(false, limits, None).await;
+        let g = p.grant(&SessionId::from("s-idle"), lab());
+        // A tunnel to a peer that never speaks.
+        let (port, _server) = silent_server().await;
+        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        s.write_all(connect_req(&g, &format!("127.0.0.1:{port}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
+        let mut rest = Vec::new();
+        let n = timeout(T, s.read_to_end(&mut rest)).await.expect("the idle tunnel was not closed").unwrap();
+        assert_eq!(n, 0);
+        // A forwarded request whose upstream never answers.
+        let (port, _server) = silent_server().await;
+        let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
+        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut rest = Vec::new();
+        timeout(T, s.read_to_end(&mut rest)).await.expect("the idle forward was not closed").unwrap();
+        assert!(rest.is_empty());
+        // Traffic keeps a tunnel alive past the idle period.
+        let echo = echo_server().await;
+        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            s.write_all(b"x").await.unwrap();
+            let mut b = [0u8; 1];
+            timeout(T, s.read_exact(&mut b)).await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_ends_when_the_client_goes_away() {
+        let (p, _rx) = start().await;
+        let g = p.grant(&SessionId::from("s-gone"), lab());
+        let (port, server) = silent_server().await;
+        let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
+        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(s);
+        // The upstream sees the request and then its connection closing, long before any idle timeout.
+        let got = timeout(T, server).await.expect("the upstream connection stayed open").unwrap();
+        assert!(String::from_utf8_lossy(&got).starts_with("GET / HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn upstream_proxy_marker_is_not_relayed() {
+        let (p, _rx) = start().await;
+        let g = p.grant(&SessionId::from("s-mark"), lab());
+        let (port, _server) =
+            http_server("HTTP/1.1 403 Forbidden\r\nx-loom-proxy: 1\r\nX-Other: kept\r\nContent-Length: 4\r\n\r\nnope").await;
+        let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
+        let resp = raw(p.port(), req.as_bytes()).await;
+        assert_eq!(status(&resp), 403, "{resp}");
+        assert!(!resp.to_ascii_lowercase().contains("loom-proxy"), "{resp}");
+        assert!(resp.contains("X-Other: kept\r\n") && resp.ends_with("\r\n\r\nnope"), "{resp}");
+        // A destination that does not speak HTTP gets a proxy-generated 502, which does carry the marker.
+        let (port, _server) = http_server("not http at all\r\n\r\n").await;
+        let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
+        let resp = raw(p.port(), req.as_bytes()).await;
+        assert_eq!(status(&resp), 502, "{resp}");
+        assert!(resp.contains("X-Loom-Proxy: 1\r\n"));
     }
 
     #[tokio::test]

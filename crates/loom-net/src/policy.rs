@@ -213,7 +213,8 @@ impl PrivEntry {
 pub struct Policy {
     mode: NetworkMode,
     allow: Vec<Pattern>,
-    deny: Vec<Pattern>,
+    /// Host patterns, plus address entries (literals and CIDR blocks) that also match resolved addresses.
+    deny: Vec<PrivEntry>,
     allow_private: Vec<PrivEntry>,
 }
 
@@ -224,7 +225,7 @@ fn parse_list<T>(list: &str, entries: &[String], parse: fn(&str) -> Result<T, St
             parse(e).map_err(|why| {
                 format!(
                     "network.{list} entry \"{e}\" is not valid: {why}. Write a host (`example.test`), a wildcard (`*.example.test`) or `*`, optionally followed by `:port`{}, then reload the config.",
-                    if list == "allow_private" { ", or a CIDR block such as `10.0.0.0/8`" } else { "" }
+                    if list != "allow" { ", or a CIDR block such as `10.0.0.0/8`" } else { "" }
                 )
             })
         })
@@ -236,15 +237,15 @@ impl Policy {
         Ok(Policy {
             mode: cfg.mode,
             allow: parse_list("allow", &cfg.allow, Pattern::parse)?,
-            deny: parse_list("deny", &cfg.deny, Pattern::parse)?,
+            deny: parse_list("deny", &cfg.deny, PrivEntry::parse)?,
             allow_private: parse_list("allow_private", &cfg.allow_private, PrivEntry::parse)?,
         })
     }
 
     pub fn check_name(&self, host: &str, port: u16) -> Verdict {
         let h = normalize_host(host);
-        if let Some(p) = self.deny.iter().find(|p| p.matches(&h, port)) {
-            return Verdict::no(format!("deny {}", p.text));
+        if let Some(rule) = self.deny_hit(&h, port, h.parse::<IpAddr>().ok()) {
+            return Verdict::no(rule);
         }
         match self.mode {
             NetworkMode::DenyAll => Verdict::no("mode deny_all"),
@@ -256,11 +257,43 @@ impl Policy {
         }
     }
 
+    /// The `deny ...` rule that matches the name, or the address when there is one. Address entries
+    /// are compared on the canonical form, so `::ffff:10.0.0.5` is `10.0.0.5`.
+    fn deny_hit(&self, host: &str, port: u16, addr: Option<IpAddr>) -> Option<String> {
+        for e in &self.deny {
+            match e {
+                PrivEntry::Name(p) => {
+                    let literal = match (&p.kind, addr) {
+                        (Kind::Exact(x), Some(a)) => {
+                            p.port.is_none_or(|pp| pp == port)
+                                && x.parse::<IpAddr>().is_ok_and(|x| canonical_ip(x) == canonical_ip(a))
+                        }
+                        _ => false,
+                    };
+                    if literal || p.matches(host, port) {
+                        return Some(format!("deny {}", p.text));
+                    }
+                }
+                PrivEntry::Net { text, net } => {
+                    if addr.is_some_and(|a| net.contains(a) || net.contains(canonical_ip(a))) {
+                        return Some(format!("deny {text}"));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Like the module contract, with one addition: before anything else, a `deny` entry that is an IP
+    /// literal or a CIDR block refuses a resolved address it contains, whatever name led to it.
     pub fn check_addr(&self, host: &str, port: u16, addr: IpAddr, name_rule: &str) -> Verdict {
+        let h = normalize_host(host);
+        if let Some(rule) = self.deny_hit(&h, port, Some(addr)) {
+            return Verdict::no(rule);
+        }
         if !is_special(addr) {
             return Verdict::yes(name_rule);
         }
-        let h = normalize_host(host);
         for e in &self.allow_private {
             match e {
                 PrivEntry::Name(p) if p.matches(&h, port) => return Verdict::yes(format!("allow_private {}", p.text)),
@@ -284,6 +317,19 @@ fn embedded_v4(a: Ipv6Addr) -> Option<Ipv4Addr> {
     let [a0, a1] = s6.to_be_bytes();
     let [a2, a3] = s7.to_be_bytes();
     Some(Ipv4Addr::new(a0, a1, a2, a3))
+}
+
+/// IPv4-mapped and IPv4-compatible IPv6 addresses as the IPv4 address they carry (`::` and `::1` stay).
+fn canonical_ip(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V6(a) => match embedded_v4(a) {
+            Some(v4) if v4.octets().first().is_some_and(|o| *o != 0) || a.segments().get(5) == Some(&0xffff) => {
+                IpAddr::V4(v4)
+            }
+            _ => addr,
+        },
+        IpAddr::V4(_) => addr,
+    }
 }
 
 fn special_v4(a: Ipv4Addr) -> bool {
@@ -407,6 +453,33 @@ mod tests {
             let p = pol(mode, &["*.a.test", "*"], &["bad.a.test"], &[]);
             assert_eq!(p.check_name("bad.a.test", 1), Verdict { allowed: false, rule: "deny bad.a.test".into() });
         }
+    }
+
+    #[test]
+    fn deny_wins_on_the_resolved_address() {
+        // A denied literal beats allow_private, whatever name resolved to it and in whatever spelling.
+        let p = pol(NetworkMode::Open, &[], &["10.0.0.5"], &["10.0.0.0/8"]);
+        let a = |h: &str, port: u16, addr: &str| p.check_addr(h, port, ip(addr), "mode open");
+        assert_eq!(a("lab.test", 80, "10.0.0.5"), Verdict { allowed: false, rule: "deny 10.0.0.5".into() });
+        assert!(!a("lab.test", 80, "::ffff:10.0.0.5").allowed);
+        assert!(!a("lab.test", 80, "::10.0.0.5").allowed);
+        assert!(a("lab.test", 80, "10.0.0.6").allowed);
+        // A mapped deny entry covers the plain form.
+        let p = pol(NetworkMode::Open, &[], &["[::ffff:10.0.0.5]"], &["10.0.0.0/8"]);
+        assert!(!p.check_addr("x.test", 80, ip("10.0.0.5"), "mode open").allowed);
+        // CIDR deny entries, public addresses included; the port form only matches its port.
+        let p = pol(NetworkMode::Open, &[], &["10.1.0.0/16", "203.0.113.0/24", "8.8.8.8:53", "fd00::/8"], &["10.0.0.0/8", "fd00::/8"]);
+        assert_eq!(p.check_addr("x.test", 80, ip("10.1.2.3"), "r").rule, "deny 10.1.0.0/16");
+        assert!(!p.check_addr("x.test", 80, ip("203.0.113.9"), "r").allowed);
+        assert!(!p.check_addr("x.test", 80, ip("::ffff:203.0.113.9"), "r").allowed);
+        assert!(!p.check_addr("x.test", 80, ip("fd12::1"), "r").allowed);
+        assert!(!p.check_addr("x.test", 53, ip("8.8.8.8"), "r").allowed);
+        assert!(p.check_addr("x.test", 443, ip("8.8.8.8"), "r").allowed);
+        assert!(p.check_addr("x.test", 80, ip("10.2.0.1"), "r").allowed);
+        // A literal host is refused before resolving; names keep matching names.
+        assert_eq!(p.check_name("10.1.2.3", 80).rule, "deny 10.1.0.0/16");
+        assert!(p.check_name("10.2.0.1", 80).allowed);
+        assert!(Policy::new(&cfg(NetworkMode::Open, &[], &["10.0.0.0/33"], &[])).is_err());
     }
 
     #[test]
