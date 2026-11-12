@@ -324,7 +324,7 @@ async fn exchange(ctx: &ToolCtx, req: RequestBuilder, url: &Url, what: &str) -> 
         let resp = match client.execute(req).await {
             Ok(r) => r,
             // A refused CONNECT looks like any failure to connect: the proxy is asked again (see `Tunnel`).
-            Err(e) if tunnelled && e.is_connect() => {
+            Err(e) if tunnelled && e.is_connect() && !crate::web::names_tls_failure(&e) => {
                 let tunnel = verdict(crate::web::proxy_verdict(&client, url).await, what, &host)?;
                 return Err(request_failure(&e, what, &host, Some(&tunnel)));
             }

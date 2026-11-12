@@ -1106,6 +1106,13 @@ async fn cmd_down(paths: &Paths) -> Result<i32, String> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    // /healthz stops first; the old process keeps the home's lock until its shutdown is done.
+    if !crate::serve::wait_home_lock_free(paths, Duration::from_secs(30)).await {
+        return Err(format!(
+            "The daemon stopped answering but has not finished shutting down after 30 seconds, so `loom up` would be refused. Wait a little, then run `loom down` again; see {}.",
+            paths.logs_dir().join("loomd.log").display()
+        ));
+    }
     outln("stopped").map(|()| 0)
 }
 

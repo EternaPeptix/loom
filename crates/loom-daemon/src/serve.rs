@@ -471,13 +471,41 @@ fn take_home_lock(paths: &Paths) -> Result<std::fs::File, String> {
     if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
         return Err(format!("Cannot lock {}: {err}.", path.display()));
     }
-    Err(match read_daemon_file(paths) {
+    // A daemon.json left by a crashed daemon names a process that is gone; only a live pid is reported.
+    Err(match read_daemon_file(paths).filter(|f| pid_alive(f.pid)) {
         Some(f) => format!("A loom daemon is already running for {} (pid {}, {}).", paths.home.display(), f.pid, f.bind),
         None => format!(
             "A loom daemon is already running for {} (it is starting; its address is not written yet).",
             paths.home.display()
         ),
     })
+}
+
+/// True when no process holds the lock on `<home>/daemon.lock`. The lock is taken to find out and given back at
+/// once; a lock that cannot be tested counts as free, so a caller never waits on it.
+pub(crate) fn home_lock_free(paths: &Paths) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(paths.home.join(LOCK_FILE)) else {
+        return true;
+    };
+    // SAFETY: flock on a descriptor this function owns; closing the file releases the lock.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::EWOULDBLOCK)
+}
+
+/// Waits until the daemon of this home has let go of `<home>/daemon.lock` (its shutdown has finished);
+/// false when `within` passes first.
+pub(crate) async fn wait_home_lock_free(paths: &Paths, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    while !home_lock_free(paths) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    true
 }
 
 /// The address to bind among those `bind` resolved to: a loopback one, IPv4 preferred. When none is loopback the
@@ -747,13 +775,47 @@ mod tests {
         let first = take_home_lock(&paths).unwrap();
         let err = take_home_lock(&paths).unwrap_err();
         assert!(err.starts_with(&format!("A loom daemon is already running for {}", paths.home.display())), "{err}");
-        let file = DaemonFile { pid: 4242, bind: "127.0.0.1:9".to_string(), started_ms: 1 };
+        let file = DaemonFile { pid: std::process::id(), bind: "127.0.0.1:9".to_string(), started_ms: 1 };
         write_daemon_file(&paths, &file).unwrap();
         assert_eq!(
             take_home_lock(&paths).unwrap_err(),
-            format!("A loom daemon is already running for {} (pid 4242, 127.0.0.1:9).", paths.home.display())
+            format!("A loom daemon is already running for {} (pid {}, 127.0.0.1:9).", paths.home.display(), file.pid)
         );
         drop(first);
+        assert!(take_home_lock(&paths).is_ok());
+    }
+
+    #[test]
+    fn a_stale_daemon_file_is_not_named_by_the_home_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path());
+        let _held = take_home_lock(&paths).unwrap();
+        // A pid no process can have: above the kernel's pid limit.
+        let file = DaemonFile { pid: 4_000_000_000, bind: "127.0.0.1:9".to_string(), started_ms: 1 };
+        write_daemon_file(&paths, &file).unwrap();
+        assert_eq!(
+            take_home_lock(&paths).unwrap_err(),
+            format!(
+                "A loom daemon is already running for {} (it is starting; its address is not written yet).",
+                paths.home.display()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_for_the_home_lock_ends_when_the_holder_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path());
+        let held = take_home_lock(&paths).unwrap();
+        assert!(!home_lock_free(&paths));
+        assert!(!wait_home_lock_free(&paths, Duration::from_millis(200)).await);
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(held);
+        });
+        assert!(wait_home_lock_free(&paths, Duration::from_secs(5)).await);
+        release.await.unwrap();
+        // The check does not keep the lock.
         assert!(take_home_lock(&paths).is_ok());
     }
 

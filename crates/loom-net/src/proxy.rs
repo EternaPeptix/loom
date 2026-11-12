@@ -48,11 +48,13 @@
 //! after an allow are reported as allowed with the rule suffixed ` (unreachable: {why})`.
 //! A connection on record as allowed that then fails gets a second decision: the same destination,
 //! address and rule, allowed, with the rule suffixed ` (failed after the allow: {why})`. For a tunnel
-//! that is when its client is gone before the `200`, the bytes it sent ahead cannot be written, or it
-//! ends (closed, failed on either side, or idle) before the destination sent a byte; once bytes have
-//! come from the destination the proxy cannot tell a cut-off encrypted stream from a routine close, so
-//! the tunnel is not judged further. For a forwarded request it is when the request cannot be written,
-//! the destination answers nothing usable or stalls, or the relay fails on either side.
+//! that is when its client is gone before the `200`, the bytes it sent ahead cannot be written, it
+//! ends (closed, failed on either side, or idle) before the destination sent a byte, or the proxy shuts
+//! down while it is open (reason "the egress proxy shut down"); once bytes have come from the
+//! destination the proxy cannot tell a cut-off encrypted stream from a routine close, so the tunnel is
+//! not judged further otherwise. For a forwarded request it is when the request cannot be written,
+//! the destination answers nothing usable or stalls, the relay fails on either side, or the proxy shuts
+//! down during the relay.
 //! Refusals answer `403` with header `X-Loom-Proxy: 1` and a plain-text body that states the
 //! destination, the rule, and that the network policy is set by the operator in the loom config
 //! (`[network]`) — a command cannot change it. Unreachable destinations answer `502` with
@@ -283,6 +285,17 @@ impl Shared {
         (id, token)
     }
 
+    /// Like [`Shared::add_pending`], but at the front of the queue, so eviction closes it first. For a
+    /// connection that is only being drained: it has nothing left to serve.
+    fn add_pending_front(&self, permit: OwnedSemaphorePermit) -> (u64, CancellationToken) {
+        let mut p = lock(&self.pending);
+        let id = p.next;
+        p.next = p.next.wrapping_add(1);
+        let token = CancellationToken::new();
+        p.queue.push_front((id, token.clone(), permit));
+        (id, token)
+    }
+
     /// Closes the oldest pending connection and returns its permit.
     fn evict_pending(&self) -> Option<OwnedSemaphorePermit> {
         let (_, token, permit) = lock(&self.pending).queue.pop_front()?;
@@ -341,6 +354,9 @@ impl Drop for PendingGuard<'_> {
         drop(self.shared.claim_pending(self.id));
     }
 }
+
+/// Why a connection on record as allowed ended when the proxy was cancelled.
+const SHUTDOWN: &str = "the egress proxy shut down";
 
 struct Inner {
     port: u16,
@@ -615,7 +631,7 @@ async fn answer(
     if !send(client, status, extra, body).await {
         return;
     }
-    let (id, evicted) = shared.add_pending(slot);
+    let (id, evicted) = shared.add_pending_front(slot);
     let _pending = PendingGuard { shared, id };
     tokio::select! {
         _ = drain(client) => {}
@@ -1186,7 +1202,7 @@ async fn tunnel(
     }
     let end = tokio::select! {
         end = relay(&mut client, &mut up, idle, None) => end,
-        _ = cancel.cancelled() => return,
+        _ = cancel.cancelled() => return cx.failed_after_allow(&allowed, SHUTDOWN).await,
     };
     // Once bytes have come from the destination, a failure cannot be told from a routine close.
     let why = match end {
@@ -1558,7 +1574,7 @@ async fn forward(
     let fwd = Fwd { budget: owed, grace: cx.shared.limits.forward_grace };
     let end = tokio::select! {
         r = relay(&mut client, &mut up, idle, Some(fwd)) => r,
-        _ = cancel.cancelled() => return,
+        _ = cancel.cancelled() => return cx.failed_after_allow(&allowed, SHUTDOWN).await,
     };
     let (why, reply) = match end {
         RelayEnd::Done(_) => return,
@@ -2702,6 +2718,44 @@ mod tests {
         assert_eq!(env.get("no_proxy").map(String::as_str), Some(""));
         let g2 = p.grant(&SessionId::from("s-env2"), lab());
         assert_ne!(g.password, g2.password);
+    }
+
+    #[tokio::test]
+    async fn eviction_closes_draining_connections_before_older_ones_still_sending_a_head() {
+        let (p, _rx) = start().await;
+        let shared = &p.inner.shared;
+        let permit = || shared.connections.clone().try_acquire_owned().unwrap();
+        let (_, waiting) = shared.add_pending(permit());
+        let (_, draining) = shared.add_pending_front(permit());
+        assert!(shared.evict_pending().is_some());
+        assert!(draining.is_cancelled() && !waiting.is_cancelled());
+        assert!(shared.evict_pending().is_some());
+        assert!(waiting.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_a_tunnel_or_forward_is_recorded_after_the_allow() {
+        let (p, _rx, seen) = start_audited(false, Limits::default(), None).await;
+        let g = p.grant(&SessionId::from("s-down"), lab());
+        let (port, _server) = silent_server().await;
+        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        s.write_all(connect_req(&g, &format!("127.0.0.1:{port}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
+        let (port2, _server2) = silent_server().await;
+        let mut f = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        f.write_all(format!("GET http://127.0.0.1:{port2}/ HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        p.shutdown();
+        let deadline = tokio::time::Instant::now() + T;
+        loop {
+            let rules: Vec<String> = lock(&seen).iter().map(|(_, d)| d.rule.clone()).collect();
+            let n = rules.iter().filter(|r| r.ends_with("(failed after the allow: the egress proxy shut down)")).count();
+            if n == 2 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "{rules:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]

@@ -231,6 +231,13 @@ fn describe(e: &(dyn std::error::Error + 'static)) -> String {
     parts.join(": ")
 }
 
+/// Whether the error or one of its causes names a TLS or certificate failure. reqwest reports those as
+/// connect errors, but they are not a refused CONNECT, so the proxy need not be asked again about them.
+pub(crate) fn names_tls_failure(e: &(dyn std::error::Error + 'static)) -> bool {
+    let lower = describe(e).to_lowercase();
+    ["certificate", "tls", "ssl", "handshake"].iter().any(|w| lower.contains(w))
+}
+
 /// `tunnel`: for an https request through the egress proxy that failed to connect, what the proxy
 /// said about the destination afterwards.
 fn request_error(e: &reqwest::Error, url: &Url, hops: &[Url], tunnel: Option<&Tunnel>) -> ToolOutput {
@@ -287,7 +294,7 @@ async fn fetch(ctx: &ToolCtx, client: &Client, start: Url, raw: bool) -> ToolOut
         let resp = match client.get(current.clone()).send().await {
             Ok(r) => r,
             // A refused CONNECT looks like any failure to connect: the proxy is asked again (see [`Tunnel`]).
-            Err(e) if tunnelled && e.is_connect() => {
+            Err(e) if tunnelled && e.is_connect() && !names_tls_failure(&e) => {
                 return match verdict(proxy_verdict(client, &current).await, &current) {
                     Ok(tunnel) => request_error(&e, &current, &hops, Some(&tunnel)),
                     Err(out) => *out,
@@ -440,6 +447,29 @@ mod tests {
     use loom_core::config::{NetworkCfg, NetworkMode, SandboxCfg, SandboxMode, ToolsCfg};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct Hop(&'static str, Option<Box<Hop>>);
+
+    impl std::fmt::Display for Hop {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Hop {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|h| h as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn a_certificate_failure_in_the_chain_is_named() {
+        let cert = Hop("error trying to connect", Some(Box::new(Hop("invalid peer certificate: UnknownIssuer", None))));
+        assert!(names_tls_failure(&cert));
+        let refused = Hop("error trying to connect", Some(Box::new(Hop("tcp connect error: Connection refused", None))));
+        assert!(!names_tls_failure(&refused));
+    }
 
     async fn serve(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
