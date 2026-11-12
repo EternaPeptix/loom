@@ -50,7 +50,8 @@
 //!   error and exit 1); `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
 //!   overwrite: `{path} already exists.`).
 //! - `service install|uninstall|status` (macOS; elsewhere `This command is for macOS (launchd).`):
-//!   `install` writes `serve::launch_agent_plist` to `~/Library/LaunchAgents/{SERVICE_LABEL}.plist`
+//!   `install` prepares the home (`serve::prepare_home`), creates `{logs}/loomd.log` (0600) if it is missing,
+//!   writes `serve::launch_agent_plist` to `~/Library/LaunchAgents/{SERVICE_LABEL}.plist`
 //!   and runs `launchctl bootstrap gui/{uid} {plist}`; `uninstall` runs `launchctl bootout
 //!   gui/{uid}/{SERVICE_LABEL}` and removes the file; `status` runs `launchctl print` and says
 //!   whether it is loaded.
@@ -1250,11 +1251,8 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
             outln("ok").map(|()| 0)
         }
         ConfigAction::Init => {
-            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&paths.home)
+            use std::os::unix::fs::OpenOptionsExt;
+            loom_core::config::ensure_private_dir(&paths.home)
                 .map_err(|e| format!("Cannot create {} ({e}).", paths.home.display()))?;
             let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&file) {
                 Ok(f) => f,
@@ -1283,11 +1281,24 @@ fn launchctl(args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Prepare the home (`serve::prepare_home`) and write the agent's property list to `plist`. launchd opens the log the
+/// list names itself, with its own default mode, so the log is created here first (0600); launchd appends to a file
+/// that exists without changing its mode.
+fn write_service_files(paths: &Paths, plist: &Path, exe: &Path) -> Result<(), String> {
+    if let Some(dir) = plist.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create {} ({e}).", dir.display()))?;
+    }
+    crate::serve::prepare_home(paths)?;
+    crate::serve::open_daemon_log(paths)?;
+    std::fs::write(plist, crate::serve::launch_agent_plist(exe, &paths.home))
+        .map_err(|e| format!("Cannot write {} ({e}).", plist.display()))
+}
+
 fn cmd_service(paths: &Paths, action: ServiceAction) -> Result<i32, String> {
     if !cfg!(target_os = "macos") {
         return Err("This command is for macOS (launchd).".to_string());
     }
-    use crate::serve::{launch_agent_plist, SERVICE_LABEL};
+    use crate::serve::SERVICE_LABEL;
     let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("HOME is not set, so there is no LaunchAgents folder to use.")?;
     let plist = home.join("Library/LaunchAgents").join(format!("{SERVICE_LABEL}.plist"));
     // SAFETY: getuid has no preconditions and cannot fail.
@@ -1296,11 +1307,7 @@ fn cmd_service(paths: &Paths, action: ServiceAction) -> Result<i32, String> {
     match action {
         ServiceAction::Install => {
             let exe = std::env::current_exe().map_err(|e| format!("Cannot find this program's path ({e})."))?;
-            for dir in [plist.parent(), Some(paths.logs_dir().as_path())].into_iter().flatten() {
-                std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create {} ({e}).", dir.display()))?;
-            }
-            std::fs::write(&plist, launch_agent_plist(&exe, &paths.home))
-                .map_err(|e| format!("Cannot write {} ({e}).", plist.display()))?;
+            write_service_files(paths, &plist, &exe)?;
             launchctl(&["bootstrap", &domain, &plist.display().to_string()])?;
             outln(&format!("installed {}; the daemon starts at login", plist.display())).map(|()| 0)
         }
@@ -1689,6 +1696,23 @@ mod tests {
         assert_eq!(cmd_config(&paths, ConfigAction::Check), Ok(0));
         std::fs::write(paths.config_file(), "default_model = [").unwrap();
         assert!(cmd_config(&paths, ConfigAction::Check).unwrap_err().contains("config.toml"));
+    }
+
+    #[test]
+    fn service_install_files_tighten_the_home_and_create_the_log_before_launchd_opens_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        std::fs::create_dir_all(&paths.home).unwrap();
+        std::fs::set_permissions(&paths.home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plist = dir.path().join("LaunchAgents").join("agent.plist");
+        write_service_files(&paths, &plist, Path::new("/usr/local/bin/loom")).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&paths.home), 0o700);
+        assert_eq!(mode(&paths.logs_dir()), 0o700);
+        let log = paths.logs_dir().join("loomd.log");
+        assert_eq!(mode(&log), 0o600);
+        assert!(std::fs::read_to_string(&plist).unwrap().contains(&log.display().to_string()));
     }
 
     #[test]

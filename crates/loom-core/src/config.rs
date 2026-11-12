@@ -343,6 +343,30 @@ fn id_dir(id: &str) -> PathBuf {
     }
 }
 
+/// Create `dir` (and any missing parents) with mode 0700; when it already exists with any group or other
+/// permission bit, tighten it to 0700. Every directory the harness creates under the loom home goes through this.
+/// On non-Unix targets it only creates the directory. An empty path (the parent of a bare file name) names the
+/// current directory, which is left as it is.
+pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.as_os_str().is_empty() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        let meta = std::fs::metadata(dir)?;
+        if meta.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
 /// Where everything lives on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Paths {
@@ -405,6 +429,16 @@ impl Paths {
     }
     pub fn packs_dir(&self) -> PathBuf {
         self.home.join("packs")
+    }
+
+    /// Create the home and its top-level directories (keys, sessions, missions, blobs, logs) as private (0700)
+    /// directories, tightening any that already exist with group or other access.
+    pub fn ensure_private_layout(&self) -> std::io::Result<()> {
+        ensure_private_dir(&self.home)?;
+        for dir in [self.keys_dir(), self.sessions_dir(), self.missions_dir(), self.blobs_dir(), self.logs_dir()] {
+            ensure_private_dir(&dir)?;
+        }
+        Ok(())
     }
 }
 
@@ -507,6 +541,36 @@ allow = ["*.example.test"]
         let sid = SessionId::from("s-1");
         assert!(p.session_log(&sid).ends_with("sessions/s-1/log.jsonl"));
         assert!(p.journal(&MissionId::from("m-1")).ends_with("missions/m-1/journal.jsonl"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_layout_creates_0700_and_tightens_existing_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths::at(dir.path().join(".loom"));
+        // The operator made the home and one of its directories first, as `mkdir -p ~/.loom/packs` would.
+        std::fs::create_dir_all(p.packs_dir()).unwrap();
+        std::fs::create_dir(p.sessions_dir()).unwrap();
+        for d in [&p.home, &p.packs_dir(), &p.sessions_dir()] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        p.ensure_private_layout().unwrap();
+        for d in [p.home.clone(), p.keys_dir(), p.sessions_dir(), p.missions_dir(), p.blobs_dir(), p.logs_dir()] {
+            assert_eq!(mode(&d), 0o700, "{}", d.display());
+        }
+        // Directories the harness does not create are left as they were.
+        assert_eq!(mode(&p.packs_dir()), 0o755);
+        // A second call changes nothing and fails nowhere.
+        p.ensure_private_layout().unwrap();
+    }
+
+    #[test]
+    fn an_empty_private_dir_path_is_the_current_directory_and_left_alone() {
+        // The parent of a bare file name is empty; it names a directory that exists and is not the harness's.
+        assert!(Path::new("log.jsonl").parent().is_some_and(|p| p.as_os_str().is_empty()));
+        ensure_private_dir(Path::new("")).unwrap();
     }
 
     #[test]

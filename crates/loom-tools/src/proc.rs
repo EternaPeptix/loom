@@ -281,7 +281,17 @@ fn write_pid_record(path: &Path, record: &PidRecord) -> io::Result<()> {
     if let Some((pid, start)) = &record.owner {
         text.push_str(&format!("owner {pid} {start}\n"));
     }
-    std::fs::write(path, text)
+    use std::io::Write;
+    let mut f = private_file_options();
+    f.write(true).create(true).truncate(true);
+    f.open(path)?.write_all(text.as_bytes())
+}
+
+/// Options for a file only the owner may read or write (mode 0600 on Unix, set at creation).
+fn private_file_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
 }
 
 /// The pid record left by an earlier run, or `None` when there is none or it cannot be understood.
@@ -407,8 +417,8 @@ pub fn spawn(sandbox: &Sandbox, spec: &Spawn) -> io::Result<Running> {
     for stale in [&spec.out_path, &spec.exit_path, &pid_file] {
         remove_stale(stale)?;
     }
-    let out = std::fs::OpenOptions::new().create_new(true).append(true).open(&spec.out_path)?;
-    let exit = std::fs::OpenOptions::new().create_new(true).write(true).open(&spec.exit_path)?;
+    let out = private_file_options().create_new(true).append(true).open(&spec.out_path)?;
+    let exit = private_file_options().create_new(true).write(true).open(&spec.exit_path)?;
     let (program, mut args) = sandbox.command(WRAPPER);
     args.push(spec.script.clone());
     let mut cmd = tokio::process::Command::new(program);
@@ -1189,6 +1199,19 @@ mod tests {
         let mut r = f.start(script);
         assert_eq!(finish(&mut r).await, Ended::Exit(0));
         assert_eq!(String::from_utf8(r.read_output(0).expect("read")).expect("utf-8"), "a \"quoted\" it's|$HOME|3|\n");
+    }
+
+    #[tokio::test]
+    async fn output_status_and_pid_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fx();
+        let mut r = f.start("echo hi");
+        assert_eq!(finish(&mut r).await, Ended::Exit(0));
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // `spawn` writes the pid record and only a job table removes it, so it is there after the command ends.
+        for p in [f.root.join("out"), f.root.join("exit"), pid_path(&f.root.join("out"))] {
+            assert_eq!(mode(&p), 0o600, "{}", p.display());
+        }
     }
 
     #[tokio::test]

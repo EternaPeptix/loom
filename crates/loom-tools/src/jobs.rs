@@ -276,7 +276,7 @@ impl JobTable {
 
     /// The next id and the paths of its output and status files.
     pub async fn allocate(&self) -> std::io::Result<(String, PathBuf, PathBuf)> {
-        std::fs::create_dir_all(&self.dir)?;
+        loom_core::config::ensure_private_dir(&self.dir)?;
         let mut inner = lock(&self.inner);
         inner.last = inner.last.saturating_add(1);
         let id = format!("j{}", inner.last);
@@ -923,6 +923,24 @@ mod tests {
         assert_eq!(f.table.allocate().await.expect("allocate").0, "j42");
         f.table.resume_from(3).await;
         assert_eq!(f.table.allocate().await.expect("allocate").0, "j43");
+    }
+
+    #[tokio::test]
+    async fn the_jobs_directory_and_the_files_of_a_job_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fx();
+        let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        // A directory left looser by an earlier version is tightened when the next id is handed out.
+        let dir = f.root.join("home/jobs");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let info = f.start("sleep 300").await;
+        assert_eq!(mode(&dir), 0o700);
+        // The pid record is removed when the job settles, so the files are checked while it runs.
+        for p in [info.out_path.clone(), info.exit_path.clone(), proc::pid_path(&info.out_path)] {
+            assert_eq!(mode(&p), 0o600, "{}", p.display());
+        }
+        f.table.kill(&info.id, Duration::from_secs(2)).await.expect("kill");
     }
 
     /// A command spawned with its record in the jobs directory, never registered.

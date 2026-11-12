@@ -218,7 +218,11 @@ impl Journal {
     fn lock_shared(&self) -> Result<Option<std::fs::File>, JournalError> {
         use std::io::ErrorKind::{NotFound, PermissionDenied, ReadOnlyFilesystem};
         let lock_path = self.lock_path();
-        let lock = match std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path) {
+        let mut lock_options = std::fs::OpenOptions::new();
+        lock_options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut lock_options, 0o600);
+        let lock = match lock_options.open(&lock_path) {
             Ok(l) => l,
             Err(e) if e.kind() == NotFound => return Ok(None),
             // The journal can be readable where its directory is not writable; a read-only descriptor
@@ -352,15 +356,16 @@ impl Journal {
         check: &dyn Fn(&LedgerState) -> Result<(), String>,
     ) -> Result<(Entry, LedgerState), JournalError> {
         if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| self.io(e))?;
+            if !parent.as_os_str().is_empty() && !parent.is_dir() {
+                crate::config::ensure_private_dir(parent).map_err(|e| self.io(e))?;
             }
         }
         let lock_path = self.lock_path();
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
+        let mut lock_options = std::fs::OpenOptions::new();
+        lock_options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut lock_options, 0o600);
+        let lock = lock_options
             .open(&lock_path)
             .map_err(|source| JournalError::Io { path: lock_path.clone(), source })?;
         fs2::FileExt::lock_exclusive(&lock).map_err(|source| JournalError::Io { path: lock_path.clone(), source })?;

@@ -654,7 +654,10 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()
     let text = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let tmp = path.with_file_name(format!(".{name}.tmp"));
-    std::fs::write(&tmp, text)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    std::io::Write::write_all(&mut options.open(&tmp)?, &text)?;
     std::fs::rename(&tmp, path)
 }
 
@@ -1514,7 +1517,7 @@ impl Inner {
         let workspace = std::fs::canonicalize(&meta.workspace)
             .map_err(|e| format!("The workspace {} cannot be used: {e}", meta.workspace))?;
         let tmp = self.paths.session_tmp(id);
-        std::fs::create_dir_all(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+        loom_core::config::ensure_private_dir(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
         let tmp = std::fs::canonicalize(&tmp).map_err(|e| format!("cannot resolve {}: {e}", tmp.display()))?;
         let cfg = sandbox_cfg_for(&self.config.sandbox, &role, &workspace);
         let sandbox = Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, Some(self.proxy.port()))
@@ -2507,9 +2510,9 @@ impl Runtime {
     /// Bring the runtime up over `paths` and restore what was running. See *Start*.
     pub async fn start(config: Config, paths: Paths) -> Result<Runtime, String> {
         config.check().map_err(|e| e.to_string())?;
-        for dir in [paths.home.clone(), paths.sessions_dir(), paths.missions_dir(), paths.logs_dir(), paths.keys_dir()] {
-            std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        }
+        paths
+            .ensure_private_layout()
+            .map_err(|e| format!("cannot create {} as a private directory: {e}", paths.home.display()))?;
         let packs = Packs::load(&paths.packs_dir())?;
         packs.check_tools(&rtools::known_tools())?;
         let key = journal::load_or_create_key(&paths.journal_key())
@@ -3694,6 +3697,34 @@ mod tests {
 
     fn inbox_kinds(e: &Env) -> Vec<InboxKind> {
         e.rt.inbox().iter().map(|i| i.item.kind).collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_looser_existing_home_is_tightened_and_new_session_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = env_with_packs(Script::new(|_, _| finish("ok")), |_| {}, |packs| {
+            std::fs::create_dir_all(packs).unwrap();
+            for d in [packs.parent().unwrap(), packs] {
+                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        })
+        .await;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let home = e.dir.path().join("home");
+        for d in ["", "keys", "sessions", "missions", "blobs", "logs"] {
+            assert_eq!(mode(&home.join(d)), 0o700, "{d}");
+        }
+        let id = e.rt.create_session(e.new_session(Some("hi"))).await.unwrap().meta.id;
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let sdir = home.join("sessions").join(id.as_str());
+        until("status.json", || sdir.join("status.json").is_file()).await;
+        for f in ["log.jsonl", "meta.json", "status.json"] {
+            assert_eq!(mode(&sdir.join(f)), 0o600, "{f}");
+        }
+        for d in [sdir.clone(), sdir.join("tmp")] {
+            assert_eq!(mode(&d), 0o700, "{}", d.display());
+        }
     }
 
     #[tokio::test]

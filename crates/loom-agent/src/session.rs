@@ -489,14 +489,17 @@ pub fn queue_input(paths: &Paths, session: &SessionId, input: Input) -> Result<I
 fn write_kept(dir: &Path, kept: &KeptInput) -> std::io::Result<PathBuf> {
     fn write_synced(dir: &Path, tmp: &Path, path: &Path, kept: &KeptInput) -> std::io::Result<()> {
         use std::io::Write;
-        let mut file = std::fs::File::create(tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(tmp)?;
         file.write_all(&serde_json::to_vec(kept).map_err(std::io::Error::other)?)?;
         file.sync_all()?;
         std::fs::rename(tmp, path)?;
         std::fs::File::open(dir)?.sync_all()
     }
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    std::fs::create_dir_all(dir)?;
+    loom_core::config::ensure_private_dir(dir)?;
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = format!("{:016}-{n:010}.json", now_ms());
     let path = dir.join(&name);
@@ -4660,6 +4663,23 @@ mod tests {
         assert_eq!(count(&rs, "turn_start"), 0);
         assert_eq!(std::fs::read_dir(&queue).unwrap().count(), 0, "nothing is left on disk");
         finish_task(tx, task).await;
+    }
+
+    #[test]
+    fn a_kept_input_is_private_and_its_directory_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        let id = SessionId::from("s-test");
+        let queue = queue_dir(&paths, &id);
+        // Left looser by an earlier version.
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::set_permissions(&queue, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let kept = queue_input(&paths, &id, Input::Constraint("never push to main".into())).unwrap();
+        let Input::Queued { file, .. } = &kept else { panic!("a rule is kept on disk") };
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(file), 0o600);
+        assert_eq!(mode(&queue), 0o700);
     }
 
     #[tokio::test]
