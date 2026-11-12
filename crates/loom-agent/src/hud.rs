@@ -5,8 +5,10 @@
 //! The block is the last message of each request and is not part of the stored prefix, so it can
 //! change freely. It carries what a model otherwise loses track of over a long session: the mission
 //! state, what it has not looked at, what is running. It never mentions context size, message
-//! counts, or how long the session has run — those are not the model's concern (DESIGN §2.2). The
-//! only budget shown is the session's own step/time budget.
+//! counts, or how long the session has run — those are not the model's concern (DESIGN §2.2). A
+//! budget is not shown as a running count either (a rising number reads as pressure); the model is
+//! given one late heads-up when its step or time budget is nearly used, and the harness enforces the
+//! limit regardless.
 //!
 //! `render(input)` is pure and deterministic. Output, sections in this order, each omitted when it
 //! has nothing to show, separated by one blank line:
@@ -34,7 +36,7 @@
 //! Waiting on the operator ({n}):
 //! - q2: Which branch should this target?
 //!
-//! Budget: step 37 of 200; 84 of 120 minutes left
+//! Heads-up: this session's budget is nearly used. …   (only in the last stretch of the budget)
 //! ```
 //!
 //! Details:
@@ -43,9 +45,9 @@
 //! - Mission state: only when `input.ledger` is `Some` and the brief is non-empty. Followed, when
 //!   `input.ledger_skipped` is `n > 0`, by its own line `{n} ledger entries written by a newer loom are
 //!   not shown` (`1 ledger entry … is not shown`): the ledger as read lacks entries this build cannot parse.
-//! - Finish: a line of its own after the mission state, in a lead only (`!input.is_child`): `Finish: rejected
-//!   {n}; needs new execution evidence` while an objection of a finish verifier is an open obligation (n = the
-//!   rejected finishes since the latest accepted one), else `Finish: unavailable — goal not concluded` while a
+//! - Finish: a line of its own after the mission state, in a lead only (`!input.is_child`): a steady
+//!   instruction with no count. `Finish: the check raised an objection. …` while an objection of a finish
+//!   verifier is an open obligation, else `Finish: conclude the goal first — …` while the goal-met
 //!   goal is set, its goal-met claim is not concluded and the operator has not released the mission. The
 //!   goal status itself is a line of the mission state.
 //! - Not looked at: `observe::unviewed(records, input.unviewed_min_lines)`; gaps as `a-b` joined by
@@ -59,9 +61,9 @@
 //!   (`<1 min` below one).
 //! - Waiting on the operator: ledger questions with no answer (id and text), only when
 //!   `input.ledger` is `Some`.
-//! - Budget: only when the budget has a limit; named `Budget` for a child (its assignment's) and
-//!   `Session budget` for a root. Steps: `step {step} of {max}`. Minutes: whole minutes left, from
-//!   `started_ms`, floor at 0. Both parts when both limits exist. `step` and `started_ms` count from
+//! - Budget: nothing while the budget has room. In the last `BUDGET_WARN_PCT`% of either the step or
+//!   the minute allowance, one heads-up with no number (`this assignment's` for a child, `this session's`
+//!   for a root), telling the model to wrap up without rushing. `step` and `started_ms` count from
 //!   where the budget was granted: the session's start, or the turn that gave a root a fresh one.
 //! - Every list shows at most `MAX_ITEMS` entries, then `- (+{k} more)`. Every entry is one line,
 //!   cut to `MAX_LINE` characters with `…`; newlines inside values are replaced by spaces.
@@ -185,36 +187,32 @@ pub fn render(input: &HudInput<'_>) -> String {
         push_list(&mut sections, "Waiting on the operator", "", waiting);
     }
 
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(max) = input.budget.max_steps {
-        parts.push(format!("step {} of {}", input.step, max));
-    }
-    if let Some(max) = input.budget.max_minutes {
-        let elapsed = input.now_ms.saturating_sub(input.started_ms) / 60_000;
-        let left = u64::from(max).saturating_sub(elapsed);
-        parts.push(format!("{left} of {max} minutes left"));
-    }
-    if !parts.is_empty() {
-        let name = if input.is_child { "Budget" } else { "Session budget" };
-        sections.push(format!("{name}: {}", parts.join("; ")));
+    if budget_nearly_used(input.step, input.started_ms, input.now_ms, &input.budget) {
+        sections.push(texts::budget_nearly_used(input.is_child).to_string());
     }
 
     sections.join("\n\n")
 }
 
-/// Why `finish` is closed, from the ledger: `Finish: rejected {n}; needs new execution evidence` while an
-/// objection of a verifier is open and the operator has not released (n = rejections since the latest accepted finish), else `Finish:
-/// unavailable — goal not concluded` while the goal claim is open and the operator has not released.
+/// The last `BUDGET_WARN_PCT`% of the step or the minute allowance, whichever is reached first. The
+/// budget is enforced by the runtime, not here; this only decides the one late heads-up.
+const BUDGET_WARN_PCT: u64 = 85;
+fn budget_nearly_used(step: u32, started_ms: u64, now_ms: u64, budget: &Budget) -> bool {
+    let step_near = budget.max_steps.is_some_and(|m| u64::from(step) * 100 >= u64::from(m) * BUDGET_WARN_PCT);
+    let min_near = budget.max_minutes.is_some_and(|m| {
+        let elapsed = now_ms.saturating_sub(started_ms) / 60_000;
+        elapsed * 100 >= u64::from(m) * BUDGET_WARN_PCT
+    });
+    step_near || min_near
+}
+
+/// The steady finish line, from the ledger, with no count (a rising tally reads as pressure): the
+/// objection line while an objection of a verifier is open and the operator has not released, else the
+/// conclude-first line while the goal claim is open and the operator has not released, else `None`.
 fn finish_line(ledger: &LedgerState, gated: bool) -> Option<String> {
-    let objected = ledger.release.is_none()
+    let objection_open = ledger.release.is_none()
         && ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind == ObligationKind::Objection);
-    let rejected = if objected {
-        let since = ledger.finishes.iter().rposition(|f| f.accepted == Some(true)).map_or(0, |i| i.saturating_add(1));
-        ledger.finishes.iter().skip(since).filter(|f| f.accepted == Some(false)).count()
-    } else {
-        0
-    };
-    texts::finish_status_line(gated && crate::gate::goal_unconcluded(ledger), rejected)
+    texts::finish_status_line(gated && crate::gate::goal_unconcluded(ledger), objection_open)
 }
 
 /// One section: `{title} ({n}){suffix}:` and its entries, capped at `MAX_ITEMS`. Omitted when empty.
@@ -465,7 +463,7 @@ mod tests {
         let mut i = input(EMPTY);
         i.ledger = Some(&l);
         let expected = format!(
-            "Now: 1970-01-01 00:00 UTC\n\nMission state (from the ledger — the ledger tools change it):\n{}\n\nFinish: unavailable — goal not concluded\n\nWaiting on the operator (1):\n- q2: Which branch should this target?",
+            "Now: 1970-01-01 00:00 UTC\n\nMission state (from the ledger — the ledger tools change it):\n{}\n\nFinish: conclude the goal first — record a run that shows it is met, or that it cannot be met as stated, then finish.\n\nWaiting on the operator (1):\n- q2: Which branch should this target?",
             l.brief(&BriefOpts::default())
         );
         assert_eq!(render(&i), expected);
@@ -580,37 +578,52 @@ mod tests {
     }
 
     #[test]
-    fn budget_variants() {
+    fn budget_shows_only_a_late_heads_up_with_no_number() {
         let mut i = input(EMPTY);
         i.is_child = true;
+        i.budget = Budget { max_steps: Some(200), max_minutes: Some(120) };
+        // Plenty of room: nothing about the budget at all.
         i.step = 37;
         i.now_ms = 36 * 60_000;
-        i.budget = Budget { max_steps: Some(200), max_minutes: Some(120) };
-        assert!(render(&i).ends_with("\n\nBudget: step 37 of 200; 84 of 120 minutes left"));
-        i.budget = Budget { max_steps: Some(200), max_minutes: None };
-        assert!(render(&i).ends_with("\n\nBudget: step 37 of 200"));
-        i.budget = Budget { max_steps: None, max_minutes: Some(30) };
-        i.now_ms = 36 * 60_000;
-        assert!(render(&i).ends_with("\n\nBudget: 0 of 30 minutes left"));
-        i.budget = Budget::default();
-        assert_eq!(render(&i), "Now: 1970-01-01 00:36 UTC");
-        i.budget = Budget { max_steps: Some(5), max_minutes: None };
+        assert!(!render(&i).contains("budget"), "{}", render(&i));
+        // Last 15% of the steps: one heads-up, and no number in it.
+        i.step = 170;
+        let out = render(&i);
+        assert!(out.ends_with("do not rush the work that remains.") && out.contains("this assignment's budget is nearly used"), "{out}");
+        assert!(!out.contains("170") && !out.contains(" of "), "{out}");
+        // Last 15% of the minutes triggers it too.
+        i.step = 0;
+        i.now_ms = 102 * 60_000;
+        assert!(render(&i).contains("nearly used"), "{}", render(&i));
+        // A root says `this session's`.
         i.is_child = false;
-        assert!(render(&i).ends_with("\n\nSession budget: step 37 of 5"));
+        assert!(render(&i).contains("this session's budget is nearly used"), "{}", render(&i));
+        // No limit: nothing, however high the step.
+        i.budget = Budget::default();
+        i.step = 9999;
+        assert!(!render(&i).contains("nearly used") && !render(&i).contains("budget"), "{}", render(&i));
     }
 
     #[test]
-    fn a_root_budget_is_named_and_counted_from_where_it_was_granted() {
-        // A root whose fresh budget was granted by the turn that started at minute 30, two steps ago.
+    fn a_root_budget_warning_counts_from_where_it_was_granted() {
+        // A fresh budget granted by the turn that started at minute 30, two steps ago.
         let mut i = input(EMPTY);
         i.step = 2;
         i.started_ms = 30 * 60_000;
         i.now_ms = 36 * 60_000;
         i.budget = Budget { max_steps: Some(10), max_minutes: Some(20) };
-        assert!(render(&i).ends_with("\n\nSession budget: step 2 of 10; 14 of 20 minutes left"), "{}", render(&i));
+        // Two of ten steps, six of twenty minutes: not near, nothing shown.
+        assert!(!render(&i).contains("nearly used"), "{}", render(&i));
+        // Nine of ten steps: the last stretch, one heads-up.
+        i.step = 9;
+        assert!(render(&i).contains("this session's budget is nearly used"), "{}", render(&i));
+        // Minutes measured from `started_ms`: eighteen of twenty, from minute 30.
+        i.step = 2;
+        i.now_ms = 48 * 60_000;
+        assert!(render(&i).contains("nearly used"), "{}", render(&i));
         // No limit, no line.
         i.budget = Budget::default();
-        assert_eq!(render(&i), "Now: 1970-01-01 00:36 UTC");
+        assert_eq!(render(&i), "Now: 1970-01-01 00:48 UTC");
     }
 
     #[test]
@@ -620,13 +633,13 @@ mod tests {
         l.goal_met = Some(GoalMet { status: GoalMetStatus::Open, note: String::new(), evidence: vec![], n: 0 });
         let mut i = input(EMPTY);
         i.ledger = Some(&l);
-        assert!(render(&i).contains("\n\nFinish: unavailable — goal not concluded"), "{}", render(&i));
+        assert!(render(&i).contains("\n\nFinish: conclude the goal first"), "{}", render(&i));
         // A child is not told about finish.
         i.is_child = true;
         assert!(!render(&i).contains("Finish:"));
         i.is_child = false;
 
-        // An open objection of a verifier: the count of rejections since the latest accepted finish.
+        // An open objection of a verifier: a steady line, no count.
         let rejected = |id: &str, accepted: bool| FinishRecord {
             id: id.into(),
             summary: "s".into(),
@@ -645,7 +658,7 @@ mod tests {
             outcome: None,
         });
         i.ledger = Some(&done);
-        assert!(render(&i).contains("\n\nFinish: rejected 2; needs new execution evidence"), "{}", render(&i));
+        assert!(render(&i).contains("\n\nFinish: the check raised an objection."), "{}", render(&i));
         // Settled objection and a concluded goal: no line. Neither with a release.
         let mut settled = done.clone();
         settled.obligations[0].outcome = Some("settled".into());
@@ -683,8 +696,7 @@ Out of date (2):\n\
 - src/a.rs changed after you last read it — read it again before relying on what you saw\n\
 - src/a.rs changed after you ran `cargo test -p x` — run it again before relying on its result\n\n\
 Running (1):\n- job j1 `make` — <1 min, 1 lines so far\n\n\
-Waiting on the operator (1):\n- q2: Which branch should this target?\n\n\
-Budget: step 2 of 10",
+Waiting on the operator (1):\n- q2: Which branch should this target?",
             l.brief(&BriefOpts::default())
         );
         assert_eq!(render(&i), expected);

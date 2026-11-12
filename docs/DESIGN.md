@@ -32,7 +32,7 @@ That inverts the usual cloud trade-offs:
    at any time, so a restart, a crash and an eviction are the same operation.
 2. **Window fullness is never an input to a model decision.** The model is told once, in the pack
    preamble, that context is managed and is never a reason to stop, defer or summarise. No gauge is
-   shown. Budgets that do exist (steps, wall time) are shown separately and named.
+   shown. Budgets that do exist (steps, wall time) are the harness's to enforce, not the model's to ration: no running count is shown, only one heads-up when a budget is nearly used, and the harness parks on exhaustion regardless.
 3. **Tool output is admitted whole.** If it cannot be, the cut is explicit (which lines were omitted,
    sizes, outcome) and the full output stays addressable by a handle the model can page and search.
    Later eviction replaces old output with a stub carrying the same handle. Nothing is ever lost
@@ -294,8 +294,9 @@ blob named by the request's `model_request.hud`. It carries, each section only w
 current time (UTC, minutes); the mission state from the ledger brief (§7); command outputs with at
 least `agents.unviewed_min_lines` (20) lines never shown; calls repeated with the same arguments and the
 same output; reads and command results that a later write of this session made out of date; running
-jobs and agents; ledger questions waiting on the operator; and the budget (`Budget` for a child,
-`Session budget` for a root). It never mentions context size, message counts or elapsed session time.
+jobs and agents; ledger questions waiting on the operator; and, only in the last stretch of a step or
+time budget, one heads-up to wrap up — with no running count, so a rising number is never shown. It
+never mentions context size, message counts or elapsed session time.
 
 **Prefix guard** (`loom-core::prefix`). For each step request the session hands the stable messages to
 `PrefixGuard::check`, which compares them with those of the previous request: unless the epoch

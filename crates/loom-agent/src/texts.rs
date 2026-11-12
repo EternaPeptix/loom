@@ -628,11 +628,25 @@ pub fn verification_fault_result(why: &str) -> String {
 
 /// The HUD line saying why `finish` is closed, or `None` when it is not. `rejected` is the number of
 /// rejected finishes whose objections are still open.
-pub fn finish_status_line(goal_unconcluded: bool, rejected: usize) -> Option<String> {
-    if rejected > 0 {
-        return Some(format!("Finish: rejected {rejected}; needs new execution evidence"));
+pub fn finish_status_line(goal_unconcluded: bool, objection_open: bool) -> Option<String> {
+    if objection_open {
+        return Some("Finish: the check raised an objection. Answer it with a new run, then finish again.".to_string());
     }
-    goal_unconcluded.then(|| "Finish: unavailable — goal not concluded".to_string())
+    goal_unconcluded.then(|| {
+        "Finish: conclude the goal first — record a run that shows it is met, or that it cannot be met as stated, then finish."
+            .to_string()
+    })
+}
+
+/// The one late heads-up the state block shows when the session's budget is nearly used. It carries
+/// no count: the model does not ration its own budget (the harness enforces it), it is only told once,
+/// late, to wrap up without rushing.
+pub fn budget_nearly_used(is_child: bool) -> &'static str {
+    if is_child {
+        "Heads-up: this assignment's budget is nearly used. Bring the current step to a clean stop and return your result; do not rush the work that remains."
+    } else {
+        "Heads-up: this session's budget is nearly used. Bring the current step to a clean stop and wrap up; do not rush the work that remains."
+    }
 }
 
 #[cfg(test)]

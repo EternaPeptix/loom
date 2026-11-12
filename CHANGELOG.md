@@ -194,6 +194,8 @@ upgrade" first; the rest says what behaves differently.
 
 ### Sessions, agents and finishing
 
+- The harness-state block no longer shows a running turn/step count or a finish-rejection tally; a rising number read as time pressure. The step and time budget is enforced as before, with one late heads-up to wrap up, and the finish line is a steady instruction to conclude the goal first.
+
 - A lead can no longer finish by conceding: `finish` is refused in the same step while the goal is not
   concluded, and a new `conclude` tool (`met` or `unreachable`, with execution evidence) records the
   conclusion. A verifier's objections become obligations that only new execution evidence settles. A

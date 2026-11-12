@@ -4320,11 +4320,13 @@ mod tests {
         let second = rs.iter().rposition(|r| kind(r) == "turn_start").unwrap();
         assert!(matches!(&rs[second + 1].event, Event::HarnessNote { note: NoteKind::Info, .. }), "{:?}", kinds(&rs));
         assert!(all_text(&fx.server.requests()[3]).contains(&texts::budget_renewed(Some(1), None)));
-        // The state block shows the root's budget, counted from the turn that granted it.
+        // The state block carries no running count; it warns only when the budget is nearly used,
+        // measured from the turn that granted it. Fresh (step 0 of 1): no warning; over it (step 2 of 1):
+        // a warning; renewed (step 0 of 1 again): the warning is gone.
         let huds: Vec<String> = fx.server.requests().iter().map(last_text).collect();
-        assert!(huds[0].contains("\nSession budget: step 0 of 1\n"), "{}", huds[0]);
-        assert!(huds[2].contains("\nSession budget: step 2 of 1\n"), "{}", huds[2]);
-        assert!(huds[3].contains("\nSession budget: step 0 of 1\n"), "{}", huds[3]);
+        assert!(!huds[0].contains("nearly used"), "{}", huds[0]);
+        assert!(huds[2].contains("nearly used"), "{}", huds[2]);
+        assert!(!huds[3].contains("nearly used"), "{}", huds[3]);
         // Reopened from the log, the session counts the same way.
         finish_task(tx, task).await;
         let reopened = Session::open(fx.deps()).unwrap();
