@@ -23,15 +23,23 @@
 //! - **retry, until 3 attempts in a row have failed this way** (the third is the last: it returns
 //!   `ModelError::Unavailable` whatever the window): a failure waiting cannot cure — a 200 whose body
 //!   is not an event stream, `AssembleError::Malformed`, a clean end of stream with no
-//!   `finish_reason`, and local errors (request building, TLS certificate or protocol). These count
-//!   together; a failure of the plain retry kind in between resets the count;
+//!   `finish_reason`, and send errors that are not about reaching the server (request building, TLS
+//!   certificate or protocol, an answer that is not HTTP). A send error is sorted by its causes, never
+//!   by its own text, which carries the request URL. These count together; a failure of the plain
+//!   retry kind in between resets the count;
 //! - **redirect** (no retry): the client follows none; a 3xx → `ModelError::Rejected` naming
 //!   `Location` and the `base_url` it implies (that address without `/chat/completions`);
-//! - **unknown model** (one resend per call): on HTTP 404, run `discover`. When it selects another id
-//!   than the one sent, send the request again at once with that id, so a client that never ran
-//!   discovery, or whose server was relaunched with another model, recovers by itself. A
-//!   `ModelError::Config` from that discovery (several served models, none the configured one) is
-//!   returned; in every other case the 404 is **rejected** as below;
+//! - **unknown model**: on HTTP 404, ask the server what it serves, as `discover` does. A
+//!   `ModelError::Config` from that (several served models, none the configured one) is returned.
+//!   When the answer selects another id than the one sent, what follows depends on whether discovery
+//!   has selected an id in this process before:
+//!   - it has not (a session restored after a daemon restart, or begun while the server was down):
+//!     the id is remembered and the request is sent again at once with it, once per call;
+//!   - it has, so the server was relaunched with another model: the 404 is **rejected** with a
+//!     sentence naming the id now served, and the remembered id stays. What a session recorded at its
+//!     start (model id, context window) describes the old model, so the move is the operator's.
+//!
+//!   In every other case the 404 is **rejected** as below;
 //! - **context overflow** (no retry): HTTP 400 or 413 whose message matches the server's wording for
 //!   an over-long prompt — any of `maximum context length`, `context length`, `too many tokens`,
 //!   `prompt is too long`, `max_model_len`, case-insensitive → `ModelError::ContextOverflow`, with
@@ -44,8 +52,9 @@
 //! Retry pacing: delays 0.5 s, 1 s, 2 s, 4 s, … capped at `profile.retry_max_delay_s`, each with
 //! ±10% jitter. A `Retry-After` header (seconds) replaces the computed delay when it is larger, up to
 //! 600 s. Before sleeping, emit `StreamEvent::Retrying`. `profile.retry_window_s == 0` retries until
-//! cancelled (the cases above excepted); otherwise, when the time since the first failure of this call exceeds the window,
-//! return `ModelError::Unavailable { attempts, last }`.
+//! cancelled (the capped cases above excepted, and nothing else: a failure of the plain retry kind
+//! that never heals is retried for ever); otherwise, when the time since the first failure of this
+//! call exceeds the window, return `ModelError::Unavailable { attempts, last }`.
 //!
 //! Cancellation: `cancel` is observed while connecting, reading and sleeping; it returns
 //! `ModelError::Cancelled` promptly (the HTTP request is dropped). Whatever text had streamed is
@@ -117,7 +126,9 @@ pub enum ModelError {
     /// The server refused the request as malformed. Retrying the same request cannot help.
     #[error("the model server rejected the request (HTTP {status}): {message}")]
     Rejected { status: u16, message: String },
-    #[error("the model server did not answer after {attempts} attempts: {last}")]
+    /// Retrying ended without a completion: the window ran out, or the server kept answering with
+    /// something that waiting cannot cure. `last` says which.
+    #[error("the model request failed after {attempts} attempts: {last}")]
     Unavailable { attempts: u32, last: String },
     #[error("model profile: {0}")]
     Config(String),
@@ -187,11 +198,16 @@ fn sticky(reason: impl Into<String>) -> Fail {
     Fail::Retry { reason: reason.into(), retry_after: None, sticky: true }
 }
 
-/// True for send errors that are about this machine's request, not about reaching the server:
-/// the request could not be built, or the TLS handshake failed on the certificate or protocol.
-fn is_local_failure(builder: bool, text: &str) -> bool {
-    const MARKERS: [&str; 10] = [
+/// True for send errors that are not about reaching the server: the request could not be built, the
+/// TLS handshake failed on the certificate or protocol, or the answer was not HTTP. `causes` is the
+/// text of the error's causes without the error's own, which carries the request URL.
+///
+/// A connection closed during the TLS handshake ("tls handshake eof") is left out on purpose: a
+/// TCP-level proxy answers that way for as long as its backend is being relaunched.
+fn is_local_failure(builder: bool, causes: &str) -> bool {
+    const MARKERS: [&str; 11] = [
         "certificate",
+        "invalid http",
         "unknown issuer",
         "peer is incompatible",
         "peer misbehaved",
@@ -202,7 +218,7 @@ fn is_local_failure(builder: bool, text: &str) -> bool {
         "corrupt message",
         "invalid content type",
     ];
-    let lower = text.to_lowercase();
+    let lower = causes.to_lowercase();
     builder || MARKERS.iter().any(|m| lower.contains(m))
 }
 
@@ -245,7 +261,7 @@ pub struct ModelClient {
     http: reqwest::Client,
     pacing: Pacing,
     /// The model id `discover` last selected; shared by clones. Requests carry it in place of
-    /// `profile.model` once it is known, and a 404 has it looked up again.
+    /// `profile.model` once it is known. While it is not, a 404 has it looked up.
     served: Arc<Mutex<Option<String>>>,
 }
 
@@ -285,10 +301,13 @@ impl ModelClient {
         &self.profile
     }
 
-    /// The id requests carry: what discovery selected, else the configured name.
-    fn model_id(&self) -> String {
-        let served = self.served.lock().unwrap_or_else(|e| e.into_inner());
-        served.clone().unwrap_or_else(|| self.profile.model.clone())
+    /// The id discovery selected, when it has selected one in this process.
+    fn discovered_id(&self) -> Option<String> {
+        self.served.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn remember(&self, id: &str) {
+        *self.served.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.to_string());
     }
 
     fn url(&self, path: &str) -> String {
@@ -311,7 +330,10 @@ impl ModelClient {
                 .map(Bytes::from)
                 .map_err(|e| ModelError::Config(format!("the request cannot be serialised: {e}")))
         };
-        let mut model = self.model_id();
+        // Requests carry what discovery selected, else the configured name.
+        let discovered = self.discovered_id();
+        let known = discovered.is_some();
+        let mut model = discovered.unwrap_or_else(|| self.profile.model.clone());
         let mut body = encode(&model)?;
         let url = self.url("chat/completions");
         let key = self.api_key();
@@ -333,13 +355,30 @@ impl ModelClient {
                     return Ok(done);
                 }
                 Err(Fail::Cancelled(partial)) => return Err(ModelError::Cancelled { partial }),
-                // 404 is what a server answers for a model id it does not serve: discovery never ran
-                // in this process, or the server was relaunched with another model since it did.
+                // 404 is what a server answers for a model id it does not serve.
                 Err(Fail::Fatal(ModelError::Rejected { status: 404, message })) if !rediscovered => {
                     rediscovered = true;
                     let Some(id) = self.reselect(&model, cancel).await? else {
                         return Err(ModelError::Rejected { status: 404, message });
                     };
+                    if known {
+                        // The server was relaunched with another model since discovery. What a session
+                        // recorded at its start (model id, context window) describes the old one, so
+                        // nothing is sent to the new one and the remembered id stays.
+                        tracing::warn!(
+                            model = %self.name, sent = %model, served = %id,
+                            "the server serves another model than discovery found; the request fails"
+                        );
+                        return Err(ModelError::Rejected {
+                            status: 404,
+                            message: format!(
+                                "the server no longer serves '{model}', the model loom found there earlier; it now serves '{id}'. loom does not move running sessions to another model by itself: relaunch the server with '{model}', or restart the loom daemon to carry on with '{id}'. The server said: {message}"
+                            ),
+                        });
+                    }
+                    // Discovery has selected nothing in this process yet: the session was restored
+                    // after a daemon restart, or it began while the server was down.
+                    self.remember(&id);
                     let reason =
                         format!("the server does not serve model '{model}' but '{id}'; sending the request again with that id");
                     tracing::info!(model = %self.name, attempt = attempts, %reason, "model id corrected");
@@ -377,12 +416,13 @@ impl ModelClient {
     }
 
     /// After a 404 for a request that carried `sent`: asks the server what it serves. `Some(id)` when
-    /// discovery selects another id than the one sent, `None` when the 404 stands.
+    /// discovery would select another id than the one sent, `None` when the 404 stands. Nothing is
+    /// remembered here.
     async fn reselect(&self, sent: &str, cancel: &CancellationToken) -> Result<Option<String>, ModelError> {
         let found = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(ModelError::Cancelled { partial: None }),
-            r = self.discover() => r,
+            r = self.lookup() => r,
         };
         match found {
             Ok(d) => Ok(Some(d.served_model).filter(|id| id != sent)),
@@ -426,7 +466,10 @@ impl ModelClient {
                 Err(_) => return Err(retry(format!("the server sent no response headers within {stall_text}"))),
                 Ok(Err(e)) => {
                     let text = describe(&e);
-                    return Err(if is_local_failure(e.is_builder(), &text) {
+                    // Only the causes are sorted: the error's own text carries the request URL, whose
+                    // host or path may contain one of the marker words.
+                    let causes = std::error::Error::source(&e).map(describe).unwrap_or_default();
+                    return Err(if is_local_failure(e.is_builder(), &causes) {
                         sticky(format!(
                             "the request to the server failed before any reply: {text}. Check base_url, the API key variable and the server's TLS certificate."
                         ))
@@ -524,6 +567,13 @@ impl ModelClient {
     }
 
     pub async fn discover(&self) -> Result<Discovered, ModelError> {
+        let found = self.lookup().await?;
+        self.remember(&found.served_model);
+        Ok(found)
+    }
+
+    /// What `discover` selects, without remembering it.
+    async fn lookup(&self) -> Result<Discovered, ModelError> {
         let url = self.url("models");
         let mut req = self.http.get(&url).timeout(DISCOVER_TIMEOUT);
         if let Some(k) = self.api_key() {
@@ -550,9 +600,7 @@ impl ModelClient {
         }
         let json: Value = serde_json::from_str(&text)
             .map_err(|e| unavailable(format!("{url} did not return JSON ({e}); check that base_url ends in /v1")))?;
-        let found = pick_model(&self.name, &self.profile, &json)?;
-        *self.served.lock().unwrap_or_else(|e| e.into_inner()) = Some(found.served_model.clone());
-        Ok(found)
+        pick_model(&self.name, &self.profile, &json)
     }
 
     pub async fn health(&self) -> bool {
@@ -888,6 +936,9 @@ mod tests {
     async fn html_body_with_status_200_fails_after_three_attempts() {
         let html = "<html><body>Welcome to the router admin page</body></html>";
         let (err, s) = fails_with(Action::Status { status: 200, body: html.into(), retry_after_s: None }).await;
+        // The sentence does not claim that a server which answered did not answer.
+        let shown = err.to_string();
+        assert!(shown.starts_with("the model request failed after 3 attempts: the server answered HTTP 200"), "{shown}");
         match err {
             ModelError::Unavailable { attempts, last } => {
                 assert_eq!(attempts, 3);
@@ -960,6 +1011,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_answer_that_is_not_http_fails_after_three_attempts() {
+        // base_url points at a port where something else listens.
+        let (url, task) = answering("SSH-2.0-OpenSSH_9.6\r\n".into()).await;
+        match gives_up(&url).await {
+            ModelError::Unavailable { attempts, last } => {
+                assert_eq!(attempts, 3);
+                assert!(last.contains("invalid HTTP") && last.contains("Check base_url"), "{last}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn a_different_failure_in_between_resets_the_count() {
         let eof = || Action::Eof { reply: Reply::text("abc"), chunks: 2 };
         let s = server(vec![
@@ -1005,11 +1070,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_marker_word_in_base_url_does_not_end_the_retries_of_a_refused_connection() {
+        // The send error's text carries the URL; "certificate" in it must not read as a TLS failure.
+        let s = server(vec![]).await;
+        s.shutdown().await;
+        let base = s.base_url().replacen("/v1", "/certificate/v1", 1);
+        let pacing = Pacing { window: Some(Duration::from_millis(300)), ..fast_pacing() };
+        let err = client_with(profile(&base), pacing).complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
+        match err {
+            ModelError::Unavailable { attempts, last } => {
+                assert!(attempts > 3, "{attempts}");
+                assert!(last.starts_with("cannot reach the server") && last.contains("/certificate/v1/"), "{last}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
     #[test]
     fn local_failures_are_told_apart_from_unreachable_servers() {
         assert!(is_local_failure(true, "builder error"));
         assert!(is_local_failure(false, "error trying to connect: invalid peer certificate: UnknownIssuer"));
         assert!(is_local_failure(false, "tls: received fatal alert: ProtocolVersion"));
+        assert!(is_local_failure(false, "client error (SendRequest): invalid HTTP version parsed"));
+        // A TCP-level proxy hangs up like this while its backend is down, so waiting can cure it.
+        assert!(!is_local_failure(false, "client error (Connect): tls handshake eof"));
         // rustls' wording for the other handshake failures that are not about reaching the server.
         for text in [
             "peer sent no certificates",
@@ -1041,12 +1126,20 @@ mod tests {
 
     /// Answers every request with a 307 to `location`.
     async fn redirector(location: String) -> (String, tokio::task::JoinHandle<()>) {
+        answering(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ))
+        .await
+    }
+
+    /// Reads each request whole, answers it with `reply` byte for byte and closes the connection.
+    async fn answering(reply: String) -> (String, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", l.local_addr().unwrap());
         let task = tokio::spawn(async move {
             while let Ok((mut sock, _)) = l.accept().await {
-                let location = location.clone();
+                let reply = reply.clone();
                 tokio::spawn(async move {
                     // Read the whole request so the client is not reset while still sending.
                     let mut buf = Vec::new();
@@ -1067,9 +1160,6 @@ mod tests {
                             break;
                         }
                     }
-                    let reply = format!(
-                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    );
                     let _ = sock.write_all(reply.as_bytes()).await;
                 });
             }
@@ -1427,6 +1517,11 @@ mod tests {
         let done = c.clone().complete(&req("x"), None, &CancellationToken::new()).await.unwrap();
         assert_eq!((done.text.as_str(), done.attempts), ("again", 1));
         assert_eq!(models_sent(&s), ["mock", "the-served-name", "the-served-name"]);
+        // The id found this way counts as discovered: a later change of model is not followed.
+        s.set_model("yet-another", Some(32768));
+        let err = c.complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
+        assert!(matches!(err, ModelError::Rejected { status: 404, ref message } if message.contains("'yet-another'")), "{err:?}");
+        assert_eq!(models_sent(&s).len(), 4);
     }
 
     #[tokio::test]
@@ -1447,17 +1542,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_server_relaunched_with_another_model_is_followed() {
+    async fn a_server_relaunched_with_another_model_is_not_followed() {
         let s = server(vec![Reply::text("one").into(), Reply::text("two").into()]).await;
         s.set_model("first", Some(32768));
         let c = client(&s.base_url());
         assert_eq!(c.discover().await.unwrap().served_model, "first");
         c.complete(&req("x"), None, &CancellationToken::new()).await.unwrap();
-        // The relaunched server serves the configured name; the remembered id is stale.
+        // The relaunched server serves another id (here the configured name); the session began with "first".
         s.set_model("mock", Some(32768));
+        let (tx, mut rx) = unbounded_channel();
+        let err = c.complete(&req("x"), Some(&tx), &CancellationToken::new()).await.unwrap_err();
+        match err {
+            ModelError::Rejected { status: 404, message } => {
+                assert!(message.contains("no longer serves 'first'") && message.contains("now serves 'mock'"), "{message}");
+                assert!(message.contains("restart the loom daemon"), "{message}");
+                // What the server itself said is kept.
+                assert!(message.ends_with("The server said: The model `first` does not exist."), "{message}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(!drain(&mut rx).iter().any(|e| matches!(e, StreamEvent::Retrying { .. })));
+        // Nothing went out with the new id, and the next request, of a clone too, does not switch either.
+        assert_eq!(models_sent(&s), ["first", "first"]);
+        assert!(matches!(
+            c.clone().complete(&req("x"), None, &CancellationToken::new()).await,
+            Err(ModelError::Rejected { status: 404, .. })
+        ));
+        assert_eq!(models_sent(&s), ["first", "first", "first"]);
+        // With the old model back the session carries on.
+        s.set_model("first", Some(32768));
         let done = c.complete(&req("x"), None, &CancellationToken::new()).await.unwrap();
-        assert_eq!((done.text.as_str(), done.attempts), ("two", 2));
-        assert_eq!(models_sent(&s), ["first", "first", "mock"]);
+        assert_eq!((done.text.as_str(), done.attempts), ("two", 1));
     }
 
     #[tokio::test]
