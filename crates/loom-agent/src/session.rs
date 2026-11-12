@@ -60,7 +60,11 @@
 //! ## `run`
 //! 1. If the session has ended (`session_end` in the log): return `End::Closed`. Otherwise record,
 //!    as arrivals, the operator inputs left in the session's `queued/` directory (see
-//!    [`queue_input`]), oldest first.
+//!    [`queue_input`]), oldest first. A `{stem}.{seq}.taking` file was being recorded when the
+//!    harness stopped: when the record at `seq` is an operator's (author `User`) `ledger` record or
+//!    `Constraint`/`Approval` note, the recording reached the log and the file is only deleted;
+//!    otherwise it is recorded like the others. Each input is so recorded once, except when the
+//!    harness stops between the ledger entry and its `ledger` record in the log.
 //! 2. If the session is a child (`deps.shared.is_child()`) and has no own `turn_start` yet: run a
 //!    turn with `Trigger::Start`.
 //! 3. Loop: wait for the next of (an [`Input`], a `JobEvent` from `deps.job_events`). Handle it as
@@ -94,9 +98,9 @@
 //! - `Input::Withdraw{id, reason}`: `shared.ledger_append(true, ConstraintRetire{id, reason})`; on
 //!   success append what it queued and `harness_note{Constraint, texts::constraint_withdrawn(id,
 //!   reason)}` with author `User`; on refusal (or without a journal) warn and append nothing.
-//! - `Input::Queued{file, input}`: when `file` still exists, `input` as above, then the file is
-//!   deleted; when it is gone the input was already recorded at the start of `run`, and nothing
-//!   happens.
+//! - `Input::Queued{file, input}`: rename `file` to `{stem}.{seq}.taking`, `seq` being the log's
+//!   next seq; then `input` as above, then delete the renamed file. When `file` is gone it was taken
+//!   already (at the start of `run`), and nothing happens.
 //! - `Input::ChildSettled(s)`: append `child_settled{child, outcome, report, full, usage, steps,
 //!   inline: false}`. Start a turn (`Trigger::ChildSettled`) only if the last turn ended `Waiting`
 //!   or `Yielded`.
@@ -256,23 +260,25 @@
 //! itself, `full` is `None` and `payload` is `Value::Null`.
 //!
 //! ## Re-weave procedure (`reason`: `target`, `overflow`, `operator`)
-//! `est` is the size of the next request as the server counts it, when it has counted one in this
+//! `est = estimator.tokens_for_messages(&w.messages)` plus the tokens of the tool specs' JSON.
+//! `size` is the size of the next request as the server counts it, when it has counted one in this
 //! epoch: with `m` the latest own-or-inherited step `model_request` of epoch `w.epoch` whose
-//! response reported `prompt_tokens > 0`, `est = m's prompt_tokens + estimator.tokens_for_messages(
-//! &w.messages[k..])`, where `k = m.n_messages`, or `m.n_messages − 1` when the message at that
-//! index has merged in a record written after `m` (its whole size then counts again). Before the
-//! first such response of an epoch, `est = estimator.tokens_for_messages(&w.messages)` plus the
-//! tokens of the tool specs' JSON. `window` is `deps.context_window`; for an `overflow` re-weave it
+//! response reported `prompt_tokens > 0` and `n = m.n_messages`, `size = m's prompt_tokens +
+//! estimator.tokens(Σ (item.chars + 2) over the items merged into w.messages[n − 1] from records
+//! after m) + estimator.tokens_for_messages(&w.messages[n..])`. Before the first such response of
+//! an epoch, `size = est`. `window` is `deps.context_window`; for an `overflow` re-weave it
 //! is the smaller of that and the limit the server's error stated (the estimate of the refused
 //! request when it stated none), so that a forced re-weave can be planned when the window is unknown
 //! or set too large. `limit` = `deps.context.target_tokens`, lowered (when there is a `window`) to
-//! `window − reserve` (`reserve` = the profile's `max_output_tokens` or 16_384, plus 4_096, but at
-//! most a quarter of `window`) and to four fifths of `window`; the floor used is `floor_tokens`
-//! lowered to half of `window`, and to half of `limit` when it is not below `limit`. For windows of
-//! 81_920 tokens and more the reserve is never cut, and for a 1M window the defaults (400k, 180k)
-//! are unchanged. Not forced and `est <= limit`: nothing to do.
-//! A plan is *enough* when its `after_tokens_est` is at or below the midpoint between the floor used
-//! and `limit`.
+//! `window − reserve` and to four fifths of `window`; the floor used is `floor_tokens` lowered to
+//! half of `window`, and to half of `limit` when it is not below `limit`. `reserve` is the profile's
+//! `max_output_tokens` plus `min(4_096, window / 4)`, or `min(20_480, window / 4)` without one (or
+//! with one that leaves no room in `window`): the reply asked for always fits, and a small window
+//! keeps a positive trigger. For windows of 81_920 tokens and more the reserve is never cut, and for
+//! a 1M window the defaults (400k, 180k) are unchanged. Not forced and `size <= limit`: nothing to
+//! do. The plan counts in the estimator's units: it is made with the floor used × `est / size`, and
+//! is *enough* when its `after_tokens_est` is at or below the midpoint between the floor used and
+//! `limit`, × `est / size`.
 //! 1. `plan = w.plan(records, estimator, &policy, false)` (`plan_reweave` on the step's weave) with
 //!    `policy = deps.context`. While
 //!    the plan is not enough and `policy.keep_recent_steps` is above `MIN_KEEP_RECENT_STEPS`, halve
@@ -293,7 +299,8 @@
 //!    the digest an addition to it.
 //! 3. No plan: return without a record. Otherwise append `reweave{epoch: current + 1, upto_seq,
 //!    evictions, brief: texts::reweave_brief(<ledger.brief(default) or "">), digest, reason,
-//!    before_tokens: plan.before_tokens_est, after_tokens_est}`.
+//!    before_tokens: size, after_tokens_est: size − (plan.before_tokens_est − plan.after_tokens_est)
+//!    × size / est}`.
 //!
 //! Why a re-weave must be worth it: every re-weave starts a new epoch, and the server's cache of
 //! the conversation is lost with the old one. A re-weave that frees little is needed again one step
@@ -449,19 +456,41 @@ pub fn queue_input(paths: &Paths, session: &SessionId, input: Input) -> Result<I
 
 /// Write `kept` durably as the next file of `dir`; file names sort in the order they were written.
 fn write_kept(dir: &Path, kept: &KeptInput) -> std::io::Result<PathBuf> {
-    use std::io::Write;
+    fn write_synced(dir: &Path, tmp: &Path, path: &Path, kept: &KeptInput) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(tmp)?;
+        file.write_all(&serde_json::to_vec(kept).map_err(std::io::Error::other)?)?;
+        file.sync_all()?;
+        std::fs::rename(tmp, path)?;
+        std::fs::File::open(dir)?.sync_all()
+    }
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     std::fs::create_dir_all(dir)?;
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = format!("{:016}-{n:010}.json", now_ms());
     let path = dir.join(&name);
     let tmp = dir.join(format!(".{name}.tmp"));
-    let mut file = std::fs::File::create(&tmp)?;
-    file.write_all(&serde_json::to_vec(kept).map_err(std::io::Error::other)?)?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, &path)?;
-    std::fs::File::open(dir)?.sync_all()?;
+    if let Err(e) = write_synced(dir, &tmp, &path, kept) {
+        // The operator is told to send it again, so it must not be recorded later as well.
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
     Ok(path)
+}
+
+/// The name a kept input's `file` takes while the session records it: `{stem}.{seq}.taking`, where
+/// `seq` is the seq the first record of the recording gets.
+fn taking_path(file: &Path, seq: Seq) -> PathBuf {
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = name.split('.').next().unwrap_or_default();
+    file.with_file_name(format!("{stem}.{seq}.taking"))
+}
+
+/// The seq a name made by [`taking_path`] carries.
+fn taking_seq(file: &Path) -> Option<Seq> {
+    let name = file.file_name()?.to_str()?.strip_suffix(".taking")?;
+    name.rsplit_once('.')?.1.parse().ok()
 }
 
 /// Receives everything a session produces, as it happens. Calls must return quickly.
@@ -764,13 +793,20 @@ fn tools_chars(tools: &[ToolSpec]) -> usize {
 }
 
 /// The trigger and the floor of a re-weave (see the module contract): `policy`'s, lowered for a
-/// known `window` so that a request at the trigger leaves room for the reply. That room
-/// (`max_output` or 16_384, plus 4_096) is at most a quarter of the window, so that a small window
-/// keeps a positive trigger and floor; from a window of 81_920 tokens up it is never cut.
+/// known `window` so that a request at the trigger leaves room for the reply. That room is
+/// `max_output` plus 4_096, or 20_480 without one. What the harness chooses itself (the 4_096, the
+/// 20_480) is at most a quarter of the window, so that a small window keeps a positive trigger and
+/// floor; a configured `max_output` is never cut, since every request asks for that much. One the
+/// window cannot hold with its 4_096 cannot be honoured, and counts as none. From a window of
+/// 81_920 tokens up nothing is cut.
 fn reweave_bounds(policy: &ReweavePolicy, window: Option<u64>, max_output: Option<u64>) -> (u64, u64) {
     let (mut limit, mut floor) = (policy.target_tokens, policy.floor_tokens);
     if let Some(window) = window {
-        let reserve = max_output.unwrap_or(16_384).saturating_add(4_096).min(window / 4);
+        let slack = 4_096_u64.min(window / 4);
+        let reserve = match max_output.map(|m| m.saturating_add(slack)) {
+            Some(reserve) if reserve < window => reserve,
+            _ => 20_480_u64.min(window / 4),
+        };
         // The trigger stays within four fifths of the window and the floor within half of it, so
         // that a small window can always be planned for.
         limit = limit.min(window.saturating_sub(reserve)).min(window / 5 * 4);
@@ -780,6 +816,13 @@ fn reweave_bounds(policy: &ReweavePolicy, window: Option<u64>, max_output: Optio
         }
     }
     (limit, floor)
+}
+
+/// `x × num / den`: a token count carried from units where a request measures `den` into units where
+/// it measures `num`.
+fn scaled(x: u64, num: u64, den: u64) -> u64 {
+    let v = u128::from(x).saturating_mul(u128::from(num)) / u128::from(den.max(1));
+    u64::try_from(v).unwrap_or(u64::MAX)
 }
 
 /// The lines of running jobs' output files, counted on from where the previous count stopped, so
@@ -1236,19 +1279,27 @@ impl Session {
     }
 
     /// The operator inputs left on disk by a harness that stopped before this session recorded them
-    /// (see [`queue_input`]), in the order they were handed over. A file that cannot be read is left
-    /// where it is.
+    /// (see [`queue_input`]), in the order they were handed over. A file left while it was being
+    /// recorded is deleted instead when its recording reached the log (see [`Session::recorded_from`]).
+    /// A file that cannot be read is left where it is.
     fn kept_inputs(&self) -> Vec<Input> {
         let dir = queue_dir(&self.deps.paths, &self.deps.shared.session);
         let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
         let mut files: Vec<PathBuf> = entries
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .filter(|p| p.extension().is_some_and(|x| x == "json" || x == "taking"))
             .collect();
+        // `{stem}.json` and `{stem}.{seq}.taking` sort by their stems, which sort by time.
         files.sort();
         files
             .into_iter()
             .filter_map(|file| {
+                if taking_seq(&file).is_some_and(|seq| self.recorded_from(seq)) {
+                    if let Err(e) = std::fs::remove_file(&file) {
+                        tracing::warn!(session = %self.deps.shared.session, "queued input {} not deleted: {e}", file.display());
+                    }
+                    return None;
+                }
                 let kept = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<KeptInput>(&b).ok());
                 if kept.is_none() {
                     tracing::warn!(session = %self.deps.shared.session, "unreadable queued input {}", file.display());
@@ -1258,17 +1309,39 @@ impl Session {
             .collect()
     }
 
+    /// Whether the record at `seq` begins an operator input's recording: the operator's ledger entry
+    /// or note, which [`Session::record_input`] appends first. A file renamed for recording names
+    /// that seq ([`taking_path`]), and nothing else writes such a record there after the rename.
+    fn recorded_from(&self, seq: Seq) -> bool {
+        let at = self.records.binary_search_by_key(&seq, |r| r.seq).ok().and_then(|i| self.records.get(i));
+        at.is_some_and(|r| {
+            r.author == Author::User
+                && matches!(
+                    r.event,
+                    Event::Ledger { .. } | Event::HarnessNote { note: NoteKind::Constraint | NoteKind::Approval, .. }
+                )
+        })
+    }
+
     /// Record an input that is not a command. Whether it starts a turn is the caller's business. An
-    /// input kept on disk is recorded as the input it holds, unless its file is gone (it was recorded
-    /// when the session started), and its file is then deleted.
+    /// input kept on disk is recorded as the input it holds, unless its file is gone (it was taken
+    /// already, e.g. when the session started). Its file is first renamed to name the seq where its
+    /// records start ([`taking_path`]), and deleted once it is recorded, so that a harness that stops
+    /// in between records it once: see [`Session::kept_inputs`].
     async fn arrival(&mut self, input: Input) -> R<Arrival> {
         let Input::Queued { file, input } = input else { return self.record_input(input).await };
-        if !file.exists() {
-            return Ok(Arrival::default());
-        }
+        let marker = taking_path(&file, self.log.next_seq());
+        let held = match std::fs::rename(&file, &marker) {
+            Ok(()) => marker,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Arrival::default()),
+            Err(e) => {
+                tracing::warn!(session = %self.deps.shared.session, "queued input {} not marked: {e}", file.display());
+                file
+            }
+        };
         let out = self.record_input(*input).await?;
-        if let Err(e) = std::fs::remove_file(&file) {
-            tracing::warn!(session = %self.deps.shared.session, "queued input {} not deleted: {e}", file.display());
+        if let Err(e) = std::fs::remove_file(&held) {
+            tracing::warn!(session = %self.deps.shared.session, "queued input {} not deleted: {e}", held.display());
         }
         Ok(out)
     }
@@ -1914,19 +1987,22 @@ impl Session {
             .saturating_add(self.estimator.tokens(tools_chars(&w.tools)))
     }
 
-    /// Size of the request the session would send now with `w`, in tokens, for the re-weave check.
-    /// When a request of the current epoch has been answered with a prompt size, that is the size
-    /// the server counted for the latest such request plus the estimate of the messages `w` has
-    /// beyond the `n_messages` it carried (from its last one on, whole, when text has been merged
-    /// into that one since). Otherwise [`Session::estimate`].
-    fn prompt_size(&self, w: &Weave) -> u64 {
-        let Some(m) = self.st.measured.as_ref().filter(|m| m.epoch == w.epoch) else { return self.estimate(w) };
+    /// Size of the request the session would send now with `w`, in tokens, as the server counts it:
+    /// the size it counted for the latest request of this epoch it answered with one, plus the
+    /// estimate of what `w` has beyond the `n_messages` that request carried — the items merged into
+    /// its last message since (with the blank line joining each), and the messages after it. `None`
+    /// before the first such answer of the epoch.
+    fn measured_size(&self, w: &Weave) -> Option<u64> {
+        let m = self.st.measured.as_ref().filter(|m| m.epoch == w.epoch)?;
         let n = usize::try_from(m.n_messages).unwrap_or(usize::MAX);
-        let last = n.checked_sub(1).and_then(|i| w.messages.get(i));
-        let grown = last.is_some_and(|last| last.origin.iter().any(|s| *s > m.seq));
-        let from = if grown { n.saturating_sub(1) } else { n };
-        let added = self.estimator.tokens_for_messages(w.messages.get(from..).unwrap_or_default());
-        m.prompt_tokens.saturating_add(added)
+        let merged = n.checked_sub(1).and_then(|i| w.messages.get(i)).map_or(0, |last| {
+            let item = |seq: Seq| w.items.binary_search_by_key(&seq, |i| i.seq).ok().and_then(|i| w.items.get(i));
+            let since = last.origin.iter().filter(|s| **s > m.seq);
+            since.fold(0usize, |sum, s| sum.saturating_add(item(*s).map_or(0, |i| i.chars)).saturating_add(2))
+        });
+        let added = self.estimator.tokens(merged);
+        let after = self.estimator.tokens_for_messages(w.messages.get(n..).unwrap_or_default());
+        Some(m.prompt_tokens.saturating_add(added).saturating_add(after))
     }
 
     /// Fold older material out of view when the request has grown past the limit (or `forced`).
@@ -1946,11 +2022,14 @@ impl Session {
         };
         let mut policy = self.deps.context.clone();
         let (limit, floor) = reweave_bounds(&policy, window, self.deps.client.profile().max_output_tokens);
-        policy.floor_tokens = floor;
-        if !forced && self.prompt_size(&woven.weave) <= limit {
+        let est = self.estimate(&woven.weave);
+        let size = self.measured_size(&woven.weave).unwrap_or(est);
+        if !forced && size <= limit {
             return Ok(false);
         }
-        let midpoint = policy.floor_tokens.saturating_add(limit) / 2;
+        // The plan counts in the estimator's units, the check in the server's when it has counted.
+        policy.floor_tokens = scaled(floor, est, size);
+        let midpoint = scaled(floor.saturating_add(limit) / 2, est, size);
         let enough = |p: &Option<loom_core::weave::ReweavePlan>| p.as_ref().is_some_and(|p| p.after_tokens_est <= midpoint);
         let mut plan = woven.plan(&self.records, &self.estimator, &policy, false);
         while !enough(&plan) && policy.keep_recent_steps > MIN_KEEP_RECENT_STEPS {
@@ -1976,6 +2055,7 @@ impl Session {
             }
         }
         let Some(plan) = plan else { return Ok(false) };
+        let freed = scaled(plan.before_tokens_est.saturating_sub(plan.after_tokens_est), size, est);
         let ledger_brief = if self.deps.shared.journal.is_some() {
             self.deps.shared.ledger().map(|l| l.brief(&BriefOpts::default())).unwrap_or_default()
         } else {
@@ -1990,8 +2070,8 @@ impl Session {
                 brief: texts::reweave_brief(&ledger_brief),
                 digest,
                 reason: reason.to_string(),
-                before_tokens: plan.before_tokens_est,
-                after_tokens_est: plan.after_tokens_est,
+                before_tokens: size,
+                after_tokens_est: size.saturating_sub(freed),
             }),
         )?;
         self.publish();
@@ -3696,6 +3776,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_rule_left_on_disk_while_it_was_being_recorded_is_recorded_once() {
+        let mut fx = Fx::new("lead", false, true, seq(vec![])).await;
+        let mut session = fx.create();
+        let id = SessionId::from("s-test");
+        let queue = queue_dir(&fx.paths, &id);
+        let take = |session: &Session, input: Input| {
+            let Input::Queued { file, .. } = queue_input(&fx.paths, &id, input).unwrap() else { panic!("kept") };
+            let marker = taking_path(&file, session.log.next_seq());
+            std::fs::rename(&file, &marker).unwrap();
+            marker
+        };
+        // The harness stopped after recording this rule and before deleting its file ...
+        let rule = take(&session, Input::Constraint("never push to main".into()));
+        session.record_input(Input::Constraint("never push to main".into())).await.unwrap();
+        // ... and before recording this approval, after something else took the seq it named.
+        let approval = Input::Approval { text: "you may restart staging".into(), scope: "staging".into() };
+        let pending = take(&session, approval);
+        session.note(Author::Harness, NoteKind::Info, "the harness went down".into()).unwrap();
+        assert_eq!(taking_seq(&rule), Some(taking_seq(&pending).unwrap() - 2));
+        drop(session);
+        let (tx, task) = spawn_run(Session::open(fx.deps()).unwrap());
+        wait_until(&fx.sink, "the approval", |rs| notes(rs, NoteKind::Approval).len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let rs = fx.sink.records();
+        assert_eq!(notes(&rs, NoteKind::Constraint).len(), 1, "{:?}", kinds(&rs));
+        let ledger = fx.shared.ledger().unwrap();
+        assert_eq!((ledger.constraints.len(), ledger.approvals.len()), (1, 1));
+        assert_eq!(std::fs::read_dir(&queue).unwrap().count(), 0, "nothing is left on disk");
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
     async fn child_settled_agent_message_resume_and_stop_inputs() {
         let script = seq(vec![Reply::text("a").into(), Reply::text("b").into()]);
         let mut fx = Fx::new("chat", false, false, script).await;
@@ -3780,24 +3892,143 @@ mod tests {
 
     #[tokio::test]
     async fn the_reweave_check_uses_the_prompt_size_the_server_reported() {
-        // The server counts far more tokens than the estimator can be calibrated to (its ratio has a
-        // floor), so the estimate alone never reaches the target.
-        let usage = Usage { prompt_tokens: 100_000, completion_tokens: 10, ..Usage::default() };
-        let big = || Action::from(bash(BIG).with_usage(usage));
-        let script = seq(vec![big(), big(), big(), Reply::text("ok").with_usage(usage).into()]);
+        // The server counts a token per character of the request, more than the estimator can be
+        // calibrated to (it counts at least 1.5 characters a token), so the estimate trails it.
+        let mut answered = 0;
+        let script = Script::new(move |body, _| {
+            let counted = body["messages"].to_string().len() + body["tools"].to_string().len();
+            let usage = Usage { prompt_tokens: counted as u64, completion_tokens: 10, ..Usage::default() };
+            answered += 1;
+            let reply = if answered <= 8 { bash(BIG) } else { Reply::text("ok") };
+            reply.with_usage(usage).into()
+        });
         let mut fx = Fx::new("chat", false, false, script).await;
-        fx.context = ReweavePolicy { target_tokens: 70_000, floor_tokens: 10_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let target = 150_000;
+        fx.context = ReweavePolicy { target_tokens: target, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
-        let rs = fx.sink.records();
+        let rs = read_records(&fx.log_path()).unwrap().records;
         let rw = reweave_records(&rs);
         assert!(!rw.is_empty(), "{:?}", kinds(&rs));
         assert_eq!(rw[0].reason, "target");
-        assert!(rw[0].before_tokens < 70_000, "the estimate was below the target: {}", rw[0].before_tokens);
-        // Not before a response of the epoch reported a size and the window had grown past it.
+        // Started by the size the server counted ...
+        assert!(rw[0].before_tokens > target, "{}", rw[0].before_tokens);
+        assert!(rw[0].after_tokens_est < rw[0].before_tokens);
+        // ... where the estimate, tool specs included, had not reached the target yet.
         let first = rs.iter().position(|r| matches!(r.event, Event::Reweave(_))).unwrap();
-        assert!(rs[..first].iter().filter(|r| matches!(r.event, Event::ModelResponse(_))).count() >= 2);
+        let w = weave(&rs[..first]);
+        let most = TokenEstimator::with_ratio(1.5);
+        let estimate = most.tokens_for_messages(&w.messages) + most.tokens(tools_chars(&w.tools));
+        assert!(estimate < target, "{estimate}");
         assert_no_cache_break(&rs);
+    }
+
+    #[tokio::test]
+    async fn the_measured_size_counts_only_what_was_merged_into_the_last_message_since() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("first").into()])).await;
+        let mut session = fx.create();
+        // A long paste, which the server has counted already.
+        session.append(Author::User, Event::UserMessage { text: "u ".repeat(10_000) }).unwrap();
+        let w = session.woven().weave;
+        let n = w.messages.len();
+        let request = ModelRequest {
+            req_id: "r-1".into(),
+            step: 1,
+            epoch: 0,
+            purpose: Purpose::Step,
+            n_messages: to_u32(n),
+            stable_hash: stable_hash(&w.messages),
+            hud: None,
+            est_tokens: 0,
+        };
+        session.append(Author::Harness, Event::ModelRequest(request)).unwrap();
+        // Cut off before any text: nothing renders, so later notes merge into the last user message.
+        let reply = ModelResponse {
+            req_id: "r-1".into(),
+            text: String::new(),
+            reasoning: "x".repeat(5_000),
+            tool_calls: Vec::new(),
+            finish: FinishReason::Length,
+            usage: Usage { prompt_tokens: 50_000, ..Usage::default() },
+            timing: Timing::default(),
+            attempts: 1,
+        };
+        session.append(Author::Model, Event::ModelResponse(reply)).unwrap();
+        let w = session.woven().weave;
+        assert_eq!(session.measured_size(&w), Some(50_000), "nothing new");
+        let note = "n".repeat(3_000);
+        session.note(Author::Harness, NoteKind::OutputCut, note.clone()).unwrap();
+        let w = session.woven().weave;
+        assert_eq!(w.messages.len(), n, "merged into the last message the request carried");
+        let item = w.items.last().unwrap().chars;
+        assert!(item > note.len());
+        // The server's count plus the note and the blank line before it, not the whole message again.
+        let added = session.estimator.tokens(item + 2);
+        assert_eq!(session.measured_size(&w), Some(50_000 + added));
+        assert!(session.estimator.tokens(w.messages[n - 1].chars()) > added + 4_000);
+        // Another epoch has not been counted yet.
+        let mut later = w.clone();
+        later.epoch = 1;
+        assert_eq!(session.measured_size(&later), None);
+    }
+
+    #[tokio::test]
+    async fn a_re_weave_the_servers_count_starts_is_planned_and_recorded_in_its_units() {
+        fn answered(session: &mut Session, req_id: &str, text: &str, prompt_tokens: u64) {
+            let w = weave(session.records());
+            let request = ModelRequest {
+                req_id: req_id.into(),
+                step: 1,
+                epoch: 0,
+                purpose: Purpose::Step,
+                n_messages: to_u32(w.messages.len()),
+                stable_hash: stable_hash(&w.messages),
+                hud: None,
+                est_tokens: 0,
+            };
+            session.append(Author::Harness, Event::ModelRequest(request)).unwrap();
+            let reply = ModelResponse {
+                req_id: req_id.into(),
+                text: text.into(),
+                reasoning: String::new(),
+                tool_calls: Vec::new(),
+                finish: FinishReason::Stop,
+                usage: Usage { prompt_tokens, ..Usage::default() },
+                timing: Timing::default(),
+                attempts: 1,
+            };
+            session.append(Author::Model, Event::ModelResponse(reply)).unwrap();
+        }
+        let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
+        fx.context = ReweavePolicy { target_tokens: 400_000, floor_tokens: 300_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let mut session = fx.create();
+        let kid = SessionId::from("s-kid");
+        let report = |text: &str| {
+            let report = text.repeat(30_000);
+            let usage = Usage::default();
+            let settled = ChildSettled { child: kid.clone(), outcome: ChildOutcome::Returned, report, full: None, usage, steps: 1, inline: false };
+            Event::ChildSettled(settled)
+        };
+        session.append(Author::User, Event::UserMessage { text: "go".into() }).unwrap();
+        answered(&mut session, "r-1", "a", 10_000);
+        session.append(Author::Agent(kid.clone()), report("first ")).unwrap();
+        answered(&mut session, "r-2", "b", 500_000);
+        session.append(Author::Agent(kid.clone()), report("second")).unwrap();
+        answered(&mut session, "r-3", "c", 1_000_000);
+        let woven = session.woven();
+        // Counted by the estimator, the log is below the floor: a plan in its units folds nothing ...
+        let est = session.estimate(&woven.weave);
+        assert!(est < 300_000);
+        assert!(woven.plan(session.records(), &session.estimator, &fx.context, true).is_none());
+        // ... while the server counts it far above the target, and the plan is made for that.
+        let size = session.measured_size(&woven.weave).unwrap();
+        assert!(size > 1_000_000);
+        assert!(session.reweave(&woven, "target", false, &CancellationToken::new(), None).await.unwrap());
+        let rw = reweave_records(session.records());
+        assert_eq!(rw.len(), 1);
+        assert_eq!(rw[0].evictions.len(), 2, "both reports are folded");
+        assert_eq!(rw[0].before_tokens, size, "the size that started it");
+        assert!(rw[0].after_tokens_est < 400_000, "{}", rw[0].after_tokens_est);
     }
 
     #[tokio::test]
@@ -3948,7 +4179,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_small_window_re_weaves_instead_of_failing_when_it_overflows() {
+    async fn a_small_window_is_folded_at_its_trigger_before_the_server_refuses_it() {
         let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
         fx.server.set_model("mock", Some(32_000));
         fx.window = Some(32_000);
@@ -3967,21 +4198,53 @@ mod tests {
         assert!(inbox(&rs).is_empty());
     }
 
+    #[tokio::test]
+    async fn a_small_window_re_weaves_instead_of_failing_when_it_overflows() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
+        // The session is told twice the window the server enforces, so the server refuses first.
+        fx.server.set_model("mock", Some(32_000));
+        fx.window = Some(64_000);
+        // The configured floor (180k) is far above both windows.
+        fx.context = ReweavePolicy { target_tokens: 400_000, floor_tokens: 180_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let rw = reweave_records(&rs);
+        assert!(!rw.is_empty(), "{:?}", kinds(&rs));
+        assert!(rw.iter().all(|w| w.reason == "overflow"), "{rw:?}");
+        assert!(count(&rs, "model_request") > count(&rs, "model_response"), "a request was refused");
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+        assert!(inbox(&rs).is_empty());
+    }
+
     #[test]
     fn the_reply_reserve_is_at_most_a_quarter_of_the_window() {
         let policy = ReweavePolicy::default();
         // 16k: 4k are kept for the reply, so the trigger and the floor stay positive.
         assert_eq!(reweave_bounds(&policy, Some(16_000), None), (12_000, 8_000));
+        // A configured reply length is honoured whole; only the slack after it shrinks.
+        assert_eq!(reweave_bounds(&policy, Some(16_000), Some(4_000)), (8_000, 4_000));
+        // One the window cannot hold is no reply length the session can honour: it counts as none,
+        // not as a trigger of 0 that would re-weave at every step.
         assert_eq!(reweave_bounds(&policy, Some(16_000), Some(32_768)), (12_000, 8_000));
-        // From 81_920 tokens up the whole reserve (16_384 + 4_096) is kept, as it always was.
-        let whole = |w: u64| {
-            let limit = 400_000u64.min(w - 20_480).min(w / 5 * 4);
+        assert_eq!(reweave_bounds(&policy, Some(16_000), Some(14_000)), (12_000, 8_000));
+        // A request at the trigger leaves room for the reply it asks for, and the 4_096 after it.
+        let (limit, floor) = reweave_bounds(&policy, Some(65_536), Some(32_768));
+        assert_eq!((limit, floor), (28_672, 14_336));
+        assert!(limit + 32_768 + 4_096 <= 65_536);
+        // From 81_920 tokens up the whole reserve (the reply or 16_384, plus 4_096) is kept, as it
+        // always was.
+        let whole = |w: u64, reply: u64| {
+            let limit = 400_000u64.min(w - reply - 4_096).min(w / 5 * 4);
             let floor = 180_000u64.min(w / 2);
             (limit, if floor >= limit { limit / 2 } else { floor })
         };
         for w in [81_920, 82_000, 131_072, 200_000, 1_000_000] {
-            assert_eq!(reweave_bounds(&policy, Some(w), None), whole(w), "window {w}");
+            assert_eq!(reweave_bounds(&policy, Some(w), None), whole(w, 16_384), "window {w}");
+            assert_eq!(reweave_bounds(&policy, Some(w), Some(32_768)), whole(w, 32_768), "window {w}");
         }
+        assert_eq!(reweave_bounds(&policy, Some(131_072), Some(32_768)), (94_208, 65_536));
+        assert_eq!(reweave_bounds(&policy, Some(82_000), Some(32_768)).0, 45_136);
         assert_eq!(reweave_bounds(&policy, Some(1_000_000), None), (400_000, 180_000));
         assert_eq!(reweave_bounds(&policy, None, None), (400_000, 180_000));
         // Below it the reserve shrinks with the window instead of swallowing it.
