@@ -50,7 +50,7 @@
 //! an unknown handle, an output with no producer); `evidence` kind by producer class; a session
 //! without a mission gets `NO_MISSION` from every tool.
 
-use super::{Shared, NO_MISSION};
+use super::{Shared, NAMES, NO_MISSION};
 use crate::gate::{check_quotes, Quote};
 use async_trait::async_trait;
 use loom_core::event::{ToolClass, ToolSpec};
@@ -301,7 +301,7 @@ impl Tool for Evidence {
         let note = str_arg(args, "note").unwrap_or("").trim().to_string();
         let supports = args.get("supports").and_then(Value::as_bool).unwrap_or(true);
 
-        let q = Quote { handle: handle.clone(), start, end, text: quote.clone() };
+        let q = Quote { handle: handle.clone(), start, end, text: quote };
         let verified = match check_quotes(&ctx.blobs, &[q]) {
             Ok(v) => v,
             Err(text) => return ToolOutput::error(format!("{text}\nNothing was attached.")),
@@ -316,9 +316,11 @@ impl Tool for Evidence {
                 "{handle} was not produced by a tool call of this mission, so it cannot be used as evidence. Evidence is a quote from the output of a command you ran or a file you read."
             ));
         };
-        if matches!(producer.class, ToolClass::State | ToolClass::Terminal) {
+        // Only observations are evidence. Every runtime tool (the ledger rendered back, a log search, an
+        // agent's report, ...) returns words of the model, the harness or another agent.
+        if matches!(producer.class, ToolClass::State | ToolClass::Terminal) || NAMES.contains(&producer.tool.as_str()) {
             return ToolOutput::error(format!(
-                "{handle} is the result of `{}`, which is a message from the harness or from another agent, not an observation. Quote the output of the command or file read that shows it (an agent's report names the handles).",
+                "{handle} is the result of `{}`, which is a message from the harness or from another agent, or your own words played back, not an observation. Quote the output of the command or file read that shows it instead (an agent's report names the handles).",
                 producer.tool
             ));
         }
@@ -331,7 +333,7 @@ impl Tool for Evidence {
             call_id: producer.call_id.clone(),
             blob: Some(v.blob.clone()),
             lines: Some((v.start, v.end)),
-            quote: Some(quote),
+            quote: Some(v.text),
             note,
             attested: true,
         };
@@ -557,7 +559,7 @@ mod tests {
         let t = refused(
             &rig,
             "evidence",
-            json!({"claim": "c1", "handle": blob.handle(), "start": 1, "end": 1, "quote": "orphan", "note": "n"}),
+            json!({"claim": "c1", "handle": blob.handle(), "start": 1, "end": 1, "quote": "orphan text", "note": "n"}),
         )
         .await;
         assert!(t.contains("was not produced by a tool call of this mission"), "{t}");
@@ -567,7 +569,7 @@ mod tests {
             let t = refused(
                 &rig,
                 "evidence",
-                json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "quote": "report", "note": "n"}),
+                json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "quote": format!("report from {tool}"), "note": "n"}),
             )
             .await;
             assert!(t.contains(&format!("is the result of `{tool}`")), "{t}");
@@ -577,11 +579,183 @@ mod tests {
         let t = refused(
             &rig,
             "evidence",
-            json!({"claim": "c9", "handle": h, "start": 1, "end": 1, "quote": "hello", "note": "n"}),
+            json!({"claim": "c9", "handle": h, "start": 1, "end": 1, "quote": "hello world", "note": "n"}),
         )
         .await;
         assert!(t.contains("c1"), "{t}");
         assert!(rig.shared.take_emitted().len() == 1, "only the claim was recorded");
+    }
+
+    /// The 1-based line of `blob` holding `needle`.
+    fn line_of(rig: &Rig, blob: &loom_core::BlobRef, needle: &str) -> u64 {
+        let text = String::from_utf8(rig.env.ctx.blobs.read_all(&blob.id).unwrap()).unwrap();
+        let at = text.lines().position(|l| l.contains(needle)).expect("needle in output");
+        at as u64 + 1
+    }
+
+    #[tokio::test]
+    async fn the_models_own_words_are_not_evidence() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "All 212 tests pass"})).await;
+        let quote = "All 212 tests pass";
+
+        // The ledger rendered back, directly and through a view of it.
+        let r = rig.call("ledger", json!({})).await;
+        let blob = r.output.clone().unwrap();
+        let n = line_of(&rig, &blob, quote);
+        let h = blob.handle();
+        let args = json!({"claim": "c1", "handle": h, "start": n, "end": n, "quote": quote, "note": "n"});
+        let t = refused(&rig, "evidence", args.clone()).await;
+        assert!(t.contains("is the result of `ledger`") && t.contains("not an observation"), "{t}");
+        let view = rig.call("out_read", json!({"handle": h})).await;
+        assert!(view.text.contains(quote), "{}", view.text);
+        let t = refused(&rig, "evidence", args).await;
+        assert!(t.contains("is the result of `ledger`"), "{t}");
+
+        // A search of the session log finds the model's words and the claim's.
+        let mut log = loom_core::log::SessionLog::create(&rig.shared.log_path, loom_core::log::Durability::Batch).unwrap();
+        let said: loom_core::event::Event = serde_json::from_value(json!({
+            "kind": "model_response", "req_id": "r1", "text": quote, "reasoning": "", "finish": "stop"
+        }))
+        .unwrap();
+        log.append(loom_core::event::Author::Model, said).unwrap();
+        let r = rig.call("log_search", json!({"pattern": "212"})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        let blob = r.output.clone().unwrap();
+        let n = line_of(&rig, &blob, "you: All 212");
+        let h = blob.handle();
+        let t = refused(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": h, "start": n, "end": n, "quote": quote, "note": "n"}),
+        )
+        .await;
+        assert!(t.contains("is the result of `log_search`"), "{t}");
+        assert!(rig.shared.ledger().unwrap().evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_view_of_a_command_output_is_evidence_of_that_command() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let h = rig.output("running 212 tests\ntest result: ok. 212 passed\n", "bash", ToolClass::Exec);
+        let view = rig.call("out_read", json!({"handle": h})).await;
+        assert_eq!(view.status, ToolStatus::Ok, "{}", view.text);
+        let t = ok(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": h, "start": 2, "end": 2, "quote": "2\ttest result: ok. 212 passed", "note": "n"}),
+        )
+        .await;
+        assert!(t.contains("execution: bash call in s-test"), "{t}");
+        let state = rig.shared.ledger().unwrap();
+        let e = &state.evidence[0].input;
+        assert_eq!(e.kind, loom_core::ledger::EvidenceKind::Execution);
+        assert_eq!(e.quote.as_deref(), Some("test result: ok. 212 passed"));
+    }
+
+    #[tokio::test]
+    async fn a_view_that_has_its_own_blob_takes_the_producer_of_the_blob_it_views() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let led = rig.call("ledger", json!({})).await.output.unwrap();
+        let bash = rig.output("fine and green\n", "bash", ToolClass::Exec);
+        // Stand-ins for view results that carry a blob: one of the ledger, one of a command output.
+        let mk = |text: &str, of: &str| {
+            let blob = rig.env.ctx.blobs.put_bytes(text.as_bytes()).unwrap();
+            let mut meta = serde_json::Map::new();
+            meta.insert(loom_core::event::META_OF_BLOB.into(), json!(of));
+            (blob, meta)
+        };
+        let (b1, m1) = mk("claims all 212 tests pass\n", led.id.as_str());
+        let bash_id = rig.env.ctx.blobs.resolve(&bash).unwrap();
+        let (b2, m2) = mk("fine and green again\n", bash_id.as_str());
+        for (blob, meta, name) in [(&b1, m1, "out_read"), (&b2, m2, "out_read")] {
+            let result = loom_core::event::ToolResult {
+                call_id: loom_core::CallId::from("v1"),
+                name: name.into(),
+                status: ToolStatus::Ok,
+                text: String::new(),
+                output: Some(blob.clone()),
+                cut: false,
+                class: ToolClass::Read,
+                meta,
+                duration_ms: 1,
+            };
+            rig.index_producer(&result);
+        }
+        let t = refused(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": b1.handle(), "start": 1, "end": 1, "quote": "all 212 tests pass", "note": "n"}),
+        )
+        .await;
+        assert!(t.contains("is the result of `ledger`"), "{t}");
+        let t = ok(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": b2.handle(), "start": 1, "end": 1, "quote": "fine and green again", "note": "n"}),
+        )
+        .await;
+        assert!(t.contains("execution: bash call"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn evidence_quotes_check_line_numbers_and_length() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let h = rig.output("0 of 40 tests passed\nsecond line here\nok\n", "bash", ToolClass::Exec);
+        let ev = |start: u64, end: u64, quote: &str| {
+            json!({"claim": "c1", "handle": h, "start": start, "end": end, "quote": quote, "note": "n"})
+        };
+        let t = refused(&rig, "evidence", ev(1, 1, "40: tests passed")).await;
+        assert!(t.contains("the text is on line 1") && t.contains("not line 40"), "{t}");
+        let t = refused(&rig, "evidence", ev(1, 3, "pass")).await;
+        assert!(t.contains("at least 8 non-space characters"), "{t}");
+        assert!(rig.shared.ledger().unwrap().evidence.is_empty());
+        ok(&rig, "evidence", ev(1, 1, "1\ttests passed")).await;
+        ok(&rig, "evidence", ev(3, 3, "ok")).await;
+        let state = rig.shared.ledger().unwrap();
+        assert_eq!(state.evidence[0].input.quote.as_deref(), Some("tests passed"));
+        assert_eq!(state.evidence[1].input.quote.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn refusal_sentences_name_tools_that_exist() {
+        let rig = rig("lead", false, true);
+        let known = crate::rtools::known_tools();
+        for name in ["step", "claim", "claim_update", "evidence"] {
+            assert!(known.iter().any(|k| k == name), "{name} is not a tool");
+        }
+        ok(&rig, "plan", json!({"steps": ["a"]})).await;
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let mut sentences = vec![
+            refused(&rig, "step", json!({"id": "p1", "status": "done"})).await,
+            refused(&rig, "step", json!({"id": "p1", "status": "done", "evidence": ["e9"]})).await,
+            refused(&rig, "claim_update", json!({"id": "c1", "status": "supported"})).await,
+            refused(&rig, "evidence", json!({"claim": "c9", "handle": "x", "start": 1, "end": 1, "quote": "q", "note": "n"}))
+                .await,
+        ];
+        let h = rig.output("some output line\n", "bash", ToolClass::Exec);
+        sentences.push(
+            refused(&rig, "evidence", json!({"claim": "c9", "handle": h, "start": 1, "end": 1, "quote": "some output", "note": "n"}))
+                .await,
+        );
+        for text in sentences {
+            for dead in ["plan_update", "evidence_add", "claim_add", "obligation_open", "obligation_settle"] {
+                assert!(!text.contains(dead), "{dead} is not a tool: {text}");
+            }
+            for word in text.split('`').skip(1).step_by(2) {
+                let word = word.trim();
+                // Ids of ledger records in the sentence (e9, c1, p2) are data, not names.
+                if word.len() < 4 && word.chars().skip(1).all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                let known_word = known.iter().any(|k| k == word)
+                    || ["note", "evidence", "start", "end", "quote", "out:", "handle", "id", "status", "text"].contains(&word);
+                assert!(known_word || word.starts_with("out:"), "`{word}` is not a tool or parameter: {text}");
+            }
+        }
     }
 
     #[tokio::test]

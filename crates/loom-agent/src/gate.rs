@@ -394,8 +394,20 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize) -> Result<VerifiedQuote, St
     let slice = blobs
         .read_lines(&id, q.start, end)
         .map_err(|e| format!("quote {i}: the stored output {handle} could not be read ({e}); try again."))?;
-    if observe::quote_matches(&slice.text, &q.text) {
-        return Ok(VerifiedQuote { blob: id, start: q.start, end, text: q.text.clone() });
+    match observe::check_quote(&slice.text, &q.text, q.start) {
+        Ok(text) => return Ok(VerifiedQuote { blob: id, start: q.start, end, text }),
+        Err(observe::QuoteError::WrongLine { quoted, actual }) => {
+            return Err(format!(
+                "quote {i}: the text is on line {actual} of {handle}, not line {quoted}. Fix the line number, or quote the text without line numbers."
+            ));
+        }
+        Err(observe::QuoteError::TooShort) => {
+            return Err(format!(
+                "quote {i}: a quote that is only part of a line needs at least {} non-space characters. Quote more of the line, or the whole line.",
+                observe::MIN_PARTIAL_QUOTE_CHARS
+            ));
+        }
+        Err(observe::QuoteError::NotFound) => {}
     }
     let mut msg = format!("quote {i}: the text does not occur in {handle} lines {}-{end}.", q.start);
     if let Some((n, line)) = observe::nearest_line(&slice.text, &q.text) {
@@ -766,6 +778,21 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         assert_eq!(e, "quote 1: the text is empty.");
         let e = check_quotes(&store, &[q(&h, 1, 2, "nothing like it")]).err().unwrap_or_default();
         assert_eq!(e, format!("quote 1: the text does not occur in {h} lines 1-2. Copy the text exactly from the output."));
+    }
+
+    #[test]
+    fn quote_line_numbers_are_checked_and_stripped() {
+        let (_d, store, h) = store_with(OUT);
+        // The numbers are absolute line numbers of the stored output, and the stored text is stripped.
+        let ok = check_quotes(&store, &[q(&h, 2, 3, "2\tbeta line two\n3\tgamma line three")]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(ok[0].text, "beta line two\ngamma line three");
+        let e = check_quotes(&store, &[q(&h, 2, 3, "7: beta line two")]).err().unwrap_or_default();
+        assert_eq!(
+            e,
+            format!("quote 1: the text is on line 2 of {h}, not line 7. Fix the line number, or quote the text without line numbers.")
+        );
+        let e = check_quotes(&store, &[q(&h, 1, 4, "line")]).err().unwrap_or_default();
+        assert!(e.starts_with("quote 1: ") && e.contains("at least 8 non-space characters"), "{e}");
     }
 
     #[test]

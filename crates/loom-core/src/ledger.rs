@@ -367,6 +367,17 @@ fn ids<'a>(it: impl Iterator<Item = &'a str>) -> String {
     }
 }
 
+/// The line that tells the brief's reader that `hidden` oldest items were left out: it names the ids
+/// hidden and where to read them. `None` when nothing is hidden.
+fn elision<'a>(mut ids: impl Iterator<Item = &'a str>, hidden: usize) -> Option<String> {
+    let first = ids.next().filter(|_| hidden > 0)?;
+    let range = match ids.nth(hidden.saturating_sub(2)).filter(|_| hidden > 1) {
+        Some(last) => format!("{first}–{last}"),
+        None => first.to_string(),
+    };
+    Some(format!("({hidden} older not shown: {range}; call `ledger` to read them)"))
+}
+
 /// Refusal text for an id that does not exist: names the ids that do.
 fn no_such(kind: &str, id: &str, existing: String) -> String {
     if existing == "none" {
@@ -502,7 +513,7 @@ impl LedgerState {
         for id in wanted {
             if !self.evidence.iter().any(|e| &e.id == id) {
                 let mut msg = no_such("evidence record", id, ids(self.evidence.iter().map(|e| e.id.as_str())));
-                msg.push_str(&format!(" Evidence ids are created by evidence_add; record the evidence first, then cite its id in {what}."));
+                msg.push_str(&format!(" Evidence ids are created by the `evidence` tool; record the evidence first, then cite its id in {what}."));
                 return Err(msg);
             }
         }
@@ -558,13 +569,13 @@ impl LedgerState {
                 if !self.plan.iter().any(|p| &p.id == id) {
                     return Err(no_such("plan step", id, ids(self.plan.iter().map(|p| p.id.as_str()))));
                 }
-                self.check_evidence_ids(evidence, "plan_update")?;
+                self.check_evidence_ids(evidence, "`step`")?;
                 match status {
                     StepStatus::Done if blank(note) && evidence.is_empty() => {
-                        return Err(format!("Plan step {id} cannot be marked done without saying how it was verified. Call plan_update again with a `note` describing the check you ran and what it showed, or with `evidence` ids from evidence_add."));
+                        return Err(format!("Plan step {id} cannot be marked done without saying how it was verified. Call `step` again with a `note` describing the check you ran and what it showed, or with `evidence` ids from the `evidence` tool."));
                     }
                     StepStatus::Dropped if blank(note) => {
-                        return Err(format!("Plan step {id} cannot be dropped without a reason. Call plan_update again with a `note` saying why the step is no longer needed."));
+                        return Err(format!("Plan step {id} cannot be dropped without a reason. Call `step` again with a `note` saying why the step is no longer needed."));
                     }
                     _ => {}
                 }
@@ -598,7 +609,7 @@ impl LedgerState {
                     ClaimStatus::Supported => {
                         let backed = self.evidence.iter().any(|e| e.input.claim == claim.id && e.input.supports && e.input.attested);
                         if !backed {
-                            return Err(format!("Claim {id} cannot be marked supported: it has no attested evidence that supports it. Run or read something that shows it, then call evidence_add for {id} with the tool call id of that observation (and a quote from its output); evidence the harness did not witness does not count. Then call claim_update again."));
+                            return Err(format!("Claim {id} cannot be marked supported: it has no attested evidence that supports it. Run or read something that shows it, then call `evidence` with claim {id}, the `out:` handle of that output, the line range `start` and `end`, and a `quote` copied from those lines; evidence the harness did not witness does not count. Then call `claim_update` again."));
                         }
                     }
                     ClaimStatus::Refuted | ClaimStatus::Withdrawn if blank(note) => {
@@ -609,7 +620,7 @@ impl LedgerState {
             }
             LedgerOp::EvidenceAdd(input) => {
                 if !self.claims.iter().any(|c| c.id == input.claim) {
-                    return Err(no_such("claim", &input.claim, ids(self.claims.iter().map(|c| c.id.as_str()))) + " Add the claim with claim_add first, then attach evidence to it.");
+                    return Err(no_such("claim", &input.claim, ids(self.claims.iter().map(|c| c.id.as_str()))) + " Add the claim with `claim` first, then attach evidence to it.");
                 }
                 if blank(&input.note) {
                     return Err(needs_text("the evidence", "note") + " Say what the observation shows and what it does not show.");
@@ -625,7 +636,7 @@ impl LedgerState {
                     return Err(no_such("obligation", id, ids(self.obligations.iter().map(|o| o.id.as_str()))));
                 };
                 if let Some(prev) = &o.outcome {
-                    return Err(format!("Obligation {id} is already settled (outcome: {}). Records are never edited; if something new is owed, open a new obligation with obligation_open.", line(prev, 120)));
+                    return Err(format!("Obligation {id} is already settled (outcome: {}). Records are never edited.", line(prev, 120)));
                 }
                 if blank(outcome) {
                     return Err(needs_text("the settlement", "outcome"));
@@ -694,7 +705,7 @@ impl LedgerState {
     fn open_items_refusal(&self, open: &OpenItems) -> String {
         let mut out = String::from("Cannot finish yet: the ledger still has open items. Close each one, then call finish again.\n");
         if !open.plan.is_empty() {
-            out.push_str("Plan steps still todo or doing (close with plan_update: status done with a note saying how it was verified or with evidence ids, or status dropped with a note saying why):\n");
+            out.push_str("Plan steps still todo or doing (close with `step`: status done with a note saying how it was verified or with evidence ids, or status dropped with a note saying why):\n");
             for id in &open.plan {
                 if let Some(p) = self.plan.iter().find(|p| &p.id == id) {
                     out.push_str(&format!("- {} {}\n", p.id, preview(&p.text)));
@@ -702,7 +713,7 @@ impl LedgerState {
             }
         }
         if !open.obligations.is_empty() {
-            out.push_str("Obligations with no outcome (close with obligation_settle: id and what became of it):\n");
+            out.push_str("Obligations with no outcome (wait for the job or agent to report, or stop it):\n");
             for id in &open.obligations {
                 if let Some(o) = self.obligations.iter().find(|o| &o.id == id) {
                     out.push_str(&format!("- {} {}\n", o.id, preview(&o.text)));
@@ -710,7 +721,7 @@ impl LedgerState {
             }
         }
         if !open.claims.is_empty() {
-            out.push_str("Claims still open (close with claim_update: supported once evidence_add has attached attested supporting evidence, or refuted/withdrawn with a note):\n");
+            out.push_str("Claims still open (close with `claim_update`: supported once `evidence` has attached attested supporting evidence, or refuted/withdrawn with a note):\n");
             for id in &open.claims {
                 if let Some(c) = self.claims.iter().find(|c| &c.id == id) {
                     out.push_str(&format!("- {} {}\n", c.id, preview(&c.text)));
@@ -806,6 +817,10 @@ impl LedgerState {
         if opts.max_decisions > 0 && !self.decisions.is_empty() {
             let skip = self.decisions.len().saturating_sub(opts.max_decisions);
             let mut s = String::from("Decisions:");
+            if let Some(hidden) = elision(self.decisions.iter().map(|d| d.id.as_str()), skip) {
+                s.push('\n');
+                s.push_str(&hidden);
+            }
             for d in self.decisions.iter().skip(skip) {
                 s.push('\n');
                 s.push_str(&line(&format!("- {}: {} — {}", d.id, d.text, d.reason), max));
@@ -816,6 +831,10 @@ impl LedgerState {
         if opts.max_dead_ends > 0 && !self.dead_ends.is_empty() {
             let skip = self.dead_ends.len().saturating_sub(opts.max_dead_ends);
             let mut s = String::from("Dead ends:");
+            if let Some(hidden) = elision(self.dead_ends.iter().map(|d| d.id.as_str()), skip) {
+                s.push('\n');
+                s.push_str(&hidden);
+            }
             for d in self.dead_ends.iter().skip(skip) {
                 s.push('\n');
                 s.push_str(&line(&format!("- {}: {} — {}", d.id, d.what, d.why), max));
@@ -1331,7 +1350,7 @@ mod tests {
         let m = refusal(&s, LedgerOp::FinishVerdict { claim: "f5".into(), accepted: true, objections: vec![], verifier: None }, false);
         assert!(m.contains("f1"), "{m}");
         let m = refusal(&s, LedgerOp::PlanUpdate { id: "p1".into(), status: StepStatus::Done, note: String::new(), evidence: vec!["e4".into()] }, false);
-        assert!(m.contains("`e4`") && m.contains("evidence_add"), "{m}");
+        assert!(m.contains("`e4`") && m.contains("`evidence` tool"), "{m}");
         let empty = LedgerState::default();
         let m = refusal(&empty, LedgerOp::PlanUpdate { id: "p1".into(), status: StepStatus::Doing, note: String::new(), evidence: vec![] }, false);
         assert!(m.contains("no plan step has been recorded"), "{m}");
@@ -1388,7 +1407,7 @@ mod tests {
         let upd = |status, note: &str| LedgerOp::ClaimUpdate { id: "c1".into(), status, note: note.into() };
         let s = build(ops.clone());
         let m = refusal(&s, upd(ClaimStatus::Supported, ""), false);
-        assert!(m.contains("evidence_add") && m.contains("attested"), "{m}");
+        assert!(m.contains("`evidence`") && m.contains("attested"), "{m}");
         ops.push(LedgerOp::EvidenceAdd(ev("c1", true, false)));
         refusal(&build(ops.clone()), upd(ClaimStatus::Supported, "n"), false);
         ops.push(LedgerOp::EvidenceAdd(ev("c1", false, true)));
@@ -1451,7 +1470,7 @@ mod tests {
         assert!(!m.contains("p2 second"), "{m}");
         assert!(m.contains("- o1 benchmark job") && m.contains("- c1 it is fast") && m.contains("- q1 blocking q"), "{m}");
         assert!(!m.contains("q2"), "{m}");
-        for tool in ["plan_update", "obligation_settle", "claim_update", "ask_user"] {
+        for tool in ["`step`", "wait for the job or agent", "claim_update", "ask_user"] {
             assert!(m.contains(tool), "{tool} missing: {m}");
         }
         let clean = build(vec![
@@ -1582,6 +1601,18 @@ mod tests {
         let claim_line = b.lines().find(|l| l.starts_with("- c1")).unwrap_or("");
         assert_eq!(claim_line.chars().count(), 20);
         assert!(claim_line.ends_with('…'));
+    }
+
+    #[test]
+    fn brief_says_when_older_items_are_hidden() {
+        let s = rich_state();
+        let b = s.brief(&BriefOpts { max_decisions: 2, max_dead_ends: 1, max_line: 400 });
+        assert!(b.contains("(1 older not shown: d1; call `ledger` to read them)"), "{b}");
+        assert!(b.contains("(1 older not shown: x1; call `ledger` to read them)"), "{b}");
+        let b = s.brief(&BriefOpts { max_decisions: 1, max_dead_ends: 2, max_line: 400 });
+        assert!(b.contains("(2 older not shown: d1–d2; call `ledger` to read them)"), "{b}");
+        let b = s.brief(&BriefOpts::default());
+        assert!(!b.contains("not shown"), "{b}");
     }
 
     #[test]

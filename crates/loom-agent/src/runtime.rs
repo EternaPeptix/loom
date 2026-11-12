@@ -919,10 +919,16 @@ impl Orchestrator for Orch {
                 for r in own_records(&report.records) {
                     if let Event::ToolResult(t) = &r.event {
                         if let Some(o) = &t.output {
-                            out.push((
-                                o.id.clone(),
-                                Producer { session: id.clone(), call_id: t.call_id.clone(), tool: t.name.clone(), class: t.class },
-                            ));
+                            let own =
+                                Producer { session: id.clone(), call_id: t.call_id.clone(), tool: t.name.clone(), class: t.class };
+                            // A view of another output is a view of what produced that one.
+                            let producer = match t.meta.get(loom_core::event::META_OF_BLOB).and_then(serde_json::Value::as_str) {
+                                Some(of) => out.iter().find(|(b, _)| b.as_str() == of).map(|(_, p)| p.clone()),
+                                None => Some(own),
+                            };
+                            if let Some(p) = producer {
+                                out.push((o.id.clone(), p));
+                            }
                         }
                     }
                 }
@@ -1015,12 +1021,20 @@ impl Inner {
                 match &record.event {
                     Event::ToolResult(t) => {
                         if let Some(o) = &t.output {
-                            st.producers.entry((mission.clone(), o.id.clone())).or_insert(Producer {
+                            // A view of another output is a view of what produced that one.
+                            let own = Producer {
                                 session: session.clone(),
                                 call_id: t.call_id.clone(),
                                 tool: t.name.clone(),
                                 class: t.class,
-                            });
+                            };
+                            let producer = match t.meta.get(loom_core::event::META_OF_BLOB).and_then(serde_json::Value::as_str) {
+                                Some(of) => st.producers.get(&(mission.clone(), BlobId::from(of))).cloned(),
+                                None => Some(own),
+                            };
+                            if let Some(p) = producer {
+                                st.producers.entry((mission.clone(), o.id.clone())).or_insert(p);
+                            }
                         }
                     }
                     Event::InboxOpened(item) => {

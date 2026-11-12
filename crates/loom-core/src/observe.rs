@@ -397,7 +397,8 @@ pub fn stale(records: &[Record]) -> Vec<Stale> {
     out
 }
 
-/// Split a read-tool line number prefix (`^\s*\d+[:\-│|]\s?`) off `line`, giving the number and the rest.
+/// Split a read-tool line number prefix (`^\s*\d+[:\-│|\t]\s?`) off `line`, giving the number and the rest. A line
+/// of digits alone is a number with an empty rest (a blank line of a numbered listing).
 fn split_line_prefix(line: &str) -> Option<(u64, &str)> {
     let t = line.trim_start();
     let digits = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
@@ -406,11 +407,18 @@ fn split_line_prefix(line: &str) -> Option<(u64, &str)> {
     }
     let n: u64 = t.get(..digits)?.parse().ok()?;
     let rest = t.get(digits..)?;
+    if rest.is_empty() {
+        return Some((n, ""));
+    }
     let mut chars = rest.chars();
-    if !matches!(chars.next()?, ':' | '-' | '│' | '|') {
+    let sep = chars.next()?;
+    if !matches!(sep, ':' | '-' | '│' | '|' | '\t') {
         return None;
     }
     let after = chars.as_str();
+    if sep == '\t' {
+        return Some((n, after));
+    }
     let mut again = after.chars();
     let rest = match again.next() {
         Some(c) if c.is_whitespace() => again.as_str(),
@@ -433,14 +441,17 @@ fn quote_lines(quote: &str) -> Vec<&str> {
     lines.split_off(lead)
 }
 
-/// The quote with line-number prefixes removed, or `None` when it does not consistently carry them:
-/// every non-blank line needs one and the numbers must increase.
-fn strip_prefixes<'a>(lines: &[&'a str]) -> Option<Vec<&'a str>> {
+/// The quote with line-number prefixes removed, and the number each line carried (`None` for a blank
+/// line), or `None` when it does not consistently carry them: every non-blank line needs one and the
+/// numbers must increase.
+fn strip_prefixes<'a>(lines: &[&'a str]) -> Option<(Vec<&'a str>, Vec<Option<u64>>)> {
     let mut out = Vec::with_capacity(lines.len());
+    let mut numbers = Vec::with_capacity(lines.len());
     let mut prev: Option<u64> = None;
     for l in lines {
         if l.is_empty() {
             out.push("");
+            numbers.push(None);
             continue;
         }
         let (n, rest) = split_line_prefix(l)?;
@@ -449,26 +460,97 @@ fn strip_prefixes<'a>(lines: &[&'a str]) -> Option<Vec<&'a str>> {
         }
         prev = Some(n);
         out.push(rest);
+        numbers.push(Some(n));
     }
-    Some(out)
+    Some((out, numbers))
 }
 
-pub fn quote_matches(haystack: &str, quote: &str) -> bool {
+/// A quote that does not span whole lines must have at least this many non-whitespace characters.
+pub const MIN_PARTIAL_QUOTE_CHARS: usize = 8;
+
+/// Why a quote was not accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuoteError {
+    /// The text does not occur.
+    NotFound,
+    /// The text occurs, but the line numbers in the quote are not those of the lines it is on: `actual`
+    /// is where the line numbered `quoted` really is.
+    WrongLine { quoted: u64, actual: u64 },
+    /// The text occurs but is a fragment of fewer than [`MIN_PARTIAL_QUOTE_CHARS`] characters.
+    TooShort,
+}
+
+/// Byte offsets at which `needle` occurs in `hay`, overlapping ones included.
+fn find_all(hay: &str, needle: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rest) = hay.get(from..) {
+        let Some(at) = rest.find(needle) else { break };
+        let off = from.saturating_add(at);
+        out.push(off);
+        let step = rest.get(at..).and_then(|r| r.chars().next()).map_or(1, char::len_utf8);
+        from = off.saturating_add(step);
+    }
+    out
+}
+
+/// Check `quote` against `haystack`, whose first line is line `first_line` of the stored output. Returns
+/// the quoted text as it is to be recorded: with line-number prefixes removed. Prefixes, when present,
+/// must be the real line numbers; a quote that is not whole lines needs [`MIN_PARTIAL_QUOTE_CHARS`]
+/// non-whitespace characters.
+pub fn check_quote(haystack: &str, quote: &str, first_line: u64) -> Result<String, QuoteError> {
     if quote.trim().is_empty() {
-        return false;
+        return Err(QuoteError::NotFound);
     }
     let hay = prepare_haystack(haystack);
     let lines = quote_lines(quote);
-    if hay.contains(&lines.join("\n")) {
-        return true;
-    }
-    match strip_prefixes(&lines) {
-        Some(stripped) => {
-            let joined = stripped.join("\n");
-            !joined.trim().is_empty() && hay.contains(&joined)
+    let literal = lines.join("\n");
+    let (text, numbers) = if hay.contains(&literal) {
+        (literal, None)
+    } else {
+        let (stripped, numbers) = strip_prefixes(&lines).ok_or(QuoteError::NotFound)?;
+        let joined = stripped.join("\n");
+        if joined.trim().is_empty() {
+            return Err(QuoteError::NotFound);
         }
-        None => false,
+        (joined, Some(numbers))
+    };
+    let found = find_all(&hay, &text);
+    if found.is_empty() {
+        return Err(QuoteError::NotFound);
     }
+    let long_enough = text.chars().filter(|c| !c.is_whitespace()).count() >= MIN_PARTIAL_QUOTE_CHARS;
+    let mut wrong: Option<QuoteError> = None;
+    let mut short = false;
+    for off in found {
+        let before = hay.get(..off).unwrap_or("");
+        let base = first_line.saturating_add(before.matches('\n').count() as u64);
+        if let Some(numbers) = &numbers {
+            let bad = numbers.iter().enumerate().find_map(|(k, n)| {
+                let actual = base.saturating_add(k as u64);
+                n.filter(|n| *n != actual).map(|n| QuoteError::WrongLine { quoted: n, actual })
+            });
+            if bad.is_some() {
+                wrong = wrong.or(bad);
+                continue;
+            }
+        }
+        let end = off.saturating_add(text.len());
+        let starts_line = before.is_empty() || before.ends_with('\n');
+        let ends_line = hay.get(end..).is_some_and(|r| r.is_empty() || r.starts_with('\n'));
+        if (starts_line && ends_line) || long_enough {
+            return Ok(text);
+        }
+        short = true;
+    }
+    match wrong {
+        Some(e) if !short => Err(e),
+        _ => Err(QuoteError::TooShort),
+    }
+}
+
+pub fn quote_matches(haystack: &str, quote: &str) -> bool {
+    check_quote(haystack, quote, 1).is_ok()
 }
 
 fn common_prefix_chars(a: &str, b: &str) -> usize {
@@ -809,7 +891,10 @@ mod tests {
     #[test]
     fn quote_exact_and_multiline() {
         let hay = "fn main() {\n    let x = 1;   \n    println!(\"{x}\");\n}\n";
-        assert!(quote_matches(hay, "let x = 1;"));
+        // A fragment of seven characters is too short; the whole line is not.
+        assert!(!quote_matches(hay, "let x = 1;"));
+        assert!(quote_matches(hay, "    let x = 1;"));
+        assert!(quote_matches(hay, "println!(\"{x}\");"));
         assert!(quote_matches(hay, "    let x = 1;\n    println!(\"{x}\");"));
         assert!(quote_matches(hay, "\n\n    let x = 1;  \n\n"));
         assert!(quote_matches("a\r\nb\r\n", "a\nb"));
@@ -821,8 +906,52 @@ mod tests {
         assert!(quote_matches(hay, "1: alpha\n2:     beta();"));
         assert!(quote_matches(hay, "  1│alpha\n  2│     beta();"));
         assert!(quote_matches(hay, "1|alpha\n2|     beta();\n3|\n4|gamma"));
-        assert!(quote_matches(hay, "7-gamma"));
-        assert!(quote_matches(hay, "  12:     beta();"));
+        assert!(quote_matches(hay, "4-gamma"));
+        assert!(!quote_matches(hay, "7-gamma"));
+        // Line numbers are those of the stored output: the haystack here starts at line 11.
+        assert!(check_quote(hay, "  12:     beta();", 11).is_ok());
+        assert_eq!(check_quote(hay, "  12:     beta();", 1), Err(QuoteError::WrongLine { quoted: 12, actual: 2 }));
+    }
+
+    #[test]
+    fn quote_line_numbers_must_be_the_real_ones() {
+        let hay = "0 of 40 tests passed\nsecond line here\n";
+        assert_eq!(check_quote(hay, "40: tests passed", 1), Err(QuoteError::WrongLine { quoted: 40, actual: 1 }));
+        assert_eq!(check_quote(hay, "2: tests passed", 1), Err(QuoteError::WrongLine { quoted: 2, actual: 1 }));
+        assert_eq!(check_quote(hay, "1: tests passed", 1), Ok("tests passed".to_string()));
+        assert_eq!(check_quote(hay, "40: tests passed", 40), Ok("tests passed".to_string()));
+        // Every separator style, TAB included, is accepted and the stored text is stripped.
+        let hay = "alpha line\n    beta line\n\ngamma line\n";
+        for q in [
+            "1: alpha line\n2:     beta line",
+            "1- alpha line\n2-     beta line",
+            "1| alpha line\n2|     beta line",
+            "1│alpha line\n2│     beta line",
+            "1\talpha line\n2\t    beta line",
+            "     1\talpha line\n     2\t    beta line",
+        ] {
+            assert_eq!(check_quote(hay, q, 1), Ok("alpha line\n    beta line".to_string()), "{q:?}");
+        }
+        assert_eq!(check_quote(hay, "3\t\n4\tgamma line", 1), Ok("\ngamma line".to_string()));
+        assert!(check_quote(hay, "1\talpha line\n3\t    beta line", 1).is_err());
+        // Unprefixed quotes are returned as they are.
+        assert_eq!(check_quote(hay, "gamma line", 1), Ok("gamma line".to_string()));
+    }
+
+    #[test]
+    fn quote_minimum_length_applies_to_fragments_only() {
+        let hay = "ok\nthe build is green now\n7\n";
+        assert_eq!(check_quote(hay, "green", 1), Err(QuoteError::TooShort));
+        assert_eq!(check_quote(hay, "is gre", 1), Err(QuoteError::TooShort));
+        assert!(check_quote(hay, "build is green", 1).is_ok());
+        assert!(check_quote(hay, "ok", 1).is_ok());
+        assert!(check_quote(hay, "7", 1).is_ok());
+        assert!(check_quote(hay, "ok\nthe build is green now", 1).is_ok());
+        assert_eq!(check_quote(hay, "o", 1), Err(QuoteError::TooShort));
+        assert_eq!(check_quote(hay, "zzz", 1), Err(QuoteError::NotFound));
+        // A whole line with indentation is a whole line only when the indentation is quoted too.
+        assert_eq!(check_quote("  ab\n", "ab", 1), Err(QuoteError::TooShort));
+        assert!(check_quote("  ab\n", "  ab  ", 1).is_ok());
     }
 
     #[test]
