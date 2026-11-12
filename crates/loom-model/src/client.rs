@@ -377,7 +377,7 @@ impl ModelClient {
                         return Err(ModelError::Rejected {
                             status: 404,
                             message: format!(
-                                "the server no longer serves '{model}', the model loom found there earlier; it now serves '{id}'. loom does not move running sessions to another model by itself: relaunch the server with '{model}', or restart the loom daemon to carry on with '{id}'. The server said: {message}"
+                                "the server no longer serves '{model}', the model loom found there earlier; it now serves '{id}'. loom does not switch running sessions on this error: relaunch the server with '{model}', or restart the loom daemon (or let the next successful model discovery, which happens when a session is created on this profile before discovery has succeeded, move every session of the profile) to carry on with '{id}'. The server said: {message}"
                             ),
                         });
                     }

@@ -1703,25 +1703,36 @@ impl Inner {
     async fn facts(&self, profile_name: &str) -> Result<(String, Option<u64>, bool), String> {
         let rt = self.profiles.get(profile_name).ok_or_else(|| format!("The model profile \"{profile_name}\" is not configured."))?;
         let remembered = lock(&rt.discovered).clone();
+        let profile = rt.client.profile();
         let found = match remembered {
             Some(d) => Some(d),
             None => match rt.client.discover().await {
+                Ok(d) if d.context_window.is_none() => {
+                    // Not remembered: every creation is refused until the profile sets a window.
+                    return Err(format!(
+                        "The model server at {} answered but reports no context window for the model, so the session would start without knowing it. Set context_window in [models.{profile_name}] of the config.",
+                        profile.base_url
+                    ));
+                }
                 Ok(d) => {
                     *lock(&rt.discovered) = Some(d.clone());
                     Some(d)
                 }
-                Err(ModelError::Unavailable { .. }) => None,
+                Err(ModelError::Unavailable { last, .. }) => {
+                    if profile.context_window.is_none() {
+                        return Err(format!(
+                            "The model server at {} could not be asked for its models ({last}), and the profile \"{profile_name}\" sets no context_window, so the session would start without knowing the model's window. Start the model server, or set context_window in [models.{profile_name}] of the config.",
+                            profile.base_url
+                        ));
+                    }
+                    None
+                }
                 Err(e) => return Err(e.to_string()),
             },
         };
-        let profile = rt.client.profile();
         match found {
             Some(d) => Ok((d.served_model, d.context_window, false)),
-            None if profile.context_window.is_some() => Ok((profile.model.clone(), profile.context_window, true)),
-            None => Err(format!(
-                "The model server at {} did not answer, and the profile \"{profile_name}\" sets no context_window, so the session would start without knowing the model's window. Start the model server, or set context_window in [models.{profile_name}] of the config.",
-                profile.base_url
-            )),
+            None => Ok((profile.model.clone(), profile.context_window, true)),
         }
     }
 
@@ -2126,12 +2137,6 @@ impl Runtime {
             }
         };
         let id = SessionId::generate();
-        if from_config {
-            tracing::info!(
-                session = %id.as_str(), profile = %profile_name, context_window = ?window,
-                "the model server did not answer; this session's context window comes from the configuration"
-            );
-        }
         let explicit = role.termination == Termination::Explicit;
         let meta = SessionMeta {
             id: id.clone(),
@@ -2140,7 +2145,7 @@ impl Runtime {
             workspace: workspace.display().to_string(),
             pack: role.pack.clone(),
             role: role.name.clone(),
-            profile: profile_name,
+            profile: profile_name.clone(),
             model,
             context_window: window,
             title,
@@ -2179,6 +2184,13 @@ impl Runtime {
         if let Err(e) = write_json_atomic(&inner.paths.session_dir(&id).join("meta.json"), &meta) {
             forget(inner);
             return Err(format!("cannot write the session's meta.json: {e}"));
+        }
+        if from_config {
+            // Recorded in the daemon log only, once the session exists.
+            tracing::info!(
+                session = %id.as_str(), profile = %profile_name, context_window = ?window,
+                "the model server did not answer; this session's context window comes from the configuration"
+            );
         }
         let info = {
             let mut st = inner.st();
@@ -2980,6 +2992,18 @@ mod tests {
         let err = e.rt.create_session(e.new_session(None)).await.unwrap_err();
         assert!(err.contains(&e.server.base_url()), "{err}");
         assert!(err.contains("Start the model server") && err.contains("context_window"), "{err}");
+        assert!(e.rt.sessions(true).is_empty());
+        e.rt.shutdown().await;
+        // The server answers but reports no window, and the profile sets none: refused too.
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            if let Some(p) = c.models.get_mut("mock") {
+                p.context_window = None;
+            }
+        })
+        .await;
+        e.server.set_model("mock", None);
+        let err = e.rt.create_session(e.new_session(None)).await.unwrap_err();
+        assert!(err.contains(&e.server.base_url()) && err.contains("context_window"), "{err}");
         assert!(e.rt.sessions(true).is_empty());
         e.rt.shutdown().await;
         // A configured window: the session starts with it.

@@ -193,7 +193,7 @@ pub enum NetworkMode {
     Open,
     /// Only destinations matching `allow`.
     Allowlist,
-    /// Nothing leaves the machine; the default.
+    /// Tools reach no host through the egress proxy (model requests to the configured endpoint are not affected); the default.
     #[default]
     DenyAll,
 }

@@ -46,7 +46,7 @@ loopback_all = false
 protect_credentials = true # ~/.ssh, ~/.aws, ~/.gnupg, keychains, browser profiles ... are unreadable to commands and file tools
 
 [network]
-mode = "deny_all"          # the default: nothing leaves the machine. "allowlist" reaches only `allow`; "open" any public host.
+mode = "deny_all"          # the default: tools reach no host through the egress proxy (model requests are not affected). "allowlist" reaches only `allow`; "open" any public host.
                            # web_fetch needs a route (allowlist or open)
 # allow = ["*.rust-lang.org", "docs.rs", "crates.io"]
 

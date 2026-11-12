@@ -109,7 +109,7 @@ target_tokens = 400000
 floor_tokens = 180000
 
 [network]
-# deny_all (the default): tool commands reach no host at all.
+# deny_all (the default): tools reach no host through the egress proxy.
 # To let them reach chosen hosts, use:  mode = "allowlist"  with  allow = ["*.example.com"]
 #   (allowlist: only hosts matching `allow` are reachable.)
 # To let them reach any public host, use:  mode = "open"   (open: every public destination is reachable.)
