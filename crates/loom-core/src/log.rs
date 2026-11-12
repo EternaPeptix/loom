@@ -12,21 +12,34 @@
 //!   the wrong `seq`, or has a `prev` that does not match. A line whose chain header is right but whose
 //!   body this build cannot deserialize (written by a newer loom) is not damage: it is kept as an
 //!   opaque record (`Event::Unknown`), advances the chain and is counted in `OpenReport::opaque`.
-//!   `open` then refuses to append (`LogError::Newer`) without touching the file, and so does a log
-//!   whose `session_start` carries a schema above `event::SCHEMA`; reading such a log works. If anything follows the good prefix, those bytes are moved to
+//!   Such a line must still be complete JSON, and the line after it must not disown it: when that
+//!   line has the next `seq` but a `prev` that is not the unreadable line's hash, the unreadable
+//!   line is not the one that was written, so it is damage and ends the prefix.
+//!   `open` refuses to append to a log with opaque records (`LogError::Newer`) without touching the
+//!   file, and so does a log whose `session_start` carries a schema above `event::SCHEMA`; reading
+//!   such a log works. If anything follows the good prefix, those bytes are moved to
 //!   `<path>.damaged-<now_ms>` and the log file is truncated to the good prefix; `OpenReport::damage`
 //!   says what happened. A torn final line alone (crash mid-append) is the same case.
 //! - `read_records` is the read-only variant: same stopping rule, no file is modified.
+//! - `read_page` and [`PageReader`] serve pages under the same stopping rule. A `PageReader` keeps
+//!   checkpoints of what it verified, so pages fetched in sequence cost time proportional to the page.
 //! - `fork_to` creates a new log whose first `upto_seq + 1` lines are byte-identical to this log's, and
 //!   returns it ready to append (`next_seq == upto_seq + 1`, chain continuing from the copied line).
 //! - Lines can be large (a tool result is stored inline). There is no line-length limit.
 //!
 //! Tests required: round trip; chain values; torn tail; corrupted middle line (salvage file exists,
 //! log truncated, appends continue); wrong seq; reopen-and-append; fork is byte-identical and chains;
-//! `read_page` paging; `create` refuses an existing file; `Unknown` events survive rewrite-free.
+//! `read_page` paging; `create` refuses an existing file; `Unknown` events survive rewrite-free;
+//! an unreadable body with an intact chain is opaque, refuses append and leaves the file alone (also
+//! in `session_start`, also as the last line); a higher schema refuses append and reads; a log from
+//! before the schema field opens; damage with a right `seq` and `prev` (invalid UTF-8, nesting too
+//! deep to read back, an unreadable line the next line disowns) is salvaged; `PageReader` equals
+//! `read_page` for every window, follows appends, starts over after truncation, replacement and a
+//! changed verified line, and does not rescan when paging in sequence.
 
 use crate::event::{Author, Event, Record, Seq, SCHEMA};
 use crate::{now_ms, sha256_hex};
+use serde::Deserialize;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use serde_json::Value;
@@ -117,47 +130,75 @@ struct Scanner<R> {
     opaque: u64,
     /// Highest schema number a `session_start` line declared (1 when none did).
     schema: u32,
+    /// A line read ahead of its turn, to check the unreadable line before it; the next `step` takes it.
+    ahead: Option<Vec<u8>>,
 }
 
-/// The part of a line every build can read: enough to place it in the chain.
-#[derive(serde::Deserialize)]
-struct Header {
-    seq: Seq,
-    prev: String,
-    #[serde(default)]
-    ts_ms: Option<Value>,
-    #[serde(default)]
-    author: Option<Value>,
-    #[serde(default)]
-    kind: Option<Value>,
-    #[serde(default)]
-    schema: Option<Value>,
+/// One stored line as this build reads it.
+struct Parsed {
+    record: Record,
+    /// Why the body could not be read; `None` for a record this build understands.
+    unreadable: Option<serde_json::Error>,
+    /// The schema a `session_start` line declares; 1 for every other line.
+    schema: u32,
+}
+
+/// Parse one line (newline excluded). A line this build cannot deserialize but that still places
+/// itself in the chain comes back as an opaque record; anything else is an error.
+fn parse_line(line: &[u8]) -> Result<Parsed, serde_json::Error> {
+    match serde_json::from_slice::<Record>(line) {
+        Ok(record) => {
+            let schema = if let Event::SessionStart(s) = &record.event { s.schema } else { 1 };
+            Ok(Parsed { record, unreadable: None, schema })
+        }
+        Err(e) => match opaque_record(line) {
+            Some((record, schema)) => Ok(Parsed { record, unreadable: Some(e), schema }),
+            None => Err(e),
+        },
+    }
 }
 
 /// Read a line this build cannot fully deserialize as an opaque record, plus the schema it declares.
+/// The whole line must parse as a JSON object with a `seq` and a `prev`. Parsing all of it, not
+/// only those two fields, keeps bytes that are not JSON at all (invalid UTF-8 inside a string,
+/// nesting deeper than `serde_json` reads) on the damage side.
 fn opaque_record(line: &[u8]) -> Option<(Record, u32)> {
-    if line.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {
-        return None;
-    }
-    let h: Header = serde_json::from_slice(line).ok()?;
-    let author = h.author.and_then(|v| serde_json::from_value::<Author>(v).ok()).unwrap_or(Author::Harness);
-    let is_start = h.kind.as_ref().and_then(Value::as_str) == Some("session_start");
-    let schema = match (is_start, h.schema.as_ref().and_then(Value::as_u64)) {
+    let Value::Object(map) = serde_json::from_slice::<Value>(line).ok()? else { return None };
+    let seq = map.get("seq").and_then(Value::as_u64)?;
+    let prev = map.get("prev").and_then(Value::as_str)?.to_string();
+    let author = map.get("author").and_then(|v| Author::deserialize(v).ok()).unwrap_or(Author::Harness);
+    let is_start = map.get("kind").and_then(Value::as_str) == Some("session_start");
+    let schema = match (is_start, map.get("schema").and_then(Value::as_u64)) {
         (true, Some(n)) => u32::try_from(n).unwrap_or(u32::MAX),
         _ => 1,
     };
-    let ts_ms = h.ts_ms.as_ref().and_then(Value::as_u64).unwrap_or(0);
-    Some((Record { seq: h.seq, ts_ms, author, prev: h.prev, event: Event::Unknown }, schema))
+    let ts_ms = map.get("ts_ms").and_then(Value::as_u64).unwrap_or(0);
+    Some((Record { seq, ts_ms, author, prev, event: Event::Unknown }, schema))
 }
 
 impl<R: BufRead> Scanner<R> {
     fn new(reader: R) -> Self {
-        Scanner { reader, buf: Vec::new(), next_seq: 0, last_hash: ZERO_HASH.to_string(), good_len: 0, opaque: 0, schema: 1 }
+        Scanner {
+            reader,
+            buf: Vec::new(),
+            next_seq: 0,
+            last_hash: ZERO_HASH.to_string(),
+            good_len: 0,
+            opaque: 0,
+            schema: 1,
+            ahead: None,
+        }
     }
 
     fn step(&mut self) -> std::io::Result<Step> {
-        self.buf.clear();
-        if self.reader.read_until(b'\n', &mut self.buf)? == 0 {
+        match self.ahead.take() {
+            Some(line) => self.buf = line,
+            None => {
+                self.buf.clear();
+                self.reader.read_until(b'\n', &mut self.buf)?;
+            }
+        }
+        if self.buf.is_empty() {
             return Ok(Step::End);
         }
         let Some((&b'\n', line)) = self.buf.split_last() else {
@@ -165,15 +206,9 @@ impl<R: BufRead> Scanner<R> {
         };
         let total = self.buf.len() as u64;
         let line_no = self.next_seq.saturating_add(1);
-        let (record, is_opaque, schema) = match serde_json::from_slice::<Record>(line) {
-            Ok(r) => {
-                let schema = if let Event::SessionStart(s) = &r.event { s.schema } else { 1 };
-                (r, false, schema)
-            }
-            Err(e) => match opaque_record(line) {
-                Some((r, schema)) => (r, true, schema),
-                None => return Ok(Step::Bad(format!("line {line_no} is not a record: {e}"))),
-            },
+        let Parsed { record, unreadable, schema } = match parse_line(line) {
+            Ok(parsed) => parsed,
+            Err(e) => return Ok(Step::Bad(format!("line {line_no} is not a record: {e}"))),
         };
         if record.seq != self.next_seq {
             return Ok(Step::Bad(format!(
@@ -184,12 +219,36 @@ impl<R: BufRead> Scanner<R> {
         if record.prev != self.last_hash {
             return Ok(Step::Bad(format!("line {line_no} breaks the chain")));
         }
-        self.last_hash = sha256_hex(line);
+        let hash = sha256_hex(line);
+        if let Some(e) = &unreadable {
+            // Only the next line can vouch for bytes this build cannot read.
+            if self.next_line_disowns(&hash)? {
+                return Ok(Step::Bad(format!("line {line_no} is not a record: {e}")));
+            }
+        }
+        self.last_hash = hash;
         self.next_seq = self.next_seq.saturating_add(1);
         self.good_len = self.good_len.saturating_add(total);
-        self.opaque = self.opaque.saturating_add(u64::from(is_opaque));
+        self.opaque = self.opaque.saturating_add(u64::from(unreadable.is_some()));
         self.schema = self.schema.max(schema);
         Ok(Step::Record(Box::new(record)))
+    }
+
+    /// Read the line after the current one and keep it for the next `step`. True when that line has
+    /// the seq that follows but a `prev` other than `hash`, the current line's hash: it was chained
+    /// to other bytes, so the current line is not the one that was written.
+    fn next_line_disowns(&mut self, hash: &str) -> std::io::Result<bool> {
+        let mut next = Vec::new();
+        if self.reader.read_until(b'\n', &mut next)? == 0 {
+            return Ok(false);
+        }
+        let follows = self.next_seq.saturating_add(1);
+        let disowns = match next.split_last() {
+            Some((&b'\n', line)) => parse_line(line).is_ok_and(|p| p.record.seq == follows && p.record.prev != hash),
+            _ => false,
+        };
+        self.ahead = Some(next);
+        Ok(disowns)
     }
 }
 
@@ -439,7 +498,10 @@ impl Mark {
 
 /// Pages through one log file and remembers how far it has verified the chain, so that fetching
 /// pages in sequence costs time proportional to the page, not to the log. Every record it serves
-/// was chain-verified. It starts over when the file got shorter or its last verified line changed.
+/// was chain-verified. It starts over when the file got shorter, when its last verified line
+/// changed, and when a scan stops inside the part it had verified. A line changed in place below a
+/// checkpoint, with the length and the last line as they were, is noticed by the first scan that
+/// crosses it; until then pages above that checkpoint are served as verified before the change.
 #[derive(Debug)]
 pub struct PageReader {
     path: PathBuf,
@@ -452,7 +514,7 @@ pub struct PageReader {
     /// Start offset and length (newline excluded) of the last verified line.
     tail: Option<(u64, u64)>,
     /// Lines hashed so far (chain steps and prefix checks); lets tests see that paging is not rescanning.
-    pub lines_hashed: u64,
+    lines_hashed: u64,
 }
 
 impl PageReader {
@@ -489,23 +551,36 @@ impl PageReader {
 
     /// Up to `limit` records with `seq > after` (`None` = from the start); stops silently at damage.
     pub fn read_page(&mut self, after: Option<Seq>, limit: usize) -> Result<Vec<Record>, LogError> {
-        let mut page = Vec::new();
         let first = match after {
             None => 0,
             Some(a) => match a.checked_add(1) {
                 Some(f) => f,
-                None => return Ok(page),
+                None => return Ok(Vec::new()),
             },
         };
         if limit == 0 {
-            return Ok(page);
+            return Ok(Vec::new());
         }
         let path = self.path.clone();
         let mut file = File::open(&path).map_err(io_err(&path))?;
         if !self.prefix_holds(&mut file).map_err(io_err(&path))? {
             self.reset();
         }
-        // Resume from the latest verified position at or before the first wanted record.
+        let (page, full) = self.scan(file, first, limit).map_err(io_err(&path))?;
+        if full || self.cursor.seq >= self.end.seq {
+            return Ok(page);
+        }
+        // The scan stopped at a line verified earlier, so the verified part has changed: forget it
+        // and read again from the start of the file.
+        self.reset();
+        let file = File::open(&path).map_err(io_err(&path))?;
+        Ok(self.scan(file, first, limit).map_err(io_err(&path))?.0)
+    }
+
+    /// Collect up to `limit` records from `first` on, scanning from the latest verified position at
+    /// or before `first`. The flag says whether the page was filled (false: the scan reached the end
+    /// of the readable log first).
+    fn scan(&mut self, mut file: File, first: Seq, limit: usize) -> std::io::Result<(Vec<Record>, bool)> {
         let index = usize::try_from(first / CHECKPOINT_EVERY).unwrap_or(usize::MAX);
         let mut start = self.marks.get(index).or(self.marks.last()).cloned().unwrap_or_else(Mark::origin);
         for m in [&self.cursor, &self.end] {
@@ -513,14 +588,16 @@ impl PageReader {
                 start = m.clone();
             }
         }
-        file.seek(SeekFrom::Start(start.offset)).map_err(io_err(&path))?;
+        file.seek(SeekFrom::Start(start.offset))?;
         let mut scanner = Scanner::new(BufReader::new(file));
         scanner.next_seq = start.seq;
         scanner.last_hash = start.hash;
         scanner.good_len = start.offset;
-        loop {
+        let mut page = Vec::new();
+        let mut full = false;
+        while !full {
             let before = scanner.good_len;
-            let Step::Record(r) = scanner.step().map_err(io_err(&path))? else { break };
+            let Step::Record(r) = scanner.step()? else { break };
             self.lines_hashed = self.lines_hashed.saturating_add(1);
             if scanner.next_seq > self.end.seq {
                 self.end = Mark { seq: scanner.next_seq, offset: scanner.good_len, hash: scanner.last_hash.clone() };
@@ -533,13 +610,11 @@ impl PageReader {
             }
             if r.seq >= first {
                 page.push(*r);
-                if page.len() >= limit {
-                    break;
-                }
+                full = page.len() >= limit;
             }
         }
         self.cursor = Mark { seq: scanner.next_seq, offset: scanner.good_len, hash: scanner.last_hash };
-        Ok(page)
+        Ok((page, full))
     }
 }
 
@@ -769,6 +844,22 @@ mod tests {
         fill(&mut log, 5);
         let more = reader.read_page(Some(9), 100).unwrap();
         assert_eq!(more.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![10, 11, 12, 13, 14]);
+        drop(log);
+        // Cut back to eight records, then grown past the old length with other records. The reader
+        // remembers where the fifteen it verified ended; a page asked for from there has to come
+        // from the file as it is now.
+        let old_len = std::fs::metadata(&path).unwrap().len();
+        std::fs::write(&path, lines(&path)[..8].concat()).unwrap();
+        let (mut log, _) = SessionLog::open(&path, Durability::Batch).unwrap();
+        for i in 0..12 {
+            log.append(Author::Model, msg(1000 + i)).unwrap();
+        }
+        drop(log);
+        assert!(std::fs::metadata(&path).unwrap().len() >= old_len);
+        let want = read_page(&path, Some(14), 100).unwrap();
+        assert_eq!(want.len(), 5);
+        assert_eq!(reader.read_page(Some(14), 100).unwrap(), want);
+        assert_eq!(reader.read_page(Some(9), 100).unwrap(), read_page(&path, Some(9), 100).unwrap());
         // Cut back to eight records (a shorter file).
         let ls = lines(&path);
         let keep: Vec<u8> = ls[..8].concat();
@@ -788,6 +879,53 @@ mod tests {
         // Truncated to nothing.
         std::fs::write(&path, b"").unwrap();
         assert!(reader.read_page(None, 100).unwrap().is_empty());
+
+        // A different, longer log under the name of one the reader had read to its end.
+        let path = dir.path().join("replaced").join("log.jsonl");
+        let mut log = SessionLog::create(&path, Durability::Batch).unwrap();
+        fill(&mut log, 15);
+        drop(log);
+        let mut reader = PageReader::new(&path);
+        assert_eq!(reader.read_page(None, 100).unwrap().len(), 15);
+        let longer = dir.path().join("longer.jsonl");
+        let mut l = SessionLog::create(&longer, Durability::Batch).unwrap();
+        for i in 0..40 {
+            l.append(Author::Model, msg(2000 + i)).unwrap();
+        }
+        drop(l);
+        std::fs::write(&path, std::fs::read(&longer).unwrap()).unwrap();
+        let want = read_page(&path, Some(14), 100).unwrap();
+        assert_eq!(want.len(), 25);
+        assert_eq!(reader.read_page(Some(14), 100).unwrap(), want);
+    }
+
+    #[test]
+    fn page_reader_starts_over_when_a_verified_line_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut log) = new_log(&dir);
+        fill(&mut log, 600);
+        drop(log);
+        let mut reader = PageReader::new(&path);
+        assert_eq!(reader.read_page(None, 1000).unwrap().len(), 600);
+        // Line 100 altered in place: the length and the last line stay, line 101 no longer chains.
+        let mut ls = lines(&path);
+        let original = String::from_utf8(ls[100].clone()).unwrap();
+        let altered = original.replace("message 100", "message 1oo");
+        assert!(altered != original && altered.len() == original.len());
+        ls[100] = altered.into_bytes();
+        std::fs::write(&path, ls.concat()).unwrap();
+        // A scan that crosses the altered line stops behind it, inside what was verified before...
+        let want = read_page(&path, Some(50), 100).unwrap();
+        assert_eq!(want.last().map(|r| r.seq), Some(100));
+        assert_eq!(reader.read_page(Some(50), 100).unwrap(), want);
+        // ...and from then on nothing is served from the checkpoints beyond it.
+        assert!(reader.read_page(Some(299), 10).unwrap().is_empty());
+        for after in [None, Some(98), Some(99), Some(100), Some(255), Some(256), Some(511), Some(598)] {
+            for limit in [1usize, 10, 1000] {
+                let want = read_page(&path, after, limit).unwrap();
+                assert_eq!(reader.read_page(after, limit).unwrap(), want, "after {after:?} limit {limit}");
+            }
+        }
     }
 
     #[test]
@@ -895,6 +1033,78 @@ mod tests {
     }
 
     #[test]
+    fn opaque_record_stands_unless_the_next_line_disowns_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        // As the last line, and in front of a torn line, nothing contradicts it: it stays opaque
+        // and the file is left alone.
+        let last = hand_log(&[OK_MSG, OK_MSG, FUTURE_NOTE]);
+        let torn = [last.clone(), b"{\"seq\":3".to_vec()].concat();
+        for bytes in [last.clone(), torn] {
+            std::fs::write(&path, &bytes).unwrap();
+            let report = read_records(&path).unwrap();
+            assert_eq!((report.records.len(), report.opaque), (3, 1));
+            assert_eq!(report.records[2].event, Event::Unknown);
+            assert!(matches!(SessionLog::open(&path, Durability::Batch), Err(LogError::Newer(_))));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(no_salvage_files(&path));
+        }
+        // Opaque records in a row vouch for each other.
+        std::fs::write(&path, hand_log(&[OK_MSG, FUTURE_NOTE, FUTURE_NOTE, OK_MSG])).unwrap();
+        let report = read_records(&path).unwrap();
+        assert!(report.damage.is_none());
+        assert_eq!((report.records.len(), report.opaque), (4, 2));
+
+        // In front of a line with the next seq that was chained to other bytes, the unreadable line
+        // is where the damage starts, as it was before opaque records existed.
+        let good = hand_log(&[OK_MSG, OK_MSG]);
+        let stray = format!("{}\n", hand_line(3, &"f".repeat(64), OK_MSG)).into_bytes();
+        let bytes = [last, stray].concat();
+        std::fs::write(&path, &bytes).unwrap();
+        let report = read_records(&path).unwrap();
+        assert_eq!((report.records.len(), report.opaque), (2, 0));
+        let d = report.damage.unwrap();
+        assert!(d.detail.starts_with("line 3 is not a record"), "{}", d.detail);
+        assert_eq!(d.bad_bytes, (bytes.len() - good.len()) as u64);
+        // No reader serves the disowned line, wherever its page ends.
+        assert_eq!(read_page(&path, None, 3).unwrap(), report.records);
+        assert_eq!(PageReader::new(&path).read_page(None, 3).unwrap(), report.records);
+        assert!(PageReader::new(&path).read_page(Some(1), 1).unwrap().is_empty());
+        let (mut log, report) = SessionLog::open(&path, Durability::Batch).unwrap();
+        assert_eq!((report.records.len(), log.next_seq()), (2, 2));
+        assert_eq!(std::fs::read(&path).unwrap(), good);
+        assert_eq!(std::fs::read(report.damage.unwrap().moved_to.unwrap()).unwrap(), bytes[good.len()..].to_vec());
+        log.append(Author::User, msg(2)).unwrap();
+        assert!(read_records(&path).unwrap().damage.is_none());
+    }
+
+    #[test]
+    fn a_record_too_deep_to_read_back_is_damage_not_a_newer_record() {
+        use crate::event::{ToolCall, ToolClass};
+        use crate::ids::CallId;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut log) = new_log(&dir);
+        fill(&mut log, 2);
+        // serde_json writes any depth and reads 127 levels; inside the record these arguments are
+        // one level too deep, so this build cannot read its own line back.
+        let mut args = Value::Null;
+        for _ in 0..127 {
+            args = Value::Array(vec![args]);
+        }
+        let call = ToolCall { call_id: CallId::from("c1"), req_id: "r1".into(), name: "t".into(), args, class: ToolClass::Exec };
+        log.append(Author::Model, Event::ToolCall(call)).unwrap();
+        fill(&mut log, 1);
+        drop(log);
+        let seen = read_records(&path).unwrap();
+        assert_eq!((seen.records.len(), seen.opaque), (2, 0));
+        let (log, report) = SessionLog::open(&path, Durability::Batch).unwrap();
+        let d = report.damage.unwrap();
+        assert!(d.detail.starts_with("line 3 is not a record"), "{}", d.detail);
+        assert_eq!((report.records.len(), log.next_seq()), (2, 2));
+        assert!(read_records(&path).unwrap().damage.is_none());
+    }
+
+    #[test]
     fn unknown_variant_in_session_start_does_not_truncate() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.jsonl");
@@ -973,15 +1183,37 @@ mod tests {
         let mut chain_break = good.clone();
         chain_break.extend_from_slice(hand_line(2, &"f".repeat(64), OK_MSG).as_bytes());
         chain_break.push(b'\n');
+        // Damage in a line whose seq and prev are right: an invalid UTF-8 byte inside a string (as
+        // the last line, and in front of a line chained to the intact bytes), nesting deeper than
+        // serde_json reads, and a mangled key in front of a line chained to the intact bytes.
+        let tip = sha256_hex(good.strip_suffix(b"\n").unwrap().rsplit(|b| *b == b'\n').next().unwrap());
+        let intact = hand_line(2, &tip, OK_MSG);
+        let next = format!("{}\n", hand_line(3, &sha256_hex(intact.as_bytes()), OK_MSG)).into_bytes();
+        let mut bad_utf8 = format!("{intact}\n").into_bytes();
+        bad_utf8[intact.find("\"hi\"").unwrap() + 1] = 0xff;
+        let mangled = format!("{}\n", intact.replace("\"text\"", "\"texu\"")).into_bytes();
+        let nested = format!("{OK_MSG},\"x\":{}{}", "[".repeat(200), "]".repeat(200));
+        let deep = format!("{}\n", hand_line(2, &tip, &nested)).into_bytes();
         let cases: Vec<(&str, Vec<u8>)> = vec![
             ("is not a record", [good.clone(), b"this is not json\n".to_vec()].concat()),
             ("is not a record", [good.clone(), b"{\"x\":1}\n".to_vec()].concat()),
             ("is not a record", [good.clone(), b"[2,\"abc\"]\n".to_vec()].concat()),
             ("breaks the chain", chain_break),
             ("torn final line", [good.clone(), b"{\"seq\":2".to_vec()].concat()),
+            ("line 3 is not a record", [good.clone(), bad_utf8.clone()].concat()),
+            ("line 3 is not a record", [good.clone(), bad_utf8, next.clone()].concat()),
+            ("line 3 is not a record", [good.clone(), deep].concat()),
+            ("line 3 is not a record", [good.clone(), mangled, next].concat()),
         ];
         for (detail, bytes) in cases {
             std::fs::write(&path, &bytes).unwrap();
+            // Every reader stops in front of the damaged line and none calls it a newer record.
+            let seen = read_records(&path).unwrap();
+            assert_eq!((seen.records.len(), seen.opaque), (2, 0), "{detail}");
+            assert!(seen.damage.unwrap().detail.contains(detail));
+            assert_eq!(read_page(&path, None, 100).unwrap(), seen.records);
+            assert_eq!(PageReader::new(&path).read_page(None, 100).unwrap(), seen.records);
+            assert!(PageReader::new(&path).read_page(Some(1), 1).unwrap().is_empty());
             let (log, report) = SessionLog::open(&path, Durability::Batch).unwrap();
             let d = report.damage.unwrap();
             assert!(d.detail.contains(detail), "{} / {detail}", d.detail);

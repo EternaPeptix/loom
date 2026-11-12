@@ -223,7 +223,10 @@
 //!
 //! ## Reading
 //! - `sessions(include_archived)`: newest first. `session(id)`.
-//! - `records(id, after, limit)`: `log::read_page(paths.session_log(id), after, min(limit, 2_000))`.
+//! - `records(id, after, limit)`: a page of at most `min(limit, 2_000)` records with `seq > after`
+//!   from the session's `log::PageReader` over `paths.session_log(id)`. One reader is kept per
+//!   session so that paging in sequence does not rescan the log; only the `PAGERS_MAX` (16) most
+//!   recently paged sessions keep theirs.
 //! - `window(id)`: `log::read_records` → `weave` → [`WindowView`] (`est_tokens` with a default
 //!   `TokenEstimator` over the messages plus the tool specs' JSON).
 //! - `missions()`: one per root session. `ledger(mission)`: the journal read and folded
