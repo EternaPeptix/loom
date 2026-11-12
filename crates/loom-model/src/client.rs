@@ -527,17 +527,22 @@ impl ModelClient {
             if head.len() < HEAD_BYTES {
                 head.extend(chunk.iter().take(HEAD_BYTES - head.len()));
             }
-            for payload in parser.feed(&chunk) {
+            let classify = |e: AssembleError| match e {
+                AssembleError::Malformed(m) => sticky(format!(
+                    "the server sent a stream chunk that is not valid JSON ({m}). Check that base_url points at an OpenAI-compatible /v1 endpoint."
+                )),
+                // A stream over a size limit is malformed too: it counts toward the same bounded retries.
+                AssembleError::Oversize(m) => sticky(format!(
+                    "the server sent a malformed stream: {m}. Check that base_url points at an OpenAI-compatible /v1 endpoint."
+                )),
+                other => retry(other.to_string()),
+            };
+            for payload in parser.feed(&chunk).map_err(classify)? {
                 payloads = payloads.saturating_add(1);
                 if payload.trim() == "[DONE]" {
                     finished = true;
                 }
-                let evs = asm.push(&payload).map_err(|e| match e {
-                    AssembleError::Malformed(m) => sticky(format!(
-                        "the server sent a stream chunk that is not valid JSON ({m}). Check that base_url points at an OpenAI-compatible /v1 endpoint."
-                    )),
-                    other => retry(other.to_string()),
-                })?;
+                let evs = asm.push(&payload).map_err(classify)?;
                 for ev in evs {
                     if ttft.is_none() {
                         ttft = Some(millis(sent.elapsed()));
@@ -972,6 +977,20 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn an_endless_line_fails_after_three_attempts_naming_the_limit() {
+        let body = format!("data: {}", "x".repeat(9 * 1024 * 1024));
+        let (err, s) = fails_with(Action::Status { status: 200, body, retry_after_s: None }).await;
+        match err {
+            ModelError::Unavailable { attempts, last } => {
+                assert_eq!(attempts, 3);
+                assert!(last.contains("malformed stream") && last.contains("a line") && last.contains("8 MiB"), "{last}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(s.requests().len(), 3);
     }
 
     #[tokio::test]

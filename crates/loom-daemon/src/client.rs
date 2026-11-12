@@ -97,7 +97,14 @@ impl EventStream {
             }
             match tokio::time::timeout(self.idle, self.response.chunk()).await {
                 Ok(Ok(Some(chunk))) => {
-                    for payload in self.parser.feed(&chunk) {
+                    let payloads = match self.parser.feed(&chunk) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            self.done = true;
+                            return Some(Err(e.to_string()));
+                        }
+                    };
+                    for payload in payloads {
                         match serde_json::from_str::<BusEvent>(&payload) {
                             Ok(event) => self.ready.push_back(event),
                             Err(e) => tracing::debug!("skipping an event that did not parse: {e}"),
