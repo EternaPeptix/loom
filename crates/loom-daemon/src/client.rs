@@ -41,7 +41,7 @@
 //! is public so the command line names the same address the client uses.
 
 use crate::wire::{
-    AnswerBody, ArchiveBody, DaemonFile, ErrorBody, LinesView, MessageBody, RecordsPage, SessionDetail, StatusView,
+    AnswerBody, ArchiveBody, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody, RecordsPage, SessionDetail, StatusView,
 };
 use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, NetEntry, NewSession, SessionInfo, WindowView,
@@ -344,6 +344,17 @@ impl Client {
     pub async fn blob_lines(&self, handle: &str, start: u64, end: u64) -> Result<LinesView, String> {
         let query = [("start", start.to_string()), ("end", end.to_string())];
         self.call(Method::GET, &format!("/api/blobs/{}/lines", segment(handle)), &query, None).await
+    }
+
+    /// Collect unreferenced stored outputs; a dry run unless `apply`. Walking a large store takes a while.
+    pub async fn gc(&self, apply: bool) -> Result<loom_core::blob::SweepReport, String> {
+        let body = serde_json::to_value(GcBody { apply }).map_err(|e| format!("The request cannot be encoded ({e})."))?;
+        let path = "/api/gc";
+        let response = self.send_raw(Method::POST, path, &[], Some(body), Some(Duration::from_secs(600))).await?;
+        let bytes = response.bytes().await.map_err(|e| self.transport_error(&Method::POST, path, e))?;
+        serde_json::from_slice(&bytes).map_err(|e| {
+            format!("The daemon's answer to POST {path} was not understood ({e}); the `loom` command and the daemon may be different versions.")
+        })
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {

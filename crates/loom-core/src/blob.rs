@@ -9,7 +9,28 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+/// Temporary files in `tmp/` older than this are leftovers of a crashed writer and are removed when the store
+/// opens; a younger one may belong to a writer in another process.
+pub const STALE_TMP_AGE: Duration = Duration::from_secs(3600);
+
+/// A blob younger than this is never collected: it may have been written just before the record that names it.
+pub const DEFAULT_GC_MIN_AGE: Duration = Duration::from_secs(3600);
+
+/// What a sweep found. With `applied == false` nothing was deleted and `collected*` are what would be.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SweepReport {
+    pub examined: u64,
+    pub examined_bytes: u64,
+    pub kept: u64,
+    pub kept_bytes: u64,
+    pub collected: u64,
+    pub collected_bytes: u64,
+    pub applied: bool,
+}
 
 /// A stored output: its id and size.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,7 +90,49 @@ impl BlobStore {
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
         fs::create_dir_all(root.join("tmp"))?;
+        remove_stale_tmp(&root.join("tmp"), STALE_TMP_AGE);
         Ok(Self { root })
+    }
+
+    /// Delete blobs (and their index files) whose id is not in `keep` and whose file is older than `min_age`.
+    /// With `apply == false` only counts. Anything that cannot be deleted is kept.
+    pub fn sweep(&self, keep: &HashSet<String>, min_age: Duration, apply: bool) -> io::Result<SweepReport> {
+        let mut report = SweepReport { applied: apply, ..SweepReport::default() };
+        let now = SystemTime::now();
+        for shard in fs::read_dir(&self.root)?.flatten() {
+            let name = shard.file_name().to_string_lossy().to_string();
+            if name.len() != 2 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(shard.path()) else { continue };
+            for entry in entries.flatten() {
+                let id = entry.file_name().to_string_lossy().to_string();
+                if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                report.examined += 1;
+                report.examined_bytes = report.examined_bytes.saturating_add(meta.len());
+                let old = meta.modified().ok().and_then(|m| now.duration_since(m).ok()).is_some_and(|age| age >= min_age);
+                let mut keep_it = keep.contains(&id) || !old;
+                if !keep_it && apply {
+                    // Index first: a blob without an index is rebuilt on read, an index without a blob is inert.
+                    let _ = fs::remove_file(self.idx_path(&BlobId(id.clone())));
+                    keep_it = fs::remove_file(entry.path()).is_err();
+                }
+                if keep_it {
+                    report.kept += 1;
+                    report.kept_bytes = report.kept_bytes.saturating_add(meta.len());
+                } else {
+                    report.collected += 1;
+                    report.collected_bytes = report.collected_bytes.saturating_add(meta.len());
+                }
+            }
+        }
+        Ok(report)
     }
 
     pub fn root(&self) -> &Path {
@@ -128,7 +191,7 @@ impl BlobStore {
 
     pub fn meta(&self, id: &BlobId) -> io::Result<BlobRef> {
         let bytes = fs::metadata(self.path_of(&id.0))?.len();
-        let lines = fs::metadata(self.idx_path(id))?.len() / 8;
+        let lines = self.offsets(id)?.len() as u64;
         Ok(BlobRef { id: id.clone(), bytes, lines })
     }
 
@@ -143,8 +206,27 @@ impl BlobStore {
     }
 
     fn offsets(&self, id: &BlobId) -> io::Result<Vec<u64>> {
-        let raw = fs::read(self.idx_path(id))?;
-        Ok(raw.chunks_exact(8).map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])).collect())
+        let blob = self.path_of(&id.0);
+        let size = fs::metadata(&blob)?.len();
+        let stored = fs::read(self.idx_path(id)).ok().filter(|raw| raw.len() % 8 == 0).map(|raw| {
+            raw.chunks_exact(8).map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])).collect::<Vec<u64>>()
+        });
+        if let Some(offsets) = stored {
+            if index_matches(&blob, &offsets, size)? {
+                return Ok(offsets);
+            }
+        }
+        // Missing, short or garbage index (a crash, a bad disk): the blob is the truth, so rebuild from it.
+        let offsets = scan_offsets(&blob)?;
+        let tmp = self.root.join("tmp").join(format!("rebuild-{}-{}.idx", crate::now_ms(), rand::random::<u64>()));
+        if write_index(&tmp, &self.idx_path(id), &offsets).is_ok() {
+            if let Some(dir) = blob.parent() {
+                let _ = sync_dir(dir);
+            }
+        } else {
+            let _ = fs::remove_file(&tmp);
+        }
+        Ok(offsets)
     }
 
     /// Lines `start..=end` (1-based). Out-of-range bounds are clamped; an empty range gives empty text.
@@ -157,11 +239,14 @@ impl BlobStore {
             return Ok(LineSlice { text: String::new(), first, last: first.saturating_sub(1), total });
         }
         let size = fs::metadata(self.path_of(&id.0))?.len();
-        let from = offsets[(first - 1) as usize];
-        let to = if last < total { offsets[last as usize] } else { size };
+        let corrupt = || io::Error::new(io::ErrorKind::InvalidData, format!("the line index of {} is inconsistent", id.0));
+        let at = |n: u64| usize::try_from(n).ok().and_then(|n| offsets.get(n));
+        let from = *at(first - 1).ok_or_else(corrupt)?;
+        let to = if last < total { *at(last).ok_or_else(corrupt)? } else { size };
+        let len = usize::try_from(to.checked_sub(from).ok_or_else(corrupt)?).map_err(|_| corrupt())?;
         let mut file = File::open(self.path_of(&id.0))?;
         file.seek(SeekFrom::Start(from))?;
-        let mut buf = vec![0u8; (to - from) as usize];
+        let mut buf = vec![0u8; len];
         file.read_exact(&mut buf)?;
         Ok(LineSlice { text: String::from_utf8_lossy(&buf).into_owned(), first, last, total })
     }
@@ -201,6 +286,118 @@ impl BlobStore {
     }
 }
 
+/// Add to `found` every run of 64 hexadecimal characters in `reader`, lower-cased, whatever surrounds it. A longer
+/// run (an id glued to other hex, up to 1024 characters) contributes every 64-character window, so an id is
+/// found even when it is not delimited. This is how a garbage collection learns which blobs are in use without
+/// knowing which record field holds an id.
+pub fn scan_ids(reader: impl Read, found: &mut HashSet<String>) -> io::Result<()> {
+    const MAX_RUN: usize = 1024;
+    let mut reader = BufReader::new(reader);
+    let mut run: Vec<u8> = Vec::new();
+    let flush = |run: &mut Vec<u8>, found: &mut HashSet<String>| {
+        for w in run.windows(64) {
+            found.insert(String::from_utf8_lossy(w).into_owned());
+        }
+        run.clear();
+    };
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            flush(&mut run, found);
+            return Ok(());
+        }
+        for b in chunk {
+            if b.is_ascii_hexdigit() {
+                if run.len() < MAX_RUN {
+                    run.push(b.to_ascii_lowercase());
+                }
+            } else {
+                flush(&mut run, found);
+            }
+        }
+        let n = chunk.len();
+        reader.consume(n);
+    }
+}
+
+/// Remove files in `dir` last modified more than `max_age` ago. Best effort.
+fn remove_stale_tmp(dir: &Path, max_age: Duration) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|m| m.is_file())
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > max_age);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+/// Write the index through `tmp` (synced) and rename it over `idx`.
+fn write_index(tmp: &Path, idx: &Path, offsets: &[u64]) -> io::Result<()> {
+    let mut raw = Vec::with_capacity(offsets.len().saturating_mul(8));
+    for off in offsets {
+        raw.extend_from_slice(&off.to_le_bytes());
+    }
+    let mut f = File::create(tmp)?;
+    f.write_all(&raw)?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(tmp, idx)
+}
+
+/// Line start offsets computed from the blob itself.
+fn scan_offsets(blob: &Path) -> io::Result<Vec<u64>> {
+    let mut reader = BufReader::new(File::open(blob)?);
+    let (mut offsets, mut pos, mut at_start) = (Vec::new(), 0u64, true);
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(offsets);
+        }
+        for b in chunk {
+            if at_start {
+                offsets.push(pos);
+            }
+            at_start = *b == b'\n';
+            pos = pos.saturating_add(1);
+        }
+        let n = chunk.len();
+        reader.consume(n);
+    }
+}
+
+/// Cheap consistency check of a stored index against the blob: starts at 0, strictly increasing, inside the
+/// blob, and the last line really is the last line (so a truncated index is noticed).
+fn index_matches(blob: &Path, offsets: &[u64], size: u64) -> io::Result<bool> {
+    let (Some(&first), Some(&last)) = (offsets.first(), offsets.last()) else { return Ok(size == 0) };
+    if first != 0 || last >= size || offsets.windows(2).any(|w| w[0] >= w[1]) {
+        return Ok(false);
+    }
+    let mut file = File::open(blob)?;
+    file.seek(SeekFrom::Start(last))?;
+    let mut reader = BufReader::new(file);
+    let (mut newlines, mut final_byte) = (0u64, 0u8);
+    loop {
+        let chunk = reader.fill_buf()?;
+        let Some(&tail) = chunk.last() else { break };
+        newlines += chunk.iter().filter(|b| **b == b'\n').count() as u64;
+        final_byte = tail;
+        let n = chunk.len();
+        reader.consume(n);
+    }
+    Ok(newlines == 0 || (newlines == 1 && final_byte == b'\n'))
+}
+
 fn not_found(handle: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("no stored output for handle {handle}"))
 }
@@ -227,6 +424,16 @@ impl Write for BlobWriter {
     }
 }
 
+impl Drop for BlobWriter {
+    /// A writer that was abandoned or failed leaves nothing behind (after `finish` the files are gone already).
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.tmp);
+        let mut idx_tmp = self.tmp.clone().into_os_string();
+        idx_tmp.push(".idx");
+        let _ = fs::remove_file(idx_tmp);
+    }
+}
+
 impl BlobWriter {
     pub fn bytes_written(&self) -> u64 {
         self.bytes
@@ -242,19 +449,31 @@ impl BlobWriter {
         }
         let blob = BlobRef { id: BlobId(id), bytes: self.bytes, lines: self.offsets.len() as u64 };
         let idx = self.store.idx_path(&blob.id);
-        if dest.exists() && idx.exists() {
+        let mut idx_tmp = self.tmp.clone().into_os_string();
+        idx_tmp.push(".idx");
+        let idx_tmp = PathBuf::from(idx_tmp);
+        let shard = dest.parent().map(Path::to_path_buf);
+        if dest.exists() {
+            // Same bytes are already stored. Trust the index only if it has the length the content implies.
+            let want = (self.offsets.len() as u64).saturating_mul(8);
+            if fs::metadata(&idx).map(|m| m.len()).ok() != Some(want) {
+                write_index(&idx_tmp, &idx, &self.offsets)?;
+                if let Some(dir) = &shard {
+                    sync_dir(dir)?;
+                }
+            }
+            // Refresh the age so a collection running now does not take a blob that is about to be referenced.
+            if let Ok(f) = fs::OpenOptions::new().write(true).open(&dest) {
+                let _ = f.set_modified(SystemTime::now());
+            }
             let _ = fs::remove_file(&self.tmp);
             return Ok(blob);
         }
-        let mut raw = Vec::with_capacity(self.offsets.len() * 8);
-        for off in &self.offsets {
-            raw.extend_from_slice(&off.to_le_bytes());
-        }
-        let mut idx_tmp = self.tmp.clone().into_os_string();
-        idx_tmp.push(".idx");
-        fs::write(&idx_tmp, raw)?;
-        fs::rename(&idx_tmp, &idx)?;
+        write_index(&idx_tmp, &idx, &self.offsets)?;
         fs::rename(&self.tmp, &dest)?;
+        if let Some(dir) = &shard {
+            sync_dir(dir)?;
+        }
         Ok(blob)
     }
 }
@@ -347,5 +566,115 @@ mod tests {
         let streamed = w.finish().unwrap();
         assert_eq!(streamed, s.put_bytes(b"abc\ndef\n").unwrap());
         assert_eq!(s.read_lines(&streamed.id, 2, 2).unwrap().text, "def\n");
+    }
+
+    fn tmp_files(s: &BlobStore) -> Vec<PathBuf> {
+        fs::read_dir(s.root().join("tmp")).unwrap().flatten().map(|e| e.path()).collect()
+    }
+
+    #[test]
+    fn dropped_writer_leaves_no_temp_file() {
+        let (_d, s) = store();
+        let mut w = s.writer().unwrap();
+        w.write_all(b"half a line").unwrap();
+        assert_eq!(tmp_files(&s).len(), 1);
+        drop(w);
+        assert!(tmp_files(&s).is_empty());
+        s.put_bytes(b"x\n").unwrap();
+        assert!(tmp_files(&s).is_empty());
+    }
+
+    #[test]
+    fn open_removes_old_temp_files_only() {
+        let (_d, s) = store();
+        let old = s.root().join("tmp").join("old-1");
+        let fresh = s.root().join("tmp").join("fresh-1");
+        fs::write(&old, b"x").unwrap();
+        fs::write(&fresh, b"x").unwrap();
+        let f = fs::OpenOptions::new().write(true).open(&old).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(2 * 3600)).unwrap();
+        drop(f);
+        let _s2 = BlobStore::open(s.root()).unwrap();
+        assert!(!old.exists());
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn damaged_index_is_repaired_on_store_and_on_read() {
+        let (_d, s) = store();
+        let data = b"one\ntwo\nthree\n";
+        let b = s.put_bytes(data).unwrap();
+        let idx = s.idx_path(&b.id);
+        // Empty index: storing the same bytes again repairs it.
+        fs::write(&idx, b"").unwrap();
+        assert_eq!(s.put_bytes(data).unwrap(), b);
+        assert_eq!(fs::metadata(&idx).unwrap().len(), 24);
+        assert_eq!(s.meta(&b.id).unwrap().lines, 3);
+        // Short (truncated) index: reading repairs it.
+        fs::write(&idx, 0u64.to_le_bytes()).unwrap();
+        assert_eq!(s.read_lines(&b.id, 2, 3).unwrap().text, "two\nthree\n");
+        assert_eq!(fs::metadata(&idx).unwrap().len(), 24);
+        // Garbage that would underflow, odd lengths, and a missing index do not panic.
+        let mut garbage = Vec::new();
+        for off in [0u64, 900, 5] {
+            garbage.extend_from_slice(&off.to_le_bytes());
+        }
+        fs::write(&idx, &garbage).unwrap();
+        assert_eq!(s.read_lines(&b.id, 1, 3).unwrap().text, "one\ntwo\nthree\n");
+        fs::write(&idx, b"abc").unwrap();
+        assert_eq!(s.meta(&b.id).unwrap().lines, 3);
+        fs::remove_file(&idx).unwrap();
+        assert!(s.contains_in_range(&b.id, 3, 3, "three").unwrap());
+        assert!(idx.exists());
+    }
+
+    #[test]
+    fn sweep_deletes_old_unreferenced_blobs_with_their_index() {
+        let (_d, s) = store();
+        let old_gone = s.put_bytes(b"gone\n").unwrap();
+        let old_kept = s.put_bytes(b"kept\n").unwrap();
+        let young = s.put_bytes(b"young\n").unwrap();
+        for b in [&old_gone, &old_kept] {
+            let f = fs::OpenOptions::new().write(true).open(s.path_of(&b.id.0)).unwrap();
+            f.set_modified(SystemTime::now() - Duration::from_secs(7200)).unwrap();
+        }
+        let keep: HashSet<String> = [old_kept.id.0.clone()].into_iter().collect();
+        let dry = s.sweep(&keep, DEFAULT_GC_MIN_AGE, false).unwrap();
+        assert_eq!((dry.examined, dry.kept, dry.collected, dry.collected_bytes, dry.applied), (3, 2, 1, 5, false));
+        assert!(s.path_of(&old_gone.id.0).exists());
+        let real = s.sweep(&keep, DEFAULT_GC_MIN_AGE, true).unwrap();
+        assert_eq!((real.examined, real.kept, real.collected, real.collected_bytes), (3, 2, 1, 5));
+        assert!(!s.path_of(&old_gone.id.0).exists());
+        assert!(!s.idx_path(&old_gone.id).exists());
+        assert!(s.path_of(&old_kept.id.0).exists() && s.idx_path(&old_kept.id).exists());
+        assert!(s.path_of(&young.id.0).exists());
+    }
+
+    #[test]
+    fn scan_ids_finds_ids_in_any_text() {
+        let a = "a".repeat(64);
+        let b = "0123456789abcdef".repeat(4).to_uppercase();
+        let text = format!("{{\"x\":\"{a}\"}} out:{b}\\n12345 {}", "f".repeat(63));
+        let mut found = HashSet::new();
+        scan_ids(text.as_bytes(), &mut found).unwrap();
+        assert!(found.contains(&a));
+        assert!(found.contains(&b.to_lowercase()));
+        assert_eq!(found.len(), 2);
+        // Glued to other hex still counts.
+        let mut found = HashSet::new();
+        scan_ids(format!("9{a}").as_bytes(), &mut found).unwrap();
+        assert!(found.contains(&a));
+    }
+
+    #[test]
+    fn restoring_existing_bytes_refreshes_their_age() {
+        let (_d, s) = store();
+        let b = s.put_bytes(b"again\n").unwrap();
+        let f = fs::OpenOptions::new().write(true).open(s.path_of(&b.id.0)).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(7200)).unwrap();
+        drop(f);
+        s.put_bytes(b"again\n").unwrap();
+        let r = s.sweep(&HashSet::new(), DEFAULT_GC_MIN_AGE, false).unwrap();
+        assert_eq!((r.kept, r.collected), (1, 0));
     }
 }

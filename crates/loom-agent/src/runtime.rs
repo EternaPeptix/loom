@@ -2025,6 +2025,27 @@ impl Runtime {
         Ok(())
     }
 
+    /// Garbage-collect stored outputs. Keeps every blob whose id appears anywhere in the text of any file under
+    /// the sessions and missions directories (logs, damaged-log remainders, meta, status, net audit, journals),
+    /// and every blob younger than `min_age` (default one hour). Only the rest is deleted, and only with
+    /// `apply`; otherwise the report says what would be. Removing a session's directory is what makes its
+    /// outputs collectable. Any file that cannot be read aborts the collection before anything is deleted.
+    pub async fn gc(&self, apply: bool, min_age: Option<Duration>) -> Result<loom_core::blob::SweepReport, String> {
+        let blobs = self.inner.blobs.clone();
+        let roots = [self.inner.paths.sessions_dir(), self.inner.paths.missions_dir()];
+        let min_age = min_age.unwrap_or(loom_core::blob::DEFAULT_GC_MIN_AGE);
+        tokio::task::spawn_blocking(move || {
+            let mut keep = HashSet::new();
+            for root in &roots {
+                scan_tree_for_ids(root, &mut keep, 0)
+                    .map_err(|e| format!("cannot read {} ({e}); nothing was collected. Fix that and run it again.", root.display()))?;
+            }
+            blobs.sweep(&keep, min_age, apply).map_err(|e| format!("cannot sweep the blob store: {e}"))
+        })
+        .await
+        .map_err(|e| format!("the collection task failed: {e}"))?
+    }
+
     pub fn inbox(&self) -> Vec<InboxEntry> {
         let mut items = self.inner.st().inbox.clone();
         items.sort_by_key(|e| e.opened_ms);
@@ -2201,6 +2222,37 @@ impl Runtime {
         }
         inner.proxy.shutdown();
     }
+}
+
+/// Add every 64-hex token in every file below `dir` to `keep`. A missing `dir` is an empty tree.
+fn scan_tree_for_ids(dir: &Path, keep: &mut HashSet<String>, depth: usize) -> std::io::Result<()> {
+    if depth > 16 {
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            // Vanished while scanning (a session directory being removed): nothing there to keep.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if meta.is_dir() {
+            scan_tree_for_ids(&path, keep, depth + 1)?;
+        } else if meta.is_file() {
+            match std::fs::File::open(&path) {
+                Ok(f) => loom_core::blob::scan_ids(f, keep)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Inner {
@@ -2735,6 +2787,51 @@ mod tests {
         rt2.archive(&id, false).await.unwrap();
         assert_eq!(rt2.sessions(false).len(), 1);
         rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_everything_referenced_anywhere_and_young_blobs() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let home = e.dir.path().join("home");
+        let store = e.rt.blobs().clone();
+        let old = |data: &str| {
+            let b = store.put_bytes(data.as_bytes()).unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(store.root().join(&b.id.0[..2]).join(&b.id.0)).unwrap();
+            f.set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)).unwrap();
+            b.id.0
+        };
+        let (in_log, in_journal, in_damaged, in_raw, orphan) =
+            (old("log\n"), old("journal\n"), old("damaged\n"), old("raw\n"), old("orphan\n"));
+        let young = store.put_bytes(b"young\n").unwrap().id.0;
+        let s1 = home.join("sessions").join("s-gc1");
+        let m1 = home.join("missions").join("m-gc1");
+        std::fs::create_dir_all(&s1).unwrap();
+        std::fs::create_dir_all(&m1).unwrap();
+        std::fs::write(s1.join("log.jsonl"), format!("{{\"seq\":1,\"blob\":\"{in_log}\"}}\n")).unwrap();
+        std::fs::write(s1.join("log.jsonl.damaged-1"), format!("garbage {{{{ \"x\":\"{in_damaged}")).unwrap();
+        std::fs::write(
+            s1.join("log2.jsonl"),
+            format!("{{\"type\":\"ToolResult\",\"meta\":{{\"{}\":\"{in_raw}\"}}}}\n", loom_core::event::META_RAW_BLOB),
+        )
+        .unwrap();
+        std::fs::write(m1.join("journal.jsonl"), format!("{{\"ref\":\"out:{in_journal}\"}}\n")).unwrap();
+
+        let dry = e.rt.gc(false, None).await.unwrap();
+        assert_eq!((dry.examined, dry.kept, dry.collected, dry.applied), (6, 5, 1, false));
+        assert!(store.read_all(&BlobId(orphan.clone())).is_ok());
+        let done = e.rt.gc(true, None).await.unwrap();
+        assert_eq!((done.collected, done.collected_bytes), (1, 7));
+        assert!(store.read_all(&BlobId(orphan)).is_err());
+        for id in [&in_log, &in_journal, &in_damaged, &in_raw, &young] {
+            assert!(store.read_all(&BlobId(id.clone())).is_ok(), "{id} was collected");
+        }
+        // The session directory goes: its blobs become collectable (the young one still is not).
+        std::fs::remove_dir_all(&s1).unwrap();
+        let after = e.rt.gc(false, None).await.unwrap();
+        assert_eq!((after.examined, after.kept, after.collected), (5, 2, 3));
+        let zero_age = e.rt.gc(false, Some(Duration::ZERO)).await.unwrap();
+        assert_eq!(zero_age.collected, 4);
+        e.rt.shutdown().await;
     }
 
     #[tokio::test]

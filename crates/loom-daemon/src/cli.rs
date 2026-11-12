@@ -144,6 +144,11 @@ pub enum Command {
     Reweave(SessionArg),
     /// Hide a finished session (or bring it back with --undo)
     Archive(ArchiveArgs),
+    /// Delete stored tool outputs that no session or mission refers to any more (dry run unless --apply)
+    ///
+    /// Collects blobs that appear nowhere in the files under the sessions and missions directories and are
+    /// older than one hour. Removing a session's directory is what makes its outputs collectable.
+    Gc(GcArgs),
     /// List what is waiting for you
     Inbox,
     /// Answer an inbox item
@@ -275,6 +280,13 @@ pub struct ArchiveArgs {
     pub session: String,
     #[arg(long)]
     pub undo: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct GcArgs {
+    /// Delete them (the default only reports what would be deleted)
+    #[arg(long)]
+    pub apply: bool,
 }
 
 #[derive(Args, Debug)]
@@ -906,6 +918,15 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             c.archive(&id, !a.undo).await?;
             outln(&format!("{} {id}", if a.undo { "restored" } else { "archived" })).map(|()| 0)
         }
+        Command::Gc(a) => {
+            let r = client_of(&paths)?.gc(a.apply).await?;
+            let (verb, hint) = if a.apply { ("deleted", "") } else { ("would delete", "\nRun `loom gc --apply` to delete them.") };
+            outln(&format!(
+                "examined {} stored outputs ({} bytes); kept {} ({} bytes); {verb} {} ({} bytes).{hint}",
+                r.examined, r.examined_bytes, r.kept, r.kept_bytes, r.collected, r.collected_bytes
+            ))
+            .map(|()| 0)
+        }
         Command::Inbox => {
             let list = client_of(&paths)?.inbox().await?;
             block(&render::inbox_list(&list, loom_core::now_ms(), &style())).map(|()| 0)
@@ -1266,6 +1287,9 @@ mod tests {
         assert!(a.undo);
         let Command::Archive(a) = ok(&["archive", "s-1"]) else { panic!("not archive") };
         assert!(!a.undo);
+        assert!(matches!(ok(&["gc"]), Command::Gc(GcArgs { apply: false })));
+        assert!(matches!(ok(&["gc", "--apply"]), Command::Gc(GcArgs { apply: true })));
+        rejected(&["gc", "--force"]);
         let Command::Answer(a) = ok(&["answer", "i-1", "yes", "please"]) else { panic!("not answer") };
         assert_eq!((a.item.as_str(), a.text), ("i-1", words(&["yes", "please"])));
         let Command::Answer(a) = ok(&["answer", "i-1"]) else { panic!("not answer") };

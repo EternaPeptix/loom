@@ -53,6 +53,7 @@
 //! | `GET /blobs/{handle}/raw` | the stored bytes | `application/octet-stream`, `Content-Disposition: attachment` |
 //! | `GET /blobs/{handle}/lines?start={a}&end={b}` | `blobs.read_lines` (1-based inclusive; default `1..=2000`; at most 5000 lines per call) | `LinesView` |
 //! | `GET /events?deltas=true` | see *Streams* | SSE |
+//! | `POST /gc` (`GcBody`) | `runtime.gc(apply, None)` | `200` `SweepReport` |
 //! | `POST /shutdown` | cancels `state.shutdown` | `202` `{}` |
 //!
 //! A session id that no session has is `404` `{"error": "There is no session {id}."}`; a handle
@@ -96,7 +97,7 @@
 use crate::auth;
 use crate::ui;
 use crate::wire::{
-    AnswerBody, ArchiveBody, ErrorBody, LinesView, MessageBody, RecordsPage, SessionDetail, StatusView,
+    AnswerBody, ArchiveBody, ErrorBody, GcBody, LinesView, MessageBody, RecordsPage, SessionDetail, StatusView,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -176,6 +177,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/blobs/{handle}/raw", get(blob_raw))
         .route("/api/blobs/{handle}/lines", get(blob_lines))
         .route("/api/events", get(events))
+        .route("/api/gc", post(gc))
         .route("/api/shutdown", post(shutdown))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(state.clone(), gate))
@@ -513,6 +515,12 @@ async fn answer(State(s): State<ApiState>, Path(item_id): Path<String>, body: By
     let body: AnswerBody = json_body(&body)?;
     s.runtime.answer(&item_id, &body.answer).await.map_err(rt_err)?;
     Ok(accepted())
+}
+
+async fn gc(State(s): State<ApiState>, body: Bytes) -> Res<Response> {
+    let body: GcBody = json_body(&body)?;
+    let report = s.runtime.gc(body.apply, None).await.map_err(rt_err)?;
+    Ok(Json(report).into_response())
 }
 
 async fn shutdown(State(s): State<ApiState>) -> Response {
@@ -1359,6 +1367,20 @@ mod tests {
         // A limit above the maximum is clamped rather than refused.
         let (s, _) = e.get(&format!("/api/sessions/{id}/records?limit=99999")).await;
         assert_eq!(s, 200);
+    }
+
+    #[tokio::test]
+    async fn gc_route_reports_dry_run_by_default_and_deletes_on_apply() {
+        let e = env(Script::new(|_, _| slow_finish("ok", 0))).await;
+        let b = e.rt.blobs().put_bytes(b"orphan\n").unwrap();
+        let (s, r) = e.post("/api/gc", json!({})).await;
+        assert_eq!((s, r["applied"].clone(), r["examined"].clone(), r["collected"].clone()), (200, json!(false), json!(1), json!(0)));
+        // Young blobs are never collected, so even --apply keeps this one.
+        let (s, r) = e.post("/api/gc", json!({"apply": true})).await;
+        assert_eq!((s, r["applied"].clone(), r["kept"].clone()), (200, json!(true), json!(1)));
+        assert!(e.rt.blobs().read_all(&b.id).is_ok());
+        let (s, r) = e.post_text("/api/gc", "{\"apply\": \"yes\"}").await;
+        assert_eq!(s, 400, "{r}");
     }
 
     // --- streams -------------------------------------------------------------------------------
