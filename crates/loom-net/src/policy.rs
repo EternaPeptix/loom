@@ -44,6 +44,15 @@
 //! IPv4 address behind such a prefix is not seen. Listing one in `allow_private` admits every IPv4
 //! address behind it, private ones included, and IPv4 `deny` entries do not cover addresses inside it.
 //!
+//! ## Per-session grants — `Policy::with_hosts(cfg, hosts)`, `check_hosts(hosts)`
+//! `with_hosts` is `Policy::new(cfg)` plus the operator-granted `hosts` (same pattern syntax as `allow`).
+//! Mode `deny_all` with at least one host becomes `allowlist` allowing exactly the granted hosts; mode
+//! `allowlist` gets them appended to `allow`; mode `open` is unchanged. `deny` and `allow_private` are
+//! the config's, so a granted host that is denied, or resolves to a private address, is still refused.
+//! An entry that is not a valid pattern is an error sentence naming it. `check_hosts` trims and
+//! validates a list of hosts to grant (non-empty, no blank entry, no whitespace or comma inside an
+//! entry, each a valid pattern) and returns them as written, trimmed.
+//!
 //! `Verdict::allowed` + `rule` are what the proxy reports. Everything here is deterministic and does
 //! no I/O.
 //!
@@ -272,6 +281,35 @@ pub struct Policy {
     allow_private: Vec<PrivEntry>,
 }
 
+fn grant_pattern(host: &str) -> Result<Pattern, String> {
+    Pattern::parse(host).map_err(|why| {
+        format!(
+            "The host \"{host}\" cannot be authorized: {why}. Write a host (`example.test`) or a wildcard (`*.example.test`), optionally followed by `:port`."
+        )
+    })
+}
+
+/// Validate hosts to be granted to a session: at least one, none blank, one host per entry, each a valid
+/// pattern. Returned trimmed. The errors are sentences for the operator or the model.
+pub fn check_hosts(hosts: &[String]) -> Result<Vec<String>, String> {
+    if hosts.is_empty() {
+        return Err("Name at least one host, one per entry, such as `api.example.test` or `*.example.test`.".to_string());
+    }
+    let mut out = Vec::new();
+    for h in hosts {
+        let h = h.trim();
+        if h.is_empty() {
+            return Err("A host is blank. Give one host per entry, such as `api.example.test`, and no empty entries.".to_string());
+        }
+        if h.chars().any(|c| c.is_whitespace() || c == ',') {
+            return Err(format!("The host entry \"{h}\" contains whitespace or a comma. Give one host per entry."));
+        }
+        grant_pattern(h)?;
+        out.push(h.to_string());
+    }
+    Ok(out)
+}
+
 fn parse_list<T>(list: &str, entries: &[String], parse: fn(&str) -> Result<T, String>) -> Result<Vec<T>, String> {
     entries
         .iter()
@@ -294,6 +332,20 @@ impl Policy {
             deny: parse_list("deny", &cfg.deny, PrivEntry::parse)?,
             allow_private: parse_list("allow_private", &cfg.allow_private, PrivEntry::parse_private)?,
         })
+    }
+
+    /// The policy of `cfg` with `hosts` granted on top (see the module contract). The hosts are not
+    /// trimmed here: pass them through [`check_hosts`] first.
+    pub fn with_hosts(cfg: &NetworkCfg, hosts: &[String]) -> Result<Policy, String> {
+        let mut policy = Policy::new(cfg)?;
+        if hosts.is_empty() || policy.mode == NetworkMode::Open {
+            return Ok(policy);
+        }
+        for h in hosts {
+            policy.allow.push(grant_pattern(h)?);
+        }
+        policy.mode = NetworkMode::Allowlist;
+        Ok(policy)
     }
 
     pub fn check_name(&self, host: &str, port: u16) -> Verdict {
@@ -454,6 +506,49 @@ mod tests {
     }
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn granted_hosts_widen_deny_all_and_allowlist_but_not_open_and_not_past_deny_or_private() {
+        let c = cfg(NetworkMode::DenyAll, &[], &["bad.test"], &[]);
+        let hosts = |h: &[&str]| h.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let p = Policy::with_hosts(&c, &hosts(&["a.test", "*.b.test:443"])).unwrap();
+        assert!(p.check_name("a.test", 80).allowed);
+        assert!(p.check_name("x.b.test", 443).allowed);
+        assert!(!p.check_name("x.b.test", 80).allowed);
+        assert_eq!(p.check_name("other.test", 80).rule, "not in allow list");
+        // Nothing granted: still deny_all.
+        assert_eq!(Policy::with_hosts(&c, &[]).unwrap().check_name("a.test", 80).rule, "mode deny_all");
+
+        let base = cfg(NetworkMode::Allowlist, &["base.test"], &["bad.test"], &[]);
+        let p = Policy::with_hosts(&base, &hosts(&["a.test", "bad.test"])).unwrap();
+        assert!(p.check_name("base.test", 80).allowed && p.check_name("a.test", 80).allowed);
+        assert!(!p.check_name("other.test", 80).allowed);
+        // The deny list beats a grant.
+        assert_eq!(p.check_name("bad.test", 80).rule, "deny bad.test");
+        // A granted name that resolves to a private address is still refused.
+        let v = p.check_addr("a.test", 80, ip("10.1.2.3"), "allow a.test");
+        assert!(!v.allowed && v.rule.starts_with("deny private-address"), "{v:?}");
+        assert!(p.check_addr("a.test", 80, ip("93.184.216.34"), "allow a.test").allowed);
+
+        let open = Policy::with_hosts(&cfg(NetworkMode::Open, &[], &[], &[]), &hosts(&["a.test"])).unwrap();
+        assert_eq!(open.check_name("anything.test", 80).rule, "mode open");
+    }
+
+    #[test]
+    fn granted_hosts_are_validated() {
+        let c = cfg(NetworkMode::DenyAll, &[], &[], &[]);
+        let bad = |h: &str| Policy::with_hosts(&c, &[h.to_string()]).unwrap_err();
+        assert!(bad("bad host").contains("\"bad host\" cannot be authorized"));
+        assert!(bad("a*b.test").contains("cannot be authorized"));
+        assert!(bad("x.test:99999").contains("cannot be authorized"));
+        let s = |h: &[&str]| check_hosts(&h.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        assert_eq!(s(&[" a.test ", "*.b.test"]).unwrap(), ["a.test", "*.b.test"]);
+        assert!(s(&[]).unwrap_err().contains("at least one host"));
+        assert!(s(&["a.test", "  "]).unwrap_err().contains("blank"));
+        assert!(s(&["a.test,b.test"]).unwrap_err().contains("one host per entry"));
+        assert!(s(&["a b"]).unwrap_err().contains("one host per entry"));
+        assert!(s(&["a*b"]).unwrap_err().contains("cannot be authorized"));
     }
 
     #[test]

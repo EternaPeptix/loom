@@ -118,6 +118,10 @@
 //! - `Input::Withdraw{id, reason}`: `shared.ledger_append(true, ConstraintRetire{id, reason})`; on
 //!   success append what it queued and `harness_note{Constraint, texts::constraint_withdrawn(id,
 //!   reason)}` with author `User`; on refusal (or without a journal) warn and append nothing.
+//! - `Input::Scope{hosts, note}`: network access the operator authorized. With a journal,
+//!   `shared.ledger_append(true, ScopeGrant{hosts, note})` and append what it queued (failure: warn,
+//!   carry on). Append `harness_note{Approval, texts::scope_granted(hosts, note)}` with author `User`.
+//!   It starts no turn. (The runtime widens the egress policy itself, not the session.)
 //! - `Input::Queued{file, input}`: rename `file` to `{stem}.{seq}.taking`, `seq` being the log's
 //!   next seq; then `input` as above, then delete the renamed file. When `file` is gone it was taken
 //!   already (at the start of `run`), and nothing happens.
@@ -482,6 +486,8 @@ pub enum Input {
     Approval { text: String, scope: String },
     /// The operator withdrew a standing rule (`id` is its ledger id, `k2`).
     Withdraw { id: String, reason: String },
+    /// The operator authorized network access to `hosts` for the mission.
+    Scope { hosts: Vec<String>, note: Option<String> },
     /// A child that nobody was waiting for has settled.
     ChildSettled(Settlement),
     /// The agent that assigned this session's work sent it a message.
@@ -493,7 +499,7 @@ pub enum Input {
     /// The operator pressed stop. The runtime also cancels the running turn through [`Control`];
     /// this input covers what is left when no turn is running.
     Stop,
-    /// A `Constraint`, `Approval` or `Withdraw` kept on disk at `file` until it is recorded (see
+    /// A `Constraint`, `Approval`, `Withdraw` or `Scope` kept on disk at `file` until it is recorded (see
     /// [`queue_input`]).
     Queued { file: PathBuf, input: Box<Input> },
 }
@@ -505,6 +511,7 @@ enum KeptInput {
     Constraint { text: String },
     Approval { text: String, scope: String },
     Withdraw { id: String, reason: String },
+    Scope { hosts: Vec<String>, note: Option<String> },
 }
 
 impl KeptInput {
@@ -513,6 +520,7 @@ impl KeptInput {
             KeptInput::Constraint { text } => Input::Constraint(text),
             KeptInput::Approval { text, scope } => Input::Approval { text, scope },
             KeptInput::Withdraw { id, reason } => Input::Withdraw { id, reason },
+            KeptInput::Scope { hosts, note } => Input::Scope { hosts, note },
         }
     }
 }
@@ -532,6 +540,7 @@ pub fn queue_input(paths: &Paths, session: &SessionId, input: Input) -> Result<I
         Input::Constraint(text) => KeptInput::Constraint { text: text.clone() },
         Input::Approval { text, scope } => KeptInput::Approval { text: text.clone(), scope: scope.clone() },
         Input::Withdraw { id, reason } => KeptInput::Withdraw { id: id.clone(), reason: reason.clone() },
+        Input::Scope { hosts, note } => KeptInput::Scope { hosts: hosts.clone(), note: note.clone() },
         _ => return Ok(input),
     };
     let file = write_kept(&queue_dir(paths, session), &kept)
@@ -1941,6 +1950,13 @@ impl Session {
                 if self.operator_op(op)?.is_some() {
                     self.note(Author::User, NoteKind::Constraint, texts::constraint_withdrawn(&id, &reason))?;
                 }
+            }
+            Input::Scope { hosts, note } => {
+                if hosts.is_empty() {
+                    return Ok(out);
+                }
+                self.operator_op(LedgerOp::ScopeGrant { hosts: hosts.clone(), note: note.clone() })?;
+                self.note(Author::User, NoteKind::Approval, texts::scope_granted(&hosts, note.as_deref()))?;
             }
             Input::ChildSettled(s) => {
                 let child = s.child.clone();

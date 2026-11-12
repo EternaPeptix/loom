@@ -147,6 +147,37 @@ pub fn constraint_withdrawn(id: &str, reason: &str) -> String {
     }
 }
 
+/// The operator authorized network access to `hosts` for the mission; `note` is the operator's reason.
+pub fn scope_granted(hosts: &[String], note: Option<&str>) -> String {
+    let note = note
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(|n| format!(" Operator's note: {}", sentence(n)))
+        .unwrap_or_default();
+    format!(
+        "The operator authorized network access to: {}. This widens the engagement scope; it is a standing authorization for this session.{note}",
+        hosts.join(", ")
+    )
+}
+
+/// The inbox text of an agent's request for network scope; the operator authorizes the hosts to grant it.
+pub fn scope_request(hosts: &[String], why: &str) -> String {
+    format!(
+        "Scope request: the agent asks for network access to: {}.\nWhy: {}\nAuthorize these hosts to let this mission reach them (`loom scope <session> <host>...`); dismiss this item to refuse.",
+        hosts.join(", "),
+        why.trim()
+    )
+}
+
+/// The result of `request_scope`: nothing was granted.
+pub fn scope_requested(hosts: &[String]) -> String {
+    format!(
+        "Your request for network access to {} is in the operator's inbox. Nothing is authorized yet. Carry on with what you can do without it, and do not try to reach {} until the authorization appears in your harness-state (the authorized hosts line) or the operator tells you so.",
+        hosts.join(", "),
+        if hosts.len() == 1 { "that host" } else { "those hosts" }
+    )
+}
+
 /// An approval from the operator. `id` is its ledger id when the mission has a ledger.
 pub fn approval(id: Option<&str>, text: &str, scope: &str) -> String {
     let id = id.map(|i| format!(" ({i})")).unwrap_or_default();

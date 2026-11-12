@@ -6,6 +6,7 @@
 //!
 //! - [`ledger`]   `plan`, `step`, `note`, `claim`, `claim_update`, `evidence`, `ledger`
 //! - [`misc`]     `pin`, `log_search`
+//! - [`scope`]    `request_scope`
 //! - [`terminal`] `finish`, `verdict`, `ask_user`, `report_blocker`, `wait`
 //! - [`agents`]   `agent_spawn`, `agent_fanout`, `agent_message`, `agent_stop`, `decide`, `verify`
 //!
@@ -24,6 +25,7 @@
 pub mod agents;
 pub mod ledger;
 pub mod misc;
+pub mod scope;
 pub mod terminal;
 #[cfg(test)]
 pub(crate) mod testkit;
@@ -320,6 +322,7 @@ pub fn tool(name: &str, shared: &Arc<Shared>) -> Option<Arc<dyn loom_tools::Tool
         "ask_user" => Arc::new(terminal::AskUser(s)),
         "report_blocker" => Arc::new(terminal::ReportBlocker(s)),
         "wait" => Arc::new(terminal::Wait(s)),
+        "request_scope" => Arc::new(scope::RequestScope(s)),
         "agent_spawn" => Arc::new(agents::AgentSpawn(s)),
         "agent_fanout" => Arc::new(agents::AgentFanout(s)),
         "agent_message" => Arc::new(agents::AgentMessage(s)),
@@ -360,7 +363,7 @@ pub fn known_tools() -> Vec<String> {
 pub const NAMES: &[&str] = &[
     "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "finish", "verdict",
     "ask_user", "report_blocker", "wait", "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "decide",
-    "verify",
+    "verify", "request_scope",
 ];
 
 #[cfg(test)]

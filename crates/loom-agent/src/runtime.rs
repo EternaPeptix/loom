@@ -97,7 +97,10 @@
 //!     config's `SandboxCfg`; for a role with `read_only`, `extra_writable` is emptied and the
 //!     workspace is added to `protected_paths`; every model profile's `api_key_env` name is added to
 //!     `secret_env`, so commands never see it.
-//!   - `env`: the session's proxy grant (`proxy.grant(id, Policy::new(&config.network))`), `env()`.
+//!   - `env`: the session's proxy grant (`proxy.grant(id, policy)`), `env()`. The policy is
+//!     `Policy::with_hosts(&config.network, granted)`, `granted` being the hosts the operator authorized
+//!     for the mission (`grant_scope`): the ledger's `granted_hosts()` and those granted since the daemon
+//!     started and not yet recorded, so that a restored session keeps its authorizations.
 //!     Every session gets a grant, also under `deny_all` (in-process fetches go through the proxy
 //!     too, so the policy is what refuses them).
 //! - `job_events`: the receiver of the job table's channel; `sink`: the runtime; `control`: new.
@@ -633,6 +636,17 @@ pub struct RuleReceipt {
     pub stock: Option<String>,
 }
 
+/// What became of a scope grant the operator made (see [`Runtime::grant_scope`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeReceipt {
+    /// The lead session of the mission, which records the grant.
+    pub lead: SessionId,
+    /// The hosts granted, trimmed.
+    pub hosts: Vec<String>,
+    /// The mission keeps a ledger, so the grant is recorded there as well as in a note.
+    pub ledger: bool,
+}
+
 /// The scope recorded in the ledger for an approval given without one.
 const STOCK_SCOPE: &str = "only what the approval says";
 /// The reason recorded in the ledger for a rule withdrawn without one.
@@ -957,6 +971,9 @@ struct State {
     tasks: Vec<JoinHandle<()>>,
     /// Sessions whose task waits in a `join` that shutdown cancelled and that will not return.
     parked: HashSet<SessionId>,
+    /// Hosts the operator granted to each mission since the daemon started (a superset of what the
+    /// ledger records of them until the lead has recorded a grant that is still queued).
+    scope: HashMap<MissionId, Vec<String>>,
 }
 
 /// One model profile, made at start.
@@ -1622,6 +1639,40 @@ impl Inner {
         Ok(())
     }
 
+    /// The hosts the operator has authorized for the mission of `meta`: those in its ledger (when it
+    /// keeps one) and those granted since the daemon started, de-duplicated ignoring case.
+    fn granted_hosts(&self, meta: &SessionMeta, explicit: bool) -> Vec<String> {
+        let mut hosts: Vec<String> = Vec::new();
+        if explicit {
+            // A journal not written yet reads as an empty ledger.
+            let journal = Journal::new(self.paths.journal(&meta.mission), self.key.clone());
+            match journal.state() {
+                Ok(state) => hosts = state.granted_hosts(),
+                Err(e) => tracing::warn!(session = %meta.id, "granted hosts not read from the ledger: {e}"),
+            }
+        }
+        for h in self.st().scope.get(&meta.mission).into_iter().flatten() {
+            if !hosts.iter().any(|x| x.eq_ignore_ascii_case(h)) {
+                hosts.push(h.clone());
+            }
+        }
+        hosts
+    }
+
+    /// The proxy policy of a session: the configured network plus the mission's granted hosts. A
+    /// granted host that cannot be parsed is left out (with a warning), which only narrows the policy.
+    fn session_policy(&self, meta: &SessionMeta, explicit: bool) -> Result<Policy, String> {
+        let hosts = self.granted_hosts(meta, explicit);
+        match Policy::with_hosts(&self.config.network, &hosts) {
+            Ok(p) => Ok(p),
+            Err(e) if !hosts.is_empty() => {
+                tracing::warn!(session = %meta.id, "granted hosts ignored: {e}");
+                Policy::new(&self.config.network)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// The `Deps` of a session (granting it its proxy credentials).
     fn build(&self, meta: &SessionMeta, explicit: bool) -> Result<(Deps, Parts), String> {
         let role = self.packs.role(Some(&meta.pack), Some(&meta.role))?.clone();
@@ -1638,7 +1689,7 @@ impl Inner {
         let cfg = sandbox_cfg_for(&self.config.sandbox, &role, &workspace, &self.config.models);
         let sandbox = Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, Some(self.proxy.port()))
             .map_err(|e| format!("The sandbox for this session cannot be set up: {e}"))?;
-        let policy = Policy::new(&self.config.network)?;
+        let policy = self.session_policy(meta, explicit)?;
         let (events_tx, job_events) = unbounded_channel();
         let jobs = Arc::new(JobTable::new(
             self.paths.session_dir(id).join("jobs"),
@@ -3259,6 +3310,69 @@ impl Runtime {
         self.send_to_lead(&lead.id, input, true, stock)
     }
 
+    /// Authorize network access to `hosts` for the mission of `id` (any of its sessions): its egress
+    /// policy becomes the configured network plus every host granted to the mission so far, for the
+    /// lead and for each of its agents that is running, at once and without a restart (an agent started
+    /// later gets it when it starts). The lead records the grant in the ledger (`ScopeGrant`, when the
+    /// mission keeps one; receipt `ledger`) and gets a protected note saying so; no turn is started. A
+    /// restored session gets its grants back from the ledger. The configured `deny` list and private
+    /// address rules still apply to a granted host. Refused: an unknown or archived session, no host,
+    /// a blank or invalid host, a session that is not running.
+    pub async fn grant_scope(&self, id: &SessionId, hosts: &[String], note: Option<&str>) -> Result<ScopeReceipt, String> {
+        let hosts = loom_net::policy::check_hosts(hosts)?;
+        let note = note.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+        let lead = self.lead_of(id)?;
+        let ledger = self.inner.mission_explicit(&lead)?;
+        // Held by the mission from now on, so that a lead activated by the send below gets the policy.
+        let added: Vec<String> = {
+            let mut st = self.inner.st();
+            let granted = st.scope.entry(lead.mission.clone()).or_default();
+            let mut added = Vec::new();
+            for h in &hosts {
+                if !granted.iter().any(|x| x.eq_ignore_ascii_case(h)) {
+                    granted.push(h.clone());
+                    added.push(h.clone());
+                }
+            }
+            added
+        };
+        let input = Input::Scope { hosts: hosts.clone(), note };
+        if let Err(e) = self.send_to_lead(&lead.id, input, ledger, None) {
+            if let Some(granted) = self.inner.st().scope.get_mut(&lead.mission) {
+                granted.retain(|h| !added.contains(h));
+            }
+            // A lead activated by the failed send was built with the new hosts: take them back.
+            if !added.is_empty() {
+                for meta in self.active_family(&lead.mission) {
+                    if let Ok(policy) = self.inner.session_policy(&meta, ledger) {
+                        self.inner.proxy.set_policy(&meta.id, policy);
+                    }
+                }
+            }
+            return Err(e);
+        }
+        let family = self.active_family(&lead.mission);
+        let mut lead_set = false;
+        for meta in &family {
+            let policy = self.inner.session_policy(meta, ledger)?;
+            let set = self.inner.proxy.set_policy(&meta.id, policy);
+            lead_set |= set && meta.id == lead.id;
+        }
+        if !lead_set {
+            return Err(format!(
+                "Session {} is not running, so the authorization could not be applied to it now. It is recorded for the mission and applies when the session is resumed.",
+                lead.id.as_str()
+            ));
+        }
+        Ok(ScopeReceipt { lead: lead.id, hosts, ledger })
+    }
+
+    /// The metas of the active sessions of `mission`.
+    fn active_family(&self, mission: &MissionId) -> Vec<SessionMeta> {
+        let st = self.inner.st();
+        st.known.values().filter(|k| &k.meta.mission == mission && k.active.is_some()).map(|k| k.meta.clone()).collect()
+    }
+
     pub async fn stop(&self, id: &SessionId) -> Result<(), String> {
         self.inner.check_open()?;
         if !self.inner.st().known.contains_key(id) {
@@ -4155,6 +4269,102 @@ mod tests {
         let unknown = SessionId::from("s-nope");
         assert_eq!(e.rt.add_rule(&unknown, "x").await.unwrap_err(), "There is no session s-nope.".to_string());
         e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_scope_grant_widens_the_running_sessions_policy_and_is_recorded_without_a_turn() {
+        use loom_core::event::NoteKind;
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        let turns = |e: &Env| e.kinds(&id).iter().filter(|k| *k == "turn_start").count();
+        let before = turns(&e);
+        let rule = |host: &str| e.rt.inner.proxy.check_name(&id, host, 443).map(|v| v.rule);
+        assert_eq!(rule("api.example.test").as_deref(), Some("mode deny_all"));
+
+        let hosts = vec![" api.example.test ".to_string()];
+        let receipt = e.rt.grant_scope(&id, &hosts, Some(" the target ")).await.unwrap();
+        assert_eq!(receipt, ScopeReceipt { lead: id.clone(), hosts: vec!["api.example.test".into()], ledger: true });
+        // The proxy allows it at once; anything else is still refused.
+        assert_eq!(rule("api.example.test").as_deref(), Some("allow api.example.test"));
+        assert_eq!(rule("other.example.test").as_deref(), Some("not in allow list"));
+        until("grant in ledger", || {
+            e.rt.ledger(&mission).is_ok_and(|l| l.state.granted_hosts() == ["api.example.test"])
+        })
+        .await;
+        let grants = e.rt.ledger(&mission).unwrap().state.scope_grants;
+        assert_eq!(grants[0].note.as_deref(), Some("the target"));
+        let noted = |needle: &str| {
+            e.has(&id, |ev| matches!(ev, Event::HarnessNote { note: NoteKind::Approval, text } if text.contains(needle)))
+        };
+        until("note", || noted("The operator authorized network access to: api.example.test.")).await;
+        assert!(noted("a standing authorization for this session"));
+
+        // A second grant adds to the first.
+        e.rt.grant_scope(&id, &["*.cdn.test".to_string(), "api.example.test".to_string()], None).await.unwrap();
+        assert_eq!(rule("api.example.test").as_deref(), Some("allow api.example.test"));
+        assert_eq!(rule("x.cdn.test").as_deref(), Some("allow *.cdn.test"));
+        until("both in ledger", || {
+            e.rt.ledger(&mission).is_ok_and(|l| l.state.granted_hosts() == ["api.example.test", "*.cdn.test"])
+        })
+        .await;
+        assert_eq!(turns(&e), before, "a scope grant must not start a turn");
+
+        // Refusals say what to do.
+        let none: [String; 0] = [];
+        assert!(e.rt.grant_scope(&id, &none, None).await.unwrap_err().contains("at least one host"));
+        assert!(e.rt.grant_scope(&id, &["  ".to_string()], None).await.unwrap_err().contains("blank"));
+        assert!(e.rt.grant_scope(&id, &["a*b.test".to_string()], None).await.unwrap_err().contains("cannot be authorized"));
+        let unknown = SessionId::from("s-nope");
+        let err = e.rt.grant_scope(&unknown, &["a.test".to_string()], None).await.unwrap_err();
+        assert_eq!(err, "There is no session s-nope.");
+        assert_eq!(rule("a.test").as_deref(), Some("not in allow list"));
+        e.rt.archive(&id, true).await.unwrap();
+        let err = e.rt.grant_scope(&id, &["a.test".to_string()], None).await.unwrap_err();
+        assert!(err.contains("archived"), "{err}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn scope_grants_are_applied_again_to_a_session_restored_after_a_restart() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        e.rt.grant_scope(&id, &["api.example.test".to_string()], None).await.unwrap();
+        until("grant in ledger", || e.rt.ledger(&mission).is_ok_and(|l| l.state.scope_grants.len() == 1)).await;
+        e.rt.shutdown().await;
+
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        // The new daemon holds no grant in memory: the host comes back from the ledger.
+        assert!(rt2.inner.st().scope.is_empty());
+        rt2.inner.activate(&id).unwrap();
+        let rule = |host: &str| rt2.inner.proxy.check_name(&id, host, 443).map(|v| v.rule);
+        assert_eq!(rule("api.example.test").as_deref(), Some("allow api.example.test"));
+        assert_eq!(rule("other.example.test").as_deref(), Some("not in allow list"));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_scope_grant_that_could_not_be_handed_to_the_lead_leaves_no_host_allowed() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        e.rt.shutdown().await;
+
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        // The lead is not active yet; a file where its queue directory belongs makes keeping the input fail.
+        std::fs::write(rt2.inner.paths.session_dir(&id).join("queued"), b"x").unwrap();
+        let err = rt2.grant_scope(&id, &["api.example.test".to_string()], None).await.unwrap_err();
+        assert!(err.contains("send it again"), "{err}");
+        // The send activated the lead with the new host; the failure took it back.
+        let rule = rt2.inner.proxy.check_name(&id, "api.example.test", 443).map(|v| v.rule);
+        assert_eq!(rule.as_deref(), Some("mode deny_all"));
+        assert!(rt2.inner.st().scope.values().all(|h| h.is_empty()));
+        rt2.shutdown().await;
     }
 
     #[tokio::test]

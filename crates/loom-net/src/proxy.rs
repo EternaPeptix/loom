@@ -490,6 +490,12 @@ impl Proxy {
         }
     }
 
+    /// What the name check of the session's current policy says about `host:port`; `None` when the
+    /// session holds no grant.
+    pub fn check_name(&self, session: &SessionId, host: &str, port: u16) -> Option<crate::policy::Verdict> {
+        lock(&self.inner.shared.sessions).get(session.as_str()).map(|e| e.policy.check_name(host, port))
+    }
+
     pub fn revoke(&self, session: &SessionId) {
         lock(&self.inner.shared.sessions).remove(session.as_str());
     }
