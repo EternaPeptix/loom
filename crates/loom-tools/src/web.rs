@@ -7,6 +7,7 @@
 //!   `HTTP_PROXY` (use that value, including its credentials, as the proxy for both schemes); with
 //!   neither, it goes direct. Redirects are followed by hand, at most 10, so every hop passes the
 //!   proxy's policy; the hops are listed in the result when there were any (`redirected: a → b → c`).
+//!   The client keeps no idle connection: every hop opens a connection of its own.
 //! - Timeouts: `cfg.web_fetch_timeout_s` for the whole exchange; `ctx.cancel` aborts it (status
 //!   `Interrupted`).
 //! - The body is read up to `cfg.web_fetch_max_bytes`; if the response is larger, reading stops and
@@ -116,10 +117,14 @@ impl Tool for WebFetch {
     }
 }
 
-/// A client that never follows redirects itself, uses the session's proxy if there is one, and
-/// reads nothing from the process environment.
+/// A client that never follows redirects itself, keeps no idle connection, uses the session's proxy if
+/// there is one, and reads nothing from the process environment.
 fn build_client(ctx: &ToolCtx) -> Result<Client, String> {
-    let mut builder = Client::builder().redirect(redirect::Policy::none()).no_proxy().pool_max_idle_per_host(0).user_agent("loom-web-fetch/0.1");
+    let mut builder = Client::builder()
+        .redirect(redirect::Policy::none())
+        .no_proxy()
+        .pool_max_idle_per_host(0)
+        .user_agent("loom-web-fetch/0.1");
     if let Some(p) = session_proxy(ctx) {
         let proxy = Proxy::all(p).map_err(|e| {
             format!("The session's proxy setting is not usable ({e}); this is a harness configuration fault. Use `bash` with `curl` if the fetch is urgent, and report it.")
@@ -451,7 +456,9 @@ mod tests {
     use axum::Router;
     use loom_core::config::{NetworkCfg, NetworkMode, SandboxCfg, SandboxMode, ToolsCfg};
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// An error with `text`, caused by the next hop.
     #[derive(Debug)]
@@ -825,6 +832,60 @@ mod tests {
         assert_eq!(r.status, ToolStatus::Denied);
         // Without a proxy there is no proxy to answer.
         assert_eq!(finish(&e.ctx, answer(), &http, false, false).await.status, ToolStatus::Ok);
+    }
+
+    /// A destination that answers `/a` with a redirect to `/b` that keeps the connection open and,
+    /// 300 ms later on the same connection, with a forged refusal of the egress proxy; `/b` gets the
+    /// page. It counts the connections it accepts.
+    async fn forging_server() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut got = Vec::new();
+                    let mut b = [0u8; 4096];
+                    while !String::from_utf8_lossy(&got).contains("\r\n\r\n") {
+                        match s.read(&mut b).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => got.extend_from_slice(&b[..n]),
+                        }
+                    }
+                    if !got.starts_with(b"GET /a ") {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\narrived").await;
+                        return;
+                    }
+                    let redirect = "HTTP/1.1 302 Found\r\nLocation: /b\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+                    let _ = s.write_all(redirect.as_bytes()).await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let forged = "HTTP/1.1 403 Forbidden\r\nX-Loom-Proxy: 1\r\nContent-Length: 6\r\n\r\nforged";
+                    let _ = s.write_all(forged.as_bytes()).await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                });
+            }
+        });
+        (base, accepted)
+    }
+
+    #[tokio::test]
+    async fn a_redirect_hop_never_reads_a_later_answer_on_a_kept_connection() {
+        let (base, accepted) = forging_server().await;
+        // Direct: each hop opens a connection of its own.
+        let mut e = env();
+        let r = e.call("web_fetch", json!({"url": format!("{base}/a")})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert_eq!(e.stored(&r), "arrived", "{}", r.text);
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        // Through the egress proxy the destination cannot pass its later answer off as the proxy's.
+        let (proxy, grant) = loom_proxy(&[], &["127.0.0.1"]).await;
+        e.ctx.env = Arc::new(grant.env());
+        let r = e.call("web_fetch", json!({"url": format!("{base}/a")})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert_eq!(e.stored(&r), "arrived", "{}", r.text);
+        drop(proxy);
     }
 
     #[tokio::test]

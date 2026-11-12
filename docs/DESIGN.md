@@ -849,12 +849,15 @@ head within 10 s gets `400`.
   generates carries `X-Loom-Proxy: 1` and `Connection: close`; a destination's plain-HTTP response head
   is re-written with CRLF line ends, without any `X-Loom-Proxy` header, and with the destination's
   `Connection`, `Keep-Alive` and `Proxy-Connection` headers replaced by `Connection: close` (one that
-  does not parse gets `502`). A forwarded connection carries one request and one response: the relay
-  ends after the announced body length, and bytes the client sends after its request stop any further
-  relaying of destination bytes, so a destination cannot answer a later request on the connection.
-  The tools' HTTP clients also keep no idle connections. `LOOM-CHECK host:port` (or `http://host:port/`) applies the policy and resolves the name but
-  connects to nothing: `200` allowed, `403` refused, `502` the name does not resolve, with the rule in
-  `X-Loom-Rule`.
+  does not parse, or whose `Content-Length` is invalid or conflicting, gets `502`). A forwarded
+  connection carries one request and one response: the request body is forwarded up to its end, the
+  response is relayed up to the end its head gives (none for `HEAD`, `204` and `304`, the last chunk
+  and trailers, `Content-Length` bytes, else the destination's close), and then the connection is
+  closed, so a destination cannot answer a later request on it. When the client sends more than its
+  request, a response that runs until the destination closes is cut after its head. The tools' HTTP
+  clients keep no idle connections. `LOOM-CHECK host:port` (or `http://host:port/`) applies the policy
+  and resolves the name but connects to nothing: `200` allowed, `403` refused, `502` the name does not
+  resolve, with the rule in `X-Loom-Rule`.
 - **Limits** (`loom_net::Limits` defaults, not configurable): 256 connections in all — at the limit a
   new one takes the slot of the oldest connection that has not sent a head yet or is only being
   answered by the proxy itself, else `503` with `Retry-After: 5`; 64 per session (`429`, `Retry-After:

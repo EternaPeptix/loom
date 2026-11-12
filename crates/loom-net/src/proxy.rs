@@ -9,10 +9,7 @@
 //! - a request with an absolute `http://` URI → the proxy connects to that host (port 80 by
 //!   default), sends the request with an origin-form target, drops `Proxy-Authorization` and
 //!   `Proxy-Connection`, adds `Connection: close`, and copies the request body and the response
-//!   through. The final response head loses the destination's `Connection`, `Keep-Alive` and
-//!   `Proxy-Connection` headers and ends in `Connection: close`. One request and one response per
-//!   client connection: when the response length is announced the relay ends after that many bytes, and
-//!   once the client sends anything after its request no further destination bytes are relayed.
+//!   through, one request and one response per client connection (see *Forwarded requests*);
 //! - a check, method [`CHECK_METHOD`] with the destination as `host:port` or as an absolute
 //!   `http://host:port/` URI (see *Checks*);
 //! - anything else (origin-form target, `https://` absolute URI, unparseable head, a head larger than
@@ -110,11 +107,26 @@
 //!   not read any more but still gets the response while the destination keeps sending: it ends when
 //!   the destination is silent for 30 s, or at once when a write to the client fails.
 //!
-//! ## Response heads
+//! ## Forwarded requests
+//! The request body is forwarded up to its end as its head frames it: `Content-Length` bytes, or a
+//! `chunked` body up to its last chunk and trailers (a body with another transfer coding, or a chunked
+//! body the proxy cannot follow, runs until the client stops sending). What the client sends after it
+//! is not forwarded.
 //! A plain-HTTP response head from the destination is parsed as an HTTP client parses it (a bare LF
 //! ends a line too) and written to the client again with CRLF line ends and without any
-//! `X-Loom-Proxy` header; only responses the proxy generates carry that marker. A head that does not
-//! parse gets `502`.
+//! `X-Loom-Proxy` header; only responses the proxy generates carry that marker. The final (non-1xx)
+//! head also loses the destination's `Connection`, `Keep-Alive` and `Proxy-Connection` headers, and its
+//! `Content-Length` when it has a `Transfer-Encoding`, and ends in `Connection: close`. A head that does
+//! not parse, or whose `Content-Length` values are not numbers or differ, gets `502`.
+//! The response ends where its head says, read as hyper reads it: at the head for a `HEAD` request and
+//! for `204` and `304`; after the last chunk and the trailers when the last coding of the last
+//! `Transfer-Encoding` is `chunked`; after `Content-Length` bytes; otherwise (and for `101`) when the
+//! destination closes. At that end the proxy closes the connection and relays nothing more, so bytes
+//! a destination sends after its response never reach the client. A chunked body that breaks the
+//! chunked format ends the relay where it breaks.
+//! When the client sends anything after its request other than empty lines, a response that runs
+//! until the destination closes is cut: the relay ends with the bytes that carried its head, or at once
+//! when they have already been relayed.
 
 use crate::policy::{normalize_host, Policy};
 use base64::Engine as _;
@@ -1261,13 +1273,15 @@ async fn write_within<W: AsyncWriteExt + Unpin>(w: &mut W, bytes: &[u8], idle: D
 enum Body {
     None,
     Length(u64),
-    /// Chunked or otherwise unframed by length: relay until the client stops sending.
+    /// Chunked: relay up to the last chunk and its trailers.
+    Chunked,
+    /// Another transfer coding, unframed by length: relay until the client stops sending.
     Stream,
 }
 
 fn body_kind(head: &Head) -> Result<Body, String> {
     let mut length: Option<u64> = None;
-    let mut chunked = false;
+    let mut coding: Option<&[u8]> = None;
     for (n, v) in &head.headers {
         if n.eq_ignore_ascii_case("content-length") {
             let parsed = std::str::from_utf8(v)
@@ -1279,57 +1293,194 @@ fn body_kind(head: &Head) -> Result<Body, String> {
             }
             length = Some(parsed);
         } else if n.eq_ignore_ascii_case("transfer-encoding") {
-            chunked = true;
+            coding = Some(v);
         }
     }
-    match (length, chunked) {
-        (Some(_), true) => Err("the request has both Content-Length and Transfer-Encoding".into()),
-        (Some(n), false) => Ok(Body::Length(n)),
-        (None, true) => Ok(Body::Stream),
-        (None, false) => Ok(Body::None),
+    match (length, coding) {
+        (Some(_), Some(_)) => Err("the request has both Content-Length and Transfer-Encoding".into()),
+        (Some(n), None) => Ok(Body::Length(n)),
+        (None, Some(v)) if ends_chunked(v) => Ok(Body::Chunked),
+        (None, Some(_)) => Ok(Body::Stream),
+        (None, None) => Ok(Body::None),
+    }
+}
+
+/// Whether the value of the last `Transfer-Encoding` header makes the body chunked: its last coding is
+/// `chunked` (as hyper reads it).
+fn ends_chunked(value: &[u8]) -> bool {
+    value.rsplit(|b| *b == b',').next().is_some_and(|c| c.trim_ascii().eq_ignore_ascii_case(b"chunked"))
+}
+
+/// Whether bytes a client sent after its request are more than the empty lines some clients add after
+/// a body.
+fn further_request(past: &[u8]) -> bool {
+    past.iter().any(|b| !matches!(b, b'\r' | b'\n'))
+}
+
+/// Follows the framing of a chunked body to find where it ends, as leniently as common HTTP clients
+/// read it; the bytes themselves are passed on unchanged.
+#[derive(Clone, Copy)]
+enum Chunked {
+    /// In a chunk-size line, before or in the size: the size so far, and whether a digit was read.
+    Size(u64, bool),
+    /// In a chunk-size line after the size (extensions, spaces) up to the line end: the size.
+    Line(u64),
+    /// In the data of a chunk: the bytes still to come.
+    Data(u64),
+    /// After the data of a chunk, before its line end.
+    DataEnd,
+    /// In the trailer section after the last chunk; whether the current line is still empty.
+    Trailer(bool),
+    /// The body has ended.
+    Done,
+}
+
+impl Chunked {
+    fn new() -> Self {
+        Chunked::Size(0, false)
+    }
+
+    fn done(&self) -> bool {
+        matches!(self, Chunked::Done)
+    }
+
+    /// Takes the next bytes; returns how many of them belong to the body (all of them until it ends).
+    fn feed(&mut self, data: &[u8]) -> Result<usize, &'static str> {
+        let mut used = 0usize;
+        loop {
+            let rest = data.get(used..).unwrap_or(&[]);
+            let Some(&b) = rest.first() else { return Ok(used) };
+            let n = match *self {
+                Chunked::Done => return Ok(used),
+                Chunked::Data(left) => {
+                    let k = usize::try_from(left).map_or(rest.len(), |l| l.min(rest.len()));
+                    let left = left.saturating_sub(k as u64);
+                    *self = if left == 0 { Chunked::DataEnd } else { Chunked::Data(left) };
+                    k
+                }
+                state => {
+                    *self = state.step(b)?;
+                    1
+                }
+            };
+            used = used.saturating_add(n);
+        }
+    }
+
+    /// The state after one byte outside chunk data.
+    fn step(self, b: u8) -> Result<Chunked, &'static str> {
+        if let (Chunked::Size(size, _), Some(d)) = (self, char::from(b).to_digit(16)) {
+            let size = size.checked_mul(16).and_then(|s| s.checked_add(u64::from(d)));
+            return Ok(Chunked::Size(size.ok_or("a chunk size is too large")?, true));
+        }
+        Ok(match (self, b) {
+            (Chunked::Size(_, false), b' ' | b'\t') => self,
+            (Chunked::Size(_, false), _) => return Err("a chunk does not start with its size"),
+            (Chunked::Size(0, true) | Chunked::Line(0), b'\n') => Chunked::Trailer(true),
+            (Chunked::Size(size, true) | Chunked::Line(size), b'\n') => Chunked::Data(size),
+            (Chunked::Size(size, true) | Chunked::Line(size), _) => Chunked::Line(size),
+            (Chunked::DataEnd, b'\r') => self,
+            (Chunked::DataEnd, b'\n') => Chunked::new(),
+            (Chunked::DataEnd, _) => return Err("the data of a chunk is not followed by a line end"),
+            (Chunked::Trailer(true), b'\n') => Chunked::Done,
+            (Chunked::Trailer(_), b'\n') => Chunked::Trailer(true),
+            (Chunked::Trailer(empty), b'\r') => Chunked::Trailer(empty),
+            (Chunked::Trailer(_), _) => Chunked::Trailer(false),
+            (Chunked::Data(_) | Chunked::Done, _) => self,
+        })
+    }
+}
+
+/// What is still to come of the request body of a forwarded request.
+enum Owed {
+    /// This many bytes.
+    Bytes(u64),
+    /// The rest of a chunked body.
+    Chunked(Chunked),
+    /// Everything until the client stops sending.
+    Stream,
+}
+
+impl Owed {
+    /// How many of `data`, the client's next bytes, belong to the body; the rest come after it.
+    fn take(&mut self, data: &[u8]) -> usize {
+        match self {
+            Owed::Bytes(left) => {
+                let k = usize::try_from(*left).map_or(data.len(), |l| l.min(data.len()));
+                *left = left.saturating_sub(k as u64);
+                k
+            }
+            Owed::Chunked(c) => match c.feed(data) {
+                Ok(k) => k,
+                // A body the proxy cannot follow is passed on whole, for the destination to judge.
+                Err(_) => {
+                    *self = Owed::Stream;
+                    data.len()
+                }
+            },
+            Owed::Stream => data.len(),
+        }
     }
 }
 
 /// Response heads from the destination, written again without any `X-Loom-Proxy` header (see
-/// [`response_head`]). Interim (1xx) heads are treated the same way. The final head also loses the
-/// destination's connection headers and says `Connection: close`; when its length is known, bytes
-/// past the body are dropped and [`HeadFilter::finished`] turns true at the body's end.
+/// [`response_head`]). Interim (1xx) heads are treated the same way. The body after the final head is
+/// passed on up to the end that head gives it; bytes after that end are dropped.
 struct HeadFilter {
     buf: Vec<u8>,
-    done: bool,
     /// The request was `HEAD`: the response has no body whatever its headers say.
     head_request: bool,
-    /// Body bytes still to come after the final head, when the head fixes them.
-    remaining: Option<u64>,
-    finished: bool,
+    /// How the body after the final head is framed; `None` until that head has been read.
+    body: Option<Framing>,
+}
+
+/// How the body of a response is framed.
+enum Framing {
+    /// Bytes still to come (none for a response without a body).
+    Length(u64),
+    Chunked(Chunked),
+    /// Everything until the destination closes.
+    UntilClose,
 }
 
 impl HeadFilter {
     fn new(head_request: bool) -> Self {
-        Self { buf: Vec::new(), done: false, head_request, remaining: None, finished: false }
+        Self { buf: Vec::new(), head_request, body: None }
+    }
+
+    /// The final head has been read.
+    fn head_done(&self) -> bool {
+        self.body.is_some()
     }
 
     /// The response is complete; nothing further from the destination is relayed.
     fn finished(&self) -> bool {
-        self.finished
+        match &self.body {
+            Some(Framing::Length(left)) => *left == 0,
+            Some(Framing::Chunked(c)) => c.done(),
+            Some(Framing::UntilClose) | None => false,
+        }
+    }
+
+    /// The final head has been read and the body runs until the destination closes.
+    fn until_close(&self) -> bool {
+        matches!(self.body, Some(Framing::UntilClose))
     }
 
     /// Takes the next bytes from the destination; returns what may be sent to the client now.
     fn push(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
-        if self.done {
-            return Ok(self.body(data));
+        if self.body.is_some() {
+            return self.pass(data);
         }
         self.buf.extend_from_slice(data);
         let mut out = Vec::new();
-        while let Some(h) = response_head(&self.buf)? {
+        while let Some(h) = response_head(&self.buf, self.head_request)? {
             out.extend_from_slice(&h.head);
             self.buf.drain(..h.len.min(self.buf.len()));
-            if !(100..200).contains(&h.code) || h.code == 101 {
-                self.done = true;
-                let no_body = self.head_request || matches!(h.code, 204 | 304);
-                self.remaining = if no_body { Some(0) } else { h.length };
+            if let Some(framing) = h.body {
+                self.body = Some(framing);
                 let rest = std::mem::take(&mut self.buf);
-                out.append(&mut self.body(&rest));
+                out.append(&mut self.pass(&rest)?);
                 return Ok(out);
             }
         }
@@ -1339,37 +1490,55 @@ impl HeadFilter {
         Ok(out)
     }
 
-    /// Body bytes to pass on: all of them when the length is unknown, else up to the announced length.
-    fn body(&mut self, data: &[u8]) -> Vec<u8> {
-        match self.remaining {
-            None => data.to_vec(),
-            Some(r) => {
-                let take = usize::try_from(r).map_or(data.len(), |r| r.min(data.len()));
-                self.remaining = Some(r.saturating_sub(take as u64));
-                self.finished = self.remaining == Some(0);
-                data.get(..take).unwrap_or(&[]).to_vec()
+    /// The bytes of `data`, which follow the final head, that belong to the body.
+    fn pass(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        let k = match &mut self.body {
+            Some(Framing::Length(left)) => {
+                let k = usize::try_from(*left).map_or(data.len(), |l| l.min(data.len()));
+                *left = left.saturating_sub(k as u64);
+                k
             }
-        }
+            Some(Framing::Chunked(c)) => {
+                c.feed(data).map_err(|m| format!("the destination's chunked response is malformed ({m})"))?
+            }
+            Some(Framing::UntilClose) | None => data.len(),
+        };
+        Ok(data.get(..k).unwrap_or(&[]).to_vec())
     }
 }
 
 /// A response head read from the destination.
 struct RespHead {
-    code: u16,
     /// The head written again with CRLF line ends and without `X-Loom-Proxy` headers. A final head
-    /// has no `Connection`, `Keep-Alive` or `Proxy-Connection` header of the destination and ends in
-    /// `Connection: close`.
+    /// has no `Connection`, `Keep-Alive` or `Proxy-Connection` header of the destination, no
+    /// `Content-Length` when it has a `Transfer-Encoding`, and ends in `Connection: close`.
     head: Vec<u8>,
     /// Its length in the buffer it was read from.
     len: usize,
-    /// The body length it announces with `Content-Length`; `None` when it is not a single clear
-    /// number or the body is framed some other way.
-    length: Option<u64>,
+    /// For a final head, how the body after it is framed; `None` for an interim (1xx) head.
+    body: Option<Framing>,
 }
 
-/// The response head at the start of `buf`, parsed as an HTTP client parses it. `None` while it is
-/// incomplete.
-fn response_head(buf: &[u8]) -> Result<Option<RespHead>, String> {
+/// The body length that the `Content-Length` headers give, read as hyper reads them: `None` when
+/// there is none, an error when a value is not a number or two differ.
+fn content_length(headers: &[httparse::Header<'_>]) -> Result<Option<u64>, String> {
+    let mut length = None;
+    for h in headers.iter().filter(|h| h.name.eq_ignore_ascii_case("content-length")) {
+        for v in h.value.split(|b| *b == b',').map(<[u8]>::trim_ascii) {
+            let n = std::str::from_utf8(v).ok().filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()));
+            match (n.and_then(|n| n.parse::<u64>().ok()), length) {
+                (Some(n), None) => length = Some(n),
+                (Some(n), Some(l)) if n == l => {}
+                _ => return Err("the destination's response has an invalid or conflicting Content-Length".into()),
+            }
+        }
+    }
+    Ok(length)
+}
+
+/// The response head at the start of `buf`, parsed as an HTTP client parses it, for a request that
+/// was `HEAD` or not. `None` while it is incomplete.
+fn response_head(buf: &[u8], head_request: bool) -> Result<Option<RespHead>, String> {
     let mut headers = vec![httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
     let mut resp = httparse::Response::new(&mut headers);
     let parsed = httparse::ParserConfig::default()
@@ -1386,23 +1555,24 @@ fn response_head(buf: &[u8]) -> Result<Option<RespHead>, String> {
         return Err("the destination did not answer with a valid HTTP response".into());
     };
     let is_final = !(100..200).contains(&code) || code == 101;
+    let coding = resp.headers.iter().rev().find(|h| h.name.eq_ignore_ascii_case("transfer-encoding"));
+    let body = if !is_final {
+        None
+    } else if head_request || matches!(code, 204 | 304) {
+        Some(Framing::Length(0))
+    } else if code == 101 {
+        Some(Framing::UntilClose)
+    } else if let Some(c) = coding {
+        Some(if ends_chunked(c.value) { Framing::Chunked(Chunked::new()) } else { Framing::UntilClose })
+    } else {
+        Some(content_length(resp.headers)?.map_or(Framing::UntilClose, Framing::Length))
+    };
+    let dropped = |name: &str| {
+        let connection = ["connection", "keep-alive", "proxy-connection"].iter().any(|d| name.eq_ignore_ascii_case(d));
+        is_final && (connection || (coding.is_some() && name.eq_ignore_ascii_case("content-length")))
+    };
     let mut head = format!("HTTP/1.{version} {code} {}\r\n", resp.reason.unwrap_or("")).into_bytes();
-    let (mut length, mut clear, mut framed) = (None::<u64>, true, false);
-    for h in resp.headers.iter().filter(|h| !h.name.eq_ignore_ascii_case(MARKER)) {
-        if is_final {
-            if ["connection", "keep-alive", "proxy-connection"].iter().any(|d| h.name.eq_ignore_ascii_case(d)) {
-                continue;
-            }
-            if h.name.eq_ignore_ascii_case("transfer-encoding") {
-                framed = true;
-            } else if h.name.eq_ignore_ascii_case("content-length") {
-                let v = std::str::from_utf8(h.value).ok().map(str::trim).filter(|v| v.bytes().all(|b| b.is_ascii_digit()));
-                match v.and_then(|v| v.parse::<u64>().ok()) {
-                    Some(v) if length.is_none() || length == Some(v) => length = Some(v),
-                    _ => clear = false,
-                }
-            }
-        }
+    for h in resp.headers.iter().filter(|h| !h.name.eq_ignore_ascii_case(MARKER) && !dropped(h.name)) {
         head.extend_from_slice(h.name.as_bytes());
         head.extend_from_slice(b": ");
         head.extend_from_slice(h.value);
@@ -1412,14 +1582,15 @@ fn response_head(buf: &[u8]) -> Result<Option<RespHead>, String> {
         head.extend_from_slice(b"Connection: close\r\n");
     }
     head.extend_from_slice(b"\r\n");
-    let length = if clear && !framed { length } else { None };
-    Ok(Some(RespHead { code, head, len: n, length }))
+    Ok(Some(RespHead { head, len: n, body }))
 }
 
 /// What the relay of a forwarded request needs.
 struct Fwd {
-    /// Request body bytes the client still owes; `None` when the body runs until the client stops.
-    budget: Option<u64>,
+    /// What the client still owes of the request body.
+    owed: Owed,
+    /// The client sent more than its request together with it (see [`further_request`]).
+    further: bool,
     /// After the client has ended its side, how long a silent destination is waited for.
     grace: Duration,
     /// The request method is `HEAD`.
@@ -1445,13 +1616,30 @@ struct Flow {
     last_ms: AtomicU64,
     /// The client of a forwarded request has ended its side.
     client_done: AtomicBool,
-    /// The client of a forwarded request sent bytes after the end of its request.
+    /// The client of a forwarded request sent more than its request (see [`further_request`]).
     extra_request: AtomicBool,
+    /// The head of a forwarded response whose body runs until the destination closes has been relayed.
+    until_close: AtomicBool,
     /// Something has been sent to the client.
     wrote: AtomicBool,
 }
 
 impl Flow {
+    /// Notes that the client sent more than its request; true when the response runs until the
+    /// destination closes and its head has been relayed, so the relay ends now. The two sides note
+    /// their part and read the other's in the opposite order, so at least one of them sees both.
+    fn client_sent_more(&self) -> bool {
+        self.extra_request.store(true, Ordering::SeqCst);
+        self.until_close.load(Ordering::SeqCst)
+    }
+
+    /// Notes that the head of a response that runs until the destination closes has been relayed; true
+    /// when the client has sent more than its request, so the relay ends now.
+    fn response_until_close(&self) -> bool {
+        self.until_close.store(true, Ordering::SeqCst);
+        self.extra_request.load(Ordering::SeqCst)
+    }
+
     fn touch(&self) {
         let ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_ms.fetch_max(ms, Ordering::Relaxed);
@@ -1471,6 +1659,9 @@ enum Pump {
     Stop(&'static str),
     /// The destination's response was unusable.
     Bad(String),
+    /// The client of a forwarded request sent more than its request while the response runs until the
+    /// destination closes: nothing more is relayed.
+    Cut,
 }
 
 /// Writes all of `bytes`, counting each partial write as activity.
@@ -1486,12 +1677,11 @@ async fn write_counted(w: &mut WriteHalf<'_>, mut bytes: &[u8], flow: &Flow) -> 
     Ok(())
 }
 
-/// Client to destination. A tunnel passes the client's end on. With `forward` (the request body
-/// budget of a forwarded request) bytes past the body are discarded, the client's end is noted in
-/// `flow`, and a destination that stops reading does not end the relay.
-async fn upload(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, forward: Option<Option<u64>>) -> Pump {
+/// Client to destination. A tunnel passes the client's end on. With `forward` (what the client of a
+/// forwarded request still owes of its body) bytes past the body are discarded and noted in `flow`,
+/// the client's end is noted in `flow`, and a destination that stops reading does not end the relay.
+async fn upload(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, mut forward: Option<Owed>) -> Pump {
     let mut buf = vec![0u8; 16 * 1024];
-    let mut budget = forward.flatten();
     let mut sending = true;
     let mut discarded = 0usize;
     loop {
@@ -1508,37 +1698,38 @@ async fn upload(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, forwar
             }
             return Pump::Ended;
         }
-        if budget == Some(0) {
-            // The client sends a further request on a connection that carries one: no later destination
-            // bytes may be read as its answer.
-            flow.extra_request.store(true, Ordering::Relaxed);
-        }
-        let take = if sending { budget.map_or(n, |b| usize::try_from(b).map_or(n, |b| b.min(n))) } else { 0 };
+        let data = buf.get(..n).unwrap_or(&[]);
+        let body = forward.as_mut().map_or(n, |owed| owed.take(data));
+        let more = further_request(data.get(body..).unwrap_or(&[]));
+        let take = if sending { body } else { 0 };
         discarded = discarded.saturating_add(n.saturating_sub(take));
         if discarded > MAX_DISCARD {
             return Pump::Stop("the client sent more than 1 MiB past the request body");
         }
-        if take == 0 {
-            continue;
-        }
-        if write_counted(w, buf.get(..take).unwrap_or(&[]), flow).await.is_err() {
+        if take > 0 && write_counted(w, data.get(..take).unwrap_or(&[]), flow).await.is_err() {
             if forward.is_none() {
                 return Pump::Stop("writing to the destination failed");
             }
             // The destination stopped reading; its answer may still come.
             sending = false;
         }
-        budget = budget.map(|b| b.saturating_sub(take as u64));
+        // A further request on a connection that carries one: no later destination bytes may be read as
+        // its answer.
+        if more && flow.client_sent_more() {
+            return Pump::Cut;
+        }
     }
 }
 
 /// Destination to client. A tunnel passes the destination's end on. With `filter` (a forwarded
-/// request) the response head is filtered, and an end before the head is complete is `Bad`.
+/// request) the response head is filtered, an end before the head is complete is `Bad`, and the
+/// relay ends at the end of the response, or after its head when the response runs until the
+/// destination closes and the client has sent more than its request.
 async fn download(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, mut filter: Option<HeadFilter>) -> Pump {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         let read = r.read(&mut buf).await;
-        let head_pending = filter.as_ref().is_some_and(|f| !f.done);
+        let head_pending = filter.as_ref().is_some_and(|f| !f.head_done());
         let n = match read {
             Ok(0) | Err(_) if head_pending => {
                 return Pump::Bad("the destination closed the connection before it answered".to_string())
@@ -1551,11 +1742,6 @@ async fn download(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, mut 
             Err(_) => return Pump::Stop("the connection to the destination failed"),
         };
         flow.touch();
-        if !head_pending && flow.extra_request.load(Ordering::Relaxed) {
-            // One request, one response: what follows is not relayed.
-            let _ = w.shutdown().await;
-            return Pump::Ended;
-        }
         let chunk = buf.get(..n).unwrap_or(&[]);
         let out = match filter.as_mut() {
             Some(f) => match f.push(chunk) {
@@ -1570,7 +1756,9 @@ async fn download(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, mut 
                 return Pump::Stop("writing to the client failed");
             }
         }
-        if filter.as_ref().is_some_and(HeadFilter::finished) {
+        // One request, one response: what follows its end is not relayed.
+        let over = filter.as_ref().is_some_and(|f| f.finished() || (f.until_close() && flow.response_until_close()));
+        if over {
             let _ = w.shutdown().await;
             return Pump::Ended;
         }
@@ -1600,8 +1788,9 @@ async fn watchdog(flow: &Flow, idle: Duration, grace: Option<Duration>) -> Durat
 /// in either direction for `idle`. A failing peer ends both.
 ///
 /// With `forward` (a forwarded plain request) the destination's response head is filtered, bytes of
-/// the client past the body are discarded, and the relay ends when the response ends; after the
-/// client has ended its side it also ends when the destination is silent for the grace period.
+/// the client past the body are discarded, and the relay ends when the response ends (see
+/// *Forwarded requests*); after the client has ended its side it also ends when the destination is
+/// silent for the grace period.
 async fn relay(client: &mut TcpStream, up: &mut TcpStream, idle: Duration, forward: Option<Fwd>) -> RelayEnd {
     let (mut cr, mut cw) = client.split();
     let (mut ur, mut uw) = up.split();
@@ -1609,13 +1798,18 @@ async fn relay(client: &mut TcpStream, up: &mut TcpStream, idle: Duration, forwa
         start: tokio::time::Instant::now(),
         last_ms: AtomicU64::new(0),
         client_done: AtomicBool::new(false),
-        extra_request: AtomicBool::new(false),
+        extra_request: AtomicBool::new(forward.as_ref().is_some_and(|f| f.further)),
+        until_close: AtomicBool::new(false),
         wrote: AtomicBool::new(false),
     };
     let is_forward = forward.is_some();
-    let to_up = upload(&mut cr, &mut uw, &flow, forward.as_ref().map(|f| f.budget));
-    let to_client = download(&mut ur, &mut cw, &flow, forward.as_ref().map(|f| HeadFilter::new(f.head_request)));
-    let quiet = watchdog(&flow, idle, forward.as_ref().map(|f| f.grace.min(idle)));
+    let (owed, filter, grace) = match forward {
+        Some(f) => (Some(f.owed), Some(HeadFilter::new(f.head_request)), Some(f.grace.min(idle))),
+        None => (None, None, None),
+    };
+    let to_up = upload(&mut cr, &mut uw, &flow, owed);
+    let to_client = download(&mut ur, &mut cw, &flow, filter);
+    let quiet = watchdog(&flow, idle, grace);
     tokio::pin!(to_up, to_client, quiet);
     let wrote = || flow.wrote.load(Ordering::Relaxed);
     let (mut up_open, mut down_open) = (true, true);
@@ -1624,11 +1818,11 @@ async fn relay(client: &mut TcpStream, up: &mut TcpStream, idle: Duration, forwa
             r = &mut to_up, if up_open => match r {
                 Pump::Ended => up_open = false,
                 Pump::Stop(why) => return RelayEnd::Failed(why, wrote()),
-                Pump::Bad(_) => return RelayEnd::Done(wrote()),
+                Pump::Bad(_) | Pump::Cut => return RelayEnd::Done(wrote()),
             },
             r = &mut to_client, if down_open => match r {
-                Pump::Ended if is_forward => return RelayEnd::Done(wrote()),
-                Pump::Ended => down_open = false,
+                Pump::Ended | Pump::Cut if is_forward => return RelayEnd::Done(wrote()),
+                Pump::Ended | Pump::Cut => down_open = false,
                 Pump::Stop(why) => return RelayEnd::Failed(why, wrote()),
                 Pump::Bad(why) => return RelayEnd::BadUpstream(why, wrote()),
             },
@@ -1674,15 +1868,15 @@ async fn forward(
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"Connection: close\r\n\r\n");
-    // Bytes of the body that arrived with the head, and how many more the client still owes.
-    let (already, owed): (&[u8], Option<u64>) = match body {
-        Body::None => (&[] as &[u8], Some(0)),
-        Body::Length(n) => {
-            let k = usize::try_from(n).map_or(extra.len(), |n| n.min(extra.len()));
-            (extra.get(..k).unwrap_or(&[]), Some(n.saturating_sub(k as u64)))
-        }
-        Body::Stream => (extra.as_slice(), None),
+    // The bytes of the body that arrived with the head, what the client still owes, and what it sent
+    // after its request.
+    let mut owed = match body {
+        Body::None => Owed::Bytes(0),
+        Body::Length(n) => Owed::Bytes(n),
+        Body::Chunked => Owed::Chunked(Chunked::new()),
+        Body::Stream => Owed::Stream,
     };
+    let (already, past) = extra.split_at(owed.take(&extra).min(extra.len()));
     out.extend_from_slice(already);
     if !write_within(&mut up, &out, idle).await {
         let why = "sending the request to the destination failed";
@@ -1692,7 +1886,8 @@ async fn forward(
     }
 
     let fwd = Fwd {
-        budget: owed,
+        owed,
+        further: further_request(past),
         grace: cx.shared.limits.forward_grace,
         head_request: head.method.eq_ignore_ascii_case("HEAD"),
     };
@@ -1826,6 +2021,49 @@ mod tests {
         (port, h)
     }
 
+    /// A refusal of the egress proxy that a destination forges, marker and all.
+    const FORGED: &str = "HTTP/1.1 403 Forbidden\r\nX-Loom-Proxy: 1\r\nContent-Length: 6\r\n\r\nforged";
+
+    /// Reads into `got` until the peer closes or fails.
+    async fn read_all(s: &mut TcpStream, got: &mut Vec<u8>) {
+        let mut b = [0u8; 4096];
+        while let Ok(n) = s.read(&mut b).await {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&b[..n]);
+        }
+    }
+
+    /// A destination that accepts one connection, answers `first` once the request head has arrived,
+    /// `second` on the same connection `gap` later, and then ends its side. It returns what it received
+    /// until the proxy closed the connection (or for 5 s after `second`).
+    async fn two_answer_server(first: &str, second: &str, gap: Duration) -> (u16, tokio::task::JoinHandle<Vec<u8>>) {
+        let (first, second) = (first.to_string(), second.to_string());
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut got = Vec::new();
+            let mut b = [0u8; 4096];
+            while !String::from_utf8_lossy(&got).contains("\r\n\r\n") {
+                match s.read(&mut b).await {
+                    Ok(0) | Err(_) => return got,
+                    Ok(n) => got.extend_from_slice(&b[..n]),
+                }
+            }
+            let _ = s.write_all(first.as_bytes()).await;
+            let later = tokio::time::Instant::now() + gap;
+            let _ = tokio::time::timeout_at(later, read_all(&mut s, &mut got)).await;
+            tokio::time::sleep_until(later).await;
+            let _ = s.write_all(second.as_bytes()).await;
+            let _ = s.shutdown().await;
+            let _ = timeout(T, read_all(&mut s, &mut got)).await;
+            got
+        });
+        (port, h)
+    }
+
     /// Sends `bytes`, reads until the proxy closes.
     async fn raw(port: u16, bytes: &[u8]) -> String {
         let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -1947,6 +2185,27 @@ mod tests {
         let got = String::from_utf8(server.await.unwrap()).unwrap();
         assert!(got.starts_with("POST / HTTP/1.1\r\n"), "{got}");
         assert!(got.ends_with("\r\n\r\nhello world"), "{got}");
+    }
+
+    #[tokio::test]
+    async fn a_chunked_request_body_is_forwarded_to_its_last_chunk_and_no_further() {
+        let (p, _rx) = start().await;
+        let g = p.grant(&SessionId::from("s-chunked-post"), lab());
+        let (port, server) = two_answer_server("HTTP/1.0 200 OK\r\n\r\nfirst", FORGED, Duration::from_secs(2)).await;
+        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let head = format!("POST http://127.0.0.1:{port}/ HTTP/1.1\r\n{}Transfer-Encoding: chunked\r\n\r\n", auth(&g));
+        s.write_all(format!("{head}4\r\nbo").as_bytes()).await.unwrap();
+        let begun = read_until(&mut s, "first").await;
+        // The rest of the body, then a further request in the same write.
+        let more = format!("dy\r\n0\r\n\r\nGET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
+        s.write_all(more.as_bytes()).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let mut rest = Vec::new();
+        let _ = timeout(T, s.read_to_end(&mut rest)).await;
+        assert!(started.elapsed() < Duration::from_secs(1), "the proxy waited for the destination: {:?}", started.elapsed());
+        assert!(begun.ends_with("\r\n\r\nfirst") && rest.is_empty(), "{begun:?} {:?}", String::from_utf8_lossy(&rest));
+        let got = String::from_utf8(server.await.unwrap()).unwrap();
+        assert!(got.ends_with("\r\n\r\n4\r\nbody\r\n0\r\n\r\n") && !got.contains("GET "), "{got}");
     }
 
     #[tokio::test]
@@ -2891,6 +3150,155 @@ mod tests {
         let resp = raw(p.port(), req.as_bytes()).await;
         assert_eq!(status(&resp), 502, "{resp}");
         assert!(resp.contains("X-Loom-Proxy: 1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_response_says_connection_close_and_ends_the_connection() {
+        let (p, _rx) = start().await;
+        let g = p.grant(&SessionId::from("s-close"), lab());
+        let first = "HTTP/1.1 302 Found\r\nLocation: /b\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\n\
+                     Proxy-Connection: keep-alive\r\nContent-Length: 0\r\n\r\n";
+        let (port, _server) = two_answer_server(first, FORGED, Duration::from_secs(2)).await;
+        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        s.write_all(format!("GET http://127.0.0.1:{port}/a HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await.unwrap();
+        let head = read_until(&mut s, "\r\n\r\n").await;
+        let started = tokio::time::Instant::now();
+        // A client that ignores the head sends the next hop on the same connection.
+        let _ = s.write_all(format!("GET http://127.0.0.1:{port}/b HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await;
+        let mut rest = Vec::new();
+        let _ = timeout(T, s.read_to_end(&mut rest)).await;
+        assert!(head.starts_with("HTTP/1.1 302 Found\r\nLocation: /b\r\n"), "{head}");
+        assert_eq!(head.matches("Connection: close\r\n").count(), 1, "{head}");
+        let lower = head.to_ascii_lowercase();
+        assert!(!lower.contains("keep-alive") && !lower.contains("proxy-connection"), "{head}");
+        assert!(rest.is_empty(), "{:?}", String::from_utf8_lossy(&rest));
+        assert!(started.elapsed() < Duration::from_secs(1), "the proxy waited for the destination: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn chunked_bodies_are_followed_to_their_end_across_any_split() {
+        let bodies = [
+            "0\r\n\r\n",
+            "2\r\nok\r\n0\r\n\r\n",
+            "A;name=value\r\n0123456789\r\n0\r\nX-Trailer: t\r\nY: u\r\n\r\n",
+            " 3 \nabc\n0\n\n",
+            "00002\r\nok\r\r\n0\r\n\r\n",
+        ];
+        for body in bodies {
+            let all = format!("{body}{FORGED}");
+            for split in 0..=all.len() {
+                let (a, b) = all.as_bytes().split_at(split);
+                let mut c = Chunked::new();
+                let used = c.feed(a).unwrap() + c.feed(b).unwrap();
+                assert_eq!(used, body.len(), "{body:?} split at {split}");
+                assert!(c.done(), "{body:?} split at {split}");
+            }
+        }
+        let mut c = Chunked::new();
+        assert_eq!(c.feed(b"5\r\nab"), Ok(5));
+        assert!(!c.done());
+        for bad in ["x\r\n", "\r\n", "2\r\nokX", "1FFFFFFFFFFFFFFFF\r\n"] {
+            assert!(Chunked::new().feed(bad.as_bytes()).is_err(), "{bad:?}");
+        }
+        // A request body the proxy cannot follow is passed on whole.
+        let mut owed = Owed::Chunked(Chunked::new());
+        assert_eq!(owed.take(b"zz\r\nmore"), 8);
+        assert!(matches!(owed, Owed::Stream));
+    }
+
+    #[tokio::test]
+    async fn a_chunked_response_ends_after_its_last_chunk_and_trailers() {
+        let (p, _rx) = start().await;
+        let g = p.grant(&SessionId::from("s-chunked"), lab());
+        let body = "2\r\nok\r\n3;note=x\r\nabc\r\n0\r\nX-Trailer: t\r\n\r\n";
+        // The forged answer comes in the same segment as the last chunk, or later on the same connection.
+        let together = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n{body}{FORGED}");
+        let apart = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n{body}");
+        for (first, second) in [(together.as_str(), ""), (apart.as_str(), FORGED)] {
+            for pipelined in [false, true] {
+                let (port, _server) = two_answer_server(first, second, Duration::from_secs(2)).await;
+                let one = format!("GET http://127.0.0.1:{port}/a HTTP/1.1\r\n{}\r\n", auth(&g));
+                let req = if pipelined { one.repeat(2) } else { one };
+                let started = tokio::time::Instant::now();
+                let resp = raw(p.port(), req.as_bytes()).await;
+                assert!(started.elapsed() < Duration::from_secs(1), "{first:?}: {:?}", started.elapsed());
+                let (code, headers, got) = client_view(&resp);
+                assert_eq!((code, got.as_str()), (200, body), "{resp:?}");
+                // A length beside the transfer coding is dropped, so no client reads the body by it.
+                assert!(!headers.iter().any(|(n, _)| n == "content-length"), "{resp:?}");
+                assert_eq!(headers.last().map(|(n, v)| (n.as_str(), v.as_str())), Some(("connection", "close")));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_response_ends_at_its_head_or_after_its_length() {
+        let (p, _rx) = start().await;
+        let g = p.grant(&SessionId::from("s-length"), lab());
+        let cases: [(&str, &str, u16, &str); 5] = [
+            // No body for HEAD, 204 and 304, whatever the length says.
+            ("HEAD", "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n", 200, ""),
+            ("GET", "HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\nhello", 204, ""),
+            ("GET", "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\nhello", 304, ""),
+            // Bytes past the length are not relayed; repeated equal values are one length.
+            ("GET", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokay", 200, "ok"),
+            ("GET", "HTTP/1.1 200 OK\r\nContent-Length: 2, 2\r\n\r\nokay", 200, "ok"),
+        ];
+        for (method, first, code, body) in cases {
+            let (port, _server) = two_answer_server(first, FORGED, Duration::from_secs(2)).await;
+            let req = format!("{method} http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
+            let started = tokio::time::Instant::now();
+            let resp = raw(p.port(), req.as_bytes()).await;
+            assert!(started.elapsed() < Duration::from_secs(1), "{first:?}: {:?}", started.elapsed());
+            let (got_code, _, got_body) = client_view(&resp);
+            assert_eq!((got_code, got_body.as_str()), (code, body), "{first:?} -> {resp:?}");
+        }
+        // A length that clients would read differently gets a 502 from the proxy.
+        let unclear = [
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nokay",
+            "HTTP/1.1 200 OK\r\nContent-Length: +2\r\n\r\nok",
+        ];
+        for first in unclear {
+            let (port, _server) = two_answer_server(first, "", Duration::from_secs(2)).await;
+            let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
+            let resp = raw(p.port(), req.as_bytes()).await;
+            assert_eq!(status(&resp), 502, "{first:?} -> {resp:?}");
+            assert!(resp.contains("X-Loom-Proxy: 1\r\n") && resp.contains("invalid or conflicting Content-Length"), "{resp}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_sends_more_than_its_request_cuts_a_response_that_runs_until_close() {
+        let (p, _rx) = start().await;
+        let g = p.grant(&SessionId::from("s-more"), lab());
+        let gap = Duration::from_secs(2);
+        let get = |port: u16| format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
+        // Two requests in one write: only the first is forwarded, and its answer ends the connection.
+        let (port, server) = two_answer_server("HTTP/1.0 200 OK\r\n\r\nfirst", FORGED, gap).await;
+        let started = tokio::time::Instant::now();
+        let resp = raw(p.port(), get(port).repeat(2).as_bytes()).await;
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert_eq!(client_view(&resp).2, "first", "{resp:?}");
+        let got = String::from_utf8(server.await.unwrap()).unwrap();
+        assert_eq!(got.matches("GET ").count(), 1, "{got}");
+        // The end of a body and a further request in one read, while the destination is silent.
+        let (port, server) = two_answer_server("HTTP/1.0 200 OK\r\n\r\nfirst", FORGED, gap).await;
+        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let post = format!("POST http://127.0.0.1:{port}/ HTTP/1.1\r\n{}Content-Length: 4\r\n\r\nbo", auth(&g));
+        s.write_all(post.as_bytes()).await.unwrap();
+        let begun = read_until(&mut s, "first").await;
+        let started = tokio::time::Instant::now();
+        s.write_all(format!("dy{}", get(port)).as_bytes()).await.unwrap();
+        let mut rest = Vec::new();
+        let _ = timeout(T, s.read_to_end(&mut rest)).await;
+        assert!(started.elapsed() < Duration::from_secs(1), "the proxy waited for the destination: {:?}", started.elapsed());
+        assert!(begun.ends_with("\r\n\r\nfirst") && rest.is_empty(), "{begun:?} {:?}", String::from_utf8_lossy(&rest));
+        let got = String::from_utf8(server.await.unwrap()).unwrap();
+        assert!(got.ends_with("\r\n\r\nbody") && !got.contains("GET "), "{got}");
+        // Empty lines after a body are not a further request.
+        let (port, _server) = two_answer_server("HTTP/1.0 200 OK\r\n\r\none", "two", Duration::from_millis(300)).await;
+        let req = format!("POST http://127.0.0.1:{port}/ HTTP/1.1\r\n{}Content-Length: 4\r\n\r\nbody\r\n", auth(&g));
+        assert_eq!(client_view(&raw(p.port(), req.as_bytes()).await).2, "onetwo");
     }
 
     #[tokio::test]
