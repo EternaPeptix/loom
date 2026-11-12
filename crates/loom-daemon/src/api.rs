@@ -1277,9 +1277,15 @@ mod tests {
         assert_eq!(inbox[0]["session"], id.as_str());
         let (s, b) = e.post(&format!("/api/inbox/{item}"), json!({"answer": ""})).await;
         assert_eq!((s, b), (202, json!({})));
-        // The answer starts another turn, which finishes with a new item; the old one is gone.
+        // An empty answer to a finished item only dismisses it: no turn starts. The message behind it
+        // does start one, which would be the fifth if the dismissal had started the fourth.
+        let (s, _) = e.post(&format!("/api/sessions/{id}/messages"), json!({"text": "third"})).await;
+        assert_eq!(s, 202);
         e.wait_turn_ends(&id, 4).await;
         assert!(e.rt.inbox().iter().all(|i| i.item.item_id != item));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let turn_ends = e.records(&id).await.iter().filter(|r| r["kind"] == "turn_end").count();
+        assert_eq!(turn_ends, 4);
         let (s, b) = e.post("/api/inbox/i-nope", json!({"answer": "x"})).await;
         assert_eq!((s, b["error"].as_str().unwrap()), (404, "There is no open inbox item i-nope."));
     }

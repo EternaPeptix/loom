@@ -449,6 +449,10 @@ struct State {
     ended: Option<SessionOutcome>,
     /// Own steps counted when the `Budget` note was given.
     budget_note_step: Option<u32>,
+    /// Own steps and start time from which a root's budget counts: a turn the operator starts after
+    /// the budget ran out begins a fresh one.
+    budget_step_base: u32,
+    budget_from_ms: Option<u64>,
     inbox: Vec<InboxItem>,
     last_interrupted: Option<String>,
     prompt_tokens: u64,
@@ -492,7 +496,15 @@ impl State {
             Event::HarnessNote { note: NoteKind::Budget, .. } => self.budget_note_step = Some(self.step),
             Event::InboxOpened(item) => self.inbox.push(item.clone()),
             Event::InboxResolved { item_id, .. } => self.inbox.retain(|i| &i.item_id != item_id),
-            Event::TurnStart { .. } => self.has_turn = true,
+            Event::TurnStart { trigger } => {
+                self.has_turn = true;
+                let operator = matches!(trigger, Trigger::User | Trigger::InboxAnswer | Trigger::Resume);
+                if operator && self.last_end == Some(TurnEndReason::BudgetExhausted) {
+                    self.budget_step_base = self.step;
+                    self.budget_from_ms = Some(rec.ts_ms);
+                    self.budget_note_step = None;
+                }
+            }
             Event::TurnEnd { reason } => self.last_end = Some(*reason),
             Event::SessionEnd { outcome, .. } => self.ended = Some(*outcome),
             Event::Interrupted { reason } => self.last_interrupted = Some(reason.clone()),
@@ -529,6 +541,8 @@ pub struct Session {
     jobs_open: bool,
     token: CancellationToken,
     nudges: u32,
+    /// Replies in a row that made no progress: cut off, or with only malformed calls.
+    stuck: u32,
     phase: Phase,
     st: State,
     published: Option<Status>,
@@ -577,6 +591,18 @@ fn count_lines(path: &Path) -> u64 {
     lines
 }
 
+/// What a JSON value is, for a sentence.
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 fn delivery(outcome: ChildOutcome, report: String) -> Delivery {
     Delivery { outcome, report, full: None, payload: Value::Null }
 }
@@ -599,6 +625,7 @@ impl Session {
             jobs_open: true,
             token: CancellationToken::new(),
             nudges: 0,
+            stuck: 0,
             phase,
             st,
             published: None,
@@ -825,6 +852,9 @@ impl Session {
                 }
             };
             let trigger = match ev {
+                Ev::Input(Some(Input::Stop)) if self.deps.shared.is_child() => {
+                    return Ok(End::Settled(self.stop_idle_child().await?));
+                }
                 Ev::Input(None) => {
                     self.deps.ctx.jobs.kill_all(self.grace()).await;
                     return Ok(End::Closed);
@@ -860,10 +890,25 @@ impl Session {
                 if jobs || children {
                     self.append(Author::Harness, Event::Interrupted { reason: texts::REASON_OPERATOR.to_string() })?;
                 }
+                // Stopped stays stopped: what the stop itself causes (a child's settlement, a job's end)
+                // must not wake a session that was waiting, only the operator can.
+                if matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded)) {
+                    self.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped })?;
+                    self.publish();
+                }
                 Ok(None)
             }
             other => Ok(self.arrival(other).await?.trigger),
         }
+    }
+
+    /// A child that is between turns was stopped: end its jobs and children and settle it `Stopped`, so
+    /// that its parent is not left waiting for it.
+    async fn stop_idle_child(&mut self) -> R<Settlement> {
+        self.append(Author::Harness, Event::Interrupted { reason: texts::REASON_PARENT.to_string() })?;
+        self.deps.ctx.jobs.kill_all(self.grace()).await;
+        self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
+        self.settle(delivery(ChildOutcome::Stopped, texts::stopped_report(self.st.step))).await
     }
 
     /// Record an input that is not a command. Whether it starts a turn is the caller's business.
@@ -879,7 +924,11 @@ impl Session {
             Input::Answer { item_id, answer } => {
                 let Some(item) = self.st.inbox.iter().find(|i| i.item_id == item_id).cloned() else { return Ok(out) };
                 self.append(Author::User, Event::InboxResolved { item_id, answer: answer.clone() })?;
-                if let (Some(reference), true) = (&item.reference, self.deps.shared.journal.is_some()) {
+                if answer.trim().is_empty() && !item.blocking {
+                    return Ok(out);
+                }
+                let asked = matches!(item.kind, InboxKind::Question | InboxKind::Blocker);
+                if let (Some(reference), true, true) = (&item.reference, asked, self.deps.shared.journal.is_some()) {
                     let op = LedgerOp::QuestionAnswer { id: reference.clone(), answer: answer.clone() };
                     if let Err(e) = self.deps.shared.ledger_append(true, op) {
                         tracing::warn!(session = %self.deps.shared.session, "answer not recorded in the ledger: {e}");
@@ -1041,6 +1090,7 @@ impl Session {
     async fn turn(&mut self, trigger: Trigger) -> R<Option<Settlement>> {
         self.token = self.deps.control.begin_turn();
         self.nudges = 0;
+        self.stuck = 0;
         self.append(Author::Harness, Event::TurnStart { trigger })?;
         if self.st.last_end == Some(TurnEndReason::Stopped) {
             let restarted = self
@@ -1149,6 +1199,9 @@ impl Session {
             return self.cancelled().await;
         }
         let force = self.drain_arrivals().await?;
+        if self.token.is_cancelled() {
+            return self.cancelled().await;
+        }
         if let Some(flow) = self.check_budget().await? {
             return Ok(flow);
         }
@@ -1359,10 +1412,12 @@ impl Session {
             let Some(input) = next else { break };
             match input {
                 Input::Reweave => force = true,
-                Input::Resume | Input::Stop => {}
+                Input::Resume => {}
+                Input::Stop => self.token.cancel(),
                 other => {
                     if self.arrival(other).await?.user {
                         self.nudges = 0;
+                        self.stuck = 0;
                     }
                 }
             }
@@ -1376,8 +1431,8 @@ impl Session {
         if max_steps == 0 && max_minutes == 0 {
             return Ok(None);
         }
-        let step = self.st.step;
-        let minutes = now_ms().saturating_sub(self.st.started_ms) / 60_000;
+        let step = self.st.step.saturating_sub(self.st.budget_step_base);
+        let minutes = now_ms().saturating_sub(self.st.budget_from_ms.unwrap_or(self.st.started_ms)) / 60_000;
         let reached = (max_steps > 0 && step >= max_steps) || (max_minutes > 0 && minutes >= u64::from(max_minutes));
         match self.st.budget_note_step {
             None if reached => {
@@ -1385,7 +1440,7 @@ impl Session {
                 self.note(Author::Harness, NoteKind::Budget, texts::budget_reached(step, minutes, can_finish))?;
                 Ok(None)
             }
-            Some(at) if step.saturating_sub(at) >= texts::BUDGET_GRACE_STEPS => {
+            Some(at) if self.st.step.saturating_sub(at) >= texts::BUDGET_GRACE_STEPS => {
                 if self.deps.shared.is_child() {
                     let report = texts::budget_exhausted_report(step, minutes, &self.last_reply());
                     Ok(Some(Flow::Settle(delivery(ChildOutcome::BudgetExhausted, report))))
@@ -1450,7 +1505,13 @@ impl Session {
         let mut limit = policy.target_tokens;
         if let Some(window) = self.deps.context_window {
             let reserve = self.deps.client.profile().max_output_tokens.unwrap_or(16_384).saturating_add(4_096);
-            limit = limit.min(window.saturating_sub(reserve));
+            // The trigger stays within four fifths of the window and the floor within half of it, so
+            // that a small window can always be planned for.
+            limit = limit.min(window.saturating_sub(reserve)).min(window / 5 * 4);
+            policy.floor_tokens = policy.floor_tokens.min(window / 2);
+            if policy.floor_tokens >= limit {
+                policy.floor_tokens = limit / 2;
+            }
         }
         if !forced && self.estimate() <= limit {
             return Ok(false);
@@ -1552,9 +1613,37 @@ impl Session {
             return self.cancelled().await;
         }
         if c.finish == FinishReason::Length {
+            if complete.is_empty() {
+                if let Some(flow) = self.give_up_if_stuck(texts::repeated_cut, &c.text)? {
+                    return Ok(flow);
+                }
+            }
             let dropped = c.tool_calls.iter().find(|t| !t.complete).map(|t| t.name.as_str());
             let text = texts::output_cut(c.usage.completion_tokens, dropped, calls.ran);
             self.note(Author::Harness, NoteKind::OutputCut, text)?;
+            return Ok(Flow::Next);
+        }
+        // Calls that were not cut off by the limit but whose arguments are not a JSON object: they are
+        // not run and not replayed (the weave keeps only complete calls); the model is told why.
+        let malformed: Vec<&ToolCallRequest> = c.tool_calls.iter().filter(|t| !t.complete && !t.name.is_empty()).collect();
+        if !malformed.is_empty() {
+            if complete.is_empty() {
+                if let Some(flow) = self.give_up_if_stuck(texts::repeated_malformed, &c.text)? {
+                    return Ok(flow);
+                }
+            }
+            let text = malformed
+                .iter()
+                .map(|t| {
+                    let error = match serde_json::from_str::<Value>(&t.arguments) {
+                        Err(e) => e.to_string(),
+                        Ok(v) => format!("they are valid JSON but hold {}, not an object", json_kind(&v)),
+                    };
+                    texts::malformed_call(&t.name, &error, &t.arguments)
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            self.note(Author::Harness, NoteKind::Nudge, text)?;
             return Ok(Flow::Next);
         }
         if !complete.is_empty() {
@@ -1592,6 +1681,22 @@ impl Session {
                     Ok(Flow::End(TurnEndReason::Parked))
                 }
             }
+        }
+    }
+
+    /// Count a reply that made no progress. Past `agents.max_nudges` of them in a row the session gives
+    /// up: a child settles `Failed`, anything else opens a `Parked` item. `why` names the cause.
+    fn give_up_if_stuck(&mut self, why: fn(u32) -> String, reply: &str) -> R<Option<Flow>> {
+        if self.stuck < self.deps.agents.max_nudges {
+            self.stuck = self.stuck.saturating_add(1);
+            return Ok(None);
+        }
+        let why = why(self.stuck.saturating_add(1));
+        if self.deps.shared.is_child() {
+            Ok(Some(Flow::Settle(delivery(ChildOutcome::Failed, texts::failed_report(&why, reply)))))
+        } else {
+            self.open_inbox(InboxKind::Parked, texts::turn_failed(&why))?;
+            Ok(Some(Flow::End(TurnEndReason::Parked)))
         }
     }
 
@@ -1643,6 +1748,7 @@ impl Session {
             }
             if ok {
                 self.nudges = 0;
+                self.stuck = 0;
             }
             out.ran = out.ran.saturating_add(1);
         }
@@ -2132,6 +2238,27 @@ mod tests {
         assert_eq!(asst["tool_calls"].as_array().unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn repeated_output_limit_replies_park_and_progress_resets_the_count() {
+        let agents = AgentsCfg { max_nudges: 2, verify_finish: false, ..AgentsCfg::default() };
+        let cut = || -> Action { Reply::text("rambling").with_finish(FinishReason::Length).into() };
+        let script = seq(vec![cut(), cut(), bash("echo ok").into(), cut(), cut(), cut(), cut()]);
+        let mut fx = Fx::build("lead", false, true, agents.clone(), script).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(fx.server.requests().len(), 6, "{:?}", kinds(&rs));
+        assert_eq!(notes(&rs, NoteKind::OutputCut).len(), 4);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Parked]);
+        assert_eq!(inbox(&rs)[0].text, texts::turn_failed(&texts::repeated_cut(3)));
+
+        let mut kid = Fx::build("worker", true, true, agents, seq((0..5).map(|_| cut()).collect())).await;
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Do it.".into())));
+        let End::Settled(s) = run_with(session, vec![]).await else { panic!("expected a settlement") };
+        assert_eq!(s.outcome, ChildOutcome::Failed);
+        assert!(s.report.contains(&texts::repeated_cut(3)), "{}", s.report);
+    }
+
     // ---- several calls, effects ----------------------------------------------------------------
 
     #[tokio::test]
@@ -2185,6 +2312,74 @@ mod tests {
         let res = results(&rs);
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].status, ToolStatus::Invalid);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_call_is_not_run_not_replayed_and_never_reaches_the_gate() {
+        let bad = "{\"command\": \"ls";
+        let script = seq(vec![Reply::tool("bash", bad).into(), finish_call("done").into()]);
+        let mut fx = Fx::new("lead", false, true, script).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(count(&rs, "tool_call"), 1, "only finish was called: {:?}", kinds(&rs));
+        let n = notes(&rs, NoteKind::Nudge);
+        assert_eq!(n.len(), 1, "{n:?}");
+        assert!(n[0].contains("`bash`") && n[0].contains("not a valid JSON object"), "{}", n[0]);
+        assert!(n[0].contains("EOF while parsing") && n[0].contains("line 1 column"), "{}", n[0]);
+        assert!(n[0].contains(bad) && n[0].contains("Send the call again"), "{}", n[0]);
+        assert!(!n[0].contains("without a tool call"));
+        let reqs = fx.server.requests();
+        assert_eq!(reqs.len(), 2);
+        assert!(all_text(&reqs[1]).contains(&n[0]));
+        for m in reqs[1]["messages"].as_array().unwrap() {
+            assert!(m.get("tool_calls").is_none(), "the malformed call must not be replayed: {m}");
+        }
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Finished]);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_call_beside_a_valid_one_leaves_the_valid_one_running() {
+        let reply = Reply::tools([
+            ("bash", json!({ "command": "echo fine" }).to_string()),
+            ("bash", "[1, 2]".to_string()),
+            ("bash", "{nope".to_string()),
+        ]);
+        let mut fx = Fx::new("chat", false, false, seq(vec![reply.into(), Reply::text("ok").into()])).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(count(&rs, "tool_call"), 1);
+        assert_eq!(results(&rs)[0].status, ToolStatus::Ok);
+        let n = notes(&rs, NoteKind::Nudge);
+        assert_eq!(n.len(), 1);
+        assert!(n[0].contains("hold an array, not an object") && n[0].contains("key must be a string"), "{}", n[0]);
+        let second = &fx.server.requests()[1];
+        let asst = second["messages"].as_array().unwrap().iter().find(|m| m["role"] == "assistant").unwrap().clone();
+        assert_eq!(asst["tool_calls"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_replies_in_a_row_park_a_lead_and_fail_a_child() {
+        let agents = AgentsCfg { max_nudges: 2, verify_finish: false, ..AgentsCfg::default() };
+        let script = || seq((0..5).map(|_| Reply::tool("bash", "{\"command\": ").into()).collect());
+        let mut fx = Fx::build("lead", false, true, agents.clone(), script()).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(fx.server.requests().len(), 3);
+        assert_eq!(notes(&rs, NoteKind::Nudge).len(), 2);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Parked]);
+        let items = inbox(&rs);
+        assert_eq!((items.len(), items[0].kind, items[0].blocking), (1, InboxKind::Parked, true));
+        assert_eq!(items[0].text, texts::turn_failed(&texts::repeated_malformed(3)));
+        assert_eq!(count(&rs, "tool_call"), 0);
+
+        let mut kid = Fx::build("worker", true, true, agents, script()).await;
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Do it.".into())));
+        let End::Settled(s) = run_with(session, vec![]).await else { panic!("expected a settlement") };
+        assert_eq!(s.outcome, ChildOutcome::Failed);
+        assert!(s.report.contains(&texts::repeated_malformed(3)), "{}", s.report);
     }
 
     #[tokio::test]
@@ -2287,6 +2482,29 @@ mod tests {
         assert_eq!(count(&rs, "model_request"), 3);
         assert_eq!(turn_ends(&rs).last(), Some(&TurnEndReason::BudgetExhausted));
         assert!(matches!(rs.last().unwrap().event, Event::SessionEnd { outcome: SessionOutcome::BudgetExhausted, .. }));
+    }
+
+    #[tokio::test]
+    async fn a_root_whose_budget_ran_out_gets_a_fresh_budget_when_the_operator_writes() {
+        let script = seq((0..10).map(|_| bash("echo x").into()).collect());
+        let mut fx = Fx::new("lead", false, true, script).await;
+        let session = fx.create_with(Budget { max_steps: Some(1), max_minutes: None }, None);
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "the budget end", |rs| count(rs, "turn_end") == 1).await;
+        assert_eq!(turn_ends(&fx.sink.records()), vec![TurnEndReason::BudgetExhausted]);
+        assert_eq!(fx.server.requests().len(), 3);
+        tx.send(user("keep going")).unwrap();
+        wait_until(&fx.sink, "the second budget end", |rs| count(rs, "turn_end") == 2).await;
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::BudgetExhausted; 2]);
+        assert_eq!(notes(&rs, NoteKind::Budget).len(), 2, "the new budget gets its own note");
+        assert_eq!(fx.server.requests().len(), 6, "the second turn ran its own three steps");
+        assert_eq!(inbox(&rs).len(), 2);
+        // Reopened from the log, the session counts the same way.
+        finish_task(tx, task).await;
+        let reopened = Session::open(fx.deps()).unwrap();
+        assert_eq!(reopened.st.budget_step_base, 3);
     }
 
     #[tokio::test]
@@ -2395,6 +2613,81 @@ mod tests {
             .collect();
         assert_eq!(reasons, vec![texts::REASON_PARENT.to_string()]);
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn an_idle_stop_is_sticky_until_the_operator_writes_again() {
+        let script = seq(vec![
+            Reply::tool("bash", json!({ "command": "sleep 60", "background": true }).to_string()).into(),
+            Reply::tool("wait", json!({}).to_string()).into(),
+            finish_call("done").into(),
+        ]);
+        let mut fx = Fx::new("lead", false, true, script).await;
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "waiting", |rs| turn_ends(rs) == vec![TurnEndReason::Waiting]).await;
+        tx.send(Input::Stop).unwrap();
+        wait_until(&fx.sink, "the stop", |rs| turn_ends(rs).len() == 2).await;
+        let settlement = Settlement {
+            child: SessionId::from("s-kid9"),
+            role: "worker".into(),
+            outcome: ChildOutcome::Stopped,
+            report: "stopped".into(),
+            full: None,
+            payload: Value::Null,
+            steps: 1,
+            usage: Usage::default(),
+        };
+        tx.send(Input::ChildSettled(settlement)).unwrap();
+        wait_until(&fx.sink, "the job end and the settlement", |rs| count(rs, "job_settled") == 1 && count(rs, "child_settled") == 1)
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Waiting, TurnEndReason::Stopped]);
+        assert_eq!(count(&rs, "turn_start"), 1, "nothing may start a turn after the stop: {:?}", kinds(&rs));
+        assert_eq!(fx.sink.last_status().unwrap().last_end, Some(TurnEndReason::Stopped));
+        assert_eq!(fx.server.requests().len(), 2);
+        // The operator writing again runs the session.
+        tx.send(user("carry on")).unwrap();
+        wait_until(&fx.sink, "the next turn", |rs| count(rs, "turn_end") == 3).await;
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs).last(), Some(&TurnEndReason::Finished));
+        assert!(notes(&rs, NoteKind::Interrupted).contains(&texts::AFTER_STOP.to_string()));
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn stopping_an_idle_child_settles_it_stopped() {
+        let script = seq(vec![
+            Reply::tool("bash", json!({ "command": "sleep 60", "background": true }).to_string()).into(),
+            Reply::tool("wait", json!({}).to_string()).into(),
+        ]);
+        let mut kid = Fx::new("worker", true, true, script).await;
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Run it.".into())));
+        let (tx, task) = spawn_run(session);
+        wait_until(&kid.sink, "waiting", |rs| turn_ends(rs) == vec![TurnEndReason::Waiting]).await;
+        tx.send(Input::Stop).unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(30), task).await.expect("the child did not settle").unwrap();
+        let End::Settled(s) = end else { panic!("expected a settlement, got {end:?}") };
+        assert_eq!(s.outcome, ChildOutcome::Stopped);
+        assert_eq!(s.report, texts::stopped_report(2));
+        let rs = kid.sink.records();
+        assert!(matches!(rs.last().unwrap().event, Event::SessionEnd { outcome: SessionOutcome::Stopped, .. }));
+        assert!(kid.ctx.jobs.list().await.iter().all(|j| j.state != JobState::Running));
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_lands_while_a_trigger_is_queued_is_honoured() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("never asked").into()])).await;
+        let session = fx.create();
+        // The stop is queued behind the message that starts the turn.
+        run_with(session, vec![user("go"), Input::Stop]).await;
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Stopped], "{:?}", kinds(&rs));
+        assert_eq!(count(&rs, "model_request"), 0);
+        assert_eq!(count(&rs, "interrupted"), 1);
     }
 
     // ---- open --------------------------------------------------------------------------------
@@ -2530,6 +2823,51 @@ mod tests {
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Asked, TurnEndReason::Finished]);
         assert_eq!(fx.sink.last_status().unwrap().open_inbox, 1); // the Finished item
         finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn dismissing_a_non_blocking_item_resolves_it_without_a_turn() {
+        let mut fx = Fx::new("lead", false, true, seq(vec![finish_call("first").into(), finish_call("second").into()])).await;
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "the finished item", |rs| !inbox(rs).is_empty() && count(rs, "turn_end") == 1).await;
+        let item = inbox(&fx.sink.records())[0].clone();
+        assert_eq!((item.kind, item.blocking), (InboxKind::Finished, false));
+        tx.send(Input::Answer { item_id: item.item_id.clone(), answer: "  ".into() }).unwrap();
+        // A real message behind the dismissal: by the time its turn has run, the dismissal has been
+        // handled, so any request it caused would be in the log before this one.
+        tx.send(user("next")).unwrap();
+        wait_until(&fx.sink, "the second turn", |rs| count(rs, "turn_end") == 2).await;
+        let rs = fx.sink.records();
+        assert_eq!(count(&rs, "inbox_resolved"), 1);
+        assert_eq!(count(&rs, "turn_start"), 2);
+        let reqs = fx.server.requests();
+        assert_eq!(reqs.len(), 2, "the dismissal must not cost a request");
+        assert!(!all_text(&reqs[1]).contains("The operator's answer"), "{}", all_text(&reqs[1]));
+        assert_eq!(rs.iter().filter(|r| matches!(&r.event, Event::UserMessage { .. })).count(), 2);
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn a_written_answer_to_a_finished_item_starts_a_turn_and_is_not_a_ledger_answer() {
+        let mut fx = Fx::new("lead", false, true, seq(vec![Reply::text("ok").into()])).await;
+        let mut session = fx.create();
+        fx.shared.ledger_append(false, LedgerOp::QuestionAsk { text: "which?".into(), blocking: false }).unwrap();
+        let item = InboxItem {
+            item_id: "i-fin".into(),
+            kind: InboxKind::Finished,
+            text: "done".into(),
+            options: Vec::new(),
+            blocking: false,
+            call_id: None,
+            reference: Some("q1".into()),
+        };
+        session.append(Author::Harness, Event::InboxOpened(item)).unwrap();
+        let arrival = session.arrival(Input::Answer { item_id: "i-fin".into(), answer: "thanks, now do more".into() }).await.unwrap();
+        assert_eq!(arrival.trigger, Some(Trigger::InboxAnswer));
+        assert!(arrival.user);
+        assert!(fx.shared.ledger().unwrap().questions.iter().all(|q| q.answer.is_none()), "a Finished item answers no question");
     }
 
     #[tokio::test]
@@ -2766,6 +3104,21 @@ mod tests {
         assert_eq!(items.len(), 1, "{:?}", kinds(&rs));
         assert_eq!(items[0].text, texts::turn_failed(texts::OVERFLOW_UNFOLDABLE));
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error]);
+    }
+
+    #[tokio::test]
+    async fn a_small_window_re_weaves_instead_of_failing_when_it_overflows() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
+        fx.server.set_model("mock", Some(32_000));
+        fx.window = Some(32_000);
+        // The configured floor (180k) is far above this window.
+        fx.context = ReweavePolicy { target_tokens: 400_000, floor_tokens: 180_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert!(!reweave_records(&rs).is_empty(), "{:?}", kinds(&rs));
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+        assert!(inbox(&rs).is_empty());
     }
 
     #[tokio::test]

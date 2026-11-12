@@ -2600,7 +2600,11 @@ mod tests {
         let before = e.server.requests().len();
         e.rt.answer(&entry.item.item_id, "").await.unwrap();
         until("resolved", || e.rt.inbox().is_empty()).await;
-        assert_eq!(e.server.requests().len(), before);
+        // A message behind the dismissal: once its turn has run, a turn started by the dismissal
+        // would already have sent its request, so exactly one new request proves there was none.
+        e.rt.send_message(&id, "and now something else").await.unwrap();
+        until("the next turn", || e.records(&id).iter().filter(|r| matches!(r.event, Event::TurnEnd { .. })).count() == 2).await;
+        assert_eq!(e.server.requests().len(), before + 1);
         assert!(e.rt.answer("i-nothing", "x").await.is_err());
         e.rt.shutdown().await;
     }

@@ -29,6 +29,28 @@ pub fn cut(s: &str, max: usize) -> String {
     format!("{kept}…[+{} chars]", total.saturating_sub(max))
 }
 
+/// Longest part of a malformed call's arguments shown back to the model.
+pub const MALFORMED_ARGS_CHARS: usize = 600;
+
+/// A tool call whose arguments are not a JSON object was not run. `error` is the parser's message
+/// (with its position) or a sentence saying what the arguments were instead.
+pub fn malformed_call(name: &str, error: &str, arguments: &str) -> String {
+    format!(
+        "Your call to `{name}` was not run: its arguments are not a valid JSON object ({error}).\nWhat was received:\n{}\nThe call was left out of the conversation. Send the call again with a JSON object as its arguments.",
+        cut(arguments, MALFORMED_ARGS_CHARS)
+    )
+}
+
+/// Why a session gave up: `n` replies in a row whose tool calls were all malformed.
+pub fn repeated_malformed(n: u32) -> String {
+    format!("The model sent only tool calls with malformed arguments in {n} replies in a row, and none of them could be run.")
+}
+
+/// Why a session gave up: `n` replies in a row reached the output limit without a complete tool call.
+pub fn repeated_cut(n: u32) -> String {
+    format!("The model's reply reached the output limit in {n} replies in a row without completing a tool call.")
+}
+
 /// The reply reached the output limit. `dropped_call` names the tool whose call was cut off, if any;
 /// `ran` is how many complete calls of the same reply were run.
 pub fn output_cut(completion_tokens: u64, dropped_call: Option<&str>, ran: usize) -> String {
