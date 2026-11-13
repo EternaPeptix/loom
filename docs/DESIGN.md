@@ -284,7 +284,10 @@ plus one appended instruction asking for a digest. That request is a full cache 
 a `model_request` with purpose `digest` (its reply is not a record), capped at 8 000 tokens, and waits
 for a request slot at the session's own priority. A non-empty reply is stored in the `reweave` record
 and rendered in the resume block under `Leads from earlier work (written by the model, not verified —
-re-check before relying on them):`. Without a digest the re-weave goes ahead all the same: the ledger
+re-check before relying on them):`. The digest asks for a map of the work (established, ruled out with its boundary, tried but not
+ruled out, open leads, next), not a retelling. The resume brief adds, for a session with a ledger, the
+frontier block (`Where the work stands:`) and a paragraph saying a failed attempt rules out that attempt, not
+the approach. Without a digest the re-weave goes ahead all the same: the ledger
 brief is the durable state.
 
 **HUD (ephemeral tail).** Not part of the weave. Each step request ends with one `user`-role message

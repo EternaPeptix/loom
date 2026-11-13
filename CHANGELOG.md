@@ -10,6 +10,9 @@
   New module `loom-agent::frontier` (`frontier`, `attempts_run`, `render`, `directions`).
 - `claim_update` to `supported` adds one line, `Established: {id}. Results established in this mission so
   far: {n} ({ids}).`, so a banked result stays in view.
+- A re-weave now leaves a map, not a chronicle of failures: the resume brief adds the frontier block (when the
+  session has a ledger) and says a failed attempt rules out that attempt, not the approach, and the digest
+  request asks for Established / Ruled out / Tried, not ruled out / Open leads / Next instead of a list of leads.
 
 ### Watched jobs, agents in their own copies, and attempts
 

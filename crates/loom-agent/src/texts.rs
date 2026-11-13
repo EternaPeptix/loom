@@ -515,11 +515,19 @@ fn append_last_reply(out: &mut String, last_reply: &str) {
 }
 
 /// The `brief` of a re-weave: what the model is told at the point where older material was folded.
-/// `ledger_brief` is `LedgerState::brief`, empty for a session without a ledger.
-pub fn reweave_brief(ledger_brief: &str) -> String {
+/// `ledger_brief` is `LedgerState::brief`, empty for a session without a ledger. `frontier` is the rendered
+/// `frontier::render` block, `None` for a session without a ledger or with nothing to show; when it is given,
+/// a paragraph says that folded attempts are ground covered, not a verdict on the task.
+pub fn reweave_brief(ledger_brief: &str, frontier: Option<&str>) -> String {
     let mut out = String::from(
         "Older tool output above this point is now shown in shortened form. Nothing was deleted: each shortened result names its handle (out:…), `out_read` and `out_grep` open any part of it again, and `log_search` searches the whole session. If you need something you saw earlier, reopen it rather than working from memory.",
     );
+    if let Some(frontier) = frontier {
+        out.push_str(
+            "\n\nWhat was folded is mostly attempts. Read them as ground covered, not as a verdict on the task: a failed attempt rules out that attempt, not the approach. What is established, ruled out with evidence, set aside and still open is below.\n\n",
+        );
+        out.push_str(frontier.trim_end());
+    }
     if !ledger_brief.trim().is_empty() {
         out.push_str("\n\nThe mission ledger at this point:\n");
         out.push_str(ledger_brief.trim_end());
@@ -527,8 +535,9 @@ pub fn reweave_brief(ledger_brief: &str) -> String {
     out
 }
 
-/// The instruction of a digest request, sent after the session's current stable prefix.
-pub const DIGEST_PROMPT: &str = "Some of your own earlier messages in this session are about to be folded out of view (tool output stays reachable through its handles, and the mission ledger stays as it is). Write down, for yourself, what you would otherwise lose: leads you have not followed up, partial results that are not yet in the ledger, where things are (files, lines, commands, handles), and anything you decided to try next and why. Be specific and brief: a list, at most 600 words. Do not call tools and do not address anyone; this is a note to yourself.";
+/// The instruction of a digest request, sent after the session's current stable prefix. It is appended after
+/// the stable messages of the request, so changing it changes no cached prefix of an existing session.
+pub const DIGEST_PROMPT: &str = "Some of your own earlier messages in this session are about to be folded out of view (tool output stays reachable through its handles, and the mission ledger stays as it is). Write a note to yourself that keeps the map of the work, not its history. Use these headings, each with a short list: Established (results a run has shown, with handles); Ruled out (only what a run disproved, with the exact boundary of what was tested and its handle); Tried, not ruled out (attempts that failed without disproving their approach, and what would have to change); Open leads (what you have not followed up yet, and where things are: files, lines, commands, handles); Next (what you decided to try next, and why). Do not retell what went wrong in order. Be specific and brief: at most 600 words. Do not call tools and do not address anyone.";
 
 /// Inbox text for a session the harness could not continue (`why` is a complete sentence).
 pub fn turn_failed(why: &str) -> String {
@@ -1099,10 +1108,24 @@ mod tests {
     }
 
     #[test]
-    fn reweave_brief_with_and_without_ledger() {
-        assert!(!reweave_brief("").contains("mission ledger"));
-        let b = reweave_brief("Goal: ship it\n");
-        assert!(b.ends_with("The mission ledger at this point:\nGoal: ship it"));
+    fn reweave_brief_with_and_without_ledger_and_frontier() {
+        let first = "Older tool output above this point is now shown in shortened form. Nothing was deleted: each shortened result names its handle (out:…), `out_read` and `out_grep` open any part of it again, and `log_search` searches the whole session. If you need something you saw earlier, reopen it rather than working from memory.";
+        let map = "\n\nWhat was folded is mostly attempts. Read them as ground covered, not as a verdict on the task: a failed attempt rules out that attempt, not the approach. What is established, ruled out with evidence, set aside and still open is below.\n\n";
+        let block = "Where the work stands:\n- Established: 1 (c1)";
+        let ledger = "\n\nThe mission ledger at this point:\nGoal: ship it";
+        assert_eq!(reweave_brief("", None), first);
+        assert_eq!(reweave_brief("  \n", None), first);
+        assert_eq!(reweave_brief("Goal: ship it\n", None), format!("{first}{ledger}"));
+        assert_eq!(reweave_brief("", Some(block)), format!("{first}{map}{block}"));
+        assert_eq!(reweave_brief("Goal: ship it\n", Some(block)), format!("{first}{map}{block}{ledger}"));
+    }
+
+    #[test]
+    fn digest_prompt_asks_for_a_map() {
+        for heading in ["Established (", "Ruled out (", "Tried, not ruled out (", "Open leads (", "Next ("] {
+            assert!(DIGEST_PROMPT.contains(heading), "{heading}");
+        }
+        assert!(DIGEST_PROMPT.ends_with("at most 600 words. Do not call tools and do not address anyone."));
     }
 
     #[test]
