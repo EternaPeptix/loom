@@ -190,6 +190,9 @@ upgrade" first; the rest says what behaves differently.
 
 ### Daemon and web UI
 
+- The web UI bounds the mission goal's height in the session header and scrolls it within its own box.
+  A goal that is a whole recorded prompt no longer grows the header past the viewport, which had left
+  the tabs, the record and the composer below it off screen and the page with nothing to scroll.
 - The web UI shows each model reply's generation speed in its footer (tokens after the first over the
   time from the first streamed token to the end of the stream, so the wait for the first token is left
   out), and the open session's speed in the top bar beside the stream freshness — the latest reply,

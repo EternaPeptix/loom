@@ -385,7 +385,7 @@ table.net tr.refused td { color: var(--bad); }
 /* ---- mission supervision ---- */
 .eyebrow { color: var(--dim); font-size: 12px; margin: 0; }
 .mission-heading { display: flex; flex: 1 1 320px; flex-direction: column; gap: 6px; min-width: 0; }
-.mission-goal { max-width: 80ch; color: var(--dim); margin: 0; overflow-wrap: anywhere; }
+.mission-goal { max-width: 80ch; color: var(--dim); margin: 0; overflow-wrap: anywhere; max-height: 7.5em; overflow-y: auto; }
 .mission-goal:empty { display: none; }
 .mission-status { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; margin-top: 4px; font-size: 12px; overflow-wrap: anywhere; }
 .topbar-speed { font-variant-numeric: tabular-nums; }
