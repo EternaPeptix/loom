@@ -159,6 +159,9 @@ export function shownOfTotal(result) {
     words = cut ? "Output was cut." : "";
   }
   const complete = !cut && shown !== null && total !== null && shown >= total;
+  if (meta.deferred_observation === true) {
+    words = "Stored-action output: initially deferred; actor exposure is recorded separately in outputs_observed receipts.";
+  }
   return { blob, shown, total, cut, ranges, ofBlob: !!ofBlob, words, complete };
 }
 

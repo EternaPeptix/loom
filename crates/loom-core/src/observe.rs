@@ -72,7 +72,8 @@
 //! style, wrong line numbers, the minimum length, and negatives.
 
 use crate::event::{
-    Event, Record, Seq, ToolCall, ToolClass, ToolResult, ToolStatus, META_OF_BLOB, META_PATH, META_SHOWN,
+    Event, Record, Seq, ToolCall, ToolClass, ToolResult, ToolStatus, META_DEFERRED_OBSERVATION, META_OF_BLOB,
+    META_PATH, META_SHOWN,
 };
 use crate::ids::{BlobId, CallId};
 use serde::{Deserialize, Serialize};
@@ -199,10 +200,23 @@ pub fn coverage(records: &[Record]) -> BTreeMap<BlobId, Coverage> {
     }
 
     let mut map: BTreeMap<BlobId, Coverage> = BTreeMap::new();
+    let observed: std::collections::HashSet<&CallId> = records
+        .iter()
+        .filter_map(|r| match &r.event {
+            Event::OutputsObserved { calls, .. } => Some(calls.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
     for r in records {
         let Event::ToolResult(t) = &r.event else { continue };
         if let Some(o) = &t.output {
             map.entry(o.id.clone()).or_default();
+        }
+        if t.meta.get(META_DEFERRED_OBSERVATION).and_then(Value::as_bool) == Some(true)
+            && !observed.contains(&t.call_id)
+        {
+            continue;
         }
         match t.meta.get(META_OF_BLOB) {
             Some(Value::String(id)) if !id.is_empty() => {
@@ -752,6 +766,23 @@ mod tests {
     use crate::blob::BlobRef;
     use crate::event::Author;
     use serde_json::json;
+
+    #[test]
+    fn controller_receipts_are_not_model_observations() {
+        let mut records = vec![result(
+            0,
+            "stored",
+            ToolClass::Exec,
+            ToolStatus::Ok,
+            Some(blob("output", 5)),
+            false,
+            json!({"shown":[[1,5]],"deferred_observation":true}),
+        )];
+        assert!(!coverage(&records).get(&BlobId::from("output")).is_some_and(|c| c.covers(1, 5)));
+        assert_eq!(unviewed(&records, 1).first().unwrap().gaps, vec![(1, 5)]);
+        records.push(rec(1, Event::OutputsObserved { req_id: "actor".into(), calls: vec!["stored".into()] }));
+        assert!(coverage(&records).get(&BlobId::from("output")).unwrap().covers(1, 5));
+    }
 
     fn rec(seq: Seq, event: Event) -> Record {
         Record { seq, ts_ms: seq, author: Author::Tool, prev: "0".repeat(64), event }

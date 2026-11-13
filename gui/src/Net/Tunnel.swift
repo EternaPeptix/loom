@@ -4,7 +4,8 @@ import Darwin
 /// Manages the SSH port-forward to a daemon that binds loopback on another host, and the token fetch.
 /// See gui/DESIGN.md "Tunnel". Exactly one tunnel is alive at a time.
 ///
-/// - `open(_:)` for a `.sshTunnel` connection: wait for the child the last `close()` stopped to exit, then
+/// - `open(_:)` for a `.sshTunnel` connection: derive the browser URL and the ssh forward from ONE validated
+///   `Forward` endpoint (same port at both ends), wait for the child the last `close()` stopped to exit, then
 ///   spawn `ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
 ///    -o ControlMaster=no -o ControlPath=none -L 127.0.0.1:<port>:127.0.0.1:<port> <sshHost>` (the SAME
 ///   port number at both ends, because the daemon only accepts its own port in the Host/Origin headers;
@@ -96,6 +97,27 @@ final class Tunnel: @unchecked Sendable {
 
     static let forwardDeadline: TimeInterval = 10
 
+    /// The daemon checks the port in Host and Origin, so the browser-visible and remote ports must
+    /// match. Keep the URL and ssh arguments derived from the same validated endpoint.
+    struct Forward: Sendable {
+        let port: Int
+
+        init?(remotePort: Int) {
+            guard (1...65535).contains(remotePort) else { return nil }
+            port = remotePort
+        }
+
+        var baseURL: String { "http://127.0.0.1:\(port)" }
+
+        func arguments(host: String) -> [String] { Tunnel.tunnelArguments(host: host, port: port) }
+
+        var unavailable: String { TunnelError.portBusy(port).description }
+
+        func failure(_ stderr: String) -> String {
+            Tunnel.isBindFailure(stderr) ? stderr + " — " + unavailable : stderr
+        }
+    }
+
     func open(_ connection: Connection) async throws -> Ready {
         guard connection.mode == .sshTunnel else {
             throw TunnelError.spawnFailed("not an SSH connection")
@@ -103,18 +125,17 @@ final class Tunnel: @unchecked Sendable {
         guard ConnectionStore.isValidSSHHost(connection.sshHost) else {
             throw TunnelError.spawnFailed("the SSH host is empty or malformed")
         }
-        guard (1...65535).contains(connection.remotePort) else {
+        guard let forward = Forward(remotePort: connection.remotePort) else {
             throw TunnelError.spawnFailed("the remote port is out of range")
         }
         close()
         await waitForExitingChild()
         if Task.isCancelled { throw CancellationError() }
-        let local = connection.remotePort
-        if Tunnel.canConnect(port: local) { throw TunnelError.portBusy(local) }
+        if Tunnel.canConnect(port: forward.port) { throw TunnelError.portBusy(forward.port) }
 
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        p.arguments = Tunnel.tunnelArguments(host: connection.sshHost, port: local)
+        p.arguments = forward.arguments(host: connection.sshHost)
         let err = Pipe()
         let sink = Sink()
         err.fileHandleForReading.readabilityHandler = { h in
@@ -136,7 +157,7 @@ final class Tunnel: @unchecked Sendable {
                     sink.waitForEnd()
                     // A close() or a newer open() during the wait makes this exit someone else's business.
                     guard isCurrent() else { return }
-                    let msg = sink.lastLine
+                    let msg = forward.failure(sink.lastLine)
                     self.onUnexpectedExit?(msg.isEmpty ? "ssh exited with status \(proc.terminationStatus)" : msg, isCurrent)
                 }
             }
@@ -156,12 +177,12 @@ final class Tunnel: @unchecked Sendable {
                 await sink.awaitEnd()
                 let msg = sink.text
                 close(only: p)
-                if Tunnel.isBindFailure(msg) { throw TunnelError.portBusy(local) }
+                if Tunnel.isBindFailure(msg) { throw TunnelError.portBusy(forward.port) }
                 throw TunnelError.forwardTimedOut(msg.isEmpty ? "ssh exited with status \(p.terminationStatus)" : msg)
             }
-            if Tunnel.canConnect(port: local) {
+            if Tunnel.canConnect(port: forward.port) {
                 portUp = true
-                if await Tunnel.healthz(port: local) { break }
+                if await Tunnel.healthz(port: forward.port) { break }
             }
             if Date() >= deadline {
                 let msg = sink.text
@@ -189,7 +210,7 @@ final class Tunnel: @unchecked Sendable {
             close(only: p)
             throw TunnelError.exited(msg.isEmpty ? "ssh exited with status \(p.terminationStatus)" : msg)
         }
-        return Ready(baseURL: "http://127.0.0.1:\(local)", token: token)
+        return Ready(baseURL: forward.baseURL, token: token)
     }
 
     /// True while the ssh child of the current tunnel is still running.
@@ -346,8 +367,48 @@ final class Tunnel: @unchecked Sendable {
         stderr.lowercased().contains("address already in use")
     }
 
+    #if DEBUG
+    /// Reserve a loopback address until the caller closes the returned descriptor. Port 0 is used
+    /// only by isolated self-checks. ssh makes the final bind with ExitOnForwardFailure, so a race
+    /// after the preflight still fails explicitly rather than changing ports.
+    private static func bindLoopback(port: Int) -> Int32? {
+        guard (0...65535).contains(port) else { return nil }
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        var reuse: Int32 = 1
+        guard setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+            Darwin.close(fd)
+            return nil
+        }
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = UInt16(port).bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else { Darwin.close(fd); return nil }
+        return fd
+    }
+
+    private static func localPort(_ fd: Int32) -> Int? {
+        var out = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let got = withUnsafeMutablePointer(to: &out) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &len) }
+        }
+        guard got == 0 else { return nil }
+        let port = Int(UInt16(bigEndian: out.sin_port))
+        return port > 0 ? port : nil
+    }
+    #endif
+
     /// One blocking connect attempt to 127.0.0.1:port (loopback: returns immediately).
     static func canConnect(port: Int) -> Bool {
+        guard (1...65535).contains(port) else { return false }
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         defer { Darwin.close(fd) }
@@ -384,6 +445,7 @@ final class Tunnel: @unchecked Sendable {
         var f: [String] = []
         if forwardSpec(port: 7878) != "127.0.0.1:7878:127.0.0.1:7878" { f.append("Tunnel: forwardSpec \(forwardSpec(port: 7878))") }
         let args = tunnelArguments(host: "studio", port: 7979)
+        func check(_ condition: Bool, _ message: String) { if !condition { f.append("Tunnel: " + message) } }
         if let i = args.firstIndex(of: "-L"), i + 1 < args.count {
             if args[i + 1] != "127.0.0.1:7979:127.0.0.1:7979" { f.append("Tunnel: -L \(args[i + 1]) (ports must be equal)") }
         } else { f.append("Tunnel: no -L in the arguments") }
@@ -402,6 +464,26 @@ final class Tunnel: @unchecked Sendable {
         if !busy.contains("[daemon] bind") || !busy.contains("change this connection's port") {
             f.append("Tunnel: portBusy does not say how to move a daemon")
         }
+        for port in [1, 7878, 65535] {
+            guard let forward = Forward(remotePort: port) else { f.append("Tunnel: valid port refused"); continue }
+            check(forward.port == port, "forward changed the daemon port")
+            check(forward.baseURL == "http://127.0.0.1:\(port)", "base URL port differs")
+            check(forward.arguments(host: "fixture") == tunnelArguments(host: "fixture", port: port), "forward arguments differ from the tunnel's")
+            check(forward.arguments(host: "fixture").contains("127.0.0.1:\(port):127.0.0.1:\(port)"), "forward ports differ")
+            check(forward.failure("bind: Address already in use").contains(forward.unavailable), "bind race has no actionable conflict message")
+        }
+        check(Forward(remotePort: 0) == nil && Forward(remotePort: 65536) == nil && Forward(remotePort: -1) == nil, "invalid forward port accepted")
+        if let fd = bindLoopback(port: 0) {
+            defer { Darwin.close(fd) }
+            if let port = localPort(fd) {
+                check(listen(fd, 1) == 0, "fixture listener could not start")
+                check(canConnect(port: port), "fixture listener was not reachable")
+                if let collision = bindLoopback(port: port) {
+                    Darwin.close(collision)
+                    f.append("Tunnel: occupied port was accepted")
+                }
+            } else { f.append("Tunnel: fixture listener has no port") }
+        } else { f.append("Tunnel: fixture port reservation failed") }
         return f
     }
     #endif

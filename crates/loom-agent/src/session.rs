@@ -343,7 +343,8 @@
 //! sends the body the client encoded once.
 //!
 //! ## Settling (children)
-//! Append `turn_end{reason}` and `session_end{outcome, detail}` per the table, kill the session's
+//! Sync `child_completed` with the full typed settlement before `turn_end{reason}` and
+//! `session_end{outcome, detail}` per the table, kill the session's
 //! jobs, publish status (`Phase::Ended`), and return `End::Settled(Settlement{child: id, role,
 //! outcome, report, full, payload, steps: own steps, usage: sum of own responses' usage})`.
 //! `Returned` → `Finished`/`Done`; `Blocked` → `Blocked`/`Done`; `BudgetExhausted` →
@@ -465,10 +466,10 @@ use loom_core::admit::AdmitPolicy;
 use loom_core::config::{AgentsCfg, Paths};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
-    Author, Budget, ChildOutcome, ChildSettled, Event, FinishReason, Forked, InboxItem, InboxKind, ModelRequest,
-    ModelResponse, NoteKind, Purpose, Record, Reweave, Seq, SessionOutcome, SessionStart, Termination, Timing,
-    ToolCall, ToolCallRequest, ToolClass, ToolSpec, ToolStatus, Trigger, TurnEndReason, Usage, META_EXIT_CODE,
-    META_JOB, META_SIGNAL,
+    Author, Budget, ChildCompleted, ChildOutcome, ChildSettled, Event, FinishReason, Forked, InboxItem, InboxKind,
+    ModelRequest, ModelResponse, NoteKind, Purpose, Record, Reweave, Seq, SessionOutcome, SessionStart, StoredAction,
+    Termination, Timing, ToolCall, ToolCallRequest, ToolClass, ToolSpec, ToolStatus, Trigger, TurnEndReason, Usage,
+    META_DEFERRED_OBSERVATION, META_EXIT_CODE, META_JOB, META_SIGNAL,
 };
 use loom_core::ids::{new_item_id, new_request_id, CallId, SessionId};
 use loom_core::ledger::{BriefOpts, LedgerOp, LedgerState};
@@ -885,6 +886,10 @@ impl State {
                     prompt_tokens: 0,
                 });
             }
+            Event::StoredAction(_) => {
+                self.step = self.step.saturating_add(1);
+                self.fork_point = rec.seq.checked_sub(1);
+            }
             Event::ModelResponse(r) => {
                 if let Some(q) = self.requested.as_ref().filter(|q| q.req_id == r.req_id && r.usage.prompt_tokens > 0) {
                     self.measured = Some(Measured { prompt_tokens: r.usage.prompt_tokens, ..q.clone() });
@@ -925,6 +930,14 @@ impl State {
                 }
             }
             Event::SessionEnd { outcome, .. } => self.ended = Some(*outcome),
+            Event::ChildCompleted(result) => {
+                self.ended = Some(match result.outcome {
+                    ChildOutcome::Returned | ChildOutcome::Blocked => SessionOutcome::Done,
+                    ChildOutcome::BudgetExhausted => SessionOutcome::BudgetExhausted,
+                    ChildOutcome::Stopped => SessionOutcome::Stopped,
+                    ChildOutcome::Failed => SessionOutcome::Failed,
+                });
+            }
             Event::Interrupted { reason } => {
                 if let Some(clock) = &mut self.clock {
                     let restart = reason == texts::REASON_RESTART || reason.starts_with("the session log was damaged");
@@ -1543,6 +1556,26 @@ impl Session {
             return Err(format!("the session log {} holds no readable record", path.display()));
         }
         let mut session = Session::bare(deps, log, report.records, registry);
+        session.deps.shared.take_continuation();
+        // A durable plan is an audit artifact, never a restart queue: the last dispatch may
+        // have taken effect without a receipt. Reconcile it through a real actor callback.
+        let pending: Vec<String> = session
+            .own()
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ContinuationPlanned { plan_id, .. }
+                    if !session.own().iter().any(
+                        |r| matches!(&r.event, Event::ContinuationStopped { plan_id: ended, .. } if ended == plan_id),
+                    ) =>
+                {
+                    Some(plan_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for id in pending {
+            session.stop_continuation(id, "harness restarted; stored actions were not replayed").map_err(|e| e.0)?;
+        }
         if let Some(damage) = &report.damage {
             let reason =
                 format!("the session log was damaged and was cut back to its last good record ({})", damage.detail);
@@ -1751,6 +1784,15 @@ impl Session {
     // ---- the log -------------------------------------------------------------------------------
 
     fn append(&mut self, author: Author, event: Event) -> R<Seq> {
+        if let Event::ChildSettled(receipt) = &event {
+            if let Some(record) = self
+                .own()
+                .iter()
+                .find(|r| matches!(&r.event, Event::ChildSettled(previous) if previous.child == receipt.child))
+            {
+                return Ok(record.seq);
+            }
+        }
         let record = self.log.append(author, event).map_err(fatal)?;
         self.st.absorb(self.records.len(), &record);
         self.deps.sink.record(&self.deps.shared.session, &record);
@@ -2089,6 +2131,13 @@ impl Session {
             }
             Input::ChildSettled(s) => {
                 let child = s.child.clone();
+                if self
+                    .own()
+                    .iter()
+                    .any(|record| matches!(&record.event, Event::ChildSettled(receipt) if receipt.child == child))
+                {
+                    return Ok(out);
+                }
                 let event = Event::ChildSettled(ChildSettled {
                     child: s.child,
                     outcome: s.outcome,
@@ -2310,6 +2359,7 @@ impl Session {
     }
 
     fn end_turn(&mut self, reason: TurnEndReason) -> R<()> {
+        self.discard_continuation("the turn ended before the queued plan completed")?;
         self.append(Author::Harness, Event::TurnEnd { reason })?;
         if self.deps.control.is_shutting() {
             // The published status stays `running`, which is what makes the next start restore the session.
@@ -2320,8 +2370,9 @@ impl Session {
         Ok(())
     }
 
-    /// End a child session: `turn_end`, `session_end`, jobs killed, and the settlement for the parent.
+    /// Sync the complete settlement before ending the child or returning it to the parent.
     async fn settle(&mut self, d: Delivery) -> R<Settlement> {
+        self.discard_continuation("the child settled before the queued plan completed")?;
         let (reason, outcome) = match d.outcome {
             ChildOutcome::Returned | ChildOutcome::Blocked => {
                 let r =
@@ -2332,14 +2383,7 @@ impl Session {
             ChildOutcome::Stopped => (TurnEndReason::Stopped, SessionOutcome::Stopped),
             ChildOutcome::Failed => (TurnEndReason::Error, SessionOutcome::Failed),
         };
-        let detail: String = d.report.lines().next().unwrap_or("").chars().take(DETAIL_CHARS).collect();
-        self.append(Author::Harness, Event::TurnEnd { reason })?;
-        self.append(Author::Harness, Event::SessionEnd { outcome, detail })?;
-        self.deps.ctx.capabilities.ptys.close_all().await;
-        self.deps.ctx.jobs.kill_all(self.grace()).await;
-        self.phase = Phase::Ended;
-        self.publish();
-        Ok(Settlement {
+        let settlement = Settlement {
             child: self.deps.shared.session.clone(),
             role: self.deps.shared.role.name.clone(),
             outcome: d.outcome,
@@ -2348,12 +2392,34 @@ impl Session {
             payload: d.payload,
             steps: self.st.step,
             usage: self.st.usage,
-        })
+        };
+        self.append(
+            Author::Harness,
+            Event::ChildCompleted(ChildCompleted {
+                child: settlement.child.clone(),
+                role: settlement.role.clone(),
+                outcome: settlement.outcome,
+                report: settlement.report.clone(),
+                full: settlement.full.clone(),
+                payload: settlement.payload.clone(),
+                steps: settlement.steps,
+                usage: settlement.usage,
+            }),
+        )?;
+        let detail: String = settlement.report.lines().next().unwrap_or("").chars().take(DETAIL_CHARS).collect();
+        self.append(Author::Harness, Event::TurnEnd { reason })?;
+        self.append(Author::Harness, Event::SessionEnd { outcome, detail })?;
+        self.deps.ctx.capabilities.ptys.close_all().await;
+        self.deps.ctx.jobs.kill_all(self.grace()).await;
+        self.phase = Phase::Ended;
+        self.publish();
+        Ok(settlement)
     }
 
     /// The turn's token fired: record it, stop what the session started, and end the turn (or settle
     /// the child as stopped).
     async fn cancelled(&mut self) -> R<Flow> {
+        self.discard_continuation("the turn was cancelled; inspect effects before resuming")?;
         let shutting = self.deps.control.is_shutting();
         let child = self.deps.shared.is_child() && !shutting;
         let reason = if shutting {
@@ -2399,11 +2465,19 @@ impl Session {
         if self.token.is_cancelled() {
             return self.cancelled().await;
         }
+        if self.deps.shared.is_child() {
+            if let Err(error) = self.deps.shared.ledger() {
+                return self.fail(&format!("The current mission state cannot be read: {error}"));
+            }
+        }
         let force = self.drain_arrivals().await?;
         if self.token.is_cancelled() {
             return self.cancelled().await;
         }
         if let Some(flow) = self.check_budget().await? {
+            return Ok(flow);
+        }
+        if let Some(flow) = self.run_continuation(force).await? {
             return Ok(flow);
         }
         self.check_stall()?;
@@ -2419,9 +2493,10 @@ impl Session {
         }
 
         let mut overflowed = false;
-        let (req_id, completion, queue_ms, tools, early) = loop {
+        let (req_id, completion, queue_ms, tools, early, observed) = loop {
             let req_id = new_request_id();
             let w = &woven.weave;
+            let observed = self.deferred_observations(&w.messages);
             if let PrefixCheck::Break { first_diff_message, detail } = self.guard.check(w.epoch, &w.messages) {
                 self.append(Author::Harness, Event::CacheBreak { req_id: req_id.clone(), first_diff_message, detail })?;
             }
@@ -2470,7 +2545,7 @@ impl Session {
                     if c.usage.prompt_tokens > 0 {
                         self.estimator.calibrate(sent_chars, c.usage.prompt_tokens);
                     }
-                    break (req_id, c, queue_ms, request.tools, early);
+                    break (req_id, c, queue_ms, request.tools, early, observed);
                 }
                 Err(ModelError::Cancelled { .. }) => return self.cancelled().await,
                 Err(ModelError::ContextOverflow { limit, .. }) => {
@@ -2507,8 +2582,155 @@ impl Session {
                 attempts: completion.attempts,
             }),
         )?;
+        if !observed.is_empty() && !matches!(completion.finish, FinishReason::Error | FinishReason::Aborted) {
+            self.append(Author::Harness, Event::OutputsObserved { req_id: req_id.clone(), calls: observed })?;
+        }
         self.publish();
         self.handle_reply(&req_id, &completion, &tools, early).await
+    }
+
+    fn stop_continuation(&mut self, plan_id: String, reason: &str) -> R<()> {
+        self.append(Author::Harness, Event::ContinuationStopped { plan_id: plan_id.clone(), reason: reason.into() })?;
+        self.note(Author::Harness, NoteKind::Info, texts::continuation_stopped(&plan_id, reason))
+    }
+
+    fn discard_continuation(&mut self, reason: &str) -> R<()> {
+        if let Some(plan) = self.deps.shared.take_continuation() {
+            self.stop_continuation(plan.id, reason)?;
+        }
+        Ok(())
+    }
+
+    /// Only a verbatim native output included in a completed actor request becomes observed.
+    fn deferred_observations(&self, messages: &[Message]) -> Vec<CallId> {
+        let observed: HashSet<&CallId> = self
+            .records
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::OutputsObserved { calls, .. } => Some(calls.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        self.records
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ToolResult(t)
+                    if t.meta.get(META_DEFERRED_OBSERVATION).and_then(Value::as_bool) == Some(true)
+                        && !observed.contains(&t.call_id)
+                        && messages.iter().any(|m| {
+                            m.role == loom_core::message::Role::Tool && m.origin.contains(&r.seq) && m.content == t.text
+                        }) =>
+                {
+                    Some(t.call_id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Stored actions use the same permission checks, admission and tool-result path as actor calls.
+    /// No semantic decision, terminal action or generated argument is delegated to this controller.
+    async fn run_continuation(&mut self, force: bool) -> R<Option<Flow>> {
+        let Some(mut plan) = self.deps.shared.take_continuation() else { return Ok(None) };
+        let started = Instant::now();
+        let source = self
+            .own()
+            .iter()
+            .find(|r| matches!(&r.event, Event::ToolCall(c) if c.call_id == plan.source_call))
+            .map(|r| r.seq);
+        let interrupted = source.is_none_or(|source| {
+            self.own().iter().any(|r| {
+                r.seq > source
+                    && match &r.event {
+                        Event::UserMessage { .. } | Event::InboxResolved { .. } | Event::ChildSettled(_) => true,
+                        Event::HarnessNote { note, .. } => *note != NoteKind::Info,
+                        Event::ToolCall(_) => r.author != Author::Harness,
+                        _ => false,
+                    }
+            })
+        });
+        let guard = if force || interrupted {
+            Err("New instructions, arrivals or another actor action require reconciliation.".into())
+        } else if self.st.budget_note_step.is_some() {
+            Err("The assignment budget requires an actor finalization step.".into())
+        } else {
+            crate::continuation::mission_hash(&self.deps.shared).and_then(|hash| plan.check(&self.deps.ctx, &hash))
+        };
+        if let Err(reason) = guard {
+            self.stop_continuation(plan.id, &reason)?;
+            return Ok(None);
+        }
+        let Some(node) = plan.next().cloned() else {
+            self.stop_continuation(plan.id, "the literal plan is exhausted")?;
+            return Ok(None);
+        };
+        if !self.deps.shared.role.tools.contains(&node.tool) || self.registry.get(&node.tool).is_none() {
+            self.stop_continuation(plan.id, "the role no longer grants the stored native tool")?;
+            return Ok(None);
+        }
+        if self.token.is_cancelled() {
+            return self.cancelled().await.map(Some);
+        }
+        let req_id = new_request_id();
+        let call = ToolCallRequest {
+            call_id: CallId::from(format!("stored-{}", req_id)),
+            name: node.tool,
+            arguments: node.arguments,
+            complete: true,
+        };
+        self.note(
+            Author::Harness,
+            NoteKind::Info,
+            texts::continuation_dispatch(&plan.id, plan.cursor.saturating_add(1)),
+        )?;
+        self.append(
+            Author::Harness,
+            Event::StoredAction(StoredAction {
+                plan_id: plan.id.clone(),
+                source_call: plan.source_call.clone(),
+                node: to_u32(plan.cursor.saturating_add(1)),
+                omitted_callback: req_id.clone(),
+                call: call.clone(),
+                arguments_hash: node.arguments_hash,
+                predecessor: plan.previous.as_ref().map(|p| p.call_id.clone()),
+                file_guards: serde_json::to_value(&node.files).map_err(|e| Fatal(e.to_string()))?,
+                guard_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            }),
+        )?;
+        self.publish();
+        let tools = self.registry.specs();
+        let early = Early::new(
+            false,
+            self.registry.clone(),
+            self.deps.ctx.clone(),
+            &self.token,
+            HashSet::new(),
+            self.early_counts.clone(),
+        );
+        let calls =
+            self.run_calls_as(&req_id, std::slice::from_ref(&call), &tools, Author::Harness, true, early).await?;
+        if calls.cancelled {
+            return self.cancelled().await.map(Some);
+        }
+        let result = self.own().iter().rev().find_map(|r| match &r.event {
+            Event::ToolResult(result) if result.call_id == call.call_id => Some(result.clone()),
+            _ => None,
+        });
+        if let Some(result) = result {
+            plan.advance(&result);
+            if plan.next().is_some() {
+                self.deps.shared.set_continuation(plan);
+            } else {
+                self.stop_continuation(plan.id, "the literal plan is exhausted; inspect the native receipts")?;
+            }
+        } else {
+            self.stop_continuation(
+                plan.id,
+                "the dispatch has no native receipt; reconcile effects before repeating it",
+            )?;
+        }
+        Ok(Some(Flow::Next))
     }
 
     /// One request, with every stream event forwarded to the sink as it arrives, and the calls it
@@ -2700,7 +2922,7 @@ impl Session {
             max_steps: self.st.budget.max_steps.filter(|n| *n > 0),
             max_minutes: self.st.budget.max_minutes.filter(|n| *n > 0),
         };
-        hud::render(&HudInput {
+        let mut text = hud::render(&HudInput {
             now_ms: now_ms(),
             records: self.own(),
             ledger: ledger.as_ref(),
@@ -2718,7 +2940,15 @@ impl Session {
             budget,
             finish_gated: shared.role.termination == loom_core::event::Termination::Explicit
                 && shared.role.tools.iter().any(|t| t == "conclude"),
-        })
+        });
+        if shared.is_child() {
+            text.push_str(if shared.role.read_only {
+                "\n\nMission ledger access: read-only. Return observations through your report or verdict."
+            } else {
+                "\n\nMission ledger access: notes and your own claims/evidence. Mission plans, approvals and shared obligations belong to the lead."
+            });
+        }
+        text
     }
 
     /// Record what arrived while the turn was running. Nothing here starts a turn.
@@ -2830,7 +3060,9 @@ impl Session {
         let mut step = 0u32;
         let mut from = None;
         for (i, r) in own.iter().enumerate() {
-            if matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Step) {
+            if matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Step)
+                || matches!(&r.event, Event::StoredAction(_))
+            {
                 step = step.saturating_add(1);
                 if step == first_step {
                     from = Some(i);
@@ -3111,6 +3343,20 @@ impl Session {
         req_id: &str,
         calls: &[ToolCallRequest],
         w_tools: &[ToolSpec],
+        early: Early,
+    ) -> R<Calls> {
+        self.run_calls_as(req_id, calls, w_tools, Author::Model, false, early).await
+    }
+
+    /// [`Session::run_calls`] for calls of `author`; `deferred` marks native results of a stored
+    /// action, whose output the actor has not yet seen.
+    async fn run_calls_as(
+        &mut self,
+        req_id: &str,
+        calls: &[ToolCallRequest],
+        w_tools: &[ToolSpec],
+        author: Author,
+        deferred: bool,
         mut early: Early,
     ) -> R<Calls> {
         let mut out = Calls::default();
@@ -3126,7 +3372,7 @@ impl Session {
             let args = serde_json::from_str::<Value>(&call.arguments)
                 .unwrap_or_else(|_| Value::String(call.arguments.clone()));
             self.append(
-                Author::Model,
+                author.clone(),
                 Event::ToolCall(ToolCall {
                     call_id: call.call_id.clone(),
                     req_id: req_id.to_string(),
@@ -3139,7 +3385,7 @@ impl Session {
             ctx.call_id = call.call_id.clone();
             ctx.cancel = self.token.clone();
             let started = Instant::now();
-            let result = if let Some(first) = &ender {
+            let mut result = if let Some(first) = &ender {
                 refused(&ctx, &call.name, class, texts::not_run_after(first), started)
             } else if tool.is_none() && w_tools.iter().any(|t| t.name == call.name) {
                 let message = texts::not_in_assignment(&call.name, &self.deps.shared.role.name, &self.registry.names());
@@ -3165,6 +3411,9 @@ impl Session {
                 let admission = Admission { policy: &self.deps.admit, estimator: &self.estimator };
                 execute(&self.registry, &ctx, &call.name, &call.arguments, &admission).await
             };
+            if deferred {
+                result.meta.insert(META_DEFERRED_OBSERVATION.into(), Value::Bool(true));
+            }
             let ok = result.status == ToolStatus::Ok;
             let flag_note = self.deps.shared.role.flag_regex.as_ref().and_then(|pattern| {
                 let re = regex::RegexBuilder::new(pattern).size_limit(1_000_000).build().ok()?;
@@ -3247,6 +3496,8 @@ mod tests {
     use loom_tools::Tool;
     use serde_json::json;
     use tokio::sync::mpsc::UnboundedSender;
+
+    include!("continuation_tests.rs");
 
     // ---- rig ---------------------------------------------------------------------------------
 
@@ -4564,7 +4815,7 @@ mod tests {
         let res = results(&rs);
         assert_eq!(res[0].status, ToolStatus::Invalid);
         assert!(res[0].text.contains("agent_spawn"));
-        assert_eq!(&kinds(&rs)[kinds(&rs).len() - 3..], ["tool_result", "turn_end", "session_end"]);
+        assert_eq!(&kinds(&rs)[kinds(&rs).len() - 4..], ["tool_result", "child_completed", "turn_end", "session_end"]);
         assert_eq!(kid.sink.last_status().unwrap().phase, Phase::Ended);
         assert_eq!(kid.sink.last_status().unwrap().outcome, Some(SessionOutcome::Done));
         assert_no_cache_break(&rs);
@@ -4642,6 +4893,106 @@ mod tests {
         finish_task(tx, task).await;
         let reopened = Session::open(fx.deps()).unwrap();
         assert_eq!(reopened.st.budget_step_base, 3);
+    }
+
+    #[tokio::test]
+    async fn fresh_and_forked_children_receive_live_operator_state_independently_of_the_brief() {
+        let (_parent, path, upto) = parent_log().await;
+        for fork in [false, true] {
+            let mut kid = Fx::new("worker", true, true, seq(vec![finish_call("done").into()])).await;
+            let journal = kid.shared.journal.as_ref().unwrap().clone();
+            let operator = SessionId::from("s-lead");
+            let goal = format!("{} GOAL_END", "operator goal ".repeat(80));
+            let constraint = format!("{} CONSTRAINT_END", "standing rule ".repeat(80));
+            let approval = format!("{} APPROVAL_END", "scoped permission ".repeat(80));
+            for op in [
+                LedgerOp::GoalSet { text: goal.clone() },
+                LedgerOp::ConstraintAdd { text: constraint.clone() },
+                LedgerOp::ApprovalGrant { text: approval.clone(), scope: "staging reads only".into() },
+            ] {
+                journal.append(&operator, true, op, &|_| Ok(())).unwrap();
+            }
+            let mut session = if fork {
+                kid.fork(&path, upto, Budget::default())
+            } else {
+                kid.create_with(Budget::default(), Some((operator.clone(), "A deliberately minimal brief.".into())))
+            };
+            let first = session.render_hud().await;
+            for text in [&goal, &constraint, &approval] {
+                assert!(first.contains(text), "protected text must be complete in the HUD: {first}");
+            }
+            journal
+                .append(&operator, true, LedgerOp::ConstraintAdd { text: "NEW_LIVE_RULE: do not push".into() }, &|_| {
+                    Ok(())
+                })
+                .unwrap();
+            let current = session.render_hud().await;
+            assert!(current.contains("NEW_LIVE_RULE: do not push"));
+            assert!(current.contains("Mission ledger access: notes and your own claims/evidence"));
+            assert!(matches!(run_with(session, vec![]).await, End::Settled(_)));
+            let request = &kid.server.requests()[0];
+            let text = all_text(request);
+            for protected in [&goal, &constraint, &approval] {
+                assert!(text.contains(protected));
+            }
+            assert!(text.contains("NEW_LIVE_RULE: do not push"));
+        }
+    }
+
+    #[tokio::test]
+    async fn child_refuses_to_act_when_mission_state_cannot_be_verified() {
+        let mut kid = Fx::new("worker", true, true, seq(vec![finish_call("must not run").into()])).await;
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "inspect".into())));
+        let path = kid.shared.journal.as_ref().unwrap().path();
+        std::fs::write(path, "tampered\n").unwrap();
+        let End::Settled(result) = run_with(session, vec![]).await else { panic!("settlement expected") };
+        assert_eq!(result.outcome, ChildOutcome::Failed);
+        assert!(result.report.contains("current mission state cannot be read"));
+        assert!(kid.server.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_child_outbox_is_terminal_before_session_end_is_written() {
+        let mut kid = Fx::new("worker", true, true, seq(vec![])).await;
+        let mut session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "inspect".into())));
+        session.st.step = 4;
+        session.st.usage =
+            Usage { prompt_tokens: 1234, cached_tokens: 456, completion_tokens: 78, reasoning_tokens: 9 };
+        let full = kid.ctx.blobs.put_bytes(b"complete long answer\n").unwrap();
+        let result = session
+            .settle(Delivery {
+                outcome: ChildOutcome::Returned,
+                report: "A complete report\nwith several lines".into(),
+                full: Some(full),
+                payload: json!({"accepted": false, "objections": ["unchecked output"], "opened": ["out:abcd"]}),
+            })
+            .await
+            .unwrap();
+        drop(session);
+        let log = read_records(&kid.log_path()).unwrap();
+        let (position, completed) = log
+            .records
+            .iter()
+            .enumerate()
+            .find_map(|(i, r)| match &r.event {
+                Event::ChildCompleted(result) => Some((i, result.clone())),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(completed.report, result.report);
+        assert_eq!(completed.full, result.full);
+        assert_eq!(completed.payload, result.payload);
+        assert_eq!(completed.usage, result.usage);
+        assert_eq!(completed.steps, result.steps);
+        let text = std::fs::read_to_string(kid.log_path()).unwrap();
+        std::fs::write(kid.log_path(), format!("{}\n", text.lines().take(position + 1).collect::<Vec<_>>().join("\n")))
+            .unwrap();
+        let reopened = Session::open(kid.deps()).unwrap();
+        assert_eq!(reopened.status().phase, Phase::Ended);
+        assert_eq!(reopened.status().outcome, Some(SessionOutcome::Done));
+        assert_eq!(count(reopened.records(), "interrupted"), 0);
+        assert_eq!(run_with(reopened, vec![]).await, End::Closed);
+        assert!(kid.server.requests().is_empty());
     }
 
     #[tokio::test]
@@ -6097,8 +6448,10 @@ mod tests {
             steps: 3,
             usage: Usage::default(),
         };
-        tx.send(Input::ChildSettled(settlement)).unwrap();
+        tx.send(Input::ChildSettled(settlement.clone())).unwrap();
         wait_until(&fx.sink, "second turn", |rs| count(rs, "turn_end") == 2).await;
+        // A replayed delivery must neither append a receipt nor wake another turn.
+        tx.send(Input::ChildSettled(settlement)).unwrap();
         // A message from the assigning agent does not wake a session that is not waiting.
         tx.send(Input::AgentMessage { from: SessionId::from("s-lead"), text: "psst".into() }).unwrap();
         tx.send(Input::Stop).unwrap();
@@ -6278,8 +6631,8 @@ mod tests {
         fx.context =
             ReweavePolicy { target_tokens: 400_000, floor_tokens: 300_000, keep_recent_steps: 1, stub_tail_lines: 3 };
         let mut session = fx.create();
-        let kid = SessionId::from("s-kid");
-        let report = |text: &str| {
+        // One receipt per child (a replayed delivery is not appended again), so two children report.
+        let report = |kid: &SessionId, text: &str| {
             let report = text.repeat(30_000);
             let usage = Usage::default();
             let settled = ChildSettled {
@@ -6295,9 +6648,10 @@ mod tests {
         };
         session.append(Author::User, Event::UserMessage { text: "go".into() }).unwrap();
         answered(&mut session, "r-1", "a", 10_000);
-        session.append(Author::Agent(kid.clone()), report("first ")).unwrap();
+        let (kid1, kid2) = (SessionId::from("s-kid-1"), SessionId::from("s-kid-2"));
+        session.append(Author::Agent(kid1.clone()), report(&kid1, "first ")).unwrap();
         answered(&mut session, "r-2", "b", 500_000);
-        session.append(Author::Agent(kid.clone()), report("second")).unwrap();
+        session.append(Author::Agent(kid2.clone()), report(&kid2, "second")).unwrap();
         answered(&mut session, "r-3", "c", 1_000_000);
         let woven = session.woven();
         // Counted by the estimator, the log is below the floor: a plan in its units folds nothing ...

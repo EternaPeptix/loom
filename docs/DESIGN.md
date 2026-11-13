@@ -487,6 +487,14 @@ brief: goal, constraints and approvals are the operator's words and never cut; e
 cut at 400 characters; it shows the last 12 decisions and the last 20 dead ends, each list starting
 with `(N older not shown: d1–d3; call `ledger` to read them)` when older ones are left out.
 
+Children read the same current mission journal through `ledger` and their request HUD, including
+fresh children whose assignment omits the goal or constraints. A worker may append notes and create
+claims, then update and attach attested evidence to claims created by that child. The journal's append
+lock protects this ownership check. Mission plans, shared obligations, standing instructions and
+approvals remain with the lead; operator input addressed to a child cannot change that shared state.
+A verifier has read-only ledger access and returns its observations through its report or verdict.
+An unreadable mission journal stops a child before another model request.
+
 ## 8. Agent loop and stop gate (`loom-agent::session`, `loom-agent::gate`)
 
 The module documentation of `session.rs` is the precise specification of the loop; `gate.rs` and
@@ -765,6 +773,14 @@ the precise specification.
   lead's waiting call has a recorded result for an agent that had ended. A finish verifier (known
   from its `meta.json`) is never delivered as a report, listed among the lead's agents, or counted as
   its running work.
+  Before a child is marked ended or delivered, its own log syncs a `child_completed` outbox record
+  containing the typed outcome, report, full-answer blob pointer, payload, steps and token usage.
+  Recovery uses this record first, even if the later terminal/status writes were interrupted (an
+  awaited child that was stopped included, and a child of an archived family, whose result is kept for
+  `join` until the family is reopened); a completed child does not act again. The parent's
+  `child_settled` receipt acknowledges that child id, and replayed delivery neither appends a
+  duplicate receipt nor wakes another turn. Legacy terminal logs without a typed result (and without
+  a `settlement.json`) recover as explicitly incomplete rather than as successful summaries.
 
 ## 10. Model access (`loom-model`)
 
@@ -880,6 +896,15 @@ evidence kind and staleness. Each module's documentation is the precise specific
   - When the shell exits while other processes of its group are still alive 200 ms later, the result
     carries the shell's status and the output so far, and the rest continues as a job whose end is
     reported like any other.
+  - A shell leader exiting does not complete the command while live descendants remain in its group:
+    late output is retained, output limits and cancellation still apply, and the known leader status
+    is preserved. A group with only zombies left is complete. The wrapper carries a persisted inert
+    ownership marker (`jN.status.owner`, an argument of the wrapper, never an environment variable), so
+    that a live replacement leader holding an old pid is not signalled; a failed inspection or
+    ownership check ends the command as a tracking failure that says so, never as a successful kill.
+    Tracking covers the original process group (see below for what leaves it). Numeric process-group
+    ids alone cannot establish generation identity if a replacement group has also lost its leader
+    during downtime; the pid record's start times are the identity that is checked.
   - The status the wrapper writes is always reported as an exit code (`exit <code>`); for a code above
     128 a fact says that 128+N conventionally means death by signal N, then names signal `code − 128`
     (with its name when known), or says that `code − 128` is not a signal number and so the code is the

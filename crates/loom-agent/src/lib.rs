@@ -9,6 +9,7 @@
 //! - [`session`] one session: its log, its step loop, and its reactions to what happens to it
 //! - [`runtime`] every session of a loom home: starting, restoring, parents and children, the operator's actions
 
+pub mod continuation;
 pub mod gate;
 pub mod hud;
 pub mod pack;

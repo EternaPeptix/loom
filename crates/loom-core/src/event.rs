@@ -28,6 +28,8 @@ pub const META_PATH: &str = "path";
 pub const META_RAW_BLOB: &str = "raw_blob";
 /// `ToolResult::meta` key: id of the background job a call turned into or started.
 pub const META_JOB: &str = "job";
+/// Output was admitted for a stored action; coverage awaits an actual actor callback.
+pub const META_DEFERRED_OBSERVATION: &str = "deferred_observation";
 
 /// Who produced an item. Never changed by projection, eviction or summarisation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +89,23 @@ pub enum Event {
     /// Bookkeeping for one model request. Not rendered.
     ModelRequest(ModelRequest),
     ModelResponse(ModelResponse),
+    /// A model-authored literal plan admitted by the opt-in guarded-plan prototype.
+    ContinuationPlanned {
+        plan_id: String,
+        source_call: CallId,
+        plan: Value,
+    },
+    /// A stored action substitutes for a model callback. This is not a model response.
+    StoredAction(StoredAction),
+    ContinuationStopped {
+        plan_id: String,
+        reason: String,
+    },
+    /// Deferred outputs included verbatim in a successfully completed actor request.
+    OutputsObserved {
+        req_id: String,
+        calls: Vec<CallId>,
+    },
     /// Intent to run a tool. Appended and synced before the tool starts.
     ToolCall(ToolCall),
     ToolResult(ToolResult),
@@ -101,6 +120,9 @@ pub enum Event {
     },
     ChildSpawned(ChildSpawned),
     ChildSettled(ChildSettled),
+    /// A child's complete result, synced in its own log before it is marked ended or delivered.
+    /// Recovery treats this as a terminal outbox record; the parent acknowledges it with ChildSettled.
+    ChildCompleted(ChildCompleted),
     JobRegistered {
         job_id: String,
         call_id: CallId,
@@ -413,6 +435,20 @@ pub struct ModelResponse {
     pub attempts: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredAction {
+    pub plan_id: String,
+    pub source_call: CallId,
+    pub node: u32,
+    pub omitted_callback: String,
+    pub call: ToolCallRequest,
+    pub arguments_hash: String,
+    pub predecessor: Option<CallId>,
+    /// Resolved input paths and their observed hashes; no file contents are disclosed here.
+    pub file_guards: Value,
+    pub guard_ms: u64,
+}
+
 /// A tool call as the model wrote it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallRequest {
@@ -625,6 +661,20 @@ pub struct ChildSettled {
     pub inline: bool,
 }
 
+/// Durable child outbox payload. Kept separate from the parent-facing receipt so recovery retains
+/// machine-readable verdicts, evidence and accounting even if delivery never happened.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChildCompleted {
+    pub child: SessionId,
+    pub role: String,
+    pub outcome: ChildOutcome,
+    pub report: String,
+    pub full: Option<BlobRef>,
+    pub payload: Value,
+    pub steps: u32,
+    pub usage: Usage,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxKind {
@@ -821,6 +871,35 @@ mod tests {
                 }),
             ),
             (
+                "continuation_planned",
+                Event::ContinuationPlanned {
+                    plan_id: "gp-1".into(),
+                    source_call: c(),
+                    plan: serde_json::json!({"nodes":[]}),
+                },
+            ),
+            (
+                "stored_action",
+                Event::StoredAction(StoredAction {
+                    plan_id: "gp-1".into(),
+                    source_call: c(),
+                    node: 1,
+                    omitted_callback: "omitted-1".into(),
+                    call: ToolCallRequest {
+                        call_id: "stored-1".into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                        complete: true,
+                    },
+                    arguments_hash: "hash".into(),
+                    predecessor: None,
+                    file_guards: serde_json::json!([]),
+                    guard_ms: 1,
+                }),
+            ),
+            ("continuation_stopped", Event::ContinuationStopped { plan_id: "gp-1".into(), reason: "exhausted".into() }),
+            ("outputs_observed", Event::OutputsObserved { req_id: "r-2".into(), calls: vec!["stored-1".into()] }),
+            (
                 "tool_call",
                 Event::ToolCall(ToolCall {
                     call_id: c(),
@@ -884,6 +963,19 @@ mod tests {
                     usage: Usage::default(),
                     steps: 2,
                     inline: true,
+                }),
+            ),
+            (
+                "child_completed",
+                Event::ChildCompleted(ChildCompleted {
+                    child: s(),
+                    role: "worker".into(),
+                    outcome: ChildOutcome::Returned,
+                    report: "answer and checked quotes".into(),
+                    full: Some(blob()),
+                    payload: serde_json::json!({"quotes": ["checked"]}),
+                    steps: 2,
+                    usage: Usage::default(),
                 }),
             ),
             ("job_registered", Event::JobRegistered { job_id: "j1".into(), call_id: c(), command: "make".into() }),
