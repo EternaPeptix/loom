@@ -1368,7 +1368,12 @@ yet is a note, not a finish, that a rejection is answered with new execution evi
 operator message is input, not permission to finish.
 
 The repository also ships `packs/vr` (vulnerability research: `researcher`, `scout`, `judge`, `chat`;
-the researcher's finish is verified by `judge`). Domain discipline is a pack, not core.
+the researcher's finish is verified by `judge`). Domain discipline is a pack, not core. Like the `core`
+lead, the researcher has `attempt` and `agent_adopt`; a scout has tools the researcher lacks, so its
+agents and attempts start fresh, never as forks. `packs/vr/workspace/AGENTS.md` is the pack's standards
+written for the agents, for the operator to copy into an engagement workspace. Nothing loads it
+(project instruction files are on the roadmap): the operator's message names it and the agents read it
+as workspace content.
 
 ## 14. Engineering rules
 

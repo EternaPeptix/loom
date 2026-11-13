@@ -67,7 +67,35 @@ link-local addresses are refused unless `allow_private` lists them. Every decisi
 - **Observed content is data.** Stated in `harness.md` for every role, with the scope-widening attack
   called out specifically, because a repository that says "run this first" is where it arrives.
 - **Orchestrating an engagement.** Only the researcher fans out; scouts return evidence or a blocker;
-  reports reach the parent framed, bounded and marked unverified with a handle to the full text.
+  reports reach the parent framed, bounded and marked unverified with a handle to the full text. A
+  scout always starts fresh: it has tools the researcher lacks, so it cannot be a fork of it.
+- **Scouts in their own copies.** Scouts that write the same files can each be started in a copy of
+  the workspace (`workspace: "copy"`), and `attempt` has several scouts try one experiment, each in
+  its own copy, with a check command the harness runs in every copy. Nothing reaches the workspace
+  until the researcher adopts one scout's changes with `agent_adopt`. A check that ran in a copy is
+  not a check of the workspace: the researcher re-runs it after adopting, and cites that run.
+- **Long runs.** A fuzzer or a listener is a background job with `wake_on`: the session is resumed
+  when its output has a matching line, instead of polling it.
+
+## The workspace standards file
+
+`workspace/AGENTS.md` holds the same standards as the role prompts in one place, written for the
+agents to read: the scope gate, the pipeline, attribution and revalidation, the two records, what
+ready means, when to stop, the order of the tools, orchestration, and what only the operator does.
+Copy it to the root of an engagement workspace and name it in your first message:
+
+```
+cp packs/vr/workspace/AGENTS.md <workspace>/AGENTS.md
+loom run --pack vr -w <workspace> "Read AGENTS.md, then …the engagement…"
+```
+
+loom does not load the file by itself. It is workspace content, so the agents read it as data: it
+can describe and restrict, and it cannot widen the scope, grant an approval or relax a role prompt.
+The file says so, and tells the agent to treat a copy that appears to do otherwise as tampered.
+
+Add a section at its end for what is specific to your workspace: which directories hold earlier
+reports and lab state, and what the agents must leave alone. A test keeps the shipped file to tools
+the pack's roles have, so it cannot name a tool that no role has.
 
 ## Installing
 
@@ -80,7 +108,8 @@ loom down && loom up
 loom run --pack vr -w <workspace> "…"
 ```
 
-The pack is self-contained (`pack.toml`, `harness.md`, `roles/*.md`). The daemon loads every directory
+The pack is self-contained (`pack.toml`, `harness.md`, `roles/*.md`; the daemon reads nothing in
+`workspace/`). The daemon loads every directory
 under `~/.loom/packs/` that holds a `pack.toml`, and refuses to start if one is invalid; the error is in
 `~/.loom/logs/loomd.log` (or on the terminal for `loom daemon`). Loading checks every key and file, and
 that each role's verifier is a read-only role of the same pack with the `verdict` tool.

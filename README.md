@@ -210,7 +210,8 @@ mission needs you. See `gui/README.md`.
 A pack is a set of roles. `core` (built in) is general. `vr` (`packs/vr/`) is a vulnerability-research
 pipeline (scope gate, evidence tiers, a judge that attacks the researcher's finish, a report-readiness gate)
 expressed as roles, ledger records and the harness's own checks. It is not installed by default; see
-`packs/vr/README.md`.
+`packs/vr/README.md`. `packs/vr/workspace/AGENTS.md` is its standards file, to copy into an engagement
+workspace for the agents to read.
 
 `packs/ctf` and `packs/redteam` add bounded specialist roles, typed security state and independent
 operator-contract verification. They are opt-in and require explicit scope and acceptance setup;
