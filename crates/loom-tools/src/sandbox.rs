@@ -538,7 +538,7 @@ impl Sandbox {
     }
 
     /// `new` with the user's home directory given instead of read from `HOME`.
-    fn with_home(
+    pub(crate) fn with_home(
         cfg: &SandboxCfg,
         workspace: &Path,
         tmp_dir: &Path,

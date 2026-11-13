@@ -40,6 +40,9 @@ pub struct Config {
     pub network: NetworkCfg,
     pub agents: AgentsCfg,
     pub notify: NotifyCfg,
+    /// The remote Docker container the agent runs commands in (`box_exec`). Disabled by default.
+    #[serde(rename = "box")]
+    pub boxed: BoxCfg,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -301,6 +304,186 @@ pub struct NotifyCfg {
     pub repeat_minutes: u32,
 }
 
+/// Capabilities `[box] cap_add` may never contain (compared without a `CAP_` prefix, ignoring case).
+pub const BOX_FORBIDDEN_CAPS: &[&str] = &[
+    "ALL",
+    "SYS_ADMIN",
+    "SYS_MODULE",
+    "SYS_RAWIO",
+    "SYS_BOOT",
+    "SYS_TIME",
+    "MAC_ADMIN",
+    "MAC_OVERRIDE",
+    "NET_ADMIN",
+    "DAC_READ_SEARCH",
+    "BPF",
+    "PERFMON",
+    "SYSLOG",
+];
+
+/// `[box]`: one Docker host, one container per mission (see `loom_tools::boxctl`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BoxCfg {
+    pub enabled: bool,
+    /// Forward the Docker socket of this host over SSH (the daemon's own `ssh`, batch mode).
+    pub ssh_host: String,
+    /// The socket's path on `ssh_host`.
+    pub remote_socket: String,
+    /// A Docker socket on this machine, instead of `ssh_host` and `remote_socket`.
+    pub docker_socket: String,
+    /// The docker command line client, resolved on the daemon's PATH at start.
+    pub docker_cli: String,
+    /// The image of the box: `name@sha256:<64 hex>` or an image ID `sha256:<64 hex>`.
+    pub image: String,
+    /// The image that edits the egress rules on the Docker host. It must contain `iptables`.
+    pub helper_image: String,
+    pub cpus: u32,
+    pub memory_mb: u64,
+    pub pids: u64,
+    /// Size of the tmpfs mounted on `/work`.
+    pub work_mb: u64,
+    /// Size of the tmpfs mounted on `/tmp`.
+    pub tmp_mb: u64,
+    /// Capabilities added back to the box (everything else is dropped); see [`BOX_FORBIDDEN_CAPS`].
+    pub cap_add: Vec<String>,
+    /// Most megabytes of changed workspace files copied into `/work` before one `box_exec`.
+    pub sync_max_mb: u64,
+    /// A workspace file larger than this many megabytes is not copied.
+    pub sync_file_max_mb: u64,
+    /// Most megabytes one `box_get` brings back.
+    pub get_max_mb: u64,
+}
+
+impl Default for BoxCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ssh_host: String::new(),
+            remote_socket: String::new(),
+            docker_socket: String::new(),
+            docker_cli: "docker".into(),
+            image: String::new(),
+            helper_image: String::new(),
+            cpus: 4,
+            memory_mb: 8192,
+            pids: 512,
+            work_mb: 4096,
+            tmp_mb: 1024,
+            cap_add: Vec::new(),
+            sync_max_mb: 64,
+            sync_file_max_mb: 16,
+            get_max_mb: 64,
+        }
+    }
+}
+
+/// `name@sha256:<64 hex>` or `sha256:<64 hex>`: an image that cannot change under its name.
+pub fn pinned_image(image: &str) -> bool {
+    let digest = |d: &str| {
+        d.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    };
+    match image.split_once('@') {
+        Some((name, d)) => {
+            !name.is_empty()
+                && !name.starts_with('-')
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/' | b':'))
+                && digest(d)
+        }
+        None => digest(image),
+    }
+}
+
+/// The capability name as Docker takes it: upper case, without `CAP_`.
+pub fn normalize_cap(cap: &str) -> String {
+    let up = cap.trim().to_ascii_uppercase();
+    up.strip_prefix("CAP_").unwrap_or(&up).to_string()
+}
+
+impl BoxCfg {
+    /// The capabilities of `cap_add`, normalised.
+    pub fn caps(&self) -> Vec<String> {
+        self.cap_add.iter().map(|c| normalize_cap(c)).collect()
+    }
+
+    /// Checks that hold whether or not the box is enabled (what is written must never be unsafe), then,
+    /// when it is enabled, that it can be used. Every error is a sentence.
+    pub fn check(&self) -> Result<(), String> {
+        for cap in &self.cap_add {
+            let name = normalize_cap(cap);
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') {
+                return Err(format!(
+                    "box.cap_add contains \"{cap}\", which is not a capability name. Write names such as SYS_PTRACE or NET_RAW."
+                ));
+            }
+            if BOX_FORBIDDEN_CAPS.contains(&name.as_str()) {
+                return Err(format!(
+                    "box.cap_add contains {name}, which loom never gives the box: it would let a command act on the Docker host or undo the box's own limits. Remove it; capabilities such as SYS_PTRACE or NET_RAW are accepted."
+                ));
+            }
+        }
+        for (key, image) in [("image", &self.image), ("helper_image", &self.helper_image)] {
+            if !image.is_empty() && !pinned_image(image) {
+                return Err(format!(
+                    "box.{key} \"{image}\" is not pinned. A tag can be moved to a different image after it was checked, so loom takes only name@sha256:<64 hex digits> or an image ID sha256:<64 hex digits>. Find the ID with `docker image inspect --format '{{{{.Id}}}}' <tag>` on the Docker host."
+                ));
+            }
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        for (key, image) in [("image", &self.image), ("helper_image", &self.helper_image)] {
+            if image.is_empty() {
+                return Err(format!("box.enabled is true but box.{key} is not set. Set it to a pinned image (sha256:<64 hex digits>)."));
+            }
+        }
+        let ssh = !self.ssh_host.is_empty() || !self.remote_socket.is_empty();
+        let local = !self.docker_socket.is_empty();
+        if ssh == local {
+            return Err("box.enabled needs exactly one way to reach Docker: either ssh_host with remote_socket, or docker_socket for a socket on this machine.".into());
+        }
+        if ssh {
+            if self.ssh_host.is_empty() || self.remote_socket.is_empty() {
+                return Err("box.ssh_host and box.remote_socket must be set together.".into());
+            }
+            if self.ssh_host.starts_with('-') || self.ssh_host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(format!(
+                    "box.ssh_host \"{}\" must be a host name or an ssh config alias: no spaces, and not starting with `-`.",
+                    self.ssh_host
+                ));
+            }
+            if !self.remote_socket.starts_with('/')
+                || self.remote_socket.chars().any(|c| c == ':' || c.is_whitespace() || c.is_control())
+            {
+                return Err(format!(
+                    "box.remote_socket \"{}\" must be an absolute path on {} without spaces or `:`.",
+                    self.remote_socket, self.ssh_host
+                ));
+            }
+        } else if !self.docker_socket.starts_with('/') {
+            return Err("box.docker_socket must be an absolute path.".into());
+        }
+        if self.docker_cli.trim().is_empty() {
+            return Err("box.docker_cli must name the docker command line client.".into());
+        }
+        for (key, v) in [
+            ("cpus", u64::from(self.cpus)),
+            ("memory_mb", self.memory_mb),
+            ("pids", self.pids),
+            ("work_mb", self.work_mb),
+            ("tmp_mb", self.tmp_mb),
+            ("sync_max_mb", self.sync_max_mb),
+            ("sync_file_max_mb", self.sync_file_max_mb),
+            ("get_max_mb", self.get_max_mb),
+        ] {
+            if v == 0 {
+                return Err(format!("box.{key} must be at least 1."));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Config {
     /// Load a config file. A missing file is the default config.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
@@ -339,6 +522,7 @@ impl Config {
         if self.context.floor_tokens >= self.context.target_tokens {
             return Err(ConfigError::Invalid("context.floor_tokens must be below context.target_tokens".into()));
         }
+        self.boxed.check().map_err(ConfigError::Invalid)?;
         for (name, profile) in &self.models {
             if profile.max_concurrent == 0 {
                 return Err(ConfigError::Invalid(format!("models.{name}.max_concurrent must be at least 1")));
@@ -668,5 +852,77 @@ allow = ["*.example.test"]
             assert!(p.journal(&MissionId::from(bad)).starts_with(p.missions_dir()));
         }
         assert_ne!(p.session_dir(&SessionId::from("a/b")), p.session_dir(&SessionId::from("a\\b")));
+    }
+
+    const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn box_cfg(extra: &str) -> Result<Config, String> {
+        let text = format!(
+            "[box]\nenabled = true\nssh_host = \"loom-box\"\nremote_socket = \"/var/run/docker.sock\"\nimage = \"{DIGEST}\"\nhelper_image = \"img@{DIGEST}\"\n{extra}"
+        );
+        let c = Config::parse(&text)?;
+        c.check().map_err(|e| e.to_string())?;
+        Ok(c)
+    }
+
+    #[test]
+    fn box_is_off_by_default_and_parses_when_pinned() {
+        assert!(!Config::default().boxed.enabled);
+        assert!(Config::parse("").unwrap().check().is_ok());
+        let c = box_cfg("cap_add = [\"SYS_PTRACE\", \"cap_net_raw\"]").unwrap();
+        assert!(c.boxed.enabled);
+        assert_eq!(c.boxed.caps(), ["SYS_PTRACE", "NET_RAW"]);
+        assert_eq!((c.boxed.cpus, c.boxed.memory_mb, c.boxed.pids), (4, 8192, 512));
+        assert!(Config::parse("[box]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn i2_cap_add_rejects_exactly_the_dangerous_capabilities() {
+        for cap in BOX_FORBIDDEN_CAPS {
+            for spelled in [cap.to_string(), cap.to_lowercase(), format!("CAP_{cap}"), format!("cap_{}", cap.to_lowercase())] {
+                let err = box_cfg(&format!("cap_add = [\"{spelled}\"]")).unwrap_err();
+                assert!(err.contains("never gives the box"), "{spelled}: {err}");
+            }
+        }
+        // The rejection holds when the box is not enabled too: nothing unsafe is kept in a config.
+        let err = Config::parse("[box]\ncap_add = [\"SYS_ADMIN\"]").unwrap().check().unwrap_err().to_string();
+        assert!(err.contains("SYS_ADMIN"), "{err}");
+        for ok in ["SYS_PTRACE", "NET_RAW", "CAP_SYS_PTRACE", "NET_BIND_SERVICE", "SYS_CHROOT"] {
+            assert!(box_cfg(&format!("cap_add = [\"{ok}\"]")).is_ok(), "{ok}");
+        }
+        assert!(box_cfg("cap_add = [\"not a cap\"]").unwrap_err().contains("not a capability name"));
+    }
+
+    #[test]
+    fn i3_image_must_be_pinned_by_digest() {
+        for tag in ["ubuntu:24.04", "ubuntu", "ubuntu@sha256:abc", "sha256:ABCDEF", "latest", "x@sha1:0123"] {
+            let text = format!(
+                "[box]\nenabled = true\nssh_host = \"h\"\nremote_socket = \"/s\"\nimage = \"{tag}\"\nhelper_image = \"{DIGEST}\""
+            );
+            let err = Config::parse(&text).unwrap().check().unwrap_err().to_string();
+            assert!(err.contains("not pinned") && err.contains("A tag can be moved"), "{tag}: {err}");
+        }
+        assert!(pinned_image(DIGEST));
+        assert!(pinned_image(&format!("registry.example:5000/a/b@{DIGEST}")));
+        assert!(!pinned_image(&format!("@{DIGEST}")));
+        assert!(!pinned_image(&format!("-x@{DIGEST}")));
+        // The helper image is pinned the same way.
+        let text = format!("[box]\nenabled = true\nssh_host = \"h\"\nremote_socket = \"/s\"\nimage = \"{DIGEST}\"\nhelper_image = \"alpine:3\"");
+        assert!(Config::parse(&text).unwrap().check().unwrap_err().to_string().contains("box.helper_image"));
+    }
+
+    #[test]
+    fn box_enabled_needs_one_route_to_docker_and_sane_values() {
+        let base = format!("[box]\nenabled = true\nimage = \"{DIGEST}\"\nhelper_image = \"{DIGEST}\"\n");
+        let check = |extra: &str| Config::parse(&format!("{base}{extra}")).unwrap().check().map_err(|e| e.to_string());
+        assert!(check("").unwrap_err().contains("exactly one way"));
+        assert!(check("docker_socket = \"/s\"").is_ok());
+        assert!(check("docker_socket = \"/s\"\nssh_host = \"h\"\nremote_socket = \"/r\"").unwrap_err().contains("exactly one way"));
+        assert!(check("ssh_host = \"h\"").unwrap_err().contains("together"));
+        assert!(check("ssh_host = \"-oProxyCommand=x\"\nremote_socket = \"/r\"").unwrap_err().contains("ssh_host"));
+        assert!(check("ssh_host = \"h\"\nremote_socket = \"/r:/etc\"").unwrap_err().contains("remote_socket"));
+        assert!(check("docker_socket = \"relative.sock\"").unwrap_err().contains("absolute"));
+        assert!(check("docker_socket = \"/s\"\ncpus = 0").unwrap_err().contains("cpus"));
+        assert!(Config::parse("[box]\nenabled = true").unwrap().check().unwrap_err().to_string().contains("box.image"));
     }
 }

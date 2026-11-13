@@ -21,28 +21,28 @@ flag_regex = "(?:flag|HTB|CTF)\\{[^}\\r\\n]{1,200}\\}"
 [roles.solver]
 prompt = "roles/solver.md"
 termination = "explicit"
-tools = ["bash", "read", "write", "edit", "out_read", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "pty_open", "pty_exec", "pty_close", "grep", "glob", "wait", "hand_off"]
+tools = ["bash", "read", "write", "edit", "out_read", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "pty_open", "pty_exec", "pty_close", "grep", "glob", "wait", "hand_off", "box_exec", "box_get", "box_reset"]
 max_steps = 35
 flag_regex = "(?:flag|HTB|CTF)\\{[^}\\r\\n]{1,200}\\}"
 
 [roles.web_solver]
 prompt = "roles/web_solver.md"
 termination = "explicit"
-tools = ["bash", "read", "write", "out_read", "http_send", "http_repeat", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "pty_open", "pty_exec", "pty_close", "job_kill", "edit", "grep", "glob", "job_wait", "wait", "hand_off"]
+tools = ["bash", "read", "write", "out_read", "http_send", "http_repeat", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "pty_open", "pty_exec", "pty_close", "job_kill", "edit", "grep", "glob", "job_wait", "wait", "hand_off", "box_exec", "box_get", "box_reset"]
 max_steps = 35
 flag_regex = "(?:flag|HTB|CTF)\\{[^}\\r\\n]{1,200}\\}"
 
 [roles.binary_solver]
 prompt = "roles/binary_solver.md"
 termination = "explicit"
-tools = ["bash", "read", "write", "out_read", "bin_survey", "bin_decompile", "bin_xrefs", "gdb_probe", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "edit", "grep", "glob", "pty_open", "pty_exec", "pty_close", "wait", "hand_off"]
+tools = ["bash", "read", "write", "out_read", "bin_survey", "bin_decompile", "bin_xrefs", "gdb_probe", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "edit", "grep", "glob", "pty_open", "pty_exec", "pty_close", "wait", "hand_off", "box_exec", "box_get", "box_reset"]
 max_steps = 35
 flag_regex = "(?:flag|HTB|CTF)\\{[^}\\r\\n]{1,200}\\}"
 
 [roles.crypto_solver]
 prompt = "roles/crypto_solver.md"
 termination = "explicit"
-tools = ["bash", "read", "write", "out_read", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "edit", "grep", "glob", "pty_open", "pty_exec", "pty_close", "wait", "hand_off"]
+tools = ["bash", "read", "write", "out_read", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "edit", "grep", "glob", "pty_open", "pty_exec", "pty_close", "wait", "hand_off", "box_exec", "box_get", "box_reset"]
 max_steps = 35
 flag_regex = "(?:flag|HTB|CTF)\\{[^}\\r\\n]{1,200}\\}"
 

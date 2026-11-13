@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Box: a remote container for commands
+
+- New `[box]` config (off by default) and tools `box_exec`, `box_get`, `box_reset`, given to the `ctf` solver
+  roles. One hardened container per mission on a Docker host reached by an ssh-forwarded or local socket; the
+  agent never sees Docker. Images must be pinned by digest; egress is the mission's granted exact hosts and IPs
+  (per-mission network and host firewall chain, updated on grants and releases, removed with the mission);
+  workspace files are copied in (never what the agent could not read) and `box_get` unpacks results through the
+  `write` tool's own path with size, entry and type limits. New modules `loom-tools::boxctl`, `boxfs`,
+  `loom-agent::rtools::boxtools`; `proc::spawn_launched` and `bash::run_launched` run a loom-built launcher
+  outside the sandbox with `bash`'s procedure. The ctf tool cap is 30. See docs/RUN.md and SECURITY.md.
+
 ### Morale: keeping a model on a hard task
 
 - The step block gains `Where the work stands:`, read from the ledger alone: results established, what is

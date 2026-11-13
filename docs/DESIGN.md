@@ -869,7 +869,7 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
 
 **Tools.** Built in (`Registry::builtin`): `bash`, `job_wait`, `job_kill`, `job_list`, `read`,
 `write`, `edit`, `glob`, `grep`, `out_read`, `out_grep`, `web_fetch`, `cve_lookup`, `cve_search`,
-`advisory_lookup`. Runtime-owned (`loom-agent::rtools`, `NAMES`): `plan`, `step`, `note`, `claim`,
+`advisory_lookup`. Box tools (`rtools::BOX_NAMES`, `[box]` only): `box_exec`, `box_get`, `box_reset`. Runtime-owned (`loom-agent::rtools`, `NAMES`): `plan`, `step`, `note`, `claim`,
 `claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`, `finish`, `verdict`, `ask_user`,
 `report_blocker`, `wait`, `agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`,
 `agent_stop`, `decide`, `verify`. A role lists the tools it has, in request order; a name in neither set is a pack error. The
@@ -1137,6 +1137,31 @@ head within 10 s gets `400`.
   An unterminated final fragment that is not a JSON object is a torn append, not a break: it is cut off
   before the next append, and readers verify the lines before it. `GET /api/sessions/{id}/net` and
   `loom net` verify the chain and refuse to serve a broken one, with a sentence naming the line.
+
+**Box** (`loom-tools::boxctl`, `loom-tools::boxfs`, `loom-agent::rtools::boxtools`, `[box]`). One container per mission on a
+Docker host the operator names, for what the local sandbox cannot do. The module documentation of each
+file is the specification; the invariants are:
+
+1. *The agent is never near Docker.* The docker client is spawned by the daemon, outside the sandbox
+   (`proc::spawn_launched`, with `bash::run_launched` carrying `bash`'s whole procedure), with a fixed argv built
+   by pure functions (`run_args`, `exec_args`, `kill_args`, `cp_in_args`, `cp_out_args`, `network_args`,
+   `rules_args`, `rm_args`). The agent's script is the last argument of `/bin/bash -c` in the container. The
+   ssh-forwarded socket lives in `<loom home>/keys`.
+2. *Hardened container*: `--cap-drop ALL` plus the vetted `cap_add`, `no-new-privileges`, read-only root,
+   tmpfs `/tmp` and `/work`, user 1000, no mounts, devices, privileged mode or host namespaces.
+3. *Pinned images*: `name@sha256:...` or `sha256:...`.
+4. *Egress*: a bridge per mission without IPv6, DNS at an unroutable address, rules in a chain `LOOM-<id>` on
+   the Docker host installed by `helper_image` (`--network host --cap-add NET_ADMIN`), from the exact granted
+   hosts and IPs after `Policy::check_addr`; wildcards are not applied; container after rules.
+5. *Grants*: `grant_scope` and `release` re-apply the rules; stop, archive and the end of a mission tear the
+   box down (container, network, chain); a start removes leftovers of missions that are not running.
+6. *Files in*: only regular files the agent could read, no `.loom`/`.git`, no links, size limits.
+7. *Files out*: `boxfs::extract`, regular files and directories only, checked before writing, written by
+   `fstools::write_file_checked`, the `write` tool's own path.
+
+The box tools are `Exec` (`box_exec`, `box_reset`) and `Write` (`box_get`) calls; a job started by `box_exec`
+is an ordinary job, and killing it signals the process group in the container through `docker exec`
+(`proc::RemoteStop`). Not done: a box for an agent that has its own workspace copy; wildcard grants; IPv6.
 
 ## 12. Daemon API (`loom-daemon`)
 

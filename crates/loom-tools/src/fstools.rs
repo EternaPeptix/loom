@@ -22,6 +22,8 @@
 //!   runs again for the file it names (relative to the link's directory), at most `MAX_LINKS` (8)
 //!   times, so the target's directory is the one judged; more links → error sentence.
 //!
+//! `write_file_checked` is the same write for callers outside these tools (`box_get`).
+//!
 //! All three tools work only on regular files. A device, FIFO or socket → error sentence naming what
 //! the path is and what to use instead; it is never opened (`files::open_readable`). At most `READ_CAP`
 //! (64 MiB) of a file is loaded into memory.
@@ -344,6 +346,19 @@ fn write_failed(given: &str, fail: WriteFail, advice: &str) -> ToolOutput {
             ToolOutput::error(format!("{given} could not be written ({e}). Nothing was changed; {advice}"))
         }
     }
+}
+
+/// Writes `bytes` to the file `path` by the path the `write` tool takes: the sandbox's `check_write` on
+/// the path as given, then `write_atomic` (descriptor-relative, no link followed in the directory,
+/// the real path judged again, temporary file renamed into place, missing directories made one at a
+/// time). `Err` is a sentence saying why nothing was written. For `box_get`, which must not have a
+/// weaker way to write the workspace than the model's own tool.
+pub fn write_file_checked(sandbox: &Sandbox, path: &Path, bytes: &[u8]) -> Result<(), String> {
+    sandbox.check_write(path)?;
+    write_atomic(sandbox, path, bytes).map_err(|fail| match fail {
+        WriteFail::Denied(why) | WriteFail::Refused(why) => why,
+        WriteFail::Io(e) => format!("{} could not be written ({e})", path.display()),
+    })
 }
 
 pub struct Read;

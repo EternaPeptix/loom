@@ -90,6 +90,35 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
 Commands run with your user id. The sandbox is the only barrier between them and everything your user
 can read.
 
+### The box (`[box]`)
+
+When the operator enables a box, a session can run commands in a container on a Docker host with
+`box_exec`. What that does and does not give the agent:
+
+- **No Docker for the agent.** The docker command line client is run by the daemon, outside the sandbox,
+  with an argument list loom builds. The agent's text is only the last argument of `/bin/bash -c` in the
+  container, never a docker, ssh or firewall argument. The forwarded Docker socket is in `<loom home>/keys`,
+  which commands cannot read, and is never added to the sandbox's socket list.
+- **A hardened container.** All capabilities dropped (plus `cap_add`, from which `SYS_ADMIN`, `NET_ADMIN`
+  and the other dangerous ones are refused at config load), `no-new-privileges`, a read-only root, tmpfs
+  `/tmp` and `/work`, user 1000, no bind mounts, devices, privileged mode or host namespaces, limits on
+  memory, processes and CPUs.
+- **Pinned images.** `image` and `helper_image` must be `name@sha256:<digest>`; a tag can be moved.
+- **Egress is the mission's grants.** A per-mission bridge network without IPv6 and without DNS; rules
+  on the Docker host allow only the granted exact hosts and addresses (checked against the same policy as
+  the proxy, so private addresses need `allow_private`) and drop the rest; they are updated when grants
+  change and removed with the box. The container is started only after its rules are in place, and is
+  removed if they cannot be kept current.
+- **Files in** are the changed regular files of the workspace that the agent could read itself: never
+  `.loom`, `.git`, oracle secrets, unreadable paths, credential stores or anything reached through a link.
+  **Files out** (`box_get`) are unpacked by loom, not by `tar`: regular files and directories only, no
+  names that leave the destination, no links or devices, size and entry caps, and each file is written
+  the way the `write` tool writes it, so it cannot reach a path `write` cannot.
+- **Limits.** A kernel or Docker escape from the container reaches the Docker VM, not this machine. Run
+  the VM as dedicated and unprivileged, and block it at the VM's host from the host itself and from
+  private ranges (see docs/RUN.md). Commands in the box are untrusted code with the network reach of the
+  grants; data the agent can read can be sent to a granted host, as with the proxy.
+
 ### Records
 
 Sessions are append-only logs in which each record names the hash of the previous one, and mission

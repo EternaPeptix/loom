@@ -156,6 +156,44 @@ Environment variables whose names look like secrets (in any case: containing `KE
 variable whose value holds a URL with a password in it) are not passed to commands unless listed in
 `env_pass`.
 
+## A box
+
+`[box]` gives the agent a place to run what the local sandbox cannot (raw TCP to a target, heavy
+tooling) without giving it Docker. Each mission gets one container on a Docker host that you set up;
+the tools `box_exec`, `box_get` and `box_reset` are the whole interface, and the `ctf` solver roles
+have them. The daemon, not the agent, talks to Docker.
+
+Set up the host once:
+
+1. Use a **dedicated Linux VM** that runs Docker and nothing you care about (a KVM guest is fine).
+   Give it an `ssh_config` alias that works without a prompt from the daemon's account, for example
+   `Host loom-box` with its `HostName`, `User`, `IdentityFile` and, when the VM is behind another
+   machine, `ProxyJump`. Test it: `ssh loom-box docker version`.
+2. Set `ssh_host = "loom-box"` and `remote_socket = "/var/run/docker.sock"` (the socket inside the VM).
+   loom forwards it to `~/.loom/keys/box.sock`, which commands cannot read. Or set `docker_socket` to a
+   socket on this machine instead.
+3. Pick two images and pin them by digest (`name@sha256:...`; tags are refused): `image`, the box
+   itself (the tools you want, with `bash`; it runs as user 1000), and `helper_image`, a small image
+   with `sh`, `iptables` and `iptables-restore` that loom runs with `NET_ADMIN` on the host network to
+   install the per-mission egress rules.
+4. Set `enabled = true`.
+
+What the box can reach is the mission's grants: exact hosts and IP addresses given with
+`request_scope` and approved, with an optional `:port`. Wildcard grants are not applied (the first
+`box_exec` of a session says so). The daemon resolves names, applies the `[network]` policy to the
+addresses (private addresses need `allow_private`), and writes the result into rules on the Docker VM
+(chain `LOOM-<id>`, jumped to from `DOCKER-USER` and `INPUT`); everything else, including DNS and IPv6,
+is dropped. A new grant, a release and the end of the mission update or remove the rules. The box has no
+other mounts, no devices, all capabilities dropped except `cap_add`, a read-only root, and tmpfs `/work`
+and `/tmp`: files in it are lost when the mission ends or on `box_reset`.
+
+**Also protect the host from the VM.** loom's rules cover only the boxes it makes. As a second layer
+that does not depend on loom, configure the VM's *host* (the machine that runs the hypervisor) to block
+the VM from reaching the host itself and every private range (RFC 1918, link-local, your management
+network), allowing only the addresses the VM needs (its DNS or package mirror if any, and the
+targets). A container escape or a bug in the rules should then still end at a VM that cannot see
+anything else.
+
 ## Start
 
 ```

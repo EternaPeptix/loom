@@ -21,10 +21,13 @@
 //! - [`files`]   what a session has read, for refusing writes over unseen changes
 //! - [`view`]    numbered line views of stored output
 //! - [`workcopy`] a child's own copy of the workspace, and bringing one child's changes back
+//! - [`boxctl`], [`boxfs`] the remote Docker box: container life, egress, files in and out
 //! - [`bash`], [`fstools`], [`search`], [`outview`], [`web`]: the built-in tools
 
 pub mod bash;
 pub mod binary;
+pub mod boxctl;
+pub mod boxfs;
 pub mod capabilities;
 pub mod codec;
 pub mod cve;

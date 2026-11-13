@@ -48,6 +48,15 @@
 //!    (for `background` the body ends with that sentence instead). `wake_on` on a command that ends
 //!    in the foreground does nothing, and `wake_every_s` without `wake_on` is ignored.
 //!
+//! ## `run_launched`
+//! `box_exec` runs commands in a container through the same procedure: `run_launched(ctx, args, launch)`
+//! is steps 1 to 6 with the differences that `launch` is a [`Launch`] (a `proc::Launcher` built by loom and
+//! the directory the local launcher starts in). `proc::spawn_launched` is used instead of `proc::spawn`;
+//! `args.cwd` is not read (the launcher carries the directory in the container); the launcher's environment
+//! is `PATH` and `HOME` of this process only (neither the session's environment nor the sandbox's); and the
+//! `sandboxed:` reminder is not added. Jobs, timeouts, `wake_on`, output handles and `job_kill` are the
+//! session's own, and killing one runs the launcher's `remote_stop`.
+//!
 //! ## `job_wait` / `job_kill` / `job_list`
 //! `job_wait`: `ctx.jobs.wait(job, timeout_s or cfg.job_wait_s, ctx.cancel)`. Outcome: the state's
 //! outcome (`running`, `exit 0`, …); facts: `job {id}`, `{bytes} new bytes` and, while running,
@@ -340,10 +349,12 @@ struct Finish<'a> {
     facts: Vec<String>,
     /// The job that the rest of the command's process group continues as, when it left one running.
     job: Option<&'a str>,
+    /// The command ran under the sandbox (so a permission error may be the sandbox's).
+    sandboxed: bool,
 }
 
 fn finish(f: Finish<'_>) -> ToolOutput {
-    let Finish { ctx, status, outcome, ended, mut output, elapsed, facts, job } = f;
+    let Finish { ctx, status, outcome, ended, mut output, elapsed, facts, job, sandboxed } = f;
     if let Ended::Failed(text) = ended {
         output.extend_from_slice(format!("\n[the command could not be started: {text}]\n").as_bytes());
     }
@@ -359,6 +370,7 @@ fn finish(f: Finish<'_>) -> ToolOutput {
         out = out.with_more(fact);
     }
     if *ended != Ended::Exit(0)
+        && sandboxed
         && ctx.sandbox.mode() == SandboxMode::Seatbelt
         && contains(&output, b"Operation not permitted")
     {
@@ -382,6 +394,36 @@ fn watched_fact(watch: &Watch) -> String {
 }
 
 async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+    run_command(ctx, args, None).await
+}
+
+/// Where a command from `box_exec` runs: a program that loom built (outside the sandbox) that carries
+/// the script as one argument of its own argv. See [`run_launched`].
+#[derive(Clone, Debug)]
+pub struct Launch {
+    /// What `proc::spawn_launched` runs.
+    pub launcher: proc::Launcher,
+    /// The directory the local launcher process starts in (nothing the command sees).
+    pub cwd: std::path::PathBuf,
+}
+
+/// The `bash` tool's procedure for a command that runs through a launcher built by loom instead of
+/// under the sandbox: guard, `wake_on`, `background`, `timeout_s`, `idle_timeout_s`, the foreground
+/// limit and its promotion to a job, the output limit, cancellation, the group settle window and the
+/// result format are those of `bash`, and the job is an ordinary job of the session. What differs:
+/// `cwd` of `args` is ignored (the launcher carries the directory), the launcher's environment is
+/// only `PATH` and `HOME` (never the session's, never the agent's), and the sandbox reminder is not
+/// added to a failure.
+pub async fn run_launched(ctx: &ToolCtx, args: &Map<String, Value>, launch: &Launch) -> ToolOutput {
+    run_command(ctx, args, Some(launch)).await
+}
+
+/// `PATH` and `HOME` of this process: all the environment a launcher program gets.
+fn launcher_env() -> BTreeMap<String, String> {
+    ["PATH", "HOME"].iter().filter_map(|k| Some((k.to_string(), std::env::var(k).ok()?))).collect()
+}
+
+async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&Launch>) -> ToolOutput {
     let Some(command) = args.get("command").and_then(Value::as_str) else {
         return ToolOutput::error(
             "No command was given. Call bash again with `command` set to the command line to run.",
@@ -404,9 +446,10 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         }
         None => None,
     };
-    let cwd = match args.get("cwd").and_then(Value::as_str) {
-        Some(given) => ctx.sandbox.resolve(given),
-        None => ctx.workspace.clone(),
+    let cwd = match (launch, args.get("cwd").and_then(Value::as_str)) {
+        (Some(launch), _) => launch.cwd.clone(),
+        (None, Some(given)) => ctx.sandbox.resolve(given),
+        (None, None) => ctx.workspace.clone(),
     };
     if !Path::new(&cwd).is_dir() {
         return ToolOutput::error(format!(
@@ -419,9 +462,15 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         Ok(a) => a,
         Err(e) => return ToolOutput::error(format!("Nothing was run: the harness could not prepare the output files for the command ({e}). Try the call again.")),
     };
-    let spec = Spawn { script: command.to_string(), cwd, env: command_env(ctx), out_path, exit_path };
+    let env = if launch.is_some() { launcher_env() } else { command_env(ctx) };
+    let spec = Spawn { script: command.to_string(), cwd, env, out_path, exit_path };
     let started = Instant::now();
-    let mut running = match proc::spawn(&ctx.sandbox, &spec) {
+    let sandboxed = launch.is_none();
+    let spawned = match launch {
+        Some(launch) => proc::spawn_launched(&launch.launcher, &spec),
+        None => proc::spawn(&ctx.sandbox, &spec),
+    };
+    let mut running = match spawned {
         Ok(r) => r,
         Err(e) => {
             let _ = std::fs::remove_file(&spec.out_path);
@@ -482,7 +531,7 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
             }
         };
         remove_files(&running);
-        return finish(Finish { ctx, status: ToolStatus::Timeout, outcome: "stopped: no output during idle timeout".into(), ended: &ended, output, elapsed: started.elapsed(), facts: note.into_iter().chain(["Silent computation can trigger this watchdog. Use batch flags for interactive tools, pty_open for interactive input, or omit idle_timeout_s for silent work.".into()]).collect(), job: None });
+        return finish(Finish { ctx, status: ToolStatus::Timeout, outcome: "stopped: no output during idle timeout".into(), ended: &ended, output, elapsed: started.elapsed(), facts: note.into_iter().chain(["Silent computation can trigger this watchdog. Use batch flags for interactive tools, pty_open for interactive input, or omit idle_timeout_s for silent work.".into()]).collect(), job: None, sandboxed });
     }
     if end == WaitEnd::Deadline {
         // It may have ended in the instant between the deadline and now.
@@ -537,10 +586,11 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
                     elapsed,
                     facts,
                     job: Some(&id),
+                    sandboxed,
                 });
             }
             remove_files(&running);
-            finish(Finish { ctx, status, outcome: ended.outcome(), ended: &ended, output, elapsed, facts, job: None })
+            finish(Finish { ctx, status, outcome: ended.outcome(), ended: &ended, output, elapsed, facts, job: None, sandboxed })
         }
         WaitEnd::Deadline if timeout_s.is_none() => {
             // Not stopped: the command goes on as a job, and the first job_wait starts after what is shown here.
@@ -597,7 +647,7 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
             };
             let mut facts = vec![format!("the command's own status after it was stopped: {}", ended.outcome())];
             facts.extend(note);
-            finish(Finish { ctx, status, outcome, ended: &ended, output, elapsed, facts, job: None })
+            finish(Finish { ctx, status, outcome, ended: &ended, output, elapsed, facts, job: None, sandboxed })
         }
     }
 }

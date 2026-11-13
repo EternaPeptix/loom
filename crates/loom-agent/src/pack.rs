@@ -1019,7 +1019,7 @@ mod tests {
             let pack = packs.get(name).unwrap();
             assert!(pack.requires_restricted_network);
             assert!(pack.command_guard);
-            let cap = if name == "ctf" { 26 } else { 18 };
+            let cap = if name == "ctf" { 30 } else { 18 };
             for role in pack.roles.values() {
                 assert!(role.tools.len() <= cap, "{name}/{} exposes {} tools", role.name, role.tools.len());
                 assert_eq!(role.requires_credential, name == "redteam" && role.name == "lateral_operator");
@@ -1062,7 +1062,7 @@ mod tests {
         for role in ["solver", "web_solver", "binary_solver", "crypto_solver"] {
             assert!(has(role, "hand_off") && !has(role, "ask_for"), "ctf/{role} should have hand_off only");
         }
-        assert_eq!(ctf.roles.get("binary_solver").unwrap().tools.len(), 26);
+        assert_eq!(ctf.roles.get("binary_solver").unwrap().tools.len(), 29);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! - [`misc`]     `pin`, `log_search`
 //! - [`scope`]    `request_scope`
 //! - [`terminal`] `finish`, `verdict`, `ask_user`, `ask_for`, `hand_off`, `report_blocker`, `wait`, `conclude`
+//! - [`boxtools`] `box_exec`, `box_get`, `box_reset` (the mission's remote container)
 //! - [`agents`]   `agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`, `agent_stop`,
 //!   `decide`, `verify`
 //!
@@ -24,6 +25,7 @@
 //! This file is complete; the sub-modules carry their own contracts.
 
 pub mod agents;
+pub mod boxtools;
 pub mod continuation;
 pub mod ledger;
 pub mod misc;
@@ -274,6 +276,12 @@ pub trait Orchestrator: Send + Sync {
     async fn resolve_child(&self, _parent: &SessionId, child: &SessionId) -> Result<SessionId, String> {
         Ok(child.clone())
     }
+    /// The box of the mission of `session`, made ready to be used. The errors are the sentences the box
+    /// tools return: no box configured ([`boxtools::NO_BOX`], the default), a session that works in its own
+    /// copy of the workspace ([`boxtools::BOX_IN_COPY`]), a session without a mission.
+    async fn box_access(&self, _session: &SessionId) -> Result<Arc<loom_tools::boxctl::MissionBox>, String> {
+        Err(boxtools::NO_BOX.to_string())
+    }
     /// Ask `k` independent copies of `session` (same context up to its current step, different
     /// seeds, no tools executed) to choose between `options`.
     async fn poll(
@@ -507,6 +515,9 @@ pub fn tool(name: &str, shared: &Arc<Shared>) -> Option<Arc<dyn loom_tools::Tool
         "report_blocker" => Arc::new(terminal::ReportBlocker(s)),
         "wait" => Arc::new(terminal::Wait(s)),
         "request_scope" => Arc::new(scope::RequestScope(s)),
+        "box_exec" => Arc::new(boxtools::BoxExec(s)),
+        "box_get" => Arc::new(boxtools::BoxGet(s)),
+        "box_reset" => Arc::new(boxtools::BoxReset(s)),
         "conclude" => Arc::new(terminal::Conclude(s)),
         "agent_spawn" => Arc::new(agents::AgentSpawn(s)),
         "agent_fanout" => Arc::new(agents::AgentFanout(s)),
@@ -543,10 +554,15 @@ pub fn build_registry(shared: &Arc<Shared>) -> Result<Registry, String> {
 pub fn known_tools() -> Vec<String> {
     let mut names = Registry::builtin().names();
     names.extend(NAMES.iter().map(|n| n.to_string()));
+    names.extend(BOX_NAMES.iter().map(|n| n.to_string()));
     names
 }
 
-/// The names [`tool`] knows.
+/// The box tools [`tool`] knows. They are not in [`NAMES`]: what `box_exec` prints is an observation of a
+/// command that ran, and may be quoted as evidence like the output of `bash`.
+pub const BOX_NAMES: &[&str] = &["box_exec", "box_get", "box_reset"];
+
+/// The names [`tool`] knows, other than [`BOX_NAMES`].
 pub const NAMES: &[&str] = &[
     "guarded_plan",
     "plan",

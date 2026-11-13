@@ -502,6 +502,7 @@ use loom_core::{now_ms, BlobId, BlobRef, BlobStore, CallId, MissionId, SessionId
 use loom_model::{ChatRequest, Discovered, Limiter, ModelClient, ModelError, Priority, StreamEvent, ToolChoice};
 use loom_net::policy::Policy;
 use loom_net::proxy::Proxy;
+use loom_tools::boxctl::{DockerHost, MissionBox};
 use loom_tools::jobs::JobTable;
 use loom_tools::sandbox::Sandbox;
 use loom_tools::workcopy;
@@ -1165,6 +1166,8 @@ struct State {
     /// Hosts the operator granted to each mission since the daemon started (a superset of what the
     /// ledger records of them until the lead has recorded a grant that is still queued).
     scope: HashMap<MissionId, Vec<String>>,
+    /// The box of each mission that has used one (see `Inner::box_for`).
+    boxes: HashMap<MissionId, Arc<MissionBox>>,
 }
 
 /// One model profile, made at start.
@@ -1217,6 +1220,8 @@ struct Inner {
     sink: Arc<dyn Sink>,
     /// Paging state per recently viewed session, least recently used first.
     pagers: Mutex<Vec<(SessionId, Arc<Mutex<PageReader>>)>>,
+    /// The Docker host of `[box]`, when the operator enabled one (see `loom_tools::boxctl`).
+    box_host: Option<Arc<DockerHost>>,
 }
 
 impl Drop for Inner {
@@ -1310,6 +1315,10 @@ impl Orchestrator for Orch {
         }
         // Marked as the gate's in its `meta.json`, written before its first turn: a crash cannot lose that.
         inner.spawn_child(parent, req).await
+    }
+
+    async fn box_access(&self, session: &SessionId) -> Result<Arc<MissionBox>, String> {
+        self.up()?.box_for(session)
     }
 
     async fn child_copy(&self, parent: &SessionId, child: &SessionId) -> Result<Option<ChildCopy>, String> {
@@ -1946,6 +1955,92 @@ impl Inner {
         Ok(())
     }
 
+    // ---- the box -----------------------------------------------------------------------------
+
+    /// The lead session of `mission`, as it is known.
+    fn mission_lead(&self, mission: &MissionId) -> Option<SessionMeta> {
+        let st = self.st();
+        st.known.values().find(|k| k.meta.parent.is_none() && &k.meta.mission == mission).map(|k| k.meta.clone())
+    }
+
+    /// What a mission's box may reach: the hosts granted to the mission and the effective policy of its
+    /// sessions, as they are at this moment.
+    fn box_egress(&self, mission: &MissionId) -> Result<(Vec<String>, Policy), String> {
+        let lead = self.mission_lead(mission).ok_or_else(|| format!("The mission {} has no lead session.", mission.as_str()))?;
+        let explicit = self.mission_explicit(&lead)?;
+        Ok((self.granted_hosts(&lead, explicit), self.session_policy(&lead, explicit)?))
+    }
+
+    /// The box of the mission `session` belongs to, made when it is first asked for (its container is
+    /// made by the first command). The error sentences are the ones the box tools return.
+    fn box_for(&self, session: &SessionId) -> Result<Arc<MissionBox>, String> {
+        let host = self.box_host.clone().ok_or_else(|| rtools::boxtools::NO_BOX.to_string())?;
+        let meta = self.st().known.get(session).map(|k| k.meta.clone()).ok_or_else(|| no_session(session))?;
+        if meta.copy_of.is_some() {
+            return Err(rtools::boxtools::BOX_IN_COPY.to_string());
+        }
+        if meta.archived {
+            return Err("This session is archived; unarchive it first.".to_string());
+        }
+        let mut st = self.st();
+        if let Some(b) = st.boxes.get(&meta.mission) {
+            return Ok(b.clone());
+        }
+        let (weak, mission) = (self.me.clone(), meta.mission.clone());
+        let source: loom_tools::boxctl::EgressSource = Arc::new(move || {
+            let inner = weak.upgrade().ok_or_else(|| SHUTTING.to_string())?;
+            inner.box_egress(&mission)
+        });
+        let made = MissionBox::new(host, meta.mission.as_str(), source);
+        st.boxes.insert(meta.mission, made.clone());
+        Ok(made)
+    }
+
+    /// Bring the rules of the mission's box, when it has one, to the mission's grants of now (I5).
+    async fn box_resync(&self, mission: &MissionId) {
+        let b = self.st().boxes.get(mission).cloned();
+        if let Some(b) = b {
+            b.resync().await;
+        }
+    }
+
+    /// Remove the mission's box (container, network, rules), in the background, best effort (I5).
+    fn box_teardown(&self, mission: &MissionId) {
+        let Some(host) = self.box_host.clone() else { return };
+        let known = self.st().boxes.remove(mission);
+        let mission = mission.clone();
+        let task = tokio::spawn(async move {
+            match known {
+                Some(b) => b.teardown().await,
+                // Not asked for by this run of the daemon: what an earlier run left is removed by name.
+                None => loom_tools::boxctl::teardown_mission(&host, mission.as_str()).await,
+            }
+        });
+        // Not tracked: it ends by itself, and a shutdown does not wait for the Docker host.
+        drop(task);
+    }
+
+    /// At start: remove what boxes of this loom home left on the Docker host for missions that have no
+    /// running lead (I5). In the background; the daemon does not wait for the Docker host.
+    fn reconcile_boxes(self: &Arc<Self>) {
+        let Some(host) = self.box_host.clone() else { return };
+        let running: HashSet<String> = {
+            let st = self.st();
+            st.known
+                .values()
+                .filter(|k| k.meta.parent.is_none() && k.active.is_some())
+                .map(|k| k.meta.mission.as_str().to_string())
+                .collect()
+        };
+        let task = tokio::spawn(async move {
+            let cleaned = loom_tools::boxctl::reconcile(&host, &running).await;
+            if !cleaned.is_empty() {
+                tracing::info!("box: removed what {} mission(s) left on the Docker host", cleaned.len());
+            }
+        });
+        self.st().tasks.push(task);
+    }
+
     /// The hosts the operator has authorized for the mission of `meta`: those in its ledger (when it
     /// keeps one) and those granted since the daemon started, de-duplicated ignoring case.
     fn granted_hosts(&self, meta: &SessionMeta, explicit: bool) -> Vec<String> {
@@ -2223,6 +2318,14 @@ impl Inner {
 
     fn on_end(self: &Arc<Self>, id: &SessionId, gen: u64, end: End) {
         self.proxy.revoke(id);
+        // The end of a mission's lead is the end of its box, except at a shutdown, which the next start
+        // resumes from (it keeps the box of a mission that is running again).
+        if !self.shutting.load(Ordering::SeqCst) {
+            let lead = self.st().known.get(id).map(|k| k.meta.clone()).filter(|m| m.parent.is_none());
+            if let Some(lead) = lead {
+                self.box_teardown(&lead.mission);
+            }
+        }
         let settlement = match end {
             End::Settled(s) => Some(s),
             // A child ends `Closed` only at a shutdown, which the next start resumes it from: a child
@@ -3434,6 +3537,11 @@ impl Runtime {
         for warning in start_warnings(&config, cfg!(target_os = "macos")) {
             tracing::warn!("{warning}");
         }
+        let box_host = if config.boxed.enabled {
+            Some(DockerHost::new(&config.boxed, &paths.home).map_err(|e| format!("The box cannot be used: {e}"))?)
+        } else {
+            None
+        };
         let (bus, _) = broadcast::channel(BUS_CAPACITY);
         let (net_tx, mut net_rx) = unbounded_channel();
         let audit = net_audit(paths.clone(), bus.clone());
@@ -3459,6 +3567,7 @@ impl Runtime {
             orch: Arc::new(Orch(me.clone())),
             sink: Arc::new(SinkImpl(me.clone())),
             pagers: Mutex::new(Vec::new()),
+            box_host,
         });
 
         let weak = Arc::downgrade(&inner);
@@ -3594,6 +3703,7 @@ impl Runtime {
                 going.insert(id);
             }
         }
+        inner.reconcile_boxes();
         Ok(Runtime { inner })
     }
 
@@ -3861,7 +3971,10 @@ impl Runtime {
         }
         let lead = self.lead_of(id)?;
         let ledger = self.inner.mission_explicit(&lead)?;
-        self.send_to_lead(&lead.id, Input::Release { reason: reason.to_string() }, ledger, None)
+        let receipt = self.send_to_lead(&lead.id, Input::Release { reason: reason.to_string() }, ledger, None)?;
+        // The box never has more than the mission's grants: its rules are brought to them again.
+        self.inner.box_resync(&lead.mission).await;
+        Ok(receipt)
     }
 
     /// Record that the operator approved something, with what the approval covers. Handed to the
@@ -3977,6 +4090,8 @@ impl Runtime {
             let set = self.inner.proxy.set_policy(&meta.id, policy);
             lead_set |= set && meta.id == lead.id;
         }
+        // The mission's box, when it has one, gets the new grants too (I5).
+        self.inner.box_resync(&lead.mission).await;
         if !lead_set {
             return Err(format!(
                 "Session {} is not running, so the authorization could not be applied to it now. It is recorded for the mission and applies when the session is resumed.",
@@ -3994,10 +4109,12 @@ impl Runtime {
 
     pub async fn stop(&self, id: &SessionId) -> Result<(), String> {
         self.inner.check_open()?;
-        if !self.inner.st().known.contains_key(id) {
-            return Err(no_session(id));
-        }
+        let meta = self.inner.st().known.get(id).map(|k| k.meta.clone()).ok_or_else(|| no_session(id))?;
         self.inner.stop_one(id);
+        // Stopping the lead of a mission ends its box (I5); an agent's stop does not.
+        if meta.parent.is_none() {
+            self.inner.box_teardown(&meta.mission);
+        }
         Ok(())
     }
 
@@ -4059,6 +4176,10 @@ impl Runtime {
         // which reaches the lead when the mission is unarchived.
         drop(closing);
         if archived {
+            let lead = self.inner.st().known.get(id).map(|k| k.meta.clone()).filter(|m| m.parent.is_none());
+            if let Some(lead) = lead {
+                self.inner.box_teardown(&lead.mission);
+            }
             // A session with a task has its scratch directory emptied as the task ends (`launch`, `on_end`).
             let idle: Vec<&SessionId> = {
                 let st = self.inner.st();
@@ -4408,6 +4529,9 @@ impl Runtime {
         let _ = tokio::time::timeout(grace + Duration::from_secs(5), kill).await;
         for task in background {
             task.abort();
+        }
+        if let Some(host) = &inner.box_host {
+            host.shutdown().await;
         }
         // The proxy's connections record how they ended; the process may exit right after this returns.
         inner.proxy.stop(SHUTDOWN_TASK_WAIT).await;
@@ -8373,6 +8497,147 @@ mod tests {
             _ => None,
         });
         assert!(text.unwrap_or_default().contains(&format!("@127.0.0.1:{port}")));
+        e.rt.shutdown().await;
+    }
+
+    // ---- the box (I1, I5) -------------------------------------------------------------------------
+
+    use loom_tools::boxctl::fake::FakeDocker;
+
+    /// A runtime whose box is the fake docker of a directory of its own.
+    async fn box_env(fake: &FakeDocker) -> Env {
+        let cfg = fake.cfg();
+        env_with(Script::new(|_, _| finish("ok")), false, move |c| c.boxed = cfg).await
+    }
+
+    async fn idle_lead(e: &Env) -> (SessionId, MissionId) {
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        (id, info.meta.mission.clone())
+    }
+
+    fn box_container(mission: &MissionId) -> String {
+        loom_tools::boxctl::names(mission.as_str()).container
+    }
+
+    #[tokio::test]
+    async fn without_a_box_in_the_config_the_box_tools_say_so_and_an_agent_copy_has_none() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let (id, _) = idle_lead(&e).await;
+        let err = e.rt.inner.orch.box_access(&id).await.err().unwrap();
+        assert_eq!(err, "No box is configured. The operator sets [box] in config.toml.");
+        e.rt.shutdown().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let e = box_env(&fake).await;
+        let (id, _) = idle_lead(&e).await;
+        assert!(e.rt.inner.orch.box_access(&id).await.is_ok());
+        // A session that works in its own copy of the workspace is refused with the sentence.
+        e.rt.inner.st().known.get_mut(&id).unwrap().meta.copy_of = Some("/somewhere".into());
+        let err = e.rt.inner.orch.box_access(&id).await.err().unwrap();
+        assert_eq!(err, "box_exec is not available in an agent copy yet; work in the shared workspace.");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn i5_a_scope_grant_applies_the_rules_to_the_missions_box_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let e = box_env(&fake).await;
+        let (id, mission) = idle_lead(&e).await;
+        // No box yet: a grant touches no docker (the start only listed leftovers).
+        e.rt.grant_scope(&id, &["198.51.100.4".to_string()], None).await.unwrap();
+        assert!(fake.sub("run").is_empty() && fake.sub("exec").is_empty(), "{:?}", fake.calls());
+        let b = e.rt.inner.orch.box_access(&id).await.unwrap();
+        b.ready().await.unwrap();
+        let rules = std::fs::read_to_string(fake.dir.join("rules.in")).unwrap();
+        assert!(rules.contains("-d 198.51.100.4/32 -p tcp -j ACCEPT"), "the grant made before the box is in it: {rules}");
+        assert!(!rules.contains("203.0.113.7"));
+        // A grant on the running box is applied at once, and nothing else is.
+        e.rt.grant_scope(&id, &["203.0.113.7:8080".to_string(), "*.wild.test".to_string()], None).await.unwrap();
+        let rules = std::fs::read_to_string(fake.dir.join("rules.in")).unwrap();
+        assert!(rules.contains("-d 203.0.113.7/32 -p tcp -m tcp --dport 8080 -j ACCEPT"), "{rules}");
+        assert!(rules.contains("-d 198.51.100.4/32 -p tcp -j ACCEPT"), "{rules}");
+        assert!(!rules.contains("wild") && rules.trim_end().ends_with("COMMIT"));
+        assert!(fake.running(&box_container(&mission)));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn i5_archiving_and_stopping_the_mission_remove_its_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let e = box_env(&fake).await;
+        let (id, mission) = idle_lead(&e).await;
+        let container = box_container(&mission);
+        e.rt.inner.orch.box_access(&id).await.unwrap().ready().await.unwrap();
+        assert!(fake.running(&container));
+        e.rt.stop(&id).await.unwrap();
+        until("box removed by stop", || !fake.running(&container)).await;
+        until("chain removed by stop", || fake.sub("run").iter().any(|r| r.iter().any(|a| a == &loom_tools::boxctl::names(mission.as_str()).chain) && !r.iter().any(|a| a == "--interactive"))).await;
+        // After the stop a box is made again on demand, and the archive removes that one.
+        e.rt.inner.orch.box_access(&id).await.unwrap().ready().await.unwrap();
+        assert!(fake.running(&container));
+        let mark = fake.calls().len();
+        e.rt.archive(&id, true).await.unwrap();
+        until("box removed by archive", || !fake.running(&container)).await;
+        until("its chain removed", || {
+            fake.calls()[mark..].iter().any(|c| c.get(2).is_some_and(|s| s == "run"))
+        })
+        .await;
+        // The order of the removal: container, then network, then the chain.
+        let subs: Vec<String> = fake.calls()[mark..].iter().filter_map(|c| c.get(2).cloned()).collect();
+        let first = |name: &str| subs.iter().position(|s| s == name).unwrap_or(usize::MAX);
+        assert!(first("rm") < first("network") && first("network") < first("run"), "{subs:?}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn i5_start_removes_what_boxes_of_missions_that_are_not_running_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        // An earlier daemon left a container, a network and a chain for a mission nothing runs.
+        let stale = loom_tools::boxctl::names("m-stale");
+        std::fs::write(fake.dir.join(format!("ctr-{}", stale.container)), "").unwrap();
+        std::fs::write(fake.dir.join(format!("net-{}", stale.network)), "").unwrap();
+        std::fs::write(fake.dir.join("ps.txt"), "m-stale\n").unwrap();
+        std::fs::write(fake.dir.join("net.txt"), "m-stale\n").unwrap();
+        let e = box_env(&fake).await;
+        until("stale box removed", || !fake.running(&stale.container)).await;
+        until("stale network removed", || !fake.dir.join(format!("net-{}", stale.network)).exists()).await;
+        until("chain removed", || fake.sub("run").iter().any(|r| r.iter().any(|a| a == &stale.chain))).await;
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn i1_the_docker_forward_is_unreadable_to_commands_and_never_a_permitted_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let cfg = {
+            let mut c = fake.cfg();
+            c.docker_socket = String::new();
+            c.ssh_host = "loom-box".into();
+            c.remote_socket = "/var/run/docker.sock".into();
+            c
+        };
+        let e = env_with(Script::new(|_, _| finish("ok")), false, move |c| c.boxed = cfg).await;
+        let (id, _) = idle_lead(&e).await;
+        let socket = e.rt.inner.box_host.as_ref().unwrap().socket().to_path_buf();
+        assert_eq!(socket, e.rt.paths().keys_dir().join("box.sock"));
+        std::fs::write(&socket, b"").unwrap();
+        // Neither the config the runtime hands the sandbox nor the sandbox that results has the socket.
+        let meta = e.rt.session(&id).unwrap().meta;
+        let (deps, _parts) = e.rt.inner.build(&meta, true).unwrap();
+        assert!(deps.ctx.sandbox.check_read(&socket).is_err(), "commands cannot read the forwarded socket");
+        assert!(deps.ctx.sandbox.check_write(&socket).is_err(), "nor write it");
+        assert!(!deps.ctx.sandbox.describe().contains("box.sock"));
+        let role = e.rt.inner.packs.role(Some(&meta.pack), Some(&meta.role)).unwrap().clone();
+        let ws = std::fs::canonicalize(&meta.workspace).unwrap();
+        let sandbox_cfg = sandbox_cfg_for(&e.rt.inner.config.sandbox, &role, &ws, &e.rt.inner.config.models);
+        assert!(sandbox_cfg.unix_sockets.is_empty());
+        assert!(sandbox_cfg.extra_writable.iter().chain(&sandbox_cfg.loopback_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>()).all(|p| !p.contains("box.sock")));
         e.rt.shutdown().await;
     }
 

@@ -68,6 +68,16 @@
 //! format. Refresh requires a previously confirmed leader/member identity; restart cleanup reuses
 //! `kill_recorded_group`, leaving uncertain or reused groups untouched. PTY output is not a job.
 //!
+//! ## `spawn_launched`
+//! For a command that loom starts itself, outside the sandbox, with an argv it built (`box_exec` runs
+//! `docker exec ...`). Same files, process group, pid record and owner marker as `spawn`, but the program
+//! is `/bin/bash -c '"$@" 2>&1; echo $? >&2' <owner> <launcher.program> <launcher.args...>`: the arguments
+//! are an argv that no shell reads, `spec.script` is not run, and the environment is `spec.env` only.
+//! The caller confines whatever the launcher runs. A `launcher.remote_stop` is called with the signal
+//! each time the group is signalled (`terminate`, `kill`) and with KILL when an armed `Running` is dropped,
+//! because the command runs where this process cannot signal it. With one, `terminate`'s TERM is not sent
+//! to the local client (it ends with the command, so its status is the command's); KILL is sent to both.
+//!
 //! ## Output
 //! `output_len` is the current size of the output file; `read_output(from)` returns its bytes from
 //! offset `from` to the end (empty when `from` is at or past the end).
@@ -86,11 +96,16 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
 /// Runs the script in `$0` and then appends its exit status, as a number, to stderr (the exit file).
 const WRAPPER: &str = "/bin/bash -c \"$0\" 2>&1; echo $? >&2";
+
+/// Runs the launcher's program and arguments (`$@`, an inert owner marker is `$0`) and then appends the
+/// exit status, as `WRAPPER` does. The arguments are never parsed by this shell.
+const LAUNCH_WRAPPER: &str = "\"$@\" 2>&1; echo $? >&2";
 
 /// How long `terminate` waits for the leader and group to disappear after KILL.
 const KILL_SETTLE: Duration = Duration::from_secs(5);
@@ -98,6 +113,27 @@ const KILL_SETTLE: Duration = Duration::from_secs(5);
 const REPLACED: &str = "the recorded process-group id now belongs to a different leader; it was not signalled";
 const UNINSPECTABLE: &str =
     "the process group could not be inspected safely; it may still be running and was not signalled";
+
+/// What stops a command that runs somewhere this process cannot signal (a process in a container):
+/// called with a signal number (`SIGTERM`, then `SIGKILL`) whenever the command's group is signalled.
+/// It must return quickly and may be called more than once.
+#[derive(Clone)]
+pub struct RemoteStop(pub Arc<dyn Fn(i32) + Send + Sync>);
+
+impl std::fmt::Debug for RemoteStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RemoteStop")
+    }
+}
+
+/// A program that loom itself built, run in place of `Sandbox::command` (see [`spawn_launched`]). The
+/// arguments are an argv: they are handed to the program as they are.
+#[derive(Clone, Debug)]
+pub struct Launcher {
+    pub program: String,
+    pub args: Vec<String>,
+    pub remote_stop: Option<RemoteStop>,
+}
 
 #[derive(Clone, Debug)]
 pub struct Spawn {
@@ -205,11 +241,16 @@ pub struct Running {
     members: Vec<(u32, String)>,
     /// The marker the wrapper was started with; read back from beside the status file when adopting.
     owner: Option<String>,
+    /// Stops the command where it really runs, when that is not a process of this machine.
+    remote_stop: Option<RemoteStop>,
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
         if self.armed {
+            if let Some(remote) = &self.remote_stop {
+                (remote.0)(libc::SIGKILL);
+            }
             let own = self.child.is_some();
             // An unreadable process table does not spare a leader that is ours.
             if matches!(group_state(self.pid, self.owner.as_deref(), own), GroupState::Live)
@@ -619,6 +660,25 @@ fn remove_stale(path: &Path) -> io::Result<()> {
 }
 
 pub fn spawn(sandbox: &Sandbox, spec: &Spawn) -> io::Result<Running> {
+    spawn_with(How::Sandboxed(sandbox), spec)
+}
+
+/// Like [`spawn`], but runs `launcher` instead of the sandboxed wrapper: `/bin/bash -c '"$@" 2>&1; echo $? >&2'`
+/// with the launcher's program and arguments as `$@`, so they reach the program as the argv they are and
+/// no shell reads them. The caller is responsible for what the program does: nothing here confines it.
+/// `spec.script` is not run (the launcher's arguments carry whatever the program should run); output,
+/// status, process group, pid record and owner marker are as for [`spawn`]. A `launcher.remote_stop` is
+/// called with the signal whenever the group is signalled, and with KILL when the armed `Running` is dropped.
+pub fn spawn_launched(launcher: &Launcher, spec: &Spawn) -> io::Result<Running> {
+    spawn_with(How::Launched(launcher), spec)
+}
+
+enum How<'a> {
+    Sandboxed(&'a Sandbox),
+    Launched(&'a Launcher),
+}
+
+fn spawn_with(how: How<'_>, spec: &Spawn) -> io::Result<Running> {
     let pid_file = pid_path(&spec.out_path);
     for stale in [&spec.out_path, &spec.exit_path, &pid_file, &owner_path(&spec.exit_path)] {
         remove_stale(stale)?;
@@ -632,9 +692,19 @@ pub fn spawn(sandbox: &Sandbox, spec: &Spawn) -> io::Result<Running> {
         marker.write_all(owner.as_bytes())?;
         marker.sync_data()?;
     }
-    let (program, mut args) = sandbox.command(WRAPPER);
-    args.push(spec.script.clone());
-    args.push(owner.clone());
+    let (program, args, remote_stop) = match how {
+        How::Sandboxed(sandbox) => {
+            let (program, mut args) = sandbox.command(WRAPPER);
+            args.push(spec.script.clone());
+            args.push(owner.clone());
+            (program, args, None)
+        }
+        How::Launched(launcher) => {
+            let mut args = vec!["-c".to_string(), LAUNCH_WRAPPER.to_string(), owner.clone(), launcher.program.clone()];
+            args.extend(launcher.args.iter().cloned());
+            ("/bin/bash".to_string(), args, launcher.remote_stop.clone())
+        }
+    };
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .env_clear()
@@ -670,6 +740,7 @@ pub fn spawn(sandbox: &Sandbox, spec: &Spawn) -> io::Result<Running> {
         start: process_start(pid),
         members: Vec::new(),
         owner: Some(owner),
+        remote_stop,
     };
     recorded(running, &pid_file)
 }
@@ -696,7 +767,20 @@ impl Running {
             .ok()
             .filter(|s| s.starts_with("loom-owner-") && !s.chars().any(char::is_whitespace));
         let (child, ended, start, members) = (None, None, None, Vec::new());
-        Running { pid, out_path, exit_path, started_ms, child, ended, armed: false, over: false, start, members, owner }
+        Running {
+            pid,
+            out_path,
+            exit_path,
+            started_ms,
+            child,
+            ended,
+            armed: false,
+            over: false,
+            start,
+            members,
+            owner,
+            remote_stop: None,
+        }
     }
 
     /// Ends the drop guard: the command's group is now somebody else's to stop.
@@ -907,6 +991,15 @@ impl Running {
     /// Signals the group when it is confirmed to be this command's own; `false` when it could not be
     /// confirmed (a different leader holds the id, or the process table could not be read).
     fn signal(&mut self, signal: i32) -> bool {
+        // The command runs elsewhere: it is stopped there whether or not its local client is still here.
+        // The local client is left to end with the command (so that its status is the command's), and only
+        // a KILL is sent to it too, which is what a client that does not end after that needs.
+        if let Some(remote) = &self.remote_stop {
+            (remote.0)(signal);
+            if signal != libc::SIGKILL {
+                return true;
+            }
+        }
         match group_state(self.pid, self.owner.as_deref(), self.child.is_some()) {
             GroupState::Gone => true,
             GroupState::Live => {
@@ -1517,6 +1610,51 @@ mod tests {
         assert!(matches!(end, Ended::Signal(_)), "{end:?}");
         assert_gone(&pids).await;
         assert!(!alive(r.pid as i32));
+    }
+
+    #[tokio::test]
+    async fn a_launched_program_gets_its_arguments_as_an_argv_and_its_status_is_recorded() {
+        let f = fx();
+        let launcher = Launcher {
+            program: "/usr/bin/printf".to_string(),
+            args: ["[%s]\\n", "a b", "$(echo injected)", "'; echo no; '", "--privileged", "x\ny"].iter().map(|s| s.to_string()).collect(),
+            remote_stop: None,
+        };
+        let mut r = spawn_launched(&launcher, &f.spec("ignored by a launcher")).expect("spawn");
+        let end = r.wait(&never(), Some(Duration::from_secs(10)), u64::MAX).await;
+        assert_eq!(end, WaitEnd::Ended(Ended::Exit(0)));
+        let out = String::from_utf8_lossy(&r.read_output(0).expect("read")).to_string();
+        assert_eq!(out, "[a b]\n[$(echo injected)]\n['; echo no; ']\n[--privileged]\n[x\ny]\n");
+        // The launcher's environment is the one it was given, not ours.
+        let launcher = Launcher { program: "/usr/bin/env".to_string(), args: vec![], remote_stop: None };
+        let mut r = spawn_launched(&launcher, &f.spec("")).expect("spawn");
+        r.wait(&never(), Some(Duration::from_secs(10)), u64::MAX).await;
+        let env = String::from_utf8_lossy(&r.read_output(0).expect("read")).to_string();
+        assert!(env.contains("PATH=/usr/bin:/bin:/usr/sbin:/sbin") && !env.contains("CARGO"), "{env}");
+    }
+
+    #[tokio::test]
+    async fn remote_stop_is_called_with_term_and_then_kill_when_the_local_client_ignores_term() {
+        let f = fx();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let launcher = Launcher {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".into(), "trap '' TERM; sleep 30".into()],
+            remote_stop: Some(RemoteStop(Arc::new(move |sig| log.lock().expect("lock").push(sig)))),
+        };
+        let mut r = spawn_launched(&launcher, &f.spec("")).expect("spawn");
+        let end = r.terminate(Duration::from_millis(300)).await;
+        assert!(matches!(end, Ended::Signal(_) | Ended::Exit(_)), "{end:?}");
+        let sigs = seen.lock().expect("lock").clone();
+        assert_eq!(sigs.first(), Some(&libc::SIGTERM), "{sigs:?}");
+        assert!(sigs.contains(&libc::SIGKILL), "{sigs:?}");
+        assert!(!alive(r.pid as i32));
+        // A running that is dropped while armed has its command stopped in the box too.
+        seen.lock().expect("lock").clear();
+        let r = spawn_launched(&launcher, &f.spec("")).expect("spawn");
+        drop(r);
+        assert_eq!(*seen.lock().expect("lock"), [libc::SIGKILL]);
     }
 
     #[tokio::test]
