@@ -25,6 +25,7 @@ final class DaemonClient: @unchecked Sendable {
     struct SessionLite: Decodable, Equatable {
         var id: String
         var title: String?
+        var parent: String?
         var archived: Bool?
         var status: StatusLite?
         var phase: String? { status?.phase }
@@ -344,13 +345,77 @@ final class DaemonClient: @unchecked Sendable {
     }
 
     /// Derive counts from the current sessions and open inbox items. Pure helper.
-    /// running = phase running; active = not ended / archived; waiting = open blocking inbox items.
+    /// Missions are root sessions; agents are counted separately. Waiting counts blocking inbox items.
     static func derive(sessions: [SessionLite], inbox: [InboxLite]) -> Counts {
         let live = sessions.filter { $0.archived != true }
-        return Counts(running: live.filter { $0.phase == "running" }.count,
+        let missions = live.filter { $0.parent == nil }
+        let byID = Dictionary(live.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
+        var runningMissions = Set(missions.filter { $0.phase == "running" }.map(\.id))
+        for agent in live where agent.parent != nil && agent.phase == "running" {
+            var cursor: SessionLite? = agent
+            var visited = Set<String>()
+            while let current = cursor, visited.insert(current.id).inserted {
+                guard let parent = current.parent else {
+                    runningMissions.insert(current.id)
+                    break
+                }
+                cursor = byID[parent]
+            }
+        }
+        return Counts(running: runningMissions.count,
                       waiting: inbox.filter { $0.item.isBlocking }.count,
-                      active: live.filter { $0.phase != "ended" }.count,
-                      requests: inbox.filter { $0.item.isScopeRequest }.count)
+                      active: missions.filter { $0.phase != "ended" }.count,
+                      requests: inbox.filter { $0.item.isScopeRequest }.count,
+                      runningAgents: live.filter { $0.parent != nil && $0.phase == "running" }.count)
+    }
+
+    /// Snapshot validity is separate from transport mode and from mission attention.
+    struct FeedStatus: Equatable {
+        enum Mode: String { case connecting, live, polling }
+        var mode: Mode = .connecting
+        var lastUpdated: Date?
+        private var pending: Set<String> = ["sessions", "inbox"]
+        private var failures: [String: String] = [:]
+
+        var stale: Bool { !pending.isEmpty || !failures.isEmpty }
+        var detail: String { failures.keys.sorted().compactMap { failures[$0] }.joined(separator: "; ") }
+
+        mutating func succeeded(_ resource: String, at now: Date) {
+            pending.remove(resource)
+            failures[resource] = nil
+            if !stale { lastUpdated = now }
+        }
+
+        mutating func failed(_ resource: String, reason: String) {
+            failures[resource] = reason
+        }
+
+        mutating func recoveredSnapshot(at now: Date) {
+            failures["stream"] = nil
+            if !stale { lastUpdated = now }
+        }
+
+        mutating func receivedEvent(at now: Date) {
+            if !stale { lastUpdated = now }
+        }
+
+        func label(at now: Date) -> String {
+            if stale {
+                guard let lastUpdated else { return "State unknown · reconnecting" }
+                return "Reconnecting · last update \(Self.age(now.timeIntervalSince(lastUpdated)))"
+            }
+            if mode == .live { return "Live" }
+            return mode == .polling ? "Polling" : "Connecting stream"
+        }
+
+        private static func age(_ interval: TimeInterval) -> String {
+            guard interval.isFinite else { return "unknown" }
+            let seconds = Int(max(0, min(interval, 315_360_000)))
+            if seconds < 5 { return "just now" }
+            if seconds < 60 { return "\(seconds)s ago" }
+            if seconds < 3600 { return "\(seconds / 60)m ago" }
+            return "\(seconds / 3600)h ago"
+        }
     }
 
     // MARK: SSE parsing (pure)
@@ -391,15 +456,17 @@ final class DaemonClient: @unchecked Sendable {
     private let lock = NSLock()
     private var task: Task<Void, Never>?
 
-    /// `onMode` says how the data is arriving: "live" or "polling (reason)".
+    /// `onMode` is diagnostic text; `onFeedStatus` reports whether the retained counts are current.
     func start(baseURL: String,
                token: String?,
                onCounts: @escaping @Sendable (Counts) -> Void,
                onBlockingInbox: @escaping @Sendable (_ sessionId: String, _ title: String, _ text: String) -> Void,
-               onMode: @escaping @Sendable (String) -> Void = { _ in }) {
+               onMode: @escaping @Sendable (String) -> Void = { _ in },
+               onFeedStatus: @escaping @Sendable (FeedStatus) -> Void = { _ in }) {
         stop()
         let runner = Runner(baseURL: baseURL, token: token,
-                            onCounts: onCounts, onBlocking: onBlockingInbox, onMode: onMode)
+                            onCounts: onCounts, onBlocking: onBlockingInbox, onMode: onMode,
+                            onFeedStatus: onFeedStatus)
         let t = Task.detached { await runner.run() }
         lock.lock(); task = t; lock.unlock()
     }
@@ -417,6 +484,7 @@ final class DaemonClient: @unchecked Sendable {
         let onCounts: @Sendable (Counts) -> Void
         let onBlocking: @Sendable (String, String, String) -> Void
         let onMode: @Sendable (String) -> Void
+        let onFeedStatus: @Sendable (FeedStatus) -> Void
         let session: URLSession
 
         private let lock = NSLock()
@@ -424,13 +492,16 @@ final class DaemonClient: @unchecked Sendable {
         private var seen = Set<String>()
         private var seeded = false
         private var lastCounts: Counts?
+        private var feed = FeedStatus()
 
         init(baseURL: String, token: String?,
              onCounts: @escaping @Sendable (Counts) -> Void,
              onBlocking: @escaping @Sendable (String, String, String) -> Void,
-             onMode: @escaping @Sendable (String) -> Void) {
+             onMode: @escaping @Sendable (String) -> Void,
+             onFeedStatus: @escaping @Sendable (FeedStatus) -> Void) {
             self.baseURL = baseURL; self.token = token
             self.onCounts = onCounts; self.onBlocking = onBlocking; self.onMode = onMode
+            self.onFeedStatus = onFeedStatus
             let cfg = URLSessionConfiguration.ephemeral
             cfg.timeoutIntervalForRequest = 45      // the stream sends a keep-alive every 15 s
             cfg.httpShouldSetCookies = false
@@ -488,6 +559,11 @@ final class DaemonClient: @unchecked Sendable {
                     reason = (error as? HTTPError)?.description ?? error.localizedDescription
                 }
                 if Task.isCancelled { break }
+                lock.withLock {
+                    feed.mode = .polling
+                    feed.failed("stream", reason: reason)
+                }
+                publishFeed()
                 // Whatever ended the stream may have freed the port for another listener: prove the daemon
                 // again before the snapshot below sends the token.
                 if !(await proven()) { continue }
@@ -509,6 +585,8 @@ final class DaemonClient: @unchecked Sendable {
             if let h = resp as? HTTPURLResponse, h.statusCode != 200 { throw HTTPError(status: h.statusCode) }
             // Subscribed, then snapshot again: nothing between the first snapshot and now is lost.
             await refresh(sessions: true, inbox: true)
+            lock.withLock { feed.mode = .live }
+            publishFeed()
             onMode("live")
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask { [self] in
@@ -541,30 +619,52 @@ final class DaemonClient: @unchecked Sendable {
         func handle(_ payload: String) async {
             guard let ev = try? JSONDecoder().decode(BusEvent.self, from: Data(payload.utf8)) else { return }
             let need = lock.withLock { model.apply(ev) }
+            lock.withLock { feed.receivedEvent(at: Date()) }
             publish()
+            publishFeed()
             if !need.isEmpty { await refresh(sessions: need.contains(.sessions), inbox: need.contains(.inbox)) }
         }
 
         func refresh(sessions: Bool, inbox: Bool) async {
-            if sessions, let d = try? await get("/api/sessions"),
-               let list = DaemonClient.decodeList(SessionLite.self, from: d) {
-                lock.withLock { model.replaceSessions(list) }
-            }
-            if inbox, let d = try? await get("/api/inbox"),
-               let list = DaemonClient.decodeList(InboxLite.self, from: d) {
-                let fresh: [InboxLite] = lock.withLock {
-                    model.replaceInbox(list)
-                    let f = seeded ? list.filter { $0.item.isBlocking && !seen.contains($0.item.item_id) } : []
-                    for e in list { seen.insert(e.item.item_id) }   // the first snapshot seeds silently
-                    seeded = true
-                    return f
-                }
-                for e in fresh {
-                    onBlocking(e.session, e.title ?? e.session, e.item.text ?? "")
+            var complete = true
+            if sessions {
+                do {
+                    let data = try await get("/api/sessions")
+                    guard let list = DaemonClient.decodeList(SessionLite.self, from: data) else {
+                        throw URLError(.cannotParseResponse)
+                    }
+                    lock.withLock { model.replaceSessions(list); feed.succeeded("sessions", at: Date()) }
+                } catch {
+                    complete = false
+                    lock.withLock { feed.failed("sessions", reason: "Session refresh failed: \(error.localizedDescription)") }
                 }
             }
+            if inbox {
+                do {
+                    let data = try await get("/api/inbox")
+                    guard let list = DaemonClient.decodeList(InboxLite.self, from: data) else {
+                        throw URLError(.cannotParseResponse)
+                    }
+                    let fresh: [InboxLite] = lock.withLock {
+                        model.replaceInbox(list)
+                        feed.succeeded("inbox", at: Date())
+                        let f = seeded ? list.filter { $0.item.isBlocking && !seen.contains($0.item.item_id) } : []
+                        for e in list { seen.insert(e.item.item_id) }   // the first snapshot seeds silently
+                        seeded = true
+                        return f
+                    }
+                    for e in fresh { onBlocking(e.session, e.title ?? e.session, e.item.text ?? "") }
+                } catch {
+                    complete = false
+                    lock.withLock { feed.failed("inbox", reason: "Inbox refresh failed: \(error.localizedDescription)") }
+                }
+            }
+            if sessions && inbox && complete { lock.withLock { feed.recoveredSnapshot(at: Date()) } }
             publish()
+            publishFeed()
         }
+
+        func publishFeed() { onFeedStatus(lock.withLock { feed }) }
 
         func publish() {
             let (c, changed): (Counts, Bool) = lock.withLock {
@@ -612,6 +712,40 @@ final class DaemonClient: @unchecked Sendable {
         chk(ii.count == 3, "inbox decode kept \(ii.count)")
         let c = derive(sessions: ss, inbox: ii)
         chk(c == Counts(running: 1, waiting: 1, active: 2, requests: 1), "derive: \(c)")
+        let agents = Data("""
+        [{"id":"lead","parent":null,"status":{"phase":"idle"}},
+         {"id":"worker","parent":"lead","status":{"phase":"running"}},
+         {"id":"verifier","parent":"lead","status":{"phase":"idle"}},
+         {"id":"archived","parent":"lead","archived":true,"status":{"phase":"running"}}]
+        """.utf8)
+        let splitCounts = derive(sessions: decodeList(SessionLite.self, from: agents) ?? [], inbox: [])
+        chk(splitCounts == Counts(running: 1, waiting: 0, active: 1, runningAgents: 1), "mission / agent counts: \(splitCounts)")
+
+        // Partial refreshes, live events, and reconnection must not hide a stale resource.
+        let initial = Date(timeIntervalSince1970: 100)
+        var feed = FeedStatus()
+        chk(feed.stale && feed.lastUpdated == nil, "initial state must be unknown")
+        feed.succeeded("sessions", at: initial)
+        chk(feed.stale, "one initial resource must not make the snapshot current")
+        feed.succeeded("inbox", at: initial)
+        feed.mode = .live
+        chk(!feed.stale && feed.label(at: initial) == "Live", "complete live snapshot")
+        feed.failed("inbox", reason: "offline")
+        feed.receivedEvent(at: initial.addingTimeInterval(30))
+        chk(feed.stale && feed.lastUpdated == initial, "live event must not clear failed inbox refresh")
+        chk(feed.label(at: initial.addingTimeInterval(45)) == "Reconnecting · last update 45s ago", "stale snapshot age")
+        feed.succeeded("inbox", at: initial.addingTimeInterval(50))
+        chk(!feed.stale, "successful resource refresh must recover its error")
+        feed.mode = .polling
+        feed.failed("stream", reason: "stream ended")
+        feed.succeeded("inbox", at: initial.addingTimeInterval(60))
+        chk(feed.stale, "partial refresh must not recover a disconnected stream")
+        feed.succeeded("sessions", at: initial.addingTimeInterval(60))
+        feed.recoveredSnapshot(at: initial.addingTimeInterval(60))
+        chk(!feed.stale && feed.label(at: initial) == "Polling", "complete polling snapshot recovers counts")
+        feed.failed("sessions", reason: "offline")
+        feed.succeeded("inbox", at: initial.addingTimeInterval(70))
+        chk(feed.stale && feed.lastUpdated == initial.addingTimeInterval(60), "inbox success must retain failed sessions and their last-known age")
 
         // Event folding.
         var m = Model()

@@ -4,18 +4,24 @@ import UserNotifications
 
 /// Live counts shown in the menu bar and the status line.
 struct Counts: Equatable {
-    var running = 0
+    var running = 0   // missions whose lead or an agent is running
     var waiting = 0   // open blocking inbox items
-    var active = 0    // sessions not ended/archived
+    var active = 0    // root missions not ended/archived
     var requests = 0  // open scope requests: agents asking for hosts, which do not stop the session
+    var runningAgents = 0
 
-    /// Menu-bar label, e.g. "◆ 2▸ 1!". Red when `waiting > 0` (the caller decides colour).
+    var summary: String {
+        "\(running) \(running == 1 ? "mission" : "missions") running · \(runningAgents) \(runningAgents == 1 ? "agent" : "agents") running"
+    }
+
+    /// Attention is text rather than a connection-health signal.
     var menuLabel: String {
-        var s = "◆"
-        if running > 0 { s += " \(running)▸" }
-        if waiting > 0 { s += " \(waiting)!" }
-        if requests > 0 { s += " \(requests)?" }
-        return s
+        var parts: [String] = []
+        if running > 0 { parts.append("\(running) \(running == 1 ? "mission" : "missions")") }
+        if runningAgents > 0 { parts.append("\(runningAgents) \(runningAgents == 1 ? "agent" : "agents")") }
+        if waiting > 0 { parts.append("\(waiting) needs you") }
+        if requests > 0 { parts.append("\(requests) asking for hosts") }
+        return parts.isEmpty ? "loom" : parts.joined(separator: " · ")
     }
 }
 
@@ -36,6 +42,7 @@ final class AppState: ObservableObject {
     @Published var active: Connection? = nil
     @Published var link: Link = .none
     @Published var counts = Counts()
+    @Published var feedStatus = DaemonClient.FeedStatus()
     @Published var status: String = "not connected"
     /// True while the client's identity check cannot reach the daemon (it keeps retrying); the bar then
     /// shows the link as not connected.
@@ -176,6 +183,7 @@ final class AppState: ObservableObject {
         paneEpoch += 1
         active = connection
         counts = Counts()
+        feedStatus = DaemonClient.FeedStatus()
         webState = .idle
         webLoadedOnce = false
         UserDefaults.standard.set(connection.id.uuidString, forKey: Self.lastKey)
@@ -246,6 +254,7 @@ final class AppState: ObservableObject {
         link = .none
         status = "not connected"
         counts = Counts()
+        feedStatus = DaemonClient.FeedStatus()
         webState = .idle
     }
 
@@ -303,7 +312,13 @@ final class AppState: ObservableObject {
                         return
                     }
                     self.daemonUnreachable = false
-                    self.status = mode == "live" ? "connected · live" : "connected · \(mode)"
+                }
+            },
+            onFeedStatus: { [weak self] feed in
+                Task { @MainActor in
+                    guard let self, self.generation == gen else { return }
+                    self.feedStatus = feed
+                    self.status = feed.label(at: Date())
                 }
             })
     }
@@ -317,6 +332,7 @@ final class AppState: ObservableObject {
         baseURL = nil
         pendingEntry = nil
         counts = Counts()
+        feedStatus.failed("stream", reason: msg)
         link = .failed("the SSH tunnel closed: \(msg)")
         status = "tunnel closed"
     }
@@ -431,9 +447,10 @@ enum SelfCheck {
         failures += Tunnel.selfCheck()
         failures += DaemonClient.selfCheck()
         failures += WebPane.selfCheck()
-        if Counts(running: 2, waiting: 1, active: 3).menuLabel != "◆ 2▸ 1!" { failures.append("Counts.menuLabel") }
-        if Counts(running: 0, waiting: 0, active: 1, requests: 2).menuLabel != "◆ 2?" { failures.append("Counts.menuLabel requests") }
-        if Counts().menuLabel != "◆" { failures.append("Counts.menuLabel empty") }
+        if Counts(running: 2, waiting: 1, active: 3, runningAgents: 4).menuLabel != "2 missions · 4 agents · 1 needs you" { failures.append("Counts.menuLabel") }
+        if Counts(running: 0, waiting: 0, active: 1, requests: 2).menuLabel != "2 asking for hosts" { failures.append("Counts.menuLabel requests") }
+        if Counts().menuLabel != "loom" { failures.append("Counts.menuLabel empty") }
+        if Counts(running: 1, runningAgents: 1).summary != "1 mission running · 1 agent running" { failures.append("Counts.summary singular") }
         if Notifier.cut("a\nb", 10) != "a b" || Notifier.cut(String(repeating: "x", count: 20), 5).count != 5 {
             failures.append("Notifier.cut")
         }

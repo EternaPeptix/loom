@@ -95,12 +95,27 @@ struct ConnectionBar: View {
                     .help("Switch connection")
             }
             Spacer()
-            if state.counts.running > 0 || state.counts.waiting > 0 || state.counts.active > 0 {
-                Text("\(state.counts.running) running · \(state.counts.waiting) waiting · \(state.counts.active) active"
-                     + (state.counts.requests > 0 ? " · \(state.counts.requests) asking for hosts" : ""))
-                    .font(.caption).foregroundStyle(state.counts.waiting > 0 ? Color.red : Color.secondary)
+            if state.feedStatus.lastUpdated != nil {
+                Text((state.feedStatus.stale ? "Last known: " : "") + state.counts.summary)
+                    .font(.caption).foregroundStyle(.secondary)
+                if state.counts.waiting > 0 {
+                    Text("\(state.counts.waiting) needs you")
+                        .font(.caption).foregroundStyle(state.feedStatus.stale ? Color.secondary : Color.orange)
+                }
+                if state.counts.requests > 0 {
+                    Text("\(state.counts.requests) asking for hosts")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
-            Text(state.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            if case .connected = state.link, !state.daemonUnreachable {
+                TimelineView(.periodic(from: .now, by: 5)) { context in
+                    Text(state.feedStatus.label(at: context.date))
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                .help(state.feedStatus.detail.isEmpty ? state.status : state.feedStatus.detail)
+            } else {
+                Text(state.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
             if case .connected = state.link {
                 Button { state.reload() } label: { Image(systemName: "arrow.clockwise") }
                     .help("Reload the page")
@@ -120,7 +135,7 @@ struct ConnectionBar: View {
         switch state.link {
         case .connected:
             if state.daemonUnreachable { return .orange }
-            return state.counts.waiting > 0 ? .red : .green
+            return state.feedStatus.stale || state.feedStatus.mode != .live ? .orange : .green
         case .connecting: return .orange
         case .failed: return .red
         case .none: return .gray

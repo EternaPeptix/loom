@@ -342,20 +342,130 @@ export function sessionRows(store, { showArchived = false } = {}) {
   return rows;
 }
 
+/** Open inbox items classified by operator action, without treating results as blockers. */
+export function attentionFor(inbox, sessionId) {
+  const attention = { open: 0, blocking: 0, questions: 0, results: 0 };
+  for (const entry of inbox.items.values()) {
+    if (entry.session !== sessionId) continue;
+    attention.open++;
+    if (entry.item.blocking) attention.blocking++;
+    else if (entry.item.item_kind === "finished") attention.results++;
+    else attention.questions++;
+  }
+  return attention;
+}
+
+/** "1 agent", "3 agents", "2 open claims": a count with the noun in the right number. */
+export function count(n, one, many = one + "s") {
+  return `${num(n)} ${Number(n) === 1 ? one : many}`;
+}
+
+/**
+ * What is open for a set of sessions, with when the oldest item of each class was opened.
+ * `blocking.kind` is the kind of that oldest blocking item, so a row can name what is waiting.
+ */
+export function waitingFor(inbox, sessionIds) {
+  const ids = sessionIds instanceof Set ? sessionIds : new Set(sessionIds || []);
+  const out = {
+    blocking: { count: 0, since: null, kind: null },
+    questions: { count: 0, since: null },
+    results: { count: 0, since: null },
+  };
+  for (const entry of inbox.items.values()) {
+    if (!ids.has(entry.session)) continue;
+    const slot = entry.item.blocking ? out.blocking : entry.item.item_kind === "finished" ? out.results : out.questions;
+    slot.count++;
+    const opened = Number.isFinite(entry.opened_ms) ? entry.opened_ms : null;
+    const older = opened !== null && (slot.since === null || opened < slot.since);
+    if (older) slot.since = opened;
+    if (slot === out.blocking && (older || slot.kind === null)) slot.kind = entry.item.item_kind;
+  }
+  return out;
+}
+
+/** How a session's execution stands in one word, whatever is waiting on the operator. */
+export function executionWord(info) {
+  const st = (info && info.status) || {};
+  if (st.phase === "running") return "running";
+  if (st.phase === "ended") {
+    if (st.outcome === "stopped") return "stopped";
+    return st.outcome === "failed" || st.outcome === "budget_exhausted" ? "failed" : "finished";
+  }
+  if (st.last_end === "waiting") return "waiting";
+  if (st.last_end === "stopped") return "stopped";
+  return "idle";
+}
+
+/**
+ * Mission navigation, with stable creation order inside attention groups. Root rows carry
+ * aggregate attention; child rows keep their own attention and appear only when expanded.
+ */
+export function missionGroups(store, inbox, { showArchived = false, expanded = new Set() } = {}) {
+  const groups = [
+    { key: "needs_answer", label: "Needs your answer", rows: [] },
+    { key: "running", label: "Running", rows: [] },
+    { key: "ready", label: "Ready to review", rows: [] },
+    { key: "other", label: "Other missions", rows: [] },
+  ];
+  const byKey = new Map(groups.map((g) => [g.key, g]));
+  const ordered = sessionRows(store, { showArchived });
+  let mission = null;
+  let members = [];
+  const publish = () => {
+    if (!mission) return;
+    const attention = { open: 0, blocking: 0, questions: 0, results: 0 };
+    for (const row of members) {
+      const own = attentionFor(inbox, row.info.id);
+      for (const key of Object.keys(attention)) attention[key] += own[key];
+    }
+    const executing = members.some(({ info }) => {
+      const mark = stateMark(info, attentionFor(inbox, info.id));
+      return mark === "running" || mark === "waiting";
+    });
+    const rootMark = stateMark(mission, attentionFor(inbox, mission.id));
+    const key = attention.blocking ? "needs_answer" : executing ? "running"
+      : attention.results || attention.questions || rootMark === "finished" || rootMark === "failed" ? "ready" : "other";
+    const agentCount = members.length - 1;
+    const agentsRunning = members.slice(1).filter(({ info }) => (info.status || {}).phase === "running").length;
+    const waiting = waitingFor(inbox, members.map((row) => row.info.id));
+    byKey.get(key).rows.push({ info: mission, depth: 0, mission: mission.id, agentCount, agentsRunning, expanded: expanded.has(mission.id), attention, waiting });
+    if (expanded.has(mission.id)) {
+      for (const row of members.slice(1)) {
+        byKey.get(key).rows.push({ ...row, mission: mission.id, agentCount: 0, agentsRunning: 0, expanded: false, attention: attentionFor(inbox, row.info.id), waiting: waitingFor(inbox, [row.info.id]) });
+      }
+    }
+  };
+  for (const row of ordered) {
+    if (row.depth === 0) {
+      publish();
+      mission = row.info;
+      members = [];
+    }
+    members.push(row);
+  }
+  publish();
+  return groups.filter((g) => g.rows.length);
+}
+
 /**
  * The state mark of a session: needs_you, running, waiting, stopped, finished, failed or idle.
- * `openInbox` is the number of open inbox items of the session (when unknown, the status says).
+ * Pass classified attention to distinguish nonblocking questions and available results. A numeric
+ * count is retained for older callers, which cannot classify their open inbox items.
  */
 export function stateMark(info, openInbox) {
   const st = (info && info.status) || {};
-  const open = typeof openInbox === "number" ? openInbox : st.open_inbox || 0;
-  if (open > 0 && st.phase !== "ended") return "needs_you";
+  const classified = openInbox && typeof openInbox === "object";
+  const blocking = classified ? openInbox.blocking || 0 : typeof openInbox === "number" ? openInbox : st.open_inbox || 0;
+  if (blocking > 0 && st.phase !== "ended") return "needs_you";
   if (st.phase === "running") return "running";
   if (st.phase === "ended") {
     if (st.outcome === "stopped") return "stopped";
     if (st.outcome === "failed" || st.outcome === "budget_exhausted") return "failed";
+    if (classified && openInbox.results > 0) return "result_ready";
     return "finished";
   }
+  if (classified && openInbox.questions > 0) return "question";
+  if (classified && openInbox.results > 0) return "result_ready";
   switch (st.last_end) {
     case "waiting": return "waiting";
     case "stopped": return "stopped";
@@ -374,9 +484,45 @@ const MARK_WORDS = {
   finished: "finished",
   failed: "failed",
   idle: "idle",
+  result_ready: "result ready",
+  question: "question — work can continue",
 };
 export function markWords(mark) {
   return MARK_WORDS[mark] || mark;
+}
+
+// One shape per state, so a mark is never told apart by colour alone. `icon` names a drawing in
+// index.html; `tone` names a colour treatment in style.css.
+const STANDING = {
+  needs_you: { tone: "attention", icon: "diamond", text: "Needs your answer" },
+  running: { tone: "running", icon: "dot", text: "Running" },
+  waiting: { tone: "", icon: "half", text: "Waiting for jobs or agents" },
+  stopped: { tone: "", icon: "square", text: "Stopped" },
+  finished: { tone: "ok", icon: "check", text: "Finished" },
+  failed: { tone: "bad", icon: "cross", text: "Failed" },
+  idle: { tone: "", icon: "ring", text: "Idle" },
+  result_ready: { tone: "ok", icon: "diamond-outline", text: "Result ready" },
+  question: { tone: "info", icon: "question", text: "Question open · work can continue" },
+};
+export function markIcon(mark) {
+  return (STANDING[mark] || STANDING.idle).icon;
+}
+
+/** What to call the session at the root of a mission: only a lead leads; a chat is just a session. */
+export function rootNoun(info) {
+  return info && info.role === "lead" ? "lead" : "session";
+}
+
+/**
+ * The standing of a session as separate facts, in the order an operator needs them: what is
+ * waiting on the operator, how execution stands, and how many agents of the mission are running.
+ */
+export function missionStanding(info, attention, agentsRunning = 0) {
+  const mark = stateMark(info, attention);
+  const pills = [{ ...(STANDING[mark] || { tone: "", icon: "ring", text: markWords(mark) }) }];
+  if (mark === "needs_you") pills.push({ tone: "", icon: null, text: `${info.parent ? "Agent" : capitalized(rootNoun(info))} ${executionWord(info)}` });
+  if (!info.parent && agentsRunning > 0) pills.push({ tone: "running", icon: "dot", text: `${count(agentsRunning, "agent")} running` });
+  return { mark, pills };
 }
 
 /** Which buttons the transcript header offers. */
@@ -403,6 +549,231 @@ export function rowDetail(info, now) {
   if (st.prompt_tokens) parts.push(tokens(st.prompt_tokens));
   parts.push(age(now, info.created_ms));
   return parts.join(" · ");
+}
+
+/** Human-readable activity from one recorded event; null for background bookkeeping. */
+export function recordActivity(record) {
+  if (!record) return null;
+  const name = oneLine(record.name || "tool", 50);
+  switch (record.kind) {
+    case "user_message": return "Operator message received";
+    case "model_request": return "Model request started";
+    case "model_response": return record.finish === "length" ? "Model reply reached its output limit" : "Model replied";
+    case "tool_call": return `${name} started${record.args && record.args.path ? ": " + oneLine(record.args.path, 90) : ""}`;
+    case "tool_result": return `${name}: ${record.status === "ok" ? "completed" : oneLine(record.status || "result recorded", 50)}`;
+    case "child_spawned": return `${oneLine(record.role || "Worker", 40)} agent started`;
+    case "child_settled": return `Agent ${outcomeWords(record.outcome)}`;
+    case "job_registered": return `Job ${oneLine(record.job_id, 30)} started`;
+    case "job_settled": return `Job ${oneLine(record.job_id, 30)} settled${Number.isInteger(record.exit_code) ? " (exit " + record.exit_code + ")" : ""}`;
+    case "ledger": return "Mission state updated";
+    case "inbox_opened": return record.blocking ? "Waiting for an operator answer" : record.item_kind === "finished" ? "Result ready to review" : "Nonblocking question opened";
+    case "inbox_resolved": return "Operator answered an inbox item";
+    case "interrupted": return "Execution interrupted";
+    case "turn_end": return turnEndWords(record.reason);
+    case "session_end": return `Session ${outcomeWords(record.outcome)}`;
+    default: return null;
+  }
+}
+
+/** A creation timestamp is never presented as proof of recent execution activity. */
+export function rowActivity(info, lastRecord, now) {
+  const activity = recordActivity(lastRecord);
+  if (activity && Number.isFinite(lastRecord.ts_ms)) {
+    const when = age(now, lastRecord.ts_ms);
+    return `${activity} · ${when === "now" ? "just now" : when + " ago"}`;
+  }
+  return `${markWords(stateMark(info, { blocking: 0 }))} · activity not loaded`;
+}
+
+const WAITING_NOUN = { approval: "Approval", question: "Question", blocker: "Blocker", parked: "Parked session" };
+const capitalized = (text) => text.charAt(0).toUpperCase() + text.slice(1);
+
+/**
+ * The second line of a row in the mission list. What waits on the operator comes first, with how
+ * long it has waited; then recorded activity; then the plain state. A mission row ends with how its
+ * root session stands; an agent row starts with its role. Ages come from recorded times, never
+ * creation.
+ */
+export function rowSummary(row, lastRecord, now) {
+  const info = row.info;
+  const waiting = row.waiting || { blocking: { count: 0 }, questions: { count: 0 }, results: { count: 0 } };
+  const agent = !!info.parent;
+  const waited = (slot) => (Number.isFinite(slot.since) ? age(now, slot.since) : null);
+  const base = markWords(stateMark(info, { blocking: 0 }));
+  // Phrases written here follow the row: a sentence start for a mission, lower case after a role.
+  // Recorded activity keeps the names it was recorded with.
+  const own = (text) => (agent ? text.charAt(0).toLowerCase() + text.slice(1) : capitalized(text));
+  let text;
+  if (waiting.blocking.count > 0) {
+    const a = waited(waiting.blocking);
+    if (waiting.blocking.count > 1) text = `${waiting.blocking.count} requests waiting${a && a !== "now" ? " · oldest " + a : ""}`;
+    else {
+      const noun = WAITING_NOUN[waiting.blocking.kind] || "Request";
+      text = own(a === "now" ? `${noun} just arrived` : `${noun} waiting${a ? " " + a : ""}`);
+    }
+    if (!agent) text += ` · ${rootNoun(info)} ${executionWord(info)}`;
+  } else {
+    const activity = recordActivity(lastRecord);
+    if (activity && Number.isFinite(lastRecord.ts_ms)) {
+      const when = age(now, lastRecord.ts_ms);
+      text = `${activity} · ${when === "now" ? "just now" : when + " ago"}`;
+    } else if (waiting.results.count > 0) {
+      const a = waited(waiting.results);
+      text = own(`Result ready${a && a !== "now" ? " " + a : ""} · ${base}`);
+    } else if (waiting.questions.count > 0) {
+      const a = waited(waiting.questions);
+      text = own(`Question open${a && a !== "now" ? " " + a : ""} · work can continue`);
+    } else text = agent ? base : `${capitalized(base)} · open it to load activity`;
+  }
+  return agent ? `${info.role || "agent"} · ${text}` : text;
+}
+
+/**
+ * Recorded mission changes and ledger state; it does not infer semantic success from receipts.
+ * Every change is listed. `fresh` marks those recorded after `sinceSeq` (the last record seen on
+ * the previous visit); with no previous visit nothing is fresh. `tone` is "bad" for a tool result
+ * that was not ok, an interruption, or a session that failed.
+ */
+export function missionOverview(records, ledgerState, inboxEntries, sinceSeq = null) {
+  const source = records instanceof Map ? records.values() : records || [];
+  const ordered = [...source].filter((r) => r && Number.isInteger(r.seq)).sort((a, b) => a.seq - b.seq);
+  const ledger = ledgerState || {};
+  const entries = [...(inboxEntries || [])];
+  const pendingDecisions = entries.filter((e) => e.item && e.item.blocking);
+  const changes = [];
+  let lastActivity = null;
+  let failedChecks = 0;
+  for (const record of ordered) {
+    const activity = recordActivity(record);
+    if (activity) lastActivity = { seq: record.seq, ts: record.ts_ms, text: activity, kind: record.kind };
+    let text = null;
+    let tone = "";
+    if (record.kind === "tool_result" && record.status !== "ok") {
+      failedChecks++;
+      tone = "bad";
+      text = `${oneLine(record.name || "Tool", 50)} returned ${oneLine(record.status || "an unknown status", 50)}`;
+    } else if (record.kind === "tool_result" && record.status === "ok" && record.class === "write") {
+      text = `Write tool completed${record.meta && record.meta.path ? ": " + oneLine(record.meta.path, 100) : ""}`;
+    } else if (record.kind === "ledger") {
+      text = `Ledger updated${record.summary ? ": " + oneLine(record.summary, 200) : ""}`;
+    } else if (["child_settled", "job_settled", "inbox_opened", "inbox_resolved", "interrupted", "session_end"].includes(record.kind)) {
+      text = activity;
+      const failed = record.outcome === "failed" || record.outcome === "budget_exhausted";
+      if (record.kind === "interrupted" || ((record.kind === "session_end" || record.kind === "child_settled") && failed)) tone = "bad";
+    }
+    if (text) changes.push({ seq: record.seq, ts: record.ts_ms, text, kind: record.kind, tone, fresh: sinceSeq !== null && record.seq > sinceSeq });
+  }
+  const plan = ledger.plan || [];
+  const claims = ledger.claims || [];
+  return {
+    activeSteps: plan.filter((s) => s.status === "doing"),
+    changes,
+    lastActivity,
+    pendingDecisions,
+    counts: {
+      planTotal: plan.length,
+      planDone: plan.filter((s) => s.status === "done").length,
+      claimsOpen: claims.filter((c) => c.status === "open").length,
+      claimsSupported: claims.filter((c) => c.status === "supported").length,
+      openObligations: (ledger.obligations || []).filter((o) => o.outcome === null || o.outcome === undefined).length,
+      pendingDecisions: pendingDecisions.length,
+      failedChecks,
+    },
+  };
+}
+
+/**
+ * The changes the overview lists: the latest `max`, newest first, split into those recorded since
+ * the previous visit and the rest. `total` says how many were recorded, so a cut is never silent.
+ */
+export function recentChanges(changes, max = 10) {
+  const all = changes || [];
+  const shown = all.slice(-max).reverse();
+  return { fresh: shown.filter((c) => c.fresh), earlier: shown.filter((c) => !c.fresh), shown: shown.length, total: all.length };
+}
+
+/** Progress over the steps still in the plan: a dropped step stays listed but is not counted. */
+export function planProgress(plan) {
+  const steps = (plan || []).filter((s) => s.status !== "dropped");
+  const done = steps.filter((s) => s.status === "done").length;
+  const doing = steps.filter((s) => s.status === "doing").length;
+  const label = `${done} of ${count(steps.length, "step")} done`;
+  return {
+    total: steps.length,
+    done,
+    doing,
+    segments: steps.map((s) => (s.status === "done" || s.status === "doing" ? s.status : "todo")),
+    label,
+    words: doing ? `${label}, ${doing} in progress` : label,
+  };
+}
+
+const STEP_WORDS = { todo: "To do", doing: "In progress", done: "Done", dropped: "Dropped" };
+export function stepWords(status) {
+  return STEP_WORDS[status] || String(status);
+}
+const STEP_ICON = { todo: "ring", doing: "half", done: "check", dropped: "cross" };
+export function stepIcon(status) {
+  return STEP_ICON[status] || "ring";
+}
+
+// ---------------------------------------------------------------------------------------------
+// Operator drafts and navigation
+
+/** Drafts stay in memory and are namespaced by the caller, e.g. session:<id> / inbox:<item-id>. */
+export function createDraftStore() { return new Map(); }
+export function getDraft(store, key) { return store.get(key) || ""; }
+export function setDraft(store, key, text) {
+  const value = String(text ?? "");
+  if (value) store.set(key, value);
+  else store.delete(key);
+  return value;
+}
+export function clearDraft(store, key) { return store.delete(key); }
+/** A completed request must not discard text edited while it was in flight. */
+export function clearDraftIfUnchanged(store, key, sentText) {
+  if (getDraft(store, key) !== sentText) return false;
+  store.delete(key);
+  return true;
+}
+
+/** A missing HTTP acknowledgement cannot undo an independently recorded delivery receipt. */
+export function sendFailure(state, message, { rejected = false } = {}) {
+  const previous = state || {};
+  const detail = oneLine(message || "The request did not return an acknowledgement.", 400);
+  if (Number.isInteger(previous.recordedSeq) && previous.recordedSeq >= 0) {
+    const delivered = previous.state === "delivered";
+    return {
+      ...previous,
+      state: delivered ? "delivered" : "queued",
+      text: `${delivered ? "Delivered to a model step" : "Message recorded"} · HTTP acknowledgement unavailable: ${detail}`,
+    };
+  }
+  return {
+    ...previous,
+    accepted: false,
+    state: rejected ? "failed" : "uncertain",
+    text: rejected ? `Message rejected: ${detail}` : `Sending could not be confirmed. Check the record before retrying. ${detail}`,
+  };
+}
+
+const SESSION_SECTIONS = new Set(["overview", "record", "evidence"]);
+export function sessionHash(session, section = "overview") {
+  return `#/s/${encodeURIComponent(session)}/${SESSION_SECTIONS.has(section) ? section : "overview"}`;
+}
+/** Decode identifiers after splitting the route so encoded punctuation remains part of an id. */
+export function parseRoute(hash) {
+  const parts = String(hash || "").replace(/^#/, "").split("/");
+  if (parts[1] === "inbox" && parts.length === 2) return { view: "inbox" };
+  if (parts[1] === "new" && parts.length === 2) return { view: "new" };
+  if (parts[1] !== "s" || !parts[2] || parts.length > 4) return { view: "empty" };
+  try {
+    const session = decodeURIComponent(parts[2]);
+    const section = parts[3] || "overview";
+    return SESSION_SECTIONS.has(section) ? { view: "session", session, section } : { view: "empty" };
+  } catch {
+    return { view: "empty" };
+  }
 }
 
 /** The dot in the left header: green, amber or red, and what the tooltip says. */
@@ -589,6 +960,7 @@ export const RELEASED_WORDS = "Closed by operator, goal not established";
 export function createRecordStore(session) {
   return {
     session,
+    records: new Map(), // raw, applied records for source-linked operator views
     next: 0, // the seq expected next
     ahead: new Map(), // records that arrived before their turn
     blocks: [],
@@ -674,6 +1046,7 @@ function base(rec) {
 }
 
 function step(store, rec) {
+  store.records.set(rec.seq, rec);
   switch (rec.kind) {
     case "user_message":
       push(store, { ...base(rec), kind: "user", text: rec.text || "" });
@@ -952,6 +1325,86 @@ export function nextRange(viewer, page = LINES_PAGE) {
   return { start, end: start + page - 1 };
 }
 
+/** The page before the loaded lines, or null when the output is loaded from its first line. */
+export function earlierRange(viewer, page = LINES_PAGE) {
+  if (viewer.chunks.length === 0 || viewer.first <= 1) return null;
+  return { start: Math.max(1, viewer.first - page), end: viewer.first - 1 };
+}
+
+/** Add the page that ends right before the loaded lines; any other page is refused. */
+export function applyEarlierLines(viewer, view) {
+  if (viewer.chunks.length === 0 || view.last !== viewer.first - 1 || view.first > view.last) return false;
+  viewer.chunks.unshift(view.text);
+  viewer.first = view.first;
+  viewer.total = view.total;
+  return true;
+}
+
+/** The lines of a `LinesView` text. The newline that ends the last line does not add a line. */
+export function splitLines(text) {
+  const s = String(text ?? "");
+  if (s === "") return [];
+  const lines = s.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+/** "line 1596" for one line, "lines 212–214" for several. */
+export function sourceRangeWords(start, end) {
+  return end > start ? `lines ${start}–${end}` : `line ${start}`;
+}
+
+/** What a "Go to line" entry means: {line}, or {error} with the sentence to show. */
+export function lineTarget(value, total) {
+  const text = String(value ?? "").trim();
+  const line = Number(text);
+  const max = total > 0 ? total : null;
+  if (!text || !Number.isSafeInteger(line) || line < 1 || (max !== null && line > max)) {
+    return { error: max !== null ? `Choose a line from 1 to ${num(max)}.` : "Choose a line number of 1 or more." };
+  }
+  return { line };
+}
+
+/**
+ * Literal search of line texts without regard to case: one {index, at, length} per matching line.
+ * Only the text of a line is searched, never its number. `at` is where the first match starts,
+ * or -1 when lower-casing changed the length of the line and the place cannot be given exactly.
+ * Case is folded without regard to the browser's language, so a search finds the same lines for
+ * every operator.
+ */
+export function findInLines(lines, query) {
+  const q = String(query ?? "").toLowerCase();
+  if (!q) return [];
+  const out = [];
+  (lines || []).forEach((line, index) => {
+    const text = String(line);
+    const lower = text.toLowerCase();
+    const at = lower.indexOf(q);
+    if (at >= 0) out.push({ index, at: lower.length === text.length ? at : -1, length: q.length });
+  });
+  return out;
+}
+
+/** The match after (`delta` 1) or before (-1) `current` among `total`, wrapping; -1 with none. */
+export function stepMatch(total, current, delta) {
+  if (!(total > 0)) return -1;
+  if (!(current >= 0 && current < total)) return delta < 0 ? total - 1 : 0;
+  return (current + (delta < 0 ? -1 : 1) + total) % total;
+}
+
+/**
+ * What "Copy reference" copies: the line the operator jumped to, else the cited range, else the
+ * loaded range, with the producing session and call when they are known.
+ */
+export function viewerReference(viewer) {
+  const s = viewer.source || {};
+  const [first, last] = viewer.target ? [viewer.target, viewer.target]
+    : s.citeStart ? [s.citeStart, s.citeEnd || s.citeStart]
+      : [viewer.first, viewer.last];
+  const from = s.session ? ` (${s.session}${s.call ? ", call " + s.call : ""})` : "";
+  return `out:${viewer.blob} ${sourceRangeWords(first, last)}${from}`;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Context view
 
@@ -1012,7 +1465,8 @@ export function windowRows(w, { hideFolded = false } = {}) {
 export function ledgerModel(view) {
   const s = (view && view.state) || {};
   const evById = new Map((s.evidence || []).map((e) => [e.id, e]));
-  const lines = (e) => (Array.isArray(e.lines) ? `lines ${e.lines[0]}–${e.lines[1]}` : "");
+  const range = (e) => (Array.isArray(e.lines) && e.lines[0] >= 1 && e.lines[1] >= e.lines[0] ? [e.lines[0], e.lines[1]] : null);
+  const lines = (e) => (range(e) ? sourceRangeWords(...range(e)) : "");
   const n = (view && view.skipped) || 0;
   const ahead = (view && view.ahead_of_head) || 0;
   const notices = [];
@@ -1041,9 +1495,11 @@ export function ledgerModel(view) {
         attested: !!e.attested,
         quote: e.quote || "",
         blob: e.blob || null,
+        range: range(e),
         lines: lines(e),
         note: e.note || "",
         call_id: e.call_id,
+        session: e.session || null,
       })),
     })),
     obligations: (s.obligations || []).filter((o) => o.outcome === null || o.outcome === undefined).map((o) => ({ id: o.id, kind: o.kind, text: o.text })),
@@ -1155,6 +1611,39 @@ export function rulesHint(ledgerError) {
 const STEP_MARK = { todo: "○", doing: "◐", done: "●", dropped: "✕" };
 export function stepMark(status) {
   return STEP_MARK[status] || "?";
+}
+
+const CLAIM_WORDS = { open: "Open", supported: "Supported", refuted: "Refuted", withdrawn: "Withdrawn" };
+export function claimStatusWords(status) {
+  return CLAIM_WORDS[status] || String(status);
+}
+
+/** The filters of the Evidence view, each with its count. Withdrawn is offered only when used. */
+export function claimFilters(claims) {
+  const list = claims || [];
+  const n = (status) => list.filter((c) => c.status === status).length;
+  const filters = [{ key: "all", label: "All", count: list.length }];
+  for (const status of ["open", "supported", "refuted"]) filters.push({ key: status, label: CLAIM_WORDS[status], count: n(status) });
+  if (n("withdrawn")) filters.push({ key: "withdrawn", label: CLAIM_WORDS.withdrawn, count: n("withdrawn") });
+  return filters;
+}
+/** The claims a filter shows. A filter that is no longer offered shows every claim. */
+export function filterClaims(claims, key) {
+  const list = claims || [];
+  return claimFilters(list).some((f) => f.key === key && f.key !== "all") ? list.filter((c) => c.status === key) : [...list];
+}
+
+/**
+ * The two facts an evidence item carries, kept apart: whether the runtime found its quote in the
+ * stored output, and which way the agent says it points. Neither is verification. The runtime
+ * refuses a quote that does not match, so an unattested item is one it did not check.
+ */
+export function evidenceStanding(evidence) {
+  const quote = !evidence.quote ? { tone: "dim", icon: null, text: "No quote recorded" }
+    : evidence.attested ? { tone: "ok", icon: "check", text: "Quote matches stored output" }
+      : { tone: "warn", icon: "alert", text: "Quote not checked against stored output" };
+  const direction = evidence.supports ? { tone: "", text: "Supports" } : { tone: "bad", text: "Undermines" };
+  return { quote, direction };
 }
 
 export function netRow(e) {
