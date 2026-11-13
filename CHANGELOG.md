@@ -30,9 +30,18 @@
 - Archiving a mission deletes its agents' copies, including changes that were never adopted.
 - `meta.json` of an agent in a copy has `copy_of`; older daemons ignore it.
 
+### Morale: keeping a model on a hard task
+
+- New tools for a stuck model, neither a finish nor a claim that the work cannot be done. `ask_for`
+  (lead: `core` `lead`, `vr` `researcher`, `ctf` `dispatcher`) asks the operator for budget, a tool, a
+  hint or direction without ending the turn. `hand_off` (`core` `worker`, `vr` `scout`, the `ctf`
+  solvers) returns an assignment unfinished with its state, open leads and an ask; it settles the child
+  as `returned`, and an ask for `stronger_model` selects the role's `escalation_model` next time.
+  `ctf` `binary_solver` now has 26 tools. Installed packs under `~/.loom/packs` are not updated by an upgrade.
+
 ### Domain packs and evaluation
 
-- Added opt-in CTF and Redteam packs with specialist tool surfaces (CTF roles at most 25 per role,
+- Added opt-in CTF and Redteam packs with specialist tool surfaces (CTF roles at most 26 per role,
   Redteam at most 18), bounded epochs, credential-gated lateral assignments, observers and
   operator-contract judges. Existing installed packs and running session prefixes are not
   automatically replaced.

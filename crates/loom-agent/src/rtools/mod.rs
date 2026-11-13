@@ -7,7 +7,7 @@
 //! - [`ledger`]   `plan`, `step`, `note`, `claim`, `claim_update`, `evidence`, `ledger`
 //! - [`misc`]     `pin`, `log_search`
 //! - [`scope`]    `request_scope`
-//! - [`terminal`] `finish`, `verdict`, `ask_user`, `report_blocker`, `wait`, `conclude`
+//! - [`terminal`] `finish`, `verdict`, `ask_user`, `ask_for`, `hand_off`, `report_blocker`, `wait`, `conclude`
 //! - [`agents`]   `agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`, `agent_stop`,
 //!   `decide`, `verify`
 //!
@@ -479,6 +479,8 @@ pub fn tool(name: &str, shared: &Arc<Shared>) -> Option<Arc<dyn loom_tools::Tool
         "finish" => Arc::new(terminal::Finish(s)),
         "verdict" => Arc::new(terminal::Verdict(s)),
         "ask_user" => Arc::new(terminal::AskUser(s)),
+        "ask_for" => Arc::new(terminal::AskFor(s)),
+        "hand_off" => Arc::new(terminal::HandOff(s)),
         "report_blocker" => Arc::new(terminal::ReportBlocker(s)),
         "wait" => Arc::new(terminal::Wait(s)),
         "request_scope" => Arc::new(scope::RequestScope(s)),
@@ -539,6 +541,8 @@ pub const NAMES: &[&str] = &[
     "finish",
     "verdict",
     "ask_user",
+    "ask_for",
+    "hand_off",
     "report_blocker",
     "wait",
     "conclude",

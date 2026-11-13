@@ -18,7 +18,7 @@ tools = [
   "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search",
   "cve_lookup", "cve_search", "advisory_lookup",
   "agent_spawn", "agent_fanout", "attempt", "agent_adopt", "agent_message", "agent_stop", "decide", "verify",
-  "request_scope", "conclude", "finish", "ask_user", "report_blocker", "wait",
+  "request_scope", "conclude", "finish", "ask_user", "report_blocker", "wait", "ask_for",
 ]
 
 # One experiment per scout: one hypothesis, one input, one observation, the smallest harness that
@@ -31,7 +31,7 @@ tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
   "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search",
   "cve_lookup", "advisory_lookup",
-  "request_scope", "conclude", "finish", "report_blocker", "wait",
+  "request_scope", "conclude", "finish", "report_blocker", "wait", "hand_off",
 ]
 
 # The independent check. Checks a proposed scope against the page that authorizes it, and refutes a

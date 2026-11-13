@@ -161,6 +161,64 @@ pub fn agent_message(text: &str) -> String {
     format!("Message from the agent that assigned this work:\n{text}")
 }
 
+/// The question an `ask_for` records and shows the operator. `label` is the kind's wording ("more budget").
+pub fn ask_for_question(label: &str, what: &str, why: &str) -> String {
+    format!("{}{what} — why: {why}", ask_for_question_prefix(label))
+}
+
+/// What every question of one `ask_for` kind starts with.
+pub fn ask_for_question_prefix(label: &str) -> String {
+    format!("Asks for {label}: ")
+}
+
+/// Added to the operator's copy of a budget ask: what actually renews a root session's budget.
+pub fn ask_for_budget_route(session: &str) -> String {
+    format!("To grant budget: a session whose budget is used up gets a fresh budget of its configured size, counted from that moment, when you restart it (`loom resume {session}`, `POST /api/sessions/{session}/resume`, or answering its parked inbox item). Nothing raises a budget that is not yet used up; answer this item to reply meanwhile.")
+}
+
+/// `ask_for` was recorded.
+pub fn ask_for_asked(label: &str, qid: Option<&str>) -> String {
+    let id = qid.map(|q| format!(" ({q})")).unwrap_or_default();
+    format!("Asked the operator for {label}{id}. This is not a finish and does not pause the work: carry on with what you said you would do meanwhile. The answer arrives as a message.")
+}
+
+/// A second `ask_for` of a kind whose earlier ask is unanswered.
+pub fn ask_for_already(label: &str, qid: Option<&str>) -> String {
+    let id = qid.map(|q| format!(" ({q})")).unwrap_or_default();
+    format!("Already asked for {label}{id}; it is still open. Carry on meanwhile.")
+}
+
+/// `ask_for` in a child session.
+pub fn ask_for_in_child(has_hand_off: bool) -> String {
+    let mut text = "`ask_for` is for the lead.".to_string();
+    if has_hand_off {
+        text.push_str(" An agent working on an assignment uses `hand_off` to return the work with what it needs.");
+    }
+    text
+}
+
+/// `hand_off` in a lead session.
+pub fn hand_off_in_root(has_ask_for: bool) -> String {
+    let mut text = "`hand_off` returns an assignment to the agent that gave it; this session has none.".to_string();
+    if has_ask_for {
+        text.push_str(" If you are stuck, use `ask_for`.");
+    }
+    text
+}
+
+/// What `hand_off` answers once the assignment is returned.
+pub const HAND_OFF_DELIVERED: &str =
+    "The assignment was handed back with your state and leads. This session is finished.";
+
+/// The report a parent reads for a child that handed its assignment back. `ask_label` is the wording of the ask.
+pub fn hand_off_report(ask_label: &str, state: &str, leads: &[String], why: &str) -> String {
+    let leads: Vec<String> = leads.iter().map(|l| format!("- {}", loom_core::tagsafe::hang_lines(l))).collect();
+    format!(
+        "HANDED OFF — this agent is not done, and it has not concluded that the work cannot be done. It asks for {ask_label}.\nWhere it stands:\n{state}\nOpen leads:\n{}\nWhy: {why}",
+        leads.join("\n")
+    )
+}
+
 /// A standing rule from the operator. `id` is its ledger id when the mission has a ledger.
 pub fn constraint(id: Option<&str>, text: &str) -> String {
     let id = id.map(|i| format!(" ({i})")).unwrap_or_default();
