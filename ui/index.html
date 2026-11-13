@@ -31,6 +31,7 @@
       <button id="open-left" type="button" class="btn drawer-btn" aria-controls="left" aria-expanded="false">Missions</button>
       <span id="connection-state" class="connection-state" role="status">Connecting…</span>
       <span id="connection-updated" class="dim"></span>
+      <span id="s-speed" class="dim topbar-speed" title="generation speed of the open session: the latest reply, then the latest replies together; the wait for the first token is left out"></span>
       <span class="spacer"></span>
       <button id="open-right" type="button" class="btn drawer-btn" aria-controls="right" aria-expanded="false">Inspector</button>
     </div>
@@ -51,7 +52,6 @@
           <h1 id="s-title" class="stitle"></h1>
           <p id="s-goal" class="mission-goal"></p>
           <div id="s-standing" class="mission-status"></div>
-          <span id="s-speed" class="dim mission-speed" title="generation speed: the latest reply, then the latest replies together; the wait for the first token is left out"></span>
         </div>
         <div class="mission-actions">
           <button id="b-stop" type="button" class="btn danger" hidden>Stop</button>

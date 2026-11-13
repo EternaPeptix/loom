@@ -76,6 +76,13 @@ The header keeps the goal and current plan step visible at all supported widths.
 row of separate facts: what is waiting on the operator, how the lead (or agent) stands, and how many
 agents are running. A root session is called the lead only when its role is `lead`.
 
+The top bar carries the open session's generation speed next to the stream freshness, so a long goal
+cannot push it out of view: the latest reply's tokens per second, and — once there is more than one —
+the rate over the latest replies together. Each measures the tokens after the first over the time
+from the first streamed token to the end of the stream, so the wait for the first token is left out;
+a reply of fewer than two tokens, or one recorded before the daemon kept this timing, contributes
+none. The same figure is on every model reply's footer. It is blank off a session view.
+
 Overview is the default. Its main column holds the questions waiting on the operator, the recorded
 plan with a progress bar over the steps still in it, and recent activity. Its rail holds the agents
 (or, for an agent, the mission it is part of), the counts of claims and obligations, and the run

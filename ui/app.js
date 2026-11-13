@@ -389,6 +389,7 @@ function route() {
 function setView(v) {
   if (S.view === "session" && v !== "session") saveSeen();
   S.view = v;
+  if (v !== "session") $("s-speed").textContent = "";
   $("view-empty").hidden = v !== "empty";
   $("view-session").hidden = v !== "session";
   $("view-inbox").hidden = v !== "inbox";
