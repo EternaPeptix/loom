@@ -32,6 +32,7 @@ const S = {
   sessionsRevision: 0,
   sinceSeq: null,
   section: "overview",
+  claimFilter: "all", // which claims the Evidence view lists
   view: "empty", // empty | session | inbox | new
   openId: null,
   rec: null, // record store of the open session
@@ -75,11 +76,33 @@ function link(text, hash) {
   return a;
 }
 
-const MARKS = { running: "●", waiting: "◔", needs_you: "◆", result_ready: "◇", question: "?", stopped: "■", finished: "✓", failed: "✕", idle: "○" };
+// Icons are drawings kept in index.html and cloned here, so no markup is built from strings.
+function icon(name) {
+  const drawing = $("icons").content.querySelector(`[data-icon="${name}"]`);
+  return drawing ? drawing.cloneNode(true) : document.createTextNode("");
+}
 function markEl(mark) {
-  const m = el("span", "mark mark-" + mark, MARKS[mark] || "?");
+  const m = add(el("span", "mark mark-" + mark), icon(C.markIcon(mark)));
   m.title = C.markWords(mark);
   return m;
+}
+/** A small labelled fact. `tone` picks the colour; the icon and the words carry the meaning. */
+function pill(text, tone, iconName, cls = "pill") {
+  const p = el("span", cls + (tone ? ` ${cls}-${tone}` : ""));
+  if (iconName) p.append(icon(iconName));
+  p.append(document.createTextNode(text));
+  return p;
+}
+const chip = (text, tone, iconName) => pill(text, tone, iconName, "chip");
+/** The mark of a plan step: a drawing whose name is the status in words. */
+function stepMarkEl(status) {
+  const mark = add(el("span", "step-mark"), icon(C.stepIcon(status)));
+  mark.setAttribute("role", "img");
+  mark.setAttribute("aria-label", C.stepWords(status));
+  return mark;
+}
+function heading(tag, text, ...aside) {
+  return add(el("div", "section-heading"), el(tag, "", text), ...aside);
 }
 const clock = (ms) => new Date(ms).toLocaleTimeString();
 const ago = (ms) => { const age = C.age(Date.now(), ms); return age === "now" ? "just now" : age + " ago"; };
@@ -227,8 +250,11 @@ function renderList() {
     if (!group.rows.length) continue;
     const section = el("section", "mission-group");
     section.setAttribute("aria-label", group.label);
-    section.append(el("h2", "group-title", group.label));
-    for (const { info, depth, agentCount, expanded, attention } of group.rows) {
+    const missions = group.rows.filter((row) => !row.depth).length;
+    // The space is not drawn between the two ends of the heading; it keeps them two words when read out.
+    section.append(add(el("h2", "group-title"), el("span", "", group.label), document.createTextNode(" "), el("span", "group-count", String(missions))));
+    for (const row of group.rows) {
+      const { info, depth, agentCount, agentsRunning, expanded, attention } = row;
       const mark = C.stateMark(info, attention || inboxCount(info.id));
       const wrap = el("div", "mission-row");
       const a = el("a", `row d${Math.min(depth, 2)}${mark === "needs_you" ? " needs" : ""}${info.id === S.openId && S.view === "session" ? " sel" : ""}${info.archived ? " arch" : ""}`);
@@ -237,17 +263,19 @@ function renderList() {
       if (info.id === S.openId) a.setAttribute("aria-current", "page");
       const t = el("div", "t");
       add(t, markEl(mark), el("span", "name", info.title || info.id));
-      const last = S.latest.get(info.id);
-      add(a, t, el("div", "sub", C.rowActivity(info, last, S.now)));
+      add(a, t, el("div", "sub", C.rowSummary(row, S.latest.get(info.id), S.now)));
       a.title = info.title || info.id;
       wrap.append(a);
       if (!depth && agentCount) {
-        const toggle = btn(`${expanded ? "▾" : "▸"} ${agentCount} ${agentCount === 1 ? "agent" : "agents"}`, "link agent-toggle", () => {
+        const toggle = btn("", "link agent-toggle", () => {
           if (S.expanded.has(info.id)) S.expanded.delete(info.id); else S.expanded.add(info.id);
           want("list");
         });
+        const agents = C.count(agentCount, "agent") + (agentsRunning ? ` · ${agentsRunning} running` : "");
+        add(toggle, icon("chevron"), document.createTextNode(agents));
         toggle.setAttribute("aria-expanded", String(expanded));
-        toggle.setAttribute("aria-label", `${expanded ? "Collapse" : "Expand"} agents of ${info.title || info.id}`);
+        // The name starts with the visible words, so speech input can target what is on screen.
+        toggle.setAttribute("aria-label", `${agents} of ${info.title || info.id}`);
         toggle.dataset.focusKey = "agents:" + info.id;
         wrap.append(toggle);
       }
@@ -592,29 +620,19 @@ function renderHeader() {
     $("s-title").textContent = S.openId || "";
     return;
   }
-  const mark = C.stateMark(info, inboxCount(info.id));
+  $("s-eyebrow").textContent = info.parent ? `Agent · ${info.role}` : "Mission";
   $("s-title").textContent = info.title || info.id;
   $("s-title").title = info.id;
   $("s-goal").textContent = S.ledger.state?.goal || (info.parent ? "Agent assignment · messages go to the mission lead." : "Mission goal has not been recorded yet.");
   const currentStep = S.ledger.state?.plan?.find(step => step.status === "doing");
-  $("s-activity").textContent = currentStep ? "Current step: " + currentStep.text : C.rowActivity(info, S.latest.get(info.id), S.now);
-  const m = $("s-mark");
-  m.className = "mark mark-" + mark;
-  m.textContent = MARKS[mark];
-  let standing = C.markWords(mark);
-  if (mark === "needs_you") {
-    const phase = info.status?.phase === "running" ? "running" : info.status?.last_end === "stopped" ? "stopped" : info.status?.last_end === "waiting" ? "waiting" : "idle";
-    standing = `Needs your answer · ${info.parent ? "agent" : "lead"} ${phase}`;
-  }
-  if (!info.parent) {
-    const working = [...S.sessions.byId.values()].filter(child => child.mission === info.mission && child.parent && child.status?.phase === "running").length;
-    if (working) standing += ` · ${working} ${working === 1 ? "agent" : "agents"} running`;
-  }
-  $("s-words").textContent = standing;
-  $("s-step").textContent = `step ${(info.status && info.status.step) || 0}`;
-  const meter = C.statusMeter(info);
-  $("s-meter").firstElementChild.style.setProperty("width", meter.inViewPct + "%");
-  $("s-meter-label").textContent = meter.label;
+  const standing = C.missionStanding(info, inboxCount(info.id), info.parent ? 0 : missionAgents(info).filter(agent => agent.status?.phase === "running").length);
+  $("s-standing").replaceChildren(
+    ...standing.pills.map(p => pill(p.text, p.tone, p.icon)),
+    el("span", "dim", currentStep ? "Current step: " + currentStep.text : C.rowActivity(info, S.latest.get(info.id), S.now)),
+  );
+  const openClaims = (S.ledger.state?.claims || []).filter(claim => claim.status === "open").length;
+  $("evidence-count").textContent = `${openClaims} open`;
+  $("evidence-count").hidden = openClaims === 0;
   const a = C.sessionActions(info);
   $("b-stop").hidden = !a.stop;
   $("b-resume").hidden = !a.resume;
@@ -625,7 +643,13 @@ function renderHeader() {
   const closed = $("closed-note");
   closed.hidden = !!info.parent || a.send;
   closed.textContent = info.archived ? "This session is archived; unarchive it to send messages." : "This session has ended.";
-  $("send").textContent = a.running ? "Send (delivered between steps)" : "Send";
+  $("send").textContent = "Send";
+  // A message is not an answer: say so while a question of this mission waits on the operator.
+  const paused = missionEntries().some(entry => entry.item.blocking);
+  const lead = C.rootNoun(info) === "lead";
+  $("composer-help").textContent = "Enter sends · Shift+Enter adds a line."
+    + (paused ? " A message does not answer the open question." : "") + (a.running ? (lead ? " It reaches the lead between steps." : " It is read between steps.") : "");
+  $("composer-help").hidden = !a.send;
   let action = S.actionState.get(info.id);
   if (action?.accepted && ((action.name === "stop" && !a.stop) || (action.name === "resume" && a.running) || (action.name === "archive" && info.archived === action.archived))) {
     S.actionState.delete(info.id); action = null;
@@ -635,7 +659,7 @@ function renderHeader() {
     button.disabled = !!action;
     button.textContent = action?.name === name ? action.label : label;
   }
-  $("composer-recipient").textContent = `Message to: ${info.title || info.id}`;
+  $("composer-recipient").textContent = a.send ? `Message to ${lead ? "the lead of " : ""}${info.title || info.id}` : "";
   const sending = S.sending.has(info.id);
   const message = S.messageState.get(info.id);
   const pendingReceipt = message?.accepted && message.recordedSeq === undefined && message.state !== "failed";
@@ -651,18 +675,38 @@ function missionEntries() {
   return [...S.inbox.items.values()].filter(e => e.mission === info?.mission || e.session === S.openId);
 }
 
+/** The agents of a mission, oldest first. */
+function missionAgents(info) {
+  return [...S.sessions.byId.values()]
+    .filter(s => s.mission === info.mission && s.parent)
+    .sort((a, b) => a.created_ms - b.created_ms || (a.id < b.id ? -1 : 1));
+}
+
 function renderOverview() {
   if (S.view !== "session" || !S.rec) return;
   const panel = $("mission-overview");
   if (!panel.firstElementChild) {
-    panel.append(el("div", "overview-decisions"), el("section", "overview-section overview-plan"), el("section", "overview-section overview-changes"));
+    const main = add(el("div", "overview-main"), el("div", "overview-decisions"), el("section", "overview-section overview-plan"), el("section", "overview-section overview-changes"));
+    const rail = el("aside", "overview-rail");
+    rail.setAttribute("aria-label", "Mission standing");
+    panel.append(add(el("div", "overview-layout"), main, rail));
   }
   const entries = missionEntries();
   const model = C.missionOverview(S.rec.records.values(), S.ledger.state, entries, S.sinceSeq);
   reconcileInbox(panel.querySelector(".overview-decisions"), entries.filter(e => e.item.item_kind !== "finished"), "overview");
-  const plan = panel.querySelector(".overview-plan");
+  for (const [selector, build] of [[".overview-plan", planSection], [".overview-changes", changesSection], [".overview-rail", railSection]]) {
+    const box = panel.querySelector(selector);
+    const body = build(model);
+    preserveFocus(box, () => box.replaceChildren(body));
+  }
+  if (S.section === "evidence") renderEvidence($("mission-evidence"));
+}
+
+function planSection() {
   const body = document.createDocumentFragment();
-  body.append(el("h2", "section-heading", "Current plan"));
+  const steps = S.ledger.state?.plan || [];
+  const progress = C.planProgress(steps);
+  body.append(heading("h2", "Plan", progress.total ? el("span", "dim", progress.label) : null));
   if (S.rec.error) {
     body.append(el("p", "error", "The record could not be loaded: " + S.rec.error));
     const retry = btn("Retry loading the record", "", () => loadRecords(S.rec, 0));
@@ -670,40 +714,100 @@ function renderOverview() {
   }
   if (S.ledger.error) body.append(el("p", "error", "Mission state could not be refreshed: " + S.ledger.error));
   if (S.ledger.stale && S.ledger.state) body.append(el("p", "warn", "Showing the last recorded mission state; refreshing…"));
-  const steps = S.ledger.state?.plan || [];
-  if (!steps.length) body.append(el("p", "dim", S.ledger.model ? "The lead has not recorded a plan yet." : "Loading mission state…"));
+  if (!steps.length) {
+    body.append(el("p", "dim", S.ledger.model ? "No plan has been recorded yet." : "Loading mission state…"));
+    return body;
+  }
+  if (progress.total) {
+    const bar = el("div", "plan-progress");
+    bar.setAttribute("role", "img");
+    bar.setAttribute("aria-label", progress.words);
+    for (const segment of progress.segments) bar.append(el("span", "seg seg-" + segment));
+    body.append(bar);
+  }
+  const list = el("ol", "plan-list");
   for (const step of steps) {
-    const row = el("div", "plan-step");
-    const mark = el("span", "mark", C.stepMark(step.status));
-    mark.setAttribute("aria-label", step.status);
-    const content = el("div");
-    add(content, el("div", "", step.text), step.note ? el("p", "dim", step.note) : null);
-    row.append(mark, content); body.append(row);
+    const line = add(el("div", "step-text"), el("span", "", step.text), step.status === "doing" ? pill("Now", "info") : null);
+    list.append(add(el("li", "plan-step step-" + step.status), stepMarkEl(step.status), add(el("div"), line, step.note ? el("p", "dim", step.note) : null)));
+  }
+  body.append(list);
+  return body;
+}
+
+function changesSection(model) {
+  const body = document.createDocumentFragment();
+  const record = link("Open full record", C.sessionHash(S.openId, "record"));
+  record.dataset.focusKey = "overview-record";
+  body.append(heading("h2", "Recent activity", record));
+  const recent = C.recentChanges(model.changes);
+  if (S.rec.loading) body.append(el("p", "dim", "Loading the record…"));
+  else if (!recent.total) body.append(el("p", "dim", "No activity has been recorded yet."));
+  else if (S.sinceSeq !== null && !recent.fresh.length) body.append(el("p", "dim", "Nothing new has been recorded since your last visit."));
+  const group = (label, changes) => {
+    if (!changes.length) return;
+    if (label) body.append(el("h3", "change-group" + (changes[0].fresh ? " fresh" : ""), label));
+    const list = el("ul", "change-list");
+    for (const change of changes) {
+      const when = el("time", "dim", change.ts ? ago(change.ts) : "");
+      if (change.ts) when.dateTime = new Date(change.ts).toISOString();
+      const jump = btn(change.text, "link", () => jumpToRecord(change.seq));
+      jump.dataset.focusKey = "change:" + change.seq;
+      list.append(add(el("li", "change-item" + (change.tone ? " " + change.tone : "")), when, jump));
+    }
+    body.append(list);
+  };
+  group(recent.fresh.length ? "New since your last visit" : null, recent.fresh);
+  group(recent.fresh.length && recent.earlier.length ? "Earlier" : null, recent.earlier);
+  if (recent.total > recent.shown) body.append(el("p", "dim fineprint", `Showing the latest ${recent.shown} of ${C.num(recent.total)} recorded changes.`));
+  body.append(el("p", "dim fineprint", "Activity is derived from recorded events. Completed steps and matching quotes do not by themselves establish a claim."));
+  return body;
+}
+
+function sessionLink(s) {
+  const mark = C.stateMark(s, inboxCount(s.id));
+  const a = el("a", "rail-session");
+  a.setAttribute("href", C.sessionHash(s.id));
+  a.dataset.focusKey = "rail:" + s.id;
+  return add(a, markEl(mark), add(el("span", "rail-session-text"), el("span", "name", s.title || s.id), el("span", "dim", `${s.role} · ${C.markWords(mark)} · step ${s.status?.step || 0}`)));
+}
+
+/** The right rail of the overview: who is working, what is unsettled, and what the run has used. */
+function railSection(model) {
+  const body = document.createDocumentFragment();
+  const info = S.sessions.byId.get(S.openId);
+  if (!info) return body;
+  const card = (title, ...kids) => add(el("section", "rail-card"), el("h3", "", title), ...kids);
+  if (info.parent) {
+    const lead = [...S.sessions.byId.values()].find(s => s.mission === info.mission && !s.parent);
+    if (lead) body.append(card("Part of", sessionLink(lead)));
+  } else {
+    const agents = missionAgents(info);
+    if (agents.length) body.append(card("Agents", ...agents.map(sessionLink)));
   }
   if (S.ledger.state) {
-    const outstanding = el("p", "dim", `${model.counts.claimsOpen} open claims · ${model.counts.openObligations} open obligations`);
-    body.append(outstanding);
+    const stats = el("dl", "rail-stats");
+    for (const [value, label] of [
+      [model.counts.claimsOpen, model.counts.claimsOpen === 1 ? "open claim" : "open claims"],
+      [model.counts.claimsSupported, "supported"],
+      [model.counts.openObligations, model.counts.openObligations === 1 ? "open obligation" : "open obligations"],
+    ]) stats.append(add(el("div", "stat"), el("dt", "", label), el("dd", "", C.num(value))));
     const inspect = btn("Review claims and evidence", "link", () => setSection("evidence"));
     inspect.dataset.focusKey = "overview-evidence";
-    body.append(inspect);
+    body.append(card("Claims and obligations", stats, inspect));
   }
-  preserveFocus(plan, () => plan.replaceChildren(body));
-  const changes = panel.querySelector(".overview-changes");
-  const history = document.createDocumentFragment();
-  history.append(el("h2", "section-heading", S.sinceSeq === null ? "Recent recorded activity" : "Since your last visit"));
-  if (S.rec.loading) history.append(el("p", "dim", "Loading the record…"));
-  else if (!model.changes.length) history.append(el("p", "dim", S.sinceSeq === null ? "No activity has been recorded yet." : "No new activity has been recorded since your last visit."));
-  for (const change of model.changes.slice(-10).reverse()) {
-    const row = el("div", "change-item");
-    const when = el("time", "dim", change.ts ? ago(change.ts) : "");
-    if (change.ts) when.dateTime = new Date(change.ts).toISOString();
-    const jump = btn(change.text, "link", () => jumpToRecord(change.seq));
-    jump.dataset.focusKey = "change:" + change.seq;
-    add(row, when, jump); history.append(row);
-  }
-  history.append(el("p", "dim", "Activity is derived from recorded events. Completed steps and matching quotes do not by themselves establish a claim."));
-  preserveFocus(changes, () => changes.replaceChildren(history));
-  if (S.section === "evidence") renderEvidence($("mission-evidence"));
+  const st = info.status || {};
+  const meter = C.statusMeter(info);
+  const bar = add(el("span", "meter"), el("span", "fill"));
+  bar.firstElementChild.style.setProperty("width", meter.inViewPct + "%");
+  bar.setAttribute("role", "img");
+  bar.setAttribute("aria-label", `Last prompt ${meter.label} tokens`);
+  const row = (label, value) => add(el("div", "rail-row"), el("span", "dim", label), el("span", "", value));
+  body.append(card("Run",
+    row("Last prompt", meter.label), bar,
+    row("Cached prefix", C.cachedShare(st.cached_tokens || 0, st.prompt_tokens || 0) || "n/a"),
+    row(info.parent ? "Agent step" : C.rootNoun(info) === "lead" ? "Lead step" : "Step", C.num(st.step || 0)),
+    el("p", "dim fineprint", "Run numbers describe effort, not completion.")));
+  return body;
 }
 
 function jumpToRecord(seq) {
@@ -721,35 +825,81 @@ function jumpToRecord(seq) {
 
 function renderEvidence(panel) {
   const frag = document.createDocumentFragment();
-  frag.append(el("h2", "section-heading", "Claims and source evidence"));
-  frag.append(el("p", "dim", "Quote matching checks stored text. Claim status is recorded by the agent; it is separate from independent verification."));
+  const claims = S.ledger.model?.claims || [];
+  const filters = el("div", "filters");
+  filters.setAttribute("role", "group");
+  filters.setAttribute("aria-label", "Filter claims by recorded status");
+  if (claims.length) {
+    for (const filter of C.claimFilters(claims)) {
+      const chosen = filter.key === S.claimFilter;
+      const b = btn("", "small filter", () => { S.claimFilter = filter.key; renderEvidence(panel); });
+      add(b, document.createTextNode(filter.label + " "), el("span", "dim", C.num(filter.count)));
+      b.setAttribute("aria-pressed", String(chosen));
+      b.dataset.focusKey = "claim-filter:" + filter.key;
+      filters.append(b);
+    }
+  }
+  frag.append(heading("h2", "Claims and source evidence", claims.length ? filters : null));
+  const about = el("p", "dim evidence-about");
+  add(about, document.createTextNode("Two separate checks appear below. "), el("strong", "", "Quote match"),
+    document.createTextNode(" means the runtime found the quoted text in the stored output. "), el("strong", "", "Claim status"),
+    document.createTextNode(" is what the agent recorded. Neither is independent verification."));
+  frag.append(about);
   if (S.ledger.error) frag.append(el("p", "error", S.ledger.error));
   if (!S.ledger.model) frag.append(el("p", "dim", "Loading mission evidence…"));
-  else if (!S.ledger.model.claims.length) frag.append(el("p", "dim", "No claims have been recorded yet."));
-  for (const claim of S.ledger.model?.claims || []) {
-    const section = el("section", "evidence-claim");
-    section.append(el("h3", "", claim.text), el("p", "dim", `${claim.id} · recorded status: ${claim.status}`));
-    if (claim.note) section.append(el("p", "", claim.note));
+  else if (!claims.length) frag.append(el("p", "dim", "No claims have been recorded yet."));
+  const shown = C.filterClaims(claims, S.claimFilter);
+  if (claims.length && !shown.length) frag.append(el("p", "dim", "No claims have this status."));
+  for (const claim of shown) {
+    const section = el("article", "evidence-claim");
+    section.append(add(el("div", "chips"),
+      chip(C.claimStatusWords(claim.status), "status-" + claim.status), el("span", "mono dim", claim.id), el("span", "dim", "status recorded by the agent")));
+    section.append(el("h3", "", claim.text));
+    if (claim.note) section.append(el("p", "claim-note", claim.note));
     if (!claim.evidence.length) section.append(el("p", "dim", "No source evidence attached."));
     for (const evidence of claim.evidence) section.append(evidenceCard(evidence));
+    frag.append(section);
+  }
+  const obligations = S.ledger.model?.obligations || [];
+  if (obligations.length) {
+    const section = el("section", "overview-section");
+    section.append(heading("h2", "Open obligations"));
+    const list = el("ul", "obligation-list");
+    for (const o of obligations) list.append(add(el("li"), el("span", "mono dim", o.id), chip(o.kind.replace(/_/g, " "), "dim"), el("span", "", o.text)));
+    section.append(list);
     frag.append(section);
   }
   preserveFocus(panel, () => panel.replaceChildren(frag));
 }
 
+/** One evidence item, in the Evidence view and in the inspector's ledger. */
 function evidenceCard(evidence) {
   const card = el("div", "ev" + (evidence.supports ? "" : " no"));
-  card.append(el("div", "dim", `${evidence.attested ? "Quote matches stored output" : "Quote not attested"} · ${evidence.supports ? "supports" : "undermines"} · ${evidence.kind}`));
+  const standing = C.evidenceStanding(evidence);
+  card.append(add(el("div", "chips"),
+    chip(standing.quote.text, standing.quote.tone, standing.quote.icon), chip(standing.direction.text, standing.direction.tone), chip(evidence.kind, "dim")));
   if (evidence.quote) card.append(textBox(evidence.quote, "txt out"));
-  if (evidence.blob) {
-    const lines = /lines (\d+)–(\d+)/.exec(evidence.lines || "");
-    const start = lines ? Number(lines[1]) : 1;
-    const end = lines ? Number(lines[2]) : start;
-    const source = btn(`${evidence.blob.slice(0, 16)} · ${evidence.lines || "source output"}`, "link evidence-source", () => openViewer(evidence.blob, "Source evidence", null, { start: Math.max(1, start - 3), end: Math.max(end + 3, start + 12), citeStart: start, citeEnd: end, session: evidence.session, call: evidence.call_id }));
-    source.dataset.focusKey = "evidence:" + evidence.id;
-    card.append(source);
+  const producer = evidence.session ? S.sessions.byId.get(evidence.session) : null;
+  const tool = evidence.session === S.openId ? S.rec?.calls.get(evidence.call_id)?.name : null;
+  const from = el("span", "dim ev-from");
+  if (evidence.session) {
+    add(from, document.createTextNode("from "), tool ? el("code", "", tool) : document.createTextNode(evidence.call_id ? "call " + evidence.call_id : "a call"),
+      document.createTextNode(" in "), link(producer?.title || evidence.session, C.sessionHash(evidence.session, "record")));
   }
-  if (evidence.note) card.append(el("p", "dim", evidence.note));
+  if (evidence.blob) {
+    const [start, end] = evidence.range || [1, 1];
+    const source = btn("", "small evidence-source", (e) => openViewer(evidence.blob, "Source evidence", null, {
+      start: Math.max(1, start - 3), end: Math.max(end + 3, start + 12),
+      citeStart: evidence.range ? start : null, citeEnd: evidence.range ? end : null,
+      session: evidence.session, call: evidence.call_id, tool, producer: producer?.title || null,
+    }, e.currentTarget));
+    add(source, icon("source"), document.createTextNode(evidence.range ? "Open source at " + evidence.lines : "Open stored source"));
+    source.dataset.focusKey = "evidence:" + evidence.id;
+    card.append(add(el("div", "ev-source"), source, evidence.session ? from : null));
+  } else {
+    card.append(add(el("div", "ev-source"), el("span", "dim", "No stored source is attached to this item."), evidence.session ? from : null));
+  }
+  if (evidence.note) card.append(el("p", "ev-note", evidence.note));
   return card;
 }
 
@@ -822,13 +972,13 @@ function buildBlock(b) {
       add(h, el("strong", "", `agent ${C.outcomeWords(b.outcome)}`), link(b.child, "#/s/" + encodeURIComponent(b.child)), el("span", "dim", `${b.steps} steps`));
       add(root, h);
       add(root, collapsible(b, "report", b.report, 24));
-      if (b.full) add(root, btn("open full report", "link", () => openViewer(b.full.id, "Full report")));
+      if (b.full) add(root, btn("open full report", "link", (e) => openViewer(b.full.id, "Full report", null, {}, e.currentTarget)));
       break;
     }
     case "line": {
       root.classList.add(b.tone === "warn" ? "warn" : "dimline");
       root.textContent = b.text;
-      if (b.blob) add(root, btn("open output", "link", () => openViewer(b.blob.id, "Job output")));
+      if (b.blob) add(root, btn("open output", "link", (e) => openViewer(b.blob.id, "Job output", null, {}, e.currentTarget)));
       break;
     }
     case "reweave": {
@@ -846,9 +996,9 @@ function buildBlock(b) {
       break;
     }
     case "inbox": {
-      root.classList.add("block-inbox");
+      root.classList.add("block-inbox", b.item.blocking ? "decision-card" : "informational");
       if (b.resolved) root.classList.add("done");
-      add(root, inboxCard({ session: S.openId, item: b.item, opened_ms: b.ts }, b.resolved || S.answered.get(b.item.item_id)));
+      add(root, inboxCard({ session: S.openId, title: S.sessions.byId.get(S.openId)?.title, item: b.item, opened_ms: b.ts }, b.resolved || S.answered.get(b.item.item_id), "record"));
       break;
     }
     case "divider":
@@ -910,7 +1060,7 @@ function buildTool(root, b) {
     if (s.words || s.blob) {
       const note = el("div", "tnote" + (s.cut ? " cutline" : ""));
       add(note, document.createTextNode(s.words ? s.words + " " : ""));
-      if (s.blob) add(note, btn("open full output", "link", () => openViewer(s.blob, `Full output of ${b.name}`, s.total)));
+      if (s.blob) add(note, btn("open full output", "link", (e) => openViewer(s.blob, `Full output of ${b.name}`, s.total, {}, e.currentTarget)));
       add(body, note);
     }
   } else if (b.state === "missing") {
@@ -1036,17 +1186,31 @@ function oneLineArgs(s) {
 // ---------------------------------------------------------------------------------------------
 // Inbox cards and view
 
-function inboxCard(entry, resolved) {
+/**
+ * One inbox item. `context` is where the card is shown: "inbox" (every mission), "overview" (the
+ * open mission) or "record" (the open session). Nothing is sent until the operator presses the
+ * submit button: a suggested answer only fills the draft.
+ */
+function inboxCard(entry, resolved, context = "inbox") {
   const item = entry.item;
   const key = "inbox:" + item.item_id;
+  const result = item.item_kind === "finished";
   const card = el("div", "inbox-card");
   card.dataset.answerItem = item.item_id;
   const h = el("div", "ih");
-  add(h, el("span", "kind", item.item_kind === "finished" ? "Result ready" : C.inboxKindWords(item.item_kind)));
-  add(h, el("span", item.blocking ? "warn" : "dim", item.blocking ? "Needs an answer" : item.item_kind === "finished" ? "Review when ready" : "Work can continue"));
-  if (entry.title) add(h, link(entry.title, C.sessionHash(entry.session)));
-  if (entry.opened_ms) { const time = el("time", "dim", ago(entry.opened_ms)); time.dataset.opened = String(entry.opened_ms); time.dateTime = new Date(entry.opened_ms).toISOString(); h.append(time); }
-  add(card, h, textBox(item.text, "txt prose-text"));
+  add(h, el("span", "kind", result ? "Result ready" : C.inboxKindWords(item.item_kind)));
+  add(h, el("span", item.blocking ? "state" : "dim", item.blocking ? "Needs your answer" : result ? "Review when ready" : "Work can continue"));
+  // A card shown inside its own session needs no link back to where the operator already is.
+  if (entry.title && (context === "inbox" || entry.session !== S.openId)) add(h, link(entry.title, C.sessionHash(entry.session)));
+  if (entry.opened_ms) {
+    const asker = S.sessions.byId.get(entry.session);
+    const time = el("time", "", ago(entry.opened_ms));
+    time.dataset.opened = String(entry.opened_ms);
+    time.dateTime = new Date(entry.opened_ms).toISOString();
+    add(h, add(el("span", "dim"), document.createTextNode(result ? "" : "asked "), time,
+      document.createTextNode(result || !asker ? "" : asker.parent ? " by an agent" : C.rootNoun(asker) === "lead" ? " by the lead" : "")));
+  }
+  add(card, h, textBox(item.text, "txt prose-text item-text"));
   if (resolved) {
     const given = el("div", "given");
     add(given, el("div", "label", resolved.answer === "" ? "Dismissed" : "Answered"));
@@ -1071,7 +1235,7 @@ function inboxCard(entry, resolved) {
       if (C.clearDraftIfUnchanged(S.drafts, key, answer)) setDraft(key, "");
       updateInboxBadge();
       await loadInbox();
-      if (document.contains(card)) card.replaceChildren(inboxCard(entry, { answer }));
+      if (document.contains(card)) card.replaceWith(inboxCard(entry, { answer }, context));
     } catch (e) {
       err.textContent = e.message;
       err.hidden = false;
@@ -1080,52 +1244,88 @@ function inboxCard(entry, resolved) {
       syncAnswerState(item.item_id);
     }
   };
-  if (item.item_kind === "finished") {
-    form.append(btn("Dismiss result", "answer-submit", () => send("")));
+  const foot = el("div", "answer-foot");
+  const words = el("div", "answer-words");
+  if (result) {
+    add(words, el("span", "dim", "Dismissing removes it from the inbox; the result stays in the record."));
+    add(foot, words, btn("Dismiss result", "answer-submit", () => send("")));
   } else {
+    const options = item.options || [];
     const ta = el("textarea");
     ta.rows = 2;
     ta.dataset.draftKey = key;
     ta.value = C.getDraft(S.drafts, key);
+    ta.placeholder = options.length ? "Write your own answer…" : "Write your answer…";
     ta.setAttribute("aria-label", "Answer for " + (entry.title || entry.session));
-    const sendBtn = btn("Send answer", "primary answer-submit", () => send(ta.value));
     const sync = () => {
       setDraft(key, ta.value, ta);
       syncAnswerState(item.item_id);
     };
     ta.addEventListener("input", sync);
-    if ((item.options || []).length) {
+    const own = add(el("div", "answer-own"), ta);
+    if (options.length) {
+      // Suggested answers are toggles over the one draft: the pressed one is the draft as it stands.
       const opts = el("div", "opts");
-      for (const option of item.options) opts.append(btn(option, "", () => {
-        ta.value = option; sync(); ta.focus();
-      }));
-      form.append(opts);
+      opts.setAttribute("role", "group");
+      opts.setAttribute("aria-label", "Suggested answers");
+      options.forEach((option, i) => {
+        const b = btn("", "option", () => { ta.value = ta.value === option ? "" : option; sync(); });
+        add(b, icon("check"), document.createTextNode(option));
+        b.dataset.option = option;
+        b.dataset.focusKey = `option:${item.item_id}:${i}`;
+        opts.append(b);
+      });
+      const write = btn("Write your own…", "option write-own", () => {
+        own.hidden = !own.hidden;
+        syncAnswerState(item.item_id);
+        if (!own.hidden) ta.focus();
+      });
+      write.dataset.focusKey = "write-own:" + item.item_id;
+      form.append(add(opts, write));
+      own.hidden = true;
     }
-    if ((item.options || []).length) {
-      const edit = el("details", "answer-edit");
-      const summary = el("summary", "dim", ta.value ? "Answer: " + C.oneLine(ta.value, 100) : "Write a custom answer");
-      add(edit, summary, ta);
-      add(form, edit, sendBtn);
-    } else add(form, ta, sendBtn);
-    form.append(el("div", "dim answer-recipient", "Reply to: " + (entry.title || entry.session)));
-    sendBtn.disabled = !!item.blocking && !ta.value.trim();
+    form.append(own);
+    add(words, el("span", "answer-hint"), el("span", "dim answer-recipient", "Reply to: " + (entry.title || entry.session)));
+    add(foot, words, btn("Send answer", "primary answer-submit", () => send(ta.value)));
   }
-  add(card, form, err);
+  add(card, add(form, foot), err);
+  syncAnswerCard(card, S.answering.has(item.item_id));
   return card;
+}
+
+/** Bring one card in line with its draft: pressed suggestion, what will be sent, what Send does. */
+function syncAnswerCard(card, busy) {
+  const ta = card.querySelector("textarea");
+  const blocking = card.querySelector(".answer")?.dataset.blocking === "true";
+  const draft = ta ? ta.value : "";
+  const options = [...card.querySelectorAll("button[data-option]")];
+  if (ta) ta.disabled = busy;
+  for (const option of options) option.setAttribute("aria-pressed", String(option.dataset.option === draft));
+  const own = card.querySelector(".answer-own");
+  const write = card.querySelector(".write-own");
+  if (own && write) {
+    // A draft that is not one of the suggestions is the operator's own text: keep it in view.
+    if (draft && !options.some(option => option.dataset.option === draft)) own.hidden = false;
+    write.setAttribute("aria-expanded", String(!own.hidden));
+  }
+  for (const button of card.querySelectorAll("button")) {
+    const submit = button.classList.contains("answer-submit");
+    button.disabled = busy || (submit && blocking && !!ta && !draft.trim());
+    if (submit) button.textContent = busy ? "Sending…" : !ta ? "Dismiss result" : !blocking && !draft.trim() ? "Dismiss" : "Send answer";
+  }
+  const hint = card.querySelector(".answer-hint");
+  if (hint) {
+    hint.classList.toggle("has-answer", !!draft.trim());
+    hint.textContent = draft.trim() ? "Your answer: " + C.oneLine(draft, 120)
+      : options.length ? "Pick an option or write your own. Nothing is sent until you press Send answer."
+        : blocking ? "Nothing is sent until you press Send answer." : "Answer it, or dismiss it without an answer.";
+  }
 }
 
 function syncAnswerState(id) {
   const busy = S.answering.has(id);
   for (const card of document.querySelectorAll("[data-answer-item]")) {
-    if (card.dataset.answerItem !== id) continue;
-    const ta = card.querySelector("textarea");
-    if (ta) ta.disabled = busy;
-    for (const button of card.querySelectorAll("button")) {
-      button.disabled = busy || (button.classList.contains("answer-submit") && card.querySelector(".answer")?.dataset.blocking === "true" && ta && !ta.value.trim());
-      if (button.classList.contains("answer-submit")) button.textContent = busy ? "Sending…" : ta ? "Send answer" : "Dismiss result";
-    }
-    const summary = card.querySelector(".answer-edit summary");
-    if (summary) summary.textContent = ta?.value ? "Answer: " + C.oneLine(ta.value, 100) : "Write a custom answer";
+    if (card.dataset.answerItem === id) syncAnswerCard(card, busy);
   }
 }
 
@@ -1141,7 +1341,7 @@ function reconcileInbox(box, entries, context) {
     let saved = cards.get(id);
     if (!saved || saved.signature !== signature) {
       const wrap = el("div", "block inbox" + (entry.item.blocking ? " decision-card" : " informational"));
-      wrap.append(inboxCard(entry, S.answered.get(id)));
+      wrap.append(inboxCard(entry, S.answered.get(id), context));
       saved = { signature, node: wrap };
       cards.set(id, saved);
     }
@@ -1329,7 +1529,8 @@ function renderLedger(p) {
     frag.append(h2("Constraints"), ul(...m.constraints.map((c) => li(el("span", "k", c.id), el("span", c.retired ? "retired" : "", c.text), c.retired ? el("span", "dim", ` (retired: ${c.retired})`) : null))));
   }
   if (m.plan.length) {
-    frag.append(h2("Plan"), ul(...m.plan.map((s) => li(el("span", "k", C.stepMark(s.status) + " " + s.id), document.createTextNode(s.text), s.note ? el("div", "dim", s.note) : null))));
+    frag.append(h2("Plan"), ul(...m.plan.map((s) => add(el("li", "ledger-step step-" + s.status),
+      stepMarkEl(s.status), el("span", "k", s.id), add(el("div"), el("span", "", s.text), s.note ? el("div", "dim", s.note) : null)))));
   }
   if (m.claims.length) {
     frag.append(h2("Claims"));
@@ -1484,30 +1685,64 @@ function renderSessionTab(p, info) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Full output viewer
+// Stored output viewer
 
-function openViewer(blob, title, total, source = {}) {
+const viewerStatus = (text) => { $("viewer-error").textContent = text; };
+
+/**
+ * Open the dialog on a stored output. `source` may carry where to start (`start`, `end`), the
+ * cited lines (`citeStart`, `citeEnd`) and where the output came from (`session`, `call`, `tool`,
+ * `producer`). Focus goes to the lines themselves, so the keyboard scrolls them at once and Enter
+ * is not sitting on Close. `opener` is the control that asked, which gets focus back on close; a
+ * click does not focus a button in every browser, so callers pass it.
+ */
+function openViewer(blob, title, total, source = {}, opener = document.activeElement) {
   const dialog = $("viewer");
-  const first = Math.max(1, source.start || 1);
-  S.viewer = { ...C.createViewer(blob, total), source, nextStart: first, nextEnd: source.end || first + C.LINES_PAGE - 1, findOffset: -1, opener: document.activeElement };
   $("viewer-title").textContent = title || "Stored output";
-  $("viewer-text").textContent = "";
-  $("viewer-info").textContent = "";
-  $("viewer-error").textContent = "";
-  $("viewer-find").value = "";
-  $("viewer-start").value = String(source.citeStart || first);
-  $("viewer-provenance").replaceChildren(document.createTextNode("Snapshot out:" + blob));
+  const provenance = $("viewer-provenance");
+  provenance.replaceChildren();
   if (source.session) {
-    const producer = link(source.session, C.sessionHash(source.session, "record"));
+    const producer = link(source.producer || source.session, C.sessionHash(source.session, "record"));
     producer.addEventListener("click", closeViewer);
-    $("viewer-provenance").append(document.createTextNode(" · producer: "), producer);
-  }
-  if (source.call) $("viewer-provenance").append(document.createTextNode(" · call " + source.call));
-  $("viewer-standing").textContent = "Opening this stored snapshot is an operator action. It does not change model observation or verify the claim.";
+    add(provenance, document.createTextNode("From "), source.tool ? el("code", "", source.tool) : document.createTextNode("a call"),
+      document.createTextNode(" in "), producer, document.createTextNode((source.call ? " · call " + source.call : "") + " · snapshot "));
+  } else provenance.append(document.createTextNode("Snapshot "));
+  provenance.append(el("span", "mono", "out:" + blob));
+  $("viewer-standing").textContent = source.citeStart
+    ? "Opening this stored snapshot is an operator action. It does not change what the model has observed, and it does not verify the claim."
+    : "This is a stored output snapshot. Opening it here does not change what the model has observed.";
+  $("viewer-find").value = "";
+  $("viewer-start").value = String(source.citeStart || Math.max(1, source.start || 1));
   if (!dialog.open) dialog.showModal();
-  $("viewer-close").focus();
-  viewerMore();
+  $("viewer-scroll").focus({ preventScroll: true });
+  loadViewer(blob, total, source, { opener });
 }
+
+/** Show a range of `blob` in the open dialog. Focus and the element that opened it are kept. */
+function loadViewer(blob, total, source, { opener = null, target = null } = {}) {
+  const first = Math.max(1, source.start || 1);
+  S.viewer = {
+    ...C.createViewer(blob, total), source, opener, target,
+    nextStart: first, nextEnd: source.end || first + C.LINES_PAGE - 1,
+    lines: [], query: "", matches: [], match: -1, matchLine: null,
+  };
+  $("viewer-text").replaceChildren();
+  $("viewer-info").textContent = "";
+  $("viewer-find-count").textContent = "";
+  $("viewer-earlier").hidden = true;
+  $("viewer-more").hidden = true;
+  viewerStatus("");
+  return viewerPage(1);
+}
+
+function sourceLine(v, number, text) {
+  const cited = !!v.source.citeStart && number >= v.source.citeStart && number <= (v.source.citeEnd || v.source.citeStart);
+  const row = el("span", "source-line" + (cited ? " cited-line" : "") + (number === v.target ? " target-line" : ""));
+  row.dataset.line = String(number);
+  return add(row, el("span", "line-number", String(number)), el("span", "line-text", text), document.createTextNode("\n"));
+}
+
+const viewerRow = (v, line) => $("viewer-text").children[line - v.first] || null;
 
 function closeViewer() {
   const v = S.viewer;
@@ -1519,80 +1754,136 @@ function closeViewer() {
   if (target) target.focus({ preventScroll: true });
 }
 
-async function viewerMore() {
+/** Load the page after the loaded lines (`direction` 1) or before them (-1). */
+async function viewerPage(direction) {
   const v = S.viewer;
-  if (!v || v.busy || v.done) return;
-  const range = v.chunks.length ? C.nextRange(v) : { start: v.nextStart, end: v.nextEnd };
+  if (!v || v.busy) return;
+  const range = direction < 0 ? C.earlierRange(v) : v.chunks.length ? C.nextRange(v) : { start: v.nextStart, end: v.nextEnd };
   if (!range) return;
+  const opening = !v.chunks.length;
   v.busy = true;
   $("viewer-more").disabled = true;
-  $("viewer-error").textContent = "Loading stored lines…";
+  $("viewer-earlier").disabled = true;
+  viewerStatus("Loading stored lines…");
   try {
     const view = await api("GET", C.linesUrl(v.blob, range.start, range.end));
     if (S.viewer !== v) return;
-    if (C.applyLines(v, view)) {
-      const text = view.text.endsWith("\n") || view.text === "" ? view.text : view.text + "\n";
-      const lines = text.split("\n");
-      if (lines[lines.length - 1] === "") lines.pop();
-      lines.forEach((line, index) => {
-        const row = el("span", "source-line" + ((view.first + index) >= v.source.citeStart && (view.first + index) <= v.source.citeEnd ? " cited-line" : ""));
-        row.dataset.line = String(view.first + index);
-        add(row, el("span", "line-number", String(view.first + index)), document.createTextNode(line + "\n"));
-        $("viewer-text").append(row);
-      });
+    const joined = direction < 0 ? C.applyEarlierLines(v, view) : C.applyLines(v, view);
+    if (joined) {
+      const texts = C.splitLines(view.text);
+      const rows = texts.map((text, i) => sourceLine(v, view.first + i, text));
+      if (direction < 0) {
+        // Keep the lines being read where they are while earlier ones arrive above them.
+        const scroll = $("viewer-scroll");
+        const before = scroll.scrollHeight;
+        v.lines.unshift(...texts);
+        $("viewer-text").prepend(...rows);
+        scroll.scrollTop += scroll.scrollHeight - before;
+      } else {
+        v.lines.push(...texts);
+        $("viewer-text").append(...rows);
+      }
+      // What is loaded changed, so the matches of the current search did too.
+      if (v.query) {
+        v.matches = C.findInLines(v.lines, v.query);
+        v.match = v.matches.findIndex(m => v.first + m.index === v.matchLine);
+        $("viewer-find-count").textContent = v.match >= 0 ? `${C.num(v.match + 1)} of ${C.num(v.matches.length)}` : C.count(v.matches.length, "match", "matches");
+      }
     }
-    $("viewer-info").textContent = `Lines ${C.num(v.first)}–${C.num(v.last)} of ${C.num(v.total)}`;
-    $("viewer-error").textContent = "";
+    $("viewer-info").textContent = v.last >= v.first ? `Lines ${C.num(v.first)}–${C.num(v.last)} of ${C.num(v.total)}` : "No lines stored";
     $("viewer-start").max = String(Math.max(1, v.total));
+    // A page that does not meet the loaded lines is not shown, and that is said rather than hidden.
+    viewerStatus(joined ? "" : "The lines returned do not join the loaded ones. Close this output and open it again.");
+    // Paging further must not pull the view back to a line the operator went to earlier.
+    if (opening && v.target) showTarget(v);
   } catch (e) {
-    if (S.viewer === v) $("viewer-error").textContent = e.message;
+    if (S.viewer === v) viewerStatus(e.message);
   } finally {
     v.busy = false;
     if (S.viewer === v) {
+      const focused = document.activeElement;
       $("viewer-more").disabled = false;
-      $("viewer-more").hidden = v.done;
+      $("viewer-earlier").disabled = false;
+      $("viewer-more").hidden = v.done || !v.chunks.length;
+      $("viewer-earlier").hidden = !C.earlierRange(v);
+      // A paging button that has nothing left to load goes away; do not let focus go with it.
+      if ((focused === $("viewer-more") || focused === $("viewer-earlier")) && focused.hidden) $("viewer-scroll").focus({ preventScroll: true });
     }
   }
 }
 
-function viewerJump() {
-  const v = S.viewer;
-  const start = Number($("viewer-start").value);
-  if (!v) return;
-  if (!Number.isSafeInteger(start) || start < 1 || (v.total > 0 && start > v.total)) {
-    $("viewer-error").textContent = `Choose a line from 1 to ${C.num(v.total || 1)}.`; return;
-  }
-  const source = { ...v.source, start: Math.max(1, start - 3), end: start + C.LINES_PAGE - 4, citeStart: start, citeEnd: start };
-  const opener = v.opener;
-  openViewer(v.blob, $("viewer-title").textContent, v.total, source);
-  S.viewer.opener = opener;
-  $("viewer-start").value = String(start);
+function showTarget(v) {
+  for (const old of $("viewer-text").querySelectorAll(".target-line")) old.classList.remove("target-line");
+  const row = viewerRow(v, v.target);
+  if (!row) return;
+  row.classList.add("target-line");
+  row.scrollIntoView({ block: "center" });
 }
 
-function viewerFind() {
+/** Go to line: scroll when the line is loaded, otherwise load the range around it. Focus stays put. */
+async function viewerJump() {
   const v = S.viewer;
-  const query = $("viewer-find").value.toLocaleLowerCase();
-  if (!v || !query) return;
-  const lines = [...$("viewer-text").querySelectorAll(".source-line")];
-  for (const line of lines) line.classList.remove("find-match");
-  const from = v.findQuery === query ? v.findOffset + 1 : 0;
-  const index = lines.findIndex((line, i) => i >= from && line.textContent.toLocaleLowerCase().includes(query));
-  const wrapped = index < 0 ? lines.findIndex(line => line.textContent.toLocaleLowerCase().includes(query)) : index;
-  v.findQuery = query; v.findOffset = wrapped;
-  if (wrapped < 0) { $("viewer-error").textContent = "No match in the displayed lines. Load more or go to another range to search it."; return; }
-  lines[wrapped].classList.add("find-match");
-  lines[wrapped].scrollIntoView({ block: "center" });
-  $("viewer-error").textContent = `Match at line ${lines[wrapped].dataset.line} · searching displayed lines only.`;
+  if (!v || v.busy) return;
+  const target = C.lineTarget($("viewer-start").value, v.total);
+  if (target.error) { viewerStatus(target.error); return; }
+  if (v.chunks.length && target.line >= v.first && target.line <= v.last) {
+    v.target = target.line;
+    showTarget(v);
+  } else {
+    await loadViewer(v.blob, v.total, { ...v.source, start: Math.max(1, target.line - 3), end: target.line + C.LINES_PAGE - 4 }, { opener: v.opener, target: target.line });
+    if (S.viewer?.target !== target.line || !viewerRow(S.viewer, target.line)) return;
+  }
+  viewerStatus(`At line ${C.num(target.line)}. Copy reference now gives this line.`);
+}
+
+function clearMatch() {
+  const old = $("viewer-text").querySelector(".find-match");
+  if (!old) return;
+  old.classList.remove("find-match");
+  const text = old.querySelector(".line-text");
+  text.replaceChildren(document.createTextNode(text.textContent)); // drops the mark
+}
+
+/** Find the next (`delta` 1) or previous (-1) loaded line whose text holds the query. */
+function viewerFind(delta) {
+  const v = S.viewer;
+  if (!v) return;
+  const query = $("viewer-find").value;
+  clearMatch();
+  if (!query) {
+    v.query = ""; v.matches = []; v.match = -1; v.matchLine = null;
+    $("viewer-find-count").textContent = "";
+    viewerStatus("");
+    return;
+  }
+  if (query !== v.query) { v.query = query; v.matches = C.findInLines(v.lines, query); v.match = -1; }
+  v.match = C.stepMatch(v.matches.length, v.match, delta);
+  if (v.match < 0) {
+    v.matchLine = null;
+    $("viewer-find-count").textContent = "No matches";
+    viewerStatus(`No match in the loaded lines ${C.num(v.first)}–${C.num(v.last)}. Load more lines or go to another line to search there.`);
+    return;
+  }
+  const found = v.matches[v.match];
+  const row = $("viewer-text").children[found.index];
+  row.classList.add("find-match");
+  if (found.at >= 0) {
+    const full = v.lines[found.index];
+    row.querySelector(".line-text").replaceChildren(
+      document.createTextNode(full.slice(0, found.at)), el("mark", "", full.slice(found.at, found.at + found.length)), document.createTextNode(full.slice(found.at + found.length)));
+  }
+  row.scrollIntoView({ block: "center" });
+  v.matchLine = v.first + found.index;
+  $("viewer-find-count").textContent = `${C.num(v.match + 1)} of ${C.num(v.matches.length)}`;
+  viewerStatus(`Line ${C.num(v.matchLine)} · ${C.num(v.match + 1)} of ${C.count(v.matches.length, "matching line")} · only the loaded lines are searched.`);
 }
 
 async function copyViewerReference() {
   const v = S.viewer;
   if (!v) return;
-  const first = v.source.citeStart || v.first;
-  const last = v.source.citeEnd || v.last;
-  const reference = `out:${v.blob} lines ${first}–${last}${v.source.session ? " (" + v.source.session + (v.source.call ? ", call " + v.source.call : "") + ")" : ""}`;
-  try { await navigator.clipboard.writeText(reference); $("viewer-error").textContent = "Source reference copied."; }
-  catch { $("viewer-error").textContent = "Copy this reference: " + reference; }
+  const reference = C.viewerReference(v);
+  try { await navigator.clipboard.writeText(reference); viewerStatus("Copied: " + reference); }
+  catch { viewerStatus("Copy this reference: " + reference); }
 }
 
 function updateDelivery(id) {
@@ -1774,10 +2065,19 @@ function wire() {
   $("viewer-close").addEventListener("click", closeViewer);
   $("viewer").addEventListener("cancel", e => { e.preventDefault(); closeViewer(); });
   $("viewer-jump").addEventListener("click", viewerJump);
-  $("viewer-find-next").addEventListener("click", viewerFind);
+  $("viewer-find-next").addEventListener("click", () => viewerFind(1));
+  $("viewer-find-prev").addEventListener("click", () => viewerFind(-1));
   $("viewer-copy").addEventListener("click", copyViewerReference);
-  $("viewer-controls").addEventListener("submit", e => { e.preventDefault(); if (document.activeElement === $("viewer-start")) viewerJump(); else viewerFind(); });
-  $("viewer-more").addEventListener("click", viewerMore);
+  // Two fields share the dialog, so the browser submits neither on Enter: each handles its own.
+  $("viewer-start").addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); viewerJump(); }
+  });
+  $("viewer-find").addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); viewerFind(e.shiftKey ? -1 : 1); }
+  });
+  $("viewer-find").addEventListener("input", () => { if (!$("viewer-find").value) viewerFind(1); });
+  $("viewer-more").addEventListener("click", () => viewerPage(1));
+  $("viewer-earlier").addEventListener("click", () => viewerPage(-1));
   window.addEventListener("hashchange", route);
   window.addEventListener("pagehide", saveSeen);
   window.addEventListener("resize", () => {

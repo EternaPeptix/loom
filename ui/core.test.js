@@ -287,13 +287,122 @@ test("mission overview derives factual changes without treating a tool pass as v
   const entries = [{ item: { item_id: "q1", blocking: true } }, { item: { item_id: "q2", blocking: false } }];
   const view = C.missionOverview(new Map(records.map((r) => [r.seq, r])), state, entries, 2);
   assert.deepEqual(view.activeSteps, [{ id: "p2", status: "doing" }]);
-  assert.deepEqual(view.changes.map((c) => c.seq), [3, 4, 5]);
-  assert.equal(view.changes[0].text, "Write tool completed: src/a.rs");
+  // every change is listed; only those recorded after the previous visit are fresh
+  assert.deepEqual(view.changes.map((c) => [c.seq, c.fresh]), [[2, false], [3, true], [4, true], [5, true]]);
+  assert.equal(view.changes[1].text, "Write tool completed: src/a.rs");
+  assert.deepEqual(view.changes.map((c) => c.tone), ["", "", "bad", ""], "only the failed tool result is marked");
+  assert.ok(C.missionOverview(records, state, entries).changes.every((c) => !c.fresh), "nothing is new on a first visit");
+  const ended = C.missionOverview([{ seq: 1, kind: "session_end", outcome: "failed" }, { seq: 2, kind: "interrupted" }, { seq: 3, kind: "session_end", outcome: "done" }], null, []);
+  assert.deepEqual(ended.changes.map((c) => c.tone), ["bad", "bad", ""]);
   assert.deepEqual(view.lastActivity, { seq: 6, ts: 6000, text: "Model request started", kind: "model_request" });
   assert.deepEqual(view.counts, { planTotal: 3, planDone: 1, claimsOpen: 1, claimsSupported: 1, openObligations: 1, pendingDecisions: 1, failedChecks: 1 });
   assert.equal(view.pendingDecisions[0].item.item_id, "q1");
   assert(!JSON.stringify(view).includes("verified"));
   assert.equal(C.missionOverview([], null, []).lastActivity, null);
+});
+
+test("recent changes are newest first, split at the previous visit, and say when they are cut", () => {
+  const changes = Array.from({ length: 12 }, (_, i) => ({ seq: i + 1, fresh: i >= 10 }));
+  const recent = C.recentChanges(changes, 5);
+  assert.deepEqual(recent.fresh.map((c) => c.seq), [12, 11]);
+  assert.deepEqual(recent.earlier.map((c) => c.seq), [10, 9, 8]);
+  assert.deepEqual([recent.shown, recent.total], [5, 12]);
+  assert.deepEqual(C.recentChanges(null), { fresh: [], earlier: [], shown: 0, total: 0 });
+});
+
+test("plan progress counts the steps still in the plan", () => {
+  const plan = [{ status: "done" }, { status: "doing" }, { status: "todo" }, { status: "dropped" }];
+  const progress = C.planProgress(plan);
+  assert.deepEqual(progress.segments, ["done", "doing", "todo"], "a dropped step has no segment");
+  assert.equal(progress.label, "1 of 3 steps done");
+  assert.equal(progress.words, "1 of 3 steps done, 1 in progress");
+  assert.equal(C.planProgress([{ status: "done" }]).words, "1 of 1 step done");
+  assert.equal(C.planProgress(null).total, 0);
+  assert.deepEqual(["todo", "doing", "done", "dropped"].map(C.stepWords), ["To do", "In progress", "Done", "Dropped"]);
+  assert.deepEqual(["todo", "doing", "done", "dropped", "later"].map(C.stepIcon), ["ring", "half", "check", "cross", "ring"]);
+});
+
+test("counts name their noun in the right number", () => {
+  assert.equal(C.count(1, "agent"), "1 agent");
+  assert.equal(C.count(0, "agent"), "0 agents");
+  assert.equal(C.count(1200, "match", "matches"), "1,200 matches");
+});
+
+test("what waits on the operator is tallied by class with the oldest opening time", () => {
+  const inbox = C.createInbox();
+  C.applyInboxList(inbox, [
+    { session: "lead", opened_ms: 5000, item: { item_id: "a", item_kind: "question", blocking: true } },
+    { session: "worker", opened_ms: 2000, item: { item_id: "b", item_kind: "approval", blocking: true } },
+    { session: "lead", opened_ms: 3000, item: { item_id: "c", item_kind: "question", blocking: false } },
+    { session: "lead", item: { item_id: "d", item_kind: "finished", blocking: false } },
+    { session: "elsewhere", opened_ms: 1, item: { item_id: "e", item_kind: "blocker", blocking: true } },
+  ]);
+  const waiting = C.waitingFor(inbox, ["lead", "worker"]);
+  assert.deepEqual(waiting.blocking, { count: 2, since: 2000, kind: "approval" }, "the kind is that of the oldest blocking item");
+  assert.deepEqual(waiting.questions, { count: 1, since: 3000 });
+  assert.deepEqual(waiting.results, { count: 1, since: null }, "an item without an opening time has no age");
+  assert.equal(C.waitingFor(inbox, new Set(["none"])).blocking.count, 0);
+});
+
+test("mission rows carry running agents and what is waiting", () => {
+  const store = C.createSessionStore();
+  C.applySessionList(store, [
+    info("lead", { status: st({ last_end: "waiting" }) }),
+    info("w1", { parent: "lead", role: "worker", created_ms: 1100, status: st({ phase: "running" }) }),
+    info("w2", { parent: "lead", role: "worker", created_ms: 1200 }),
+  ]);
+  const inbox = C.createInbox();
+  C.applyInboxList(inbox, [{ session: "w1", opened_ms: 1000, item: { item_id: "i", item_kind: "question", blocking: true } }]);
+  const rows = C.missionGroups(store, inbox, { expanded: new Set(["lead"]) })[0].rows;
+  assert.deepEqual(rows.map((r) => [r.info.id, r.agentCount, r.agentsRunning]), [["lead", 2, 1], ["w1", 0, 0], ["w2", 0, 0]]);
+  assert.equal(rows[0].waiting.blocking.count, 1, "the mission row counts what its agents are waiting for");
+  assert.equal(rows[1].waiting.blocking.count, 1);
+  assert.equal(rows[2].waiting.blocking.count, 0);
+  // the second line of each row
+  const now = 1000 + 7 * 60000;
+  assert.equal(C.rowSummary(rows[0], null, now), "Question waiting 7m · lead waiting");
+  assert.equal(C.rowSummary(rows[1], null, now), "worker · question waiting 7m");
+  assert.equal(C.rowSummary(rows[2], null, now), "worker · idle");
+  assert.equal(C.rowSummary(rows[0], null, 1000), "Question just arrived · lead waiting");
+});
+
+test("a row summary puts waiting first, then recorded activity, never the creation age", () => {
+  const row = (over = {}, waiting = {}) => ({
+    info: info("s", { created_ms: 0, ...over }),
+    waiting: { blocking: { count: 0, since: null, kind: null }, questions: { count: 0, since: null }, results: { count: 0, since: null }, ...waiting },
+  });
+  const record = { kind: "tool_result", name: "read", status: "ok", ts_ms: 1000 };
+  assert.equal(C.rowSummary(row({ status: st({ phase: "running" }) }), null, 9e9), "Running · open it to load activity");
+  assert.equal(C.rowSummary(row({ status: st({ phase: "running" }) }), record, 13000), "read: completed · 12s ago");
+  assert.equal(C.rowSummary(row({ parent: "p", role: "worker", status: st({ phase: "running" }) }), record, 13000), "worker · read: completed · 12s ago");
+  assert.equal(C.rowSummary(row({}, { blocking: { count: 3, since: 0, kind: "question" } }), record, 600000), "3 requests waiting · oldest 10m · lead idle");
+  assert.equal(C.rowSummary(row({}, { blocking: { count: 1, since: null, kind: "parked" } }), record, 600000), "Parked session waiting · lead idle");
+  assert.equal(C.rowSummary(row({ status: st({ phase: "ended", outcome: "done" }) }, { results: { count: 1, since: 0 } }), null, 780000), "Result ready 13m · finished");
+  assert.equal(C.rowSummary(row({ status: st({ phase: "running" }) }, { questions: { count: 1, since: 0 } }), null, 60000), "Question open 1m · work can continue");
+  assert.equal(C.rowSummary({ info: info("s") }, null, 0), "Idle · open it to load activity", "a row without a tally is still described");
+});
+
+test("standing separates what waits on the operator from how execution stands", () => {
+  const texts = (s) => s.pills.map((p) => p.text);
+  const lead = info("lead", { status: st({ last_end: "waiting" }) });
+  const needs = C.missionStanding(lead, { open: 1, blocking: 1, questions: 0, results: 0 }, 2);
+  assert.equal(needs.mark, "needs_you");
+  assert.deepEqual(texts(needs), ["Needs your answer", "Lead waiting", "2 agents running"]);
+  assert.deepEqual(needs.pills.map((p) => p.tone), ["attention", "", "running"]);
+  assert.deepEqual(texts(C.missionStanding(lead, { blocking: 0 }, 1)), ["Waiting for jobs or agents", "1 agent running"]);
+  const agent = info("w", { parent: "lead", status: st({ phase: "running" }) });
+  assert.deepEqual(texts(C.missionStanding(agent, { blocking: 1 }, 5)), ["Needs your answer", "Agent running"], "an agent row never counts agents");
+  assert.deepEqual(texts(C.missionStanding(info("x", { status: st({ phase: "ended", outcome: "failed" }) }), { blocking: 0 })), ["Failed"]);
+  // a chat has no lead: its root is called a session, in the header and in the list
+  const chat = info("chat", { role: "chat", status: st({ phase: "running" }) });
+  assert.deepEqual(texts(C.missionStanding(chat, { blocking: 1 })), ["Needs your answer", "Session running"]);
+  assert.equal(C.rowSummary({ info: chat, waiting: C.waitingFor({ items: new Map([["i", { session: "chat", opened_ms: 0, item: { item_id: "i", item_kind: "approval", blocking: true } }]]) }, ["chat"]) }, null, 120000), "Approval waiting 2m · session running");
+  assert.deepEqual([C.rootNoun(lead), C.rootNoun(chat), C.rootNoun(null)], ["lead", "session", "session"]);
+  assert.deepEqual(
+    [st({ phase: "running" }), st({ phase: "ended", outcome: "stopped" }), st({ phase: "ended", outcome: "budget_exhausted" }), st({ phase: "ended", outcome: "done" }), st({ last_end: "waiting" }), st({ last_end: "stopped" }), st({})]
+      .map((status) => C.executionWord({ status })),
+    ["running", "stopped", "failed", "finished", "waiting", "stopped", "idle"]);
+  assert.equal(C.executionWord(null), "idle");
 });
 
 test("draft destinations are isolated and completing a send preserves subsequent edits", () => {
@@ -638,6 +747,64 @@ test("blob viewer pages in order until the end", () => {
   assert.deepEqual(v.chunks, ["a", "b", "c"]);
 });
 
+test("blob viewer pages backwards from a range opened in the middle", () => {
+  const v = C.createViewer("b", 5000);
+  assert.equal(C.earlierRange(v), null, "nothing is loaded yet");
+  C.applyLines(v, { text: "m", first: 1593, last: 1608, total: 5000 });
+  assert.deepEqual(C.earlierRange(v), { start: 593, end: 1592 });
+  assert.equal(C.applyEarlierLines(v, { text: "x", first: 1, last: 500, total: 5000 }), false, "a page that does not touch the loaded lines is refused");
+  assert.equal(C.applyEarlierLines(v, { text: "e", first: 593, last: 1592, total: 5000 }), true);
+  assert.deepEqual([v.first, v.last, v.chunks], [593, 1608, ["e", "m"]]);
+  assert.deepEqual(C.earlierRange(v), { start: 1, end: 592 }, "the first page stops at line 1");
+  C.applyEarlierLines(v, { text: "s", first: 1, last: 592, total: 5000 });
+  assert.equal(C.earlierRange(v), null, "loaded from the first line");
+  assert.deepEqual(C.nextRange(v), { start: 1609, end: 2608 }, "later pages still follow the loaded lines");
+});
+
+test("stored text splits into its lines without a phantom last line", () => {
+  assert.deepEqual(C.splitLines("a\nb\n"), ["a", "b"]);
+  assert.deepEqual(C.splitLines("a\n\nb"), ["a", "", "b"]);
+  assert.deepEqual(C.splitLines("\n"), [""], "one empty line");
+  assert.deepEqual(C.splitLines(""), []);
+  assert.deepEqual(C.splitLines(null), []);
+});
+
+test("go to line accepts whole lines inside the output and says what is allowed otherwise", () => {
+  assert.deepEqual(C.lineTarget(" 2000 ", 5000), { line: 2000 });
+  assert.deepEqual(C.lineTarget(5000, 5000), { line: 5000 });
+  for (const bad of ["", "0", "-3", "1.5", "abc", "5001", "1e99"]) {
+    assert.equal(C.lineTarget(bad, 5000).error, "Choose a line from 1 to 5,000.", `"${bad}"`);
+  }
+  assert.deepEqual(C.lineTarget("7", 0), { line: 7 }, "an unknown length does not bound the line");
+  assert.equal(C.lineTarget("0", 0).error, "Choose a line number of 1 or more.");
+});
+
+test("find searches line text only, without regard to case, and steps both ways", () => {
+  const lines = ["stored output line 1593", "outcome,", "full: None,", "ΣΑΣ none"];
+  assert.deepEqual(C.findInLines(lines, "NONE"), [{ index: 2, at: 6, length: 4 }, { index: 3, at: 4, length: 4 }]);
+  assert.deepEqual(C.findInLines(lines, "1594"), [], "a line number is not part of the text");
+  assert.deepEqual(C.findInLines(lines, ""), []);
+  assert.deepEqual(C.findInLines(lines, ".*"), [], "the query is literal");
+  assert.equal(C.findInLines(["İstanbul none"], "none")[0].at, -1, "no exact place when lower-casing changes the length");
+  assert.equal(C.stepMatch(3, -1, 1), 0);
+  assert.equal(C.stepMatch(3, -1, -1), 2, "previous from nowhere is the last match");
+  assert.equal(C.stepMatch(3, 2, 1), 0, "next wraps");
+  assert.equal(C.stepMatch(3, 0, -1), 2, "previous wraps");
+  assert.equal(C.stepMatch(0, -1, 1), -1);
+});
+
+test("a copied reference names the line gone to, else the cited lines, else what is loaded", () => {
+  const v = { ...C.createViewer("abc", 5000), first: 1593, last: 1608, source: {} };
+  assert.equal(C.viewerReference(v), "out:abc lines 1593–1608");
+  v.source = { citeStart: 212, citeEnd: 214, session: "s-audit", call: "read1" };
+  assert.equal(C.viewerReference(v), "out:abc lines 212–214 (s-audit, call read1)");
+  v.source = { citeStart: 1596, session: "s-audit" };
+  assert.equal(C.viewerReference(v), "out:abc line 1596 (s-audit)");
+  v.target = 2000;
+  assert.equal(C.viewerReference(v), "out:abc line 2000 (s-audit)");
+  assert.equal(C.sourceRangeWords(7, 7), "line 7");
+});
+
 // ---- context, ledger, network ----
 
 test("context meter has marks at floor and target", () => {
@@ -700,7 +867,35 @@ test("ledger model joins evidence to claims and keeps open obligations only", ()
   assert.deepEqual(m.obligations.map((o) => o.id), ["o1"]);
   assert.equal(m.questions[0].answer, null);
   assert.equal(C.ledgerModel({ state: { entries: 0 } }).empty, true);
-  assert.equal(C.stepMark("done"), "●");
+});
+
+test("evidence keeps a usable line range, and a quote match is not the direction of the evidence", () => {
+  const ev = (lines) => C.ledgerModel({ state: { entries: 1, claims: [{ id: "c1", text: "t", status: "open", evidence: ["e1"] }], evidence: [{ id: "e1", supports: true, kind: "static", attested: true, quote: "q", blob: "b", lines }] } }).claims[0].evidence[0];
+  assert.deepEqual([ev([1596, 1596]).range, ev([1596, 1596]).lines], [[1596, 1596], "line 1596"]);
+  assert.deepEqual([ev([212, 214]).range, ev([212, 214]).lines], [[212, 214], "lines 212–214"]);
+  for (const bad of [undefined, null, [0, 3], [9, 3]]) assert.deepEqual([ev(bad).range, ev(bad).lines], [null, ""], JSON.stringify(bad));
+  const standing = (e) => { const s = C.evidenceStanding(e); return [s.quote.text, s.quote.tone, s.direction.text]; };
+  assert.deepEqual(standing({ quote: "q", attested: true, supports: true }), ["Quote matches stored output", "ok", "Supports"]);
+  assert.deepEqual(standing({ quote: "q", attested: true, supports: false }), ["Quote matches stored output", "ok", "Undermines"]);
+  assert.deepEqual(standing({ quote: "q", attested: false, supports: true }), ["Quote not checked against stored output", "warn", "Supports"]);
+  assert.deepEqual(standing({ quote: "", attested: false, supports: false }), ["No quote recorded", "dim", "Undermines"]);
+  for (const e of [{ quote: "q", attested: true, supports: true }, { quote: "q" }, {}]) {
+    assert.doesNotMatch(JSON.stringify(C.evidenceStanding(e)), /verif|confirm|proved|failed/i, "neither fact is verification, and an unchecked quote did not fail");
+  }
+});
+
+test("claim filters count by recorded status and offer withdrawn only when it is used", () => {
+  const claims = [{ id: "c1", status: "open" }, { id: "c2", status: "supported" }, { id: "c3", status: "open" }];
+  assert.deepEqual(C.claimFilters(claims).map((f) => [f.key, f.label, f.count]), [["all", "All", 3], ["open", "Open", 2], ["supported", "Supported", 1], ["refuted", "Refuted", 0]]);
+  assert.deepEqual(C.filterClaims(claims, "open").map((c) => c.id), ["c1", "c3"]);
+  assert.deepEqual(C.filterClaims(claims, "refuted"), []);
+  assert.equal(C.filterClaims(claims, "all").length, 3);
+  assert.equal(C.filterClaims(claims, "withdrawn").length, 3, "a filter that is not offered shows every claim");
+  const withdrawn = [...claims, { id: "c4", status: "withdrawn" }];
+  assert.deepEqual(C.claimFilters(withdrawn).at(-1), { key: "withdrawn", label: "Withdrawn", count: 1 });
+  assert.deepEqual(C.filterClaims(withdrawn, "withdrawn").map((c) => c.id), ["c4"]);
+  assert.deepEqual(C.claimFilters(null).map((f) => f.count), [0, 0, 0, 0]);
+  assert.equal(C.claimStatusWords("refuted"), "Refuted");
 });
 
 test("net rows and live dedupe", () => {
@@ -808,6 +1003,45 @@ test("index.html and app.js contain no HTML sinks, inline handlers, inline style
   assert.ok(!/https?:\/\//i.test(stripComments(core)), "core.js has a remote URL");
   // core.js is pure
   assert.ok(!/\b(document|window|fetch|localStorage|EventSource)\b/.test(stripComments(core)), "core.js touches the browser");
+});
+
+test("every drawing the scripts name is in the icon template, and every id they look up is in the page", () => {
+  const html = readFileSync(join(here, "index.html"), "utf8");
+  const app = stripComments(readFileSync(join(here, "app.js"), "utf8"));
+  const template = html.match(/<template id="icons">([\s\S]*?)<\/template>/);
+  assert.ok(template, "index.html carries the icon template");
+  const drawn = new Set([...template[1].matchAll(/data-icon="([a-z-]+)"/g)].map((m) => m[1]));
+  const named = new Set([...app.matchAll(/\bicon\("([a-z-]+)"\)/g)].map((m) => m[1]));
+  for (const mark of ["needs_you", "running", "waiting", "stopped", "finished", "failed", "idle", "result_ready", "question", "not a mark"]) named.add(C.markIcon(mark));
+  for (const status of ["todo", "doing", "done", "dropped", "not a status"]) named.add(C.stepIcon(status));
+  for (const evidence of [{ quote: "q", attested: true }, { quote: "q" }]) named.add(C.evidenceStanding(evidence).quote.icon);
+  for (const status of [st({ phase: "running" }), st({ last_end: "waiting" }), st({ phase: "ended", outcome: "failed" }), st({ phase: "ended", outcome: "done" }), st({ last_end: "stopped" }), st({})]) {
+    for (const attention of [{ blocking: 1 }, { blocking: 0, questions: 1 }, { blocking: 0, results: 1 }, { blocking: 0 }]) {
+      for (const p of C.missionStanding(info("s", { status }), attention, 1).pills) if (p.icon) named.add(p.icon);
+    }
+  }
+  assert.ok(named.size >= 10, "the marks, the steps and the evidence chips have drawings");
+  for (const name of named) assert.ok(drawn.has(name), `index.html has no drawing for "${name}"`);
+  // a drawing never carries meaning alone: the words beside it do, so it is hidden from speech
+  for (const m of html.matchAll(/<svg\b[^>]*>/g)) assert.match(m[0], /aria-hidden="true"/, m[0]);
+  const ids = new Set([...html.matchAll(/\sid="([^"]+)"/g)].map((m) => m[1]));
+  const lookups = [...app.matchAll(/\$\("([A-Za-z0-9_-]+)"\)/g)].map((m) => m[1]);
+  assert.ok(lookups.length > 50);
+  for (const id of lookups) assert.ok(ids.has(id), `app.js looks up #${id}, which index.html does not have`);
+});
+
+test("two fields share the stored output dialog, so it is not a form and each field handles Enter", () => {
+  const html = readFileSync(join(here, "index.html"), "utf8");
+  const app = stripComments(readFileSync(join(here, "app.js"), "utf8"));
+  const dialog = html.match(/<dialog id="viewer"[\s\S]*?<\/dialog>/)[0];
+  assert.doesNotMatch(dialog, /<form\b/, "a form with two fields and no submit button swallows Enter");
+  assert.equal((dialog.match(/<button\b[^>]*>/g) || []).filter((b) => !/type="button"/.test(b)).length, 0);
+  for (const field of ["viewer-start", "viewer-find"]) {
+    assert.match(app, new RegExp(`\\$\\("${field}"\\)\\.addEventListener\\("keydown"`), `${field} handles Enter itself`);
+  }
+  // opening puts focus on the lines, so Enter is never left resting on Close
+  assert.match(app, /\$\("viewer-scroll"\)\.focus\(/);
+  assert.match(dialog, /id="viewer-scroll"[^>]*tabindex="0"/);
 });
 
 test("the files the daemon embeds exist and the stylesheet carries no remote loads", () => {

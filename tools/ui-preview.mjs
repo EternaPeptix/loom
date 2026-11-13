@@ -14,6 +14,7 @@ const logs = new Map();
 const lines = Array.from({ length: 5000 }, (_, i) => `stored output line ${i + 1}`);
 lines[1593] = "outcome,"; lines[1594] = "report: text,"; lines[1595] = "full: None,";
 lines[1596] = "payload: serde_json::Value::Null,"; lines[1597] = "steps,"; lines[1598] = "usage: Usage::default(),";
+lines[211] = "$ sh -c 'sleep 30 & exit 0'"; lines[212] = "job settled (exit 0) while pid 4127 still running"; lines[213] = "tracked: 0 processes";
 
 function session(id, title, { parent = null, phase = "running", last_end = null, outcome = null } = {}) {
   return { id, title, mission: parent || id === "s-audit" ? "m-audit" : "m-" + id, parent, workspace: "/fixture/loom", pack: "core", role: parent ? "worker" : "lead", profile: "fixture", model: "Fixture model", context_window: 1000000, created_ms: now - 3600000, unattended: true, archived: false, active: phase === "running", status: { phase, step: 48, last_end, outcome, epoch: 1, prompt_tokens: 86000, cached_tokens: 84000, completion_tokens_total: 18000, open_inbox: 0 } };
@@ -28,9 +29,10 @@ let inbox = [
   { session: "s-audit", mission: "m-audit", title: "Audit harness reliability", opened_ms: now - 240000, item: { item_id: "i-scope", item_kind: "question", text: "Include the desktop app in this audit?", options: ["Include desktop", "Runtime only"], blocking: true, call_id: "question", reference: "q1" } },
   { session: "s-result", mission: "m-s-result", title: "Dependency review", opened_ms: now - 600000, item: { item_id: "i-result", item_kind: "finished", text: "The review is ready to read.", options: [], blocking: false, call_id: "finish" } },
 ];
+let startupClock = now - 16 * 60000; // the records written at startup are spread over the minutes before it
 function append(id, kind, fields = {}, author = "harness", live = false) {
   const log = logs.get(id) || []; logs.set(id, log);
-  const record = { seq: log.length, ts_ms: Date.now(), author, prev: "0".repeat(64), kind, ...fields };
+  const record = { seq: log.length, ts_ms: live ? Date.now() : (startupClock += 40000), author, prev: "0".repeat(64), kind, ...fields };
   log.push(record);
   if (live) emit({ type: "record", session: id, record });
   return record;
@@ -39,13 +41,15 @@ for (const info of sessions) {
   append(info.id, "session_start", { session: info.id, mission: info.mission, parent: info.parent, workspace: info.workspace, pack: info.pack, role: info.role, termination: "explicit", model: { profile: "fixture", model: "Fixture model", context_window: 1000000 }, budget: {}, reasoning_replay: "all", tools: [] });
   append(info.id, "user_message", { text: "Review reliability and preserve the evidence." }, "user");
 }
+append("s-audit", "tool_call", { call_id: "bash1", req_id: "r1", name: "bash", args: { command: "cargo test recovery" }, class: "exec" }, "model");
+append("s-audit", "tool_result", { call_id: "bash1", name: "bash", status: "error", text: "error: test recovery::report_after_crash failed", cut: false, class: "exec", meta: {}, duration_ms: 900 }, "tool");
 append("s-audit", "tool_call", { call_id: "read1", req_id: "r1", name: "read", args: { path: "runtime.rs", start: 1594, end: 1599 }, class: "read" }, "model");
 append("s-audit", "tool_result", { call_id: "read1", name: "read", status: "ok", text: lines.slice(1593, 1599).join("\n"), output: { id: blob, bytes: 128000, lines: 5000 }, cut: true, class: "read", meta: { shown: [[1594, 1599]] }, duration_ms: 4 }, "tool");
 append("s-audit", "model_response", { req_id: "r1", text: "## Preliminary finding\n\n**Recovery requires verification.**\n\n- Source evidence is attached.\n- A crash reproduction remains open.\n\n```rust\nfull: None,\n```\n\n<img src=\"https://example.invalid/leak.png\" onerror=\"alert(1)\">", reasoning: "Review the exact source and preserve uncertainty.", tool_calls: [], finish: "stop", usage: { prompt_tokens: 86000, cached_tokens: 84000, completion_tokens: 100 }, timing: { total_ms: 1200 }, attempts: 1 }, "model");
 append("s-audit", "ledger", { n: 9, summary: "Claim and source evidence recorded." });
 append("s-audit", "inbox_opened", inbox[0].item);
 append("s-audit", "turn_end", { reason: "waiting" });
-const ledger = { entries: 9, goal: "Find actionable reliability defects and preserve source evidence.", constraints: [{ id: "k1", text: "Read-only review." }], plan: [{ id: "p1", text: "Inspect recovery paths", status: "done", note: "Source finding recorded." }, { id: "p2", text: "Review tool execution", status: "doing" }, { id: "p3", text: "Independently verify findings", status: "todo" }], claims: [{ id: "c1", text: "Recovered reports may omit the answer.", status: "open", evidence: ["e1"], note: "Crash reproduction pending." }], evidence: [{ id: "e1", supports: true, kind: "static", attested: true, quote: "full: None,", blob, lines: [1596, 1596], session: "s-audit", call_id: "read1", note: "Source text only." }], obligations: [{ id: "o1", kind: "agent", text: "Recovery review", outcome: null }], decisions: [], dead_ends: [], questions: [] };
+const ledger = { entries: 9, goal: "Find actionable reliability defects and preserve source evidence.", constraints: [{ id: "k1", text: "Read-only review." }], plan: [{ id: "p1", text: "Inspect recovery paths", status: "done", note: "Source finding recorded." }, { id: "p2", text: "Review tool execution", status: "doing" }, { id: "p3", text: "Independently verify findings", status: "todo" }], claims: [{ id: "c1", text: "Recovered reports may omit the answer.", status: "open", evidence: ["e1"], note: "Crash reproduction pending." }, { id: "c2", text: "Process tracking ends when the shell exits.", status: "supported", evidence: ["e2", "e3"] }], evidence: [{ id: "e1", supports: true, kind: "static", attested: true, quote: "full: None,", blob, lines: [1596, 1596], session: "s-audit", call_id: "read1", note: "Source text only." }, { id: "e2", supports: true, kind: "execution", attested: true, quote: "job settled (exit 0) while pid 4127 still running", blob, lines: [212, 214], session: "s-worker", call_id: "bash7" }, { id: "e3", supports: false, kind: "note", attested: false, quote: "a foreground pipeline was tracked to completion", note: "Only observed with a backgrounded child." }], obligations: [{ id: "o1", kind: "agent", text: "Recovery review", outcome: null }], decisions: [], dead_ends: [], questions: [] };
 
 function emit(event) { for (const res of clients) res.write("data: " + JSON.stringify(event) + "\n\n"); }
 function json(res, value, status = 200) { const body = JSON.stringify(value); res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" }); res.end(body); }
