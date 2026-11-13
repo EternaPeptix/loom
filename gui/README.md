@@ -9,7 +9,8 @@ reaches it, authenticates, watches `/api/events` for the counts, and shows the p
 
 ## Connecting
 
-An SSH-tunnel connection forwards `127.0.0.1:<port>` to `127.0.0.1:<port>` on the remote host, with
+An SSH-tunnel connection derives its browser URL and its ssh forward from one validated endpoint, so
+the ports cannot differ: it forwards `127.0.0.1:<port>` to `127.0.0.1:<port>` on the remote host, with
 the SAME port number at both ends (the daemon only accepts its own port in the `Host`/`Origin`
 headers). If that local port is busy the connection fails and names the port. Any forward, made by
 loom-desk or by hand, must use the daemon's own port number on both ends, so stop whatever listens on

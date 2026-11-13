@@ -127,6 +127,9 @@ test("shownOfTotal", () => {
   assert.equal(none.blob, null);
   assert.equal(none.words, "");
   assert.equal(C.shownOfTotal({ cut: true, output: null, meta: {} }).words, "Output was cut.");
+  const deferred = C.shownOfTotal({ cut: false, output: { id: "stored", lines: 7 }, meta: { deferred_observation: true } });
+  assert.match(deferred.words, /initially deferred/);
+  assert.doesNotMatch(deferred.words, /All 7 lines shown/);
 });
 
 test("mergeRanges merges overlapping and adjacent ranges, drops nonsense", () => {

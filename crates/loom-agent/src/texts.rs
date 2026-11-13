@@ -232,6 +232,19 @@ pub fn rendering_changed(sent: u32, now: usize) -> String {
     )
 }
 
+/// The settlement report of a child whose log holds no complete result: its summary is not an answer.
+pub fn recovery_incomplete(detail: &str) -> String {
+    format!("Recovery incomplete: this legacy child has no durable result payload. Recorded terminal detail: {detail}\nInspect the child's original log before relying on its answer.")
+}
+
+pub fn continuation_dispatch(id: &str, node: usize) -> String {
+    format!("Stored plan {id}, node {node}: the controller is dispatching your previously authored literal native call after its mechanical guards passed. This omitted one actor callback; it establishes no semantic claim and does not mean you have read the resulting output.")
+}
+
+pub fn continuation_stopped(id: &str, reason: &str) -> String {
+    format!("Stored plan {id} returned control to the actor: {reason}. Inspect the native receipts and current state before deciding what follows. An action without a recorded result may have taken effect; never repeat it blindly.")
+}
+
 /// A background job ended while the session was doing something else (or waiting).
 pub fn job_arrival(
     id: &str,

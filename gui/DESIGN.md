@@ -77,7 +77,9 @@ when stored, goes to the login Keychain (`kSecClassGenericPassword`, service `co
 
 For a `.sshTunnel` connection, `connect()`:
 
-1. uses the daemon's own port number for the local end too (`<port>` = `remotePort`). The daemon only
+1. uses the daemon's own port number for the local end too (`<port>` = `remotePort`): one validated
+   `Forward` value (a port in 1...65535) yields both `baseURL` and the ssh arguments, so they cannot
+   disagree. The daemon only
    accepts its own port in the `Host` and `Origin` headers, so a different local port would have every
    request refused. First it waits (bounded, ~3 s) for the ssh child of the previous tunnel to exit,
    so that loom-desk's own dying listener is not taken for someone else's. If something then listens

@@ -22,6 +22,9 @@
 //!   output limit` (yellow) when `finish` is `Length`). Then the reasoning: with
 //!   `opts.reasoning`, the text (dim); otherwise, when not empty, `  (reasoning: {n} lines)` (dim).
 //!   Then the text. Tool calls are not printed here (their `tool_call` records follow).
+//! - `stored_action`: `∙ controller · {plan_id} node {node} · {tool} · callback
+//!   {omitted_callback} omitted` (dim). Its ordinary tool records carry arguments and results;
+//!   this is never rendered as a model inference or charged fabricated token usage.
 //! - `tool_call`: `→ {name} {args}` where `args` is the compact JSON, cut to `3 * width`
 //!   characters with `…` unless `opts.full`.
 //! - `tool_result`: `← ` followed by the text. Lines after the first are indented two spaces. Only
@@ -50,6 +53,9 @@
 //! - `turn_start`, `model_request`, `net`, unknown kinds: empty — except with `opts.verbose`, where
 //!   `model_request` prints `… request {req_id} · step {step} · epoch {epoch} · about
 //!   {tokens(est_tokens)} tokens` (dim).
+//! - With `opts.verbose`, continuation authorship/stopping, deferred-output observation and the
+//!   child's durable outbox receipt print a concise metadata line (dim). The outbox receipt never
+//!   repeats the parent-facing child report.
 //!
 //! ## Small formats
 //! - `tokens(n)`: `812`, `12.3k` (from 1 000), `1.05M` (from 1 000 000).
@@ -397,6 +403,28 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
             }
             push_block(&mut out, style, None, &m.text, "");
         }
+        Event::StoredAction(action) => {
+            let text = format!(
+                "∙ controller · {} node {} · {} · callback {} omitted",
+                action.plan_id, action.node, action.call.name, action.omitted_callback
+            );
+            out.push(paint(style, DIM, &text));
+        }
+        Event::ContinuationPlanned { plan_id, source_call, .. } => {
+            if opts.verbose {
+                out.push(paint(style, DIM, &format!("∙ continuation {plan_id} authored by call {source_call}")));
+            }
+        }
+        Event::ContinuationStopped { plan_id, reason } => {
+            if opts.verbose {
+                out.push(paint(style, DIM, &format!("∙ continuation {plan_id} stopped: {reason}")));
+            }
+        }
+        Event::OutputsObserved { req_id, calls } => {
+            if opts.verbose {
+                out.push(paint(style, DIM, &format!("∙ request {req_id} observed {} deferred outputs", calls.len())));
+            }
+        }
         Event::ToolCall(c) => {
             let args = serde_json::to_string(&c.args).unwrap_or_default();
             let args = clean(&args);
@@ -460,6 +488,12 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
                 if hidden > 0 {
                     out.push(more_lines_notice(style, hidden, c.full.as_ref().map(|b| b.handle())));
                 }
+            }
+        }
+        Event::ChildCompleted(c) => {
+            if opts.verbose {
+                let text = format!("∙ child outbox {} persisted: {}", c.child, child_outcome_words(c.outcome));
+                out.push(paint(style, DIM, &text));
             }
         }
         Event::JobRegistered { job_id, command, .. } => {
@@ -865,12 +899,50 @@ mod tests {
         Brief { question: q.into(), ..Default::default() }
     }
 
+    fn continuation_and_outbox_events(s: &str) -> Vec<Event> {
+        vec![
+            Event::ContinuationPlanned {
+                plan_id: s.into(),
+                source_call: s.into(),
+                plan: serde_json::json!({"nodes":[]}),
+            },
+            Event::StoredAction(StoredAction {
+                plan_id: s.into(),
+                source_call: s.into(),
+                node: 2,
+                omitted_callback: s.into(),
+                call: ToolCallRequest {
+                    call_id: s.into(),
+                    name: s.into(),
+                    arguments: "{\"command\":\"printf literal\"}".into(),
+                    complete: true,
+                },
+                arguments_hash: s.into(),
+                predecessor: Some(s.into()),
+                file_guards: serde_json::json!([]),
+                guard_ms: 3,
+            }),
+            Event::ContinuationStopped { plan_id: s.into(), reason: s.into() },
+            Event::OutputsObserved { req_id: s.into(), calls: vec![s.into()] },
+            Event::ChildCompleted(ChildCompleted {
+                child: s.into(),
+                role: s.into(),
+                outcome: ChildOutcome::Returned,
+                report: "parent-facing report must not repeat".into(),
+                full: Some(blob()),
+                payload: serde_json::json!({"verdict":"accept"}),
+                steps: 3,
+                usage: Usage { prompt_tokens: 1234, ..Usage::default() },
+            }),
+        ]
+    }
+
     /// One event of every kind; each string field holds `s`.
     fn one_of_each(s: &str) -> Vec<Event> {
         let sid = || SessionId::from(s);
         let cid = || CallId::from(s);
         let budget = Budget { max_steps: Some(5), max_minutes: Some(9) };
-        vec![
+        let mut events = vec![
             Event::SessionStart(SessionStart {
                 session: sid(),
                 mission: MissionId::from("m-a"),
@@ -995,7 +1067,9 @@ mod tests {
             Event::TurnEnd { reason: TurnEndReason::Finished },
             Event::SessionEnd { outcome: SessionOutcome::Failed, detail: s.into() },
             Event::Unknown,
-        ]
+        ];
+        events.extend(continuation_and_outbox_events(s));
+        events
     }
 
     #[test]
@@ -1475,6 +1549,35 @@ mod tests {
         });
         assert_eq!(record(&rec(Author::Harness, net), &MONO, &verbose), "");
         assert_eq!(record(&rec(Author::Harness, Event::Unknown), &MONO, &verbose), "");
+    }
+
+    #[test]
+    fn continuation_and_outbox_metadata_roundtrip_without_fabricating_inference() {
+        let verbose = RecordOpts { verbose: true, full: true, ..RecordOpts::default() };
+        let expected = [
+            "∙ continuation audit authored by call audit\n",
+            "∙ controller · audit node 2 · audit · callback audit omitted\n",
+            "∙ continuation audit stopped: audit\n",
+            "∙ request audit observed 1 deferred outputs\n",
+            "∙ child outbox audit persisted: returned\n",
+        ];
+        for (event, expected) in continuation_and_outbox_events("audit").into_iter().zip(expected) {
+            let original = rec(Author::Harness, event);
+            let encoded = serde_json::to_vec(&original).unwrap();
+            let decoded: Record = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, original);
+            assert_eq!(record(&decoded, &MONO, &verbose), expected);
+            let ordinary = record(&decoded, &MONO, &RecordOpts::default());
+            assert_eq!(ordinary, if matches!(decoded.event, Event::StoredAction(_)) { expected } else { "" });
+            for style in [MONO, COLOR] {
+                let rendered = record(&decoded, &style, &verbose);
+                assert!(!rendered.contains("▌ model"));
+                assert!(!rendered.contains("cached"));
+                assert!(!rendered.contains("1234"));
+                assert!(!rendered.contains("printf literal"));
+                assert!(!rendered.contains("parent-facing report"));
+            }
+        }
     }
 
     #[test]

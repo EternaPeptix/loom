@@ -246,14 +246,23 @@ impl Rig {
 
     /// Write an op to the mission journal as the operator (`from_user`), bypassing the tools.
     pub fn user_op(&self, op: LedgerOp) -> LedgerState {
-        let (_, state) = self.shared.ledger_append(true, op).expect("operator ledger op");
+        let journal = self.shared.journal.as_ref().expect("mission journal");
+        let (_, state) =
+            journal.append(&SessionId::from("s-operator"), true, op, &|_| Ok(())).expect("operator ledger op");
         self.shared.take_emitted();
         state
     }
 
     /// Write an op to the mission journal as the model, bypassing the tools.
     pub fn model_op(&self, op: LedgerOp) -> LedgerState {
-        let (_, state) = self.shared.ledger_append(false, op).expect("model ledger op");
+        // A read-only role cannot write the ledger through its own session: its fixtures are written
+        // as another (lead) session, which is also what a real mission has.
+        let state = if self.shared.role.read_only {
+            let journal = self.shared.journal.as_ref().expect("mission journal");
+            journal.append(&SessionId::from("s-lead"), false, op, &|_| Ok(())).expect("fixture ledger op").1
+        } else {
+            self.shared.ledger_append(false, op).expect("model ledger op").1
+        };
         self.shared.take_emitted();
         state
     }

@@ -367,6 +367,11 @@ pub struct LedgerState {
     /// Operator grants of network hosts, in order. Never evicted.
     #[serde(default)]
     pub scope_grants: Vec<ScopeGrantRecord>,
+    /// The session that recorded each claim, in creation order (`claims[i]` was added by
+    /// `claim_sessions[i]`). Kept so that a rule can be checked under the journal's append lock
+    /// without a second read. Absent in older snapshots.
+    #[serde(default)]
+    pub claim_sessions: Vec<crate::ids::SessionId>,
     /// Number of entries folded.
     pub entries: u64,
 }
@@ -623,6 +628,7 @@ impl LedgerState {
             }
             LedgerOp::ClaimAdd { text } => {
                 let id = next_id("c", self.claims.len());
+                self.claim_sessions.push(entry.session.clone());
                 self.claims.push(Claim {
                     id,
                     text: text.clone(),

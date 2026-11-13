@@ -33,7 +33,7 @@
 //! A session is *active* when a task is driving it (`Session::run`). The runtime keeps, per active
 //! session: the sender of its inputs, its `Control`, its `Arc<Shared>`, its job table, its latest
 //! status, and for a child its settlement once there is one. Sessions that are not active are known
-//! from `meta.json` and `status.json` only.
+//! from `meta.json`, `status.json` and any durable child result in their logs.
 //!
 //! *Activating* a session = building its `Deps` (below), `Session::open`, spawning the task.
 //! Activating a child first activates its parent. Activation happens:
@@ -47,7 +47,8 @@
 //! - on demand, by `send_message`, `resume`, `reweave`, `answer`, and when a settlement has to be
 //!   delivered to a parent that is not active.
 //!
-//! A session whose `status.json` says `phase == Ended` is never activated. Neither is a session of
+//! A session whose `status.json` says `phase == Ended`, or whose durable `child_completed` record
+//! says it ended, is never activated. Neither is a session of
 //! a pack with `requires_restricted_network` while `config.network.mode` is `Open`: its prompt
 //! says the network is restricted. Activation (and `create_session`) is refused with `The pack
 //! "{pack}" needs a restricted network, but the network mode is open, so its sessions are not run.
@@ -85,8 +86,9 @@
 //!   `context_window` from `meta`.
 //! - `shared`: `Shared::new(id, Some(mission), parent, role, journal, paths.session_log(id),
 //!   agents, orchestrator)`. `journal` is `Some(Journal::new(paths.journal(mission), key))` when the
-//!   **root** session's role has `Termination::Explicit`, for the root and all its children; `None`
-//!   otherwise. `key` = `journal::load_or_create_key(paths.journal_key())`, read once at start.
+//!   root session's role has `Termination::Explicit`, and for every child. Children read current
+//!   mission state independently of their brief; runtime rules limit child writes by role and claim
+//!   ownership. `key` = `journal::load_or_create_key(paths.journal_key())`, read once at start.
 //!   The orchestrator handed to `Shared` must not keep the runtime alive in a reference cycle
 //!   (hold a `Weak`, and answer "The harness is shutting down." when it is gone).
 //! - `ctx`: `ToolCtx{session, call_id: empty, workspace (canonical), tmp_dir: paths.session_tmp(id)
@@ -177,7 +179,11 @@
 //! When a child settles and it was not `awaited`, or it was restored after a restart (nobody can be
 //! waiting for it any more): send `Input::ChildSettled(settlement)` to its parent, activating the
 //! parent if necessary. Each settlement is delivered once; one that cannot be delivered (the lead is
-//! archived) is delivered when the lead is unarchived or by the next start. A verifier the finish
+//! archived) is delivered when the lead is unarchived or by the next start. The child's synced
+//! `child_completed` is the durable outbox. Recovery restores every typed settlement field from it,
+//! even when terminal/status writes were cut, and parent receipts acknowledge delivery once per
+//! child. A legacy terminal log without this payload recovers as explicitly incomplete rather than
+//! fabricating a successful answer from its summary. A verifier the finish
 //! gate started (`harness: true`) is never delivered: its verdict belongs to the `finish` that joins it.
 //! A `harness` spawn whose parent has a verifier of the same role and assignment that a shutdown cut
 //! (no `join` took it, and it has a task and has not ended, or it ended with a verdict) gets that
@@ -838,6 +844,42 @@ fn produced_by(
             output.as_ref().map(|o| (o.id.clone(), p))
         }
         _ => None,
+    }
+}
+
+/// The completed result is authoritative even when a later terminal/status write was interrupted.
+fn completed_settlement(records: &[Record], child: &SessionId) -> Option<Settlement> {
+    own_records(records).iter().rev().find_map(|record| match &record.event {
+        Event::ChildCompleted(result) if &result.child == child => Some(Settlement {
+            child: result.child.clone(),
+            role: result.role.clone(),
+            outcome: result.outcome,
+            report: result.report.clone(),
+            full: result.full.clone(),
+            payload: result.payload.clone(),
+            steps: result.steps,
+            usage: result.usage,
+        }),
+        _ => None,
+    })
+}
+
+fn settled_status(previous: &Status, result: &Settlement) -> Status {
+    let (outcome, last_end) = match result.outcome {
+        ChildOutcome::Returned => (SessionOutcome::Done, TurnEndReason::Finished),
+        ChildOutcome::Blocked => (SessionOutcome::Done, TurnEndReason::Blocked),
+        ChildOutcome::BudgetExhausted => (SessionOutcome::BudgetExhausted, TurnEndReason::BudgetExhausted),
+        ChildOutcome::Stopped => (SessionOutcome::Stopped, TurnEndReason::Stopped),
+        ChildOutcome::Failed => (SessionOutcome::Failed, TurnEndReason::Error),
+    };
+    Status {
+        phase: Phase::Ended,
+        outcome: Some(outcome),
+        last_end: Some(last_end),
+        step: result.steps,
+        completion_tokens_total: result.usage.completion_tokens,
+        // Prompt/cache metrics describe the latest request, while settlement usage is cumulative.
+        ..previous.clone()
     }
 }
 
@@ -1839,8 +1881,10 @@ impl Inner {
                 pack.target_concurrency,
             )),
         };
-        // The mission journal is shared by the lead and all its children.
-        let journal = explicit.then(|| Journal::new(self.paths.journal(&meta.mission), self.key.clone()));
+        // The mission journal is shared by the lead and all its children; a child is always bound to
+        // it, so that it has explicit access to the mission state.
+        let journal = (explicit || meta.parent.is_some())
+            .then(|| Journal::new(self.paths.journal(&meta.mission), self.key.clone()));
         // The stall note asks for a ledger record (`note`, or `claim` with `evidence`): a role that
         // can write none (a verifier) is not given it.
         let mut agents = self.config.agents.clone();
@@ -2040,18 +2084,30 @@ impl Inner {
                         if !self.shutting.load(Ordering::SeqCst) {
                             self.notify("error", id, &title, &e);
                         }
-                        if is_child {
+                        // A result the child synced before the fault is its settlement, and it ends the
+                        // session as that result says (`record_settlement`); only without one is the
+                        // child failed on its own account.
+                        let done = if is_child {
+                            read_records(&self.paths.session_log(id))
+                                .ok()
+                                .and_then(|log| completed_settlement(&log.records, id))
+                        } else {
+                            None
+                        };
+                        if is_child && done.is_none() {
                             self.mark_failed(id);
                         }
-                        is_child.then(|| Settlement {
-                            child: id.clone(),
-                            role,
-                            outcome: ChildOutcome::Failed,
-                            report: texts::failed_report(&e, ""),
-                            full: None,
-                            payload: serde_json::Value::Null,
-                            steps,
-                            usage: Usage::default(),
+                        is_child.then(|| {
+                            done.unwrap_or_else(|| Settlement {
+                                child: id.clone(),
+                                role,
+                                outcome: ChildOutcome::Failed,
+                                report: texts::failed_report(&e, ""),
+                                full: None,
+                                payload: serde_json::Value::Null,
+                                steps,
+                                usage: Usage::default(),
+                            })
                         })
                     }
                     None => None,
@@ -2100,9 +2156,17 @@ impl Inner {
     /// nobody can be waiting. A verifier of the finish gate is never delivered: its verdict is the
     /// `finish`'s, which takes it with a `join` (after a restart, the `finish` made again).
     fn record_settlement(self: &Arc<Self>, id: &SessionId, s: Settlement) {
-        let (parent, deliver) = {
+        let (parent, deliver, status) = {
             let mut st = self.st();
             let Some(k) = st.known.get_mut(id) else { return };
+            if k.settlement.is_some() {
+                return;
+            }
+            let terminal = settled_status(&k.status, &s);
+            let status = (terminal != k.status).then(|| {
+                k.status = terminal.clone();
+                terminal
+            });
             k.settlement = Some(s.clone());
             k.settled_tx.send_replace(Some(s.clone()));
             // During the start-up pass the recovery that ends it delivers what settled before then: it
@@ -2115,8 +2179,11 @@ impl Inner {
             if deliver {
                 k.joined = true;
             }
-            (k.meta.parent.clone(), deliver)
+            (k.meta.parent.clone(), deliver, status)
         };
+        if let Some(status) = status {
+            self.on_status(id, &status);
+        }
         self.publish(BusEvent::Settled { session: id.clone(), settlement: Box::new(s.clone()) });
         if let (Some(parent), true) = (parent, deliver) {
             self.deliver(&parent, s);
@@ -2463,7 +2530,7 @@ impl Inner {
     /// was delivered to.
     fn recover_settlements(self: &Arc<Self>, scope: impl Fn(&Known) -> bool) -> HashSet<SessionId> {
         let mut delivered_to = HashSet::new();
-        let candidates: Vec<(SessionId, SessionId, SessionMeta, bool)> = {
+        let candidates: Vec<(SessionId, SessionId, SessionMeta, bool, bool)> = {
             let st = self.st();
             st.known
                 .iter()
@@ -2472,14 +2539,22 @@ impl Inner {
                     let parent_ok =
                         st.known.get(&parent).is_some_and(|p| !p.meta.archived && p.status.phase != Phase::Ended);
                     let wanted = scope(k) && !k.joined && !k.meta.archived && parent_ok;
-                    wanted.then(|| (id.clone(), parent, k.meta.clone(), k.finished()))
+                    // A completed child of an archived or ended family still gets its result back in
+                    // memory, so that `join` and `watch` work once the family is reopened; only the
+                    // delivery depends on the lead being eligible.
+                    let restorable = k.settlement.is_none() && k.status.phase == Phase::Ended;
+                    (wanted || restorable).then(|| (id.clone(), parent, k.meta.clone(), k.finished(), wanted))
                 })
                 .collect()
         };
         // First what the leads' logs say about each agent; then the deliveries.
         let mut seen: HashMap<SessionId, Spawns> = HashMap::new();
-        let mut open: Vec<(SessionId, SessionId, SessionMeta, bool)> = Vec::new();
-        for (id, parent, meta, ended) in candidates {
+        let mut open: Vec<(SessionId, SessionId, SessionMeta, bool, bool)> = Vec::new();
+        for (id, parent, meta, ended, wanted) in candidates {
+            if !wanted {
+                open.push((id, parent, meta, false, false));
+                continue;
+            }
             let spawns = seen.entry(parent.clone()).or_insert_with(|| {
                 read_records(&self.paths.session_log(&parent)).map(|r| Spawns::of(&r.records)).unwrap_or_default()
             });
@@ -2495,59 +2570,73 @@ impl Inner {
                     k.gate = gate.clone();
                 }
             }
-            if !had {
-                open.push((id, parent, meta, gate.is_some()));
+            if had {
+                // Already told to the lead: nothing is delivered, but the complete result is still
+                // restored in memory (for `join`, `watch` and the family's reopening).
+                open.push((id, parent, meta, false, false));
+            } else {
+                open.push((id, parent, meta, gate.is_some(), true));
             }
         }
         // From here on a settlement is delivered as it is made; what settled before is delivered
         // below. The claim each delivery takes under the state lock makes it one.
         self.restoring.store(false, Ordering::SeqCst);
-        for (id, parent, meta, gate) in open {
+        for (id, parent, meta, gate, wanted) in open {
             let (kept, ended) = match self.st().known.get(&id) {
                 Some(k) => (k.settlement.clone(), k.status.phase == Phase::Ended || k.settlement.is_some()),
                 None => continue,
             };
-            if !ended {
+            if !ended || (!wanted && kept.is_some()) {
                 continue;
             }
-            // What the child's task handed over when it ended. Without it (see *Files*) the child's
-            // log gives the outcome and the first line of the report.
-            let persisted = kept.or_else(|| {
-                read_json::<Settlement>(&self.paths.session_dir(&id).join("settlement.json")).filter(|p| p.child == id)
-            });
+            // What the child's task handed over when it ended: first the complete result its log
+            // holds (`child_completed`, synced before any terminal write, so it is authoritative even
+            // when those were cut), then the `settlement.json` kept beside the log. Without either (see
+            // *Files*) the child ended before results were persisted whole: it is reported as an
+            // incomplete recovery, never as a success made up from its summary.
+            let persisted = kept
+                .or_else(|| {
+                    read_records(&self.paths.session_log(&id)).ok().and_then(|r| completed_settlement(&r.records, &id))
+                })
+                .or_else(|| {
+                    read_json::<Settlement>(&self.paths.session_dir(&id).join("settlement.json"))
+                        .filter(|p| p.child == id)
+                });
             let s = match persisted {
                 Some(s) => s,
                 None => {
                     let Ok(report) = read_records(&self.paths.session_log(&id)) else { continue };
                     let own = own_records(&report.records);
-                    let blocked = own
-                        .iter()
-                        .rev()
-                        .find_map(|r| match &r.event {
-                            Event::TurnEnd { reason } => Some(*reason == TurnEndReason::Blocked),
-                            _ => None,
-                        })
-                        .unwrap_or(false);
-                    let end = own.iter().rev().find_map(|r| match &r.event {
-                        Event::SessionEnd { outcome, detail } => Some((*outcome, detail.clone())),
+                    let detail = own.iter().rev().find_map(|r| match &r.event {
+                        Event::SessionEnd { detail, .. } => Some(detail.as_str()),
                         _ => None,
                     });
-                    let Some((outcome, detail)) = end else { continue };
-                    let outcome = if blocked { ChildOutcome::Blocked } else { child_outcome_of(outcome) };
+                    let Some(detail) = detail else { continue };
                     let steps = self.st().known.get(&id).map(|k| k.status.step).unwrap_or(0);
-                    let text = if detail.trim().is_empty() { texts::stopped_report(steps) } else { detail };
                     Settlement {
                         child: id.clone(),
                         role: meta.role.clone(),
-                        outcome,
-                        report: text,
+                        outcome: ChildOutcome::Failed,
+                        report: texts::recovery_incomplete(detail),
                         full: None,
-                        payload: serde_json::Value::Null,
+                        payload: serde_json::json!({"recovery_incomplete": true}),
                         steps,
                         usage: Usage::default(),
                     }
                 }
             };
+            // A child of a family that is not delivered to keeps its result for `join` only.
+            if !wanted {
+                let mut st = self.st();
+                if let Some(k) = st.known.get_mut(&id) {
+                    if k.settlement.is_none() {
+                        k.settlement = Some(s.clone());
+                        k.settled_tx.send_replace(Some(s));
+                    }
+                    k.restored = true;
+                }
+                continue;
+            }
             // Claimed under the lock: the settlement of an agent that ends now is delivered once.
             let claimed = {
                 let mut st = self.st();
@@ -4242,7 +4331,14 @@ impl Inner {
                 tracing::warn!("{} has no readable meta.json; ignored", path.display());
                 continue;
             };
-            let status = read_json::<Status>(&path.join("status.json")).unwrap_or_else(idle_status);
+            let mut status = read_json::<Status>(&path.join("status.json")).unwrap_or_else(idle_status);
+            if meta.parent.is_some() {
+                if let Ok(log) = read_records(&self.paths.session_log(&meta.id)) {
+                    if let Some(result) = completed_settlement(&log.records, &meta.id) {
+                        status = settled_status(&status, &result);
+                    }
+                }
+            }
             st.known.insert(meta.id.clone(), Known::new(meta, status));
         }
     }
@@ -4252,7 +4348,7 @@ impl Inner {
 mod tests {
     use super::*;
     use loom_core::config::{ModelProfile, SandboxMode};
-    use loom_core::event::InboxKind;
+    use loom_core::event::{Brief, InboxKind};
     use loom_model::mock::{Action, MockServer, Reply, Script};
     use serde_json::{json, Value};
 
@@ -5239,6 +5335,62 @@ mod tests {
         assert!(cm.len() > common);
         assert_eq!(pm[..common], cm[..common]);
         assert!(cm[common..].iter().any(|m| m.to_string().contains("FORKMARK")));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fresh_forked_and_verifier_children_are_bound_to_current_mission_state() {
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let parent = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let shared = e.rt.inner.st().known.get(&parent).unwrap().active.as_ref().unwrap().shared.clone();
+        for op in [
+            loom_core::ledger::LedgerOp::GoalSet { text: "MISSION_STATE_GOAL".into() },
+            loom_core::ledger::LedgerOp::ConstraintAdd { text: "MISSION_STATE_RULE: never deploy".into() },
+            loom_core::ledger::LedgerOp::ApprovalGrant {
+                text: "MISSION_STATE_PERMISSION".into(),
+                scope: "read staging".into(),
+            },
+        ] {
+            shared.ledger_append(true, op).unwrap();
+        }
+        e.rt.send_message(&parent, "establish a fork point").await.unwrap();
+        until("parent request", || !e.server.requests().is_empty()).await;
+        for (role, mode) in [("worker", SpawnMode::Fresh), ("worker", SpawnMode::Fork), ("verifier", SpawnMode::Fresh)]
+        {
+            e.rt.inner
+                .spawn_child(
+                    &parent,
+                    SpawnReq {
+                        role: role.into(),
+                        mode,
+                        brief: Brief { question: "a minimal brief".into(), ..Brief::default() },
+                        budget: Budget::default(),
+                        call_id: CallId::from("state-test"),
+                        title: "state test".into(),
+                        awaited: true,
+                        harness: false,
+                        prerequisite: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        until("three child requests", || {
+            e.server.requests().iter().filter(|b| mentions(b, "Mission ledger access:")).count() == 3
+        })
+        .await;
+        let requests = e.server.requests();
+        let child_requests: Vec<_> = requests.iter().filter(|b| mentions(b, "Mission ledger access:")).collect();
+        assert_eq!(child_requests.len(), 3);
+        for request in &child_requests {
+            for text in
+                ["MISSION_STATE_GOAL", "MISSION_STATE_RULE: never deploy", "MISSION_STATE_PERMISSION", "read staging"]
+            {
+                assert!(mentions(request, text), "child is missing {text}");
+            }
+            assert!(has_tool(request, "ledger"));
+        }
+        assert_eq!(child_requests.iter().filter(|b| mentions(b, "Mission ledger access: read-only")).count(), 1);
         e.rt.shutdown().await;
     }
 
@@ -7405,14 +7557,309 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_settlement_recovered_from_a_log_without_the_kept_report_has_its_first_line() {
+    async fn a_settlement_recovered_from_a_log_without_a_complete_result_is_reported_incomplete() {
         let (e, id, child, stall) = a_settlement_nobody_took().await;
+        // Drop the complete result the log holds as well as the one kept beside it: what is left is
+        // a log that ended before results were persisted whole.
+        let log = e.rt.inner.paths.session_log(&child);
+        let records = read_records(&log).unwrap().records;
+        let pos = records.iter().position(|r| matches!(r.event, Event::ChildCompleted(_))).unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        std::fs::write(&log, format!("{}\n", text.lines().take(pos).collect::<Vec<_>>().join("\n"))).unwrap();
+        let (mut writer, _) = loom_core::log::SessionLog::open(&log, loom_core::log::Durability::Always).unwrap();
+        writer.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Finished }).unwrap();
+        writer
+            .append(
+                Author::Harness,
+                Event::SessionEnd { outcome: SessionOutcome::Done, detail: "Outcome: returned".into() },
+            )
+            .unwrap();
+        drop(writer);
         std::fs::remove_file(e.rt.inner.paths.session_dir(&child).join("settlement.json")).unwrap();
         stall.store(false, Ordering::SeqCst);
         let (rt2, c) = recovered_settlement(&e, &id).await;
-        assert_eq!((&c.child, c.outcome, c.inline), (&child, ChildOutcome::Returned, false));
-        assert_eq!(c.report, "Outcome: returned");
+        assert_eq!((&c.child, c.outcome, c.inline), (&child, ChildOutcome::Failed, false));
+        assert!(c.report.contains("Recovery incomplete"), "{}", c.report);
+        assert!(c.full.is_none());
         rt2.shutdown().await;
+    }
+
+    /// End an awaited child without joining it, leaving the delivery boundary unacknowledged.
+    async fn unreceived_child(e: &Env) -> (SessionId, SessionId, loom_core::event::ChildCompleted) {
+        let parent = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let child =
+            e.rt.inner
+                .spawn_child(
+                    &parent,
+                    SpawnReq {
+                        role: "worker".into(),
+                        mode: SpawnMode::Fresh,
+                        brief: Brief { question: "inspect this".into(), ..Brief::default() },
+                        budget: Budget::default(),
+                        call_id: CallId::from("awaited-call"),
+                        title: "unreceived child".into(),
+                        awaited: true,
+                        harness: false,
+                        prerequisite: None,
+                    },
+                )
+                .await
+                .unwrap();
+        until("child settlement", || e.rt.session(&child).is_some_and(|s| s.status.phase == Phase::Ended && !s.active))
+            .await;
+        let completed = e
+            .records(&child)
+            .into_iter()
+            .find_map(|r| match r.event {
+                Event::ChildCompleted(c) => Some(c),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!e.has(&parent, |ev| matches!(ev, Event::ChildSettled(_))));
+        e.rt.shutdown().await;
+        (parent, child, completed)
+    }
+
+    #[tokio::test]
+    async fn fatal_after_completed_outbox_persists_terminal_status_without_duplicate_status_events() {
+        let e = env(Script::new(|_, _| finish("durable result before terminal failure"))).await;
+        let (_, child, _) = unreceived_child(&e).await;
+        let paths = Paths::at(e.dir.path().join("home"));
+        let expected =
+            completed_settlement(&read_records(&paths.session_log(&child)).unwrap().records, &child).unwrap();
+        let stale = {
+            let mut state = e.rt.inner.st();
+            let known = state.known.get_mut(&child).unwrap();
+            known.settlement = None;
+            known.settled_tx.send_replace(None);
+            known.status.phase = Phase::Running;
+            known.status.last_end = None;
+            known.status.outcome = None;
+            known.status.step = 0;
+            known.status.completion_tokens_total = 0;
+            known.status.clone()
+        };
+        write_json_atomic(&paths.session_dir(&child).join("status.json"), &stale).unwrap();
+        let mut bus = e.rt.subscribe();
+        e.rt.inner.on_end(&child, 0, End::Fatal("terminal write failed after the outbox synced".into()));
+        let status = e.rt.session(&child).unwrap().status;
+        assert_eq!(status.phase, Phase::Ended);
+        assert_eq!(status.outcome, Some(SessionOutcome::Done));
+        assert_eq!(status.last_end, Some(TurnEndReason::Finished));
+        assert_eq!(status.step, expected.steps);
+        assert_eq!(status.completion_tokens_total, expected.usage.completion_tokens);
+        assert_eq!((status.prompt_tokens, status.cached_tokens), (stale.prompt_tokens, stale.cached_tokens));
+        assert_eq!(read_json::<Status>(&paths.session_dir(&child).join("status.json")).unwrap(), status);
+        assert_eq!(e.rt.inner.st().known.get(&child).unwrap().settlement.as_ref(), Some(&expected));
+        let events: Vec<_> = std::iter::from_fn(|| bus.try_recv().ok()).collect();
+        assert_eq!(
+            events.iter().filter(|e| matches!(e, BusEvent::Status { session, .. } if session == &child)).count(),
+            1
+        );
+
+        // The ordinary settlement path already published this terminal status from Session.
+        e.rt.inner.st().known.get_mut(&child).unwrap().settlement = None;
+        e.rt.inner.record_settlement(&child, expected.clone());
+        let events: Vec<_> = std::iter::from_fn(|| bus.try_recv().ok()).collect();
+        assert!(!events.iter().any(|e| matches!(e, BusEvent::Status { .. })));
+        assert_eq!(events.iter().filter(|e| matches!(e, BusEvent::Settled { .. })).count(), 1);
+        e.rt.inner.record_settlement(&child, expected);
+        assert!(bus.try_recv().is_err(), "repeated settlement must emit nothing");
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_complete_child_results_across_both_delivery_boundaries_once() {
+        for after_outbox in [false, true] {
+            let answer = "complete answer\n".repeat(1_000);
+            let e = env(Script::new(move |_, _| {
+                Action::Reply(Reply::tool("finish", json!({"answer": answer}).to_string()).with_usage(Usage {
+                    prompt_tokens: 4321,
+                    cached_tokens: 1234,
+                    completion_tokens: 321,
+                    reasoning_tokens: 21,
+                }))
+            }))
+            .await;
+            let (parent, child, completed) = unreceived_child(&e).await;
+            assert!(completed.full.is_some());
+            assert_eq!(completed.payload, json!({"quotes": []}));
+            let paths = Paths::at(e.dir.path().join("home"));
+            if after_outbox {
+                // Crash after syncing the result, before TurnEnd/SessionEnd/status.json.
+                let records = read_records(&paths.session_log(&child)).unwrap().records;
+                let pos = records.iter().position(|r| matches!(r.event, Event::ChildCompleted(_))).unwrap();
+                let text = std::fs::read_to_string(paths.session_log(&child)).unwrap();
+                std::fs::write(
+                    paths.session_log(&child),
+                    format!("{}\n", text.lines().take(pos + 1).collect::<Vec<_>>().join("\n")),
+                )
+                .unwrap();
+                write_json_atomic(&paths.session_dir(&child).join("status.json"), &idle_status()).unwrap();
+            }
+            let expected = Settlement {
+                child: completed.child,
+                role: completed.role,
+                outcome: completed.outcome,
+                report: completed.report,
+                full: completed.full,
+                payload: completed.payload,
+                steps: completed.steps,
+                usage: completed.usage,
+            };
+            for _ in 0..2 {
+                let rt = Runtime::start(e.config.clone(), paths.clone()).await.unwrap();
+                until("recovered child receipt", || {
+                    rt.records(&parent, None, 2_000).unwrap().iter().any(|r| matches!(r.event, Event::ChildSettled(_)))
+                })
+                .await;
+                let restored = rt.inner.st().known.get(&child).unwrap().settlement.clone().unwrap();
+                assert_eq!(restored, expected, "every typed field must survive restart");
+                assert!(!rt.session(&child).unwrap().active, "completed child must not act again");
+                assert_eq!(rt.session(&child).unwrap().status.phase, Phase::Ended);
+                let receipts: Vec<_> = rt
+                    .records(&parent, None, 2_000)
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|r| match r.event {
+                        Event::ChildSettled(c) if c.child == child => Some((r.author, c)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(receipts.len(), 1, "one receipt across repeated recovery");
+                assert_eq!(receipts[0].0, Author::Agent(child.clone()));
+                assert_eq!(receipts[0].1.report, expected.report);
+                assert_eq!(receipts[0].1.full, expected.full);
+                assert_eq!(receipts[0].1.usage, expected.usage);
+                assert_eq!(receipts[0].1.steps, expected.steps);
+                rt.shutdown().await;
+            }
+            assert_eq!(e.server.requests().len(), 1, "recovery makes no child or parent inference");
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_awaited_outbox_recovers_and_is_acknowledged_once() {
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let parent = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let child =
+            e.rt.inner
+                .spawn_child(
+                    &parent,
+                    SpawnReq {
+                        role: "worker".into(),
+                        mode: SpawnMode::Fresh,
+                        brief: Brief { question: "inspect this".into(), ..Brief::default() },
+                        budget: Budget::default(),
+                        call_id: CallId::from("awaited-stop"),
+                        title: "stopped awaited child".into(),
+                        awaited: true,
+                        harness: false,
+                        prerequisite: None,
+                    },
+                )
+                .await
+                .unwrap();
+        until("child request", || !e.server.requests().is_empty()).await;
+        e.rt.stop(&child).await.unwrap();
+        until("stopped child", || e.rt.session(&child).is_some_and(|s| s.status.phase == Phase::Ended && !s.active))
+            .await;
+        let expected = completed_settlement(&e.records(&child), &child).unwrap();
+        assert_eq!(expected.outcome, ChildOutcome::Stopped);
+        assert!(!e.has(&parent, |ev| matches!(ev, Event::ChildSettled(_))));
+        e.rt.shutdown().await;
+
+        let paths = Paths::at(e.dir.path().join("home"));
+        for _ in 0..2 {
+            let rt = Runtime::start(e.config.clone(), paths.clone()).await.unwrap();
+            until("stopped child receipt", || {
+                rt.records(&parent, None, 2_000).unwrap().iter().any(|r| matches!(r.event, Event::ChildSettled(_)))
+            })
+            .await;
+            assert_eq!(rt.inner.st().known.get(&child).unwrap().settlement.as_ref(), Some(&expected));
+            assert!(!rt.session(&child).unwrap().active);
+            let receipts: Vec<_> = rt
+                .records(&parent, None, 2_000)
+                .unwrap()
+                .into_iter()
+                .filter_map(|r| match r.event {
+                    Event::ChildSettled(c) if c.child == child => Some(c),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].outcome, ChildOutcome::Stopped);
+            assert_eq!(receipts[0].report, expected.report);
+            rt.shutdown().await;
+        }
+        assert_eq!(e.server.requests().len(), 1, "stopped child is never resumed");
+    }
+
+    #[tokio::test]
+    async fn archived_family_retains_complete_child_result_for_join_after_unarchive() {
+        let e = env(Script::new(|_, _| finish("durable archived result"))).await;
+        let (parent, child, _) = unreceived_child(&e).await;
+        let paths = Paths::at(e.dir.path().join("home"));
+        let expected =
+            completed_settlement(&read_records(&paths.session_log(&child)).unwrap().records, &child).unwrap();
+        for id in [&parent, &child] {
+            let path = paths.session_dir(id).join("meta.json");
+            let mut meta: SessionMeta = read_json(&path).unwrap();
+            meta.archived = true;
+            write_json_atomic(&path, &meta).unwrap();
+        }
+        let rt = Runtime::start(e.config.clone(), paths).await.unwrap();
+        assert!(!rt.session(&parent).unwrap().active);
+        assert!(!rt.records(&parent, None, 2_000).unwrap().iter().any(|r| matches!(r.event, Event::ChildSettled(_))));
+        assert_eq!(rt.inner.st().known.get(&child).unwrap().settlement.as_ref(), Some(&expected));
+        rt.archive(&parent, false).await.unwrap();
+        rt.inner.activate(&parent).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            rt.inner.orch.join(&parent, &child, &CancellationToken::new()),
+        )
+        .await
+        .expect("join must not wait on an already completed archived child")
+        .unwrap();
+        assert_eq!(result, expected);
+        rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_child_without_a_complete_result_recovers_as_incomplete_not_successful() {
+        let e = env(Script::new(|_, _| finish("this answer was never durably stored"))).await;
+        let (parent, child, _) = unreceived_child(&e).await;
+        let paths = Paths::at(e.dir.path().join("home"));
+        let records = read_records(&paths.session_log(&child)).unwrap().records;
+        let pos = records.iter().position(|r| matches!(r.event, Event::ChildCompleted(_))).unwrap();
+        let text = std::fs::read_to_string(paths.session_log(&child)).unwrap();
+        std::fs::write(
+            paths.session_log(&child),
+            format!("{}\n", text.lines().take(pos).collect::<Vec<_>>().join("\n")),
+        )
+        .unwrap();
+        // The settlement kept beside the log is a complete result too: a legacy child had none.
+        let _ = std::fs::remove_file(paths.session_dir(&child).join("settlement.json"));
+        let (mut log, _) =
+            loom_core::log::SessionLog::open(&paths.session_log(&child), loom_core::log::Durability::Always).unwrap();
+        log.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Finished }).unwrap();
+        log.append(
+            Author::Harness,
+            Event::SessionEnd { outcome: SessionOutcome::Done, detail: "Outcome: returned".into() },
+        )
+        .unwrap();
+        drop(log);
+        let rt = Runtime::start(e.config.clone(), paths).await.unwrap();
+        until("legacy recovery receipt", || {
+            rt.records(&parent, None, 2_000).unwrap().iter().any(|r| matches!(r.event, Event::ChildSettled(_)))
+        })
+        .await;
+        let result = rt.inner.st().known.get(&child).unwrap().settlement.clone().unwrap();
+        assert_eq!(result.outcome, ChildOutcome::Failed);
+        assert!(result.report.contains("Recovery incomplete"));
+        assert!(result.report.contains("no durable result payload"));
+        assert_eq!(result.payload, json!({"recovery_incomplete": true}));
+        assert!(result.full.is_none());
+        rt.shutdown().await;
     }
 
     #[test]

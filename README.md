@@ -216,6 +216,9 @@ operator-contract verification. They are opt-in and require explicit scope and a
 see [CTF](packs/ctf/README.md), [Redteam](packs/redteam/README.md), and the
 [qualification protocol](docs/SECURITY-EVAL.md). External model/corpus performance is unmeasured.
 
+`harnessmm` is an opt-in experimental pack for bounded guarded continuations. See
+[`docs/HARNESSMM.md`](docs/HARNESSMM.md) for its limits and evaluation protocol.
+
 ## Building and testing
 
 ```

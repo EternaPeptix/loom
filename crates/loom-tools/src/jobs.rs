@@ -258,6 +258,7 @@ pub fn clear_leftovers(dir: &Path) -> Vec<Leftover> {
         };
         // The group is never probed again: its id may be reused from now on.
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.owner", status_path.display()));
         if !left.ended_by_itself() {
             let _ = std::fs::remove_file(&left.out_path);
             let _ = std::fs::remove_file(&status_path);
@@ -570,12 +571,9 @@ impl Drop for JobTable {
             if st.ended_ms.is_none() {
                 *lock(&j.grace) = Duration::ZERO;
                 j.stop.cancel();
-                if let Some(pid) = i32::try_from(st.info.pid).ok().filter(|p| *p > 1) {
-                    // SAFETY: kill(2) takes plain integers and has no memory effects. The group is the
-                    // job's own (it was spawned as a group leader) and the job has not settled.
-                    unsafe {
-                        libc::kill(-pid, libc::SIGKILL);
-                    }
+                // The same identity check as at restart: never an unchecked numeric pid.
+                if let Some(record) = proc::read_pid_record(&proc::pid_path(&st.info.out_path)) {
+                    proc::kill_recorded_group(&record);
                 }
             }
         }
@@ -636,19 +634,35 @@ async fn watch(
         }
     }
     let state = match end {
+        WaitEnd::Ended(Ended::TrackingFailed(error)) => {
+            detail = error.clone();
+            JobState::Ended(Ended::TrackingFailed(error))
+        }
         WaitEnd::Ended(e) => JobState::Ended(e),
         WaitEnd::Cancelled | WaitEnd::Deadline => {
             let grace = *lock(&shared.grace);
             // A command that ignores TERM does not get to write past the limit during the grace period.
-            running.terminate_within(grace, max_output_bytes).await;
-            detail = std::mem::take(&mut *lock(&shared.why));
-            JobState::Killed
+            match running.terminate_within(grace, max_output_bytes).await {
+                Ended::TrackingFailed(error) => {
+                    detail = error.clone();
+                    JobState::Ended(Ended::TrackingFailed(error))
+                }
+                _ => {
+                    detail = std::mem::take(&mut *lock(&shared.why));
+                    JobState::Killed
+                }
+            }
         }
         WaitEnd::TooMuchOutput => {
-            // No grace: a command that ignores TERM would otherwise keep writing.
-            running.kill().await;
             detail = format!("stopped by the harness: the output passed the limit of {max_output_bytes} bytes");
-            JobState::Killed
+            // No grace: a command that ignores TERM would otherwise keep writing.
+            match running.kill().await {
+                Ended::TrackingFailed(error) => {
+                    detail.push_str(&format!("; {error}"));
+                    JobState::Ended(Ended::TrackingFailed(error))
+                }
+                _ => JobState::Killed,
+            }
         }
     };
     // A job whose own command had exited keeps that status: only what it left running was stopped.
@@ -663,9 +677,11 @@ async fn watch(
         }
         (state, _) => state,
     };
-    // The process group is gone (or `terminate` gave up on it); the files are final.
+    // Only a complete group has final output. A failed ownership/inspection check is reported as
+    // a failure, with the available snapshot and its explicit detail, rather than a successful kill.
     let path = lock(&shared.st).info.out_path.clone();
     let _ = std::fs::remove_file(proc::pid_path(&path));
+    running.remove_owner();
     let output = store_output(&blobs, &path, max_output_bytes, &mut detail);
     let info = {
         let mut st = lock(&shared.st);
@@ -776,6 +792,72 @@ mod tests {
         // Killing it and waiting for it send nothing more.
         f.table.kill("j1", Duration::from_millis(100)).await.expect("kill ended job");
         f.table.wait("j1", Duration::from_millis(10), &never()).await.expect("wait");
+        f.assert_quiet().await;
+    }
+
+    #[tokio::test]
+    async fn settlement_waits_for_late_output_after_the_shell_exits() {
+        let mut f = fx();
+        f.start("(sleep 0.6; echo late) & echo first; exit 7").await;
+        let _ = f.event().await;
+        let view = f.table.wait("j1", Duration::from_millis(150), &never()).await.expect("first view");
+        assert_eq!(view.info.state, JobState::Running);
+        assert!(f.table.output_blob("j1").is_none());
+        let JobEvent::Settled { info, output, .. } = f.event().await else { panic!("settled") };
+        assert_eq!(info.state, JobState::Ended(Ended::Exit(7)));
+        assert_eq!(f.stored(&output.expect("output")), "first\nlate\n");
+        f.assert_quiet().await;
+    }
+
+    #[tokio::test]
+    async fn job_kill_reaches_a_group_whose_shell_already_exited() {
+        let mut f = fx();
+        let info = f.start("sleep 300 & echo $!; exit 0").await;
+        let _ = f.event().await;
+        for _ in 0..100 {
+            if std::fs::read_to_string(&info.exit_path).unwrap_or_default().trim() == "0" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(std::fs::read_to_string(&info.exit_path).expect("status").trim(), "0");
+        let output = std::fs::read_to_string(&info.out_path).expect("pid output");
+        let child: u32 = output.trim().parse().expect("descendant pid");
+        assert!(alive(child), "the descendant outlives its shell");
+        for _ in 0..200 {
+            if f.table.leader_status("j1").is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(f.table.peek("j1").await.expect("peek").info.state, JobState::Running);
+        let view = f.table.kill("j1", Duration::from_millis(100)).await.expect("kill descendants");
+        // The shell had exited 0 and the job has seen it: that status stays the job's; only what it
+        // left running was killed.
+        assert_eq!(view.info.state, JobState::Ended(Ended::Exit(0)));
+        let JobEvent::Settled { output, .. } = f.event().await else { panic!("settled") };
+        assert_eq!(f.stored(&output.expect("stored")), format!("{child}\n"));
+        for _ in 0..200 {
+            if !alive(child) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!alive(child), "job_kill must stop the descendant");
+        f.assert_quiet().await;
+    }
+
+    #[tokio::test]
+    async fn late_descendant_output_still_triggers_a_job_limit() {
+        let mut f = fx_with(2000);
+        f.start("(sleep 0.3; head -c 5000 /dev/zero; sleep 300) & exit 0").await;
+        let _ = f.event().await;
+        let JobEvent::Settled { info, output, detail } = f.event().await else { panic!("settled") };
+        // The shell had exited 0: that status stays the job's, and the detail says what was stopped.
+        assert_eq!(info.state, JobState::Ended(Ended::Exit(0)));
+        assert!(info.output_bytes > 2000);
+        assert!(output.is_some());
+        assert!(detail.contains("limit of 2000 bytes"));
         f.assert_quiet().await;
     }
 

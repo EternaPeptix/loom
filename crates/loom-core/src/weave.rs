@@ -290,7 +290,25 @@ fn build(records: &[Record]) -> (Weave, Vec<Aux<'_>>) {
 
     for rec in records {
         let seq = rec.seq;
-        match &rec.event {
+        // Project an earlier model-authored action into the native call/result message shape.
+        // Its durable event remains StoredAction, so accounting never invents an inference.
+        let stored_projection;
+        let event = if let Event::StoredAction(action) = &rec.event {
+            stored_projection = Event::ModelResponse(crate::event::ModelResponse {
+                req_id: action.omitted_callback.clone(),
+                text: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![action.call.clone()],
+                finish: crate::event::FinishReason::ToolCalls,
+                usage: Default::default(),
+                timing: Default::default(),
+                attempts: 0,
+            });
+            &stored_projection
+        } else {
+            &rec.event
+        };
+        match event {
             Event::SessionStart(s) if !started => {
                 started = true;
                 let mut msg = Message::system(s.system_prompt.clone());
@@ -401,7 +419,8 @@ fn build(records: &[Record]) -> (Weave, Vec<Aux<'_>>) {
                     result: None,
                 };
                 let chars = msg.content.len() + aux.reasoning + calls_chars(&msg.tool_calls);
-                entries.push((item(seq, "model_response", Role::Assistant, chars, state, &shown), aux));
+                let kind = if matches!(rec.event, Event::StoredAction(_)) { "stored_action" } else { "model_response" };
+                entries.push((item(seq, kind, Role::Assistant, chars, state, &shown), aux));
                 if !msg.tool_calls.is_empty() || !msg.content.is_empty() {
                     elems.push(Elem { group: seq, msg, entry: Some(entries.len() - 1) });
                 }
@@ -577,7 +596,9 @@ fn plan_on(
         records.last()?.seq
     } else {
         let steps: Vec<usize> = (0..records.len())
-            .filter(|&i| records.get(i).is_some_and(|r| matches!(r.event, Event::ModelResponse(_))))
+            .filter(|&i| {
+                records.get(i).is_some_and(|r| matches!(r.event, Event::ModelResponse(_) | Event::StoredAction(_)))
+            })
             .collect();
         let first_recent = match steps.len().checked_sub(keep) {
             Some(k) => *steps.get(k)?,
@@ -800,6 +821,84 @@ mod tests {
 
     const FLOOR_ZERO: ReweavePolicy =
         ReweavePolicy { target_tokens: 0, floor_tokens: 0, keep_recent_steps: 1, stub_tail_lines: 3 };
+
+    #[test]
+    fn stored_actions_keep_native_call_result_pairs_without_inventing_inference() {
+        let mut l = Log::new();
+        l.user("Continue the authored plan.");
+        let call = ToolCallRequest {
+            call_id: "stored-1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"true"}"#.into(),
+            complete: true,
+        };
+        let action_seq = l.push(
+            Author::Harness,
+            Event::StoredAction(crate::event::StoredAction {
+                plan_id: "p".into(),
+                source_call: "author".into(),
+                node: 1,
+                omitted_callback: "omitted-1".into(),
+                call: call.clone(),
+                arguments_hash: "hash".into(),
+                predecessor: None,
+                file_guards: serde_json::json!([]),
+                guard_ms: 1,
+            }),
+        );
+        l.push(
+            Author::Tool,
+            Event::ToolResult(ToolResult {
+                call_id: call.call_id,
+                name: "bash".into(),
+                status: ToolStatus::Ok,
+                text: "native receipt".into(),
+                output: None,
+                cut: false,
+                class: ToolClass::Exec,
+                meta: Default::default(),
+                duration_ms: 2,
+            }),
+        );
+        let w = weave(&l.recs);
+        assert_eq!(w.messages.len(), 4);
+        assert_eq!(w.messages[2].tool_calls[0].arguments, call.arguments);
+        assert_eq!(w.messages[3].content, "native receipt");
+        assert!(w.items.iter().any(|item| item.seq == action_seq && item.kind == "stored_action"));
+        assert!(!l.recs.iter().any(|r| matches!(r.event, Event::ModelRequest(_) | Event::ModelResponse(_))));
+    }
+
+    #[test]
+    fn stored_dispatches_bound_the_recent_region_for_output_eviction() {
+        let mut l = Log::new();
+        let mut output_seqs = Vec::new();
+        for node in 1..=3 {
+            let id = format!("stored-{node}");
+            l.push(
+                Author::Harness,
+                Event::StoredAction(crate::event::StoredAction {
+                    plan_id: "p".into(),
+                    source_call: "author".into(),
+                    node,
+                    omitted_callback: format!("omitted-{node}"),
+                    call: ToolCallRequest {
+                        call_id: id.clone().into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                        complete: true,
+                    },
+                    arguments_hash: "hash".into(),
+                    predecessor: None,
+                    file_guards: serde_json::json!([]),
+                    guard_ms: 1,
+                }),
+            );
+            output_seqs.push(l.result(&id, ToolClass::Exec, &"large output\n".repeat(1_000)));
+        }
+        let plan = plan_reweave(&l.recs, &TokenEstimator::default(), &FLOOR_ZERO, false).unwrap();
+        assert!(plan.evictions.iter().any(|e| e.seq == output_seqs[0]));
+        assert!(plan.evictions.iter().all(|e| e.seq != output_seqs[2]));
+    }
 
     struct Log {
         recs: Vec<Record>,
