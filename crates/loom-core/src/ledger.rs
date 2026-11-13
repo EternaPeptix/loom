@@ -126,6 +126,8 @@ pub enum LedgerOp {
         #[serde(default)]
         note: Option<String>,
     },
+    /// Additive typed security observations; no change to existing op shapes.
+    Security(crate::security_state::SecurityOp),
 }
 
 /// Where the goal-met claim stands. There is deliberately no `Withdrawn`: once concluded it can only
@@ -342,6 +344,9 @@ pub struct ScopeGrantRecord {
 /// approvals `a1…`, questions `q1…`, finish claims `f1…`, scope grants `s1…`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerState {
+    /// Security observations and deterministic causal projections. Absent in older snapshots.
+    #[serde(default)]
+    pub security: crate::security_state::SecurityState,
     pub goal: Option<String>,
     pub constraints: Vec<Constraint>,
     pub plan: Vec<PlanStep>,
@@ -368,6 +373,10 @@ pub struct LedgerState {
 
 // ---------------------------------------------------------------------------------------------
 // CONTRACT.
+// `Security` delegates validation/folding to `security_state`, whose contract defines its additive
+// records. Security IDs never reuse existing ledger prefixes. The complete security state appears
+// in generated Markdown; `security_query` exposes typed bounded projections. Coverage is checked by
+// the runtime finish gate using `security.mandatory_open()`; legacy missions have no security assets.
 //
 // Ids are assigned by position: the i-th `ConstraintAdd` is `k{i}`, plan steps `p{i}` (a `PlanSet`
 // REPLACES the plan: earlier steps not `Done` become `Dropped` with note "replaced by a new plan" and
@@ -566,6 +575,7 @@ impl LedgerState {
         self.entries = self.entries.saturating_add(1);
         let n = entry.n;
         match &entry.op {
+            LedgerOp::Security(op) => self.security.apply(op, n, &entry.session),
             LedgerOp::GoalSet { text } => {
                 self.goal = Some(text.clone());
                 if self.goal_met.is_none() {
@@ -738,6 +748,7 @@ impl LedgerState {
 
     pub fn validate(&self, op: &LedgerOp, from_user: bool) -> Result<(), String> {
         match op {
+            LedgerOp::Security(op) => self.security.validate(op, self)?,
             LedgerOp::GoalSet { text } => {
                 if !from_user {
                     return Err(user_only("The goal"));
@@ -916,6 +927,10 @@ impl LedgerState {
                 let open = self.open_items();
                 if !open.is_empty() {
                     return Err(self.open_items_refusal(&open));
+                }
+                let uncovered = self.security.mandatory_open();
+                if !uncovered.is_empty() {
+                    return Err(format!("Cannot finish yet: mandatory security coverage is untested for {}. Use security_record coverage_set to cite attested test evidence or defer each asset with a reason, then finish again.", uncovered.join(", ")));
                 }
             }
             LedgerOp::FinishVerdict { claim, .. } => {
@@ -1210,6 +1225,13 @@ impl LedgerState {
         let mut o =
             String::from("<!-- generated from the mission journal; edits here are ignored -->\n\n# Mission ledger\n");
         o.push_str(&format!("\nEntries folded: {}\n", self.entries));
+        if self.security != crate::security_state::SecurityState::default() {
+            if let Ok(json) = serde_json::to_string_pretty(&self.security) {
+                o.push_str("\n## Security observations\n\n```json\n");
+                o.push_str(&json);
+                o.push_str("\n```\n");
+            }
+        }
 
         o.push_str("\n## Goal\n\n");
         match &self.goal {
@@ -1422,6 +1444,7 @@ impl LedgerState {
     /// One line describing an op, for the session log's `ledger` event (`summary`).
     pub fn summarize(op: &LedgerOp) -> String {
         let s = match op {
+            LedgerOp::Security(_) => "security state updated (use security_query for typed records)".to_string(),
             LedgerOp::GoalSet { text } => format!("goal set: {text}"),
             LedgerOp::ConstraintAdd { text } => format!("constraint added: {text}"),
             LedgerOp::ConstraintRetire { id, reason } => format!("constraint {id} retired: {reason}"),

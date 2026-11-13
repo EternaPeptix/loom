@@ -26,6 +26,7 @@ pub mod agents;
 pub mod ledger;
 pub mod misc;
 pub mod scope;
+pub mod security;
 pub mod terminal;
 #[cfg(test)]
 pub(crate) mod testkit;
@@ -318,6 +319,9 @@ pub fn tool(name: &str, shared: &Arc<Shared>) -> Option<Arc<dyn loom_tools::Tool
         "claim_update" => Arc::new(ledger::ClaimUpdate(s)),
         "evidence" => Arc::new(ledger::Evidence(s)),
         "ledger" => Arc::new(ledger::Ledger(s)),
+        "security_record" => Arc::new(security::SecurityRecord(s)),
+        "security_query" => Arc::new(security::SecurityQuery(s)),
+        "security_ingest" => Arc::new(security::SecurityIngest(s)),
         "pin" => Arc::new(misc::Pin(s)),
         "log_search" => Arc::new(misc::LogSearch(s)),
         "finish" => Arc::new(terminal::Finish(s)),
@@ -372,6 +376,9 @@ pub const NAMES: &[&str] = &[
     "claim_update",
     "evidence",
     "ledger",
+    "security_record",
+    "security_query",
+    "security_ingest",
     "pin",
     "log_search",
     "finish",

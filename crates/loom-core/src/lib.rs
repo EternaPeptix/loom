@@ -27,6 +27,7 @@ pub mod log;
 pub mod message;
 pub mod observe;
 pub mod prefix;
+pub mod security_state;
 pub mod tagsafe;
 pub mod weave;
 

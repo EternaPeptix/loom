@@ -277,3 +277,13 @@ upgrade" first; the rest says what behaves differently.
   judge delivers a scope check through `verdict`. `vr` documents its network policy.
 - `README.md`, `docs/RUN.md`, `docs/config.example.toml` and `docs/IMPLEMENTING.md` were rewritten to
   match the code. `SECURITY.md` was added. `docs/REVIEW-COVERAGE.md` is a dated record.
+
+### Durable security state
+
+- Add evidence-linked typed assets, secret handles, footholds, mandatory coverage dispositions,
+  condition revisits, bounded crash attempts, and independently judged hypotheses to the sealed ledger.
+- Add bounded stratified causal rules, provenance explanations, nonmutating hypothetical queries,
+  downstream retraction invalidation, aliases, and expiry-aware path suggestions.
+- Add opt-in `security_record`, `security_query`, and observed-blob `security_ingest` tools with atomic
+  scanner imports. Existing journal op shapes and old ledger snapshots remain readable; older builds
+  refuse append after the new `security` op. See `docs/SECURITY_STATE.md` for limits and supported formats.
