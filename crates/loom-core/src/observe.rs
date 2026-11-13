@@ -188,6 +188,7 @@ pub fn coverage(records: &[Record]) -> BTreeMap<BlobId, Coverage> {
                 }
             }
             Event::JobSettled { output: Some(o), .. } => note_total(&o.id, o.lines),
+            Event::JobMatched { output: Some(o), .. } => note_total(&o.id, o.lines),
             Event::ChildSettled(c) => {
                 if let Some(o) = &c.full {
                     note_total(&o.id, o.lines);

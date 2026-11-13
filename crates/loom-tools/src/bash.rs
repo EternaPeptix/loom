@@ -39,6 +39,14 @@
 //! 5. When the exit status is not 0, the sandbox is in seatbelt mode and the output contains
 //!    `Operation not permitted`, add the fact `sandboxed: writes only under the workspace and temp
 //!    dir; network only via proxy` — a reminder, not a diagnosis.
+//! 6. `wake_on` (a regular expression) makes whatever job the call leaves behind a watched one
+//!    (`jobs`, "Watched output"): `Watch::new(wake_on, wake_every_s or cfg.job_wake_gap_s,
+//!    cfg.job_wake_max)`, whose refusal is the error result, before anything is spawned. Every
+//!    registration above passes it on (`register_watched`), so the watch starts after the output the
+//!    result showed. The result of a call that leaves a watched job carries the fact `watched: you
+//!    are told, and resumed if you are waiting, when its output has a line matching /{pattern}/`
+//!    (for `background` the body ends with that sentence instead). `wake_on` on a command that ends
+//!    in the foreground does nothing, and `wake_every_s` without `wake_on` is ignored.
 //!
 //! ## `job_wait` / `job_kill` / `job_list`
 //! `job_wait`: `ctx.jobs.wait(job, timeout_s or cfg.job_wait_s, ctx.cancel)`. Outcome: the state's
@@ -53,16 +61,19 @@
 //! `job_kill`: `ctx.jobs.kill`, same rendering, outcome prefixed by what happened.
 //! `job_list`: one line per job: `{id}  {state}  {elapsed}s  {output_bytes} bytes  {command (≤ 120
 //! chars)}`, or `(no jobs)`; the state of a job that runs on after its own command has exited is
-//! `running (the command itself has exited: {status})`.
+//! `running (the command itself has exited: {status})`, and a job whose watch can still report has
+//! `, watched for /{pattern}/` after `running`.
 //! An unknown job id is an error result carrying the table's sentence.
 //!
 //! Tests required (real processes, sandbox mode `none`, through `crate::execute` so that the
 //! envelope and the stored output are exercised): exit 0 / non-zero with the right status, facts and
 //! meta; stderr captured in order; `cwd`; bad `cwd`; `timeout_s` stops and reports; foreground limit
 //! promotes to a job and `job_wait` then returns only the rest; `background`; cancel; output limit;
-//! job tools incl. unknown id; a long output is stored whole and the result is a cut with a handle.
+//! job tools incl. unknown id; a long output is stored whole and the result is a cut with a handle;
+//! `wake_on` on a background call and on a promoted one (the watch starts after what was shown), a
+//! refused pattern runs nothing, `job_list` names the watch.
 
-use crate::jobs::{JobState, JobView};
+use crate::jobs::{JobState, JobView, Watch};
 use crate::proc::{self, Ended, Running, Spawn, WaitEnd};
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
@@ -171,6 +182,8 @@ impl Tool for Bash {
                 params::opt("background", "boolean", "Start the command as a background job and return immediately (default false). Use for servers and long runs; read its output with job_wait."),
                 params::opt("cwd", "string", "Directory to run in (default: the workspace)."),
                 params::opt("idle_timeout_s", "integer", "Stop a foreground command after this many seconds without output. Silent computation can also trigger it; omitted means no idle watchdog.").min(1).max(300),
+                params::opt("wake_on", "string", "For a background job: a regular expression. When a line of the job's output matches it you are told at once, with the matching lines and the handle of that part of the output, and if you had ended your turn with `wait` you are resumed, as when a job ends. Use it for a fuzzer, cracker, scan or listener that runs for hours and matters only when it finds something, e.g. `(?i)crash|panic|FOUND`. Rust regex syntax, matched line by line."),
+                params::opt("wake_every_s", "integer", "With `wake_on`: tell you at most once in this many seconds; lines that match in between come with the next notice (default 30).").min(1).max(3600),
             ],
         )
     }
@@ -259,7 +272,11 @@ impl Tool for JobList {
                     Some(leader) => format!("running (the command itself has exited: {})", leader.outcome()),
                     None => j.state.outcome(),
                 };
-                format!("{}  {}  {}s  {} bytes  {}", j.id, state, elapsed, j.output_bytes, command)
+                let watched = match ctx.jobs.watching(&j.id) {
+                    Some(pattern) => format!(", watched for /{}/", crate::preview(&pattern, 60)),
+                    None => String::new(),
+                };
+                format!("{}  {}{}  {}s  {} bytes  {}", j.id, state, watched, elapsed, j.output_bytes, command)
             })
             .collect();
         ToolOutput::ok(format!("{} jobs", jobs.len()), Body::Message(lines.join("\n")))
@@ -352,6 +369,14 @@ fn finish(f: Finish<'_>) -> ToolOutput {
     }
 }
 
+/// What the result of a call says about the watch on the job it leaves behind.
+fn watched_fact(watch: &Watch) -> String {
+    format!(
+        "watched: you are told, and resumed if you are waiting, when its output has a line matching /{}/",
+        crate::preview(watch.pattern(), 120)
+    )
+}
+
 async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
     let Some(command) = args.get("command").and_then(Value::as_str) else {
         return ToolOutput::error(
@@ -365,6 +390,16 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         }
     }
     let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
+    let watch = match args.get("wake_on").and_then(Value::as_str) {
+        Some(pattern) => {
+            let gap = args.get("wake_every_s").and_then(Value::as_u64).unwrap_or(ctx.cfg.job_wake_gap_s);
+            match Watch::new(pattern, Duration::from_secs(gap), ctx.cfg.job_wake_max) {
+                Ok(watch) => Some(watch),
+                Err(sentence) => return ToolOutput::error(format!("{sentence} Nothing was run.")),
+            }
+        }
+        None => None,
+    };
     let cwd = match args.get("cwd").and_then(Value::as_str) {
         Some(given) => ctx.sandbox.resolve(given),
         None => ctx.workspace.clone(),
@@ -394,10 +429,11 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
     };
 
     if background {
-        ctx.jobs.register(&id, &ctx.call_id, command, running).await;
+        let watched = watch.as_ref().map(|w| format!("; {}", watched_fact(w))).unwrap_or_default();
+        ctx.jobs.register_watched(&id, &ctx.call_id, command, running, 0, watch).await;
         let mut out = ToolOutput::ok(
             format!("started as job {id}"),
-            Body::Message(format!("(running in the background — job_wait(\"{id}\") returns its output)")),
+            Body::Message(format!("(running in the background — job_wait(\"{id}\") returns its output{watched})")),
         );
         out = out.with_meta(META_JOB, json!(id));
         return out;
@@ -466,7 +502,7 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
                 Ok(o) => o,
                 Err(e) if group_runs => {
                     // Not dropped, which would kill them unannounced: what is left goes on as a job.
-                    ctx.jobs.register(&id, &ctx.call_id, command, running).await;
+                    ctx.jobs.register_watched(&id, &ctx.call_id, command, running, 0, watch).await;
                     return ToolOutput::error(format!(
                         "{e} The command itself has ended ({}); other processes it started are still running as job {id}: job_wait(\"{id}\") returns their output, job_kill(\"{id}\") stops them.",
                         ended.outcome()
@@ -483,7 +519,8 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
             let mut facts: Vec<String> = note.into_iter().collect();
             if group_runs {
                 // The leader is over, the rest of its group is not: it goes on as a job, from after what is shown.
-                ctx.jobs.register_from(&id, &ctx.call_id, command, running, output.len() as u64).await;
+                facts.extend(watch.as_ref().map(watched_fact));
+                ctx.jobs.register_watched(&id, &ctx.call_id, command, running, output.len() as u64, watch).await;
                 facts.push(format!(
                     "other processes it started are still running, not finished — now job {id}; follow them with job_wait(\"{id}\"), stop them with job_kill(\"{id}\")"
                 ));
@@ -506,14 +543,15 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
             let (shown, note) = match read_all(&running, limit) {
                 Ok(o) => o,
                 Err(e) => {
-                    ctx.jobs.register(&id, &ctx.call_id, command, running).await;
+                    ctx.jobs.register_watched(&id, &ctx.call_id, command, running, 0, watch).await;
                     return ToolOutput::error(format!(
                         "{e} The command is still running as job {id}; job_wait(\"{id}\") returns its output."
                     ))
                     .with_meta(META_JOB, json!(id));
                 }
             };
-            ctx.jobs.register_from(&id, &ctx.call_id, command, running, shown.len() as u64).await;
+            let watched = watch.as_ref().map(watched_fact);
+            ctx.jobs.register_watched(&id, &ctx.call_id, command, running, shown.len() as u64, watch).await;
             let n = allowed.as_secs();
             ToolOutput {
                 status: ToolStatus::Ok,
@@ -521,6 +559,7 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
                 more: [
                     Some(format!("{:.1}s", elapsed.as_secs_f64())),
                     Some(format!("still running, not finished; follow it with job_wait(\"{id}\"), stop it with job_kill(\"{id}\")")),
+                    watched,
                     note,
                 ]
                 .into_iter()
@@ -832,6 +871,65 @@ mod tests {
                 assert!(!jobs.join(format!("{id}.{left}")).exists(), "{id}.{left} is left behind");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn wake_on_watches_a_background_job_and_job_list_names_the_watch() {
+        let mut e = env();
+        let r = e
+            .call("bash", json!({"command": "echo warming up; echo CRASH at 0x41; sleep 300", "background": true, "wake_on": "CRASH", "wake_every_s": 1}))
+            .await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(
+            r.text.contains("(running in the background — job_wait(\"j1\") returns its output; watched: you are told, and resumed if you are waiting, when its output has a line matching /CRASH/)"),
+            "{}",
+            r.text
+        );
+        assert!(matches!(e.job_events.recv().await, Some(JobEvent::Registered(_))));
+        let l = e.call("job_list", json!({})).await;
+        assert!(l.text.contains("j1  running, watched for /CRASH/  "), "{}", l.text);
+        let report = tokio::time::timeout(Duration::from_secs(20), e.job_events.recv()).await.expect("in time");
+        let Some(JobEvent::Matched(m)) = report else { panic!("a match, not {report:?}") };
+        assert_eq!(m.lines, [(2, "CRASH at 0x41".to_string())]);
+        assert!(m.running);
+        // What the watch reported is still new to job_wait.
+        let w = e.call("job_wait", json!({"job": "j1", "timeout_s": 0})).await;
+        assert_eq!(e.stored(&w), "warming up\nCRASH at 0x41\n");
+        e.call("job_kill", json!({"job": "j1"})).await;
+        let l = e.call("job_list", json!({})).await;
+        assert!(l.text.contains("j1  killed  "), "{}", l.text);
+    }
+
+    #[tokio::test]
+    async fn wake_on_a_promoted_job_starts_after_what_was_shown_and_a_bad_pattern_runs_nothing() {
+        let cfg = ToolsCfg { bash_foreground_s: 1, ..ToolsCfg::default() };
+        let mut e = bash_env(cfg);
+        let marker = e.ctx.tmp_dir.join("ran");
+        let r = e.call("bash", json!({"command": format!("touch {}", marker.display()), "wake_on": "(unclosed"})).await;
+        assert_eq!(r.status, ToolStatus::Error);
+        assert!(r.text.contains("`wake_on` is not a regular expression that can be used"), "{}", r.text);
+        assert!(r.text.contains("Nothing was run."), "{}", r.text);
+        assert!(!marker.exists());
+
+        // The first "hit" is in the result the model was shown; only the second is reported.
+        let r = e
+            .call("bash", json!({"command": "echo hit one; sleep 2; echo hit two; sleep 300", "wake_on": "^hit"}))
+            .await;
+        assert!(r.text.contains("still running after 1s — now job j1"), "{}", r.text);
+        assert!(
+            r.text.contains(
+                "watched: you are told, and resumed if you are waiting, when its output has a line matching /^hit/"
+            ),
+            "{}",
+            r.text
+        );
+        assert_eq!(e.stored(&r), "hit one\n");
+        assert!(matches!(e.job_events.recv().await, Some(JobEvent::Registered(_))));
+        let report = tokio::time::timeout(Duration::from_secs(20), e.job_events.recv()).await.expect("in time");
+        let Some(JobEvent::Matched(m)) = report else { panic!("a match, not {report:?}") };
+        assert_eq!(m.lines, [(1, "hit two".to_string())]);
+        assert_eq!(m.from, "hit one\n".len() as u64);
+        e.call("job_kill", json!({"job": "j1"})).await;
     }
 
     #[tokio::test]

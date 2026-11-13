@@ -152,6 +152,13 @@
 //!   the last `JOB_TAIL_LINES` lines of the stored output (`blobs.read_lines`), each cut with
 //!   `texts::cut(line, JOB_TAIL_LINE_CHARS)`. When a note was appended and the last turn ended
 //!   `Waiting` or `Yielded`, start a turn (`Trigger::JobSettled`).
+//! - `JobEvent::Matched(m)` (a watched job wrote lines matching its `wake_on` pattern): append
+//!   `job_matched{job_id, pattern, output, from, shown, matches}` authored `Tool` (`shown`: the line
+//!   numbers of `m.lines`), then `harness_note{Arrival, texts::job_matched(..)}` with those lines
+//!   and the handle of the stored part. When the last turn ended `Waiting` or `Yielded`, start a
+//!   turn (`Trigger::JobOutput`): a session that sleeps on a long job is woken by what the job
+//!   finds, not only by its end. During a turn the note is one more arrival; after a stop
+//!   (`Stopped`) it wakes nothing.
 //! - `Input::AgentMessage{from, text}`: append `harness_note{Arrival, texts::agent_message(text)}`
 //!   authored `Agent(from)`. Start a turn (`Trigger::Resume`) only if the last turn ended `Waiting`.
 //! - `Input::Resume`: start a turn (`Trigger::Resume`).
@@ -1882,7 +1889,7 @@ impl Session {
                     return Ok(End::Closed);
                 }
                 Ev::Input(Some(input)) => self.idle_input(input).await?,
-                Ev::Job(Some(event)) => self.on_job_event(event).await?.then_some(Trigger::JobSettled),
+                Ev::Job(Some(event)) => self.on_job_event(event).await?,
                 Ev::Job(None) => {
                     self.jobs_open = false;
                     None
@@ -2144,14 +2151,44 @@ impl Session {
     }
 
     /// Record a job event. True when a note was appended that should wake a waiting session.
-    async fn on_job_event(&mut self, event: JobEvent) -> R<bool> {
+    /// Record a job event. `Some`: the turn it starts when the session is idle.
+    async fn on_job_event(&mut self, event: JobEvent) -> R<Option<Trigger>> {
+        let asleep = matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
         match event {
             JobEvent::Registered(info) => {
                 self.append(
                     Author::Harness,
                     Event::JobRegistered { job_id: info.id, call_id: info.call_id, command: info.command },
                 )?;
-                Ok(false)
+                Ok(None)
+            }
+            JobEvent::Matched(m) => {
+                self.append(
+                    Author::Tool,
+                    Event::JobMatched {
+                        job_id: m.info.id.clone(),
+                        pattern: m.pattern.clone(),
+                        output: m.output.clone(),
+                        from: m.from,
+                        shown: m.lines.iter().map(|(n, _)| *n).collect(),
+                        matches: m.matches,
+                    },
+                )?;
+                let handle = m.output.as_ref().map(BlobRef::handle);
+                let text = texts::job_matched(&texts::JobMatchNote {
+                    id: &m.info.id,
+                    command: &m.info.command,
+                    pattern: &m.pattern,
+                    running: m.running,
+                    handle: handle.as_deref(),
+                    part_lines: m.output.as_ref().map_or(0, |b| b.lines),
+                    from: m.from,
+                    lines: &m.lines,
+                    matches: m.matches,
+                    last: m.last,
+                });
+                self.note(Author::Harness, NoteKind::Arrival, text)?;
+                Ok(asleep.then_some(Trigger::JobOutput))
             }
             JobEvent::Settled { info, output, detail } => {
                 let exit_code = match &info.state {
@@ -2168,11 +2205,11 @@ impl Session {
                     },
                 )?;
                 if self.end_shown(&info.id) {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 let text = self.job_note(&info.id, &info.command, &info.state.outcome(), &detail, output.as_ref());
                 self.note(Author::Harness, NoteKind::Arrival, text)?;
-                Ok(matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded)))
+                Ok(asleep.then_some(Trigger::JobSettled))
             }
         }
     }
@@ -5669,6 +5706,97 @@ mod tests {
         assert_eq!(count(&rs, "job_settled"), 1);
         assert!(rs.iter().any(|r| matches!(&r.event, Event::TurnStart { trigger: Trigger::JobSettled })));
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Waiting, TurnEndReason::Finished]);
+    }
+
+    #[tokio::test]
+    async fn a_watched_job_that_writes_a_matching_line_wakes_a_waiting_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("release");
+        // Bounded, so that a failed run leaves no loop behind. The job goes on after the line.
+        let command = format!(
+            "echo scanning; i=0; while [ ! -f '{}' ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done; echo 'FOUND key=abc'; sleep 120",
+            release.display()
+        );
+        let script = seq(vec![
+            Reply::tool("bash", json!({ "command": command, "background": true, "wake_on": "^FOUND" }).to_string())
+                .into(),
+            Reply::tool("wait", json!({}).to_string()).into(),
+            Reply::tool("job_kill", json!({ "job": "j1" }).to_string()).into(),
+            finish_call("done").into(),
+        ]);
+        let mut kid = Fx::new("worker", true, true, script).await;
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Run it.".into())));
+        let (tx, task) = spawn_run(session);
+        // The line is written only once the turn is waiting, however slow the machine is.
+        wait_until(&kid.sink, "the turn waits", |rs| count(rs, "turn_end") == 1).await;
+        assert_eq!(count(&kid.sink.records(), "job_matched"), 0);
+        std::fs::write(&release, "").unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(60), task).await.expect("the child did not settle").unwrap();
+        let End::Settled(s) = end else { panic!("expected a settlement, got {end:?}") };
+        assert_eq!(s.outcome, ChildOutcome::Returned);
+        drop(tx);
+        let rs = kid.sink.records();
+        // The match started the second turn while the job was still running: its end came later, by job_kill.
+        let ks = kinds(&rs);
+        let at = |kind: &str| ks.iter().position(|k| *k == kind).unwrap_or_else(|| panic!("no {kind} in {ks:?}"));
+        assert!(at("job_matched") < at("job_settled"), "{ks:?}");
+        assert!(rs.iter().any(|r| matches!(&r.event, Event::TurnStart { trigger: Trigger::JobOutput })));
+        assert!(!rs.iter().any(|r| matches!(&r.event, Event::TurnStart { trigger: Trigger::JobSettled })));
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Waiting, TurnEndReason::Finished]);
+        let matched = rs.iter().find_map(|r| match &r.event {
+            Event::JobMatched { job_id, pattern, output, shown, matches, .. } => {
+                Some((job_id.clone(), pattern.clone(), output.clone(), shown.clone(), *matches))
+            }
+            _ => None,
+        });
+        let (job, pattern, output, shown, matches) = matched.expect("job_matched");
+        assert_eq!((job.as_str(), pattern.as_str(), shown, matches), ("j1", "^FOUND", vec![2], 1));
+        let handle = output.expect("the part is stored").handle();
+        let arrivals = notes(&rs, NoteKind::Arrival);
+        let note = arrivals.iter().find(|n| n.contains("matching /^FOUND/")).expect("the note of the match");
+        assert!(
+            note.starts_with("Background job j1 is still running and has written 1 line matching /^FOUND/."),
+            "{note}"
+        );
+        assert!(
+            note.contains(&format!(
+                "That part of its output is stored as {handle} (2 lines, from byte 0 of what the job has written)"
+            )),
+            "{note}"
+        );
+        assert!(note.contains("\n> 2: FOUND key=abc\n"), "{note}");
+        assert!(
+            note.contains("job_wait(\"j1\") returns everything the job has written since you last looked"),
+            "{note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_match_during_a_turn_is_an_arrival_and_starts_no_turn() {
+        // The job writes its line at once; the turn is busy in job_wait when the report comes.
+        let script = seq(vec![
+            Reply::tool(
+                "bash",
+                json!({ "command": "echo 'panic: boom'; sleep 120", "background": true, "wake_on": "(?i)panic" })
+                    .to_string(),
+            )
+            .into(),
+            Reply::tool("job_wait", json!({ "job": "j1", "timeout_s": 4 }).to_string()).into(),
+            Reply::tool("job_kill", json!({ "job": "j1" }).to_string()).into(),
+            finish_call("done").into(),
+        ]);
+        let mut kid = Fx::new("worker", true, true, script).await;
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Run it.".into())));
+        let End::Settled(_) = run_with(session, vec![]).await else { panic!("expected a settlement") };
+        let rs = kid.sink.records();
+        assert_eq!(count(&rs, "job_matched"), 1, "{:?}", kinds(&rs));
+        let arrivals = notes(&rs, NoteKind::Arrival);
+        assert!(
+            arrivals.iter().any(|n| n.contains("matching /(?i)panic/") && n.contains("> 1: panic: boom")),
+            "{arrivals:?}"
+        );
+        assert_eq!(count(&rs, "turn_start"), 1);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Finished]);
     }
 
     #[tokio::test]

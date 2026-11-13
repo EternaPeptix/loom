@@ -58,6 +58,8 @@ web_fetch_timeout_s = 60
 web_fetch_max_bytes = 20971520   # 20 MiB
 max_output_bytes = 67108864      # a command whose output passes this (64 MiB) is stopped; the first part is kept
 job_wait_s = 120           # how long job_wait waits when the call gives no time
+job_wake_gap_s = 30        # a background job watched with `wake_on` is reported at most this often, when the call gives no time
+job_wake_max = 20          # reports per watched job; after the last one it is followed with job_wait
 # Start a reply's leading read-only calls (read, glob, grep, out_read, out_grep) while the model is
 # still writing the rest. Results are recorded in call order and used only if the finished reply holds
 # the same call. false = run calls only after the whole reply has arrived.

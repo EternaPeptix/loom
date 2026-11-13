@@ -125,6 +125,11 @@ pub struct ToolsCfg {
     pub max_output_bytes: u64,
     /// How long `job_wait` waits when the call gives no time.
     pub job_wait_s: u64,
+    /// The least time between two reports of a background job whose output is watched (`bash` with
+    /// `wake_on`), when the call gives none.
+    pub job_wake_gap_s: u64,
+    /// A watched job is reported this many times; after that it is followed with `job_wait`.
+    pub job_wake_max: u32,
     /// Start a reply's leading read-only calls (`read`, `glob`, `grep`, `out_read`, `out_grep`) while
     /// the rest of the reply is still streaming. What is recorded and shown is the same either way.
     pub speculate: bool,
@@ -141,6 +146,8 @@ impl Default for ToolsCfg {
             web_fetch_max_bytes: 20 * 1024 * 1024,
             max_output_bytes: 64 * 1024 * 1024,
             job_wait_s: 120,
+            job_wake_gap_s: 30,
+            job_wake_max: 20,
             speculate: true,
         }
     }

@@ -803,8 +803,9 @@ fn own_records(records: &[Record]) -> &[Record] {
 /// The stored output an event makes citable as evidence, and what produced it. A result's own
 /// output; the text a `read` showed (the result is a view, `META_OF_BLOB` names the stored file text);
 /// the complete output of a background job, attributed to the call that started it (`jobs` is filled by
-/// `job_registered`, which states that call, and emptied by `job_settled`; only `bash` starts jobs). A
-/// view of a runtime tool's output (`out_read`, `out_grep`) is not an observation and registers nothing.
+/// `job_registered`, which states that call, and emptied by `job_settled`; only `bash` starts jobs); the
+/// part of a running job's output a `job_matched` stored, attributed to the same call. A view of a
+/// runtime tool's output (`out_read`, `out_grep`) is not an observation and registers nothing.
 fn produced_by(
     session: &SessionId,
     jobs: &mut HashMap<(SessionId, String), Producer>,
@@ -835,6 +836,10 @@ fn produced_by(
         }
         Event::JobSettled { job_id, output, .. } => {
             let p = jobs.remove(&(session.clone(), job_id.clone()))?;
+            output.as_ref().map(|o| (o.id.clone(), p))
+        }
+        Event::JobMatched { job_id, output, .. } => {
+            let p = jobs.get(&(session.clone(), job_id.clone()))?.clone();
             output.as_ref().map(|o| (o.id.clone(), p))
         }
         _ => None,
