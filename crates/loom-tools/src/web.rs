@@ -751,7 +751,7 @@ mod tests {
     /// The real egress proxy with an open policy and these deny and allow_private lists, and a grant.
     async fn loom_proxy(deny: &[&str], private: &[&str]) -> (loom_net::Proxy, loom_net::SessionGrant) {
         let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let cfg = NetworkCfg { mode: NetworkMode::Open, allow: Vec::new(), deny: v(deny), allow_private: v(private) };
+        let cfg = NetworkCfg { mode: NetworkMode::Open, allow: Vec::new(), deny: v(deny), allow_private: v(private), ..NetworkCfg::default() };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = loom_net::Proxy::start(0, tx).await.unwrap();
         let grant = proxy.grant(&loom_core::SessionId::from("s-web"), loom_net::Policy::new(&cfg).unwrap());

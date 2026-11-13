@@ -1658,7 +1658,7 @@ mod tests {
         use loom_core::config::{NetworkCfg, NetworkMode};
         let deny = vec!["*.blocked.test".to_string()];
         let cfg =
-            NetworkCfg { mode: NetworkMode::Open, allow: Vec::new(), deny, allow_private: vec!["127.0.0.1".into()] };
+            NetworkCfg { mode: NetworkMode::Open, allow: Vec::new(), deny, allow_private: vec!["127.0.0.1".into()], ..NetworkCfg::default() };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = loom_net::Proxy::start(0, tx).await.unwrap();
         let grant = proxy.grant(&loom_core::SessionId::from("s-cve"), loom_net::Policy::new(&cfg).unwrap());

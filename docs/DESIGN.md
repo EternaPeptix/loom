@@ -891,17 +891,30 @@ evidence kind and staleness. Each module's documentation is the precise specific
 **Sandbox** (`loom-tools::sandbox`; its module documentation holds the exact seatbelt profile). Mode
 `seatbelt` (default) runs commands under `/usr/bin/sandbox-exec`; the daemon refuses to start when the
 mode cannot work on the host (not macOS, or no `sandbox-exec`). Mode `none` confines nothing, which the
-system prompt states. The policy:
+system prompt states. Linux `bubblewrap` is a separate deny-all command-network mode: it requires
+`/usr/bin/bwrap`, refuses loopback/Unix socket exceptions and host proxy bridges, uses isolated
+namespaces, a read-only host filesystem, private `/tmp`, `/var/tmp` and `/run`, and a seccomp filter
+that denies socket creation/connection (including filesystem Unix sockets and io_uring setup).
+Protected mounts are read-only. User home (with credential protection), Loom home, and workspace
+`.loom` are hidden by private mounts; scoped workspace/temp roots are restored from pinned sources.
+This hides future oracle-secret/credential creation too. Missing explicit unreadable paths outside
+hidden parents are refused; a whole user-home writable root is refused. The session temp remains
+writable. It never falls back to `none`. In-process tools still use the daemon's network policy.
+Only x86_64 and aarch64 Linux are supported. Bind sources are pinned by open harness descriptors,
+resolved through the original host proc mount, so replacing a writable root or temp ancestor does
+not grant a different directory. Missing protected paths inside a writable root are refused unless
+an existing read-only ancestor covers them; create those paths before running a writable session.
+The Seatbelt policy:
 
-- writable: the workspace, the session temp dir, `sandbox.extra_writable`, `/private/tmp`,
-  `/private/var/folders` and the device files commands need;
+- writable: the workspace, the session temp dir, `sandbox.extra_writable`, and the device files
+  commands need. Shared system temp directories are not writable by default;
 - never writable, even inside a writable root: `<workspace>/.loom`, the loom home, and
   `sandbox.protected_paths`. The session temp dir (`<loom home>/sessions/<id>/tmp`) is the exception:
   what is in it can be written, and it tests as writable, but the directory itself cannot be removed,
   renamed, replaced or swapped for a link. A temp dir that is `/`, or is or contains the loom home, is
   refused;
 - not readable, and not writable either (renaming and removing included), wherever they lie, even in
-  the workspace: `<loom home>/token`, `<loom home>/keys`, `sandbox.unreadable_paths`, and, while
+  the workspace: `<loom home>/token`, `<loom home>/keys`, `<workspace>/.loom/oracle-secrets`, `sandbox.unreadable_paths`, and, while
   `sandbox.protect_credentials` is on (default), the user's credential stores (`~/.ssh`, `~/.aws`,
   `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`, `~/.docker/config.json`,
   `~/.netrc`, `~/.npmrc`, `~/.pypirc`, cargo and git credentials, `~/.password-store`, `~/.config/op`,
@@ -928,6 +941,14 @@ system prompt states. The policy:
   every loopback port with `loopback_all`) and to `sandbox.unix_sockets`; listening on loopback is
   allowed.
 
+Git configuration, hooks and gitdir/commondir pointers are protected by default. Existing nested
+repositories and linked worktrees are discovered without running host Git; resolved gitdir and
+commondir metadata is protected too. Discovery refuses unreadable or excessive trees (100000
+workspace directories, 4096 metadata pointers, 4096 bytes per pointer). Seatbelt and file tools also
+refuse future nested `.git` configuration/hook writes. Bubblewrap freezes discovered Git directories
+as a whole; it cannot reserve future `.git` names in writable directories, so new repositories must
+be created outside a session. These protections do not establish immunity to arbitrary host Git bugs.
+
 Paths are made canonical when the sandbox is built. On macOS the rules that refuse are compared without
 regard to case (volumes are case-insensitive by default); the rules that allow are compared exactly. The
 file tools apply the same policy in-process (`check_read`, `check_write`) to the path resolved through
@@ -942,8 +963,8 @@ path of that directory joined with the file name, and creates, syncs and renames
 relative to that descriptor. A file name that is itself a link is read and followed by the writer, at
 most 8 links, so the directory checked is the target's. A role with `read_only` gets no `extra_writable`
 and its workspace is added to the never-writable paths, so it can still write in its session temp dir,
-in the system temp locations (`/private/tmp`, `/private/var/folders`, which other sessions use too) and
-to the device files, and nowhere else. Commands get the daemon's environment without any variable whose
+and to the device files, and nowhere else. This is a write policy; readable untrusted files remain
+untrusted inputs. In `none`, read-only roles do not constrain shell commands. Commands get the daemon's environment without any variable whose
 name (case-insensitive) contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`,
 `CREDENTIAL`, `AUTH_TOKEN`, `COOKIE`, `SESSION_KEY` or `PRIVATE`, has `SESSION`, `AUTH`, `PASS`, `JWT`
 or `WEBHOOK` as a part delimited by `_` or the ends of the name, ends in `_PAT`, `_DSN`, `_PWD` or `_PW`,
@@ -1314,3 +1335,14 @@ relied on.
   it; titles are not written by a model).
 - A warning when a configured context window is larger than the one the server reports
   (`Discovered::server_window` is computed and not reported).
+
+### Reference service capabilities
+
+`network.reference_hosts` reserves host patterns for trusted in-process GET clients. The raw command
+proxy refuses those names even when `allow`, open mode, or a mission grant would permit them. A
+separate random `ReferenceGrant` is held in tool memory and never included in command environment
+variables; revoking a session revokes both grants. Deny and resolved private-address rules still apply.
+Plain HTTP reference requests permit GET only and strip Authorization, Cookie and Referer. HTTPS
+CONNECT remains opaque: the in-process client must enforce GET and credential stripping, reject URL
+user-info, and recheck each redirect. Name reservations are not alias/IP or data-flow isolation.
+GET paths and queries can disclose data, so this is not an exfiltration-proof channel.

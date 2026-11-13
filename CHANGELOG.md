@@ -13,6 +13,23 @@
   retaining output inspection, cleanup and honest blocker delivery.
 - Reasoning-only replies receive a specific bounded nudge. Similar-outcome HUD warnings and optional
   flag-pattern alerts are advisory and do not verify success. See `docs/RUNTIME-CONTROLS.md`.
+### Containment and reference capabilities
+
+- Shared macOS system temp directories are no longer blanket writable roots. Commands use their
+  session `$TMPDIR`; read-only verifiers cannot write sibling system temp locations.
+- Git configuration/hooks/pointers are protected, including nested repositories, linked gitdirs and
+  commondirs. Seatbelt/file tools guard future metadata names; Bubblewrap makes discovered Git dirs
+  wholly read-only and does not reserve future repository names in writable directories.
+- Oracle supervisor secrets under `<workspace>/.loom/oracle-secrets` are unreadable, including before
+  creation and through symlinks. `Sandbox::isolated_replay` enforces separate harness-owned replay
+  workspace/temp siblings, rejects unconfined mode and removes the actor's writable roots.
+- Added the serialized sandbox mode `bubblewrap` (old config modes remain readable): Linux
+  namespaces, descriptor-pinned read-only/masked mounts and seccomp deny-all socket policy, without
+  unconfined fallback. Missing protected paths inside writable roots are refused.
+- Added optional `network.reference_hosts` (defaults empty): separate in-process GET proxy grants
+  kept out of command env, raw proxy refusal of reference names, method/header restrictions for plain
+  HTTP, and session revocation of both credentials. HTTPS GET/redirect policy belongs to the trusted
+  client. This is a capability restriction, not an exfiltration-proof channel.
 
 These changes follow a review of the first version of loom. They are grouped by area. Read "Before you
 upgrade" first; the rest says what behaves differently.
@@ -76,8 +93,9 @@ upgrade" first; the rest says what behaves differently.
    is unset but falls back to a host name written into the script, which is not a machine of yours.
    `./x` is optional and `cargo build --release -p loom-daemon` is the normal way to build. `./x` reads
    `LOOM_LANE` for separate build copies.
-9. **On non-macOS systems the daemon refuses to start** unless `[sandbox] mode = "none"`, because the
-   OS sandbox exists only on macOS. That mode leaves commands unconfined.
+9. **Linux can use explicit `mode = "bubblewrap"`** with `/usr/bin/bwrap` on x86_64/aarch64. It has
+   deny-all command networking and refuses host proxy/loopback/Unix socket exceptions. Other
+   unsupported systems require explicit `mode = "none"`; that leaves shell commands unconfined.
 10. **Going back to the first version is unsafe.** This version and later ones refuse to add to a
     session log that has a newer `schema` or records they cannot read, or to a mission journal with an
     operation they do not know, with a sentence telling you to upgrade; reading such a session still

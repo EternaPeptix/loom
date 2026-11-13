@@ -723,7 +723,7 @@ mod tests {
         }
 
         fn pidfile(&self) -> PathBuf {
-            self.root.join("pids")
+            self.root.join("tmp/pids")
         }
     }
 

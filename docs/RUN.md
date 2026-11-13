@@ -3,11 +3,10 @@
 ## Requirements
 
 - Rust 1.85 or newer to build.
-- macOS to run commands under the OS sandbox. The sandbox is macOS seatbelt (`/usr/bin/sandbox-exec`)
-  only. On any other system the daemon refuses to start unless the config says `[sandbox] mode = "none"`;
-  that mode leaves every command the model runs unconfined (the file tools still refuse the protected
-  and credential paths). The daemon checks this at start and the message names the alternatives: run on
-  macOS, or set `mode = "none"`.
+- macOS for the default Seatbelt sandbox, or Linux with `/usr/bin/bwrap` for `mode = "bubblewrap"`.
+  Bubblewrap supports x86_64/aarch64 and deny-all command networking only; host proxy bridges and
+  loopback/Unix socket exceptions are refused. Explicit `mode = "none"` leaves shell commands
+  unconfined, including read-only verifier roles. Missing sandbox support never triggers a fallback.
 - An OpenAI-compatible server with `/v1/chat/completions` (streaming) and, ideally, `/v1/models`.
 
 ## Build and install
@@ -99,8 +98,7 @@ session. `loom net <session>` lists the hosts granted so far.
 
 With `[sandbox] mode = "seatbelt"` (the default) commands run under a macOS sandbox profile:
 
-- they can write only in the workspace, the session's temp directory, `extra_writable`, the system
-  temp locations `/private/tmp` (`/tmp`) and `/private/var/folders` (the per-user temp folders), and
+- they can write only in the workspace, the session's temp directory, `extra_writable`, and
   the device files `/dev/null`, `/dev/tty` and `/dev/dtracehelper`;
 - `~/.loom`, `<workspace>/.loom` and `protected_paths` are never writable, with one exception: the
   session's temp directory is `~/.loom/sessions/<id>/tmp`, and everything inside it is writable (the
@@ -108,6 +106,26 @@ With `[sandbox] mode = "seatbelt"` (the default) commands run under a macOS sand
 - the loom token and keys and `unreadable_paths` are neither readable nor writable;
 - no network except the egress proxy (plus `loopback_ports`, `loopback_all`, `unix_sockets`);
 - no LaunchServices opens, Apple Events or launchd jobs.
+
+Git config/hooks and metadata pointers are protected, including existing nested repositories and
+linked worktrees. Normal source edits still work. Commands that explicitly write shared `/tmp` or
+`/private/var/folders` must use `$TMPDIR` instead; a read-only verifier can write only its own session
+temp and device files. Other readable files remain untrusted inputs.
+
+Linux `mode = "bubblewrap"` uses a read-only host tree, private temp/run mounts, hidden credential
+stores, and a seccomp socket deny policy. The original user home (when protecting credentials),
+Loom home, and workspace `.loom` are hidden by private mounts; scoped workspace/temp roots are
+restored from pinned descriptors. Create workspace `.loom` first. Missing explicit unreadable
+paths outside hidden parents are refused, and the whole user home cannot be a writable root. Bind sources are pinned by harness descriptors; missing protected paths under writable roots must
+exist first (including the reserved workspace `.loom` directory). Existing Git directories are entirely read-only there;
+future repositories must be created by the operator outside the session. It has no shell egress
+proxy bridge: use `network.mode = "deny_all"` with no active grants or socket exceptions. In-process
+reference GET tools may use `reference_hosts`; the shell cannot use their separate credential.
+
+`network.reference_hosts = ["docs.rs:443"]` enables a separate in-process reference GET capability.
+Raw proxy access to those names is refused even under open mode or explicit grants. Do not treat
+GET-only requests or stripped auth headers as an exfiltration guarantee: URL paths/queries can carry
+secrets, and host-pattern rules do not identify every alias or tenant of a shared service.
 
 Other files are readable.
 
@@ -312,3 +330,8 @@ to a path outside the home.
    the model id the server serves and the window it reported (or the `context_window` you set).
 3. `loom window last`: the stable prefix is the system prompt, your message and the turns; the
    `<harness-state>` block is not part of it.
+
+The Bubblewrap host launcher always removes loader/shell startup variables (`LD_*`, `DYLD_*`,
+`BASH_FUNC_*`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`), even when listed in `env_pass`. Set a
+needed library path inside the confined command instead. Its source descriptors are closed by a trusted confined launcher
+before target execution; native tests check that they cannot bypass read-only mounts.

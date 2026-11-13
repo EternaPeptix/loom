@@ -64,7 +64,7 @@ job_wait_s = 120           # how long job_wait waits when the call gives no time
 speculate = true
 
 [sandbox]
-mode = "seatbelt"          # "seatbelt" (macOS only) or "none". "none" leaves commands unconfined and is the only mode other systems can use.
+mode = "seatbelt"          # "seatbelt" (macOS), "bubblewrap" (Linux, no shell network), or explicitly unconfined "none".
 protect_credentials = true # ~/.ssh, ~/.aws, ~/.gnupg, keychains, browser profiles ... are unreadable and unwritable to commands and file tools; false turns this off
 # unreadable_paths = ["~/private"]       # more paths commands and file tools cannot read or write ("~" is expanded)
 # extra_writable = ["/path/to/scratch"]  # more directories commands may write to (absolute)
@@ -81,6 +81,7 @@ loopback_all = false       # true lets commands connect to any loopback port
 #   "allowlist" only hosts matching `allow` are reachable
 #   "open"      any public host is reachable
 mode = "deny_all"
+# reference_hosts = ["docs.rs:443"]  # trusted in-process GET only; refused to the raw command proxy in every mode
 # allow = ["*.rust-lang.org", "docs.rs", "crates.io", "api.example.test:443"]   # used by "allowlist"; example
 # deny = ["169.254.0.0/16", "tracker.example.test"]   # always refused, in every mode: host patterns, IP addresses or CIDR blocks
 # allow_private = ["10.1.2.3"]   # private, loopback or link-local destinations that are permitted (host pattern, IP or CIDR)
