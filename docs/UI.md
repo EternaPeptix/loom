@@ -72,9 +72,11 @@ of completion.
 Routes are `#/s/<id>/overview`, `/evidence`, and `/record`; the old `#/s/<id>` route opens Overview.
 `#/inbox` and `#/new` retain their meaning. Browser Back/Forward restores the selected mission view.
 
-The header keeps the goal and current plan step visible at all supported widths. Its standing is a
-row of separate facts: what is waiting on the operator, how the lead (or agent) stands, and how many
-agents are running. A root session is called the lead only when its role is `lead`.
+The header keeps the goal and current plan step visible at all supported widths. The goal is bounded
+in height and scrolls within its own box, so a long one (a whole prompt recorded as the goal) cannot
+grow the header past the viewport and leave the record below it unreachable. Its standing is a row of
+separate facts: what is waiting on the operator, how the lead (or agent) stands, and how many agents
+are running. A root session is called the lead only when its role is `lead`.
 
 The top bar carries the open session's generation speed next to the stream freshness, so a long goal
 cannot push it out of view: the latest reply's tokens per second, and — once there is more than one —
