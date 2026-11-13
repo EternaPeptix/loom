@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Morale: keeping a model on a hard task
+
+- New pack key `solvable` (default false). In a solvable pack the system prompt says the operator built the mission to be solved, and `conclude` with status `unreachable` is refused with a pointer to `report_blocker`. The `ctf` pack sets it; `core`, `vr` and `redteam` do not.
+
 ### Watched jobs, agents in their own copies, and attempts
 
 - `bash` takes `wake_on` (a regular expression) and `wake_every_s`. The background job the call

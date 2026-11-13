@@ -3,6 +3,7 @@ description = "Evidence-linked ctf investigations with operator-pinned verificat
 default_role = "dispatcher"
 preamble = "harness.md"
 requires_restricted_network = true
+solvable = true
 command_guard = "offensive"
 target_concurrency = 2
 

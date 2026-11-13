@@ -26,3 +26,5 @@ authenticated ledger review capabilities; filesystem read-only does not mean the
 External tools such as rizin/pdg, GDB/Python, pwntools or z3 are optional operator prerequisites for
 the relevant challenge; Loom does not install them. See [tool limits](../../docs/SECURITY-TOOLS.md)
 and the [evaluation protocol](../../docs/SECURITY-EVAL.md) before making performance claims.
+
+The pack is marked `solvable`, which tells roles the challenge was built to be solved and refuses `conclude` unreachable; remove the key for targets that are not solvable by construction.
