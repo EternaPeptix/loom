@@ -42,9 +42,10 @@
 //! 1. `S.ledger()`. The goal-met pre-gate: when the role's termination is `Explicit` and a goal is set whose
 //!    goal-met claim is `None` or `Open` and the operator has not released the mission
 //!    (`gate::goal_unconcluded`), finish is refused in this step: a `harness_note{Nudge}` and an error with
-//!    `texts::finish_unavailable` (conclude when a run shows the goal met or it cannot be met as stated;
-//!    otherwise note where you are and take the next step; `report_blocker` for what only the operator can
-//!    supply; naming only tools the role has). No finish is recorded, no verifier is started, no inbox item
+//!    `texts::finish_unavailable(&FinishTools, &directions)`: the routes the ledger still shows open
+//!    (`frontier::directions(&frontier(ledger, now), 8)`) with "pick one and run it", or, when there are
+//!    none, a demand to name three untried approaches; then what to do when stuck (`ask_for`, `agent_spawn`,
+//!    `report_blocker`) and `conclude` once a run shows the goal met; naming only tools the role has). No finish is recorded, no verifier is started, no inbox item
 //!    is opened, no effect is set. A mission without a goal, and a role with termination `Free`, are not gated.
 //! 2. Open objections are settled (see Objections), then `gate::check_finish_lead(&state, answer)`; `Err(text)`
 //!    -> error `text`.
@@ -89,10 +90,11 @@
 //! ## `conclude` (lead)
 //! `status` `met` | `unreachable`, `note`, `evidence`. Refused in a child session. In a solvable pack
 //! (`role.solvable`) `unreachable` is refused first of all, nothing recorded, with
-//! `texts::conclude_unreachable_refused(has report_blocker)`: the operator built the mission to be solved, so
-//! not having found the way is not a finding. `met`, the operator's `release` and `report_blocker` are
-//! unaffected. Otherwise `unreachable` is refused,
-//! with a sentence listing them, while a plan step is open. Writes `GoalMetSet { Supported | Refuted, note,
+//! `texts::conclude_unreachable_refused(has report_blocker)` followed by `texts::open_routes_block` of the
+//! frontier's directions: the operator built the mission to be solved, so not having found the way is not a
+//! finding. `met`, the operator's `release` and `report_blocker` are unaffected. Otherwise `unreachable` is
+//! refused, with a sentence listing them and `These are routes still open; run one of them.`, while a plan
+//! step is open. Writes `GoalMetSet { Supported | Refuted, note,
 //! evidence }`; the ledger's own rules refuse a missing goal, a blank note, evidence that is missing,
 //! unattested, not supporting or static only, and a repeat. Output: ok, outcome `goal concluded: ...`, saying
 //! that `finish` may now be called.
@@ -193,6 +195,7 @@
 use super::{
     Delivery, Effect, Settlement, Shared, SpawnReq, Workspace, MAX_FINISH_REJECTIONS, REPORT_MAX_CHARS, SHUTTING_DOWN,
 };
+use crate::frontier;
 use crate::gate::{self, Quote, ReportInput, VerifiedQuote};
 use crate::pack::RoleDef;
 use crate::texts;
@@ -606,7 +609,16 @@ impl Finish {
         // A role without `conclude` cannot make the conclusion the gate waits for, so it is not gated.
         let has = |tool: &str| s.role.tools.iter().any(|t| t == tool);
         if s.role.termination == Termination::Explicit && has("conclude") && gate::goal_unconcluded(&state) {
-            let text = texts::finish_unavailable(has("conclude"), has("report_blocker"));
+            let tools = texts::FinishTools {
+                conclude: true,
+                block: has("report_blocker"),
+                ask_for: has("ask_for"),
+                spawn: has("agent_spawn") && !s.role.may_spawn.is_empty(),
+                plan: has("plan") || has("step"),
+                solvable: s.role.solvable,
+            };
+            let directions = frontier::directions(&frontier::frontier(&state, loom_core::now_ms()), 8);
+            let text = texts::finish_unavailable(&tools, &directions);
             s.emit(Author::Harness, Event::HarnessNote { note: NoteKind::Nudge, text: text.clone() });
             return ToolOutput::error(text);
         }
@@ -1131,7 +1143,12 @@ impl Tool for Conclude {
         };
         if status == GoalMetStatus::Refuted && s.role.solvable {
             let has_blocker = s.role.tools.iter().any(|t| t == "report_blocker");
-            return ToolOutput::error(texts::conclude_unreachable_refused(has_blocker));
+            let mut text = texts::conclude_unreachable_refused(has_blocker);
+            if let Ok(state) = s.ledger() {
+                let directions = frontier::directions(&frontier::frontier(&state, loom_core::now_ms()), 8);
+                text.push_str(&texts::open_routes_block(&directions));
+            }
+            return ToolOutput::error(text);
         }
         let state = match s.ledger() {
             Ok(st) => st,
@@ -1166,6 +1183,7 @@ impl Tool for Conclude {
                     }
                 }
                 text.push_str("\nClose each route with `step`: status done (say what showed it) or dropped (say why). Then call conclude again.");
+                text.push_str(texts::CONCLUDE_OPEN_ROUTES_TAIL);
                 return ToolOutput::error(text);
             }
         }
@@ -2301,9 +2319,9 @@ mod tests {
             let res = r.call("finish", json!({"answer": "No result: the objective was not reached."})).await;
             assert_eq!(res.status, Status::Error, "{}", res.text);
             assert!(res.text.contains("finish is not available yet: the goal is not concluded"), "{}", res.text);
-            assert!(res.text.contains("Call conclude once a run shows the goal met"), "{}", res.text);
-            assert!(res.text.contains("record where you are with a note"), "{}", res.text);
-            assert!(res.text.contains("call report_blocker"), "{}", res.text);
+            assert!(res.text.contains("Call conclude once a run shows the goal met."), "{}", res.text);
+            assert!(res.text.contains("The mission ledger shows no open route."), "{}", res.text);
+            assert!(res.text.contains("report_blocker if something only the operator can supply"), "{}", res.text);
             let (items, notes) = drain(&r);
             assert!(items.is_empty(), "{items:?}");
             assert_eq!(notes.iter().filter(|(k, _)| *k == NoteKind::Nudge).count(), 1, "{notes:?}");
@@ -2425,6 +2443,74 @@ mod tests {
         assert!(
             context.contains("The lead concluded the goal cannot be met as stated (evidence: e1):\nevery route fails"),
             "{context}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_finish_lists_the_routes_the_ledger_shows_open_in_order() {
+        use loom_core::security_state::{AssetInput, AssetKind, SecurityOp};
+        let r = lead_with_goal();
+        let e = record_run(&r);
+        let asset = AssetInput {
+            kind: AssetKind::Host,
+            locator: "fixture.test".into(),
+            evidence: vec![e],
+            mandatory: true,
+            parent: None,
+        };
+        let id = asset.id().unwrap();
+        r.model_op(LedgerOp::Security(SecurityOp::AssetUpsert { asset }));
+        r.model_op(LedgerOp::PlanAdd { text: "try the other parser".into() });
+        r.model_op(LedgerOp::DeadEnd { what: "regex parser".into(), why: "no recursion".into() });
+        let before = r.shared.ledger().unwrap();
+        let res = r.call("finish", json!({"answer": "No result."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        let want = format!(
+            "Routes the mission ledger still shows open:\n- untested surface {id}\n- open plan step p1: try the other parser\n- set aside, not refuted, x1: regex parser — no recursion — a different attempt can reopen it\nPick one and run it; record what the run shows."
+        );
+        assert!(res.text.contains(&want), "{}", res.text);
+        assert!(!res.text.contains("shows no open route"), "{}", res.text);
+        assert_eq!(r.shared.ledger().unwrap(), before);
+        assert!(effect(&r).is_none());
+        assert_eq!(spawn_count(&r), 0);
+    }
+
+    #[tokio::test]
+    async fn a_solvable_pack_lists_open_routes_on_unreachable_and_never_offers_it_on_finish() {
+        let mut role = core_role("lead");
+        role.solvable = true;
+        let r = rig_with(role, false, true, loom_core::config::AgentsCfg::default());
+        r.user_op(LedgerOp::GoalSet { text: "g".into() });
+        // With no route open, a refused finish asks for approaches and does not offer `unreachable`.
+        let res = r.call("finish", json!({"answer": "No result."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("shows no open route"), "{}", res.text);
+        assert!(!res.text.contains("conclude with status unreachable"), "{}", res.text);
+        // With a route open, the unreachable refusal names it.
+        r.model_op(LedgerOp::PlanAdd { text: "try the other parser".into() });
+        let e = record_run(&r);
+        let res = r.call("conclude", json!({"status": "unreachable", "note": "n", "evidence": [e]})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("operator set it up as solvable"), "{}", res.text);
+        assert!(
+            res.text.contains("Routes the mission ledger still shows open:\n- open plan step p1: try the other parser"),
+            "{}",
+            res.text
+        );
+        assert_eq!(r.shared.ledger().unwrap().goal_met.map(|g| g.status), Some(loom_core::ledger::GoalMetStatus::Open));
+    }
+
+    #[tokio::test]
+    async fn conclude_unreachable_with_open_steps_says_they_are_open_routes() {
+        let r = lead_with_goal();
+        r.model_op(LedgerOp::PlanAdd { text: "try the other parser".into() });
+        let e = record_run(&r);
+        let res = r.call("conclude", json!({"status": "unreachable", "note": "n", "evidence": [e]})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(
+            res.text.contains("Then call conclude again. These are routes still open; run one of them.\n"),
+            "{}",
+            res.text
         );
     }
 

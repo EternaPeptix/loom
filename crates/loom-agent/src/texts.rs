@@ -797,24 +797,71 @@ pub fn job_lost(id: &str, command: &str) -> String {
     )
 }
 
-/// The refusal of `finish` while the goal claim is not concluded (the goal-met pre-gate). `can_conclude`
-/// and `can_block` say whether the role has `conclude` and `report_blocker`, so only real tools are named.
-pub fn finish_unavailable(can_conclude: bool, can_block: bool) -> String {
+/// Which tools the role has, so the refusal of `finish` names only real ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FinishTools {
+    pub conclude: bool,
+    pub block: bool,
+    pub ask_for: bool,
+    /// The role has `agent_spawn` and can spawn at least one role.
+    pub spawn: bool,
+    /// The role has `plan` or `step`.
+    pub plan: bool,
+    /// The role's pack is solvable: `conclude` with status unreachable is not available to it.
+    pub solvable: bool,
+}
+
+/// The refusal of `finish` while the goal claim is not concluded (the goal-met pre-gate). It gives the routes
+/// the ledger still shows open (`directions`, from `frontier::directions`), or, when there are none, asks for
+/// new ones. `tools` says which tools the role has, so only real tools are named.
+pub fn finish_unavailable(tools: &FinishTools, directions: &[String]) -> String {
     let mut out = String::from(
-        "finish is not available yet: the goal is not concluded, and not being there yet is not a finish. Nothing was delivered and no verifier was started.",
+        "finish is not available yet: the goal is not concluded. Nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result.",
     );
-    if can_conclude {
-        out.push_str(
-            " Call conclude once a run shows the goal met, or once you have established that it cannot be met as stated (every plan route closed, with execution evidence).",
-        );
+    if tools.conclude {
+        out.push_str(" Call conclude once a run shows the goal met.");
     }
-    out.push_str(
-        " Until then, record where you are with a note and take the next step: run the target, read what it did, change the approach.",
-    );
-    if can_block {
-        out.push_str(" If something only the operator can supply is blocking you, call report_blocker.");
+    out.push('\n');
+    if directions.is_empty() {
+        out.push_str("The mission ledger shows no open route. Before anything else, name three approaches you have not yet tried with execution evidence");
+        if tools.plan {
+            out.push_str(" and add them to the plan");
+        }
+        out.push_str(", then run the first.");
+        if tools.conclude && !tools.solvable {
+            out.push_str(" If after honest effort you cannot name any, that is what conclude with status unreachable records: every route closed, with execution evidence.");
+        }
+    } else {
+        out.push_str("Routes the mission ledger still shows open:\n");
+        out.push_str(&directions.join("\n"));
+        out.push_str("\nPick one and run it; record what the run shows.");
+    }
+    if tools.ask_for || tools.spawn || tools.block {
+        out.push_str("\nIf you are stuck rather than done:");
+        if tools.ask_for {
+            out.push_str(" ask_for (budget, a tool, a hint or direction);");
+        }
+        if tools.spawn {
+            out.push_str(" start a fresh agent with agent_spawn for another view;");
+        }
+        if tools.block {
+            out.push_str(" report_blocker if something only the operator can supply is missing;");
+        }
+        out.push_str(" keep working meanwhile.");
     }
     out
+}
+
+/// The refusal of `conclude` with status unreachable that follows the plan listing: these steps are routes.
+pub const CONCLUDE_OPEN_ROUTES_TAIL: &str = " These are routes still open; run one of them.";
+
+/// The open routes appended to a refusal, or nothing when `directions` is empty.
+pub fn open_routes_block(directions: &[String]) -> String {
+    if directions.is_empty() {
+        String::new()
+    } else {
+        format!("\nRoutes the mission ledger still shows open:\n{}", directions.join("\n"))
+    }
 }
 
 /// What follows the objections in the result of a `finish` the verifier did not accept.
@@ -887,6 +934,60 @@ pub fn flag_candidate(handle: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tools_all() -> FinishTools {
+        FinishTools { conclude: true, block: true, ask_for: true, spawn: true, plan: true, solvable: false }
+    }
+
+    #[test]
+    fn finish_unavailable_lists_the_open_routes() {
+        let d = vec!["- untested surface as-1".to_string(), "- open plan step p1: read".to_string()];
+        assert_eq!(
+            finish_unavailable(&tools_all(), &d),
+            "finish is not available yet: the goal is not concluded. Nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result. Call conclude once a run shows the goal met.\n\
+Routes the mission ledger still shows open:\n\
+- untested surface as-1\n\
+- open plan step p1: read\n\
+Pick one and run it; record what the run shows.\n\
+If you are stuck rather than done: ask_for (budget, a tool, a hint or direction); start a fresh agent with agent_spawn for another view; report_blocker if something only the operator can supply is missing; keep working meanwhile."
+        );
+    }
+
+    #[test]
+    fn finish_unavailable_without_routes_asks_for_new_ones() {
+        assert_eq!(
+            finish_unavailable(&tools_all(), &[]),
+            "finish is not available yet: the goal is not concluded. Nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result. Call conclude once a run shows the goal met.\n\
+The mission ledger shows no open route. Before anything else, name three approaches you have not yet tried with execution evidence and add them to the plan, then run the first. If after honest effort you cannot name any, that is what conclude with status unreachable records: every route closed, with execution evidence.\n\
+If you are stuck rather than done: ask_for (budget, a tool, a hint or direction); start a fresh agent with agent_spawn for another view; report_blocker if something only the operator can supply is missing; keep working meanwhile."
+        );
+        let solvable = FinishTools { solvable: true, ..tools_all() };
+        let text = finish_unavailable(&solvable, &[]);
+        assert!(text.contains("then run the first.\nIf you are stuck"), "{text}");
+        assert!(!text.contains("unreachable"), "{text}");
+    }
+
+    #[test]
+    fn finish_unavailable_for_a_minimal_role_names_no_absent_tool() {
+        assert_eq!(
+            finish_unavailable(&FinishTools::default(), &[]),
+            "finish is not available yet: the goal is not concluded. Nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result.\n\
+The mission ledger shows no open route. Before anything else, name three approaches you have not yet tried with execution evidence, then run the first."
+        );
+        let only_block = FinishTools { block: true, ..FinishTools::default() };
+        assert!(finish_unavailable(&only_block, &["- x".into()]).ends_with(
+            "Pick one and run it; record what the run shows.\nIf you are stuck rather than done: report_blocker if something only the operator can supply is missing; keep working meanwhile."
+        ));
+    }
+
+    #[test]
+    fn open_routes_block_is_empty_without_directions() {
+        assert_eq!(open_routes_block(&[]), "");
+        assert_eq!(
+            open_routes_block(&["- a".into(), "- b".into()]),
+            "\nRoutes the mission ledger still shows open:\n- a\n- b"
+        );
+    }
 
     #[test]
     fn the_restart_note_does_not_call_resumed_agents_gone() {

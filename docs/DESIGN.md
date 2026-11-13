@@ -610,9 +610,10 @@ only when every check passes and, where verification is required, a verifier acc
 - A child's `finish` delivers its report to its parent (§9).
 - The goal-met pre-gate. In a role with explicit termination, `finish` is refused in the same step,
   before a finish is recorded, a verifier started or an inbox item opened, while the mission has a goal
-  and the goal-met claim (§7) is not concluded; a nudge note says to run the target and call `conclude`
-  once a run shows the goal met or the goal is established unreachable, or `report_blocker` for what only
-  the operator can supply. The ledger, not the wording of a reply, decides whether a stop is a
+  and the goal-met claim (§7) is not concluded; a nudge note lists the routes the ledger still shows
+  open (or, when it shows none, asks for three untried approaches), says to call `conclude` once a run
+  shows the goal met, and names the role's ways out when stuck (`ask_for`, `agent_spawn`,
+  `report_blocker`). The ledger, not the wording of a reply, decides whether a stop is a
   deliverable. `conclude {status: met|unreachable, note, evidence}` writes the goal-met claim (the
   ledger checks the evidence, §7); `unreachable` is also refused while a plan step is open, so every route
   is closed first, and the verifier is then told to name one untried route or get one step further, not to

@@ -11,6 +11,10 @@
 - `claim_update` to `supported` adds one line, `Established: {id}. Results established in this mission so
   far: {n} ({ids}).`, so a banked result stays in view.
 - New pack key `solvable` (default false). In a solvable pack the system prompt says the operator built the mission to be solved, and `conclude` with status `unreachable` is refused with a pointer to `report_blocker`. The `ctf` pack sets it; `core`, `vr` and `redteam` do not.
+- A refused `finish` (goal not concluded) now lists the routes the ledger still shows open, from
+  `frontier::directions`, and says to pick one and run it. When the ledger shows none it asks for three
+  untried approaches, then names the role's real ways out (`ask_for`, `agent_spawn`, `report_blocker`).
+  `conclude` unreachable with open plan steps adds that those steps are routes still open.
 
 ### Watched jobs, agents in their own copies, and attempts
 
