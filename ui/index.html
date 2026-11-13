@@ -13,63 +13,83 @@
   <aside id="left" class="col left">
     <header class="lhead">
       <span class="brand">loom</span>
-      <span id="dot" class="dot dot-red" title="connecting"></span>
+      <span id="dot" class="dot dot-red" title="connecting" aria-hidden="true"></span>
       <span class="spacer"></span>
       <button id="btn-inbox" type="button" class="btn">Inbox <span id="inbox-count" class="count" hidden>0</span></button>
       <button id="btn-new" type="button" class="btn">New</button>
+      <button id="close-left" type="button" class="btn small drawer-btn" aria-label="Close missions">Close</button>
     </header>
-    <nav id="sessions" class="sessions" aria-label="Sessions"></nav>
+    <nav id="sessions" class="sessions" aria-label="Missions"></nav>
     <footer class="lfoot">
-      <label><input id="show-archived" type="checkbox"> show archived</label>
+      <label><input id="show-archived" type="checkbox"> Show archived</label>
     </footer>
   </aside>
 
   <main id="mid" class="col mid">
     <div class="bar">
-      <button id="open-left" type="button" class="btn drawer-btn">Sessions</button>
+      <button id="open-left" type="button" class="btn drawer-btn" aria-controls="left" aria-expanded="false">Missions</button>
+      <span id="connection-state" class="connection-state" role="status">Connecting…</span>
+      <span id="connection-updated" class="dim"></span>
       <span class="spacer"></span>
-      <button id="open-right" type="button" class="btn drawer-btn">State</button>
+      <button id="open-right" type="button" class="btn drawer-btn" aria-controls="right" aria-expanded="false">Inspector</button>
     </div>
-    <div id="notice" class="notice" hidden>
+    <div id="notice" class="notice" role="alert" hidden>
       <span id="notice-text"></span>
-      <button id="notice-close" type="button" class="btn small">dismiss</button>
+      <button id="notice-close" type="button" class="btn small">Dismiss</button>
     </div>
 
     <section id="view-empty" class="view empty">
-      <p>Pick a session on the left, or start a new one.</p>
+      <h1>Work that stays inspectable.</h1>
+      <p>Choose a mission, review what needs you, or start new work.</p>
     </section>
 
     <section id="view-session" class="view session" hidden>
       <header class="shead">
-        <h1 id="s-title" class="stitle"></h1>
-        <span id="s-mark" class="mark"></span>
-        <span id="s-words" class="dim"></span>
-        <span id="s-step" class="dim"></span>
-        <span id="s-meter" class="meter small" title="prompt size of the last request"><span class="fill"></span></span>
-        <span id="s-meter-label" class="dim"></span>
-        <span class="spacer"></span>
-        <label class="dim"><input id="details" type="checkbox"> details</label>
-        <button id="b-stop" type="button" class="btn" hidden>Stop</button>
-        <button id="b-resume" type="button" class="btn" hidden>Resume</button>
-        <button id="b-archive" type="button" class="btn" hidden>Archive</button>
-        <button id="b-unarchive" type="button" class="btn" hidden>Unarchive</button>
-      </header>
-      <div id="scroller" class="scroller">
-        <div id="earlier" class="earlier" hidden>
-          <button id="btn-earlier" type="button" class="btn">Show earlier</button>
+        <div class="mission-heading">
+          <p id="s-eyebrow" class="eyebrow">Mission</p>
+          <h1 id="s-title" class="stitle"></h1>
+          <p id="s-goal" class="mission-goal"></p>
+          <div id="s-standing" class="mission-status"></div>
         </div>
-        <div id="loading" class="dim pad">loading the record...</div>
-        <div id="blocks" class="blocks hide-details"></div>
-        <div id="live" class="live-wrap"></div>
+        <div class="mission-actions">
+          <button id="b-stop" type="button" class="btn danger" hidden>Stop</button>
+          <button id="b-resume" type="button" class="btn" hidden>Resume</button>
+          <button id="b-archive" type="button" class="btn" hidden>Archive</button>
+          <button id="b-unarchive" type="button" class="btn" hidden>Unarchive</button>
+          <button id="toggle-inspector" type="button" class="btn with-icon" aria-controls="right" aria-expanded="false"><svg class="icon" viewBox="0 0 14 14" aria-hidden="true"><rect x="1.5" y="2" width="11" height="10" rx="1.5"/><path d="M9 2v10"/></svg>Inspector</button>
+        </div>
+      </header>
+      <nav id="mission-tabs" class="mission-tabs" role="tablist" aria-label="Mission views">
+        <button id="mission-tab-overview" type="button" class="mission-tab" data-view="overview" role="tab" aria-controls="mission-overview" aria-selected="true">Overview</button>
+        <button id="mission-tab-evidence" type="button" class="mission-tab" data-view="evidence" role="tab" aria-controls="mission-evidence" aria-selected="false" tabindex="-1">Evidence <span id="evidence-count" class="tab-badge" hidden></span></button>
+        <button id="mission-tab-record" type="button" class="mission-tab" data-view="record" role="tab" aria-controls="mission-record" aria-selected="false" tabindex="-1">Full record</button>
+      </nav>
+      <div id="mission-overview" class="mission-panel" role="tabpanel" aria-labelledby="mission-tab-overview"></div>
+      <div id="mission-evidence" class="mission-panel" role="tabpanel" aria-labelledby="mission-tab-evidence" hidden></div>
+      <div id="mission-record" class="mission-record" role="tabpanel" aria-labelledby="mission-tab-record" hidden>
+        <div class="record-tools">
+          <span class="dim">Everything recorded for this session, oldest first.</span>
+          <label class="dim"><input id="details" type="checkbox"> Show request details</label>
+        </div>
+        <div id="scroller" class="scroller">
+          <div id="earlier" class="earlier" hidden>
+            <button id="btn-earlier" type="button" class="btn">Show earlier</button>
+          </div>
+          <div id="loading" class="dim pad" role="status">Loading the record…</div>
+          <div id="blocks" class="blocks hide-details"></div>
+          <div id="live" class="live-wrap"></div>
+        </div>
+        <button id="jump" type="button" class="btn jump" hidden>Jump to latest</button>
       </div>
-      <button id="jump" type="button" class="btn jump" hidden>jump to latest</button>
       <footer id="composer" class="composer">
+        <div class="composer-heading"><span id="composer-recipient" class="dim"></span><span id="send-state" class="dim" role="status" aria-live="polite"></span></div>
         <p id="agent-note" class="dim pad" hidden>Messages go to the lead session of this mission, not to its agents.</p>
         <p id="closed-note" class="dim pad" hidden></p>
         <div id="composer-row" class="composer-row">
-          <textarea id="msg" rows="2" placeholder="Message (Enter sends, Shift+Enter is a new line)" aria-label="Message"></textarea>
+          <textarea id="msg" rows="1" placeholder="Add direction or context…" aria-label="Message" aria-describedby="composer-recipient composer-help"></textarea>
           <button id="send" type="button" class="btn primary">Send</button>
         </div>
+        <p id="composer-help" class="composer-help dim"></p>
       </footer>
     </section>
 
@@ -84,7 +104,7 @@
     </section>
 
     <section id="view-new" class="view newform" hidden>
-      <header class="vhead"><h1 class="stitle">New session</h1></header>
+      <header class="vhead"><h1 class="stitle">New mission</h1></header>
       <form id="new-form" class="form" autocomplete="off">
         <label>Workspace <input id="f-workspace" type="text" required placeholder="/path/to/workspace"></label>
         <label>Message <textarea id="f-message" rows="6" required></textarea></label>
@@ -93,39 +113,68 @@
           <label>Model profile <select id="f-model"></select></label>
         </div>
         <label>Title (optional) <input id="f-title" type="text"></label>
-        <label class="check"><input id="f-unattended" type="checkbox" checked> resume by itself after a restart</label>
-        <p id="f-error" class="error" hidden></p>
+        <label class="check"><input id="f-unattended" type="checkbox" checked> Resume by itself after a restart</label>
+        <p id="f-error" class="error" role="alert" hidden></p>
         <div><button id="f-submit" type="submit" class="btn primary">Start</button></div>
       </form>
     </section>
   </main>
 
-  <aside id="right" class="col right">
+  <aside id="right" class="col right" aria-label="Mission inspector" inert>
+    <div id="inspector-resize" class="inspector-resize" role="separator" aria-label="Resize inspector" aria-orientation="vertical" aria-valuemin="280" aria-valuemax="560" aria-valuenow="360" tabindex="0"></div>
     <header class="rhead">
-      <nav class="tabs" id="tabs">
-        <button type="button" class="tab" data-tab="ledger">Ledger</button>
-        <button type="button" class="tab" data-tab="context">Context</button>
-        <button type="button" class="tab" data-tab="network">Network</button>
-        <button type="button" class="tab" data-tab="session">Session</button>
+      <nav class="tabs" id="tabs" role="tablist" aria-label="Inspector views">
+        <button id="tab-ledger" type="button" class="tab" data-tab="ledger" role="tab" aria-controls="panel" aria-selected="true">Ledger</button>
+        <button id="tab-context" type="button" class="tab" data-tab="context" role="tab" aria-controls="panel" aria-selected="false" tabindex="-1">Context</button>
+        <button id="tab-network" type="button" class="tab" data-tab="network" role="tab" aria-controls="panel" aria-selected="false" tabindex="-1">Network</button>
+        <button id="tab-session" type="button" class="tab" data-tab="session" role="tab" aria-controls="panel" aria-selected="false" tabindex="-1">Session</button>
       </nav>
-      <button id="close-right" type="button" class="btn small drawer-btn">close</button>
+      <button id="close-right" type="button" class="btn small" aria-label="Close inspector">Close</button>
     </header>
-    <div id="panel" class="panel"></div>
+    <div id="panel" class="panel" role="tabpanel" aria-labelledby="tab-ledger"></div>
   </aside>
 
   <div id="scrim" class="scrim"></div>
 
-  <section id="viewer" class="viewer" hidden>
+  <dialog id="viewer" class="viewer" aria-labelledby="viewer-title" aria-describedby="viewer-standing">
     <header class="vhead">
-      <strong id="viewer-title">Full output</strong>
+      <h2 id="viewer-title">Stored output</h2>
       <span id="viewer-info" class="dim"></span>
       <span class="spacer"></span>
-      <button id="viewer-more" type="button" class="btn">Load more</button>
+      <button id="viewer-copy" type="button" class="btn">Copy reference</button>
       <button id="viewer-close" type="button" class="btn">Close</button>
     </header>
-    <pre id="viewer-text" class="viewer-text"></pre>
-  </section>
+    <div class="viewer-meta"><p id="viewer-provenance"></p><p id="viewer-standing" class="dim"></p></div>
+    <div id="viewer-controls" class="viewer-controls" role="group" aria-label="Move through the stored output">
+      <label>Go to line <input id="viewer-start" type="number" min="1" step="1" value="1" inputmode="numeric" enterkeyhint="go"></label>
+      <button id="viewer-jump" type="button" class="btn">Go</button>
+      <label class="viewer-search">Find in loaded lines <input id="viewer-find" type="search" autocomplete="off" enterkeyhint="search" aria-describedby="viewer-find-count"></label>
+      <span id="viewer-find-count" class="viewer-find-count dim"></span>
+      <button id="viewer-find-prev" type="button" class="btn">Previous</button>
+      <button id="viewer-find-next" type="button" class="btn">Next</button>
+    </div>
+    <p id="viewer-error" class="viewer-error dim" role="status" aria-live="polite"></p>
+    <div id="viewer-scroll" class="viewer-scroll" role="region" aria-label="Stored output lines" tabindex="0">
+      <button id="viewer-earlier" type="button" class="btn small viewer-page" hidden>Load earlier lines</button>
+      <pre id="viewer-text" class="viewer-text"></pre>
+      <button id="viewer-more" type="button" class="btn small viewer-page" hidden>Load later lines</button>
+    </div>
+  </dialog>
 </div>
+<template id="icons">
+  <svg data-icon="diamond" class="icon solid" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 1 11 6 6 11 1 6Z"/></svg>
+  <svg data-icon="diamond-outline" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 1.5 10.5 6 6 10.5 1.5 6Z"/></svg>
+  <svg data-icon="dot" class="icon solid" viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="6" r="4.5"/></svg>
+  <svg data-icon="ring" class="icon" viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="6" r="4.2"/></svg>
+  <svg data-icon="half" class="icon" viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="6" r="4.2"/><path class="filled" d="M6 1.8a4.2 4.2 0 0 1 0 8.4Z"/></svg>
+  <svg data-icon="check" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 6.5 5 9l4.5-5.5"/></svg>
+  <svg data-icon="cross" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6"/></svg>
+  <svg data-icon="square" class="icon solid" viewBox="0 0 12 12" aria-hidden="true"><rect x="2.5" y="2.5" width="7" height="7" rx="1"/></svg>
+  <svg data-icon="question" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M4 4.4a2 2 0 1 1 3 1.7c-.6.4-1 .8-1 1.5M6 9.6v.1"/></svg>
+  <svg data-icon="alert" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 2.5v4.5M6 9.4v.1"/></svg>
+  <svg data-icon="chevron" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5 6 8l3.5-3.5"/></svg>
+  <svg data-icon="source" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 1.5h4l2.5 2.5v6.5H3Z"/><path d="M4.5 6.5h3M4.5 8.5h3"/></svg>
+</template>
 <script type="module" src="/app.js"></script>
 </body>
 </html>

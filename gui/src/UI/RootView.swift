@@ -91,11 +91,23 @@ struct ConnectionBar: View {
                     .help("Switch connection")
             }
             Spacer()
-            if state.counts.running > 0 || state.counts.waiting > 0 || state.counts.active > 0 {
-                Text("\(state.counts.running) running · \(state.counts.waiting) waiting · \(state.counts.active) active")
-                    .font(.caption).foregroundStyle(state.counts.waiting > 0 ? Color.red : Color.secondary)
+            if state.feedStatus.lastUpdated != nil {
+                Text((state.feedStatus.stale ? "Last known: " : "") + state.counts.summary)
+                    .font(.caption).foregroundStyle(.secondary)
+                if state.counts.waiting > 0 {
+                    Text("\(state.counts.waiting) needs you")
+                        .font(.caption).foregroundStyle(state.feedStatus.stale ? Color.secondary : Color.orange)
+                }
             }
-            Text(state.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            if case .connected = state.link {
+                TimelineView(.periodic(from: .now, by: 5)) { context in
+                    Text(state.feedStatus.label(at: context.date))
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                .help(state.feedStatus.detail.isEmpty ? state.status : state.feedStatus.detail)
+            } else {
+                Text(state.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
             if case .connected = state.link {
                 Button { state.reload() } label: { Image(systemName: "arrow.clockwise") }
                     .help("Reload the page")
@@ -113,7 +125,7 @@ struct ConnectionBar: View {
 
     private var dotColor: Color {
         switch state.link {
-        case .connected: return state.counts.waiting > 0 ? .red : .green
+        case .connected: return state.feedStatus.stale || state.feedStatus.mode != .live ? .orange : .green
         case .connecting: return .orange
         case .failed: return .red
         case .none: return .gray

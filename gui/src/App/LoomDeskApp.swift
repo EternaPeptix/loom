@@ -51,8 +51,9 @@ struct MenuBarLabel: View {
     }
 
     @ViewBuilder private var content: some View {
-        let text = state.counts.menuLabel
-        if state.counts.waiting > 0 {
+        let stale = state.feedStatus.stale && state.link != .none
+        let text = stale ? "loom · state unknown" : state.counts.menuLabel
+        if state.counts.waiting > 0 && !stale {
             // The menu bar tints plain text as a template; a rendered, non-template image keeps the red.
             let r = ImageRenderer(content: Text(text).font(.system(size: 13, weight: .semibold)).foregroundColor(.red).padding(.horizontal, 2))
             let _ = { r.scale = NSScreen.main?.backingScaleFactor ?? 2 }()
@@ -77,6 +78,15 @@ struct MenuBarMenu: View {
         Group {
             Text(state.active.map { "Connection: \($0.name)" } ?? "No connection")
             Text(state.status)
+            if state.link != .none {
+                TimelineView(.periodic(from: .now, by: 5)) { context in
+                    Text(state.feedStatus.label(at: context.date))
+                }
+                if state.feedStatus.lastUpdated != nil {
+                    Text((state.feedStatus.stale ? "Last known: " : "") + state.counts.summary)
+                    if state.counts.waiting > 0 { Text("\(state.counts.waiting) blocking \(state.counts.waiting == 1 ? "item" : "items") need an answer") }
+                }
+            }
             Divider()
             Button("Open loom") { openWindow(id: "main"); NSApp.activate(ignoringOtherApps: true) }
             if !state.connections.isEmpty {
@@ -89,6 +99,7 @@ struct MenuBarMenu: View {
             if state.link != .none {
                 Button("Disconnect") { state.disconnect() }
             }
+            Button("Enable notifications…") { Notifier.requestAuthorization() }
             Divider()
             Button("Quit loom-desk") { NSApp.terminate(nil) }
         }
@@ -101,7 +112,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if Bundle.main.bundleURL.pathExtension == "app" {
             UNUserNotificationCenter.current().delegate = self
         }
-        Notifier.requestAuthorization()
         Task { @MainActor in AppState.shared.restoreLast() }
     }
 

@@ -4,16 +4,22 @@ import UserNotifications
 
 /// Live counts shown in the menu bar and the status line.
 struct Counts: Equatable {
-    var running = 0
+    var running = 0   // missions whose lead or an agent is running
     var waiting = 0   // open blocking inbox items
-    var active = 0    // sessions not ended/archived
+    var active = 0    // root missions not ended/archived
+    var runningAgents = 0
 
-    /// Menu-bar label, e.g. "◆ 2▸ 1!". Red when `waiting > 0` (the caller decides colour).
+    var summary: String {
+        "\(running) \(running == 1 ? "mission" : "missions") running · \(runningAgents) \(runningAgents == 1 ? "agent" : "agents") running"
+    }
+
+    /// Attention is text rather than a connection-health signal.
     var menuLabel: String {
-        var s = "◆"
-        if running > 0 { s += " \(running)▸" }
-        if waiting > 0 { s += " \(waiting)!" }
-        return s
+        var parts: [String] = []
+        if running > 0 { parts.append("\(running) \(running == 1 ? "mission" : "missions")") }
+        if runningAgents > 0 { parts.append("\(runningAgents) \(runningAgents == 1 ? "agent" : "agents")") }
+        if waiting > 0 { parts.append("\(waiting) needs you") }
+        return parts.isEmpty ? "loom" : parts.joined(separator: " · ")
     }
 }
 
@@ -34,6 +40,7 @@ final class AppState: ObservableObject {
     @Published var active: Connection? = nil
     @Published var link: Link = .none
     @Published var counts = Counts()
+    @Published var feedStatus = DaemonClient.FeedStatus()
     @Published var status: String = "not connected"
     @Published var baseURL: String? = nil
     @Published var focusSession: String? = nil
@@ -110,6 +117,7 @@ final class AppState: ObservableObject {
         connectionEpoch += 1
         active = connection
         counts = Counts()
+        feedStatus = DaemonClient.FeedStatus()
         webState = .idle
         webLoadedOnce = false
         UserDefaults.standard.set(connection.id.uuidString, forKey: Self.lastKey)
@@ -169,6 +177,7 @@ final class AppState: ObservableObject {
         link = .none
         status = "not connected"
         counts = Counts()
+        feedStatus = DaemonClient.FeedStatus()
         webState = .idle
     }
 
@@ -203,10 +212,11 @@ final class AppState: ObservableObject {
                     Notifier.post(session: session, title: title, text: text)
                 }
             },
-            onMode: { [weak self] mode in
+            onFeedStatus: { [weak self] feed in
                 Task { @MainActor in
                     guard let self, self.generation == gen else { return }
-                    self.status = mode == "live" ? "connected · live" : "connected · \(mode)"
+                    self.feedStatus = feed
+                    self.status = feed.label(at: Date())
                 }
             })
     }
@@ -216,7 +226,7 @@ final class AppState: ObservableObject {
         client.stop()
         token = nil
         baseURL = nil
-        counts = Counts()
+        feedStatus.failed("stream", reason: msg)
         link = .failed("the SSH tunnel closed: \(msg)")
         status = "tunnel closed"
     }
@@ -331,8 +341,9 @@ enum SelfCheck {
         failures += Tunnel.selfCheck()
         failures += DaemonClient.selfCheck()
         failures += WebPane.selfCheck()
-        if Counts(running: 2, waiting: 1, active: 3).menuLabel != "◆ 2▸ 1!" { failures.append("Counts.menuLabel") }
-        if Counts().menuLabel != "◆" { failures.append("Counts.menuLabel empty") }
+        if Counts(running: 2, waiting: 1, active: 3, runningAgents: 4).menuLabel != "2 missions · 4 agents · 1 needs you" { failures.append("Counts.menuLabel") }
+        if Counts().menuLabel != "loom" { failures.append("Counts.menuLabel empty") }
+        if Counts(running: 1, runningAgents: 1).summary != "1 mission running · 1 agent running" { failures.append("Counts.summary singular") }
         if Notifier.cut("a\nb", 10) != "a b" || Notifier.cut(String(repeating: "x", count: 20), 5).count != 5 {
             failures.append("Notifier.cut")
         }

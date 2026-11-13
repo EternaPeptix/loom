@@ -1,169 +1,157 @@
 # The web UI
 
-The UI is what the operator leaves open while missions run. It is four static files in `ui/`
-(`index.html`, `style.css`, `core.js`, `app.js`), embedded in the binary and served by the daemon at
-`/`, `/style.css`, `/core.js` and `/app.js`. No build step, no framework, no dependency, nothing
-loaded from anywhere else.
+The operator supervises missions through four static files in `ui/`: `index.html`, `style.css`,
+`core.js`, and `app.js`. The daemon embeds them; there is no frontend build step or runtime
+framework. `core.js` owns pure state and presentation decisions; `app.js` owns DOM and network IO.
 
-It exists because of what went wrong in the harness loom replaces: tool output that was cut without
-a trace, context compaction the operator could not see, questions that waited for hours because
-nothing said they were waiting, and model output that could load remote images. So the UI's job is
-to make the record, the context and the things waiting for the operator *visible*.
+## Content and authority
 
-## Hard rules
+- Keep the daemon's strict CSP: scripts, styles and requests are same-origin; no inline handlers,
+  executable record content, remote images, analytics, or third-party resources.
+- Model prose may use a small presentation subset: headings, paragraphs, lists, bold text, inline
+  code and fenced code. Create each element and text node directly. Source HTML, links and images
+  stay inert. Every formatted response also exposes its exact raw text. Tool output stays raw.
+- The event log remains the record. Overview text is derived deterministically from records and
+  typed ledger fields; it is not a generated summary or a substitute for the full record.
+- Display a quote's attestation as “Quote matches stored output.” Keep that distinct from recorded
+  claim status and independent verification. The runtime refuses a quote that does not match, so
+  an unattested quote is one it did not check: show “Quote not checked against stored output”,
+  never a failed match. Opening evidence in the UI never changes model observation coverage or
+  verifies a claim.
+- Icons are drawings in the `<template id="icons">` of `index.html`, cloned by `app.js`. Markup is
+  never built from strings, and a namespaced element is never created from script (the namespace
+  URL would break the no-remote-URL check). Every drawing is `aria-hidden`; the words beside it
+  carry the meaning, and each state has its own shape so it is not told apart by colour alone.
+- Authenticate every same-origin request through the existing daemon cookie. A `401` replaces the
+  page with the instruction to run `loom open` again.
 
-- **Content security policy** (sent by the daemon): `default-src 'none'; script-src 'self';
-  style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none';
-  frame-ancestors 'none'`. So: no inline `<script>`, no inline `style=""` attribute, no `on…=""`
-  attribute, no `eval`. Styles come from classes; dynamic sizes (the context meter) use
-  `element.style.setProperty` from script, which the policy allows.
-- **Text from records is never parsed as HTML.** Everything a model, a tool or the network produced
-  is inserted with `textContent` / `createTextNode`. There is no `innerHTML` with data in it, no
-  Markdown-to-HTML conversion, no linkifying into `<a href>` except for links the UI itself builds
-  to its own routes. Images are never rendered from record content.
-- **Authentication** is the cookie the daemon set; every `fetch` is same-origin with
-  `credentials: "same-origin"`. A `401` anywhere replaces the page with: `This page lost its access
-  token. Run "loom open" again.`
-- Works in current Safari, Chrome and Firefox. ES modules (`<script type="module" src="/app.js">`).
-- `core.js` is pure (no `document`, no `window`, no `fetch`): state, reducers, formatting. It is
-  what `node --test ui/` exercises. `app.js` is the DOM and the network.
+## Missions and navigation
 
-## Data
+![Mission overview with illustrative fixture data](images/mission-overview.jpg)
 
-Routes and bodies: `crates/loom-daemon/src/api.rs`, `wire.rs`, and the types they name in
-`crates/loom-agent/src/runtime.rs` (`SessionInfo`, `BusEvent`, `InboxEntry`, `WindowView`,
-`LedgerView`, …), `crates/loom-agent/src/session.rs` (`Status`), `crates/loom-core/src/event.rs`
-(`Record` and every event kind), `crates/loom-core/src/ledger.rs` (`LedgerState`). Read those files
-for the exact field names — serde conventions: enums and `kind`/`type` tags are `snake_case`; a
-`Record` is flat (`{seq, ts_ms, author, prev, kind, …fields of the event}`); `author` is `"user"`,
-`"model"`, `"tool"`, `"harness"` or `{"agent": "s-…"}`; `SessionInfo` is its `meta` fields
-flattened plus `active` and `status`. One exception to the names in the Rust types: an inbox item's
-kind is `item_kind` on the wire (in an `inbox_opened` record and in `InboxEntry.item`), because
-`kind` is the record's own tag.
+The sidebar groups root sessions into Needs your answer, Running, Ready to review, and Other
+missions. Blocking child inbox items contribute to their mission's attention. Agents are collapsed
+under the root by default; opening an agent expands its ancestors. Peer order stays based on creation
+order inside each group. Archived roots remain hidden until Show archived is enabled.
 
-- At load: `GET /api/sessions`, `GET /api/inbox`, `GET /api/status`; then one `EventSource` on
-  `/api/events?deltas=true` for everything live. Every event is a `message` event whose data is one
-  JSON object with a `type`: `session`, `record`, `delta`, `status`, `net`, `settled`, `error`,
-  `lagged`.
-- Opening a session: `GET /api/sessions/{id}/records` page by page (`after`, `next_after`) until
-  the end, then keep it current from the event stream (records carry `seq`: apply one only if it
-  is the next one; a gap means fetch the missing page). Sessions not open are not fetched.
-- `lagged`, or the `EventSource` reconnecting: refetch the session list, the inbox, and the open
-  session's records after the last seq held.
-- A blocking inbox item is also announced with the browser's `Notification` API when permission was
-  granted (a button in the inbox view asks for it; never ask unprompted).
+Blocking requests, nonblocking questions and available results have different labels. Only blocking
+requests use the urgent attention treatment. The second line of a mission row says what is waiting
+on the operator and for how long, then how its root session stands; with nothing waiting it shows
+recorded activity and its age. Ages come from recorded times, never from creation, and activity that
+has not been loaded is explicitly unknown. The agents toggle under a mission says how many agents it
+has and how many are running. Token counts and step counters are run details rather than a measure
+of completion.
 
-## Layout
+Routes are `#/s/<id>/overview`, `/evidence`, and `/record`; the old `#/s/<id>` route opens Overview.
+`#/inbox` and `#/new` retain their meaning. Browser Back/Forward restores the selected mission view.
 
-Three columns, full height, each scrolling by itself. Below 1100 px the right column becomes a
-drawer opened from the header; below 700 px the left one does too.
+The header keeps the goal and current plan step visible at all supported widths. Its standing is a
+row of separate facts: what is waiting on the operator, how the lead (or agent) stands, and how many
+agents are running. A root session is called the lead only when its role is `lead`.
 
-### Left: missions
+Overview is the default. Its main column holds the questions waiting on the operator, the recorded
+plan with a progress bar over the steps still in it, and recent activity. Its rail holds the agents
+(or, for an agent, the mission it is part of), the counts of claims and obligations, and the run
+numbers. Activity lists the latest ten recorded changes, newest first, and says so when more were
+recorded. After a prior visit, the changes recorded after the last fully loaded sequence seen when
+leaving are grouped under “New since your last visit”; the earlier ones stay listed below them.
+Only sequence watermarks and inspector width are saved in tab-scoped storage; message and answer
+text stays in memory.
 
-- Header: `loom`, a dot for the daemon/model state (green: every model reachable; amber: one is
-  not — the tooltip says which and why; red: the event stream is disconnected), an **Inbox** button
-  with the count of open items (highlighted when any is blocking), and **New**.
-- The list: root sessions newest first, each with its agents nested under it (indent, role name).
-  Each row: a state mark, the title, and one dim line: role · step N · context size · age.
-  State marks (also used in the header of the transcript): running (animated), waiting for jobs or
-  agents, needs you (an open inbox item — the most prominent), stopped, finished, failed, idle.
-  A toggle at the bottom shows archived sessions.
-- **New** opens a form: workspace (text, required), message (textarea, required), role (select
-  from: lead, chat — default lead), model profile (select from `status.models`), title (optional),
-  "resume by itself after a restart" (checkbox, default on for lead). Submits `POST /api/sessions`
-  and opens the new session. Errors are shown in the form, verbatim.
+Evidence lists claims with their recorded status, source quotes and remaining notes, and can be
+filtered by that status. Each evidence item shows two separate facts: whether its quote matches the
+stored output, and which way the agent says it points. Each source
+reference opens its cited range with surrounding context. Full record retains all previous event
+presentation: native tool call/result pairing, explicit missing results and output cuts, child
+reports, re-weaves, inbox resolutions, request details, reasoning and live output. Scrolling up
+stops following new output and reveals Jump to latest. Activity links open their corresponding
+record blocks.
 
-### Middle: the transcript
+## Drafts, submissions and updates
 
-Header: title, state mark and words, `step N`, a context meter (below), and the actions that apply:
-**Stop** (while running or waiting), **Resume** (after a stop), **Archive**/**Unarchive**.
+Drafts are keyed by session ID for messages and item ID for inbox answers. They survive mission/view
+switching, stream reconnection and snapshot refreshes while the page remains open. They do not
+persist after a page reload or tab closure. Keyed inbox nodes preserve focus and selection when
+another question arrives. Suggested answers are toggles over the one draft: pressing one fills the
+draft, pressing it again clears it, and nothing is sent until Send answer. The card always says what
+would be sent. When suggestions exist, “Write your own…” reveals the text field; a draft that is not
+one of the suggestions keeps the field in view. Send answer stays disabled for a blocking request
+with an empty draft; a nonblocking question with an empty draft offers Dismiss instead.
 
-The transcript is the session's record, in order, one block per record kind:
+Capture the destination and submitted text before awaiting a request. An acknowledgement for one
+mission must not clear another mission's draft or steal its focus. Clear a draft only if its value
+still equals the submitted text. Disable duplicate in-flight submissions per destination. Require a
+fully loaded initial record watermark before sending or correlating delivery. A message accepted by
+the API waits for its matching recorded receipt before another submission reuses that watermark;
+a following model-request event updates its delivery standing. These are observable UI receipts,
+not proof that the model understood the message.
 
-- `user_message`: the operator's words. Full width, strong.
-- `harness_note`: labelled with its kind (`nudge`, `output_cut`, `budget`, `stall`, `arrival`,
-  `assignment`, …), dim, collapsed to three lines with *show*. An `assignment` is open by default.
-- `model_response`: reasoning first, collapsed to a one-line summary (`reasoning · N lines`) that
-  expands; then the text, whitespace preserved (`white-space: pre-wrap`); a footer line: prompt
-  tokens, cached share as a percentage, completion tokens, seconds, attempts when above 1. A reply
-  cut by the output limit (`finish: "length"`) says so in amber.
-- `tool_call` + its `tool_result` (matched by `call_id`): one block. Header: tool name, the
-  arguments on one line (for `bash` the command itself, for file tools the path; otherwise compact
-  JSON), status mark, duration. Body: the result text in a monospace box, collapsed beyond 24 lines
-  (*show all N lines*). When the result has `cut: true` or a stored `output`, a line says how much
-  the model was shown of how much (`meta.shown` ranges against `output.lines`) with **open full
-  output**, which loads `GET /api/blobs/{handle}/lines` page by page into a viewer panel. A call
-  with no result yet shows *running…*; a call whose turn was interrupted shows *no result
-  recorded*. Status other than `ok` is marked red (`error`, `timeout`, `denied`, `invalid`,
-  `interrupted`).
-- `child_spawned`: a card — role, mode, the brief's question — linking to the agent's session.
-  `child_settled`: outcome and the report (collapsed beyond 24 lines). An `inline` settlement is
-  shown as a one-line marker only (its report is the result of the call above it).
-- `job_registered` / `job_settled`: one line each.
-- `ledger`: one dim line (`ledger #n: summary`).
-- `reweave`: a full-width divider: `context re-woven (reason) — N items folded out of view, about X
-  → Y tokens`, expanding to the list of evictions (seq, action) and the brief that was put in
-  view. Nothing was deleted; say so in the expanded view: `Folded items stay in the record above
-  and can be read back by the model.`
-- `inbox_opened`: a prominent card with the text, the options as buttons (clicking one fills the
-  answer), an answer box and **Send answer** (`POST /api/inbox/{item_id}`); for kind `finished`
-  the card is the result, with **Dismiss** (an empty answer). Once the matching `inbox_resolved`
-  exists the card shows the answer and no form.
-- `cache_break`: an amber line (`cache break at message N: detail`). `interrupted`: an amber line.
-- `turn_end`: a thin divider with the reason in words. `session_end`: a final line.
-- `turn_start`, `model_request`, `pin`, `unpin`, `net`, unknown kinds: not shown, except that a
-  toggle **details** in the header shows `model_request` lines (step, epoch, estimated tokens).
+Stop, Resume, Archive and Unarchive have explicit pending states. Stop's description identifies its
+scope: the session, descendant agents and tracked jobs. Message receipts distinguish acceptance,
+recording and a subsequent model step. Failures retain the draft and explain what happened.
 
-While a reply streams (`delta` events for the open session): a live block at the end with the
-reasoning and text so far and the tool calls being written (name, then arguments as they arrive).
-It is replaced by the real blocks when the `model_response` record arrives. `retrying` deltas show
-`retrying (attempt N): reason`.
+Snapshot requests use destination and request-generation guards on both success and failure.
+Session/inbox refreshes must not overwrite newer stream events. Connection status and snapshot
+freshness remain separate from mission attention; a disconnected stream makes execution standing
+unknown while retaining the last update time.
 
-The view follows the end while the operator is at the end, and stops following when they scroll up
-(a **jump to latest** button appears).
+## Inspector and responsive behavior
 
-Composer (root sessions only; hidden for agents, with a line saying messages go to the lead):
-a textarea, **Send** (Enter sends, Shift+Enter is a newline). While a turn is running, sending is
-still allowed (the message is delivered between steps) and the button says **Send (delivered
-between steps)**.
+The mission inspector is closed by default. It contains Ledger, Context, Network and Session tabs.
+On a wide display, opening it adds a resizable side pane. Drag the separator or use its arrow keys;
+Home/End select the bounds. On narrower displays it becomes a drawer. Below 700px the mission
+sidebar is also a drawer. Closed surfaces are inert; modal drawers trap keyboard focus, close with
+Escape, and restore focus. Background content is inert while a modal drawer is open.
 
-### Right: state
+Tabs have explicit tab/tabpanel semantics and arrow/Home/End keyboard navigation. Use system text
+for prose and monospace for source, commands and logs. Keep visible focus, readable form controls,
+light/dark appearance and reduced-motion support. Avoid dependence on color or hover alone.
 
-Tabs:
+## Stored output dialog
 
-- **Ledger** (`GET /api/missions/{mission}/ledger`, refetched when a `ledger` record arrives for
-  any session of the mission): goal; constraints; plan (each step with its status mark and note);
-  claims (status, with their evidence: quote, handle + lines, note; `attested` shown as a check);
-  open obligations; decisions; dead ends; questions. When the mission has no ledger, say so.
-- **Context** (`GET /api/sessions/{id}/window`, refetched on each `turn_end` and `reweave` and
-  on demand): the meter — a bar scaled to the model's window showing what is in view, with marks
-  at `floor_tokens` and `target_tokens`; the numbers (in view, last request's prompt tokens, cached
-  share, epoch); then the items in view, each: seq, kind, state (`live`, `stubbed`,
-  `reasoning_dropped`, `dropped`), size, a pin mark, the preview. A **Fold now** button
-  (`POST …/reweave`). The header's small context meter is the same bar without the list.
-- **Network** (`GET /api/sessions/{id}/net`, plus live `net` events): time, allowed/refused, method,
-  host:port, the rule that decided.
-- **Session**: id, mission, role, pack, model, workspace, created, budget, unattended, parent (a
-  link), agents (links).
+Use a native modal dialog with an accessible title, focus containment, Escape dismissal and focus
+restoration, including when a live update replaces the original source button. The viewer shows
+snapshot identity, producing session/call when available, numbered lines and highlighted citations.
+It supports paging in both directions, Go to line, copying the source reference, and literal Find
+in displayed lines. Search is explicitly limited to the loaded range; it does not claim to search
+an entire unseen blob. Jumping to another line updates the copied citation. Loading an old range
+cannot overwrite a newly opened source dialog.
 
-### Inbox view
+The dialog holds two fields, so it is not a form: a form with two fields and no submit button
+swallows Enter. Each field handles its own Enter. Go to line scrolls to a loaded line, or loads the
+range around a line that is not loaded, and refuses a line outside the output with the allowed
+range. Find searches the text of the lines, never their numbers; Enter and Next go forward,
+Shift+Enter and Previous go back, both wrap, and the count says which match is shown. Neither
+action moves focus or closes the dialog. Opening the dialog puts focus on the lines, so the arrow
+keys scroll them at once and Enter never rests on Close. Loading earlier lines keeps the lines
+being read where they are. A cited line, the line gone to and a search match are marked
+differently, since all three can meet on one line.
 
-Replaces the middle column: every open item, oldest first, with its session's title (a link), age,
-text, options, answer box. Blocking items first. A line at the top: `Notifications: on/off` with
-the button that asks for permission.
+## Validation
 
-## Look
+Run the pure regressions and safety checks with:
 
-Dark by default, light with `prefers-color-scheme: light`. System font for prose, a monospace stack
-for tool output and arguments. Dense but calm: the transcript is the page; chrome is quiet. One
-accent colour for "needs you". No animation except the running mark.
+```sh
+node --test ui/core.test.js
+node --check ui/app.js
+```
 
-## `core.js` (pure, tested with `node --test ui/`)
+For browser checks without a model or real daemon:
 
-At least: the session store (apply a session list, a `session` event, a `status` event; build the
-tree of roots and agents; the state mark of a session from its `status` and open inbox count);
-the record store of the open session (append in order, detect a gap, pair `tool_call` with
-`tool_result`, pair `inbox_opened` with `inbox_resolved`, fold the live deltas into a pending
-reply and clear it on the `model_response` with the same `req_id`); formatters (`tokens`: `812`,
-`12.3k`, `1.05M`; `seconds`; `age`; cached share; the one-line form of a tool call's arguments;
-shown-of-total for a cut output). `ui/core.test.mjs` covers each of these.
+```sh
+node tools/ui-preview.mjs
+```
+
+Open the printed loopback URL. The fixture contains three missions, a running agent, a blocking
+question, a nonblocking completed result, a failed tool result, formatted/inert source text, and
+two claims: an open one citing output at line 1596, and a supported one with a matching quote at
+lines 212–214 and an unchecked quote that undermines it. Message responses are delayed so navigation during submission can be checked. The fixture-only
+`POST /__fixture/question` injects a nonblocking arrival, and `POST /__fixture/reconnect` drops the
+stream to exercise refreshes. `GET /__fixture/state` lists only synthetic submission receipts.
+
+Check mission and answer draft isolation, focus after an arrival/reconnect, duplicate submission
+prevention, evidence jumps/search/copy, Enter in both fields of the stored output dialog, paging to
+earlier lines, Back/Forward, inspector tabs/resizing, closed-drawer tab order, modal focus
+restoration, light and dark appearance, and 320px/desktop layouts. The preview binds loopback and never reads
+credentials, starts a model or writes a workspace. Rust/native builds follow the separate-host rule
+in `docs/IMPLEMENTING.md` and `gui/DESIGN.md`.

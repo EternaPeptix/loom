@@ -98,13 +98,20 @@ Talks to the active `baseURL` with `Authorization: Bearer <token>`. Two jobs:
   `settled`, `lagged`, …). There is no `inbox` event: an inbox change shows up as a `record` of kind
   `inbox_opened` / `inbox_resolved` or a `status` whose `open_inbox` changed, and is answered by
   re-reading `GET /api/inbox`, the source of truth for the open set. Maintain a local map of
-  sessions by id and a set of open inbox items; derive `running` (sessions whose phase is running),
-  `waiting` (open blocking inbox items) and `active` (not ended/archived). If the SSE stream drops,
+  sessions by id and a set of open inbox items; derive `running` (missions with a running lead or
+  descendant agent), `runningAgents` (child sessions whose phase is running), `waiting` (open blocking inbox
+  items) and `active` (root missions not ended/archived). If the SSE stream drops,
   fall back to polling `GET /api/sessions` and `GET /api/inbox` every few seconds and keep retrying
   the stream. All of this is read-only.
+- **Freshness** is independent of attention. Counts are unknown until both session and inbox
+  snapshots succeed. A failed resource refresh retains the last counts and exposes them as last
+  known, with an updating age; another resource succeeding or an SSE event must not clear that
+  failure. A full successful polling snapshot can make counts current while the stream reconnects.
+  The connection dot is green only for a live stream with current data, amber for reconnecting or
+  polling, and never changes colour merely because a mission needs an answer.
 - **Notifications**: when a new **blocking** inbox item appears (kind `question`, `blocker`, or a
-  parked session) that was not seen before, post a `UNUserNotification` (request authorization once at
-  launch). Its title names the mission; its body is the item text, cut. Activating the notification
+  parked session) that was not seen before, post a `UNUserNotification` (authorization is requested
+  by the **Enable notifications…** menu action). Its title names the mission; its body is the item text, cut. Activating the notification
   brings the window forward and navigates the web pane to that session.
 
 The client never writes: answering, stopping, approving all happen in the web UI the operator is
@@ -132,13 +139,16 @@ Do not inject scripts into the page or read its contents; the pane only navigate
 
 `@main` `App` with:
 
-- a `MenuBarExtra` whose label is a short glyph plus counts (e.g. `◆ 2▸ 1!` meaning 2 running, 1
-  waiting), red when anything is waiting. Its menu: the connection name and status; **Open loom** (show
+- a `MenuBarExtra` whose label names missions, agents, and items needing an answer (e.g.
+  `2 missions · 4 agents · 1 needs you`), red when a current snapshot has blocking items. Unknown or
+  stale counts are labelled `loom · state unknown`; the menu retains their last-known values.
+  Its menu: the connection name and data freshness; **Open loom** (show
   / focus the window); a connections submenu to switch; **Disconnect**; **Quit**. `LSUIElement` is
   true so the app lives in the menu bar; the main `Window` is opened on demand and on first launch.
 - the main `Window` hosting `RootView` (a connection bar — active connection, state, reload — above
   the `WebPane`).
-- notification setup (authorization, delegate that foregrounds the window and routes to a session).
+- notification setup (an explicit **Enable notifications…** menu action requests authorization;
+  the delegate foregrounds the window and routes to a session). Launch does not prompt for consent.
 - lifecycle: restore the last-used connection on launch and connect to it; tear the tunnel down on
   quit.
 
