@@ -163,6 +163,7 @@ loom approve <session> "text" [--scope "..."]
 loom scope <session> <host>...            let the mission's tools reach these hosts (a session asks with request_scope)
 loom release <session> "reason"           accept a blocked mission as it is and close it
 loom ledger <session>                     the mission ledger
+loom score <session> [--json]             what the mission's work took: steps, refused finishes, malformed calls
 loom window <session>                     what is in the model's context right now
 loom net <session>                        every network request and how it was decided
 loom open                                 open the web UI in a browser
@@ -228,6 +229,7 @@ cargo build --release -p loom-daemon      # the `loom` binary, target/release/lo
 cargo test --workspace                    # the Rust suite
 cargo clippy --workspace --all-targets -- -D warnings
 node --test ui/core.test.js               # the web UI's logic; needs Node.js 22.12 or newer
+cargo run -p loom-agent --example eval    # scripted models against the mock server: what each run took
 ```
 
 `./x` is an optional wrapper that runs cargo on another machine named by `LOOM_BUILD_HOST` (and

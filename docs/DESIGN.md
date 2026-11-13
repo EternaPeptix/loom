@@ -225,14 +225,17 @@ harness-built report, text the harness did not write is fenced line by line: `>`
 `  | ` before each further line of a list item (§9).
 
 **Re-weave.** A `reweave` record changes the projection for everything at or before `upto_seq`: it
-lists evictions (`stub` with replacement text, `drop`, or `drop_reasoning`) and carries a brief (the
+lists evictions (`stub` with replacement text, `drop`, `drop_reasoning`, or `remove`) and carries a brief (the
 ledger snapshot and resume instructions) that is rendered as a `<harness kind="resume">` block
 directly after the last item at or before `upto_seq`. Evictions accumulate across re-weaves (a later
 one wins for the same record); only the latest brief is rendered. The epoch increments. Everything
 after `upto_seq` renders normally. Because the record is in the log, the projection stays a pure
 function of the log. `drop` on a tool result renders `[evicted from view; the call and its result
 remain in the session record]`; on a model response it removes the text and reasoning and keeps the
-calls, so pairing holds. Evictions that name a protected item are ignored.
+calls, so pairing holds. `remove` on a tool result takes the call out of the window together with its
+result: the assistant message no longer lists that call and no `tool` message is rendered for it (the
+calls that stay keep their pairing; a response left with no text and no call renders nothing). Only a
+fresh start plans one (below). Evictions that name a protected item are ignored.
 
 **Eviction order** (`plan_reweave`), applied until the estimate is at or below the floor, stopping as
 soon as it is:
@@ -246,6 +249,14 @@ soon as it is:
 6. never: the system message, user messages, the `forked` record, harness notes of kind
    `constraint`, `approval` and `assignment`, pinned output, and the protected recent region — the
    last `keep_recent_steps` model responses (rendered or not) and everything after the first of them.
+
+**Fresh start** (`plan_fresh_start`). The fold made when a verifier did not accept a lead's finish (§8)
+is another plan: it is not driven by size and protects no recent region (`upto_seq` is the last record,
+so the brief renders after everything). It drops the text and reasoning of every model response,
+removes every tool result the caller names as an attempt (the session names the `finish` and `conclude`
+calls since the last delivered result; a pin does not keep one), stubs every other unpinned result and
+agent report, and drops the harness notes of kind `nudge`, `stall` and `verdict` (what the harness said
+about the attempt). User messages, constraints, approvals, the assignment and pinned output stay.
 
 A stub is the evicted result's first line (its envelope header: call, outcome, size, handle); for an
 execution, the last `stub_tail_lines` (12) lines follow under `[last N lines as first shown]`; then
@@ -296,7 +307,10 @@ least `agents.unviewed_min_lines` (20) lines never shown; calls repeated with th
 same output; reads and command results that a later write of this session made out of date; running
 jobs and agents; ledger questions waiting on the operator; and, only in the last stretch of a step or
 time budget, one heads-up to wrap up — with no running count, so a rising number is never shown. It
-never mentions context size, message counts or elapsed session time.
+never mentions context size, message counts or elapsed session time. It states facts the harness holds
+and carries no guess: a repeat is listed only when the call and its result were the same, byte for
+byte (an advisory "similar outcomes" line was tried and removed: a guess beside the exact signal
+weakens both).
 
 **Prefix guard** (`loom-core::prefix`). For each step request the session hands the stable messages to
 `PrefixGuard::check`, which compares them with those of the previous request: unless the epoch
@@ -423,7 +437,13 @@ the first two are singletons.
   all exist and are attested and supporting, at least one of kind `execution` (a static-only basis is
   refused: run the target and cite the run). A concluded claim may be written again only with the other
   terminal state and at least one execution evidence record added after the entry that set the current
-  state. A later gate and verifier check the claim; the ledger only holds it.
+  state. A later gate and verifier check the claim; the ledger only holds it. The one way back to
+  `open` is the harness's (`GoalReopen {finish}`, which no tool of a model writes): it records that a
+  verifier did not accept the finish that rested on the conclusion (§8, fresh start). It must name the
+  latest finish claim, rejected and not yet used to reopen, and a concluded claim; an entry that names
+  anything else changes nothing, so a forged one cannot retract a conclusion. A reopened claim may be
+  concluded either way, but only citing execution evidence recorded after the reopening: what was
+  shown before the rejection cannot conclude it again.
 - **Operator release** (`release`, written by `OperatorRelease`, operator only). The operator accepts the
   result short of the goal and the work may stop. A reason is required, a goal must be set, and only one
   release is recorded. It never changes `goal_met`; the views show it as `released by the operator (goal
@@ -442,9 +462,10 @@ Network scope. A journal written before these records existed folds unchanged; t
 default to empty.
 
 **Evidence** (the `evidence` tool, `loom-agent::rtools::ledger`). The model names a claim, a stored
-output by handle, a line range, a quote and a note. The harness:
+output by handle, a line range and a note, and either a quote or nothing more (a quote by lines, below).
+The harness:
 
-1. checks the quote against those lines of the stored text (below);
+1. checks the quote against those lines of the stored text, or takes the lines themselves (below);
 2. finds the producer of the output among the mission's sessions (a session's own records only):
    the tool call whose result stored it; for a `read`, the call that stored the file text its header
    names; for the complete output of a background job, the call that started the job. A view
@@ -478,6 +499,22 @@ characters (`observe::QUOTE_RECORD_CHARS`); on longer lines it is the occurrence
 the lines around it as fits in 300 characters and `…` where text was left out, so the quoted text is
 always shown and the record stays bounded. There is no other leniency: case, indentation, inner spacing
 and punctuation must match.
+
+**Quote by lines** (`gate::check_quotes`, `observe::lines_as_quote`). Retyping is what fails most in a
+quote (a changed space, a cut line, a paraphrase), and each failure costs a step, while the numbered
+views (`out_read`, `out_grep`, `read`) give the model line numbers for nothing. So the text of a quote
+may be left out (`quote` of `evidence`, `text` of a `finish` quote: absent, `null` or blank): the quote
+is then the lines `start`-`end` as the stored output has them, trailing whitespace removed and blank
+lines at either end left out. Nothing is retyped, so nothing can be mistyped, and what is recorded is
+the output's own text. With no text to pin the place the range is taken at its word: an `end` past the
+last line is refused rather than clamped, and so are a range of more than 20 lines
+(`observe::REF_QUOTE_MAX_LINES`), one of blank lines only, and one whose text has more than 2000
+characters (`REF_QUOTE_MAX_CHARS`); a quote is the lines that show a point, and a range costs nothing to
+widen. The producer rule (point 3) holds for it as for any quote. What this gives up is the check of
+the numbers against a text: a miscounted range records the neighbouring lines. So `evidence` plays back
+what it recorded (`Recorded from {handle}, lines {a}-{b}, as stored:` and the lines), and the tool
+descriptions say to leave the text out only with line numbers read from a numbered view. A quote given
+with its text is checked as before.
 
 **Views.** `LedgerState::render_markdown()` is the full Markdown view (the `ledger` tool, the API's
 `markdown`, `loom ledger`). A mission whose lead keeps a ledger but has written nothing yet has an
@@ -601,8 +638,8 @@ when it is false), `report_blocker {class, what, tried, needs}` (class `needs_ap
 **Finish gate** (`rtools::terminal`). It fails closed: a lead's result reaches the operator as finished
 only when every check passes and, where verification is required, a verifier accepted it.
 
-- `answer` must not be blank, and each quote (`{handle, start, end, text}`) must pass the quote check and
-  quote an observation (the rule of `evidence`, §7).
+- `answer` must not be blank, and each quote (`{handle, start, end, text?}`; without `text` it is a
+  quote by lines) must pass the quote check and quote an observation (the rule of `evidence`, §7).
 - `finish` is refused, in a lead and in a child alike, while a background job of the session or an
   agent it started is running; the refusal names them and says what to do (`wait`, `job_kill`,
   `agent_stop`; `job_kill` and `finish` can go in one reply). This is live state, not ledger
@@ -639,6 +676,23 @@ only when every check passes and, where verification is required, a verifier acc
     `MAX_FINISH_REJECTIONS` (2) rejections counted since the latest accepted finish, each rejection also
     writes a non-blocking note (`finish rejected n times; continuing`); nobody is asked and the session
     works on until its budget;
+  - rejected, started afresh (`agents.fresh_start`, default on). A session that goes on from a rejection
+    with its own account of the attempt in view (the answer it gave, the conclusion it drew, the
+    reasoning that led there, replayed at every step) tends to defend that account or to give up again.
+    So every rejection also (a) reopens the goal: a concluded goal-met claim goes back to open
+    (`GoalReopen`, not after an operator's release), and the ledger accepts a new `conclude` only on
+    execution evidence recorded after the reopening; and (b) folds the lead's window once the reply's
+    calls have their results: one `reweave` with the reason `finish not accepted`, not driven by size
+    and without a digest (a digest would be that account again), which drops the text and reasoning of
+    every response, takes every `finish` and `conclude` call made since the last delivered result out
+    of the window together with its result (`EvictAction::Remove`, §5), stubs the other results and
+    drops the nudge, stall and verdict notes. The next request ends with a brief
+    (`texts::fresh_start_brief`): what the check found, in the verifier's words, how to go on (the goal
+    is unsolved, not decided either way; a route is closed only by a recorded run that shows it fails),
+    and the ledger. The brief and the HUD's finish line never say that a finish was made or rejected.
+    Nothing leaves the record: the attempt stays in the log and its outputs in the store, so
+    `log_search`, `out_read` and `out_grep` reach them, and the operator sees all of it. With the option
+    off the conclusion stands and the rejection stays in view as the result of the call;
   - a verifier that cannot be started, or ends without a verdict, is a fault of the harness: a fresh
     one is started up to two more times; if none runs, the finish stays recorded without a verdict, a
     non-blocking note labelled an infrastructure fault is written, `finish` returns an error saying so,
@@ -1201,6 +1255,7 @@ GET  /api/sessions/{id}/window                → WindowView
 GET  /api/sessions/{id}/net?limit=            → [NetEntry], the last `limit` (default 200, at most 2000)
 GET  /api/missions                            → [MissionInfo]
 GET  /api/missions/{id}/ledger                → LedgerView {state, markdown, skipped, skipped_detail, torn_tail, ahead_of_head}
+GET  /api/missions/{id}/score                 → ScoreView {mission, sessions: [{session, role, parent?, card}], total}
 GET  /api/inbox                               → [InboxEntry], oldest first
 POST /api/inbox/{item_id}                     {answer} → 202 {}
 GET  /api/blobs/{handle}                      → BlobRef {id, bytes, lines}
@@ -1322,6 +1377,22 @@ temporary file and rename, syncs the shard directory, rebuilds a missing or inco
 blob, refreshes a blob's age when the same bytes are stored again (or writes it anew when it cannot),
 and removes temporary files older than an hour when it opens.
 
+**Scorecard** (`loom-core::scorecard`, `GET /api/missions/{id}/score`, `loom score <session|mission>
+[--json]`). A change to the harness (a prompt, a gate, a tool's shape) is meant to make the model's work
+cheaper or its results better; whether it did is a question about runs. A scorecard is the counts that
+answer it, read from a session's own records and nothing else: steps, and the steps up to the first
+delivered finish (none for a run that did not finish, which is censored, not fast); tool calls and
+those that were malformed (cut by the output limit, or refused as invalid: nothing ran); `finish` calls
+and those refused, whatever held them back; quote refusals (a `finish` or `evidence` whose quote did
+not check: a step spent on repairing a quote); finishes a verifier accepted and rejected; fresh starts.
+The refusals a card counts by kind are marked in the result's `meta` when they happen
+(`META_REFUSAL`: `quote` or `verifier`; `META_VERIFIED` on a delivered finish), so nothing is inferred
+from prose; a log written before those keys existed shows `?` for the counts it cannot know. The route
+answers one card per session of the mission (the lead first) and a total, which is the lead's card with
+the others' counts added: the result of a mission is its lead's, the cost is everyone's. The counts say
+what the work took and how often the harness sent it back, never whether the result is right: that is
+the business of an oracle outside the session (`docs/SECURITY-EVAL.md`).
+
 **Status.** `GET /api/status` (`loom status`) reports the version, pid, address, proxy port, home, each
 model profile (reachable, served model, window, `max_concurrent`), session and inbox counts, and `disk`
 (`{free_bytes, total_bytes}` of the volume that holds the home, or null); `loom status` warns when less
@@ -1383,6 +1454,14 @@ as workspace content.
 - Errors are typed per crate with `thiserror`; messages that reach the model say what to do next.
 - Every module has unit tests; anything that touches disk uses `tempfile`. Tests never need the
   network or a real model — use `loom_model::mock`.
+- A change to what the model reads or to what the harness refuses is measured, not argued.
+  `loom-agent::evalkit` plays scripted models (one that does everything right, one that retypes its
+  quotes wrong, one that finishes early, one whose calls are malformed, one whose finish is rejected,
+  one that delegates, one that gives up) against the real runtime and the mock server on one small
+  task, and prints the scorecard of each (`cargo run -p loom-agent --example eval [--json]
+  [scenario…]`); its tests pin the counts, so a change that costs a scripted model a step fails one. A
+  script cannot say how a real model reacts: for that, compare `loom score --json` of recorded runs
+  before and after the change, on the same tasks, with their oracle's verdicts beside them.
 - No telemetry of any kind. No network access except what this document names.
 - Building is plain cargo: `cargo build --release -p loom-daemon`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`. The UI's pure module is tested with

@@ -13,6 +13,7 @@
 //! - [`ledger`]  typed mission state (ops and folded state)
 //! - [`journal`] sealed append-only journal that stores ledger ops
 //! - [`observe`] what the model has been shown: coverage, repetition, staleness, quote checks
+//! - [`scorecard`] what a session's work took: steps, malformed calls, refusals, verdicts
 //! - [`config`]  configuration file and on-disk layout
 
 pub mod admit;
@@ -27,6 +28,7 @@ pub mod log;
 pub mod message;
 pub mod observe;
 pub mod prefix;
+pub mod scorecard;
 pub mod security_state;
 pub mod tagsafe;
 pub mod weave;

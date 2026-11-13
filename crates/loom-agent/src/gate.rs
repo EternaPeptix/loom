@@ -60,7 +60,30 @@
 //! - `InsideToken { line }`: `quote {i}: the text occurs on line {line} of {handle} only inside a longer
 //!   word or number. Quote from the start of that word or number to its end, or quote the whole line.`
 //!
-//! An empty `text` is a mismatch with the sentence `quote {i}: the text is empty.`
+//! A quote with an empty or whitespace-only `text` is a quote *by lines*: the model names the lines and
+//! the harness takes their text from the stored output, so nothing is retyped and nothing can be
+//! mistyped. Retyping is what fails most (a changed space, a cut line, a paraphrase), and each failure
+//! costs a step; line numbers are what the numbered views (`out_read`, `out_grep`, `read`) give the
+//! model for nothing. After the handle and range checks above, with no text to pin the place, the range
+//! is taken at its word:
+//! - `end` past the last line is refused, not clamped: `quote {i}: {handle} has {total} lines, so end
+//!   {end} is past its end. A quote without its text is exactly the lines you name; give a range within
+//!   1-{total}.`
+//! - more than `observe::REF_QUOTE_MAX_LINES` (20) lines: `quote {i}: lines {start}-{end} are {n} lines; a
+//!   quote without its text takes at most 20. Name only the lines that show the point, or give several
+//!   quotes.` (a range costs nothing to widen, and a quote is the lines that show a point);
+//! - `observe::lines_as_quote(lines, start)` is `None`: `quote {i}: lines {start}-{end} of {handle} are
+//!   blank. Name the lines that carry the text.`
+//! - its text has more than `observe::REF_QUOTE_MAX_CHARS` (2000) characters: `quote {i}: lines
+//!   {start}-{end} of {handle} have {n} characters; a quote without its text takes at most 2000. Name
+//!   fewer lines, or give the text of the part that shows the point, copied exactly.`
+//!
+//! Otherwise it is verified with that text and the numbers of its first and last line (blank lines at
+//! either end of the range are left out). What this gives up is the check of the numbers against a text:
+//! a miscounted range records the neighbouring lines. So a tool that goes on after the check shows the
+//! model what was recorded (`evidence` does), and the tool descriptions say to leave the text out only
+//! with line numbers read from a numbered view.
+//!
 //! Returns `Ok(verified)` when every quote passes (blob id, the text `check_quote_at` records for it and
 //! the range of the lines that text is on: without line-number prefixes, a fragment with the rest of its
 //! line, or with a window of it of at most `observe::QUOTE_RECORD_CHARS` characters when the line is
@@ -94,7 +117,8 @@
 //! Tests required: every branch of `on_yield`, including each tool-availability variant of the
 //! closing paragraph and exact text of at least one full nudge; `looks_like_call` positives and
 //! negatives (ordinary prose and ordinary JSON must be negative); `check_finish_lead` for each kind
-//! of open item; `check_quotes` success, each failure sentence, clamping, several failures at once;
+//! of open item; `check_quotes` success, each failure sentence, clamping, several failures at once; a
+//! quote by lines recorded as stored, with its blank ends left out, and each of its four refusals;
 //! `render_report` full, minimal, and cut.
 
 use loom_core::event::{ChildOutcome, Termination};
@@ -355,7 +379,8 @@ pub fn looks_like_call(text: &str) -> bool {
     })
 }
 
-/// A quote as the model gives it.
+/// A quote as the model gives it. With an empty `text` it is a quote by lines: the lines `start`-`end`
+/// as the output has them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quote {
     pub handle: String,
@@ -460,10 +485,10 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize) -> Result<VerifiedQuote, St
             q.start
         ));
     }
-    let end = q.end.min(total);
     if q.text.trim().is_empty() {
-        return Err(format!("quote {i}: the text is empty."));
+        return by_lines(blobs, q, &id, total, i);
     }
+    let end = q.end.min(total);
     let slice = blobs
         .read_lines(&id, q.start, end)
         .map_err(|e| format!("quote {i}: the stored output {handle} could not be read ({e}); try again."))?;
@@ -498,6 +523,42 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize) -> Result<VerifiedQuote, St
     }
     msg.push_str(" Copy the text exactly from the output.");
     Err(msg)
+}
+
+/// A quote given without its text: the lines it names, taken from the stored output (see the contract).
+/// `q.start` is known to be a line of the output, and not after `q.end`.
+fn by_lines(blobs: &BlobStore, q: &Quote, id: &BlobId, total: u64, i: usize) -> Result<VerifiedQuote, String> {
+    let handle = &q.handle;
+    let (start, end) = (q.start, q.end);
+    // No text pins the place, so the range is taken at its word: nothing is clamped.
+    if end > total {
+        return Err(format!(
+            "quote {i}: {handle} has {total} lines, so end {end} is past its end. A quote without its text is exactly the lines you name; give a range within 1-{total}."
+        ));
+    }
+    let count = end.saturating_sub(start).saturating_add(1);
+    if count > observe::REF_QUOTE_MAX_LINES {
+        return Err(format!(
+            "quote {i}: lines {start}-{end} are {count} lines; a quote without its text takes at most {}. Name only the lines that show the point, or give several quotes.",
+            observe::REF_QUOTE_MAX_LINES
+        ));
+    }
+    let slice = blobs
+        .read_lines(id, start, end)
+        .map_err(|e| format!("quote {i}: the stored output {handle} could not be read ({e}); try again."))?;
+    let Some((text, first, last)) = observe::lines_as_quote(&slice.text, start) else {
+        return Err(format!(
+            "quote {i}: lines {start}-{end} of {handle} are blank. Name the lines that carry the text."
+        ));
+    };
+    let chars = text.chars().count();
+    if chars > observe::REF_QUOTE_MAX_CHARS {
+        return Err(format!(
+            "quote {i}: lines {start}-{end} of {handle} have {chars} characters; a quote without its text takes at most {}. Name fewer lines, or give the text of the part that shows the point, copied exactly.",
+            observe::REF_QUOTE_MAX_CHARS
+        ));
+    }
+    Ok(VerifiedQuote { blob: id.clone(), start: first, end: last, text })
 }
 
 /// `s` cut to `max` characters, with `…` appended when something was removed.
@@ -994,13 +1055,67 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         assert!(e.contains("not valid"), "{e}");
         let e = check_quotes(&store, &[q(&h, 3, 2, "x")]).err().unwrap_or_default();
         assert!(e.contains("not valid"), "{e}");
-        let e = check_quotes(&store, &[q(&h, 1, 2, "  ")]).err().unwrap_or_default();
-        assert_eq!(e, "quote 1: the text is empty.");
         let e = check_quotes(&store, &[q(&h, 1, 2, "nothing like it")]).err().unwrap_or_default();
         assert_eq!(
             e,
             format!("quote 1: the text does not occur in {h} lines 1-2. Copy the text exactly from the output.")
         );
+    }
+
+    #[test]
+    fn a_quote_without_its_text_is_the_lines_it_names() {
+        let (_d, store, h) = store_with(OUT);
+        let id = store.resolve(&h).unwrap_or_else(|e| panic!("{e}"));
+        // Nothing is typed, so nothing is compared: the stored lines are the quote. Blank text is no text.
+        let ok = check_quotes(&store, &[q(&h, 2, 3, ""), q(&h, 4, 4, " \n")]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            ok,
+            vec![
+                VerifiedQuote { blob: id.clone(), start: 2, end: 3, text: "beta line two\ngamma line three".into() },
+                VerifiedQuote { blob: id, start: 4, end: 4, text: "delta line four".into() },
+            ]
+        );
+        // Blank lines at the ends of the range are left out and the numbers follow; indentation stays.
+        let (_d, store, h) = store_with("head\n\n  indented   \n\nmore\n\n\ntail\n");
+        let ok = check_quotes(&store, &[q(&h, 2, 6, "")]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((ok[0].start, ok[0].end, ok[0].text.as_str()), (3, 5, "  indented\n\nmore"));
+    }
+
+    #[test]
+    fn a_quote_without_its_text_is_taken_at_its_word_and_kept_small() {
+        let (_d, store, h) = store_with(OUT);
+        // With no text to pin the place, a range past the end is not clamped.
+        let e = check_quotes(&store, &[q(&h, 3, 9, "")]).err().unwrap_or_default();
+        assert_eq!(
+            e,
+            format!("quote 1: {h} has 4 lines, so end 9 is past its end. A quote without its text is exactly the lines you name; give a range within 1-4.")
+        );
+        // The checks of any quote come first.
+        let e = check_quotes(&store, &[q(&h, 9, 12, "")]).err().unwrap_or_default();
+        assert!(e.contains("start 9 is past its end"), "{e}");
+        let e = check_quotes(&store, &[q("out:0123456789abcdef", 1, 1, "")]).err().unwrap_or_default();
+        assert!(e.contains("there is no stored output"), "{e}");
+        // At most 20 lines.
+        let many: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        let (_d, store, h) = store_with(&many);
+        assert_eq!(check_quotes(&store, &[q(&h, 5, 24, "")]).map(|v| (v[0].start, v[0].end)), Ok((5, 24)));
+        let e = check_quotes(&store, &[q(&h, 5, 25, "")]).err().unwrap_or_default();
+        assert_eq!(
+            e,
+            "quote 1: lines 5-25 are 21 lines; a quote without its text takes at most 20. Name only the lines that show the point, or give several quotes."
+        );
+        // Blank lines carry nothing.
+        let (_d, store, h) = store_with("a\n\n  \nb\n");
+        let e = check_quotes(&store, &[q(&h, 2, 3, "")]).err().unwrap_or_default();
+        assert_eq!(e, format!("quote 1: lines 2-3 of {h} are blank. Name the lines that carry the text."));
+        // At most 2000 characters: a long line is quoted by the part that matters.
+        let (_d, store, h) = store_with(&format!("short\n{}\n", "x".repeat(2_001)));
+        let e = check_quotes(&store, &[q(&h, 2, 2, "")]).err().unwrap_or_default();
+        assert_eq!(
+            e,
+            format!("quote 1: lines 2-2 of {h} have 2001 characters; a quote without its text takes at most 2000. Name fewer lines, or give the text of the part that shows the point, copied exactly.")
+        );
+        assert!(check_quotes(&store, &[q(&h, 1, 1, "")]).is_ok());
     }
 
     #[test]
@@ -1063,7 +1178,13 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         let (_d, store, h) = store_with(OUT);
         let e = check_quotes(
             &store,
-            &[q(&h, 1, 1, "alpha line one"), q(&h, 1, 1, "zzz"), q("out:ffffffffffffffff", 1, 1, "x"), q(&h, 2, 2, "")],
+            &[
+                q(&h, 1, 1, "alpha line one"),
+                q(&h, 1, 1, "zzz"),
+                q("out:ffffffffffffffff", 1, 1, "x"),
+                q(&h, 2, 2, ""),
+                q(&h, 2, 7, ""),
+            ],
         )
         .err()
         .unwrap_or_default();
@@ -1071,7 +1192,7 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         assert_eq!(lines.len(), 3);
         assert!(lines[0].starts_with("quote 2: the text does not occur"));
         assert!(lines[1].starts_with("quote 3: there is no stored output"));
-        assert_eq!(lines[2], "quote 4: the text is empty.");
+        assert!(lines[2].starts_with("quote 5: ") && lines[2].contains("end 7 is past its end"), "{}", lines[2]);
     }
 
     #[test]

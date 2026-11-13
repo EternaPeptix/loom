@@ -57,9 +57,37 @@ verified success. Verification children started by a terminal gate retain their 
 Output-limit nudges ask for one short complete tool call first. Reasoning-only replies receive a
 specific nudge without copying their reasoning; both paths retain the bounded no-progress breaker.
 
-The HUD adds advisory repeated-outcome warnings over the latest 64 result records. Fingerprints use
-up to 4096 admitted characters and normalize ISO timestamps/long hexadecimal addresses; they preserve
-HTTP status, ordinary numbers, tool status, exit code and signal. They supplement exact repetitions,
-never block tools or establish equivalent failures. A role's `flag_regex` alerts on admitted result
-views, naming the stored output; hidden portions are not exhaustively scanned. Matches remain
-unverified candidates requiring inspection and a challenge oracle or independent verifier.
+The HUD lists a repeated call only when the call and its result were the same, byte for byte. The
+advisory "similar outcomes" warning (fingerprints of normalized output) was removed: a guess shown
+beside the exact signal weakens both, and it never blocked a tool or established anything. A role's
+`flag_regex` alerts on admitted result views, naming the stored output; hidden portions are not
+exhaustively scanned. Matches remain unverified candidates requiring inspection and a challenge oracle
+or independent verifier.
+
+## Fresh start after a rejected finish
+
+`[agents] fresh_start` (default `true`) applies to every role whose finish is verified. When the
+verifier does not accept a lead's finish, the lead does not go on with the rejection, its answer and its
+own reasoning in view. Instead:
+
+- the goal is open again: a new `conclude` is accepted only on execution evidence recorded after the
+  rejection, and each objection stays an open obligation until such a run is recorded;
+- the lead's window is folded: its earlier replies and reasoning go out of view, every `finish` and
+  `conclude` call made since the last delivered result is taken out together with its result, other
+  tool output is shown in shortened form, and nudge, stall and verdict notes are dropped;
+- the next request ends with a brief that says what the check found (the verifier's words), that the
+  goal is unsolved and not decided either way, and how to reach folded material.
+
+This happens at every rejection. Nothing is deleted: the attempt stays in the session log (`loom tail`,
+the web UI) and its outputs in the store, and the model can still open them with `out_read`, `out_grep`
+and `log_search`. The fold starts a new cache epoch, like any re-weave. `fresh_start = false` restores
+the earlier behaviour: the conclusion stands, the rejection stays in the window as the result of the
+call, and only the objections hold the next finish. A mission the operator released is never reopened.
+
+## Measuring a change
+
+`loom score <session|mission> [--json]` prints what a mission's work took, one row per session and a
+total: steps, steps to the delivered finish, tool calls and malformed ones, refused finishes, refused
+quotes, verifier verdicts and fresh starts. These are counts of log records, not judgements of the
+result. `cargo run -p loom-agent --example eval` prints the same card for scripted models played
+against the mock server (no model, no network), for comparing two builds of the harness.

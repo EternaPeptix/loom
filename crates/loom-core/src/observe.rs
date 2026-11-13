@@ -19,13 +19,8 @@
 //! ## Repetition
 //! A repetition is the same tool name with the same canonical arguments (`serde_json` compact form of
 //! `tool_call.args`) and the same output blob id, completed at least `min_count` times. Only calls of
-//! class `Nav`, `Read` and `Exec` count.
-//!
-//! `outcome_repetitions` is an additional advisory signal over admitted output bodies, grouped by
-//! tool, status, exit code and signal after normalizing timestamps and long hexadecimal addresses.
-//! It ignores argument differences and output handles, scans at most 4096 characters per result,
-//! and never changes a verdict or tool admission. HTTP status codes and ordinary numbers remain.
-//! Similarity does not prove the same target or failure; raw records are preserved.
+//! class `Nav`, `Read` and `Exec` count. There is no looser notion ("similar outcomes"): one was tried
+//! as an advisory line in the HUD and removed, since a guess beside the exact signal weakens both.
 //!
 //! ## Staleness
 //! Using `meta[META_PATH]` on results of class `Read` (a file was read) and `Write` (a file was
@@ -66,10 +61,21 @@
 //! the longest common prefix with the first non-blank quote line (for error messages), if any shares
 //! at least 8 characters.
 //!
+//! ## Quote by lines
+//! A quote may also be given without its text, by the line numbers alone: nothing is retyped, so
+//! nothing can be mistyped, and what is recorded is the stored output's own text.
+//! `lines_as_quote(haystack, first_line)` is what such a quote records: the lines of the haystack, each
+//! with trailing whitespace removed, without the blank lines at either end (the text joined with `\n`),
+//! and the numbers of the first and last line of that text; `None` when every line is blank. The caller
+//! keeps such a quote small (`REF_QUOTE_MAX_LINES` lines, `REF_QUOTE_MAX_CHARS` characters): a quote
+//! names the lines that show a point, and a range costs nothing to widen. Nothing checks the numbers
+//! against a text here, so the caller shows what was recorded where it can.
+//!
 //! Tests required: coverage from own output, from views, merged ranges, malformed meta; unviewed
 //! ordering and threshold; repetition counting across different outputs; both staleness kinds and
 //! their absence after a re-read / re-run; check_quote positives, prefix stripping in every separator
-//! style, wrong line numbers, the minimum length, and negatives.
+//! style, wrong line numbers, the minimum length, and negatives; `lines_as_quote` on whole lines, with
+//! blank lines at the ends and inside, and on blank lines only.
 
 use crate::event::{
     Event, Record, Seq, ToolCall, ToolClass, ToolResult, ToolStatus, META_DEFERRED_OBSERVATION, META_OF_BLOB,
@@ -334,66 +340,6 @@ fn canonical(v: &Value) -> Value {
     }
 }
 
-/// Similar admitted outcomes across different arguments. A warning, not an equivalence proof.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutcomeRepetition {
-    pub tool: String,
-    pub count: u32,
-    pub last_seq: Seq,
-}
-
-pub fn outcome_fingerprint(result: &ToolResult) -> String {
-    static NORMALIZERS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
-    let normalizers = NORMALIZERS.get_or_init(|| {
-        [r"\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d+)?Z?", r"\b0x[0-9a-fA-F]{6,}\b"]
-            .iter()
-            .filter_map(|pattern| regex::Regex::new(pattern).ok())
-            .collect()
-    });
-    let limited: String = result.text.chars().take(4096).collect();
-    let header = format!("[{} · ", result.name);
-    let mut normalized = limited
-        .lines()
-        .enumerate()
-        .filter(|(i, line)| !((*i == 0 && line.starts_with(&header)) || line.starts_with("[end of ")))
-        .map(|(_, line)| line)
-        .collect::<Vec<_>>()
-        .join("\n");
-    for re in normalizers {
-        normalized = re.replace_all(&normalized, "<volatile>").into_owned();
-    }
-    format!(
-        "{:?}|{}|{}|{}",
-        result.status,
-        result.meta.get(crate::event::META_EXIT_CODE).unwrap_or(&Value::Null),
-        result.meta.get(crate::event::META_SIGNAL).unwrap_or(&Value::Null),
-        normalized
-    )
-}
-
-pub fn outcome_repetitions(records: &[Record], min_count: u32) -> Vec<OutcomeRepetition> {
-    let mut groups: BTreeMap<(String, String), (u32, Seq)> = BTreeMap::new();
-    // Limit work per HUD render; this signal concerns recent loops, not a lifetime similarity index.
-    for r in records.iter().rev().filter(|r| matches!(&r.event, Event::ToolResult(_))).take(64) {
-        let Event::ToolResult(t) = &r.event else { continue };
-        if !matches!(t.class, ToolClass::Exec | ToolClass::Read | ToolClass::Nav)
-            || matches!(t.status, ToolStatus::Denied | ToolStatus::Invalid)
-            || t.text.trim().is_empty()
-        {
-            continue;
-        }
-        let e = groups.entry((t.name.clone(), outcome_fingerprint(t))).or_insert((0, r.seq));
-        e.0 = e.0.saturating_add(1);
-    }
-    let mut out: Vec<_> = groups
-        .into_iter()
-        .filter(|(_, (count, _))| *count >= min_count)
-        .map(|((tool, _), (count, last_seq))| OutcomeRepetition { tool, count, last_seq })
-        .collect();
-    out.sort_by(|a, b| b.count.cmp(&a.count).then(b.last_seq.cmp(&a.last_seq)));
-    out
-}
-
 /// Same tool, same arguments, same output blob, completed at least `min_count` times; most repeated first.
 pub fn repetitions(records: &[Record], min_count: u32) -> Vec<Repetition> {
     let mut calls: HashMap<&CallId, &ToolCall> = HashMap::new();
@@ -578,6 +524,26 @@ pub const MIN_PARTIAL_QUOTE_CHARS: usize = 8;
 /// Longest text, in characters, recorded for an accepted quote whose text is shorter: the lines it lies on
 /// when they fit, else a window of them around it.
 pub const QUOTE_RECORD_CHARS: usize = 300;
+
+/// Most lines a quote given by its line numbers alone may span.
+pub const REF_QUOTE_MAX_LINES: u64 = 20;
+
+/// Most characters a quote given by its line numbers alone may record.
+pub const REF_QUOTE_MAX_CHARS: usize = 2_000;
+
+/// What a quote given by its line numbers alone records (see the contract, *Quote by lines*): the lines
+/// of `haystack`, a range of a stored output whose first line has the number `first_line`, each without
+/// trailing whitespace and without the blank lines at either end; with it the numbers of the first and
+/// the last line recorded. `None` when every line is blank.
+pub fn lines_as_quote(haystack: &str, first_line: u64) -> Option<(String, u64, u64)> {
+    let lines: Vec<&str> = haystack.lines().map(str::trim_end).collect();
+    let lead = lines.iter().take_while(|l| l.is_empty()).count();
+    let keep = lines.iter().rposition(|l| !l.is_empty())?.saturating_add(1);
+    let body = lines.get(lead..keep)?;
+    let first = first_line.saturating_add(lead as u64);
+    let last = first.saturating_add((body.len() as u64).saturating_sub(1));
+    Some((body.join("\n"), first, last))
+}
 
 /// Why a quote was not accepted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1285,32 +1251,19 @@ mod tests {
         let n = nearest_line(hay, "2: fn parse_config(path: &str) {}").unwrap_or_default();
         assert_eq!(n.0, 2);
     }
+
     #[test]
-    fn outcome_fingerprints_ignore_volatile_text_but_preserve_status_and_signals() {
-        let make = |text: &str| {
-            let Event::ToolResult(mut t) =
-                result(1, "c", ToolClass::Exec, ToolStatus::Error, None, false, json!({"exit_code":1})).event
-            else {
-                panic!()
-            };
-            t.name = "bash".into();
-            t.text = text.into();
-            t
-        };
-        let first =
-            make("[bash · exit 1 · out:aaa]\n2026-11-12T12:00:00Z HTTP/1.1 403 at 0xabcdef12\n[end of bash output]");
-        let next =
-            make("[bash · exit 1 · out:bbb]\n2026-11-13T13:00:00Z HTTP/1.1 403 at 0xabcdef99\n[end of bash output]");
-        assert_eq!(outcome_fingerprint(&first), outcome_fingerprint(&next));
-        assert_ne!(
-            outcome_fingerprint(&first),
-            outcome_fingerprint(&make("2026-11-12T12:00:00Z HTTP/1.1 404 at 0xabcdef12"))
+    fn a_quote_by_lines_is_the_lines_as_stored() {
+        // Whole lines, trailing whitespace removed, indentation kept; the haystack starts at line 40.
+        assert_eq!(
+            lines_as_quote("  FAILED tests/a.rs  \nassert left == right\n", 40),
+            Some(("  FAILED tests/a.rs\nassert left == right".to_string(), 40, 41))
         );
-        let mut signal = next.clone();
-        signal.meta.insert(crate::event::META_SIGNAL.into(), json!(11));
-        assert_ne!(outcome_fingerprint(&first), outcome_fingerprint(&signal));
-        let records = vec![rec(1, Event::ToolResult(first)), rec(2, Event::ToolResult(next))];
-        assert_eq!(outcome_repetitions(&records, 2).len(), 1);
-        assert!(repetitions(&records, 2).is_empty());
+        // Blank lines at the ends are not part of it, and the numbers follow; one inside stays.
+        assert_eq!(lines_as_quote("\n \nfirst\n\nlast\n\t\n", 7), Some(("first\n\nlast".to_string(), 9, 11)));
+        assert_eq!(lines_as_quote("only", 1), Some(("only".to_string(), 1, 1)));
+        // Nothing but blank lines is no quote.
+        assert_eq!(lines_as_quote("\n  \n\t\n", 3), None);
+        assert_eq!(lines_as_quote("", 1), None);
     }
 }

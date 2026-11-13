@@ -293,7 +293,9 @@
 //!   estimator}`.
 //!
 //! Append the `tool_result`, then every record the call queued (`shared.take_emitted()`), then take
-//! the effect (`shared.take_effect()`). After the last call, apply the first effect that was set:
+//! the effect (`shared.take_effect()`). After the last call, a fresh start that a call asked for
+//! (`shared.take_fresh_start()`) is made (*Fresh start*), whatever else the reply did; then apply the
+//! first effect that was set:
 //! `EndTurn(reason)` ends the turn with that reason; `Settle(delivery)` settles the child (below).
 //! Calls run one at a time, but for the early starts below.
 //!
@@ -407,6 +409,28 @@
 //! not asked for (`target`) happens only when it buys room for a long stretch of steps; otherwise
 //! the context is left to grow until the window itself forces one (`overflow`).
 //!
+//! ## Fresh start (`reason`: `finish not accepted`)
+//! A lead's `finish` that its verifier did not accept leaves a `FreshStart{objections, reopened}` in
+//! `Shared` when `agents.fresh_start` is on (default). A session that goes on from such a rejection
+//! with its own account of the attempt in view (the answer it gave, the conclusion it drew, the
+//! reasoning that led there, replayed at every step) tends to defend that account or to give up again.
+//! So the session goes on from the mission state instead: once every call of the reply has its result,
+//! one `reweave` is appended, of another kind than the procedure above. It is not driven by size, asks
+//! for no digest (a digest would be that account again) and protects no recent steps:
+//! `plan = woven.plan_fresh_start(records, estimator, &deps.context, ending)` on a weave rendered
+//! then, where `ending(seq, result)` holds for the results of `rtools::ENDING_TOOLS` (`finish`,
+//! `conclude`) that come after the latest `finish` result with status `Ok` among the own records (a
+//! result that was delivered, and what led to it, is not taken out). The plan drops the text and
+//! reasoning of every response, removes those calls with their results, stubs every other unpinned
+//! result and agent report, and drops the nudge, stall and verdict notes (`weave` has the rules). No
+//! plan: nothing is appended. Otherwise `reweave{epoch: current + 1, upto_seq: the last record's seq,
+//! evictions, brief: texts::fresh_start_brief(objections, reopened, <ledger.brief(default) or "">),
+//! digest: None, reason: texts::FRESH_START_REASON, before_tokens, after_tokens_est}` with the sizes
+//! computed as in point 3 above, and status is published. The next request ends with the brief: what
+//! the verifier found and how to go on. Nothing leaves the record: the attempt stays in the log and
+//! its outputs in the store, so `log_search` and `out_read` reach them. With `agents.fresh_start` off
+//! no `FreshStart` is left and the rejection stays in the window as the result of the call.
+//!
 //! ## Status
 //! [`Status`] is published through `Sink::status` whenever a field changes. `prompt_tokens` and
 //! `cached_tokens` are those of the latest response; `completion_tokens_total` sums own responses.
@@ -448,6 +472,12 @@
 //!   digest path (plan insufficient → digest request → text eviction) and its failure path;
 //!   `ContextOverflow` from the server triggers a forced re-weave and a retry; unfoldable overflow
 //!   fails the turn with an inbox item;
+//! - a fresh start: after a `finish` its verifier did not accept, one `reweave` with the fresh-start
+//!   reason follows the call's records, the next request carries the brief with the objection and
+//!   nothing of the attempt (no `finish` or `conclude` call, none of the reply texts, the reasoning or
+//!   the rejection), a result delivered earlier in the session stays, no `cache_break` is recorded,
+//!   and the folded text is still found by `log_search`; with `agents.fresh_start` off there is no
+//!   such record and the rejection is in the next request;
 //! - a model error (`Rejected`) parks a lead with `turn_failed` and settles a child `Failed`;
 //! - a request retrying (503s) past `unavailable_notice_s` opens one notice with the address and the last
 //!   error, resolved by the harness when the reply arrives, which is handled as usual; the retried
@@ -459,7 +489,7 @@
 
 use crate::gate::{self, Yield, YieldCtx};
 use crate::hud::{self, HudChild, HudInput, HudJob};
-use crate::rtools::{build_registry, ChildInfo, Delivery, Effect, Settlement, Shared};
+use crate::rtools::{build_registry, ChildInfo, Delivery, Effect, FreshStart, Settlement, Shared, ENDING_TOOLS};
 use crate::texts;
 use futures_util::FutureExt;
 use loom_core::admit::AdmitPolicy;
@@ -3444,7 +3474,56 @@ impl Session {
             out.ran = out.ran.saturating_add(1);
         }
         early.discard().await;
+        // Every call of the reply has its result: a fresh start folds them all.
+        if let Some(fresh) = self.deps.shared.take_fresh_start() {
+            self.fresh_start(&fresh)?;
+        }
         Ok(out)
+    }
+
+    /// Start afresh after a `finish` its verifier did not accept (see the contract, *Fresh start*): one
+    /// re-weave that folds the whole window, takes the calls that tried to end the mission out of it and
+    /// carries what was found.
+    fn fresh_start(&mut self, fresh: &FreshStart) -> R<()> {
+        let woven = self.woven();
+        // What was delivered, and what led to it, stays: only the calls that came after it are taken out.
+        let delivered = self
+            .own()
+            .iter()
+            .rev()
+            .find_map(|r| match &r.event {
+                Event::ToolResult(t) if t.name == "finish" && t.status == ToolStatus::Ok => Some(r.seq),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let ending =
+            |seq: Seq, t: &loom_core::event::ToolResult| seq > delivered && ENDING_TOOLS.contains(&t.name.as_str());
+        let Some(plan) = woven.plan_fresh_start(&self.records, &self.estimator, &self.deps.context, &ending) else {
+            return Ok(());
+        };
+        let est = self.estimate(&woven.weave);
+        let size = self.measured_size(&woven.weave).unwrap_or(est);
+        let freed = scaled(plan.before_tokens_est.saturating_sub(plan.after_tokens_est), size, est);
+        let ledger_brief = if self.deps.shared.journal.is_some() {
+            self.deps.shared.ledger().map(|l| l.brief(&BriefOpts::default())).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        self.append(
+            Author::Harness,
+            Event::Reweave(Reweave {
+                epoch: self.st.epoch.saturating_add(1),
+                upto_seq: plan.upto_seq,
+                evictions: plan.evictions,
+                brief: texts::fresh_start_brief(&fresh.objections, fresh.reopened, &ledger_brief),
+                digest: None,
+                reason: texts::FRESH_START_REASON.to_string(),
+                before_tokens: size,
+                after_tokens_est: size.saturating_sub(freed),
+            }),
+        )?;
+        self.publish();
+        Ok(())
     }
 
     /// The result of a call that was started early, as if it had just run in place: awaited (its token

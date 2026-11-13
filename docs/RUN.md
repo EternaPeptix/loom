@@ -217,6 +217,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom release <session> <reason...>` | accept a blocked mission as it is and close it: "closed by operator, goal not established" |
 | `loom inbox` / `loom answer <item> <text...>` | what waits for you / answer one |
 | `loom ledger <session>` | the mission ledger |
+| `loom score <session> [--json]` | what the mission's work took: steps, malformed calls, refused finishes and quotes, verifier verdicts |
 | `loom window <session>` | what is in the model's context, and what was folded out |
 | `loom net <session> [-n <limit>]` | network requests and how each was decided, and the hosts you granted |
 | `loom out <handle> [--lines a:b]` | print a stored tool output |
@@ -249,7 +250,19 @@ closes it.
 When you answer, point at the next step instead of asking a yes/no question. "Is it blocked?" invites
 "yes". "Run the build with the staging config, then read the first failure" gives it something to do.
 A verifier that rejects a finish no longer parks the session on you: the agent gets the objection and
-continues.
+continues. By default it continues from a fresh start: the goal is open again and its context is folded,
+so that it works from what the verifier found and not from its own account of the attempt (see Packs,
+below).
+
+`loom score <session>` counts what a mission's work took, from its logs: one row per session (the lead,
+then its agents and verifiers) and a total. `steps` and `to finish` (steps up to the delivered finish,
+`-` when there was none), `calls` and how many were `malformed` (cut short or refused as invalid),
+`finish refused` (of how many finish calls), `quote refused` (a finish or an evidence record whose
+quote did not check), `verifier` (finishes accepted, of those a verifier judged) and `fresh starts`.
+`?` marks a count that a log written by an older loom did not record. `--json` prints the same counts
+for a script. They say what the work cost and how often the harness sent it back, not whether the
+result is right. To see whether a change to a prompt, a pack or the configuration helped, score the
+same tasks before and after it.
 
 `loom gc` reports the stored outputs that appear in no file under `~/.loom/sessions` or
 `~/.loom/missions` and are older than one hour; `--apply` deletes them. Deleting a session's directory
@@ -304,12 +317,18 @@ pack, be `read_only`, and have `verdict` and `out_read` or `out_grep`. Copies of
 then restart the daemon).
 
 Start a session of a pack with `loom run --pack <pack> --role <role> -w <workspace> "..."`. A role that
-has `verify_finish` has its `finish` checked by the verifier. If the verifier rejects it twice and the lead
-finishes a third time, or the verifier cannot be run, the answer is not delivered as finished: you get
-a blocking inbox item whose answer is labelled `NOT VERIFIED`, and the next `finish` after you answer is
-verified again. `finish` is also refused while the session has running jobs or running agents.
-`[agents] verify_finish = false` in the config turns verification off for every role: the finish is
-then delivered at once, marked `not verified`.
+has `verify_finish` has its `finish` checked by the verifier. A rejected finish is not delivered and
+does not stop the session or ask you anything: each objection holds the next finish until a new run of
+the target is recorded. With `[agents] fresh_start = true` (the default) the lead also starts afresh at
+every rejection. The goal is open again, so it must be concluded anew on a run made after the rejection.
+The lead's context is folded: its earlier replies, its reasoning and its finish and conclude calls go
+out of view, and it reads what the verifier found in their place. Nothing is deleted: `loom tail` and
+the web UI show the whole record, and the agent can open folded output again. A session that keeps the
+rejection in view tends to argue with it or to give up again; `fresh_start = false` keeps it in view
+all the same. When the verifier cannot be run, the finish is held as unverified, a note says so, and
+nothing is delivered as finished. `finish` is also refused while the session has running jobs or
+running agents. `[agents] verify_finish = false` in the config turns verification off for every role:
+the finish is then delivered at once, marked `not verified`.
 
 ## Files
 

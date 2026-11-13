@@ -1,8 +1,9 @@
 //! The harness-state block: what the model is told, fresh at every step, about where things stand.
 //!
 //! CONTRACT.
-//! Normalized outcome repetition warnings supplement exact repeats; they never declare two targets
-//! equivalent, block tools, or establish task success.
+//! The block states facts the harness holds and instructions that follow from them. It carries no
+//! advisory guess: a repeat is listed only when the call and its result were the same, byte for byte
+//! (a "possibly similar outcome" line competes with the exact signals and was removed).
 //!
 //! The block is the last message of each request and is not part of the stored prefix, so it can
 //! change freely. It carries what a model otherwise loses track of over a long session: the mission
@@ -48,10 +49,13 @@
 //!   `input.ledger_skipped` is `n > 0`, by its own line `{n} ledger entries written by a newer loom are
 //!   not shown` (`1 ledger entry … is not shown`): the ledger as read lacks entries this build cannot parse.
 //! - Finish: a line of its own after the mission state, in a lead only (`!input.is_child`): a steady
-//!   instruction with no count. `Finish: the check raised an objection. …` while an objection of a finish
-//!   verifier is an open obligation, else `Finish: conclude the goal first — …` while the goal-met
-//!   goal is set, its goal-met claim is not concluded and the operator has not released the mission. The
-//!   goal status itself is a line of the mission state.
+//!   instruction with no count (`texts::finish_status_line`). With *open* meaning a goal is set, its
+//!   goal-met claim is not concluded and the operator has not released the mission, and *objection*
+//!   meaning an objection of a finish verifier is an open obligation and the operator has not released:
+//!   `Finish: the goal is open. Answer each open objection …, conclude …, then finish.` with both (the
+//!   state after a fresh start: the check reopened the goal), `Finish: the check raised an objection. …`
+//!   with an objection alone, `Finish: conclude the goal first — …` when open alone. None of them says
+//!   that a finish was made or rejected. The goal status itself is a line of the mission state.
 //! - Typed security state: bounded mandatory coverage, unacknowledged routes unlocked by currently
 //!   live credentials/footholds, hypothesis status/priority and attempt counts. Render only record IDs
 //!   and counts, never locators, principals, secrets, free-form hypothesis/attempt text or conditions.
@@ -178,17 +182,6 @@ pub fn render(input: &HudInput<'_>) -> String {
         .collect();
     push_list(&mut sections, "Repeated calls", " — the result will not change; do something different", repeated);
 
-    let similar = observe::outcome_repetitions(input.records, 3)
-        .iter()
-        .map(|r| {
-            format!(
-                "- {} — {} similar admitted outcomes; compare targets and raw outputs before repeating",
-                r.tool, r.count
-            )
-        })
-        .collect();
-    push_list(&mut sections, "Possible repeated outcomes (advisory)", "", similar);
-
     push_list(&mut sections, "Out of date", "", stale_lines(input.records));
 
     let mut running: Vec<String> = Vec::new();
@@ -273,9 +266,9 @@ fn budget_nearly_used(step: u32, started_ms: u64, now_ms: u64, budget: &Budget) 
     step_near || min_near
 }
 
-/// The steady finish line, from the ledger, with no count (a rising tally reads as pressure): the
-/// objection line while an objection of a verifier is open and the operator has not released, else the
-/// conclude-first line while the goal claim is open and the operator has not released, else `None`.
+/// The steady finish line, from the ledger, with no count (a rising tally reads as pressure): which
+/// line, by whether an objection of a verifier is open and whether the goal claim is open, neither
+/// counting once the operator has released (see the contract); `None` when finish is not held.
 fn finish_line(ledger: &LedgerState, gated: bool) -> Option<String> {
     let objection_open = ledger.release.is_none()
         && ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind == ObligationKind::Objection);
@@ -753,6 +746,7 @@ mod tests {
             evidence: vec![],
             accepted: Some(accepted),
             objections: vec!["o".into()],
+            reopened_goal: false,
         };
         let mut done = l.clone();
         done.goal_met =
@@ -767,6 +761,14 @@ mod tests {
         });
         i.ledger = Some(&done);
         assert!(render(&i).contains("\n\nFinish: the check raised an objection."), "{}", render(&i));
+        // The check reopened the goal (a fresh start): one line for both, which names no attempt.
+        let mut reopened = done.clone();
+        reopened.goal_met = Some(GoalMet { status: GoalMetStatus::Open, note: String::new(), evidence: vec![], n: 7 });
+        i.ledger = Some(&reopened);
+        let out = render(&i);
+        assert!(out.contains("\n\nFinish: the goal is open. Answer each open objection"), "{out}");
+        assert_eq!(out.matches("Finish:").count(), 1, "{out}");
+        i.ledger = Some(&done);
         // Settled objection and a concluded goal: no line. Neither with a release.
         let mut settled = done.clone();
         settled.obligations[0].outcome = Some("settled".into());

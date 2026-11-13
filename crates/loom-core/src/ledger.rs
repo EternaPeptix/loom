@@ -116,6 +116,12 @@ pub enum LedgerOp {
         #[serde(default)]
         evidence: Vec<String>,
     },
+    /// A verifier did not accept the finish claim `finish`, so the conclusion it rested on no longer
+    /// stands: the goal-met claim goes back to `open`. Written by the harness right after the verdict;
+    /// no tool a model calls writes it.
+    GoalReopen {
+        finish: String,
+    },
     /// The operator accepts the result short of the goal and the work may stop. Operator only.
     OperatorRelease {
         reason: String,
@@ -130,8 +136,9 @@ pub enum LedgerOp {
     Security(crate::security_state::SecurityOp),
 }
 
-/// Where the goal-met claim stands. There is deliberately no `Withdrawn`: once concluded it can only
-/// move to the other terminal state.
+/// Where the goal-met claim stands. There is deliberately no `Withdrawn`: once concluded, the agent can
+/// only move it to the other terminal state. Only a verifier's rejection of a finish reopens it
+/// (`LedgerOp::GoalReopen`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalMetStatus {
@@ -308,6 +315,10 @@ pub struct FinishRecord {
     /// `None` until a verdict is recorded.
     pub accepted: Option<bool>,
     pub objections: Vec<String>,
+    /// Its rejection reopened the goal-met claim (`GoalReopen`); a finish does so at most once. Absent
+    /// in older snapshots.
+    #[serde(default)]
+    pub reopened_goal: bool,
 }
 
 /// The harness-held claim about whether the goal is met. A singleton, not one of `claims`.
@@ -317,8 +328,16 @@ pub struct GoalMet {
     pub note: String,
     /// Evidence ids cited for the current status.
     pub evidence: Vec<String>,
-    /// Journal position of the entry that set the current status; 0 while open.
+    /// Journal position of the entry that set the current status: 0 while open and never concluded, the
+    /// position of the `GoalReopen` entry while open again after a rejected finish.
     pub n: u64,
+}
+
+impl GoalMet {
+    /// Open again after a rejected finish, as opposed to never concluded.
+    pub fn reopened(&self) -> bool {
+        self.status == GoalMetStatus::Open && self.n > 0
+    }
 }
 
 /// The operator's acceptance of the result short of the goal.
@@ -426,6 +445,18 @@ pub struct LedgerState {
 // terminal status and at least one execution evidence record added after the entry that set the current
 // status (`GoalMet.n`); repeating the current status is refused. `apply` replaces status, note and
 // evidence and records the entry position.
+//
+// Reopening (`GoalReopen { finish }`, harness-authored: no tool of a model writes it). The one way back
+// to `Open`, and it is not a withdrawal by the agent: it records that a verifier did not accept the
+// finish that rested on the conclusion. `validate` requires `finish` to exist, to be the LATEST finish
+// claim, to have the verdict `accepted: false`, not to have reopened the goal before
+// (`FinishRecord.reopened_goal`), and a goal-met claim that is `Supported` or `Refuted`. `apply` checks the
+// same again (an entry that names anything else changes nothing, so a forged one cannot retract a
+// conclusion), then sets the claim to `Open` with an empty note and evidence and `n` = the position of
+// this entry, and marks the finish. A claim that is open again (`GoalMet::reopened`: `Open` with
+// `n > 0`) may be concluded either way, but only citing at least one execution evidence record added
+// after `n`: what was shown before the rejection cannot conclude it again. The brief shows it like any
+// open goal; the Markdown adds where it was reopened.
 //
 // Operator release (`OperatorRelease`, `from_user` only): sets `LedgerState.release` (reason, entry
 // position) once; refused for a model, with a blank reason, before a goal is set, or when already
@@ -691,6 +722,7 @@ impl LedgerState {
                     evidence: evidence.clone(),
                     accepted: None,
                     objections: Vec::new(),
+                    reopened_goal: false,
                 });
             }
             LedgerOp::FinishVerdict { claim, accepted, objections, .. } => {
@@ -705,6 +737,19 @@ impl LedgerState {
                     if let Some(gm) = self.goal_met.as_mut() {
                         *gm = GoalMet { status: *status, note: note.clone(), evidence: evidence.clone(), n };
                     }
+                }
+            }
+            LedgerOp::GoalReopen { finish } => {
+                // Only the rejection of the latest finish reopens a conclusion, and only once: an entry that
+                // names anything else changes nothing.
+                let rejected = self
+                    .finishes
+                    .last_mut()
+                    .filter(|f| &f.id == finish && f.accepted == Some(false) && !f.reopened_goal);
+                let concluded = self.goal_met.as_mut().filter(|g| g.status != GoalMetStatus::Open);
+                if let (Some(f), Some(gm)) = (rejected, concluded) {
+                    f.reopened_goal = true;
+                    *gm = GoalMet { status: GoalMetStatus::Open, note: String::new(), evidence: Vec::new(), n };
                 }
             }
             LedgerOp::OperatorRelease { reason } => {
@@ -951,6 +996,28 @@ impl LedgerState {
                 }
             }
             LedgerOp::GoalMetSet { status, note, evidence } => self.validate_goal_met(*status, note, evidence)?,
+            LedgerOp::GoalReopen { finish } => {
+                let Some(f) = self.finishes.iter().find(|f| &f.id == finish) else {
+                    return Err(no_such("finish claim", finish, ids(self.finishes.iter().map(|f| f.id.as_str()))));
+                };
+                if f.accepted != Some(false) {
+                    return Err(format!("Finish claim {finish} was not rejected by a verifier, so it does not reopen the goal. Only a rejected finish does."));
+                }
+                if self.finishes.last().map(|l| l.id.as_str()) != Some(finish.as_str()) {
+                    return Err(format!("Finish claim {finish} is not the latest finish claim. Only the latest one, once rejected, reopens the goal."));
+                }
+                if f.reopened_goal {
+                    return Err(format!(
+                        "Finish claim {finish} already reopened the goal. A rejection reopens it once."
+                    ));
+                }
+                if self.goal_met.as_ref().is_none_or(|g| g.status == GoalMetStatus::Open) {
+                    return Err(
+                        "There is no conclusion about the goal to reopen: the goal is not set, or it is already open."
+                            .to_string(),
+                    );
+                }
+            }
             LedgerOp::OperatorRelease { reason } => {
                 if !from_user {
                     return Err(user_only("A release"));
@@ -1025,6 +1092,10 @@ impl LedgerState {
         }
         if current.status != GoalMetStatus::Open && !executed.iter().any(|e| e.n > current.n) {
             return Err(format!("The goal is recorded as {}. To change it, run the target again and cite execution evidence recorded after that conclusion (entry {}).", goal_met_label(current.status), current.n));
+        }
+        // Open again after a rejected finish: what was shown before the rejection did not hold up.
+        if current.reopened() && !executed.iter().any(|e| e.n > current.n) {
+            return Err(format!("The goal is open again: a check did not accept the earlier result (entry {}), so runs recorded before that cannot conclude it. Run the target again, record the run with `evidence`, and cite that new record.", current.n));
         }
         Ok(())
     }
@@ -1254,6 +1325,10 @@ impl LedgerState {
         o.push_str("\n## Goal status\n\n");
         match &self.goal_met {
             None => o.push_str("(no goal set)\n"),
+            Some(gm) if gm.reopened() => o.push_str(&format!(
+                "open (not yet concluded; reopened at entry {} when a finish was not accepted)\n",
+                gm.n
+            )),
             Some(gm) if gm.status == GoalMetStatus::Open => o.push_str("open (not yet concluded)\n"),
             Some(gm) => {
                 o.push_str(goal_met_label(gm.status));
@@ -1497,6 +1572,7 @@ impl LedgerState {
                 format!("finish {claim} {}", if *accepted { "accepted" } else { "rejected" })
             }
             LedgerOp::GoalMetSet { status, note, .. } => format!("goal {}{}", goal_met_label(*status), suffix(note)),
+            LedgerOp::GoalReopen { finish } => format!("goal open again: finish {finish} was not accepted"),
             LedgerOp::OperatorRelease { reason } => {
                 format!("released by the operator (goal not established): {reason}")
             }
@@ -1653,6 +1729,7 @@ mod tests {
                 note: "ran it".into(),
                 evidence: vec!["e1".into()],
             },
+            LedgerOp::GoalReopen { finish: "f1".into() },
             LedgerOp::OperatorRelease { reason: "good enough".into() },
             LedgerOp::ScopeGrant {
                 hosts: vec!["a.example".into(), "b.example".into()],
@@ -2386,6 +2463,114 @@ mod tests {
         assert!(s.validate(&conclude(GoalMetStatus::Refuted, &["e3"]), false).is_ok());
         s.apply(&entry(7, conclude(GoalMetStatus::Refuted, &["e3"])));
         assert_eq!(s.goal_met.as_ref().map(|g| (g.status, g.n)), Some((GoalMetStatus::Refuted, 7)));
+    }
+
+    /// A goal concluded as `status` on `e1` (entry 4), then finished (`f1`, entry 5).
+    fn concluded_and_finished(status: GoalMetStatus) -> Vec<LedgerOp> {
+        vec![
+            LedgerOp::GoalSet { text: "g".into() },
+            LedgerOp::ClaimAdd { text: "it runs".into() },
+            LedgerOp::EvidenceAdd(ev("c1", true, true)),
+            conclude(status, &["e1"]),
+            LedgerOp::FinishClaim { summary: "done".into(), evidence: vec![] },
+        ]
+    }
+
+    fn verdict(claim: &str, accepted: bool) -> LedgerOp {
+        LedgerOp::FinishVerdict {
+            claim: claim.into(),
+            accepted,
+            objections: if accepted { vec![] } else { vec!["no test ran".into()] },
+            verifier: None,
+        }
+    }
+
+    fn reopen(finish: &str) -> LedgerOp {
+        LedgerOp::GoalReopen { finish: finish.into() }
+    }
+
+    #[test]
+    fn only_the_rejection_of_the_latest_finish_reopens_the_goal() {
+        assert_eq!(serde_json::to_string(&reopen("f1")).unwrap_or_default(), r#"{"op":"goal_reopen","finish":"f1"}"#);
+        // No such finish; a finish without a verdict; an accepted one.
+        let mut ops = concluded_and_finished(GoalMetStatus::Supported);
+        let pending = build(ops.clone());
+        assert!(refusal(&pending, reopen("f9"), false).contains("Existing finish claim ids: f1"));
+        assert!(refusal(&pending, reopen("f1"), false).contains("was not rejected by a verifier"));
+        ops.push(verdict("f1", true));
+        let accepted = build(ops.clone());
+        assert!(refusal(&accepted, reopen("f1"), false).contains("was not rejected by a verifier"));
+        // Forged into the journal all the same, none of them retracts the conclusion.
+        for forged in ["f1", "f9"] {
+            let mut s = accepted.clone();
+            s.apply(&entry(7, reopen(forged)));
+            assert_eq!(s.goal_met.as_ref().map(|g| (g.status, g.n)), Some((GoalMetStatus::Supported, 4)));
+            assert!(!s.finishes[0].reopened_goal);
+        }
+
+        // Both conclusions are reopened by a rejection, whoever appends the entry.
+        for status in [GoalMetStatus::Supported, GoalMetStatus::Refuted] {
+            let mut ops = concluded_and_finished(status);
+            ops.push(verdict("f1", false));
+            let rejected = build(ops.clone());
+            assert!(rejected.validate(&reopen("f1"), false).is_ok());
+            assert!(rejected.validate(&reopen("f1"), true).is_ok());
+            ops.push(reopen("f1"));
+            let s = build(ops);
+            let gm = s.goal_met.clone().unwrap_or_else(|| panic!("goal_met"));
+            assert_eq!((gm.status, gm.note.as_str(), gm.evidence.len(), gm.n), (GoalMetStatus::Open, "", 0, 7));
+            assert!(gm.reopened() && s.finishes[0].reopened_goal);
+            // The model reads an open goal; the operator's Markdown says where it was reopened.
+            assert!(s.brief(&BriefOpts::default()).contains("Goal status: open (not yet concluded)"));
+            assert!(s
+                .render_markdown()
+                .contains("open (not yet concluded; reopened at entry 7 when a finish was not accepted)"));
+            assert!(refusal(&s, reopen("f1"), false).contains("already reopened the goal"));
+        }
+        assert!(!build(vec![LedgerOp::GoalSet { text: "g".into() }]).goal_met.is_some_and(|g| g.reopened()));
+    }
+
+    #[test]
+    fn a_reopened_goal_is_concluded_only_on_runs_recorded_after_it() {
+        let mut ops = concluded_and_finished(GoalMetStatus::Refuted);
+        ops.extend([verdict("f1", false), reopen("f1")]);
+        let mut s = build(ops);
+        // Neither conclusion can rest on what was shown before the rejection.
+        for status in [GoalMetStatus::Supported, GoalMetStatus::Refuted] {
+            let m = refusal(&s, conclude(status, &["e1"]), false);
+            assert!(
+                m.contains("The goal is open again") && m.contains("entry 7") && m.contains("cite that new record")
+            );
+        }
+        // A static record added afterwards is not a run; a new run is, for either conclusion (the same
+        // one as before included).
+        s.apply(&entry(8, LedgerOp::EvidenceAdd(static_ev("c1"))));
+        assert!(refusal(&s, conclude(GoalMetStatus::Refuted, &["e2"]), false).contains("static only"));
+        s.apply(&entry(9, LedgerOp::EvidenceAdd(ev("c1", true, true))));
+        assert!(s.validate(&conclude(GoalMetStatus::Refuted, &["e3"]), false).is_ok());
+        assert!(s.validate(&conclude(GoalMetStatus::Supported, &["e1", "e3"]), false).is_ok());
+        s.apply(&entry(10, conclude(GoalMetStatus::Supported, &["e3"])));
+        assert_eq!(s.goal_met.as_ref().map(|g| (g.status, g.n)), Some((GoalMetStatus::Supported, 10)));
+        // The same rejection does not reopen the new conclusion: validated or forged.
+        assert!(refusal(&s, reopen("f1"), false).contains("already reopened the goal"));
+        s.apply(&entry(11, reopen("f1")));
+        assert_eq!(s.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Supported));
+        // Nor does an older rejection once a later finish exists; the later one, rejected, does.
+        s.apply(&entry(12, LedgerOp::FinishClaim { summary: "done again".into(), evidence: vec![] }));
+        s.finishes[0].reopened_goal = false;
+        assert!(refusal(&s, reopen("f1"), false).contains("is not the latest finish claim"));
+        s.apply(&entry(13, reopen("f1")));
+        assert_eq!(s.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Supported));
+        s.apply(&entry(14, verdict("f2", false)));
+        assert!(s.validate(&reopen("f2"), false).is_ok());
+        s.apply(&entry(15, reopen("f2")));
+        assert_eq!(s.goal_met.as_ref().map(|g| (g.status, g.n)), Some((GoalMetStatus::Open, 15)));
+        // Nothing to reopen while it is open, or before a goal.
+        s.finishes[1].reopened_goal = false;
+        assert!(refusal(&s, reopen("f2"), false).contains("no conclusion about the goal to reopen"));
+        let goalless =
+            build(vec![LedgerOp::FinishClaim { summary: "x".into(), evidence: vec![] }, verdict("f1", false)]);
+        assert!(refusal(&goalless, reopen("f1"), false).contains("no conclusion about the goal to reopen"));
     }
 
     #[test]

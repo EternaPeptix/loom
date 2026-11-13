@@ -30,6 +30,49 @@
 - Archiving a mission deletes its agents' copies, including changes that were never adopted.
 - `meta.json` of an agent in a copy has `copy_of`; older daemons ignore it.
 
+### Quoting, fresh starts and measuring a change
+
+Upgrading: restart the daemon (`loom down`, `loom up`); `loom score` says so when the running daemon
+is older. Replace copies of shipped packs in `~/.loom/packs` to get the new role texts; a running
+session keeps the system text and the tool descriptions it started with (a quote without its text is
+accepted there too).
+`fresh_start` is on by default and changes what a lead reads after a rejected finish; set
+`[agents] fresh_start = false` to keep the earlier behaviour. A session that had a fresh start has a
+`remove` eviction in its log and a `goal_reopen` entry in its ledger, which an older `loom` does not
+know: do not go back to an older build on a home with such sessions.
+
+- **Quotes by line numbers.** The `text` of a `finish` quote and the `quote` of `evidence` may be left
+  out: the harness then takes the lines `start`-`end` from the stored output, so nothing is retyped and
+  nothing can be mistyped. Such a quote takes at most 20 lines and 2000 characters, and its range is
+  not clamped: a range past the end of the output, or of blank lines only, is refused. `evidence` plays
+  back what it recorded, since nothing compared the numbers with a text. A quote given with its text is
+  checked as before. The tool descriptions and the worker, scout and `vr` harness texts say to leave
+  the text out when the line numbers come from `out_read`, `out_grep` or `read`.
+- **A fresh start after a rejected finish** (`[agents] fresh_start`, default `true`). When the verifier
+  does not accept a lead's finish, the goal is open again (a new `conclude` needs execution evidence
+  recorded after the rejection) and the lead's window is folded: its replies and reasoning go out of
+  view, every `finish` and `conclude` call since the last delivered result is taken out of the window
+  with its result, other output is shortened to stubs, and nudge, stall and verdict notes are dropped.
+  The lead reads a brief instead: what the verifier found, that the goal is unsolved and not decided
+  either way, and where folded material is. This happens at every rejection. Nothing is deleted: the
+  record, `loom tail`, the web UI, `log_search`, `out_read` and `out_grep` have all of it. The HUD's
+  finish line no longer says "finish again". A mission the operator released is not reopened.
+- **The advisory "Possible repeated outcomes" section of the HUD is gone**, with
+  `observe::outcome_repetitions`. A repeat is listed only when the call and its result were the same,
+  byte for byte.
+- **`loom score <session|mission> [--json]`** and `GET /api/missions/{id}/score`: what a mission's work
+  took, one row per session and a total (steps, steps to the delivered finish, calls, malformed calls,
+  refused finishes, refused quotes, verifier verdicts, fresh starts). Refusals over a quote or by the
+  verifier, and whether a delivered finish was verified, are now marked in the tool result's `meta`
+  (`refusal`, `verified`), so the counts read no prose; a log from before shows `?` for them. The
+  counts say what the work cost, not whether the result is right.
+- **An evaluation kit for harness changes** (`loom-agent::evalkit`, `cargo run -p loom-agent --example
+  eval [--json] [scenario…]`): eight scripted models (does everything right, retypes its quotes wrong,
+  finishes early, makes malformed calls, is rejected once with and without the fresh start, delegates,
+  gives up) played against the real runtime and the mock server on one small task, with the scorecard
+  of each. Its tests pin the counts. It needs no model and no network, and it measures the harness's
+  side only: how a real model reacts is measured by scoring recorded runs before and after a change.
+
 ### Domain packs and evaluation
 
 - Added opt-in CTF and Redteam packs with specialist tool surfaces (at most 18 per role), bounded
@@ -62,8 +105,8 @@
   readable; older binaries refuse new session headers. Time excludes recorded queues, retries and idle
   turns. Wrap-up admission now blocks probes/new work on both normal and speculative paths while
   retaining output inspection, cleanup and honest blocker delivery.
-- Reasoning-only replies receive a specific bounded nudge. Similar-outcome HUD warnings and optional
-  flag-pattern alerts are advisory and do not verify success. See `docs/RUNTIME-CONTROLS.md`.
+- Reasoning-only replies receive a specific bounded nudge. Optional flag-pattern alerts are advisory
+  and do not verify success. See `docs/RUNTIME-CONTROLS.md`.
 ### Containment and reference capabilities
 
 - Shared macOS system temp directories are no longer blanket writable roots. Commands use their

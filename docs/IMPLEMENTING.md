@@ -51,7 +51,12 @@ cargo test --workspace                                # everything
 cargo test -p loom-tools sandbox::                    # one crate, one module
 cargo clippy --workspace --all-targets -- -D warnings # must be clean
 node --test ui/core.test.js                           # the web UI's logic (Node.js 22.12 or newer)
+cargo run -p loom-agent --example eval                # scripted models against the mock server, scored
 ```
+
+When a change touches what the model reads (a prompt, a tool description, a refusal) or what the harness
+refuses, run the last one before and after: it prints what each scripted run took (`loom-agent::evalkit`).
+Its tests pin those counts, so a change that moves one must say why.
 
 Tests live next to the code in `#[cfg(test)] mod tests` blocks; `crates/loom-model/examples/live.rs` is a
 manual check against a real server. Rules for tests:

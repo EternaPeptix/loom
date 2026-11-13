@@ -30,6 +30,18 @@ pub const META_RAW_BLOB: &str = "raw_blob";
 pub const META_JOB: &str = "job";
 /// Output was admitted for a stored action; coverage awaits an actual actor callback.
 pub const META_DEFERRED_OBSERVATION: &str = "deferred_observation";
+/// `ToolResult::meta` key: which check of the harness refused the call, for the two refusals a
+/// scorecard counts by kind: [`REFUSAL_QUOTE`] or [`REFUSAL_VERIFIER`]. Absent on any other result.
+pub const META_REFUSAL: &str = "refusal";
+/// [`META_REFUSAL`]: a quote of a `finish` or an `evidence` did not check, so nothing was delivered or
+/// attached.
+pub const REFUSAL_QUOTE: &str = "quote";
+/// [`META_REFUSAL`]: the verifier of a lead's `finish` did not accept the result.
+pub const REFUSAL_VERIFIER: &str = "verifier";
+/// `ToolResult::meta` key on a delivered `finish` (status `Ok`): `true` when an independent verifier
+/// accepted the result, `false` when it was delivered without one. Absent in logs written before the
+/// key existed.
+pub const META_VERIFIED: &str = "verified";
 
 /// Who produced an item. Never changed by projection, eviction or summarisation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -582,6 +594,9 @@ pub enum EvictAction {
     Drop,
     /// For a model response: stop replaying its reasoning; text and tool calls stay.
     DropReasoning,
+    /// For a tool result: take the call and its result out of the window together, so the response that
+    /// made the call no longer lists it. Unlike `Drop`, nothing of the call's arguments stays in view.
+    Remove,
 }
 
 /// A typed task hand-off. Rendered for the child by the harness, never by the parent's prose.
@@ -932,6 +947,7 @@ mod tests {
                         Eviction { seq: 3, action: EvictAction::Stub { text: "s".into() } },
                         Eviction { seq: 4, action: EvictAction::Drop },
                         Eviction { seq: 5, action: EvictAction::DropReasoning },
+                        Eviction { seq: 6, action: EvictAction::Remove },
                     ],
                     brief: "b".into(),
                     digest: Some("d".into()),

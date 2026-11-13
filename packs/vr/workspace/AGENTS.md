@@ -184,10 +184,13 @@ What belongs in the ledger, and through which tool:
 
 - `plan` and `step` — the experiments in flight and their state (researcher).
 - `claim` — a statement a result depends on. It stays open until evidence supports or refutes it.
-- `evidence` — the output that shows a claim: a handle, a line range and the quoted lines. The quote
-  is checked against the stored bytes when the record is written, and the output's hash is copied into
-  the record, so the citation cannot later point at different bytes. Quote whole lines, or at least
-  eight non-space characters of one; line numbers copied along must be the right ones.
+- `evidence` — the output that shows a claim: a handle and a line range. When you have the line
+  numbers from `out_read`, `out_grep` or `read`, give only those (at most 20 lines): the harness takes
+  the lines from the stored bytes and shows you what it recorded, so nothing is retyped. Otherwise add
+  the quoted lines; the quote is checked against the stored bytes when the record is written. Either
+  way the output's hash is copied into the record, so the citation cannot later point at different
+  bytes. Quote whole lines, or at least eight non-space characters of one; line numbers copied along
+  must be the right ones.
 - `claim_update` — supported, refuted or withdrawn, when the evidence settles it.
 - `note` — a decision and its reason, or a dead end and why, so it is never repeated.
 - The goal, standing rules and approvals are the operator's. You have no tool that writes them.
@@ -226,14 +229,18 @@ operator is input, not permission to finish.
   the evidence handles. The judge must open the evidence it was given before it may answer.
 - **Accepted** — the result is delivered to the operator, marked verified.
 - **Rejected** — the objections come back to you. They are work items, not something to argue with.
+  You go on from a fresh start: the goal is open again, your earlier messages are folded out of view
+  and you read what the judge found in their place. Treat the goal as unsolved, not as decided either
+  way: run the target again, record the run, and `conclude` on that run before the next `finish`.
+  Nothing was deleted; stored output opens again by its handle.
 - **Not verified** — after repeated rejections, or when the judge could not be run, the operator
   receives the answer as a blocking item labelled NOT VERIFIED with every objection. That is not a
   result. Wait for the operator.
 - **Refuted** — the evidence closed the claim. That is a successful outcome: mark the claim refuted
   and say why in a `note`.
 
-`finish` carries the answer, the exact stored lines that support it (`quotes`, checked like
-evidence), and `not_established`: what you could not determine, what you did not try, and what would
+`finish` carries the answer, the stored lines that support it (`quotes`: by handle and line numbers
+alone, or with the text, checked like evidence), and `not_established`: what you could not determine, what you did not try, and what would
 settle it. Leaving `not_established` empty is a claim that nothing is unknown.
 
 Closing a line of work is itself a claim, so the closing `note` names one disposition:

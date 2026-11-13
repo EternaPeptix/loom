@@ -18,6 +18,9 @@
 //!   (`ledger`, `pin`, `inbox_opened`, `child_spawned`, …), in the order emitted;
 //! - **an effect** ([`Shared::set_effect`]): the turn ends, or this (child) session settles.
 //!
+//! A lead's `finish` that its verifier did not accept leaves a third thing, a [`FreshStart`]
+//! ([`Shared::set_fresh_start`]), which the loop reads once every call of the reply has its result.
+//!
 //! Everything a tool does to the mission ledger goes through [`Shared::ledger_append`], which
 //! writes the sealed journal and emits the matching `ledger` record.
 //!
@@ -63,6 +66,22 @@ pub enum Effect {
     EndTurn(TurnEndReason),
     /// This child session is done: deliver the settlement to its parent and end the session.
     Settle(Delivery),
+}
+
+/// Tools whose calls are a session's bids to end its mission. A fresh start takes those made since
+/// the latest result that was delivered out of the window, each with its result. (The `attempt` tool
+/// is not one of them: it starts agents.)
+pub const ENDING_TOOLS: [&str; 2] = ["finish", "conclude"];
+
+/// What a lead's `finish` leaves for the step loop when its verifier did not accept it and
+/// `agents.fresh_start` is on: the session goes on, from a folded window (`session`, *Fresh start*). It
+/// is not an [`Effect`]: the turn does not end and the calls that follow in the same reply still run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FreshStart {
+    /// What the verifier found, in its words.
+    pub objections: Vec<String>,
+    /// The goal-met claim went back to open (`LedgerOp::GoalReopen`).
+    pub reopened: bool,
 }
 
 /// What a child hands back when it ends itself.
@@ -294,6 +313,7 @@ struct Slots {
     emitted: Vec<(Author, Event)>,
     effect: Option<Effect>,
     continuation: Option<crate::continuation::Plan>,
+    fresh_start: Option<FreshStart>,
 }
 
 /// One session's handle for its runtime tools. Created by the runtime, shared by `Arc`.
@@ -350,6 +370,15 @@ impl Shared {
 
     pub fn take_effect(&self) -> Option<Effect> {
         self.slots().effect.take()
+    }
+
+    /// Ask the loop to start the session afresh once the results of the reply's calls are recorded.
+    pub fn set_fresh_start(&self, fresh: FreshStart) {
+        self.slots().fresh_start = Some(fresh);
+    }
+
+    pub fn take_fresh_start(&self) -> Option<FreshStart> {
+        self.slots().fresh_start.take()
     }
 
     pub fn set_continuation(&self, plan: crate::continuation::Plan) {

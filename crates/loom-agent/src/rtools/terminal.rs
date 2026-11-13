@@ -18,14 +18,17 @@
 //! ## `finish`
 //! `answer` must contain non-whitespace (else error ``finish needs an `answer`: the result, written
 //! for someone who has not seen your work. Nothing was delivered.``).
-//! `quotes` elements are objects `{handle, start, end, text}`; an element of another shape is an
-//! error naming its position and the four fields. They are checked with `gate::check_quotes(&ctx.blobs,
+//! `quotes` elements are objects `{handle, start, end, text}`, where `text` may be left out (or be
+//! `null` or blank): the quote is then those lines as the stored output has them (`gate`, a quote by
+//! lines). An element of another shape is an error naming its position and the fields. They are checked
+//! with `gate::check_quotes(&ctx.blobs,
 //! …)`; `Err(text)` → error `{text}\nNothing was delivered. Correct the quotes and call finish again.`
 //! Every quote must also be an observation, by the rule `evidence` applies (`rtools::observed_producer`):
 //! the output of a command run or a file read; a quote of the output of a runtime tool (`ledger`,
 //! `log_search`, an agent's report, ...), of a `write` or `edit`, or of an output no tool call of the
 //! mission produced is refused with that sentence and `Nothing was delivered.` A session without a
-//! mission has no producers to consult and is not checked.
+//! mission has no producers to consult and is not checked. A refusal by either rule carries
+//! `meta[META_REFUSAL] = REFUSAL_QUOTE` (what a scorecard counts as a step spent on a quote).
 //! Refused, in a lead and in a child session alike, while a background job of this session (`ctx.jobs`)
 //! or a child agent (`S.orch.children`) is running: the error names them and says what to do with the
 //! tools this role has (`wait`, `job_kill`, `agent_stop`; that `job_kill` and `finish` can go in one
@@ -36,7 +39,8 @@
 //! `gate::render_report(ReportInput { outcome: Returned, answer, quotes: &verified, not_established,
 //! max_chars: REPORT_MAX_CHARS, full_handle })`, then `S.set_effect(Effect::Settle(Delivery {
 //! outcome: Returned, report, full, payload: {"quotes": [{"handle","start","end","text"}…]} }))`.
-//! Output: ok, outcome `delivered`, message `Your result was delivered. This session is finished.`
+//! Output: ok, outcome `delivered`, message `Your result was delivered. This session is finished.`,
+//! `meta[META_VERIFIED] = false` (it goes to the agent that assigned the work, unverified).
 //!
 //! **In a lead session** (not a child):
 //! 1. `S.ledger()`. The goal-met pre-gate: when the role's termination is `Explicit` and a goal is set whose
@@ -63,17 +67,20 @@
 //!    - `accepted: true` -> `FinishVerdict` recorded, deliver with `verified by {child}`.
 //!    - `accepted: false` -> `FinishVerdict` recorded; one `ObligationOpen { kind: Objection, text: the
 //!      objection, reference: "{fid} (verifier {child})" }` per objection; error text with the objections,
-//!      the report and `texts::FINISH_NOT_ACCEPTED_TAIL`; no effect. When the rejections since the latest
+//!      the report and `texts::FINISH_NOT_ACCEPTED_TAIL`, `meta[META_REFUSAL] = REFUSAL_VERIFIER`; no
+//!      effect. When the rejections since the latest
 //!      accepted finish (`rejection_floor`: only an accepted finish moves it) reach `MAX_FINISH_REJECTIONS`,
 //!      a `harness_note{Verdict}` `finish rejected {n} times; continuing` is also written. It is a record,
 //!      not an inbox item: nothing is asked of the operator and the session works on. The verifier is
 //!      still started for later finishes.
+//!      With `S.agents.fresh_start` (default) the session also starts afresh (*Fresh start* below).
 //!    - any other spawn or join error, or no verdict in the payload, is a fault of the harness: a fresh
 //!      verifier is started up to `VERIFIER_RETRIES` (2) more times, waiting `VERIFIER_RETRY_WAIT_MS` between
 //!      attempts. When none could be run, step 6.
 //! 5. Deliver: `InboxItem { kind: Finished, text: "{answer}{support}\n\n[{note}]", blocking: false, ... }`
 //!    where `support` is the lead's `not_established` and its harness-checked quotes, then
-//!    `Effect::EndTurn(Finished)`; ok, outcome `finished - {note}`.
+//!    `Effect::EndTurn(Finished)`; ok, outcome `finished - {note}`, `meta[META_VERIFIED]` true when a
+//!    verifier accepted the result and false when it was delivered without one.
 //! 6. Hold as unverified: the finish stays recorded without a verdict; a `harness_note{Verdict}` labelled an
 //!    infrastructure fault (`texts::verification_fault_notice`) is written; the result is an error
 //!    (`texts::verification_fault_result`, with the verifier's report cut at `REPORT_MAX_CHARS` when it ended
@@ -86,11 +93,30 @@
 //! else settles one: answering an inbox item, a question, or calling finish again does not. While one is open
 //! `check_finish_lead` refuses finish.
 //!
+//! **Fresh start.** A session that goes on from a rejection with its own account of the attempt in view
+//! (the answer it gave, the conclusion it drew) tends to defend that account or to give up again. With
+//! `S.agents.fresh_start` (default on), a rejection therefore does two more things, after the verdict is
+//! recorded and before the objections are opened:
+//! - when the goal-met claim is concluded (`Supported` or `Refuted`) and the operator has not released the
+//!   mission, `GoalReopen { finish: fid }` is recorded: the conclusion the rejected result rested on did
+//!   not hold up, so the goal is `Open` again and the pre-gate (step 1) holds the next finish until a new
+//!   `conclude`, which the ledger accepts only on execution evidence recorded after the reopening. The
+//!   result then ends with `texts::FINISH_REOPENED_TAIL` instead. After a release nothing is reopened
+//!   (a release lets a finish through whatever the goal's status);
+//! - `S.set_fresh_start(FreshStart { objections, reopened })` asks the step loop to fold the window once
+//!   the reply's calls have their results (`session`, *Fresh start*): this result, the call and every
+//!   earlier `finish` and `conclude` attempt since the last delivered result leave the model's view (not
+//!   the record), and what the verifier found comes back as a brief.
+//!
+//! With it off, the conclusion stands, the rejection stays in view as this call's result, and only the
+//! objections hold the next finish.
+//!
 //! ## `conclude` (lead)
 //! `status` `met` | `unreachable`, `note`, `evidence`. Refused in a child session. `unreachable` is refused,
 //! with a sentence listing them, while a plan step is open. Writes `GoalMetSet { Supported | Refuted, note,
 //! evidence }`; the ledger's own rules refuse a missing goal, a blank note, evidence that is missing,
-//! unattested, not supporting or static only, and a repeat. Output: ok, outcome `goal concluded: ...`, saying
+//! unattested, not supporting or static only, a repeat, and, for a goal a rejected finish reopened, evidence
+//! with no run recorded after the reopening. Output: ok, outcome `goal concluded: ...`, saying
 //! that `finish` may now be called.
 //!
 //! ## `verdict` (verifier role)
@@ -172,7 +198,8 @@
 //! and lead; `wait` — nothing running, a running job, a running child.
 
 use super::{
-    Delivery, Effect, Settlement, Shared, SpawnReq, Workspace, MAX_FINISH_REJECTIONS, REPORT_MAX_CHARS, SHUTTING_DOWN,
+    Delivery, Effect, FreshStart, Settlement, Shared, SpawnReq, Workspace, MAX_FINISH_REJECTIONS, REPORT_MAX_CHARS,
+    SHUTTING_DOWN,
 };
 use crate::gate::{self, Quote, ReportInput, VerifiedQuote};
 use crate::pack::RoleDef;
@@ -180,7 +207,7 @@ use crate::texts;
 use async_trait::async_trait;
 use loom_core::event::{
     Author, Brief, Budget, ChildOutcome, Event, InboxItem, InboxKind, NoteKind, SpawnMode, Termination, ToolClass,
-    ToolSpec, ToolStatus, TurnEndReason, META_OF_BLOB,
+    ToolSpec, ToolStatus, TurnEndReason, META_OF_BLOB, META_REFUSAL, META_VERIFIED, REFUSAL_QUOTE, REFUSAL_VERIFIER,
 };
 use loom_core::ids::new_item_id;
 use loom_core::ledger::{ClaimStatus, Evidence, EvidenceKind, GoalMetStatus, LedgerOp, LedgerState, ObligationKind};
@@ -294,11 +321,11 @@ pub fn quote_items() -> Value {
         "type": "object",
         "properties": {
             "handle": { "type": "string", "description": "The stored output, for example out:7f3a9c1e." },
-            "start": { "type": "integer", "description": "First line of the quoted text." },
-            "end": { "type": "integer", "description": "Last line of the quoted text." },
-            "text": { "type": "string", "description": "The text, copied exactly from those lines." }
+            "start": { "type": "integer", "description": "First line of the quote in that output." },
+            "end": { "type": "integer", "description": "Last line of the quote in that output." },
+            "text": { "type": "string", "description": "Leave out to quote lines start-end whole, as stored (at most 20 lines; needs exact line numbers). Or the text copied exactly from within those lines; the range may then be wider than the text." }
         },
-        "required": ["handle", "start", "end", "text"],
+        "required": ["handle", "start", "end"],
         "additionalProperties": false
     })
 }
@@ -450,28 +477,35 @@ fn strings_of(v: Option<&Value>) -> Vec<String> {
 
 const QUOTE_SHAPE: &str = "{handle, start, end, text}";
 
-/// Parse the `quotes` argument; an element of another shape is an error naming its position.
+/// Parse the `quotes` argument; an element of another shape is an error naming its position. A quote
+/// without `text` (absent or `null`) is a quote by lines: its text is empty here.
 fn parse_quotes(args: &Map<String, Value>) -> Result<Vec<Quote>, String> {
     let Some(list) = args.get("quotes") else { return Ok(Vec::new()) };
     let Some(list) = list.as_array() else {
-        return Err(format!("`quotes` must be a list of objects {QUOTE_SHAPE}. Nothing was delivered."));
+        return Err(format!(
+            "`quotes` must be a list of objects {QUOTE_SHAPE}; `text` may be left out. Nothing was delivered."
+        ));
     };
     let mut out = Vec::new();
     for (idx, v) in list.iter().enumerate() {
         let pos = idx.saturating_add(1);
         let quote = v.as_object().and_then(|o| {
+            let text = match o.get("text") {
+                None | Some(Value::Null) => String::new(),
+                Some(t) => t.as_str()?.to_string(),
+            };
             Some(Quote {
                 handle: o.get("handle")?.as_str()?.to_string(),
                 start: o.get("start")?.as_u64()?,
                 end: o.get("end")?.as_u64()?,
-                text: o.get("text")?.as_str()?.to_string(),
+                text,
             })
         });
         match quote {
             Some(q) => out.push(q),
             None => {
                 return Err(format!(
-                    "quote {pos} is not an object with the four fields {QUOTE_SHAPE} (handle and text are strings, start and end are line numbers). Nothing was delivered."
+                    "quote {pos} is not an object with the fields {QUOTE_SHAPE} (handle is a string, start and end are line numbers; text is a string, or left out to quote those lines whole). Nothing was delivered."
                 ))
             }
         }
@@ -562,7 +596,9 @@ impl Finish {
             full,
             payload: json!({ "quotes": quotes_json(verified) }),
         }));
+        // A child's result goes to the agent that assigned it, unverified.
         ToolOutput::ok("delivered", Body::Message("Your result was delivered. This session is finished.".into()))
+            .with_meta(META_VERIFIED, json!(false))
     }
 
     /// What this session still has running: its background jobs, and its child agents.
@@ -648,6 +684,8 @@ impl Finish {
         let support = support_text(not_established, verified);
 
         let mut note = "not verified".to_string();
+        // Whether a verifier accepted what is delivered: recorded with the result (`META_VERIFIED`).
+        let mut verified_by = false;
         // The operator's release closes the mission short of the goal: there is no goal claim for a verifier
         // to attack, and the result says so.
         let closed_by_release = released && gate::goal_unconcluded_ignoring_release(&state);
@@ -771,6 +809,24 @@ impl Finish {
                 if let Err(e) = s.ledger_append(false, op) {
                     return ToolOutput::error(e);
                 }
+                // A fresh start: the conclusion this finish rested on did not hold up, so the goal is open
+                // again and the next finish needs a new conclusion on a new run. Not after a release, which
+                // lets a finish through whatever the goal's status.
+                let fresh = s.agents.fresh_start;
+                let mut reopened = false;
+                if fresh {
+                    let current = match s.ledger() {
+                        Ok(st) => st,
+                        Err(e) => return ToolOutput::error(e),
+                    };
+                    let concluded = current.goal_met.as_ref().is_some_and(|g| g.status != GoalMetStatus::Open);
+                    if concluded && current.release.is_none() {
+                        if let Err(e) = s.ledger_append(false, LedgerOp::GoalReopen { finish: fid.clone() }) {
+                            return ToolOutput::error(e);
+                        }
+                        reopened = true;
+                    }
+                }
                 // Each objection becomes an obligation: it holds every later finish until new execution
                 // evidence is recorded after it, so a rejection cannot be answered by finishing again.
                 for o in objections.iter().map(|o| o.trim()).filter(|o| !o.is_empty()) {
@@ -795,11 +851,19 @@ impl Finish {
                 for o in &objections {
                     text.push_str(&format!("\n- {o}"));
                 }
-                text.push_str(&format!("\n\n{}\n\n{}", settled.report, texts::FINISH_NOT_ACCEPTED_TAIL));
-                let mut out = ToolOutput::ok("not accepted", Body::Raw(text.into_bytes()));
+                let tail = if reopened { texts::FINISH_REOPENED_TAIL } else { texts::FINISH_NOT_ACCEPTED_TAIL };
+                text.push_str(&format!("\n\n{}\n\n{tail}", settled.report));
+                if fresh {
+                    // The loop folds the window once this result is recorded: this text stays in the record
+                    // and leaves the model's view with the call.
+                    s.set_fresh_start(FreshStart { objections, reopened });
+                }
+                let mut out = ToolOutput::ok("not accepted", Body::Raw(text.into_bytes()))
+                    .with_meta(META_REFUSAL, json!(REFUSAL_VERIFIER));
                 out.status = ToolStatus::Error;
                 return out;
             }
+            verified_by = true;
         }
 
         s.emit(
@@ -808,6 +872,7 @@ impl Finish {
         );
         s.set_effect(Effect::EndTurn(TurnEndReason::Finished));
         ToolOutput::ok(format!("finished — {note}"), Body::Message("The result was delivered to the operator.".into()))
+            .with_meta(META_VERIFIED, json!(verified_by))
     }
 
     /// Settle the open objections of earlier rejections that new work has answered: an objection is settled
@@ -1028,11 +1093,11 @@ impl Tool for Finish {
     fn spec(&self) -> ToolSpec {
         spec(
             "finish",
-            "Deliver the result and end the work. This is the only way a result is delivered. `answer` is the result, written for someone who has not seen your work. `quotes` are the exact lines of stored output that support it; each is checked against the stored output and refused if it does not match. `not_established` says what you could not determine or did not check. If the harness refuses the call, it says what is still open; deal with that and call finish again.",
+            "Deliver the result and end the work. This is the only way a result is delivered. `answer` is the result, written for someone who has not seen your work. `quotes` are the lines of stored output that support it. Name them by handle and line numbers and the harness takes their text from the stored output: do this when you have the numbers from `out_read`, `out_grep` or `read`. Otherwise add `text`, copied exactly; it is checked against the stored output and refused if it does not match. `not_established` says what you could not determine or did not check. If the harness refuses the call, it says what is still open; deal with that and call finish again.",
             ToolClass::Terminal,
             &[
                 req("answer", "string", "The result: what was done or found, and how it was confirmed."),
-                opt("quotes", "array", "Supporting lines of stored output, copied exactly.").with("items", quote_items()),
+                opt("quotes", "array", "Supporting lines of stored output: by line numbers, or with the text copied exactly.").with("items", quote_items()),
                 opt("not_established", "string", "What you could not determine, and what you did not check."),
                 opt("evidence", "array", "Ids of ledger evidence records (e1, e2) the result rests on.").items("string"),
             ],
@@ -1051,10 +1116,12 @@ impl Tool for Finish {
             Ok(q) => q,
             Err(e) => return ToolOutput::error(e),
         };
+        // A refusal over a quote says so in the record: a scorecard counts the steps spent on quotes.
+        let quote_refused = |text: String| ToolOutput::error(text).with_meta(META_REFUSAL, json!(REFUSAL_QUOTE));
         let verified = match gate::check_quotes(&ctx.blobs, &quotes) {
             Ok(v) => v,
             Err(text) => {
-                return ToolOutput::error(format!(
+                return quote_refused(format!(
                     "{text}\nNothing was delivered. Correct the quotes and call finish again."
                 ))
             }
@@ -1063,7 +1130,7 @@ impl Tool for Finish {
         if let Some(mission) = self.0.mission.as_ref() {
             for (q, v) in quotes.iter().zip(&verified) {
                 if let Err(text) = super::observed_producer(&self.0, mission, &q.handle, &v.blob).await {
-                    return ToolOutput::error(format!("{text}\nNothing was delivered."));
+                    return quote_refused(format!("{text}\nNothing was delivered."));
                 }
             }
         }
@@ -1909,6 +1976,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_quote_by_lines_is_delivered_with_the_text_the_output_has() {
+        let out = "running 2 tests\n  test parse ... FAILED\n  left: 1, right: 2\n\ntest result: FAILED\n";
+        // A child names the lines and types none of them: `text` left out, null, and blank are the same.
+        let r = rig("worker", true, true);
+        let h = r.output(out, "bash", ToolClass::Exec);
+        let quotes = json!([
+            {"handle": h, "start": 2, "end": 4},
+            {"handle": h, "start": 5, "end": 5, "text": null},
+            {"handle": h, "start": 1, "end": 1, "text": " "},
+            {"handle": h, "start": 1, "end": 5, "text": "test result: FAILED"}
+        ]);
+        let res = r.call("finish", json!({"answer": "The parser test fails.", "quotes": quotes})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let Some(Effect::Settle(d)) = effect(&r) else { panic!("settle expected") };
+        assert_eq!(
+            d.payload["quotes"],
+            json!([
+                {"handle": h, "start": 2, "end": 3, "text": "  test parse ... FAILED\n  left: 1, right: 2"},
+                {"handle": h, "start": 5, "end": 5, "text": "test result: FAILED"},
+                {"handle": h, "start": 1, "end": 1, "text": "running 2 tests"},
+                {"handle": h, "start": 5, "end": 5, "text": "test result: FAILED"}
+            ])
+        );
+        assert!(
+            d.report.contains(&format!("- {h} lines 2-3:   test parse ... FAILED\n  |   left: 1, right: 2")),
+            "{}",
+            d.report
+        );
+        // A range that is not the output's is refused as any quote is, and nothing is delivered.
+        let r = rig("worker", true, true);
+        let h = r.output(out, "bash", ToolClass::Exec);
+        let res = r.call("finish", json!({"answer": "done", "quotes": [{"handle": h, "start": 4, "end": 9}]})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("end 9 is past its end"), "{}", res.text);
+        assert!(res.text.contains("Nothing was delivered. Correct the quotes and call finish again."), "{}", res.text);
+        assert_eq!(res.meta.get(META_REFUSAL), Some(&json!(REFUSAL_QUOTE)));
+        assert!(effect(&r).is_none());
+        // It is an observation or it is no quote: the producer rule applies to it too.
+        let own = r.output("#12 you: All 212 tests pass\n", "log_search", ToolClass::Read);
+        let res = r.call("finish", json!({"answer": "done", "quotes": [{"handle": own, "start": 1, "end": 1}]})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("is the result of `log_search`"), "{}", res.text);
+        assert_eq!(res.meta.get(META_REFUSAL), Some(&json!(REFUSAL_QUOTE)));
+        // A child's delivery is recorded as unverified.
+        let h = r.output(out, "bash", ToolClass::Exec);
+        let res = r.call("finish", json!({"answer": "done", "quotes": [{"handle": h, "start": 1, "end": 1}]})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert_eq!(res.meta.get(META_VERIFIED), Some(&json!(false)));
+        assert!(matches!(effect(&r), Some(Effect::Settle(_))));
+        // A lead: the verifier and the operator read the stored lines.
+        let r = lead();
+        let h = r.output(out, "bash", ToolClass::Exec);
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "fine", accepted_payload());
+        let res =
+            r.call("finish", json!({"answer": "It fails.", "quotes": [{"handle": h, "start": 5, "end": 5}]})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let spawned = r.orch.spawned.lock().unwrap().clone();
+        let brief = spawned[0].1.brief.context.clone().unwrap();
+        assert!(brief.contains(&format!("- {h} lines 5-5: test result: FAILED")), "{brief}");
+        // A `text` of another type is still a malformed element.
+        let r = lead();
+        let res = r
+            .call(
+                "finish",
+                json!({"answer": "done", "quotes": [{"handle": "out:aa", "start": 1, "end": 1, "text": 7}]}),
+            )
+            .await;
+        assert_ne!(res.status, Status::Ok, "{}", res.text);
+        assert!(effect(&r).is_none());
+    }
+
+    #[tokio::test]
     async fn a_fragment_of_a_long_line_stays_visible_where_the_quote_is_shown() {
         let fragment = "versions before 2.4.1 are affected";
         let line = format!("{}{fragment}, and {}\n", "lorem ".repeat(150), "ipsum ".repeat(50).trim_end());
@@ -2080,13 +2219,22 @@ mod tests {
 
     /// A lead whose role also has `conclude`, with a goal set by the operator.
     fn lead_with_goal() -> Rig {
+        lead_with_goal_cfg(loom_core::config::AgentsCfg::default())
+    }
+
+    fn lead_with_goal_cfg(agents: loom_core::config::AgentsCfg) -> Rig {
         let mut role = core_role("lead");
         if !role.tools.iter().any(|t| t == "conclude") {
             role.tools.push("conclude".into());
         }
-        let r = rig_with(role, false, true, loom_core::config::AgentsCfg::default());
+        let r = rig_with(role, false, true, agents);
         r.user_op(LedgerOp::GoalSet { text: "fix the parser".into() });
         r
+    }
+
+    /// A lead for which a rejection leaves the goal as concluded and the window as it is.
+    fn lead_without_fresh_start() -> Rig {
+        lead_with_goal_cfg(loom_core::config::AgentsCfg { fresh_start: false, ..Default::default() })
     }
 
     /// Record a run of the target: a supported claim with attested execution evidence. Returns the evidence id.
@@ -2245,8 +2393,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rejection_opens_objections_that_only_new_execution_evidence_settles() {
+    async fn a_rejection_reopens_the_goal_and_asks_the_loop_for_a_fresh_start() {
         let r = lead_with_goal();
+        conclude_met(&r).await;
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "I could not reproduce the fix.", rejected_payload());
+        r.orch.settle("s-kid2", ChildOutcome::Returned, "fine", accepted_payload());
+        r.shared.take_emitted();
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("the goal is open again"), "{}", res.text);
+        assert!(res.text.contains("conclude the goal on that run and call finish again"), "{}", res.text);
+        assert_eq!(res.meta.get(META_REFUSAL), Some(&json!(REFUSAL_VERIFIER)), "the record says who refused");
+        let (items, _) = drain(&r);
+        assert!(items.is_empty(), "a rejection opens no inbox item: {items:?}");
+        // The loop is asked once, with what the check found.
+        let fresh = r.shared.take_fresh_start().unwrap();
+        assert_eq!(fresh.objections, vec!["no test ran".to_string(), "line 4 is wrong".to_string()]);
+        assert!(fresh.reopened);
+        assert!(r.shared.take_fresh_start().is_none());
+        let st = r.shared.ledger().unwrap();
+        assert_eq!(st.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Open));
+        assert!(st.finishes[0].reopened_goal);
+        assert_eq!(open_objections(&r), 2);
+
+        // Finishing again is refused before anything else: no verifier, no second fresh start.
+        let res = r.call("finish", json!({"answer": "Parser fixed, really."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("finish is not available yet: the goal is not concluded"), "{}", res.text);
+        assert!(!res.meta.contains_key(META_REFUSAL), "the gate is neither a quote nor a verifier");
+        assert!(r.shared.take_fresh_start().is_none());
+        assert_eq!(spawn_count(&r), 1);
+        // The run the rejected result rested on does not conclude the goal a second time.
+        let res = r.call("conclude", json!({"status": "met", "note": "the run passes", "evidence": ["e1"]})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("The goal is open again"), "{}", res.text);
+        assert!(res.text.contains("Run the target again"), "{}", res.text);
+        // A run recorded from here on does: it concludes the goal and settles the objections.
+        conclude_met(&r).await;
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(res.text.contains("finished — verified by s-kid2"), "{}", res.text);
+        assert_eq!(res.meta.get(META_VERIFIED), Some(&json!(true)));
+        assert_eq!(open_objections(&r), 0);
+        assert!(r.shared.take_fresh_start().is_none(), "an accepted finish folds nothing");
+    }
+
+    #[tokio::test]
+    async fn a_rejection_after_a_release_folds_the_window_and_leaves_the_goal_as_it_is() {
+        let r = lead_with_goal();
+        conclude_met(&r).await;
+        r.user_op(LedgerOp::OperatorRelease { reason: "out of time".into() });
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "no", rejected_payload());
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(!res.text.contains("the goal is open again"), "{}", res.text);
+        let fresh = r.shared.take_fresh_start().unwrap();
+        assert!(!fresh.reopened);
+        assert_eq!(fresh.objections.len(), 2);
+        let st = r.shared.ledger().unwrap();
+        assert_eq!(st.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Supported));
+        assert!(!st.finishes[0].reopened_goal);
+    }
+
+    #[tokio::test]
+    async fn a_rejection_opens_objections_that_only_new_execution_evidence_settles() {
+        let r = lead_without_fresh_start();
         conclude_met(&r).await;
         r.orch.settle("s-kid1", ChildOutcome::Returned, "I could not reproduce the fix.", rejected_payload());
         r.orch.settle("s-kid2", ChildOutcome::Returned, "fine", accepted_payload());
@@ -2263,6 +2474,9 @@ mod tests {
         assert_eq!(objections[1].text, "line 4 is wrong");
         assert!(objections[0].reference.starts_with("f1 (verifier s-kid1)"), "{}", objections[0].reference);
         assert!(res.text.contains("settled only by new execution evidence"), "{}", res.text);
+        // With the fresh start off, the conclusion stands and the loop is asked for nothing.
+        assert_eq!(st.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Supported));
+        assert!(r.shared.take_fresh_start().is_none());
 
         // Finishing again does nothing: no verifier, the objections are named.
         for _ in 0..2 {
@@ -2315,7 +2529,8 @@ mod tests {
         r.shared.take_emitted();
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
-        record_run(&r);
+        // Each rejection reopened the goal: the next finish rests on a new run and a new conclusion.
+        conclude_met(&r).await;
         r.shared.take_emitted();
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
@@ -2329,7 +2544,7 @@ mod tests {
         assert!(effect(&r).is_none());
         assert!(r.shared.ledger().unwrap().questions.is_empty());
         // The session works on and can still finish with new evidence: nothing is stuck.
-        record_run(&r);
+        conclude_met(&r).await;
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         assert!(res.text.contains("verified by s-kid3"), "{}", res.text);
@@ -2346,10 +2561,27 @@ mod tests {
         let res = r.call("ask_user", json!({"question": "Is the lexer in scope?"})).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         r.user_op(LedgerOp::QuestionAnswer { id: "q1".into(), answer: "just go on".into() });
+        // The rejection reopened the goal, and the answer neither concludes it nor settles an objection.
+        let st = r.shared.ledger().unwrap();
+        assert_eq!(st.goal_met.as_ref().map(|g| g.status), Some(loom_core::ledger::GoalMetStatus::Open));
+        assert_eq!(open_objections(&r), 2);
+        assert_eq!(rejection_floor(&st), 0);
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("finish is not available yet"), "{}", res.text);
+        assert_eq!(spawn_count(&r), 1);
+        // The same without the fresh start: the conclusion stands, the objections hold the finish.
+        let r = lead_without_fresh_start();
+        conclude_met(&r).await;
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "no", rejected_payload());
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        let res = r.call("ask_user", json!({"question": "Is the lexer in scope?"})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        r.user_op(LedgerOp::QuestionAnswer { id: "q1".into(), answer: "just go on".into() });
         let st = r.shared.ledger().unwrap();
         assert_eq!(st.goal_met.as_ref().map(|g| g.status), Some(loom_core::ledger::GoalMetStatus::Supported));
         assert_eq!(open_objections(&r), 2);
-        assert_eq!(rejection_floor(&st), 0);
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(res.text.contains("objection"), "{}", res.text);
