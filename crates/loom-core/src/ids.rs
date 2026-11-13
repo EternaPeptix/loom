@@ -42,7 +42,7 @@ const ALPHABET: &[u8] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
 /// Time-sortable id body: 9 chars of millisecond time + 7 random chars (Crockford-style base32).
 fn sortable(now_ms: u64) -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut out = String::with_capacity(16);
     for shift in (0..9).rev() {
         out.push(ALPHABET[((now_ms >> (shift * 5)) & 31) as usize] as char);

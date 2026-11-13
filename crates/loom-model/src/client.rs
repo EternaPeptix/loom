@@ -94,7 +94,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use loom_core::config::ModelProfile;
 use loom_core::event::{FinishReason, Timing, Usage};
-use rand::Rng;
+use rand::RngExt;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

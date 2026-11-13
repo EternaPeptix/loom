@@ -16,7 +16,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use loom_core::config::SandboxMode;
 use loom_core::event::{ToolClass, ToolSpec};
 use serde::{Deserialize, Serialize};

@@ -1368,7 +1368,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_with_a_nonce_proves_the_token_without_authentication() {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         let e = env(Script::new(|_, _| finish("x"))).await;
         let nonce = "ab12".repeat(8);
         let r = e.http.get(e.url(&format!("/healthz?nonce={nonce}"))).send().await.unwrap();

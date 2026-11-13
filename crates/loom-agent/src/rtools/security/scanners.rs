@@ -159,7 +159,7 @@ fn nmap(input: &str, evidence: &[String], assets: &mut BTreeMap<String, AssetInp
     let mut depth = 0usize;
     loop {
         match reader.read_event().map_err(|e| format!("Malformed nmap XML: {e}. Nothing was imported."))? {
-            Event::DocType(d) if &*d != b"nmaprun" => {
+            Event::DocType(d) if &*d != "nmaprun" => {
                 return Err(
                     "External or entity-bearing XML DTDs are not accepted; use a plain nmaprun declaration.".into()
                 )
@@ -169,25 +169,23 @@ fn nmap(input: &str, evidence: &[String], assets: &mut BTreeMap<String, AssetInp
                 let mut attrs = BTreeMap::new();
                 for attr in e.attributes() {
                     let attr = attr.map_err(|_| "Malformed nmap XML attributes; nothing was imported.".to_string())?;
-                    let key = std::str::from_utf8(attr.key.as_ref())
-                        .map_err(|_| "XML attribute names must be UTF-8.".to_string())?
-                        .to_string();
+                    let key = attr.key.as_ref().to_string();
                     let value = attr
-                        .decode_and_unescape_value(reader.decoder())
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                         .map_err(|_| "Malformed XML attribute value.".to_string())?
                         .into_owned();
                     attrs.insert(key, value);
                 }
                 match name.as_ref() {
-                    b"nmaprun" if !root && depth == 0 => root = true,
-                    b"nmaprun" => {
+                    "nmaprun" if !root && depth == 0 => root = true,
+                    "nmaprun" => {
                         return Err("Use one nmaprun document root, without wrapping or repeated roots.".into())
                     }
-                    b"host" => {
+                    "host" => {
                         host = None;
                         port = None;
                     }
-                    b"address"
+                    "address"
                         if root
                             && matches!(attrs.get("addrtype").map(String::as_str), Some("ipv4" | "ipv6"))
                             && host.is_none() =>
@@ -199,7 +197,7 @@ fn nmap(input: &str, evidence: &[String], assets: &mut BTreeMap<String, AssetInp
                         let id = add(AssetKind::Host, value, None, evidence, assets)?;
                         host = Some((value.clone(), id));
                     }
-                    b"port" if root => {
+                    "port" if root => {
                         let protocol =
                             attrs.get("protocol").cloned().ok_or_else(|| "An nmap port needs protocol.".to_string())?;
                         if !["tcp", "udp", "sctp"].contains(&protocol.as_str()) {
@@ -212,7 +210,7 @@ fn nmap(input: &str, evidence: &[String], assets: &mut BTreeMap<String, AssetInp
                             .ok_or_else(|| "An nmap portid must be between one and 65535.".to_string())?;
                         port = Some((protocol, number, false));
                     }
-                    b"state" => {
+                    "state" => {
                         if let Some((_, _, open)) = &mut port {
                             *open = attrs.get("state").is_some_and(|s| s == "open");
                         }
@@ -226,7 +224,7 @@ fn nmap(input: &str, evidence: &[String], assets: &mut BTreeMap<String, AssetInp
                 }
             }
             Event::End(e) => match e.name().as_ref() {
-                b"port" => {
+                "port" => {
                     if let (Some((address, parent)), Some((protocol, number, true))) = (&host, port.take()) {
                         add(
                             AssetKind::Service,
@@ -237,7 +235,7 @@ fn nmap(input: &str, evidence: &[String], assets: &mut BTreeMap<String, AssetInp
                         )?;
                     }
                 }
-                b"host" => {
+                "host" => {
                     host = None;
                     port = None;
                 }

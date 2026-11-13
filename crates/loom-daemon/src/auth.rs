@@ -225,7 +225,7 @@ pub fn valid_nonce(nonce: &str) -> bool {
 /// `hex(HMAC-SHA256(key = token bytes, "loom-healthz-v1:" + nonce))`: what a daemon that holds the token answers to
 /// `GET /healthz?nonce=<nonce>`. `None` only when the key cannot be used.
 pub fn healthz_proof(token: &str, nonce: &str) -> Option<String> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(token.as_bytes()).ok()?;
     mac.update(HEALTHZ_PROOF_PREFIX.as_bytes());
     mac.update(nonce.as_bytes());

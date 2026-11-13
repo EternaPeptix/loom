@@ -137,7 +137,7 @@ use crate::policy::{normalize_host, Policy};
 use base64::Engine as _;
 use loom_core::event::NetDecision;
 use loom_core::SessionId;
-use rand::Rng;
+use rand::RngExt;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};

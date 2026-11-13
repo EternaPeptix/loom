@@ -66,7 +66,7 @@
 
 use crate::ids::SessionId;
 use crate::ledger::{Entry, LedgerOp, LedgerState};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Map, Value};
 use sha2::Sha256;
 use std::io::{Read, Write};
@@ -606,7 +606,7 @@ pub fn load_or_create_key(path: &Path) -> std::io::Result<Vec<u8>> {
         }
     }
     let mut key = [0u8; 32];
-    rand::Rng::fill(&mut rand::rng(), &mut key[..]);
+    rand::RngExt::fill(&mut rand::rng(), &mut key[..]);
     // A concurrent creator's file wins; whichever file is published is the one read back.
     publish_new_file(path, hex::encode(key).as_bytes())?;
     read_key(path)

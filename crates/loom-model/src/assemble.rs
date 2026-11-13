@@ -254,7 +254,7 @@ fn error_message(e: &Value) -> String {
 }
 
 fn random_call_id() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut rng = rand::rng();
     let mut id = String::from("call-");
