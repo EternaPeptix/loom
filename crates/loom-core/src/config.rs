@@ -465,7 +465,9 @@ mod tests {
 
     #[test]
     fn bubblewrap_and_reference_hosts_are_additive_config_options() {
-        let c = Config::parse("[sandbox]\nmode = 'bubblewrap'\n[network]\nreference_hosts = ['docs.example.test:443']\n").unwrap();
+        let c =
+            Config::parse("[sandbox]\nmode = 'bubblewrap'\n[network]\nreference_hosts = ['docs.example.test:443']\n")
+                .unwrap();
         assert_eq!(c.sandbox.mode, SandboxMode::Bubblewrap);
         assert_eq!(c.network.reference_hosts, ["docs.example.test:443"]);
         assert!(Config::parse("").unwrap().network.reference_hosts.is_empty());

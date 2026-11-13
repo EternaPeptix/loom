@@ -285,8 +285,10 @@ fn git_metadata(path: &Path, workspace: &Path) -> bool {
         if component.as_os_str().to_string_lossy().eq_ignore_ascii_case(".git")
             && components.next().is_none_or(|name| {
                 ["config", "config.worktree", "hooks", "commondir", "gitdir"]
-                    .iter().any(|x| name.as_os_str().to_string_lossy().eq_ignore_ascii_case(x))
-            }) {
+                    .iter()
+                    .any(|x| name.as_os_str().to_string_lossy().eq_ignore_ascii_case(x))
+            })
+        {
             return true;
         }
     }
@@ -302,7 +304,10 @@ fn git_directories(workspace: &Path) -> io::Result<Vec<PathBuf>> {
     let pointer = |path: &Path| -> io::Result<Option<String>> {
         match std::fs::metadata(path) {
             Ok(m) if m.is_file() && m.len() <= 4096 => Ok(Some(std::fs::read_to_string(path)?)),
-            Ok(m) if m.is_file() => Err(invalid(format!("Git metadata pointer {} is larger than 4096 bytes. Inspect it before starting a session.", path.display()))),
+            Ok(m) if m.is_file() => Err(invalid(format!(
+                "Git metadata pointer {} is larger than 4096 bytes. Inspect it before starting a session.",
+                path.display()
+            ))),
             Ok(_) => Ok(None),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -641,12 +646,16 @@ impl Sandbox {
             if !workspace.join(".loom").is_dir() {
                 return Err(invalid("Bubblewrap requires an existing workspace .loom directory so its contents, including future oracle secrets, can be hidden. Create the reserved directory before starting the session.".to_string()));
             }
-            if !credentials.is_empty() && home.as_ref().is_some_and(|home| writable.iter().any(|root| under(home, root))) {
+            if !credentials.is_empty()
+                && home.as_ref().is_some_and(|home| writable.iter().any(|root| under(home, root)))
+            {
                 return Err(invalid("Bubblewrap cannot use the whole user home as a writable root while protecting credentials. Choose a narrower workspace and extra_writable directories.".to_string()));
             }
             for path in unreadable.iter().chain(&credentials) {
-                let hidden = under(path, &loom_home) || under(path, &workspace.join(".loom"))
-                    || (!credentials.is_empty() && home.as_ref().is_some_and(|home| under(path, home))
+                let hidden = under(path, &loom_home)
+                    || under(path, &workspace.join(".loom"))
+                    || (!credentials.is_empty()
+                        && home.as_ref().is_some_and(|home| under(path, home))
                         && !writable.iter().any(|root| under(path, root)));
                 if !path.exists() && !hidden {
                     return Err(invalid(format!("Bubblewrap cannot hide the missing unreadable path {}. Create it before starting the session or choose a scope whose parent can be hidden.", path.display())));
@@ -710,7 +719,9 @@ impl Sandbox {
             if !path.is_dir() {
                 return Err(format!("Replay directory {} does not exist. Create private staging directories outside the session temp first.", path.display()));
             }
-            std::fs::canonicalize(path).map_err(|e| format!("Replay directory {} cannot be resolved: {e}. Inspect it before retrying.", path.display()))
+            std::fs::canonicalize(path).map_err(|e| {
+                format!("Replay directory {} cannot be resolved: {e}. Inspect it before retrying.", path.display())
+            })
         };
         let workspace = canonical(workspace)?;
         let tmp = canonical(tmp)?;
@@ -719,9 +730,11 @@ impl Sandbox {
                 && self.tmp_dir.parent().is_some_and(|session| parent.starts_with(session))
                 && self.protected.iter().any(|root| under(parent, root))
         });
-        if workspace.starts_with(&tmp) || tmp.starts_with(&workspace)
+        if workspace.starts_with(&tmp)
+            || tmp.starts_with(&workspace)
             || private_parent.is_none()
-            || self.check_write(&workspace).is_ok() || self.check_write(&tmp).is_ok()
+            || self.check_write(&workspace).is_ok()
+            || self.check_write(&tmp).is_ok()
         {
             return Err("Replay workspace and temp must be separate private directories outside the caller's writable areas. Create them as siblings under the protected session directory.".to_string());
         }
@@ -737,11 +750,17 @@ impl Sandbox {
         let secrets = workspace.join(".loom/oracle-secrets");
         push_unique(&mut replay.unreadable, resolve_path(&secrets, true)?);
         push_unique(&mut replay.unreadable, secrets);
-        replay.git_dirs = git_directories(&workspace).map_err(|e| format!("Replay Git metadata cannot be protected: {e}. Inspect the staged workspace."))?;
+        replay.git_dirs = git_directories(&workspace)
+            .map_err(|e| format!("Replay Git metadata cannot be protected: {e}. Inspect the staged workspace."))?;
         if replay.mode == SandboxMode::Bubblewrap {
-            replay.linux_pins = linux::pin(&replay.writable, &replay.protected, &replay.unreadable,
-                &replay.credentials, &replay.git_dirs)
-                .map_err(|e| format!("Replay mounts cannot be pinned: {e}. Inspect the staged directories."))?;
+            replay.linux_pins = linux::pin(
+                &replay.writable,
+                &replay.protected,
+                &replay.unreadable,
+                &replay.credentials,
+                &replay.git_dirs,
+            )
+            .map_err(|e| format!("Replay mounts cannot be pinned: {e}. Inspect the staged directories."))?;
         }
         Ok(replay)
     }
@@ -763,11 +782,19 @@ impl Sandbox {
             out.push_str(&format!("(deny file-write*{})\n", subpaths(&self.protected)));
         }
         // New nested Git metadata is covered too, even when it did not exist at construction.
-        let names = ["config", "config.worktree", "hooks", "commondir", "gitdir"].map(|name| {
-            name.chars().map(|c| if c.is_ascii_alphabetic() {
-                format!("[{}{}]", c, c.to_ascii_uppercase())
-            } else { "[.]".to_string() }).collect::<String>()
-        }).join("|");
+        let names = ["config", "config.worktree", "hooks", "commondir", "gitdir"]
+            .map(|name| {
+                name.chars()
+                    .map(|c| {
+                        if c.is_ascii_alphabetic() {
+                            format!("[{}{}]", c, c.to_ascii_uppercase())
+                        } else {
+                            "[.]".to_string()
+                        }
+                    })
+                    .collect::<String>()
+            })
+            .join("|");
         let git = format!("^.*/[.][gG][iI][tT](/({names})(/.*)?)?$");
         if let Ok(ws) = sbpl(&self.workspace) {
             out.push_str(&format!("(deny file-write* (require-all (subpath \"{ws}\") (regex #\"{git}\")))\n"));
@@ -959,9 +986,12 @@ impl Sandbox {
             .filter(|(name, value)| {
                 // These would execute agent-writable files in the trusted host launcher before bwrap.
                 let upper = name.to_uppercase();
-                if self.mode == SandboxMode::Bubblewrap && (upper.starts_with("LD_")
-                    || upper.starts_with("DYLD_") || upper.starts_with("BASH_FUNC_")
-                    || matches!(upper.as_str(), "BASH_ENV" | "ENV" | "SHELLOPTS" | "BASHOPTS")) {
+                if self.mode == SandboxMode::Bubblewrap
+                    && (upper.starts_with("LD_")
+                        || upper.starts_with("DYLD_")
+                        || upper.starts_with("BASH_FUNC_")
+                        || matches!(upper.as_str(), "BASH_ENV" | "ENV" | "SHELLOPTS" | "BASHOPTS"))
+                {
                     return false;
                 }
                 self.env_pass.iter().any(|p| p == *name)
@@ -1101,8 +1131,7 @@ mod tests {
         let r = s(&f.root);
         // The directories that hold the denied paths and could be moved: the workspace (it holds `.loom`)
         // and, when the fixture lies in a system temp location, every directory from there down to it.
-        let mut holders: Vec<&Path> =
-            f.ws.ancestors().filter(|a| *a == f.ws).collect();
+        let mut holders: Vec<&Path> = f.ws.ancestors().filter(|a| *a == f.ws).collect();
         holders.reverse();
         let holders: String = holders.iter().map(|a| format!(" (literal \"{}\")", s(a))).collect();
         let expected = format!(
@@ -1124,7 +1153,8 @@ mod tests {
              (allow network-inbound (local ip \"localhost:*\"))\n"
         );
         let actual = sb.profile().expect("profile");
-        let without_git: String = actual.lines().filter(|line| !line.contains("(regex #")).map(|line| format!("{line}\n")).collect();
+        let without_git: String =
+            actual.lines().filter(|line| !line.contains("(regex #")).map(|line| format!("{line}\n")).collect();
         assert_eq!(without_git, expected);
         let (prog, args) = sb.command("echo hi");
         assert_eq!(prog, "/usr/bin/sandbox-exec");
@@ -1833,8 +1863,14 @@ mod tests {
         std::fs::create_dir_all(git.join("hooks")).unwrap();
         std::fs::write(git.join("config"), "original").unwrap();
         let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
-        for path in [git.join("config"), git.join("config.worktree"), git.join("hooks/pre-commit"),
-            f.ws.join("new/.git/config"), f.ws.join("new/.GIT/hooks/tool"), f.ws.join("new/.git")] {
+        for path in [
+            git.join("config"),
+            git.join("config.worktree"),
+            git.join("hooks/pre-commit"),
+            f.ws.join("new/.git/config"),
+            f.ws.join("new/.GIT/hooks/tool"),
+            f.ws.join("new/.git"),
+        ] {
             assert!(sb.check_write(&path).is_err(), "{}", path.display());
         }
         assert!(sb.check_write(&f.ws.join("nested/source.rs")).is_ok());
@@ -1853,7 +1889,9 @@ mod tests {
         let private = f.tmp.parent().unwrap().join("oracle-private");
         let ws = private.join("workspace");
         let tmp = private.join("tmp");
-        for path in [&ws, &tmp] { std::fs::create_dir_all(path).unwrap(); }
+        for path in [&ws, &tmp] {
+            std::fs::create_dir_all(path).unwrap();
+        }
         std::fs::write(ws.join("source"), "original").unwrap();
         assert!(caller.check_write(&ws.join("source")).is_err());
         assert!(caller.check_write(&tmp.join("fake-result")).is_err());
@@ -1892,7 +1930,9 @@ mod tests {
 
     #[test]
     fn git_profile_handles_quoted_and_regex_special_workspace_names() {
-        if !available() { return; }
+        if !available() {
+            return;
+        }
         let f = fx();
         let ws = f.ws.join("quote\" [literal] (dir)");
         std::fs::create_dir(&ws).unwrap();

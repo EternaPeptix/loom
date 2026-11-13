@@ -1657,8 +1657,13 @@ mod tests {
     async fn an_https_refusal_by_the_real_proxy_names_its_rule_and_an_unreachable_host_is_not_one() {
         use loom_core::config::{NetworkCfg, NetworkMode};
         let deny = vec!["*.blocked.test".to_string()];
-        let cfg =
-            NetworkCfg { mode: NetworkMode::Open, allow: Vec::new(), deny, allow_private: vec!["127.0.0.1".into()], ..NetworkCfg::default() };
+        let cfg = NetworkCfg {
+            mode: NetworkMode::Open,
+            allow: Vec::new(),
+            deny,
+            allow_private: vec!["127.0.0.1".into()],
+            ..NetworkCfg::default()
+        };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = loom_net::Proxy::start(0, tx).await.unwrap();
         let grant = proxy.grant(&loom_core::SessionId::from("s-cve"), loom_net::Policy::new(&cfg).unwrap());

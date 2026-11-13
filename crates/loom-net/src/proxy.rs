@@ -1220,8 +1220,15 @@ async fn handle(
     };
     let Authed { reference, session, policy, permits, lookups } = auth;
     if reference && !matches!(head.method.as_str(), "GET" | "CONNECT" | CHECK_METHOD) {
-        return reject(&mut client, &shared, slot, &session, &head,
-            "reference credentials allow GET only; use an active scope grant for other methods").await;
+        return reject(
+            &mut client,
+            &shared,
+            slot,
+            &session,
+            &head,
+            "reference credentials allow GET only; use an active scope grant for other methods",
+        )
+        .await;
     }
     let Ok(_session_slot) = permits.try_acquire_owned() else {
         let body = format!(
@@ -2028,7 +2035,14 @@ mod tests {
 
     fn policy(mode: NetworkMode, allow: &[&str], deny: &[&str], private: &[&str]) -> Policy {
         let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        Policy::new(&NetworkCfg { mode, allow: v(allow), deny: v(deny), allow_private: v(private), ..NetworkCfg::default() }).unwrap()
+        Policy::new(&NetworkCfg {
+            mode,
+            allow: v(allow),
+            deny: v(deny),
+            allow_private: v(private),
+            ..NetworkCfg::default()
+        })
+        .unwrap()
     }
 
     fn lab() -> Policy {
@@ -2180,8 +2194,12 @@ mod tests {
         let (p, _, seen) = start_audited(false, Limits::default(), None).await;
         let (port, got) = http_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
         let sid = SessionId::from("s-reference");
-        let cfg = NetworkCfg { mode: NetworkMode::Open, reference_hosts: vec![format!("127.0.0.1:{port}")],
-            allow_private: vec!["127.0.0.1".into()], ..NetworkCfg::default() };
+        let cfg = NetworkCfg {
+            mode: NetworkMode::Open,
+            reference_hosts: vec![format!("127.0.0.1:{port}")],
+            allow_private: vec!["127.0.0.1".into()],
+            ..NetworkCfg::default()
+        };
         let raw_grant = p.grant(&sid, Policy::new(&cfg).unwrap());
         let reference = p.grant_reference(&sid, &cfg).unwrap();
         assert_ne!(reference.url(), raw_grant.url());
@@ -2191,10 +2209,22 @@ mod tests {
         let denied = raw(p.port(), format!("GET {url} HTTP/1.1\r\n{}\r\n", auth(&raw_grant)).as_bytes()).await;
         assert_eq!(status(&denied), 403);
         assert!(!lock(&seen).last().unwrap().1.allowed);
-        let post = raw(p.port(), format!("POST {url} HTTP/1.1\r\n{}Content-Length: 0\r\n\r\n", auth(&reference.grant)).as_bytes()).await;
+        let post = raw(
+            p.port(),
+            format!("POST {url} HTTP/1.1\r\n{}Content-Length: 0\r\n\r\n", auth(&reference.grant)).as_bytes(),
+        )
+        .await;
         assert_eq!(status(&post), 400);
         assert!(!lock(&seen).last().unwrap().1.allowed);
-        let response = raw(p.port(), format!("GET {url} HTTP/1.1\r\n{}Authorization: secret\r\nCookie: secret\r\nReferer: secret\r\n\r\n", auth(&reference.grant)).as_bytes()).await;
+        let response = raw(
+            p.port(),
+            format!(
+                "GET {url} HTTP/1.1\r\n{}Authorization: secret\r\nCookie: secret\r\nReferer: secret\r\n\r\n",
+                auth(&reference.grant)
+            )
+            .as_bytes(),
+        )
+        .await;
         assert_eq!(status(&response), 200);
         let (who, decision) = lock(&seen).last().unwrap().clone();
         assert_eq!(who, Some(sid.clone()));

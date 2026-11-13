@@ -50,8 +50,12 @@ pub(super) fn pin(
     use std::os::unix::fs::OpenOptionsExt;
     let mut out: Vec<PinnedPath> = Vec::new();
     for path in writable.iter().chain(protected).chain(unreadable).chain(credentials).chain(git_dirs) {
-        if !writable.contains(path) && !protected.contains(path) && !git_dirs.contains(path) { continue; }
-        if out.iter().any(|p| &p.path == path) { continue; }
+        if !writable.contains(path) && !protected.contains(path) && !git_dirs.contains(path) {
+            continue;
+        }
+        if out.iter().any(|p| &p.path == path) {
+            continue;
+        }
         if !path.exists() {
             // A missing protection inside a writable area has no mountable source. Refuse rather
             // than promise a future-path exclusion that a bind-mount policy cannot implement.
@@ -60,11 +64,15 @@ pub(super) fn pin(
                 return Err(invalid(format!("Bubblewrap cannot protect the missing path {} inside a writable root. Create that protected path before starting the session, or use a read-only workspace.", path.display())));
             }
             if writable.contains(path) {
-                return Err(invalid(format!("Bubblewrap writable root {} must already exist. Create it before starting the session.", path.display())));
+                return Err(invalid(format!(
+                    "Bubblewrap writable root {} must already exist. Create it before starting the session.",
+                    path.display()
+                )));
             }
             continue;
         }
-        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+        let file =
+            std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
         let real = crate::files::real_path(file.as_fd())?;
         if &real != path {
             return Err(invalid(format!("Bubblewrap bind source {} changed while its descriptor was opened (now {}). Stop concurrent filesystem changes and retry.", path.display(), real.display())));
@@ -75,8 +83,11 @@ pub(super) fn pin(
 }
 
 fn source(sb: &Sandbox, path: &Path) -> Option<String> {
-    sb.linux_pins.iter().position(|p| p.path == path)
-        .and_then(|i| i.checked_add(10)).map(|fd| format!("/proc/self/fd/{fd}"))
+    sb.linux_pins
+        .iter()
+        .position(|p| p.path == path)
+        .and_then(|i| i.checked_add(10))
+        .map(|fd| format!("/proc/self/fd/{fd}"))
 }
 
 pub(super) fn preflight(cfg: &SandboxCfg, exec: &Path, linux: bool) -> Result<(), String> {
@@ -88,7 +99,10 @@ pub(super) fn preflight(cfg: &SandboxCfg, exec: &Path, linux: bool) -> Result<()
         return Err("Bubblewrap supports deny-all command networking only. Remove loopback_ports, loopback_all and unix_sockets; no host proxy bridge is implemented.".to_string());
     }
     if !exec.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) {
-        return Err(format!("{} is missing or not executable. Install bubblewrap; Loom will not run the command unconfined.", exec.display()));
+        return Err(format!(
+            "{} is missing or not executable. Install bubblewrap; Loom will not run the command unconfined.",
+            exec.display()
+        ));
     }
     Ok(())
 }
@@ -100,7 +114,9 @@ fn filter() -> io::Result<Vec<u8>> {
     } else if cfg!(target_arch = "aarch64") {
         0xc000_00b7_u32
     } else {
-        return Err(invalid("Bubblewrap seccomp supports x86_64 and aarch64 Linux only. Use a supported host.".to_string()));
+        return Err(invalid(
+            "Bubblewrap seccomp supports x86_64 and aarch64 Linux only. Use a supported host.".to_string(),
+        ));
     };
     // Classic BPF: load architecture, kill on a mismatch, then inspect syscall number.
     let mut code = vec![(0x20_u16, 0_u8, 0_u8, 4_u32), (0x15, 1, 0, arch), (0x06, 0, 0, 0x8000_0000), (0x20, 0, 0, 0)];
@@ -108,9 +124,19 @@ fn filter() -> io::Result<Vec<u8>> {
         // x32 uses the same audit architecture with different syscall numbers.
         code.extend([(0x45, 0, 1, 0x4000_0000), (0x06, 0, 0, 0x8000_0000)]);
     }
-    for nr in [libc::SYS_socket, libc::SYS_socketpair, libc::SYS_connect, libc::SYS_bind,
-        libc::SYS_listen, libc::SYS_accept, libc::SYS_accept4, libc::SYS_sendto, libc::SYS_sendmsg,
-        libc::SYS_sendmmsg, libc::SYS_io_uring_setup] {
+    for nr in [
+        libc::SYS_socket,
+        libc::SYS_socketpair,
+        libc::SYS_connect,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_accept,
+        libc::SYS_accept4,
+        libc::SYS_sendto,
+        libc::SYS_sendmsg,
+        libc::SYS_sendmmsg,
+        libc::SYS_io_uring_setup,
+    ] {
         code.extend([(0x15, 0, 1, nr as u32), (0x06, 0, 0, 0x0005_0000 | libc::EPERM as u32)]);
     }
     code.push((0x06, 0, 0, 0x7fff_0000));
@@ -140,7 +166,11 @@ pub(super) fn prepare(home: &Path) -> io::Result<PathBuf> {
         let path = dir.join(format!("network-deny-v1-{}.bpf", std::env::consts::ARCH));
         // The path lies in protected Loom home, not model-writable session temp. Rewrite atomically
         // so concurrent session construction never exposes a partial program.
-        let tmp = dir.join(format!(".network-{}-{}.bpf", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let tmp = dir.join(format!(
+            ".network-{}-{}.bpf",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
         let result = (|| {
             file.write_all(&bytes)?;
@@ -166,14 +196,47 @@ pub(super) fn command(sb: &Sandbox, script: &str) -> (String, Vec<String>) {
         launcher.push_str(&format!("exec {fd}<\"$1\" || exit 126; shift; "));
     }
     launcher.push_str("exec \"$@\"");
-    let mut args = vec!["--noprofile".to_string(), "--norc".to_string(), "-p".to_string(), "-c".to_string(), launcher, "loom-bwrap".to_string()];
+    let mut args = vec![
+        "--noprofile".to_string(),
+        "--norc".to_string(),
+        "-p".to_string(),
+        "-c".to_string(),
+        launcher,
+        "loom-bwrap".to_string(),
+    ];
     args.push(sb.linux_filter.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
     for pin in &sb.linux_pins {
         args.push(format!("/proc/{}/fd/{}", std::process::id(), pin.file.as_raw_fd()));
     }
-    args.extend([super::BWRAP, "--die-with-parent", "--new-session", "--unshare-all", "--unshare-user", "--disable-userns", "--cap-drop", "ALL",
-        "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp",
-        "--tmpfs", "/run", "--seccomp", "3"].into_iter().map(str::to_string));
+    args.extend(
+        [
+            super::BWRAP,
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-all",
+            "--unshare-user",
+            "--disable-userns",
+            "--cap-drop",
+            "ALL",
+            "--ro-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            "/var/tmp",
+            "--tmpfs",
+            "/run",
+            "--seccomp",
+            "3",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
     // Hide the whole original home before restoring scoped roots. This also hides credential stores
     // created after launch, rather than relying on a mount for every currently-existing secret file.
     let hidden_home = sb.home.as_ref().filter(|_| !sb.credentials.is_empty());
@@ -191,7 +254,9 @@ pub(super) fn command(sb: &Sandbox, script: &str) -> (String, Vec<String>) {
         }
     }
     for path in sb.protected.iter().chain(&sb.git_dirs) {
-        if under(path, &sb.loom_home) && !under(path, &sb.workspace) { continue; }
+        if under(path, &sb.loom_home) && !under(path, &sb.workspace) {
+            continue;
+        }
         bind(&mut args, "--ro-bind", path);
     }
     if !sb.inside_tmp_protected().iter().any(|p| under(&sb.tmp_dir, p)) {
@@ -205,7 +270,9 @@ pub(super) fn command(sb: &Sandbox, script: &str) -> (String, Vec<String>) {
         if !restored && (under(path, &sb.loom_home) || hidden_home.is_some_and(|home| under(path, home))) {
             continue;
         }
-        if under(path, &sb.workspace.join(".loom")) { continue; }
+        if under(path, &sb.workspace.join(".loom")) {
+            continue;
+        }
         if path.is_dir() {
             args.extend(["--tmpfs".to_string(), path.display().to_string()]);
         } else if path.exists() {
@@ -213,8 +280,12 @@ pub(super) fn command(sb: &Sandbox, script: &str) -> (String, Vec<String>) {
         }
     }
     let workspace_state = sb.workspace.join(".loom");
-    args.extend(["--tmpfs".to_string(), workspace_state.display().to_string(),
-        "--remount-ro".to_string(), workspace_state.display().to_string()]);
+    args.extend([
+        "--tmpfs".to_string(),
+        workspace_state.display().to_string(),
+        "--remount-ro".to_string(),
+        workspace_state.display().to_string(),
+    ]);
     // Only these top mounts become read-only; the scoped writable workspace/temp bind mounts below
     // them keep their own access modes.
     for path in hidden_home.into_iter().chain(std::iter::once(&sb.loom_home)) {
@@ -228,9 +299,19 @@ pub(super) fn command(sb: &Sandbox, script: &str) -> (String, Vec<String>) {
         close_sources.push_str(&format!("exec {fd}<&-; "));
     }
     close_sources.push_str("exec /bin/bash -c \"$1\" \"${@:2}\"");
-    args.extend(["--chdir".to_string(), sb.workspace.display().to_string(), "--".to_string(),
-        "/bin/bash".to_string(), "--noprofile".to_string(), "--norc".to_string(), "-p".to_string(),
-        "-c".to_string(), close_sources, "loom-confined-close".to_string(), script.to_string()]);
+    args.extend([
+        "--chdir".to_string(),
+        sb.workspace.display().to_string(),
+        "--".to_string(),
+        "/bin/bash".to_string(),
+        "--noprofile".to_string(),
+        "--norc".to_string(),
+        "-p".to_string(),
+        "-c".to_string(),
+        close_sources,
+        "loom-confined-close".to_string(),
+        script.to_string(),
+    ]);
     ("/bin/bash".to_string(), args)
 }
 
@@ -274,13 +355,21 @@ mod tests {
         let ws = dir.path().join("ws");
         let home = dir.path().join("home");
         let tmp = dir.path().join("tmp");
-        for p in [&ws, &home, &tmp] { std::fs::create_dir(p).unwrap(); }
-        let cfg = SandboxCfg { mode: SandboxMode::None, protect_credentials: false,
-            env_pass: vec!["LD_PRELOAD".into()], ..SandboxCfg::default() };
+        for p in [&ws, &home, &tmp] {
+            std::fs::create_dir(p).unwrap();
+        }
+        let cfg = SandboxCfg {
+            mode: SandboxMode::None,
+            protect_credentials: false,
+            env_pass: vec!["LD_PRELOAD".into()],
+            ..SandboxCfg::default()
+        };
         let mut sb = Sandbox::new(&cfg, &ws, &tmp, &home, None).unwrap();
         sb.mode = SandboxMode::Bubblewrap;
         let parent = ["BASH_ENV", "ENV", "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "BASH_FUNC_exec%%"]
-            .into_iter().map(|key| (key.to_string(), "untrusted".to_string())).collect();
+            .into_iter()
+            .map(|key| (key.to_string(), "untrusted".to_string()))
+            .collect();
         let env = sb.env(&parent);
         assert!(!env.contains_key("LD_PRELOAD"));
         assert!(!env.contains_key("BASH_ENV"));
@@ -294,12 +383,17 @@ mod tests {
         let ws = dir.path().join("ws");
         let tmp = dir.path().join("tmp");
         let home = dir.path().join("home");
-        for p in [&ws, &tmp, &home] { std::fs::create_dir(p).unwrap(); }
+        for p in [&ws, &tmp, &home] {
+            std::fs::create_dir(p).unwrap();
+        }
         let ws = ws.canonicalize().unwrap();
         let tmp = tmp.canonicalize().unwrap();
         let home = home.canonicalize().unwrap();
-        let cfg = SandboxCfg { protect_credentials: false, protected_paths: vec![ws.display().to_string()],
-            ..SandboxCfg::default() };
+        let cfg = SandboxCfg {
+            protect_credentials: false,
+            protected_paths: vec![ws.display().to_string()],
+            ..SandboxCfg::default()
+        };
         let mut sb = Sandbox::new(&cfg, &ws, &tmp, &home, None).unwrap();
         sb.mode = SandboxMode::Bubblewrap;
         sb.linux_filter = Some(home.join("sandbox/filter.bpf"));
@@ -309,8 +403,12 @@ mod tests {
         assert!(args.iter().any(|x| x == "--unshare-all"));
         assert!(args.windows(2).any(|w| w == ["--seccomp", "3"]));
         assert!(!args.windows(3).any(|w| w == ["--bind", ws.to_str().unwrap(), ws.to_str().unwrap()]));
-        assert!(args.windows(3).any(|w| w[0] == "--ro-bind" && w[1].starts_with("/proc/") && w[2] == ws.to_str().unwrap()));
-        assert!(args.windows(3).any(|w| w[0] == "--bind" && w[1].starts_with("/proc/") && w[2] == tmp.to_str().unwrap()));
+        assert!(args
+            .windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[1].starts_with("/proc/") && w[2] == ws.to_str().unwrap()));
+        assert!(args
+            .windows(3)
+            .any(|w| w[0] == "--bind" && w[1].starts_with("/proc/") && w[2] == tmp.to_str().unwrap()));
         assert_eq!(args.last().unwrap(), "printf 'literal $()'; true");
     }
 
@@ -335,8 +433,13 @@ mod native_tests {
     use std::process::Command;
 
     fn required_launcher() -> bool {
-        if Path::new(super::super::BWRAP).exists() { return true; }
-        assert!(std::env::var_os("LOOM_BWRAP_REQUIRED").is_none(), "Linux CI requires /usr/bin/bwrap; install bubblewrap");
+        if Path::new(super::super::BWRAP).exists() {
+            return true;
+        }
+        assert!(
+            std::env::var_os("LOOM_BWRAP_REQUIRED").is_none(),
+            "Linux CI requires /usr/bin/bwrap; install bubblewrap"
+        );
         false
     }
 
@@ -348,11 +451,16 @@ mod native_tests {
         let ws = root.path().join("ws");
         let home = root.path().join("home");
         let tmp = home.join("sessions/test/tmp");
-        for path in [ws.join(".loom"), tmp.clone(), ws.join(".git/hooks")] { std::fs::create_dir_all(path).unwrap(); }
+        for path in [ws.join(".loom"), tmp.clone(), ws.join(".git/hooks")] {
+            std::fs::create_dir_all(path).unwrap();
+        }
         std::fs::write(ws.join(".git/config"), "original").unwrap();
-        let cfg = SandboxCfg { mode: SandboxMode::Bubblewrap, protect_credentials: false,
+        let cfg = SandboxCfg {
+            mode: SandboxMode::Bubblewrap,
+            protect_credentials: false,
             protected_paths: if readonly { vec![ws.display().to_string()] } else { Vec::new() },
-            ..SandboxCfg::default() };
+            ..SandboxCfg::default()
+        };
         let sb = Sandbox::new(&cfg, &ws, &tmp, &home, None).unwrap();
         (root, sb, ws)
     }
@@ -364,14 +472,17 @@ mod native_tests {
 
     #[test]
     fn bubblewrap_native_writable_readonly_temp_git_and_network_are_enforced() {
-        if !required_launcher() { return; }
+        if !required_launcher() {
+            return;
+        }
         let (root, sb, ws) = fixture(false);
         let out = run(&sb, "echo source > source.txt; echo own > \"$TMPDIR/own\"; echo private > /tmp/loom-private; test -r source.txt");
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert!(ws.join("source.txt").exists());
         let hostile_init = root.path().join("hostile-bash-env");
         let host_canary = root.path().join("host-canary");
-        std::fs::write(&hostile_init, format!("echo executed-before-confinement > '{}'", host_canary.display())).unwrap();
+        std::fs::write(&hostile_init, format!("echo executed-before-confinement > '{}'", host_canary.display()))
+            .unwrap();
         let (program, args) = sb.command("echo safe > source.txt");
         let out = Command::new(program).args(args).env("BASH_ENV", &hostile_init).output().unwrap();
         assert!(out.status.success());
@@ -386,7 +497,12 @@ mod native_tests {
         assert_eq!(std::fs::read_to_string(ws.join(".git/config")).unwrap(), "original");
         let exe = std::env::current_exe().unwrap().display().to_string().replace('\'', "'\"'\"'");
         let out = run(&sb, &format!("LOOM_BWRAP_SOCKET_PROBE=1 '{exe}' --ignored --exact sandbox::linux::native_tests::socket_probe --nocapture"));
-        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
         let (_root, readonly, _ws) = fixture(true);
         assert!(!run(&readonly, "echo forbidden > source.txt").status.success());
         assert!(run(&readonly, "echo own > \"$TMPDIR/own\"").status.success());
@@ -397,12 +513,17 @@ mod native_tests {
     fn socket_probe() {
         assert!(std::env::var_os("LOOM_BWRAP_SOCKET_PROBE").is_some());
         assert!(!Path::new("/proc/self/fd/10").exists(), "old-mount source fd must be closed before target execution");
-        assert!(std::fs::File::open("/proc/1/fd/10").is_err(), "PID namespace reaper must not expose an old-mount source fd");
+        assert!(
+            std::fs::File::open("/proc/1/fd/10").is_err(),
+            "PID namespace reaper must not expose an old-mount source fd"
+        );
         for domain in [libc::AF_INET, libc::AF_INET6, libc::AF_UNIX] {
             // SAFETY: socket has no pointer arguments. Any unexpected descriptor is closed below.
             let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
             let error = io::Error::last_os_error();
-            if fd >= 0 { unsafe { libc::close(fd) }; }
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+            }
             assert_eq!(fd, -1, "socket domain {domain} must be denied");
             assert_eq!(error.raw_os_error(), Some(libc::EPERM));
         }
@@ -410,7 +531,9 @@ mod native_tests {
 
     #[test]
     fn bubblewrap_native_pins_sources_when_workspace_or_temp_ancestor_is_replaced() {
-        if !required_launcher() { return; }
+        if !required_launcher() {
+            return;
+        }
         let (root, sb, ws) = fixture(false);
         let outside = root.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
@@ -430,7 +553,9 @@ mod native_tests {
 
     #[tokio::test]
     async fn bubblewrap_native_works_with_the_tracked_process_wrapper() {
-        if !required_launcher() { return; }
+        if !required_launcher() {
+            return;
+        }
         let (root, sb, ws) = fixture(false);
         let spec = crate::proc::Spawn {
             script: "echo tracked; exit 0".to_string(),
@@ -440,30 +565,44 @@ mod native_tests {
             exit_path: root.path().join("command.exit"),
         };
         let mut running = crate::proc::spawn(&sb, &spec).unwrap();
-        let end = running.wait(&tokio_util::sync::CancellationToken::new(),
-            Some(std::time::Duration::from_secs(10)), 1_000_000).await;
-        assert_eq!(end, crate::proc::WaitEnd::Ended(crate::proc::Ended::Exit(0)),
-            "{}", String::from_utf8_lossy(&running.read_output(0).unwrap()));
+        let end = running
+            .wait(&tokio_util::sync::CancellationToken::new(), Some(std::time::Duration::from_secs(10)), 1_000_000)
+            .await;
+        assert_eq!(
+            end,
+            crate::proc::WaitEnd::Ended(crate::proc::Ended::Exit(0)),
+            "{}",
+            String::from_utf8_lossy(&running.read_output(0).unwrap())
+        );
         assert!(String::from_utf8_lossy(&running.read_output(0).unwrap()).contains("tracked"));
     }
 
     #[test]
     fn bubblewrap_native_hides_credentials_and_oracle_keys_created_after_construction() {
-        if !required_launcher() { return; }
+        if !required_launcher() {
+            return;
+        }
         let executable = std::env::current_exe().unwrap();
         let root = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
         let user_home = root.path().join("user-home");
         let ws = user_home.join("project");
         let home = user_home.join("loom-state");
         let tmp = home.join("sessions/test/tmp");
-        for path in [ws.join(".loom"), tmp.clone()] { std::fs::create_dir_all(path).unwrap(); }
+        for path in [ws.join(".loom"), tmp.clone()] {
+            std::fs::create_dir_all(path).unwrap();
+        }
         let cfg = SandboxCfg { mode: SandboxMode::Bubblewrap, ..SandboxCfg::default() };
         let sb = Sandbox::with_home(&cfg, &ws, &tmp, &home, None, Some(user_home.clone())).unwrap();
         for path in [user_home.join(".aws/credentials"), ws.join(".loom/oracle-secrets/key"), home.join("token")] {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "host-secret-created-after-policy").unwrap();
             let out = run(&sb, &format!("test ! -r '{}'", path.display()));
-            assert!(out.status.success(), "late-created {} was readable: {}", path.display(), String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "late-created {} was readable: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         assert!(run(&sb, "echo source > source.txt; echo tmp > \"$TMPDIR/own\"").status.success());
         assert!(ws.join("source.txt").exists());
