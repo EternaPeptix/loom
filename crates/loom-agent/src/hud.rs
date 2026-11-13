@@ -21,6 +21,14 @@
 //! Mission state (from the ledger — the ledger tools change it):
 //! {LedgerState::brief(&input.brief)}
 //!
+//! Where the work stands:
+//! - Established: 2 (c1, c3); latest c3: the parser drops the last token
+//! - Ruled out with evidence: 1 (c2)
+//! - Set aside without evidence: 1 (x1) — set aside is not refuted; a different attempt can reopen it
+//! - Open leads: 2 (p2, c4)
+//! - Surfaces: 1 of 3 closed; untested: as-1, as-2
+//! - Attempts run in this session: 7; ruled out with evidence: 1. A failed attempt rules out that attempt, not the approach.
+//!
 //! Outputs you have not fully looked at ({n}):
 //! - out:7f3a9c1e (bash): 18412 lines, 17612 never shown — lines 401-18012
 //!
@@ -52,6 +60,11 @@
 //!   verifier is an open obligation, else `Finish: conclude the goal first — …` while the goal-met
 //!   goal is set, its goal-met claim is not concluded and the operator has not released the mission. The
 //!   goal status itself is a line of the mission state.
+//! - Where the work stands: `frontier::render` of the frontier of the ledger (`frontier::frontier(ledger,
+//!   now_ms)` with `attempts_run` taken from `input.records`), right after the mission state and before the
+//!   security sections; shown to leads and children alike (a child reads the shared mission ledger). Omitted
+//!   when it has nothing to show. Security records appear by id only, never by their free-form text. See
+//!   the `frontier` module for the lines.
 //! - Typed security state: bounded mandatory coverage, unacknowledged routes unlocked by currently
 //!   live credentials/footholds, hypothesis status/priority and attempt counts. Render only record IDs
 //!   and counts, never locators, principals, secrets, free-form hypothesis/attempt text or conditions.
@@ -81,7 +94,7 @@
 //! (epoch, a leap day, end of year); child budget variants and floor at 0; stale de-duplication and
 //! the re-read rule; determinism.
 
-use crate::texts;
+use crate::{frontier, texts};
 use loom_core::event::{Budget, Event, Record, ToolClass, ToolStatus, META_PATH};
 use loom_core::ledger::{BriefOpts, LedgerState, ObligationKind};
 use loom_core::observe::{self, StaleKind};
@@ -136,6 +149,11 @@ pub fn render(input: &HudInput<'_>) -> String {
         if !brief.trim().is_empty() {
             sections
                 .push(format!("Mission state (from the ledger — the ledger tools change it):\n{}", brief.trim_end()));
+        }
+        let mut f = frontier::frontier(ledger, input.now_ms);
+        f.attempts_run = frontier::attempts_run(input.records);
+        if let Some(block) = frontier::render(&f) {
+            sections.push(block);
         }
         security_sections(&mut sections, &ledger.security, input.now_ms);
         if !input.is_child {
@@ -300,7 +318,7 @@ fn push_list(sections: &mut Vec<String>, title: &str, suffix: &str, entries: Vec
 }
 
 /// `s` on one line, cut to `MAX_LINE` characters with a trailing `…`.
-fn one_line(s: &str) -> String {
+pub(crate) fn one_line(s: &str) -> String {
     let flat: String = s.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
     cut(&flat, MAX_LINE)
 }
@@ -548,7 +566,7 @@ mod tests {
         let mut i = input(EMPTY);
         i.ledger = Some(&l);
         let expected = format!(
-            "Now: 1970-01-01 00:00 UTC\n\nMission state (from the ledger — the ledger tools change it):\n{}\n\nFinish: conclude the goal first — record a run that shows it is met, or that it cannot be met as stated, then finish.\n\nWaiting on the operator (1):\n- q2: Which branch should this target?",
+            "Now: 1970-01-01 00:00 UTC\n\nMission state (from the ledger — the ledger tools change it):\n{}\n\nWhere the work stands:\n- Open leads: 1 (p1)\n\nFinish: conclude the goal first — record a run that shows it is met, or that it cannot be met as stated, then finish.\n\nWaiting on the operator (1):\n- q2: Which branch should this target?",
             l.brief(&BriefOpts::default())
         );
         assert_eq!(render(&i), expected);
@@ -806,6 +824,8 @@ mod tests {
         let expected = format!(
             "Now: 1970-01-01 00:00 UTC\n\n\
 Mission state (from the ledger — the ledger tools change it):\n{}\n\n\
+Where the work stands:\n- Open leads: 1 (p1)\n\
+- Attempts run in this session: 2; ruled out with evidence: 0. A failed attempt rules out that attempt, not the approach.\n\n\
 Outputs you have not fully looked at (1):\n\
 - out:dd00000000000000 (bash): 50 lines, 40 never shown — lines 11-50\n\n\
 Out of date (2):\n\
@@ -816,6 +836,80 @@ Waiting on the operator (1):\n- q2: Which branch should this target?",
             l.brief(&BriefOpts::default())
         );
         assert_eq!(render(&i), expected);
+    }
+
+    #[test]
+    fn frontier_block_sits_after_the_mission_state_for_leads_and_children() {
+        use loom_core::ledger::{Claim, ClaimStatus};
+        let mut l = ledger();
+        l.claims = vec![Claim {
+            id: "c1".into(),
+            text: "the parser drops the last token".into(),
+            status: ClaimStatus::Supported,
+            note: String::new(),
+            evidence: vec!["e1".into()],
+        }];
+        let recs = vec![result(1, "a", "bash", ToolClass::Exec, None, false, json!({}))];
+        for is_child in [false, true] {
+            let mut i = input(&recs);
+            i.ledger = Some(&l);
+            i.is_child = is_child;
+            let text = render(&i);
+            let want = "\n\nWhere the work stands:\n- Established: 1 (c1); latest c1: the parser drops the last token\n- Open leads: 1 (p1)\n- Attempts run in this session: 1; ruled out with evidence: 0. A failed attempt rules out that attempt, not the approach.";
+            assert!(text.contains(want), "{text}");
+            let mission = text.find("Mission state").unwrap_or(usize::MAX);
+            let block = text.find("Where the work stands").unwrap_or(0);
+            let waiting = text.find("Waiting on the operator").unwrap_or(0);
+            assert!(mission < block && block < waiting, "{text}");
+        }
+    }
+
+    #[test]
+    fn frontier_block_is_absent_without_anything_to_show() {
+        let empty = LedgerState::default();
+        let mut i = input(EMPTY);
+        i.ledger = Some(&empty);
+        assert_eq!(render(&i), "Now: 1970-01-01 00:00 UTC");
+        // No ledger: no block, even with attempts in the records.
+        let recs = vec![result(1, "a", "bash", ToolClass::Exec, None, false, json!({}))];
+        assert!(!render(&input(&recs)).contains("Where the work stands"));
+        // A ledger whose only content is a done plan step has nothing open to show.
+        let mut done = ledger();
+        done.plan[0].status = StepStatus::Done;
+        i.ledger = Some(&done);
+        assert!(!render(&i).contains("Where the work stands"));
+    }
+
+    #[test]
+    fn frontier_lists_are_capped_and_security_text_stays_out() {
+        use loom_core::security_state::{Asset, AssetKind, CoverageDisposition};
+        let mut l = LedgerState::default();
+        for k in 0..10 {
+            let id = format!("as-{k:02}");
+            l.security.assets.insert(
+                id.clone(),
+                Asset {
+                    id,
+                    kind: AssetKind::Host,
+                    locator: "SECRET locator".into(),
+                    evidence: vec![],
+                    mandatory: true,
+                    parent: None,
+                    coverage: CoverageDisposition::Untested,
+                    n: k,
+                },
+            );
+        }
+        let mut i = input(EMPTY);
+        i.ledger = Some(&l);
+        let text = render(&i);
+        assert!(
+            text.contains(
+                "Where the work stands:\n- Surfaces: 0 of 10 closed; untested: as-00, as-01, as-02, as-03, as-04, as-05, as-06, as-07, …"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("SECRET"), "{text}");
     }
 
     #[test]

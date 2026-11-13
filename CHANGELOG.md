@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Morale: keeping a model on a hard task
+
+- The step block gains `Where the work stands:`, read from the ledger alone: results established, what is
+  ruled out with evidence, what is only set aside (a dead end is not a refutation), open leads, security
+  surfaces closed and untested, and the attempts run in this session. Security records appear by id only.
+  New module `loom-agent::frontier` (`frontier`, `attempts_run`, `render`, `directions`).
+- `claim_update` to `supported` adds one line, `Established: {id}. Results established in this mission so
+  far: {n} ({ids}).`, so a banked result stays in view.
+- New pack key `solvable` (default false). In a solvable pack the system prompt says the operator built the mission to be solved, and `conclude` with status `unreachable` is refused with a pointer to `report_blocker`. The `ctf` pack sets it; `core`, `vr` and `redteam` do not.
+- A refused `finish` (goal not concluded) now lists the routes the ledger still shows open, from
+  `frontier::directions`, and says to pick one and run it. When the ledger shows none it asks for three
+  untried approaches, then names the role's real ways out (`ask_for`, `agent_spawn`, `report_blocker`).
+  `conclude` unreachable with open plan steps adds that those steps are routes still open.
+- A re-weave now leaves a map, not a chronicle of failures: the resume brief adds the frontier block (when the
+  session has a ledger) and says a failed attempt rules out that attempt, not the approach, and the digest
+  request asks for Established / Ruled out / Tried, not ruled out / Open leads / Next instead of a list of leads.
+- New tools for a stuck model, neither a finish nor a claim that the work cannot be done. `ask_for`
+  (lead: `core` `lead`, `vr` `researcher`, `ctf` `dispatcher`) asks the operator for budget, a tool, a
+  hint or direction without ending the turn. `hand_off` (`core` `worker`, `vr` `scout`, the `ctf`
+  solvers) returns an assignment unfinished with its state, open leads and an ask; it settles the child
+  as `returned`, and an ask for `stronger_model` selects the role's `escalation_model` next time.
+  `ctf` `binary_solver` now has 26 tools. Installed packs under `~/.loom/packs` are not updated by an upgrade.
+
 ### Watched jobs, agents in their own copies, and attempts
 
 - `bash` takes `wake_on` (a regular expression) and `wake_every_s`. The background job the call
@@ -32,9 +55,15 @@
 
 ### Domain packs and evaluation
 
-- Added opt-in CTF and Redteam packs with specialist tool surfaces (at most 18 per role), bounded
-  epochs, credential-gated lateral assignments, observers and operator-contract judges. Existing
-  installed packs and running session prefixes are not automatically replaced.
+- Added opt-in CTF and Redteam packs with specialist tool surfaces (CTF roles at most 26 per role,
+  Redteam at most 18), bounded epochs, credential-gated lateral assignments, observers and
+  operator-contract judges. Existing installed packs and running session prefixes are not
+  automatically replaced.
+- The `ctf` dispatcher gained `grep`, `glob`, `wait`, `attempt` and `agent_adopt`; `solver` gained
+  `grep`, `glob` and `wait`; `web_solver`, `binary_solver` and `crypto_solver` gained `edit`, `grep`,
+  `glob` and `wait`, and `binary_solver`/`crypto_solver` also gained the PTY tools
+  (`pty_open`/`pty_exec`/`pty_close`); `web_solver` also gained `job_wait`. Packs installed under
+  `~/.loom/packs` are not updated by an upgrade: replace an installed `ctf` with the shipped one.
 - Added a paired qualification protocol and a JSONL analyzer that retains censored failures, unknown
   usage and pairing errors. It performs no model/target calls and claims no benchmark improvement.
 

@@ -2,7 +2,7 @@
 
 Opt-in roles for authorized local challenges and scoped CTF services. The dispatcher has four direct
 execution starts; solver roles have 35-step slices. Web/binary/crypto roles keep tools relevant to
-their work (at most 18 per role). An observer returns bounded recommendations to the dispatcher, which
+their work (at most 26 per role). An observer returns bounded recommendations to the dispatcher, which
 relays them to active solvers. Profile diversity is operator configured; no cache hit or quality gain
 is assumed.
 
@@ -26,3 +26,5 @@ authenticated ledger review capabilities; filesystem read-only does not mean the
 External tools such as rizin/pdg, GDB/Python, pwntools or z3 are optional operator prerequisites for
 the relevant challenge; Loom does not install them. See [tool limits](../../docs/SECURITY-TOOLS.md)
 and the [evaluation protocol](../../docs/SECURITY-EVAL.md) before making performance claims.
+
+The pack is marked `solvable`, which tells roles the challenge was built to be solved and refuses `conclude` unreachable; remove the key for targets that are not solvable by construction.

@@ -1,4 +1,4 @@
-//! Tools that end a turn or a session: `finish`, `verdict`, `ask_user`, `report_blocker`, `wait`.
+//! Tools that end a turn or a session: `finish`, `verdict`, `ask_user`, `ask_for`, `hand_off`, `report_blocker`, `wait`.
 //!
 //! CONTRACT.
 //!
@@ -42,9 +42,10 @@
 //! 1. `S.ledger()`. The goal-met pre-gate: when the role's termination is `Explicit` and a goal is set whose
 //!    goal-met claim is `None` or `Open` and the operator has not released the mission
 //!    (`gate::goal_unconcluded`), finish is refused in this step: a `harness_note{Nudge}` and an error with
-//!    `texts::finish_unavailable` (conclude when a run shows the goal met or it cannot be met as stated;
-//!    otherwise note where you are and take the next step; `report_blocker` for what only the operator can
-//!    supply; naming only tools the role has). No finish is recorded, no verifier is started, no inbox item
+//!    `texts::finish_unavailable(&FinishTools, &directions)`: the routes the ledger still shows open
+//!    (`frontier::directions(&frontier(ledger, now), 8)`) with "pick one and run it", or, when there are
+//!    none, a demand to name three untried approaches; then what to do when stuck (`ask_for`, `agent_spawn`,
+//!    `report_blocker`) and `conclude` once a run shows the goal met; naming only tools the role has). No finish is recorded, no verifier is started, no inbox item
 //!    is opened, no effect is set. A mission without a goal, and a role with termination `Free`, are not gated.
 //! 2. Open objections are settled (see Objections), then `gate::check_finish_lead(&state, answer)`; `Err(text)`
 //!    -> error `text`.
@@ -87,8 +88,13 @@
 //! `check_finish_lead` refuses finish.
 //!
 //! ## `conclude` (lead)
-//! `status` `met` | `unreachable`, `note`, `evidence`. Refused in a child session. `unreachable` is refused,
-//! with a sentence listing them, while a plan step is open. Writes `GoalMetSet { Supported | Refuted, note,
+//! `status` `met` | `unreachable`, `note`, `evidence`. Refused in a child session. In a solvable pack
+//! (`role.solvable`) `unreachable` is refused first of all, nothing recorded, with
+//! `texts::conclude_unreachable_refused(has report_blocker)` followed by `texts::open_routes_block` of the
+//! frontier's directions: the operator built the mission to be solved, so not having found the way is not a
+//! finding. `met`, the operator's `release` and `report_blocker` are unaffected. Otherwise `unreachable` is
+//! refused, with a sentence listing them and `These are routes still open; run one of them.`, while a plan
+//! step is open. Writes `GoalMetSet { Supported | Refuted, note,
 //! evidence }`; the ledger's own rules refuse a missing goal, a blank note, evidence that is missing,
 //! unattested, not supporting or static only, and a repeat. Output: ok, outcome `goal concluded: ...`, saying
 //! that `finish` may now be called.
@@ -130,6 +136,21 @@
 //! - not blocking: no effect; ok, outcome `asked`, message `The question is in the operator's inbox.
 //!   The answer will arrive as a message. Meanwhile: {meanwhile}`
 //!
+//! ## `ask_for` (lead)
+//! `kind` (`budget`|`tool`|`hint`|`direction`), `what`, `why`, `meanwhile`, each non-blank. Refused in a
+//! child session (`texts::ask_for_in_child`; names `hand_off` only when the role has it). The non-blocking
+//! `ask_user` path: `QuestionAsk { text: texts::ask_for_question, blocking: false }` (when there is a journal)
+//! and a non-blocking `Question` inbox item; no effect, the turn does not end. For `budget` the inbox item
+//! also says how the operator grants it (`texts::ask_for_budget_route`). An earlier question of the same kind
+//! that is still unanswered refuses a second (`texts::ask_for_already`); nothing is recorded.
+//!
+//! ## `hand_off` (child)
+//! `state`, `leads` (1 to 8 non-blank), `ask` (`fresh_eyes`|`stronger_model`|`hint`|`more_steps`), `why`.
+//! Refused in a lead session (`texts::hand_off_in_root`) and, like `finish`, while a job or child agent of the
+//! session is running (`running_refusal`). Settles the child as `Returned` with `texts::hand_off_report` and
+//! payload `{"handed_off": {"ask": ask}}`; it delivers no result, so no quotes are asked for. The runtime
+//! escalates the role's next assignment after `ask: stronger_model`, as after a failed child.
+//!
 //! ## `report_blocker`
 //! `what`, `tried`, `needs` must each contain non-whitespace. Text:
 //! `Blocked ({class}): {what}\nTried: {tried}\nNeeds: {needs}`.
@@ -166,7 +187,7 @@
 //! count restarting at an accepted finish only, an answered inbox item changing nothing, the goal-met
 //! pre-gate, objections settled by new execution evidence, an operator release, verifier ending without a
 //! verdict and spawn failure (retried, then held with a notice, no inbox item), shutdown and cancellation
-//! (error, nothing recorded); `conclude` - met, unreachable with and without open plan steps, a child;
+//! (error, nothing recorded); `conclude` - met, unreachable with and without open plan steps, unreachable refused in a solvable pack (with and without `report_blocker`), a child;
 //! `verdict` — each refusal, the settle effect and payload; `ask_user` — blocking and not, child
 //! refusal, missing `meanwhile`, ledger question recorded and referenced; `report_blocker` — child
 //! and lead; `wait` — nothing running, a running job, a running child.
@@ -174,6 +195,7 @@
 use super::{
     Delivery, Effect, Settlement, Shared, SpawnReq, Workspace, MAX_FINISH_REJECTIONS, REPORT_MAX_CHARS, SHUTTING_DOWN,
 };
+use crate::frontier;
 use crate::gate::{self, Quote, ReportInput, VerifiedQuote};
 use crate::pack::RoleDef;
 use crate::texts;
@@ -197,6 +219,8 @@ use std::sync::Arc;
 pub struct Finish(pub Arc<Shared>);
 pub struct Verdict(pub Arc<Shared>);
 pub struct AskUser(pub Arc<Shared>);
+pub struct AskFor(pub Arc<Shared>);
+pub struct HandOff(pub Arc<Shared>);
 pub struct ReportBlocker(pub Arc<Shared>);
 pub struct Wait(pub Arc<Shared>);
 pub struct Conclude(pub Arc<Shared>);
@@ -565,31 +589,6 @@ impl Finish {
         ToolOutput::ok("delivered", Body::Message("Your result was delivered. This session is finished.".into()))
     }
 
-    /// What this session still has running: its background jobs, and its child agents.
-    async fn running_work(&self, ctx: &ToolCtx) -> (Vec<String>, Vec<String>) {
-        let s = &self.0;
-        let jobs = ctx
-            .jobs
-            .list()
-            .await
-            .into_iter()
-            .filter(|j| j.state == JobState::Running)
-            .map(|j| {
-                let command = j.command.split_whitespace().collect::<Vec<_>>().join(" ");
-                format!("job {} ({})", j.id, cut_chars(&command, 60))
-            })
-            .collect();
-        let agents = s
-            .orch
-            .children(&s.session)
-            .await
-            .into_iter()
-            .filter(|c| c.running)
-            .map(|c| format!("agent {} ({})", c.id, c.role))
-            .collect();
-        (jobs, agents)
-    }
-
     /// The lead's result goes through the ledger gate and, when required, an independent verifier. When
     /// verification is required, the result is delivered as finished only after the verifier accepted it.
     async fn finish_lead(
@@ -610,7 +609,16 @@ impl Finish {
         // A role without `conclude` cannot make the conclusion the gate waits for, so it is not gated.
         let has = |tool: &str| s.role.tools.iter().any(|t| t == tool);
         if s.role.termination == Termination::Explicit && has("conclude") && gate::goal_unconcluded(&state) {
-            let text = texts::finish_unavailable(has("conclude"), has("report_blocker"));
+            let tools = texts::FinishTools {
+                conclude: true,
+                block: has("report_blocker"),
+                ask_for: has("ask_for"),
+                spawn: has("agent_spawn") && !s.role.may_spawn.is_empty(),
+                plan: has("plan") || has("step"),
+                solvable: s.role.solvable,
+            };
+            let directions = frontier::directions(&frontier::frontier(&state, loom_core::now_ms()), 8);
+            let text = texts::finish_unavailable(&tools, &directions);
             s.emit(Author::Harness, Event::HarnessNote { note: NoteKind::Nudge, text: text.clone() });
             return ToolOutput::error(text);
         }
@@ -868,13 +876,37 @@ impl Finish {
     }
 }
 
-/// The refusal of `finish` while work this session started is still running. It names only tools the
-/// role has, and says what to do about an agent that no tool of the session can end.
-fn running_refusal(role: &RoleDef, jobs: &[String], agents: &[String]) -> String {
-    let has = |tool: &str| role.tools.iter().any(|t| t == tool);
+/// What a session still has running: its background jobs, and its child agents.
+async fn running_work(s: &Shared, ctx: &ToolCtx) -> (Vec<String>, Vec<String>) {
+    let jobs = ctx
+        .jobs
+        .list()
+        .await
+        .into_iter()
+        .filter(|j| j.state == JobState::Running)
+        .map(|j| {
+            let command = j.command.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("job {} ({})", j.id, cut_chars(&command, 60))
+        })
+        .collect();
+    let agents = s
+        .orch
+        .children(&s.session)
+        .await
+        .into_iter()
+        .filter(|c| c.running)
+        .map(|c| format!("agent {} ({})", c.id, c.role))
+        .collect();
+    (jobs, agents)
+}
+
+/// The refusal of `finish` (or `hand_off`, named by `tool`) while work this session started is still running.
+/// It names only tools the role has, and says what to do about an agent that no tool of the session can end.
+fn running_refusal(tool: &str, role: &RoleDef, jobs: &[String], agents: &[String]) -> String {
+    let has = |name: &str| role.tools.iter().any(|t| t == name);
     let running: Vec<&str> = jobs.iter().chain(agents).map(String::as_str).collect();
     let mut text = format!(
-        "finish was refused: work started by this session is still running: {}. Nothing was delivered.",
+        "{tool} was refused: work started by this session is still running: {}. Nothing was delivered.",
         running.join(", ")
     );
     let mut ways: Vec<&str> = Vec::new();
@@ -888,16 +920,16 @@ fn running_refusal(role: &RoleDef, jobs: &[String], agents: &[String]) -> String
         ways.push("end an agent with `agent_stop`");
     }
     if ways.is_empty() {
-        text.push_str(" Call finish again when it has ended.");
+        text.push_str(&format!(" Call {tool} again when it has ended."));
     } else {
-        text.push_str(&format!(" To go on: {}; then call finish again.", ways.join(", or ")));
+        text.push_str(&format!(" To go on: {}; then call {tool} again.", ways.join(", or ")));
     }
     // A job ends before `job_kill` returns, so one reply can end it and deliver: a child whose budget is
     // used up has no step to spare.
     if !jobs.is_empty() && has("job_kill") {
-        text.push_str(
-            " `job_kill` and `finish` can go in the same reply: the calls run in order, so the job has ended when finish runs.",
-        );
+        text.push_str(&format!(
+            " `job_kill` and `{tool}` can go in the same reply: the calls run in order, so the job has ended when {tool} runs."
+        ));
     }
     if !agents.is_empty() {
         if has("agent_stop") {
@@ -1067,9 +1099,9 @@ impl Tool for Finish {
                 }
             }
         }
-        let (jobs, agents) = self.running_work(ctx).await;
+        let (jobs, agents) = running_work(&self.0, ctx).await;
         if !jobs.is_empty() || !agents.is_empty() {
-            return ToolOutput::error(running_refusal(&self.0.role, &jobs, &agents));
+            return ToolOutput::error(running_refusal("finish", &self.0.role, &jobs, &agents));
         }
         if self.0.is_child() {
             self.finish_child(ctx, answer, &verified, str_arg(args, "not_established"))
@@ -1109,6 +1141,15 @@ impl Tool for Conclude {
                 )
             }
         };
+        if status == GoalMetStatus::Refuted && s.role.solvable {
+            let has_blocker = s.role.tools.iter().any(|t| t == "report_blocker");
+            let mut text = texts::conclude_unreachable_refused(has_blocker);
+            if let Ok(state) = s.ledger() {
+                let directions = frontier::directions(&frontier::frontier(&state, loom_core::now_ms()), 8);
+                text.push_str(&texts::open_routes_block(&directions));
+            }
+            return ToolOutput::error(text);
+        }
         let state = match s.ledger() {
             Ok(st) => st,
             Err(e) => return ToolOutput::error(e),
@@ -1142,6 +1183,7 @@ impl Tool for Conclude {
                     }
                 }
                 text.push_str("\nClose each route with `step`: status done (say what showed it) or dropped (say why). Then call conclude again.");
+                text.push_str(texts::CONCLUDE_OPEN_ROUTES_TAIL);
                 return ToolOutput::error(text);
             }
         }
@@ -1253,7 +1295,7 @@ impl Tool for Verdict {
         }
 
         // The verifier's own checks end when it settles: one still running has not been seen to finish.
-        let (jobs, _) = Finish(s.clone()).running_work(ctx).await;
+        let (jobs, _) = running_work(s, ctx).await;
         if !jobs.is_empty() {
             return ToolOutput::error(running_verdict_refusal(&s.role, &jobs));
         }
@@ -1361,6 +1403,150 @@ impl Tool for AskUser {
                 meanwhile.unwrap_or_default()
             )),
         )
+    }
+}
+
+/// The wording of an `ask_for` kind: `budget`, `tool`, `hint` or `direction`.
+fn ask_kind_label(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "budget" => "more budget",
+        "tool" => "a tool",
+        "hint" => "a hint",
+        "direction" => "direction",
+        _ => return None,
+    })
+}
+
+/// A required, non-blank string argument, trimmed.
+fn text_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    str_arg(args, key).map(str::trim).filter(|t| !t.is_empty())
+}
+
+#[async_trait]
+impl Tool for AskFor {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "ask_for",
+            "Ask the operator for something you need: more budget, a tool, a hint or a direction. Asking for help is not a finish and does not stop the work. Use it when you are stuck, instead of trying to finish. Say exactly what you want and why, and say in `meanwhile` what you will do while you wait. The answer arrives as a message.",
+            ToolClass::Terminal,
+            &[
+                req("kind", "string", "What you are asking for.").one_of(&["budget", "tool", "hint", "direction"]),
+                req("what", "string", "Exactly what you want."),
+                req("why", "string", "Why you need it."),
+                req("meanwhile", "string", "What you will do while you wait."),
+            ],
+        )
+    }
+    async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        let s = &self.0;
+        let has = |tool: &str| s.role.tools.iter().any(|t| t == tool);
+        if s.is_child() {
+            return ToolOutput::error(texts::ask_for_in_child(has("hand_off")));
+        }
+        let Some((kind, label)) = str_arg(args, "kind").and_then(|k| Some((k, ask_kind_label(k)?))) else {
+            return ToolOutput::error("ask_for needs a `kind`: budget, tool, hint or direction.");
+        };
+        let mut fields: Vec<&str> = Vec::new();
+        for key in ["what", "why", "meanwhile"] {
+            match text_arg(args, key) {
+                Some(t) => fields.push(t),
+                None => return ToolOutput::error(format!("ask_for needs `{key}` to contain text.")),
+            }
+        }
+        let [what, why, _meanwhile] = fields[..] else {
+            return ToolOutput::error("ask_for needs `what`, `why` and `meanwhile`.");
+        };
+        // An earlier ask of this kind that is still unanswered: the operator has it already.
+        let prefix = texts::ask_for_question_prefix(label);
+        if let Ok(state) = s.ledger() {
+            if let Some(open) = state.questions.iter().find(|q| q.answer.is_none() && q.text.starts_with(&prefix)) {
+                return ToolOutput::error(texts::ask_for_already(label, Some(&open.id)));
+            }
+        }
+        let question = texts::ask_for_question(label, what, why);
+        let qid = match record_question(s, &question, false) {
+            Ok(q) => q,
+            Err(e) => return ToolOutput::error(e),
+        };
+        let shown = if kind == "budget" {
+            format!("{question}\n{}", texts::ask_for_budget_route(s.session.as_str()))
+        } else {
+            question
+        };
+        s.emit(Author::Harness, inbox(InboxKind::Question, shown, Vec::new(), false, ctx, qid.clone()));
+        ToolOutput::ok("asked", Body::Message(texts::ask_for_asked(label, qid.as_deref())))
+    }
+}
+
+/// How `hand_off`'s `ask` is worded in the report.
+fn hand_off_label(ask: &str) -> Option<&'static str> {
+    Some(match ask {
+        "fresh_eyes" => "a fresh agent to look at it",
+        "stronger_model" => "a stronger model",
+        "hint" => "a hint",
+        "more_steps" => "more steps",
+        _ => return None,
+    })
+}
+
+/// The most open leads a hand-off carries.
+const HAND_OFF_MAX_LEADS: usize = 8;
+
+#[async_trait]
+impl Tool for HandOff {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "hand_off",
+            "Return this assignment to the agent that gave it, unfinished. Use it when you are stuck and cannot make progress on your own in this assignment. It is not a failure report and does not say the work cannot be done. Give where the work stands and the open leads, so the next agent starts warm, and say what you ask for. This ends your session.",
+            ToolClass::Terminal,
+            &[
+                req("state", "string", "Where the work stands and what you learned."),
+                req("leads", "array", "Open leads the next agent should pursue, one per entry (1 to 8).").items("string"),
+                req("ask", "string", "What you ask for.")
+                    .one_of(&["fresh_eyes", "stronger_model", "hint", "more_steps"]),
+                req("why", "string", "Why you are asking for it."),
+            ],
+        )
+    }
+    async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        let s = &self.0;
+        let has = |tool: &str| s.role.tools.iter().any(|t| t == tool);
+        if !s.is_child() {
+            return ToolOutput::error(texts::hand_off_in_root(has("ask_for")));
+        }
+        let Some(state) = text_arg(args, "state") else {
+            return ToolOutput::error(
+                "hand_off needs `state` to contain text: where the work stands and what you learned.",
+            );
+        };
+        let leads: Vec<String> = match args.get("leads").and_then(Value::as_array) {
+            Some(a) => a.iter().map(|l| l.as_str().map(str::trim).unwrap_or_default().to_string()).collect(),
+            None => Vec::new(),
+        };
+        if leads.is_empty() || leads.len() > HAND_OFF_MAX_LEADS || leads.iter().any(String::is_empty) {
+            return ToolOutput::error(format!(
+                "hand_off needs `leads`: from 1 to {HAND_OFF_MAX_LEADS} open leads, each with text."
+            ));
+        }
+        let Some((ask, label)) = str_arg(args, "ask").and_then(|a| Some((a, hand_off_label(a)?))) else {
+            return ToolOutput::error("hand_off needs an `ask`: fresh_eyes, stronger_model, hint or more_steps.");
+        };
+        let Some(why) = text_arg(args, "why") else {
+            return ToolOutput::error("hand_off needs `why` to contain text.");
+        };
+        let (jobs, agents) = running_work(s, ctx).await;
+        if !jobs.is_empty() || !agents.is_empty() {
+            return ToolOutput::error(running_refusal("hand_off", &s.role, &jobs, &agents));
+        }
+        // The ask rides in the payload, which the settlement keeps: the runtime reads it to choose the
+        // profile of the role's next assignment (`stronger_model` escalates).
+        s.set_effect(Effect::Settle(Delivery {
+            outcome: ChildOutcome::Returned,
+            report: texts::hand_off_report(label, state, &leads, why),
+            full: None,
+            payload: json!({ "handed_off": { "ask": ask } }),
+        }));
+        ToolOutput::ok("handed off", Body::Message(texts::HAND_OFF_DELIVERED.into()))
     }
 }
 
@@ -2133,9 +2319,9 @@ mod tests {
             let res = r.call("finish", json!({"answer": "No result: the objective was not reached."})).await;
             assert_eq!(res.status, Status::Error, "{}", res.text);
             assert!(res.text.contains("finish is not available yet: the goal is not concluded"), "{}", res.text);
-            assert!(res.text.contains("Call conclude once a run shows the goal met"), "{}", res.text);
-            assert!(res.text.contains("record where you are with a note"), "{}", res.text);
-            assert!(res.text.contains("call report_blocker"), "{}", res.text);
+            assert!(res.text.contains("Call conclude once a run shows the goal met."), "{}", res.text);
+            assert!(res.text.contains("The mission ledger shows no open route."), "{}", res.text);
+            assert!(res.text.contains("report_blocker if something only the operator can supply"), "{}", res.text);
             let (items, notes) = drain(&r);
             assert!(items.is_empty(), "{items:?}");
             assert_eq!(notes.iter().filter(|(k, _)| *k == NoteKind::Nudge).count(), 1, "{notes:?}");
@@ -2193,6 +2379,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conclude_unreachable_is_refused_in_a_solvable_pack_and_met_is_not() {
+        let blocker = " If something only the operator can supply is missing, call report_blocker.";
+        let keep = " Otherwise keep working: pick an open route from the mission state and run it.";
+        let base = "conclude unreachable is not available in this mission: the operator set it up as solvable, so not having found the way is not a finding.";
+        for with_blocker in [true, false] {
+            let mut role = core_role("lead");
+            role.solvable = true;
+            if with_blocker {
+                if !role.tools.iter().any(|t| t == "report_blocker") {
+                    role.tools.push("report_blocker".into());
+                }
+            } else {
+                role.tools.retain(|t| t != "report_blocker");
+            }
+            let r = rig_with(role, false, true, loom_core::config::AgentsCfg::default());
+            r.user_op(LedgerOp::GoalSet { text: "g".into() });
+            let e = record_run(&r);
+            let res = r.call("conclude", json!({"status": "unreachable", "note": "n", "evidence": [e.clone()]})).await;
+            assert_eq!(res.status, Status::Error, "{}", res.text);
+            let want = format!("{base}{}{keep}", if with_blocker { blocker } else { "" });
+            assert_eq!(res.text, format!("[conclude · error]\n{want}\n[end of conclude output · error]"));
+            let status = r.shared.ledger().unwrap().goal_met.map(|g| g.status);
+            assert_eq!(status, Some(loom_core::ledger::GoalMetStatus::Open));
+            let met = r.call("conclude", json!({"status": "met", "note": "the run passes", "evidence": [e]})).await;
+            assert_eq!(met.status, Status::Ok, "{}", met.text);
+        }
+    }
+
+    #[tokio::test]
     async fn concluding_unreachable_needs_every_route_closed_and_execution_evidence() {
         let r = lead_with_goal();
         r.model_op(LedgerOp::PlanAdd { text: "try the other parser".into() });
@@ -2228,6 +2443,74 @@ mod tests {
         assert!(
             context.contains("The lead concluded the goal cannot be met as stated (evidence: e1):\nevery route fails"),
             "{context}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_finish_lists_the_routes_the_ledger_shows_open_in_order() {
+        use loom_core::security_state::{AssetInput, AssetKind, SecurityOp};
+        let r = lead_with_goal();
+        let e = record_run(&r);
+        let asset = AssetInput {
+            kind: AssetKind::Host,
+            locator: "fixture.test".into(),
+            evidence: vec![e],
+            mandatory: true,
+            parent: None,
+        };
+        let id = asset.id().unwrap();
+        r.model_op(LedgerOp::Security(SecurityOp::AssetUpsert { asset }));
+        r.model_op(LedgerOp::PlanAdd { text: "try the other parser".into() });
+        r.model_op(LedgerOp::DeadEnd { what: "regex parser".into(), why: "no recursion".into() });
+        let before = r.shared.ledger().unwrap();
+        let res = r.call("finish", json!({"answer": "No result."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        let want = format!(
+            "Routes the mission ledger still shows open:\n- untested surface {id}\n- open plan step p1: try the other parser\n- set aside, not refuted, x1: regex parser — no recursion — a different attempt can reopen it\nPick one and run it; record what the run shows."
+        );
+        assert!(res.text.contains(&want), "{}", res.text);
+        assert!(!res.text.contains("shows no open route"), "{}", res.text);
+        assert_eq!(r.shared.ledger().unwrap(), before);
+        assert!(effect(&r).is_none());
+        assert_eq!(spawn_count(&r), 0);
+    }
+
+    #[tokio::test]
+    async fn a_solvable_pack_lists_open_routes_on_unreachable_and_never_offers_it_on_finish() {
+        let mut role = core_role("lead");
+        role.solvable = true;
+        let r = rig_with(role, false, true, loom_core::config::AgentsCfg::default());
+        r.user_op(LedgerOp::GoalSet { text: "g".into() });
+        // With no route open, a refused finish asks for approaches and does not offer `unreachable`.
+        let res = r.call("finish", json!({"answer": "No result."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("shows no open route"), "{}", res.text);
+        assert!(!res.text.contains("conclude with status unreachable"), "{}", res.text);
+        // With a route open, the unreachable refusal names it.
+        r.model_op(LedgerOp::PlanAdd { text: "try the other parser".into() });
+        let e = record_run(&r);
+        let res = r.call("conclude", json!({"status": "unreachable", "note": "n", "evidence": [e]})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("operator set it up as solvable"), "{}", res.text);
+        assert!(
+            res.text.contains("Routes the mission ledger still shows open:\n- open plan step p1: try the other parser"),
+            "{}",
+            res.text
+        );
+        assert_eq!(r.shared.ledger().unwrap().goal_met.map(|g| g.status), Some(loom_core::ledger::GoalMetStatus::Open));
+    }
+
+    #[tokio::test]
+    async fn conclude_unreachable_with_open_steps_says_they_are_open_routes() {
+        let r = lead_with_goal();
+        r.model_op(LedgerOp::PlanAdd { text: "try the other parser".into() });
+        let e = record_run(&r);
+        let res = r.call("conclude", json!({"status": "unreachable", "note": "n", "evidence": [e]})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(
+            res.text.contains("Then call conclude again. These are routes still open; run one of them.\n"),
+            "{}",
+            res.text
         );
     }
 
@@ -2646,14 +2929,14 @@ mod tests {
     fn the_running_work_refusal_names_only_tools_the_role_has() {
         let mut role = core_role("lead");
         let (jobs, agents) = (vec!["job j1 (make)".to_string()], vec!["agent s-kid1 (worker)".to_string()]);
-        let all = running_refusal(&role, &jobs, &agents);
+        let all = running_refusal("finish", &role, &jobs, &agents);
         assert!(
             all.contains("still running: job j1 (make), agent s-kid1 (worker). Nothing was delivered. To go on: wait for it to report (`wait`), or end a job with `job_kill`, or end an agent with `agent_stop`; then call finish again."),
             "{all}"
         );
         assert!(all.contains("`job_kill` and `finish` can go in the same reply"), "{all}");
         role.tools.retain(|t| !matches!(t.as_str(), "wait" | "job_kill" | "agent_stop" | "report_blocker"));
-        let bare = running_refusal(&role, &jobs, &agents);
+        let bare = running_refusal("finish", &role, &jobs, &agents);
         assert!(bare.contains("Nothing was delivered. Call finish again when it has ended."), "{bare}");
         assert!(!bare.contains("`wait`") && !bare.contains("job_kill") && !bare.contains("agent_stop"), "{bare}");
         assert!(
@@ -2663,8 +2946,8 @@ mod tests {
             "{bare}"
         );
         role.tools.retain(|t| t != "ask_user");
-        assert!(running_refusal(&role, &jobs, &agents).ends_with("Call finish again when it has ended."));
-        assert!(!running_refusal(&role, &jobs, &[]).contains("operator"));
+        assert!(running_refusal("finish", &role, &jobs, &agents).ends_with("Call finish again when it has ended."));
+        assert!(!running_refusal("finish", &role, &jobs, &[]).contains("operator"));
     }
 
     #[tokio::test]
@@ -2920,6 +3203,207 @@ mod tests {
         let items = inbox_items(&r);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].reference, None);
+    }
+
+    // ---- ask_for ----
+
+    /// A result's text without the frame `execute` puts around it (`[tool · status]` … `[end of …]`).
+    fn plain(text: &str) -> String {
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.remove(0);
+        lines.pop();
+        lines.join("\n")
+    }
+
+    fn ask(kind: &str) -> Value {
+        json!({"kind": kind, "what": "the thing", "why": "the reason", "meanwhile": "read the logs"})
+    }
+
+    #[tokio::test]
+    async fn ask_for_records_a_non_blocking_question_for_each_kind() {
+        for (kind, label) in
+            [("budget", "more budget"), ("tool", "a tool"), ("hint", "a hint"), ("direction", "direction")]
+        {
+            let r = lead();
+            let res = r.call("ask_for", ask(kind)).await;
+            assert_eq!(res.status, Status::Ok, "{kind}: {}", res.text);
+            assert_eq!(
+                plain(&res.text),
+                format!(
+                    "Asked the operator for {label} (q1). This is not a finish and does not pause the work: carry on with what you said you would do meanwhile. The answer arrives as a message."
+                )
+            );
+            assert!(effect(&r).is_none(), "{kind}: the turn must not end");
+            let question = format!("Asks for {label}: the thing — why: the reason");
+            let state = r.shared.ledger().unwrap();
+            assert_eq!((state.questions.len(), state.questions[0].text.as_str()), (1, question.as_str()));
+            assert!(!state.questions[0].blocking);
+            let items = inbox_items(&r);
+            assert_eq!(items.len(), 1);
+            assert!(!items[0].blocking);
+            assert_eq!(items[0].kind, InboxKind::Question);
+            assert_eq!(items[0].reference.as_deref(), Some("q1"));
+            if kind == "budget" {
+                assert!(items[0].text.starts_with(&question), "{}", items[0].text);
+                assert!(
+                    items[0].text.contains("`loom resume s-test`")
+                        && items[0].text.contains("/api/sessions/s-test/resume"),
+                    "{}",
+                    items[0].text
+                );
+            } else {
+                assert_eq!(items[0].text, question);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_for_is_refused_in_a_child_and_names_hand_off_only_when_the_role_has_it() {
+        let r = rig("worker", true, false);
+        let out = AskFor(r.shared.clone()).run(&r.env.ctx, &map(ask("hint"))).await;
+        assert_eq!(out.status, Status::Error);
+        let Body::Message(m) = out.body else { panic!("message expected") };
+        assert_eq!(
+            m,
+            "`ask_for` is for the lead. An agent working on an assignment uses `hand_off` to return the work with what it needs."
+        );
+        let mut role = core_role("worker");
+        role.tools.retain(|t| t != "hand_off");
+        let r = rig_with(role, true, false, Default::default());
+        let out = AskFor(r.shared.clone()).run(&r.env.ctx, &map(ask("hint"))).await;
+        let Body::Message(m) = out.body else { panic!("message expected") };
+        assert_eq!(m, "`ask_for` is for the lead.");
+        assert!(effect(&r).is_none());
+        assert!(inbox_items(&r).is_empty());
+    }
+
+    #[tokio::test]
+    async fn ask_for_refuses_a_second_open_ask_of_one_kind_only() {
+        let r = lead();
+        assert_eq!(r.call("ask_for", ask("hint")).await.status, Status::Ok);
+        inbox_items(&r);
+        let again = r.call("ask_for", ask("hint")).await;
+        assert_eq!(again.status, Status::Error);
+        assert_eq!(plain(&again.text), "Already asked for a hint (q1); it is still open. Carry on meanwhile.");
+        assert_eq!(r.shared.ledger().unwrap().questions.len(), 1);
+        assert!(inbox_items(&r).is_empty());
+        // Another kind is a different ask.
+        assert_eq!(r.call("ask_for", ask("tool")).await.status, Status::Ok);
+        // Once the operator answered, the kind can be asked again.
+        r.user_op(LedgerOp::QuestionAnswer { id: "q1".into(), answer: "try the second log".into() });
+        let res = r.call("ask_for", ask("hint")).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(res.text.contains("(q3)"), "{}", res.text);
+    }
+
+    #[tokio::test]
+    async fn ask_for_needs_every_field() {
+        let r = lead();
+        for field in ["what", "why", "meanwhile"] {
+            let mut args = ask("hint");
+            args[field] = json!("   ");
+            let res = r.call("ask_for", args).await;
+            assert_eq!(res.status, Status::Error, "{field}");
+            assert!(res.text.contains(field), "{field}: {}", res.text);
+        }
+        // A kind outside the list never reaches the tool: the argument check refuses it.
+        let res = r.call("ask_for", ask("everything")).await;
+        assert_eq!(res.status, Status::Invalid, "{}", res.text);
+        assert!(r.shared.ledger().unwrap().questions.is_empty());
+        assert!(inbox_items(&r).is_empty());
+    }
+
+    // ---- hand_off ----
+
+    fn hand(ask: &str) -> Value {
+        json!({"state": "The parser is fixed; the lexer still fails.", "leads": ["check the escape table", "diff against v2"], "ask": ask, "why": "I keep reading the same code"})
+    }
+
+    #[tokio::test]
+    async fn hand_off_settles_the_child_as_returned_with_the_exact_report() {
+        let r = rig("worker", true, false);
+        let res = r.call("hand_off", hand("fresh_eyes")).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert_eq!(plain(&res.text), texts::HAND_OFF_DELIVERED);
+        let Some(Effect::Settle(d)) = effect(&r) else { panic!("settle expected") };
+        assert_eq!(d.outcome, ChildOutcome::Returned);
+        assert_eq!(
+            d.report,
+            "HANDED OFF — this agent is not done, and it has not concluded that the work cannot be done. It asks for a fresh agent to look at it.\nWhere it stands:\nThe parser is fixed; the lexer still fails.\nOpen leads:\n- check the escape table\n- diff against v2\nWhy: I keep reading the same code"
+        );
+        assert_eq!(d.payload, json!({"handed_off": {"ask": "fresh_eyes"}}));
+        assert!(d.full.is_none());
+        assert!(inbox_items(&r).is_empty());
+        for (ask, label) in [("stronger_model", "a stronger model"), ("hint", "a hint"), ("more_steps", "more steps")] {
+            let r = rig("worker", true, false);
+            assert_eq!(r.call("hand_off", hand(ask)).await.status, Status::Ok);
+            let Some(Effect::Settle(d)) = effect(&r) else { panic!("settle expected") };
+            assert!(d.report.contains(&format!("It asks for {label}.\n")), "{}", d.report);
+        }
+    }
+
+    #[tokio::test]
+    async fn hand_off_is_refused_in_a_lead_and_names_ask_for_only_when_the_role_has_it() {
+        let r = lead();
+        let out = HandOff(r.shared.clone()).run(&r.env.ctx, &map(hand("hint"))).await;
+        assert_eq!(out.status, Status::Error);
+        let Body::Message(m) = out.body else { panic!("message expected") };
+        assert_eq!(
+            m,
+            "`hand_off` returns an assignment to the agent that gave it; this session has none. If you are stuck, use `ask_for`."
+        );
+        assert!(effect(&r).is_none());
+        let mut role = core_role("lead");
+        role.tools.retain(|t| t != "ask_for");
+        let r = rig_with(role, false, true, Default::default());
+        let out = HandOff(r.shared.clone()).run(&r.env.ctx, &map(hand("hint"))).await;
+        let Body::Message(m) = out.body else { panic!("message expected") };
+        assert!(m.ends_with("this session has none."), "{m}");
+    }
+
+    #[tokio::test]
+    async fn hand_off_needs_its_fields() {
+        let r = rig("worker", true, false);
+        for (field, value) in [
+            ("state", json!(" ")),
+            ("why", json!("")),
+            ("leads", json!([])),
+            ("leads", json!(["ok", "  "])),
+            ("leads", json!(["1", "2", "3", "4", "5", "6", "7", "8", "9"])),
+        ] {
+            let mut args = hand("hint");
+            args[field] = value.clone();
+            let res = r.call("hand_off", args).await;
+            assert_eq!(res.status, Status::Error, "{field} {value}");
+            assert!(res.text.contains(field), "{field}: {}", res.text);
+            assert!(effect(&r).is_none());
+        }
+        let mut args = hand("give_up");
+        args["leads"] = json!(["1", "2", "3", "4", "5", "6", "7", "8"]);
+        assert_eq!(r.call("hand_off", args.clone()).await.status, Status::Invalid);
+        args["ask"] = json!("hint");
+        assert_eq!(r.call("hand_off", args).await.status, Status::Ok);
+    }
+
+    #[tokio::test]
+    async fn hand_off_is_refused_while_a_job_is_running() {
+        let r = rig("worker", true, false);
+        let started = r.call("bash", json!({"command": "sleep 30", "background": true})).await;
+        assert_eq!(started.status, Status::Ok, "{}", started.text);
+        let res = r.call("hand_off", hand("hint")).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(
+            plain(&res.text)
+                .starts_with("hand_off was refused: work started by this session is still running: job j1 (sleep 30)."),
+            "{}",
+            res.text
+        );
+        assert!(res.text.contains("then call hand_off again."), "{}", res.text);
+        assert!(res.text.contains("`job_kill` and `hand_off` can go in the same reply"), "{}", res.text);
+        assert!(effect(&r).is_none());
+        let killed = r.call("job_kill", json!({"job": "j1"})).await;
+        assert_eq!(killed.status, Status::Ok, "{}", killed.text);
+        assert_eq!(r.call("hand_off", hand("hint")).await.status, Status::Ok);
     }
 
     // ---- report_blocker ----

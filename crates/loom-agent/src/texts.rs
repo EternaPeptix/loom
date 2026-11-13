@@ -156,9 +156,73 @@ pub fn stall(steps: u32) -> String {
     )
 }
 
+/// The line a successful `claim_update` to `supported` adds: the result is banked. `n` and `ids` describe every
+/// result established in the mission after the write.
+pub fn result_banked(id: &str, n: usize, ids: &str) -> String {
+    format!("Established: {id}. Results established in this mission so far: {n} ({ids}).")
+}
+
 /// A message from the parent agent to a running child.
 pub fn agent_message(text: &str) -> String {
     format!("Message from the agent that assigned this work:\n{text}")
+}
+
+/// The question an `ask_for` records and shows the operator. `label` is the kind's wording ("more budget").
+pub fn ask_for_question(label: &str, what: &str, why: &str) -> String {
+    format!("{}{what} — why: {why}", ask_for_question_prefix(label))
+}
+
+/// What every question of one `ask_for` kind starts with.
+pub fn ask_for_question_prefix(label: &str) -> String {
+    format!("Asks for {label}: ")
+}
+
+/// Added to the operator's copy of a budget ask: what actually renews a root session's budget.
+pub fn ask_for_budget_route(session: &str) -> String {
+    format!("To grant budget: a session whose budget is used up gets a fresh budget of its configured size, counted from that moment, when you restart it (`loom resume {session}`, `POST /api/sessions/{session}/resume`, or answering its parked inbox item). Nothing raises a budget that is not yet used up; answer this item to reply meanwhile.")
+}
+
+/// `ask_for` was recorded.
+pub fn ask_for_asked(label: &str, qid: Option<&str>) -> String {
+    let id = qid.map(|q| format!(" ({q})")).unwrap_or_default();
+    format!("Asked the operator for {label}{id}. This is not a finish and does not pause the work: carry on with what you said you would do meanwhile. The answer arrives as a message.")
+}
+
+/// A second `ask_for` of a kind whose earlier ask is unanswered.
+pub fn ask_for_already(label: &str, qid: Option<&str>) -> String {
+    let id = qid.map(|q| format!(" ({q})")).unwrap_or_default();
+    format!("Already asked for {label}{id}; it is still open. Carry on meanwhile.")
+}
+
+/// `ask_for` in a child session.
+pub fn ask_for_in_child(has_hand_off: bool) -> String {
+    let mut text = "`ask_for` is for the lead.".to_string();
+    if has_hand_off {
+        text.push_str(" An agent working on an assignment uses `hand_off` to return the work with what it needs.");
+    }
+    text
+}
+
+/// `hand_off` in a lead session.
+pub fn hand_off_in_root(has_ask_for: bool) -> String {
+    let mut text = "`hand_off` returns an assignment to the agent that gave it; this session has none.".to_string();
+    if has_ask_for {
+        text.push_str(" If you are stuck, use `ask_for`.");
+    }
+    text
+}
+
+/// What `hand_off` answers once the assignment is returned.
+pub const HAND_OFF_DELIVERED: &str =
+    "The assignment was handed back with your state and leads. This session is finished.";
+
+/// The report a parent reads for a child that handed its assignment back. `ask_label` is the wording of the ask.
+pub fn hand_off_report(ask_label: &str, state: &str, leads: &[String], why: &str) -> String {
+    let leads: Vec<String> = leads.iter().map(|l| format!("- {}", loom_core::tagsafe::hang_lines(l))).collect();
+    format!(
+        "HANDED OFF — this agent is not done, and it has not concluded that the work cannot be done. It asks for {ask_label}.\nWhere it stands:\n{state}\nOpen leads:\n{}\nWhy: {why}",
+        leads.join("\n")
+    )
 }
 
 /// A standing rule from the operator. `id` is its ledger id when the mission has a ledger.
@@ -167,6 +231,19 @@ pub fn constraint(id: Option<&str>, text: &str) -> String {
     format!(
         "The operator set a standing rule{id}. It applies to all work on this mission, yours and that of every agent you assign work to, until the operator withdraws it. Where it conflicts with an earlier instruction, the rule wins:\n{}",
         text.trim()
+    )
+}
+
+/// Part of the system prompt of a pack marked `solvable`, between the role prompt and `# Environment`.
+/// Fixed text: it is part of the cached prefix head.
+pub const SOLVABLE_PRIOR: &str = "The operator has set this mission up to be solvable with the access you have been given. On a task like this, not having found the way yet is the normal state of the work, not evidence that it cannot be done: keep forming approaches and testing them, and record what each run shows. If something only the operator can supply is missing — scope, a tool, a prerequisite — report it as a blocker; that is not a failure.";
+
+/// `conclude` with status `unreachable` in a solvable pack. `has_blocker`: the role has `report_blocker`.
+pub fn conclude_unreachable_refused(has_blocker: bool) -> String {
+    let blocker =
+        if has_blocker { " If something only the operator can supply is missing, call report_blocker." } else { "" };
+    format!(
+        "conclude unreachable is not available in this mission: the operator set it up as solvable, so not having found the way is not a finding.{blocker} Otherwise keep working: pick an open route from the mission state and run it."
     )
 }
 
@@ -509,11 +586,19 @@ fn append_last_reply(out: &mut String, last_reply: &str) {
 }
 
 /// The `brief` of a re-weave: what the model is told at the point where older material was folded.
-/// `ledger_brief` is `LedgerState::brief`, empty for a session without a ledger.
-pub fn reweave_brief(ledger_brief: &str) -> String {
+/// `ledger_brief` is `LedgerState::brief`, empty for a session without a ledger. `frontier` is the rendered
+/// `frontier::render` block, `None` for a session without a ledger or with nothing to show; when it is given,
+/// a paragraph says that folded attempts are ground covered, not a verdict on the task.
+pub fn reweave_brief(ledger_brief: &str, frontier: Option<&str>) -> String {
     let mut out = String::from(
         "Older tool output above this point is now shown in shortened form. Nothing was deleted: each shortened result names its handle (out:…), `out_read` and `out_grep` open any part of it again, and `log_search` searches the whole session. If you need something you saw earlier, reopen it rather than working from memory.",
     );
+    if let Some(frontier) = frontier {
+        out.push_str(
+            "\n\nWhat was folded is mostly attempts. Read them as ground covered, not as a verdict on the task: a failed attempt rules out that attempt, not the approach. What is established, ruled out with evidence, set aside and still open is below.\n\n",
+        );
+        out.push_str(frontier.trim_end());
+    }
     if !ledger_brief.trim().is_empty() {
         out.push_str("\n\nThe mission ledger at this point:\n");
         out.push_str(ledger_brief.trim_end());
@@ -521,8 +606,9 @@ pub fn reweave_brief(ledger_brief: &str) -> String {
     out
 }
 
-/// The instruction of a digest request, sent after the session's current stable prefix.
-pub const DIGEST_PROMPT: &str = "Some of your own earlier messages in this session are about to be folded out of view (tool output stays reachable through its handles, and the mission ledger stays as it is). Write down, for yourself, what you would otherwise lose: leads you have not followed up, partial results that are not yet in the ledger, where things are (files, lines, commands, handles), and anything you decided to try next and why. Be specific and brief: a list, at most 600 words. Do not call tools and do not address anyone; this is a note to yourself.";
+/// The instruction of a digest request, sent after the session's current stable prefix. It is appended after
+/// the stable messages of the request, so changing it changes no cached prefix of an existing session.
+pub const DIGEST_PROMPT: &str = "Some of your own earlier messages in this session are about to be folded out of view (tool output stays reachable through its handles, and the mission ledger stays as it is). Write a note to yourself that keeps the map of the work, not its history. Use these headings, each with a short list: Established (results a run has shown, with handles); Ruled out (only what a run disproved, with the exact boundary of what was tested and its handle); Tried, not ruled out (attempts that failed without disproving their approach, and what would have to change); Open leads (what you have not followed up yet, and where things are: files, lines, commands, handles); Next (what you decided to try next, and why). Do not retell what went wrong in order. Be specific and brief: at most 600 words. Do not call tools and do not address anyone.";
 
 /// Inbox text for a session the harness could not continue (`why` is a complete sentence).
 pub fn turn_failed(why: &str) -> String {
@@ -720,24 +806,71 @@ pub fn job_lost(id: &str, command: &str) -> String {
     )
 }
 
-/// The refusal of `finish` while the goal claim is not concluded (the goal-met pre-gate). `can_conclude`
-/// and `can_block` say whether the role has `conclude` and `report_blocker`, so only real tools are named.
-pub fn finish_unavailable(can_conclude: bool, can_block: bool) -> String {
+/// Which tools the role has, so the refusal of `finish` names only real ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FinishTools {
+    pub conclude: bool,
+    pub block: bool,
+    pub ask_for: bool,
+    /// The role has `agent_spawn` and can spawn at least one role.
+    pub spawn: bool,
+    /// The role has `plan` or `step`.
+    pub plan: bool,
+    /// The role's pack is solvable: `conclude` with status unreachable is not available to it.
+    pub solvable: bool,
+}
+
+/// The refusal of `finish` while the goal claim is not concluded (the goal-met pre-gate). It gives the routes
+/// the ledger still shows open (`directions`, from `frontier::directions`), or, when there are none, asks for
+/// new ones. `tools` says which tools the role has, so only real tools are named.
+pub fn finish_unavailable(tools: &FinishTools, directions: &[String]) -> String {
     let mut out = String::from(
-        "finish is not available yet: the goal is not concluded, and not being there yet is not a finish. Nothing was delivered and no verifier was started.",
+        "finish is not available yet: the goal is not concluded. Nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result.",
     );
-    if can_conclude {
-        out.push_str(
-            " Call conclude once a run shows the goal met, or once you have established that it cannot be met as stated (every plan route closed, with execution evidence).",
-        );
+    if tools.conclude {
+        out.push_str(" Call conclude once a run shows the goal met.");
     }
-    out.push_str(
-        " Until then, record where you are with a note and take the next step: run the target, read what it did, change the approach.",
-    );
-    if can_block {
-        out.push_str(" If something only the operator can supply is blocking you, call report_blocker.");
+    out.push('\n');
+    if directions.is_empty() {
+        out.push_str("The mission ledger shows no open route. Before anything else, name three approaches you have not yet tried with execution evidence");
+        if tools.plan {
+            out.push_str(" and add them to the plan");
+        }
+        out.push_str(", then run the first.");
+        if tools.conclude && !tools.solvable {
+            out.push_str(" If after honest effort you cannot name any, that is what conclude with status unreachable records: every route closed, with execution evidence.");
+        }
+    } else {
+        out.push_str("Routes the mission ledger still shows open:\n");
+        out.push_str(&directions.join("\n"));
+        out.push_str("\nPick one and run it; record what the run shows.");
+    }
+    if tools.ask_for || tools.spawn || tools.block {
+        out.push_str("\nIf you are stuck rather than done:");
+        if tools.ask_for {
+            out.push_str(" ask_for (budget, a tool, a hint or direction);");
+        }
+        if tools.spawn {
+            out.push_str(" start a fresh agent with agent_spawn for another view;");
+        }
+        if tools.block {
+            out.push_str(" report_blocker if something only the operator can supply is missing;");
+        }
+        out.push_str(" keep working meanwhile.");
     }
     out
+}
+
+/// The refusal of `conclude` with status unreachable that follows the plan listing: these steps are routes.
+pub const CONCLUDE_OPEN_ROUTES_TAIL: &str = " These are routes still open; run one of them.";
+
+/// The open routes appended to a refusal, or nothing when `directions` is empty.
+pub fn open_routes_block(directions: &[String]) -> String {
+    if directions.is_empty() {
+        String::new()
+    } else {
+        format!("\nRoutes the mission ledger still shows open:\n{}", directions.join("\n"))
+    }
 }
 
 /// What follows the objections in the result of a `finish` the verifier did not accept.
@@ -810,6 +943,60 @@ pub fn flag_candidate(handle: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tools_all() -> FinishTools {
+        FinishTools { conclude: true, block: true, ask_for: true, spawn: true, plan: true, solvable: false }
+    }
+
+    #[test]
+    fn finish_unavailable_lists_the_open_routes() {
+        let d = vec!["- untested surface as-1".to_string(), "- open plan step p1: read".to_string()];
+        assert_eq!(
+            finish_unavailable(&tools_all(), &d),
+            "finish is not available yet: the goal is not concluded. Nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result. Call conclude once a run shows the goal met.\n\
+Routes the mission ledger still shows open:\n\
+- untested surface as-1\n\
+- open plan step p1: read\n\
+Pick one and run it; record what the run shows.\n\
+If you are stuck rather than done: ask_for (budget, a tool, a hint or direction); start a fresh agent with agent_spawn for another view; report_blocker if something only the operator can supply is missing; keep working meanwhile."
+        );
+    }
+
+    #[test]
+    fn finish_unavailable_without_routes_asks_for_new_ones() {
+        assert_eq!(
+            finish_unavailable(&tools_all(), &[]),
+            "finish is not available yet: the goal is not concluded. Nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result. Call conclude once a run shows the goal met.\n\
+The mission ledger shows no open route. Before anything else, name three approaches you have not yet tried with execution evidence and add them to the plan, then run the first. If after honest effort you cannot name any, that is what conclude with status unreachable records: every route closed, with execution evidence.\n\
+If you are stuck rather than done: ask_for (budget, a tool, a hint or direction); start a fresh agent with agent_spawn for another view; report_blocker if something only the operator can supply is missing; keep working meanwhile."
+        );
+        let solvable = FinishTools { solvable: true, ..tools_all() };
+        let text = finish_unavailable(&solvable, &[]);
+        assert!(text.contains("then run the first.\nIf you are stuck"), "{text}");
+        assert!(!text.contains("unreachable"), "{text}");
+    }
+
+    #[test]
+    fn finish_unavailable_for_a_minimal_role_names_no_absent_tool() {
+        assert_eq!(
+            finish_unavailable(&FinishTools::default(), &[]),
+            "finish is not available yet: the goal is not concluded. Nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result.\n\
+The mission ledger shows no open route. Before anything else, name three approaches you have not yet tried with execution evidence, then run the first."
+        );
+        let only_block = FinishTools { block: true, ..FinishTools::default() };
+        assert!(finish_unavailable(&only_block, &["- x".into()]).ends_with(
+            "Pick one and run it; record what the run shows.\nIf you are stuck rather than done: report_blocker if something only the operator can supply is missing; keep working meanwhile."
+        ));
+    }
+
+    #[test]
+    fn open_routes_block_is_empty_without_directions() {
+        assert_eq!(open_routes_block(&[]), "");
+        assert_eq!(
+            open_routes_block(&["- a".into(), "- b".into()]),
+            "\nRoutes the mission ledger still shows open:\n- a\n- b"
+        );
+    }
 
     #[test]
     fn the_restart_note_does_not_call_resumed_agents_gone() {
@@ -1093,10 +1280,24 @@ mod tests {
     }
 
     #[test]
-    fn reweave_brief_with_and_without_ledger() {
-        assert!(!reweave_brief("").contains("mission ledger"));
-        let b = reweave_brief("Goal: ship it\n");
-        assert!(b.ends_with("The mission ledger at this point:\nGoal: ship it"));
+    fn reweave_brief_with_and_without_ledger_and_frontier() {
+        let first = "Older tool output above this point is now shown in shortened form. Nothing was deleted: each shortened result names its handle (out:…), `out_read` and `out_grep` open any part of it again, and `log_search` searches the whole session. If you need something you saw earlier, reopen it rather than working from memory.";
+        let map = "\n\nWhat was folded is mostly attempts. Read them as ground covered, not as a verdict on the task: a failed attempt rules out that attempt, not the approach. What is established, ruled out with evidence, set aside and still open is below.\n\n";
+        let block = "Where the work stands:\n- Established: 1 (c1)";
+        let ledger = "\n\nThe mission ledger at this point:\nGoal: ship it";
+        assert_eq!(reweave_brief("", None), first);
+        assert_eq!(reweave_brief("  \n", None), first);
+        assert_eq!(reweave_brief("Goal: ship it\n", None), format!("{first}{ledger}"));
+        assert_eq!(reweave_brief("", Some(block)), format!("{first}{map}{block}"));
+        assert_eq!(reweave_brief("Goal: ship it\n", Some(block)), format!("{first}{map}{block}{ledger}"));
+    }
+
+    #[test]
+    fn digest_prompt_asks_for_a_map() {
+        for heading in ["Established (", "Ruled out (", "Tried, not ruled out (", "Open leads (", "Next ("] {
+            assert!(DIGEST_PROMPT.contains(heading), "{heading}");
+        }
+        assert!(DIGEST_PROMPT.ends_with("at most 600 words. Do not call tools and do not address anyone."));
     }
 
     #[test]

@@ -139,7 +139,7 @@
 //!   one.`
 //! - role `model` selects a named profile; fresh children otherwise inherit. `alloy_models` rotates
 //!   fresh siblings, and `escalation_model` is selected for subsequent children of a role after a
-//!   failed/budget-exhausted result. This never mutates a running session or promises provider cache hits.
+//!   failed/budget-exhausted result or a `hand_off` that asked for a `stronger_model`. This never mutates a running session or promises provider cache hits.
 //!   A fork selecting a different profile is refused. Distinct verifier profile checks compare names,
 //!   not model families. Discovery and limiter selection follow the chosen profile.
 //! - a request with `harness: true` (the finish gate's verifier) is exempt from both of the last two rules.
@@ -150,7 +150,7 @@
 //! - join/message/stop resolve exact IDs first, then `last` or an unambiguous prefix of at least four
 //!   characters within this parent's children only. Ambiguity never picks an arbitrary child.
 //! - `SpawnMode::Fork`: the parent's status must have a `fork_point`, and every tool of the child
-//!   role must be among the parent role's tools; otherwise `A `{role}` agent cannot be forked from
+//!   role must be among the parent role's tools (`hand_off` aside: a forked agent is not offered it); otherwise `A `{role}` agent cannot be forked from
 //!   this session: it needs tools this session does not have ({list}). Start it with mode `fresh`
 //!   and put what it needs to know in the assignment.` The child is
 //!   `Session::fork(deps, &paths.session_log(parent), fork_point, Forked{session, parent, upto_seq:
@@ -2483,11 +2483,15 @@ impl Inner {
                 .values()
                 .filter(|k| k.meta.parent.as_ref() == Some(parent) && k.meta.role == req.role)
                 .collect();
+            // A hand-off asking for a stronger model escalates like a failure; any other ask does not.
             let failed = prior.iter().any(|k| {
                 matches!(
                     k.settlement.as_ref().map(|s| s.outcome),
                     Some(ChildOutcome::Failed | ChildOutcome::BudgetExhausted)
-                )
+                ) || k
+                    .settlement
+                    .as_ref()
+                    .is_some_and(|s| s.payload["handed_off"]["ask"].as_str() == Some("stronger_model"))
             });
             let prior_count = prior.len();
             let cursor = st.route_cursor.entry((parent.clone(), req.role.clone())).or_insert(prior_count);
@@ -2560,7 +2564,10 @@ impl Inner {
             }
             let mut fork_point = None;
             if req.mode == SpawnMode::Fork {
-                let missing: Vec<&String> = crole.tools.iter().filter(|t| !prole.tools.contains(t)).collect();
+                // `hand_off` is bound to the role's assignment, not to what the parent's prefix defines: a
+                // lead has none, and a forked agent is simply not offered it.
+                let missing: Vec<&String> =
+                    crole.tools.iter().filter(|t| !prole.tools.contains(t) && t.as_str() != "hand_off").collect();
                 if !missing.is_empty() {
                     let list = missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
                     return Err(format!(
@@ -2644,7 +2651,7 @@ impl Inner {
         };
         let created = match fork_point {
             Some(upto) => {
-                let tools = crole.tools.clone();
+                let tools: Vec<String> = crole.tools.iter().filter(|t| t.as_str() != "hand_off").cloned().collect();
                 Session::fork(
                     deps,
                     &self.paths.session_log(parent),
@@ -6291,6 +6298,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_spawned_child_waits_on_its_own_watched_job_while_its_parent_blocks_in_join() {
+        // Bounded, so a failed run leaves no loop behind. The job writes its line only when the test says so.
+        let command = "echo scanning; i=0; while [ ! -f release ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done; \
+                       echo 'FOUND key=abc'";
+        let e = env(Script::new(move |body, _| {
+            if has_tool(body, "agent_spawn") {
+                if last_role(body) == "tool" {
+                    finish("lead done")
+                } else {
+                    call("agent_spawn", json!({"question": "CHILDMARK work"}))
+                }
+            } else {
+                match tool_msgs(body) {
+                    0 => call("bash", json!({"command": command, "background": true, "wake_on": "^FOUND"})),
+                    1 => call("wait", json!({})),
+                    _ => finish("child report"),
+                }
+            }
+        }))
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("child registered its job", || {
+            e.children(&id).first().is_some_and(|c| e.has(&c.meta.id, |ev| matches!(ev, Event::JobRegistered { .. })))
+        })
+        .await;
+        let kid = e.children(&id)[0].meta.id.clone();
+        until("the child's turn waits", || e.has(&kid, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        // The parent is blocked in `join`: it has sent its spawn request and nothing more, however
+        // slow the machine is, until the child settles.
+        assert_eq!(e.server.requests().iter().filter(|b| has_tool(b, "agent_spawn")).count(), 1);
+        assert!(!e.has(&id, |ev| matches!(ev, Event::ChildSettled(_))));
+        std::fs::write(e.ws.join("release"), "").unwrap();
+        until("the job matched and woke the child", || e.has(&kid, |ev| matches!(ev, Event::JobMatched { .. }))).await;
+        until("the child settled", || {
+            e.has(&kid, |ev| matches!(ev, Event::ChildSettled { .. } | Event::TurnEnd { .. }))
+        })
+        .await;
+        until("the parent's turn ends", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let kid_kinds = e.kinds(&kid);
+        assert!(kid_kinds.iter().any(|k| k == "job_matched"), "{kid_kinds:?}");
+        assert!(e.has(&id, |ev| matches!(ev, Event::ChildSettled(c) if c.outcome == ChildOutcome::Returned)));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn the_part_a_watched_job_matched_is_citable_while_the_job_runs() {
         // The job writes its line only when the test says so. Bounded, so a failed run leaves no loop.
         let command = "echo scanning; i=0; while [ ! -f release ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done; \
@@ -8864,6 +8917,60 @@ mod tests {
         assert_eq!(e.rt.session(&next).unwrap().meta.profile, "other");
         assert_eq!(e.records(&next).iter().filter(|r| matches!(r.event, Event::Forked(_))).count(), 0);
         e.rt.shutdown().await;
+    }
+
+    /// Spawn a worker that hands its assignment off with `ask`, then another; the profile of the second.
+    async fn profile_after_hand_off(ask: &str) -> String {
+        let other = MockServer::start(Script::new(|_, _| finish("escalated"))).await.unwrap();
+        let other_url = other.base_url();
+        let ask = ask.to_string();
+        let e = env_with_packs(
+            Script::new(move |_, _| {
+                call("hand_off", json!({"state": "half way", "leads": ["the lexer"], "ask": ask, "why": "stuck"}))
+            }),
+            |c| {
+                let mut p = c.models["mock"].clone();
+                p.base_url = other_url;
+                c.models.insert("other".into(), p);
+            },
+            |packs| {
+                let path = packs.join("core/pack.toml");
+                let text = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("[roles.worker]", "[roles.worker]\nescalation_model = \"other\"");
+                std::fs::write(path, text).unwrap();
+            },
+        )
+        .await;
+        let parent = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let req = SpawnReq {
+            role: "worker".into(),
+            mode: SpawnMode::Fresh,
+            brief: Brief::default(),
+            budget: Budget::default(),
+            call_id: CallId::from("hand-off"),
+            title: "hand off".into(),
+            awaited: true,
+            harness: false,
+            prerequisite: None,
+            workspace: Workspace::Shared,
+        };
+        let first = e.rt.inner.orch.spawn(&parent, req.clone()).await.unwrap();
+        let result = e.rt.inner.orch.join(&parent, &first, &CancellationToken::new()).await.unwrap();
+        assert_eq!(result.outcome, ChildOutcome::Returned);
+        assert!(result.report.starts_with("HANDED OFF"), "{}", result.report);
+        let next = e.rt.inner.orch.spawn(&parent, req).await.unwrap();
+        let profile = e.rt.session(&next).unwrap().meta.profile;
+        e.rt.shutdown().await;
+        profile
+    }
+
+    #[tokio::test]
+    async fn a_hand_off_asking_for_a_stronger_model_escalates_the_next_assignment_of_that_role() {
+        assert_eq!(profile_after_hand_off("stronger_model").await, "other");
+        for ask in ["fresh_eyes", "hint", "more_steps"] {
+            assert_eq!(profile_after_hand_off(ask).await, "mock", "{ask}");
+        }
     }
 
     // ---- an agent's own copy of the workspace ----

@@ -284,14 +284,17 @@ plus one appended instruction asking for a digest. That request is a full cache 
 a `model_request` with purpose `digest` (its reply is not a record), capped at 8 000 tokens, and waits
 for a request slot at the session's own priority. A non-empty reply is stored in the `reweave` record
 and rendered in the resume block under `Leads from earlier work (written by the model, not verified —
-re-check before relying on them):`. Without a digest the re-weave goes ahead all the same: the ledger
+re-check before relying on them):`. The digest asks for a map of the work (established, ruled out with its boundary, tried but not
+ruled out, open leads, next), not a retelling. The resume brief adds, for a session with a ledger, the
+frontier block (`Where the work stands:`) and a paragraph saying a failed attempt rules out that attempt, not
+the approach. Without a digest the re-weave goes ahead all the same: the ledger
 brief is the durable state.
 
 **HUD (ephemeral tail).** Not part of the weave. Each step request ends with one `user`-role message
 `<harness-state>…</harness-state>` (`loom-agent::hud`) that is never part of the stable prefix, so the
 next request diverges from the cache only after the previous last stable message. It is stored as a
 blob named by the request's `model_request.hud`. It carries, each section only when non-empty: the
-current time (UTC, minutes); the mission state from the ledger brief (§7); command outputs with at
+current time (UTC, minutes); the mission state from the ledger brief (§7); where the work stands (what is established, ruled out with evidence, only set aside, open, and the attempts run); command outputs with at
 least `agents.unviewed_min_lines` (20) lines never shown; calls repeated with the same arguments and the
 same output; reads and command results that a later write of this session made out of date; running
 jobs and agents; ledger questions waiting on the operator; and, only in the last stretch of a step or
@@ -610,9 +613,10 @@ only when every check passes and, where verification is required, a verifier acc
 - A child's `finish` delivers its report to its parent (§9).
 - The goal-met pre-gate. In a role with explicit termination, `finish` is refused in the same step,
   before a finish is recorded, a verifier started or an inbox item opened, while the mission has a goal
-  and the goal-met claim (§7) is not concluded; a nudge note says to run the target and call `conclude`
-  once a run shows the goal met or the goal is established unreachable, or `report_blocker` for what only
-  the operator can supply. The ledger, not the wording of a reply, decides whether a stop is a
+  and the goal-met claim (§7) is not concluded; a nudge note lists the routes the ledger still shows
+  open (or, when it shows none, asks for three untried approaches), says to call `conclude` once a run
+  shows the goal met, and names the role's ways out when stuck (`ask_for`, `agent_spawn`,
+  `report_blocker`). The ledger, not the wording of a reply, decides whether a stop is a
   deliverable. `conclude {status: met|unreachable, note, evidence}` writes the goal-met claim (the
   ledger checks the evidence, §7); `unreachable` is also refused while a plan step is open, so every route
   is closed first, and the verifier is then told to name one untried route or get one step further, not to
@@ -1338,6 +1342,7 @@ description = "…"
 default_role = "lead"
 preamble = "harness.md"               # optional; the built-in preamble otherwise
 requires_restricted_network = false   # true: sessions refused while [network] mode = "open"
+solvable = false                      # true: roles are told the task was built to be solved; conclude refuses unreachable
 
 [roles.lead]
 description = "…"

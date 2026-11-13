@@ -295,7 +295,7 @@ tunnel, fetches the token and keeps it in the Keychain.
 A pack is a directory with a `pack.toml`. `core` is built into the binary. Others are loaded from
 `~/.loom/packs/<name>/` at daemon start (a directory named `core` replaces the built-in one). A pack
 that does not load stops the daemon from starting and the log names the pack and the key. Unknown keys
-are errors. Top level: `name`, `description`, `default_role`, `preamble`, `requires_restricted_network`.
+are errors. Top level: `name`, `description`, `default_role`, `preamble`, `requires_restricted_network`, `solvable` (true: roles are told the mission was built to be solved and `conclude` refuses `unreachable`; off by default).
 Per role (`[roles.<name>]`): `description`, `prompt`, `termination` (`explicit` or `free`), `tools`,
 `may_spawn`, `verify_finish`, `verifier`, `read_only`. A role with `verify_finish = true` names its
 verifier role (`verifier`, default: the pack's role called `verifier`); that role must be in the same
