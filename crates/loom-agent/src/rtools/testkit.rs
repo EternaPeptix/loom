@@ -3,7 +3,7 @@
 
 #![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
 
-use super::{build_registry, ChildInfo, Orchestrator, Producer, Settlement, Shared, SpawnReq, Vote};
+use super::{build_registry, ChildCopy, ChildInfo, Orchestrator, Producer, Settlement, Shared, SpawnReq, Vote};
 use crate::pack::{Packs, RoleDef};
 use async_trait::async_trait;
 use loom_core::config::AgentsCfg;
@@ -40,6 +40,8 @@ pub struct FakeOrch {
     pub producers: Mutex<HashMap<BlobId, Producer>>,
     /// Error returned by `stop_child` / `message_child` when set.
     pub refuse: Mutex<Option<String>>,
+    /// Copies by child; a child with none works in its parent's workspace.
+    pub copies: Mutex<HashMap<SessionId, Result<ChildCopy, String>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -177,6 +179,11 @@ impl Orchestrator for FakeOrch {
 
     async fn producer(&self, _mission: &MissionId, blob: &BlobId) -> Option<Producer> {
         lock(&self.producers).get(blob).cloned()
+    }
+
+    async fn child_copy(&self, _parent: &SessionId, child: &SessionId) -> Result<Option<ChildCopy>, String> {
+        self.record(format!("copy {child}"));
+        lock(&self.copies).get(child).cloned().transpose()
     }
 }
 

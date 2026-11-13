@@ -315,9 +315,18 @@ then delivered at once, marked `not verified`.
 
 Under the loom home: `config.toml`, `token`, `daemon.json`, `daemon.lock`, `keys/`, `logs/loomd.log`,
 `packs/`, `blobs/` (stored outputs), `sessions/<id>/` (`log.jsonl`, `meta.json`, `status.json`, `jobs/`,
-`tmp/`, `queued/`, `net.jsonl`, and `settlement.json` for a child), `missions/<id>/` (`journal.jsonl`,
-`journal.head`). Session ids made of anything other than letters, digits, `-`, `_` and `.` never map
-to a path outside the home.
+`tmp/`, `queued/`, `net.jsonl`, and for a child `settlement.json` and, when it works in its own copy
+of the workspace, `copy.json`), `missions/<id>/` (`journal.jsonl`, `journal.head`). Session ids made
+of anything other than letters, digits, `-`, `_` and `.` never map to a path outside the home.
+
+Beside the loom home, not in it: `~/.loom-copies/<mission>/<agent>/` (the home's name with `-copies`
+added), the copies of a workspace that agents started with `workspace: "copy"` or by `attempt` work
+in. A copy holds everything the workspace holds except `.loom`, so treat the directory like the
+workspaces themselves. On APFS the files are clones and take space only as they change, and only
+`agents.copy_max_files` bounds what is copied; elsewhere a copy is a full copy and
+`agents.copy_max_mb` bounds it too. Making a copy takes about a second per ten thousand files.
+Archiving a mission (`loom archive`) deletes its copies, including changes the lead never adopted,
+and `--undo` does not bring them back. Nothing else deletes them.
 
 ## First run checklist
 

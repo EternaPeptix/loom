@@ -171,7 +171,9 @@
 //! refusal, missing `meanwhile`, ledger question recorded and referenced; `report_blocker` — child
 //! and lead; `wait` — nothing running, a running job, a running child.
 
-use super::{Delivery, Effect, Settlement, Shared, SpawnReq, MAX_FINISH_REJECTIONS, REPORT_MAX_CHARS, SHUTTING_DOWN};
+use super::{
+    Delivery, Effect, Settlement, Shared, SpawnReq, Workspace, MAX_FINISH_REJECTIONS, REPORT_MAX_CHARS, SHUTTING_DOWN,
+};
 use crate::gate::{self, Quote, ReportInput, VerifiedQuote};
 use crate::pack::RoleDef;
 use crate::texts;
@@ -673,6 +675,7 @@ impl Finish {
                 awaited: true,
                 harness: true,
                 prerequisite: None,
+                workspace: Workspace::Shared,
             };
             // A verifier that cannot be run is a fault of the harness: it is retried with a fresh one, and when
             // it still cannot be run the finish is held, never escalated and never delivered as verified.

@@ -1519,6 +1519,7 @@ mod tests {
             mission: MissionId::from("m-a"),
             parent: parent.map(SessionId::from),
             workspace: "/w".into(),
+            copy_of: None,
             pack: "core".into(),
             role: "lead".into(),
             profile: "local".into(),

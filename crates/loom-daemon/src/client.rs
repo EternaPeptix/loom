@@ -832,6 +832,7 @@ pub(crate) mod testkit {
                 mission: MissionId::from(format!("m-of-{id}")),
                 parent: None,
                 workspace: "/w".into(),
+                copy_of: None,
                 pack: "core".into(),
                 role: "lead".into(),
                 profile: "local".into(),

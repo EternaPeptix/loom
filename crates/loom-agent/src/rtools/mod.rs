@@ -8,7 +8,8 @@
 //! - [`misc`]     `pin`, `log_search`
 //! - [`scope`]    `request_scope`
 //! - [`terminal`] `finish`, `verdict`, `ask_user`, `report_blocker`, `wait`, `conclude`
-//! - [`agents`]   `agent_spawn`, `agent_fanout`, `agent_message`, `agent_stop`, `decide`, `verify`
+//! - [`agents`]   `agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`, `agent_stop`,
+//!   `decide`, `verify`
 //!
 //! ## How a runtime tool acts on its session
 //! A tool never writes the session log. It returns its `ToolOutput` and leaves two things in
@@ -109,6 +110,50 @@ pub struct SpawnReq {
     pub harness: bool,
     /// Explicit security-state prerequisites, checked against the actual child role by the runtime.
     pub prerequisite: Option<DispatchPrerequisite>,
+    /// Where the child works.
+    pub workspace: Workspace,
+}
+
+/// Where a child works.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Workspace {
+    /// In its parent's workspace, beside the parent and its other agents.
+    #[default]
+    Shared,
+    /// In its own copy of the parent's workspace, made when it starts (`loom_tools::workcopy`).
+    /// Nothing it changes reaches the parent's workspace unless the parent adopts it.
+    Copy,
+}
+
+/// A child's own copy of the workspace, as its parent may look at it.
+#[derive(Clone, Debug)]
+pub struct ChildCopy {
+    /// The child, by its full id.
+    pub agent: SessionId,
+    /// The copy. Canonical.
+    pub dir: PathBuf,
+    /// What it was made from.
+    pub manifest: loom_tools::workcopy::Manifest,
+    /// The child has not settled.
+    pub running: bool,
+    /// The commands the child itself ran with `bash` to their end, oldest first, from its log.
+    pub runs: Vec<Run>,
+    /// For a command the parent has the harness run in the copy: it may write to the copy and to
+    /// the parent's scratch directory, not to the workspace the copy was made from.
+    pub sandbox: Arc<loom_tools::sandbox::Sandbox>,
+}
+
+/// One command a child ran to its end, as its log recorded it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub command: String,
+    /// When the call was recorded, before the command started.
+    pub started_ms: u64,
+    /// `None` when it did not end by exiting (a signal, a timeout, an interruption).
+    pub exit_code: Option<i64>,
+    /// The handle of its stored output.
+    pub output: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +280,12 @@ pub trait Orchestrator: Send + Sync {
     ) -> Result<Vec<Vote>, String>;
     /// Find the tool call whose stored output is `blob`, among the sessions of `mission`.
     async fn producer(&self, mission: &MissionId, blob: &BlobId) -> Option<Producer>;
+    /// The working copy of a child that was started with `Workspace::Copy`; `None` for a child that
+    /// shares its parent's workspace. `Err` when `child` is not a child of `parent`, or the record of
+    /// what its copy was made from cannot be read.
+    async fn child_copy(&self, _parent: &SessionId, _child: &SessionId) -> Result<Option<ChildCopy>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Default)]
@@ -395,6 +446,8 @@ pub fn tool(name: &str, shared: &Arc<Shared>) -> Option<Arc<dyn loom_tools::Tool
         "conclude" => Arc::new(terminal::Conclude(s)),
         "agent_spawn" => Arc::new(agents::AgentSpawn(s)),
         "agent_fanout" => Arc::new(agents::AgentFanout(s)),
+        "attempt" => Arc::new(agents::Attempt(s)),
+        "agent_adopt" => Arc::new(agents::AgentAdopt(s)),
         "agent_message" => Arc::new(agents::AgentMessage(s)),
         "agent_stop" => Arc::new(agents::AgentStop(s)),
         "decide" => Arc::new(agents::Decide(s)),
@@ -451,6 +504,8 @@ pub const NAMES: &[&str] = &[
     "conclude",
     "agent_spawn",
     "agent_fanout",
+    "attempt",
+    "agent_adopt",
     "agent_message",
     "agent_stop",
     "decide",

@@ -29,6 +29,39 @@ pub fn cut(s: &str, max: usize) -> String {
     format!("{kept}…[+{} chars]", total.saturating_sub(max))
 }
 
+/// Put first in the assignment of an agent that works in its own copy of the workspace: where it
+/// is, that nothing done there reaches the original, and what follows from that for paths and Git.
+/// `fork`: the agent starts with its parent's conversation, whose paths name the original.
+pub fn copy_header(copy: &str, source: &str, made: &loom_tools::workcopy::Made, fork: bool) -> String {
+    let mut text = format!(
+        "You work in your own copy of the workspace: {copy}. It was made from {source} as you were started ({} {}). Your commands start in the copy and relative paths are paths in it, so work with relative paths. Nothing you change in the copy changes {source}; do not write to {source}. When you have ended, the session that started you is shown which files you changed and may bring them into {source}, so leave the copy in the state you want judged.",
+        made.files,
+        if made.files == 1 { "file" } else { "files" }
+    );
+    if fork {
+        text.push_str(&format!(
+            " Everything before this assignment was done in {source}: where an earlier message names a path under {source}, the same file of your copy is under {copy}."
+        ));
+    }
+    if made.git_left_out.iter().any(|p| p == ".git") {
+        text.push_str(&format!(
+            " The copy is not a Git repository: {source} is a linked Git worktree whose repository lies outside it, and Git commands run in a copy would have changed that repository. To see what you changed, compare with the original, for example `diff -ru {source}/src src`."
+        ));
+    } else if !made.git_left_out.is_empty() {
+        text.push_str(&format!(
+            " Not copied, because their repositories lie outside the workspace: the Git pointer files {}. Git commands do not work in those directories of the copy.",
+            made.git_left_out.join(", ")
+        ));
+    }
+    if made.skipped > 0 {
+        text.push_str(&format!(
+            " {} entries of the workspace could not be read and are not in the copy.",
+            made.skipped
+        ));
+    }
+    text
+}
+
 /// Longest part of a malformed call's arguments shown back to the model.
 pub const MALFORMED_ARGS_CHARS: usize = 600;
 /// Longest tool name shown back to the model in a harness text.
