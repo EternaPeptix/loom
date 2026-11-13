@@ -397,7 +397,8 @@
 //!    The plan becomes `text_plan`, with or without a digest: the ledger brief is the durable state,
 //!    the digest an addition to it.
 //! 3. No plan: return without a record. Otherwise append `reweave{epoch: current + 1, upto_seq,
-//!    evictions, brief: texts::reweave_brief(<ledger.brief(default) or "">), digest, reason,
+//!    evictions, brief: texts::reweave_brief(<ledger.brief(default) or "">, <the rendered frontier, with
+//!    `attempts_run` of the records, when the session has a journal>), digest, reason,
 //!    before_tokens: size, after_tokens_est: size − (plan.before_tokens_est − plan.after_tokens_est)
 //!    × size / est}`.
 //!
@@ -457,6 +458,7 @@
 //!   watched too; a notice left open is resolved when `run` starts;
 //! - stall note after `stall_steps` steps of read-only calls, and not again until progress.
 
+use crate::frontier;
 use crate::gate::{self, Yield, YieldCtx};
 use crate::hud::{self, HudChild, HudInput, HudJob};
 use crate::rtools::{build_registry, ChildInfo, Delivery, Effect, Settlement, Shared};
@@ -3170,10 +3172,14 @@ impl Session {
         }
         let Some(plan) = plan else { return Ok(false) };
         let freed = scaled(plan.before_tokens_est.saturating_sub(plan.after_tokens_est), size, est);
-        let ledger_brief = if self.deps.shared.journal.is_some() {
-            self.deps.shared.ledger().map(|l| l.brief(&BriefOpts::default())).unwrap_or_default()
-        } else {
-            String::new()
+        let ledger = self.deps.shared.journal.as_ref().map(|_| self.deps.shared.ledger());
+        let (ledger_brief, frontier_block) = match ledger {
+            Some(Ok(l)) => {
+                let mut f = frontier::frontier(&l, now_ms());
+                f.attempts_run = frontier::attempts_run(&self.records);
+                (l.brief(&BriefOpts::default()), frontier::render(&f))
+            }
+            _ => (String::new(), None),
         };
         self.append(
             Author::Harness,
@@ -3181,7 +3187,7 @@ impl Session {
                 epoch: self.st.epoch.saturating_add(1),
                 upto_seq: plan.upto_seq,
                 evictions: plan.evictions,
-                brief: texts::reweave_brief(&ledger_brief),
+                brief: texts::reweave_brief(&ledger_brief, frontier_block.as_deref()),
                 digest,
                 reason: reason.to_string(),
                 before_tokens: size,
@@ -6514,7 +6520,7 @@ mod tests {
         );
         assert!(lines(2) < 700, "after the re-weave only the newest output is whole, got {}", lines(2));
         assert_no_cache_break(&rs);
-        assert!(all_text(&reqs[2]).contains(&texts::reweave_brief("")));
+        assert!(all_text(&reqs[2]).contains(&texts::reweave_brief("", None)));
     }
 
     #[tokio::test]
@@ -6740,6 +6746,60 @@ mod tests {
             let last = fx.server.requests().last().unwrap().clone();
             assert_eq!(all_text(&last).contains("Leads from earlier work"), digest.is_some());
             assert_no_cache_break(&rs);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_reweave_brief_carries_the_frontier_only_when_the_session_has_a_ledger() {
+        for mission in [true, false] {
+            let long = || Reply::tool("bash", json!({ "command": BIG }).to_string()).with_text("t".repeat(40_000));
+            let script = with_digest(vec![long().into(), long().into(), long().into(), Reply::text("ok").into()], None);
+            let mut fx = Fx::new("chat", false, mission, script).await;
+            fx.context =
+                ReweavePolicy { target_tokens: 60_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+            if mission {
+                let journal = fx.shared.journal.as_ref().unwrap().clone();
+                use loom_core::ledger::{EvidenceInput, EvidenceKind};
+                let me = SessionId::from("s-lead");
+                let ops = [
+                    LedgerOp::ClaimAdd { text: "the parser drops the last token".into() },
+                    LedgerOp::EvidenceAdd(EvidenceInput {
+                        claim: "c1".into(),
+                        kind: EvidenceKind::Execution,
+                        supports: true,
+                        session: "s-lead".into(),
+                        call_id: "call-0".into(),
+                        blob: None,
+                        lines: None,
+                        quote: None,
+                        note: "ran it".into(),
+                        attested: true,
+                    }),
+                    LedgerOp::ClaimUpdate {
+                        id: "c1".into(),
+                        status: loom_core::ledger::ClaimStatus::Supported,
+                        note: String::new(),
+                    },
+                    LedgerOp::DeadEnd { what: "tried mmap".into(), why: "segfaults".into() },
+                ];
+                for op in ops {
+                    journal.append(&me, true, op, &|_| Ok(())).unwrap();
+                }
+            }
+            let session = fx.create();
+            run_with(session, vec![user("go")]).await;
+            let rw = reweave_records(&fx.sink.records());
+            assert!(!rw.is_empty());
+            let brief = &rw[0].brief;
+            let paragraph = "a failed attempt rules out that attempt, not the approach";
+            assert_eq!(brief.contains(paragraph), mission, "{brief}");
+            assert_eq!(brief.contains("Where the work stands:"), mission, "{brief}");
+            if mission {
+                assert!(brief.contains("- Established: 1 (c1); latest c1: the parser drops the last token"), "{brief}");
+                assert!(brief.contains("- Set aside without evidence: 1 (x1)"), "{brief}");
+                assert!(brief.contains("- Attempts run in this session: "), "{brief}");
+                assert!(brief.contains("The mission ledger at this point:"), "{brief}");
+            }
         }
     }
 

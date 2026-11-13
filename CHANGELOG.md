@@ -15,6 +15,9 @@
   `frontier::directions`, and says to pick one and run it. When the ledger shows none it asks for three
   untried approaches, then names the role's real ways out (`ask_for`, `agent_spawn`, `report_blocker`).
   `conclude` unreachable with open plan steps adds that those steps are routes still open.
+- A re-weave now leaves a map, not a chronicle of failures: the resume brief adds the frontier block (when the
+  session has a ledger) and says a failed attempt rules out that attempt, not the approach, and the digest
+  request asks for Established / Ruled out / Tried, not ruled out / Open leads / Next instead of a list of leads.
 
 ### Watched jobs, agents in their own copies, and attempts
 
