@@ -36,8 +36,10 @@
 //! The runtime resets `nudges` to 0 whenever a tool call completes with status `Ok`.
 //!
 //! ## `check_finish_lead` — a lead called `finish`
-//! Returns `Err(text)` when `ledger.open_items()` is not empty. The text lists every open item (same
-//! line format as above, no cap) and, per group present, how to close it: plan steps — `step` with
+//! Returns `Err(text)` when `ledger.open_items()` is not empty. The text is collaborative, not an
+//! indictment: it opens with what the model asked for (finish), why the harness cannot deliver it yet
+//! (the record is incomplete), then the same `Still open:` lines as above, then, per group present,
+//! how to close it: plan steps — `step` with
 //! status done (say what showed it) or dropped (say why); obligations — wait for the job/agent, or
 //! stop it; claims — attach evidence with `evidence` and set the status with `claim_update`, or
 //! withdraw it; questions — they wait for the operator: `ask_user` ends the turn until answered.
@@ -270,11 +272,11 @@ fn idle_goal_paragraph(ctx: &YieldCtx<'_>) -> Option<String> {
         return None;
     }
     let mut p = String::from(
-        "The goal is not concluded and no plan step is open, so stopping here is not an exit. Add a plan step for the next route and take it, or run the target again.",
+        "The goal is not concluded and no plan step is open, so stopping here is not an exit — but this is not a judgment of the mission either: the record does not show one of the two honest outcomes yet. Add a plan step for the next route and take it, or run the target again.",
     );
     if has(ctx.tools, "conclude") {
         p.push_str(
-            " Call conclude once a run shows the goal met, or once you have established that it cannot be met as stated (every route closed, with execution evidence).",
+            " Call conclude once a run shows the goal met, or once you have established that it cannot be met as stated (every route closed, with execution evidence) — a well-evidenced negative conclusion is a reportable outcome, not a failure.",
         );
     }
     if has(ctx.tools, "report_blocker") {
@@ -377,7 +379,9 @@ pub fn check_finish_lead(ledger: &LedgerState, answer: &str) -> Result<(), Strin
     let mut parts: Vec<String> = Vec::new();
     let open = ledger.open_items();
     if !open.is_empty() {
-        let mut text = String::from("finish was refused: the ledger still has open items.\nStill open:");
+        let mut text = String::from(
+            "finish cannot be accepted yet: the ledger still has open items.\nThis is not a verdict on the work — it is the record being incomplete, and the harness can only deliver what the record supports.\nStill open:",
+        );
         for l in open_lines(ledger) {
             text.push('\n');
             text.push_str(&l);
@@ -834,7 +838,7 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         let l = with_goal(false);
         let text = nudge(&ctx(&t, Some(&l), "I am done."));
         assert!(
-            text.contains("The goal is not concluded and no plan step is open, so stopping here is not an exit."),
+            text.contains("The goal is not concluded and no plan step is open, so stopping here is not an exit — but this is not a judgment of the mission either:"),
             "{text}"
         );
         assert!(text.contains("Call conclude once a run shows the goal met"), "{text}");

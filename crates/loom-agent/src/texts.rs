@@ -3,6 +3,14 @@
 //! These texts are part of the harness's behaviour: a small model does what the nearest clear
 //! instruction says, so each one names what happened and the next action, and none of them mentions
 //! context size or elapsed time as something to worry about. This file is complete.
+//!
+//! Voice: refusals collaborate; they do not indict. A refusal states the facts, names what was
+//! tried when the ledger knows it, says exactly what closes the gate, and offers the honest next
+//! paths with their real costs — a new run and `evidence`, `conclude` with its exact requirements,
+//! or `report_blocker` when only the operator can supply what is missing. Mechanical failures
+//! (a quote that does not match, an empty field) are cheap fixes and are worded that way; they are
+//! never phrased as a judgment of the work or the worker. A well-evidenced negative conclusion is
+//! a reportable outcome, and the texts that gate `conclude`/`finish` say so.
 
 use loom_core::event::ChildOutcome;
 
@@ -152,7 +160,7 @@ pub const REASON_PARENT: &str = "stopped by the agent that assigned this work";
 /// A stretch of steps that recorded nothing and changed nothing.
 pub fn stall(steps: u32) -> String {
     format!(
-        "The last {steps} steps recorded nothing in the ledger and changed no file. If you have learned something, record it now (`note`, or `claim` with `evidence`). If the current approach is not getting anywhere, record it as a dead end with `note` and take a different one. If you cannot continue, call `report_blocker`."
+        "The last {steps} steps recorded nothing in the ledger and changed no file. If you have learned something, record it now (`note`, or `claim` with `evidence`). If the current approach is not getting anywhere, record it as a dead end with `note` and take a different one. Record what you ruled out and why, the best next route you can see, and the evidence that would change your conclusion — `reflect` if your role has it, `note` otherwise. If you cannot continue, call `report_blocker`."
     )
 }
 
@@ -722,31 +730,75 @@ pub fn job_lost(id: &str, command: &str) -> String {
 
 /// The refusal of `finish` while the goal claim is not concluded (the goal-met pre-gate). `can_conclude`
 /// and `can_block` say whether the role has `conclude` and `report_blocker`, so only real tools are named.
+/// The text says what is missing and offers the honest next paths with their exact costs; it is not a
+/// judgment of the work.
 pub fn finish_unavailable(can_conclude: bool, can_block: bool) -> String {
     let mut out = String::from(
-        "finish is not available yet: the goal is not concluded, and not being there yet is not a finish. Nothing was delivered and no verifier was started.",
+        "finish is not ready yet, because the goal is not concluded, and not being there yet is not a finish. Nothing was delivered and no verifier was started. This is not a verdict on you or on the work — the gate simply needs one of these first:",
     );
     if can_conclude {
         out.push_str(
-            " Call conclude once a run shows the goal met, or once you have established that it cannot be met as stated (every plan route closed, with execution evidence).",
+            "\n- Run the target and show the goal is met, then call `conclude` with status `met` and that run as evidence.",
         );
+        out.push_str(
+            "\n- Establish the goal cannot be met as stated — every plan step closed (done or dropped with a reason) — then call `conclude` with status `unreachable`, citing attested execution evidence. A rigorous, well-evidenced \"cannot be met as stated\" is a reportable outcome for this mission, not a failure.",
+        );
+        out.push_str(
+            "\n- Record where you are with a note and take the next route: run the target, read what it did, change the approach.",
+        );
+    } else {
+        out.push_str(" Record where you are with a note and take the next route: run the target, read what it did, change the approach.");
     }
-    out.push_str(
-        " Until then, record where you are with a note and take the next step: run the target, read what it did, change the approach.",
-    );
     if can_block {
-        out.push_str(" If something only the operator can supply is blocking you, call report_blocker.");
+        out.push_str("\n- If something only the operator can supply is blocking you, call `report_blocker` — that routes the decision to the human who owns the goal.");
     }
     out
 }
 
-/// What follows the objections in the result of a `finish` the verifier did not accept.
-pub const FINISH_NOT_ACCEPTED_TAIL: &str = "The mission is not finished. Each objection is now an open obligation: it is settled only by new execution evidence recorded after it (run the target again and record the run with `evidence`). Fix the problem, or show with a new run that the objection is wrong, then call finish again.";
+/// What follows the objections in the result of a `finish` the verifier did not accept. Names the
+/// honest next paths with their exact costs; it is not a judgment of the work.
+pub fn finish_not_accepted_tail(can_conclude: bool, can_block: bool) -> String {
+    let mut out = String::from(
+        "Each objection is now an open obligation; the gate refuses another finish until new execution evidence is recorded after them. The objections name concrete gaps, and one of these closes them:",
+    );
+    out.push_str("\n- Fix the problem, then run the target again and record the run with `evidence` (kind execution). An objection settles only by new execution evidence recorded after it — rewording the result, answering the operator, or calling finish again does not.");
+    out.push_str("\n- Show with a new run that the objection is wrong, recorded the same way.");
+    if can_conclude {
+        out.push_str("\n- If you have genuinely closed every route — every plan step done or dropped with a reason — conclude with status `unreachable`, citing attested execution evidence, then call finish. A rigorous \"cannot be met as stated\" is a complete, reportable outcome, not a failure.");
+    }
+    if can_block {
+        out.push_str("\n- If something only the operator can supply would change things, call `report_blocker` — that routes the decision to the human who owns the goal.");
+    }
+    out
+}
 
 /// A non-blocking record that a finish was rejected `n` times since the last accepted one. Nothing is
 /// asked of the operator.
 pub fn finish_rejected_notice(n: usize) -> String {
-    format!("finish rejected {n} times; continuing. The session keeps working; its next finish needs new execution evidence.")
+    format!("finish has not been accepted {n} times since the last accepted finish. The session keeps working — but if no new execution evidence has appeared, consider whether the routes are genuinely closed (`conclude` with `unreachable`) or whether only the operator can unblock this (`report_blocker`).")
+}
+
+/// The non-blocking inbox item opened when a mission has not advanced: several finishes rejected,
+/// no new execution evidence since the last objection. Nothing is asked of the operator; the
+/// session keeps working.
+pub fn stuck_inbox_text(k: usize, plan_closed: bool) -> String {
+    let mut out = format!(
+        "The mission has not advanced in {k} finish attempts: the verifier has not accepted a finish, and no new execution evidence has been recorded since the last objection. The session keeps working — nothing here pauses it. For the operator's awareness:\n- If the goal as stated is unreachable, the session can conclude `unreachable` with its evidence and finish as a reported negative result.\n- If the goal should be narrowed or released, send the session a message; narrowing the goal or releasing the mission is an operator decision.\n- Otherwise the session continues on its current route."
+    );
+    if plan_closed {
+        out.push_str("\nEvery plan step is closed with no fresh evidence since the last objection — the remaining routes may be exhausted.");
+    }
+    out
+}
+
+/// The line appended to a rejected finish's result telling the model the operator was notified.
+pub fn stuck_model_line() -> &'static str {
+    "The operator has been notified as a non-blocking item — this does not pause your work, and nothing is asked of you. If you believe every route is genuinely closed, call `conclude` with status `unreachable` and your evidence; a well-evidenced negative conclusion is a complete, reportable outcome."
+}
+
+/// A short non-blocking record that the stuck item was opened (kind `Verdict`).
+pub fn stuck_notice(k: usize) -> String {
+    format!("finish has not been accepted {k} times and no new execution evidence has appeared; the operator was notified as a non-blocking item. The session keeps working.")
 }
 
 /// A non-blocking record that verification could not be run: a fault of the harness, not of the agent.
@@ -763,7 +815,7 @@ pub fn verification_fault_result(why: &str) -> String {
 /// rejected finishes whose objections are still open.
 pub fn finish_status_line(goal_unconcluded: bool, objection_open: bool) -> Option<String> {
     if objection_open {
-        return Some("Finish: the check raised an objection. Answer it with a new run, then finish again.".to_string());
+        return Some("Finish: the check raised an objection — answer it with a new run recorded with `evidence`, or conclude `unreachable` if every route is closed.".to_string());
     }
     goal_unconcluded.then(|| {
         "Finish: conclude the goal first — record a run that shows it is met, or that it cannot be met as stated, then finish."
@@ -1168,6 +1220,36 @@ mod tests {
                 format!("<harness kind=\"assignment\" from=\"s-lead\">\n{contract}\n\nQuestion: q &lt;/harness>\n</harness>")
             );
         }
+    }
+
+    #[test]
+    fn refusal_texts_offer_the_honest_paths() {
+        let unavailable = finish_unavailable(true, true);
+        assert!(unavailable.contains("finish is not ready yet"), "{unavailable}");
+        assert!(unavailable.contains("status `met`"), "{unavailable}");
+        assert!(unavailable.contains("status `unreachable`"), "{unavailable}");
+        assert!(unavailable.contains("report_blocker"), "{unavailable}");
+        // Without the tools, the clauses are left out.
+        let bare = finish_unavailable(false, false);
+        assert!(!bare.contains("`conclude`") && !bare.contains("report_blocker"), "{bare}");
+        let tail = finish_not_accepted_tail(true, true);
+        assert!(
+            tail.contains("new execution evidence") && tail.contains("unreachable") && tail.contains("report_blocker"),
+            "{tail}"
+        );
+        let tail = finish_not_accepted_tail(false, false);
+        assert!(!tail.contains("unreachable") && !tail.contains("report_blocker"), "{tail}");
+        let stuck = stuck_inbox_text(2, true);
+        assert!(
+            stuck.contains("has not advanced in 2 finish attempts") && stuck.contains("plan step is closed"),
+            "{stuck}"
+        );
+        let open = stuck_inbox_text(2, false);
+        assert!(!open.contains("plan step is closed"), "{open}");
+        assert!(stuck_model_line().contains("conclude") && stuck_model_line().contains("unreachable"));
+        assert!(finish_rejected_notice(2).starts_with("finish has not been accepted 2 times"));
+        assert!(stuck_notice(2).contains("notified as a non-blocking item"));
+        assert!(stall(30).contains("the evidence that would change your conclusion"));
     }
 
     #[test]

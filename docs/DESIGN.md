@@ -862,7 +862,7 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
 **Tools.** Built in (`Registry::builtin`): `bash`, `job_wait`, `job_kill`, `job_list`, `read`,
 `write`, `edit`, `glob`, `grep`, `out_read`, `out_grep`, `web_fetch`, `cve_lookup`, `cve_search`,
 `advisory_lookup`. Runtime-owned (`loom-agent::rtools`, `NAMES`): `plan`, `step`, `note`, `claim`,
-`claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `finish`, `verdict`, `ask_user`,
+`claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`, `finish`, `verdict`, `ask_user`,
 `report_blocker`, `wait`, `agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`,
 `agent_stop`, `decide`, `verify`. A role lists the tools it has, in request order; a name in neither set is a pack error. The
 set is frozen in `session_start`. Every call goes through one pipeline (`loom_tools::prepare` → `run`

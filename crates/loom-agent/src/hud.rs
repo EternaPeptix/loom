@@ -52,6 +52,11 @@
 //!   verifier is an open obligation, else `Finish: conclude the goal first — …` while the goal-met
 //!   goal is set, its goal-met claim is not concluded and the operator has not released the mission. The
 //!   goal status itself is a line of the mission state.
+//! - Trajectory: a line of its own after the finish line, in a lead only, when the ledger records
+//!   anything at all. Facts, not gauges: claims supported of those recorded, plan steps remaining
+//!   (doing count in parentheses), dead ends recorded, finishes rejected since the mission started,
+//!   reflections recorded. Never a budget, a rate, a percentage or a projection. Omitted when the
+//!   ledger records nothing.
 //! - Typed security state: bounded mandatory coverage, unacknowledged routes unlocked by currently
 //!   live credentials/footholds, hypothesis status/priority and attempt counts. Render only record IDs
 //!   and counts, never locators, principals, secrets, free-form hypothesis/attempt text or conditions.
@@ -83,7 +88,7 @@
 
 use crate::texts;
 use loom_core::event::{Budget, Event, Record, ToolClass, ToolStatus, META_PATH};
-use loom_core::ledger::{BriefOpts, LedgerState, ObligationKind};
+use loom_core::ledger::{BriefOpts, ClaimStatus, LedgerState, ObligationKind, StepStatus};
 use loom_core::observe::{self, StaleKind};
 use loom_core::security_state::{HypothesisStatus, SecurityState};
 use serde_json::Value;
@@ -140,6 +145,9 @@ pub fn render(input: &HudInput<'_>) -> String {
         security_sections(&mut sections, &ledger.security, input.now_ms);
         if !input.is_child {
             if let Some(line) = finish_line(ledger, input.finish_gated) {
+                sections.push(line);
+            }
+            if let Some(line) = trajectory_line(ledger) {
                 sections.push(line);
             }
         }
@@ -280,6 +288,43 @@ fn finish_line(ledger: &LedgerState, gated: bool) -> Option<String> {
     let objection_open = ledger.release.is_none()
         && ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind == ObligationKind::Objection);
     texts::finish_status_line(gated && crate::gate::goal_unconcluded(ledger), objection_open)
+}
+
+/// A factual trajectory line from the ledger, for a lead: claims supported of those recorded, plan
+/// steps remaining (doing count in parentheses), dead ends recorded, finishes rejected since the
+/// mission started, reflections recorded. Never a budget, a rate, a percentage or a projection —
+/// just what the ledger holds. `None` when the ledger records nothing.
+fn trajectory_line(ledger: &LedgerState) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if !ledger.claims.is_empty() {
+        let supported = ledger.claims.iter().filter(|c| c.status == ClaimStatus::Supported).count();
+        parts.push(format!("{supported} of {} claims supported", ledger.claims.len()));
+    }
+    if !ledger.plan.is_empty() {
+        let remaining = ledger.plan.iter().filter(|p| matches!(p.status, StepStatus::Todo | StepStatus::Doing)).count();
+        let doing = ledger.plan.iter().filter(|p| p.status == StepStatus::Doing).count();
+        let mut s = format!("{remaining} plan step{} remaining", if remaining == 1 { "" } else { "s" });
+        if doing > 0 {
+            s.push_str(&format!(" ({doing} doing)"));
+        }
+        parts.push(s);
+    }
+    if !ledger.dead_ends.is_empty() {
+        let n = ledger.dead_ends.len();
+        parts.push(format!("{n} dead end{} recorded", if n == 1 { "" } else { "s" }));
+    }
+    let rejected = ledger.finishes.iter().filter(|f| f.accepted == Some(false)).count();
+    if rejected > 0 {
+        parts.push(format!("{rejected} finish{} rejected", if rejected == 1 { "" } else { "es" }));
+    }
+    if !ledger.reflections.is_empty() {
+        let n = ledger.reflections.len();
+        parts.push(format!("{n} reflection{} recorded", if n == 1 { "" } else { "s" }));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("Trajectory (from the ledger): {}", parts.join("; ")))
 }
 
 /// One section: `{title} ({n}){suffix}:` and its entries, capped at `MAX_ITEMS`. Omitted when empty.
@@ -548,7 +593,7 @@ mod tests {
         let mut i = input(EMPTY);
         i.ledger = Some(&l);
         let expected = format!(
-            "Now: 1970-01-01 00:00 UTC\n\nMission state (from the ledger — the ledger tools change it):\n{}\n\nFinish: conclude the goal first — record a run that shows it is met, or that it cannot be met as stated, then finish.\n\nWaiting on the operator (1):\n- q2: Which branch should this target?",
+            "Now: 1970-01-01 00:00 UTC\n\nMission state (from the ledger — the ledger tools change it):\n{}\n\nFinish: conclude the goal first — record a run that shows it is met, or that it cannot be met as stated, then finish.\n\nTrajectory (from the ledger): 1 plan step remaining (1 doing)\n\nWaiting on the operator (1):\n- q2: Which branch should this target?",
             l.brief(&BriefOpts::default())
         );
         assert_eq!(render(&i), expected);
@@ -734,6 +779,85 @@ mod tests {
     }
 
     #[test]
+    fn the_trajectory_line_reports_facts_without_gauges() {
+        use loom_core::ledger::{Claim, ClaimStatus, DeadEnd, FinishRecord, PlanStep, Reflection, StepStatus as S};
+        let mut l = LedgerState::default();
+        // Nothing recorded: the line is omitted.
+        let empty = input(EMPTY);
+        let mut i = empty;
+        i.ledger = Some(&l);
+        assert!(!render(&i).contains("Trajectory"), "{}", render(&i));
+        l.claims.push(Claim {
+            id: "c1".into(),
+            text: "x".into(),
+            status: ClaimStatus::Supported,
+            note: String::new(),
+            evidence: vec!["e1".into()],
+        });
+        l.claims.push(Claim {
+            id: "c2".into(),
+            text: "y".into(),
+            status: ClaimStatus::Open,
+            note: String::new(),
+            evidence: vec![],
+        });
+        l.plan.push(PlanStep {
+            id: "p1".into(),
+            text: "a".into(),
+            status: S::Doing,
+            note: String::new(),
+            evidence: vec![],
+        });
+        l.plan.push(PlanStep {
+            id: "p2".into(),
+            text: "b".into(),
+            status: S::Todo,
+            note: String::new(),
+            evidence: vec![],
+        });
+        l.plan.push(PlanStep {
+            id: "p3".into(),
+            text: "c".into(),
+            status: S::Done,
+            note: String::new(),
+            evidence: vec![],
+        });
+        l.dead_ends.push(DeadEnd { id: "x1".into(), what: "d".into(), why: "w".into(), n: 0 });
+        l.reflections.push(Reflection {
+            id: "r1".into(),
+            ruled_out: "a".into(),
+            next_route: "b".into(),
+            would_change: "c".into(),
+            n: 0,
+        });
+        l.finishes.push(FinishRecord {
+            id: "f1".into(),
+            summary: "s".into(),
+            evidence: vec![],
+            accepted: Some(false),
+            objections: vec!["o".into()],
+        });
+        l.finishes.push(FinishRecord {
+            id: "f2".into(),
+            summary: "s".into(),
+            evidence: vec![],
+            accepted: Some(true),
+            objections: vec![],
+        });
+        let mut i = input(EMPTY);
+        i.ledger = Some(&l);
+        let text = render(&i);
+        let line = text.lines().find(|l| l.starts_with("Trajectory")).expect("trajectory line");
+        assert_eq!(
+            line,
+            "Trajectory (from the ledger): 1 of 2 claims supported; 2 plan steps remaining (1 doing); 1 dead end recorded; 1 finish rejected; 1 reflection recorded"
+        );
+        // A child is not shown the trajectory either.
+        i.is_child = true;
+        assert!(!render(&i).contains("Trajectory"));
+    }
+
+    #[test]
     fn the_finish_line_says_why_finish_is_closed() {
         use loom_core::ledger::{FinishRecord, GoalMet, GoalMetStatus, Obligation, Release};
         let mut l = LedgerState { goal: Some("fix it".into()), ..LedgerState::default() };
@@ -741,7 +865,7 @@ mod tests {
         let mut i = input(EMPTY);
         i.ledger = Some(&l);
         assert!(render(&i).contains("\n\nFinish: conclude the goal first"), "{}", render(&i));
-        // A child is not told about finish.
+        // A child is not told about finish or trajectory.
         i.is_child = true;
         assert!(!render(&i).contains("Finish:"));
         i.is_child = false;
@@ -766,7 +890,7 @@ mod tests {
             outcome: None,
         });
         i.ledger = Some(&done);
-        assert!(render(&i).contains("\n\nFinish: the check raised an objection."), "{}", render(&i));
+        assert!(render(&i).contains("\n\nFinish: the check raised an objection"), "{}", render(&i));
         // Settled objection and a concluded goal: no line. Neither with a release.
         let mut settled = done.clone();
         settled.obligations[0].outcome = Some("settled".into());

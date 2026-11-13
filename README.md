@@ -135,7 +135,7 @@ and `edit` (regular files only; a write refuses when the file changed since the 
 it); `glob` and `grep`; `out_read` and `out_grep` (page and search any stored output); `web_fetch`
 (through the egress proxy); and `cve_lookup`, `cve_search` and `advisory_lookup` (public vulnerability
 databases, through the same proxy). The runtime adds the ledger tools (`plan`, `step`, `note`, `claim`,
-`claim_update`, `evidence`, `ledger`, `pin`, `log_search`), the agent tools (`agent_spawn`,
+`claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`), the agent tools (`agent_spawn`,
 `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`, `agent_stop`, `decide`, `verify`), `request_scope` (ask the operator for
 hosts) and `conclude` (state that the goal is met or cannot be met, with evidence) and the terminating tools (`finish`,
 `verdict`, `ask_user`, `report_blocker`, `wait`). Which of them a session has depends on its role.
