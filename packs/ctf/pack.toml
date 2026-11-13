@@ -9,7 +9,7 @@ target_concurrency = 2
 [roles.dispatcher]
 prompt = "roles/dispatcher.md"
 termination = "explicit"
-tools = ["bash", "read", "out_read", "plan", "step", "claim", "security_record", "security_query", "evidence", "agent_spawn", "agent_fanout", "agent_stop", "claim_update", "request_scope", "conclude", "finish", "report_blocker", "agent_message"]
+tools = ["bash", "read", "out_read", "plan", "step", "claim", "security_record", "security_query", "evidence", "agent_spawn", "agent_fanout", "agent_stop", "claim_update", "request_scope", "conclude", "finish", "report_blocker", "agent_message", "grep", "glob", "wait", "attempt", "agent_adopt"]
 may_spawn = ["solver", "web_solver", "binary_solver", "crypto_solver", "observer", "flag_judge"]
 verify_finish = true
 verifier = "flag_judge"
@@ -20,28 +20,28 @@ flag_regex = "(?:flag|HTB|CTF)\\{[^}\\r\\n]{1,200}\\}"
 [roles.solver]
 prompt = "roles/solver.md"
 termination = "explicit"
-tools = ["bash", "read", "write", "edit", "out_read", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "pty_open", "pty_exec", "pty_close"]
+tools = ["bash", "read", "write", "edit", "out_read", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "pty_open", "pty_exec", "pty_close", "grep", "glob", "wait"]
 max_steps = 35
 flag_regex = "(?:flag|HTB|CTF)\\{[^}\\r\\n]{1,200}\\}"
 
 [roles.web_solver]
 prompt = "roles/web_solver.md"
 termination = "explicit"
-tools = ["bash", "read", "write", "out_read", "http_send", "http_repeat", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "pty_open", "pty_exec", "pty_close", "job_kill"]
+tools = ["bash", "read", "write", "out_read", "http_send", "http_repeat", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "pty_open", "pty_exec", "pty_close", "job_kill", "edit", "grep", "glob", "job_wait", "wait"]
 max_steps = 35
 flag_regex = "(?:flag|HTB|CTF)\\{[^}\\r\\n]{1,200}\\}"
 
 [roles.binary_solver]
 prompt = "roles/binary_solver.md"
 termination = "explicit"
-tools = ["bash", "read", "write", "out_read", "bin_survey", "bin_decompile", "bin_xrefs", "gdb_probe", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill"]
+tools = ["bash", "read", "write", "out_read", "bin_survey", "bin_decompile", "bin_xrefs", "gdb_probe", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "edit", "grep", "glob", "pty_open", "pty_exec", "pty_close", "wait"]
 max_steps = 35
 flag_regex = "(?:flag|HTB|CTF)\\{[^}\\r\\n]{1,200}\\}"
 
 [roles.crypto_solver]
 prompt = "roles/crypto_solver.md"
 termination = "explicit"
-tools = ["bash", "read", "write", "out_read", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill"]
+tools = ["bash", "read", "write", "out_read", "codec_calc", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "edit", "grep", "glob", "pty_open", "pty_exec", "pty_close", "wait"]
 max_steps = 35
 flag_regex = "(?:flag|HTB|CTF)\\{[^}\\r\\n]{1,200}\\}"
 

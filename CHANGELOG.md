@@ -32,9 +32,15 @@
 
 ### Domain packs and evaluation
 
-- Added opt-in CTF and Redteam packs with specialist tool surfaces (at most 18 per role), bounded
-  epochs, credential-gated lateral assignments, observers and operator-contract judges. Existing
-  installed packs and running session prefixes are not automatically replaced.
+- Added opt-in CTF and Redteam packs with specialist tool surfaces (CTF roles at most 25 per role,
+  Redteam at most 18), bounded epochs, credential-gated lateral assignments, observers and
+  operator-contract judges. Existing installed packs and running session prefixes are not
+  automatically replaced.
+- The `ctf` dispatcher gained `grep`, `glob`, `wait`, `attempt` and `agent_adopt`; `solver` gained
+  `grep`, `glob` and `wait`; `web_solver`, `binary_solver` and `crypto_solver` gained `edit`, `grep`,
+  `glob` and `wait`, and `binary_solver`/`crypto_solver` also gained the PTY tools
+  (`pty_open`/`pty_exec`/`pty_close`); `web_solver` also gained `job_wait`. Packs installed under
+  `~/.loom/packs` are not updated by an upgrade: replace an installed `ctf` with the shipped one.
 - Added a paired qualification protocol and a JSONL analyzer that retains censored failures, unknown
   usage and pairing errors. It performs no model/target calls and claims no benchmark improvement.
 

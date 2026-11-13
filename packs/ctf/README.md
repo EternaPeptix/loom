@@ -2,7 +2,7 @@
 
 Opt-in roles for authorized local challenges and scoped CTF services. The dispatcher has four direct
 execution starts; solver roles have 35-step slices. Web/binary/crypto roles keep tools relevant to
-their work (at most 18 per role). An observer returns bounded recommendations to the dispatcher, which
+their work (at most 25 per role). An observer returns bounded recommendations to the dispatcher, which
 relays them to active solvers. Profile diversity is operator configured; no cache hit or quality gain
 is assumed.
 

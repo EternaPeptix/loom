@@ -829,6 +829,32 @@ mod tests {
         assert!(text.contains("refuses to start a scout as a `fork`"));
     }
 
+    #[test]
+    fn the_ctf_prose_names_only_tools_the_pack_has() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let p = Packs::load(&dir).unwrap();
+        let known = crate::rtools::known_tools();
+        let ctf = p.get("ctf").unwrap();
+        // The shared preamble is read by every role, so a tool it names only needs to belong to
+        // some role of the pack.
+        for tool in tools_named(&ctf.preamble, &known) {
+            assert!(
+                ctf.roles.values().any(|r| r.tools.contains(&tool)),
+                "packs/ctf/harness.md names `{tool}`, which no role of the pack has"
+            );
+        }
+        // A role's own prompt only gets to name tools that role itself has.
+        for role in ctf.roles.values() {
+            for tool in tools_named(&role.prompt, &known) {
+                assert!(
+                    role.tools.contains(&tool),
+                    "ctf/{}: its prompt names `{tool}`, which it does not have",
+                    role.name
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_escape_rejected() {
@@ -926,8 +952,9 @@ mod tests {
             let pack = packs.get(name).unwrap();
             assert!(pack.requires_restricted_network);
             assert!(pack.command_guard);
+            let cap = if name == "ctf" { 25 } else { 18 };
             for role in pack.roles.values() {
-                assert!(role.tools.len() <= 18, "{name}/{} exposes {} tools", role.name, role.tools.len());
+                assert!(role.tools.len() <= cap, "{name}/{} exposes {} tools", role.name, role.tools.len());
                 assert_eq!(role.requires_credential, name == "redteam" && role.name == "lateral_operator");
                 if role.name != pack.default_role {
                     assert!(role.max_steps.is_some(), "{name}/{} lacks an epoch cap", role.name);
@@ -938,5 +965,30 @@ mod tests {
         assert_eq!(packs.role(Some("ctf"), Some("solver")).unwrap().max_steps, Some(35));
         assert_eq!(packs.role(Some("redteam"), Some("recon_operator")).unwrap().max_steps, Some(25));
         assert_eq!(packs.role(Some("redteam"), Some("lateral_operator")).unwrap().max_steps, Some(30));
+    }
+
+    #[test]
+    fn ctf_pack_grants_search_wait_edit_and_pty_to_the_roles_that_lacked_them() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let packs = Packs::load(&dir).unwrap();
+        let ctf = packs.get("ctf").unwrap();
+        let has = |role: &str, tool: &str| ctf.roles.get(role).unwrap().tools.iter().any(|t| t == tool);
+        for role in ["solver", "web_solver", "binary_solver", "crypto_solver"] {
+            for tool in ["grep", "glob", "wait"] {
+                assert!(has(role, tool), "ctf/{role} should have {tool}");
+            }
+        }
+        for role in ["web_solver", "binary_solver", "crypto_solver"] {
+            assert!(has(role, "edit"), "ctf/{role} should have edit");
+        }
+        for role in ["binary_solver", "crypto_solver"] {
+            for tool in ["pty_open", "pty_exec", "pty_close"] {
+                assert!(has(role, tool), "ctf/{role} should have {tool}");
+            }
+        }
+        assert!(has("web_solver", "job_wait"));
+        for tool in ["wait", "attempt", "agent_adopt", "grep", "glob"] {
+            assert!(has("dispatcher", tool), "ctf/dispatcher should have {tool}");
+        }
     }
 }

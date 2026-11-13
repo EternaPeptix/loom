@@ -6291,6 +6291,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_spawned_child_waits_on_its_own_watched_job_while_its_parent_blocks_in_join() {
+        // Bounded, so a failed run leaves no loop behind. The job writes its line only when the test says so.
+        let command = "echo scanning; i=0; while [ ! -f release ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done; \
+                       echo 'FOUND key=abc'";
+        let e = env(Script::new(move |body, _| {
+            if has_tool(body, "agent_spawn") {
+                if last_role(body) == "tool" {
+                    finish("lead done")
+                } else {
+                    call("agent_spawn", json!({"question": "CHILDMARK work"}))
+                }
+            } else {
+                match tool_msgs(body) {
+                    0 => call("bash", json!({"command": command, "background": true, "wake_on": "^FOUND"})),
+                    1 => call("wait", json!({})),
+                    _ => finish("child report"),
+                }
+            }
+        }))
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("child registered its job", || {
+            e.children(&id).first().is_some_and(|c| e.has(&c.meta.id, |ev| matches!(ev, Event::JobRegistered { .. })))
+        })
+        .await;
+        let kid = e.children(&id)[0].meta.id.clone();
+        until("the child's turn waits", || e.has(&kid, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        // The parent is blocked in `join`: it has sent its spawn request and nothing more, however
+        // slow the machine is, until the child settles.
+        assert_eq!(e.server.requests().iter().filter(|b| has_tool(b, "agent_spawn")).count(), 1);
+        assert!(!e.has(&id, |ev| matches!(ev, Event::ChildSettled(_))));
+        std::fs::write(e.ws.join("release"), "").unwrap();
+        until("the job matched and woke the child", || e.has(&kid, |ev| matches!(ev, Event::JobMatched { .. }))).await;
+        until("the child settled", || {
+            e.has(&kid, |ev| matches!(ev, Event::ChildSettled { .. } | Event::TurnEnd { .. }))
+        })
+        .await;
+        until("the parent's turn ends", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let kid_kinds = e.kinds(&kid);
+        assert!(kid_kinds.iter().any(|k| k == "job_matched"), "{kid_kinds:?}");
+        assert!(e.has(&id, |ev| matches!(ev, Event::ChildSettled(c) if c.outcome == ChildOutcome::Returned)));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn the_part_a_watched_job_matched_is_citable_while_the_job_runs() {
         // The job writes its line only when the test says so. Bounded, so a failed run leaves no loop.
         let command = "echo scanning; i=0; while [ ! -f release ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done; \
