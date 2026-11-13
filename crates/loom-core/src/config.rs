@@ -381,7 +381,8 @@ impl Default for BoxCfg {
 /// `name@sha256:<64 hex>` or `sha256:<64 hex>`: an image that cannot change under its name.
 pub fn pinned_image(image: &str) -> bool {
     let digest = |d: &str| {
-        d.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        d.strip_prefix("sha256:")
+            .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
     };
     match image.split_once('@') {
         Some((name, d)) => {
@@ -434,7 +435,9 @@ impl BoxCfg {
         }
         for (key, image) in [("image", &self.image), ("helper_image", &self.helper_image)] {
             if image.is_empty() {
-                return Err(format!("box.enabled is true but box.{key} is not set. Set it to a pinned image (sha256:<64 hex digits>)."));
+                return Err(format!(
+                    "box.enabled is true but box.{key} is not set. Set it to a pinned image (sha256:<64 hex digits>)."
+                ));
             }
         }
         let ssh = !self.ssh_host.is_empty() || !self.remote_socket.is_empty();
@@ -879,7 +882,9 @@ allow = ["*.example.test"]
     #[test]
     fn i2_cap_add_rejects_exactly_the_dangerous_capabilities() {
         for cap in BOX_FORBIDDEN_CAPS {
-            for spelled in [cap.to_string(), cap.to_lowercase(), format!("CAP_{cap}"), format!("cap_{}", cap.to_lowercase())] {
+            for spelled in
+                [cap.to_string(), cap.to_lowercase(), format!("CAP_{cap}"), format!("cap_{}", cap.to_lowercase())]
+            {
                 let err = box_cfg(&format!("cap_add = [\"{spelled}\"]")).unwrap_err();
                 assert!(err.contains("never gives the box"), "{spelled}: {err}");
             }
@@ -917,7 +922,9 @@ allow = ["*.example.test"]
         let check = |extra: &str| Config::parse(&format!("{base}{extra}")).unwrap().check().map_err(|e| e.to_string());
         assert!(check("").unwrap_err().contains("exactly one way"));
         assert!(check("docker_socket = \"/s\"").is_ok());
-        assert!(check("docker_socket = \"/s\"\nssh_host = \"h\"\nremote_socket = \"/r\"").unwrap_err().contains("exactly one way"));
+        assert!(check("docker_socket = \"/s\"\nssh_host = \"h\"\nremote_socket = \"/r\"")
+            .unwrap_err()
+            .contains("exactly one way"));
         assert!(check("ssh_host = \"h\"").unwrap_err().contains("together"));
         assert!(check("ssh_host = \"-oProxyCommand=x\"\nremote_socket = \"/r\"").unwrap_err().contains("ssh_host"));
         assert!(check("ssh_host = \"h\"\nremote_socket = \"/r:/etc\"").unwrap_err().contains("remote_socket"));

@@ -189,7 +189,14 @@ pub fn rm_args(n: &Names) -> Vec<String> {
 }
 
 pub fn running_args(n: &Names) -> Vec<String> {
-    vec!["inspect".into(), "--type".into(), "container".into(), "--format".into(), "{{.State.Running}}".into(), n.container.clone()]
+    vec![
+        "inspect".into(),
+        "--type".into(),
+        "container".into(),
+        "--format".into(),
+        "{{.State.Running}}".into(),
+        n.container.clone(),
+    ]
 }
 
 /// `docker run` of the box (I2). `cfg.cap_add` has passed `BoxCfg::check`.
@@ -323,7 +330,8 @@ pub fn network_ls_args(home: &str) -> Vec<String> {
 const RULES_APPLY: &str = "iptables-restore -w 5 --noflush || exit 1; \
 for c in DOCKER-USER INPUT; do iptables -w 5 -C \"$c\" -i \"$2\" -j \"$1\" 2>/dev/null || iptables -w 5 -I \"$c\" 1 -i \"$2\" -j \"$1\" || exit 1; done";
 /// The script that removes the jumps, then the chain.
-const RULES_REMOVE: &str = "for c in DOCKER-USER INPUT; do while iptables -w 5 -D \"$c\" -i \"$2\" -j \"$1\" 2>/dev/null; do :; done; done; \
+const RULES_REMOVE: &str =
+    "for c in DOCKER-USER INPUT; do while iptables -w 5 -D \"$c\" -i \"$2\" -j \"$1\" 2>/dev/null; do :; done; done; \
 iptables -w 5 -F \"$1\" 2>/dev/null; iptables -w 5 -X \"$1\" 2>/dev/null; exit 0";
 
 fn helper_args(cfg: &BoxCfg, interactive: bool, script: &str, n: &Names) -> Vec<String> {
@@ -370,7 +378,9 @@ pub fn rules_text(n: &Names, allowed: &BTreeSet<Allowed>) -> String {
     for a in allowed {
         for proto in ["tcp", "udp"] {
             match a.port {
-                Some(p) => t.push_str(&format!("-A {} -d {}/32 -p {proto} -m {proto} --dport {p} -j ACCEPT\n", n.chain, a.ip)),
+                Some(p) => {
+                    t.push_str(&format!("-A {} -d {}/32 -p {proto} -m {proto} --dport {p} -j ACCEPT\n", n.chain, a.ip))
+                }
                 None => t.push_str(&format!("-A {} -d {}/32 -p {proto} -j ACCEPT\n", n.chain, a.ip)),
             }
         }
@@ -438,7 +448,9 @@ fn split_grant(grant: &str) -> Option<(String, Option<u16>)> {
         return Some((g.to_ascii_lowercase(), None));
     }
     match g.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') => Some((host.trim_end_matches('.').to_ascii_lowercase(), Some(port.parse::<u16>().ok()?))),
+        Some((host, port)) if !host.contains(':') => {
+            Some((host.trim_end_matches('.').to_ascii_lowercase(), Some(port.parse::<u16>().ok()?)))
+        }
         Some(_) => None,
         None => Some((g.trim_end_matches('.').to_ascii_lowercase(), None)),
     }
@@ -706,7 +718,8 @@ impl DockerHost {
 
     fn start_forward(&self) -> Forward {
         let stop = Arc::new(tokio::sync::Notify::new());
-        let (program, args, socket) = (self.ssh_program.clone(), ssh_args(&self.cfg, &self.socket), self.socket.clone());
+        let (program, args, socket) =
+            (self.ssh_program.clone(), ssh_args(&self.cfg, &self.socket), self.socket.clone());
         let (stop2, errors) = (stop.clone(), self.last_ssh_error.clone());
         let task = tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
@@ -729,7 +742,11 @@ impl DockerHost {
                         };
                         let mut text = String::new();
                         if let Some(mut e) = child.stderr.take() {
-                            let _ = tokio::time::timeout(Duration::from_millis(200), (&mut e).take(4096).read_to_string(&mut text)).await;
+                            let _ = tokio::time::timeout(
+                                Duration::from_millis(200),
+                                (&mut e).take(4096).read_to_string(&mut text),
+                            )
+                            .await;
                         }
                         if let Ok(mut last) = errors.lock() {
                             *last = text.trim().to_string();
@@ -936,7 +953,10 @@ impl MissionBox {
 
     async fn install_rules(&self, plan: &Egress) -> Result<(), String> {
         let text = rules_text(&self.names, &plan.allowed).into_bytes();
-        self.host.run_ok("Installing the egress rules", &rules_args(&self.host.cfg, &self.names), Some(text)).await.map(|_| ())
+        self.host
+            .run_ok("Installing the egress rules", &rules_args(&self.host.cfg, &self.names), Some(text))
+            .await
+            .map(|_| ())
     }
 
     async fn write_hosts(&self, plan: &Egress) -> Result<(), String> {
@@ -1045,7 +1065,10 @@ impl MissionBox {
     pub async fn push(&self, sandbox: Arc<Sandbox>, workspace: PathBuf) -> Result<PushReport, String> {
         let mut st = self.state.lock().await;
         let cfg = &self.host.cfg;
-        let limits = boxfs::PushLimits { total: cfg.sync_max_mb.saturating_mul(1 << 20), file: cfg.sync_file_max_mb.saturating_mul(1 << 20) };
+        let limits = boxfs::PushLimits {
+            total: cfg.sync_max_mb.saturating_mul(1 << 20),
+            file: cfg.sync_file_max_mb.saturating_mul(1 << 20),
+        };
         let prev = std::mem::take(&mut st.pushed);
         let built = {
             let prev = prev.clone();
@@ -1261,7 +1284,8 @@ exit 0
             // Hosts without a `setsid` command (macOS) get one that behaves the same for the box's wrapper.
             std::fs::create_dir_all(dir.join("bin")).expect("fake bin");
             let setsid = dir.join("bin/setsid");
-            std::fs::write(&setsid, "#!/usr/bin/perl\nuse POSIX;\nPOSIX::setsid();\nexec { $ARGV[0] } @ARGV;\n").expect("write setsid");
+            std::fs::write(&setsid, "#!/usr/bin/perl\nuse POSIX;\nPOSIX::setsid();\nexec { $ARGV[0] } @ARGV;\n")
+                .expect("write setsid");
             std::fs::set_permissions(&setsid, std::fs::Permissions::from_mode(0o755)).expect("chmod setsid");
             FakeDocker { dir, cli, socket }
         }
@@ -1296,7 +1320,11 @@ exit 0
 
         /// The calls of one docker subcommand (the argv after `--host <x>`).
         pub fn sub(&self, name: &str) -> Vec<Vec<String>> {
-            self.calls().into_iter().filter_map(|c| c.get(2..).map(<[String]>::to_vec)).filter(|c| c.first().is_some_and(|s| s == name)).collect()
+            self.calls()
+                .into_iter()
+                .filter_map(|c| c.get(2..).map(<[String]>::to_vec))
+                .filter(|c| c.first().is_some_and(|s| s == name))
+                .collect()
         }
 
         pub fn running(&self, container: &str) -> bool {
@@ -1370,19 +1398,60 @@ mod tests {
         let n = names("m-1");
         let args = run_args(&sample_cfg(), &n, "HOMEHASH");
         let expected: Vec<String> = [
-            "run", "--detach", "--name", "loom-m-1", "--label", "loom.home=HOMEHASH", "--label", "loom.mission=m-1",
-            "--network", "loom-m-1", "--dns", "192.0.2.1", "--cap-drop", "ALL", "--cap-add", "SYS_PTRACE", "--cap-add",
-            "NET_RAW", "--security-opt", "no-new-privileges", "--pids-limit", "512", "--memory", "8192m", "--memory-swap",
-            "8192m", "--cpus", "4", "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,size=1024m,uid=1000,gid=1000,mode=1777",
-            "--tmpfs", "/work:rw,nosuid,nodev,size=4096m,uid=1000,gid=1000,mode=0755", "--user", "1000:1000", "--workdir",
-            "/work", "--ipc", "private", "--restart", "no", "--entrypoint", "/bin/sleep", DIGEST, "2147483647",
+            "run",
+            "--detach",
+            "--name",
+            "loom-m-1",
+            "--label",
+            "loom.home=HOMEHASH",
+            "--label",
+            "loom.mission=m-1",
+            "--network",
+            "loom-m-1",
+            "--dns",
+            "192.0.2.1",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "SYS_PTRACE",
+            "--cap-add",
+            "NET_RAW",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            "512",
+            "--memory",
+            "8192m",
+            "--memory-swap",
+            "8192m",
+            "--cpus",
+            "4",
+            "--read-only",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=1024m,uid=1000,gid=1000,mode=1777",
+            "--tmpfs",
+            "/work:rw,nosuid,nodev,size=4096m,uid=1000,gid=1000,mode=0755",
+            "--user",
+            "1000:1000",
+            "--workdir",
+            "/work",
+            "--ipc",
+            "private",
+            "--restart",
+            "no",
+            "--entrypoint",
+            "/bin/sleep",
+            DIGEST,
+            "2147483647",
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
         assert_eq!(args, expected);
         // What must never appear, whatever the configuration.
-        for forbidden in ["--privileged", "-v", "--volume", "--mount", "--device", "--pid", "--uts", "--userns", "--cap-add=ALL"] {
+        for forbidden in
+            ["--privileged", "-v", "--volume", "--mount", "--device", "--pid", "--uts", "--userns", "--cap-add=ALL"]
+        {
             assert!(!args.iter().any(|a| a == forbidden), "{forbidden}");
         }
         for (i, a) in args.iter().enumerate() {
@@ -1413,11 +1482,29 @@ mod tests {
             let a = exec_args(&n, "call-1", "/work", script);
             assert_eq!(a.len(), plain.len(), "{script:?} changed the number of arguments");
             assert_eq!(a.last().map(String::as_str), Some(script), "the script is the last argument, verbatim");
-            assert_eq!(a[..a.len() - 1], plain[..plain.len() - 1], "{script:?} changed an argument that is not its own");
+            assert_eq!(
+                a[..a.len() - 1],
+                plain[..plain.len() - 1],
+                "{script:?} changed an argument that is not its own"
+            );
         }
         let expected: Vec<String> = [
-            "exec", "--user", "1000:1000", "--workdir", "/work", "--env", "HOME=/tmp", "--env", "TERM=dumb", "loom-m-1", "/bin/bash",
-            "-c", EXEC_WRAP, "_", "/tmp/.loom-call-1.pid", "echo hi",
+            "exec",
+            "--user",
+            "1000:1000",
+            "--workdir",
+            "/work",
+            "--env",
+            "HOME=/tmp",
+            "--env",
+            "TERM=dumb",
+            "loom-m-1",
+            "/bin/bash",
+            "-c",
+            EXEC_WRAP,
+            "_",
+            "/tmp/.loom-call-1.pid",
+            "echo hi",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -1439,11 +1526,27 @@ mod tests {
         let kill = kill_args(&n, "/tmp/.loom-c.pid", "TERM");
         assert_eq!(
             kill,
-            ["exec", "--user", "1000:1000", "loom-m-1", "/bin/sh", "-c", "kill -TERM -- -$(cat \"$0\")", "/tmp/.loom-c.pid"]
+            [
+                "exec",
+                "--user",
+                "1000:1000",
+                "loom-m-1",
+                "/bin/sh",
+                "-c",
+                "kill -TERM -- -$(cat \"$0\")",
+                "/tmp/.loom-c.pid"
+            ]
         );
         assert_eq!(kill_args(&n, "/p", "KILL")[6], "kill -KILL -- -$(cat \"$0\")");
-        assert_eq!(kill_args(&n, "/p", "x; rm")[6], "kill -TERM -- -$(cat \"$0\")", "the signal is one of two fixed words");
-        assert_eq!(hosts_args(&n), ["exec", "--interactive", "--user", "0", "loom-m-1", "/bin/sh", "-c", "cat > /etc/hosts"]);
+        assert_eq!(
+            kill_args(&n, "/p", "x; rm")[6],
+            "kill -TERM -- -$(cat \"$0\")",
+            "the signal is one of two fixed words"
+        );
+        assert_eq!(
+            hosts_args(&n),
+            ["exec", "--interactive", "--user", "0", "loom-m-1", "/bin/sh", "-c", "cat > /etc/hosts"]
+        );
         assert_eq!(cp_in_args(&n), ["cp", "--archive", "-", "loom-m-1:/work"]);
         assert_eq!(cp_out_args(&n, "/work/out"), ["cp", "loom-m-1:/work/out", "-"]);
         assert_eq!(rm_args(&n), ["rm", "--force", "--volumes", "loom-m-1"]);
@@ -1451,8 +1554,17 @@ mod tests {
         assert_eq!(
             network_args(&n, "H"),
             [
-                "network", "create", "--driver", "bridge", "--ipv6=false", "--opt",
-                &format!("com.docker.network.bridge.name={}", n.iface), "--label", "loom.home=H", "--label", "loom.mission=m-1",
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--ipv6=false",
+                "--opt",
+                &format!("com.docker.network.bridge.name={}", n.iface),
+                "--label",
+                "loom.home=H",
+                "--label",
+                "loom.mission=m-1",
                 "loom-m-1"
             ]
         );
@@ -1461,16 +1573,16 @@ mod tests {
     #[test]
     fn i4_the_plan_applies_exact_hosts_and_ips_under_the_policy() {
         let g = grants(&[
-            "203.0.113.7",          // public IP literal, all ports
-            "198.51.100.9:443",     // public IP literal with a port
-            "target.test:8080",     // a name with a port
-            "both.test",            // a name that resolves to a v4 and a v6 address
-            "10.1.2.3",             // private literal: refused
-            "internal.test",        // resolves to a private address: refused
-            "*.wild.test",          // wildcard: not applied
-            "*",                    // wildcard: not applied
-            "[2001:db8::1]:80",     // IPv6 literal: skipped
-            "gone.test",            // does not resolve
+            "203.0.113.7",      // public IP literal, all ports
+            "198.51.100.9:443", // public IP literal with a port
+            "target.test:8080", // a name with a port
+            "both.test",        // a name that resolves to a v4 and a v6 address
+            "10.1.2.3",         // private literal: refused
+            "internal.test",    // resolves to a private address: refused
+            "*.wild.test",      // wildcard: not applied
+            "*",                // wildcard: not applied
+            "[2001:db8::1]:80", // IPv6 literal: skipped
+            "gone.test",        // does not resolve
         ]);
         let res = resolved(&[
             ("target.test", &["203.0.113.50"]),
@@ -1497,7 +1609,10 @@ mod tests {
         assert!(skipped.contains("gone.test") && skipped.contains("did not resolve"), "{skipped}");
         // Only names appear in /etc/hosts, with the addresses that passed.
         assert_eq!(plan.hosts.keys().map(String::as_str).collect::<Vec<_>>(), ["both.test", "target.test"]);
-        assert_eq!(hosts_text(&plan.hosts), "127.0.0.1 localhost\n::1 localhost ip6-localhost\n203.0.113.60 both.test\n203.0.113.50 target.test\n");
+        assert_eq!(
+            hosts_text(&plan.hosts),
+            "127.0.0.1 localhost\n::1 localhost ip6-localhost\n203.0.113.60 both.test\n203.0.113.50 target.test\n"
+        );
         // The names to resolve: exact names only.
         assert_eq!(grant_names(&g), ["both.test", "gone.test", "internal.test", "target.test"]);
     }
@@ -1512,10 +1627,19 @@ mod tests {
         let ips: Vec<String> = plan.allowed.iter().map(|a| format!("{}:{:?}", a.ip, a.port)).collect();
         assert_eq!(ips, ["10.1.2.3:None", "10.9.9.9:Some(22)"]);
         // A deny entry still wins over a grant, and one that names ports refuses a grant of all ports.
-        let plan = plan_egress(&grants(&["203.0.113.7", "203.0.113.8:22"]), &policy(&[], &["203.0.113.7"]), &BTreeMap::new());
+        let plan =
+            plan_egress(&grants(&["203.0.113.7", "203.0.113.8:22"]), &policy(&[], &["203.0.113.7"]), &BTreeMap::new());
         assert_eq!(plan.allowed.iter().map(|a| a.ip.to_string()).collect::<Vec<_>>(), ["203.0.113.8"]);
-        let plan = plan_egress(&grants(&["203.0.113.7", "203.0.113.7:80"]), &policy(&[], &["203.0.113.7:22"]), &BTreeMap::new());
-        assert_eq!(plan.allowed.iter().map(|a| a.port).collect::<Vec<_>>(), [Some(80)], "all ports are refused when one is denied");
+        let plan = plan_egress(
+            &grants(&["203.0.113.7", "203.0.113.7:80"]),
+            &policy(&[], &["203.0.113.7:22"]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            plan.allowed.iter().map(|a| a.port).collect::<Vec<_>>(),
+            [Some(80)],
+            "all ports are refused when one is denied"
+        );
     }
 
     #[test]
@@ -1545,15 +1669,33 @@ mod tests {
         assert_eq!(
             run[..run.len() - 3],
             [
-                "run", "--rm", "--interactive", "--network", "host", "--cap-drop", "ALL", "--cap-add", "NET_ADMIN", "--security-opt",
-                "no-new-privileges", "--read-only", "--entrypoint", "/bin/sh", &cfg.helper_image, "-c", RULES_APPLY
+                "run",
+                "--rm",
+                "--interactive",
+                "--network",
+                "host",
+                "--cap-drop",
+                "ALL",
+                "--cap-add",
+                "NET_ADMIN",
+                "--security-opt",
+                "no-new-privileges",
+                "--read-only",
+                "--entrypoint",
+                "/bin/sh",
+                &cfg.helper_image,
+                "-c",
+                RULES_APPLY
             ]
         );
         assert_eq!(run[run.len() - 3..], ["_".to_string(), n.chain.clone(), n.iface.clone()]);
         let rm = rules_remove_args(&cfg, &n);
         assert!(!rm.iter().any(|a| a == "--interactive") && rm.iter().any(|a| a == RULES_REMOVE));
         // The only mission-dependent words are derived from a hash.
-        assert!(n.chain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') && n.iface.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+        assert!(
+            n.chain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && n.iface.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        );
     }
 
     #[test]
@@ -1563,8 +1705,21 @@ mod tests {
         assert_eq!(
             a,
             [
-                "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ControlPath=none", "-o", "ForwardAgent=no", "-o",
-                "ServerAliveInterval=15", "-N", "-L", "/h/keys/box.sock:/var/run/docker.sock", "--", "loom-box"
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "ControlPath=none",
+                "-o",
+                "ForwardAgent=no",
+                "-o",
+                "ServerAliveInterval=15",
+                "-N",
+                "-L",
+                "/h/keys/box.sock:/var/run/docker.sock",
+                "--",
+                "loom-box"
             ]
         );
     }
@@ -1572,15 +1727,18 @@ mod tests {
     #[test]
     fn i1_the_socket_lives_under_keys_and_a_long_path_is_refused() {
         let cfg = sample_cfg();
-        let host = DockerHost::new(&BoxCfg { docker_cli: "/bin/sh".into(), ..cfg.clone() }, Path::new("/home/x/.loom")).unwrap();
+        let host = DockerHost::new(&BoxCfg { docker_cli: "/bin/sh".into(), ..cfg.clone() }, Path::new("/home/x/.loom"))
+            .unwrap();
         assert_eq!(host.socket(), Path::new("/home/x/.loom/keys/box.sock"));
         let (program, argv) = host.argv(&["ps".into()]);
         assert_eq!(program, "/bin/sh");
         assert_eq!(argv, ["--host", "unix:///home/x/.loom/keys/box.sock", "ps"]);
         let long = format!("/{}", "a".repeat(120));
-        let err = DockerHost::new(&BoxCfg { docker_cli: "/bin/sh".into(), ..cfg.clone() }, Path::new(&long)).err().unwrap();
+        let err =
+            DockerHost::new(&BoxCfg { docker_cli: "/bin/sh".into(), ..cfg.clone() }, Path::new(&long)).err().unwrap();
         assert!(err.contains("longer than"), "{err}");
-        let err = DockerHost::new(&BoxCfg { docker_cli: "no-such-docker-cli".into(), ..cfg }, Path::new("/h")).err().unwrap();
+        let err =
+            DockerHost::new(&BoxCfg { docker_cli: "no-such-docker-cli".into(), ..cfg }, Path::new("/h")).err().unwrap();
         assert!(err.contains("not found on the daemon's PATH"), "{err}");
     }
 
@@ -1603,7 +1761,10 @@ mod tests {
         // inspect (is one there?) -> rm leftovers -> network -> rules (helper) -> container -> /etc/hosts
         assert_eq!(subs(&f), ["inspect", "rm", "network", "run", "run", "exec"]);
         let runs = f.sub("run");
-        assert!(runs[0].iter().any(|a| a == "--entrypoint") && runs[0].iter().any(|a| a == "/bin/sh"), "the helper comes first");
+        assert!(
+            runs[0].iter().any(|a| a == "--entrypoint") && runs[0].iter().any(|a| a == "/bin/sh"),
+            "the helper comes first"
+        );
         assert!(runs[1].iter().any(|a| a == "--name"), "then the container");
         let rules = std::fs::read_to_string(f.dir.join("rules.in")).unwrap();
         assert!(rules.contains("-d 203.0.113.7/32 -p tcp -j ACCEPT") && rules.contains("-j DROP"), "{rules}");
@@ -1807,7 +1968,11 @@ mod tests {
         assert_eq!(body, "hello 3\n; docker ps; \n--privileged\n");
         // The docker call the daemon made for it has the script as its last argument, and no other call has it.
         let exec = f.sub("exec").into_iter().find(|c| c.last().is_some_and(|l| l == script)).expect("the exec call");
-        assert_eq!(exec[..exec.len() - 1], exec_args(b.names(), "call-run", "/work", script)[..exec_args(b.names(), "call-run", "/work", script).len() - 1]);
+        assert_eq!(
+            exec[..exec.len() - 1],
+            exec_args(b.names(), "call-run", "/work", script)
+                [..exec_args(b.names(), "call-run", "/work", script).len() - 1]
+        );
         assert_eq!(f.calls().iter().filter(|c| c.iter().any(|a| a == script)).count(), 1);
         // The exit status of the command in the box is the job's.
         let launch = Launch { launcher: b.launcher("call-exit", None, "exit 7").unwrap(), cwd: e.ctx.tmp_dir.clone() };
@@ -1821,7 +1986,10 @@ mod tests {
         let f = FakeDocker::new(dir.path());
         let b = MissionBox::new(f.host(), "m-1", source(&[]));
         b.ready().await.unwrap();
-        let e = env_with(ToolsCfg { kill_grace_s: 1, ..ToolsCfg::default() }, SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() });
+        let e = env_with(
+            ToolsCfg { kill_grace_s: 1, ..ToolsCfg::default() },
+            SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() },
+        );
         let tag = std::process::id();
         for (call, script, expect_sigs) in [
             (format!("killtest-term-{tag}"), "sleep 300 & wait", vec!["TERM"]),
@@ -1842,7 +2010,12 @@ mod tests {
                 .sub("exec")
                 .into_iter()
                 .filter(|c| c.iter().any(|a| a == &pid_file(call)) && c.iter().any(|a| a.starts_with("kill -")))
-                .map(|c| c.iter().find(|a| a.starts_with("kill -")).map(|a| a[6..].split(' ').next().unwrap_or("").to_string()).unwrap_or_default())
+                .map(|c| {
+                    c.iter()
+                        .find(|a| a.starts_with("kill -"))
+                        .map(|a| a[6..].split(' ').next().unwrap_or("").to_string())
+                        .unwrap_or_default()
+                })
                 .collect();
             let mut seen = sigs.clone();
             seen.dedup();
@@ -1856,7 +2029,10 @@ mod tests {
         let f = FakeDocker::new(dir.path());
         let b = MissionBox::new(f.host(), "m-1", source(&[]));
         b.ready().await.unwrap();
-        let e = env_with(ToolsCfg { kill_grace_s: 1, ..ToolsCfg::default() }, SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() });
+        let e = env_with(
+            ToolsCfg { kill_grace_s: 1, ..ToolsCfg::default() },
+            SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() },
+        );
         let script = "sleep 300";
         let call = format!("timeout-test-{}", std::process::id());
         let _ = std::fs::remove_file(pid_file(&call));

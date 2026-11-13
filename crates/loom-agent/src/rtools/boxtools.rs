@@ -106,7 +106,11 @@ impl Tool for BoxExec {
         }
         let pushed = match b.push(ctx.sandbox.clone(), ctx.workspace.clone()).await {
             Ok(p) => p,
-            Err(e) => return ToolOutput::error(format!("The workspace could not be copied into the box, so nothing was run. {e}")),
+            Err(e) => {
+                return ToolOutput::error(format!(
+                    "The workspace could not be copied into the box, so nothing was run. {e}"
+                ))
+            }
         };
         let launch = loom_tools::bash::Launch { launcher, cwd: ctx.tmp_dir.clone() };
         let mut out = loom_tools::bash::run_launched(ctx, args, &launch).await;
@@ -157,7 +161,9 @@ impl Tool for BoxGet {
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let Some(given) = args.get("path").and_then(Value::as_str) else {
-            return ToolOutput::error("No path was given. Call box_get again with `path` set to a file or directory in the box.");
+            return ToolOutput::error(
+                "No path was given. Call box_get again with `path` set to a file or directory in the box.",
+            );
         };
         let b = match self.0.orch.box_access(&ctx.session).await {
             Ok(b) => b,
@@ -260,7 +266,9 @@ mod tests {
 
     fn source(grants: &[&str]) -> EgressSource {
         let g: Vec<String> = grants.iter().map(|s| s.to_string()).collect();
-        Arc::new(move || Ok((g.clone(), Policy::new(&loom_core::config::NetworkCfg::default()).map_err(|e| e.to_string())?)))
+        Arc::new(move || {
+            Ok((g.clone(), Policy::new(&loom_core::config::NetworkCfg::default()).map_err(|e| e.to_string())?))
+        })
     }
 
     fn with_box(grants: &[&str]) -> (Rig, FakeDocker, tempfile::TempDir) {
@@ -279,7 +287,9 @@ mod tests {
     #[tokio::test]
     async fn without_a_configured_box_every_tool_says_so() {
         let rig = box_rig();
-        for (tool, args) in [("box_exec", json!({"command": "id"})), ("box_get", json!({"path": "x"})), ("box_reset", json!({}))] {
+        for (tool, args) in
+            [("box_exec", json!({"command": "id"})), ("box_get", json!({"path": "x"})), ("box_reset", json!({}))]
+        {
             let r = rig.call(tool, args).await;
             assert_eq!(r.status, ToolStatus::Error, "{tool}");
             assert!(r.text.contains("No box is configured. The operator sets [box] in config.toml."), "{}", r.text);
@@ -287,7 +297,11 @@ mod tests {
         // In an agent copy.
         *rig.orch.boxed.lock().unwrap() = Some(Err(BOX_IN_COPY.to_string()));
         let r = rig.call("box_exec", json!({"command": "id"})).await;
-        assert!(r.text.contains("box_exec is not available in an agent copy yet; work in the shared workspace."), "{}", r.text);
+        assert!(
+            r.text.contains("box_exec is not available in an agent copy yet; work in the shared workspace."),
+            "{}",
+            r.text
+        );
         // A call without its argument.
         assert!(rig.call("box_exec", json!({})).await.text.contains("command"));
     }
@@ -303,14 +317,25 @@ mod tests {
         assert!(r.text.contains("; docker ps; \n42\n--privileged"), "{}", r.text);
         assert!(r.text.contains("1 file(s) copied into /work first"), "{}", r.text);
         // The file went in as a tar stream, once; the script was one argument of exactly one docker call.
-        let tars: Vec<_> = std::fs::read_dir(&fake.dir).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().starts_with("cp-in.")).collect();
+        let tars: Vec<_> = std::fs::read_dir(&fake.dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("cp-in."))
+            .collect();
         assert_eq!(tars.len(), 1);
         assert!(String::from_utf8_lossy(&std::fs::read(tars[0].path()).unwrap()).contains("a.txt"));
         assert_eq!(fake.calls().iter().filter(|c| c.iter().any(|a| a == script)).count(), 1);
         // Nothing changed: nothing is copied again.
         let r = rig.call("box_exec", json!({"command": "true", "timeout_s": 20})).await;
         assert!(!r.text.contains("copied into /work"), "{}", r.text);
-        assert_eq!(std::fs::read_dir(&fake.dir).unwrap().filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().starts_with("cp-in.")).count(), 1);
+        assert_eq!(
+            std::fs::read_dir(&fake.dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("cp-in."))
+                .count(),
+            1
+        );
         // A change is.
         std::fs::write(rig.env.ctx.workspace.join("a.txt"), "alpha two").unwrap();
         let r = rig.call("box_exec", json!({"command": "true", "timeout_s": 20})).await;
@@ -333,7 +358,9 @@ mod tests {
     #[tokio::test]
     async fn a_box_job_runs_in_the_background_and_is_followed_with_the_job_tools() {
         let (rig, _fake, _d) = with_box(&[]);
-        let r = rig.call("box_exec", json!({"command": "echo started; sleep 1; echo done-marker", "background": true})).await;
+        let r = rig
+            .call("box_exec", json!({"command": "echo started; sleep 1; echo done-marker", "background": true}))
+            .await;
         assert!(r.text.contains("started as job j1"), "{}", r.text);
         let w = rig.call("job_wait", json!({"job": "j1", "timeout_s": 20})).await;
         assert!(w.text.contains("done-marker") && w.text.contains("exit 0"), "{}", w.text);

@@ -1617,7 +1617,10 @@ mod tests {
         let f = fx();
         let launcher = Launcher {
             program: "/usr/bin/printf".to_string(),
-            args: ["[%s]\\n", "a b", "$(echo injected)", "'; echo no; '", "--privileged", "x\ny"].iter().map(|s| s.to_string()).collect(),
+            args: ["[%s]\\n", "a b", "$(echo injected)", "'; echo no; '", "--privileged", "x\ny"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             remote_stop: None,
         };
         let mut r = spawn_launched(&launcher, &f.spec("ignored by a launcher")).expect("spawn");

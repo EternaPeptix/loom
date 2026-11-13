@@ -1966,7 +1966,9 @@ impl Inner {
     /// What a mission's box may reach: the hosts granted to the mission and the effective policy of its
     /// sessions, as they are at this moment.
     fn box_egress(&self, mission: &MissionId) -> Result<(Vec<String>, Policy), String> {
-        let lead = self.mission_lead(mission).ok_or_else(|| format!("The mission {} has no lead session.", mission.as_str()))?;
+        let lead = self
+            .mission_lead(mission)
+            .ok_or_else(|| format!("The mission {} has no lead session.", mission.as_str()))?;
         let explicit = self.mission_explicit(&lead)?;
         Ok((self.granted_hosts(&lead, explicit), self.session_policy(&lead, explicit)?))
     }
@@ -8553,7 +8555,10 @@ mod tests {
         let b = e.rt.inner.orch.box_access(&id).await.unwrap();
         b.ready().await.unwrap();
         let rules = std::fs::read_to_string(fake.dir.join("rules.in")).unwrap();
-        assert!(rules.contains("-d 198.51.100.4/32 -p tcp -j ACCEPT"), "the grant made before the box is in it: {rules}");
+        assert!(
+            rules.contains("-d 198.51.100.4/32 -p tcp -j ACCEPT"),
+            "the grant made before the box is in it: {rules}"
+        );
         assert!(!rules.contains("203.0.113.7"));
         // A grant on the running box is applied at once, and nothing else is.
         e.rt.grant_scope(&id, &["203.0.113.7:8080".to_string(), "*.wild.test".to_string()], None).await.unwrap();
@@ -8576,17 +8581,20 @@ mod tests {
         assert!(fake.running(&container));
         e.rt.stop(&id).await.unwrap();
         until("box removed by stop", || !fake.running(&container)).await;
-        until("chain removed by stop", || fake.sub("run").iter().any(|r| r.iter().any(|a| a == &loom_tools::boxctl::names(mission.as_str()).chain) && !r.iter().any(|a| a == "--interactive"))).await;
+        until("chain removed by stop", || {
+            fake.sub("run").iter().any(|r| {
+                r.iter().any(|a| a == &loom_tools::boxctl::names(mission.as_str()).chain)
+                    && !r.iter().any(|a| a == "--interactive")
+            })
+        })
+        .await;
         // After the stop a box is made again on demand, and the archive removes that one.
         e.rt.inner.orch.box_access(&id).await.unwrap().ready().await.unwrap();
         assert!(fake.running(&container));
         let mark = fake.calls().len();
         e.rt.archive(&id, true).await.unwrap();
         until("box removed by archive", || !fake.running(&container)).await;
-        until("its chain removed", || {
-            fake.calls()[mark..].iter().any(|c| c.get(2).is_some_and(|s| s == "run"))
-        })
-        .await;
+        until("its chain removed", || fake.calls()[mark..].iter().any(|c| c.get(2).is_some_and(|s| s == "run"))).await;
         // The order of the removal: container, then network, then the chain.
         let subs: Vec<String> = fake.calls()[mark..].iter().filter_map(|c| c.get(2).cloned()).collect();
         let first = |name: &str| subs.iter().position(|s| s == name).unwrap_or(usize::MAX);
@@ -8637,7 +8645,11 @@ mod tests {
         let ws = std::fs::canonicalize(&meta.workspace).unwrap();
         let sandbox_cfg = sandbox_cfg_for(&e.rt.inner.config.sandbox, &role, &ws, &e.rt.inner.config.models);
         assert!(sandbox_cfg.unix_sockets.is_empty());
-        assert!(sandbox_cfg.extra_writable.iter().chain(&sandbox_cfg.loopback_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>()).all(|p| !p.contains("box.sock")));
+        assert!(sandbox_cfg
+            .extra_writable
+            .iter()
+            .chain(&sandbox_cfg.loopback_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>())
+            .all(|p| !p.contains("box.sock")));
         e.rt.shutdown().await;
     }
 

@@ -590,7 +590,17 @@ async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&L
                 });
             }
             remove_files(&running);
-            finish(Finish { ctx, status, outcome: ended.outcome(), ended: &ended, output, elapsed, facts, job: None, sandboxed })
+            finish(Finish {
+                ctx,
+                status,
+                outcome: ended.outcome(),
+                ended: &ended,
+                output,
+                elapsed,
+                facts,
+                job: None,
+                sandboxed,
+            })
         }
         WaitEnd::Deadline if timeout_s.is_none() => {
             // Not stopped: the command goes on as a job, and the first job_wait starts after what is shown here.

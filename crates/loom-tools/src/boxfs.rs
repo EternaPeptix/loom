@@ -159,7 +159,15 @@ pub fn append_file(out: &mut Vec<u8>, path: &str, mode: u32, mtime: u64, data: &
     let mode = mode & 0o777;
     match split_ustar(path) {
         Some((prefix, name)) => {
-            out.extend_from_slice(&header(name.as_bytes(), prefix.as_bytes(), data.len() as u64, mode, mtime, b'0', b""));
+            out.extend_from_slice(&header(
+                name.as_bytes(),
+                prefix.as_bytes(),
+                data.len() as u64,
+                mode,
+                mtime,
+                b'0',
+                b"",
+            ));
         }
         None => {
             let record = pax_path(path);
@@ -266,7 +274,10 @@ impl Walk<'_> {
 /// The files of `workspace` to send now (see the module contract).
 pub fn build_push(sandbox: &Sandbox, workspace: &Path, prev: &Manifest, lim: PushLimits) -> Result<Push, String> {
     if !workspace.is_dir() {
-        return Err(format!("The workspace {} is not a directory, so nothing could be copied into the box.", workspace.display()));
+        return Err(format!(
+            "The workspace {} is not a directory, so nothing could be copied into the box.",
+            workspace.display()
+        ));
     }
     let mut w = Walk {
         sandbox,
@@ -353,7 +364,9 @@ fn pax_records(data: &[u8]) -> (Option<String>, Option<u64>) {
     let mut rest = data;
     while !rest.is_empty() {
         let Some(sp) = rest.iter().position(|b| *b == b' ') else { break };
-        let Some(len) = std::str::from_utf8(rest.get(..sp).unwrap_or_default()).ok().and_then(|l| l.parse::<usize>().ok()) else {
+        let Some(len) =
+            std::str::from_utf8(rest.get(..sp).unwrap_or_default()).ok().and_then(|l| l.parse::<usize>().ok())
+        else {
             break;
         };
         if len <= sp + 1 || len > rest.len() {
@@ -390,7 +403,8 @@ fn parse(bytes: &[u8], max_entries: usize) -> Result<Vec<Entry>, String> {
             break;
         }
         let stored = number(field(h, 148, 156)).ok_or(NOT_TAR)?;
-        let sum: u64 = h.iter().enumerate().map(|(i, b)| if (148..156).contains(&i) { 32 } else { u64::from(*b) }).sum();
+        let sum: u64 =
+            h.iter().enumerate().map(|(i, b)| if (148..156).contains(&i) { 32 } else { u64::from(*b) }).sum();
         if sum != stored {
             return Err(NOT_TAR.to_string());
         }
@@ -528,7 +542,8 @@ pub fn extract(sandbox: &Sandbox, dest: &Path, tar: &[u8], lim: GetLimits) -> Re
                 kind_name(e.kind)
             )));
         }
-        let parts = components(&e.name).map_err(|why| refuse(format!("{why} Only names below what was asked for are taken.")))?;
+        let parts = components(&e.name)
+            .map_err(|why| refuse(format!("{why} Only names below what was asked for are taken.")))?;
         let Some((first, rest)) = parts.split_first() else {
             if e.kind == Kind::Dir {
                 continue;
@@ -539,7 +554,10 @@ pub fn extract(sandbox: &Sandbox, dest: &Path, tar: &[u8], lim: GetLimits) -> Re
             None => root = Some(first),
             Some(r) if r == *first => {}
             Some(r) => {
-                return Err(refuse(format!("It holds `{}` beside `{r}`; a fetch is one file or one directory.", e.name)));
+                return Err(refuse(format!(
+                    "It holds `{}` beside `{r}`; a fetch is one file or one directory.",
+                    e.name
+                )));
             }
         }
         match e.kind {
@@ -586,7 +604,8 @@ pub fn extract(sandbox: &Sandbox, dest: &Path, tar: &[u8], lim: GetLimits) -> Re
         if let (Some(parent), Some((existing, real))) = (target.parent(), &dest_real) {
             if let Some(a) = nearest_existing(parent) {
                 if a.starts_with(existing) {
-                    let real_a = std::fs::canonicalize(a).map_err(|e| refuse(format!("{} cannot be resolved ({e}).", a.display())))?;
+                    let real_a = std::fs::canonicalize(a)
+                        .map_err(|e| refuse(format!("{} cannot be resolved ({e}).", a.display())))?;
                     let inside = match a.strip_prefix(existing) {
                         Ok(tail) => real_a == real.join(tail),
                         Err(_) => false,
@@ -779,8 +798,16 @@ mod tests {
         let lim = PushLimits { total: 1000, file: 1000 };
         let first = build_push(&f.sb, &f.ws, &Manifest::new(), lim).unwrap();
         assert_eq!(names_in(&first.tar), ["a.txt"], "big.bin is over the file limit, b.txt over the total");
-        assert!(first.notes.iter().any(|n| n.contains("big.bin (5000 bytes)") && n.contains("sync_file_max_mb")), "{:?}", first.notes);
-        assert!(first.notes.iter().any(|n| n.contains("1 changed file(s)") && n.contains("sync_max_mb")), "{:?}", first.notes);
+        assert!(
+            first.notes.iter().any(|n| n.contains("big.bin (5000 bytes)") && n.contains("sync_file_max_mb")),
+            "{:?}",
+            first.notes
+        );
+        assert!(
+            first.notes.iter().any(|n| n.contains("1 changed file(s)") && n.contains("sync_max_mb")),
+            "{:?}",
+            first.notes
+        );
         // What did not fit goes next time.
         let second = build_push(&f.sb, &f.ws, &first.manifest, lim).unwrap();
         assert_eq!(names_in(&second.tar), ["b.txt"]);
@@ -793,7 +820,12 @@ mod tests {
     #[test]
     fn extract_unpacks_a_plain_tree_exactly() {
         let f = fix();
-        let t = raw_tar(&[("out", b'5', "", b""), ("out/a.txt", b'0', "", b"A"), ("out/d", b'5', "", b""), ("out/d/b.bin", b'0', "", &[0, 1, 2])]);
+        let t = raw_tar(&[
+            ("out", b'5', "", b""),
+            ("out/a.txt", b'0', "", b"A"),
+            ("out/d", b'5', "", b""),
+            ("out/d/b.bin", b'0', "", &[0, 1, 2]),
+        ]);
         let done = extract(&f.sb, &dest_of(&f, "got"), &t, GET).unwrap();
         assert_eq!(done.files.len(), 2);
         assert_eq!(std::fs::read(f.ws.join("got/a.txt")).unwrap(), b"A");
@@ -827,8 +859,16 @@ mod tests {
         assert_refused_and_empty(&f, &raw_tar(&[("out/dev", b'3', "", b"")]), "device");
         assert_refused_and_empty(&f, &raw_tar(&[("out/dev", b'4', "", b"")]), "device");
         assert_refused_and_empty(&f, &raw_tar(&[("out/pipe", b'6', "", b"")]), "FIFO");
-        assert_refused_and_empty(&f, &raw_tar(&[("out/a", b'0', "", b"1"), ("other/b", b'0', "", b"2")]), "one file or one directory");
-        assert_refused_and_empty(&f, b"this is not a tar stream at all, just text that is long enough to be a block".as_slice(), "not a tar");
+        assert_refused_and_empty(
+            &f,
+            &raw_tar(&[("out/a", b'0', "", b"1"), ("other/b", b'0', "", b"2")]),
+            "one file or one directory",
+        );
+        assert_refused_and_empty(
+            &f,
+            b"this is not a tar stream at all, just text that is long enough to be a block".as_slice(),
+            "not a tar",
+        );
     }
 
     #[test]
@@ -839,7 +879,8 @@ mod tests {
         assert!(err.contains("get_max_mb") && err.contains("Nothing was written"), "{err}");
         let many: Vec<(String, u8, &str, &[u8])> = (0..6).map(|i| (format!("o/f{i}"), b'0', "", &b"x"[..])).collect();
         let refs: Vec<(&str, u8, &str, &[u8])> = many.iter().map(|(n, k, l, d)| (n.as_str(), *k, *l, *d)).collect();
-        let err = extract(&f.sb, &dest_of(&f, "dest"), &raw_tar(&refs), GetLimits { total: 1 << 20, entries: 5 }).unwrap_err();
+        let err = extract(&f.sb, &dest_of(&f, "dest"), &raw_tar(&refs), GetLimits { total: 1 << 20, entries: 5 })
+            .unwrap_err();
         assert!(err.contains("more than 5 entries"), "{err}");
         assert!(!f.ws.join("dest").exists());
     }

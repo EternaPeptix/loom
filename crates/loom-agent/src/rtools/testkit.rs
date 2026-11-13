@@ -300,6 +300,9 @@ pub fn box_registry() -> Registry {
 /// A session `s-test` whose role is the core worker with the box tools added; its box is not configured.
 pub fn box_rig() -> Rig {
     let mut role = core_role("worker");
-    role.tools = ["box_exec", "box_get", "box_reset", "job_wait", "job_kill", "out_read"].iter().map(|s| s.to_string()).collect();
+    role.tools = ["box_exec", "box_get", "box_reset", "job_wait", "job_kill", "out_read"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     rig_with(role, false, false, AgentsCfg::default())
 }
