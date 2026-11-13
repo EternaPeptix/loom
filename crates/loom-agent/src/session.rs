@@ -2942,6 +2942,7 @@ impl Session {
             budget,
             finish_gated: shared.role.termination == loom_core::event::Termination::Explicit
                 && shared.role.tools.iter().any(|t| t == "conclude"),
+            solvable: shared.role.solvable,
         });
         if shared.is_child() {
             text.push_str(if shared.role.read_only {

@@ -4,7 +4,7 @@
 //! (`loom_tools::execute`), so argument checking, refusals and result records are identical. What
 //! makes them different is that each instance is bound to one session through [`Shared`].
 //!
-//! - [`ledger`]   `plan`, `step`, `note`, `claim`, `claim_update`, `evidence`, `ledger`
+//! - [`ledger`]   `plan`, `step`, `note`, `claim`, `claim_update`, `evidence`, `ledger`, `reflect`
 //! - [`misc`]     `pin`, `log_search`
 //! - [`scope`]    `request_scope`
 //! - [`terminal`] `finish`, `verdict`, `ask_user`, `ask_for`, `hand_off`, `report_blocker`, `wait`, `conclude`
@@ -52,6 +52,11 @@ pub const REPORT_MAX_CHARS: usize = 12_000;
 /// How many rejections of a lead's `finish`, counted since the latest accepted finish, make the harness record
 /// that a finish was rejected that many times and that the session continues. It never asks the operator.
 pub const MAX_FINISH_REJECTIONS: u32 = 2;
+/// How many rejections of a lead's `finish`, counted since the latest accepted finish, at which the mission is
+/// treated as stalled: when no new attested execution evidence was recorded after the previous rejection, the
+/// operator is opened one non-blocking inbox item (nothing is asked, the session keeps working). Fires at most
+/// once per stall; an accepted finish resets the count.
+pub const STUCK_FINISH_REJECTIONS: u32 = MAX_FINISH_REJECTIONS;
 /// What an [`Orchestrator`] answers once the runtime is shutting down. It is not a failure of the request:
 /// the turn that made it is being cut and is resumed after the restart.
 pub const SHUTTING_DOWN: &str = "The harness is shutting down.";
@@ -294,6 +299,8 @@ struct Slots {
     emitted: Vec<(Author, Event)>,
     effect: Option<Effect>,
     continuation: Option<crate::continuation::Plan>,
+    /// Refusals of the lead's `finish` without new execution evidence since the last rejection. In-memory only.
+    stuck_refusals: u32,
 }
 
 /// One session's handle for its runtime tools. Created by the runtime, shared by `Arc`.
@@ -337,6 +344,20 @@ impl Shared {
     /// Queue a record to be appended after the current call's result.
     pub fn emit(&self, author: Author, event: Event) {
         self.slots().emitted.push((author, event));
+    }
+
+    /// Count one refusal of the lead's `finish` (the goal pre-gate, or the open-items gate) that happened
+    /// without new attested execution evidence since the last verifier rejection (`false` for `fresh`).
+    /// The count resets to zero when fresh evidence appears. Not a persistent record: after a restart the
+    /// count starts at zero.
+    fn record_finish_refusal(&self, fresh: bool) -> u32 {
+        let mut slots = self.slots();
+        if fresh {
+            slots.stuck_refusals = 0;
+            return 0;
+        }
+        slots.stuck_refusals = slots.stuck_refusals.saturating_add(1);
+        slots.stuck_refusals
     }
 
     pub fn take_emitted(&self) -> Vec<(Author, Event)> {
@@ -396,6 +417,7 @@ impl Shared {
             let claim = match &checked_op {
                 LedgerOp::Decision { .. }
                 | LedgerOp::DeadEnd { .. }
+                | LedgerOp::Reflection { .. }
                 | LedgerOp::ClaimAdd { .. }
                 | LedgerOp::Security(_) => return Ok(()),
                 LedgerOp::ClaimUpdate { id, .. } => id,
@@ -471,6 +493,7 @@ pub fn tool(name: &str, shared: &Arc<Shared>) -> Option<Arc<dyn loom_tools::Tool
         "claim_update" => Arc::new(ledger::ClaimUpdate(s)),
         "evidence" => Arc::new(ledger::Evidence(s)),
         "ledger" => Arc::new(ledger::Ledger(s)),
+        "reflect" => Arc::new(ledger::Reflect(s)),
         "security_record" => Arc::new(security::SecurityRecord(s)),
         "security_query" => Arc::new(security::SecurityQuery(s)),
         "security_ingest" => Arc::new(security::SecurityIngest(s)),
@@ -533,6 +556,7 @@ pub const NAMES: &[&str] = &[
     "claim_update",
     "evidence",
     "ledger",
+    "reflect",
     "security_record",
     "security_query",
     "security_ingest",

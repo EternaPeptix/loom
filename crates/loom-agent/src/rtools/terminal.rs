@@ -20,7 +20,8 @@
 //! for someone who has not seen your work. Nothing was delivered.``).
 //! `quotes` elements are objects `{handle, start, end, text}`; an element of another shape is an
 //! error naming its position and the four fields. They are checked with `gate::check_quotes(&ctx.blobs,
-//! …)`; `Err(text)` → error `{text}\nNothing was delivered. Correct the quotes and call finish again.`
+//! …)`; `Err(text)` → error `{text}\nNothing was delivered. These are mechanical fixes, not findings about
+//! the work — correct the quotes above and call finish again.`
 //! Every quote must also be an observation, by the rule `evidence` applies (`rtools::observed_producer`):
 //! the output of a command run or a file read; a quote of the output of a runtime tool (`ledger`,
 //! `log_search`, an agent's report, ...), of a `write` or `edit`, or of an output no tool call of the
@@ -64,11 +65,27 @@
 //!    - `accepted: true` -> `FinishVerdict` recorded, deliver with `verified by {child}`.
 //!    - `accepted: false` -> `FinishVerdict` recorded; one `ObligationOpen { kind: Objection, text: the
 //!      objection, reference: "{fid} (verifier {child})" }` per objection; error text with the objections,
-//!      the report and `texts::FINISH_NOT_ACCEPTED_TAIL`; no effect. When the rejections since the latest
-//!      accepted finish (`rejection_floor`: only an accepted finish moves it) reach `MAX_FINISH_REJECTIONS`,
-//!      a `harness_note{Verdict}` `finish rejected {n} times; continuing` is also written. It is a record,
-//!      not an inbox item: nothing is asked of the operator and the session works on. The verifier is
-//!      still started for later finishes.
+//!      the report and `texts::finish_not_accepted_tail(&finish_tools(&s.role))`; no effect.
+//!      When the rejections since the latest accepted finish (`rejection_floor`: only an accepted finish
+//!      moves it) reach `MAX_FINISH_REJECTIONS`, a `harness_note{Verdict}` `finish has not been accepted
+//!      {n} times …` is also written. It is a record: nothing is asked of the operator and the session
+//!      works on. The verifier is still started for later finishes.
+//!
+//! Stuck detection wraps the two refusals in (1) and (2); a verifier rejection that is reached implies
+//! fresh execution evidence has been recorded since the last objection (otherwise the open-items gate
+//! refuses before the verifier starts), so the signal lives at the gate, not after the verdict. Whenever
+//! a lead's `finish` is refused before a verifier runs — the goal pre-gate (1) or the open-items check
+//! (2) — the session counts it (`Shared::record_finish_refusal`), unless attested `Execution` evidence
+//! was recorded after the last rejected `FinishVerdict` in the journal (a read failure counts as no fresh
+//! evidence rather than failing the finish). At `STUCK_FINISH_REJECTIONS` consecutive refusals the
+//! operator is opened one non-blocking `InboxItem { kind: Question, blocking: false, options: Keep
+//!      working / Narrow the goal / Release the mission / Conclude unreachable }` (`texts::stuck_inbox_text`,
+//!      naming whether every plan step is closed) and the refusal result carries `texts::stuck_model_line`
+//!      telling the model it was opened; a `harness_note{Verdict}` (`texts::stuck_notice`) is recorded too.
+//!      It is not an ask: it does not pause the session, is not a ledger question and does not block a
+//!      finish. One item per stall burst; the count resets to zero when fresh evidence appears (in-memory
+//!      only, so a restart starts the count at zero). `STUCK_FINISH_REJECTIONS` equals
+//!      `MAX_FINISH_REJECTIONS`.
 //!    - any other spawn or join error, or no verdict in the payload, is a fault of the harness: a fresh
 //!      verifier is started up to `VERIFIER_RETRIES` (2) more times, waiting `VERIFIER_RETRY_WAIT_MS` between
 //!      attempts. When none could be run, step 6.
@@ -183,7 +200,9 @@
 //! quote, child delivery (effect, report text, payload, long answer stored), refusal while a job or a
 //! child agent is running (lead and child), lead with open items refused, lead accepted with
 //! verification (verdict recorded, inbox item, effect), lead rejected (no effect, objections listed,
-//! finish recorded as not accepted, objections opened), the rejection cap (a notice, no inbox item), the
+//! finish recorded as not accepted, objections opened), the rejection cap (a notice), stuck detection (a
+//! non-blocking inbox item opened once at the threshold when no new execution evidence appeared, and the
+//! line for the model; nothing when a fresh run does appear), the
 //! count restarting at an accepted finish only, an answered inbox item changing nothing, the goal-met
 //! pre-gate, objections settled by new execution evidence, an operator release, verifier ending without a
 //! verdict and spawn failure (retried, then held with a notice, no inbox item), shutdown and cancellation
@@ -194,6 +213,7 @@
 
 use super::{
     Delivery, Effect, Settlement, Shared, SpawnReq, Workspace, MAX_FINISH_REJECTIONS, REPORT_MAX_CHARS, SHUTTING_DOWN,
+    STUCK_FINISH_REJECTIONS,
 };
 use crate::frontier;
 use crate::gate::{self, Quote, ReportInput, VerifiedQuote};
@@ -478,7 +498,7 @@ const QUOTE_SHAPE: &str = "{handle, start, end, text}";
 fn parse_quotes(args: &Map<String, Value>) -> Result<Vec<Quote>, String> {
     let Some(list) = args.get("quotes") else { return Ok(Vec::new()) };
     let Some(list) = list.as_array() else {
-        return Err(format!("`quotes` must be a list of objects {QUOTE_SHAPE}. Nothing was delivered."));
+        return Err(format!("`quotes` must be a list of objects {QUOTE_SHAPE}. Nothing was delivered. This is a shape fix, not a finding about the work — call finish again once the quotes are in that shape."));
     };
     let mut out = Vec::new();
     for (idx, v) in list.iter().enumerate() {
@@ -495,7 +515,7 @@ fn parse_quotes(args: &Map<String, Value>) -> Result<Vec<Quote>, String> {
             Some(q) => out.push(q),
             None => {
                 return Err(format!(
-                    "quote {pos} is not an object with the four fields {QUOTE_SHAPE} (handle and text are strings, start and end are line numbers). Nothing was delivered."
+                    "quote {pos} is not an object with the four fields {QUOTE_SHAPE} (handle and text are strings, start and end are line numbers). Nothing was delivered. This is a shape fix, not a finding about the work — call finish again once the quotes match the shape."
                 ))
             }
         }
@@ -609,16 +629,12 @@ impl Finish {
         // A role without `conclude` cannot make the conclusion the gate waits for, so it is not gated.
         let has = |tool: &str| s.role.tools.iter().any(|t| t == tool);
         if s.role.termination == Termination::Explicit && has("conclude") && gate::goal_unconcluded(&state) {
-            let tools = texts::FinishTools {
-                conclude: true,
-                block: has("report_blocker"),
-                ask_for: has("ask_for"),
-                spawn: has("agent_spawn") && !s.role.may_spawn.is_empty(),
-                plan: has("plan") || has("step"),
-                solvable: s.role.solvable,
-            };
+            let tools = finish_tools(&s.role);
             let directions = frontier::directions(&frontier::frontier(&state, loom_core::now_ms()), 8);
-            let text = texts::finish_unavailable(&tools, &directions);
+            let mut text = texts::finish_unavailable(&tools, &directions);
+            if let Some(line) = self.maybe_note_stuck(ctx, &state) {
+                text.push_str(&format!("\n\n{line}"));
+            }
             s.emit(Author::Harness, Event::HarnessNote { note: NoteKind::Nudge, text: text.clone() });
             return ToolOutput::error(text);
         }
@@ -630,7 +646,12 @@ impl Finish {
             Ok(st) => st,
             Err(e) => return ToolOutput::error(e),
         };
-        if let Err(text) = gate::check_finish_lead(&state, answer) {
+        if let Err(mut text) = gate::check_finish_lead(&state, answer) {
+            if !state.open_items().is_empty() {
+                if let Some(line) = self.maybe_note_stuck(ctx, &state) {
+                    text.push_str(&format!("\n\n{line}"));
+                }
+            }
             return ToolOutput::error(text);
         }
         let evidence = strings_of(args.get("evidence"));
@@ -803,7 +824,11 @@ impl Finish {
                 for o in &objections {
                     text.push_str(&format!("\n- {o}"));
                 }
-                text.push_str(&format!("\n\n{}\n\n{}", settled.report, texts::FINISH_NOT_ACCEPTED_TAIL));
+                text.push_str(&format!(
+                    "\n\n{}\n\n{}",
+                    settled.report,
+                    texts::finish_not_accepted_tail(&finish_tools(&s.role))
+                ));
                 let mut out = ToolOutput::ok("not accepted", Body::Raw(text.into_bytes()));
                 out.status = ToolStatus::Error;
                 return out;
@@ -816,6 +841,61 @@ impl Finish {
         );
         s.set_effect(Effect::EndTurn(TurnEndReason::Finished));
         ToolOutput::ok(format!("finished — {note}"), Body::Message("The result was delivered to the operator.".into()))
+    }
+
+    /// Stuck detection. A lead that keeps calling `finish` while nothing new was executed since the last
+    /// verifier rejection is flagging its own wall. At `STUCK_FINISH_REJECTIONS` consecutive refusals
+    /// (`record_finish_refusal`: the count resets when attested execution evidence appears) open one
+    /// non-blocking inbox item for the operator — options to keep working, narrow the goal, release the
+    /// mission or conclude `unreachable` — and tell the model it was opened. Not an ask: it does not pause
+    /// the session, is not a ledger question and does not block a finish. One item per stall burst (the
+    /// count resets on fresh evidence); a journal read failure counts as no fresh evidence rather than
+    /// failing the finish.
+    fn maybe_note_stuck(&self, ctx: &ToolCtx, state: &LedgerState) -> Option<String> {
+        let s = &self.0;
+        let last_rejected_n = s
+            .journal
+            .as_ref()
+            .and_then(|j| j.read().ok())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| matches!(&e.op, LedgerOp::FinishVerdict { accepted: false, .. }))
+                    .map(|e| e.n)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let fresh = state
+            .evidence
+            .iter()
+            .any(|e| e.n > last_rejected_n && e.input.kind == EvidenceKind::Execution && e.input.attested);
+        let refused = s.record_finish_refusal(fresh);
+        if refused != STUCK_FINISH_REJECTIONS {
+            return None;
+        }
+        let plan_closed = state.open_items().plan.is_empty();
+        let mut options =
+            vec!["Keep working".to_string(), "Narrow the goal".to_string(), "Release the mission".to_string()];
+        if !s.role.solvable {
+            options.push("Conclude unreachable".to_string());
+        }
+        s.emit(
+            Author::Harness,
+            inbox(
+                InboxKind::Question,
+                texts::stuck_inbox_text(refused as usize, plan_closed, s.role.solvable),
+                options,
+                false,
+                ctx,
+                None,
+            ),
+        );
+        s.emit(
+            Author::Harness,
+            Event::HarnessNote { note: NoteKind::Verdict, text: texts::stuck_notice(refused as usize) },
+        );
+        Some(texts::stuck_model_line(s.role.solvable).to_string())
     }
 
     /// Settle the open objections of earlier rejections that new work has answered: an objection is settled
@@ -900,13 +980,26 @@ async fn running_work(s: &Shared, ctx: &ToolCtx) -> (Vec<String>, Vec<String>) {
     (jobs, agents)
 }
 
+/// The tools of `role` that the refusals of `finish` name, so only real ones are offered.
+fn finish_tools(role: &RoleDef) -> texts::FinishTools {
+    let has = |name: &str| role.tools.iter().any(|t| t == name);
+    texts::FinishTools {
+        conclude: has("conclude"),
+        block: has("report_blocker"),
+        ask_for: has("ask_for"),
+        spawn: has("agent_spawn") && !role.may_spawn.is_empty(),
+        plan: has("plan") || has("step"),
+        solvable: role.solvable,
+    }
+}
+
 /// The refusal of `finish` (or `hand_off`, named by `tool`) while work this session started is still running.
 /// It names only tools the role has, and says what to do about an agent that no tool of the session can end.
 fn running_refusal(tool: &str, role: &RoleDef, jobs: &[String], agents: &[String]) -> String {
     let has = |name: &str| role.tools.iter().any(|t| t == name);
     let running: Vec<&str> = jobs.iter().chain(agents).map(String::as_str).collect();
     let mut text = format!(
-        "{tool} was refused: work started by this session is still running: {}. Nothing was delivered.",
+        "{tool} cannot be accepted yet: work started by this session is still running: {}. Nothing was delivered.",
         running.join(", ")
     );
     let mut ways: Vec<&str> = Vec::new();
@@ -1087,8 +1180,8 @@ impl Tool for Finish {
             Ok(v) => v,
             Err(text) => {
                 return ToolOutput::error(format!(
-                    "{text}\nNothing was delivered. Correct the quotes and call finish again."
-                ))
+                    "{text}\nNothing was delivered. These are mechanical fixes, not findings about the work — correct the quotes above and call finish again."
+                            ))
             }
         };
         // A quote is attested support, so it comes from an observation, as evidence does.
@@ -1170,7 +1263,7 @@ impl Tool for Conclude {
             let open = state.open_items().plan;
             if !open.is_empty() {
                 let mut text = String::from(
-                    "conclude unreachable was refused: the plan still has open steps, so not every route is closed:",
+                    "conclude `unreachable` cannot be recorded yet: the plan still has open steps, so not every route is closed:",
                 );
                 for id in &open {
                     if let Some(p) = state.plan.iter().find(|p| &p.id == id) {
@@ -1182,7 +1275,7 @@ impl Tool for Conclude {
                         ));
                     }
                 }
-                text.push_str("\nClose each route with `step`: status done (say what showed it) or dropped (say why). Then call conclude again.");
+                text.push_str("\nClose each route with `step`: status done (say what showed it) or dropped (say why); the ledger is what turns 'unreachable' from an impression into a finding. Then call conclude again.");
                 text.push_str(texts::CONCLUDE_OPEN_ROUTES_TAIL);
                 return ToolOutput::error(text);
             }
@@ -2007,7 +2100,7 @@ mod tests {
             .await;
         assert_eq!(res.status, Status::Error);
         assert!(res.text.contains("does not occur"), "{}", res.text);
-        assert!(res.text.contains("Nothing was delivered. Correct the quotes and call finish again."));
+        assert!(res.text.contains("Nothing was delivered. These are mechanical fixes, not findings about the work — correct the quotes above and call finish again."));
         assert!(effect(&r).is_none());
         assert!(r.shared.ledger().unwrap().finishes.is_empty());
     }
@@ -2238,7 +2331,7 @@ mod tests {
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error);
         assert!(res.text.contains("not accepted"), "{}", res.text);
-        assert!(res.text.contains("An independent verifier (s-kid1) examined the result and did not accept it.\n- no test ran\n- line 4 is wrong\n\nI could not reproduce the fix.\n\nThe mission is not finished."), "{}", res.text);
+        assert!(res.text.contains("An independent verifier (s-kid1) examined the result and did not accept it.\n- no test ran\n- line 4 is wrong\n\nI could not reproduce the fix.\n\nEach objection is now an open obligation"), "{}", res.text);
         assert!(effect(&r).is_none());
         assert!(inbox_items(&r).is_empty());
         let st = r.shared.ledger().unwrap();
@@ -2315,15 +2408,29 @@ mod tests {
     #[tokio::test]
     async fn the_incident_a_lead_that_finishes_with_the_goal_open_is_refused_in_step_and_never_reaches_the_operator() {
         let r = lead_with_goal();
-        for _ in 0..13 {
+        for i in 0..13 {
             let res = r.call("finish", json!({"answer": "No result: the objective was not reached."})).await;
             assert_eq!(res.status, Status::Error, "{}", res.text);
             assert!(res.text.contains("finish is not available yet: the goal is not concluded"), "{}", res.text);
-            assert!(res.text.contains("Call conclude once a run shows the goal met."), "{}", res.text);
+            assert!(res.text.contains("call conclude with status met"), "{}", res.text);
+            assert!(
+                res.text.contains("a well-evidenced unreachable conclusion is a reportable outcome"),
+                "{}",
+                res.text
+            );
             assert!(res.text.contains("The mission ledger shows no open route."), "{}", res.text);
             assert!(res.text.contains("report_blocker if something only the operator can supply"), "{}", res.text);
             let (items, notes) = drain(&r);
-            assert!(items.is_empty(), "{items:?}");
+            // The second refusal without any new execution evidence trips stuck detection: one
+            // non-blocking item for the operator, and the model is told. Nothing else reaches them.
+            if i == 1 {
+                assert_eq!(items.len(), 1, "{items:?}");
+                assert!(!items[0].blocking && items[0].kind == InboxKind::Question, "{items:?}");
+                assert!(items[0].text.contains("has not advanced in 2 finish attempts"), "{items:?}");
+                assert!(res.text.contains("conclude` with status `unreachable`"), "{}", res.text);
+            } else {
+                assert!(items.is_empty(), "{items:?}");
+            }
             assert_eq!(notes.iter().filter(|(k, _)| *k == NoteKind::Nudge).count(), 1, "{notes:?}");
             assert!(effect(&r).is_none());
         }
@@ -2343,7 +2450,11 @@ mod tests {
         r.user_op(LedgerOp::GoalSet { text: "g".into() });
         let res = r.call("finish", json!({"answer": "done"})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
-        assert!(res.text.contains("Call conclude") && !res.text.contains("report_blocker"), "{}", res.text);
+        assert!(
+            res.text.contains("call conclude with status met") && !res.text.contains("report_blocker"),
+            "{}",
+            res.text
+        );
     }
 
     #[tokio::test]
@@ -2538,14 +2649,14 @@ mod tests {
         assert_eq!(res.status, Status::Error, "{}", res.text);
         let (items, notes) = drain(&r);
         assert!(items.is_empty(), "a rejection opens no inbox item: {items:?}");
-        assert!(notes.iter().all(|(_, t)| !t.contains("rejected 2 times")), "{notes:?}");
+        assert!(notes.iter().all(|(_, t)| !t.contains("accepted 2 times")), "{notes:?}");
         let st = r.shared.ledger().unwrap();
         let objections: Vec<_> = st.obligations.iter().filter(|o| o.kind == ObligationKind::Objection).collect();
         assert_eq!(objections.len(), 2);
         assert_eq!(objections[0].text, "no test ran");
         assert_eq!(objections[1].text, "line 4 is wrong");
         assert!(objections[0].reference.starts_with("f1 (verifier s-kid1)"), "{}", objections[0].reference);
-        assert!(res.text.contains("settled only by new execution evidence"), "{}", res.text);
+        assert!(res.text.contains("settles only by new execution evidence"), "{}", res.text);
 
         // Finishing again does nothing: no verifier, the objections are named.
         for _ in 0..2 {
@@ -2589,6 +2700,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stuck_detection_opens_a_nonblocking_inbox_item_after_two_refusals_without_new_work() {
+        let r = lead_with_goal();
+        conclude_met(&r).await;
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "no", rejected_payload());
+        r.orch.settle("s-kid2", ChildOutcome::Returned, "fine", accepted_payload());
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        r.shared.take_emitted();
+        // Two refusals at the open-items gate, no new execution evidence since the rejection: the stuck signal.
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(!res.text.contains("non-blocking item"), "{}", res.text);
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("The operator has been notified as a non-blocking item"), "{}", res.text);
+        assert!(res.text.contains("conclude` with status `unreachable`"), "{}", res.text);
+        let (items, notes) = drain(&r);
+        assert_eq!(items.len(), 1, "{items:?}");
+        let item = &items[0];
+        assert_eq!(item.kind, InboxKind::Question);
+        assert!(!item.blocking);
+        assert!(item.options.contains(&"Conclude unreachable".to_string()), "{item:?}");
+        assert!(items[0].text.contains("has not advanced in 2 finish attempts"), "{}", items[0].text);
+        assert!(
+            notes.iter().any(|(k, t)| *k == NoteKind::Verdict && t.contains("notified as a non-blocking item")),
+            "{notes:?}"
+        );
+        // Not an ask: no ledger question, no verifier started for the refusals, no turn ended.
+        assert_eq!(spawn_count(&r), 1);
+        assert!(r.shared.ledger().unwrap().questions.is_empty());
+        assert!(effect(&r).is_none());
+        // A fresh run is all it takes to unstick the gate.
+        record_run(&r);
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+    }
+
+    #[tokio::test]
+    async fn stuck_detection_in_a_solvable_pack_never_offers_conclude_unreachable() {
+        let mut role = core_role("lead");
+        role.solvable = true;
+        let r = rig_with(role, false, true, loom_core::config::AgentsCfg::default());
+        r.user_op(LedgerOp::GoalSet { text: "fix the parser".into() });
+        r.shared.take_emitted();
+        for _ in 0..2 {
+            let res = r.call("finish", json!({"answer": "No result."})).await;
+            assert_eq!(res.status, Status::Error, "{}", res.text);
+            assert!(!res.text.contains("unreachable"), "{}", res.text);
+        }
+        let (items, _) = drain(&r);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].kind, InboxKind::Question);
+        assert!(!items[0].blocking);
+        assert_eq!(items[0].options, vec!["Keep working", "Narrow the goal", "Release the mission"]);
+        assert!(!items[0].text.contains("unreachable"), "{}", items[0].text);
+    }
+
+    #[tokio::test]
     async fn the_rejection_cap_is_a_notice_not_a_summons() {
         let r = lead_with_goal();
         conclude_met(&r).await;
@@ -2606,7 +2775,7 @@ mod tests {
         let (items, notes) = drain(&r);
         assert!(items.is_empty(), "{items:?}");
         assert!(
-            notes.iter().any(|(k, t)| *k == NoteKind::Verdict && t.starts_with("finish rejected 2 times; continuing")),
+            notes.iter().any(|(k, t)| *k == NoteKind::Verdict && t.starts_with("finish has not been accepted 2 times")),
             "{notes:?}"
         );
         assert!(effect(&r).is_none());
@@ -2886,7 +3055,11 @@ mod tests {
         assert_eq!(started.status, Status::Ok, "{}", started.text);
         let res = r.call("finish", json!({"answer": "It is beta."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
-        assert!(res.text.contains("finish was refused") && res.text.contains("job j1 (sleep 30)"), "{}", res.text);
+        assert!(
+            res.text.contains("finish cannot be accepted yet") && res.text.contains("job j1 (sleep 30)"),
+            "{}",
+            res.text
+        );
         assert!(res.text.contains("Nothing was delivered."), "{}", res.text);
         assert!(
             res.text.contains(
@@ -3393,8 +3566,9 @@ mod tests {
         let res = r.call("hand_off", hand("hint")).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(
-            plain(&res.text)
-                .starts_with("hand_off was refused: work started by this session is still running: job j1 (sleep 30)."),
+            plain(&res.text).starts_with(
+                "hand_off cannot be accepted yet: work started by this session is still running: job j1 (sleep 30)."
+            ),
             "{}",
             res.text
         );
