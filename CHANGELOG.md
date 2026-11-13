@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Morale: keeping a model on a hard task
+
+- The step block gains `Where the work stands:`, read from the ledger alone: results established, what is
+  ruled out with evidence, what is only set aside (a dead end is not a refutation), open leads, security
+  surfaces closed and untested, and the attempts run in this session. Security records appear by id only.
+  New module `loom-agent::frontier` (`frontier`, `attempts_run`, `render`, `directions`).
+- `claim_update` to `supported` adds one line, `Established: {id}. Results established in this mission so
+  far: {n} ({ids}).`, so a banked result stays in view.
+
 ### Watched jobs, agents in their own copies, and attempts
 
 - `bash` takes `wake_on` (a regular expression) and `wake_every_s`. The background job the call

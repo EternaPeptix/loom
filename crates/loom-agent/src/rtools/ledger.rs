@@ -22,7 +22,11 @@
 //!   echoing the id and the text.
 //! - `claim`: `ClaimAdd { text }`. Outcome `claim {id} open`. Text: ``{id}: {text}`` and the line
 //!   `Attach evidence with `evidence`, then set its status with `claim_update`.`
-//! - `claim_update`: `ClaimUpdate { id, status, note }`. Outcome `claim {id} {status}`.
+//! - `claim_update`: `ClaimUpdate { id, status, note }`. Outcome `claim {id} {status}`. When the claim moves INTO
+//!   `supported` from another status, the text gains the line `Established: {id}. Results established in this
+//!   mission so far: {n} ({ids, at most 8, then …}).` (`texts::result_banked`), counted from the ledger after
+//!   the write. Nothing else is recorded; a refutation or withdrawal gets no such line. (`claim` always
+//!   creates an open claim, so it never banks.)
 //! - `evidence`:
 //!   1. `gate::check_quotes(&ctx.blobs, &[Quote { handle, start, end, text: quote }])`; on `Err(text)`
 //!      → error `{text}\nNothing was attached.`
@@ -66,6 +70,7 @@
 
 use super::{observed_producer, Shared, NO_MISSION};
 use crate::gate::{check_quotes, Quote};
+use crate::{frontier, texts};
 use async_trait::async_trait;
 use loom_core::event::{ToolClass, ToolSpec};
 use loom_core::ledger::{ClaimStatus, EvidenceInput, EvidenceKind, LedgerOp, LedgerState, StepStatus};
@@ -279,10 +284,18 @@ impl Tool for ClaimUpdate {
             return ToolOutput::error("`status` must be one of supported, refuted, withdrawn.");
         };
         let note = str_arg(args, "note").unwrap_or("").trim().to_string();
+        let was_supported =
+            self.0.ledger().is_ok_and(|s| s.claims.iter().any(|c| c.id == id && c.status == ClaimStatus::Supported));
         match self.0.ledger_append(false, LedgerOp::ClaimUpdate { id: id.clone(), status: parsed, note }) {
             Ok((_, state)) => {
                 let text = state.claims.iter().find(|c| c.id == id).map(|c| c.text.as_str()).unwrap_or("");
-                ToolOutput::ok(format!("claim {id} {status}"), Body::Message(format!("{id} is {status}: {text}")))
+                let mut message = format!("{id} is {status}: {text}");
+                if parsed == ClaimStatus::Supported && !was_supported {
+                    let established = frontier::frontier(&state, 0).established;
+                    message.push('\n');
+                    message.push_str(&texts::result_banked(&id, established.len(), &frontier::id_list(&established)));
+                }
+                ToolOutput::ok(format!("claim {id} {status}"), Body::Message(message))
             }
             Err(text) => ToolOutput::error(text),
         }
@@ -512,6 +525,7 @@ mod tests {
 
         let t = ok(&rig, "claim_update", json!({"id": "c1", "status": "supported"})).await;
         assert!(t.contains("claim c1 supported"), "{t}");
+        assert!(t.contains("Established: c1. Results established in this mission so far: 1 (c1)."), "{t}");
 
         // A second piece of evidence on a settled claim has no "still open" line.
         let t = ok(
@@ -526,6 +540,37 @@ mod tests {
 
         let t = refused(&rig, "claim_update", json!({"id": "c1", "status": "refuted"})).await;
         assert!(t.contains("note") || t.contains("Note"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn supported_claim_is_banked_once_and_refutation_is_not() {
+        let rig = rig("lead", false, true);
+        for text in ["first", "second", "third"] {
+            ok(&rig, "claim", json!({"text": text})).await;
+        }
+        let h = rig.output("alpha\nbeta\n", "bash", ToolClass::Exec);
+        for c in ["c1", "c2", "c3"] {
+            ok(&rig, "evidence", json!({"claim": c, "handle": h, "start": 1, "end": 1, "quote": "alpha", "note": "n"}))
+                .await;
+        }
+        let t = ok(&rig, "claim_update", json!({"id": "c1", "status": "supported"})).await;
+        assert!(
+            t.contains(
+                "c1 is supported: first\nEstablished: c1. Results established in this mission so far: 1 (c1).\n"
+            ),
+            "{t}"
+        );
+        let t = ok(&rig, "claim_update", json!({"id": "c2", "status": "refuted", "note": "no"})).await;
+        assert!(t.contains("c2 is refuted: second\n") && !t.contains("Established"), "{t}");
+        let t = ok(&rig, "claim_update", json!({"id": "c3", "status": "supported"})).await;
+        assert!(t.contains("Established: c3. Results established in this mission so far: 2 (c1, c3)."), "{t}");
+        // Already supported: no second banking line.
+        let t = ok(&rig, "claim_update", json!({"id": "c3", "status": "supported", "note": "again"})).await;
+        assert!(t.contains("c3 is supported: third\n") && !t.contains("Established"), "{t}");
+        // Out of supported and back in: banked again.
+        ok(&rig, "claim_update", json!({"id": "c3", "status": "withdrawn", "note": "x"})).await;
+        let t = ok(&rig, "claim_update", json!({"id": "c3", "status": "supported"})).await;
+        assert!(t.contains("Established: c3."), "{t}");
     }
 
     #[tokio::test]

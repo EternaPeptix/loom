@@ -291,7 +291,7 @@ brief is the durable state.
 `<harness-state>…</harness-state>` (`loom-agent::hud`) that is never part of the stable prefix, so the
 next request diverges from the cache only after the previous last stable message. It is stored as a
 blob named by the request's `model_request.hud`. It carries, each section only when non-empty: the
-current time (UTC, minutes); the mission state from the ledger brief (§7); command outputs with at
+current time (UTC, minutes); the mission state from the ledger brief (§7); where the work stands (what is established, ruled out with evidence, only set aside, open, and the attempts run); command outputs with at
 least `agents.unviewed_min_lines` (20) lines never shown; calls repeated with the same arguments and the
 same output; reads and command results that a later write of this session made out of date; running
 jobs and agents; ledger questions waiting on the operator; and, only in the last stretch of a step or

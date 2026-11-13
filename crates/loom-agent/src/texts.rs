@@ -156,6 +156,12 @@ pub fn stall(steps: u32) -> String {
     )
 }
 
+/// The line a successful `claim_update` to `supported` adds: the result is banked. `n` and `ids` describe every
+/// result established in the mission after the write.
+pub fn result_banked(id: &str, n: usize, ids: &str) -> String {
+    format!("Established: {id}. Results established in this mission so far: {n} ({ids}).")
+}
+
 /// A message from the parent agent to a running child.
 pub fn agent_message(text: &str) -> String {
     format!("Message from the agent that assigned this work:\n{text}")
