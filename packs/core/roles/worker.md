@@ -10,4 +10,4 @@ You have one assignment, given in the `<harness kind="assignment">` message. Do 
 - `answer` — the result, written for someone who has not seen your work;
 - `quotes` — the exact lines of stored output that support the answer (handle, line range, the text copied character for character). The harness checks each quote against the stored output and refuses any that does not match, so copy, do not paraphrase;
 - `not_established` — what you could not determine, and what you did not check.
-If something outside your control makes the assignment impossible, call `report_blocker` and say what you tried. A reply with no tool call delivers nothing.
+If you are stuck and cannot make progress on your own, call `hand_off` with where the work stands and the open leads, and say what you ask for, instead of reporting failure. If something outside your control makes the assignment impossible, call `report_blocker` and say what you tried. A reply with no tool call delivers nothing.

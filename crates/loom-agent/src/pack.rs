@@ -1019,7 +1019,7 @@ mod tests {
             let pack = packs.get(name).unwrap();
             assert!(pack.requires_restricted_network);
             assert!(pack.command_guard);
-            let cap = if name == "ctf" { 25 } else { 18 };
+            let cap = if name == "ctf" { 26 } else { 18 };
             for role in pack.roles.values() {
                 assert!(role.tools.len() <= cap, "{name}/{} exposes {} tools", role.name, role.tools.len());
                 assert_eq!(role.requires_credential, name == "redteam" && role.name == "lateral_operator");
@@ -1056,6 +1056,25 @@ mod tests {
         assert!(has("web_solver", "job_wait"));
         for tool in ["wait", "attempt", "agent_adopt", "grep", "glob"] {
             assert!(has("dispatcher", tool), "ctf/dispatcher should have {tool}");
+        }
+        // Being stuck has a door that is not a finish: the dispatcher asks, the solvers hand the work back.
+        assert!(has("dispatcher", "ask_for") && !has("dispatcher", "hand_off"));
+        for role in ["solver", "web_solver", "binary_solver", "crypto_solver"] {
+            assert!(has(role, "hand_off") && !has(role, "ask_for"), "ctf/{role} should have hand_off only");
+        }
+        assert_eq!(ctf.roles.get("binary_solver").unwrap().tools.len(), 26);
+    }
+
+    #[test]
+    fn core_and_vr_packs_grant_the_exits_that_are_not_concessions() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let packs = Packs::load(&dir).unwrap();
+        let has = |pack: &str, role: &str, tool: &str| {
+            packs.role(Some(pack), Some(role)).unwrap().tools.iter().any(|t| t == tool)
+        };
+        for (pack, lead, child) in [("core", "lead", "worker"), ("vr", "researcher", "scout")] {
+            assert!(has(pack, lead, "ask_for") && !has(pack, lead, "hand_off"), "{pack}/{lead}");
+            assert!(has(pack, child, "hand_off") && !has(pack, child, "ask_for"), "{pack}/{child}");
         }
     }
 }
