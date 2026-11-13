@@ -719,13 +719,18 @@ the precise specification.
   told its copy is not a repository.
   What an agent changed is told by comparing its copy with a manifest written when the copy was made
   (size, modification time, permission bits, link targets of every file Git would not ignore), not
-  by Git, so it works in any directory and ignores build output. The lead is shown the changed paths
+  by Git, so it works in any directory and ignores build output. Making the copy ends only when the
+  clock is past the newest time in the manifest (a wait of at most 2.5 s, and none unless a file was
+  written just before), so a file written afterwards cannot have a time the manifest has, however
+  coarse the file system's clock is. The lead is shown the changed paths
   with the agent's report, and the commands the agent ran to their end with how each ended (marked
   when a file changed after the command started).
 - `agent_adopt {agent, preview?}` brings one agent's changes into the lead's workspace: added and
   modified files are written, deleted ones removed. Nothing is merged. A path the agent changed that
   has also changed in the workspace since the copy was made is a conflict, and with one conflict (or
-  one path the lead's sandbox rules refuse) nothing is written. Adopting twice is harmless, and two
+  one path the lead's sandbox rules refuse) nothing is written. A path that is in the workspace as
+  the agent's copy has it — the same bytes and permission bits, compared as such and not by time —
+  is no conflict and is left alone. Adopting twice is harmless, and two
   agents whose changes touch different paths can be adopted one after the other. `.git` is never
   touched. Copies stay until the mission is archived, which removes them.
 - `attempt {question…, check, n?, approaches?, mode?, check_timeout_s?}` is best-of-N: `n` agents (3

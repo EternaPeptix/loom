@@ -25,10 +25,11 @@
 //! Before anything is copied the tree is measured: more than `limits.max_files` files and links, or
 //! more than `limits.max_bytes` bytes of file content (0 = no limit), and nothing is copied. The
 //! limit on bytes is there for file systems where a copy duplicates them. Where files are cloned it
-//! does not apply: that is found out by cloning one file of the tree into the directory the copy
-//! will be made in (macOS `clonefile`; the probe is removed again), and `Made::cloned` says how it
-//! came out. Elsewhere, and when the probe fails for any reason, the limit holds. A copy that fails
-//! part-way removes what it made. All refusals are sentences for the model.
+//! does not apply: that is found out by cloning one file of the tree to a path beside where the copy
+//! will be (macOS `clonefile`; the probe is named for the copy, so copies made at the same time do
+//! not share it, and is removed again), and `Made::cloned` says how it came out. Elsewhere, and when
+//! the probe fails for any reason, the limit holds. A copy that fails part-way removes what it made.
+//! All refusals are sentences for the model.
 //!
 //! ## The manifest
 //! `Made::manifest` records what the copy was made from: for every file and link that Git would
@@ -42,6 +43,13 @@
 //! Ignored files are in the copy and are not in the manifest: what a build wrote is not what a child
 //! changed.
 //!
+//! Changes are told by size and time, so `make` returns only when no file written from then on can
+//! get a time the manifest has: when the clock is 20 ms past the newest of them (a file system
+//! takes its times from a clock that moves every few milliseconds), or 2 s past one in whole seconds
+//! (a file system that keeps no fractions may keep only even seconds). It waits at most 2.5 s for
+//! that, which is no wait at all unless a file was written just before; a time in the future is not
+//! waited for.
+//!
 //! ## What changed
 //! `changes(manifest, copy)` walks the copy by the same rules (with the copy's own ignore files) and
 //! compares with the manifest: `added` (not in the manifest), `modified` (a file whose size, time or
@@ -49,14 +57,17 @@
 //! became a link or the reverse), `deleted` (in the manifest and no longer in the copy at all — a
 //! file that is still there but is now ignored counts as unchanged). Each list is sorted.
 //! `newest_ms` is the latest modification time among the added and modified files. A comparison by
-//! size and time, as `rsync` makes by default: a change that keeps both is not seen.
+//! size and time, as `rsync` makes by default: a change that keeps both is not seen. That takes a
+//! program that sets a file's time back, or one that rewrote the file while the copy was being made.
 //!
 //! ## Adopting
 //! `adopt(manifest, copy, dest, may_write)` brings those changes into `dest` (the workspace the copy
 //! was made from): the added and modified files and links are written, the deleted ones removed.
 //! Nothing is merged, and it is all or nothing as far as that can be known beforehand:
-//! - a path whose state in `dest` is already the copy's is left alone (so adopting twice, or after a
-//!   crash part-way, is harmless);
+//! - a path that is in `dest` as the copy has it — a link with the same target, a file with the same
+//!   permission bits and the same bytes — is left alone (so adopting twice, or after a crash
+//!   part-way, is harmless, and the same change made on both sides is no conflict). The bytes are
+//!   compared, not the times: two files written at one moment have the same time;
 //! - otherwise the path must be in `dest` as the manifest recorded the source (for an added path:
 //!   must not exist). Any path that is not — it was changed in the workspace since the copy was made
 //!   — is a conflict, and with one conflict nothing is written (`AdoptError::Conflicts`);
@@ -72,17 +83,21 @@
 //! Tests required (temp dirs): a copy holds files, links, modes and times, leaves out `.loom`, and
 //! its manifest leaves out ignored files and `.git`; a Git pointer that leaves the tree is left out
 //! and one that stays inside is copied; the limit on bytes holds unless the copy is cloned, and the
-//! probe leaves nothing behind; the limits refuse before anything is written; a
-//! destination inside the source is refused; changes lists added, modified, deleted and ignores
-//! build output; adopt writes and removes exactly those, is harmless when repeated, refuses on a
-//! conflict or a refused path without writing anything, and does not touch `.git`.
+//! probe leaves nothing behind; copies made at the same time agree on whether files are cloned; the
+//! limits refuse before anything is written; a destination inside the source is refused; when a
+//! copy is made the clock is past the times it recorded, and a file rewritten at once to the same
+//! size is seen as changed, in the copy and in the workspace; changes lists added, modified, deleted
+//! and ignores build output; adopt writes and removes exactly those, is harmless when repeated,
+//! refuses on a conflict or a refused path without writing anything — also when the file in the
+//! workspace has the size and time of the copy's and other bytes — takes the same change on both
+//! sides for no conflict, and does not touch `.git`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How large a workspace may be to be copied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,11 +321,12 @@ fn sample_file(dir: &Path, top: bool) -> Option<PathBuf> {
     later.iter().find_map(|d| sample_file(d, false))
 }
 
-/// Whether a file of the tree can be cloned into the directory `into`: both are then on one file
-/// system that shares the bytes of a copy with its original.
+/// Whether a file of the tree can be cloned to `probe`, which is beside where the copy will be: both
+/// are then on one file system that shares the bytes of a copy with its original.
 #[cfg(target_os = "macos")]
-fn clones_into(sample: &Path, into: &Path) -> bool {
-    let probe = into.join(format!(".loom-clone-probe-{}", std::process::id()));
+fn clones_to(sample: &Path, probe: &Path) -> bool {
+    // One left by a run that was killed would make the clone fail.
+    let _ = std::fs::remove_file(probe);
     let (Ok(from), Ok(to)) =
         (std::ffi::CString::new(sample.as_os_str().as_bytes()), std::ffi::CString::new(probe.as_os_str().as_bytes()))
     else {
@@ -319,13 +335,72 @@ fn clones_into(sample: &Path, into: &Path) -> bool {
     // SAFETY: both arguments are NUL-terminated paths that live for the call; clonefile(2) reads
     // them and has no other memory effects.
     let cloned = unsafe { libc::clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0;
-    let _ = std::fs::remove_file(&probe);
+    let _ = std::fs::remove_file(probe);
     cloned
 }
 
 #[cfg(not(target_os = "macos"))]
-fn clones_into(_sample: &Path, _into: &Path) -> bool {
+fn clones_to(_sample: &Path, _probe: &Path) -> bool {
     false
+}
+
+/// Where the clone is tried for the copy at `dest`: named for it, so that copies made at the same
+/// time in one directory do not try at the same path.
+fn probe_path(dest: &Path) -> Option<PathBuf> {
+    let name = dest.file_name()?.to_string_lossy().into_owned();
+    Some(dest.with_file_name(format!(".{name}.loom-clone-probe")))
+}
+
+/// How far the clock must be past a recorded time before a file written from then on cannot carry
+/// it. A file system that keeps fractions of a second takes its times from a clock that moves every
+/// few milliseconds; one that keeps whole seconds may keep only the even ones.
+const TICK: Duration = Duration::from_millis(20);
+const WHOLE_SECONDS: Duration = Duration::from_millis(2_020);
+/// The longest `make` waits for that. A time that lies in the future is not waited for.
+const SETTLE_MAX: Duration = Duration::from_millis(2_500);
+
+/// When the clock is past every time recorded in `files`; `None` when none is recorded.
+fn settled_at(files: &BTreeMap<String, Entry>) -> Option<SystemTime> {
+    let past = |s: &Stamp| {
+        let secs = u64::try_from(s.secs).ok()?;
+        let margin = if s.nanos == 0 { WHOLE_SECONDS } else { TICK };
+        UNIX_EPOCH.checked_add(Duration::new(secs, s.nanos))?.checked_add(margin)
+    };
+    files
+        .values()
+        .filter_map(|entry| match entry {
+            Entry::File { source, copy } => past(source).max(past(copy)),
+            Entry::Link { .. } => None,
+        })
+        .max()
+}
+
+/// Whether two files hold the same bytes. One that cannot be read is not the same as anything.
+fn same_bytes(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+    fn fill(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut have = 0;
+        while let Some(rest) = buf.get_mut(have..).filter(|r| !r.is_empty()) {
+            match file.read(rest) {
+                Ok(0) => break,
+                Ok(n) => have += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(have)
+    }
+    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else { return false };
+    let (mut ba, mut bb) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    loop {
+        let (Ok(na), Ok(nb)) = (fill(&mut fa, &mut ba), fill(&mut fb, &mut bb)) else { return false };
+        if na != nb || ba.get(..na) != bb.get(..nb) {
+            return false;
+        }
+        if na == 0 {
+            return true;
+        }
+    }
 }
 
 struct Copier {
@@ -473,8 +548,8 @@ pub fn make(source: &Path, dest: &Path, limits: &Limits) -> Result<Made, String>
         std::fs::create_dir_all(parent).map_err(failed)?;
     }
     // Bytes that a copy shares with its original are not bytes to be afraid of.
-    let cloned = match (dest.parent(), sample_file(source, true)) {
-        (Some(parent), Some(sample)) => clones_into(&sample, parent),
+    let cloned = match (probe_path(dest), sample_file(source, true)) {
+        (Some(probe), Some(sample)) => clones_to(&sample, &probe),
         _ => false,
     };
     let measured = Limits { max_files: limits.max_files, max_bytes: if cloned { 0 } else { limits.max_bytes } };
@@ -489,6 +564,10 @@ pub fn make(source: &Path, dest: &Path, limits: &Limits) -> Result<Made, String>
     let Copier { done, files, bytes, skipped, mut git_left_out } = copier;
     git_left_out.sort();
     let files_listed: BTreeMap<String, Entry> = done.into_iter().filter(|(rel, _)| keep.contains(rel)).collect();
+    // From here on a file that is written gets a time that none of the recorded ones is.
+    if let Some(wait) = settled_at(&files_listed).and_then(|at| at.duration_since(SystemTime::now()).ok()) {
+        std::thread::sleep(wait.min(SETTLE_MAX));
+    }
     Ok(Made {
         manifest: Manifest { source: source.display().to_string(), made_ms: now_ms(), files: files_listed },
         files,
@@ -504,6 +583,17 @@ fn unchanged_in_copy(entry: &Entry, now: &Seen) -> bool {
     match (entry, now) {
         (Entry::File { copy, .. }, Seen::File(s)) => copy == s,
         (Entry::Link { target }, Seen::Link(t)) => target == t,
+        _ => false,
+    }
+}
+
+/// Whether a path is in the workspace (`there`) as the copy has it (`here`): a link with the same
+/// target, or a file with the same permission bits and bytes. Their times are not asked: two files
+/// written at one moment have the same time, and a file system may round the one it is given.
+fn as_the_copy_has_it(there: &Seen, here: &Seen, in_dest: &Path, in_copy: &Path) -> bool {
+    match (there, here) {
+        (Seen::Link(a), Seen::Link(b)) => a == b,
+        (Seen::File(a), Seen::File(b)) => a.size == b.size && a.mode == b.mode && same_bytes(in_dest, in_copy),
         _ => false,
     }
 }
@@ -594,9 +684,10 @@ pub fn adopt(
     let mut todo = Changes { newest_ms: all.newest_ms, ..Changes::default() };
     let mut conflicts = Vec::new();
     for (rel, added) in all.added.iter().map(|r| (r, true)).chain(all.modified.iter().map(|r| (r, false))) {
-        let there = seen(&dest.join(rel));
-        // Compared by time and size, so a path already adopted (its time is the copy's) is recognised.
-        if there == seen(&copy.join(rel)) {
+        let (in_dest, in_copy) = (dest.join(rel), copy.join(rel));
+        let there = seen(&in_dest);
+        // Adopted already, or the same change was made on both sides.
+        if as_the_copy_has_it(&there, &seen(&in_copy), &in_dest, &in_copy) {
             continue;
         }
         let as_copied = match manifest.files.get(rel) {
@@ -701,18 +792,6 @@ mod tests {
         fs::metadata(p).unwrap().modified().unwrap()
     }
 
-    /// Write `text` to `p` and give it a time that differs from any it had (a rewrite within one
-    /// tick of a coarse clock would otherwise keep the old one).
-    fn rewrite(p: &Path, text: &str) {
-        let before = fs::symlink_metadata(p).ok().map(|m| stamp(&m));
-        fs::write(p, text).unwrap();
-        let mut s = stamp(&fs::metadata(p).unwrap());
-        if before.is_some_and(|b| b.secs == s.secs && b.nanos == s.nanos) {
-            s.secs += 2;
-            set_mtime(p, &s).unwrap();
-        }
-    }
-
     #[test]
     fn a_copy_holds_everything_but_harness_state_and_its_manifest_leaves_out_what_git_ignores() {
         let f = fx();
@@ -772,7 +851,7 @@ mod tests {
     fn changes_lists_what_the_child_did_and_not_what_a_build_wrote() {
         let f = fx();
         let made = make(&f.ws, &f.copy, &ROOMY).unwrap();
-        rewrite(&f.copy.join("src/a.rs"), "fn a() { 1 }\n");
+        fs::write(f.copy.join("src/a.rs"), "fn a() { 1 }\n").unwrap();
         fs::write(f.copy.join("src/new.rs"), "fn n() {}\n").unwrap();
         fs::remove_file(f.copy.join("docs/old.md")).unwrap();
         fs::set_permissions(f.copy.join("src/b.rs"), fs::Permissions::from_mode(0o600)).unwrap();
@@ -799,7 +878,7 @@ mod tests {
     fn adopt_brings_exactly_the_changes_and_is_harmless_when_repeated() {
         let f = fx();
         let made = make(&f.ws, &f.copy, &ROOMY).unwrap();
-        rewrite(&f.copy.join("src/a.rs"), "fn a() { 1 }\n");
+        fs::write(f.copy.join("src/a.rs"), "fn a() { 1 }\n").unwrap();
         fs::create_dir_all(f.copy.join("tests/deep")).unwrap();
         fs::write(f.copy.join("tests/deep/t.rs"), "#[test] fn t() {}\n").unwrap();
         fs::remove_file(f.copy.join("docs/old.md")).unwrap();
@@ -835,37 +914,120 @@ mod tests {
     fn adopt_writes_nothing_when_the_workspace_changed_too_or_a_path_is_refused() {
         let f = fx();
         let made = make(&f.ws, &f.copy, &ROOMY).unwrap();
-        rewrite(&f.copy.join("src/a.rs"), "fn a() { 1 }\n");
-        rewrite(&f.copy.join("src/b.rs"), "fn b() { 2 }\n");
+        fs::write(f.copy.join("src/a.rs"), "fn a() { 1 }\n").unwrap();
+        fs::write(f.copy.join("src/b.rs"), "fn b() { 2 }\n").unwrap();
         fs::write(f.copy.join("new.txt"), "from the copy\n").unwrap();
+        fs::write(f.copy.join("run.sh"), "#!/bin/sh\necho yo\n").unwrap();
         fs::remove_file(f.copy.join("docs/old.md")).unwrap();
-        // Meanwhile, in the workspace: one of those files was edited, another path of the same name
+        // Meanwhile, in the workspace: two of those files were edited, another path of the same name
         // appeared, and the file the copy removed was changed.
-        rewrite(&f.ws.join("src/a.rs"), "fn a() { lead }\n");
+        fs::write(f.ws.join("src/a.rs"), "fn a() { lead }\n").unwrap();
         fs::write(f.ws.join("new.txt"), "from the lead\n").unwrap();
-        rewrite(&f.ws.join("docs/old.md"), "old, edited\n");
+        fs::write(f.ws.join("run.sh"), "#!/bin/sh\necho no\n").unwrap();
+        fs::write(f.ws.join("docs/old.md"), "old, edited\n").unwrap();
+        // Two of them have the size of the copy's and, as files written at one moment do, its time:
+        // only their bytes say that they are not what the copy has.
+        for same in ["new.txt", "run.sh"] {
+            set_mtime(&f.ws.join(same), &stamp(&fs::metadata(f.copy.join(same)).unwrap())).unwrap();
+            assert_eq!(seen(&f.ws.join(same)), seen(&f.copy.join(same)), "{same}");
+        }
         let Err(AdoptError::Conflicts(conflicts)) = adopt(&made.manifest, &f.copy, &f.ws, &allow) else {
             panic!("conflicts expected")
         };
         let paths: Vec<&str> = conflicts.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(paths, ["new.txt", "src/a.rs", "docs/old.md"]);
+        assert_eq!(paths, ["new.txt", "run.sh", "src/a.rs", "docs/old.md"]);
         assert_eq!(conflicts[0].1, "a path of that name has appeared there");
         assert_eq!(conflicts[1].1, "the file there has changed");
+        assert_eq!(conflicts[2].1, "the file there has changed");
         // Nothing was written, not even the file without a conflict.
         assert_eq!(fs::read_to_string(f.ws.join("src/b.rs")).unwrap(), "fn b() {}\n");
         assert_eq!(fs::read_to_string(f.ws.join("new.txt")).unwrap(), "from the lead\n");
+        assert_eq!(fs::read_to_string(f.ws.join("run.sh")).unwrap(), "#!/bin/sh\necho no\n");
 
         // Without the conflicts, a path that may not be written stops everything as well.
         let g = fx();
         let made = make(&g.ws, &g.copy, &ROOMY).unwrap();
-        rewrite(&g.copy.join("src/a.rs"), "fn a() { 1 }\n");
-        rewrite(&g.copy.join("run.sh"), "#!/bin/sh\necho changed\n");
+        fs::write(g.copy.join("src/a.rs"), "fn a() { 1 }\n").unwrap();
+        fs::write(g.copy.join("run.sh"), "#!/bin/sh\necho changed\n").unwrap();
         let may = |p: &Path| if p.ends_with("run.sh") { Err("protected".to_string()) } else { Ok(()) };
         let Err(AdoptError::Refused(refused)) = adopt(&made.manifest, &g.copy, &g.ws, &may) else {
             panic!("a refusal expected")
         };
         assert_eq!(refused, [("run.sh".to_string(), "protected".to_string())]);
         assert_eq!(fs::read_to_string(g.ws.join("src/a.rs")).unwrap(), "fn a() {}\n");
+    }
+
+    #[test]
+    fn the_same_change_on_both_sides_is_no_conflict_and_is_not_brought() {
+        let f = fx();
+        let made = make(&f.ws, &f.copy, &ROOMY).unwrap();
+        for side in [&f.copy, &f.ws] {
+            fs::write(side.join("src/a.rs"), "fn a() { same }\n").unwrap();
+            fs::write(side.join("notes.txt"), "the same\n").unwrap();
+        }
+        fs::write(f.copy.join("src/b.rs"), "fn b() { 2 }\n").unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let may = |p: &Path| {
+            asked.borrow_mut().push(p.to_path_buf());
+            Ok(())
+        };
+        let done = adopt(&made.manifest, &f.copy, &f.ws, &may).unwrap();
+        assert_eq!(done.lines(), ["M src/b.rs"]);
+        assert_eq!(*asked.borrow(), [f.ws.join("src/b.rs")]);
+        assert_eq!(fs::read_to_string(f.ws.join("src/b.rs")).unwrap(), "fn b() { 2 }\n");
+    }
+
+    #[test]
+    fn when_a_copy_is_made_the_clock_is_past_the_times_it_recorded() {
+        let at = |secs: i64, nanos: u32| Stamp { size: 1, secs, nanos, mode: 0o644 };
+        let file = |s: Stamp| Entry::File { source: s, copy: s };
+        let mut files = BTreeMap::new();
+        assert_eq!(settled_at(&files), None);
+        files.insert("link".to_string(), Entry::Link { target: "x".into() });
+        files.insert("old".to_string(), file(at(-5, 0)));
+        assert_eq!(settled_at(&files), None);
+        files.insert("a".to_string(), file(at(100, 5)));
+        assert_eq!(settled_at(&files), Some(UNIX_EPOCH + Duration::new(100, 5) + TICK));
+        // A time in whole seconds may be all its file system keeps of a later one.
+        files.insert("b".to_string(), file(at(99, 0)));
+        assert_eq!(settled_at(&files), Some(UNIX_EPOCH + Duration::from_secs(99) + WHOLE_SECONDS));
+        // The time of the copy's file counts as that of the source's does.
+        files.insert("c".to_string(), Entry::File { source: at(50, 1), copy: at(200, 1) });
+        assert_eq!(settled_at(&files), Some(UNIX_EPOCH + Duration::new(200, 1) + TICK));
+
+        // The files of the fixture were written a moment ago.
+        let f = fx();
+        let made = make(&f.ws, &f.copy, &ROOMY).unwrap();
+        assert!(SystemTime::now() >= settled_at(&made.manifest.files).unwrap());
+        // So a file rewritten at once, to the size it had, has another time: it is seen as changed in
+        // the copy, and as changed in the workspace when the copy's is to replace it.
+        fs::write(f.copy.join("src/a.rs"), "fn z() {}\n").unwrap();
+        fs::write(f.copy.join("src/b.rs"), "fn y() {}\n").unwrap();
+        assert_eq!(changes(&made.manifest, &f.copy).unwrap().modified, ["src/a.rs", "src/b.rs"]);
+        fs::write(f.ws.join("src/a.rs"), "fn x() {}\n").unwrap();
+        let Err(AdoptError::Conflicts(conflicts)) = adopt(&made.manifest, &f.copy, &f.ws, &allow) else {
+            panic!("a conflict expected")
+        };
+        assert_eq!(conflicts, [("src/a.rs".to_string(), "the file there has changed".to_string())]);
+        assert_eq!(fs::read_to_string(f.ws.join("src/a.rs")).unwrap(), "fn x() {}\n");
+    }
+
+    #[test]
+    fn copies_made_at_the_same_time_agree_on_whether_files_are_cloned() {
+        let f = fx();
+        let beside = f.copy.parent().unwrap().to_path_buf();
+        let cloned: Vec<bool> = std::thread::scope(|s| {
+            let making: Vec<_> = (0..8)
+                .map(|i| {
+                    let (ws, dest) = (f.ws.clone(), beside.join(format!("at-once-{i}")));
+                    s.spawn(move || make(&ws, &dest, &ROOMY).unwrap().cloned)
+                })
+                .collect();
+            making.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(cloned.iter().all(|c| *c == cloned[0]), "{cloned:?}");
+        let left: Vec<_> = fs::read_dir(&beside).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(!left.iter().any(|n| n.to_string_lossy().contains("clone-probe")), "{left:?}");
     }
 
     #[test]
