@@ -243,8 +243,9 @@
 //! `producer(mission, blob)`: the first record that stores `blob` among the sessions of the mission (a
 //! session's own records only — a fork's copied records belong to its parent): a `tool_result` with
 //! `output.id == blob`; a successful `read` result whose `META_OF_BLOB` is `blob` (the file text it
-//! stored); a `job_settled` whose output is `blob`, credited to the call named by the `job_registered`
-//! of that job (`bash`, class `Exec`). Views of runtime tools register nothing.
+//! stored); a `job_settled` whose output is `blob`, or a `job_matched` whose stored part is, credited
+//! to the call named by the `job_registered` of that job (`bash`, class `Exec`). Views of runtime tools
+//! register nothing.
 //! `Producer{session, call_id, tool: name, class}`. Kept as an in-memory index fed by
 //! every record that passes through the sink; on a miss for a mission whose logs have not been
 //! scanned since start, scan the logs of all its sessions once, then answer.
@@ -458,7 +459,8 @@
 //!   and ends the lead's turn `Stopped`; `stop_child` on an idle child settles it;
 //! - `poll`: `k` requests whose messages equal the session's stable prefix plus the vote prompt,
 //!   distinct seeds, votes parsed, a failed request counted as no choice;
-//! - `producer`: found through the live index and, after a restart, through the scan;
+//! - `producer`: found through the live index and, after a restart, through the scan; the part a
+//!   watched job's match stored is found while the job runs, after the mission's logs were scanned;
 //! - inbox: a `finish` opens an item and notifies (the command's file has the kind); `answer`
 //!   resolves it; an empty answer dismisses a non-blocking item without a turn and is refused for a
 //!   blocking one;
@@ -1744,7 +1746,10 @@ impl Inner {
             let found = st.known.get(session).map(|k| (k.meta.mission.clone(), k.meta.title.clone()));
             if let Some((mission, title)) = found {
                 match &record.event {
-                    Event::ToolResult(_) | Event::JobRegistered { .. } | Event::JobSettled { .. } => {
+                    Event::ToolResult(_)
+                    | Event::JobRegistered { .. }
+                    | Event::JobSettled { .. }
+                    | Event::JobMatched { .. } => {
                         if let Some((blob, p)) = produced_by(session, &mut st.job_starts, &record.event) {
                             st.producers.entry((mission.clone(), blob)).or_insert(p);
                         }
@@ -6285,6 +6290,49 @@ mod tests {
         rt2.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn the_part_a_watched_job_matched_is_citable_while_the_job_runs() {
+        // The job writes its line only when the test says so. Bounded, so a failed run leaves no loop.
+        let command = "echo scanning; i=0; while [ ! -f release ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done; \
+                       echo 'FOUND key=abc'; sleep 120";
+        let e = env(Script::new(move |body, _| {
+            if tool_msgs(body) == 0 {
+                call("bash", json!({"command": command, "background": true, "wake_on": "^FOUND"}))
+            } else {
+                Action::Reply(Reply::text("noted"))
+            }
+        }))
+        .await;
+        // The chat role ends its turns by replying; it has no `wait`.
+        let mut chat = e.new_session(Some("start a job"));
+        chat.role = Some("chat".into());
+        let info = e.rt.create_session(chat).await.unwrap();
+        let id = info.meta.id.clone();
+        until("registered", || e.has(&id, |ev| matches!(ev, Event::JobRegistered { .. }))).await;
+        let call_id = e
+            .records(&id)
+            .iter()
+            .find_map(|r| match &r.event {
+                Event::ToolCall(c) if c.name == "bash" => Some(c.call_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        // The mission's logs have been read for producers once: what follows is learned from the
+        // records as they are written, or not at all.
+        assert!(e.rt.inner.orch.producer(&info.meta.mission, &BlobId::from("00")).await.is_none());
+        std::fs::write(e.ws.join("release"), "").unwrap();
+        until("matched", || e.has(&id, |ev| matches!(ev, Event::JobMatched { .. }))).await;
+        let part = e.records(&id).into_iter().find_map(|r| match r.event {
+            Event::JobMatched { output, .. } => output,
+            _ => None,
+        });
+        let part = part.expect("the matching part is stored");
+        assert!(!e.has(&id, |ev| matches!(ev, Event::JobSettled { .. })), "the job is still running");
+        let p = e.rt.inner.orch.producer(&info.meta.mission, &part.id).await.expect("the part has a producer");
+        assert_eq!((p.session, p.call_id, p.tool.as_str(), p.class), (id, call_id, "bash", ToolClass::Exec));
+        e.rt.shutdown().await;
+    }
+
     /// The `out:…` handle in the header of the `n`th tool message of a request.
     fn handle_in_tool_msg(body: &Value, n: usize) -> String {
         let text = body["messages"]
@@ -6437,6 +6485,21 @@ mod tests {
         assert!(produced_by(&s, &mut jobs, &reg("c4")).is_none());
         let wait = tool_result("c5", "job_wait", ToolClass::Exec, None, json!({"job": "j1"}));
         assert!(produced_by(&s, &mut jobs, &wait).is_none());
+        // A part of its output stored while it runs belongs to that call too, and the job stays known.
+        let matched = Event::JobMatched {
+            job_id: "j1".into(),
+            pattern: "FOUND".into(),
+            output: Some(loom_core::BlobRef { id: BlobId::from("cc02"), bytes: 10, lines: 2 }),
+            from: 0,
+            shown: vec![1],
+            matches: 1,
+        };
+        let p = produced_by(&s, &mut jobs, &matched).expect("the matched part registers");
+        assert_eq!(
+            (p.0, p.1.call_id, p.1.class, p.1.tool.as_str()),
+            (BlobId::from("cc02"), CallId::from("c4"), ToolClass::Exec, "bash")
+        );
+        assert_eq!(jobs.len(), 1, "a job that matched is still running");
         let settled = Event::JobSettled {
             job_id: "j1".into(),
             exit_code: Some(0),
