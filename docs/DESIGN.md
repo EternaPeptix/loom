@@ -1338,6 +1338,7 @@ description = "…"
 default_role = "lead"
 preamble = "harness.md"               # optional; the built-in preamble otherwise
 requires_restricted_network = false   # true: sessions refused while [network] mode = "open"
+solvable = false                      # true: roles are told the task was built to be solved; conclude refuses unreachable
 
 [roles.lead]
 description = "…"

@@ -87,7 +87,11 @@
 //! `check_finish_lead` refuses finish.
 //!
 //! ## `conclude` (lead)
-//! `status` `met` | `unreachable`, `note`, `evidence`. Refused in a child session. `unreachable` is refused,
+//! `status` `met` | `unreachable`, `note`, `evidence`. Refused in a child session. In a solvable pack
+//! (`role.solvable`) `unreachable` is refused first of all, nothing recorded, with
+//! `texts::conclude_unreachable_refused(has report_blocker)`: the operator built the mission to be solved, so
+//! not having found the way is not a finding. `met`, the operator's `release` and `report_blocker` are
+//! unaffected. Otherwise `unreachable` is refused,
 //! with a sentence listing them, while a plan step is open. Writes `GoalMetSet { Supported | Refuted, note,
 //! evidence }`; the ledger's own rules refuse a missing goal, a blank note, evidence that is missing,
 //! unattested, not supporting or static only, and a repeat. Output: ok, outcome `goal concluded: ...`, saying
@@ -166,7 +170,7 @@
 //! count restarting at an accepted finish only, an answered inbox item changing nothing, the goal-met
 //! pre-gate, objections settled by new execution evidence, an operator release, verifier ending without a
 //! verdict and spawn failure (retried, then held with a notice, no inbox item), shutdown and cancellation
-//! (error, nothing recorded); `conclude` - met, unreachable with and without open plan steps, a child;
+//! (error, nothing recorded); `conclude` - met, unreachable with and without open plan steps, unreachable refused in a solvable pack (with and without `report_blocker`), a child;
 //! `verdict` — each refusal, the settle effect and payload; `ask_user` — blocking and not, child
 //! refusal, missing `meanwhile`, ledger question recorded and referenced; `report_blocker` — child
 //! and lead; `wait` — nothing running, a running job, a running child.
@@ -1109,6 +1113,10 @@ impl Tool for Conclude {
                 )
             }
         };
+        if status == GoalMetStatus::Refuted && s.role.solvable {
+            let has_blocker = s.role.tools.iter().any(|t| t == "report_blocker");
+            return ToolOutput::error(texts::conclude_unreachable_refused(has_blocker));
+        }
         let state = match s.ledger() {
             Ok(st) => st,
             Err(e) => return ToolOutput::error(e),
@@ -2190,6 +2198,35 @@ mod tests {
         assert!(res.text.contains("finished — verified by s-kid1"), "{}", res.text);
         assert_eq!(spawn_count(&r), 1);
         assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Finished)));
+    }
+
+    #[tokio::test]
+    async fn conclude_unreachable_is_refused_in_a_solvable_pack_and_met_is_not() {
+        let blocker = " If something only the operator can supply is missing, call report_blocker.";
+        let keep = " Otherwise keep working: pick an open route from the mission state and run it.";
+        let base = "conclude unreachable is not available in this mission: the operator set it up as solvable, so not having found the way is not a finding.";
+        for with_blocker in [true, false] {
+            let mut role = core_role("lead");
+            role.solvable = true;
+            if with_blocker {
+                if !role.tools.iter().any(|t| t == "report_blocker") {
+                    role.tools.push("report_blocker".into());
+                }
+            } else {
+                role.tools.retain(|t| t != "report_blocker");
+            }
+            let r = rig_with(role, false, true, loom_core::config::AgentsCfg::default());
+            r.user_op(LedgerOp::GoalSet { text: "g".into() });
+            let e = record_run(&r);
+            let res = r.call("conclude", json!({"status": "unreachable", "note": "n", "evidence": [e.clone()]})).await;
+            assert_eq!(res.status, Status::Error, "{}", res.text);
+            let want = format!("{base}{}{keep}", if with_blocker { blocker } else { "" });
+            assert_eq!(res.text, format!("[conclude · error]\n{want}\n[end of conclude output · error]"));
+            let status = r.shared.ledger().unwrap().goal_met.map(|g| g.status);
+            assert_eq!(status, Some(loom_core::ledger::GoalMetStatus::Open));
+            let met = r.call("conclude", json!({"status": "met", "note": "the run passes", "evidence": [e]})).await;
+            assert_eq!(met.status, Status::Ok, "{}", met.text);
+        }
     }
 
     #[tokio::test]

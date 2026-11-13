@@ -10,6 +10,7 @@
   New module `loom-agent::frontier` (`frontier`, `attempts_run`, `render`, `directions`).
 - `claim_update` to `supported` adds one line, `Established: {id}. Results established in this mission so
   far: {n} ({ids}).`, so a banked result stays in view.
+- New pack key `solvable` (default false). In a solvable pack the system prompt says the operator built the mission to be solved, and `conclude` with status `unreachable` is refused with a pointer to `report_blocker`. The `ctf` pack sets it; `core`, `vr` and `redteam` do not.
 
 ### Watched jobs, agents in their own copies, and attempts
 

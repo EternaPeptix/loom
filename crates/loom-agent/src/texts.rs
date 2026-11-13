@@ -176,6 +176,19 @@ pub fn constraint(id: Option<&str>, text: &str) -> String {
     )
 }
 
+/// Part of the system prompt of a pack marked `solvable`, between the role prompt and `# Environment`.
+/// Fixed text: it is part of the cached prefix head.
+pub const SOLVABLE_PRIOR: &str = "The operator has set this mission up to be solvable with the access you have been given. On a task like this, not having found the way yet is the normal state of the work, not evidence that it cannot be done: keep forming approaches and testing them, and record what each run shows. If something only the operator can supply is missing — scope, a tool, a prerequisite — report it as a blocker; that is not a failure.";
+
+/// `conclude` with status `unreachable` in a solvable pack. `has_blocker`: the role has `report_blocker`.
+pub fn conclude_unreachable_refused(has_blocker: bool) -> String {
+    let blocker =
+        if has_blocker { " If something only the operator can supply is missing, call report_blocker." } else { "" };
+    format!(
+        "conclude unreachable is not available in this mission: the operator set it up as solvable, so not having found the way is not a finding.{blocker} Otherwise keep working: pick an open route from the mission state and run it."
+    )
+}
+
 /// The operator withdrew a standing rule.
 pub fn constraint_withdrawn(id: &str, reason: &str) -> String {
     let reason = reason.trim();

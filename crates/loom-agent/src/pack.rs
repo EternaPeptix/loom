@@ -12,6 +12,7 @@
 //! command_guard = "off"         # "off" | "offensive" command preflight policy
 //! target_concurrency = 2        # positive per-target tool concurrency
 //! requires_restricted_network = false  # optional; true = refuse to start sessions while the network mode is open
+//! solvable = false              # optional; true = the operator built this mission to be solvable (see below)
 //!
 //! [roles.lead]
 //! description = "…"             # optional
@@ -62,6 +63,12 @@
 //!    `Sandbox: {sandbox}`, `Network: {network}` — and nothing that changes from one request to the
 //!    next (no date, no time, no counters), because this text is the head of the cached prefix.
 //!
+//! When the pack sets `solvable = true`, `texts::SOLVABLE_PRIOR` is inserted as its own part between the
+//! role prompt and `# Environment`. It is a fixed text, so it stays inside the cached head. A pack without
+//! the key gets exactly the three parts above, byte for byte. `solvable` is read from `RoleDef::solvable`,
+//! which the loader copies from the pack onto every role (so tools and the prompt need no pack lookup); it
+//! also makes `conclude` refuse `status: "unreachable"` (see `rtools/terminal.rs`).
+//!
 //! Tests required: the built-in pack loads, has the roles `lead`, `worker`, `verifier`, `chat`, and
 //! every role's prompt is non-empty; a directory pack loads and can replace `core`; each validation
 //! failure (missing name, bad name, unknown key, missing prompt file, path escaping the pack,
@@ -70,6 +77,7 @@
 //! identical for identical inputs; the shipped `packs/vr/workspace/AGENTS.md` (a file the loader never
 //! reads) names only tools that a role of `vr` has.
 
+use crate::texts;
 use loom_core::event::Termination;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -107,6 +115,8 @@ pub struct RoleDef {
     pub require_distinct_verifier_profile: bool,
     /// Candidate discovery only; a match is not a verdict.
     pub flag_regex: Option<String>,
+    /// Copied from the pack's `solvable` key at load: the operator built this mission to be solved.
+    pub solvable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +129,9 @@ pub struct Pack {
     /// The pack's text says the network is restricted: sessions of it are refused while the
     /// daemon's network mode is `open`.
     pub requires_restricted_network: bool,
+    /// The operator built missions of this pack to be solvable: roles are told so, and `conclude`
+    /// refuses `unreachable`.
+    pub solvable: bool,
     pub command_guard: bool,
     pub target_concurrency: u32,
     pub roles: BTreeMap<String, RoleDef>,
@@ -158,6 +171,8 @@ struct RawPack {
     preamble: Option<String>,
     #[serde(default)]
     requires_restricted_network: bool,
+    #[serde(default)]
+    solvable: bool,
     command_guard: Option<String>,
     target_concurrency: Option<u32>,
     #[serde(default)]
@@ -394,6 +409,7 @@ fn parse_pack(
                 max_exec_calls: r.max_exec_calls,
                 require_distinct_verifier_profile: r.require_distinct_verifier_profile,
                 flag_regex: r.flag_regex.clone(),
+                solvable: raw.solvable,
             },
         );
     }
@@ -412,6 +428,7 @@ fn parse_pack(
         default_role,
         preamble,
         requires_restricted_network: raw.requires_restricted_network,
+        solvable: raw.solvable,
         command_guard,
         target_concurrency,
         roles,
@@ -552,8 +569,9 @@ pub fn load_pack(dir: &Path) -> Result<Pack, String> {
 }
 
 pub fn system_prompt(role: &RoleDef, preamble: &str, env: &PromptEnv) -> String {
+    let prior = if role.solvable { format!("{}\n\n", texts::SOLVABLE_PRIOR) } else { String::new() };
     format!(
-        "{}\n\n{}\n\n# Environment\nWorkspace: {}\nPlatform: {}\nSandbox: {}\nNetwork: {}",
+        "{}\n\n{}\n\n{prior}# Environment\nWorkspace: {}\nPlatform: {}\nSandbox: {}\nNetwork: {}",
         preamble.trim_end(),
         role.prompt.trim_end(),
         env.workspace,
@@ -904,6 +922,55 @@ mod tests {
         );
         assert_eq!(s, system_prompt(r, pre, &env()));
     }
+    #[test]
+    fn solvable_prior_sits_between_role_prompt_and_environment_only_in_solvable_packs() {
+        let p = Packs::builtin().unwrap();
+        let mut r = p.role(None, Some("worker")).unwrap().clone();
+        let pre = &p.get("core").unwrap().preamble;
+        let plain = system_prompt(&r, pre, &env());
+        assert!(!plain.contains("solvable"));
+        assert_eq!(
+            plain,
+            format!(
+                "{pre}\n\n{}\n\n# Environment\nWorkspace: /w\nPlatform: linux\nSandbox: sb\nNetwork: net",
+                r.prompt
+            )
+        );
+        r.solvable = true;
+        let s = system_prompt(&r, pre, &env());
+        assert_eq!(
+            s,
+            format!(
+                "{pre}\n\n{}\n\n{}\n\n# Environment\nWorkspace: /w\nPlatform: linux\nSandbox: sb\nNetwork: net",
+                r.prompt,
+                texts::SOLVABLE_PRIOR
+            )
+        );
+        assert_eq!(s, system_prompt(&r, pre, &env()));
+    }
+
+    #[test]
+    fn solvable_is_a_top_level_key_defaulting_to_false() {
+        let d = mk(GOOD);
+        let packs = Packs::load(d.path()).unwrap();
+        assert!(!packs.get("mine").unwrap().solvable);
+        assert!(!packs.role(Some("mine"), Some("a")).unwrap().solvable);
+        let d = mk(&format!("solvable = true\n{GOOD}"));
+        let packs = Packs::load(d.path()).unwrap();
+        assert!(packs.get("mine").unwrap().solvable);
+        assert!(packs.get("mine").unwrap().roles.values().all(|r| r.solvable));
+        let e = err(&format!("solvable = \"yes\"\n{GOOD}"));
+        assert!(e.contains("solvable"), "{e}");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let packs = Packs::load(&dir).unwrap();
+        assert!(packs.get("ctf").unwrap().solvable);
+        assert!(packs.get("ctf").unwrap().roles.values().all(|r| r.solvable));
+        for name in ["core", "vr", "redteam"] {
+            let pack = packs.get(name).unwrap();
+            assert!(!pack.solvable && pack.roles.values().all(|r| !r.solvable), "{name}");
+        }
+    }
+
     #[test]
     fn runtime_role_controls_load_validate_and_default_without_changing_old_packs() {
         let text = GOOD.replace("[roles.a]", "[roles.a]\nmodel = \"fast\"\nescalation_model = \"strong\"\nalloy_models = [\"fast\", \"other\"]\nmax_exec_calls = 0\nrequire_distinct_verifier_profile = true\nflag_regex = 'FLAG\\{[^}]+\\}'");
