@@ -2009,6 +2009,16 @@ impl Inner {
         self.st().box_closed.remove(mission);
     }
 
+    /// `session` was activated by an operator message, an inbox answer or a rule: when it is a lead, its
+    /// mission runs again, so its box may be made again (a message to a stopped lead reopens it).
+    fn box_reopen_for(&self, session: &SessionId) {
+        let mut st = self.st();
+        let mission = st.known.get(session).filter(|k| k.meta.parent.is_none()).map(|k| k.meta.mission.clone());
+        if let Some(m) = mission {
+            st.box_closed.remove(&m);
+        }
+    }
+
     /// Whether the daemon still has a use for the box of mission `m`: its lead has a task, or a box handle
     /// for it exists (made after the start's listing of leftovers).
     fn box_in_use(&self, m: &str) -> bool {
@@ -3898,6 +3908,7 @@ impl Runtime {
             return Err("This session is archived; unarchive it first.".to_string());
         }
         self.inner.activate(id)?;
+        self.inner.box_reopen_for(id);
         if !self.inner.send_input(id, Input::User(text.to_string())) {
             return Err(format!("Session {} is not accepting input.", id.as_str()));
         }
@@ -3941,6 +3952,7 @@ impl Runtime {
         stock: Option<&str>,
     ) -> Result<RuleReceipt, String> {
         self.inner.activate(lead)?;
+        self.inner.box_reopen_for(lead);
         let input = queue_input(&self.inner.paths, lead, input)?;
         let kept = match &input {
             Input::Queued { file, .. } => Some(file.clone()),
@@ -4163,6 +4175,7 @@ impl Runtime {
             return Err(no_session(id));
         }
         self.inner.activate(id)?;
+        self.inner.box_reopen_for(id);
         self.inner.send_input(id, Input::Reweave);
         Ok(())
     }
@@ -4325,6 +4338,9 @@ impl Runtime {
             return Err("This item is waiting for an answer; write one.".to_string());
         }
         self.inner.activate(&entry.session)?;
+        if !answer.trim().is_empty() {
+            self.inner.box_reopen_for(&entry.session);
+        }
         if !self
             .inner
             .send_input(&entry.session, Input::Answer { item_id: item_id.to_string(), answer: answer.to_string() })
@@ -8666,6 +8682,23 @@ mod tests {
         let b = e.rt.inner.orch.box_access(&id).await.unwrap();
         b.ready().await.unwrap();
         assert!(fake.running(&container));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn l3_a_message_to_a_stopped_lead_gives_its_mission_the_box_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let e = box_env(&fake).await;
+        let (id, mission) = idle_lead(&e).await;
+        e.rt.stop(&id).await.unwrap();
+        assert!(e.rt.inner.orch.box_access(&id).await.is_err(), "stopped: no box");
+        assert!(e.rt.inner.st().box_closed.contains(&mission));
+        e.rt.send_message(&id, "carry on").await.unwrap();
+        assert!(!e.rt.inner.st().box_closed.contains(&mission), "the message made the lead run again");
+        let b = e.rt.inner.orch.box_access(&id).await.unwrap();
+        b.ready().await.unwrap();
+        assert!(fake.running(&box_container(&mission)));
         e.rt.shutdown().await;
     }
 

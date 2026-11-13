@@ -110,9 +110,12 @@ When the operator enables a box, a session can run commands in a container on a 
   `allow_private`) and drop the rest; they are updated when grants change and removed with the box. Every
   box bridge is sent to a static chain `LOOM-ALL` that ends with `DROP`, so a bridge with no chain of its
   own is dropped, never NATed. The container is started only after its rules are in place, and is removed
-  if they cannot be kept current; a running box's rules are checked again about once a minute. A mission's
+  if they cannot be kept current at an update; a running box's rules are checked again about once a minute. A mission's
   create, reset, re-rule and teardown are serialized, and its chain is removed only after its container
-  and network are gone. A network that is not this box's own is never adopted.
+  and network are gone. A network that is not this box's own is never adopted. The Docker host must not
+  have other interfaces named `lb-*`: `LOOM-ALL` drops them. The mission chain has no rule for
+  established traffic, so a revoked grant cuts open flows at once; a box whose rules cannot be put back
+  is paused (its `/work` kept) and the command refused, not removed.
 - **The box is not run without a sandbox.** `[sandbox] mode = "none"` with the box, or a
   `sandbox.unix_sockets` entry for the box's socket or anything under `<loom home>/keys`, is a config
   error. The docker client and `ssh` are resolved to absolute paths at start and run with a fixed `PATH`,

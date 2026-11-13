@@ -55,7 +55,7 @@ pub const NO_BOX: &str = "No box is configured. The operator sets [box] in confi
 /// What `box_exec` and the others answer in a session that works in its own copy of the workspace.
 pub const BOX_IN_COPY: &str = "box_exec is not available in an agent copy yet; work in the shared workspace.";
 /// What the tools answer after the mission was stopped, ended or archived, until it is resumed.
-pub const BOX_CLOSED: &str = "The box of this mission was removed when the mission was stopped. It comes back when the operator resumes the mission.";
+pub use loom_tools::boxctl::BOX_CLOSED;
 
 /// Most files `box_get` lists in its result.
 const LISTED: usize = 20;

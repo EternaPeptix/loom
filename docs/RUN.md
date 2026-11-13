@@ -186,8 +186,11 @@ addresses (private addresses need `allow_private`), and writes the result into r
 (chain `LOOM-<id>`); everything else, including DNS and IPv6, is dropped. `DOCKER-USER` and `INPUT` send
 everything that enters on a box bridge (`lb-*`) to a static chain `LOOM-ALL`, which holds one jump per
 mission and ends with `DROP`: a box bridge without its own chain is dropped, never routed or translated.
-loom checks a running box's rules about once a minute and puts them back (or removes the box) if they
-are gone. A new grant, a release and the end of the mission update or remove the rules. The box has no
+The Docker host must not have other interfaces named `lb-*`: they are dropped by `LOOM-ALL`. A revoked
+grant cuts open flows at once (the mission chain has no rule for established traffic).
+loom checks a running box's rules about once a minute and puts them back if they are gone; if that fails
+twice it pauses the box (keeping `/work`), refuses the command, and resumes the box when a later check
+works. A new grant, a release and the end of the mission update or remove the rules. The box has no
 other mounts, no devices, all capabilities dropped except `cap_add`, a read-only root, and tmpfs `/work`
 and `/tmp`: files in it are lost when the mission ends or on `box_reset`.
 

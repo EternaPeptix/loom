@@ -59,7 +59,7 @@
 //! grant of all ports), and keeps IPv4 addresses only (the network has no IPv6). The names that were
 //! resolved, with the addresses that passed, are written to the container's `/etc/hosts` by the daemon
 //! (`docker exec -u 0 -i /bin/sh -c '/bin/cat > /etc/hosts'` with a fixed `PATH`, the text on stdin). The
-//! rules are the chain `LOOM-<short>` ([`rules_text`]): ACCEPT established and related, ACCEPT each allowed
+//! rules are the chain `LOOM-<short>` ([`rules_text`]): flushed first, then ACCEPT each allowed
 //! `ip/32` per protocol (tcp and udp, with `--dport` when a port was granted), DROP the rest. Behind it is a
 //! static chain `LOOM-ALL` that ends with `DROP` and holds one jump `-i lb-<short> -j LOOM-<short>` per
 //! mission, above that `DROP`; `DOCKER-USER` (forwarded packets) and `INPUT` (packets to the Docker host
@@ -148,6 +148,10 @@ const RESOLVE_LIMIT: Duration = Duration::from_secs(10);
 const FORWARD_WAIT: Duration = Duration::from_secs(20);
 /// A running box has its egress rules looked at again by `ready` when this long has passed since the last time.
 pub const RULES_RECHECK: Duration = Duration::from_secs(60);
+/// When the rules of a running box are not there and cannot be put back, the try is made once more after this.
+pub const RULES_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// What the box tools answer after the mission was stopped, ended or archived, until it is resumed.
+pub const BOX_CLOSED: &str = "The box of this mission was removed when the mission was stopped. It comes back when the operator resumes the mission.";
 /// The `PATH` of every process this module starts on this machine: fixed system directories, all absolute.
 pub const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 /// The `PATH` of the container's root-run `/etc/hosts` writer.
@@ -221,6 +225,14 @@ pub fn network_rm_args(n: &Names) -> Vec<String> {
 /// `docker network inspect` of the mission's network as one JSON object.
 pub fn network_inspect_args(n: &Names) -> Vec<String> {
     vec!["network".into(), "inspect".into(), "--format".into(), "{{json .}}".into(), n.network.clone()]
+}
+
+pub fn pause_args(n: &Names) -> Vec<String> {
+    vec!["pause".into(), n.container.clone()]
+}
+
+pub fn unpause_args(n: &Names) -> Vec<String> {
+    vec!["unpause".into(), n.container.clone()]
 }
 
 pub fn rm_args(n: &Names) -> Vec<String> {
@@ -443,10 +455,13 @@ pub fn rules_check_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
     helper_args(cfg, false, RULES_CHECK, n)
 }
 
-/// The `iptables-restore` input for the chain: established and related traffic, each allowed address, drop.
+/// The `iptables-restore` input for the chain: an explicit flush, each allowed address, drop. There is no
+/// rule for established traffic: the chain sees only packets that leave the `lb-` bridge, and those of an
+/// allowed flow match the `-d` rules anyway, so a revoked address stops at once, with its open flows (the
+/// replies arrive on the uplink, never through this chain). Container-to-host packets end at the `DROP`.
 pub fn rules_text(n: &Names, allowed: &BTreeSet<Allowed>) -> String {
-    let mut t = format!("*filter\n:{} - [0:0]\n", n.chain);
-    t.push_str(&format!("-A {} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n", n.chain));
+    // The `-F` is explicit so that a revoke never depends on a declared chain being flushed by itself.
+    let mut t = format!("*filter\n:{} - [0:0]\n-F {}\n", n.chain, n.chain);
     for a in allowed {
         for proto in ["tcp", "udp"] {
             match a.port {
@@ -681,6 +696,8 @@ pub struct DockerHost {
     locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Milliseconds between two looks at the rules of a running box.
     recheck_ms: AtomicU64,
+    /// Milliseconds before the second try of a failed rules check.
+    retry_ms: AtomicU64,
 }
 
 /// `name` as an absolute path to an executable file. A name with a `/` is taken as it is; a bare name is
@@ -755,6 +772,7 @@ impl DockerHost {
             last_ssh_error: Arc::new(StdMutex::new(String::new())),
             locks: StdMutex::new(HashMap::new()),
             recheck_ms: AtomicU64::new(u64::try_from(RULES_RECHECK.as_millis()).unwrap_or(u64::MAX)),
+            retry_ms: AtomicU64::new(u64::try_from(RULES_RETRY_DELAY.as_millis()).unwrap_or(u64::MAX)),
         }))
     }
 
@@ -769,6 +787,16 @@ impl DockerHost {
     #[cfg(any(test, feature = "testutil"))]
     pub fn set_recheck(&self, every: Duration) {
         self.recheck_ms.store(u64::try_from(every.as_millis()).unwrap_or(u64::MAX), Ordering::SeqCst);
+    }
+
+    /// Wait this long before the second try of a failed rules check (tests make it shorter).
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn set_retry_delay(&self, delay: Duration) {
+        self.retry_ms.store(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX), Ordering::SeqCst);
+    }
+
+    fn retry_delay(&self) -> Duration {
+        Duration::from_millis(self.retry_ms.load(Ordering::SeqCst))
     }
 
     fn recheck_every(&self) -> Duration {
@@ -1021,10 +1049,15 @@ struct State {
     pushed: Manifest,
     /// When the rules of the running container were last known to be in place.
     verified: Option<Instant>,
+    /// The container is paused because its rules could not be checked or put back (L2).
+    paused: bool,
+    /// The mission's box was torn down through this handle; it makes nothing again (L1). `forget` keeps it.
+    closed: bool,
 }
 
 impl State {
     fn forget(&mut self) {
+        self.paused = false;
         self.up = false;
         self.pushed.clear();
         self.verified = None;
@@ -1173,35 +1206,62 @@ impl MissionBox {
     }
 
     /// Whether the rules of the running container are all there, and if not, put them back, at most once per
-    /// `recheck_every` (R4). When they cannot be put back the container is removed and the call fails.
+    /// `recheck_every` (R4). A try that fails is made once more after `retry_delay` (a helper that failed
+    /// once is not a reason to lose `/work`). When the rules still cannot be put back the container is
+    /// paused, not removed, and the call fails (L2); a later check or install that works unpauses it.
     async fn verify_rules(&self, st: &mut State) -> Result<(), String> {
-        if st.verified.is_some_and(|t| t.elapsed() < self.host.recheck_every()) {
+        if !st.paused && st.verified.is_some_and(|t| t.elapsed() < self.host.recheck_every()) {
             return Ok(());
         }
-        let args = rules_check_args(&self.host.cfg, &self.names);
-        let present = matches!(self.host.docker(&args, None, SMALL_OUT).await, Ok(o) if o.ok());
-        if present {
-            st.verified = Some(Instant::now());
-            return Ok(());
-        }
-        tracing::warn!(mission = %self.names.mission, "box: its egress rules are not all in place; installing them again");
-        let again = async { self.install_rules(&self.plan().await?).await }.await;
-        match again {
-            Ok(()) => {
-                st.verified = Some(Instant::now());
-                Ok(())
+        let mut last = String::new();
+        for attempt in 0..2 {
+            if attempt > 0 {
+                tokio::time::sleep(self.host.retry_delay()).await;
             }
-            Err(e) => {
-                self.remove_container(st).await;
-                Err(format!(
-                    "The egress rules of the box were not all in place and could not be put back ({e}), so the box was removed and the command was not run. The next box_exec makes a new box."
-                ))
+            let args = rules_check_args(&self.host.cfg, &self.names);
+            if matches!(self.host.docker(&args, None, SMALL_OUT).await, Ok(o) if o.ok()) {
+                return self.rules_ok(st).await;
+            }
+            tracing::warn!(mission = %self.names.mission, "box: its egress rules are not all in place; installing them again");
+            match async { self.install_rules(&self.plan().await?).await }.await {
+                Ok(()) => return self.rules_ok(st).await,
+                Err(e) => last = e,
             }
         }
+        // Fail closed without losing the work: a paused container runs nothing and keeps `/work`.
+        let paused = matches!(self.host.docker(&pause_args(&self.names), None, SMALL_OUT).await, Ok(o) if o.ok());
+        if paused {
+            st.paused = true;
+            st.verified = None;
+            Err(format!(
+                "The egress rules of the box were not all in place and could not be put back ({last}), so the box was paused and the command was not run. The next box_exec checks the rules again and continues when they are back."
+            ))
+        } else {
+            self.remove_container(st).await;
+            Err(format!(
+                "The egress rules of the box were not all in place and could not be put back ({last}), and the box could not be paused, so it was removed and the command was not run. The next box_exec makes a new box."
+            ))
+        }
+    }
+
+    /// The rules are in place: note it, and let a paused container run again.
+    async fn rules_ok(&self, st: &mut State) -> Result<(), String> {
+        if st.paused {
+            match self.host.docker(&unpause_args(&self.names), None, SMALL_OUT).await {
+                Ok(o) if o.ok() => st.paused = false,
+                Ok(o) => return Err(format!("The box is paused and could not be resumed: {}", o.why())),
+                Err(e) => return Err(e),
+            }
+        }
+        st.verified = Some(Instant::now());
+        Ok(())
     }
 
     /// The body of `ready` and `reset`; the mission's lock and the state are held by the caller.
     async fn ensure_locked(&self, st: &mut State) -> Result<(), String> {
+        if st.closed {
+            return Err(BOX_CLOSED.to_string());
+        }
         self.host.ensure_forward().await?;
         if st.up {
             if self.is_running().await {
@@ -1246,6 +1306,9 @@ impl MissionBox {
     pub async fn reset(&self) -> Result<(), String> {
         let _life = self.lifecycle.lock().await;
         let mut st = self.state.lock().await;
+        if st.closed {
+            return Err(BOX_CLOSED.to_string());
+        }
         self.host.ensure_forward().await?;
         self.run_ok("Removing the box", rm_args(&self.names)).await?;
         st.forget();
@@ -1280,6 +1343,7 @@ impl MissionBox {
         let _life = self.lifecycle.lock().await;
         let mut st = self.state.lock().await;
         st.forget();
+        st.closed = true;
         teardown_names_locked(&self.host, &self.names).await;
     }
 
@@ -1303,6 +1367,9 @@ impl MissionBox {
     pub async fn push(&self, sandbox: Arc<Sandbox>, workspace: PathBuf) -> Result<PushReport, String> {
         let _life = self.lifecycle.lock().await;
         let mut st = self.state.lock().await;
+        if st.closed {
+            return Err(BOX_CLOSED.to_string());
+        }
         let cfg = &self.host.cfg;
         let limits = boxfs::PushLimits {
             total: cfg.sync_max_mb.saturating_mul(1 << 20),
@@ -1348,7 +1415,10 @@ impl MissionBox {
     /// `docker cp <container>:<path> -`: the tar stream, at most `max` bytes (I7 reads it).
     pub async fn get_tar(&self, path: &str, max: usize) -> Result<Vec<u8>, String> {
         let _life = self.lifecycle.lock().await;
-        let _st = self.state.lock().await;
+        let st = self.state.lock().await;
+        if st.closed {
+            return Err(BOX_CLOSED.to_string());
+        }
         if !path.starts_with('/') || path.contains('\0') {
             return Err(format!("The path `{path}` is not absolute in the box."));
         }
@@ -1536,6 +1606,7 @@ case "$sub" in
         # by their first word; the chain is a file here, so tests can see when it exists.
         chain=""; iface=""; for a in "$@"; do chain="$iface"; iface="$a"; done
         [ -f "$D/rules.fail" ] && { echo "iptables: failed" >&2; exit 1; }
+        if [ -f "$D/rules.fail.count" ]; then n=$(cat "$D/rules.fail.count"); if [ "$n" -gt 0 ]; then echo $((n-1)) > "$D/rules.fail.count"; echo "iptables: transient" >&2; exit 1; fi; fi
         case "$*" in
           *": loom-rules-check;"*)
             [ -f "$D/chain-$chain" ] || { echo "iptables: Bad rule (does a matching rule exist in that chain?)" >&2; exit 1; }
@@ -1553,8 +1624,14 @@ case "$sub" in
     if [ -f "$D/netif-$net" ]; then short=$(sed 's/^lb-//' "$D/netif-$net"); [ -f "$D/chain-LOOM-$short" ] || echo "$name" >> "$D/violations"; fi
     touch "$D/ctr-$name"; echo "fakeid"; exit 0;;
   rm) for a in "$@"; do last="$a"; done
-      if [ -f "$D/ctr-$last" ]; then rm -f "$D/ctr-$last"; exit 0; fi
+      if [ -f "$D/ctr-$last" ]; then rm -f "$D/ctr-$last" "$D/paused-$last"; exit 0; fi
       echo "Error: No such container: $last" >&2; exit 1;;
+  pause) for a in "$@"; do last="$a"; done
+      if [ -f "$D/ctr-$last" ]; then touch "$D/paused-$last"; echo "$last"; exit 0; fi
+      echo "Error: No such container: $last" >&2; exit 1;;
+  unpause) for a in "$@"; do last="$a"; done
+      if [ -f "$D/paused-$last" ]; then rm -f "$D/paused-$last"; echo "$last"; exit 0; fi
+      echo "Error response from daemon: Container $last is not paused" >&2; exit 1;;
   inspect) for a in "$@"; do last="$a"; done
       if [ -f "$D/ctr-$last" ]; then echo true; exit 0; fi
       echo "Error: No such object: $last" >&2; exit 1;;
@@ -1593,6 +1670,7 @@ case "$sub" in
     done
     ctr=$1; shift
     if [ ! -f "$D/ctr-$ctr" ]; then echo "Error: No such container: $ctr" >&2; exit 1; fi
+    if [ -f "$D/paused-$ctr" ]; then echo "Error response from daemon: Container $ctr is paused, unpause the container before exec" >&2; exit 1; fi
     if [ "$*" = "/bin/sh -c /bin/cat > /etc/hosts" ]; then cat > "$D/etc-hosts"; exit 0; fi
     mkdir -p "$D/work"; cd "$D/work" || exit 1
     command -v setsid >/dev/null 2>&1 || PATH="$D/bin:$PATH"
@@ -1659,6 +1737,10 @@ exit 0
 
         pub fn running(&self, container: &str) -> bool {
             self.dir.join(format!("ctr-{container}")).exists()
+        }
+
+        pub fn paused(&self, container: &str) -> bool {
+            self.dir.join(format!("paused-{container}")).exists()
         }
 
         pub fn host(&self) -> Arc<DockerHost> {
@@ -2002,7 +2084,7 @@ mod tests {
         assert_eq!(
             rules_text(&n, &allowed),
             format!(
-                "*filter\n:{c} - [0:0]\n-A {c} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n\
+                "*filter\n:{c} - [0:0]\n-F {c}\n\
                  -A {c} -d 203.0.113.7/32 -p tcp -j ACCEPT\n-A {c} -d 203.0.113.7/32 -p udp -j ACCEPT\n\
                  -A {c} -d 203.0.113.50/32 -p tcp -m tcp --dport 8080 -j ACCEPT\n\
                  -A {c} -d 203.0.113.50/32 -p udp -m udp --dport 8080 -j ACCEPT\n-A {c} -j DROP\nCOMMIT\n"
@@ -2535,7 +2617,9 @@ if [ "$T" = iptables-restore ]; then
   while IFS= read -r line; do
     case "$line" in
       :*) c=${line#:}; c=${c%% *}
-          if grep -qxF "$c" "$S/iptables.chains"; then grep -v "^$c|" "$S/iptables.rules" > "$S/t"; mv "$S/t" "$S/iptables.rules"; else echo "$c" >> "$S/iptables.chains"; fi;;
+          # --noflush: a declared chain that exists is kept as it is (only an explicit -F empties it).
+          grep -qxF "$c" "$S/iptables.chains" || echo "$c" >> "$S/iptables.chains";;
+      -F*) set -- $line; c=$2; grep -v "^$c|" "$S/iptables.rules" > "$S/t"; mv "$S/t" "$S/iptables.rules";;
       -A*) set -- $line; shift; c=$1; shift; echo "$c|$*" >> "$S/iptables.rules";;
     esac
   done
@@ -2618,7 +2702,8 @@ exit 2
         assert_eq!(t.chain("iptables", "DOCKER-USER"), ["-i lb-+ -j LOOM-ALL"]);
         assert_eq!(t.chain("iptables", "INPUT"), ["-i lb-+ -j LOOM-ALL"]);
         let own = t.chain("iptables", &m1.chain);
-        assert!(own.first().unwrap().contains("ESTABLISHED,RELATED") && own.last().unwrap() == "-j DROP", "{own:?}");
+        assert!(!own.iter().any(|l| l.contains("ESTABLISHED") || l.contains("conntrack")), "{own:?}");
+        assert!(own.first().unwrap().contains("-d 203.0.113.7/32") && own.last().unwrap() == "-j DROP", "{own:?}");
         assert!(own.iter().any(|l| l.contains("-d 203.0.113.7/32 -p tcp -j ACCEPT")), "{own:?}");
         for c in ["INPUT", "FORWARD"] {
             assert_eq!(t.chain("ip6tables", c), [format!("-i {} -j DROP", m1.iface)], "{c}");
@@ -2661,6 +2746,34 @@ exit 2
         }
     }
 
+    #[test]
+    fn m1_a_revoked_destination_is_gone_from_the_chain_and_its_open_flows_are_cut() {
+        let t = Tables::new();
+        let m = names("m-1");
+        let both: BTreeSet<Allowed> = [
+            Allowed { ip: "203.0.113.7".parse().unwrap(), port: None },
+            Allowed { ip: "203.0.113.9".parse().unwrap(), port: None },
+        ]
+        .into_iter()
+        .collect();
+        let only: BTreeSet<Allowed> =
+            [Allowed { ip: "203.0.113.7".parse().unwrap(), port: None }].into_iter().collect();
+        // The text itself: an explicit flush after the declaration, and no rule for established traffic.
+        let text = rules_text(&m, &both);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[..3], ["*filter".to_string(), format!(":{} - [0:0]", m.chain), format!("-F {}", m.chain)]);
+        assert!(!text.contains("ESTABLISHED") && !text.contains("conntrack"), "{text}");
+        // Applied twice with a grant revoked in between (the stub does not flush a declared chain by itself):
+        // the revoked address no longer has a rule, so nothing of its open flows is accepted.
+        assert!(t.run(RULES_APPLY, &m, &text));
+        assert!(t.chain("iptables", &m.chain).iter().any(|l| l.contains("203.0.113.9/32")));
+        assert!(t.run(RULES_APPLY, &m, &rules_text(&m, &only)));
+        let own = t.chain("iptables", &m.chain);
+        assert!(!own.iter().any(|l| l.contains("203.0.113.9")), "{own:?}");
+        assert!(own.iter().any(|l| l.contains("203.0.113.7/32")) && own.last().unwrap() == "-j DROP", "{own:?}");
+        assert!(!own.iter().any(|l| l.contains("ESTABLISHED")), "{own:?}");
+    }
+
     #[tokio::test]
     async fn r4_a_running_box_has_its_rules_checked_again_and_put_back_or_the_command_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -2685,12 +2798,90 @@ exit 2
         assert_eq!(kinds_since(&f, mark), ["inspect", "check", "apply"]);
         assert!(chain_file.exists() && f.running("loom-m-1"));
         assert!(std::fs::read_to_string(f.dir.join("rules.in")).unwrap().contains("-d 203.0.113.7/32"));
-        // Missing and not to be put back: the command is refused and the box is not left running.
+        // Missing and not to be put back (L2): the command is refused, the box is paused, not removed, and
+        // `/work` stays; both tries (check, install) are made twice.
+        host.set_retry_delay(Duration::ZERO);
         std::fs::remove_file(&chain_file).unwrap();
         std::fs::write(f.dir.join("rules.fail"), "").unwrap();
+        let mark = f.calls().len();
         let err = b.ready().await.unwrap_err();
-        assert!(err.contains("not all in place") && err.contains("command was not run"), "{err}");
-        assert!(!f.running("loom-m-1"), "fail closed: no container without its rules");
+        assert!(
+            err.contains("not all in place") && err.contains("command was not run") && err.contains("paused"),
+            "{err}"
+        );
+        assert_eq!(kinds_since(&f, mark), ["inspect", "check", "apply", "check", "apply", "pause"]);
+        assert!(f.running("loom-m-1") && f.paused("loom-m-1"), "paused, not removed");
+        // Still failing: still refused (even inside the recheck interval), still paused.
+        host.set_recheck(Duration::from_secs(3600));
+        assert!(b.ready().await.is_err() && f.paused("loom-m-1"));
+        // The helper works again: the rules are put back and the box runs again (L2).
+        std::fs::remove_file(f.dir.join("rules.fail")).unwrap();
+        let mark = f.calls().len();
+        b.ready().await.unwrap();
+        assert_eq!(kinds_since(&f, mark), ["inspect", "check", "apply", "unpause"]);
+        assert!(f.running("loom-m-1") && !f.paused("loom-m-1") && chain_file.exists());
+        // A check that passes also unpauses.
+        host.set_recheck(Duration::ZERO);
+        std::fs::write(f.dir.join("rules.fail.count"), "4").unwrap();
+        std::fs::remove_file(&chain_file).unwrap();
+        assert!(b.ready().await.is_err() && f.paused("loom-m-1"));
+        std::fs::write(&chain_file, "").unwrap();
+        let mark = f.calls().len();
+        b.ready().await.unwrap();
+        assert_eq!(kinds_since(&f, mark), ["inspect", "check", "unpause"]);
+        assert!(!f.paused("loom-m-1"));
+    }
+
+    #[tokio::test]
+    async fn l2_a_helper_that_fails_once_does_not_cost_the_box_and_a_paused_box_can_be_torn_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let host = f.host();
+        host.set_recheck(Duration::ZERO);
+        host.set_retry_delay(Duration::ZERO);
+        let b = MissionBox::new(host.clone(), "m-1", source(&["203.0.113.7"]));
+        b.ready().await.unwrap();
+        // The chain is gone and the helper fails twice (the check and the install of the first try): the
+        // second try puts the rules back, and nothing is paused or removed.
+        std::fs::remove_file(f.dir.join(format!("chain-{}", b.names().chain))).unwrap();
+        std::fs::write(f.dir.join("rules.fail.count"), "2").unwrap();
+        let mark = f.calls().len();
+        b.ready().await.unwrap();
+        assert_eq!(kinds_since(&f, mark), ["inspect", "check", "apply", "check", "apply"]);
+        assert!(f.running("loom-m-1") && !f.paused("loom-m-1"));
+        assert!(!subs(&f).iter().any(|s| s == "pause"));
+        // A paused box goes away with the mission: `docker rm --force` removes a paused container.
+        std::fs::remove_file(f.dir.join(format!("chain-{}", b.names().chain))).unwrap();
+        std::fs::write(f.dir.join("rules.fail"), "").unwrap();
+        assert!(b.ready().await.is_err());
+        assert!(f.paused("loom-m-1"));
+        std::fs::remove_file(f.dir.join("rules.fail")).unwrap();
+        b.teardown().await;
+        assert!(!f.running("loom-m-1") && !f.paused("loom-m-1"));
+        assert_eq!(rm_args(b.names())[..2], ["rm", "--force"]);
+    }
+
+    #[tokio::test]
+    async fn l1_a_handle_of_a_torn_down_box_makes_nothing_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let host = f.host();
+        let b = MissionBox::new(host.clone(), "m-1", source(&[]));
+        b.ready().await.unwrap();
+        b.teardown().await;
+        assert!(!f.running("loom-m-1"));
+        let runs = f.sub("run").len();
+        let e = env_with(ToolsCfg::default(), SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() });
+        assert_eq!(b.ready().await.unwrap_err(), BOX_CLOSED);
+        assert_eq!(b.reset().await.unwrap_err(), BOX_CLOSED);
+        assert_eq!(b.push(e.ctx.sandbox.clone(), e.ctx.workspace.clone()).await.unwrap_err(), BOX_CLOSED);
+        assert_eq!(b.get_tar("/work", 1024).await.unwrap_err(), BOX_CLOSED);
+        assert_eq!(f.sub("run").len(), runs, "no docker run: nothing was made");
+        assert!(!f.running("loom-m-1"));
+        // A new handle (the mission was resumed) is a new box.
+        let again = MissionBox::new(host, "m-1", source(&[]));
+        again.ready().await.unwrap();
+        assert!(f.running("loom-m-1"));
     }
 
     #[tokio::test]
