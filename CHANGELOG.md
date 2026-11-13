@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Role runtime controls
+
+- Packs can route fresh children through named model profiles, rotate sibling profiles, escalate
+  subsequent assignments after failure, require a distinct named verifier profile, and cap admitted
+  execution attempts. Cross-profile forks are refused; existing pack defaults are unchanged.
+- Session log schema 2 adds non-rendered active-budget and Exec-admission records. Schema 1 logs remain
+  readable; older binaries refuse new session headers. Time excludes recorded queues, retries and idle
+  turns. Wrap-up admission now blocks probes/new work on both normal and speculative paths while
+  retaining output inspection, cleanup and honest blocker delivery.
+- Reasoning-only replies receive a specific bounded nudge. Similar-outcome HUD warnings and optional
+  flag-pattern alerts are advisory and do not verify success. See `docs/RUNTIME-CONTROLS.md`.
+
 These changes follow a review of the first version of loom. They are grouped by area. Read "Before you
 upgrade" first; the rest says what behaves differently.
 

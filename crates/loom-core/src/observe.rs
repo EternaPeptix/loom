@@ -21,6 +21,12 @@
 //! `tool_call.args`) and the same output blob id, completed at least `min_count` times. Only calls of
 //! class `Nav`, `Read` and `Exec` count.
 //!
+//! `outcome_repetitions` is an additional advisory signal over admitted output bodies, grouped by
+//! tool, status, exit code and signal after normalizing timestamps and long hexadecimal addresses.
+//! It ignores argument differences and output handles, scans at most 4096 characters per result,
+//! and never changes a verdict or tool admission. HTTP status codes and ordinary numbers remain.
+//! Similarity does not prove the same target or failure; raw records are preserved.
+//!
 //! ## Staleness
 //! Using `meta[META_PATH]` on results of class `Read` (a file was read) and `Write` (a file was
 //! changed, status `Ok`):
@@ -311,6 +317,66 @@ fn canonical(v: &Value) -> Value {
         Value::Array(a) => Value::Array(a.iter().map(canonical).collect()),
         other => other.clone(),
     }
+}
+
+/// Similar admitted outcomes across different arguments. A warning, not an equivalence proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutcomeRepetition {
+    pub tool: String,
+    pub count: u32,
+    pub last_seq: Seq,
+}
+
+pub fn outcome_fingerprint(result: &ToolResult) -> String {
+    static NORMALIZERS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    let normalizers = NORMALIZERS.get_or_init(|| {
+        [r"\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(?:\.\d+)?Z?", r"\b0x[0-9a-fA-F]{6,}\b"]
+            .iter()
+            .filter_map(|pattern| regex::Regex::new(pattern).ok())
+            .collect()
+    });
+    let limited: String = result.text.chars().take(4096).collect();
+    let header = format!("[{} · ", result.name);
+    let mut normalized = limited
+        .lines()
+        .enumerate()
+        .filter(|(i, line)| !((*i == 0 && line.starts_with(&header)) || line.starts_with("[end of ")))
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for re in normalizers {
+        normalized = re.replace_all(&normalized, "<volatile>").into_owned();
+    }
+    format!(
+        "{:?}|{}|{}|{}",
+        result.status,
+        result.meta.get(crate::event::META_EXIT_CODE).unwrap_or(&Value::Null),
+        result.meta.get(crate::event::META_SIGNAL).unwrap_or(&Value::Null),
+        normalized
+    )
+}
+
+pub fn outcome_repetitions(records: &[Record], min_count: u32) -> Vec<OutcomeRepetition> {
+    let mut groups: BTreeMap<(String, String), (u32, Seq)> = BTreeMap::new();
+    // Limit work per HUD render; this signal concerns recent loops, not a lifetime similarity index.
+    for r in records.iter().rev().filter(|r| matches!(&r.event, Event::ToolResult(_))).take(64) {
+        let Event::ToolResult(t) = &r.event else { continue };
+        if !matches!(t.class, ToolClass::Exec | ToolClass::Read | ToolClass::Nav)
+            || matches!(t.status, ToolStatus::Denied | ToolStatus::Invalid)
+            || t.text.trim().is_empty()
+        {
+            continue;
+        }
+        let e = groups.entry((t.name.clone(), outcome_fingerprint(t))).or_insert((0, r.seq));
+        e.0 = e.0.saturating_add(1);
+    }
+    let mut out: Vec<_> = groups
+        .into_iter()
+        .filter(|(_, (count, _))| *count >= min_count)
+        .map(|((tool, _), (count, last_seq))| OutcomeRepetition { tool, count, last_seq })
+        .collect();
+    out.sort_by(|a, b| b.count.cmp(&a.count).then(b.last_seq.cmp(&a.last_seq)));
+    out
 }
 
 /// Same tool, same arguments, same output blob, completed at least `min_count` times; most repeated first.
@@ -1186,5 +1252,33 @@ mod tests {
         assert_eq!(nearest_line(hay, "   "), None);
         let n = nearest_line(hay, "2: fn parse_config(path: &str) {}").unwrap_or_default();
         assert_eq!(n.0, 2);
+    }
+    #[test]
+    fn outcome_fingerprints_ignore_volatile_text_but_preserve_status_and_signals() {
+        let make = |text: &str| {
+            let Event::ToolResult(mut t) =
+                result(1, "c", ToolClass::Exec, ToolStatus::Error, None, false, json!({"exit_code":1})).event
+            else {
+                panic!()
+            };
+            t.name = "bash".into();
+            t.text = text.into();
+            t
+        };
+        let first =
+            make("[bash · exit 1 · out:aaa]\n2026-11-12T12:00:00Z HTTP/1.1 403 at 0xabcdef12\n[end of bash output]");
+        let next =
+            make("[bash · exit 1 · out:bbb]\n2026-11-13T13:00:00Z HTTP/1.1 403 at 0xabcdef99\n[end of bash output]");
+        assert_eq!(outcome_fingerprint(&first), outcome_fingerprint(&next));
+        assert_ne!(
+            outcome_fingerprint(&first),
+            outcome_fingerprint(&make("2026-11-12T12:00:00Z HTTP/1.1 404 at 0xabcdef12"))
+        );
+        let mut signal = next.clone();
+        signal.meta.insert(crate::event::META_SIGNAL.into(), json!(11));
+        assert_ne!(outcome_fingerprint(&first), outcome_fingerprint(&signal));
+        let records = vec![rec(1, Event::ToolResult(first)), rec(2, Event::ToolResult(next))];
+        assert_eq!(outcome_repetitions(&records, 2).len(), 1);
+        assert!(repetitions(&records, 2).is_empty());
     }
 }

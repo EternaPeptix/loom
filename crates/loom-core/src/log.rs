@@ -1432,7 +1432,7 @@ mod tests {
         let (path2, mut log2) = new_log(&dir2);
         log2.append(Author::Harness, start_event(SCHEMA)).unwrap();
         drop(log2);
-        assert!(std::fs::read_to_string(&path2).unwrap().contains("\"schema\":1"));
+        assert!(std::fs::read_to_string(&path2).unwrap().contains(&format!("\"schema\":{SCHEMA}")));
         assert!(SessionLog::open(&path2, Durability::Batch).is_ok());
     }
 

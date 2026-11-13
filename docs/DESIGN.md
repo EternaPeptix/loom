@@ -32,7 +32,7 @@ That inverts the usual cloud trade-offs:
    at any time, so a restart, a crash and an eviction are the same operation.
 2. **Window fullness is never an input to a model decision.** The model is told once, in the pack
    preamble, that context is managed and is never a reason to stop, defer or summarise. No gauge is
-   shown. Budgets that do exist (steps, wall time) are the harness's to enforce, not the model's to ration: no running count is shown, only one heads-up when a budget is nearly used, and the harness parks on exhaustion regardless.
+   shown. Budgets that do exist (steps, active time) are the harness's to enforce, not the model's to ration: no running count is shown, only one heads-up when a budget is nearly used, and the harness parks on exhaustion regardless.
 3. **Tool output is admitted whole.** If it cannot be, the cut is explicit (which lines were omitted,
    sizes, outcome) and the full output stays addressable by a handle the model can page and search.
    Later eviction replaces old output with a stub carrying the same handle. Nothing is ever lost
@@ -651,6 +651,14 @@ none by default). When one is reached the session gets a budget note; two steps 
 `budget_exhausted` with its last reply, and a root opens a blocking `parked` item and its turn ends
 `budget_exhausted`. The next turn the operator starts for that root (message, answer, resume) grants a
 fresh budget of the configured size, counted from that turn, and the model is told so.
+Schema 2 records active-time intervals: limiter queues, retry backoff/outages and idle turns do not
+consume minute budgets. After a crash, an interrupted active interval closes at the latest durable
+pre-interruption timestamp; unknown time after that checkpoint is excluded. Schema 1 logs retain their
+previous wall accounting until their first clock transition. During the two grace steps the unchanged
+tool schemas remain in the prefix, but dispatch admits existing-output inspection, ledger cleanup,
+bounded waiting/stopping and delivery. Probes, writes, new plans/claims and delegation are refused,
+including speculative starts. A finish requiring fresh execution may still refuse; report the blocker
+and partial result rather than claiming verification. See [runtime controls](RUNTIME-CONTROLS.md).
 
 **Stall.** In a session with a ledger whose role has `note`, `claim` or `evidence`, when the last
 `agents.stall_steps` (30) steps recorded nothing in the ledger, changed no file and started or received

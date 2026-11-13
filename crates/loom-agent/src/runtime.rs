@@ -134,6 +134,11 @@
 //!   verifiers (as in `children`): otherwise `{n} agents are already running, which is the most
 //!   allowed at once. Wait for one to finish (`wait`) or stop one (`agent_stop`), then start this
 //!   one.`
+//! - role `model` selects a named profile; fresh children otherwise inherit. `alloy_models` rotates
+//!   fresh siblings, and `escalation_model` is selected for subsequent children of a role after a
+//!   failed/budget-exhausted result. This never mutates a running session or promises provider cache hits.
+//!   A fork selecting a different profile is refused. Distinct verifier profile checks compare names,
+//!   not model families. Discovery and limiter selection follow the chosen profile.
 //! - a request with `harness: true` (the finish gate's verifier) is exempt from both of the last two rules.
 //! - `SpawnMode::Fork`: the parent's status must have a `fork_point`, and every tool of the child
 //!   role must be among the parent role's tools; otherwise `A `{role}` agent cannot be forked from
@@ -990,6 +995,7 @@ impl Known {
 #[derive(Default)]
 struct State {
     known: BTreeMap<SessionId, Known>,
+    route_cursor: HashMap<(SessionId, String), usize>,
     inbox: Vec<InboxEntry>,
     producers: HashMap<(MissionId, BlobId), Producer>,
     scanned: HashSet<MissionId>,
@@ -1124,7 +1130,7 @@ impl Orchestrator for Orch {
     async fn spawn(&self, parent: &SessionId, req: SpawnReq) -> Result<SessionId, String> {
         let inner = self.up()?;
         if !req.harness {
-            return inner.spawn_child(parent, req);
+            return inner.spawn_child(parent, req).await;
         }
         if let Some(verifier) = inner.cut_verifier(parent, &req.role, &req.brief) {
             // The finish waits for it now: one the restart left idle goes on (an ended one has its verdict).
@@ -1132,7 +1138,7 @@ impl Orchestrator for Orch {
             return Ok(verifier);
         }
         // Marked as the gate's in its `meta.json`, written before its first turn: a crash cannot lose that.
-        inner.spawn_child(parent, req)
+        inner.spawn_child(parent, req).await
     }
 
     async fn join(
@@ -2065,7 +2071,71 @@ impl Inner {
 
     // ---- children ---------------------------------------------------------------------------
 
-    fn spawn_child(self: &Arc<Self>, parent: &SessionId, req: SpawnReq) -> Result<SessionId, String> {
+    async fn spawn_child(self: &Arc<Self>, parent: &SessionId, req: SpawnReq) -> Result<SessionId, String> {
+        self.check_open()?;
+        // Reserve rotation before discovery: parallel fanout siblings get different slots. Restarts
+        // derive the initial cursor from persisted child metadata rather than a process-global counter.
+        let (profile_name, inherited_model, inherited_window) = {
+            let mut st = self.st();
+            let p = st
+                .known
+                .get(parent)
+                .filter(|k| k.active.is_some() && k.meta.parent.is_none())
+                .ok_or_else(|| "Only the lead session of a mission can start agents.".to_string())?;
+            let prole = self.packs.role(Some(&p.meta.pack), Some(&p.meta.role))?;
+            let role = self
+                .packs
+                .role(Some(&p.meta.pack), Some(&req.role))
+                .ok()
+                .filter(|_| req.harness || prole.may_spawn.contains(&req.role))
+                .ok_or_else(|| {
+                    format!(
+                        "`{}` is not a role this session can start. Roles it can start: {}.",
+                        req.role,
+                        prole.may_spawn.join(", ")
+                    )
+                })?;
+            let inherited = (p.meta.profile.clone(), p.meta.model.clone(), p.meta.context_window);
+            let prior: Vec<_> = st
+                .known
+                .values()
+                .filter(|k| k.meta.parent.as_ref() == Some(parent) && k.meta.role == req.role)
+                .collect();
+            let failed = prior.iter().any(|k| {
+                matches!(
+                    k.settlement.as_ref().map(|s| s.outcome),
+                    Some(ChildOutcome::Failed | ChildOutcome::BudgetExhausted)
+                )
+            });
+            let prior_count = prior.len();
+            let cursor = st.route_cursor.entry((parent.clone(), req.role.clone())).or_insert(prior_count);
+            let selected = if failed && role.escalation_model.is_some() {
+                role.escalation_model.clone()
+            } else if !role.alloy_models.is_empty() {
+                role.alloy_models.get(*cursor % role.alloy_models.len()).cloned()
+            } else {
+                role.model.clone()
+            };
+            *cursor = cursor.saturating_add(1);
+            let profile = selected.unwrap_or_else(|| inherited.0.clone());
+            if req.mode == SpawnMode::Fork && profile != inherited.0 {
+                return Err(texts::cross_profile_fork(&inherited.0, &profile));
+            }
+            if prole.verifier.as_deref() == Some(req.role.as_str())
+                && prole.require_distinct_verifier_profile
+                && profile == inherited.0
+            {
+                return Err(texts::same_verifier_profile(&profile));
+            }
+            (profile, inherited.1, inherited.2)
+        };
+        let parent_profile = self.st().known.get(parent).map(|p| p.meta.profile.clone());
+        let (model, window) = if parent_profile.as_deref() == Some(profile_name.as_str()) {
+            (inherited_model, inherited_window)
+        } else {
+            let (model, window, _) = self.facts(&profile_name).await?;
+            (model, window)
+        };
         self.check_open()?;
         let child_id = SessionId::generate();
         let (meta, crole, fork_point, parent_shared, explicit) = {
@@ -2119,9 +2189,9 @@ impl Inner {
                 workspace: p.meta.workspace.clone(),
                 pack: p.meta.pack.clone(),
                 role: crole.name.clone(),
-                profile: p.meta.profile.clone(),
-                model: p.meta.model.clone(),
-                context_window: p.meta.context_window,
+                profile: profile_name.clone(),
+                model: model.clone(),
+                context_window: window,
                 title: req.title.clone(),
                 created_ms: now_ms(),
                 mode: Some(req.mode),
@@ -2537,6 +2607,9 @@ impl Inner {
             let mut st = self.st();
             let mut found = None;
             let mut stale = Vec::new();
+            let parent_meta = st.known.get(parent).map(|k| k.meta.clone());
+            let prole = parent_meta.as_ref().and_then(|m| self.packs.role(Some(&m.pack), Some(&m.role)).ok());
+            let target = parent_meta.as_ref().and_then(|m| self.packs.role(Some(&m.pack), Some(role)).ok());
             for (id, k) in st.known.iter_mut().filter(|(_, k)| k.meta.parent.as_ref() == Some(parent) && !k.joined) {
                 let Some(given) = &k.gate else { continue };
                 // One that was stopped, failed, or ended without a verdict gives nothing to take.
@@ -2544,7 +2617,10 @@ impl Inner {
                     .settlement
                     .as_ref()
                     .is_some_and(|s| s.payload.get("accepted").is_some_and(serde_json::Value::is_boolean));
-                let usable = verdict || (!k.finished() && k.active.is_some());
+                let profile_ok = target.and_then(|r| r.model.as_ref()).is_none_or(|p| p == &k.meta.profile)
+                    && !(prole.is_some_and(|r| r.require_distinct_verifier_profile)
+                        && parent_meta.as_ref().is_some_and(|p| p.profile == k.meta.profile));
+                let usable = profile_ok && (verdict || (!k.finished() && k.active.is_some()));
                 if found.is_none() && usable && given == brief && k.meta.role == role {
                     found = Some(id.clone());
                     continue;
@@ -2883,6 +2959,7 @@ impl Runtime {
             .map_err(|e| format!("cannot create {} as a private directory: {e}", paths.home.display()))?;
         let packs = Packs::load(&paths.packs_dir())?;
         packs.check_tools(&rtools::known_tools())?;
+        packs.check_profiles(&config.models)?;
         let key = journal::load_or_create_key(&paths.journal_key())
             .map_err(|e| format!("cannot read or create the journal key {}: {e}", paths.journal_key().display()))?;
         let blobs = BlobStore::open(paths.blobs_dir()).map_err(|e| format!("cannot open the blob store: {e}"))?;
@@ -3095,7 +3172,12 @@ impl Runtime {
         }
         let role = inner.packs.role(new.pack.as_deref(), new.role.as_deref())?.clone();
         inner.check_network(&role.pack)?;
-        let profile_name = inner.config.profile(new.model.as_deref()).map_err(|e| e.to_string())?.0.to_string();
+        let profile_name = inner
+            .config
+            .profile(new.model.as_deref().or(role.model.as_deref()))
+            .map_err(|e| e.to_string())?
+            .0
+            .to_string();
         let (model, window, from_config) = inner.facts(&profile_name).await?;
         let title = match new.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
             Some(t) => t.to_string(),
@@ -7617,5 +7699,122 @@ mod tests {
         // task was given that long, although it is more than `SHUTDOWN_TASK_WAIT`.
         assert!(took >= Duration::from_secs(grace), "shutdown took {took:?}");
         assert_cut_by_the_session(&records);
+    }
+    #[tokio::test]
+    async fn fresh_children_route_profiles_and_cross_profile_forks_fail_closed() {
+        let other = MockServer::start(Script::new(|_, _| finish("other child"))).await.unwrap();
+        let other_url = other.base_url();
+        let e = env_with_packs(
+            Script::new(|_, _| finish("primary child")),
+            |c| {
+                let mut p = c.models["mock"].clone();
+                p.base_url = other_url;
+                c.models.insert("other".into(), p);
+            },
+            |packs| {
+                let path = packs.join("core/pack.toml");
+                let text = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("[roles.worker]", "[roles.worker]\nalloy_models = [\"mock\", \"other\"]");
+                std::fs::write(path, text).unwrap();
+            },
+        )
+        .await;
+        let parent = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let req = SpawnReq {
+            role: "worker".into(),
+            mode: SpawnMode::Fresh,
+            brief: Brief::default(),
+            budget: Budget::default(),
+            call_id: CallId::from("route"),
+            title: "route".into(),
+            awaited: true,
+            harness: false,
+        };
+        let first = e.rt.inner.orch.spawn(&parent, req.clone()).await.unwrap();
+        let second = e.rt.inner.orch.spawn(&parent, req.clone()).await.unwrap();
+        assert_eq!(e.rt.session(&first).unwrap().meta.profile, "mock");
+        assert_eq!(e.rt.session(&second).unwrap().meta.profile, "other");
+        until("other model request", || !other.requests().is_empty()).await;
+        // Rotation slot 2 is primary; slot 3 would inherit a different wire prefix.
+        let _ = e.rt.inner.orch.spawn(&parent, req.clone()).await.unwrap();
+        let mut fork = req;
+        fork.mode = SpawnMode::Fork;
+        let error = e.rt.inner.orch.spawn(&parent, fork).await.unwrap_err();
+        assert!(error.contains("mode `fresh`"), "{error}");
+        assert!(other.requests().iter().all(|r| !r.to_string().contains("You are now a separate agent")));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn verifier_profile_requirement_is_named_profile_not_a_family_guess() {
+        let e = env_with_packs(
+            Script::new(|_, _| finish("ready")),
+            |_| {},
+            |packs| {
+                let path = packs.join("core/pack.toml");
+                let text = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("[roles.lead]", "[roles.lead]\nrequire_distinct_verifier_profile = true");
+                std::fs::write(path, text).unwrap();
+            },
+        )
+        .await;
+        let parent = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let req = SpawnReq {
+            role: "verifier".into(),
+            mode: SpawnMode::Fresh,
+            brief: Brief::default(),
+            budget: Budget::default(),
+            call_id: CallId::from("verify"),
+            title: "verify".into(),
+            awaited: true,
+            harness: true,
+        };
+        assert!(e.rt.inner.orch.spawn(&parent, req).await.unwrap_err().contains("distinct named profile"));
+        assert!(e.server.requests().is_empty());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_role_escalates_only_the_next_fresh_assignment() {
+        let other = MockServer::start(Script::new(|_, _| finish("escalated"))).await.unwrap();
+        let other_url = other.base_url();
+        let e = env_with_packs(
+            Script::new(|_, _| Reply::text("no tool").into()),
+            |c| {
+                let mut p = c.models["mock"].clone();
+                p.base_url = other_url;
+                c.models.insert("other".into(), p);
+                c.agents.max_nudges = 1;
+            },
+            |packs| {
+                let path = packs.join("core/pack.toml");
+                let text = std::fs::read_to_string(&path)
+                    .unwrap()
+                    .replace("[roles.worker]", "[roles.worker]\nescalation_model = \"other\"");
+                std::fs::write(path, text).unwrap();
+            },
+        )
+        .await;
+        let parent = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let req = SpawnReq {
+            role: "worker".into(),
+            mode: SpawnMode::Fresh,
+            brief: Brief::default(),
+            budget: Budget::default(),
+            call_id: CallId::from("escalate"),
+            title: "escalate".into(),
+            awaited: true,
+            harness: false,
+        };
+        let first = e.rt.inner.orch.spawn(&parent, req.clone()).await.unwrap();
+        let result = e.rt.inner.orch.join(&parent, &first, &CancellationToken::new()).await.unwrap();
+        assert_eq!(result.outcome, ChildOutcome::Failed);
+        let next = e.rt.inner.orch.spawn(&parent, req).await.unwrap();
+        assert_eq!(e.rt.session(&first).unwrap().meta.profile, "mock");
+        assert_eq!(e.rt.session(&next).unwrap().meta.profile, "other");
+        assert_eq!(e.records(&next).iter().filter(|r| matches!(r.event, Event::Forked(_))).count(), 0);
+        e.rt.shutdown().await;
     }
 }

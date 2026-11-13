@@ -90,7 +90,7 @@ pub fn output_cut(completion_tokens: u64, dropped_call: Option<&str>, ran: usize
         (None, n) => out.push_str(&format!(" Its {n} tool call{} ran.", if n == 1 { "" } else { "s" })),
     }
     out.push_str(
-        " Make the call again in a shorter form: write long content to a file in several `write`/`edit` calls rather than in one, and keep explanations out of the reply.",
+        " Emit one short complete tool call first, with no prose body. Make the call again in a shorter form: write long content to a file in several `write`/`edit` calls rather than in one, and keep explanations out of the reply.",
     );
     out
 }
@@ -656,6 +656,31 @@ pub fn budget_nearly_used(is_child: bool) -> &'static str {
     } else {
         "Heads-up: this session's budget is nearly used. Bring the current step to a clean stop and wrap up; do not rush the work that remains."
     }
+}
+
+/// Profiles are immutable within a copied wire prefix.
+pub fn cross_profile_fork(parent: &str, child: &str) -> String {
+    format!("A fork cannot change model profile from `{parent}` to `{child}`. Start mode `fresh` and include the needed evidence and mission state in the assignment.")
+}
+
+pub fn same_verifier_profile(profile: &str) -> String {
+    format!("This role requires a verifier on a distinct named profile, but both select `{profile}`. Configure the verifier role's `model` to a different profile; no verification was performed.")
+}
+
+/// No reasoning is copied into the nudge or the operator's result.
+pub const REASONING_ONLY: &str = "The server ended with reasoning but no visible answer or complete tool call. Send one short complete tool call without a prose body, or provide a visible answer if your role permits plain replies. If no further work can be established, use your role's delivery or blocker tool.";
+pub fn repeated_reasoning(n: u32) -> String {
+    format!("The model produced reasoning without a visible answer or complete tool call {n} times in a row.")
+}
+pub fn wrapup_refused(name: &str) -> String {
+    format!("Budget wrap-up active: `{}` was not run. Inspect existing outputs with out_read/out_grep, attach evidence, close existing plan steps as done/dropped, and deliver with your role's ending tool. If open requirements need new work, use report_blocker and state the partial result honestly; no further probing, edits or delegation are admitted. job_wait requires timeout_s at most 2.", shown_name(name))
+}
+pub fn exec_cap(cap: u32) -> String {
+    format!("This role has used its limit of {cap} admitted execution calls. Delegate remaining work to an allowed child role, or report what is still unestablished. This limit counts execution attempts, not subprocesses or commands.")
+}
+
+pub fn flag_candidate(handle: &str) -> String {
+    format!("Candidate flag pattern appeared in the admitted view of {handle}. This is an unverified candidate: inspect its stored output and validate against the challenge oracle or independent verifier. A regex match alone never establishes success.")
 }
 
 #[cfg(test)]

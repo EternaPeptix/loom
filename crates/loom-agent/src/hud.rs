@@ -1,6 +1,8 @@
 //! The harness-state block: what the model is told, fresh at every step, about where things stand.
 //!
 //! CONTRACT.
+//! Normalized outcome repetition warnings supplement exact repeats; they never declare two targets
+//! equivalent, block tools, or establish task success.
 //!
 //! The block is the last message of each request and is not part of the stored prefix, so it can
 //! change freely. It carries what a model otherwise loses track of over a long session: the mission
@@ -168,6 +170,17 @@ pub fn render(input: &HudInput<'_>) -> String {
         .map(|r| format!("- {} {} — {} times, same result", r.tool, r.args, r.count))
         .collect();
     push_list(&mut sections, "Repeated calls", " — the result will not change; do something different", repeated);
+
+    let similar = observe::outcome_repetitions(input.records, 3)
+        .iter()
+        .map(|r| {
+            format!(
+                "- {} — {} similar admitted outcomes; compare targets and raw outputs before repeating",
+                r.tool, r.count
+            )
+        })
+        .collect();
+    push_list(&mut sections, "Possible repeated outcomes (advisory)", "", similar);
 
     push_list(&mut sections, "Out of date", "", stale_lines(input.records));
 

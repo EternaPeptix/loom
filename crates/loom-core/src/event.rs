@@ -1,3 +1,4 @@
+//! Schema 2 adds non-rendered active-budget interval and Exec-admission records; schema 1 logs remain readable.
 //! The normative event schema. A session log is a sequence of [`Record`]s, one JSON object per line.
 //!
 //! Field and variant names here are the wire format: the daemon serves records exactly as stored and
@@ -73,6 +74,15 @@ pub enum Event {
     },
     TurnStart {
         trigger: Trigger,
+    },
+    /// Active-budget interval transition. Paused during limiter queues, retries and idle turns.
+    /// Not rendered; old logs without these records retain their original wall-clock accounting.
+    BudgetClock {
+        running: bool,
+    },
+    /// Durable admission of an Exec attempt, before dispatch. Not rendered or inherited as own work.
+    ExecStarted {
+        call_id: CallId,
     },
     /// Bookkeeping for one model request. Not rendered.
     ModelRequest(ModelRequest),
@@ -167,7 +177,7 @@ pub struct SessionStart {
 }
 
 /// The log schema version this build writes and supports.
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 fn schema_v1() -> u32 {
     1

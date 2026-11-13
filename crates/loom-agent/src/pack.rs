@@ -9,6 +9,8 @@
 //! description = "…"             # optional
 //! default_role = "lead"         # required; must name a role
 //! preamble = "harness.md"       # optional file; when absent the built-in preamble is used
+//! command_guard = "off"         # "off" | "offensive" command preflight policy
+//! target_concurrency = 2        # positive per-target tool concurrency
 //! requires_restricted_network = false  # optional; true = refuse to start sessions while the network mode is open
 //!
 //! [roles.lead]
@@ -18,8 +20,15 @@
 //! tools = ["bash", "read"]      # required, non-empty, no duplicates; order is the request order
 //! may_spawn = ["worker"]        # optional; each must name a role of this pack
 //! verify_finish = true          # optional, default false
+//! require_oracle = false        # optional, default false; operator-pinned mechanical finish gate
 //! verifier = "verifier"         # optional; the role that attacks this role's finish (see below)
 //! read_only = false             # optional, default false
+//! model = "fast"                 # optional named config profile; absent = inherit
+//! escalation_model = "strong"    # optional profile used after a failed/budget-exhausted child
+//! alloy_models = ["a", "b"]      # optional fresh-child profile rotation
+//! max_exec_calls = 6             # optional admitted Exec starts per assignment/session, 0 denies all
+//! require_distinct_verifier_profile = false # require a different named profile, not a family claim
+//! flag_regex = "FLAG\\{[^}]+\\}" # optional candidate alert; never verifies success
 //! ```
 //! `verifier` defaults to the pack's role named `verifier` when it has one. A role with
 //! `verify_finish = true` (or an explicit `verifier`) whose verifier is not a role of the same pack that is
@@ -77,11 +86,20 @@ pub struct RoleDef {
     pub may_spawn: Vec<String>,
     /// An accepted `finish` by this role is first attacked by an independent verifier.
     pub verify_finish: bool,
+    pub require_oracle: bool,
     /// The role of this pack that attacks this role's finish and answers its `verify` tool; resolved at
     /// load (`verifier` key, else the pack's role named `verifier`). Always `Some` when `verify_finish`.
     pub verifier: Option<String>,
     /// The sandbox denies this role every write outside its session temp directory.
     pub read_only: bool,
+    /// Named model profiles. No in-session model switching is performed.
+    pub model: Option<String>,
+    pub escalation_model: Option<String>,
+    pub alloy_models: Vec<String>,
+    pub max_exec_calls: Option<u32>,
+    pub require_distinct_verifier_profile: bool,
+    /// Candidate discovery only; a match is not a verdict.
+    pub flag_regex: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,6 +112,8 @@ pub struct Pack {
     /// The pack's text says the network is restricted: sessions of it are refused while the
     /// daemon's network mode is `open`.
     pub requires_restricted_network: bool,
+    pub command_guard: bool,
+    pub target_concurrency: u32,
     pub roles: BTreeMap<String, RoleDef>,
 }
 
@@ -131,6 +151,8 @@ struct RawPack {
     preamble: Option<String>,
     #[serde(default)]
     requires_restricted_network: bool,
+    command_guard: Option<String>,
+    target_concurrency: Option<u32>,
     #[serde(default)]
     roles: BTreeMap<String, RawRole>,
 }
@@ -146,9 +168,19 @@ struct RawRole {
     may_spawn: Vec<String>,
     #[serde(default)]
     verify_finish: bool,
+    #[serde(default)]
+    require_oracle: bool,
     verifier: Option<String>,
     #[serde(default)]
     read_only: bool,
+    model: Option<String>,
+    escalation_model: Option<String>,
+    #[serde(default)]
+    alloy_models: Vec<String>,
+    max_exec_calls: Option<u32>,
+    #[serde(default)]
+    require_distinct_verifier_profile: bool,
+    flag_regex: Option<String>,
 }
 
 fn valid_name(s: &str) -> bool {
@@ -310,6 +342,17 @@ fn parse_pack(
                 return Err(format!("{at}: `may_spawn` lists \"{m}\" more than once"));
             }
         }
+        for profile in r.model.iter().chain(r.escalation_model.iter()).chain(r.alloy_models.iter()) {
+            if profile.trim().is_empty() {
+                return Err(format!("{at}: model profiles must be non-empty names from [models] in the config"));
+            }
+        }
+        if let Some(pattern) = &r.flag_regex {
+            regex::RegexBuilder::new(pattern)
+                .size_limit(1_000_000)
+                .build()
+                .map_err(|e| format!("{at}: `flag_regex` is invalid: {e}"))?;
+        }
         let verifier = resolve_verifier(&at, rname == "verifier", r, &raw.roles, &role_list)?;
         roles.insert(
             rname.clone(),
@@ -322,10 +365,26 @@ fn parse_pack(
                 tools,
                 may_spawn: r.may_spawn.clone(),
                 verify_finish: r.verify_finish,
+                require_oracle: r.require_oracle,
                 verifier,
                 read_only: r.read_only,
+                model: r.model.clone(),
+                escalation_model: r.escalation_model.clone(),
+                alloy_models: r.alloy_models.clone(),
+                max_exec_calls: r.max_exec_calls,
+                require_distinct_verifier_profile: r.require_distinct_verifier_profile,
+                flag_regex: r.flag_regex.clone(),
             },
         );
+    }
+    let command_guard = match raw.command_guard.as_deref().unwrap_or("off") {
+        "off" => false,
+        "offensive" => true,
+        other => return Err(format!("pack {label}: `command_guard` = \"{other}\" is invalid; use off or offensive")),
+    };
+    let target_concurrency = raw.target_concurrency.unwrap_or(2);
+    if target_concurrency == 0 {
+        return Err(format!("pack {label}: `target_concurrency` must be at least 1"));
     }
     Ok(Pack {
         name,
@@ -333,6 +392,8 @@ fn parse_pack(
         default_role,
         preamble,
         requires_restricted_network: raw.requires_restricted_network,
+        command_guard,
+        target_concurrency,
         roles,
     })
 }
@@ -411,6 +472,20 @@ impl Packs {
                 p.roles.keys().cloned().collect::<Vec<_>>().join(", ")
             )
         })
+    }
+
+    /// Resolve every configured role profile at daemon start; pack keys never name model ids.
+    pub fn check_profiles(&self, models: &BTreeMap<String, loom_core::config::ModelProfile>) -> Result<(), String> {
+        for pack in self.packs.values() {
+            for role in pack.roles.values() {
+                for name in role.model.iter().chain(role.escalation_model.iter()).chain(role.alloy_models.iter()) {
+                    if !models.contains_key(name) {
+                        return Err(format!("pack {} role {}: model profile \"{}\" is not configured; add [models.{}] or change the role", pack.name, role.name, name, name));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn check_tools(&self, known: &[String]) -> Result<(), String> {
@@ -756,5 +831,29 @@ mod tests {
             )
         );
         assert_eq!(s, system_prompt(r, pre, &env()));
+    }
+    #[test]
+    fn runtime_role_controls_load_validate_and_default_without_changing_old_packs() {
+        let text = GOOD.replace("[roles.a]", "[roles.a]\nmodel = \"fast\"\nescalation_model = \"strong\"\nalloy_models = [\"fast\", \"other\"]\nmax_exec_calls = 0\nrequire_distinct_verifier_profile = true\nflag_regex = 'FLAG\\{[^}]+\\}'");
+        let d = mk(&format!("command_guard = \"offensive\"\ntarget_concurrency = 3\n{text}"));
+        let packs = Packs::load(d.path()).unwrap();
+        let role = packs.role(Some("mine"), Some("a")).unwrap();
+        assert_eq!(role.model.as_deref(), Some("fast"));
+        assert_eq!(role.max_exec_calls, Some(0));
+        assert_eq!(role.alloy_models, ["fast", "other"]);
+        assert!(role.require_distinct_verifier_profile);
+        assert!(packs.get("mine").unwrap().command_guard);
+        assert_eq!(packs.get("mine").unwrap().target_concurrency, 3);
+        let mut models = BTreeMap::new();
+        assert!(packs.check_profiles(&models).unwrap_err().contains("fast"));
+        for name in ["fast", "strong", "other"] {
+            models.insert(name.into(), Default::default());
+        }
+        packs.check_profiles(&models).unwrap();
+        for extra in ["command_guard = \"typo\"", "target_concurrency = 0"] {
+            assert!(Packs::load(mk(&format!("{extra}\n{GOOD}")).path()).is_err());
+        }
+        let bad = GOOD.replace("[roles.a]", "[roles.a]\nflag_regex = '['");
+        assert!(Packs::load(mk(&bad).path()).unwrap_err().contains("flag_regex"));
     }
 }
