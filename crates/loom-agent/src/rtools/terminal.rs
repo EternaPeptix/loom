@@ -67,9 +67,10 @@
 //!      objection, reference: "{fid} (verifier {child})" }` per objection; error text with the objections,
 //!      the report and `texts::finish_not_accepted_tail(&finish_tools(&s.role))`; no effect.
 //!      When the rejections since the latest accepted finish (`rejection_floor`: only an accepted finish
-//!      moves it) reach `MAX_FINISH_REJECTIONS`, a `harness_note{Verdict}` `finish has not been accepted
-//!      {n} times …` is also written. It is a record: nothing is asked of the operator and the session
-//!      works on. The verifier is still started for later finishes.
+//!      moves it) reach `MAX_FINISH_REJECTIONS`, a `harness_note{Verdict}`
+//!      `texts::finish_rejected_notice(role.solvable)` is also written. The model sees it, so it carries no
+//!      count and offers `unreachable` only outside a solvable pack. Nothing is asked of the operator and
+//!      the session works on. The verifier is still started for later finishes.
 //!
 //! Stuck detection wraps the two refusals in (1) and (2); a verifier rejection that is reached implies
 //! fresh execution evidence has been recorded since the last objection (otherwise the open-items gate
@@ -817,7 +818,10 @@ impl Finish {
                     // Not a summons: the operator is told, nothing is asked, and the session keeps working.
                     s.emit(
                         Author::Harness,
-                        Event::HarnessNote { note: NoteKind::Verdict, text: texts::finish_rejected_notice(rejected) },
+                        Event::HarnessNote {
+                            note: NoteKind::Verdict,
+                            text: texts::finish_rejected_notice(s.role.solvable),
+                        },
                     );
                 }
                 let mut text = format!("An independent verifier ({child}) examined the result and did not accept it.");
@@ -893,7 +897,7 @@ impl Finish {
         );
         s.emit(
             Author::Harness,
-            Event::HarnessNote { note: NoteKind::Verdict, text: texts::stuck_notice(refused as usize) },
+            Event::HarnessNote { note: NoteKind::Verdict, text: texts::stuck_notice().to_string() },
         );
         Some(texts::stuck_model_line(s.role.solvable).to_string())
     }
@@ -2775,7 +2779,9 @@ mod tests {
         let (items, notes) = drain(&r);
         assert!(items.is_empty(), "{items:?}");
         assert!(
-            notes.iter().any(|(k, t)| *k == NoteKind::Verdict && t.starts_with("finish has not been accepted 2 times")),
+            notes.iter().any(
+                |(k, t)| *k == NoteKind::Verdict && t.starts_with("The verifier has not accepted the finish again")
+            ),
             "{notes:?}"
         );
         assert!(effect(&r).is_none());

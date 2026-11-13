@@ -904,8 +904,15 @@ pub fn finish_not_accepted_tail(tools: &FinishTools) -> String {
 
 /// A non-blocking record that a finish was rejected `n` times since the last accepted one. Nothing is
 /// asked of the operator.
-pub fn finish_rejected_notice(n: usize) -> String {
-    format!("finish has not been accepted {n} times since the last accepted finish. The session keeps working — but if no new execution evidence has appeared, consider whether the routes are genuinely closed (`conclude` with `unreachable`) or whether only the operator can unblock this (`report_blocker`).")
+/// No count: the model is never shown a rising tally of refused finishes. `solvable`: the pack refuses
+/// `conclude unreachable`, so it is not offered.
+pub fn finish_rejected_notice(solvable: bool) -> String {
+    let routes = if solvable {
+        "pick an open route from the mission state and run it"
+    } else {
+        "pick an open route from the mission state and run it, or, if every route is genuinely closed, `conclude` with `unreachable` and its execution evidence"
+    };
+    format!("The verifier has not accepted the finish again. The session keeps working: answer the objection with a new run, {routes}. If only the operator can unblock this, call `report_blocker`.")
 }
 
 /// The non-blocking inbox item opened when a mission has not advanced: several finishes rejected,
@@ -935,8 +942,9 @@ pub fn stuck_model_line(solvable: bool) -> &'static str {
 }
 
 /// A short non-blocking record that the stuck item was opened (kind `Verdict`).
-pub fn stuck_notice(k: usize) -> String {
-    format!("finish has not been accepted {k} times and no new execution evidence has appeared; the operator was notified as a non-blocking item. The session keeps working.")
+/// No count, for the same reason as `finish_rejected_notice`.
+pub fn stuck_notice() -> &'static str {
+    "finish was refused again with no new execution evidence since; the operator was notified as a non-blocking item. The session keeps working."
 }
 
 /// A non-blocking record that verification could not be run: a fault of the harness, not of the agent.
@@ -1454,8 +1462,14 @@ mod tests {
         assert!(stuck_model_line(false).contains("conclude") && stuck_model_line(false).contains("unreachable"));
         assert!(!stuck_model_line(true).contains("unreachable"));
         assert!(!stuck_model_line(false).chars().any(|c| c.is_ascii_digit()));
-        assert!(finish_rejected_notice(2).starts_with("finish has not been accepted 2 times"));
-        assert!(stuck_notice(2).contains("notified as a non-blocking item"));
+        assert!(stuck_notice().contains("notified as a non-blocking item"));
+        // The model never sees a count of refused finishes, and a solvable pack is never offered `unreachable`.
+        for solvable in [true, false] {
+            let t = finish_rejected_notice(solvable);
+            assert!(!t.chars().any(|c| c.is_ascii_digit()), "{t}");
+            assert_eq!(t.contains("unreachable"), !solvable, "{t}");
+        }
+        assert!(!stuck_notice().chars().any(|c| c.is_ascii_digit()));
         assert!(finish_status_line(false, true, false).is_some_and(|l| l.contains("unreachable")));
         assert!(finish_status_line(false, true, true).is_some_and(|l| !l.contains("unreachable")));
         assert!(stall(30).contains("the evidence that would change your conclusion"));
