@@ -12,6 +12,15 @@
   `write` tool's own path with size, entry and type limits. New modules `loom-tools::boxctl`, `boxfs`,
   `loom-agent::rtools::boxtools`; `proc::spawn_launched` and `bash::run_launched` run a loom-built launcher
   outside the sandbox with `bash`'s procedure. The ctf tool cap is 30. See docs/RUN.md and SECURITY.md.
+- Box security review: a mission's box lifecycle (create, reset, re-rule, teardown, reconcile) is serialized
+  by one lock per mission and its chain is removed only after the container and network are gone; every box
+  bridge is dropped by a static `LOOM-ALL` chain unless its own chain accepts; IPv6 is off in the container
+  and dropped on the host; a stopped mission's box stays down until the lead is resumed; a running box's
+  rules are re-checked and reinstalled or the command refused; a network that is not the box's own is never
+  adopted; file push opens by descriptor with `O_NOFOLLOW`; `box_get` refuses `.`/`..` components and tar
+  typeflag 7; `ssh` and the docker client are resolved once, run with a fixed environment and a private
+  directory; the box is refused with `sandbox.mode = "none"` or a `unix_sockets` entry that reaches its
+  socket; the `/etc/hosts` writer runs an absolute program with a fixed `PATH`.
 
 ### Morale: keeping a model on a hard task
 

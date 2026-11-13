@@ -1168,6 +1168,9 @@ struct State {
     scope: HashMap<MissionId, Vec<String>>,
     /// The box of each mission that has used one (see `Inner::box_for`).
     boxes: HashMap<MissionId, Arc<MissionBox>>,
+    /// Missions whose box was removed because the mission was stopped, ended or archived: no box is made for
+    /// one of them until its lead is resumed (see `Inner::box_for`).
+    box_closed: HashSet<MissionId>,
 }
 
 /// One model profile, made at start.
@@ -1985,6 +1988,9 @@ impl Inner {
             return Err("This session is archived; unarchive it first.".to_string());
         }
         let mut st = self.st();
+        if st.box_closed.contains(&meta.mission) {
+            return Err(rtools::boxtools::BOX_CLOSED.to_string());
+        }
         if let Some(b) = st.boxes.get(&meta.mission) {
             return Ok(b.clone());
         }
@@ -1998,6 +2004,19 @@ impl Inner {
         Ok(made)
     }
 
+    /// The mission's lead runs again: its box may be made again.
+    fn box_reopen(&self, mission: &MissionId) {
+        self.st().box_closed.remove(mission);
+    }
+
+    /// Whether the daemon still has a use for the box of mission `m`: its lead has a task, or a box handle
+    /// for it exists (made after the start's listing of leftovers).
+    fn box_in_use(&self, m: &str) -> bool {
+        let st = self.st();
+        st.known.values().any(|k| k.meta.parent.is_none() && k.active.is_some() && k.meta.mission.as_str() == m)
+            || st.boxes.keys().any(|b| b.as_str() == m)
+    }
+
     /// Bring the rules of the mission's box, when it has one, to the mission's grants of now (I5).
     async fn box_resync(&self, mission: &MissionId) {
         let b = self.st().boxes.get(mission).cloned();
@@ -2006,10 +2025,15 @@ impl Inner {
         }
     }
 
-    /// Remove the mission's box (container, network, rules), in the background, best effort (I5).
+    /// Remove the mission's box (container, network, rules), in the background, best effort (I5), and keep it
+    /// down: no box is made for the mission again until its lead is resumed (`box_reopen`).
     fn box_teardown(&self, mission: &MissionId) {
         let Some(host) = self.box_host.clone() else { return };
-        let known = self.st().boxes.remove(mission);
+        let known = {
+            let mut st = self.st();
+            st.box_closed.insert(mission.clone());
+            st.boxes.remove(mission)
+        };
         let mission = mission.clone();
         let task = tokio::spawn(async move {
             match known {
@@ -2026,16 +2050,12 @@ impl Inner {
     /// running lead (I5). In the background; the daemon does not wait for the Docker host.
     fn reconcile_boxes(self: &Arc<Self>) {
         let Some(host) = self.box_host.clone() else { return };
-        let running: HashSet<String> = {
-            let st = self.st();
-            st.known
-                .values()
-                .filter(|k| k.meta.parent.is_none() && k.active.is_some())
-                .map(|k| k.meta.mission.as_str().to_string())
-                .collect()
-        };
+        // Asked for each mission once the mission's lock is held, so that a mission that started after this
+        // listing began is not removed from under itself.
+        let weak = self.me.clone();
         let task = tokio::spawn(async move {
-            let cleaned = loom_tools::boxctl::reconcile(&host, &running).await;
+            let keep = move |mission: &str| weak.upgrade().is_none_or(|inner| inner.box_in_use(mission));
+            let cleaned = loom_tools::boxctl::reconcile(&host, &keep).await;
             if !cleaned.is_empty() {
                 tracing::info!("box: removed what {} mission(s) left on the Docker host", cleaned.len());
             }
@@ -2274,6 +2294,9 @@ impl Inner {
         self.check_network(&meta.pack)?;
         if let Some(parent) = &meta.parent {
             self.activate_locked(parent)?;
+        } else {
+            // A lead that runs again (a message after its end, an unarchive) may have its box again.
+            self.box_reopen(&meta.mission);
         }
         let explicit = self.mission_explicit(&meta)?;
         let (deps, parts) = self.build(&meta, explicit)?;
@@ -3539,6 +3562,7 @@ impl Runtime {
         for warning in start_warnings(&config, cfg!(target_os = "macos")) {
             tracing::warn!("{warning}");
         }
+        config.check_box_paths(&paths.home)?;
         let box_host = if config.boxed.enabled {
             Some(DockerHost::new(&config.boxed, &paths.home).map_err(|e| format!("The box cannot be used: {e}"))?)
         } else {
@@ -4126,6 +4150,8 @@ impl Runtime {
             return Err("This session is archived; unarchive it first.".to_string());
         }
         self.inner.activate(id)?;
+        // Resuming the lead gives the mission its box back (it was removed when the mission was stopped).
+        self.inner.box_reopen(&meta.mission);
         self.inner.send_input(id, Input::Resume);
         self.inner.resume_cut_children(id);
         Ok(())
@@ -8506,10 +8532,19 @@ mod tests {
 
     use loom_tools::boxctl::fake::FakeDocker;
 
+    /// The box needs the OS sandbox (config load refuses it with `mode = "none"`, R10): whichever the platform has.
+    fn with_os_sandbox(c: &mut Config) {
+        c.sandbox.mode = if cfg!(target_os = "macos") { SandboxMode::Seatbelt } else { SandboxMode::Bubblewrap };
+    }
+
     /// A runtime whose box is the fake docker of a directory of its own.
     async fn box_env(fake: &FakeDocker) -> Env {
         let cfg = fake.cfg();
-        env_with(Script::new(|_, _| finish("ok")), false, move |c| c.boxed = cfg).await
+        env_with(Script::new(|_, _| finish("ok")), false, move |c| {
+            c.boxed = cfg;
+            with_os_sandbox(c);
+        })
+        .await
     }
 
     async fn idle_lead(e: &Env) -> (SessionId, MissionId) {
@@ -8588,9 +8623,20 @@ mod tests {
             })
         })
         .await;
-        // After the stop a box is made again on demand, and the archive removes that one.
+        // R3: a stopped mission's box stays down: asking for it again is refused, not re-created.
+        let runs = fake.sub("run").len();
+        let err = e.rt.inner.orch.box_access(&id).await.err().unwrap();
+        assert_eq!(
+            err,
+            "The box of this mission was removed when the mission was stopped. It comes back when the operator resumes the mission."
+        );
+        assert_eq!(fake.sub("run").len(), runs, "nothing was made");
+        assert!(!fake.running(&container));
+        // Resuming the lead gives it back, on demand; the archive removes that one.
+        e.rt.resume(&id).await.unwrap();
         e.rt.inner.orch.box_access(&id).await.unwrap().ready().await.unwrap();
         assert!(fake.running(&container));
+        until("idle again", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
         let mark = fake.calls().len();
         e.rt.archive(&id, true).await.unwrap();
         until("box removed by archive", || !fake.running(&container)).await;
@@ -8600,6 +8646,48 @@ mod tests {
         let first = |name: &str| subs.iter().position(|s| s == name).unwrap_or(usize::MAX);
         assert!(first("rm") < first("network") && first("network") < first("run"), "{subs:?}");
         e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn r3_a_mission_that_ended_or_was_stopped_has_no_box_until_its_lead_runs_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let e = box_env(&fake).await;
+        let (id, mission) = idle_lead(&e).await;
+        let container = box_container(&mission);
+        assert!(e.rt.inner.orch.box_access(&id).await.is_ok(), "an untouched mission can have a box");
+        e.rt.stop(&id).await.unwrap();
+        // `box_access` is what box_exec, box_get and box_reset ask: all three get the refusal.
+        let err = e.rt.inner.orch.box_access(&id).await.err().unwrap();
+        assert!(err.starts_with("The box of this mission was removed when the mission was stopped."), "{err}");
+        assert!(e.rt.inner.st().box_closed.contains(&mission));
+        e.rt.resume(&id).await.unwrap();
+        assert!(!e.rt.inner.st().box_closed.contains(&mission), "resuming the lead clears the mark");
+        let b = e.rt.inner.orch.box_access(&id).await.unwrap();
+        b.ready().await.unwrap();
+        assert!(fake.running(&container));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn r10_start_refuses_an_unix_socket_that_leads_to_the_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let e = box_env(&fake).await;
+        e.rt.shutdown().await;
+        let home = e.dir.path().join("home");
+        for socket in [home.join("keys/box.sock"), home.join("keys/anything"), fake.socket.clone()] {
+            let mut config = e.config.clone();
+            config.sandbox.unix_sockets = vec![socket.display().to_string()];
+            let err = Runtime::start(config, Paths::at(home.clone())).await.err().expect("start must refuse");
+            assert!(err.contains("sandbox.unix_sockets"), "{}: {err}", socket.display());
+        }
+        // Without the box, a socket elsewhere is none of its business.
+        let mut config = e.config.clone();
+        config.boxed.enabled = false;
+        config.sandbox.unix_sockets = vec![fake.socket.display().to_string()];
+        let rt = Runtime::start(config, Paths::at(home.clone())).await.expect("no box, no restriction");
+        rt.shutdown().await;
     }
 
     #[tokio::test]
@@ -8630,7 +8718,11 @@ mod tests {
             c.remote_socket = "/var/run/docker.sock".into();
             c
         };
-        let e = env_with(Script::new(|_, _| finish("ok")), false, move |c| c.boxed = cfg).await;
+        let e = env_with(Script::new(|_, _| finish("ok")), false, move |c| {
+            c.boxed = cfg;
+            with_os_sandbox(c);
+        })
+        .await;
         let (id, _) = idle_lead(&e).await;
         let socket = e.rt.inner.box_host.as_ref().unwrap().socket().to_path_buf();
         assert_eq!(socket, e.rt.paths().keys_dir().join("box.sock"));

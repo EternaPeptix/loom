@@ -487,7 +487,58 @@ impl BoxCfg {
     }
 }
 
+/// `p` with `.` removed and `..` applied, without touching the file system.
+fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The paths `p` may stand for: itself, and (when it or an ancestor exists) with the links resolved.
+fn spellings(p: &Path) -> Vec<PathBuf> {
+    let plain = lexical(p);
+    let mut all = vec![plain.clone()];
+    if let Some(existing) = plain.ancestors().find(|a| a.exists()) {
+        if let (Ok(real), Ok(tail)) = (std::fs::canonicalize(existing), plain.strip_prefix(existing)) {
+            all.push(real.join(tail));
+        }
+    }
+    all
+}
+
 impl Config {
+    /// What can only be checked once the loom home is known: no `sandbox.unix_sockets` entry may be (or be
+    /// below) `<loom home>/keys`, where the box's forwarded Docker socket lives, and none may be the local
+    /// `box.docker_socket`. A command that could connect there would control the Docker host.
+    pub fn check_box_paths(&self, home: &Path) -> Result<(), String> {
+        let keys = spellings(&home.join("keys"));
+        let docker = (self.boxed.enabled && !self.boxed.docker_socket.is_empty())
+            .then(|| spellings(Path::new(&self.boxed.docker_socket)));
+        for entry in &self.sandbox.unix_sockets {
+            let mine = spellings(Path::new(entry));
+            if mine.iter().any(|m| keys.iter().any(|k| m.starts_with(k))) {
+                return Err(format!(
+                    "sandbox.unix_sockets lists {entry}, which is inside {}. That directory holds the box's Docker socket and the daemon's keys, and no command may be allowed to connect there. Remove the entry.",
+                    home.join("keys").display()
+                ));
+            }
+            if docker.as_ref().is_some_and(|d| mine.iter().any(|m| d.contains(m))) {
+                return Err(format!(
+                    "sandbox.unix_sockets lists {entry}, which is the Docker socket of the box (box.docker_socket). A command that could connect to it would control the Docker host. Remove the entry."
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Load a config file. A missing file is the default config.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         let text = match std::fs::read_to_string(path) {
@@ -526,6 +577,11 @@ impl Config {
             return Err(ConfigError::Invalid("context.floor_tokens must be below context.target_tokens".into()));
         }
         self.boxed.check().map_err(ConfigError::Invalid)?;
+        if self.boxed.enabled && self.sandbox.mode == SandboxMode::None {
+            return Err(ConfigError::Invalid(
+                "box.enabled cannot be combined with sandbox.mode = \"none\": without a sandbox the agent's own commands could connect to the Docker socket and the ssh forward that the box uses, and would then control the Docker host. Use the seatbelt or bubblewrap sandbox, or leave the box off.".into(),
+            ));
+        }
         for (name, profile) in &self.models {
             if profile.max_concurrent == 0 {
                 return Err(ConfigError::Invalid(format!("models.{name}.max_concurrent must be at least 1")));
@@ -931,5 +987,39 @@ allow = ["*.example.test"]
         assert!(check("docker_socket = \"relative.sock\"").unwrap_err().contains("absolute"));
         assert!(check("docker_socket = \"/s\"\ncpus = 0").unwrap_err().contains("cpus"));
         assert!(Config::parse("[box]\nenabled = true").unwrap().check().unwrap_err().to_string().contains("box.image"));
+    }
+
+    #[test]
+    fn r10_the_box_is_refused_with_no_sandbox_and_with_its_socket_in_unix_sockets() {
+        // The box with no sandbox: the agent's own commands could reach the socket.
+        let err = box_cfg("[sandbox]\nmode = \"none\"").unwrap_err();
+        assert!(err.contains("sandbox.mode") && err.contains("Docker socket"), "{err}");
+        // Without the box, mode none stays what it was.
+        assert!(Config::parse("[sandbox]\nmode = \"none\"").unwrap().check().is_ok());
+        let home = Path::new("/home/x/.loom");
+        let with = |sockets: &str, extra: &str| {
+            Config::parse(&format!(
+                "[sandbox]\nunix_sockets = [{sockets}]\n[box]\nenabled = true\nimage = \"{DIGEST}\"\nhelper_image = \"{DIGEST}\"\n{extra}"
+            ))
+            .unwrap()
+        };
+        let ssh = "ssh_host = \"h\"\nremote_socket = \"/r\"";
+        for bad in [
+            "\"/home/x/.loom/keys/box.sock\"",
+            "\"/home/x/.loom/keys\"",
+            "\"/home/x/.loom/keys/anything/else\"",
+            "\"/home/x/.loom/./keys/../keys/box.sock\"",
+        ] {
+            let c = with(bad, ssh);
+            assert!(c.check().is_ok(), "the load-time check does not know the home");
+            let err = c.check_box_paths(home).unwrap_err();
+            assert!(err.contains("inside /home/x/.loom/keys"), "{bad}: {err}");
+        }
+        assert!(with("\"/run/other.sock\", \"/home/x/.loom/keysx/s\"", ssh).check_box_paths(home).is_ok());
+        // The local socket of the box is refused as well, and only when the box is enabled.
+        let err =
+            with("\"/var/run/box.sock\"", "docker_socket = \"/var/run/box.sock\"").check_box_paths(home).unwrap_err();
+        assert!(err.contains("box.docker_socket"), "{err}");
+        assert!(with("\"/var/run/box.sock\"", ssh).check_box_paths(home).is_ok());
     }
 }

@@ -98,8 +98,9 @@ enabled = false
 # remote_socket = "/var/run/docker.sock" # the Docker socket inside that machine
 #   or a socket on this machine:
 # docker_socket = "/var/run/docker.sock"
-# docker_cli = "docker"                  # the docker command line client, found on the daemon's PATH
-# Both images must be pinned by digest; a tag is refused. helper_image needs `sh` and `iptables`/`iptables-restore`.
+# docker_cli = "docker"                  # the docker command line client: a full path, or a name that is looked for on the daemon's PATH once, at start
+# Both images must be pinned by digest; a tag is refused. helper_image needs `sh`, `iptables`, `iptables-restore` and `ip6tables`.
+# The box needs a sandbox: `[sandbox] mode = "none"` is refused with it, and `sandbox.unix_sockets` may not name the box's socket or anything under <loom home>/keys.
 # image = "registry.example.test/box@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 # helper_image = "registry.example.test/netadmin@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 cpus = 4
@@ -108,6 +109,8 @@ pids = 512
 work_mb = 4096             # size of the tmpfs on /work
 tmp_mb = 1024              # size of the tmpfs on /tmp
 cap_add = []               # capabilities to add back (all are dropped); loom refuses the dangerous ones (SYS_ADMIN, NET_ADMIN, ...)
+#                            Commands run as uid 1000 with no-new-privileges, so cap_add does NOT give them capabilities: it
+#                            affects only root processes inside the container (and a command cannot become root there).
 sync_max_mb = 64           # most data copied from the workspace into /work by one call
 sync_file_max_mb = 16      # largest single file copied
 get_max_mb = 64            # most data one box_get brings back

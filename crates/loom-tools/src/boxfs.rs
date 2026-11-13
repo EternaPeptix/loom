@@ -7,16 +7,19 @@
 //! records and GNU long names on the reading side).
 //!
 //! ## Push (`build_push`, I6)
-//! Walks the workspace without following a link and returns one tar stream of the files that changed since
-//! the manifest of the last push (size and modification time), with `uid=gid=1000` and the file's
-//! permission bits without setuid, setgid and sticky. A file is sent only when
+//! Walks the workspace by descriptors and returns one tar stream of the files that changed since the
+//! manifest of the last push (size and modification time), with `uid=gid=1000` and the file's permission
+//! bits without setuid, setgid and sticky. Every directory is held open and each name in it is looked up
+//! with `openat` relative to it: a directory is opened with `O_DIRECTORY | O_NOFOLLOW`, a file with
+//! `O_NOFOLLOW | O_NONBLOCK`, so a link (or a FIFO) put in the place of an entry after it was listed is
+//! refused by the open, never followed. A file is sent only when
 //! - it is a regular file reached without a link (a symlink is neither followed nor sent, and neither is
 //!   a device, FIFO or socket);
 //! - it is not inside `<workspace>/.loom` or any directory or file named `.git`, and not inside a
-//!   directory the sandbox refuses to let the agent read;
-//! - it can be opened and the sandbox's read rule (`Sandbox::check_read`: unreadable paths, credential
-//!   stores, oracle secrets) accepts the real path of the file that was opened, which is the file that is
-//!   then read, so a link swapped in after the walk reaches nothing the agent could not read;
+//!   directory the sandbox refuses to let the agent read (judged by the real path of the open directory,
+//!   which is then not entered);
+//! - the sandbox's read rule (`Sandbox::check_read`: unreadable paths, credential stores, oracle secrets)
+//!   accepts the real path of the file that was opened, which is the file that is then read;
 //! - it is at most `file` bytes (a larger one is named in a note, once per push, at most 5 names);
 //! - the total of the push stays within `total` bytes (the files that did not fit go with the next push;
 //!   the note says how many).
@@ -30,8 +33,8 @@
 //! - the names: not absolute, no `..` component, valid UTF-8, no NUL; a component `.` or an empty one is
 //!   dropped; every entry starts with the same first component (what `docker cp` names the object); that
 //!   component is replaced by `dest`'s own name, so `to` names the file or directory that results;
-//! - the types: only regular files and directories. A symbolic link, a hard link, a device, a FIFO or any
-//!   other type refuses the whole stream, and nothing is written;
+//! - the types: only regular files and directories. A symbolic link, a hard link, a device, a FIFO, a
+//!   contiguous file (typeflag 7) or any other type refuses the whole stream, and nothing is written;
 //! - the caps: `total` bytes of file data in all and `entries` entries (at most 10,000), else nothing is
 //!   written;
 //! - every file is then written with [`crate::fstools::write_file_checked`], the path of the `write` tool
@@ -50,10 +53,13 @@
 //! over the caps; refuses an existing link at the destination; writes through the sandbox, so a protected
 //! or unreadable destination is refused; a plain tree is unpacked exactly.
 
-use crate::files::open_readable;
+use crate::files::real_path;
 use crate::sandbox::Sandbox;
 use std::collections::HashMap;
-use std::io::Read;
+use std::ffi::{CString, OsStr, OsString};
+use std::io::{self, Read};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -193,10 +199,85 @@ fn mtime_ns(m: &std::fs::Metadata) -> i128 {
     i128::from(m.mtime()) * 1_000_000_000 + i128::from(m.mtime_nsec())
 }
 
+/// Deepest directory nesting a push walks into (each level holds one open descriptor).
+const MAX_DEPTH: usize = 64;
+
+/// `openat` with `O_CLOEXEC`: `name` is looked up in the directory `dir` only.
+fn open_at(dir: &OwnedFd, name: &OsStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    let c = CString::new(name.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `c` is a NUL-terminated string that lives through the call and `dir` is an open descriptor.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by `openat`, so it is open and nothing else owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// What `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)` says: the entry itself, never what a link points to.
+struct EntryStat {
+    mode: u32,
+    size: u64,
+    mtime: i128,
+}
+
+fn stat_at(dir: &OwnedFd, name: &OsStr) -> io::Result<EntryStat> {
+    let c = CString::new(name.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: an all-zero `stat` is a valid value for the C struct.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is NUL-terminated, `st` is a valid out-pointer and `dir` is an open descriptor.
+    let rc = unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(EntryStat {
+        mode: u32::from(st.st_mode) & u32::from(libc::S_IFMT),
+        size: u64::try_from(st.st_size).unwrap_or(0),
+        mtime: i128::from(st.st_mtime) * 1_000_000_000 + i128::from(st.st_mtime_nsec),
+    })
+}
+
+/// The names in the directory `dir` (not `.` and `..`).
+fn list_names(dir: &OwnedFd) -> io::Result<Vec<OsString>> {
+    // SAFETY: duplicating an open descriptor; `fdopendir` takes ownership of the duplicate.
+    let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `dup` is an open descriptor that nothing else uses.
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        let e = io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so `dup` is still ours to close.
+        unsafe { libc::close(dup) };
+        return Err(e);
+    }
+    let mut names = Vec::new();
+    // SAFETY: `stream` is a valid directory stream until `closedir`; each entry is read before the next call.
+    unsafe {
+        libc::rewinddir(stream);
+        loop {
+            let entry = libc::readdir(stream);
+            if entry.is_null() {
+                break;
+            }
+            let name = std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()).to_bytes();
+            if name != b"." && name != b".." {
+                names.push(OsStr::from_bytes(name).to_os_string());
+            }
+        }
+        libc::closedir(stream);
+    }
+    Ok(names)
+}
+
 struct Walk<'a> {
     sandbox: &'a Sandbox,
     prev: &'a Manifest,
     lim: PushLimits,
+    /// Called with the path of a file or directory after it was listed and before it is opened (tests swap
+    /// it for a link here).
+    between: &'a dyn Fn(&Path),
     tar: Vec<u8>,
     manifest: Manifest,
     sent: usize,
@@ -207,52 +288,71 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
-    fn dir(&mut self, abs: &Path, rel: &Path) {
-        // A directory the agent could not read is not entered.
-        if self.sandbox.check_read(abs).is_err() {
-            return;
+    /// One directory, held open as `fd`: every name in it is looked up relative to that descriptor, and
+    /// nothing is followed, so a link put in the place of a file or directory after it was listed is refused
+    /// by the open instead of leading anywhere.
+    fn dir(&mut self, fd: &OwnedFd, abs: &Path, rel: &Path, depth: usize) {
+        // A directory the agent could not read is not entered: judged by the real path of the open directory.
+        match real_path(fd.as_fd()) {
+            Ok(real) if self.sandbox.check_read(&real).is_ok() => {}
+            _ => return,
         }
-        let Ok(read) = std::fs::read_dir(abs) else { return };
-        let mut entries: Vec<_> = read.filter_map(Result::ok).collect();
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries {
-            let name = entry.file_name();
+        let Ok(mut names) = list_names(fd) else { return };
+        names.sort();
+        for name in names {
             let lossy = name.to_string_lossy();
             if lossy.eq_ignore_ascii_case(".git") || (rel.as_os_str().is_empty() && lossy == ".loom") {
                 continue;
             }
-            let Ok(kind) = entry.file_type() else { continue };
+            let Ok(st) = stat_at(fd, &name) else { continue };
             let (abs_child, rel_child) = (abs.join(&name), rel.join(&name));
-            if kind.is_dir() {
-                self.dir(&abs_child, &rel_child);
-            } else if kind.is_file() {
-                self.file(&abs_child, rel_child, &entry);
+            if st.mode == u32::from(libc::S_IFDIR) {
+                if depth >= MAX_DEPTH {
+                    continue;
+                }
+                (self.between)(&abs_child);
+                let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+                if let Ok(child) = open_at(fd, &name, flags) {
+                    self.dir(&child, &abs_child, &rel_child, depth + 1);
+                }
+            } else if st.mode == u32::from(libc::S_IFREG) {
+                self.file(fd, &name, &abs_child, rel_child, &st);
             }
         }
     }
 
-    fn file(&mut self, abs: &Path, rel: PathBuf, entry: &std::fs::DirEntry) {
+    fn file(&mut self, dir: &OwnedFd, name: &OsStr, abs: &Path, rel: PathBuf, listed: &EntryStat) {
         let Some(rel_text) = rel.to_str().map(str::to_string) else { return };
-        let Ok(listed) = entry.metadata() else { return };
-        let key = (listed.len(), mtime_ns(&listed));
+        let key = (listed.size, listed.mtime);
         if self.prev.get(&rel) == Some(&key) {
             self.manifest.insert(rel, key);
             return;
         }
-        if listed.len() > self.lim.file {
+        if listed.size > self.lim.file {
             self.oversize_n += 1;
             if self.oversize.len() < NOTE_NAMES {
-                self.oversize.push(format!("{rel_text} ({} bytes)", listed.len()));
+                self.oversize.push(format!("{rel_text} ({} bytes)", listed.size));
             }
             return;
         }
-        if self.bytes.saturating_add(listed.len()) > self.lim.total {
+        if self.bytes.saturating_add(listed.size) > self.lim.total {
             self.deferred += 1;
             return;
         }
-        let sandbox = self.sandbox;
-        let readable = |real: &Path| sandbox.check_read(real).map(|_| ());
-        let Ok((file, meta)) = open_readable(abs, &readable) else { return };
+        (self.between)(abs);
+        // Never a link (O_NOFOLLOW), never a FIFO that blocks (O_NONBLOCK), never a controlling terminal.
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY;
+        let Ok(fd) = open_at(dir, name, flags) else { return };
+        let file = std::fs::File::from(fd);
+        let Ok(meta) = file.metadata() else { return };
+        if !meta.is_file() {
+            return;
+        }
+        // The file that is open is judged by its real path, which is also the file that is read.
+        match real_path(file.as_fd()) {
+            Ok(real) if self.sandbox.check_read(&real).is_ok() => {}
+            _ => return,
+        }
         let key = (meta.len(), mtime_ns(&meta));
         if meta.len() > self.lim.file || self.bytes.saturating_add(meta.len()) > self.lim.total {
             self.deferred += 1;
@@ -273,16 +373,29 @@ impl Walk<'_> {
 
 /// The files of `workspace` to send now (see the module contract).
 pub fn build_push(sandbox: &Sandbox, workspace: &Path, prev: &Manifest, lim: PushLimits) -> Result<Push, String> {
-    if !workspace.is_dir() {
+    build_push_between(sandbox, workspace, prev, lim, &|_| {})
+}
+
+/// [`build_push`], calling `between` with each path after it was listed and before it is opened.
+fn build_push_between(
+    sandbox: &Sandbox,
+    workspace: &Path,
+    prev: &Manifest,
+    lim: PushLimits,
+    between: &dyn Fn(&Path),
+) -> Result<Push, String> {
+    let root = std::fs::File::open(workspace).ok().filter(|f| f.metadata().is_ok_and(|m| m.is_dir()));
+    let Some(root) = root.map(OwnedFd::from) else {
         return Err(format!(
             "The workspace {} is not a directory, so nothing could be copied into the box.",
             workspace.display()
         ));
-    }
+    };
     let mut w = Walk {
         sandbox,
         prev,
         lim,
+        between,
         tar: Vec::new(),
         manifest: Manifest::new(),
         sent: 0,
@@ -291,7 +404,7 @@ pub fn build_push(sandbox: &Sandbox, workspace: &Path, prev: &Manifest, lim: Pus
         oversize: Vec::new(),
         oversize_n: 0,
     };
-    w.dir(workspace, Path::new(""));
+    w.dir(&root, workspace, Path::new(""), 0);
     finish_tar(&mut w.tar);
     let mut notes = Vec::new();
     if w.oversize_n > 0 {
@@ -452,7 +565,7 @@ fn parse(bytes: &[u8], max_entries: usize) -> Result<Vec<Entry>, String> {
             }
         };
         let kind = match flag {
-            b'0' | 0 | b'7' => Kind::File,
+            b'0' | 0 => Kind::File,
             b'5' => Kind::Dir,
             b'2' => Kind::Symlink,
             b'1' => Kind::Hardlink,
@@ -681,6 +794,18 @@ mod tests {
         Fix { _dir: dir, ws, sb }
     }
 
+    /// A fixture whose sandbox config is made from the workspace path (to name paths inside it).
+    fn fix_in_ws(cfg: impl FnOnce(&Path) -> SandboxCfg) -> Fix {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (ws, tmp, home) = (root.join("ws"), root.join("tmp"), root.join("home"));
+        for d in [&ws, &tmp, &home, &ws.join(".loom"), &home.join("keys")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let sb = Sandbox::new(&cfg(&ws), &ws, &tmp, &home, None).unwrap();
+        Fix { _dir: dir, ws, sb }
+    }
+
     fn fix() -> Fix {
         fix_with(SandboxCfg { mode: SandboxMode::None, protect_credentials: false, ..SandboxCfg::default() })
     }
@@ -760,6 +885,90 @@ mod tests {
         for secret in ["TOPSECRET", "STATE", "ORACLE", "GITCONF"] {
             assert!(!all.contains(secret), "{secret} was sent");
         }
+    }
+
+    #[test]
+    fn r6_files_and_directories_listed_as_unreadable_inside_the_workspace_are_not_sent() {
+        let f = fix_in_ws(|ws| SandboxCfg {
+            mode: SandboxMode::None,
+            protect_credentials: false,
+            unreadable_paths: vec![ws.join("secret.txt").display().to_string(), ws.join("vault").display().to_string()],
+            ..SandboxCfg::default()
+        });
+        std::fs::write(f.ws.join("ok.txt"), "fine").unwrap();
+        // A regular file the config makes unreadable: only the readable check on the opened file stops it.
+        std::fs::write(f.ws.join("secret.txt"), "TOPSECRET").unwrap();
+        // A directory the config makes unreadable: not descended.
+        std::fs::create_dir_all(f.ws.join("vault/inner")).unwrap();
+        std::fs::write(f.ws.join("vault/key"), "VAULTKEY").unwrap();
+        std::fs::write(f.ws.join("vault/inner/deep"), "VAULTDEEP").unwrap();
+        assert!(f.sb.check_read(&f.ws.join("secret.txt")).is_err() && f.sb.check_read(&f.ws.join("vault")).is_err());
+        let push = build_push(&f.sb, &f.ws, &Manifest::new(), LIM).unwrap();
+        assert_eq!(names_in(&push.tar), ["ok.txt"]);
+        let all = String::from_utf8_lossy(&push.tar);
+        for secret in ["TOPSECRET", "VAULTKEY", "VAULTDEEP"] {
+            assert!(!all.contains(secret), "{secret} was sent");
+        }
+        assert!(!push.manifest.contains_key(Path::new("secret.txt")), "a refused file is not in the manifest");
+    }
+
+    #[test]
+    fn r6_a_file_swapped_for_a_link_to_an_unreadable_file_after_the_listing_is_not_sent() {
+        let f = fix_in_ws(|ws| SandboxCfg {
+            mode: SandboxMode::None,
+            protect_credentials: false,
+            unreadable_paths: vec![ws.join("secret.txt").display().to_string()],
+            ..SandboxCfg::default()
+        });
+        std::fs::write(f.ws.join("a.txt"), "harmless").unwrap();
+        std::fs::write(f.ws.join("secret.txt"), "TOPSECRET").unwrap();
+        let (a, secret) = (f.ws.join("a.txt"), f.ws.join("secret.txt"));
+        let swap = |path: &Path| {
+            if path == a {
+                std::fs::remove_file(&a).unwrap();
+                std::os::unix::fs::symlink(&secret, &a).unwrap();
+            }
+        };
+        let push = build_push_between(&f.sb, &f.ws, &Manifest::new(), LIM, &swap).unwrap();
+        assert_eq!(push.sent, 0, "{:?}", names_in(&push.tar));
+        assert!(!String::from_utf8_lossy(&push.tar).contains("TOPSECRET"));
+    }
+
+    #[test]
+    fn r7_a_link_swapped_in_after_the_listing_is_refused_not_followed() {
+        let f = fix();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_dir = outside.path().canonicalize().unwrap();
+        // A readable file and a readable directory outside the workspace: only the link itself is the problem.
+        std::fs::write(outside_dir.join("elsewhere.txt"), "OUTSIDEFILE").unwrap();
+        std::fs::create_dir_all(outside_dir.join("dir")).unwrap();
+        std::fs::write(outside_dir.join("dir/inner.txt"), "OUTSIDEDIR").unwrap();
+        std::fs::write(f.ws.join("a.txt"), "harmless").unwrap();
+        std::fs::create_dir_all(f.ws.join("d")).unwrap();
+        std::fs::write(f.ws.join("d/b.txt"), "in d").unwrap();
+        let (a, d) = (f.ws.join("a.txt"), f.ws.join("d"));
+        let (target_file, target_dir) = (outside_dir.join("elsewhere.txt"), outside_dir.join("dir"));
+        let swap = |path: &Path| {
+            if path == a {
+                std::fs::remove_file(&a).unwrap();
+                std::os::unix::fs::symlink(&target_file, &a).unwrap();
+            } else if path == d {
+                std::fs::remove_dir_all(&d).unwrap();
+                std::os::unix::fs::symlink(&target_dir, &d).unwrap();
+            }
+        };
+        let push = build_push_between(&f.sb, &f.ws, &Manifest::new(), LIM, &swap).unwrap();
+        let all = String::from_utf8_lossy(&push.tar);
+        assert!(!all.contains("OUTSIDEFILE") && !all.contains("OUTSIDEDIR"), "a link was followed");
+        assert_eq!(push.sent, 0, "{:?}", names_in(&push.tar));
+        // Without a swap the same tree is sent as it is.
+        std::fs::remove_file(&a).unwrap();
+        std::fs::remove_file(&d).unwrap();
+        std::fs::write(&a, "harmless").unwrap();
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("b.txt"), "in d").unwrap();
+        let plain = build_push(&f.sb, &f.ws, &Manifest::new(), LIM).unwrap();
+        assert_eq!(names_in(&plain.tar), ["a.txt", "d/b.txt"]);
     }
 
     #[test]
@@ -859,6 +1068,12 @@ mod tests {
         assert_refused_and_empty(&f, &raw_tar(&[("out/dev", b'3', "", b"")]), "device");
         assert_refused_and_empty(&f, &raw_tar(&[("out/dev", b'4', "", b"")]), "device");
         assert_refused_and_empty(&f, &raw_tar(&[("out/pipe", b'6', "", b"")]), "FIFO");
+        // R11: a contiguous file (typeflag 7) is not a type that is taken.
+        assert_refused_and_empty(
+            &f,
+            &raw_tar(&[("out/a", b'0', "", b"ok"), ("out/c", b'7', "", b"")]),
+            "neither a file",
+        );
         assert_refused_and_empty(
             &f,
             &raw_tar(&[("out/a", b'0', "", b"1"), ("other/b", b'0', "", b"2")]),

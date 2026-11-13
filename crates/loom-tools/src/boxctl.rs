@@ -6,19 +6,24 @@
 //! (`box_exec`, `box_get`, `box_reset`), which are the only things a session can do with a box. The
 //! agent's text is never a docker argument, an ssh argument, an iptables argument or shell text on this
 //! machine: the docker command line client is run by the daemon, outside every sandbox, with an argv that
-//! loom builds (the pure `*_args` functions below), a minimal environment (`PATH`, `HOME`), and
+//! loom builds (the pure `*_args` functions below), a fixed environment ([`DockerHost::docker_env`]), and
 //! `--host unix://<socket>`. A command of the agent is the single last argument of
 //! `/bin/bash -c <fixed text> _ <pid file> <script>` inside the container.
 //!
 //! ## Reaching Docker (`DockerHost`)
-//! `DockerHost::new(cfg, loom_home)` resolves `docker_cli` on the daemon's `PATH` (a name with a `/` is
-//! taken as a path) and fixes the socket: `docker_socket`, or with `ssh_host` the forwarded socket
+//! `DockerHost::new(cfg, loom_home)` resolves `docker_cli` and, when the socket is forwarded, `ssh` to absolute
+//! paths once, at start (a bare name is looked for on the daemon's `PATH` then and never again; a relative path
+//! or a program that is not found refuses the start of the box), makes the private directories
+//! `<loom home>/keys/box-docker` (empty; `HOME` and `DOCKER_CONFIG` of the docker client, so no operator
+//! configuration or credential helper is read) and `<loom home>/keys/box-run` (where every process of this
+//! module starts, never the session's scratch directory), and fixes the socket: `docker_socket`, or with `ssh_host` the forwarded socket
 //! `<loom home>/keys/box.sock`. That directory is private to the daemon and unreadable to commands
 //! (`Sandbox` makes `<loom home>/keys` unreadable), and the socket is never added to
 //! `sandbox.unix_sockets`. A socket path longer than 100 bytes is refused with a sentence.
 //! The forward is started lazily by the first use (`ensure_forward`) as
-//! `ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -o ControlPath=none -o ForwardAgent=no
-//! -o ServerAliveInterval=15 -N -L <socket>:<remote_socket> -- <ssh_host>` ([`ssh_args`]), supervised: a stale
+//! `<absolute ssh> -o BatchMode=yes -o ExitOnForwardFailure=yes -o ControlPath=none -o ForwardAgent=no
+//! -o ServerAliveInterval=15 -N -L <socket>:<remote_socket> -- <ssh_host>` ([`ssh_args`]), with `PATH` fixed to
+//! [`SYSTEM_PATH`] and the operator's own `HOME`, supervised: a stale
 //! socket file is removed before each start, an exit restarts it after a backoff of 1 s doubling to 30 s
 //! (reset after a minute of uptime), and `shutdown` stops it and removes the socket. It reads the
 //! operator's own ssh configuration, which is where an alias such as `loom-box` (with its ProxyJump) is defined.
@@ -37,7 +42,8 @@
 //! capabilities dropped and only `cap_add` added back (config load refuses the dangerous ones),
 //! `no-new-privileges`, pids/memory/cpus limits (memory-swap equal to memory), a read-only root with
 //! tmpfs on `/tmp` and `/work` (`nosuid,nodev`, owned by 1000:1000, sizes from the config), user
-//! 1000:1000, its own network (below), a private IPC namespace, no bind mount or volume, no device, no
+//! 1000:1000, IPv6 off in its own network namespace (`--sysctl net.ipv6.conf.{all,default}.disable_ipv6=1`),
+//! its own network (below), a private IPC namespace, no bind mount or volume, no device, no
 //! privileged mode, and no host network, pid, ipc or uts namespace. The entry point is replaced by
 //! `/bin/sleep 2147483647`.
 //!
@@ -52,28 +58,41 @@
 //! addresses need `allow_private`, `deny` entries apply, and an entry that denies some ports refuses a
 //! grant of all ports), and keeps IPv4 addresses only (the network has no IPv6). The names that were
 //! resolved, with the addresses that passed, are written to the container's `/etc/hosts` by the daemon
-//! (`docker exec -u 0 -i`, the text on stdin). The rules are the chain `LOOM-<short>`
-//! ([`rules_text`]): ACCEPT established and related, ACCEPT each allowed `ip/32` per protocol (tcp and
-//! udp, with `--dport` when a port was granted), DROP the rest. The chain is jumped to from `DOCKER-USER`
-//! (forwarded packets) and from `INPUT` (packets to the Docker host itself) for packets that enter on the
-//! bridge interface. It is installed or replaced atomically (`iptables-restore --noflush`) by the operator's
-//! `helper_image`, run as `--rm --network host --cap-drop ALL --cap-add NET_ADMIN` with a fixed script;
-//! the only variable parts are validated addresses and ports that loom formats itself, and chain and
-//! interface names that are derived from a hash.
+//! (`docker exec -u 0 -i /bin/sh -c '/bin/cat > /etc/hosts'` with a fixed `PATH`, the text on stdin). The
+//! rules are the chain `LOOM-<short>` ([`rules_text`]): ACCEPT established and related, ACCEPT each allowed
+//! `ip/32` per protocol (tcp and udp, with `--dport` when a port was granted), DROP the rest. Behind it is a
+//! static chain `LOOM-ALL` that ends with `DROP` and holds one jump `-i lb-<short> -j LOOM-<short>` per
+//! mission, above that `DROP`; `DOCKER-USER` (forwarded packets) and `INPUT` (packets to the Docker host
+//! itself) send everything that enters on any `lb-+` interface to `LOOM-ALL`. So a bridge whose mission has
+//! no chain or no jump is dropped, never routed or translated. IPv6 on the interface is dropped in `INPUT`
+//! and `FORWARD` (`ip6tables`; the helper image must have it). The mission's chain is installed or replaced
+//! atomically (`iptables-restore --noflush`) by the operator's `helper_image`, run as `--rm --network host
+//! --cap-drop ALL --cap-add NET_ADMIN` with a fixed script ([`rules_args`]); removing a mission
+//! ([`rules_remove_args`]) takes away only its own jump, chain and IPv6 drops, never `LOOM-ALL` or its `DROP`.
 //! The container is started only after its rules are in place. When rules cannot be brought up to date
-//! while a container exists, the container is removed (fail closed).
+//! while a container exists, the container is removed (fail closed). The rules of a running box are checked
+//! again by `ready` when [`RULES_RECHECK`] has passed since they were last known to be there
+//! ([`rules_check_args`]); a missing chain or jump is installed again before the command runs, and when that
+//! fails the container is removed and the command is refused.
 //!
 //! ## Life of a box (`MissionBox`, I5)
 //! One per mission, created by the runtime with a source of the mission's grants and effective policy.
+//! Everything that creates, changes or removes a mission's box (`ready`, `reset`, `resync`, `teardown`,
+//! `push`, `get_tar`, [`teardown_mission`] and each mission [`reconcile`] sweeps) holds the host's lock
+//! for that mission, shared by every handle, so a teardown and a re-creation never overlap (R1).
 //! `ready` creates the network, the rules and the container when there is no running container (it
-//! adopts one that is running, re-applying the rules). `reset` removes the container and makes a new one.
-//! `resync` re-applies the rules to the current grants when the box exists. `teardown` removes the
-//! container, then the network, then the chain (in that order, so that a container is never left without
-//! its filter), best effort. [`reconcile`] removes the containers, networks and chains labelled with this
-//! loom home whose mission is not in the set it is given.
+//! adopts one that is running, re-applying the rules). An existing network of the mission's name is adopted
+//! only when its labels, driver, IPv6 setting and bridge name are the box's own; any other is removed and
+//! made again, or, when containers are attached to it, left alone and the call fails. `reset` removes the
+//! container and makes a new one. `resync` re-applies the rules to the current grants when the box exists.
+//! `teardown` removes the container, then the network, then the chain, in that order and each only if the
+//! one before succeeded (a network that was not found counts as removed), so that a container or network is
+//! never left without its filter; best effort. [`reconcile`] removes the containers, networks and chains
+//! labelled with this loom home whose mission `keep` does not name, asking `keep` after the lock is taken.
 //!
 //! ## Commands (`launcher`, I1)
-//! `launcher(call, cwd, script)` returns the `proc::Launcher` that `bash::run_launched` runs:
+//! `launch(call, cwd, script)` returns the `bash::Launch` that `bash::run_launched` runs: the launcher
+//! below, the box's private run directory and the docker client's environment. The launcher is:
 //! `docker exec -u 1000:1000 -w /work[/cwd] -e HOME=/tmp -e TERM=dumb <container> /bin/bash -c
 //! 'exec setsid /bin/bash -c '\''echo $$ > "$0"; exec /bin/bash -c "$1"'\'' "$1" "$2"' _ <pid file> <script>`.
 //! The command runs in its own session, and the pid file `/tmp/.loom-<call>.pid` holds the process group
@@ -87,22 +106,25 @@
 //! unpacked is in `boxfs` (I6, I7).
 //!
 //! Tests required: exact argv of `run`, `exec`, `cp`, `network create`, `rm`, the helper run and the
-//! kill (I1, I2, I4); a hostile script reaches the launcher as one argv element; the egress plan for a grant
+//! kill (I1, I2, I4); the three helper scripts run against stand-ins for `iptables` (R1, R2); a hostile script reaches the launcher as one argv element; the egress plan for a grant
 //! set (private address refused without `allow_private`, wildcard skipped and noticed once, IPv6 skipped,
 //! ports kept); the rules text; names and labels; the ssh argv and the forward supervisor with a fake
 //! `ssh` (stale socket removed, restarted after an exit); container life with a fake `docker` (created
 //! after its rules, reset, resync fail-closed, teardown order, reconcile); a box job's kill reaches the
 //! command in the "container" (fake `docker exec` runs it), TERM then KILL.
 
+use crate::bash::Launch;
 use crate::boxfs::{self, Manifest};
 use crate::proc::{Launcher, RemoteStop};
 use crate::sandbox::Sandbox;
 use loom_core::config::BoxCfg;
 use loom_net::policy::Policy;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -124,6 +146,18 @@ const SMALL_OUT: usize = 1 << 20;
 const RESOLVE_LIMIT: Duration = Duration::from_secs(10);
 /// How long the first use waits for the forwarded socket to appear.
 const FORWARD_WAIT: Duration = Duration::from_secs(20);
+/// A running box has its egress rules looked at again by `ready` when this long has passed since the last time.
+pub const RULES_RECHECK: Duration = Duration::from_secs(60);
+/// The `PATH` of every process this module starts on this machine: fixed system directories, all absolute.
+pub const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+/// The `PATH` of the container's root-run `/etc/hosts` writer.
+pub const HOSTS_PATH: &str = "PATH=/usr/sbin:/usr/bin:/sbin:/bin";
+/// The static chain that every box bridge (`lb-+`) is sent to first; it ends with `DROP`.
+pub const ALL_CHAIN: &str = "LOOM-ALL";
+/// The directory (under `<loom home>/keys`) that is `HOME` and `DOCKER_CONFIG` of the docker client: empty.
+const DOCKER_DIR: &str = "box-docker";
+/// The directory (under `<loom home>/keys`) the launcher processes start in.
+const RUN_DIR: &str = "box-run";
 
 // ---- names ---------------------------------------------------------------------------------------
 
@@ -184,6 +218,11 @@ pub fn network_rm_args(n: &Names) -> Vec<String> {
     vec!["network".into(), "rm".into(), n.network.clone()]
 }
 
+/// `docker network inspect` of the mission's network as one JSON object.
+pub fn network_inspect_args(n: &Names) -> Vec<String> {
+    vec!["network".into(), "inspect".into(), "--format".into(), "{{json .}}".into(), n.network.clone()]
+}
+
 pub fn rm_args(n: &Names) -> Vec<String> {
     vec!["rm".into(), "--force".into(), "--volumes".into(), n.container.clone()]
 }
@@ -212,6 +251,12 @@ pub fn run_args(cfg: &BoxCfg, n: &Names, home: &str) -> Vec<String> {
         a.push(cap);
     }
     a.extend(strings(["--security-opt", "no-new-privileges"]));
+    a.extend(strings([
+        "--sysctl",
+        "net.ipv6.conf.all.disable_ipv6=1",
+        "--sysctl",
+        "net.ipv6.conf.default.disable_ipv6=1",
+    ]));
     a.push("--pids-limit".into());
     a.push(cfg.pids.to_string());
     a.push("--memory".into());
@@ -286,11 +331,12 @@ pub fn kill_args(n: &Names, pid_file: &str, signal: &str) -> Vec<String> {
     a
 }
 
-/// `docker exec` that replaces `/etc/hosts` with what arrives on stdin.
+/// `docker exec` as root that replaces `/etc/hosts` with what arrives on stdin. Root runs only absolute
+/// programs, with a fixed `PATH`: nothing in the container's own (user-writable) search path is found.
 pub fn hosts_args(n: &Names) -> Vec<String> {
-    let mut a = strings(["exec", "--interactive", "--user", "0"]);
+    let mut a = strings(["exec", "--interactive", "--user", "0", "--env", HOSTS_PATH]);
     a.push(n.container.clone());
-    a.extend(strings(["/bin/sh", "-c", "cat > /etc/hosts"]));
+    a.extend(strings(["/bin/sh", "-c", "/bin/cat > /etc/hosts"]));
     a
 }
 
@@ -326,13 +372,34 @@ pub fn network_ls_args(home: &str) -> Vec<String> {
     ]
 }
 
-/// The script of the helper run that installs or replaces the chain. `$1` is the chain, `$2` the interface.
-const RULES_APPLY: &str = "iptables-restore -w 5 --noflush || exit 1; \
-for c in DOCKER-USER INPUT; do iptables -w 5 -C \"$c\" -i \"$2\" -j \"$1\" 2>/dev/null || iptables -w 5 -I \"$c\" 1 -i \"$2\" -j \"$1\" || exit 1; done";
-/// The script that removes the jumps, then the chain.
-const RULES_REMOVE: &str =
-    "for c in DOCKER-USER INPUT; do while iptables -w 5 -D \"$c\" -i \"$2\" -j \"$1\" 2>/dev/null; do :; done; done; \
-iptables -w 5 -F \"$1\" 2>/dev/null; iptables -w 5 -X \"$1\" 2>/dev/null; exit 0";
+/// The script of the helper run that installs or replaces the mission's rules. `$1` is the mission's chain
+/// and `$2` its bridge interface; the chain's rules arrive on stdin ([`rules_text`]).
+///
+/// The static chain `LOOM-ALL` is made first and ends with `DROP`; `DOCKER-USER` (forwarded packets) and
+/// `INPUT` (packets to the Docker host) send everything that enters on any `lb-` interface to it. The
+/// mission's own chain is installed by `iptables-restore --noflush` (a declared chain is replaced as one
+/// step), and only then does `LOOM-ALL` get the mission's jump, inserted above its final `DROP`. A bridge
+/// without a jump of its own is therefore dropped, never routed or translated. IPv6 is dropped for the
+/// interface in `INPUT` and `FORWARD`. Every step can be repeated.
+const RULES_APPLY: &str = ": loom-rules-apply; \
+iptables -w 5 -N LOOM-ALL 2>/dev/null; \
+iptables -w 5 -C LOOM-ALL -j DROP 2>/dev/null || iptables -w 5 -A LOOM-ALL -j DROP || exit 1; \
+for c in DOCKER-USER INPUT; do iptables -w 5 -C \"$c\" -i 'lb-+' -j LOOM-ALL 2>/dev/null || iptables -w 5 -I \"$c\" 1 -i 'lb-+' -j LOOM-ALL || exit 1; done; \
+iptables-restore -w 5 --noflush || exit 1; \
+iptables -w 5 -C LOOM-ALL -i \"$2\" -j \"$1\" 2>/dev/null || iptables -w 5 -I LOOM-ALL 1 -i \"$2\" -j \"$1\" || exit 1; \
+for c in INPUT FORWARD; do ip6tables -w 5 -C \"$c\" -i \"$2\" -j DROP 2>/dev/null || ip6tables -w 5 -I \"$c\" 1 -i \"$2\" -j DROP || exit 1; done";
+/// The script that tells whether everything [`RULES_APPLY`] makes is still there (exit status 0).
+const RULES_CHECK: &str = ": loom-rules-check; \
+iptables -w 5 -C LOOM-ALL -j DROP && \
+iptables -w 5 -C DOCKER-USER -i 'lb-+' -j LOOM-ALL && iptables -w 5 -C INPUT -i 'lb-+' -j LOOM-ALL && \
+iptables -w 5 -C LOOM-ALL -i \"$2\" -j \"$1\" && iptables -w 5 -C \"$1\" -j DROP && \
+ip6tables -w 5 -C INPUT -i \"$2\" -j DROP && ip6tables -w 5 -C FORWARD -i \"$2\" -j DROP";
+/// The script that removes the mission's jump from `LOOM-ALL`, its chain and its IPv6 drops. Nothing else:
+/// `LOOM-ALL` and its final `DROP` stay.
+const RULES_REMOVE: &str = ": loom-rules-remove; \
+while iptables -w 5 -D LOOM-ALL -i \"$2\" -j \"$1\" 2>/dev/null; do :; done; \
+iptables -w 5 -F \"$1\" 2>/dev/null; iptables -w 5 -X \"$1\" 2>/dev/null; \
+for c in INPUT FORWARD; do while ip6tables -w 5 -D \"$c\" -i \"$2\" -j DROP 2>/dev/null; do :; done; done; exit 0";
 
 fn helper_args(cfg: &BoxCfg, interactive: bool, script: &str, n: &Names) -> Vec<String> {
     let mut a = strings(["run", "--rm"]);
@@ -366,9 +433,14 @@ pub fn rules_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
     helper_args(cfg, true, RULES_APPLY, n)
 }
 
-/// The helper run that removes the jumps and the chain.
+/// The helper run that removes the mission's jump, chain and IPv6 drops.
 pub fn rules_remove_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
     helper_args(cfg, false, RULES_REMOVE, n)
+}
+
+/// The helper run that checks that the mission's rules are all in place (its status says).
+pub fn rules_check_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
+    helper_args(cfg, false, RULES_CHECK, n)
 }
 
 /// The `iptables-restore` input for the chain: established and related traffic, each allowed address, drop.
@@ -597,35 +669,63 @@ pub struct DockerHost {
     home: PathBuf,
     cli: PathBuf,
     socket: PathBuf,
+    /// The absolute path of `ssh` (resolved once, at start), when the socket is forwarded.
     ssh_program: String,
+    /// `HOME` and `DOCKER_CONFIG` of the docker client: an empty directory of the daemon's own.
+    docker_dir: PathBuf,
+    /// Where the launcher processes start: a directory of the daemon's own.
+    run_dir: PathBuf,
     forward: Mutex<Option<Forward>>,
     last_ssh_error: Arc<StdMutex<String>>,
+    /// One lock per mission (by `Names::short`) that every change of its box takes (R1).
+    locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Milliseconds between two looks at the rules of a running box.
+    recheck_ms: AtomicU64,
 }
 
-fn resolve_cli(name: &str) -> Result<PathBuf, String> {
+/// `name` as an absolute path to an executable file. A name with a `/` is taken as it is; a bare name is
+/// looked for in `search` (a `PATH` value) now, and the answer is what is used from then on.
+fn resolve_program(name: &str, what: &str, search: &OsStr) -> Result<PathBuf, String> {
     let executable = |p: &Path| {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     };
     if name.contains('/') {
         let p = PathBuf::from(name);
-        return if executable(&p) {
+        return if !p.is_absolute() {
+            Err(format!(
+                "{what} {name} is a relative path. Give a bare name to look for on the daemon's PATH, or a full path."
+            ))
+        } else if executable(&p) {
             Ok(p)
         } else {
-            Err(format!("box.docker_cli {name} is not an executable file. Install the docker command line client or give its full path."))
+            Err(format!("{what} {name} is not an executable file. Install it or give its full path."))
         };
     }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
+    std::env::split_paths(search)
+        .filter(|d| d.is_absolute())
         .map(|d| d.join(name))
         .find(|p| executable(p))
-        .ok_or_else(|| format!("box.docker_cli `{name}` was not found on the daemon's PATH. Install the docker command line client or give its full path."))
+        .ok_or_else(|| format!("{what} `{name}` was not found on the daemon's PATH. Install it or give its full path."))
 }
 
 impl DockerHost {
     /// Prepare the connection (nothing is started yet). `loom_home` is where `keys/box.sock` lives.
     pub fn new(cfg: &BoxCfg, loom_home: &Path) -> Result<Arc<DockerHost>, String> {
-        let cli = resolve_cli(&cfg.docker_cli)?;
+        let search = std::env::var_os("PATH").unwrap_or_default();
+        Self::new_in(cfg, loom_home, &search)
+    }
+
+    /// [`DockerHost::new`] looking for `docker_cli` and `ssh` in `search` (a `PATH` value) instead of the
+    /// daemon's. Both are resolved here, once; nothing is looked up by name later. A program that is not
+    /// found refuses the start of the box with a sentence.
+    pub fn new_in(cfg: &BoxCfg, loom_home: &Path, search: &OsStr) -> Result<Arc<DockerHost>, String> {
+        let cli = resolve_program(&cfg.docker_cli, "box.docker_cli", search)?;
+        let ssh_program = if cfg.docker_socket.is_empty() {
+            resolve_program("ssh", "The ssh program (box.ssh_host needs it)", search)?.display().to_string()
+        } else {
+            String::new()
+        };
         let socket = if cfg.docker_socket.is_empty() {
             loom_home.join("keys").join("box.sock")
         } else {
@@ -637,27 +737,42 @@ impl DockerHost {
                 socket.display()
             ));
         }
+        let keys = loom_home.join("keys");
+        let (docker_dir, run_dir) = (keys.join(DOCKER_DIR), keys.join(RUN_DIR));
+        for dir in [&docker_dir, &run_dir] {
+            loom_core::config::ensure_private_dir(dir)
+                .map_err(|e| format!("The box's private directory {} cannot be made: {e}", dir.display()))?;
+        }
         Ok(Arc::new(DockerHost {
             cfg: cfg.clone(),
             home: loom_home.to_path_buf(),
             cli,
             socket,
-            ssh_program: "ssh".to_string(),
+            ssh_program,
+            docker_dir,
+            run_dir,
             forward: Mutex::new(None),
             last_ssh_error: Arc::new(StdMutex::new(String::new())),
+            locks: StdMutex::new(HashMap::new()),
+            recheck_ms: AtomicU64::new(u64::try_from(RULES_RECHECK.as_millis()).unwrap_or(u64::MAX)),
         }))
     }
 
-    /// Run `program` instead of `ssh` for the forward (tests).
+    /// The lock that serializes everything done to one mission's box: creating, resetting, re-ruling,
+    /// removing, and what reconcile removes. It is shared by every handle for the same mission (R1).
+    fn mission_lock(&self, short: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.entry(short.to_string()).or_default().clone()
+    }
+
+    /// Look at the rules of a running box this often (tests make it shorter).
     #[cfg(any(test, feature = "testutil"))]
-    pub fn with_ssh_program(self: Arc<Self>, program: &str) -> Arc<DockerHost> {
-        match Arc::try_unwrap(self) {
-            Ok(mut h) => {
-                h.ssh_program = program.to_string();
-                Arc::new(h)
-            }
-            Err(shared) => shared,
-        }
+    pub fn set_recheck(&self, every: Duration) {
+        self.recheck_ms.store(u64::try_from(every.as_millis()).unwrap_or(u64::MAX), Ordering::SeqCst);
+    }
+
+    fn recheck_every(&self) -> Duration {
+        Duration::from_millis(self.recheck_ms.load(Ordering::SeqCst))
     }
 
     pub fn home_hash(&self) -> String {
@@ -679,9 +794,33 @@ impl DockerHost {
         (self.cli.display().to_string(), full)
     }
 
-    /// The environment of every process this module starts: `PATH` and `HOME`, nothing of the agent's.
-    fn base_env() -> Vec<(&'static str, String)> {
-        ["PATH", "HOME"].iter().filter_map(|k| Some((*k, std::env::var(k).ok()?))).collect()
+    /// The whole environment of the docker client: a fixed `PATH`, and `HOME` and `DOCKER_CONFIG` in an
+    /// empty directory of the daemon's own, so that no configuration, credential helper or plugin of the
+    /// operator's account is read, and nothing of the agent's or of this process's environment is passed.
+    pub fn docker_env(&self) -> BTreeMap<String, String> {
+        let dir = self.docker_dir.display().to_string();
+        BTreeMap::from([
+            ("PATH".to_string(), SYSTEM_PATH.to_string()),
+            ("HOME".to_string(), dir.clone()),
+            ("DOCKER_CONFIG".to_string(), dir),
+        ])
+    }
+
+    /// The environment of `ssh`: a fixed `PATH` and the operator's own `HOME`, where its configuration is.
+    fn ssh_env() -> Vec<(&'static str, String)> {
+        let mut env = vec![("PATH", SYSTEM_PATH.to_string())];
+        env.extend(std::env::var("HOME").ok().map(|h| ("HOME", h)));
+        env
+    }
+
+    /// The directory the launcher processes start in.
+    pub fn run_dir(&self) -> &Path {
+        &self.run_dir
+    }
+
+    /// The absolute path of the `ssh` program that was resolved at start (empty with a local socket).
+    pub fn ssh_program(&self) -> &str {
+        &self.ssh_program
     }
 
     /// Make sure the socket can be used: start the ssh forward when one is configured.
@@ -718,8 +857,8 @@ impl DockerHost {
 
     fn start_forward(&self) -> Forward {
         let stop = Arc::new(tokio::sync::Notify::new());
-        let (program, args, socket) =
-            (self.ssh_program.clone(), ssh_args(&self.cfg, &self.socket), self.socket.clone());
+        let (program, args, socket, run_dir) =
+            (self.ssh_program.clone(), ssh_args(&self.cfg, &self.socket), self.socket.clone(), self.run_dir.clone());
         let (stop2, errors) = (stop.clone(), self.last_ssh_error.clone());
         let task = tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
@@ -729,7 +868,8 @@ impl DockerHost {
                 let mut cmd = tokio::process::Command::new(&program);
                 cmd.args(&args)
                     .env_clear()
-                    .envs(DockerHost::base_env())
+                    .envs(DockerHost::ssh_env())
+                    .current_dir(&run_dir)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped())
@@ -799,7 +939,8 @@ impl DockerHost {
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(full)
             .env_clear()
-            .envs(Self::base_env())
+            .envs(self.docker_env())
+            .current_dir(&self.run_dir)
             .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -878,6 +1019,16 @@ pub type EgressSource = Arc<dyn Fn() -> Result<(Vec<String>, Policy), String> + 
 struct State {
     up: bool,
     pushed: Manifest,
+    /// When the rules of the running container were last known to be in place.
+    verified: Option<Instant>,
+}
+
+impl State {
+    fn forget(&mut self) {
+        self.up = false;
+        self.pushed.clear();
+        self.verified = None;
+    }
 }
 
 /// What a push did.
@@ -888,12 +1039,16 @@ pub struct PushReport {
     pub notes: Vec<String>,
 }
 
-/// One mission's container, network and rules. All changes are made one at a time.
+/// One mission's container, network and rules. All changes are made one at a time, and the lock that
+/// orders them is the host's lock of the mission, so it holds across every handle of the same mission
+/// and against [`teardown_mission`] and [`reconcile`] (R1).
 pub struct MissionBox {
     host: Arc<DockerHost>,
     names: Names,
     home: String,
     source: EgressSource,
+    /// The mission's lock on the host: held by everything that creates, changes or removes the box.
+    lifecycle: Arc<Mutex<()>>,
     state: Mutex<State>,
     wildcards: StdMutex<Vec<String>>,
     told: StdMutex<HashSet<String>>,
@@ -902,8 +1057,10 @@ pub struct MissionBox {
 impl MissionBox {
     pub fn new(host: Arc<DockerHost>, mission: &str, source: EgressSource) -> Arc<MissionBox> {
         let home = host.home_hash();
+        let names = names(mission);
         Arc::new(MissionBox {
-            names: names(mission),
+            lifecycle: host.mission_lock(&names.short),
+            names,
             home,
             host,
             source,
@@ -964,61 +1121,141 @@ impl MissionBox {
         self.host.run_ok("Writing the container's /etc/hosts", &hosts_args(&self.names), Some(text)).await.map(|_| ())
     }
 
+    /// Remove the container so that it never runs with rules that are not the grants' (best effort).
+    async fn remove_container(&self, st: &mut State) {
+        let _ = self.host.docker(&rm_args(&self.names), None, SMALL_OUT).await;
+        st.forget();
+    }
+
+    async fn create_network(&self) -> Result<DockerOut, String> {
+        let args = network_args(&self.names, &self.home);
+        self.host.docker(&args, None, SMALL_OUT).await
+    }
+
+    /// Make the mission's network, or adopt the one that is there when it is this mission's own (R5): its
+    /// labels name this loom home and mission, it is a bridge without IPv6, and its bridge interface is the
+    /// one the rules name. Any other network of that name is removed and made again, unless something is
+    /// attached to it, in which case it is left alone and the call fails.
+    async fn make_network(&self) -> Result<(), String> {
+        let made = self.create_network().await?;
+        if made.ok() {
+            return Ok(());
+        }
+        if !made.stderr.contains("already exists") {
+            return Err(format!("Creating the box network failed on the Docker host: {}", made.why()));
+        }
+        let looked = self.host.docker(&network_inspect_args(&self.names), None, SMALL_OUT).await?;
+        if !looked.ok() {
+            return Err(format!(
+                "The existing network {} could not be inspected: {}",
+                self.names.network,
+                looked.why()
+            ));
+        }
+        let found = inspect_network(&looked.stdout, &self.names, &self.home)?;
+        match found {
+            Found::Ours => Ok(()),
+            Found::Foreign { attached: 0, why } => {
+                tracing::warn!(mission = %self.names.mission, "box: replacing the network {}: {why}", self.names.network);
+                self.run_ok("Removing a network that is not the box's", network_rm_args(&self.names)).await?;
+                let again = self.create_network().await?;
+                if again.ok() {
+                    Ok(())
+                } else {
+                    Err(format!("Creating the box network failed on the Docker host: {}", again.why()))
+                }
+            }
+            Found::Foreign { attached, why } => Err(format!(
+                "A network named {} already exists on the Docker host and is not this box's ({why}), and {attached} container(s) are attached to it, so it was left alone and no box was made. Remove or rename that network on the Docker host.",
+                self.names.network
+            )),
+        }
+    }
+
+    /// Whether the rules of the running container are all there, and if not, put them back, at most once per
+    /// `recheck_every` (R4). When they cannot be put back the container is removed and the call fails.
+    async fn verify_rules(&self, st: &mut State) -> Result<(), String> {
+        if st.verified.is_some_and(|t| t.elapsed() < self.host.recheck_every()) {
+            return Ok(());
+        }
+        let args = rules_check_args(&self.host.cfg, &self.names);
+        let present = matches!(self.host.docker(&args, None, SMALL_OUT).await, Ok(o) if o.ok());
+        if present {
+            st.verified = Some(Instant::now());
+            return Ok(());
+        }
+        tracing::warn!(mission = %self.names.mission, "box: its egress rules are not all in place; installing them again");
+        let again = async { self.install_rules(&self.plan().await?).await }.await;
+        match again {
+            Ok(()) => {
+                st.verified = Some(Instant::now());
+                Ok(())
+            }
+            Err(e) => {
+                self.remove_container(st).await;
+                Err(format!(
+                    "The egress rules of the box were not all in place and could not be put back ({e}), so the box was removed and the command was not run. The next box_exec makes a new box."
+                ))
+            }
+        }
+    }
+
+    /// The body of `ready` and `reset`; the mission's lock and the state are held by the caller.
     async fn ensure_locked(&self, st: &mut State) -> Result<(), String> {
         self.host.ensure_forward().await?;
         if st.up {
             if self.is_running().await {
-                return Ok(());
+                return self.verify_rules(st).await;
             }
-            st.up = false;
-            st.pushed.clear();
+            st.forget();
         }
         let plan = self.plan().await?;
         if self.is_running().await {
             // A box from before a restart of the daemon: bring its rules to the grants of now.
             self.install_rules(&plan).await?;
             self.write_hosts(&plan).await?;
+            st.forget();
             st.up = true;
-            st.pushed.clear();
+            st.verified = Some(Instant::now());
             return Ok(());
         }
         // Leftovers of an earlier box of this mission (stopped container, network).
         let _ = self.host.docker(&rm_args(&self.names), None, SMALL_OUT).await;
-        let made = self.host.docker(&network_args(&self.names, &self.home), None, SMALL_OUT).await?;
-        if !made.ok() && !made.stderr.contains("already exists") {
-            return Err(format!("Creating the box network failed on the Docker host: {}", made.why()));
-        }
+        self.make_network().await?;
         // The container starts only once the rules that confine it are in place.
         self.install_rules(&plan).await?;
         self.run_ok("Starting the box", run_args(&self.host.cfg, &self.names, &self.home)).await?;
         if let Err(e) = self.write_hosts(&plan).await {
-            let _ = self.host.docker(&rm_args(&self.names), None, SMALL_OUT).await;
+            self.remove_container(st).await;
             return Err(e);
         }
+        st.forget();
         st.up = true;
-        st.pushed.clear();
+        st.verified = Some(Instant::now());
         Ok(())
     }
 
     /// Make sure the container is running, creating it (network, rules, container) when it is not.
     pub async fn ready(&self) -> Result<(), String> {
+        let _life = self.lifecycle.lock().await;
         let mut st = self.state.lock().await;
         self.ensure_locked(&mut st).await
     }
 
     /// Remove the container and make a new one. What was in `/work` is gone.
     pub async fn reset(&self) -> Result<(), String> {
+        let _life = self.lifecycle.lock().await;
         let mut st = self.state.lock().await;
         self.host.ensure_forward().await?;
         self.run_ok("Removing the box", rm_args(&self.names)).await?;
-        st.up = false;
-        st.pushed.clear();
+        st.forget();
         self.ensure_locked(&mut st).await
     }
 
     /// Bring the rules to the mission's grants as they are now, if the box exists. When that cannot be
     /// done the container is removed, so that it never has more than the grants allow.
     pub async fn resync(&self) {
+        let _life = self.lifecycle.lock().await;
         let mut st = self.state.lock().await;
         if self.host.ensure_forward().await.is_err() || !self.is_running().await {
             return;
@@ -1029,20 +1266,21 @@ impl MissionBox {
             self.write_hosts(&plan).await
         }
         .await;
-        if let Err(e) = applied {
-            tracing::warn!(mission = %self.names.mission, "box: the egress rules could not be updated, so the box is removed: {e}");
-            let _ = self.host.docker(&rm_args(&self.names), None, SMALL_OUT).await;
-            st.up = false;
-            st.pushed.clear();
+        match applied {
+            Ok(()) => st.verified = Some(Instant::now()),
+            Err(e) => {
+                tracing::warn!(mission = %self.names.mission, "box: the egress rules could not be updated, so the box is removed: {e}");
+                self.remove_container(&mut st).await;
+            }
         }
     }
 
     /// Remove the container, the network and the chain, in that order (best effort, logged).
     pub async fn teardown(&self) {
+        let _life = self.lifecycle.lock().await;
         let mut st = self.state.lock().await;
-        st.up = false;
-        st.pushed.clear();
-        teardown_names(&self.host, &self.names).await;
+        st.forget();
+        teardown_names_locked(&self.host, &self.names).await;
     }
 
     /// The one-time note about grants the box does not apply, for the first call of `session`.
@@ -1063,6 +1301,7 @@ impl MissionBox {
 
     /// Copy the files of the workspace that changed since the last push into `/work` (I6).
     pub async fn push(&self, sandbox: Arc<Sandbox>, workspace: PathBuf) -> Result<PushReport, String> {
+        let _life = self.lifecycle.lock().await;
         let mut st = self.state.lock().await;
         let cfg = &self.host.cfg;
         let limits = boxfs::PushLimits {
@@ -1108,6 +1347,7 @@ impl MissionBox {
 
     /// `docker cp <container>:<path> -`: the tar stream, at most `max` bytes (I7 reads it).
     pub async fn get_tar(&self, path: &str, max: usize) -> Result<Vec<u8>, String> {
+        let _life = self.lifecycle.lock().await;
         let _st = self.state.lock().await;
         if !path.starts_with('/') || path.contains('\0') {
             return Err(format!("The path `{path}` is not absolute in the box."));
@@ -1132,7 +1372,8 @@ impl MissionBox {
             if let Ok(mut child) = std::process::Command::new(program)
                 .args(args)
                 .env_clear()
-                .envs(DockerHost::base_env())
+                .envs(host.docker_env())
+                .current_dir(host.run_dir())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1145,10 +1386,51 @@ impl MissionBox {
         };
         Ok(Launcher { program, args, remote_stop: Some(RemoteStop(Arc::new(stop))) })
     }
+
+    /// [`MissionBox::launcher`] with where it starts (a directory of the daemon's own, never the session's
+    /// scratch directory) and the whole environment of the docker client (R9).
+    pub fn launch(&self, call_id: &str, cwd: Option<&str>, script: &str) -> Result<Launch, String> {
+        Ok(Launch {
+            launcher: self.launcher(call_id, cwd, script)?,
+            cwd: self.host.run_dir().to_path_buf(),
+            env: self.host.docker_env(),
+        })
+    }
 }
 
-/// Remove one mission's container, network and chain.
-async fn teardown_names(host: &DockerHost, n: &Names) {
+/// What `docker network inspect` says about a network that is in the way.
+#[derive(Debug, PartialEq, Eq)]
+enum Found {
+    Ours,
+    Foreign { attached: usize, why: String },
+}
+
+/// Judge the JSON of `docker network inspect --format '{{json .}}'` (R5).
+fn inspect_network(json: &[u8], n: &Names, home: &str) -> Result<Found, String> {
+    let v: serde_json::Value = serde_json::from_slice(json)
+        .map_err(|e| format!("The existing network {} could not be understood ({e}).", n.network))?;
+    let text = |obj: &str, key: &str| v.get(obj).and_then(|o| o.get(key)).and_then(|x| x.as_str()).unwrap_or("");
+    let attached = v.get("Containers").and_then(|c| c.as_object()).map_or(0, serde_json::Map::len);
+    let checks = [
+        (v.get("Driver").and_then(|d| d.as_str()) == Some("bridge"), "it is not a bridge network".to_string()),
+        (!v.get("EnableIPv6").and_then(serde_json::Value::as_bool).unwrap_or(false), "it has IPv6 on".to_string()),
+        (text("Labels", "loom.home") == home, "it is not labelled with this loom home".to_string()),
+        (text("Labels", "loom.mission") == n.mission, "it is not labelled with this mission".to_string()),
+        (
+            text("Options", "com.docker.network.bridge.name") == n.iface,
+            format!("its bridge interface is not {}", n.iface),
+        ),
+    ];
+    match checks.into_iter().find(|(ok, _)| !ok) {
+        None => Ok(Found::Ours),
+        Some((_, why)) => Ok(Found::Foreign { attached, why }),
+    }
+}
+
+/// Remove one mission's container, network and chain. The caller holds the mission's lock. The chain goes
+/// last, and only when the container is gone and the network is gone or was not there: while either exists
+/// the chain (and `LOOM-ALL` behind it) is what confines the bridge (R1).
+async fn teardown_names_locked(host: &DockerHost, n: &Names) {
     let container = host.docker(&rm_args(n), None, SMALL_OUT).await;
     match container {
         Ok(o) if o.ok() || o.stderr.contains("No such container") => {}
@@ -1161,9 +1443,15 @@ async fn teardown_names(host: &DockerHost, n: &Names) {
             return;
         }
     }
-    if let Ok(o) = host.docker(&network_rm_args(n), None, SMALL_OUT).await {
-        if !o.ok() && !o.stderr.contains("not found") {
-            tracing::warn!(mission = %n.mission, "box: the network was not removed: {}", o.why());
+    match host.docker(&network_rm_args(n), None, SMALL_OUT).await {
+        Ok(o) if o.ok() || o.stderr.contains("not found") || o.stderr.contains("No such network") => {}
+        Ok(o) => {
+            tracing::warn!(mission = %n.mission, "box: the network was not removed, so its rules stay: {}", o.why());
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(mission = %n.mission, "box: the network was not removed, so its rules stay: {e}");
+            return;
         }
     }
     match host.docker(&rules_remove_args(&host.cfg, n), None, SMALL_OUT).await {
@@ -1173,14 +1461,20 @@ async fn teardown_names(host: &DockerHost, n: &Names) {
     }
 }
 
-/// Remove the container, network and chain of one mission by name (best effort, logged).
+/// Remove the container, network and chain of one mission by name (best effort, logged), once nothing else
+/// is changing that mission's box.
 pub async fn teardown_mission(host: &DockerHost, mission: &str) {
-    teardown_names(host, &names(mission)).await;
+    let n = names(mission);
+    let lock = host.mission_lock(&n.short);
+    let _life = lock.lock().await;
+    teardown_names_locked(host, &n).await;
 }
 
-/// Remove what boxes of this loom home leave on the Docker host for missions that are not in `running`
-/// (I5): containers, networks and chains. Best effort; returns the missions that were cleaned.
-pub async fn reconcile(host: &DockerHost, running: &HashSet<String>) -> Vec<String> {
+/// Remove what boxes of this loom home leave on the Docker host for missions that `keep` does not name
+/// (I5): containers, networks and chains. Best effort; returns the missions that were cleaned. `keep` is
+/// asked for each mission after that mission's lock is taken, so a mission that started in the meantime is
+/// not touched.
+pub async fn reconcile(host: &DockerHost, keep: &(dyn Fn(&str) -> bool + Sync)) -> Vec<String> {
     let home = host.home_hash();
     let mut found: BTreeSet<String> = BTreeSet::new();
     for args in [ps_args(&home), network_ls_args(&home)] {
@@ -1195,10 +1489,16 @@ pub async fn reconcile(host: &DockerHost, running: &HashSet<String>) -> Vec<Stri
     let mut cleaned = Vec::new();
     for mission in found {
         let plain = mission.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
-        if !plain || running.contains(&mission) {
+        if !plain {
             continue;
         }
-        teardown_names(host, &names(&mission)).await;
+        let n = names(&mission);
+        let lock = host.mission_lock(&n.short);
+        let _life = lock.lock().await;
+        if keep(&mission) {
+            continue;
+        }
+        teardown_names_locked(host, &n).await;
         cleaned.push(mission);
     }
     cleaned
@@ -1223,6 +1523,7 @@ pub mod fake {
 
     const SCRIPT: &str = r##"#!/bin/sh
 D="@DIR@"
+env > "$D/docker.env"; pwd -P > "$D/docker.cwd"
 entry=$(for a in "$@"; do printf '%s\n' "$a"; done; echo '----'); until mkdir "$D/log.lock" 2>/dev/null; do :; done; printf '%s\n' "$entry" >> "$D/docker.log"; rmdir "$D/log.lock"
 [ -f "$D/fail.$3" ] && { echo "boom: $3 failed" >&2; exit 1; }
 shift 2
@@ -1231,11 +1532,25 @@ case "$sub" in
   run)
     case " $* " in
       *" --entrypoint /bin/sh "*)
+        # The helper: the last two arguments are the chain and the interface. Its three scripts are told apart
+        # by their first word; the chain is a file here, so tests can see when it exists.
+        chain=""; iface=""; for a in "$@"; do chain="$iface"; iface="$a"; done
         [ -f "$D/rules.fail" ] && { echo "iptables: failed" >&2; exit 1; }
+        case "$*" in
+          *": loom-rules-check;"*)
+            [ -f "$D/chain-$chain" ] || { echo "iptables: Bad rule (does a matching rule exist in that chain?)" >&2; exit 1; }
+            exit 0;;
+          *": loom-rules-remove;"*)
+            [ -f "$D/slow.remove" ] && sleep 1
+            rm -f "$D/chain-$chain"; exit 0;;
+        esac
         case " $* " in *" --interactive "*) cat > "$D/rules.in.$$"; mv "$D/rules.in.$$" "$D/rules.in";; esac
+        touch "$D/chain-$chain"
         exit 0;;
     esac
-    name=""; prev=""; for a in "$@"; do [ "$prev" = "--name" ] && name="$a"; prev="$a"; done
+    name=""; net=""; prev=""; for a in "$@"; do [ "$prev" = "--name" ] && name="$a"; [ "$prev" = "--network" ] && net="$a"; prev="$a"; done
+    # A container that starts while the chain of its bridge is not there is a hole: note it.
+    if [ -f "$D/netif-$net" ]; then short=$(sed 's/^lb-//' "$D/netif-$net"); [ -f "$D/chain-LOOM-$short" ] || echo "$name" >> "$D/violations"; fi
     touch "$D/ctr-$name"; echo "fakeid"; exit 0;;
   rm) for a in "$@"; do last="$a"; done
       if [ -f "$D/ctr-$last" ]; then rm -f "$D/ctr-$last"; exit 0; fi
@@ -1245,10 +1560,25 @@ case "$sub" in
       echo "Error: No such object: $last" >&2; exit 1;;
   network)
     case "$1" in
-      create) for a in "$@"; do last="$a"; done
-              if [ -f "$D/net-$last" ]; then echo "network with name $last already exists" >&2; exit 1; fi
-              touch "$D/net-$last"; echo netid; exit 0;;
-      rm) rm -f "$D/net-$2"; exit 0;;
+      create) h=""; m=""; iface=""; prev=""; last=""
+              for a in "$@"; do
+                case "$prev" in
+                  --label) case "$a" in loom.home=*) h="${a#loom.home=}";; loom.mission=*) m="${a#loom.mission=}";; esac;;
+                  --opt) case "$a" in com.docker.network.bridge.name=*) iface="${a#*=}";; esac;;
+                esac
+                prev="$a"; last="$a"
+              done
+              if [ -f "$D/net-$last" ]; then echo "Error response from daemon: network with name $last already exists" >&2; exit 1; fi
+              touch "$D/net-$last"; echo "$iface" > "$D/netif-$last"
+              printf '{"Name":"%s","Driver":"bridge","EnableIPv6":false,"Labels":{"loom.home":"%s","loom.mission":"%s"},"Options":{"com.docker.network.bridge.name":"%s"},"Containers":{}}\n' "$last" "$h" "$m" "$iface" > "$D/netjson-$last"
+              echo netid; exit 0;;
+      inspect) for a in "$@"; do last="$a"; done
+              if [ -f "$D/netjson-$last" ]; then cat "$D/netjson-$last"; exit 0; fi
+              if [ -f "$D/net-$last" ]; then echo '{"Driver":"bridge","Labels":null,"Options":{},"Containers":{}}'; exit 0; fi
+              echo "Error: No such network: $last" >&2; exit 1;;
+      rm) [ -f "$D/netrm.fail" ] && { echo "Error response from daemon: error while removing network: network $2 has active endpoints" >&2; exit 1; }
+          if [ -f "$D/net-$2" ]; then rm -f "$D/net-$2" "$D/netif-$2" "$D/netjson-$2"; exit 0; fi
+          echo "Error response from daemon: network $2 not found" >&2; exit 1;;
       ls) [ -f "$D/net.txt" ] && cat "$D/net.txt"; exit 0;;
     esac;;
   ps) [ -f "$D/ps.txt" ] && cat "$D/ps.txt"; exit 0;;
@@ -1263,7 +1593,7 @@ case "$sub" in
     done
     ctr=$1; shift
     if [ ! -f "$D/ctr-$ctr" ]; then echo "Error: No such container: $ctr" >&2; exit 1; fi
-    if [ "$*" = "/bin/sh -c cat > /etc/hosts" ]; then cat > "$D/etc-hosts"; exit 0; fi
+    if [ "$*" = "/bin/sh -c /bin/cat > /etc/hosts" ]; then cat > "$D/etc-hosts"; exit 0; fi
     mkdir -p "$D/work"; cd "$D/work" || exit 1
     command -v setsid >/dev/null 2>&1 || PATH="$D/bin:$PATH"
     export PATH
@@ -1418,6 +1748,10 @@ mod tests {
             "NET_RAW",
             "--security-opt",
             "no-new-privileges",
+            "--sysctl",
+            "net.ipv6.conf.all.disable_ipv6=1",
+            "--sysctl",
+            "net.ipv6.conf.default.disable_ipv6=1",
             "--pids-limit",
             "512",
             "--memory",
@@ -1543,10 +1877,23 @@ mod tests {
             "kill -TERM -- -$(cat \"$0\")",
             "the signal is one of two fixed words"
         );
+        // R12: root runs an absolute program with a fixed PATH.
         assert_eq!(
             hosts_args(&n),
-            ["exec", "--interactive", "--user", "0", "loom-m-1", "/bin/sh", "-c", "cat > /etc/hosts"]
+            [
+                "exec",
+                "--interactive",
+                "--user",
+                "0",
+                "--env",
+                "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+                "loom-m-1",
+                "/bin/sh",
+                "-c",
+                "/bin/cat > /etc/hosts"
+            ]
         );
+        assert_eq!(network_inspect_args(&n), ["network", "inspect", "--format", "{{json .}}", "loom-m-1"]);
         assert_eq!(cp_in_args(&n), ["cp", "--archive", "-", "loom-m-1:/work"]);
         assert_eq!(cp_out_args(&n, "/work/out"), ["cp", "loom-m-1:/work/out", "-"]);
         assert_eq!(rm_args(&n), ["rm", "--force", "--volumes", "loom-m-1"]);
@@ -1727,19 +2074,38 @@ mod tests {
     #[test]
     fn i1_the_socket_lives_under_keys_and_a_long_path_is_refused() {
         let cfg = sample_cfg();
-        let host = DockerHost::new(&BoxCfg { docker_cli: "/bin/sh".into(), ..cfg.clone() }, Path::new("/home/x/.loom"))
-            .unwrap();
-        assert_eq!(host.socket(), Path::new("/home/x/.loom/keys/box.sock"));
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap().join(".loom");
+        let (search, _ssh) = fake_ssh_dir(dir.path());
+        let host = DockerHost::new_in(&BoxCfg { docker_cli: "/bin/sh".into(), ..cfg.clone() }, &home, &search).unwrap();
+        assert_eq!(host.socket(), home.join("keys/box.sock"));
         let (program, argv) = host.argv(&["ps".into()]);
         assert_eq!(program, "/bin/sh");
-        assert_eq!(argv, ["--host", "unix:///home/x/.loom/keys/box.sock", "ps"]);
+        assert_eq!(
+            argv,
+            ["--host".to_string(), format!("unix://{}", home.join("keys/box.sock").display()), "ps".to_string()]
+        );
         let long = format!("/{}", "a".repeat(120));
         let err =
-            DockerHost::new(&BoxCfg { docker_cli: "/bin/sh".into(), ..cfg.clone() }, Path::new(&long)).err().unwrap();
+            DockerHost::new_in(&BoxCfg { docker_cli: "/bin/sh".into(), ..cfg.clone() }, Path::new(&long), &search)
+                .err()
+                .unwrap();
         assert!(err.contains("longer than"), "{err}");
-        let err =
-            DockerHost::new(&BoxCfg { docker_cli: "no-such-docker-cli".into(), ..cfg }, Path::new("/h")).err().unwrap();
+        let err = DockerHost::new_in(&BoxCfg { docker_cli: "no-such-docker-cli".into(), ..cfg }, &home, &search)
+            .err()
+            .unwrap();
         assert!(err.contains("not found on the daemon's PATH"), "{err}");
+    }
+
+    /// A directory with an executable `ssh` in it (that does nothing), as a `PATH` value, and its path.
+    fn fake_ssh_dir(base: &Path) -> (std::ffi::OsString, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = base.canonicalize().unwrap().join("ssh-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let ssh = bin.join("ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (bin.into_os_string(), ssh)
     }
 
     fn source(g: &[&str]) -> EgressSource {
@@ -1855,8 +2221,7 @@ mod tests {
         }
         std::fs::write(f.dir.join("ps.txt"), "m-live\nm-dead\nm-bad; x\n").unwrap();
         std::fs::write(f.dir.join("net.txt"), "m-live\nm-dead\nm-orphan-net\n").unwrap();
-        let running: HashSet<String> = ["m-live".to_string()].into_iter().collect();
-        let cleaned = reconcile(&host, &running).await;
+        let cleaned = reconcile(&host, &|m| m == "m-live").await;
         assert_eq!(cleaned, ["m-dead", "m-orphan-net"]);
         assert!(f.running("loom-m-live"), "a running mission keeps its box");
         assert!(!f.running("loom-m-dead") && !f.running("loom-m-orphan-net"));
@@ -1889,7 +2254,8 @@ mod tests {
             std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let cfg = BoxCfg { docker_cli: "/bin/sh".into(), ..sample_cfg() };
-        let host = DockerHost::new(&cfg, &root).unwrap().with_ssh_program(&ssh.display().to_string());
+        let host = DockerHost::new_in(&cfg, &root, root.as_os_str()).unwrap();
+        assert_eq!(host.ssh_program(), ssh.display().to_string(), "ssh is resolved to an absolute path at start");
         assert!(std::fs::read_to_string(root.join("ssh.log")).is_err(), "nothing runs before the first use");
         // A stale socket from an earlier daemon is removed before ssh starts (the fake recreates it).
         std::fs::write(root.join("keys/box.sock"), "stale").unwrap();
@@ -1914,7 +2280,7 @@ mod tests {
 
     // ---- a command in the box, through the job machinery ----------------------------------------
 
-    use crate::bash::{run_launched, Launch};
+    use crate::bash::run_launched;
     use crate::testutil::env_with;
     use loom_core::config::{SandboxCfg, SandboxMode, ToolsCfg};
     use loom_core::event::{ToolStatus, META_JOB};
@@ -1957,7 +2323,7 @@ mod tests {
         b.ready().await.unwrap();
         let e = env_with(ToolsCfg::default(), SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() });
         let script = "echo \"hello $((1+2))\"; echo '; docker ps; '; echo --privileged";
-        let launch = Launch { launcher: b.launcher("call-run", None, script).unwrap(), cwd: e.ctx.tmp_dir.clone() };
+        let launch = b.launch("call-run", None, script).unwrap();
         let out = run_launched(&e.ctx, &args(json!({"command": script})), &launch).await;
         assert_eq!(out.status, ToolStatus::Ok, "{out:?}");
         assert_eq!(out.outcome, "exit 0");
@@ -1975,7 +2341,7 @@ mod tests {
         );
         assert_eq!(f.calls().iter().filter(|c| c.iter().any(|a| a == script)).count(), 1);
         // The exit status of the command in the box is the job's.
-        let launch = Launch { launcher: b.launcher("call-exit", None, "exit 7").unwrap(), cwd: e.ctx.tmp_dir.clone() };
+        let launch = b.launch("call-exit", None, "exit 7").unwrap();
         let out = run_launched(&e.ctx, &args(json!({"command": "exit 7"})), &launch).await;
         assert_eq!((out.status, out.outcome.as_str()), (ToolStatus::Error, "exit 7"));
     }
@@ -1997,7 +2363,7 @@ mod tests {
         ] {
             let call = call.as_str();
             let _ = std::fs::remove_file(pid_file(call));
-            let launch = Launch { launcher: b.launcher(call, None, script).unwrap(), cwd: e.ctx.tmp_dir.clone() };
+            let launch = b.launch(call, None, script).unwrap();
             let started = run_launched(&e.ctx, &args(json!({"command": script, "background": true})), &launch).await;
             let job = started.meta.get(META_JOB).and_then(Value::as_str).unwrap().to_string();
             let pgid = read_pid(&pid_file(call)).await;
@@ -2036,10 +2402,444 @@ mod tests {
         let script = "sleep 300";
         let call = format!("timeout-test-{}", std::process::id());
         let _ = std::fs::remove_file(pid_file(&call));
-        let launch = Launch { launcher: b.launcher(&call, None, script).unwrap(), cwd: e.ctx.tmp_dir.clone() };
+        let launch = b.launch(&call, None, script).unwrap();
         let out = run_launched(&e.ctx, &args(json!({"command": script, "timeout_s": 1})), &launch).await;
         assert_eq!(out.status, ToolStatus::Timeout, "{out:?}");
         let pgid = read_pid(&pid_file(&call)).await;
         assert!(gone(pgid).await, "the command in the container was stopped with the call");
+    }
+
+    // ---- R1 to R5, R9: the lifecycle lock, the static chain, the checks, the environment ----------
+
+    /// What one logged docker call was: `apply`, `check` or `remove` for the helper, `container` for the
+    /// box's own `docker run`, otherwise the subcommand.
+    fn kind(call: &[String]) -> String {
+        if let Some(script) = call.iter().find(|a| a.starts_with(": loom-rules-")) {
+            return script.trim_start_matches(": loom-rules-").split(';').next().unwrap_or_default().to_string();
+        }
+        match call.get(2).map(String::as_str) {
+            Some("run") => "container".to_string(),
+            other => other.unwrap_or_default().to_string(),
+        }
+    }
+
+    fn kinds_since(f: &FakeDocker, mark: usize) -> Vec<String> {
+        f.calls()[mark..].iter().map(|c| kind(c)).collect()
+    }
+
+    fn net_ops(f: &FakeDocker) -> Vec<String> {
+        f.calls()
+            .iter()
+            .filter(|c| c.get(2).is_some_and(|s| s == "network"))
+            .filter_map(|c| c.get(3).cloned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn r1_a_teardown_racing_a_recreate_never_runs_the_container_without_its_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let host = f.host();
+        let old = MissionBox::new(host.clone(), "m-1", source(&["203.0.113.7"]));
+        old.ready().await.unwrap();
+        let chain_file = f.dir.join(format!("chain-{}", old.names().chain));
+        assert!(chain_file.exists());
+        // Removing the chain takes a second on the Docker host.
+        std::fs::write(f.dir.join("slow.remove"), "").unwrap();
+        let mark = f.calls().len();
+        let teardown = tokio::spawn({
+            let old = old.clone();
+            async move { old.teardown().await }
+        });
+        for _ in 0..300 {
+            if !f.running("loom-m-1") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!f.running("loom-m-1"), "the teardown has removed the container and is on its way to the chain");
+        // Another handle for the same mission (the runtime makes one after a stop) wants the box now.
+        let fresh = MissionBox::new(host.clone(), "m-1", source(&["203.0.113.7"]));
+        fresh.ready().await.unwrap();
+        teardown.await.unwrap();
+        assert!(f.running("loom-m-1"), "the box that was asked for is there");
+        assert!(chain_file.exists(), "and its chain is: the teardown's late removal did not take it away");
+        assert!(!f.dir.join("violations").exists(), "the container never started without its chain");
+        let kinds = kinds_since(&f, mark);
+        let at = |k: &str| kinds.iter().position(|x| x == k).unwrap_or(usize::MAX);
+        assert!(at("remove") < at("apply") && at("apply") < at("container"), "{kinds:?}");
+    }
+
+    #[tokio::test]
+    async fn r1_reconcile_and_teardown_by_name_take_the_missions_lock_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let host = f.host();
+        let b = MissionBox::new(host.clone(), "m-1", source(&[]));
+        b.ready().await.unwrap();
+        std::fs::write(f.dir.join("ps.txt"), "m-1\n").unwrap();
+        // While the mission's lock is held (here by a stand-in for a creation), neither one gets to touch it.
+        let lock = host.mission_lock(&b.names().short);
+        let guard = lock.lock().await;
+        let by_name = tokio::spawn({
+            let host = host.clone();
+            async move { teardown_mission(&host, "m-1").await }
+        });
+        let swept = tokio::spawn({
+            let host = host.clone();
+            async move { reconcile(&host, &|_| false).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(f.running("loom-m-1"), "nothing was removed while the lock was held");
+        assert!(!by_name.is_finished() && !swept.is_finished());
+        drop(guard);
+        by_name.await.unwrap();
+        let cleaned = swept.await.unwrap();
+        assert!(!f.running("loom-m-1"));
+        // The sweep asked the keep rule only after it had the lock, and a mission it keeps is left alone.
+        assert_eq!(cleaned, ["m-1"]);
+        let b2 = MissionBox::new(host.clone(), "m-1", source(&[]));
+        b2.ready().await.unwrap();
+        assert!(reconcile(&host, &|m| m == "m-1").await.is_empty());
+        assert!(f.running("loom-m-1"));
+    }
+
+    #[tokio::test]
+    async fn r1_the_chain_stays_until_the_container_and_the_network_are_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let host = f.host();
+        let b = MissionBox::new(host.clone(), "m-1", source(&[]));
+        b.ready().await.unwrap();
+        let chain_file = f.dir.join(format!("chain-{}", b.names().chain));
+        // The network cannot be removed: the container is gone but the chain stays, with its jump.
+        std::fs::write(f.dir.join("netrm.fail"), "").unwrap();
+        let mark = f.calls().len();
+        b.teardown().await;
+        assert_eq!(kinds_since(&f, mark), ["rm", "network"], "no helper run that removes the chain");
+        assert!(chain_file.exists() && !f.running("loom-m-1"));
+        // The network is gone by the time the next try is made ("not found" counts as gone): now the chain goes.
+        std::fs::remove_file(f.dir.join("netrm.fail")).unwrap();
+        std::fs::remove_file(f.dir.join("net-loom-m-1")).unwrap();
+        let mark = f.calls().len();
+        teardown_mission(&host, "m-1").await;
+        assert_eq!(kinds_since(&f, mark), ["rm", "network", "remove"]);
+        assert!(!chain_file.exists());
+    }
+
+    /// Stands in for `iptables`, `ip6tables` and `iptables-restore`: rules and chains are lines in files.
+    const IPTABLES_STUB: &str = r##"#!/bin/sh
+S="@S@"
+T=$(basename "$0")
+if [ "$T" = iptables-restore ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      :*) c=${line#:}; c=${c%% *}
+          if grep -qxF "$c" "$S/iptables.chains"; then grep -v "^$c|" "$S/iptables.rules" > "$S/t"; mv "$S/t" "$S/iptables.rules"; else echo "$c" >> "$S/iptables.chains"; fi;;
+      -A*) set -- $line; shift; c=$1; shift; echo "$c|$*" >> "$S/iptables.rules";;
+    esac
+  done
+  exit 0
+fi
+F="$S/$T.rules"; C="$S/$T.chains"
+[ "$1" = "-w" ] && shift 2
+op=$1; c=$2; shift 2
+has() { grep -qxF "$1" "$C"; }
+case "$op" in
+  -N) has "$c" && exit 1; echo "$c" >> "$C"; exit 0;;
+  -C) grep -qxF "$c|$*" "$F"; exit $?;;
+  -A) has "$c" || exit 1; echo "$c|$*" >> "$F"; exit 0;;
+  -I) case "$1" in [0-9]*) shift;; esac; has "$c" || exit 1; { echo "$c|$*"; cat "$F"; } > "$S/t"; mv "$S/t" "$F"; exit 0;;
+  -D) grep -qxF "$c|$*" "$F" || exit 1; grep -vxF "$c|$*" "$F" > "$S/t"; mv "$S/t" "$F"; exit 0;;
+  -F) has "$c" || exit 1; grep -v "^$c|" "$F" > "$S/t"; mv "$S/t" "$F"; exit 0;;
+  -X) has "$c" || exit 1; grep -q "^$c|" "$F" && exit 1; grep -vxF "$c" "$C" > "$S/t"; mv "$S/t" "$C"; exit 0;;
+esac
+exit 2
+"##;
+
+    struct Tables {
+        dir: PathBuf,
+        _keep: tempfile::TempDir,
+    }
+
+    impl Tables {
+        fn new() -> Tables {
+            use std::os::unix::fs::PermissionsExt;
+            let keep = tempfile::tempdir().unwrap();
+            let dir = keep.path().canonicalize().unwrap();
+            for name in ["iptables", "ip6tables", "iptables-restore"] {
+                let path = dir.join(name);
+                std::fs::write(&path, IPTABLES_STUB.replace("@S@", &dir.display().to_string())).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            std::fs::write(dir.join("iptables.chains"), "DOCKER-USER\nINPUT\nFORWARD\n").unwrap();
+            std::fs::write(dir.join("ip6tables.chains"), "INPUT\nFORWARD\n").unwrap();
+            std::fs::write(dir.join("iptables.rules"), "").unwrap();
+            std::fs::write(dir.join("ip6tables.rules"), "").unwrap();
+            Tables { dir, _keep: keep }
+        }
+
+        /// Run one of the helper's scripts the way the helper container does, with the stub tools.
+        fn run(&self, script: &str, n: &Names, stdin: &str) -> bool {
+            use std::io::Write;
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .arg("_")
+                .arg(&n.chain)
+                .arg(&n.iface)
+                .env_clear()
+                .env("PATH", format!("{}:/usr/bin:/bin", self.dir.display()))
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+            child.wait().unwrap().success()
+        }
+
+        /// The rules of one chain of one table, top first.
+        fn chain(&self, table: &str, chain: &str) -> Vec<String> {
+            let text = std::fs::read_to_string(self.dir.join(format!("{table}.rules"))).unwrap();
+            let prefix = format!("{chain}|");
+            text.lines().filter_map(|l| l.strip_prefix(&prefix)).map(str::to_string).collect()
+        }
+    }
+
+    #[test]
+    fn r1_r2_the_scripts_keep_loom_all_with_its_final_drop_and_drop_ipv6() {
+        let t = Tables::new();
+        let (m1, m2) = (names("m-1"), names("m-2"));
+        let allowed: BTreeSet<Allowed> =
+            [Allowed { ip: "203.0.113.7".parse().unwrap(), port: None }].into_iter().collect();
+        let to_all = |n: &Names| format!("-i {} -j {}", n.iface, n.chain);
+        // One mission: its chain, its jump above LOOM-ALL's DROP, the static jumps, the IPv6 drops.
+        assert!(t.run(RULES_APPLY, &m1, &rules_text(&m1, &allowed)));
+        assert_eq!(t.chain("iptables", ALL_CHAIN), [to_all(&m1), "-j DROP".to_string()]);
+        assert_eq!(t.chain("iptables", "DOCKER-USER"), ["-i lb-+ -j LOOM-ALL"]);
+        assert_eq!(t.chain("iptables", "INPUT"), ["-i lb-+ -j LOOM-ALL"]);
+        let own = t.chain("iptables", &m1.chain);
+        assert!(own.first().unwrap().contains("ESTABLISHED,RELATED") && own.last().unwrap() == "-j DROP", "{own:?}");
+        assert!(own.iter().any(|l| l.contains("-d 203.0.113.7/32 -p tcp -j ACCEPT")), "{own:?}");
+        for c in ["INPUT", "FORWARD"] {
+            assert_eq!(t.chain("ip6tables", c), [format!("-i {} -j DROP", m1.iface)], "{c}");
+        }
+        // Again: nothing doubles. A second mission goes above the DROP, not below it.
+        assert!(t.run(RULES_APPLY, &m1, &rules_text(&m1, &allowed)));
+        assert_eq!(t.chain("iptables", ALL_CHAIN), [to_all(&m1), "-j DROP".to_string()]);
+        assert_eq!(t.chain("iptables", "DOCKER-USER").len(), 1);
+        assert!(t.run(RULES_APPLY, &m2, &rules_text(&m2, &BTreeSet::new())));
+        assert_eq!(t.chain("iptables", ALL_CHAIN), [to_all(&m2), to_all(&m1), "-j DROP".to_string()]);
+        assert_eq!(t.chain("iptables", "INPUT").len(), 1);
+        assert_eq!(t.chain("ip6tables", "FORWARD").len(), 2);
+        // The check passes while everything is there, and fails when the jump or an IPv6 drop is gone.
+        assert!(t.run(RULES_CHECK, &m1, ""));
+        let rules = std::fs::read_to_string(t.dir.join("ip6tables.rules")).unwrap();
+        let without = rules.lines().filter(|l| *l != format!("FORWARD|-i {} -j DROP", m1.iface)).collect::<Vec<_>>();
+        std::fs::write(t.dir.join("ip6tables.rules"), without.join("\n") + "\n").unwrap();
+        assert!(!t.run(RULES_CHECK, &m1, ""), "an IPv6 drop is missing");
+        assert!(t.run(RULES_APPLY, &m1, &rules_text(&m1, &allowed)) && t.run(RULES_CHECK, &m1, ""));
+        // Removing one mission removes its own jump, chain and IPv6 drops, and nothing of LOOM-ALL's.
+        assert!(t.run(RULES_REMOVE, &m1, ""));
+        assert_eq!(t.chain("iptables", ALL_CHAIN), [to_all(&m2), "-j DROP".to_string()]);
+        assert!(t.chain("iptables", &m1.chain).is_empty());
+        assert!(!std::fs::read_to_string(t.dir.join("iptables.chains")).unwrap().contains(&m1.chain));
+        assert_eq!(t.chain("ip6tables", "INPUT"), [format!("-i {} -j DROP", m2.iface)]);
+        assert_eq!(t.chain("iptables", "DOCKER-USER"), ["-i lb-+ -j LOOM-ALL"], "the static jumps stay");
+        assert!(!t.run(RULES_CHECK, &m1, ""));
+        // The last mission leaves LOOM-ALL with its DROP alone: a bridge with no chain is dropped.
+        assert!(t.run(RULES_REMOVE, &m2, ""));
+        assert_eq!(t.chain("iptables", ALL_CHAIN), ["-j DROP"]);
+        assert_eq!(t.chain("iptables", "INPUT"), ["-i lb-+ -j LOOM-ALL"]);
+        assert!(t.chain("ip6tables", "INPUT").is_empty() && t.chain("ip6tables", "FORWARD").is_empty());
+        // The scripts say nothing that touches the static chain's end: no flush, no delete of LOOM-ALL.
+        for script in [RULES_APPLY, RULES_REMOVE] {
+            assert!(
+                !script.contains("-F LOOM-ALL")
+                    && !script.contains("-X LOOM-ALL")
+                    && !script.contains("-D LOOM-ALL -j")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn r4_a_running_box_has_its_rules_checked_again_and_put_back_or_the_command_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let host = f.host();
+        let b = MissionBox::new(host.clone(), "m-1", source(&["203.0.113.7"]));
+        b.ready().await.unwrap();
+        let chain_file = f.dir.join(format!("chain-{}", b.names().chain));
+        // Inside the interval nothing is looked at.
+        let mark = f.calls().len();
+        b.ready().await.unwrap();
+        assert_eq!(kinds_since(&f, mark), ["inspect"]);
+        // Once the interval is over the rules are checked; present, nothing else happens.
+        host.set_recheck(Duration::ZERO);
+        let mark = f.calls().len();
+        b.ready().await.unwrap();
+        assert_eq!(kinds_since(&f, mark), ["inspect", "check"]);
+        // The chain went missing: it is installed again before the command may run.
+        std::fs::remove_file(&chain_file).unwrap();
+        let mark = f.calls().len();
+        b.ready().await.unwrap();
+        assert_eq!(kinds_since(&f, mark), ["inspect", "check", "apply"]);
+        assert!(chain_file.exists() && f.running("loom-m-1"));
+        assert!(std::fs::read_to_string(f.dir.join("rules.in")).unwrap().contains("-d 203.0.113.7/32"));
+        // Missing and not to be put back: the command is refused and the box is not left running.
+        std::fs::remove_file(&chain_file).unwrap();
+        std::fs::write(f.dir.join("rules.fail"), "").unwrap();
+        let err = b.ready().await.unwrap_err();
+        assert!(err.contains("not all in place") && err.contains("command was not run"), "{err}");
+        assert!(!f.running("loom-m-1"), "fail closed: no container without its rules");
+    }
+
+    #[tokio::test]
+    async fn r5_an_existing_network_is_adopted_only_when_it_is_the_missions_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let host = f.host();
+        // Our own network left by an earlier box: adopted after an inspect, not removed.
+        let b = MissionBox::new(host.clone(), "m-1", source(&[]));
+        b.ready().await.unwrap();
+        b.reset().await.unwrap();
+        assert_eq!(net_ops(&f), ["create", "create", "inspect"], "{:?}", net_ops(&f));
+        assert!(f.running("loom-m-1"));
+        // A foreign network of that name (no labels), or one with the labels but another bridge: replaced.
+        let home = host.home_hash();
+        let foreign = [
+            r#"{"Driver":"bridge","EnableIPv6":false,"Labels":{"x":"y"},"Options":{},"Containers":{}}"#.to_string(),
+            format!(
+                r#"{{"Driver":"bridge","EnableIPv6":false,"Labels":{{"loom.home":"{home}","loom.mission":"m-2"}},"Options":{{"com.docker.network.bridge.name":"docker0"}},"Containers":{{}}}}"#
+            ),
+        ];
+        for (i, json) in foreign.iter().enumerate() {
+            let mission = format!("m-{}", i + 2);
+            let n = names(&mission);
+            std::fs::write(f.dir.join(format!("net-{}", n.network)), "").unwrap();
+            std::fs::write(f.dir.join(format!("netjson-{}", n.network)), json).unwrap();
+            let mark = net_ops(&f).len();
+            let b = MissionBox::new(host.clone(), &mission, source(&[]));
+            b.ready().await.unwrap();
+            assert_eq!(net_ops(&f)[mark..], ["create", "inspect", "rm", "create"], "{mission}");
+            let made = std::fs::read_to_string(f.dir.join(format!("netjson-{}", n.network))).unwrap();
+            assert!(made.contains(&format!("\"loom.mission\":\"{mission}\"")) && made.contains(&n.iface), "{made}");
+        }
+        // A foreign network with a container attached is left alone, and no box is made.
+        let n = names("m-9");
+        std::fs::write(f.dir.join(format!("net-{}", n.network)), "").unwrap();
+        std::fs::write(
+            f.dir.join(format!("netjson-{}", n.network)),
+            r#"{"Driver":"bridge","EnableIPv6":false,"Labels":null,"Options":{},"Containers":{"abc":{}}}"#,
+        )
+        .unwrap();
+        let mark = net_ops(&f).len();
+        let b = MissionBox::new(host.clone(), "m-9", source(&[]));
+        let err = b.ready().await.unwrap_err();
+        assert!(err.contains("left alone") && err.contains("1 container"), "{err}");
+        assert_eq!(net_ops(&f)[mark..], ["create", "inspect"]);
+        assert!(!f.running(&n.container));
+    }
+
+    #[test]
+    fn r5_inspect_judges_driver_ipv6_labels_and_the_bridge_name() {
+        let n = names("m-1");
+        let json = |driver: &str, v6: bool, home: &str, mission: &str, bridge: &str, containers: &str| {
+            format!(
+                r#"{{"Driver":"{driver}","EnableIPv6":{v6},"Labels":{{"loom.home":"{home}","loom.mission":"{mission}"}},"Options":{{"com.docker.network.bridge.name":"{bridge}"}},"Containers":{containers}}}"#
+            )
+        };
+        let ours = json("bridge", false, "H", "m-1", &n.iface, "{}");
+        assert_eq!(inspect_network(ours.as_bytes(), &n, "H").unwrap(), Found::Ours);
+        for (bad, why) in [
+            (json("overlay", false, "H", "m-1", &n.iface, "{}"), "not a bridge"),
+            (json("bridge", true, "H", "m-1", &n.iface, "{}"), "IPv6"),
+            (json("bridge", false, "other", "m-1", &n.iface, "{}"), "loom home"),
+            (json("bridge", false, "H", "m-2", &n.iface, "{}"), "this mission"),
+            (json("bridge", false, "H", "m-1", "br-x", r#"{"a":{},"b":{}}"#), "bridge interface"),
+        ] {
+            match inspect_network(bad.as_bytes(), &n, "H").unwrap() {
+                Found::Foreign { why: w, .. } => assert!(w.contains(why), "{w}"),
+                Found::Ours => panic!("{bad} was taken as ours"),
+            }
+        }
+        assert!(inspect_network(b"not json", &n, "H").is_err());
+    }
+
+    #[test]
+    fn r9_programs_are_absolute_from_the_start_and_the_private_directories_exist() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap().join("home");
+        let (search, ssh) = fake_ssh_dir(dir.path());
+        let cfg = BoxCfg { docker_cli: "/bin/sh".into(), ..sample_cfg() };
+        let host = DockerHost::new_in(&cfg, &home, &search).unwrap();
+        assert_eq!(host.ssh_program(), ssh.display().to_string());
+        assert_eq!(host.cli(), Path::new("/bin/sh"));
+        for sub in ["box-docker", "box-run"] {
+            let mode = std::fs::metadata(home.join("keys").join(sub)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{sub}");
+            assert_eq!(std::fs::read_dir(home.join("keys").join(sub)).unwrap().count(), 0, "{sub} is empty");
+        }
+        // A bare name is looked for once, in the search path; a relative path is never taken.
+        let empty = tempfile::tempdir().unwrap();
+        let err = DockerHost::new_in(&cfg, &home, empty.path().as_os_str()).err().unwrap();
+        assert!(err.contains("ssh") && err.contains("not found on the daemon's PATH"), "{err}");
+        let err = DockerHost::new_in(&BoxCfg { docker_cli: "bin/docker".into(), ..cfg.clone() }, &home, &search)
+            .err()
+            .unwrap();
+        assert!(err.contains("relative path"), "{err}");
+        let relative_dir = DockerHost::new_in(&cfg, &home, std::ffi::OsStr::new("relative/dir")).err().unwrap();
+        assert!(relative_dir.contains("not found"), "a relative PATH entry is not searched: {relative_dir}");
+        // A local socket needs no ssh at all.
+        let local = BoxCfg { docker_cli: "/bin/sh".into(), docker_socket: "/s.sock".into(), ..BoxCfg::default() };
+        assert!(DockerHost::new_in(&local, &home, empty.path().as_os_str()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn r9_the_docker_client_gets_exactly_a_fixed_environment_and_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let b = MissionBox::new(f.host(), "m-1", source(&[]));
+        b.ready().await.unwrap();
+        let e = env_with(ToolsCfg::default(), SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() });
+        // A command through the job machinery: the launcher process and the docker client under it.
+        let launch = b.launch("call-env", None, "true").unwrap();
+        assert_eq!(launch.cwd, f.dir.join("keys/box-run"), "not the session's scratch directory");
+        assert_ne!(launch.cwd, e.ctx.tmp_dir);
+        assert_eq!(launch.env, f.host().docker_env());
+        let out = run_launched(&e.ctx, &args(json!({"command": "true"})), &launch).await;
+        assert_eq!(out.status, ToolStatus::Ok, "{out:?}");
+        let text = std::fs::read_to_string(f.dir.join("docker.env")).unwrap();
+        let seen: BTreeMap<String, String> = text
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .filter(|(k, _)| !matches!(*k, "PWD" | "OLDPWD" | "SHLVL" | "_"))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let keys = f.dir.join("keys");
+        let expected: BTreeMap<String, String> = [
+            ("PATH", SYSTEM_PATH.to_string()),
+            ("HOME", keys.join("box-docker").display().to_string()),
+            ("DOCKER_CONFIG", keys.join("box-docker").display().to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(seen, expected, "the environment of the docker client");
+        assert!(SYSTEM_PATH.split(':').all(|d| d.starts_with('/')), "only absolute directories");
+        assert_eq!(
+            std::fs::read_to_string(f.dir.join("docker.cwd")).unwrap().trim(),
+            keys.join("box-run").display().to_string()
+        );
+        assert_eq!(std::fs::metadata(keys.join("box-docker")).unwrap().permissions().mode() & 0o777, 0o700);
+        // The docker calls the daemon makes itself (not through a job) have the same environment.
+        b.teardown().await;
+        let text = std::fs::read_to_string(f.dir.join("docker.env")).unwrap();
+        assert!(text.lines().any(|l| l == format!("DOCKER_CONFIG={}", keys.join("box-docker").display())), "{text}");
+        assert!(
+            !text.lines().any(|l| l.starts_with("LOOM") || l.starts_with("RUST") || l.starts_with("CARGO")),
+            "{text}"
+        );
     }
 }

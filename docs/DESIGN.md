@@ -1152,16 +1152,23 @@ file is the specification; the invariants are:
 3. *Pinned images*: `name@sha256:...` or `sha256:...`.
 4. *Egress*: a bridge per mission without IPv6, DNS at an unroutable address, rules in a chain `LOOM-<id>` on
    the Docker host installed by `helper_image` (`--network host --cap-add NET_ADMIN`), from the exact granted
-   hosts and IPs after `Policy::check_addr`; wildcards are not applied; container after rules.
+   hosts and IPs after `Policy::check_addr`; wildcards are not applied; container after rules. A static
+   chain `LOOM-ALL` (jumped to from `DOCKER-USER` and `INPUT` for `lb-+`, one jump per mission, final `DROP`)
+   drops a bridge that has no chain of its own; IPv6 is off in the container and dropped on the host; the
+   rules of a running box are re-checked about once a minute.
 5. *Grants*: `grant_scope` and `release` re-apply the rules; stop, archive and the end of a mission tear the
-   box down (container, network, chain); a start removes leftovers of missions that are not running.
+   box down (container, network, chain) and keep it down until the lead is resumed; a start removes
+   leftovers of missions that are not running. Every change of one mission's box (create, reset, re-rule,
+   teardown, a sweep of leftovers) takes the same per-mission lock, and the chain goes last, only after the
+   container and the network are gone.
 6. *Files in*: only regular files the agent could read, no `.loom`/`.git`, no links, size limits.
 7. *Files out*: `boxfs::extract`, regular files and directories only, checked before writing, written by
    `fstools::write_file_checked`, the `write` tool's own path.
 
 The box tools are `Exec` (`box_exec`, `box_reset`) and `Write` (`box_get`) calls; a job started by `box_exec`
 is an ordinary job, and killing it signals the process group in the container through `docker exec`
-(`proc::RemoteStop`). Not done: a box for an agent that has its own workspace copy; wildcard grants; IPv6.
+(`proc::RemoteStop`). Not done: a box for an agent that has its own workspace copy; wildcard grants; IPv6;
+a remote stop for a box job adopted after a daemon restart (its record does not keep one).
 
 ## 12. Daemon API (`loom-daemon`)
 

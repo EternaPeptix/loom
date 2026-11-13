@@ -50,10 +50,11 @@
 //!
 //! ## `run_launched`
 //! `box_exec` runs commands in a container through the same procedure: `run_launched(ctx, args, launch)`
-//! is steps 1 to 6 with the differences that `launch` is a [`Launch`] (a `proc::Launcher` built by loom and
-//! the directory the local launcher starts in). `proc::spawn_launched` is used instead of `proc::spawn`;
-//! `args.cwd` is not read (the launcher carries the directory in the container); the launcher's environment
-//! is `PATH` and `HOME` of this process only (neither the session's environment nor the sandbox's); and the
+//! is steps 1 to 6 with the differences that `launch` is a [`Launch`] (a `proc::Launcher` built by loom, the
+//! directory the local launcher starts in and its whole environment). `proc::spawn_launched` is used instead
+//! of `proc::spawn`; `args.cwd` is not read (the launcher carries the directory in the container); the
+//! launcher's environment is the map in `launch.env` and nothing else (neither this process's, nor the
+//! session's, nor the sandbox's); and the
 //! `sandboxed:` reminder is not added. Jobs, timeouts, `wake_on`, output handles and `job_kill` are the
 //! session's own, and killing one runs the launcher's `remote_stop`.
 //!
@@ -403,8 +404,11 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
 pub struct Launch {
     /// What `proc::spawn_launched` runs.
     pub launcher: proc::Launcher,
-    /// The directory the local launcher process starts in (nothing the command sees).
+    /// The directory the local launcher process starts in (nothing the command sees): a directory of the
+    /// daemon's own, never one the agent can write to.
     pub cwd: std::path::PathBuf,
+    /// The whole environment of the launcher process (and so of the program it runs).
+    pub env: BTreeMap<String, String>,
 }
 
 /// The `bash` tool's procedure for a command that runs through a launcher built by loom instead of
@@ -412,15 +416,10 @@ pub struct Launch {
 /// limit and its promotion to a job, the output limit, cancellation, the group settle window and the
 /// result format are those of `bash`, and the job is an ordinary job of the session. What differs:
 /// `cwd` of `args` is ignored (the launcher carries the directory), the launcher's environment is
-/// only `PATH` and `HOME` (never the session's, never the agent's), and the sandbox reminder is not
+/// the one `launch` carries (never the session's, never the agent's), and the sandbox reminder is not
 /// added to a failure.
 pub async fn run_launched(ctx: &ToolCtx, args: &Map<String, Value>, launch: &Launch) -> ToolOutput {
     run_command(ctx, args, Some(launch)).await
-}
-
-/// `PATH` and `HOME` of this process: all the environment a launcher program gets.
-fn launcher_env() -> BTreeMap<String, String> {
-    ["PATH", "HOME"].iter().filter_map(|k| Some((k.to_string(), std::env::var(k).ok()?))).collect()
 }
 
 async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&Launch>) -> ToolOutput {
@@ -462,7 +461,10 @@ async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&L
         Ok(a) => a,
         Err(e) => return ToolOutput::error(format!("Nothing was run: the harness could not prepare the output files for the command ({e}). Try the call again.")),
     };
-    let env = if launch.is_some() { launcher_env() } else { command_env(ctx) };
+    let env = match launch {
+        Some(launch) => launch.env.clone(),
+        None => command_env(ctx),
+    };
     let spec = Spawn { script: command.to_string(), cwd, env, out_path, exit_path };
     let started = Instant::now();
     let sandboxed = launch.is_none();

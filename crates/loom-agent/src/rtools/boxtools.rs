@@ -54,6 +54,8 @@ use std::sync::Arc;
 pub const NO_BOX: &str = "No box is configured. The operator sets [box] in config.toml.";
 /// What `box_exec` and the others answer in a session that works in its own copy of the workspace.
 pub const BOX_IN_COPY: &str = "box_exec is not available in an agent copy yet; work in the shared workspace.";
+/// What the tools answer after the mission was stopped, ended or archived, until it is resumed.
+pub const BOX_CLOSED: &str = "The box of this mission was removed when the mission was stopped. It comes back when the operator resumes the mission.";
 
 /// Most files `box_get` lists in its result.
 const LISTED: usize = 20;
@@ -97,7 +99,7 @@ impl Tool for BoxExec {
             Err(e) => return ToolOutput::error(e),
         };
         let cwd = args.get("cwd").and_then(Value::as_str);
-        let launcher = match b.launcher(ctx.call_id.as_str(), cwd, command) {
+        let launch = match b.launch(ctx.call_id.as_str(), cwd, command) {
             Ok(l) => l,
             Err(e) => return ToolOutput::error(e),
         };
@@ -112,7 +114,6 @@ impl Tool for BoxExec {
                 ))
             }
         };
-        let launch = loom_tools::bash::Launch { launcher, cwd: ctx.tmp_dir.clone() };
         let mut out = loom_tools::bash::run_launched(ctx, args, &launch).await;
         out = with_box(out, &b);
         if pushed.files > 0 {
@@ -128,16 +129,28 @@ impl Tool for BoxExec {
     }
 }
 
-/// The path in the container: relative paths start at `/work`; a trailing `/` or `/.` is dropped.
+/// A path of `box_get` (`which` names the parameter) with a `.` or `..` component is refused: the box's own
+/// path rules and the workspace's are not to be played against each other.
+fn plain_components(which: &str, given: &str) -> Result<(), String> {
+    match given.split('/').find(|part| matches!(*part, "." | "..")) {
+        Some(part) => Err(format!(
+            "`{which}` contains a `{part}` component ({given}). Give a path without `.` and `..`: absolute, or relative to {}.",
+            if which == "path" { "/work in the box" } else { "the workspace" }
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The path in the container: relative paths start at `/work`; a trailing `/` is dropped.
 fn container_path(given: &str) -> Result<String, String> {
     let g = given.trim();
     if g.is_empty() || g.contains('\0') || g.chars().any(char::is_control) {
         return Err("Give the path of a file or directory in the box, absolute or relative to /work.".to_string());
     }
+    plain_components("path", g)?;
     let mut p = if g.starts_with('/') { g.to_string() } else { format!("{}/{g}", loom_tools::boxctl::WORK) };
-    while p.len() > 1 && (p.ends_with('/') || p.ends_with("/.")) {
-        let cut = if p.ends_with("/.") { 2 } else { 1 };
-        p.truncate(p.len() - cut);
+    while p.len() > 1 && p.ends_with('/') {
+        p.truncate(p.len() - 1);
     }
     if p == "/" || p.is_empty() {
         return Err("Name a file or directory below `/`; the whole box root cannot be fetched.".to_string());
@@ -175,7 +188,12 @@ impl Tool for BoxGet {
         };
         let name = path.rsplit('/').next().unwrap_or_default().to_string();
         let to = match args.get("to").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) {
-            Some(t) => ctx.sandbox.resolve(t),
+            Some(t) => {
+                if let Err(e) = plain_components("to", t) {
+                    return ToolOutput::error(e);
+                }
+                ctx.sandbox.resolve(t)
+            }
             None => ctx.workspace.join(&name),
         };
         if !b.running().await {
@@ -425,12 +443,40 @@ mod tests {
         assert!(r.text.contains("1 file(s) copied into /work first"), "{}", r.text);
     }
 
+    #[tokio::test]
+    async fn r8_box_get_refuses_dot_and_dotdot_components_in_path_and_to() {
+        let (rig, fake, _d) = with_box(&[]);
+        rig.call("box_exec", json!({"command": "true", "timeout_s": 20})).await;
+        let mut tar = Vec::new();
+        loom_tools::boxfs::append_file(&mut tar, "out/a.txt", 0o644, 0, b"A");
+        loom_tools::boxfs::finish_tar(&mut tar);
+        std::fs::write(fake.dir.join("cp-out.tar"), &tar).unwrap();
+        let before = fake.sub("cp").len();
+        for (args, which) in [
+            (json!({"path": "../etc/passwd"}), "`path`"),
+            (json!({"path": "out/../../etc"}), "`path`"),
+            (json!({"path": "/work/./out"}), "`path`"),
+            (json!({"path": "out/."}), "`path`"),
+            (json!({"path": "out", "to": "../escaped"}), "`to`"),
+            (json!({"path": "out", "to": "a/../b"}), "`to`"),
+            (json!({"path": "out", "to": "./here"}), "`to`"),
+        ] {
+            let r = rig.call("box_get", args.clone()).await;
+            assert_eq!(r.status, ToolStatus::Error, "{args}: {}", r.text);
+            assert!(r.text.contains(which) && r.text.contains("component"), "{args}: {}", r.text);
+        }
+        assert_eq!(fake.sub("cp").len(), before, "docker was not asked for any of them");
+        // Plain paths still work, also with a trailing slash.
+        let r = rig.call("box_get", json!({"path": "out/", "to": "got"})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+    }
+
     #[test]
     fn container_paths_are_made_absolute_and_never_empty() {
         assert_eq!(container_path("out").unwrap(), "/work/out");
         assert_eq!(container_path("out/").unwrap(), "/work/out");
         assert_eq!(container_path("/etc/hosts").unwrap(), "/etc/hosts");
-        assert_eq!(container_path("/work/dir/.").unwrap(), "/work/dir");
+        assert!(container_path("/work/dir/.").is_err(), "no `.` component anywhere");
         assert!(container_path("").is_err() && container_path("/").is_err() && container_path("a\0b").is_err());
     }
 }
