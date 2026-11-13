@@ -568,6 +568,7 @@ export function recordActivity(record) {
     case "child_settled": return `Agent ${outcomeWords(record.outcome)}`;
     case "job_registered": return `Job ${oneLine(record.job_id, 30)} started`;
     case "job_settled": return `Job ${oneLine(record.job_id, 30)} settled${Number.isInteger(record.exit_code) ? " (exit " + record.exit_code + ")" : ""}`;
+    case "job_matched": return `Job ${oneLine(record.job_id, 30)} wrote a line matching /${oneLine(record.pattern, 60)}/`;
     case "ledger": return "Mission state updated";
     case "inbox_opened": return record.blocking ? "Waiting for an operator answer" : record.item_kind === "finished" ? "Result ready to review" : "Nonblocking question opened";
     case "inbox_resolved": return "Operator answered an inbox item";
@@ -1135,6 +1136,11 @@ function step(store, rec) {
     case "job_settled": {
       const code = rec.exit_code === null || rec.exit_code === undefined ? "no exit code" : `exit ${rec.exit_code}`;
       push(store, { ...base(rec), kind: "line", tone: rec.exit_code === 0 ? "dim" : "warn", text: `job ${rec.job_id} settled (${code})${rec.detail ? ": " + oneLine(rec.detail, 200) : ""}`, blob: rec.output || null });
+      break;
+    }
+    case "job_matched": {
+      const n = Number.isInteger(rec.matches) ? rec.matches : 0;
+      push(store, { ...base(rec), kind: "line", tone: "warn", text: `job ${rec.job_id} wrote ${n} line${n === 1 ? "" : "s"} matching /${oneLine(rec.pattern, 120)}/`, blob: rec.output || null });
       break;
     }
     case "ledger":

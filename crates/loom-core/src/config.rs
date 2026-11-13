@@ -125,6 +125,11 @@ pub struct ToolsCfg {
     pub max_output_bytes: u64,
     /// How long `job_wait` waits when the call gives no time.
     pub job_wait_s: u64,
+    /// The least time between two reports of a background job whose output is watched (`bash` with
+    /// `wake_on`), when the call gives none.
+    pub job_wake_gap_s: u64,
+    /// A watched job is reported this many times; after that it is followed with `job_wait`.
+    pub job_wake_max: u32,
     /// Start a reply's leading read-only calls (`read`, `glob`, `grep`, `out_read`, `out_grep`) while
     /// the rest of the reply is still streaming. What is recorded and shown is the same either way.
     pub speculate: bool,
@@ -141,6 +146,8 @@ impl Default for ToolsCfg {
             web_fetch_max_bytes: 20 * 1024 * 1024,
             max_output_bytes: 64 * 1024 * 1024,
             job_wait_s: 120,
+            job_wake_gap_s: 30,
+            job_wake_max: 20,
             speculate: true,
         }
     }
@@ -256,6 +263,13 @@ pub struct AgentsCfg {
     /// session tells the operator in a non-blocking inbox item (0 = never). None is opened when the
     /// request's retry window ends first: the request then fails at its next failed attempt.
     pub unavailable_notice_s: u64,
+    /// A workspace with more files than this is not copied for an agent that asks for its own copy
+    /// (`agent_spawn` with `workspace: "copy"` or `attempts`).
+    pub copy_max_files: u64,
+    /// Nor is one that holds more than this many MiB of file content (0 = no limit), where a copy
+    /// duplicates them. On a file system that clones files (APFS) a copy takes no space until files
+    /// are changed, and this limit is not applied.
+    pub copy_max_mb: u64,
 }
 
 impl Default for AgentsCfg {
@@ -270,6 +284,8 @@ impl Default for AgentsCfg {
             invalid_calls_before_forcing: 3,
             unviewed_min_lines: 20,
             unavailable_notice_s: 300,
+            copy_max_files: 300_000,
+            copy_max_mb: 20_480,
         }
     }
 }
@@ -433,6 +449,20 @@ impl Paths {
     /// Scratch directory a session's commands may write to.
     pub fn session_tmp(&self, id: &SessionId) -> PathBuf {
         self.session_dir(id).join("tmp")
+    }
+    /// Where agents' own copies of a workspace are made: beside the loom home, not in it, because
+    /// nothing under the home is writable to a session's commands. `~/.loom` gives `~/.loom-copies`.
+    pub fn copies_dir(&self) -> PathBuf {
+        let name = self.home.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "loom".into());
+        self.home.with_file_name(format!("{name}-copies"))
+    }
+    /// The copies of one mission's agents.
+    pub fn mission_copies(&self, id: &MissionId) -> PathBuf {
+        self.copies_dir().join(id_dir(id.as_str()))
+    }
+    /// The working copy of one agent of a mission.
+    pub fn agent_copy(&self, mission: &MissionId, agent: &SessionId) -> PathBuf {
+        self.mission_copies(mission).join(id_dir(agent.as_str()))
     }
     pub fn blobs_dir(&self) -> PathBuf {
         self.home.join("blobs")

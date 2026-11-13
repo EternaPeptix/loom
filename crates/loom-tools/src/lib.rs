@@ -20,6 +20,7 @@
 //! - [`jobs`]    background jobs
 //! - [`files`]   what a session has read, for refusing writes over unseen changes
 //! - [`view`]    numbered line views of stored output
+//! - [`workcopy`] a child's own copy of the workspace, and bringing one child's changes back
 //! - [`bash`], [`fstools`], [`search`], [`outview`], [`web`]: the built-in tools
 
 pub mod bash;
@@ -41,6 +42,7 @@ pub mod schema;
 pub mod search;
 pub mod view;
 pub mod web;
+pub mod workcopy;
 
 use async_trait::async_trait;
 use futures_util::FutureExt;

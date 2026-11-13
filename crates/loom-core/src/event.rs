@@ -134,6 +134,21 @@ pub enum Event {
         output: Option<BlobRef>,
         detail: String,
     },
+    /// Lines of a background job's output matched the pattern its call asked to be told of
+    /// (`bash` with `wake_on`). The harness note that follows shows the lines. Not rendered.
+    JobMatched {
+        job_id: String,
+        /// The pattern as the call gave it.
+        pattern: String,
+        /// The part of the job's output this is about, stored. `None` only when storing failed.
+        output: Option<BlobRef>,
+        /// Byte offset of that part in the job's whole output.
+        from: u64,
+        /// Line numbers, in `output`, of the matching lines the note shows.
+        shown: Vec<u64>,
+        /// Lines of the part that match, in all.
+        matches: u64,
+    },
     InboxOpened(InboxItem),
     InboxResolved {
         item_id: String,
@@ -369,6 +384,8 @@ pub enum Trigger {
     User,
     ChildSettled,
     JobSettled,
+    /// A watched background job wrote a line matching its pattern (`job_matched`).
+    JobOutput,
     InboxAnswer,
     Resume,
 }
@@ -965,6 +982,17 @@ mod tests {
             (
                 "job_settled",
                 Event::JobSettled { job_id: "j1".into(), exit_code: Some(0), output: Some(blob()), detail: "d".into() },
+            ),
+            (
+                "job_matched",
+                Event::JobMatched {
+                    job_id: "j1".into(),
+                    pattern: "CRASH".into(),
+                    output: Some(blob()),
+                    from: 40,
+                    shown: vec![3, 7],
+                    matches: 2,
+                },
             ),
             (
                 "inbox_opened",

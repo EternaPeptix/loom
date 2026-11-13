@@ -153,7 +153,9 @@
 //! to wait for. Carry on with the work, or end with {the terminating tools this role has other than
 //! wait, as `a`, `b` or `c`}.` Otherwise `S.set_effect(Effect::EndTurn(Waiting))`; ok, outcome
 //! `waiting`, message `Waiting for: {job j1 (command cut to 60 chars), … ; agent s-… (role), …}. You
-//! will be resumed as soon as one of them ends.`
+//! will be resumed as soon as one of them ends.` When running jobs are watched (`ctx.jobs.watching`)
+//! the last sentence goes on: `…as one of them ends, or job j1 writes a line matching /{pattern cut
+//! to 60 chars}/[, or job j2 …].`
 //!
 //! Tests required (fake `Orchestrator` with scripted spawn/join results; temp journal; calls made
 //! through `loom_tools::execute`): for `finish` — empty answer, malformed quote element, failed
@@ -169,7 +171,9 @@
 //! refusal, missing `meanwhile`, ledger question recorded and referenced; `report_blocker` — child
 //! and lead; `wait` — nothing running, a running job, a running child.
 
-use super::{Delivery, Effect, Settlement, Shared, SpawnReq, MAX_FINISH_REJECTIONS, REPORT_MAX_CHARS, SHUTTING_DOWN};
+use super::{
+    Delivery, Effect, Settlement, Shared, SpawnReq, Workspace, MAX_FINISH_REJECTIONS, REPORT_MAX_CHARS, SHUTTING_DOWN,
+};
 use crate::gate::{self, Quote, ReportInput, VerifiedQuote};
 use crate::pack::RoleDef;
 use crate::texts;
@@ -671,6 +675,7 @@ impl Finish {
                 awaited: true,
                 harness: true,
                 prerequisite: None,
+                workspace: Workspace::Shared,
             };
             // A verifier that cannot be run is a fault of the harness: it is retried with a fresh one, and when
             // it still cannot be run the finish is held, never escalated and never delivered as verified.
@@ -1434,22 +1439,26 @@ impl Tool for Wait {
     fn spec(&self) -> ToolSpec {
         spec(
             "wait",
-            "End the turn until a background job or an agent you started ends; you are then resumed with its result. Use it when there is nothing useful to do until then. It is refused when nothing is running.",
+            "End the turn until a background job or an agent you started ends, or a job you started with `wake_on` writes a line that matches; you are then resumed with its result. Use it when there is nothing useful to do until then. It is refused when nothing is running.",
             ToolClass::Terminal,
             &[opt("reason", "string", "What you are waiting for, in a few words.")],
         )
     }
     async fn run(&self, ctx: &ToolCtx, _args: &Map<String, Value>) -> ToolOutput {
         let s = &self.0;
-        let jobs: Vec<String> = ctx
-            .jobs
-            .list()
-            .await
-            .into_iter()
-            .filter(|j| j.state == JobState::Running)
+        let running: Vec<_> = ctx.jobs.list().await.into_iter().filter(|j| j.state == JobState::Running).collect();
+        let jobs: Vec<String> = running
+            .iter()
             .map(|j| {
                 let command = j.command.split_whitespace().collect::<Vec<_>>().join(" ");
                 format!("job {} ({})", j.id, cut_chars(&command, 60))
+            })
+            .collect();
+        let watched: String = running
+            .iter()
+            .filter_map(|j| {
+                let pattern = ctx.jobs.watching(&j.id)?;
+                Some(format!(", or job {} writes a line matching /{}/", j.id, cut_chars(&pattern, 60)))
             })
             .collect();
         let agents: Vec<String> = s
@@ -1488,7 +1497,7 @@ impl Tool for Wait {
         ToolOutput::ok(
             "waiting",
             Body::Message(format!(
-                "Waiting for: {}. You will be resumed as soon as one of them ends.",
+                "Waiting for: {}. You will be resumed as soon as one of them ends{watched}.",
                 groups.join(" ; ")
             )),
         )
@@ -3045,6 +3054,18 @@ mod tests {
             res.text
         );
         assert_eq!(effect(&r), Some(Effect::EndTurn(TurnEndReason::Waiting)));
+        // A watched job is named with what wakes the session before it ends.
+        let started =
+            r.call("bash", json!({"command": "sleep 31", "background": true, "wake_on": "CRASH|panic"})).await;
+        assert_eq!(started.status, Status::Ok, "{}", started.text);
+        let res = r.call("wait", json!({})).await;
+        assert!(
+            res.text.contains("Waiting for: job j1 (sleep 30), job j2 (sleep 31). You will be resumed as soon as one of them ends, or job j2 writes a line matching /CRASH|panic/."),
+            "{}",
+            res.text
+        );
+        let killed = r.call("job_kill", json!({"job": "j2"})).await;
+        assert_eq!(killed.status, Status::Ok, "{}", killed.text);
         let killed = r.call("job_kill", json!({"job": "j1"})).await;
         assert_eq!(killed.status, Status::Ok, "{}", killed.text);
         // An ended job is not waited for.

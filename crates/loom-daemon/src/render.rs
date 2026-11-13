@@ -37,7 +37,8 @@
 //! - `child_spawned`: `⇢ agent {child} ({role}, {mode}): {brief.question}` (cyan).
 //! - `child_settled`: `⇠ agent {child} {outcome word}` (cyan), then the report indented two spaces,
 //!   cut like a tool result. An `inline` settlement prints only the first line.
-//! - `job_registered`: `⚙ job {job_id}: {command}`; `job_settled`: `⚙ job {job_id} ended: {detail}`.
+//! - `job_registered`: `⚙ job {job_id}: {command}`; `job_settled`: `⚙ job {job_id} ended: {detail}`;
+//!   `job_matched`: `⚙ job {job_id} wrote {matches} line(s) matching /{pattern}/`.
 //! - `inbox_opened`: `✉ {kind}` + ` (waiting for you)` when blocking (bold yellow), the text, the
 //!   options numbered `  1. …`, then `  answer: loom answer {item_id} "…"` (dim) unless the kind is
 //!   `Finished`. A scope request (see [`scope_request_hosts`]) is `✉ scope request`, the text, `  hosts: a, b`
@@ -501,6 +502,10 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
         }
         Event::JobSettled { job_id, detail, .. } => {
             out.push(format!("⚙ job {} ended: {}", clean(job_id), clean(detail)));
+        }
+        Event::JobMatched { job_id, pattern, matches, .. } => {
+            let lines = if *matches == 1 { "line" } else { "lines" };
+            out.push(format!("⚙ job {} wrote {matches} {lines} matching /{}/", clean(job_id), clean(pattern)));
         }
         Event::InboxOpened(item) => {
             if let Some(hosts) = scope_request_hosts(item) {
@@ -1043,6 +1048,14 @@ mod tests {
             }),
             Event::JobRegistered { job_id: s.into(), call_id: cid(), command: s.into() },
             Event::JobSettled { job_id: s.into(), exit_code: Some(0), output: None, detail: s.into() },
+            Event::JobMatched {
+                job_id: s.into(),
+                pattern: s.into(),
+                output: None,
+                from: 0,
+                shown: vec![1],
+                matches: 1,
+            },
             Event::InboxOpened(InboxItem {
                 item_id: s.into(),
                 kind: InboxKind::Question,
@@ -1265,6 +1278,20 @@ mod tests {
                 &MONO
             ),
             "⚙ job j1 ended: exit 1\n"
+        );
+        assert_eq!(
+            render(
+                Event::JobMatched {
+                    job_id: "j1".into(),
+                    pattern: "CRASH".into(),
+                    output: None,
+                    from: 0,
+                    shown: vec![4, 9],
+                    matches: 3,
+                },
+                &MONO
+            ),
+            "⚙ job j1 wrote 3 lines matching /CRASH/\n"
         );
         assert_eq!(render(Event::Ledger { n: 4, summary: "claim".into() }, &MONO), "▪ ledger #4: claim\n");
         assert_eq!(
@@ -1595,6 +1622,7 @@ mod tests {
             mission: MissionId::from("m-a"),
             parent: parent.map(SessionId::from),
             workspace: "/w".into(),
+            copy_of: None,
             pack: "core".into(),
             role: "lead".into(),
             profile: "local".into(),

@@ -55,20 +55,109 @@
 //! was already shown), `output_blob`, `elapsed_ms`, `leader_status` and `detail` (what the job tools
 //! report). A table that is dropped kills every job still running.
 //!
+//! ## Watched output
+//! `register_watched` takes a [`Watch`]: a regular expression (`Watch::new`: Rust `regex` syntax, at
+//! most `WATCH_PATTERN_MAX_CHARS` characters, not blank; a refusal is a sentence), the least time
+//! between two reports, and how many reports there may be. While the job runs its watcher looks at
+//! the output written since the last look every `SCAN_EVERY`, from the byte the job was registered
+//! from, whole lines only, as `view::store_text` would normalise them (escape sequences removed,
+//! overwritten lines collapsed), so a pattern is matched against the text the model reads. Output
+//! that normalises as binary matches nothing, and nothing past `max_output_bytes` is looked at.
+//! - A line that matches is reported `MATCH_SETTLE` after it was seen (what follows it at once is
+//!   then there too), and no sooner than the watch's gap after the previous report; lines matching
+//!   in between are part of the same report.
+//! - A report is [`JobEvent::Matched`]: the *part* of the output it is about, stored
+//!   (`view::store_text`; `None` only when storing failed) — from up to `MATCH_CONTEXT_LINES` lines
+//!   before the first unreported matching line (looked for in the `MATCH_CONTEXT_BYTES` before it,
+//!   never reaching into an earlier part) to the last whole line written, at most
+//!   `MATCH_PART_MAX_BYTES` — the byte offset it starts at, the first `MATCH_LINES_MAX` matching
+//!   lines of it with their line numbers in the stored part, how many lines of it match in all,
+//!   and whether this was the watch's last report. Parts are disjoint and in order; the next look
+//!   starts where the part ended.
+//! - When the job ends by itself, what is left is looked at once more (an unfinished last line
+//!   included) and a match is reported at once, before `Settled`, with `running: false`. A job that
+//!   is killed gets no such report. After its last report a watch looks at nothing more.
+//! - `watching(id)` is the pattern of a running job's watch that can still report.
+//!
 //! Tests required (real processes, sandbox mode `none`, tempfile): a job that finishes sends
 //! Registered then Settled with its stored output and exit status; `wait` returns early on end and on
 //! timeout; successive waits return disjoint, contiguous output; `kill`; `kill_all` with several
 //! jobs, and the detail `kill_all_because` gives; output-limit kill; unknown id; `list`; `resume_from`;
 //! no event is sent twice; a previous daemon's job that ended by itself is reported with its exit
-//! code, keeps its files until `discard`, and `ended_while_down` stores its output.
+//! code, keeps its files until `discard`, and `ended_while_down` stores its output; a watched job
+//! reports a matching line while it runs, with the stored part, the line's number in it and the
+//! lines before it; reports keep the gap and their parts are disjoint; the last report says so and
+//! nothing follows it; a match in the last output of a job that ends is reported before `Settled`,
+//! and not for a job that is killed; `Watch::new` refusals.
 
 use crate::proc::{self, Ended, RecordedGroup, Running, WaitEnd};
+use loom_core::admit::normalize;
 use loom_core::{BlobRef, BlobStore, CallId};
+use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
+
+/// How often the new output of a watched job is looked at.
+const SCAN_EVERY: Duration = Duration::from_millis(500);
+/// A matching line is reported this long after it was seen, so that what the command wrote right
+/// after it is in the stored part too.
+const MATCH_SETTLE: Duration = Duration::from_millis(750);
+/// Most bytes of output read in one look.
+const SCAN_CHUNK: u64 = 4 * 1024 * 1024;
+/// Most chunks read in one look.
+const SCAN_CHUNKS: u32 = 4;
+/// Most bytes of output stored with one report.
+pub const MATCH_PART_MAX_BYTES: u64 = 1024 * 1024;
+/// Lines kept before the first matching line of a report, and how far back they are looked for.
+pub const MATCH_CONTEXT_LINES: usize = 10;
+const MATCH_CONTEXT_BYTES: u64 = 16 * 1024;
+/// Most matching lines one report carries; the others are counted.
+pub const MATCH_LINES_MAX: usize = 10;
+/// Longest pattern a watch takes.
+pub const WATCH_PATTERN_MAX_CHARS: usize = 300;
+/// Largest compiled program of a watch's pattern, in bytes.
+const WATCH_PROGRAM_MAX_BYTES: usize = 1 << 20;
+
+/// What the output of a background job is watched for.
+#[derive(Clone, Debug)]
+pub struct Watch {
+    pattern: Regex,
+    /// The least time between two reports.
+    gap: Duration,
+    /// The watch ends with this report.
+    max_reports: u32,
+}
+
+impl Watch {
+    /// A watch for lines matching `pattern`, reporting at most once per `gap` and at most `max_reports`
+    /// times (at least once). The error is a sentence for the model.
+    pub fn new(pattern: &str, gap: Duration, max_reports: u32) -> Result<Watch, String> {
+        if pattern.trim().is_empty() {
+            return Err("`wake_on` is empty, which would match every line. Give a regular expression for the lines you want to be told of, or leave `wake_on` out.".to_string());
+        }
+        let chars = pattern.chars().count();
+        if chars > WATCH_PATTERN_MAX_CHARS {
+            return Err(format!(
+                "`wake_on` is {chars} characters long; the most is {WATCH_PATTERN_MAX_CHARS}. Give a shorter regular expression: one that matches the few words that mark the line."
+            ));
+        }
+        match regex::RegexBuilder::new(pattern).size_limit(WATCH_PROGRAM_MAX_BYTES).build() {
+            Ok(pattern) => Ok(Watch { pattern, gap, max_reports: max_reports.max(1) }),
+            Err(e) => Err(format!(
+                "`wake_on` is not a regular expression that can be used ({}). It is matched against each line of the output in Rust regex syntax, which has no look-around and no backreferences; write `(?i)` first to ignore case. Correct it, or leave `wake_on` out.",
+                e.to_string().replace('\n', " ")
+            )),
+        }
+    }
+
+    /// The pattern as it was given.
+    pub fn pattern(&self) -> &str {
+        self.pattern.as_str()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobState {
@@ -120,6 +209,28 @@ pub enum JobEvent {
         /// Why it ended, when that needs saying (output limit, storage failure).
         detail: String,
     },
+    /// Lines of a watched job's output matched its pattern.
+    Matched(JobMatch),
+}
+
+/// One report of a watch: the part of the job's output it is about, and the lines of it that matched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobMatch {
+    pub info: JobInfo,
+    /// The pattern as the call gave it.
+    pub pattern: String,
+    /// The part, stored as every view reads it. `None` only when storing failed.
+    pub output: Option<BlobRef>,
+    /// Byte offset of the part in the job's whole output.
+    pub from: u64,
+    /// The first matching lines of the part: 1-based line number in the stored part, and the line.
+    pub lines: Vec<(u64, String)>,
+    /// Lines of the part that match, in all.
+    pub matches: u64,
+    /// The watch ends with this report.
+    pub last: bool,
+    /// False for the report made when the job had ended by itself.
+    pub running: bool,
 }
 
 /// How long `kill` waits, beyond the grace period, for the watcher to report the job settled.
@@ -168,6 +279,8 @@ struct St {
     leader: Option<Ended>,
     /// The `detail` of the settled event, when there was something to say.
     detail: Option<String>,
+    /// The pattern of this job's watch, while it can still report.
+    watching: Option<String>,
 }
 
 /// One job, shared by the table and its watcher.
@@ -429,8 +542,22 @@ impl JobTable {
         id: &str,
         call_id: &CallId,
         command: &str,
+        running: Running,
+        read_from: u64,
+    ) -> JobInfo {
+        self.register_watched(id, call_id, command, running, read_from, None).await
+    }
+
+    /// Like [`JobTable::register_from`], and the output from `read_from` on is watched for `watch`
+    /// (see "Watched output" in the module contract).
+    pub async fn register_watched(
+        &self,
+        id: &str,
+        call_id: &CallId,
+        command: &str,
         mut running: Running,
         read_from: u64,
+        watch: Option<Watch>,
     ) -> JobInfo {
         // From here on the table (its watcher and its Drop) is responsible for the group.
         running.disarm();
@@ -457,6 +584,7 @@ impl JobTable {
                 blob: None,
                 leader,
                 detail: None,
+                watching: watch.as_ref().map(|w| w.pattern().to_string()),
             }),
             ended,
             stop: CancellationToken::new(),
@@ -472,8 +600,33 @@ impl JobTable {
             inner.jobs.push(shared.clone());
         }
         let _ = self.events.send(JobEvent::Registered(info.clone()));
-        tokio::spawn(watch(shared, running, self.blobs.clone(), self.events.clone(), self.max_output_bytes));
+        let scanner = watch.map(|watch| Scanner {
+            watch,
+            path: info.out_path.clone(),
+            limit: self.max_output_bytes,
+            scanned: read_from,
+            floor: read_from,
+            pending: None,
+            last_report: None,
+            reports: 0,
+        });
+        tokio::spawn(self::watch(
+            shared,
+            running,
+            self.blobs.clone(),
+            self.events.clone(),
+            self.max_output_bytes,
+            scanner,
+        ));
         info
+    }
+
+    /// The pattern a running job's output is watched for, while its watch can still report. `None`
+    /// for a job that is not watched, has settled or has had its last report, and for an unknown id.
+    pub fn watching(&self, id: &str) -> Option<String> {
+        let j = self.find(id).ok()?;
+        let st = lock(&j.st);
+        st.ended_ms.is_none().then(|| st.watching.clone()).flatten()
     }
 
     fn find(&self, id: &str) -> Result<Arc<Shared>, String> {
@@ -613,6 +766,223 @@ fn view_of(j: &Shared) -> JobView {
     JobView { info: st.info.clone(), new_output, from }
 }
 
+/// The watch of one job's output: where it has looked, and what it has yet to report.
+struct Scanner {
+    watch: Watch,
+    path: PathBuf,
+    /// Nothing past this many bytes of output is looked at.
+    limit: u64,
+    /// The output before this offset has been looked at.
+    scanned: u64,
+    /// No stored part reaches back before this offset.
+    floor: u64,
+    /// Where the part of the next report starts, and when its first matching line was seen.
+    pending: Option<(u64, Instant)>,
+    last_report: Option<Instant>,
+    reports: u32,
+}
+
+/// What one look found to report.
+struct Found {
+    output: Option<BlobRef>,
+    from: u64,
+    lines: Vec<(u64, String)>,
+    matches: u64,
+    last: bool,
+}
+
+impl Scanner {
+    /// Whether the watch has made its last report.
+    fn over(&self) -> bool {
+        self.reports >= self.watch.max_reports
+    }
+
+    /// Look at the output written since the last look and report what is due. `last`: the job has
+    /// ended, so an unfinished line is a line and a match is due at once.
+    fn look(&mut self, blobs: &BlobStore, last: bool) -> Option<Found> {
+        if self.over() {
+            return None;
+        }
+        self.find(last);
+        let (_, seen) = self.pending?;
+        let due =
+            last || (seen.elapsed() >= MATCH_SETTLE && self.last_report.is_none_or(|t| t.elapsed() >= self.watch.gap));
+        if due {
+            self.report(blobs, last)
+        } else {
+            None
+        }
+    }
+
+    /// Advance over whole lines until one matches (which starts the part of the next report) or there
+    /// is nothing more to read.
+    fn find(&mut self, last: bool) {
+        let end = file_len(&self.path).min(self.limit);
+        let mut chunks = SCAN_CHUNKS;
+        while self.pending.is_none() && self.scanned < end && chunks > 0 {
+            chunks -= 1;
+            let upto = end.min(self.scanned.saturating_add(SCAN_CHUNK));
+            let Ok(raw) = read_from(&self.path, self.scanned, upto) else { return };
+            // A line that has not ended is left for the next look, unless there will be none or it is
+            // longer than a chunk.
+            let whole = match raw.iter().rposition(|b| *b == b'\n') {
+                Some(i) => i + 1,
+                None if last || raw.len() as u64 >= SCAN_CHUNK => raw.len(),
+                None => return,
+            };
+            let Some(lines) = raw.get(..whole).filter(|l| !l.is_empty()) else { return };
+            if let Some(offset) = first_match(&self.watch.pattern, lines) {
+                let at = self.scanned.saturating_add(offset);
+                self.pending = Some((self.context_start(at), Instant::now()));
+            }
+            self.scanned = self.scanned.saturating_add(whole as u64);
+        }
+    }
+
+    /// The start of the line `MATCH_CONTEXT_LINES` lines before the line that starts at `at`, as far
+    /// as those lines begin after `floor` and within `MATCH_CONTEXT_BYTES`.
+    fn context_start(&self, at: u64) -> u64 {
+        let from = at.saturating_sub(MATCH_CONTEXT_BYTES).max(self.floor);
+        if from >= at {
+            return at;
+        }
+        let Ok(before) = read_from(&self.path, from, at) else { return at };
+        // Where lines start in `before`. What precedes its first line break is the end of a line that
+        // began earlier, unless `from` is where an earlier part ended.
+        let mut starts: Vec<u64> = Vec::new();
+        if from == self.floor {
+            starts.push(from);
+        }
+        starts.extend(
+            before.iter().enumerate().filter(|(_, b)| **b == b'\n').map(|(i, _)| from.saturating_add(i as u64 + 1)),
+        );
+        starts.retain(|s| *s < at);
+        let keep = starts.len().saturating_sub(MATCH_CONTEXT_LINES);
+        starts.get(keep).copied().unwrap_or(at)
+    }
+
+    /// Store the part that starts at the pending offset and say which of its lines match. The next
+    /// look starts where the part ends.
+    fn report(&mut self, blobs: &BlobStore, last: bool) -> Option<Found> {
+        let (start, _) = self.pending.take()?;
+        let end = file_len(&self.path).min(self.limit);
+        let upto = end.min(start.saturating_add(MATCH_PART_MAX_BYTES));
+        let raw = read_from(&self.path, start, upto).ok()?;
+        let whole = match raw.iter().rposition(|b| *b == b'\n') {
+            Some(i) if !(last && upto == end) => i + 1,
+            _ => raw.len(),
+        };
+        let part = raw.get(..whole)?;
+        let part_end = start.saturating_add(whole as u64);
+        self.scanned = part_end;
+        self.floor = part_end;
+        let (output, normalized) = match crate::view::store_text(blobs, part) {
+            Ok((stored, normalized)) => (Some(stored), normalized),
+            Err(e) => {
+                tracing::warn!("a matching part of the output {} was not stored: {e}", self.path.display());
+                (None, normalize(part))
+            }
+        };
+        let mut lines = Vec::new();
+        let mut matches = 0u64;
+        if !normalized.binary {
+            for (n, line) in normalized.text.split('\n').enumerate() {
+                if self.watch.pattern.is_match(line) {
+                    matches += 1;
+                    if lines.len() < MATCH_LINES_MAX {
+                        lines.push((n as u64 + 1, line.to_string()));
+                    }
+                }
+            }
+        }
+        if matches == 0 {
+            return None;
+        }
+        self.reports = self.reports.saturating_add(1);
+        self.last_report = Some(Instant::now());
+        Some(Found { output, from: start, lines, matches, last: self.over() })
+    }
+}
+
+/// The byte offset, in `lines`, of the first line that matches once normalised. Normalising keeps
+/// line breaks where they are, so the line with the same number is the one.
+fn first_match(pattern: &Regex, lines: &[u8]) -> Option<u64> {
+    let normalized = normalize(lines);
+    if normalized.binary {
+        return None;
+    }
+    let index = normalized.text.split('\n').position(|line| pattern.is_match(line))?;
+    let mut offset = 0u64;
+    for (n, line) in lines.split(|b| *b == b'\n').enumerate() {
+        if n == index {
+            return Some(offset);
+        }
+        offset = offset.saturating_add(line.len() as u64 + 1);
+    }
+    Some(0)
+}
+
+/// One look of `scanner`, off the async workers; what it found is sent. A look that panics ends the watch.
+async fn look(
+    shared: &Shared,
+    scanner: &mut Option<Scanner>,
+    blobs: &BlobStore,
+    events: &UnboundedSender<JobEvent>,
+    last: bool,
+) {
+    let Some(mut s) = scanner.take() else { return };
+    let store = blobs.clone();
+    let looked = tokio::task::spawn_blocking(move || {
+        let found = s.look(&store, last);
+        (s, found)
+    })
+    .await;
+    let Ok((s, found)) = looked else {
+        lock(&shared.st).watching = None;
+        return;
+    };
+    if let Some(found) = found {
+        if found.last {
+            lock(&shared.st).watching = None;
+        }
+        let _ = events.send(JobEvent::Matched(JobMatch {
+            info: snapshot(shared),
+            pattern: s.watch.pattern().to_string(),
+            output: found.output,
+            from: found.from,
+            lines: found.lines,
+            matches: found.matches,
+            last: found.last,
+            running: !last,
+        }));
+    }
+    *scanner = Some(s);
+}
+
+/// `Running::wait` (or `wait_group`), looking at the output of a watched job every `SCAN_EVERY` meanwhile.
+async fn wait_looking(
+    running: &mut Running,
+    shared: &Shared,
+    whole_group: bool,
+    max_output_bytes: u64,
+    scanner: &mut Option<Scanner>,
+    blobs: &BlobStore,
+    events: &UnboundedSender<JobEvent>,
+) -> WaitEnd {
+    loop {
+        let every = scanner.as_ref().filter(|s| !s.over()).map(|_| SCAN_EVERY);
+        let end = if whole_group {
+            running.wait_group(&shared.stop, every, max_output_bytes).await
+        } else {
+            running.wait(&shared.stop, every, max_output_bytes).await
+        };
+        if end != WaitEnd::Deadline || every.is_none() {
+            return end;
+        }
+        look(shared, scanner, blobs, events, false).await;
+    }
+}
+
 /// Owns the process until it is over, then stores the output and reports, once.
 async fn watch(
     shared: Arc<Shared>,
@@ -620,18 +990,23 @@ async fn watch(
     blobs: BlobStore,
     events: UnboundedSender<JobEvent>,
     max_output_bytes: u64,
+    mut scanner: Option<Scanner>,
 ) {
     let mut detail = String::new();
     // The leader's status is the job's and is known when the leader exits; the job is over only when
     // its group is empty.
-    let mut end = running.wait(&shared.stop, None, max_output_bytes).await;
+    let mut end = wait_looking(&mut running, &shared, false, max_output_bytes, &mut scanner, &blobs, &events).await;
     let mut leader = None;
     if let WaitEnd::Ended(e) = &end {
         if running.group_alive() {
             leader = Some(e.clone());
             lock(&shared.st).leader = leader.clone();
-            end = running.wait_group(&shared.stop, None, max_output_bytes).await;
+            end = wait_looking(&mut running, &shared, true, max_output_bytes, &mut scanner, &blobs, &events).await;
         }
+    }
+    // A job that ended by itself may have written a matching line since the last look.
+    if matches!(end, WaitEnd::Ended(_)) {
+        look(&shared, &mut scanner, &blobs, &events, true).await;
     }
     let state = match end {
         WaitEnd::Ended(Ended::TrackingFailed(error)) => {
@@ -747,11 +1122,39 @@ mod tests {
             self.table.register_from(&id, &CallId::from("call-1"), script, running, read_from).await
         }
 
+        /// A job whose output from `read_from` on is watched for `pattern`.
+        async fn start_watched(
+            &self,
+            script: &str,
+            pattern: &str,
+            gap: Duration,
+            reports: u32,
+            read_from: u64,
+        ) -> JobInfo {
+            let (id, out_path, exit_path) = self.table.allocate().await.expect("allocate");
+            let env = [("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let spec = Spawn { script: script.to_string(), cwd: self.root.clone(), env, out_path, exit_path };
+            let running = spawn(&self.sb, &spec).expect("spawn");
+            let watch = Watch::new(pattern, gap, reports).expect("watch");
+            self.table.register_watched(&id, &CallId::from("call-1"), script, running, read_from, Some(watch)).await
+        }
+
         async fn event(&mut self) -> JobEvent {
             tokio::time::timeout(Duration::from_secs(20), self.rx.recv())
                 .await
                 .expect("event in time")
                 .expect("channel open")
+        }
+
+        /// The next event, which must be a report of a watch.
+        async fn matched(&mut self) -> JobMatch {
+            match self.event().await {
+                JobEvent::Matched(m) => m,
+                other => panic!("expected a match, got {other:?}"),
+            }
         }
 
         fn stored(&self, blob: &BlobRef) -> String {
@@ -796,6 +1199,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_watched_job_reports_a_matching_line_while_it_runs() {
+        let mut f = fx();
+        // Twelve lines, then the line, then what the command writes right after it; the job goes on.
+        let script = "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do echo line $i; done; \
+                      printf '\\033[31mERROR: crash in parser\\033[0m\\n'; echo '  at frame 1'; sleep 30";
+        f.start_watched(script, "^ERROR", Duration::from_secs(60), 5, 0).await;
+        assert!(matches!(f.event().await, JobEvent::Registered(_)));
+        assert_eq!(f.table.watching("j1").as_deref(), Some("^ERROR"));
+        let m = f.matched().await;
+        assert_eq!(m.info.id, "j1");
+        assert_eq!(m.info.state, JobState::Running);
+        assert!(m.running && !m.last);
+        assert_eq!(m.pattern, "^ERROR");
+        // The part starts ten lines before the match and holds what followed it; the escape sequences
+        // are gone, which is why `^ERROR` matches.
+        assert_eq!(m.from, "line 1\nline 2\n".len() as u64);
+        let stored = f.stored(m.output.as_ref().expect("stored"));
+        assert!(stored.starts_with("line 3\n"), "{stored}");
+        assert!(stored.ends_with("ERROR: crash in parser\n  at frame 1\n"), "{stored}");
+        assert_eq!(m.lines, [(11, "ERROR: crash in parser".to_string())]);
+        assert_eq!(m.matches, 1);
+        // Nothing more while nothing new matches; the job is still there to be killed.
+        f.assert_quiet().await;
+        f.table.kill("j1", Duration::from_millis(100)).await.expect("kill");
+        assert!(matches!(f.event().await, JobEvent::Settled { .. }));
+        assert_eq!(f.table.watching("j1"), None);
+        f.assert_quiet().await;
+    }
+
+    #[tokio::test]
     async fn settlement_waits_for_late_output_after_the_shell_exits() {
         let mut f = fx();
         f.start("(sleep 0.6; echo late) & echo first; exit 7").await;
@@ -807,6 +1240,108 @@ mod tests {
         assert_eq!(info.state, JobState::Ended(Ended::Exit(7)));
         assert_eq!(f.stored(&output.expect("output")), "first\nlate\n");
         f.assert_quiet().await;
+    }
+
+    #[tokio::test]
+    async fn reports_keep_the_gap_and_their_parts_are_disjoint() {
+        let mut f = fx();
+        // The job writes on only when the test says so, which is after the first report.
+        let script = "echo hit 1; while [ ! -e go ]; do sleep 0.05; done; echo hit 2; echo miss; echo hit 3; sleep 30";
+        f.start_watched(script, "hit", Duration::from_secs(2), 5, 0).await;
+        assert!(matches!(f.event().await, JobEvent::Registered(_)));
+        let first = f.matched().await;
+        let seen = Instant::now();
+        assert_eq!(first.lines, [(1, "hit 1".to_string())]);
+        assert_eq!(first.from, 0);
+        std::fs::write(f.root.join("go"), "").expect("go");
+        // The lines written inside the gap come in one report, once the gap is over.
+        let second = f.matched().await;
+        assert!(seen.elapsed() >= Duration::from_millis(1800), "reported after {:?}", seen.elapsed());
+        assert_eq!(second.from, "hit 1\n".len() as u64);
+        assert_eq!(second.lines, [(1, "hit 2".to_string()), (3, "hit 3".to_string())]);
+        assert_eq!(second.matches, 2);
+        assert_eq!(f.stored(second.output.as_ref().expect("stored")), "hit 2\nmiss\nhit 3\n");
+        f.table.kill("j1", Duration::from_millis(100)).await.expect("kill");
+        assert!(matches!(f.event().await, JobEvent::Settled { .. }));
+    }
+
+    #[tokio::test]
+    async fn the_last_report_says_so_and_nothing_follows_it() {
+        let mut f = fx();
+        let script = "echo hit 1; while [ ! -e go ]; do sleep 0.05; done; echo hit 2; \
+                      while [ ! -e go2 ]; do sleep 0.05; done; echo hit 3; sleep 30";
+        f.start_watched(script, "hit", Duration::ZERO, 2, 0).await;
+        assert!(matches!(f.event().await, JobEvent::Registered(_)));
+        assert!(!f.matched().await.last);
+        std::fs::write(f.root.join("go"), "").expect("go");
+        let second = f.matched().await;
+        assert!(second.last);
+        assert_eq!(second.lines, [(1, "hit 2".to_string())]);
+        assert_eq!(f.table.watching("j1"), None);
+        // The third line is written and not reported.
+        std::fs::write(f.root.join("go2"), "").expect("go2");
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert!(matches!(f.rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(f.table.peek("j1").await.expect("peek").new_output.ends_with(b"hit 3\n"));
+        f.table.kill("j1", Duration::from_millis(100)).await.expect("kill");
+        assert!(matches!(f.event().await, JobEvent::Settled { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_match_in_the_last_output_is_reported_before_the_job_settles() {
+        let mut f = fx();
+        // The job ends before a look could have reported the line, which has no line break.
+        f.start_watched("echo starting; printf 'FOUND key=abc'", "FOUND", Duration::from_secs(60), 5, 0).await;
+        assert!(matches!(f.event().await, JobEvent::Registered(_)));
+        let m = f.matched().await;
+        assert!(!m.running);
+        assert_eq!(m.lines, [(2, "FOUND key=abc".to_string())]);
+        assert_eq!(f.stored(m.output.as_ref().expect("stored")), "starting\nFOUND key=abc");
+        let JobEvent::Settled { info, .. } = f.event().await else { panic!("Settled must follow") };
+        assert_eq!(info.state, JobState::Ended(Ended::Exit(0)));
+        f.assert_quiet().await;
+    }
+
+    #[tokio::test]
+    async fn a_watched_job_that_is_killed_or_never_matches_reports_no_match() {
+        let mut f = fx();
+        // Killed inside the settle time of its match: no report.
+        f.start_watched("echo hit; sleep 30", "hit", Duration::ZERO, 5, 0).await;
+        assert!(matches!(f.event().await, JobEvent::Registered(_)));
+        f.table.kill("j1", Duration::from_millis(100)).await.expect("kill");
+        assert!(matches!(f.event().await, JobEvent::Settled { .. }));
+        // Output the model was shown before the job was handed over is not looked at, and what follows
+        // does not match: only the end is reported.
+        let script = "echo hit; sleep 1; echo other";
+        let (id, out_path, exit_path) = f.table.allocate().await.expect("allocate");
+        let env =
+            [("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let spec =
+            Spawn { script: script.to_string(), cwd: f.root.clone(), env, out_path: out_path.clone(), exit_path };
+        let running = spawn(&f.sb, &spec).expect("spawn");
+        while file_len(&out_path) < 4 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let watch = Watch::new("hit", Duration::ZERO, 5).expect("watch");
+        f.table.register_watched(&id, &CallId::from("call-1"), script, running, 4, Some(watch)).await;
+        assert!(matches!(f.event().await, JobEvent::Registered(_)));
+        assert!(matches!(f.event().await, JobEvent::Settled { .. }));
+        f.assert_quiet().await;
+    }
+
+    #[test]
+    fn a_watch_refuses_a_pattern_it_cannot_use() {
+        let gap = Duration::from_secs(1);
+        assert!(Watch::new("  ", gap, 1).expect_err("blank").contains("`wake_on` is empty"));
+        assert!(Watch::new("(unclosed", gap, 1)
+            .expect_err("syntax")
+            .contains("is not a regular expression that can be used"));
+        assert!(Watch::new("(?=x)y", gap, 1).expect_err("look-around").contains("no look-around"));
+        let long = "x".repeat(WATCH_PATTERN_MAX_CHARS + 1);
+        assert!(Watch::new(&long, gap, 1).expect_err("long").contains("characters long; the most is 300"));
+        let w = Watch::new("(?i)crash|panic", gap, 0).expect("ok");
+        assert_eq!(w.pattern(), "(?i)crash|panic");
+        assert_eq!(w.max_reports, 1);
     }
 
     #[tokio::test]
@@ -1047,6 +1582,7 @@ mod tests {
             match e {
                 JobEvent::Registered(_) => registered += 1,
                 JobEvent::Settled { .. } => settled += 1,
+                JobEvent::Matched(_) => panic!("no job of this test is watched"),
             }
         }
         assert_eq!((registered, settled), (4, 4));

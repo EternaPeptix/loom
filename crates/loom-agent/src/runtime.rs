@@ -160,11 +160,42 @@
 //!   role and system prompt, parent: Some(parent), the parent's mission, workspace, model and
 //!   `unattended`, budget: req.budget, title: req.title}, Some((parent,
 //!   weave::render_brief(&req.brief))))`.
-//! - Then: `meta.json` (`mode`, `awaited`, and `gate: Some(req.brief)` for a `harness` request),
+//! - `Workspace::Copy` (see *Copies* below): refused for a role that only reads; otherwise the copy
+//!   is made after the child has its place among the known sessions (so it counts against
+//!   `max_children` while the files are copied) and before its session exists, and a failure of any
+//!   later step removes it again.
+//! - Then: `meta.json` (`mode`, `awaited`, `copy_of`, and `gate: Some(req.brief)` for a `harness`
+//!   request),
 //!   spawn the task (a child starts its first turn by itself), publish `BusEvent::Session`, and queue
 //!   in the parent's log
 //!   `parent_shared.emit(Author::Harness, Event::ChildSpawned(ChildSpawned{child, role, mode, brief,
 //!   budget, call_id}))`. Return the child's id.
+//!
+//! ### Copies
+//! A child spawned with `Workspace::Copy` works in its own copy of its parent's workspace, at
+//! `paths.agent_copy(mission, child)` — under `paths.copies_dir()`, which is beside the loom home and
+//! not in it, because nothing in the home is writable to a session's commands. Its `meta.json` has
+//! `workspace` = the copy and `copy_of` = the parent's workspace, so everything built from the meta
+//! (tools, sandbox, system prompt, a restart) uses the copy without knowing about copies.
+//! - Made by `workcopy::make` on a blocking thread, within `agents.copy_max_files` and (where
+//!   files are not cloned) `agents.copy_max_mb`; its refusals are the spawn's error. What the copy
+//!   was made from (`workcopy::Manifest`) is written to `sessions/<child>/copy.json`.
+//! - The assignment's context begins with `texts::copy_header`: where the copy is (as `pwd` prints
+//!   it), that nothing changed there reaches the original, for a fork that earlier paths name the
+//!   original, and what was left out (a Git pointer to a repository outside the workspace).
+//! - Sandbox (`with_copies`): the child may not write to the workspace its copy was made from
+//!   (`protected_paths`), and the copies directory is an untrusted origin of every session's replays
+//!   (`replay_untrusted_paths`), as any place an agent can write is. In Bubblewrap mode the copies
+//!   directory is created when a session is built, since only an existing directory can be hidden.
+//! - `child_copy(parent, child)` (the id resolved as for `join`): `None` for a child that shares the
+//!   workspace; otherwise the canonical copy directory (an error when it is gone), the manifest,
+//!   whether the child is unsettled, the commands the child ran to their end with `bash`, from its
+//!   own log records (`runs_of`: an own `bash` result with `META_EXIT_CODE` or `META_SIGNAL`, with the
+//!   time its call was recorded), and a sandbox for commands the parent has the harness run there:
+//!   the child's rules, with the copy and the parent's scratch directory writable.
+//! - Archiving a mission removes its directory of copies once the family's tasks have ended (an
+//!   agent archived alone: its own copy). What was not adopted is gone; an agent that had not settled
+//!   cannot be opened after an unarchive and is settled `failed`.
 //!
 //! `join(parent, child, cancel)`: `child` must be a child of `parent` (`{child} is not an agent this
 //! session started.`) spawned with `awaited` (`{child} was started in the background; its report
@@ -212,8 +243,9 @@
 //! `producer(mission, blob)`: the first record that stores `blob` among the sessions of the mission (a
 //! session's own records only — a fork's copied records belong to its parent): a `tool_result` with
 //! `output.id == blob`; a successful `read` result whose `META_OF_BLOB` is `blob` (the file text it
-//! stored); a `job_settled` whose output is `blob`, credited to the call named by the `job_registered`
-//! of that job (`bash`, class `Exec`). Views of runtime tools register nothing.
+//! stored); a `job_settled` whose output is `blob`, or a `job_matched` whose stored part is, credited
+//! to the call named by the `job_registered` of that job (`bash`, class `Exec`). Views of runtime tools
+//! register nothing.
 //! `Producer{session, call_id, tool: name, class}`. Kept as an in-memory index fed by
 //! every record that passes through the sink; on a miss for a mission whose logs have not been
 //! scanned since start, scan the logs of all its sessions once, then answer.
@@ -427,7 +459,8 @@
 //!   and ends the lead's turn `Stopped`; `stop_child` on an idle child settles it;
 //! - `poll`: `k` requests whose messages equal the session's stable prefix plus the vote prompt,
 //!   distinct seeds, votes parsed, a failed request counted as no choice;
-//! - `producer`: found through the live index and, after a restart, through the scan;
+//! - `producer`: found through the live index and, after a restart, through the scan; the part a
+//!   watched job's match stored is found while the job runs, after the mission's logs were scanned;
 //! - inbox: a `finish` opens an item and notifies (the command's file has the kind); `answer`
 //!   resolves it; an empty answer dismisses a non-blocking item without a turn and is refused for a
 //!   blocking one;
@@ -438,33 +471,43 @@
 //! - a read-only role's sandbox configuration protects the workspace; every session's environment
 //!   names the proxy;
 //! - `archive` hides, refuses messages, and survives a restart;
+//! - copies: an agent started with `Workspace::Copy` is told where it works and its command runs
+//!   there, the lead's workspace is unchanged until `agent_adopt` and has the agent's files after it,
+//!   archiving removes the copy; `attempt` forks into copies, the check's result per attempt is the
+//!   harness's, only the adopted attempt's files reach the workspace; a read-only role and a
+//!   workspace past the limit are refused and leave no agent and no directory; `runs_of`;
+//!   `with_copies`;
 //! - `records` paging and `window` totals; `ledger` after a goal was set by the first message.
 
 use crate::pack::{self, Packs, PromptEnv, RoleDef};
-use crate::rtools::{self, ChildInfo, Orchestrator, Producer, Settlement, Shared, SpawnReq, Vote};
+use crate::rtools::{
+    self, ChildCopy, ChildInfo, Orchestrator, Producer, Run, Settlement, Shared, SpawnReq, Vote, Workspace,
+};
 use crate::session::{queue_input, Control, Deps, End, Input, Phase, Session, Sink, Status};
 use crate::texts;
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use loom_core::config::{Config, NetworkMode, Paths, SandboxCfg, SandboxMode};
+use loom_core::config::{ensure_private_dir, Config, NetworkMode, Paths, SandboxCfg, SandboxMode};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
     Author, Brief, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, Forked, InboxItem, ModelRef, NetDecision,
     Record, Seq, SessionOutcome, SessionStart, SpawnMode, Termination, ToolClass, ToolStatus, TurnEndReason, Usage,
-    META_OF_BLOB,
+    META_EXIT_CODE, META_OF_BLOB, META_SIGNAL,
 };
 use loom_core::journal::{self, Journal};
 use loom_core::ledger::LedgerState;
 use loom_core::log::{read_records, Durability, PageReader, SessionLog, StoredRecord};
 use loom_core::weave::{render_brief, weave, WindowItem};
-use loom_core::{now_ms, BlobId, BlobStore, CallId, MissionId, SessionId};
+use loom_core::{now_ms, BlobId, BlobRef, BlobStore, CallId, MissionId, SessionId};
 use loom_model::{ChatRequest, Discovered, Limiter, ModelClient, ModelError, Priority, StreamEvent, ToolChoice};
 use loom_net::policy::Policy;
 use loom_net::proxy::Proxy;
 use loom_tools::jobs::JobTable;
 use loom_tools::sandbox::Sandbox;
+use loom_tools::workcopy;
 use loom_tools::ToolCtx;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -505,6 +548,10 @@ pub struct SessionMeta {
     #[serde(default)]
     pub parent: Option<SessionId>,
     pub workspace: String,
+    /// For an agent that works in its own copy of its parent's workspace: the workspace the copy was
+    /// made from. `workspace` is then the copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_of: Option<String>,
     pub pack: String,
     pub role: String,
     /// Model profile name in the config.
@@ -806,11 +853,49 @@ fn own_records(records: &[Record]) -> &[Record] {
     }
 }
 
+/// Beside the log of an agent that works in its own copy of the workspace: what the copy was made
+/// from (`loom_tools::workcopy::Manifest`).
+const COPY_MANIFEST: &str = "copy.json";
+
+/// The commands a session ran itself with `bash` to their end, oldest first: every own `bash` result
+/// that carries how the command ended (an exit code or a signal). A command that became a job has no
+/// such result and is not listed.
+fn runs_of(records: &[Record]) -> Vec<Run> {
+    let mut calls: HashMap<&CallId, (&str, u64)> = HashMap::new();
+    let mut runs = Vec::new();
+    for r in own_records(records) {
+        match &r.event {
+            Event::ToolCall(c) if c.name == "bash" => {
+                if let Some(command) = c.args.get("command").and_then(Value::as_str) {
+                    calls.insert(&c.call_id, (command, r.ts_ms));
+                }
+            }
+            Event::ToolResult(t) if t.name == "bash" => {
+                let exit_code = t.meta.get(META_EXIT_CODE).and_then(Value::as_i64);
+                if exit_code.is_none() && !t.meta.contains_key(META_SIGNAL) {
+                    continue;
+                }
+                if let Some((command, started_ms)) = calls.remove(&t.call_id) {
+                    runs.push(Run {
+                        command: command.to_string(),
+                        started_ms,
+                        exit_code,
+                        output: t.output.as_ref().map(BlobRef::handle),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    runs
+}
+
 /// The stored output an event makes citable as evidence, and what produced it. A result's own
 /// output; the text a `read` showed (the result is a view, `META_OF_BLOB` names the stored file text);
 /// the complete output of a background job, attributed to the call that started it (`jobs` is filled by
-/// `job_registered`, which states that call, and emptied by `job_settled`; only `bash` starts jobs). A
-/// view of a runtime tool's output (`out_read`, `out_grep`) is not an observation and registers nothing.
+/// `job_registered`, which states that call, and emptied by `job_settled`; only `bash` starts jobs); the
+/// part of a running job's output a `job_matched` stored, attributed to the same call. A view of a
+/// runtime tool's output (`out_read`, `out_grep`) is not an observation and registers nothing.
 fn produced_by(
     session: &SessionId,
     jobs: &mut HashMap<(SessionId, String), Producer>,
@@ -841,6 +926,10 @@ fn produced_by(
         }
         Event::JobSettled { job_id, output, .. } => {
             let p = jobs.remove(&(session.clone(), job_id.clone()))?;
+            output.as_ref().map(|o| (o.id.clone(), p))
+        }
+        Event::JobMatched { job_id, output, .. } => {
+            let p = jobs.get(&(session.clone(), job_id.clone()))?.clone();
             output.as_ref().map(|o| (o.id.clone(), p))
         }
         _ => None,
@@ -949,6 +1038,20 @@ fn sandbox_cfg_for(
         }
         cfg.extra_writable.clear();
         cfg.protected_paths.push(workspace.display().to_string());
+    }
+    cfg
+}
+
+/// `cfg` with what agents' own copies of a workspace add. Every copy is a place some agent can
+/// write, so none of them is an input of an isolated replay; and an agent that works in a copy may
+/// not write to the workspace the copy was made from.
+fn with_copies(mut cfg: SandboxCfg, copies: &Path, copy_of: Option<&str>) -> SandboxCfg {
+    let copies = copies.display().to_string();
+    if !cfg.replay_untrusted_paths.contains(&copies) {
+        cfg.replay_untrusted_paths.push(copies);
+    }
+    if let Some(source) = copy_of {
+        cfg.protected_paths.push(source.to_string());
     }
     cfg
 }
@@ -1207,6 +1310,53 @@ impl Orchestrator for Orch {
         }
         // Marked as the gate's in its `meta.json`, written before its first turn: a crash cannot lose that.
         inner.spawn_child(parent, req).await
+    }
+
+    async fn child_copy(&self, parent: &SessionId, child: &SessionId) -> Result<Option<ChildCopy>, String> {
+        let inner = self.0.upgrade().ok_or_else(|| SHUTTING.to_string())?;
+        let child = inner.resolve_child_id(parent, child)?;
+        let (meta, running) = {
+            let st = inner.st();
+            let Some(k) = st.known.get(&child).filter(|k| k.meta.parent.as_ref() == Some(parent)) else {
+                return Err(format!("{} {NOT_YOURS}", child.as_str()));
+            };
+            (k.meta.clone(), !k.finished())
+        };
+        let Some(source) = meta.copy_of.clone() else { return Ok(None) };
+        let role = inner.packs.role(Some(&meta.pack), Some(&meta.role))?.clone();
+        let (record, log) = (inner.paths.session_dir(&child).join(COPY_MANIFEST), inner.paths.session_log(&child));
+        let (tmp, home, copies) = (inner.paths.session_tmp(parent), inner.paths.home.clone(), inner.paths.copies_dir());
+        let (base, models, port) = (inner.config.sandbox.clone(), inner.config.models.clone(), inner.proxy.port());
+        let read = tokio::task::spawn_blocking(move || {
+            let dir = std::fs::canonicalize(&meta.workspace).map_err(|e| {
+                format!(
+                    "The copy of agent {} ({}) cannot be used: {e}. An agent's copy is removed when its mission is archived.",
+                    child.as_str(),
+                    meta.workspace
+                )
+            })?;
+            let manifest = read_json(&record).ok_or_else(|| {
+                format!(
+                    "The record of what the copy of agent {} was made from ({}) cannot be read, so what the agent changed cannot be told. Its files are in {}.",
+                    child.as_str(),
+                    record.display(),
+                    dir.display()
+                )
+            })?;
+            // A log that cannot be read shows no commands; the files are still compared.
+            let runs = read_records(&log).map(|report| runs_of(&report.records)).unwrap_or_default();
+            // Commands the parent has the harness run in the copy: they write there and to the
+            // parent's own scratch directory, under the rules the agent itself ran under.
+            let cfg = with_copies(sandbox_cfg_for(&base, &role, &dir, &models), &copies, Some(&source));
+            let bubblewrap = cfg.mode == SandboxMode::Bubblewrap;
+            let sandbox = Sandbox::new(&cfg, &dir, &tmp, &home, (!bubblewrap).then_some(port))
+                .map_err(|e| format!("The sandbox for the copy of agent {} cannot be set up: {e}", child.as_str()))?;
+            Ok(ChildCopy { agent: child, dir, manifest, running, runs, sandbox: Arc::new(sandbox) })
+        });
+        match read.await {
+            Ok(copy) => copy.map(Some),
+            Err(e) => Err(format!("The agent's copy could not be read: {e}")),
+        }
     }
 
     async fn join(
@@ -1596,7 +1746,10 @@ impl Inner {
             let found = st.known.get(session).map(|k| (k.meta.mission.clone(), k.meta.title.clone()));
             if let Some((mission, title)) = found {
                 match &record.event {
-                    Event::ToolResult(_) | Event::JobRegistered { .. } | Event::JobSettled { .. } => {
+                    Event::ToolResult(_)
+                    | Event::JobRegistered { .. }
+                    | Event::JobSettled { .. }
+                    | Event::JobMatched { .. } => {
                         if let Some((blob, p)) = produced_by(session, &mut st.job_starts, &record.event) {
                             st.producers.entry((mission.clone(), blob)).or_insert(p);
                         }
@@ -1840,8 +1993,17 @@ impl Inner {
         let tmp = self.paths.session_tmp(id);
         loom_core::config::ensure_private_dir(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
         let tmp = std::fs::canonicalize(&tmp).map_err(|e| format!("cannot resolve {}: {e}", tmp.display()))?;
-        let cfg = sandbox_cfg_for(&self.config.sandbox, &role, &workspace, &self.config.models);
+        let copies = self.paths.copies_dir();
+        let cfg = with_copies(
+            sandbox_cfg_for(&self.config.sandbox, &role, &workspace, &self.config.models),
+            &copies,
+            meta.copy_of.as_deref(),
+        );
         let bubblewrap = cfg.mode == loom_core::config::SandboxMode::Bubblewrap;
+        if bubblewrap {
+            // Bubblewrap can keep a replay out of a directory only when the directory exists.
+            let _ = ensure_private_dir(&copies);
+        }
         if bubblewrap && self.config.network.mode != loom_core::config::NetworkMode::DenyAll {
             return Err("Bubblewrap requires network.mode = deny_all. Explicit mission grants apply only to trusted in-process HTTP tools; subprocess proxy bridges are unsupported.".into());
         }
@@ -2220,6 +2382,36 @@ impl Inner {
 
     // ---- children ---------------------------------------------------------------------------
 
+    /// Make the copy of the workspace `source` an agent will work in, at `dest`, and record what it
+    /// was made from beside the agent's log. On `Err` nothing is left at `dest`.
+    async fn make_copy(&self, child: &SessionId, source: PathBuf, dest: PathBuf) -> Result<workcopy::Made, String> {
+        let limits = workcopy::Limits {
+            max_files: self.config.agents.copy_max_files,
+            max_bytes: self.config.agents.copy_max_mb.saturating_mul(1024 * 1024),
+        };
+        let record = self.paths.session_dir(child).join(COPY_MANIFEST);
+        let work = tokio::task::spawn_blocking(move || {
+            // Private like the loom home: a copy holds what the workspace holds.
+            if let Some(root) = dest.parent() {
+                ensure_private_dir(root).map_err(|e| format!("Cannot create {}: {e}", root.display()))?;
+            }
+            let made = workcopy::make(&source, &dest, &limits)?;
+            let written = match record.parent() {
+                Some(dir) => ensure_private_dir(dir).and_then(|()| write_json_atomic(&record, &made.manifest)),
+                None => write_json_atomic(&record, &made.manifest),
+            };
+            if let Err(e) = written {
+                let _ = std::fs::remove_dir_all(&dest);
+                return Err(format!("The agent could not be started: cannot write {}: {e}", record.display()));
+            }
+            Ok(made)
+        });
+        match work.await {
+            Ok(made) => made,
+            Err(e) => Err(format!("The copy of the workspace could not be made: {e}")),
+        }
+    }
+
     async fn spawn_child(self: &Arc<Self>, parent: &SessionId, mut req: SpawnReq) -> Result<SessionId, String> {
         self.check_open()?;
         let (shared, requires_credential, max_steps) = {
@@ -2242,6 +2434,12 @@ impl Inner {
                         prole.may_spawn.join(", ")
                     )
                 })?;
+            if req.workspace == Workspace::Copy && role.read_only {
+                return Err(format!(
+                    "A `{}` agent only reads the workspace, so a copy of it would hold nothing to adopt. Start it without `workspace: \"copy\"`.",
+                    req.role
+                ));
+            }
             let shared = p.active.as_ref().map(|a| a.shared.clone()).ok_or_else(|| SHUTTING.to_string())?;
             (shared, role.requires_credential, role.max_steps)
         };
@@ -2375,11 +2573,19 @@ impl Inner {
                 })?);
             }
             let shared = p.active.as_ref().map(|a| a.shared.clone()).ok_or_else(|| SHUTTING.to_string())?;
+            let (workspace, copy_of) = match req.workspace {
+                Workspace::Shared => (p.meta.workspace.clone(), None),
+                Workspace::Copy => (
+                    self.paths.agent_copy(&p.meta.mission, &child_id).display().to_string(),
+                    Some(p.meta.workspace.clone()),
+                ),
+            };
             let meta = SessionMeta {
                 id: child_id.clone(),
                 mission: p.meta.mission.clone(),
                 parent: Some(parent.clone()),
-                workspace: p.meta.workspace.clone(),
+                workspace,
+                copy_of,
                 pack: p.meta.pack.clone(),
                 role: crole.name.clone(),
                 profile: profile_name.clone(),
@@ -2397,10 +2603,38 @@ impl Inner {
             st.known.insert(child_id.clone(), Known::new(meta.clone(), idle_status()));
             (meta, crole, fork_point, shared, explicit)
         };
+        let copy_dir = meta.copy_of.as_ref().map(|_| PathBuf::from(&meta.workspace));
         let forget = |this: &Inner| {
             this.proxy.revoke(&child_id);
             this.st().known.remove(&child_id);
+            if let Some(dir) = copy_dir.clone() {
+                // Not on this thread: a copy can hold some hundred thousand files.
+                drop(tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)));
+            }
         };
+        // The child is known (and counted against `max_children`) while its copy is made.
+        if let (Some(source), Some(dest)) = (meta.copy_of.clone(), copy_dir.clone()) {
+            let made = match self.make_copy(&child_id, PathBuf::from(&source), dest).await {
+                // The daemon may have begun to stop while the files were copied.
+                Ok(made) => self.check_open().map(|()| made),
+                Err(e) => Err(e),
+            };
+            let made = match made {
+                Ok(made) => made,
+                Err(e) => {
+                    forget(self);
+                    return Err(e);
+                }
+            };
+            // As its commands will see it: `pwd` prints the path with every link resolved.
+            let copy = std::fs::canonicalize(&meta.workspace).map(|p| p.display().to_string());
+            let copy = copy.unwrap_or_else(|_| meta.workspace.clone());
+            let header = texts::copy_header(&copy, &source, &made, req.mode == SpawnMode::Fork);
+            req.brief.context = Some(match req.brief.context.take() {
+                Some(context) => format!("{header}\n\n{context}"),
+                None => header,
+            });
+        }
         let (deps, parts) = match self.build(&meta, explicit) {
             Ok(x) => x,
             Err(e) => {
@@ -3411,6 +3645,7 @@ impl Runtime {
             mission: MissionId::generate(),
             parent: None,
             workspace: workspace.display().to_string(),
+            copy_of: None,
             pack: role.pack.clone(),
             role: role.name.clone(),
             profile: profile_name.clone(),
@@ -3824,6 +4059,39 @@ impl Runtime {
             };
             for sid in idle {
                 let _ = self.inner.clear_scratch(sid).await;
+            }
+            // The agents' own copies of the workspace go with the mission: what was not adopted from
+            // them is discarded. After their tasks have ended, so that no command still runs there.
+            // A lead takes the mission's whole directory of copies, which also holds what a daemon
+            // that died while copying left behind; an agent archived alone takes its own copy.
+            let copies: Vec<PathBuf> = {
+                let st = self.inner.st();
+                let known = |sid: &SessionId| st.known.get(sid).map(|k| k.meta.clone());
+                let own = |m: &SessionMeta| m.copy_of.as_ref().map(|_| PathBuf::from(&m.workspace));
+                match known(id) {
+                    Some(lead) if lead.parent.is_none() => {
+                        let had = family.iter().filter_map(known).any(|m| m.copy_of.is_some());
+                        let dir = self.inner.paths.mission_copies(&lead.mission);
+                        if had || dir.exists() {
+                            vec![dir]
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    Some(agent) => own(&agent).into_iter().collect(),
+                    None => Vec::new(),
+                }
+            };
+            if !copies.is_empty() {
+                self.inner.until_closed(&family).await;
+                let removal = tokio::task::spawn_blocking(move || {
+                    for dir in copies {
+                        let _ = std::fs::remove_dir_all(&dir);
+                        // The mission's directory, once its last copy is gone.
+                        let _ = dir.parent().map(std::fs::remove_dir);
+                    }
+                });
+                let _ = removal.await;
             }
         }
         if !archived {
@@ -5284,6 +5552,7 @@ mod tests {
             awaited: false,
             harness: false,
             prerequisite: None,
+            workspace: Workspace::Shared,
         };
         let worker = e.rt.inner.orch.spawn(&id, req("worker")).await.unwrap();
         let verifier = e.rt.inner.orch.spawn(&id, req("verifier")).await.unwrap();
@@ -5370,6 +5639,7 @@ mod tests {
                         awaited: true,
                         harness: false,
                         prerequisite: None,
+                        workspace: Workspace::Shared,
                     },
                 )
                 .await
@@ -5411,6 +5681,7 @@ mod tests {
             awaited: false,
             harness: false,
             prerequisite: None,
+            workspace: Workspace::Shared,
         };
         let err = orch.spawn(&id, req("nobody")).await.unwrap_err();
         assert!(err.contains("is not a role this session can start"), "{err}");
@@ -5453,6 +5724,7 @@ mod tests {
             awaited: true,
             harness: false,
             prerequisite,
+            workspace: Workspace::Shared,
         };
         assert!(e.rt.inner.orch.spawn(&parent, request(None)).await.unwrap_err().contains("requires explicit"));
         assert!(e.children(&parent).is_empty());
@@ -5560,6 +5832,7 @@ mod tests {
             awaited: false,
             harness,
             prerequisite: None,
+            workspace: Workspace::Shared,
         };
         orch.spawn(&id, req("verifier", true)).await.unwrap();
         orch.spawn(&id, req("worker", false)).await.expect("a gate verifier is not counted against max_children");
@@ -5585,6 +5858,7 @@ mod tests {
             awaited: false,
             harness,
             prerequisite: None,
+            workspace: Workspace::Shared,
         };
         orch.spawn(&id, req("worker", false)).await.unwrap();
         let err = orch.spawn(&id, req("verifier", false)).await.unwrap_err();
@@ -5820,6 +6094,7 @@ mod tests {
             awaited: false,
             harness: false,
             prerequisite: None,
+            workspace: Workspace::Shared,
         };
         orch.spawn(&id, again).await.expect("a stopped agent does not count toward max_children");
         let settled = |c: &ChildSettled| c.child == child && c.outcome == ChildOutcome::Stopped && !c.inline;
@@ -5900,6 +6175,7 @@ mod tests {
             awaited: true,
             harness: false,
             prerequisite: None,
+            workspace: Workspace::Shared,
         };
         let child = orch.spawn(&id, req).await.unwrap();
         let settlement = tokio::time::timeout(WAIT, orch.join(&id, &child, &CancellationToken::new()))
@@ -6012,6 +6288,49 @@ mod tests {
         let p2 = rt2.inner.orch.producer(&info.meta.mission, &blob).await.unwrap();
         assert_eq!(p2.call_id, call_id);
         rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_part_a_watched_job_matched_is_citable_while_the_job_runs() {
+        // The job writes its line only when the test says so. Bounded, so a failed run leaves no loop.
+        let command = "echo scanning; i=0; while [ ! -f release ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done; \
+                       echo 'FOUND key=abc'; sleep 120";
+        let e = env(Script::new(move |body, _| {
+            if tool_msgs(body) == 0 {
+                call("bash", json!({"command": command, "background": true, "wake_on": "^FOUND"}))
+            } else {
+                Action::Reply(Reply::text("noted"))
+            }
+        }))
+        .await;
+        // The chat role ends its turns by replying; it has no `wait`.
+        let mut chat = e.new_session(Some("start a job"));
+        chat.role = Some("chat".into());
+        let info = e.rt.create_session(chat).await.unwrap();
+        let id = info.meta.id.clone();
+        until("registered", || e.has(&id, |ev| matches!(ev, Event::JobRegistered { .. }))).await;
+        let call_id = e
+            .records(&id)
+            .iter()
+            .find_map(|r| match &r.event {
+                Event::ToolCall(c) if c.name == "bash" => Some(c.call_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        // The mission's logs have been read for producers once: what follows is learned from the
+        // records as they are written, or not at all.
+        assert!(e.rt.inner.orch.producer(&info.meta.mission, &BlobId::from("00")).await.is_none());
+        std::fs::write(e.ws.join("release"), "").unwrap();
+        until("matched", || e.has(&id, |ev| matches!(ev, Event::JobMatched { .. }))).await;
+        let part = e.records(&id).into_iter().find_map(|r| match r.event {
+            Event::JobMatched { output, .. } => output,
+            _ => None,
+        });
+        let part = part.expect("the matching part is stored");
+        assert!(!e.has(&id, |ev| matches!(ev, Event::JobSettled { .. })), "the job is still running");
+        let p = e.rt.inner.orch.producer(&info.meta.mission, &part.id).await.expect("the part has a producer");
+        assert_eq!((p.session, p.call_id, p.tool.as_str(), p.class), (id, call_id, "bash", ToolClass::Exec));
+        e.rt.shutdown().await;
     }
 
     /// The `out:…` handle in the header of the `n`th tool message of a request.
@@ -6166,6 +6485,21 @@ mod tests {
         assert!(produced_by(&s, &mut jobs, &reg("c4")).is_none());
         let wait = tool_result("c5", "job_wait", ToolClass::Exec, None, json!({"job": "j1"}));
         assert!(produced_by(&s, &mut jobs, &wait).is_none());
+        // A part of its output stored while it runs belongs to that call too, and the job stays known.
+        let matched = Event::JobMatched {
+            job_id: "j1".into(),
+            pattern: "FOUND".into(),
+            output: Some(loom_core::BlobRef { id: BlobId::from("cc02"), bytes: 10, lines: 2 }),
+            from: 0,
+            shown: vec![1],
+            matches: 1,
+        };
+        let p = produced_by(&s, &mut jobs, &matched).expect("the matched part registers");
+        assert_eq!(
+            (p.0, p.1.call_id, p.1.class, p.1.tool.as_str()),
+            (BlobId::from("cc02"), CallId::from("c4"), ToolClass::Exec, "bash")
+        );
+        assert_eq!(jobs.len(), 1, "a job that matched is still running");
         let settled = Event::JobSettled {
             job_id: "j1".into(),
             exit_code: Some(0),
@@ -7309,6 +7643,7 @@ mod tests {
             awaited: true,
             harness: false,
             prerequisite: None,
+            workspace: Workspace::Shared,
         };
         let a = e.rt.inner.orch.spawn(&id, req).await.unwrap();
         let kept = e.rt.inner.paths.session_dir(&a).join("settlement.json");
@@ -7515,6 +7850,7 @@ mod tests {
             awaited: true,
             harness: false,
             prerequisite: None,
+            workspace: Workspace::Shared,
         };
         let child = e.rt.inner.orch.spawn(&id, req).await.unwrap();
         let kept = e.rt.inner.paths.session_dir(&child).join("settlement.json");
@@ -7601,6 +7937,7 @@ mod tests {
                         awaited: true,
                         harness: false,
                         prerequisite: None,
+                        workspace: Workspace::Shared,
                     },
                 )
                 .await
@@ -7755,6 +8092,7 @@ mod tests {
                         awaited: true,
                         harness: false,
                         prerequisite: None,
+                        workspace: Workspace::Shared,
                     },
                 )
                 .await
@@ -8435,6 +8773,7 @@ mod tests {
             awaited: true,
             harness: false,
             prerequisite: None,
+            workspace: Workspace::Shared,
         };
         let first = e.rt.inner.orch.spawn(&parent, req.clone()).await.unwrap();
         let second = e.rt.inner.orch.spawn(&parent, req.clone()).await.unwrap();
@@ -8476,6 +8815,7 @@ mod tests {
             awaited: true,
             harness: true,
             prerequisite: None,
+            workspace: Workspace::Shared,
         };
         assert!(e.rt.inner.orch.spawn(&parent, req).await.unwrap_err().contains("distinct named profile"));
         assert!(e.server.requests().is_empty());
@@ -8514,6 +8854,7 @@ mod tests {
             awaited: true,
             harness: false,
             prerequisite: None,
+            workspace: Workspace::Shared,
         };
         let first = e.rt.inner.orch.spawn(&parent, req.clone()).await.unwrap();
         let result = e.rt.inner.orch.join(&parent, &first, &CancellationToken::new()).await.unwrap();
@@ -8523,5 +8864,254 @@ mod tests {
         assert_eq!(e.rt.session(&next).unwrap().meta.profile, "other");
         assert_eq!(e.records(&next).iter().filter(|r| matches!(r.event, Event::Forked(_))).count(), 0);
         e.rt.shutdown().await;
+    }
+
+    // ---- an agent's own copy of the workspace ----
+
+    /// The text of a request's latest tool message.
+    fn last_tool_text(body: &Value) -> String {
+        let messages = body["messages"].as_array();
+        let last = messages.and_then(|m| m.iter().rev().find(|m| m["role"] == "tool"));
+        last.and_then(|m| m["content"].as_str()).unwrap_or("").to_string()
+    }
+
+    #[tokio::test]
+    async fn an_agent_in_its_own_copy_changes_the_workspace_only_when_it_is_adopted() {
+        let ws_at = Arc::new(Mutex::new(None::<PathBuf>));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (at, log) = (ws_at.clone(), seen.clone());
+        let e = env(Script::new(move |body, _| {
+            if !has_tool(body, "agent_spawn") {
+                return if tool_msgs(body) == 0 {
+                    call("bash", json!({"command": "pwd; echo two-longer > a.txt; echo new > b.txt"}))
+                } else {
+                    finish("child report")
+                };
+            }
+            match tool_msgs(body) {
+                0 => call("agent_spawn", json!({"question": "CHILDMARK", "workspace": "copy"})),
+                1 => {
+                    // What the workspace holds after the agent has ended and before anything is adopted.
+                    let ws = at.lock().unwrap().clone().unwrap();
+                    let mut log = log.lock().unwrap();
+                    if log.is_empty() {
+                        log.push(std::fs::read_to_string(ws.join("a.txt")).unwrap_or_default());
+                        log.push(format!("b.txt there: {}", ws.join("b.txt").exists()));
+                        log.push(last_tool_text(body));
+                    }
+                    call("agent_adopt", json!({"agent": "last"}))
+                }
+                _ => {
+                    let mut log = log.lock().unwrap();
+                    if log.len() == 3 {
+                        log.push(last_tool_text(body));
+                    }
+                    finish("lead done")
+                }
+            }
+        }))
+        .await;
+        std::fs::write(e.ws.join("a.txt"), "one\n").unwrap();
+        *ws_at.lock().unwrap() = Some(e.ws.clone());
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("the lead finished", || {
+            e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))
+        })
+        .await;
+        let child = e.children(&id).pop().expect("the agent");
+        // Its workspace is a copy beside the loom home, and its meta says what it is a copy of.
+        let copy = Paths::at(e.dir.path().join("home")).agent_copy(&child.meta.mission, &child.meta.id);
+        assert_eq!(child.meta.workspace, copy.display().to_string());
+        let lead_ws = e.rt.session(&id).unwrap().meta.workspace;
+        assert_eq!(child.meta.copy_of.as_deref(), Some(lead_ws.as_str()));
+        assert!(copy.join("a.txt").is_file());
+        // It was told so, and its command ran there.
+        let reqs = e.server.requests();
+        let told =
+            reqs.iter().find(|b| !has_tool(b, "agent_spawn") && mentions(b, "CHILDMARK")).expect("child request");
+        assert!(mentions(told, "You work in your own copy of the workspace"), "{told}");
+        let ran = reqs.iter().find(|b| !has_tool(b, "agent_spawn") && tool_msgs(b) == 1).expect("after its command");
+        let shown = last_tool_text(ran);
+        let canonical = std::fs::canonicalize(&copy).unwrap();
+        assert!(shown.contains(&canonical.display().to_string()), "{shown}");
+        // Before the adoption the workspace was as it had been; the lead was shown what differs.
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(log.len(), 4, "{log:?}");
+        assert_eq!(log[0], "one\n");
+        assert_eq!(log[1], "b.txt there: false");
+        assert!(log[2].contains("===== report of agent"), "{}", log[2]);
+        assert!(log[2].contains("2 files differ from your workspace"), "{}", log[2]);
+        assert!(log[2].contains("M a.txt\nA b.txt"), "{}", log[2]);
+        assert!(log[2].contains("- exit 0: `pwd; echo two-longer > a.txt; echo new > b.txt`"), "{}", log[2]);
+        assert!(log[3].contains("adopted 2 files from"), "{}", log[3]);
+        // After it, the workspace has the agent's files.
+        assert_eq!(std::fs::read_to_string(e.ws.join("a.txt")).unwrap(), "two-longer\n");
+        assert_eq!(std::fs::read_to_string(e.ws.join("b.txt")).unwrap(), "new\n");
+        // The copy goes when the mission is archived.
+        e.rt.archive(&id, true).await.unwrap();
+        assert!(!copy.exists());
+        assert!(e.ws.join("b.txt").is_file());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn attempts_fork_into_copies_and_the_harness_checks_each() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        let e = env(Script::new(move |body, _| {
+            if mentions(body, "This is attempt 1 of 2") {
+                return if last_role(body) == "tool" {
+                    finish("A report")
+                } else {
+                    call("bash", json!({"command": "touch done.txt"}))
+                };
+            }
+            if mentions(body, "This is attempt 2 of 2") {
+                return finish("B report");
+            }
+            match tool_msgs(body) {
+                0 => call("attempt", json!({"question": "make done.txt", "n": 2, "check": "test -f done.txt"})),
+                1 => {
+                    let text = last_tool_text(body);
+                    let section = text.split("===== attempt 1 of 2: ").nth(1).unwrap_or("");
+                    let winner = section.split(' ').next().unwrap_or("").to_string();
+                    let mut log = log.lock().unwrap();
+                    if log.is_empty() {
+                        log.push(text);
+                    }
+                    call("agent_adopt", json!({"agent": winner}))
+                }
+                _ => finish("lead done"),
+            }
+        }))
+        .await;
+        std::fs::write(e.ws.join("a.txt"), "one\n").unwrap();
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("the lead finished", || {
+            e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))
+        })
+        .await;
+        let children = e.children(&id);
+        assert_eq!(children.len(), 2);
+        for c in &children {
+            assert_eq!(c.meta.mode, Some(SpawnMode::Fork));
+            assert!(c.meta.copy_of.is_some());
+            assert!(c.meta.title.starts_with("attempt "), "{}", c.meta.title);
+        }
+        let log = seen.lock().unwrap().clone();
+        let text = log.first().expect("the result of attempt");
+        assert!(text.contains("2 attempts: 1 passed the check"), "{text}");
+        let second = text.find("===== attempt 2 of 2: ").expect("the second section");
+        assert!(text[..second].contains("check: exit 0") && text[..second].contains("passed"), "{text}");
+        assert!(text[..second].contains("changed: 1 file (1 added)\nA done.txt"), "{text}");
+        assert!(text[..second].contains("report:\n") && text[..second].contains("> A report"), "{text}");
+        assert!(text[second..].contains("check: exit 1") && text[second..].contains("FAILED"), "{text}");
+        assert!(text[second..].contains("changed: nothing"), "{text}");
+        // Only the adopted attempt's file is in the workspace.
+        assert!(e.ws.join("done.txt").is_file());
+        // Both attempts started from the lead's request: its system message, then its conversation,
+        // with the assignment after it.
+        let reqs = e.server.requests();
+        let lead = reqs.iter().find(|b| !mentions(b, "This is attempt") && tool_msgs(b) == 0).expect("lead request");
+        for n in 1..=2 {
+            let mark = format!("This is attempt {n} of 2");
+            let first = reqs.iter().find(|b| mentions(b, &mark)).expect("attempt request");
+            assert_eq!(first["messages"][0], lead["messages"][0]);
+            let said = first["messages"][1]["content"].as_str().unwrap_or_default();
+            assert!(said.starts_with("go\n") && said.contains("You work in your own copy of the workspace"), "{said}");
+        }
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_copy_is_refused_for_a_role_that_only_reads_and_for_a_workspace_past_the_limit() {
+        let e = env_with(
+            Script::new(|body, _| match tool_msgs(body) {
+                0 => call("agent_spawn", json!({"question": "q", "role": "verifier", "workspace": "copy"})),
+                1 => call("agent_spawn", json!({"question": "q", "workspace": "copy"})),
+                _ => finish("lead done"),
+            }),
+            false,
+            |c| c.agents.copy_max_files = 2,
+        )
+        .await;
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(e.ws.join(name), "x\n").unwrap();
+        }
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("the lead finished", || {
+            e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))
+        })
+        .await;
+        let reqs = e.server.requests();
+        let first = last_tool_text(reqs.iter().find(|b| tool_msgs(b) == 1).expect("after the first refusal"));
+        assert!(first.contains("A `verifier` agent only reads the workspace"), "{first}");
+        let second = last_tool_text(reqs.iter().find(|b| tool_msgs(b) == 2).expect("after the second refusal"));
+        assert!(second.contains("more than 2 files") && second.contains("agents.copy_max_files"), "{second}");
+        // Neither left an agent, a slot or a directory behind.
+        assert!(e.children(&id).is_empty());
+        let copies = Paths::at(e.dir.path().join("home")).copies_dir();
+        let left =
+            std::fs::read_dir(&copies).map(|d| d.flatten().flat_map(|m| std::fs::read_dir(m.path())).flatten().count());
+        assert_eq!(left.unwrap_or(0), 0, "{}", copies.display());
+        e.rt.shutdown().await;
+    }
+
+    #[test]
+    fn a_sessions_own_commands_are_read_from_its_log() {
+        let rec = |seq: u64, ts_ms: u64, event: Event| Record {
+            seq,
+            ts_ms,
+            author: Author::Harness,
+            prev: String::new(),
+            event,
+        };
+        let call_of = |id: &str, name: &str, args: Value| {
+            Event::ToolCall(loom_core::event::ToolCall {
+                call_id: CallId::from(id),
+                req_id: "r".into(),
+                name: name.into(),
+                args,
+                class: ToolClass::Exec,
+            })
+        };
+        let result_of = |id: &str, name: &str, meta: Value| {
+            let mut r: loom_core::event::ToolResult = serde_json::from_value(json!({
+                "call_id": id, "name": name, "class": "exec", "status": "ok", "text": "t",
+            }))
+            .expect("a tool result");
+            r.meta = meta.as_object().cloned().unwrap_or_default();
+            Event::ToolResult(r)
+        };
+        let records = vec![
+            rec(0, 10, call_of("c1", "bash", json!({"command": "make test"}))),
+            rec(1, 11, result_of("c1", "bash", json!({ META_EXIT_CODE: 2 }))),
+            // A command that became a job carries no end, and another tool is not a command.
+            rec(2, 20, call_of("c2", "bash", json!({"command": "sleep 100"}))),
+            rec(3, 21, result_of("c2", "bash", json!({ "job": "j1" }))),
+            rec(4, 30, call_of("c3", "read", json!({"path": "a"}))),
+            rec(5, 31, result_of("c3", "read", json!({ META_EXIT_CODE: 0 }))),
+            rec(6, 40, call_of("c4", "bash", json!({"command": "kill -9 $$"}))),
+            rec(7, 41, result_of("c4", "bash", json!({ META_SIGNAL: 9 }))),
+        ];
+        let runs = runs_of(&records);
+        assert_eq!(
+            runs,
+            vec![
+                Run { command: "make test".into(), started_ms: 10, exit_code: Some(2), output: None },
+                Run { command: "kill -9 $$".into(), started_ms: 40, exit_code: None, output: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn copies_are_kept_out_of_replays_and_a_copy_cannot_write_to_its_source() {
+        let base = SandboxCfg { replay_untrusted_paths: vec!["/x".into()], ..SandboxCfg::default() };
+        let shared = with_copies(base.clone(), Path::new("/h-copies"), None);
+        assert_eq!(shared.replay_untrusted_paths, ["/x", "/h-copies"]);
+        assert_eq!(shared.protected_paths, base.protected_paths);
+        let copy = with_copies(shared.clone(), Path::new("/h-copies"), Some("/ws"));
+        assert_eq!(copy.replay_untrusted_paths, ["/x", "/h-copies"]);
+        assert_eq!(copy.protected_paths, ["/ws"]);
     }
 }

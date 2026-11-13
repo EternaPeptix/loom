@@ -698,9 +698,49 @@ the precise specification.
   By default the call waits until the agent settles and its report is the call's result (recorded as an
   `inline` settlement); with `background: true` it returns at once and the report arrives later as an
   `agent-report` block that wakes a waiting lead.
-- `agent_fanout {agents[2..max_children], max_steps?, max_minutes?}` checks every assignment before
-  starting any, starts them, waits for all and returns one result with a `=====` header per agent; a
-  report line that starts with `=====` is prefixed `> `, so a report cannot forge a header.
+- `agent_fanout {agents[2..max_children], max_steps?, max_minutes?, workspace?}` checks every
+  assignment before starting any, starts them, waits for all and returns one result with a `=====`
+  header per agent; a report line that starts with `=====` is prefixed `> `, so a report cannot forge
+  a header.
+- **A copy of the workspace per agent** (`loom_tools::workcopy`, `runtime.rs` *Copies*). Agents share
+  their lead's workspace unless they are started with `workspace: "copy"` (`agent_spawn`,
+  `agent_fanout`). Such an agent works in its own copy, made as it starts at
+  `<loom home>-copies/<mission>/<agent>` (`~/.loom-copies/…`): everything in the workspace but
+  `.loom`, build output and `.git` included, so that what ran in the workspace runs in the copy.
+  Files are cloned where the file system can (APFS), so a copy takes time proportional to the number
+  of files — about ten thousand a second — and no space until files change. A workspace with more
+  than `agents.copy_max_files` (300 000) files is refused, as is one with more than
+  `agents.copy_max_mb` (20 480) MiB where a copy would duplicate the bytes (not where a probe shows
+  that files are cloned), and a copy for a role that only reads. The agent's
+  assignment begins by saying where it works and that nothing there reaches the original; its file
+  tools and, under a sandbox, its commands cannot write to the workspace the copy was made from. A
+  `.git` that is a pointer to a repository outside the workspace (a linked worktree) is not copied,
+  because Git commands in the copy would then change the original's index and `HEAD`; the agent is
+  told its copy is not a repository.
+  What an agent changed is told by comparing its copy with a manifest written when the copy was made
+  (size, modification time, permission bits, link targets of every file Git would not ignore), not
+  by Git, so it works in any directory and ignores build output. Making the copy ends only when the
+  clock is past the newest time in the manifest (a wait of at most 2.5 s, and none unless a file was
+  written just before), so a file written afterwards cannot have a time the manifest has, however
+  coarse the file system's clock is. The lead is shown the changed paths
+  with the agent's report, and the commands the agent ran to their end with how each ended (marked
+  when a file changed after the command started).
+- `agent_adopt {agent, preview?}` brings one agent's changes into the lead's workspace: added and
+  modified files are written, deleted ones removed. Nothing is merged. A path the agent changed that
+  has also changed in the workspace since the copy was made is a conflict, and with one conflict (or
+  one path the lead's sandbox rules refuse) nothing is written. A path that is in the workspace as
+  the agent's copy has it — the same bytes and permission bits, compared as such and not by time —
+  is no conflict and is left alone. Adopting twice is harmless, and two
+  agents whose changes touch different paths can be adopted one after the other. `.git` is never
+  touched. Copies stay until the mission is archived, which removes them.
+- `attempt {question…, check, n?, approaches?, mode?, check_timeout_s?}` is best-of-N: `n` agents (3
+  by default) get the same assignment at once, each in its own copy, by default as forks of the lead
+  — so they share one cached prefix and differ only from the assignment on — optionally each with
+  its own `approaches` sentence. When all have ended the harness itself runs `check` in every copy,
+  one at a time, under a sandbox that can write the copy and not the lead's workspace, and the
+  result gives per attempt the check's exit status, the end of its output with the handle of all of
+  it, the changed paths and the report. The lead picks one by that evidence and adopts it; the
+  status is an error when no attempt passed. Forks that only vote remain `decide`.
 - `agent_message {agent, text}`; `agent_stop {agent | all}`, which waits up to `tools.kill_grace_s`
   + 2 s for the agent to settle and says `stopped` or `stopping`; `wait` ends the lead's turn until a
   job or an agent ends. Running agents are listed in the HUD.
@@ -823,8 +863,8 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
 `write`, `edit`, `glob`, `grep`, `out_read`, `out_grep`, `web_fetch`, `cve_lookup`, `cve_search`,
 `advisory_lookup`. Runtime-owned (`loom-agent::rtools`, `NAMES`): `plan`, `step`, `note`, `claim`,
 `claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `finish`, `verdict`, `ask_user`,
-`report_blocker`, `wait`, `agent_spawn`, `agent_fanout`, `agent_message`, `agent_stop`, `decide`,
-`verify`. A role lists the tools it has, in request order; a name in neither set is a pack error. The
+`report_blocker`, `wait`, `agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`,
+`agent_stop`, `decide`, `verify`. A role lists the tools it has, in request order; a name in neither set is a pack error. The
 set is frozen in `session_start`. Every call goes through one pipeline (`loom_tools::prepare` → `run`
 → `finish`): lookup, argument check, run (a panic becomes an error result), store and admit. Each tool
 has a class — `Nav`, `Read`, `Exec`, `Write`, `State`, `Terminal` — which drives eviction order,
@@ -888,6 +928,19 @@ evidence kind and staleness. Each module's documentation is the precise specific
   job (TERM, then KILL), `job_list` lists them. When a job settles its complete output is stored, the
   session is told in a note unless the model already saw its end, and a session whose last turn
   ended `waiting` or `yielded` starts a turn.
+  **Watched output.** `bash {…, wake_on, wake_every_s?}` makes the job the call leaves behind a
+  watched one: twice a second the table reads what the job has written since, as the text the model
+  would be shown (escape sequences removed, whole lines only), and when a line matches the regular
+  expression `wake_on` it stores that part of the output and reports the matching lines with their
+  numbers. The session records `job_matched`, shows the lines and the part's handle in a note, and
+  — like a job's end — starts a turn (trigger `job_output`) when its last turn ended `waiting` or
+  `yielded`; a session in a turn reads the note at its next step. Reports of one job are at least
+  `wake_every_s` apart (default `tools.job_wake_gap_s`, 30; matches in between are counted into the
+  next report) and at most `tools.job_wake_max` (20), after which the job is followed with
+  `job_wait`. So a fuzzer, a cracker or a listener that runs for hours costs no step until it prints
+  what the session said it is waiting for. When a watched job ends by itself its last output is
+  looked at once more and a match is reported before its end; a job that is killed, or that a
+  daemon restart stops tracking, reports nothing more.
   Every command writes `jobs/jN.out`, `jN.status` and `jN.pid` (created fresh); the pid record holds the
   shell's pid and start time, the members of a group that outlived it, and the owning daemon. At the
   next start a previous daemon's process group is killed only when its leader or a recorded member is
@@ -1369,7 +1422,11 @@ relied on.
   option on stop, and a text/plain line-range route `GET /api/blobs/{id}?start=&end=`.
 - A stderr line count in the `bash` header (stdout and stderr are one stream).
 - A separate handle to the full list of a `glob` or `grep` result beyond the stored result itself.
-- Staleness across the mission (a file another session modified).
+- Staleness across the mission (a file another session modified) for agents that share the
+  workspace. An agent started with `workspace: "copy"` cannot be affected, and `agent_adopt` refuses
+  paths that changed on both sides.
+- Merging an agent's copy into a workspace that changed in the same files, and adopting through Git
+  (a branch or a patch) rather than by files.
 - Background request priority for digests and titles (`Priority::Background` exists and nothing uses
   it; titles are not written by a model).
 - A warning when a configured context window is larger than the one the server reports

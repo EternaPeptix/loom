@@ -34,6 +34,7 @@ function oneOfEach() {
     rec("child_settled", { child: "s-b", outcome: "returned", report: "r", full: BLOB, usage: {}, steps: 2, inline: true }, { agent: "s-b" }),
     rec("job_registered", { job_id: "j1", call_id: "c1", command: "make" }),
     rec("job_settled", { job_id: "j1", exit_code: 0, output: BLOB, detail: "d" }),
+    rec("job_matched", { job_id: "j1", pattern: "CRASH", output: BLOB, from: 0, shown: [2], matches: 1 }),
     rec("inbox_opened", { item_id: "i-1", item_kind: "question", text: "t", options: ["a"], blocking: true, call_id: "c1", reference: "q1" }),
     rec("inbox_resolved", { item_id: "i-1", answer: "a" }, "user"),
     rec("ledger", { n: 3, summary: "s" }),
@@ -617,7 +618,7 @@ test("one record of each kind: shown kinds produce blocks, hidden kinds do not",
   const kinds = store.blocks.map((b) => b.kind);
   assert.deepEqual(kinds, [
     "user", "note", "line" /* model_request, detail */, "response", "tool", "reweave", "child_spawned", "child_settled",
-    "line" /* job registered */, "line" /* job settled */, "inbox", "line" /* ledger */, "line" /* cache break */,
+    "line" /* job registered */, "line" /* job settled */, "line" /* job matched */, "inbox", "line" /* ledger */, "line" /* cache break */,
     "line" /* interrupted */, "divider", "end",
   ]);
   assert.equal(store.blocks[2].detail, true);
@@ -627,8 +628,12 @@ test("one record of each kind: shown kinds produce blocks, hidden kinds do not",
   const inbox = store.blocks.find((b) => b.kind === "inbox");
   assert.equal(inbox.resolved.answer, "a");
   assert.equal(store.blocks.find((b) => b.kind === "child_settled").inline, true);
+  const matched = store.blocks.find((b) => b.kind === "line" && /matching/.test(b.text));
+  assert.equal(matched.text, "job j1 wrote 1 line matching /CRASH/");
+  assert.deepEqual(matched.blob, BLOB, "the stored part of the output opens from the line");
+  assert.equal(C.recordActivity(rec("job_matched", { job_id: "j1", pattern: "CRASH", matches: 1 })), "Job j1 wrote a line matching /CRASH/");
   assert.equal(store.ended, true);
-  assert.equal(store.next, 25, "the unknown kind still advances the sequence");
+  assert.equal(store.next, 26, "the unknown kind still advances the sequence");
 });
 
 test("tool call and result are one block", () => {

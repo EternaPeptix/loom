@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Watched jobs, agents in their own copies, and attempts
+
+- `bash` takes `wake_on` (a regular expression) and `wake_every_s`. The background job the call
+  leaves behind is watched: when its output has a matching line the session is told, with the lines
+  and a handle to that part of the output, and a session that ended its turn with `wait` is resumed
+  as it is when a job ends. Before, a job that runs for hours could only be polled, a step per look.
+  New record `job_matched` and turn trigger `job_output`; `tools.job_wake_gap_s` (30) and
+  `tools.job_wake_max` (20) bound how often one job reports.
+- `agent_spawn` and `agent_fanout` take `workspace: "copy"`: the agent works in its own copy of the
+  lead's workspace (`~/.loom-copies/<mission>/<agent>`, cloned files on APFS) instead of beside the
+  lead, and the lead is shown which files it changed. New tool `agent_adopt` brings one agent's
+  changes into the workspace, all or nothing: a path that changed on both sides is a conflict and
+  nothing is merged. `agents.copy_max_files` bounds what is copied, and `agents.copy_max_mb` does
+  where a copy duplicates the bytes (not on APFS, where files are cloned).
+- New tool `attempt`: one assignment attempted by several agents at once, each a fork of the lead in
+  its own copy. The harness runs the lead's `check` command in every copy and reports each exit
+  status, output and changed files; the lead adopts one attempt.
+- The built-in `core` lead has `attempt` and `agent_adopt`. Packs installed under `~/.loom/packs` are
+  not updated by an upgrade: add the two tools to a lead's `tools` there to use them (see
+  `docs/RUN.md`).
+- Archiving a mission deletes its agents' copies, including changes that were never adopted.
+- `meta.json` of an agent in a copy has `copy_of`; older daemons ignore it.
+
 ### Domain packs and evaluation
 
 - Added opt-in CTF and Redteam packs with specialist tool surfaces (at most 18 per role), bounded

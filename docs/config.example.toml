@@ -58,6 +58,8 @@ web_fetch_timeout_s = 60
 web_fetch_max_bytes = 20971520   # 20 MiB
 max_output_bytes = 67108864      # a command whose output passes this (64 MiB) is stopped; the first part is kept
 job_wait_s = 120           # how long job_wait waits when the call gives no time
+job_wake_gap_s = 30        # a background job watched with `wake_on` is reported at most this often, when the call gives no time
+job_wake_max = 20          # reports per watched job; after the last one it is followed with job_wait
 # Start a reply's leading read-only calls (read, glob, grep, out_read, out_grep) while the model is
 # still writing the rest. Results are recorded in call order and used only if the finished reply holds
 # the same call. false = run calls only after the whole reply has arrived.
@@ -96,6 +98,8 @@ verify_finish = true       # a role with verify_finish has its finish attacked b
 invalid_calls_before_forcing = 3   # reserved: accepted, but nothing reads it and it has no effect
 unviewed_min_lines = 20    # outputs with at least this many lines never shown are listed in the HUD
 unavailable_notice_s = 300 # a model request still retrying after this long opens a non-blocking inbox item and notifies you (it closes by itself); 0 = never
+copy_max_files = 300000    # a workspace with more files is not copied for an agent that asks for its own copy (workspace = "copy", attempts)
+copy_max_mb = 20480        # nor one with more MiB of file content, where a copy duplicates them; 0 = no limit. Not applied on APFS, where copies are clones that take no space until files change
 
 [notify]
 # command = ["/usr/local/bin/my-notify"]   # program run per notification, given LOOM_KIND, LOOM_SESSION, LOOM_TITLE and LOOM_TEXT in its environment; default: the platform's notifier (macOS only; elsewhere nobody is notified)
