@@ -10,6 +10,10 @@
   New module `loom-agent::frontier` (`frontier`, `attempts_run`, `render`, `directions`).
 - `claim_update` to `supported` adds one line, `Established: {id}. Results established in this mission so
   far: {n} ({ids}).`, so a banked result stays in view.
+- A refused `finish` (goal not concluded) now lists the routes the ledger still shows open, from
+  `frontier::directions`, and says to pick one and run it. When the ledger shows none it asks for three
+  untried approaches, then names the role's real ways out (`ask_for`, `agent_spawn`, `report_blocker`).
+  `conclude` unreachable with open plan steps adds that those steps are routes still open.
 
 ### Watched jobs, agents in their own copies, and attempts
 
