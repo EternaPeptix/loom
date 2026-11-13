@@ -1,0 +1,51 @@
+name = "redteam"
+description = "Evidence-linked redteam investigations with operator-pinned verification."
+default_role = "commander"
+preamble = "harness.md"
+requires_restricted_network = true
+command_guard = "offensive"
+target_concurrency = 2
+
+[roles.commander]
+prompt = "roles/commander.md"
+termination = "explicit"
+tools = ["read", "out_read", "plan", "step", "claim", "claim_update", "evidence", "security_record", "security_query", "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "verify", "request_scope", "conclude", "finish", "report_blocker"]
+may_spawn = ["recon_operator", "tactical_operator", "lateral_operator", "observer", "op_judge"]
+verify_finish = true
+verifier = "op_judge"
+require_oracle = true
+max_exec_calls = 0
+
+[roles.recon_operator]
+prompt = "roles/recon_operator.md"
+termination = "explicit"
+tools = ["bash", "read", "write", "out_read", "web_fetch", "http_send", "security_ingest", "security_query", "security_record", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "codec_calc"]
+max_steps = 25
+
+[roles.tactical_operator]
+prompt = "roles/tactical_operator.md"
+termination = "explicit"
+tools = ["bash", "read", "write", "out_read", "pty_open", "pty_exec", "pty_close", "http_send", "http_repeat", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill"]
+max_steps = 30
+
+[roles.lateral_operator]
+prompt = "roles/lateral_operator.md"
+termination = "explicit"
+tools = ["bash", "read", "write", "out_read", "pty_open", "pty_exec", "pty_close", "http_send", "http_repeat", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill"]
+requires_credential = true
+max_steps = 30
+
+[roles.observer]
+prompt = "roles/observer.md"
+termination = "explicit"
+tools = ["read", "out_read", "log_search", "security_query", "finish", "report_blocker"]
+read_only = true
+max_steps = 8
+
+[roles.op_judge]
+prompt = "roles/op_judge.md"
+termination = "explicit"
+tools = ["read", "out_read", "oracle_check", "security_query", "security_record", "evidence", "verdict"]
+read_only = true
+max_steps = 12
+# model = "independent-judge" # operator-defined profile; also set lead require_distinct_verifier_profile = true when configured.

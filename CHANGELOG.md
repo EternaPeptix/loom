@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Domain packs and evaluation
+
+- Added opt-in CTF and Redteam packs with specialist tool surfaces (at most 18 per role), bounded
+  epochs, credential-gated lateral assignments, observers and operator-contract judges. Existing
+  installed packs and running session prefixes are not automatically replaced.
+- Added a paired qualification protocol and a JSONL analyzer that retains censored failures, unknown
+  usage and pairing errors. It performs no model/target calls and claims no benchmark improvement.
+
 ### Structured execution and security gates
 
 - Added opt-in session-local PTY, structured HTTP replay/cookie/capture/race, exact codec/TOTP,

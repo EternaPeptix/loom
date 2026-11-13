@@ -39,6 +39,8 @@ jobs:
           node-version: 22
       - name: UI tests
         run: node --test ui/core.test.js
+      - name: Security evaluation accounting tests
+        run: python3 -B tools/security-eval.test.py
 
   linux-bubblewrap:
     runs-on: ubuntu-24.04

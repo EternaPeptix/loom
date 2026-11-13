@@ -207,6 +207,11 @@ pipeline (scope gate, evidence tiers, a judge that attacks the researcher's fini
 expressed as roles, ledger records and the harness's own checks. It is not installed by default; see
 `packs/vr/README.md`.
 
+`packs/ctf` and `packs/redteam` add bounded specialist roles, typed security state and independent
+operator-contract verification. They are opt-in and require explicit scope and acceptance setup;
+see [CTF](packs/ctf/README.md), [Redteam](packs/redteam/README.md), and the
+[qualification protocol](docs/SECURITY-EVAL.md). External model/corpus performance is unmeasured.
+
 ## Building and testing
 
 ```

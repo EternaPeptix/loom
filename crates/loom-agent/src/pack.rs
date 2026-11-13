@@ -891,4 +891,26 @@ mod tests {
         assert!(Packs::load(mk(&missing_oracle_verifier).path()).unwrap_err().contains("require_oracle"));
     }
 
+    #[test]
+    fn security_packs_have_bounded_tool_surfaces_and_only_lateral_dispatch_requires_credentials() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let packs = Packs::load(&dir).unwrap();
+        packs.check_tools(&crate::rtools::known_tools()).unwrap();
+        for name in ["ctf", "redteam"] {
+            let pack = packs.get(name).unwrap();
+            assert!(pack.requires_restricted_network);
+            assert!(pack.command_guard);
+            for role in pack.roles.values() {
+                assert!(role.tools.len() <= 18, "{name}/{} exposes {} tools", role.name, role.tools.len());
+                assert_eq!(role.requires_credential, name == "redteam" && role.name == "lateral_operator");
+                if role.name != pack.default_role {
+                    assert!(role.max_steps.is_some(), "{name}/{} lacks an epoch cap", role.name);
+                }
+            }
+            assert!(pack.roles.get(&pack.default_role).unwrap().require_oracle);
+        }
+        assert_eq!(packs.role(Some("ctf"), Some("solver")).unwrap().max_steps, Some(35));
+        assert_eq!(packs.role(Some("redteam"), Some("recon_operator")).unwrap().max_steps, Some(25));
+        assert_eq!(packs.role(Some("redteam"), Some("lateral_operator")).unwrap().max_steps, Some(30));
+    }
 }
