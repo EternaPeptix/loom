@@ -1,6 +1,8 @@
 //! The harness-state block: what the model is told, fresh at every step, about where things stand.
 //!
 //! CONTRACT.
+//! Normalized outcome repetition warnings supplement exact repeats; they never declare two targets
+//! equivalent, block tools, or establish task success.
 //!
 //! The block is the last message of each request and is not part of the stored prefix, so it can
 //! change freely. It carries what a model otherwise loses track of over a long session: the mission
@@ -50,6 +52,11 @@
 //!   verifier is an open obligation, else `Finish: conclude the goal first — …` while the goal-met
 //!   goal is set, its goal-met claim is not concluded and the operator has not released the mission. The
 //!   goal status itself is a line of the mission state.
+//! - Typed security state: bounded mandatory coverage, unacknowledged routes unlocked by currently
+//!   live credentials/footholds, hypothesis status/priority and attempt counts. Render only record IDs
+//!   and counts, never locators, principals, secrets, free-form hypothesis/attempt text or conditions.
+//!   Route notices persist until an explicit `security_record` revisit_acknowledge; rendering writes
+//!   nothing. A bounded causal projection reports incomplete closure as unknown, never false.
 //! - Not looked at: `observe::unviewed(records, input.unviewed_min_lines)`; gaps as `a-b` joined by
 //!   `, `, at most 4 gaps then `, …`.
 //! - Repeated: `observe::repetitions(records, 3)`.
@@ -78,6 +85,7 @@ use crate::texts;
 use loom_core::event::{Budget, Event, Record, ToolClass, ToolStatus, META_PATH};
 use loom_core::ledger::{BriefOpts, LedgerState, ObligationKind};
 use loom_core::observe::{self, StaleKind};
+use loom_core::security_state::{HypothesisStatus, SecurityState};
 use serde_json::Value;
 
 pub const MAX_ITEMS: usize = 8;
@@ -129,6 +137,7 @@ pub fn render(input: &HudInput<'_>) -> String {
             sections
                 .push(format!("Mission state (from the ledger — the ledger tools change it):\n{}", brief.trim_end()));
         }
+        security_sections(&mut sections, &ledger.security, input.now_ms);
         if !input.is_child {
             if let Some(line) = finish_line(ledger, input.finish_gated) {
                 sections.push(line);
@@ -169,6 +178,17 @@ pub fn render(input: &HudInput<'_>) -> String {
         .collect();
     push_list(&mut sections, "Repeated calls", " — the result will not change; do something different", repeated);
 
+    let similar = observe::outcome_repetitions(input.records, 3)
+        .iter()
+        .map(|r| {
+            format!(
+                "- {} — {} similar admitted outcomes; compare targets and raw outputs before repeating",
+                r.tool, r.count
+            )
+        })
+        .collect();
+    push_list(&mut sections, "Possible repeated outcomes (advisory)", "", similar);
+
     push_list(&mut sections, "Out of date", "", stale_lines(input.records));
 
     let mut running: Vec<String> = Vec::new();
@@ -193,6 +213,52 @@ pub fn render(input: &HudInput<'_>) -> String {
     }
 
     sections.join("\n\n")
+}
+
+/// A compact index, not a copy of the security ledger: credentials and free-form observations can
+/// contain secrets. Explicit queries supply details only when the agent actually needs them.
+fn security_sections(sections: &mut Vec<String>, state: &SecurityState, now_ms: u64) {
+    let mandatory = state
+        .mandatory_open()
+        .into_iter()
+        .map(|id| format!("- {id}: untested; record attested coverage or defer with a reason"))
+        .collect();
+    push_list(sections, "Mandatory security coverage", "", mandatory);
+    let unlocked = state.newly_unlocked_at(now_ms).into_iter()
+        .map(|id| format!("- {id}: prerequisites available; inspect the route, then acknowledge with security_record revisit_acknowledge"))
+        .collect();
+    push_list(sections, "Routes to revisit", " — unverified opportunities, not established access", unlocked);
+    let mut hypotheses: Vec<_> = state.hypotheses.values().collect();
+    hypotheses.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.id.cmp(&b.id)));
+    let hypotheses = hypotheses
+        .into_iter()
+        .map(|h| {
+            let status = match h.status {
+                HypothesisStatus::Open => "open",
+                HypothesisStatus::Supported => "supported",
+                HypothesisStatus::Refuted => "refuted",
+            };
+            format!(
+                "- {}: {status}, priority {}, {} evidence / {} counterevidence; query details before choosing work",
+                h.id,
+                h.priority,
+                h.evidence.len(),
+                h.counterevidence.len()
+            )
+        })
+        .collect();
+    push_list(sections, "Security hypotheses", "", hypotheses);
+    let attempts = state.vector_attempts.values().fold(0usize, |n, v| n.saturating_add(v.len()));
+    let crash_attempts = state.crashes.values().fold(0usize, |n, c| n.saturating_add(c.attempts.len()));
+    if attempts > 0 || !state.crashes.is_empty() {
+        sections.push(format!("Security attempts: {} vector groups, {attempts} retained attempts; {} distinct crash signatures, {crash_attempts} retained crash attempts. Query typed state before repeating a vector.", state.vector_attempts.len(), state.crashes.len()));
+    }
+    if !state.facts.is_empty() || !state.rules.is_empty() || state.retraction_limitation.is_some() {
+        let projection = state.projection();
+        if !projection.complete || state.retraction_limitation.is_some() {
+            sections.push("Causal projection incomplete: missing or removed conclusions are unknown. Narrow the rules and use security_query before relying on absence.".into());
+        }
+    }
 }
 
 /// The last `BUDGET_WARN_PCT`% of the step or the minute allowance, whichever is reached first. The
@@ -792,5 +858,118 @@ Waiting on the operator (1):\n- q2: Which branch should this target?",
     fn stale_dedup_keeps_one_entry_per_key() {
         let items = stale_lines(&stale_records());
         assert_eq!(items.len(), 2);
+    }
+    #[test]
+    fn typed_security_hud_is_bounded_and_does_not_disclose_values() {
+        use loom_core::ids::SessionId;
+        use loom_core::security_state::{Asset, AssetKind, AttemptInput, CoverageDisposition, Hypothesis};
+        let mut ledger = LedgerState::default();
+        for n in 0..12 {
+            let id = format!("as-{n:02}");
+            ledger.security.assets.insert(
+                id.clone(),
+                Asset {
+                    id,
+                    kind: AssetKind::Endpoint,
+                    locator: "https://private/?token=SECRET".into(),
+                    evidence: vec![],
+                    mandatory: true,
+                    parent: None,
+                    coverage: CoverageDisposition::Untested,
+                    n,
+                },
+            );
+        }
+        ledger.security.hypotheses.insert(
+            "hy-1".into(),
+            Hypothesis {
+                id: "hy-1".into(),
+                text: "SECRET hypothesis".into(),
+                priority: 2,
+                owner: SessionId::from("s-owner"),
+                status: HypothesisStatus::Open,
+                evidence: vec![],
+                counterevidence: vec![],
+                note: "SECRET note".into(),
+                judge: None,
+                n: 1,
+            },
+        );
+        ledger.security.vector_attempts.insert(
+            "SECRET vector".into(),
+            vec![AttemptInput { vector: "SECRET vector".into(), summary: "SECRET attempt".into(), evidence: vec![] }],
+        );
+        let mut args = input(&[]);
+        args.ledger = Some(&ledger);
+        let text = render(&args);
+        assert!(text.contains("Mandatory security coverage (12)"));
+        assert!(text.contains("(+4 more)"));
+        assert!(text.contains("hy-1: open, priority 2"));
+        assert!(text.contains("1 vector groups, 1 retained attempts"));
+        assert!(!text.contains("SECRET"));
+        assert_eq!(text, render(&args));
+    }
+
+    #[test]
+    fn route_notices_respect_credential_expiry_and_explicit_acknowledgment() {
+        use loom_core::security_state::{BlockedRoute, Condition, ConditionKind, Credential, CredentialInput};
+        let mut ledger = LedgerState::default();
+        let condition = Condition { kind: ConditionKind::Auth, value: "SECRET scope".into() };
+        ledger
+            .security
+            .blocked
+            .insert("c1".into(), BlockedRoute { target: "c1".into(), conditions: vec![condition.clone()], n: 1 });
+        ledger.security.credentials.insert(
+            "cr-1".into(),
+            Credential {
+                id: "cr-1".into(),
+                input: CredentialInput {
+                    asset: "as-1".into(),
+                    principal: "SECRET user".into(),
+                    secret_handle: "out:SECRET".into(),
+                    evidence: vec![],
+                    unlocks: vec![condition],
+                    expires_ms: Some(200),
+                },
+                n: 2,
+            },
+        );
+        let render_at = |state: &LedgerState, now| {
+            let mut args = input(&[]);
+            args.ledger = Some(state);
+            args.now_ms = now;
+            render(&args)
+        };
+        let first = render_at(&ledger, 100);
+        assert!(first.contains("Routes to revisit"));
+        assert!(!first.contains("SECRET"));
+        assert!(render_at(&ledger, 100).contains("Routes to revisit"), "rendering must not acknowledge state");
+        assert!(!render_at(&ledger, 200).contains("Routes to revisit"));
+        ledger.security.revisited.insert("c1".into(), 3);
+        assert!(!render_at(&ledger, 100).contains("Routes to revisit"));
+        ledger.security.retraction_limitation = Some("SECRET diagnostic".into());
+        let text = render_at(&ledger, 100);
+        assert!(text.contains("Causal projection incomplete"));
+        assert!(!text.contains("SECRET"));
+    }
+
+    #[test]
+    fn an_incomplete_causal_projection_is_never_rendered_as_negative_knowledge() {
+        use loom_core::security_state::{AssertedFact, Fact};
+        let mut ledger = LedgerState::default();
+        for (n, args) in [vec!["SECRET".to_string()], vec![]].into_iter().enumerate() {
+            let fact = Fact { predicate: "relation".into(), args };
+            let id = fact.id();
+            ledger
+                .security
+                .facts
+                .insert(id.clone(), AssertedFact { id, fact, evidence: vec![], active: true, n: n as u64 });
+        }
+        assert!(!ledger.security.projection().complete);
+        let mut args = input(&[]);
+        args.ledger = Some(&ledger);
+        let text = render(&args);
+        assert!(text.contains("missing or removed conclusions are unknown"));
+        assert!(!text.contains("SECRET"));
     }
 }

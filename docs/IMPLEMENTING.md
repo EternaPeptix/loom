@@ -43,7 +43,7 @@ the details. They must stay true of the code:
 
 ## Building and testing
 
-You need Rust 1.85 or newer. From the repository root:
+You need Rust 1.88 or newer. From the repository root:
 
 ```
 cargo build --release -p loom-daemon                  # the `loom` binary

@@ -26,10 +26,10 @@ It inverts the cloud assumptions:
 
 ## Requirements
 
-- Rust 1.85 or newer (`rust-version` in `Cargo.toml`) to build.
-- macOS to run commands under the OS sandbox. The sandbox is macOS seatbelt (`/usr/bin/sandbox-exec`)
-  only. On any other system the daemon refuses to start unless the config says `[sandbox] mode = "none"`,
-  which leaves every command the model runs unconfined.
+- Rust 1.88 or newer (`rust-version` in `Cargo.toml`) to build.
+- macOS for Seatbelt (`/usr/bin/sandbox-exec`), or x86_64/aarch64 Linux with `/usr/bin/bwrap` for
+  `mode = "bubblewrap"` (deny-all shell networking; no proxy bridge). Explicit `mode = "none"` leaves
+  every shell command unconfined, including verifier roles. Missing sandbox support fails closed.
 - An OpenAI-compatible `/v1/chat/completions` server that streams.
 
 ## Quick start
@@ -206,6 +206,11 @@ A pack is a set of roles. `core` (built in) is general. `vr` (`packs/vr/`) is a 
 pipeline (scope gate, evidence tiers, a judge that attacks the researcher's finish, a report-readiness gate)
 expressed as roles, ledger records and the harness's own checks. It is not installed by default; see
 `packs/vr/README.md`.
+
+`packs/ctf` and `packs/redteam` add bounded specialist roles, typed security state and independent
+operator-contract verification. They are opt-in and require explicit scope and acceptance setup;
+see [CTF](packs/ctf/README.md), [Redteam](packs/redteam/README.md), and the
+[qualification protocol](docs/SECURITY-EVAL.md). External model/corpus performance is unmeasured.
 
 ## Building and testing
 

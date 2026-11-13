@@ -8,7 +8,8 @@
 //!
 //! ## Assignments
 //! [`assignment`] turns one JSON object into `(role, Brief)`:
-//! - keys: `role`, `question`, `hypothesis`, `scope`, `do_not`, `return`, `stop_when`, `context`; any
+//! - keys: `role`, `question`, `hypothesis`, `scope`, `do_not`, `return`, `stop_when`, `context`,
+//!   `asset`, `credential`; any
 //!   other key is an error naming it and listing these;
 //! - every value must be a string (else an error naming the key and what was received);
 //! - `question` is required and must contain non-whitespace;
@@ -16,6 +17,9 @@
 //!   cannot start agents.` When the role is not in `may_spawn`: ``This role can start: a, b. `x` is
 //!   not one of them.``
 //! - strings are kept exactly as given; an optional field that is empty or whitespace becomes `None`.
+//! - `asset`/`credential` are optional together and resolved against attested mission state before
+//!   dispatch. The runtime checks the actual child role's `requires_credential` flag and current expiry
+//!   again, then persists the canonical prerequisite IDs in its assignment header. Neither grants scope.
 //!
 //! Budgets: `max_steps` / `max_minutes` default to `S.agents.child_max_steps` / `child_max_minutes`
 //! and are lowered to those values when larger (the result then carries the header fact `budget
@@ -124,7 +128,8 @@ const FANOUT_LEGEND: &str = "Each agent's report is in its own section. The harn
 
 /// Read one assignment object. See the module contract.
 pub fn assignment(shared: &Shared, object: &Map<String, Value>) -> Result<(String, Brief), String> {
-    const KEYS: [&str; 8] = ["role", "question", "hypothesis", "scope", "do_not", "return", "stop_when", "context"];
+    const KEYS: [&str; 10] =
+        ["role", "question", "hypothesis", "scope", "do_not", "return", "stop_when", "context", "asset", "credential"];
     if let Some(key) = object.keys().find(|k| !KEYS.contains(&k.as_str())) {
         return Err(format!("`{key}` is not a field of an assignment. The fields are: {}.", KEYS.join(", ")));
     }
@@ -206,7 +211,36 @@ fn budget_for(shared: &Shared, args: &Map<String, Value>) -> (Budget, Option<Str
 
 fn request(ctx: &ToolCtx, role: String, mode: SpawnMode, brief: Brief, budget: Budget, awaited: bool) -> SpawnReq {
     let title = cut(&brief.question, 80);
-    SpawnReq { role, mode, brief, budget, call_id: ctx.call_id.clone(), title, awaited, harness: false }
+    SpawnReq {
+        role,
+        mode,
+        brief,
+        budget,
+        call_id: ctx.call_id.clone(),
+        title,
+        awaited,
+        harness: false,
+        prerequisite: None,
+    }
+}
+
+fn prerequisite(shared: &Shared, args: &Map<String, Value>) -> Result<Option<super::DispatchPrerequisite>, String> {
+    match (
+        str_arg(args, "asset").filter(|s| !s.trim().is_empty()),
+        str_arg(args, "credential").filter(|s| !s.trim().is_empty()),
+    ) {
+        (None, None) => Ok(None),
+        (Some(asset), Some(credential)) => super::validate_dispatch_prerequisite(
+            shared,
+            false,
+            Some(&super::DispatchPrerequisite { asset: asset.into(), credential: credential.into() }),
+            loom_core::now_ms(),
+        ),
+        _ => {
+            Err("Supply asset and credential together, or omit both for a role that does not require a credential."
+                .into())
+        }
+    }
 }
 
 fn str_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
@@ -214,15 +248,15 @@ fn str_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
 }
 
 /// Join one awaited child; a cancellation stops it and becomes the call's error.
-async fn join_one(shared: &Shared, ctx: &ToolCtx, id: &SessionId) -> Result<Settlement, ToolOutput> {
+async fn join_one(shared: &Shared, ctx: &ToolCtx, id: &SessionId) -> Result<Settlement, Box<ToolOutput>> {
     match shared.orch.join(&shared.session, id, &ctx.cancel).await {
         Ok(settlement) => Ok(settlement),
         Err(text) => {
             if ctx.cancel.is_cancelled() {
                 let _ = shared.orch.stop_child(&shared.session, id).await;
-                Err(ToolOutput::error(format!("Interrupted while waiting for agent {id}; it was stopped.")))
+                Err(Box::new(ToolOutput::error(format!("Interrupted while waiting for agent {id}; it was stopped."))))
             } else {
-                Err(ToolOutput::error(text))
+                Err(Box::new(ToolOutput::error(text)))
             }
         }
     }
@@ -234,6 +268,8 @@ fn assignment_params() -> Vec<Param> {
     vec![
         req("question", "string", "One sentence: what the agent must find out or do."),
         opt("role", "string", "The agent's role. Defaults to the first role you may start."),
+        opt("asset", "string", "Explicit security asset ID for credential-gated roles; requires credential as well."),
+        opt("credential", "string", "Unexpired evidence-linked credential ID for that exact asset."),
         opt("hypothesis", "string", "What you currently believe the answer is, if anything."),
         opt("scope", "string", "The files, commands or systems the agent should work with, and why they matter."),
         opt("do_not", "string", "What the agent must leave alone: neighbouring work, things already settled."),
@@ -281,7 +317,11 @@ impl Tool for AgentSpawn {
         let mode = if str_arg(args, "mode") == Some("fork") { SpawnMode::Fork } else { SpawnMode::Fresh };
         let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
         let (budget, lowered) = budget_for(shared, args);
-        let req = request(ctx, role.clone(), mode, brief, budget, !background);
+        let mut req = request(ctx, role.clone(), mode, brief, budget, !background);
+        req.prerequisite = match prerequisite(shared, args) {
+            Ok(p) => p,
+            Err(e) => return ToolOutput::error(e),
+        };
         let id = match shared.orch.spawn(&shared.session, req).await {
             Ok(id) => id,
             Err(e) => return ToolOutput::error(e),
@@ -300,7 +340,7 @@ impl Tool for AgentSpawn {
         }
         let settlement = match join_one(shared, ctx, &id).await {
             Ok(s) => s,
-            Err(out) => return out,
+            Err(out) => return *out,
         };
         let mut out = ToolOutput::ok(
             format!("agent {id} {}", outcome_word(settlement.outcome)),
@@ -346,7 +386,8 @@ impl Tool for AgentFanout {
         for (i, item) in items.iter().enumerate() {
             let number = i.saturating_add(1);
             let result = match item.as_object() {
-                Some(object) => assignment(shared, object),
+                Some(object) => assignment(shared, object)
+                    .and_then(|(role, brief)| prerequisite(shared, object).map(|p| (role, brief, p))),
                 None => Err(format!("must be an assignment object; received {}.", describe(item))),
             };
             match result {
@@ -369,8 +410,9 @@ impl Tool for AgentFanout {
         }
         let (budget, lowered) = budget_for(shared, args);
         let mut started: Vec<SessionId> = Vec::new();
-        for (role, brief) in parsed {
-            let req = request(ctx, role, SpawnMode::Fresh, brief, budget.clone(), true);
+        for (role, brief, prerequisite) in parsed {
+            let mut req = request(ctx, role, SpawnMode::Fresh, brief, budget.clone(), true);
+            req.prerequisite = prerequisite;
             match shared.orch.spawn(&shared.session, req).await {
                 Ok(id) => started.push(id),
                 Err(e) => {
@@ -437,7 +479,7 @@ impl Tool for AgentMessage {
             "agent_message",
             "Send a message to an agent you started with background: true, for example to correct its course or add information. It reads the message at its next step.",
             ToolClass::State,
-            &[req("agent", "string", "The agent's id (s-…)."), req("text", "string", "The message.")],
+            &[req("agent", "string", "Exact child ID, an unambiguous prefix, or last."), req("text", "string", "The message.")],
         )
     }
     async fn run(&self, _ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
@@ -445,8 +487,12 @@ impl Tool for AgentMessage {
         let (Some(agent), Some(text)) = (str_arg(args, "agent"), str_arg(args, "text")) else {
             return ToolOutput::error("Give `agent` (the agent's id) and `text` (the message), both as strings.");
         };
-        match shared.orch.message_child(&shared.session, &SessionId::from(agent), text).await {
-            Ok(()) => ToolOutput::ok("sent", Body::Message(format!("Delivered to {agent}."))),
+        let id = match shared.orch.resolve_child(&shared.session, &SessionId::from(agent)).await {
+            Ok(id) => id,
+            Err(e) => return ToolOutput::error(e),
+        };
+        match shared.orch.message_child(&shared.session, &id, text).await {
+            Ok(()) => ToolOutput::ok("sent", Body::Message(format!("Delivered to {id}."))),
             Err(e) => ToolOutput::error(e),
         }
     }
@@ -460,7 +506,7 @@ impl Tool for AgentStop {
             "Stop an agent you started, or all of them. A stopped agent delivers no report.",
             ToolClass::State,
             &[
-                opt("agent", "string", "The agent's id (s-…)."),
+                opt("agent", "string", "Exact child ID, an unambiguous prefix, or last."),
                 opt("all", "boolean", "true to stop every agent you started.").default(json!(false)),
             ],
         )
@@ -477,7 +523,11 @@ impl Tool for AgentStop {
         };
         match (agent, all) {
             (Some(agent), false) => {
-                let id = SessionId::from(agent);
+                let id = match shared.orch.resolve_child(&shared.session, &SessionId::from(agent)).await {
+                    Ok(id) => id,
+                    Err(e) => return ToolOutput::error(e),
+                };
+                let agent = id.as_str();
                 if let Err(e) = shared.orch.stop_child(&shared.session, &id).await {
                     return ToolOutput::error(e);
                 }
@@ -681,7 +731,7 @@ impl Tool for Verify {
         };
         let settlement = match join_one(shared, ctx, &id).await {
             Ok(s) => s,
-            Err(out) => return out,
+            Err(out) => return *out,
         };
         let mut report = settlement.report.clone();
         if let Some(id) = claim_id {

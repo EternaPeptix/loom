@@ -10,4 +10,4 @@ pub mod policy;
 pub mod proxy;
 
 pub use policy::{Policy, Verdict};
-pub use proxy::{AuditFn, Limits, Proxy, ProxyError, SessionGrant, CHECK_METHOD, RULE_HEADER};
+pub use proxy::{AuditFn, Limits, Proxy, ProxyError, ReferenceGrant, SessionGrant, CHECK_METHOD, RULE_HEADER};

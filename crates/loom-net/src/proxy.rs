@@ -27,7 +27,12 @@
 //! `grant(session, policy)` returns a [`SessionGrant`] with fresh random credentials (user = the
 //! session id, password = 32 hex chars). The client authenticates with `Proxy-Authorization: Basic`.
 //! Missing or unknown credentials → `407` with `Proxy-Authenticate: Basic realm="loom"`.
-//! `revoke(session)` drops them; connections already open are left to finish.
+//! `grant_reference(session, cfg)` returns a separate `ReferenceGrant` (URL and host matcher, no env).
+//! Its random credential is kept only in trusted in-process tools, with GET/check/CONNECT permitted.
+//! Plain HTTP strips Authorization, Cookie and Referer. HTTPS CONNECT is opaque: the trusted client
+//! enforces GET, no URL user-info, no credential headers and redirect policy at every hop. Neither a
+//! host reservation nor GET-only access prevents exfiltration in URL paths/queries.
+//! `revoke(session)` drops both command and reference grants; connections already open are left to finish.
 //! `set_policy(session, policy)` replaces the policy of a session that holds a grant and keeps its
 //! credentials, so commands already running pick the change up on their next connection.
 //! `SessionGrant::env()` gives the variables to place in a command's environment so that ordinary
@@ -249,7 +254,27 @@ impl SessionGrant {
     }
 }
 
+/// A separate capability held only by trusted in-process reference clients, never command env.
+/// CONNECT is opaque: the client must enforce GET, strip credentials and validate each redirect.
+#[derive(Clone, Debug)]
+pub struct ReferenceGrant {
+    grant: SessionGrant,
+    raw_policy: Policy,
+}
+
+impl ReferenceGrant {
+    pub fn url(&self) -> String {
+        self.grant.url()
+    }
+
+    /// Pattern routing only; the proxy still checks deny rules and resolved addresses.
+    pub fn matches_host(&self, host: &str, port: u16) -> bool {
+        self.raw_policy.matches_reference(host, port)
+    }
+}
+
 struct Entry {
+    reference: bool,
     session: SessionId,
     password: String,
     policy: Arc<Policy>,
@@ -467,6 +492,7 @@ impl Proxy {
         let password = format!("{:032x}", rand::rng().random::<u128>());
         let limits = &self.inner.shared.limits;
         let entry = Entry {
+            reference: false,
             session: session.clone(),
             password: password.clone(),
             policy: Arc::new(policy),
@@ -475,6 +501,31 @@ impl Proxy {
         };
         lock(&self.inner.shared.sessions).insert(session.as_str().to_string(), entry);
         SessionGrant { port: self.inner.port, user: session.as_str().to_string(), password }
+    }
+
+    /// Mint a credential for in-process reference GET clients. It is not added to command env.
+    pub fn grant_reference(
+        &self,
+        session: &SessionId,
+        cfg: &loom_core::config::NetworkCfg,
+    ) -> Result<ReferenceGrant, String> {
+        let raw_policy = Policy::new(cfg)?;
+        let policy = Policy::reference(cfg)?;
+        let user = format!("reference-{:032x}", rand::rng().random::<u128>());
+        let password = format!("{:032x}", rand::rng().random::<u128>());
+        let limits = &self.inner.shared.limits;
+        let entry = Entry {
+            reference: true,
+            session: session.clone(),
+            password: password.clone(),
+            policy: Arc::new(policy),
+            permits: semaphore(limits.max_per_session),
+            lookups: semaphore(limits.max_lookups_per_session),
+        };
+        let mut sessions = lock(&self.inner.shared.sessions);
+        sessions.retain(|_, entry| !(entry.reference && &entry.session == session));
+        sessions.insert(user.clone(), entry);
+        Ok(ReferenceGrant { grant: SessionGrant { port: self.inner.port, user, password }, raw_policy })
     }
 
     /// Replace the policy of a session that holds a grant. Its credentials stay as they are. False
@@ -496,7 +547,7 @@ impl Proxy {
     }
 
     pub fn revoke(&self, session: &SessionId) {
-        lock(&self.inner.shared.sessions).remove(session.as_str());
+        lock(&self.inner.shared.sessions).retain(|_, entry| &entry.session != session);
     }
 
     /// Stop accepting connections. Open tunnels are closed.
@@ -816,6 +867,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 struct Authed {
+    reference: bool,
     session: SessionId,
     policy: Arc<Policy>,
     permits: Arc<Semaphore>,
@@ -842,7 +894,7 @@ fn authenticate(shared: &Shared, head: &Head) -> Result<Authed, String> {
     let Some(e) = sessions.get(user) else { return Err("unknown user".into()) };
     if constant_time_eq(e.password.as_bytes(), password.as_bytes()) {
         let (session, policy) = (e.session.clone(), e.policy.clone());
-        Ok(Authed { session, policy, permits: e.permits.clone(), lookups: e.lookups.clone() })
+        Ok(Authed { reference: e.reference, session, policy, permits: e.permits.clone(), lookups: e.lookups.clone() })
     } else {
         Err(format!("wrong password for session {}", e.session.as_str()))
     }
@@ -1166,7 +1218,18 @@ async fn handle(
             return answer(&mut client, &shared, slot, "407 Proxy Authentication Required", challenge, body).await;
         }
     };
-    let Authed { session, policy, permits, lookups } = auth;
+    let Authed { reference, session, policy, permits, lookups } = auth;
+    if reference && !matches!(head.method.as_str(), "GET" | "CONNECT" | CHECK_METHOD) {
+        return reject(
+            &mut client,
+            &shared,
+            slot,
+            &session,
+            &head,
+            "reference credentials allow GET only; use an active scope grant for other methods",
+        )
+        .await;
+    }
     let Ok(_session_slot) = permits.try_acquire_owned() else {
         let body = format!(
             "loom proxy: this session already has {} open proxy connections, the limit. Let running requests finish before starting more.\n",
@@ -1212,7 +1275,7 @@ async fn handle(
         Ok((host, port, authority, path)) => {
             let (shared, session, lookups) = (&*shared, &session, &lookups);
             let cx = Ctx { shared, session, lookups, method: &head.method, host: &host, port };
-            forward(client, extra, &head, &cx, &policy, &authority, &path, slot, cancel).await;
+            forward(client, extra, &head, &cx, &policy, &authority, &path, reference, slot, cancel).await;
         }
         Err(m) => reject(&mut client, &shared, slot, &session, &head, &m).await,
     }
@@ -1849,6 +1912,7 @@ async fn forward(
     policy: &Policy,
     authority: &str,
     path: &str,
+    reference: bool,
     slot: OwnedSemaphorePermit,
     cancel: CancellationToken,
 ) {
@@ -1867,7 +1931,8 @@ async fn forward(
         let drop = ["proxy-authorization", "proxy-connection", "connection", "keep-alive", "upgrade", "host"]
             .iter()
             .any(|d| n.eq_ignore_ascii_case(d));
-        if drop {
+        let secret = reference && ["authorization", "cookie", "referer"].iter().any(|x| n.eq_ignore_ascii_case(x));
+        if drop || secret {
             continue;
         }
         out.extend_from_slice(n.as_bytes());
@@ -1970,7 +2035,14 @@ mod tests {
 
     fn policy(mode: NetworkMode, allow: &[&str], deny: &[&str], private: &[&str]) -> Policy {
         let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        Policy::new(&NetworkCfg { mode, allow: v(allow), deny: v(deny), allow_private: v(private) }).unwrap()
+        Policy::new(&NetworkCfg {
+            mode,
+            allow: v(allow),
+            deny: v(deny),
+            allow_private: v(private),
+            ..NetworkCfg::default()
+        })
+        .unwrap()
     }
 
     fn lab() -> Policy {
@@ -2115,6 +2187,53 @@ mod tests {
             got.push(b[0]);
         }
         String::from_utf8_lossy(&got).to_string()
+    }
+
+    #[tokio::test]
+    async fn reference_grants_are_separate_strip_headers_and_revoke_with_the_session() {
+        let (p, _, seen) = start_audited(false, Limits::default(), None).await;
+        let (port, got) = http_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let sid = SessionId::from("s-reference");
+        let cfg = NetworkCfg {
+            mode: NetworkMode::Open,
+            reference_hosts: vec![format!("127.0.0.1:{port}")],
+            allow_private: vec!["127.0.0.1".into()],
+            ..NetworkCfg::default()
+        };
+        let raw_grant = p.grant(&sid, Policy::new(&cfg).unwrap());
+        let reference = p.grant_reference(&sid, &cfg).unwrap();
+        assert_ne!(reference.url(), raw_grant.url());
+        assert!(reference.matches_host("127.0.0.1", port));
+        assert!(!raw_grant.env().values().any(|value| value == &reference.url()));
+        let url = format!("http://127.0.0.1:{port}/reference?q=public");
+        let denied = raw(p.port(), format!("GET {url} HTTP/1.1\r\n{}\r\n", auth(&raw_grant)).as_bytes()).await;
+        assert_eq!(status(&denied), 403);
+        assert!(!lock(&seen).last().unwrap().1.allowed);
+        let post = raw(
+            p.port(),
+            format!("POST {url} HTTP/1.1\r\n{}Content-Length: 0\r\n\r\n", auth(&reference.grant)).as_bytes(),
+        )
+        .await;
+        assert_eq!(status(&post), 400);
+        assert!(!lock(&seen).last().unwrap().1.allowed);
+        let response = raw(
+            p.port(),
+            format!(
+                "GET {url} HTTP/1.1\r\n{}Authorization: secret\r\nCookie: secret\r\nReferer: secret\r\n\r\n",
+                auth(&reference.grant)
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert_eq!(status(&response), 200);
+        let (who, decision) = lock(&seen).last().unwrap().clone();
+        assert_eq!(who, Some(sid.clone()));
+        assert!(decision.allowed);
+        let request = String::from_utf8(got.await.unwrap()).unwrap().to_lowercase();
+        assert!(!request.contains("authorization:") && !request.contains("cookie:") && !request.contains("referer:"));
+        p.revoke(&sid);
+        let revoked = raw(p.port(), format!("GET {url} HTTP/1.1\r\n{}\r\n", auth(&reference.grant)).as_bytes()).await;
+        assert_eq!(status(&revoked), 407);
     }
 
     #[tokio::test]

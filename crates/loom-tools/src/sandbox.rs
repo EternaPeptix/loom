@@ -3,15 +3,15 @@
 //! CONTRACT.
 //!
 //! ## Policy
-//! - writable roots: the workspace, the session temp dir, `cfg.extra_writable`, and the system temp
-//!   locations commands need (`/private/tmp`, `/private/var/folders`, `/dev`);
+//! - writable roots: the workspace, the session temp dir and `cfg.extra_writable`. System temp
+//!   directories have no blanket write grant. Standard device literals remain writable;
 //! - never writable, even inside a writable root: `<workspace>/.loom`, the loom home directory, and
-//!   `cfg.protected_paths` (relative entries are relative to the workspace). One exception: the
+//!   Git config/hooks/pointers (including discovered worktree gitdir/commondir), and `cfg.protected_paths` (relative entries are relative to the workspace). One exception: the
 //!   session temp dir lies inside the loom home (`<loom home>/sessions/<id>/tmp`) and what is in it
 //!   is writable all the same — but not the directory entry itself (it cannot be removed, renamed,
 //!   replaced or made anew, yet tests as writable), and not a protected path that is the temp dir or
 //!   lies inside it. A temp dir that is `/`, or is or contains the loom home, is refused at construction;
-//! - not readable: `<loom home>/token`, `<loom home>/keys`, `cfg.unreadable_paths` (`~` expands to
+//! - not readable: `<loom home>/token`, `<loom home>/keys`, `<workspace>/.loom/oracle-secrets`, `cfg.unreadable_paths` (`~` expands to
 //!   the home directory) and, unless `cfg.protect_credentials` is off, the user's credential stores
 //!   (`CREDENTIAL_PATHS` under the home directory). A credential store that is or contains the
 //!   workspace is skipped, so the workspace stays readable; when the home directory is not known the
@@ -37,7 +37,7 @@
 //! command's own.
 //!
 //! ## `profile()`
-//! The seatbelt profile text, `None` in mode `none`. This form is verified on macOS 27 — keep its
+//! The seatbelt profile text, `None` in modes `none` and `bubblewrap`. This form is verified on macOS 27 — keep its
 //! structure (later rules win):
 //!
 //! ```text
@@ -84,6 +84,8 @@
 //! ## `command(script)`
 //! The program and arguments that run `script` with `/bin/bash -c`: in seatbelt mode
 //! `/usr/bin/sandbox-exec -p <profile> /bin/bash -c <script>`; in mode `none`, `/bin/bash -c <script>`.
+//! Linux `bubblewrap` uses the read-only/masked mounts and seccomp deny-all network policy in `linux`.
+//! It requires an executable bwrap and refuses host proxy/loopback/socket grants, with no fallback.
 //!
 //! ## `check_read(path)` / `check_write(path)`
 //! The same policy for the file tools, which run in this process. `path` must be absolute. The path
@@ -94,6 +96,18 @@
 //! `check_write` lets the session temp dir through the never-writable rules, as the profile does, and
 //! refuses what is not readable and the temp dir entry itself wherever they lie. In mode `none` only
 //! the never-writable and not-readable rules apply.
+//!
+//! ## `oracle_staging_root()` / `isolated_replay(workspace, tmp)`
+//! Staging is `<loom home>/oracle-runs`, outside all session temp trees. The harness creates a private
+//! random child with workspace/tmp siblings. Both must already exist under that protected root and
+//! outside caller write grants. `none` is refused. The replay workspace is read-only and only its
+//! separate temp is writable. Existing read/credential/network restrictions remain; Linux sources
+//! are repinned. All prior workspace/temp/extra writable origins and `<loom home>/sessions` become
+//! unreadable, including future sibling temp paths, so an interpreter cannot load actor-modified
+//! originals instead of pinned copies. Read-only roles retain removed global extra writable paths
+//! as internal metadata for this exclusion; normal verifier reads are unchanged. Any origin that
+//! contains staging is refused, rather than allowing read exceptions inside an untrusted tree.
+//! Linux refuses missing origins outside an already hidden private parent.
 //!
 //! ## `resolve(given)`
 //! A path as the model wrote it → absolute: `~`/`~/x` expand to the home directory, a relative path
@@ -108,7 +122,9 @@
 //! `cfg.secret_env` (the `api_key_env` of every model profile), or starts with `LOOM_`, and without
 //! any whose value holds a URL with a password in its user-info part (`scheme://user:password@host`):
 //! every `://` in the value starts an authority that ends at `/`, `?`, `#`, `"`, `]` or white space.
-//! A variable listed in `cfg.env_pass` is passed whatever its name and value. Added: `TERM=dumb`,
+//! A variable listed in `cfg.env_pass` is passed whatever its name and value. Bubblewrap additionally
+//! always removes LD_*, DYLD_*, BASH_FUNC_*, BASH_ENV, ENV, SHELLOPTS and BASHOPTS before its trusted
+//! host launcher; tools can set needed library variables inside the confined script. Added: `TERM=dumb`,
 //! `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR=<session temp dir>`.
 //!
 //! ## `describe()`
@@ -118,7 +134,7 @@
 //!
 //! ## `preflight(cfg)`
 //! Whether the configured mode can work on this host: seatbelt needs macOS and an executable
-//! `/usr/bin/sandbox-exec`. The error is a sentence naming the problem and the alternatives; the
+//! `/usr/bin/sandbox-exec`; bubblewrap needs Linux and `/usr/bin/bwrap`, without socket grants. The error is a sentence naming the problem and the alternatives; the
 //! daemon refuses to start with it.
 //!
 //! Tests required: profile text for a representative config (exact string); escaping; canonical
@@ -127,6 +143,8 @@
 //! mode `none`; `resolve`; `env` scrubbing and `env_pass`. Tests that execute `sandbox-exec` are
 //! welcome when `/usr/bin/sandbox-exec` exists (skip otherwise): a write inside the workspace
 //! succeeds, a write outside fails, a read of an unreadable path fails.
+
+mod linux;
 
 use loom_core::config::{SandboxCfg, SandboxMode};
 use std::collections::BTreeMap;
@@ -138,8 +156,7 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// Device files commands may write to (redirections and pipes need these).
 const DEVICE_LITERALS: [&str; 3] = ["/dev/null", "/dev/tty", "/dev/dtracehelper"];
 
-/// System temp locations that commands need.
-const SYSTEM_WRITABLE: [&str; 2] = ["/private/tmp", "/private/var/folders"];
+const BWRAP: &str = "/usr/bin/bwrap";
 
 const SECRET_WORDS: [&str; 10] =
     ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASSPHRASE", "CREDENTIAL", "AUTH_TOKEN", "COOKIE", "SESSION_KEY"];
@@ -236,10 +253,16 @@ const CREDENTIAL_PATHS: &[&str] = &[
 #[derive(Clone, Debug)]
 pub struct Sandbox {
     mode: SandboxMode,
+    linux_filter: Option<PathBuf>,
+    linux_pins: Vec<linux::PinnedPath>,
+    git_dirs: Vec<PathBuf>,
     workspace: PathBuf,
+    loom_home: PathBuf,
+    oracle_staging_root: PathBuf,
     tmp_dir: PathBuf,
     home: Option<PathBuf>,
     writable: Vec<PathBuf>,
+    replay_untrusted: Vec<PathBuf>,
     protected: Vec<PathBuf>,
     unreadable: Vec<PathBuf>,
     credentials: Vec<PathBuf>,
@@ -258,6 +281,87 @@ fn push_unique<T: PartialEq>(v: &mut Vec<T>, item: T) {
     if !v.contains(&item) {
         v.push(item);
     }
+}
+
+/// Git's configuration/hook entries and the `.git` entry itself cannot be written, including at
+/// locations created after construction. Ordinary object/ref updates remain possible on Seatbelt.
+fn git_metadata(path: &Path, workspace: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(workspace) else { return false };
+    let mut components = relative.components();
+    while let Some(component) = components.next() {
+        if component.as_os_str().to_string_lossy().eq_ignore_ascii_case(".git")
+            && components.next().is_none_or(|name| {
+                ["config", "config.worktree", "hooks", "commondir", "gitdir"]
+                    .iter()
+                    .any(|x| name.as_os_str().to_string_lossy().eq_ignore_ascii_case(x))
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Discover existing nested repositories and linked-worktree metadata without running host Git or
+/// following arbitrary directory links. A worktree's `commondir` is resolved relative to its gitdir.
+/// Refuse an unreadable/oversized tree rather than silently leaving discovered metadata unprotected.
+fn git_directories(workspace: &Path) -> io::Result<Vec<PathBuf>> {
+    use std::collections::BTreeSet;
+    let canon = |p: &Path| resolve_path(p, true).map_err(invalid);
+    let pointer = |path: &Path| -> io::Result<Option<String>> {
+        match std::fs::metadata(path) {
+            Ok(m) if m.is_file() && m.len() <= 4096 => Ok(Some(std::fs::read_to_string(path)?)),
+            Ok(m) if m.is_file() => Err(invalid(format!(
+                "Git metadata pointer {} is larger than 4096 bytes. Inspect it before starting a session.",
+                path.display()
+            ))),
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    };
+    let mut pending = vec![workspace.to_path_buf()];
+    let mut dirs = Vec::new();
+    let mut visited = 0_u64;
+    while let Some(dir) = pending.pop() {
+        visited = visited.saturating_add(1);
+        if visited > 100_000 {
+            return Err(invalid("The workspace has more than 100000 directories. Choose a smaller workspace so Git metadata can be protected.".to_string()));
+        }
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if entry.file_name().to_string_lossy().eq_ignore_ascii_case(".git") {
+                if path.is_dir() {
+                    push_unique(&mut dirs, canon(&path)?);
+                } else if let Some(text) = pointer(&path)? {
+                    if let Some(target) = text.trim().strip_prefix("gitdir:") {
+                        push_unique(&mut dirs, canon(&dir.join(target.trim()))?);
+                    }
+                }
+            } else if kind.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    let mut checked = BTreeSet::new();
+    let mut pending = dirs.clone();
+    while let Some(dir) = pending.pop() {
+        if !checked.insert(dir.clone()) {
+            continue;
+        }
+        if checked.len() > 4096 {
+            return Err(invalid("Git commondir pointers exceed 4096 directories. Inspect repository metadata before starting a session.".to_string()));
+        }
+        if let Some(text) = pointer(&dir.join("commondir"))? {
+            let path = canon(&dir.join(text.trim()))?;
+            push_unique(&mut dirs, path.clone());
+            pending.push(path);
+        }
+    }
+    dirs.sort();
+    Ok(dirs)
 }
 
 /// Resolves symlinks in the deepest existing ancestor of `path` and appends the rest. A `..` in the
@@ -360,7 +464,7 @@ fn under(path: &Path, rule: &Path) -> bool {
 
 /// Why `mode` cannot work on this host, if it cannot (`exec` is the seatbelt launcher).
 fn preflight_at(mode: SandboxMode, exec: &Path, macos: bool) -> Result<(), String> {
-    if mode != SandboxMode::Seatbelt {
+    if mode == SandboxMode::None {
         return Ok(());
     }
     let runnable = exec.metadata().map(|m| {
@@ -376,13 +480,16 @@ fn preflight_at(mode: SandboxMode, exec: &Path, macos: bool) -> Result<(), Strin
         "this host is not macOS".to_string()
     };
     Err(format!(
-        "[sandbox] mode = \"seatbelt\" cannot work here: {why}. Run the daemon on macOS, or set [sandbox] mode = \"none\" \
+        "[sandbox] mode = \"seatbelt\" cannot work here: {why}. Use macOS, or Linux [sandbox] mode = \"bubblewrap\" with deny-all command networking, or set [sandbox] mode = \"none\" \
          in the configuration knowing that commands are then not confined and can read and write anything this user can."
     ))
 }
 
 /// Checks that the configured sandbox mode can work on this host; the daemon refuses to start otherwise.
 pub fn preflight(cfg: &SandboxCfg) -> Result<(), String> {
+    if cfg.mode == SandboxMode::Bubblewrap {
+        return linux::preflight(cfg, Path::new(BWRAP), cfg!(target_os = "linux"));
+    }
     preflight_at(cfg.mode, Path::new(SANDBOX_EXEC), cfg!(target_os = "macos"))
 }
 
@@ -475,18 +582,35 @@ impl Sandbox {
         for p in &cfg.extra_writable {
             push_unique(&mut writable, anchored(p)?);
         }
-        for p in SYSTEM_WRITABLE {
-            push_unique(&mut writable, canon(Path::new(p))?);
+        let oracle_staging_root = canon(&loom_home.join("oracle-runs"))?;
+        let mut replay_untrusted = Vec::new();
+        for path in cfg.replay_untrusted_paths.iter().chain(&cfg.extra_writable) {
+            let written = absolute(path)?;
+            push_unique(&mut replay_untrusted, canon(&written)?);
+            if let Some(written) = lexical(&written) {
+                push_unique(&mut replay_untrusted, written);
+            }
         }
 
+        let git_dirs = git_directories(&workspace)?;
         let mut protected = vec![canon(&workspace.join(".loom"))?, loom_home.clone()];
+        push_unique(&mut protected, workspace.join(".loom"));
+        for dir in &git_dirs {
+            for name in ["config", "config.worktree", "hooks", "commondir", "gitdir"] {
+                let path = dir.join(name);
+                push_unique(&mut protected, canon(&path)?);
+                push_unique(&mut protected, path);
+            }
+        }
         for p in &cfg.protected_paths {
             push_unique(&mut protected, anchored(p)?);
         }
 
         // A not-readable path is kept as written as well when a link along it makes that differ: removed,
         // the link could be replaced by a directory of a command's own, which the canonical rule misses.
-        let mut unreadable = vec![loom_home.join("token"), loom_home.join("keys")];
+        let oracle_secrets = workspace.join(".loom/oracle-secrets");
+        let mut unreadable = vec![loom_home.join("token"), loom_home.join("keys"), canon(&oracle_secrets)?];
+        push_unique(&mut unreadable, oracle_secrets);
         for p in &cfg.unreadable_paths {
             let written = absolute(p)?;
             push_unique(&mut unreadable, canon(&written)?);
@@ -530,16 +654,54 @@ impl Sandbox {
             push_unique(&mut unix_sockets, anchored(p)?);
         }
 
+        let linux_filter = if cfg.mode == SandboxMode::Bubblewrap {
+            if proxy_port.is_some() {
+                return Err(invalid("Bubblewrap does not support a host proxy bridge. Pass no proxy port and use deny_all command networking.".to_string()));
+            }
+            linux::preflight(cfg, Path::new(BWRAP), cfg!(target_os = "linux")).map_err(invalid)?;
+            if !workspace.join(".loom").is_dir() {
+                return Err(invalid("Bubblewrap requires an existing workspace .loom directory so its contents, including future oracle secrets, can be hidden. Create the reserved directory before starting the session.".to_string()));
+            }
+            if !credentials.is_empty()
+                && home.as_ref().is_some_and(|home| writable.iter().any(|root| under(home, root)))
+            {
+                return Err(invalid("Bubblewrap cannot use the whole user home as a writable root while protecting credentials. Choose a narrower workspace and extra_writable directories.".to_string()));
+            }
+            for path in unreadable.iter().chain(&credentials) {
+                let hidden = under(path, &loom_home)
+                    || under(path, &workspace.join(".loom"))
+                    || (!credentials.is_empty()
+                        && home.as_ref().is_some_and(|home| under(path, home))
+                        && !writable.iter().any(|root| under(path, root)));
+                if !path.exists() && !hidden {
+                    return Err(invalid(format!("Bubblewrap cannot hide the missing unreadable path {}. Create it before starting the session or choose a scope whose parent can be hidden.", path.display())));
+                }
+            }
+            Some(linux::prepare(&loom_home)?)
+        } else {
+            None
+        };
+        let linux_pins = if cfg.mode == SandboxMode::Bubblewrap {
+            linux::pin(&writable, &protected, &unreadable, &credentials, &git_dirs)?
+        } else {
+            Vec::new()
+        };
         // Every path that can reach a profile must be writable as a literal, whatever the mode.
         for p in writable.iter().chain(&protected).chain(&unreadable).chain(&credentials).chain(&unix_sockets) {
             sbpl(p)?;
         }
         Ok(Sandbox {
             mode: cfg.mode,
+            linux_filter,
+            linux_pins,
+            git_dirs,
             workspace,
+            loom_home,
+            oracle_staging_root,
             tmp_dir,
             home,
             writable,
+            replay_untrusted,
             protected,
             unreadable,
             credentials,
@@ -563,8 +725,97 @@ impl Sandbox {
         &self.tmp_dir
     }
 
-    pub fn profile(&self) -> Option<String> {
+    /// Harness-owned staging lives outside all sessions, whose mutable temp trees are excluded from
+    /// trusted replay reads. Callers create a private random child containing workspace/tmp siblings.
+    pub fn oracle_staging_root(&self) -> &Path {
+        &self.oracle_staging_root
+    }
+
+    /// Derive a replay policy over harness-owned staging directories outside the caller's write
+    /// grants. Read/credential/network restrictions are retained; all old writable roots are unreadable.
+    /// Workspace/temp must share a protected parent under `oracle_staging_root`. The new
+    /// workspace is read-only and only the disjoint new temp is writable. `none` is refused.
+    pub fn isolated_replay(&self, workspace: &Path, tmp: &Path) -> Result<Sandbox, String> {
         if self.mode == SandboxMode::None {
+            return Err("An isolated replay needs an OS sandbox. Use seatbelt or bubblewrap; mode = \"none\" cannot enforce a read-only replay.".to_string());
+        }
+        let canonical = |path: &Path| -> Result<PathBuf, String> {
+            if !path.is_dir() {
+                return Err(format!("Replay directory {} does not exist. Create private staging directories outside the session temp first.", path.display()));
+            }
+            std::fs::canonicalize(path).map_err(|e| {
+                format!("Replay directory {} cannot be resolved: {e}. Inspect it before retrying.", path.display())
+            })
+        };
+        let workspace = canonical(workspace)?;
+        let tmp = canonical(tmp)?;
+        let private_parent = workspace.parent().filter(|parent| {
+            Some(*parent) == tmp.parent()
+                && parent.starts_with(&self.oracle_staging_root)
+                && self.protected.iter().any(|root| under(parent, root))
+        });
+        if workspace.starts_with(&tmp)
+            || tmp.starts_with(&workspace)
+            || private_parent.is_none()
+            || self.check_write(&workspace).is_ok()
+            || self.check_write(&tmp).is_ok()
+        {
+            return Err("Replay workspace and temp must be separate private directories outside the caller's writable areas. Create them as siblings under the protected oracle staging root.".to_string());
+        }
+        let mut untrusted = Vec::new();
+        let sessions = self.loom_home.join("sessions");
+        for path in self.replay_untrusted.iter().chain(&self.writable).chain(std::iter::once(&sessions)) {
+            push_unique(&mut untrusted, resolve_path(path, true)?);
+            if let Some(written) = lexical(path) {
+                push_unique(&mut untrusted, written);
+            }
+        }
+        if untrusted.iter().any(|root| under(&workspace, root) || under(&tmp, root)) {
+            return Err("An actor-writable origin contains the oracle staging directories. Choose narrower writable roots; trusted replay does not make read exceptions inside untrusted trees.".to_string());
+        }
+        if self.mode == SandboxMode::Bubblewrap {
+            for origin in &untrusted {
+                let hidden = under(origin, &self.loom_home)
+                    || (!self.credentials.is_empty() && self.home.as_ref().is_some_and(|home| under(origin, home)))
+                    || ["/tmp", "/var/tmp", "/run"].iter().any(|root| origin.starts_with(root));
+                if !origin.exists() && !hidden {
+                    return Err(format!("The untrusted replay origin {} is missing and Bubblewrap cannot reserve that future path. Create the actor directory before replay or choose a scope hidden by a private parent.", origin.display()));
+                }
+            }
+        }
+        let mut replay = self.clone();
+        if self.mode == SandboxMode::Bubblewrap {
+            loom_core::config::ensure_private_dir(&workspace.join(".loom"))
+                .map_err(|e| format!("Replay state directory cannot be created: {e}. Inspect the staged workspace."))?;
+        }
+        replay.workspace = workspace.clone();
+        replay.tmp_dir = tmp.clone();
+        replay.writable = vec![workspace.clone(), tmp];
+        for path in &untrusted {
+            push_unique(&mut replay.unreadable, path.clone());
+        }
+        replay.replay_untrusted = untrusted;
+        push_unique(&mut replay.protected, workspace.clone());
+        let secrets = workspace.join(".loom/oracle-secrets");
+        push_unique(&mut replay.unreadable, resolve_path(&secrets, true)?);
+        push_unique(&mut replay.unreadable, secrets);
+        replay.git_dirs = git_directories(&workspace)
+            .map_err(|e| format!("Replay Git metadata cannot be protected: {e}. Inspect the staged workspace."))?;
+        if replay.mode == SandboxMode::Bubblewrap {
+            replay.linux_pins = linux::pin(
+                &replay.writable,
+                &replay.protected,
+                &replay.unreadable,
+                &replay.credentials,
+                &replay.git_dirs,
+            )
+            .map_err(|e| format!("Replay mounts cannot be pinned: {e}. Inspect the staged directories."))?;
+        }
+        Ok(replay)
+    }
+
+    pub fn profile(&self) -> Option<String> {
+        if self.mode != SandboxMode::Seatbelt {
             return None;
         }
         // Paths were validated in `new`; one that fails here is left out rather than half written.
@@ -578,6 +829,24 @@ impl Sandbox {
         out.push_str(&format!("(allow file-write*{}{literals})\n", subpaths(&self.writable)));
         if !self.protected.is_empty() {
             out.push_str(&format!("(deny file-write*{})\n", subpaths(&self.protected)));
+        }
+        // New nested Git metadata is covered too, even when it did not exist at construction.
+        let names = ["config", "config.worktree", "hooks", "commondir", "gitdir"]
+            .map(|name| {
+                name.chars()
+                    .map(|c| {
+                        if c.is_ascii_alphabetic() {
+                            format!("[{}{}]", c, c.to_ascii_uppercase())
+                        } else {
+                            "[.]".to_string()
+                        }
+                    })
+                    .collect::<String>()
+            })
+            .join("|");
+        let git = format!("^.*/[.][gG][iI][tT](/({names})(/.*)?)?$");
+        if let Ok(ws) = sbpl(&self.workspace) {
+            out.push_str(&format!("(deny file-write* (require-all (subpath \"{ws}\") (regex #\"{git}\")))\n"));
         }
         // The session temp dir may lie inside a protected directory; this later rule wins. The directory
         // entry itself cannot be removed, renamed, replaced, or made anew once gone, so the next activation
@@ -656,6 +925,9 @@ impl Sandbox {
     }
 
     pub fn command(&self, script: &str) -> (String, Vec<String>) {
+        if self.mode == SandboxMode::Bubblewrap {
+            return linux::command(self, script);
+        }
         match self.profile() {
             Some(profile) => (
                 SANDBOX_EXEC.to_string(),
@@ -697,6 +969,12 @@ impl Sandbox {
 
     pub fn check_write(&self, path: &Path) -> Result<PathBuf, String> {
         let r = self.resolved(path)?;
+        if git_metadata(&r, &self.workspace) || git_metadata(path, &self.workspace) {
+            return Err(format!("{} is Git configuration or hooks metadata, protected from writes. Ask the operator to change repository configuration outside the session.", path.display()));
+        }
+        if self.mode == SandboxMode::Bubblewrap && self.git_dirs.iter().any(|dir| under(&r, dir)) {
+            return Err(format!("{} is in Git metadata mounted read-only by Bubblewrap. Ask the operator to update Git metadata outside the session.", r.display()));
+        }
         // The session temp dir is writable even when it lies inside a protected directory.
         let in_tmp = r.starts_with(&self.tmp_dir) && !self.inside_tmp_protected().iter().any(|p| under(&r, p));
         if let Some(rule) = self.protected.iter().find(|p| !in_tmp && under(&r, p)) {
@@ -730,7 +1008,7 @@ impl Sandbox {
             ));
         }
         // The temp dir is a writable root, so what lies in it passes here.
-        if self.mode == SandboxMode::Seatbelt {
+        if self.mode != SandboxMode::None {
             let device = DEVICE_LITERALS.iter().any(|d| r == Path::new(d));
             if !device && !self.writable.iter().any(|w| r.starts_with(w)) {
                 let shown = if r == path { String::new() } else { format!(" (resolved from {})", path.display()) };
@@ -755,6 +1033,16 @@ impl Sandbox {
         let mut out: BTreeMap<String, String> = parent
             .iter()
             .filter(|(name, value)| {
+                // These would execute agent-writable files in the trusted host launcher before bwrap.
+                let upper = name.to_uppercase();
+                if self.mode == SandboxMode::Bubblewrap
+                    && (upper.starts_with("LD_")
+                        || upper.starts_with("DYLD_")
+                        || upper.starts_with("BASH_FUNC_")
+                        || matches!(upper.as_str(), "BASH_ENV" | "ENV" | "SHELLOPTS" | "BASHOPTS"))
+                {
+                    return false;
+                }
                 self.env_pass.iter().any(|p| p == *name)
                     || !(secret_name(name) || self.secret_env.iter().any(|n| n == *name) || url_with_password(value))
             })
@@ -780,7 +1068,7 @@ impl Sandbox {
             (false, SandboxMode::None) => {
                 format!(" They also refuse to read or write credential directories ({stores}).")
             }
-            (false, SandboxMode::Seatbelt) => {
+            (false, SandboxMode::Seatbelt | SandboxMode::Bubblewrap) => {
                 format!(" Credential directories ({stores}) are off limits to read and to write.")
             }
         };
@@ -798,6 +1086,9 @@ impl Sandbox {
                 "Commands are not confined by an operating-system sandbox: they can read and write anything this user can. \
                  File tools still refuse to write under {protected} and to read or write {unreadable}.{exception}{credentials}"
             );
+        }
+        if self.mode == SandboxMode::Bubblewrap {
+            return format!("Commands run in Linux bubblewrap with a read-only host filesystem, writable roots {}, a private /tmp, and all socket creation/connections denied. Protected paths {protected} and discovered Git metadata remain read-only; credential paths are hidden.{exception} New Git repositories must be created by the operator outside the session. File tools additionally refuse Git config and hook writes.", join_list(&self.writable));
         }
         let ports = if self.loopback_all {
             "any loopback port".to_string()
@@ -889,18 +1180,17 @@ mod tests {
         let r = s(&f.root);
         // The directories that hold the denied paths and could be moved: the workspace (it holds `.loom`)
         // and, when the fixture lies in a system temp location, every directory from there down to it.
-        let mut holders: Vec<&Path> =
-            f.ws.ancestors().filter(|a| *a == f.ws || SYSTEM_WRITABLE.iter().any(|w| a.starts_with(w))).collect();
+        let mut holders: Vec<&Path> = f.ws.ancestors().filter(|a| *a == f.ws).collect();
         holders.reverse();
         let holders: String = holders.iter().map(|a| format!(" (literal \"{}\")", s(a))).collect();
         let expected = format!(
             "(version 1)\n(allow default)\n(deny signal)\n(allow signal (target same-sandbox))\n(deny file-write*)\n\
-             (allow file-write* (subpath \"{r}/ws\") (subpath \"{r}/tmp\") (subpath \"{r}/extra\") (subpath \"/private/tmp\") (subpath \"/private/var/folders\") (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\"))\n\
+             (allow file-write* (subpath \"{r}/ws\") (subpath \"{r}/tmp\") (subpath \"{r}/extra\") (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\"))\n\
              (deny file-write* (subpath \"{r}/ws/.loom\") (subpath \"{r}/home\") (subpath \"{r}/ws/secrets\"))\n\
              (allow file-write* (subpath \"{r}/tmp\"))\n\
              (deny file-write-unlink file-write-create (literal \"{r}/tmp\"))\n\
-             (deny file-write* (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\") (subpath \"{r}/hidden\"))\n\
-             (deny file-read* (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\") (subpath \"{r}/hidden\"))\n\
+             (deny file-write* (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\") (subpath \"{r}/ws/.loom/oracle-secrets\") (subpath \"{r}/hidden\"))\n\
+             (deny file-read* (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\") (subpath \"{r}/ws/.loom/oracle-secrets\") (subpath \"{r}/hidden\"))\n\
              (deny file-write-unlink{holders})\n\
              (deny file-write-create (require-all (vnode-type SYMLINK) (require-any{holders})))\n\
              (deny lsopen)\n(deny appleevent-send)\n(deny job-creation)\n\
@@ -911,11 +1201,14 @@ mod tests {
              (allow network-bind (local ip \"localhost:*\"))\n\
              (allow network-inbound (local ip \"localhost:*\"))\n"
         );
-        assert_eq!(sb.profile().expect("profile"), expected);
+        let actual = sb.profile().expect("profile");
+        let without_git: String =
+            actual.lines().filter(|line| !line.contains("(regex #")).map(|line| format!("{line}\n")).collect();
+        assert_eq!(without_git, expected);
         let (prog, args) = sb.command("echo hi");
         assert_eq!(prog, "/usr/bin/sandbox-exec");
         assert_eq!(args[0], "-p");
-        assert_eq!(args[1], expected);
+        assert_eq!(args[1], actual);
         assert_eq!(&args[2..], ["/bin/bash", "-c", "echo hi"]);
     }
 
@@ -1385,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn mode_none_has_no_profile_and_only_the_two_rules() {
+    fn mode_none_has_no_process_profile_and_keeps_file_guards() {
         let f = fx();
         let sb = build(&f, &cfg(SandboxMode::None), None);
         assert_eq!(sb.mode(), SandboxMode::None);
@@ -1601,6 +1894,177 @@ mod tests {
         assert_eq!(e.ctx.sandbox.mode(), SandboxMode::None);
     }
 
+    #[test]
+    fn session_temp_is_the_only_default_temp_write_grant() {
+        let f = fx();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        assert!(sb.check_write(&f.tmp.join("own")).is_ok());
+        assert!(sb.check_write(&f.root.join("sibling-session.tmp")).is_err());
+        let profile = sb.profile().unwrap();
+        assert!(!profile.contains("(subpath \"/private/tmp\")"));
+        assert!(!profile.contains("(subpath \"/private/var/folders\")"));
+    }
+
+    #[test]
+    fn nested_and_future_git_metadata_are_protected_without_blocking_source_edits() {
+        let f = fx();
+        let git = f.ws.join("nested/.git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        std::fs::write(git.join("config"), "original").unwrap();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        for path in [
+            git.join("config"),
+            git.join("config.worktree"),
+            git.join("hooks/pre-commit"),
+            f.ws.join("new/.git/config"),
+            f.ws.join("new/.GIT/hooks/tool"),
+            f.ws.join("new/.git"),
+        ] {
+            assert!(sb.check_write(&path).is_err(), "{}", path.display());
+        }
+        assert!(sb.check_write(&f.ws.join("nested/source.rs")).is_ok());
+        assert!(sb.check_write(&git.join("objects/object")).is_ok());
+        if available() {
+            assert!(!run(&sb, &f.ws, "echo changed > nested/.git/config").0);
+            assert!(!run(&sb, &f.ws, "echo changed > nested/.git/hooks/pre-commit").0);
+            assert!(!run(&sb, &f.ws, "mkdir -p new/.git").0);
+        }
+    }
+
+    #[test]
+    fn isolated_replay_only_writes_private_temp_and_keeps_original_read_network_policy() {
+        let f = fx_prod();
+        let caller = build(&f, &cfg(SandboxMode::Seatbelt), Some(8080));
+        let private = caller.oracle_staging_root().join("oracle-private");
+        let ws = private.join("workspace");
+        let tmp = private.join("tmp");
+        for path in [&ws, &tmp] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(ws.join("source"), "original").unwrap();
+        std::fs::write(f.ws.join("actor-source"), "mutable original").unwrap();
+        assert!(caller.check_write(&ws.join("source")).is_err());
+        assert!(caller.check_write(&tmp.join("fake-result")).is_err());
+        let replay = caller.isolated_replay(&ws, &tmp).unwrap();
+        assert!(replay.check_write(&ws.join("source")).is_err());
+        assert!(replay.check_write(&f.tmp.join("old-temp")).is_err());
+        assert!(replay.check_write(&tmp.join("own-result")).is_ok());
+        assert!(replay.check_read(&f.home.join("token")).is_err());
+        assert!(replay.check_read(&f.ws.join("actor-source")).is_err());
+        assert!(replay.check_read(&f.tmp.join("mutable-dependency")).is_err());
+        assert!(replay.check_read(&f.home.join("sessions/another-agent/tmp/import.py")).is_err());
+        assert!(replay.check_read(&ws.join("source")).is_ok());
+        assert_eq!(caller.loopback_ports, replay.loopback_ports);
+        assert_eq!(caller.unix_sockets, replay.unix_sockets);
+        assert!(caller.isolated_replay(&f.ws, &f.tmp).is_err());
+        let unconfined = build(&f, &cfg(SandboxMode::None), None);
+        assert!(unconfined.isolated_replay(&ws, &tmp).is_err());
+        if available() {
+            assert!(!run(&caller, &f.ws, &format!("echo fake > '{}/fake-result'", tmp.display())).0);
+            assert!(!run(&replay, &ws, "chmod 666 source; echo modified > source").0);
+            assert!(!run(&replay, &ws, &format!("cat '{}/actor-source'", f.ws.display())).0);
+            assert!(run(&replay, &ws, "cat source").0);
+            assert_eq!(std::fs::read_to_string(ws.join("source")).unwrap(), "original");
+            assert!(run(&replay, &ws, "echo genuine > \"$TMPDIR/result\"").0);
+        }
+    }
+
+    #[test]
+    fn replay_retains_judges_actor_origins_without_changing_ordinary_reads_and_rejects_broad_origins() {
+        let f = fx_prod();
+        let extra = f.root.join("actor-cache");
+        std::fs::create_dir(&extra).unwrap();
+        std::fs::write(extra.join("dependency.py"), "mutable library").unwrap();
+        let cfg = SandboxCfg {
+            protected_paths: vec![f.ws.display().to_string()],
+            replay_untrusted_paths: vec![extra.display().to_string()],
+            ..cfg(SandboxMode::Seatbelt)
+        };
+        let judge = build(&f, &cfg, None);
+        assert!(judge.check_read(&extra.join("dependency.py")).is_ok());
+        assert!(judge.check_write(&extra.join("dependency.py")).is_err());
+        let private = judge.oracle_staging_root().join("retained-origins");
+        let (ws, tmp) = (private.join("workspace"), private.join("tmp"));
+        for path in [&ws, &tmp] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let replay = judge.isolated_replay(&ws, &tmp).unwrap();
+        assert!(replay.check_read(&extra.join("dependency.py")).is_err());
+        if available() {
+            assert!(!run(&replay, &ws, &format!("cat '{}/dependency.py'", extra.display())).0);
+        }
+        let mut broad = judge.clone();
+        broad.replay_untrusted.push(f.root.clone());
+        assert!(broad.isolated_replay(&ws, &tmp).is_err());
+    }
+
+    #[test]
+    fn oracle_secrets_are_denied_before_creation_and_through_symlinks() {
+        let f = fx();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let secrets = f.ws.join(".loom/oracle-secrets");
+        assert!(sb.check_read(&secrets.join("key")).is_err());
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::fs::write(secrets.join("key"), "test-only-secret").unwrap();
+        let alias = f.ws.join("alias-key");
+        symlink(secrets.join("key"), &alias).unwrap();
+        assert!(sb.check_read(&alias).is_err());
+        let judge = |real: &Path| sb.check_read(real).map(|_| ());
+        assert!(crate::files::open_readable(&alias, &judge).is_err());
+    }
+
+    #[test]
+    fn git_profile_handles_quoted_and_regex_special_workspace_names() {
+        if !available() {
+            return;
+        }
+        let f = fx();
+        let ws = f.ws.join("quote\" [literal] (dir)");
+        std::fs::create_dir(&ws).unwrap();
+        let sb = Sandbox::new(&cfg(SandboxMode::Seatbelt), &ws, &f.tmp, &f.home, None).unwrap();
+        let (ok, text) = run(&sb, &ws, "echo source > source.txt");
+        assert!(ok, "{text}");
+        assert!(!run(&sb, &ws, "mkdir -p nested/.git").0);
+    }
+
+    #[test]
+    fn linked_worktree_gitdir_and_commondir_config_hooks_and_pointers_are_protected() {
+        let f = fx();
+        let worktree = f.ws.join("metadata/worktrees/one");
+        let common = f.ws.join("metadata");
+        std::fs::create_dir_all(worktree.join("hooks")).unwrap();
+        std::fs::create_dir_all(common.join("hooks")).unwrap();
+        std::fs::write(f.ws.join(".git"), "gitdir: metadata/worktrees/one\n").unwrap();
+        std::fs::write(worktree.join("commondir"), "../..\n").unwrap();
+        std::fs::write(common.join("config"), "original").unwrap();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        for root in [&worktree, &common] {
+            for name in ["config", "config.worktree", "hooks/pre-commit", "commondir", "gitdir"] {
+                assert!(sb.check_write(&root.join(name)).is_err(), "{root:?}/{name}");
+            }
+        }
+        if available() {
+            assert!(!run(&sb, &f.ws, "echo changed > metadata/config").0);
+            assert!(!run(&sb, &f.ws, "echo changed > metadata/worktrees/one/commondir").0);
+            assert!(!run(&sb, &f.ws, "echo changed > .git").0);
+        }
+    }
+
+    #[test]
+    fn readonly_role_can_write_own_temp_but_not_workspace_or_sibling_temp() {
+        let f = fx();
+        let cfg = SandboxCfg { protected_paths: vec![f.ws.display().to_string()], ..cfg(SandboxMode::Seatbelt) };
+        let sb = build(&f, &cfg, None);
+        assert!(sb.check_write(&f.ws.join("source.rs")).is_err());
+        assert!(sb.check_write(&f.root.join("sibling.tmp")).is_err());
+        assert!(sb.check_write(&f.tmp.join("scratch")).is_ok());
+        if available() {
+            assert!(!run(&sb, &f.ws, "echo changed > source.rs").0);
+            assert!(!run(&sb, &f.ws, &format!("echo changed > {}/sibling.tmp", f.root.display())).0);
+            assert!(run(&sb, &f.ws, "echo scratch > \"$TMPDIR/own\"").0);
+        }
+    }
+
     // ---- tests that run commands under the generated profile ----
 
     fn available() -> bool {
@@ -1610,7 +2074,7 @@ mod tests {
     /// (succeeded, stdout + stderr)
     fn run(sb: &Sandbox, cwd: &Path, script: &str) -> (bool, String) {
         let (prog, args) = sb.command(script);
-        let out = Command::new(prog).args(args).current_dir(cwd).output().expect("run");
+        let out = Command::new(prog).args(args).current_dir(cwd).env("TMPDIR", &sb.tmp_dir).output().expect("run");
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         (out.status.success(), text)
     }

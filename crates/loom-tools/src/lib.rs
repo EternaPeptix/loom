@@ -23,13 +23,19 @@
 //! - [`bash`], [`fstools`], [`search`], [`outview`], [`web`]: the built-in tools
 
 pub mod bash;
+pub mod binary;
+pub mod capabilities;
+pub mod codec;
 pub mod cve;
 pub mod files;
 pub mod fstools;
+pub mod http;
 pub mod jobs;
+pub mod oracle;
 pub mod outview;
 pub mod params;
 pub mod proc;
+pub mod pty;
 pub mod sandbox;
 pub mod schema;
 pub mod search;
@@ -64,9 +70,13 @@ pub struct ToolCtx {
     pub sandbox: Arc<sandbox::Sandbox>,
     /// Environment variables added to every command (proxy settings and the like).
     pub env: Arc<BTreeMap<String, String>>,
+    /// Reference-only proxy capability, deliberately absent from subprocess environments.
+    pub reference_proxy: Option<loom_net::ReferenceGrant>,
     pub files: Arc<files::FileTracker>,
     pub jobs: Arc<jobs::JobTable>,
     pub cancel: CancellationToken,
+    /// Session-local PTY/HTTP state. Cloned contexts share it; children start with fresh state.
+    pub capabilities: Arc<capabilities::SessionTools>,
 }
 
 /// What a tool hands back.
@@ -89,6 +99,9 @@ pub enum Body {
     /// Lines of an output that is already stored: the text to show and exactly which of its lines
     /// that text contains (1-based, inclusive).
     View { of: BlobId, text: String, shown: Vec<(u64, u64)> },
+    /// A newly produced complete normalized output, with only these numbered lines displayed.
+    /// Unlike View, this records the producing tool and retains the complete output as its own blob.
+    ProducedView { blob: loom_core::BlobRef, text: String, shown: Vec<(u64, u64)> },
     /// A short message with nothing behind it (a refusal, a confirmation).
     Message(String),
 }
@@ -165,6 +178,17 @@ impl Registry {
         r.add(Arc::new(bash::JobWait));
         r.add(Arc::new(bash::JobKill));
         r.add(Arc::new(bash::JobList));
+        r.add(Arc::new(pty::PtyOpen));
+        r.add(Arc::new(pty::PtyExec));
+        r.add(Arc::new(pty::PtyClose));
+        r.add(Arc::new(http::HttpSend));
+        r.add(Arc::new(http::HttpRepeat));
+        r.add(Arc::new(codec::CodecCalc));
+        r.add(Arc::new(binary::BinSurvey));
+        r.add(Arc::new(binary::BinDecompile));
+        r.add(Arc::new(binary::BinXrefs));
+        r.add(Arc::new(binary::GdbProbe));
+        r.add(Arc::new(oracle::OracleCheck));
         r.add(Arc::new(fstools::Read));
         r.add(Arc::new(fstools::Write));
         r.add(Arc::new(fstools::Edit));
@@ -350,6 +374,12 @@ pub fn finalize(
             meta.insert(META_SHOWN.into(), ranges_json(&shown));
             base(status, envelope_plain(&facts, &text), None, false, meta)
         }
+        Body::ProducedView { blob, text, shown } => {
+            let cut = blob.lines > 0 && !(shown.len() == 1 && shown.first() == Some(&(1, blob.lines)));
+            meta.insert(META_OF_BLOB.into(), json!(blob.id.as_str()));
+            meta.insert(META_SHOWN.into(), ranges_json(&shown));
+            base(status, envelope_plain(&facts, &text), Some(blob), cut, meta)
+        }
         Body::Raw(bytes) => {
             let normalized = normalize(&bytes);
             facts.notes = normalized.notes();
@@ -481,9 +511,11 @@ pub mod testutil {
             cfg: Arc::new(cfg),
             sandbox: Arc::new(sandbox),
             env: Arc::new(BTreeMap::new()),
+            reference_proxy: None,
             files: Arc::new(files::FileTracker::new()),
             jobs: Arc::new(jobs),
             cancel: CancellationToken::new(),
+            capabilities: Arc::new(capabilities::SessionTools::default()),
         };
         TestEnv {
             dir,

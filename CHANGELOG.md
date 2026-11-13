@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+### Domain packs and evaluation
+
+- Added opt-in CTF and Redteam packs with specialist tool surfaces (at most 18 per role), bounded
+  epochs, credential-gated lateral assignments, observers and operator-contract judges. Existing
+  installed packs and running session prefixes are not automatically replaced.
+- Added a paired qualification protocol and a JSONL analyzer that retains censored failures, unknown
+  usage and pairing errors. It performs no model/target calls and claims no benchmark improvement.
+
+### Structured execution and security gates
+
+- Added opt-in session-local PTY, structured HTTP replay/cookie/capture/race, exact codec/TOTP,
+  binary-analysis and operator-oracle tools. PTYs participate in stop/finish/recovery accounting;
+  subprocess outputs and partial failures retain normal output provenance. Backend analysis uses
+  content-pinned inputs and bounded generated views. See `docs/SECURITY-TOOLS.md`.
+- HTTP tools share a daemon-wide per-host limit; reference web/CVE GETs use a distinct in-process
+  credential, validate redirect hops and strip ambient credentials. Reference OSV POST is refused.
+- Security roles can require an independent current-contract oracle receipt, matching live credential
+  prerequisites and hard child step slices. Verdict disqualifiers override accepting model prose.
+  Coverage remains checked atomically; output text/PTY frames are not independent success oracles.
+- Typed coverage/revisit/hypothesis summaries are shown in the HUD without copied secrets. Child IDs
+  accept exact IDs, unambiguous prefixes and `last` within the parent's actual children.
+- Rust 1.88 is now required by the RFC HTTP cookie-store dependency (previously 1.85).
+
+### Role runtime controls
+
+- Packs can route fresh children through named model profiles, rotate sibling profiles, escalate
+  subsequent assignments after failure, require a distinct named verifier profile, and cap admitted
+  execution attempts. Cross-profile forks are refused; existing pack defaults are unchanged.
+- Session log schema 2 adds non-rendered active-budget and Exec-admission records. Schema 1 logs remain
+  readable; older binaries refuse new session headers. Time excludes recorded queues, retries and idle
+  turns. Wrap-up admission now blocks probes/new work on both normal and speculative paths while
+  retaining output inspection, cleanup and honest blocker delivery.
+- Reasoning-only replies receive a specific bounded nudge. Similar-outcome HUD warnings and optional
+  flag-pattern alerts are advisory and do not verify success. See `docs/RUNTIME-CONTROLS.md`.
+### Containment and reference capabilities
+
+- Shared macOS system temp directories are no longer blanket writable roots. Commands use their
+  session `$TMPDIR`; read-only verifiers cannot write sibling system temp locations.
+- Git configuration/hooks/pointers are protected, including nested repositories, linked gitdirs and
+  commondirs. Seatbelt/file tools guard future metadata names; Bubblewrap makes discovered Git dirs
+  wholly read-only and does not reserve future repository names in writable directories.
+- Oracle supervisor secrets under `<workspace>/.loom/oracle-secrets` are unreadable, including before
+  creation and through symlinks. `Sandbox::isolated_replay` enforces separate harness-owned replay
+  workspace/temp siblings, rejects unconfined mode and removes the actor's writable roots.
+- Added the serialized sandbox mode `bubblewrap` (old config modes remain readable): Linux
+  namespaces, descriptor-pinned read-only/masked mounts and seccomp deny-all socket policy, without
+  unconfined fallback. Missing protected paths inside writable roots are refused.
+- Added optional `network.reference_hosts` (defaults empty): separate in-process GET proxy grants
+  kept out of command env, raw proxy refusal of reference names, method/header restrictions for plain
+  HTTP, and session revocation of both credentials. HTTPS GET/redirect policy belongs to the trusted
+  client. This is a capability restriction, not an exfiltration-proof channel.
+
 These changes follow a review of the first version of loom. They are grouped by area. Read "Before you
 upgrade" first; the rest says what behaves differently.
 
@@ -64,8 +116,9 @@ upgrade" first; the rest says what behaves differently.
    is unset but falls back to a host name written into the script, which is not a machine of yours.
    `./x` is optional and `cargo build --release -p loom-daemon` is the normal way to build. `./x` reads
    `LOOM_LANE` for separate build copies.
-9. **On non-macOS systems the daemon refuses to start** unless `[sandbox] mode = "none"`, because the
-   OS sandbox exists only on macOS. That mode leaves commands unconfined.
+9. **Linux can use explicit `mode = "bubblewrap"`** with `/usr/bin/bwrap` on x86_64/aarch64. It has
+   deny-all command networking and refuses host proxy/loopback/Unix socket exceptions. Other
+   unsupported systems require explicit `mode = "none"`; that leaves shell commands unconfined.
 10. **Going back to the first version is unsafe.** This version and later ones refuse to add to a
     session log that has a newer `schema` or records they cannot read, or to a mission journal with an
     operation they do not know, with a sentence telling you to upgrade; reading such a session still
@@ -265,3 +318,13 @@ upgrade" first; the rest says what behaves differently.
   judge delivers a scope check through `verdict`. `vr` documents its network policy.
 - `README.md`, `docs/RUN.md`, `docs/config.example.toml` and `docs/IMPLEMENTING.md` were rewritten to
   match the code. `SECURITY.md` was added. `docs/REVIEW-COVERAGE.md` is a dated record.
+
+### Durable security state
+
+- Add evidence-linked typed assets, secret handles, footholds, mandatory coverage dispositions,
+  condition revisits, bounded crash attempts, and independently judged hypotheses to the sealed ledger.
+- Add bounded stratified causal rules, provenance explanations, nonmutating hypothetical queries,
+  downstream retraction invalidation, aliases, and expiry-aware path suggestions.
+- Add opt-in `security_record`, `security_query`, and observed-blob `security_ingest` tools with atomic
+  scanner imports. Existing journal op shapes and old ledger snapshots remain readable; older builds
+  refuse append after the new `security` op. See `docs/SECURITY_STATE.md` for limits and supported formats.

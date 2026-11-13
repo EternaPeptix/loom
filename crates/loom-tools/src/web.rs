@@ -1,4 +1,7 @@
 //! `web_fetch`.
+//! Reference hosts use a distinct trusted-client capability kept out of subprocess env. Only GET
+//! is sent; no URL userinfo, Authorization or Cookie is carried. Each redirect selects/rechecks the
+//! appropriate proxy. This is capability reduction, not a URL/query exfiltration guarantee.
 //!
 //! CONTRACT.
 //!
@@ -37,7 +40,10 @@
 //! Tests required (local `axum` server on loopback; no proxy): plain text; html rendered and raw
 //! stored; `raw: true`; redirect chain reported; redirect loop stops at 10; 404 is `Ok` with the
 //! body; size limit reported; timeout; cancel; bad URL; large html is converted completely (text
-//! from the end of the document is present in the stored output).
+//! from the end of the document is present in the stored output). Real-proxy reference tests:
+//! raw credentials cannot reach reference hosts; reference GET works without inherited credentials;
+//! redirects switch capabilities both ways, refuse ungranted destinations, and refuse URL user-info
+//! without echoing the credentials.
 
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
@@ -76,6 +82,9 @@ impl Tool for WebFetch {
         let given = args.get("url").and_then(Value::as_str).unwrap_or_default().trim().to_string();
         let raw = args.get("raw").and_then(Value::as_bool).unwrap_or(false);
         let url = match Url::parse(&given) {
+            Ok(u) if !u.username().is_empty() || u.password().is_some() => {
+                return ToolOutput::denied("web_fetch does not send embedded URL credentials. Use an explicit authorized http_send request instead.");
+            }
             Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some() => u,
             Ok(u) => {
                 return ToolOutput::error(format!(
@@ -120,12 +129,29 @@ impl Tool for WebFetch {
 /// A client that never follows redirects itself, keeps no idle connection, uses the session's proxy if
 /// there is one, and reads nothing from the process environment.
 fn build_client(ctx: &ToolCtx) -> Result<Client, String> {
+    build_client_with_proxy(session_proxy(ctx).map(str::to_string))
+}
+
+pub(crate) fn reference_proxy(ctx: &ToolCtx, url: &Url) -> Option<String> {
+    ctx.reference_proxy
+        .as_ref()
+        .filter(|p| {
+            url.host_str().zip(url.port_or_known_default()).is_some_and(|(host, port)| p.matches_host(host, port))
+        })
+        .map(|p| p.url())
+}
+
+pub(crate) fn reference_client(ctx: &ToolCtx, url: &Url) -> Result<Option<Client>, String> {
+    reference_proxy(ctx, url).map(|p| build_client_with_proxy(Some(p))).transpose()
+}
+
+fn build_client_with_proxy(proxy_url: Option<String>) -> Result<Client, String> {
     let mut builder = Client::builder()
         .redirect(redirect::Policy::none())
         .no_proxy()
         .pool_max_idle_per_host(0)
         .user_agent("loom-web-fetch/0.1");
-    if let Some(p) = session_proxy(ctx) {
+    if let Some(p) = proxy_url {
         let proxy = Proxy::all(p).map_err(|e| {
             format!("The session's proxy setting is not usable ({e}); this is a harness configuration fault. Use `bash` with `curl` if the fetch is urgent, and report it.")
         })?;
@@ -290,10 +316,18 @@ fn chain_text(hops: &[Url]) -> String {
 
 /// Follow the redirects by hand, then turn the final response into the result.
 async fn fetch(ctx: &ToolCtx, client: &Client, start: Url, raw: bool) -> ToolOutput {
-    let proxied = session_proxy(ctx).is_some();
     let mut hops = vec![start];
     loop {
         let current = hops.last().cloned().unwrap_or_else(|| hops[0].clone());
+        if !current.username().is_empty() || current.password().is_some() {
+            return ToolOutput::denied("web_fetch does not send embedded URL credentials. Use an explicit authorized http_send request instead.");
+        }
+        let reference = match reference_client(ctx, &current) {
+            Ok(c) => c,
+            Err(e) => return ToolOutput::error(e),
+        };
+        let client = reference.as_ref().unwrap_or(client);
+        let proxied = session_proxy(ctx).is_some() || reference.is_some();
         // The proxy answers the CONNECT of an https URL out of the client's sight, so it is asked first.
         let tunnelled = proxied && current.scheme() == "https";
         if tunnelled {
@@ -751,11 +785,141 @@ mod tests {
     /// The real egress proxy with an open policy and these deny and allow_private lists, and a grant.
     async fn loom_proxy(deny: &[&str], private: &[&str]) -> (loom_net::Proxy, loom_net::SessionGrant) {
         let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let cfg = NetworkCfg { mode: NetworkMode::Open, allow: Vec::new(), deny: v(deny), allow_private: v(private) };
+        let cfg = NetworkCfg {
+            mode: NetworkMode::Open,
+            allow: Vec::new(),
+            deny: v(deny),
+            allow_private: v(private),
+            ..NetworkCfg::default()
+        };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = loom_net::Proxy::start(0, tx).await.unwrap();
         let grant = proxy.grant(&loom_core::SessionId::from("s-web"), loom_net::Policy::new(&cfg).unwrap());
         (proxy, grant)
+    }
+
+    async fn with_reference(e: &mut TestEnv, reference: &str, active: Vec<String>) -> loom_net::Proxy {
+        let url = Url::parse(reference).unwrap();
+        let host = format!("{}:{}", url.host_str().unwrap(), url.port_or_known_default().unwrap());
+        let cfg = NetworkCfg {
+            mode: NetworkMode::Allowlist,
+            allow: active,
+            reference_hosts: vec![host],
+            allow_private: vec!["127.0.0.1".into()],
+            ..NetworkCfg::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let proxy = loom_net::Proxy::start(0, tx).await.unwrap();
+        let raw = proxy.grant(&e.ctx.session, loom_net::Policy::new(&cfg).unwrap());
+        e.ctx.env = Arc::new(raw.env());
+        e.ctx.reference_proxy = Some(proxy.grant_reference(&e.ctx.session, &cfg).unwrap());
+        proxy
+    }
+
+    #[tokio::test]
+    async fn reference_fetch_works_while_raw_proxy_denies_and_default_credentials_are_not_carried() {
+        let seen: Arc<std::sync::Mutex<Vec<HeaderMap>>> = Arc::default();
+        let captured = seen.clone();
+        let base = serve(Router::new().route(
+            "/data",
+            get(move |headers: HeaderMap| {
+                captured.lock().unwrap().push(headers);
+                async { "reference body" }
+            }),
+        ))
+        .await;
+        let mut e = env();
+        let _proxy = with_reference(&mut e, &base, Vec::new()).await;
+        let reference = e.ctx.reference_proxy.take();
+        let denied = e.call("web_fetch", json!({"url": format!("{base}/data")})).await;
+        assert_eq!(denied.status, ToolStatus::Denied, "{}", denied.text);
+        assert!(seen.lock().unwrap().is_empty());
+        e.ctx.reference_proxy = reference;
+        let raw_url = session_proxy(&e.ctx).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer must-not-leak"));
+        headers.insert(header::COOKIE, HeaderValue::from_static("session=must-not-leak"));
+        headers.insert(header::REFERER, HeaderValue::from_static("http://private.example/secret"));
+        let raw = Client::builder()
+            .no_proxy()
+            .proxy(Proxy::all(raw_url).unwrap())
+            .default_headers(headers)
+            .redirect(redirect::Policy::none())
+            .build()
+            .unwrap();
+        let result = fetch(&e.ctx, &raw, Url::parse(&format!("{base}/data")).unwrap(), true).await;
+        assert_eq!(result.status, ToolStatus::Ok);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        for name in ["authorization", "cookie", "referer", "proxy-authorization"] {
+            assert!(!seen[0].contains_key(name), "reference endpoint received {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reference_redirects_select_each_hops_capability_and_do_not_widen_scope() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let active_hits = Arc::new(AtomicUsize::new(0));
+        let active_count = active_hits.clone();
+        let active = serve(Router::new().route(
+            "/ok",
+            get(move || {
+                active_count.fetch_add(1, Ordering::SeqCst);
+                async { "active body" }
+            }),
+        ))
+        .await;
+        let blocked_hits = Arc::new(AtomicUsize::new(0));
+        let blocked_count = blocked_hits.clone();
+        let blocked = serve(Router::new().route(
+            "/blocked",
+            get(move || {
+                blocked_count.fetch_add(1, Ordering::SeqCst);
+                async { "should not be fetched" }
+            }),
+        ))
+        .await;
+        let active_url = format!("{active}/ok");
+        let blocked_url = format!("{blocked}/blocked");
+        let userinfo_url = active_url.replacen("http://", "http://user:password@", 1);
+        let reference = serve(
+            Router::new()
+                .route("/active", get(move || async move { Redirect::temporary(&active_url) }))
+                .route("/blocked", get(move || async move { Redirect::temporary(&blocked_url) }))
+                .route("/userinfo", get(move || async move { Redirect::temporary(&userinfo_url) }))
+                .route("/data", get(|| async { "reference body" })),
+        )
+        .await;
+        let reference_data = format!("{reference}/data");
+        let back =
+            serve(Router::new().route("/reference", get(move || async move { Redirect::temporary(&reference_data) })))
+                .await;
+        let active_hosts = [&active, &back]
+            .into_iter()
+            .map(|base| {
+                let url = Url::parse(base).unwrap();
+                format!("{}:{}", url.host_str().unwrap(), url.port().unwrap())
+            })
+            .collect();
+        let mut e = env();
+        let _proxy = with_reference(&mut e, &reference, active_hosts).await;
+        let ok = e.call("web_fetch", json!({"url": format!("{reference}/active")})).await;
+        assert_eq!(ok.status, ToolStatus::Ok, "{}", ok.text);
+        assert!(e.stored(&ok).contains("active body"));
+        assert_eq!(active_hits.load(Ordering::SeqCst), 1);
+        let back = e.call("web_fetch", json!({"url": format!("{back}/reference")})).await;
+        assert_eq!(back.status, ToolStatus::Ok, "{}", back.text);
+        assert!(e.stored(&back).contains("reference body"));
+        let denied = e.call("web_fetch", json!({"url": format!("{reference}/blocked")})).await;
+        assert_eq!(denied.status, ToolStatus::Denied, "{}", denied.text);
+        assert_eq!(blocked_hits.load(Ordering::SeqCst), 0);
+        let denied = e.call("web_fetch", json!({"url": format!("{reference}/userinfo")})).await;
+        assert_eq!(denied.status, ToolStatus::Denied, "{}", denied.text);
+        assert_eq!(active_hits.load(Ordering::SeqCst), 1);
+        let direct_userinfo = format!("{reference}/data").replacen("http://", "http://user:password@", 1);
+        let denied = e.call("web_fetch", json!({"url": direct_userinfo})).await;
+        assert_eq!(denied.status, ToolStatus::Denied, "{}", denied.text);
+        assert!(!denied.text.contains("password"));
     }
 
     #[tokio::test]

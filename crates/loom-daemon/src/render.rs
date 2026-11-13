@@ -530,7 +530,11 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
                 out.push(paint(style, DIM, &text));
             }
         }
-        Event::TurnStart { .. } | Event::Net(_) | Event::Unknown => {}
+        Event::BudgetClock { .. }
+        | Event::ExecStarted { .. }
+        | Event::TurnStart { .. }
+        | Event::Net(_)
+        | Event::Unknown => {}
     }
     finish(out)
 }

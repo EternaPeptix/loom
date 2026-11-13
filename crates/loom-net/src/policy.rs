@@ -2,7 +2,7 @@
 //!
 //! CONTRACT.
 //!
-//! ## Patterns (`allow`, `deny`, and the name form of `allow_private`)
+//! ## Patterns (`allow`, `reference_hosts`, `deny`, and the name form of `allow_private`)
 //! `host`, `*.suffix`, either optionally followed by `:port`. Matching is on the lower-cased host
 //! with a trailing dot removed. `example.test` matches only that name; `*.example.test` matches any
 //! name that ends in `.example.test` (one or more labels before it) and not `example.test` itself.
@@ -15,9 +15,10 @@
 //! ## Decision — `check_name(host, port)` runs before resolving, `check_addr` after
 //! `check_name`, first match wins:
 //!   1. `deny` pattern matches → refused, rule `deny {pattern}`;
-//!   2. mode `deny_all` → refused, rule `mode deny_all`;
-//!   3. mode `allowlist` and no `allow` pattern matches → refused, rule `not in allow list`;
-//!   4. otherwise allowed so far: rule `allow {pattern}` (allowlist) or `mode open`.
+//!   2. `reference_hosts` matches → refused on the raw command policy, regardless of mode/grants;
+//!   3. mode `deny_all` → refused, rule `mode deny_all`;
+//!   4. mode `allowlist` and no `allow` pattern matches → refused, rule `not in allow list`;
+//!   5. otherwise allowed so far: rule `allow {pattern}` (allowlist) or `mode open`.
 //! `check_addr(host, port, addr, name_rule)` — for the address the proxy is about to connect to:
 //!   - if `addr` is special (see below): allowed only when an `allow_private` entry matches the
 //!     host name pattern (with port), or a CIDR/address entry contains `addr`; rule
@@ -43,6 +44,12 @@
 //! not unwrapped, and a network-specific NAT64 prefix (RFC 6052) is an ordinary IPv6 prefix here: the
 //! IPv4 address behind such a prefix is not seen. Listing one in `allow_private` admits every IPv4
 //! address behind it, private ones included, and IPv4 `deny` entries do not cover addresses inside it.
+//!
+//! ## Reference clients — `Policy::reference(cfg)`
+//! Allows only `reference_hosts`, retaining deny and resolved-address restrictions. This is separate
+//! from command grants: raw `new`/`with_hosts` refuse these names even in open mode. These are name
+//! reservations, not data-flow isolation or alias/IP blocking; GET URLs can still carry secrets.
+//! `matches_reference` is pattern routing only and does not authorize an address or override deny.
 //!
 //! ## Per-session grants — `Policy::with_hosts(cfg, hosts)`, `check_hosts(hosts)`
 //! `with_hosts` is `Policy::new(cfg)` plus the operator-granted `hosts` (same pattern syntax as `allow`).
@@ -278,6 +285,7 @@ impl PrivEntry {
 pub struct Policy {
     mode: NetworkMode,
     allow: Vec<Pattern>,
+    reference_hosts: Vec<Pattern>,
     /// Host patterns, plus address entries (literals and CIDR blocks) that also match resolved addresses.
     deny: Vec<PrivEntry>,
     allow_private: Vec<PrivEntry>,
@@ -334,9 +342,24 @@ impl Policy {
         Ok(Policy {
             mode: cfg.mode,
             allow: parse_list("allow", &cfg.allow, Pattern::parse)?,
+            reference_hosts: parse_list("reference_hosts", &cfg.reference_hosts, Pattern::parse)?,
             deny: parse_list("deny", &cfg.deny, PrivEntry::parse)?,
             allow_private: parse_list("allow_private", &cfg.allow_private, PrivEntry::parse_private)?,
         })
+    }
+
+    /// Reference-only policy for trusted in-process GET clients. Deny/address checks still apply.
+    pub fn reference(cfg: &NetworkCfg) -> Result<Policy, String> {
+        let mut policy = Self::new(cfg)?;
+        policy.mode = NetworkMode::Allowlist;
+        policy.allow = std::mem::take(&mut policy.reference_hosts);
+        Ok(policy)
+    }
+
+    /// Whether the configuration reserves this destination for the in-process reference client.
+    pub fn matches_reference(&self, host: &str, port: u16) -> bool {
+        let h = normalize_host(host);
+        self.reference_hosts.iter().any(|p| p.matches(&h, port))
     }
 
     /// The policy of `cfg` with `hosts` granted on top (see the module contract). The hosts are not
@@ -357,6 +380,9 @@ impl Policy {
         let h = normalize_host(host);
         if let Some(rule) = self.deny_hit(&h, port, h.parse::<IpAddr>().ok()) {
             return Verdict::no(rule);
+        }
+        if self.matches_reference(&h, port) {
+            return Verdict::no("reference host requires the in-process GET client");
         }
         match self.mode {
             NetworkMode::DenyAll => Verdict::no("mode deny_all"),
@@ -504,13 +530,34 @@ mod tests {
 
     fn cfg(mode: NetworkMode, allow: &[&str], deny: &[&str], private: &[&str]) -> NetworkCfg {
         let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        NetworkCfg { mode, allow: v(allow), deny: v(deny), allow_private: v(private) }
+        NetworkCfg { mode, allow: v(allow), deny: v(deny), allow_private: v(private), ..NetworkCfg::default() }
     }
     fn pol(mode: NetworkMode, allow: &[&str], deny: &[&str], private: &[&str]) -> Policy {
         Policy::new(&cfg(mode, allow, deny, private)).unwrap()
     }
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn reference_hosts_are_separate_even_with_open_mode_and_session_grants() {
+        let mut cfg = cfg(NetworkMode::Open, &["*"], &["blocked.reference.test"], &[]);
+        cfg.reference_hosts = vec!["*.reference.test:443".into()];
+        for raw in [Policy::new(&cfg).unwrap(), Policy::with_hosts(&cfg, &["api.reference.test:443".into()]).unwrap()] {
+            assert!(!raw.check_name("API.Reference.Test.", 443).allowed);
+            assert!(raw.check_name("api.reference.test", 80).allowed);
+            assert!(raw.check_name("active.test", 443).allowed);
+        }
+        let reference = Policy::reference(&cfg).unwrap();
+        assert!(reference.check_name("api.reference.test", 443).allowed);
+        assert!(!reference.check_name("api.reference.test", 80).allowed);
+        assert!(!reference.check_name("blocked.reference.test", 443).allowed);
+        assert!(!reference.check_name("active.test", 443).allowed);
+        assert!(!reference.check_addr("api.reference.test", 443, "127.0.0.1".parse().unwrap(), "allowed").allowed);
+        cfg.mode = NetworkMode::DenyAll;
+        assert!(Policy::reference(&cfg).unwrap().check_name("api.reference.test", 443).allowed);
+        cfg.reference_hosts = vec!["bad host".into()];
+        assert!(Policy::new(&cfg).is_err());
     }
 
     #[test]

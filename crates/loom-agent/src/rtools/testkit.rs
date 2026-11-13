@@ -33,6 +33,8 @@ pub struct FakeOrch {
     pub hang: Mutex<Vec<SessionId>>,
     /// When set, every `join` waits for cancellation.
     pub hang_all: Mutex<bool>,
+    /// Controlled verifier latency for contract-change regression tests; zero by default.
+    pub join_delay_ms: std::sync::atomic::AtomicU64,
     pub children: Mutex<Vec<ChildInfo>>,
     pub votes: Mutex<Option<Result<Vec<Vote>, String>>>,
     pub producers: Mutex<HashMap<BlobId, Producer>>,
@@ -106,6 +108,10 @@ impl Orchestrator for FakeOrch {
         cancel: &CancellationToken,
     ) -> Result<Settlement, String> {
         self.record(format!("join {child}"));
+        let delay = self.join_delay_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
         let hangs = *lock(&self.hang_all) || lock(&self.hang).contains(child);
         if hangs {
             cancel.cancelled().await;

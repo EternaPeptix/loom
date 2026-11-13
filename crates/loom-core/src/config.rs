@@ -152,6 +152,8 @@ pub enum SandboxMode {
     /// macOS `sandbox-exec` profile.
     #[default]
     Seatbelt,
+    /// Linux bubblewrap with isolated namespaces and no command network access.
+    Bubblewrap,
     /// No OS sandbox: commands are unconfined. The daemon logs a warning at start when this is set, and the
     /// system prompt of every session says so.
     None,
@@ -182,6 +184,10 @@ pub struct SandboxCfg {
     /// names). Filled in by the runtime; not a configuration key. `env_pass` still overrides it.
     #[serde(skip)]
     pub secret_env: Vec<String>,
+    /// Potential actor write origins retained when read-only roles lose `extra_writable` grants.
+    /// Used only to exclude untrusted imports/inputs during isolated replay; not a config key.
+    #[serde(skip)]
+    pub replay_untrusted_paths: Vec<String>,
 }
 
 impl Default for SandboxCfg {
@@ -197,6 +203,7 @@ impl Default for SandboxCfg {
             unix_sockets: Vec::new(),
             env_pass: Vec::new(),
             secret_env: Vec::new(),
+            replay_untrusted_paths: Vec::new(),
         }
     }
 }
@@ -219,6 +226,8 @@ pub struct NetworkCfg {
     pub mode: NetworkMode,
     /// Host patterns: `example.test`, `*.example.test`, optionally `:port`.
     pub allow: Vec<String>,
+    /// Reference-only hosts: in-process GET clients use a separate grant; raw proxy access refuses them.
+    pub reference_hosts: Vec<String>,
     /// Host patterns that are always refused.
     pub deny: Vec<String>,
     /// Private, loopback or link-local destinations that are permitted (same pattern syntax, or CIDR).
@@ -458,6 +467,20 @@ impl Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bubblewrap_and_reference_hosts_are_additive_config_options() {
+        let c =
+            Config::parse("[sandbox]\nmode = 'bubblewrap'\n[network]\nreference_hosts = ['docs.example.test:443']\n")
+                .unwrap();
+        assert_eq!(c.sandbox.mode, SandboxMode::Bubblewrap);
+        assert_eq!(c.network.reference_hosts, ["docs.example.test:443"]);
+        assert!(Config::parse("").unwrap().network.reference_hosts.is_empty());
+        assert_eq!(Config::parse("[sandbox]\nmode = 'none'\n").unwrap().sandbox.mode, SandboxMode::None);
+        assert!(Config::parse("[sandbox]\nreplay_untrusted_paths = ['/actor']\n").is_err());
+        let cfg = SandboxCfg { replay_untrusted_paths: vec!["/actor".into()], ..SandboxCfg::default() };
+        assert!(serde_json::to_value(cfg).unwrap().get("replay_untrusted_paths").is_none());
+    }
 
     #[test]
     fn empty_file_is_default() {

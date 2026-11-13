@@ -26,6 +26,7 @@ pub mod agents;
 pub mod ledger;
 pub mod misc;
 pub mod scope;
+pub mod security;
 pub mod terminal;
 #[cfg(test)]
 pub(crate) mod testkit;
@@ -106,6 +107,58 @@ pub struct SpawnReq {
     /// Started by the harness itself for the finish gate: not counted against `max_children` and not
     /// limited to the parent role's `may_spawn`. Tools the model calls always set this to false.
     pub harness: bool,
+    /// Explicit security-state prerequisites, checked against the actual child role by the runtime.
+    pub prerequisite: Option<DispatchPrerequisite>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchPrerequisite {
+    pub asset: String,
+    pub credential: String,
+}
+
+/// Resolve an explicit dispatch prerequisite in this mission. A credential for another asset or an
+/// expired observation cannot satisfy the gate; this does not grant scope or promise a login works.
+pub fn validate_dispatch_prerequisite(
+    shared: &Shared,
+    required: bool,
+    requested: Option<&DispatchPrerequisite>,
+    now_ms: u64,
+) -> Result<Option<DispatchPrerequisite>, String> {
+    let Some(requested) = requested else {
+        return if required {
+            Err("This role requires explicit asset and credential IDs. Record an evidence-linked credential for the target asset, then pass both IDs when dispatching it.".into())
+        } else {
+            Ok(None)
+        };
+    };
+    let state = shared.ledger()?;
+    let asset = state.security.resolve(&requested.asset)?;
+    if !state.security.assets.contains_key(&asset) {
+        return Err("The dispatch asset must be an asset record; query security assets and use its ID.".into());
+    }
+    let id = state.security.resolve(&requested.credential)?;
+    let credential = state.security.credentials.get(&id).ok_or_else(|| {
+        "The dispatch credential must be a credential record; query security state and use its ID.".to_string()
+    })?;
+    if credential.input.asset != asset {
+        return Err(
+            "This credential belongs to another asset. Supply a credential recorded for this exact target asset."
+                .into(),
+        );
+    }
+    if credential.input.expires_ms.is_some_and(|t| t <= now_ms) {
+        return Err(
+            "The credential observation expired. Revalidate and record current evidence before dispatching this role."
+                .into(),
+        );
+    }
+    if credential.input.evidence.is_empty()
+        || credential.input.evidence.iter().any(|id| !state.evidence.iter().any(|e| &e.id == id && e.input.attested))
+    {
+        return Err("The credential lacks attested mission evidence. Record an observed credential before dispatching this role.".into());
+    }
+    Ok(Some(DispatchPrerequisite { asset, credential: id }))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +213,16 @@ pub trait Orchestrator: Send + Sync {
     /// Deliver a message from `parent` to a running child.
     async fn message_child(&self, parent: &SessionId, child: &SessionId, text: &str) -> Result<(), String>;
     async fn children(&self, parent: &SessionId) -> Vec<ChildInfo>;
+    /// Actual child role, including harness verifiers omitted from the running-work list. Used to
+    /// authenticate mechanical evidence ownership; never inferred from a child's report text.
+    async fn child_role(&self, parent: &SessionId, child: &SessionId) -> Option<String> {
+        self.children(parent).await.into_iter().find(|c| &c.id == child).map(|c| c.role)
+    }
+    /// Normalize a child reference for status reporting. Implementations must still enforce ownership
+    /// at their action boundaries; scripted orchestrators may use exact IDs unchanged.
+    async fn resolve_child(&self, _parent: &SessionId, child: &SessionId) -> Result<SessionId, String> {
+        Ok(child.clone())
+    }
     /// Ask `k` independent copies of `session` (same context up to its current step, different
     /// seeds, no tools executed) to choose between `options`.
     async fn poll(
@@ -318,6 +381,9 @@ pub fn tool(name: &str, shared: &Arc<Shared>) -> Option<Arc<dyn loom_tools::Tool
         "claim_update" => Arc::new(ledger::ClaimUpdate(s)),
         "evidence" => Arc::new(ledger::Evidence(s)),
         "ledger" => Arc::new(ledger::Ledger(s)),
+        "security_record" => Arc::new(security::SecurityRecord(s)),
+        "security_query" => Arc::new(security::SecurityQuery(s)),
+        "security_ingest" => Arc::new(security::SecurityIngest(s)),
         "pin" => Arc::new(misc::Pin(s)),
         "log_search" => Arc::new(misc::LogSearch(s)),
         "finish" => Arc::new(terminal::Finish(s)),
@@ -372,6 +438,9 @@ pub const NAMES: &[&str] = &[
     "claim_update",
     "evidence",
     "ledger",
+    "security_record",
+    "security_query",
+    "security_ingest",
     "pin",
     "log_search",
     "finish",
@@ -392,6 +461,58 @@ pub const NAMES: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_dispatch_requires_a_matching_unexpired_attested_record() {
+        use crate::rtools::testkit::rig;
+        use loom_core::ledger::{EvidenceInput, EvidenceKind};
+        use loom_core::security_state::{AssetInput, AssetKind, CredentialInput, SecurityOp};
+        let r = rig("lead", false, true);
+        assert!(validate_dispatch_prerequisite(&r.shared, true, None, 100).is_err());
+        assert_eq!(validate_dispatch_prerequisite(&r.shared, false, None, 100).unwrap(), None);
+        r.model_op(LedgerOp::ClaimAdd { text: "fixture credential observed".into() });
+        r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
+            claim: "c1".into(),
+            kind: EvidenceKind::Execution,
+            supports: true,
+            session: "s-test".into(),
+            call_id: "call-fixture".into(),
+            blob: None,
+            lines: None,
+            quote: None,
+            note: "dummy fixture observation".into(),
+            attested: true,
+        }));
+        let mut ids = Vec::new();
+        for locator in ["first.test", "second.test"] {
+            let asset = AssetInput {
+                kind: AssetKind::Host,
+                locator: locator.into(),
+                evidence: vec!["e1".into()],
+                mandatory: true,
+                parent: None,
+            };
+            ids.push(asset.id().unwrap());
+            r.model_op(LedgerOp::Security(SecurityOp::AssetUpsert { asset }));
+        }
+        let credential = CredentialInput {
+            asset: ids[0].clone(),
+            principal: "dummy".into(),
+            secret_handle: "out:0123456789abcdef".into(),
+            evidence: vec!["e1".into()],
+            unlocks: vec![],
+            expires_ms: Some(200),
+        };
+        let state = r.model_op(LedgerOp::Security(SecurityOp::CredentialAdd { credential }));
+        let id = state.security.credentials.keys().next().unwrap().clone();
+        let mut request = DispatchPrerequisite { asset: ids[0].clone(), credential: id };
+        assert!(validate_dispatch_prerequisite(&r.shared, true, Some(&request), 100).is_ok());
+        assert!(validate_dispatch_prerequisite(&r.shared, true, Some(&request), 200).unwrap_err().contains("expired"));
+        request.asset = ids[1].clone();
+        assert!(validate_dispatch_prerequisite(&r.shared, true, Some(&request), 100)
+            .unwrap_err()
+            .contains("another asset"));
+    }
 
     #[test]
     fn journal_sentences_are_distinct_and_say_what_to_do() {

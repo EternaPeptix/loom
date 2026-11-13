@@ -32,7 +32,7 @@ That inverts the usual cloud trade-offs:
    at any time, so a restart, a crash and an eviction are the same operation.
 2. **Window fullness is never an input to a model decision.** The model is told once, in the pack
    preamble, that context is managed and is never a reason to stop, defer or summarise. No gauge is
-   shown. Budgets that do exist (steps, wall time) are the harness's to enforce, not the model's to ration: no running count is shown, only one heads-up when a budget is nearly used, and the harness parks on exhaustion regardless.
+   shown. Budgets that do exist (steps, active time) are the harness's to enforce, not the model's to ration: no running count is shown, only one heads-up when a budget is nearly used, and the harness parks on exhaustion regardless.
 3. **Tool output is admitted whole.** If it cannot be, the cut is explicit (which lines were omitted,
    sizes, outcome) and the full output stays addressable by a handle the model can page and search.
    Later eviction replaces old output with a stub carrying the same handle. Nothing is ever lost
@@ -651,6 +651,14 @@ none by default). When one is reached the session gets a budget note; two steps 
 `budget_exhausted` with its last reply, and a root opens a blocking `parked` item and its turn ends
 `budget_exhausted`. The next turn the operator starts for that root (message, answer, resume) grants a
 fresh budget of the configured size, counted from that turn, and the model is told so.
+Schema 2 records active-time intervals: limiter queues, retry backoff/outages and idle turns do not
+consume minute budgets. After a crash, an interrupted active interval closes at the latest durable
+pre-interruption timestamp; unknown time after that checkpoint is excluded. Schema 1 logs retain their
+previous wall accounting until their first clock transition. During the two grace steps the unchanged
+tool schemas remain in the prefix, but dispatch admits existing-output inspection, ledger cleanup,
+bounded waiting/stopping and delivery. Probes, writes, new plans/claims and delegation are refused,
+including speculative starts. A finish requiring fresh execution may still refuse; report the blocker
+and partial result rather than claiming verification. See [runtime controls](RUNTIME-CONTROLS.md).
 
 **Stall.** In a session with a ledger whose role has `note`, `claim` or `evidence`, when the last
 `agents.stall_steps` (30) steps recorded nothing in the ledger, changed no file and started or received
@@ -883,17 +891,30 @@ evidence kind and staleness. Each module's documentation is the precise specific
 **Sandbox** (`loom-tools::sandbox`; its module documentation holds the exact seatbelt profile). Mode
 `seatbelt` (default) runs commands under `/usr/bin/sandbox-exec`; the daemon refuses to start when the
 mode cannot work on the host (not macOS, or no `sandbox-exec`). Mode `none` confines nothing, which the
-system prompt states. The policy:
+system prompt states. Linux `bubblewrap` is a separate deny-all command-network mode: it requires
+`/usr/bin/bwrap`, refuses loopback/Unix socket exceptions and host proxy bridges, uses isolated
+namespaces, a read-only host filesystem, private `/tmp`, `/var/tmp` and `/run`, and a seccomp filter
+that denies socket creation/connection (including filesystem Unix sockets and io_uring setup).
+Protected mounts are read-only. User home (with credential protection), Loom home, and workspace
+`.loom` are hidden by private mounts; scoped workspace/temp roots are restored from pinned sources.
+This hides future oracle-secret/credential creation too. Missing explicit unreadable paths outside
+hidden parents are refused; a whole user-home writable root is refused. The session temp remains
+writable. It never falls back to `none`. In-process tools still use the daemon's network policy.
+Only x86_64 and aarch64 Linux are supported. Bind sources are pinned by open harness descriptors,
+resolved through the original host proc mount, so replacing a writable root or temp ancestor does
+not grant a different directory. Missing protected paths inside a writable root are refused unless
+an existing read-only ancestor covers them; create those paths before running a writable session.
+The Seatbelt policy:
 
-- writable: the workspace, the session temp dir, `sandbox.extra_writable`, `/private/tmp`,
-  `/private/var/folders` and the device files commands need;
+- writable: the workspace, the session temp dir, `sandbox.extra_writable`, and the device files
+  commands need. Shared system temp directories are not writable by default;
 - never writable, even inside a writable root: `<workspace>/.loom`, the loom home, and
   `sandbox.protected_paths`. The session temp dir (`<loom home>/sessions/<id>/tmp`) is the exception:
   what is in it can be written, and it tests as writable, but the directory itself cannot be removed,
   renamed, replaced or swapped for a link. A temp dir that is `/`, or is or contains the loom home, is
   refused;
 - not readable, and not writable either (renaming and removing included), wherever they lie, even in
-  the workspace: `<loom home>/token`, `<loom home>/keys`, `sandbox.unreadable_paths`, and, while
+  the workspace: `<loom home>/token`, `<loom home>/keys`, `<workspace>/.loom/oracle-secrets`, `sandbox.unreadable_paths`, and, while
   `sandbox.protect_credentials` is on (default), the user's credential stores (`~/.ssh`, `~/.aws`,
   `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`, `~/.docker/config.json`,
   `~/.netrc`, `~/.npmrc`, `~/.pypirc`, cargo and git credentials, `~/.password-store`, `~/.config/op`,
@@ -920,6 +941,14 @@ system prompt states. The policy:
   every loopback port with `loopback_all`) and to `sandbox.unix_sockets`; listening on loopback is
   allowed.
 
+Git configuration, hooks and gitdir/commondir pointers are protected by default. Existing nested
+repositories and linked worktrees are discovered without running host Git; resolved gitdir and
+commondir metadata is protected too. Discovery refuses unreadable or excessive trees (100000
+workspace directories, 4096 metadata pointers, 4096 bytes per pointer). Seatbelt and file tools also
+refuse future nested `.git` configuration/hook writes. Bubblewrap freezes discovered Git directories
+as a whole; it cannot reserve future `.git` names in writable directories, so new repositories must
+be created outside a session. These protections do not establish immunity to arbitrary host Git bugs.
+
 Paths are made canonical when the sandbox is built. On macOS the rules that refuse are compared without
 regard to case (volumes are case-insensitive by default); the rules that allow are compared exactly. The
 file tools apply the same policy in-process (`check_read`, `check_write`) to the path resolved through
@@ -934,8 +963,8 @@ path of that directory joined with the file name, and creates, syncs and renames
 relative to that descriptor. A file name that is itself a link is read and followed by the writer, at
 most 8 links, so the directory checked is the target's. A role with `read_only` gets no `extra_writable`
 and its workspace is added to the never-writable paths, so it can still write in its session temp dir,
-in the system temp locations (`/private/tmp`, `/private/var/folders`, which other sessions use too) and
-to the device files, and nowhere else. Commands get the daemon's environment without any variable whose
+and to the device files, and nowhere else. This is a write policy; readable untrusted files remain
+untrusted inputs. In `none`, read-only roles do not constrain shell commands. Commands get the daemon's environment without any variable whose
 name (case-insensitive) contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`,
 `CREDENTIAL`, `AUTH_TOKEN`, `COOKIE`, `SESSION_KEY` or `PRIVATE`, has `SESSION`, `AUTH`, `PASS`, `JWT`
 or `WEBHOOK` as a part delimited by `_` or the ends of the name, ends in `_PAT`, `_DSN`, `_PWD` or `_PW`,
@@ -1265,7 +1294,7 @@ the researcher's finish is verified by `judge`). Domain discipline is a pack, no
 
 ## 14. Engineering rules
 
-- Rust 2021, stable (`rust-version` 1.85). Dependencies come from `[workspace.dependencies]`; add there
+- Rust 2021, stable (`rust-version` 1.88). Dependencies come from `[workspace.dependencies]`; add there
   if you need one.
 - No `unwrap`/`expect`/`panic!` outside tests, except on invariants established in the same function.
 - Errors are typed per crate with `thiserror`; messages that reach the model say what to do next.
@@ -1278,6 +1307,20 @@ the researcher's finish is verified by `judge`). Domain discipline is a pack, no
   named by `LOOM_BUILD_HOST` and runs cargo there (`LOOM_BUILD_HOST=local` runs it in place;
   `LOOM_LANE` gives a run its own source copy and target directory on that host). Set
   `LOOM_BUILD_HOST` before using it: unset, the script falls back to a host name of its author's.
+
+## Security workflow extensions
+
+Typed asset/credential/foothold records, coverage, revisit triggers, hypothesis ownership and bounded
+causal projections live in the sealed mission journal; see `docs/SECURITY_STATE.md`. They are
+observations and investigation hints, not network authorization or automatic vulnerability verdicts.
+The HUD renders bounded derived state without copying credentials or untrusted observation prose.
+
+Roles may opt into structured HTTP/PTY/calculation/binary tools, credential prerequisites and hard
+child step slices. Execution tools retain normal sandboxing, cancellation and output provenance.
+`docs/SECURITY-TOOLS.md` defines framing, cache and backend limits. `docs/SECURITY-ORACLES.md` defines
+operator-pinned independent acceptance receipts and structured verdict disqualifiers. A raw banner,
+regex match, model JSON, static analysis or PTY trailer cannot satisfy an oracle-required finish.
+Unsupported checks fail closed; blocked/budget settlement remains honest about incomplete work.
 
 ## Roadmap (not implemented)
 
@@ -1306,3 +1349,14 @@ relied on.
   it; titles are not written by a model).
 - A warning when a configured context window is larger than the one the server reports
   (`Discovered::server_window` is computed and not reported).
+
+## Reference service capabilities
+
+`network.reference_hosts` reserves host patterns for trusted in-process GET clients. The raw command
+proxy refuses those names even when `allow`, open mode, or a mission grant would permit them. A
+separate random `ReferenceGrant` is held in tool memory and never included in command environment
+variables; revoking a session revokes both grants. Deny and resolved private-address rules still apply.
+Plain HTTP reference requests permit GET only and strip Authorization, Cookie and Referer. HTTPS
+CONNECT remains opaque: the in-process client must enforce GET and credential stripping, reject URL
+user-info, and recheck each redirect. Name reservations are not alias/IP or data-flow isolation.
+GET paths and queries can disclose data, so this is not an exfiltration-proof channel.

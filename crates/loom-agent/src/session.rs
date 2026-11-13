@@ -19,6 +19,19 @@
 //! `Agent(sender)`. Records queued by tools (`Shared::take_emitted`) keep the author they were
 //! queued with.
 //!
+//! ## Runtime admission and clocks
+//! Exhausted budgets retain the serialized tool schema but admit only existing-output inspection,
+//! ledger cleanup and terminal/blocker delivery. The same policy applies before speculative starts.
+//! Role Exec caps count durable `exec_started` admissions over own records, including errors and
+//! interrupted attempts; old results are counted when no admission record exists. Zero denies all.
+//! `budget_clock` transitions persist active intervals: queue and retry waits do not count, nor idle
+//! turns. A restart closes an active interval at the latest durable timestamp, so unobserved
+//! time after a crash is not guessed. Old logs keep wall time until their first clock transition.
+//! Candidate flags and normalized outcome fingerprints are advisory, never success or refutation.
+//!
+//! Session cancellation, idle stop, settlement, archive and shutdown also close every session PTY,
+//! including terminals whose earlier read already returned. Open terminals are not orphaned jobs.
+//!
 //! ## Own records
 //! A forked session's log starts with a copy of its parent's records. The session's *own* records
 //! are those after its `forked` record (all records when there is none). Step counts, turn state,
@@ -738,6 +751,8 @@ struct State {
     /// the budget ran out begins a fresh one.
     budget_step_base: u32,
     budget_from_ms: Option<u64>,
+    clock: Option<ActiveClock>,
+    last_ms: u64,
     inbox: Vec<InboxItem>,
     last_interrupted: Option<String>,
     /// The latest `interrupted` was recorded while no turn was open: a stop between turns.
@@ -752,6 +767,67 @@ struct State {
     requested: Option<Measured>,
     /// The latest step request whose reply carried the prompt size the server counted.
     measured: Option<Measured>,
+}
+
+/// Durable intervals rather than subtracting response timings (which can overlap or never arrive).
+#[derive(Default)]
+struct ActiveClock {
+    accrued_ms: u64,
+    running_from: Option<u64>,
+}
+
+impl ActiveClock {
+    fn elapsed(&self, now: u64) -> u64 {
+        self.accrued_ms.saturating_add(self.running_from.map_or(0, |from| now.saturating_sub(from)))
+    }
+    fn set(&mut self, running: bool, at: u64) {
+        if let Some(from) = self.running_from.take() {
+            self.accrued_ms = self.accrued_ms.saturating_add(at.saturating_sub(from));
+        }
+        self.running_from = running.then_some(at);
+    }
+}
+
+/// Dispatch policy shared by streamed speculative reads and normal calls. Unknown tools fail closed
+/// during wrap-up; adding a new State/Terminal tool cannot silently create another probing route.
+#[derive(Clone, Copy, Default)]
+struct CallPolicy {
+    wrapup: bool,
+}
+
+impl CallPolicy {
+    fn allows(self, name: &str, args: &Value) -> bool {
+        if !self.wrapup {
+            return true;
+        }
+        match name {
+            "out_read" | "out_grep" | "ledger" | "mission_state" | "security_query" | "codec_calc" | "pty_close"
+            | "note" | "evidence" | "claim_update" | "finish" | "conclude" | "verdict" | "report_blocker"
+            | "ask_user" | "wait" | "agent_stop" | "agent_list" | "job_kill" => true,
+            "security_record" => args.get("operation").is_some_and(|op| {
+                let has = |key| op.get(key).and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
+                match op.get("action").and_then(Value::as_str) {
+                    Some("coverage_set") => {
+                        has("asset")
+                            && matches!(
+                                op.get("disposition").and_then(|d| d.get("status")).and_then(Value::as_str),
+                                Some("tested" | "deferred")
+                            )
+                    }
+                    Some("hypothesis_evidence" | "hypothesis_verdict" | "fact_retract" | "rule_retract") => has("id"),
+                    Some("revisit_acknowledge") => has("target"),
+                    _ => false,
+                }
+            }),
+            "step" => {
+                args.get("id").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty())
+                    && args.get("text").is_none()
+                    && matches!(args.get("status").and_then(Value::as_str), Some("done" | "dropped"))
+            }
+            "job_wait" => args.get("timeout_s").and_then(Value::as_u64).is_some_and(|s| s <= 2),
+            _ => false,
+        }
+    }
 }
 
 /// A step request as the re-weave check needs it.
@@ -774,6 +850,9 @@ impl State {
                 self.started_ms = rec.ts_ms;
                 self.termination = Some(s.termination);
                 self.budget = s.budget.clone();
+                if s.schema >= 2 {
+                    self.clock = Some(ActiveClock::default());
+                }
             }
             Event::Forked(f) => {
                 *self = State {
@@ -782,6 +861,7 @@ impl State {
                     epoch: self.epoch,
                     termination: Some(f.termination),
                     budget: f.budget.clone(),
+                    clock: self.clock.take().map(|_| ActiveClock::default()),
                     requested: self.requested.take(),
                     measured: self.measured.take(),
                     ..State::default()
@@ -810,6 +890,11 @@ impl State {
                 self.usage.reasoning_tokens = self.usage.reasoning_tokens.saturating_add(r.usage.reasoning_tokens);
             }
             Event::Reweave(r) => self.epoch = r.epoch,
+            Event::BudgetClock { running } => {
+                let old_elapsed = rec.ts_ms.saturating_sub(self.budget_from_ms.unwrap_or(self.started_ms));
+                let clock = self.clock.get_or_insert(ActiveClock { accrued_ms: old_elapsed, running_from: None });
+                clock.set(*running, rec.ts_ms);
+            }
             Event::HarnessNote { note: NoteKind::Budget, .. } => self.budget_note_step = Some(self.step),
             Event::InboxOpened(item) => self.inbox.push(item.clone()),
             Event::InboxResolved { item_id, .. } => self.inbox.retain(|i| &i.item_id != item_id),
@@ -820,19 +905,30 @@ impl State {
                     self.budget_step_base = self.step;
                     self.budget_from_ms = Some(rec.ts_ms);
                     self.budget_note_step = None;
+                    if self.clock.is_some() {
+                        self.clock = Some(ActiveClock::default());
+                    }
                 }
             }
             Event::TurnEnd { reason } => {
                 self.last_end = Some(*reason);
                 self.in_turn = false;
+                if let Some(clock) = &mut self.clock {
+                    clock.set(false, rec.ts_ms);
+                }
             }
             Event::SessionEnd { outcome, .. } => self.ended = Some(*outcome),
             Event::Interrupted { reason } => {
+                if let Some(clock) = &mut self.clock {
+                    let restart = reason == texts::REASON_RESTART || reason.starts_with("the session log was damaged");
+                    clock.set(false, if restart { self.last_ms } else { rec.ts_ms });
+                }
                 self.last_interrupted = Some(reason.clone());
                 self.stopped_idle = !self.in_turn;
             }
             _ => {}
         }
+        self.last_ms = rec.ts_ms;
     }
 }
 
@@ -914,6 +1010,7 @@ impl EarlyRun {
 /// without `discard` (a step that ends on a failed append), its tasks are stopped, not awaited.
 struct Early {
     on: bool,
+    policy: CallPolicy,
     registry: Registry,
     template: ToolCtx,
     turn: CancellationToken,
@@ -946,6 +1043,7 @@ impl Early {
     ) -> Early {
         Early {
             on,
+            policy: CallPolicy::default(),
             registry,
             template,
             turn: turn.clone(),
@@ -1007,7 +1105,8 @@ impl Early {
         if self.runs.contains_key(&index) || self.turn.is_cancelled() || running >= MAX_EARLY {
             return;
         }
-        if !matches!(serde_json::from_str::<Value>(arguments), Ok(Value::Object(_))) {
+        if !matches!(serde_json::from_str::<Value>(arguments), Ok(Value::Object(ref a)) if self.policy.allows(name, &Value::Object(a.clone())))
+        {
             return;
         }
         let mut ctx = self.template.clone();
@@ -1773,6 +1872,7 @@ impl Session {
                 Ev::Input(None) => {
                     // Between turns no `interrupted` note goes with the jobs a shutdown stops: their ends say why.
                     let why = if self.deps.control.is_shutting() { texts::JOB_SHUTDOWN_DETAIL } else { "" };
+                    self.deps.ctx.capabilities.ptys.close_all().await;
                     self.deps.ctx.jobs.kill_all_because(self.grace(), why).await;
                     // Nothing reads the job events after this task: what the jobs reported (killed just
                     // now, or ended before) is recorded now, or the next `open` would take them for lost.
@@ -1808,6 +1908,7 @@ impl Session {
             Input::Stop => {
                 let jobs = !self.running_jobs().await.is_empty();
                 let children = !self.running_children().await.is_empty();
+                self.deps.ctx.capabilities.ptys.close_all().await;
                 self.deps.ctx.jobs.kill_all(self.grace()).await;
                 self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
                 // Stopped stays stopped: what the stop itself causes (a child's settlement, a job's end)
@@ -1831,6 +1932,7 @@ impl Session {
     /// settle it `Stopped`, so that its parent is not left waiting for it. `reason` says who stopped it.
     async fn stop_idle_child(&mut self, reason: &str) -> R<Settlement> {
         self.append(Author::Harness, Event::Interrupted { reason: reason.to_string() })?;
+        self.deps.ctx.capabilities.ptys.close_all().await;
         self.deps.ctx.jobs.kill_all(self.grace()).await;
         self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
         self.settle(delivery(ChildOutcome::Stopped, texts::stopped_report(self.st.step))).await
@@ -2116,6 +2218,7 @@ impl Session {
         self.nudges = 0;
         let renewed = renews_budget(trigger, self.st.last_end);
         self.append(Author::Harness, Event::TurnStart { trigger })?;
+        self.clock_set(true)?;
         // A turn that starts while the harness is going down is cut at once (its token is cancelled
         // from birth): the note belongs to the first turn after the restart.
         if self.st.last_end == Some(TurnEndReason::Stopped) && !self.deps.control.is_shutting() {
@@ -2195,6 +2298,7 @@ impl Session {
         let detail: String = d.report.lines().next().unwrap_or("").chars().take(DETAIL_CHARS).collect();
         self.append(Author::Harness, Event::TurnEnd { reason })?;
         self.append(Author::Harness, Event::SessionEnd { outcome, detail })?;
+        self.deps.ctx.capabilities.ptys.close_all().await;
         self.deps.ctx.jobs.kill_all(self.grace()).await;
         self.phase = Phase::Ended;
         self.publish();
@@ -2223,6 +2327,7 @@ impl Session {
             texts::REASON_OPERATOR
         };
         self.append(Author::Harness, Event::Interrupted { reason: reason.to_string() })?;
+        self.deps.ctx.capabilities.ptys.close_all().await;
         self.deps.ctx.jobs.kill_all(self.grace()).await;
         if shutting {
             // The inputs are closed behind a shutdown, so nothing would read these later: what the
@@ -2307,9 +2412,11 @@ impl Session {
             )?;
             self.publish();
 
+            self.clock_set(false)?;
             let Some(permit) = self.deps.limiter.acquire(self.deps.priority, &token).await else {
                 return self.cancelled().await;
             };
+            self.clock_set(true)?;
             let request = ChatRequest {
                 messages,
                 tools: w.tools.clone(),
@@ -2381,6 +2488,7 @@ impl Session {
         let logged = if on { self.logged_call_ids() } else { HashSet::new() };
         let (registry, template, counts) = (self.registry.clone(), self.deps.ctx.clone(), self.early_counts.clone());
         let mut early = Early::new(on, registry, template, token, logged, counts);
+        early.policy = CallPolicy { wrapup: self.st.budget_note_step.is_some() };
         let result = self
             .complete_watched(request, token, |event| {
                 sink.delta(&session, req_id, event);
@@ -2424,6 +2532,7 @@ impl Session {
                 r = &mut call => break r,
                 Some(event) = rx.recv() => {
                     on_event(&event);
+                    self.clock_event(&event)?;
                     outage.on_event(&event);
                 }
                 () = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {
@@ -2433,7 +2542,9 @@ impl Session {
         };
         while let Ok(event) = rx.try_recv() {
             on_event(&event);
+            self.clock_event(&event)?;
         }
+        self.clock_set(true)?;
         if let Some(item_id) = notice {
             let at = texts::clock(now_ms());
             let answer = match &result {
@@ -2564,7 +2675,9 @@ impl Session {
             is_child: shared.is_child(),
             // Counted from where the budget was granted: a root's fresh budget starts at its turn.
             step: self.st.step.saturating_sub(self.st.budget_step_base),
-            started_ms: self.st.budget_from_ms.unwrap_or(self.st.started_ms),
+            started_ms: self.st.clock.as_ref().map_or(self.st.budget_from_ms.unwrap_or(self.st.started_ms), |c| {
+                now_ms().saturating_sub(c.elapsed(now_ms()))
+            }),
             budget,
             finish_gated: shared.role.termination == loom_core::event::Termination::Explicit
                 && shared.role.tools.iter().any(|t| t == "conclude"),
@@ -2598,6 +2711,39 @@ impl Session {
         Ok(force)
     }
 
+    fn clock_set(&mut self, running: bool) -> R<()> {
+        if self.st.clock.as_ref().is_some_and(|c| c.running_from.is_some() == running) {
+            return Ok(());
+        }
+        self.append(Author::Harness, Event::BudgetClock { running }).map(|_| ())
+    }
+
+    fn clock_event(&mut self, event: &StreamEvent) -> R<()> {
+        match event {
+            StreamEvent::Retrying { .. } => self.clock_set(false),
+            StreamEvent::AttemptStart { .. } => Ok(()),
+            _ => self.clock_set(true),
+        }
+    }
+
+    fn exec_count(&self) -> u64 {
+        let mut admitted: HashSet<&CallId> = HashSet::new();
+        for r in self.own() {
+            match &r.event {
+                Event::ExecStarted { call_id } => {
+                    admitted.insert(call_id);
+                }
+                Event::ToolResult(t)
+                    if t.class == ToolClass::Exec && !matches!(t.status, ToolStatus::Denied | ToolStatus::Invalid) =>
+                {
+                    admitted.insert(&t.call_id);
+                }
+                _ => {}
+            }
+        }
+        u64::try_from(admitted.len()).unwrap_or(u64::MAX)
+    }
+
     async fn check_budget(&mut self) -> R<Option<Flow>> {
         let max_steps = self.st.budget.max_steps.unwrap_or(0);
         let max_minutes = self.st.budget.max_minutes.unwrap_or(0);
@@ -2605,7 +2751,10 @@ impl Session {
             return Ok(None);
         }
         let step = self.st.step.saturating_sub(self.st.budget_step_base);
-        let minutes = now_ms().saturating_sub(self.st.budget_from_ms.unwrap_or(self.st.started_ms)) / 60_000;
+        let minutes = self.st.clock.as_ref().map_or_else(
+            || now_ms().saturating_sub(self.st.budget_from_ms.unwrap_or(self.st.started_ms)),
+            |c| c.elapsed(now_ms()),
+        ) / 60_000;
         let reached = (max_steps > 0 && step >= max_steps) || (max_minutes > 0 && minutes >= u64::from(max_minutes));
         match self.st.budget_note_step {
             None if reached => {
@@ -2791,7 +2940,9 @@ impl Session {
                 est_tokens: self.estimate(w),
             }),
         )?;
+        self.clock_set(false)?;
         let Some(permit) = self.deps.limiter.acquire(self.deps.priority, token).await else { return Ok(None) };
+        self.clock_set(true)?;
         let mut messages = w.messages.clone();
         messages.push(Message::user(texts::DIGEST_PROMPT));
         let request = ChatRequest {
@@ -2862,6 +3013,13 @@ impl Session {
         let ledger = if shared.journal.is_some() { shared.ledger().ok() } else { None };
         let running_jobs = self.running_jobs().await.len();
         let running_children = self.running_children().await.len();
+        if c.text.trim().is_empty() && !c.reasoning.trim().is_empty() {
+            if let Some(flow) = self.give_up_if_stuck(texts::repeated_reasoning, &c.text)? {
+                return Ok(flow);
+            }
+            self.note(Author::Harness, NoteKind::Nudge, texts::REASONING_ONLY.to_string())?;
+            return Ok(Flow::Next);
+        }
         let verdict = gate::on_yield(&YieldCtx {
             termination: self.st.termination.unwrap_or(Termination::Explicit),
             is_child: shared.is_child(),
@@ -2936,7 +3094,7 @@ impl Session {
                     call_id: call.call_id.clone(),
                     req_id: req_id.to_string(),
                     name: call.name.clone(),
-                    args,
+                    args: args.clone(),
                     class,
                 }),
             )?;
@@ -2949,14 +3107,44 @@ impl Session {
             } else if tool.is_none() && w_tools.iter().any(|t| t.name == call.name) {
                 let message = texts::not_in_assignment(&call.name, &self.deps.shared.role.name, &self.registry.names());
                 refused(&ctx, &call.name, class, message, started)
+            } else if !(CallPolicy { wrapup: self.st.budget_note_step.is_some() }).allows(&call.name, &args) {
+                refused(&ctx, &call.name, class, texts::wrapup_refused(&call.name), started)
+            } else if class == ToolClass::Exec
+                && self.deps.shared.role.max_exec_calls.is_some_and(|cap| self.exec_count() >= u64::from(cap))
+            {
+                refused(
+                    &ctx,
+                    &call.name,
+                    class,
+                    texts::exec_cap(self.deps.shared.role.max_exec_calls.unwrap_or(0)),
+                    started,
+                )
             } else if let Some(run) = early.claim(index, call) {
                 self.claim_early(run, &early, &ctx, call).await
             } else {
+                if class == ToolClass::Exec {
+                    self.append(Author::Harness, Event::ExecStarted { call_id: call.call_id.clone() })?;
+                }
                 let admission = Admission { policy: &self.deps.admit, estimator: &self.estimator };
                 execute(&self.registry, &ctx, &call.name, &call.arguments, &admission).await
             };
             let ok = result.status == ToolStatus::Ok;
+            let flag_note = self.deps.shared.role.flag_regex.as_ref().and_then(|pattern| {
+                let re = regex::RegexBuilder::new(pattern).size_limit(1_000_000).build().ok()?;
+                if !re.is_match(&result.text) {
+                    return None;
+                }
+                result.output.as_ref().map(|blob| texts::flag_candidate(&blob.handle()))
+            });
             self.append(Author::Tool, Event::ToolResult(result))?;
+            if let Some(text) = flag_note {
+                let already = self.own().iter().any(
+                    |r| matches!(&r.event, Event::HarnessNote { note: NoteKind::Info, text: old } if old == &text),
+                );
+                if !already {
+                    self.note(Author::Harness, NoteKind::Info, text)?;
+                }
+            }
             self.flush_emitted()?;
             if let Some(effect) = self.deps.shared.take_effect() {
                 if out.effect.is_none() {
@@ -3245,8 +3433,13 @@ mod tests {
         serde_json::to_value(r).unwrap()["kind"].as_str().unwrap().to_string()
     }
 
+    // Existing contract-order assertions concern rendered/lifecycle events. Bookkeeping transitions
+    // have their own replay/admission tests below and do not change those relative orders.
     fn kinds(rs: &[Record]) -> Vec<String> {
-        rs.iter().map(kind).collect()
+        rs.iter()
+            .filter(|r| !matches!(r.event, Event::BudgetClock { .. } | Event::ExecStarted { .. }))
+            .map(kind)
+            .collect()
     }
 
     fn count(rs: &[Record], k: &str) -> usize {
@@ -3380,8 +3573,8 @@ mod tests {
         );
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Finished]);
         assert_eq!(rs[1].author, Author::User);
-        assert_eq!(rs[5].author, Author::Model);
-        assert_eq!(rs[7].author, Author::Tool);
+        assert_eq!(rs.iter().find(|r| matches!(r.event, Event::ModelResponse(_))).unwrap().author, Author::Model);
+        assert_eq!(rs.iter().find(|r| matches!(r.event, Event::ToolResult(_))).unwrap().author, Author::Tool);
         assert_eq!(inbox(&rs)[0].kind, InboxKind::Finished);
         assert_eq!(fx.shared.ledger().unwrap().goal.as_deref(), Some("do it"));
         // What the sink was shown is what is on disk.
@@ -4145,7 +4338,7 @@ mod tests {
         wait_until(&fx.sink, "turn end", |rs| count(rs, "turn_end") == 1).await;
         assert_eq!(witness.live(), 0, "no early call outlives the turn");
         let rs = fx.sink.records();
-        assert_eq!(&kinds(&rs)[rs.len() - 2..], ["interrupted", "turn_end"]);
+        assert_eq!(&kinds(&rs)[kinds(&rs).len() - 2..], ["interrupted", "turn_end"]);
         assert_eq!(count(&rs, "tool_call") + count(&rs, "tool_result"), 0);
         assert_eq!(counts_of(&counts), (1, 0, 1));
         assert_eq!(finish_task(tx, task).await, End::Closed);
@@ -4334,7 +4527,7 @@ mod tests {
         let res = results(&rs);
         assert_eq!(res[0].status, ToolStatus::Invalid);
         assert!(res[0].text.contains("agent_spawn"));
-        assert_eq!(&kinds(&rs)[rs.len() - 3..], ["tool_result", "turn_end", "session_end"]);
+        assert_eq!(&kinds(&rs)[kinds(&rs).len() - 3..], ["tool_result", "turn_end", "session_end"]);
         assert_eq!(kid.sink.last_status().unwrap().phase, Phase::Ended);
         assert_eq!(kid.sink.last_status().unwrap().outcome, Some(SessionOutcome::Done));
         assert_no_cache_break(&rs);
@@ -4392,7 +4585,14 @@ mod tests {
         // The model is told that the budget was renewed, right at the start of the second turn.
         assert_eq!(notes(&rs, NoteKind::Info), vec![texts::budget_renewed(Some(1), None)]);
         let second = rs.iter().rposition(|r| kind(r) == "turn_start").unwrap();
-        assert!(matches!(&rs[second + 1].event, Event::HarnessNote { note: NoteKind::Info, .. }), "{:?}", kinds(&rs));
+        assert!(
+            matches!(
+                rs.iter().skip(second + 1).find(|r| !matches!(r.event, Event::BudgetClock { .. })).map(|r| &r.event),
+                Some(Event::HarnessNote { note: NoteKind::Info, .. })
+            ),
+            "{:?}",
+            kinds(&rs)
+        );
         assert!(all_text(&fx.server.requests()[3]).contains(&texts::budget_renewed(Some(1), None)));
         // The state block carries no running count; it warns only when the budget is nearly used,
         // measured from the turn that granted it. Fresh (step 0 of 1): no warning; over it (step 2 of 1):
@@ -4669,7 +4869,7 @@ mod tests {
         fx.control.stop_turn();
         wait_until(&fx.sink, "turn end", |rs| count(rs, "turn_end") == 1).await;
         let rs = fx.sink.records();
-        assert_eq!(&kinds(&rs)[rs.len() - 2..], ["interrupted", "turn_end"]);
+        assert_eq!(&kinds(&rs)[kinds(&rs).len() - 2..], ["interrupted", "turn_end"]);
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Stopped]);
         tx.send(user("again")).unwrap();
         wait_until(&fx.sink, "second turn end", |rs| count(rs, "turn_end") == 2).await;
@@ -4717,7 +4917,7 @@ mod tests {
         fx.control.stop_turn();
         wait_until(&fx.sink, "turn end", |rs| count(rs, "turn_end") == 1).await;
         let rs = fx.sink.records();
-        assert_eq!(&kinds(&rs)[rs.len() - 3..], ["tool_result", "interrupted", "turn_end"]);
+        assert_eq!(&kinds(&rs)[kinds(&rs).len() - 3..], ["tool_result", "interrupted", "turn_end"]);
         assert_eq!(results(&rs)[0].status, ToolStatus::Interrupted);
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Stopped]);
         assert!(fx.ctx.jobs.list().await.iter().all(|j| j.state != JobState::Running));
@@ -5324,9 +5524,12 @@ mod tests {
         let reopened = Session::open(fx.deps()).unwrap();
         // A message is still queued when the harness goes down.
         fx.control.stop_for_shutdown();
-        assert_eq!(run_with(reopened, vec![user("one more thing")]).await, End::Closed);
+        // The runtime runs each session in an owning task. Join it before opening the next writer.
+        let (tx, task) = spawn_run(reopened);
+        tx.send(user("one more thing")).unwrap();
+        assert_eq!(finish_task(tx, task).await, End::Closed);
         let rs = fx.sink.records();
-        assert_eq!(&kinds(&rs)[rs.len() - 4..], ["user_message", "turn_start", "interrupted", "turn_end"]);
+        assert_eq!(&kinds(&rs)[kinds(&rs).len() - 4..], ["user_message", "turn_start", "interrupted", "turn_end"]);
         assert!(notes(&rs, NoteKind::Interrupted).is_empty());
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Stopped, TurnEndReason::Stopped]);
         assert!(fx.server.requests().is_empty());
@@ -6124,7 +6327,7 @@ mod tests {
         let got = session.ask_digest(&w, &CancellationToken::new()).await.unwrap();
         assert_eq!(got.as_deref(), Some("leads"));
         let rs = session.records().to_vec();
-        assert_eq!(&kinds(&rs)[rs.len() - 3..], ["model_request", "inbox_opened", "inbox_resolved"]);
+        assert_eq!(&kinds(&rs)[kinds(&rs).len() - 3..], ["model_request", "inbox_opened", "inbox_resolved"]);
         assert!(inbox(&rs)[0].text.contains("the model is loading"), "{}", inbox(&rs)[0].text);
         let answer = &resolutions(&rs)[0].2;
         assert!(answer.starts_with("Answered automatically: the model server answered again at "), "{answer}");
@@ -6312,5 +6515,249 @@ mod tests {
         let at = rs.iter().position(|r| matches!(&r.event, Event::HarnessNote { note: NoteKind::Stall, .. })).unwrap();
         let requests_before = rs[..at].iter().filter(|r| matches!(r.event, Event::ModelRequest(_))).count();
         assert_eq!(requests_before, 3);
+    }
+    #[test]
+    fn runtime_wrapup_policy_closes_new_work_but_preserves_cleanup() {
+        let policy = CallPolicy { wrapup: true };
+        for name in [
+            "bash",
+            "web_fetch",
+            "read",
+            "grep",
+            "write",
+            "plan",
+            "claim",
+            "agent_spawn",
+            "agent_fanout",
+            "verify",
+            "decide",
+            "future_state_tool",
+        ] {
+            assert!(!policy.allows(name, &json!({})), "{name}");
+        }
+        for name in [
+            "out_read",
+            "out_grep",
+            "evidence",
+            "claim_update",
+            "report_blocker",
+            "finish",
+            "verdict",
+            "ledger",
+            "agent_stop",
+            "job_kill",
+        ] {
+            assert!(policy.allows(name, &json!({})), "{name}");
+        }
+        assert!(!policy.allows("step", &json!({"text":"new work"})));
+        assert!(!policy.allows("step", &json!({"id":"p1", "status":"doing"})));
+        assert!(policy.allows("step", &json!({"id":"p1", "status":"dropped"})));
+        assert!(!policy.allows("job_wait", &json!({})));
+        assert!(policy.allows("job_wait", &json!({"timeout_s":2})));
+        assert!(policy.allows("security_record", &json!({"operation":{"action":"coverage_set", "asset":"a1", "disposition":{"status":"deferred", "reason":"budget"}}})));
+        assert!(!policy.allows("security_record", &json!({"operation":{"action":"asset_upsert", "asset":"new"}})));
+        assert!(!policy.allows("security_record", &json!({"operation":{"action":"batch", "operations":[]}})));
+    }
+
+    #[test]
+    fn durable_clock_excludes_waits_renewals_and_restart_downtime() {
+        let mut state = State { started_ms: 1000, ..State::default() };
+        let apply = |s: &mut State, ms, event| {
+            s.absorb(0, &Record { seq: 0, ts_ms: ms, author: Author::Harness, prev: String::new(), event })
+        };
+        apply(&mut state, 1000, Event::BudgetClock { running: true });
+        apply(&mut state, 2000, Event::BudgetClock { running: false });
+        apply(&mut state, 9000, Event::BudgetClock { running: true });
+        assert_eq!(state.clock.as_ref().unwrap().elapsed(10000), 2000);
+        apply(&mut state, 10000, Event::HarnessNote { note: NoteKind::Info, text: "checkpoint".into() });
+        apply(&mut state, 90000, Event::Interrupted { reason: texts::REASON_RESTART.into() });
+        assert_eq!(state.clock.as_ref().unwrap().elapsed(100000), 2000);
+        apply(&mut state, 100000, Event::TurnEnd { reason: TurnEndReason::BudgetExhausted });
+        apply(&mut state, 110000, Event::TurnStart { trigger: Trigger::User });
+        apply(&mut state, 110000, Event::BudgetClock { running: true });
+        assert_eq!(state.clock.as_ref().unwrap().elapsed(111000), 1000);
+        let fork = Forked {
+            session: SessionId::from("s-child"),
+            parent: SessionId::from("s-parent"),
+            upto_seq: 0,
+            role: "worker".into(),
+            termination: Termination::Explicit,
+            budget: Budget::default(),
+            brief: Brief::default(),
+            contract: String::new(),
+            allowed_tools: None,
+            title: String::new(),
+        };
+        apply(&mut state, 120000, Event::Forked(fork));
+        assert_eq!(
+            state.clock.as_ref().unwrap().elapsed(130000),
+            0,
+            "a fresh fork starts paused, without inheriting parent time or charging scheduler delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapup_blocks_speculative_reads_and_keeps_the_wire_schema() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
+        let witness = Witness::default();
+        let mut session = fx.create();
+        session.registry.add(Arc::new(Probe { sink: Some(fx.sink.clone()), witness: witness.clone(), hold: false }));
+        session.st.budget_note_step = Some(0);
+        let token = CancellationToken::new();
+        let mut early = Early::new(
+            true,
+            session.registry.clone(),
+            session.deps.ctx.clone(),
+            &token,
+            HashSet::new(),
+            session.early_counts.clone(),
+        );
+        early.policy = CallPolicy { wrapup: true };
+        early.on_event(&StreamEvent::AttemptStart { attempt: 1 });
+        early.on_event(&StreamEvent::ToolCallReady {
+            index: 0,
+            id: None,
+            name: "read".into(),
+            arguments: json!({"path":"a.txt"}).to_string(),
+        });
+        assert!(early.runs.is_empty());
+        let specs = session.woven().weave.tools;
+        let call = ToolCallRequest {
+            call_id: CallId::from("blocked-read"),
+            name: "read".into(),
+            arguments: json!({"path":"a.txt"}).to_string(),
+            complete: true,
+        };
+        session.run_calls("req", &[call], &specs, early).await.unwrap();
+        assert_eq!(results(session.records()).last().unwrap().status, ToolStatus::Invalid);
+        assert!(results(session.records()).last().unwrap().text.contains("Budget wrap-up active"));
+        assert_eq!(session.woven().weave.tools, specs);
+    }
+
+    #[tokio::test]
+    async fn role_exec_cap_survives_reopen_and_flag_alert_is_advisory() {
+        let mut role = core_role("chat");
+        role.max_exec_calls = Some(1);
+        role.flag_regex = Some(r"FLAG\{[^}]+\}".into());
+        let script = seq(vec![
+            bash("printf 'FLAG{candidate}\\n'").into(),
+            bash("touch should-not-exist").into(),
+            Reply::text("done").into(),
+        ]);
+        let mut fx = Fx::build_with(role, "chat", false, false, AgentsCfg::default(), script).await;
+        run_with(fx.create(), vec![user("go")]).await;
+        assert!(!fx.ctx.workspace.join("should-not-exist").exists());
+        let rs = fx.sink.records();
+        assert_eq!(rs.iter().filter(|r| matches!(r.event, Event::ExecStarted { .. })).count(), 1);
+        assert!(notes(&rs, NoteKind::Info).iter().any(|s| s.contains("unverified candidate")));
+        let session = Session::open(fx.deps()).unwrap();
+        assert_eq!(session.exec_count(), 1);
+        assert_eq!(session.st.clock.as_ref().unwrap().running_from, None);
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_replies_get_a_specific_bounded_nudge() {
+        let script = seq(vec![Reply::text("").with_reasoning("private thought").into(); 3]);
+        let mut fx = Fx::new("worker", true, true, script).await;
+        fx.agents.max_nudges = 1;
+        let end = run_with(fx.create(), vec![]).await;
+        assert!(matches!(end, End::Settled(ref s) if s.outcome == ChildOutcome::Failed));
+        assert!(notes(&fx.sink.records(), NoteKind::Nudge).iter().any(|n| n == texts::REASONING_ONLY));
+        assert_eq!(fx.server.requests().len(), 2);
+        assert!(!notes(&fx.sink.records(), NoteKind::Nudge).join(" ").contains("private thought"));
+    }
+
+    #[tokio::test]
+    async fn a_real_limiter_wait_is_excluded_and_replayed_from_durable_intervals() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("done").into()])).await;
+        let mut session = fx.create();
+        session.deps.limiter = Arc::new(Limiter::new(1));
+        let token = CancellationToken::new();
+        let held = session.deps.limiter.acquire(Priority::Lead, &token).await.unwrap();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "paused queue", |rs| {
+            rs.iter().any(|r| matches!(r.event, Event::BudgetClock { running: false }))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        drop(held);
+        finish_task(tx, task).await;
+        let rs = fx.sink.records();
+        let turn_start = rs.iter().find(|r| matches!(r.event, Event::TurnStart { .. })).unwrap().ts_ms;
+        let turn_end = rs.iter().find(|r| matches!(r.event, Event::TurnEnd { .. })).unwrap().ts_ms;
+        let reopened = Session::open(fx.deps()).unwrap();
+        let active = reopened.st.clock.as_ref().unwrap().elapsed(now_ms());
+        assert!(turn_end.saturating_sub(turn_start).saturating_sub(active) >= 100);
+        assert_eq!(reopened.st.clock.as_ref().unwrap().running_from, None);
+    }
+
+    #[tokio::test]
+    async fn retry_intervals_are_paused_without_recording_reasoning() {
+        let (script, _) = down_then(3, vec![Reply::text("done").into()]);
+        let mut fx = retrying_fx(script, 0, 0).await;
+        run_with(fx.create(), vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let turn_start = rs.iter().find(|r| matches!(r.event, Event::TurnStart { .. })).unwrap().ts_ms;
+        let turn_end = rs.iter().find(|r| matches!(r.event, Event::TurnEnd { .. })).unwrap().ts_ms;
+        let reopened = Session::open(fx.deps()).unwrap();
+        let active = reopened.st.clock.as_ref().unwrap().elapsed(now_ms());
+        assert!(turn_end.saturating_sub(turn_start).saturating_sub(active) >= 1000);
+        assert!(rs.iter().filter(|r| matches!(r.event, Event::BudgetClock { running: false })).count() >= 2);
+    }
+    #[tokio::test]
+    async fn a_free_role_can_recover_from_reasoning_only_with_a_visible_answer() {
+        let mut fx = Fx::new(
+            "chat",
+            false,
+            false,
+            seq(vec![Reply::text("").with_reasoning("hidden").into(), Reply::text("visible answer").into()]),
+        )
+        .await;
+        run_with(fx.create(), vec![user("go")]).await;
+        assert_eq!(fx.server.requests().len(), 2);
+        assert_eq!(notes(&fx.sink.records(), NoteKind::Nudge), [texts::REASONING_ONLY]);
+        assert_eq!(turn_ends(&fx.sink.records()), [TurnEndReason::Yielded]);
+    }
+    #[tokio::test]
+    async fn idle_stop_and_archive_close_terminals_whose_reads_already_returned() {
+        for stop in [true, false] {
+            let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
+            loom_tools::pty::PtyOpen
+                .run(&fx.ctx, json!({"command":"exec sleep 60", "timeout_s":1}).as_object().unwrap())
+                .await;
+            assert_eq!(fx.ctx.capabilities.ptys.ids().len(), 1);
+            let session = fx.create();
+            let (tx, task) = spawn_run(session);
+            if stop {
+                tx.send(Input::Stop).unwrap();
+                for _ in 0..100 {
+                    if fx.ctx.capabilities.ptys.ids().is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(fx.ctx.capabilities.ptys.ids().is_empty());
+            }
+            assert_eq!(finish_task(tx, task).await, End::Closed);
+            assert!(fx.ctx.capabilities.ptys.ids().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_a_model_request_also_closes_idle_terminals() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Action::Stall { ms: 600_000 }])).await;
+        loom_tools::pty::PtyOpen
+            .run(&fx.ctx, json!({"command":"exec sleep 60", "timeout_s":1}).as_object().unwrap())
+            .await;
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "model request", |rs| rs.iter().any(|r| matches!(r.event, Event::ModelRequest(_)))).await;
+        fx.control.stop_turn();
+        tx.send(Input::Stop).unwrap();
+        wait_until(&fx.sink, "stopped", |rs| turn_ends(rs).contains(&TurnEndReason::Stopped)).await;
+        assert!(fx.ctx.capabilities.ptys.ids().is_empty());
+        assert_eq!(finish_task(tx, task).await, End::Closed);
     }
 }
