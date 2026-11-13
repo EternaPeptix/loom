@@ -18,6 +18,12 @@
 - A re-weave now leaves a map, not a chronicle of failures: the resume brief adds the frontier block (when the
   session has a ledger) and says a failed attempt rules out that attempt, not the approach, and the digest
   request asks for Established / Ruled out / Tried, not ruled out / Open leads / Next instead of a list of leads.
+- New tools for a stuck model, neither a finish nor a claim that the work cannot be done. `ask_for`
+  (lead: `core` `lead`, `vr` `researcher`, `ctf` `dispatcher`) asks the operator for budget, a tool, a
+  hint or direction without ending the turn. `hand_off` (`core` `worker`, `vr` `scout`, the `ctf`
+  solvers) returns an assignment unfinished with its state, open leads and an ask; it settles the child
+  as `returned`, and an ask for `stronger_model` selects the role's `escalation_model` next time.
+  `ctf` `binary_solver` now has 26 tools. Installed packs under `~/.loom/packs` are not updated by an upgrade.
 
 ### Watched jobs, agents in their own copies, and attempts
 
@@ -46,15 +52,6 @@
   `conclude`, watched jobs, agents in their own copies and attempts. loom does not load it.
 - Archiving a mission deletes its agents' copies, including changes that were never adopted.
 - `meta.json` of an agent in a copy has `copy_of`; older daemons ignore it.
-
-### Morale: keeping a model on a hard task
-
-- New tools for a stuck model, neither a finish nor a claim that the work cannot be done. `ask_for`
-  (lead: `core` `lead`, `vr` `researcher`, `ctf` `dispatcher`) asks the operator for budget, a tool, a
-  hint or direction without ending the turn. `hand_off` (`core` `worker`, `vr` `scout`, the `ctf`
-  solvers) returns an assignment unfinished with its state, open leads and an ask; it settles the child
-  as `returned`, and an ask for `stronger_model` selects the role's `escalation_model` next time.
-  `ctf` `binary_solver` now has 26 tools. Installed packs under `~/.loom/packs` are not updated by an upgrade.
 
 ### Domain packs and evaluation
 
