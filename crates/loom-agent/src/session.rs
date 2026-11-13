@@ -29,6 +29,9 @@
 //! time after a crash is not guessed. Old logs keep wall time until their first clock transition.
 //! Candidate flags and normalized outcome fingerprints are advisory, never success or refutation.
 //!
+//! Session cancellation, idle stop, settlement, archive and shutdown also close every session PTY,
+//! including terminals whose earlier read already returned. Open terminals are not orphaned jobs.
+//!
 //! ## Own records
 //! A forked session's log starts with a copy of its parent's records. The session's *own* records
 //! are those after its `forked` record (all records when there is none). Step counts, turn state,
@@ -812,6 +815,7 @@ impl CallPolicy {
                             )
                     }
                     Some("hypothesis_evidence" | "hypothesis_verdict" | "fact_retract" | "rule_retract") => has("id"),
+                    Some("revisit_acknowledge") => has("target"),
                     _ => false,
                 }
             }),
@@ -857,6 +861,7 @@ impl State {
                     epoch: self.epoch,
                     termination: Some(f.termination),
                     budget: f.budget.clone(),
+                    clock: self.clock.take().map(|_| ActiveClock::default()),
                     requested: self.requested.take(),
                     measured: self.measured.take(),
                     ..State::default()
@@ -1867,6 +1872,7 @@ impl Session {
                 Ev::Input(None) => {
                     // Between turns no `interrupted` note goes with the jobs a shutdown stops: their ends say why.
                     let why = if self.deps.control.is_shutting() { texts::JOB_SHUTDOWN_DETAIL } else { "" };
+                    self.deps.ctx.capabilities.ptys.close_all().await;
                     self.deps.ctx.jobs.kill_all_because(self.grace(), why).await;
                     // Nothing reads the job events after this task: what the jobs reported (killed just
                     // now, or ended before) is recorded now, or the next `open` would take them for lost.
@@ -1902,6 +1908,7 @@ impl Session {
             Input::Stop => {
                 let jobs = !self.running_jobs().await.is_empty();
                 let children = !self.running_children().await.is_empty();
+                self.deps.ctx.capabilities.ptys.close_all().await;
                 self.deps.ctx.jobs.kill_all(self.grace()).await;
                 self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
                 // Stopped stays stopped: what the stop itself causes (a child's settlement, a job's end)
@@ -1925,6 +1932,7 @@ impl Session {
     /// settle it `Stopped`, so that its parent is not left waiting for it. `reason` says who stopped it.
     async fn stop_idle_child(&mut self, reason: &str) -> R<Settlement> {
         self.append(Author::Harness, Event::Interrupted { reason: reason.to_string() })?;
+        self.deps.ctx.capabilities.ptys.close_all().await;
         self.deps.ctx.jobs.kill_all(self.grace()).await;
         self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
         self.settle(delivery(ChildOutcome::Stopped, texts::stopped_report(self.st.step))).await
@@ -2290,6 +2298,7 @@ impl Session {
         let detail: String = d.report.lines().next().unwrap_or("").chars().take(DETAIL_CHARS).collect();
         self.append(Author::Harness, Event::TurnEnd { reason })?;
         self.append(Author::Harness, Event::SessionEnd { outcome, detail })?;
+        self.deps.ctx.capabilities.ptys.close_all().await;
         self.deps.ctx.jobs.kill_all(self.grace()).await;
         self.phase = Phase::Ended;
         self.publish();
@@ -2318,6 +2327,7 @@ impl Session {
             texts::REASON_OPERATOR
         };
         self.append(Author::Harness, Event::Interrupted { reason: reason.to_string() })?;
+        self.deps.ctx.capabilities.ptys.close_all().await;
         self.deps.ctx.jobs.kill_all(self.grace()).await;
         if shutting {
             // The inputs are closed behind a shutdown, so nothing would read these later: what the
@@ -5514,7 +5524,10 @@ mod tests {
         let reopened = Session::open(fx.deps()).unwrap();
         // A message is still queued when the harness goes down.
         fx.control.stop_for_shutdown();
-        assert_eq!(run_with(reopened, vec![user("one more thing")]).await, End::Closed);
+        // The runtime runs each session in an owning task. Join it before opening the next writer.
+        let (tx, task) = spawn_run(reopened);
+        tx.send(user("one more thing")).unwrap();
+        assert_eq!(finish_task(tx, task).await, End::Closed);
         let rs = fx.sink.records();
         assert_eq!(&kinds(&rs)[kinds(&rs).len() - 4..], ["user_message", "turn_start", "interrupted", "turn_end"]);
         assert!(notes(&rs, NoteKind::Interrupted).is_empty());
@@ -6563,6 +6576,24 @@ mod tests {
         apply(&mut state, 110000, Event::TurnStart { trigger: Trigger::User });
         apply(&mut state, 110000, Event::BudgetClock { running: true });
         assert_eq!(state.clock.as_ref().unwrap().elapsed(111000), 1000);
+        let fork = Forked {
+            session: SessionId::from("s-child"),
+            parent: SessionId::from("s-parent"),
+            upto_seq: 0,
+            role: "worker".into(),
+            termination: Termination::Explicit,
+            budget: Budget::default(),
+            brief: Brief::default(),
+            contract: String::new(),
+            allowed_tools: None,
+            title: String::new(),
+        };
+        apply(&mut state, 120000, Event::Forked(fork));
+        assert_eq!(
+            state.clock.as_ref().unwrap().elapsed(130000),
+            0,
+            "a fresh fork starts paused, without inheriting parent time or charging scheduler delay"
+        );
     }
 
     #[tokio::test]
@@ -6687,5 +6718,46 @@ mod tests {
         assert_eq!(fx.server.requests().len(), 2);
         assert_eq!(notes(&fx.sink.records(), NoteKind::Nudge), [texts::REASONING_ONLY]);
         assert_eq!(turn_ends(&fx.sink.records()), [TurnEndReason::Yielded]);
+    }
+    #[tokio::test]
+    async fn idle_stop_and_archive_close_terminals_whose_reads_already_returned() {
+        for stop in [true, false] {
+            let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
+            loom_tools::pty::PtyOpen
+                .run(&fx.ctx, json!({"command":"exec sleep 60", "timeout_s":1}).as_object().unwrap())
+                .await;
+            assert_eq!(fx.ctx.capabilities.ptys.ids().len(), 1);
+            let session = fx.create();
+            let (tx, task) = spawn_run(session);
+            if stop {
+                tx.send(Input::Stop).unwrap();
+                for _ in 0..100 {
+                    if fx.ctx.capabilities.ptys.ids().is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(fx.ctx.capabilities.ptys.ids().is_empty());
+            }
+            assert_eq!(finish_task(tx, task).await, End::Closed);
+            assert!(fx.ctx.capabilities.ptys.ids().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_a_model_request_also_closes_idle_terminals() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Action::Stall { ms: 600_000 }])).await;
+        loom_tools::pty::PtyOpen
+            .run(&fx.ctx, json!({"command":"exec sleep 60", "timeout_s":1}).as_object().unwrap())
+            .await;
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "model request", |rs| rs.iter().any(|r| matches!(r.event, Event::ModelRequest(_)))).await;
+        fx.control.stop_turn();
+        tx.send(Input::Stop).unwrap();
+        wait_until(&fx.sink, "stopped", |rs| turn_ends(rs).contains(&TurnEndReason::Stopped)).await;
+        assert!(fx.ctx.capabilities.ptys.ids().is_empty());
+        assert_eq!(finish_task(tx, task).await, End::Closed);
     }
 }

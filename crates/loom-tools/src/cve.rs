@@ -18,7 +18,12 @@
 //! the proxy, and for an https:// URL the proxy's verdict asked for before the request and again when
 //! the request fails to connect.
 //!
-//! The daemon must allow these hosts (config `[network]` allowlist) or every call is denied:
+//! Reference-host GETs use the separate trusted-client capability from `ctx.reference_proxy`; URL
+//! credentials and non-GET methods are refused and Authorization/Cookie/Proxy-Authorization/Referer
+//! are removed before transport (HTTPS CONNECT is opaque to the proxy). Redirects remain disabled.
+//! OSV POST queries require an active host grant and are refused when OSV is reference-only.
+//!
+//! The daemon must authorize these hosts (active allowlist/grants, or reference_hosts for GETs):
 //! `services.nvd.nist.gov` (NVD), `api.first.org` (EPSS), `api.osv.dev` (OSV). The tools never
 //! contact any other host. No API key is used (NVD works unauthenticated at a lower rate limit); a
 //! 403/429 from NVD itself is reported as `error` with the fact `NVD rate-limited this request —
@@ -314,15 +319,37 @@ async fn read_limited(resp: reqwest::Response, limit: usize) -> Result<(Vec<u8>,
     Ok((buf, false))
 }
 
+/// Validate and strip a reference request before transport, including opaque HTTPS tunnels.
+fn prepare_reference_request(req: &mut reqwest::Request, url: &Url) -> Result<(), Failure> {
+    if req.method() != reqwest::Method::GET {
+        return Err(Failure::Denied("This reference host is GET-only. The OSV query adapter requires POST; ask the operator for an appropriate active service capability instead.".into()));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Failure::Denied("Reference requests cannot contain URL credentials.".into()));
+    }
+    // This must happen in the trusted client too: an HTTPS CONNECT hides these headers from proxy.
+    for name in ["authorization", "cookie", "proxy-authorization", "referer"] {
+        req.headers_mut().remove(name);
+    }
+    Ok(())
+}
+
 /// Send one request, with the whole exchange (headers and body) bounded by the configured timeout.
 async fn exchange(ctx: &ToolCtx, req: RequestBuilder, url: &Url, what: &str) -> Result<Reply, Failure> {
     let host = url.host_str().unwrap_or("the host").to_string();
     let limit = Duration::from_secs(ctx.cfg.web_fetch_timeout_s.max(1));
     let max = usize::try_from(ctx.cfg.web_fetch_max_bytes).unwrap_or(usize::MAX);
-    let proxied = crate::web::session_proxy(ctx).is_some();
+    let reference = crate::web::reference_client(ctx, url).map_err(Failure::Error)?;
+    let proxied = crate::web::session_proxy(ctx).is_some() || reference.is_some();
     let work = async {
         let (client, req) = req.build_split();
-        let req = req.map_err(|e| request_failure(&e, what, &host, None))?;
+        let mut req = req.map_err(|e| request_failure(&e, what, &host, None))?;
+        let client = if let Some(reference) = reference {
+            prepare_reference_request(&mut req, url)?;
+            reference
+        } else {
+            client
+        };
         // The proxy answers the CONNECT of an https URL out of the client's sight, so it is asked first.
         let tunnelled = proxied && url.scheme() == "https";
         if tunnelled {
@@ -1651,6 +1678,95 @@ mod tests {
             assert_eq!(resp.text().await.unwrap(), "ok");
         }
         assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn reference_request_sanitization_applies_before_opaque_https_transport() {
+        let client = Client::builder().no_proxy().build().unwrap();
+        let url = Url::parse("https://reference.example/data").unwrap();
+        let mut request = client
+            .get(url.clone())
+            .basic_auth("user", Some("secret"))
+            .header("cookie", "session=secret")
+            .header("proxy-authorization", "secret")
+            .header("referer", "https://private.example/secret")
+            .build()
+            .unwrap();
+        assert!(prepare_reference_request(&mut request, &url).is_ok());
+        for name in ["authorization", "cookie", "proxy-authorization", "referer"] {
+            assert!(!request.headers().contains_key(name));
+        }
+        let mut post = client.post(url.clone()).build().unwrap();
+        assert!(matches!(prepare_reference_request(&mut post, &url), Err(Failure::Denied(_))));
+        let credentials = Url::parse("https://user:secret@reference.example/data").unwrap();
+        let mut request = client.get(credentials.clone()).build().unwrap();
+        assert!(matches!(prepare_reference_request(&mut request, &credentials), Err(Failure::Denied(_))));
+    }
+
+    #[tokio::test]
+    async fn reference_cve_gets_work_raw_access_is_denied_and_osv_post_never_reaches_upstream() {
+        use loom_core::config::{NetworkCfg, NetworkMode};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let posts = Arc::new(AtomicUsize::new(0));
+        let post_count = posts.clone();
+        let headers: Arc<std::sync::Mutex<Vec<HeaderMap>>> = Arc::default();
+        let captured = headers.clone();
+        let base = serve(
+            Router::new()
+                .route(
+                    "/rest/json/cves/2.0",
+                    get(move |h: HeaderMap| {
+                        captured.lock().unwrap().push(h);
+                        async { Json(nvd_page(vec![cve_json("CVE-2024-0001", json!({}))])) }
+                    }),
+                )
+                .route("/data/v1/epss", get(|| async { Json(json!({"data": []})) }))
+                .route(
+                    "/v1/query",
+                    post(move || {
+                        post_count.fetch_add(1, Ordering::SeqCst);
+                        async { Json(json!({"vulns": []})) }
+                    }),
+                ),
+        )
+        .await;
+        let url = Url::parse(&base).unwrap();
+        let cfg = NetworkCfg {
+            mode: NetworkMode::DenyAll,
+            reference_hosts: vec![format!("{}:{}", url.host_str().unwrap(), url.port().unwrap())],
+            allow_private: vec!["127.0.0.1".into()],
+            ..NetworkCfg::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let proxy = loom_net::Proxy::start(0, tx).await.unwrap();
+        let mut e = env();
+        let raw = proxy.grant(&e.ctx.session, loom_net::Policy::new(&cfg).unwrap());
+        e.ctx.env = Arc::new(raw.env());
+        seamed(&mut e, &base);
+        let denied = e.call("cve_lookup", json!({"id": "CVE-2024-0001"})).await;
+        assert_eq!(denied.status, ToolStatus::Denied, "{}", denied.text);
+        assert!(headers.lock().unwrap().is_empty());
+        e.ctx.reference_proxy = Some(proxy.grant_reference(&e.ctx.session, &cfg).unwrap());
+        let result = e.call("cve_lookup", json!({"id": "CVE-2024-0001"})).await;
+        assert_eq!(result.status, ToolStatus::Ok, "{}", result.text);
+        assert!(e.stored(&result).contains("CVE-2024-0001"));
+        let url = Url::parse(&format!("{base}/rest/json/cves/2.0")).unwrap();
+        let client = build_client(&e.ctx).unwrap();
+        let request = client
+            .get(url.clone())
+            .header("authorization", "secret")
+            .header("cookie", "session=secret")
+            .header("referer", "https://private.example/secret");
+        assert!(exchange(&e.ctx, request, &url, "NVD").await.is_ok());
+        for observed in headers.lock().unwrap().iter() {
+            for name in ["authorization", "cookie", "proxy-authorization", "referer"] {
+                assert!(!observed.contains_key(name));
+            }
+        }
+        let denied = e.call("advisory_lookup", json!({"name": "example", "ecosystem": "npm"})).await;
+        assert_eq!(denied.status, ToolStatus::Denied, "{}", denied.text);
+        assert!(denied.text.contains("GET-only"), "{}", denied.text);
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

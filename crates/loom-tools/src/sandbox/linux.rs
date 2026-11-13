@@ -608,4 +608,43 @@ mod native_tests {
         assert!(ws.join("source.txt").exists());
         assert!(tmp.join("own").exists());
     }
+
+    #[test]
+    fn bubblewrap_native_replay_cannot_import_actor_workspace_extra_or_sibling_temp() {
+        if !required_launcher() {
+            return;
+        }
+        let (root, mut actor, ws) = fixture(false);
+        let extra = root.path().join("actor-library-cache");
+        let sibling = actor.loom_home.join("sessions/other-agent/tmp");
+        for path in [&extra, &sibling] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let paths = [ws.join("library.py"), extra.join("dependency.so"), sibling.join("payload.py")];
+        for path in &paths {
+            std::fs::write(path, "actor controlled").unwrap();
+        }
+        // A read-only judge retains this origin as metadata, without a write grant to it.
+        actor.replay_untrusted.push(extra.clone());
+        let private = actor.oracle_staging_root().join("test-replay");
+        let workspace = private.join("workspace");
+        let tmp = private.join("tmp");
+        for path in [&workspace, &tmp] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(workspace.join("pinned.py"), "trusted snapshot").unwrap();
+        let replay = actor.isolated_replay(&workspace, &tmp).unwrap();
+        for path in &paths {
+            assert!(replay.check_read(path).is_err());
+            let out = run(&replay, &format!("cat '{}'", path.display()));
+            assert!(!out.status.success(), "replay read actor origin {}", path.display());
+        }
+        let future = actor.loom_home.join("sessions/future-agent/tmp");
+        std::fs::create_dir_all(&future).unwrap();
+        std::fs::write(future.join("payload.py"), "late actor import").unwrap();
+        assert!(!run(&replay, &format!("cat '{}/payload.py'", future.display())).status.success());
+        assert!(run(&replay, "cat pinned.py; echo result > \"$TMPDIR/result\"").status.success());
+        assert!(tmp.join("result").exists());
+        assert!(!run(&replay, "echo changed > pinned.py").status.success());
+    }
 }

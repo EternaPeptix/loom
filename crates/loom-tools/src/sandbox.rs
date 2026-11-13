@@ -97,12 +97,17 @@
 //! refuses what is not readable and the temp dir entry itself wherever they lie. In mode `none` only
 //! the never-writable and not-readable rules apply.
 //!
-//! ## `isolated_replay(workspace, tmp)`
-//! Derives a read-only replay workspace with only a separate harness-owned temp writable, retaining
-//! all read/credential/network restrictions. Both directories must exist outside the caller's write
-//! grants, be disjoint siblings, and share a protected parent under the current session directory. `none` is refused. Linux bind sources are repinned. No earlier writable
-//! root or temp exception is retained. The harness creates private siblings under the protected
-//! session directory; actor-writable staging paths are refused.
+//! ## `oracle_staging_root()` / `isolated_replay(workspace, tmp)`
+//! Staging is `<loom home>/oracle-runs`, outside all session temp trees. The harness creates a private
+//! random child with workspace/tmp siblings. Both must already exist under that protected root and
+//! outside caller write grants. `none` is refused. The replay workspace is read-only and only its
+//! separate temp is writable. Existing read/credential/network restrictions remain; Linux sources
+//! are repinned. All prior workspace/temp/extra writable origins and `<loom home>/sessions` become
+//! unreadable, including future sibling temp paths, so an interpreter cannot load actor-modified
+//! originals instead of pinned copies. Read-only roles retain removed global extra writable paths
+//! as internal metadata for this exclusion; normal verifier reads are unchanged. Any origin that
+//! contains staging is refused, rather than allowing read exceptions inside an untrusted tree.
+//! Linux refuses missing origins outside an already hidden private parent.
 //!
 //! ## `resolve(given)`
 //! A path as the model wrote it → absolute: `~`/`~/x` expand to the home directory, a relative path
@@ -253,9 +258,11 @@ pub struct Sandbox {
     git_dirs: Vec<PathBuf>,
     workspace: PathBuf,
     loom_home: PathBuf,
+    oracle_staging_root: PathBuf,
     tmp_dir: PathBuf,
     home: Option<PathBuf>,
     writable: Vec<PathBuf>,
+    replay_untrusted: Vec<PathBuf>,
     protected: Vec<PathBuf>,
     unreadable: Vec<PathBuf>,
     credentials: Vec<PathBuf>,
@@ -575,6 +582,15 @@ impl Sandbox {
         for p in &cfg.extra_writable {
             push_unique(&mut writable, anchored(p)?);
         }
+        let oracle_staging_root = canon(&loom_home.join("oracle-runs"))?;
+        let mut replay_untrusted = Vec::new();
+        for path in cfg.replay_untrusted_paths.iter().chain(&cfg.extra_writable) {
+            let written = absolute(path)?;
+            push_unique(&mut replay_untrusted, canon(&written)?);
+            if let Some(written) = lexical(&written) {
+                push_unique(&mut replay_untrusted, written);
+            }
+        }
 
         let git_dirs = git_directories(&workspace)?;
         let mut protected = vec![canon(&workspace.join(".loom"))?, loom_home.clone()];
@@ -681,9 +697,11 @@ impl Sandbox {
             git_dirs,
             workspace,
             loom_home,
+            oracle_staging_root,
             tmp_dir,
             home,
             writable,
+            replay_untrusted,
             protected,
             unreadable,
             credentials,
@@ -707,9 +725,15 @@ impl Sandbox {
         &self.tmp_dir
     }
 
+    /// Harness-owned staging lives outside all sessions, whose mutable temp trees are excluded from
+    /// trusted replay reads. Callers create a private random child containing workspace/tmp siblings.
+    pub fn oracle_staging_root(&self) -> &Path {
+        &self.oracle_staging_root
+    }
+
     /// Derive a replay policy over harness-owned staging directories outside the caller's write
-    /// grants. Read/credential/network restrictions are retained; all old writable roots are removed.
-    /// Workspace/temp must share a protected parent under the current session directory. The new
+    /// grants. Read/credential/network restrictions are retained; all old writable roots are unreadable.
+    /// Workspace/temp must share a protected parent under `oracle_staging_root`. The new
     /// workspace is read-only and only the disjoint new temp is writable. `none` is refused.
     pub fn isolated_replay(&self, workspace: &Path, tmp: &Path) -> Result<Sandbox, String> {
         if self.mode == SandboxMode::None {
@@ -727,7 +751,7 @@ impl Sandbox {
         let tmp = canonical(tmp)?;
         let private_parent = workspace.parent().filter(|parent| {
             Some(*parent) == tmp.parent()
-                && self.tmp_dir.parent().is_some_and(|session| parent.starts_with(session))
+                && parent.starts_with(&self.oracle_staging_root)
                 && self.protected.iter().any(|root| under(parent, root))
         });
         if workspace.starts_with(&tmp)
@@ -736,7 +760,28 @@ impl Sandbox {
             || self.check_write(&workspace).is_ok()
             || self.check_write(&tmp).is_ok()
         {
-            return Err("Replay workspace and temp must be separate private directories outside the caller's writable areas. Create them as siblings under the protected session directory.".to_string());
+            return Err("Replay workspace and temp must be separate private directories outside the caller's writable areas. Create them as siblings under the protected oracle staging root.".to_string());
+        }
+        let mut untrusted = Vec::new();
+        let sessions = self.loom_home.join("sessions");
+        for path in self.replay_untrusted.iter().chain(&self.writable).chain(std::iter::once(&sessions)) {
+            push_unique(&mut untrusted, resolve_path(path, true)?);
+            if let Some(written) = lexical(path) {
+                push_unique(&mut untrusted, written);
+            }
+        }
+        if untrusted.iter().any(|root| under(&workspace, root) || under(&tmp, root)) {
+            return Err("An actor-writable origin contains the oracle staging directories. Choose narrower writable roots; trusted replay does not make read exceptions inside untrusted trees.".to_string());
+        }
+        if self.mode == SandboxMode::Bubblewrap {
+            for origin in &untrusted {
+                let hidden = under(origin, &self.loom_home)
+                    || (!self.credentials.is_empty() && self.home.as_ref().is_some_and(|home| under(origin, home)))
+                    || ["/tmp", "/var/tmp", "/run"].iter().any(|root| origin.starts_with(root));
+                if !origin.exists() && !hidden {
+                    return Err(format!("The untrusted replay origin {} is missing and Bubblewrap cannot reserve that future path. Create the actor directory before replay or choose a scope hidden by a private parent.", origin.display()));
+                }
+            }
         }
         let mut replay = self.clone();
         if self.mode == SandboxMode::Bubblewrap {
@@ -746,6 +791,10 @@ impl Sandbox {
         replay.workspace = workspace.clone();
         replay.tmp_dir = tmp.clone();
         replay.writable = vec![workspace.clone(), tmp];
+        for path in &untrusted {
+            push_unique(&mut replay.unreadable, path.clone());
+        }
+        replay.replay_untrusted = untrusted;
         push_unique(&mut replay.protected, workspace.clone());
         let secrets = workspace.join(".loom/oracle-secrets");
         push_unique(&mut replay.unreadable, resolve_path(&secrets, true)?);
@@ -1886,13 +1935,14 @@ mod tests {
     fn isolated_replay_only_writes_private_temp_and_keeps_original_read_network_policy() {
         let f = fx_prod();
         let caller = build(&f, &cfg(SandboxMode::Seatbelt), Some(8080));
-        let private = f.tmp.parent().unwrap().join("oracle-private");
+        let private = caller.oracle_staging_root().join("oracle-private");
         let ws = private.join("workspace");
         let tmp = private.join("tmp");
         for path in [&ws, &tmp] {
             std::fs::create_dir_all(path).unwrap();
         }
         std::fs::write(ws.join("source"), "original").unwrap();
+        std::fs::write(f.ws.join("actor-source"), "mutable original").unwrap();
         assert!(caller.check_write(&ws.join("source")).is_err());
         assert!(caller.check_write(&tmp.join("fake-result")).is_err());
         let replay = caller.isolated_replay(&ws, &tmp).unwrap();
@@ -1900,6 +1950,10 @@ mod tests {
         assert!(replay.check_write(&f.tmp.join("old-temp")).is_err());
         assert!(replay.check_write(&tmp.join("own-result")).is_ok());
         assert!(replay.check_read(&f.home.join("token")).is_err());
+        assert!(replay.check_read(&f.ws.join("actor-source")).is_err());
+        assert!(replay.check_read(&f.tmp.join("mutable-dependency")).is_err());
+        assert!(replay.check_read(&f.home.join("sessions/another-agent/tmp/import.py")).is_err());
+        assert!(replay.check_read(&ws.join("source")).is_ok());
         assert_eq!(caller.loopback_ports, replay.loopback_ports);
         assert_eq!(caller.unix_sockets, replay.unix_sockets);
         assert!(caller.isolated_replay(&f.ws, &f.tmp).is_err());
@@ -1908,9 +1962,40 @@ mod tests {
         if available() {
             assert!(!run(&caller, &f.ws, &format!("echo fake > '{}/fake-result'", tmp.display())).0);
             assert!(!run(&replay, &ws, "chmod 666 source; echo modified > source").0);
+            assert!(!run(&replay, &ws, &format!("cat '{}/actor-source'", f.ws.display())).0);
+            assert!(run(&replay, &ws, "cat source").0);
             assert_eq!(std::fs::read_to_string(ws.join("source")).unwrap(), "original");
             assert!(run(&replay, &ws, "echo genuine > \"$TMPDIR/result\"").0);
         }
+    }
+
+    #[test]
+    fn replay_retains_judges_actor_origins_without_changing_ordinary_reads_and_rejects_broad_origins() {
+        let f = fx_prod();
+        let extra = f.root.join("actor-cache");
+        std::fs::create_dir(&extra).unwrap();
+        std::fs::write(extra.join("dependency.py"), "mutable library").unwrap();
+        let cfg = SandboxCfg {
+            protected_paths: vec![f.ws.display().to_string()],
+            replay_untrusted_paths: vec![extra.display().to_string()],
+            ..cfg(SandboxMode::Seatbelt)
+        };
+        let judge = build(&f, &cfg, None);
+        assert!(judge.check_read(&extra.join("dependency.py")).is_ok());
+        assert!(judge.check_write(&extra.join("dependency.py")).is_err());
+        let private = judge.oracle_staging_root().join("retained-origins");
+        let (ws, tmp) = (private.join("workspace"), private.join("tmp"));
+        for path in [&ws, &tmp] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let replay = judge.isolated_replay(&ws, &tmp).unwrap();
+        assert!(replay.check_read(&extra.join("dependency.py")).is_err());
+        if available() {
+            assert!(!run(&replay, &ws, &format!("cat '{}/dependency.py'", extra.display())).0);
+        }
+        let mut broad = judge.clone();
+        broad.replay_untrusted.push(f.root.clone());
+        assert!(broad.isolated_replay(&ws, &tmp).is_err());
     }
 
     #[test]

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Structured execution and security gates
+
+- Added opt-in session-local PTY, structured HTTP replay/cookie/capture/race, exact codec/TOTP,
+  binary-analysis and operator-oracle tools. PTYs participate in stop/finish/recovery accounting;
+  subprocess outputs and partial failures retain normal output provenance. Backend analysis uses
+  content-pinned inputs and bounded generated views. See `docs/SECURITY-TOOLS.md`.
+- HTTP tools share a daemon-wide per-host limit; reference web/CVE GETs use a distinct in-process
+  credential, validate redirect hops and strip ambient credentials. Reference OSV POST is refused.
+- Security roles can require an independent current-contract oracle receipt, matching live credential
+  prerequisites and hard child step slices. Verdict disqualifiers override accepting model prose.
+  Coverage remains checked atomically; output text/PTY frames are not independent success oracles.
+- Typed coverage/revisit/hypothesis summaries are shown in the HUD without copied secrets. Child IDs
+  accept exact IDs, unambiguous prefixes and `last` within the parent's actual children.
+- Rust 1.88 is now required by the RFC HTTP cookie-store dependency (previously 1.85).
+
 ### Role runtime controls
 
 - Packs can route fresh children through named model profiles, rotate sibling profiles, escalate

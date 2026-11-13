@@ -13,7 +13,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 loom-core = { path = "crates/loom-core" }
@@ -31,7 +31,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
 async-trait = "0.1"
 bytes = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "cookies"] }
 axum = { version = "0.8", features = ["macros"] }
 tower-http = { version = "0.6", features = ["trace"] }
 clap = { version = "4", features = ["derive"] }
@@ -52,6 +52,9 @@ html2text = "0.17"
 httparse = "1"
 url = "2"
 base64 = "0.23"
+sha1 = "0.10"
+goblin = "0.10"
+shlex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

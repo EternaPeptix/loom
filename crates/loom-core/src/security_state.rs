@@ -1177,6 +1177,23 @@ mod tests {
     }
 
     #[test]
+    fn final_acceptance_rechecks_coverage_added_after_the_finish_claim() {
+        let mut l = ledger();
+        let op = LedgerOp::FinishClaim { summary: "fixture result".into(), evidence: vec!["e1".into()] };
+        l.validate(&op, false).unwrap();
+        l.apply(&Entry { n: 1, ts_ms: 0, session: "s-lead".into(), from_user: false, op, mac: String::new() });
+        asset(&mut l, "newly-discovered.test");
+        let verdict = |accepted| LedgerOp::FinishVerdict {
+            claim: "f1".into(),
+            accepted,
+            objections: vec![],
+            verifier: Some("s-judge".into()),
+        };
+        assert!(l.validate(&verdict(true), false).unwrap_err().contains("coverage"));
+        assert!(l.validate(&verdict(false), false).is_ok());
+    }
+
+    #[test]
     fn crash_signatures_keep_root_line_ignore_caller_lines_and_bound_attempts() {
         let signature = CrashSignature {
             sanitizer: "ASAN-heap-overflow".into(),

@@ -59,6 +59,10 @@
 //! `terminate_within(grace, max_bytes)` also ends the grace period as soon as the output file passes
 //! `max_bytes`, so that a command which ignores TERM cannot write through it.
 //!
+//! `ExternalGroup` checkpoints externally spawned PTY groups into the same private pid record
+//! format. Refresh requires a previously confirmed leader/member identity; restart cleanup reuses
+//! `kill_recorded_group`, leaving uncertain or reused groups untouched. PTY output is not a job.
+//!
 //! ## Output
 //! `output_len` is the current size of the output file; `read_output(from)` returns its bytes from
 //! offset `from` to the end (empty when `from` is at or past the end).
@@ -381,6 +385,96 @@ pub fn kill_recorded_group(record: &PidRecord) -> RecordedGroup {
     }
     signal_group(record.pid, libc::SIGKILL);
     RecordedGroup::Killed
+}
+
+/// An externally spawned process group (for example a PTY) using the same identity-checked crash
+/// records as ordinary jobs. The owner retains/reaps its Child; this tracker never assumes a numeric
+/// pid still names that child after it has observed the group disappear.
+#[derive(Debug)]
+pub struct ExternalGroup {
+    path: PathBuf,
+    record: PidRecord,
+    over: bool,
+}
+
+impl ExternalGroup {
+    /// Call while the freshly spawned group leader is still owned and unreaped. The path belongs
+    /// in the session's protected jobs directory, using JobTable::allocate + pid_path.
+    pub fn track(pid: u32, path: PathBuf) -> io::Result<Self> {
+        let start = process_start(pid).ok_or_else(|| {
+            io::Error::other("The PTY leader exited before its identity could be recorded; open another terminal.")
+        })?;
+        if pgid_of(pid) != Some(pid) {
+            return Err(io::Error::other("The PTY process did not establish its own process group."));
+        }
+        let record = PidRecord { pid, start: Some(start), members: group_members(pid), owner: this_process() };
+        write_external_record(&path, &record)?;
+        Ok(Self { path, record, over: false })
+    }
+
+    pub fn record_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Refresh known members only while an existing recorded identity confirms the group. Never
+    /// adopt a group that merely has the old group number. Unknown identity is left for the operator.
+    pub fn refresh(&mut self) -> io::Result<()> {
+        if self.over {
+            return Ok(());
+        }
+        if !group_alive(self.record.pid) {
+            self.over = true;
+            let _ = std::fs::remove_file(&self.path);
+            return Ok(());
+        }
+        let leader = self.record.start.as_deref().is_some_and(|s| is_member(self.record.pid, self.record.pid, s));
+        if !leader && !self.record.members.iter().any(|(pid, start)| is_member(self.record.pid, *pid, start)) {
+            return Err(io::Error::other("The PTY process-group identity is no longer confirmed; its crash record was not widened to unrelated processes."));
+        }
+        let members = group_members(self.record.pid);
+        if members != self.record.members {
+            let mut record = self.record.clone();
+            record.members = members;
+            write_external_record(&self.path, &record)?;
+            self.record = record;
+        }
+        Ok(())
+    }
+
+    /// Stop only an identity-confirmed group. A gone/unconfirmed group is never signalled by pid
+    /// number alone. The caller must still reap its owned Child.
+    pub fn stop(&mut self) -> RecordedGroup {
+        if self.over {
+            return RecordedGroup::Gone;
+        }
+        let _ = self.refresh();
+        if self.over {
+            return RecordedGroup::Gone;
+        }
+        let result = kill_recorded_group(&self.record);
+        if result != RecordedGroup::Unconfirmed {
+            self.over = true;
+            let _ = std::fs::remove_file(&self.path);
+        }
+        result
+    }
+}
+
+impl Drop for ExternalGroup {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Replace a PTY identity checkpoint atomically; a daemon crash cannot leave a truncated replacement
+/// in place of the last sound record. The directory is protected from actor writes.
+fn write_external_record(path: &Path, record: &PidRecord) -> io::Result<()> {
+    let pending = path.with_extension(format!("pid-pending-{:032x}", rand::random::<u128>()));
+    let result = write_pid_record(&pending, record).and_then(|()| std::fs::rename(&pending, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&pending);
+    }
+    result
 }
 
 /// The pid as a signal target; pids 0 and 1 are never targets (0 would mean our own group).
@@ -1283,5 +1377,65 @@ mod tests {
         let pids = read_pids(&f.pidfile(), 2).await;
         r.terminate(Duration::from_secs(2)).await;
         assert_gone(&pids).await;
+    }
+    #[test]
+    fn external_groups_checkpoint_members_and_never_adopt_an_unconfirmed_group() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut child =
+            std::process::Command::new("/bin/bash").args(["-c", "sleep 60 & wait"]).process_group(0).spawn().unwrap();
+        let path = dir.path().join("j1.pid");
+        let mut tracked = ExternalGroup::track(child.id(), path.clone()).unwrap();
+        for _ in 0..100 {
+            tracked.refresh().unwrap();
+            if read_pid_record(&path).is_some_and(|r| r.members.len() >= 2) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let record = read_pid_record(&path).unwrap();
+        assert!(record.members.len() >= 2);
+        let mut stranger = ExternalGroup {
+            path: dir.path().join("j2.pid"),
+            record: PidRecord { start: Some("wrong".into()), members: vec![], ..record.clone() },
+            over: false,
+        };
+        assert!(stranger.refresh().is_err());
+        assert_eq!(stranger.stop(), RecordedGroup::Unconfirmed);
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(tracked.stop(), RecordedGroup::Killed);
+        child.wait().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn external_leaderless_group_record_is_recovered_by_the_job_sweep() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("release");
+        let script = format!("sleep 60 & while [ ! -f '{}' ]; do sleep 0.01; done", release.display());
+        let mut child = std::process::Command::new("/bin/bash").args(["-c", &script]).process_group(0).spawn().unwrap();
+        let path = dir.path().join("j1.pid");
+        let mut tracked = ExternalGroup::track(child.id(), path.clone()).unwrap();
+        for _ in 0..100 {
+            tracked.refresh().unwrap();
+            if read_pid_record(&path).is_some_and(|r| r.members.len() >= 2) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::write(&release, b"go").unwrap();
+        child.wait().unwrap();
+        tracked.refresh().unwrap();
+        let mut record = read_pid_record(&path).unwrap();
+        assert!(record.members.iter().any(|(pid, _)| *pid != record.pid));
+        record.owner = None;
+        write_external_record(&path, &record).unwrap();
+        let recovered = crate::jobs::clear_leftovers(dir.path());
+        assert_eq!(recovered.len(), 1);
+        assert!(recovered[0].killed);
+        assert!(!recovered[0].left_running);
+        assert!(!path.exists());
+        tracked.over = true;
     }
 }

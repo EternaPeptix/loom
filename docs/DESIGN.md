@@ -1294,7 +1294,7 @@ the researcher's finish is verified by `judge`). Domain discipline is a pack, no
 
 ## 14. Engineering rules
 
-- Rust 2021, stable (`rust-version` 1.85). Dependencies come from `[workspace.dependencies]`; add there
+- Rust 2021, stable (`rust-version` 1.88). Dependencies come from `[workspace.dependencies]`; add there
   if you need one.
 - No `unwrap`/`expect`/`panic!` outside tests, except on invariants established in the same function.
 - Errors are typed per crate with `thiserror`; messages that reach the model say what to do next.
@@ -1307,6 +1307,20 @@ the researcher's finish is verified by `judge`). Domain discipline is a pack, no
   named by `LOOM_BUILD_HOST` and runs cargo there (`LOOM_BUILD_HOST=local` runs it in place;
   `LOOM_LANE` gives a run its own source copy and target directory on that host). Set
   `LOOM_BUILD_HOST` before using it: unset, the script falls back to a host name of its author's.
+
+## Security workflow extensions
+
+Typed asset/credential/foothold records, coverage, revisit triggers, hypothesis ownership and bounded
+causal projections live in the sealed mission journal; see `docs/SECURITY_STATE.md`. They are
+observations and investigation hints, not network authorization or automatic vulnerability verdicts.
+The HUD renders bounded derived state without copying credentials or untrusted observation prose.
+
+Roles may opt into structured HTTP/PTY/calculation/binary tools, credential prerequisites and hard
+child step slices. Execution tools retain normal sandboxing, cancellation and output provenance.
+`docs/SECURITY-TOOLS.md` defines framing, cache and backend limits. `docs/SECURITY-ORACLES.md` defines
+operator-pinned independent acceptance receipts and structured verdict disqualifiers. A raw banner,
+regex match, model JSON, static analysis or PTY trailer cannot satisfy an oracle-required finish.
+Unsupported checks fail closed; blocked/budget settlement remains honest about incomplete work.
 
 ## Roadmap (not implemented)
 
@@ -1336,7 +1350,7 @@ relied on.
 - A warning when a configured context window is larger than the one the server reports
   (`Discovered::server_window` is computed and not reported).
 
-### Reference service capabilities
+## Reference service capabilities
 
 `network.reference_hosts` reserves host patterns for trusted in-process GET clients. The raw command
 proxy refuses those names even when `allow`, open mode, or a mission grant would permit them. A

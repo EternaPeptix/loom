@@ -26,7 +26,7 @@ It inverts the cloud assumptions:
 
 ## Requirements
 
-- Rust 1.85 or newer (`rust-version` in `Cargo.toml`) to build.
+- Rust 1.88 or newer (`rust-version` in `Cargo.toml`) to build.
 - macOS for Seatbelt (`/usr/bin/sandbox-exec`), or x86_64/aarch64 Linux with `/usr/bin/bwrap` for
   `mode = "bubblewrap"` (deny-all shell networking; no proxy bridge). Explicit `mode = "none"` leaves
   every shell command unconfined, including verifier roles. Missing sandbox support fails closed.

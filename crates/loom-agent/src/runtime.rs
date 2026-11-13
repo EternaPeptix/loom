@@ -94,7 +94,8 @@
 //!   env, files: new FileTracker, jobs: JobTable::new(<session dir>/jobs, blobs, sender,
 //!   tools.max_output_bytes), cancel: new token}`.
 //!   - `sandbox`: `Sandbox::new(&cfg, workspace, tmp_dir, paths.home, Some(proxy port))` with the
-//!     config's `SandboxCfg`; for a role with `read_only`, `extra_writable` is emptied and the
+//!     config's `SandboxCfg`; for a role with `read_only`, `extra_writable` is retained as internal
+//!     replay-untrusted metadata before its grants are emptied, and the
 //!     workspace is added to `protected_paths`; every model profile's `api_key_env` name is added to
 //!     `secret_env`, so commands never see it.
 //!   - `env`: the session's proxy grant (`proxy.grant(id, policy)`), `env()`. The policy is
@@ -140,6 +141,12 @@
 //!   A fork selecting a different profile is refused. Distinct verifier profile checks compare names,
 //!   not model families. Discovery and limiter selection follow the chosen profile.
 //! - a request with `harness: true` (the finish gate's verifier) is exempt from both of the last two rules.
+//! - the actual child role's `requires_credential` requires explicit matching asset/credential IDs from
+//!   the parent's mission. Missing, unattested, wrong-asset and expired observations refuse dispatch
+//!   before allocation, including harness requests. Canonical IDs are persisted in the brief context.
+//! - role `max_steps` caps the child budget; omitted/zero caller budgets cannot bypass a configured cap.
+//! - join/message/stop resolve exact IDs first, then `last` or an unambiguous prefix of at least four
+//!   characters within this parent's children only. Ambiguity never picks an arbitrary child.
 //! - `SpawnMode::Fork`: the parent's status must have a `fork_point`, and every tool of the child
 //!   role must be among the parent role's tools; otherwise `A `{role}` agent cannot be forked from
 //!   this session: it needs tools this session does not have ({list}). Start it with mode `fresh`
@@ -893,6 +900,11 @@ fn sandbox_cfg_for(
         }
     }
     if role.read_only {
+        for path in &cfg.extra_writable {
+            if !cfg.replay_untrusted_paths.contains(path) {
+                cfg.replay_untrusted_paths.push(path.clone());
+            }
+        }
         cfg.extra_writable.clear();
         cfg.protected_paths.push(workspace.display().to_string());
     }
@@ -1132,6 +1144,20 @@ impl Orchestrator for Orch {
         if !req.harness {
             return inner.spawn_child(parent, req).await;
         }
+        // A recovered harness verifier must meet the current credential gate too; reusing a held
+        // child cannot bypass the actual target role's dispatch prerequisites.
+        let (shared, required) = {
+            let state = inner.st();
+            let p = state
+                .known
+                .get(parent)
+                .filter(|k| k.meta.parent.is_none())
+                .ok_or_else(|| "Only the lead session of a mission can start agents.".to_string())?;
+            let role = inner.packs.role(Some(&p.meta.pack), Some(&req.role))?;
+            let shared = p.active.as_ref().map(|a| a.shared.clone()).ok_or_else(|| SHUTTING.to_string())?;
+            (shared, role.requires_credential)
+        };
+        rtools::validate_dispatch_prerequisite(&shared, required, req.prerequisite.as_ref(), now_ms())?;
         if let Some(verifier) = inner.cut_verifier(parent, &req.role, &req.brief) {
             // The finish waits for it now: one the restart left idle goes on (an ended one has its verdict).
             inner.resume_held(&verifier);
@@ -1148,6 +1174,8 @@ impl Orchestrator for Orch {
         cancel: &CancellationToken,
     ) -> Result<Settlement, String> {
         let inner = self.0.upgrade().ok_or_else(|| SHUTTING.to_string())?;
+        let resolved = inner.resolve_child_id(parent, child)?;
+        let child = &resolved;
         let (mut rx, parent_shared) = {
             let st = inner.st();
             let k = st.known.get(child).filter(|k| k.meta.parent.as_ref() == Some(parent));
@@ -1225,6 +1253,8 @@ impl Orchestrator for Orch {
         if inner.shutting.load(Ordering::SeqCst) {
             return Ok(());
         }
+        let resolved = inner.resolve_child_id(parent, child)?;
+        let child = &resolved;
         inner.check_child(parent, child)?;
         inner.stop_and_wait(std::slice::from_ref(child)).await;
         Ok(())
@@ -1248,6 +1278,8 @@ impl Orchestrator for Orch {
 
     async fn message_child(&self, parent: &SessionId, child: &SessionId, text: &str) -> Result<(), String> {
         let inner = self.up()?;
+        let resolved = inner.resolve_child_id(parent, child)?;
+        let child = &resolved;
         inner.check_child(parent, child)?;
         let activated = {
             let _g = lock(&inner.activation);
@@ -1277,6 +1309,16 @@ impl Orchestrator for Orch {
                 running: !k.finished(),
             })
             .collect()
+    }
+
+    async fn child_role(&self, parent: &SessionId, child: &SessionId) -> Option<String> {
+        let inner = self.0.upgrade()?;
+        let st = inner.st();
+        st.known.get(child).filter(|k| k.meta.parent.as_ref() == Some(parent)).map(|k| k.meta.role.clone())
+    }
+
+    async fn resolve_child(&self, parent: &SessionId, child: &SessionId) -> Result<SessionId, String> {
+        self.up()?.resolve_child_id(parent, child)
     }
 
     async fn poll(
@@ -1467,7 +1509,31 @@ impl Inner {
         }
     }
 
-    /// `child` must be an unsettled child of `parent`; the error is a sentence for the model.
+    /// Resolve only within this parent's actual children, retaining exact-ID precedence.
+    fn resolve_child_id(&self, parent: &SessionId, wanted: &SessionId) -> Result<SessionId, String> {
+        let st = self.st();
+        let own: Vec<_> = st.known.iter().filter(|(_, k)| k.meta.parent.as_ref() == Some(parent)).collect();
+        if own.iter().any(|(id, _)| *id == wanted) {
+            return Ok(wanted.clone());
+        }
+        if wanted.as_str() == "last" {
+            return own
+                .into_iter()
+                .max_by(|(a, ka), (b, kb)| ka.meta.created_ms.cmp(&kb.meta.created_ms).then_with(|| a.cmp(b)))
+                .map(|(id, _)| id.clone())
+                .ok_or_else(|| "This session has no child agents; start one before using last.".into());
+        }
+        if wanted.as_str().len() < 4 {
+            return Err("Use an exact child ID, last, or an unambiguous prefix of at least four characters.".into());
+        }
+        let mut matches = own.into_iter().filter(|(id, _)| id.as_str().starts_with(wanted.as_str()));
+        let first = matches.next().map(|(id, _)| id.clone());
+        if matches.next().is_some() {
+            return Err(format!("Child prefix {} is ambiguous; give more characters or its exact ID.", wanted));
+        }
+        first.ok_or_else(|| format!("{} {NOT_YOURS}", wanted.as_str()))
+    }
+
     fn check_child(&self, parent: &SessionId, child: &SessionId) -> Result<(), String> {
         let st = self.st();
         match st.known.get(child).filter(|k| k.meta.parent.as_ref() == Some(parent)) {
@@ -1733,8 +1799,13 @@ impl Inner {
         loom_core::config::ensure_private_dir(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
         let tmp = std::fs::canonicalize(&tmp).map_err(|e| format!("cannot resolve {}: {e}", tmp.display()))?;
         let cfg = sandbox_cfg_for(&self.config.sandbox, &role, &workspace, &self.config.models);
-        let sandbox = Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, Some(self.proxy.port()))
-            .map_err(|e| format!("The sandbox for this session cannot be set up: {e}"))?;
+        let bubblewrap = cfg.mode == loom_core::config::SandboxMode::Bubblewrap;
+        if bubblewrap && self.config.network.mode != loom_core::config::NetworkMode::DenyAll {
+            return Err("Bubblewrap requires network.mode = deny_all. Explicit mission grants apply only to trusted in-process HTTP tools; subprocess proxy bridges are unsupported.".into());
+        }
+        let sandbox =
+            Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, (!bubblewrap).then_some(self.proxy.port()))
+                .map_err(|e| format!("The sandbox for this session cannot be set up: {e}"))?;
         let policy = self.session_policy(meta, explicit)?;
         let (events_tx, job_events) = unbounded_channel();
         let jobs = Arc::new(JobTable::new(
@@ -1744,6 +1815,12 @@ impl Inner {
             self.config.tools.max_output_bytes,
         ));
         let grant = self.proxy.grant(id, policy);
+        let reference_proxy = if self.config.network.reference_hosts.is_empty() {
+            None
+        } else {
+            Some(self.proxy.grant_reference(id, &self.config.network)?)
+        };
+        let pack = self.packs.get(&meta.pack).ok_or_else(|| format!("Pack {} is no longer loaded.", meta.pack))?;
         let ctx = ToolCtx {
             session: id.clone(),
             call_id: CallId::from(""),
@@ -1753,9 +1830,14 @@ impl Inner {
             cfg: Arc::new(self.config.tools.clone()),
             sandbox: Arc::new(sandbox),
             env: Arc::new(grant.env()),
+            reference_proxy,
             files: Arc::new(loom_tools::files::FileTracker::new()),
             jobs: jobs.clone(),
             cancel: CancellationToken::new(),
+            capabilities: Arc::new(loom_tools::capabilities::SessionTools::new(
+                pack.command_guard,
+                pack.target_concurrency,
+            )),
         };
         // The mission journal is shared by the lead and all its children.
         let journal = explicit.then(|| Journal::new(self.paths.journal(&meta.mission), self.key.clone()));
@@ -2071,8 +2153,43 @@ impl Inner {
 
     // ---- children ---------------------------------------------------------------------------
 
-    async fn spawn_child(self: &Arc<Self>, parent: &SessionId, req: SpawnReq) -> Result<SessionId, String> {
+    async fn spawn_child(self: &Arc<Self>, parent: &SessionId, mut req: SpawnReq) -> Result<SessionId, String> {
         self.check_open()?;
+        let (shared, requires_credential, max_steps) = {
+            let st = self.st();
+            let p = st
+                .known
+                .get(parent)
+                .filter(|k| k.active.is_some() && k.meta.parent.is_none())
+                .ok_or_else(|| "Only the lead session of a mission can start agents.".to_string())?;
+            let prole = self.packs.role(Some(&p.meta.pack), Some(&p.meta.role))?;
+            let role = self
+                .packs
+                .role(Some(&p.meta.pack), Some(&req.role))
+                .ok()
+                .filter(|_| req.harness || prole.may_spawn.contains(&req.role))
+                .ok_or_else(|| {
+                    format!(
+                        "`{}` is not a role this session can start. Roles it can start: {}.",
+                        req.role,
+                        prole.may_spawn.join(", ")
+                    )
+                })?;
+            let shared = p.active.as_ref().map(|a| a.shared.clone()).ok_or_else(|| SHUTTING.to_string())?;
+            (shared, role.requires_credential, role.max_steps)
+        };
+        if let Some(cap) = max_steps {
+            req.budget.max_steps = Some(req.budget.max_steps.filter(|n| *n > 0).map(|n| n.min(cap)).unwrap_or(cap));
+        }
+        req.prerequisite =
+            rtools::validate_dispatch_prerequisite(&shared, requires_credential, req.prerequisite.as_ref(), now_ms())?;
+        if let Some(p) = &req.prerequisite {
+            let header=format!("Dispatch prerequisite checked by Loom: asset {}; credential {}. This observation does not grant network scope or guarantee the credential remains valid.",p.asset,p.credential);
+            req.brief.context = Some(match req.brief.context.take() {
+                Some(context) => format!("{header}\n\n{context}"),
+                None => header,
+            });
+        }
         // Reserve rotation before discovery: parallel fanout siblings get different slots. Restarts
         // derive the initial cursor from persisted child metadata rather than a process-global counter.
         let (profile_name, inherited_model, inherited_window) = {
@@ -2157,6 +2274,15 @@ impl Inner {
                     ));
                 }
             };
+            // Model discovery may have waited. Recheck current mission state and expiry immediately
+            // before allocating the child, including trusted harness dispatches.
+            let shared = p.active.as_ref().map(|a| a.shared.clone()).ok_or_else(|| SHUTTING.to_string())?;
+            rtools::validate_dispatch_prerequisite(
+                &shared,
+                crole.requires_credential,
+                req.prerequisite.as_ref(),
+                now_ms(),
+            )?;
             let running = st
                 .known
                 .values()
@@ -5061,6 +5187,7 @@ mod tests {
             title: role.into(),
             awaited: false,
             harness: false,
+            prerequisite: None,
         };
         let worker = e.rt.inner.orch.spawn(&id, req("worker")).await.unwrap();
         let verifier = e.rt.inner.orch.spawn(&id, req("verifier")).await.unwrap();
@@ -5131,6 +5258,7 @@ mod tests {
             title: "t".into(),
             awaited: false,
             harness: false,
+            prerequisite: None,
         };
         let err = orch.spawn(&id, req("nobody")).await.unwrap_err();
         assert!(err.contains("is not a role this session can start"), "{err}");
@@ -5139,6 +5267,128 @@ mod tests {
         assert!(err.contains("most allowed"), "{err}");
         let err = orch.spawn(&child, req("worker")).await.unwrap_err();
         assert!(err.contains("Only the lead"), "{err}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn actual_role_credential_gate_and_epoch_cap_apply_before_child_allocation() {
+        use loom_core::event::NoteKind;
+        use loom_core::ledger::{EvidenceInput, EvidenceKind, LedgerOp};
+        use loom_core::security_state::{AssetInput, AssetKind, CredentialInput, SecurityOp};
+        let e = env_with_packs(
+            Script::new(|_, _| Action::Stall { ms: 600_000 }),
+            |_| {},
+            |packs| {
+                let path = packs.join("core/pack.toml");
+                let text = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(
+                    path,
+                    text.replace("[roles.worker]", "[roles.worker]\nrequires_credential = true\nmax_steps = 3"),
+                )
+                .unwrap();
+            },
+        )
+        .await;
+        let parent = e.rt.create_session(e.new_session(Some("fixture goal"))).await.unwrap().meta.id;
+        until("parent active", || !e.server.requests().is_empty()).await;
+        let request = |prerequisite| SpawnReq {
+            role: "worker".into(),
+            mode: SpawnMode::Fresh,
+            brief: Default::default(),
+            budget: Budget { max_steps: Some(0), max_minutes: None },
+            call_id: "fixture-call".into(),
+            title: "gated fixture".into(),
+            awaited: true,
+            harness: false,
+            prerequisite,
+        };
+        assert!(e.rt.inner.orch.spawn(&parent, request(None)).await.unwrap_err().contains("requires explicit"));
+        assert!(e.children(&parent).is_empty());
+        let shared = e.rt.inner.st().known.get(&parent).unwrap().active.as_ref().unwrap().shared.clone();
+        shared.ledger_append(false, LedgerOp::ClaimAdd { text: "credential observed".into() }).unwrap();
+        shared
+            .ledger_append(
+                false,
+                LedgerOp::EvidenceAdd(EvidenceInput {
+                    claim: "c1".into(),
+                    kind: EvidenceKind::Execution,
+                    supports: true,
+                    session: parent.clone(),
+                    call_id: "fixture-observation".into(),
+                    blob: None,
+                    lines: None,
+                    quote: None,
+                    note: "dummy credential fixture".into(),
+                    attested: true,
+                }),
+            )
+            .unwrap();
+        let mut assets = Vec::new();
+        for locator in ["first.test", "second.test"] {
+            let asset = AssetInput {
+                kind: AssetKind::Host,
+                locator: locator.into(),
+                evidence: vec!["e1".into()],
+                mandatory: false,
+                parent: None,
+            };
+            assets.push(asset.id().unwrap());
+            shared.ledger_append(false, LedgerOp::Security(SecurityOp::AssetUpsert { asset })).unwrap();
+        }
+        let mut credential = CredentialInput {
+            asset: assets[0].clone(),
+            principal: "dummy".into(),
+            secret_handle: "out:0123456789abcdef".into(),
+            evidence: vec!["e1".into()],
+            unlocks: vec![],
+            expires_ms: Some(0),
+        };
+        let (_, state) = shared
+            .ledger_append(false, LedgerOp::Security(SecurityOp::CredentialAdd { credential: credential.clone() }))
+            .unwrap();
+        let id = state.security.credentials.keys().next().unwrap().clone();
+        let good = rtools::DispatchPrerequisite { asset: assets[0].clone(), credential: id.clone() };
+        let wrong = rtools::DispatchPrerequisite { asset: assets[1].clone(), credential: id };
+        assert!(e.rt.inner.orch.spawn(&parent, request(Some(wrong))).await.unwrap_err().contains("another asset"));
+        assert!(e.rt.inner.orch.spawn(&parent, request(Some(good.clone()))).await.unwrap_err().contains("expired"));
+        assert!(e.children(&parent).is_empty());
+        credential.expires_ms = None;
+        shared.ledger_append(false, LedgerOp::Security(SecurityOp::CredentialAdd { credential })).unwrap();
+        let child = e.rt.inner.orch.spawn(&parent, request(Some(good.clone()))).await.unwrap();
+        let records = e.records(&child);
+        assert!(records
+            .iter()
+            .any(|r| matches!(&r.event,Event::SessionStart(start) if start.budget.max_steps==Some(3))));
+        assert!(records.iter().any(|r| matches!(&r.event,Event::HarnessNote{note:NoteKind::Assignment,text}
+            if text.contains(&good.asset)&&text.contains(&good.credential))));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn child_reference_aliases_are_exact_first_ambiguous_safe_and_parent_scoped() {
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let first = e.rt.create_session(e.new_session(None)).await.unwrap().meta;
+        let second = e.rt.create_session(e.new_session(None)).await.unwrap().meta;
+        {
+            let mut state = e.rt.inner.st();
+            for (id, parent, created) in
+                [("s-agentA", &first, 10), ("s-agentB", &first, 20), ("s-age", &first, 30), ("s-foreign", &second, 99)]
+            {
+                let mut meta = parent.clone();
+                meta.id = id.into();
+                meta.parent = Some(parent.id.clone());
+                meta.created_ms = created;
+                state.known.insert(meta.id.clone(), Known::new(meta, idle_status()));
+            }
+        }
+        let resolve = |parent: &SessionId, name: &str| e.rt.inner.resolve_child_id(parent, &name.into());
+        assert_eq!(resolve(&first.id, "s-age").unwrap(), SessionId::from("s-age"));
+        assert_eq!(resolve(&first.id, "s-agentA").unwrap(), SessionId::from("s-agentA"));
+        assert!(resolve(&first.id, "s-agent").unwrap_err().contains("ambiguous"));
+        assert_eq!(resolve(&first.id, "last").unwrap(), SessionId::from("s-age"));
+        assert_eq!(resolve(&second.id, "s-fore").unwrap(), SessionId::from("s-foreign"));
+        assert!(resolve(&first.id, "s-fore").is_err());
+        assert!(resolve(&second.id, "s-agent").is_err());
         e.rt.shutdown().await;
     }
 
@@ -5157,6 +5407,7 @@ mod tests {
             title: "t".into(),
             awaited: false,
             harness,
+            prerequisite: None,
         };
         orch.spawn(&id, req("verifier", true)).await.unwrap();
         orch.spawn(&id, req("worker", false)).await.expect("a gate verifier is not counted against max_children");
@@ -5181,6 +5432,7 @@ mod tests {
             title: "t".into(),
             awaited: false,
             harness,
+            prerequisite: None,
         };
         orch.spawn(&id, req("worker", false)).await.unwrap();
         let err = orch.spawn(&id, req("verifier", false)).await.unwrap_err();
@@ -5415,6 +5667,7 @@ mod tests {
             title: "again".into(),
             awaited: false,
             harness: false,
+            prerequisite: None,
         };
         orch.spawn(&id, again).await.expect("a stopped agent does not count toward max_children");
         let settled = |c: &ChildSettled| c.child == child && c.outcome == ChildOutcome::Stopped && !c.inline;
@@ -5494,6 +5747,7 @@ mod tests {
             title: "PANICTITLE".into(),
             awaited: true,
             harness: false,
+            prerequisite: None,
         };
         let child = orch.spawn(&id, req).await.unwrap();
         let settlement = tokio::time::timeout(WAIT, orch.join(&id, &child, &CancellationToken::new()))
@@ -6902,6 +7156,7 @@ mod tests {
             title: "a".into(),
             awaited: true,
             harness: false,
+            prerequisite: None,
         };
         let a = e.rt.inner.orch.spawn(&id, req).await.unwrap();
         let kept = e.rt.inner.paths.session_dir(&a).join("settlement.json");
@@ -7107,6 +7362,7 @@ mod tests {
             title: "t".into(),
             awaited: true,
             harness: false,
+            prerequisite: None,
         };
         let child = e.rt.inner.orch.spawn(&id, req).await.unwrap();
         let kept = e.rt.inner.paths.session_dir(&child).join("settlement.json");
@@ -7168,6 +7424,7 @@ mod tests {
         let none = BTreeMap::new();
         let cfg = sandbox_cfg_for(&base, ro, Path::new("/ws"), &none);
         assert!(cfg.extra_writable.is_empty());
+        assert_eq!(cfg.replay_untrusted_paths, ["/somewhere"]);
         assert!(cfg.protected_paths.contains(&"/ws".to_string()));
         let rw = packs.role(None, Some("worker")).unwrap();
         assert_eq!(sandbox_cfg_for(&base, rw, Path::new("/ws"), &none), base);
@@ -7730,6 +7987,7 @@ mod tests {
             title: "route".into(),
             awaited: true,
             harness: false,
+            prerequisite: None,
         };
         let first = e.rt.inner.orch.spawn(&parent, req.clone()).await.unwrap();
         let second = e.rt.inner.orch.spawn(&parent, req.clone()).await.unwrap();
@@ -7770,6 +8028,7 @@ mod tests {
             title: "verify".into(),
             awaited: true,
             harness: true,
+            prerequisite: None,
         };
         assert!(e.rt.inner.orch.spawn(&parent, req).await.unwrap_err().contains("distinct named profile"));
         assert!(e.server.requests().is_empty());
@@ -7807,6 +8066,7 @@ mod tests {
             title: "escalate".into(),
             awaited: true,
             harness: false,
+            prerequisite: None,
         };
         let first = e.rt.inner.orch.spawn(&parent, req.clone()).await.unwrap();
         let result = e.rt.inner.orch.join(&parent, &first, &CancellationToken::new()).await.unwrap();

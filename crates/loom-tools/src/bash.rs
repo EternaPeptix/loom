@@ -3,6 +3,9 @@
 //! CONTRACT.
 //!
 //! ## `bash`
+//! Pack-enabled command guards reject known interactive/unbounded patterns before a spawn. They
+//! are hygiene checks rather than shell containment; arbitrary scripts remain subject to sandbox,
+//! output, cancellation and time limits. Optional idle_timeout_s terminates a silent foreground call.
 //! 1. `cwd`: `ctx.sandbox.resolve`, must be an existing directory (else an error sentence); default
 //!    `ctx.workspace`.
 //! 2. `ctx.jobs.allocate()`, then `proc::spawn` with the script exactly as given, environment
@@ -167,6 +170,7 @@ impl Tool for Bash {
                 params::opt("timeout_s", "integer", "Stop the command if it has not finished after this many seconds. Leave it out to let the command run as long as it needs.").min(1),
                 params::opt("background", "boolean", "Start the command as a background job and return immediately (default false). Use for servers and long runs; read its output with job_wait."),
                 params::opt("cwd", "string", "Directory to run in (default: the workspace)."),
+                params::opt("idle_timeout_s", "integer", "Stop a foreground command after this many seconds without output. Silent computation can also trigger it; omitted means no idle watchdog.").min(1).max(300),
             ],
         )
     }
@@ -355,6 +359,11 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         );
     };
     let timeout_s = args.get("timeout_s").and_then(Value::as_u64);
+    if ctx.capabilities.command_guard {
+        if let Err(e) = crate::capabilities::guard_script(command) {
+            return ToolOutput::denied(e);
+        }
+    }
     let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
     let cwd = match args.get("cwd").and_then(Value::as_str) {
         Some(given) => ctx.sandbox.resolve(given),
@@ -397,7 +406,44 @@ async fn run_bash(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
     let limit = ctx.cfg.max_output_bytes;
     let allowed = Duration::from_secs(timeout_s.unwrap_or(ctx.cfg.bash_foreground_s));
     let grace = Duration::from_secs(ctx.cfg.kill_grace_s);
-    let mut end = running.wait(&ctx.cancel, Some(allowed), limit).await;
+    let mut idle_stopped = false;
+    let mut end = if let Some(idle) = args.get("idle_timeout_s").and_then(Value::as_u64) {
+        let mut last = Instant::now();
+        let mut size = running.output_len();
+        loop {
+            let left = allowed.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break WaitEnd::Deadline;
+            }
+            let end = running.wait(&ctx.cancel, Some(left.min(Duration::from_millis(100))), limit).await;
+            if end != WaitEnd::Deadline {
+                break end;
+            }
+            let now_size = running.output_len();
+            if now_size != size {
+                size = now_size;
+                last = Instant::now();
+            }
+            if last.elapsed() >= Duration::from_secs(idle.clamp(1, 300)) {
+                idle_stopped = true;
+                break WaitEnd::Deadline;
+            }
+        }
+    } else {
+        running.wait(&ctx.cancel, Some(allowed), limit).await
+    };
+    if idle_stopped {
+        let ended = running.terminate_within(grace, limit).await;
+        let (output, note) = match read_all(&running, limit) {
+            Ok(v) => v,
+            Err(e) => {
+                remove_records(&running);
+                return ToolOutput::error(format!("Idle watchdog stopped the process group. {e}"));
+            }
+        };
+        remove_files(&running);
+        return finish(Finish { ctx, status: ToolStatus::Timeout, outcome: "stopped: no output during idle timeout".into(), ended: &ended, output, elapsed: started.elapsed(), facts: note.into_iter().chain(["Silent computation can trigger this watchdog. Use batch flags for interactive tools, pty_open for interactive input, or omit idle_timeout_s for silent work.".into()]).collect(), job: None });
+    }
     if end == WaitEnd::Deadline {
         // It may have ended in the instant between the deadline and now.
         if let Some(e) = running.poll() {

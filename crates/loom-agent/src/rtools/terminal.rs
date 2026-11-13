@@ -2,6 +2,15 @@
 //!
 //! CONTRACT.
 //!
+//! Security acceptance: mandatory asset coverage must be tested or explicitly deferred before either
+//! conclusion or finish, except after an operator release. For `require_oracle` roles, a met-goal
+//! conclusion and finish must cite attested execution evidence whose actual mission producer is
+//! `oracle_check` in an independent child of the configured verifier role. Its stored root JSON must
+//! say passed=true and name the current operator contract digest. A printed banner, self-verification,
+//! another role/mission, or an older contract never qualifies. Negative conclusions do not run/load an
+//! oracle. Optional verdict disqualifiers synthesize objections and force rejection; existing output-
+//! opening and running-work checks still apply. Omitted disqualifiers preserve the old payload shape.
+//!
 //! These tools decide nothing by themselves about the loop: they record, then leave an
 //! [`Effect`](super::Effect) in `Shared` for the step loop. A tool that returns an error leaves no
 //! effect. Nothing here panics. `S` below is `self.0` (the `Shared`).
@@ -187,6 +196,83 @@ pub struct AskUser(pub Arc<Shared>);
 pub struct ReportBlocker(pub Arc<Shared>);
 pub struct Wait(pub Arc<Shared>);
 pub struct Conclude(pub Arc<Shared>);
+
+/// A successful security conclusion cites an actual oracle output from this lead's independently
+/// spawned, named verifier role. Printed JSON and another mission's receipts cannot satisfy it.
+async fn check_mechanical_oracle(
+    shared: &Shared,
+    ctx: &ToolCtx,
+    state: &LedgerState,
+    evidence: &[String],
+) -> Result<(), String> {
+    if !shared.role.require_oracle || state.release.is_some() {
+        return Ok(());
+    }
+    if ctx.sandbox.mode() == loom_core::config::SandboxMode::None {
+        return Err("Mechanical security acceptance requires an enforced OS sandbox. An older passing receipt cannot authorize acceptance in unsandboxed mode.".into());
+    }
+    let mission = shared.mission.as_ref().ok_or_else(|| super::NO_MISSION.to_string())?;
+    let verifier=shared.role.verifier.as_deref().ok_or_else(||
+        "This role requires a mechanical oracle but has no named verifier. Correct the pack before accepting a security result.".to_string())?;
+    let digest = loom_tools::oracle::contract_digest(ctx)?;
+    for id in evidence {
+        let Some(e) = state
+            .evidence
+            .iter()
+            .find(|e| &e.id == id && e.input.attested && e.input.supports && e.input.kind == EvidenceKind::Execution)
+        else {
+            continue;
+        };
+        let Some(blob) = e.input.blob.as_ref() else {
+            continue;
+        };
+        let Some(producer) = shared.orch.producer(mission, blob).await else {
+            continue;
+        };
+        if producer.tool != "oracle_check"
+            || producer.class != ToolClass::Exec
+            || producer.session == shared.session
+            || producer.session != e.input.session
+            || producer.call_id != e.input.call_id
+            || shared.orch.child_role(&shared.session, &producer.session).await.as_deref() != Some(verifier)
+        {
+            continue;
+        }
+        let Ok(meta) = ctx.blobs.meta(blob) else {
+            continue;
+        };
+        if meta.bytes > 8 * 1024 * 1024 {
+            continue;
+        }
+        let Ok(bytes) = ctx.blobs.read_all(blob) else {
+            continue;
+        };
+        if bytes.len() > 8 * 1024 * 1024 {
+            continue;
+        }
+        let Ok(receipt) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if receipt.get("passed").and_then(Value::as_bool) == Some(true)
+            && receipt.get("contract_sha256").and_then(Value::as_str) == Some(digest.as_str())
+        {
+            // Producer lookups may have waited. A contract changed during this check must not be
+            // accepted based only on the digest read before those awaits.
+            if loom_tools::oracle::contract_digest(ctx)? == digest {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!("The goal is not mechanically established. Have an independent `{verifier}` child run oracle_check against the current operator contract, attach its passing output as attested mission evidence, and cite that evidence ID. A banner, model-authored JSON, self-verification, another role's receipt, or a receipt for an older contract does not count."))
+}
+
+fn check_security_coverage(state: &LedgerState) -> Result<(), String> {
+    let pending = state.security.mandatory_open();
+    if state.release.is_none() && !pending.is_empty() {
+        return Err(format!("Mandatory security coverage is still untested for {}. Record tested evidence or a reasoned deferral with security_record coverage_set before concluding or finishing.",pending.join(", ")));
+    }
+    Ok(())
+}
 
 /// How many more times a finish verifier is started when one could not be run (so at most
 /// `1 + VERIFIER_RETRIES` attempts).
@@ -525,6 +611,9 @@ impl Finish {
             return ToolOutput::error(text);
         }
         let released = state.release.is_some();
+        if let Err(e) = check_security_coverage(&state) {
+            return ToolOutput::error(e);
+        }
         state = match self.settle_objections(state, released) {
             Ok(st) => st,
             Err(e) => return ToolOutput::error(e),
@@ -533,6 +622,15 @@ impl Finish {
             return ToolOutput::error(text);
         }
         let evidence = strings_of(args.get("evidence"));
+        if state.goal_met.as_ref().is_some_and(|g| g.status == GoalMetStatus::Supported) {
+            let mut cited = evidence.clone();
+            if let Some(goal) = &state.goal_met {
+                cited.extend(goal.evidence.iter().cloned());
+            }
+            if let Err(e) = check_mechanical_oracle(s, ctx, &state, &cited).await {
+                return ToolOutput::error(e);
+            }
+        }
         let claim = LedgerOp::FinishClaim { summary: answer.to_string(), evidence: evidence.clone() };
         let after = match s.ledger_append(false, claim) {
             Ok((_, after)) => after,
@@ -572,6 +670,7 @@ impl Finish {
                 title: format!("verify finish {fid}"),
                 awaited: true,
                 harness: true,
+                prerequisite: None,
             };
             // A verifier that cannot be run is a fault of the harness: it is retried with a fresh one, and when
             // it still cannot be run the finish is held, never escalated and never delivered as verified.
@@ -629,6 +728,23 @@ impl Finish {
                 return self.hold_unverified(&fault, fault_report);
             };
             if accepted {
+                let current = match s.ledger() {
+                    Ok(st) => st,
+                    Err(e) => return ToolOutput::error(e),
+                };
+                if let Err(e) = check_security_coverage(&current) {
+                    return ToolOutput::error(e);
+                }
+                if current.goal_met.as_ref().is_some_and(|g| g.status == GoalMetStatus::Supported) {
+                    let mut cited = evidence.clone();
+                    if let Some(goal) = &current.goal_met {
+                        cited.extend(goal.evidence.iter().cloned());
+                    }
+                    cited.extend(strings_of(settled.payload.get("evidence")));
+                    if let Err(e) = check_mechanical_oracle(s, ctx, &current, &cited).await {
+                        return ToolOutput::error(e);
+                    }
+                }
                 let op = LedgerOp::FinishVerdict {
                     claim: fid.clone(),
                     accepted: true,
@@ -972,7 +1088,7 @@ impl Tool for Conclude {
             ],
         )
     }
-    async fn run(&self, _ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+    async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let s = &self.0;
         if s.is_child() {
             return ToolOutput::error(
@@ -988,6 +1104,18 @@ impl Tool for Conclude {
                 )
             }
         };
+        let state = match s.ledger() {
+            Ok(st) => st,
+            Err(e) => return ToolOutput::error(e),
+        };
+        if let Err(e) = check_security_coverage(&state) {
+            return ToolOutput::error(e);
+        }
+        if status == GoalMetStatus::Supported {
+            if let Err(e) = check_mechanical_oracle(s, ctx, &state, &strings_of(args.get("evidence"))).await {
+                return ToolOutput::error(e);
+            }
+        }
         if status == GoalMetStatus::Refuted {
             let state = match s.ledger() {
                 Ok(st) => st,
@@ -1043,6 +1171,12 @@ impl Tool for Verdict {
                 req("accepted", "boolean", "true only if the claim survived your attempts to refute it."),
                 opt("objections", "array", "What is wrong or unproven. Required when accepted is false.").items("string"),
                 req("opened", "array", "Handles (out:…) of the outputs you examined.").items("string"),
+                opt("harm_is_mechanism_only", "boolean", "True when only a mechanism was observed and the claimed harm was not established."),
+                opt("target_was_modified", "boolean", "True when the solver modified the target used to establish success."),
+                opt("static_only", "boolean", "True when the claimed execution outcome has only static evidence."),
+                opt("out_of_scope_hop", "boolean", "True when the result depends on an unauthorized scope transition."),
+                opt("duplicate_signature", "string", "Existing crash signature ID when this result duplicates a known crash."),
+                opt("evidence", "array", "Optional attested ledger evidence IDs for the parent, including mechanical oracle observations.").items("string"),
             ],
         )
     }
@@ -1051,12 +1185,41 @@ impl Tool for Verdict {
         if !s.is_child() {
             return ToolOutput::error("`verdict` belongs to a verifier working on an assignment.");
         }
-        let accepted = args.get("accepted").and_then(Value::as_bool).unwrap_or(false);
-        let objections: Vec<String> = strings_of(args.get("objections"))
+        let mut accepted = args.get("accepted").and_then(Value::as_bool).unwrap_or(false);
+        let mut objections: Vec<String> = strings_of(args.get("objections"))
             .into_iter()
             .map(|o| o.trim().to_string())
             .filter(|o| !o.is_empty())
             .collect();
+        let mut disqualifiers = Map::new();
+        for (field, objection) in [
+            (
+                "harm_is_mechanism_only",
+                "The observed mechanism does not establish the claimed harm; demonstrate the boundary result.",
+            ),
+            ("target_was_modified", "The success check used a modified target; replay against a clean pinned target."),
+            (
+                "static_only",
+                "Static evidence does not establish the claimed execution result; run the bounded verification.",
+            ),
+            ("out_of_scope_hop", "The result depends on an out-of-scope transition; use an authorized route."),
+        ] {
+            let value = args.get(field).and_then(Value::as_bool).unwrap_or(false);
+            if args.contains_key(field) {
+                disqualifiers.insert(field.into(), json!(value));
+            }
+            if value {
+                accepted = false;
+                objections.push(objection.into());
+            }
+        }
+        if let Some(signature) = str_arg(args, "duplicate_signature").map(str::trim).filter(|s| !s.is_empty()) {
+            accepted = false;
+            objections.push(format!(
+                "This result duplicates crash signature {signature}; establish a distinct requested result."
+            ));
+            disqualifiers.insert("duplicate_signature".into(), json!(signature));
+        }
         if !accepted && objections.is_empty() {
             return ToolOutput::error(
                 "accepted: false needs at least one objection: one specific, checkable statement of what is wrong or unproven.",
@@ -1066,6 +1229,16 @@ impl Tool for Verdict {
             return ToolOutput::error(
                 "accepted: true cannot come with objections — either they are objections, or it is accepted",
             );
+        }
+        let evidence = strings_of(args.get("evidence"));
+        if !evidence.is_empty() {
+            let state = match s.ledger() {
+                Ok(st) => st,
+                Err(e) => return ToolOutput::error(e),
+            };
+            if evidence.iter().any(|id| !state.evidence.iter().any(|e| &e.id == id && e.input.attested)) {
+                return ToolOutput::error("Every verdict evidence ID must name an attested record in this mission; record the observation first.");
+            }
         }
         let opened = strings_of(args.get("opened"));
         if opened.is_empty() {
@@ -1109,12 +1282,17 @@ impl Tool for Verdict {
             }
         }
         report.push_str(&format!("\nExamined: {}", opened.join(", ")));
-        s.set_effect(Effect::Settle(Delivery {
-            outcome: ChildOutcome::Returned,
-            report,
-            full: None,
-            payload: json!({ "accepted": accepted, "objections": objections, "opened": opened }),
-        }));
+        if !evidence.is_empty() {
+            report.push_str(&format!("\nEvidence: {}", evidence.join(", ")));
+        }
+        let mut payload = json!({"accepted":accepted,"objections":objections,"opened":opened});
+        if !disqualifiers.is_empty() {
+            payload["disqualifiers"] = Value::Object(disqualifiers);
+        }
+        if !evidence.is_empty() {
+            payload["evidence"] = json!(evidence);
+        }
+        s.set_effect(Effect::Settle(Delivery { outcome: ChildOutcome::Returned, report, full: None, payload }));
         ToolOutput::ok(
             "verdict delivered",
             Body::Message("Your verdict was delivered. This session is finished.".into()),
@@ -1353,6 +1531,252 @@ mod tests {
 
     fn rejected_payload() -> Value {
         json!({"accepted": false, "objections": ["no test ran", "line 4 is wrong"], "opened": ["out:aa"]})
+    }
+
+    fn oracle_rig() -> Rig {
+        oracle_rig_with_verification(false)
+    }
+
+    fn oracle_rig_with_verification(verify_finish: bool) -> Rig {
+        let mut role = core_role("lead");
+        role.require_oracle = true;
+        let agents = loom_core::config::AgentsCfg { verify_finish, ..Default::default() };
+        let mut r = rig_with(role, false, true, agents);
+        let cfg = loom_core::config::SandboxCfg {
+            mode: loom_core::config::SandboxMode::Seatbelt,
+            protect_credentials: false,
+            ..Default::default()
+        };
+        r.env.ctx.sandbox = Arc::new(
+            loom_tools::sandbox::Sandbox::new(
+                &cfg,
+                &r.env.ctx.workspace,
+                &r.env.ctx.tmp_dir,
+                &r.env.dir.path().join("home"),
+                None,
+            )
+            .unwrap(),
+        );
+        r
+    }
+
+    fn observed_evidence(r: &Rig, body: &str, tool: &str, session: &str, role: Option<&str>) -> String {
+        r.user_op(LedgerOp::GoalSet { text: "fixture goal".into() });
+        r.model_op(LedgerOp::ClaimAdd { text: "fixture observation".into() });
+        let blob = r.env.ctx.blobs.put_bytes(body.as_bytes()).unwrap();
+        r.orch.produced(&blob, session, "oracle-call", tool, ToolClass::Exec);
+        if let Some(role) = role {
+            r.orch.running_child(session, role);
+            r.orch.children.lock().unwrap().iter_mut().for_each(|c| c.running = false);
+        }
+        r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
+            claim: "c1".into(),
+            kind: EvidenceKind::Execution,
+            supports: true,
+            session: session.into(),
+            call_id: "oracle-call".into(),
+            blob: Some(blob.id),
+            lines: None,
+            quote: None,
+            note: "bounded fixture observation".into(),
+            attested: true,
+        }));
+        r.model_op(LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: "observed".into() });
+        "e1".into()
+    }
+
+    fn oracle_contract(r: &Rig) -> String {
+        std::fs::create_dir_all(r.env.ctx.workspace.join(".loom")).unwrap();
+        std::fs::write(
+            r.env.ctx.workspace.join(".loom/security-oracle.json"),
+            json!({"kind":"flag_exact","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+                .to_string(),
+        )
+        .unwrap();
+        loom_tools::oracle::contract_digest(&r.env.ctx).unwrap()
+    }
+
+    #[tokio::test]
+    async fn verdict_disqualifiers_force_rejection_even_when_the_model_accepts() {
+        for field in
+            ["harm_is_mechanism_only", "target_was_modified", "static_only", "out_of_scope_hop", "duplicate_signature"]
+        {
+            let (r, produced, _) = verifier_with_log();
+            let mut args = json!({"accepted":true,"opened":[produced]});
+            args[field] = if field == "duplicate_signature" { json!("cs-known") } else { json!(true) };
+            let result = r.call("verdict", args).await;
+            assert_eq!(result.status, Status::Ok, "{field}: {}", result.text);
+            let Some(Effect::Settle(delivery)) = effect(&r) else { panic!("verdict settlement expected") };
+            assert_eq!(delivery.payload["accepted"], false);
+            assert!(!delivery.payload["objections"].as_array().unwrap().is_empty());
+        }
+        let (r, _, _) = verifier_with_log();
+        let missing = r.call("verdict", json!({"accepted":true,"target_was_modified":true,"opened":[]})).await;
+        assert_eq!(missing.status, Status::Error);
+        assert!(missing.text.contains("examined nothing"));
+    }
+
+    #[tokio::test]
+    async fn oracle_gate_rejects_printed_self_wrong_role_stale_and_failed_receipts() {
+        for (tool, session, role, passed, current, json_body) in [
+            ("bash", "s-judge", Some("verifier"), true, true, true),
+            ("oracle_check", "s-test", Some("verifier"), true, true, true),
+            ("oracle_check", "s-worker", Some("worker"), true, true, true),
+            ("oracle_check", "s-outsider", None, true, true, true),
+            ("oracle_check", "s-judge", Some("verifier"), false, true, true),
+            ("oracle_check", "s-judge", Some("verifier"), true, false, true),
+            ("oracle_check", "s-judge", Some("verifier"), true, true, false),
+            ("oracle_check", "s-judge", Some("verifier"), true, true, true),
+        ] {
+            let r = oracle_rig();
+            let digest = oracle_contract(&r);
+            let receipt = json!({"passed":passed,"contract_sha256":if current{digest.as_str()}else{"older-contract"}})
+                .to_string();
+            let body = if json_body { receipt } else { format!("success banner\n{receipt}") };
+            let e = observed_evidence(&r, &body, tool, session, role);
+            let result = check_mechanical_oracle(&r.shared, &r.env.ctx, &r.shared.ledger().unwrap(), &[e]).await;
+            let expected = tool == "oracle_check"
+                && session != "s-test"
+                && role == Some("verifier")
+                && passed
+                && current
+                && json_body;
+            assert_eq!(result.is_ok(), expected, "{tool} {session} {role:?}: {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn conclusion_and_finish_both_require_the_current_oracle_for_a_met_goal() {
+        let r = oracle_rig();
+        let digest = oracle_contract(&r);
+        let e = observed_evidence(
+            &r,
+            &json!({"passed":true,"contract_sha256":digest}).to_string(),
+            "oracle_check",
+            "s-judge",
+            Some("verifier"),
+        );
+        let concluded =
+            r.call("conclude", json!({"status":"met","note":"operator criterion passed","evidence":[e]})).await;
+        assert_eq!(concluded.status, Status::Ok, "{}", concluded.text);
+        std::fs::write(
+            r.env.ctx.workspace.join(".loom/security-oracle.json"),
+            json!({"kind":"flag_exact","sha256":"new"}).to_string(),
+        )
+        .unwrap();
+        let finished = r.call("finish", json!({"answer":"fixture result","evidence":[e]})).await;
+        assert_eq!(finished.status, Status::Error);
+        assert!(finished.text.contains("contract changed"));
+        assert!(r.shared.ledger().unwrap().finishes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_older_passing_receipt_does_not_accept_an_unsandboxed_session() {
+        let mut r = oracle_rig();
+        let digest = oracle_contract(&r);
+        let e = observed_evidence(
+            &r,
+            &json!({"passed":true,"contract_sha256":digest}).to_string(),
+            "oracle_check",
+            "s-judge",
+            Some("verifier"),
+        );
+        let cfg = loom_core::config::SandboxCfg { mode: loom_core::config::SandboxMode::None, ..Default::default() };
+        r.env.ctx.sandbox = Arc::new(
+            loom_tools::sandbox::Sandbox::new(
+                &cfg,
+                &r.env.ctx.workspace,
+                &r.env.ctx.tmp_dir,
+                &r.env.dir.path().join("home"),
+                None,
+            )
+            .unwrap(),
+        );
+        let error =
+            check_mechanical_oracle(&r.shared, &r.env.ctx, &r.shared.ledger().unwrap(), &[e]).await.unwrap_err();
+        assert!(error.contains("unsandboxed"));
+    }
+
+    #[tokio::test]
+    async fn contract_changes_during_verification_cannot_be_delivered_as_accepted() {
+        let r = oracle_rig_with_verification(true);
+        let digest = oracle_contract(&r);
+        let e = observed_evidence(
+            &r,
+            &json!({"passed":true,"contract_sha256":digest}).to_string(),
+            "oracle_check",
+            "s-judge",
+            Some("verifier"),
+        );
+        r.model_op(LedgerOp::GoalMetSet {
+            status: GoalMetStatus::Supported,
+            note: "operator criterion passed".into(),
+            evidence: vec![e.clone()],
+        });
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "accepted", accepted_payload());
+        r.orch.join_delay_ms.store(500, std::sync::atomic::Ordering::Relaxed);
+        let finish = r.call("finish", json!({"answer":"fixture result","evidence":[e]}));
+        let change = async {
+            for _ in 0..500 {
+                if r.orch.calls().iter().any(|c| c.starts_with("join ")) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            assert!(r.orch.calls().iter().any(|c| c.starts_with("join ")));
+            std::fs::write(
+                r.env.ctx.workspace.join(".loom/security-oracle.json"),
+                json!({"kind":"flag_exact","sha256":"changed-during-verification"}).to_string(),
+            )
+            .unwrap();
+        };
+        let (result, ()) = tokio::join!(finish, change);
+        assert_eq!(result.status, Status::Error);
+        assert!(result.text.contains("contract changed"));
+        assert!(effect(&r).is_none());
+        assert!(inbox_items(&r).is_empty());
+        assert_eq!(r.shared.ledger().unwrap().finishes.last().unwrap().accepted, None);
+    }
+
+    #[tokio::test]
+    async fn negative_conclusion_checks_coverage_without_running_an_oracle_and_release_bypasses_coverage() {
+        let r = oracle_rig();
+        let e = observed_evidence(&r, "no route remains", "bash", "s-test", None);
+        let asset = loom_core::security_state::AssetInput {
+            kind: loom_core::security_state::AssetKind::Host,
+            locator: "fixture.test".into(),
+            evidence: vec![e.clone()],
+            mandatory: true,
+            parent: None,
+        };
+        let id = asset.id().unwrap();
+        r.model_op(LedgerOp::Security(loom_core::security_state::SecurityOp::AssetUpsert { asset }));
+        let refused = r.call("conclude", json!({"status":"unreachable","note":"routes closed","evidence":[e]})).await;
+        assert_eq!(refused.status, Status::Error);
+        assert!(refused.text.contains("coverage"));
+        r.model_op(LedgerOp::Security(loom_core::security_state::SecurityOp::CoverageSet {
+            asset: id,
+            disposition: loom_core::security_state::CoverageDisposition::Deferred {
+                reason: "operator-owned fixture unavailable".into(),
+            },
+        }));
+        let accepted = r.call("conclude", json!({"status":"unreachable","note":"routes closed","evidence":[e]})).await;
+        assert_eq!(accepted.status, Status::Ok, "{}", accepted.text);
+        assert!(!r.env.ctx.workspace.join(".loom/security-oracle.json").exists());
+
+        let released = oracle_rig();
+        let e = observed_evidence(&released, "partial observation", "bash", "s-test", None);
+        let asset = loom_core::security_state::AssetInput {
+            kind: loom_core::security_state::AssetKind::Host,
+            locator: "pending.test".into(),
+            evidence: vec![e],
+            mandatory: true,
+            parent: None,
+        };
+        released.model_op(LedgerOp::Security(loom_core::security_state::SecurityOp::AssetUpsert { asset }));
+        released.user_op(LedgerOp::OperatorRelease { reason: "accept the partial result".into() });
+        let finished = released.call("finish", json!({"answer":"partial fixture result"})).await;
+        assert_eq!(finished.status, Status::Ok, "{}", finished.text);
     }
 
     // ---- finish ----
@@ -2260,7 +2684,11 @@ mod tests {
 
     /// A verifier session whose log shows it produced one output and read a view of another.
     fn verifier_with_log() -> (Rig, String, String) {
-        let r = rig("verifier", true, false);
+        verifier_with_log_in(false)
+    }
+
+    fn verifier_with_log_in(mission: bool) -> (Rig, String, String) {
+        let r = rig("verifier", true, mission);
         let produced = r.env.ctx.blobs.put_bytes(b"produced\n").unwrap();
         let viewed = r.env.ctx.blobs.put_bytes(b"viewed\n").unwrap();
         let view_text = r.env.ctx.blobs.put_bytes(b"a view\n").unwrap();
@@ -2338,6 +2766,20 @@ mod tests {
         let Some(Effect::Settle(d)) = effect(&r) else { panic!("settle expected") };
         assert_eq!(d.report, format!("Verdict: accepted\nExamined: {produced}"));
         assert_eq!(d.payload["accepted"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn verdict_forwards_only_existing_attested_evidence_ids() {
+        let (r, produced, _) = verifier_with_log_in(true);
+        let e = observed_evidence(&r, "fixture oracle observation", "bash", "s-test", None);
+        let bad = r.call("verdict", json!({"accepted":true,"opened":[produced],"evidence":["e404"]})).await;
+        assert_eq!(bad.status, Status::Error);
+        assert!(bad.text.contains("attested"));
+        let good = r.call("verdict", json!({"accepted":true,"opened":[produced],"evidence":[e]})).await;
+        assert_eq!(good.status, Status::Ok, "{}", good.text);
+        let Some(Effect::Settle(d)) = effect(&r) else { panic!("settlement expected") };
+        assert_eq!(d.payload["evidence"], json!([e]));
+        assert!(d.report.contains("Evidence: e1"));
     }
 
     #[tokio::test]

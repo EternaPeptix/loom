@@ -929,16 +929,19 @@ impl LedgerState {
                     return Err(self.open_items_refusal(&open));
                 }
                 let uncovered = self.security.mandatory_open();
-                if !uncovered.is_empty() {
+                if self.release.is_none() && !uncovered.is_empty() {
                     return Err(format!("Cannot finish yet: mandatory security coverage is untested for {}. Use security_record coverage_set to cite attested test evidence or defer each asset with a reason, then finish again.", uncovered.join(", ")));
                 }
             }
-            LedgerOp::FinishVerdict { claim, .. } => {
+            LedgerOp::FinishVerdict { claim, accepted, .. } => {
                 let Some(f) = self.finishes.iter().find(|f| &f.id == claim) else {
                     return Err(no_such("finish claim", claim, ids(self.finishes.iter().map(|f| f.id.as_str()))));
                 };
                 if let Some(acc) = f.accepted {
                     return Err(format!("Finish claim {claim} already has a verdict ({}). Verdicts are final; a new finish claim gets its own verdict.", if acc { "accepted" } else { "rejected" }));
+                }
+                if *accepted && self.release.is_none() && !self.security.mandatory_open().is_empty() {
+                    return Err("Cannot accept the finish: mandatory security coverage became untested during verification. Record test evidence or a reasoned deferral before finishing again.".into());
                 }
             }
             LedgerOp::GoalMetSet { status, note, evidence } => self.validate_goal_met(*status, note, evidence)?,
@@ -984,6 +987,9 @@ impl LedgerState {
 
     /// The rules for writing the goal-met claim (see CONTRACT).
     fn validate_goal_met(&self, status: GoalMetStatus, note: &str, evidence: &[String]) -> Result<(), String> {
+        if self.release.is_none() && !self.security.mandatory_open().is_empty() {
+            return Err("Mandatory security coverage remains untested. Record test evidence or defer every mandatory asset with a reason before concluding the goal.".into());
+        }
         let Some(current) = &self.goal_met else {
             return Err(
                 "There is no goal yet, so there is nothing to conclude. The operator sets the goal; wait for it."

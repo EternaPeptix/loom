@@ -21,6 +21,8 @@
 //! may_spawn = ["worker"]        # optional; each must name a role of this pack
 //! verify_finish = true          # optional, default false
 //! require_oracle = false        # optional, default false; operator-pinned mechanical finish gate
+//! requires_credential = false   # optional explicit asset/credential dispatch gate
+//! max_steps = 35                # optional hard child epoch slice; zero is rejected
 //! verifier = "verifier"         # optional; the role that attacks this role's finish (see below)
 //! read_only = false             # optional, default false
 //! model = "fast"                 # optional named config profile; absent = inherit
@@ -31,7 +33,7 @@
 //! flag_regex = "FLAG\\{[^}]+\\}" # optional candidate alert; never verifies success
 //! ```
 //! `verifier` defaults to the pack's role named `verifier` when it has one. A role with
-//! `verify_finish = true` (or an explicit `verifier`) whose verifier is not a role of the same pack that is
+//! `verify_finish = true`, `require_oracle = true`, or an explicit `verifier` whose verifier is not a role of the same pack that is
 //! `read_only` and has the `verdict` tool and `out_read` or `out_grep` is a load error. (A verdict must
 //! name evidence the verifier opened, and those two tools are how it opens another session's output.)
 //! Unknown keys are errors. File paths must stay inside the pack directory (no absolute paths, no
@@ -87,6 +89,10 @@ pub struct RoleDef {
     /// An accepted `finish` by this role is first attacked by an independent verifier.
     pub verify_finish: bool,
     pub require_oracle: bool,
+    /// Dispatch requires explicit evidence-linked asset and credential IDs from this mission.
+    pub requires_credential: bool,
+    /// Hard child epoch slice; zero is rejected at pack load.
+    pub max_steps: Option<u32>,
     /// The role of this pack that attacks this role's finish and answers its `verify` tool; resolved at
     /// load (`verifier` key, else the pack's role named `verifier`). Always `Some` when `verify_finish`.
     pub verifier: Option<String>,
@@ -170,6 +176,9 @@ struct RawRole {
     verify_finish: bool,
     #[serde(default)]
     require_oracle: bool,
+    #[serde(default)]
+    requires_credential: bool,
+    max_steps: Option<u32>,
     verifier: Option<String>,
     #[serde(default)]
     read_only: bool,
@@ -185,6 +194,10 @@ struct RawRole {
 
 fn valid_name(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn valid_role_name(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 /// A path that stays inside the pack directory by construction.
@@ -241,12 +254,13 @@ fn resolve_verifier(
             v.read_only && has("verdict") && (has("out_read") || has("out_grep"))
         })
     };
-    if !(r.verify_finish || r.verifier.is_some()) {
+    if !(r.verify_finish || r.require_oracle || r.verifier.is_some()) {
         return Ok(wanted.filter(|n| usable(n)));
     }
     let Some(name) = wanted else {
+        let gate = if r.require_oracle && !r.verify_finish { "require_oracle" } else { "verify_finish" };
         return Err(format!(
-            "{at}: `verify_finish` = true needs a verifier role. Add a role named \"verifier\" to this pack, or set `verifier = \"<role>\"`; it must be {VERIFIER_NEEDS} (roles: {role_list})"
+            "{at}: `{gate}` = true needs a verifier role. Add a role named \"verifier\" to this pack, or set `verifier = \"<role>\"`; it must be {VERIFIER_NEEDS} (roles: {role_list})"
         ));
     };
     if !roles.contains_key(&name) {
@@ -301,8 +315,8 @@ fn parse_pack(
     };
     let mut roles = BTreeMap::new();
     for (rname, r) in &raw.roles {
-        if !valid_name(rname) {
-            return Err(format!("pack {label}: role name \"{rname}\" is not valid; use only a-z, 0-9 and `-`"));
+        if !valid_role_name(rname) {
+            return Err(format!("pack {label}: role name \"{rname}\" is not valid; use only a-z, 0-9, `-` and `_`"));
         }
         let at = format!("pack {label}: roles.{rname}");
         let prompt_rel = r.prompt.as_deref().ok_or_else(|| format!("{at} is missing the required key `prompt`"))?;
@@ -353,6 +367,9 @@ fn parse_pack(
                 .build()
                 .map_err(|e| format!("{at}: `flag_regex` is invalid: {e}"))?;
         }
+        if r.max_steps == Some(0) {
+            return Err(format!("{at}: max_steps must be at least one; omit it to inherit the dispatch budget"));
+        }
         let verifier = resolve_verifier(&at, rname == "verifier", r, &raw.roles, &role_list)?;
         roles.insert(
             rname.clone(),
@@ -366,6 +383,8 @@ fn parse_pack(
                 may_spawn: r.may_spawn.clone(),
                 verify_finish: r.verify_finish,
                 require_oracle: r.require_oracle,
+                requires_credential: r.requires_credential,
+                max_steps: r.max_steps,
                 verifier,
                 read_only: r.read_only,
                 model: r.model.clone(),
@@ -595,6 +614,7 @@ mod tests {
         assert_eq!(a.prompt, "Role A.");
         assert_eq!(a.termination, Termination::Explicit);
         assert!(!a.verify_finish && !a.read_only);
+        assert!(!a.requires_credential && a.max_steps.is_none());
         assert_eq!(a.description, "");
         assert_eq!(a.may_spawn, vec!["b".to_string()]);
         assert_eq!(p.get("mine").unwrap().preamble, p.get("core").unwrap().preamble);
@@ -856,4 +876,19 @@ mod tests {
         let bad = GOOD.replace("[roles.a]", "[roles.a]\nflag_regex = '['");
         assert!(Packs::load(mk(&bad).path()).unwrap_err().contains("flag_regex"));
     }
+
+    #[test]
+    fn credential_dispatch_and_hard_epoch_slices_are_optional_and_validated() {
+        let text = GOOD.replace("[roles.a]", "[roles.a]\nrequires_credential = true\nmax_steps = 35");
+        let d = mk(&text);
+        let packs = Packs::load(d.path()).unwrap();
+        let role = packs.role(Some("mine"), Some("a")).unwrap();
+        assert!(role.requires_credential);
+        assert_eq!(role.max_steps, Some(35));
+        let bad = GOOD.replace("[roles.a]", "[roles.a]\nmax_steps = 0");
+        assert!(Packs::load(mk(&bad).path()).unwrap_err().contains("max_steps"));
+        let missing_oracle_verifier = GOOD.replace("[roles.a]", "[roles.a]\nrequire_oracle = true");
+        assert!(Packs::load(mk(&missing_oracle_verifier).path()).unwrap_err().contains("require_oracle"));
+    }
+
 }

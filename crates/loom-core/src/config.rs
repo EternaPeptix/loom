@@ -184,6 +184,10 @@ pub struct SandboxCfg {
     /// names). Filled in by the runtime; not a configuration key. `env_pass` still overrides it.
     #[serde(skip)]
     pub secret_env: Vec<String>,
+    /// Potential actor write origins retained when read-only roles lose `extra_writable` grants.
+    /// Used only to exclude untrusted imports/inputs during isolated replay; not a config key.
+    #[serde(skip)]
+    pub replay_untrusted_paths: Vec<String>,
 }
 
 impl Default for SandboxCfg {
@@ -199,6 +203,7 @@ impl Default for SandboxCfg {
             unix_sockets: Vec::new(),
             env_pass: Vec::new(),
             secret_env: Vec::new(),
+            replay_untrusted_paths: Vec::new(),
         }
     }
 }
@@ -472,6 +477,9 @@ mod tests {
         assert_eq!(c.network.reference_hosts, ["docs.example.test:443"]);
         assert!(Config::parse("").unwrap().network.reference_hosts.is_empty());
         assert_eq!(Config::parse("[sandbox]\nmode = 'none'\n").unwrap().sandbox.mode, SandboxMode::None);
+        assert!(Config::parse("[sandbox]\nreplay_untrusted_paths = ['/actor']\n").is_err());
+        let cfg = SandboxCfg { replay_untrusted_paths: vec!["/actor".into()], ..SandboxCfg::default() };
+        assert!(serde_json::to_value(cfg).unwrap().get("replay_untrusted_paths").is_none());
     }
 
     #[test]
