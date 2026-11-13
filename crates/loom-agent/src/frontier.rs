@@ -24,7 +24,8 @@
 //! - `render(f)` gives the block shown in the HUD (see `hud`), or `None` when `f.is_empty()`. Lines, only
 //!   the non-empty ones, in this order:
 //!   `Where the work stands:`, `- Established: …`, `- Ruled out with evidence: …`,
-//!   `- Set aside without evidence: …`, `- Open leads: …`, `- Surfaces: …`, `- Attempts run in this
+//!   `- Set aside without evidence: …`, `- Open leads: …`, `- Surfaces: …`, `- Reflections recorded: {n}`
+//!   (only when n > 0; `Frontier::reflections` is the ledger's reflection count), `- Attempts run in this
 //!   session: …`. Id lists show at most 8 ids then `, …`. Every line is cut to `hud::MAX_LINE`.
 //! - `directions(f, max)` gives up to `max` one-line open routes, in the priority: untested surfaces,
 //!   open plan steps, open claims, routes to revisit, open hypotheses, set-aside approaches; then
@@ -70,6 +71,8 @@ pub struct Frontier {
     /// Admitted execution attempts of the session the caller describes (see `attempts_run`); 0 when
     /// the caller has no records.
     pub attempts_run: u64,
+    /// Reflections recorded in the ledger (`reflect`).
+    pub reflections: usize,
 }
 
 fn item(id: &str, text: &str) -> FrontierItem {
@@ -124,6 +127,7 @@ pub fn frontier(ledger: &LedgerState, now_ms: u64) -> Frontier {
     f.untested = untested.iter().map(|a| item(&a.id, "")).collect();
     f.surfaces_total = sec.assets.len();
     f.surfaces_closed = f.surfaces_total.saturating_sub(f.untested.len());
+    f.reflections = ledger.reflections.len();
     f
 }
 
@@ -162,6 +166,7 @@ impl Frontier {
             && self.untested.is_empty()
             && self.surfaces_total == 0
             && self.attempts_run == 0
+            && self.reflections == 0
     }
 }
 
@@ -206,6 +211,9 @@ pub fn render(f: &Frontier) -> Option<String> {
             line.push_str(&format!("; untested: {}", id_list(&f.untested)));
         }
         lines.push(line);
+    }
+    if f.reflections > 0 {
+        lines.push(format!("- Reflections recorded: {}", f.reflections));
     }
     if f.attempts_run > 0 {
         lines.push(format!(
@@ -454,6 +462,7 @@ mod tests {
         assert!(!attempts.is_empty() && attempts.no_open_route());
         let surfaces = Frontier { surfaces_total: 1, surfaces_closed: 1, ..Frontier::default() };
         assert!(!surfaces.is_empty());
+        assert!(!Frontier { reflections: 1, ..Frontier::default() }.is_empty());
     }
 
     #[test]
@@ -482,6 +491,7 @@ mod tests {
             surfaces_total: 3,
             surfaces_closed: 1,
             attempts_run: 7,
+            reflections: 2,
         }
     }
 
@@ -494,6 +504,7 @@ mod tests {
 - Set aside without evidence: 1 (x1) — set aside is not refuted; a different attempt can reopen it\n\
 - Open leads: 2 (p2, c4)\n\
 - Surfaces: 1 of 3 closed; untested: as-1, as-2\n\
+- Reflections recorded: 2\n\
 - Attempts run in this session: 7; ruled out with evidence: 1. A failed attempt rules out that attempt, not the approach.";
         assert_eq!(render(&full()).as_deref(), Some(want));
     }
@@ -518,6 +529,7 @@ mod tests {
             one(Frontier { surfaces_total: 2, surfaces_closed: 2, ..Frontier::default() }),
             format!("{head}- Surfaces: 2 of 2 closed")
         );
+        assert_eq!(one(Frontier { reflections: 1, ..Frontier::default() }), format!("{head}- Reflections recorded: 1"));
         assert_eq!(
             one(Frontier { attempts_run: 2, ..Frontier::default() }),
             format!(

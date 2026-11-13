@@ -48,6 +48,15 @@ pub enum LedgerOp {
         text: String,
         reason: String,
     },
+    /// A structured reflection recorded while working.
+    Reflection {
+        /// What is ruled out, and why.
+        ruled_out: String,
+        /// The single best next route, and why.
+        next_route: String,
+        /// The evidence that would change the conclusion.
+        would_change: String,
+    },
     /// Something tried or considered that did not work, and why. Prevents retries of dead ends.
     DeadEnd {
         what: String,
@@ -255,6 +264,19 @@ pub struct DeadEnd {
     pub n: u64,
 }
 
+/// A structured reflection recorded while working: what is ruled out, the best next
+/// route, and the evidence that would change the conclusion. Reflection is a
+/// first-class record so that a stuck session externalizes its thinking instead of
+/// silently looping.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reflection {
+    pub id: String,
+    pub ruled_out: String,
+    pub next_route: String,
+    pub would_change: String,
+    pub n: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     pub id: String,
@@ -340,7 +362,7 @@ pub struct ScopeGrantRecord {
 }
 
 /// The folded state of a mission. Ids are assigned by `fold`: constraints `k1…`, plan steps `p1…`,
-/// decisions `d1…`, dead ends `x1…`, claims `c1…`, evidence `e1…`, obligations `o1…`,
+/// decisions `d1…`, dead ends `x1…`, reflections `r1…`, claims `c1…`, evidence `e1…`, obligations `o1…`,
 /// approvals `a1…`, questions `q1…`, finish claims `f1…`, scope grants `s1…`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerState {
@@ -352,6 +374,9 @@ pub struct LedgerState {
     pub plan: Vec<PlanStep>,
     pub decisions: Vec<Decision>,
     pub dead_ends: Vec<DeadEnd>,
+    /// Reflections recorded by the `reflect` tool. Never blocks a finish and is never evicted.
+    #[serde(default)]
+    pub reflections: Vec<Reflection>,
     pub claims: Vec<Claim>,
     pub evidence: Vec<Evidence>,
     pub obligations: Vec<Obligation>,
@@ -385,8 +410,7 @@ pub struct LedgerState {
 //
 // Ids are assigned by position: the i-th `ConstraintAdd` is `k{i}`, plan steps `p{i}` (a `PlanSet`
 // REPLACES the plan: earlier steps not `Done` become `Dropped` with note "replaced by a new plan" and
-// stay listed; numbering continues, it never restarts), decisions `d{i}`, dead ends `x{i}`, claims
-// `c{i}`, evidence `e{i}`, obligations `o{i}`, approvals `a{i}`, questions `q{i}`, finish claims
+// stay listed; numbering continues, it never restarts), decisions `d{i}`, dead ends `x{i}`, reflections `r{i}`, claims `c{i}`, evidence `e{i}`, obligations `o{i}`, approvals `a{i}`, questions `q{i}`, finish claims
 // `f{i}`. `apply` never fails: an op that refers to an unknown id is ignored (validation happens
 // before an op is written, in `validate`).
 //
@@ -402,6 +426,8 @@ pub struct LedgerState {
 //   `from_user`; the message says these record the operator's words and cannot be written by a tool
 //   call;
 // - any op naming an id that does not exist → message lists the ids that do exist for that kind;
+// - `Reflection` requires each of `ruled_out`, `next_route` and `would_change` to be non-blank; it records
+//   progress thinking and never blocks a finish;
 // - `PlanSet` with no steps, or any empty/whitespace `text`/`what`/`summary` → refused;
 // - `PlanUpdate` to `Done` requires a non-empty `note` or at least one evidence id, and every
 //   evidence id must exist; to `Dropped` requires a non-empty `note`;
@@ -622,6 +648,16 @@ impl LedgerState {
                 let id = next_id("d", self.decisions.len());
                 self.decisions.push(Decision { id, text: text.clone(), reason: reason.clone(), n });
             }
+            LedgerOp::Reflection { ruled_out, next_route, would_change } => {
+                let id = next_id("r", self.reflections.len());
+                self.reflections.push(Reflection {
+                    id,
+                    ruled_out: ruled_out.clone(),
+                    next_route: next_route.clone(),
+                    would_change: would_change.clone(),
+                    n,
+                });
+            }
             LedgerOp::DeadEnd { what, why } => {
                 let id = next_id("x", self.dead_ends.len());
                 self.dead_ends.push(DeadEnd { id, what: what.clone(), why: why.clone(), n });
@@ -823,6 +859,17 @@ impl LedgerState {
                 // Named as the `note` tool names them: a decision's reason is `why`, a dead end's what is `text`.
                 if blank(reason) {
                     return Err(needs_text("the decision", "`why`"));
+                }
+            }
+            LedgerOp::Reflection { ruled_out, next_route, would_change } => {
+                if blank(ruled_out) {
+                    return Err(needs_text("the reflection", "`ruled_out`"));
+                }
+                if blank(next_route) {
+                    return Err(needs_text("the reflection", "`next_route`"));
+                }
+                if blank(would_change) {
+                    return Err(needs_text("the reflection", "`would_change`"));
                 }
             }
             LedgerOp::DeadEnd { what, why } => {
@@ -1325,6 +1372,16 @@ impl LedgerState {
             o.push_str(&format!("- **{}** (entry {}): {} — {}\n", d.id, d.n, md_inline(&d.what), md_inline(&d.why)));
         }
 
+        o.push_str("\n## Reflections\n\n");
+        if self.reflections.is_empty() {
+            o.push_str("(none)\n");
+        }
+        for r in &self.reflections {
+            o.push_str(&format!("- **{}** (entry {}): ruled out — {}\n", r.id, r.n, md_inline(&r.ruled_out)));
+            o.push_str(&format!("  - next route: {}\n", md_inline(&r.next_route)));
+            o.push_str(&format!("  - would change the conclusion: {}\n", md_inline(&r.would_change)));
+        }
+
         o.push_str("\n## Claims\n\n");
         if self.claims.is_empty() {
             o.push_str("(none)\n");
@@ -1465,6 +1522,7 @@ impl LedgerState {
             LedgerOp::PlanUpdate { id, status, note, .. } => {
                 format!("plan step {id} -> {}{}", step_status(*status), suffix(note))
             }
+            LedgerOp::Reflection { next_route, .. } => format!("reflection: {next_route}"),
             LedgerOp::Decision { text, reason } => format!("decision: {text} — {reason}"),
             LedgerOp::DeadEnd { what, why } => format!("dead end: {what} — {why}"),
             LedgerOp::ClaimAdd { text } => format!("claim added: {text}"),
@@ -1629,6 +1687,11 @@ mod tests {
                 status: StepStatus::Done,
                 note: "n".into(),
                 evidence: vec!["e1".into()],
+            },
+            LedgerOp::Reflection {
+                ruled_out: "try A, try B".into(),
+                next_route: "instrument C".into(),
+                would_change: "a clean run of the target".into(),
             },
             LedgerOp::Decision { text: "t".into(), reason: "r".into() },
             LedgerOp::DeadEnd { what: "w".into(), why: "y".into() },
@@ -2127,6 +2190,11 @@ mod tests {
             LedgerOp::Decision { text: "pin rust".into(), reason: "ci".into() },
             LedgerOp::DeadEnd { what: "regex parser".into(), why: "no recursion".into() },
             LedgerOp::DeadEnd { what: "peg".into(), why: "slow".into() },
+            LedgerOp::Reflection {
+                ruled_out: "regex and peg parsers".into(),
+                next_route: "instrument the recursive descent path".into(),
+                would_change: "a clean run of the target".into(),
+            },
             LedgerOp::ApprovalGrant { text: "ok to push".into(), scope: "git push".into() },
             LedgerOp::ApprovalGrant { text: "ok to delete".into(), scope: "rm".into() },
             LedgerOp::ApprovalUse { id: "a2".into(), used_for: "cleanup".into() },
@@ -2221,6 +2289,9 @@ mod tests {
             "speed",
             "regex parser",
             "no recursion",
+            "## Reflections",
+            "instrument the recursive descent path",
+            "would change the conclusion",
             "ok to push",
             "ok to delete",
             "cleanup",

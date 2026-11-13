@@ -14,7 +14,27 @@
 - A refused `finish` (goal not concluded) now lists the routes the ledger still shows open, from
   `frontier::directions`, and says to pick one and run it. When the ledger shows none it asks for three
   untried approaches, then names the role's real ways out (`ask_for`, `agent_spawn`, `report_blocker`).
+  The text says what is missing and how to close it, in a collaborative tone, never as a judgment of the
+  work. Outside a solvable pack it adds that a well-evidenced `unreachable` conclusion is a reportable
+  outcome, not a failure; in a solvable pack `unreachable` is never offered.
   `conclude` unreachable with open plan steps adds that those steps are routes still open.
+- The other `finish` refusals are worded the same way: open items (what is still open and how to close each
+  kind, "not a verdict on the work"), a verifier objection (the concrete gaps, and that only new execution
+  evidence settles them), the mechanical failures (quote shape and match, empty answer, running work) as
+  cheap fixes, and the stop-gate idle paragraph. Wherever `conclude` `unreachable` is offered as a path, a
+  solvable pack leaves it out.
+- Stuck detection: when a lead's `finish` is refused before a verifier runs (goal not concluded, or open
+  items) twice in a row with no new attested execution evidence, one non-blocking `Question` inbox item
+  opens for the operator (Keep working / Narrow the goal / Release the mission / Conclude unreachable;
+  the last is left out in a solvable pack). It pauses nothing, is not a ledger question and never blocks a
+  finish. The refusal text says the operator was told, with no count. The count resets when fresh evidence
+  appears and is in memory only.
+- New ledger tool `reflect` (`ruled_out`, `next_route`, `would_change`) records a structured reflection
+  for a session going in circles; it is rendered in the ledger document and granted to the lead and worker
+  roles of `core`, `harnessmm` and `vr`. The step block shows `- Reflections recorded: {n}` in `Where the
+  work stands:` when there are any. There is no count of rejected finishes anywhere in the model's view.
+- The `core`, `harnessmm` and `vr` prompts say that a well-evidenced `unreachable` conclusion is a
+  successful mission outcome.
 - A re-weave now leaves a map, not a chronicle of failures: the resume brief adds the frontier block (when the
   session has a ledger) and says a failed attempt rules out that attempt, not the approach, and the digest
   request asks for Established / Ruled out / Tried, not ruled out / Open leads / Next instead of a list of leads.

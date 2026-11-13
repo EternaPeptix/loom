@@ -616,8 +616,12 @@ only when every check passes and, where verification is required, a verifier acc
   and the goal-met claim (§7) is not concluded; a nudge note lists the routes the ledger still shows
   open (or, when it shows none, asks for three untried approaches), says to call `conclude` once a run
   shows the goal met, and names the role's ways out when stuck (`ask_for`, `agent_spawn`,
-  `report_blocker`). The ledger, not the wording of a reply, decides whether a stop is a
-  deliverable. `conclude {status: met|unreachable, note, evidence}` writes the goal-met claim (the
+  `report_blocker`); outside a solvable pack it adds that a well-evidenced `unreachable` conclusion is a
+  reportable outcome. The ledger, not the wording of a reply, decides whether a stop is a
+  deliverable. Stuck detection: a lead's `finish` refused before a verifier runs (this gate or the
+  open-items check) twice in a row with no new attested execution evidence opens one non-blocking
+  `Question` inbox item for the operator (Keep working / Narrow the goal / Release the mission, plus
+  Conclude unreachable outside a solvable pack); the model is told it was opened, never given a count. `conclude {status: met|unreachable, note, evidence}` writes the goal-met claim (the
   ledger checks the evidence, §7); `unreachable` is also refused while a plan step is open, so every route
   is closed first, and the verifier is then told to name one untried route or get one step further, not to
   confirm impossibility. A mission the operator released (`OperatorRelease`) may finish without a
@@ -866,7 +870,7 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
 **Tools.** Built in (`Registry::builtin`): `bash`, `job_wait`, `job_kill`, `job_list`, `read`,
 `write`, `edit`, `glob`, `grep`, `out_read`, `out_grep`, `web_fetch`, `cve_lookup`, `cve_search`,
 `advisory_lookup`. Runtime-owned (`loom-agent::rtools`, `NAMES`): `plan`, `step`, `note`, `claim`,
-`claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `finish`, `verdict`, `ask_user`,
+`claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`, `finish`, `verdict`, `ask_user`,
 `report_blocker`, `wait`, `agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`,
 `agent_stop`, `decide`, `verify`. A role lists the tools it has, in request order; a name in neither set is a pack error. The
 set is frozen in `session_start`. Every call goes through one pipeline (`loom_tools::prepare` → `run`

@@ -1,4 +1,4 @@
-//! Ledger tools: `plan`, `step`, `note`, `claim`, `claim_update`, `evidence`, `ledger`.
+//! Ledger tools: `plan`, `step`, `note`, `claim`, `claim_update`, `evidence`, `ledger`, `reflect`.
 //!
 //! CONTRACT.
 //!
@@ -20,6 +20,10 @@
 //! - `note`: `kind` `decision` → `Decision { text, reason: why }`, outcome `decision {id} recorded`;
 //!   `dead_end` → `DeadEnd { what: text, why }`, outcome `dead end {id} recorded`. Text: one line
 //!   echoing the id and the text.
+//! - `reflect`: `ruled_out`, `next_route`, `would_change` → `Reflection { ruled_out, next_route,
+//!   would_change }`. Outcome `reflection {id} recorded`; text one line echoing the id and `next_route`.
+//!   A structured self-check for when progress stalls: what is ruled out, the best next route, and the
+//!   evidence that would change the conclusion. Each field must say something true, not a ritual glyph.
 //! - `claim`: `ClaimAdd { text }`. Outcome `claim {id} open`. Text: ``{id}: {text}`` and the line
 //!   `Attach evidence with `evidence`, then set its status with `claim_update`.`
 //! - `claim_update`: `ClaimUpdate { id, status, note }`. Outcome `claim {id} {status}`. When the claim moves INTO
@@ -62,7 +66,7 @@
 //! Tests required (use a fake `Orchestrator`, a temp journal with a random key, and
 //! `loom_tools::execute` so that argument handling is covered): each tool's success text and the
 //! `ledger` record emitted through `Shared::take_emitted`; each refusal path (ledger rule refusal
-//! passed through verbatim, bad `step` combinations, empty plan step, evidence with a wrong quote,
+//! passed through verbatim, bad `step` combinations, empty plan step, `reflect` with a blank field, evidence with a wrong quote,
 //! an unknown handle, an output with no producer, the output of `ledger` and of `log_search` cited
 //! directly and as a view shows it, the diff of an `edit`); `evidence` kind by producer class, also
 //! when the quote is copied from a view of a command's output; a session without a mission gets
@@ -119,6 +123,7 @@ pub struct Claim(pub Arc<Shared>);
 pub struct ClaimUpdate(pub Arc<Shared>);
 pub struct Evidence(pub Arc<Shared>);
 pub struct Ledger(pub Arc<Shared>);
+pub struct Reflect(pub Arc<Shared>);
 
 #[async_trait]
 impl Tool for Plan {
@@ -230,6 +235,35 @@ impl Tool for Note {
                         state.decisions.last().map(|d| (d.id.as_str(), d.text.as_str())).unwrap_or(("", ""));
                     ToolOutput::ok(format!("decision {id} recorded"), Body::Message(format!("{id}: {what}")))
                 }
+            }
+            Err(text) => ToolOutput::error(text),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for Reflect {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "reflect",
+            "Record a structured reflection while you work: what you have ruled out and why, the single best next route you can see, and the evidence that would change your conclusion. Use it when progress stalls or the picture is unclear. Each field must say something true — a reflection that names real content moves the work forward; a ritual glyph does not.",
+            ToolClass::State,
+            &[
+                req("ruled_out", "string", "What you have ruled out, and why. One or two sentences."),
+                req("next_route", "string", "The single best next route you can see, and why."),
+                req("would_change", "string", "The evidence that, if you saw it, would change your conclusion about this mission — and what you would do with it."),
+            ],
+        )
+    }
+    async fn run(&self, _ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        let ruled_out = str_arg(args, "ruled_out").unwrap_or("").to_string();
+        let next_route = str_arg(args, "next_route").unwrap_or("").to_string();
+        let would_change = str_arg(args, "would_change").unwrap_or("").to_string();
+        match self.0.ledger_append(false, LedgerOp::Reflection { ruled_out, next_route, would_change }) {
+            Ok((_, state)) => {
+                let (id, route) =
+                    state.reflections.last().map(|r| (r.id.as_str(), r.next_route.as_str())).unwrap_or(("", ""));
+                ToolOutput::ok(format!("reflection {id} recorded"), Body::Message(format!("{id}: {route}")))
             }
             Err(text) => ToolOutput::error(text),
         }
@@ -499,6 +533,25 @@ mod tests {
         assert!(t.contains("The `text` of the dead end is empty."), "{t}");
         let t = refused(&rig, "note", json!({"kind": "decision", "text": "x", "why": "  "})).await;
         assert!(t.contains("The `why` of the decision is empty."), "{t}");
+    }
+
+    #[tokio::test]
+    async fn reflect_records_a_structured_reflection() {
+        let rig = rig("lead", false, true);
+        let t = ok(
+            &rig,
+            "reflect",
+            json!({"ruled_out": "mmap is out, it segfaults under load", "next_route": "instrument the C path", "would_change": "a clean run of the target"}),
+        )
+        .await;
+        assert!(t.contains("reflection r1 recorded"), "{t}");
+        assert!(t.contains("r1: instrument the C path"), "{t}");
+        assert_eq!(ledger_records(&rig), vec![1]);
+        let state = rig.shared.ledger().unwrap();
+        assert_eq!(state.reflections[0].ruled_out, "mmap is out, it segfaults under load");
+        assert_eq!(state.reflections[0].would_change, "a clean run of the target");
+        let t = refused(&rig, "reflect", json!({"ruled_out": " ", "next_route": "x", "would_change": "y"})).await;
+        assert!(t.contains("The `ruled_out` of the reflection is empty."), "{t}");
     }
 
     #[tokio::test]

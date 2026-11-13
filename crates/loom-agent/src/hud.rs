@@ -139,6 +139,8 @@ pub struct HudInput<'a> {
     /// The session's `finish` waits for a conclusion of the goal-met claim (an explicit-termination role that
     /// has `conclude`); only then is the state of that claim said.
     pub finish_gated: bool,
+    /// The role's pack is solvable: the finish line never offers a conclusion of `unreachable`.
+    pub solvable: bool,
 }
 
 pub fn render(input: &HudInput<'_>) -> String {
@@ -157,7 +159,7 @@ pub fn render(input: &HudInput<'_>) -> String {
         }
         security_sections(&mut sections, &ledger.security, input.now_ms);
         if !input.is_child {
-            if let Some(line) = finish_line(ledger, input.finish_gated) {
+            if let Some(line) = finish_line(ledger, input.finish_gated, input.solvable) {
                 sections.push(line);
             }
         }
@@ -294,10 +296,10 @@ fn budget_nearly_used(step: u32, started_ms: u64, now_ms: u64, budget: &Budget) 
 /// The steady finish line, from the ledger, with no count (a rising tally reads as pressure): the
 /// objection line while an objection of a verifier is open and the operator has not released, else the
 /// conclude-first line while the goal claim is open and the operator has not released, else `None`.
-fn finish_line(ledger: &LedgerState, gated: bool) -> Option<String> {
+fn finish_line(ledger: &LedgerState, gated: bool, solvable: bool) -> Option<String> {
     let objection_open = ledger.release.is_none()
         && ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind == ObligationKind::Objection);
-    texts::finish_status_line(gated && crate::gate::goal_unconcluded(ledger), objection_open)
+    texts::finish_status_line(gated && crate::gate::goal_unconcluded(ledger), objection_open, solvable)
 }
 
 /// One section: `{title} ({n}){suffix}:` and its entries, capped at `MAX_ITEMS`. Omitted when empty.
@@ -494,6 +496,7 @@ mod tests {
             started_ms: 0,
             budget: Budget::default(),
             finish_gated: true,
+            solvable: false,
         }
     }
 
@@ -784,7 +787,7 @@ mod tests {
             outcome: None,
         });
         i.ledger = Some(&done);
-        assert!(render(&i).contains("\n\nFinish: the check raised an objection."), "{}", render(&i));
+        assert!(render(&i).contains("\n\nFinish: the check raised an objection"), "{}", render(&i));
         // Settled objection and a concluded goal: no line. Neither with a release.
         let mut settled = done.clone();
         settled.obligations[0].outcome = Some("settled".into());
