@@ -397,6 +397,7 @@ mod native_tests {
     fn socket_probe() {
         assert!(std::env::var_os("LOOM_BWRAP_SOCKET_PROBE").is_some());
         assert!(!Path::new("/proc/self/fd/10").exists(), "old-mount source fd must be closed before target execution");
+        assert!(std::fs::File::open("/proc/1/fd/10").is_err(), "PID namespace reaper must not expose an old-mount source fd");
         for domain in [libc::AF_INET, libc::AF_INET6, libc::AF_UNIX] {
             // SAFETY: socket has no pointer arguments. Any unexpected descriptor is closed below.
             let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
@@ -444,5 +445,28 @@ mod native_tests {
         assert_eq!(end, crate::proc::WaitEnd::Ended(crate::proc::Ended::Exit(0)),
             "{}", String::from_utf8_lossy(&running.read_output(0).unwrap()));
         assert!(String::from_utf8_lossy(&running.read_output(0).unwrap()).contains("tracked"));
+    }
+
+    #[test]
+    fn bubblewrap_native_hides_credentials_and_oracle_keys_created_after_construction() {
+        if !required_launcher() { return; }
+        let executable = std::env::current_exe().unwrap();
+        let root = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
+        let user_home = root.path().join("user-home");
+        let ws = user_home.join("project");
+        let home = user_home.join("loom-state");
+        let tmp = home.join("sessions/test/tmp");
+        for path in [ws.join(".loom"), tmp.clone()] { std::fs::create_dir_all(path).unwrap(); }
+        let cfg = SandboxCfg { mode: SandboxMode::Bubblewrap, ..SandboxCfg::default() };
+        let sb = Sandbox::with_home(&cfg, &ws, &tmp, &home, None, Some(user_home.clone())).unwrap();
+        for path in [user_home.join(".aws/credentials"), ws.join(".loom/oracle-secrets/key"), home.join("token")] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "host-secret-created-after-policy").unwrap();
+            let out = run(&sb, &format!("test ! -r '{}'", path.display()));
+            assert!(out.status.success(), "late-created {} was readable: {}", path.display(), String::from_utf8_lossy(&out.stderr));
+        }
+        assert!(run(&sb, "echo source > source.txt; echo tmp > \"$TMPDIR/own\"").status.success());
+        assert!(ws.join("source.txt").exists());
+        assert!(tmp.join("own").exists());
     }
 }
