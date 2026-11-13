@@ -248,15 +248,15 @@ fn str_arg<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
 }
 
 /// Join one awaited child; a cancellation stops it and becomes the call's error.
-async fn join_one(shared: &Shared, ctx: &ToolCtx, id: &SessionId) -> Result<Settlement, ToolOutput> {
+async fn join_one(shared: &Shared, ctx: &ToolCtx, id: &SessionId) -> Result<Settlement, Box<ToolOutput>> {
     match shared.orch.join(&shared.session, id, &ctx.cancel).await {
         Ok(settlement) => Ok(settlement),
         Err(text) => {
             if ctx.cancel.is_cancelled() {
                 let _ = shared.orch.stop_child(&shared.session, id).await;
-                Err(ToolOutput::error(format!("Interrupted while waiting for agent {id}; it was stopped.")))
+                Err(Box::new(ToolOutput::error(format!("Interrupted while waiting for agent {id}; it was stopped."))))
             } else {
-                Err(ToolOutput::error(text))
+                Err(Box::new(ToolOutput::error(text)))
             }
         }
     }
@@ -340,7 +340,7 @@ impl Tool for AgentSpawn {
         }
         let settlement = match join_one(shared, ctx, &id).await {
             Ok(s) => s,
-            Err(out) => return out,
+            Err(out) => return *out,
         };
         let mut out = ToolOutput::ok(
             format!("agent {id} {}", outcome_word(settlement.outcome)),
@@ -731,7 +731,7 @@ impl Tool for Verify {
         };
         let settlement = match join_one(shared, ctx, &id).await {
             Ok(s) => s,
-            Err(out) => return out,
+            Err(out) => return *out,
         };
         let mut report = settlement.report.clone();
         if let Some(id) = claim_id {
