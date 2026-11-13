@@ -388,8 +388,9 @@ table.net tr.refused td { color: var(--bad); }
 .mission-goal { max-width: 80ch; color: var(--dim); margin: 0; overflow-wrap: anywhere; }
 .mission-goal:empty { display: none; }
 .mission-status { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; margin-top: 4px; font-size: 12px; overflow-wrap: anywhere; }
-.mission-speed { display: block; margin-top: 2px; font-size: 12px; }
-.mission-speed:empty { display: none; }
+.topbar-speed { font-variant-numeric: tabular-nums; }
+.topbar-speed::before { content: "·"; margin-right: 8px; }
+.topbar-speed:empty { display: none; }
 .mission-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .mission-actions .btn { min-height: 32px; padding: 5px 12px; }
 .mission-tabs { display: flex; flex: 0 0 auto; gap: 24px; padding: 0 28px; border-bottom: 1px solid var(--line); }

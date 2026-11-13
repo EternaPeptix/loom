@@ -190,6 +190,12 @@ upgrade" first; the rest says what behaves differently.
 
 ### Daemon and web UI
 
+- The web UI shows each model reply's generation speed in its footer (tokens after the first over the
+  time from the first streamed token to the end of the stream, so the wait for the first token is left
+  out), and the open session's speed in the top bar beside the stream freshness — the latest reply,
+  then the rate over the latest replies together — where a long goal cannot push it out of view. This
+  is in the desktop app too, which shows the same page. Replies recorded before the daemon kept this
+  timing show no figure.
 - The web UI shows a warning line when the disk of the loom home is low, and the daemon raises one
   notification when it turns low (and again only after it has recovered).
 - A session's scratch directory (`tmp/`) is emptied when the session ends for good or is archived.
