@@ -718,7 +718,7 @@ fn starts_last_line(blob: &Path, start: u64) -> io::Result<bool> {
         reader.seek(SeekFrom::Start(before))?;
         let mut byte = [0u8; 1];
         reader.read_exact(&mut byte)?;
-        if byte != [b'\n'] {
+        if byte != *b"\n" {
             return Ok(false);
         }
     }
