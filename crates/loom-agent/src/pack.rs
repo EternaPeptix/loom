@@ -67,7 +67,8 @@
 //! failure (missing name, bad name, unknown key, missing prompt file, path escaping the pack,
 //! empty/duplicate tools, `default_role`/`may_spawn` naming a missing role, bad termination);
 //! defaults; `role` lookup defaults and errors; `check_tools`; `system_prompt` layout and that it is
-//! identical for identical inputs.
+//! identical for identical inputs; the shipped `packs/vr/workspace/AGENTS.md` (a file the loader never
+//! reads) names only tools that a role of `vr` has.
 
 use loom_core::event::Termination;
 use serde::Deserialize;
@@ -801,6 +802,31 @@ mod tests {
                 && vr.contains("`conclude`")
                 && vr.contains("Only the operator grants scope")
         );
+    }
+
+    #[test]
+    fn the_vr_workspace_standards_name_only_tools_the_pack_has() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let p = Packs::load(&dir).unwrap();
+        let known = crate::rtools::known_tools();
+        let vr = p.get("vr").unwrap();
+        let text = fs::read_to_string(dir.join("vr/workspace/AGENTS.md")).unwrap();
+        let named = tools_named(&text, &known);
+        for tool in &named {
+            assert!(
+                vr.roles.values().any(|r| r.tools.contains(tool)),
+                "packs/vr/workspace/AGENTS.md names `{tool}`, which no role of the pack has"
+            );
+        }
+        // What it tells the researcher to orchestrate with, the researcher has.
+        let researcher = &vr.roles["researcher"];
+        for tool in ["agent_spawn", "agent_fanout", "attempt", "agent_adopt", "request_scope", "conclude", "wait"] {
+            assert!(named.iter().any(|t| t == tool), "the standards do not mention `{tool}`");
+            assert!(researcher.tools.iter().any(|t| t == tool), "the researcher lacks `{tool}`");
+        }
+        // A scout has tools the researcher lacks, which is why the file says scouts start fresh.
+        assert!(vr.roles["scout"].tools.iter().any(|t| !researcher.tools.contains(t)));
+        assert!(text.contains("refuses to start a scout as a `fork`"));
     }
 
     #[cfg(unix)]

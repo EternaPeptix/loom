@@ -17,7 +17,7 @@ tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
   "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search",
   "cve_lookup", "cve_search", "advisory_lookup",
-  "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "decide", "verify",
+  "agent_spawn", "agent_fanout", "attempt", "agent_adopt", "agent_message", "agent_stop", "decide", "verify",
   "request_scope", "conclude", "finish", "ask_user", "report_blocker", "wait",
 ]
 

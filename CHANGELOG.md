@@ -19,9 +19,14 @@
 - New tool `attempt`: one assignment attempted by several agents at once, each a fork of the lead in
   its own copy. The harness runs the lead's `check` command in every copy and reports each exit
   status, output and changed files; the lead adopts one attempt.
-- The built-in `core` lead has `attempt` and `agent_adopt`. Packs installed under `~/.loom/packs` are
-  not updated by an upgrade: add the two tools to a lead's `tools` there to use them (see
-  `docs/RUN.md`).
+- The built-in `core` lead and the `vr` researcher have `attempt` and `agent_adopt`. Packs installed
+  under `~/.loom/packs` are not updated by an upgrade: replace an installed `vr` with the shipped one,
+  and add the two tools to the lead's `tools` of a pack of your own (see `docs/RUN.md`). In `vr` a
+  scout has tools the researcher lacks, so it always starts fresh; the researcher's prompt said a scout
+  starts from everything the researcher has seen, and now says what happens.
+- `packs/vr/workspace/AGENTS.md` is new: the `vr` pack's standards in one file written for the agents,
+  to copy into an engagement workspace and name in the first message. It covers scope requests,
+  `conclude`, watched jobs, agents in their own copies and attempts. loom does not load it.
 - Archiving a mission deletes its agents' copies, including changes that were never adopted.
 - `meta.json` of an agent in a copy has `copy_of`; older daemons ignore it.
 
