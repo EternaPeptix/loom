@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/loom-hero.png" alt="Loom — a local AI agent harness" width="100%">
+</p>
+
 # loom
 
 An agent harness for long, unattended work on a model you host yourself.
