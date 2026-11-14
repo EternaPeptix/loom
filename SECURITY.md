@@ -107,7 +107,9 @@ When the operator enables a box, a session can run commands in a container on a 
 - **Egress is the mission's grants.** A per-mission bridge network without IPv6 (also off inside the
   container, and dropped on the host) and without DNS; rules on the Docker host allow only the granted
   exact hosts and addresses (checked against the same policy as the proxy, so private addresses need
-  `allow_private`) and drop the rest; they are updated when grants change and removed with the box. Every
+  `allow_private`) and drop the rest; they are updated when grants change and removed with the box. Granted names reach the container only as
+  `--add-host name:ip` built from validated names and IPv4 addresses (no root process runs in the box); a
+  name granted later resolves after `box_reset`, its address is allowed at once. Every
   box bridge is sent to a static chain `LOOM-ALL` that ends with `DROP`, so a bridge with no chain of its
   own is dropped, never NATed. The container is started only after its rules are in place, and is removed
   if they cannot be kept current at an update; a running box's rules are checked again about once a minute. A mission's

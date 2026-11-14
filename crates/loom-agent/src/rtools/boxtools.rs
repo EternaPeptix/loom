@@ -122,11 +122,30 @@ impl Tool for BoxExec {
         for note in pushed.notes {
             out = out.with_more(note);
         }
+        if let Some(line) = pending_hosts_line(&b.pending_hosts().await) {
+            out = out.with_more(line);
+        }
         if let Some(notice) = b.take_notice(ctx.session.as_str()) {
             out = out.with_more(notice);
         }
         out
     }
+}
+
+/// The line under a `box_exec` result while names granted after the box was made are not yet in its
+/// `/etc/hosts`: their addresses are reachable (the rules are current), their names resolve after `box_reset`.
+pub(crate) fn pending_hosts_line(pending: &[(String, Vec<std::net::Ipv4Addr>)]) -> Option<String> {
+    if pending.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = pending
+        .iter()
+        .map(|(name, ips)| format!("{name} ({})", ips.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")))
+        .collect();
+    Some(format!(
+        "Not resolvable inside the box until box_reset: {}. Their addresses are reachable now.",
+        names.join("; ")
+    ))
 }
 
 /// A path of `box_get` (`which` names the parameter) with a `.` or `..` component is refused: the box's own
@@ -371,6 +390,50 @@ mod tests {
         assert!(first.text.contains("these wildcard grants are not applied to it: *.wild.test"), "{}", first.text);
         let second = rig.call("box_exec", json!({"command": "true", "timeout_s": 20})).await;
         assert!(!second.text.contains("wildcard"), "{}", second.text);
+    }
+
+    #[tokio::test]
+    async fn a_name_granted_after_the_box_exists_is_flagged_in_box_exec_until_box_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let rig = box_rig();
+        let grants = Arc::new(std::sync::Mutex::new(vec!["203.0.113.9".to_string()]));
+        let g = grants.clone();
+        let source: EgressSource = Arc::new(move || {
+            let cfg = loom_core::config::NetworkCfg { allow_private: vec!["127.0.0.0/8".into()], ..Default::default() };
+            Ok((g.lock().unwrap().clone(), Policy::new(&cfg).map_err(|e| e.to_string())?))
+        });
+        let b = MissionBox::new(fake.host(), "m-test", source);
+        *rig.orch.boxed.lock().unwrap() = Some(Ok(b.clone()));
+        let r = rig.call("box_exec", json!({"command": "true", "timeout_s": 20})).await;
+        assert!(!r.text.contains("Not resolvable"), "{}", r.text);
+        grants.lock().unwrap().push("localhost".to_string());
+        b.resync().await;
+        let line =
+            "Not resolvable inside the box until box_reset: localhost (127.0.0.1). Their addresses are reachable now.";
+        for _ in 0..2 {
+            let r = rig.call("box_exec", json!({"command": "true", "timeout_s": 20})).await;
+            assert_eq!(r.text.matches(line).count(), 1, "{}", r.text);
+        }
+        let r = rig.call("box_reset", json!({})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        let r = rig.call("box_exec", json!({"command": "true", "timeout_s": 20})).await;
+        assert!(!r.text.contains("Not resolvable"), "{}", r.text);
+        assert!(fake.sub("run").last().unwrap().windows(2).any(|w| w == ["--add-host", "localhost:127.0.0.1"]));
+    }
+
+    #[test]
+    fn the_pending_line_lists_each_name_with_its_addresses() {
+        assert_eq!(pending_hosts_line(&[]), None);
+        let ip = |s: &str| s.parse::<std::net::Ipv4Addr>().unwrap();
+        assert_eq!(
+            pending_hosts_line(&[
+                ("a.test".into(), vec![ip("203.0.113.5"), ip("203.0.113.6")]),
+                ("b.test".into(), vec![ip("198.51.100.9")])
+            ])
+            .unwrap(),
+            "Not resolvable inside the box until box_reset: a.test (203.0.113.5, 203.0.113.6); b.test (198.51.100.9). Their addresses are reachable now."
+        );
     }
 
     #[tokio::test]

@@ -20,7 +20,13 @@
   adopted; file push opens by descriptor with `O_NOFOLLOW`; `box_get` refuses `.`/`..` components and tar
   typeflag 7; `ssh` and the docker client are resolved once, run with a fixed environment and a private
   directory; the box is refused with `sandbox.mode = "none"` or a `unix_sockets` entry that reaches its
-  socket; the `/etc/hosts` writer runs an absolute program with a fixed `PATH`.
+  socket.
+- Box fix: the container has a read-only root, so Docker mounts `/etc/hosts` read-only too and the root
+  writer failed (every `box_exec` and `box_reset` said the box could not be made ready). The writer and
+  its root `docker exec` are gone; the granted names are given to `docker run` as `--add-host name:ip`
+  (sorted, built from validated names and `Ipv4Addr` only). A name granted after the box exists has its
+  address reachable at once (the rules are updated) but resolves inside the box only after `box_reset`;
+  until then every `box_exec` result says so.
 
 ### Morale: keeping a model on a hard task
 

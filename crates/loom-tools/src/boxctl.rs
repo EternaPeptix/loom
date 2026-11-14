@@ -57,9 +57,12 @@
 //! `loom_net::policy::Policy::check_addr` with the session's effective policy (private and special
 //! addresses need `allow_private`, `deny` entries apply, and an entry that denies some ports refuses a
 //! grant of all ports), and keeps IPv4 addresses only (the network has no IPv6). The names that were
-//! resolved, with the addresses that passed, are written to the container's `/etc/hosts` by the daemon
-//! (`docker exec -u 0 -i /bin/sh -c '/bin/cat > /etc/hosts'` with a fixed `PATH`, the text on stdin). The
-//! rules are the chain `LOOM-<short>` ([`rules_text`]): flushed first, then ACCEPT each allowed
+//! resolved, with the addresses that passed, are given to `docker run` as one `--add-host <name>:<ipv4>`
+//! each, sorted by name then address, built from validated names and `Ipv4Addr` only; Docker writes the
+//! container's `/etc/hosts` from them (the root is read-only, so `/etc/hosts` is read-only too, and no
+//! root `docker exec` exists). A name granted after the container was made gets its rules at once, so
+//! its addresses are reachable, but it resolves inside the box only after `box_reset`; until then
+//! [`MissionBox::pending_hosts`] lists it and every `box_exec` result says so. The rules are the chain `LOOM-<short>` ([`rules_text`]): flushed first, then ACCEPT each allowed
 //! `ip/32` per protocol (tcp and udp, with `--dport` when a port was granted), DROP the rest. Behind it is a
 //! static chain `LOOM-ALL` that ends with `DROP` and holds one jump `-i lb-<short> -j LOOM-<short>` per
 //! mission, above that `DROP`; `DOCKER-USER` (forwarded packets) and `INPUT` (packets to the Docker host
@@ -154,8 +157,6 @@ pub const RULES_RETRY_DELAY: Duration = Duration::from_secs(2);
 pub const BOX_CLOSED: &str = "The box of this mission was removed when the mission was stopped. It comes back when the operator resumes the mission.";
 /// The `PATH` of every process this module starts on this machine: fixed system directories, all absolute.
 pub const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-/// The `PATH` of the container's root-run `/etc/hosts` writer.
-pub const HOSTS_PATH: &str = "PATH=/usr/sbin:/usr/bin:/sbin:/bin";
 /// The static chain that every box bridge (`lb-+`) is sent to first; it ends with `DROP`.
 pub const ALL_CHAIN: &str = "LOOM-ALL";
 /// The directory (under `<loom home>/keys`) that is `HOME` and `DOCKER_CONFIG` of the docker client: empty.
@@ -250,8 +251,10 @@ pub fn running_args(n: &Names) -> Vec<String> {
     ]
 }
 
-/// `docker run` of the box (I2). `cfg.cap_add` has passed `BoxCfg::check`.
-pub fn run_args(cfg: &BoxCfg, n: &Names, home: &str) -> Vec<String> {
+/// `docker run` of the box (I2). `cfg.cap_add` has passed `BoxCfg::check`. `hosts` are the granted names with the
+/// addresses that passed the policy: each becomes one `--add-host name:ip`, from a validated name and an
+/// `Ipv4Addr`, so nothing in a grant can become a flag or a second value.
+pub fn run_args(cfg: &BoxCfg, n: &Names, home: &str, hosts: &Hosts) -> Vec<String> {
     // `--init`: an init as PID 1 reaps the processes a stopped command leaves behind; without it they stay
     // zombies under `sleep` and count against `--pids-limit`.
     let mut a = strings(["run", "--detach", "--init", "--name"]);
@@ -259,7 +262,14 @@ pub fn run_args(cfg: &BoxCfg, n: &Names, home: &str) -> Vec<String> {
     a.extend(labels(&n.mission, home));
     a.extend(strings(["--network"]));
     a.push(n.network.clone());
-    a.extend(strings(["--dns", DNS_SINKHOLE, "--cap-drop", "ALL"]));
+    a.extend(strings(["--dns", DNS_SINKHOLE]));
+    for (name, ips) in hosts.iter().filter(|(name, _)| valid_name(name)) {
+        for ip in ips {
+            a.push("--add-host".into());
+            a.push(format!("{name}:{ip}"));
+        }
+    }
+    a.extend(strings(["--cap-drop", "ALL"]));
     for cap in cfg.caps() {
         a.push("--cap-add".into());
         a.push(cap);
@@ -345,15 +355,6 @@ pub fn kill_args(n: &Names, pid_file: &str, signal: &str) -> Vec<String> {
     // both read `kill -SIG -PGID` as a signal to the process group.
     a.push(format!("kill -{sig} -$(cat \"$0\")"));
     a.push(pid_file.to_string());
-    a
-}
-
-/// `docker exec` as root that replaces `/etc/hosts` with what arrives on stdin. Root runs only absolute
-/// programs, with a fixed `PATH`: nothing in the container's own (user-writable) search path is found.
-pub fn hosts_args(n: &Names) -> Vec<String> {
-    let mut a = strings(["exec", "--interactive", "--user", "0", "--env", HOSTS_PATH]);
-    a.push(n.container.clone());
-    a.extend(strings(["/bin/sh", "-c", "/bin/cat > /etc/hosts"]));
     a
 }
 
@@ -512,12 +513,15 @@ pub struct Allowed {
     pub port: Option<u16>,
 }
 
+/// Granted names with the addresses that passed the policy.
+pub type Hosts = BTreeMap<String, BTreeSet<Ipv4Addr>>;
+
 /// What the grants and the policy allow the box (see the module contract).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Egress {
     pub allowed: BTreeSet<Allowed>,
-    /// The resolved names with the addresses that passed the policy, for `/etc/hosts`.
-    pub hosts: BTreeMap<String, BTreeSet<Ipv4Addr>>,
+    /// The resolved names with the addresses that passed the policy, for `--add-host`.
+    pub hosts: Hosts,
     /// Wildcard grants, which are not applied to the box.
     pub wildcards: Vec<String>,
     /// Entries left out for another reason, each with the reason (logged).
@@ -561,7 +565,7 @@ pub fn grant_names(grants: &[String]) -> Vec<String> {
     out.into_iter().collect()
 }
 
-/// A host name that can be written to `/etc/hosts`.
+/// A host name that can be given to `--add-host`.
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 253
@@ -637,17 +641,6 @@ pub fn plan_egress(grants: &[String], policy: &Policy, resolved: &BTreeMap<Strin
     plan.wildcards.sort();
     plan.wildcards.dedup();
     plan
-}
-
-/// The container's `/etc/hosts`.
-pub fn hosts_text(hosts: &BTreeMap<String, BTreeSet<Ipv4Addr>>) -> String {
-    let mut t = String::from("127.0.0.1 localhost\n::1 localhost ip6-localhost\n");
-    for (name, ips) in hosts {
-        for ip in ips {
-            t.push_str(&format!("{ip} {name}\n"));
-        }
-    }
-    t
 }
 
 // ---- the Docker host -----------------------------------------------------------------------------
@@ -1058,6 +1051,10 @@ struct State {
     paused: bool,
     /// The mission's box was torn down through this handle; it makes nothing again (L1). `forget` keeps it.
     closed: bool,
+    /// The names and addresses the running container was created with (its `/etc/hosts`).
+    created_hosts: Hosts,
+    /// The names and addresses the grants give now, as of the last time the rules were brought to them.
+    wanted_hosts: Hosts,
 }
 
 impl State {
@@ -1066,6 +1063,8 @@ impl State {
         self.up = false;
         self.pushed.clear();
         self.verified = None;
+        self.created_hosts.clear();
+        self.wanted_hosts.clear();
     }
 }
 
@@ -1154,11 +1153,6 @@ impl MissionBox {
             .map(|_| ())
     }
 
-    async fn write_hosts(&self, plan: &Egress) -> Result<(), String> {
-        let text = hosts_text(&plan.hosts).into_bytes();
-        self.host.run_ok("Writing the container's /etc/hosts", &hosts_args(&self.names), Some(text)).await.map(|_| ())
-    }
-
     /// Remove the container so that it never runs with rules that are not the grants' (best effort).
     async fn remove_container(&self, st: &mut State) {
         let _ = self.host.docker(&rm_args(&self.names), None, SMALL_OUT).await;
@@ -1228,8 +1222,17 @@ impl MissionBox {
                 return self.rules_ok(st).await;
             }
             tracing::warn!(mission = %self.names.mission, "box: its egress rules are not all in place; installing them again");
-            match async { self.install_rules(&self.plan().await?).await }.await {
-                Ok(()) => return self.rules_ok(st).await,
+            let again = async {
+                let plan = self.plan().await?;
+                self.install_rules(&plan).await?;
+                Ok::<_, String>(plan.hosts)
+            }
+            .await;
+            match again {
+                Ok(hosts) => {
+                    st.wanted_hosts = hosts;
+                    return self.rules_ok(st).await;
+                }
                 Err(e) => last = e,
             }
         }
@@ -1278,9 +1281,10 @@ impl MissionBox {
         if self.is_running().await {
             // A box from before a restart of the daemon: bring its rules to the grants of now.
             self.install_rules(&plan).await?;
-            self.write_hosts(&plan).await?;
             st.forget();
             st.up = true;
+            // What it was created with is not known: its names count as pending until `box_reset`.
+            st.wanted_hosts = plan.hosts;
             st.verified = Some(Instant::now());
             return Ok(());
         }
@@ -1289,13 +1293,11 @@ impl MissionBox {
         self.make_network().await?;
         // The container starts only once the rules that confine it are in place.
         self.install_rules(&plan).await?;
-        self.run_ok("Starting the box", run_args(&self.host.cfg, &self.names, &self.home)).await?;
-        if let Err(e) = self.write_hosts(&plan).await {
-            self.remove_container(st).await;
-            return Err(e);
-        }
+        self.run_ok("Starting the box", run_args(&self.host.cfg, &self.names, &self.home, &plan.hosts)).await?;
         st.forget();
         st.up = true;
+        st.created_hosts.clone_from(&plan.hosts);
+        st.wanted_hosts = plan.hosts;
         st.verified = Some(Instant::now());
         Ok(())
     }
@@ -1331,11 +1333,14 @@ impl MissionBox {
         let applied = async {
             let plan = self.plan().await?;
             self.install_rules(&plan).await?;
-            self.write_hosts(&plan).await
+            Ok::<_, String>(plan.hosts)
         }
         .await;
         match applied {
-            Ok(()) => st.verified = Some(Instant::now()),
+            Ok(hosts) => {
+                st.wanted_hosts = hosts;
+                st.verified = Some(Instant::now());
+            }
             Err(e) => {
                 tracing::warn!(mission = %self.names.mission, "box: the egress rules could not be updated, so the box is removed: {e}");
                 self.remove_container(&mut st).await;
@@ -1350,6 +1355,21 @@ impl MissionBox {
         st.forget();
         st.closed = true;
         teardown_names_locked(&self.host, &self.names).await;
+    }
+
+    /// The granted names whose addresses differ from what the running container was created with: their rules
+    /// are in place, but the container's `/etc/hosts` (written by Docker at creation) lacks them until
+    /// `reset`. Name and addresses, sorted.
+    pub async fn pending_hosts(&self) -> Vec<(String, Vec<Ipv4Addr>)> {
+        let st = self.state.lock().await;
+        if !st.up {
+            return Vec::new();
+        }
+        st.wanted_hosts
+            .iter()
+            .filter(|(name, ips)| st.created_hosts.get(*name) != Some(*ips))
+            .map(|(name, ips)| (name.clone(), ips.iter().copied().collect()))
+            .collect()
     }
 
     /// The one-time note about grants the box does not apply, for the first call of `session`.
@@ -1676,7 +1696,6 @@ case "$sub" in
     ctr=$1; shift
     if [ ! -f "$D/ctr-$ctr" ]; then echo "Error: No such container: $ctr" >&2; exit 1; fi
     if [ -f "$D/paused-$ctr" ]; then echo "Error response from daemon: Container $ctr is paused, unpause the container before exec" >&2; exit 1; fi
-    if [ "$*" = "/bin/sh -c /bin/cat > /etc/hosts" ]; then cat > "$D/etc-hosts"; exit 0; fi
     mkdir -p "$D/work"; cd "$D/work" || exit 1
     command -v setsid >/dev/null 2>&1 || PATH="$D/bin:$PATH"
     export PATH
@@ -1762,6 +1781,15 @@ mod tests {
 
     const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    fn sample_hosts() -> Hosts {
+        let mut h = Hosts::new();
+        // Inserted out of order: the argv is sorted by name, then address.
+        h.entry("b.test".into()).or_default().insert("198.51.100.9".parse().unwrap());
+        h.entry("a.test".into()).or_default().insert("203.0.113.60".parse().unwrap());
+        h.entry("a.test".into()).or_default().insert("203.0.113.5".parse().unwrap());
+        h
+    }
+
     fn sample_cfg() -> BoxCfg {
         BoxCfg {
             enabled: true,
@@ -1813,7 +1841,7 @@ mod tests {
     #[test]
     fn i2_the_docker_run_argv_is_exactly_this() {
         let n = names("m-1");
-        let args = run_args(&sample_cfg(), &n, "HOMEHASH");
+        let args = run_args(&sample_cfg(), &n, "HOMEHASH", &sample_hosts());
         let expected: Vec<String> = [
             "run",
             "--detach",
@@ -1828,6 +1856,12 @@ mod tests {
             "loom-m-1",
             "--dns",
             "192.0.2.1",
+            "--add-host",
+            "a.test:203.0.113.5",
+            "--add-host",
+            "a.test:203.0.113.60",
+            "--add-host",
+            "b.test:198.51.100.9",
             "--cap-drop",
             "ALL",
             "--cap-add",
@@ -1883,7 +1917,7 @@ mod tests {
             assert!(!a.starts_with("container:") && !a.contains("docker.sock"), "{a}");
         }
         // No cap_add: nothing is added back.
-        let plain = run_args(&BoxCfg { cap_add: vec![], ..sample_cfg() }, &n, "H");
+        let plain = run_args(&BoxCfg { cap_add: vec![], ..sample_cfg() }, &n, "H", &Hosts::new());
         assert!(!plain.iter().any(|a| a == "--cap-add"));
         assert!(plain.windows(2).any(|w| w == ["--cap-drop", "ALL"]));
     }
@@ -1943,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    fn the_kill_cp_hosts_network_and_rm_argv_are_exactly_this() {
+    fn the_kill_cp_network_and_rm_argv_are_exactly_this() {
         let n = names("m-1");
         let kill = kill_args(&n, "/tmp/.loom-c.pid", "TERM");
         assert_eq!(
@@ -1964,22 +1998,6 @@ mod tests {
             kill_args(&n, "/p", "x; rm")[6],
             "kill -TERM -$(cat \"$0\")",
             "the signal is one of two fixed words"
-        );
-        // R12: root runs an absolute program with a fixed PATH.
-        assert_eq!(
-            hosts_args(&n),
-            [
-                "exec",
-                "--interactive",
-                "--user",
-                "0",
-                "--env",
-                "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
-                "loom-m-1",
-                "/bin/sh",
-                "-c",
-                "/bin/cat > /etc/hosts"
-            ]
         );
         assert_eq!(network_inspect_args(&n), ["network", "inspect", "--format", "{{json .}}", "loom-m-1"]);
         assert_eq!(cp_in_args(&n), ["cp", "--archive", "-", "loom-m-1:/work"]);
@@ -2042,12 +2060,9 @@ mod tests {
         assert!(skipped.contains("2001:db8::1") && skipped.contains("IPv6"), "{skipped}");
         assert!(skipped.contains("2001:db8::60") && skipped.contains("IPv6"), "{skipped}");
         assert!(skipped.contains("gone.test") && skipped.contains("did not resolve"), "{skipped}");
-        // Only names appear in /etc/hosts, with the addresses that passed.
+        // Only names are given to the container, with the addresses that passed.
         assert_eq!(plan.hosts.keys().map(String::as_str).collect::<Vec<_>>(), ["both.test", "target.test"]);
-        assert_eq!(
-            hosts_text(&plan.hosts),
-            "127.0.0.1 localhost\n::1 localhost ip6-localhost\n203.0.113.60 both.test\n203.0.113.50 target.test\n"
-        );
+        assert_eq!(plan.hosts["both.test"].iter().map(ToString::to_string).collect::<Vec<_>>(), ["203.0.113.60"]);
         // The names to resolve: exact names only.
         assert_eq!(grant_names(&g), ["both.test", "gone.test", "internal.test", "target.test"]);
     }
@@ -2212,8 +2227,8 @@ mod tests {
         let b = MissionBox::new(f.host(), "m-1", source(&["203.0.113.7", "*.wild.test"]));
         assert!(f.calls().is_empty(), "nothing is done before the first use");
         b.ready().await.unwrap();
-        // inspect (is one there?) -> rm leftovers -> network -> rules (helper) -> container -> /etc/hosts
-        assert_eq!(subs(&f), ["inspect", "rm", "network", "run", "run", "exec"]);
+        // inspect (is one there?) -> rm leftovers -> network -> rules (helper) -> container; no exec at all
+        assert_eq!(subs(&f), ["inspect", "rm", "network", "run", "run"]);
         let runs = f.sub("run");
         assert!(
             runs[0].iter().any(|a| a == "--entrypoint") && runs[0].iter().any(|a| a == "/bin/sh"),
@@ -2222,7 +2237,7 @@ mod tests {
         assert!(runs[1].iter().any(|a| a == "--name"), "then the container");
         let rules = std::fs::read_to_string(f.dir.join("rules.in")).unwrap();
         assert!(rules.contains("-d 203.0.113.7/32 -p tcp -j ACCEPT") && rules.contains("-j DROP"), "{rules}");
-        assert!(f.dir.join("etc-hosts").exists());
+        assert!(!f.calls().iter().any(|c| c.iter().any(|a| a.contains("/etc/hosts"))), "no root writer remains");
         // A second call finds it running and does nothing more.
         let before = f.calls().len();
         b.ready().await.unwrap();
@@ -2236,6 +2251,75 @@ mod tests {
         for c in f.calls() {
             assert_eq!(&c[..2], ["--host".to_string(), format!("unix://{}", f.socket.display())]);
         }
+    }
+
+    /// Grants that can be changed while a box exists.
+    fn live_source(g: &Arc<StdMutex<Vec<String>>>) -> EgressSource {
+        let g = g.clone();
+        Arc::new(move || Ok((g.lock().unwrap().clone(), policy(&["127.0.0.0/8"], &[]))))
+    }
+
+    #[tokio::test]
+    async fn a_name_granted_after_creation_is_pending_until_reset_and_its_address_works_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let grants = Arc::new(StdMutex::new(vec!["203.0.113.7".to_string()]));
+        let b = MissionBox::new(f.host(), "m-1", live_source(&grants));
+        b.ready().await.unwrap();
+        assert!(b.pending_hosts().await.is_empty());
+        // A grant after creation: the rules follow at once, the name resolves only after a reset.
+        grants.lock().unwrap().push("localhost".to_string());
+        b.resync().await;
+        let rules = std::fs::read_to_string(f.dir.join("rules.in")).unwrap();
+        assert!(rules.contains("-d 127.0.0.1/32 -p tcp -j ACCEPT"), "{rules}");
+        let pending = b.pending_hosts().await;
+        assert_eq!(pending, [("localhost".to_string(), vec!["127.0.0.1".parse::<Ipv4Addr>().unwrap()])]);
+        // A second resync does not change that.
+        b.resync().await;
+        assert_eq!(b.pending_hosts().await, pending);
+        // The reset makes the container with every current name.
+        b.reset().await.unwrap();
+        assert!(b.pending_hosts().await.is_empty());
+        let runs = f.sub("run");
+        let container = runs.last().unwrap();
+        assert!(container.windows(2).any(|w| w == ["--add-host", "localhost:127.0.0.1"]), "{container:?}");
+        // No call is ever a root exec or touches /etc/hosts.
+        for c in f.calls() {
+            assert!(!c.iter().any(|a| a.contains("/etc/hosts")), "{c:?}");
+            assert!(!(c.get(2).map(String::as_str) == Some("exec") && c.iter().any(|a| a == "0")), "{c:?}");
+        }
+        assert!(!subs(&f).iter().any(|s| s == "exec"));
+    }
+
+    #[test]
+    fn a_hostile_grant_cannot_become_a_flag() {
+        let n = names("m-1");
+        let g = grants(&[
+            "--privileged",
+            "-v",
+            "evil.test --privileged",
+            "x.test:--cap-add=ALL",
+            "a.test,--network=host",
+            "ok.test",
+        ]);
+        let res = resolved(&[
+            ("--privileged", &["203.0.113.1"]),
+            ("-v", &["203.0.113.2"]),
+            ("evil.test --privileged", &["203.0.113.3"]),
+            ("x.test", &["203.0.113.4"]),
+            ("ok.test", &["203.0.113.5"]),
+        ]);
+        let plan = plan_egress(&g, &policy(&[], &[]), &res);
+        let plain = run_args(&sample_cfg(), &n, "H", &Hosts::new());
+        let args = run_args(&sample_cfg(), &n, "H", &plan.hosts);
+        let adds: Vec<&str> = args.windows(2).filter(|w| w[0] == "--add-host").map(|w| w[1].as_str()).collect();
+        assert_eq!(adds, ["ok.test:203.0.113.5"], "only the valid name, as one `name:ip` value");
+        assert_eq!(args.len(), plain.len() + 2, "nothing else was added: no flag came from a grant");
+        // A hostile map that bypassed the plan is still filtered by the name check.
+        let mut bad = Hosts::new();
+        bad.entry("--privileged".into()).or_default().insert("203.0.113.1".parse().unwrap());
+        bad.entry("a b".into()).or_default().insert("203.0.113.2".parse().unwrap());
+        assert_eq!(run_args(&sample_cfg(), &n, "H", &bad), plain);
     }
 
     #[tokio::test]

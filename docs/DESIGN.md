@@ -1209,7 +1209,10 @@ file is the specification; the invariants are:
 3. *Pinned images*: `name@sha256:...` or `sha256:...`.
 4. *Egress*: a bridge per mission without IPv6, DNS at an unroutable address, rules in a chain `LOOM-<id>` on
    the Docker host installed by `helper_image` (`--network host --cap-add NET_ADMIN`), from the exact granted
-   hosts and IPs after `Policy::check_addr`; wildcards are not applied; container after rules. A static
+   hosts and IPs after `Policy::check_addr`; wildcards are not applied; container after rules. Resolved
+   names go to `docker run` as `--add-host name:ip` (the root is read-only, so Docker's `/etc/hosts` is
+   too; no root exec exists); a name granted later is reachable by address at once and resolves after
+   `box_reset` (`MissionBox::pending_hosts`, shown under every `box_exec` result meanwhile). A static
    chain `LOOM-ALL` (jumped to from `DOCKER-USER` and `INPUT` for `lb-+`, one jump per mission, final `DROP`)
    drops a bridge that has no chain of its own; IPv6 is off in the container and dropped on the host; the
    rules of a running box are re-checked about once a minute.
