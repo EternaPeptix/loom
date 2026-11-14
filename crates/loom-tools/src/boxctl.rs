@@ -97,7 +97,9 @@
 //! `launch(call, cwd, script)` returns the `bash::Launch` that `bash::run_launched` runs: the launcher
 //! below, the box's private run directory and the docker client's environment. The launcher is:
 //! `docker exec -u 1000:1000 -w /work[/cwd] -e HOME=/tmp -e TERM=dumb <container> /bin/bash -c
-//! 'exec setsid /bin/bash -c '\''echo $$ > "$0"; exec /bin/bash -c "$1"'\'' "$1" "$2"' _ <pid file> <script>`.
+//! 'exec setsid -w /bin/bash -c '\''echo $$ > "$0"; exec /bin/bash -c "$1"'\'' "$1" "$2"' _ <pid file> <script>`
+//! (`-w`: `setsid` forks when the command already leads its process group, as under `docker exec`, and must
+//! wait for it so that its output and exit status are the call's).
 //! The command runs in its own session, and the pid file `/tmp/.loom-<call>.pid` holds the process group
 //! id. The launcher's `remote_stop` runs `docker exec ... /bin/sh -c 'kill -<SIG> -$(cat "$0")'
 //! <pid file>` (TERM, then KILL) whenever the job's group is signalled: stopping the local docker client
@@ -317,7 +319,9 @@ pub fn pid_file(call_id: &str) -> String {
 }
 
 /// The fixed text the container's outer bash runs. `$1` is the pid file and `$2` the agent's script.
-const EXEC_WRAP: &str = r#"exec setsid /bin/bash -c 'echo $$ > "$0"; exec /bin/bash -c "$1"' "$1" "$2""#;
+// `setsid -w`: under `docker exec` the command already leads its process group, so `setsid` forks; without
+// `--wait` its parent exits 0 at once, the exec ends, and the command's output and status are lost.
+const EXEC_WRAP: &str = r#"exec setsid -w /bin/bash -c 'echo $$ > "$0"; exec /bin/bash -c "$1"' "$1" "$2""#;
 
 /// A directory under `/work`: relative, plain components only.
 pub fn work_dir(cwd: Option<&str>) -> Result<String, String> {
@@ -1743,7 +1747,8 @@ case "$sub" in
     fi
     command -v setsid >/dev/null 2>&1 || PATH="$D/bin:$PATH"
     export PATH
-    exec "$@";;
+    # Like `docker exec`, the command leads its own process group (a real `setsid` then forks).
+    exec /usr/bin/perl -e 'setpgrp(0, 0); exec { $ARGV[0] } @ARGV or die "exec: $!"' "$@";;
 esac
 exit 0
 "##;
@@ -1760,7 +1765,7 @@ exit 0
             // Hosts without a `setsid` command (macOS) get one that behaves the same for the box's wrapper.
             std::fs::create_dir_all(dir.join("bin")).expect("fake bin");
             let setsid = dir.join("bin/setsid");
-            std::fs::write(&setsid, "#!/usr/bin/perl\nuse POSIX;\nPOSIX::setsid();\nexec { $ARGV[0] } @ARGV;\n")
+            std::fs::write(&setsid, "#!/usr/bin/perl\nuse POSIX;\nshift @ARGV if @ARGV && $ARGV[0] eq \"-w\";\nPOSIX::setsid();\nexec { $ARGV[0] } @ARGV;\n")
                 .expect("write setsid");
             std::fs::set_permissions(&setsid, std::fs::Permissions::from_mode(0o755)).expect("chmod setsid");
             FakeDocker { dir, cli, socket }
@@ -2647,6 +2652,26 @@ mod tests {
             seen.dedup();
             assert_eq!(seen, expect_sigs, "{call}: {sigs:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_foreground_command_that_takes_a_while_keeps_its_output_and_exit_status() {
+        // Under `docker exec` the command leads its process group, so `setsid` forks; without `-w` the call
+        // would end at once with status 0 and no output while the command ran on in the container.
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let b = MissionBox::new(f.host(), "m-1", source(&[]));
+        b.ready().await.unwrap();
+        let e = env_with(ToolsCfg::default(), SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() });
+        let script = "sleep 1; echo late; exit 3";
+        let launch = b.launch("call-late", None, script).unwrap();
+        let out = run_launched(&e.ctx, &args(json!({"command": script})), &launch).await;
+        assert_eq!((out.status, out.outcome.as_str()), (ToolStatus::Error, "exit 3"), "{out:?}");
+        let body = match &out.body {
+            crate::Body::Raw(b) => String::from_utf8_lossy(b).to_string(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(body, "late\n");
     }
 
     #[tokio::test]
