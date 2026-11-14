@@ -4474,8 +4474,13 @@ mod tests {
     async fn early_run(speculate: bool, script: Vec<Action>) -> (Fx, Witness, Arc<Mutex<EarlyCounts>>) {
         let mut fx = Fx::new("chat", false, false, seq(script)).await;
         fx.ctx.cfg = Arc::new(loom_core::config::ToolsCfg { speculate, ..(*fx.ctx.cfg).clone() });
+        // One fixed modification time for every file: `glob` lists newest first (ties by path), and the runs
+        // these tests compare make their files at different instants.
+        let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         for (file, text) in [("a.txt", "alpha\n"), ("b.txt", "beta\n"), ("c.txt", "gamma\n")] {
-            std::fs::write(fx.ctx.workspace.join(file), text).unwrap();
+            let path = fx.ctx.workspace.join(file);
+            std::fs::write(&path, text).unwrap();
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
         }
         let witness = Witness::default();
         let mut session = fx.create();
