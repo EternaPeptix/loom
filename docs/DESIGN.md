@@ -1148,7 +1148,8 @@ file is the specification; the invariants are:
    `rules_args`, `rm_args`). The agent's script is the last argument of `/bin/bash -c` in the container. The
    ssh-forwarded socket lives in `<loom home>/keys`.
 2. *Hardened container*: `--cap-drop ALL` plus the vetted `cap_add`, `no-new-privileges`, read-only root,
-   tmpfs `/tmp` and `/work`, user 1000, no mounts, devices, privileged mode or host namespaces.
+   tmpfs `/tmp` and `/work` (mounted `exec`: the box runs what is built in it), an init as PID 1 (`--init`,
+   so stopped commands leave no zombies), user 1000, no mounts, devices, privileged mode or host namespaces.
 3. *Pinned images*: `name@sha256:...` or `sha256:...`.
 4. *Egress*: a bridge per mission without IPv6, DNS at an unroutable address, rules in a chain `LOOM-<id>` on
    the Docker host installed by `helper_image` (`--network host --cap-add NET_ADMIN`), from the exact granted

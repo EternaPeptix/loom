@@ -96,7 +96,7 @@
 //! `docker exec -u 1000:1000 -w /work[/cwd] -e HOME=/tmp -e TERM=dumb <container> /bin/bash -c
 //! 'exec setsid /bin/bash -c '\''echo $$ > "$0"; exec /bin/bash -c "$1"'\'' "$1" "$2"' _ <pid file> <script>`.
 //! The command runs in its own session, and the pid file `/tmp/.loom-<call>.pid` holds the process group
-//! id. The launcher's `remote_stop` runs `docker exec ... /bin/sh -c 'kill -<SIG> -- -$(cat "$0")'
+//! id. The launcher's `remote_stop` runs `docker exec ... /bin/sh -c 'kill -<SIG> -$(cat "$0")'
 //! <pid file>` (TERM, then KILL) whenever the job's group is signalled: stopping the local docker client
 //! alone would leave the command running in the container.
 //!
@@ -252,7 +252,9 @@ pub fn running_args(n: &Names) -> Vec<String> {
 
 /// `docker run` of the box (I2). `cfg.cap_add` has passed `BoxCfg::check`.
 pub fn run_args(cfg: &BoxCfg, n: &Names, home: &str) -> Vec<String> {
-    let mut a = strings(["run", "--detach", "--name"]);
+    // `--init`: an init as PID 1 reaps the processes a stopped command leaves behind; without it they stay
+    // zombies under `sleep` and count against `--pids-limit`.
+    let mut a = strings(["run", "--detach", "--init", "--name"]);
     a.push(n.container.clone());
     a.extend(labels(&n.mission, home));
     a.extend(strings(["--network"]));
@@ -279,9 +281,10 @@ pub fn run_args(cfg: &BoxCfg, n: &Names, home: &str) -> Vec<String> {
     a.push(cfg.cpus.to_string());
     a.push("--read-only".into());
     a.push("--tmpfs".into());
-    a.push(format!("/tmp:rw,nosuid,nodev,size={}m,uid=1000,gid=1000,mode=1777", cfg.tmp_mb));
+    // `exec`: Docker mounts a tmpfs `noexec` unless told otherwise, and the box exists to run what is built in it.
+    a.push(format!("/tmp:rw,exec,nosuid,nodev,size={}m,uid=1000,gid=1000,mode=1777", cfg.tmp_mb));
     a.push("--tmpfs".into());
-    a.push(format!("{WORK}:rw,nosuid,nodev,size={}m,uid=1000,gid=1000,mode=0755", cfg.work_mb));
+    a.push(format!("{WORK}:rw,exec,nosuid,nodev,size={}m,uid=1000,gid=1000,mode=0755", cfg.work_mb));
     a.extend(strings(["--user", BOX_USER, "--workdir", WORK, "--ipc", "private", "--restart", "no"]));
     a.extend(strings(["--entrypoint", "/bin/sleep", &cfg.image, "2147483647"]));
     a
@@ -338,7 +341,9 @@ pub fn kill_args(n: &Names, pid_file: &str, signal: &str) -> Vec<String> {
     let mut a = strings(["exec", "--user", BOX_USER]);
     a.push(n.container.clone());
     a.extend(strings(["/bin/sh", "-c"]));
-    a.push(format!("kill -{sig} -- -$(cat \"$0\")"));
+    // No `--`: dash (Debian/Ubuntu `/bin/sh`) refuses `kill -SIG -- -PGID` ("Illegal number"), and bash and dash
+    // both read `kill -SIG -PGID` as a signal to the process group.
+    a.push(format!("kill -{sig} -$(cat \"$0\")"));
     a.push(pid_file.to_string());
     a
 }
@@ -1812,6 +1817,7 @@ mod tests {
         let expected: Vec<String> = [
             "run",
             "--detach",
+            "--init",
             "--name",
             "loom-m-1",
             "--label",
@@ -1844,9 +1850,9 @@ mod tests {
             "4",
             "--read-only",
             "--tmpfs",
-            "/tmp:rw,nosuid,nodev,size=1024m,uid=1000,gid=1000,mode=1777",
+            "/tmp:rw,exec,nosuid,nodev,size=1024m,uid=1000,gid=1000,mode=1777",
             "--tmpfs",
-            "/work:rw,nosuid,nodev,size=4096m,uid=1000,gid=1000,mode=0755",
+            "/work:rw,exec,nosuid,nodev,size=4096m,uid=1000,gid=1000,mode=0755",
             "--user",
             "1000:1000",
             "--workdir",
@@ -1949,14 +1955,14 @@ mod tests {
                 "loom-m-1",
                 "/bin/sh",
                 "-c",
-                "kill -TERM -- -$(cat \"$0\")",
+                "kill -TERM -$(cat \"$0\")",
                 "/tmp/.loom-c.pid"
             ]
         );
-        assert_eq!(kill_args(&n, "/p", "KILL")[6], "kill -KILL -- -$(cat \"$0\")");
+        assert_eq!(kill_args(&n, "/p", "KILL")[6], "kill -KILL -$(cat \"$0\")");
         assert_eq!(
             kill_args(&n, "/p", "x; rm")[6],
-            "kill -TERM -- -$(cat \"$0\")",
+            "kill -TERM -$(cat \"$0\")",
             "the signal is one of two fixed words"
         );
         // R12: root runs an absolute program with a fixed PATH.
