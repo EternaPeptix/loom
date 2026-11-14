@@ -156,6 +156,61 @@ Environment variables whose names look like secrets (in any case: containing `KE
 variable whose value holds a URL with a password in it) are not passed to commands unless listed in
 `env_pass`.
 
+## A box
+
+`[box]` gives the agent a place to run what the local sandbox cannot (raw TCP to a target, heavy
+tooling) without giving it Docker. Each mission gets one container on a Docker host that you set up;
+the tools `box_exec`, `box_get` and `box_reset` are the whole interface, and the `ctf` solver roles
+have them. The daemon, not the agent, talks to Docker.
+
+Set up the host once:
+
+1. Use a **dedicated Linux VM** that runs Docker and nothing you care about (a KVM guest is fine).
+   Give it an `ssh_config` alias that works without a prompt from the daemon's account, for example
+   `Host loom-box` with its `HostName`, `User`, `IdentityFile` and, when the VM is behind another
+   machine, `ProxyJump`. Test it: `ssh loom-box docker version`.
+2. Set `ssh_host = "loom-box"` and `remote_socket = "/var/run/docker.sock"` (the socket inside the VM).
+   loom forwards it to `~/.loom/keys/box.sock`, which commands cannot read. Or set `docker_socket` to a
+   socket on this machine instead.
+3. Pick two images and pin them by digest (`name@sha256:...`; tags are refused): `image`, the box
+   itself (the tools you want, with `bash`; it runs as user 1000), and `helper_image`, a small image
+   with `sh`, `iptables`, `iptables-restore` and `ip6tables` (the alpine `iptables` package has all of
+   them) that loom runs with `NET_ADMIN` on the host network to install the per-mission egress rules. The
+   Docker VM's kernel must have the iptables and ip6tables filter tables.
+4. Set `enabled = true`.
+
+What the box can reach is the mission's grants: exact hosts and IP addresses given with
+`request_scope` and approved, with an optional `:port`. Wildcard grants are not applied (the first
+`box_exec` of a session says so). The daemon resolves names, applies the `[network]` policy to the
+addresses (private addresses need `allow_private`), and writes the result into rules on the Docker VM
+(chain `LOOM-<id>`); everything else, including DNS and IPv6, is dropped. `DOCKER-USER` and `INPUT` send
+everything that enters on a box bridge (`lb-*`) to a static chain `LOOM-ALL`, which holds one jump per
+mission and ends with `DROP`: a box bridge without its own chain is dropped, never routed or translated.
+The Docker host must not have other interfaces named `lb-*`: they are dropped by `LOOM-ALL`. A revoked
+grant cuts open flows at once (the mission chain has no rule for established traffic).
+loom checks a running box's rules about once a minute and puts them back if they are gone; if that fails
+twice it pauses the box (keeping `/work`), refuses the command, and resumes the box when a later check
+works. A new grant, a release and the end of the mission update or remove the rules. The box has no
+other mounts, no devices, all capabilities dropped except `cap_add`, a read-only root, and tmpfs `/work`
+and `/tmp`: files in it are lost when the mission ends or on `box_reset`.
+
+Notes. The box needs the OS sandbox: `[sandbox] mode = "none"` and a `sandbox.unix_sockets` entry that
+names the box's socket (or anything in `<loom home>/keys`) are refused. `docker_cli` and `ssh` are looked
+up on the daemon's `PATH` once, at start; the docker client runs with a fixed `PATH` and an empty
+`HOME`/`DOCKER_CONFIG` of its own (`<loom home>/keys/box-docker`), so your docker configuration and
+credential helpers are not used. Commands in the box run as user 1000 with `no-new-privileges`, so
+`cap_add` gives them no capabilities; it matters only for root processes in the image. A mission that is
+stopped, ended or archived has its box removed and gets none until its lead is resumed. After a daemon
+restart a box job that was running is still listed, but `job_kill` stops only the local client, not the
+command in the container (the remote stop is not kept with the job record): `box_reset` stops it.
+
+**Also protect the host from the VM.** loom's rules cover only the boxes it makes. As a second layer
+that does not depend on loom, configure the VM's *host* (the machine that runs the hypervisor) to block
+the VM from reaching the host itself and every private range (RFC 1918, link-local, your management
+network), allowing only the addresses the VM needs (its DNS or package mirror if any, and the
+targets). A container escape or a bug in the rules should then still end at a VM that cannot see
+anything else.
+
 ## Start
 
 ```

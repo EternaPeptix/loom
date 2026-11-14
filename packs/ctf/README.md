@@ -2,7 +2,7 @@
 
 Opt-in roles for authorized local challenges and scoped CTF services. The dispatcher has four direct
 execution starts; solver roles have 35-step slices. Web/binary/crypto roles keep tools relevant to
-their work (at most 26 per role). An observer returns bounded recommendations to the dispatcher, which
+their work (at most 30 per role). An observer returns bounded recommendations to the dispatcher, which
 relays them to active solvers. Profile diversity is operator configured; no cache hit or quality gain
 is assumed.
 
@@ -11,7 +11,7 @@ the operator acceptance contract described in [SECURITY-ORACLES](../../docs/SECU
 Start a **new** mission with pack `ctf`, role `dispatcher`. On Linux use the supported Bubblewrap
 configuration and create the reserved workspace `.loom` directory first. Subprocess networking is
 deny-all there; trusted structured HTTP still uses explicit mission grants. Interactive TCP pivots
-need a separately qualified proxy/guest bridge and are not supplied by this pack.
+need a separately qualified proxy/guest bridge and are not supplied by this pack, unless the operator configures a remote box (`[box]`, see [RUN](../../docs/RUN.md)): the solver roles can then run tooling with `box_exec` in a container that reaches the granted targets directly, including raw TCP.
 
 Create a legacy claim and pass its actual `cN` ID to the verifier; there is no implicit `c0`. Use
 `agent_spawn` with `role: flag_judge` for pre-conclusion verification. Open its receipt, attach

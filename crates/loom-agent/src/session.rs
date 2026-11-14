@@ -7103,6 +7103,21 @@ mod tests {
     }
 
     #[test]
+    fn box_tools_are_refused_in_wrap_up_like_bash_and_the_class_counts_as_exec() {
+        let policy = CallPolicy { wrapup: true };
+        for name in ["box_exec", "box_get", "box_reset", "bash"] {
+            assert!(!policy.allows(name, &json!({"command": "id"})), "{name} must be closed in wrap-up");
+            assert!(CallPolicy::default().allows(name, &json!({})), "{name} is open otherwise");
+        }
+        // box_exec and box_reset start work in the box: they are Exec calls, which `max_exec_calls` counts.
+        let registry = crate::rtools::testkit::box_registry();
+        let class = |n: &str| registry.get(n).map(|t| t.spec().class);
+        assert_eq!(class("box_exec"), Some(ToolClass::Exec));
+        assert_eq!(class("box_reset"), Some(ToolClass::Exec));
+        assert_eq!(class("box_get"), Some(ToolClass::Write));
+    }
+
+    #[test]
     fn durable_clock_excludes_waits_renewals_and_restart_downtime() {
         let mut state = State { started_ms: 1000, ..State::default() };
         let apply = |s: &mut State, ms, event| {

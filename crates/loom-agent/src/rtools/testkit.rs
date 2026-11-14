@@ -42,6 +42,8 @@ pub struct FakeOrch {
     pub refuse: Mutex<Option<String>>,
     /// Copies by child; a child with none works in its parent's workspace.
     pub copies: Mutex<HashMap<SessionId, Result<ChildCopy, String>>>,
+    /// What `box_access` answers; unset means no box is configured.
+    pub boxed: Mutex<Option<Result<Arc<loom_tools::boxctl::MissionBox>, String>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -181,6 +183,13 @@ impl Orchestrator for FakeOrch {
         lock(&self.producers).get(blob).cloned()
     }
 
+    async fn box_access(&self, _session: &SessionId) -> Result<Arc<loom_tools::boxctl::MissionBox>, String> {
+        match lock(&self.boxed).clone() {
+            Some(answer) => answer,
+            None => Err(super::boxtools::NO_BOX.to_string()),
+        }
+    }
+
     async fn child_copy(&self, _parent: &SessionId, child: &SessionId) -> Result<Option<ChildCopy>, String> {
         self.record(format!("copy {child}"));
         lock(&self.copies).get(child).cloned().transpose()
@@ -281,4 +290,19 @@ impl Rig {
         self.orch.produced(&blob, "s-test", "call-0", tool, class);
         blob.handle()
     }
+}
+
+/// The registry of a role that has the three box tools (and the job tools that follow their jobs).
+pub fn box_registry() -> Registry {
+    box_rig().registry
+}
+
+/// A session `s-test` whose role is the core worker with the box tools added; its box is not configured.
+pub fn box_rig() -> Rig {
+    let mut role = core_role("worker");
+    role.tools = ["box_exec", "box_get", "box_reset", "job_wait", "job_kill", "out_read"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    rig_with(role, false, false, AgentsCfg::default())
 }

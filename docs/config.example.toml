@@ -88,6 +88,33 @@ mode = "deny_all"
 # deny = ["169.254.0.0/16", "tracker.example.test"]   # always refused, in every mode: host patterns, IP addresses or CIDR blocks
 # allow_private = ["10.1.2.3"]   # private, loopback or link-local destinations that are permitted (host pattern, IP or CIDR)
 
+[box]
+# A remote container the agent's commands can run in with `box_exec` (raw TCP to granted hosts, tooling
+# that the local sandbox cannot run). Off by default. See docs/RUN.md, "A box".
+enabled = false
+# Reach Docker one of two ways, not both:
+#   over ssh: loom starts `ssh -N -L <loom home>/keys/box.sock:<remote_socket> <ssh_host>` itself
+# ssh_host = "loom-box"                  # an alias from your ssh config (it may use ProxyJump); batch mode, no prompts
+# remote_socket = "/var/run/docker.sock" # the Docker socket inside that machine
+#   or a socket on this machine:
+# docker_socket = "/var/run/docker.sock"
+# docker_cli = "docker"                  # the docker command line client: a full path, or a name that is looked for on the daemon's PATH once, at start
+# Both images must be pinned by digest; a tag is refused. helper_image needs `sh`, `iptables`, `iptables-restore` and `ip6tables`.
+# The box needs a sandbox: `[sandbox] mode = "none"` is refused with it, and `sandbox.unix_sockets` may not name the box's socket or anything under <loom home>/keys.
+# image = "registry.example.test/box@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+# helper_image = "registry.example.test/netadmin@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+cpus = 4
+memory_mb = 8192
+pids = 512
+work_mb = 4096             # size of the tmpfs on /work
+tmp_mb = 1024              # size of the tmpfs on /tmp
+cap_add = []               # capabilities to add back (all are dropped); loom refuses the dangerous ones (SYS_ADMIN, NET_ADMIN, ...)
+#                            Commands run as uid 1000 with no-new-privileges, so cap_add does NOT give them capabilities: it
+#                            affects only root processes inside the container (and a command cannot become root there).
+sync_max_mb = 64           # most data copied from the workspace into /work by one call
+sync_file_max_mb = 16      # largest single file copied
+get_max_mb = 64            # most data one box_get brings back
+
 [agents]
 max_children = 6           # child sessions running at once within one mission
 child_max_steps = 200      # default step budget for a child spawned without one
