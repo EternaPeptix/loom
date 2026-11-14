@@ -8564,6 +8564,8 @@ mod tests {
     }
 
     async fn idle_lead(e: &Env) -> (SessionId, MissionId) {
+        // Bubblewrap (the Linux OS sandbox these tests use) refuses a workspace without its reserved `.loom`.
+        std::fs::create_dir_all(e.ws.join(".loom")).unwrap();
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         let id = info.meta.id.clone();
         until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
