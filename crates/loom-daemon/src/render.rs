@@ -87,19 +87,28 @@
 //!   (`DiskSpace::is_low`), a warning that sessions will fail when the disk fills (bold yellow); one
 //!   line per model (`✓`/`✗`, base URL, model, window, detail when unreachable); the counts.
 //! - `net_table(entries, style)`: `TIME  VERDICT  METHOD  HOST:PORT  RULE` (time as `HH:MM:SS` UTC).
+//! - `score_table(view, style)`: what a mission's work took. `SESSION  ROLE`, then the headings of
+//!   `loom_core::scorecard::COLUMNS` in capitals; one row per session with its `Scorecard::cells()`
+//!   (a session with a parent as `  └ {id}`), and for a mission of more than one session a last row
+//!   `total` with the view's total. Unlike the other listings its rows are not cut to the width: a
+//!   number cut off at the right edge would read as not there. When a card is `unrecorded`, a line
+//!   (dim) follows saying what `?` means: `? = not recorded: this log was written before loom recorded
+//!   verdicts and quote refusals.`
 //!
 //! Tests required: every record kind (the shape above, with and without colour — no escape byte
 //! without colour); `clean` on escape sequences; reasoning shown/hidden; output cutting with and
 //! without a handle and with `full`; each small format at its boundaries; each listing including
-//! the empty cases and the child indentation; rows never exceed `width` characters.
+//! the empty cases and the child indentation; rows never exceed `width` characters; the score table
+//! for one session and for several, with a card that is not recorded, wider than the width.
 
 use crate::wire::StatusView;
-use loom_agent::runtime::{InboxEntry, NetEntry, SessionInfo, WindowView};
+use loom_agent::runtime::{InboxEntry, NetEntry, ScoreView, SessionInfo, WindowView};
 use loom_agent::session::Phase;
 use loom_core::event::{
     Author, ChildOutcome, Event, FinishReason, InboxItem, InboxKind, Record, SessionOutcome, SpawnMode, ToolStatus,
     TurnEndReason,
 };
+use loom_core::scorecard::COLUMNS;
 use loom_core::weave::ItemState;
 use std::collections::HashSet;
 
@@ -851,6 +860,36 @@ pub fn net_table(entries: &[NetEntry], style: &Style) -> String {
         })
         .collect();
     table(style, &["TIME", "VERDICT", "METHOD", "HOST:PORT", "RULE"], &rows)
+}
+
+pub fn score_table(view: &ScoreView, style: &Style) -> String {
+    let mut header = vec!["SESSION".to_string(), "ROLE".to_string()];
+    header.extend(COLUMNS.iter().map(|c| c.to_uppercase()));
+    let mut rows: Vec<Vec<String>> = view
+        .sessions
+        .iter()
+        .map(|s| {
+            let id = flat(s.session.as_str());
+            let mut row = vec![if s.parent.is_some() { format!("  └ {id}") } else { id }, flat(&s.role)];
+            row.extend(s.card.cells());
+            row
+        })
+        .collect();
+    if view.sessions.len() > 1 {
+        let mut row = vec!["total".to_string(), String::new()];
+        row.extend(view.total.cells());
+        rows.push(row);
+    }
+    // A number cut off at the right edge would read as not there: these rows keep their width.
+    let whole = Style { color: style.color, width: usize::MAX };
+    let header: Vec<&str> = header.iter().map(String::as_str).collect();
+    let mut text = table(&whole, &header, &rows);
+    if view.sessions.iter().any(|s| s.card.unrecorded) {
+        let note = "? = not recorded: this log was written before loom recorded verdicts and quote refusals.";
+        text.push_str(&paint(style, DIM, note));
+        text.push('\n');
+    }
+    text
 }
 
 #[cfg(test)]
@@ -1939,5 +1978,86 @@ mod tests {
         assert!(lines[1].starts_with("01:02:03  denied "));
         assert!(lines[1].contains("CONNECT  example.test:443  default deny"));
         assert!(lines[2].starts_with("00:00:59  allowed"));
+    }
+
+    #[test]
+    fn score_table_shapes() {
+        use loom_agent::runtime::SessionScore;
+        use loom_core::scorecard::Scorecard;
+        let lead = Scorecard {
+            steps: 10,
+            finished: true,
+            steps_to_finish: Some(10),
+            calls: 12,
+            malformed_calls: 3,
+            finish_calls: 2,
+            finish_refusals: 1,
+            quote_refusals: 2,
+            verifier_accepts: 1,
+            verifier_rejections: 1,
+            fresh_starts: 1,
+            hand_offs: 0,
+            asks: 1,
+            unrecorded: false,
+        };
+        let verifier = Scorecard { steps: 2, calls: 2, ..Scorecard::default() };
+        let scored = |id: &str, role: &str, parent: Option<&str>, card: &Scorecard| SessionScore {
+            session: SessionId::from(id),
+            role: role.into(),
+            parent: parent.map(SessionId::from),
+            card: card.clone(),
+        };
+        // One session: its row, and no total to repeat it.
+        let alone = ScoreView {
+            mission: MissionId::from("m-1"),
+            sessions: vec![scored("s-lead", "lead", None, &lead)],
+            total: lead.clone(),
+        };
+        let expected = "\
+SESSION  ROLE  STEPS  TO FINISH  CALLS  MALFORMED  FINISH REFUSED  QUOTE REFUSED  VERIFIER  FRESH STARTS  HAND OFFS  ASKS
+s-lead   lead  10     10         12     3 (25%)    1 of 2          2              1 of 2    1             0          1
+";
+        assert_eq!(score_table(&alone, &MONO), expected);
+
+        // Several: the others under the lead, then the total. A row is not cut to the width.
+        let mut total = lead.clone();
+        total.add(&verifier);
+        total.add(&verifier);
+        let view = ScoreView {
+            mission: MissionId::from("m-1"),
+            sessions: vec![
+                scored("s-lead", "lead", None, &lead),
+                scored("s-check-1", "verifier", Some("s-lead"), &verifier),
+                scored("s-check-2", "verifier", Some("s-lead"), &verifier),
+            ],
+            total,
+        };
+        let narrow = Style { color: false, width: 40 };
+        let expected = "\
+SESSION        ROLE      STEPS  TO FINISH  CALLS  MALFORMED  FINISH REFUSED  QUOTE REFUSED  VERIFIER  FRESH STARTS  HAND OFFS  ASKS
+s-lead         lead      10     10         12     3 (25%)    1 of 2          2              1 of 2    1             0          1
+  └ s-check-1  verifier  2      -          2      0 (0%)     0 of 0          0              -         0             0          0
+  └ s-check-2  verifier  2      -          2      0 (0%)     0 of 0          0              -         0             0          0
+total                    14     10         16     3 (19%)    1 of 2          2              1 of 2    1             0          1
+";
+        assert_eq!(score_table(&view, &narrow), expected);
+
+        // A log from before the facts were recorded: `?`, and a line that says what it means.
+        let old = Scorecard { unrecorded: true, ..lead.clone() };
+        let view = ScoreView {
+            mission: MissionId::from("m-1"),
+            sessions: vec![scored("s-\x1b[31mold", "lead", None, &old)],
+            total: old,
+        };
+        let text = score_table(&view, &MONO);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[1].starts_with("s-·[31mold  lead  10") && lines[1].contains("  ?  "), "{text}");
+        assert_eq!(
+            lines[2],
+            "? = not recorded: this log was written before loom recorded verdicts and quote refusals."
+        );
+        assert!(!text.contains('\x1b'));
+        assert!(score_table(&view, &COLOR).contains(DIM));
     }
 }

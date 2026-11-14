@@ -58,6 +58,7 @@
 //! | `GET /sessions/{id}/net?limit={n}` | `runtime.net` (default 200, at most 2000) | `[NetEntry]` |
 //! | `GET /missions` | `runtime.missions` | `[MissionInfo]` |
 //! | `GET /missions/{id}/ledger` | `runtime.ledger` | `LedgerView` |
+//! | `GET /missions/{id}/score` | `runtime.score` | `ScoreView` |
 //! | `GET /inbox` | `runtime.inbox` | `[InboxEntry]` |
 //! | `POST /inbox/{item_id}` (`AnswerBody`) | `runtime.answer` | `202` `{}` |
 //! | `GET /blobs/{handle}` | `blobs.resolve` + `meta` | `BlobRef` |
@@ -209,6 +210,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/net", get(net))
         .route("/api/missions", get(missions))
         .route("/api/missions/{id}/ledger", get(ledger))
+        .route("/api/missions/{id}/score", get(score))
         .route("/api/inbox", get(inbox))
         .route("/api/inbox/{item_id}", post(answer))
         .route("/api/blobs/{handle}", get(blob_meta))
@@ -703,6 +705,11 @@ async fn missions(State(s): State<ApiState>) -> Response {
 
 async fn ledger(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
     let view = s.runtime.ledger(&MissionId::from(id)).map_err(rt_err)?;
+    Ok(Json(view).into_response())
+}
+
+async fn score(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
+    let view = s.runtime.score(&MissionId::from(id)).await.map_err(rt_err)?;
     Ok(Json(view).into_response())
 }
 
@@ -1623,6 +1630,13 @@ mod tests {
         assert!(ledger["markdown"].is_string());
         let (s, b) = e.get("/api/missions/m-nope/ledger").await;
         assert_eq!(s, 404, "{b}");
+        let (s, score) = e.get(&format!("/api/missions/{mission}/score")).await;
+        assert_eq!(s, 200, "{score}");
+        assert_eq!(score["mission"], mission.as_str());
+        assert_eq!(score["sessions"][0]["session"], id.as_str());
+        assert!(score["sessions"][0]["card"]["steps"].is_u64() && score["total"]["calls"].is_u64(), "{score}");
+        let (s, b) = e.get("/api/missions/m-nope/score").await;
+        assert_eq!((s, b), (404, json!({"error": "There is no mission m-nope."})));
 
         let end = tokio::time::Instant::now() + WAIT;
         let status = loop {

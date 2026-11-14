@@ -174,6 +174,7 @@ test("reweave summary and eviction words", () => {
   assert.match(C.evictionWords({ seq: 1, action: { stub: { text: "gone" } } }), /^stub: gone/);
   assert.equal(C.evictionWords({ seq: 1, action: "drop" }), "dropped");
   assert.equal(C.evictionWords({ seq: 1, action: "drop_reasoning" }), "reasoning dropped");
+  assert.equal(C.evictionWords({ seq: 1, action: "remove" }), "call and result out of view");
 });
 
 test("urls", () => {

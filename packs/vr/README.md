@@ -51,8 +51,11 @@ link-local addresses are refused unless `allow_private` lists them. Every decisi
   a `read_only` role of the same pack with the `verdict` tool. Its `finish` is delivered only after the
   judge accepts it. A finding is attacked by an agent that did not produce it, and the finish gate is
   mechanical (nothing open) before it is adversarial (the judge tries to refute). If the judge rejects
-  the finish twice and the researcher finishes a third time, or the judge cannot be run, the answer
-  reaches you as a blocking inbox item labelled `NOT VERIFIED`. `[agents] verify_finish = false` in the
+  the finish, its objections come back as open obligations that only a new recorded run settles, and
+  the researcher starts afresh on what the judge found (`[agents] fresh_start`, on by default). Nothing
+  is parked on you for a rejection. If the judge cannot be run, the finish is held as unverified and is
+  never delivered as verified. A researcher that keeps asking to finish with no new execution evidence
+  opens a non-blocking question in your inbox. `[agents] verify_finish = false` in the
   config turns this off for every pack: the researcher's finish is then delivered at once, marked
   `not verified`.
 - **Pipeline: candidate, validated, assessed, ready.** Plan steps and claim statuses. Evidence is

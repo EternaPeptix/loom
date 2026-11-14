@@ -28,6 +28,9 @@
 //!   `POST /api/sessions/{id}/release`, the `RuleReceipt`. Both are the operator's, like `add_rule`.
 //! - `mission_of(word)`: a word starting with `m-` is taken as a mission id as it is; otherwise
 //!   `resolve(word)` and that session's mission.
+//! - `score(mission)`: `GET /api/missions/{id}/score`, the `ScoreView`, with ten minutes for the answer
+//!   (the daemon reads every log of the mission). A daemon from before scorecards has no such route;
+//!   its refusal becomes a sentence that says to restart the daemon.
 //! - `stream(id, after)` / `events(deltas)`: open the event stream and return an [`EventStream`].
 //!   `EventStream::next()` yields each event as a `BusEvent` (`loom_model::assemble::SseParser` over
 //!   the body's chunks, each payload parsed as `BusEvent`; a `record` event whose record does not
@@ -39,7 +42,8 @@
 //! Tests required (against a small `axum` server in the test that plays the daemon — no runtime
 //! needed): the bearer header is sent; each call hits the documented method and path and parses the
 //! documented body; the four error forms; `resolve` (exact, prefix with and without `s-`, `last`,
-//! none, several); `mission_of`; a stream delivering events split across chunks, a comment line and
+//! none, several); `mission_of`; `score` (its route, an older daemon, a mission that is not there); a
+//! stream delivering events split across chunks, a comment line and
 //! an unparsable payload in between, then end of stream; a stream's record served as stored (an
 //! opaque one) arriving as `Event::Unknown`; `from_home` preferring `daemon.json`.
 //!
@@ -63,7 +67,8 @@ use crate::wire::{
     ReleaseBody, RuleBody, ScopeBody, ScopeReceipt, SessionDetail, StatusView, WithdrawBody,
 };
 use loom_agent::runtime::{
-    BusEvent, InboxEntry, LedgerView, MissionInfo, NetEntry, NewSession, RuleReceipt, SessionInfo, WindowView,
+    BusEvent, InboxEntry, LedgerView, MissionInfo, NetEntry, NewSession, RuleReceipt, ScoreView, SessionInfo,
+    WindowView,
 };
 use loom_core::config::{Config, Paths};
 use loom_core::event::Seq;
@@ -84,6 +89,9 @@ const LOST: &str = "The connection to the daemon was lost.";
 /// What every daemon has answered to a path it does not have (`404`).
 const NO_SUCH_PATH: &str = "There is no such path on the loom daemon.";
 const OLDER_DAEMON: &str = "The running daemon is older than this `loom` and cannot issue login codes. Restart it (`loom down`, then `loom up`) and run `loom open` again.";
+const OLDER_DAEMON_SCORE: &str = "The running daemon is older than this `loom` and cannot score a mission. Restart it (`loom down`, then `loom up`) and run `loom score` again.";
+/// Every log of the mission is read for a scorecard.
+const SCORE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Set once by `--unverified-daemon`: talk to a listener that does not prove it is this home's daemon.
 static UNVERIFIED_DAEMON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -530,6 +538,17 @@ impl Client {
 
     pub async fn ledger(&self, mission: &MissionId) -> Result<LedgerView, String> {
         self.call(Method::GET, &format!("/api/missions/{}/ledger", segment(mission.as_str())), &[], None).await
+    }
+
+    /// What a mission's work took (`GET /api/missions/{id}/score`). Reading the logs of a long mission takes a while.
+    pub async fn score(&self, mission: &MissionId) -> Result<ScoreView, String> {
+        let path = format!("/api/missions/{}/score", segment(mission.as_str()));
+        match self.call_with_timeout(Method::GET, &path, &[], None, SCORE_TIMEOUT).await {
+            Ok(view) => Ok(view),
+            // Only a daemon from before scorecards has no such route.
+            Err(e) if e == NO_SUCH_PATH => Err(OLDER_DAEMON_SCORE.to_string()),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn inbox(&self) -> Result<Vec<InboxEntry>, String> {
@@ -1154,6 +1173,40 @@ mod tests {
         let refused = json(&ErrorBody { error: "Missing or wrong access token.".into() });
         let (client, _) = start(Script::default().route("POST", "/api/login-codes", 401, refused)).await;
         assert_eq!(client.login_code().await.unwrap_err(), "Missing or wrong access token.");
+    }
+
+    #[tokio::test]
+    async fn a_score_is_asked_of_the_mission_and_an_older_daemon_is_told_apart() {
+        use loom_agent::runtime::{ScoreView, SessionScore};
+        use loom_core::scorecard::Scorecard;
+        let card = Scorecard { steps: 6, finished: true, steps_to_finish: Some(6), calls: 7, ..Scorecard::default() };
+        let view = ScoreView {
+            mission: MissionId::from("m-1"),
+            sessions: vec![SessionScore {
+                session: SessionId::from("s-1"),
+                role: "lead".into(),
+                parent: None,
+                card: card.clone(),
+            }],
+            total: card,
+        };
+        let (client, shared) = start(Script::default().route("GET", "/api/missions/m-1/score", 200, json(&view))).await;
+        assert_eq!(client.score(&MissionId::from("m-1")).await.unwrap(), view);
+        let seen = shared.lock().unwrap().seen.clone();
+        assert_eq!((seen[0].method.as_str(), seen[0].target.as_str()), ("GET", "/api/missions/m-1/score"));
+
+        // A daemon from before scorecards answers as it does to any unknown path: say what to do.
+        let unknown = json(&ErrorBody { error: "There is no such path on the loom daemon.".into() });
+        let (client, _) = start(Script::default().route("GET", "/api/missions/m-1/score", 404, unknown)).await;
+        assert_eq!(
+            client.score(&MissionId::from("m-1")).await.unwrap_err(),
+            "The running daemon is older than this `loom` and cannot score a mission. Restart it (`loom down`, then `loom up`) and run `loom score` again."
+        );
+
+        // A mission that does not exist is the daemon's own sentence.
+        let none = json(&ErrorBody { error: "There is no mission m-1.".into() });
+        let (client, _) = start(Script::default().route("GET", "/api/missions/m-1/score", 404, none)).await;
+        assert_eq!(client.score(&MissionId::from("m-1")).await.unwrap_err(), "There is no mission m-1.");
     }
 
     #[tokio::test]

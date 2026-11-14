@@ -272,6 +272,8 @@ export function evictionWords(e) {
   if (a.stub !== undefined) return `stub: ${oneLine(a.stub && a.stub.text !== undefined ? a.stub.text : a.stub, 120)}`;
   if (a === "drop" || a.drop !== undefined) return "dropped";
   if (a === "drop_reasoning" || a.drop_reasoning !== undefined) return "reasoning dropped";
+  // A fresh start takes a finish or conclude call out of the window together with its result.
+  if (a === "remove" || a.remove !== undefined) return "call and result out of view";
   if (typeof a.type === "string") return a.type.replace(/_/g, " ");
   if (typeof a === "string") return a.replace(/_/g, " ");
   return "folded";

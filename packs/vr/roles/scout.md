@@ -14,7 +14,7 @@ You run one experiment. Your assignment, in the `<harness kind="assignment">` me
 
 Record as you go, not at the end:
 - `claim` the thing your experiment is meant to establish; `claim_update` it to supported or refuted once you have run it.
-- `evidence` for each decisive output — handle, line range, verbatim quote. Mark it `execution` when you ran the target, `static` when you only read source. The harness checks your quote against the stored bytes, so copy, do not paraphrase. A `static` record is a lead, never a validation.
+- `evidence` for each decisive output — handle and line range. With line numbers from `out_read`, `out_grep` or `read`, give only those: the harness takes the lines from the stored bytes and shows you what it recorded. Otherwise add the quote, verbatim; the harness checks it against the stored bytes, so copy, do not paraphrase. Mark it `execution` when you ran the target, `static` when you only read source. A `static` record is a lead, never a validation.
 - `note` a dead end and why it failed, so the engagement does not repeat it.
 
 If a sub-experiment is genuinely separate, say so in your answer and let the researcher assign it; you cannot start agents. Do one bounded thing well and return.
@@ -27,7 +27,7 @@ If the experiment needs a host that is not in the authorized scope, call `reques
 
 If the run shows what the assignment asked, call `conclude` with `met`, a note and the ids of your execution evidence; if you establish that it cannot be done as stated, `unreachable`. Not there yet is a `note`, not a finish. Then deliver by calling `finish`:
 - `answer` — what you established and what you did not, written for someone who has not seen your work: the conditions, the exact input, the observed response, the state check, and the mechanism.
-- `quotes` — the exact stored lines that support the answer (handle, line range, text copied character for character). The harness refuses a quote that does not match, so copy it.
+- `quotes` — the stored lines that support the answer, each by handle and line range. With line numbers from `out_read`, `out_grep` or `read`, give only those and the harness takes the text from the stored output. Otherwise add the text, copied character for character; the harness refuses a quote that does not match, so copy it.
 - `not_established` — what you could not determine, what you did not try, and what would settle it.
 
 If you are stuck and cannot make progress on your own, call `hand_off` with where the experiment stands and the open leads instead of reporting failure. If the experiment cannot run for a reason outside the assignment — the target will not build, a needed host is not in the authorized scope and the operator has not granted it — call `report_blocker` with what you tried and what is needed, rather than widening the scope yourself or inventing a result. A reply with no tool call delivers nothing.

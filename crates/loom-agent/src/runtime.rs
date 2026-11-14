@@ -437,6 +437,12 @@
 //!   file yet has an empty ledger). The id
 //!   must be the mission of a known session, checked before a path is made from it (`There is no
 //!   mission {id}.`).
+//! - `score(mission)`: what the mission's work took, as a [`ScoreView`]: `loom_core::scorecard::score`
+//!   over `log::read_records` of each of its sessions (the lead first, then the others, oldest first),
+//!   and `total`, the lead's card with every other session's added (`Scorecard::add`). The logs are
+//!   read on a blocking thread: a mission can have many, and a fork's begins with a copy of its
+//!   parent's. The id is checked as for `ledger`. It counts records and judges nothing: whether the
+//!   result was right is not in a log.
 //! - `inbox()`: open items, oldest first. `net(id, limit)`: the last `limit` entries.
 //! - `health()`: for every profile, `client.health()` and what discovery last reported.
 //!
@@ -477,7 +483,9 @@
 //!   harness's, only the adopted attempt's files reach the workspace; a read-only role and a
 //!   workspace past the limit are refused and leave no agent and no directory; `runs_of`;
 //!   `with_copies`;
-//! - `records` paging and `window` totals; `ledger` after a goal was set by the first message.
+//! - `records` paging and `window` totals; `ledger` after a goal was set by the first message;
+//! - `score`: a mission whose finish a verifier accepted (the lead's card, the verifier's, the total);
+//!   a mission no session belongs to.
 
 use crate::pack::{self, Packs, PromptEnv, RoleDef};
 use crate::rtools::{
@@ -497,6 +505,7 @@ use loom_core::event::{
 use loom_core::journal::{self, Journal};
 use loom_core::ledger::LedgerState;
 use loom_core::log::{read_records, Durability, PageReader, SessionLog, StoredRecord};
+use loom_core::scorecard::{self, Scorecard};
 use loom_core::weave::{render_brief, weave, WindowItem};
 use loom_core::{now_ms, BlobId, BlobRef, BlobStore, CallId, MissionId, SessionId};
 use loom_model::{ChatRequest, Discovered, Limiter, ModelClient, ModelError, Priority, StreamEvent, ToolChoice};
@@ -685,6 +694,26 @@ impl LedgerView {
         }
         out
     }
+}
+
+/// The scorecard of one session of a mission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionScore {
+    pub session: SessionId,
+    pub role: String,
+    #[serde(default)]
+    pub parent: Option<SessionId>,
+    pub card: Scorecard,
+}
+
+/// What a mission's work took (see [`Runtime::score`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScoreView {
+    pub mission: MissionId,
+    /// The lead first, then the other sessions, oldest first.
+    pub sessions: Vec<SessionScore>,
+    /// The lead's card with every other session's added: the result is the lead's, the cost everyone's.
+    pub total: Scorecard,
 }
 
 /// What became of a rule, an approval or a withdrawal the operator sent (see [`Runtime::add_rule`]).
@@ -4460,6 +4489,40 @@ impl Runtime {
         })
     }
 
+    pub async fn score(&self, mission: &MissionId) -> Result<ScoreView, String> {
+        self.inner.check_open()?;
+        let mut sessions: Vec<SessionMeta> =
+            self.inner.st().known.values().filter(|k| &k.meta.mission == mission).map(|k| k.meta.clone()).collect();
+        // The id comes from a URL: only a mission some known session belongs to is looked at.
+        if sessions.is_empty() {
+            return Err(format!("There is no mission {}.", mission.as_str()));
+        }
+        sessions
+            .sort_by(|a, b| (a.parent.is_some(), a.created_ms, &a.id).cmp(&(b.parent.is_some(), b.created_ms, &b.id)));
+        let paths = self.inner.paths.clone();
+        let mission = mission.clone();
+        let scored = tokio::task::spawn_blocking(move || {
+            let mut scored = Vec::with_capacity(sessions.len());
+            for meta in sessions {
+                let records = read_records(&paths.session_log(&meta.id)).map_err(|e| e.to_string())?.records;
+                scored.push(SessionScore {
+                    session: meta.id,
+                    role: meta.role,
+                    parent: meta.parent,
+                    card: scorecard::score(&records),
+                });
+            }
+            Ok::<_, String>(scored)
+        })
+        .await
+        .map_err(|e| format!("The logs of mission {} could not be read: {e}", mission.as_str()))??;
+        let mut total = scored.first().map(|lead| lead.card.clone()).unwrap_or_default();
+        for other in scored.iter().skip(1) {
+            total.add(&other.card);
+        }
+        Ok(ScoreView { mission, sessions: scored, total })
+    }
+
     pub fn net(&self, id: &SessionId, limit: usize) -> Result<Vec<NetEntry>, String> {
         self.inner.check_open()?;
         if !self.inner.st().known.contains_key(id) {
@@ -6077,7 +6140,213 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_finish_with_real_children_returns_the_objections_and_the_work_continues() {
+    async fn score_counts_each_session_of_a_mission_and_adds_the_others_to_the_leads() {
+        let e = env_with(
+            Script::new(
+                |body, _| if has_tool(body, "verdict") { verifier_turn(body, true) } else { finish("lead done") },
+            ),
+            false,
+            |c| c.agents.verify_finish = true,
+        )
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))).await;
+        let view = e.rt.score(&info.meta.mission).await.unwrap();
+        assert_eq!(view.mission, info.meta.mission);
+        // The lead first, then the verifier its finish gate started.
+        let who: Vec<(&str, Option<&SessionId>)> =
+            view.sessions.iter().map(|s| (s.role.as_str(), s.parent.as_ref())).collect();
+        assert_eq!(who, vec![("lead", None), ("verifier", Some(&id))]);
+        assert_eq!(view.sessions[0].session, id);
+        let lead = &view.sessions[0].card;
+        assert_eq!((lead.steps, lead.steps_to_finish, lead.calls, lead.malformed_calls), (1, Some(1), 1, 0));
+        assert_eq!((lead.finish_calls, lead.finish_refusals, lead.verifier_accepts, lead.unrecorded), (1, 0, 1, false));
+        // The verifier looked, then gave its verdict: two steps of the mission's, no finish of its own.
+        let verifier = &view.sessions[1].card;
+        assert_eq!((verifier.steps, verifier.calls, verifier.finished, verifier.finish_calls), (2, 2, false, 0));
+        // The total is the lead's result at everyone's cost.
+        let mut total = lead.clone();
+        total.add(verifier);
+        assert_eq!(view.total, total);
+        assert_eq!(
+            (view.total.steps, view.total.steps_to_finish, view.total.verifier_accept_rate()),
+            (3, Some(1), Some(1.0))
+        );
+        // The id comes from a URL: one that no session belongs to reaches no path.
+        let err = e.rt.score(&MissionId::from("../../etc")).await.unwrap_err();
+        assert_eq!(err, "There is no mission ../../etc.");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_finish_with_real_children_starts_the_lead_afresh_on_what_the_check_found() {
+        let e = env_with(
+            Script::new(move |body, _| {
+                if has_tool(body, "verdict") {
+                    return verifier_turn(body, false);
+                }
+                // The lead works, gives up in a finish, and, started afresh, goes on working.
+                if mentions(body, "What the check found") {
+                    return Action::Stall { ms: 600_000 };
+                }
+                match tool_msgs(body) {
+                    0 => Action::Reply(
+                        Reply::tool("bash", json!({"command": "echo WORKMARK"}).to_string())
+                            .with_text("PLANMARK: one look, then stop."),
+                    ),
+                    _ => Action::Reply(
+                        Reply::tool("finish", json!({"answer": "GIVEUPMARK: no result is possible."}).to_string())
+                            .with_text("DESPAIRMARK: nothing more can be done here.")
+                            .with_reasoning("REASONMARK: every route is exhausted."),
+                    ),
+                }
+            }),
+            false,
+            |c| c.agents.verify_finish = true,
+        )
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "What the check found");
+        until("the lead was started afresh", || e.server.requests().iter().any(afresh)).await;
+        let request = e.server.requests().into_iter().find(afresh).unwrap();
+        // What the check found is there, as a brief; the run the lead made is still in view.
+        assert!(mentions(&request, "no test ran"), "{request}");
+        assert!(mentions(&request, "treat the goal as unsolved"), "{request}");
+        assert!(mentions(&request, "WORKMARK"), "{request}");
+        // Nothing of the attempt is: not the call, not its result, not what the lead said or thought around it.
+        for gone in ["GIVEUPMARK", "DESPAIRMARK", "PLANMARK", "REASONMARK", "did not accept it"] {
+            assert!(!mentions(&request, gone), "{gone} is still in view: {request}");
+        }
+        assert_eq!(tool_msgs(&request), 1, "the finish call left the window with its result: {request}");
+        let hud = hud_of(&request);
+        assert!(hud.contains("Finish: the check raised an objection"), "{hud}");
+        assert!(!hud.contains("GIVEUPMARK") && !hud.contains("reject"), "{hud}");
+        // Folded, not deleted: the record of the attempt is in the log, after it the re-weave that folded it.
+        assert!(e.has(
+            &id,
+            |ev| matches!(ev, Event::ToolResult(t) if t.name == "finish" && t.text.contains("did not accept it"))
+        ));
+        assert!(e.has(
+            &id,
+            |ev| matches!(ev, Event::ToolCall(c) if c.name == "finish" && c.args.to_string().contains("GIVEUPMARK"))
+        ));
+        let folds: Vec<loom_core::event::Reweave> = e
+            .records(&id)
+            .into_iter()
+            .filter_map(|r| if let Event::Reweave(w) = r.event { Some(w) } else { None })
+            .collect();
+        assert_eq!(folds.len(), 1, "one rejection, one fresh start");
+        assert_eq!(folds[0].reason, texts::FRESH_START_REASON);
+        // The brief carries the frontier picture, as a re-weave brief does, and no count of anything refused.
+        assert!(folds[0].brief.contains("ground covered"), "{}", folds[0].brief);
+        assert!(folds[0].brief.contains("Where the work stands:"), "{}", folds[0].brief);
+        assert!(folds[0].brief.contains("a failed attempt rules out that attempt, not the approach"));
+        assert!(folds[0].evictions.iter().any(|x| x.action == loom_core::event::EvictAction::Remove));
+        let ledger = e.rt.ledger(&info.meta.mission).unwrap();
+        let verdicts: Vec<Option<bool>> = ledger.state.finishes.iter().map(|f| f.accepted).collect();
+        assert_eq!(verdicts, vec![Some(false)]);
+        assert_eq!(ledger.state.finishes[0].objections, vec!["no test ran".to_string()]);
+        // The objection is an open obligation until new execution evidence is recorded after it.
+        assert_eq!(ledger.state.obligations.len(), 1);
+        assert_eq!(ledger.state.obligations[0].kind, loom_core::ledger::ObligationKind::Objection);
+        assert!(ledger.state.obligations[0].outcome.is_none());
+        assert!(e.rt.inbox().is_empty(), "a rejection never reaches the operator");
+        assert_eq!(e.children(&id).len(), 1);
+        e.rt.shutdown().await;
+    }
+
+    /// After a rejection with a fresh start no model-visible text about the harness's own earlier notes or
+    /// about rejections is left: the nudge written before the finish is folded out with the rest.
+    #[tokio::test]
+    async fn a_fresh_start_leaves_no_harness_note_about_the_attempt_in_view() {
+        let e = env_with(
+            Script::new(move |body, _| {
+                if has_tool(body, "verdict") {
+                    return verifier_turn(body, false);
+                }
+                if mentions(body, "What the check found") {
+                    return Action::Stall { ms: 600_000 };
+                }
+                let replies =
+                    body["messages"].as_array().map_or(0, |m| m.iter().filter(|m| m["role"] == "assistant").count());
+                match replies {
+                    // A reply without a tool call: the harness answers with a nudge note.
+                    0 => Action::Reply(Reply::text("NUDGEMARK: that is all.")),
+                    1 => call("bash", json!({"command": "echo WORKMARK"})),
+                    _ => finish("GIVEUPMARK: done."),
+                }
+            }),
+            false,
+            |c| c.agents.verify_finish = true,
+        )
+        .await;
+        let _info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "What the check found");
+        until("the lead was started afresh", || e.server.requests().iter().any(afresh)).await;
+        // Before the fold the note was in view.
+        let before = e.server.requests().into_iter().find(|b| mentions(b, "WORKMARK") && !afresh(b)).unwrap();
+        assert!(mentions(&before, "kind=\\\"nudge\\\""), "{before}");
+        let after = e.server.requests().into_iter().find(afresh).unwrap();
+        assert!(mentions(&after, "WORKMARK"), "{after}");
+        for gone in ["kind=\\\"nudge\\\"", "kind=\\\"verdict\\\"", "NUDGEMARK", "GIVEUPMARK", "did not accept"] {
+            assert!(!mentions(&after, gone), "{gone} is still in view: {after}");
+        }
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_fresh_start_keeps_what_was_delivered_and_leaves_the_attempt_reachable() {
+        let e = env_with(
+            Script::new(move |body, _| {
+                if has_tool(body, "verdict") {
+                    // The first result is accepted, the one after it is not.
+                    return verifier_turn(body, !mentions(body, "SECONDANSWER"));
+                }
+                if mentions(body, "What the check found") {
+                    // Started afresh, the lead looks its attempt up in the record, then works on.
+                    return match tool_msgs(body) {
+                        1 => call("log_search", json!({"pattern": "SECONDANSWER", "in": "calls"})),
+                        _ => Action::Stall { ms: 600_000 },
+                    };
+                }
+                if mentions(body, "MOREMARK") {
+                    finish("SECONDANSWER: nothing more is possible.")
+                } else {
+                    finish("FIRSTANSWER: the first part is done.")
+                }
+            }),
+            false,
+            |c| c.agents.verify_finish = true,
+        )
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("the first result was delivered", || inbox_kinds(&e).contains(&InboxKind::Finished)).await;
+        e.rt.send_message(&id, "MOREMARK: now the second part").await.unwrap();
+        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "What the check found");
+        until("the lead was started afresh", || e.server.requests().iter().any(afresh)).await;
+        let request = e.server.requests().into_iter().find(afresh).unwrap();
+        // The delivered result and its call are not an attempt: they stay. The rejected one is gone.
+        assert!(mentions(&request, "FIRSTANSWER"), "{request}");
+        assert!(mentions(&request, "MOREMARK"), "{request}");
+        assert!(!mentions(&request, "SECONDANSWER"), "{request}");
+        assert!(!mentions(&request, "did not accept it"), "{request}");
+        assert_eq!(tool_msgs(&request), 1, "{request}");
+        // The record still has the attempt: a search of the session finds the call.
+        until("the search answered", || {
+            e.server.requests().iter().any(|b| afresh(b) && tool_msgs(b) == 2 && mentions(b, "SECONDANSWER"))
+        })
+        .await;
+        let kinds = e.kinds(&id);
+        assert_eq!(kinds.iter().filter(|k| *k == "reweave").count(), 1, "{kinds:?}");
+        assert!(!kinds.iter().any(|k| k == "cache_break"), "a fresh start is a new epoch, not a break: {kinds:?}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn with_the_fresh_start_off_a_rejected_finish_stays_in_view_with_its_objections() {
         let e = env_with(
             Script::new(move |body, _| {
                 if has_tool(body, "verdict") {
@@ -6091,7 +6360,10 @@ mod tests {
                 }
             }),
             false,
-            |c| c.agents.verify_finish = true,
+            |c| {
+                c.agents.verify_finish = true;
+                c.agents.fresh_start = false;
+            },
         )
         .await;
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
@@ -6103,16 +6375,10 @@ mod tests {
                 .any(|b| has_tool(b, "finish") && mentions(b, "did not accept it") && mentions(b, "no test ran"))
         })
         .await;
+        assert!(!e.has(&id, |ev| matches!(ev, Event::Reweave(_))));
+        assert!(e.server.requests().iter().all(|b| !mentions(b, "What the check found")));
         let ledger = e.rt.ledger(&info.meta.mission).unwrap();
-        let verdicts: Vec<Option<bool>> = ledger.state.finishes.iter().map(|f| f.accepted).collect();
-        assert_eq!(verdicts, vec![Some(false)]);
-        assert_eq!(ledger.state.finishes[0].objections, vec!["no test ran".to_string()]);
-        // The objection is an open obligation until new execution evidence is recorded after it.
         assert_eq!(ledger.state.obligations.len(), 1);
-        assert_eq!(ledger.state.obligations[0].kind, loom_core::ledger::ObligationKind::Objection);
-        assert!(ledger.state.obligations[0].outcome.is_none());
-        assert!(e.rt.inbox().is_empty(), "a rejection never reaches the operator");
-        assert_eq!(e.children(&id).len(), 1);
         e.rt.shutdown().await;
     }
 

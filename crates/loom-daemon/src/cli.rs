@@ -51,6 +51,8 @@
 //! - `inbox`: `render::inbox_list`. `answer <item> <text…>`: `client.answer`; `answered {item}`.
 //! - `ledger <session|mission>`: the ledger's `markdown`, then one line for each of `LedgerView::notices`
 //!   (entries written by a newer loom that are not shown, an ignored torn tail, entries past the head record).
+//! - `score <session|mission> [--json]`: `client.score` of the mission, as `render::score_table`; with
+//!   `--json` the `ScoreView` itself, indented, for a script that compares runs.
 //! - `window <session>`: `render::window_table`. `net <session> [-n <limit>]`: `render::net_table`, then
 //!   `render::granted_hosts_line` from the mission's ledger (left out when the ledger cannot be read).
 //! - `out <handle> [--lines <a>:<b>]`: the stored output's lines (all of it, paged 5 000 lines at a
@@ -198,6 +200,12 @@ pub enum Command {
     Answer(AnswerArgs),
     /// Print a mission's ledger
     Ledger(SessionArg),
+    /// Count what a mission's work took: steps, refused finishes, malformed calls, verdicts
+    ///
+    /// One row per session of the mission and a total. The counts are of the records in the logs:
+    /// they say what the work cost and how often the harness sent it back, not whether the result
+    /// is right.
+    Score(ScoreArgs),
     /// Show what is in a session's context
     Window(SessionArg),
     /// Show a session's network requests and how each was decided
@@ -323,6 +331,15 @@ pub struct ArchiveArgs {
     pub session: String,
     #[arg(long)]
     pub undo: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ScoreArgs {
+    /// A session id, the beginning of one, `last`, or a mission id
+    pub session: String,
+    /// Print the counts as JSON, for a script that compares runs
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1124,6 +1141,17 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             }
             block(&text).map(|()| 0)
         }
+        Command::Score(a) => {
+            let c = client_of(&paths)?;
+            let mission = c.mission_of(&a.session).await?;
+            let view = c.score(&mission).await?;
+            let text = if a.json {
+                serde_json::to_string_pretty(&view).map_err(|e| format!("The score could not be written: {e}"))?
+            } else {
+                render::score_table(&view, &style())
+            };
+            block(&text).map(|()| 0)
+        }
         Command::Window(a) => {
             let c = client_of(&paths)?;
             let id = c.resolve(&a.session).await?;
@@ -1546,9 +1574,14 @@ mod tests {
         assert!(matches!(ok(&["reweave", "s-1"]), Command::Reweave(_)));
         assert!(matches!(ok(&["ledger", "m-1"]), Command::Ledger(_)));
         assert!(matches!(ok(&["window", "s-1"]), Command::Window(_)));
-        for cmd in ["stop", "resume", "reweave", "archive", "ledger", "window", "net", "answer", "out"] {
+        for cmd in ["stop", "resume", "reweave", "archive", "ledger", "score", "window", "net", "answer", "out"] {
             rejected(&[cmd]);
         }
+        let Command::Score(a) = ok(&["score", "last"]) else { panic!("not score") };
+        assert_eq!((a.session.as_str(), a.json), ("last", false));
+        let Command::Score(a) = ok(&["score", "m-1", "--json"]) else { panic!("not score") };
+        assert_eq!((a.session.as_str(), a.json), ("m-1", true));
+        rejected(&["score", "s-1", "--csv"]);
         let Command::Archive(a) = ok(&["archive", "s-1", "--undo"]) else { panic!("not archive") };
         assert!(a.undo);
         let Command::Archive(a) = ok(&["archive", "s-1"]) else { panic!("not archive") };

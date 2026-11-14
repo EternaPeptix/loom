@@ -33,7 +33,10 @@
 //!   creates an open claim, so it never banks.)
 //! - `evidence`:
 //!   1. `gate::check_quotes(&ctx.blobs, &[Quote { handle, start, end, text: quote }])`; on `Err(text)`
-//!      → error `{text}\nNothing was attached.`
+//!      → error `{text}\nNothing was attached.` `quote` may be left out (or blank): the quote is then
+//!      by lines, the lines `start`-`end` as the stored output has them (`gate`). This refusal and the
+//!      next carry `meta[META_REFUSAL] = REFUSAL_QUOTE` (what a scorecard counts as a step spent on a
+//!      quote).
 //!   2. `rtools::observed_producer` (the rule `finish` applies to its quotes as well):
 //!      `shared.orch.producer(mission, blob)`; `None` → error ``{handle} was not produced by a tool
 //!      call of this mission, so it cannot be used as evidence. Evidence is a quote from the output
@@ -58,7 +61,11 @@
 //!
 //!   Outcome `evidence {id} attached to {claim}`. Text: `{id} ({supports|undermines}; {execution|static}:
 //!   {tool} call in {session}) attached to {claim}.` and, when the claim is still `Open`, the line
-//!   `The claim is still open — set its status with `claim_update`.`
+//!   `The claim is still open — set its status with `claim_update`.` After a quote by lines, what was
+//!   recorded follows, since nothing compared the line numbers with a text and a miscounted range shows
+//!   nowhere else: `Recorded from {handle}, lines {start}-{end}, as stored:`, each line of the text as
+//!   `| {line}`, and `If these are not the lines you meant, attach the right ones.` A quote given with
+//!   its text is not played back: the model wrote it.
 //! - `ledger`: `ToolOutput::ok("ledger", Body::Raw(state.render_markdown().into_bytes()))`.
 //!
 //! The id in each outcome is read from the returned state (the last item of the kind).
@@ -69,14 +76,15 @@
 //! passed through verbatim, bad `step` combinations, empty plan step, `reflect` with a blank field, evidence with a wrong quote,
 //! an unknown handle, an output with no producer, the output of `ledger` and of `log_search` cited
 //! directly and as a view shows it, the diff of an `edit`); `evidence` kind by producer class, also
-//! when the quote is copied from a view of a command's output; a session without a mission gets
-//! `NO_MISSION` from every tool.
+//! when the quote is copied from a view of a command's output; evidence by lines: what is recorded and
+//! played back, its refusals, and the producer rule applying to it as well; a session without a mission
+//! gets `NO_MISSION` from every tool.
 
 use super::{observed_producer, Shared, NO_MISSION};
 use crate::gate::{check_quotes, Quote};
 use crate::{frontier, texts};
 use async_trait::async_trait;
-use loom_core::event::{ToolClass, ToolSpec};
+use loom_core::event::{ToolClass, ToolSpec, META_REFUSAL, REFUSAL_QUOTE};
 use loom_core::ledger::{ClaimStatus, EvidenceInput, EvidenceKind, LedgerOp, LedgerState, StepStatus};
 use loom_tools::params::{opt, req, spec};
 use loom_tools::{Body, Tool, ToolCtx, ToolOutput};
@@ -341,14 +349,14 @@ impl Tool for Evidence {
     fn spec(&self) -> ToolSpec {
         spec(
             "evidence",
-            "Attach evidence to a claim: text copied exactly from the stored output of a command you ran or a file you read. The harness checks that the quoted text occurs in the lines you name, and refuses evidence that does not check. Quote whole lines, or at least 8 non-space characters of a line; line numbers copied along with the text must be the output's own. `handle` is the out:… id shown in the header of the result.",
+            "Attach evidence to a claim: lines of the stored output of a command you ran or a file you read. Two ways. By line numbers: give `handle`, `start` and `end` and leave `quote` out; the harness takes those lines from the stored output (at most 20) and shows you what it recorded. Do this when you have the numbers from `out_read`, `out_grep` or `read`. By text: also give `quote`, copied exactly; the harness looks for it within the lines you name (the range may be wider than the text) and refuses it if it does not occur. Quote whole lines, or at least 8 non-space characters of a line; line numbers copied along with the text must be the output's own. `handle` is the out:… id shown in the header of the result.",
             ToolClass::State,
             &[
                 req("claim", "string", "The claim this bears on, for example c1."),
                 req("handle", "string", "The stored output the quote is from, for example out:7f3a9c1e."),
-                req("start", "integer", "First line of the quoted text in that output.").min(1),
-                req("end", "integer", "Last line of the quoted text in that output.").min(1),
-                req("quote", "string", "The text, copied exactly from those lines."),
+                req("start", "integer", "First line of the quote in that output.").min(1),
+                req("end", "integer", "Last line of the quote in that output.").min(1),
+                opt("quote", "string", "Leave out to quote lines start-end whole, as stored. Or the text, copied exactly from within those lines."),
                 req("note", "string", "One sentence: what this shows about the claim."),
                 opt("supports", "boolean", "false when the quote counts against the claim.").default(json!(true)),
             ],
@@ -364,11 +372,15 @@ impl Tool for Evidence {
         let quote = str_arg(args, "quote").unwrap_or("").to_string();
         let note = str_arg(args, "note").unwrap_or("").trim().to_string();
         let supports = args.get("supports").and_then(Value::as_bool).unwrap_or(true);
+        // Without its text the quote is the lines named: the result then shows what was recorded.
+        let by_lines = quote.trim().is_empty();
 
+        // A refusal over the quote says so in the record: a scorecard counts the steps spent on quotes.
+        let quote_refused = |text: String| ToolOutput::error(text).with_meta(META_REFUSAL, json!(REFUSAL_QUOTE));
         let q = Quote { handle: handle.clone(), start, end, text: quote };
         let verified = match check_quotes(&ctx.blobs, &[q]) {
             Ok(v) => v,
-            Err(text) => return ToolOutput::error(format!("{text}\nNothing was attached.")),
+            Err(text) => return quote_refused(format!("{text}\nNothing was attached.")),
         };
         let Some(v) = verified.into_iter().next() else {
             return ToolOutput::error(
@@ -378,9 +390,10 @@ impl Tool for Evidence {
         // Only observations are evidence.
         let producer = match observed_producer(shared, mission, &handle, &v.blob).await {
             Ok(p) => p,
-            Err(text) => return ToolOutput::error(text),
+            Err(text) => return quote_refused(text),
         };
         let kind = if producer.class == ToolClass::Exec { EvidenceKind::Execution } else { EvidenceKind::Static };
+        let recorded = by_lines.then(|| recorded_lines(&handle, v.start, v.end, &v.text));
         let input = EvidenceInput {
             claim: claim.clone(),
             kind,
@@ -405,11 +418,27 @@ impl Tool for Evidence {
                 if state.claims.iter().any(|c| c.id == claim && c.status == ClaimStatus::Open) {
                     text.push_str("\nThe claim is still open — set its status with `claim_update`.");
                 }
+                if let Some(recorded) = recorded {
+                    text.push('\n');
+                    text.push_str(&recorded);
+                }
                 ToolOutput::ok(format!("evidence {id} attached to {claim}"), Body::Message(text))
             }
             Err(text) => ToolOutput::error(text),
         }
     }
+}
+
+/// What a quote by lines recorded, for the model to compare with what it meant: nothing checked its
+/// line numbers against a text, so a miscounted range shows here and nowhere else.
+fn recorded_lines(handle: &str, start: u64, end: u64, text: &str) -> String {
+    let mut out = format!("Recorded from {handle}, lines {start}-{end}, as stored:");
+    for line in text.split('\n') {
+        out.push_str("\n| ");
+        out.push_str(line);
+    }
+    out.push_str("\nIf these are not the lines you meant, attach the right ones.");
+    out
 }
 
 #[async_trait]
@@ -644,6 +673,70 @@ mod tests {
         assert!(e.attested);
         assert_eq!(e.lines, Some((1, 1)));
         assert_eq!(e.call_id.as_str(), "call-0");
+    }
+
+    #[tokio::test]
+    async fn evidence_by_lines_records_the_stored_lines_and_plays_them_back() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "the suite fails"})).await;
+        let h = rig.output(
+            "running 3 tests\n\n  test a ... FAILED   \n  left: 1, right: 2\n\ndone\n",
+            "bash",
+            ToolClass::Exec,
+        );
+        // No `quote`: the lines are taken from the stored output, blank ends left out, indentation kept.
+        let t = ok(&rig, "evidence", json!({"claim": "c1", "handle": h, "start": 2, "end": 5, "note": "the failure"}))
+            .await;
+        assert!(t.contains("e1 (supports; execution: bash call in s-test) attached to c1."), "{t}");
+        let played = format!(
+            "Recorded from {h}, lines 3-4, as stored:\n|   test a ... FAILED\n|   left: 1, right: 2\nIf these are not the lines you meant, attach the right ones."
+        );
+        assert!(t.contains(&played), "{t}");
+        let state = rig.shared.ledger().unwrap();
+        let e = &state.evidence[0].input;
+        assert_eq!(e.lines, Some((3, 4)));
+        assert_eq!(e.quote.as_deref(), Some("  test a ... FAILED\n  left: 1, right: 2"));
+        assert!(e.attested);
+        assert_eq!(e.kind, loom_core::ledger::EvidenceKind::Execution);
+        // A blank or null `quote` is the same; a quote given with its text is not played back.
+        let t = ok(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": h, "start": 6, "end": 6, "quote": "  ", "note": "the end"}),
+        )
+        .await;
+        assert!(t.contains(&format!("Recorded from {h}, lines 6-6, as stored:\n| done\n")), "{t}");
+        let t = ok(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": h, "start": 1, "end": 6, "quote": "running 3 tests", "note": "the start"}),
+        )
+        .await;
+        assert!(!t.contains("Recorded from"), "{t}");
+
+        // Its refusals: the range is taken at its word, and nothing is attached. The record says a quote
+        // was the reason, as it does for a quote given with text that does not occur.
+        let t = refused(&rig, "evidence", json!({"claim": "c1", "handle": h, "start": 5, "end": 9, "note": "n"})).await;
+        assert!(t.contains("end 9 is past its end") && t.contains("\nNothing was attached."), "{t}");
+        for args in [
+            json!({"claim": "c1", "handle": h, "start": 5, "end": 9, "note": "n"}),
+            json!({"claim": "c1", "handle": h, "start": 1, "end": 6, "quote": "no such text here", "note": "n"}),
+        ] {
+            let r = rig.call("evidence", args).await;
+            assert_eq!(r.meta.get(loom_core::event::META_REFUSAL), Some(&json!(loom_core::event::REFUSAL_QUOTE)));
+        }
+        // A refusal for another reason (an unknown claim) is not one over a quote.
+        let r = rig.call("evidence", json!({"claim": "c9", "handle": h, "start": 6, "end": 6, "note": "n"})).await;
+        assert_eq!(r.status, ToolStatus::Error, "{}", r.text);
+        assert!(!r.meta.contains_key(loom_core::event::META_REFUSAL));
+        let t = refused(&rig, "evidence", json!({"claim": "c1", "handle": h, "start": 5, "end": 5, "note": "n"})).await;
+        assert!(t.contains("are blank"), "{t}");
+        // The producer rule holds for it as for any quote: only an observation is evidence.
+        let own = rig.output("the model's own words\n", "ledger", ToolClass::Read);
+        let t =
+            refused(&rig, "evidence", json!({"claim": "c1", "handle": own, "start": 1, "end": 1, "note": "n"})).await;
+        assert!(t.contains("is the result of `ledger`"), "{t}");
+        assert_eq!(rig.shared.ledger().unwrap().evidence.len(), 3);
     }
 
     #[tokio::test]

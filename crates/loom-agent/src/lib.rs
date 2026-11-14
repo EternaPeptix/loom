@@ -9,8 +9,10 @@
 //! - [`texts`] everything the step loop itself says to the model
 //! - [`session`] one session: its log, its step loop, and its reactions to what happens to it
 //! - [`runtime`] every session of a loom home: starting, restoring, parents and children, the operator's actions
+//! - [`evalkit`] scripted models played against the runtime, and the scorecard of each run
 
 pub mod continuation;
+pub mod evalkit;
 pub mod frontier;
 pub mod gate;
 pub mod hud;

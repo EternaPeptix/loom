@@ -122,6 +122,7 @@ child_max_minutes = 120    # default time budget for a child
 max_nudges = 3             # stop-gate nudges or malformed replies in a row before the session is parked for you
 stall_steps = 30           # steps without a new ledger entry before the harness adds a stall note
 verify_finish = true       # a role with verify_finish has its finish attacked by its verifier first; false skips that for every role (the finish is marked "not verified")
+fresh_start = true         # when the verifier does not accept a finish, the lead starts afresh: the goal is open again (a new conclude needs a new run) and its window is folded with the attempt taken out of view (nothing is deleted); false keeps the rejection in view and the goal concluded
 invalid_calls_before_forcing = 3   # reserved: accepted, but nothing reads it and it has no effect
 unviewed_min_lines = 20    # outputs with at least this many lines never shown are listed in the HUD
 unavailable_notice_s = 300 # a model request still retrying after this long opens a non-blocking inbox item and notifies you (it closes by itself); 0 = never

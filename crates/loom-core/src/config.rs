@@ -258,6 +258,10 @@ pub struct AgentsCfg {
     pub stall_steps: u32,
     /// Run an independent verifier before a lead's `finish` is accepted.
     pub verify_finish: bool,
+    /// When that verifier does not accept a finish, start the lead afresh: reopen the goal and fold its
+    /// window, taking the attempt out of view (the records stay). False leaves the rejection in the
+    /// window and the goal concluded, as before this option existed.
+    pub fresh_start: bool,
     /// Reserved: accepted so that configs that set it load, but nothing reads it and it has no effect.
     pub invalid_calls_before_forcing: u32,
     /// Outputs with at least this many lines never shown are listed in the HUD.
@@ -284,6 +288,7 @@ impl Default for AgentsCfg {
             max_nudges: 3,
             stall_steps: 30,
             verify_finish: true,
+            fresh_start: true,
             invalid_calls_before_forcing: 3,
             unviewed_min_lines: 20,
             unavailable_notice_s: 300,

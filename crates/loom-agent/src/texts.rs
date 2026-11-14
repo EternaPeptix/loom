@@ -614,6 +614,51 @@ pub fn reweave_brief(ledger_brief: &str, frontier: Option<&str>) -> String {
     out
 }
 
+/// `Reweave::reason` of a fresh start: the fold made when a verifier did not accept a finish.
+pub const FRESH_START_REASON: &str = "finish not accepted";
+
+/// The `brief` of a fresh start: what the model reads in place of its own account of the attempt, at the
+/// point where everything before was folded. It names what the verifier found (`objections`, in its words)
+/// and how to go on, and never what the session had concluded or answered: that is what the fold takes out
+/// of view. `reopened` says the goal-met claim went back to open; `ledger_brief` is `LedgerState::brief`,
+/// empty for a session without a ledger. `frontier` is the rendered `frontier::render` block, exactly as a
+/// re-weave brief gets it (`None` without a ledger or with nothing to show). The brief carries no count and
+/// never says that a finish was made or rejected; it offers no `unreachable` conclusion (in a solvable pack
+/// that is the pack's rule, and elsewhere the finish refusals already name it).
+pub fn fresh_start_brief(objections: &[String], reopened: bool, frontier: Option<&str>, ledger_brief: &str) -> String {
+    let mut out = String::from(
+        "A check independent of you examined the work so far and did not find the goal established. From here you start afresh: your earlier messages are folded out of view and earlier tool output is shown in shortened form, so that you look at the problem itself again and not at an account of it. Nothing was deleted: each shortened result names its handle (out:…), `out_read` and `out_grep` open any part of it again, and `log_search` searches the whole session.",
+    );
+    let found: Vec<&str> = objections.iter().map(|o| o.trim()).filter(|o| !o.is_empty()).collect();
+    if !found.is_empty() {
+        out.push_str("\n\nWhat the check found missing or wrong:");
+        for o in &found {
+            // The verifier's words: further lines of a point cannot start a line of this brief.
+            out.push_str(&format!("\n- {}", loom_core::tagsafe::hang_lines(o)));
+        }
+    }
+    out.push_str(
+        "\n\nHow to go on: treat the goal as unsolved, not as decided either way. A route is closed only when a recorded run shows that it fails; one that was set aside without such a run is still open, and so is every route not tried yet. Work from what the check found: run the target, read what it did, and record each run with `evidence`.",
+    );
+    if !found.is_empty() {
+        out.push_str(" Each point above is an open obligation that only a run recorded from now on settles.");
+    }
+    if reopened {
+        out.push_str(" The goal is open again, so `conclude` it on such a run before you call `finish`.");
+    }
+    if let Some(frontier) = frontier {
+        out.push_str(
+            "\n\nWhat was folded is mostly attempts. Read them as ground covered, not as a verdict on the task: a failed attempt rules out that attempt, not the approach. What is established, ruled out with evidence, set aside and still open is below.\n\n",
+        );
+        out.push_str(frontier.trim_end());
+    }
+    if !ledger_brief.trim().is_empty() {
+        out.push_str("\n\nThe mission ledger at this point:\n");
+        out.push_str(ledger_brief.trim_end());
+    }
+    out
+}
+
 /// The instruction of a digest request, sent after the session's current stable prefix. It is appended after
 /// the stable messages of the request, so changing it changes no cached prefix of an existing session.
 pub const DIGEST_PROMPT: &str = "Some of your own earlier messages in this session are about to be folded out of view (tool output stays reachable through its handles, and the mission ledger stays as it is). Write a note to yourself that keeps the map of the work, not its history. Use these headings, each with a short list: Established (results a run has shown, with handles); Ruled out (only what a run disproved, with the exact boundary of what was tested and its handle); Tried, not ruled out (attempts that failed without disproving their approach, and what would have to change); Open leads (what you have not followed up yet, and where things are: files, lines, commands, handles); Next (what you decided to try next, and why). Do not retell what went wrong in order. Be specific and brief: at most 600 words. Do not call tools and do not address anyone.";
@@ -902,6 +947,10 @@ pub fn finish_not_accepted_tail(tools: &FinishTools) -> String {
     out
 }
 
+/// What follows the objections instead of [`finish_not_accepted_tail`] when the rejection also reopened the
+/// goal: the next finish needs a new conclusion first.
+pub const FINISH_REOPENED_TAIL: &str = "The mission is not finished, and the goal is open again. Each objection is now an open obligation: it is settled only by new execution evidence recorded after it (run the target again and record the run with `evidence`). Fix the problem, or show with a new run that the objection is wrong; then conclude the goal on that run and call finish again.";
+
 /// A non-blocking record that a finish was rejected `n` times since the last accepted one. Nothing is
 /// asked of the operator.
 /// No count: the model is never shown a rising tally of refused finishes. `solvable`: the pack refuses
@@ -957,9 +1006,18 @@ pub fn verification_fault_result(why: &str) -> String {
     format!("The result could not be verified: {why}. This is a fault of the harness, not a problem with your work. The result is recorded as unverified and was NOT delivered as finished. Keep working, or call finish again later: it is verified again.")
 }
 
-/// The HUD line saying why `finish` is closed, or `None` when it is not. `rejected` is the number of
-/// rejected finishes whose objections are still open.
+/// The HUD line saying why `finish` is closed, or `None` when it is not: a steady instruction with no
+/// count. `objection_open` says an objection of a finish verifier is an open obligation. With both, the
+/// goal was reopened by that check (a fresh start): the line says what leads to the next finish and
+/// nothing about the attempt. `unreachable` is offered only outside a solvable pack, and not in the
+/// reopened line, which names no way out.
 pub fn finish_status_line(goal_unconcluded: bool, objection_open: bool, solvable: bool) -> Option<String> {
+    if objection_open && goal_unconcluded {
+        return Some(
+            "Finish: the goal is open. Answer each open objection with a new run and record it, conclude the goal on that run, then finish."
+                .to_string(),
+        );
+    }
     if objection_open {
         return Some(if solvable {
             "Finish: the check raised an objection — answer it with a new run recorded with `evidence`.".to_string()
@@ -1363,6 +1421,73 @@ mod tests {
             assert!(DIGEST_PROMPT.contains(heading), "{heading}");
         }
         assert!(DIGEST_PROMPT.ends_with("at most 600 words. Do not call tools and do not address anyone."));
+    }
+
+    #[test]
+    fn a_fresh_start_brief_carries_what_was_found_and_nothing_of_the_attempt() {
+        let found = vec!["no test ran".to_string(), "  ".to_string(), "line 4 is wrong\nsee out:ab".to_string()];
+        let b = fresh_start_brief(&found, true, None, "Goal: ship it\n");
+        assert!(b.starts_with("A check independent of you examined the work so far"), "{b}");
+        // The verifier's points, blank ones left out, a second line hung under its point.
+        assert!(b.contains("What the check found missing or wrong:\n- no test ran\n- line 4 is wrong\n"), "{b}");
+        assert!(!b.contains("\nsee out:ab"), "{b}");
+        assert!(b.contains("How to go on: treat the goal as unsolved, not as decided either way."), "{b}");
+        assert!(b.contains("Each point above is an open obligation that only a run recorded from now on settles."));
+        assert!(b.contains("The goal is open again, so `conclude` it on such a run before you call `finish`."));
+        assert!(b.ends_with("The mission ledger at this point:\nGoal: ship it"), "{b}");
+        // It says where folded material is, and never speaks of a finish that was made or rejected.
+        assert!(b.contains("`out_read`") && b.contains("`log_search`"));
+        for word in ["reject", "not accept", "attempt", "again and again", "failed"] {
+            assert!(!b.to_lowercase().contains(word), "{word}: {b}");
+        }
+        // Without objections, a reopened goal or a ledger, those parts are left out.
+        let bare = fresh_start_brief(&[], false, None, " ");
+        assert!(!bare.contains("What the check found") && !bare.contains("Each point above"), "{bare}");
+        assert!(!bare.contains("conclude") && !bare.contains("mission ledger"), "{bare}");
+        assert!(bare.ends_with("record each run with `evidence`."), "{bare}");
+        assert!(!bare.chars().any(|c| c.is_ascii_digit()), "no count: {bare}");
+    }
+
+    #[test]
+    fn a_fresh_start_brief_carries_the_frontier_picture_of_a_reweave_brief() {
+        let block = "Where the work stands:\n- Established: 1";
+        let b = fresh_start_brief(&["no test ran".to_string()], true, Some(block), "Goal: ship it\n");
+        let reweave = reweave_brief("", Some(block));
+        // The same paragraph and block as a re-weave gives, before the ledger.
+        let map = reweave.split_once("\n\n").map(|(_, rest)| rest).unwrap_or_default();
+        assert!(b.contains(map), "{b}");
+        assert!(b.contains("a failed attempt rules out that attempt, not the approach"), "{b}");
+        let (at_map, at_ledger) = (b.find(block).unwrap_or(0), b.find("The mission ledger").unwrap_or(0));
+        assert!(0 < at_map && at_map < at_ledger, "{b}");
+        // No count, no finish made or rejected, and `unreachable` named nowhere: a solvable pack reads the
+        // same text.
+        let lower = b.to_lowercase();
+        for word in ["reject", "not accept", "unreachable"] {
+            assert!(!lower.contains(word), "{word}: {b}");
+        }
+        assert!(!b.contains("finish was") && !b.contains("finish that"), "{b}");
+        // Without a ledger there is no frontier and no paragraph about it.
+        assert!(!fresh_start_brief(&[], false, None, "").contains("ground covered"));
+    }
+
+    #[test]
+    fn the_finish_line_says_what_leads_to_the_next_finish() {
+        assert_eq!(finish_status_line(false, false, false), None);
+        let concluded = finish_status_line(false, true, false).unwrap_or_default();
+        assert!(concluded.starts_with("Finish: the check raised an objection"), "{concluded}");
+        let open = finish_status_line(true, false, false).unwrap_or_default();
+        assert!(open.starts_with("Finish: conclude the goal first"), "{open}");
+        // Both: the goal was reopened by the check. One line, in the order of the work.
+        let fresh = finish_status_line(true, true, false).unwrap_or_default();
+        assert_eq!(
+            fresh,
+            "Finish: the goal is open. Answer each open objection with a new run and record it, conclude the goal on that run, then finish."
+        );
+        assert_eq!(finish_status_line(true, true, true).unwrap_or_default(), fresh, "no unreachable either way");
+        // No line says that a finish was made before: it is in view after a fresh start.
+        for line in [concluded, open, fresh] {
+            assert!(!line.contains("again") && !line.contains("reject"), "{line}");
+        }
     }
 
     #[test]
