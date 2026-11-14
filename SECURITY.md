@@ -101,7 +101,7 @@ When the operator enables a box, a session can run commands in a container on a 
   which commands cannot read, and is never added to the sandbox's socket list.
 - **A hardened container.** All capabilities dropped (plus `cap_add`, from which `SYS_ADMIN`, `NET_ADMIN`
   and the other dangerous ones are refused at config load), `no-new-privileges`, a read-only root, tmpfs
-  `/tmp` and `/work`, user 1000, no bind mounts, devices, privileged mode or host namespaces, limits on
+  `/tmp` and `/work` (executable, since the box exists to run what is built in it), an init as PID 1, user 1000, no bind mounts, devices, privileged mode or host namespaces, limits on
   memory, processes and CPUs.
 - **Pinned images.** `image` and `helper_image` must be `name@sha256:<digest>`; a tag can be moved.
 - **Egress is the mission's grants.** A per-mission bridge network without IPv6 (also off inside the
