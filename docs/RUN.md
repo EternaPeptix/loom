@@ -196,7 +196,9 @@ twice it pauses the box (keeping `/work`), refuses the command, and resumes the 
 works. A new grant, a release and the end of the mission update or remove the rules. The box has no
 other mounts, no devices, all capabilities dropped except `cap_add`, a read-only root, and tmpfs `/work`
 and `/tmp` (both executable): files in it are lost when the mission ends or on `box_reset`. The image
-needs `/bin/sh`, `/bin/bash` and `setsid` (util-linux); Docker supplies the init.
+needs `/bin/sh`, `/bin/bash`, `setsid` (util-linux) and `/usr/bin/tar` (GNU tar, or one that supports
+`--format=pax`); Docker supplies the init. Files go in and out through `docker exec ... tar` as user 1000, not
+`docker cp`, which cannot write to a read-only root or see the tmpfs `/work`.
 
 Notes. The box needs the OS sandbox: `[sandbox] mode = "none"` and a `sandbox.unix_sockets` entry that
 names the box's socket (or anything in `<loom home>/keys`) are refused. `docker_cli` and `ssh` are looked

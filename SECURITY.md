@@ -127,7 +127,10 @@ When the operator enables a box, a session can run commands in a container on a 
   `.loom`, `.git`, oracle secrets, unreadable paths, credential stores or anything reached through a link
   (every directory and file is opened relative to its parent with `O_NOFOLLOW`, so a link swapped in
   after the listing is refused).
-  **Files out** (`box_get`) are unpacked by loom, not by `tar`: regular files and directories only, no
+  Both directions use `docker exec` of `/usr/bin/tar` as user 1000 with a fixed `PATH` (`docker cp` is not used);
+  the path of a fetch is one argv element after `--`, and the stream is read only up to `get_max_mb` plus
+  headers, then the client is killed.
+  **Files out** (`box_get`) are unpacked by loom, not by the box's `tar`: regular files and directories only, no
   names that leave the destination, no links or devices, size and entry caps, and each file is written
   the way the `write` tool writes it, so it cannot reach a path `write` cannot.
 - **Limits.** A kernel or Docker escape from the container reaches the Docker VM, not this machine. Run

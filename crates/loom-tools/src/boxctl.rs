@@ -104,11 +104,17 @@
 //! alone would leave the command running in the container.
 //!
 //! ## Files (`boxfs`)
-//! `push` copies changed workspace files to `/work` as a tar stream (`docker cp -a - <ctr>:/work`),
-//! `get_tar` reads a path out of the container as a tar stream; what may be sent and how a stream is
+//! `push` copies changed workspace files to `/work` as a tar stream on the stdin of `docker exec <ctr>
+//! /usr/bin/tar --extract` ([`push_args`]), `get_tar` reads a path out of the container as a pax tar stream from
+//! `docker exec <ctr> /usr/bin/tar --create --format=pax` ([`get_args`]). `docker cp` is never used: it works
+//! on the container's root file system, which is read-only (it refuses to write) and does not contain the
+//! tmpfs mounts `/work` and `/tmp`. Both run as user 1000 with a fixed `PATH`, so the image needs
+//! `/usr/bin/tar` (GNU tar, or one that supports `--format=pax`) besides `/bin/sh`, `/bin/bash` and `setsid`.
+//! The read is stopped, and the docker client killed, at the byte cap; the stream is untrusted (I7).
+//! what may be sent and how a stream is
 //! unpacked is in `boxfs` (I6, I7).
 //!
-//! Tests required: exact argv of `run`, `exec`, `cp`, `network create`, `rm`, the helper run and the
+//! Tests required: exact argv of `run`, `exec`, the tar push and get, `network create`, `rm`, the helper run and the
 //! kill (I1, I2, I4); the three helper scripts run against stand-ins for `iptables` (R1, R2); a hostile script reaches the launcher as one argv element; the egress plan for a grant
 //! set (private address refused without `allow_private`, wildcard skipped and noticed once, IPv6 skipped,
 //! ports kept); the rules text; names and labels; the ssh argv and the forward supervisor with a fake
@@ -358,14 +364,39 @@ pub fn kill_args(n: &Names, pid_file: &str, signal: &str) -> Vec<String> {
     a
 }
 
-/// `docker cp` of a tar stream on stdin into `/work` (ownership taken from the stream).
-pub fn cp_in_args(n: &Names) -> Vec<String> {
-    vec!["cp".into(), "--archive".into(), "-".into(), format!("{}:{WORK}", n.container)]
+/// The `PATH` of the tar run in the container: fixed, all absolute.
+pub const TAR_PATH: &str = "PATH=/usr/sbin:/usr/bin:/sbin:/bin";
+/// The tar of the box image, by absolute path.
+pub const TAR: &str = "/usr/bin/tar";
+
+/// `docker exec` of a tar that unpacks the stream on stdin into `/work` as user 1000 (I6): the owner in the
+/// stream is ignored. Nothing in it comes from the agent.
+pub fn push_args(n: &Names) -> Vec<String> {
+    let mut a = strings(["exec", "--interactive", "--user", BOX_USER, "--env", TAR_PATH]);
+    a.push(n.container.clone());
+    a.extend(strings([TAR, "--extract", "--file=-"]));
+    a.push(format!("--directory={WORK}"));
+    a.push("--no-same-owner".into());
+    a
 }
 
-/// `docker cp` of `path` (absolute, in the container) to a tar stream on stdout.
-pub fn cp_out_args(n: &Names, path: &str) -> Vec<String> {
-    vec!["cp".into(), format!("{}:{path}", n.container), "-".into()]
+/// `docker exec` of a tar that writes `path` (absolute, in the container) as a pax stream on stdout (I7). The
+/// path is split into its directory and its last component; both are single argv elements, the last one after
+/// `--`, so neither can be read as an option.
+pub fn get_args(n: &Names, path: &str) -> Result<Vec<String>, String> {
+    let trimmed = path.trim_end_matches('/');
+    let (parent, last) = trimmed.rsplit_once('/').unwrap_or(("", trimmed));
+    if !path.starts_with('/') || last.is_empty() || path.contains('\0') {
+        return Err(format!("The path `{path}` is not a file or directory below `/` in the box."));
+    }
+    let parent = if parent.is_empty() { "/" } else { parent };
+    let mut a = strings(["exec", "--user", BOX_USER, "--env", TAR_PATH]);
+    a.push(n.container.clone());
+    a.extend(strings([TAR, "--create", "--file=-", "--format=pax"]));
+    a.push(format!("--directory={parent}"));
+    a.push("--".into());
+    a.push(last.to_string());
+    Ok(a)
 }
 
 pub fn ps_args(home: &str) -> Vec<String> {
@@ -1421,14 +1452,14 @@ impl MissionBox {
             st.pushed = push.manifest;
             return Ok(report);
         }
-        match self.host.docker(&cp_in_args(&self.names), Some(push.tar), SMALL_OUT).await {
+        match self.host.docker(&push_args(&self.names), Some(push.tar), SMALL_OUT).await {
             Ok(o) if o.ok() => {
                 st.pushed = push.manifest;
                 Ok(report)
             }
             Ok(o) => {
                 st.pushed = prev;
-                Err(format!("Copying the workspace files into the box failed on the Docker host: {}", o.why()))
+                Err(format!("Copying the workspace files into the box failed (the image needs {TAR}): {}", o.why()))
             }
             Err(e) => {
                 st.pushed = prev;
@@ -1437,7 +1468,8 @@ impl MissionBox {
         }
     }
 
-    /// `docker cp <container>:<path> -`: the tar stream, at most `max` bytes (I7 reads it).
+    /// The tar stream of `path` from `docker exec ... tar --create`, at most `max` bytes: the read stops and the
+    /// docker client is killed there, nothing more is buffered (I7 reads it).
     pub async fn get_tar(&self, path: &str, max: usize) -> Result<Vec<u8>, String> {
         let _life = self.lifecycle.lock().await;
         let st = self.state.lock().await;
@@ -1447,7 +1479,7 @@ impl MissionBox {
         if !path.starts_with('/') || path.contains('\0') {
             return Err(format!("The path `{path}` is not absolute in the box."));
         }
-        let out = self.host.docker(&cp_out_args(&self.names, path), None, max).await?;
+        let out = self.host.docker(&get_args(&self.names, path)?, None, max).await?;
         if !out.ok() {
             return Err(format!("Reading {path} from the box failed: {}", out.why()));
         }
@@ -1685,9 +1717,7 @@ case "$sub" in
     esac;;
   ps) [ -f "$D/ps.txt" ] && cat "$D/ps.txt"; exit 0;;
   cp)
-    if [ "$1" = "--archive" ]; then n=1; while [ -e "$D/cp-in.$n.tar" ]; do n=$((n+1)); done; cat > "$D/cp-in.$n.tar"; exit 0; fi
-    [ -f "$D/cp-out.tar" ] && { cat "$D/cp-out.tar"; exit 0; }
-    echo "Error: No such container:path" >&2; exit 1;;
+    echo "Error response from daemon: container rootfs is marked read-only" >&2; exit 1;;
   exec)
     stdin=0
     while [ $# -gt 0 ]; do
@@ -1697,6 +1727,20 @@ case "$sub" in
     if [ ! -f "$D/ctr-$ctr" ]; then echo "Error: No such container: $ctr" >&2; exit 1; fi
     if [ -f "$D/paused-$ctr" ]; then echo "Error response from daemon: Container $ctr is paused, unpause the container before exec" >&2; exit 1; fi
     mkdir -p "$D/work"; cd "$D/work" || exit 1
+    if [ "$1" = "/usr/bin/tar" ]; then
+      # The container's /work is $D/work here. A test can plant a stream for the next `--create`.
+      case " $* " in *" --create "*) [ -f "$D/tar-out.tar" ] && { cat "$D/tar-out.tar"; exit 0; };; esac
+      shift; cnt=$#
+      while [ "$cnt" -gt 0 ]; do
+        a=$1; shift; cnt=$((cnt-1))
+        case "$a" in
+          --directory=/) a="--directory=$D";;
+          --directory=/work*) a="--directory=$D${a#--directory=}";;
+        esac
+        set -- "$@" "$a"
+      done
+      exec tar "$@"
+    fi
     command -v setsid >/dev/null 2>&1 || PATH="$D/bin:$PATH"
     export PATH
     exec "$@";;
@@ -1977,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn the_kill_cp_network_and_rm_argv_are_exactly_this() {
+    fn the_kill_tar_network_and_rm_argv_are_exactly_this() {
         let n = names("m-1");
         let kill = kill_args(&n, "/tmp/.loom-c.pid", "TERM");
         assert_eq!(
@@ -2000,8 +2044,52 @@ mod tests {
             "the signal is one of two fixed words"
         );
         assert_eq!(network_inspect_args(&n), ["network", "inspect", "--format", "{{json .}}", "loom-m-1"]);
-        assert_eq!(cp_in_args(&n), ["cp", "--archive", "-", "loom-m-1:/work"]);
-        assert_eq!(cp_out_args(&n, "/work/out"), ["cp", "loom-m-1:/work/out", "-"]);
+        assert_eq!(
+            push_args(&n),
+            [
+                "exec",
+                "--interactive",
+                "--user",
+                "1000:1000",
+                "--env",
+                "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+                "loom-m-1",
+                "/usr/bin/tar",
+                "--extract",
+                "--file=-",
+                "--directory=/work",
+                "--no-same-owner"
+            ]
+        );
+        assert_eq!(
+            get_args(&n, "/work/out").unwrap(),
+            [
+                "exec",
+                "--user",
+                "1000:1000",
+                "--env",
+                "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+                "loom-m-1",
+                "/usr/bin/tar",
+                "--create",
+                "--file=-",
+                "--format=pax",
+                "--directory=/work",
+                "--",
+                "out"
+            ]
+        );
+        // The path parts are single elements, the last after `--`: nothing in them is an option.
+        let hostile = get_args(&n, "/work/--checkpoint-action=exec=sh x/ --to-command=id").unwrap();
+        assert_eq!(
+            hostile[hostile.len() - 3..],
+            ["--directory=/work/--checkpoint-action=exec=sh x", "--", " --to-command=id"]
+        );
+        let dash = get_args(&n, "/work/-rf/").unwrap();
+        assert_eq!(dash[dash.len() - 3..], ["--directory=/work", "--", "-rf"]);
+        let top = get_args(&n, "/work").unwrap();
+        assert_eq!(top[top.len() - 3..], ["--directory=/", "--", "work"]);
+        assert!(get_args(&n, "/").is_err() && get_args(&n, "rel").is_err());
         assert_eq!(rm_args(&n), ["rm", "--force", "--volumes", "loom-m-1"]);
         assert_eq!(network_rm_args(&n), ["network", "rm", "loom-m-1"]);
         assert_eq!(

@@ -1200,7 +1200,7 @@ file is the specification; the invariants are:
 
 1. *The agent is never near Docker.* The docker client is spawned by the daemon, outside the sandbox
    (`proc::spawn_launched`, with `bash::run_launched` carrying `bash`'s whole procedure), with a fixed argv built
-   by pure functions (`run_args`, `exec_args`, `kill_args`, `cp_in_args`, `cp_out_args`, `network_args`,
+   by pure functions (`run_args`, `exec_args`, `kill_args`, `push_args`, `get_args`, `network_args`,
    `rules_args`, `rm_args`). The agent's script is the last argument of `/bin/bash -c` in the container. The
    ssh-forwarded socket lives in `<loom home>/keys`.
 2. *Hardened container*: `--cap-drop ALL` plus the vetted `cap_add`, `no-new-privileges`, read-only root,

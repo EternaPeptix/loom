@@ -353,26 +353,22 @@ mod tests {
         assert!(header(&r).starts_with("[box_exec · exit 0 · in box loom-m-test"), "{}", header(&r));
         assert!(r.text.contains("; docker ps; \n42\n--privileged"), "{}", r.text);
         assert!(r.text.contains("1 file(s) copied into /work first"), "{}", r.text);
-        // The file went in as a tar stream, once; the script was one argument of exactly one docker call.
-        let tars: Vec<_> = std::fs::read_dir(&fake.dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with("cp-in."))
-            .collect();
-        assert_eq!(tars.len(), 1);
-        assert!(String::from_utf8_lossy(&std::fs::read(tars[0].path()).unwrap()).contains("a.txt"));
+        // The file went in as a tar stream through `docker exec ... tar --extract`, once, as user 1000, and
+        // `docker cp` was never used; the script was one argument of exactly one docker call.
+        assert_eq!(std::fs::read(fake.dir.join("work/a.txt")).unwrap(), b"alpha");
+        let pushes = |f: &FakeDocker| {
+            f.sub("exec")
+                .iter()
+                .filter(|c| c.iter().any(|a| a == "/usr/bin/tar") && c.iter().any(|a| a == "--extract"))
+                .count()
+        };
+        assert_eq!(pushes(&fake), 1);
+        assert!(fake.sub("cp").is_empty());
         assert_eq!(fake.calls().iter().filter(|c| c.iter().any(|a| a == script)).count(), 1);
         // Nothing changed: nothing is copied again.
         let r = rig.call("box_exec", json!({"command": "true", "timeout_s": 20})).await;
         assert!(!r.text.contains("copied into /work"), "{}", r.text);
-        assert_eq!(
-            std::fs::read_dir(&fake.dir)
-                .unwrap()
-                .filter_map(Result::ok)
-                .filter(|e| e.file_name().to_string_lossy().starts_with("cp-in."))
-                .count(),
-            1
-        );
+        assert_eq!(pushes(&fake), 1);
         // A change is.
         std::fs::write(rig.env.ctx.workspace.join("a.txt"), "alpha two").unwrap();
         let r = rig.call("box_exec", json!({"command": "true", "timeout_s": 20})).await;
@@ -451,19 +447,24 @@ mod tests {
     async fn box_get_brings_back_a_tree_through_the_write_path_and_refuses_what_write_would() {
         let (rig, fake, _d) = with_box(&[]);
         rig.call("box_exec", json!({"command": "true", "timeout_s": 20})).await;
-        let mut tar = Vec::new();
-        loom_tools::boxfs::append_file(&mut tar, "out/a.txt", 0o644, 0, b"A");
-        loom_tools::boxfs::append_file(&mut tar, "out/sub/b.bin", 0o755, 0, &[0, 1, 2]);
-        loom_tools::boxfs::finish_tar(&mut tar);
-        std::fs::write(fake.dir.join("cp-out.tar"), &tar).unwrap();
+        // The "container's" /work is `<fake>/work`; the real tar reads it.
+        std::fs::create_dir_all(fake.dir.join("work/out/sub")).unwrap();
+        std::fs::write(fake.dir.join("work/out/a.txt"), b"A").unwrap();
+        std::fs::write(fake.dir.join("work/out/sub/b.bin"), [0, 1, 2]).unwrap();
         let r = rig.call("box_get", json!({"path": "out", "to": "got"})).await;
         assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
         assert!(r.text.contains("fetched 2 file(s)") && r.text.contains("in box loom-m-test"), "{}", r.text);
         let ws = &rig.env.ctx.workspace;
         assert_eq!(std::fs::read(ws.join("got/a.txt")).unwrap(), b"A");
         assert_eq!(std::fs::read(ws.join("got/sub/b.bin")).unwrap(), [0, 1, 2]);
-        // The call asked docker for exactly `<container>:/work/out`.
-        assert!(fake.sub("cp").iter().any(|c| c.iter().any(|a| a == "loom-m-test:/work/out")));
+        // The call was one tar of `out` in `/work`, never `docker cp`.
+        assert!(fake.sub("exec").iter().any(|c| c.ends_with(&[
+            "--format=pax".to_string(),
+            "--directory=/work".to_string(),
+            "--".to_string(),
+            "out".to_string()
+        ])));
+        assert!(fake.sub("cp").is_empty());
         // Where `write` is refused, so is `box_get`.
         let r = rig.call("box_get", json!({"path": "out", "to": ".loom/oracle"})).await;
         assert_eq!(r.status, ToolStatus::Denied, "{}", r.text);
@@ -473,7 +474,7 @@ mod tests {
         loom_tools::boxfs::append_file(&mut evil, "out/ok.txt", 0o644, 0, b"fine");
         loom_tools::boxfs::append_file(&mut evil, "out/../../escaped.txt", 0o644, 0, b"bad");
         loom_tools::boxfs::finish_tar(&mut evil);
-        std::fs::write(fake.dir.join("cp-out.tar"), &evil).unwrap();
+        std::fs::write(fake.dir.join("tar-out.tar"), &evil).unwrap();
         let r = rig.call("box_get", json!({"path": "out", "to": "got2"})).await;
         assert_eq!(r.status, ToolStatus::Error);
         assert!(r.text.contains("Nothing was written"), "{}", r.text);
@@ -481,6 +482,22 @@ mod tests {
         // Paths in the box are checked before docker is asked.
         let r = rig.call("box_get", json!({"path": "/"})).await;
         assert!(r.text.contains("Name a file or directory below"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn box_get_reads_a_path_over_100_characters_from_the_pax_stream_of_tar() {
+        let (rig, fake, _d) = with_box(&[]);
+        rig.call("box_exec", json!({"command": "true", "timeout_s": 20})).await;
+        let deep = format!("out/{}/{}", "d".repeat(60), "e".repeat(60));
+        std::fs::create_dir_all(fake.dir.join("work").join(&deep)).unwrap();
+        let file = format!("{}.txt", "f".repeat(70));
+        std::fs::write(fake.dir.join("work").join(&deep).join(&file), b"long").unwrap();
+        let r = rig.call("box_get", json!({"path": "out", "to": "got"})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        let want = rig.env.ctx.workspace.join("got").join(&deep["out/".len()..]).join(&file);
+        assert!(want.to_string_lossy().len() > 100);
+        assert_eq!(std::fs::read(want).unwrap(), b"long");
+        assert!(fake.sub("cp").is_empty());
     }
 
     #[tokio::test]
@@ -510,11 +527,9 @@ mod tests {
     async fn r8_box_get_refuses_dot_and_dotdot_components_in_path_and_to() {
         let (rig, fake, _d) = with_box(&[]);
         rig.call("box_exec", json!({"command": "true", "timeout_s": 20})).await;
-        let mut tar = Vec::new();
-        loom_tools::boxfs::append_file(&mut tar, "out/a.txt", 0o644, 0, b"A");
-        loom_tools::boxfs::finish_tar(&mut tar);
-        std::fs::write(fake.dir.join("cp-out.tar"), &tar).unwrap();
-        let before = fake.sub("cp").len();
+        std::fs::create_dir_all(fake.dir.join("work/out")).unwrap();
+        std::fs::write(fake.dir.join("work/out/a.txt"), b"A").unwrap();
+        let before = fake.sub("exec").len();
         for (args, which) in [
             (json!({"path": "../etc/passwd"}), "`path`"),
             (json!({"path": "out/../../etc"}), "`path`"),
@@ -528,7 +543,7 @@ mod tests {
             assert_eq!(r.status, ToolStatus::Error, "{args}: {}", r.text);
             assert!(r.text.contains(which) && r.text.contains("component"), "{args}: {}", r.text);
         }
-        assert_eq!(fake.sub("cp").len(), before, "docker was not asked for any of them");
+        assert_eq!(fake.sub("exec").len(), before, "docker was not asked for any of them");
         // Plain paths still work, also with a trailing slash.
         let r = rig.call("box_get", json!({"path": "out/", "to": "got"})).await;
         assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);

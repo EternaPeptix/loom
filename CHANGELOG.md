@@ -27,6 +27,10 @@
   (sorted, built from validated names and `Ipv4Addr` only). A name granted after the box exists has its
   address reachable at once (the rules are updated) but resolves inside the box only after `box_reset`;
   until then every `box_exec` result says so.
+- Box fix: `docker cp` fails on a `--read-only` container (it writes to the rootfs and cannot see the tmpfs
+  `/work`). `push` now runs `docker exec -i -u 1000:1000 <ctr> /usr/bin/tar --extract --directory=/work
+  --no-same-owner` and `box_get` runs `tar --create --format=pax --directory=<parent> -- <name>`, read up to the
+  byte cap and then killed; the I6 and I7 rules are unchanged. The box image needs `/usr/bin/tar`.
 
 ### Morale: keeping a model on a hard task
 
