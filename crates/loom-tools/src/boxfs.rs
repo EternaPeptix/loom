@@ -221,6 +221,12 @@ struct EntryStat {
     mtime: i128,
 }
 
+/// `mode_t` is `u16` on macOS and `u32` on Linux, so the conversion is needed on one and a no-op on the other.
+#[allow(clippy::useless_conversion)]
+fn mode_u32(m: libc::mode_t) -> u32 {
+    u32::from(m)
+}
+
 fn stat_at(dir: &OwnedFd, name: &OsStr) -> io::Result<EntryStat> {
     let c = CString::new(name.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     // SAFETY: an all-zero `stat` is a valid value for the C struct.
@@ -231,7 +237,7 @@ fn stat_at(dir: &OwnedFd, name: &OsStr) -> io::Result<EntryStat> {
         return Err(io::Error::last_os_error());
     }
     Ok(EntryStat {
-        mode: u32::from(st.st_mode) & u32::from(libc::S_IFMT),
+        mode: mode_u32(st.st_mode) & mode_u32(libc::S_IFMT),
         size: u64::try_from(st.st_size).unwrap_or(0),
         mtime: i128::from(st.st_mtime) * 1_000_000_000 + i128::from(st.st_mtime_nsec),
     })
@@ -306,7 +312,7 @@ impl Walk<'_> {
             }
             let Ok(st) = stat_at(fd, &name) else { continue };
             let (abs_child, rel_child) = (abs.join(&name), rel.join(&name));
-            if st.mode == u32::from(libc::S_IFDIR) {
+            if st.mode == mode_u32(libc::S_IFDIR) {
                 if depth >= MAX_DEPTH {
                     continue;
                 }
@@ -315,7 +321,7 @@ impl Walk<'_> {
                 if let Ok(child) = open_at(fd, &name, flags) {
                     self.dir(&child, &abs_child, &rel_child, depth + 1);
                 }
-            } else if st.mode == u32::from(libc::S_IFREG) {
+            } else if st.mode == mode_u32(libc::S_IFREG) {
                 self.file(fd, &name, &abs_child, rel_child, &st);
             }
         }
