@@ -219,6 +219,12 @@ operator-contract verification. They are opt-in and require explicit scope and a
 see [CTF](packs/ctf/README.md), [Redteam](packs/redteam/README.md), and the
 [qualification protocol](docs/SECURITY-EVAL.md). External model/corpus performance is unmeasured.
 
+`artex` (`packs/artex/`) is the defensive counterpart: it adapts FBI FLASH-20261113-001 (13 November
+2026) on the ARTEX autonomous penetration-testing framework into a hunt-and-harden pipeline — a
+coordinator that qualifies defensive scope, hunters that run one evidence check each over your own
+logs, inventories and configs, and a judge that attacks findings and findings of clean alike. It
+never probes indicators or remediates; see [Artex](packs/artex/README.md).
+
 `harnessmm` is an opt-in experimental pack for bounded guarded continuations. See
 [`docs/HARNESSMM.md`](docs/HARNESSMM.md) for its limits and evaluation protocol.
 

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### ARTEX defensive pack
+
+- Added opt-in `packs/artex`: a defensive hunt-and-harden pack adapting FBI FLASH-20261113-001
+  (13 November 2026, TLP:CLEAR) on the ARTEX autonomous penetration-testing framework. A `coordinator`
+  qualifies defensive scope through a read-only `judge`, decomposes the advisory into one-hypothesis
+  checks, and delegates them to `hunter`s; the coordinator's finish is judge-verified, and a result of
+  clean is gated on evidenced coverage exactly as a finding of compromise is. Indicators ship defanged
+  in `packs/artex/workspace/AGENTS.md` with the FBI's vet-before-acting warning, technique activity is
+  mapped to the log, inventory and config source that would show it, and preservation in the FBI's
+  eight reporting categories precedes any operator remediation — the pack itself never probes an
+  indicator and never blocks, revokes or deletes. No core, tool or serialized-shape change; installed
+  packs under `~/.loom/packs` are not updated by an upgrade: copy `packs/artex` there to use it.
+
 ### Structured tool interfaces, HTTP/recon hygiene, and exact view/state repeat tracking
 
 - `codec_calc` gains `op = "rebase"`: subtracts a symbol offset from an observed runtime address, enforces
