@@ -1,0 +1,62 @@
+name = "artex"
+description = "Defensive hunt and hardening against ARTEX-style autonomous intrusion (FBI FLASH-20261113-001): a coordinator that qualifies defensive scope, hunters that run one evidence check each against your own logs, inventories and configs, and a judge that tries to refute every finding — including a finding of clean."
+default_role = "coordinator"
+preamble = "harness.md"
+requires_restricted_network = true
+
+# The defensive lead. Turns the advisory into narrow, one-source checks and hands them to hunters;
+# does not run the checks or declare anything clean itself. Finishing is gated by an independent judge.
+[roles.coordinator]
+description = "Owns a defensive engagement: qualifies scope through a judge, decomposes the ARTEX advisory into one-hypothesis hunts and hardening checks, delegates them, and gates every result — positive or negative — before believing it."
+prompt = "roles/coordinator.md"
+termination = "explicit"
+may_spawn = ["hunter", "judge"]
+verify_finish = true
+verifier = "judge"
+tools = [
+  "bash", "job_wait", "job_kill", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
+  "cve_lookup", "cve_search", "advisory_lookup",
+  "agent_spawn", "agent_fanout", "attempt", "agent_adopt", "agent_message", "agent_stop", "decide", "verify",
+  "request_scope", "conclude", "finish", "ask_user", "report_blocker", "wait", "ask_for",
+]
+
+# One check per hunter: one hypothesis, one data source, one window, one observation, plus a separate
+# corroborating check. Returns executed evidence or a blocker, never a narrative and never a remediation.
+[roles.hunter]
+description = "Runs one hunt or hardening check from the coordinator against the operator's own logs, inventories or configs and returns one atomic executed check with its source, window, coverage and observed result — or a blocker."
+prompt = "roles/hunter.md"
+termination = "explicit"
+tools = [
+  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
+  "cve_lookup", "advisory_lookup",
+  "request_scope", "conclude", "finish", "report_blocker", "wait", "hand_off",
+]
+
+# The independent check. Checks a proposed defensive scope against the authorization the operator
+# named, and refutes a compromise finding, a hardening claim or a claim of clean. Cannot modify the
+# workspace and never judges its own submission.
+[roles.judge]
+description = "Checks a proposed defensive scope against its authorization, or tries to break a finding, a hardening claim or a clean result, citing only what it examined. Read-only."
+prompt = "roles/judge.md"
+termination = "explicit"
+read_only = true
+tools = [
+  "bash", "job_wait", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "ledger", "log_search",
+  "cve_lookup", "advisory_lookup",
+  "verdict", "report_blocker",
+]
+
+# Interactive triage assistant for working alongside the operator, turn by turn.
+[roles.chat]
+description = "Interactive defensive assistant: answers and runs read-only checks turn by turn over the operator's own material; a reply without a tool call ends the turn."
+prompt = "roles/chat.md"
+termination = "free"
+read_only = true
+tools = [
+  "bash", "job_wait", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "pin", "log_search",
+  "cve_lookup", "cve_search", "advisory_lookup", "request_scope",
+]

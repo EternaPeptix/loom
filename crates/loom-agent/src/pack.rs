@@ -750,6 +750,7 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
         let p = Packs::load(&dir).unwrap();
         assert!(p.names().contains(&"vr".to_string()) && p.names().contains(&"core".to_string()));
+        assert!(p.names().contains(&"artex".to_string()));
         p.check_tools(&crate::rtools::known_tools()).unwrap();
         let vr = p.get("vr").unwrap();
         assert_eq!(vr.roles["researcher"].verifier.as_deref(), Some("judge"));
@@ -871,6 +872,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_artex_pack_is_defensive_and_its_prose_names_only_tools_it_has() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let p = Packs::load(&dir).unwrap();
+        let known = crate::rtools::known_tools();
+        let artex = p.get("artex").unwrap();
+        assert_eq!(artex.default_role, "coordinator");
+        assert!(artex.requires_restricted_network);
+        // A defensive pack: no offensive command guard, and "clean" is never guaranteed solvable.
+        assert!(!artex.solvable && !artex.command_guard);
+        assert_eq!(artex.roles["coordinator"].verifier.as_deref(), Some("judge"));
+        assert!(artex.roles["judge"].read_only && artex.roles["chat"].read_only);
+        // The shared preamble is read by every role, so a tool it names only needs to belong to
+        // some role of the pack.
+        for tool in tools_named(&artex.preamble, &known) {
+            assert!(
+                artex.roles.values().any(|r| r.tools.contains(&tool)),
+                "packs/artex/harness.md names `{tool}`, which no role of the pack has"
+            );
+        }
+        // A role's own prompt only gets to name tools that role itself has.
+        for role in artex.roles.values() {
+            for tool in tools_named(&role.prompt, &known) {
+                assert!(
+                    role.tools.contains(&tool),
+                    "artex/{}: its prompt names `{tool}`, which it does not have",
+                    role.name
+                );
+            }
+        }
+        // The shipped workspace standards (a file the loader never reads) name only tools the pack has.
+        let text = fs::read_to_string(dir.join("artex/workspace/AGENTS.md")).unwrap();
+        for tool in tools_named(&text, &known) {
+            assert!(
+                artex.roles.values().any(|r| r.tools.contains(&tool)),
+                "packs/artex/workspace/AGENTS.md names `{tool}`, which no role of the pack has"
+            );
+        }
+        // A hunter has tools the coordinator lacks, which is why hunters start fresh.
+        assert!(artex.roles["hunter"].tools.iter().any(|t| !artex.roles["coordinator"].tools.contains(t)));
     }
 
     #[cfg(unix)]

@@ -1497,6 +1497,13 @@ written for the agents, for the operator to copy into an engagement workspace. N
 (project instruction files are on the roadmap): the operator's message names it and the agents read it
 as workspace content.
 
+The same shape carries a defensive discipline without any core change: `packs/artex` (coordinator,
+hunter, judge, chat; the coordinator's finish is verified by `judge`) adapts FBI FLASH-20261113-001 on
+ARTEX-style autonomous intrusion into scope-qualified hunts and hardening checks over the operator's
+own logs, inventories and configs, with indicators treated as leads, preservation before any operator
+remediation, and a clean result gated on evidenced coverage exactly as a finding is. Its standards
+file is `packs/artex/workspace/AGENTS.md`, on the same terms as the `vr` one.
+
 ## 14. Engineering rules
 
 - Rust 2021, stable (`rust-version` 1.88). Dependencies come from `[workspace.dependencies]`; add there
