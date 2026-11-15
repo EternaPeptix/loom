@@ -80,5 +80,16 @@ under a file-size limit and indexed alongside debugger output with explicit byte
 function calls are disabled. GDB/Python support and target debug information are operator prerequisites;
 unavailable measurements remain unknown. Debugger observations are not independent proof of a goal.
 
+## Dependency scanning
+
+`dep_scan` runs the operator-installed OWASP dep-scan `depscan` command under the session sandbox
+over a workspace directory or one CycloneDX SBOM file. Loom never installs dep-scan or starts its
+server mode. All writes (reports, `HOME`, `VDB_HOME`, temp) go under the session temp dir so
+read-only roles can scan without polluting the workspace. A missing `depscan` is an error with
+install guidance, not an empty clean result. A first scan may download dep-scan's vulnerability
+database (and `cdxgen` may reach ecosystem registries) through the egress proxy, so those hosts
+need a network route. The tool parses and stores the CycloneDX VDR and SBOM as citable blobs;
+dep-scan's prioritized/reachable labels are its static analysis, not execution evidence.
+
 All subprocess adapters use ordinary sandboxing, cancellation, process-group tracking, output caps
 and explicit deadlines. They do not install packages or change host services.

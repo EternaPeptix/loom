@@ -23,6 +23,7 @@
 //! - [`workcopy`] a child's own copy of the workspace, and bringing one child's changes back
 //! - [`boxctl`], [`boxfs`] the remote Docker box: container life, egress, files in and out
 //! - [`bash`], [`fstools`], [`search`], [`outview`], [`web`]: the built-in tools
+//! - [`cve`]: the vulnerability-database lookups; [`depscan`]: the OWASP dep-scan wrapper
 
 pub mod bash;
 pub mod binary;
@@ -31,6 +32,7 @@ pub mod boxfs;
 pub mod capabilities;
 pub mod codec;
 pub mod cve;
+pub mod depscan;
 pub mod files;
 pub mod fstools;
 pub mod http;
@@ -205,6 +207,7 @@ impl Registry {
         r.add(Arc::new(cve::CveLookup));
         r.add(Arc::new(cve::CveSearch));
         r.add(Arc::new(cve::AdvisoryLookup));
+        r.add(Arc::new(depscan::DepScan));
         r
     }
 

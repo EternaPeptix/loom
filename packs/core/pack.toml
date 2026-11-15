@@ -9,7 +9,7 @@ termination = "explicit"
 may_spawn = ["worker", "verifier"]
 verify_finish = true
 tools = [
-  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch", "dep_scan",
   "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
   "agent_spawn", "agent_fanout", "attempt", "agent_adopt", "agent_message", "agent_stop", "decide", "verify",
   "request_scope", "conclude", "finish", "ask_user", "report_blocker", "wait", "ask_for",
@@ -20,7 +20,7 @@ description = "Carries out one assignment from a lead and returns a result with 
 prompt = "roles/worker.md"
 termination = "explicit"
 tools = [
-  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch", "dep_scan",
   "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
   "finish", "report_blocker", "wait", "hand_off",
 ]
@@ -31,7 +31,7 @@ prompt = "roles/verifier.md"
 termination = "explicit"
 read_only = true
 tools = [
-  "bash", "job_wait", "job_kill", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "bash", "job_wait", "job_kill", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch", "dep_scan",
   "ledger", "log_search",
   "verdict", "report_blocker",
 ]
@@ -41,6 +41,6 @@ description = "Interactive assistant: answers and acts turn by turn; a reply wit
 prompt = "roles/chat.md"
 termination = "free"
 tools = [
-  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch", "dep_scan",
   "pin", "log_search", "request_scope",
 ]
