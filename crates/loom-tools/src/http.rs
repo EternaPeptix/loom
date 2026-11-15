@@ -3,11 +3,15 @@
 //! CONTRACT: every exchange uses the ordinary session proxy (never the reference credential), no
 //! automatic redirects, no ambient proxy/cookie state, valid HTTP framing recomputed by reqwest.
 //! Content-Length, Transfer-Encoding, Host and proxy headers supplied by the model are discarded.
-//! Raw desynchronization is deliberately not implemented by this structured client. A per-session
-//! RFC cookie jar and origin-bound captures survive calls, but are discarded at restart. Request IDs
-//! name completed exchanges only. Full bounded exchanges are BlobStore-backed observations, not
-//! independent goal or authorization oracles. Race batches (2..20) release together, then respect the
-//! daemon-wide two-request host semaphore; they do not promise simultaneous wire arrival.
+//! Raw desynchronization is deliberately not implemented by this structured client. Session-ending,
+//! destructive-lifecycle, and single-use token URLs (after up to three rounds of percent-decoding) are
+//! refused unless `allow_quarantined: true` is passed. A per-session RFC cookie jar, origin-bound
+//! captures, and a bounded per-route status matrix survive calls, but are discarded at restart.
+//! HTML responses include bounded `<form>` and field metadata (`hidden`, `readonly`, `disabled`).
+//! Cross-principal `2xx` vs `401/403` status differentials on normalized route templates are surfaced
+//! as observations, never independent goal or authorization oracles. Request IDs name completed
+//! exchanges only. Race batches (2..20) release together, then respect the daemon-wide two-request
+//! host semaphore; they do not promise simultaneous wire arrival.
 
 use crate::{
     params::{opt, req, spec},
@@ -18,12 +22,13 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{future::join_all, StreamExt};
 use loom_core::event::{ToolClass, ToolSpec, ToolStatus};
 use reqwest::{
-    cookie::Jar,
+    cookie::{CookieStore, Jar},
     header::{HeaderMap, HeaderName, HeaderValue},
     Client, Method, Proxy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{Barrier, Semaphore};
 use url::Url;
@@ -53,11 +58,15 @@ struct Variable {
     origin: String,
 }
 
+type RouteKey = (String, String, String);
+type PrincipalObservations = BTreeMap<String, (String, u16)>;
+
 #[derive(Default)]
 pub struct HttpState {
     jar: Arc<Jar>,
     requests: BTreeMap<String, Request>,
     variables: BTreeMap<String, Variable>,
+    route_matrix: BTreeMap<RouteKey, PrincipalObservations>,
     next: u64,
 }
 
@@ -76,6 +85,11 @@ fn fields() -> Vec<crate::params::Param> {
         .min(1)
         .max(20),
         opt("timeout_s", "integer", "Whole batch timeout, default 30 seconds; maximum 120.").min(1).max(120),
+        opt(
+            "allow_quarantined",
+            "boolean",
+            "Explicitly permit requesting a quarantined logout, unsubscribe, or single-use token URL (default false).",
+        ),
     ]
 }
 
@@ -251,6 +265,233 @@ pub(crate) fn client(ctx: &ToolCtx, jar: Arc<Jar>) -> Result<Client, String> {
     b.build().map_err(|e| format!("The HTTP client could not be built: {e}."))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FormField {
+    pub name: String,
+    pub kind: String,
+    pub hidden: bool,
+    pub readonly: bool,
+    pub disabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FormSurface {
+    pub action: String,
+    pub method: String,
+    pub fields: Vec<FormField>,
+}
+
+pub fn quarantined_locator(url_str: &str) -> Option<&'static str> {
+    const SESSION_SEGMENTS: &[&str] = &[
+        "logout",
+        "log-out",
+        "signout",
+        "sign-out",
+        "unsubscribe",
+        "revoke-session",
+        "delete-account",
+        "close-account",
+    ];
+    const TOKEN_SEGMENTS: &[&str] = &[
+        "reset-password",
+        "password-reset",
+        "verify-email",
+        "email-verify",
+        "magic-link",
+        "confirm-email",
+        "accept-invite",
+    ];
+    const TOKEN_QUERY_KEYS: &[&str] =
+        &["oobcode", "magic_token", "invite_token", "unsubscribe_token", "reset_token", "verification_token"];
+
+    let decoded = crate::capabilities::decode_percent_rounds(url_str, 3);
+    for candidate in [url_str, decoded.as_str()] {
+        let Ok(url) = Url::parse(candidate) else { continue };
+        for seg in url.path().split('/') {
+            let norm = crate::capabilities::decode_percent_rounds(seg.trim(), 2).to_ascii_lowercase();
+            if SESSION_SEGMENTS.contains(&norm.as_str()) {
+                return Some("session-terminating or destructive lifecycle endpoint");
+            }
+            if TOKEN_SEGMENTS.contains(&norm.as_str()) {
+                return Some("single-use token or account-verification endpoint");
+            }
+        }
+        for (k, _) in url.query_pairs() {
+            let key = crate::capabilities::decode_percent_rounds(k.trim(), 2).to_ascii_lowercase();
+            if TOKEN_QUERY_KEYS.contains(&key.as_str()) {
+                return Some("single-use query token parameter");
+            }
+        }
+    }
+    None
+}
+
+pub fn is_static_asset_locator(url_str: &str) -> bool {
+    const STATIC_EXTS: &[&str] = &[
+        ".css", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".otf",
+        ".mp4", ".webm", ".mp3", ".map",
+    ];
+    let Ok(url) = Url::parse(url_str) else { return false };
+    if url.query().is_some() {
+        return false;
+    }
+    let Some(last) = url.path().rsplit('/').find(|s| !s.is_empty()) else { return false };
+    let lower = last.to_ascii_lowercase();
+    STATIC_EXTS.iter().any(|ext| lower.ends_with(ext))
+}
+
+fn is_uuid_segment(seg: &str) -> bool {
+    if seg.len() != 36 {
+        return false;
+    }
+    let parts: Vec<&str> = seg.split('-').collect();
+    matches!(
+        parts.as_slice(),
+        [a, b, c, d, e]
+            if a.len() == 8
+                && b.len() == 4
+                && c.len() == 4
+                && d.len() == 4
+                && e.len() == 12
+                && [a, b, c, d, e].iter().all(|p| p.bytes().all(|ch| ch.is_ascii_hexdigit()))
+    )
+}
+
+pub fn route_template(path: &str) -> String {
+    if path.is_empty() || path == "/" {
+        return "/".into();
+    }
+    let normalized: Vec<&str> = path
+        .split('/')
+        .map(|seg| {
+            if seg.is_empty() {
+                ""
+            } else if is_uuid_segment(seg) {
+                "{uuid}"
+            } else if (1..=20).contains(&seg.len()) && seg.bytes().all(|b| b.is_ascii_digit()) {
+                "{id}"
+            } else if seg.len() >= 16 && seg.len().is_multiple_of(2) && seg.bytes().all(|b| b.is_ascii_hexdigit()) {
+                "{hex}"
+            } else {
+                seg
+            }
+        })
+        .collect();
+    let joined = normalized.join("/");
+    if joined.is_empty() {
+        "/".into()
+    } else {
+        joined
+    }
+}
+
+fn html_attr(attrs: &str, name: &str) -> Option<String> {
+    let pattern = format!(r#"(?i)\b{name}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"']+))"#);
+    let re = regex::Regex::new(&pattern).ok()?;
+    let caps = re.captures(attrs)?;
+    caps.get(1).or_else(|| caps.get(2)).or_else(|| caps.get(3)).map(|m| m.as_str().to_string())
+}
+
+fn html_flag(attrs: &str, name: &str) -> bool {
+    let pattern = format!(r"(?i)(?:^|\s){name}(?:\s|=|$)");
+    regex::Regex::new(&pattern).ok().is_some_and(|re| re.is_match(attrs))
+}
+
+fn extract_forms(headers: &BTreeMap<String, String>, body_text: &str) -> Vec<FormSurface> {
+    let ct_html = headers.get("content-type").is_some_and(|ct| ct.to_ascii_lowercase().contains("html"));
+    let trimmed = body_text.trim_start();
+    let head: String = trimmed.chars().take(32).collect();
+    let head_lower = head.to_ascii_lowercase();
+    let body_html =
+        head_lower.starts_with("<!doctype html") || head_lower.starts_with("<html") || head_lower.starts_with("<form");
+    if !ct_html && !body_html {
+        return Vec::new();
+    }
+    let bounded: String = body_text.chars().take(131_072).collect();
+    let Ok(form_re) = regex::Regex::new(r"(?is)<form\b([^>]*)>(.*?)</form>") else { return Vec::new() };
+    let Ok(field_re) = regex::Regex::new(r"(?is)<(input|select|textarea)\b([^>]*)>") else { return Vec::new() };
+    let mut forms = Vec::new();
+    for caps in form_re.captures_iter(&bounded).take(16) {
+        let attrs = caps.get(1).map_or("", |m| m.as_str());
+        let inner = caps.get(2).map_or("", |m| m.as_str());
+        let action = html_attr(attrs, "action").unwrap_or_default();
+        let method = html_attr(attrs, "method").unwrap_or_else(|| "GET".into()).to_ascii_uppercase();
+        let mut fields = Vec::new();
+        for fcaps in field_re.captures_iter(inner).take(32) {
+            let tag = fcaps.get(1).map_or("input", |m| m.as_str()).to_ascii_lowercase();
+            let fattrs = fcaps.get(2).map_or("", |m| m.as_str());
+            let name = html_attr(fattrs, "name").unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let kind = if tag == "input" {
+                html_attr(fattrs, "type").unwrap_or_else(|| "text".into()).to_ascii_lowercase()
+            } else {
+                tag
+            };
+            let hidden = kind == "hidden" || html_flag(fattrs, "hidden");
+            let readonly = html_flag(fattrs, "readonly");
+            let disabled = html_flag(fattrs, "disabled");
+            fields.push(FormField { name, kind, hidden, readonly, disabled });
+        }
+        forms.push(FormSurface { action, method, fields });
+    }
+    forms
+}
+
+fn principal_tag(jar: &Jar, url: &Url, r: &Request) -> String {
+    let mut material = Vec::new();
+    if let Some(cookie) = jar.cookies(url) {
+        if !cookie.is_empty() {
+            material.push(format!("jar={}", String::from_utf8_lossy(cookie.as_bytes())));
+        }
+    }
+    for (k, v) in &r.headers {
+        let low = k.to_ascii_lowercase();
+        if ["cookie", "authorization", "x-api-key", "x-auth-token"].contains(&low.as_str()) && !v.trim().is_empty() {
+            material.push(format!("{low}={}", v.trim()));
+        }
+    }
+    if material.is_empty() {
+        return "anon".into();
+    }
+    material.sort();
+    let digest = hex::encode(Sha256::digest(material.join("\n").as_bytes()));
+    format!("auth:{}", digest.get(..8).unwrap_or_default())
+}
+
+impl HttpState {
+    fn record_route_status(
+        &mut self,
+        origin: &str,
+        method: &str,
+        path: &str,
+        principal: &str,
+        req_id: &str,
+        status: u16,
+    ) -> Option<Value> {
+        let template = route_template(path);
+        let key = (origin.to_string(), method.to_ascii_uppercase(), template.clone());
+        if !self.route_matrix.contains_key(&key) && self.route_matrix.len() >= 256 {
+            return None;
+        }
+        let by_principal = self.route_matrix.entry(key).or_default();
+        if by_principal.contains_key(principal) || by_principal.len() < 16 {
+            by_principal.insert(principal.to_string(), (req_id.to_string(), status));
+        }
+        let allowed = by_principal.iter().find(|(_, (_, code))| (200..300).contains(code));
+        let denied = by_principal
+            .iter()
+            .find(|(p, (_, code))| matches!(code, 401 | 403) && allowed.is_some_and(|(ap, _)| *p != ap));
+        let ((ap, (aid, acode)), (dp, (did, dcode))) = (allowed?, denied?);
+        Some(json!({
+            "route_template": template,
+            "allowed": { "request_id": aid, "principal": ap, "status": acode },
+            "denied": { "request_id": did, "principal": dp, "status": dcode },
+        }))
+    }
+}
+
 #[derive(Serialize)]
 pub(crate) struct Exchange {
     request: Request,
@@ -258,6 +499,8 @@ pub(crate) struct Exchange {
     headers: BTreeMap<String, String>,
     body_base64: String,
     pub body_text: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub forms: Vec<FormSurface>,
     pub truncated: bool,
     pub read_error: Option<String>,
     pub proxy_generated: bool,
@@ -331,11 +574,14 @@ pub(crate) async fn one(ctx: &ToolCtx, client: &Client, r: &Request) -> Result<E
             }
         }
     }
+    let body_text = String::from_utf8_lossy(&body).into_owned();
+    let forms = extract_forms(&headers, &body_text);
     Ok(Exchange {
         request: r.clone(),
         status,
         headers,
-        body_text: String::from_utf8_lossy(&body).into_owned(),
+        body_text,
+        forms,
         body_base64: STANDARD.encode(&body),
         truncated,
         read_error,
@@ -357,9 +603,10 @@ async fn run(ctx: &ToolCtx, mut r: Request, args: &Map<String, Value>) -> ToolOu
     let jar = state.jar.clone();
     let variables = state.variables.clone();
     drop(state);
-    let expanded = (|| -> Result<(), String> {
+    let expanded = (|| -> Result<Url, String> {
         r.url = expand(&r.url, &variables, &origin)?;
-        if checked_url(&r.url)?.origin().ascii_serialization() != origin {
+        let parsed = checked_url(&r.url)?;
+        if parsed.origin().ascii_serialization() != origin {
             return Err("URL expansion cannot change the origin.".into());
         }
         r.body = expand(&r.body, &variables, &origin)?;
@@ -374,11 +621,22 @@ async fn run(ctx: &ToolCtx, mut r: Request, args: &Map<String, Value>) -> ToolOu
         if forms > 1 {
             return Err("Choose only one body, body_base64 or json field.".into());
         }
-        Ok(())
+        Ok(parsed)
     })();
-    if let Err(e) = expanded {
-        return ToolOutput::error(e);
+    let parsed_url = match expanded {
+        Ok(u) => u,
+        Err(e) => return ToolOutput::error(e),
+    };
+    let allow_quarantined = args.get("allow_quarantined").and_then(Value::as_bool).unwrap_or(false);
+    if !allow_quarantined {
+        if let Some(reason) = quarantined_locator(&r.url) {
+            return ToolOutput::error(format!(
+                "Quarantined URL refused ({reason}): {}. Pass `allow_quarantined: true` only when the assignment explicitly tests this endpoint.",
+                r.url
+            ));
+        }
     }
+    let principal = principal_tag(&jar, &parsed_url, &r);
     let client = match client(ctx, jar) {
         Ok(c) => c,
         Err(e) => return ToolOutput::error(e),
@@ -414,6 +672,8 @@ async fn run(ctx: &ToolCtx, mut r: Request, args: &Map<String, Value>) -> ToolOu
                 state.next = state.next.saturating_add(1);
                 let id = format!("rq{}", state.next);
                 state.requests.insert(id.clone(), r.clone());
+                let differential =
+                    state.record_route_status(&origin, &r.method, parsed_url.path(), &principal, &id, e.status);
                 let mut capture_errors = Vec::new();
                 if let Some(captures) = args.get("capture").and_then(Value::as_object) {
                     for (name, selector) in captures {
@@ -429,7 +689,13 @@ async fn run(ctx: &ToolCtx, mut r: Request, args: &Map<String, Value>) -> ToolOu
                         }
                     }
                 }
-                outputs.push(json!({"request_id":id,"exchange":e,"capture_errors":capture_errors}));
+                let mut entry = json!({"request_id":id,"exchange":e,"capture_errors":capture_errors});
+                if let Some(diff) = differential {
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("differential_observation".into(), diff);
+                    }
+                }
+                outputs.push(entry);
             }
         }
     }
@@ -522,6 +788,92 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v[0]["exchange"]["status"], 200);
         assert_eq!(v[1]["exchange"]["status"], 200);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn quarantine_route_differentials_and_html_form_surfaces_work() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            routing::get,
+            Router,
+        };
+        assert!(quarantined_locator("https://example.test/auth/logout").is_some());
+        assert!(quarantined_locator("https://example.test/%6cogout").is_some());
+        assert!(quarantined_locator("https://example.test/account?magic_token=abc").is_some());
+        assert!(quarantined_locator("https://example.test/api/users/42").is_none());
+        assert!(is_static_asset_locator("https://example.test/assets/app.woff2"));
+        assert!(!is_static_asset_locator("https://example.test/assets/app.png?file=x"));
+        assert_eq!(
+            route_template("/api/users/42/items/550e8400-e29b-41d4-a716-446655440000/0123456789abcdef"),
+            "/api/users/{id}/items/{uuid}/{hex}"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/orders/{id}",
+                get(|h: HeaderMap| async move {
+                    if h.get("authorization").is_some_and(|v| v == "Bearer user1") {
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/html")],
+                            "<form action='/orders/update' method='post'><input type='hidden' name='csrf' value='1'><input name='role' readonly><input name='note' disabled></form>",
+                        )
+                    } else {
+                        (StatusCode::FORBIDDEN, [("content-type", "text/plain")], "denied")
+                    }
+                }),
+            )
+            .route("/logout", get(|| async { StatusCode::OK }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let env = crate::testutil::env();
+        let ctx = env.ctx;
+
+        // Quarantined URL is refused by default and permitted only with allow_quarantined: true.
+        let blocked =
+            HttpSend.run(&ctx, json!({"request":{"url":format!("http://{addr}/logout")}}).as_object().unwrap()).await;
+        assert_eq!(blocked.status, ToolStatus::Error);
+        let allowed = HttpSend
+            .run(
+                &ctx,
+                json!({"request":{"url":format!("http://{addr}/logout")},"allow_quarantined":true})
+                    .as_object()
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(allowed.status, ToolStatus::Ok);
+
+        // Unauthenticated request to /orders/1 returns 403; authenticated request to /orders/2 returns 200
+        // on the same normalized `/orders/{id}` template and surfaces both the differential and hidden form fields.
+        let first =
+            HttpSend.run(&ctx, json!({"request":{"url":format!("http://{addr}/orders/1")}}).as_object().unwrap()).await;
+        assert_eq!(first.status, ToolStatus::Ok);
+        let second = HttpSend
+            .run(
+                &ctx,
+                json!({"request":{"url":format!("http://{addr}/orders/2"),"headers":{"Authorization":"Bearer user1"}}})
+                    .as_object()
+                    .unwrap(),
+            )
+            .await;
+        let Body::Raw(bytes) = second.body else { panic!() };
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed[0]["differential_observation"]["route_template"], "/orders/{id}");
+        assert_eq!(parsed[0]["differential_observation"]["denied"]["principal"], "anon");
+        assert_eq!(parsed[0]["differential_observation"]["denied"]["status"], 403);
+        assert_eq!(parsed[0]["differential_observation"]["allowed"]["status"], 200);
+        assert!(parsed[0]["differential_observation"]["allowed"]["principal"].as_str().unwrap().starts_with("auth:"));
+        assert!(!parsed[0]["differential_observation"].to_string().contains("Bearer user1"));
+        let forms = parsed[0]["exchange"]["forms"].as_array().unwrap();
+        assert_eq!(forms.len(), 1);
+        assert_eq!(forms[0]["action"], "/orders/update");
+        assert_eq!(forms[0]["method"], "POST");
+        assert_eq!(forms[0]["fields"][0]["name"], "csrf");
+        assert_eq!(forms[0]["fields"][0]["hidden"], true);
+        assert_eq!(forms[0]["fields"][1]["readonly"], true);
+        assert_eq!(forms[0]["fields"][2]["disabled"], true);
         server.abort();
     }
 }

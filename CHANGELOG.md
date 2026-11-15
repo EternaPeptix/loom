@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Structured tool interfaces, HTTP/recon hygiene, and exact view/state repeat tracking
+
+- `codec_calc` gains `op = "rebase"`: subtracts a symbol offset from an observed runtime address, enforces
+  power-of-two page alignment (`>= 4096`, default `4096`), and resolves up to 32 named target offsets into
+  decimal, hex, `le64`, and `be64` forms in one checked operation (`loom-tools::codec`).
+- `bin_survey` on ELF objects now includes bounded static `sections` (`SHF_ALLOC`, `writable`, `executable`,
+  `nobits`), dynamic/PLT `relocations` (`symbol`, `address`), and defined `symbols` (`function`, `object`,
+  `other`, including zero-size labels) without executing the binary (`loom-tools::binary`, `packs/ctf`).
+- `command_guard` decodes up to three rounds of percent-encoding before checking interactive or unbounded
+  command patterns (`loom-tools::capabilities`).
+- `http_send` and `http_repeat` refuse quarantined session-ending, destructive-lifecycle, and single-use token
+  URLs unless `allow_quarantined: true` is passed, extract bounded `<form>` and `hidden`/`readonly`/`disabled`
+  field metadata on HTML responses, and record cross-principal `2xx` vs `401/403` status differentials on
+  normalized route templates (`loom-tools::http`, `packs/ctf`).
+- `security_ingest` classifies quarantined lifecycle/token URLs and queryless static-asset URLs as
+  `mandatory = false` and orders mandatory API/auth/query endpoints ahead of generic and non-mandatory routes
+  (`loom-agent::rtools::security`, `packs/redteam`).
+- `observe::repetitions` now also counts repeated `Read`/`Nav` views (`META_OF_BLOB` + `META_SHOWN`) and
+  `State`/`Nav`/`Read`/`Exec` plain-message results whose canonical arguments and result text match byte for
+  byte (`loom-core::observe`).
+
 ### Box: a remote container for commands
 
 - New `[box]` config (off by default) and tools `box_exec`, `box_get`, `box_reset`, given to the `ctf` solver

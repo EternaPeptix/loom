@@ -12,7 +12,9 @@
 //!
 //! `security_ingest` reads an existing observed blob (<=2 MiB, <=500 discovered assets), not model
 //! text. It requires attested mission evidence referring to that exact blob, parses a documented
-//! scanner format, and appends one atomic batch of asset observations. Every candidate is parsed
+//! scanner format, and appends one atomic batch of asset observations (quarantined lifecycle/token
+//! URLs and queryless static assets import with `mandatory = false`, ordered after application/API
+//! endpoints). Every candidate is parsed
 //! and validated before any append; malformed/unsupported formats fail with no partial import.
 //! External/entity-bearing XML DTDs are refused (the inert nmaprun declaration is accepted). Scanner
 //! labels never become confirmed vulnerabilities or scope grants.

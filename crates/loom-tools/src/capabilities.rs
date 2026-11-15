@@ -3,7 +3,9 @@
 //! CONTRACT: state is shared by calls of one session, never inherited by a child or restored on
 //! restart. Two HTTP exchanges at most may be in flight to the same normalized host in this daemon,
 //! across sessions. Acquisition is cancellation safe. This bounds structured HTTP, not arbitrary shell
-//! network traffic. `command_guard` is an execution-hygiene check, not a sandbox boundary.
+//! network traffic. `command_guard` normalizes up to three rounds of percent-encoding before checking
+//! known interactive or unbounded command patterns; it is an execution-hygiene check, not a sandbox
+//! boundary.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -63,10 +65,52 @@ pub async fn target_permit(host: &str, cancel: &CancellationToken) -> Result<Own
     }
 }
 
+pub(crate) fn decode_percent_rounds(input: &str, rounds: usize) -> String {
+    let mut current = input.to_string();
+    for _ in 0..rounds {
+        let bytes = current.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len().min(65_536));
+        let mut i = 0usize;
+        while let Some(&b) = bytes.get(i) {
+            if out.len() >= 65_536 {
+                break;
+            }
+            if b == b'%' {
+                if let (Some(&hi), Some(&lo)) = (bytes.get(i.saturating_add(1)), bytes.get(i.saturating_add(2))) {
+                    let hex_val = |c: u8| match c {
+                        b'0'..=b'9' => Some(c - b'0'),
+                        b'a'..=b'f' => Some(c - b'a' + 10),
+                        b'A'..=b'F' => Some(c - b'A' + 10),
+                        _ => None,
+                    };
+                    if let (Some(h), Some(l)) = (hex_val(hi), hex_val(lo)) {
+                        out.push((h << 4) | l);
+                        i = i.saturating_add(3);
+                        continue;
+                    }
+                }
+            }
+            out.push(b);
+            i = i.saturating_add(1);
+        }
+        let next = String::from_utf8_lossy(&out).into_owned();
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
 pub fn guard_script(script: &str) -> Result<(), String> {
-    let tokens = shlex::split(script).ok_or("The command has unbalanced shell quoting. Correct it before running.")?;
-    let has = |word: &str| tokens.iter().any(|t| t == word || t.rsplit('/').next() == Some(word));
-    let blocked = if script.contains("/dev/tcp/") {
+    let raw_tokens =
+        shlex::split(script).ok_or("The command has unbalanced shell quoting. Correct it before running.")?;
+    let decoded = decode_percent_rounds(script, 3);
+    let tokens: Vec<String> = raw_tokens.iter().map(|t| decode_percent_rounds(t, 3)).collect();
+    let matches_word = |t: &str, word: &str| t == word || t.rsplit('/').next() == Some(word);
+    let has =
+        |word: &str| raw_tokens.iter().any(|t| matches_word(t, word)) || tokens.iter().any(|t| matches_word(t, word));
+    let blocked = if script.contains("/dev/tcp/") || decoded.to_ascii_lowercase().contains("/dev/tcp/") {
         Some("Use a bounded HTTP request or an explicit socket timeout instead of /dev/tcp.")
     } else if has("tail") && (has("-f") || has("--follow")) {
         Some("Use a bounded tail call without follow mode.")
@@ -75,7 +119,7 @@ pub fn guard_script(script: &str) -> Result<(), String> {
     } else if has("msfconsole") && !has("-x") {
         Some("Use pty_open for an interactive console, or pass msfconsole -x with a bounded script.")
     } else if ["hydra", "ffuf", "gobuster", "nxc"].iter().any(|t| has(t))
-        && script.to_ascii_lowercase().contains("rockyou")
+        && (script.to_ascii_lowercase().contains("rockyou") || decoded.to_ascii_lowercase().contains("rockyou"))
     {
         Some("Use a small explicit wordlist and a time/rate limit instead of an online rockyou run.")
     } else if has("hashcat")
@@ -106,11 +150,14 @@ mod tests {
             "hashcat hashes",
             "cat </dev/tcp/host/80",
             "hydra -P rockyou.txt host ssh",
+            "hydra -P %72%6f%63%6b%79%6f%75.txt host ssh",
+            "hydra -P %252572ockyou.txt host ssh",
+            "python3 -c 'open(\"%252fdev%252ftcp%252fhost/80\")'",
             "tail -f log",
         ] {
             assert!(guard_script(s).is_err(), "{s}");
         }
-        for s in ["sqlmap --batch -u https://target", "hashcat --runtime=30 hashes", "printf '%s' hello"] {
+        for s in ["sqlmap --batch -u https://target", "hashcat --runtime=30 hashes", "printf '%s%%20ok' hello"] {
             assert!(guard_script(s).is_ok(), "{s}");
         }
     }
