@@ -1,5 +1,7 @@
 //! Bounded scanner adapters. These parse assets, never execute scanners or accept scanner severity
-//! as proof. Unknown records/required fields fail loudly; optional scanner metadata is ignored.
+//! as proof. Quarantined (logout, unsubscribe, single-use token) and queryless static-asset URLs are
+//! imported with `mandatory = false` and ordered after mandatory application/API endpoints. Unknown
+//! records/required fields fail loudly; optional scanner metadata is ignored.
 
 use loom_core::security_state::{AssetInput, AssetKind};
 use quick_xml::events::Event;
@@ -113,10 +115,31 @@ pub(super) fn parse(format: &str, bytes: &[u8], evidence: &[String]) -> Result<V
         return Err("The scanner output contains no supported asset observations; nothing was imported.".into());
     }
     // Atomic batch validation checks references at their point of use. Scanner service parents are
-    // hosts, so import all hosts before their services rather than sorting only by content hash.
+    // hosts, so import all hosts before their services, and order high-priority mandatory endpoints
+    // ahead of generic and non-mandatory static/quarantined endpoints.
     let mut ordered: Vec<_> = assets.into_iter().collect();
-    ordered.sort_by_key(|(id, asset)| (asset.parent.is_some(), id.clone()));
+    ordered.sort_by_key(|(id, asset)| (asset.parent.is_some(), priority_rank(asset), id.clone()));
     Ok(ordered.into_iter().map(|(_, asset)| asset).collect())
+}
+
+fn priority_rank(asset: &AssetInput) -> u8 {
+    match asset.kind {
+        AssetKind::Host | AssetKind::Identity | AssetKind::File => 0,
+        AssetKind::Service => 1,
+        AssetKind::Endpoint if !asset.mandatory => 4,
+        AssetKind::Endpoint => {
+            let low = asset.locator.to_ascii_lowercase();
+            if low.contains('?')
+                || ["/api/", "/admin", "/auth", "/login", "/graphql", "/v1/", "/v2/", "/internal"]
+                    .iter()
+                    .any(|p| low.contains(p))
+            {
+                2
+            } else {
+                3
+            }
+        }
+    }
 }
 
 fn authority(host: &str) -> String {
@@ -140,7 +163,10 @@ fn add(
     evidence: &[String],
     assets: &mut BTreeMap<String, AssetInput>,
 ) -> Result<String, String> {
-    let input = AssetInput { kind, locator: locator.into(), evidence: evidence.to_vec(), mandatory: true, parent };
+    let mandatory = kind != AssetKind::Endpoint
+        || (loom_tools::http::quarantined_locator(locator).is_none()
+            && !loom_tools::http::is_static_asset_locator(locator));
+    let input = AssetInput { kind, locator: locator.into(), evidence: evidence.to_vec(), mandatory, parent };
     let id = input.id()?;
     if !assets.contains_key(&id) && assets.len() >= MAX_ASSETS {
         return Err(
@@ -306,5 +332,25 @@ mod tests {
         assert!(parse("nuclei", data.as_bytes(), &["e1".into()]).is_err());
         assert!(parse("netexec", b"{\"hosts\":[{\"host\":\"a.test\",\"port\":70000}]}", &["e1".into()]).is_err());
         assert!(parse("bloodhound", b"{\"data\":[]}", &["e1".into()]).is_err());
+    }
+
+    #[test]
+    fn quarantined_and_static_endpoints_are_non_mandatory_and_ordered_after_api_routes() {
+        let ffuf = br#"{"results":[
+            {"url":"https://example.test/static/app.woff2","status":200},
+            {"url":"https://example.test/auth/logout","status":302},
+            {"url":"https://example.test/account?reset_token=abc","status":200},
+            {"url":"https://example.test/about","status":200},
+            {"url":"https://example.test/api/v1/users","status":200}
+        ]}"#;
+        let assets = parse("ffuf", ffuf, &["e1".into()]).unwrap();
+        assert_eq!(assets.len(), 5);
+        assert_eq!(assets[0].locator, "https://example.test/api/v1/users");
+        assert!(assets[0].mandatory);
+        assert_eq!(assets[1].locator, "https://example.test/about");
+        assert!(assets[1].mandatory);
+        for non_mandatory in &assets[2..] {
+            assert!(!non_mandatory.mandatory, "{}", non_mandatory.locator);
+        }
     }
 }

@@ -18,9 +18,11 @@
 //!
 //! ## Repetition
 //! A repetition is the same tool name with the same canonical arguments (`serde_json` compact form of
-//! `tool_call.args`) and the same output blob id, completed at least `min_count` times. Only calls of
-//! class `Nav`, `Read` and `Exec` count. There is no looser notion ("similar outcomes"): one was tried
-//! as an advisory line in the HUD and removed, since a guess beside the exact signal weakens both.
+//! `tool_call.args`) and the exact same result — the same output blob id, the same viewed blob and
+//! line range (`META_OF_BLOB` + `META_SHOWN`), or the same non-empty plain result text — completed at
+//! least `min_count` times. Calls of class `Nav`, `Read`, `Exec` and `State` count (`Write` and
+//! `Terminal` never do). There is no looser notion ("similar outcomes"): one was tried as an advisory
+//! line in the HUD and removed, since a guess beside the exact signal weakens both.
 //!
 //! ## Staleness
 //! Using `meta[META_PATH]` on results of class `Read` (a file was read) and `Write` (a file was
@@ -340,7 +342,28 @@ fn canonical(v: &Value) -> Value {
     }
 }
 
-/// Same tool, same arguments, same output blob, completed at least `min_count` times; most repeated first.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ResultIdentity {
+    Blob(BlobId),
+    View(String, String),
+    Text(String),
+}
+
+fn result_identity(t: &ToolResult) -> Option<ResultIdentity> {
+    if let Some(o) = &t.output {
+        return Some(ResultIdentity::Blob(o.id.clone()));
+    }
+    if let Some(of) = t.meta.get(META_OF_BLOB).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        let shown = t.meta.get(META_SHOWN).map(Value::to_string).unwrap_or_default();
+        return Some(ResultIdentity::View(of.to_string(), shown));
+    }
+    if !t.text.is_empty() {
+        return Some(ResultIdentity::Text(t.text.clone()));
+    }
+    None
+}
+
+/// Same tool, same arguments, and exact same result, completed at least `min_count` times; most repeated first.
 pub fn repetitions(records: &[Record], min_count: u32) -> Vec<Repetition> {
     let mut calls: HashMap<&CallId, &ToolCall> = HashMap::new();
     for r in records {
@@ -348,16 +371,16 @@ pub fn repetitions(records: &[Record], min_count: u32) -> Vec<Repetition> {
             calls.insert(&c.call_id, c);
         }
     }
-    let mut groups: BTreeMap<(String, String, BlobId), (u32, Seq)> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, String, ResultIdentity), (u32, Seq)> = BTreeMap::new();
     for r in records {
         let Event::ToolResult(t) = &r.event else { continue };
         let Some(call) = calls.get(&t.call_id) else { continue };
-        if !matches!(call.class, ToolClass::Nav | ToolClass::Read | ToolClass::Exec) {
+        if !matches!(call.class, ToolClass::Nav | ToolClass::Read | ToolClass::Exec | ToolClass::State) {
             continue;
         }
-        let Some(o) = &t.output else { continue };
+        let Some(identity) = result_identity(t) else { continue };
         let args = serde_json::to_string(&canonical(&call.args)).unwrap_or_default();
-        let e = groups.entry((call.name.clone(), args, o.id.clone())).or_insert((0, 0));
+        let e = groups.entry((call.name.clone(), args, identity)).or_insert((0, 0));
         e.0 = e.0.saturating_add(1);
         e.1 = e.1.max(r.seq);
     }
@@ -998,6 +1021,89 @@ mod tests {
         ];
         let r = repetitions(&recs, 2);
         assert_eq!(r[0].args.chars().count(), 200);
+    }
+
+    #[test]
+    fn repetitions_track_views_and_plain_state_messages_without_counting_terminal_or_writes() {
+        let msg_res = |seq: Seq, id: &str, name: &str, class: ToolClass, text: &str| {
+            rec(
+                seq,
+                Event::ToolResult(ToolResult {
+                    call_id: CallId::from(id),
+                    name: name.into(),
+                    status: ToolStatus::Ok,
+                    text: text.into(),
+                    output: None,
+                    cut: false,
+                    class,
+                    meta: serde_json::Map::new(),
+                    duration_ms: 0,
+                }),
+            )
+        };
+        let recs = vec![
+            call(1, "v1", "read", json!({"path": "a.rs"}), ToolClass::Read),
+            result(
+                2,
+                "v1",
+                ToolClass::Read,
+                ToolStatus::Ok,
+                None,
+                false,
+                json!({"of_blob": "blob1", "shown": [[1, 20]]}),
+            ),
+            call(3, "v2", "read", json!({"path": "a.rs"}), ToolClass::Read),
+            result(
+                4,
+                "v2",
+                ToolClass::Read,
+                ToolStatus::Ok,
+                None,
+                false,
+                json!({"of_blob": "blob1", "shown": [[1, 20]]}),
+            ),
+            call(5, "v3", "read", json!({"path": "a.rs"}), ToolClass::Read),
+            result(
+                6,
+                "v3",
+                ToolClass::Read,
+                ToolStatus::Ok,
+                None,
+                false,
+                json!({"of_blob": "blob1", "shown": [[1, 20]]}),
+            ),
+            // Different line window of the same blob is not a repeat.
+            call(7, "v4", "read", json!({"path": "a.rs"}), ToolClass::Read),
+            result(
+                8,
+                "v4",
+                ToolClass::Read,
+                ToolStatus::Ok,
+                None,
+                false,
+                json!({"of_blob": "blob1", "shown": [[21, 40]]}),
+            ),
+            // Identical cross-turn State tool calls with identical message text count.
+            call(9, "s1", "security_record", json!({"op": "same"}), ToolClass::State),
+            msg_res(10, "s1", "security_record", ToolClass::State, "[security_record · error]\nalready exists"),
+            call(11, "s2", "security_record", json!({"op": "same"}), ToolClass::State),
+            msg_res(12, "s2", "security_record", ToolClass::State, "[security_record · error]\nalready exists"),
+            call(13, "s3", "security_record", json!({"op": "same"}), ToolClass::State),
+            msg_res(14, "s3", "security_record", ToolClass::State, "[security_record · error]\nalready exists"),
+            // Terminal calls never count.
+            call(15, "t1", "finish", json!({"answer": "x"}), ToolClass::Terminal),
+            msg_res(16, "t1", "finish", ToolClass::Terminal, "refused"),
+            call(17, "t2", "finish", json!({"answer": "x"}), ToolClass::Terminal),
+            msg_res(18, "t2", "finish", ToolClass::Terminal, "refused"),
+            call(19, "t3", "finish", json!({"answer": "x"}), ToolClass::Terminal),
+            msg_res(20, "t3", "finish", ToolClass::Terminal, "refused"),
+        ];
+        let r = repetitions(&recs, 3);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].tool, "security_record");
+        assert_eq!(r[0].count, 3);
+        assert_eq!(r[1].tool, "read");
+        assert_eq!(r[1].count, 3);
     }
 
     fn read(seq: Seq, path: &str) -> Record {

@@ -1,7 +1,9 @@
 //! Deterministic encoding and integer helpers.
 //!
 //! CONTRACT: `codec_calc` never starts a process or reaches the network. Unsigned 64-bit arithmetic is
-//! checked; JWT decoding is explicitly unverified; RFC 6238 TOTP uses HMAC-SHA1 with an explicit
+//! checked; `rebase` subtracts a symbol offset from an observed address, requires power-of-two page
+//! alignment (`>= 4096`, default `4096`), and resolves up to 32 named target offsets with checked
+//! addition; JWT decoding is explicitly unverified; RFC 6238 TOTP uses HMAC-SHA1 with an explicit
 //! timestamp (no hidden clock dependency). Cyclic patterns use a bounded De Bruijn sequence, n=2..6.
 //! Inputs and results pass through normal tool logging: do not treat this as a secret vault.
 
@@ -109,6 +111,70 @@ fn cyclic(n: usize, limit: usize) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+fn addr_json(a: u64) -> Value {
+    json!({
+        "decimal": a.to_string(),
+        "hex": format!("0x{a:x}"),
+        "le64": hex::encode(a.to_le_bytes()),
+        "be64": hex::encode(a.to_be_bytes()),
+    })
+}
+
+fn rebase(observed_str: &str, args: &Map<String, Value>) -> Result<Value, String> {
+    let observed = number(observed_str)?;
+    let symbol_offset = args
+        .get("operand")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Supply operand as the known symbol offset for rebase.".to_string())
+        .and_then(number)?;
+    let page_size = args.get("page_size").and_then(Value::as_u64).unwrap_or(4096);
+    if page_size < 4096 || !page_size.is_power_of_two() {
+        return Err("Use a power-of-two page_size of at least 4096 bytes.".into());
+    }
+    let base = observed
+        .checked_sub(symbol_offset)
+        .ok_or("Observed address is smaller than the symbol offset; check the leaked value and symbol.")?;
+    let rem = base % page_size;
+    if rem != 0 {
+        return Err(format!(
+            "Rebased base 0x{base:x} is not aligned to page_size 0x{page_size:x} (remainder 0x{rem:x}); check the symbol offset, build, or leak width."
+        ));
+    }
+    let mut resolved = Map::new();
+    if let Some(targets_val) = args.get("targets") {
+        let targets = targets_val
+            .as_object()
+            .ok_or("targets must be an object mapping symbol names to decimal or 0x offsets.")?;
+        if targets.len() > 32 {
+            return Err("Supply at most 32 target offsets in one rebase call.".into());
+        }
+        for (name, offset_val) in targets {
+            if name.is_empty()
+                || name.len() > 64
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+            {
+                return Err(format!(
+                    "Invalid target name `{name}`; use 1..64 ASCII letters, digits, `_`, `.`, or `-`."
+                ));
+            }
+            let offset_str = offset_val
+                .as_str()
+                .ok_or_else(|| format!("Offset for target `{name}` must be a decimal or 0x integer string."))?;
+            let offset = number(offset_str)?;
+            let addr = base
+                .checked_add(offset)
+                .ok_or_else(|| format!("Target `{name}` overflowed 64-bit address space from base 0x{base:x}."))?;
+            resolved.insert(name.clone(), addr_json(addr));
+        }
+    }
+    Ok(json!({
+        "base": addr_json(base),
+        "page_size": format!("0x{page_size:x}"),
+        "page_aligned": true,
+        "targets": resolved,
+    }))
+}
+
 fn calculate(args: &Map<String, Value>) -> Result<Value, String> {
     let s = args.get("input").and_then(Value::as_str).unwrap_or_default();
     let op = args.get("op").and_then(Value::as_str).unwrap_or_default();
@@ -125,8 +191,9 @@ fn calculate(args: &Map<String, Value>) -> Result<Value, String> {
                 (Some("or"), Some(b)) => a | b,
                 _ => return Err("Supply operand with arithmetic add, sub, xor, and or or.".into()),
             };
-            json!({"decimal": a.to_string(), "hex":format!("0x{a:x}"), "le64":hex::encode(a.to_le_bytes()),"be64":hex::encode(a.to_be_bytes())})
+            addr_json(a)
         }
+        "rebase" => rebase(s, args)?,
         "unpack_le64" | "unpack_be64" => {
             let bytes: [u8; 8] = hex::decode(s)
                 .map_err(|e| e.to_string())?
@@ -188,10 +255,12 @@ fn calculate(args: &Map<String, Value>) -> Result<Value, String> {
 #[async_trait]
 impl Tool for CodecCalc {
     fn spec(&self) -> ToolSpec {
-        spec("codec_calc", "Calculate exact 64-bit pointer arithmetic/packing, encodings, unverified JWT decoding, cyclic offsets, or reproducible SHA1 TOTP. Never infer signature validity from decoded JWT fields.", ToolClass::Read, &[
-            req("op","string","Operation.").one_of(&["int","unpack_le64","unpack_be64","hex_encode","hex_decode","base64_encode","base64_decode","url_encode","url_decode","jwt_decode","totp","cyclic","cyclic_find"]),
-            opt("input","string","Value, UTF-8 text, Base32 TOTP secret, JWT, or cyclic needle (hex: allowed)."),
-            opt("arithmetic","string","Optional unsigned operation.").one_of(&["add","sub","xor","and","or"]), opt("operand","string","Decimal or 0x integer."),
+        spec("codec_calc", "Calculate exact 64-bit pointer arithmetic/packing, page-aligned base rebasing, encodings, unverified JWT decoding, cyclic offsets, or reproducible SHA1 TOTP. Never infer signature validity from decoded JWT fields.", ToolClass::Read, &[
+            req("op","string","Operation.").one_of(&["int","rebase","unpack_le64","unpack_be64","hex_encode","hex_decode","base64_encode","base64_decode","url_encode","url_decode","jwt_decode","totp","cyclic","cyclic_find"]),
+            opt("input","string","Value, observed address, UTF-8 text, Base32 TOTP secret, JWT, or cyclic needle (hex: allowed)."),
+            opt("arithmetic","string","Optional unsigned operation.").one_of(&["add","sub","xor","and","or"]), opt("operand","string","Decimal or 0x integer (symbol offset for rebase)."),
+            opt("page_size","integer","Page alignment modulus in bytes for rebase, default 4096 (power of two >= 4096).").min(4096),
+            opt("targets","object","Optional symbol name -> decimal or 0x offset map resolved from the rebased base.").with("additionalProperties",json!({"type":"string"})),
             opt("time_s","integer","Explicit Unix timestamp for TOTP.").min(0), opt("step_s","integer","TOTP interval, default 30.").min(1),opt("digits","integer","6 or 8."),
             opt("length","integer","Cyclic length/search bound, max one million.").min(1).max(1_000_000), opt("width","integer","Cyclic width, default 4.").min(2).max(6),
         ])
@@ -226,5 +295,47 @@ mod tests {
             calculate(json!({"op":"jwt_decode","input":jwt}).as_object().unwrap()).unwrap()["signature_verified"],
             false
         );
+    }
+    #[test]
+    fn rebase_enforces_page_alignment_and_resolves_targets() {
+        let ok = calculate(
+            json!({
+                "op": "rebase",
+                "input": "0x7f4a12084420",
+                "operand": "0x84420",
+                "targets": { "sym_a": "0x52290", "sym_b": "4096" }
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ok["base"]["hex"], "0x7f4a12000000");
+        assert_eq!(ok["page_aligned"], true);
+        assert_eq!(ok["targets"]["sym_a"]["hex"], "0x7f4a12052290");
+        assert_eq!(ok["targets"]["sym_a"]["le64"], "902205124a7f0000");
+        assert_eq!(ok["targets"]["sym_b"]["hex"], "0x7f4a12001000");
+
+        let unaligned =
+            calculate(json!({"op": "rebase", "input": "0x7f4a12084421", "operand": "0x84420"}).as_object().unwrap())
+                .unwrap_err();
+        assert!(unaligned.contains("not aligned to page_size 0x1000"), "{unaligned}");
+        assert!(
+            calculate(json!({"op": "rebase", "input": "0x1000", "operand": "0x2000"}).as_object().unwrap()).is_err()
+        );
+        assert!(calculate(
+            json!({"op": "rebase", "input": "0x8000", "operand": "0x0", "page_size": 6000}).as_object().unwrap()
+        )
+        .is_err());
+        assert!(calculate(
+            json!({
+                "op": "rebase",
+                "input": "0xfffffffffffff000",
+                "operand": "0x0",
+                "targets": { "wrap": "0x2000" }
+            })
+            .as_object()
+            .unwrap()
+        )
+        .is_err());
     }
 }

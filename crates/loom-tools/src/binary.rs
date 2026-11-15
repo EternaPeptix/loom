@@ -1,7 +1,8 @@
 //! Bounded binary inspection and optional local CLI adapters.
 //!
-//! CONTRACT: survey reads a descriptor-checked regular file (<=64 MiB), reports ELF/PE/Mach metadata
-//! indicators separately from unverified runtime mitigations, and identifies universal Mach containers.
+//! CONTRACT: survey reads a descriptor-checked regular file (<=64 MiB), reports static ELF/PE/Mach
+//! metadata indicators (including bounded ELF allocatable sections, dynamic relocations and defined
+//! symbols) separately from unverified runtime mitigations, and identifies universal Mach containers.
 //! Unknown facts remain unknown; no guessed mitigation. Optional rizin decompilation/xrefs are bounded, content-hash
 //! cached per query, sandboxed, and fail with installation guidance when the backend is absent.
 //! They do not install/launch a daemon or modify targets. gdb_probe disables startup/auto-load files,
@@ -57,7 +58,7 @@ fn read_binary(ctx: &ToolCtx, given: &str) -> Result<(PathBuf, Vec<u8>, String),
 fn survey(bytes: &[u8]) -> Result<Value, String> {
     let mut v = match Object::parse(bytes).map_err(|e| format!("Binary parse failed: {e}."))? {
         Object::Elf(elf) => {
-            use goblin::elf::{header, program_header as ph};
+            use goblin::elf::{header, program_header as ph, section_header as sh, sym};
             let imports: Vec<_> = elf
                 .dynsyms
                 .iter()
@@ -83,6 +84,57 @@ fn survey(bytes: &[u8]) -> Result<Value, String> {
                 })
                 .collect();
             functions.sort_by_key(|b| std::cmp::Reverse(b.0));
+            let sections: Vec<_> = elf
+                .section_headers
+                .iter()
+                .filter(|s| s.sh_flags & u64::from(sh::SHF_ALLOC) != 0)
+                .filter_map(|s| {
+                    let name = elf.shdr_strtab.get_at(s.sh_name).filter(|n| !n.is_empty())?;
+                    Some(json!({
+                        "name": name,
+                        "address": format!("0x{:x}", s.sh_addr),
+                        "bytes": s.sh_size,
+                        "writable": s.sh_flags & u64::from(sh::SHF_WRITE) != 0,
+                        "executable": s.sh_flags & u64::from(sh::SHF_EXECINSTR) != 0,
+                        "nobits": s.sh_type == sh::SHT_NOBITS,
+                    }))
+                })
+                .take(32)
+                .collect();
+            let mut reloc_map = BTreeMap::new();
+            for rel in elf.pltrelocs.iter().chain(elf.dynrelas.iter()).chain(elf.dynrels.iter()) {
+                if rel.r_sym == 0 {
+                    continue;
+                }
+                if let Some(name) =
+                    elf.dynsyms.get(rel.r_sym).and_then(|s| elf.dynstrtab.get_at(s.st_name)).filter(|n| !n.is_empty())
+                {
+                    reloc_map
+                        .entry((rel.r_offset, name.to_string()))
+                        .or_insert_with(|| json!({"symbol": name, "address": format!("0x{:x}", rel.r_offset)}));
+                }
+            }
+            let relocations: Vec<_> = reloc_map.into_values().take(40).collect();
+            let mut symbol_map = BTreeMap::new();
+            for (s, tab) in
+                elf.syms.iter().map(|s| (s, &elf.strtab)).chain(elf.dynsyms.iter().map(|s| (s, &elf.dynstrtab)))
+            {
+                if s.st_shndx == 0 || s.st_value == 0 {
+                    continue;
+                }
+                let Some(name) = tab.get_at(s.st_name).filter(|n| !n.is_empty()) else {
+                    continue;
+                };
+                let kind = match sym::st_type(s.st_info) {
+                    sym::STT_FUNC => "function",
+                    sym::STT_OBJECT => "object",
+                    _ => "other",
+                };
+                symbol_map.entry((s.st_value, name.to_string())).or_insert_with(|| {
+                    json!({"name": name, "address": format!("0x{:x}", s.st_value), "bytes": s.st_size, "kind": kind})
+                });
+            }
+            let symbols: Vec<_> = symbol_map.into_values().take(40).collect();
             let mut grouped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
             for name in &imports {
                 let group = if ["exec", "system", "spawn"].iter().any(|p| name.contains(p)) {
@@ -116,6 +168,7 @@ fn survey(bytes: &[u8]) -> Result<Value, String> {
             json!({"format":"ELF","bits":if elf.is_64{64}else{32},"entry":format!("0x{:x}",elf.entry),"shared_library":shared,
                 "entry_strategy":if shared{"exports and init_array before main"}else{"entrypoint and functions"},"nx_stack":stack,"position_independent":elf.header.e_type==header::ET_DYN,
                 "gnu_relro_segment":relro,"relro_binding":"unknown; segment presence alone does not establish full RELRO","stack_canary_import":imports.iter().any(|s|s.contains("__stack_chk_fail")),"seccomp":"unknown (requires runtime verification)",
+                "sections":sections,"relocations":relocations,"symbols":symbols,
                 "exports":exports,"constructors":constructors,"functions_by_size":functions.into_iter().take(15).map(|(_,v)|v).collect::<Vec<_>>(),"imports":grouped,"xref_ranking":"not inferred by the static survey; use bin_xrefs with rizin"})
         }
         Object::PE(pe) => {
@@ -429,7 +482,7 @@ fn limited_backend_view(ctx: &ToolCtx, mut output: ToolOutput, bytes: &[u8]) -> 
 #[async_trait]
 impl Tool for BinSurvey {
     fn spec(&self) -> ToolSpec {
-        spec("bin_survey","Inspect a bounded ELF/PE/Mach-O object without executing it. ELF/PE/Mach metadata flags, exports/imports, ELF constructors/large functions and interesting strings; unknown facts remain unknown.",ToolClass::Read,&[req("path","string","Binary path.")])
+        spec("bin_survey","Inspect a bounded ELF/PE/Mach-O object without executing it. ELF/PE/Mach metadata flags, ELF allocatable sections, dynamic relocations and defined symbols, exports/imports, constructors/large functions and interesting strings; unknown facts remain unknown.",ToolClass::Read,&[req("path","string","Binary path.")])
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let given = args.get("path").and_then(Value::as_str).unwrap_or_default();
@@ -862,5 +915,144 @@ mod tests {
         let result = command(&env.ctx, "printf real_target".into(), 2).await.unwrap();
         assert!(result.success());
         assert_eq!(result.bytes, b"real_target");
+    }
+
+    #[test]
+    fn elf_survey_extracts_sections_relocations_and_zero_size_symbols() {
+        use goblin::elf::{header, program_header as ph, section_header as sh, sym};
+        let mut buf = vec![0u8; 0x500];
+        let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let w64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+
+        // ELF64 little-endian executable header at 0x00 (64 bytes).
+        buf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        buf[4] = header::ELFCLASS64;
+        buf[5] = header::ELFDATA2LSB;
+        buf[6] = 1;
+        w16(&mut buf, 16, header::ET_EXEC);
+        w16(&mut buf, 18, header::EM_X86_64);
+        w32(&mut buf, 20, 1);
+        w64(&mut buf, 24, 0x401000); // e_entry
+        w64(&mut buf, 32, 0x40); // e_phoff (2 program headers: PT_LOAD + PT_DYNAMIC)
+        w64(&mut buf, 40, 0x200); // e_shoff (6 section headers * 64 = 0x180)
+        w16(&mut buf, 52, 64);
+        w16(&mut buf, 54, 56);
+        w16(&mut buf, 56, 2);
+        w16(&mut buf, 58, 64);
+        w16(&mut buf, 60, 6);
+        w16(&mut buf, 62, 1); // e_shstrndx = 1
+
+        // Program header 0: PT_LOAD mapping 0x0..0x500 at vaddr 0x400000 so goblin resolves DT_* vaddrs.
+        w32(&mut buf, 0x40, ph::PT_LOAD);
+        w32(&mut buf, 0x44, ph::PF_R | ph::PF_X);
+        w64(&mut buf, 0x48, 0);
+        w64(&mut buf, 0x50, 0x400000);
+        w64(&mut buf, 0x58, 0x400000);
+        w64(&mut buf, 0x60, 0x500);
+        w64(&mut buf, 0x68, 0x500);
+        w64(&mut buf, 0x70, 0x1000);
+
+        // Program header 1: PT_DYNAMIC at file offset 0x380 (vaddr 0x400380, size 0x70 = 7 entries).
+        w32(&mut buf, 0x78, ph::PT_DYNAMIC);
+        w32(&mut buf, 0x7c, ph::PF_R | ph::PF_W);
+        w64(&mut buf, 0x80, 0x380);
+        w64(&mut buf, 0x88, 0x400380);
+        w64(&mut buf, 0x90, 0x400380);
+        w64(&mut buf, 0x98, 0x70);
+        w64(&mut buf, 0xa0, 0x70);
+        w64(&mut buf, 0xa8, 8);
+
+        // Section string table at 0x100; symbol/dyn string table at 0x140.
+        let shstr = b"\0.shstrtab\0.text\0.bss\0.strtab\0.symtab\0";
+        buf[0x100..0x100 + shstr.len()].copy_from_slice(shstr);
+        let strtab = b"\0puts\0entry_label\0stage_buf\0";
+        buf[0x140..0x140 + strtab.len()].copy_from_slice(strtab);
+
+        // Symtab / dynsym at 0x180 (3 symbols * 24 bytes = 72 bytes): [0]=null, [1]=puts (undef), [2]=stage_buf (object), [3]=entry_label (zero-size func).
+        // Entry 1 (0x198): puts (undef, for dynamic relocation)
+        w32(&mut buf, 0x198, 1);
+        buf[0x198 + 4] = (sym::STB_GLOBAL << 4) | sym::STT_FUNC;
+        // Entry 2 (0x1b0): stage_buf (defined object at 0x404080, size 256)
+        w32(&mut buf, 0x1b0, 18);
+        buf[0x1b0 + 4] = (sym::STB_GLOBAL << 4) | sym::STT_OBJECT;
+        w16(&mut buf, 0x1b0 + 6, 3);
+        w64(&mut buf, 0x1b0 + 8, 0x404080);
+        w64(&mut buf, 0x1b0 + 16, 256);
+        // Entry 3 (0x1c8): entry_label (defined zero-size func at 0x401010)
+        w32(&mut buf, 0x1c8, 6);
+        buf[0x1c8 + 4] = (sym::STB_GLOBAL << 4) | sym::STT_FUNC;
+        w16(&mut buf, 0x1c8 + 6, 2);
+        w64(&mut buf, 0x1c8 + 8, 0x401010);
+
+        // One Elf64_Rela at 0x400 (24 bytes): r_offset = 0x404018, sym = 1 (puts), type = R_X86_64_JUMP_SLOT (7).
+        w64(&mut buf, 0x400, 0x404018);
+        w64(&mut buf, 0x408, (1u64 << 32) | 7);
+
+        // Dynamic table at 0x380: DT_STRTAB(5), DT_STRSZ(10), DT_SYMTAB(6), DT_SYMENT(11), DT_JMPREL(23), DT_PLTRELSZ(2), DT_PLTREL(20=RELA(7)), DT_NULL(0).
+        let dyn_entries: [(u64, u64); 8] = [
+            (5, 0x400140),
+            (10, strtab.len() as u64),
+            (6, 0x400180),
+            (11, 24),
+            (23, 0x400400),
+            (2, 24),
+            (20, 7),
+            (0, 0),
+        ];
+        w64(&mut buf, 0x98, 0x80);
+        w64(&mut buf, 0xa0, 0x80);
+        for (i, (tag, val)) in dyn_entries.iter().enumerate() {
+            w64(&mut buf, 0x380 + i * 16, *tag);
+            w64(&mut buf, 0x388 + i * 16, *val);
+        }
+
+        // Section headers at 0x200 (6 * 64 bytes): [0]=null, [1]=.shstrtab, [2]=.text, [3]=.bss, [4]=.strtab, [5]=.symtab.
+        let shdr = |b: &mut [u8],
+                    idx: usize,
+                    name: u32,
+                    ty: u32,
+                    flags: u64,
+                    addr: u64,
+                    off: u64,
+                    size: u64,
+                    link: u32,
+                    entsize: u64| {
+            let base = 0x200 + idx * 64;
+            w32(b, base, name);
+            w32(b, base + 4, ty);
+            w64(b, base + 8, flags);
+            w64(b, base + 16, addr);
+            w64(b, base + 24, off);
+            w64(b, base + 32, size);
+            w32(b, base + 40, link);
+            w64(b, base + 56, entsize);
+        };
+        shdr(&mut buf, 1, 1, sh::SHT_STRTAB, 0, 0, 0x100, shstr.len() as u64, 0, 0);
+        shdr(
+            &mut buf,
+            2,
+            11,
+            sh::SHT_PROGBITS,
+            u64::from(sh::SHF_ALLOC | sh::SHF_EXECINSTR),
+            0x401000,
+            0x100,
+            0x40,
+            0,
+            0,
+        );
+        shdr(&mut buf, 3, 17, sh::SHT_NOBITS, u64::from(sh::SHF_ALLOC | sh::SHF_WRITE), 0x404080, 0x480, 0x200, 0, 0);
+        shdr(&mut buf, 4, 22, sh::SHT_STRTAB, 0, 0, 0x140, strtab.len() as u64, 0, 0);
+        shdr(&mut buf, 5, 30, sh::SHT_SYMTAB, 0, 0, 0x180, 4 * 24, 4, 24);
+
+        let data = survey(&buf).unwrap();
+        assert_eq!(data["sections"][0]["name"], ".text");
+        assert_eq!(data["sections"][0]["executable"], true);
+        assert_eq!(data["sections"][1]["name"], ".bss");
+        assert_eq!(data["sections"][1]["writable"], true);
+        assert_eq!(data["sections"][1]["nobits"], true);
+        assert_eq!(data["relocations"][0], json!({"symbol": "puts", "address": "0x404018"}));
+        assert!(data["symbols"].as_array().unwrap().iter().any(|s| s["name"] == "entry_label" && s["bytes"] == 0));
+        assert!(data["symbols"].as_array().unwrap().iter().any(|s| s["name"] == "stage_buf" && s["kind"] == "object"));
     }
 }
