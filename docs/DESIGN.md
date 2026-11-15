@@ -1132,7 +1132,9 @@ head within 10 s gets `400`.
   The proxy then resolves the name itself and checks every address before connecting: `deny` entries
   that are IP literals or CIDR blocks match the resolved address, before any allow and before
   `allow_private`, in every mode; a private, loopback, link-local or otherwise special address is
-  refused unless `allow_private` lists the name (pattern) or the address (literal or CIDR). The
+  refused unless `allow_private` lists the name (pattern) or the address (literal or CIDR), or the
+  mission was granted exactly that private IP literal with a matching port (a `loom scope` grant of
+  `127.0.0.1:19201` reaches only `127.0.0.1:19201`; names granted never unlock private resolution). The
   connection is made to the first allowed address, never by name again, so a second lookup cannot
   change the destination. Rules are reported as `deny {entry}`, `mode deny_all`, `not in allow list`,
   `allow {pattern}`, `mode open`, `allow_private {entry}` or `deny private-address {addr}`.
@@ -1140,8 +1142,10 @@ head within 10 s gets `400`.
   restart (`Runtime::grant_scope`, `POST /api/sessions/{id}/scope`, `loom scope`). The egress policy of
   every running session of the mission becomes the configured network plus the granted hosts: under
   `deny_all` the granted hosts become an allowlist, under `allowlist` they are added to `allow`, under
-  `open` nothing changes. The configured `deny` list and the private-address rules still bind a granted
-  host. The lead records the grant in the ledger (`ScopeGrant`, when the mission keeps one) and gets a
+  `open` nothing changes. The configured `deny` list still binds a granted host. A granted host that
+  is an IP literal additionally authorizes that exact address (and port, when written) against the
+  private-address rule, for this mission only; names granted stay bound to the private-address rule
+  even when they resolve to a private address. The lead records the grant in the ledger (`ScopeGrant`, when the mission keeps one) and gets a
   protected note; no turn starts. A grant lives as long as the mission's sessions: a session started
   or restored later is built from the configured network plus the ledger's `granted_hosts()`, so
   grants survive a daemon restart. A lead asks with the `request_scope` tool (`hosts`, `why`), which

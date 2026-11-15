@@ -60,6 +60,14 @@
 //! validates a list of hosts to grant (non-empty, no blank entry, no whitespace or comma inside an
 //! entry, each a valid pattern) and returns them as written, trimmed.
 //!
+//! **Loopback/private literals granted to a session unlock that exact address**: a granted host that is
+//! an IP literal (`127.0.0.1`, `[::1]:8080`, `10.0.0.5:443`) additionally authorizes connections to that
+//! exact address (and port, when written) even though the address is private/loopback — an operator
+//! typing a lab target's literal address into a mission grant means exactly that address and nothing
+//! else. Names granted are not unlocked this way even when they resolve to a private address: opting into
+//! name resolution for private destinations stays with `allow_private`. `deny` still wins over a literal
+//! grant.
+//!
 //! `Verdict::allowed` + `rule` are what the proxy reports. Everything here is deterministic and does
 //! no I/O.
 //!
@@ -289,6 +297,9 @@ pub struct Policy {
     /// Host patterns, plus address entries (literals and CIDR blocks) that also match resolved addresses.
     deny: Vec<PrivEntry>,
     allow_private: Vec<PrivEntry>,
+    /// IP literals granted to this session (with optional port): exact addresses that may be reached
+    /// even though they are private/loopback/link-local. See the module contract.
+    granted_private: Vec<(IpAddr, Option<u16>)>,
 }
 
 fn grant_pattern(host: &str) -> Result<Pattern, String> {
@@ -297,6 +308,14 @@ fn grant_pattern(host: &str) -> Result<Pattern, String> {
             "The host \"{host}\" cannot be authorized: {why}. Write a host (`example.test`) or a wildcard (`*.example.test`), optionally followed by `:port`."
         )
     })
+}
+
+/// Extract an IP-literal grant from a granted host: `1.2.3.4`, `[::1]:8080`, `10.0.0.5:443`.
+/// A granted name is never a private grant, even if it resolves to one.
+fn literal_grant(host: &str) -> Option<(IpAddr, Option<u16>)> {
+    let (h, port) = split_host_port(host).ok()?;
+    let ip = h.parse::<IpAddr>().ok()?;
+    Some((canonical_ip(ip), port))
 }
 
 /// Validate hosts to be granted to a session: at least one, none blank, one host per entry, each a valid
@@ -345,6 +364,7 @@ impl Policy {
             reference_hosts: parse_list("reference_hosts", &cfg.reference_hosts, Pattern::parse)?,
             deny: parse_list("deny", &cfg.deny, PrivEntry::parse)?,
             allow_private: parse_list("allow_private", &cfg.allow_private, PrivEntry::parse_private)?,
+            granted_private: Vec::new(),
         })
     }
 
@@ -370,7 +390,11 @@ impl Policy {
             return Ok(policy);
         }
         for h in hosts {
-            policy.allow.push(grant_pattern(h)?);
+            let p = grant_pattern(h)?;
+            if let Some((ip, port)) = literal_grant(h) {
+                policy.granted_private.push((ip, port));
+            }
+            policy.allow.push(p);
         }
         policy.mode = NetworkMode::Allowlist;
         Ok(policy)
@@ -430,6 +454,13 @@ impl Policy {
         }
         if !is_special(addr) {
             return Verdict::yes(name_rule);
+        }
+        let grant_port = port;
+        let can = canonical_ip(addr);
+        for (ip, gp) in &self.granted_private {
+            if *ip == can && gp.as_ref().is_none_or(|p| *p == grant_port) {
+                return Verdict::yes(format!("grant private-address {can}"));
+            }
         }
         for e in &self.allow_private {
             match e {
@@ -585,6 +616,43 @@ mod tests {
 
         let open = Policy::with_hosts(&cfg(NetworkMode::Open, &[], &[], &[]), &hosts(&["a.test"])).unwrap();
         assert_eq!(open.check_name("anything.test", 80).rule, "mode open");
+    }
+
+    #[test]
+    fn granted_private_literals_authorize_exactly_themselves() {
+        let c = cfg(NetworkMode::DenyAll, &[], &[], &[]);
+        let hosts = |h: &[&str]| h.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // A granted literal with a port authorizes that literal:port only.
+        let p = Policy::with_hosts(&c, &hosts(&["127.0.0.1:19201"])).unwrap();
+        assert!(p.check_addr("127.0.0.1", 19201, ip("127.0.0.1"), "allow 127.0.0.1:19201").allowed);
+        assert!(!p.check_addr("127.0.0.1", 7878, ip("127.0.0.1"), "allow 127.0.0.1:19201").allowed);
+        // A different loopback address is still refused — the grant is exact.
+        assert!(!p.check_addr("127.0.0.2", 19201, ip("127.0.0.2"), "allow 127.0.0.1:19201").allowed);
+        // Port-less literal grants cover every port on that address — but nothing else.
+        let p = Policy::with_hosts(&c, &hosts(&["127.0.0.1"])).unwrap();
+        assert!(p.check_addr("127.0.0.1", 7878, ip("127.0.0.1"), "allow 127.0.0.1").allowed);
+        assert!(!p.check_addr("127.0.0.2", 7878, ip("127.0.0.2"), "allow 127.0.0.1").allowed);
+        // IPv6 brackets, canonical-form compare (an IPv4-mapped form stands for the same address).
+        let p = Policy::with_hosts(&c, &hosts(&["[::1]:8080"])).unwrap();
+        assert!(p.check_addr("::1", 8080, ip("::1"), "allow [::1]:8080").allowed);
+        assert!(!p.check_addr("::1", 9090, ip("::1"), "allow ::1:8080").allowed);
+        let p = Policy::with_hosts(&c, &hosts(&["10.0.0.5:443"])).unwrap();
+        assert!(p.check_addr("::ffff:10.0.0.5", 443, ip("::ffff:10.0.0.5"), "allow ::ffff:10.0.0.5").allowed);
+        // A name grant does NOT unlock its private resolution (SSRF amplifier stays closed).
+        let p = Policy::with_hosts(&c, &hosts(&["lab.test:19201"])).unwrap();
+        assert!(!p.check_addr("lab.test", 19201, ip("10.1.2.3"), "allow lab.test:19201").allowed);
+        // But granting the literal IP unlocks it.
+        let p = Policy::with_hosts(&c, &hosts(&["10.1.2.3:19201"])).unwrap();
+        assert!(p.check_addr("lab.test", 19201, ip("10.1.2.3"), "allow lab.test:19201").allowed);
+        // The config's deny list still beats the literal grant.
+        let c2 = cfg(NetworkMode::DenyAll, &[], &["10.1.2.3:19201"], &[]);
+        let p = Policy::with_hosts(&c2, &hosts(&["10.1.2.3:19201"])).unwrap();
+        assert_eq!(p.check_addr("lab.test", 19201, ip("10.1.2.3"), "allow 10.1.2.3:19201").rule, "deny 10.1.2.3:19201");
+        // Mode open unchanged: private addresses stay refused there (module contract), grants
+        // don't need to work in an open mode.
+        let open = Policy::with_hosts(&cfg(NetworkMode::Open, &[], &[], &[]), &hosts(&["127.0.0.1"])).unwrap();
+        assert_eq!(open.check_addr("x.test", 80, ip("127.0.0.1"), "mode open").rule, "deny private-address 127.0.0.1");
     }
 
     #[test]
