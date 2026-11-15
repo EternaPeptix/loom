@@ -458,7 +458,7 @@ impl Policy {
         let grant_port = port;
         let can = canonical_ip(addr);
         for (ip, gp) in &self.granted_private {
-            if *ip == can && gp.map_or(true, |p| p == grant_port) {
+            if *ip == can && gp.as_ref().is_none_or(|p| *p == grant_port) {
                 return Verdict::yes(format!("grant private-address {can}"));
             }
         }
