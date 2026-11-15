@@ -1062,7 +1062,7 @@ mod tests {
         for role in ["solver", "web_solver", "binary_solver", "crypto_solver"] {
             assert!(has(role, "hand_off") && !has(role, "ask_for"), "ctf/{role} should have hand_off only");
         }
-        assert_eq!(ctf.roles.get("binary_solver").unwrap().tools.len(), 29);
+        assert_eq!(ctf.roles.get("binary_solver").unwrap().tools.len(), 30);
     }
 
     #[test]
