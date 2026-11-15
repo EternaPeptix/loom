@@ -16,7 +16,7 @@ verifier = "judge"
 tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
   "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
-  "cve_lookup", "cve_search", "advisory_lookup",
+  "cve_lookup", "cve_search", "advisory_lookup", "dep_scan",
   "agent_spawn", "agent_fanout", "attempt", "agent_adopt", "agent_message", "agent_stop", "decide", "verify",
   "request_scope", "conclude", "finish", "ask_user", "report_blocker", "wait", "ask_for",
 ]
@@ -30,7 +30,7 @@ termination = "explicit"
 tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
   "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
-  "cve_lookup", "advisory_lookup",
+  "cve_lookup", "advisory_lookup", "dep_scan",
   "request_scope", "conclude", "finish", "report_blocker", "wait", "hand_off",
 ]
 
@@ -44,7 +44,7 @@ read_only = true
 tools = [
   "bash", "job_wait", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
   "ledger", "log_search",
-  "cve_lookup", "advisory_lookup",
+  "cve_lookup", "advisory_lookup", "dep_scan",
   "verdict", "report_blocker",
 ]
 
@@ -57,5 +57,5 @@ read_only = true
 tools = [
   "bash", "job_wait", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
   "pin", "log_search",
-  "cve_lookup", "cve_search", "advisory_lookup", "request_scope",
+  "cve_lookup", "cve_search", "advisory_lookup", "dep_scan", "request_scope",
 ]

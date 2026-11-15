@@ -77,7 +77,8 @@ loopback_all = false       # true lets commands connect to any loopback port
 # env_pass = ["MY_TOKEN"]  # environment variables passed to commands although their names look like secrets
 
 [network]
-# What tools (bash, web_fetch, the vulnerability lookups) can reach through the egress proxy.
+# What tools (bash, web_fetch, the vulnerability lookups, and dep_scan's first-run database /
+# cdxgen fetches) can reach through the egress proxy.
 # Requests to your model server are not affected by this section.
 #   "deny_all"  (the default) no host is reachable
 #   "allowlist" only hosts matching `allow` are reachable
@@ -85,6 +86,8 @@ loopback_all = false       # true lets commands connect to any loopback port
 mode = "deny_all"
 # reference_hosts = ["docs.rs:443"]  # trusted in-process GET only; refused to the raw command proxy in every mode
 # allow = ["*.rust-lang.org", "docs.rs", "crates.io", "api.example.test:443"]   # used by "allowlist"; example
+# For dep_scan's first vulnerability-database download, also allow the OCI registry dep-scan is
+# configured with (often ghcr.io) and any ecosystem hosts cdxgen needs for the project type.
 # deny = ["169.254.0.0/16", "tracker.example.test"]   # always refused, in every mode: host patterns, IP addresses or CIDR blocks
 # allow_private = ["10.1.2.3"]   # private, loopback or link-local destinations that are permitted (host pattern, IP or CIDR)
 

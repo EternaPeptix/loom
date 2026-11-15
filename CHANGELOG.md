@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### OWASP dep-scan tool
+
+- New built-in `dep_scan` tool wraps the operator-installed OWASP
+  [dep-scan](https://github.com/owasp-dep-scan/dep-scan) `depscan` command under the sandbox: scan a
+  project directory (`--src`) or one CycloneDX SBOM (`--bom`), write reports/`HOME`/`VDB_HOME` only
+  under the session temp dir, parse and store the VDR and SBOM as citable blobs, and summarise
+  prioritized/reachable findings (at most 50 lines; counts cover all). A missing binary is install
+  guidance, not a clean scan. `command_bounded` raises the analysis-command timeout ceiling for the
+  first-run database download. Granted to `core` and `vr` roles; see README, DESIGN § tools, and
+  `docs/SECURITY-TOOLS.md`.
+
 ### Structured tool interfaces, HTTP/recon hygiene, and exact view/state repeat tracking
 
 - `codec_calc` gains `op = "rebase"`: subtracts a symbol offset from an observed runtime address, enforces

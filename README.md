@@ -35,6 +35,9 @@ It inverts the cloud assumptions:
   `mode = "bubblewrap"` (deny-all shell networking; no proxy bridge). Explicit `mode = "none"` leaves
   every shell command unconfined, including verifier roles. Missing sandbox support fails closed.
 - An OpenAI-compatible `/v1/chat/completions` server that streams.
+- Optional, for the `dep_scan` tool only: the `depscan` command (OWASP dep-scan) on the daemon's
+  `PATH` — e.g. `brew tap owasp-dep-scan/tap && brew install dep-scan`, a standalone release binary,
+  or `pip install owasp-depscan` with `npm install -g @cyclonedx/cdxgen`. Loom never installs it.
 
 ## Quick start
 
@@ -134,7 +137,10 @@ prints a line matching a pattern, not only when it ends) with `job_wait`, `job_k
 and `edit` (regular files only; a write refuses when the file changed since the session last read
 it); `glob` and `grep`; `out_read` and `out_grep` (page and search any stored output); `web_fetch`
 (through the egress proxy); and `cve_lookup`, `cve_search` and `advisory_lookup` (public vulnerability
-databases, through the same proxy). The runtime adds the ledger tools (`plan`, `step`, `note`, `claim`,
+databases, through the same proxy); and `dep_scan` (OWASP [dep-scan](https://github.com/owasp-dep-scan/dep-scan)
+over a project directory or a CycloneDX SBOM: it runs the operator-installed `depscan` command under
+the sandbox, and stores the generated SBOM and the full CycloneDX VDR like any other tool output, so
+its prioritized findings can be quoted as evidence). The runtime adds the ledger tools (`plan`, `step`, `note`, `claim`,
 `claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`), the agent tools (`agent_spawn`,
 `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`, `agent_stop`, `decide`, `verify`), `request_scope` (ask the operator for
 hosts) and `conclude` (state that the goal is met or cannot be met, with evidence) and the terminating tools (`finish`,
@@ -188,7 +194,9 @@ waits in your inbox without stopping it, and `loom scope <session> <host>...` (o
 grants it for that session only.
 
 `web_fetch` and the vulnerability-lookup tools need a route, so with the default they fail with a
-refusal that names the policy. `docs/config.example.toml` shows an allowlist.
+refusal that names the policy. `docs/config.example.toml` shows an allowlist. `dep_scan` runs locally
+once installed, but a first scan downloads dep-scan's vulnerability database (and `cdxgen` may reach
+its ecosystem registries), so it needs a route for those hosts too.
 
 To use a daemon that runs on another machine, forward its port over SSH and give the client that
 daemon's token; `docs/RUN.md` has the recipe.

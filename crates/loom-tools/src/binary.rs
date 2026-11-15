@@ -276,6 +276,17 @@ impl CommandOutcome {
 }
 
 pub(crate) async fn command(ctx: &ToolCtx, script: String, seconds: u64) -> Result<CommandOutcome, String> {
+    command_bounded(ctx, script, seconds, 120).await
+}
+
+/// Like [`command`], with a caller-chosen timeout ceiling (for scanners whose first run may
+/// download a large vulnerability database). The output limit is unchanged.
+pub(crate) async fn command_bounded(
+    ctx: &ToolCtx,
+    script: String,
+    seconds: u64,
+    ceiling: u64,
+) -> Result<CommandOutcome, String> {
     use crate::proc::{self, Spawn, WaitEnd};
     let (_, out_path, exit_path) = ctx.jobs.allocate().await.map_err(|e| e.to_string())?;
     let parent = std::env::vars().collect();
@@ -315,7 +326,8 @@ pub(crate) async fn command(ctx: &ToolCtx, script: String, seconds: u64) -> Resu
     let mut running =
         proc::spawn(&ctx.sandbox, &spec).map_err(|e| format!("The analysis command did not start: {e}."))?;
     let limit = ctx.cfg.max_output_bytes.min(2_000_000);
-    let wait = running.wait(&ctx.cancel, Some(Duration::from_secs(seconds.clamp(1, 120))), limit).await;
+    let wait =
+        running.wait(&ctx.cancel, Some(Duration::from_secs(seconds.clamp(1, ceiling.max(1)))), limit).await;
     let background = matches!(wait, WaitEnd::Ended(_)) && running.group_alive();
     let ended = match &wait {
         WaitEnd::Ended(e) if !background => e.clone(),

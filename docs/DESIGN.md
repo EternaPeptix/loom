@@ -925,7 +925,7 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
 
 **Tools.** Built in (`Registry::builtin`): `bash`, `job_wait`, `job_kill`, `job_list`, `read`,
 `write`, `edit`, `glob`, `grep`, `out_read`, `out_grep`, `web_fetch`, `cve_lookup`, `cve_search`,
-`advisory_lookup`. Box tools (`rtools::BOX_NAMES`, `[box]` only): `box_exec`, `box_get`, `box_reset`. Runtime-owned (`loom-agent::rtools`, `NAMES`): `plan`, `step`, `note`, `claim`,
+`advisory_lookup`, `dep_scan`. Box tools (`rtools::BOX_NAMES`, `[box]` only): `box_exec`, `box_get`, `box_reset`. Runtime-owned (`loom-agent::rtools`, `NAMES`): `plan`, `step`, `note`, `claim`,
 `claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`, `finish`, `verdict`, `ask_user`,
 `report_blocker`, `wait`, `agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`,
 `agent_stop`, `decide`, `verify`. A role lists the tools it has, in request order; a name in neither set is a pack error. The
@@ -1027,6 +1027,15 @@ evidence kind and staleness. Each module's documentation is the precise specific
 - `cve_lookup` (NVD record with EPSS), `cve_search` (NVD, ranked by EPSS) and `advisory_lookup` (OSV)
   reach only `services.nvd.nist.gov`, `api.first.org` and `api.osv.dev`, through the proxy, so the
   network policy must allow them; each stores the upstream JSON beside its text report.
+- `dep_scan` runs the operator-installed OWASP dep-scan `depscan` command under the sandbox over a
+  workspace directory (`--src`) or one CycloneDX SBOM file (`--bom`), never installing it and never
+  using its server mode. Every write (reports, `HOME`, the `VDB_HOME` database cache, temp) goes to
+  a fresh directory under the session temp dir, so read-only roles can scan and the workspace is not
+  polluted; that per-session cache means a first scan may download the vulnerability database
+  through the egress proxy. The `*.vdr.json` reports are parsed, deduplicated and summarised
+  (prioritized/reachable first, then score, at most 50 lines; counts cover all findings), and the
+  VDR, the generated SBOM and the scanner console are stored as blobs. dep-scan's
+  prioritized/reachable labels are its static analysis, stated as such, not execution evidence.
 - `pin {handle, reason, unpin?}` keeps a stored output and every view of it in view through re-weaves;
   `log_search {pattern, in?, max?}` searches the session's own record.
 
