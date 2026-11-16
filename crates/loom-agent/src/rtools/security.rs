@@ -6,6 +6,12 @@
 //! op. The lead opens/prioritizes hypotheses. Only an independent child with `read_only` and `verdict`
 //! may close one, and only its original lead may reprioritize it. The core checks all evidence and
 //! coverage invariants under the journal lock. Batches have the same authorization as individual ops.
+//! A batch element that fails ID resolution, secret-handle resolution or authorization is refused with
+//! "Operation {i} of {n} in the batch ({action}): {error}", as the core names one that fails validation.
+//! The asset in a `cred` or `auth` condition (`blocked_on`, `condition_unlock`, a credential's or
+//! foothold's `unlocks`) is resolved from an alias or prefix to the full asset ID, because routes are
+//! revisited by exact match; a value that is not an ID or alias is kept, and one that starts with `as-`
+//! and matches nothing is refused.
 //!
 //! The caller passed to `shapes` is built from the session: `Standing::Lead` when it has no parent,
 //! `Standing::Judge` when it is a child whose role is `read_only` and has the `verdict` tool,
@@ -36,7 +42,7 @@ use super::{observed_producer, Shared};
 use async_trait::async_trait;
 use loom_core::event::{ToolClass, ToolSpec};
 use loom_core::ledger::LedgerOp;
-use loom_core::security_state::{Fact, SecurityOp, SecurityState};
+use loom_core::security_state::{Condition, ConditionKind, Fact, SecurityOp, SecurityState};
 use loom_tools::params::{opt, req, spec};
 use loom_tools::{Body, Tool, ToolCtx, ToolOutput};
 use serde::de::DeserializeOwned;
@@ -117,8 +123,17 @@ fn resolve_op(state: &SecurityState, op: &mut SecurityOp) -> Result<(), String> 
                 }
             }
         }
-        SecurityOp::CredentialAdd { credential } => resolve(&mut credential.asset)?,
-        SecurityOp::FootholdAdd { foothold } => resolve(&mut foothold.asset)?,
+        SecurityOp::CredentialAdd { credential } => {
+            resolve(&mut credential.asset)?;
+            resolve_conditions(state, &mut credential.unlocks)?;
+        }
+        SecurityOp::FootholdAdd { foothold } => {
+            resolve(&mut foothold.asset)?;
+            resolve_conditions(state, &mut foothold.unlocks)?;
+        }
+        SecurityOp::ConditionUnlock { conditions, .. } | SecurityOp::BlockedOn { conditions, .. } => {
+            resolve_conditions(state, conditions)?;
+        }
         SecurityOp::CoverageSet { asset, .. } => resolve(asset)?,
         SecurityOp::HypothesisPriority { id, .. }
         | SecurityOp::HypothesisEvidence { id, .. }
@@ -131,6 +146,23 @@ fn resolve_op(state: &SecurityState, op: &mut SecurityOp) -> Result<(), String> 
             resolve(&mut relation.to)?;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// A cred or auth condition's value is an asset ID, matched exactly when routes are revisited: an alias or
+/// prefix is resolved to the full ID. A value that is not an ID or alias is kept; one that looks like a
+/// mistyped asset ID (`as-…`) is refused.
+fn resolve_conditions(state: &SecurityState, conditions: &mut [Condition]) -> Result<(), String> {
+    for condition in conditions {
+        if !matches!(condition.kind, ConditionKind::Cred | ConditionKind::Auth) {
+            continue;
+        }
+        match state.resolve(&condition.value) {
+            Ok(id) if id.starts_with("as-") => condition.value = id,
+            Err(e) if condition.value.starts_with("as-") && condition.value.len() != 67 => return Err(e),
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -177,10 +209,24 @@ impl Tool for SecurityRecord {
             && operation.get("action").and_then(Value::as_str) != Some("batch");
         let notes = read.notes;
         let mut op = read.op;
-        if let Err(e) = resolve_op(&state.security, &mut op)
-            .and_then(|_| resolve_secrets(ctx, &mut op))
-            .and_then(|_| authorize(&self.0, &state.security, &op))
-        {
+        let prepare = |op: &mut SecurityOp| {
+            resolve_op(&state.security, op)
+                .and_then(|_| resolve_secrets(ctx, op))
+                .and_then(|_| authorize(&self.0, &state.security, op))
+        };
+        // A batch element that fails is named, the way the core names one that fails validation.
+        let prepared = match &mut op {
+            SecurityOp::Batch { operations } => {
+                let n = operations.len();
+                operations.iter_mut().enumerate().try_for_each(|(i, element)| {
+                    prepare(element).map_err(|e| {
+                        format!("Operation {} of {n} in the batch ({}): {e}", i.saturating_add(1), element.action())
+                    })
+                })
+            }
+            single => prepare(single),
+        };
+        if let Err(e) = prepared {
             return ToolOutput::error(e);
         }
         // Shared::ledger_append serializes all structural validation and writes under the journal lock.
@@ -470,6 +516,80 @@ mod tests {
         assert_eq!(batch.status, Status::Error);
         assert!(batch.text.contains("Operation 2 of 2 in the batch (asset_upsert): "), "{}", batch.text);
         assert!(r.shared.ledger().unwrap().security.assets.len() == 2);
+    }
+
+    #[tokio::test]
+    async fn condition_assets_resolve_and_every_batch_failure_is_named() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        let host = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"asset_upsert","asset":{"kind":"host","locator":"10.0.0.5",
+                    "evidence":["e1"]}}}),
+            )
+            .await;
+        assert_eq!(host.status, Status::Ok, "{}", host.text);
+        let full = r.shared.ledger().unwrap().security.assets.keys().next().unwrap().clone();
+        // A prefix in a cred condition is stored as the full asset ID, which is what a later unlock compares.
+        let blocked = |value: &str| {
+            json!({"operation":{"action":"blocked_on","target":"c1","conditions":[{"kind":"cred","value":value}]}})
+        };
+        let ok = r.call("security_record", blocked(&full[..12])).await;
+        assert_eq!(ok.status, Status::Ok, "{}", ok.text);
+        let stored = r.shared.ledger().unwrap().security.blocked.get("c1").unwrap().conditions[0].value.clone();
+        assert_eq!(stored, full);
+        // A mistyped asset ID is refused instead of waiting for an unlock that cannot come.
+        let bad = r.call("security_record", blocked("as-zzzzzzzz")).await;
+        assert_eq!(bad.status, Status::Error);
+        assert!(bad.text.contains("No security record matches `as-zzzzzzzz`"), "{}", bad.text);
+        // A value that is not an ID is kept.
+        assert_eq!(r.call("security_record", blocked("admin-session")).await.status, Status::Ok);
+        // A resolution failure inside a batch names the element.
+        let batch = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"batch","operations":[
+                    {"action":"coverage_set","asset":full,"disposition":{"status":"deferred","reason":"budget"}},
+                    {"action":"coverage_set","asset":"a1","disposition":{"status":"deferred","reason":"budget"}}]}}),
+            )
+            .await;
+        assert_eq!(batch.status, Status::Error);
+        assert!(batch.text.contains("Operation 2 of 2 in the batch (coverage_set): Use an exact ID or alias"), "{}", batch.text);
+        // So does a failing secret handle, and a nested batch.
+        let secret = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"batch","operations":[
+                    {"action":"coverage_set","asset":full,"disposition":{"status":"deferred","reason":"budget"}},
+                    {"action":"credential_add","credential":{"asset":full,"principal":"root","evidence":["e1"],
+                        "secret_handle":"out:nothere"}}]}}),
+            )
+            .await;
+        assert!(secret.text.contains("Operation 2 of 2 in the batch (credential_add): Use an existing stored out:"), "{}", secret.text);
+        let nested = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"batch","operations":[
+                    {"action":"coverage_set","asset":full,"disposition":{"status":"deferred","reason":"budget"}},
+                    {"action":"batch","operations":[
+                        {"action":"coverage_set","asset":full,"disposition":{"status":"deferred","reason":"budget"}}]}]}}),
+            )
+            .await;
+        assert!(nested.text.contains("Operation 2 of 2 in the batch (batch): Nested security batches"), "{}", nested.text);
+        // A child's early refusal inside a batch is named too.
+        let child = rig("worker", true, true);
+        let denied = child
+            .call(
+                "security_record",
+                json!({"operation":{"action":"batch","operations":[
+                    {"action":"alias_add","alias":"web","target":"as-0000"},
+                    {"action":"hypothesis_priority","id":"hy-0000","priority":3}]}}),
+            )
+            .await;
+        assert_eq!(denied.status, Status::Error);
+        assert!(denied.text.contains("Operation 2 of 2 in the batch (hypothesis_priority): Only"), "{}", denied.text);
     }
 
     #[tokio::test]

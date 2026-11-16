@@ -28,8 +28,10 @@
 //! `SecurityOp::action` is the serialized `action` tag of an op (`asset_upsert`, …, `batch`). A batch
 //! stays one atomic append; when one of its operations fails validation the error is
 //! "Operation {i} of {n} in the batch ({action}): {error}" (1-based `i`), so the caller can tell
-//! which one to correct. Tests required: the prefix for a failing second operation of three, and
-//! that nothing of the batch was applied.
+//! which one to correct; a nested batch is one such operation ("Operation {i} of {n} in the batch
+//! (batch): Nested security batches are not supported; flatten the operations."). Tests required: the
+//! prefix for a failing second operation of three, the nested batch, and that nothing of the batch was
+//! applied.
 
 pub mod causal;
 pub use causal::{Atom, Fact, Literal, Projection, Rule, WhatIf};
@@ -600,7 +602,12 @@ impl SecurityState {
                 let n = operations.len();
                 for (i, op) in operations.iter().enumerate() {
                     if matches!(op, SecurityOp::Batch { .. }) {
-                        return Err("Nested security batches are not supported; flatten the operations.".into());
+                        return Err(format!(
+                            "Operation {} of {n} in the batch ({}): Nested security batches are not supported; \
+                             flatten the operations.",
+                            i.saturating_add(1),
+                            op.action()
+                        ));
                     }
                     staged.security.validate(op, &staged).map_err(|e| {
                         format!("Operation {} of {n} in the batch ({}): {e}", i.saturating_add(1), op.action())
@@ -1435,6 +1442,15 @@ mod tests {
         assert!(err.starts_with("Operation 2 of 3 in the batch (asset_upsert): "), "{err}");
         assert!(err.contains("e404"), "{err}");
         assert!(l.security.assets.is_empty());
+        // A nested batch is one of the operations that fails, and is named like the others.
+        let nested = SecurityOp::Batch {
+            operations: vec![host("a.test", "e1"), SecurityOp::Batch { operations: vec![host("c.test", "e1")] }],
+        };
+        let err = l.validate(&LedgerOp::Security(nested), false).unwrap_err();
+        assert_eq!(
+            err,
+            "Operation 2 of 2 in the batch (batch): Nested security batches are not supported; flatten the operations."
+        );
     }
 
     #[test]

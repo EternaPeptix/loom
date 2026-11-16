@@ -54,7 +54,7 @@ sentence under `normalized` in the result (`{"entry": n, "normalized": [...], "s
 absent when nothing was rewritten). What is read:
 
 - `ops` or `items` for a batch's `operations`; a batch element is read on its own and a failing element
-  is named ("Operation 2 of 3 in the batch (asset_upsert): ..."). A batch stays one atomic append.
+  is named, whichever check refuses it ("Operation 2 of 3 in the batch (asset_upsert): ..."). A batch stays one atomic append.
 - Wrapper fields for `asset_upsert`, `credential_add`, `foothold_add`, `relation_add` given at the top
   level, `evidence` given beside the wrapper, `username`/`user` for `principal`.
 - A hypothesis given as `hypothesis: {...}`, `statement` for `text`, a `status` (dropped: a new hypothesis
@@ -65,11 +65,15 @@ absent when nothing was rewritten). What is read:
 - A host locator written as `host:port` or a URL is recorded as the host; a service or endpoint locator
   loses a leading HTTP method and any text after the URL, and a path is joined to the URL of its
   `parent` when the scheme, host and port stay the same. A locator with URL user information is never
-  rewritten or quoted back; the core refuses it.
+  rewritten or quoted back, wherever in the locator it appears; the core refuses it. A description after
+  a relative path is cut like one after a URL, and `ftp:21`-style host names are not read as URLs.
+- A hypothesis opened with a refuted-style `status` and `evidence` records that evidence as
+  counterevidence. The asset in a `cred` or `auth` condition may be an alias or prefix; it is stored as
+  the full asset ID.
 
 What is refused, before anything is recorded and with the shape to send: an action that belongs to
 another tool, an unknown action, a hypothesis verdict from anyone but an independent read-only verifier,
-a hypothesis open or priority change from a child, a condition that is not a typed `{kind, value}`, a
+a hypothesis open or priority change from a child (a verifier included), a condition that is not a typed `{kind, value}`, a
 service or endpoint locator without a scheme or a bare path, and an unreadable priority. Evidence must
 still exist and be attested, authority is still checked by the tool and the core, and these records
 never authorize network access. The tool description lists the exact shape of every action and differs

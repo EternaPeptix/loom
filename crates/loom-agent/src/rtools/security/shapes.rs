@@ -38,9 +38,9 @@
 //!      P + "Only an independent read-only verifier records a hypothesis verdict. Attach your
 //!      evidence with hypothesis_evidence {id, evidence}; the hypothesis stays open until a verifier
 //!      reviews it."
-//!    - `hypothesis_open` when `caller.standing == Child` →
+//!    - `hypothesis_open` when `caller.standing != Lead` (a child, judges included) →
 //!      P + "Only the mission lead may open a hypothesis; send the proposed hypothesis to the lead."
-//!    - `hypothesis_priority` when `caller.standing == Child` →
+//!    - `hypothesis_priority` when `caller.standing != Lead` →
 //!      P + "Only the hypothesis's original lead may change its priority; send the proposed change to
 //!      that lead."
 //! 4. Normalization (N1–N7 below). Every rewrite appends exactly one note, in the order applied. A
@@ -54,7 +54,9 @@
 //!
 //! Strings quoted back into a note or a refusal are cut to 80 characters on a character boundary
 //! (with "…" appended when cut). A locator holding URL user information (`user@` or `user:pass@`)
-//! is never rewritten and never quoted; the core refuses it.
+//! is never rewritten and never quoted; the core refuses it. It holds user information when the
+//! authority after any `://` in it contains `@`, or when any whitespace-separated token parses as a URL
+//! with a user name or password; that check runs before N7a (kind host) and N7b to N7d.
 //!
 //! ### Normalization rules
 //!
@@ -82,7 +84,13 @@
 //!     "In L, `status` was dropped: a new hypothesis is always open." Otherwise:
 //!     "In L, status `{status}` was not recorded: a new hypothesis is open, and only an independent
 //!     read-only verifier records a verdict."
-//!   - N4d: `evidence` or `counterevidence` present. For a single operation, when either is a
+//!   - N4d: first, when the dropped status (N4c) reads as refuted (the N6c words "refuted",
+//!     "disproved", "rejected", "false", "invalid", or a JSON false) and `evidence` is a nonempty array
+//!     while `counterevidence` is empty or absent, `evidence` is moved into `counterevidence` (the status
+//!     says the evidence counts against the hypothesis; attaching it as support would record the
+//!     opposite). Note, after the N4c note: "In L, the status said the hypothesis is refuted, so its
+//!     `evidence` was attached as counterevidence." Then: `evidence` or `counterevidence` present. For a
+//!     single operation, when either is a
 //!     nonempty array, the operation becomes the batch [hypothesis_open {text, priority},
 //!     hypothesis_evidence {id: stable_id("hy", [text.trim()]), evidence, counterevidence}]
 //!     (missing lists empty). Note: "In L, the evidence was attached by a hypothesis_evidence
@@ -104,8 +112,9 @@
 //!     JSON boolean true/false the same. Note: "In L, status `{given}` was read as `{status}`."
 //! - N7 asset_upsert locators (after N2; only when `asset.kind` and `asset.locator` are strings;
 //!   the locator is trimmed first):
-//!   - N7a kind host: a locator that is not an IP address and (i) parses as a URL with a host and no
-//!     user information, or (ii) is `name:port` / `[v6]:port` with a decimal port of at most five
+//!   - N7a kind host: a locator that is not an IP address, holds no user information, and (i) contains
+//!     `://` and parses as a URL with a host (a name such as `ftp:21` is not a URL: the URL parser
+//!     would read it as an IPv4 address), or (ii) is `name:port` / `[v6]:port` with a decimal port of at most five
 //!     digits and a name without `/`, `@`, `:` or whitespace → the host (brackets removed), only when
 //!     `canonical_locator(Host, host)` accepts it. Note: "In L, the host was recorded as `{host}`
 //!     from `{given}`: a host locator has no scheme, port or path; record the service as kind
@@ -116,7 +125,9 @@
 //!     identified by its URL."
 //!   - N7c kind service/endpoint: the locator holds whitespace and its first token parses as an
 //!     absolute URL with a host and no user information → the first token. Note: "In L, the text
-//!     after the URL was not recorded: `{rest}`; record it as a fact if it matters."
+//!     after the URL was not recorded: `{rest}`; record it as a fact if it matters." The same applies
+//!     when the first token is a path (starts with `/` but not `//`), with "the text after the path"
+//!     in the note; N7d then joins that path.
 //!   - N7d kind service/endpoint: the locator starts with `/` but not `//`, `asset.parent` is a
 //!     string that `state.resolve` resolves to a recorded asset whose locator parses as an absolute
 //!     URL with a host → `base.join(locator)`, accepted only when the joined URL keeps the base's
@@ -133,8 +144,10 @@
 //!   target is unreachable or the environment is broken, use report_blocker." `{given}` is the
 //!   string itself, or the `kind` value, or the compact JSON of the element.
 //! - R5 kind service/endpoint, the locator has no `://`, no whitespace, no `@`, and its part before
-//!   the first `/` is `name:port` with a decimal port, or a bare name or IP → P + "Give the scheme as
-//!   well, for example `http://{locator}` (or `tcp://{locator}` for a service that is not HTTP)."
+//!   the first `/` is `name:port` with a decimal port, or a bare name or IP (an IPv6 address bare or in
+//!   brackets included) → P + "Give the scheme as well, for example `http://{locator}` (or
+//!   `tcp://{locator}` for a service that is not HTTP)." A bare IPv6 address is bracketed in
+//!   `{locator}` (`::1/x` gives `[::1]/x`).
 //! - R6 kind service/endpoint, the locator starts with `/` and N7d did not apply (no parent, or a
 //!   parent whose locator is not an absolute URL) → P + "An endpoint locator is one absolute URL,
 //!   such as `http://10.0.0.5:8080/render?name=`; give the full URL, or name its service asset as
@@ -157,7 +170,7 @@
 //! - condition_unlock: `{action:condition_unlock, conditions:[condition], evidence:[eN]}`
 //! - blocked_on: `{action:blocked_on, target:ID, conditions:[condition]}`
 //! - revisit_acknowledge: `{action:revisit_acknowledge, target:ID}`
-//! - crash_record: `{action:crash_record, signature:{sanitizer, frames:[{function, file, line?}], outcome:crash|timeout|oom|no_crash|fuzzer_exit71}, attempt:{vector, summary, evidence:[eN]}}`
+//! - crash_record: `{action:crash_record, signature:{sanitizer, frames:[{function, file, line?}], outcome:crash}, attempt:{vector, summary, evidence:[eN]}}; only a real crash has a signature: record a timeout, an out-of-memory exit or a run without a crash as a fact with fact_assert`
 //! - hypothesis_open: `{action:hypothesis_open, text, priority?:1 (low) to 5 (high), default 3}`
 //! - hypothesis_priority: `{action:hypothesis_priority, id:hypothesisID, priority:1 (low) to 5 (high)}`
 //! - hypothesis_evidence: `{action:hypothesis_evidence, id:hypothesisID, evidence:[eN], counterevidence?:[eN]}`
@@ -178,7 +191,8 @@
 //! 1. "Record typed, evidence-linked security observations in the mission ledger. `operation` is one
 //!    object: an action and its fields."
 //! 2. One line "- {shape(action)}" per action in ACTIONS order, with batch moved to the end, except:
-//!    - Child: hypothesis_open and hypothesis_priority are replaced by the single line
+//!    - Child and Judge (every standing but Lead): hypothesis_open and hypothesis_priority are replaced by
+//!      the single line
 //!      "- hypothesis_open, hypothesis_priority: the mission lead's; send a proposed hypothesis to the
 //!      lead." (at hypothesis_open's position).
 //!    - Lead and Child: hypothesis_verdict is "- hypothesis_verdict: recorded only by an independent
@@ -188,9 +202,11 @@
 //!    waits on, not a description of a fault." + (when tools has report_blocker) " Report an
 //!    unreachable target or a broken environment with report_blocker."
 //! 4. "Evidence IDs (eN) must already exist and be attested" + (when tools has evidence) ": attach
-//!    the output that shows it with the evidence tool first" + ". An ID may be the exact ID, an
-//!    alias, or a unique prefix of at least four characters" + (when tools has security_query)
-//!    "; security_query lists them" + "."
+//!    the output that shows it with the evidence tool first" + ". Evidence IDs are given exactly; other
+//!    IDs (assets, parents, hypotheses, facts, rules, and the asset in a cred or auth condition) may be
+//!    the exact ID, an alias, or a unique prefix of at least four characters" + (when tools has
+//!    security_query) "; security_query lists them" + "." (Why: evidence IDs are matched exactly, and a
+//!    cred or auth condition's asset is resolved by `security_record`, see security.rs.)
 //! 5. "Near-miss field names and locators are read where the meaning is unambiguous, and each such
 //!    reading is listed under `normalized` in the result. These records never authorize network
 //!    access."
@@ -209,7 +225,10 @@
 //!   `::1` and `[::1]:8080`; a name with a port above 99999 is left unchanged.
 //! - N7d: `//evil.test/x` with a parent is not joined; a join keeps scheme, host and port.
 //! - Note and refusal quotes are cut on a character boundary (a multi-byte string over 80 chars).
-//! - `description`: judge shows the verdict shape, lead and child do not; child has the merged
+//! - N7a: `ftp:21` and `http:8080` give `ftp` and `http`; user information after the first URL (host,
+//!   service and endpoint) is never rewritten or quoted. N7c/N7d: `GET /render?name= (text)` with a
+//!   parent is joined without the text; `/\evil.test/x` with a parent is refused (R6). R5: `::1`.
+//! - `description`: judge shows the verdict shape, lead and child do not; child and judge have the merged
 //!   open/priority line; with tools lacking evidence/report_blocker/security_query none is named.
 //! - A regression list of synthetic operations, one per failure class seen in logged missions
 //!   (host:port host, URL host, method-prefixed URL, URL + trailing text, scheme-less service,
@@ -441,13 +460,13 @@ fn read_one(
              hypothesis_evidence {id, evidence}; the hypothesis stays open until a verifier reviews it.",
         ));
     }
-    if action == "hypothesis_open" && caller.standing == Standing::Child {
+    if action == "hypothesis_open" && caller.standing != Standing::Lead {
         return Err(refuse(
             &p,
             "Only the mission lead may open a hypothesis; send the proposed hypothesis to the lead.",
         ));
     }
-    if action == "hypothesis_priority" && caller.standing == Standing::Child {
+    if action == "hypothesis_priority" && caller.standing != Standing::Lead {
         return Err(refuse(
             &p,
             "Only the hypothesis's original lead may change its priority; send the proposed change to that lead.",
@@ -630,11 +649,13 @@ fn open(
             notes.push(format!("In {l}, `{key}` was read as `text`."));
         }
     }
+    let mut refuted = false;
     if let Some(status) = m.remove("status") {
         let given = match &status {
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
+        refuted = verdict_word(&given) == Some("refuted");
         if given.trim().eq_ignore_ascii_case("open") {
             notes.push(format!("In {l}, `status` was dropped: a new hypothesis is always open."));
         } else {
@@ -655,6 +676,19 @@ fn open(
             .iter()
             .any(|k| m.get(*k).and_then(Value::as_array).is_some_and(|a| !a.is_empty()));
         let text = m.get("text").and_then(Value::as_str).map(|t| t.trim().to_string());
+        // A refuted status says the evidence given counts against the hypothesis (N4d).
+        let given_support = m.get("evidence").and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+        let given_counter = m.get("counterevidence").and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+        if refuted && given_support && !given_counter {
+            if let Some(evidence) = m.remove("evidence") {
+                m.insert("counterevidence".into(), evidence);
+                m.insert("evidence".into(), Value::Array(Vec::new()));
+                notes.push(format!(
+                    "In {l}, the status said the hypothesis is refuted, so its `evidence` was attached as \
+                     counterevidence."
+                ));
+            }
+        }
         match (nonempty, text) {
             (false, _) => {
                 m.remove("evidence");
@@ -742,6 +776,15 @@ fn rename_id(m: &mut Map<String, Value>, l: &str, notes: &mut Vec<String>) {
     }
 }
 
+/// The verdict a status word means (N6c): "supported" or "refuted".
+fn verdict_word(word: &str) -> Option<&'static str> {
+    match word.trim().to_ascii_lowercase().as_str() {
+        "supported" | "confirmed" | "verified" | "true" | "accepted" | "valid" => Some("supported"),
+        "refuted" | "disproved" | "rejected" | "false" | "invalid" => Some("refuted"),
+        _ => None,
+    }
+}
+
 /// N6b and N6c for hypothesis_verdict.
 fn verdict(m: &mut Map<String, Value>, l: &str, notes: &mut Vec<String>) {
     if !m.contains_key("status") {
@@ -753,11 +796,7 @@ fn verdict(m: &mut Map<String, Value>, l: &str, notes: &mut Vec<String>) {
     let (given, status) = match m.get("status") {
         Some(Value::Bool(b)) => (b.to_string(), if *b { "supported" } else { "refuted" }),
         Some(Value::String(s)) => {
-            let status = match s.trim().to_ascii_lowercase().as_str() {
-                "supported" | "confirmed" | "verified" | "true" | "accepted" | "valid" => "supported",
-                "refuted" | "disproved" | "rejected" | "false" | "invalid" => "refuted",
-                _ => return,
-            };
+            let Some(status) = verdict_word(s) else { return };
             (s.clone(), status)
         }
         _ => return,
@@ -768,11 +807,18 @@ fn verdict(m: &mut Map<String, Value>, l: &str, notes: &mut Vec<String>) {
     m.insert("status".into(), Value::String(status.to_string()));
 }
 
-/// Whether `s` holds URL user information (`user@` or `user:pass@` in the authority after `://`).
+/// Whether `s` holds URL user information (`user@` or `user:pass@`) anywhere: in the authority after any `://`,
+/// or in a whitespace-separated token that parses as a URL with a user name or password.
 fn has_userinfo(s: &str) -> bool {
-    let Some((_, rest)) = s.split_once("://") else { return false };
-    let authority = rest.split(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace()).next();
-    authority.is_some_and(|a| a.contains('@'))
+    let after_scheme = s.match_indices("://").any(|(at, _)| {
+        let rest = s.get(at.saturating_add(3)..).unwrap_or("");
+        let authority = rest.split(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace()).next();
+        authority.is_some_and(|a| a.contains('@'))
+    });
+    after_scheme
+        || s.split_whitespace().any(|token| {
+            url::Url::parse(token).is_ok_and(|u| !u.username().is_empty() || u.password().is_some())
+        })
 }
 
 /// The host of `s` when it is `name:port` or `[v6]:port` with a decimal port of at most five digits.
@@ -831,8 +877,9 @@ fn locator(
     let mut loc = given.clone();
     let before = notes.len();
     match kind.as_str() {
-        "host" if loc.parse::<std::net::IpAddr>().is_err() => {
-            let host = url_host(&loc).or_else(|| host_and_port(&loc));
+        "host" if loc.parse::<std::net::IpAddr>().is_err() && !has_userinfo(&loc) => {
+            // A URL is read only with `://`: WHATWG parsing reads `ftp:21` as ftp://0.0.0.21/.
+            let host = if loc.contains("://") { url_host(&loc) } else { None }.or_else(|| host_and_port(&loc));
             if let Some(host) = host.filter(|h| canonical_locator(AssetKind::Host, h).is_ok()) {
                 notes.push(format!(
                     "In {l}, the host was recorded as `{}` from `{}`: a host locator has no scheme, port or \
@@ -857,9 +904,11 @@ fn locator(
                 }
             }
             if let Some((first, rest)) = loc.clone().split_once(char::is_whitespace) {
-                if first.contains("://") && url_host(first).is_some() {
+                let path = first.starts_with('/') && !first.starts_with("//");
+                if (first.contains("://") && url_host(first).is_some()) || path {
+                    let what = if path { "path" } else { "URL" };
                     notes.push(format!(
-                        "In {l}, the text after the URL was not recorded: `{}`; record it as a fact if it \
+                        "In {l}, the text after the {what} was not recorded: `{}`; record it as a fact if it \
                          matters.",
                         cut(rest.trim(), QUOTE)
                     ));
@@ -897,8 +946,15 @@ fn locator(
             }
             let head = loc.split('/').next().unwrap_or("");
             let plain = !loc.contains("://") && !loc.contains('@') && !loc.chars().any(char::is_whitespace);
-            if plain && !head.is_empty() && (host_and_port_any(head) || bare_name(head)) {
-                let shown = cut(&loc, QUOTE);
+            let v6 = head.parse::<std::net::Ipv6Addr>().is_ok();
+            let bracketed = head
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .is_some_and(|h| h.parse::<std::net::Ipv6Addr>().is_ok());
+            if plain && !head.is_empty() && (host_and_port_any(head) || bare_name(head) || v6 || bracketed) {
+                // A bare IPv6 address is bracketed in a URL.
+                let tail = loc.get(head.len()..).unwrap_or("");
+                let shown = if v6 { cut(&format!("[{head}]{tail}"), QUOTE) } else { cut(&loc, QUOTE) };
                 return Err(refuse(
                     p,
                     &format!(
@@ -940,7 +996,7 @@ pub(super) fn shape(action: &str) -> Option<&'static str> {
         "condition_unlock" => "{action:condition_unlock, conditions:[condition], evidence:[eN]}",
         "blocked_on" => "{action:blocked_on, target:ID, conditions:[condition]}",
         "revisit_acknowledge" => "{action:revisit_acknowledge, target:ID}",
-        "crash_record" => "{action:crash_record, signature:{sanitizer, frames:[{function, file, line?}], outcome:crash|timeout|oom|no_crash|fuzzer_exit71}, attempt:{vector, summary, evidence:[eN]}}",
+        "crash_record" => "{action:crash_record, signature:{sanitizer, frames:[{function, file, line?}], outcome:crash}, attempt:{vector, summary, evidence:[eN]}}; only a real crash has a signature: record a timeout, an out-of-memory exit or a run without a crash as a fact with fact_assert",
         "hypothesis_open" => "{action:hypothesis_open, text, priority?:1 (low) to 5 (high), default 3}",
         "hypothesis_priority" => "{action:hypothesis_priority, id:hypothesisID, priority:1 (low) to 5 (high)}",
         "hypothesis_evidence" => "{action:hypothesis_evidence, id:hypothesisID, evidence:[eN], counterevidence?:[eN]}",
@@ -968,10 +1024,10 @@ pub(super) fn description(caller: &Caller<'_>) -> String {
     order.push("batch");
     for action in order {
         let line = match (action, caller.standing) {
-            ("hypothesis_open", Standing::Child) => "- hypothesis_open, hypothesis_priority: the mission lead's; send a \
+            ("hypothesis_open", Standing::Child | Standing::Judge) => "- hypothesis_open, hypothesis_priority: the mission lead's; send a \
                  proposed hypothesis to the lead."
                 .to_string(),
-            ("hypothesis_priority", Standing::Child) => continue,
+            ("hypothesis_priority", Standing::Child | Standing::Judge) => continue,
             ("hypothesis_verdict", Standing::Lead | Standing::Child) => "- hypothesis_verdict: recorded only by an \
                  independent read-only verifier; attach evidence with hypothesis_evidence and the hypothesis stays \
                  open until one reviews it."
@@ -991,7 +1047,10 @@ pub(super) fn description(caller: &Caller<'_>) -> String {
     if has("evidence") {
         evidence.push_str(": attach the output that shows it with the evidence tool first");
     }
-    evidence.push_str(". An ID may be the exact ID, an alias, or a unique prefix of at least four characters");
+    evidence.push_str(
+        ". Evidence IDs are given exactly; other IDs (assets, parents, hypotheses, facts, rules, and the asset in a \
+         cred or auth condition) may be the exact ID, an alias, or a unique prefix of at least four characters",
+    );
     if has("security_query") {
         evidence.push_str("; security_query lists them");
     }
@@ -1231,6 +1290,34 @@ mod tests {
     }
 
     #[test]
+    fn n4d_reads_evidence_given_with_a_refuted_status_as_counterevidence() {
+        let id = stable_id("hy", &["s"]);
+        for status in [json!("refuted"), json!(" Disproved "), json!(false)] {
+            let r = ok(lead(json!({"action": "hypothesis_open", "hypothesis": {"statement": "s", "status": status,
+                "evidence": ["e5"]}})));
+            assert_eq!(
+                element(&r, 1),
+                json!({"action": "hypothesis_evidence", "id": id, "evidence": [], "counterevidence": ["e5"]})
+            );
+            assert!(
+                r.notes.contains(
+                    &"In the operation, the status said the hypothesis is refuted, so its `evidence` was attached as \
+                      counterevidence."
+                        .to_string()
+                ),
+                "{:?}",
+                r.notes
+            );
+        }
+        // Evidence given on both sides is kept as given, and a supported status moves nothing.
+        let r = ok(lead(json!({"action": "hypothesis_open", "text": "s", "status": "refuted", "evidence": ["e1"],
+            "counterevidence": ["e2"]})));
+        assert_eq!(element(&r, 1)["evidence"], json!(["e1"]));
+        let r = ok(lead(json!({"action": "hypothesis_open", "text": "s", "status": "verified", "evidence": ["e1"]})));
+        assert_eq!(element(&r, 1)["evidence"], json!(["e1"]));
+    }
+
+    #[test]
     fn r8_refuses_evidence_on_an_open_inside_a_batch() {
         let id = stable_id("hy", &["s"]);
         let e = err(lead(batch(vec![
@@ -1308,7 +1395,8 @@ mod tests {
         let host = |loc: &str| lead(asset("host", loc));
         for (given, want) in [("127.0.0.1:19727", "127.0.0.1"), ("http://127.0.0.1:19750", "127.0.0.1"),
             ("https://Example.test/a/b?x=1", "example.test"), ("db.internal:5432", "db.internal"), ("[::1]:8080", "::1"),
-            ("http://[::1]:8080/x", "::1"), ("  10.0.0.5:80 ", "10.0.0.5")] {
+            ("http://[::1]:8080/x", "::1"), ("  10.0.0.5:80 ", "10.0.0.5"), ("ftp:21", "ftp"), ("http:8080", "http"),
+            ("https:443", "https"), ("ws:80", "ws")] {
             let r = ok(host(given));
             assert_eq!(locator_of(&r), want, "{given}");
             assert_eq!(
@@ -1326,7 +1414,8 @@ mod tests {
             assert!(r.notes.is_empty(), "{same}");
         }
         // User information is never rewritten and never quoted; the core refuses it.
-        for secret in ["http://user:pass@h/", "user@h:1", "http://:pw@h"] {
+        for secret in ["http://user:pass@h/", "user@h:1", "http://:pw@h", "http://10.0.0.5/ http://admin:pw@10.0.0.5/",
+            "http://10.0.0.5/?next=http://admin:pw@x"] {
             let r = ok(host(secret));
             assert_eq!(locator_of(&r), secret);
             assert!(r.notes.is_empty());
@@ -1357,6 +1446,14 @@ mod tests {
         let r = ok(lead(asset("service", "POST http://u:p@h.test/a")));
         assert_eq!(locator_of(&r), "POST http://u:p@h.test/a");
         assert!(r.notes.is_empty());
+        // User information anywhere in the locator is never rewritten and never quoted.
+        for secret in ["http://10.0.0.5:8080/login (try http://admin:admin@10.0.0.5:8080/)",
+            "http://10.0.0.5:8080 admin via http://admin:hunter2@10.0.0.5:8080/",
+            "POST http://10.0.0.5:8080/a?next=http://u:p@x/"] {
+            let r = ok(lead(asset("service", secret)));
+            assert_eq!(locator_of(&r), secret);
+            assert!(r.notes.is_empty(), "{secret}");
+        }
         // A locator that is a URL already is untouched.
         assert!(ok(lead(asset("endpoint", "http://10.0.0.5:8080/login?next="))).notes.is_empty());
         assert!(ok(lead(asset("file", "/etc/passwd x"))).notes.is_empty());
@@ -1386,6 +1483,20 @@ mod tests {
         let r = ok(with_parent("GET /a/../b", &id));
         assert_eq!(locator_of(&r), "http://10.0.0.5:8080/b");
         assert_eq!(r.notes.len(), 2);
+        // A description after a path is cut, as it is after a URL, before the path is joined.
+        let r = ok(with_parent("GET /render?name= (Jinja2 SSTI)", &id));
+        assert_eq!(locator_of(&r), "http://10.0.0.5:8080/render?name=");
+        assert_eq!(
+            r.notes[1],
+            "In the operation, the text after the path was not recorded: `(Jinja2 SSTI)`; record it as a fact if it \
+             matters."
+        );
+        assert_eq!(r.notes.len(), 3);
+        // A backslash is a slash in a special scheme, so this join would change the host: it is refused.
+        for evil in ["/\\evil.test/x", "/\\\\evil.test/x"] {
+            let e = err(with_parent(evil, &id));
+            assert!(e.starts_with("An endpoint locator is one absolute URL"), "{evil}: {e}");
+        }
         // A protocol-relative locator is never joined, so it cannot change the host.
         let e = err(with_parent("//evil.test/x", &id));
         assert!(e.starts_with("An endpoint locator is one absolute URL"), "{e}");
@@ -1408,6 +1519,18 @@ mod tests {
                     "Give the scheme as well, for example `http://{shown}` (or `tcp://{shown}` for a service that is \
                      not HTTP). Nothing was recorded."
                 )
+            );
+        }
+        // A bare IPv6 address needs a scheme, and the suggestion brackets it.
+        for (loc, shown) in [("::1", "[::1]"), ("fe80::1", "[fe80::1]"), ("[::1]", "[::1]"), ("::1/x", "[::1]/x")] {
+            let e = err(lead(asset("endpoint", loc)));
+            assert_eq!(
+                e,
+                format!(
+                    "Give the scheme as well, for example `http://{shown}` (or `tcp://{shown}` for a service that is \
+                     not HTTP). Nothing was recorded."
+                ),
+                "{loc}"
             );
         }
         // Not a bare host: left for the core.
@@ -1481,7 +1604,10 @@ mod tests {
             "Only the hypothesis's original lead may change its priority; send the proposed change to that lead. \
              Nothing was recorded."
         );
-        assert!(go(Standing::Judge, &[], json!({"action": "hypothesis_open", "text": "t"})).is_ok());
+        for action in ["hypothesis_open", "hypothesis_priority"] {
+            let e = err(go(Standing::Judge, &[], json!({"action": action, "text": "t"})));
+            assert!(e.starts_with("Only the "), "{action}: {e}");
+        }
         assert!(go(Standing::Lead, &[], json!({"action": "hypothesis_open", "text": "t"})).is_ok());
     }
 
@@ -1551,6 +1677,11 @@ mod tests {
         }
         assert!(lead_d.contains("- {action:hypothesis_open,") && lead_d.contains("- {action:hypothesis_priority,"));
         assert!(!child.contains("{action:hypothesis_open") && !child.contains("{action:hypothesis_priority"));
+        // A judge is a child too: it never sees the lead's hypothesis shapes.
+        assert!(!judge.contains("{action:hypothesis_open") && !judge.contains("{action:hypothesis_priority"));
+        assert!(judge.contains("- hypothesis_open, hypothesis_priority: the mission lead's;"));
+        assert!(!judge.contains("outcome:timeout") && !lead_d.contains("fuzzer_exit71"));
+        assert!(lead_d.contains("outcome:crash}") && lead_d.contains("record a timeout, an out-of-memory exit"));
         assert!(child.contains(
             "- hypothesis_open, hypothesis_priority: the mission lead's; send a proposed hypothesis to the lead."
         ));
@@ -1558,14 +1689,15 @@ mod tests {
         assert!(lead_d.contains("Report an unreachable target or a broken environment with report_blocker."));
         assert!(lead_d.contains(
             "Evidence IDs (eN) must already exist and be attested: attach the output that shows it with the evidence \
-             tool first. An ID may be the exact ID, an alias, or a unique prefix of at least four characters; \
-             security_query lists them."
+             tool first. Evidence IDs are given exactly; other IDs (assets, parents, hypotheses, facts, rules, and \
+             the asset in a cred or auth condition) may be the exact ID, an alias, or a unique prefix of at least \
+             four characters; security_query lists them."
         ));
         assert!(lead_d.ends_with("These records never authorize network access."));
         assert_eq!(lead_d, d(Standing::Lead, &all));
         let bare = d(Standing::Lead, &[]);
         assert!(!bare.contains("report_blocker") && !bare.contains("security_query") && !bare.contains("evidence tool"));
-        assert!(bare.contains("Evidence IDs (eN) must already exist and be attested. An ID may be the exact ID"));
+        assert!(bare.contains("Evidence IDs (eN) must already exist and be attested. Evidence IDs are given exactly;"));
         // The batch is the last action line, the shapes are listed in the enum order.
         let lines: Vec<&str> = lead_d.lines().collect();
         assert!(lines.iter().position(|l| l.starts_with("- {action:batch")).is_some_and(|i| i == lines.len() - 4));
