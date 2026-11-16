@@ -114,7 +114,8 @@
 
 use crate::wire::{ModelsView, StatusView};
 use loom_agent::runtime::{
-    InboxEntry, ModelSwitchReceipt, ModelsReload, NetEntry, ScoreView, SessionInfo, WindowView,
+    InboxEntry, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry, RoleModelReceipt, RoleModels, ScoreView,
+    SessionInfo, WindowView, ANY_ROLE,
 };
 use loom_agent::session::Phase;
 use loom_core::event::{
@@ -943,6 +944,89 @@ pub fn model_switch_line(r: &ModelSwitchReceipt) -> String {
         flat(&r.model.profile),
         flat(&r.model.model)
     )
+}
+
+/// What the pack chooses for a role's agents when the operator chose nothing.
+fn pack_choice_words(r: &RoleModels) -> String {
+    let mut words = if !r.alloy_models.is_empty() {
+        format!("rotates {}", r.alloy_models.iter().map(|m| flat(m)).collect::<Vec<_>>().join(", "))
+    } else if let Some(m) = &r.pack_model {
+        flat(m)
+    } else {
+        "the lead's".to_string()
+    };
+    if let Some(e) = &r.escalation_model {
+        words.push_str(&format!(", {} after a failed agent", flat(e)));
+    }
+    words
+}
+
+/// `loom models show`: the lead's model, the choice for every role, one line per role of its agents
+/// (the choice in force, whether it is the finish gate's, its agents running now), the profiles.
+pub fn mission_models_table(m: &MissionModels, style: &Style) -> String {
+    let width = width_of(style);
+    let window = |w: u64| if w > 0 { tokens(w) } else { "unknown".to_string() };
+    let mut out = vec![cut(
+        &format!(
+            "mission {} · lead {} on {} ({}, window {})",
+            flat(m.mission.as_str()),
+            flat(m.lead.as_str()),
+            flat(&m.lead_model.profile),
+            flat(&m.lead_model.model),
+            window(m.lead_model.context_window)
+        ),
+        width,
+    )];
+    out.push(match &m.any_role {
+        Some(p) => cut(&format!("agents of every role: {}", flat(p)), width),
+        None => cut("agents of every role: as each role's pack setting says", width),
+    });
+    if m.roles.is_empty() {
+        out.push("this lead starts no agents".to_string());
+    }
+    let pad = m.roles.iter().map(|r| flat(&r.role).chars().count()).max().unwrap_or(0);
+    for r in &m.roles {
+        let choice = match (&r.chosen, &m.any_role) {
+            (Some(p), _) => format!("{} (chosen)", flat(p)),
+            (None, Some(p)) if !r.verifier => format!("{} (every role)", flat(p)),
+            _ => format!("pack: {}", pack_choice_words(r)),
+        };
+        let gate = if r.verifier { " · finish gate" } else { "" };
+        let running = if r.agents.is_empty() {
+            "none".to_string()
+        } else {
+            r.agents
+                .iter()
+                .map(|a| {
+                    format!("{} on {}{}", flat(a.session.as_str()), flat(&a.profile), if a.forked { " (forked)" } else { "" })
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        out.push(cut(&format!("{:pad$}  {choice}{gate} · running: {running}", flat(&r.role)), width));
+    }
+    let profiles: Vec<String> = m
+        .profiles
+        .iter()
+        .map(|p| if *p == m.default_model { format!("{} (default)", flat(p)) } else { flat(p) })
+        .collect();
+    out.push(cut(&format!("profiles: {}", profiles.join(", ")), width));
+    finish(out)
+}
+
+/// `loom models role`: what changed, who moved now, then [`mission_models_table`].
+pub fn role_model_receipt(r: &RoleModelReceipt, role: &str, profile: Option<&str>, style: &Style) -> String {
+    let who = if role == ANY_ROLE { "every role".to_string() } else { format!("`{}`", flat(role)) };
+    let mut out = vec![match profile {
+        Some(p) => format!("agents of {who} start on {} from now on", flat(p)),
+        None => format!("the choice for {who} is cleared: the pack chooses again"),
+    }];
+    if !r.switched.is_empty() {
+        out.push(format!("moved now: {}", r.switched.iter().map(|s| flat(s.as_str())).collect::<Vec<_>>().join(", ")));
+    }
+    let mut text = finish(out);
+    text.push_str(&mission_models_table(&r.models, style));
+    text
 }
 
 pub fn net_table(entries: &[NetEntry], style: &Style) -> String {
@@ -1783,6 +1867,7 @@ mod tests {
             unattended: false,
             archived: false,
             gate: None,
+            role_models: Default::default(),
         }
     }
 
@@ -2033,6 +2118,61 @@ mod tests {
         };
         assert_eq!(model_switch_line(&receipt(true)), "s-1 now uses fast (m, window 200.0k), from its next step");
         assert_eq!(model_switch_line(&receipt(false)), "s-1 now uses fast (m, window 200.0k), when it next runs");
+    }
+
+    #[test]
+    fn mission_models_and_role_receipt_shapes() {
+        use loom_agent::runtime::{AgentModel, MissionModels, RoleModelReceipt, RoleModels};
+        let role = |name: &str, verifier: bool| RoleModels {
+            role: name.into(),
+            verifier,
+            chosen: None,
+            pack_model: None,
+            alloy_models: vec![],
+            escalation_model: None,
+            agents: vec![],
+        };
+        let mut worker = role("worker", false);
+        worker.chosen = Some("fast".into());
+        worker.agents = vec![
+            AgentModel { session: SessionId::from("s-a"), profile: "fast".into(), forked: false },
+            AgentModel { session: SessionId::from("s-b"), profile: "big".into(), forked: true },
+        ];
+        let mut solver = role("solver", false);
+        solver.alloy_models = vec!["big".into(), "fast".into()];
+        solver.escalation_model = Some("huge".into());
+        let mut verifier = role("verifier", true);
+        verifier.pack_model = Some("big".into());
+        let mut m = MissionModels {
+            mission: loom_core::MissionId::from("m-1"),
+            lead: SessionId::from("s-l"),
+            lead_model: loom_core::event::ModelRef { profile: "big".into(), model: "b".into(), context_window: 1_000_000 },
+            any_role: None,
+            roles: vec![worker, solver, verifier],
+            profiles: vec!["big".into(), "fast".into()],
+            default_model: "big".into(),
+        };
+        assert_eq!(
+            mission_models_table(&m, &MONO),
+            "mission m-1 · lead s-l on big (b, window 1.00M)\n\
+             agents of every role: as each role's pack setting says\n\
+             worker    fast (chosen) · running: s-a on fast, s-b on big (forked)\n\
+             solver    pack: rotates big, fast, huge after a failed agent · running: none\n\
+             verifier  pack: big · finish gate · running: none\n\
+             profiles: big (default), fast\n"
+        );
+        // A choice for every role covers the roles without their own, not the finish gate's verifier.
+        m.any_role = Some("fast".into());
+        let text = mission_models_table(&m, &MONO);
+        assert!(text.contains("agents of every role: fast\n") && text.contains("solver    fast (every role) ·"), "{text}");
+        assert!(text.contains("verifier  pack: big · finish gate"), "{text}");
+
+        let r = RoleModelReceipt { switched: vec![SessionId::from("s-a")], models: m.clone() };
+        assert!(role_model_receipt(&r, "worker", Some("fast"), &MONO)
+            .starts_with("agents of `worker` start on fast from now on\nmoved now: s-a\nmission m-1"));
+        let cleared = RoleModelReceipt { switched: vec![], models: m };
+        assert!(role_model_receipt(&cleared, "*", None, &MONO)
+            .starts_with("the choice for every role is cleared: the pack chooses again\nmission m-1"));
     }
 
     #[test]

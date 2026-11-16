@@ -56,6 +56,8 @@
 //! | `POST /sessions/{id}/archive` (`ArchiveBody`) | `runtime.archive` | `200` `{}` |
 //! | `POST /sessions/{id}/rename` (`RenameBody`) | `runtime.rename` | `200` `{}` |
 //! | `POST /sessions/{id}/model` (`ModelBody`) | `runtime.set_session_model` | `ModelSwitchReceipt` |
+//! | `GET /sessions/{id}/models` | `runtime.mission_models` | `MissionModels` |
+//! | `POST /sessions/{id}/role-model` (`RoleModelBody`) | `runtime.set_role_model` | `RoleModelReceipt` |
 //! | `GET /models` | `runtime.default_model()`, `runtime.health()` | `ModelsView` |
 //! | `POST /models/reload` | `runtime.reload_models` (no body) | `ModelsReload` |
 //! | `GET /sessions/{id}/window` | `runtime.window` | `WindowView` |
@@ -128,7 +130,7 @@ use crate::auth;
 use crate::ui;
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, ModelBody, ModelsView,
-    ReleaseBody, RenameBody, RuleBody, ScopeBody, SessionDetail, StatusView, WithdrawBody,
+    ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, SessionDetail, StatusView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -212,6 +214,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/archive", post(archive))
         .route("/api/sessions/{id}/rename", post(rename))
         .route("/api/sessions/{id}/model", post(set_model))
+        .route("/api/sessions/{id}/models", get(mission_models))
+        .route("/api/sessions/{id}/role-model", post(set_role_model))
         .route("/api/models", get(models))
         .route("/api/models/reload", post(reload_models))
         .route("/api/sessions/{id}/window", get(window))
@@ -707,6 +711,21 @@ async fn rename(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) 
 async fn set_model(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
     let body: ModelBody = json_body(&body)?;
     let receipt = s.runtime.set_session_model(&SessionId::from(id), &body.profile).await.map_err(rt_err)?;
+    Ok(Json(receipt).into_response())
+}
+
+async fn mission_models(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
+    let view = s.runtime.mission_models(&SessionId::from(id)).map_err(rt_err)?;
+    Ok(Json(view).into_response())
+}
+
+async fn set_role_model(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: RoleModelBody = json_body(&body)?;
+    let receipt = s
+        .runtime
+        .set_role_model(&SessionId::from(id), &body.role, body.profile.as_deref(), body.now)
+        .await
+        .map_err(rt_err)?;
     Ok(Json(receipt).into_response())
 }
 
@@ -1897,6 +1916,18 @@ mod tests {
         let (s, receipt) = e.post(&format!("/api/sessions/{id}/model"), json!({"profile": "other"})).await;
         assert_eq!((s, receipt["model"]["profile"].as_str()), (200, Some("other")), "{receipt}");
         assert_eq!(e.get("/api/models").await.1["models"].as_array().unwrap().len(), 2);
+
+        // The mission's models: one entry per role its lead starts, and a choice per role.
+        let (s, m) = e.get(&format!("/api/sessions/{id}/models")).await;
+        assert_eq!((s, m["lead"].as_str(), m["lead_model"]["profile"].as_str()), (200, Some(id.as_str()), Some("other")));
+        assert_eq!(m["roles"][0]["role"], "worker");
+        let (s, b) = e.post(&format!("/api/sessions/{id}/role-model"), json!({"role": "nope", "profile": "mock"})).await;
+        assert_eq!(s, 409, "{b}");
+        assert!(b["error"].as_str().unwrap().contains("Its roles: worker, verifier"), "{b}");
+        let (s, r) = e.post(&format!("/api/sessions/{id}/role-model"), json!({"role": "worker", "profile": "mock"})).await;
+        assert_eq!((s, &r["models"]["roles"][0]["chosen"], &r["switched"]), (200, &json!("mock"), &json!([])), "{r}");
+        let (s, r) = e.post(&format!("/api/sessions/{id}/role-model"), json!({"role": "worker"})).await;
+        assert_eq!((s, &r["models"]["roles"][0]["chosen"]), (200, &Value::Null), "a choice without a profile clears it");
         e.rt.shutdown().await;
     }
 

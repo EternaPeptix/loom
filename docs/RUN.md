@@ -289,9 +289,14 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom models list` | the model profiles in use (the default marked), each server ✓/✗ |
 | `loom models reload` | read `[models]` and `default_model` from the config again and use them now, without a restart; sessions on a changed profile move to its new settings |
 | `loom models set <session> <profile>` | switch a session (lead or agent) to another model profile from its next step, without a restart; logged as `model_switched` |
+| `loom models show <session>` | a mission's models: the lead's, the choice for each role of its agents (or what the pack picks), the agents running and their models |
+| `loom models role <session> <role> <profile> [--now]` | start the mission's new agents of `role` (`all`: every role without a choice of its own, not the finish gate's verifier) on `profile`; `--now` also moves its running agents of that role (not forked ones) |
+| `loom models role <session> <role> --clear` | drop that choice: the pack picks again for agents started later |
 | `loom service install` / `uninstall` / `status` | the macOS login service |
 
 Options of `run` and `chat`: `-w/--workspace`, `--pack`, `--role`, `-m/--model` (a profile name),
+`--agent-model ROLE=PROFILE` (repeatable; `all=PROFILE` for every role: the mission's agents start on
+it from the first one, as `loom models role` sets later),
 `-t/--title`, `--attended` (do not resume by itself after a restart), `--max-steps`, `--max-minutes`;
 and for display `--reasoning`, `--full`, `-v`. A `<session>` is an id, the beginning of one, or `last`.
 `-` as the text reads standard input.

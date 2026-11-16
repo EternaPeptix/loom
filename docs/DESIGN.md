@@ -937,6 +937,17 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   while the session was idle` when it is next opened). The weave takes `reasoning_replay` from the
   latest one for the whole history, and a switch is never reported as a cache break: a new model is
   a cold cache by nature. The model is not told.
+- **A mission's agents' models.** The operator chooses, per mission, the profile its agents of a
+  role start on: `loom models role <session> <role> <profile>` (`POST /api/sessions/{id}/role-model`,
+  the web UI's Models tab), or at creation (`--agent-model ROLE=PROFILE`, the new-mission form's
+  "Agents' model"). `all` (`*`) covers every role without a choice of its own, but not the finish
+  gate's verifier, whose model is a separate decision (and refused on the lead's profile when the
+  pack wants them distinct). The choices live in the lead's `meta.json` (`role_models`) and are read
+  at each fresh spawn before the pack's `model`, `alloy_models` and `escalation_model`; a fork never
+  takes one, since it shares the lead's prefix and model. A choice applies to agents started from
+  then on; `--now` (the Models tab's checkbox) also switches the role's running, unforked agents as
+  `loom models set` would. `loom models show` (`GET /api/sessions/{id}/models`) shows the lead's
+  model, each role's choice or the pack's, and the agents running with their models.
 
 ## 11. Tools, sandbox, network (`loom-tools`, `loom-net`)
 
