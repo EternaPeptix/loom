@@ -196,6 +196,8 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 .view.empty { align-items: center; justify-content: center; padding: 32px; text-align: center; color: var(--dim); }
 .view.empty h1 { color: var(--fg); font-size: 22px; font-weight: 500; margin-bottom: 10px; }
 .stitle { font-size: 20px; font-weight: 500; color: var(--strong); overflow-wrap: anywhere; }
+.rename-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.stitle-edit { flex: 1 1 14rem; min-width: 10rem; font: inherit; color: var(--strong); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
 .notice { display: flex; gap: 8px; align-items: center; padding: 6px 12px; background: var(--accent-bg); color: var(--accent); border-bottom: 1px solid var(--accent); }
 .meter { display: inline-block; position: relative; height: 8px; background: var(--bg-3); border-radius: 4px; overflow: hidden; vertical-align: middle; }
 .meter.small { width: 80px; }

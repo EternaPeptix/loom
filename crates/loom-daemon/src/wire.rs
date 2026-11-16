@@ -158,6 +158,13 @@ pub struct ArchiveBody {
     pub archived: bool,
 }
 
+/// Body of `POST /api/sessions/{id}/rename`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenameBody {
+    pub title: String,
+}
+
 /// Body of `POST /api/gc`. An empty object is a dry run.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

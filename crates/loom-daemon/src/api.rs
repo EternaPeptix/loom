@@ -54,6 +54,7 @@
 //! | `POST /sessions/{id}/resume` | `runtime.resume` | `202` `{}` |
 //! | `POST /sessions/{id}/reweave` | `runtime.reweave` | `202` `{}` |
 //! | `POST /sessions/{id}/archive` (`ArchiveBody`) | `runtime.archive` | `200` `{}` |
+//! | `POST /sessions/{id}/rename` (`RenameBody`) | `runtime.rename` | `200` `{}` |
 //! | `GET /sessions/{id}/window` | `runtime.window` | `WindowView` |
 //! | `GET /sessions/{id}/net?limit={n}` | `runtime.net` (default 200, at most 2000) | `[NetEntry]` |
 //! | `GET /missions` | `runtime.missions` | `[MissionInfo]` |
@@ -123,8 +124,8 @@
 use crate::auth;
 use crate::ui;
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, ReleaseBody, RuleBody,
-    ScopeBody, SessionDetail, StatusView, WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, ReleaseBody, RenameBody,
+    RuleBody, ScopeBody, SessionDetail, StatusView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -206,6 +207,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/resume", post(resume))
         .route("/api/sessions/{id}/reweave", post(reweave))
         .route("/api/sessions/{id}/archive", post(archive))
+        .route("/api/sessions/{id}/rename", post(rename))
         .route("/api/sessions/{id}/window", get(window))
         .route("/api/sessions/{id}/net", get(net))
         .route("/api/missions", get(missions))
@@ -685,6 +687,12 @@ async fn reweave(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Respo
 async fn archive(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
     let body: ArchiveBody = json_body(&body)?;
     s.runtime.archive(&SessionId::from(id), body.archived).await.map_err(rt_err)?;
+    Ok(ok_empty())
+}
+
+async fn rename(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: RenameBody = json_body(&body)?;
+    s.runtime.rename(&SessionId::from(id), &body.title).await.map_err(rt_err)?;
     Ok(ok_empty())
 }
 

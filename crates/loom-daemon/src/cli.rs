@@ -180,6 +180,8 @@ pub enum Command {
     Reweave(SessionArg),
     /// Hide a finished session (or bring it back with --undo)
     Archive(ArchiveArgs),
+    /// Rename a mission (set its lead session's title)
+    Rename(RenameArgs),
     /// Set a standing rule for a mission (or withdraw one with --withdraw)
     Rule(RuleArgs),
     /// Record an approval for a mission
@@ -328,9 +330,20 @@ pub struct SessionArg {
 
 #[derive(Args, Debug)]
 pub struct ArchiveArgs {
+    /// A session id, the beginning of one, or `last`
     pub session: String,
+    /// Bring an archived session back instead of hiding it
     #[arg(long)]
     pub undo: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RenameArgs {
+    /// A session id, the beginning of one, or `last` (the mission's lead)
+    pub session: String,
+    /// The new title (quote it if it has spaces); the words are joined with a space
+    #[arg(required = true)]
+    pub title: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1074,6 +1087,13 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             c.archive(&id, !a.undo).await?;
             outln(&format!("{} {id}", if a.undo { "restored" } else { "archived" })).map(|()| 0)
         }
+        Command::Rename(a) => {
+            let c = client_of(&paths)?;
+            let id = c.resolve(&a.session).await?;
+            let title = a.title.join(" ");
+            c.rename(&id, &title).await?;
+            outln(&format!("renamed {id} to {title:?}")).map(|()| 0)
+        }
         Command::Rule(a) => {
             let c = client_of(&paths)?;
             if let Some(rule) = &a.withdraw {
@@ -1586,6 +1606,9 @@ mod tests {
         assert!(a.undo);
         let Command::Archive(a) = ok(&["archive", "s-1"]) else { panic!("not archive") };
         assert!(!a.undo);
+        let Command::Rename(a) = ok(&["rename", "last", "Grafana", "CVE", "hunt"]) else { panic!("not rename") };
+        assert_eq!((a.session.as_str(), a.title.join(" ").as_str()), ("last", "Grafana CVE hunt"));
+        rejected(&["rename", "s-1"]); // a title is required
         let Command::Rule(a) = ok(&["rule", "s-1", "no", "prod"]) else { panic!("not rule") };
         assert_eq!((a.session.as_str(), a.text, a.withdraw), ("s-1", words(&["no", "prod"]), None));
         let Command::Rule(a) = ok(&["rule", "last", "--withdraw", "k2", "--reason", "done now"]) else {

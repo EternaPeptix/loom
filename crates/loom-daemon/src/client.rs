@@ -64,7 +64,7 @@
 
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody, RecordsPage,
-    ReleaseBody, RuleBody, ScopeBody, ScopeReceipt, SessionDetail, StatusView, WithdrawBody,
+    ReleaseBody, RenameBody, RuleBody, ScopeBody, ScopeReceipt, SessionDetail, StatusView, WithdrawBody,
 };
 use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, NetEntry, NewSession, RuleReceipt, ScoreView, SessionInfo,
@@ -513,6 +513,12 @@ impl Client {
         let body = serde_json::to_value(ArchiveBody { archived })
             .map_err(|e| format!("The request cannot be encoded ({e})."))?;
         self.call_unit(Method::POST, &format!("/api/sessions/{}/archive", segment(id.as_str())), Some(body)).await
+    }
+
+    pub async fn rename(&self, id: &SessionId, title: &str) -> Result<(), String> {
+        let body = serde_json::to_value(RenameBody { title: title.to_string() })
+            .map_err(|e| format!("The request cannot be encoded ({e})."))?;
+        self.call_unit(Method::POST, &format!("/api/sessions/{}/rename", segment(id.as_str())), Some(body)).await
     }
 
     pub async fn records(&self, id: &SessionId, after: Option<Seq>, limit: usize) -> Result<RecordsPage, String> {

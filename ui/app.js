@@ -716,8 +716,11 @@ function renderHeader() {
     return;
   }
   $("s-eyebrow").textContent = info.parent ? `Agent · ${info.role}` : "Mission";
-  $("s-title").textContent = info.title || info.id;
+  // Leave the title alone while the operator is editing it inline (see renameSession).
+  if ($("s-title").dataset.editing !== "true") $("s-title").textContent = info.title || info.id;
   $("s-title").title = info.id;
+  // Only a mission (lead) is renamed; an agent is named by the question that started it.
+  $("b-rename").hidden = !!info.parent;
   $("s-goal").textContent = S.ledger.state?.goal || (info.parent ? "Agent assignment · messages go to the mission lead." : "Mission goal has not been recorded yet.");
   const currentStep = S.ledger.state?.plan?.find(step => step.status === "doing");
   const standing = C.missionStanding(info, inboxCount(info.id), info.parent ? 0 : missionAgents(info).filter(agent => agent.status?.phase === "running").length);
@@ -2219,6 +2222,46 @@ async function sendMessage() {
   }
 }
 
+function renameSession() {
+  const id = S.openId;
+  const info = id && S.sessions.byId.get(id);
+  if (!info || info.parent) return;
+  const h = $("s-title");
+  if (h.dataset.editing === "true") return;
+  h.dataset.editing = "true";
+  const current = info.title || "";
+  const input = el("input", "stitle-edit");
+  input.type = "text";
+  input.value = current;
+  input.maxLength = 200;
+  input.setAttribute("aria-label", "Mission title");
+  const restore = () => {
+    h.dataset.editing = "";
+    h.textContent = (S.sessions.byId.get(id) || {}).title || id;
+  };
+  const submit = async () => {
+    const title = input.value.trim();
+    if (!title || title === current) return restore();
+    input.disabled = true;
+    try {
+      await api("POST", "/api/sessions/" + encodeURIComponent(id) + "/rename", { title });
+      const cur = S.sessions.byId.get(id);
+      if (cur) S.sessions.byId.set(id, { ...cur, title });
+      restore();
+      want("list", "header", "overview");
+    } catch (e) { input.disabled = false; notice(e.message); }
+  };
+  const row = el("div", "rename-row");
+  add(row, input, btn("Save", "primary small", submit), btn("Cancel", "small", restore));
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); submit(); }
+    else if (e.key === "Escape") { e.preventDefault(); restore(); }
+  });
+  h.replaceChildren(row);
+  input.focus();
+  input.select();
+}
+
 async function sessionAction(name, body) {
   const id = S.openId;
   if (!id || S.actionState.has(id)) return;
@@ -2332,6 +2375,8 @@ function wire() {
   $("btn-earlier").addEventListener("click", showEarlier);
   $("details").addEventListener("change", (e) => $("blocks").classList.toggle("hide-details", !e.target.checked));
 
+  $("b-rename").addEventListener("click", renameSession);
+  $("b-rename").title = "Rename this mission.";
   $("b-stop").addEventListener("click", () => sessionAction("stop"));
   $("b-stop").title = "Stop this session and cancel its descendant agents and tracked jobs.";
   $("b-resume").addEventListener("click", () => sessionAction("resume"));

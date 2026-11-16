@@ -11,7 +11,8 @@
 //! ## Files (under `paths.session_dir(id)`)
 //! - `log.jsonl` — the session's log; written only by its [`Session`](crate::session::Session).
 //! - `meta.json` — [`SessionMeta`], written when the session is created (for a verifier the finish
-//!   gate starts, with `gate`, before its first turn); rewritten only by [`Runtime::archive`]. Writes
+//!   gate starts, with `gate`, before its first turn); rewritten by [`Runtime::archive`] (the
+//!   `archived` flag) and [`Runtime::rename`] (the `title`). Writes
 //!   are atomic (temporary file in the same directory, then rename).
 //! - `status.json` — the latest [`Status`](crate::session::Status), rewritten atomically whenever
 //!   the session publishes one.
@@ -323,6 +324,10 @@
 //!   have no task (the lead could not be opened at start) are first restored as an unarchive does,
 //!   and what children ended with while the lead could not take it is delivered.
 //! - `reweave(id)`: activate; `Input::Reweave`.
+//! - `rename(id, title)`: root only (an agent is named by its question); blank title refused (`Write
+//!   the new title.`). Trims `title`, sets it in the lead's `meta.json`, updates the titles cached on
+//!   that session's open inbox items, and publishes a `session` event. No turn is started. Allowed in
+//!   any state, archived included.
 //! - `answer(item_id, answer)`: the item must be open (`There is no open inbox item {item_id}.`);
 //!   an empty answer to a blocking item is refused (`This item is waiting for an answer; write
 //!   one.`); activate the session; `Input::Answer`; a non-empty answer also resumes the session's
@@ -3923,6 +3928,10 @@ impl Runtime {
                 Some("resume") => {
                     format!("Resume goes to the lead session of a mission; {} is one of its agents.", id.as_str())
                 }
+                Some("rename") => format!(
+                    "Only a mission's lead is renamed; {} is one of its agents, named by the question that started it.",
+                    id.as_str()
+                ),
                 _ => {
                     format!("Only the lead session of a mission can be archived; {} is one of its agents.", id.as_str())
                 }
@@ -4045,6 +4054,35 @@ impl Runtime {
         // The box never has more than the mission's grants: its rules are brought to them again.
         self.inner.box_resync(&lead.mission).await;
         Ok(receipt)
+    }
+
+    /// Rename a mission: set its lead session's title. Root sessions only (an agent is named by the
+    /// question that started it). The new title is trimmed and must not be blank. Writes the lead's
+    /// `meta.json`, keeps the titles cached on that session's open inbox items in step, and publishes a
+    /// `session` event so every client updates its list and header. No turn is started and no log
+    /// record is written: the title is metadata, read back from `meta.json` at the next start. Allowed
+    /// whatever the session is doing, archived included.
+    pub async fn rename(&self, id: &SessionId, title: &str) -> Result<(), String> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err("Write the new title.".to_string());
+        }
+        self.operable(id, Some("rename"))?;
+        let (meta, info) = {
+            let mut st = self.inner.st();
+            let k = st.known.get_mut(id).ok_or_else(|| no_session(id))?;
+            k.meta.title = title.to_string();
+            let meta = k.meta.clone();
+            let info = Inner::info_of(k);
+            for e in st.inbox.iter_mut().filter(|e| &e.session == id) {
+                e.title = title.to_string();
+            }
+            (meta, info)
+        };
+        write_json_atomic(&self.inner.paths.session_dir(id).join("meta.json"), &meta)
+            .map_err(|e| format!("cannot write the meta.json of {}: {e}", id.as_str()))?;
+        self.inner.publish(BusEvent::Session { info: Box::new(info) });
+        Ok(())
     }
 
     /// Record that the operator approved something, with what the approval covers. Handed to the
@@ -9134,6 +9172,24 @@ mod tests {
         e.rt.shutdown().await;
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         assert!(rt2.inbox().is_empty(), "a restart re-opened an archived mission's inbox item");
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rename_sets_the_mission_title_updates_the_inbox_and_survives_restart() {
+        let e = env_with(Script::new(|_, _| finish("result")), true, |_| {}).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("inbox", || e.rt.inbox().iter().any(|i| i.session == id)).await;
+        assert!(e.rt.rename(&id, "   ").await.is_err(), "a blank title is refused");
+        e.rt.rename(&id, "  Grafana CVE hunt  ").await.unwrap();
+        assert_eq!(e.rt.session(&id).unwrap().meta.title, "Grafana CVE hunt");
+        // The mission listing and the titles cached on the inbox items follow.
+        assert_eq!(e.rt.missions().iter().find(|m| m.root == id).unwrap().title, "Grafana CVE hunt");
+        assert!(e.rt.inbox().iter().filter(|i| i.session == id).all(|i| i.title == "Grafana CVE hunt"));
+        // It is durable: meta.json is rewritten, so a restart reads the new title back.
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert_eq!(rt2.session(&id).unwrap().meta.title, "Grafana CVE hunt");
         rt2.shutdown().await;
     }
 
