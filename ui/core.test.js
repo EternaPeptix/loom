@@ -572,6 +572,21 @@ test("inbox from the api list and the page title", () => {
   assert.match(n.title, /blocker/);
 });
 
+test("inbox list does not resurrect an item the operator already answered", () => {
+  // The daemon resolves a dismissal asynchronously; a refetch in that window still lists the item.
+  const inbox = C.createInbox();
+  const list = [
+    { session: "s-1", title: "t", opened_ms: 1, item: { item_id: "i-done", item_kind: "finished", text: "r", options: [], blocking: false } },
+    { session: "s-1", title: "t", opened_ms: 2, item: { item_id: "i-live", item_kind: "question", text: "q", options: [], blocking: true } },
+  ];
+  const answered = new Map([["i-done", { answer: "" }]]);
+  C.applyInboxList(inbox, list, answered);
+  assert.deepEqual([...inbox.items.keys()], ["i-live"], "the answered item is not re-added");
+  // With no answered set the whole list applies (back-compatible).
+  C.applyInboxList(inbox, list);
+  assert.deepEqual([...inbox.items.keys()].sort(), ["i-done", "i-live"]);
+});
+
 // ---- record store ----
 
 test("records appear once and in order whatever the delivery order", () => {

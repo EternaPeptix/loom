@@ -661,7 +661,7 @@ async function loadInbox() {
     const inbox = await api("GET", "/api/inbox");
     if (request !== S.requests.inbox) return;
     if (revision !== S.inboxRevision) return loadInbox();
-    C.applyInboxList(S.inbox, inbox);
+    C.applyInboxList(S.inbox, inbox, S.answered);
     S.lastUpdate = Date.now();
     updateInboxBadge();
   } catch (e) {

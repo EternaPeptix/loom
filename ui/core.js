@@ -815,8 +815,13 @@ export function createInbox() {
   return { items: new Map() };
 }
 
-export function applyInboxList(inbox, list) {
-  inbox.items = new Map((list || []).map((e) => [e.item.item_id, e]));
+export function applyInboxList(inbox, list, answered) {
+  // The daemon resolves a dismissal/answer asynchronously, so a refetch right after one can still
+  // report the item as open. Drop anything the operator has already answered here (tracked in
+  // `answered`) so it is not resurrected between the POST and the `inbox_resolved` event.
+  inbox.items = new Map(
+    (list || []).filter((e) => !(answered && answered.has(e.item.item_id))).map((e) => [e.item.item_id, e]),
+  );
   return inbox;
 }
 
