@@ -1,10 +1,20 @@
 //! Typed mission security state tools.
 //!
-//! CONTRACT. `security_record { operation }` parses a deny-unknown-fields `SecurityOp`, resolves
-//! security-ID prefixes/aliases, checks actual session capabilities, then appends one sealed op.
-//! The lead opens/prioritizes hypotheses. Only an independent child with `read_only` and `verdict`
+//! CONTRACT. `security_record { operation }` reads `operation` with `shapes::read` (near misses read
+//! where unambiguous, each with a note; early role refusals; exact-shape guidance on a refusal), then
+//! resolves security-ID prefixes/aliases, checks actual session capabilities, then appends one sealed
+//! op. The lead opens/prioritizes hypotheses. Only an independent child with `read_only` and `verdict`
 //! may close one, and only its original lead may reprioritize it. The core checks all evidence and
 //! coverage invariants under the journal lock. Batches have the same authorization as individual ops.
+//!
+//! The caller passed to `shapes` is built from the session: `Standing::Lead` when it has no parent,
+//! `Standing::Judge` when it is a child whose role is `read_only` and has the `verdict` tool,
+//! `Standing::Child` otherwise; `tools` is the role's tool list. The tool description is
+//! `shapes::description` of that caller. On success the result is the JSON object
+//! `{"entry": n, "normalized": [notes…], "state": …}`, with `normalized` present only when a note was
+//! made. When the read operation was expanded by N4d (a single hypothesis_open carrying evidence) and
+//! the append fails, the error gets the sentence " The evidence given with hypothesis_open was being
+//! attached by a second operation in the same atomic append; nothing was recorded." appended.
 //!
 //! `security_query` returns JSON for state/assets/coverage/revisit/hypotheses/facts/why/what_if/
 //! resolve/path_suggest. Hypothetical changes never write. Rule evaluation reports its bounds and
@@ -20,6 +30,7 @@
 //! labels never become confirmed vulnerabilities or scope grants.
 
 mod scanners;
+mod shapes;
 
 use super::{observed_producer, Shared};
 use async_trait::async_trait;

@@ -24,6 +24,12 @@
 //! edges, and discounts edges out of known footholds. These are prioritization hints over explicit
 //! relations, never validated attack paths. Prefix resolution prefers exact IDs/aliases and refuses
 //! ambiguous prefixes. All maps/outputs have deterministic ordering.
+//!
+//! `SecurityOp::action` is the serialized `action` tag of an op (`asset_upsert`, …, `batch`). A batch
+//! stays one atomic append; when one of its operations fails validation the error is
+//! "Operation {i} of {n} in the batch ({action}): {error}" (1-based `i`), so the caller can tell
+//! which one to correct. Tests required: the prefix for a failing second operation of three, and
+//! that nothing of the batch was applied.
 
 pub mod causal;
 pub use causal::{Atom, Fact, Literal, Projection, Rule, WhatIf};
@@ -464,6 +470,13 @@ fn conditions(values: &[Condition]) -> Result<(), String> {
         text(&c.value, "condition value")?;
     }
     Ok(())
+}
+
+impl SecurityOp {
+    /// The serialized `action` tag of this op.
+    pub fn action(&self) -> &'static str {
+        todo!()
+    }
 }
 
 impl SecurityState {
