@@ -490,14 +490,18 @@ test("a definite request rejection fails an unrecorded send", () => {
 });
 
 test("mission routes preserve destination and view across navigation", () => {
-  assert.deepEqual(C.parseRoute("#/s/s-one"), { view: "session", session: "s-one", section: "overview" });
-  for (const section of ["overview", "record", "evidence"]) {
+  assert.deepEqual(C.parseRoute("#/s/s-one"), { view: "session", session: "s-one", section: "chat" });
+  for (const section of ["chat", "overview", "evidence"]) {
     assert.deepEqual(C.parseRoute(C.sessionHash("s/one ?#", section)), { view: "session", session: "s/one ?#", section });
   }
+  // the old name of the chat tab opens chat and says what to rewrite the address to
+  assert.deepEqual(C.parseRoute("#/s/s-one/record"), { view: "session", session: "s-one", section: "chat", rewrite: "#/s/s-one/chat" });
+  assert.equal(C.sessionHash("s-one", "record"), "#/s/s-one/chat");
   assert.deepEqual(C.parseRoute("#/inbox"), { view: "inbox" });
   assert.deepEqual(C.parseRoute("#/new"), { view: "new" });
   for (const hash of ["", "#/s/", "#/s/%XX/record", "#/s/s-one/unknown", "#/s/s-one/record/extra"]) assert.deepEqual(C.parseRoute(hash), { view: "empty" });
-  assert.equal(C.sessionHash("s-one", "unknown"), "#/s/s-one/overview");
+  assert.equal(C.sessionHash("s-one", "unknown"), "#/s/s-one/chat");
+  assert.equal(C.sessionHash("s-one"), "#/s/s-one/chat");
 });
 
 test("session actions", () => {
@@ -1374,4 +1378,542 @@ test("granted hosts and the outcome come from the ledger state", () => {
   assert.match(C.ledgerModel({ state: { entries: 1, goal_met: { status: "supported", note: "ran it", evidence: ["e1"], n: 1 } } }).outcome.words, /^Goal met/);
   assert.match(C.ledgerModel({ state: { entries: 1, goal_met: { status: "refuted", note: "n", evidence: ["e1"], n: 1 } } }).outcome.words, /unreachable/);
   assert.equal(C.outcomeOf({ goal_met: { status: "open", note: "", evidence: [], n: 0 } }), null);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Chat-first redesign
+
+function storeOf(records) {
+  const store = C.createRecordStore("s-a");
+  C.applyRecords(store, records);
+  return store;
+}
+// A small record builder with explicit seq/ts so timing is under the test's control.
+let sq = 0;
+const R = (kind, fields = {}, ts = 1000 + sq * 1000, author = "harness") => ({ seq: sq++, ts_ms: ts, author, prev: "0".repeat(64), kind, ...fields });
+const MODEL_A = { profile: "dsv41", model: "deepseek-v4.1", context_window: 1048576 };
+const MODEL_B = { profile: "qwen", model: "qwen4-max-preview", context_window: 262144 };
+const start = (m = MODEL_A) => R("session_start", { session: "s-a", mission: "m-a", parent: null, workspace: "/w", pack: "core", role: "lead", model: m, tools: [], budget: {} });
+const reply = (id, text, extra = {}) => R("model_response", { req_id: id, text, reasoning: "", tool_calls: [], finish: "stop", usage: { prompt_tokens: 100, cached_tokens: 50, completion_tokens: 10 }, timing: { ttft_ms: 100, total_ms: 1100 }, attempts: 1, ...extra }, undefined, "model");
+const call = (id, name = "bash", cls = "exec") => R("tool_call", { call_id: id, req_id: "r", name, args: { command: "ls" }, class: cls }, undefined, "model");
+const result = (id, status = "ok", extra = {}) => R("tool_result", { call_id: id, name: "bash", status, text: "x", class: "exec", meta: {}, duration_ms: 500, ...extra }, undefined, "tool");
+const reset = () => { sq = 0; };
+
+test("formatWindow names a context window", () => {
+  assert.equal(C.formatWindow(1048576), "1M");
+  assert.equal(C.formatWindow(1000000), "1M");
+  assert.equal(C.formatWindow(2000000), "2M");
+  assert.equal(C.formatWindow(1500000), "1.5M");
+  assert.equal(C.formatWindow(262144), "262k");
+  assert.equal(C.formatWindow(128000), "128k");
+  assert.equal(C.formatWindow(800), "800");
+  for (const v of [0, null, undefined, NaN, -5, "x"]) assert.equal(C.formatWindow(v), "");
+});
+
+test("the store keeps the start model and follows model_switched", () => {
+  reset();
+  const store = storeOf([
+    start(), R("user_message", { text: "hi" }, undefined, "user"), reply("r1", "one"),
+    R("model_switched", { from: MODEL_A, to: MODEL_B, reason: "operator" }), reply("r2", "two"),
+  ]);
+  assert.equal(store.start.model.profile, "dsv41");
+  assert.deepEqual(store.models.map((m) => m.profile), ["dsv41", "qwen"]);
+  assert.equal(C.modelAt(store, 0).profile, "dsv41");
+  assert.equal(C.modelAt(store, 2).profile, "dsv41");
+  assert.equal(C.modelAt(store, 3).profile, "qwen"); // the switch record itself is already on the new model
+  assert.equal(C.modelAt(store, 4).profile, "qwen");
+  assert.equal(C.modelAt(createEmpty(), 3), null);
+  // live info wins over the record store; the store answers when info has no profile
+  assert.deepEqual(C.currentModel(store, { profile: "necromicon", model: "n", context_window: 8000 }), { profile: "necromicon", model: "n", context_window: 8000 });
+  assert.deepEqual(C.currentModel(store, {}), { profile: "qwen", model: "qwen4-max-preview", context_window: 262144 });
+  assert.equal(C.currentModel(createEmpty(), {}), null);
+  // the switch block carries both sides
+  const sw = store.blocks.find((b) => b.switch);
+  assert.equal(sw.kind, "line");
+  assert.equal(sw.switch.from.profile, "dsv41");
+  assert.equal(sw.switch.to.model, "qwen4-max-preview");
+  assert.equal(sw.switch.reason, "operator");
+  assert.deepEqual(C.switchLine(sw), { from: "dsv41 · deepseek-v4.1 · 1M", to: "qwen · qwen4-max-preview · 262k", reason: "operator", text: sw.text });
+  assert.equal(C.switchLine({ kind: "user" }), null);
+});
+function createEmpty() { return C.createRecordStore("x"); }
+
+test("the store tracks the running turn and the tool result time", () => {
+  reset();
+  const store = storeOf([start(), R("turn_start", { trigger: "user" }, 5000), call("c1")]);
+  assert.deepEqual(store.turn, { seq: 1, ts: 5000 });
+  C.applyRecord(store, result("c1"));
+  assert.equal(store.blocks[0].result.ts, store.records.get(3).ts_ms);
+  C.applyRecord(store, R("turn_end", { reason: "finished" }));
+  assert.equal(store.turn, null);
+  C.applyRecord(store, R("turn_start", {}, 9000));
+  assert.equal(store.turn.ts, 9000);
+  C.applyRecord(store, R("session_end", { outcome: "done" }));
+  assert.equal(store.turn, null);
+  C.applyRecord(store, R("turn_start", {}, 9500));
+  C.applyRecord(store, R("interrupted", { reason: "r" }));
+  assert.equal(store.turn, null);
+});
+
+const kinds = (items) => items.map((i) => (i.type === "block" ? i.block.kind : i.type));
+
+test("chatItems groups consecutive tool calls and text-less replies, with the model chip first", () => {
+  reset();
+  const store = storeOf([
+    start(), R("user_message", { text: "go" }, undefined, "user"),
+    reply("r1", "", { reasoning: "a\nb", tool_calls: [{ call_id: "c1", name: "bash", arguments: "{}", complete: true }] }),
+    call("c1"), result("c1"),
+    reply("r2", "", { tool_calls: [{ call_id: "c2", name: "bash", arguments: "{}", complete: true }] }),
+    call("c2"), result("c2", "error"),
+    R("ledger", { n: 1, summary: "s" }),
+    reply("r3", "all done"),
+  ]);
+  const items = C.chatItems(store.blocks, { models: store.models });
+  assert.deepEqual(kinds(items), ["user", "model", "group", "response"]);
+  assert.deepEqual([items[1].profile, items[1].model, items[1].reason], ["dsv41", "deepseek-v4.1", "start"]);
+  const g = items[2];
+  assert.equal(g.toolCount, 2);
+  assert.equal(g.failed, 1);
+  assert.equal(g.running, false);
+  assert.equal(g.blocks.length, 5); // two text-less replies, two tools, the ledger line
+  assert.equal(g.key, "g" + g.blocks[0].seq);
+  assert.equal(g.open, false); // not last, nothing running, not expanded
+  assert.equal(items[3].last, true);
+  assert.equal(items[3].model.profile, "dsv41");
+  assert.equal(items[3].differs, false);
+  // the first text-less reply keeps its reasoning for a Thought row
+  assert.equal(C.thoughtLabel(g.blocks[0]), "Thought · 2 lines");
+  assert.equal(C.thoughtLabel(g.blocks[2]), "");
+});
+
+test("a running group is open, and so is the last item; expandAll and the open set open the rest", () => {
+  reset();
+  const store = storeOf([start(), R("user_message", { text: "go" }, undefined, "user"), call("c1"), result("c1"), reply("r", "mid"), call("c2")]);
+  const items = C.chatItems(store.blocks, { models: store.models });
+  const groups = items.filter((i) => i.type === "group");
+  assert.equal(groups.length, 2);
+  assert.equal(groups[0].open, false);
+  assert.equal(groups[1].running, true);
+  assert.equal(groups[1].open, true);
+  assert.equal(groups[1].last, true);
+  assert.equal(C.chatItems(store.blocks, { models: store.models, expandAll: true }).filter((i) => i.type === "group").every((g) => g.open), true);
+  assert.equal(C.chatItems(store.blocks, { models: store.models, open: new Set([groups[0].key]) }).filter((i) => i.type === "group")[0].open, true);
+  // a finished last group is open only because it is last
+  C.applyRecord(store, result("c2"));
+  assert.equal(C.chatItems(store.blocks, { models: store.models }).filter((i) => i.type === "group")[1].open, true);
+  C.applyRecord(store, reply("r9", "done"));
+  assert.equal(C.chatItems(store.blocks, { models: store.models }).filter((i) => i.type === "group")[1].open, false);
+});
+
+test("group keys stay put when the chat grows", () => {
+  reset();
+  const store = storeOf([start(), call("c1"), result("c1")]);
+  const key = C.chatItems(store.blocks, { models: store.models }).find((i) => i.type === "group").key;
+  C.applyRecord(store, call("c2"));
+  C.applyRecord(store, result("c2"));
+  C.applyRecord(store, reply("r", "text"));
+  const after = C.chatItems(store.blocks, { models: store.models });
+  assert.equal(after.find((i) => i.type === "group").key, key);
+  assert.equal(after.find((i) => i.type === "group").toolCount, 2);
+});
+
+test("a group counts a call with no result and one whose result was never recorded", () => {
+  reset();
+  const store = storeOf([start(), call("c1"), R("turn_end", { reason: "stopped" })]);
+  const items = C.chatItems(store.blocks, { models: store.models });
+  const g = items.find((i) => i.type === "group");
+  assert.equal(g.running, false);
+  assert.equal(g.missing, 1);
+  assert.equal(g.failed, 0);
+  assert.match(C.groupLabel(g, 0).text, /1 tool call · 1 without a result$/);
+  assert.equal(kinds(items).at(-1), "divider");
+});
+
+test("a model switch ends the group, is shown as a line, and starts a new chip", () => {
+  reset();
+  const store = storeOf([
+    start(), R("user_message", { text: "go" }, undefined, "user"), call("c1"), result("c1"),
+    R("model_switched", { from: MODEL_A, to: MODEL_B, reason: "operator" }),
+    call("c2"), result("c2"), reply("r", "answer"),
+  ]);
+  const items = C.chatItems(store.blocks, { models: store.models });
+  assert.deepEqual(kinds(items), ["user", "model", "group", "line", "model", "group", "response"]);
+  assert.equal(items[1].profile, "dsv41");
+  assert.equal(items[3].block.switch.to.profile, "qwen");
+  assert.deepEqual([items[4].profile, items[4].reason], ["qwen", "switch"]);
+  assert.equal(items[6].model.profile, "qwen");
+  assert.equal(items[6].differs, false);
+  // without model data there are no chips
+  assert.equal(C.chatItems(store.blocks).some((i) => i.type === "model"), false);
+});
+
+test("every boundary starts a new chip; a reply in the same segment does not", () => {
+  reset();
+  const store = storeOf([
+    start(), reply("r0", "first"), reply("r1", "second"),
+    R("child_spawned", { child: "s-b", role: "worker", mode: "fork", brief: {}, budget: {} }),
+    reply("r2", "third"), R("turn_end", { reason: "yielded" }), reply("r3", "fourth"),
+    R("user_message", { text: "u" }, undefined, "user"), reply("r4", "fifth"),
+  ]);
+  const items = C.chatItems(store.blocks, { models: store.models });
+  assert.deepEqual(kinds(items), [
+    "model", "response", "response", "child_spawned", "model", "response", "divider", "model", "response", "user", "model", "response",
+  ]);
+});
+
+test("request detail lines are hidden unless asked for, and sit inside a group when shown", () => {
+  reset();
+  const store = storeOf([
+    start(), R("user_message", { text: "go" }, undefined, "user"),
+    R("model_request", { req_id: "r", step: 1, epoch: 0, purpose: "step", est_tokens: 5 }), call("c1"), result("c1"),
+  ]);
+  const hidden = C.chatItems(store.blocks, { models: store.models });
+  assert.equal(hidden.find((i) => i.type === "group").blocks.length, 1);
+  const shown = C.chatItems(store.blocks, { models: store.models, details: true });
+  assert.equal(shown.find((i) => i.type === "group").blocks.length, 2);
+});
+
+test("groupKeyForSeq finds the group holding a call, its result or a line", () => {
+  reset();
+  const store = storeOf([start(), R("user_message", { text: "go" }, undefined, "user"), call("c1"), result("c1"), reply("r", "t")]);
+  const items = C.chatItems(store.blocks, { models: store.models });
+  const key = items.find((i) => i.type === "group").key;
+  assert.equal(C.groupKeyForSeq(items, 2), key);
+  assert.equal(C.groupKeyForSeq(items, 3), key); // the result's seq
+  assert.equal(C.groupKeyForSeq(items, 4), null); // the reply is not in a group
+  assert.equal(C.groupKeyForSeq(items, 99), null);
+  assert.equal(C.groupKeyForSeq(null, 1), null);
+});
+
+test("groupLabel: duration, counts, failures and running", () => {
+  const base = { type: "group", toolCount: 4, failed: 0, missing: 0, running: false, startTs: 1000, endTs: 13000 };
+  assert.equal(C.groupLabel(base, 0).text, "Worked for 12s · 4 tool calls");
+  assert.equal(C.groupLabel({ ...base, toolCount: 1 }, 0).text, "Worked for 12s · 1 tool call");
+  assert.equal(C.groupLabel({ ...base, failed: 2 }, 0).text, "Worked for 12s · 4 tool calls · 2 failed");
+  const run = C.groupLabel({ ...base, running: true }, 31000);
+  assert.equal(run.text, "Worked for 30s · 4 tool calls · running");
+  assert.equal(run.running, true);
+  assert.equal(C.groupLabel({ ...base, endTs: 1200 }, 0).duration, "under 1s");
+});
+
+test("tool rows: icon by class and name, capsule by state", () => {
+  reset();
+  const store = storeOf([
+    start(), call("c1"), result("c1", "ok", { meta: { exit_code: 0 } }),
+    call("c2"), result("c2", "error", { meta: { exit_code: 2 } }),
+    call("c3"), call("c4", "read_file", "read"), result("c4"),
+    R("turn_end", { reason: "stopped" }),
+  ]);
+  const rows = store.blocks.filter((b) => b.kind === "tool").map(C.toolRow);
+  assert.deepEqual(rows[0].capsule, { text: "exit 0", tone: "ok", icon: "check" });
+  assert.equal(rows[0].duration, "500ms");
+  assert.equal(rows[0].icon, "tool-exec");
+  assert.deepEqual(rows[1].capsule, { text: "exit 2", tone: "bad", icon: "cross" });
+  assert.deepEqual(rows[2].capsule, { text: "no result", tone: "warn", icon: "alert" });
+  assert.equal(rows[3].icon, "tool-read");
+  assert.equal(rows[0].argsLine, "ls");
+  const running = C.toolRow({ kind: "tool", name: "bash", cls: "exec", state: "running", argsLine: "make", result: null });
+  assert.deepEqual(running.capsule, { text: "running", tone: "running", icon: "dot" });
+  assert.equal(C.toolIcon({ name: "edit", cls: "write" }), "tool-write");
+  assert.equal(C.toolIcon({ name: "grep", cls: "nav" }), "tool-nav");
+  assert.equal(C.toolIcon({ name: "ledger_note", cls: "state" }), "tool-state");
+  assert.equal(C.toolIcon({ name: "agent_spawn", cls: "state" }), "tool-agent");
+  assert.equal(C.toolIcon({ name: "x" }), "tool-exec");
+  assert.equal(C.toolRow({ kind: "tool", name: "x", state: "done", result: { status: "timeout", meta: {}, duration_ms: 0 } }).capsule.text, "timeout");
+});
+
+test("replyMeta is quiet and leads with the profile only when asked", () => {
+  const r = { usage: { prompt_tokens: 100, cached_tokens: 92, completion_tokens: 11 }, timing: { ttft_ms: 100, total_ms: 1100 } };
+  assert.equal(C.replyMeta(r), "10.0 tok/s · 1.1s · cache 92%");
+  assert.equal(C.replyMeta(r, "qwen"), "qwen · 10.0 tok/s · 1.1s · cache 92%");
+  assert.equal(C.replyMeta({ usage: {}, timing: {} }), "");
+});
+
+test("a reply whose model differs from the segment chip says so", () => {
+  reset();
+  // the chip is for the segment start; a switch record is missing from the window but the models list has it
+  const blocks = [{ kind: "response", seq: 5, ts: 1, text: "t", reasoningLines: 0 }];
+  const models = [{ seq: 0, profile: "a", model: "m1", context_window: 0 }, { seq: 3, profile: "b", model: "m2", context_window: 0 }];
+  const items = C.chatItems([{ kind: "response", seq: 1, ts: 1, text: "x" }, ...blocks], { models });
+  assert.deepEqual(kinds(items), ["model", "response", "response"]);
+  assert.equal(items[1].differs, false);
+  assert.equal(items[2].differs, true);
+  assert.equal(items[2].model.profile, "b");
+});
+
+// ---- sidebar
+
+function infoOf(id, extra = {}) {
+  return { id, mission: extra.mission || id, parent: null, workspace: "/w/a", role: "lead", pack: "core", profile: "dsv41", model: "m", context_window: 1048576, title: id, created_ms: 1000, status: { phase: "idle", step: 1, last_end: "yielded", prompt_tokens: 0, cached_tokens: 0, open_inbox: 0 }, ...extra };
+}
+function sessionStore(list) { const s = C.createSessionStore(); C.applySessionList(s, list); return s; }
+const blockingItem = (session, kind = "approval", opened = 1000) => ({ session, item: { item_id: session + kind, item_kind: kind, blocking: true }, opened_ms: opened });
+function inboxWith(entries) {
+  const inbox = C.createInbox();
+  for (const e of entries) inbox.items.set(e.item.item_id, e);
+  return inbox;
+}
+
+test("workspaceName is the last path component", () => {
+  assert.equal(C.workspaceName("/Users/me/code/loom"), "loom");
+  assert.equal(C.workspaceName("/Users/me/code/loom/"), "loom");
+  assert.equal(C.workspaceName("/"), "no workspace");
+  assert.equal(C.workspaceName(""), "no workspace");
+  assert.equal(C.workspaceName(null), "no workspace");
+});
+
+test("rowMark precedence: needs you > running > new > failed > idle/ended, each with its own shape", () => {
+  const run = (phase, extra = {}) => infoOf("s", { status: { phase, step: 1, ...extra } });
+  const blocking = { blocking: 1 };
+  assert.equal(C.rowMark(run("running"), blocking, { fresh: true }).mark, "needs_you");
+  assert.equal(C.rowMark(run("running"), {}, { fresh: true }).mark, "running");
+  assert.equal(C.rowMark(run("idle"), {}, { fresh: true }).mark, "new");
+  assert.equal(C.rowMark(run("ended", { outcome: "failed" }), {}, { fresh: true }).mark, "new");
+  assert.equal(C.rowMark(run("ended", { outcome: "failed" }), {}).mark, "failed");
+  assert.equal(C.rowMark(run("ended", { outcome: "budget_exhausted" }), {}).mark, "failed");
+  assert.equal(C.rowMark(run("ended", { outcome: "done" }), {}).mark, "ended");
+  assert.equal(C.rowMark(run("ended", { outcome: "stopped" }), {}).mark, "ended");
+  assert.equal(C.rowMark(run("idle", { last_end: "yielded" }), {}).mark, "idle");
+  assert.equal(C.rowMark(run("idle", { last_end: "waiting" }), {}).mark, "waiting");
+  // an ended session has nothing to answer
+  assert.equal(C.rowMark(run("ended", { outcome: "done" }), blocking).mark, "ended");
+  // the mission's aggregate can make a root run
+  assert.equal(C.rowMark(run("idle"), {}, { running: true }).mark, "running");
+  const shapes = ["needs_you", "running", "waiting", "new", "failed", "idle", "ended"].map((m) => {
+    const sample = { needs_you: [run("idle"), blocking], running: [run("running"), {}], waiting: [run("idle", { last_end: "waiting" }), {}], new: [run("idle"), {}, { fresh: true }], failed: [run("ended", { outcome: "failed" }), {}], idle: [run("idle"), {}], ended: [run("ended", { outcome: "done" }), {}] }[m];
+    const r = C.rowMark(...sample);
+    assert.equal(r.mark, m);
+    assert.ok(r.words);
+    return r.icon;
+  });
+  assert.equal(new Set(shapes).size, shapes.length, "each state has its own icon");
+});
+
+test("workspaceGroups: groups by workspace, newest activity first, Needs you pinned on top", () => {
+  const list = [
+    infoOf("old", { workspace: "/w/alpha", created_ms: 1000 }),
+    infoOf("mid", { workspace: "/w/beta", created_ms: 2000, profile: "qwen", role: "chat" }),
+    infoOf("new", { workspace: "/w/alpha", created_ms: 3000 }),
+    infoOf("ask", { workspace: "/w/gamma", created_ms: 500 }),
+  ];
+  const now = 400000;
+  const groups = C.workspaceGroups(sessionStore(list), inboxWith([blockingItem("ask", "approval", 100000)]), {}, now);
+  assert.deepEqual(groups.map((g) => g.key), ["needs_you", "ws:/w/alpha", "ws:/w/beta"]);
+  assert.equal(groups[0].label, "Needs you");
+  assert.deepEqual(groups[0].rows.map((r) => r.info.id), ["ask"]);
+  assert.equal(groups[1].label, "alpha");
+  assert.equal(groups[1].tip, "/w/alpha");
+  assert.deepEqual(groups[1].rows.map((r) => r.info.id), ["new", "old"]);
+  // the waiting reason replaces the age on the identity line
+  const ask = groups[0].rows[0];
+  assert.equal(ask.mark.mark, "needs_you");
+  assert.equal(ask.identity.text, "dsv41 · lead · Approval waiting 5m");
+  assert.equal(ask.identity.waiting.icon, "diamond");
+  assert.equal(groups[2].rows[0].identity.text, "qwen · chat · 6m");
+  assert.equal(groups[2].rows[0].identity.waiting, null);
+});
+
+test("workspaceGroups: activity orders groups and rows; agents nest under their mission when expanded", () => {
+  const list = [
+    infoOf("m1", { workspace: "/w/a", created_ms: 1000 }),
+    infoOf("m2", { workspace: "/w/b", created_ms: 2000 }),
+    infoOf("w1", { workspace: "/w/a", parent: "m1", mission: "m1", role: "worker", created_ms: 1500, profile: "qwen", status: { phase: "running", step: 3 } }),
+  ];
+  const activity = new Map([["w1", { seq: 9, ts: 50000 }], ["m2", { seq: 2, ts: 20000 }]]);
+  const store = sessionStore(list);
+  const collapsed = C.workspaceGroups(store, C.createInbox(), {}, 60000, { activity });
+  assert.deepEqual(collapsed.map((g) => g.label), ["a", "b"]); // a: agent activity at 50000 beats b at 20000
+  assert.deepEqual(collapsed[0].rows.map((r) => r.info.id), ["m1"]);
+  const root = collapsed[0].rows[0];
+  assert.equal(root.agentCount, 1);
+  assert.equal(root.agentsRunning, 1);
+  assert.equal(root.mark.mark, "running"); // the mission runs while its agent runs
+  assert.equal(root.expanded, false);
+  const open = C.workspaceGroups(store, C.createInbox(), {}, 60000, { activity, expanded: new Set(["m1"]) });
+  assert.deepEqual(open[0].rows.map((r) => [r.info.id, r.depth]), [["m1", 0], ["w1", 1]]);
+  assert.equal(open[0].rows[1].identity.text, "qwen · worker · 10s");
+  // flipping the order of activity flips the groups
+  const flipped = C.workspaceGroups(store, C.createInbox(), {}, 60000, { activity: new Map([["m2", { seq: 2, ts: 59000 }]]) });
+  assert.deepEqual(flipped.map((g) => g.label), ["b", "a"]);
+});
+
+test("workspaceGroups: a blocking agent pulls its whole mission into Needs you; new needs a watermark", () => {
+  const list = [
+    infoOf("m1", { workspace: "/w/a" }),
+    infoOf("w1", { workspace: "/w/a", parent: "m1", mission: "m1", role: "worker", created_ms: 1500 }),
+    infoOf("m2", { workspace: "/w/b", created_ms: 900 }),
+    infoOf("m3", { workspace: "/w/b", created_ms: 800 }),
+  ];
+  const activity = new Map([["m2", { seq: 7, ts: 5000 }], ["m3", { seq: 7, ts: 4000 }]]);
+  const groups = C.workspaceGroups(sessionStore(list), inboxWith([blockingItem("w1")]), { m2: 3, m3: 7 }, 10000, { activity });
+  assert.equal(groups[0].key, "needs_you");
+  assert.equal(groups[0].rows[0].info.id, "m1");
+  assert.equal(groups[0].rows[0].waiting.blocking.count, 1);
+  const b = groups.find((g) => g.key === "ws:/w/b");
+  assert.equal(b.rows.find((r) => r.info.id === "m2").mark.mark, "new"); // seq 7 is past the watermark 3
+  assert.equal(b.rows.find((r) => r.info.id === "m3").mark.mark, "idle"); // seen up to 7
+  // a Map works as well as an object, and a session never visited is not new
+  const viaMap = C.workspaceGroups(sessionStore(list), C.createInbox(), new Map([["m2", 3]]), 10000, { activity });
+  const rows = viaMap.flatMap((g) => g.rows);
+  assert.equal(rows.find((r) => r.info.id === "m2").mark.mark, "new");
+  assert.equal(rows.find((r) => r.info.id === "m3").mark.mark, "idle");
+});
+
+test("workspaceGroups: archived roots only when asked; no sessions, no groups", () => {
+  const list = [infoOf("a", { archived: true }), infoOf("b")];
+  const store = sessionStore(list);
+  assert.deepEqual(C.workspaceGroups(store, C.createInbox(), {}, 1).flatMap((g) => g.rows.map((r) => r.info.id)), ["b"]);
+  assert.deepEqual(C.workspaceGroups(store, C.createInbox(), {}, 1, { showArchived: true }).flatMap((g) => g.rows.map((r) => r.info.id)).sort(), ["a", "b"]);
+  assert.deepEqual(C.workspaceGroups(sessionStore([]), C.createInbox(), {}, 1), []);
+  assert.equal(C.workspaceGroups(sessionStore([infoOf("x", { workspace: "" })]), C.createInbox(), {}, 1)[0].label, "no workspace");
+});
+
+test("waitingReason words", () => {
+  assert.equal(C.waitingReason({ blocking: { count: 0 } }, 1), null);
+  assert.equal(C.waitingReason(null, 1), null);
+  assert.equal(C.waitingReason({ blocking: { count: 1, kind: "question", since: 1000 } }, 1001).text, "Question just arrived");
+  assert.equal(C.waitingReason({ blocking: { count: 1, kind: "blocker", since: 0 } }, 120000).text, "Blocker waiting 2m");
+  assert.equal(C.waitingReason({ blocking: { count: 3, kind: "approval", since: 0 } }, 120000).text, "3 requests waiting");
+});
+
+// ---- identity bar
+
+test("runWords: running with elapsed, idle, waiting for you, ended", () => {
+  const mk = (status, extra = {}) => infoOf("s", { status, ...extra });
+  const running = C.runWords(mk({ phase: "running", step: 214 }), { now: 100000, startMs: 38000 });
+  assert.equal(running.text, "Running · step 214 · 1m02s");
+  assert.equal(running.running, true);
+  assert.equal(running.icon, "dot");
+  assert.equal(C.runWords(mk({ phase: "running", step: 2 }), { now: 100000 }).text, "Running · step 2"); // start unknown
+  assert.equal(C.runWords(mk({ phase: "running", step: 0 }), { now: 5000, startMs: 4000 }).text, "Running · 1s");
+  assert.equal(C.runWords(mk({ phase: "idle", step: 7, last_end: "yielded" }), {}).text, "Idle · step 7");
+  assert.equal(C.runWords(mk({ phase: "idle", step: 7, last_end: "waiting" }), {}).text, "Waiting for jobs or agents · step 7");
+  assert.equal(C.runWords(mk({ phase: "idle", step: 7, last_end: "stopped" }), {}).text, "Stopped · step 7");
+  const waiting = C.runWords(mk({ phase: "running", step: 7 }), { attention: { blocking: 1 } });
+  assert.equal(waiting.text, "Waiting for you");
+  assert.equal(waiting.running, false);
+  assert.equal(waiting.icon, "diamond");
+  assert.equal(C.runWords(mk({ phase: "ended", outcome: "done" }), {}).text, "Ended · done");
+  assert.equal(C.runWords(mk({ phase: "ended", outcome: "failed" }), {}).text, "Ended · failed");
+  assert.equal(C.runWords(mk({ phase: "ended", outcome: "budget_exhausted" }), {}).text, "Ended · budget exhausted");
+  assert.equal(C.runWords(mk({ phase: "ended", outcome: "stopped" }), {}).text, "Ended · stopped");
+  assert.equal(C.runWords(mk({ phase: "ended" }), {}).text, "Ended · done");
+  assert.equal(C.runWords({ id: "x" }, {}).text, "Idle");
+  // each run state has its own shape
+  const icons = [running, waiting, C.runWords(mk({ phase: "idle", step: 1, last_end: "yielded" }), {}), C.runWords(mk({ phase: "ended", outcome: "failed" }), {})].map((r) => r.icon);
+  assert.equal(new Set(icons).size, 4);
+});
+
+test("identityChips: model, role, id and run", () => {
+  const info = infoOf("session-abcdef-0123", { profile: "qwen", model: "qwen4-max-preview", context_window: 1048576, pack: "core", role: "lead", status: { phase: "running", step: 4 } });
+  const status = { models: [{ profile: "qwen", base_url: "http://x.test/v1", model: "qwen4-max-preview", reachable: true, detail: "", context_window: 1048576 }] };
+  const chips = C.identityChips(info, status, { now: 10000, startMs: 4000 });
+  assert.equal(chips.model.text, "qwen · qwen4-max-preview · 1M");
+  assert.equal(chips.model.reachable, true);
+  assert.equal(chips.model.warn, null);
+  assert.match(chips.model.tip, /http:\/\/x\.test\/v1/);
+  assert.match(chips.model.tip, /reachable/);
+  assert.equal(chips.role.text, "core / lead");
+  assert.equal(chips.id.text, "session-ab");
+  assert.equal(chips.id.full, "session-abcdef-0123");
+  assert.equal(chips.run.text, "Running · step 4 · 6s");
+});
+
+test("identityChips: an unreachable profile warns, an unknown one is not a warning, a missing window is dropped", () => {
+  const info = infoOf("s", { profile: "necromicon", model: "necromicon", context_window: 0 });
+  const down = C.identityChips(info, { models: [{ profile: "necromicon", base_url: "b", model: "necromicon", reachable: false, detail: "connection refused", context_window: 0 }] });
+  assert.deepEqual(down.model.warn, { icon: "alert", word: "unreachable" });
+  assert.equal(down.model.reachable, false);
+  assert.equal(down.model.text, "necromicon · necromicon");
+  assert.match(down.model.tip, /unreachable: connection refused/);
+  // other profiles' health does not matter; no status at all is not a warning
+  assert.equal(C.identityChips(info, { models: [{ profile: "other", reachable: false }] }).model.warn, null);
+  const none = C.identityChips(info, null);
+  assert.equal(none.model.warn, null);
+  assert.equal(none.model.reachable, null);
+  // the window falls back to the daemon's figure
+  assert.equal(C.identityChips(info, { models: [{ profile: "necromicon", reachable: true, context_window: 262144 }] }).model.text, "necromicon · necromicon · 262k");
+  // no profile on the info: the record store's model is used
+  const fromStore = C.identityChips({ id: "s", role: "lead" }, null, { current: { profile: "qwen", model: "q", context_window: 8000 } });
+  assert.equal(fromStore.model.text, "qwen · q · 8k");
+  assert.equal(C.identityChips({ id: "s" }, null).model.text, "unknown profile");
+});
+
+test("identityChips: an agent's role tip names its mission", () => {
+  const agent = infoOf("w1", { parent: "m1", role: "worker", pack: "core" });
+  const chips = C.identityChips(agent, null, { mission: infoOf("m1", { title: "Ship it" }) });
+  assert.equal(chips.role.text, "core / worker");
+  assert.equal(chips.role.tip, "agent of Ship it");
+  assert.equal(C.identityChips(infoOf("m1"), null).role.tip, "lead of its mission");
+  assert.equal(C.identityChips(infoOf("m1", { role: "chat" }), null).role.tip, "session");
+});
+
+test("breadcrumbs: a root is its own title; an agent has linked ancestors; a long chain collapses", () => {
+  const list = [
+    infoOf("m", { title: "Mission" }), infoOf("a", { parent: "m", title: "", role: "worker" }),
+    infoOf("b", { parent: "a", title: "B title" }), infoOf("c", { parent: "b", title: "C" }), infoOf("d", { parent: "c", title: "" }),
+  ];
+  const store = sessionStore(list);
+  assert.deepEqual(C.breadcrumbs(store, "m"), [{ id: "m", label: "Mission", tip: "m", current: true, ellipsis: false }]);
+  assert.deepEqual(C.breadcrumbs(store, "a").map((c) => [c.label, c.current]), [["Mission", false], ["a", true]]);
+  const deep = C.breadcrumbs(store, "d");
+  assert.deepEqual(deep.map((c) => c.label), ["Mission", "…", "C", "d"]);
+  assert.equal(deep[1].ellipsis, true);
+  assert.equal(deep[1].id, null);
+  assert.equal(deep[1].tip, "a / B title");
+  assert.equal(deep[3].current, true);
+  assert.deepEqual(C.breadcrumbs(store, "missing"), [{ id: "missing", label: "missing", tip: "missing", current: true, ellipsis: false }]);
+  // a cycle in the data does not hang
+  const cyc = sessionStore([infoOf("x", { parent: "y" }), infoOf("y", { parent: "x" })]);
+  assert.ok(C.breadcrumbs(cyc, "x").length <= 2);
+});
+
+test("shortId is the first ten characters", () => {
+  assert.equal(C.shortId("0123456789abcdef"), "0123456789");
+  assert.equal(C.shortId("s-1"), "s-1");
+  assert.equal(C.shortId(null), "");
+});
+
+// ---- stats
+
+test("sessionStats: speed, cache, context and step; missing data is omitted", () => {
+  reset();
+  const store = storeOf([start(), reply("r1", "x", { usage: { prompt_tokens: 10, completion_tokens: 11 }, timing: { ttft_ms: 100, total_ms: 1100 } })]);
+  const info = infoOf("s", { context_window: 1048576, status: { phase: "running", step: 214, prompt_tokens: 325000, cached_tokens: 299000 } });
+  const stats = C.sessionStats(info, store.blocks);
+  assert.deepEqual(stats, { speed: "10.0 tok/s", cache: "cache 92%", context: "context 31% of 1M", step: "step 214" });
+  // nothing known: every part is empty, never zero
+  assert.deepEqual(C.sessionStats({ id: "s" }, []), { speed: "", cache: "", context: "", step: "" });
+  assert.deepEqual(C.sessionStats(infoOf("s", { context_window: 0, status: { phase: "idle", step: 0, prompt_tokens: 500, cached_tokens: 0 } }), null), { speed: "", cache: "cache 0%", context: "", step: "" });
+  // a tiny context still reads as at least 1%
+  assert.equal(C.sessionStats(infoOf("s", { context_window: 1000000, status: { prompt_tokens: 10, step: 1 } }), []).context, "context 1% of 1M");
+  assert.equal(C.sessionStats(null, undefined).step, "");
+});
+
+test("seatOptions lists configured profiles and keeps an unconfigured current one", () => {
+  const models = [{ profile: "a", model: "ma", reachable: true }, { profile: "b", model: "mb", reachable: false }];
+  assert.deepEqual(C.seatOptions(models, { profile: "a" }).map(o => o.label), ["a", "b (not reachable)"]);
+  assert.equal(C.seatOptions(models, { profile: "a" })[1].unreachable, true);
+  const gone = C.seatOptions(models, { profile: "old" });
+  assert.equal(gone[2].value, "old");
+  assert.equal(gone[2].label, "old (not configured)");
+  assert.deepEqual(C.seatOptions(null, null), []);
+});
+
+test("seatConfirm asks before switching and says what it costs", () => {
+  const models = [{ profile: "a", model: "ma", reachable: true }, { profile: "b", model: "mb", reachable: false }];
+  const q = C.seatConfirm(models, { profile: "a" }, "b");
+  assert.match(q.text, /^Switch this session to b \(mb\) from its next step\? The next request re-reads the whole prompt once\./);
+  assert.match(q.text, /not reachable/);
+  assert.equal(q.yes, "Switch");
+  assert.equal(q.no, "Keep a");
+  assert.equal(C.seatConfirm(models, { profile: "a" }, "a"), null);
+  assert.equal(C.seatConfirm(models, { profile: "a" }, "zzz"), null);
+});
+
+test("seatReceipt says when the switch takes effect", () => {
+  const r = { session: "s", model: { profile: "b", model: "mb" }, live: true };
+  assert.equal(C.seatReceipt(r), "Switched to b (mb); takes effect at the next step.");
+  assert.match(C.seatReceipt({ ...r, live: false }), /when it next runs/);
+  assert.match(C.seatReceipt({}), /Switched to the new model/);
 });

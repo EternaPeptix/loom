@@ -1,5 +1,5 @@
 // Isolated UI fixtures: no model, daemon, credentials, or workspace writes.
-// Run: node tools/ui-preview.mjs [port], then open /#/s/s-audit.
+// Run: node tools/ui-preview.mjs [port], then open the printed URL (/#code=fixture signs in, then /#/s/s-audit).
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -16,14 +16,23 @@ lines[1593] = "outcome,"; lines[1594] = "report: text,"; lines[1595] = "full: No
 lines[1596] = "payload: serde_json::Value::Null,"; lines[1597] = "steps,"; lines[1598] = "usage: Usage::default(),";
 lines[211] = "$ sh -c 'sleep 30 & exit 0'"; lines[212] = "job settled (exit 0) while pid 4127 still running"; lines[213] = "tracked: 0 processes";
 
-function session(id, title, { parent = null, phase = "running", last_end = null, outcome = null } = {}) {
-  return { id, title, mission: parent || id === "s-audit" ? "m-audit" : "m-" + id, parent, workspace: "/fixture/loom", pack: "core", role: parent ? "worker" : "lead", profile: "fixture", model: "Fixture model", context_window: 1000000, created_ms: now - 3600000, unattended: true, archived: false, active: phase === "running", status: { phase, step: 48, last_end, outcome, epoch: 1, prompt_tokens: 86000, cached_tokens: 84000, completion_tokens_total: 18000, open_inbox: 0 } };
+// Profiles as the daemon's ModelHealth reports them; "necromicon" is the unreachable one.
+const profiles = [
+  { profile: "dsv41", base_url: "https://api.fixture.invalid/dsv41/v1", model: "dsv41", reachable: true, detail: "", context_window: 1000000, max_concurrent: 4 },
+  { profile: "qwen", base_url: "https://api.fixture.invalid/qwen/v1", model: "qwen4-max-preview", reachable: true, detail: "", context_window: 262144, max_concurrent: 2 },
+  { profile: "necromicon", base_url: "http://10.0.0.9:8000/v1", model: "necromicon", reachable: false, detail: "connection refused: http://10.0.0.9:8000/v1 did not answer; start the server or run `loom models reload` after fixing the profile's base_url.", context_window: 128000, max_concurrent: 1 },
+];
+const modelRef = p => ({ profile: p.profile, model: p.model, context_window: p.context_window });
+const profileOf = name => profiles.find(p => p.profile === name);
+function session(id, title, { parent = null, phase = "running", last_end = null, outcome = null, workspace = "/fixture/loom", profile = "dsv41", prompt = 86000, cached = 84000 } = {}) {
+  const p = profileOf(profile);
+  return { id, title, mission: parent || id === "s-audit" ? "m-audit" : "m-" + id, parent, workspace, pack: "core", role: parent ? "worker" : "lead", profile: p.profile, model: p.model, context_window: p.context_window, created_ms: now - 3600000, unattended: true, archived: false, active: phase === "running", status: { phase, step: 48, last_end, outcome, epoch: 1, prompt_tokens: prompt, cached_tokens: cached, completion_tokens_total: 18000, open_inbox: 0 } };
 }
 const sessions = [
-  session("s-audit", "Audit harness reliability", { phase: "idle", last_end: "waiting" }),
-  session("s-worker", "Review recovery", { parent: "s-audit" }),
-  session("s-other", "Indexer benchmark"),
-  session("s-result", "Dependency review", { phase: "ended", last_end: "finished", outcome: "done" }),
+  session("s-audit", "Audit harness reliability", { phase: "idle", last_end: "waiting", profile: "dsv41" }),
+  session("s-worker", "Review recovery", { parent: "s-audit", profile: "qwen", prompt: 120000, cached: 90000 }),
+  session("s-other", "Indexer benchmark", { workspace: "/fixture/indexer", profile: "qwen", prompt: 190000, cached: 150000 }),
+  session("s-result", "Dependency review", { phase: "ended", last_end: "finished", outcome: "done", workspace: "/fixture/docs", profile: "necromicon", prompt: 40000, cached: 0 }),
 ];
 let inbox = [
   { session: "s-audit", mission: "m-audit", title: "Audit harness reliability", opened_ms: now - 240000, item: { item_id: "i-scope", item_kind: "question", text: "Include the desktop app in this audit?", options: ["Include desktop", "Runtime only"], blocking: true, call_id: "question", reference: "q1" } },
@@ -38,11 +47,12 @@ function append(id, kind, fields = {}, author = "harness", live = false) {
   return record;
 }
 for (const info of sessions) {
-  append(info.id, "session_start", { session: info.id, mission: info.mission, parent: info.parent, workspace: info.workspace, pack: info.pack, role: info.role, termination: "explicit", model: { profile: "fixture", model: "Fixture model", context_window: 1000000 }, budget: {}, reasoning_replay: "all", tools: [] });
+  append(info.id, "session_start", { session: info.id, mission: info.mission, parent: info.parent, workspace: info.workspace, pack: info.pack, role: info.role, termination: "explicit", model: info.id === "s-audit" ? modelRef(profileOf("necromicon")) : modelRef(profileOf(info.profile)), budget: {}, reasoning_replay: "all", tools: [] });
   append(info.id, "user_message", { text: "Review reliability and preserve the evidence." }, "user");
 }
 append("s-audit", "tool_call", { call_id: "bash1", req_id: "r1", name: "bash", args: { command: "cargo test recovery" }, class: "exec" }, "model");
 append("s-audit", "tool_result", { call_id: "bash1", name: "bash", status: "error", text: "error: test recovery::report_after_crash failed", cut: false, class: "exec", meta: {}, duration_ms: 900 }, "tool");
+append("s-audit", "model_switched", { from: modelRef(profileOf("necromicon")), to: modelRef(profileOf("dsv41")), reasoning_replay: "all", reason: "operator" }, "harness");
 append("s-audit", "tool_call", { call_id: "read1", req_id: "r1", name: "read", args: { path: "runtime.rs", start: 1594, end: 1599 }, class: "read" }, "model");
 append("s-audit", "tool_result", { call_id: "read1", name: "read", status: "ok", text: lines.slice(1593, 1599).join("\n"), output: { id: blob, bytes: 128000, lines: 5000 }, cut: true, class: "read", meta: { shown: [[1594, 1599]] }, duration_ms: 4 }, "tool");
 append("s-audit", "model_response", { req_id: "r1", text: "## Preliminary finding\n\n**Recovery requires verification.**\n\n- Source evidence is attached.\n- A crash reproduction remains open.\n\n```rust\nfull: None,\n```\n\n<img src=\"https://example.invalid/leak.png\" onerror=\"alert(1)\">", reasoning: "Review the exact source and preserve uncertainty.", tool_calls: [], finish: "stop", usage: { prompt_tokens: 86000, cached_tokens: 84000, completion_tokens: 100 }, timing: { total_ms: 1200 }, attempts: 1 }, "model");
@@ -71,6 +81,11 @@ const server = createServer(async (req, res) => {
       const timer = setInterval(() => res.write(": fixture heartbeat\n\n"), 10000);
       req.on("close", () => { clients.delete(res); clearInterval(timer); }); return;
     }
+    if (req.method === "POST" && path === "/api/web-sessions") {
+      const data = await body(req); requests.push({ path, body: data });
+      if (data.code !== "fixture") return json(res, { error: "That login code is not valid. Run `loom login` for a new one." }, 401);
+      return json(res, { secret: "fixture-secret" });
+    }
     if (req.method === "POST" && path.startsWith("/api/")) {
       const data = await body(req); requests.push({ path, body: data });
       const parts = path.split("/");
@@ -81,6 +96,17 @@ const server = createServer(async (req, res) => {
       }
       const id = parts[3]; const info = sessions.find(s => s.id === id);
       if (!info) return json(res, { error: "No such fixture session." }, 404);
+      if (parts[4] === "model") {
+        const target = profileOf(data.profile);
+        if (!target) return json(res, { error: `There is no model profile named \`${data.profile}\`; pick one of ${profiles.map(p => p.profile).join(", ")}.` }, 404);
+        const live = info.status.phase === "running";
+        await wait(300);
+        const from = { profile: info.profile, model: info.model, context_window: info.context_window };
+        Object.assign(info, { profile: target.profile, model: target.model, context_window: target.context_window });
+        append(id, "model_switched", { from, to: modelRef(target), reasoning_replay: "all", reason: "operator" }, "harness", true);
+        emit({ type: "session", info: { ...info, status: { ...info.status, open_inbox: inbox.filter(e => e.session === id).length } } });
+        return json(res, { session: id, model: modelRef(target), live });
+      }
       if (parts[4] === "messages") {
         await wait(2500); append(id, "user_message", { text: data.text }, "user", true); append(id, "model_request", { req_id: "fixture-delivery", purpose: "step", step: 49 }, "harness", true);
       } else if (parts[4] === "stop") { await wait(500); info.status = { ...info.status, phase: "idle", last_end: "stopped" }; }
@@ -90,7 +116,8 @@ const server = createServer(async (req, res) => {
     }
     if (path === "/api/sessions") return json(res, sessions.map(s => ({ ...s, status: { ...s.status, open_inbox: inbox.filter(e => e.session === s.id).length } })));
     if (path === "/api/inbox") return json(res, inbox);
-    if (path === "/api/status") return json(res, { models: [{ profile: "fixture", reachable: true, model: "Fixture model" }] });
+    if (path === "/api/status") return json(res, { version: "fixture", pid: 0, started_ms: now, bind: "127.0.0.1:7878", proxy_port: 0, home: "/fixture/home", sandbox: "seatbelt", network: "allowlist", disk: { free_bytes: 200e9, total_bytes: 500e9 }, models: profiles, sessions_total: sessions.length, sessions_active: sessions.filter(s => s.active).length, sessions_running: sessions.filter(s => s.status.phase === "running").length, inbox_open: inbox.length });
+    if (path === "/api/models") return json(res, { default_model: "dsv41", models: profiles });
     if (path.endsWith("/records")) { const after = Number(url.searchParams.get("after") ?? -1); return json(res, { records: (logs.get(path.split("/")[3]) || []).filter(r => r.seq > after), next_after: null }); }
     if (path.endsWith("/ledger")) return json(res, { state: path.includes("m-audit") ? ledger : { entries: 0 }, markdown: "" });
     if (path.endsWith("/window")) return json(res, { est_tokens: 86000, prompt_tokens: 86000, cached_tokens: 84000, epoch: 1, context_window: 1000000, floor_tokens: 180000, target_tokens: 400000, items: [] });
@@ -108,4 +135,4 @@ const server = createServer(async (req, res) => {
   } catch (e) { json(res, { error: e.message }, 500); }
 });
 const port = Number(process.argv[2] || 8766);
-server.listen(port, "127.0.0.1", () => console.log(`UI fixtures: http://127.0.0.1:${server.address().port}/#/s/s-audit`));
+server.listen(port, "127.0.0.1", () => console.log(`UI fixtures: http://127.0.0.1:${server.address().port}/#code=fixture (then /#/s/s-audit)`));

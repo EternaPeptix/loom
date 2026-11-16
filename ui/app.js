@@ -31,7 +31,19 @@ const S = {
   inboxRevision: 0,
   sessionsRevision: 0,
   sinceSeq: null,
-  section: "overview",
+  section: "chat",
+  models: null, // GET /api/models: {default_model, models: [...]} (null until fetched)
+  seat: null, // a model switch waiting for the operator's answer: {session, profile}
+  seatBusy: false,
+  seatNote: new Map(), // session id -> the sentence the last switch ended with
+  workState: new Map(), // work group key -> true (operator opened it) | false (operator folded it)
+  expandAll: false,
+  details: false,
+  activity: new Map(), // session id -> {seq, ts} of the latest record seen on the stream
+  watermarks: new Map(), // session id -> last seq seen on the last visit (from sessionStorage, kept live for the open one)
+  watermarkRead: new Set(),
+  goalOpen: false,
+  runTimer: 0,
   claimFilter: "all", // which claims the Evidence view lists
   view: "empty", // empty | session | inbox | new
   openId: null,
@@ -299,29 +311,49 @@ function inboxCount(id) {
   return C.attentionFor(S.inbox, id);
 }
 
+function loadWatermarks() {
+  for (const id of S.sessions.byId.keys()) {
+    if (S.watermarkRead.has(id)) continue;
+    S.watermarkRead.add(id);
+    const seen = recalled("seen." + id, null);
+    if (Number.isInteger(seen) && !S.watermarks.has(id)) S.watermarks.set(id, seen);
+  }
+}
+
+/** The identity line of a row: mono "profile · role · age"; a waiting reason replaces the age, with its own shape. */
+function identityEl(identity) {
+  const line = el("span", "ident");
+  if (!identity.waiting) return add(line, el("span", "ident-text", identity.text));
+  const wait = add(el("span", "ident-wait"), icon(identity.waiting.icon), el("span", "ident-text", identity.waiting.text));
+  return add(line, el("span", "ident-text", identity.parts.slice(0, 2).join(" · ") + " ·"), wait);
+}
+
 function renderList() {
   const box = $("sessions");
-  const groups = C.missionGroups(S.sessions, S.inbox, { showArchived: S.showArchived, expanded: S.expanded });
+  loadWatermarks();
+  const groups = C.workspaceGroups(S.sessions, S.inbox, S.watermarks, S.now, { showArchived: S.showArchived, expanded: S.expanded, activity: S.activity });
   const frag = document.createDocumentFragment();
   for (const group of groups) {
     if (!group.rows.length) continue;
-    const section = el("section", "mission-group");
+    const section = el("section", "mission-group" + (group.key === "needs_you" ? " needs-group" : ""));
     section.setAttribute("aria-label", group.label);
     const missions = group.rows.filter((row) => !row.depth).length;
     // The space is not drawn between the two ends of the heading; it keeps them two words when read out.
-    section.append(add(el("h2", "group-title"), el("span", "", group.label), document.createTextNode(" "), el("span", "group-count", String(missions))));
+    const head = add(el("h2", "group-title"), el("span", "", group.label), document.createTextNode(" "), el("span", "group-count", String(missions)));
+    head.title = group.tip;
+    section.append(head);
     for (const row of group.rows) {
-      const { info, depth, agentCount, agentsRunning, expanded, attention } = row;
-      const mark = C.stateMark(info, attention || inboxCount(info.id));
+      const { info, depth, agentCount, agentsRunning, expanded, mark } = row;
       const wrap = el("div", "mission-row");
-      const a = el("a", `row d${Math.min(depth, 2)}${mark === "needs_you" ? " needs" : ""}${info.id === S.openId && S.view === "session" ? " sel" : ""}${info.archived ? " arch" : ""}`);
+      const a = el("a", `row d${Math.min(depth, 2)}${mark.mark === "needs_you" ? " needs" : ""}${info.id === S.openId && S.view === "session" ? " sel" : ""}${info.archived ? " arch" : ""}`);
       a.setAttribute("href", C.sessionHash(info.id));
       a.dataset.focusKey = "session:" + info.id;
       if (info.id === S.openId) a.setAttribute("aria-current", "page");
-      const t = el("div", "t");
-      add(t, markEl(mark), el("span", "name", info.title || info.id));
-      add(a, t, el("div", "sub", C.rowSummary(row, S.latest.get(info.id), S.now)));
-      a.title = info.title || info.id;
+      const m = add(el("span", "mark mark-" + (mark.tone || "dim")), icon(mark.icon), el("span", "sr-only", mark.words + ": "));
+      const main = add(el("span", "row-main"), el("span", "name", info.title || info.id), identityEl(row.identity));
+      add(a, m, main);
+      // Everything the old second line said stays reachable as the row's description.
+      a.title = C.rowSummary(row, S.latest.get(info.id), S.now);
       wrap.append(a);
       if (!depth && agentCount) {
         const toggle = btn("", "link agent-toggle", () => {
@@ -340,7 +372,7 @@ function renderList() {
     }
     frag.append(section);
   }
-  if (!frag.childNodes.length) frag.append(el("p", "dim pad", "No missions yet. Start a mission with New."));
+  if (!frag.childNodes.length) frag.append(el("p", "dim pad", "No missions yet. Start a mission with New mission."));
   preserveFocus(box, () => box.replaceChildren(frag));
 }
 
@@ -351,7 +383,11 @@ function renderDot() {
   dot.title = d.tip;
   const state = $("connection-state");
   const updated = $("connection-updated");
-  if (state) state.textContent = S.connected ? (S.statusError ? "Live events · model status unavailable" : d.state === "amber" ? "Live · model unavailable" : "Live") : "Reconnecting · execution state unknown";
+  const words = S.connected ? (S.statusError ? "Live events · model status unavailable" : d.state === "amber" ? "Live · model unavailable" : "Live") : "Reconnecting · execution state unknown";
+  if (state) state.textContent = words;
+  // Below 1100px the sidebar can be closed: a lost connection is also said in the bar.
+  const bar = $("bar-connection");
+  if (bar) bar.textContent = S.connected ? "" : words;
   if (updated) updated.textContent = S.lastUpdate ? `Last update ${ago(S.lastUpdate)}` : "Waiting for first update";
 }
 
@@ -390,7 +426,12 @@ function updateInboxBadge() {
 function route() {
   const r = C.parseRoute(location.hash);
   setDrawer("left", false);
-  if (r.view === "session") { setSection(r.section, false); return openSession(r.session); }
+  if (r.view === "session") {
+    // The old name of the chat tab (/record) is rewritten in place, so Back does not return to it.
+    if (r.rewrite) { try { history.replaceState(null, "", r.rewrite); } catch { /* the old address still works */ } }
+    setSection(r.section, false);
+    return openSession(r.session);
+  }
   if (r.view === "inbox") return showInbox();
   if (r.view === "new") return showNew();
   setView(S.openId ? "session" : "empty");
@@ -399,7 +440,7 @@ function route() {
 function setView(v) {
   if (S.view === "session" && v !== "session") saveSeen();
   S.view = v;
-  if (v !== "session") $("s-speed").textContent = "";
+  if (v !== "session") { renderStats(); stopRunTimer(); }
   $("view-empty").hidden = v !== "empty";
   $("view-session").hidden = v !== "session";
   $("view-inbox").hidden = v !== "inbox";
@@ -422,8 +463,11 @@ function openSession(id) {
   S.sinceSeq = recalled("seen." + id, null);
   S.rec = C.createRecordStore(id);
   S.rec.initialComplete = false;
-  S.r = { from: 0, end: 0, nodes: new Map(), fresh: true };
+  S.r = { from: 0, end: 0, nodes: new Map(), items: [], forced: new Set(), fresh: true };
+  S.workState = new Map();
+  S.seat = null;
   S.follow = true;
+  S.goalOpen = false;
   S.net = [];
   S.netError = null;
   S.liveEl = null;
@@ -442,6 +486,7 @@ function openSession(id) {
   $("msg").value = C.getDraft(S.drafts, "message:" + id);
   $("msg").dataset.draftKey = "message:" + id;
   want("header", "blocks", "live", "right", "overview");
+  loadModels();
   loadRecords(S.rec, 0);
   loadNet();
   loadLedger();
@@ -464,6 +509,13 @@ async function loadRecords(store, tries) {
       after = page.next_after;
     }
     $("loading").hidden = true;
+    // Where the session scrolls as a whole (a phone, a short window) it opens at its latest message and composer.
+    if (!store.landed && matchMedia("(max-width: 699px), (max-height: 700px)").matches) {
+      store.landed = true;
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        if (S.rec === store && S.section === "chat" && S.follow) $("view-session").scrollTop = $("view-session").scrollHeight;
+      }));
+    }
     store.initialComplete = !C.missing(store);
     store.error = null;
   } catch (e) {
@@ -482,26 +534,36 @@ async function loadRecords(store, tries) {
 }
 
 function saveSeen() {
-  if (S.openId && S.rec && !S.rec.loading && C.lastSeq(S.rec) !== null) remember("seen." + S.openId, C.lastSeq(S.rec));
+  if (S.openId && S.rec && !S.rec.loading && C.lastSeq(S.rec) !== null) {
+    remember("seen." + S.openId, C.lastSeq(S.rec));
+    S.watermarks.set(S.openId, C.lastSeq(S.rec));
+  }
 }
 
 function noteActivity(session, record) {
+  if (Number.isInteger(record.seq)) {
+    const was = S.activity.get(session);
+    if (!was || record.seq >= was.seq) S.activity.set(session, { seq: record.seq, ts: record.ts_ms });
+    // The open session is being read, so it is never "new since your last visit".
+    if (session === S.openId && S.view === "session") S.watermarks.set(session, record.seq);
+  }
   if (!C.recordActivity(record)) return;
   const last = S.latest.get(session);
   if (!last || record.seq >= last.seq) S.latest.set(session, record);
 }
 
+const SECTION_PANEL = { chat: "mission-record", overview: "mission-overview", evidence: "mission-evidence" };
 function setSection(section, navigate = true) {
-  S.section = ["overview", "record", "evidence"].includes(section) ? section : "overview";
+  S.section = Object.hasOwn(SECTION_PANEL, section) ? section : "chat";
   for (const tab of document.querySelectorAll("#mission-tabs [data-view]")) {
     const selected = tab.dataset.view === S.section;
     tab.setAttribute("aria-selected", String(selected));
     tab.tabIndex = selected ? 0 : -1;
   }
-  for (const name of ["overview", "record", "evidence"]) $("mission-" + name).hidden = name !== S.section;
-  $("jump").hidden = S.section !== "record" || S.follow;
+  for (const [name, id] of Object.entries(SECTION_PANEL)) $(id).hidden = name !== S.section;
+  $("jump").hidden = S.section !== "chat" || S.follow;
   if (navigate && S.openId) location.hash = C.sessionHash(S.openId, S.section);
-  if (S.section === "record") want("blocks", "live");
+  if (S.section === "chat") want("blocks", "live");
   if (S.section === "evidence" && S.ledger.stale) loadLedger();
   want("overview");
 }
@@ -568,7 +630,7 @@ function handleEvent(ev) {
         break;
       case "refetch_ledger":
         S.ledger.stale = true;
-        if (S.tab === "ledger" || S.section !== "record") loadLedger();
+        if (S.tab === "ledger" || S.section !== "chat") loadLedger();
         break;
       case "net":
         C.applyNet(S.net, f.entry);
@@ -709,40 +771,162 @@ function announce(entry) {
 // ---------------------------------------------------------------------------------------------
 // Session header
 
+/** The stats line under the composer: each part is its own span; blank parts are omitted. */
+function renderStats() {
+  const info = S.sessions.byId.get(S.openId);
+  const stats = info && S.view === "session" && S.rec ? C.sessionStats(info, S.rec.blocks) : { speed: "", cache: "", context: "", step: "" };
+  $("s-speed").textContent = stats.speed;
+  $("s-cache").textContent = stats.cache;
+  $("s-context").textContent = stats.context;
+  $("s-step").textContent = stats.step;
+}
+
+function chipContent(node, ...kids) {
+  node.replaceChildren(...kids.filter(Boolean));
+}
+
+/** The run chip: shape + words. The elapsed time of a running turn ticks once a second, only while running. */
+function renderRun(info) {
+  const run = C.runWords(info, { now: Date.now(), startMs: S.rec && S.rec.turn ? S.rec.turn.ts : null, attention: inboxCount(info.id) });
+  const node = $("s-run");
+  node.className = "id-chip id-run" + (run.tone ? " tone-" + run.tone : "");
+  chipContent(node, icon(run.icon), document.createTextNode(run.text));
+  if (run.running && !S.runTimer) S.runTimer = setInterval(() => {
+    const current = S.sessions.byId.get(S.openId);
+    if (!current || S.view !== "session") return stopRunTimer();
+    renderRun(current);
+    S.now = Date.now();
+    tickGroups();
+  }, 1000);
+  else if (!run.running) stopRunTimer();
+}
+function stopRunTimer() {
+  if (S.runTimer) clearInterval(S.runTimer);
+  S.runTimer = 0;
+}
+
+function renderCrumbs(info) {
+  const trail = $("s-crumb-trail");
+  const crumbs = C.breadcrumbs(S.sessions, info.id).filter((c) => !c.current);
+  trail.replaceChildren();
+  for (const c of crumbs) {
+    if (c.ellipsis) {
+      const gap = el("span", "crumb crumb-gap", "…");
+      gap.title = c.tip;
+      gap.setAttribute("role", "img");
+      gap.setAttribute("aria-label", "Between: " + c.tip);
+      trail.append(gap);
+    } else {
+      const a = link(c.label, C.sessionHash(c.id));
+      a.className = "crumb";
+      a.title = c.tip;
+      trail.append(a);
+    }
+    trail.append(el("span", "crumb-sep", "/"));
+    trail.lastChild.setAttribute("aria-hidden", "true");
+  }
+}
+
+function renderGoal(info) {
+  const goal = $("s-goal");
+  const toggle = $("s-goal-toggle");
+  goal.textContent = S.ledger.state?.goal || (info.parent ? "Agent assignment · messages go to the mission lead." : "Mission goal has not been recorded yet.");
+  goal.classList.toggle("open", S.goalOpen);
+  // Measured while clamped: an overflowing one-line goal gets the toggle. Hidden pages measure zero and keep it as it was.
+  if (!S.goalOpen && goal.clientWidth > 0) toggle.hidden = goal.scrollWidth <= goal.clientWidth;
+  else if (S.goalOpen) toggle.hidden = false;
+  toggle.textContent = S.goalOpen ? "Show less" : "Show all";
+  toggle.setAttribute("aria-expanded", String(S.goalOpen));
+}
+
+function renderIdentity(info) {
+  const mission = info.parent ? [...S.sessions.byId.values()].find((s) => !s.parent && s.mission === info.mission) || null : null;
+  const chips = C.identityChips(info, S.status, { current: C.currentModel(S.rec, info), now: Date.now(), startMs: S.rec && S.rec.turn ? S.rec.turn.ts : null, attention: inboxCount(info.id), mission });
+  const m = chips.model;
+  const model = $("s-model");
+  model.className = "id-chip id-model" + (m.warn ? " unreachable" : "");
+  model.title = m.tip;
+  const kids = [document.createTextNode(m.text)];
+  if (m.warn) kids.push(add(el("span", "id-warn"), icon(m.warn.icon), document.createTextNode(m.warn.word)));
+  chipContent(model, ...kids);
+  $("s-role").textContent = chips.role.text;
+  $("s-role").title = chips.role.tip;
+  const id = $("s-id");
+  if (!id.dataset.copying) {
+    chipContent(id, icon("copy"), document.createTextNode(chips.id.text));
+    id.title = chips.id.full;
+    id.setAttribute("aria-label", `${chips.id.label}: ${chips.id.text}`);
+    id.dataset.full = chips.id.full;
+  }
+  renderRun(info);
+}
+
+async function copySessionId() {
+  const id = $("s-id");
+  const full = id.dataset.full;
+  if (!full) return;
+  const say = (text) => { $("s-copied").textContent = text; };
+  const done = (label, ms) => {
+    id.dataset.copying = "1";
+    chipContent(id, icon("check"), document.createTextNode(label));
+    setTimeout(() => { delete id.dataset.copying; say(""); want("header"); }, ms);
+  };
+  try {
+    await navigator.clipboard.writeText(full);
+    say("Session id copied");
+    done("Copied", 1500);
+  } catch {
+    // No clipboard access: show the whole id selected, to be copied by hand.
+    id.dataset.copying = "1";
+    chipContent(id, document.createTextNode(full));
+    const range = document.createRange();
+    range.selectNodeContents(id);
+    const selection = getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    say("Session id selected; press Ctrl+C or Cmd+C to copy it");
+    setTimeout(() => { delete id.dataset.copying; say(""); want("header"); }, 6000);
+  }
+}
+
 function renderHeader() {
   const info = S.sessions.byId.get(S.openId);
   if (!info) {
     $("s-title").textContent = S.openId || "";
+    $("s-crumb-trail").replaceChildren();
     return;
   }
-  $("s-eyebrow").textContent = info.parent ? `Agent · ${info.role}` : "Mission";
+  renderCrumbs(info);
   // Leave the title alone while the operator is editing it inline (see renameSession).
   if ($("s-title").dataset.editing !== "true") $("s-title").textContent = info.title || info.id;
   $("s-title").title = info.id;
   // Only a mission (lead) is renamed; an agent is named by the question that started it.
   $("b-rename").hidden = !!info.parent;
-  $("s-goal").textContent = S.ledger.state?.goal || (info.parent ? "Agent assignment · messages go to the mission lead." : "Mission goal has not been recorded yet.");
+  renderGoal(info);
+  renderIdentity(info);
   const currentStep = S.ledger.state?.plan?.find(step => step.status === "doing");
   const standing = C.missionStanding(info, inboxCount(info.id), info.parent ? 0 : missionAgents(info).filter(agent => agent.status?.phase === "running").length);
+  // The first pill is the run state, which the run chip above already says.
   $("s-standing").replaceChildren(
-    ...standing.pills.map(p => pill(p.text, p.tone, p.icon)),
+    ...standing.pills.slice(1).map(p => pill(p.text, p.tone, p.icon)),
     el("span", "dim", currentStep ? "Current step: " + currentStep.text : C.rowActivity(info, S.latest.get(info.id), S.now)),
   );
   const openClaims = (S.ledger.state?.claims || []).filter(claim => claim.status === "open").length;
   $("evidence-count").textContent = `${openClaims} open`;
   $("evidence-count").hidden = openClaims === 0;
-  $("s-speed").textContent = S.rec ? C.sessionSpeed(S.rec.blocks).label : "";
+  renderStats();
   const a = C.sessionActions(info);
   $("b-stop").hidden = !a.stop;
   $("b-resume").hidden = !a.resume;
   $("b-archive").hidden = !a.archive;
   $("b-unarchive").hidden = !a.unarchive;
-  $("composer-row").hidden = !a.send;
+  // The text box and Send go with the ability to send; the model seat stays, so an ended session can still be re-seated.
+  $("msg").hidden = !a.send;
+  $("send").hidden = !a.send;
   $("agent-note").hidden = !info.parent;
   const closed = $("closed-note");
   closed.hidden = !!info.parent || a.send;
   closed.textContent = info.archived ? "This session is archived; unarchive it to send messages." : "This session has ended.";
-  $("send").textContent = "Send";
   // A message is not an answer: say so while a question of this mission waits on the operator.
   const paused = missionEntries().some(entry => entry.item.blocking);
   const lead = C.rootNoun(info) === "lead";
@@ -764,9 +948,14 @@ function renderHeader() {
   const pendingReceipt = message?.accepted && message.recordedSeq === undefined && message.state !== "failed";
   $("msg").disabled = sending;
   $("send").disabled = sending || pendingReceipt || !S.rec?.initialComplete || !$("msg").value.trim();
-  if (sending) $("send").textContent = "Sending…";
-  else if (pendingReceipt) $("send").textContent = "Awaiting receipt…";
-  $("send-state").textContent = message?.text || (!S.rec?.initialComplete ? "Loading the record before messages can be sent." : "");
+  // The button is an icon; its accessible name says the state, and send-state (live) says it in words.
+  const sendLabel = sending ? "Sending…" : pendingReceipt ? "Awaiting receipt…" : "Send";
+  $("send").setAttribute("aria-label", sendLabel);
+  $("send").title = sendLabel === "Send" ? "Send (Enter)" : sendLabel;
+  $("send").setAttribute("aria-busy", String(sending || !!pendingReceipt));
+  $("send-state").textContent = S.seatNote.get(info.id) || message?.text || (!S.rec?.initialComplete ? "Loading the record before messages can be sent." : "");
+  renderSeat(info);
+  growMsg();
 }
 
 function missionEntries() {
@@ -835,7 +1024,7 @@ function planSection() {
 
 function changesSection(model) {
   const body = document.createDocumentFragment();
-  const record = link("Open full record", C.sessionHash(S.openId, "record"));
+  const record = link("Open the chat", C.sessionHash(S.openId, "chat"));
   record.dataset.focusKey = "overview-record";
   body.append(heading("h2", "Recent activity", record));
   const recent = C.recentChanges(model.changes);
@@ -910,15 +1099,22 @@ function railSection(model) {
 }
 
 function jumpToRecord(seq) {
-  setSection("record");
+  setSection("chat");
   requestAnimationFrame(() => {
-    const block = S.rec?.blocks.find(b => b.seq === seq || b.result?.seq === seq || b.resolved?.seq === seq);
-    if (block && S.r) {
-      S.follow = false;
-      while (block.id < S.r.from) showEarlier();
-      const node = S.r.nodes.get(block.id);
+    const block = S.rec?.blocks.find(b => b.seq === seq || b.callSeq === seq || b.result?.seq === seq || b.resolved?.seq === seq);
+    if (!block || !S.r) return;
+    S.follow = false;
+    while (block.id < S.r.from && S.r.from > 0) showEarlier();
+    // A folded group holding the record opens, and so does the call's own row.
+    const key = C.groupKeyForSeq(S.r.items, block.seq);
+    if (key) S.workState.set(key, true);
+    if (block.kind === "tool") block.ui = { ...(block.ui || {}), open: true };
+    if (key || block.kind === "tool") { S.r.forced.add(block.id); syncChat(); }
+    // One more frame: a pending render may still replace the node.
+    requestAnimationFrame(() => {
+      const node = $("blocks").querySelector(`[data-bid="${block.id}"]`);
       if (node) { node.scrollIntoView({ block: "center" }); node.classList.add("record-highlight"); setTimeout(() => node.classList.remove("record-highlight"), 2500); }
-    }
+    });
   });
 }
 
@@ -983,7 +1179,7 @@ function evidenceCard(evidence) {
   const from = el("span", "dim ev-from");
   if (evidence.session) {
     add(from, document.createTextNode("from "), tool ? el("code", "", tool) : document.createTextNode(evidence.call_id ? "call " + evidence.call_id : "a call"),
-      document.createTextNode(" in "), link(producer?.title || evidence.session, C.sessionHash(evidence.session, "record")));
+      document.createTextNode(" in "), link(producer?.title || evidence.session, C.sessionHash(evidence.session, "chat")));
   }
   if (evidence.blob) {
     const [start, end] = evidence.range || [1, 1];
@@ -1009,13 +1205,21 @@ function textBox(text, cls) {
   return el("pre", cls || "txt", text);
 }
 
-function buildBlock(b) {
+const modelChip = (m, extra = "") => {
+  const chip = el("span", "model-chip" + extra, m.profile || "model");
+  chip.title = [m.model, m.context_window ? C.formatWindow(m.context_window) + " context" : ""].filter(Boolean).join(" · ") || "model";
+  return chip;
+};
+
+/** `ctx` carries the chat item a block is shown as: {differs, model}. */
+function buildBlock(b, ctx = {}) {
   const root = el("div", "block " + b.kind + (b.detail ? " detail" : ""));
   b.ui = b.ui || {};
+  root.dataset.bid = String(b.id);
   switch (b.kind) {
     case "user": {
       if (b.author !== "user") add(root, el("div", "label", C.authorLabel(b.author)));
-      add(root, textBox(b.text));
+      add(root, textBox(b.text, "txt bubble"));
       break;
     }
     case "note": {
@@ -1034,9 +1238,10 @@ function buildBlock(b) {
       break;
     }
     case "response": {
+      const thought = C.thoughtLabel(b);
       if (b.reasoning) {
-        const d = el("details", "reasoning");
-        add(d, el("summary", "", `reasoning · ${b.reasoningLines} ${b.reasoningLines === 1 ? "line" : "lines"}`), textBox(b.reasoning));
+        const d = el("details", "reasoning thought");
+        add(d, el("summary", "", thought || "Thought"), textBox(b.reasoning));
         add(root, d);
       }
       if (b.text) {
@@ -1047,7 +1252,9 @@ function buildBlock(b) {
       }
       for (const n of b.cutCalls) add(root, el("div", "warn", `The reply was cut inside a call to ${n}; the call was not run.`));
       if (b.warning) add(root, el("div", b.warning.level === "bad" ? "bad" : "warn", b.warning.text));
-      add(root, el("div", "foot", b.footer));
+      const foot = el("div", "foot", C.replyMeta(b, ctx.differs && ctx.model ? ctx.model.profile : "") || b.footer);
+      foot.title = b.footer;
+      add(root, foot);
       break;
     }
     case "tool":
@@ -1056,7 +1263,7 @@ function buildBlock(b) {
     case "child_spawned": {
       root.classList.add("card");
       const h = el("div", "ch");
-      add(h, el("strong", "", `agent started: ${b.role}`), el("span", "dim", b.mode), link(b.child, "#/s/" + encodeURIComponent(b.child)));
+      add(h, icon("tool-agent"), el("strong", "", `agent started: ${b.role}`), el("span", "dim", b.mode), link(b.child, "#/s/" + encodeURIComponent(b.child)));
       add(root, h, textBox(b.brief.question || "", "txt"));
       break;
     }
@@ -1068,7 +1275,7 @@ function buildBlock(b) {
       }
       root.classList.add("card");
       const h = el("div", "ch");
-      add(h, el("strong", "", `agent ${C.outcomeWords(b.outcome)}`), link(b.child, "#/s/" + encodeURIComponent(b.child)), el("span", "dim", `${b.steps} steps`));
+      add(h, icon("tool-agent"), el("strong", "", `agent ${C.outcomeWords(b.outcome)}`), link(b.child, "#/s/" + encodeURIComponent(b.child)), el("span", "dim", `${b.steps} steps`));
       add(root, h);
       add(root, collapsible(b, "report", b.report, 24));
       if (b.full) add(root, btn("open full report", "link", (e) => openViewer(b.full.id, "Full report", null, {}, e.currentTarget)));
@@ -1076,7 +1283,12 @@ function buildBlock(b) {
     }
     case "line": {
       root.classList.add(b.tone === "warn" ? "warn" : "dimline");
-      root.textContent = b.text;
+      if (b.sub === "switch") {
+        root.classList.add("model-switch");
+        add(root, icon("diamond-outline"), el("span", "", b.text));
+      } else {
+        root.textContent = b.text;
+      }
       if (b.blob) add(root, btn("open output", "link", (e) => openViewer(b.blob.id, "Job output", null, {}, e.currentTarget)));
       break;
     }
@@ -1126,31 +1338,41 @@ function collapsible(b, key, text, max) {
   return wrap;
 }
 
+/** One tool call as a one-line row; the row opens to today's full output UI. */
 function buildTool(root, b) {
   const res = b.result;
   const bad = res && res.status !== "ok";
+  const row = C.toolRow(b);
+  const open = !!b.ui.open;
+  root.classList.add("trow");
   if (bad) root.classList.add("bad");
-  const head = el("div", "thead");
-  add(head, el("span", "name", b.name));
-  const args = el("span", "args", b.argsLine || "");
+  const head = el("button", "thead");
+  head.type = "button";
+  head.setAttribute("aria-expanded", String(open));
+  head.dataset.focusKey = "tool:" + b.id;
+  add(head, icon("chevron"), icon(row.icon), el("span", "name", b.name));
+  const args = el("span", "args", row.argsLine);
   if (b.argsInvalid) args.title = "The model's arguments were not valid JSON; this is what it wrote.";
   add(head, args);
-  if (res) {
-    add(head, el("span", "stat " + (bad ? "bad" : "okc"), res.status));
-    add(head, el("span", "dur", C.seconds(res.duration_ms)));
-  } else if (b.state === "missing") {
-    add(head, el("span", "stat warn", "no result"));
-  } else {
-    add(head, el("span", "stat dim", "running…"));
+  if (row.capsule) {
+    const cap = el("span", "capsule tone-" + row.capsule.tone);
+    add(cap, icon(row.capsule.icon), document.createTextNode(row.capsule.text));
+    add(head, cap);
   }
+  if (row.duration) add(head, el("span", "dur", row.duration));
+  head.addEventListener("click", () => {
+    b.ui.open = !open;
+    refresh(b);
+  });
+  add(root, head);
+  if (!open) return;
+  const body = el("div", "tbody");
   if (b.args !== undefined && b.args !== null) {
-    add(head, btn(b.ui.args ? "hide args" : "args", "link", () => {
+    add(body, btn(b.ui.args ? "hide args" : "args", "link", () => {
       b.ui.args = !b.ui.args;
       refresh(b);
     }));
   }
-  add(root, head);
-  const body = el("div", "tbody");
   if (b.ui.args) add(body, textBox(JSON.stringify(b.args, null, 2), "txt out"));
   if (res) {
     if (res.text === "") add(body, el("div", "dim", "(no output)"));
@@ -1170,49 +1392,165 @@ function buildTool(root, b) {
   add(root, body);
 }
 
+// ---- the chat: items (blocks, work groups, model chips) reconciled into #blocks
+
+function groupHeadText(it) {
+  const label = C.groupLabel(it, Date.now());
+  // Only ledger, job or cache lines, no calls: say that instead of "0 tool calls".
+  if (!it.toolCount) return `Activity · ${C.count(it.blocks.length, "record")}` + (it.running ? " · running" : "");
+  return label.text;
+}
+
+function toggleGroup(it) {
+  S.workState.set(it.key, !it.open);
+  syncChat();
+}
+
+function buildGroup(it) {
+  const root = el("div", "work-group" + (it.open ? " open" : "") + (it.failed ? " has-failed" : ""));
+  root.dataset.group = it.key;
+  const head = el("button", "group-head");
+  head.type = "button";
+  head.setAttribute("aria-expanded", String(it.open));
+  head.dataset.focusKey = "group:" + it.key;
+  const label = el("span", "group-label", groupHeadText(it));
+  label.dataset.groupLabel = "1";
+  add(head, icon("chevron"), label);
+  if (it.failed) {
+    const fail = el("span", "group-fail");
+    fail.title = `${C.count(it.failed, "call")} failed`;
+    add(fail, icon("cross"));
+    add(head, fail);
+  }
+  head.title = it.open ? "Fold this work away; every call stays in the record." : "Show the calls in this work.";
+  head.addEventListener("click", () => toggleGroup(it));
+  add(root, head);
+  if (it.open) {
+    const body = el("div", "group-body");
+    for (const b of it.blocks) add(body, buildBlock(b));
+    add(root, body);
+  }
+  return root;
+}
+
+function buildItem(it) {
+  if (it.type === "model") {
+    const row = el("div", "model-row");
+    add(row, modelChip(it));
+    return row;
+  }
+  if (it.type === "group") return buildGroup(it);
+  return buildBlock(it.block, { differs: it.differs, model: it.model });
+}
+
+const itemKey = (it) => it.type === "model" ? `m${it.seq}${it.reason}` : it.type === "group" ? it.key : "b" + it.block.id;
+
+function itemSig(it) {
+  if (it.type === "model") return it.profile + "|" + it.model;
+  if (it.type === "group") return [it.open, it.last, it.toolCount, it.failed, it.missing, it.running, it.blocks.length, it.running ? "" : it.endTs].join("|");
+  return (it.differs ? "d" : "") + (it.model ? it.model.profile : "");
+}
+
+function itemDirty(it, dirty) {
+  if (!dirty.size) return false;
+  if (it.type === "model") return false;
+  if (it.type === "block") return dirty.has(it.block.id);
+  return it.blocks.some((b) => dirty.has(b.id));
+}
+
+/** The chat items of the open record under the operator's folds, windowed to what is shown. */
+function chatView() {
+  const store = S.rec;
+  const open = new Set([...S.workState].filter(([, v]) => v).map(([k]) => k));
+  const items = C.chatItems(store.blocks, { expandAll: S.expandAll, details: S.details, open, models: store.models });
+  if (!S.expandAll) for (const it of items) if (it.type === "group" && S.workState.has(it.key)) it.open = S.workState.get(it.key);
+  const from = S.r.from;
+  const fromSeq = from > 0 && store.blocks[from] ? store.blocks[from].seq : -1;
+  return items.filter((it) => {
+    if (from === 0) return true;
+    if (it.type === "model") return it.seq >= fromSeq;
+    if (it.type === "group") return it.blocks[it.blocks.length - 1].id >= from;
+    return it.block.id >= from;
+  });
+}
+
+function syncChat() {
+  const store = S.rec;
+  const R = S.r;
+  if (!store || !R || S.view !== "session") return;
+  const holder = $("blocks");
+  const dirty = new Set([...C.takeDirty(store), ...R.forced]);
+  R.forced.clear();
+  const items = chatView();
+  R.items = items;
+  preserveFocus(holder, () => {
+    const seen = new Set();
+    let cursor = holder.firstChild;
+    for (const it of items) {
+      const key = itemKey(it);
+      const sig = itemSig(it);
+      seen.add(key);
+      let entry = R.nodes.get(key);
+      if (!entry || entry.sig !== sig || itemDirty(it, dirty)) {
+        const node = buildItem(it);
+        if (entry && entry.node.parentNode === holder) {
+          if (cursor === entry.node) cursor = node;
+          entry.node.replaceWith(node);
+        }
+        entry = { node, sig, item: it };
+        R.nodes.set(key, entry);
+      } else {
+        entry.item = it;
+      }
+      if (entry.node === cursor) cursor = cursor.nextSibling;
+      else holder.insertBefore(entry.node, cursor);
+    }
+    for (const [key, entry] of R.nodes) {
+      if (!seen.has(key)) {
+        entry.node.remove();
+        R.nodes.delete(key);
+      }
+    }
+  });
+  $("earlier").hidden = R.from === 0;
+  $("btn-earlier").textContent = `Show earlier (${C.num(R.from)} more)`;
+  tickGroups();
+}
+
+/** Running groups count up to now; called by the run timer and on every sync. */
+function tickGroups() {
+  const R = S.r;
+  if (!R) return;
+  for (const [, entry] of R.nodes) {
+    const it = entry.item;
+    if (it.type !== "group" || !it.running) continue;
+    const label = entry.node.querySelector("[data-group-label]");
+    if (label) label.textContent = groupHeadText(it);
+  }
+}
+
 function refresh(b) {
   const R = S.r;
-  if (!R || !R.nodes.has(b.id)) return;
-  const old = R.nodes.get(b.id);
-  const fresh = buildBlock(b);
-  preserveFocus(old.parentElement, () => old.replaceWith(fresh));
-  R.nodes.set(b.id, fresh);
+  if (!R) return;
+  R.forced.add(b.id);
+  syncChat();
 }
 
 function renderBlocks() {
   const store = S.rec;
   const R = S.r;
   if (!store || !R || S.view !== "session") return;
-  $("s-speed").textContent = C.sessionSpeed(store.blocks).label;
-  const holder = $("blocks");
+  renderStats();
   const scroller = $("scroller");
   const total = store.blocks.length;
-  const dirty = C.takeDirty(store);
-  for (const i of dirty) if (i >= R.from && i < R.end) refresh(store.blocks[i]);
-
   if (total > R.end) {
-    let newFrom = R.from;
-    if (S.follow) newFrom = R.fresh ? C.initialFrom(total) : Math.max(R.from, C.trimFrom(total, R.from, C.MAX_RENDERED));
+    if (S.follow) R.from = R.fresh ? C.initialFrom(total) : Math.max(R.from, C.trimFrom(total, R.from, C.MAX_RENDERED));
     R.fresh = false;
-    for (let i = R.from; i < Math.min(newFrom, R.end); i++) {
-      const n = R.nodes.get(i);
-      if (n) n.remove();
-      R.nodes.delete(i);
-    }
-    const frag = document.createDocumentFragment();
-    for (let i = Math.max(R.end, newFrom); i < total; i++) {
-      const n = buildBlock(store.blocks[i]);
-      R.nodes.set(i, n);
-      frag.append(n);
-    }
-    holder.append(frag);
-    R.from = newFrom;
     R.end = total;
   }
-  $("earlier").hidden = R.from === 0;
-  $("btn-earlier").textContent = `Show earlier (${C.num(R.from)} more)`;
+  syncChat();
   if (S.follow) scroller.scrollTop = scroller.scrollHeight;
-  $("jump").hidden = S.section !== "record" || S.follow;
+  $("jump").hidden = S.section !== "chat" || S.follow;
 }
 
 function showEarlier() {
@@ -1221,18 +1559,10 @@ function showEarlier() {
   if (!store || R.from === 0) return;
   const scroller = $("scroller");
   const before = scroller.scrollHeight;
-  const newFrom = C.earlierFrom(R.from);
-  const frag = document.createDocumentFragment();
-  for (let i = newFrom; i < R.from; i++) {
-    const n = buildBlock(store.blocks[i]);
-    R.nodes.set(i, n);
-    frag.append(n);
-  }
-  $("blocks").prepend(frag);
-  R.from = newFrom;
+  R.from = C.earlierFrom(R.from);
+  R.forced.clear();
+  syncChat();
   scroller.scrollTop += scroller.scrollHeight - before;
-  $("earlier").hidden = R.from === 0;
-  $("btn-earlier").textContent = `Show earlier (${C.num(R.from)} more)`;
 }
 
 // ---- the reply that is streaming now
@@ -1251,15 +1581,21 @@ function renderLive() {
   if (!L || L.req !== p.req_id) {
     clear(holder);
     const root = el("div", "live");
+    const chipRow = el("div", "model-row");
     const label = el("div", "label dim", "");
     const retry = el("div", "warn");
     const reasoning = el("pre", "txt dim");
     const text = el("pre", "txt");
     const calls = el("div");
-    add(root, label, retry, reasoning, text, calls);
+    add(root, chipRow, label, retry, reasoning, text, calls);
     holder.append(root);
-    L = S.liveEl = { req: p.req_id, label, retry, reasoning, text, calls };
+    L = S.liveEl = { req: p.req_id, chipRow, label, retry, reasoning, text, calls };
   }
+  const lastItem = S.r && S.r.items[S.r.items.length - 1];
+  const segmentChipShown = lastItem && (lastItem.type === "group" || lastItem.type === "model" || (lastItem.type === "block" && lastItem.block.kind === "response"));
+  const cur = C.currentModel(S.rec, S.sessions.byId.get(S.openId));
+  L.chipRow.replaceChildren(...(cur && !segmentChipShown ? [modelChip(cur)] : []));
+  L.chipRow.hidden = !L.chipRow.firstChild;
   L.label.textContent = p.attempt > 1 ? `model is writing (attempt ${p.attempt})` : "model is writing";
   L.retry.textContent = p.retrying ? C.retryingWords(p.retrying) : "";
   L.retry.hidden = !p.retrying;
@@ -1997,7 +2333,7 @@ function openViewer(blob, title, total, source = {}, opener = document.activeEle
   const provenance = $("viewer-provenance");
   provenance.replaceChildren();
   if (source.session) {
-    const producer = link(source.producer || source.session, C.sessionHash(source.session, "record"));
+    const producer = link(source.producer || source.session, C.sessionHash(source.session, "chat"));
     producer.addEventListener("click", closeViewer);
     add(provenance, document.createTextNode("From "), source.tool ? el("code", "", source.tool) : document.createTextNode("a call"),
       document.createTextNode(" in "), producer, document.createTextNode((source.call ? " · call " + source.call : "") + " · snapshot "));
@@ -2202,6 +2538,7 @@ async function sendMessage() {
   const info = S.sessions.byId.get(id);
   if (!info || !C.sessionActions(info).send) return;
   C.setDraft(S.drafts, key, text);
+  S.seatNote.delete(id);
   S.sending.add(id);
   S.messageState.set(id, { state: "sending", accepted: false, sentText: text, afterSeq: C.lastSeq(S.rec) ?? -1, text: "Sending to " + (info.title || id) + "…" });
   renderHeader();
@@ -2219,6 +2556,85 @@ async function sendMessage() {
   } finally {
     S.sending.delete(id);
     if (S.openId === id) { renderHeader(); if (S.view === "session") $("msg").focus({ preventScroll: true }); }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Model seat (composer)
+
+/** The configured profiles: the live list from GET /api/models, else the ones /api/status reported. */
+function seatModels() {
+  return (S.models && S.models.models) || (S.status && S.status.models) || [];
+}
+async function loadModels() {
+  try { S.models = await api("GET", "/api/models"); } catch { /* /api/status still names the profiles */ }
+  if (S.view === "session") want("header");
+}
+
+/** The select shows the session's profile; another choice waits behind an inline confirmation. */
+function renderSeat(info) {
+  const sel = $("model-seat");
+  const current = C.currentModel(S.rec, info);
+  const models = seatModels();
+  const options = C.seatOptions(models, current);
+  const sig = info.id + "|" + (current ? "" : "?") + options.map(o => o.value + "=" + o.label).join(",");
+  if (sel.dataset.sig !== sig) {
+    sel.replaceChildren();
+    if (!current) { const none = new Option("model unknown", ""); none.disabled = true; sel.append(none); }
+    for (const o of options) sel.append(new Option(o.label, o.value));
+    sel.dataset.sig = sig;
+  }
+  if (S.seat && (S.seat.session !== info.id || (current && current.profile === S.seat.profile))) S.seat = null;
+  sel.value = S.seat ? S.seat.profile : current ? current.profile : "";
+  sel.disabled = S.seatBusy || options.length === 0;
+  const unreachable = !!options.find(o => o.value === sel.value && o.unreachable);
+  sel.classList.toggle("unreachable", unreachable);
+  sel.setAttribute("aria-label", "Model for this session" + (unreachable ? ", not reachable" : ""));
+  const q = S.seat ? C.seatConfirm(models, current, S.seat.profile) : null;
+  if (S.seat && !q) S.seat = null;
+  $("model-confirm").hidden = !q;
+  if (q) {
+    if ($("model-confirm-text").textContent !== q.text) $("model-confirm-text").textContent = q.text;
+    $("model-confirm-yes").textContent = q.yes;
+    $("model-confirm-no").textContent = q.no;
+  }
+  $("model-confirm-yes").disabled = S.seatBusy;
+  $("model-confirm-no").disabled = S.seatBusy;
+}
+/** The text box grows with its text up to 40% of the window (CSS max-height), then scrolls. */
+function growMsg() {
+  const msg = $("msg");
+  const key = msg.value + "|" + msg.clientWidth;
+  if (msg.dataset.grown === key || msg.hidden) return;
+  msg.dataset.grown = key;
+  msg.style.setProperty("height", "auto");
+  msg.style.setProperty("height", msg.scrollHeight + "px");
+}
+function cancelSeat() {
+  if (!S.seat || S.seatBusy) return;
+  S.seat = null;
+  renderHeader();
+  $("model-seat").focus({ preventScroll: true });
+}
+async function applySeat() {
+  const pending = S.seat;
+  if (!pending || S.seatBusy) return;
+  S.seatBusy = true;
+  S.seatNote.set(pending.session, `Switching to ${pending.profile}…`);
+  renderHeader();
+  try {
+    const receipt = await api("POST", "/api/sessions/" + encodeURIComponent(pending.session) + "/model", { profile: pending.profile });
+    S.seatNote.set(pending.session, C.seatReceipt(receipt));
+    const info = S.sessions.byId.get(pending.session);
+    // The `session` frame confirms it; show the new seat now so the select does not flicker back.
+    if (info && receipt && receipt.model) C.applySessionEvent(S.sessions, { ...info, profile: receipt.model.profile, model: receipt.model.model, context_window: receipt.model.context_window });
+  } catch (e) {
+    S.seatNote.set(pending.session, e.message);
+  } finally {
+    S.seat = null;
+    S.seatBusy = false;
+    if (S.openId === pending.session) { renderHeader(); if (S.view === "session") $("model-seat").focus({ preventScroll: true }); }
+    want("list");
   }
 }
 
@@ -2282,11 +2698,14 @@ async function sessionAction(name, body) {
 }
 
 let drawerOpener = null;
+let nextOpener = null; // the button that asked for a drawer (a click does not focus it in every browser)
 function setDrawer(side, open) {
   const panel = $(side);
   const narrow = matchMedia("(max-width: 1099px)").matches;
   const mobile = matchMedia("(max-width: 699px)").matches;
-  if (open) drawerOpener = document.activeElement;
+  const asked = nextOpener;
+  nextOpener = null;
+  if (open) drawerOpener = asked || document.activeElement;
   document.body.classList.toggle("show-" + side, open);
   const rightOpen = document.body.classList.contains("show-right");
   const leftOpen = document.body.classList.contains("show-left");
@@ -2340,9 +2759,9 @@ function wire() {
     S.showArchived = e.target.checked;
     want("list");
   });
-  $("open-left").addEventListener("click", () => { setDrawer("right", false); setDrawer("left", true); });
+  $("open-left").addEventListener("click", (e) => { setDrawer("right", false); nextOpener = e.currentTarget; setDrawer("left", true); });
   $("close-left").addEventListener("click", () => setDrawer("left", false));
-  const inspector = () => { setDrawer("left", false); setDrawer("right", !document.body.classList.contains("show-right")); };
+  const inspector = (e) => { setDrawer("left", false); nextOpener = e.currentTarget; setDrawer("right", !document.body.classList.contains("show-right")); };
   $("open-right").addEventListener("click", inspector);
   $("toggle-inspector").addEventListener("click", inspector);
   $("close-right").addEventListener("click", () => setDrawer("right", false));
@@ -2365,7 +2784,7 @@ function wire() {
     const s = $("scroller");
     const was = S.follow;
     S.follow = C.atEnd(s.scrollTop, s.clientHeight, s.scrollHeight);
-    $("jump").hidden = S.section !== "record" || S.follow;
+    $("jump").hidden = S.section !== "chat" || S.follow;
     if (S.follow && !was) want("blocks");
   });
   $("jump").addEventListener("click", () => {
@@ -2373,8 +2792,18 @@ function wire() {
     want("blocks");
   });
   $("btn-earlier").addEventListener("click", showEarlier);
-  $("details").addEventListener("change", (e) => $("blocks").classList.toggle("hide-details", !e.target.checked));
+  $("details").addEventListener("change", (e) => {
+    S.details = e.target.checked;
+    $("blocks").classList.toggle("hide-details", !S.details);
+    syncChat();
+  });
+  $("expand-work").addEventListener("change", (e) => {
+    S.expandAll = e.target.checked;
+    syncChat();
+  });
 
+  $("s-id").addEventListener("click", copySessionId);
+  $("s-goal-toggle").addEventListener("click", () => { S.goalOpen = !S.goalOpen; renderHeader(); });
   $("b-rename").addEventListener("click", renameSession);
   $("b-rename").title = "Rename this mission.";
   $("b-stop").addEventListener("click", () => sessionAction("stop"));
@@ -2383,6 +2812,17 @@ function wire() {
   $("b-archive").addEventListener("click", () => sessionAction("archive", { archived: true }));
   $("b-unarchive").addEventListener("click", () => sessionAction("archive", { archived: false }));
 
+  $("model-seat").addEventListener("change", (e) => {
+    const info = S.sessions.byId.get(S.openId);
+    if (!info) return;
+    const current = C.currentModel(S.rec, info);
+    S.seatNote.delete(info.id);
+    S.seat = e.target.value && e.target.value !== (current && current.profile) ? { session: info.id, profile: e.target.value } : null;
+    renderHeader();
+  });
+  $("model-confirm-yes").addEventListener("click", applySeat);
+  $("model-confirm-no").addEventListener("click", cancelSeat);
+  $("composer").addEventListener("keydown", (e) => { if (e.key === "Escape" && S.seat && !S.seatBusy) { e.preventDefault(); cancelSeat(); } });
   const msg = $("msg");
   msg.addEventListener("input", () => { if (S.openId) C.setDraft(S.drafts, "message:" + S.openId, msg.value); renderHeader(); });
   $("send").addEventListener("click", sendMessage);
@@ -2421,6 +2861,7 @@ function wire() {
   window.addEventListener("hashchange", route);
   window.addEventListener("pagehide", saveSeen);
   window.addEventListener("resize", () => {
+    if (S.view === "session") want("header");
     setDrawer("left", document.body.classList.contains("show-left"));
     setDrawer("right", document.body.classList.contains("show-right"));
   });
@@ -2466,7 +2907,7 @@ async function start() {
   }
   wire();
   setTab("ledger");
-  setSection("overview", false);
+  setSection("chat", false);
   setDrawer("left", false);
   setDrawer("right", false);
   resizeInspector(Number(recalled("inspector-width", 360)) || 360);

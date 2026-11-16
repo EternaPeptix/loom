@@ -70,7 +70,7 @@
 //! ## Listings (columns separated by two spaces, widths from the content, a header line, rows cut
 //! to `style.width`)
 //! - `sessions_table(list, now_ms, style)`: one row per session, children indented under their
-//!   parent (`  └ `): `ID  ROLE  STATE  STEP  CONTEXT  AGE  TITLE`. `STATE`: `running`, `ended
+//!   parent (`  └ `): `ID  ROLE  MODEL  STATE  STEP  CONTEXT  AGE  TITLE`. `MODEL`: the session's profile name (`meta.profile`). `STATE`: `running`, `ended
 //!   ({outcome})`, else the last turn end in the words above, else `new`; ` *` appended when
 //!   `open_inbox > 0`. `CONTEXT`: `tokens(prompt_tokens)`. Empty list: `No sessions.`
 //! - `inbox_list(list, now_ms, style)`: per item `{item_id}  {kind}  {age}  {session}  {title}` and
@@ -715,6 +715,7 @@ pub fn sessions_table(list: &[SessionInfo], now_ms: u64, style: &Style) -> Strin
             vec![
                 id,
                 flat(&s.meta.role),
+                flat(&s.meta.profile),
                 flat(&session_state(s)),
                 s.status.step.to_string(),
                 tokens(s.status.prompt_tokens),
@@ -723,7 +724,7 @@ pub fn sessions_table(list: &[SessionInfo], now_ms: u64, style: &Style) -> Strin
             ]
         })
         .collect();
-    table(style, &["ID", "ROLE", "STATE", "STEP", "CONTEXT", "AGE", "TITLE"], &rows)
+    table(style, &["ID", "ROLE", "MODEL", "STATE", "STEP", "CONTEXT", "AGE", "TITLE"], &rows)
 }
 
 pub fn inbox_list(list: &[InboxEntry], now_ms: u64, style: &Style) -> String {
@@ -1844,6 +1845,24 @@ mod tests {
         for line in &lines[1..] {
             assert_eq!(line.chars().nth(col), Some('l'), "{line}");
         }
+    }
+
+    #[test]
+    fn sessions_table_shows_the_profile_after_role() {
+        let mut root = info("s-root", None, "main", status_of(Phase::Idle, None, None, 0));
+        root.meta.profile = "dsv41".into();
+        let mut kid = info("s-kid", Some("s-root"), "sub", status_of(Phase::Idle, None, None, 0));
+        kid.meta.profile = "qwen\nx".into();
+        let text = sessions_table(&[root, kid], 0, &MONO);
+        let lines: Vec<&str> = text.lines().collect();
+        let header: Vec<&str> = lines[0].split_whitespace().collect();
+        assert_eq!(&header[..4], ["ID", "ROLE", "MODEL", "STATE"], "{}", lines[0]);
+        let col = lines[0].find("MODEL").unwrap_or(usize::MAX);
+        assert!(lines[1][lines[1].char_indices().nth(col).map_or(0, |(i, _)| i)..].starts_with("dsv41"), "{}", lines[1]);
+        assert!(lines[2].contains("qwen x"), "{}", lines[2]);
+        assert!(lines[2].starts_with("  └ s-kid"), "{}", lines[2]);
+        let kid_col = lines[2].chars().take(col).count();
+        assert_eq!(kid_col, col);
     }
 
     #[test]

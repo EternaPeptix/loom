@@ -763,9 +763,10 @@ export function sendFailure(state, message, { rejected = false } = {}) {
   };
 }
 
-const SESSION_SECTIONS = new Set(["overview", "record", "evidence"]);
-export function sessionHash(session, section = "overview") {
-  return `#/s/${encodeURIComponent(session)}/${SESSION_SECTIONS.has(section) ? section : "overview"}`;
+const SESSION_SECTIONS = new Set(["chat", "overview", "evidence"]);
+/** Hash of a session view: `#/s/<id>/<chat|overview|evidence>`; "record" (the old name of chat) and unknown sections give chat. */
+export function sessionHash(session, section = "chat") {
+  return `#/s/${encodeURIComponent(session)}/${SESSION_SECTIONS.has(section) ? section : "chat"}`;
 }
 /** Decode identifiers after splitting the route so encoded punctuation remains part of an id. */
 export function parseRoute(hash) {
@@ -775,7 +776,9 @@ export function parseRoute(hash) {
   if (parts[1] !== "s" || !parts[2] || parts.length > 4) return { view: "empty" };
   try {
     const session = decodeURIComponent(parts[2]);
-    const section = parts[3] || "overview";
+    const section = parts[3] || "chat";
+    // The old name of the chat tab keeps working; `rewrite` is the hash the page should replace it with.
+    if (section === "record") return { view: "session", session, section: "chat", rewrite: sessionHash(session, "chat") };
     return SESSION_SECTIONS.has(section) ? { view: "session", session, section } : { view: "empty" };
   } catch {
     return { view: "empty" };
@@ -985,6 +988,8 @@ export function createRecordStore(session) {
     pendingRev: 0,
     ended: false,
     start: null, // facts from session_start / forked, for the Session tab
+    models: [], // the model in effect over time: {seq, ts, profile, model, context_window}, ascending by seq
+    turn: null, // {seq, ts} of the turn running now (latest turn_start with no turn_end/interrupt/end after it)
   };
 }
 
@@ -1125,6 +1130,7 @@ function step(store, rec) {
         duration_ms: rec.duration_ms || 0,
         shown: shownOfTotal(rec),
         lines: lineCount(rec.text || ""),
+        ts: rec.ts_ms,
       };
       b.state = "done";
       store.openCalls.delete(b);
@@ -1138,20 +1144,20 @@ function step(store, rec) {
       push(store, { ...base(rec), kind: "child_settled", child: rec.child, outcome: rec.outcome, report: rec.report || "", full: rec.full || null, steps: rec.steps || 0, inline: !!rec.inline });
       break;
     case "job_registered":
-      push(store, { ...base(rec), kind: "line", tone: "dim", text: `job ${rec.job_id} started: ${oneLine(rec.command, 200)}` });
+      push(store, { ...base(rec), kind: "line", sub: "job", tone: "dim", text: `job ${rec.job_id} started: ${oneLine(rec.command, 200)}` });
       break;
     case "job_settled": {
       const code = rec.exit_code === null || rec.exit_code === undefined ? "no exit code" : `exit ${rec.exit_code}`;
-      push(store, { ...base(rec), kind: "line", tone: rec.exit_code === 0 ? "dim" : "warn", text: `job ${rec.job_id} settled (${code})${rec.detail ? ": " + oneLine(rec.detail, 200) : ""}`, blob: rec.output || null });
+      push(store, { ...base(rec), kind: "line", sub: "job", tone: rec.exit_code === 0 ? "dim" : "warn", text: `job ${rec.job_id} settled (${code})${rec.detail ? ": " + oneLine(rec.detail, 200) : ""}`, blob: rec.output || null });
       break;
     }
     case "job_matched": {
       const n = Number.isInteger(rec.matches) ? rec.matches : 0;
-      push(store, { ...base(rec), kind: "line", tone: "warn", text: `job ${rec.job_id} wrote ${n} line${n === 1 ? "" : "s"} matching /${oneLine(rec.pattern, 120)}/`, blob: rec.output || null });
+      push(store, { ...base(rec), kind: "line", sub: "job", tone: "warn", text: `job ${rec.job_id} wrote ${n} line${n === 1 ? "" : "s"} matching /${oneLine(rec.pattern, 120)}/`, blob: rec.output || null });
       break;
     }
     case "ledger":
-      push(store, { ...base(rec), kind: "line", tone: "dim", text: `ledger #${rec.n}: ${oneLine(rec.summary, 300)}` });
+      push(store, { ...base(rec), kind: "line", sub: "ledger", tone: "dim", text: `ledger #${rec.n}: ${oneLine(rec.summary, 300)}` });
       break;
     case "reweave":
       push(store, {
@@ -1185,7 +1191,7 @@ function step(store, rec) {
       break;
     }
     case "cache_break":
-      push(store, { ...base(rec), kind: "line", tone: "warn", text: `cache break at message ${rec.first_diff_message}: ${oneLine(rec.detail, 300)}` });
+      push(store, { ...base(rec), kind: "line", sub: "cache", tone: "warn", text: `cache break at message ${rec.first_diff_message}: ${oneLine(rec.detail, 300)}` });
       break;
     case "model_switched": {
       // The session's requests go to another model from here on (the operator switched it, or its
@@ -1195,38 +1201,55 @@ function step(store, rec) {
         return `${oneLine((m && m.profile) || "?", 80)} (${oneLine((m && m.model) || "?", 80)}${win})`;
       };
       const reason = rec.reason ? ` · ${oneLine(rec.reason, 120)}` : "";
-      push(store, { ...base(rec), kind: "line", tone: "dim", text: `model switched: ${side(rec.from)} → ${side(rec.to)}${reason}` });
+      const to = modelEntry(rec, rec.to);
+      store.models.push(to);
+      push(store, {
+        ...base(rec), kind: "line", sub: "switch", tone: "dim",
+        text: `model switched: ${side(rec.from)} → ${side(rec.to)}${reason}`,
+        switch: { from: modelEntry(rec, rec.from), to, reason: rec.reason || "" },
+      });
       break;
     }
     case "interrupted":
-      push(store, { ...base(rec), kind: "line", tone: "warn", text: `interrupted: ${oneLine(rec.reason, 300)}` });
+      push(store, { ...base(rec), kind: "line", sub: "interrupted", tone: "warn", text: `interrupted: ${oneLine(rec.reason, 300)}` });
+      store.turn = null;
       lostCalls(store);
       clearPending(store);
       break;
     case "turn_end":
       push(store, { ...base(rec), kind: "divider", text: turnEndWords(rec.reason), reason: rec.reason });
+      store.turn = null;
       lostCalls(store);
       clearPending(store);
       break;
     case "session_end":
       push(store, { ...base(rec), kind: "end", outcome: rec.outcome, text: `session ended: ${outcomeWords(rec.outcome)}${rec.detail ? " — " + oneLine(rec.detail, 300) : ""}` });
       store.ended = true;
+      store.turn = null;
       lostCalls(store);
       clearPending(store);
       break;
     case "model_request":
-      push(store, { ...base(rec), kind: "line", detail: true, tone: "dim", text: `request ${rec.req_id}: step ${rec.step}, epoch ${rec.epoch}, about ${tokens(rec.est_tokens)} tokens${rec.purpose && rec.purpose !== "step" ? " (" + rec.purpose + ")" : ""}` });
+      push(store, { ...base(rec), kind: "line", sub: "request", detail: true, tone: "dim", text: `request ${rec.req_id}: step ${rec.step}, epoch ${rec.epoch}, about ${tokens(rec.est_tokens)} tokens${rec.purpose && rec.purpose !== "step" ? " (" + rec.purpose + ")" : ""}` });
       break;
     case "session_start":
-      store.start = { budget: rec.budget || {}, tools: (rec.tools || []).length, termination: rec.termination, reasoning_replay: rec.reasoning_replay };
+      store.start = { budget: rec.budget || {}, tools: (rec.tools || []).length, termination: rec.termination, reasoning_replay: rec.reasoning_replay, model: rec.model ? modelEntry(rec, rec.model) : null };
+      if (rec.model) store.models.push(modelEntry(rec, rec.model));
+      break;
+    case "turn_start":
+      store.turn = { seq: rec.seq, ts: rec.ts_ms };
       break;
     case "forked":
       store.start = { ...(store.start || {}), budget: rec.budget || {}, termination: rec.termination, forked_from: rec.parent, upto_seq: rec.upto_seq };
       break;
     default:
-      // turn_start, pin, unpin, net and kinds this build does not know.
+      // pin, unpin, net and kinds this build does not know.
       break;
   }
+}
+
+function modelEntry(rec, m) {
+  return { seq: rec.seq, ts: rec.ts_ms, profile: (m && m.profile) || "", model: (m && m.model) || "", context_window: (m && m.context_window) || 0 };
 }
 
 function clearPending(store) {
@@ -1865,4 +1888,526 @@ export function deliverEvents(events, handle, report) {
       report(e);
     }
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Chat-first redesign: model identity, chat items, sidebar rows, identity chips, stats
+// ---------------------------------------------------------------------------------------------
+
+/** "1M", "262k", "128k", "4k", "800": a context window in tokens; "" when unknown. Binary sizes read as their round name. */
+export function formatWindow(n) {
+  const v = Number(n);
+  if (!(v > 0)) return "";
+  if (v < 1000) return String(Math.round(v));
+  if (v >= 1e6) {
+    const bin = v / 1048576;
+    if (Math.abs(bin - Math.round(bin)) < 0.005) return Math.round(bin) + "M";
+    return trimZeros((v / 1e6).toFixed(1)) + "M";
+  }
+  return Math.round(v / 1000) + "k";
+}
+
+/** The model that served a record: `store.models` (ascending by seq) entry in effect at `seq`; null when none is known yet.
+ *  Shape of an entry: {seq, ts, profile, model, context_window}. */
+export function modelAt(store, seq) {
+  let found = null;
+  for (const m of (store && store.models) || []) {
+    if (m.seq <= seq) found = m;
+    else break;
+  }
+  return found;
+}
+
+/** The model in effect now: the live session info wins (it updates on a `session` frame), else the latest in the
+ *  record store. Returns {profile, model, context_window} or null when neither knows. */
+export function currentModel(store, info) {
+  if (info && info.profile) return { profile: info.profile, model: info.model || "", context_window: info.context_window || 0 };
+  const list = (store && store.models) || [];
+  if (!list.length) return null;
+  const m = list[list.length - 1];
+  return { profile: m.profile, model: m.model, context_window: m.context_window };
+}
+
+const isWorkLine = (b) => b.kind === "line" && (b.sub === "job" || b.sub === "ledger" || b.sub === "cache" || b.sub === "request");
+const isTextless = (b) => b.kind === "response" && !String(b.text || "").trim();
+const isGroupMember = (b) => b.kind === "tool" || isTextless(b) || isWorkLine(b);
+// What starts a new assistant segment, so the next assistant item names its model again.
+const isBoundary = (b) => b.kind === "user" || b.kind === "note" || b.kind === "inbox" || b.kind === "divider"
+  || b.kind === "child_spawned" || b.kind === "child_settled" || b.kind === "end";
+
+/** The group key of a group whose first block has `seq`: stable while the group grows at its end. */
+const groupKey = (firstBlock) => "g" + firstBlock.seq;
+
+function makeGroup(blocks) {
+  let toolCount = 0, failed = 0, missing = 0, running = false;
+  let startTs = blocks[0].ts, endTs = blocks[0].ts;
+  for (const b of blocks) {
+    if (Number.isFinite(b.ts)) {
+      if (!Number.isFinite(startTs) || b.ts < startTs) startTs = b.ts;
+      if (!Number.isFinite(endTs) || b.ts > endTs) endTs = b.ts;
+    }
+    if (b.kind !== "tool") continue;
+    toolCount++;
+    if (b.state === "running") running = true;
+    else if (b.state === "missing") missing++;
+    else if (b.result && b.result.status !== "ok") failed++;
+    if (b.result && Number.isFinite(b.result.ts) && b.result.ts > endTs) endTs = b.result.ts;
+  }
+  return { type: "group", key: groupKey(blocks[0]), blocks, toolCount, failed, missing, running, startTs, endTs, open: false, last: false };
+}
+
+/**
+ * The chat as a render list from `blocks` (a record store's blocks). Items, in order:
+ *   {type:"block", block, last, model?, differs?}   a block shown as itself; for a model reply `model` is {profile, model}
+ *                                                   serving it and `differs` says it is not the segment chip's model
+ *   {type:"group", key, blocks, toolCount, failed, missing, running, startTs, endTs, open, last}
+ *                                                   a maximal run of tool blocks, text-less replies and job/ledger/cache lines
+ *   {type:"model", profile, model, context_window, seq, reason:"start"|"switch"}   chip before the first assistant item of a
+ *                                                   segment (after a user message, note, inbox card, divider, child card or
+ *                                                   model switch)
+ * `open` of a group: opts.expandAll, a running call, the last item, or opts.open (Set of keys). Request-detail lines
+ * are dropped unless opts.details. opts.models is `store.models`; without it no chips are emitted.
+ */
+export function chatItems(blocks, opts = {}) {
+  const { expandAll = false, details = false } = opts;
+  const open = opts.open instanceof Set ? opts.open : new Set(opts.open || []);
+  const store = { models: opts.models || [] };
+  const items = [];
+  let run = null;
+  let needChip = true;
+  let chip = null;
+  const chipFor = (seq) => {
+    if (!store.models.length) return;
+    const m = modelAt(store, seq) || store.models[0];
+    if (needChip) {
+      const reason = chip ? "switch" : "start";
+      items.push({ type: "model", profile: m.profile, model: m.model, context_window: m.context_window, seq, reason });
+      chip = m;
+      needChip = false;
+    }
+  };
+  const flush = () => {
+    if (!run) return;
+    chipFor(run[0].seq);
+    items.push(makeGroup(run));
+    run = null;
+  };
+  for (const b of blocks || []) {
+    if (!b) continue;
+    if (b.detail && !details) continue;
+    if (isGroupMember(b)) {
+      (run || (run = [])).push(b);
+      continue;
+    }
+    flush();
+    if (b.kind === "response") {
+      chipFor(b.seq);
+      const m = modelAt(store, b.seq);
+      const item = { type: "block", block: b, last: false };
+      if (m) {
+        item.model = { profile: m.profile, model: m.model };
+        item.differs = !!chip && (chip.profile !== m.profile || chip.model !== m.model);
+      }
+      items.push(item);
+      continue;
+    }
+    items.push({ type: "block", block: b, last: false });
+    if (b.sub === "switch") needChip = true;
+    else if (isBoundary(b)) needChip = true;
+  }
+  flush();
+  const last = items[items.length - 1];
+  if (last) last.last = true;
+  for (const it of items) if (it.type === "group") it.open = !!(expandAll || it.running || it.last || open.has(it.key));
+  return items;
+}
+
+/** The key of the group of `items` that holds record `seq` (a block's own seq, a tool's call or result seq); null when none. */
+export function groupKeyForSeq(items, seq) {
+  for (const it of items || []) {
+    if (it.type !== "group") continue;
+    for (const b of it.blocks) {
+      if (b.seq === seq || b.callSeq === seq || (b.result && b.result.seq === seq)) return it.key;
+    }
+  }
+  return null;
+}
+
+/** The header words of a work group: {text, duration, tools, failed, missing, running} where text is
+ *  "Worked for 12s · 4 tool calls · 1 failed · running" (the running group's duration runs to `now`). */
+export function groupLabel(group, now) {
+  const end = group.running && Number.isFinite(now) ? now : group.endTs;
+  const ms = Math.max(0, (Number(end) || 0) - (Number(group.startTs) || 0));
+  const duration = ms < 1000 ? "under 1s" : seconds(ms);
+  const parts = [`Worked for ${duration}`, count(group.toolCount, "tool call")];
+  if (group.failed) parts.push(`${group.failed} failed`);
+  if (group.missing) parts.push(`${group.missing} without a result`);
+  if (group.running) parts.push("running");
+  return { text: parts.join(" · "), duration, tools: group.toolCount, failed: group.failed, missing: group.missing, running: group.running };
+}
+
+/** "Thought · 3 lines" for a reply that has reasoning; "" otherwise. */
+export function thoughtLabel(block) {
+  const n = (block && block.reasoningLines) || 0;
+  return n > 0 ? `Thought · ${count(n, "line")}` : "";
+}
+
+/** The icon (a name in the icons template) for a tool block: terminal for exec, file for read, pencil for write/edit,
+ *  search for nav, list for state/ledger, people for agent tools. */
+export function toolIcon(block) {
+  const name = String((block && block.name) || "").toLowerCase();
+  if (/^(agent|delegate|spawn|child)/.test(name) || /(^|_)agents?(_|$)/.test(name)) return "tool-agent";
+  if (/^(edit|write|patch|apply)/.test(name)) return "tool-write";
+  switch (block && block.cls) {
+    case "exec": return "tool-exec";
+    case "read": return "tool-read";
+    case "write": return "tool-write";
+    case "nav": return "tool-nav";
+    case "state":
+    case "terminal": return "tool-state";
+    default: return "tool-exec";
+  }
+}
+
+/** One tool row in a group: {icon, name, argsLine, capsule, duration, state}. `capsule` is {text, tone, icon} or null
+ *  (tone "ok" | "bad" | "warn" | "running"; icon is a template name with its own shape: check / cross / alert / dot). */
+export function toolRow(block) {
+  const r = block.result;
+  let capsule = null;
+  if (block.state === "running") capsule = { text: "running", tone: "running", icon: "dot" };
+  else if (block.state === "missing") capsule = { text: "no result", tone: "warn", icon: "alert" };
+  else if (r) {
+    const code = r.meta && Number.isInteger(r.meta.exit_code) ? r.meta.exit_code : null;
+    if (r.status === "ok") capsule = { text: code === null ? "ok" : `exit ${code}`, tone: "ok", icon: "check" };
+    else capsule = { text: code !== null && code !== 0 ? `exit ${code}` : oneLine(r.status || "error", 24), tone: "bad", icon: "cross" };
+  }
+  const duration = r && r.duration_ms ? seconds(r.duration_ms) : "";
+  return { icon: toolIcon(block), name: block.name, argsLine: block.argsLine || "", capsule, duration, state: block.state };
+}
+
+/** Footer of a reply, quiet: [profile ·] tok/s · seconds · cache N%. Pass `profile` only when the reply's model differs
+ *  from the segment chip. Empty parts are left out. */
+export function replyMeta(block, profile = "") {
+  const parts = [];
+  if (profile) parts.push(profile);
+  const speed = speedText(tokensPerSecond(block));
+  if (speed) parts.push(speed);
+  const total = block.timing && block.timing.total_ms;
+  if (total) parts.push(seconds(total));
+  const share = cachedShare((block.usage || {}).cached_tokens || 0, (block.usage || {}).prompt_tokens || 0);
+  if (share) parts.push(`cache ${share}`);
+  return parts.join(" · ");
+}
+
+/** The model-switched line in full: {from, to, text} with each side "profile · model · window" and `reason`. */
+export function switchLine(block) {
+  const sw = block && block.switch;
+  if (!sw) return null;
+  const side = (m) => [m.profile || "?", m.model || "?", formatWindow(m.context_window)].filter(Boolean).join(" · ");
+  return { from: side(sw.from), to: side(sw.to), reason: sw.reason, text: block.text };
+}
+
+// ---- sidebar
+
+/** Last path component of a workspace path ("/a/b/" is "b"); "no workspace" for empty. */
+export function workspaceName(path) {
+  const parts = String(path || "").split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "no workspace";
+}
+
+const getMark = (m, id) => (m instanceof Map ? m.get(id) : m && typeof m === "object" ? m[id] : undefined);
+
+const ROW_MARKS = {
+  needs_you: { icon: "diamond", tone: "attention", words: "needs you" },
+  running: { icon: "dot", tone: "running", words: "running" },
+  waiting: { icon: "half", tone: "running", words: "waiting for jobs or agents" },
+  new: { icon: "new", tone: "info", words: "new since your last visit" },
+  failed: { icon: "cross", tone: "bad", words: "ended: failed" },
+  idle: { icon: "ring", tone: "", words: "idle" },
+  ended: { icon: "check", tone: "", words: "ended" },
+};
+
+/**
+ * The one status mark of a sidebar row, strict precedence needs-you > running > new > failed > idle/ended.
+ * `info` the session (root or agent); `attention` from attentionFor (aggregate over the mission for a root);
+ * opts.running / opts.waiting override the execution state with the mission's aggregate; opts.fresh says records are
+ * newer than the stored watermark. Returns {mark, icon, tone, words}; each mark has its own icon shape.
+ */
+export function rowMark(info, attention, opts = {}) {
+  const st = (info && info.status) || {};
+  const blocking = (attention && attention.blocking) || 0;
+  let mark;
+  if (blocking > 0 && st.phase !== "ended") mark = "needs_you";
+  else if (opts.running || st.phase === "running") mark = "running";
+  else if (opts.waiting || (st.phase !== "ended" && st.last_end === "waiting")) mark = "waiting";
+  else if (opts.fresh) mark = "new";
+  else if (st.phase === "ended") mark = st.outcome === "failed" || st.outcome === "budget_exhausted" ? "failed" : "ended";
+  else mark = st.last_end === "error" || st.last_end === "budget_exhausted" ? "failed" : "idle";
+  return { mark, ...ROW_MARKS[mark] };
+}
+
+/** What waits on the operator as short words replacing the age on the identity line, or null. `waiting` is waitingFor(). */
+export function waitingReason(waiting, now) {
+  const b = waiting && waiting.blocking;
+  if (!b || !(b.count > 0)) return null;
+  if (b.count > 1) return { text: `${b.count} requests waiting`, icon: "diamond", tone: "attention" };
+  const noun = WAITING_NOUN[b.kind] || "Request";
+  const a = Number.isFinite(b.since) ? age(now, b.since) : null;
+  return { text: a === "now" ? `${noun} just arrived` : `${noun} waiting${a ? " " + a : ""}`, icon: "diamond", tone: "attention" };
+}
+
+/** The identity line of a row: "profile · role · age", or "profile · role · <waiting reason>". Returns {text, parts, waiting}. */
+export function identityLine(info, activityMs, waiting, now) {
+  const reason = waitingReason(waiting, now);
+  const parts = [info.profile || "?", info.role || "session", reason ? reason.text : age(now, activityMs)];
+  return { text: parts.join(" · "), parts, waiting: reason };
+}
+
+/**
+ * The sidebar: root sessions grouped by workspace, groups and rows by most recent activity, with a "Needs you" group
+ * pinned on top holding the roots (any of whose sessions) blocks on the operator. `store` is the session store;
+ * `watermarks` maps session id to the last seq seen on the last visit (Map or object; no entry means never visited, so
+ * never "new"); opts.activity is a Map id -> {seq, ts} of the latest record known per session (ts falls back to
+ * created_ms); opts.expanded is the Set of missions whose agents are listed, opts.showArchived includes archived roots.
+ * Groups: {key:"needs_you"|"ws:<path>", label, tip, workspace, activityMs, rows}. Rows: {info, depth, mission, agentCount,
+ * agentsRunning, expanded, attention, waiting, mark:{mark,icon,tone,words}, identity:{text,parts,waiting}, activityMs}.
+ */
+export function workspaceGroups(store, inbox, watermarks, now, opts = {}) {
+  const { showArchived = false, expanded = new Set(), activity = new Map() } = opts;
+  const lastMs = (info) => {
+    const a = activity.get(info.id);
+    return a && Number.isFinite(a.ts) ? a.ts : Number(info.created_ms) || 0;
+  };
+  const isFresh = (info) => {
+    const a = activity.get(info.id);
+    const seen = getMark(watermarks, info.id);
+    return !!a && Number.isInteger(seen) && Number.isInteger(a.seq) && a.seq > seen;
+  };
+  const ordered = sessionRows(store, { showArchived });
+  const missions = [];
+  for (const row of ordered) {
+    if (row.depth === 0) missions.push([row]);
+    else if (missions.length) missions[missions.length - 1].push(row);
+  }
+  const groups = new Map();
+  const needs = { key: "needs_you", label: "Needs you", tip: "Sessions waiting on you", workspace: null, activityMs: 0, rows: [] };
+  const rowOf = (info, depth, mission, extra) => {
+    const attention = extra.attention;
+    const ms = extra.activityMs;
+    return {
+      info, depth, mission, agentCount: extra.agentCount, agentsRunning: extra.agentsRunning, expanded: extra.expanded,
+      attention, waiting: extra.waiting,
+      mark: rowMark(info, attention, { running: extra.running, waiting: extra.waitingExec, fresh: extra.fresh }),
+      identity: identityLine(info, ms, extra.waiting, now),
+      activityMs: ms,
+    };
+  };
+  for (const rows of missions) {
+    const root = rows[0].info;
+    const ids = rows.map((r) => r.info.id);
+    const attention = { open: 0, blocking: 0, questions: 0, results: 0 };
+    let running = false, waitingExec = false, fresh = false, newest = 0;
+    for (const r of rows) {
+      const own = attentionFor(inbox, r.info.id);
+      for (const k of Object.keys(attention)) attention[k] += own[k];
+      const st = r.info.status || {};
+      if (st.phase === "running") running = true;
+      else if (st.phase !== "ended" && st.last_end === "waiting") waitingExec = true;
+      if (isFresh(r.info)) fresh = true;
+      newest = Math.max(newest, lastMs(r.info));
+    }
+    const agents = rows.slice(1);
+    const rootRow = rowOf(root, 0, root.id, {
+      agentCount: agents.length,
+      agentsRunning: agents.filter((r) => (r.info.status || {}).phase === "running").length,
+      expanded: expanded.has(root.id), attention, waiting: waitingFor(inbox, ids),
+      running, waitingExec, fresh, activityMs: newest,
+    });
+    const out = [rootRow];
+    if (expanded.has(root.id)) {
+      for (const r of agents) {
+        out.push(rowOf(r.info, r.depth, root.id, {
+          agentCount: 0, agentsRunning: 0, expanded: false,
+          attention: attentionFor(inbox, r.info.id), waiting: waitingFor(inbox, [r.info.id]),
+          running: false, waitingExec: false, fresh: isFresh(r.info), activityMs: lastMs(r.info),
+        }));
+      }
+    }
+    let group;
+    if (rootRow.mark.mark === "needs_you") group = needs;
+    else {
+      const key = "ws:" + (root.workspace || "");
+      if (!groups.has(key)) groups.set(key, { key, label: workspaceName(root.workspace), tip: root.workspace || "no workspace recorded", workspace: root.workspace || "", activityMs: 0, rows: [], blocks: [] });
+      group = groups.get(key);
+    }
+    (group.blocks || (group.blocks = [])).push(out);
+    group.activityMs = Math.max(group.activityMs, newest);
+  }
+  const flatten = (g) => {
+    const blocks = (g.blocks || []).sort((a, b) => b[0].activityMs - a[0].activityMs || (a[0].info.id < b[0].info.id ? 1 : -1));
+    g.rows = blocks.flat();
+    delete g.blocks;
+    return g;
+  };
+  const list = [...groups.values()].map(flatten).sort((a, b) => b.activityMs - a.activityMs || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
+  return needs.blocks && needs.blocks.length ? [flatten(needs), ...list] : list;
+}
+
+// ---- identity bar
+
+/** The first 10 characters of a session id, for the id button. */
+export function shortId(id) {
+  return String(id || "").slice(0, 10);
+}
+
+/**
+ * The run state in words with its shape: {text, mark, icon, tone, running}.
+ *   needs you -> "Waiting for you"; running -> "Running · step N · <elapsed>" (elapsed only when opts.startMs, the
+ *   start of this run, is known: store.turn.ts); idle -> "Idle · step N"; stopped / waiting for jobs likewise;
+ *   ended -> "Ended · done|failed|stopped|…". opts.attention is attentionFor() output, opts.now epoch ms.
+ */
+export function runWords(info, opts = {}) {
+  const st = (info && info.status) || {};
+  const mark = stateMark(info, opts.attention);
+  const step = st.step > 0 ? ` · step ${st.step}` : "";
+  const shape = (STANDING[mark] || STANDING.idle);
+  let text;
+  let running = false;
+  switch (mark) {
+    case "needs_you": text = "Waiting for you"; break;
+    case "running": {
+      running = true;
+      const ms = Number.isFinite(opts.startMs) && Number.isFinite(opts.now) ? Math.max(0, opts.now - opts.startMs) : null;
+      const whole = ms === null ? 0 : Math.floor(ms / 1000);
+      text = `Running${step}${ms === null ? "" : " · " + (whole < 10 ? whole + "s" : seconds(whole * 1000))}`;
+      break;
+    }
+    case "waiting": text = `Waiting for jobs or agents${step}`; break;
+    case "stopped": text = st.phase === "ended" ? "Ended · stopped" : `Stopped${step}`; break;
+    case "finished":
+    case "failed":
+    case "result_ready":
+      text = st.phase === "ended" ? `Ended · ${st.outcome ? outcomeWords(st.outcome) : mark === "failed" ? "failed" : "done"}` : mark === "failed" ? `Failed${step}` : `Idle${step}`;
+      break;
+    default: text = `Idle${step}`;
+  }
+  return { text, mark, icon: shape.icon, tone: shape.tone, running };
+}
+
+/**
+ * The chips of the session header. `info` is the session, `status` the daemon status ({models:[{profile, base_url, model,
+ * reachable, detail, context_window}]} or null), opts: {current (currentModel(), used when info has no profile), now,
+ * startMs, attention, mission (the mission root's info, for "agent of")}. Returns
+ *   model {text:"profile · model · window", profile, model, contextWindow, tip, reachable:true|false|null, warn:{icon:"alert", word:"unreachable"}|null}
+ *   role  {text:"pack / role", tip}
+ *   id    {text: shortId, full, label}
+ *   run   runWords(...)
+ */
+export function identityChips(info, status, opts = {}) {
+  const cur = currentModel(null, info) || opts.current || { profile: "", model: "", context_window: 0 };
+  const health = ((status && status.models) || []).find((m) => m.profile === cur.profile) || null;
+  const win = cur.context_window || (health && health.context_window) || 0;
+  const modelId = cur.model || (health && health.model) || "";
+  const textParts = [cur.profile || "unknown profile", modelId, formatWindow(win)].filter(Boolean);
+  const reachable = health ? !!health.reachable : null;
+  const tip = [`${cur.profile} · ${modelId}`.trim()];
+  if (health && health.base_url) tip.push(health.base_url);
+  if (health) tip.push(reachable ? "reachable" : `unreachable${health.detail ? ": " + health.detail : ""}`);
+  if (win) tip.push(`context limit ${num(win)} tokens`);
+  const role = info.role || "session";
+  const pack = info.pack || "";
+  const roleTip = [info.parent && opts.mission ? `agent of ${opts.mission.title || opts.mission.id}` : info.parent ? "agent" : (role === "lead" ? "lead of its mission" : "session")];
+  return {
+    model: { text: textParts.join(" · "), profile: cur.profile, model: modelId, contextWindow: win, tip: tip.join("\n"), reachable, warn: reachable === false ? { icon: "alert", word: "unreachable" } : null },
+    role: { text: pack ? `${pack} / ${role}` : role, tip: roleTip.join("\n") },
+    id: { text: shortId(info.id), full: info.id, label: "Copy session id" },
+    run: runWords(info, opts),
+  };
+}
+
+/** Breadcrumbs of a session, root first: [{id, label, tip, current, ellipsis}]. Ancestors beyond the root and the parent
+ *  collapse into one {ellipsis:true, tip: the hidden titles}; the last crumb is the session itself (title, or its id). */
+export function breadcrumbs(store, id) {
+  const info = store.byId.get(id);
+  if (!info) return [{ id, label: id, tip: id, current: true, ellipsis: false }];
+  const chain = [];
+  const seen = new Set([id]);
+  let p = info.parent ? store.byId.get(info.parent) : null;
+  while (p && !seen.has(p.id)) {
+    chain.unshift(p);
+    seen.add(p.id);
+    p = p.parent ? store.byId.get(p.parent) : null;
+  }
+  const crumb = (s, current) => ({ id: s.id, label: s.title || s.id, tip: s.id, current, ellipsis: false });
+  const out = [];
+  if (chain.length > 2) {
+    out.push(crumb(chain[0], false));
+    out.push({ id: null, label: "…", tip: chain.slice(1, -1).map((s) => s.title || s.id).join(" / "), current: false, ellipsis: true });
+    out.push(crumb(chain[chain.length - 1], false));
+  } else for (const s of chain) out.push(crumb(s, false));
+  out.push(crumb(info, true));
+  return out;
+}
+
+// ---- stats line
+
+/**
+ * The stats under the composer, each a label or "" (omitted, never zero): speed (sessionSpeed label, "" without a
+ * measured reply), cache ("cache 92%": cached/prompt of the latest status), context ("context 31% of 1M": latest prompt
+ * tokens over the window), step ("step 214"). `info` is the session (status, context_window); `blocks` the record blocks.
+ */
+export function sessionStats(info, blocks) {
+  const st = (info && info.status) || {};
+  const prompt = Number(st.prompt_tokens) || 0;
+  const share = cachedShare(st.cached_tokens || 0, prompt);
+  const win = Number(info && info.context_window) || 0;
+  const context = prompt > 0 && win > 0 ? `context ${Math.max(1, Math.round(pct(prompt, win)))}% of ${formatWindow(win)}` : "";
+  return {
+    speed: sessionSpeed(blocks).label,
+    cache: share ? `cache ${share}` : "",
+    context,
+    step: st.step > 0 ? `step ${st.step}` : "",
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Composer model seat
+
+/**
+ * The choices of the model seat: the configured profiles (`GET /api/models` `models`), in the daemon's order, each
+ * {value, label, unreachable}. A profile that is unreachable says so in words. When the session's own profile is no
+ * longer configured it is still listed, so the select can show the truth.
+ */
+export function seatOptions(models, current) {
+  const out = (Array.isArray(models) ? models : []).filter(m => m && m.profile).map(m => ({
+    value: m.profile,
+    label: m.profile + (m.reachable === false ? " (not reachable)" : ""),
+    unreachable: m.reachable === false,
+  }));
+  if (current && current.profile && !out.some(o => o.value === current.profile)) {
+    out.push({ value: current.profile, label: current.profile + " (not configured)", unreachable: false });
+  }
+  return out;
+}
+
+/** The inline question for switching to `target` (a profile name): {text, yes, no}; null when there is nothing to ask. */
+export function seatConfirm(models, current, target) {
+  const entry = (Array.isArray(models) ? models : []).find(m => m && m.profile === target);
+  if (!entry || (current && current.profile === target)) return null;
+  const unreachable = entry.reachable === false
+    ? ` ${entry.profile} is not reachable now; the next step fails until it answers.` : "";
+  return {
+    text: `Switch this session to ${entry.profile} (${entry.model}) from its next step? The next request re-reads the whole prompt once.${unreachable}`,
+    yes: "Switch",
+    no: current && current.profile ? "Keep " + current.profile : "Keep current",
+  };
+}
+
+/** The sentence for a switch receipt `{session, model, live}`. */
+export function seatReceipt(receipt) {
+  const m = (receipt && receipt.model) || {};
+  const name = m.profile ? `${m.profile}${m.model ? " (" + m.model + ")" : ""}` : "the new model";
+  return receipt && receipt.live === false
+    ? `Switched to ${name}. The session records the switch and uses it when it next runs.`
+    : `Switched to ${name}; takes effect at the next step.`;
 }
