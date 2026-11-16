@@ -21,6 +21,12 @@ pub struct StatusView {
     pub proxy_port: u16,
     /// The loom home directory.
     pub home: String,
+    /// The command sandbox mode: `seatbelt`, `bubblewrap` or `none` (unconfined).
+    #[serde(default)]
+    pub sandbox: String,
+    /// The egress network mode for tools: `deny_all`, `allowlist` or `open`.
+    #[serde(default)]
+    pub network: String,
     /// Space on the volume that holds the loom home; `null` when it cannot be read.
     #[serde(default)]
     pub disk: Option<DiskSpace>,

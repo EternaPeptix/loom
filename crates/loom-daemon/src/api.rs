@@ -548,6 +548,8 @@ async fn status(State(s): State<ApiState>) -> Json<StatusView> {
         bind: s.bind.clone(),
         proxy_port: s.runtime.proxy_port(),
         home: s.runtime.paths().home.display().to_string(),
+        sandbox: s.runtime.config().sandbox.mode.as_str().to_string(),
+        network: s.runtime.config().network.mode.as_str().to_string(),
         disk,
         models,
         sessions_total: sessions.len(),

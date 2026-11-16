@@ -903,6 +903,8 @@ mod tests {
             bind: "127.0.0.1:7878".into(),
             proxy_port: 9000,
             home: "/h".into(),
+            sandbox: "seatbelt".into(),
+            network: "deny_all".into(),
             disk: Some(crate::wire::DiskSpace { free_bytes: 3 << 30, total_bytes: 1 << 40 }),
             models: vec![ModelHealth {
                 profile: "local".into(),

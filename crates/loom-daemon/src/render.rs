@@ -817,6 +817,14 @@ pub fn status(view: &StatusView, style: &Style) -> String {
         view.version, view.pid, view.bind, view.proxy_port, view.home
     );
     out.push(cut(&flat(&daemon), width));
+    // The security posture, at the place an operator checks the daemon. A missing field means an older
+    // daemon that does not report it, so skip the line rather than show blanks.
+    if !view.sandbox.is_empty() {
+        let line = format!("sandbox: {} · network: {}", flat(&view.sandbox), flat(&view.network));
+        // `none` (commands unconfined) and `open` (tools reach any host) are the postures worth a warning.
+        let unsafe_posture = view.sandbox == "none" || view.network == "open";
+        out.push(if unsafe_posture { paint(style, BOLD_YELLOW, &cut(&line, width)) } else { cut(&line, width) });
+    }
     match &view.disk {
         Some(disk) => {
             let (free, total) = (disk.free_bytes, disk.total_bytes);
@@ -1906,6 +1914,8 @@ mod tests {
             bind: "127.0.0.1:7878".into(),
             proxy_port: 7879,
             home: "/home/u/.loom".into(),
+            sandbox: "seatbelt".into(),
+            network: "deny_all".into(),
             disk: Some(crate::wire::DiskSpace { free_bytes: 400 << 30, total_bytes: (1000 << 30) + (1 << 29) }),
             models: vec![health(true), health(false)],
             sessions_total: 5,
@@ -1916,6 +1926,7 @@ mod tests {
         assert_eq!(
             status(&view, &MONO),
             "loom 0.1.0 · pid 42 · 127.0.0.1:7878 · proxy port 7879 · home /home/u/.loom\n\
+             sandbox: seatbelt · network: deny_all\n\
              400.0 GiB free of 1000.5 GiB (39%) on the volume of the loom home\n\
              ✓ http://10.0.0.1:8000/v1 · big · window 1.00M\n\
              ✗ http://10.0.0.1:8000/v1 · big · window unknown · connection refused\n\
@@ -1924,6 +1935,11 @@ mod tests {
         let colored = status(&view, &COLOR);
         assert!(colored.contains("\x1b[32m✓\x1b[0m http://"));
         assert!(colored.contains("\x1b[31m✗\x1b[0m http://"));
+        // An unsafe posture (unconfined, or open network) is warned in bold yellow.
+        view.sandbox = "none".into();
+        assert!(status(&view, &COLOR).contains(&format!("{BOLD_YELLOW}sandbox: none · network: deny_all{RESET}")), "{}", status(&view, &COLOR));
+        assert!(status(&view, &MONO).contains("\nsandbox: none · network: deny_all\n"));
+        view.sandbox = "seatbelt".into();
         view.models.clear();
         assert!(status(&view, &MONO).contains("no models configured\n"));
         let narrow = status(&view, &Style { color: false, width: 20 });
@@ -1943,6 +1959,10 @@ mod tests {
             bind: "127.0.0.1:7878".into(),
             proxy_port: 7879,
             home: "/home/u/.loom".into(),
+            // This test indexes lines by position and is about disk, not posture: leave the sandbox line
+            // off (the renderer skips it when the field is empty).
+            sandbox: String::new(),
+            network: String::new(),
             disk,
             models: vec![health(true)],
             sessions_total: 0,

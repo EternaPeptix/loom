@@ -94,7 +94,7 @@ use crate::render::{self, RecordOpts, Style};
 use clap::{Args, Parser, Subcommand};
 use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt};
 use loom_agent::session::Phase;
-use loom_core::config::{Config, Paths};
+use loom_core::config::{Config, ConfigError, Paths};
 use loom_core::event::{Budget, Event, Record, Seq, SessionOutcome, TurnEndReason};
 use loom_core::SessionId;
 use std::io::{IsTerminal, Read, Write};
@@ -431,15 +431,21 @@ pub struct OutArgs {
 
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigAction {
+    /// Print the path of the configuration file
     Path,
+    /// Validate the configuration — parse, sandbox preflight and box paths — and name the file checked
     Check,
+    /// Write a starting configuration file (refuses to overwrite an existing one)
     Init,
 }
 
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceAction {
+    /// Install and start the login service so the daemon runs at login (macOS launchd)
     Install,
+    /// Stop and remove the login service
     Uninstall,
+    /// Show whether the login service is installed and loaded
     Status,
 }
 /// Run one command; the result is the process's exit code.
@@ -1233,8 +1239,12 @@ async fn down(paths: &Paths, within: Duration) -> Result<i32, String> {
         // named, alive, in `daemon.json` and holds the home until it exits: that is waited for below. A
         // daemon that is starting has not written `daemon.json` yet, or answers once it has.
         let shutting_down = !crate::serve::home_lock_free(paths) && crate::serve::live_daemon_pid(paths).is_some();
-        if !shutting_down || c.alive().await {
-            return Err(e);
+        if c.alive().await {
+            return Err(e); // it answered but the shutdown itself errored: keep the real reason
+        }
+        if !shutting_down {
+            // For `down`, the generic "start it with `loom up`" is the wrong next step.
+            return Err("The loom daemon is not running, so there is nothing to stop.".to_string());
         }
     } else {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1342,6 +1352,10 @@ async fn cmd_chat(paths: &Paths, a: ChatArgs) -> Result<i32, String> {
         }
     };
     let tty = std::io::stdin().is_terminal();
+    if tty {
+        // A first-time operator has no way to know how to leave or that the prompt means "your turn".
+        errln("type a message and press Enter · /quit or Ctrl-D to leave");
+    }
     let style = style();
     let opts = record_opts(&a.show);
     let render_record = |r: &Record| render::record(r, &style, &opts);
@@ -1372,8 +1386,17 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
     match action {
         ConfigAction::Path => outln(&file.display().to_string()).map(|()| 0),
         ConfigAction::Check => {
-            Config::load(&file).map_err(|e| e.to_string())?;
-            outln("ok").map(|()| 0)
+            // Name the file on error, as the daemon does, so the operator knows which one to edit.
+            let describe = |e: ConfigError| match e {
+                ConfigError::Parse { .. } => e.to_string(), // already begins with the path
+                other => format!("{}: {other}", file.display()),
+            };
+            let cfg = Config::load(&file).map_err(describe)?;
+            // Run the same deterministic checks the daemon runs at startup, so `check` no longer prints
+            // `ok` for a config that `up` then refuses (a missing sandbox, a box path inside the home).
+            loom_tools::sandbox::preflight(&cfg.sandbox).map_err(|e| e.to_string())?;
+            cfg.check_box_paths(&paths.home).map_err(|e| e.to_string())?;
+            outln(&format!("ok: {}", file.display())).map(|()| 0)
         }
         ConfigAction::Init => {
             use std::os::unix::fs::OpenOptionsExt;
