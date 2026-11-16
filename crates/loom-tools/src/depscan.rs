@@ -101,8 +101,13 @@ impl Finding {
 }
 
 fn one_line(s: &str, max: usize) -> String {
-    let joined: String =
-        s.chars().filter(|c| *c == '\n' || !c.is_control()).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+    let joined: String = s
+        .chars()
+        .filter(|c| *c == '\n' || !c.is_control())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if joined.chars().count() > max {
         format!("{}…", joined.chars().take(max).collect::<String>())
     } else {
@@ -192,16 +197,13 @@ fn component_count(doc: &Value) -> usize {
 /// Sort key: prioritized, then reachable, then score (unscored last), then id and target.
 fn sort_findings(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
-        b.prioritized
-            .cmp(&a.prioritized)
-            .then_with(|| b.reachable.cmp(&a.reachable))
-            .then_with(|| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.id.cmp(&b.id))
-                    .then_with(|| a.affects.cmp(&b.affects))
-            })
+        b.prioritized.cmp(&a.prioritized).then_with(|| b.reachable.cmp(&a.reachable)).then_with(|| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.affects.cmp(&b.affects))
+        })
     });
 }
 
@@ -220,8 +222,7 @@ fn render(target: &str, components: usize, mut findings: Vec<Finding>, artifact_
         *by_severity.entry(f.severity.clone()).or_default() += 1;
     }
 
-    let outcome =
-        if total == 0 { "no vulnerabilities".to_string() } else { format!("{total} vulnerabilities") };
+    let outcome = if total == 0 { "no vulnerabilities".to_string() } else { format!("{total} vulnerabilities") };
     let mut r = String::new();
     r.push_str(&format!(
         "dep-scan of {target} — {components} components · {total} vulnerabilities · {prioritized} prioritized · {reachable} reachable\n"
@@ -242,8 +243,7 @@ fn render(target: &str, components: usize, mut findings: Vec<Finding>, artifact_
     if total == 0 {
         r.push_str("No vulnerabilities were reported for the scanned components. That means none are recorded in dep-scan's database for this SBOM, not that the project is safe: check that the component count above covers the dependencies you expected.\n");
     } else {
-        let (focus, rest): (Vec<&Finding>, Vec<&Finding>) =
-            findings.iter().partition(|f| f.prioritized || f.reachable);
+        let (focus, rest): (Vec<&Finding>, Vec<&Finding>) = findings.iter().partition(|f| f.prioritized || f.reachable);
         let mut shown = 0usize;
         if !focus.is_empty() {
             r.push_str(&format!("Prioritized or reachable findings ({}):\n", focus.len()));
@@ -486,7 +486,8 @@ async fn run(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
     let mut findings: Vec<Finding> = parsed.iter().flat_map(findings_of).collect();
     let artifact_names: Vec<String> =
         vdrs.iter().map(|a| a.name.clone()).chain(boms.iter().map(|a| a.name.clone())).collect();
-    let (summary, outcome_text) = render(&resolved.display().to_string(), components, std::mem::take(&mut findings), &artifact_names);
+    let (summary, outcome_text) =
+        render(&resolved.display().to_string(), components, std::mem::take(&mut findings), &artifact_names);
 
     let mut out = ToolOutput::ok(outcome_text, Body::Raw(summary.into_bytes()));
     // Store the artifacts so they outlive the temp directory and can be cited.
@@ -578,16 +579,22 @@ mod tests {
         let (text, outcome) = render("/ws", 2, findings, &["sbom-js.vdr.json".to_string()]);
         assert_eq!(outcome, "3 vulnerabilities");
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(
-            lines[0],
-            "dep-scan of /ws — 2 components · 3 vulnerabilities · 1 prioritized · 1 reachable"
+        assert_eq!(lines[0], "dep-scan of /ws — 2 components · 3 vulnerabilities · 1 prioritized · 1 reachable");
+        assert!(
+            lines[1].contains("critical 1") && lines[1].contains("high 1") && lines[1].contains("medium 1"),
+            "{}",
+            lines[1]
         );
-        assert!(lines[1].contains("critical 1") && lines[1].contains("high 1") && lines[1].contains("medium 1"), "{}", lines[1]);
         let crit = text.find("CVE-2024-1111").unwrap();
         let high = text.find("GHSA-xxxx").unwrap();
         let med = text.find("CVE-2024-2222").unwrap();
         assert!(crit < high && high < med, "{text}");
-        assert!(text.contains("CVE-2024-1111  CRITICAL 9.8  pkg:npm/a@1.0.0  fixed 1.0.1  Reachable; Direct dependency  PRIORITIZED"), "{text}");
+        assert!(
+            text.contains(
+                "CVE-2024-1111  CRITICAL 9.8  pkg:npm/a@1.0.0  fixed 1.0.1  Reachable; Direct dependency  PRIORITIZED"
+            ),
+            "{text}"
+        );
         assert!(text.contains("not execution evidence"), "{text}");
     }
 
@@ -605,10 +612,22 @@ mod tests {
             Some("rust"),
         );
         assert!(script.contains("depscan --no-banner --no-vuln-table --src '/ws/it'\\''s here'"), "{script}");
-        assert!(script.contains("--profile 'research' --severity 'high' --reachability-analyzer off -t 'rust'\n"), "{script}");
+        assert!(
+            script.contains("--profile 'research' --severity 'high' --reachability-analyzer off -t 'rust'\n"),
+            "{script}"
+        );
         assert!(script.contains("VDB_HOME='/tmp/run dir/vdb'"), "{script}");
         assert!(script.contains(MISSING_MARKER), "{script}");
-        let bom = build_script(&run_dir, &run_dir.join("reports"), &PathBuf::from("/ws/sbom.json"), true, None, None, true, None);
+        let bom = build_script(
+            &run_dir,
+            &run_dir.join("reports"),
+            &PathBuf::from("/ws/sbom.json"),
+            true,
+            None,
+            None,
+            true,
+            None,
+        );
         assert!(bom.contains("--bom '/ws/sbom.json'") && !bom.contains("--reachability-analyzer"), "{bom}");
     }
 
@@ -677,7 +696,10 @@ echo "fake depscan ran: $*"
         assert_eq!(r.status, Status::Ok, "{}", r.text);
         assert!(r.text.contains("1 vulnerabilities"), "{}", r.text);
         let stored = e.stored(&r);
-        assert!(stored.contains("RUSTSEC-2020-0071  HIGH 7.5  pkg:cargo/time@0.1.44  fixed 0.2.23  Reachable  PRIORITIZED"), "{stored}");
+        assert!(
+            stored.contains("RUSTSEC-2020-0071  HIGH 7.5  pkg:cargo/time@0.1.44  fixed 0.2.23  Reachable  PRIORITIZED"),
+            "{stored}"
+        );
         assert!(stored.contains("1 components"), "{stored}");
         // The VDR bytes are the raw blob beside the summary, and the SBOM is named by handle.
         let raw_id = r.meta.get(META_RAW_BLOB).and_then(Value::as_str).unwrap();
