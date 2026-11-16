@@ -4311,6 +4311,27 @@ impl Runtime {
             // agent that had not settled goes on with its lead (or is settled, if it cannot be opened).
             self.inner.restore_children(|p| p == id);
             self.inner.recover_settlements(|k| k.meta.parent.as_ref() == Some(id));
+            // Archiving dropped the family's open inbox items; unarchiving brings them back by
+            // restoring the lead the way the start does. The start activates any session with open
+            // inbox items (or a running/waiting one), which re-reads its log and re-adds them;
+            // `restore_children` already did that for the agents, but a lead with no agents is not
+            // covered, so bring it up here when the start's rule would.
+            let bring_up_lead = {
+                let st = self.inner.st();
+                st.known.get(id).is_some_and(|k| {
+                    k.meta.parent.is_none()
+                        && k.active.is_none()
+                        && k.status.phase != Phase::Ended
+                        && (k.status.phase == Phase::Running
+                            || k.status.last_end == Some(TurnEndReason::Waiting)
+                            || k.status.open_inbox > 0)
+                })
+            };
+            if bring_up_lead {
+                if let Err(e) = self.inner.activate(id) {
+                    tracing::warn!("lead {} could not be restored on unarchive: {e}", id.as_str());
+                }
+            }
         }
         // Tell every connected client the family's archived state changed, so their session lists and
         // inboxes update without a reload. Archiving otherwise sends nothing (it only writes meta.json
