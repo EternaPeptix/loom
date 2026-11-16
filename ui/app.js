@@ -369,6 +369,16 @@ function updateInboxBadge() {
   n.textContent = String(c.open);
   n.hidden = c.open === 0;
   b.classList.toggle("urgent", c.blocking > 0);
+  // The red "urgent" tint is the only on-screen signal that some items block work; give the same
+  // information in text so it does not depend on colour (a screen reader reads this label).
+  b.setAttribute(
+    "aria-label",
+    c.open === 0
+      ? "Inbox: nothing waiting"
+      : c.blocking > 0
+        ? `Inbox: ${c.open} open, ${c.blocking} ${c.blocking === 1 ? "needs" : "need"} you`
+        : `Inbox: ${c.open} open`,
+  );
   document.title = C.pageTitle(c);
   if (S.view === "inbox") renderInbox();
   want("list", "header", "overview");
@@ -1432,6 +1442,7 @@ function parkControls(entry, choices, ta, sync, send, err) {
       notice(C.RELEASED_WORDS + ".");
       loadInbox();
       loadLedger();
+      loadSessions();
     } catch (e) {
       close.disabled = false;
       fail(err, e.message);
@@ -1865,7 +1876,11 @@ function renderContext(p) {
   frag.append(el("div", "dim", `${sum.counts.live} live · ${sum.counts.stubbed} stubbed · ${sum.counts.reasoning_dropped} reasoning dropped · ${sum.counts.dropped} dropped · ${sum.pinned} pinned`));
   const bar = el("div", "nums");
   add(bar, btn("Fold now", "", async () => {
-    await act(api("POST", "/api/sessions/" + encodeURIComponent(S.openId) + "/reweave"));
+    // Reweave is silent until a later record lands, so confirm it was asked for and pull the view.
+    if (await act(api("POST", "/api/sessions/" + encodeURIComponent(S.openId) + "/reweave")) !== undefined) {
+      notice("Folding now — the view updates when it is done.");
+      loadWindow();
+    }
   }), btn("Refresh", "", loadWindow));
   const hide = el("label", "dim");
   const cb = el("input");

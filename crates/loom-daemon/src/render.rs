@@ -71,13 +71,14 @@
 //!   parent (`  └ `): `ID  ROLE  STATE  STEP  CONTEXT  AGE  TITLE`. `STATE`: `running`, `ended
 //!   ({outcome})`, else the last turn end in the words above, else `new`; ` *` appended when
 //!   `open_inbox > 0`. `CONTEXT`: `tokens(prompt_tokens)`. Empty list: `No sessions.`
-//! - `inbox_list(list, now_ms, style)`: per item `{item_id}  {kind}  {age}  {session} {title}` and
+//! - `inbox_list(list, now_ms, style)`: per item `{item_id}  {kind}  {age}  {session}  {title}` and
 //!   the text indented, then the options numbered; `Nothing is waiting for you.` when empty. A scope
 //!   request is listed as `scope request`, with `hosts: a, b` and `approve: loom scope {session} a b`
-//!   (a host with a character the shell would read is single-quoted). A blocking `Blocker` or `Parked`
-//!   item gets the ways to answer it: `answer: loom answer {item_id} "…"` and `close as blocked: loom
-//!   release {session} "why"`; a blocker also says to name the next step, not ask a yes or no question.
-//!   `granted_hosts_line(hosts)` is the line `loom net` ends with.
+//!   (a host with a character the shell would read is single-quoted). Every other item names how to
+//!   act on it, as the streaming view does: a finished report gets `dismiss: loom answer {item_id}`;
+//!   anything else gets `answer: loom answer {item_id} "…"`, and a blocking `Blocker` or `Parked`
+//!   item also gets `close as blocked: loom release {session} "why"`; a blocker says to name the next
+//!   step, not ask a yes or no question. `granted_hosts_line(hosts)` is the line `loom net` ends with.
 //! - `window_table(view, style)`: a summary line (`epoch {e} · about {tokens} tokens in view ·
 //!   folds at {target} down to {floor} · window {context_window or "unknown"} · last request
 //!   {prompt} in, {pct}% cached`), then per item `#{seq}  {kind}  {state}  {chars}  {pin}
@@ -709,7 +710,7 @@ pub fn inbox_list(list: &[InboxEntry], now_ms: u64, style: &Style) -> String {
     let mut out = Vec::new();
     for entry in list {
         let head = format!(
-            "{}  {}  {}  {} {}",
+            "{}  {}  {}  {}  {}",
             flat(&entry.item.item_id),
             inbox_kind_word(entry.item.kind),
             age(now_ms.saturating_sub(entry.opened_ms)),
@@ -736,12 +737,19 @@ pub fn inbox_list(list: &[InboxEntry], now_ms: u64, style: &Style) -> String {
         for (i, option) in item.options.iter().enumerate() {
             out.push(format!("  {}. {}", i + 1, flat(option)));
         }
-        if item.blocking && matches!(item.kind, InboxKind::Blocker | InboxKind::Parked) {
+        // Every item but a finished report can be acted on with `loom answer`; the streaming view
+        // (`record`) already shows this for every kind, so the list does too. A finished report is
+        // only cleared, and a blocked/parked session can also be closed outright.
+        if item.kind == InboxKind::Finished {
+            out.push(dim(format!("  dismiss: loom answer {}", flat(&item.item_id))));
+        } else {
             let next =
                 if item.kind == InboxKind::Blocker { " (name the next step, not a yes or no question)" } else { "" };
             out.push(dim(format!("  answer: loom answer {} \"…\"{next}", flat(&item.item_id))));
-            let session = shell_word(&flat(entry.session.as_str()));
-            out.push(dim(format!("  close as blocked: loom release {session} \"why\"")));
+            if item.blocking && matches!(item.kind, InboxKind::Blocker | InboxKind::Parked) {
+                let session = shell_word(&flat(entry.session.as_str()));
+                out.push(dim(format!("  close as blocked: loom release {session} \"why\"")));
+            }
         }
     }
     finish(out)
@@ -1567,7 +1575,7 @@ mod tests {
         e.item = item(false, vec!["docs.example.test", "*.cdn.test"]);
         assert_eq!(
             inbox_list(&[e], 5_000, &MONO),
-            "i-7  scope request  5s  s-a main job\n  Needs docs.example.test to read the API reference.\n  hosts: docs.example.test, *.cdn.test\n  approve: loom scope s-a docs.example.test '*.cdn.test'\n"
+            "i-7  scope request  5s  s-a  main job\n  Needs docs.example.test to read the API reference.\n  hosts: docs.example.test, *.cdn.test\n  approve: loom scope s-a docs.example.test '*.cdn.test'\n"
         );
     }
 
@@ -1789,9 +1797,11 @@ mod tests {
     fn inbox_list_shapes() {
         assert_eq!(inbox_list(&[], 0, &MONO), "Nothing is waiting for you.\n");
         let text = inbox_list(&[entry(0), entry(60_000)], 3_600_000, &MONO);
+        // A blocking approval that is not a scope request still needs the operator, so it names how
+        // to answer — as the streaming view (`record`) does for every kind but a finished report.
         assert_eq!(
             text,
-            "i-1  approval  1h  s-a main job\n  May I?\n  Please.\ni-1  approval  59m  s-a main job\n  May I?\n  Please.\n"
+            "i-1  approval  1h  s-a  main job\n  May I?\n  Please.\n  answer: loom answer i-1 \"…\"\ni-1  approval  59m  s-a  main job\n  May I?\n  Please.\n  answer: loom answer i-1 \"…\"\n"
         );
         let narrow = inbox_list(&[entry(0)], 5_000, &Style { color: false, width: 12 });
         assert_eq!(narrow.lines().next().map(|l| l.chars().count()), Some(12));
@@ -1808,15 +1818,23 @@ mod tests {
         };
         assert_eq!(
             with(InboxKind::Blocker, true, &[]),
-            "i-1  blocker  5s  s-a main job\n  May I?\n  Please.\n  answer: loom answer i-1 \"…\" (name the next step, not a yes or no question)\n  close as blocked: loom release s-a \"why\"\n"
+            "i-1  blocker  5s  s-a  main job\n  May I?\n  Please.\n  answer: loom answer i-1 \"…\" (name the next step, not a yes or no question)\n  close as blocked: loom release s-a \"why\"\n"
         );
         let parked = with(InboxKind::Parked, true, &["Keep working", "Accept as blocked and close"]);
         assert_eq!(
             parked,
-            "i-1  parked  5s  s-a main job\n  May I?\n  Please.\n  1. Keep working\n  2. Accept as blocked and close\n  answer: loom answer i-1 \"…\"\n  close as blocked: loom release s-a \"why\"\n"
+            "i-1  parked  5s  s-a  main job\n  May I?\n  Please.\n  1. Keep working\n  2. Accept as blocked and close\n  answer: loom answer i-1 \"…\"\n  close as blocked: loom release s-a \"why\"\n"
         );
         // A notice that does not block is not a park.
         assert!(!with(InboxKind::Blocker, false, &[]).contains("loom release"));
+        // A question — the most common operator action — names how to answer it, with no release line.
+        let question = with(InboxKind::Question, true, &[]);
+        assert!(question.contains("answer: loom answer i-1 \"…\""), "{question}");
+        assert!(!question.contains("loom release"), "{question}");
+        // A finished report is cleared, not answered: it offers `dismiss`, never `answer …`.
+        let finished = with(InboxKind::Finished, false, &[]);
+        assert!(finished.contains("dismiss: loom answer i-1"), "{finished}");
+        assert!(!finished.contains("answer: loom answer"), "{finished}");
     }
 
     fn window_item(seq: u64, state: ItemState, pinned: bool) -> WindowItem {
