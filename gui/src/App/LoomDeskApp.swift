@@ -50,16 +50,29 @@ struct MenuBarLabel: View {
             .onChange(of: state.openWindowTick) { _, _ in openWindow(id: "main") }
     }
 
+    // A failed or connecting link is named, not folded into "state unknown" (which means a live link
+    // whose feed went quiet): the operator can tell a dead tunnel from a self-healing gap.
+    private var label: (text: String, urgent: Bool) {
+        switch state.link {
+        case .failed: return ("loom · disconnected", false)
+        case .connecting: return ("loom · connecting…", false)
+        default:
+            let stale = state.feedStatus.stale && state.link != .none
+            let text = stale ? "loom · state unknown" : state.counts.menuLabel
+            return (text, state.counts.waiting > 0 && !stale)
+        }
+    }
+
     @ViewBuilder private var content: some View {
-        let stale = state.feedStatus.stale && state.link != .none
-        let text = stale ? "loom · state unknown" : state.counts.menuLabel
-        if state.counts.waiting > 0 && !stale {
+        let (text, urgent) = label
+        if urgent {
             // The menu bar tints plain text as a template; a rendered, non-template image keeps the red.
             let r = ImageRenderer(content: Text(text).font(.system(size: 13, weight: .semibold)).foregroundColor(.red).padding(.horizontal, 2))
             let _ = { r.scale = NSScreen.main?.backingScaleFactor ?? 2 }()
             if let img = r.nsImage {
                 let _ = { img.isTemplate = false }()
-                Image(nsImage: img)
+                // Without a label VoiceOver reads only "image" for the most urgent state.
+                Image(nsImage: img).accessibilityLabel(text)
             } else {
                 Text(text).foregroundStyle(.red)
             }
@@ -92,14 +105,32 @@ struct MenuBarMenu: View {
             if !state.connections.isEmpty {
                 Menu("Connections") {
                     ForEach(state.connections) { c in
-                        Button(c.name.isEmpty ? c.sshHost : c.name) { state.connect(c) }
+                        let isActive = c.id == state.active?.id
+                        // A tap on the active connection is ignored, so a stray click cannot tear down
+                        // the live tunnel; the checkmark shows which one is current.
+                        Button { if !isActive { state.connect(c) } } label: {
+                            Label(c.name.isEmpty ? c.sshHost : c.name, systemImage: isActive ? "checkmark" : "")
+                        }
                     }
                 }
             }
             if state.link != .none {
                 Button("Disconnect") { state.disconnect() }
             }
-            Button("Enable notifications…") { Notifier.requestAuthorization() }
+            // Reflect the OS permission and guide the operator out of a denied dead end (where asking
+            // again silently does nothing — macOS only re-prompts from its own Settings).
+            switch state.notifStatus {
+            case .denied:
+                Button("Notifications are off — open Settings") {
+                    if let u = URL(string: "x-apple.systempreferences:com.apple.preference.notifications") {
+                        NSWorkspace.shared.open(u)
+                    }
+                }
+            case .authorized, .provisional, .ephemeral:
+                Text("Notifications: on")
+            default:
+                Button("Enable notifications…") { Notifier.requestAuthorization() }
+            }
             Divider()
             Button("Quit loom-desk") { NSApp.terminate(nil) }
         }
@@ -112,7 +143,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if Bundle.main.bundleURL.pathExtension == "app" {
             UNUserNotificationCenter.current().delegate = self
         }
-        Task { @MainActor in AppState.shared.restoreLast() }
+        Task { @MainActor in
+            AppState.shared.restoreLast()
+            AppState.shared.refreshNotificationStatus()
+        }
+    }
+
+    // The operator may flip the permission in System Settings while the app runs; re-read it on focus.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Task { @MainActor in AppState.shared.refreshNotificationStatus() }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

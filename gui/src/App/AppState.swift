@@ -43,6 +43,8 @@ final class AppState: ObservableObject {
     @Published var link: Link = .none
     @Published var counts = Counts()
     @Published var feedStatus = DaemonClient.FeedStatus()
+    /// The OS notification permission, so the menu can show it and guide the operator when it is off.
+    @Published var notifStatus: UNAuthorizationStatus = .notDetermined
     @Published var status: String = "not connected"
     /// True while the client's identity check cannot reach the daemon (it keeps retrying); the bar then
     /// shows the link as not connected.
@@ -363,6 +365,15 @@ final class AppState: ObservableObject {
 
     // MARK: window / notification routing
 
+    /// Read the OS notification permission into `notifStatus` (so the menu can reflect it). Called at
+    /// launch and when the app becomes active, since the operator may change it in System Settings.
+    func refreshNotificationStatus() {
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return }
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            Task { @MainActor in self.notifStatus = s.authorizationStatus }
+        }
+    }
+
     /// Bring the window forward; navigate the pane to `session` when given.
     func openWindow(focus session: String? = nil) {
         openWindowTick += 1
@@ -383,7 +394,9 @@ enum Notifier {
 
     static func requestAuthorization() {
         guard available else { return }
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in
+            Task { @MainActor in AppState.shared.refreshNotificationStatus() }
+        }
     }
 
     /// Title names the mission (the session title), body is the item text, cut.
