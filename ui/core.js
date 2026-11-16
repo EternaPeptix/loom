@@ -1692,9 +1692,15 @@ export function applyNet(list, entry, keep = 2000) {
 export function planEvent(ev, ctx) {
   const out = [];
   switch (ev && ev.type) {
-    case "session":
+    case "session": {
       out.push({ fx: "session", info: ev.info });
+      // Archiving a mission drops its open inbox items on the daemon without an `inbox_resolved`
+      // record, and a session that just gained an item may carry it in its status: in both cases
+      // pull the authoritative inbox so it is not left stale. Mirrors the macOS shell.
+      const open = (ev.info && ev.info.status && ev.info.status.open_inbox) || 0;
+      if (ev.info && (ev.info.archived || open > 0)) out.push({ fx: "refetch_inbox" });
       break;
+    }
     case "status":
       out.push({ fx: "status", session: ev.session, status: ev.status });
       if (!ctx.known(ev.session)) out.push({ fx: "refetch_sessions" });

@@ -331,7 +331,10 @@
 //! - `archive(id, archived)`: root only; refused while the session or one of its children is
 //!   running a turn (`Stop the session before archiving it.`). Sets `archived` in the `meta.json`
 //!   of the session and its children; archiving closes their inputs (the lead's task ends `Closed`,
-//!   each child settles `Stopped`; a task keeps its place until it has ended). Unarchiving waits for
+//!   each child settles `Stopped`; a task keeps its place until it has ended). Archiving also drops
+//!   the family's open inbox items from the index, so a done mission stops waiting for the operator
+//!   and stops notifying; the items come back only if the session is unarchived (rebuilt from its
+//!   log). Unarchiving waits for
 //!   those tasks to end (at most `tools.kill_grace_s` + `SHUTDOWN_TASK_WAIT`), delivers what the
 //!   children settled with in the meantime, and restores those that had not settled as the start
 //!   does (an unattended mission's go on at once). Archiving empties the scratch directories of the
@@ -4246,6 +4249,14 @@ impl Runtime {
         // which reaches the lead when the mission is unarchived.
         drop(closing);
         if archived {
+            // The operator is done with this mission, so its open inbox items stop waiting: they are
+            // dropped from the index and stop notifying (the repeat notice ends when the item leaves the
+            // index). Archived sessions are not activated at the next start, so the items do not come
+            // back; unarchiving a session the operator reopens does, which rebuilds them from its log.
+            {
+                let mut st = self.inner.st();
+                st.inbox.retain(|e| !family.contains(&e.session));
+            }
             let lead = self.inner.st().known.get(id).map(|k| k.meta.clone()).filter(|m| m.parent.is_none());
             if let Some(lead) = lead {
                 self.inner.box_teardown(&lead.mission);
@@ -4300,6 +4311,18 @@ impl Runtime {
             // agent that had not settled goes on with its lead (or is settled, if it cannot be opened).
             self.inner.restore_children(|p| p == id);
             self.inner.recover_settlements(|k| k.meta.parent.as_ref() == Some(id));
+        }
+        // Tell every connected client the family's archived state changed, so their session lists and
+        // inboxes update without a reload. Archiving otherwise sends nothing (it only writes meta.json
+        // and purges the in-memory index), so a client that archived elsewhere — the CLI, another tab —
+        // would keep showing the session and its now-dropped inbox items until it reloaded. A `session`
+        // event carrying `archived` is what the web UI and the macOS shell refetch the inbox on.
+        let infos: Vec<SessionInfo> = {
+            let st = self.inner.st();
+            family.iter().filter_map(|sid| st.known.get(sid).map(Inner::info_of)).collect()
+        };
+        for info in infos {
+            self.inner.publish(BusEvent::Session { info: Box::new(info) });
         }
         Ok(())
     }
@@ -9072,6 +9095,24 @@ mod tests {
         assert!(!rt2.session(&id).unwrap().active);
         rt2.archive(&id, false).await.unwrap();
         assert_eq!(rt2.sessions(false).len(), 1);
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn archiving_a_mission_clears_its_open_inbox_items() {
+        // A finish opens a blocking "finished" item that waits for the operator. Archiving the
+        // mission is the operator saying they are done with it: the item must leave the inbox.
+        let e = env_with(Script::new(|_, _| finish("result")), true, |_| {}).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("inbox", || e.rt.inbox().iter().any(|i| i.session == id)).await;
+        // The repeat notice is armed while the item is open; archiving must silence it too.
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase != Phase::Running)).await;
+        e.rt.archive(&id, true).await.unwrap();
+        assert!(e.rt.inbox().is_empty(), "archiving left items in the inbox: {:?}", e.rt.inbox());
+        // It stays clear across a restart: an archived session is not activated, so nothing re-adds it.
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert!(rt2.inbox().is_empty(), "a restart re-opened an archived mission's inbox item");
         rt2.shutdown().await;
     }
 

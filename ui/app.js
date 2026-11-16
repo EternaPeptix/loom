@@ -2216,6 +2216,9 @@ async function sessionAction(name, body) {
     action.accepted = true;
     action.label = name === "stop" ? "Stop requested" : name === "resume" ? "Resume requested" : label;
     await loadSessions();
+    // Archiving a mission drops its open inbox items on the daemon without emitting a resolve
+    // record, so pull the authoritative inbox to clear them here too (and bring them back on undo).
+    if (name === "archive") loadInbox();
   } catch (e) { S.actionState.delete(id); notice(e.message); }
   if (S.openId === id) renderHeader();
 }

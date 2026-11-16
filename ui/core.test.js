@@ -1036,6 +1036,9 @@ test("planEvent", () => {
   assert.deepEqual(fx({ type: "delta", session: "s-1", req_id: "r", delta: { delta: "text", text: "x" } }), ["apply_delta"]);
   assert.deepEqual(fx({ type: "delta", session: "s-2", req_id: "r", delta: { delta: "text", text: "x" } }), []);
   assert.deepEqual(fx({ type: "net", session: "s-1", entry: {} }), ["net"]);
+  assert.deepEqual(fx({ type: "session", info: { id: "s-1", archived: false } }), ["session"], "a plain session event only updates the list");
+  assert.deepEqual(fx({ type: "session", info: { id: "s-1", archived: true, status: { open_inbox: 1 } } }), ["session", "refetch_inbox"], "an archived session clears its inbox items");
+  assert.deepEqual(fx({ type: "session", info: { id: "s-1", archived: false, status: { open_inbox: 2 } } }), ["session", "refetch_inbox"], "a session that reports open inbox items pulls them");
   assert.deepEqual(fx({ type: "lagged", missed: 5 }), ["refetch_sessions", "refetch_inbox", "refetch_records"]);
   assert.deepEqual(C.planEvent({ type: "lagged", missed: 5 }, { ...ctx, openId: null }).map((e) => e.fx), ["refetch_sessions", "refetch_inbox"]);
   assert.deepEqual(fx({ type: "error", session: null, message: "boom" }), ["notice"]);
