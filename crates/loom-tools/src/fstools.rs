@@ -2168,7 +2168,9 @@ mod tests {
         if !Path::new(&key).exists() {
             return; // the temp directory is not on the data volume
         }
-        let refusal = format!("{} is not readable", secret.join("k.txt").display());
+        // The alias is turned back into the usual path before the rules are applied, so each tool refuses by
+        // the rule that names the file, which is the usual path.
+        let plain = secret.join("k.txt").display().to_string();
         for (tool, args) in [
             ("read", json!({"path": key})),
             ("write", json!({"path": key, "content": "x"})),
@@ -2176,7 +2178,10 @@ mod tests {
         ] {
             let r = e.call(tool, args).await;
             assert!(
-                r.status == ToolStatus::Denied && r.text.contains(&refusal) && !r.text.contains("PRIVATE"),
+                r.status == ToolStatus::Denied
+                    && (r.text.contains(&format!("{plain} is not readable"))
+                        || r.text.contains(&format!("{plain} is not writable")))
+                    && !r.text.contains("PRIVATE"),
                 "{tool}: {}",
                 r.text
             );

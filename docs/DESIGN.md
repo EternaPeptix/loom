@@ -1064,6 +1064,19 @@ The Seatbelt policy:
   what is in it can be written, and it tests as writable, but the directory itself cannot be removed,
   renamed, replaced or swapped for a link. A temp dir that is `/`, or is or contains the loom home, is
   refused;
+- not readable: the whole loom home (records, stored outputs, journals, logs, configuration, packs, token and
+  keys) except the session temp dir and `<session dir>/analysis`, the harness's staging of binary-analysis
+  inputs, which commands can read and never write (an isolated replay: its staged workspace and temp
+  instead), for commands under Seatbelt (Bubblewrap already hides it) and for the file tools in every mode,
+  mode `none` included (commands are not confined there). The home entry and the directories down to the
+  temp dir can be looked up but not listed, and the names under the home are hidden as well as the
+  content: the profile denies `file-test-existence` there, so a command cannot name files by their id
+  (`fsgetpath`), and denies `file-search` (`searchfs`) everywhere. The session's job output directory
+  gives commands the metadata of its files only: each command's stdout and stderr is a file there, and
+  `fstat` of an inherited descriptor is a metadata read, without which `cat` fails and Python loses its
+  output. A workspace that is or lies inside the loom home is refused at construction. A hard link from the
+  temp dir to a file that is not readable reads nothing (probed on macOS 27: the link is refused, as the
+  profile denies the read of its source);
 - not readable, and not writable either (renaming and removing included), wherever they lie, even in
   the workspace: `<loom home>/token`, `<loom home>/keys`, `<workspace>/.loom/oracle-secrets`, `sandbox.unreadable_paths`, and, while
   `sandbox.protect_credentials` is on (default), the user's credential stores (`~/.ssh`, `~/.aws`,

@@ -4,15 +4,18 @@
 //! CONTRACT.
 //!
 //! ## Making a copy
-//! `make(source, dest, limits)` copies the directory `source` to `dest`, which must not exist and
+//! `make(source, dest, limits, readable)` copies the directory `source` to `dest`, which must not exist and
 //! must not lie inside `source` (nor `source` inside it). Everything is copied, build output and
 //! `.git` included, so that what ran in the workspace runs in the copy without a rebuild or a
 //! download — but for `<source>/.loom` (harness state and oracle secrets), and for what is neither a
-//! file, a directory nor a symbolic link. Files are copied with `std::fs::copy`, which clones them
-//! (no bytes are duplicated) where the file system can, as APFS does; their permission bits and
+//! file, a directory nor a symbolic link. Files are copied from the open file, which is cloned
+//! (`fclonefileat`: no bytes are duplicated) where the file system can, as APFS does, and otherwise copied; their permission bits and
 //! modification times are kept. A symbolic link is made again with the same target text and never
 //! followed. An entry that cannot be read, or whose name is not UTF-8, is left out and counted
-//! (`Made::skipped`).
+//! (`Made::skipped`). Each file is opened (a regular file only, never blocking) and `readable` judges the
+//! real path of what was opened, so a file that was swapped for a link to what the session may not read
+//! (the loom home, a credential store) after it was listed is left out and counted, never copied; the
+//! bytes are cloned or copied from the open file, not from its path.
 //!
 //! One kind of file is left out on purpose: a `.git` that is a file (the pointer of a linked Git
 //! worktree or of a submodule) whose `gitdir:` is an absolute path, leaves the tree, or cannot be
@@ -61,7 +64,7 @@
 //! program that sets a file's time back, or one that rewrote the file while the copy was being made.
 //!
 //! ## Adopting
-//! `adopt(manifest, copy, dest, may_write)` brings those changes into `dest` (the workspace the copy
+//! `adopt(manifest, copy, dest, may_write, readable)` brings those changes into `dest` (the workspace the copy
 //! was made from): the added and modified files and links are written, the deleted ones removed.
 //! Nothing is merged, and it is all or nothing as far as that can be known beforehand:
 //! - a path that is in `dest` as the copy has it — a link with the same target, a file with the same
@@ -75,7 +78,8 @@
 //!   written (`AdoptError::Refused`, with the refusals).
 //!
 //! Then each file is copied beside its place and renamed over it, with the copy's time and
-//! permission bits; directories are made as needed, and a directory of `dest` that a removal left
+//! permission bits, from the file opened in the copy and judged by `readable` as in `make` (a file that
+//! is refused fails the adoption as `AdoptError::Io`, and what it names is not copied); directories are made as needed, and a directory of `dest` that a removal left
 //! empty and that the copy no longer has is removed. What Git stores (`.git`) is never touched:
 //! commits a child made in its copy stay there. A failure while writing is `AdoptError::Io`, with
 //! what had been written by then.
@@ -90,8 +94,10 @@
 //! and ignores build output; adopt writes and removes exactly those, is harmless when repeated,
 //! refuses on a conflict or a refused path without writing anything — also when the file in the
 //! workspace has the size and time of the copy's and other bytes — takes the same change on both
-//! sides for no conflict, and does not touch `.git`.
+//! sides for no conflict, and does not touch `.git`; a file swapped for a link to a file `readable`
+//! refuses is not copied by `make` (it is counted as skipped) nor by `adopt`.
 
+use crate::files::{open_readable, NotOpened, Readable};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt;
@@ -403,7 +409,34 @@ fn same_bytes(a: &Path, b: &Path) -> bool {
     }
 }
 
-struct Copier {
+/// Copy the regular file at `from` to the new file `to`, with its permission bits. `from` is opened first
+/// and `readable` judges the real path of what was opened; the bytes come from that open file (cloned where the
+/// file system can, as APFS does), never from the path again, so a link swapped in meanwhile leads nowhere.
+fn copy_file(from: &Path, to: &Path, readable: Readable<'_>) -> Result<(), NotOpened> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let (mut file, meta) = open_readable(from, readable)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        if let Ok(dest) = std::ffi::CString::new(to.as_os_str().as_bytes()) {
+            // SAFETY: `file` is open for the call, `dest` is a NUL-terminated path that lives for it, and
+            // fclonefileat(2) has no other memory effects.
+            let cloned = unsafe { libc::fclonefileat(file.as_raw_fd(), libc::AT_FDCWD, dest.as_ptr(), 0) } == 0;
+            if cloned {
+                return Ok(());
+            }
+        }
+    }
+    let mut out =
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(to).map_err(NotOpened::Io)?;
+    std::io::copy(&mut file, &mut out).map_err(NotOpened::Io)?;
+    out.set_permissions(meta.permissions()).map_err(NotOpened::Io)?;
+    Ok(())
+}
+
+struct Copier<'a> {
+    /// Judges the real path of each file opened to be copied.
+    readable: Readable<'a>,
     /// Source and copy stamps of every file copied, and the target of every link, by relative path.
     done: BTreeMap<String, Entry>,
     files: u64,
@@ -431,7 +464,7 @@ fn points_outside(file: &Path, rel: &str) -> bool {
     false
 }
 
-impl Copier {
+impl Copier<'_> {
     fn dir(&mut self, source: &Path, dest: &Path, rel: &str) -> std::io::Result<()> {
         let entries = match std::fs::read_dir(source) {
             Ok(e) => e,
@@ -476,17 +509,23 @@ impl Copier {
                     continue;
                 }
                 let source = stamp(&md);
-                match std::fs::copy(&from, &to) {
-                    Ok(_) => {}
-                    // The file could not be read (or went away): the copy goes on without it.
-                    Err(e)
+                match copy_file(&from, &to, self.readable) {
+                    Ok(()) => {}
+                    // The file could not be read, went away, is no longer a file, or is now a link to what the
+                    // session may not read: the copy goes on without it.
+                    Err(NotOpened::Denied(_) | NotOpened::NotRegular(_)) => {
+                        let _ = std::fs::remove_file(&to);
+                        self.skipped += 1;
+                        continue;
+                    }
+                    Err(NotOpened::Io(e))
                         if matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound) =>
                     {
                         let _ = std::fs::remove_file(&to);
                         self.skipped += 1;
                         continue;
                     }
-                    Err(e) => return Err(e),
+                    Err(NotOpened::Io(e)) => return Err(e),
                 }
                 set_mtime(&to, &source)?;
                 let copy = stamp(&std::fs::symlink_metadata(&to)?);
@@ -526,7 +565,7 @@ fn listed(root: &Path) -> Result<BTreeSet<String>, String> {
 }
 
 /// See the module contract.
-pub fn make(source: &Path, dest: &Path, limits: &Limits) -> Result<Made, String> {
+pub fn make(source: &Path, dest: &Path, limits: &Limits, readable: Readable<'_>) -> Result<Made, String> {
     if !source.is_dir() {
         return Err(format!("{} is not a directory, so no copy of it can be made.", source.display()));
     }
@@ -556,12 +595,13 @@ pub fn make(source: &Path, dest: &Path, limits: &Limits) -> Result<Made, String>
     let (mut files, mut bytes) = (0u64, 0u64);
     measure(source, true, &measured, &mut files, &mut bytes)?;
     std::fs::create_dir(dest).map_err(failed)?;
-    let mut copier = Copier { done: BTreeMap::new(), files: 0, bytes: 0, skipped: 0, git_left_out: Vec::new() };
+    let mut copier =
+        Copier { readable, done: BTreeMap::new(), files: 0, bytes: 0, skipped: 0, git_left_out: Vec::new() };
     copier.dir(source, dest, "").map_err(failed)?;
     let keep = listed(dest).inspect_err(|_| {
         let _ = std::fs::remove_dir_all(dest);
     })?;
-    let Copier { done, files, bytes, skipped, mut git_left_out } = copier;
+    let Copier { done, files, bytes, skipped, mut git_left_out, .. } = copier;
     git_left_out.sort();
     let files_listed: BTreeMap<String, Entry> = done.into_iter().filter(|(rel, _)| keep.contains(rel)).collect();
     // From here on a file that is written gets a time that none of the recorded ones is.
@@ -652,7 +692,7 @@ fn prune(dest: &Path, copy: &Path, rel: &str) {
 }
 
 /// Bring one path of the copy to `dest`: beside its place first, then renamed over it.
-fn bring(copy: &Path, dest: &Path, rel: &str) -> std::io::Result<()> {
+fn bring(copy: &Path, dest: &Path, rel: &str, readable: Readable<'_>) -> std::io::Result<()> {
     let (from, to) = (copy.join(rel), dest.join(rel));
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent)?;
@@ -662,7 +702,15 @@ fn bring(copy: &Path, dest: &Path, rel: &str) -> std::io::Result<()> {
     let _ = std::fs::remove_file(&beside);
     let made = match seen(&from) {
         Seen::Link(target) => std::os::unix::fs::symlink(PathBuf::from(target), &beside),
-        Seen::File(s) => std::fs::copy(&from, &beside).and_then(|_| set_mtime(&beside, &s)),
+        Seen::File(s) => copy_file(&from, &beside, readable)
+            .map_err(|e| match e {
+                NotOpened::Io(e) => e,
+                NotOpened::Denied(sentence) => std::io::Error::new(std::io::ErrorKind::PermissionDenied, sentence),
+                NotOpened::NotRegular(_) => {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "it is no longer a file in the copy")
+                }
+            })
+            .and_then(|()| set_mtime(&beside, &s)),
         _ => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "it is no longer a file in the copy")),
     };
     let moved = made.and_then(|()| std::fs::rename(&beside, &to));
@@ -679,6 +727,7 @@ pub fn adopt(
     copy: &Path,
     dest: &Path,
     may_write: &dyn Fn(&Path) -> Result<(), String>,
+    readable: Readable<'_>,
 ) -> Result<Changes, AdoptError> {
     let all = changes(manifest, copy).map_err(|message| AdoptError::Io { message, written: Vec::new() })?;
     let mut todo = Changes { newest_ms: all.newest_ms, ..Changes::default() };
@@ -732,7 +781,7 @@ pub fn adopt(
     }
     let mut written = Vec::new();
     for rel in todo.added.iter().chain(&todo.modified) {
-        if let Err(e) = bring(copy, dest, rel) {
+        if let Err(e) = bring(copy, dest, rel, readable) {
             return Err(AdoptError::Io { message: format!("{rel} could not be written: {e}"), written });
         }
         written.push(rel.clone());
@@ -795,7 +844,7 @@ mod tests {
     #[test]
     fn a_copy_holds_everything_but_harness_state_and_its_manifest_leaves_out_what_git_ignores() {
         let f = fx();
-        let made = make(&f.ws, &f.copy, &ROOMY).unwrap();
+        let made = make(&f.ws, &f.copy, &ROOMY, &allow).unwrap();
         // Build output and Git metadata are there, so the copy runs as the workspace does.
         assert_eq!(fs::read_to_string(f.copy.join("target/debug/app")).unwrap(), "binary");
         assert_eq!(fs::read_to_string(f.copy.join(".git/HEAD")).unwrap(), "ref: refs/heads/main\n");
@@ -817,7 +866,7 @@ mod tests {
     #[test]
     fn the_limits_and_a_bad_destination_refuse_before_anything_is_written() {
         let f = fx();
-        let e = make(&f.ws, &f.copy, &Limits { max_files: 3, max_bytes: 0 }).unwrap_err();
+        let e = make(&f.ws, &f.copy, &Limits { max_files: 3, max_bytes: 0 }, &allow).unwrap_err();
         assert!(e.contains("more than 3 files") && e.contains("agents.copy_max_files"), "{e}");
         assert!(!f.copy.exists());
         fs::write(f.ws.join("big"), vec![0u8; 3 * 1024 * 1024]).unwrap();
@@ -826,7 +875,7 @@ mod tests {
         let e = measure(&f.ws, true, &tight, &mut files, &mut bytes).unwrap_err();
         assert!(e.contains("more than 2 MiB") && e.contains("agents.copy_max_mb"), "{e}");
         // The limit on bytes holds exactly where a copy duplicates them.
-        match make(&f.ws, &f.copy, &tight) {
+        match make(&f.ws, &f.copy, &tight, &allow) {
             Ok(made) => {
                 assert!(made.cloned, "a copy past the limit was made without cloning");
                 fs::remove_dir_all(&f.copy).unwrap();
@@ -839,18 +888,18 @@ mod tests {
         // The probe leaves nothing behind.
         let beside: Vec<_> = fs::read_dir(f.copy.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
         assert!(!beside.iter().any(|n| n.to_string_lossy().contains("clone-probe")), "{beside:?}");
-        let e = make(&f.ws, &f.ws.join("inside"), &ROOMY).unwrap_err();
+        let e = make(&f.ws, &f.ws.join("inside"), &ROOMY, &allow).unwrap_err();
         assert!(e.contains("one lies inside the other"), "{e}");
         assert!(!f.ws.join("inside").exists());
         fs::create_dir_all(&f.copy).unwrap();
-        let e = make(&f.ws, &f.copy, &ROOMY).unwrap_err();
+        let e = make(&f.ws, &f.copy, &ROOMY, &allow).unwrap_err();
         assert!(e.contains("exists already"), "{e}");
     }
 
     #[test]
     fn changes_lists_what_the_child_did_and_not_what_a_build_wrote() {
         let f = fx();
-        let made = make(&f.ws, &f.copy, &ROOMY).unwrap();
+        let made = make(&f.ws, &f.copy, &ROOMY, &allow).unwrap();
         fs::write(f.copy.join("src/a.rs"), "fn a() { 1 }\n").unwrap();
         fs::write(f.copy.join("src/new.rs"), "fn n() {}\n").unwrap();
         fs::remove_file(f.copy.join("docs/old.md")).unwrap();
@@ -877,7 +926,7 @@ mod tests {
     #[test]
     fn adopt_brings_exactly_the_changes_and_is_harmless_when_repeated() {
         let f = fx();
-        let made = make(&f.ws, &f.copy, &ROOMY).unwrap();
+        let made = make(&f.ws, &f.copy, &ROOMY, &allow).unwrap();
         fs::write(f.copy.join("src/a.rs"), "fn a() { 1 }\n").unwrap();
         fs::create_dir_all(f.copy.join("tests/deep")).unwrap();
         fs::write(f.copy.join("tests/deep/t.rs"), "#[test] fn t() {}\n").unwrap();
@@ -890,7 +939,7 @@ mod tests {
             asked.borrow_mut().push(p.to_path_buf());
             Ok(())
         };
-        let done = adopt(&made.manifest, &f.copy, &f.ws, &may).unwrap();
+        let done = adopt(&made.manifest, &f.copy, &f.ws, &may, &allow).unwrap();
         assert_eq!(done.lines(), ["D docs/old.md", "M src/a.rs", "A tests/deep/t.rs"]);
         assert_eq!(asked.borrow().len(), 3);
         assert_eq!(fs::read_to_string(f.ws.join("src/a.rs")).unwrap(), "fn a() { 1 }\n");
@@ -906,14 +955,14 @@ mod tests {
             .flatten()
             .all(|e| !e.file_name().to_string_lossy().contains("loom-adopt")));
         // A second time there is nothing left to bring.
-        let again = adopt(&made.manifest, &f.copy, &f.ws, &allow).unwrap();
+        let again = adopt(&made.manifest, &f.copy, &f.ws, &allow, &allow).unwrap();
         assert!(again.is_empty(), "{again:?}");
     }
 
     #[test]
     fn adopt_writes_nothing_when_the_workspace_changed_too_or_a_path_is_refused() {
         let f = fx();
-        let made = make(&f.ws, &f.copy, &ROOMY).unwrap();
+        let made = make(&f.ws, &f.copy, &ROOMY, &allow).unwrap();
         fs::write(f.copy.join("src/a.rs"), "fn a() { 1 }\n").unwrap();
         fs::write(f.copy.join("src/b.rs"), "fn b() { 2 }\n").unwrap();
         fs::write(f.copy.join("new.txt"), "from the copy\n").unwrap();
@@ -931,7 +980,7 @@ mod tests {
             set_mtime(&f.ws.join(same), &stamp(&fs::metadata(f.copy.join(same)).unwrap())).unwrap();
             assert_eq!(seen(&f.ws.join(same)), seen(&f.copy.join(same)), "{same}");
         }
-        let Err(AdoptError::Conflicts(conflicts)) = adopt(&made.manifest, &f.copy, &f.ws, &allow) else {
+        let Err(AdoptError::Conflicts(conflicts)) = adopt(&made.manifest, &f.copy, &f.ws, &allow, &allow) else {
             panic!("conflicts expected")
         };
         let paths: Vec<&str> = conflicts.iter().map(|(p, _)| p.as_str()).collect();
@@ -946,11 +995,11 @@ mod tests {
 
         // Without the conflicts, a path that may not be written stops everything as well.
         let g = fx();
-        let made = make(&g.ws, &g.copy, &ROOMY).unwrap();
+        let made = make(&g.ws, &g.copy, &ROOMY, &allow).unwrap();
         fs::write(g.copy.join("src/a.rs"), "fn a() { 1 }\n").unwrap();
         fs::write(g.copy.join("run.sh"), "#!/bin/sh\necho changed\n").unwrap();
         let may = |p: &Path| if p.ends_with("run.sh") { Err("protected".to_string()) } else { Ok(()) };
-        let Err(AdoptError::Refused(refused)) = adopt(&made.manifest, &g.copy, &g.ws, &may) else {
+        let Err(AdoptError::Refused(refused)) = adopt(&made.manifest, &g.copy, &g.ws, &may, &allow) else {
             panic!("a refusal expected")
         };
         assert_eq!(refused, [("run.sh".to_string(), "protected".to_string())]);
@@ -960,7 +1009,7 @@ mod tests {
     #[test]
     fn the_same_change_on_both_sides_is_no_conflict_and_is_not_brought() {
         let f = fx();
-        let made = make(&f.ws, &f.copy, &ROOMY).unwrap();
+        let made = make(&f.ws, &f.copy, &ROOMY, &allow).unwrap();
         for side in [&f.copy, &f.ws] {
             fs::write(side.join("src/a.rs"), "fn a() { same }\n").unwrap();
             fs::write(side.join("notes.txt"), "the same\n").unwrap();
@@ -971,7 +1020,7 @@ mod tests {
             asked.borrow_mut().push(p.to_path_buf());
             Ok(())
         };
-        let done = adopt(&made.manifest, &f.copy, &f.ws, &may).unwrap();
+        let done = adopt(&made.manifest, &f.copy, &f.ws, &may, &allow).unwrap();
         assert_eq!(done.lines(), ["M src/b.rs"]);
         assert_eq!(*asked.borrow(), [f.ws.join("src/b.rs")]);
         assert_eq!(fs::read_to_string(f.ws.join("src/b.rs")).unwrap(), "fn b() { 2 }\n");
@@ -997,7 +1046,7 @@ mod tests {
 
         // The files of the fixture were written a moment ago.
         let f = fx();
-        let made = make(&f.ws, &f.copy, &ROOMY).unwrap();
+        let made = make(&f.ws, &f.copy, &ROOMY, &allow).unwrap();
         assert!(SystemTime::now() >= settled_at(&made.manifest.files).unwrap());
         // So a file rewritten at once, to the size it had, has another time: it is seen as changed in
         // the copy, and as changed in the workspace when the copy's is to replace it.
@@ -1005,11 +1054,39 @@ mod tests {
         fs::write(f.copy.join("src/b.rs"), "fn y() {}\n").unwrap();
         assert_eq!(changes(&made.manifest, &f.copy).unwrap().modified, ["src/a.rs", "src/b.rs"]);
         fs::write(f.ws.join("src/a.rs"), "fn x() {}\n").unwrap();
-        let Err(AdoptError::Conflicts(conflicts)) = adopt(&made.manifest, &f.copy, &f.ws, &allow) else {
+        let Err(AdoptError::Conflicts(conflicts)) = adopt(&made.manifest, &f.copy, &f.ws, &allow, &allow) else {
             panic!("a conflict expected")
         };
         assert_eq!(conflicts, [("src/a.rs".to_string(), "the file there has changed".to_string())]);
         assert_eq!(fs::read_to_string(f.ws.join("src/a.rs")).unwrap(), "fn x() {}\n");
+    }
+
+    /// A judge that refuses the real path of any file whose name is `secret`.
+    fn refuse_secret(real: &Path) -> Result<(), String> {
+        if real.file_name().is_some_and(|n| n == "secret") {
+            Err(format!("{} is not readable", real.display()))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_file_that_leads_to_what_may_not_be_read_is_not_copied_by_make_or_adopt() {
+        let f = fx();
+        // The file is in the tree as the walk saw it; what it opens as is judged by its real path.
+        fs::write(f.ws.join("src/secret"), "SECRET-BYTES").unwrap();
+        let made = make(&f.ws, &f.copy, &ROOMY, &refuse_secret).unwrap();
+        assert!(!f.copy.join("src/secret").exists(), "a refused file is not copied");
+        assert!(made.skipped >= 1 && !made.manifest.files.contains_key("src/secret"));
+        assert!(f.copy.join("src/a.rs").exists());
+        // In adopt, a file of the copy that opens as a refused file is not brought over.
+        fs::create_dir_all(f.copy.join("added")).unwrap();
+        fs::write(f.copy.join("added/secret"), "SECRET-BYTES").unwrap();
+        let Err(AdoptError::Io { message, .. }) = adopt(&made.manifest, &f.copy, &f.ws, &allow, &refuse_secret) else {
+            panic!("an adoption that meets a refused file fails")
+        };
+        assert!(message.contains("added/secret") && message.contains("not readable"), "{message}");
+        assert!(!f.ws.join("added/secret").exists());
     }
 
     #[test]
@@ -1020,7 +1097,7 @@ mod tests {
             let making: Vec<_> = (0..8)
                 .map(|i| {
                     let (ws, dest) = (f.ws.clone(), beside.join(format!("at-once-{i}")));
-                    s.spawn(move || make(&ws, &dest, &ROOMY).unwrap().cloned)
+                    s.spawn(move || make(&ws, &dest, &ROOMY, &allow).unwrap().cloned)
                 })
                 .collect();
             making.into_iter().map(|h| h.join().unwrap()).collect()
@@ -1033,7 +1110,7 @@ mod tests {
     #[test]
     fn the_manifest_round_trips_as_json() {
         let f = fx();
-        let made = make(&f.ws, &f.copy, &ROOMY).unwrap();
+        let made = make(&f.ws, &f.copy, &ROOMY, &allow).unwrap();
         let text = serde_json::to_string(&made.manifest).unwrap();
         let back: Manifest = serde_json::from_str(&text).unwrap();
         assert_eq!(back, made.manifest);
@@ -1055,7 +1132,7 @@ mod tests {
         std::fs::write(src.join("vendored/.git"), "gitdir: ../../outside\n").unwrap();
         std::fs::write(src.join("odd/.git"), "not a pointer\n").unwrap();
         std::fs::write(src.join("a.txt"), "a\n").unwrap();
-        let made = make(&src, &dest, &Limits { max_files: 100, max_bytes: 0 }).unwrap();
+        let made = make(&src, &dest, &Limits { max_files: 100, max_bytes: 0 }, &allow).unwrap();
         assert_eq!(made.git_left_out, [".git", "odd/.git", "vendored/.git"]);
         assert!(!dest.join(".git").exists() && !dest.join("vendored/.git").exists() && !dest.join("odd/.git").exists());
         assert_eq!(std::fs::read_to_string(dest.join("sub/deep/.git")).unwrap(), "gitdir: ../../.modules/deep\n");
@@ -1066,7 +1143,7 @@ mod tests {
         let (src2, dest2) = (t.path().join("src2"), t.path().join("dest2"));
         std::fs::create_dir_all(src2.join(".git")).unwrap();
         std::fs::write(src2.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        let made = make(&src2, &dest2, &Limits { max_files: 100, max_bytes: 0 }).unwrap();
+        let made = make(&src2, &dest2, &Limits { max_files: 100, max_bytes: 0 }, &allow).unwrap();
         assert!(made.git_left_out.is_empty());
         assert!(dest2.join(".git/HEAD").is_file());
     }

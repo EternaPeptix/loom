@@ -68,21 +68,15 @@ pub struct Plan {
 }
 
 fn hash_file(ctx: &ToolCtx, given: &str) -> Result<(String, String), String> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use loom_tools::files::{open_readable, NotOpened};
     let path = ctx.sandbox.check_read(&ctx.sandbox.resolve(given))?;
-    if !std::fs::metadata(&path).map_err(|e| format!("Cannot guard {given}: {e}."))?.is_file() {
-        return Err(format!("The guard {given} must name a regular file."));
-    }
-    // A path can change to a FIFO between metadata and open. Nonblocking open plus the
-    // descriptor check rejects it without hanging the session's cancellation/budget loop.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(&path)
-        .map_err(|e| format!("Cannot guard {given}: {e}."))?;
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err(format!("The guard {given} must name a regular file."));
-    }
+    // Only a regular file is opened, without blocking, and the file that was opened is judged by its real path,
+    // so a path that changed to a link or a FIFO after the check above reads nothing the sandbox refuses.
+    let (file, _) = open_readable(&path, &|real| ctx.sandbox.check_read(real).map(|_| ())).map_err(|e| match e {
+        NotOpened::NotRegular(_) => format!("The guard {given} must name a regular file."),
+        NotOpened::Denied(sentence) => sentence,
+        NotOpened::Io(e) => format!("Cannot guard {given}: {e}."),
+    })?;
     let mut bytes = Vec::new();
     file.take(MAX_GUARD_BYTES + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_GUARD_BYTES {
@@ -201,6 +195,26 @@ mod tests {
         std::fs::write(e.ctx.workspace.join("input"), "new").unwrap();
         assert!(p.check(&e.ctx, "mission").unwrap_err().contains("changed"));
         assert!(p.check(&e.ctx, "new mission").is_err());
+    }
+
+    #[test]
+    fn a_file_guard_hashes_nothing_in_the_loom_home_however_the_path_is_written() {
+        let e = env();
+        let home = e.dir.path().canonicalize().unwrap().join("home");
+        let log = home.join("sessions/other/log.jsonl");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "OTHER-LOG").unwrap();
+        std::os::unix::fs::symlink(&log, e.ctx.workspace.join("link")).unwrap();
+        let mut given = vec![log.display().to_string(), "link".to_string()];
+        // macOS also names the data volume's folders under /System/Volumes/Data.
+        let aliased = format!("/System/Volumes/Data{}", log.display());
+        if cfg!(target_os = "macos") && std::path::Path::new(&aliased).exists() {
+            given.push(aliased);
+        }
+        for path in given {
+            let e = hash_file(&e.ctx, &path).unwrap_err();
+            assert!(e.contains("not readable") && e.contains("loom home"), "{path}: {e}");
+        }
     }
 
     #[test]

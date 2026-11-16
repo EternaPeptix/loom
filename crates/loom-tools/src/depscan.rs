@@ -17,7 +17,11 @@
 //!   parsed, deduplicated and summarised (prioritized/reachable first, then severity score),
 //!   and their bytes are stored as blobs the model can page (`out_read`) and quote as
 //!   evidence. The generated SBOM (`*.cdx.json`) and the scanner console are stored the same
-//!   way and named in the result facts. At most [`MAX_FINDINGS`] finding lines are rendered;
+//!   way and named in the result facts. The reports directory is writable by the session's commands, so
+//!   each report file is opened through the sandbox read check (a regular file only, judged by the real
+//!   path of what was opened): a link in it to what the session cannot read (the loom home, a credential
+//!   store, an unreadable path) is refused and named in the result's facts, never stored; a link to a
+//!   file the session can read still works. At most [`MAX_FINDINGS`] finding lines are rendered;
 //!   the counts always cover every parsed finding.
 //! - dep-scan's `depscan:prioritized` / `depscan:insights` labels are its own static
 //!   (reachability) analysis. The summary says so: they are scanner data about the scanned
@@ -28,7 +32,8 @@
 //!
 //! Tests required: VDR parsing/sorting/counts and the no-findings case as pure functions; a
 //! fake `depscan` on `PATH` that writes an SBOM+VDR (end to end, stored blobs, raw meta);
-//! a missing `depscan` (install guidance, nothing invented); a bad target; a bad project type.
+//! a missing `depscan` (install guidance, nothing invented); a bad target; a bad project type; a report file that is a link to a file in the loom home or a
+//! credential store is refused and named and its bytes are in no stored blob, while a link to a readable file is read.
 
 use crate::binary::{command_bounded, quote, CommandOutcome};
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
@@ -281,11 +286,27 @@ struct Artifact {
     bytes: Vec<u8>,
 }
 
-/// Read the `*.vdr.json` / `*.cdx.json` files of the reports directory. An oversized file is
-/// not read; its name is returned so the caller can keep the directory and say where it is.
-fn read_artifacts(reports: &std::path::Path) -> (Vec<Artifact>, Vec<Artifact>, Vec<String>) {
-    let (mut vdrs, mut boms, mut oversized) = (Vec::new(), Vec::new(), Vec::new());
-    let Ok(entries) = std::fs::read_dir(reports) else { return (vdrs, boms, oversized) };
+/// What [`read_artifacts`] found in the reports directory.
+#[derive(Default)]
+struct Artifacts {
+    vdrs: Vec<Artifact>,
+    boms: Vec<Artifact>,
+    /// Names of files over the size limit, which are not read.
+    oversized: Vec<String>,
+    /// A sentence for each report file that was not read because the session may not read what it is.
+    refused: Vec<String>,
+}
+
+/// Read the `*.vdr.json` / `*.cdx.json` files of the reports directory. The directory is writable by
+/// the scan (and by any command of the session), so each file is opened as the file tools open one: only
+/// a regular file, and only when `readable` accepts the real path of what was opened. A link to something
+/// the session cannot read is refused and named, never stored. An oversized file is not read; its name is
+/// returned so the caller can keep the directory and say where it is.
+fn read_artifacts(reports: &std::path::Path, readable: crate::files::Readable<'_>) -> Artifacts {
+    use crate::files::{open_readable, NotOpened};
+    use std::io::Read as _;
+    let mut found = Artifacts::default();
+    let Ok(entries) = std::fs::read_dir(reports) else { return found };
     let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     paths.sort();
     for path in paths {
@@ -295,17 +316,35 @@ fn read_artifacts(reports: &std::path::Path) -> (Vec<Artifact>, Vec<Artifact>, V
         if !is_vdr && !is_bom {
             continue;
         }
-        match std::fs::metadata(&path) {
-            Ok(m) if m.is_file() && m.len() > MAX_ARTIFACT_BYTES => oversized.push(name),
-            Ok(m) if m.is_file() => match std::fs::read(&path) {
-                Ok(bytes) if is_vdr => vdrs.push(Artifact { name, bytes }),
-                Ok(bytes) => boms.push(Artifact { name, bytes }),
-                Err(_) => oversized.push(name),
-            },
-            _ => {}
+        let (file, meta) = match open_readable(&path, readable) {
+            Ok(opened) => opened,
+            Err(NotOpened::Denied(sentence)) => {
+                found.refused.push(format!("report file {name} was not read: {sentence}"));
+                continue;
+            }
+            Err(NotOpened::NotRegular(kind)) => {
+                found.refused.push(format!(
+                    "report file {name} was not read: it is {}, not a regular file",
+                    crate::files::describe_type(&kind)
+                ));
+                continue;
+            }
+            Err(NotOpened::Io(_)) => continue,
+        };
+        if meta.len() > MAX_ARTIFACT_BYTES {
+            found.oversized.push(name);
+            continue;
+        }
+        // A file that grew after the check is not read whole.
+        let mut bytes = Vec::new();
+        match file.take(MAX_ARTIFACT_BYTES + 1).read_to_end(&mut bytes) {
+            Ok(_) if bytes.len() as u64 > MAX_ARTIFACT_BYTES => found.oversized.push(name),
+            Ok(_) if is_vdr => found.vdrs.push(Artifact { name, bytes }),
+            Ok(_) => found.boms.push(Artifact { name, bytes }),
+            Err(_) => found.oversized.push(name),
         }
     }
-    (vdrs, boms, oversized)
+    found
 }
 
 /// The shell script for one scan. All variable parts are single-quoted literals (see
@@ -437,7 +476,8 @@ async fn run(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
     let console = String::from_utf8_lossy(&outcome.bytes).into_owned();
 
     // --- Artifacts ------------------------------------------------------------
-    let (vdrs, boms, oversized) = read_artifacts(&reports);
+    let Artifacts { vdrs, boms, oversized, refused } =
+        read_artifacts(&reports, &|real| ctx.sandbox.check_read(real).map(|_| ()));
     let keep_dir = !oversized.is_empty();
     let mut parsed: Vec<Value> = Vec::new();
     let mut unparseable = 0usize;
@@ -470,6 +510,7 @@ async fn run(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         if keep_dir {
             out.more.push(format!("Oversized report files were left under {}", reports.display()));
         }
+        out.more.extend(refused);
         return out;
     }
 
@@ -518,6 +559,9 @@ async fn run(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
     if unparseable > 0 {
         out = out.with_more(format!("{unparseable} VDR file(s) were not parseable and were left out"));
     }
+    for sentence in refused {
+        out = out.with_more(sentence);
+    }
     if !oversized.is_empty() {
         out = out.with_more(format!(
             "report file(s) over {} MiB were not parsed and were left under {}: {}",
@@ -545,6 +589,7 @@ mod tests {
     use crate::testutil::{env, TestEnv};
     use loom_core::event::ToolStatus as Status;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
 
     fn vdr_fixture() -> Value {
         json!({
@@ -707,6 +752,60 @@ echo "fake depscan ran: $*"
         assert!(String::from_utf8(raw).unwrap().contains("RUSTSEC-2020-0071"));
         assert!(r.text.contains("SBOM sbom-rust.cdx.json: out:"), "{}", r.text);
         assert!(r.text.contains("scanner console: out:"), "{}", r.text);
+    }
+
+    /// Every byte stored under the loom home's blob directory.
+    fn all_stored_bytes(e: &TestEnv) -> Vec<u8> {
+        let mut all = Vec::new();
+        let mut dirs = vec![e.dir.path().join("home/blobs")];
+        while let Some(d) = dirs.pop() {
+            for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                if entry.path().is_dir() {
+                    dirs.push(entry.path());
+                } else {
+                    all.extend(std::fs::read(entry.path()).unwrap_or_default());
+                }
+            }
+        }
+        all
+    }
+
+    /// A fake `depscan` that writes a valid VDR and then plants one report link per `(name, target)`.
+    fn planting_scan(links: &[(&str, &Path)]) -> String {
+        let mut script = FAKE_SCAN.replace("echo \"fake depscan ran: $*\"\n", "");
+        for (name, target) in links {
+            script.push_str(&format!("ln -s '{}' \"$reports/{name}\"\n", target.display()));
+        }
+        script
+    }
+
+    #[tokio::test]
+    async fn a_report_file_that_links_to_the_loom_home_or_a_credential_is_refused_and_not_stored() {
+        let mut e = env();
+        let root = e.dir.path().canonicalize().unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("sessions/other")).unwrap();
+        std::fs::write(home.join("sessions/other/log.jsonl"), "OTHER-LOG-SECRET").unwrap();
+        std::fs::write(home.join("token"), "T0KEN-SECRET").unwrap();
+        let readable = e.ctx.workspace.join("readable.txt");
+        std::fs::write(&readable, "READABLE-FILE-BYTES").unwrap();
+        let (log, token) = (home.join("sessions/other/log.jsonl"), home.join("token"));
+        with_fake_depscan(
+            &mut e,
+            &planting_scan(&[("x.cdx.json", &log), ("y.cdx.json", &token), ("z.cdx.json", &readable)]),
+        );
+        std::fs::write(e.ctx.workspace.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let r = e.call("dep_scan", json!({})).await;
+        assert_eq!(r.status, Status::Ok, "{}", r.text);
+        assert!(r.text.contains("x.cdx.json was not read") && r.text.contains("y.cdx.json was not read"), "{}", r.text);
+        assert!(r.text.contains("loom home"), "{}", r.text);
+        assert!(!r.text.contains("SBOM x.cdx.json") && !r.text.contains("SBOM y.cdx.json"), "{}", r.text);
+        // The control: a link to a file the session can read is stored.
+        assert!(r.text.contains("SBOM z.cdx.json: out:"), "{}", r.text);
+        let stored = String::from_utf8_lossy(&all_stored_bytes(&e)).into_owned();
+        assert!(stored.contains("READABLE-FILE-BYTES"), "the control was not stored");
+        assert!(!stored.contains("OTHER-LOG-SECRET") && !stored.contains("T0KEN-SECRET"), "a refused file was stored");
+        assert!(!r.text.contains("OTHER-LOG-SECRET") && !r.text.contains("T0KEN-SECRET"), "{}", r.text);
     }
 
     #[tokio::test]

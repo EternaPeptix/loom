@@ -50,7 +50,7 @@
 //! with the "would match with hidden/no_ignore" count; invalid patterns; a single file as `path`;
 //! sandbox-unreadable entries skipped; cancellation.
 
-use crate::files::open_regular;
+use crate::files::{open_dir_readable, open_readable, NotOpened};
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
 use globset::{GlobBuilder, GlobMatcher};
@@ -201,6 +201,14 @@ impl Scan {
                 ctx.workspace.display()
             )))
         })?;
+        // The root is judged again as the directory that is opened: a link swapped in after the check leads nowhere.
+        if meta.is_dir() {
+            match open_dir_readable(&root, &|real| ctx.sandbox.check_read(real).map(|_| ())) {
+                Ok(()) => {}
+                Err(NotOpened::Denied(m)) => return Err(Box::new(ToolOutput::denied(m))),
+                Err(_) => {}
+            }
+        }
         Ok(Scan { sandbox: ctx.sandbox.clone(), cancel: ctx.cancel.clone(), root, is_file: meta.is_file() })
     }
 
@@ -241,7 +249,13 @@ impl Scan {
                 if e.file_name() == ".git" {
                     return false;
                 }
-                if e.file_type().is_some_and(|t| t.is_dir()) && sandbox.check_read(e.path()).is_err() {
+                if e.file_type().is_some_and(|t| t.is_dir())
+                    && (sandbox.check_read(e.path()).is_err()
+                        || matches!(
+                            open_dir_readable(e.path(), &|real| sandbox.check_read(real).map(|_| ())),
+                            Err(NotOpened::Denied(_))
+                        ))
+                {
                     skipped.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
@@ -650,9 +664,13 @@ enum Read {
 
 /// The text of a regular file of at most `cap` bytes. The first `BINARY_PROBE` bytes are read and
 /// checked for a NUL before the rest is read, and a file over the cap is never read at all.
-fn read_text(path: &Path, cap: u64) -> Read {
-    // Only a regular file is opened (never a FIFO, device or socket), and the open does not block.
-    let Ok((mut file, meta)) = open_regular(path) else { return Read::Unreadable };
+fn read_text(path: &Path, cap: u64, sandbox: &crate::sandbox::Sandbox) -> Read {
+    // Only a regular file is opened (never a FIFO, device or socket), and the open does not block. The
+    // file that was opened is judged by its real path, so a link swapped in after the walk reads nothing
+    // that the sandbox refuses.
+    let Ok((mut file, meta)) = open_readable(path, &|real| sandbox.check_read(real).map(|_| ())) else {
+        return Read::Unreadable;
+    };
     if meta.len() > cap {
         return Read::TooLarge;
     }
@@ -719,7 +737,7 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
             interrupted = true;
             break;
         }
-        let content = match read_text(&entry.abs, MAX_GREP_FILE_BYTES) {
+        let content = match read_text(&entry.abs, MAX_GREP_FILE_BYTES, &scan.sandbox) {
             Read::Text(t) => t,
             Read::Binary => {
                 binary += 1;
@@ -826,7 +844,7 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
                         if !budget.spend() {
                             return false;
                         }
-                        match read_text(&e.abs, MAX_GREP_FILE_BYTES) {
+                        match read_text(&e.abs, MAX_GREP_FILE_BYTES, &scan.sandbox) {
                             Read::Text(t) => t.lines().any(|l| opts.re.is_match(l)),
                             Read::TooLarge => {
                                 budget.too_large.insert(e.abs.clone());
@@ -1253,9 +1271,15 @@ mod tests {
             r.text
         );
         // read_text never returns the contents of a file over its cap.
-        assert!(matches!(read_text(&e.ctx.workspace.join("model.bin"), MAX_GREP_FILE_BYTES), Read::TooLarge));
-        assert!(matches!(read_text(&e.ctx.workspace.join("text.txt"), 3), Read::TooLarge));
-        assert!(matches!(read_text(&e.ctx.workspace.join("bin.dat"), MAX_GREP_FILE_BYTES), Read::Binary));
+        assert!(matches!(
+            read_text(&e.ctx.workspace.join("model.bin"), MAX_GREP_FILE_BYTES, &e.ctx.sandbox),
+            Read::TooLarge
+        ));
+        assert!(matches!(read_text(&e.ctx.workspace.join("text.txt"), 3, &e.ctx.sandbox), Read::TooLarge));
+        assert!(matches!(
+            read_text(&e.ctx.workspace.join("bin.dat"), MAX_GREP_FILE_BYTES, &e.ctx.sandbox),
+            Read::Binary
+        ));
         // The same holds for a single file named as the path.
         let r = e.call("grep", json!({"pattern": "needle", "path": "model.bin"})).await;
         assert!(r.text.contains("1 files skipped as too large"), "{}", r.text);
@@ -1460,5 +1484,82 @@ mod tests {
         assert_eq!(r.status, ToolStatus::Interrupted);
         assert!(r.text.contains("results are partial"), "{}", r.text);
         assert!(!r.text.contains("no match"), "{}", r.text);
+    }
+
+    /// The loom home (here `<dir>/home`) and the oracle secrets hold files that grep and glob must never show.
+    fn home_secret(e: &TestEnv) -> (PathBuf, PathBuf) {
+        let home = e.dir.path().canonicalize().unwrap().join("home");
+        std::fs::create_dir_all(home.join("sessions/other")).unwrap();
+        std::fs::write(home.join("sessions/other/log.jsonl"), "OTHER-LOG needle\n").unwrap();
+        std::fs::write(home.join("token"), "t0ken needle\n").unwrap();
+        let oracle = e.ctx.workspace.join(".loom/oracle-secrets");
+        std::fs::create_dir_all(&oracle).unwrap();
+        std::fs::write(oracle.join("k"), "ORACLE-KEY needle\n").unwrap();
+        (home, oracle)
+    }
+
+    #[tokio::test]
+    async fn the_loom_home_and_oracle_secrets_are_not_searched() {
+        let e = env();
+        let (home, oracle) = home_secret(&e);
+        for path in [home.clone(), oracle.clone()] {
+            for tool in
+                [json!({"pattern": "needle", "path": path}), json!({"pattern": "needle", "path": path, "hidden": true})]
+            {
+                let r = e.call("grep", tool).await;
+                assert!(r.status == ToolStatus::Denied && !r.text.contains("OTHER-LOG"), "{}", r.text);
+            }
+            let r = e.call("glob", json!({"pattern": "**", "path": path, "hidden": true})).await;
+            assert_eq!(r.status, ToolStatus::Denied, "{}", r.text);
+        }
+    }
+
+    /// macOS also names the data volume's folders under `/System/Volumes/Data`; `realpath` keeps that form,
+    /// which the rules are not written in.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_search_rooted_through_the_data_volume_alias_is_refused_like_the_plain_path() {
+        let e = env();
+        let (home, oracle) = home_secret(&e);
+        let data = |p: &Path| format!("/System/Volumes/Data{}", p.display());
+        if !Path::new(&data(&home)).exists() {
+            return; // the temp directory is not on the data volume
+        }
+        for path in [data(&home), data(&oracle), data(&home.join("sessions"))] {
+            let r = e.call("grep", json!({"pattern": ".", "path": path, "hidden": true, "no_ignore": true})).await;
+            assert!(
+                r.status == ToolStatus::Denied && !r.text.contains("OTHER-LOG") && !r.text.contains("t0ken"),
+                "grep {path}: {}",
+                r.text
+            );
+            let r = e.call("glob", json!({"pattern": "**", "path": path, "hidden": true, "no_ignore": true})).await;
+            assert!(r.status == ToolStatus::Denied && !r.text.contains("log.jsonl"), "glob {path}: {}", r.text);
+        }
+        // A file named through the alias is refused too.
+        let r = e.call("grep", json!({"pattern": ".", "path": data(&home.join("token"))})).await;
+        assert!(r.status == ToolStatus::Denied && !r.text.contains("t0ken"), "{}", r.text);
+        // The workspace itself, named through the alias, still searches.
+        put(&e, "a.txt", "needle\n");
+        let r = e.call("grep", json!({"pattern": "needle", "path": data(&e.ctx.workspace), "files_only": true})).await;
+        assert!(e.stored(&r).contains("a.txt"), "{}", r.text);
+    }
+
+    #[test]
+    fn a_path_swapped_for_a_link_into_the_loom_home_after_the_walk_reads_nothing() {
+        let e = env();
+        let (home, oracle) = home_secret(&e);
+        let ws = &e.ctx.workspace;
+        put(&e, "d/f", "plain needle\n");
+        // What the walk saw as a regular file is now a link; read_text judges what it opens.
+        for (name, target) in
+            [("l1", home.join("sessions/other/log.jsonl")), ("l2", home.join("token")), ("l3", oracle.join("k"))]
+        {
+            std::os::unix::fs::symlink(&target, ws.join("d").join(name)).unwrap();
+            assert!(
+                matches!(read_text(&ws.join("d").join(name), MAX_GREP_FILE_BYTES, &e.ctx.sandbox), Read::Unreadable),
+                "{name}"
+            );
+        }
+        assert!(matches!(read_text(&ws.join("d/f"), MAX_GREP_FILE_BYTES, &e.ctx.sandbox), Read::Text(_)));
     }
 }

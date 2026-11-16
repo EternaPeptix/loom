@@ -1070,7 +1070,9 @@ impl Tool for AgentAdopt {
         let (manifest, dir, dest, sandbox) =
             (copy.manifest.clone(), copy.dir.clone(), ctx.workspace.clone(), ctx.sandbox.clone());
         let adopting = tokio::task::spawn_blocking(move || {
-            workcopy::adopt(&manifest, &dir, &dest, &|path| sandbox.check_write(path).map(|_| ()))
+            workcopy::adopt(&manifest, &dir, &dest, &|path| sandbox.check_write(path).map(|_| ()), &|real| {
+                sandbox.check_read(real).map(|_| ())
+            })
         });
         let adopted = match adopting.await {
             Ok(result) => result,
@@ -2020,7 +2022,7 @@ mod tests {
         let root = r.env.dir.path().canonicalize().unwrap();
         let dest = root.join("copies").join(child);
         let limits = workcopy::Limits { max_files: 1_000, max_bytes: 0 };
-        let made = workcopy::make(&r.env.ctx.workspace, &dest, &limits).unwrap();
+        let made = workcopy::make(&r.env.ctx.workspace, &dest, &limits, &|_| Ok(())).unwrap();
         edit(&dest);
         let cfg = SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() };
         let sandbox =

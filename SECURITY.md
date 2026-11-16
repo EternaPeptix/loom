@@ -70,7 +70,8 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   `~/.config/rclone`, and more), wallets, the macOS Keychains and Cookies folders, Mail, Messages,
   Telegram, Group Containers and the Chrome, Chromium, Brave, Edge, Arc, Vivaldi, Opera, Firefox and
   Safari profiles. So are
-  the loom token and keys and your `unreadable_paths`. A listed directory that is or contains the
+  the whole loom home but the session's temp directory and the harness's staging of analysis inputs (the
+  token and keys included), whose names are hidden as well as their content, and your `unreadable_paths`. A listed directory that is or contains the
   workspace is skipped.
 - **The network** is closed except for loopback connections to the egress proxy (and any ports or sockets
   you list). The proxy applies `[network]`: by default (`deny_all`) it forwards nothing. It resolves
@@ -148,8 +149,9 @@ truncation detectable, not impossible: see the limits below.
 
 These are the places where loom does less than the text above might suggest.
 
-- **Reads are allowed by default.** The sandbox denies reads of the credential list, the loom token
-  and keys, and `unreadable_paths`. Everything else your user can read, a command can read: your
+- **Reads are allowed by default.** The sandbox denies reads of the credential list, the whole loom home
+  (`~/.loom`: other sessions' and its own logs, stored outputs, mission journals, configuration, token and
+  keys; only the session's temp directory is readable), and `unreadable_paths`. Everything else your user can read, a command can read: your
   documents, shell history, other projects, source trees, tokens kept in files that are not on the
   list, and anything under a directory that is or contains the workspace. Set the workspace to the
   smallest directory that works, and add paths to `unreadable_paths`.
@@ -165,13 +167,14 @@ These are the places where loom does less than the text above might suggest.
   opens the directory, judges its real path with the file name, and creates and renames the file
   relative to that open directory. A command that swaps a directory for a link during such a call gets
   no content and no file out of it; it can still learn whether a path there exists and what kind of
-  file it is. `glob` and `grep` check each path and then open it by name, so a command that swaps a
-  link in between can in principle make them list or read through it. They also judge a path in the
-  form it was given, with links resolved: macOS shows `/Users`, `/private` and the other folders of the
-  data volume under `/System/Volumes/Data` too, and given a path in that form, which the rules are not
-  written in, `glob` and `grep` list and read what the rules refuse; `read`, `write` and `edit` judge
-  the name the system gives for the open file, which is the usual one. All of them refuse to touch
-  anything that is not a regular file.
+  file it is. `grep` checks each path as the walk finds it, and then judges the real path of the file it
+  opens, as `read` does; `dep_scan` reads its report files, `continuation` its guarded files and the copy of
+  a workspace made for an agent (and adopted back) its files the same way, so a link swapped in meanwhile
+  reads and copies nothing the rules refuse. `glob` only lists names, checking each directory it walks
+  as the directory that was opened, so a command that swaps a link in during a walk can in principle make it
+  list names it should not (never content). macOS shows `/Users`, `/private` and the other folders of the
+  data volume under `/System/Volumes/Data` too; a path in that form is given its usual form back before the
+  rules are applied. All of them refuse to touch anything that is not a regular file.
 - **Without macOS there is no sandbox.** On other systems the daemon starts only with
   `[sandbox] mode = "none"`, and then commands are unconfined. The file tools still refuse the protected
   and credential paths, and the network proxy still exists, but a command can ignore it. Do not run

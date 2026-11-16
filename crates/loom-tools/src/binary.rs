@@ -8,9 +8,11 @@
 //! They do not install/launch a daemon or modify targets. gdb_probe disables startup/auto-load files,
 //! runs under the same sandbox with timeout/output/cancellation limits, and labels its observation as
 //! debugger output rather than an independent privilege/success oracle. Backends use descriptor-hashed
-//! staging outside actor write grants. Unconfined mode is explicitly labelled and never cached.
+//! staging outside actor write grants: `<session dir>/analysis/<random>/target`, the sandbox's
+//! `analysis_dir()`, which the session's commands can read (the backends open their input) and never write.
+//! Unconfined mode is explicitly labelled and never cached.
 //! Every readable process observation, including failure/cancellation/timeout/limit prefixes, is Raw
-//! output with completion/termination metadata. Read failures retain the protected output file.
+//! output with completion/termination metadata. Read failures retain the output file, which lies in the loom home where the session cannot read it: the sentence says to run the analysis again and names the file for the operator.
 //! ProducedView stores and indexes full normalized decompiler output while showing at most 120 lines.
 
 use crate::{
@@ -332,7 +334,7 @@ pub(crate) async fn command_bounded(
         WaitEnd::Ended(e) if !background => e.clone(),
         _ => running.terminate_within(Duration::from_secs(1), limit).await,
     };
-    let(bytes,written)=running.read_output_capped(limit).map_err(|e|format!("Analysis ran but its output could not be read: {e}. Output is retained at {}; inspect that protected file before retrying.",spec.out_path.display()))?;
+    let(bytes,written)=running.read_output_capped(limit).map_err(|e|format!("Analysis ran but its output could not be read: {e}. Run the analysis again. What it wrote is left for the operator in {}, which commands and file tools cannot read.",spec.out_path.display()))?;
     let mut reason = match wait {
         WaitEnd::Cancelled => Some("cancelled"),
         WaitEnd::Deadline => Some("timeout"),
@@ -361,8 +363,11 @@ impl BackendInput {
     fn create(ctx: &ToolCtx, bytes: &[u8], hash: &str) -> Result<Self, String> {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let parent = ctx.tmp_dir.parent().ok_or("The session has no protected parent for analysis staging.")?;
-        let root = parent.join(format!("analysis-{:032x}", rand::random::<u128>()));
+        // One fixed directory per session, which the sandbox lets commands read (never write), and a private
+        // random directory per call inside it.
+        let staging = ctx.sandbox.analysis_dir();
+        let root = staging.join(format!("{:032x}", rand::random::<u128>()));
+        loom_core::config::ensure_private_dir(staging).map_err(|e| format!("Analysis input staging failed: {e}."))?;
         loom_core::config::ensure_private_dir(&root).map_err(|e| format!("Analysis input staging failed: {e}."))?;
         let path = root.join("target");
         let enforced = ctx.sandbox.mode() != loom_core::config::SandboxMode::None;
@@ -817,6 +822,40 @@ mod tests {
         assert_eq!(std::fs::read(&staged.path).unwrap(), b"original");
         assert!(staged.unchanged());
         assert!(!staged.enforced);
+    }
+
+    /// In production the staging is `<session dir>/analysis/<random>/target`, inside the loom home, which commands
+    /// cannot read: the backends that run as commands (rizin, gdb) must still read their input, and never write it.
+    #[tokio::test]
+    async fn staged_input_is_readable_to_the_backend_and_not_writable_in_the_production_layout() {
+        use loom_core::config::{SandboxCfg, SandboxMode, ToolsCfg};
+        if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
+            return;
+        }
+        let env = crate::testutil::env_prod(
+            ToolsCfg::default(),
+            SandboxCfg { mode: SandboxMode::Seatbelt, ..SandboxCfg::default() },
+        );
+        let staged = BackendInput::create(&env.ctx, b"STAGED-TARGET-BYTES", "hash").unwrap();
+        assert!(staged.enforced);
+        assert!(staged.path.starts_with(env.ctx.sandbox.analysis_dir()), "{}", staged.path.display());
+        assert!(env.ctx.sandbox.check_read(&staged.path).is_ok());
+        assert!(env.ctx.sandbox.check_write(&staged.path).is_err());
+        let path = quote(&staged.path.to_string_lossy());
+        let read = command(&env.ctx, format!("cat {path}; /usr/bin/file {path}"), 10).await.unwrap();
+        let text = String::from_utf8_lossy(&read.bytes).into_owned();
+        assert!(read.completed && text.contains("STAGED-TARGET-BYTES") && !text.contains("cannot open"), "{text}");
+        for write in [format!("echo x >> {path}"), format!("rm {path}"), format!("echo x > {path}.new")] {
+            let r = command(&env.ctx, write.clone(), 10).await.unwrap();
+            assert!(r.ended != crate::proc::Ended::Exit(0), "{write}: {}", String::from_utf8_lossy(&r.bytes));
+        }
+        assert_eq!(std::fs::read(&staged.path).unwrap(), b"STAGED-TARGET-BYTES");
+        // Another session's files in the loom home stay unreadable.
+        let other = env.dir.path().canonicalize().unwrap().join("home/blobs/x");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, "STORED-OUTPUT").unwrap();
+        let r = command(&env.ctx, format!("cat {}", quote(&other.to_string_lossy())), 10).await.unwrap();
+        assert!(!String::from_utf8_lossy(&r.bytes).contains("STORED-OUTPUT"));
     }
 
     #[test]

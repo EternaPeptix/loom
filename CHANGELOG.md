@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### The sandbox hides the whole loom home
+
+- Commands (seatbelt profile) and the file tools (`check_read`) can no longer read anything under the loom
+  home except the session temp dir (an isolated replay: its staged workspace and temp); before, only `token`,
+  `keys` and `oracle-secrets` were hidden, so a command could read its own or another session's log, a stored
+  output, a mission journal or an earlier run's results. The home and the directories down to the temp dir stay
+  stat-able (`cd`, `pwd -P`, `mkdir -p` in `$TMPDIR` work) but cannot be listed. A hard link from the temp dir to
+  a file that is not readable is refused by seatbelt (probed on macOS 27). A workspace that is or lies inside
+  the loom home is now refused at construction, and the system prompt says loom's own files are not readable.
+  Linux Bubblewrap already hid the home; its file tools now agree.
+- The names under the home are hidden too (`file-test-existence`, and `file-search` everywhere), so a command
+  can no longer list the home by file id (`fsgetpath`) or `searchfs`. The session's job output directory gives
+  commands the metadata of its files, which `cat` and Python take of their inherited stdout; without it they
+  lost their output. Binary-analysis inputs are staged in `<session dir>/analysis/<random>/target`, which
+  commands can read (rizin and gdb open it) and never write.
+- A path written through `/System/Volumes/Data/...` is given its usual form back, so `grep`, `glob`,
+  `continuation` guards and the workspace check judge it as the plain path. `grep`, `dep_scan` report files, guard
+  hashing and the copy of a workspace made for an agent (and its adoption) now judge the real path of the file
+  they open, so a link swapped in after a check reads and copies nothing refused. `dep_scan` names the report
+  files it refused. `workcopy::make` and `adopt` take a read judge.
+- Messages that told the model to read a job output file now say to run the command again; `describe()` in mode
+  `none` words the loom-home rule as the file tools' own.
+
 ### security_record reads near misses
 
 - `security_record` now reads an operation where its meaning is unambiguous (`ops`/`items` for

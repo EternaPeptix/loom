@@ -103,7 +103,13 @@ With `[sandbox] mode = "seatbelt"` (the default) commands run under a macOS sand
 - `~/.loom`, `<workspace>/.loom` and `protected_paths` are never writable, with one exception: the
   session's temp directory is `~/.loom/sessions/<id>/tmp`, and everything inside it is writable (the
   directory entry itself cannot be removed, renamed or replaced);
-- the loom token and keys and `unreadable_paths` are neither readable nor writable;
+- the whole loom home (`~/.loom`: logs, records, stored outputs, missions, configuration, packs, token and keys) is
+  not readable by commands (and not by the file tools, in every mode), except the session's temp directory and
+  the harness's `analysis` staging directory (a replay: its staged workspace and temp instead); the home and the
+  directories down to the temp dir can be looked up (`stat`, `cd`) but not listed, and the names under the home
+  are hidden. A command's own output file is in `~/.loom/sessions/<id>/jobs`: its metadata can be read, nothing
+  else, so output works but cannot be read back from a command. A workspace inside `~/.loom` is refused at
+  start. `unreadable_paths` are neither readable nor writable;
 - no network except the egress proxy (plus `loopback_ports`, `loopback_all`, `unix_sockets`);
 - no LaunchServices opens, Apple Events or launchd jobs.
 

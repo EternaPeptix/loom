@@ -417,7 +417,10 @@ fn store_output(blobs: &BlobStore, path: &Path, max: u64, detail: &mut String) -
         Err(e) => {
             add_detail(
                 detail,
-                &format!("the complete output could not be stored ({e}); it is still in the file {}", path.display()),
+                &format!(
+                    "the complete output could not be stored ({e}); it is left for the operator in {}, which the session cannot read, so run the command again if you need it",
+                    path.display()
+                ),
             );
             None
         }

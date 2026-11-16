@@ -95,8 +95,9 @@
 //!   (created, canonical), blobs: BlobStore::open(paths.blobs_dir()), cfg: tools config, sandbox,
 //!   env, files: new FileTracker, jobs: JobTable::new(<session dir>/jobs, blobs, sender,
 //!   tools.max_output_bytes), cancel: new token}`.
-//!   - `sandbox`: `Sandbox::new(&cfg, workspace, tmp_dir, paths.home, Some(proxy port))` with the
-//!     config's `SandboxCfg`; for a role with `read_only`, `extra_writable` is retained as internal
+//!   - `sandbox`: `Sandbox::new(&cfg, workspace, tmp_dir, paths.home, Some(proxy port))`, then
+//!     `.with_jobs_dir(<session dir>/jobs)` (commands' own output files are there: their metadata can be read,
+//!     not their content), with the config's `SandboxCfg`; for a role with `read_only`, `extra_writable` is retained as internal
 //!     replay-untrusted metadata before its grants are emptied, and the
 //!     workspace is added to `protected_paths`; every model profile's `api_key_env` name is added to
 //!     `secret_env`, so commands never see it.
@@ -1367,6 +1368,7 @@ impl Orchestrator for Orch {
         let role = inner.packs.role(Some(&meta.pack), Some(&meta.role))?.clone();
         let (record, log) = (inner.paths.session_dir(&child).join(COPY_MANIFEST), inner.paths.session_log(&child));
         let (tmp, home, copies) = (inner.paths.session_tmp(parent), inner.paths.home.clone(), inner.paths.copies_dir());
+        let parent_jobs = inner.paths.session_dir(parent).join("jobs");
         let (base, models, port) = (inner.config.sandbox.clone(), inner.config.models.clone(), inner.proxy.port());
         let read = tokio::task::spawn_blocking(move || {
             let dir = std::fs::canonicalize(&meta.workspace).map_err(|e| {
@@ -1391,6 +1393,7 @@ impl Orchestrator for Orch {
             let cfg = with_copies(sandbox_cfg_for(&base, &role, &dir, &models), &copies, Some(&source));
             let bubblewrap = cfg.mode == SandboxMode::Bubblewrap;
             let sandbox = Sandbox::new(&cfg, &dir, &tmp, &home, (!bubblewrap).then_some(port))
+                .and_then(|s| s.with_jobs_dir(&parent_jobs))
                 .map_err(|e| format!("The sandbox for the copy of agent {} cannot be set up: {e}", child.as_str()))?;
             Ok(ChildCopy { agent: child, dir, manifest, running, runs, sandbox: Arc::new(sandbox) })
         });
@@ -2163,17 +2166,14 @@ impl Inner {
         if bubblewrap && self.config.network.mode != loom_core::config::NetworkMode::DenyAll {
             return Err("Bubblewrap requires network.mode = deny_all. Explicit mission grants apply only to trusted in-process HTTP tools; subprocess proxy bridges are unsupported.".into());
         }
+        let jobs_dir = self.paths.session_dir(id).join("jobs");
         let sandbox =
             Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, (!bubblewrap).then_some(self.proxy.port()))
+                .and_then(|s| s.with_jobs_dir(&jobs_dir))
                 .map_err(|e| format!("The sandbox for this session cannot be set up: {e}"))?;
         let policy = self.session_policy(meta, explicit)?;
         let (events_tx, job_events) = unbounded_channel();
-        let jobs = Arc::new(JobTable::new(
-            self.paths.session_dir(id).join("jobs"),
-            self.blobs.clone(),
-            events_tx,
-            self.config.tools.max_output_bytes,
-        ));
+        let jobs = Arc::new(JobTable::new(jobs_dir, self.blobs.clone(), events_tx, self.config.tools.max_output_bytes));
         let grant = self.proxy.grant(id, policy);
         let reference_proxy = if self.config.network.reference_hosts.is_empty() {
             None
@@ -2551,7 +2551,25 @@ impl Inner {
 
     /// Make the copy of the workspace `source` an agent will work in, at `dest`, and record what it
     /// was made from beside the agent's log. On `Err` nothing is left at `dest`.
-    async fn make_copy(&self, child: &SessionId, source: PathBuf, dest: PathBuf) -> Result<workcopy::Made, String> {
+    async fn make_copy(
+        &self,
+        parent: &SessionId,
+        child: &SessionId,
+        source: PathBuf,
+        dest: PathBuf,
+    ) -> Result<workcopy::Made, String> {
+        // What the parent's own session may read decides which files are copied: the rules are the same in every
+        // mode (the sandbox is built here only to judge paths, so no mode is needed).
+        let (pack, role) = self
+            .st()
+            .known
+            .get(parent)
+            .map(|p| (p.meta.pack.clone(), p.meta.role.clone()))
+            .ok_or_else(|| "Only the lead session of a mission can start agents.".to_string())?;
+        let role = self.packs.role(Some(&pack), Some(&role))?.clone();
+        let mut judge_cfg = sandbox_cfg_for(&self.config.sandbox, &role, &source, &self.config.models);
+        judge_cfg.mode = loom_core::config::SandboxMode::None;
+        let (home, tmp) = (self.paths.home.clone(), self.paths.session_tmp(parent));
         let limits = workcopy::Limits {
             max_files: self.config.agents.copy_max_files,
             max_bytes: self.config.agents.copy_max_mb.saturating_mul(1024 * 1024),
@@ -2562,7 +2580,9 @@ impl Inner {
             if let Some(root) = dest.parent() {
                 ensure_private_dir(root).map_err(|e| format!("Cannot create {}: {e}", root.display()))?;
             }
-            let made = workcopy::make(&source, &dest, &limits)?;
+            let judge = Sandbox::new(&judge_cfg, &source, &tmp, &home, None)
+                .map_err(|e| format!("The copy of the workspace could not be made: {e}"))?;
+            let made = workcopy::make(&source, &dest, &limits, &|real| judge.check_read(real).map(|_| ()))?;
             let written = match record.parent() {
                 Some(dir) => ensure_private_dir(dir).and_then(|()| write_json_atomic(&record, &made.manifest)),
                 None => write_json_atomic(&record, &made.manifest),
@@ -2788,7 +2808,7 @@ impl Inner {
         };
         // The child is known (and counted against `max_children`) while its copy is made.
         if let (Some(source), Some(dest)) = (meta.copy_of.clone(), copy_dir.clone()) {
-            let made = match self.make_copy(&child_id, PathBuf::from(&source), dest).await {
+            let made = match self.make_copy(parent, &child_id, PathBuf::from(&source), dest).await {
                 // The daemon may have begun to stop while the files were copied.
                 Ok(made) => self.check_open().map(|()| made),
                 Err(e) => Err(e),

@@ -500,16 +500,34 @@ pub mod testutil {
     }
 
     pub fn env_with(cfg: ToolsCfg, sandbox_cfg: SandboxCfg) -> TestEnv {
+        make_env(cfg, sandbox_cfg, false)
+    }
+
+    /// `env_with` in the production layout: the session temp dir is `<dir>/home/sessions/s1/tmp`, inside the loom
+    /// home, and the job output files are in `<dir>/home/sessions/s1/jobs`, which the sandbox is told of.
+    pub fn env_prod(cfg: ToolsCfg, sandbox_cfg: SandboxCfg) -> TestEnv {
+        make_env(cfg, sandbox_cfg, true)
+    }
+
+    fn make_env(cfg: ToolsCfg, sandbox_cfg: SandboxCfg, prod: bool) -> TestEnv {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonical tempdir");
-        let (ws, tmp, home) = (root.join("ws"), root.join("tmp"), root.join("home"));
+        let (ws, home) = (root.join("ws"), root.join("home"));
+        let (tmp, jobs_dir) = if prod {
+            (home.join("sessions/s1/tmp"), home.join("sessions/s1/jobs"))
+        } else {
+            (root.join("tmp"), home.join("jobs"))
+        };
         for d in [&ws, &tmp, &home] {
             std::fs::create_dir_all(d).expect("create test dirs");
         }
         let blobs = BlobStore::open(home.join("blobs")).expect("blob store");
-        let sandbox = sandbox::Sandbox::new(&sandbox_cfg, &ws, &tmp, &home, None).expect("sandbox");
+        let mut sandbox = sandbox::Sandbox::new(&sandbox_cfg, &ws, &tmp, &home, None).expect("sandbox");
+        if prod {
+            sandbox = sandbox.with_jobs_dir(&jobs_dir).expect("jobs dir");
+        }
         let (tx, job_events) = tokio::sync::mpsc::unbounded_channel();
-        let jobs = jobs::JobTable::new(home.join("jobs"), blobs.clone(), tx, cfg.max_output_bytes);
+        let jobs = jobs::JobTable::new(jobs_dir, blobs.clone(), tx, cfg.max_output_bytes);
         let ctx = ToolCtx {
             session: SessionId::from("s-test"),
             call_id: CallId::from("call-1"),

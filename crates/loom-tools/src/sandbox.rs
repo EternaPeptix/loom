@@ -12,14 +12,20 @@
 //!   replaced or made anew, yet tests as writable), and not a protected path that is the temp dir or
 //!   lies inside it. A temp dir that is `/`, or is or contains the loom home, is refused at construction;
 //! - not readable: the whole loom home — its records, stored outputs, journals, logs, configuration,
-//!   packs, `token` and `keys` among them — except the session temp dir (in an isolated replay: its
+//!   packs, `token` and `keys` among them — except the session temp dir and `<session dir>/analysis`, the
+//!   harness's staging of binary-analysis inputs (readable, never writable; in an isolated replay: its
 //!   staged workspace and temp instead), so a command or file tool cannot read another session's or its
 //!   own log, a stored output, or an earlier mission's results, as Bubblewrap already hides the home. The
-//!   loom home's own entry and each directory between it and that temp dir can be looked up (their
-//!   metadata read) but not listed or read. Also not readable: `<workspace>/.loom/oracle-secrets`,
+//!   loom home's own entry and each directory between it and those can be looked up (their metadata read)
+//!   but not listed or read. Names are hidden as well as content: the home's files cannot be found by
+//!   their file id (`fsgetpath`), searched for by name (`searchfs`, denied everywhere as `file-search`),
+//!   nor tested for existence. A session's job output directory (`with_jobs_dir`; its commands' own stdout
+//!   and stderr files are there) gives commands the metadata of what is in it and nothing more — `fstat` of an
+//!   inherited descriptor is a metadata read, and without it `cat` fails and Python loses its output —
+//!   so those files can be neither read nor listed. Also not readable: `<workspace>/.loom/oracle-secrets`,
 //!   `cfg.unreadable_paths` (`~` expands to
 //!   the home directory) and, unless `cfg.protect_credentials` is off, the user's credential stores
-//!   (`CREDENTIAL_PATHS` under the home directory). A credential store that is or contains the
+//!   (`CREDENTIAL_PATHS` under the home directory), their names hidden too. A credential store that is or contains the
 //!   workspace is skipped, so the workspace stays readable; when the home directory is not known the
 //!   stores cannot be located and construction is refused. A workspace that is or lies inside the loom
 //!   home is refused at construction (only `isolated_replay` places one there). What is not readable is
@@ -43,7 +49,10 @@
 //! writable, not readable) are compared without regard to case; the rules that allow are compared
 //! exactly, as they are everywhere else. A not-readable path that a link along it makes differ from
 //! its canonical form is denied as written too, so the link cannot be swapped for a directory of a
-//! command's own.
+//! command's own. macOS also names the data volume's folders under `/System/Volumes/Data`, and `realpath`
+//! keeps that prefix where it was written: a canonical path that has it is given its usual form back when
+//! that names the very same file (same device and inode), so rules written in the usual form judge it;
+//! `check_read`, `check_write`, construction and every other user of the canonical form get this.
 //!
 //! ## `profile()`
 //! The seatbelt profile text, `None` in modes `none` and `bubblewrap`. This form is verified on macOS 27 — keep its
@@ -61,16 +70,18 @@
 //! (deny file-write-unlink file-write-create (literal "<session temp dir>"))
 //! (deny file-write* (subpath "<protected, at or inside the temp dir>") …)
 //! (deny file-write* (subpath "<unreadable or credential store>") …)
-//! (deny file-read* (subpath "<unreadable or credential store>") …)
-//! (deny file-read* (subpath "<loom home>"))
-//! (allow file-read-metadata (literal "<loom home>") (literal "<each directory down to the session temp dir>") …)
-//! (allow file-read* (subpath "<session temp dir>"))          ; a replay: its staged workspace and temp
-//! (deny file-read* (subpath "<unreadable or credential store at or inside those>") …)
+//! (deny file-read* file-test-existence (subpath "<unreadable or credential store>") …)
+//! (deny file-read* file-test-existence (subpath "<loom home>"))
+//! (allow file-read-metadata file-test-existence (literal "<loom home>") (literal "<each directory between it and the session temp dir>") …)
+//! (allow file-read* file-test-existence (subpath "<session temp dir>") (subpath "<session dir>/analysis"))   ; a replay: its staged workspace and temp
+//! (deny file-read* file-test-existence (subpath "<unreadable or credential store at, inside or around those>") …)
+//! (allow file-read-metadata (subpath "<session dir>/jobs"))      ; only with `with_jobs_dir`: metadata, never content
 //! (deny file-write-unlink (literal "<writable directory that holds one of the above>") …)
 //! (deny file-write-create (require-all (vnode-type SYMLINK) (require-any (literal "<same directory>") …)))
 //! (deny lsopen)
 //! (deny appleevent-send)
 //! (deny job-creation)
+//! (deny file-search)
 //! (deny network*)
 //! (allow network-outbound (remote ip "localhost:<port>")) …      ; or "localhost:*" for loopback_all
 //! (allow network-outbound (remote unix-socket (path-literal "<socket>"))) …
@@ -108,8 +119,9 @@
 //! sentence: which path, which rule refused it, and what is allowed (for writes, the writable roots).
 //! `check_write` lets the session temp dir through the never-writable rules, as the profile does, and
 //! refuses what is not readable and the temp dir entry itself wherever they lie. `check_read` refuses
-//! everything under the loom home except the session temp dir (a replay: its staged workspace and
-//! temp), naming the loom home as the reason without echoing what lies there. In mode `none` only
+//! everything under the loom home except the session temp dir and the analysis staging dir (a replay: its
+//! staged workspace and temp), naming the loom home and what is readable as the reason without echoing what
+//! lies there; in mode `none` the sentence says the file tools cannot read it, as commands are not confined. In mode `none` only
 //! the never-writable and not-readable rules apply (the loom home rule included: it is the file tools'
 //! own rule in that mode).
 //!
@@ -146,9 +158,11 @@
 //!
 //! ## `describe()`
 //! Two or three plain sentences for the system prompt: where commands may write, what they may not
-//! read (loom's own files other than the session temp dir, and credential stores when protected), how
-//! network access works. Deterministic. In
-//! mode `none` it says commands are not confined and what the file tools still refuse.
+//! read (loom's own files other than the session temp dir and the analysis staging dir, and credential
+//! stores when protected), how network access works. Deterministic. In
+//! mode `none` it says commands are not confined and what the file tools still refuse: the rule about loom's
+//! own files is worded as the file tools' (`File tools also refuse to read loom's own files under …`), not
+//! as one that binds commands.
 //!
 //! ## `preflight(cfg)`
 //! Whether the configured mode can work on this host: seatbelt needs macOS and an executable
@@ -168,7 +182,12 @@
 //! succeeds, a write outside fails, a read of an unreadable path fails; `cat` of a session log, a blob
 //! and `config.toml` and `ls` of `<loom home>/sessions` fail; in `$TMPDIR` a file can be written and
 //! read back, `mkdir -p` and `cd` + `pwd -P` work; a hard link from `$TMPDIR` to a file under the
-//! loom home (and to a credential store file) is refused or reads nothing.
+//! loom home (and to a credential store file) is refused or reads nothing; a command that asks the kernel for
+//! the paths under the loom home by file id (`fsgetpath`) finds only the home, the directories down to the temp
+//! dir and what is in it; through the production layout `cat`, `printf x | cat` and `python3 -c 'print(1)'`
+//! keep their output, while `cat` and `ls` of the jobs directory fail; `check_read` and construction judge
+//! a path written through `/System/Volumes/Data` as the plain one; the analysis staging dir is readable and
+//! not writable; the `check_read` test also builds a Bubblewrap sandbox where that is possible.
 
 mod linux;
 
@@ -286,6 +305,14 @@ pub struct Sandbox {
     loom_home: PathBuf,
     oracle_staging_root: PathBuf,
     tmp_dir: PathBuf,
+    /// An isolated replay: inside the loom home its staged workspace and temp are readable, not the temp dir alone.
+    replay: bool,
+    /// `<session dir>/analysis`: where the harness stages the files that binary-analysis backends read. Readable
+    /// (never writable) to the session's commands when it lies inside the loom home; not in a replay.
+    analysis_dir: PathBuf,
+    /// The session's job-output directory when it lies inside the loom home: commands can take the metadata of
+    /// what is in it (their own stdout and stderr files live there), never read or list it.
+    jobs_dir: Option<PathBuf>,
     home: Option<PathBuf>,
     writable: Vec<PathBuf>,
     replay_untrusted: Vec<PathBuf>,
@@ -390,6 +417,25 @@ fn git_directories(workspace: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
+/// macOS names the folders of the data volume `/System/Volumes/Data/...` as well, and `realpath` keeps that
+/// form where it was written. The rules are written in the usual form, so a path in the alias form is
+/// given its usual form back when that names the very same file (same device and inode); otherwise it
+/// stays as it is.
+fn without_data_volume(c: PathBuf) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(rest) = c.strip_prefix("/System/Volumes/Data") else {
+        return c;
+    };
+    if rest.as_os_str().is_empty() {
+        return c;
+    }
+    let usual = Path::new("/").join(rest);
+    match (std::fs::symlink_metadata(&usual), std::fs::symlink_metadata(&c)) {
+        (Ok(a), Ok(b)) if a.dev() == b.dev() && a.ino() == b.ino() => usual,
+        _ => c,
+    }
+}
+
 /// Resolves symlinks in the deepest existing ancestor of `path` and appends the rest. A `..` in the
 /// part that does not exist is an error when `lenient` is false and is applied lexically otherwise.
 fn resolve_path(path: &Path, lenient: bool) -> Result<PathBuf, String> {
@@ -402,7 +448,7 @@ fn resolve_path(path: &Path, lenient: bool) -> Result<PathBuf, String> {
         }
         match prefix.canonicalize() {
             Ok(c) => {
-                base = Some((c, n));
+                base = Some((without_data_volume(c), n));
                 break;
             }
             Err(_) if lenient => {
@@ -585,6 +631,16 @@ impl Sandbox {
                 loom_home.display()
             )));
         }
+        // The loom home is not readable, so a workspace inside it would be a workspace that cannot be read.
+        if under(&workspace, &loom_home) {
+            let who = if cfg.mode == SandboxMode::None { "file tools" } else { "commands and file tools" };
+            return Err(invalid(format!(
+                "the workspace {} is or lies inside the loom home {}, which {who} cannot read. \
+                 Use a workspace outside the loom home.",
+                workspace.display(),
+                loom_home.display()
+            )));
+        }
         let home = match home {
             Some(h) => Some(canon(&h)?),
             None => None,
@@ -716,6 +772,7 @@ impl Sandbox {
         for p in writable.iter().chain(&protected).chain(&unreadable).chain(&credentials).chain(&unix_sockets) {
             sbpl(p)?;
         }
+        let analysis_dir = tmp_dir.parent().map(|p| p.join("analysis")).unwrap_or_default();
         Ok(Sandbox {
             mode: cfg.mode,
             linux_filter,
@@ -725,6 +782,9 @@ impl Sandbox {
             loom_home,
             oracle_staging_root,
             tmp_dir,
+            replay: false,
+            analysis_dir,
+            jobs_dir: None,
             home,
             writable,
             replay_untrusted,
@@ -749,6 +809,22 @@ impl Sandbox {
 
     pub fn tmp_dir(&self) -> &Path {
         &self.tmp_dir
+    }
+
+    /// `<session dir>/analysis`, the harness's staging for binary-analysis inputs: readable to commands and file
+    /// tools (inside the loom home) but never writable to them.
+    pub fn analysis_dir(&self) -> &Path {
+        &self.analysis_dir
+    }
+
+    /// This sandbox with the session's job-output directory named. Commands' own stdout and stderr files are in
+    /// it, so what lies inside the loom home is given a metadata-only exception there (`fstat` of an inherited
+    /// descriptor is a metadata read); its content cannot be read nor can it be listed.
+    pub fn with_jobs_dir(mut self, dir: &Path) -> io::Result<Sandbox> {
+        let dir = resolve_path(dir, true).map_err(invalid)?;
+        sbpl(&dir)?;
+        self.jobs_dir = Some(dir);
+        Ok(self)
     }
 
     /// Harness-owned staging lives outside all sessions, whose mutable temp trees are excluded from
@@ -814,6 +890,7 @@ impl Sandbox {
             loom_core::config::ensure_private_dir(&workspace.join(".loom"))
                 .map_err(|e| format!("Replay state directory cannot be created: {e}. Inspect the staged workspace."))?;
         }
+        replay.replay = true;
         replay.workspace = workspace.clone();
         replay.tmp_dir = tmp.clone();
         replay.writable = vec![workspace.clone(), tmp];
@@ -891,7 +968,42 @@ impl Sandbox {
         let unreadable: Vec<PathBuf> = self.unreadable.iter().chain(&self.credentials).cloned().collect();
         if !unreadable.is_empty() {
             let denied = subpaths(&unreadable);
-            out.push_str(&format!("(deny file-write*{denied})\n(deny file-read*{denied})\n"));
+            out.push_str(&format!("(deny file-write*{denied})\n(deny file-read* file-test-existence{denied})\n"));
+        }
+        // The whole loom home is unreadable but for what a session or replay works in: the home entry and the
+        // directories down to it can be looked up (stat, `cd`, `pwd -P`), not listed. A not-readable path at,
+        // inside or around what was opened again is denied once more, as the rule above would otherwise lose.
+        if let Ok(h) = sbpl(&self.loom_home) {
+            let open = self.open_in_home();
+            let mut lookup = vec![self.loom_home.clone()];
+            for dir in &open {
+                for a in dir.ancestors().skip(1) {
+                    if a != self.loom_home && under(a, &self.loom_home) {
+                        push_unique(&mut lookup, a.to_path_buf());
+                    }
+                }
+            }
+            lookup.sort();
+            let literals: String =
+                lookup.iter().filter_map(|p| sbpl(p).ok()).map(|s| format!(" (literal \"{s}\")")).collect();
+            // `file-read*` does not cover `file-test-existence`: without it a command could still ask the kernel
+            // for the name of every file under the home by its id (`fsgetpath`), so the names are denied too.
+            out.push_str(&format!(
+                "(deny file-read* file-test-existence (subpath \"{h}\"))\n\
+                 (allow file-read-metadata file-test-existence{literals})\n\
+                 (allow file-read* file-test-existence{})\n",
+                subpaths(&open)
+            ));
+            let again: Vec<PathBuf> =
+                unreadable.iter().filter(|u| open.iter().any(|o| under(u, o) || under(o, u))).cloned().collect();
+            if !again.is_empty() {
+                out.push_str(&format!("(deny file-read* file-test-existence{})\n", subpaths(&again)));
+            }
+            // The job output files are the commands' own stdout and stderr: their metadata can be read (Python
+            // and `cat` take it of the inherited descriptors), their content and the directory cannot.
+            if let Some(jobs) = self.jobs_dir.as_ref().filter(|j| under(j, &self.loom_home)) {
+                out.push_str(&format!("(allow file-read-metadata{})\n", subpaths(std::slice::from_ref(jobs))));
+            }
         }
         // Nor can a directory that holds one be moved, or made as a link where it is missing.
         let holders = self.holders();
@@ -905,7 +1017,8 @@ impl Sandbox {
         }
         // Opening an application or URL through LaunchServices, driving one with Apple Events, or handing
         // launchd a job, runs code outside the sandbox.
-        out.push_str("(deny lsopen)\n(deny appleevent-send)\n(deny job-creation)\n");
+        // `searchfs(2)` finds files by name across a volume, the home's among them.
+        out.push_str("(deny lsopen)\n(deny appleevent-send)\n(deny job-creation)\n(deny file-search)\n");
         out.push_str("(deny network*)\n");
         if self.loopback_all {
             out.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
@@ -920,6 +1033,18 @@ impl Sandbox {
         out.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
         out.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
         Some(out)
+    }
+
+    /// What is readable inside the loom home: the session temp dir and the analysis staging dir, or in a replay its
+    /// staged workspace and temp.
+    fn open_in_home(&self) -> Vec<PathBuf> {
+        if self.replay {
+            vec![self.workspace.clone(), self.tmp_dir.clone()]
+        } else if under(&self.analysis_dir, &self.loom_home) {
+            vec![self.tmp_dir.clone(), self.analysis_dir.clone()]
+        } else {
+            vec![self.tmp_dir.clone()]
+        }
     }
 
     /// Protected paths that are the session temp dir or lie inside it; they stay protected.
@@ -988,6 +1113,35 @@ impl Sandbox {
                 "{} is not readable: {} is a credential store, off limits to commands and file tools. Read something else, or ask the user to set `sandbox.protect_credentials = false` if this is wrong.",
                 r.display(),
                 rule.display()
+            ));
+        }
+        if under(&r, &self.loom_home) && !self.open_in_home().iter().any(|o| r.starts_with(o)) {
+            let who = if self.mode == SandboxMode::None { "file tools" } else { "commands and file tools" };
+            let (allowed, instead) = if self.replay {
+                (
+                    format!(
+                        "this replay's staged workspace {} and temp dir {}",
+                        self.workspace.display(),
+                        self.tmp_dir.display()
+                    ),
+                    "the staged workspace or temp dir",
+                )
+            } else if self.open_in_home().len() > 1 {
+                (
+                    format!(
+                        "the session temp dir {} and the analysis staging dir {}",
+                        self.tmp_dir.display(),
+                        self.analysis_dir.display()
+                    ),
+                    "the workspace or the session temp dir",
+                )
+            } else {
+                (format!("the session temp dir {}", self.tmp_dir.display()), "the workspace or the session temp dir")
+            };
+            return Err(format!(
+                "{} is not readable: it lies inside the loom home {}, which {who} cannot read except {allowed}. Read a file in {instead} instead.",
+                r.display(),
+                self.loom_home.display(),
             ));
         }
         Ok(r)
@@ -1107,14 +1261,44 @@ impl Sandbox {
         } else {
             String::new()
         };
+        let home = self.loom_home.display();
+        let file_tools_only = self.mode == SandboxMode::None;
+        let own = match (self.replay, file_tools_only) {
+            (true, true) => format!(
+                " File tools also refuse to read loom's own files under {home}, except this replay's staged workspace and temp dir {tmp}.",
+                tmp = tmp.display()
+            ),
+            (true, false) => format!(
+                "Loom's own files under {home} are not readable, except this replay's staged workspace and temp dir {tmp}.",
+                tmp = tmp.display()
+            ),
+            (false, _) => {
+                let analysis = if self.open_in_home().len() > 1 {
+                    format!(" and the analysis staging dir {}", self.analysis_dir.display())
+                } else {
+                    String::new()
+                };
+                if file_tools_only {
+                    format!(
+                        " File tools also refuse to read loom's own files under {home} (logs, records, stored outputs, configuration), except the session temp dir {tmp}{analysis}.",
+                        tmp = tmp.display()
+                    )
+                } else {
+                    format!(
+                        "Loom's own files under {home} (logs, records, stored outputs, configuration) are not readable, except the session temp dir {tmp}{analysis}.",
+                        tmp = tmp.display()
+                    )
+                }
+            }
+        };
         if self.mode == SandboxMode::None {
             return format!(
                 "Commands are not confined by an operating-system sandbox: they can read and write anything this user can. \
-                 File tools still refuse to write under {protected} and to read or write {unreadable}.{exception}{credentials}"
+                 File tools still refuse to write under {protected} and to read or write {unreadable}.{exception}{credentials}{own}"
             );
         }
         if self.mode == SandboxMode::Bubblewrap {
-            return format!("Commands run in Linux bubblewrap with a read-only host filesystem, writable roots {}, a private /tmp, and all socket creation/connections denied. Protected paths {protected} and discovered Git metadata remain read-only; credential paths are hidden.{exception} New Git repositories must be created by the operator outside the session. File tools additionally refuse Git config and hook writes.", join_list(&self.writable));
+            return format!("Commands run in Linux bubblewrap with a read-only host filesystem, writable roots {}, a private /tmp, and all socket creation/connections denied. Protected paths {protected} and discovered Git metadata remain read-only; credential paths are hidden. {own}{exception} New Git repositories must be created by the operator outside the session. File tools additionally refuse Git config and hook writes.", join_list(&self.writable));
         }
         let ports = if self.loopback_all {
             "any loopback port".to_string()
@@ -1130,7 +1314,7 @@ impl Sandbox {
         };
         format!(
             "Commands and file tools may write only under {}; writes under {protected} are refused even there.{exception} \
-             {unreadable} cannot be read or written.{credentials} \
+             {unreadable} cannot be read or written. {own}{credentials} \
              Direct network access is blocked except connections to {ports}{sockets}; reach other hosts through the proxy named in the environment, if there is one.",
             join_list(&self.writable)
         )
@@ -1216,10 +1400,13 @@ mod tests {
              (allow file-write* (subpath \"{r}/tmp\"))\n\
              (deny file-write-unlink file-write-create (literal \"{r}/tmp\"))\n\
              (deny file-write* (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\") (subpath \"{r}/ws/.loom/oracle-secrets\") (subpath \"{r}/hidden\"))\n\
-             (deny file-read* (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\") (subpath \"{r}/ws/.loom/oracle-secrets\") (subpath \"{r}/hidden\"))\n\
+             (deny file-read* file-test-existence (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\") (subpath \"{r}/ws/.loom/oracle-secrets\") (subpath \"{r}/hidden\"))\n\
+             (deny file-read* file-test-existence (subpath \"{r}/home\"))\n\
+             (allow file-read-metadata file-test-existence (literal \"{r}/home\"))\n\
+             (allow file-read* file-test-existence (subpath \"{r}/tmp\"))\n\
              (deny file-write-unlink{holders})\n\
              (deny file-write-create (require-all (vnode-type SYMLINK) (require-any{holders})))\n\
-             (deny lsopen)\n(deny appleevent-send)\n(deny job-creation)\n\
+             (deny lsopen)\n(deny appleevent-send)\n(deny job-creation)\n(deny file-search)\n\
              (deny network*)\n\
              (allow network-outbound (remote ip \"localhost:8080\"))\n\
              (allow network-outbound (remote ip \"localhost:9000\"))\n\
@@ -1594,7 +1781,8 @@ mod tests {
         assert!(sb.check_read(&f.home.join("keys/k")).is_err());
         let e = sb.check_read(&f.root.join("hidden/x")).expect_err("configured");
         assert!(e.contains("`sandbox.unreadable_paths`") && !e.contains("protect_credentials"), "{e}");
-        assert!(sb.check_read(&f.home.join("other")).is_ok());
+        // Nothing else in the loom home is readable either.
+        assert!(sb.check_read(&f.home.join("other")).expect_err("loom home").contains("loom home"));
         assert!(sb.check_read(&f.ws.join("anything")).is_ok());
         assert!(sb.check_read(Path::new("/usr/bin/env")).is_ok());
         // A link cannot be used to read around the rule.
@@ -1679,7 +1867,7 @@ mod tests {
         let p = sb.profile().expect("profile");
         let ws = s(&f.ws);
         // Removed, the link could be replaced by a directory of the command's own: both spellings are denied.
-        for rule in ["(deny file-write* (subpath", "(deny file-read* (subpath"] {
+        for rule in ["(deny file-write* (subpath", "(deny file-read* file-test-existence (subpath"] {
             let line = p.lines().find(|l| l.starts_with(rule) && l.contains("/Sync/ssh\"")).expect(rule);
             for denied in [".ssh", "Sync/ssh", ".cargo/credentials", "Sync/cargo/credentials", "hidden", "Sync/hidden"]
             {
@@ -2330,7 +2518,375 @@ mod tests {
         assert!(!run(&sb, &f.ws, &format!("cat {}/f", s(&hidden))).0);
         assert!(!run(&sb, &f.ws, &format!("ls {}", s(&hidden))).0);
         let (ok, text) = run(&sb, &f.ws, &format!("cat {h}/other"));
-        assert!(ok && text == "visible", "{text}");
+        assert!(!ok && text.contains("Operation not permitted") && !text.contains("visible"), "{text}");
+    }
+
+    /// `path` written through the data volume (`/System/Volumes/Data/...`), when macOS has it that way.
+    #[cfg(target_os = "macos")]
+    fn data_volume(path: &Path) -> Option<PathBuf> {
+        let aliased = Path::new("/System/Volumes/Data").join(path.strip_prefix("/").ok()?);
+        aliased.exists().then_some(aliased)
+    }
+
+    /// The production layout with another session, a stored output, a mission journal, logs, configuration and a pack.
+    fn fx_home_files() -> Fx {
+        let f = fx_prod();
+        for (rel, body) in [
+            ("sessions/s2/log.jsonl", "OTHER-LOG"),
+            ("sessions/s2/tmp/note", "other temp"),
+            ("blobs/aa/x", "STORED-OUTPUT"),
+            ("missions/m1/journal.jsonl", "JOURNAL"),
+            ("logs/daemon.log", "DAEMON-LOG"),
+            ("config.toml", "CONFIG"),
+            ("packs/p1/pack.toml", "PACK"),
+        ] {
+            let p = f.home.join(rel);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(p, body).expect("write");
+        }
+        f
+    }
+
+    #[test]
+    fn check_read_refuses_the_whole_loom_home_but_the_session_temp_dir_in_every_mode() {
+        let f = fx_home_files();
+        std::fs::write(f.tmp.join("mine"), "fine").expect("write");
+        symlink(f.home.join("sessions/s1/log.jsonl"), f.ws.join("log-link")).expect("symlink");
+        symlink(f.home.join("sessions"), f.ws.join("sessions-link")).expect("symlink");
+        let mut modes = vec![SandboxMode::Seatbelt, SandboxMode::None];
+        // Built with `expect` (in `build`): where bubblewrap can exist, a failure to build it is a failure here.
+        if cfg!(target_os = "linux") && Path::new(BWRAP).exists() {
+            modes.push(SandboxMode::Bubblewrap);
+        }
+        for mode in modes {
+            let sb = build(&f, &cfg(mode), None);
+            for rel in [
+                "sessions/s1/log.jsonl",
+                "sessions/s2/log.jsonl",
+                "sessions/s2/tmp/note",
+                "blobs/aa/x",
+                "missions/m1/journal.jsonl",
+                "logs/daemon.log",
+                "logs",
+                "config.toml",
+                "packs/p1/pack.toml",
+                "sessions",
+                "sessions/s1",
+                "other",
+                "",
+            ] {
+                let path = f.home.join(rel);
+                let e = sb.check_read(&path).expect_err(rel);
+                assert!(e.contains("not readable") && e.contains(&format!("loom home {}", s(&f.home))), "{rel}: {e}");
+                assert!(!e.contains("OTHER-LOG") && !e.contains("STORED-OUTPUT"), "{e}");
+            }
+            // A link in the workspace that resolves into the loom home grants nothing.
+            assert!(sb.check_read(&f.ws.join("log-link")).is_err());
+            assert!(sb.check_read(&f.ws.join("sessions-link/s2/log.jsonl")).is_err());
+            // macOS also names the data volume's folders under `/System/Volumes/Data`: the same files, the same refusal.
+            #[cfg(target_os = "macos")]
+            if let Some(data) = data_volume(&f.home) {
+                for rel in
+                    ["sessions/s2/log.jsonl", "blobs/aa/x", "config.toml", "logs", "sessions", "", "token", "keys/k"]
+                {
+                    let e = sb.check_read(&data.join(rel)).expect_err(rel);
+                    assert!(e.contains("not readable") && e.contains(s(&f.home)), "{rel}: {e}");
+                }
+                let alias_tmp = Path::new("/System/Volumes/Data").join(f.tmp.strip_prefix("/").expect("absolute"));
+                assert!(sb.check_read(&alias_tmp.join("mine")).is_ok());
+            }
+            // The session temp dir and the workspace are readable.
+            assert!(sb.check_read(&f.tmp.join("mine")).is_ok());
+            assert!(sb.check_read(&f.tmp.join("not/yet/there")).is_ok());
+            assert!(sb.check_read(&f.tmp).is_ok());
+            assert!(sb.check_read(&f.ws.join("anything")).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_workspace_that_is_or_lies_inside_the_loom_home_is_refused() {
+        let f = fx_prod();
+        let inside = f.home.join("sessions/s1/ws");
+        std::fs::create_dir_all(&inside).expect("mkdir");
+        symlink(&inside, f.root.join("ws-link")).expect("symlink");
+        #[allow(unused_mut)]
+        let mut workspaces = vec![f.home.clone(), f.home.join("sessions"), inside.clone(), f.root.join("ws-link")];
+        // The same directories written through the data volume.
+        #[cfg(target_os = "macos")]
+        workspaces.extend([&f.home, &inside].into_iter().filter_map(|p| data_volume(p)));
+        for ws in workspaces {
+            for mode in [SandboxMode::Seatbelt, SandboxMode::None] {
+                let e = Sandbox::new(&cfg(mode), &ws, &f.tmp, &f.home, None).expect_err("workspace in the loom home");
+                let e = e.to_string();
+                assert!(
+                    e.contains("workspace") && e.contains(s(&f.home)) && e.contains("outside the loom home"),
+                    "{e}"
+                );
+            }
+        }
+        // A workspace that holds the loom home is not inside it.
+        assert!(Sandbox::new(&cfg(SandboxMode::Seatbelt), &f.root, &f.tmp, &f.home, None).is_ok());
+    }
+
+    #[test]
+    fn the_profile_hides_the_loom_home_but_the_session_temp_dir_and_its_ancestors_can_be_looked_up() {
+        let f = fx_prod();
+        let c = SandboxCfg { unreadable_paths: vec![format!("{}/secret", s(&f.tmp))], ..cfg(SandboxMode::Seatbelt) };
+        let jobs = f.home.join("sessions/s1/jobs");
+        let p = build(&f, &c, None).with_jobs_dir(&jobs).expect("jobs dir").profile().expect("profile");
+        let (h, t, a) = (s(&f.home), s(&f.tmp), format!("{}/sessions/s1/analysis", s(&f.home)));
+        // Names are hidden as well as content: `file-read*` alone leaves `fsgetpath` and `searchfs` their way.
+        let deny = p.find(&format!("(deny file-read* file-test-existence (subpath \"{h}\"))\n")).expect("home deny");
+        let meta_line =
+            format!("(allow file-read-metadata file-test-existence (literal \"{h}\") (literal \"{h}/sessions\") (literal \"{h}/sessions/s1\"))\n");
+        let meta = p.find(&meta_line).expect("lookup of the ancestors, not listing and not the temp dir");
+        let allow = p
+            .find(&format!("(allow file-read* file-test-existence (subpath \"{t}\") (subpath \"{a}\"))\n"))
+            .expect("temp dir and analysis staging read");
+        let again = p
+            .rfind(&format!("(deny file-read* file-test-existence (subpath \"{t}/secret\"))\n"))
+            .expect("unreadable inside the temp dir");
+        let jobs_allow =
+            p.find(&format!("(allow file-read-metadata (subpath \"{h}/sessions/s1/jobs\"))\n")).expect("jobs metadata");
+        assert!(deny < meta && meta < allow && allow < again && again < jobs_allow, "later rules win: {p}");
+        // The credential and configured denials precede the home rule; they are all above the allow.
+        let first =
+            p.find(&format!("(deny file-read* file-test-existence (subpath \"{h}/token\")")).expect("token deny");
+        assert!(first < deny, "{p}");
+        // The jobs directory gets the metadata of what is in it and nothing else: no read, not even its existence.
+        assert_eq!(p.matches(&format!("{h}/sessions/s1/jobs")).count(), 1, "{p}");
+        // The temp dir itself is given a full read grant, never a metadata-only one.
+        assert!(
+            p.lines()
+                .filter(|l| l.starts_with("(allow file-read-metadata"))
+                .all(|l| !l.contains(&format!("(literal \"{t}\")"))),
+            "{p}"
+        );
+        // Searching the volume by name is denied for everything.
+        assert!(p.contains("(deny file-search)\n"), "{p}");
+        // Without a jobs directory there is no such line.
+        let plain = build(&f, &c, None).profile().expect("profile");
+        assert!(!plain.contains("jobs"), "{plain}");
+    }
+
+    #[test]
+    fn a_replay_reads_its_staged_workspace_and_temp_and_not_the_callers_temp_dir() {
+        let f = fx_home_files();
+        let jobs = f.home.join("sessions/s1/jobs");
+        let caller = build(&f, &cfg(SandboxMode::Seatbelt), None).with_jobs_dir(&jobs).expect("jobs dir");
+        let private = caller.oracle_staging_root().join("run-1");
+        let (ws, tmp) = (private.join("workspace"), private.join("tmp"));
+        for d in [&ws, &tmp] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        std::fs::write(ws.join("source"), "original").expect("write");
+        std::fs::write(tmp.join("result"), "mine").expect("write");
+        std::fs::write(f.tmp.join("caller-file"), "caller").expect("write");
+        {
+            let replay = caller.isolated_replay(&ws, &tmp).expect("replay");
+            assert!(replay.check_read(&ws.join("source")).is_ok());
+            assert!(replay.check_read(&tmp.join("result")).is_ok());
+            assert!(replay.check_read(&f.tmp.join("caller-file")).is_err());
+            assert!(replay.check_read(&f.home.join("sessions/s2/log.jsonl")).is_err());
+            assert!(replay.check_read(&f.home.join("blobs/aa/x")).is_err());
+            assert!(replay.check_read(&private.join("..").join("other-run")).is_err());
+            assert!(replay.describe().contains("replay"), "{}", replay.describe());
+            // The refusal names what is readable: the staged workspace and temp, not the caller's temp dir.
+            let e = replay.check_read(&f.home.join("blobs/aa/x")).expect_err("loom home");
+            assert!(e.contains("this replay's staged workspace") && e.contains(s(&ws)) && e.contains(s(&tmp)), "{e}");
+            assert!(!e.contains(s(&f.tmp)) && !e.contains("STORED-OUTPUT"), "{e}");
+            let p = replay.profile().expect("profile");
+            let (h, o) = (s(&f.home), s(caller.oracle_staging_root()));
+            assert!(
+                p.contains(&format!(
+                    "(allow file-read-metadata file-test-existence (literal \"{h}\") (literal \"{o}\") (literal \"{}\"))\n",
+                    s(&private)
+                )),
+                "{p}"
+            );
+            assert!(
+                p.contains(&format!(
+                    "(allow file-read* file-test-existence (subpath \"{}\") (subpath \"{}\"))\n",
+                    s(&ws),
+                    s(&tmp)
+                )),
+                "{p}"
+            );
+            assert!(p.lines().filter(|l| l.starts_with("(allow file-read*")).all(|l| !l.contains(s(&f.tmp))), "{p}");
+            // The caller's job files keep their metadata exception, after the denial of the sessions directory.
+            let sessions = p.rfind(&format!("(subpath \"{h}/sessions\")")).expect("sessions denied");
+            let jobs_allow = p.find(&format!("(allow file-read-metadata (subpath \"{}\"))\n", s(&jobs))).expect("jobs");
+            assert!(sessions < jobs_allow, "{p}");
+        }
+        if available() {
+            let replay = caller.isolated_replay(&ws, &tmp).expect("replay");
+            let (ok, text) = run(&replay, &ws, "cat source; cat \"$TMPDIR/result\"");
+            assert!(ok && text == "originalmine", "{text}");
+            assert!(!run(&replay, &ws, &format!("cat {}/caller-file", s(&f.tmp))).0);
+            assert!(!run(&replay, &ws, &format!("cat {}/blobs/aa/x", s(&f.home))).0);
+        }
+    }
+
+    #[test]
+    fn describe_says_loom_own_files_are_not_readable() {
+        let f = fx_prod();
+        for mode in [SandboxMode::Seatbelt, SandboxMode::None, SandboxMode::Bubblewrap] {
+            // Bubblewrap cannot be built on every host; its text needs only the fields describe reads.
+            let sb = match Sandbox::new(&cfg(mode), &f.ws, &f.tmp, &f.home, None) {
+                Ok(sb) => sb,
+                Err(_) if mode == SandboxMode::Bubblewrap => continue,
+                Err(e) => panic!("{e}"),
+            };
+            let d = sb.describe();
+            let analysis = format!("{}/sessions/s1/analysis", s(&f.home));
+            if mode == SandboxMode::None {
+                // Commands are not confined in this mode: the rule is the file tools' own, and is worded as theirs.
+                assert!(
+                    d.contains("File tools also refuse to read loom's own files under")
+                        && d.contains(s(&f.tmp))
+                        && !d.contains("Loom's own files")
+                        && !d.contains("not readable"),
+                    "{d}"
+                );
+            } else {
+                assert!(d.contains("Loom's own files") && d.contains("not readable") && d.contains(s(&f.tmp)), "{d}");
+            }
+            assert!(d.contains(&format!("the analysis staging dir {analysis}")), "{d}");
+        }
+        // A replay (never in mode none) names its staged workspace and temp instead.
+        let caller = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let private = caller.oracle_staging_root().join("run-d");
+        let (ws, tmp) = (private.join("workspace"), private.join("tmp"));
+        for d in [&ws, &tmp] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        let d = caller.isolated_replay(&ws, &tmp).expect("replay").describe();
+        assert!(
+            d.contains("except this replay's staged workspace and temp dir") && !d.contains("analysis staging"),
+            "{d}"
+        );
+    }
+
+    #[test]
+    fn commands_cannot_read_the_loom_home_but_work_in_the_session_temp_dir() {
+        if !available() {
+            return;
+        }
+        let f = fx_home_files();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let h = s(&f.home);
+        for rel in
+            ["sessions/s1/log.jsonl", "sessions/s2/log.jsonl", "blobs/aa/x", "config.toml", "missions/m1/journal.jsonl"]
+        {
+            let (ok, text) = run(&sb, &f.ws, &format!("cat {h}/{rel}"));
+            assert!(
+                !ok && text.contains("Operation not permitted") && !text.contains("LOG") && !text.contains("STORED"),
+                "{rel}: {text}"
+            );
+        }
+        for dir in ["sessions", "blobs", "", "sessions/s2"] {
+            assert!(!run(&sb, &f.ws, &format!("ls '{h}/{dir}'")).0, "{dir} is listable");
+        }
+        // The home entry and the directories down to the temp dir can be looked up, not listed.
+        for dir in ["", "/sessions", "/sessions/s1"] {
+            let (ok, text) = run(&sb, &f.ws, &format!("stat -f %N '{h}{dir}'"));
+            assert!(ok && text.trim() == format!("{h}{dir}"), "{dir}: {text}");
+        }
+        // The temp dir works: write and read back, mkdir -p, cd and pwd -P, a tool that makes a temp file.
+        let (ok, text) = run(&sb, &f.ws, "echo hi > \"$TMPDIR/f\" && cat \"$TMPDIR/f\"");
+        assert!(ok && text == "hi\n", "{text}");
+        let (ok, text) = run(&sb, &f.ws, "mkdir -p \"$TMPDIR/a/b/c\" && cd \"$TMPDIR/a/b/c\" && pwd -P");
+        assert!(ok && text.trim() == format!("{}/a/b/c", s(&f.tmp)), "{text}");
+        let (ok, text) = run(&sb, &f.ws, "cd \"$TMPDIR\" && pwd -P && ls");
+        assert!(ok && text.starts_with(s(&f.tmp)) && text.contains('f'), "{text}");
+        if Path::new("/usr/bin/python3").exists() {
+            let script = "python3 -c 'import tempfile; f = tempfile.NamedTemporaryFile(); f.write(b\"x\"); f.flush(); print(f.name)'";
+            let (ok, text) = run(&sb, &f.ws, script);
+            assert!(ok && text.trim().starts_with(s(&f.tmp)), "{text}");
+        }
+    }
+
+    /// The kernel can name a file by its id (`fsgetpath`), whatever the profile says of reading it, unless the
+    /// existence of what is under the loom home is denied as well. Ids near the home's own are asked for.
+    #[test]
+    fn commands_cannot_list_the_loom_home_by_file_id() {
+        if !available() || !Path::new("/usr/bin/python3").exists() {
+            return;
+        }
+        let f = fx_home_files();
+        let fake = f.root.join("fakehome-ids");
+        std::fs::create_dir_all(fake.join(".ssh")).expect("mkdir");
+        std::fs::write(fake.join(".ssh/id"), "CRED-SECRET").expect("write");
+        std::fs::write(f.home.join("token"), "t0ken").expect("write");
+        std::fs::write(f.tmp.join("note"), "mine").expect("write");
+        let script = f.tmp.join("ids.py");
+        std::fs::write(
+            &script,
+            "import ctypes, os, sys\n\
+             libc = ctypes.CDLL(None)\n\
+             buf = ctypes.create_string_buffer(2200)\n\
+             out = ctypes.create_string_buffer(1024)\n\
+             for root in sys.argv[1:]:\n\
+             \x20   if libc.statfs(root.encode(), buf) != 0:\n\
+             \x20       continue\n\
+             \x20   fsid = (ctypes.c_int32 * 2).from_buffer_copy(buf.raw[48:56])\n\
+             \x20   ino = os.stat(root).st_ino\n\
+             \x20   for i in range(max(1, ino - 100), ino + 5000):\n\
+             \x20       if libc.fsgetpath(out, 1024, ctypes.byref(fsid), ctypes.c_uint64(i)) > 0:\n\
+             \x20           print('FOUND ' + out.value.decode(errors='replace'))\n",
+        )
+        .expect("write");
+        let sb = build_home(&f, &cfg(SandboxMode::Seatbelt), &fake);
+        let (h, t) = (s(&f.home).to_string(), s(&f.tmp).to_string());
+        let (ok, text) = run(&sb, &f.ws, &format!("python3 -I '{}' '{h}' '{}'", s(&script), s(&fake)));
+        assert!(ok, "{text}");
+        let found: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("FOUND ")).collect();
+        // The probe works: the home, the temp dir and what is in it are named.
+        assert!(found.contains(&h.as_str()) && found.iter().any(|p| p.ends_with("/tmp/note")), "{text}");
+        let allowed = [h.clone(), format!("{h}/sessions"), format!("{h}/sessions/s1")];
+        // Other tests make files on the same volume at the same time: only what lies in this fixture is judged.
+        let (root, creds) = (s(&f.root).to_string(), format!("{}/.ssh", s(&fake)));
+        for path in found.iter().filter(|p| p.starts_with(&root)) {
+            let own = path.starts_with(&format!("{t}/")) || *path == t;
+            let under_home = *path == h || path.starts_with(&format!("{h}/"));
+            assert!(!under_home || own || allowed.iter().any(|a| a == path), "named by file id: {path}");
+            assert!(
+                !(*path == creds || path.starts_with(&format!("{creds}/"))),
+                "a credential store was named: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hard_link_from_the_temp_dir_does_not_make_what_is_not_readable_readable() {
+        if !available() {
+            return;
+        }
+        let f = fx_home_files();
+        let fake = f.root.join("fakehome-links");
+        std::fs::create_dir_all(fake.join(".ssh")).expect("mkdir");
+        std::fs::write(fake.join(".ssh/id"), "CRED-SECRET").expect("write");
+        std::fs::write(f.ws.join("plain"), "plain").expect("write");
+        let sb = build_home(&f, &cfg(SandboxMode::Seatbelt), &fake);
+        let h = s(&f.home);
+        let sources = [
+            (format!("{h}/sessions/s1/log.jsonl"), "{}"),
+            (format!("{h}/sessions/s2/log.jsonl"), "OTHER-LOG"),
+            (format!("{h}/blobs/aa/x"), "STORED-OUTPUT"),
+            (format!("{h}/token"), "t0ken"),
+            (format!("{}/.ssh/id", s(&fake)), "CRED-SECRET"),
+        ];
+        for (src, secret) in sources {
+            for link in ["ln", "ln -s", "cp -c", "cp -l"] {
+                let script = format!("{link} '{src}' \"$TMPDIR/l\" && cat \"$TMPDIR/l\"");
+                let (ok, text) = run(&sb, &f.ws, &script);
+                assert!(!(ok && text.contains(secret)), "`{link}` made {src} readable: {text}");
+                let _ = std::fs::remove_file(f.tmp.join("l"));
+            }
+        }
+        // The control: a link to a readable file reads.
+        let (ok, text) = run(&sb, &f.ws, &format!("ln '{}/plain' \"$TMPDIR/l\" && cat \"$TMPDIR/l\"", s(&f.ws)));
+        assert!(ok && text == "plain", "{text}");
     }
 
     #[test]
