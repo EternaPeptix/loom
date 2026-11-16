@@ -11,12 +11,21 @@
 //!   is writable all the same — but not the directory entry itself (it cannot be removed, renamed,
 //!   replaced or made anew, yet tests as writable), and not a protected path that is the temp dir or
 //!   lies inside it. A temp dir that is `/`, or is or contains the loom home, is refused at construction;
-//! - not readable: `<loom home>/token`, `<loom home>/keys`, `<workspace>/.loom/oracle-secrets`, `cfg.unreadable_paths` (`~` expands to
+//! - not readable: the whole loom home — its records, stored outputs, journals, logs, configuration,
+//!   packs, `token` and `keys` among them — except the session temp dir (in an isolated replay: its
+//!   staged workspace and temp instead), so a command or file tool cannot read another session's or its
+//!   own log, a stored output, or an earlier mission's results, as Bubblewrap already hides the home. The
+//!   loom home's own entry and each directory between it and that temp dir can be looked up (their
+//!   metadata read) but not listed or read. Also not readable: `<workspace>/.loom/oracle-secrets`,
+//!   `cfg.unreadable_paths` (`~` expands to
 //!   the home directory) and, unless `cfg.protect_credentials` is off, the user's credential stores
 //!   (`CREDENTIAL_PATHS` under the home directory). A credential store that is or contains the
 //!   workspace is skipped, so the workspace stays readable; when the home directory is not known the
-//!   stores cannot be located and construction is refused. What is not readable is not writable
-//!   either, wherever it lies (a command could otherwise rename it and read it under the new name);
+//!   stores cannot be located and construction is refused. A workspace that is or lies inside the loom
+//!   home is refused at construction (only `isolated_replay` places one there). What is not readable is
+//!   not writable either, wherever it lies (a command could otherwise rename it and read it under the new
+//!   name); a hard link made where reads are allowed to a file that is not readable must not make it
+//!   readable (test this on macOS: the profile is path-based);
 //! - a directory where writes are allowed that holds a never-writable or not-readable path, or the
 //!   session temp dir, cannot be removed or renamed, nor made as a link where it does not exist yet:
 //!   that would carry what it holds out of its rule. A missing one can still be made by moving a
@@ -53,6 +62,10 @@
 //! (deny file-write* (subpath "<protected, at or inside the temp dir>") …)
 //! (deny file-write* (subpath "<unreadable or credential store>") …)
 //! (deny file-read* (subpath "<unreadable or credential store>") …)
+//! (deny file-read* (subpath "<loom home>"))
+//! (allow file-read-metadata (literal "<loom home>") (literal "<each directory down to the session temp dir>") …)
+//! (allow file-read* (subpath "<session temp dir>"))          ; a replay: its staged workspace and temp
+//! (deny file-read* (subpath "<unreadable or credential store at or inside those>") …)
 //! (deny file-write-unlink (literal "<writable directory that holds one of the above>") …)
 //! (deny file-write-create (require-all (vnode-type SYMLINK) (require-any (literal "<same directory>") …)))
 //! (deny lsopen)
@@ -94,8 +107,11 @@
 //! the workspace that points outside it does not grant access. Returns the resolved path, or a
 //! sentence: which path, which rule refused it, and what is allowed (for writes, the writable roots).
 //! `check_write` lets the session temp dir through the never-writable rules, as the profile does, and
-//! refuses what is not readable and the temp dir entry itself wherever they lie. In mode `none` only
-//! the never-writable and not-readable rules apply.
+//! refuses what is not readable and the temp dir entry itself wherever they lie. `check_read` refuses
+//! everything under the loom home except the session temp dir (a replay: its staged workspace and
+//! temp), naming the loom home as the reason without echoing what lies there. In mode `none` only
+//! the never-writable and not-readable rules apply (the loom home rule included: it is the file tools'
+//! own rule in that mode).
 //!
 //! ## `oracle_staging_root()` / `isolated_replay(workspace, tmp)`
 //! Staging is `<loom home>/oracle-runs`, outside all session temp trees. The harness creates a private
@@ -104,7 +120,8 @@
 //! separate temp is writable. Existing read/credential/network restrictions remain; Linux sources
 //! are repinned. All prior workspace/temp/extra writable origins and `<loom home>/sessions` become
 //! unreadable, including future sibling temp paths, so an interpreter cannot load actor-modified
-//! originals instead of pinned copies. Read-only roles retain removed global extra writable paths
+//! originals instead of pinned copies. Inside the loom home only the staged workspace and temp are
+//! readable (the caller's session temp dir is not). Read-only roles retain removed global extra writable paths
 //! as internal metadata for this exclusion; normal verifier reads are unchanged. Any origin that
 //! contains staging is refused, rather than allowing read exceptions inside an untrusted tree.
 //! Linux refuses missing origins outside an already hidden private parent.
@@ -129,7 +146,8 @@
 //!
 //! ## `describe()`
 //! Two or three plain sentences for the system prompt: where commands may write, what they may not
-//! read (credential stores included, when protected), how network access works. Deterministic. In
+//! read (loom's own files other than the session temp dir, and credential stores when protected), how
+//! network access works. Deterministic. In
 //! mode `none` it says commands are not confined and what the file tools still refuse.
 //!
 //! ## `preflight(cfg)`
@@ -140,9 +158,17 @@
 //! Tests required: profile text for a representative config (exact string); escaping; canonical
 //! paths; `check_write`/`check_read` accept and refuse per rule, including a symlink escape, a
 //! not-yet-existing file in a writable dir, `..`, and the protected directory inside the workspace;
-//! mode `none`; `resolve`; `env` scrubbing and `env_pass`. Tests that execute `sandbox-exec` are
+//! mode `none`; `resolve`; `env` scrubbing and `env_pass`; `check_read` refuses, in every mode, the
+//! session's own and another session's `log.jsonl`, a stored output under `blobs/`, a mission journal,
+//! `logs/`, `config.toml`, an installed pack, a listing of `<loom home>/sessions`, and a workspace
+//! symlink that resolves into the loom home, while a file in the session temp dir is accepted; a
+//! replay accepts its staged workspace and temp and refuses the caller's temp dir; a workspace inside
+//! the loom home is refused at construction. Tests that execute `sandbox-exec` are
 //! welcome when `/usr/bin/sandbox-exec` exists (skip otherwise): a write inside the workspace
-//! succeeds, a write outside fails, a read of an unreadable path fails.
+//! succeeds, a write outside fails, a read of an unreadable path fails; `cat` of a session log, a blob
+//! and `config.toml` and `ls` of `<loom home>/sessions` fail; in `$TMPDIR` a file can be written and
+//! read back, `mkdir -p` and `cd` + `pwd -P` work; a hard link from `$TMPDIR` to a file under the
+//! loom home (and to a credential store file) is refused or reads nothing.
 
 mod linux;
 
