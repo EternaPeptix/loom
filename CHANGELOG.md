@@ -32,6 +32,20 @@
   change the groups. The model seat is disabled for ended sessions and per-session while switching.
 - `loom ls` shows a MODEL column (the session's profile) after ROLE.
 
+### security_record reads near misses
+
+- `security_record` now reads an operation where its meaning is unambiguous (`ops`/`items` for
+  `operations`, wrapper fields at the top level, `username` for `principal`, a `hypothesis: {...}` wrapper,
+  word priorities, `verdict` for `status`, `host:port` or URL host locators, a method or trailing text on a
+  URL, a path under its `parent`) and lists each rewrite under a new `normalized` key of the result; the
+  key is present only when something was rewritten. Everything else is refused with the exact shape to send,
+  and role-forbidden actions (a verdict from a non-verifier, a child opening a hypothesis) are refused first.
+  Evidence still has to exist and be attested. A single `hypothesis_open` that carries evidence is recorded
+  with it in one atomic append.
+- The tool description now lists the shape of every action and differs for the lead, a child, and a
+  verifier. A failing operation inside a batch is named in the core's error (`SecurityOp::action`, added).
+  `loom-agent` depends on `url` for locator reading. No serialized shape changed; see `docs/SECURITY_STATE.md`.
+
 ### OWASP dep-scan tool
 
 - New built-in `dep_scan` tool wraps the operator-installed OWASP

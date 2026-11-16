@@ -24,6 +24,14 @@
 //! edges, and discounts edges out of known footholds. These are prioritization hints over explicit
 //! relations, never validated attack paths. Prefix resolution prefers exact IDs/aliases and refuses
 //! ambiguous prefixes. All maps/outputs have deterministic ordering.
+//!
+//! `SecurityOp::action` is the serialized `action` tag of an op (`asset_upsert`, …, `batch`). A batch
+//! stays one atomic append; when one of its operations fails validation the error is
+//! "Operation {i} of {n} in the batch ({action}): {error}" (1-based `i`), so the caller can tell
+//! which one to correct; a nested batch is one such operation ("Operation {i} of {n} in the batch
+//! (batch): Nested security batches are not supported; flatten the operations."). Tests required: the
+//! prefix for a failing second operation of three, the nested batch, and that nothing of the batch was
+//! applied.
 
 pub mod causal;
 pub use causal::{Atom, Fact, Literal, Projection, Rule, WhatIf};
@@ -466,6 +474,33 @@ fn conditions(values: &[Condition]) -> Result<(), String> {
     Ok(())
 }
 
+impl SecurityOp {
+    /// The serialized `action` tag of this op.
+    pub fn action(&self) -> &'static str {
+        match self {
+            SecurityOp::Batch { .. } => "batch",
+            SecurityOp::AssetUpsert { .. } => "asset_upsert",
+            SecurityOp::CredentialAdd { .. } => "credential_add",
+            SecurityOp::FootholdAdd { .. } => "foothold_add",
+            SecurityOp::ConditionUnlock { .. } => "condition_unlock",
+            SecurityOp::BlockedOn { .. } => "blocked_on",
+            SecurityOp::RevisitAcknowledge { .. } => "revisit_acknowledge",
+            SecurityOp::CoverageSet { .. } => "coverage_set",
+            SecurityOp::CrashRecord { .. } => "crash_record",
+            SecurityOp::HypothesisOpen { .. } => "hypothesis_open",
+            SecurityOp::HypothesisPriority { .. } => "hypothesis_priority",
+            SecurityOp::HypothesisEvidence { .. } => "hypothesis_evidence",
+            SecurityOp::HypothesisVerdict { .. } => "hypothesis_verdict",
+            SecurityOp::RelationAdd { .. } => "relation_add",
+            SecurityOp::FactAssert { .. } => "fact_assert",
+            SecurityOp::FactRetract { .. } => "fact_retract",
+            SecurityOp::RuleInstall { .. } => "rule_install",
+            SecurityOp::RuleRetract { .. } => "rule_retract",
+            SecurityOp::AliasAdd { .. } => "alias_add",
+        }
+    }
+}
+
 impl SecurityState {
     pub fn resolve(&self, wanted: &str) -> Result<String, String> {
         let ids: BTreeSet<&str> = self
@@ -564,11 +599,19 @@ impl SecurityState {
                     return Err("Give one to 1000 security operations in one import batch.".into());
                 }
                 let mut staged = ledger.clone();
-                for op in operations {
+                let n = operations.len();
+                for (i, op) in operations.iter().enumerate() {
                     if matches!(op, SecurityOp::Batch { .. }) {
-                        return Err("Nested security batches are not supported; flatten the operations.".into());
+                        return Err(format!(
+                            "Operation {} of {n} in the batch ({}): Nested security batches are not supported; \
+                             flatten the operations.",
+                            i.saturating_add(1),
+                            op.action()
+                        ));
                     }
-                    staged.security.validate(op, &staged)?;
+                    staged.security.validate(op, &staged).map_err(|e| {
+                        format!("Operation {} of {n} in the batch ({}): {e}", i.saturating_add(1), op.action())
+                    })?;
                     staged.security.apply(op, 0, &SessionId::from("validation"));
                 }
             }
@@ -1371,6 +1414,40 @@ mod tests {
         let paths = l.security.path_suggest(&a, &c, 101);
         assert_eq!(paths[0].cost, 13);
         assert_eq!(paths[0].assets, vec![a, b, c]);
+    }
+
+    #[test]
+    fn batch_error_names_the_failing_operation_and_applies_nothing() {
+        let l = ledger();
+        let host = |name: &str, evidence: &str| SecurityOp::AssetUpsert {
+            asset: AssetInput {
+                kind: AssetKind::Host,
+                locator: name.into(),
+                evidence: vec![evidence.into()],
+                mandatory: true,
+                parent: None,
+            },
+        };
+        let ops =
+            vec![host("a.test", "e1"), host("b.test", "e404"), SecurityOp::RevisitAcknowledge { target: "x".into() }];
+        for op in &ops {
+            assert_eq!(serde_json::to_value(op).unwrap()["action"], op.action());
+        }
+        let batch = SecurityOp::Batch { operations: ops };
+        assert_eq!(serde_json::to_value(&batch).unwrap()["action"], batch.action());
+        let err = l.validate(&LedgerOp::Security(batch), false).unwrap_err();
+        assert!(err.starts_with("Operation 2 of 3 in the batch (asset_upsert): "), "{err}");
+        assert!(err.contains("e404"), "{err}");
+        assert!(l.security.assets.is_empty());
+        // A nested batch is one of the operations that fails, and is named like the others.
+        let nested = SecurityOp::Batch {
+            operations: vec![host("a.test", "e1"), SecurityOp::Batch { operations: vec![host("c.test", "e1")] }],
+        };
+        let err = l.validate(&LedgerOp::Security(nested), false).unwrap_err();
+        assert_eq!(
+            err,
+            "Operation 2 of 2 in the batch (batch): Nested security batches are not supported; flatten the operations."
+        );
     }
 
     #[test]

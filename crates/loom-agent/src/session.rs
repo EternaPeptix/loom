@@ -910,7 +910,11 @@ impl CallPolicy {
                                 Some("tested" | "deferred")
                             )
                     }
-                    Some("hypothesis_evidence" | "hypothesis_verdict" | "fact_retract" | "rule_retract") => has("id"),
+                    Some("hypothesis_evidence" | "hypothesis_verdict") => {
+                        // shapes::read accepts `hypothesis` and `hypothesis_id` for `id`.
+                        has("id") || has("hypothesis") || has("hypothesis_id")
+                    }
+                    Some("fact_retract" | "rule_retract") => has("id"),
                     Some("revisit_acknowledge") => has("target"),
                     _ => false,
                 }
@@ -7305,6 +7309,20 @@ mod tests {
         assert!(!policy.allows("job_wait", &json!({})));
         assert!(policy.allows("job_wait", &json!({"timeout_s":2})));
         assert!(policy.allows("security_record", &json!({"operation":{"action":"coverage_set", "asset":"a1", "disposition":{"status":"deferred", "reason":"budget"}}})));
+        for key in ["id", "hypothesis", "hypothesis_id"] {
+            for action in ["hypothesis_evidence", "hypothesis_verdict"] {
+                assert!(
+                    policy.allows("security_record", &json!({"operation":{"action":action, key:"hy-3f2a"}})),
+                    "{action} {key}"
+                );
+            }
+        }
+        assert!(
+            !policy.allows("security_record", &json!({"operation":{"action":"hypothesis_evidence", "hypothesis":" "}}))
+        );
+        assert!(
+            !policy.allows("security_record", &json!({"operation":{"action":"fact_retract", "hypothesis":"hy-3f2a"}}))
+        );
         assert!(!policy.allows("security_record", &json!({"operation":{"action":"asset_upsert", "asset":"new"}})));
         assert!(!policy.allows("security_record", &json!({"operation":{"action":"batch", "operations":[]}})));
     }
