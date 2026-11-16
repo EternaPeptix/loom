@@ -146,6 +146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         Task { @MainActor in
             AppState.shared.restoreLast()
             AppState.shared.refreshNotificationStatus()
+            AppState.shared.beginWatching()
         }
     }
 
