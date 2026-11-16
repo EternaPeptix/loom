@@ -619,34 +619,44 @@ impl Config {
 
     /// The profile a session should use: `name` when given, else `default_model`, else the only one.
     pub fn profile(&self, name: Option<&str>) -> Result<(&str, &ModelProfile), ConfigError> {
-        // Name what is configured and how to choose, so the operator is not left guessing.
-        let configured = || {
-            let mut names: Vec<&str> = self.models.keys().map(String::as_str).collect();
-            names.sort_unstable();
-            if names.is_empty() {
-                "no model profiles are configured; add a [models.<name>] section".to_string()
-            } else {
-                format!("configured profiles: {}", names.join(", "))
-            }
-        };
-        let wanted = match name {
-            Some(n) if !n.is_empty() => n,
-            _ if !self.default_model.is_empty() => self.default_model.as_str(),
-            _ if self.models.len() == 1 => self.models.keys().next().map(String::as_str).unwrap_or(""),
-            _ => {
-                return Err(ConfigError::Invalid(format!(
-                    "no model given and no default_model set. Pass --model <name> or set default_model in the config ({}).",
-                    configured()
-                )))
-            }
-        };
-        self.models.get_key_value(wanted).map(|(k, v)| (k.as_str(), v)).ok_or_else(|| {
-            ConfigError::Invalid(format!(
-                "no model profile named \"{wanted}\". Pass --model <name> or set default_model in the config ({}).",
-                configured()
-            ))
-        })
+        resolve_profile(&self.models, &self.default_model, name)
     }
+}
+
+/// [`Config::profile`] over any set of profiles: the daemon keeps a live set that `loom models reload`
+/// replaces, and it resolves names against that set the same way.
+pub fn resolve_profile<'a>(
+    models: &'a BTreeMap<String, ModelProfile>,
+    default_model: &str,
+    name: Option<&str>,
+) -> Result<(&'a str, &'a ModelProfile), ConfigError> {
+    // Name what is configured and how to choose, so the operator is not left guessing.
+    let configured = || {
+        let mut names: Vec<&str> = models.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        if names.is_empty() {
+            "no model profiles are configured; add a [models.<name>] section".to_string()
+        } else {
+            format!("configured profiles: {}", names.join(", "))
+        }
+    };
+    let wanted = match name {
+        Some(n) if !n.is_empty() => n,
+        _ if !default_model.is_empty() => default_model,
+        _ if models.len() == 1 => models.keys().next().map(String::as_str).unwrap_or(""),
+        _ => {
+            return Err(ConfigError::Invalid(format!(
+                "no model given and no default_model set. Pass --model <name> or set default_model in the config ({}).",
+                configured()
+            )))
+        }
+    };
+    models.get_key_value(wanted).map(|(k, v)| (k.as_str(), v)).ok_or_else(|| {
+        ConfigError::Invalid(format!(
+            "no model profile named \"{wanted}\". Pass --model <name> or set default_model in the config ({}).",
+            configured()
+        ))
+    })
 }
 
 /// Directory (inside `sessions/` or `missions/`) that loom never creates. An id that is not a plain name maps to

@@ -171,6 +171,21 @@ pub struct RenameBody {
     pub title: String,
 }
 
+/// Body of `POST /api/sessions/{id}/model`: the model profile to switch the session to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelBody {
+    pub profile: String,
+}
+
+/// Answer of `GET /api/models`: the live model profiles, as `loom models reload` last read them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelsView {
+    /// The profile a session uses when none is named (empty: none set).
+    pub default_model: String,
+    pub models: Vec<ModelHealth>,
+}
+
 /// Body of `POST /api/gc`. An empty object is a dry run.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

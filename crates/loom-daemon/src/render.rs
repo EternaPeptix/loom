@@ -46,6 +46,8 @@
 //! - `inbox_resolved`: `✉ answered: {answer}` (`✉ dismissed` for an empty answer).
 //! - `ledger`: `▪ ledger #{n}: {summary}` (dim).
 //! - `cache_break`: `! cache break at message {first_diff_message}: {detail}` (yellow).
+//! - `model_switched`: `⇄ model {profile} ({model}, window {window}) → {…same for to} · {reason}` (cyan;
+//!   a window of 0 reads `unknown`; no `· …` when the reason is empty).
 //! - `interrupted`: `! interrupted: {reason}` (yellow).
 //! - `turn_end`: `— turn ended: {reason in words} —` (dim): `yielded`, `finished`, `asked the
 //!   operator`, `blocked`, `waiting for jobs or agents`, `stopped`, `parked for the operator`,
@@ -87,6 +89,14 @@
 //!   GiB free of {total} GiB ({pct}%) on the volume of the loom home`, or `unknown`) and, when it is low
 //!   (`DiskSpace::is_low`), a warning that sessions will fail when the disk fills (bold yellow); one
 //!   line per model (`✓`/`✗`, base URL, model, window, detail when unreachable); the counts.
+//! - `models_table(view, style)`: one line per live profile, `✓`/`✗ {profile}[ (default)] · {model} ·
+//!   {base_url} · window {window} · {max_concurrent} at once[ · {detail}]`; then a line when no
+//!   `default_model` is set; `No model profiles are configured.` when there is none.
+//! - `models_reload(report)`: `No profile changed.` or one `added|changed|removed: a, b` line per
+//!   non-empty list; `{n} session(s) moved to the new settings of a changed profile`; `default model:
+//!   {name or none}`; then one `! {note}` per note.
+//! - `model_switch_line(receipt)`: `{session} now uses {profile} ({model}, window {window}), from its
+//!   next step` (or `when it next runs` when no task took it).
 //! - `net_table(entries, style)`: `TIME  VERDICT  METHOD  HOST:PORT  RULE` (time as `HH:MM:SS` UTC).
 //! - `score_table(view, style)`: what a mission's work took. `SESSION  ROLE`, then the headings of
 //!   `loom_core::scorecard::COLUMNS` in capitals; one row per session with its `Scorecard::cells()`
@@ -102,8 +112,10 @@
 //! the empty cases and the child indentation; rows never exceed `width` characters; the score table
 //! for one session and for several, with a card that is not recorded, wider than the width.
 
-use crate::wire::StatusView;
-use loom_agent::runtime::{InboxEntry, NetEntry, ScoreView, SessionInfo, WindowView};
+use crate::wire::{ModelsView, StatusView};
+use loom_agent::runtime::{
+    InboxEntry, ModelSwitchReceipt, ModelsReload, NetEntry, ScoreView, SessionInfo, WindowView,
+};
 use loom_agent::session::Phase;
 use loom_core::event::{
     Author, ChildOutcome, Event, FinishReason, InboxItem, InboxKind, Record, SessionOutcome, SpawnMode, ToolStatus,
@@ -554,6 +566,17 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
             let text = format!("! cache break at message {first_diff_message}: {detail}");
             out.push(paint(style, YELLOW, &text));
         }
+        Event::ModelSwitched(m) => {
+            let side = |r: &loom_core::event::ModelRef| {
+                let window = if r.context_window > 0 { tokens(r.context_window) } else { "unknown".to_string() };
+                format!("{} ({}, window {window})", clean(&r.profile), clean(&r.model))
+            };
+            let mut text = format!("⇄ model {} → {}", side(&m.from), side(&m.to));
+            if !m.reason.is_empty() {
+                text.push_str(&format!(" · {}", clean(&m.reason)));
+            }
+            out.push(paint(style, CYAN, &text));
+        }
         Event::Interrupted { reason } => {
             out.push(paint(style, YELLOW, &format!("! interrupted: {reason}")));
         }
@@ -858,6 +881,70 @@ pub fn status(view: &StatusView, style: &Style) -> String {
     finish(out)
 }
 
+/// `loom models list`: one line per live profile — ✓/✗ for its server, the default one marked.
+pub fn models_table(view: &ModelsView, style: &Style) -> String {
+    if view.models.is_empty() {
+        return "No model profiles are configured.\n".to_string();
+    }
+    let width = width_of(style);
+    let mut out = Vec::new();
+    for m in &view.models {
+        let mark = if m.reachable { paint(style, GREEN, "✓") } else { paint(style, RED, "✗") };
+        let default = if m.profile == view.default_model { " (default)" } else { "" };
+        let window = m.context_window.map_or_else(|| "unknown".to_string(), tokens);
+        let mut text = format!(
+            "{}{default} · {} · {} · window {window} · {} at once",
+            flat(&m.profile),
+            flat(&m.model),
+            flat(&m.base_url),
+            m.max_concurrent
+        );
+        if !m.reachable && !m.detail.is_empty() {
+            text.push_str(&format!(" · {}", flat(&m.detail)));
+        }
+        out.push(format!("{mark} {}", cut(&text, width.saturating_sub(2))));
+    }
+    if view.default_model.is_empty() {
+        out.push(cut("no default_model: a new session names its model with --model", width));
+    }
+    finish(out)
+}
+
+/// `loom models reload`: what changed, then what needs the operator (`! …`).
+pub fn models_reload(r: &ModelsReload) -> String {
+    let list = |names: &[String]| names.iter().map(|n| flat(n)).collect::<Vec<_>>().join(", ");
+    let mut out = Vec::new();
+    if r.added.is_empty() && r.changed.is_empty() && r.removed.is_empty() {
+        out.push("No profile changed.".to_string());
+    }
+    for (word, names) in [("added", &r.added), ("changed", &r.changed), ("removed", &r.removed)] {
+        if !names.is_empty() {
+            out.push(format!("{word}: {}", list(names)));
+        }
+    }
+    if !r.rebound.is_empty() {
+        let n = r.rebound.len();
+        out.push(format!("{n} {} moved to the new settings of a changed profile", if n == 1 { "session" } else { "sessions" }));
+    }
+    out.push(format!("default model: {}", if r.default_model.is_empty() { "none" } else { r.default_model.as_str() }));
+    for note in &r.notes {
+        out.push(format!("! {}", flat(note)));
+    }
+    finish(out)
+}
+
+/// `loom models set`: whom it switched, to what, and from when.
+pub fn model_switch_line(r: &ModelSwitchReceipt) -> String {
+    let when = if r.live { "from its next step" } else { "when it next runs" };
+    let window = if r.model.context_window > 0 { tokens(r.model.context_window) } else { "unknown".to_string() };
+    format!(
+        "{} now uses {} ({}, window {window}), {when}",
+        flat(r.session.as_str()),
+        flat(&r.model.profile),
+        flat(&r.model.model)
+    )
+}
+
 pub fn net_table(entries: &[NetEntry], style: &Style) -> String {
     if entries.is_empty() {
         return "No network decisions.\n".to_string();
@@ -1134,6 +1221,12 @@ mod tests {
             Event::Interrupted { reason: s.into() },
             Event::TurnEnd { reason: TurnEndReason::Finished },
             Event::SessionEnd { outcome: SessionOutcome::Failed, detail: s.into() },
+            Event::ModelSwitched(loom_core::event::ModelSwitched {
+                from: loom_core::event::ModelRef { profile: s.into(), model: s.into(), context_window: 1000 },
+                to: loom_core::event::ModelRef { profile: s.into(), model: s.into(), context_window: 0 },
+                reasoning_replay: loom_core::event::ReasoningReplay::None,
+                reason: s.into(),
+            }),
             Event::Unknown,
         ];
         events.extend(continuation_and_outbox_events(s));
@@ -1903,6 +1996,43 @@ mod tests {
             context_window: if reachable { Some(1_000_000) } else { None },
             max_concurrent: 4,
         }
+    }
+
+    #[test]
+    fn models_list_reload_report_and_switch_line_shapes() {
+        let mut other = health(false);
+        other.profile = "other".into();
+        let view = ModelsView { default_model: "local".into(), models: vec![health(true), other] };
+        assert_eq!(
+            models_table(&view, &MONO),
+            "✓ local (default) · big · http://10.0.0.1:8000/v1 · window 1.00M · 4 at once\n\
+             ✗ other · big · http://10.0.0.1:8000/v1 · window unknown · 4 at once · connection refused\n"
+        );
+        let none = ModelsView { default_model: String::new(), models: vec![health(true)] };
+        assert!(models_table(&none, &MONO).ends_with("no default_model: a new session names its model with --model\n"));
+        assert_eq!(models_table(&ModelsView { default_model: String::new(), models: vec![] }, &MONO), "No model profiles are configured.\n");
+
+        assert_eq!(models_reload(&ModelsReload::default()), "No profile changed.\ndefault model: none\n");
+        let report = ModelsReload {
+            added: vec!["fast".into()],
+            changed: vec!["big".into()],
+            removed: vec!["old".into()],
+            default_model: "big".into(),
+            rebound: vec![SessionId::from("s-1"), SessionId::from("s-2")],
+            notes: vec!["\"old\" is no longer configured".into()],
+        };
+        assert_eq!(
+            models_reload(&report),
+            "added: fast\nchanged: big\nremoved: old\n2 sessions moved to the new settings of a changed profile\ndefault model: big\n! \"old\" is no longer configured\n"
+        );
+
+        let receipt = |live: bool| ModelSwitchReceipt {
+            session: SessionId::from("s-1"),
+            model: loom_core::event::ModelRef { profile: "fast".into(), model: "m".into(), context_window: 200_000 },
+            live,
+        };
+        assert_eq!(model_switch_line(&receipt(true)), "s-1 now uses fast (m, window 200.0k), from its next step");
+        assert_eq!(model_switch_line(&receipt(false)), "s-1 now uses fast (m, window 200.0k), when it next runs");
     }
 
     #[test]

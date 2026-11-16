@@ -905,7 +905,7 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   while the server was down), the new one is remembered and the request is sent again once; when one
   has (the server was relaunched with another model), the 404 is refused with a sentence naming the
   model now served — loom never follows a new model by itself, because what a session recorded at its
-  start describes the old one.
+  start describes the old one (the operator switches it: `loom models set`, below).
 - **Context overflow.** A 400 or 413 whose message reads like an over-long prompt (`maximum context
   length`, `context length`, `too many tokens`, `prompt is too long`, `max_model_len`) is reported with
   the limit and request size parsed from it; the session then re-weaves (`overflow`) and sends again,
@@ -918,8 +918,25 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   is refused when the server cannot be asked and the profile sets no window, and when the server
   answers but reports none and the profile sets none. With the server down and a configured window, the
   session starts with the configured model and window, and the daemon log says so. The window is
-  recorded in the session's `session_start` and fixed for its life.
-- No provider fallback. A profile's `extra_body` is fixed for the life of a session.
+  recorded in the session's `session_start` and changes only at a recorded `model_switched` (below).
+- No provider fallback. A session's profile settings, `extra_body` included, change only at a recorded
+  `model_switched`, or when a session that had no task is next opened after a reload or a restart.
+- **Live model set.** The profiles in use are the daemon's own copy of `[models]` and `default_model`;
+  `loom models reload` (`POST /api/models/reload`) reads them from the configuration file again
+  without a restart — nothing else in the file is reread. A new profile is usable at once; an
+  unchanged one keeps its client, request slots and discovery; a changed one gets new ones, and every
+  session on it that has not ended is switched to it again; a removed one is no longer offered (a
+  session running on it keeps its client; an idle one is refused activation until it is switched). A
+  reload that fails to load the file, has no `[models]`, or leaves a pack's role naming a missing
+  profile changes nothing. The daemon's environment is the one it started with: a profile whose
+  `api_key_env` is unset there is reported. `loom models set <session> <profile>`
+  (`POST /api/sessions/{id}/model`) switches one session — a lead or an agent; its agents keep their
+  own models — after discovery as for a new session: `meta.json` first, then the running task, which
+  applies it between steps (a running request finishes on the old model). The session records
+  `model_switched{from, to, reasoning_replay, reason}` (`operator`, `profile reloaded`, or `changed
+  while the session was idle` when it is next opened). The weave takes `reasoning_replay` from the
+  latest one for the whole history, and a switch is never reported as a cache break: a new model is
+  a cold cache by nature. The model is not told.
 
 ## 11. Tools, sandbox, network (`loom-tools`, `loom-net`)
 

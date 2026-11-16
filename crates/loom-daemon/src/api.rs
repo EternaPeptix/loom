@@ -55,6 +55,9 @@
 //! | `POST /sessions/{id}/reweave` | `runtime.reweave` | `202` `{}` |
 //! | `POST /sessions/{id}/archive` (`ArchiveBody`) | `runtime.archive` | `200` `{}` |
 //! | `POST /sessions/{id}/rename` (`RenameBody`) | `runtime.rename` | `200` `{}` |
+//! | `POST /sessions/{id}/model` (`ModelBody`) | `runtime.set_session_model` | `ModelSwitchReceipt` |
+//! | `GET /models` | `runtime.default_model()`, `runtime.health()` | `ModelsView` |
+//! | `POST /models/reload` | `runtime.reload_models` (no body) | `ModelsReload` |
 //! | `GET /sessions/{id}/window` | `runtime.window` | `WindowView` |
 //! | `GET /sessions/{id}/net?limit={n}` | `runtime.net` (default 200, at most 2000) | `[NetEntry]` |
 //! | `GET /missions` | `runtime.missions` | `[MissionInfo]` |
@@ -124,8 +127,8 @@
 use crate::auth;
 use crate::ui;
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, ReleaseBody, RenameBody,
-    RuleBody, ScopeBody, SessionDetail, StatusView, WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, ModelBody, ModelsView,
+    ReleaseBody, RenameBody, RuleBody, ScopeBody, SessionDetail, StatusView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -208,6 +211,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/reweave", post(reweave))
         .route("/api/sessions/{id}/archive", post(archive))
         .route("/api/sessions/{id}/rename", post(rename))
+        .route("/api/sessions/{id}/model", post(set_model))
+        .route("/api/models", get(models))
+        .route("/api/models/reload", post(reload_models))
         .route("/api/sessions/{id}/window", get(window))
         .route("/api/sessions/{id}/net", get(net))
         .route("/api/missions", get(missions))
@@ -696,6 +702,21 @@ async fn rename(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) 
     let body: RenameBody = json_body(&body)?;
     s.runtime.rename(&SessionId::from(id), &body.title).await.map_err(rt_err)?;
     Ok(ok_empty())
+}
+
+async fn set_model(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: ModelBody = json_body(&body)?;
+    let receipt = s.runtime.set_session_model(&SessionId::from(id), &body.profile).await.map_err(rt_err)?;
+    Ok(Json(receipt).into_response())
+}
+
+async fn models(State(s): State<ApiState>) -> Json<ModelsView> {
+    Json(ModelsView { default_model: s.runtime.default_model(), models: s.runtime.health().await })
+}
+
+async fn reload_models(State(s): State<ApiState>) -> Res<Response> {
+    let report = s.runtime.reload_models().await.map_err(rt_err)?;
+    Ok(Json(report).into_response())
 }
 
 async fn window(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
@@ -1849,6 +1870,34 @@ mod tests {
             let (s, b) = e.get(&format!("/api/missions/{bad}/ledger")).await;
             assert_eq!(s, 404, "{bad}: {b}");
         }
+    }
+
+    #[tokio::test]
+    async fn models_are_listed_reloaded_and_switched_over_the_api() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let (s, v) = e.get("/api/models").await;
+        assert_eq!((s, v["default_model"].as_str()), (200, Some("mock")));
+        assert_eq!(v["models"].as_array().unwrap().len(), 1);
+        let id = e.create("go").await;
+        let (s, b) = e.post(&format!("/api/sessions/{id}/model"), json!({"profile": "other"})).await;
+        assert_eq!(s, 404, "{b}");
+        assert!(b["error"].as_str().unwrap().contains("loom models reload"), "{b}");
+        let (s, _) = e.post(&format!("/api/sessions/{id}/model"), json!({"profile": "mock", "extra": 1})).await;
+        assert_eq!(s, 400, "unknown fields are refused");
+
+        // Added to the file and reloaded: usable at once, without a restart.
+        let url = e.rt.config().models["mock"].base_url.clone();
+        let profile = |name: &str| {
+            format!("[models.{name}]\nbase_url = \"{url}\"\nmodel = \"mock\"\ncontext_window = 1000000\nretry_window_s = 1\nretry_max_delay_s = 1\nstall_timeout_s = 30\n")
+        };
+        let text = format!("default_model = \"mock\"\n\n{}\n{}", profile("mock"), profile("other"));
+        std::fs::write(e.rt.paths().config_file(), text).unwrap();
+        let (s, r) = e.post("/api/models/reload", json!({})).await;
+        assert_eq!((s, &r["added"], &r["changed"]), (200, &json!(["other"]), &json!([])), "{r}");
+        let (s, receipt) = e.post(&format!("/api/sessions/{id}/model"), json!({"profile": "other"})).await;
+        assert_eq!((s, receipt["model"]["profile"].as_str()), (200, Some("other")), "{receipt}");
+        assert_eq!(e.get("/api/models").await.1["models"].as_array().unwrap().len(), 2);
+        e.rt.shutdown().await;
     }
 
     #[tokio::test]

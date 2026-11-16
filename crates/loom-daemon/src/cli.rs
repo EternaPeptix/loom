@@ -57,9 +57,14 @@
 //!   `render::granted_hosts_line` from the mission's ledger (left out when the ledger cannot be read).
 //! - `out <handle> [--lines <a>:<b>]`: the stored output's lines (all of it, paged 5 000 lines at a
 //!   time, without `--lines`), passed through `render::clean`.
-//! - `config path` prints the config file's path; `config check` loads and checks it (`ok`, or the
-//!   error and exit 1); `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
+//! - `config path` prints the config file's path; `config check` loads and checks it and runs the
+//!   daemon's start-up checks (sandbox preflight, box paths): `ok: {path}`, or the error (naming the
+//!   file) and exit 1; `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
 //!   overwrite: `{path} already exists.`).
+//! - `models list`: `render::models_table` of `GET /api/models`. `models reload`: `POST
+//!   /api/models/reload`, `render::models_reload` of the report. `models set <session> <profile>`:
+//!   resolves the session, `POST /api/sessions/{id}/model`, `render::model_switch_line`. None needs a
+//!   restart; the daemon refuses with its sentence (an unknown profile names the configured ones).
 //! - `service install|uninstall|status` (macOS; elsewhere `This command is for macOS (launchd).`):
 //!   `install` prepares the home (`serve::prepare_home`), creates `{logs}/loomd.log` (0600) if it is missing,
 //!   writes `serve::launch_agent_plist` to `~/Library/LaunchAgents/{SERVICE_LABEL}.plist`
@@ -218,6 +223,11 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// The model profiles: list them, reload them from the config, switch a session's model
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
     },
     /// Run the daemon as a login service (macOS)
     Service {
@@ -437,6 +447,24 @@ pub enum ConfigAction {
     Check,
     /// Write a starting configuration file (refuses to overwrite an existing one)
     Init,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum ModelsAction {
+    /// List the model profiles in use, with each server's state (the default one is marked)
+    List,
+    /// Read [models] and default_model from the config again and use them now, without a restart
+    Reload,
+    /// Switch a session to another model profile, from its next step, without a restart
+    Set(ModelsSetArgs),
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ModelsSetArgs {
+    /// A session id, the beginning of one, or `last`
+    pub session: String,
+    /// The model profile to switch it to (`loom models list` shows them)
+    pub profile: String,
 }
 
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1039,6 +1067,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
         Command::Up => cmd_up(&paths).await,
         Command::Down => cmd_down(&paths).await,
         Command::Config { action } => cmd_config(&paths, action),
+        Command::Models { action } => cmd_models(&paths, action).await,
         Command::Service { action } => cmd_service(&paths, action),
         Command::Status => {
             let view = client_of(&paths)?.status().await?;
@@ -1381,6 +1410,19 @@ async fn cmd_chat(paths: &Paths, a: ChatArgs) -> Result<i32, String> {
     }
 }
 
+async fn cmd_models(paths: &Paths, action: ModelsAction) -> Result<i32, String> {
+    let c = client_of(paths)?;
+    match action {
+        ModelsAction::List => block(&render::models_table(&c.models().await?, &style())).map(|()| 0),
+        ModelsAction::Reload => block(&render::models_reload(&c.reload_models().await?)).map(|()| 0),
+        ModelsAction::Set(a) => {
+            let id = c.resolve(&a.session).await?;
+            let receipt = c.set_model(&id, &a.profile).await?;
+            outln(&render::model_switch_line(&receipt)).map(|()| 0)
+        }
+    }
+}
+
 fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
     let file = paths.config_file();
     match action {
@@ -1690,6 +1732,14 @@ mod tests {
         rejected(&["config"]);
         rejected(&["config", "edit"]);
         rejected(&["service"]);
+        assert!(matches!(ok(&["models", "list"]), Command::Models { action: ModelsAction::List }));
+        assert!(matches!(ok(&["models", "reload"]), Command::Models { action: ModelsAction::Reload }));
+        let Command::Models { action: ModelsAction::Set(a) } = ok(&["models", "set", "last", "big"]) else {
+            panic!("not models set")
+        };
+        assert_eq!((a.session.as_str(), a.profile.as_str()), ("last", "big"));
+        rejected(&["models"]);
+        rejected(&["models", "set", "last"]); // a profile is required
     }
 
     #[test]

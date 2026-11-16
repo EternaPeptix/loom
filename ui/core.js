@@ -1187,6 +1187,17 @@ function step(store, rec) {
     case "cache_break":
       push(store, { ...base(rec), kind: "line", tone: "warn", text: `cache break at message ${rec.first_diff_message}: ${oneLine(rec.detail, 300)}` });
       break;
+    case "model_switched": {
+      // The session's requests go to another model from here on (the operator switched it, or its
+      // profile was reloaded). Not shown to the model; one line for the operator.
+      const side = (m) => {
+        const win = m && m.context_window ? `, ${tokens(m.context_window)} context` : "";
+        return `${oneLine((m && m.profile) || "?", 80)} (${oneLine((m && m.model) || "?", 80)}${win})`;
+      };
+      const reason = rec.reason ? ` · ${oneLine(rec.reason, 120)}` : "";
+      push(store, { ...base(rec), kind: "line", tone: "dim", text: `model switched: ${side(rec.from)} → ${side(rec.to)}${reason}` });
+      break;
+    }
     case "interrupted":
       push(store, { ...base(rec), kind: "line", tone: "warn", text: `interrupted: ${oneLine(rec.reason, 300)}` });
       lostCalls(store);

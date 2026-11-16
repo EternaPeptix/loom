@@ -12,7 +12,8 @@
 //! - `log.jsonl` — the session's log; written only by its [`Session`](crate::session::Session).
 //! - `meta.json` — [`SessionMeta`], written when the session is created (for a verifier the finish
 //!   gate starts, with `gate`, before its first turn); rewritten by [`Runtime::archive`] (the
-//!   `archived` flag) and [`Runtime::rename`] (the `title`). Writes
+//!   `archived` flag), [`Runtime::rename`] (the `title`) and a model switch (`profile`, `model`,
+//!   `context_window`: [`Runtime::set_session_model`], [`Runtime::reload_models`]). Writes
 //!   are atomic (temporary file in the same directory, then rename).
 //! - `status.json` — the latest [`Status`](crate::session::Status), rewritten atomically whenever
 //!   the session publishes one.
@@ -82,9 +83,12 @@
 //! - `paths`, `agents`, `context`, `admit` from the config (`agents.stall_steps` is 0 for a role
 //!   with none of the tools `note`, `claim`, `evidence`: the stall note asks for a ledger record,
 //!   and with the journal every child would otherwise be given it); `client` and `limiter` of the session's
-//!   model profile (one `ModelClient` and one `Limiter::new(profile.max_concurrent)` per profile,
-//!   made at start); `priority` `Lead` for a root session, `Child` for a child;
-//!   `context_window` from `meta`.
+//!   model profile in the live model set (one `ModelClient` and one `Limiter::new(profile.max_concurrent)`
+//!   per profile, made at start, and again for a profile `reload_models` adds or changes); `priority`
+//!   `Lead` for a root session, `Child` for a child; `context_window` from `meta`; `model` (`meta`'s
+//!   profile, model and window) and its profile's `reasoning_replay`, which `open` compares with the
+//!   log (see `Session::open`). A profile `meta` names that is no longer configured refuses the
+//!   activation, saying to switch the session or add the profile back.
 //! - `shared`: `Shared::new(id, Some(mission), parent, role, journal, paths.session_log(id),
 //!   agents, orchestrator)`. `journal` is `Some(Journal::new(paths.journal(mission), key))` when the
 //!   root session's role has `Termination::Explicit`, and for every child. Children read current
@@ -328,6 +332,25 @@
 //!   the new title.`). Trims `title`, sets it in the lead's `meta.json`, updates the titles cached on
 //!   that session's open inbox items, and publishes a `session` event. No turn is started. Allowed in
 //!   any state, archived included.
+//! - `set_session_model(id, profile)`: any session, lead or agent, that has not ended; the profile
+//!   must be in the live set (`There is no model profile "{p}" (configured profiles: …). Add it to
+//!   [models] in the config and run `loom models reload`.`). Under `model_changes`: discovery for the
+//!   profile as for a new session; then `meta` in memory, then `meta.json`, then, when a task runs the
+//!   session, `Input::SwitchModel` with the profile's client, limiter, window and replay policy (the
+//!   task applies it between steps and records `model_switched{reason: operator}`); a session without a
+//!   task records it when it is next opened. Publishes a `session` event. Its agents keep their models.
+//!   The receipt says whether a task took it (`live`).
+//! - `reload_models()`: reads the configuration file again and replaces the live `[models]` and
+//!   `default_model`, without a restart; nothing else in the file is reread. Refused, changing
+//!   nothing, when the file does not load, it has no `[models]`, or `Packs::check_profiles` fails. A
+//!   profile whose settings are unchanged keeps its client, slots and discovery; a new or changed one
+//!   gets new ones. Every session on a changed profile that has not ended (archived ones included) is
+//!   switched to it again as above, with reason `profile reloaded`: a running one records it whatever
+//!   changed (`settings_changed`: the server or `extra_body` may have); one without a task records it
+//!   when next opened only if its model, window or replay policy changed. Sessions still on a removed profile are named in the report: a
+//!   running one keeps its client; an idle one cannot be activated until it is switched. A new or
+//!   changed profile whose `api_key_env` is not set in the daemon's environment is noted too (the
+//!   environment is the one the daemon started with). The report is a [`ModelsReload`].
 //! - `answer(item_id, answer)`: the item must be open (`There is no open inbox item {item_id}.`);
 //!   an empty answer to a blocking item is refused (`This item is waiting for an answer; write
 //!   one.`); activate the session; `Input::Answer`; a non-empty answer also resumes the session's
@@ -617,6 +640,33 @@ pub struct MissionInfo {
     pub created_ms: u64,
     pub has_ledger: bool,
     pub archived: bool,
+}
+
+/// What [`Runtime::reload_models`] changed.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelsReload {
+    /// Profiles that were not configured before.
+    pub added: Vec<String>,
+    /// Profiles whose settings changed: they have a new client and new request slots.
+    pub changed: Vec<String>,
+    /// Profiles no longer configured.
+    pub removed: Vec<String>,
+    /// The default profile after the reload (empty: none set).
+    pub default_model: String,
+    /// Sessions moved to the new settings of a changed profile (running ones from their next step).
+    pub rebound: Vec<SessionId>,
+    /// Sentences about what the reload could not do for the operator to act on.
+    pub notes: Vec<String>,
+}
+
+/// What [`Runtime::set_session_model`] did.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelSwitchReceipt {
+    pub session: SessionId,
+    pub model: ModelRef,
+    /// A running task took the switch: its requests go to the new model from its next step. Otherwise
+    /// the session records the switch when it next runs.
+    pub live: bool,
 }
 
 /// An open inbox item and where it came from.
@@ -1210,11 +1260,59 @@ struct State {
     box_closed: HashSet<MissionId>,
 }
 
-/// One model profile, made at start.
+/// One model profile: its client, request slots and what discovery found. Made at start, and again for
+/// a profile a reload added or changed.
 struct ProfileRt {
     client: Arc<ModelClient>,
     limiter: Arc<Limiter>,
     discovered: Mutex<Option<Discovered>>,
+}
+
+impl ProfileRt {
+    fn new(client: ModelClient, max_concurrent: u32) -> ProfileRt {
+        ProfileRt {
+            client: Arc::new(client),
+            limiter: Arc::new(Limiter::new(max_concurrent)),
+            discovered: Mutex::new(None),
+        }
+    }
+}
+
+/// The model profiles in use: `[models]` and `default_model` as the daemon last read them (at start,
+/// or by [`Runtime::reload_models`]). Replaced whole by a reload; readers take an `Arc` of it and never
+/// hold the lock across an `.await`. A session keeps the client it was given until it is switched.
+struct ModelTable {
+    default_model: String,
+    profiles: BTreeMap<String, Arc<ProfileRt>>,
+}
+
+impl ModelTable {
+    fn get(&self, name: &str) -> Option<&Arc<ProfileRt>> {
+        self.profiles.get(name)
+    }
+
+    /// The profiles' settings, keyed as in the configuration.
+    fn configs(&self) -> BTreeMap<String, loom_core::config::ModelProfile> {
+        self.profiles.iter().map(|(name, rt)| (name.clone(), rt.client.profile().clone())).collect()
+    }
+
+    /// The profile to use for `name`, as [`Config::profile`] resolves it: the name, else `default_model`,
+    /// else the only one.
+    fn resolve(&self, name: Option<&str>) -> Result<String, String> {
+        let configs = self.configs();
+        loom_core::config::resolve_profile(&configs, &self.default_model, name)
+            .map(|(n, _)| n.to_string())
+            .map_err(|e| e.to_string())
+    }
+
+    /// `configured profiles: a, b` (or that none is), for refusals.
+    fn names(&self) -> String {
+        if self.profiles.is_empty() {
+            "no model profiles are configured".to_string()
+        } else {
+            format!("configured profiles: {}", self.profiles.keys().cloned().collect::<Vec<_>>().join(", "))
+        }
+    }
 }
 
 /// What the runtime keeps of a session's `Deps`.
@@ -1244,7 +1342,10 @@ struct Inner {
     bus: broadcast::Sender<BusEvent>,
     packs: Packs,
     key: Vec<u8>,
-    profiles: BTreeMap<String, ProfileRt>,
+    /// The live model profiles (see [`ModelTable`]). `config.models` is the start-up snapshot only.
+    models: std::sync::RwLock<Arc<ModelTable>>,
+    /// Held by a reload and by a switch, so that model changes apply one at a time.
+    model_changes: tokio::sync::Mutex<()>,
     proxy: Proxy,
     state: Mutex<State>,
     /// Held while sessions are activated (never across an `.await`).
@@ -1375,7 +1476,7 @@ impl Orchestrator for Orch {
         let role = inner.packs.role(Some(&meta.pack), Some(&meta.role))?.clone();
         let (record, log) = (inner.paths.session_dir(&child).join(COPY_MANIFEST), inner.paths.session_log(&child));
         let (tmp, home, copies) = (inner.paths.session_tmp(parent), inner.paths.home.clone(), inner.paths.copies_dir());
-        let (base, models, port) = (inner.config.sandbox.clone(), inner.config.models.clone(), inner.proxy.port());
+        let (base, models, port) = (inner.config.sandbox.clone(), inner.models().configs(), inner.proxy.port());
         let read = tokio::task::spawn_blocking(move || {
             let dir = std::fs::canonicalize(&meta.workspace).map_err(|e| {
                 format!(
@@ -1581,8 +1682,11 @@ impl Orchestrator for Orch {
                 "Nothing has been sent to the model in this session yet, so there is nothing to vote on.".to_string()
             );
         };
-        let rt =
-            inner.profiles.get(&profile).ok_or_else(|| format!("model profile \"{profile}\" is not configured."))?;
+        let models = inner.models();
+        let rt = models
+            .get(&profile)
+            .cloned()
+            .ok_or_else(|| format!("model profile \"{profile}\" is not configured ({}).", models.names()))?;
         let records = read_records(&inner.paths.session_log(session)).map_err(|e| e.to_string())?.records;
         let upto: Vec<Record> = records.into_iter().filter(|r| r.seq <= fork_point).collect();
         let w = weave(&upto);
@@ -1684,6 +1788,18 @@ impl Inner {
 
     fn me(&self) -> Option<Arc<Inner>> {
         self.me.upgrade()
+    }
+
+    /// The live model profiles. Cheap: an `Arc` of the current table.
+    fn models(&self) -> Arc<ModelTable> {
+        self.models.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Sessions bound to `profile` that can still send a request (archived ones included: they take the
+    /// change when they are unarchived).
+    fn sessions_on(&self, profile: &str) -> Vec<SessionId> {
+        let st = self.st();
+        st.known.iter().filter(|(_, k)| k.meta.profile == profile && !k.finished()).map(|(id, _)| id.clone()).collect()
     }
 
     fn info_of(k: &Known) -> SessionInfo {
@@ -2147,10 +2263,16 @@ impl Inner {
     /// The `Deps` of a session (granting it its proxy credentials).
     fn build(&self, meta: &SessionMeta, explicit: bool) -> Result<(Deps, Parts), String> {
         let role = self.packs.role(Some(&meta.pack), Some(&meta.role))?.clone();
-        let profile = self
-            .profiles
-            .get(&meta.profile)
-            .ok_or_else(|| format!("The model profile \"{}\" is not in the configuration.", meta.profile))?;
+        let models = self.models();
+        let profile = models.get(&meta.profile).cloned().ok_or_else(|| {
+            format!(
+                "The model profile \"{}\" of session {} is no longer configured ({}). Switch the session to another one with `loom models set {} <profile>`, or add it back to [models] and run `loom models reload`.",
+                meta.profile,
+                meta.id.as_str(),
+                models.names(),
+                meta.id.as_str()
+            )
+        })?;
         let id = &meta.id;
         let workspace = std::fs::canonicalize(&meta.workspace)
             .map_err(|e| format!("The workspace {} cannot be used: {e}", meta.workspace))?;
@@ -2159,7 +2281,7 @@ impl Inner {
         let tmp = std::fs::canonicalize(&tmp).map_err(|e| format!("cannot resolve {}: {e}", tmp.display()))?;
         let copies = self.paths.copies_dir();
         let cfg = with_copies(
-            sandbox_cfg_for(&self.config.sandbox, &role, &workspace, &self.config.models),
+            sandbox_cfg_for(&self.config.sandbox, &role, &workspace, &models.configs()),
             &copies,
             meta.copy_of.as_deref(),
         );
@@ -2237,6 +2359,12 @@ impl Inner {
             limiter: profile.limiter.clone(),
             priority: if meta.parent.is_some() { Priority::Child } else { Priority::Lead },
             context_window: meta.context_window,
+            model: ModelRef {
+                profile: meta.profile.clone(),
+                model: meta.model.clone(),
+                context_window: meta.context_window.unwrap_or(0),
+            },
+            reasoning_replay: profile.client.profile().reasoning_replay,
             shared: shared.clone(),
             ctx,
             job_events,
@@ -2256,7 +2384,7 @@ impl Inner {
             sandbox: deps.ctx.sandbox.describe(),
             network: network_text(&self.config),
         };
-        let replay = self.config.models.get(&meta.profile).map(|p| p.reasoning_replay).unwrap_or_default();
+        let replay = deps.reasoning_replay;
         Ok(SessionStart {
             session: meta.id.clone(),
             mission: meta.mission.clone(),
@@ -2893,10 +3021,10 @@ impl Inner {
     /// when the server could not be asked and the numbers come from the profile alone. Without a
     /// configured window that is refused: a session must not start with a window nobody knows.
     async fn facts(&self, profile_name: &str) -> Result<(String, Option<u64>, bool), String> {
-        let rt = self
-            .profiles
-            .get(profile_name)
-            .ok_or_else(|| format!("The model profile \"{profile_name}\" is not configured."))?;
+        let models = self.models();
+        let rt = models.get(profile_name).cloned().ok_or_else(|| {
+            format!("The model profile \"{profile_name}\" is not configured ({}).", models.names())
+        })?;
         let remembered = lock(&rt.discovered).clone();
         let profile = rt.client.profile();
         let found = match remembered {
@@ -2905,7 +3033,7 @@ impl Inner {
                 Ok(d) if d.context_window.is_none() => {
                     // Not remembered: every creation is refused until the profile sets a window.
                     return Err(format!(
-                        "The model server at {} answered but reports no context window for the model, so the session would start without knowing it. Set context_window in [models.{profile_name}] of the config and restart the daemon: the config is read only at start.",
+                        "The model server at {} answered but reports no context window for the model, so the session would start without knowing it. Set context_window in [models.{profile_name}] of the config, then run `loom models reload`.",
                         profile.base_url
                     ));
                 }
@@ -2920,7 +3048,7 @@ impl Inner {
                 Err(ModelError::Unavailable { last, .. }) => {
                     if profile.context_window.is_none() {
                         return Err(format!(
-                            "The model server at {} could not be asked for its models ({last}), and the profile \"{profile_name}\" sets no context_window, so the session would start without knowing the model's window. Start the model server, or set context_window in [models.{profile_name}] of the config and restart the daemon: the config is read only at start.",
+                            "The model server at {} could not be asked for its models ({last}), and the profile \"{profile_name}\" sets no context_window, so the session would start without knowing the model's window. Start the model server, or set context_window in [models.{profile_name}] of the config and run `loom models reload`.",
                             profile.base_url
                         ));
                     }
@@ -3597,15 +3725,9 @@ impl Runtime {
         let mut profiles = BTreeMap::new();
         for (name, profile) in &config.models {
             let client = ModelClient::new(name, profile.clone()).map_err(|e| e.to_string())?;
-            profiles.insert(
-                name.clone(),
-                ProfileRt {
-                    client: Arc::new(client),
-                    limiter: Arc::new(Limiter::new(profile.max_concurrent)),
-                    discovered: Mutex::new(None),
-                },
-            );
+            profiles.insert(name.clone(), Arc::new(ProfileRt::new(client, profile.max_concurrent)));
         }
+        let models = Arc::new(ModelTable { default_model: config.default_model.clone(), profiles });
         for warning in start_warnings(&config, cfg!(target_os = "macos")) {
             tracing::warn!("{warning}");
         }
@@ -3629,7 +3751,8 @@ impl Runtime {
             bus,
             packs,
             key,
-            profiles,
+            models: std::sync::RwLock::new(models),
+            model_changes: tokio::sync::Mutex::new(()),
             proxy,
             state: Mutex::new(State::default()),
             activation: Mutex::new(()),
@@ -3780,6 +3903,8 @@ impl Runtime {
         Ok(Runtime { inner })
     }
 
+    /// The configuration the daemon started with. Its `models` and `default_model` are that start-up
+    /// snapshot: the live set is what [`Runtime::health`] lists, and [`Runtime::reload_models`] replaces.
     pub fn config(&self) -> &Config {
         &self.inner.config
     }
@@ -3811,12 +3936,7 @@ impl Runtime {
         }
         let role = inner.packs.role(new.pack.as_deref(), new.role.as_deref())?.clone();
         inner.check_network(&role.pack)?;
-        let profile_name = inner
-            .config
-            .profile(new.model.as_deref().or(role.model.as_deref()))
-            .map_err(|e| e.to_string())?
-            .0
-            .to_string();
+        let profile_name = inner.models().resolve(new.model.as_deref().or(role.model.as_deref()))?;
         let (model, window, from_config) = inner.facts(&profile_name).await?;
         let title = match new.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
             Some(t) => t.to_string(),
@@ -4083,6 +4203,168 @@ impl Runtime {
             .map_err(|e| format!("cannot write the meta.json of {}: {e}", id.as_str()))?;
         self.inner.publish(BusEvent::Session { info: Box::new(info) });
         Ok(())
+    }
+
+    /// Read `[models]` and `default_model` from the configuration file again and use them from now on,
+    /// without a restart (the rest of the configuration is still read only at start). A new profile
+    /// can be used at once. One whose settings changed gets a new client and new request slots, and
+    /// every session bound to it that can still send a request is switched to it again (see
+    /// [`Runtime::set_session_model`]). One that is gone is no longer offered: a session running on it
+    /// keeps its client until it is switched, and an idle one cannot be resumed until then. Refused,
+    /// changing nothing, when the file does not load, it has no `[models]`, or a pack names a profile it
+    /// no longer has.
+    pub async fn reload_models(&self) -> Result<ModelsReload, String> {
+        self.inner.check_open()?;
+        let _one_at_a_time = self.inner.model_changes.lock().await;
+        let path = self.inner.paths.config_file();
+        let cfg = Config::load(&path).map_err(|e| match e {
+            loom_core::config::ConfigError::Parse { .. } => e.to_string(),
+            other => format!("{}: {other}", path.display()),
+        })?;
+        if cfg.models.is_empty() {
+            return Err(format!(
+                "{} has no [models]: a reload would leave the daemon without a model, so nothing was changed.",
+                path.display()
+            ));
+        }
+        // The packs name profiles in their roles (`model`, `alloy_models`, `escalation_model`).
+        self.inner.packs.check_profiles(&cfg.models)?;
+        let old = self.inner.models();
+        let mut report = ModelsReload { default_model: cfg.default_model.clone(), ..ModelsReload::default() };
+        let mut profiles = BTreeMap::new();
+        for (name, p) in &cfg.models {
+            match old.get(name) {
+                Some(rt) if rt.client.profile() == p => {
+                    profiles.insert(name.clone(), rt.clone());
+                }
+                before => {
+                    let client = ModelClient::new(name, p.clone()).map_err(|e| e.to_string())?;
+                    profiles.insert(name.clone(), Arc::new(ProfileRt::new(client, p.max_concurrent)));
+                    if before.is_some() {
+                        report.changed.push(name.clone());
+                    } else {
+                        report.added.push(name.clone());
+                    }
+                    // The daemon's environment is fixed when it starts; a reload cannot add a variable.
+                    if let Some(var) = p.api_key_env.as_deref().filter(|v| !v.is_empty()) {
+                        if std::env::var(var).map_or(true, |v| v.is_empty()) {
+                            report.notes.push(format!(
+                                "Profile \"{name}\" takes its key from {var}, which is not set in the daemon's environment (it is read when the daemon starts): its requests carry no key until the daemon is started with {var} set."
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        report.removed = old.profiles.keys().filter(|n| !cfg.models.contains_key(*n)).cloned().collect();
+        *self.inner.models.write().unwrap_or_else(|p| p.into_inner()) =
+            Arc::new(ModelTable { default_model: cfg.default_model.clone(), profiles });
+        for name in report.changed.clone() {
+            for id in self.inner.sessions_on(&name) {
+                match self.switch(&id, &name, crate::session::SWITCH_RELOADED).await {
+                    Ok(_) => report.rebound.push(id),
+                    Err(e) => report.notes.push(format!(
+                        "Session {} keeps the previous settings of \"{name}\" until it is switched again: {e}",
+                        id.as_str()
+                    )),
+                }
+            }
+        }
+        for name in &report.removed {
+            let left = self.inner.sessions_on(name);
+            if left.is_empty() {
+                continue;
+            }
+            const SHOWN: usize = 8;
+            let mut ids: Vec<&str> = left.iter().take(SHOWN).map(SessionId::as_str).collect();
+            if left.len() > SHOWN {
+                ids.push("…");
+            }
+            report.notes.push(format!(
+                "\"{name}\" is no longer configured, but {} {} still on it ({}): a running one goes on with it, and an idle one cannot be resumed until it is switched with `loom models set <session> <profile>`.",
+                left.len(),
+                if left.len() == 1 { "session is" } else { "sessions are" },
+                ids.join(", ")
+            ));
+        }
+        Ok(report)
+    }
+
+    /// Switch session `id` — a lead or an agent — to model profile `profile`, without a restart: a
+    /// running task sends its requests to the new model from its next step; an idle session from when
+    /// it next runs. The change goes to its `meta.json` first and is recorded in its log as
+    /// `model_switched` (by the task, or by `open`), so the weave keeps following the log. The model and
+    /// window are discovered as for a new session. Its agents keep their own models. Refused: a blank
+    /// or unknown profile, an unknown session, one that has ended.
+    pub async fn set_session_model(&self, id: &SessionId, profile: &str) -> Result<ModelSwitchReceipt, String> {
+        self.inner.check_open()?;
+        let profile = profile.trim();
+        if profile.is_empty() {
+            return Err("Name the model profile to switch to (`loom models list` shows them).".to_string());
+        }
+        let _one_at_a_time = self.inner.model_changes.lock().await;
+        let models = self.inner.models();
+        if models.get(profile).is_none() {
+            return Err(format!(
+                "There is no model profile \"{profile}\" ({}). Add it to [models] in the config and run `loom models reload`.",
+                models.names()
+            ));
+        }
+        let (model, live) = self.switch(id, profile, crate::session::SWITCH_OPERATOR).await?;
+        Ok(ModelSwitchReceipt { session: id.clone(), model, live })
+    }
+
+    /// Point session `id` at `profile`: discovery, then its meta (memory and `meta.json`), then its
+    /// running task when it has one. Returns the new model and whether a task took it. The caller holds
+    /// `model_changes`.
+    async fn switch(&self, id: &SessionId, profile: &str, reason: &str) -> Result<(ModelRef, bool), String> {
+        if self.inner.st().known.get(id).ok_or_else(|| no_session(id))?.finished() {
+            return Err(format!("Session {} has ended, so its model no longer changes.", id.as_str()));
+        }
+        let rt = self
+            .inner
+            .models()
+            .get(profile)
+            .cloned()
+            .ok_or_else(|| format!("The model profile \"{profile}\" is not configured."))?;
+        let (model, window, _) = self.inner.facts(profile).await?;
+        let to = ModelRef { profile: profile.to_string(), model: model.clone(), context_window: window.unwrap_or(0) };
+        // Memory, then disk, then the task: a session activated meanwhile is opened on the new model
+        // (and `open` records the switch); a restart that cuts this short opens it on the new model too.
+        let (meta, before) = {
+            let mut st = self.inner.st();
+            let k = st.known.get_mut(id).ok_or_else(|| no_session(id))?;
+            let before = (k.meta.profile.clone(), k.meta.model.clone(), k.meta.context_window);
+            k.meta.profile = profile.to_string();
+            k.meta.model = model;
+            k.meta.context_window = window;
+            (k.meta.clone(), before)
+        };
+        if let Err(e) = write_json_atomic(&self.inner.paths.session_dir(id).join("meta.json"), &meta) {
+            if let Some(k) = self.inner.st().known.get_mut(id) {
+                (k.meta.profile, k.meta.model, k.meta.context_window) = before;
+            }
+            return Err(format!("cannot write the meta.json of {}: {e}", id.as_str()));
+        }
+        let (info, live) = {
+            let st = self.inner.st();
+            let k = st.known.get(id).ok_or_else(|| no_session(id))?;
+            let input = Input::SwitchModel(Box::new(crate::session::ModelSwitch {
+                client: rt.client.clone(),
+                limiter: rt.limiter.clone(),
+                context_window: window,
+                model: to.clone(),
+                reasoning_replay: rt.client.profile().reasoning_replay,
+                reason: reason.to_string(),
+                // A reload switches a session to a profile whose settings changed: logged even when the
+                // model and window did not, since the server or the request's extra fields may have.
+                settings_changed: reason == crate::session::SWITCH_RELOADED,
+            }));
+            let live = k.active.as_ref().is_some_and(|a| a.inputs.send(input).is_ok());
+            (Inner::info_of(k), live)
+        };
+        self.inner.publish(BusEvent::Session { info: Box::new(info) });
+        Ok((to, live))
     }
 
     /// Record that the operator approved something, with what the approval covers. Handed to the
@@ -4633,9 +4915,15 @@ impl Runtime {
         Ok(entries)
     }
 
+    /// The live `default_model` (empty: none set): the profile a session uses when none is named.
+    pub fn default_model(&self) -> String {
+        self.inner.models().default_model.clone()
+    }
+
     pub async fn health(&self) -> Vec<ModelHealth> {
         let mut out = Vec::new();
-        for (name, rt) in &self.inner.profiles {
+        let models = self.inner.models();
+        for (name, rt) in &models.profiles {
             let reachable = rt.client.health().await;
             let profile = rt.client.profile();
             let discovered = lock(&rt.discovered).clone();
@@ -9191,6 +9479,148 @@ mod tests {
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         assert_eq!(rt2.session(&id).unwrap().meta.title, "Grafana CVE hunt");
         rt2.shutdown().await;
+    }
+
+    /// A runtime whose config also has the profile "other", served by a mock server of its own.
+    async fn env_two_models(primary: Script, second: Script) -> (Env, MockServer) {
+        let other = MockServer::start(second).await.unwrap();
+        let url = other.base_url();
+        let e = env_with(primary, false, |c| {
+            let mut p = c.models["mock"].clone();
+            p.base_url = url;
+            c.models.insert("other".into(), p);
+        })
+        .await;
+        (e, other)
+    }
+
+    fn switches(records: Vec<Record>) -> Vec<loom_core::event::ModelSwitched> {
+        records
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::ModelSwitched(m) => Some(m),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_running_session_switches_model_at_its_next_step_and_keeps_it_across_a_restart() {
+        let (e, other) =
+            env_two_models(Script::new(|_, _| finish("from mock")), Script::new(|_, _| finish("from other"))).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("first turn", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase != Phase::Running)).await;
+        assert!(other.requests().is_empty());
+        assert!(e.rt.set_session_model(&id, "  ").await.is_err(), "a blank profile is refused");
+        let unknown = e.rt.set_session_model(&id, "nope").await.unwrap_err();
+        assert!(unknown.contains("configured profiles: mock, other"), "{unknown}");
+
+        let receipt = e.rt.set_session_model(&id, "other").await.unwrap();
+        assert!(receipt.live, "the session's task took the switch");
+        assert_eq!(receipt.model.profile, "other");
+        assert_eq!(e.rt.session(&id).unwrap().meta.profile, "other");
+        until("switch recorded", || !switches(e.records(&id)).is_empty()).await;
+        let sw = switches(e.records(&id)).remove(0);
+        assert_eq!((sw.from.profile.as_str(), sw.to.profile.as_str()), ("mock", "other"));
+        assert_eq!(sw.reason, crate::session::SWITCH_OPERATOR);
+
+        let before = e.server.requests().len();
+        e.rt.send_message(&id, "again").await.unwrap();
+        until("the next request went to the new model", || !other.requests().is_empty()).await;
+        let turn_ends = || e.records(&id).iter().filter(|r| matches!(r.event, Event::TurnEnd { .. })).count();
+        until("second turn", || turn_ends() == 2).await;
+        assert_eq!(e.server.requests().len(), before, "nothing more went to the old model");
+        assert!(!e.has(&id, |ev| matches!(ev, Event::CacheBreak { .. })), "{:?}", e.kinds(&id));
+
+        // Durable: the next start opens it on the new model and records no second switch.
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert_eq!(rt2.session(&id).unwrap().meta.profile, "other");
+        assert_eq!(switches(rt2.records(&id, None, 2_000).unwrap()).len(), 1);
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_switch_while_idle_is_recorded_when_the_session_next_runs() {
+        let (e, other) =
+            env_two_models(Script::new(|_, _| finish("from mock")), Script::new(|_, _| finish("from other"))).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("inbox", || e.rt.inbox().iter().any(|i| i.session == id)).await;
+        // Dismissed, nothing asks for the session at the next start: it stays without a task.
+        let item = e.rt.inbox().remove(0).item.item_id;
+        e.rt.answer(&item, "").await.unwrap();
+        let status = e.rt.paths().session_dir(&id).join("status.json");
+        until("status published", || {
+            std::fs::read_to_string(&status).is_ok_and(|s| s.contains("\"open_inbox\": 0"))
+        })
+        .await;
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert!(!rt2.session(&id).unwrap().active);
+
+        let receipt = rt2.set_session_model(&id, "other").await.unwrap();
+        assert!(!receipt.live, "no task runs it");
+        assert!(switches(rt2.records(&id, None, 2_000).unwrap()).is_empty(), "recorded when it runs");
+        rt2.send_message(&id, "again").await.unwrap();
+        until("a request on the new model", || !other.requests().is_empty()).await;
+        let sw = switches(rt2.records(&id, None, 2_000).unwrap());
+        assert_eq!(sw.len(), 1);
+        assert_eq!((sw[0].to.profile.as_str(), sw[0].reason.as_str()), ("other", crate::session::SWITCH_IDLE));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reload_models_adds_rebinds_and_removes_profiles_without_a_restart() {
+        let other = MockServer::start(Script::new(|_, _| finish("from other"))).await.unwrap();
+        let e = env(Script::new(|_, _| finish("from mock"))).await;
+        let file = e.rt.paths().config_file();
+        let write = |c: &Config| std::fs::write(&file, toml::to_string(c).unwrap()).unwrap();
+        let mut wanted = e.new_session(Some("go"));
+        wanted.model = Some("other".into());
+        let refused = e.rt.create_session(wanted.clone()).await.unwrap_err();
+        assert!(refused.contains("configured profiles: mock"), "{refused}");
+
+        // Added: usable at once.
+        let mut cfg = e.config.clone();
+        let mut p = cfg.models["mock"].clone();
+        p.base_url = other.base_url();
+        cfg.models.insert("other".into(), p);
+        write(&cfg);
+        let r = e.rt.reload_models().await.unwrap();
+        assert_eq!((r.added.as_slice(), r.changed.len(), r.removed.len()), (&["other".to_string()][..], 0, 0));
+        let id = e.rt.create_session(wanted).await.unwrap().meta.id;
+        until("a request on the added profile", || !other.requests().is_empty()).await;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase != Phase::Running)).await;
+
+        // Changed: a new client and slots, and the session on it is switched to them.
+        cfg.models.get_mut("other").unwrap().max_concurrent = 2;
+        write(&cfg);
+        let r = e.rt.reload_models().await.unwrap();
+        assert_eq!((r.changed.as_slice(), r.rebound.as_slice()), (&["other".to_string()][..], &[id.clone()][..]));
+        let health = e.rt.health().await;
+        assert_eq!(health.iter().find(|h| h.profile == "other").unwrap().max_concurrent, 2);
+        // Same model and window, but the profile changed under a running session: its log says so.
+        until("the reload in the session's log", || {
+            switches(e.records(&id)).iter().any(|s| s.reason == crate::session::SWITCH_RELOADED)
+        })
+        .await;
+
+        // Removed: no longer offered, and the session still on it is named with the way out.
+        cfg.models.remove("other");
+        write(&cfg);
+        let r = e.rt.reload_models().await.unwrap();
+        assert_eq!(r.removed, vec!["other".to_string()]);
+        assert!(r.notes.iter().any(|n| n.contains(id.as_str()) && n.contains("loom models set")), "{:?}", r.notes);
+        let gone = e.rt.set_session_model(&id, "other").await.unwrap_err();
+        assert!(gone.contains("loom models reload"), "{gone}");
+        assert_eq!(e.rt.set_session_model(&id, "mock").await.unwrap().model.profile, "mock");
+
+        // A file that does not load changes nothing.
+        std::fs::write(&file, "[models\n").unwrap();
+        assert!(e.rt.reload_models().await.is_err());
+        assert!(e.rt.health().await.iter().any(|h| h.profile == "mock"));
+        e.rt.shutdown().await;
     }
 
     #[tokio::test]

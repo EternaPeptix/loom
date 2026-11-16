@@ -40,6 +40,7 @@ function oneOfEach() {
     rec("ledger", { n: 3, summary: "s" }),
     rec("net", { host: "h", port: 443, method: "CONNECT", allowed: false, rule: "deny", resolved: "1.2.3.4" }),
     rec("cache_break", { req_id: "r-1", first_diff_message: 2, detail: "d" }),
+    rec("model_switched", { from: { profile: "a", model: "m1", context_window: 1000 }, to: { profile: "b", model: "m2", context_window: 0 }, reasoning_replay: "none", reason: "operator" }),
     rec("interrupted", { reason: "r" }),
     rec("turn_end", { reason: "finished" }),
     rec("session_end", { outcome: "done", detail: "d" }),
@@ -635,8 +636,10 @@ test("one record of each kind: shown kinds produce blocks, hidden kinds do not",
   assert.deepEqual(kinds, [
     "user", "note", "line" /* model_request, detail */, "response", "tool", "reweave", "child_spawned", "child_settled",
     "line" /* job registered */, "line" /* job settled */, "line" /* job matched */, "inbox", "line" /* ledger */, "line" /* cache break */,
-    "line" /* interrupted */, "divider", "end",
+    "line" /* model switched */, "line" /* interrupted */, "divider", "end",
   ]);
+  const switched = store.blocks.find((b) => b.kind === "line" && /model switched/.test(b.text));
+  assert.equal(switched.text, "model switched: a (m1, 1k context) → b (m2) · operator");
   assert.equal(store.blocks[2].detail, true);
   const r = store.blocks.find((b) => b.kind === "response");
   assert.equal(r.reasoningLines, 2);
@@ -649,7 +652,7 @@ test("one record of each kind: shown kinds produce blocks, hidden kinds do not",
   assert.deepEqual(matched.blob, BLOB, "the stored part of the output opens from the line");
   assert.equal(C.recordActivity(rec("job_matched", { job_id: "j1", pattern: "CRASH", matches: 1 })), "Job j1 wrote a line matching /CRASH/");
   assert.equal(store.ended, true);
-  assert.equal(store.next, 26, "the unknown kind still advances the sequence");
+  assert.equal(store.next, 27, "the unknown kind still advances the sequence");
 });
 
 test("tool call and result are one block", () => {

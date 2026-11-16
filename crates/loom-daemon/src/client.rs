@@ -63,12 +63,13 @@
 //! and the client prints `unverified_warning` to stderr, once. `Client::new` alone does not ask.
 
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody, RecordsPage,
-    ReleaseBody, RenameBody, RuleBody, ScopeBody, ScopeReceipt, SessionDetail, StatusView, WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody, ModelBody,
+    ModelsView, RecordsPage, ReleaseBody, RenameBody, RuleBody, ScopeBody, ScopeReceipt, SessionDetail, StatusView,
+    WithdrawBody,
 };
 use loom_agent::runtime::{
-    BusEvent, InboxEntry, LedgerView, MissionInfo, NetEntry, NewSession, RuleReceipt, ScoreView, SessionInfo,
-    WindowView,
+    BusEvent, InboxEntry, LedgerView, MissionInfo, ModelSwitchReceipt, ModelsReload, NetEntry, NewSession,
+    RuleReceipt, ScoreView, SessionInfo, WindowView,
 };
 use loom_core::config::{Config, Paths};
 use loom_core::event::Seq;
@@ -519,6 +520,23 @@ impl Client {
         let body = serde_json::to_value(RenameBody { title: title.to_string() })
             .map_err(|e| format!("The request cannot be encoded ({e})."))?;
         self.call_unit(Method::POST, &format!("/api/sessions/{}/rename", segment(id.as_str())), Some(body)).await
+    }
+
+    /// The live model profiles and the default one.
+    pub async fn models(&self) -> Result<ModelsView, String> {
+        self.call(Method::GET, "/api/models", &[], None).await
+    }
+
+    /// Read `[models]` from the configuration file again (`loom models reload`).
+    pub async fn reload_models(&self) -> Result<ModelsReload, String> {
+        self.call(Method::POST, "/api/models/reload", &[], None).await
+    }
+
+    /// Switch a session to another model profile (`loom models set`).
+    pub async fn set_model(&self, id: &SessionId, profile: &str) -> Result<ModelSwitchReceipt, String> {
+        let body = serde_json::to_value(ModelBody { profile: profile.to_string() })
+            .map_err(|e| format!("The request cannot be encoded ({e})."))?;
+        self.call(Method::POST, &format!("/api/sessions/{}/model", segment(id.as_str())), &[], Some(body)).await
     }
 
     pub async fn records(&self, id: &SessionId, after: Option<Seq>, limit: usize) -> Result<RecordsPage, String> {
