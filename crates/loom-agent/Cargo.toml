@@ -23,6 +23,7 @@ regex.workspace = true
 quick-xml.workspace = true
 tracing.workspace = true
 libc.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

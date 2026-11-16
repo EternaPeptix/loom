@@ -157,18 +157,26 @@ fn resolve_secrets(ctx: &ToolCtx, op: &mut SecurityOp) -> Result<(), String> {
 #[async_trait]
 impl Tool for SecurityRecord {
     fn spec(&self) -> ToolSpec {
-        spec("security_record", "Record typed evidence-linked security observations. operation.action is asset_upsert, credential_add (secret_handle only), foothold_add, condition_unlock, blocked_on, coverage_set, crash_record, hypothesis_open, hypothesis_priority, hypothesis_evidence, hypothesis_verdict, relation_add, fact_assert, fact_retract, rule_install, rule_retract, alias_add, or batch. Use security_query to inspect exact IDs. Assets: {action:asset_upsert,asset:{kind:host|service|endpoint|file|identity,locator:string,evidence:[e1],mandatory:true,parent?:assetID}}. Coverage: {action:coverage_set,asset:ID,disposition:{status:tested,evidence:[e1]}}, or {status:deferred,reason:string}. Facts: {action:fact_assert,fact:{predicate:string,args:[string]},evidence:[e1]}. Rules: {action:rule_install,rule:{name:string,head:{predicate:string,args:[?x]},body:[{atom:{predicate:string,args:[?x]},negated:false}]}}. Every evidence ID must already exist and be attested. These observations never authorize network access.", ToolClass::State,
+        let caller = shapes::Caller { standing: standing(&self.0), tools: &self.0.role.tools };
+        spec("security_record", &shapes::description(&caller), ToolClass::State,
             &[req("operation", "object", "A SecurityOp object with action and its typed fields.")])
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
-        let mut op: SecurityOp = match decode(args.get("operation"), "operation") {
-            Ok(op) => op,
-            Err(e) => return ToolOutput::error(e),
-        };
         let state = match self.0.ledger() {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(e),
         };
+        let caller = shapes::Caller { standing: standing(&self.0), tools: &self.0.role.tools };
+        let operation = args.get("operation").unwrap_or(&Value::Null);
+        let read = match shapes::read(&caller, &state.security, operation) {
+            Ok(read) => read,
+            Err(e) => return ToolOutput::error(e),
+        };
+        // A single hypothesis_open that carried evidence was read as a two-operation batch (N4d).
+        let expanded = matches!(read.op, SecurityOp::Batch { .. })
+            && operation.get("action").and_then(Value::as_str) != Some("batch");
+        let notes = read.notes;
+        let mut op = read.op;
         if let Err(e) = resolve_op(&state.security, &mut op)
             .and_then(|_| resolve_secrets(ctx, &mut op))
             .and_then(|_| authorize(&self.0, &state.security, &op))
@@ -177,9 +185,32 @@ impl Tool for SecurityRecord {
         }
         // Shared::ledger_append serializes all structural validation and writes under the journal lock.
         match self.0.ledger_append(false, LedgerOp::Security(op)) {
-            Ok((entry, state)) => output(&json!({"entry":entry.n,"state":state.security})),
+            Ok((entry, state)) => {
+                let mut result = Map::new();
+                result.insert("entry".into(), json!(entry.n));
+                if !notes.is_empty() {
+                    result.insert("normalized".into(), json!(notes));
+                }
+                result.insert("state".into(), json!(state.security));
+                output(&result)
+            }
+            Err(e) if expanded => ToolOutput::error(format!(
+                "{e} The evidence given with hypothesis_open was being attached by a second operation in the same \
+                 atomic append; nothing was recorded."
+            )),
             Err(e) => ToolOutput::error(e),
         }
+    }
+}
+
+/// The session's standing for hypotheses: the lead, a read-only child with the verdict tool, or another child.
+fn standing(shared: &Shared) -> shapes::Standing {
+    if !shared.is_child() {
+        shapes::Standing::Lead
+    } else if shared.role.read_only && shared.role.tools.iter().any(|t| t == "verdict") {
+        shapes::Standing::Judge
+    } else {
+        shapes::Standing::Child
     }
 }
 
@@ -352,6 +383,11 @@ mod tests {
         role.tools.extend(["security_record".into(), "security_query".into(), "security_ingest".into()]);
         rig_with(role, child, mission, AgentsCfg::default())
     }
+    /// The JSON object a tool result carries after its header lines.
+    fn body_json(text: &str) -> Value {
+        let start = text.find("{\n").unwrap();
+        serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>().next().unwrap().unwrap()
+    }
     fn evidence(r: &Rig, handle: &str) {
         r.model_op(LedgerOp::ClaimAdd { text: "scanner output observed".into() });
         let blob = r.env.ctx.blobs.resolve(handle).unwrap();
@@ -367,6 +403,83 @@ mod tests {
             note: "synthetic scanner fixture".into(),
             attested: true,
         }));
+    }
+
+    #[tokio::test]
+    async fn near_misses_are_read_and_listed_under_normalized() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        let host = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"asset_upsert","asset":{"kind":"host","locator":"127.0.0.1:19727",
+                    "evidence":["e1"]}}}),
+            )
+            .await;
+        assert_eq!(host.status, Status::Ok, "{}", host.text);
+        let body = body_json(&host.text);
+        assert_eq!(body["normalized"].as_array().map(Vec::len), Some(1), "{body}");
+        assert!(body["normalized"][0].as_str().unwrap().starts_with("In the operation, the host was recorded as `127.0.0.1`"));
+        assert_eq!(r.shared.ledger().unwrap().security.assets.values().next().unwrap().locator, "127.0.0.1");
+        // An exact operation has no `normalized` key.
+        let exact = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"asset_upsert","asset":{"kind":"host","locator":"10.0.0.5",
+                    "evidence":["e1"]}}}),
+            )
+            .await;
+        assert_eq!(exact.status, Status::Ok, "{}", exact.text);
+        assert!(body_json(&exact.text).get("normalized").is_none());
+        // A hypothesis opened with evidence is two operations in one append.
+        let open = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"hypothesis_open","hypothesis":{"statement":"candidate","priority":"high",
+                    "evidence":["e1"]}}}),
+            )
+            .await;
+        assert_eq!(open.status, Status::Ok, "{}", open.text);
+        let id = stable_id("hy", &["candidate"]);
+        let state = r.shared.ledger().unwrap().security;
+        assert_eq!(state.hypotheses.get(&id).map(|h| (h.priority, h.evidence.clone())), Some((5, vec!["e1".into()])));
+        // When the second operation fails the whole append fails and the error says so.
+        let failed = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"hypothesis_open","text":"other","priority":2,"evidence":["e404"]}}),
+            )
+            .await;
+        assert_eq!(failed.status, Status::Error);
+        assert!(failed.text.contains("e404"), "{}", failed.text);
+        assert!(failed.text.contains(
+            " The evidence given with hypothesis_open was being attached by a second operation in the same atomic \
+             append; nothing was recorded."
+        ), "{}", failed.text);
+        assert!(!r.shared.ledger().unwrap().security.hypotheses.contains_key(&stable_id("hy", &["other"])));
+        // A failing batch element is named.
+        let batch = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"batch","ops":[
+                    {"action":"asset_upsert","asset":{"kind":"host","locator":"10.0.0.9","evidence":["e1"]}},
+                    {"action":"asset_upsert","asset":{"kind":"host","locator":"10.0.0.10","evidence":["e404"]}}]}}),
+            )
+            .await;
+        assert_eq!(batch.status, Status::Error);
+        assert!(batch.text.contains("Operation 2 of 2 in the batch (asset_upsert): "), "{}", batch.text);
+        assert!(r.shared.ledger().unwrap().security.assets.len() == 2);
+    }
+
+    #[tokio::test]
+    async fn the_description_follows_the_session_standing() {
+        let lead = SecurityRecord(rig("lead", false, true).shared.clone()).spec().description;
+        let child = SecurityRecord(rig("worker", true, true).shared.clone()).spec().description;
+        let judge = SecurityRecord(rig("verifier", true, true).shared.clone()).spec().description;
+        assert!(lead.contains("{action:hypothesis_open,") && !lead.contains("status:supported|refuted"));
+        assert!(!child.contains("{action:hypothesis_open,") && child.contains("the mission lead's"));
+        assert!(judge.contains("status:supported|refuted"));
     }
 
     #[tokio::test]

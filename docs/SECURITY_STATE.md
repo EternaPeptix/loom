@@ -46,6 +46,35 @@ Missing/unattested evidence and blank deferral reasons are rejected. `mandatory_
 finish gate with remaining asset IDs. Tested coverage records that an observation exists; it does
 not mechanically establish exhaustive testing of the asset.
 
+## How `security_record` reads near misses
+
+Logged missions refused many `security_record` calls for shape rather than substance, so the tool reads
+an operation where its meaning is unambiguous and says exactly what it did. Each rewrite is one
+sentence under `normalized` in the result (`{"entry": n, "normalized": [...], "state": ...}`; the key is
+absent when nothing was rewritten). What is read:
+
+- `ops` or `items` for a batch's `operations`; a batch element is read on its own and a failing element
+  is named ("Operation 2 of 3 in the batch (asset_upsert): ..."). A batch stays one atomic append.
+- Wrapper fields for `asset_upsert`, `credential_add`, `foothold_add`, `relation_add` given at the top
+  level, `evidence` given beside the wrapper, `username`/`user` for `principal`.
+- A hypothesis given as `hypothesis: {...}`, `statement` for `text`, a `status` (dropped: a new hypothesis
+  is always open), a missing or word-valued `priority` (`low`, `medium`, `high`; default 3), and evidence
+  given with a single `hypothesis_open` (recorded by a `hypothesis_evidence` operation in the same
+  atomic append). `hypothesis` or `hypothesis_id` for `id`, a missing `counterevidence`, and `verdict`
+  or `confirmed`/`rejected`-style words for a verdict's `status`.
+- A host locator written as `host:port` or a URL is recorded as the host; a service or endpoint locator
+  loses a leading HTTP method and any text after the URL, and a path is joined to the URL of its
+  `parent` when the scheme, host and port stay the same. A locator with URL user information is never
+  rewritten or quoted back; the core refuses it.
+
+What is refused, before anything is recorded and with the shape to send: an action that belongs to
+another tool, an unknown action, a hypothesis verdict from anyone but an independent read-only verifier,
+a hypothesis open or priority change from a child, a condition that is not a typed `{kind, value}`, a
+service or endpoint locator without a scheme or a bare path, and an unreadable priority. Evidence must
+still exist and be attested, authority is still checked by the tool and the core, and these records
+never authorize network access. The tool description lists the exact shape of every action and differs
+by the session's standing (lead, child, or verifier).
+
 ## Conditions, revisits, crashes, and hypotheses
 
 `blocked_on {target,conditions}` associates an existing claim/dead-end ID with typed prerequisites:
