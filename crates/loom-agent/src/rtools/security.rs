@@ -190,8 +190,12 @@ fn resolve_secrets(ctx: &ToolCtx, op: &mut SecurityOp) -> Result<(), String> {
 impl Tool for SecurityRecord {
     fn spec(&self) -> ToolSpec {
         let caller = shapes::Caller { standing: standing(&self.0), tools: &self.0.role.tools };
-        spec("security_record", &shapes::description(&caller), ToolClass::State,
-            &[req("operation", "object", "A SecurityOp object with action and its typed fields.")])
+        spec(
+            "security_record",
+            &shapes::description(&caller),
+            ToolClass::State,
+            &[req("operation", "object", "A SecurityOp object with action and its typed fields.")],
+        )
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let state = match self.0.ledger() {
@@ -466,7 +470,10 @@ mod tests {
         assert_eq!(host.status, Status::Ok, "{}", host.text);
         let body = body_json(&host.text);
         assert_eq!(body["normalized"].as_array().map(Vec::len), Some(1), "{body}");
-        assert!(body["normalized"][0].as_str().unwrap().starts_with("In the operation, the host was recorded as `127.0.0.1`"));
+        assert!(body["normalized"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("In the operation, the host was recorded as `127.0.0.1`"));
         assert_eq!(r.shared.ledger().unwrap().security.assets.values().next().unwrap().locator, "127.0.0.1");
         // An exact operation has no `normalized` key.
         let exact = r
@@ -499,10 +506,14 @@ mod tests {
             .await;
         assert_eq!(failed.status, Status::Error);
         assert!(failed.text.contains("e404"), "{}", failed.text);
-        assert!(failed.text.contains(
-            " The evidence given with hypothesis_open was being attached by a second operation in the same atomic \
+        assert!(
+            failed.text.contains(
+                " The evidence given with hypothesis_open was being attached by a second operation in the same atomic \
              append; nothing was recorded."
-        ), "{}", failed.text);
+            ),
+            "{}",
+            failed.text
+        );
         assert!(!r.shared.ledger().unwrap().security.hypotheses.contains_key(&stable_id("hy", &["other"])));
         // A failing batch element is named.
         let batch = r
@@ -533,9 +544,7 @@ mod tests {
         assert_eq!(host.status, Status::Ok, "{}", host.text);
         let full = r.shared.ledger().unwrap().security.assets.keys().next().unwrap().clone();
         // A prefix in a cred condition is stored as the full asset ID, which is what a later unlock compares.
-        let blocked = |value: &str| {
-            json!({"operation":{"action":"blocked_on","target":"c1","conditions":[{"kind":"cred","value":value}]}})
-        };
+        let blocked = |value: &str| json!({"operation":{"action":"blocked_on","target":"c1","conditions":[{"kind":"cred","value":value}]}});
         let ok = r.call("security_record", blocked(&full[..12])).await;
         assert_eq!(ok.status, Status::Ok, "{}", ok.text);
         let stored = r.shared.ledger().unwrap().security.blocked.get("c1").unwrap().conditions[0].value.clone();
@@ -556,7 +565,11 @@ mod tests {
             )
             .await;
         assert_eq!(batch.status, Status::Error);
-        assert!(batch.text.contains("Operation 2 of 2 in the batch (coverage_set): Use an exact ID or alias"), "{}", batch.text);
+        assert!(
+            batch.text.contains("Operation 2 of 2 in the batch (coverage_set): Use an exact ID or alias"),
+            "{}",
+            batch.text
+        );
         // So does a failing secret handle, and a nested batch.
         let secret = r
             .call(
@@ -567,7 +580,11 @@ mod tests {
                         "secret_handle":"out:nothere"}}]}}),
             )
             .await;
-        assert!(secret.text.contains("Operation 2 of 2 in the batch (credential_add): Use an existing stored out:"), "{}", secret.text);
+        assert!(
+            secret.text.contains("Operation 2 of 2 in the batch (credential_add): Use an existing stored out:"),
+            "{}",
+            secret.text
+        );
         let nested = r
             .call(
                 "security_record",
@@ -577,7 +594,11 @@ mod tests {
                         {"action":"coverage_set","asset":full,"disposition":{"status":"deferred","reason":"budget"}}]}]}}),
             )
             .await;
-        assert!(nested.text.contains("Operation 2 of 2 in the batch (batch): Nested security batches"), "{}", nested.text);
+        assert!(
+            nested.text.contains("Operation 2 of 2 in the batch (batch): Nested security batches"),
+            "{}",
+            nested.text
+        );
         // A child's early refusal inside a batch is named too.
         let child = rig("worker", true, true);
         let denied = child

@@ -1428,11 +1428,8 @@ mod tests {
                 parent: None,
             },
         };
-        let ops = vec![
-            host("a.test", "e1"),
-            host("b.test", "e404"),
-            SecurityOp::RevisitAcknowledge { target: "x".into() },
-        ];
+        let ops =
+            vec![host("a.test", "e1"), host("b.test", "e404"), SecurityOp::RevisitAcknowledge { target: "x".into() }];
         for op in &ops {
             assert_eq!(serde_json::to_value(op).unwrap()["action"], op.action());
         }

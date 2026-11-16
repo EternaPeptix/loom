@@ -296,7 +296,6 @@ pub(super) const ACTIONS: [&str; 19] = [
     "alias_add",
 ];
 
-
 const SUFFIX: &str = " Nothing was recorded.";
 const METHODS: [&str; 7] = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
 const CONDITION_KINDS: [&str; 6] = ["auth", "cred", "role", "leak", "offset", "key"];
@@ -816,9 +815,8 @@ fn has_userinfo(s: &str) -> bool {
         authority.is_some_and(|a| a.contains('@'))
     });
     after_scheme
-        || s.split_whitespace().any(|token| {
-            url::Url::parse(token).is_ok_and(|u| !u.username().is_empty() || u.password().is_some())
-        })
+        || s.split_whitespace()
+            .any(|token| url::Url::parse(token).is_ok_and(|u| !u.username().is_empty() || u.password().is_some()))
 }
 
 /// The host of `s` when it is `name:port` or `[v6]:port` with a decimal port of at most five digits.
@@ -1024,9 +1022,11 @@ pub(super) fn description(caller: &Caller<'_>) -> String {
     order.push("batch");
     for action in order {
         let line = match (action, caller.standing) {
-            ("hypothesis_open", Standing::Child | Standing::Judge) => "- hypothesis_open, hypothesis_priority: the mission lead's; send a \
+            ("hypothesis_open", Standing::Child | Standing::Judge) => {
+                "- hypothesis_open, hypothesis_priority: the mission lead's; send a \
                  proposed hypothesis to the lead."
-                .to_string(),
+                    .to_string()
+            }
             ("hypothesis_priority", Standing::Child | Standing::Judge) => continue,
             ("hypothesis_verdict", Standing::Lead | Standing::Child) => "- hypothesis_verdict: recorded only by an \
                  independent read-only verifier; attach evidence with hypothesis_evidence and the hypothesis stays \
@@ -1036,9 +1036,10 @@ pub(super) fn description(caller: &Caller<'_>) -> String {
         };
         lines.push(line);
     }
-    let mut condition = "A condition is {kind:auth|cred|role|leak|offset|key, value}: a typed prerequisite that a route \
+    let mut condition =
+        "A condition is {kind:auth|cred|role|leak|offset|key, value}: a typed prerequisite that a route \
                          waits on, not a description of a fault."
-        .to_string();
+            .to_string();
     if has("report_blocker") {
         condition.push_str(" Report an unreachable target or a broken environment with report_blocker.");
     }
@@ -1198,7 +1199,8 @@ mod tests {
         let r = ok(lead(json!({"action": "asset_upsert", "kind": "host", "locator": "10.0.0.5", "evidence": ["e1"]})));
         assert_eq!(r.notes, vec!["In the operation, the asset fields were moved into `asset`."]);
         assert_eq!(locator_of(&r), "10.0.0.5");
-        let r = ok(lead(json!({"action": "asset_upsert", "asset": {"kind": "host", "locator": "h"}, "evidence": ["e1"]})));
+        let r =
+            ok(lead(json!({"action": "asset_upsert", "asset": {"kind": "host", "locator": "h"}, "evidence": ["e1"]})));
         assert_eq!(r.notes, vec!["In the operation, `evidence` was moved into `asset`."]);
         let r = ok(lead(json!({"action": "credential_add", "asset": "as-1", "principal": "root",
             "secret_handle": "out:abcdef01", "evidence": ["e1"]})));
@@ -1265,8 +1267,10 @@ mod tests {
             "counterevidence": []})));
         assert_eq!(
             r.notes,
-            vec!["In the operation, the evidence was attached by a hypothesis_evidence operation recorded in the \
-                  same atomic append."]
+            vec![
+                "In the operation, the evidence was attached by a hypothesis_evidence operation recorded in the \
+                  same atomic append."
+            ]
         );
         let id = stable_id("hy", &["s"]);
         assert_eq!(element(&r, 0), json!({"action": "hypothesis_open", "text": " s ", "priority": 4}));
@@ -1341,8 +1345,14 @@ mod tests {
     #[test]
     fn n5_reads_priorities_and_r7_refuses_the_rest() {
         let prio = |v: Value| lead(json!({"action": "hypothesis_open", "text": "s", "priority": v}));
-        for (given, want) in [(json!("low"), 1), (json!(" Medium "), 3), (json!("normal"), 3), (json!("HIGH"), 5),
-            (json!("4"), 4), (json!("255"), 255)] {
+        for (given, want) in [
+            (json!("low"), 1),
+            (json!(" Medium "), 3),
+            (json!("normal"), 3),
+            (json!("HIGH"), 5),
+            (json!("4"), 4),
+            (json!("255"), 255),
+        ] {
             let r = ok(prio(given.clone()));
             assert_eq!(json_of(&r.op)["priority"], want);
             let shown = given.as_str().unwrap_or("");
@@ -1351,7 +1361,9 @@ mod tests {
         for kept in [json!(0), json!(7), json!(255)] {
             assert!(ok(prio(kept)).notes.is_empty());
         }
-        for bad in [json!("urgent"), json!("256"), json!(256), json!(-1), json!(2.5), json!(null), json!(true), json!("")] {
+        for bad in
+            [json!("urgent"), json!("256"), json!(256), json!(-1), json!(2.5), json!(null), json!(true), json!("")]
+        {
             let e = err(prio(bad.clone()));
             assert_eq!(
                 e,
@@ -1362,7 +1374,10 @@ mod tests {
         let r = ok(lead(json!({"action": "hypothesis_priority", "hypothesis": "hy-1", "priority": "high"})));
         assert_eq!(
             r.notes,
-            vec!["In the operation, `hypothesis` was read as `id`.", "In the operation, priority `high` was read as 5."]
+            vec![
+                "In the operation, `hypothesis` was read as `id`.",
+                "In the operation, priority `high` was read as 5."
+            ]
         );
         let e = err(lead(json!({"action": "hypothesis_priority", "id": "hy-1", "priority": "soon"})));
         assert!(e.starts_with("Give priority as an integer"), "{e}");
@@ -1379,9 +1394,18 @@ mod tests {
         let r = ok(judge(json!({"action": "hypothesis_verdict", "id": "hy-1", "status": "Confirmed", "note": "n",
             "evidence": ["e1"]})));
         assert_eq!(r.notes, vec!["In the operation, status `Confirmed` was read as `supported`."]);
-        for (given, want) in [(json!("verified"), "supported"), (json!("true"), "supported"), (json!("accepted"), "supported"),
-            (json!("valid"), "supported"), (json!("disproved"), "refuted"), (json!("rejected"), "refuted"),
-            (json!("false"), "refuted"), (json!("invalid"), "refuted"), (json!(true), "supported"), (json!(false), "refuted")] {
+        for (given, want) in [
+            (json!("verified"), "supported"),
+            (json!("true"), "supported"),
+            (json!("accepted"), "supported"),
+            (json!("valid"), "supported"),
+            (json!("disproved"), "refuted"),
+            (json!("rejected"), "refuted"),
+            (json!("false"), "refuted"),
+            (json!("invalid"), "refuted"),
+            (json!(true), "supported"),
+            (json!(false), "refuted"),
+        ] {
             let r = ok(judge(json!({"action": "hypothesis_verdict", "id": "hy-1", "status": given, "note": "n"})));
             assert_eq!(json_of(&r.op)["status"], want);
             assert_eq!(r.notes.len(), 1, "{given}");
@@ -1393,10 +1417,19 @@ mod tests {
     #[test]
     fn n7a_reduces_a_host_locator_to_the_host() {
         let host = |loc: &str| lead(asset("host", loc));
-        for (given, want) in [("127.0.0.1:19727", "127.0.0.1"), ("http://127.0.0.1:19750", "127.0.0.1"),
-            ("https://Example.test/a/b?x=1", "example.test"), ("db.internal:5432", "db.internal"), ("[::1]:8080", "::1"),
-            ("http://[::1]:8080/x", "::1"), ("  10.0.0.5:80 ", "10.0.0.5"), ("ftp:21", "ftp"), ("http:8080", "http"),
-            ("https:443", "https"), ("ws:80", "ws")] {
+        for (given, want) in [
+            ("127.0.0.1:19727", "127.0.0.1"),
+            ("http://127.0.0.1:19750", "127.0.0.1"),
+            ("https://Example.test/a/b?x=1", "example.test"),
+            ("db.internal:5432", "db.internal"),
+            ("[::1]:8080", "::1"),
+            ("http://[::1]:8080/x", "::1"),
+            ("  10.0.0.5:80 ", "10.0.0.5"),
+            ("ftp:21", "ftp"),
+            ("http:8080", "http"),
+            ("https:443", "https"),
+            ("ws:80", "ws"),
+        ] {
             let r = ok(host(given));
             assert_eq!(locator_of(&r), want, "{given}");
             assert_eq!(
@@ -1414,8 +1447,13 @@ mod tests {
             assert!(r.notes.is_empty(), "{same}");
         }
         // User information is never rewritten and never quoted; the core refuses it.
-        for secret in ["http://user:pass@h/", "user@h:1", "http://:pw@h", "http://10.0.0.5/ http://admin:pw@10.0.0.5/",
-            "http://10.0.0.5/?next=http://admin:pw@x"] {
+        for secret in [
+            "http://user:pass@h/",
+            "user@h:1",
+            "http://:pw@h",
+            "http://10.0.0.5/ http://admin:pw@10.0.0.5/",
+            "http://10.0.0.5/?next=http://admin:pw@x",
+        ] {
             let r = ok(host(secret));
             assert_eq!(locator_of(&r), secret);
             assert!(r.notes.is_empty());
@@ -1428,8 +1466,10 @@ mod tests {
         assert_eq!(locator_of(&r), "http://127.0.0.1:19761/expense");
         assert_eq!(
             r.notes,
-            vec!["In the operation, the HTTP method `POST` was dropped from the locator: an endpoint is identified \
-                  by its URL."]
+            vec![
+                "In the operation, the HTTP method `POST` was dropped from the locator: an endpoint is identified \
+                  by its URL."
+            ]
         );
         let e = err(lead(asset("endpoint", "get   /x")));
         assert!(e.starts_with("An endpoint locator is one absolute URL"), "{e}");
@@ -1437,8 +1477,10 @@ mod tests {
         assert_eq!(locator_of(&r), "http://127.0.0.1:19752");
         assert_eq!(
             r.notes,
-            vec!["In the operation, the text after the URL was not recorded: `acme-sso Flask/Werkzeug 3.1.9`; record \
-                  it as a fact if it matters."]
+            vec![
+                "In the operation, the text after the URL was not recorded: `acme-sso Flask/Werkzeug 3.1.9`; record \
+                  it as a fact if it matters."
+            ]
         );
         let r = ok(lead(asset("endpoint", "PUT https://h.test/a b c")));
         assert_eq!((locator_of(&r).as_str(), r.notes.len()), ("https://h.test/a", 2));
@@ -1447,9 +1489,11 @@ mod tests {
         assert_eq!(locator_of(&r), "POST http://u:p@h.test/a");
         assert!(r.notes.is_empty());
         // User information anywhere in the locator is never rewritten and never quoted.
-        for secret in ["http://10.0.0.5:8080/login (try http://admin:admin@10.0.0.5:8080/)",
+        for secret in [
+            "http://10.0.0.5:8080/login (try http://admin:admin@10.0.0.5:8080/)",
             "http://10.0.0.5:8080 admin via http://admin:hunter2@10.0.0.5:8080/",
-            "POST http://10.0.0.5:8080/a?next=http://u:p@x/"] {
+            "POST http://10.0.0.5:8080/a?next=http://u:p@x/",
+        ] {
             let r = ok(lead(asset("service", secret)));
             assert_eq!(locator_of(&r), secret);
             assert!(r.notes.is_empty(), "{secret}");
@@ -1476,8 +1520,10 @@ mod tests {
             assert_eq!(locator_of(&r), "http://10.0.0.5:8080/render?name=");
             assert_eq!(
                 r.notes,
-                vec!["In the operation, the path `/render?name=` was joined to its parent's URL as \
-                      `http://10.0.0.5:8080/render?name=`."]
+                vec![
+                    "In the operation, the path `/render?name=` was joined to its parent's URL as \
+                      `http://10.0.0.5:8080/render?name=`."
+                ]
             );
         }
         let r = ok(with_parent("GET /a/../b", &id));
@@ -1510,8 +1556,12 @@ mod tests {
 
     #[test]
     fn r5_and_r6_refuse_a_locator_the_core_cannot_use() {
-        for (loc, shown) in [("172.17.0.3:8080", "172.17.0.3:8080"), ("localhost", "localhost"),
-            ("app.test:8080/login", "app.test:8080/login"), ("[::1]:80", "[::1]:80")] {
+        for (loc, shown) in [
+            ("172.17.0.3:8080", "172.17.0.3:8080"),
+            ("localhost", "localhost"),
+            ("app.test:8080/login", "app.test:8080/login"),
+            ("[::1]:80", "[::1]:80"),
+        ] {
             let e = err(lead(asset("service", loc)));
             assert_eq!(
                 e,
@@ -1540,7 +1590,10 @@ mod tests {
         // R6: no parent, or a parent that is a host.
         let (state, id) = state_with("10.0.0.5", AssetKind::Host);
         let e = err(lead(asset("endpoint", "/render?name=")));
-        assert!(e.contains("such as `http://10.0.0.5:8080/render?name=`") && e.ends_with("Nothing was recorded."), "{e}");
+        assert!(
+            e.contains("such as `http://10.0.0.5:8080/render?name=`") && e.ends_with("Nothing was recorded."),
+            "{e}"
+        );
         let e = err(go_in(
             &state,
             Standing::Lead,
@@ -1556,7 +1609,8 @@ mod tests {
         let blocked = |conditions: Value, tools: &[&str]| {
             go(Standing::Lead, tools, json!({"action": "blocked_on", "target": "c1", "conditions": conditions}))
         };
-        let head = "A condition is a typed prerequisite {kind, value} with kind auth, cred, role, leak, offset or key, \
+        let head =
+            "A condition is a typed prerequisite {kind, value} with kind auth, cred, role, leak, offset or key, \
                     for example {\"kind\": \"cred\", \"value\": \"<asset ID>\"}; ";
         let more = " To report that a target is unreachable or the environment is broken, use report_blocker.";
         let e = err(blocked(json!(["Target returns 502"]), &tools_with));
@@ -1568,12 +1622,14 @@ mod tests {
         let e = err(blocked(json!([{"kind": "cred", "value": "x"}, 5]), &[]));
         assert!(e.contains("`5` is not one."), "{e}");
         assert!(blocked(json!([{"kind": "cred", "value": "x"}]), &[]).is_ok());
-        let e = err(go(Standing::Lead, &[], json!({"action": "condition_unlock", "conditions": ["x"], "evidence": []})));
+        let e =
+            err(go(Standing::Lead, &[], json!({"action": "condition_unlock", "conditions": ["x"], "evidence": []})));
         assert!(e.starts_with(head), "{e}");
         let e = err(lead(json!({"action": "credential_add", "credential": {"asset": "as-1", "principal": "p",
             "secret_handle": "out:abcdef01", "evidence": ["e1"], "unlocks": ["admin"]}})));
         assert!(e.contains("`admin` is not one."), "{e}");
-        let e = err(lead(batch(vec![json!({"action": "foothold_add", "foothold": {"asset": "as-1", "principal": "p",
+        let e =
+            err(lead(batch(vec![json!({"action": "foothold_add", "foothold": {"asset": "as-1", "principal": "p",
             "access": "a", "evidence": ["e1"], "unlocks": [{"kind": "root", "value": "v"}]}})])));
         assert!(e.starts_with("Operation 1 of 1 in the batch (foothold_add): A condition is"), "{e}");
     }
@@ -1614,7 +1670,10 @@ mod tests {
     #[test]
     fn r1_names_a_separate_tool_and_unknown_actions_list_the_valid_ones() {
         let e = err(go(Standing::Lead, &["claim_update", "evidence"], json!({"action": "claim_update", "id": "c1"})));
-        assert_eq!(e, "`claim_update` is a separate tool, not a security_record action; call it directly. Nothing was recorded.");
+        assert_eq!(
+            e,
+            "`claim_update` is a separate tool, not a security_record action; call it directly. Nothing was recorded."
+        );
         let e = err(lead(json!({"action": "claim_update", "id": "c1"})));
         assert!(e.starts_with("Correct `operation` before retrying: `claim_update` is not a security_record action; use one of batch, asset_upsert,"), "{e}");
         assert!(e.ends_with("alias_add. Nothing was recorded."), "{e}");
@@ -1639,7 +1698,10 @@ mod tests {
         assert!(!e.contains("hunter2"), "{e}");
         assert!(e.contains("credential_add takes {action:credential_add"), "{e}");
         let e = err(lead(batch(vec![json!({"action": "fact_retract", "id": "ft-1", "reason": 5})])));
-        assert!(e.starts_with("Operation 1 of 1 in the batch (fact_retract): correct it before retrying: invalid type"), "{e}");
+        assert!(
+            e.starts_with("Operation 1 of 1 in the batch (fact_retract): correct it before retrying: invalid type"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -1696,7 +1758,9 @@ mod tests {
         assert!(lead_d.ends_with("These records never authorize network access."));
         assert_eq!(lead_d, d(Standing::Lead, &all));
         let bare = d(Standing::Lead, &[]);
-        assert!(!bare.contains("report_blocker") && !bare.contains("security_query") && !bare.contains("evidence tool"));
+        assert!(
+            !bare.contains("report_blocker") && !bare.contains("security_query") && !bare.contains("evidence tool")
+        );
         assert!(bare.contains("Evidence IDs (eN) must already exist and be attested. Evidence IDs are given exactly;"));
         // The batch is the last action line, the shapes are listed in the enum order.
         let lines: Vec<&str> = lead_d.lines().collect();
@@ -1710,10 +1774,18 @@ mod tests {
         // host:port and URL hosts, method-prefixed and described service locators, scheme-less services.
         assert_eq!(locator_of(&ok(lead(asset("host", "127.0.0.1:19727")))), "127.0.0.1");
         assert_eq!(locator_of(&ok(lead(asset("host", "http://127.0.0.1:19750")))), "127.0.0.1");
-        assert_eq!(locator_of(&ok(lead(asset("endpoint", "POST http://127.0.0.1:19761/expense")))), "http://127.0.0.1:19761/expense");
-        assert_eq!(locator_of(&ok(lead(asset("service", "http://127.0.0.1:19752 acme-sso Flask/Werkzeug 3.1.9")))), "http://127.0.0.1:19752");
+        assert_eq!(
+            locator_of(&ok(lead(asset("endpoint", "POST http://127.0.0.1:19761/expense")))),
+            "http://127.0.0.1:19761/expense"
+        );
+        assert_eq!(
+            locator_of(&ok(lead(asset("service", "http://127.0.0.1:19752 acme-sso Flask/Werkzeug 3.1.9")))),
+            "http://127.0.0.1:19752"
+        );
         assert!(err(lead(asset("service", "172.17.0.3:8080"))).starts_with("Give the scheme as well"));
-        assert!(err(lead(asset("endpoint", "GET /render?name="))).starts_with("An endpoint locator is one absolute URL"));
+        assert!(
+            err(lead(asset("endpoint", "GET /render?name="))).starts_with("An endpoint locator is one absolute URL")
+        );
         // hypotheses
         let r = ok(lead(json!({"action": "hypothesis_open", "hypothesis": {"statement": "s", "status": "verified",
             "priority": "high", "evidence": ["e1"]}})));
@@ -1722,8 +1794,10 @@ mod tests {
         assert_eq!(json_of(&r.op)["priority"], 3);
         let r = ok(lead(json!({"action": "hypothesis_evidence", "hypothesis": "hy-1", "evidence": ["e1"]})));
         assert_eq!(json_of(&r.op)["counterevidence"], json!([]));
-        assert!(err(lead(json!({"action": "hypothesis_verdict", "verdict": "supported"}))).starts_with("Only an independent"));
-        assert!(err(lead(json!({"action": "hypothesis_verdict", "status": "confirmed"}))).starts_with("Only an independent"));
+        assert!(err(lead(json!({"action": "hypothesis_verdict", "verdict": "supported"})))
+            .starts_with("Only an independent"));
+        assert!(err(lead(json!({"action": "hypothesis_verdict", "status": "confirmed"})))
+            .starts_with("Only an independent"));
         // batch spellings
         assert!(ok(lead(json!({"action": "batch", "ops": [asset("host", "h")]}))).notes.len() == 1);
         assert!(ok(lead(json!({"action": "batch", "items": [asset("host", "h")]}))).notes.len() == 1);
@@ -1735,9 +1809,12 @@ mod tests {
             "secret_handle": "out:abcdef01"}, "evidence": ["e1"]})));
         assert_eq!(r.notes.len(), 2);
         // blocked_on
-        assert!(err(lead(json!({"action": "blocked_on", "conditions": ["Target returns 502"]}))).contains("report_blocker"));
+        assert!(
+            err(lead(json!({"action": "blocked_on", "conditions": ["Target returns 502"]}))).contains("report_blocker")
+        );
         assert!(err(lead(json!({"action": "blocked_on", "target": "c1",
-            "conditions": [{"kind": "container_running", "value": "x"}]}))).contains("`container_running`"));
+            "conditions": [{"kind": "container_running", "value": "x"}]})))
+        .contains("`container_running`"));
         assert!(err(lead(json!({"action": "claim_update", "id": "c1"}))).contains("not a security_record action"));
     }
 
@@ -1760,8 +1837,10 @@ mod tests {
                 Some("judge") => Standing::Judge,
                 _ => Standing::Lead,
             };
-            let tools: Vec<String> =
-                entry["tools"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect()).unwrap_or_default();
+            let tools: Vec<String> = entry["tools"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+                .unwrap_or_default();
             match read(&Caller { standing, tools: &tools }, &state, &entry["operation"]) {
                 Ok(read) => {
                     ok_count += 1;
