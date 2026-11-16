@@ -1086,9 +1086,9 @@ The Seatbelt policy:
   `~/.terraform.d`, `~/.config/rclone`, `~/.s3cfg`, `~/.boto`, `~/.gem/credentials`, `~/.m2/settings.xml`,
   `~/.m2/settings-security.xml`, `~/.gradle/gradle.properties`, `~/.yarnrc.yml`, `~/.composer/auth.json`,
   `~/.codex/auth.json`, `~/.claude.json`, `~/.claude/.credentials.json`, `~/.config/github-copilot`,
-  `~/.config/hub`, `~/.config/glab-cli`, `~/.oci`, `~/.config/doctl`, `~/.fly`, `~/.config/heroku`,
+  `~/.config/hub`, `~/.config/glab-cli`, `~/.oci`, `~/.config/doctl`, `~/.fly/config.yml`, `~/.config/heroku`,
   `~/.heroku`, `~/.config/netlify`, `~/.config/sops`, `~/.age`, `~/.config/age`, `~/.bitcoin`,
-  `~/.ethereum`, `~/.config/solana`, `~/.wrangler`, `~/.config/.wrangler`, `~/.pulumi`,
+  `~/.ethereum`, `~/.config/solana`, `~/.wrangler`, `~/.config/.wrangler`, `~/.pulumi/credentials.json`,
   `~/Library/Keychains`, `~/Library/Cookies`, the Chrome (also Beta and Canary), Chromium, Brave, Edge,
   Arc, Vivaldi, Opera, Firefox and Safari profiles; under `~/Library/Application Support`: `Bitwarden`,
   `Bitwarden CLI`, `1Password`, `Telegram Desktop`, `Claude/claude_desktop_config.json`, `doctl` and

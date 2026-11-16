@@ -18,8 +18,12 @@
 //!   own log, a stored output, or an earlier mission's results, as Bubblewrap already hides the home. The
 //!   loom home's own entry and each directory between it and those can be looked up (their metadata read)
 //!   but not listed or read. Names are hidden as well as content: the home's files cannot be found by
-//!   their file id (`fsgetpath`), searched for by name (`searchfs`, denied everywhere as `file-search`),
-//!   nor tested for existence. A session's job output directory (`with_jobs_dir`; its commands' own stdout
+//!   their file id (`fsgetpath`) or searched for by name (`searchfs`, denied everywhere as `file-search`),
+//!   and only the direct children of those lookup directories (and what lies below a `node_modules` there,
+//!   which loom never makes: npm and Node search `<ancestor>/node_modules/.bin` for commands) can be tested for existence — a missing one
+//!   answers "no such file" (tools that walk up looking for `package.json`, `node_modules/.bin` or
+//!   `pyproject.toml` treat any other error as fatal), one that exists still gives EPERM for its metadata
+//!   and content; nothing deeper can be tested. A session's job output directory (`with_jobs_dir`; its commands' own stdout
 //!   and stderr files are there) gives commands the metadata of what is in it and nothing more — `fstat` of an
 //!   inherited descriptor is a metadata read, and without it `cat` fails and Python loses its output —
 //!   so those files can be neither read nor listed. Also not readable: `<workspace>/.loom/oracle-secrets`,
@@ -73,8 +77,9 @@
 //! (deny file-read* file-test-existence (subpath "<unreadable or credential store>") …)
 //! (deny file-read* file-test-existence (subpath "<loom home>"))
 //! (allow file-read-metadata file-test-existence (literal "<loom home>") (literal "<each directory between it and the session temp dir>") …)
+//! (allow file-test-existence (regex #"^<each of those directories>/[^/]+$") (regex #"^<same>/node_modules/") …)   ; a missing name gives ENOENT, not EPERM
 //! (allow file-read* file-test-existence (subpath "<session temp dir>") (subpath "<session dir>/analysis"))   ; a replay: its staged workspace and temp
-//! (deny file-read* file-test-existence (subpath "<unreadable or credential store at, inside or around those>") …)
+//! (deny file-read* file-test-existence (subpath "<unreadable path in the home, or at, inside or around those>") …)
 //! (allow file-read-metadata (subpath "<session dir>/jobs"))      ; only with `with_jobs_dir`: metadata, never content
 //! (deny file-write-unlink (literal "<writable directory that holds one of the above>") …)
 //! (deny file-write-create (require-all (vnode-type SYMLINK) (require-any (literal "<same directory>") …)))
@@ -253,7 +258,7 @@ const CREDENTIAL_PATHS: &[&str] = &[
     ".config/glab-cli",
     ".oci",
     ".config/doctl",
-    ".fly",
+    ".fly/config.yml",
     ".config/heroku",
     ".heroku",
     ".config/netlify",
@@ -265,7 +270,7 @@ const CREDENTIAL_PATHS: &[&str] = &[
     ".config/solana",
     ".wrangler",
     ".config/.wrangler",
-    ".pulumi",
+    ".pulumi/credentials.json",
     "Library/Keychains",
     "Library/Cookies",
     "Library/Application Support/Google/Chrome",
@@ -507,6 +512,23 @@ fn sbpl(path: &Path) -> io::Result<String> {
         )));
     }
     Ok(s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// `path` as the text of an SBPL regex that matches exactly it (regex metacharacters escaped); `None` for a
+/// path that cannot be written inside `#"..."` or is not valid as a profile string.
+fn regex_literal(path: &Path) -> Option<String> {
+    let s = sbpl(path).ok()?;
+    if s.contains('"') || s.contains('\\') {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if ".^$|()[]{}*+?".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Some(out)
 }
 
 fn expand_home(given: &str, home: Option<&Path>) -> Option<PathBuf> {
@@ -988,14 +1010,33 @@ impl Sandbox {
                 lookup.iter().filter_map(|p| sbpl(p).ok()).map(|s| format!(" (literal \"{s}\")")).collect();
             // `file-read*` does not cover `file-test-existence`: without it a command could still ask the kernel
             // for the name of every file under the home by its id (`fsgetpath`), so the names are denied too.
+            // A name that is missing from one of those directories must answer "no such file", not EPERM: tools
+            // that look for `package.json`, `node_modules/.bin/sh` or `pyproject.toml` above the temp dir treat
+            // anything but ENOENT as fatal (Node, libuv's PATH search, Python before 3.14). So the direct children
+            // of each lookup directory can be tested for existence (the answer for one that exists is still
+            // EPERM: its metadata and content stay unreadable), and so can what lies below a `node_modules` there:
+            // npm puts `<each ancestor>/node_modules/.bin` on `PATH` and libuv ends its search at the first EPERM,
+            // so `<ancestor>/node_modules/.bin/sh` must be ENOENT too. Loom never makes such a directory, so that
+            // names nothing. Nothing else deeper can be tested, so `fsgetpath` of what the home holds still fails.
+            let children: String = lookup
+                .iter()
+                .filter_map(|p| regex_literal(p))
+                .map(|r| format!(" (regex #\"^{r}/[^/]+$\") (regex #\"^{r}/node_modules/\")"))
+                .collect();
             out.push_str(&format!(
                 "(deny file-read* file-test-existence (subpath \"{h}\"))\n\
                  (allow file-read-metadata file-test-existence{literals})\n\
+                 (allow file-test-existence{children})\n\
                  (allow file-read* file-test-existence{})\n",
                 subpaths(&open)
             ));
-            let again: Vec<PathBuf> =
-                unreadable.iter().filter(|u| open.iter().any(|o| under(u, o) || under(o, u))).cloned().collect();
+            // What is not readable stays so wherever it lies in the home, a direct child of a lookup directory
+            // (`token`, `keys`) included: the rule above would otherwise let its name be tested.
+            let again: Vec<PathBuf> = unreadable
+                .iter()
+                .filter(|u| under(u, &self.loom_home) || open.iter().any(|o| under(u, o) || under(o, u)))
+                .cloned()
+                .collect();
             if !again.is_empty() {
                 out.push_str(&format!("(deny file-read* file-test-existence{})\n", subpaths(&again)));
             }
@@ -1404,6 +1445,7 @@ mod tests {
              (deny file-read* file-test-existence (subpath \"{r}/home\"))\n\
              (allow file-read-metadata file-test-existence (literal \"{r}/home\"))\n\
              (allow file-read* file-test-existence (subpath \"{r}/tmp\"))\n\
+             (deny file-read* file-test-existence (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\"))\n\
              (deny file-write-unlink{holders})\n\
              (deny file-write-create (require-all (vnode-type SYMLINK) (require-any{holders})))\n\
              (deny lsopen)\n(deny appleevent-send)\n(deny job-creation)\n(deny file-search)\n\
@@ -2644,7 +2686,10 @@ mod tests {
             .find(&format!("(allow file-read* file-test-existence (subpath \"{t}\") (subpath \"{a}\"))\n"))
             .expect("temp dir and analysis staging read");
         let again = p
-            .rfind(&format!("(deny file-read* file-test-existence (subpath \"{t}/secret\"))\n"))
+            .rfind(&format!("(subpath \"{t}/secret\")"))
+            .filter(|&at| {
+                p[..at].rsplit('\n').next().is_some_and(|l| l.starts_with("(deny file-read* file-test-existence"))
+            })
             .expect("unreadable inside the temp dir");
         let jobs_allow =
             p.find(&format!("(allow file-read-metadata (subpath \"{h}/sessions/s1/jobs\"))\n")).expect("jobs metadata");
@@ -2806,6 +2851,161 @@ mod tests {
         }
     }
 
+    fn node() -> Option<&'static str> {
+        ["/opt/homebrew/bin/node", "/usr/local/bin/node"].into_iter().find(|n| Path::new(n).exists())
+    }
+
+    #[test]
+    fn the_profile_lets_the_names_next_to_the_lookup_directories_be_tested_not_read() {
+        let f = fx_home_files();
+        let (h, t) = (s(&f.home).to_string(), s(&f.tmp).to_string());
+        let rx = |d: &str| format!(" (regex #\"^{}/[^/]+$\")", d.replace('.', "\\."));
+        let p = build(&f, &cfg(SandboxMode::Seatbelt), None).profile().expect("profile");
+        let both = |d: &str| format!("{} (regex #\"^{}/node_modules/\")", rx(d), d.replace('.', "\\."));
+        let line = format!(
+            "(allow file-test-existence{}{}{})\n",
+            both(&h),
+            both(&format!("{h}/sessions")),
+            both(&format!("{h}/sessions/s1"))
+        );
+        let at = p.find(&line).expect("children of the lookup directories can be tested for existence");
+        let deny = p.find(&format!("(deny file-read* file-test-existence (subpath \"{h}\"))\n")).expect("home deny");
+        let open = p.find(&format!("(allow file-read* file-test-existence (subpath \"{t}\")")).expect("open");
+        assert!(deny < at && at < open, "{p}");
+        // Never read or metadata: only the existence test.
+        assert!(!p.lines().any(|l| l.contains("(regex #\"^") && l.contains("file-read")), "{p}");
+        // The token stays denied after that rule.
+        assert!(
+            p.rfind(&format!("(deny file-read* file-test-existence (subpath \"{h}/token\")")).expect("token") > at,
+            "{p}"
+        );
+    }
+
+    /// A missing name next to the temp dir's ancestors is "no such file", not EPERM: what exists is still refused.
+    #[test]
+    fn missing_names_above_the_temp_dir_are_not_found_and_existing_ones_are_refused() {
+        if !available() || !Path::new("/usr/bin/python3").exists() {
+            return;
+        }
+        let f = fx_home_files();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let probe = "import errno, os, sys\n\
+                     for rel in sys.argv[1:]:\n\
+                     \x20   try:\n\
+                     \x20       open(os.path.join(os.environ['TMPDIR'], rel)).close()\n\
+                     \x20       print(rel, 'OK')\n\
+                     \x20   except OSError as e:\n\
+                     \x20       print(rel, errno.errorcode[e.errno])\n";
+        let py = f.root.join("probe.py");
+        std::fs::write(&py, probe).expect("write");
+        let (ok, text) = run(
+            &sb,
+            &f.ws,
+            &format!(
+                "python3 -I '{}' ../package.json ../../package.json ../../../package.json ../log.jsonl ../../s2 ../../../token ../../../blobs/aa/x ../../../blobs/zz/x",
+                s(&py)
+            ),
+        );
+        assert!(ok, "{text}");
+        for (rel, want) in [
+            ("../package.json", "ENOENT"),
+            ("../../package.json", "ENOENT"),
+            ("../../../package.json", "ENOENT"),
+            ("../log.jsonl", "EPERM"),
+            ("../../s2", "EPERM"),
+            ("../../../token", "EPERM"),
+            ("../../../blobs/aa/x", "EPERM"),
+            // Deeper than the children of a lookup directory: still refused, found or not.
+            ("../../../blobs/zz/x", "EPERM"),
+        ] {
+            assert!(text.contains(&format!("{rel} {want}\n")), "{rel} should be {want}: {text}");
+        }
+        let (ok, text) = run(&sb, &f.ws, "ls \"$TMPDIR/../nope\"");
+        assert!(!ok && text.contains("No such file") && !text.contains("not permitted"), "{text}");
+        // Python before 3.14 raises on EPERM when it walks up looking for a project root.
+        let walk = "python3 -c \"from pathlib import Path; c=Path.cwd(); print([str(d) for d in [c,*c.parents] if (d/'pyproject.toml').is_file() or (d/'.git').exists()])\"";
+        let (ok, text) = run(&sb, &f.tmp, walk);
+        assert!(ok && text.trim() == "[]", "{text}");
+    }
+
+    /// Node treats anything but ENOENT as fatal when it looks for a `package.json` above a script, and libuv ends
+    /// its `PATH` search at the first error that is not ENOENT: the production and the replay layout must run both.
+    #[test]
+    fn node_runs_scripts_and_spawns_commands_from_the_temp_dir_and_in_a_replay() {
+        let Some(node) = node().filter(|_| available()) else { return };
+        let f = fx_home_files();
+        let caller = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let spawn = "require('child_process').execFileSync('sh',['-c','echo spawn-ok'],{stdio:'inherit'})";
+        let tmp_script = format!(
+            "cd \"$TMPDIR\" && printf \"console.log('js ok')\\n\" > a.js && {node} a.js && {node} \"$TMPDIR/a.js\" && \
+             {node} -e \"require(process.env.TMPDIR+'/a.js')\" && mkdir -p sub && cp a.js sub/ && {node} sub/a.js && \
+             PATH=\"$TMPDIR/../node_modules/.bin:$TMPDIR/../../node_modules/.bin:$TMPDIR/../../../node_modules/.bin:$PATH\" {node} -e \"{spawn}\""
+        );
+        let (ok, text) = run(&caller, &f.ws, &tmp_script);
+        assert!(ok && text.matches("js ok").count() == 4 && text.contains("spawn-ok"), "{text}");
+        // A script in the workspace and one in the temp dir run from the workspace too.
+        std::fs::write(f.tmp.join("b.js"), "console.log('b ok')").expect("write");
+        let (ok, text) = run(&caller, &f.ws, &format!("{node} \"$TMPDIR/b.js\""));
+        assert!(ok && text.trim() == "b ok", "{text}");
+
+        // The replay layout: staged under the home's oracle-runs, with no pinned package.json.
+        let private = caller.oracle_staging_root().join("run-node");
+        let (ws, tmp) = (private.join("workspace"), private.join("tmp"));
+        for d in [&ws, &tmp] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        std::fs::write(ws.join("check.js"), "console.log('check ok')").expect("write");
+        std::fs::write(ws.join("package.json"), "{\"scripts\":{\"test\":\"node check.js\"}}").expect("write");
+        std::fs::create_dir_all(ws.join("bare")).expect("mkdir");
+        std::fs::write(ws.join("bare/check.js"), "console.log('bare ok')").expect("write");
+        let replay = caller.isolated_replay(&ws, &tmp).expect("replay");
+        let (ok, text) = run(&replay, &ws, &format!("{node} check.js && cd bare && {node} check.js"));
+        assert!(ok && text.contains("check ok") && text.contains("bare ok"), "{text}");
+        let npm = node.replace("/node", "/npm");
+        let npm_env = format!("PATH={}:$PATH", Path::new(node).parent().expect("dir").display());
+        if Path::new(&npm).exists() {
+            let (ok, text) = run(&replay, &ws, &format!("{npm_env} {npm} test"));
+            assert!(ok && text.contains("check ok"), "{text}");
+            // An npm script in a package in the production temp dir runs (npm spawns `sh` by name).
+            let (ok, text) = run(
+                &caller,
+                &f.ws,
+                &format!(
+                    "mkdir -p \"$TMPDIR/np\" && cd \"$TMPDIR/np\" && printf '{{\"name\":\"np\",\"scripts\":{{\"test\":\"echo test-ran\"}}}}' > package.json && {npm_env} {npm} test"
+                ),
+            );
+            assert!(ok && text.contains("test-ran"), "{text}");
+        }
+    }
+
+    /// `~/.fly` and `~/.pulumi` are protected as their credential files: with their `bin` directories on `PATH`
+    /// (the installers do that) libuv would end its search at the first EPERM and Node could spawn nothing by name.
+    #[test]
+    fn a_credential_tools_bin_directory_on_path_does_not_stop_node_spawning_commands() {
+        let Some(node) = node().filter(|_| available()) else { return };
+        let f = fx_home_files();
+        let fake = f.root.join("fakehome-bin");
+        for d in [".fly/bin", ".pulumi/bin"] {
+            std::fs::create_dir_all(fake.join(d)).expect("mkdir");
+        }
+        std::fs::write(fake.join(".fly/config.yml"), "access_token: SECRET").expect("write");
+        std::fs::write(fake.join(".pulumi/credentials.json"), "SECRET").expect("write");
+        let sb = build_home(&f, &cfg(SandboxMode::Seatbelt), &fake);
+        let spawn = "require('child_process').execFileSync('sh',['-c','echo spawn-ok'],{stdio:'inherit'})";
+        let (fl, pu) = (s(&fake.join(".fly/bin")).to_string(), s(&fake.join(".pulumi/bin")).to_string());
+        for cwd in [&f.ws, &f.tmp] {
+            let (ok, text) = run(&sb, cwd, &format!("PATH={fl}:{pu}:/usr/bin:/bin {node} -e \"{spawn}\""));
+            assert!(ok && text.contains("spawn-ok"), "{text}");
+        }
+        // The credential files are still refused, and so is a name that exists next to them.
+        for rel in [".fly/config.yml", ".pulumi/credentials.json"] {
+            let (ok, text) = run(&sb, &f.ws, &format!("cat '{}/{rel}'", s(&fake)));
+            assert!(!ok && text.contains("Operation not permitted") && !text.contains("SECRET"), "{rel}: {text}");
+        }
+        assert!(sb.check_read(&fake.join(".fly/config.yml")).is_err());
+        assert!(sb.check_read(&fake.join(".pulumi/credentials.json")).is_err());
+    }
+
     /// The kernel can name a file by its id (`fsgetpath`), whatever the profile says of reading it, unless the
     /// existence of what is under the loom home is denied as well. Ids near the home's own are asked for.
     #[test]
@@ -2843,13 +3043,24 @@ mod tests {
         let found: Vec<&str> = text.lines().filter_map(|l| l.strip_prefix("FOUND ")).collect();
         // The probe works: the home, the temp dir and what is in it are named.
         assert!(found.contains(&h.as_str()) && found.iter().any(|p| p.ends_with("/tmp/note")), "{text}");
+        // The home, the directories to the temp dir, and their direct children (a missing name must be ENOENT, so
+        // those can be tested for existence); `token` is denied again and nothing deeper is named.
         let allowed = [h.clone(), format!("{h}/sessions"), format!("{h}/sessions/s1")];
+        let child_of_lookup = |p: &str| {
+            [h.clone(), format!("{h}/sessions"), format!("{h}/sessions/s1")]
+                .iter()
+                .any(|d| p.strip_prefix(&format!("{d}/")).is_some_and(|r| !r.contains('/')))
+                && p != format!("{h}/token")
+        };
         // Other tests make files on the same volume at the same time: only what lies in this fixture is judged.
         let (root, creds) = (s(&f.root).to_string(), format!("{}/.ssh", s(&fake)));
         for path in found.iter().filter(|p| p.starts_with(&root)) {
             let own = path.starts_with(&format!("{t}/")) || *path == t;
             let under_home = *path == h || path.starts_with(&format!("{h}/"));
-            assert!(!under_home || own || allowed.iter().any(|a| a == path), "named by file id: {path}");
+            assert!(
+                !under_home || own || child_of_lookup(path) || allowed.iter().any(|a| a == path),
+                "named by file id: {path}"
+            );
             assert!(
                 !(*path == creds || path.starts_with(&format!("{creds}/"))),
                 "a credential store was named: {path}"

@@ -22,6 +22,13 @@
   hashing and the copy of a workspace made for an agent (and its adoption) now judge the real path of the file
   they open, so a link swapped in after a check reads and copies nothing refused. `dep_scan` names the report
   files it refused. `workcopy::make` and `adopt` take a read judge.
+- Missing names in the directories between the home and the temp dir answer "no such file" again (only their
+  direct children can be tested for existence; existing ones still give EPERM, nothing deeper is testable), so
+  `node a.js` and `require` from `$TMPDIR`, `npm test`, Node spawning `sh` by name with an ancestor's
+  `node_modules/.bin` on `PATH`, and Python 3.9's `pathlib` upward walks work, in a replay too.
+- `~/.fly` and `~/.pulumi` are protected as `~/.fly/config.yml` and `~/.pulumi/credentials.json` instead of whole
+  directories: with their `bin` directories on `PATH` (the installers add them) every Node spawn of a bare
+  command name failed with EPERM since names were hidden. `flyctl` and `pulumi` can run from there again.
 - Messages that told the model to read a job output file now say to run the command again; `describe()` in mode
   `none` words the loom-home rule as the file tools' own.
 

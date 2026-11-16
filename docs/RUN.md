@@ -150,9 +150,10 @@ listed directory that is or contains the workspace is skipped. This needs a home
 
 Several of these are whole directories, so what else they hold is off limits too: commands cannot load
 models from the Hugging Face cache in `~/.cache/huggingface/hub` (set `HF_HUB_CACHE` to a directory
-elsewhere; moving `HF_HOME` moves the token out of protection too), run `flyctl` from `~/.fly/bin` or
-`pulumi` from `~/.pulumi/bin` (install them elsewhere), or use Terraform's plugin cache in
-`~/.terraform.d`. The only switch is `protect_credentials = false`, which lifts the protection of every
+elsewhere; moving `HF_HOME` moves the token out of protection too), or use Terraform's plugin cache in
+`~/.terraform.d`. (`~/.fly` and `~/.pulumi` are protected as their credential files only,
+`~/.fly/config.yml` and `~/.pulumi/credentials.json`, so `flyctl` and `pulumi` can run from their `bin`
+directories, which installers put on `PATH`: a hidden name on `PATH` makes Node stop its search with EPERM.) The only switch is `protect_credentials = false`, which lifts the protection of every
 store.
 
 Environment variables whose names look like secrets (in any case: containing `KEY`, `TOKEN`, `SECRET`,
