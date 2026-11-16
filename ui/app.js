@@ -27,7 +27,7 @@ const S = {
   answered: new Map(),
   messageState: new Map(),
   actionState: new Map(),
-  requests: { ledger: 0, window: 0, net: 0, inbox: 0, sessions: 0, status: 0 },
+  requests: { ledger: 0, window: 0, net: 0, inbox: 0, sessions: 0, status: 0, models: 0 },
   inboxRevision: 0,
   sessionsRevision: 0,
   sinceSeq: null,
@@ -54,6 +54,8 @@ const S = {
   follow: true,
   tab: "ledger",
   ledger: { mission: null, model: null, state: null, error: null, stale: true },
+  // The Models tab: the open mission's models (`GET /api/sessions/{id}/models`).
+  models: { view: null, error: "", loading: false, busy: false, now: false },
   win: { data: null, error: null, stale: true, hideFolded: false, from: null },
   rules: null, // the rules form of the open session: {session, box, note, hint, lists, reason, asking, shown}
   net: [],
@@ -638,6 +640,8 @@ function handleEvent(ev) {
         S.sessionsRevision++;
         C.applySessionEvent(S.sessions, f.info);
         want("list", "header", "overview");
+        // A model switched, a choice made, or an agent started in the mission the Models tab shows.
+        if (S.tab === "models" && S.models.view && f.info && f.info.mission === S.models.view.mission) loadModels();
         break;
       case "status":
         S.sessionsRevision++;
@@ -2080,12 +2084,19 @@ function showNew() {
   const role = $("f-role");
   if (role.options.length === 0) {
     for (const r of C.ROLES) role.append(new Option(r, r));
+    // Only a lead starts agents: a chat has no agents' model to choose.
+    role.addEventListener("change", () => { $("f-agent-model").disabled = role.value !== "lead"; });
   }
   const model = $("f-model");
   model.replaceChildren();
   const models = (S.status && S.status.models) || [];
   for (const m of models) model.append(new Option(m.profile + (m.reachable ? "" : " (not reachable)"), m.profile));
   if (models.length === 0) model.append(new Option("default", ""));
+  // The model the mission's agents start on, before the lead's first one; empty: as the pack says.
+  const agents = $("f-agent-model");
+  agents.replaceChildren(new Option("As the pack says", ""));
+  for (const m of models) agents.append(new Option(m.profile, m.profile));
+  agents.disabled = role.value !== "lead";
   $("f-error").hidden = true;
 }
 
@@ -2096,6 +2107,7 @@ async function submitNew(ev) {
     message: $("f-message").value,
     role: $("f-role").value,
     model: $("f-model").value,
+    agentModel: $("f-agent-model").value,
     title: $("f-title").value,
     unattended: $("f-unattended").checked,
   });
@@ -2138,6 +2150,7 @@ function setTab(t) {
 
 function loadTab() {
   if (S.tab === "ledger") loadLedger();
+  else if (S.tab === "models") loadModels();
   else if (S.tab === "context") loadWindow();
   else if (S.tab === "network") {
     if (S.net.length === 0) loadNet();
@@ -2222,7 +2235,130 @@ function renderRight() {
   if (S.tab === "ledger") return renderLedger(p);
   if (S.tab === "context") return renderContext(p);
   if (S.tab === "network") return renderNetwork(p);
+  if (S.tab === "models") return renderModels(p, info);
   return renderSessionTab(p, info);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Models tab: the mission's lead model, and the model its agents of each role start on
+
+async function loadModels() {
+  const id = S.openId;
+  if (!id) return;
+  const request = ++S.requests.models;
+  S.models.loading = true;
+  try {
+    const view = await api("GET", "/api/sessions/" + encodeURIComponent(id) + "/models");
+    if (request !== S.requests.models || id !== S.openId) return;
+    S.models.view = view;
+    S.models.error = "";
+  } catch (e) {
+    if (request !== S.requests.models) return;
+    S.models.error = e.message;
+  } finally {
+    if (request === S.requests.models) S.models.loading = false;
+  }
+  if (S.tab === "models") want("right");
+}
+
+/** A select of the live profiles; `first` labels an empty first option (no choice), or null for none. */
+function modelSelect(label, profiles, value, first, choose) {
+  const s = el("select");
+  s.setAttribute("aria-label", label);
+  if (first !== null) s.append(new Option(first, ""));
+  for (const p of profiles) s.append(new Option(p, p));
+  s.value = value || "";
+  s.disabled = S.models.busy;
+  s.addEventListener("change", () => choose(s.value));
+  return s;
+}
+
+/** Run one model change, one at a time, then read the mission's models again. */
+async function changeModels(work) {
+  if (S.models.busy) return;
+  S.models.busy = true;
+  want("right");
+  try {
+    await work();
+  } catch (e) {
+    notice(e.message);
+  } finally {
+    S.models.busy = false;
+    await loadModels();
+  }
+}
+
+function setLeadModel(lead, profile) {
+  return changeModels(async () => {
+    const r = await api("POST", "/api/sessions/" + encodeURIComponent(lead) + "/model", { profile });
+    notice(`The lead now uses ${r.model.profile}, ${r.live ? "from its next step" : "when it next runs"}.`);
+  });
+}
+
+function setRoleModel(lead, role, value) {
+  return changeModels(async () => {
+    const body = C.roleModelBody(role, value, S.models.now);
+    const r = await api("POST", "/api/sessions/" + encodeURIComponent(lead) + "/role-model", body);
+    S.models.view = r.models;
+    const who = role === "*" ? "every role" : role;
+    const moved = r.switched.length ? ` Moved now: ${r.switched.join(", ")}.` : "";
+    notice(body.profile ? `New agents of ${who} start on ${body.profile}.${moved}` : `The choice for ${who} is cleared: the pack chooses again.`);
+  });
+}
+
+function renderModels(p, info) {
+  const m = S.models.view;
+  if (S.models.error) {
+    p.replaceChildren(el("p", "error", S.models.error), btn("Try again", "", () => loadModels()));
+    return;
+  }
+  // Nothing yet, or the view of another mission than the open session's.
+  if (!m || m.mission !== info.mission) {
+    p.replaceChildren(el("p", "dim", "Loading the mission's models…"));
+    if (!S.models.loading) loadModels();
+    return;
+  }
+  // Stacked rows (name, a full-width select, a note): the inspector is narrow, and a two-column grid
+  // squeezed the selects until their labels were cut.
+  const kv = el("div", "model-rows");
+  const row = (k, ...v) => {
+    kv.append(add(el("div", "model-row"), el("div", "model-name", k), ...v));
+  };
+  const lead = m.lead_model;
+  row(
+    "lead",
+    modelSelect("Model of the lead", m.profiles, lead.profile, null, (v) => setLeadModel(m.lead, v)),
+    el("div", "dim", `${lead.model} · context ${lead.context_window ? C.tokens(lead.context_window) : "unknown"}`),
+  );
+  if (m.roles.length) {
+    row(
+      "every role",
+      modelSelect("Model for agents of every role", m.profiles, m.any_role, "As each role's pack setting says", (v) => setRoleModel(m.lead, "*", v)),
+    );
+    for (const r of m.roles) {
+      row(
+        r.verifier ? `${r.role} (finish gate)` : r.role,
+        modelSelect(`Model for ${r.role} agents`, m.profiles, r.chosen, C.roleDefaultLabel(r, m.any_role), (v) => setRoleModel(m.lead, r.role, v)),
+        el("div", "dim", C.runningAgentsWords(r.agents)),
+      );
+    }
+  }
+  const parts = [kv];
+  if (m.roles.length) {
+    const now = el("input");
+    now.type = "checkbox";
+    now.checked = S.models.now;
+    now.disabled = S.models.busy;
+    now.addEventListener("change", () => { S.models.now = now.checked; });
+    parts.push(add(el("label", "check"), now, document.createTextNode(" Also move the running agents of a role when choosing for it")));
+  }
+  parts.push(
+    el("p", "dim", m.roles.length
+      ? "A choice is used for agents started from then on; a forked agent shares the lead's model. Profiles are the config's [models] (loom models reload)."
+      : "This lead starts no agents."),
+    btn("Refresh", "", () => loadModels()),
+  );
+  p.replaceChildren(...parts);
 }
 
 function ruleInput(placeholder) {

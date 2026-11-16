@@ -262,7 +262,8 @@ unknown while retaining the last update time.
 
 ## Inspector and responsive behavior
 
-The mission inspector is closed by default. It contains Ledger, Context, Network and Session tabs.
+The mission inspector is closed by default. It contains Ledger, Context, Network, Models and Session
+tabs.
 On a wide display, opening it adds a resizable side pane. Drag the separator or use its arrow keys;
 Home/End select the bounds. On narrower displays it becomes a drawer. Below 700px the mission
 sidebar is also a drawer. Closed surfaces are inert; modal drawers trap keyboard focus, close with
@@ -294,6 +295,20 @@ light/dark appearance and reduced-motion support. Avoid dependence on color or h
   newest first: time, allowed/refused, method, host:port, the rule that decided. When the load
   failed (for example because the egress audit log is damaged) the daemon's sentence is shown in red
   above the rows, also while live decisions arrive.
+- **Models** (`GET /api/sessions/{id}/models`, refetched when a `session` event arrives for the
+  mission it shows): one stacked row per model, each a full-width select of the live profiles (the
+  inspector is too narrow for a two-column grid). **lead**: the lead's profile, its model and window
+  below; changing it is `POST /api/sessions/{lead}/model`. **every role** (`*`) and one row per role
+  the lead starts (the finish gate's verifier marked as such): the operator's choice, whose empty
+  option names what applies without one (every role's choice, or what the pack picks: its model,
+  the profiles it rotates, the one it escalates to), and below, the role's running agents with their
+  profiles. Changing one is `POST /api/sessions/{lead}/role-model {role, profile, now}` (empty:
+  clear). **Also move the running agents of a role when choosing for it** sets `now`. Changes run
+  one at a time (the selects are disabled meanwhile), say what happened in the notice bar, and read
+  the models again. A lead that starts no agents shows only its own model.
+
+The new-mission form's **Agents' model** sends `role_models: {"*": profile}`; it is disabled unless
+the role is `lead`, the only form role that starts agents.
 
 ## Stored output dialog
 

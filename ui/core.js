@@ -1812,9 +1812,42 @@ export function buildNewSession(form) {
   const role = form.role || "lead";
   const body = { workspace, message, role, unattended: !!form.unattended };
   if (form.model) body.model = form.model;
+  // Only a lead starts agents: the choice for every role goes with it, before its first agent.
+  if (form.agentModel && role === "lead") body.role_models = { "*": form.agentModel };
   const title = String(form.title || "").trim();
   if (title) body.title = title;
   return { body };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Models of a mission (the Models tab)
+
+/** What the pack chooses for a role's agents when the operator chose nothing. */
+export function packChoiceWords(r) {
+  let words;
+  if (r.alloy_models && r.alloy_models.length) words = "rotates " + r.alloy_models.join(", ");
+  else if (r.pack_model) words = r.pack_model;
+  else words = "the lead's";
+  if (r.escalation_model) words += `, ${r.escalation_model} after a failed agent`;
+  return words;
+}
+
+/** The label of a role's "no choice of its own" option: what applies then. */
+export function roleDefaultLabel(r, anyRole) {
+  if (anyRole && !r.verifier) return `Every role's choice (${anyRole})`;
+  return `As the pack says (${packChoiceWords(r)})`;
+}
+
+/** The body of POST /api/sessions/{id}/role-model for a select's value ("" clears; clearing moves nobody). */
+export function roleModelBody(role, value, now) {
+  const profile = value ? String(value) : null;
+  return { role, profile, now: !!(now && profile) };
+}
+
+/** One line about a role's agents that have not ended. */
+export function runningAgentsWords(agents) {
+  if (!agents || !agents.length) return "No agent of this role is running.";
+  return "Running: " + agents.map((a) => `${a.session} on ${a.profile}${a.forked ? " (forked)" : ""}`).join(", ");
 }
 
 /** Parse an API error body into the sentence to show; falls back to the status line. */

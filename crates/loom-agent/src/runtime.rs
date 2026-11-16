@@ -12,7 +12,8 @@
 //! - `log.jsonl` — the session's log; written only by its [`Session`](crate::session::Session).
 //! - `meta.json` — [`SessionMeta`], written when the session is created (for a verifier the finish
 //!   gate starts, with `gate`, before its first turn); rewritten by [`Runtime::archive`] (the
-//!   `archived` flag), [`Runtime::rename`] (the `title`) and a model switch (`profile`, `model`,
+//!   `archived` flag), [`Runtime::rename`] (the `title`), [`Runtime::set_role_model`] (a lead's
+//!   `role_models`) and a model switch (`profile`, `model`,
 //!   `context_window`: [`Runtime::set_session_model`], [`Runtime::reload_models`]). Writes
 //!   are atomic (temporary file in the same directory, then rename).
 //! - `status.json` — the latest [`Status`](crate::session::Status), rewritten atomically whenever
@@ -121,8 +122,10 @@
 //!    `Unavailable`, carry on with the profile's `model` and `context_window` (logged as coming from
 //!    the configuration); without a configured window the creation is refused. On
 //!    `Rejected`/`Config`: return its message.
+//!    `role_models` (trimmed) are checked as [`Runtime::set_role_model`] checks a choice, against the
+//!    lead's role and profile, before anything exists: a bad one refuses the creation.
 //! 3. New `SessionId`, new `MissionId`. `title`: the given one, else the first line of `message` cut
-//!    to 80 characters, else `untitled`.
+//!    to 80 characters, else `untitled`. `meta.role_models`: the checked choices.
 //! 4. `SessionStart{session, mission, parent: None, workspace, pack, role, termination,
 //!    model: ModelRef{profile, model, context_window}, reasoning_replay (profile),
 //!    system_prompt: pack::system_prompt(role, &pack.preamble, &PromptEnv{workspace,
@@ -142,6 +145,9 @@
 //!   verifiers (as in `children`): otherwise `{n} agents are already running, which is the most
 //!   allowed at once. Wait for one to finish (`wait`) or stop one (`agent_stop`), then start this
 //!   one.`
+//! - the operator's choice for the mission comes first for a fresh child: the parent's
+//!   `role_models` for the role, else its `*` entry (not for a `harness` request, the finish gate's
+//!   verifier). A fork never takes one (it shares the parent's model). Otherwise the pack decides:
 //! - role `model` selects a named profile; fresh children otherwise inherit. `alloy_models` rotates
 //!   fresh siblings, and `escalation_model` is selected for subsequent children of a role after a
 //!   failed/budget-exhausted result or a `hand_off` that asked for a `stronger_model`. This never mutates a running session or promises provider cache hits.
@@ -339,7 +345,19 @@
 //!   session, `Input::SwitchModel` with the profile's client, limiter, window and replay policy (the
 //!   task applies it between steps and records `model_switched{reason: operator}`); a session without a
 //!   task records it when it is next opened. Publishes a `session` event. Its agents keep their models.
-//!   The receipt says whether a task took it (`live`).
+//!   The receipt says whether a task took it (`live`). A lead whose pack wants the finish gate's
+//!   verifier on another profile is refused the profile chosen for that verifier.
+//! - `set_role_model(id, role, profile, now)`: any session of the mission (acts on its lead); refused
+//!   for an archived mission (`This session is archived; unarchive it first.`). `role` is one the lead
+//!   starts (`may_spawn`, then the finish gate's verifier) or `*` (every role without a choice of its
+//!   own, not the verifier); otherwise refused naming the roles (a lead that starts none: `A {role}
+//!   lead starts no agents…`). A `profile` must be in the live set, and the verifier's may not be the
+//!   lead's when the pack wants them distinct; `None` clears the choice. Under `model_changes`: the
+//!   lead's `meta.role_models` in memory, then `meta.json` (memory restored if the write fails), then a
+//!   `session` event. With `now` and a profile: each of the lead's agents the choice covers that has
+//!   not ended, was not forked and is on another profile is switched as `set_session_model` does; the
+//!   first that cannot be refuses with the choice already saved. The receipt names the agents moved
+//!   and carries the mission's models as `mission_models` reads them.
 //! - `reload_models()`: reads the configuration file again and replaces the live `[models]` and
 //!   `default_model`, without a restart; nothing else in the file is reread. Refused, changing
 //!   nothing, when the file does not load, it has no `[models]`, or `Packs::check_profiles` fails. A
@@ -474,6 +492,10 @@
 //!   read on a blocking thread: a mission can have many, and a fork's begins with a copy of its
 //!   parent's. The id is checked as for `ledger`. It counts records and judges nothing: whether the
 //!   result was right is not in a log.
+//! - `mission_models(id)`: for the mission of any of its sessions, archived ones included: the lead's
+//!   model, its `*` choice, one entry per role it starts (the choice, the pack's `model`,
+//!   `alloy_models` and `escalation_model`, whether it is the verifier, its agents that have not ended
+//!   with their profile and whether each was forked), the live profiles and the default one.
 //! - `inbox()`: open items, oldest first. `net(id, limit)`: the last `limit` entries.
 //! - `health()`: for every profile, `client.health()` and what discovery last reported.
 //!
@@ -579,6 +601,9 @@ pub struct NewSession {
     pub budget: Budget,
     /// The first message, sent as soon as the session exists.
     pub message: Option<String>,
+    /// Model choices for the mission's agents (role → profile, [`ANY_ROLE`] for every role), set before
+    /// the first message so that the lead's first agents already use them.
+    pub role_models: BTreeMap<String, String>,
 }
 
 /// `meta.json`: what a session is, fixed when it is created.
@@ -619,7 +644,16 @@ pub struct SessionMeta {
     /// a restart, never to the parent as an agent's report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<Brief>,
+    /// A lead's model choices for its mission's agents: role → model profile, and [`ANY_ROLE`] for
+    /// every role it starts. They win over the pack's when a fresh agent is started (see
+    /// [`Runtime::set_role_model`]). Empty for an agent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub role_models: BTreeMap<String, String>,
 }
+
+/// The key of [`SessionMeta::role_models`] that stands for every role the lead starts (`may_spawn`),
+/// when the role has no choice of its own. The finish gate's verifier follows only its own.
+pub const ANY_ROLE: &str = "*";
 
 /// A session as listed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -667,6 +701,56 @@ pub struct ModelSwitchReceipt {
     /// A running task took the switch: its requests go to the new model from its next step. Otherwise
     /// the session records the switch when it next runs.
     pub live: bool,
+}
+
+/// A mission's models: its lead's, the operator's choices for its agents, what the pack would choose,
+/// and the agents running now. See [`Runtime::mission_models`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MissionModels {
+    pub mission: MissionId,
+    pub lead: SessionId,
+    pub lead_model: ModelRef,
+    /// The choice for every role the lead starts ([`ANY_ROLE`]), when one is set.
+    pub any_role: Option<String>,
+    /// One per role the lead starts (`may_spawn`, then the finish gate's verifier), in that order.
+    pub roles: Vec<RoleModels>,
+    /// The live profiles, to choose from.
+    pub profiles: Vec<String>,
+    pub default_model: String,
+}
+
+/// One role of [`MissionModels`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoleModels {
+    pub role: String,
+    /// The finish gate's verifier: the [`ANY_ROLE`] choice does not apply to it.
+    pub verifier: bool,
+    /// The operator's choice for this role in this mission.
+    pub chosen: Option<String>,
+    /// What the pack chooses when nothing is: `escalation_model` after a failed agent, else
+    /// `alloy_models` in turn, else `model`, else the lead's.
+    pub pack_model: Option<String>,
+    pub alloy_models: Vec<String>,
+    pub escalation_model: Option<String>,
+    /// The mission's agents of this role that have not ended.
+    pub agents: Vec<AgentModel>,
+}
+
+/// An agent in [`RoleModels`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentModel {
+    pub session: SessionId,
+    pub profile: String,
+    /// Forked from the lead: it shares the lead's prefix, so a choice for its role does not move it.
+    pub forked: bool,
+}
+
+/// What [`Runtime::set_role_model`] did.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoleModelReceipt {
+    /// Running agents moved to the chosen model (`now`).
+    pub switched: Vec<SessionId>,
+    pub models: MissionModels,
 }
 
 /// An open inbox item and where it came from.
@@ -1313,6 +1397,59 @@ impl ModelTable {
             format!("configured profiles: {}", self.profiles.keys().cloned().collect::<Vec<_>>().join(", "))
         }
     }
+}
+
+/// The roles a lead of role `lead` starts agents in: its `may_spawn`, then the finish gate's verifier.
+fn agent_roles(lead: &RoleDef) -> Vec<String> {
+    let mut roles = lead.may_spawn.clone();
+    if let Some(v) = lead.verifier.as_ref().filter(|v| !roles.contains(v)) {
+        roles.push(v.clone());
+    }
+    roles
+}
+
+/// Refusal of a model choice for `role` (a role the lead starts, or [`ANY_ROLE`]) in a mission whose lead
+/// has role `lead`.
+fn check_choice_role(lead: &RoleDef, role: &str) -> Result<(), String> {
+    let roles = agent_roles(lead);
+    if roles.is_empty() {
+        return Err(format!(
+            "A `{}` lead starts no agents, so there is no agent model to choose for its mission.",
+            lead.name
+        ));
+    }
+    if role != ANY_ROLE && !roles.iter().any(|r| r == role) {
+        return Err(format!(
+            "`{role}` is not a role this mission starts agents in. Its roles: {} (or `{ANY_ROLE}` for all of them).",
+            roles.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Refusal of choosing `profile` for `role` in a mission whose lead has role `lead` and runs on
+/// `lead_profile`: the role (as [`check_choice_role`]), an unknown profile, or the finish gate's verifier
+/// on the lead's own profile when the pack wants them distinct.
+fn check_role_choice(
+    lead: &RoleDef,
+    lead_profile: &str,
+    models: &ModelTable,
+    role: &str,
+    profile: &str,
+) -> Result<(), String> {
+    check_choice_role(lead, role)?;
+    if models.get(profile).is_none() {
+        return Err(format!(
+            "There is no model profile \"{profile}\" ({}). Add it to [models] in the config and run `loom models reload`.",
+            models.names()
+        ));
+    }
+    if lead.verifier.as_deref() == Some(role) && lead.require_distinct_verifier_profile && profile == lead_profile {
+        return Err(format!(
+            "The finish gate's verifier (`{role}`) must run on another model profile than the lead's (\"{profile}\") in this pack: choose another one."
+        ));
+    }
+    Ok(())
 }
 
 /// What the runtime keeps of a session's `Deps`.
@@ -2781,6 +2918,18 @@ impl Inner {
                     )
                 })?;
             let inherited = (p.meta.profile.clone(), p.meta.model.clone(), p.meta.context_window);
+            // The operator's choice for this mission wins over the pack's: the role's own, else the one
+            // for every role (not for the finish gate's verifier). Fresh agents only: a fork shares the
+            // lead's prefix, so it runs on the lead's model.
+            let chosen = if req.mode == SpawnMode::Fork {
+                None
+            } else {
+                p.meta
+                    .role_models
+                    .get(&req.role)
+                    .or_else(|| if req.harness { None } else { p.meta.role_models.get(ANY_ROLE) })
+                    .cloned()
+            };
             let prior: Vec<_> = st
                 .known
                 .values()
@@ -2798,7 +2947,9 @@ impl Inner {
             });
             let prior_count = prior.len();
             let cursor = st.route_cursor.entry((parent.clone(), req.role.clone())).or_insert(prior_count);
-            let selected = if failed && role.escalation_model.is_some() {
+            let selected = if chosen.is_some() {
+                chosen
+            } else if failed && role.escalation_model.is_some() {
                 role.escalation_model.clone()
             } else if !role.alloy_models.is_empty() {
                 role.alloy_models.get(*cursor % role.alloy_models.len()).cloned()
@@ -2892,6 +3043,8 @@ impl Inner {
             };
             let meta = SessionMeta {
                 id: child_id.clone(),
+                // Choices are the lead's, for the mission; an agent has none of its own.
+                role_models: BTreeMap::new(),
                 mission: p.meta.mission.clone(),
                 parent: Some(parent.clone()),
                 workspace,
@@ -3937,6 +4090,15 @@ impl Runtime {
         let role = inner.packs.role(new.pack.as_deref(), new.role.as_deref())?.clone();
         inner.check_network(&role.pack)?;
         let profile_name = inner.models().resolve(new.model.as_deref().or(role.model.as_deref()))?;
+        // The agents' models are checked before anything exists, so a bad one refuses the creation.
+        let role_models: BTreeMap<String, String> =
+            new.role_models.iter().map(|(r, p)| (r.trim().to_string(), p.trim().to_string())).collect();
+        {
+            let models = inner.models();
+            for (r, p) in &role_models {
+                check_role_choice(&role, &profile_name, &models, r, p)?;
+            }
+        }
         let (model, window, from_config) = inner.facts(&profile_name).await?;
         let title = match new.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
             Some(t) => t.to_string(),
@@ -3968,6 +4130,7 @@ impl Runtime {
             unattended: new.unattended.unwrap_or(explicit),
             archived: false,
             gate: None,
+            role_models,
         };
         inner.st().known.insert(id.clone(), Known::new(meta.clone(), idle_status()));
         let forget = |inner: &Inner| {
@@ -4082,22 +4245,27 @@ impl Runtime {
     /// The lead session of `id`'s mission (a child's id leads to its root): the session that owns the
     /// mission's ledger and takes the operator's rules and approvals.
     fn lead_of(&self, id: &SessionId) -> Result<SessionMeta, String> {
+        let lead = self.lead_meta(id)?;
+        if lead.archived {
+            return Err("This session is archived; unarchive it first.".to_string());
+        }
+        Ok(lead)
+    }
+
+    /// [`Runtime::lead_of`], archived leads included.
+    fn lead_meta(&self, id: &SessionId) -> Result<SessionMeta, String> {
         self.inner.check_open()?;
         let st = self.inner.st();
         let k = st.known.get(id).ok_or_else(|| no_session(id))?;
-        let lead = match &k.meta.parent {
-            None => k.meta.clone(),
+        match &k.meta.parent {
+            None => Ok(k.meta.clone()),
             Some(_) => st
                 .known
                 .values()
                 .find(|r| r.meta.parent.is_none() && r.meta.mission == k.meta.mission)
                 .map(|r| r.meta.clone())
-                .ok_or_else(|| format!("There is no lead session for the mission of {}.", id.as_str()))?,
-        };
-        if lead.archived {
-            return Err("This session is archived; unarchive it first.".to_string());
+                .ok_or_else(|| format!("There is no lead session for the mission of {}.", id.as_str())),
         }
-        Ok(lead)
     }
 
     /// Hand `input` to the lead session `lead`, activating it. The session handles it at once when
@@ -4310,8 +4478,148 @@ impl Runtime {
                 models.names()
             ));
         }
+        // A lead whose finish gate wants its verifier on another profile cannot move onto the one chosen
+        // for that verifier: the next `finish` would be refused.
+        let meta = self.inner.st().known.get(id).map(|k| k.meta.clone()).ok_or_else(|| no_session(id))?;
+        if meta.parent.is_none() {
+            let lrole = self.inner.packs.role(Some(&meta.pack), Some(&meta.role))?;
+            if let Some(v) = lrole.verifier.as_deref().filter(|_| lrole.require_distinct_verifier_profile) {
+                if meta.role_models.get(v).map(String::as_str) == Some(profile) {
+                    return Err(format!(
+                        "The finish gate's verifier (`{v}`) is set to run on \"{profile}\", and this pack wants it on another profile than the lead's. Choose another model for the lead, or another for the verifier first (`loom models role`)."
+                    ));
+                }
+            }
+        }
         let (model, live) = self.switch(id, profile, crate::session::SWITCH_OPERATOR).await?;
         Ok(ModelSwitchReceipt { session: id.clone(), model, live })
+    }
+
+    /// The models of the mission of `id` (any of its sessions, archived ones included): the lead's, the
+    /// operator's choices for its agents, what the pack chooses otherwise, and its agents that have not
+    /// ended with the profile each runs on.
+    pub fn mission_models(&self, id: &SessionId) -> Result<MissionModels, String> {
+        let lead = self.lead_meta(id)?;
+        let lrole = self.inner.packs.role(Some(&lead.pack), Some(&lead.role))?;
+        let models = self.inner.models();
+        let st = self.inner.st();
+        let roles = agent_roles(lrole)
+            .into_iter()
+            .map(|name| {
+                let def = self.inner.packs.role(Some(&lead.pack), Some(&name)).ok();
+                let agents = st
+                    .known
+                    .values()
+                    .filter(|k| k.meta.parent.as_ref() == Some(&lead.id) && k.meta.role == name && !k.finished())
+                    .map(|k| AgentModel {
+                        session: k.meta.id.clone(),
+                        profile: k.meta.profile.clone(),
+                        forked: k.meta.mode == Some(SpawnMode::Fork),
+                    })
+                    .collect();
+                RoleModels {
+                    verifier: lrole.verifier.as_deref() == Some(name.as_str()),
+                    chosen: lead.role_models.get(&name).cloned(),
+                    pack_model: def.and_then(|d| d.model.clone()),
+                    alloy_models: def.map(|d| d.alloy_models.clone()).unwrap_or_default(),
+                    escalation_model: def.and_then(|d| d.escalation_model.clone()),
+                    agents,
+                    role: name,
+                }
+            })
+            .collect();
+        Ok(MissionModels {
+            mission: lead.mission.clone(),
+            lead: lead.id.clone(),
+            lead_model: ModelRef {
+                profile: lead.profile.clone(),
+                model: lead.model.clone(),
+                context_window: lead.context_window.unwrap_or(0),
+            },
+            any_role: lead.role_models.get(ANY_ROLE).cloned(),
+            roles,
+            profiles: models.profiles.keys().cloned().collect(),
+            default_model: models.default_model.clone(),
+        })
+    }
+
+    /// Choose the model profile the mission of `id` starts its agents of `role` on — [`ANY_ROLE`] for
+    /// every role the lead starts that has no choice of its own — or clear the choice (`profile` `None`).
+    /// Written to the lead's `meta.json` and used for every fresh agent from then on, before the pack's
+    /// own choice (a forked agent keeps the lead's model). With `now`, the mission's agents of that role
+    /// that have not ended and were not forked move to it too, as [`Runtime::set_session_model`] moves
+    /// one; clearing moves nobody. Refused: an archived mission, a role the lead does not start, an
+    /// unknown profile, the finish gate's verifier on the lead's own profile when the pack wants them
+    /// distinct.
+    pub async fn set_role_model(
+        &self,
+        id: &SessionId,
+        role: &str,
+        profile: Option<&str>,
+        now: bool,
+    ) -> Result<RoleModelReceipt, String> {
+        self.inner.check_open()?;
+        let role = role.trim();
+        let profile = profile.map(str::trim).filter(|p| !p.is_empty());
+        let _one_at_a_time = self.inner.model_changes.lock().await;
+        let lead = self.lead_of(id)?;
+        let lrole = self.inner.packs.role(Some(&lead.pack), Some(&lead.role))?.clone();
+        match profile {
+            Some(p) => check_role_choice(&lrole, &lead.profile, &self.inner.models(), role, p)?,
+            None => check_choice_role(&lrole, role)?,
+        }
+        let (meta, before) = {
+            let mut st = self.inner.st();
+            let k = st.known.get_mut(&lead.id).ok_or_else(|| no_session(&lead.id))?;
+            let before = k.meta.role_models.clone();
+            match profile {
+                Some(p) => k.meta.role_models.insert(role.to_string(), p.to_string()),
+                None => k.meta.role_models.remove(role),
+            };
+            (k.meta.clone(), before)
+        };
+        if let Err(e) = write_json_atomic(&self.inner.paths.session_dir(&lead.id).join("meta.json"), &meta) {
+            if let Some(k) = self.inner.st().known.get_mut(&lead.id) {
+                k.meta.role_models = before;
+            }
+            return Err(format!("cannot write the meta.json of {}: {e}", lead.id.as_str()));
+        }
+        if let Some(info) = self.inner.st().known.get(&lead.id).map(Inner::info_of) {
+            self.inner.publish(BusEvent::Session { info: Box::new(info) });
+        }
+        let mut switched = Vec::new();
+        if let (true, Some(p)) = (now, profile) {
+            let targets: Vec<SessionId> = {
+                let st = self.inner.st();
+                st.known
+                    .values()
+                    .filter(|k| {
+                        let m = &k.meta;
+                        let covered = if role == ANY_ROLE {
+                            m.gate.is_none() && !meta.role_models.contains_key(&m.role)
+                        } else {
+                            m.role == role
+                        };
+                        m.parent.as_ref() == Some(&lead.id)
+                            && covered
+                            && m.mode != Some(SpawnMode::Fork)
+                            && m.profile != p
+                            && !k.finished()
+                    })
+                    .map(|k| k.meta.id.clone())
+                    .collect()
+            };
+            for agent in targets {
+                self.switch(&agent, p, crate::session::SWITCH_OPERATOR).await.map_err(|e| {
+                    format!(
+                        "The choice is saved for agents started from now on, but agent {} could not be moved now: {e}",
+                        agent.as_str()
+                    )
+                })?;
+                switched.push(agent);
+            }
+        }
+        Ok(RoleModelReceipt { switched, models: self.mission_models(&lead.id)? })
     }
 
     /// Point session `id` at `profile`: discovery, then its meta (memory and `meta.json`), then its
@@ -9620,6 +9928,120 @@ mod tests {
         std::fs::write(&file, "[models\n").unwrap();
         assert!(e.rt.reload_models().await.is_err());
         assert!(e.rt.health().await.iter().any(|h| h.profile == "mock"));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_mission_starts_its_agents_on_the_models_chosen_for_their_roles() {
+        let args = json!({"question": "CHILDMARK", "role": "worker"});
+        let (e, other) = env_two_models(lead_script(args.clone()), lead_script(args)).await;
+        let mut new = e.new_session(Some("go"));
+        new.role_models = std::collections::BTreeMap::from([("worker".to_string(), "other".to_string())]);
+        let id = e.rt.create_session(new).await.unwrap().meta.id;
+        until("the lead finished", || {
+            e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))
+        })
+        .await;
+        let child = e.children(&id).remove(0).meta;
+        assert_eq!((child.role.as_str(), child.profile.as_str()), ("worker", "other"));
+        assert!(!other.requests().is_empty(), "the worker ran on the chosen model");
+        assert_eq!(e.rt.session(&id).unwrap().meta.profile, "mock", "the lead keeps its own");
+        // The same view from any session of the mission.
+        let m = e.rt.mission_models(&child.id).unwrap();
+        assert_eq!((&m.lead, m.lead_model.profile.as_str(), &m.any_role), (&id, "mock", &None));
+        assert_eq!(m.roles.iter().map(|r| r.role.as_str()).collect::<Vec<_>>(), ["worker", "verifier"]);
+        assert_eq!(m.roles[0].chosen.as_deref(), Some("other"));
+        assert_eq!(m.profiles, ["mock", "other"]);
+        // Kept in the lead's meta.json.
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert_eq!(rt2.session(&id).unwrap().meta.role_models.get("worker").map(String::as_str), Some("other"));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_choice_for_every_role_is_used_cleared_and_checked() {
+        let args = json!({"question": "CHILDMARK", "role": "worker"});
+        let (e, _other) = env_two_models(lead_script(args.clone()), lead_script(args)).await;
+        let mut bad = e.new_session(None);
+        bad.role_models = std::collections::BTreeMap::from([("nope".to_string(), "other".to_string())]);
+        let refused = e.rt.create_session(bad).await.unwrap_err();
+        assert!(refused.contains("Its roles: worker, verifier"), "{refused}");
+        let id = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let unknown = e.rt.set_role_model(&id, "worker", Some("nope"), false).await.unwrap_err();
+        assert!(unknown.contains("configured profiles: mock, other"), "{unknown}");
+
+        let r = e.rt.set_role_model(&id, ANY_ROLE, Some("other"), false).await.unwrap();
+        assert_eq!((r.models.any_role.as_deref(), r.switched.len()), (Some("other"), 0));
+        e.rt.send_message(&id, "go").await.unwrap();
+        until("the lead finished", || {
+            e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))
+        })
+        .await;
+        assert_eq!(e.children(&id)[0].meta.profile, "other", "`*` covers a role without a choice of its own");
+        let r = e.rt.set_role_model(&id, ANY_ROLE, None, false).await.unwrap();
+        assert_eq!(r.models.any_role, None);
+        assert!(e.rt.session(&id).unwrap().meta.role_models.is_empty());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn choosing_a_model_now_moves_the_running_agents_of_the_role() {
+        let script = || {
+            Script::new(|body, _| {
+                if !has_tool(body, "agent_spawn") {
+                    return idle_worker(body);
+                }
+                match tool_msgs(body) {
+                    0 => call("agent_spawn", json!({"question": "CHILDMARK", "background": true})),
+                    _ => call("wait", json!({})),
+                }
+            })
+        };
+        let (e, _other) = env_two_models(script(), script()).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting })))
+            .await;
+        let child = e.children(&id)[0].meta.id.clone();
+        until_idle(&e, &child).await;
+        assert_eq!(e.rt.session(&child).unwrap().meta.profile, "mock");
+        let r = e.rt.set_role_model(&id, "worker", Some("other"), true).await.unwrap();
+        assert_eq!(r.switched, vec![child.clone()]);
+        assert_eq!(e.rt.session(&child).unwrap().meta.profile, "other");
+        let agents = &r.models.roles.iter().find(|x| x.role == "worker").unwrap().agents;
+        assert_eq!((agents.len(), agents[0].profile.as_str(), agents[0].forked), (1, "other", false));
+        until("the agent recorded the switch", || !switches(e.records(&child)).is_empty()).await;
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_verifier_is_kept_off_the_leads_profile_when_the_pack_wants_them_apart() {
+        let other = MockServer::start(Script::new(|_, _| finish("x"))).await.unwrap();
+        let url = other.base_url();
+        let e = env_with_packs(
+            Script::new(|_, _| finish("ok")),
+            |c| {
+                let mut p = c.models["mock"].clone();
+                p.base_url = url;
+                c.models.insert("other".into(), p);
+            },
+            |packs| {
+                let path = packs.join("core/pack.toml");
+                let text = std::fs::read_to_string(&path).unwrap().replace(
+                    "[roles.lead]",
+                    "[roles.lead]\nverifier = \"verifier\"\nrequire_distinct_verifier_profile = true",
+                );
+                std::fs::write(path, text).unwrap();
+            },
+        )
+        .await;
+        let id = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let same = e.rt.set_role_model(&id, "verifier", Some("mock"), false).await.unwrap_err();
+        assert!(same.contains("another model profile than the lead's"), "{same}");
+        e.rt.set_role_model(&id, "verifier", Some("other"), false).await.unwrap();
+        // Nor can the lead then move onto the verifier's.
+        let lead = e.rt.set_session_model(&id, "other").await.unwrap_err();
+        assert!(lead.contains("loom models role"), "{lead}");
         e.rt.shutdown().await;
     }
 

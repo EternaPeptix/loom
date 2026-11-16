@@ -178,6 +178,8 @@ loom gc [--apply]                         delete stored outputs nothing refers t
 loom models list                          the model profiles in use and whether each server answers
 loom models reload                        read [models] from the config again — no restart
 loom models set <session> <profile>       switch a session to another model from its next step — no restart
+loom models show <session>                a mission's models: the lead's, each agent role's, the agents running
+loom models role <session> <role> <profile>  start the mission's agents of a role (or `all`) on a profile
 ```
 
 A `<session>` is an id, the beginning of one, or `last`. `docs/RUN.md` lists every command and option.

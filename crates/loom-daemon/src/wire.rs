@@ -178,6 +178,19 @@ pub struct ModelBody {
     pub profile: String,
 }
 
+/// Body of `POST /api/sessions/{id}/role-model`: choose (or clear, `profile` null) the model the
+/// mission starts its agents of `role` on; `role` `*` covers every role the lead starts. `now` also moves
+/// the mission's running agents of that role.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleModelBody {
+    pub role: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub now: bool,
+}
+
 /// Answer of `GET /api/models`: the live model profiles, as `loom models reload` last read them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ModelsView {

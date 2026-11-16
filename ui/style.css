@@ -472,6 +472,10 @@ select.model-seat option { background: var(--bg-2); color: var(--fg); }
 .panel .ledger-step > div { min-width: 0; }
 .panel .ledger-step .dim { font-size: 12px; }
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 3px 10px; }
+.model-rows { display: grid; gap: 12px; margin-bottom: 12px; }
+.model-row { display: grid; gap: 4px; }
+.model-row select { width: 100%; }
+.model-name { color: var(--dim); font-size: 12px; }
 .kv dt { color: var(--dim); }
 .kv dd { margin: 0; overflow-wrap: anywhere; font-family: var(--mono); font-size: 12px; }
 .nums { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0; color: var(--dim); font-size: 12px; }

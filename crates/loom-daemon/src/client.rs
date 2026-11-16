@@ -64,12 +64,12 @@
 
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody, ModelBody,
-    ModelsView, RecordsPage, ReleaseBody, RenameBody, RuleBody, ScopeBody, ScopeReceipt, SessionDetail, StatusView,
+    ModelsView, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeReceipt, SessionDetail, StatusView,
     WithdrawBody,
 };
 use loom_agent::runtime::{
-    BusEvent, InboxEntry, LedgerView, MissionInfo, ModelSwitchReceipt, ModelsReload, NetEntry, NewSession,
-    RuleReceipt, ScoreView, SessionInfo, WindowView,
+    BusEvent, InboxEntry, LedgerView, MissionInfo, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry,
+    NewSession, RoleModelReceipt, RuleReceipt, ScoreView, SessionInfo, WindowView,
 };
 use loom_core::config::{Config, Paths};
 use loom_core::event::Seq;
@@ -532,6 +532,24 @@ impl Client {
         self.call(Method::POST, "/api/models/reload", &[], None).await
     }
 
+    /// The models of a mission (`loom models show`).
+    pub async fn mission_models(&self, id: &SessionId) -> Result<MissionModels, String> {
+        self.call(Method::GET, &format!("/api/sessions/{}/models", segment(id.as_str())), &[], None).await
+    }
+
+    /// Choose or clear the model a mission starts its agents of a role on (`loom models role`).
+    pub async fn set_role_model(
+        &self,
+        id: &SessionId,
+        role: &str,
+        profile: Option<&str>,
+        now: bool,
+    ) -> Result<RoleModelReceipt, String> {
+        let body = RoleModelBody { role: role.to_string(), profile: profile.map(str::to_string), now };
+        let body = serde_json::to_value(body).map_err(|e| format!("The request cannot be encoded ({e})."))?;
+        self.call(Method::POST, &format!("/api/sessions/{}/role-model", segment(id.as_str())), &[], Some(body)).await
+    }
+
     /// Switch a session to another model profile (`loom models set`).
     pub async fn set_model(&self, id: &SessionId, profile: &str) -> Result<ModelSwitchReceipt, String> {
         let body = serde_json::to_value(ModelBody { profile: profile.to_string() })
@@ -888,6 +906,7 @@ pub(crate) mod testkit {
                 unattended: true,
                 archived,
                 gate: None,
+                role_models: Default::default(),
             },
             active: false,
             status: status(Phase::Idle),

@@ -20,7 +20,8 @@
 //! - `run [options] <message…>`: start a session and follow it. The message is the arguments
 //!   joined by spaces; `-` or no message reads standard input to its end. Options → `NewSession`
 //!   (`--workspace` defaults to the current directory; `--attended` sets `unattended: false`;
-//!   `--max-steps`/`--max-minutes` → budget). Prints `session {id}` to stderr first. With
+//!   `--max-steps`/`--max-minutes` → budget; each `--agent-model ROLE=PROFILE` → `role_models`, `all`
+//!   as `*`). Prints `session {id}` to stderr first. With
 //!   `--detach`, stops there. Otherwise *follows* (below).
 //! - `chat [options]`: a `chat`-role session on the terminal: prompt `› `, read a line (an empty
 //!   line is ignored, end of input or `/quit` leaves), send it, follow until the turn ends, repeat.
@@ -63,8 +64,11 @@
 //!   overwrite: `{path} already exists.`).
 //! - `models list`: `render::models_table` of `GET /api/models`. `models reload`: `POST
 //!   /api/models/reload`, `render::models_reload` of the report. `models set <session> <profile>`:
-//!   resolves the session, `POST /api/sessions/{id}/model`, `render::model_switch_line`. None needs a
-//!   restart; the daemon refuses with its sentence (an unknown profile names the configured ones).
+//!   resolves the session, `POST /api/sessions/{id}/model`, `render::model_switch_line`. `models show
+//!   <session>`: `render::mission_models_table` of `GET /api/sessions/{id}/models`. `models role
+//!   <session> <role> <profile> [--now]` / `--clear`: `POST /api/sessions/{id}/role-model` (`all` sent
+//!   as `*`), `render::role_model_receipt`. None needs a restart; the daemon refuses with its sentence
+//!   (an unknown profile names the configured ones).
 //! - `service install|uninstall|status` (macOS; elsewhere `This command is for macOS (launchd).`):
 //!   `install` prepares the home (`serve::prepare_home`), creates `{logs}/loomd.log` (0600) if it is missing,
 //!   writes `serve::launch_agent_plist` to `~/Library/LaunchAgents/{SERVICE_LABEL}.plist`
@@ -97,7 +101,7 @@
 use crate::client::{self, Client};
 use crate::render::{self, RecordOpts, Style};
 use clap::{Args, Parser, Subcommand};
-use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt};
+use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt, ANY_ROLE};
 use loom_agent::session::Phase;
 use loom_core::config::{Config, ConfigError, Paths};
 use loom_core::event::{Budget, Event, Record, Seq, SessionOutcome, TurnEndReason};
@@ -255,6 +259,9 @@ pub struct StartOpts {
     /// Model profile from the configuration
     #[arg(short, long)]
     pub model: Option<String>,
+    /// Model profile for the mission's agents of a role, as ROLE=PROFILE; repeatable; `all=PROFILE` for every role
+    #[arg(long = "agent-model", value_name = "ROLE=PROFILE", value_parser = parse_agent_model)]
+    pub agent_models: Vec<(String, String)>,
     #[arg(short, long)]
     pub title: Option<String>,
     /// Do not resume by itself after a restart
@@ -457,6 +464,33 @@ pub enum ModelsAction {
     Reload,
     /// Switch a session to another model profile, from its next step, without a restart
     Set(ModelsSetArgs),
+    /// A mission's models: its lead's, the one chosen for each role of its agents, the agents running now
+    Show(ModelsShowArgs),
+    /// Choose the model a mission starts its agents of a role on (`all` for every role), or clear it
+    Role(ModelsRoleArgs),
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ModelsShowArgs {
+    /// A session id, the beginning of one, or `last` (any session of the mission)
+    pub session: String,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ModelsRoleArgs {
+    /// A session id, the beginning of one, or `last` (any session of the mission)
+    pub session: String,
+    /// The agents' role (`loom models show` lists them), or `all` for every role the lead starts
+    pub role: String,
+    /// The model profile (`loom models list`); left out with --clear
+    #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+    pub profile: Option<String>,
+    /// Remove the choice: the pack chooses again for agents started later
+    #[arg(long)]
+    pub clear: bool,
+    /// Also move the mission's running agents of that role now (not forked ones)
+    #[arg(long, conflicts_with = "clear")]
+    pub now: bool,
 }
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -691,7 +725,29 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path) -> NewSess
         unattended: opts.attended.then_some(false),
         budget: Budget { max_steps: non_zero(opts.max_steps), max_minutes: non_zero(opts.max_minutes) },
         message,
+        role_models: opts.agent_models.iter().cloned().collect(),
     }
+}
+
+/// The role a model choice names on the command line: `all` (or a quoted `*`) is every role the lead
+/// starts. `*` alone is globbed by shells, and zsh refuses `*=x` when nothing matches.
+fn cli_role(role: &str) -> String {
+    match role.trim() {
+        "all" | ANY_ROLE => ANY_ROLE.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// `--agent-model ROLE=PROFILE`.
+fn parse_agent_model(text: &str) -> Result<(String, String), String> {
+    let Some((role, profile)) = text.split_once('=') else {
+        return Err(format!("`{text}` is not ROLE=PROFILE (for example worker=fast, or all=fast for every role)"));
+    };
+    let (role, profile) = (role.trim(), profile.trim());
+    if role.is_empty() || profile.is_empty() {
+        return Err(format!("`{text}` needs both a role and a profile, as ROLE=PROFILE"));
+    }
+    Ok((cli_role(role), profile.to_string()))
 }
 
 fn record_opts(show: &ShowOpts) -> RecordOpts {
@@ -1420,6 +1476,16 @@ async fn cmd_models(paths: &Paths, action: ModelsAction) -> Result<i32, String> 
             let receipt = c.set_model(&id, &a.profile).await?;
             outln(&render::model_switch_line(&receipt)).map(|()| 0)
         }
+        ModelsAction::Show(a) => {
+            let id = c.resolve(&a.session).await?;
+            block(&render::mission_models_table(&c.mission_models(&id).await?, &style())).map(|()| 0)
+        }
+        ModelsAction::Role(a) => {
+            let id = c.resolve(&a.session).await?;
+            let role = cli_role(&a.role);
+            let receipt = c.set_role_model(&id, &role, a.profile.as_deref(), a.now).await?;
+            block(&render::role_model_receipt(&receipt, &role, a.profile.as_deref(), &style())).map(|()| 0)
+        }
     }
 }
 
@@ -1740,6 +1806,29 @@ mod tests {
         assert_eq!((a.session.as_str(), a.profile.as_str()), ("last", "big"));
         rejected(&["models"]);
         rejected(&["models", "set", "last"]); // a profile is required
+        let Command::Models { action: ModelsAction::Show(a) } = ok(&["models", "show", "last"]) else {
+            panic!("not models show")
+        };
+        assert_eq!(a.session, "last");
+        let Command::Models { action: ModelsAction::Role(a) } = ok(&["models", "role", "last", "worker", "fast", "--now"])
+        else {
+            panic!("not models role")
+        };
+        assert_eq!((a.role.as_str(), a.profile.as_deref(), a.clear, a.now), ("worker", Some("fast"), false, true));
+        let Command::Models { action: ModelsAction::Role(a) } = ok(&["models", "role", "last", "all", "--clear"]) else {
+            panic!("not models role --clear")
+        };
+        assert_eq!((cli_role(&a.role).as_str(), a.profile, a.clear), ("*", None, true));
+        rejected(&["models", "role", "last", "worker"]); // a profile, or --clear
+        rejected(&["models", "role", "last", "worker", "fast", "--clear"]);
+        rejected(&["models", "role", "last", "worker", "--clear", "--now"]);
+        // `all` spells every role on the command line: `*` alone is globbed by shells.
+        let Command::Run(a) = ok(&["run", "--agent-model", "worker=fast", "--agent-model", "all=big", "go"]) else {
+            panic!("not run")
+        };
+        assert_eq!(a.start.agent_models, vec![("worker".into(), "fast".into()), ("*".into(), "big".into())]);
+        rejected(&["run", "--agent-model", "worker", "go"]);
+        rejected(&["run", "--agent-model", "=fast", "go"]);
     }
 
     #[test]
@@ -2006,8 +2095,13 @@ mod tests {
             attended: true,
             max_steps: 7,
             max_minutes: 3,
+            agent_models: vec![("worker".into(), "fast".into()), (ANY_ROLE.into(), "big".into())],
         };
         let n = new_session(&opts, None, cwd);
+        assert_eq!(
+            n.role_models,
+            std::collections::BTreeMap::from([("worker".to_string(), "fast".to_string()), ("*".to_string(), "big".to_string())])
+        );
         assert_eq!(n.workspace, PathBuf::from("/w"));
         assert_eq!(
             (n.pack.as_deref(), n.role.as_deref(), n.model.as_deref(), n.title.as_deref()),

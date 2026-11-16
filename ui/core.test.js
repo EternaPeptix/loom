@@ -1078,6 +1078,29 @@ test("new session form", () => {
     workspace: "/w", message: "do it", role: "chat", unattended: false, model: "local",
   });
   assert.equal(C.buildNewSession({ workspace: "/w", message: "x", title: "T", unattended: true }).body.title, "T");
+  // The agents' model goes with a lead, as the choice for every role; a chat lead starts no agents.
+  assert.deepEqual(C.buildNewSession({ workspace: "/w", message: "x", role: "lead", agentModel: "fast" }).body.role_models, { "*": "fast" });
+  assert.equal(C.buildNewSession({ workspace: "/w", message: "x", role: "chat", agentModel: "fast" }).body.role_models, undefined);
+  assert.equal(C.buildNewSession({ workspace: "/w", message: "x", role: "lead", agentModel: "" }).body.role_models, undefined);
+});
+
+test("models tab words and requests", () => {
+  const role = (over) => ({ role: "worker", verifier: false, chosen: null, pack_model: null, alloy_models: [], escalation_model: null, agents: [], ...over });
+  assert.equal(C.packChoiceWords(role({})), "the lead's");
+  assert.equal(C.packChoiceWords(role({ pack_model: "big" })), "big");
+  assert.equal(C.packChoiceWords(role({ pack_model: "big", alloy_models: ["a", "b"] })), "rotates a, b", "rotation wins over the role's model");
+  assert.equal(C.packChoiceWords(role({ escalation_model: "huge" })), "the lead's, huge after a failed agent");
+  // The every-role choice covers a role without its own, not the finish gate's verifier.
+  assert.equal(C.roleDefaultLabel(role({}), "fast"), "Every role's choice (fast)");
+  assert.equal(C.roleDefaultLabel(role({ verifier: true, pack_model: "big" }), "fast"), "As the pack says (big)");
+  assert.equal(C.roleDefaultLabel(role({}), null), "As the pack says (the lead's)");
+  assert.deepEqual(C.roleModelBody("worker", "fast", true), { role: "worker", profile: "fast", now: true });
+  assert.deepEqual(C.roleModelBody("*", "", true), { role: "*", profile: null, now: false }, "clearing moves nobody");
+  assert.equal(C.runningAgentsWords([]), "No agent of this role is running.");
+  assert.equal(
+    C.runningAgentsWords([{ session: "s-a", profile: "fast", forked: false }, { session: "s-b", profile: "big", forked: true }]),
+    "Running: s-a on fast, s-b on big (forked)",
+  );
 });
 
 test("error sentence", () => {
