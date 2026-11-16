@@ -32,7 +32,7 @@ const S = {
   sessionsRevision: 0,
   sinceSeq: null,
   section: "chat",
-  models: null, // GET /api/models: {default_model, models: [...]} (null until fetched)
+  profiles: null, // GET /api/models for the model seat: {default_model, models: [...]} (null until fetched)
   seat: null, // a model switch waiting for the operator's answer: {session, profile}
   seatBusy: new Set(), // ids of the sessions a model switch is in flight for (a switch holds only its own session's seat)
   seatNote: new Map(), // session id -> {text, at}: the sentence the last switch ended with
@@ -528,7 +528,7 @@ function openSession(id) {
   $("msg").value = C.getDraft(S.drafts, "message:" + id);
   $("msg").dataset.draftKey = "message:" + id;
   want("header", "blocks", "live", "right", "overview");
-  loadModels();
+  loadProfiles();
   loadRecords(S.rec, 0);
   loadNet();
   loadLedger();
@@ -2891,10 +2891,10 @@ async function sendMessage() {
 
 /** The configured profiles: the live list from GET /api/models, else the ones /api/status reported. */
 function seatModels() {
-  return (S.models && S.models.models) || (S.status && S.status.models) || [];
+  return (S.profiles && S.profiles.models) || (S.status && S.status.models) || [];
 }
-async function loadModels() {
-  try { S.models = await api("GET", "/api/models"); } catch { /* /api/status still names the profiles */ }
+async function loadProfiles() {
+  try { S.profiles = await api("GET", "/api/models"); } catch { /* /api/status still names the profiles */ }
   if (S.view === "session") want("header");
 }
 
