@@ -43,6 +43,8 @@ pub struct Config {
     /// The remote Docker container the agent runs commands in (`box_exec`). Disabled by default.
     #[serde(rename = "box")]
     pub boxed: BoxCfg,
+    /// A disposable, sealed, root-capable VM reached over ssh (`rootbox_exec`). Disabled by default.
+    pub rootbox: RootBoxCfg,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -383,6 +385,62 @@ impl Default for BoxCfg {
     }
 }
 
+/// `[rootbox]`: one disposable root-capable VM reached over ssh (see `loom_tools::rootbox`). The operator
+/// makes and destroys the VM; loom only runs commands in it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RootBoxCfg {
+    pub enabled: bool,
+    /// An ssh host or alias that the daemon's own `ssh` resolves from the operator's ssh configuration
+    /// (address, user, key, ProxyJump). The session never sees it.
+    pub ssh_host: String,
+    /// The ssh client, resolved on the daemon's PATH at start.
+    pub ssh_cli: String,
+    /// The most seconds one call may run. A call may ask for less, never more.
+    pub exec_timeout_s: u64,
+    /// Most megabytes of output one call keeps.
+    pub max_output_mb: u64,
+    /// The name shown in results; empty means `ssh_host`.
+    pub label: String,
+}
+
+impl Default for RootBoxCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ssh_host: String::new(),
+            ssh_cli: "ssh".into(),
+            exec_timeout_s: 300,
+            max_output_mb: 8,
+            label: String::new(),
+        }
+    }
+}
+
+impl RootBoxCfg {
+    /// What results call the VM: `label`, or `ssh_host` when there is none.
+    pub fn name(&self) -> &str {
+        let label = self.label.trim();
+        if label.is_empty() {
+            self.ssh_host.trim()
+        } else {
+            label
+        }
+    }
+
+    /// Checks that hold whether or not the root box is enabled (an ssh host that starts with `-` would be
+    /// an option), then, when it is enabled, that it can be used. Every error is a sentence.
+    pub fn check(&self) -> Result<(), String> {
+        if self.ssh_host.trim_start().starts_with('-') {
+            return Err("rootbox.ssh_host must not start with '-'.".into());
+        }
+        if self.enabled && self.ssh_host.trim().is_empty() {
+            return Err("[rootbox] is enabled but rootbox.ssh_host is empty. Set it to an ssh host/alias.".into());
+        }
+        Ok(())
+    }
+}
+
 /// `name@sha256:<64 hex>` or `sha256:<64 hex>`: an image that cannot change under its name.
 pub fn pinned_image(image: &str) -> bool {
     let digest = |d: &str| {
@@ -582,6 +640,7 @@ impl Config {
             return Err(ConfigError::Invalid("context.floor_tokens must be below context.target_tokens".into()));
         }
         self.boxed.check().map_err(ConfigError::Invalid)?;
+        self.rootbox.check().map_err(ConfigError::Invalid)?;
         if self.boxed.enabled && self.sandbox.mode == SandboxMode::None {
             return Err(ConfigError::Invalid(
                 "box.enabled cannot be combined with sandbox.mode = \"none\": without a sandbox the agent's own commands could connect to the Docker socket and the ssh forward that the box uses, and would then control the Docker host. Use the seatbelt or bubblewrap sandbox, or leave the box off.".into(),
@@ -992,6 +1051,34 @@ allow = ["*.example.test"]
         assert!(check("docker_socket = \"relative.sock\"").unwrap_err().contains("absolute"));
         assert!(check("docker_socket = \"/s\"\ncpus = 0").unwrap_err().contains("cpus"));
         assert!(Config::parse("[box]\nenabled = true").unwrap().check().unwrap_err().to_string().contains("box.image"));
+    }
+
+    #[test]
+    fn the_root_box_is_off_by_default_and_refuses_an_empty_or_option_like_host() {
+        let d = Config::default();
+        assert!(!d.rootbox.enabled && d.rootbox.ssh_cli == "ssh" && d.rootbox.exec_timeout_s == 300);
+        assert_eq!(d.rootbox.max_output_mb, 8);
+        assert!(Config::parse("").unwrap().check().is_ok());
+        let ok = Config::parse("[rootbox]\nenabled = true\nssh_host = \"omarchy-box\"").unwrap();
+        assert!(ok.check().is_ok());
+        assert_eq!(ok.rootbox.name(), "omarchy-box");
+        let labelled = Config::parse("[rootbox]\nssh_host = \"h\"\nlabel = \"vm\"").unwrap();
+        assert_eq!(labelled.rootbox.name(), "vm");
+        for host in ["", "  "] {
+            let c = Config::parse(&format!("[rootbox]\nenabled = true\nssh_host = \"{host}\"")).unwrap();
+            let err = c.check().unwrap_err().to_string();
+            assert!(
+                err.contains("[rootbox] is enabled but rootbox.ssh_host is empty. Set it to an ssh host/alias."),
+                "{err}"
+            );
+        }
+        // Disabled and empty is fine; a host that starts with `-` is refused enabled or not.
+        assert!(Config::parse("[rootbox]\nssh_host = \"\"").unwrap().check().is_ok());
+        for enabled in ["true", "false"] {
+            let c = Config::parse(&format!("[rootbox]\nenabled = {enabled}\nssh_host = \"-oProxyCommand=x\"")).unwrap();
+            let err = c.check().unwrap_err().to_string();
+            assert!(err.contains("rootbox.ssh_host must not start with '-'."), "{err}");
+        }
     }
 
     #[test]

@@ -1262,6 +1262,8 @@ struct Inner {
     pagers: Mutex<Vec<(SessionId, Arc<Mutex<PageReader>>)>>,
     /// The Docker host of `[box]`, when the operator enabled one (see `loom_tools::boxctl`).
     box_host: Option<Arc<DockerHost>>,
+    /// The root box of `[rootbox]`, when the operator enabled one (see `loom_tools::rootbox`).
+    rootbox_host: Option<Arc<loom_tools::rootbox::RootBox>>,
 }
 
 impl Drop for Inner {
@@ -1359,6 +1361,10 @@ impl Orchestrator for Orch {
 
     async fn box_access(&self, session: &SessionId) -> Result<Arc<MissionBox>, String> {
         self.up()?.box_for(session)
+    }
+
+    async fn rootbox_access(&self, _session: &SessionId) -> Result<Arc<loom_tools::rootbox::RootBox>, String> {
+        self.up()?.rootbox_host.clone().ok_or_else(|| rtools::rootbox::NO_ROOTBOX.to_string())
     }
 
     async fn child_copy(&self, parent: &SessionId, child: &SessionId) -> Result<Option<ChildCopy>, String> {
@@ -3615,6 +3621,14 @@ impl Runtime {
         } else {
             None
         };
+        let rootbox_host = if config.rootbox.enabled {
+            Some(
+                loom_tools::rootbox::RootBox::new(&config.rootbox, &paths.home)
+                    .map_err(|e| format!("The root box cannot be used: {e}"))?,
+            )
+        } else {
+            None
+        };
         let (bus, _) = broadcast::channel(BUS_CAPACITY);
         let (net_tx, mut net_rx) = unbounded_channel();
         let audit = net_audit(paths.clone(), bus.clone());
@@ -3641,6 +3655,7 @@ impl Runtime {
             sink: Arc::new(SinkImpl(me.clone())),
             pagers: Mutex::new(Vec::new()),
             box_host,
+            rootbox_host,
         });
 
         let weak = Arc::downgrade(&inner);
@@ -9011,6 +9026,23 @@ mod tests {
         let subs: Vec<String> = fake.calls()[mark..].iter().filter_map(|c| c.get(2).cloned()).collect();
         let first = |name: &str| subs.iter().position(|s| s == name).unwrap_or(usize::MAX);
         assert!(first("rm") < first("network") && first("network") < first("run"), "{subs:?}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_root_box_is_refused_when_off_and_handed_out_when_enabled_even_in_a_copy() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let err = e.rt.inner.orch.rootbox_access(&info.meta.id).await.err().unwrap();
+        assert_eq!(err, "No root box is configured. The operator sets [rootbox] in config.toml.");
+        e.rt.shutdown().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = loom_tools::rootbox::fake::FakeSsh::new(dir.path());
+        let cfg = fake.cfg();
+        let e = env_with(Script::new(|_, _| finish("ok")), false, move |c| c.rootbox = cfg).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let b = e.rt.inner.orch.rootbox_access(&info.meta.id).await.unwrap();
+        assert_eq!(b.name(), "vm-alias");
         e.rt.shutdown().await;
     }
 

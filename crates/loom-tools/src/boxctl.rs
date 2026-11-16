@@ -735,7 +735,7 @@ pub struct DockerHost {
 
 /// `name` as an absolute path to an executable file. A name with a `/` is taken as it is; a bare name is
 /// looked for in `search` (a `PATH` value) now, and the answer is what is used from then on.
-fn resolve_program(name: &str, what: &str, search: &OsStr) -> Result<PathBuf, String> {
+pub(crate) fn resolve_program(name: &str, what: &str, search: &OsStr) -> Result<PathBuf, String> {
     let executable = |p: &Path| {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)

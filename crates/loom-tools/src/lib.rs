@@ -41,6 +41,7 @@ pub mod oracle;
 pub mod outview;
 pub mod params;
 pub mod proc;
+pub mod rootbox;
 pub mod pty;
 pub mod sandbox;
 pub mod schema;
