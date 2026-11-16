@@ -1481,7 +1481,8 @@ mod tests {
                 reason: "operator".into(),
             })
         };
-        let replayed = |recs: &[Record]| weave(recs).messages.iter().any(|m| m.reasoning.as_deref() == Some("thinking"));
+        let replayed =
+            |recs: &[Record]| weave(recs).messages.iter().any(|m| m.reasoning.as_deref() == Some("thinking"));
         let mut l = Log::with_replay(ReasoningReplay::All);
         l.user("go");
         l.resp("answer", "thinking", &[]);

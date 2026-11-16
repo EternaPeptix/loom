@@ -926,7 +926,10 @@ pub fn models_reload(r: &ModelsReload) -> String {
     }
     if !r.rebound.is_empty() {
         let n = r.rebound.len();
-        out.push(format!("{n} {} moved to the new settings of a changed profile", if n == 1 { "session" } else { "sessions" }));
+        out.push(format!(
+            "{n} {} moved to the new settings of a changed profile",
+            if n == 1 { "session" } else { "sessions" }
+        ));
     }
     out.push(format!("default model: {}", if r.default_model.is_empty() { "none" } else { r.default_model.as_str() }));
     for note in &r.notes {
@@ -999,7 +1002,12 @@ pub fn mission_models_table(m: &MissionModels, style: &Style) -> String {
             r.agents
                 .iter()
                 .map(|a| {
-                    format!("{} on {}{}", flat(a.session.as_str()), flat(&a.profile), if a.forked { " (forked)" } else { "" })
+                    format!(
+                        "{} on {}{}",
+                        flat(a.session.as_str()),
+                        flat(&a.profile),
+                        if a.forked { " (forked)" } else { "" }
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -1943,7 +1951,11 @@ mod tests {
         let header: Vec<&str> = lines[0].split_whitespace().collect();
         assert_eq!(&header[..4], ["ID", "ROLE", "MODEL", "STATE"], "{}", lines[0]);
         let col = lines[0].find("MODEL").unwrap_or(usize::MAX);
-        assert!(lines[1][lines[1].char_indices().nth(col).map_or(0, |(i, _)| i)..].starts_with("dsv41"), "{}", lines[1]);
+        assert!(
+            lines[1][lines[1].char_indices().nth(col).map_or(0, |(i, _)| i)..].starts_with("dsv41"),
+            "{}",
+            lines[1]
+        );
         assert!(lines[2].contains("qwen x"), "{}", lines[2]);
         assert!(lines[2].starts_with("  └ s-kid"), "{}", lines[2]);
         let kid_col = lines[2].chars().take(col).count();
@@ -2114,7 +2126,10 @@ mod tests {
         );
         let none = ModelsView { default_model: String::new(), models: vec![health(true)] };
         assert!(models_table(&none, &MONO).ends_with("no default_model: a new session names its model with --model\n"));
-        assert_eq!(models_table(&ModelsView { default_model: String::new(), models: vec![] }, &MONO), "No model profiles are configured.\n");
+        assert_eq!(
+            models_table(&ModelsView { default_model: String::new(), models: vec![] }, &MONO),
+            "No model profiles are configured.\n"
+        );
 
         assert_eq!(models_reload(&ModelsReload::default()), "No profile changed.\ndefault model: none\n");
         let report = ModelsReload {
@@ -2165,7 +2180,11 @@ mod tests {
         let mut m = MissionModels {
             mission: loom_core::MissionId::from("m-1"),
             lead: SessionId::from("s-l"),
-            lead_model: loom_core::event::ModelRef { profile: "big".into(), model: "b".into(), context_window: 1_000_000 },
+            lead_model: loom_core::event::ModelRef {
+                profile: "big".into(),
+                model: "b".into(),
+                context_window: 1_000_000,
+            },
             any_role: None,
             roles: vec![worker, solver, verifier],
             profiles: vec!["big".into(), "fast".into()],
@@ -2183,7 +2202,10 @@ mod tests {
         // A choice for every role covers the roles without their own, not the finish gate's verifier.
         m.any_role = Some("fast".into());
         let text = mission_models_table(&m, &MONO);
-        assert!(text.contains("agents of every role: fast\n") && text.contains("solver    fast (every role) ·"), "{text}");
+        assert!(
+            text.contains("agents of every role: fast\n") && text.contains("solver    fast (every role) ·"),
+            "{text}"
+        );
         assert!(text.contains("verifier  pack: big · finish gate"), "{text}");
 
         let r = RoleModelReceipt { switched: vec![SessionId::from("s-a")], models: m.clone() };
@@ -2226,7 +2248,11 @@ mod tests {
         assert!(colored.contains("\x1b[31m✗\x1b[0m http://"));
         // An unsafe posture (unconfined, or open network) is warned in bold yellow.
         view.sandbox = "none".into();
-        assert!(status(&view, &COLOR).contains(&format!("{BOLD_YELLOW}sandbox: none · network: deny_all{RESET}")), "{}", status(&view, &COLOR));
+        assert!(
+            status(&view, &COLOR).contains(&format!("{BOLD_YELLOW}sandbox: none · network: deny_all{RESET}")),
+            "{}",
+            status(&view, &COLOR)
+        );
         assert!(status(&view, &MONO).contains("\nsandbox: none · network: deny_all\n"));
         view.sandbox = "seatbelt".into();
         view.models.clear();

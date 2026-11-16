@@ -3175,9 +3175,10 @@ impl Inner {
     /// configured window that is refused: a session must not start with a window nobody knows.
     async fn facts(&self, profile_name: &str) -> Result<(String, Option<u64>, bool), String> {
         let models = self.models();
-        let rt = models.get(profile_name).cloned().ok_or_else(|| {
-            format!("The model profile \"{profile_name}\" is not configured ({}).", models.names())
-        })?;
+        let rt = models
+            .get(profile_name)
+            .cloned()
+            .ok_or_else(|| format!("The model profile \"{profile_name}\" is not configured ({}).", models.names()))?;
         let remembered = lock(&rt.discovered).clone();
         let profile = rt.client.profile();
         let found = match remembered {
@@ -9859,10 +9860,8 @@ mod tests {
         let item = e.rt.inbox().remove(0).item.item_id;
         e.rt.answer(&item, "").await.unwrap();
         let status = e.rt.paths().session_dir(&id).join("status.json");
-        until("status published", || {
-            std::fs::read_to_string(&status).is_ok_and(|s| s.contains("\"open_inbox\": 0"))
-        })
-        .await;
+        until("status published", || std::fs::read_to_string(&status).is_ok_and(|s| s.contains("\"open_inbox\": 0")))
+            .await;
         e.rt.shutdown().await;
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         assert!(!rt2.session(&id).unwrap().active);

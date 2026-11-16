@@ -514,9 +514,8 @@ use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
     Author, Budget, ChildCompleted, ChildOutcome, ChildSettled, Event, FinishReason, Forked, InboxItem, InboxKind,
     ModelRef, ModelRequest, ModelResponse, ModelSwitched, NoteKind, Purpose, ReasoningReplay, Record, Reweave, Seq,
-    SessionOutcome, SessionStart, StoredAction,
-    Termination, Timing, ToolCall, ToolCallRequest, ToolClass, ToolSpec, ToolStatus, Trigger, TurnEndReason, Usage,
-    META_DEFERRED_OBSERVATION, META_EXIT_CODE, META_JOB, META_SIGNAL,
+    SessionOutcome, SessionStart, StoredAction, Termination, Timing, ToolCall, ToolCallRequest, ToolClass, ToolSpec,
+    ToolStatus, Trigger, TurnEndReason, Usage, META_DEFERRED_OBSERVATION, META_EXIT_CODE, META_JOB, META_SIGNAL,
 };
 use loom_core::ids::{new_item_id, new_request_id, CallId, SessionId};
 use loom_core::ledger::{BriefOpts, LedgerOp, LedgerState};

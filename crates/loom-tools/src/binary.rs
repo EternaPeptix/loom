@@ -326,8 +326,7 @@ pub(crate) async fn command_bounded(
     let mut running =
         proc::spawn(&ctx.sandbox, &spec).map_err(|e| format!("The analysis command did not start: {e}."))?;
     let limit = ctx.cfg.max_output_bytes.min(2_000_000);
-    let wait =
-        running.wait(&ctx.cancel, Some(Duration::from_secs(seconds.clamp(1, ceiling.max(1)))), limit).await;
+    let wait = running.wait(&ctx.cancel, Some(Duration::from_secs(seconds.clamp(1, ceiling.max(1)))), limit).await;
     let background = matches!(wait, WaitEnd::Ended(_)) && running.group_alive();
     let ended = match &wait {
         WaitEnd::Ended(e) if !background => e.clone(),

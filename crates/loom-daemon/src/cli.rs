@@ -1810,12 +1810,14 @@ mod tests {
             panic!("not models show")
         };
         assert_eq!(a.session, "last");
-        let Command::Models { action: ModelsAction::Role(a) } = ok(&["models", "role", "last", "worker", "fast", "--now"])
+        let Command::Models { action: ModelsAction::Role(a) } =
+            ok(&["models", "role", "last", "worker", "fast", "--now"])
         else {
             panic!("not models role")
         };
         assert_eq!((a.role.as_str(), a.profile.as_deref(), a.clear, a.now), ("worker", Some("fast"), false, true));
-        let Command::Models { action: ModelsAction::Role(a) } = ok(&["models", "role", "last", "all", "--clear"]) else {
+        let Command::Models { action: ModelsAction::Role(a) } = ok(&["models", "role", "last", "all", "--clear"])
+        else {
             panic!("not models role --clear")
         };
         assert_eq!((cli_role(&a.role).as_str(), a.profile, a.clear), ("*", None, true));
@@ -2056,7 +2058,15 @@ mod tests {
             cmd_config(&paths, ConfigAction::Init).unwrap_err(),
             format!("{} already exists.", paths.config_file().display())
         );
-        assert_eq!(cmd_config(&paths, ConfigAction::Check), Ok(0));
+        // `check` runs the start-up checks, so the default sandbox (seatbelt) passes only where `up` would
+        // accept it; on any other host it is refused with the sentence `up` gives.
+        let check = cmd_config(&paths, ConfigAction::Check);
+        if cfg!(target_os = "macos") {
+            assert_eq!(check, Ok(0));
+        } else {
+            let err = check.unwrap_err();
+            assert!(err.contains("seatbelt") && err.contains("not macOS"), "{err}");
+        }
         std::fs::write(paths.config_file(), "default_model = [").unwrap();
         assert!(cmd_config(&paths, ConfigAction::Check).unwrap_err().contains("config.toml"));
     }
@@ -2100,7 +2110,10 @@ mod tests {
         let n = new_session(&opts, None, cwd);
         assert_eq!(
             n.role_models,
-            std::collections::BTreeMap::from([("worker".to_string(), "fast".to_string()), ("*".to_string(), "big".to_string())])
+            std::collections::BTreeMap::from([
+                ("worker".to_string(), "fast".to_string()),
+                ("*".to_string(), "big".to_string())
+            ])
         );
         assert_eq!(n.workspace, PathBuf::from("/w"));
         assert_eq!(

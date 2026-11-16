@@ -1919,15 +1919,24 @@ mod tests {
 
         // The mission's models: one entry per role its lead starts, and a choice per role.
         let (s, m) = e.get(&format!("/api/sessions/{id}/models")).await;
-        assert_eq!((s, m["lead"].as_str(), m["lead_model"]["profile"].as_str()), (200, Some(id.as_str()), Some("other")));
+        assert_eq!(
+            (s, m["lead"].as_str(), m["lead_model"]["profile"].as_str()),
+            (200, Some(id.as_str()), Some("other"))
+        );
         assert_eq!(m["roles"][0]["role"], "worker");
-        let (s, b) = e.post(&format!("/api/sessions/{id}/role-model"), json!({"role": "nope", "profile": "mock"})).await;
+        let (s, b) =
+            e.post(&format!("/api/sessions/{id}/role-model"), json!({"role": "nope", "profile": "mock"})).await;
         assert_eq!(s, 409, "{b}");
         assert!(b["error"].as_str().unwrap().contains("Its roles: worker, verifier"), "{b}");
-        let (s, r) = e.post(&format!("/api/sessions/{id}/role-model"), json!({"role": "worker", "profile": "mock"})).await;
+        let (s, r) =
+            e.post(&format!("/api/sessions/{id}/role-model"), json!({"role": "worker", "profile": "mock"})).await;
         assert_eq!((s, &r["models"]["roles"][0]["chosen"], &r["switched"]), (200, &json!("mock"), &json!([])), "{r}");
         let (s, r) = e.post(&format!("/api/sessions/{id}/role-model"), json!({"role": "worker"})).await;
-        assert_eq!((s, &r["models"]["roles"][0]["chosen"]), (200, &Value::Null), "a choice without a profile clears it");
+        assert_eq!(
+            (s, &r["models"]["roles"][0]["chosen"]),
+            (200, &Value::Null),
+            "a choice without a profile clears it"
+        );
         e.rt.shutdown().await;
     }
 
