@@ -795,6 +795,25 @@ export function healthDot({ connected, models }) {
   return { state: "green", tip: "Every model is reachable." };
 }
 
+/**
+ * The connection in short words for the sidebar header, and its detail for the tooltip. `short` is one of "Live",
+ * "Connecting…", "Reconnecting…", "Offline" (the stream failed `attempts` times in a row, 3 or more); the unreachable
+ * model profiles, a failed status request and the time of the last update go in `tip` (one line each) and in the
+ * Session/status views, not on the sidebar line. opts: {connected, everConnected, attempts, statusError, models,
+ * lastUpdateText}.
+ */
+export function connectionWords(opts = {}) {
+  const { connected = false, everConnected = false, attempts = 0, statusError = null, models = [], lastUpdateText = "" } = opts;
+  const short = connected ? "Live" : attempts >= 3 ? "Offline" : everConnected ? "Reconnecting…" : "Connecting…";
+  const tip = [];
+  if (connected) tip.push("Live events are connected.");
+  else tip.push(everConnected || attempts ? "The event stream is down; execution state unknown until it returns." : "Connecting to the event stream.");
+  if (statusError) tip.push("Model status unavailable: " + statusError);
+  for (const m of models || []) if (m && !m.reachable) tip.push(`${m.profile}: unreachable${m.detail ? " (" + m.detail + ")" : ""}`);
+  if (lastUpdateText) tip.push(lastUpdateText);
+  return { short, tip: tip.join("\n") };
+}
+
 /** Free space below which the status warns (`LOW_DISK_BYTES`, `LOW_DISK_PERCENT` of the daemon). */
 const LOW_DISK_BYTES = 5 * 1024 ** 3;
 const LOW_DISK_PERCENT = 5;
@@ -1928,7 +1947,7 @@ export function currentModel(store, info) {
   return { profile: m.profile, model: m.model, context_window: m.context_window };
 }
 
-const isWorkLine = (b) => b.kind === "line" && (b.sub === "job" || b.sub === "ledger" || b.sub === "cache" || b.sub === "request");
+const isWorkLine = (b) => b.kind === "line" && (b.sub === "job" || b.sub === "ledger" || b.sub === "cache");
 const isTextless = (b) => b.kind === "response" && !String(b.text || "").trim();
 const isGroupMember = (b) => b.kind === "tool" || isTextless(b) || isWorkLine(b);
 // What starts a new assistant segment, so the next assistant item names its model again.
@@ -1938,10 +1957,16 @@ const isBoundary = (b) => b.kind === "user" || b.kind === "note" || b.kind === "
 /** The group key of a group whose first block has `seq`: stable while the group grows at its end. */
 const groupKey = (firstBlock) => "g" + firstBlock.seq;
 
+/** A member that is itself a warning: a cut, aborted or failed reply, a job that exited non-zero, a cache break. */
+const isWarningBlock = (b) => !b.detail && ((b.kind === "response" && ((b.cutCalls && b.cutCalls.length > 0) || b.warning)) || (b.kind === "line" && b.tone === "warn"));
+
 function makeGroup(blocks) {
-  let toolCount = 0, failed = 0, missing = 0, running = false;
+  let toolCount = 0, failed = 0, missing = 0, warnings = 0, records = 0, running = false;
   let startTs = blocks[0].ts, endTs = blocks[0].ts;
   for (const b of blocks) {
+    if (!b.detail) records++;
+    if (isWarningBlock(b)) warnings++;
+    if (b.detail) continue;
     if (Number.isFinite(b.ts)) {
       if (!Number.isFinite(startTs) || b.ts < startTs) startTs = b.ts;
       if (!Number.isFinite(endTs) || b.ts > endTs) endTs = b.ts;
@@ -1953,7 +1978,7 @@ function makeGroup(blocks) {
     else if (b.result && b.result.status !== "ok") failed++;
     if (b.result && Number.isFinite(b.result.ts) && b.result.ts > endTs) endTs = b.result.ts;
   }
-  return { type: "group", key: groupKey(blocks[0]), blocks, toolCount, failed, missing, running, startTs, endTs, open: false, last: false };
+  return { type: "group", key: groupKey(blocks[0]), blocks, shown: blocks, earlier: 0, records, toolCount, failed, missing, warnings, running, startTs, endTs, open: false, last: false };
 }
 
 /**
@@ -1992,14 +2017,26 @@ export function chatItems(blocks, opts = {}) {
     items.push(makeGroup(run));
     run = null;
   };
+  // Request-detail lines never start, end or split a run: one inside a run joins the group (shown when it is open), one
+  // outside stands alone. So the group runs, and with them their keys, are the same with details on and off.
+  let held = [];
+  const standAlone = (b) => items.push({ type: "block", block: b, last: false });
   for (const b of blocks || []) {
     if (!b) continue;
     if (b.detail && !details) continue;
+    if (b.detail) {
+      held.push(b);
+      continue;
+    }
     if (isGroupMember(b)) {
+      if (run) run.push(...held); else for (const d of held) standAlone(d);
+      held = [];
       (run || (run = [])).push(b);
       continue;
     }
     flush();
+    for (const d of held) standAlone(d);
+    held = [];
     if (b.kind === "response") {
       chipFor(b.seq);
       const m = modelAt(store, b.seq);
@@ -2016,7 +2053,10 @@ export function chatItems(blocks, opts = {}) {
     else if (isBoundary(b)) needChip = true;
   }
   flush();
-  const last = items[items.length - 1];
+  for (const d of held) standAlone(d);
+  // "Last" ignores detail lines, so a trailing request line does not fold the group that is still running.
+  let last = null;
+  for (const it of items) if (!(it.type === "block" && it.block.detail)) last = it;
   if (last) last.last = true;
   for (const it of items) if (it.type === "group") it.open = !!(expandAll || it.running || it.last || open.has(it.key));
   return items;
@@ -2033,17 +2073,46 @@ export function groupKeyForSeq(items, seq) {
   return null;
 }
 
-/** The header words of a work group: {text, duration, tools, failed, missing, running} where text is
- *  "Worked for 12s · 4 tool calls · 1 failed · running" (the running group's duration runs to `now`). */
+/** The header words of a work group: {text, spoken, duration, tools, failed, missing, warnings, running} where text is
+ *  "Worked for 12s · 4 tool calls · 1 failed · running" (the running group's duration runs to `now`). `spoken` is the
+ *  accessible name: the same without the duration while the group runs, so a ticking clock is not read out every second. */
 export function groupLabel(group, now) {
   const end = group.running && Number.isFinite(now) ? now : group.endTs;
   const ms = Math.max(0, (Number(end) || 0) - (Number(group.startTs) || 0));
   const duration = ms < 1000 ? "under 1s" : seconds(ms);
-  const parts = [`Worked for ${duration}`, count(group.toolCount, "tool call")];
-  if (group.failed) parts.push(`${group.failed} failed`);
-  if (group.missing) parts.push(`${group.missing} without a result`);
-  if (group.running) parts.push("running");
-  return { text: parts.join(" · "), duration, tools: group.toolCount, failed: group.failed, missing: group.missing, running: group.running };
+  const rest = [count(group.toolCount, "tool call")];
+  if (group.failed) rest.push(`${group.failed} failed`);
+  if (group.missing) rest.push(`${group.missing} without a result`);
+  if (group.warnings) rest.push(count(group.warnings, "warning"));
+  if (group.running) rest.push("running");
+  return {
+    text: [`Worked for ${duration}`, ...rest].join(" · "),
+    spoken: [group.running ? "Work in progress" : `Worked for ${duration}`, ...rest].join(" · "),
+    duration, tools: group.toolCount, failed: group.failed, missing: group.missing, warnings: group.warnings || 0, running: group.running,
+  };
+}
+
+/**
+ * The part of `items` (chatItems output) inside the window that starts at block index `from` (a block's `id` is its
+ * index). A block or a group whose last member is below `from` goes; a group that crosses `from` stays, with `shown` the
+ * members inside the window and `earlier` how many of its (non-detail) members are left out, so a long open group is not
+ * rendered in full. A model chip stays whenever the item after it stays, so a segment keeps its attribution.
+ */
+export function windowItems(items, from) {
+  if (!(from > 0)) return items;
+  const keeps = (it) => !!it && (it.type === "group" ? it.blocks[it.blocks.length - 1].id >= from : it.type === "block" ? it.block.id >= from : false);
+  const out = [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (it.type === "model") {
+      if (keeps(items[i + 1])) out.push(it);
+    } else if (it.type === "group") {
+      if (!keeps(it)) continue;
+      const shown = it.blocks.filter((b) => b.id >= from);
+      out.push({ ...it, shown, earlier: it.blocks.filter((b) => b.id < from && !b.detail).length });
+    } else if (keeps(it)) out.push(it);
+  }
+  return out;
 }
 
 /** "Thought · 3 lines" for a reply that has reasoning; "" otherwise. */
@@ -2123,12 +2192,13 @@ const ROW_MARKS = {
   waiting: { icon: "half", tone: "running", words: "waiting for jobs or agents" },
   new: { icon: "new", tone: "info", words: "new since your last visit" },
   failed: { icon: "cross", tone: "bad", words: "ended: failed" },
+  stopped: { icon: "square", tone: "", words: "ended: stopped" },
   idle: { icon: "ring", tone: "", words: "idle" },
   ended: { icon: "check", tone: "", words: "ended" },
 };
 
 /**
- * The one status mark of a sidebar row, strict precedence needs-you > running > new > failed > idle/ended.
+ * The one status mark of a sidebar row, strict precedence needs-you > running > new > failed > stopped > idle/ended.
  * `info` the session (root or agent); `attention` from attentionFor (aggregate over the mission for a root);
  * opts.running / opts.waiting override the execution state with the mission's aggregate; opts.fresh says records are
  * newer than the stored watermark. Returns {mark, icon, tone, words}; each mark has its own icon shape.
@@ -2141,43 +2211,68 @@ export function rowMark(info, attention, opts = {}) {
   else if (opts.running || st.phase === "running") mark = "running";
   else if (opts.waiting || (st.phase !== "ended" && st.last_end === "waiting")) mark = "waiting";
   else if (opts.fresh) mark = "new";
-  else if (st.phase === "ended") mark = st.outcome === "failed" || st.outcome === "budget_exhausted" ? "failed" : "ended";
+  else if (st.phase === "ended") mark = st.outcome === "failed" || st.outcome === "budget_exhausted" ? "failed" : st.outcome === "stopped" ? "stopped" : "ended";
   else mark = st.last_end === "error" || st.last_end === "budget_exhausted" ? "failed" : "idle";
   return { mark, ...ROW_MARKS[mark] };
 }
 
-/** What waits on the operator as short words replacing the age on the identity line, or null. `waiting` is waitingFor(). */
+/**
+ * What waits on the operator as short words for the row's own line, or null. `waiting` is waitingFor(). A blocking request
+ * is urgent (amber diamond); a nonblocking question or an available result is said too, in its own words and shape, without
+ * the urgent treatment.
+ */
 export function waitingReason(waiting, now) {
   const b = waiting && waiting.blocking;
-  if (!b || !(b.count > 0)) return null;
-  if (b.count > 1) return { text: `${b.count} requests waiting`, icon: "diamond", tone: "attention" };
-  const noun = WAITING_NOUN[b.kind] || "Request";
-  const a = Number.isFinite(b.since) ? age(now, b.since) : null;
-  return { text: a === "now" ? `${noun} just arrived` : `${noun} waiting${a ? " " + a : ""}`, icon: "diamond", tone: "attention" };
+  if (b && b.count > 0) {
+    if (b.count > 1) return { text: `${b.count} requests waiting`, icon: "diamond", tone: "attention" };
+    const noun = WAITING_NOUN[b.kind] || "Request";
+    const a = Number.isFinite(b.since) ? age(now, b.since) : null;
+    return { text: a === "now" ? `${noun} just arrived` : `${noun} waiting${a ? " " + a : ""}`, icon: "diamond", tone: "attention" };
+  }
+  const soft = (slot, noun, plural, iconName, tone) => {
+    if (!slot || !(slot.count > 0)) return null;
+    const a = Number.isFinite(slot.since) ? age(now, slot.since) : null;
+    const text = slot.count > 1 ? `${slot.count} ${plural}` : `${noun}${a && a !== "now" ? " " + a : ""}`;
+    return { text, icon: iconName, tone };
+  };
+  return soft(waiting && waiting.questions, "Question open", "questions open", "question", "info")
+    || soft(waiting && waiting.results, "Result ready", "results ready", "diamond-outline", "ok");
 }
 
-/** The identity line of a row: "profile · role · age", or "profile · role · <waiting reason>". Returns {text, parts, waiting}. */
+/** The words that stand for an age that was never recorded: the page has not loaded that session's records. */
+export const ACTIVITY_UNKNOWN = "activity not loaded";
+
+/**
+ * The identity line of a row. `activityMs` is the time of the latest RECORD seen (null when none has been loaded: then the
+ * line says so, a creation time is never shown as an age). Returns {text, parts, age, waiting}: `parts` is
+ * [profile, role, tail] where tail is the age, or ACTIVITY_UNKNOWN; `text` is "profile · role · tail", or just
+ * "profile · role" while something waits (the waiting reason `waiting` is then its own line, so the model stays readable).
+ */
 export function identityLine(info, activityMs, waiting, now) {
   const reason = waitingReason(waiting, now);
-  const parts = [info.profile || "?", info.role || "session", reason ? reason.text : age(now, activityMs)];
-  return { text: parts.join(" · "), parts, waiting: reason };
+  const when = Number.isFinite(activityMs) ? age(now, activityMs) : ACTIVITY_UNKNOWN;
+  const head = [info.profile || "?", info.role || "session"];
+  return { text: (reason ? head : [...head, when]).join(" · "), parts: [...head, when], age: when, waiting: reason };
 }
 
 /**
  * The sidebar: root sessions grouped by workspace, groups and rows by most recent activity, with a "Needs you" group
  * pinned on top holding the roots (any of whose sessions) blocks on the operator. `store` is the session store;
  * `watermarks` maps session id to the last seq seen on the last visit (Map or object; no entry means never visited, so
- * never "new"); opts.activity is a Map id -> {seq, ts} of the latest record known per session (ts falls back to
- * created_ms); opts.expanded is the Set of missions whose agents are listed, opts.showArchived includes archived roots.
+ * never "new"); opts.activity is a Map id -> {seq, ts} of the latest record known per session (a session without one
+ * has an unknown age: its creation time only orders it); opts.expanded is the Set of missions whose agents are listed, opts.showArchived includes archived roots.
  * Groups: {key:"needs_you"|"ws:<path>", label, tip, workspace, activityMs, rows}. Rows: {info, depth, mission, agentCount,
- * agentsRunning, expanded, attention, waiting, mark:{mark,icon,tone,words}, identity:{text,parts,waiting}, activityMs}.
+ * agentsRunning, expanded, attention, waiting, mark:{mark,icon,tone,words}, identity:{text,parts,age,waiting}, activityMs
+ * (the sort key), recordedMs (the latest recorded time, null when unknown)}.
  */
 export function workspaceGroups(store, inbox, watermarks, now, opts = {}) {
   const { showArchived = false, expanded = new Set(), activity = new Map() } = opts;
-  const lastMs = (info) => {
+  // `recorded`: the time of the latest record seen, or null. The creation time only orders rows that have none; it is never shown.
+  const recorded = (info) => {
     const a = activity.get(info.id);
-    return a && Number.isFinite(a.ts) ? a.ts : Number(info.created_ms) || 0;
+    return a && Number.isFinite(a.ts) ? a.ts : null;
   };
+  const lastMs = (info) => recorded(info) ?? (Number(info.created_ms) || 0);
   const isFresh = (info) => {
     const a = activity.get(info.id);
     const seen = getMark(watermarks, info.id);
@@ -2194,19 +2289,20 @@ export function workspaceGroups(store, inbox, watermarks, now, opts = {}) {
   const rowOf = (info, depth, mission, extra) => {
     const attention = extra.attention;
     const ms = extra.activityMs;
+    const known = extra.recordedMs;
     return {
       info, depth, mission, agentCount: extra.agentCount, agentsRunning: extra.agentsRunning, expanded: extra.expanded,
       attention, waiting: extra.waiting,
       mark: rowMark(info, attention, { running: extra.running, waiting: extra.waitingExec, fresh: extra.fresh }),
-      identity: identityLine(info, ms, extra.waiting, now),
-      activityMs: ms,
+      identity: identityLine(info, known, extra.waiting, now),
+      activityMs: ms, recordedMs: known,
     };
   };
   for (const rows of missions) {
     const root = rows[0].info;
     const ids = rows.map((r) => r.info.id);
     const attention = { open: 0, blocking: 0, questions: 0, results: 0 };
-    let running = false, waitingExec = false, fresh = false, newest = 0;
+    let running = false, waitingExec = false, fresh = false, newest = 0, newestRecorded = null;
     for (const r of rows) {
       const own = attentionFor(inbox, r.info.id);
       for (const k of Object.keys(attention)) attention[k] += own[k];
@@ -2215,13 +2311,15 @@ export function workspaceGroups(store, inbox, watermarks, now, opts = {}) {
       else if (st.phase !== "ended" && st.last_end === "waiting") waitingExec = true;
       if (isFresh(r.info)) fresh = true;
       newest = Math.max(newest, lastMs(r.info));
+      const rec = recorded(r.info);
+      if (rec !== null) newestRecorded = Math.max(newestRecorded ?? 0, rec);
     }
     const agents = rows.slice(1);
     const rootRow = rowOf(root, 0, root.id, {
       agentCount: agents.length,
       agentsRunning: agents.filter((r) => (r.info.status || {}).phase === "running").length,
       expanded: expanded.has(root.id), attention, waiting: waitingFor(inbox, ids),
-      running, waitingExec, fresh, activityMs: newest,
+      running, waitingExec, fresh, activityMs: newest, recordedMs: newestRecorded,
     });
     const out = [rootRow];
     if (expanded.has(root.id)) {
@@ -2229,7 +2327,7 @@ export function workspaceGroups(store, inbox, watermarks, now, opts = {}) {
         out.push(rowOf(r.info, r.depth, root.id, {
           agentCount: 0, agentsRunning: 0, expanded: false,
           attention: attentionFor(inbox, r.info.id), waiting: waitingFor(inbox, [r.info.id]),
-          running: false, waitingExec: false, fresh: isFresh(r.info), activityMs: lastMs(r.info),
+          running: false, waitingExec: false, fresh: isFresh(r.info), activityMs: lastMs(r.info), recordedMs: recorded(r.info),
         }));
       }
     }
@@ -2286,9 +2384,14 @@ export function runWords(info, opts = {}) {
     case "stopped": text = st.phase === "ended" ? "Ended · stopped" : `Stopped${step}`; break;
     case "finished":
     case "failed":
-    case "result_ready":
-      text = st.phase === "ended" ? `Ended · ${st.outcome ? outcomeWords(st.outcome) : mark === "failed" ? "failed" : "done"}` : mark === "failed" ? `Failed${step}` : `Idle${step}`;
+    case "result_ready": {
+      const ended = `Ended · ${st.outcome ? outcomeWords(st.outcome) : mark === "failed" ? "failed" : "done"}`;
+      // A result waiting to be reviewed is said in words, not only by its shape.
+      text = st.phase === "ended" ? ended + (mark === "result_ready" ? " · result ready" : "")
+        : mark === "failed" ? `Failed${step}` : `Idle${step}${mark === "result_ready" ? " · result ready" : ""}`;
       break;
+    }
+    case "question": text = `Idle${step} · question open`; break;
     default: text = `Idle${step}`;
   }
   return { text, mark, icon: shape.icon, tone: shape.tone, running };
@@ -2410,4 +2513,39 @@ export function seatReceipt(receipt) {
   return receipt && receipt.live === false
     ? `Switched to ${name}. The session records the switch and uses it when it next runs.`
     : `Switched to ${name}; takes effect at the next step.`;
+}
+
+/**
+ * Whether the model seat of `info` can be used, and why not. The daemon refuses to re-seat a finished session, so the seat
+ * says so up front instead of asking the operator to confirm a switch that cannot happen. `busy` is the id of the session a
+ * switch is in flight for (or null): only that session's seat waits, not every session's.
+ */
+export function seatAvailability(info, busy, optionCount = 1) {
+  if (!info) return { disabled: true, reason: "No session is open." };
+  if (info.status && info.status.phase === "ended") return { disabled: true, reason: "This session has ended; its model no longer changes." };
+  if (busy && busy === info.id) return { disabled: true, reason: "Switching the model…" };
+  if (!(optionCount > 0)) return { disabled: true, reason: "No model profiles are configured." };
+  return { disabled: false, reason: "" };
+}
+
+/**
+ * Whether a switch receipt may be written over the session held now. `before` is {profile, model} captured before the
+ * request; when a session frame has since changed them (another tab or the CLI switched too), the stream's value is newer and wins.
+ */
+export function receiptApplies(held, before) {
+  if (!held || !before) return false;
+  return (held.profile || "") === (before.profile || "") && (held.model || "") === (before.model || "");
+}
+
+/**
+ * The one sentence of the composer's status line (an aria-live region). Loading comes first while the record is not fully
+ * loaded; otherwise the NEWER of the model-switch note and the message state wins, so a receipt or a failure that settles
+ * after a switch is never hidden by the switch's sentence. `seat` and `message` are {text, at} (`at` an increasing counter) or null.
+ */
+export function sendStateText({ loaded = true, seat = null, message = null } = {}) {
+  if (!loaded) return "Loading the record before messages can be sent.";
+  const s = seat && seat.text ? seat : null;
+  const m = message && message.text ? message : null;
+  if (s && m) return (Number(s.at) || 0) > (Number(m.at) || 0) ? s.text : m.text;
+  return (s || m || { text: "" }).text;
 }

@@ -1276,6 +1276,15 @@ test("every drawing the scripts name is in the icon template, and every id they 
       for (const p of C.missionStanding(info("s", { status }), attention, 1).pills) if (p.icon) named.add(p.icon);
     }
   }
+  // the names the core code picks at run time and app.js clones through icon(variable)
+  const mk = (phase, extra = {}) => infoOf("s", { status: { phase, step: 1, ...extra } });
+  for (const [i, attention, opts] of [[mk("idle"), { blocking: 1 }], [mk("running"), {}], [mk("idle", { last_end: "waiting" }), {}], [mk("idle"), {}, { fresh: true }], [mk("ended", { outcome: "failed" }), {}], [mk("ended", { outcome: "stopped" }), {}], [mk("idle"), {}], [mk("ended", { outcome: "done" }), {}]]) named.add(C.rowMark(i, attention, opts).icon);
+  for (const block of [{ name: "agent_spawn" }, { name: "edit_file" }, { cls: "exec" }, { cls: "read" }, { cls: "write" }, { cls: "nav" }, { cls: "state" }, { cls: "terminal" }, {}]) named.add(C.toolIcon(block));
+  for (const block of [{ state: "running" }, { state: "missing" }, { state: "done", result: { status: "ok" } }, { state: "done", result: { status: "error" } }]) named.add(C.toolRow(block).capsule.icon);
+  for (const [status, attention] of [[{ phase: "idle", last_end: "yielded" }, { questions: 1 }], [{ phase: "idle", last_end: "yielded" }, { results: 1 }], [{ phase: "ended", outcome: "stopped" }, {}], [{ phase: "idle", last_end: "waiting" }, {}]]) named.add(C.runWords(infoOf("s", { status }), { attention }).icon);
+  named.add(C.identityChips(info("s", {}), { models: [{ profile: info("s").profile, reachable: false }] }).model.warn?.icon || "alert");
+  for (const reason of [{ blocking: { count: 1 } }, { blocking: { count: 0 }, questions: { count: 1 } }, { blocking: { count: 0 }, results: { count: 1 } }]) named.add(C.waitingReason(reason, 1).icon);
+  named.add("alert");
   assert.ok(named.size >= 10, "the marks, the steps and the evidence chips have drawings");
   for (const name of named) assert.ok(drawn.has(name), `index.html has no drawing for "${name}"`);
   // a drawing never carries meaning alone: the words beside it do, so it is hidden from speech
@@ -1561,16 +1570,41 @@ test("every boundary starts a new chip; a reply in the same segment does not", (
   ]);
 });
 
-test("request detail lines are hidden unless asked for, and sit inside a group when shown", () => {
+test("request detail lines are hidden unless asked for; they never split a group or change its key", () => {
   reset();
+  const request = (n) => R("model_request", { req_id: "r" + n, step: n, epoch: 0, purpose: "step", est_tokens: 5 });
   const store = storeOf([
     start(), R("user_message", { text: "go" }, undefined, "user"),
-    R("model_request", { req_id: "r", step: 1, epoch: 0, purpose: "step", est_tokens: 5 }), call("c1"), result("c1"),
+    request(1), reply("r1", "", { tool_calls: [{ call_id: "c1", name: "bash", arguments: "{}", complete: true }] }), call("c1"), result("c1"),
+    request(2), reply("r2", "", { tool_calls: [{ call_id: "c2", name: "bash", arguments: "{}", complete: true }] }), call("c2"), result("c2"),
+    request(3), reply("r3", "done"),
   ]);
   const hidden = C.chatItems(store.blocks, { models: store.models });
-  assert.equal(hidden.find((i) => i.type === "group").blocks.length, 1);
   const shown = C.chatItems(store.blocks, { models: store.models, details: true });
-  assert.equal(shown.find((i) => i.type === "group").blocks.length, 2);
+  const groups = (items) => items.filter((i) => i.type === "group");
+  assert.equal(groups(hidden).length, 1);
+  assert.equal(groups(shown).length, 1, "request lines do not make a second group");
+  assert.deepEqual(groups(shown).map((g) => g.key), groups(hidden).map((g) => g.key), "the group key is the same with details on and off");
+  // counts and the record count are unchanged; a request inside the run is a member that shows when the group is open
+  assert.equal(groups(shown)[0].toolCount, groups(hidden)[0].toolCount);
+  assert.equal(groups(shown)[0].records, groups(hidden)[0].records);
+  assert.ok(groups(shown)[0].blocks.length > groups(hidden)[0].blocks.length);
+  assert.ok(groups(shown)[0].blocks.some((b) => b.sub === "request"));
+  // a request in front of the run, and one in front of the reply, stand alone as detail lines
+  const lead = shown.filter((i) => i.type === "block" && i.block.sub === "request");
+  assert.equal(lead.length, 2);
+  assert.equal(hidden.some((i) => i.type === "block" && i.block.sub === "request"), false);
+  // the last group stays open when a request line trails it
+  reset();
+  const tail = storeOf([start(), call("c1"), result("c1"), request(9)]);
+  assert.equal(C.chatItems(tail.blocks, { models: tail.models, details: true }).find((i) => i.type === "group").open, true);
+});
+
+test("a group that has only request details and ledger lines counts its records without the details", () => {
+  reset();
+  const store = storeOf([start(), R("ledger", { n: 1, summary: "s" }), R("model_request", { req_id: "r", step: 1, epoch: 0, purpose: "step", est_tokens: 5 }), R("ledger", { n: 2, summary: "t" })]);
+  const g = C.chatItems(store.blocks, { models: store.models, details: true }).find((i) => i.type === "group");
+  assert.equal(g.records, 2);
 });
 
 test("groupKeyForSeq finds the group holding a call, its result or a line", () => {
@@ -1672,15 +1706,16 @@ test("rowMark precedence: needs you > running > new > failed > idle/ended, each 
   assert.equal(C.rowMark(run("ended", { outcome: "failed" }), {}).mark, "failed");
   assert.equal(C.rowMark(run("ended", { outcome: "budget_exhausted" }), {}).mark, "failed");
   assert.equal(C.rowMark(run("ended", { outcome: "done" }), {}).mark, "ended");
-  assert.equal(C.rowMark(run("ended", { outcome: "stopped" }), {}).mark, "ended");
+  assert.equal(C.rowMark(run("ended", { outcome: "stopped" }), {}).mark, "stopped");
+  assert.notEqual(C.rowMark(run("ended", { outcome: "stopped" }), {}).icon, C.rowMark(run("ended", { outcome: "done" }), {}).icon, "a stop is not drawn as a success");
   assert.equal(C.rowMark(run("idle", { last_end: "yielded" }), {}).mark, "idle");
   assert.equal(C.rowMark(run("idle", { last_end: "waiting" }), {}).mark, "waiting");
   // an ended session has nothing to answer
   assert.equal(C.rowMark(run("ended", { outcome: "done" }), blocking).mark, "ended");
   // the mission's aggregate can make a root run
   assert.equal(C.rowMark(run("idle"), {}, { running: true }).mark, "running");
-  const shapes = ["needs_you", "running", "waiting", "new", "failed", "idle", "ended"].map((m) => {
-    const sample = { needs_you: [run("idle"), blocking], running: [run("running"), {}], waiting: [run("idle", { last_end: "waiting" }), {}], new: [run("idle"), {}, { fresh: true }], failed: [run("ended", { outcome: "failed" }), {}], idle: [run("idle"), {}], ended: [run("ended", { outcome: "done" }), {}] }[m];
+  const shapes = ["needs_you", "running", "waiting", "new", "failed", "stopped", "idle", "ended"].map((m) => {
+    const sample = { needs_you: [run("idle"), blocking], running: [run("running"), {}], waiting: [run("idle", { last_end: "waiting" }), {}], new: [run("idle"), {}, { fresh: true }], failed: [run("ended", { outcome: "failed" }), {}], stopped: [run("ended", { outcome: "stopped" }), {}], idle: [run("idle"), {}], ended: [run("ended", { outcome: "done" }), {}] }[m];
     const r = C.rowMark(...sample);
     assert.equal(r.mark, m);
     assert.ok(r.words);
@@ -1707,10 +1742,19 @@ test("workspaceGroups: groups by workspace, newest activity first, Needs you pin
   // the waiting reason replaces the age on the identity line
   const ask = groups[0].rows[0];
   assert.equal(ask.mark.mark, "needs_you");
-  assert.equal(ask.identity.text, "dsv41 · lead · Approval waiting 5m");
+  // the model and role stay on the line; the reason is its own line, so the profile is never cut off
+  assert.equal(ask.identity.text, "dsv41 · lead");
+  assert.deepEqual(ask.identity.parts.slice(0, 2), ["dsv41", "lead"]);
+  assert.equal(ask.identity.waiting.text, "Approval waiting 5m");
   assert.equal(ask.identity.waiting.icon, "diamond");
-  assert.equal(groups[2].rows[0].identity.text, "qwen · chat · 6m");
+  // no record has been loaded for the others: the age is unknown, never the time since creation
+  assert.equal(groups[2].rows[0].identity.text, "qwen · chat · activity not loaded");
+  assert.equal(groups[2].rows[0].identity.age, C.ACTIVITY_UNKNOWN);
+  assert.equal(groups[2].rows[0].recordedMs, null);
   assert.equal(groups[2].rows[0].identity.waiting, null);
+  // with a loaded record the age comes from the record
+  const loaded = C.workspaceGroups(sessionStore(list), inboxWith([]), {}, now, { activity: new Map([["mid", { seq: 4, ts: now - 120000 }]]) });
+  assert.equal(loaded.flatMap((g) => g.rows).find((r) => r.info.id === "mid").identity.text, "qwen · chat · 2m");
 });
 
 test("workspaceGroups: activity orders groups and rows; agents nest under their mission when expanded", () => {
@@ -1732,6 +1776,7 @@ test("workspaceGroups: activity orders groups and rows; agents nest under their 
   const open = C.workspaceGroups(store, C.createInbox(), {}, 60000, { activity, expanded: new Set(["m1"]) });
   assert.deepEqual(open[0].rows.map((r) => [r.info.id, r.depth]), [["m1", 0], ["w1", 1]]);
   assert.equal(open[0].rows[1].identity.text, "qwen · worker · 10s");
+  assert.equal(open[0].rows[0].identity.text, "dsv41 · lead · 10s"); // the root shows its newest recorded time (its agent's)
   // flipping the order of activity flips the groups
   const flipped = C.workspaceGroups(store, C.createInbox(), {}, 60000, { activity: new Map([["m2", { seq: 2, ts: 59000 }]]) });
   assert.deepEqual(flipped.map((g) => g.label), ["b", "a"]);
@@ -1916,4 +1961,176 @@ test("seatReceipt says when the switch takes effect", () => {
   assert.equal(C.seatReceipt(r), "Switched to b (mb); takes effect at the next step.");
   assert.match(C.seatReceipt({ ...r, live: false }), /when it next runs/);
   assert.match(C.seatReceipt({}), /Switched to the new model/);
+});
+
+// ---- review fixes: windowing, labels, waiting words
+
+test("windowItems keeps a group that crosses the window, clipped, with its model chip and the earlier count", () => {
+  reset();
+  const calls = [];
+  for (let i = 0; i < 6; i++) calls.push(call("c" + i), result("c" + i));
+  const store = storeOf([start(), R("user_message", { text: "go" }, undefined, "user"), ...calls, R("user_message", { text: "again" }, undefined, "user"), reply("r", "ok")]);
+  const items = C.chatItems(store.blocks, { models: store.models });
+  const group = items.find((i) => i.type === "group");
+  const from = group.blocks[4].id; // the window starts inside the group
+  const windowed = C.windowItems(items, from);
+  const g = windowed.find((i) => i.type === "group");
+  assert.equal(g.key, group.key, "the key does not change");
+  assert.equal(g.blocks.length, group.blocks.length, "the whole group is still known: its counts are not cut");
+  assert.equal(g.toolCount, group.toolCount);
+  assert.deepEqual(g.shown.map((b) => b.id), group.blocks.filter((b) => b.id >= from).map((b) => b.id));
+  assert.equal(g.earlier, group.blocks.filter((b) => b.id < from).length);
+  // the chip in front of the clipped group stays, even though its own seq is before the window
+  assert.equal(windowed[0].type, "model");
+  assert.equal(windowed[1].type, "group");
+  // nothing in the window is a group's last member: it goes, and so does its chip
+  const late = C.windowItems(items, store.blocks.length - 1);
+  assert.deepEqual(late.map((i) => i.type), ["model", "block"]);
+  assert.equal(C.windowItems(items, 0), items);
+  assert.equal(C.windowItems(items, from).every((i) => i.type !== "group" || i.shown.every((b) => b.id >= from)), true);
+});
+
+test("a long open group is windowed to the shown members, so rendering is bounded", () => {
+  reset();
+  const recs = [start(), R("user_message", { text: "go" }, undefined, "user")];
+  for (let i = 0; i < 400; i++) recs.push(reply("r" + i, "", { tool_calls: [{ call_id: "c" + i, name: "bash", arguments: "{}", complete: true }] }), call("c" + i), result("c" + i));
+  const store = storeOf(recs);
+  const items = C.chatItems(store.blocks, { models: store.models });
+  assert.equal(items.filter((i) => i.type === "group").length, 1);
+  const from = store.blocks.length - 300;
+  const g = C.windowItems(items, from).find((i) => i.type === "group");
+  assert.equal(g.shown.length, 300);
+  assert.equal(g.earlier, g.blocks.length - 300);
+  assert.equal(g.toolCount, 400);
+});
+
+test("groupLabel: warnings are counted and the spoken name has no ticking clock while running", () => {
+  const g = { type: "group", toolCount: 3, failed: 1, missing: 0, warnings: 2, running: true, startTs: 1000, endTs: 1000 };
+  const a = C.groupLabel(g, 42000);
+  const b = C.groupLabel(g, 43000);
+  assert.equal(a.text, "Worked for 41s · 3 tool calls · 1 failed · 2 warnings · running");
+  assert.equal(a.spoken, "Work in progress · 3 tool calls · 1 failed · 2 warnings · running");
+  assert.equal(a.spoken, b.spoken, "the name does not change while the seconds do");
+  assert.notEqual(a.text, b.text);
+  const done = C.groupLabel({ ...g, running: false, endTs: 13000 }, 0);
+  assert.equal(done.spoken, "Worked for 12s · 3 tool calls · 1 failed · 2 warnings");
+  assert.equal(C.groupLabel({ ...g, warnings: 0, failed: 0 }, 5000).text, "Worked for 4.0s · 3 tool calls · running");
+});
+
+test("a folded group counts the warnings among its members", () => {
+  reset();
+  const store = storeOf([
+    start(), R("user_message", { text: "go" }, undefined, "user"),
+    reply("r1", "", { finish: "length", tool_calls: [{ call_id: "c1", name: "bash", arguments: "{", complete: false }] }),
+    R("job_settled", { job_id: "j", exit_code: 2, output: null, detail: "" }),
+    R("cache_break", { req_id: "r", first_diff_message: 2, detail: "d" }),
+    R("job_settled", { job_id: "k", exit_code: 0, output: null, detail: "" }),
+    reply("r2", "done"),
+  ]);
+  const g = C.chatItems(store.blocks, { models: store.models }).find((i) => i.type === "group");
+  assert.equal(g.warnings, 3, "a cut reply, a failed job and a cache break");
+  assert.equal(g.toolCount, 0);
+  assert.match(C.groupLabel(g, 0).text, /3 warnings/);
+});
+
+test("waitingReason also says a nonblocking question and a ready result, in their own shapes", () => {
+  const none = { blocking: { count: 0 }, questions: { count: 0 }, results: { count: 0 } };
+  assert.equal(C.waitingReason(none, 1), null);
+  const q = C.waitingReason({ ...none, questions: { count: 1, since: 0 } }, 120000);
+  assert.deepEqual(q, { text: "Question open 2m", icon: "question", tone: "info" });
+  const r = C.waitingReason({ ...none, results: { count: 1, since: 0 } }, 600000);
+  assert.deepEqual(r, { text: "Result ready 10m", icon: "diamond-outline", tone: "ok" });
+  assert.equal(C.waitingReason({ ...none, questions: { count: 2 } }, 5).text, "2 questions open");
+  // a blocking request wins, and keeps the urgent shape
+  assert.equal(C.waitingReason({ ...none, blocking: { count: 1, kind: "approval", since: 0 }, questions: { count: 1 } }, 60000).icon, "diamond");
+  assert.notEqual(q.icon, "diamond");
+});
+
+test("a session with a nonblocking question or a ready result says so on its row", () => {
+  const list = [infoOf("q", { workspace: "/w/a" }), infoOf("r", { workspace: "/w/b", status: { phase: "ended", outcome: "done", step: 3 } })];
+  const q = { item_id: "i-q", item_kind: "question", blocking: false, text: "t" };
+  const r = { item_id: "i-r", item_kind: "finished", blocking: false, text: "t" };
+  const inbox = C.createInbox();
+  inbox.items.set("i-q", { session: "q", mission: "q", opened_ms: 0, item: q });
+  inbox.items.set("i-r", { session: "r", mission: "r", opened_ms: 0, item: r });
+  const rows = C.workspaceGroups(sessionStore(list), inbox, {}, 600000).flatMap((g) => g.rows);
+  assert.equal(rows.find((x) => x.info.id === "q").identity.waiting.text, "Question open 10m");
+  assert.equal(rows.find((x) => x.info.id === "r").identity.waiting.text, "Result ready 10m");
+  assert.equal(rows.find((x) => x.info.id === "q").mark.mark, "idle", "only a blocking request takes the needs-you mark");
+});
+
+test("runWords says an open question and a ready result in words, not only by shape", () => {
+  const live = infoOf("s", { status: { phase: "idle", step: 7, last_end: "yielded" } });
+  assert.equal(C.runWords(live, { attention: { blocking: 0, questions: 1, results: 0 } }).text, "Idle · step 7 · question open");
+  assert.equal(C.runWords(live, { attention: { blocking: 0, questions: 0, results: 1 } }).text, "Idle · step 7 · result ready");
+  const ended = infoOf("s", { status: { phase: "ended", step: 7, outcome: "done" } });
+  assert.equal(C.runWords(ended, { attention: { blocking: 0, results: 1 } }).text, "Ended · done · result ready");
+  assert.equal(C.runWords(ended, { attention: { blocking: 0 } }).text, "Ended · done");
+  assert.notEqual(C.runWords(live, { attention: { questions: 1 } }).icon, C.runWords(live, { attention: { results: 1 } }).icon);
+});
+
+test("identityLine: the age is a recorded time or an explicit unknown, and a waiting reason has its own line", () => {
+  const i = infoOf("s", { profile: "qwen", role: "chat" });
+  assert.equal(C.identityLine(i, 1000, null, 61000).text, "qwen · chat · 1m");
+  assert.equal(C.identityLine(i, null, null, 61000).text, "qwen · chat · activity not loaded");
+  assert.equal(C.identityLine(i, undefined, null, 61000).age, "activity not loaded");
+  const w = C.identityLine(i, 1000, { blocking: { count: 1, kind: "question", since: 1000 } }, 61000);
+  assert.equal(w.text, "qwen · chat");
+  assert.equal(w.waiting.text, "Question waiting 1m");
+});
+
+test("workspaceGroups: a row with no loaded activity never shows its creation as an age, and still sorts", () => {
+  const list = [infoOf("old", { workspace: "/w/a", created_ms: 1000 }), infoOf("new", { workspace: "/w/a", created_ms: 900000 })];
+  const rows = C.workspaceGroups(sessionStore(list), C.createInbox(), {}, 1000000)[0].rows;
+  assert.deepEqual(rows.map((r) => r.info.id), ["new", "old"]);
+  for (const r of rows) assert.equal(r.identity.age, "activity not loaded");
+});
+
+test("connectionWords: short words for the sidebar, the detail in the tooltip", () => {
+  const live = C.connectionWords({ connected: true, everConnected: true, lastUpdateText: "Last update 2s ago" });
+  assert.equal(live.short, "Live");
+  assert.match(live.tip, /Last update 2s ago/);
+  const amber = C.connectionWords({ connected: true, everConnected: true, models: [{ profile: "necromicon", reachable: false, detail: "refused" }, { profile: "qwen", reachable: true }] });
+  assert.equal(amber.short, "Live", "an unreachable model is not on the sidebar line");
+  assert.match(amber.tip, /necromicon: unreachable \(refused\)/);
+  assert.doesNotMatch(amber.tip, /qwen/);
+  assert.match(C.connectionWords({ connected: true, statusError: "boom" }).tip, /Model status unavailable: boom/);
+  assert.equal(C.connectionWords({}).short, "Connecting…");
+  assert.equal(C.connectionWords({ everConnected: true, attempts: 1 }).short, "Reconnecting…");
+  assert.equal(C.connectionWords({ everConnected: true, attempts: 3 }).short, "Offline");
+  assert.match(C.connectionWords({ everConnected: true }).tip, /execution state unknown/);
+  for (const w of [live, amber, C.connectionWords({}), C.connectionWords({ attempts: 9 })]) assert.ok(w.short.length <= 14, "short enough for the sidebar");
+});
+
+test("seatAvailability: an ended session's seat is disabled with the reason; a busy switch only holds its own session", () => {
+  const live = infoOf("a", { status: { phase: "idle" } });
+  assert.deepEqual(C.seatAvailability(live, null, 2), { disabled: false, reason: "" });
+  const ended = C.seatAvailability(infoOf("a", { status: { phase: "ended", outcome: "done" } }), null, 2);
+  assert.equal(ended.disabled, true);
+  assert.equal(ended.reason, "This session has ended; its model no longer changes.");
+  assert.equal(C.seatAvailability(live, "a", 2).disabled, true, "the session being switched waits");
+  assert.equal(C.seatAvailability(infoOf("b", { status: { phase: "idle" } }), "a", 2).disabled, false, "another session's switch does not hold this seat");
+  assert.equal(C.seatAvailability(live, null, 0).disabled, true);
+  assert.equal(C.seatAvailability(null, null, 2).disabled, true);
+});
+
+test("receiptApplies: a receipt never overwrites a session that a newer frame has changed", () => {
+  const before = { profile: "dsv41", model: "deepseek-v4.1" };
+  assert.equal(C.receiptApplies({ profile: "dsv41", model: "deepseek-v4.1" }, before), true);
+  assert.equal(C.receiptApplies({ profile: "qwen", model: "q" }, before), false, "a frame already moved it on");
+  assert.equal(C.receiptApplies({ profile: "dsv41", model: "other-id" }, before), false);
+  assert.equal(C.receiptApplies(undefined, before), false);
+  assert.equal(C.receiptApplies({ profile: "a" }, null), false);
+  assert.equal(C.receiptApplies({ profile: "a" }, { profile: "a", model: "" }), true);
+});
+
+test("sendStateText: the newer of the switch note and the message state wins; loading comes first", () => {
+  const seat = { text: "Switched to qwen (q); takes effect at the next step.", at: 5 };
+  assert.equal(C.sendStateText({ seat, message: { text: "Message accepted · awaiting its recorded delivery.", at: 4 } }), seat.text, "the switch came last");
+  assert.equal(C.sendStateText({ seat, message: { text: "Delivered to a model step.", at: 6 } }), "Delivered to a model step.", "a receipt that settles after the switch shows");
+  assert.equal(C.sendStateText({ seat, message: { text: "Message rejected: no", at: 9 } }), "Message rejected: no");
+  assert.equal(C.sendStateText({ seat: null, message: { text: "m", at: 1 } }), "m");
+  assert.equal(C.sendStateText({ seat, message: null }), seat.text);
+  assert.equal(C.sendStateText({ seat, message: { text: "m", at: 9 }, loaded: false }), "Loading the record before messages can be sent.");
+  assert.equal(C.sendStateText({}), "");
 });

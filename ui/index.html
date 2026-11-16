@@ -13,12 +13,11 @@
   <aside id="left" class="col left" aria-label="Missions and inbox">
     <header class="lhead">
       <span class="brand">loom</span>
-      <span class="lconn"><span id="dot" class="dot dot-red" title="connecting" aria-hidden="true"></span><span id="connection-state" class="connection-state" role="status">Connecting…</span></span>
+      <span id="connection-wrap" class="lconn"><span id="dot" class="dot dot-red" title="connecting" aria-hidden="true"></span><span id="connection-state" class="connection-state" role="status">Connecting…</span></span>
       <span class="spacer"></span>
       <button id="btn-inbox" type="button" class="btn">Inbox <span id="inbox-count" class="count" hidden>0</span></button>
       <button id="close-left" type="button" class="btn small drawer-btn" aria-label="Close missions">Close</button>
     </header>
-    <div id="connection-updated" class="lupdated"></div>
     <div class="lnew"><button id="btn-new" type="button" class="btn wide">New mission</button></div>
     <div id="disk-warning" class="disk-warning" role="status" hidden></div>
     <nav id="sessions" class="sessions" aria-label="Missions"></nav>
@@ -30,6 +29,10 @@
   <main id="mid" class="col mid">
     <div class="bar">
       <button id="open-left" type="button" class="btn drawer-btn" aria-controls="left" aria-expanded="false">Missions</button>
+      <span id="bar-identity" class="bar-identity" role="group" aria-label="Open session">
+        <span id="bar-model" class="id-chip id-model bar-chip" hidden></span>
+        <span id="bar-run" class="id-chip id-run bar-chip" hidden></span>
+      </span>
       <span id="bar-connection" class="bar-connection" role="status"></span>
       <span class="spacer"></span>
       <button id="open-right" type="button" class="btn drawer-btn" aria-controls="right" aria-expanded="false">Inspector</button>
@@ -104,16 +107,16 @@
           <p id="agent-note" class="dim pad" hidden>Messages go to the lead session of this mission, not to its agents.</p>
           <p id="closed-note" class="dim pad" hidden></p>
           <textarea id="msg" rows="1" placeholder="Add direction or context…" aria-label="Message" aria-describedby="composer-recipient composer-help"></textarea>
-          <div id="model-confirm" class="model-confirm" role="group" aria-labelledby="model-confirm-text" hidden>
-            <p id="model-confirm-text" class="model-confirm-text" role="status"></p>
-            <span class="model-confirm-actions">
-              <button id="model-confirm-yes" type="button" class="btn small primary">Switch</button>
-              <button id="model-confirm-no" type="button" class="btn small">Keep</button>
-            </span>
-          </div>
           <div id="composer-row" class="composer-bar">
             <p id="composer-help" class="composer-help dim"></p>
             <label class="seat"><span class="sr-only">Model for this session</span><select id="model-seat" class="model-seat" title="The model this session runs on. Choosing another asks first."></select></label>
+            <div id="model-confirm" class="model-confirm" role="group" aria-labelledby="model-confirm-text" hidden>
+              <p id="model-confirm-text" class="model-confirm-text"></p>
+              <span class="model-confirm-actions">
+                <button id="model-confirm-yes" type="button" class="btn small primary">Switch</button>
+                <button id="model-confirm-no" type="button" class="btn small">Keep</button>
+              </span>
+            </div>
             <button id="send" type="button" class="send-btn" aria-label="Send" title="Send (Enter)"><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 10V2.5M2.8 5.6 6 2.4l3.2 3.2"/></svg></button>
           </div>
         </div>

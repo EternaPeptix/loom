@@ -1,5 +1,8 @@
 // Isolated UI fixtures: no model, daemon, credentials, or workspace writes.
 // Run: node tools/ui-preview.mjs [port], then open the printed URL (/#code=fixture signs in, then /#/s/s-audit).
+// Fixture-only routes: GET /__fixture/state, POST /__fixture/question, POST /__fixture/reconnect, and
+// POST /__fixture/stream (streams a short live reply into s-other: reasoning, text and a tool call as delta frames, then
+// the model_response, tool_call and tool_result records; a second step follows, so a work group grows while it runs).
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -61,6 +64,31 @@ append("s-audit", "inbox_opened", inbox[0].item);
 append("s-audit", "turn_end", { reason: "waiting" });
 const ledger = { entries: 9, goal: "Find actionable reliability defects and preserve source evidence.", constraints: [{ id: "k1", text: "Read-only review." }], plan: [{ id: "p1", text: "Inspect recovery paths", status: "done", note: "Source finding recorded." }, { id: "p2", text: "Review tool execution", status: "doing" }, { id: "p3", text: "Independently verify findings", status: "todo" }], claims: [{ id: "c1", text: "Recovered reports may omit the answer.", status: "open", evidence: ["e1"], note: "Crash reproduction pending." }, { id: "c2", text: "Process tracking ends when the shell exits.", status: "supported", evidence: ["e2", "e3"] }], evidence: [{ id: "e1", supports: true, kind: "static", attested: true, quote: "full: None,", blob, lines: [1596, 1596], session: "s-audit", call_id: "read1", note: "Source text only." }, { id: "e2", supports: true, kind: "execution", attested: true, quote: "job settled (exit 0) while pid 4127 still running", blob, lines: [212, 214], session: "s-worker", call_id: "bash7" }, { id: "e3", supports: false, kind: "note", attested: false, quote: "a foreground pipeline was tracked to completion", note: "Only observed with a backgrounded child." }], obligations: [{ id: "o1", kind: "agent", text: "Recovery review", outcome: null }], decisions: [], dead_ends: [], questions: [] };
 
+let streaming = false;
+const delta = (id, req_id, d) => emit({ type: "delta", session: id, req_id, delta: d });
+/** One streamed step into s-other: deltas for reasoning, then text, then a call; then the records the daemon writes. */
+async function streamStep(n, { text, reasoning, command, run_ms }) {
+  const id = "s-other"; const info = sessions.find(s => s.id === id);
+  const req_id = `fixture-stream-${Date.now()}-${n}`; const call_id = `stream-call-${Date.now()}-${n}`;
+  info.status = { ...info.status, step: info.status.step + 1 }; emit({ type: "status", session: id, status: info.status });
+  append(id, "model_request", { req_id, step: info.status.step, epoch: 1, purpose: "step", est_tokens: info.status.prompt_tokens }, "harness", true);
+  for (const part of reasoning.match(/.{1,24}/g)) { delta(id, req_id, { delta: "reasoning", text: part }); await wait(120); }
+  for (const part of text.match(/.{1,16}/g) || []) { delta(id, req_id, { delta: "text", text: part }); await wait(120); }
+  const args = JSON.stringify({ command });
+  delta(id, req_id, { delta: "tool_call_start", index: 0, name: "bash" });
+  for (const part of args.match(/.{1,12}/g)) { delta(id, req_id, { delta: "tool_call_args", index: 0, text: part }); await wait(80); }
+  await wait(300);
+  append(id, "model_response", { req_id, text, reasoning, tool_calls: [{ call_id, name: "bash", arguments: args, complete: true }], finish: "tool_calls", usage: { prompt_tokens: info.status.prompt_tokens, cached_tokens: info.status.cached_tokens, completion_tokens: 60 }, timing: { ttft_ms: 300, total_ms: 2500 }, attempts: 1 }, "model", true);
+  append(id, "tool_call", { call_id, req_id, name: "bash", args: { command }, class: "exec" }, "model", true);
+  await wait(run_ms);
+  append(id, "tool_result", { call_id, name: "bash", status: "ok", text: "ok: " + command, cut: false, class: "exec", meta: { exit_code: 0 }, duration_ms: run_ms }, "tool", true);
+}
+async function streamReply() {
+  const id = "s-other";
+  if (!(logs.get(id) || []).some(r => r.kind === "turn_start")) append(id, "turn_start", { trigger: "user" }, "harness", true);
+  await streamStep(1, { reasoning: "The indexer benchmark needs a baseline first, so run the smallest corpus and read the timing.", text: "Running the baseline on the small corpus.", command: "indexer bench --corpus small", run_ms: 3500 });
+  await streamStep(2, { reasoning: "Now compare against the large corpus.", text: "", command: "indexer bench --corpus large", run_ms: 5000 });
+}
 function emit(event) { for (const res of clients) res.write("data: " + JSON.stringify(event) + "\n\n"); }
 function json(res, value, status = 200) { const body = JSON.stringify(value); res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" }); res.end(body); }
 async function body(req) { let text = ""; for await (const chunk of req) text += chunk; return text ? JSON.parse(text) : {}; }
@@ -73,6 +101,11 @@ const server = createServer(async (req, res) => {
     if (path === "/__fixture/question" && req.method === "POST") {
       const item = { session: "s-audit", mission: "m-audit", title: "Audit harness reliability", opened_ms: Date.now(), item: { item_id: "i-extra-" + inbox.length, item_kind: "question", text: "A second question arrived while you were typing.", options: [], blocking: false } };
       inbox.push(item); append("s-audit", "inbox_opened", item.item, "harness", true); return json(res, {});
+    }
+    if (path === "/__fixture/stream" && req.method === "POST") {
+      if (streaming) return json(res, { error: "A fixture reply is already streaming into s-other." }, 409);
+      streaming = true; streamReply().catch(() => {}).finally(() => { streaming = false; });
+      return json(res, { started: true, session: "s-other" });
     }
     if (path === "/__fixture/reconnect" && req.method === "POST") { for (const client of clients) client.end(); clients.clear(); return json(res, {}); }
     if (path === "/api/events") {
@@ -97,6 +130,8 @@ const server = createServer(async (req, res) => {
       const id = parts[3]; const info = sessions.find(s => s.id === id);
       if (!info) return json(res, { error: "No such fixture session." }, 404);
       if (parts[4] === "model") {
+        // The daemon refuses to re-seat a finished session (Runtime::switch); so does the fixture.
+        if (info.status.phase === "ended") return json(res, { error: `Session ${id} has ended, so its model no longer changes.` }, 409);
         const target = profileOf(data.profile);
         if (!target) return json(res, { error: `There is no model profile named \`${data.profile}\`; pick one of ${profiles.map(p => p.profile).join(", ")}.` }, 404);
         const live = info.status.phase === "running";
@@ -135,4 +170,8 @@ const server = createServer(async (req, res) => {
   } catch (e) { json(res, { error: e.message }, 500); }
 });
 const port = Number(process.argv[2] || 8766);
-server.listen(port, "127.0.0.1", () => console.log(`UI fixtures: http://127.0.0.1:${server.address().port}/#code=fixture (then /#/s/s-audit)`));
+server.listen(port, "127.0.0.1", () => {
+  const base = `http://127.0.0.1:${server.address().port}`;
+  console.log(`UI fixtures: ${base}/#code=fixture (then /#/s/s-audit)`);
+  console.log(`Fixture routes: GET /__fixture/state; POST /__fixture/question, /__fixture/reconnect, /__fixture/stream (a live reply, a running work group and its ticking label in s-other: curl -X POST ${base}/__fixture/stream)`);
+});

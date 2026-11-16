@@ -34,8 +34,10 @@ const S = {
   section: "chat",
   models: null, // GET /api/models: {default_model, models: [...]} (null until fetched)
   seat: null, // a model switch waiting for the operator's answer: {session, profile}
-  seatBusy: false,
-  seatNote: new Map(), // session id -> the sentence the last switch ended with
+  seatBusy: new Set(), // ids of the sessions a model switch is in flight for (a switch holds only its own session's seat)
+  seatNote: new Map(), // session id -> {text, at}: the sentence the last switch ended with
+  stamp: 0, // an increasing counter: the newer of a switch note and a message state is the one the status line shows
+  attempts: 0, // failed attempts to open the event stream in a row
   workState: new Map(), // work group key -> true (operator opened it) | false (operator folded it)
   expandAll: false,
   details: false,
@@ -317,15 +319,40 @@ function loadWatermarks() {
     S.watermarkRead.add(id);
     const seen = recalled("seen." + id, null);
     if (Number.isInteger(seen) && !S.watermarks.has(id)) S.watermarks.set(id, seen);
+    // The latest record seen on an earlier page load: ages and "new" marks survive a reload instead of starting unknown.
+    const last = recalled("activity." + id, null);
+    if (last && Number.isInteger(last.seq) && Number.isFinite(last.ts) && !S.activity.has(id)) S.activity.set(id, { seq: last.seq, ts: last.ts });
   }
 }
 
-/** The identity line of a row: mono "profile · role · age"; a waiting reason replaces the age, with its own shape. */
+const activityDirty = new Set();
+let activityTimer = 0;
+/** Keep the latest record seen per session beside the watermarks, at most once a second. */
+function persistActivity(session) {
+  activityDirty.add(session);
+  if (activityTimer) return;
+  activityTimer = setTimeout(() => {
+    activityTimer = 0;
+    for (const id of activityDirty) { const a = S.activity.get(id); if (a) remember("activity." + id, a); }
+    activityDirty.clear();
+  }, 1000);
+}
+
+/**
+ * The identity line of a row, mono: "profile · role · age". The profile never shrinks or truncates; the rest may be cut.
+ * When something waits on the operator the reason is its own line below (amber, with its own shape for a blocking
+ * request; blue and green for a question and a ready result).
+ */
 function identityEl(identity) {
   const line = el("span", "ident");
-  if (!identity.waiting) return add(line, el("span", "ident-text", identity.text));
-  const wait = add(el("span", "ident-wait"), icon(identity.waiting.icon), el("span", "ident-text", identity.waiting.text));
-  return add(line, el("span", "ident-text", identity.parts.slice(0, 2).join(" · ") + " ·"), wait);
+  const [profile, role, tail] = identity.parts;
+  const rest = identity.waiting ? role : `${role} · ${tail}`;
+  add(line, add(el("span", "ident-line"), el("span", "ident-profile", profile), el("span", "ident-text", " · " + rest)));
+  if (identity.waiting) {
+    const w = identity.waiting;
+    add(line, add(el("span", "ident-wait tone-" + w.tone), icon(w.icon), el("span", "ident-text", w.text)));
+  }
+  return line;
 }
 
 function renderList() {
@@ -377,18 +404,28 @@ function renderList() {
 }
 
 function renderDot() {
-  const d = C.healthDot({ connected: S.connected, models: (S.status && S.status.models) || [] });
+  const models = (S.status && S.status.models) || [];
+  const d = C.healthDot({ connected: S.connected, models });
   const dot = $("dot");
   dot.className = "dot dot-" + d.state;
   dot.title = d.tip;
   const state = $("connection-state");
-  const updated = $("connection-updated");
-  const words = S.connected ? (S.statusError ? "Live events · model status unavailable" : d.state === "amber" ? "Live · model unavailable" : "Live") : "Reconnecting · execution state unknown";
-  if (state) state.textContent = words;
-  // Below 1100px the sidebar can be closed: a lost connection is also said in the bar.
+  // The sidebar line stays short ("Live", "Reconnecting…", "Offline"); the detail is its tooltip.
+  const words = C.connectionWords({
+    connected: S.connected, everConnected: S.everConnected, attempts: S.attempts, statusError: S.statusError, models,
+    lastUpdateText: S.lastUpdate ? `Last update ${ago(S.lastUpdate)}` : "Waiting for first update",
+  });
+  if (state) {
+    state.textContent = words.short;
+    state.title = words.tip;
+  }
+  const wrap = $("connection-wrap");
+  if (wrap) wrap.title = words.tip;
+  // The bar speaks the loss of the connection only where the sidebar is a closed drawer (under 700px); beside the open sidebar it would be said twice.
   const bar = $("bar-connection");
-  if (bar) bar.textContent = S.connected ? "" : words;
-  if (updated) updated.textContent = S.lastUpdate ? `Last update ${ago(S.lastUpdate)}` : "Waiting for first update";
+  if (bar) bar.textContent = !S.connected && matchMedia("(max-width: 699px)").matches ? `${words.short} · execution state unknown` : "";
+  // A run chip counts up only while the stream is up: it changes with the connection.
+  if (S.view === "session") want("header");
 }
 
 function renderDiskWarning() {
@@ -440,11 +477,12 @@ function route() {
 function setView(v) {
   if (S.view === "session" && v !== "session") saveSeen();
   S.view = v;
-  if (v !== "session") { renderStats(); stopRunTimer(); }
+  if (v !== "session") { renderStats(); stopRunTimer(); hideBarIdentity(); }
   $("view-empty").hidden = v !== "empty";
   $("view-session").hidden = v !== "session";
   $("view-inbox").hidden = v !== "inbox";
   $("view-new").hidden = v !== "new";
+  if (v === "session") markRead();
   want("list");
 }
 
@@ -452,11 +490,13 @@ function openSession(id) {
   if (S.openId === id && S.rec) {
     if (S.view !== "session") S.sinceSeq = recalled("seen." + id, null);
     setView("session");
+    markRead(); // what happened while the operator was elsewhere is on screen now: the row is no longer "new"
     want("header", "blocks", "right", "overview");
     return;
   }
   saveSeen();
   S.openId = id;
+  S.seatNote.delete(id); // a switch sentence from an earlier visit is not news
   let ancestor = S.sessions.byId.get(id)?.parent;
   const walked = new Set();
   while (ancestor && !walked.has(ancestor)) { walked.add(ancestor); S.expanded.add(ancestor); ancestor = S.sessions.byId.get(ancestor)?.parent; }
@@ -533,6 +573,15 @@ async function loadRecords(store, tries) {
   if (S.rec === store && C.missing(store) && tries < 5) loadRecords(store, tries + 1);
 }
 
+/** The open session is being read: its watermark moves to the latest record, so its row is not "new". */
+function markRead() {
+  const last = S.rec && !S.rec.loading ? C.lastSeq(S.rec) : null;
+  if (last === null || last === undefined || !S.openId) return;
+  S.watermarks.set(S.openId, last);
+  remember("seen." + S.openId, last);
+  want("list");
+}
+
 function saveSeen() {
   if (S.openId && S.rec && !S.rec.loading && C.lastSeq(S.rec) !== null) {
     remember("seen." + S.openId, C.lastSeq(S.rec));
@@ -543,7 +592,7 @@ function saveSeen() {
 function noteActivity(session, record) {
   if (Number.isInteger(record.seq)) {
     const was = S.activity.get(session);
-    if (!was || record.seq >= was.seq) S.activity.set(session, { seq: record.seq, ts: record.ts_ms });
+    if (!was || record.seq >= was.seq) { S.activity.set(session, { seq: record.seq, ts: record.ts_ms }); persistActivity(session); }
     // The open session is being read, so it is never "new since your last visit".
     if (session === S.openId && S.view === "session") S.watermarks.set(session, record.seq);
   }
@@ -630,7 +679,8 @@ function handleEvent(ev) {
         break;
       case "refetch_ledger":
         S.ledger.stale = true;
-        if (S.tab === "ledger" || S.section !== "chat") loadLedger();
+        // The header shows the goal and the current step on every tab, so a session view always reloads it.
+        if (S.view === "session" || S.tab === "ledger" || S.section !== "chat") loadLedger();
         break;
       case "net":
         C.applyNet(S.net, f.entry);
@@ -668,6 +718,7 @@ async function connect() {
       const again = S.everConnected;
       S.connected = true;
       S.everConnected = true;
+      S.attempts = 0;
       S.lastUpdate = Date.now();
       attempt = 0;
       renderDot();
@@ -690,6 +741,7 @@ async function connect() {
     // After lost() the page is the sign-in sentence: there is no dot to update.
     if (streamStopped) return;
     S.connected = false;
+    S.attempts++;
     renderDot();
     await new Promise((resolve) => setTimeout(resolve, C.reconnectDelayMs(attempt++)));
   }
@@ -785,20 +837,39 @@ function chipContent(node, ...kids) {
   node.replaceChildren(...kids.filter(Boolean));
 }
 
-/** The run chip: shape + words. The elapsed time of a running turn ticks once a second, only while running. */
+/** The run chip: shape + words. The elapsed time of a running turn ticks once a second, only while running and only while the stream is up. */
 function renderRun(info) {
-  const run = C.runWords(info, { now: Date.now(), startMs: S.rec && S.rec.turn ? S.rec.turn.ts : null, attention: inboxCount(info.id) });
-  const node = $("s-run");
-  node.className = "id-chip id-run" + (run.tone ? " tone-" + run.tone : "");
-  chipContent(node, icon(run.icon), document.createTextNode(run.text));
-  if (run.running && !S.runTimer) S.runTimer = setInterval(() => {
+  const live = S.connected;
+  const run = C.runWords(info, { now: Date.now(), startMs: live && S.rec && S.rec.turn ? S.rec.turn.ts : null, attention: inboxCount(info.id) });
+  // With the stream down nothing says the run still goes on: show the last known state, as that, without a clock.
+  const text = live ? run.text : "Last known · " + run.text;
+  for (const node of [$("s-run"), $("bar-run")]) {
+    node.className = (node.id === "s-run" ? "id-chip id-run" : "id-chip id-run bar-chip") + (run.tone ? " tone-" + run.tone : "");
+    chipContent(node, icon(run.icon), document.createTextNode(text));
+    node.hidden = node.id === "bar-run" && S.view !== "session";
+  }
+  if (run.running && live && !S.runTimer) S.runTimer = setInterval(() => {
     const current = S.sessions.byId.get(S.openId);
     if (!current || S.view !== "session") return stopRunTimer();
     renderRun(current);
     S.now = Date.now();
     tickGroups();
   }, 1000);
-  else if (!run.running) stopRunTimer();
+  else if (!run.running || !live) stopRunTimer();
+}
+/** Below 1100px the top bar carries the model and the run state, so they are in view without scrolling the header. */
+function renderBar(info, chips) {
+  const node = $("bar-model");
+  if (!info || !chips || S.view !== "session") { hideBarIdentity(); return; }
+  const m = chips.model;
+  node.className = "id-chip id-model bar-chip" + (m.warn ? " unreachable" : "");
+  node.title = m.text; // the full model text: profile · model id · context window
+  chipContent(node, document.createTextNode(m.profile || "unknown"), m.warn ? add(el("span", "id-warn"), icon(m.warn.icon), document.createTextNode(m.warn.word)) : null);
+  node.hidden = false;
+}
+function hideBarIdentity() {
+  $("bar-model").hidden = true;
+  $("bar-run").hidden = true;
 }
 function stopRunTimer() {
   if (S.runTimer) clearInterval(S.runTimer);
@@ -808,23 +879,30 @@ function stopRunTimer() {
 function renderCrumbs(info) {
   const trail = $("s-crumb-trail");
   const crumbs = C.breadcrumbs(S.sessions, info.id).filter((c) => !c.current);
-  trail.replaceChildren();
-  for (const c of crumbs) {
-    if (c.ellipsis) {
-      const gap = el("span", "crumb crumb-gap", "…");
-      gap.title = c.tip;
-      gap.setAttribute("role", "img");
-      gap.setAttribute("aria-label", "Between: " + c.tip);
-      trail.append(gap);
-    } else {
-      const a = link(c.label, C.sessionHash(c.id));
-      a.className = "crumb";
-      a.title = c.tip;
-      trail.append(a);
+  // The trail is rebuilt only when it changed, so a link the operator is on keeps focus and its tooltip through the frequent no-op renders.
+  const sig = JSON.stringify(crumbs.map((c) => [c.id, c.label, c.tip, c.ellipsis]));
+  if (trail.dataset.sig === sig) return;
+  trail.dataset.sig = sig;
+  preserveFocus($("s-crumbs"), () => {
+    trail.replaceChildren();
+    for (const c of crumbs) {
+      if (c.ellipsis) {
+        const gap = el("span", "crumb crumb-gap", "…");
+        gap.title = c.tip;
+        gap.setAttribute("role", "img");
+        gap.setAttribute("aria-label", "Between: " + c.tip);
+        trail.append(gap);
+      } else {
+        const a = link(c.label, C.sessionHash(c.id));
+        a.className = "crumb";
+        a.title = c.tip;
+        a.dataset.focusKey = "crumb:" + c.id;
+        trail.append(a);
+      }
+      trail.append(el("span", "crumb-sep", "/"));
+      trail.lastChild.setAttribute("aria-hidden", "true");
     }
-    trail.append(el("span", "crumb-sep", "/"));
-    trail.lastChild.setAttribute("aria-hidden", "true");
-  }
+  });
 }
 
 function renderGoal(info) {
@@ -843,6 +921,7 @@ function renderIdentity(info) {
   const mission = info.parent ? [...S.sessions.byId.values()].find((s) => !s.parent && s.mission === info.mission) || null : null;
   const chips = C.identityChips(info, S.status, { current: C.currentModel(S.rec, info), now: Date.now(), startMs: S.rec && S.rec.turn ? S.rec.turn.ts : null, attention: inboxCount(info.id), mission });
   const m = chips.model;
+  for (const id of ["s-model", "s-role", "s-id"]) $(id).hidden = false;
   const model = $("s-model");
   model.className = "id-chip id-model" + (m.warn ? " unreachable" : "");
   model.title = m.tip;
@@ -852,6 +931,8 @@ function renderIdentity(info) {
   $("s-role").textContent = chips.role.text;
   $("s-role").title = chips.role.tip;
   const id = $("s-id");
+  // The "Copied" and "selected" states belong to the session they were made on: another session takes the normal render at once.
+  if (id.dataset.copying && id.dataset.copying !== chips.id.full) { delete id.dataset.copying; $("s-copied").textContent = ""; }
   if (!id.dataset.copying) {
     chipContent(id, icon("copy"), document.createTextNode(chips.id.text));
     id.title = chips.id.full;
@@ -859,6 +940,7 @@ function renderIdentity(info) {
     id.dataset.full = chips.id.full;
   }
   renderRun(info);
+  renderBar(info, chips);
 }
 
 async function copySessionId() {
@@ -866,18 +948,27 @@ async function copySessionId() {
   const full = id.dataset.full;
   if (!full) return;
   const say = (text) => { $("s-copied").textContent = text; };
+  // Only the session that was copied is cleared when the timer ends; if the operator moved on, the header already did it.
+  const finish = (ms) => setTimeout(() => {
+    if (id.dataset.copying !== full) return;
+    delete id.dataset.copying;
+    say("");
+    want("header");
+  }, ms);
   const done = (label, ms) => {
-    id.dataset.copying = "1";
+    id.dataset.copying = full;
     chipContent(id, icon("check"), document.createTextNode(label));
-    setTimeout(() => { delete id.dataset.copying; say(""); want("header"); }, ms);
+    finish(ms);
   };
   try {
     await navigator.clipboard.writeText(full);
+    if (id.dataset.full !== full) return; // another session was opened while the clipboard answered
     say("Session id copied");
     done("Copied", 1500);
   } catch {
+    if (id.dataset.full !== full) return;
     // No clipboard access: show the whole id selected, to be copied by hand.
-    id.dataset.copying = "1";
+    id.dataset.copying = full;
     chipContent(id, document.createTextNode(full));
     const range = document.createRange();
     range.selectNodeContents(id);
@@ -885,15 +976,36 @@ async function copySessionId() {
     selection.removeAllRanges();
     selection.addRange(range);
     say("Session id selected; press Ctrl+C or Cmd+C to copy it");
-    setTimeout(() => { delete id.dataset.copying; say(""); want("header"); }, 6000);
+    finish(6000);
   }
 }
 
 function renderHeader() {
   const info = S.sessions.byId.get(S.openId);
   if (!info) {
+    // A session this page does not hold (yet): show only what is known, never the previous session's identity.
     $("s-title").textContent = S.openId || "";
+    $("s-title").title = S.openId || "";
     $("s-crumb-trail").replaceChildren();
+    delete $("s-crumb-trail").dataset.sig;
+    for (const id of ["s-model", "s-role", "s-run", "s-standing", "s-id"]) { $(id).replaceChildren(); $(id).hidden = true; }
+    for (const id of ["s-model", "s-role", "s-run"]) $(id).title = "";
+    $("s-model").className = "id-chip id-model";
+    const idChip = $("s-id");
+    delete idChip.dataset.full;
+    delete idChip.dataset.copying;
+    idChip.removeAttribute("title");
+    idChip.removeAttribute("aria-label");
+    $("s-copied").textContent = "";
+    $("s-goal").textContent = "";
+    $("s-goal-toggle").hidden = true;
+    hideBarIdentity();
+    stopRunTimer();
+    $("model-confirm").hidden = true;
+    const seat = $("model-seat");
+    seat.disabled = true;
+    seat.title = "The model is shown once the session is known.";
+    renderStats();
     return;
   }
   renderCrumbs(info);
@@ -953,8 +1065,9 @@ function renderHeader() {
   $("send").setAttribute("aria-label", sendLabel);
   $("send").title = sendLabel === "Send" ? "Send (Enter)" : sendLabel;
   $("send").setAttribute("aria-busy", String(sending || !!pendingReceipt));
-  $("send-state").textContent = S.seatNote.get(info.id) || message?.text || (!S.rec?.initialComplete ? "Loading the record before messages can be sent." : "");
-  renderSeat(info);
+  const question = renderSeat(info);
+  // The switch question is said here, in the live region, so a screen reader hears it when the profile is picked; otherwise the newer of the switch note and the message state.
+  $("send-state").textContent = question ? question.text : C.sendStateText({ loaded: !!S.rec?.initialComplete, seat: S.seatNote.get(info.id), message });
   growMsg();
 }
 
@@ -1211,6 +1324,15 @@ const modelChip = (m, extra = "") => {
   return chip;
 };
 
+/** A details row keeps its open state in `b.ui`, so a rebuilt block (a live update in its group) does not close it again. */
+function remembered(details, b, key) {
+  details.open = !!(b.ui && b.ui[key]);
+  details.addEventListener("toggle", () => {
+    b.ui = b.ui || {};
+    b.ui[key] = details.open;
+  });
+}
+
 /** `ctx` carries the chat item a block is shown as: {differs, model}. */
 function buildBlock(b, ctx = {}) {
   const root = el("div", "block " + b.kind + (b.detail ? " detail" : ""));
@@ -1241,13 +1363,19 @@ function buildBlock(b, ctx = {}) {
       const thought = C.thoughtLabel(b);
       if (b.reasoning) {
         const d = el("details", "reasoning thought");
-        add(d, el("summary", "", thought || "Thought"), textBox(b.reasoning));
+        const sum = el("summary", "", thought || "Thought");
+        sum.dataset.focusKey = "thought:" + b.id;
+        remembered(d, b, "thought");
+        add(d, sum, textBox(b.reasoning));
         add(root, d);
       }
       if (b.text) {
         add(root, prose(b.text));
         const raw = el("details", "raw-response");
-        add(raw, el("summary", "", "Raw response"), textBox(b.text));
+        const sum = el("summary", "", "Raw response");
+        sum.dataset.focusKey = "raw:" + b.id;
+        remembered(raw, b, "raw");
+        add(raw, sum, textBox(b.text));
         add(root, raw);
       }
       for (const n of b.cutCalls) add(root, el("div", "warn", `The reply was cut inside a call to ${n}; the call was not run.`));
@@ -1278,7 +1406,7 @@ function buildBlock(b, ctx = {}) {
       add(h, icon("tool-agent"), el("strong", "", `agent ${C.outcomeWords(b.outcome)}`), link(b.child, "#/s/" + encodeURIComponent(b.child)), el("span", "dim", `${b.steps} steps`));
       add(root, h);
       add(root, collapsible(b, "report", b.report, 24));
-      if (b.full) add(root, btn("open full report", "link", (e) => openViewer(b.full.id, "Full report", null, {}, e.currentTarget)));
+      if (b.full) add(root, keyed(btn("open full report", "link", (e) => openViewer(b.full.id, "Full report", null, {}, e.currentTarget)), "report:" + b.id));
       break;
     }
     case "line": {
@@ -1289,7 +1417,7 @@ function buildBlock(b, ctx = {}) {
       } else {
         root.textContent = b.text;
       }
-      if (b.blob) add(root, btn("open output", "link", (e) => openViewer(b.blob.id, "Job output", null, {}, e.currentTarget)));
+      if (b.blob) add(root, keyed(btn("open output", "link", (e) => openViewer(b.blob.id, "Job output", null, {}, e.currentTarget)), "output:" + b.id));
       break;
     }
     case "reweave": {
@@ -1324,16 +1452,22 @@ function buildBlock(b, ctx = {}) {
   return root;
 }
 
+/** A control a live update may replace: its key lets focus (and the viewer's return) find the new one. */
+function keyed(node, key) {
+  node.dataset.focusKey = key;
+  return node;
+}
+
 function collapsible(b, key, text, max) {
   const wrap = el("div");
   const all = !!b.ui[key];
   const c = C.clip(text, max);
   add(wrap, textBox(all ? text : c.text, "txt out"));
   if (c.clipped) {
-    add(wrap, btn(all ? "show less" : `show all ${C.num(c.total)} lines`, "link", () => {
+    add(wrap, keyed(btn(all ? "show less" : `show all ${C.num(c.total)} lines`, "link", () => {
       b.ui[key] = !all;
       refresh(b);
-    }));
+    }), `showall:${b.id}:${key}`));
   }
   return wrap;
 }
@@ -1368,10 +1502,10 @@ function buildTool(root, b) {
   if (!open) return;
   const body = el("div", "tbody");
   if (b.args !== undefined && b.args !== null) {
-    add(body, btn(b.ui.args ? "hide args" : "args", "link", () => {
+    add(body, keyed(btn(b.ui.args ? "hide args" : "args", "link", () => {
       b.ui.args = !b.ui.args;
       refresh(b);
-    }));
+    }), "args:" + b.id));
   }
   if (b.ui.args) add(body, textBox(JSON.stringify(b.args, null, 2), "txt out"));
   if (res) {
@@ -1381,7 +1515,7 @@ function buildTool(root, b) {
     if (s.words || s.blob) {
       const note = el("div", "tnote" + (s.cut ? " cutline" : ""));
       add(note, document.createTextNode(s.words ? s.words + " " : ""));
-      if (s.blob) add(note, btn("open full output", "link", (e) => openViewer(s.blob, `Full output of ${b.name}`, s.total, {}, e.currentTarget)));
+      if (s.blob) add(note, keyed(btn("open full output", "link", (e) => openViewer(s.blob, `Full output of ${b.name}`, s.total, {}, e.currentTarget)), "full:" + b.id));
       add(body, note);
     }
   } else if (b.state === "missing") {
@@ -1395,10 +1529,17 @@ function buildTool(root, b) {
 // ---- the chat: items (blocks, work groups, model chips) reconciled into #blocks
 
 function groupHeadText(it) {
-  const label = C.groupLabel(it, Date.now());
   // Only ledger, job or cache lines, no calls: say that instead of "0 tool calls".
-  if (!it.toolCount) return `Activity · ${C.count(it.blocks.length, "record")}` + (it.running ? " · running" : "");
-  return label.text;
+  if (!it.toolCount) {
+    return `Activity · ${C.count(it.records, "record")}` + (it.warnings ? ` · ${C.count(it.warnings, "warning")}` : "") + (it.running ? " · running" : "");
+  }
+  return C.groupLabel(it, Date.now()).text;
+}
+
+/** The accessible name of a group header: the same words without a clock that runs while the group does. */
+function groupSpoken(it) {
+  if (!it.toolCount) return groupHeadText(it);
+  return C.groupLabel(it, Date.now()).spoken;
 }
 
 function toggleGroup(it) {
@@ -1406,31 +1547,87 @@ function toggleGroup(it) {
   syncChat();
 }
 
-function buildGroup(it) {
-  const root = el("div", "work-group" + (it.open ? " open" : "") + (it.failed ? " has-failed" : ""));
+/** The frame of a work group: its header button and, while it is open, its body. Members are kept between updates. */
+function newGroupEntry(it) {
+  const root = el("div", "work-group");
   root.dataset.group = it.key;
   const head = el("button", "group-head");
   head.type = "button";
-  head.setAttribute("aria-expanded", String(it.open));
   head.dataset.focusKey = "group:" + it.key;
-  const label = el("span", "group-label", groupHeadText(it));
-  label.dataset.groupLabel = "1";
-  add(head, icon("chevron"), label);
-  if (it.failed) {
-    const fail = el("span", "group-fail");
-    fail.title = `${C.count(it.failed, "call")} failed`;
-    add(fail, icon("cross"));
-    add(head, fail);
-  }
-  head.title = it.open ? "Fold this work away; every call stays in the record." : "Show the calls in this work.";
-  head.addEventListener("click", () => toggleGroup(it));
+  const entry = { group: true, node: root, head, label: null, body: null, members: new Map(), earlierRow: null, headSig: "", item: it, sig: "" };
+  head.addEventListener("click", () => toggleGroup(entry.item));
   add(root, head);
-  if (it.open) {
-    const body = el("div", "group-body");
-    for (const b of it.blocks) add(body, buildBlock(b));
-    add(root, body);
+  return entry;
+}
+
+/** Bring a group's node up to date with `it`: the header in place, and (when open) only the members that are new or dirty. */
+function updateGroup(entry, it, dirty) {
+  const { node, head } = entry;
+  node.className = "work-group" + (it.open ? " open" : "") + (it.failed ? " has-failed" : "") + (it.warnings ? " has-warn" : "");
+  head.setAttribute("aria-expanded", String(it.open));
+  head.title = it.open ? "Fold this work away; every call stays in the record." : "Show the calls in this work.";
+  const headSig = [it.toolCount, it.failed, it.missing, it.warnings, it.running, it.records, it.running ? "" : it.endTs].join("|");
+  if (entry.headSig !== headSig) {
+    entry.headSig = headSig;
+    const label = el("span", "group-label", groupHeadText(it));
+    label.dataset.groupLabel = "1";
+    // The visible clock ticks; the name that is spoken does not, so a screen reader is not told a new number every second.
+    label.setAttribute("aria-hidden", "true");
+    entry.label = label;
+    head.setAttribute("aria-label", groupSpoken(it));
+    head.replaceChildren(icon("chevron"), label);
+    if (it.failed) {
+      const fail = el("span", "group-fail");
+      fail.title = `${C.count(it.failed, "call")} failed`;
+      add(fail, icon("cross"));
+      head.append(fail);
+    }
+    if (it.warnings) {
+      const warn = el("span", "group-warn");
+      warn.title = C.count(it.warnings, "warning");
+      add(warn, icon("alert"));
+      head.append(warn);
+    }
   }
-  return root;
+  if (!it.open) {
+    if (entry.body) { entry.body.remove(); entry.body = null; entry.members.clear(); entry.earlierRow = null; }
+    return;
+  }
+  if (!entry.body) { entry.body = el("div", "group-body"); node.append(entry.body); }
+  const keep = new Set(it.shown.map((b) => b.id));
+  for (const [id, member] of entry.members) if (!keep.has(id)) { member.remove(); entry.members.delete(id); }
+  const order = [];
+  if (it.earlier > 0) {
+    if (!entry.earlierRow) {
+      entry.earlierRow = btn("", "link group-earlier", showEarlier);
+      entry.earlierRow.dataset.focusKey = "earlier:" + it.key;
+    }
+    entry.earlierRow.textContent = `${C.num(it.earlier)} earlier in this work`;
+    order.push(entry.earlierRow);
+  } else if (entry.earlierRow) {
+    entry.earlierRow.remove();
+    entry.earlierRow = null;
+  }
+  for (const b of it.shown) {
+    let member = entry.members.get(b.id);
+    if (!member || dirty.has(b.id)) {
+      const built = buildBlock(b);
+      if (member && member.parentNode === entry.body) member.replaceWith(built);
+      member = built;
+      entry.members.set(b.id, member);
+    }
+    order.push(member);
+  }
+  placeInOrder(entry.body, order);
+}
+
+/** Put `nodes` under `parent` in that order, moving only what is out of place. */
+function placeInOrder(parent, nodes) {
+  let cursor = parent.firstChild;
+  for (const n of nodes) {
+    if (n === cursor) cursor = cursor.nextSibling;
+    else parent.insertBefore(n, cursor);
+  }
 }
 
 function buildItem(it) {
@@ -1439,7 +1636,6 @@ function buildItem(it) {
     add(row, modelChip(it));
     return row;
   }
-  if (it.type === "group") return buildGroup(it);
   return buildBlock(it.block, { differs: it.differs, model: it.model });
 }
 
@@ -1447,15 +1643,11 @@ const itemKey = (it) => it.type === "model" ? `m${it.seq}${it.reason}` : it.type
 
 function itemSig(it) {
   if (it.type === "model") return it.profile + "|" + it.model;
-  if (it.type === "group") return [it.open, it.last, it.toolCount, it.failed, it.missing, it.running, it.blocks.length, it.running ? "" : it.endTs].join("|");
   return (it.differs ? "d" : "") + (it.model ? it.model.profile : "");
 }
 
 function itemDirty(it, dirty) {
-  if (!dirty.size) return false;
-  if (it.type === "model") return false;
-  if (it.type === "block") return dirty.has(it.block.id);
-  return it.blocks.some((b) => dirty.has(b.id));
+  return it.type === "block" && dirty.size > 0 && dirty.has(it.block.id);
 }
 
 /** The chat items of the open record under the operator's folds, windowed to what is shown. */
@@ -1464,14 +1656,8 @@ function chatView() {
   const open = new Set([...S.workState].filter(([, v]) => v).map(([k]) => k));
   const items = C.chatItems(store.blocks, { expandAll: S.expandAll, details: S.details, open, models: store.models });
   if (!S.expandAll) for (const it of items) if (it.type === "group" && S.workState.has(it.key)) it.open = S.workState.get(it.key);
-  const from = S.r.from;
-  const fromSeq = from > 0 && store.blocks[from] ? store.blocks[from].seq : -1;
-  return items.filter((it) => {
-    if (from === 0) return true;
-    if (it.type === "model") return it.seq >= fromSeq;
-    if (it.type === "group") return it.blocks[it.blocks.length - 1].id >= from;
-    return it.block.id >= from;
-  });
+  // A group that crosses the window start keeps only its members inside it, so a long open run is not rendered in full.
+  return C.windowItems(items, S.r.from);
 }
 
 function syncChat() {
@@ -1484,48 +1670,51 @@ function syncChat() {
   const items = chatView();
   R.items = items;
   preserveFocus(holder, () => {
-    const seen = new Set();
-    let cursor = holder.firstChild;
-    for (const it of items) {
-      const key = itemKey(it);
-      const sig = itemSig(it);
-      seen.add(key);
-      let entry = R.nodes.get(key);
-      if (!entry || entry.sig !== sig || itemDirty(it, dirty)) {
-        const node = buildItem(it);
-        if (entry && entry.node.parentNode === holder) {
-          if (cursor === entry.node) cursor = node;
-          entry.node.replaceWith(node);
-        }
-        entry = { node, sig, item: it };
-        R.nodes.set(key, entry);
-      } else {
-        entry.item = it;
-      }
-      if (entry.node === cursor) cursor = cursor.nextSibling;
-      else holder.insertBefore(entry.node, cursor);
-    }
+    // Nodes that left the window go first, so the ones that stay are never moved past them.
+    const keep = new Set(items.map(itemKey));
     for (const [key, entry] of R.nodes) {
-      if (!seen.has(key)) {
+      if (!keep.has(key)) {
         entry.node.remove();
         R.nodes.delete(key);
       }
     }
+    const order = [];
+    for (const it of items) {
+      const key = itemKey(it);
+      let entry = R.nodes.get(key);
+      if (it.type === "group") {
+        if (!entry) { entry = newGroupEntry(it); R.nodes.set(key, entry); }
+        updateGroup(entry, it, dirty);
+        entry.item = it;
+      } else {
+        const sig = itemSig(it);
+        if (!entry || entry.sig !== sig || itemDirty(it, dirty)) {
+          const node = buildItem(it);
+          if (entry && entry.node.parentNode === holder) entry.node.replaceWith(node);
+          entry = { node, sig, item: it };
+          R.nodes.set(key, entry);
+        } else {
+          entry.item = it;
+        }
+      }
+      order.push(entry.node);
+    }
+    placeInOrder(holder, order);
   });
   $("earlier").hidden = R.from === 0;
   $("btn-earlier").textContent = `Show earlier (${C.num(R.from)} more)`;
   tickGroups();
 }
 
-/** Running groups count up to now; called by the run timer and on every sync. */
+/** Running groups count up to now; called by the run timer and on every sync. Only the visible words change. */
 function tickGroups() {
   const R = S.r;
   if (!R) return;
   for (const [, entry] of R.nodes) {
     const it = entry.item;
-    if (it.type !== "group" || !it.running) continue;
-    const label = entry.node.querySelector("[data-group-label]");
-    if (label) label.textContent = groupHeadText(it);
+    if (it.type !== "group" || !it.running || !entry.label) continue;
+    const text = groupHeadText(it);
+    if (entry.label.textContent !== text) entry.label.textContent = text;
   }
 }
 
@@ -2525,8 +2714,10 @@ function updateDelivery(id) {
   if (!user) return;
   state.recordedSeq = user.seq;
   const request = records.find(r => r.seq > user.seq && r.kind === "model_request" && (!r.purpose || r.purpose === "step"));
+  const text = request ? "Delivered to a model step." : "Message recorded · queued for the next model step.";
+  if (state.text !== text) state.at = ++S.stamp; // a receipt that lands after a model switch is newer than the switch note
   state.state = request ? "delivered" : "queued";
-  state.text = request ? "Delivered to a model step." : "Message recorded · queued for the next model step.";
+  state.text = text;
 }
 
 async function sendMessage() {
@@ -2540,17 +2731,17 @@ async function sendMessage() {
   C.setDraft(S.drafts, key, text);
   S.seatNote.delete(id);
   S.sending.add(id);
-  S.messageState.set(id, { state: "sending", accepted: false, sentText: text, afterSeq: C.lastSeq(S.rec) ?? -1, text: "Sending to " + (info.title || id) + "…" });
+  S.messageState.set(id, { state: "sending", accepted: false, sentText: text, afterSeq: C.lastSeq(S.rec) ?? -1, text: "Sending to " + (info.title || id) + "…", at: ++S.stamp });
   renderHeader();
   try {
     await api("POST", "/api/sessions/" + encodeURIComponent(id) + "/messages", { text });
     const state = S.messageState.get(id);
     state.accepted = true;
-    if (state.state !== "delivered") { state.state = "queued"; state.text = "Message accepted · awaiting its recorded delivery."; }
+    if (state.state !== "delivered") { state.state = "queued"; state.text = "Message accepted · awaiting its recorded delivery."; state.at = ++S.stamp; }
     if (C.clearDraftIfUnchanged(S.drafts, key, text)) setDraft(key, "");
     if (S.openId === id) { updateDelivery(id); S.follow = true; }
   } catch (e) {
-    const state = C.sendFailure(S.messageState.get(id), e.message, { rejected: e.status >= 400 && e.status < 500 });
+    const state = { ...C.sendFailure(S.messageState.get(id), e.message, { rejected: e.status >= 400 && e.status < 500 }), at: ++S.stamp };
     S.messageState.set(id, state);
     if (state.recordedSeq !== undefined && C.clearDraftIfUnchanged(S.drafts, key, text)) setDraft(key, "");
   } finally {
@@ -2586,20 +2777,30 @@ function renderSeat(info) {
   }
   if (S.seat && (S.seat.session !== info.id || (current && current.profile === S.seat.profile))) S.seat = null;
   sel.value = S.seat ? S.seat.profile : current ? current.profile : "";
-  sel.disabled = S.seatBusy || options.length === 0;
+  // The daemon refuses to re-seat a finished session, so say that here rather than ask for a confirmation that cannot succeed.
+  const avail = C.seatAvailability(info, S.seatBusy.has(info.id) ? info.id : null, options.length);
+  if (avail.disabled && info.status && info.status.phase === "ended") S.seat = null;
+  sel.disabled = avail.disabled;
+  sel.title = avail.reason || "The model this session runs on. Choosing another asks first.";
   const unreachable = !!options.find(o => o.value === sel.value && o.unreachable);
   sel.classList.toggle("unreachable", unreachable);
-  sel.setAttribute("aria-label", "Model for this session" + (unreachable ? ", not reachable" : ""));
+  sel.setAttribute("aria-label", "Model for this session" + (unreachable ? ", not reachable" : "") + (avail.reason && avail.disabled ? ". " + avail.reason : ""));
   const q = S.seat ? C.seatConfirm(models, current, S.seat.profile) : null;
   if (S.seat && !q) S.seat = null;
   $("model-confirm").hidden = !q;
+  const busy = S.seatBusy.has(info.id);
   if (q) {
     if ($("model-confirm-text").textContent !== q.text) $("model-confirm-text").textContent = q.text;
     $("model-confirm-yes").textContent = q.yes;
     $("model-confirm-no").textContent = q.no;
+    sel.setAttribute("aria-describedby", "model-confirm-text");
+  } else {
+    sel.removeAttribute("aria-describedby");
+    $("model-confirm-text").textContent = "";
   }
-  $("model-confirm-yes").disabled = S.seatBusy;
-  $("model-confirm-no").disabled = S.seatBusy;
+  $("model-confirm-yes").disabled = busy;
+  $("model-confirm-no").disabled = busy;
+  return q;
 }
 /** The text box grows with its text up to 40% of the window (CSS max-height), then scrolls. */
 function growMsg() {
@@ -2611,30 +2812,45 @@ function growMsg() {
   msg.style.setProperty("height", msg.scrollHeight + "px");
 }
 function cancelSeat() {
-  if (!S.seat || S.seatBusy) return;
+  if (!S.seat || S.seatBusy.has(S.seat.session)) return;
   S.seat = null;
   renderHeader();
   $("model-seat").focus({ preventScroll: true });
 }
+/** Focus goes back to the select only when it is not somewhere the operator has gone on to (the message box, say). */
+function focusIsFree() {
+  const active = document.activeElement;
+  return !active || active === document.body || $("model-confirm").contains(active) || active === $("model-seat");
+}
 async function applySeat() {
   const pending = S.seat;
-  if (!pending || S.seatBusy) return;
-  S.seatBusy = true;
-  S.seatNote.set(pending.session, `Switching to ${pending.profile}…`);
+  if (!pending || S.seatBusy.has(pending.session)) return;
+  S.seatBusy.add(pending.session);
+  S.seatNote.set(pending.session, { text: `Switching to ${pending.profile}…`, at: ++S.stamp });
+  // What the session was on before: a newer session frame (another tab, the CLI) must not be overwritten by this receipt.
+  const was = S.sessions.byId.get(pending.session);
+  const before = was ? { profile: was.profile, model: was.model } : null;
   renderHeader();
   try {
     const receipt = await api("POST", "/api/sessions/" + encodeURIComponent(pending.session) + "/model", { profile: pending.profile });
-    S.seatNote.set(pending.session, C.seatReceipt(receipt));
+    S.seatNote.set(pending.session, { text: C.seatReceipt(receipt), at: ++S.stamp });
     const info = S.sessions.byId.get(pending.session);
     // The `session` frame confirms it; show the new seat now so the select does not flicker back.
-    if (info && receipt && receipt.model) C.applySessionEvent(S.sessions, { ...info, profile: receipt.model.profile, model: receipt.model.model, context_window: receipt.model.context_window });
+    if (info && receipt && receipt.model && C.receiptApplies(info, before)) {
+      C.applySessionEvent(S.sessions, { ...info, profile: receipt.model.profile, model: receipt.model.model, context_window: receipt.model.context_window });
+    }
   } catch (e) {
-    S.seatNote.set(pending.session, e.message);
+    S.seatNote.set(pending.session, { text: e.message, at: ++S.stamp });
   } finally {
-    S.seat = null;
-    S.seatBusy = false;
-    if (S.openId === pending.session) { renderHeader(); if (S.view === "session") $("model-seat").focus({ preventScroll: true }); }
-    want("list");
+    if (S.seat === pending) S.seat = null; // a question the operator has since raised on another session stays
+    S.seatBusy.delete(pending.session);
+    if (S.openId === pending.session) {
+      const free = focusIsFree();
+      renderHeader();
+      if (S.view === "session" && free) $("model-seat").focus({ preventScroll: true });
+    }
+    // The list shows the model too, and a seat held for this session is let go whichever session is open now.
+    want("list", "header");
   }
 }
 
@@ -2822,7 +3038,7 @@ function wire() {
   });
   $("model-confirm-yes").addEventListener("click", applySeat);
   $("model-confirm-no").addEventListener("click", cancelSeat);
-  $("composer").addEventListener("keydown", (e) => { if (e.key === "Escape" && S.seat && !S.seatBusy) { e.preventDefault(); cancelSeat(); } });
+  $("composer").addEventListener("keydown", (e) => { if (e.key === "Escape" && S.seat && !S.seatBusy.has(S.seat.session)) { e.preventDefault(); cancelSeat(); } });
   const msg = $("msg");
   msg.addEventListener("input", () => { if (S.openId) C.setDraft(S.drafts, "message:" + S.openId, msg.value); renderHeader(); });
   $("send").addEventListener("click", sendMessage);
@@ -2862,6 +3078,7 @@ function wire() {
   window.addEventListener("pagehide", saveSeen);
   window.addEventListener("resize", () => {
     if (S.view === "session") want("header");
+    renderDot();
     setDrawer("left", document.body.classList.contains("show-left"));
     setDrawer("right", document.body.classList.contains("show-right"));
   });

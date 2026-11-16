@@ -207,8 +207,10 @@ daemon's token; `docs/RUN.md` has the recipe.
 
 ## Seeing it: the web UI and the desktop app
 
-The daemon serves a web UI at `/` (three columns: missions, the live transcript, and the mission
-state: ledger, context window with each item's standing, inbox, network decisions). It is static,
+The daemon serves a web UI at `/` (missions grouped by workspace on the left; in the middle a header
+that names the model and session running it, the chat of the live record with its tool calls folded
+into work groups, and a composer with a model seat to switch the session's model; on the right an
+inspector with the ledger, context window with each item's standing, inbox, network decisions). It is static,
 strict-CSP, has no build step, and updates live over SSE. Run `loom open` to open it: the command asks
 the daemon for a one-time login code and opens the page with it. The page needs no cookie; it keeps
 a secret in the tab's session storage and asks you to run `loom open` again when that is gone.

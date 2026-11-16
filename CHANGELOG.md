@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Web UI: chat-first layout and visible model identity
+
+- The session opens on **Chat**, the whole record as a conversation (`#/s/<id>` and `/chat`; `/record` is
+  rewritten to `/chat`), then Overview and Evidence. Operator messages are bubbles; replies are plain prose
+  with a collapsed `Thought` row; consecutive tool calls, text-less replies and ledger/job lines fold into
+  work groups headed `Worked for <duration> · <n> tool calls` (failed and running counts included), open
+  for the last group, a running call or an operator click. **Expand all work** opens them; deep links and
+  Activity links expand the group they point into.
+- The header is an identity bar: breadcrumb, chips for the model in effect (`profile · model · window`,
+  with an "unreachable" warning), role, a copyable short id and the run state with elapsed time, the
+  standing facts, and a one-line goal with Show all.
+- Each stretch of assistant output carries a chip naming the profile that produced it, and a
+  `model_switched` record is a visible line showing both sides.
+- The composer has a model seat: choosing another profile asks for confirmation, then
+  `POST /api/sessions/{id}/model`; the switch takes effect at the next step and re-reads the prompt once.
+- A stats line under the composer replaces the top-bar speed: tok/s, cache share, context use, step.
+- The sidebar groups missions by workspace with a pinned **Needs you** group; each row has one mark by
+  strict precedence and an identity line `<profile> · <role> · <age>`.
+- The preview fixture signs in from `/#code=fixture` and covers models, the model switch, an unreachable
+  profile and `POST /__fixture/stream`.
+- The top bar (below 1100px) carries the open session's model profile and run state; the sidebar's
+  connection line is short (`Live`, `Reconnecting…`) with the detail in its tooltip; a row's identity line
+  never truncates the profile, and a waiting reason has its own line, including nonblocking questions and
+  ready results. A row's age comes from recorded activity (kept across a reload) or reads "activity not
+  loaded"; an ended-stopped session has its own shape.
+- Work groups update by member, so an open Thought, focus and the output viewer survive live records, a
+  long open group is windowed, warnings are counted in its header, and request-detail lines no longer
+  change the groups. The model seat is disabled for ended sessions and per-session while switching.
+- `loom ls` shows a MODEL column (the session's profile) after ROLE.
+
 ### OWASP dep-scan tool
 
 - New built-in `dep_scan` tool wraps the operator-installed OWASP

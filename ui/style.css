@@ -23,6 +23,8 @@
   --strong: #f9fafb;
   --accent: #7aaaff;
   --accent-fill: #4176e6;
+  /* Text buttons: white on this reads at 4.5:1 or more; the icon-only Send keeps the lighter --accent-fill. */
+  --accent-btn: #3463c7;
   --on-accent-fill: #ffffff;
   --bubble: #2c2c2e;
   --sel: #1f2c48;
@@ -33,6 +35,8 @@
   --code-bg: #101012;
   /* Amber: only for what waits on the operator. */
   --attn: #f0a830;
+  /* Amber as small text: --attn is for icons and borders; text takes this, which reads at 4.5:1 on every surface it sits on. */
+  --attn-text: #f0a830;
   --attn-bg: #3a2c10;
   --attn-line: #5a4416;
   --attn-card: #2c220d;
@@ -75,6 +79,7 @@
     --strong: #0f1115;
     --accent: #3463c7;
     --accent-fill: #4176e6;
+    --accent-btn: #3463c7;
     --on-accent-fill: #ffffff;
     --bubble: #edf3fe;
     --sel: #e3ecfc;
@@ -84,6 +89,7 @@
     --info: #3463c7;
     --code-bg: #f6f7f9;
     --attn: #b86e00;
+    --attn-text: #8a5200;
     --attn-bg: #fff0d2;
     --attn-line: #e3c68a;
     --attn-card: #fff8e8;
@@ -133,8 +139,13 @@ h1 { margin-bottom: 0; }
 .show-right .right { visibility: visible; }
 .mid { position: relative; }
 /* The top bar only holds the drawer buttons, so it exists only where a drawer does (below 1100px). */
-.bar { display: none; flex: 0 0 auto; align-items: center; gap: 8px; padding: 8px 16px; border-bottom: 1px solid var(--line); font-size: 12px; }
+.bar { display: none; flex: 0 0 auto; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 8px 16px; border-bottom: 1px solid var(--line); font-size: 12px; }
 .bar-connection { color: var(--bad-soft); }
+/* The open session's model and run state, in view whenever the sidebar is closed. */
+.bar-identity { display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; }
+.bar-identity:not(:has(:not([hidden]))) { display: none; }
+.bar-chip { font-size: 11.5px; padding: 1px 8px; }
+.bar-chip.id-model { flex: 0 0 auto; overflow-wrap: normal; white-space: nowrap; }
 .bar-connection:empty { display: none; }
 .drawer-btn { display: none; }
 .scrim { display: none; }
@@ -165,11 +176,11 @@ h1 { margin-bottom: 0; }
 .btn:disabled { opacity: .5; cursor: default; }
 .btn:disabled:hover { background: var(--bg-3); border-color: var(--line); }
 .btn.small { padding: 3px 7px; font-size: 12px; min-height: 26px; }
-.btn.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--on-accent-fill); }
-.btn.primary:hover { background: var(--accent-fill); filter: brightness(1.1); }
+.btn.primary { background: var(--accent-btn); border-color: var(--accent-btn); color: var(--on-accent-fill); }
+.btn.primary:hover { background: var(--accent-btn); filter: brightness(1.1); }
 .btn.link { background: none; border: none; color: var(--accent); padding: 0 4px; }
 .btn.link:hover { background: none; text-decoration: underline; }
-.btn.urgent { background: var(--attn-bg); border-color: var(--attn); color: var(--attn); }
+.btn.urgent { background: var(--attn-bg); border-color: var(--attn); color: var(--attn-text); }
 .btn.danger { border-color: var(--bad-line); color: var(--bad-soft); }
 .btn.danger:hover { border-color: var(--bad); }
 .btn.with-icon { display: inline-flex; align-items: center; gap: 7px; }
@@ -217,12 +228,17 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 .row.d2 { margin-left: 32px; }
 .row-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1 1 auto; }
 .row .name { overflow-wrap: anywhere; color: var(--strong); line-height: 1.35; }
-.row .ident { font-family: var(--mono); font-size: 11.5px; color: var(--caption); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; gap: 5px; }
-.row .ident .ident-text { overflow: hidden; text-overflow: ellipsis; }
+.row .ident { display: flex; flex-direction: column; gap: 1px; min-width: 0; font-family: var(--mono); font-size: 11.5px; color: var(--caption); }
+/* The profile is never cut: only the role and the age after it may be. */
+.row .ident-line { display: flex; align-items: baseline; min-width: 0; white-space: nowrap; }
+.row .ident-profile { flex: 0 0 auto; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.row .ident-line > .ident-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; }
 .row .ident .icon { width: 10px; height: 10px; }
-.row .ident-wait { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; color: var(--attn); }
-.row .ident > .ident-text:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.row .ident > .ident-text { flex: 0 1 auto; white-space: nowrap; }
+.row .ident-wait { display: flex; align-items: center; gap: 4px; min-width: 0; color: var(--attn-text); }
+.row .ident-wait.tone-info { color: var(--info); }
+.row .ident-wait.tone-ok { color: var(--ok); }
+.row .ident-wait > .ident-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row.sel .ident { color: var(--dim); }
 .row.needs .name { font-weight: 600; }
 .row.arch .name { opacity: .6; }
 .lfoot { padding: 8px 12px; border-top: 1px solid var(--line); color: var(--dim); font-size: 13px; }
@@ -271,7 +287,8 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 .txt { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--sans); font-size: 14px; line-height: 22px; margin: 0; }
 /* The chat is a centred column; the composer aligns to the same width. */
 .scroller > * { width: min(100%, clamp(640px, 70%, 920px)); margin-inline: auto; }
-.tools-checks { display: inline-flex; flex-wrap: wrap; gap: 4px 16px; }
+.tools-checks { display: inline-flex; flex-wrap: nowrap; gap: 4px 16px; }
+.tools-checks label { white-space: nowrap; }
 /* The operator's message is a bubble on the right. */
 .block.user { margin: 14px 0 6px auto; width: fit-content; max-width: 75%; }
 .block.user .label { text-align: right; }
@@ -304,6 +321,8 @@ details.thought > summary { color: var(--caption); }
 .group-head[aria-expanded="false"] > .icon, .thead[aria-expanded="false"] > .icon:first-child { transform: rotate(-90deg); }
 .group-label { flex: 0 1 auto; min-width: 0; }
 .group-fail { display: inline-flex; align-items: center; color: var(--bad); }
+.group-warn { display: inline-flex; align-items: center; color: var(--warn); }
+.btn.group-earlier { display: block; min-height: 24px; margin: 2px 0 4px 4px; padding: 0 4px; font-size: 12px; color: var(--accent); }
 .group-body { padding: 0 6px 6px; }
 .group-body > .block { margin: 2px 0; }
 
@@ -346,8 +365,8 @@ details.thought > summary { color: var(--caption); }
 .blocks .block.inbox { margin: 10px 0; }
 .inbox-card { display: flex; flex-direction: column; gap: 12px; }
 .inbox-card .ih { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; font-size: 12px; }
-.inbox-card .kind { color: var(--attn); font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; }
-.inbox-card .state { color: var(--attn); }
+.inbox-card .kind { color: var(--attn-text); font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; }
+.inbox-card .state { color: var(--attn-text); }
 .informational .inbox-card .kind { color: var(--dim); }
 .inbox-card .item-text { font-size: 16px; color: var(--strong); }
 .inbox-card .answer { display: flex; flex-direction: column; gap: 12px; }
@@ -414,7 +433,8 @@ select.model-seat option { background: var(--bg-2); color: var(--fg); }
 .send-btn:hover:not(:disabled) { filter: brightness(1.12); }
 .send-btn:disabled { background: var(--bg-4); color: var(--caption); cursor: default; }
 .send-btn[aria-busy="true"] .icon { opacity: .6; }
-.model-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 8px 10px; border: 1px solid var(--accent-line); border-radius: var(--r-md); background: var(--accent-tint); }
+/* In the DOM between the seat and Send (so Tab goes seat, Switch, Keep, Send); drawn on its own row below. */
+.model-confirm { order: 3; flex: 1 0 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 8px 10px; border: 1px solid var(--accent-line); border-radius: var(--r-md); background: var(--accent-tint); }
 .model-confirm-text { flex: 1 1 240px; min-width: 0; margin: 0; font-size: 13px; color: var(--strong); overflow-wrap: anywhere; }
 .model-confirm-actions { display: inline-flex; flex-wrap: wrap; gap: 6px; }
 
@@ -515,7 +535,7 @@ button.id-chip { cursor: pointer; }
 button.id-chip:hover { background: var(--bg-3); border-color: var(--line-2); }
 .id-run { font-family: var(--sans); }
 .id-run.tone-running .icon { color: var(--info); animation: pulse 1.4s ease-in-out infinite; }
-.id-run.tone-attention { border-color: var(--attn); background: var(--attn-bg); color: var(--attn); font-weight: 600; }
+.id-run.tone-attention { border-color: var(--attn); background: var(--attn-bg); color: var(--attn-text); font-weight: 600; }
 .id-run.tone-ok { border-color: var(--ok-line); color: var(--ok-soft); }
 .id-run.tone-bad { border-color: var(--bad-line); color: var(--bad-soft); }
 .mission-status { display: contents; font-size: 12px; }
@@ -542,7 +562,7 @@ button.id-chip:hover { background: var(--bg-3); border-color: var(--line-2); }
 .pill, .chip { display: inline-flex; align-items: center; border: 1px solid var(--line); color: var(--fg); }
 .pill { gap: 6px; padding: 2px 9px; border-radius: 11px; background: var(--bg-2); }
 .pill .icon { width: 10px; height: 10px; }
-.pill-attention { border-color: var(--attn); background: var(--attn-bg); color: var(--attn); font-weight: 600; }
+.pill-attention { border-color: var(--attn); background: var(--attn-bg); color: var(--attn-text); font-weight: 600; }
 .pill-running .icon { color: var(--info); }
 .pill-ok { border-color: var(--ok-line); color: var(--ok-soft); }
 .pill-bad { border-color: var(--bad-line); color: var(--bad-soft); }
@@ -662,7 +682,7 @@ button.id-chip:hover { background: var(--bg-3); border-color: var(--line-2); }
 .target-line .line-number, .cited-line .line-number { color: var(--fg); }
 .mission-group { margin: 0; }
 .group-title { display: flex; justify-content: space-between; gap: 8px; margin: 0; padding: 14px 8px 4px; color: var(--caption); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
-.mission-group.needs-group .group-title { color: var(--attn); }
+.mission-group.needs-group .group-title { color: var(--attn-text); }
 .group-title .group-count { font-weight: 400; }
 .btn.agent-toggle { display: flex; align-items: center; gap: 6px; width: calc(100% - 16px); margin-left: 16px; padding: 3px 8px; min-height: 24px; border-radius: var(--r-sm); color: var(--dim); font-size: 12px; text-align: left; }
 .btn.agent-toggle:hover { color: var(--fg); background: var(--hover); text-decoration: none; }
@@ -679,6 +699,8 @@ button.id-chip:hover { background: var(--bg-3); border-color: var(--line-2); }
   .lhead { flex-wrap: wrap; gap: 6px; }
   #close-left { display: inline-block; }
   .bar { padding: 8px 12px; }
+  /* The two drawer buttons share the first row; the model and run state take the second, whole. */
+  .bar-identity { order: 3; flex: 1 0 100%; }
   .shead { padding: 12px 16px 8px; gap: 8px; }
   .crumbs { flex-basis: 100%; }
   .mission-actions { width: 100%; }
@@ -714,16 +736,19 @@ button.id-chip:hover { background: var(--bg-3); border-color: var(--line-2); }
   .view.session > .mission-record, .view.session > .mission-panel { flex: 1 1 auto; min-height: 300px; }
   .composer { position: sticky; bottom: 0; z-index: 4; }
   .record-tools > .dim:first-child { display: none; }
+  .record-tools { justify-content: flex-start; }
+  .tools-checks { flex: 1 1 100%; justify-content: space-between; gap: 4px 10px; }
 }
 @media (pointer: coarse) {
   .btn, .btn.small, .mission-actions .btn, .btn.goal-toggle, .btn.agent-toggle, .btn.filter, .btn.option, .btn.evidence-source, .btn.viewer-page,
-  .tab, .mission-tab, .row, button.id-chip, .change-item .btn.link, .rail-card .btn.link, select.model-seat { min-height: 44px; }
+  .tab, .mission-tab, .row, button.id-chip, .change-item .btn.link, .rail-card .btn.link, select.model-seat, .form .btn.primary, .btn.group-earlier { min-height: 44px; }
   .rail-session, .group-head, .thead { min-height: 44px; }
   .send-btn { width: 44px; height: 44px; }
   a.crumb { display: inline-flex; align-items: center; min-height: 44px; }
   .record-tools label, .lfoot label, .form label.check { min-height: 44px; align-items: center; }
   input[type="checkbox"] { width: 20px; height: 20px; }
-  details > summary { padding: 12px 0; }
+  /* 12px text on an 18px line, plus 13px above and below: 44px, and the disclosure marker stays. */
+  details > summary { padding: 13px 0; }
   input[type="text"], input[type="search"], input[type="number"], select, textarea { font-size: 16px; }
   select.model-seat { font-size: 16px; }
 }
