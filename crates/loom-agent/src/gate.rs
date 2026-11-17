@@ -46,8 +46,14 @@
 //! Also `Err` when `answer` is empty or whitespace. Otherwise `Ok(())`.
 //!
 //! ## `check_quotes` — any `finish` with quotes
-//! For each quote, in order: resolve `handle` with `BlobStore::resolve` (failure → `quote {i}: there
-//! is no stored output {handle}; handles are the out:… ids in result headers`); `start`/`end` must be
+//! `pub async fn check_quotes(ctx: &ToolCtx, quotes: &[Quote]) -> Result<Vec<VerifiedQuote>, String>`.
+//! For each quote, in order: open `handle` with `loom_tools::outputs::open(ctx, handle)`, so only an
+//! output of the session's mission is ever read, counted or compared (`Unknown` or `NotAHandle` →
+//! `quote {i}: no output of this mission has the handle {handle}; copy the out:… handle exactly from a
+//! result header`; `Ambiguous` → `quote {i}: the handle {handle} matches more than one output of this
+//! mission; give more characters of it`). An output of another mission therefore gets the sentence of
+//! a handle that names nothing, and nothing of it (its line count, a closest line) is ever said. Then
+//! the checks below run on the opened id (a private sync helper over `ctx.blobs`); `start`/`end` must be
 //! `1 <= start <= end` and `start <= total lines` (else a sentence giving the output's line count);
 //! read the lines (`end` clamped to the last line) and check them with `observe::check_quote_at(lines,
 //! text, start)`, whose errors become these sentences:
@@ -119,7 +125,9 @@
 //! Tests required: every branch of `on_yield`, including each tool-availability variant of the
 //! closing paragraph and exact text of at least one full nudge; `looks_like_call` positives and
 //! negatives (ordinary prose and ordinary JSON must be negative); `check_finish_lead` for each kind
-//! of open item; `check_quotes` success, each failure sentence, clamping, several failures at once; a
+//! of open item; `check_quotes` success, each failure sentence, clamping, several failures at once; an
+//! output outside `ctx.outputs` refused with the unknown-handle sentence and none of its text or line
+//! count in the error (also when the quote's text is wrong or its range is past the end); a
 //! quote by lines recorded as stored, with its blank ends left out, and each of its four refusals;
 //! `render_report` full, minimal, and cut.
 

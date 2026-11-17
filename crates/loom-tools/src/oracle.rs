@@ -3,7 +3,9 @@
 //! CONTRACT: configuration is `<workspace>/.loom/security-oracle.json`, protected from agent writes
 //! by the sandbox. It is hash-pinned at first use in each session; subsequent changes require a new
 //! session. Unsandboxed mode is refused. Model input is only a candidate BlobStore handle, never
-//! an endpoint, expected answer, command, baseline or success rule. A passing receipt states exactly
+//! an endpoint, expected answer, command, baseline or success rule. The handle is opened with
+//! `outputs::open` (only an output of the session's mission; a refusal is `Unopened::sentence`), so
+//! another mission's stored output can never be submitted as a candidate. A passing receipt states exactly
 //! which operator contract passed; it is not a universal proof of exploitability. Clean replay copies
 //! only hash-pinned regular files into independent fresh attack/control directories, checks hashes
 //! after execution and requires both the attack criterion and the benign control. Timeout/OOM/exit71

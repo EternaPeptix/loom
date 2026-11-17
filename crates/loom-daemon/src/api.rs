@@ -40,7 +40,7 @@
 //! |---|---|---|
 //! | `GET /status` | `runtime.health()`, counts from `sessions(true)` and `inbox()`, `statvfs` of the loom home on a blocking thread (`disk`, `null` when it cannot be read) | `StatusView` |
 //! | `GET /sessions?archived=true` | `runtime.sessions(archived)` (default false) | `[SessionInfo]` |
-//! | `POST /sessions` (`NewSession`) | `runtime.create_session` | `201` `SessionInfo` |
+//! | `POST /sessions` (`NewSession`; `prior` may be left out) | `runtime.create_session` (`404` for a `prior` mission that does not exist, `409` for too many) | `201` `SessionInfo` |
 //! | `GET /sessions/{id}` | the session and its children (sessions whose `parent` is it) | `SessionDetail` |
 //! | `GET /sessions/{id}/records?after={seq}&limit={n}` | `runtime.stored_records` (`limit` default 500, at most 2000) | `RecordsPage` (`next_after` = last seq of the page when the page is full, else `null`); a record that comes with its stored line (read as `Event::Unknown`) is that line, verbatim |
 //! | `GET /sessions/{id}/stream?after={seq}` | see *Streams* | SSE |

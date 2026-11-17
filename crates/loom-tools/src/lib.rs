@@ -20,6 +20,7 @@
 //! - [`jobs`]    background jobs
 //! - [`files`]   what a session has read, for refusing writes over unseen changes
 //! - [`view`]    numbered line views of stored output
+//! - [`outputs`] opening a stored output by handle, only among the outputs of the session's mission
 //! - [`workcopy`] a child's own copy of the workspace, and bringing one child's changes back
 //! - [`boxctl`], [`boxfs`] the remote Docker box: container life, egress, files in and out
 //! - [`bash`], [`fstools`], [`search`], [`outview`], [`web`]: the built-in tools
@@ -38,6 +39,7 @@ pub mod fstools;
 pub mod http;
 pub mod jobs;
 pub mod oracle;
+pub mod outputs;
 pub mod outview;
 pub mod params;
 pub mod proc;

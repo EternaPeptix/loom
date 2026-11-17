@@ -26,6 +26,10 @@ pub const META_SIGNAL: &str = "signal";
 pub const META_PATH: &str = "path";
 /// `ToolResult::meta` key: full id of the raw bytes, when the stored text differs from them.
 pub const META_RAW_BLOB: &str = "raw_blob";
+/// `ToolResult::meta` key: full ids (an array of strings) of further outputs the call stored and names in
+/// its header, beside `output` and `META_RAW_BLOB` (dep-scan's further reports). They are outputs of the
+/// session's mission like the others (`loom_tools::outputs`).
+pub const META_ALSO_STORED: &str = "also_stored";
 /// `ToolResult::meta` key: id of the background job a call turned into or started.
 pub const META_JOB: &str = "job";
 /// Output was admitted for a stored action; coverage awaits an actual actor callback.

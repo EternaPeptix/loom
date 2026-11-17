@@ -32,7 +32,8 @@
 //!   the write. Nothing else is recorded; a refutation or withdrawal gets no such line. (`claim` always
 //!   creates an open claim, so it never banks.)
 //! - `evidence`:
-//!   1. `gate::check_quotes(&ctx.blobs, &[Quote { handle, start, end, text: quote }])`; on `Err(text)`
+//!   1. `gate::check_quotes(ctx, &[Quote { handle, start, end, text: quote }])` (only an output of the
+//!      session's mission; another mission's is refused as a handle that names nothing); on `Err(text)`
 //!      → error `{text}\nNothing was attached.` `quote` may be left out (or blank): the quote is then
 //!      by lines, the lines `start`-`end` as the stored output has them (`gate`). This refusal and the
 //!      next carry `meta[META_REFUSAL] = REFUSAL_QUOTE` (what a scorecard counts as a step spent on a

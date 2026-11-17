@@ -20,7 +20,10 @@
 //! - `run [options] <message…>`: start a session and follow it. The message is the arguments
 //!   joined by spaces; `-` or no message reads standard input to its end. Options → `NewSession`
 //!   (`--workspace` defaults to the current directory; `--attended` sets `unattended: false`;
-//!   `--max-steps`/`--max-minutes` → budget). Prints `session {id}` to stderr first. With
+//!   `--max-steps`/`--max-minutes` → budget; `--prior <mission>`, repeatable, → `prior` in the order
+//!   given: earlier missions for this one to recall, `loom_agent::prior`; `chat` takes it too). A
+//!   `--prior` word that starts with `m-` is a mission id, sent as it is; any other word is resolved as a
+//!   session (`client.resolve`: an id, a prefix, or `last`) and its `mission` is sent. Prints `session {id}` to stderr first. With
 //!   `--detach`, stops there. Otherwise *follows* (below).
 //! - `chat [options]`: a `chat`-role session on the terminal: prompt `› `, read a line (an empty
 //!   line is ignored, end of input or `/quit` leaves), send it, follow until the turn ends, repeat.

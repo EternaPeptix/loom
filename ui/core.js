@@ -1739,7 +1739,14 @@ export function planEvent(ev, ctx) {
 
 export const ROLES = ["lead", "chat"];
 
-/** Validate the form; returns {body} for POST /api/sessions or {error}. */
+/**
+ * Validate the form; returns {body} for POST /api/sessions or {error}.
+ * `form.prior` (optional text): earlier missions for the new one to recall. Split on whitespace and commas;
+ * each must be a mission id as the daemon names them (1 to 128 of A-Z a-z 0-9 _ . -, not starting with `.`),
+ * else `"{word}" is not a mission id; mission ids look like m-….`; repeats dropped (first kept); more than 8 →
+ * `Name at most 8 earlier missions to recall.` A non-empty list is sent as `body.prior`, in order; none sends no
+ * `prior` key.
+ */
 export function buildNewSession(form) {
   const workspace = String(form.workspace || "").trim();
   const message = String(form.message || "").trim();

@@ -17,7 +17,10 @@
 //!   parsed, deduplicated and summarised (prioritized/reachable first, then severity score),
 //!   and their bytes are stored as blobs the model can page (`out_read`) and quote as
 //!   evidence. The generated SBOM (`*.cdx.json`) and the scanner console are stored the same
-//!   way and named in the result facts. The reports directory is writable by the session's commands, so
+//!   way and named in the result facts. The first VDR's id is `meta[META_RAW_BLOB]`; the id of
+//!   every other blob a fact names (further VDRs, the SBOMs, the console) is in
+//!   `meta[META_ALSO_STORED]`, so that they count among the outputs of the session's mission and
+//!   `out_read` opens them (`outputs`). The reports directory is writable by the session's commands, so
 //!   each report file is opened through the sandbox read check (a regular file only, judged by the real
 //!   path of what was opened): a link in it to what the session cannot read (the loom home, a credential
 //!   store, an unreadable path) is refused and named in the result's facts, never stored; a link to a

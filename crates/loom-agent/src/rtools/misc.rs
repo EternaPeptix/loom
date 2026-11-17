@@ -5,8 +5,8 @@
 //! Both read this session's log with `loom_core::log::read_records(&shared.log_path)`.
 //!
 //! ## `pin`
-//! Resolve `handle` with `ctx.blobs.resolve` (failure → error ``There is no stored output {handle};
-//! handles are the out:… ids in result headers.``). Find every `tool_result` record in the log
+//! Open `handle` with `loom_tools::outputs::open` (failure → error `Unopened::sentence`, the same for an
+//! output of another mission as for one that does not exist). Find every `tool_result` record in the log
 //! whose `output` blob id is that blob, or whose `meta[META_OF_BLOB]` names it (the call that
 //! produced the output and every later view of it); none → error ``{handle} was not produced in this
 //! session, so it is not part of your context and cannot be pinned.`` Then, for each of them in log

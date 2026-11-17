@@ -21,7 +21,8 @@
 //! `quotes` elements are objects `{handle, start, end, text}`, where `text` may be left out (or be
 //! `null` or blank): the quote is then those lines as the stored output has them (`gate`, a quote by
 //! lines). An element of another shape is an error naming its position and the fields. They are checked
-//! with `gate::check_quotes(&ctx.blobs, …)`; `Err(text)` → error `{text}\nNothing was delivered. These are
+//! with `gate::check_quotes(ctx, …)` (only outputs of the session's mission); `Err(text)` → error
+//! `{text}\nNothing was delivered. These are
 //! mechanical fixes, not findings about the work — correct the quotes above and call finish again.`
 //! Every quote must also be an observation, by the rule `evidence` applies (`rtools::observed_producer`):
 //! the output of a command run or a file read; a quote of the output of a runtime tool (`ledger`,
@@ -161,7 +162,7 @@
 //! - refused while a background job of the verifier is running (`ctx.jobs`; a foreground command promoted to
 //!   a job counts): the error names the jobs and, of `job_wait` and `job_kill`, those the role has; nothing
 //!   is recorded.
-//! - every handle in `opened` must resolve (`ctx.blobs.resolve`) and must be an output this session
+//! - every handle in `opened` must open (`loom_tools::outputs::open`) and must be an output this session
 //!   itself produced or opened: some `tool_result` record in `S.log_path` has that blob as `output`
 //!   or names it in `meta[META_OF_BLOB]`. Otherwise: ``You listed {handle} as examined, but this
 //!   session never opened it. Open it with out_read, or take it off the list.``

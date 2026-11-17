@@ -6,6 +6,10 @@
 //! op. The lead opens/prioritizes hypotheses. Only an independent child with `read_only` and `verdict`
 //! may close one, and only its original lead may reprioritize it. The core checks all evidence and
 //! coverage invariants under the journal lock. Batches have the same authorization as individual ops.
+//! A credential's `secret_handle` is opened with `loom_tools::outputs::open` (only an output of the
+//! session's mission): any failure is ``Use an existing stored out: handle for the credential secret; no
+//! secret material was recorded.``, whether the handle names nothing or another mission's output, and the
+//! recorded handle is `out:{full id}`.
 //! A batch element that fails ID resolution, secret-handle resolution or authorization is refused with
 //! "Operation {i} of {n} in the batch ({action}): {error}", as the core names one that fails validation.
 //! The asset in a `cred` or `auth` condition (`blocked_on`, `condition_unlock`, a credential's or
@@ -27,7 +31,8 @@
 //! incomplete closures. Path suggestions are bounded heuristics, not confirmed attack paths.
 //!
 //! `security_ingest` reads an existing observed blob (<=2 MiB, <=500 discovered assets), not model
-//! text. It requires attested mission evidence referring to that exact blob, parses a documented
+//! text. Its `handle` is opened with `loom_tools::outputs::open` (a refusal is `Unopened::sentence`), then
+//! must pass `rtools::observed_producer`. It requires attested mission evidence referring to that exact blob, parses a documented
 //! scanner format, and appends one atomic batch of asset observations (quarantined lifecycle/token
 //! URLs and queryless static assets import with `mandatory = false`, ordered after application/API
 //! endpoints). Every candidate is parsed

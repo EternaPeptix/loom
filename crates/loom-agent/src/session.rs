@@ -43,6 +43,11 @@
 //!   specs of the session's registry (`rtools::build_registry(&deps.shared)`, in registry order).
 //!   When `assignment` is `Some((parent, text))`, the second record is
 //!   `harness_note{Assignment, text}` authored `Agent(parent)`.
+//! - `recall(&mut self, text: String) -> Result<(), String>`: appends `harness_note{Info, text}` (author
+//!   `Harness`) to a session that has had no turn yet (no own `turn_start`), so that the note comes before
+//!   its first model request; on a session that has had one, `Err` and nothing is appended. Used once, by
+//!   `Runtime::create_session` for `prior` (`crate::prior::brief`). The note is an ordinary `Info` note: it
+//!   renders as one and a re-weave may drop it.
 //! - `fork`: `loom_core::log::fork_file(parent_log, <own log path>, upto_seq, …)`, whose checked copy
 //!   gives the session its records, then appends `Event::Forked(forked)` (author `Agent(forked.parent)`).
 //!   A parent prefix that is not a sound chain fails the fork with the copy's sentence and no log.

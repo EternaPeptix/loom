@@ -2,9 +2,10 @@
 //!
 //! CONTRACT.
 //!
-//! Both resolve `handle` with `BlobStore::resolve` (an unknown or ambiguous handle is an error
-//! sentence that repeats the handle and says handles look like `out:1a2b3c4d`), and return
-//! `Body::View` so the record states exactly which stored lines the text contains.
+//! Both open `handle` with `outputs::open` (only an output of the session's mission; a refusal is
+//! `Unopened::sentence`, the same for an output of another mission as for one that does not exist), and
+//! return `Body::View` so the record states exactly which stored lines the text contains. A view stores
+//! nothing and widens nothing: reading an output never makes another one readable.
 //!
 //! `out_read`: `view::window(start, end, total, cfg.read_max_lines)`, then `view::numbered` with
 //! `max_line_chars` 20_000. Outcome `ok`; facts: `view::range_fact`, and `{k} long lines shortened`
@@ -20,7 +21,8 @@
 //!
 //! Tests required: paging through an output larger than one page covers every line exactly once;
 //! clamping and both `window` errors; unknown handle; grep with context, cap, no match, invalid
-//! pattern; `shown` ranges are exact.
+//! pattern; `shown` ranges are exact; for both tools, a stored output outside `ctx.outputs` is refused
+//! with exactly the sentence of a handle that names nothing, and its text is not in the result.
 
 use crate::{params, view, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;

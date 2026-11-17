@@ -92,7 +92,8 @@
 //!   The orchestrator handed to `Shared` must not keep the runtime alive in a reference cycle
 //!   (hold a `Weak`, and answer "The harness is shutting down." when it is gone).
 //! - `ctx`: `ToolCtx{session, call_id: empty, workspace (canonical), tmp_dir: paths.session_tmp(id)
-//!   (created, canonical), blobs: BlobStore::open(paths.blobs_dir()), cfg: tools config, sandbox,
+//!   (created, canonical), blobs: BlobStore::open(paths.blobs_dir()), outputs: the outputs of
+//!   `meta.mission` (see *Outputs of a mission*), cfg: tools config, sandbox,
 //!   env, files: new FileTracker, jobs: JobTable::new(<session dir>/jobs, blobs, sender,
 //!   tools.max_output_bytes), cancel: new token}`.
 //!   - `sandbox`: `Sandbox::new(&cfg, workspace, tmp_dir, paths.home, Some(proxy port))`, then
@@ -119,14 +120,25 @@
 //!    `Rejected`/`Config`: return its message.
 //! 3. New `SessionId`, new `MissionId`. `title`: the given one, else the first line of `message` cut
 //!    to 80 characters, else `untitled`.
+//!    `NewSession.prior: Vec<MissionId>` (serde default) names the earlier missions the operator chose
+//!    for this one to recall (`crate::prior`); `SessionMeta.prior: Vec<MissionId>` (serde default, not
+//!    written when empty; always empty for a child) keeps what was accepted. Each id
+//!    is trimmed; blanks dropped; repeats dropped (first kept); more than `prior::MAX_PRIOR` refused
+//!    (`Name at most {MAX_PRIOR} earlier missions to recall; {n} were named.`); every id must be the
+//!    mission of a known session (`There is no mission {id} to recall.`). Archived missions may be
+//!    named. They are read before the session is made (`prior::read` on a blocking thread, the lead's
+//!    meta giving the title) and `meta.prior` keeps them in the given order.
 //! 4. `SessionStart{session, mission, parent: None, workspace, pack, role, termination,
 //!    model: ModelRef{profile, model, context_window}, reasoning_replay (profile),
 //!    system_prompt: pack::system_prompt(role, &pack.preamble, &PromptEnv{workspace,
 //!    platform: "{OS} ({ARCH})" from std::env::consts, sandbox: sandbox.describe(),
 //!    network: texts::network_sentence(mode, allow, deny, allow_private)}), tools: empty,
 //!    budget, unattended (default: the role's termination is `Explicit`), title}`.
-//! 5. `Session::create(deps, start, None)`, write `meta.json`, spawn the task, publish
-//!    [`BusEvent::Session`]. With a `message`: `send_message`.
+//! 5. `Session::create(deps, start, None)`; with a `prior`, `session.recall(prior::brief(&recalled))`
+//!    (one `harness_note` of kind `Info`, before any turn and so before the first model request; written
+//!    once, never again after a restart); write `meta.json`, spawn the task, publish
+//!    [`BusEvent::Session`]. With a `message`: `send_message`. A failure of any of these steps forgets
+//!    the session, as the earlier ones do.
 //!
 //! ## Children (`Orchestrator`)
 //! `spawn(parent, req)`:
@@ -250,6 +262,25 @@
 //! `Producer{session, call_id, tool: name, class}`. Kept as an in-memory index fed by
 //! every record that passes through the sink; on a miss for a mission whose logs have not been
 //! scanned since start, scan the logs of all its sessions once, then answer.
+//!
+//! ## Outputs of a mission
+//! The blob store is shared by every mission, so a session's tools open stored outputs only through
+//! `ToolCtx::outputs` (`loom_tools::outputs`). The runtime's `OutputScope` for a session holds `blob`
+//! when some record of a session of the session's mission names `blob` as an output (a session's own
+//! records; a fork's copied records are its parent's, of the same mission):
+//! - every blob `producer` would find (see above);
+//! - of a `tool_result` that is not `out_read` or `out_grep`: `output`, `meta[META_OF_BLOB]`,
+//!   `meta[META_RAW_BLOB]`, and every string in `meta[META_ALSO_STORED]`;
+//! - the `output` of every `job_settled` and `job_matched`;
+//! - the `full` of every `child_settled` and `child_completed`.
+//!
+//! The ids that are not already in the producer index are kept in a second in-memory index keyed by
+//! (mission, blob), fed by the sink as the producer index is, and filled by the same once-per-mission
+//! scan (one scan fills both; `scanned` is shared). So `holds` is a map lookup once the mission has been
+//! scanned, and a miss before that scans the mission's logs once. A view (`out_read`, `out_grep`) names
+//! nothing new, so reading an output never makes another one readable. The scope holds a `Weak` of the
+//! runtime (as the orchestrator does) and answers `false` once the runtime is gone. What the operator reads
+//! (`loom out`, the API) is not scoped.
 //!
 //! ## The sink
 //! The runtime is the `Sink` of every session.
@@ -468,6 +499,15 @@
 //!   distinct seeds, votes parsed, a failed request counted as no choice;
 //! - `producer`: found through the live index and, after a restart, through the scan; the part a
 //!   watched job's match stored is found while the job runs, after the mission's logs were scanned;
+//! - outputs of a mission: a session's `out_read` opens its own output, its lead's (a fresh child), a
+//!   job's settled output and a result's `META_RAW_BLOB`, live and after a restart (the scan); it is
+//!   refused, with the sentence of an unknown handle, an output of another mission whose handle it was
+//!   given in a message; an `out_read` view of another mission's output already in a log (one written
+//!   before this rule) does not make that output readable;
+//! - `prior`: a lead created with `prior` has, right after `session_start` and before its first
+//!   `model_request`, one `harness_note{Info}` that is `prior::brief` of those missions; an unknown id and
+//!   more than `MAX_PRIOR` are refused and leave no session; `meta.json` keeps `prior`; a restart writes no
+//!   second note;
 //! - inbox: a `finish` opens an item and notifies (the command's file has the kind); `answer`
 //!   resolves it; an empty answer dismisses a non-blocking item without a turn and is refused for a
 //!   blocking one;
