@@ -3728,7 +3728,7 @@ mod tests {
                 agents: self.agents.clone(),
                 context: self.context.clone(),
                 admit: self.admit.clone(),
-                client: Arc::new(ModelClient::new("mock", self.profile.clone()).unwrap()),
+                client: Arc::new(ModelClient::new("mock", self.profile.clone(), &self.paths.model_keys_dir()).unwrap()),
                 limiter: Arc::new(Limiter::new(4)),
                 priority: Priority::Lead,
                 context_window: self.window,

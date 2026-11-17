@@ -8,7 +8,7 @@
 //! 1. emit `StreamEvent::AttemptStart { attempt }` (attempts count from 1);
 //! 2. `POST {base_url}/chat/completions` with `ChatRequest::body(model, profile.extra_body)`, where
 //!    `model` is the id `discover` last selected, else `profile.model` (see **unknown model** below),
-//!    header `Authorization: Bearer {key}` when `profile.api_key_env` names a non-empty variable,
+//!    header `Authorization: Bearer {key}` when the profile has a key (see **Keys**),
 //!    `Accept: text/event-stream`. No request timeout is set on the whole request; instead:
 //! 3. while reading (headers and every body chunk), waiting longer than `profile.stall_timeout_s`
 //!    for the next bytes fails the attempt as a stall. Connecting has a 10 s timeout;
@@ -79,6 +79,22 @@
 //! ## `health`
 //! `GET {base_url}/models` with a 5 s timeout → true on 2xx.
 //!
+//! ## `new(name, profile, keys_dir)`: keys and proxies
+//! Fails with `ModelError::Config` when `base_url` is not an http(s) URL. `keys_dir` is where key files are
+//! (`Paths::model_keys_dir()`, `<loom home>/keys/models`). **Keys**, the bearer a request carries:
+//! - `profile.api_key_file` set: the key `loom_core::config::read_model_key(keys_dir, file)` returns, read
+//!   once, here. Its refusal (missing file, a link, not this user's, any group or other permission bit, …) is
+//!   `ModelError::Config` with `model profile '{name}': ` before its sentence, so the daemon does not start
+//!   with a key it cannot send. The key is kept in this client's memory only, never put in an environment.
+//! - else `profile.api_key_env` names a variable that is set and not empty: its value, read per request.
+//! - else none, and no `Authorization` header is sent.
+//!
+//! **No proxy.** The HTTP client is built with `no_proxy()`: `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` in
+//! either case, and the system's proxy settings, are ignored. `complete`, `discover` and `health` connect
+//! only to `base_url` (DESIGN §2, principle 9), so a proxy exported in the shell that started the daemon
+//! (an intercepting proxy, say) never receives a transcript or the bearer key, and a closed one cannot
+//! make every step fail.
+//!
 //! Tests required (all against `crate::mock::MockServer`): a plain reply; a tool-call reply; events
 //! arrive in order with `AttemptStart` first; retry after 500 then success (attempts == 2, events of
 //! the failed attempt precede a second `AttemptStart`); connection dropped mid-stream is retried and
@@ -86,16 +102,24 @@
 //! `Retry-After` honoured; retry window exhausted → `Unavailable`; 400 → `Rejected` with the
 //! server's message; overflow wording → `ContextOverflow` with parsed numbers; cancellation during
 //! a stream and during a retry sleep; server unreachable then started later is picked up; bearer
-//! header sent only when configured; `discover` for each source; `timing` is plausible.
+//! header sent only when configured; `discover` for each source; `timing` is plausible. Keys: a key
+//! file's trimmed content is the bearer (and wins over nothing else: `Config::check` refuses a profile
+//! with both forms); a missing key file and one with mode 0644 make `new` fail with a `Config` naming the
+//! profile and the path. Proxies, in a child process (the test binary run again for that one test, since
+//! the variables are read when a client is built): with `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their
+//! lower-case forms all set to `http://127.0.0.1:{port}` of a port nothing listens on, `complete`,
+//! `discover` and `health` against a `MockServer` succeed, and a `reqwest::Client::new()` GET of the same
+//! mock URL in the same child fails (the control showing the variables are in force).
 
 use crate::assemble::{AssembleError, Assembler, Completion, SseParser, StreamEvent};
 use crate::request::ChatRequest;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use loom_core::config::ModelProfile;
+use loom_core::config::{read_model_key, ModelProfile};
 use loom_core::event::{FinishReason, Timing, Usage};
 use rand::RngExt;
 use serde_json::Value;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -263,12 +287,24 @@ impl Partial {
     }
 }
 
+/// A key held in memory; its `Debug` never shows it.
+#[derive(Clone)]
+struct Secret(Arc<str>);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ModelClient {
     name: String,
     profile: ModelProfile,
     http: reqwest::Client,
     pacing: Pacing,
+    /// The key `profile.api_key_file` held when this client was built; memory only.
+    file_key: Option<Secret>,
     /// The model id `discover` last selected (or a 404 lookup learned); shared by all clones, and replaced
     /// by every successful `discover`. Requests carry it in place of
     /// `profile.model` once it is known. While it is not, a 404 has it looked up.
@@ -276,8 +312,9 @@ pub struct ModelClient {
 }
 
 impl ModelClient {
-    /// `name` is the profile's name (for messages). Fails when `base_url` is not an http(s) URL.
-    pub fn new(name: &str, profile: ModelProfile) -> Result<ModelClient, ModelError> {
+    /// `name` is the profile's name (for messages). Fails when `base_url` is not an http(s) URL, or when the
+    /// profile's `api_key_file` (in `keys_dir`) cannot be used. Proxy variables are ignored.
+    pub fn new(name: &str, profile: ModelProfile, keys_dir: &Path) -> Result<ModelClient, ModelError> {
         let ok = reqwest::Url::parse(&profile.base_url)
             .map(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
             .unwrap_or(false);
@@ -287,7 +324,17 @@ impl ModelClient {
                 profile.base_url
             )));
         }
+        let file_key = match &profile.api_key_file {
+            Some(file) => Some(Secret(
+                read_model_key(keys_dir, file)
+                    .map_err(|sentence| ModelError::Config(format!("model profile '{name}': {sentence}")))?
+                    .into(),
+            )),
+            None => None,
+        };
         let http = reqwest::Client::builder()
+            // Requests go to `base_url` and nowhere else, whatever proxy the environment names.
+            .no_proxy()
             .connect_timeout(CONNECT_TIMEOUT)
             // A redirect would re-post the whole conversation to another host.
             .redirect(reqwest::redirect::Policy::none())
@@ -296,7 +343,7 @@ impl ModelClient {
                 ModelError::Config(format!("model profile '{name}': cannot build an HTTP client: {}", describe(&e)))
             })?;
         let pacing = Pacing::from_profile(&profile);
-        Ok(ModelClient { name: name.to_string(), profile, http, pacing, served: Arc::new(Mutex::new(None)) })
+        Ok(ModelClient { name: name.to_string(), profile, http, pacing, file_key, served: Arc::new(Mutex::new(None)) })
     }
 
     #[cfg(test)]
@@ -327,6 +374,9 @@ impl ModelClient {
     }
 
     fn api_key(&self) -> Option<String> {
+        if let Some(key) = &self.file_key {
+            return Some(key.0.to_string());
+        }
         let var = self.profile.api_key_env.as_deref()?;
         std::env::var(var).ok().filter(|k| !k.is_empty())
     }
@@ -822,7 +872,7 @@ mod tests {
     }
 
     fn client_with(p: ModelProfile, pacing: Pacing) -> ModelClient {
-        ModelClient::new("test", p).unwrap().with_pacing(pacing)
+        ModelClient::new("test", p, Path::new("/nonexistent-keys")).unwrap().with_pacing(pacing)
     }
 
     fn client(base: &str) -> ModelClient {
@@ -1567,6 +1617,88 @@ mod tests {
         assert_eq!(s.auth_headers(), vec![None, Some(format!("Bearer {path}")), None]);
     }
 
+    fn write_key(dir: &Path, name: &str, content: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, content).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_key_file_is_the_bearer_and_is_read_once() {
+        let s = server(vec![Reply::text("a").into(), Reply::text("b").into()]).await;
+        let d = tempfile::tempdir().unwrap();
+        write_key(d.path(), "m", "  sk-from-file\n", 0o600);
+        let mut p = profile(&s.base_url());
+        p.api_key_file = Some("m".into());
+        let c = ModelClient::new("m", p, d.path()).unwrap().with_pacing(fast_pacing());
+        assert!(!format!("{c:?}").contains("sk-from-file"));
+        let cancel = CancellationToken::new();
+        c.complete(&req("x"), None, &cancel).await.unwrap();
+        std::fs::remove_file(d.path().join("m")).unwrap();
+        c.complete(&req("x"), None, &cancel).await.unwrap();
+        assert_eq!(
+            s.auth_headers(),
+            vec![Some("Bearer sk-from-file".to_string()), Some("Bearer sk-from-file".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_missing_or_open_key_file_stops_new() {
+        let d = tempfile::tempdir().unwrap();
+        let mut p = profile("http://127.0.0.1:1/v1");
+        p.api_key_file = Some("m".into());
+        let e = ModelClient::new("m", p.clone(), d.path()).unwrap_err();
+        let ModelError::Config(msg) = e else { panic!("expected Config") };
+        assert!(msg.starts_with("model profile 'm': "), "{msg}");
+        assert!(msg.contains(&d.path().join("m").display().to_string()), "{msg}");
+        write_key(d.path(), "m", "sk-secret", 0o644);
+        let ModelError::Config(msg) = ModelClient::new("m", p, d.path()).unwrap_err() else {
+            panic!("expected Config")
+        };
+        assert!(msg.starts_with("model profile 'm': ") && msg.contains("chmod 600"), "{msg}");
+        assert!(!msg.contains("sk-secret"));
+    }
+
+    /// The proxy variables are read when a client is built, and `set_var` in a threaded test binary is
+    /// unsound, so this test runs the test binary again for itself with the variables in its environment.
+    #[tokio::test]
+    async fn model_requests_ignore_proxy_variables() {
+        if std::env::var_os("LOOM_TEST_PROXY_CHILD").is_none() {
+            let port = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().port()
+            };
+            let proxy = format!("http://127.0.0.1:{port}");
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "client::tests::model_requests_ignore_proxy_variables",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("LOOM_TEST_PROXY_CHILD", "1");
+            for var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+                cmd.env(var, &proxy);
+            }
+            let out = cmd.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "child failed:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+            assert!(stdout.contains("LOOM_PROXY_CHILD_CHECKED"), "child did not run its checks:\n{stdout}");
+            return;
+        }
+        let s = server(vec![Reply::text("hi").into()]).await;
+        let c = client(&s.base_url());
+        let done = c.complete(&req("x"), None, &CancellationToken::new()).await.unwrap();
+        assert_eq!(done.text, "hi");
+        c.discover().await.unwrap();
+        assert!(c.health().await);
+        let control = reqwest::Client::new().get(format!("{}/models", s.base_url())).send().await;
+        assert!(control.is_err(), "the control request reached the mock, so the proxy variables are not in force");
+        println!("LOOM_PROXY_CHILD_CHECKED");
+        s.shutdown().await;
+    }
+
     #[tokio::test]
     async fn timing_is_plausible() {
         let mut reply = Reply::text("0123456789".repeat(5)).with_delay_ms(30);
@@ -1767,10 +1899,10 @@ mod tests {
     #[test]
     fn new_rejects_non_http_urls() {
         for bad in ["", "localhost:8000/v1", "ftp://host/v1", "not a url"] {
-            let err = ModelClient::new("t", profile(bad)).unwrap_err();
+            let err = ModelClient::new("t", profile(bad), Path::new("/nonexistent-keys")).unwrap_err();
             assert!(matches!(err, ModelError::Config(_)), "{bad}");
         }
-        assert!(ModelClient::new("t", profile("https://example.com/v1")).is_ok());
+        assert!(ModelClient::new("t", profile("https://example.com/v1"), Path::new("/nonexistent-keys")).is_ok());
     }
 
     #[test]

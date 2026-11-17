@@ -289,7 +289,8 @@
 //! `cfg.secret_env` (the `api_key_env` of every model profile), or starts with `LOOM_`, and without
 //! any whose value holds a URL with a password in its user-info part (`scheme://user:password@host`):
 //! every `://` in the value starts an authority that ends at `/`, `?`, `#`, `"`, `]` or white space.
-//! A variable listed in `cfg.env_pass` is passed whatever its name and value. Bubblewrap additionally
+//! A variable listed in `cfg.env_pass` is passed whatever its name and value. `withheld(name, value)` is the
+//! name and value test alone (without `secret_env` and `env_pass`), for the daemon's start warning. Bubblewrap additionally
 //! always removes LD_*, DYLD_*, BASH_FUNC_*, BASH_ENV, ENV, SHELLOPTS and BASHOPTS before its trusted
 //! host launcher; tools can set needed library variables inside the confined script. Added: `TERM=dumb`,
 //! `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR=<session temp dir>`.
@@ -1476,6 +1477,12 @@ pub fn preflight(cfg: &SandboxCfg) -> Result<(), String> {
     preflight_at(cfg.mode, Path::new(SANDBOX_EXEC), cfg!(target_os = "macos"))
 }
 
+/// Whether a command is not given the variable `name` with `value`, by its name or by a password in a URL
+/// in its value (leaving out `secret_env` and `env_pass`): what the daemon's start warning reports.
+pub fn withheld(name: &str, value: &str) -> bool {
+    secret_name(name) || url_with_password(value)
+}
+
 /// Whether the environment variable `name` looks like it holds a secret and is withheld from commands.
 fn secret_name(name: &str) -> bool {
     let upper = name.to_uppercase();
@@ -2292,6 +2299,11 @@ impl Sandbox {
         }
         out.insert("TMPDIR".to_string(), self.tmp_dir.display().to_string());
         out
+    }
+
+    /// The loopback ports commands may connect to (the session's proxy port, then the configured ones).
+    pub fn loopback_ports(&self) -> &[u16] {
+        &self.loopback_ports
     }
 
     pub fn describe(&self) -> String {

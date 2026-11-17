@@ -96,9 +96,16 @@
 //!   `meta.mission` (see *Outputs of a mission*), cfg: tools config, sandbox,
 //!   env, files: new FileTracker, jobs: JobTable::new(<session dir>/jobs, blobs, sender,
 //!   tools.max_output_bytes), cancel: new token}`.
-//!   - `sandbox`: `Sandbox::new(&cfg, workspace, tmp_dir, paths.home, Some(proxy port))`, then
+//!   - The proxy grant is made first (`proxy.grant(id, policy)`; a failure to open the session's
+//!     listener fails the set-up with `The egress proxy cannot open a port for this session: {error}`).
+//!   - `sandbox`: `Sandbox::new(&cfg, workspace, tmp_dir, paths.home, Some(grant.port))` (the session's
+//!     own proxy listener, never the shared `proxy.port()`, so a command can connect to no other
+//!     session's listener and other sessions' credentials are of no use to it; `None` under bubblewrap;
+//!     the sandbox `child_copy` builds for commands run in an agent's copy uses the port of the session
+//!     whose environment those commands get, `proxy.session_port(..)`, and `None` when it holds no grant), then
 //!     `.with_jobs_dir(<session dir>/jobs)` (commands' own output files are there: their metadata can be read,
-//!     not their content), with the config's `SandboxCfg`; for a role with `read_only`, `extra_writable` is retained as internal
+//!     not their content; `child_copy` uses the parent's), with the config's `SandboxCfg`; for a role with
+//!     `read_only`, `extra_writable` is retained as internal
 //!     replay-untrusted metadata before its grants are emptied, and the
 //!     workspace is added to `protected_paths`; every model profile's `api_key_env` name is added to
 //!     `secret_env`, so commands never see it. `Runtime::start` sets `config.sandbox.network_deny_all` to
@@ -303,7 +310,9 @@
 //! holds [`BUS_CAPACITY`] events.
 //!
 //! ## Network decisions
-//! One `loom_net::Proxy` for the runtime (`config.daemon.proxy_port`). Every decision it reports is
+//! One `loom_net::Proxy` for the runtime: its shared listener on `config.daemon.proxy_port` serves the
+//! in-process reference clients, and each session's grant has a listener of its own, closed when the
+//! grant is revoked. Every decision it reports is
 //! appended to the session's `net.jsonl` and published as [`BusEvent::Net`]. Decisions that name no
 //! session are appended to `logs/net-unattributed.jsonl`.
 //!
@@ -382,7 +391,15 @@
 //! ## Start (`Runtime::start`)
 //! 1. `config.check()`; create the directories; load packs (`Packs::load(paths.packs_dir())`) and
 //!    check every role's tools against `Registry::builtin().names()` plus `rtools::NAMES`; journal
-//!    key; blob store; clients and limiters; proxy.
+//!    key; blob store; clients (`ModelClient::new(name, profile, paths.model_keys_dir())`, so a profile's
+//!    `api_key_file` is read here and a refusal stops the start) and limiters; proxy. The start warnings
+//!    (`tracing::warn!`) include `config.key_env_warnings(paths.model_keys_dir(), …)` judged against the
+//!    daemon's own environment: a key named by `api_key_env` that is in it, where commands can read it,
+//!    and one that is missing. And one sentence naming, never with their values, the variables of the
+//!    daemon's environment that commands are not given as secrets (`loom_tools::sandbox::withheld(name,
+//!    value)`), other than `LOOM_*` ones, the profiles' `api_key_env` and the `sandbox.env_pass` names:
+//!    every command can read them from the daemon's environment; start the daemon with `loom up` or
+//!    `loom service install`, which pass only what it needs (a `loom daemon` run from a shell keeps it all).
 //! 2. Read every session's `meta.json` and `status.json` (missing status = default idle status).
 //! 3. Activate as described under *Active sessions*. A session that cannot be opened is skipped
 //!    with `tracing::error!` and a `BusEvent::Error`; a child that cannot be opened while its lead
@@ -524,7 +541,13 @@
 //!   attended one idle; open inbox items are back; an ended child is not activated; a finish
 //!   verifier whose `child_spawned` a crash kept out of the lead's log is still the gate's;
 //! - a read-only role's sandbox configuration protects the workspace; every session's environment
-//!   names the proxy;
+//!   names the proxy, on the session's own port: two sessions' `HTTP_PROXY` ports differ, neither is
+//!   `proxy_port()`, and each session's sandbox allows (`loopback_ports`) its own port and not the other's;
+//!   `start_warnings` holds the `api_key_env` warning when the variable is set and when it is not, and
+//!   none for a profile with `api_key_file`; the secret-variable warning names `GITHUB_TOKEN` and a variable
+//!   whose value is `https://u:p@h/`, holds neither value, and leaves out `LOOM_HOME`, an `api_key_env` and an
+//!   `env_pass` name, and there is none when nothing is left; a profile whose key file is missing stops
+//!   `Runtime::start`;
 //! - `archive` hides, refuses messages, and survives a restart;
 //! - copies: an agent started with `Workspace::Copy` is told where it works and its command runs
 //!   there, the lead's workspace is unchanged until `agent_adopt` and has the agent's files after it,
@@ -1150,6 +1173,22 @@ fn child_outcome_of(outcome: SessionOutcome) -> ChildOutcome {
     }
 }
 
+/// Revokes a session's proxy grant (closing its listener) when dropped while armed, so that a set-up
+/// that fails after the grant leaks no listener.
+struct RevokeOnDrop<'a> {
+    proxy: &'a Proxy,
+    session: &'a SessionId,
+    armed: bool,
+}
+
+impl Drop for RevokeOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.proxy.revoke(self.session);
+        }
+    }
+}
+
 /// The sandbox configuration a session of `role` runs under.
 /// Every model profile's `api_key_env` name is withheld from its commands.
 fn sandbox_cfg_for(
@@ -1476,7 +1515,12 @@ impl Orchestrator for Orch {
         let (record, log) = (inner.paths.session_dir(&child).join(COPY_MANIFEST), inner.paths.session_log(&child));
         let (tmp, home, copies) = (inner.paths.session_tmp(parent), inner.paths.home.clone(), inner.paths.copies_dir());
         let parent_jobs = inner.paths.session_dir(parent).join("jobs");
-        let (base, models, port) = (inner.config.sandbox.clone(), inner.config.models.clone(), inner.proxy.port());
+        let (base, models, port) = (
+            inner.config.sandbox.clone(),
+            inner.config.models.clone(),
+            // The commands run with the parent's environment, so on the parent's listener.
+            inner.proxy.session_port(parent),
+        );
         let read = tokio::task::spawn_blocking(move || {
             let dir = std::fs::canonicalize(&meta.workspace).map_err(|e| {
                 format!(
@@ -1499,7 +1543,7 @@ impl Orchestrator for Orch {
             // parent's own scratch directory, under the rules the agent itself ran under.
             let cfg = with_copies(sandbox_cfg_for(&base, &role, &dir, &models), &copies, Some(&source));
             let bubblewrap = cfg.mode == SandboxMode::Bubblewrap;
-            let sandbox = Sandbox::new(&cfg, &dir, &tmp, &home, (!bubblewrap).then_some(port))
+            let sandbox = Sandbox::new(&cfg, &dir, &tmp, &home, if bubblewrap { None } else { port })
                 .and_then(|s| s.with_jobs_dir(&parent_jobs))
                 .map_err(|e| format!("The sandbox for the copy of agent {} cannot be set up: {e}", child.as_str()))?;
             Ok(ChildCopy { agent: child, dir, manifest, running, runs, sandbox: Arc::new(sandbox) })
@@ -2328,14 +2372,19 @@ impl Inner {
             return Err("Bubblewrap requires network.mode = deny_all. Explicit mission grants apply only to trusted in-process HTTP tools; subprocess proxy bridges are unsupported.".into());
         }
         let jobs_dir = self.paths.session_dir(id).join("jobs");
-        let sandbox =
-            Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, (!bubblewrap).then_some(self.proxy.port()))
-                .and_then(|s| s.with_jobs_dir(&jobs_dir))
-                .map_err(|e| format!("The sandbox for this session cannot be set up: {e}"))?;
         let policy = self.session_policy(meta, explicit)?;
+        // The session's own proxy listener comes first: its port is the only one the sandbox allows.
+        let grant = self
+            .proxy
+            .grant(id, policy)
+            .map_err(|e| format!("The egress proxy cannot open a port for this session: {e}"))?;
+        // From here a failure takes the grant, and with it the listener, back.
+        let mut revoke = RevokeOnDrop { proxy: &self.proxy, session: id, armed: true };
+        let sandbox = Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, (!bubblewrap).then_some(grant.port))
+            .and_then(|s| s.with_jobs_dir(&jobs_dir))
+            .map_err(|e| format!("The sandbox for this session cannot be set up: {e}"))?;
         let (events_tx, job_events) = unbounded_channel();
         let jobs = Arc::new(JobTable::new(jobs_dir, self.blobs.clone(), events_tx, self.config.tools.max_output_bytes));
-        let grant = self.proxy.grant(id, policy);
         let reference_proxy = if self.config.network.reference_hosts.is_empty() {
             None
         } else {
@@ -2397,6 +2446,7 @@ impl Inner {
             sink: self.sink.clone(),
             control: control.clone(),
         };
+        revoke.armed = false;
         Ok((deps, Parts { control, shared, jobs }))
     }
 
@@ -3610,8 +3660,15 @@ pub fn disk_is_low(free: u64, total: u64) -> bool {
     free < LOW_DISK_BYTES || u128::from(free) * 100 < u128::from(total) * u128::from(LOW_DISK_PERCENT)
 }
 
-/// What `start` warns about in the configuration, one sentence each.
-fn start_warnings(config: &Config, macos: bool) -> Vec<String> {
+/// What `start` warns about in the configuration, one sentence each. `key_is_set` says whether a variable
+/// is present and not empty in the daemon's environment; `env` is that environment (names and values).
+fn start_warnings(
+    config: &Config,
+    macos: bool,
+    keys_dir: &std::path::Path,
+    key_is_set: impl Fn(&str) -> bool,
+    env: &[(String, String)],
+) -> Vec<String> {
     let mut out = Vec::new();
     if config.notify.command.is_empty() && !macos {
         out.push(
@@ -3625,7 +3682,32 @@ fn start_warnings(config: &Config, macos: bool) -> Vec<String> {
                 .to_string(),
         );
     }
+    out.extend(config.key_env_warnings(keys_dir, key_is_set));
+    out.extend(secret_env_warning(config, env));
     out
+}
+
+/// The warning that names (never with their values) the variables of the daemon's environment that
+/// commands are not given as secrets but can read from the daemon's environment: all but `LOOM_*`, the
+/// profiles' `api_key_env` (reported on their own) and the `sandbox.env_pass` names.
+fn secret_env_warning(config: &Config, env: &[(String, String)]) -> Option<String> {
+    let known = |name: &str| {
+        name.to_ascii_uppercase().starts_with("LOOM_")
+            || config.models.values().any(|p| p.api_key_env.as_deref() == Some(name))
+            || config.sandbox.env_pass.iter().any(|n| n == name)
+    };
+    let names: std::collections::BTreeSet<&str> = env
+        .iter()
+        .filter(|(name, value)| loom_tools::sandbox::withheld(name, value) && !known(name))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let list = names.into_iter().collect::<Vec<_>>().join(", ");
+    Some(format!(
+        "The daemon's environment holds variables that look like secrets: {list}. Commands are not given them, but every command can read them from the daemon's environment. Start the daemon with `loom up` or `loom service install`, which pass only what it needs; a `loom daemon` run from a shell keeps all of that shell's variables."
+    ))
 }
 
 /// The warning for a profile whose configured window is larger than the one its server reports.
@@ -3773,7 +3855,7 @@ impl Runtime {
         let blobs = BlobStore::open(paths.blobs_dir()).map_err(|e| format!("cannot open the blob store: {e}"))?;
         let mut profiles = BTreeMap::new();
         for (name, profile) in &config.models {
-            let client = ModelClient::new(name, profile.clone()).map_err(|e| e.to_string())?;
+            let client = ModelClient::new(name, profile.clone(), &paths.model_keys_dir()).map_err(|e| e.to_string())?;
             profiles.insert(
                 name.clone(),
                 ProfileRt {
@@ -3783,7 +3865,13 @@ impl Runtime {
                 },
             );
         }
-        for warning in start_warnings(&config, cfg!(target_os = "macos")) {
+        let env_key_is_set = |var: &str| std::env::var_os(var).is_some_and(|v| !v.is_empty());
+        let daemon_env: Vec<(String, String)> = std::env::vars_os()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+            .collect();
+        for warning in
+            start_warnings(&config, cfg!(target_os = "macos"), &paths.model_keys_dir(), env_key_is_set, &daemon_env)
+        {
             tracing::warn!("{warning}");
         }
         config.check_box_paths(&paths.home)?;
@@ -5507,6 +5595,7 @@ mod tests {
             .await
             .unwrap_err()
             .contains("cannot be authorized"));
+        assert!(e.rt.grant_scope(&id, &["*.com".to_string()], None).await.unwrap_err().contains("top-level domain"));
         let unknown = SessionId::from("s-nope");
         let err = e.rt.grant_scope(&unknown, &["a.test".to_string()], None).await.unwrap_err();
         assert_eq!(err, "There is no session s-nope.");
@@ -5898,9 +5987,10 @@ mod tests {
         let info = e.rt.create_session(e.new_session(Some("net"))).await.unwrap();
         let id = info.meta.id.clone();
         until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
-        let grant = e.rt.inner.proxy.grant(&id, Policy::new(&e.config.network).unwrap());
+        let grant = e.rt.inner.proxy.grant(&id, Policy::new(&e.config.network).unwrap()).unwrap();
         let mut bus = e.rt.subscribe();
-        let port = e.rt.proxy_port();
+        // Command credentials are served on the session's own listener.
+        let port = grant.port;
         let ask = move |req: String| async move {
             let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             s.write_all(req.as_bytes()).await.unwrap();
@@ -7594,6 +7684,8 @@ mod tests {
     #[test]
     fn start_warns_about_what_the_operator_must_know() {
         let mut c = Config::default();
+        let keys = std::path::Path::new("/h/keys/models");
+        let start_warnings = |c: &Config, macos: bool| start_warnings(c, macos, keys, |_| false, &[]);
         assert!(start_warnings(&c, true).is_empty());
         let off = start_warnings(&c, false);
         assert_eq!(off.len(), 1);
@@ -7604,6 +7696,86 @@ mod tests {
         let none = start_warnings(&c, true);
         assert_eq!(none.len(), 1);
         assert!(none[0].contains("unconfined"), "{none:?}");
+    }
+
+    #[test]
+    fn start_warns_about_a_key_held_in_the_environment() {
+        let keys = std::path::Path::new("/h/keys/models");
+        let mut c = Config::default();
+        c.notify.command = vec!["/bin/true".into()];
+        c.models.insert(
+            "env".into(),
+            loom_core::config::ModelProfile { api_key_env: Some("LOOM_TEST_KEY".into()), ..Default::default() },
+        );
+        c.models.insert(
+            "file".into(),
+            loom_core::config::ModelProfile { api_key_file: Some("file".into()), ..Default::default() },
+        );
+        let set = start_warnings(&c, true, keys, |v| v == "LOOM_TEST_KEY", &[]);
+        assert_eq!(set.len(), 1, "{set:?}");
+        assert!(set[0].contains("models.env") && set[0].contains("LOOM_TEST_KEY") && set[0].contains("can read it"));
+        let unset = start_warnings(&c, true, keys, |_| false, &[]);
+        assert_eq!(unset.len(), 1, "{unset:?}");
+        assert!(unset[0].contains("LOOM_TEST_KEY is not set") && unset[0].contains("api_key_file"), "{unset:?}");
+        assert!(set.iter().chain(&unset).all(|w| !w.contains("models.file")));
+    }
+
+    #[test]
+    fn start_names_the_secret_variables_of_the_daemon_environment_without_their_values() {
+        let keys = std::path::Path::new("/h/keys/models");
+        let mut c = Config::default();
+        c.notify.command = vec!["/bin/true".into()];
+        c.models.insert(
+            "m".into(),
+            loom_core::config::ModelProfile { api_key_env: Some("OPENAI_API_KEY".into()), ..Default::default() },
+        );
+        c.sandbox.env_pass = vec!["PASSED_TOKEN".into()];
+        let var = |n: &str, v: &str| (n.to_string(), v.to_string());
+        let env = [
+            var("GITHUB_TOKEN", "ghp_valueone"),
+            var("DATABASE", "https://u:p@h/"),
+            var("LOOM_HOME", "/h"),
+            var("LOOM_SECRET_TOKEN", "valuethree"),
+            var("OPENAI_API_KEY", "sk-valuefour"),
+            var("PASSED_TOKEN", "valuefive"),
+            var("PATH", "/usr/bin"),
+            var("EDITOR", "vi"),
+        ];
+        let w = start_warnings(&c, true, keys, |_| true, &env);
+        let secret: Vec<_> = w.iter().filter(|x| x.contains("look like secrets")).collect();
+        assert_eq!(secret.len(), 1, "{w:?}");
+        let line = secret[0];
+        assert!(line.contains("GITHUB_TOKEN") && line.contains("DATABASE"), "{line}");
+        for left_out in ["LOOM_HOME", "LOOM_SECRET_TOKEN", "PASSED_TOKEN", "PATH", "EDITOR"] {
+            assert!(!line.contains(left_out), "{left_out}: {line}");
+        }
+        assert!(!line.contains("OPENAI_API_KEY"), "{line}");
+        for value in ["ghp_valueone", "u:p@h", "sk-valuefour", "valuefive"] {
+            assert!(w.iter().all(|x| !x.contains(value)), "{value}: {w:?}");
+        }
+        assert!(line.contains("loom up") && line.contains("loom service install"), "{line}");
+        // Nothing left: no warning.
+        let env = [var("LOOM_HOME", "/h"), var("OPENAI_API_KEY", "x"), var("PATH", "/usr/bin")];
+        assert!(start_warnings(&c, true, keys, |_| false, &env).iter().all(|x| !x.contains("look like secrets")));
+    }
+
+    #[tokio::test]
+    async fn a_missing_key_file_stops_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start(Script::new(|_, _| finish("x"))).await.unwrap();
+        let mut config = config_for(&server, None);
+        if let Some(p) = config.models.get_mut("mock") {
+            p.api_key_file = Some("mock".into());
+        }
+        let paths = Paths::at(dir.path().join("home"));
+        plain_core_pack(&paths.packs_dir());
+        let key_path = paths.model_keys_dir().join("mock");
+        let err = match Runtime::start(config, paths).await {
+            Ok(_) => panic!("the runtime started without its key file"),
+            Err(e) => e,
+        };
+        assert!(err.contains("model profile 'mock'") && err.contains(&key_path.display().to_string()), "{err}");
+        server.shutdown().await;
     }
 
     #[test]
@@ -9455,13 +9627,56 @@ mod tests {
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         let id = info.meta.id.clone();
         until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
-        let port = e.rt.proxy_port();
-        assert!(port != 0);
+        let port = e.rt.inner.proxy.session_port(&id).unwrap();
+        assert!(port != 0 && port != e.rt.proxy_port());
         let text = e.records(&id).into_iter().find_map(|r| match r.event {
             Event::ToolResult(t) if t.name == "bash" => Some(t.text),
             _ => None,
         });
-        assert!(text.unwrap_or_default().contains(&format!("@127.0.0.1:{port}")));
+        let text = text.unwrap_or_default();
+        assert!(text.contains(&format!("@127.0.0.1:{port}")), "{text}");
+        assert!(!text.contains(&format!("@127.0.0.1:{}", e.rt.proxy_port())), "{text}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sessions_have_proxy_ports_of_their_own_and_sandboxes_that_allow_only_their_own() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let a = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta;
+        let b = e.rt.create_session(e.new_session(Some("b"))).await.unwrap().meta;
+        let port_of = |env: &std::collections::BTreeMap<String, String>| -> u16 {
+            let url = env.get("HTTP_PROXY").expect("HTTP_PROXY");
+            url.rsplit(':').next().and_then(|p| p.parse().ok()).expect("a port at the end of HTTP_PROXY")
+        };
+        let shared = e.rt.proxy_port();
+        let (da, _) = e.rt.inner.build(&a, false).unwrap();
+        let (db, _) = e.rt.inner.build(&b, false).unwrap();
+        let (pa, pb) = (port_of(&da.ctx.env), port_of(&db.ctx.env));
+        assert!(pa != pb && pa != shared && pb != shared, "{pa} {pb} {shared}");
+        assert_eq!(e.rt.inner.proxy.session_port(&a.id), Some(pa));
+        assert_eq!(e.rt.inner.proxy.session_port(&b.id), Some(pb));
+        assert_eq!(da.ctx.sandbox.loopback_ports().first(), Some(&pa));
+        assert_eq!(db.ctx.sandbox.loopback_ports().first(), Some(&pb));
+        for (sandbox, own, other) in [(&da.ctx.sandbox, pa, pb), (&db.ctx.sandbox, pb, pa)] {
+            let ports = sandbox.loopback_ports();
+            assert!(ports.contains(&own) && !ports.contains(&other) && !ports.contains(&shared), "{ports:?}");
+        }
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_that_ends_holds_no_proxy_port_and_its_port_is_not_reissued() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let id = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta.id;
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let port = e.rt.inner.proxy.session_port(&id).unwrap();
+        e.rt.inner.proxy.revoke(&id);
+        assert_eq!(e.rt.inner.proxy.session_port(&id), None);
+        // The port is retired, so no later session is given it.
+        let next = e.rt.create_session(e.new_session(Some("b"))).await.unwrap().meta.id;
+        until("second turn end", || e.has(&next, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let other = e.rt.inner.proxy.session_port(&next).unwrap();
+        assert_ne!(other, port);
         e.rt.shutdown().await;
     }
 

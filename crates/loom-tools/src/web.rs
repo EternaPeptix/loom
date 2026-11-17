@@ -794,7 +794,7 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = loom_net::Proxy::start(0, tx).await.unwrap();
-        let grant = proxy.grant(&loom_core::SessionId::from("s-web"), loom_net::Policy::new(&cfg).unwrap());
+        let grant = proxy.grant(&loom_core::SessionId::from("s-web"), loom_net::Policy::new(&cfg).unwrap()).unwrap();
         (proxy, grant)
     }
 
@@ -810,7 +810,7 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = loom_net::Proxy::start(0, tx).await.unwrap();
-        let raw = proxy.grant(&e.ctx.session, loom_net::Policy::new(&cfg).unwrap());
+        let raw = proxy.grant(&e.ctx.session, loom_net::Policy::new(&cfg).unwrap()).unwrap();
         e.ctx.env = Arc::new(raw.env());
         e.ctx.reference_proxy = Some(proxy.grant_reference(&e.ctx.session, &cfg).unwrap());
         proxy
@@ -961,7 +961,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = loom_net::Proxy::start_with(0, tx, Some(audit), loom_net::Limits::default()).await.unwrap();
         let _ = cell.set(proxy.clone());
-        let grant = proxy.grant(&SessionId::from("s-web-again"), loom_net::Policy::new(&cfg).unwrap());
+        let grant = proxy.grant(&SessionId::from("s-web-again"), loom_net::Policy::new(&cfg).unwrap()).unwrap();
         let mut e = env();
         e.ctx.env = Arc::new(grant.env());
         let r = e.call("web_fetch", json!({"url": "https://127.0.0.1:9/"})).await;
@@ -973,7 +973,7 @@ mod tests {
         let limits = loom_net::Limits { max_per_session: 0, ..loom_net::Limits::default() };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = loom_net::Proxy::start_with(0, tx, None, limits).await.unwrap();
-        let grant = proxy.grant(&SessionId::from("s-web-busy"), loom_net::Policy::new(&cfg).unwrap());
+        let grant = proxy.grant(&SessionId::from("s-web-busy"), loom_net::Policy::new(&cfg).unwrap()).unwrap();
         e.ctx.env = Arc::new(grant.env());
         let r = e.call("web_fetch", json!({"url": "https://127.0.0.1:9/"})).await;
         assert_eq!(r.status, ToolStatus::Error, "{}", r.text);

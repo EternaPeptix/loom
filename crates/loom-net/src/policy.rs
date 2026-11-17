@@ -53,12 +53,36 @@
 //!
 //! ## Per-session grants — `Policy::with_hosts(cfg, hosts)`, `check_hosts(hosts)`
 //! `with_hosts` is `Policy::new(cfg)` plus the operator-granted `hosts` (same pattern syntax as `allow`).
-//! Mode `deny_all` with at least one host becomes `allowlist` allowing exactly the granted hosts; mode
-//! `allowlist` gets them appended to `allow`; mode `open` is unchanged. `deny` and `allow_private` are
-//! the config's, so a granted host that is denied, or resolves to a private address, is still refused.
-//! An entry that is not a valid pattern is an error sentence naming it. `check_hosts` trims and
-//! validates a list of hosts to grant (non-empty, no blank entry, no whitespace or comma inside an
-//! entry, each a valid pattern) and returns them as written, trimmed.
+//! Mode `deny_all` with at least one host becomes `allowlist` allowing exactly the granted hosts: the
+//! configured `allow` list is not in force under `deny_all`, so it is emptied first and a grant never
+//! switches it on. Mode `allowlist` gets them appended to `allow`; mode `open` is unchanged. `deny` and
+//! `allow_private` are the config's, so a granted host that is denied, or resolves to a private address,
+//! is still refused. An entry that is not a valid pattern is an error sentence naming it. `with_hosts`
+//! does not apply the refusals of `check_hosts` below: hosts restored from a ledger written before them
+//! are honoured as they were granted.
+//!
+//! `check_hosts` trims and validates a list of hosts to grant (non-empty, no blank entry, no whitespace
+//! or comma inside an entry, each a valid pattern) and returns them as written, trimmed. It is the check
+//! of both a model's `request_scope` and the operator's grant (`Runtime::grant_scope`, which the approve
+//! action of a scope request calls with the hosts the model wrote), and it also refuses, each with a
+//! sentence that names the entry, says why and what to write instead, and grants nothing of the list:
+//! - `*` with or without a port: it would authorize every host;
+//! - a wildcard over a single label, `*.{label}` with or without a port (`*.com`, `*.io`, `*.htb`): it
+//!   would authorize a whole top-level domain; a wildcard under a domain (`*.example.test`) is kept. A
+//!   public suffix of more than one label (`*.co.uk`) is not recognised, nor is a domain whose names
+//!   resolve to whatever address the name spells (wildcard DNS such as `*.nip.io`);
+//! - a wildcard whose last label is a number as the system's address parser reads one: all digits
+//!   (`*.0.1`, `*.1.168.192:80`, octal `*.8.010`) or `0x`/`0X` and hex digits (`*.8.0x8`): no top-level
+//!   domain is numeric, and the resolver reads `a.b.8.0x8` as the address `a.b.8.8`, so it can only match
+//!   addresses written as host names, a whole range of them;
+//! - an IP literal that is unspecified or in `0.0.0.0/8` (`0.0.0.0`, `0.0.0.0:8080`, `0.1.2.3`, `::`,
+//!   `[::]:80`), also in an IPv6 form that carries such an IPv4 address (`[::ffff:0.0.0.0]`): a literal
+//!   grant unlocks its exact address against the private-address rule (below), and a connection to the
+//!   unspecified address reaches this machine's own services;
+//! - a loopback IP literal without a port (`127.0.0.1`, `127.1.2.3`, `[::1]`, `[::ffff:127.0.0.1]`): it would
+//!   unlock every service listening on this machine's loopback; the sentence asks for the port
+//!   (`127.0.0.1:8080`). With a port it is kept. A grant of one of this machine's own non-loopback
+//!   addresses (its LAN address, say) is not recognised as this machine.
 //!
 //! **Loopback/private literals granted to a session unlock that exact address**: a granted host that is
 //! an IP literal (`127.0.0.1`, `[::1]:8080`, `10.0.0.5:443`) additionally authorizes connections to that
@@ -75,6 +99,14 @@
 //! matching; port-specific patterns; case and trailing dot; each numbered rule and their order (deny
 //! beats allow); every special range at its edges (first/last address in, neighbours out); mapped
 //! IPv6; `allow_private` by name, by CIDR and by address; open mode still refuses private addresses.
+//! `with_hosts` under `deny_all` with a non-empty configured `allow` and one granted host: the granted
+//! host is allowed and every `allow` entry is refused (`not in allow list`); under `allowlist` both are
+//! allowed. `check_hosts` refuses `*`, `*:443`, `*.com`, `*.com:443`, `*.0.1`, `*.1.168.192:80`, `*.8.0x8`,
+//! `*.8.0XfF`, `*.8.010`, `0.0.0.0`,
+//! `0.0.0.0:8080`, `0.1.2.3`, `::`, `[::]`, `[::]:80`, `[::ffff:0.0.0.0]`, `127.0.0.1`, `127.1.2.3`, `[::1]`,
+//! `::1` and `[::ffff:127.0.0.1]` with a sentence naming the entry, refuses a list holding one of them
+//! besides valid hosts, and accepts `*.example.test`, `*.a1.example.test`, `*.0xide.example.test`, `api.example.test:443`,
+//! `127.0.0.1:19201`, `10.0.0.5` and `[::1]:8080`.
 
 #![allow(clippy::doc_lazy_continuation)]
 
@@ -337,9 +369,76 @@ pub fn check_hosts(hosts: &[String]) -> Result<Vec<String>, String> {
             return Err(format!("The host entry \"{h}\" contains whitespace or a comma. Give one host per entry."));
         }
         grant_pattern(h)?;
+        refuse_too_broad(h)?;
         out.push(h.to_string());
     }
     Ok(out)
+}
+
+/// Whether an IP literal is unspecified or in `0.0.0.0/8`, also when an IPv6 form carries such an address.
+fn is_unspecified_literal(ip: IpAddr) -> bool {
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => v4.octets().first() == Some(&0),
+        IpAddr::V6(v6) => v6.is_unspecified(),
+    }
+}
+
+/// Whether an IP is loopback (`127.0.0.0/8`, `::1`), also when an IPv6 form carries a `127.x` address.
+pub(crate) fn is_loopback_literal(ip: IpAddr) -> bool {
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => v4.octets().first() == Some(&127),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+/// Whether an IP is loopback or unspecified (the addresses that reach this machine's own listeners).
+pub(crate) fn is_local_literal(ip: IpAddr) -> bool {
+    is_loopback_literal(ip) || is_unspecified_literal(ip)
+}
+
+/// The refusals of [`check_hosts`] beyond pattern validity: `*`, a wildcard over a single label and an
+/// unspecified address. `host` is a trimmed, valid pattern.
+fn refuse_too_broad(host: &str) -> Result<(), String> {
+    let (name, port) = split_host_port(host)?;
+    if name == "*" {
+        return Err(format!(
+            "The host \"{host}\" would authorize every host. Name the hosts you need, such as `api.example.test` or `*.example.test`."
+        ));
+    }
+    if let Some(rest) = name.strip_prefix("*.") {
+        let label = normalize_host(rest);
+        if !label.contains('.') {
+            return Err(format!(
+                "The host \"{host}\" would authorize a whole top-level domain. Name the hosts you need, such as `api.example.{label}` or `*.example.{label}`."
+            ));
+        }
+    }
+    if let Some(rest) = name.strip_prefix("*.") {
+        let last = normalize_host(rest);
+        let last = last.rsplit('.').next().unwrap_or("");
+        let hex = last.strip_prefix("0x").or_else(|| last.strip_prefix("0X"));
+        let numeric = !last.is_empty()
+            && (last.chars().all(|c| c.is_ascii_digit())
+                || hex.is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit())));
+        if numeric {
+            return Err(format!(
+                "The host \"{host}\" ends in a number, which no top-level domain does, so it would authorize a whole range of IP addresses written as host names. Name the hosts you need."
+            ));
+        }
+    }
+    if let Ok(ip) = normalize_host(name).parse::<IpAddr>() {
+        if is_loopback_literal(ip) && port.is_none() {
+            return Err(format!(
+                "The host \"{host}\" is a loopback address without a port, which would unlock every service on this machine. Write the port of the service you need, such as `127.0.0.1:8080`."
+            ));
+        }
+        if is_unspecified_literal(ip) {
+            return Err(format!(
+                "The host \"{host}\" is an unspecified address, and a connection to it reaches this machine's own services. Write the address of the host you need, or `127.0.0.1` with a port for a service on this machine."
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_list<T>(list: &str, entries: &[String], parse: fn(&str) -> Result<T, String>) -> Result<Vec<T>, String> {
@@ -388,6 +487,10 @@ impl Policy {
         let mut policy = Policy::new(cfg)?;
         if hosts.is_empty() || policy.mode == NetworkMode::Open {
             return Ok(policy);
+        }
+        if policy.mode == NetworkMode::DenyAll {
+            // The configured `allow` list is not in force under deny_all; a grant must not switch it on.
+            policy.allow.clear();
         }
         for h in hosts {
             let p = grant_pattern(h)?;
@@ -497,7 +600,7 @@ fn embedded_v4(a: Ipv6Addr) -> Option<Ipv4Addr> {
 
 /// IPv6 addresses that carry an IPv4 address (see [`embedded_v4`]) as that address; `::`, `::1` and the
 /// other IPv4-compatible addresses in `::/104` stay IPv6 addresses.
-fn canonical_ip(addr: IpAddr) -> IpAddr {
+pub(crate) fn canonical_ip(addr: IpAddr) -> IpAddr {
     match addr {
         IpAddr::V6(a) => match (embedded_v4(a), a.segments()) {
             (Some(v4), [0, 0, 0, 0, 0, 0, ..]) if v4.octets().first() == Some(&0) => addr,
@@ -669,6 +772,70 @@ mod tests {
         assert!(s(&["a.test,b.test"]).unwrap_err().contains("one host per entry"));
         assert!(s(&["a b"]).unwrap_err().contains("one host per entry"));
         assert!(s(&["a*b"]).unwrap_err().contains("cannot be authorized"));
+    }
+
+    #[test]
+    fn grant_under_deny_all_does_not_switch_on_the_configured_allow_list() {
+        let hosts = |h: &[&str]| h.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let c = cfg(NetworkMode::DenyAll, &["cfg.test", "*.cfg.test:443"], &[], &[]);
+        let p = Policy::with_hosts(&c, &hosts(&["granted.test"])).unwrap();
+        assert!(p.check_name("granted.test", 80).allowed);
+        for (h, port) in [("cfg.test", 80), ("api.cfg.test", 443)] {
+            let v = p.check_name(h, port);
+            assert!(!v.allowed, "{h}");
+            assert_eq!(v.rule, "not in allow list", "{h}");
+        }
+        let c = cfg(NetworkMode::Allowlist, &["cfg.test"], &[], &[]);
+        let p = Policy::with_hosts(&c, &hosts(&["granted.test"])).unwrap();
+        assert!(p.check_name("granted.test", 80).allowed);
+        assert!(p.check_name("cfg.test", 80).allowed);
+    }
+
+    #[test]
+    fn check_hosts_refuses_everything_hosts_and_unspecified_addresses() {
+        let s = |h: &[&str]| check_hosts(&h.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        for e in [
+            "*",
+            "*:443",
+            "*.com",
+            "*.com:443",
+            "*.0.1",
+            "*.8.0x8",
+            "*.8.0XfF",
+            "*.8.010",
+            "*.1.168.192:80",
+            "0.0.0.0",
+            "0.0.0.0:8080",
+            "0.1.2.3",
+            "::",
+            "[::]",
+            "[::]:80",
+            "[::ffff:0.0.0.0]",
+            "127.0.0.1",
+            "127.1.2.3",
+            "[::1]",
+            "::1",
+            "[::ffff:127.0.0.1]",
+        ] {
+            let err = s(&[e]).unwrap_err();
+            assert!(err.contains(&format!("\"{e}\"")), "{e}: {err}");
+            let err = s(&["a.test", e]).unwrap_err();
+            assert!(err.contains(&format!("\"{e}\"")), "{e}: {err}");
+        }
+        for e in [
+            "*.example.test",
+            "*.a1.example.test",
+            "*.0xide.example.test",
+            "api.example.test:443",
+            "127.0.0.1:19201",
+            "10.0.0.5",
+            "[::1]:8080",
+        ] {
+            assert_eq!(s(&[e]).unwrap(), [e], "{e}");
+        }
+        // with_hosts honours what a ledger restored.
+        let c = cfg(NetworkMode::DenyAll, &[], &[], &[]);
+        assert!(Policy::with_hosts(&c, &["*.com".to_string()]).is_ok());
     }
 
     #[test]

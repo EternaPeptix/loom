@@ -16,7 +16,8 @@
 //!    answer is the "already running" sentence below (pid and address from `daemon.json` when it is readable
 //!    and its pid is alive; otherwise the sentence says the daemon is starting and its address is not written yet).
 //!    `Config::load(paths.config_file())`, then
-//!    `check()`; an error is returned as `{path}: {error}`.
+//!    `check()`; an error is returned as `{path}: {error}`. Then `check_model_keys(paths.model_keys_dir())`;
+//!    its error is returned as it is (the key files are read again by the model clients in step 5).
 //! 2. If `daemon.json` exists and its `pid` is alive (`libc::kill(pid, 0)` succeeds or fails with
 //!    `EPERM`) and `GET http://{bind}/healthz` answers within 2 s: return `A loom daemon is already
 //!    running for {home} (pid {pid}, {bind}).` A stale file is removed.
@@ -43,11 +44,25 @@
 //! prove it holds the token, `/healthz?nonce=`, unless `--unverified-daemon`): `Ok(Already)`. A listener that answers
 //! without the proof is refused with the identity sentence (no child is started, `daemon.json` is left alone; the
 //! same in `run_until`). Otherwise `prepare_home(paths)` (as in step 1 of `run`) and start
-//! `std::env::current_exe()` with the single argument `daemon`, `LOOM_HOME` set to `paths.home`,
-//! stdin `/dev/null`, stdout and stderr appended to `{logs}/loomd.log` (`open_daemon_log`: created 0600 when
+//! `std::env::current_exe()` with the single argument `daemon` and only the environment
+//! `daemon_env(&config, std::env::vars_os(), &paths.home)` (`env_clear` first), stdin `/dev/null`, stdout and stderr appended to `{logs}/loomd.log` (`open_daemon_log`: created 0600 when
 //! missing), in its own session (`pre_exec` + `libc::setsid`) so it outlives the terminal. Then poll `healthz` every 100 ms for
 //! up to 20 s. If the child exits first or the time runs out: `Err` with `The daemon did not come
 //! up. Last lines of {log}:` followed by the log's last 15 lines.
+//!
+//! ## `daemon_env(config, parent, home)` — the environment `loom up` gives the daemon
+//! From `parent` (`loom up`'s own variables, `OsString` pairs, values kept as they are), only the
+//! variables named `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `TZ`, `TMPDIR`, `LOOM_LOG`,
+//! `RUST_BACKTRACE`, any name that starts with `LC_`, every model profile's `api_key_env`, and every
+//! `sandbox.env_pass` name; then `LOOM_HOME` = `home` (replacing one from `parent`). Nothing else: a
+//! secret exported in the shell (`GITHUB_TOKEN`, `AWS_*`, …), proxy variables and loader variables
+//! (`DYLD_*`) do not reach the daemon, where any command could read them from the environment the
+//! daemon was started with (macOS `KERN_PROCARGS2`) and where commands and the notify command would
+//! inherit them. The `api_key_env` variables are kept so that existing configurations keep working;
+//! `Config::key_env_warnings` says what that exposes. A daemon started by launchd gets the plist's
+//! variables (below) and launchd's own, and a `loom daemon` run straight from a shell keeps that
+//! shell's whole environment: neither is changed, and the start warnings (runtime) name the variables in
+//! it that look like secrets.
 //!
 //! ## `launch_agent_plist(exe, home)` — for `loom service install` (macOS)
 //! A LaunchAgent property list with `Label` [`SERVICE_LABEL`], `ProgramArguments` `[exe, "daemon"]`,
@@ -63,15 +78,24 @@
 //! is 0600; cancelling `stop` returns `Ok` and removes `daemon.json`; a second `run` against a live
 //! first one is refused with the sentence above; a stale `daemon.json` is replaced; an invalid
 //! config is reported with its path; the plist (escaping, both paths present); `prepare_home` tightens a
-//! 0755 home and makes the top-level directories 0700.
+//! 0755 home and makes the top-level directories 0700; a profile whose key file is missing stops `run_until`
+//! with a sentence naming the profile and the file. `daemon_env`: keeps each listed name, an `LC_` name, a
+//! profile's `api_key_env` and an `env_pass` name; drops `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`,
+//! `HTTP_PROXY`, `ALL_PROXY`, `DYLD_INSERT_LIBRARIES` and an unlisted `FOO`; sets `LOOM_HOME` over a
+//! parent's. `daemon_command(program, config, home)` (the `Command` `spawn_background` starts from, before
+//! it adds the argument, stdio and `setsid`), run with `/usr/bin/env` as `program`, prints exactly
+//! `daemon_env`'s variables, so `env_clear` is in force.
 
 use crate::api::{self, ApiState};
 use crate::auth;
 use crate::wire::DaemonFile;
 use loom_agent::runtime::Runtime;
 use loom_core::config::{Config, ConfigError, Paths};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::future::IntoFuture;
 use std::net::SocketAddr;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -119,6 +143,7 @@ pub async fn run_until(paths: Paths, stop: CancellationToken, ready: impl FnOnce
     prepare_home(&paths)?;
     let _home_lock = take_home_lock(&paths)?;
     let mut config = load_config(&paths)?;
+    config.check_model_keys(&paths.model_keys_dir())?;
     loom_tools::sandbox::preflight(&config.sandbox)?;
 
     if let Some(file) = read_daemon_file(&paths) {
@@ -226,6 +251,39 @@ pub fn open_daemon_log(paths: &Paths) -> Result<(PathBuf, std::fs::File), String
     Ok((log, file))
 }
 
+/// Variables of `loom up`'s environment that the daemon keeps, besides `LC_*`, the profiles' `api_key_env` and
+/// `sandbox.env_pass`.
+const DAEMON_ENV_KEEP: &[&str] =
+    &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TZ", "TMPDIR", "LOOM_LOG", "RUST_BACKTRACE"];
+
+/// The environment `loom up` gives the daemon: from `parent` only the variables of `DAEMON_ENV_KEEP`, those
+/// starting with `LC_`, every profile's `api_key_env` and every `sandbox.env_pass` name; then `LOOM_HOME` =
+/// `home`. Nothing else, so a secret exported in the shell does not become readable by commands through the
+/// daemon's environment.
+pub fn daemon_env(
+    config: &Config,
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+    home: &Path,
+) -> BTreeMap<OsString, OsString> {
+    let mut named: BTreeSet<&str> = DAEMON_ENV_KEEP.iter().copied().collect();
+    named.extend(config.models.values().filter_map(|p| p.api_key_env.as_deref()));
+    named.extend(config.sandbox.env_pass.iter().map(String::as_str));
+    let mut env: BTreeMap<OsString, OsString> = parent
+        .into_iter()
+        .filter(|(name, _)| name.as_bytes().starts_with(b"LC_") || name.to_str().is_some_and(|n| named.contains(n)))
+        .collect();
+    env.insert("LOOM_HOME".into(), home.as_os_str().to_owned());
+    env
+}
+
+/// The `Command` for the daemon's program before `spawn_background` adds the argument, stdio and `setsid`:
+/// an empty environment plus `daemon_env` of this process's.
+pub fn daemon_command(program: &Path, config: &Config, home: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.env_clear().envs(daemon_env(config, std::env::vars_os(), home));
+    command
+}
+
 /// Start the daemon in the background and wait until it answers.
 pub async fn spawn_background(paths: &Paths) -> Result<Spawned, String> {
     let config = load_config(paths)?;
@@ -236,8 +294,8 @@ pub async fn spawn_background(paths: &Paths) -> Result<Spawned, String> {
     let (log, out) = open_daemon_log(paths)?;
     let err = out.try_clone().map_err(|e| format!("Cannot open {}: {e}.", log.display()))?;
     let exe = std::env::current_exe().map_err(|e| format!("Cannot find the loom program to start: {e}."))?;
-    let mut command = std::process::Command::new(&exe);
-    command.arg("daemon").env("LOOM_HOME", &paths.home).stdin(Stdio::null()).stdout(out).stderr(err);
+    let mut command = daemon_command(&exe, &config, &paths.home);
+    command.arg("daemon").stdin(Stdio::null()).stdout(out).stderr(err);
     // SAFETY: the closure only calls `setsid`, which is async-signal-safe.
     unsafe {
         command.pre_exec(|| if libc::setsid() < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
@@ -796,6 +854,109 @@ mod tests {
         assert!(err.starts_with(&file.display().to_string()) && err.contains("loopback"), "{err}");
         assert!(!h.paths.home.join("daemon.json").exists());
         let _ = &h.dir;
+    }
+
+    #[tokio::test]
+    async fn a_missing_key_file_stops_the_daemon_naming_the_profile_and_file() {
+        let h = home_with("api_key_file = \"mock\"\n").await;
+        let err = run_until(h.paths.clone(), CancellationToken::new(), |_| {}).await.unwrap_err();
+        let file = h.paths.model_keys_dir().join("mock");
+        assert!(err.starts_with("models.mock: ") && err.contains(&file.display().to_string()), "{err}");
+        assert!(!h.paths.home.join("daemon.json").exists());
+    }
+
+    fn os_pairs(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        pairs.iter().map(|(k, v)| (OsString::from(k), OsString::from(v))).collect()
+    }
+
+    fn env_config() -> Config {
+        let mut c = Config::default();
+        c.models.insert(
+            "m".into(),
+            loom_core::config::ModelProfile { api_key_env: Some("MY_MODEL_KEY".into()), ..Default::default() },
+        );
+        c.sandbox.env_pass = vec!["PASS_ME".into()];
+        c
+    }
+
+    #[test]
+    fn daemon_env_keeps_the_allowlist_and_drops_the_rest() {
+        let parent = os_pairs(&[
+            ("PATH", "/usr/bin"),
+            ("HOME", "/h"),
+            ("USER", "u"),
+            ("LOGNAME", "u"),
+            ("SHELL", "/bin/zsh"),
+            ("LANG", "C"),
+            ("TZ", "UTC"),
+            ("TMPDIR", "/t"),
+            ("LOOM_LOG", "debug"),
+            ("RUST_BACKTRACE", "1"),
+            ("LC_ALL", "C"),
+            ("LC_CTYPE", "C"),
+            ("MY_MODEL_KEY", "sk-x"),
+            ("PASS_ME", "yes"),
+            ("LOOM_HOME", "/elsewhere"),
+            ("GITHUB_TOKEN", "t"),
+            ("AWS_SECRET_ACCESS_KEY", "t"),
+            ("HTTP_PROXY", "http://p"),
+            ("ALL_PROXY", "http://p"),
+            ("DYLD_INSERT_LIBRARIES", "/x.dylib"),
+            ("FOO", "bar"),
+        ]);
+        let env = daemon_env(&env_config(), parent, Path::new("/loom/home"));
+        let names: Vec<&str> = env.keys().filter_map(|k| k.to_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+                "LOGNAME",
+                "LOOM_HOME",
+                "LOOM_LOG",
+                "MY_MODEL_KEY",
+                "PASS_ME",
+                "PATH",
+                "RUST_BACKTRACE",
+                "SHELL",
+                "TMPDIR",
+                "TZ",
+                "USER"
+            ]
+        );
+        assert_eq!(env[&OsString::from("LOOM_HOME")], OsString::from("/loom/home"));
+        assert_eq!(env[&OsString::from("MY_MODEL_KEY")], OsString::from("sk-x"));
+    }
+
+    #[test]
+    fn daemon_command_runs_with_exactly_the_daemon_env() {
+        let env_bin = Path::new("/usr/bin/env");
+        if !env_bin.exists() {
+            return;
+        }
+        let config = env_config();
+        let home = Path::new("/loom/home");
+        let out = daemon_command(env_bin, &config, home).output().unwrap();
+        assert!(out.status.success());
+        let mut printed: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
+        printed.sort();
+        let mut expected: Vec<String> = daemon_env(&config, std::env::vars_os(), home)
+            .into_iter()
+            .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+            .collect();
+        expected.sort();
+        // Values with a newline would split into several lines on both sides alike; compare names only for them.
+        let names = |v: &[String]| {
+            v.iter()
+                .filter(|l| l.contains('='))
+                .map(|l| l.split('=').next().unwrap_or("").to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&printed), names(&expected));
+        assert!(printed.contains(&"LOOM_HOME=/loom/home".to_string()), "{printed:?}");
+        assert!(printed.iter().all(|l| !l.starts_with("DYLD_") && !l.starts_with("HTTP_PROXY=")), "{printed:?}");
     }
 
     #[tokio::test]

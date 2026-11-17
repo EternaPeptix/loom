@@ -64,6 +64,7 @@ default. Unknown keys are errors, so a typo does not go unnoticed. The values th
   with both at 300 the notice matters only for a longer window or `retry_window_s = 0`.
 - `[context] target_tokens` and `floor_tokens`: a re-weave folds old output out of view when the prompt
   passes the target, down to the floor. A session clamps both to a smaller model window automatically.
+- An API key, when the server wants one: see *Model API keys* below.
 - `[network] mode`: `deny_all` (the default), `allowlist` or `open`; see below.
 - `[sandbox] protect_credentials` (default `true`): see below.
 - `[tools] speculate` (default `true`): the leading read-only calls of a reply (`read`, `glob`, `grep`,
@@ -72,6 +73,50 @@ default. Unknown keys are errors, so a typo does not go unnoticed. The values th
   whole reply has arrived.
 - `reasoning_effort` and the other `extra_body` fields are fixed for a session's life (the chat
   template may render them into the prompt head, so changing them mid-session would break the cache).
+
+### Model API keys
+
+Keep a hosted model's key in a file under the loom home, which commands cannot read:
+
+```
+mkdir -p -m 700 ~/.loom/keys/models
+(umask 077; cat > ~/.loom/keys/models/hosted)   # paste the key, press Return, then Ctrl-D
+```
+
+and name the file (not a path) in the profile:
+
+```
+[models.hosted]
+base_url = "https://api.example.test/v1"
+model = "some-model"
+api_key_file = "hosted"
+```
+
+The file must be yours, a regular file (not a link) and mode 0600; white space around the key is
+ignored. The daemon reads it once when it starts, and refuses to start, naming the profile and the file,
+when it cannot use it. `loom config check` reads it too.
+
+`api_key_env = "VAR"` (the key in the variable `VAR` of the daemon's environment) still works, but every
+process of yours, sandboxed commands included, can read the environment a process was started with, so
+the key is readable by the commands the model runs. `loom up`, `loom config check` and the daemon's log
+warn about each such profile, and `loom service install` refuses it (a login service does not have your
+shell's variables). To move a key that is exported in your shell, for example from `~/.zshrc`:
+
+```
+mkdir -p -m 700 ~/.loom/keys/models
+(umask 077; printenv VAR > ~/.loom/keys/models/hosted)
+```
+
+then replace `api_key_env = "VAR"` with `api_key_file = "hosted"` in `[models.hosted]`, run
+`loom config check`, and restart the daemon (`loom down`, then `loom up`). Remove the export from your
+shell's start files once no profile names it.
+
+`loom up` starts the daemon with only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TZ`,
+`TMPDIR`, `LOOM_LOG`, `RUST_BACKTRACE`, the `api_key_env` variables of your profiles and the variables
+listed in `[sandbox] env_pass`, so the rest of your shell's environment (tokens, cloud credentials,
+proxy settings) does not reach the daemon or the commands it runs. List in `env_pass` a variable the
+commands need, such as `JAVA_HOME`. Model requests ignore `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
+the system's proxy settings: they go to `base_url` only.
 
 ### Network
 
@@ -92,7 +137,17 @@ A session can also be given hosts by you while it runs. When it needs one it doe
 calls `request_scope`; an item naming the hosts and why waits in your inbox, and the session keeps
 working. `loom scope <session> <host>...` grants them (the UI and the app have an Approve button on the
 item). The grant is recorded in the mission's ledger, applies to that mission only, and ends with the
-session. `loom net <session>` lists the hosts granted so far.
+session. `loom net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
+granted hosts; the `allow` list stays off. `*`, a wildcard over a whole top-level domain (`*.com`) or
+over IP addresses (`*.0.1`), the unspecified address (`0.0.0.0`, `::`) and a loopback address without a
+port (`127.0.0.1`; write `127.0.0.1:8080`) cannot be requested or granted: name the hosts, or a wildcard
+under a domain (`*.example.test`), or set the mode in the config.
+
+Each session's commands reach the proxy on a port of that session's own, and the proxy accepts a
+session's credentials only on that port and never connects to its own ports, so a command that reads
+another session's proxy credentials (from the environment another command was started with) cannot use
+them. A session's port is never given to another session while the daemon runs.
+`loopback_all = true` lets commands connect to every port, these included: see `SECURITY.md`.
 
 ### Sandbox
 
