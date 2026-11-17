@@ -267,14 +267,18 @@ impl Tool for SecurityRecord {
             return ToolOutput::error(e);
         }
         // Shared::ledger_append serializes all structural validation and writes under the journal lock.
+        let applied = op.clone();
         match self.0.ledger_append(false, LedgerOp::Security(op)) {
             Ok((entry, state)) => {
+                // The ids the operation names or creates, whatever the state held.
+                let mut addressed = SecurityState::default();
+                addressed.apply(&applied, entry.n, &entry.session);
                 let mut result = Map::new();
                 result.insert("entry".into(), json!(entry.n));
                 if !notes.is_empty() {
                     result.insert("normalized".into(), json!(notes));
                 }
-                result.extend(touched_report(&before, &state.security));
+                result.extend(touched_report(&before, &state.security, &addressed));
                 output(&result)
             }
             Err(e) if expanded => ToolOutput::error(format!(
@@ -307,15 +311,31 @@ const KEYED: [&str; 13] = [
     "aliases",
 ];
 
-/// What a write changed, as the result fields `recorded`, `removed`, `counts` and `more` (see CONTRACT):
-/// per collection the keys whose value differs between `before` and `after`, the ids that are gone, and
-/// the size of each non-empty collection after the write.
-fn touched_report(before: &SecurityState, after: &SecurityState) -> Map<String, Value> {
+/// The longest id, in characters, the counts-and-ids form names.
+const RECORDED_ID_CHARS: usize = 80;
+
+/// `s` cut to at most `max` characters, on a character boundary.
+fn cut_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// Characters of `recorded` as the result prints it (pretty JSON).
+fn pretty_chars(recorded: &Map<String, Value>) -> usize {
+    serde_json::to_string_pretty(recorded).map(|t| t.chars().count()).unwrap_or(usize::MAX)
+}
+
+/// What a write changed, as the result fields `recorded`, `unchanged`, `removed`, `counts` and `more` (see
+/// CONTRACT): per collection the keys whose value differs between `before` and `after`, the addressed ids
+/// (`addressed` is a default state the operation was applied to) that the write left as they were, the ids
+/// that are gone, and the size of each non-empty collection after the write.
+fn touched_report(before: &SecurityState, after: &SecurityState, addressed: &SecurityState) -> Map<String, Value> {
     let (before, after) = (json!(before), json!(after));
     let empty = Map::new();
     let mut touched: Map<String, Value> = Map::new();
     let mut removed: Map<String, Value> = Map::new();
     let mut counts: Map<String, Value> = Map::new();
+    let mut unchanged: Map<String, Value> = Map::new();
+    let addressed = json!(addressed);
     for name in KEYED {
         let old = before.get(name).and_then(Value::as_object).unwrap_or(&empty);
         let new = after.get(name).and_then(Value::as_object).unwrap_or(&empty);
@@ -331,6 +351,19 @@ fn touched_report(before: &SecurityState, after: &SecurityState) -> Map<String, 
         if !new.is_empty() {
             counts.insert(name.into(), json!(new.len()));
         }
+        let same: Vec<Value> = addressed
+            .get(name)
+            .and_then(Value::as_object)
+            .map(|a| {
+                a.keys().filter(|id| new.contains_key(*id) && touched.get(name).is_none_or(|t| t.get(*id).is_none()))
+            })
+            .into_iter()
+            .flatten()
+            .map(|id| json!(id))
+            .collect();
+        if !same.is_empty() {
+            unchanged.insert(name.into(), Value::Array(same));
+        }
     }
     let old = before.get("unlocked").and_then(Value::as_array).cloned().unwrap_or_default();
     let new = after.get("unlocked").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -341,29 +374,50 @@ fn touched_report(before: &SecurityState, after: &SecurityState) -> Map<String, 
     if !new.is_empty() {
         counts.insert("unlocked".into(), json!(new.len()));
     }
-    let size = serde_json::to_string(&touched).map(|t| t.chars().count()).unwrap_or(usize::MAX);
-    let recorded: Map<String, Value> = if size <= RECORDED_CHARS {
+    for name in ["died", "retraction_limitation"] {
+        let new = after.get(name).filter(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()));
+        if let Some(new) = new.filter(|v| before.get(name) != Some(*v)) {
+            touched.insert(name.into(), new.clone());
+        }
+    }
+    let recorded: Map<String, Value> = if pretty_chars(&touched) <= RECORDED_CHARS {
         touched
     } else {
-        touched
-            .into_iter()
-            .map(|(name, records)| {
-                let ids: Vec<Value> = match &records {
-                    Value::Object(m) => m.keys().take(RECORDED_IDS).map(|id| json!(id)).collect(),
-                    Value::Array(a) => a.iter().take(RECORDED_IDS).cloned().collect(),
-                    _ => Vec::new(),
-                };
-                let count = match &records {
-                    Value::Object(m) => m.len(),
-                    Value::Array(a) => a.len(),
-                    _ => 0,
-                };
-                (name, json!({"count": count, "ids": ids}))
-            })
-            .collect()
+        // Counts and ids; `unlocked`, `died` and the limitation text are named by count or a short cut.
+        let form = |with_ids: bool| -> Map<String, Value> {
+            touched
+                .iter()
+                .map(|(name, records)| {
+                    let count = match records {
+                        Value::Object(m) => m.len(),
+                        Value::Array(a) => a.len(),
+                        _ => 1,
+                    };
+                    let keyed = KEYED.contains(&name.as_str());
+                    let ids: Vec<Value> = match records {
+                        Value::Object(m) if with_ids && keyed => {
+                            m.keys().take(RECORDED_IDS).map(|id| json!(cut_chars(id, RECORDED_ID_CHARS))).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let entry =
+                        if keyed && with_ids { json!({"count": count, "ids": ids}) } else { json!({"count": count}) };
+                    (name.clone(), entry)
+                })
+                .collect()
+        };
+        let full = form(true);
+        if pretty_chars(&full) <= RECORDED_CHARS {
+            full
+        } else {
+            form(false)
+        }
     };
     let mut report = Map::new();
     report.insert("recorded".into(), Value::Object(recorded));
+    if !unchanged.is_empty() {
+        report.insert("unchanged".into(), Value::Object(unchanged));
+    }
     if !removed.is_empty() {
         report.insert("removed".into(), Value::Object(removed));
     }
@@ -743,7 +797,7 @@ mod tests {
         after.aliases.remove("db");
         after.revisited.insert("r1".into(), 4);
         after.unlocked.insert(Condition { kind: ConditionKind::Cred, value: "admin".into() });
-        let report = touched_report(&before, &after);
+        let report = touched_report(&before, &after, &SecurityState::default());
         assert_eq!(report["removed"]["aliases"], json!(["db"]), "{report:?}");
         assert_eq!(report["recorded"]["revisited"], json!({"r1": 4}), "{report:?}");
         assert_eq!(report["recorded"]["unlocked"].as_array().map(Vec::len), Some(1), "{report:?}");
@@ -1015,5 +1069,97 @@ mod tests {
             assert_eq!(res.status, Status::Error);
             assert!(res.text.contains(super::super::NO_MISSION));
         }
+    }
+
+    #[tokio::test]
+    async fn a_fact_retraction_reports_the_conclusions_that_died() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        let rule = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"rule_install","rule":{"name":"v","head":{"predicate":"viable","args":["?x"]},
+                    "body":[{"atom":{"predicate":"seen","args":["?x"]},"negated":false}]}}}),
+            )
+            .await;
+        assert_eq!(rule.status, Status::Ok, "{}", rule.text);
+        let asserted = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"fact_assert","fact":{"predicate":"seen","args":["dummy"]},"evidence":["e1"]}}),
+            )
+            .await;
+        assert_eq!(asserted.status, Status::Ok, "{}", asserted.text);
+        let id = r.shared.ledger().unwrap().security.facts.keys().next().unwrap().clone();
+        let res =
+            r.call("security_record", json!({"operation":{"action":"fact_retract","id":id,"reason":"mistaken"}})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(!r.shared.ledger().unwrap().security.died.is_empty());
+        let body = body_json(&res.text);
+        assert!(body["recorded"]["died"].to_string().contains("viable"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_hypothesis_open_names_the_hypothesis_id_as_unchanged() {
+        let r = rig("lead", false, true);
+        let op =
+            json!({"operation":{"action":"hypothesis_open","hypothesis":{"statement":"candidate","priority":"high"}}});
+        let first = r.call("security_record", op.clone()).await;
+        assert_eq!(first.status, Status::Ok, "{}", first.text);
+        let again = r.call("security_record", op).await;
+        assert_eq!(again.status, Status::Ok, "{}", again.text);
+        let id = stable_id("hy", &["candidate"]);
+        let body = body_json(&again.text);
+        assert_eq!(body["unchanged"]["hypotheses"], json!([id]), "{body}");
+        let first = body_json(&first.text);
+        assert!(first.get("unchanged").is_none(), "{first}");
+    }
+
+    #[tokio::test]
+    async fn an_upsert_of_a_known_asset_names_its_canonical_id_as_unchanged() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        let first = r.call("security_record", json!({"operation": upsert("example.test")})).await;
+        assert_eq!(first.status, Status::Ok, "{}", first.text);
+        let again = r.call("security_record", json!({"operation": upsert("Example.TEST.")})).await;
+        assert_eq!(again.status, Status::Ok, "{}", again.text);
+        let id = r.shared.ledger().unwrap().security.assets.keys().next().unwrap().clone();
+        let body = body_json(&again.text);
+        assert_eq!(body["unchanged"]["assets"], json!([id]), "{body}");
+    }
+
+    #[test]
+    fn the_over_bound_form_stays_near_the_bound_with_long_conditions_and_keys() {
+        let before = SecurityState::default();
+        let mut after = before.clone();
+        for i in 0..64 {
+            after
+                .unlocked
+                .insert(Condition { kind: ConditionKind::Cred, value: format!("{i:02}{}", "v".repeat(4000)) });
+        }
+        for i in 0..40 {
+            after.aliases.insert(format!("{i:02}{}", "k".repeat(1000)), "x".into());
+        }
+        let report = touched_report(&before, &after, &SecurityState::default());
+        let recorded = report["recorded"].as_object().unwrap();
+        let size = serde_json::to_string_pretty(recorded).unwrap().chars().count();
+        assert!(size <= RECORDED_CHARS, "`recorded` is {size} characters (bound {RECORDED_CHARS})");
+        assert_eq!(recorded["unlocked"], json!({"count": 64}), "{recorded:?}");
+        assert_eq!(recorded["aliases"]["count"], 40, "{recorded:?}");
+    }
+
+    #[test]
+    fn the_counts_and_ids_form_cuts_ids_to_80_characters() {
+        let before = SecurityState::default();
+        let mut after = before.clone();
+        for i in 0..30 {
+            after.aliases.insert(format!("{i:02}{}", "é".repeat(500)), "x".into());
+        }
+        let report = touched_report(&before, &after, &SecurityState::default());
+        let ids = report["recorded"]["aliases"]["ids"].as_array().unwrap();
+        assert_eq!(ids.len(), RECORDED_IDS);
+        assert!(ids.iter().all(|id| id.as_str().unwrap().chars().count() == 80), "{ids:?}");
     }
 }
