@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### The monitor: specification and contracts (phase P0; no behaviour change)
+
+- New `docs/MONITOR.md`: the normative specification of the adversarial monitor and "keep going" (threat model and
+  taxonomy, the deterministic floor E1 to E4, tripwires TW-01 to TW-28, canaries, the reviewer's contract, the response
+  ladder with its durable pause, the gate, keep-going's conditions, records, routes, commands, evaluation, the phased
+  build plan, the operator's decisions D1 to D18 of 2026-11-16 and the residual risks X1 to X17).
+- `docs/DESIGN.md` gains §15 "Monitor" (overview and the principles it enforces) and the matching notes in §3 (the
+  `monitor/` directory, `keys/monitor.key`, `keep_going` as a cache in `meta.json`), §8 (loom review as a way to park the
+  operator) and §12 (the monitor's routes, specified and not yet served), and a Roadmap entry. `SECURITY.md` gains the
+  monitor's threat model and residual risks X1 to X17. `docs/config.example.toml` shows, commented out, the `[monitor]`,
+  `[keep_going]`, `[sandbox] allow_fetch_services` and profile keys (`family`, `alignment`, `recipient`, `purpose`) with
+  their defaults and the operator's fleet as a worked example: the daemon does not accept them yet.
+- New module `loom_agent::monitor` with CONTRACT comments and its vocabulary: categories, severities and response
+  levels; the monitor log's entry kinds; the tripwire table; gated classes; the review-input limits and fence and
+  redaction-tag formats; the `monitor_verdict` schema; lineage; the responder trait and the R3 sequence; keep-going's
+  parameters and limits; canaries; fleet joins; and the fixed sentences an agent may ever see. Nothing calls it; every
+  function a later phase fills returns `MonitorError::NotBuilt`, so a premature caller fails closed. No serialized shape,
+  route, command, configuration key or session record changed.
+
 ### Stored outputs are the mission's own
 
 - `out_read`, `out_grep`, `pin`, `evidence` and `finish` quotes, `security_record` secret handles,

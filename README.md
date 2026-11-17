@@ -230,6 +230,10 @@ see [CTF](packs/ctf/README.md), [Redteam](packs/redteam/README.md), and the
 `harnessmm` is an opt-in experimental pack for bounded guarded continuations. See
 [`docs/HARNESSMM.md`](docs/HARNESSMM.md) for its limits and evaluation protocol.
 
+The adversarial monitor (deterministic tripwires, a cross-family reviewer, a gate for irreversible actions, a durable
+pause, and the operator-armed "keep going") is specified in [`docs/MONITOR.md`](docs/MONITOR.md) and built in phases;
+this build has the specification and the contracts, and the daemon does not run it yet.
+
 ## Building and testing
 
 ```

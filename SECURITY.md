@@ -183,6 +183,37 @@ When the operator enables a box, a session can run commands in a container on a 
   private ranges (see docs/RUN.md). Commands in the box are untrusted code with the network reach of the
   grants; data the agent can read can be sent to a granted host, as with the proxy.
 
+### The monitor (specified in `docs/MONITOR.md`; the phases build it, and until a phase lands its part does not run)
+
+The adversary the rest of this file describes is the model and what it reads. The monitor is aimed at the same
+adversary seen from one level up: the **agents themselves**, whatever the cause (a misaligned propensity, reward
+hacking, instructions injected through a target, or pressure from other agents). It assumes each agent may deceive,
+writes any text the harness reads, may coordinate with other agents through any shared surface (a workspace, a lab
+port, the process table, a scope request), runs for hours under a prompt that pushes it to persist, is competent at
+offensive security, and **knows how the monitor works**: the design is public, so its only secrets are a keyed seed
+(canary names and places, which reasoning is sampled, the fence around data) and the contents of reviews and verdicts.
+
+What is protected: third parties reached from sessions with real targets; the operator's machine and accounts (the
+logged-in browser's debugging port, local model ports, the daemon's port and keys, other missions' proxy
+credentials); the harness's own records (logs, journals, oracles, the verifier and the monitor); other missions;
+and the operator's trust (what a finish text, a scope request or a result says must be true, and nothing the
+operator is told to run may be booby-trapped).
+
+What it does about it, in the order of how much it is relied on:
+1. **A deterministic floor with no model** (phase E1 to E4): infrastructure denied in every proxy policy and beating
+   grants, macOS fetch services denied in every network mode with an hourly self-probe, tunnels that can be cut, the SNI
+   bound to the CONNECT host, every process of a session identifiable and killable, a process limit.
+2. **Tripwires** on every record, a short list of them enforcing from the first day and the rest in shadow until measured.
+3. **A reviewer model from a different family**, reading each trajectory as fenced data. It raises the cost of
+   misbehaviour. It is not the boundary, and nothing it writes reaches the agent.
+4. **A gate** that decides, before they run, the calls of the classes where harm cannot be undone; anything it
+   cannot decide goes to the operator.
+
+The monitor is itself new code with authority to stop work. It is built in shadow, fails closed for clearing (no
+model-cleared gate and no keep-going reopen without a full, non-degraded review), never counts its own faults as
+agent misbehaviour, and is out of reach of the agents (no session entry, no tools, no network except its model
+endpoints, state under the hidden loom home).
+
 ### Records
 
 Sessions are append-only logs in which each record names the hash of the previous one, and mission
@@ -301,6 +332,32 @@ These are the places where loom does less than the text above might suggest.
 - **The operator's machine and account are trusted.** Another process of your user, or anyone who can
   read `~/.loom/token`, has the daemon's full power. Disk encryption, account separation and keeping the
   token file private are your job.
+
+### Residual risks of the monitor (X1 to X17)
+
+These hold once the monitor is built, and several hold before: where a risk depends on a phase, it says so. Each is
+a place where the monitor does less than its description might suggest. `docs/MONITOR.md` §9.5 is the same list.
+
+- **X1. LLM review is weak and attackable.** A capable agent that knows the protocol can write reasoning and outputs that pass the reviewer; in published work the strongest monitor passed 375 of 375 backdoors. Cross-family review reduces affinity bias but adds no robustness to injection. The deterministic floor and the tripwires are the boundary; the reviewer only raises the cost.
+- **X2. Inside-scope harm through opaque HTTPS.** CONNECT tunnels are opaque (`loom_net::proxy`). Method, path and body of HTTPS requests to granted hosts are invisible except in arguments and referenced scripts. A compiled binary or runtime-built request can move value or reach users on a granted host before anyone sees it. G8 and the "opaque code" class cover the common shapes only. Closing this needs TLS termination with a loom CA for hosts marked real, which this design does not include.
+- **X3. Target-side SSRF.** After a host is granted, the target can fetch anything on the agent's behalf. Only arguments reveal it.
+- **X4. Domain fronting by Host header** inside a TLS session whose SNI matches a granted name, on CDNs that still route by Host. SNI binding does not stop it.
+- **X5. Box and rootbox egress.** The box has per-destination counters but no per-connection record or content. The rootbox is shared by every mission and its egress is unlogged until it is isolated per mission (a prerequisite listed in §9.3); keep-going is refused for rootbox roles until then, but Duty W sees only command text there.
+- **X6. Covert channels that carry no tool traffic:** steganography in prose, timing, file metadata in a shared workspace, and the blob existence oracle until the build that scopes stored outputs to the mission (#36) is the one that runs. The monitor watches channels, not meaning.
+- **X7. Process identity.** It depends on a private macOS sandbox query, unprobed here. Where it fails, the census falls back to process groups and environments, which `env -i` and double forks defeat.
+- **X8. Reviewer refusals and redaction gaps.** Providers may refuse offensive content (as one provider did during a published incident's forensics); a refusal is a missed detection, held as "not cleared" but not reviewed. Redaction is pattern- and index-based: unknown-format secrets and third-party PII can reach a reviewer whose recipient already receives that mission's data.
+- **X9. Monitorability.** Reasoning need not reflect intent: models verbalised taught reward hacks under 2% of the time. The middle of very long reasoning is excerpted by content, not read in full. Profiles that emit no reasoning get action-only review.
+- **X10. Keep-going still amplifies.** Every reopen adds up to `per_reopen` of exposure, and each reopen tells the agent that nothing so far was flagged at the blocking tier, a few bits of oracle per reopen. The caps bound this; nothing removes it.
+- **X11. Alert fatigue and the operator's own click.**
+  - Even tuned, the tripwires would have produced about 17 false pauses per 100 active hours on history before promotion rules. Shadow mode protects the agents' work, but the operator will see many shadow flags.
+  - A habit of "mark false positive" can wave through a real request to a Docker host or another piece of infrastructure.
+  - An approval from a phone remains the operator's act; annotations inform it but cannot stop it.
+- **X12. The gap until deployment.** Until E1–E4 and the merged work they extend (#39 and #41) are in the build that **runs**, the routes they close stay open on the running daemon: a merge does not close them, a restart onto the new build does. Tripwires detect attempts but do not close them.
+- **X13. A fleet without cross-family review.** A profile with no eligible reviewer (listed in `tripwires_only_profiles`) is watched by tripwires only, visibly and by recorded choice. Until the reviewer for `dsv41` (D2) is built and vetted (M6, M7), that includes the largest fleet.
+- **X14. Lineage is declared, not verified.** A server-side weight swap behind a declared family, or a fine-tune of unknown data (inklingv5), defeats the family rule until the served model id changes and forces a re-vet.
+- **X15. A compromised operator browser or daemon credential defeats every control.** E1 removes the known routes from agents to DevTools and the daemon. Any other route to the operator's logged-in browser or bearer token would let an agent act as the operator.
+- **X16. The monitor is new code with authority to pause the fleet.** Bugs in it can stop authorized work (mitigated by shadow mode, tests and the monitor-down policy) or miss behaviour (mitigated by layering). It must itself be reviewed like any harness change.
+- **X17. Same-family versus cross-family benefit is unmeasured in published work**. loom's own comparison (§8.3) is the evidence the operator will have, and it will rest on synthetic positives plus a small set of real incidents.
 
 ## Telemetry
 

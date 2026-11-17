@@ -10,6 +10,8 @@
 //! - [`texts`] everything the step loop itself says to the model
 //! - [`session`] one session: its log, its step loop, and its reactions to what happens to it
 //! - [`runtime`] every session of a loom home: starting, restoring, parents and children, the operator's actions
+//! - [`monitor`] the adversarial monitor: tripwires, reviewer, gate, durable pause, keep going (specified in
+//!   `docs/MONITOR.md`; phase P0 has the contracts and vocabulary only, and nothing calls it)
 //! - [`evalkit`] scripted models played against the runtime, and the scorecard of each run
 
 pub mod continuation;
@@ -17,6 +19,7 @@ pub mod evalkit;
 pub mod frontier;
 pub mod gate;
 pub mod hud;
+pub mod monitor;
 pub mod pack;
 pub mod prior;
 pub mod rtools;

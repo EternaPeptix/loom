@@ -137,3 +137,86 @@ copy_max_mb = 20480        # nor one with more MiB of file content, where a copy
 [notify]
 # command = ["/usr/local/bin/my-notify"]   # program run per notification, given LOOM_KIND, LOOM_SESSION, LOOM_TITLE and LOOM_TEXT in its environment; default: the platform's notifier (macOS only; elsewhere nobody is notified)
 repeat_minutes = 0         # re-notify an unanswered blocking item this often; 0 = never (example: 30)
+
+# ---------------------------------------------------------------------------------------------------
+# The adversarial monitor (docs/MONITOR.md). NOT YET ACCEPTED by this build: the daemon rejects unknown
+# keys, so these tables stay commented until the phase that adds them (M1 for the profile keys, M2 for
+# [monitor], M9 for [keep_going], E2 for sandbox.allow_fetch_services) says so in CHANGELOG.md. They are
+# written down now so the defaults and one worked example exist in one place.
+#
+# Defaults (every key below is shown with its default unless a comment says "example"):
+#
+# [monitor]
+# enabled = true                      # Duty W; S4 tripwires and canaries cannot be disabled
+# mode = "shadow"                     # starting state; a tripwire is promoted per cause (loom monitor promote)
+# reviewers = []                      # profile names, in preference order; example below
+# tripwires_only_profiles = []        # profiles with no eligible reviewer, named on purpose (shown as "not LLM-reviewed")
+# gate = true
+# gate_timeout_s = 90
+# gate_queue_max_s = 30
+# step_every_calls = 8
+# step_every_s = 120
+# fleet_every_s = 300
+# unreviewed_pause_min = 60           # real-target and relaxed-agent missions only
+# review_max_tokens = 48000
+# repeat_minutes = 30
+# canaries = true
+# retention_days = 30                 # review inputs under <home>/monitor/inputs, collected by `loom gc`
+# monitor_down = "pause_real_targets" # or "notify"
+#
+# [monitor.recipients]                # per-pack consent to a reviewer that is a new data recipient
+# ctf = []
+# core = []
+#
+# [monitor.content]
+# new_recipient_real_targets = "features"   # or "redacted"; secrets are redacted in every case
+#
+# [monitor.capacity.<endpoint profile>]     # keyed by endpoint: every profile on that base_url shares it
+# gate_slots = 1
+# review_slots = 1
+#
+# [keep_going]                        # defaults only; there is no "on" key: the operator arms a mission
+# max_reopens = 3                     # hard maximum 10
+# max_reopens_real_targets = 1        # hard maximum 3; also the cap for a relaxed agent
+# delay_s = 120                       # 30 to 3600
+# per_reopen_max_steps = 200          # mission-wide, summed over every session of the mission
+# per_reopen_max_minutes = 120
+#
+# [sandbox]
+# allow_fetch_services = false        # true marks egress unbounded and refuses keep-going
+#
+# Model profile keys (each profile): the model family as a set, whether its refusals are intact, who receives
+# its traffic, and whether it is a review profile. Left out, loom infers the family from the model name and
+# records that it did; an unknown alignment makes an agent profile count as relaxed and a reviewer ineligible;
+# a loopback base_url has the recipient `unknown` until you declare it.
+# [models.<name>]
+# family = ["deepseek"]
+# alignment = "stock"                 # "stock", "relaxed" or "unknown"
+# recipient = "lan"                   # "local", "lan" (a host you own) or a provider name such as "alibaba"
+# purpose = "review"                  # marks a review profile (own effort and max_tokens)
+#
+# Worked example (one operator's fleet, decided 2026-11-16; the profile names are theirs):
+#   - the LAN-hosted DeepSeek profile has no reviewer without a new recipient, so a Qwen model hosted by Alibaba reviews
+#     it, with the operator's consent for both packs, and real-target missions send it features only;
+#   - the four profiles hosted by Alibaba declare that provider as their recipient (it already receives their traffic);
+#   - Qwen agents are reviewed by a bounded-effort profile on the LAN endpoint; relaxed profiles are never reviewers.
+#
+# [monitor]
+# reviewers = ["qwen4max", "dsv41_review", "mistral"]
+# [monitor.recipients]
+# ctf = ["alibaba"]
+# core = ["alibaba"]
+# [monitor.content]
+# new_recipient_real_targets = "features"
+# [models.dsv41]
+# family = ["deepseek"]
+# alignment = "stock"
+# recipient = "lan"
+# [models.dsv41_review]               # same base_url as dsv41, bounded effort
+# purpose = "review"
+# family = ["deepseek"]
+# alignment = "stock"
+# recipient = "lan"
+# [models.necromicon]
+# family = ["kimi"]
+# alignment = "relaxed"

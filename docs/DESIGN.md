@@ -96,7 +96,7 @@ crates/
                sandbox
   loom-net     egress proxy, scope policy, chained audit file
   loom-agent   runtime: sessions and their step loop, stop and finish gates, runtime tools,
-               orchestration, HUD, packs, operator notifications
+               orchestration, HUD, packs, operator notifications, the monitor (§15)
   loom-daemon  HTTP/SSE API, authentication, CLI, embedded UI
 packs/         role packs: core (also built into the binary) and vr
 ui/            static web UI (no build step), embedded into the binary — docs/UI.md
@@ -118,12 +118,16 @@ keep the user's umask in the workspace); at start the daemon also tightens the h
 config.toml                          optional; every key has a default, unknown keys are errors
 token                                0600, the API bearer token (64 hex)
 keys/journal.key                     0600, HMAC key for ledger seals
+keys/monitor.key                     0600, HMAC key of the monitor log and of keyed redaction tags (§15; not written yet)
+monitor/log.jsonl                    the monitor's hash-chained, HMAC-sealed log (§15; not written yet)
+monitor/inputs/<sha256>              the exact rendered input of each review, content-addressed (§15; not written yet)
 daemon.lock                          0600, empty; locked by the running daemon, never removed
 daemon.json                          {pid, bind, started_ms} of the running daemon
 packs/<name>/                        installed packs (one named core replaces the built-in one)
 sessions/<sid>/log.jsonl             the session event log
 sessions/<sid>/log.jsonl.damaged-<ms>   bytes cut off a damaged log
-sessions/<sid>/meta.json             what the session is; fixed at creation except `archived`
+sessions/<sid>/meta.json             what the session is; fixed at creation except `archived` (and, once §15's keep-going is built,
+                                     `keep_going`, a cache that the monitor log overrides: the log, not this file, is authoritative)
 sessions/<sid>/status.json           its latest status
 sessions/<sid>/net.jsonl             its egress decisions, hash-chained
 sessions/<sid>/settlement.json       a child's settlement, kept for a delivery a restart cut
@@ -771,7 +775,8 @@ only when every check passes and, where verification is required, a verifier acc
     gave, instead of starting another. The verifier is marked as the gate's, with its brief, in its
     own `meta.json` before its first turn, so a crash cannot turn it into an ordinary agent.
 
-Only `report_blocker` (objective class), budget exhaustion and the operator's own release can park the
+Only `report_blocker` (objective class), budget exhaustion, the operator's own release and, once it is
+built, loom review (§15: the monitor's pause of a mission, whose item the operator answers) can park the
 operator: a rejected or unrunnable verification never opens a blocking item, and an operator's answer to
 an inbox item is never a release: it does not conclude the goal, settle an objection or move the count
 of rejections.
@@ -1503,6 +1508,15 @@ POST /api/gc                                  {apply?} → SweepReport
 POST /api/shutdown                            → 202 {}
 ```
 
+**Monitor routes (specified, not served).** The routes above are the ones this build serves. `docs/MONITOR.md` §7.5
+specifies those the monitor adds (`GET /api/monitor`, `GET /api/missions/{id}/monitor`, `POST
+/api/sessions/{id}/keep-going`, the flag, review, pause, observe-only, halt, promote, vet, replay and capacity routes, and
+`POST /api/missions/{id}/scope/revoke`), the `monitor` bus event (an unknown `type` is ignored by the UI and CLI) and
+the `monitor` fields of `StatusView` and `MissionInfo` (`#[serde(default)]`); each phase adds its routes to the list
+above and to the `api.rs` contract in the commit that serves them. Routes that mutate monitor state record the client
+(CLI token or web session), and the ones that lift a halt, promote a tripwire, set observe-only or an override need the
+API token, not a web-session secret.
+
 The wire types are `crate::wire` and the serde form of the runtime's types; `docs/UI.md` lists the
 conventions. **Records** are served as this build reads them: a known record is re-encoded field for
 field (fields an older line lacked appear with their defaults), and a record read as `Event::Unknown`
@@ -1715,6 +1729,78 @@ as workspace content.
   `LOOM_LANE` gives a run its own source copy and target directory on that host). Set
   `LOOM_BUILD_HOST` before using it: unset, the script falls back to a host name of its author's.
 
+## 15. Monitor (`loom-agent::monitor`; specification `docs/MONITOR.md`)
+
+*Status: specified in full in `docs/MONITOR.md`; phase P0 put the specification, the contracts and the vocabulary in the
+tree. Nothing in this section is enforced by the running daemon until the phase named for it in `docs/MONITOR.md` §9.1
+lands; each such phase updates the text here in the same commit. Until then the residual risks of `SECURITY.md` apply
+unchanged.*
+
+The agents are the adversary (`SECURITY.md`): whatever the cause, an agent may reach for something the operator did not
+authorize, and it can write every word the harness reads about it. §2 principle 8 already puts enforcement outside the
+agent's reach; the monitor extends it from "what a command can do" to "what a mission, and the agents of every mission
+together, are doing". It is one daemon-owned component with two duties.
+
+- **Duty W, watch and steer** (on by default, in shadow). Deterministic tripwires read every record of every session. A
+  short list of high-precision tripwires pauses or contains a mission from the first day; the rest are recorded and
+  shown ("would have paused") until their measured precision earns promotion. A reviewer model from another model family
+  reads each session's trajectory as data and its verdicts raise the cost of misbehaviour; it is never the boundary.
+- **Duty K, keep going** (off; armed by the operator per mission, never by configuration). After a *verified* finish, and
+  only after a whole-mission review finds nothing at the blocking tier and every blocker condition is clear, the lead is
+  told the operator's sentence "Keep going, I believe in you." followed by a harness restatement of scope, up to a small
+  cap. It is refused for solvable (ctf) packs, for `harness_test` missions, and wherever the monitor cannot vouch for the
+  mission's egress.
+
+**Layers.** F, the floor (no model): infrastructure denied in every proxy policy and beating grants, macOS fetch services
+denied in every network mode, open tunnels cut, SNI bound to the CONNECT host, every process a session started
+identifiable and killable, a process limit. L0, tripwires, inline in the call loop and on every durable record. L1, the
+gate for gated action classes (destinations, credentials, protected paths, destructive actions, outward posting,
+detachment, delegation, irreversible effects), deterministic first. L2, per-batch review. L3, mission-tree review, mandatory
+before a keep-going reopen. L4, fleet joins across missions.
+
+**Responses.** R0 record, R1 steer (a harness-authored note with fixed template text, a monitor-state deny, a route closure
+that the ledger never records), R2 refuse or hold a call, R3 pause the mission, R4 contain, R5 halt a cohort. The daemon
+runs them at the moment of detection; the operator is told in parallel and is never on the critical path. A pause is a
+durable mission state in the monitor log, checked by `may_run` on every path that starts a turn or launches an agent, so a
+restart, an answer to another item, a spawn or a crash cannot lift it; open tunnels are cut, jobs stopped (not killed), and
+the lead parked without `stop_children`.
+
+**Principles it enforces** (§2): 
+- **4 (authorship).** Nothing the reviewer writes reaches the agent by any channel (answers, 403 bodies, notification argv
+  or environment, session logs): the agent sees fixed template sentences filled with validated values. Every
+  agent-influenced string in a review input is fenced as data, line by line. The keep-going sentence is the operator's
+  words, recorded as a user-authored record at the moment they arm it; each delivery is harness-authored and says it
+  came after a review.
+- **5 and 6 (the ledger and witnessed evidence).** Effects are judged from what the harness witnessed: net decisions, the
+  process census, refusals and the sealed ledger, never from the agent's account or what its program printed. A
+  verdict's route closures live in a monitor-state overlay; the ledger holds only deterministic facts and operator acts.
+- **7 (stopping is an act).** A pause, like `report_blocker`, ends a turn through the gate's own paths; it is a state the
+  operator answers, never a nudge.
+- **8 (enforcement outside the agent's reach).** The monitor has no `Known` entry, no tools and no network except its model
+  endpoints; its state is under the hidden loom home; every response acts on harness state (proxy policy, tunnels, process
+  groups, the box, the inbox, turn control) and never relies on the agent complying.
+- **9 (nothing leaves the machine unless configured).** A reviewer must be disjoint in model family from every profile a
+  session can reach, must be declared stock, and must not add a data recipient the operator has not consented to for that
+  pack (consent is per pack, expiring overrides are typed and recorded). Secrets are replaced by keyed tags before a
+  request leaves the daemon; a new-recipient reviewer receives features only for missions with real targets.
+- **10 (unattended is the default).** Monitor faults (an unreachable reviewer, a refusal, a restart) never count as agent
+  misbehaviour and never pause an agent; they fail closed for *clearing* (no model-cleared gate, no keep-going reopen) and
+  show as a state. A monitor that is down pauses missions with real targets or relaxed agents (`monitor_down`), by
+  default.
+- **1 (the log is the record).** The monitor log folds into state before any session is activated; every verdict names the
+  SHA-256 of the exact input it read.
+
+**What it does not do** (`docs/MONITOR.md` §1.7): judge offensive work inside the authorization, judge whether a finding is
+real, steer approaches, or replace a deterministic control. Its blind spots (opaque HTTPS bodies to granted hosts,
+target-side request forgery, Host-header fronting, box and rootbox egress, steganography, best-effort process identity,
+the review's own weakness) are residual risks X1 to X17 in `SECURITY.md` and `docs/MONITOR.md` §9.5.
+
+**Where the detail is.** `docs/MONITOR.md` is the specification: threat model and taxonomy (§1), architecture, model
+policy and capacity (§2), the reviewer's contract (§3), the response ladder and the gate (§4), keep-going (§5), tripwires
+and canaries (§6), records, routes, commands and UI (§7), evaluation (§8), and the build plan with the operator's
+decisions and the residual risks (§9). The `CONTRACT` comments of `crates/loom-agent/src/monitor/` are the precise form of
+each part, with signatures.
+
 ## Security workflow extensions
 
 Typed asset/credential/foothold records, coverage, revisit triggers, hypothesis ownership and bounded
@@ -1734,6 +1820,12 @@ Unsupported checks fail closed; blocked/budget settlement remains honest about i
 Earlier versions of this document described these; the code does not have them. Nothing here may be
 relied on.
 
+- The monitor of §15: tripwires, the reviewer, the gate, durable pause, canaries and keep-going; their configuration keys
+  (`[monitor]`, `[keep_going]`, the profile keys `family`, `alignment`, `recipient` and `purpose`,
+  `sandbox.allow_fetch_services`), session-log records (`monitor_note`, `keep_going_set`, `keep_going`), routes
+  (`GET /api/monitor`, `POST /api/sessions/{id}/keep-going`, the flag, review, halt and scope-revoke routes of
+  `docs/MONITOR.md` §7.5) and commands (`loom keep-going`, `loom monitor …`, `loom scope --lab`, `loom scope revoke`).
+  `loom_agent::monitor` has the vocabulary and the contracts, and nothing calls it.
 - An MCP stdio client in `loom-tools`, and external MCP servers as tool providers.
 - Pack plugin processes contributing tools and hooks (`pre_tool`, `hud`, `stop_gate`, `scope`).
 - An `evals/` directory of behavioural checks against the mock or a live model.
