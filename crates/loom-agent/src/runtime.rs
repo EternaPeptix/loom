@@ -1061,6 +1061,22 @@ fn child_outcome_of(outcome: SessionOutcome) -> ChildOutcome {
     }
 }
 
+/// Revokes a session's proxy grant (closing its listener) when dropped while armed, so that a set-up
+/// that fails after the grant leaks no listener.
+struct RevokeOnDrop<'a> {
+    proxy: &'a Proxy,
+    session: &'a SessionId,
+    armed: bool,
+}
+
+impl Drop for RevokeOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.proxy.revoke(self.session);
+        }
+    }
+}
+
 /// The sandbox configuration a session of `role` runs under.
 /// Every model profile's `api_key_env` name is withheld from its commands.
 fn sandbox_cfg_for(
@@ -1382,7 +1398,12 @@ impl Orchestrator for Orch {
         let role = inner.packs.role(Some(&meta.pack), Some(&meta.role))?.clone();
         let (record, log) = (inner.paths.session_dir(&child).join(COPY_MANIFEST), inner.paths.session_log(&child));
         let (tmp, home, copies) = (inner.paths.session_tmp(parent), inner.paths.home.clone(), inner.paths.copies_dir());
-        let (base, models, port) = (inner.config.sandbox.clone(), inner.config.models.clone(), inner.proxy.port());
+        let (base, models, port) = (
+            inner.config.sandbox.clone(),
+            inner.config.models.clone(),
+            // The commands run with the parent's environment, so on the parent's listener.
+            inner.proxy.session_port(parent),
+        );
         let read = tokio::task::spawn_blocking(move || {
             let dir = std::fs::canonicalize(&meta.workspace).map_err(|e| {
                 format!(
@@ -1405,7 +1426,7 @@ impl Orchestrator for Orch {
             // parent's own scratch directory, under the rules the agent itself ran under.
             let cfg = with_copies(sandbox_cfg_for(&base, &role, &dir, &models), &copies, Some(&source));
             let bubblewrap = cfg.mode == SandboxMode::Bubblewrap;
-            let sandbox = Sandbox::new(&cfg, &dir, &tmp, &home, (!bubblewrap).then_some(port))
+            let sandbox = Sandbox::new(&cfg, &dir, &tmp, &home, if bubblewrap { None } else { port })
                 .map_err(|e| format!("The sandbox for the copy of agent {} cannot be set up: {e}", child.as_str()))?;
             Ok(ChildCopy { agent: child, dir, manifest, running, runs, sandbox: Arc::new(sandbox) })
         });
@@ -2178,10 +2199,16 @@ impl Inner {
         if bubblewrap && self.config.network.mode != loom_core::config::NetworkMode::DenyAll {
             return Err("Bubblewrap requires network.mode = deny_all. Explicit mission grants apply only to trusted in-process HTTP tools; subprocess proxy bridges are unsupported.".into());
         }
-        let sandbox =
-            Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, (!bubblewrap).then_some(self.proxy.port()))
-                .map_err(|e| format!("The sandbox for this session cannot be set up: {e}"))?;
         let policy = self.session_policy(meta, explicit)?;
+        // The session's own proxy listener comes first: its port is the only one the sandbox allows.
+        let grant = self
+            .proxy
+            .grant(id, policy)
+            .map_err(|e| format!("The egress proxy cannot open a port for this session: {e}"))?;
+        // From here a failure takes the grant, and with it the listener, back.
+        let mut revoke = RevokeOnDrop { proxy: &self.proxy, session: id, armed: true };
+        let sandbox = Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, (!bubblewrap).then_some(grant.port))
+            .map_err(|e| format!("The sandbox for this session cannot be set up: {e}"))?;
         let (events_tx, job_events) = unbounded_channel();
         let jobs = Arc::new(JobTable::new(
             self.paths.session_dir(id).join("jobs"),
@@ -2189,7 +2216,6 @@ impl Inner {
             events_tx,
             self.config.tools.max_output_bytes,
         ));
-        let grant = self.proxy.grant(id, policy);
         let reference_proxy = if self.config.network.reference_hosts.is_empty() {
             None
         } else {
@@ -2250,6 +2276,7 @@ impl Inner {
             sink: self.sink.clone(),
             control: control.clone(),
         };
+        revoke.armed = false;
         Ok((deps, Parts { control, shared, jobs }))
     }
 
@@ -5670,9 +5697,10 @@ mod tests {
         let info = e.rt.create_session(e.new_session(Some("net"))).await.unwrap();
         let id = info.meta.id.clone();
         until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
-        let grant = e.rt.inner.proxy.grant(&id, Policy::new(&e.config.network).unwrap());
+        let grant = e.rt.inner.proxy.grant(&id, Policy::new(&e.config.network).unwrap()).unwrap();
         let mut bus = e.rt.subscribe();
-        let port = e.rt.proxy_port();
+        // Command credentials are served on the session's own listener.
+        let port = grant.port;
         let ask = move |req: String| async move {
             let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             s.write_all(req.as_bytes()).await.unwrap();
@@ -8815,13 +8843,56 @@ mod tests {
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         let id = info.meta.id.clone();
         until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
-        let port = e.rt.proxy_port();
-        assert!(port != 0);
+        let port = e.rt.inner.proxy.session_port(&id).unwrap();
+        assert!(port != 0 && port != e.rt.proxy_port());
         let text = e.records(&id).into_iter().find_map(|r| match r.event {
             Event::ToolResult(t) if t.name == "bash" => Some(t.text),
             _ => None,
         });
-        assert!(text.unwrap_or_default().contains(&format!("@127.0.0.1:{port}")));
+        let text = text.unwrap_or_default();
+        assert!(text.contains(&format!("@127.0.0.1:{port}")), "{text}");
+        assert!(!text.contains(&format!("@127.0.0.1:{}", e.rt.proxy_port())), "{text}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sessions_have_proxy_ports_of_their_own_and_sandboxes_that_allow_only_their_own() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let a = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta;
+        let b = e.rt.create_session(e.new_session(Some("b"))).await.unwrap().meta;
+        let port_of = |env: &std::collections::BTreeMap<String, String>| -> u16 {
+            let url = env.get("HTTP_PROXY").expect("HTTP_PROXY");
+            url.rsplit(':').next().and_then(|p| p.parse().ok()).expect("a port at the end of HTTP_PROXY")
+        };
+        let shared = e.rt.proxy_port();
+        let (da, _) = e.rt.inner.build(&a, false).unwrap();
+        let (db, _) = e.rt.inner.build(&b, false).unwrap();
+        let (pa, pb) = (port_of(&da.ctx.env), port_of(&db.ctx.env));
+        assert!(pa != pb && pa != shared && pb != shared, "{pa} {pb} {shared}");
+        assert_eq!(e.rt.inner.proxy.session_port(&a.id), Some(pa));
+        assert_eq!(e.rt.inner.proxy.session_port(&b.id), Some(pb));
+        assert_eq!(da.ctx.sandbox.loopback_ports().first(), Some(&pa));
+        assert_eq!(db.ctx.sandbox.loopback_ports().first(), Some(&pb));
+        for (sandbox, own, other) in [(&da.ctx.sandbox, pa, pb), (&db.ctx.sandbox, pb, pa)] {
+            let ports = sandbox.loopback_ports();
+            assert!(ports.contains(&own) && !ports.contains(&other) && !ports.contains(&shared), "{ports:?}");
+        }
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_that_ends_gives_its_proxy_port_back() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let id = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta.id;
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let port = e.rt.inner.proxy.session_port(&id).unwrap();
+        e.rt.inner.proxy.revoke(&id);
+        assert_eq!(e.rt.inner.proxy.session_port(&id), None);
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            assert!(tokio::time::Instant::now() < deadline, "the port still accepts");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         e.rt.shutdown().await;
     }
 
