@@ -91,6 +91,10 @@ mode = "deny_all"
 # configured with (often ghcr.io) and any ecosystem hosts cdxgen needs for the project type.
 # deny = ["169.254.0.0/16", "tracker.example.test"]   # always refused, in every mode: host patterns, IP addresses or CIDR blocks
 # allow_private = ["10.1.2.3"]   # private, loopback or link-local destinations that are permitted (host pattern, IP or CIDR)
+# Refused to every command whatever is granted or allowed (checked first): your tailnet machines, a desktop app's
+# debugging port. Same syntax as `deny`. Loom also always refuses cloud metadata, DevTools ports 9222 and 9229 and
+# Docker API ports 2375 and 2376 on this machine, the daemon's port, every model endpoint above and the box's ssh_host.
+# infrastructure = ["*.tail1234.ts.net", "100.64.0.0/10", "127.0.0.1:9333"]
 
 [box]
 # A remote container the agent's commands can run in with `box_exec` (raw TCP to granted hosts, tooling

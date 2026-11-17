@@ -482,7 +482,11 @@ the first two are singletons.
   enforcement (the proxy and the configuration own host syntax and policy). The list must be non-empty,
   each entry non-blank and free of whitespace and commas (one host per entry); hosts are kept as
   written. `LedgerState::granted_hosts()` returns all hosts granted so far, de-duplicated ignoring ASCII
-  case, in first-seen order. Never evicted.
+  case, in first-seen order, leaving out a host revoked after the grant that named it. Never evicted.
+- **Scope revoke** (`scope_revokes`, written by `ScopeRevoke`, operator only). The operator withdraws one granted
+  host, written as it was granted (ignoring case), with a reason. A host that is not granted is refused with a
+  sentence that lists what is, and names the covering wildcard grant when there is one. A later grant of the host
+  grants it again. Never evicted; the Markdown view lists them as `v1…`.
 
 `brief()` shows, right after the goal, `Goal status: open (not yet concluded)` / `met — <note>
 (evidence: …)` / `cannot be met as stated — <note> (evidence: …)`, the release line when present, and
@@ -1325,6 +1329,16 @@ head within 10 s gets `400`.
   connection is made to the first allowed address, never by name again, so a second lookup cannot
   change the destination. Rules are reported as `deny {entry}`, `mode deny_all`, `not in allow list`,
   `allow {pattern}`, `mode open`, `allow_private {entry}` or `deny private-address {addr}`.
+- **Implicit infrastructure deny (E1).** Every command policy refuses a fixed list before everything else: a
+  grant, a literal grant, `allow_private` and `mode open` do not lift it, and it is checked on the name and
+  on every resolved address (`deny infrastructure: {what}`). Always: cloud metadata (169.254.0.0/16,
+  `fd00:ec2::254`, `100.100.100.200`, `192.0.0.192`, names whose first label is `metadata` or
+  `instance-data`) and, on this machine, DevTools and inspector ports 9222 and 9229 and the Docker API ports
+  2375 and 2376. From the configuration: the daemon's port, the `host:port` of every model profile's
+  `base_url`, the box's `ssh_host` and `network.infrastructure`. The proxy's own listeners (every other
+  session's port) are refused by the proxy itself. A named endpoint is refused by name; reached by an IP
+  alias it is refused while that address is private and not in `allow_private`. `Runtime::start` refuses a
+  `network.infrastructure` entry it cannot read.
 - **Per-session scope grants.** The operator can authorize more hosts for a running mission without a
   restart (`Runtime::grant_scope`, `POST /api/sessions/{id}/scope`, `loom scope`). The egress policy of
   every running session of the mission becomes the configured network plus the granted hosts: under
@@ -1488,6 +1502,7 @@ POST /api/sessions/{id}/rules                 {text} → 202 RuleReceipt
 POST /api/sessions/{id}/approvals             {text, scope?} → 202 RuleReceipt
 POST /api/sessions/{id}/rules/{rule_id}/withdraw   {reason?} → 202 RuleReceipt
 POST /api/sessions/{id}/scope                 {hosts, note?} → 202 ScopeReceipt {lead, hosts, ledger}
+POST /api/missions/{id}/scope/revoke          {host, reason} → 202 ScopeRevokeReceipt {lead, host, ledger, recorded, sessions, cut}
 POST /api/sessions/{id}/release               {reason} → 202 RuleReceipt
 POST /api/sessions/{id}/stop                  → 202 {}
 POST /api/sessions/{id}/resume                → 202 {}
@@ -1510,8 +1525,8 @@ POST /api/shutdown                            → 202 {}
 
 **Monitor routes (specified, not served).** The routes above are the ones this build serves. `docs/MONITOR.md` §7.5
 specifies those the monitor adds (`GET /api/monitor`, `GET /api/missions/{id}/monitor`, `POST
-/api/sessions/{id}/keep-going`, the flag, review, pause, observe-only, halt, promote, vet, replay and capacity routes, and
-`POST /api/missions/{id}/scope/revoke`), the `monitor` bus event (an unknown `type` is ignored by the UI and CLI) and
+/api/sessions/{id}/keep-going`, the flag, review, pause, observe-only, halt, promote, vet, replay and capacity routes;
+`POST /api/missions/{id}/scope/revoke` is served since phase E1), the `monitor` bus event (an unknown `type` is ignored by the UI and CLI) and
 the `monitor` fields of `StatusView` and `MissionInfo` (`#[serde(default)]`); each phase adds its routes to the list
 above and to the `api.rs` contract in the commit that serves them. Routes that mutate monitor state record the client
 (CLI token or web session), and the ones that lift a halt, promote a tripwire, set observe-only or an override need the
@@ -1601,7 +1616,12 @@ recorded as a `scope_grant` (and a standing rule); the grant lasts as long as th
 with the `request_scope` tool, which opens a non-blocking inbox item (kind `approval`, the hosts as its
 `options`, the reason as its text) and does not stop the session; the UI and app show the hosts with an
 Approve button that calls `/scope` and then resolves the item, and `loom inbox` prints the `loom scope`
-command to run. Nothing is granted without that call. `POST /release` (`loom release`) takes a reason,
+command to run. Nothing is granted without that call. `POST /api/missions/{id}/scope/revoke` (`loom scope revoke
+<mission> <host> --reason`) takes one grant back: it is appended to the ledger first, the host leaves the egress
+policy of every running session of the mission at once, the open tunnels and forwards to it are cut
+(`Proxy::cut_hosts`), the mission's box rules are applied again, and the lead gets a protected note (no turn).
+A restored or later session is built without it. The infrastructure deny of §11 is not a grant and has nothing to
+revoke. `POST /release` (`loom release`) takes a reason,
 which must not be blank, records an `operator_release` and closes the mission; the outcome reads "closed
 by operator, goal not established", never "finished". A blocking blocker or park offers the choices
 "Keep working", "Keep working (more budget)" (budget parks), "Provide what's missing" (blockers) and
@@ -1824,7 +1844,7 @@ relied on.
   (`[monitor]`, `[keep_going]`, the profile keys `family`, `alignment`, `recipient` and `purpose`,
   `sandbox.allow_fetch_services`), session-log records (`monitor_note`, `keep_going_set`, `keep_going`), routes
   (`GET /api/monitor`, `POST /api/sessions/{id}/keep-going`, the flag, review, halt and scope-revoke routes of
-  `docs/MONITOR.md` §7.5) and commands (`loom keep-going`, `loom monitor …`, `loom scope --lab`, `loom scope revoke`).
+  `docs/MONITOR.md` §7.5) and commands (`loom keep-going`, `loom monitor …`, `loom scope --lab`; `loom scope revoke` is served since phase E1).
   `loom_agent::monitor` has the vocabulary and the contracts, and nothing calls it.
 - An MCP stdio client in `loom-tools`, and external MCP servers as tool providers.
 - Pack plugin processes contributing tools and hooks (`pre_tool`, `hud`, `stop_gate`, `scope`).

@@ -136,6 +136,19 @@ pub struct ScopeBody {
 /// The answer to `POST /api/sessions/{id}/scope`.
 pub use loom_agent::runtime::ScopeReceipt;
 
+/// Body of `POST /api/missions/{id}/scope/revoke`: the operator withdraws one granted host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeRevokeBody {
+    /// The host exactly as it was granted (compared ignoring case).
+    pub host: String,
+    /// Why; kept in the ledger and shown to the lead. Required.
+    pub reason: String,
+}
+
+/// The answer to `POST /api/missions/{id}/scope/revoke`.
+pub use loom_agent::runtime::ScopeRevokeReceipt;
+
 /// Body of `POST /api/sessions/{id}/release`: the operator closes the mission without the goal established.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

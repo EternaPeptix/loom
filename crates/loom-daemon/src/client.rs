@@ -24,6 +24,7 @@
 //!   sessions (archived included): the one whose id equals `word`; else those whose id starts with
 //!   `word` or with `s-{word}`. One → it. None → `No session matches `{word}`.` Several → `` `{word}`
 //!   matches {n} sessions: {ids, at most 5, then "…"}. Give more of the id. ``
+//! - `revoke_scope(mission, host, reason)`: `POST /api/missions/{id}/scope/revoke`, the `ScopeRevokeReceipt`.
 //! - `grant_scope(id, hosts, note)`: `POST /api/sessions/{id}/scope`, the `ScopeReceipt`. `release(id, reason)`:
 //!   `POST /api/sessions/{id}/release`, the `RuleReceipt`. Both are the operator's, like `add_rule`.
 //! - `mission_of(word)`: a word starting with `m-` is taken as a mission id as it is; otherwise
@@ -64,7 +65,8 @@
 
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody, RecordsPage,
-    ReleaseBody, RuleBody, ScopeBody, ScopeReceipt, SessionDetail, StatusView, WithdrawBody,
+    ReleaseBody, RuleBody, ScopeBody, ScopeReceipt, ScopeRevokeBody, ScopeRevokeReceipt, SessionDetail, StatusView,
+    WithdrawBody,
 };
 use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, NetEntry, NewSession, RuleReceipt, ScoreView, SessionInfo,
@@ -488,6 +490,19 @@ impl Client {
         let body = serde_json::to_value(ScopeBody { hosts: hosts.to_vec(), note: note.map(str::to_string) })
             .map_err(|e| format!("The grant cannot be encoded ({e})."))?;
         self.call(Method::POST, &format!("/api/sessions/{}/scope", segment(id.as_str())), &[], Some(body)).await
+    }
+
+    /// Withdraw `host` (as it was granted) from `mission` (the operator's revoke).
+    pub async fn revoke_scope(
+        &self,
+        mission: &MissionId,
+        host: &str,
+        reason: &str,
+    ) -> Result<ScopeRevokeReceipt, String> {
+        let body = serde_json::to_value(ScopeRevokeBody { host: host.to_string(), reason: reason.to_string() })
+            .map_err(|e| format!("The revoke cannot be encoded ({e})."))?;
+        let path = format!("/api/missions/{}/scope/revoke", segment(mission.as_str()));
+        self.call(Method::POST, &path, &[], Some(body)).await
     }
 
     /// Close the mission of `id` without the goal established, for `reason`.

@@ -41,7 +41,9 @@ harness's.
   allowed `Origin`. This stops a web page you visit from reaching the API through your browser.
 - The web page is opened with `loom open`, which trades the token for a single-use login code (valid
   60 seconds) and then a web-session secret kept in memory by the daemon and in the tab's session
-  storage. The token is never put on a command line or in a URL.
+  storage. The token is never put on a command line or in a URL, and neither is the login code: `loom open` writes a
+  page file (mode 0600, in `<home>/login`, removed after five minutes) that sends the browser to the address and
+  gives the opener the file's path.
 - Before the `loom` command or the desktop app sends the token to a listener, the listener must prove it
   holds the token (an HMAC answer on `/healthz`). A different program on the daemon's port cannot
   collect the token this way. The exception is the global flag `--unverified-daemon`: with it, the
@@ -93,9 +95,13 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   proxy applies `[network]`: by default (`deny_all`) it forwards nothing. It resolves
   names itself, refuses private, loopback and link-local addresses (including IPv4 addresses hidden in
   IPv6 forms) unless you list them, applies the deny list to the resolved address, and records every
-  decision in a hash-chained audit file. Commands that listen on loopback can be reached by other
+  decision in a hash-chained audit file. Whatever you grant or allow, the proxy also refuses cloud metadata, the
+  DevTools and inspector ports 9222 and 9229 and Docker API ports 2375 and 2376 on this machine, the daemon's
+  port, the model endpoints of the configuration, the box's Docker host and `network.infrastructure`
+  (`deny infrastructure: …` in the audit file); `loom scope revoke` takes a grant back and cuts its open
+  connections. Commands that listen on loopback can be reached by other
   local processes. Commands cannot connect to the daemon's own port, whatever you allow on loopback, so a
-  `loom open` login code seen in the process list cannot be redeemed from inside the sandbox directly (the
+  `loom open` login code (which is no longer on any command line) could not be redeemed from inside the sandbox directly (the
   proxy, which refuses loopback addresses, could reach it only if you list loopback in `allow_private` or
   grant a loopback address). Under `deny_all` commands also cannot reach the macOS services that fetch a
   URL for a process (`com.apple.trustd.agent`, `com.apple.trustd`, `com.apple.ocspd`,

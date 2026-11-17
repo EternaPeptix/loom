@@ -167,6 +167,7 @@ loom rule <session> "text"                set a standing rule for the mission
 loom rule <session> --withdraw <rule-id> [--reason "..."]
 loom approve <session> "text" [--scope "..."]
 loom scope <session> <host>...            let the mission's tools reach these hosts (a session asks with request_scope)
+loom scope revoke <mission> <host> --reason "..."   take a granted host back (recorded, cut at once)
 loom release <session> "reason"           accept a blocked mission as it is and close it
 loom ledger <session>                     the mission ledger
 loom score <session> [--json]             what the mission's work took: steps, refused finishes, malformed calls

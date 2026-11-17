@@ -133,11 +133,20 @@ against the resolved address too. Private, loopback and link-local destinations 
 listed in `allow_private`. Every decision is recorded in the session's audit log (`loom net <session>`).
 A pack that sets `requires_restricted_network` (`vr` does) is refused while the mode is `open`.
 
+Some destinations are refused to every command whatever you grant or allow (`deny infrastructure: …` in `loom net`):
+cloud metadata addresses and names, the DevTools and inspector ports 9222 and 9229 and the Docker API ports 2375 and
+2376 on this machine, the daemon's own port, every model endpoint of the configuration and the box's Docker host.
+List more with `network.infrastructure` (same syntax as `deny`: hosts, `host:port`, CIDR blocks), for example a tailnet
+machine or a desktop app's debugging port. `loom open` hands the browser a short-lived page file instead of the address,
+so the login code is never on a command line.
+
 A session can also be given hosts by you while it runs. When it needs one it does not have, the agent
 calls `request_scope`; an item naming the hosts and why waits in your inbox, and the session keeps
 working. `loom scope <session> <host>...` grants them (the UI and the app have an Approve button on the
 item). The grant is recorded in the mission's ledger, applies to that mission only, and ends with the
-session. `loom net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
+session. `loom scope revoke <mission> <host> --reason <text>` takes one granted host back (the host as it was
+granted; the mission is an `m-` id or any session of it): it is recorded in the ledger, refused to the running
+sessions at once, and its open connections are cut. `loom net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
 granted hosts; the `allow` list stays off. `*`, a wildcard over a whole top-level domain (`*.com`) or
 over IP addresses (`*.0.1`), the unspecified address (`0.0.0.0`, `::`) and a loopback address without a
 port (`127.0.0.1`; write `127.0.0.1:8080`) cannot be requested or granted: name the hosts, or a wildcard
@@ -357,6 +366,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom rule <session> --withdraw <rule-id> [--reason <text>]` | withdraw a rule |
 | `loom approve <session> <text...> [--scope <text>]` | record an approval |
 | `loom scope <session> <host>... [--note <text>]` | let the mission's tools reach these hosts (one host per argument) |
+| `loom scope revoke <mission> <host> --reason <text>` | take a granted host back: recorded, refused at once, open connections cut |
 | `loom release <session> <reason...>` | accept a blocked mission as it is and close it: "closed by operator, goal not established" |
 | `loom inbox` / `loom answer <item> <text...>` | what waits for you / answer one |
 | `loom ledger <session>` | the mission ledger |

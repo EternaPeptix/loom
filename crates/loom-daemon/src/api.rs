@@ -49,6 +49,7 @@
 //! | `POST /sessions/{id}/approvals` (`ApprovalBody`; `scope` may be left out) | `runtime.approve` | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/rules/{rule_id}/withdraw` (`WithdrawBody`; `reason` may be left out) | `runtime.withdraw_rule` (`404` when the mission has no such rule, `409` when it is already withdrawn) | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/scope` (`ScopeBody`; `note` may be left out) | `runtime.grant_scope` (operator only; a child's id goes to its lead; `409` for no hosts or a host that is not a plain name) | `202` `ScopeReceipt` |
+//! | `POST /missions/{id}/scope/revoke` (`ScopeRevokeBody`; both fields required) | `runtime.revoke_scope` (operator only; `404` for an unknown mission, `409` for a blank field or a host that is not granted; the sentence lists what is) | `202` `ScopeRevokeReceipt` |
 //! | `POST /sessions/{id}/release` (`ReleaseBody`; `reason` required) | `runtime.release` (operator only; closes the mission without the goal established; `409` for a blank reason) | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/stop` | `runtime.stop` | `202` `{}` |
 //! | `POST /sessions/{id}/resume` | `runtime.resume` | `202` `{}` |
@@ -124,7 +125,7 @@ use crate::auth;
 use crate::ui;
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, ReleaseBody, RuleBody,
-    ScopeBody, SessionDetail, StatusView, WithdrawBody,
+    ScopeBody, ScopeRevokeBody, SessionDetail, StatusView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -211,6 +212,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/missions", get(missions))
         .route("/api/missions/{id}/ledger", get(ledger))
         .route("/api/missions/{id}/score", get(score))
+        .route("/api/missions/{id}/scope/revoke", post(revoke_scope))
         .route("/api/inbox", get(inbox))
         .route("/api/inbox/{item_id}", post(answer))
         .route("/api/blobs/{handle}", get(blob_meta))
@@ -651,6 +653,12 @@ async fn grant_scope(State(s): State<ApiState>, Path(id): Path<String>, body: By
     let body: ScopeBody = json_body(&body)?;
     let receipt =
         s.runtime.grant_scope(&SessionId::from(id), &body.hosts, body.note.as_deref()).await.map_err(rt_err)?;
+    Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
+}
+
+async fn revoke_scope(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: ScopeRevokeBody = json_body(&body)?;
+    let receipt = s.runtime.revoke_scope(&MissionId::from(id), &body.host, &body.reason).await.map_err(rt_err)?;
     Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
 }
 
@@ -1810,6 +1818,50 @@ mod tests {
             assert_eq!(s, 404, "{bad}: {b}");
             assert!(b["error"].as_str().unwrap().starts_with("There is no mission"), "{b}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_scope_revoke_route_withdraws_a_granted_host_and_refuses_what_is_not_granted() {
+        let e = env(lead_script(json!({"question": "CHILDMARK find it"}))).await;
+        let id = e.create("go").await;
+        e.wait_turn_ends(&id, 1).await;
+        let (_, missions) = e.get("/api/missions").await;
+        let mission = missions[0]["id"].as_str().unwrap().to_string();
+        let (s, b) =
+            e.post(&format!("/api/sessions/{id}/scope"), json!({"hosts": ["a.example.test", "*.b.test"]})).await;
+        assert_eq!(s, 202, "{b}");
+        e.ledger_state(&mission, "the grant", |l| l["scope_grants"].as_array().is_some_and(|g| !g.is_empty())).await;
+
+        let path = format!("/api/missions/{mission}/scope/revoke");
+        let (s, b) = e.post(&path, json!({"host": "A.example.test", "reason": "wrong target"})).await;
+        assert_eq!(
+            (s, &b["lead"], &b["host"], &b["recorded"]),
+            (202, &json!(id), &json!("a.example.test"), &json!(true)),
+            "{b}"
+        );
+        let state = e
+            .ledger_state(&mission, "the revoke", |l| l["scope_revokes"].as_array().is_some_and(|r| !r.is_empty()))
+            .await;
+        assert_eq!(state["scope_revokes"][0]["reason"], "wrong target");
+
+        // Refused: not granted any more (the sentence lists what is), a host a wildcard covers, a blank
+        // reason, an unknown mission; unknown fields and missing fields are bad bodies.
+        let (s, b) = e.post(&path, json!({"host": "a.example.test", "reason": "again"})).await;
+        assert_eq!(s, 409, "{b}");
+        assert!(b["error"].as_str().unwrap().contains("*.b.test"), "{b}");
+        let (s, b) = e.post(&path, json!({"host": "x.b.test", "reason": "r"})).await;
+        assert_eq!(s, 409, "{b}");
+        let (s, b) = e.post(&path, json!({"host": "*.b.test", "reason": " "})).await;
+        assert_eq!(s, 409, "{b}");
+        assert!(b["error"].as_str().unwrap().contains("Say why"), "{b}");
+        let (s, b) = e.post("/api/missions/m-nope/scope/revoke", json!({"host": "a.test", "reason": "r"})).await;
+        assert_eq!(s, 404, "{b}");
+        let (s, _) = e.post(&path, json!({"host": "a.test", "reason": "r", "extra": 1})).await;
+        assert_eq!(s, 400);
+        let (s, _) = e.post(&path, json!({"host": "a.test"})).await;
+        assert_eq!(s, 400);
+        let (s, b) = e.post(&path, json!({"host": "*.b.test", "reason": "done with it"})).await;
+        assert_eq!(s, 202, "{b}");
     }
 
     #[tokio::test]

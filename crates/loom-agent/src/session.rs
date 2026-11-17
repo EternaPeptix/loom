@@ -142,6 +142,10 @@
 //!   `shared.ledger_append(true, ScopeGrant{hosts, note})` and append what it queued (failure: warn,
 //!   carry on). Append `harness_note{Approval, texts::scope_granted(hosts, note)}` with author `User`.
 //!   It starts no turn. (The runtime widens the egress policy itself, not the session.)
+//! - `Input::ScopeRevoked{host, reason}`: the operator withdrew `host`; the runtime has already recorded
+//!   `ScopeRevoke` in the ledger and narrowed the egress policy. Append `harness_note{Approval,
+//!   texts::scope_revoked(host, reason)}` with author `User`. A blank host is ignored. No ledger entry, no
+//!   turn, nothing kept on disk.
 //! - `Input::Queued{file, input}`: rename `file` to `{stem}.{seq}.taking`, `seq` being the log's
 //!   next seq; then `input` as above, then delete the renamed file. When `file` is gone it was taken
 //!   already (at the start of `run`), and nothing happens.
@@ -583,6 +587,11 @@ pub enum Input {
     Withdraw { id: String, reason: String },
     /// The operator authorized network access to `hosts` for the mission.
     Scope { hosts: Vec<String>, note: Option<String> },
+    /// The operator withdrew network access to `host` (the revoke is already recorded in the ledger by the
+    /// runtime, which also narrowed the egress policy and cut the open connections): the session only says so
+    /// in a protected note. Not kept on disk: the ledger holds the record, and the state block shows the hosts
+    /// authorized now.
+    ScopeRevoked { host: String, reason: String },
     /// The operator closed the mission short of its goal, with a reason.
     Release { reason: String },
     /// A child that nobody was waiting for has settled.
@@ -2224,6 +2233,12 @@ Name them when you start a new mission instead."
                 }
                 self.operator_op(LedgerOp::ScopeGrant { hosts: hosts.clone(), note: note.clone() })?;
                 self.note(Author::User, NoteKind::Approval, texts::scope_granted(&hosts, note.as_deref()))?;
+            }
+            Input::ScopeRevoked { host, reason } => {
+                if host.trim().is_empty() {
+                    return Ok(out);
+                }
+                self.note(Author::User, NoteKind::Approval, texts::scope_revoked(&host, &reason))?;
             }
             Input::Release { reason } => {
                 if reason.trim().is_empty() {

@@ -312,6 +312,11 @@ pub struct NetworkCfg {
     pub deny: Vec<String>,
     /// Private, loopback or link-local destinations that are permitted (same pattern syntax, or CIDR).
     pub allow_private: Vec<String>,
+    /// Infrastructure no command may reach, whatever its grants say (same syntax as `deny`, CIDR blocks
+    /// too): tailnet infrastructure, a desktop app's debugging port. Added to what loom always refuses
+    /// (cloud metadata, DevTools and Docker API ports on this machine, the daemon's port, every model
+    /// endpoint, the box's Docker host) and checked before everything else, so a grant cannot lift it.
+    pub infrastructure: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

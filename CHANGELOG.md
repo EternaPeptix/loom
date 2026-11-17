@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Monitor E1: infrastructure deny and scope revoke
+
+- **Infrastructure no grant can reach.** Every command policy now refuses, before `deny`, any grant, `allow_private`
+  and `mode open`, by name and by every resolved address (`deny infrastructure: …` in `loom net`): cloud metadata
+  (169.254.0.0/16, `fd00:ec2::254`, `100.100.100.200`, `192.0.0.192`, names starting `metadata.` or `instance-data.`),
+  the DevTools and inspector ports 9222 and 9229 and the Docker API ports 2375 and 2376 on this machine, the daemon's
+  port, the `host:port` of every model profile and the box's `ssh_host`. New `[network] infrastructure = [...]` (same
+  syntax as `deny`, CIDR blocks too) adds your own; the daemon refuses to start on an entry it cannot read. Other
+  sessions' proxy listeners were already refused by the proxy (#39), and the sandbox profile denies the daemon port
+  (#41). A destination that used to be refused as `private-address` (such as `169.254.169.254`) is now named as
+  infrastructure, and a grant or `allow_private` entry for it no longer opens it.
+- **`loom scope revoke <mission> <host> --reason <text>`** (`POST /api/missions/{id}/scope/revoke`, ledger op
+  `ScopeRevoke`, `Runtime::revoke_scope`): takes one granted host back. The revoke is written to the ledger first, then
+  the running sessions get the narrowed policy at once, their open tunnels and forwards to the host are cut
+  (`Proxy::cut_hosts`), the box rules are applied again and the lead gets a note without a turn. A restored or new session
+  is built without the host, and granting it again grants it again. A host that is not granted is refused with the list
+  of what is (a wildcard grant that covers it is named). The ledger's Markdown view lists revokes; `granted_hosts()`
+  leaves revoked hosts out.
+- **The login code is off `/usr/bin/open`'s command line.** `loom open` writes a page file (mode 0600 in
+  `<home>/login`, removed by the next `open` after five minutes) that redirects to the address, and hands the opener
+  the file's path. `loom open --print` is unchanged.
+
 ### The monitor: specification and contracts (phase P0; no behaviour change)
 
 - New `docs/MONITOR.md`: the normative specification of the adversarial monitor and "keep going" (threat model and

@@ -73,6 +73,12 @@
 //! listener and present that session's credentials there, through the proxy, which would accept them.
 //! `set_policy(session, policy)` replaces the policy of a session that holds a grant and keeps its
 //! credentials, so commands already running pick the change up on their next connection.
+//! `cut_hosts(session, pattern) -> usize` ends the session's open tunnels and forwarded requests whose
+//! destination the grant pattern covers (`policy::pattern_covers`; a port in the pattern must match), and
+//! a connection accepted but not yet connected is refused when it would open (it is registered before the
+//! destination is opened). Each ended connection that was on record as allowed gets the second decision
+//! with the reason "the operator revoked the destination". It is what the operator's `loom scope revoke`
+//! calls after `set_policy`; the other sessions' connections to the same destination are not touched.
 //! `SessionGrant::env()` gives the variables to place in a command's environment so that ordinary
 //! clients use the proxy: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case forms, all
 //! `http://{user}:{password}@127.0.0.1:{port}` with the session's own port, plus `NO_PROXY`/`no_proxy` = ``
@@ -130,7 +136,10 @@
 //! (`allow_private`) in open mode, a `CONNECT`, a forwarded `GET http://127.0.0.1:{port}/` and a check to
 //! another session's port, to the session's own port and to the shared port are each refused (`403`, rule
 //! `deny the egress proxy's own port {port}`), also written as `[::ffff:127.0.0.1]:{port}` and
-//! `0.0.0.0:{port}`, while another loopback port is still allowed.
+//! `0.0.0.0:{port}`, while another loopback port is still allowed. `cut_hosts`: a pattern that covers
+//! nothing, or only another port, cuts nothing; one that covers a tunnel closes it (bytes stop) and leaves
+//! the same session's tunnel to another destination and another session's tunnel to the same one; the
+//! second decision names the reason.
 //!
 //! ## Audit
 //! `start_with` takes an audit hook ([`AuditFn`]), called on a blocking thread with the session (or
@@ -379,6 +388,41 @@ struct Shared {
     /// The ports of session listeners that were closed by a revoke, as numbers only. Always also in
     /// `own_ports`.
     retired: Mutex<HashSet<u16>>,
+    /// The tunnels and forwarded requests being served, by connection id, so that [`Proxy::cut_hosts`] can
+    /// end the ones to a destination the operator withdrew.
+    live: Mutex<HashMap<u64, Live>>,
+    next_live: AtomicU64,
+}
+
+/// One connection being served, as `cut_hosts` sees it.
+struct Live {
+    session: SessionId,
+    host: String,
+    port: u16,
+    cut: CancellationToken,
+}
+
+/// Registers a connection in [`Shared::live`] and takes it out again when dropped.
+struct LiveGuard<'a> {
+    shared: &'a Shared,
+    id: u64,
+    cut: CancellationToken,
+}
+
+impl<'a> LiveGuard<'a> {
+    fn register(shared: &'a Shared, session: &SessionId, host: &str, port: u16) -> LiveGuard<'a> {
+        let id = shared.next_live.fetch_add(1, Ordering::Relaxed);
+        let cut = CancellationToken::new();
+        let live = Live { session: session.clone(), host: host.to_string(), port, cut: cut.clone() };
+        lock(&shared.live).insert(id, live);
+        LiveGuard { shared, id, cut }
+    }
+}
+
+impl Drop for LiveGuard<'_> {
+    fn drop(&mut self) {
+        lock(&self.shared.live).remove(&self.id);
+    }
 }
 
 impl Shared {
@@ -496,6 +540,9 @@ impl Drop for PendingGuard<'_> {
 /// Why a connection on record as allowed ended when the proxy was cancelled.
 const SHUTDOWN: &str = "the egress proxy shut down";
 
+/// Why a connection on record as allowed ended when the operator withdrew its destination.
+const CUT: &str = "the operator revoked the destination";
+
 /// The listener a connection was accepted on.
 #[derive(Clone)]
 enum Origin {
@@ -567,6 +614,8 @@ impl Proxy {
             tasks: TaskTracker::new(),
             own_ports: Mutex::new(HashSet::from([bound])),
             retired: Mutex::new(HashSet::new()),
+            live: Mutex::new(HashMap::new()),
+            next_live: AtomicU64::new(0),
         });
         let cancel = CancellationToken::new();
         tokio::spawn(accept_loop(listener, shared.clone(), cancel.clone(), cancel.clone(), Origin::Shared));
@@ -661,6 +710,24 @@ impl Proxy {
             }
             None => false,
         }
+    }
+
+    /// Ends the tunnels and forwarded requests of `session` whose destination `pattern` covers (a grant's
+    /// host pattern, with or without a port; see [`crate::policy::pattern_covers`]), including a
+    /// connection that has been accepted but has not opened its destination yet (it is refused when it
+    /// would). Each ended connection is recorded as failed after the allow, reason "the operator revoked
+    /// the destination". Returns how many were ended. The caller sets the narrowed policy first, so a
+    /// connection that starts afterwards is refused by it.
+    pub fn cut_hosts(&self, session: &SessionId, pattern: &str) -> usize {
+        let live = lock(&self.inner.shared.live);
+        let mut cut = 0usize;
+        for l in live.values().filter(|l| &l.session == session) {
+            if !l.cut.is_cancelled() && crate::policy::pattern_covers(pattern, &l.host, Some(l.port)) {
+                l.cut.cancel();
+                cut = cut.saturating_add(1);
+            }
+        }
+        cut
     }
 
     /// What the name check of the session's current policy says about `host:port`; `None` when the
@@ -1459,7 +1526,8 @@ async fn handle(
                 let method = if connect { "CONNECT" } else { CHECK_METHOD };
                 let cx = Ctx { shared, session, lookups, method, host: &host, port };
                 if connect {
-                    tunnel(client, extra, &cx, &policy, slot, cancel).await;
+                    let live = LiveGuard::register(shared, session, &host, port);
+                    tunnel(client, extra, &cx, &policy, slot, cancel, live.cut.clone()).await;
                 } else {
                     check(&mut client, &cx, &policy, slot).await;
                 }
@@ -1481,7 +1549,9 @@ async fn handle(
         Ok((host, port, authority, path)) => {
             let (shared, session, lookups) = (&*shared, &session, &lookups);
             let cx = Ctx { shared, session, lookups, method: &head.method, host: &host, port };
-            forward(client, extra, &head, &cx, &policy, &authority, &path, reference, slot, cancel).await;
+            let live = LiveGuard::register(shared, session, &host, port);
+            let cut = live.cut.clone();
+            forward(client, extra, &head, &cx, &policy, &authority, &path, reference, slot, cancel, cut).await;
         }
         Err(m) => reject(&mut client, &shared, slot, &session, &head, &m).await,
     }
@@ -1511,6 +1581,7 @@ async fn tunnel(
     policy: &Policy,
     slot: OwnedSemaphorePermit,
     cancel: CancellationToken,
+    cut: CancellationToken,
 ) {
     let idle = cx.shared.limits.idle_timeout;
     let (mut up, allowed) = match open_upstream(cx, policy).await {
@@ -1518,6 +1589,9 @@ async fn tunnel(
         Err((status, body)) => return answer(&mut client, cx.shared, slot, status, "", &body).await,
     };
     let _slot = slot;
+    if cut.is_cancelled() {
+        return cx.failed_after_allow(&allowed, CUT).await;
+    }
     if client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.is_err() {
         return cx.failed_after_allow(&allowed, "the client closed the connection before the tunnel was open").await;
     }
@@ -1528,6 +1602,7 @@ async fn tunnel(
     let end = tokio::select! {
         end = relay(&mut client, &mut up, idle, None) => end,
         _ = cancel.cancelled() => return cx.failed_after_allow(&allowed, SHUTDOWN).await,
+        _ = cut.cancelled() => return cx.failed_after_allow(&allowed, CUT).await,
     };
     // Once bytes have come from the destination, a failure cannot be told from a routine close.
     let why = match end {
@@ -2121,6 +2196,7 @@ async fn forward(
     reference: bool,
     slot: OwnedSemaphorePermit,
     cancel: CancellationToken,
+    cut: CancellationToken,
 ) {
     let idle = cx.shared.limits.idle_timeout;
     let body = match body_kind(head) {
@@ -2173,6 +2249,7 @@ async fn forward(
     let end = tokio::select! {
         r = relay(&mut client, &mut up, idle, Some(fwd)) => r,
         _ = cancel.cancelled() => return cx.failed_after_allow(&allowed, SHUTDOWN).await,
+        _ = cut.cancelled() => return cx.failed_after_allow(&allowed, CUT).await,
     };
     let (why, reply) = match end {
         RelayEnd::Done(_) => return,
@@ -2783,7 +2860,7 @@ mod tests {
         };
         let teredo = "2001:0:4136:e378:8000:63bf:3fff:fdd2";
         let mut table: Vec<(String, String)> = vec![("teredo.test".into(), teredo.into())];
-        for v4 in ["10.0.0.5", "127.0.0.1", "169.254.169.254", "8.8.8.8"] {
+        for v4 in ["10.0.0.5", "127.0.0.1", "192.168.1.5", "8.8.8.8"] {
             for (i, a) in carried(v4).into_iter().enumerate() {
                 table.push((format!("f{i}-{v4}.test"), a));
             }
@@ -3466,6 +3543,56 @@ mod tests {
         let back = timeout(Duration::from_secs(30), both).await.expect("the tunnel stalled");
         assert!(back.len() == N && back.iter().all(|b| *b == b'd'));
         assert_eq!(timeout(T, server).await.unwrap().unwrap(), N);
+    }
+
+    #[tokio::test]
+    async fn cut_hosts_ends_the_tunnels_of_a_withdrawn_destination_and_only_those() {
+        let echo = echo_server().await;
+        let other_echo = echo_server().await;
+        let (p, mut rx) = start().await;
+        let (a, b) = (SessionId::from("s-cut-a"), SessionId::from("s-cut-b"));
+        let (ga, gb) = (p.grant(&a, lab()).unwrap(), p.grant(&b, lab()).unwrap());
+        let open = |g: &SessionGrant, port: u16| {
+            let req = connect_req(g, &format!("127.0.0.1:{port}"));
+            let port = g.port;
+            async move {
+                let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                s.write_all(req.as_bytes()).await.unwrap();
+                assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
+                s
+            }
+        };
+        let mut a_cut = open(&ga, echo).await;
+        let mut a_kept = open(&ga, other_echo).await;
+        let mut b_same = open(&gb, echo).await;
+        async fn echoes(s: &mut TcpStream) -> Option<[u8; 4]> {
+            s.write_all(b"ping").await.unwrap();
+            let mut got = [0u8; 4];
+            timeout(T, s.read_exact(&mut got)).await.ok().and_then(|r| r.ok()).map(|_| got)
+        }
+        assert_eq!(echoes(&mut a_cut).await, Some(*b"ping"));
+        // A pattern that covers nothing of the session cuts nothing.
+        assert_eq!(p.cut_hosts(&a, "example.test"), 0);
+        assert_eq!(p.cut_hosts(&a, &format!("127.0.0.1:{}", echo.wrapping_add(1))), 0, "another port");
+        // The destination of one tunnel of A: only that tunnel ends, and the other session's tunnel to the
+        // same destination stays.
+        assert_eq!(p.cut_hosts(&a, &format!("127.0.0.1:{echo}")), 1);
+        let mut gone = Vec::new();
+        let ended = timeout(T, a_cut.read_to_end(&mut gone)).await;
+        assert!(ended.is_ok(), "the cut tunnel must close");
+        assert_eq!(echoes(&mut a_kept).await, Some(*b"ping"));
+        assert_eq!(echoes(&mut b_same).await, Some(*b"ping"));
+        // The cut is on record as a failure after the allow, with its reason.
+        let mut reasons = Vec::new();
+        while let Ok(Some((sid, d))) = timeout(Duration::from_millis(500), rx.recv()).await {
+            if sid == a && d.rule.contains("failed after the allow") {
+                reasons.push(d.rule);
+            }
+        }
+        assert!(reasons.iter().any(|r| r.contains("the operator revoked the destination")), "{reasons:?}");
+        // A wildcard without a port covers every port of its hosts; the host form `127.0.0.1` covers both.
+        assert_eq!(p.cut_hosts(&a, "127.0.0.1"), 1);
+        assert_eq!(p.cut_hosts(&a, "127.0.0.1"), 0, "nothing left to cut");
     }
 
     /// A response as an HTTP client sees it: status, headers (names lower-cased), body.

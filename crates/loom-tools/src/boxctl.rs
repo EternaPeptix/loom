@@ -2361,10 +2361,12 @@ mod tests {
         b.ready().await.unwrap();
         assert!(b.pending_hosts().await.is_empty());
         // A grant after creation: the rules follow at once, the name resolves only after a reset.
-        grants.lock().unwrap().push("localhost".to_string());
+        // With a port: some ports of this machine's loopback are infrastructure (E1), so a name that resolves there
+        // cannot be granted on every port.
+        grants.lock().unwrap().push("localhost:8080".to_string());
         b.resync().await;
         let rules = std::fs::read_to_string(f.dir.join("rules.in")).unwrap();
-        assert!(rules.contains("-d 127.0.0.1/32 -p tcp -j ACCEPT"), "{rules}");
+        assert!(rules.contains("-d 127.0.0.1/32 -p tcp -m tcp --dport 8080 -j ACCEPT"), "{rules}");
         let pending = b.pending_hosts().await;
         assert_eq!(pending, [("localhost".to_string(), vec!["127.0.0.1".parse::<Ipv4Addr>().unwrap()])]);
         // A second resync does not change that.

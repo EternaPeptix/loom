@@ -256,6 +256,16 @@ To keep authorized offensive work unblocked, the monitor does **not** judge:
 | **E3** | **Process identity and limits.** RLIMIT_NPROC per sandboxed command. libproc inspection, with signals still sent on Unknown. A per-session sandbox marker (a read-allow on `/private/var/empty/loom-<sid>`) with pids enumerated by sandbox identity (probe required; fall back to process group plus environment, stated best effort). A 60 s census of processes and listening sockets per session. On bubblewrap, one cgroup per session | Orphans with cleared environments; fork bombs disabling the responder |
 | **E4** | **Proxy controls.** (a) `Proxy::cut(session)` and `cut_mission(mission)`: per-entry cancellation of tunnels and forwards, including reference grants. (b) Synchronous veto in the audit hook (`loom_net::proxy` already runs the audit hook before the `200`): `Err` yields a `502` for S4 destination classes and canary hosts. (c) SNI binding: read the ClientHello before relaying; SNI must be the CONNECT host or another granted name; ECH refused; `sni` recorded in `NetDecision`. (d) Canary users in the session table (CN-1). (e) Lab-port listener identity: the process listening on a granted loopback port is checked at connect, and a listener inside any loom sandbox identity is refused (TW-05). (f) Per-rule ACCEPT and DROP counters of each mission's box chain, polled every 60 s | Pause leaves tunnels open; fronting; squatting; CN-1 silent |
 
+**Status of E1 (built, phase E1).** `Policy::new` has the fixed list and `Policy::with_infrastructure(InfraSpec)` the daemon's
+(`daemon_port`, model endpoints, the box's `ssh_host`, `network.infrastructure`), checked before `deny` and every grant in
+`check_name` and `check_addr`, rule `deny infrastructure: {what}` (what TW-02 matches). The foreign per-session proxy
+listeners are the proxy's own-port rule (#39), not a policy entry. DevTools (9222, 9229) and Docker (2375, 2376) ports are
+refused on this machine only: a remote host listening on them is an ordinary target, so a lab may be granted it; the
+box's Docker host and any other infrastructure host are listed by name. `ScopeRevoke`, `POST /api/missions/{id}/scope/revoke`
+and `loom scope revoke` are served; the proxy narrows the running sessions at once and cuts the open connections to the host
+(`Proxy::cut_hosts`, a part of E4(a)); `loom open` no longer puts the login code on `/usr/bin/open`'s argv. The daemon port
+in the sandbox profile is #41's.
+
 Until E1–E4 are deployed, tripwires detect attempts but do not close these routes (§9.5).
 
 ### 2.3 What the monitor observes

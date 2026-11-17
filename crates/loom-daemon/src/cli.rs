@@ -19,7 +19,11 @@
 //!   `daemon.json` names a live pid (a daemon still shutting down), only the second wait.
 //! - `status`: `render::status`. Exit 1 when the daemon is not running (with the usual sentence).
 //! - `open`: request a login code and open `http://{bind}/#code={code}` (`/usr/bin/open` on macOS,
-//!   `xdg-open` elsewhere); `--print` only prints it. The API token is never printed or passed on argv.
+//!   `xdg-open` elsewhere); `--print` only prints it. The API token is never printed or passed on argv, and
+//!   neither is the login code: the opener is given the path of a page file (`<home>/login/login-{random}.html`,
+//!   mode 0600 in a private directory, a refresh and `location.replace` to the address, no referrer) and
+//!   not the address; pages older than five minutes are removed by the next `open`. A file that cannot be
+//!   written, or an opener that fails, is an error that says to use `loom open --print`.
 //! - `run [options] <message…>`: start a session and follow it. The message is the arguments
 //!   joined by spaces; `-` or no message reads standard input to its end. Options → `NewSession`
 //!   (`--workspace` defaults to the current directory; `--attended` sets `unattended: false`;
@@ -51,6 +55,11 @@
 //!   quoted); the operator's grant of network hosts to the mission, for the session's lifetime. Prints
 //!   `scope granted for {lead}: a, b` (`scope_line`, from the daemon's receipt), and says when the mission
 //!   keeps no ledger. The command an agent's scope request (`loom inbox`) asks the operator to run.
+//! - `scope revoke <mission> --reason <text> <host>`: `client.revoke_scope` (`mission_of`: an `m-` id as it is, or
+//!   the mission of a session word); the operator withdraws one granted host, written as it was granted. Prints
+//!   `scope revoked for {lead}: {host}; {n} session(s) narrowed, {n} connection(s) cut` (`scope_revoke_line`),
+//!   and says when the mission keeps no ledger or the grant was not in the ledger yet. A host that is not
+//!   granted is refused with the list of what is. `--reason` is required.
 //!   `release <session> <reason…>` (`-` = standard input): `client.release`; the operator closes the mission
 //!   without the goal established. Prints `closed by operator, goal not established: release sent to {lead}`
 //!   (`release_line`). A blank reason is refused.
@@ -106,7 +115,7 @@
 use crate::client::{self, Client};
 use crate::render::{self, RecordOpts, Style};
 use clap::{Args, Parser, Subcommand};
-use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt};
+use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt, ScopeRevokeReceipt};
 use loom_agent::session::Phase;
 use loom_core::config::{Config, Paths};
 use loom_core::event::{Budget, Event, Record, Seq, SessionOutcome, TurnEndReason};
@@ -400,15 +409,36 @@ pub struct ApproveArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct ScopeArgs {
+    #[command(subcommand)]
+    pub action: Option<ScopeAction>,
     /// A session id, the beginning of one, or `last`
-    pub session: String,
+    #[arg(required = true)]
+    pub session: Option<String>,
     /// Why the hosts are granted (kept in the ledger)
     #[arg(long)]
     pub note: Option<String>,
     /// The hosts, one per argument, such as api.example.com or '*.example.com'
     #[arg(required = true)]
     pub hosts: Vec<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ScopeAction {
+    /// Withdraw a granted host from a mission: its open connections are cut and new ones refused
+    Revoke(ScopeRevokeArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ScopeRevokeArgs {
+    /// A mission id (`m-…`), or a session id, the beginning of one, or `last`
+    pub mission: String,
+    /// The host exactly as it was granted
+    pub host: String,
+    /// Why (kept in the ledger and shown to the lead)
+    #[arg(long)]
+    pub reason: String,
 }
 
 #[derive(Args, Debug)]
@@ -631,6 +661,23 @@ fn scope_line(r: &ScopeReceipt) -> String {
     let mut line = format!("scope granted for {}: {}", r.lead.as_str(), r.hosts.join(", "));
     if !r.ledger {
         line.push_str("; this mission keeps no ledger, so the grant is not listed");
+    }
+    line
+}
+
+/// The line printed once the daemon accepted a scope revoke.
+fn scope_revoke_line(r: &ScopeRevokeReceipt) -> String {
+    let mut line = format!(
+        "scope revoked for {}: {}; {} session(s) narrowed, {} connection(s) cut",
+        r.lead.as_str(),
+        r.host,
+        r.sessions,
+        r.cut
+    );
+    if !r.ledger {
+        line.push_str("; this mission keeps no ledger, so the revoke is not listed and a restart does not keep it");
+    } else if !r.recorded {
+        line.push_str("; the grant was not in the ledger yet, so the revoke is not recorded there: run it again once `loom ledger` lists the grant");
     }
     line
 }
@@ -1132,9 +1179,17 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             let receipt = c.approve(&id, &text, a.scope.as_deref().unwrap_or("")).await?;
             outln(&receipt_line("approval", "scope", &receipt)).map(|()| 0)
         }
+        Command::Scope(ScopeArgs { action: Some(ScopeAction::Revoke(a)), .. }) => {
+            let c = client_of(&paths)?;
+            let mission = c.mission_of(&a.mission).await?;
+            let receipt = c.revoke_scope(&mission, &a.host, &a.reason).await?;
+            outln(&scope_revoke_line(&receipt)).map(|()| 0)
+        }
         Command::Scope(a) => {
             let c = client_of(&paths)?;
-            let id = c.resolve(&a.session).await?;
+            let word =
+                a.session.as_deref().ok_or("Name the session to grant the hosts to: loom scope <session> <host>…")?;
+            let id = c.resolve(word).await?;
             let receipt = c.grant_scope(&id, &a.hosts, a.note.as_deref()).await?;
             outln(&scope_line(&receipt)).map(|()| 0)
         }
@@ -1331,30 +1386,106 @@ async fn open_with(
     Ok(0)
 }
 
-/// Hand `url` to the desktop's opener.
-fn launch_browser(url: &str) -> Result<(), String> {
-    let program = if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
-    let status = std::process::Command::new(program)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| {
-            format!("Cannot start {program} ({e}). Run `loom open --print` and open the address in a browser yourself.")
-        })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{program} could not open the address. Run `loom open --print` and open it in a browser yourself."))
+/// How long a login page stays on disk before the next `open` removes it (its code is dead long before).
+const LOGIN_PAGE_KEEP: Duration = Duration::from_secs(300);
+
+/// The page that sends the browser to `url` (which holds the login code in its fragment), as a file in
+/// `dir` (a private directory under the loom home) that only this user can read. The opener is given the
+/// path of this file and never the address, so the code is not in any process's arguments, where another
+/// local process could read it while the opener runs. Pages older than [`LOGIN_PAGE_KEEP`] are removed.
+fn write_login_page(dir: &Path, url: &str) -> Result<PathBuf, String> {
+    loom_core::config::ensure_private_dir(dir).map_err(|e| {
+        format!(
+            "Cannot create {} ({e}). Run `loom open --print` and open the address in a browser yourself.",
+            dir.display()
+        )
+    })?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > LOGIN_PAGE_KEEP);
+            if old && entry.file_name().to_string_lossy().starts_with("login-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
+    let escaped = url.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;");
+    let script = serde_json::to_string(url).map_err(|e| format!("The address cannot be encoded ({e})."))?;
+    let page = format!(
+        "<!doctype html><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><title>loom</title>\n\
+         <meta http-equiv=\"refresh\" content=\"0;url={escaped}\">\n\
+         <script>location.replace({script});</script>\n\
+         <p>Opening loom. If nothing happens, <a href=\"{escaped}\">continue</a>.</p>\n"
+    );
+    let path = dir.join(format!("login-{}.html", hex::encode(rand::random::<[u8; 16]>())));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&path).map_err(|e| {
+        format!(
+            "Cannot write {} ({e}). Run `loom open --print` and open the address in a browser yourself.",
+            path.display()
+        )
+    })?;
+    file.write_all(page.as_bytes()).map_err(|e| {
+        format!(
+            "Cannot write {} ({e}). Run `loom open --print` and open the address in a browser yourself.",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+/// Hand `url` to the desktop's opener, through a page file in `dir` so that the address (with its login
+/// code) is not on the opener's command line. `run(program, page)` starts the opener.
+fn launch_browser_with(
+    dir: &Path,
+    url: &str,
+    run: impl FnOnce(&str, &Path) -> std::io::Result<bool>,
+) -> Result<(), String> {
+    let program = if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
+    let page = write_login_page(dir, url)?;
+    match run(program, &page) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            let _ = std::fs::remove_file(&page);
+            Err(format!(
+                "{program} could not open the address. Run `loom open --print` and open it in a browser yourself."
+            ))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&page);
+            Err(format!(
+                "Cannot start {program} ({e}). Run `loom open --print` and open the address in a browser yourself."
+            ))
+        }
+    }
+}
+
+/// Hand `url` to the desktop's opener (see [`launch_browser_with`]).
+fn launch_browser(dir: &Path, url: &str) -> Result<(), String> {
+    launch_browser_with(dir, url, |program, page| {
+        std::process::Command::new(program)
+            .arg(page)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+    })
 }
 
 async fn cmd_open(paths: &Paths, a: &OpenArgs) -> Result<i32, String> {
     let c = client_of(paths)?;
     // Say "not running" here rather than hand the browser an address nothing answers on.
     c.status().await?;
-    open_with(&c, a, &mut StdoutSink, launch_browser).await
+    let dir = paths.home.join("login");
+    open_with(&c, a, &mut StdoutSink, |url| launch_browser(&dir, url)).await
 }
 
 async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
@@ -1698,11 +1829,21 @@ mod tests {
         assert_eq!((a.text, a.scope.as_deref()), (words(&["ship", "it"]), Some("staging")));
         rejected(&["approve"]);
         let Command::Scope(a) = ok(&["scope", "last", "docs.example.test", "*.cdn.test"]) else { panic!("not scope") };
-        assert_eq!((a.session.as_str(), a.hosts, a.note), ("last", words(&["docs.example.test", "*.cdn.test"]), None));
+        assert_eq!(
+            (a.session.as_deref(), a.hosts, a.note),
+            (Some("last"), words(&["docs.example.test", "*.cdn.test"]), None)
+        );
         let Command::Scope(a) = ok(&["scope", "s-1", "a.test", "--note", "for the docs"]) else { panic!("not scope") };
         assert_eq!((a.hosts, a.note.as_deref()), (words(&["a.test"]), Some("for the docs")));
         rejected(&["scope"]);
         rejected(&["scope", "s-1"]);
+        let Command::Scope(a) = ok(&["scope", "revoke", "m-1", "a.test", "--reason", "wrong target"]) else {
+            panic!("not scope revoke")
+        };
+        let Some(ScopeAction::Revoke(r)) = a.action else { panic!("not revoke") };
+        assert_eq!((r.mission.as_str(), r.host.as_str(), r.reason.as_str()), ("m-1", "a.test", "wrong target"));
+        rejected(&["scope", "revoke", "m-1", "a.test"]);
+        rejected(&["scope", "revoke", "m-1", "--reason", "x"]);
         let Command::Release(a) = ok(&["release", "s-1", "target", "is", "gone"]) else { panic!("not release") };
         assert_eq!((a.session.as_str(), a.reason), ("s-1", words(&["target", "is", "gone"])));
         rejected(&["release"]);
@@ -1874,6 +2015,62 @@ mod tests {
         let script = shared.lock().unwrap();
         assert_eq!((script.seen[0].method.as_str(), script.seen[0].target.as_str()), ("POST", "/api/login-codes"));
         assert_eq!(script.seen[0].auth.as_deref(), Some("Bearer tok-123"));
+    }
+
+    #[test]
+    fn the_login_code_is_in_a_private_page_file_and_not_on_the_openers_command_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let login = dir.path().join("login");
+        let url = "http://127.0.0.1:7878/#code=c0de1234&x=\"<y>";
+        let mut argv: Vec<String> = Vec::new();
+        let mut page_text = String::new();
+        let res = launch_browser_with(&login, url, |program, page| {
+            argv = vec![program.to_string(), page.display().to_string()];
+            page_text = std::fs::read_to_string(page).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(std::fs::metadata(page).unwrap().permissions().mode() & 0o777, 0o600);
+                assert_eq!(std::fs::metadata(page.parent().unwrap()).unwrap().permissions().mode() & 0o077, 0);
+            }
+            Ok(true)
+        });
+        assert_eq!(res, Ok(()));
+        // Nothing the opener is started with holds the code or the address.
+        assert!(argv.iter().all(|a| !a.contains("c0de1234") && !a.contains("127.0.0.1:7878")), "{argv:?}");
+        assert!(argv[1].starts_with(login.to_str().unwrap()) && argv[1].ends_with(".html"), "{argv:?}");
+        // The page sends the browser on, with the address escaped where it is markup.
+        assert!(page_text.contains("http://127.0.0.1:7878/#code=c0de1234&amp;x=&quot;&lt;y&gt;"), "{page_text}");
+        assert!(page_text.contains("location.replace(") && page_text.contains("no-referrer"), "{page_text}");
+        // Another page is another file; an old page is removed by the next open, a fresh one is not.
+        let old = login.join("login-old.html");
+        std::fs::write(&old, "x").unwrap();
+        let aged = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(aged).unwrap();
+        let keep = login.join("notes.txt");
+        std::fs::write(&keep, "mine").unwrap();
+        assert_eq!(launch_browser_with(&login, url, |_, _| Ok(true)), Ok(()));
+        assert!(!old.exists(), "a stale page is removed");
+        assert!(keep.exists(), "other files are left alone");
+        assert_eq!(
+            std::fs::read_dir(&login)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("login-"))
+                .count(),
+            2
+        );
+        // An opener that fails leaves no page and says what to do.
+        let before = std::fs::read_dir(&login).unwrap().count();
+        let err = launch_browser_with(&login, url, |_, _| Ok(false)).unwrap_err();
+        assert!(err.contains("loom open --print"), "{err}");
+        let err = launch_browser_with(&login, url, |_, _| Err(std::io::Error::other("no opener"))).unwrap_err();
+        assert!(err.contains("no opener") && err.contains("loom open --print"), "{err}");
+        assert_eq!(std::fs::read_dir(&login).unwrap().count(), before);
+        // A directory that cannot be made is an error that says what to do.
+        std::fs::write(dir.path().join("file"), "x").unwrap();
+        let err = launch_browser_with(&dir.path().join("file").join("login"), url, |_, _| Ok(true)).unwrap_err();
+        assert!(err.contains("loom open --print"), "{err}");
     }
 
     #[tokio::test]
