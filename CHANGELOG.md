@@ -14,6 +14,25 @@
   and profile). `items[].note` names the kind of a `harness_note` item; `Weave::resume_chars` counts the resume block.
 - `est_tokens` now counts the tool list in bytes, as `session` does (it counted characters). No stored shape changed.
 
+### Web UI: phone pass 1 and the context card
+
+- **Phones (699px and under).** The session scrolls as one: `#view-session` is the only vertical scroller, the tabs stick under the
+  bar and the composer to the bottom, a tool output has no scroll box of its own (visible chat at 375x812 was 191px, now about
+  590px). A session with its own open question lands on that card, and the Jump button never covers it (an amber "Approval
+  waiting · Show" while it is off screen). The bar is one row of about 52px: Missions (with the count that need you), the
+  title over the model and run state, and Find; its button opens the new **Session details sheet** (run with a confirmed
+  Stop, context, model, view, session actions). Find is a two-row sticky bar of about 100px. The composer is a grid of about 110-130px
+  with a one-line caption ("Plan 1 of 3 · context 9% · cache 98% ›") that opens the sheet; on the other tabs it is one "Message
+  the lead…" button. With a coarse pointer Enter adds a line and Ctrl/Cmd+Enter sends; a narrow window with a mouse still sends
+  on Enter. Work-group headers have a short form, text is 16px and targets 44px for touch, and the viewport allows safe areas.
+- **Context card** (the inspector's Context tab and the sheet): the size with its window and share, one bar whose segments are
+  also the legend (colour family plus a pattern, never colour alone), rows by group, the fold marks from the daemon's effective
+  `fold_at` / `fold_to` in words and shapes (no amber), the cached/read-anew split, and notes. Estimates carry "~". Needs the
+  additive `/window` fields below; an older daemon's answer shows the hero only.
+- Riders: a profile named for its model is said once; the session id chip ends in an ellipsis when cut; the page title counts what
+  needs you; the Models-panel row class no longer collides with the chat's chip row; the inspector tabs scroll instead of wrapping;
+  the notification line says why they are off; `#f-workspace` turns autocorrect off. UI only apart from the `/window` fields.
+
 ### Web UI: copy buttons and opt-in copy on select
 
 - Copy buttons: Copy reply (the exact raw text), Copy code (a fenced block without its fence), Copy message

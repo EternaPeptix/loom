@@ -501,6 +501,57 @@ async function createSession(data) {
   emit({ type: "session", info });
   return { status: 201, value: { ...info, created } };
 }
+
+// GET /api/sessions/{id}/window as the daemon answers it (WindowView with the additive breakdown, measured_now, last_request, fold_at
+// and fold_to). The parts are characters at a ratio, scaled to the server's count the way the daemon does it, so they add up.
+// s-quiet has no counted request (the default-ratio basis), s-notify has no known window, s-parked is past its fold mark with
+// nothing cached, and the rest are counted.
+const PART_CHARS = { system: 18234, tools: 61230, rules: 640, assignment: 0, resume: 5200, conversation: 172850, tool_output: 229560, pinned: 11575, agent_reports: 16361, notes: 3636, stubs: 36506, other: 0 };
+const PART_COUNT = { tools: 42, rules: 2, assignment: 0, conversation: 96, tool_output: 128, pinned: 3, agent_reports: 2, notes: 6, stubs: 57, other: 0 };
+function windowFor(info) {
+  const st = (info && info.status) || {};
+  const id = info ? info.id : "";
+  const win = id === "s-notify" ? null : info && info.context_window ? info.context_window : 262144;
+  const counted = id !== "s-quiet";
+  const total = id === "s-parked" ? 120000 : Math.max(20000, st.prompt_tokens || 148812);
+  const ratio = 3.3;
+  // The characters are kept in proportion to the size the session has, at about 3.6 characters a token when counted.
+  const mult = (total * (counted ? 3.6 : ratio)) / Object.values(PART_CHARS).reduce((a, b) => a + b, 0);
+  const chars = Object.fromEntries(Object.entries(PART_CHARS).map(([k, c]) => [k, Math.round(c * mult)]));
+  const raw = Object.fromEntries(Object.entries(chars).map(([k, c]) => [k, Math.ceil(c / ratio)]));
+  const hudChars = 2310;
+  const rawHud = Math.ceil(hudChars / ratio);
+  const rawSum = Object.values(raw).reduce((a, b) => a + b, 0) + rawHud;
+  const estTotal = Math.ceil(rawSum * 1.005);
+  const measured = counted ? total : null;
+  const factor = measured ? measured / estTotal : 1;
+  const segments = Object.entries(raw).map(([key, t]) => ({ key, chars: chars[key], tokens: Math.floor(t * factor), ...(key in PART_COUNT ? { count: PART_COUNT[key] } : {}) }));
+  const used = segments.reduce((a, x) => a + x.tokens, 0) + Math.floor(rawHud * factor);
+  const grand = measured || estTotal;
+  segments.push({ key: "framing", chars: 0, tokens: Math.max(0, grand - used) });
+  segments.push({ key: "hud", chars: hudChars, tokens: Math.floor(rawHud * factor) });
+  const sum = segments.reduce((a, x) => a + x.tokens, 0);
+  const lastPrompt = counted ? Math.round(total * 0.984) : 0;
+  const foldAt = win ? Math.min(400000, Math.floor(win / 5 * 4), win - 20480) : 400000;
+  const foldTo = win ? Math.min(180000, Math.floor(win / 2)) : 180000;
+  return {
+    epoch: 3, est_tokens: estTotal, target_tokens: 400000, floor_tokens: 180000, context_window: win,
+    prompt_tokens: lastPrompt, cached_tokens: id === "s-parked" ? 0 : counted ? Math.round(lastPrompt * 0.88) : 0,
+    items: [
+      { seq: 1, kind: "session_start", role: "system", chars: PART_CHARS.system, state: "live", pinned: false, call_id: null, class: null, preview: "You are the lead of this mission. The workspace is /fixture/loom." },
+      { seq: 2, kind: "user_message", role: "user", chars: 420, state: "live", pinned: false, call_id: null, class: null, preview: "Audit the reliability of the retry path and report what you find." },
+      { seq: 3, kind: "harness_note", role: "user", chars: 320, state: "live", pinned: false, call_id: null, class: null, preview: "<harness kind=\"constraint\">Do not push to main.", note: "constraint" },
+      { seq: 5, kind: "model_response", role: "assistant", chars: 880, state: "live", pinned: false, call_id: null, class: null, preview: "Reading the retry module first." },
+      { seq: 6, kind: "tool_result", role: "tool", chars: 6400, state: "live", pinned: true, call_id: "c-1", class: "read", preview: "pub fn backoff(attempt: u32) -> Duration {" },
+      { seq: 9, kind: "tool_result", role: "tool", chars: 180, state: "stubbed", pinned: false, call_id: "c-2", class: "exec", preview: "[evicted from view; the call and its result remain in the session record]" },
+    ],
+    breakdown: { basis: measured ? "scaled_to_measured" : "default_ratio", chars_per_token: measured ? Math.round(ratio / factor * 100) / 100 : ratio, total_tokens: sum, segments },
+    measured_now: measured,
+    last_request: { req_id: "r-41", step: 41, epoch: 3, n_messages: 120, est_tokens: estTotal, prompt_tokens: lastPrompt, cached_tokens: id === "s-parked" ? 0 : counted ? Math.round(lastPrompt * 0.88) : 0, hud_bytes: hudChars },
+    fold_at: id === "s-parked" ? 100000 : foldAt, fold_to: id === "s-parked" ? 60000 : foldTo,
+  };
+}
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://localhost");
@@ -615,7 +666,7 @@ const server = createServer(async (req, res) => {
     if (path === "/api/models") return json(res, { default_model: "dsv41", models: profiles });
     if (path.endsWith("/records")) { const after = Number(url.searchParams.get("after") ?? -1); return json(res, { records: (logs.get(path.split("/")[3]) || []).filter(r => r.seq > after), next_after: null }); }
     if (path.endsWith("/ledger")) return json(res, { state: ledgers.get(decodeURIComponent(path.split("/")[3] || "")) || { entries: 0 }, markdown: "" });
-    if (path.endsWith("/window")) return json(res, { est_tokens: 86000, prompt_tokens: 86000, cached_tokens: 84000, epoch: 1, context_window: 1000000, floor_tokens: 180000, target_tokens: 400000, items: [] });
+    if (path.endsWith("/window")) return json(res, windowFor(sessions.find(x => x.id === decodeURIComponent(path.split("/")[3] || ""))));
     if (path.endsWith("/net")) return json(res, []);
     const rawMatch = path.match(/^\/api\/blobs\/([^/]+)\/raw$/);
     if (rawMatch) {

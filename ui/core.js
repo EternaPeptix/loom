@@ -557,6 +557,10 @@ export function rowActivity(info, lastRecord, now) {
 }
 
 const WAITING_NOUN = { approval: "Approval", question: "Question", blocker: "Blocker", parked: "Parked session" };
+/** What waits, in the sidebar's noun: "Approval waiting". */
+export function waitingNoun(kind) {
+  return `${WAITING_NOUN[kind] || "Request"} waiting`;
+}
 const capitalized = (text) => text.charAt(0).toUpperCase() + text.slice(1);
 
 /**
@@ -874,7 +878,7 @@ export function inboxCounts(inbox) {
 
 export function pageTitle({ open, blocking }) {
   if (!open) return "loom";
-  return blocking ? `(${open}) needs you · loom` : `(${open}) loom`;
+  return blocking ? `(${blocking}) needs you · loom` : `(${open}) loom`;
 }
 
 export function inboxKindWords(kind) {
@@ -1236,7 +1240,9 @@ function step(store, rec) {
       // profile was reloaded). Not shown to the model; one line for the operator.
       const side = (m) => {
         const win = m && m.context_window ? `, ${tokens(m.context_window)} context` : "";
-        return `${oneLine((m && m.profile) || "?", 80)} (${oneLine((m && m.model) || "?", 80)}${win})`;
+        const profile = oneLine((m && m.profile) || "?", 80);
+        const model = oneLine((m && m.model) || "?", 80);
+        return model === profile ? `${profile}${win ? " (" + win.slice(2) + ")" : ""}` : `${profile} (${model}${win})`;
       };
       const reason = rec.reason ? ` · ${oneLine(rec.reason, 120)}` : "";
       const to = modelEntry(rec, rec.to);
@@ -1380,10 +1386,57 @@ export function atEnd(scrollTop, clientHeight, scrollHeight, slack = 48) {
   return scrollHeight - (scrollTop + clientHeight) <= slack;
 }
 
-/** What a key press in the composer does. */
-export function composerAction({ key, shiftKey, isComposing, text }) {
-  if (key !== "Enter" || shiftKey || isComposing) return "none";
+/**
+ * What a key press in the composer does. Ctrl/Cmd+Enter (`mod`) sends everywhere. A plain Enter sends with a fine pointer and
+ * adds a line with a coarse one (a phone's Return key), where Send is the button.
+ */
+export function composerAction({ key, shiftKey, isComposing, text, coarse = false, mod = false }) {
+  if (key !== "Enter" || isComposing) return "none";
+  if (!mod && (shiftKey || coarse)) return "none";
   return String(text ?? "").trim() ? "send" : "ignore";
+}
+
+/**
+ * The help under the message box: {keys, note}. `keys` names the keys and is empty on a coarse pointer, which has no
+ * Enter-to-send to teach; `note` says what a message does and is kept whole.
+ */
+export function composerHelp({ coarse = false, paused = false, running = false, lead = false } = {}) {
+  const note = [];
+  if (paused) note.push("A message does not answer the open question.");
+  if (running) note.push(lead ? "It reaches the lead between steps." : "It is read between steps.");
+  return { keys: coarse ? "" : "Enter sends · Shift+Enter adds a line.", note: note.join(" ") };
+}
+
+/**
+ * The one-line caption on the phone composer: {text, label}. `line` is progressLine() output and `stats` sessionStats(); the
+ * text is "Plan 1 of 3 · context 9% · cache 98%" (ellipsized by the page), the label the full sentence for its button.
+ */
+export function composerCaption({ line, stats } = {}) {
+  const parts = [];
+  const spoken = [];
+  const plan = line && line.parts.find((p) => p.key === "plan");
+  if (plan) { parts.push(plan.text.replace(/ done$/, "")); spoken.push(plan.text); }
+  const context = stats && stats.context;
+  if (context) { parts.push(context.replace(/ of \S+$/, "")); spoken.push(context); }
+  if (stats && stats.cache) { parts.push(stats.cache); spoken.push(stats.cache); }
+  return { text: parts.join(" · ") || "Session details", label: "Session details" + (spoken.length ? ": " + spoken.join(", ") : "") };
+}
+
+/** The label of the Missions button on a phone: how many missions need the operator, said in words. */
+export function missionsLabel(blocking) {
+  const n = Number(blocking) || 0;
+  return n > 0 ? `Missions, ${n} ${n === 1 ? "needs" : "need"} you` : "Missions";
+}
+
+/**
+ * Which button the chat shows over its foot: "needs" while the session's own question is off screen (it says what waits and
+ * takes the operator to it), "latest" while the chat is scrolled away from the end, else "hidden". It is hidden while that
+ * question is on screen (`cardShown`), so it never covers an answer.
+ */
+export function jumpMode({ section, follow, needsOffscreen, cardShown = false }) {
+  if (section !== "chat" || cardShown) return "hidden";
+  if (needsOffscreen) return "needs";
+  return follow ? "hidden" : "latest";
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1655,10 +1708,6 @@ export function meterModel({ inView, windowSize, floor, target }) {
     over: target > 0 && inView > target,
     label: known ? `${tokens(inView)} of ${tokens(windowSize)}` : `${tokens(inView)}`,
   };
-}
-
-export function windowMeter(w) {
-  return meterModel({ inView: w.est_tokens, windowSize: w.context_window || 0, floor: w.floor_tokens, target: w.target_tokens });
 }
 
 /** The small meter in the transcript header, from the session status alone. */
@@ -2399,6 +2448,7 @@ export function groupLabel(group, now) {
   return {
     text: [`Worked for ${duration}`, ...rest].join(" · "),
     spoken: [group.running ? "Work in progress" : `Worked for ${duration}`, ...rest].join(" · "),
+    short: [`Worked ${duration}`, count(group.toolCount, "call"), ...(group.running ? ["running"] : [])].join(" · "),
     duration, tools: group.toolCount, failed: group.failed || 0, exited: group.exited || 0, denied: group.denied || 0, invalid: group.invalid || 0,
     timedOut: group.timedOut || 0, interrupted: group.interrupted || 0, partial: group.partial || 0, missing: group.missing, warnings: group.warnings || 0, running: group.running,
   };
@@ -2687,9 +2737,10 @@ export function workspaceGroups(store, inbox, watermarks, now, opts = {}) {
 
 // ---- identity bar
 
-/** The first 10 characters of a session id, for the id button. */
+/** The first 10 characters of a session id, for the id button; an ellipsis says when it was cut. */
 export function shortId(id) {
-  return String(id || "").slice(0, 10);
+  const s = String(id || "");
+  return s.length > 10 ? s.slice(0, 10) + "…" : s;
 }
 
 /**
@@ -2745,7 +2796,8 @@ export function identityChips(info, status, opts = {}) {
   const health = ((status && status.models) || []).find((m) => m.profile === cur.profile) || null;
   const win = cur.context_window || (health && health.context_window) || 0;
   const modelId = cur.model || (health && health.model) || "";
-  const textParts = [cur.profile || "unknown profile", modelId, formatWindow(win)].filter(Boolean);
+  // A profile named for its model says it once ("dsv41 · 1M", not "dsv41 · dsv41 · 1M").
+  const textParts = [cur.profile || "unknown profile", modelId === cur.profile ? "" : modelId, formatWindow(win)].filter(Boolean);
   const reachable = health ? !!health.reachable : null;
   const tip = [`${cur.profile} · ${modelId}`.trim()];
   if (health && health.base_url) tip.push(health.base_url);
@@ -3883,3 +3935,176 @@ export function fileMetaWords(entry, now) {
 
 /** The sentence the file viewer carries: this is the file now, not what the agent read. */
 export const FILE_NOW_WORDS = "File in the workspace now — it may have changed since the agent read it.";
+
+// ---------------------------------------------------------------------------------------------
+// Context card: what the model's request is made of (GET /api/sessions/{id}/window)
+
+/**
+ * The parts of a request, in the order the bar and the rows share. `family` picks the colour token (setup, carry, conv,
+ * fold), `pattern` the fill (a solid, hatched, dotted, outlined or crossed segment, so a part is told apart by its pattern as
+ * well as its colour), `group` the caption its row sits under, `counted` whether its label carries the number of things in it.
+ */
+export const CTX_PARTS = [
+  { key: "system", label: "System prompt", family: "setup", pattern: "solid", group: "setup" },
+  { key: "tools", label: "Tool definitions", family: "setup", pattern: "hatch", group: "setup", counted: true },
+  { key: "rules", label: "Rules and approvals", family: "setup", pattern: "dots", group: "setup", note: "Yours, verbatim; never folded." },
+  { key: "assignment", label: "Assignment from parent", family: "setup", pattern: "outline", group: "setup" },
+  { key: "resume", label: "Re-weave brief", family: "carry", pattern: "hatch", group: "carry", note: "Written when older context was folded; may include leads written by the model, not verified." },
+  { key: "notes", label: "Harness notes", family: "carry", pattern: "dots", group: "carry", counted: true },
+  { key: "conversation", label: "Messages and replies", family: "conv", pattern: "solid", group: "conv", always: true },
+  { key: "tool_output", label: "Tool output", family: "conv", pattern: "hatch", group: "conv", counted: true },
+  { key: "pinned", label: "Pinned output", family: "conv", pattern: "dots", group: "conv", counted: true },
+  { key: "agent_reports", label: "Agent reports", family: "conv", pattern: "cross", group: "conv", counted: true },
+  { key: "stubs", label: "Folded-out stubs", family: "fold", pattern: "dashed", group: "fold", counted: true, note: "The full output stays in the record." },
+  { key: "other", label: "Other records", family: "fold", pattern: "light", group: "fold" },
+  { key: "framing", label: "Message framing", family: "fold", pattern: "light", group: "fold" },
+  { key: "hud", label: "Harness state (as last sent)", family: "carry", pattern: "solid", group: "sent", note: "Sent fresh at the end of each request; never cached or folded; size as last sent." },
+];
+export const CTX_GROUPS = { setup: "Setup", carry: "Carried over", conv: "Conversation", fold: "Folded and framing", sent: "This request only" };
+
+/** Widths below this share of the window are widened to it, and parts too small to hold it are merged into one sliver. */
+export const CTX_MIN_PCT = 0.8;
+
+/**
+ * Bar widths for `segments` ([{key, tokens}]) against `scale` tokens, in percent. A nonzero part narrower than `minPct` is
+ * widened to it, the excess taken in proportion from the parts at least four times as wide; when the bar is too small to
+ * hold every minimum, the narrow parts become one sliver ({key: "small", merged: [keys]}) of their true width. The widths
+ * always add up to what the tokens say, so a small part never inflates the fill. Returns [{key, pct, merged?}].
+ */
+export function segmentLayout(segments, scale, { minPct = CTX_MIN_PCT } = {}) {
+  const base = (segments || []).filter((s) => s && s.tokens > 0).map((s) => ({ key: s.key, pct: scale > 0 ? (100 * s.tokens) / scale : 0 }));
+  const tiny = base.filter((s) => s.pct < minPct);
+  if (!tiny.length) return base;
+  const donors = base.filter((s) => s.pct >= 4 * minPct);
+  const need = tiny.reduce((sum, s) => sum + (minPct - s.pct), 0);
+  const pool = donors.reduce((sum, s) => sum + s.pct, 0);
+  if (donors.length && pool - need >= donors.length * 3 * minPct) {
+    return base.map((s) => {
+      if (s.pct < minPct) return { key: s.key, pct: minPct };
+      return donors.includes(s) ? { key: s.key, pct: s.pct - (need * s.pct) / pool } : s;
+    });
+  }
+  const sliver = { key: "small", pct: tiny.reduce((sum, s) => sum + s.pct, 0), merged: tiny.map((s) => s.key) };
+  const out = [];
+  let placed = false;
+  for (const s of base) {
+    if (s.pct >= minPct) out.push(s);
+    else if (!placed) { out.push(sliver); placed = true; }
+  }
+  return out;
+}
+
+function ctxPercent(part, whole) {
+  if (!(whole > 0) || !(part > 0)) return 0;
+  return (100 * part) / whole;
+}
+
+/** "58%", "<1%" for a share above 0 and under a half, "0%" for none. */
+export function percentWords(share) {
+  if (!(share > 0)) return "0%";
+  return share < 0.5 ? "<1%" : Math.round(share) + "%";
+}
+
+/**
+ * The context card from a `/window` answer: {parts, hero, sub, basis, bar, rows, fold, cache, notes} or, for an answer without a
+ * breakdown (an older daemon), {parts: false, hero, ...} with only what that answer holds.
+ *
+ *   hero  {figure:"~151k", approx, denominator:"of 262k tokens", exact:"262,144 tokens", percent:"58%", share, windowKnown}
+ *   sub   one sentence on where the figure comes from
+ *   basis one sentence on how the parts were estimated (null without parts)
+ *   bar   {scale, scaleNote, segments:[{key,label,tokens,pct,family,pattern,labelled}], free:{pct,tokens}|null, label (for aria)}
+ *   rows  [{key,label,count,value:"~4.9k",tokens,share,family,pattern,group,note}], dropping a zero part except Messages and replies
+ *   fold  {at, to, text, past:{text}|null} marks drawn only when both are known and inside the scale
+ *   cache {cached, fresh, of, text, none} of the last counted request, or null
+ *   notes [{label, note}] the row notes, behind one disclosure
+ */
+export function contextCardModel(w) {
+  const win = Number(w && w.context_window) || 0;
+  const b = w && w.breakdown;
+  const segs = b && Array.isArray(b.segments) ? b.segments : [];
+  const parts = segs.length > 0;
+  const total = parts ? Number(b.total_tokens) || 0 : Number(w && w.est_tokens) || 0;
+  const last = (w && w.last_request) || null;
+  const counted = last && last.prompt_tokens > 0 ? last.prompt_tokens : 0;
+  const measured = Number(w && w.measured_now) > 0 ? Number(w.measured_now) : 0;
+  const approx = !(measured > 0 && measured === counted && total === measured);
+  const share = ctxPercent(total, win);
+  const hero = {
+    figure: (approx ? "~" : "") + tokens(total),
+    approx,
+    tokens: total,
+    denominator: win ? `of ${tokens(win)} tokens` : "tokens · limit unknown",
+    exact: win ? `${num(win)} tokens` : "",
+    percent: win ? percentWords(share) : "",
+    share,
+    windowKnown: win > 0,
+  };
+  let sub;
+  if (measured && counted) {
+    const added = Math.max(0, measured - counted);
+    sub = `Last request ${tokens(counted)}, counted by the server${added > 0 ? ` · about ${tokens(added)} added since` : ""}`;
+  } else if (measured) {
+    sub = "Counted by the server at the last answered request, plus an estimate of what was added since.";
+  } else {
+    sub = "Estimated from characters; no request in this context epoch has been counted yet.";
+  }
+  let basis = null;
+  if (parts) {
+    const cpt = Number(b.chars_per_token) || 0;
+    basis = b.basis === "scaled_to_measured"
+      ? `Parts estimated from characters and scaled to the total (${cpt.toFixed(2)} characters a token).`
+      : `Parts estimated from characters at ${trimZeros(cpt.toFixed(1))} a token; not yet checked against a server count.`;
+  }
+  const byKey = new Map(segs.map((s) => [s.key, s]));
+  const rows = [];
+  const barParts = [];
+  for (const def of parts ? CTX_PARTS : []) {
+    const seg = byKey.get(def.key);
+    const t = seg ? Number(seg.tokens) || 0 : 0;
+    if (!(t > 0) && !def.always) continue;
+    const n = seg && Number.isFinite(seg.count) && def.counted ? seg.count : null;
+    const label = n === null ? def.label : `${def.label} · ${num(n)}`;
+    rows.push({ key: def.key, label, count: n, value: "~" + tokens(t), tokens: t, share: ctxPercent(t, total), family: def.family, pattern: def.pattern, group: def.group, note: def.note || "" });
+    barParts.push({ key: def.key, tokens: t });
+  }
+  const foldAt = Number(w && w.fold_at) || 0;
+  const foldTo = Number(w && w.fold_to) || 0;
+  const known = win > 0;
+  const scale = known ? win : Math.max(foldAt * 1.25, total * 1.1, 1);
+  const layout = segmentLayout(barParts, scale);
+  const defs = new Map(CTX_PARTS.map((d) => [d.key, d]));
+  const segments = layout.map((l) => {
+    if (l.merged) return { key: "small", label: "Small parts", tokens: l.merged.reduce((sum, k) => sum + (byKey.get(k) ? Number(byKey.get(k).tokens) || 0 : 0), 0), pct: l.pct, family: "fold", pattern: "light", labelled: false, merged: l.merged };
+    const d = defs.get(l.key);
+    const row = rows.find((r) => r.key === l.key);
+    return { key: l.key, label: d.label, tokens: row ? row.tokens : 0, pct: l.pct, family: d.family, pattern: d.pattern, labelled: l.pct >= 18 };
+  });
+  const filled = layout.reduce((sum, s) => sum + s.pct, 0);
+  const freePct = known ? Math.max(0, 100 - filled) : 0;
+  const spoken = rows.filter((r) => r.tokens > 0).map((r) => `${r.label.replace(/ · \d.*$/, "")} ${percentWords(ctxPercent(r.tokens, known ? win : total))}`);
+  if (known) spoken.push(`free ${percentWords(freePct)}`);
+  const barLabel = known
+    ? `Context use ${hero.percent} of ${num(win)} tokens: ${spoken.join(", ")}`
+    : `Context use about ${tokens(total)} tokens, limit unknown: ${spoken.join(", ")}`;
+  const inside = (v) => v > 0 && v <= scale;
+  const foldInfo = foldAt > 0 && foldTo > 0 && inside(foldAt) ? {
+    at: foldAt, to: foldTo, atPct: ctxPercent(foldAt, scale), toPct: ctxPercent(foldTo, scale),
+    text: `▼ folds at ${tokens(foldAt)} · ▽ down to ${tokens(foldTo)}`,
+    past: total > foldAt ? { text: "Past the fold mark: older output folds at the next step." } : null,
+  } : null;
+  let cache = null;
+  if (last && counted > 0) {
+    const cached = Math.min(Math.max(0, Number(last.cached_tokens) || 0), counted);
+    cache = {
+      cached, fresh: counted - cached, of: counted, none: cached === 0,
+      text: cached === 0 ? "No cached tokens reported. The server may not report caching."
+        : `Last request: ${tokens(cached)} from the cache · ${tokens(counted - cached)} read anew`,
+    };
+  }
+  return {
+    parts, hero, sub, basis,
+    bar: { scale, known, scaleNote: known ? "" : "scale: fold mark + 25%", segments, free: known ? { pct: freePct, tokens: Math.max(0, win - total) } : null, label: barLabel },
+    rows, fold: foldInfo, cache,
+    notes: [...rows.filter((r) => r.note).map((r) => ({ label: r.label.replace(/ · \d.*$/, ""), note: r.note }))],
+  };
+}

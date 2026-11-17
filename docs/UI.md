@@ -101,9 +101,13 @@ chip. At 1100px and narrower the sidebar and inspector are drawers, and the top 
 their buttons and a compact identity summary of the open session that is always in view: `#bar-model`
 (the profile, in the look of `#s-model`, its tooltip the full model text, with the unreachable
 warning) and `#bar-run` (the run state with its shape). Both follow the header on every update and are
-hidden when no session is open. Below 700px they take their own row under the two drawer buttons. A
-lost connection is also said in the bar there (under 700px only, so a screen reader does not hear it
-twice beside the open sidebar).
+hidden when no session is open. They sit inside one button, `#bar-details`, which opens the session details sheet (see
+"Phone layout"); from 700px up it is the same chip row as before. Below 700px the bar is one row of about 52px: the
+Missions button (`#open-left`, a menu drawing with the word read out, and `#bar-needs`, a diamond and the number of
+blocking items, so its name is "Missions, 3 need you"), the session as two lines (`#bar-title`, then the model and run state
+in one ellipsized line with their shapes), and `#bar-find`. A lost connection is also said in the bar there (under 700px
+only, so a screen reader does not hear it twice beside the open sidebar): a visible alert shape and "Offline ·" before
+the caption, and the status sentence for assistive technology.
 
 The session header is an identity bar. Line 1 is the breadcrumb: for an agent, the mission title,
 an ellipsis where ancestors are skipped, and its role, with ancestors as links to their sessions; for a
@@ -112,12 +116,12 @@ id), and the action buttons (Rename, Stop, Resume, Archive, Unarchive, Inspector
 Line 2 is a row of chips that wraps and is never hidden at any width:
 
 - `#s-model`: the model in effect now, `<profile> · <model id> · <context window>` (for example
-  `qwen · qwen4-max-preview · 1M`), in monospace with an accent tint. Its tooltip gives the base URL
+  `qwen · qwen4-max-preview · 1M`; a profile named for its model says it once: `dsv41 · 1M`), in monospace with an accent tint. Its tooltip gives the base URL
   and whether the profile is reachable (from `/api/status`). A profile reported unreachable adds an
   alert shape and the word "unreachable". It updates live from a `session` frame or a `model_switched`
   record.
 - `#s-role`: `<pack> / <role>`; for an agent, the tooltip says which mission it belongs to.
-- `#s-id`: a button showing the first ten characters of the session id. It copies the full id and says
+- `#s-id`: a button showing the first ten characters of the session id, with an ellipsis when it was cut. It copies the full id and says
   "Copied" briefly, also to assistive technology. Without clipboard access it selects the whole id
   and says so.
 - `#s-run`: the run state in words with its shape: `Running · step N · <time since this run began>`,
@@ -277,6 +281,61 @@ not a real click inside loom-desk (and run as injected script, which WebKit trea
 change (neither call is a script, style or request), and the purity tests allow exactly one clipboard use and one
 copy command, both inside `copyText`. No Swift change was needed.
 
+## Phone layout (699px and under)
+
+Layout follows the width; input behaviour follows the pointer (`PHONE`, `COMPACT` and `COARSE` in `app.js`), so a narrow
+window with a mouse keeps Enter-to-send. `COMPACT` is 699px or narrower, or 700px or shorter.
+
+- **One scroller.** Where the session scrolls as a whole (`COMPACT`), `#view-session` is the only element that scrolls
+  vertically in the session view (the message box aside): the header, the tabs (sticky under the bar), the record and
+  every tab's panel are in its flow, the composer is sticky at the bottom, and a tool output has no scroll box of its
+  own. `chatScroller()` names the element that scrolls the chat. Each tab keeps its scroll position in memory; Chat
+  follows the end while it follows. Blocks keep a scroll margin for the tabs and the composer.
+- **The question is visible on landing.** On the first render of a session that has its own open blocking question the
+  chat shows that card (without moving focus) instead of the end of the record. The button over the chat's foot has
+  three modes: "needs" (the question is off screen: an amber diamond and "Approval waiting · Show", which goes to the card
+  and focuses it), "latest" ("Jump to latest · N new") and hidden, and it is hidden while the question is on screen so
+  it never covers an answer.
+- **Find** is a sticky two-row bar: the field and Previous, Next, Close as 44px icon buttons (their words are read out)
+  on the first row, the count and the kind on the second, a one-line hint only when it has text. "Go to match" and the
+  keyboard hints are hidden for a coarse pointer. `#bar-find` opens it; the record tools row (and its two checkboxes,
+  which move to the sheet's View card) is hidden.
+- **Composer.** A grid: the message box and Send, then the model seat (at most 42vw) and `#s-caption`, a button whose
+  text is "Plan 1 of 3 · context 9% · cache 98% ›" (its name the full sentence) and which opens the details sheet at the
+  context card. The progress line and the stats line are hidden here (the caption and the sheet say the same). The help
+  line names keys only for a fine pointer; what a message does ("A message does not answer the open question. It reaches
+  the lead between steps.") is kept whole. On the other tabs the composer is the one button `#composer-go`, "Message the
+  lead…", which goes to Chat and focuses the message box; the draft stays in memory.
+- **Enter.** With a coarse pointer Enter adds a line (`enterkeyhint="enter"`) and Send, or Ctrl/Cmd+Enter, sends; with
+  a fine pointer Enter sends, whatever the width (`composerAction`). Ctrl/Cmd+Enter sends everywhere. (An iPad with a hardware
+  keyboard reports a coarse pointer, so Enter adds a line there.)
+- **Work groups** show a short header ("Worked 2m43s · 8 calls") and keep the sentence as the button's name; tool rows are
+  one line.
+- **Text and targets.** With a coarse pointer replies are 16px/24px, tool rows 14px, footers, stats and counts 13px at least,
+  every control 44px, the sheet's labels 16px and values 15px. The viewport allows the safe areas
+  (`viewport-fit=cover`, `interactive-widget=resizes-content`) and the bar, composer and drawers pad for them.
+
+## Session details sheet
+
+`#session-sheet`, a native modal `<dialog>` (focus trap, Escape, inert page behind it, focus back to its opener), opens
+from `#bar-details` (focus on the RUN heading) and `#s-caption` (on CONTEXT), and loads the context. Below 700px it is a bottom
+sheet (full width, at most 92dvh, rounded top, a grabber that is only a picture); above, the usual centred sheet. It closes
+on Close, Escape or a tap on the backdrop; there is no swipe, so no gesture is the only way out. Sections, each a caption
+(12px, 600, uppercase) over a card:
+
+1. **RUN**: the run state with its shape, the plan / now / budget line (a budget is a limit, not progress), and **Stop…** or
+   **Resume** with the scope in words ("Stops this session, its agents and their tracked jobs."). Stop asks inline with focus
+   on "Keep running"; its affirmative button ignores a held key.
+2. **CONTEXT**: the context card.
+3. **MODEL**: profile, reachability (shape and word), model id (not repeated when it equals the profile), the exact context
+   limit, the endpoint's host as text, and **Change model…** (closes the sheet and focuses `#model-seat`, which asks first).
+4. **VIEW**: Expand all work and Show request details, kept in step with the originals.
+5. **SESSION**: Rename… (a mission only; closes the sheet and edits the title), Archive / Unarchive, Copy session id (the
+   copy button, with its status in the sheet since the page behind is inert) and Open inspector.
+
+While open it redraws on session frames, new records and window loads, and only when what it shows changed, so a tap is not
+lost and an open question keeps its focus.
+
 ## Drafts, submissions and updates
 
 Drafts are keyed by session ID for messages and item ID for inbox answers. They survive mission/view
@@ -364,6 +423,28 @@ light/dark appearance and reduced-motion support. Avoid dependence on color or h
   (status, with their evidence: quote, handle + lines, note; `attested` shown as a check); open
   obligations; decisions; dead ends; questions. When the mission has no ledger, the daemon's sentence
   is shown; a ledger with no entries yet says so.
+- **Context** (`GET /api/sessions/{id}/window`, also the sheet's CONTEXT section): the context card, built by
+  `contextCard()` from `contextCardModel()`. A hero line gives the size, the window and the share: `~151k of 262k tokens 58%`.
+  The "~" is drawn and an "about" is read out, and it is dropped only when the figure is exactly the server's count of the
+  last request; the window is formatted like any token count (1.05M for 1,048,576, with the exact count in its title). The
+  sub-line says where the figure comes from ("Last request 149k, counted by the server · about 2.4k added since", or "Estimated
+  from characters; no request in this context epoch has been counted yet."), and a note says how the parts were estimated
+  (scaled to the total, or at the default ratio). One bar is drawn against the whole window: its segments are the parts, in
+  the order of the rows below (setup, carried over, conversation, folded and framing, then harness state), each with the colour
+  family (`--ctx-setup`, `--ctx-carry`, `--ctx-conv`, `--ctx-fold`, none a state colour) and a pattern (solid, hatch,
+  dots, outline, cross, dashed, light) shared with its row's swatch, so a part is not told apart by colour alone. A part
+  narrower than 0.8% is widened to that by taking from the wide ones (parts too small to hold it merge into one sliver in the
+  bar only), so the fill is never inflated; a part 18% wide or more carries its short label. Rows drop a zero part except
+  Messages and replies, group under captions and say "about 4.9k". The parts add up to the figure (the daemon's `framing`
+  takes the remainder). Fold marks use the effective bounds `fold_at` and `fold_to` (not the raw target and floor), drawn as
+  two shapes (a solid tick with a filled triangle: folds at; a dashed tick with an outline triangle: down to) and said in a
+  line ("▼ folds at 210k · ▽ down to 131k"), with "Past the fold mark: older output folds at the next step." in neutral
+  words; no amber. Under the bar a two-part bar says how much of the last request came from the cache and how much was read
+  anew (server numbers, no "~"), or that none was reported. "What these mean" holds one-line notes (rules are yours,
+  verbatim; the re-weave brief may hold unverified leads; stubs keep the output in the record; harness state is sent fresh
+  each request). **Fold now…** asks first (focus on "Keep as it is") and **Refresh** reads the window again. In the inspector
+  the card is followed by the counts and the list of what is in the window. An unknown window draws against the fold mark plus
+  25% and says so; an answer from an older daemon (no `breakdown`) shows the hero and says the parts are not reported.
 - **Network** (`GET /api/sessions/{id}/net`, plus live `net` events): the newest 500 decisions,
   newest first: time, allowed/refused, method, host:port, the rule that decided. When the load
   failed (for example because the egress audit log is damaged) the daemon's sentence is shown in red
@@ -445,6 +526,17 @@ refusals of Copy full output…. Check every button, keyboard only (Tab to it, E
 off and on, in light and dark and at 320 px. The browser pane refuses `navigator.clipboard.writeText` ("Write
 permission denied"), which exercises the fallback; to see the clipboard path, replace `navigator.clipboard.writeText`
 with a recorder in the console.
+
+Phone pass 1 adds to the fixture: `GET /api/sessions/{id}/window` answers as the daemon does (the `breakdown`, `measured_now`,
+`last_request`, `fold_at` and `fold_to` fields, with items that carry notes, a pinned result and a stub). `s-audit` and most
+sessions are counted and scaled; `s-quiet` has no counted request (the default-ratio basis); `s-notify` has no known window;
+`s-parked` is past its fold mark with nothing cached. Check at 320, 375, 390, 430 and 800 px and at desktop width, in light
+and dark, with touch emulation where the browser offers it: no horizontal scroll of the page, exactly one vertical scroller in
+the session view (`#view-session`, besides the message box), the composer's height (`--composer-h`) at most about 130px with
+an empty draft, the `s-audit` question visible on landing with Jump hidden while it is, Find at about 100px, the sheet
+from both openers, Stop's confirmation, Fold now's confirmation, Change model…, the copy buttons, and a narrow window with
+a mouse still sending on Enter. Chrome's mobile emulation is what was checked; the keyboard above the composer, the safe
+areas, Android Back and a real iOS keyboard were not.
 
 Pass 2 adds to the fixture: `GET /api/missions/{id}/score`, a mission of about 12 agents at mixed phases
 and depth 3, a parked item on `necromicon` with a recorded error, a running session whose last record is

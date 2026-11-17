@@ -6,6 +6,13 @@ import * as C from "./core.js";
 
 const $ = (id) => document.getElementById(id);
 
+// Layout follows the width; input behaviour follows the pointer, so a narrow window with a mouse keeps Enter-to-send.
+const PHONE = matchMedia("(max-width: 699px)");
+const COMPACT = matchMedia("(max-width: 699px), (max-height: 700px)"); // the whole session scrolls as one
+const COARSE = matchMedia("(pointer: coarse)");
+/** The one element that scrolls the chat: the session view where it scrolls as a whole, else the record's own scroller. */
+const chatScroller = () => (COMPACT.matches ? $("view-session") : $("scroller"));
+
 // ---------------------------------------------------------------------------------------------
 // State
 
@@ -57,6 +64,9 @@ const S = {
   rec: null, // record store of the open session
   r: null, // what is rendered of it: {from, end, nodes, fresh}
   follow: true,
+  scrollAt: {}, // the session view's scroll position per section, kept in memory while it scrolls as a whole
+  jumpNeed: null,
+  sheet: { open: false, ask: null, opener: null, sig: "", say: "", restore: true }, // the session details sheet
   tab: "ledger",
   score: { mission: null, view: null, error: null, lastMs: null, loading: false }, // GET /api/missions/{id}/score of the open mission (Agents tab)
   agentsEnded: false, // the Ended group of the Agents tab is open (this page only)
@@ -288,7 +298,7 @@ async function act(promise) {
 // ---------------------------------------------------------------------------------------------
 // Scheduling DOM work
 
-const needs = { list: false, header: false, blocks: false, live: false, right: false, overview: false };
+const needs = { list: false, header: false, blocks: false, live: false, right: false, overview: false, sheet: false };
 let raf = 0;
 function want(...keys) {
   for (const k of keys) needs[k] = true;
@@ -305,6 +315,7 @@ function flush() {
   if (n.live) renderLive();
   if (n.right) renderRight();
   if (n.overview) renderOverview();
+  if (n.sheet) renderSheet();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -429,7 +440,8 @@ function renderDot() {
   if (wrap) wrap.title = words.tip;
   // The bar speaks the loss of the connection only where the sidebar is a closed drawer (under 700px); beside the open sidebar it would be said twice.
   const bar = $("bar-connection");
-  if (bar) bar.textContent = !S.connected && matchMedia("(max-width: 699px)").matches ? `${words.short} · execution state unknown` : "";
+  if (bar) bar.textContent = !S.connected && PHONE.matches ? `${words.short} · execution state unknown` : "";
+  $("bar-offline").hidden = S.connected || S.view !== "session";
   // A run chip counts up only while the stream is up: it changes with the connection.
   if (S.view === "session") want("header");
 }
@@ -459,6 +471,10 @@ function updateInboxBadge() {
         : `Inbox: ${c.open} open`,
   );
   document.title = C.pageTitle(c);
+  // The Missions button on a phone says how many need the operator: a diamond and a number, and the same in words.
+  $("bar-needs").hidden = c.blocking === 0;
+  $("bar-needs-n").textContent = String(c.blocking);
+  $("open-left").setAttribute("aria-label", C.missionsLabel(c.blocking));
   if (S.view === "inbox") renderInbox();
   want("list", "header", "overview");
 }
@@ -510,8 +526,9 @@ function openSession(id) {
   S.sinceSeq = recalled("seen." + id, null);
   S.rec = C.createRecordStore(id);
   S.rec.initialComplete = false;
-  S.r = { from: 0, end: 0, nodes: new Map(), items: [], forced: new Set(), fresh: true };
+  S.r = { from: 0, end: 0, nodes: new Map(), items: [], forced: new Set(), fresh: true, landed: false };
   S.workState = new Map();
+  S.scrollAt = {};
   S.seat = null;
   S.follow = true;
   S.goalOpen = false;
@@ -616,6 +633,8 @@ function noteActivity(session, record) {
 
 const SECTION_PANEL = { chat: "mission-record", overview: "mission-overview", agents: "mission-agents", evidence: "mission-evidence" };
 function setSection(section, navigate = true) {
+  const previous = S.section;
+  if (COMPACT.matches && previous) S.scrollAt[previous] = $("view-session").scrollTop;
   S.section = Object.hasOwn(SECTION_PANEL, section) ? section : "chat";
   for (const tab of document.querySelectorAll("#mission-tabs [data-view]")) {
     const selected = tab.dataset.view === S.section;
@@ -623,8 +642,18 @@ function setSection(section, navigate = true) {
     tab.tabIndex = selected ? 0 : -1;
   }
   for (const [name, id] of Object.entries(SECTION_PANEL)) $(id).hidden = name !== S.section;
+  $("composer").classList.toggle("off-chat", S.section !== "chat");
   updateJump();
   if (navigate && S.openId) location.hash = C.sessionHash(S.openId, S.section);
+  if (COMPACT.matches && previous !== S.section) {
+    // One scroller serves every tab: each comes back where it was left, Chat at the end while it follows.
+    requestAnimationFrame(() => {
+      const view = $("view-session");
+      const tabs = $("mission-tabs").getBoundingClientRect().top - view.getBoundingClientRect().top + view.scrollTop;
+      const saved = S.scrollAt[S.section];
+      view.scrollTop = S.section === "chat" && S.follow ? view.scrollHeight : saved ?? Math.min(view.scrollTop, tabs);
+    });
+  }
   if (S.section === "chat") want("blocks", "live");
   if (S.section === "evidence" && S.ledger.stale) loadLedger();
   if (S.section === "agents") loadScore(true);
@@ -931,6 +960,19 @@ function renderStats() {
   $("s-cache").textContent = stats.cache;
   $("s-context").textContent = stats.context;
   $("s-step").textContent = stats.step;
+  renderCaption(info, stats);
+  if (S.sheet.open) want("sheet");
+}
+
+/** The phone composer's caption ("Plan 1 of 3 · context 9% · cache 98%"): one line that opens the session's details. */
+function renderCaption(info, stats) {
+  const node = $("s-caption");
+  if (!info || S.view !== "session") { node.hidden = true; return; }
+  const cap = C.composerCaption({ line: progressLineFor(info), stats: stats || C.sessionStats(info, S.rec ? S.rec.blocks : []) });
+  const text = $("s-caption-text");
+  if (text.textContent !== cap.text) text.textContent = cap.text;
+  node.setAttribute("aria-label", cap.label);
+  node.title = cap.label;
 }
 
 function chipContent(node, ...kids) {
@@ -961,19 +1003,27 @@ function renderRun(info) {
   }, 1000);
   else if (!run.running || !live) stopRunTimer();
 }
-/** Below 1100px the top bar carries the model and the run state, so they are in view without scrolling the header. */
+/** Below 1100px the top bar carries the model and the run state, so they are in view without scrolling the header. On a phone
+ *  it is one button: the title over the model and run state, which opens the session's details. */
 function renderBar(info, chips) {
   const node = $("bar-model");
   if (!info || !chips || S.view !== "session") { hideBarIdentity(); return; }
   const m = chips.model;
   node.className = "id-chip id-model bar-chip" + (m.warn ? " unreachable" : "");
   node.title = m.text; // the full model text: profile · model id · context window
-  chipContent(node, document.createTextNode(m.profile || "unknown"), m.warn ? add(el("span", "id-warn"), icon(m.warn.icon), document.createTextNode(m.warn.word)) : null);
+  chipContent(node, document.createTextNode(m.profile || "unknown"), m.warn ? add(el("span", "id-warn"), icon(m.warn.icon), el("span", "id-warn-word", m.warn.word)) : null);
   node.hidden = false;
+  $("bar-title").textContent = info.title || info.id;
+  $("bar-details").hidden = false;
+  $("bar-find").hidden = false;
+  $("bar-offline").hidden = S.connected;
 }
 function hideBarIdentity() {
   $("bar-model").hidden = true;
   $("bar-run").hidden = true;
+  $("bar-details").hidden = true;
+  $("bar-find").hidden = true;
+  $("bar-offline").hidden = true;
 }
 function stopRunTimer() {
   if (S.runTimer) clearInterval(S.runTimer);
@@ -1370,9 +1420,13 @@ function renderHeader() {
   // A message is not an answer: say so while a question of this mission waits on the operator.
   const paused = missionEntries().some(entry => entry.item.blocking);
   const lead = C.rootNoun(info) === "lead";
-  $("composer-help").textContent = "Enter sends · Shift+Enter adds a line."
-    + (paused ? " A message does not answer the open question." : "") + (a.running ? (lead ? " It reaches the lead between steps." : " It is read between steps.") : "");
+  const help = C.composerHelp({ coarse: COARSE.matches, paused, running: a.running, lead });
+  $("composer-help").textContent = [help.keys, help.note].filter(Boolean).join(" ");
   $("composer-help").hidden = !a.send;
+  $("msg").enterKeyHint = COARSE.matches ? "enter" : "send";
+  $("composer").classList.toggle("off-chat", S.section !== "chat");
+  $("composer-go").hidden = !a.send;
+  $("s-caption").hidden = false;
   let action = S.actionState.get(info.id);
   if (action?.accepted && ((action.name === "stop" && !a.stop) || (action.name === "resume" && a.running) || (action.name === "archive" && info.archived === action.archived))) {
     S.actionState.delete(info.id); action = null;
@@ -1391,12 +1445,13 @@ function renderHeader() {
   // The button is an icon; its accessible name says the state, and send-state (live) says it in words.
   const sendLabel = sending ? "Sending…" : pendingReceipt ? "Awaiting receipt…" : "Send";
   $("send").setAttribute("aria-label", sendLabel);
-  $("send").title = sendLabel === "Send" ? "Send (Enter)" : sendLabel;
+  $("send").title = sendLabel === "Send" ? (COARSE.matches ? "Send" : "Send (Enter)") : sendLabel;
   $("send").setAttribute("aria-busy", String(sending || !!pendingReceipt));
   const question = renderSeat(info);
   // The switch question is said here, in the live region, so a screen reader hears it when the profile is picked; otherwise the newer of the switch note and the message state.
   $("send-state").textContent = question ? question.text : C.sendStateText({ loaded: !!S.rec?.initialComplete, seat: S.seatNote.get(info.id), message });
   growMsg();
+  if (S.sheet.open) want("sheet");
 }
 
 function missionEntries() {
@@ -1547,6 +1602,226 @@ function railSection(model) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Session details sheet (the bar's button and the composer's caption open it; a phone's way to the run, the context, the model
+// and the session's own actions, which the header shows only while it is in view)
+
+/** A row of a sheet card: the label, the value, and optionally a control that takes the whole row. */
+function srow(label, value, { mono = false, full = null, cls = "" } = {}) {
+  const row = el("div", "srow " + cls);
+  row.append(el("span", "sk", label));
+  if (value instanceof Node) row.append(add(el("span", "sv"), value));
+  else if (value !== null && value !== undefined) row.append(el("span", "sv" + (mono ? " mono" : ""), value));
+  if (full) row.append(add(el("div", "sfull"), full));
+  return row;
+}
+
+function sheetSection(key, title, ...kids) {
+  const sec = el("section", "sheet-section");
+  const h = el("h3", "", title);
+  h.id = "sheet-h-" + key;
+  h.tabIndex = -1;
+  sec.setAttribute("aria-labelledby", h.id);
+  return add(sec, h, ...kids);
+}
+
+function sheetCard(...kids) {
+  return add(el("div", "sheet-card"), ...kids);
+}
+
+/** The base URL's host, as text (never a link). */
+function endpointHost(profile) {
+  const entry = ((S.status && S.status.models) || []).find((m) => m.profile === profile);
+  if (!entry || !entry.base_url) return "";
+  try { return new URL(entry.base_url).host; } catch { return ""; }
+}
+
+function setExpandAll(on) {
+  S.expandAll = on;
+  $("expand-work").checked = on;
+  syncChat();
+  want("sheet");
+}
+
+function setDetails(on) {
+  S.details = on;
+  $("details").checked = on;
+  $("blocks").classList.toggle("hide-details", !on);
+  syncChat();
+  want("sheet");
+}
+
+function sheetCheck(label, id, checked, onChange, key) {
+  const row = el("div", "srow check-row");
+  const l = el("label");
+  const cb = el("input");
+  cb.type = "checkbox";
+  cb.id = id;
+  cb.checked = checked;
+  cb.dataset.focusKey = key;
+  cb.addEventListener("change", () => onChange(cb.checked));
+  add(l, cb, document.createTextNode(label));
+  return add(row, l);
+}
+
+function buildSheet(info) {
+  const out = [];
+  const a = C.sessionActions(info);
+  const live = S.connected;
+  const run = C.runWords(info, { now: Date.now(), startMs: live && S.rec && S.rec.turn ? S.rec.turn.ts : null, attention: inboxCount(info.id) });
+  const words = add(el("span", "runwords"), icon(run.icon), document.createTextNode(live ? run.text : "Last known · " + run.text));
+
+  // RUN
+  const line = progressLineFor(info);
+  const action = S.actionState.get(info.id);
+  const runCard = sheetCard(srow("Run", words));
+  if (line) {
+    const p = el("p", "scope", line.text);
+    runCard.append(srow("Progress", null, { full: add(el("div"), p, line.parts.some((x) => x.key === "budget") ? el("p", "scope", "A budget is a limit, not a measure of progress.") : null) }));
+  }
+  if (a.stop || a.resume) {
+    const holder = el("div");
+    if (a.stop) {
+      const stop = btn(action?.name === "stop" ? action.label : "Stop…", "danger", () => { S.sheet.ask = { kind: "stop", focus: true }; want("sheet"); });
+      stop.dataset.focusKey = "sheet:stop";
+      stop.disabled = !!action;
+      stop.setAttribute("aria-label", action?.name === "stop" ? action.label : "Stop this session");
+      add(holder, stop, el("p", "scope", "Stops this session, its agents and their tracked jobs."));
+    } else {
+      const resume = btn(action?.name === "resume" ? action.label : "Resume", "", () => sessionAction("resume"));
+      resume.dataset.focusKey = "sheet:resume";
+      resume.disabled = !!action;
+      add(holder, resume, el("p", "scope", "Starts this session again from its record."));
+    }
+    runCard.append(srow("", null, { full: holder, cls: "run-actions" }));
+    if (S.sheet.ask && S.sheet.ask.kind === "stop") {
+      const q = { text: `Stop ${info.title || info.id}? It, its agents and their tracked jobs stop. It can be resumed.`, yes: "Stop it", no: "Keep running" };
+      runCard.append(confirmRow(q, () => { S.sheet.ask = null; want("sheet"); sessionAction("stop"); }, () => { S.sheet.ask = null; want("sheet"); requestAnimationFrame(() => focusKey("sheet:stop")); }, "sheet:"));
+    }
+  }
+  out.push(sheetSection("run", "Run", runCard));
+
+  // CONTEXT
+  const w = S.win.data;
+  const ctxBody = S.win.error && !w ? el("p", "dim", S.win.error) : !w ? el("p", "dim", "Loading…") : contextCard(w, "sheet", S.sheet.ask);
+  out.push(sheetSection("context", "Context", add(sheetCard(), ctxBody)));
+  out[out.length - 1].lastChild.classList.add("roomy");
+
+  // MODEL
+  const current = C.currentModel(S.rec, info) || { profile: info.profile, model: info.model, context_window: info.context_window };
+  const health = ((S.status && S.status.models) || []).find((m) => m.profile === current.profile) || null;
+  const reach = health ? add(el("span", "runwords"), icon(health.reachable ? "check" : "alert"), document.createTextNode(health.reachable ? "reachable" : "unreachable")) : null;
+  const win = current.context_window || (health && health.context_window) || 0;
+  const modelCard = sheetCard(srow("Profile", current.profile || "unknown"));
+  if (reach) modelCard.append(srow("Reachability", reach));
+  if (current.model && current.model !== current.profile) modelCard.append(srow("Model id", current.model, { mono: true }));
+  modelCard.append(srow("Context limit", win ? `${C.num(win)} tokens` : "unknown"));
+  const host = endpointHost(current.profile);
+  if (host) modelCard.append(srow("Endpoint", host, { mono: true }));
+  const seat = $("model-seat");
+  const change = btn("Change model…", "", () => { closeSheet(false); if (S.section !== "chat") setSection("chat"); requestAnimationFrame(() => { seat.focus(); }); });
+  change.dataset.focusKey = "sheet:change-model";
+  change.disabled = seat.disabled;
+  if (seat.disabled && seat.title) change.title = seat.title;
+  modelCard.append(srow("", null, { full: change }));
+  out.push(sheetSection("model", "Model", modelCard));
+
+  // VIEW
+  out.push(sheetSection("view", "View", sheetCard(
+    sheetCheck("Expand all work", "sheet-expand-work", S.expandAll, setExpandAll, "sheet:expand"),
+    sheetCheck("Show request details", "sheet-details", S.details, setDetails, "sheet:details"),
+  )));
+
+  // SESSION
+  const copied = el("p", "scope", S.sheet.say || "");
+  copied.setAttribute("role", "status");
+  const copy = copyButton("Copy session id", () => info.id, { what: "Session id", text: true, key: "sheet:copy-id", say: (t) => { S.sheet.say = t; want("sheet"); } });
+  const inspector = btn("Open inspector", "", () => { closeSheet(false); setDrawer("right", true); });
+  inspector.dataset.focusKey = "sheet:inspector";
+  inspector.title = "Ledger, Network, Models, Session and Files";
+  const rows = [];
+  if (!info.parent) {
+    const rename = btn("Rename…", "", () => { closeSheet(false); requestAnimationFrame(() => { $("s-title").scrollIntoView({ block: "nearest" }); renameSession(); }); });
+    rename.dataset.focusKey = "sheet:rename";
+    rows.push(srow("Title", null, { full: rename }));
+  }
+  if (a.archive || a.unarchive) {
+    const arch = btn(action?.name === "archive" ? action.label : a.archive ? "Archive" : "Unarchive", "", () => sessionAction("archive", { archived: !!a.archive }));
+    arch.dataset.focusKey = "sheet:archive";
+    arch.disabled = !!action;
+    rows.push(srow("Mission", null, { full: arch }));
+  }
+  rows.push(srow("Session id", null, { full: add(el("div"), copy, copied) }), srow("Inspector", null, { full: inspector }));
+  out.push(sheetSection("session", "Session", sheetCard(...rows)));
+  return out;
+}
+
+function renderSheet() {
+  const dialog = $("session-sheet");
+  if (!S.sheet.open || !dialog.open) return;
+  const info = S.sessions.byId.get(S.openId);
+  const body = $("session-sheet-body");
+  if (!info || S.view !== "session") { closeSheet(false); return; }
+  const frag = document.createDocumentFragment();
+  frag.append(...buildSheet(info));
+  // Rebuild only what changed, so a tap is never lost to a redraw and a question being read keeps its place.
+  const sig = [...frag.querySelectorAll("*")].map((n) => n.tagName + n.className + (n.firstChild && n.firstChild.nodeType === 3 ? n.firstChild.data : "") + (n.getAttribute("style") || "") + (n.disabled ? "d" : "") + (n.checked ? "c" : "") + (n.getAttribute("aria-label") || "")).join("|");
+  if (S.sheet.sig !== sig) {
+    S.sheet.sig = sig;
+    preserveFocus(body, () => body.replaceChildren(frag));
+  }
+  if (S.sheet.ask && S.sheet.ask.focus) {
+    S.sheet.ask.focus = false;
+    const safe = body.querySelector('[data-focus-key="sheet:ask:no"]');
+    if (safe) safe.focus({ preventScroll: true });
+  }
+}
+
+/** Open the sheet and put the keyboard on the heading of `section` ("run" or "context"). */
+function openSheet(section = "run", opener = null) {
+  if (S.view !== "session" || !S.openId) return;
+  const dialog = $("session-sheet");
+  if (dialog.open) return;
+  if (document.querySelector("dialog[open]")) return;
+  S.sheet.opener = opener || document.activeElement;
+  S.sheet.open = true;
+  S.sheet.ask = null;
+  S.sheet.say = "";
+  S.sheet.sig = "";
+  dialog.showModal();
+  renderSheet();
+  loadWindow();
+  const h = $("sheet-h-" + section);
+  if (h) h.focus({ preventScroll: true });
+}
+
+function closeSheet(restore = true) {
+  const dialog = $("session-sheet");
+  S.sheet.restore = restore;
+  if (dialog.open) dialog.close();
+  else S.sheet.open = false;
+}
+
+function wireSheet() {
+  const dialog = $("session-sheet");
+  $("bar-details").addEventListener("click", () => openSheet("run", $("bar-details")));
+  $("s-caption").addEventListener("click", () => openSheet("context", $("s-caption")));
+  $("session-sheet-close").addEventListener("click", () => closeSheet());
+  dialog.addEventListener("click", (e) => { if (e.target === dialog) closeSheet(); }); // the backdrop
+  dialog.addEventListener("close", () => {
+    const opener = S.sheet.opener;
+    S.sheet.open = false;
+    S.sheet.ask = null;
+    S.sheet.opener = null;
+    // Focus goes back to what opened the sheet, unless the sheet closed to send the operator somewhere else.
+    if (S.sheet.restore !== false) {
+      const target = opener && document.contains(opener) && !opener.hidden ? opener : $("bar-details").hidden ? null : $("bar-details");
+      if (target) target.focus({ preventScroll: true });
+    }
+    S.sheet.restore = true;
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
 // Agents tab
 
 /**
@@ -1686,20 +1961,25 @@ function setAgentsActive(rows, index) {
 // ---------------------------------------------------------------------------------------------
 // Progress line above the composer
 
-function renderProgress(info) {
-  const node = $("s-progress");
+/** The progress line's content (plan, step, budget) for `info`, or null: the plan is the mission's, an agent shows only its own budget. */
+function progressLineFor(info) {
   const ended = !info || info.status?.phase === "ended";
-  // The plan is the mission's, recorded by its lead: an agent's own line shows only its own budget.
   // The budget is counted from the record as the daemon counts it: active time and own steps since it was last granted.
   const used = S.rec ? C.budgetUsed(S.rec, Date.now()) : { steps: 0, minutes: null };
-  const line = ended || S.view !== "session" ? null : C.progressLine({
+  return ended || S.view !== "session" ? null : C.progressLine({
     plan: info.parent ? [] : S.ledger.model?.plan, step: used.steps, minutes: used.minutes,
     budget: S.rec && S.rec.start ? S.rec.start.budget : null,
   });
+}
+
+function renderProgress(info) {
+  const node = $("s-progress");
+  const line = progressLineFor(info);
   const sig = line ? line.text : "";
   if (node.dataset.sig === sig) return;
   node.dataset.sig = sig;
   node.hidden = !line;
+  renderCaption(info);
   if (!line) { node.replaceChildren(); return; }
   node.replaceChildren(...line.parts.map(p => el("span", "progress-part progress-" + p.key, p.text)), el("span", "sr-only", line.parts.some(p => p.key === "budget") ? ". The budget is a limit, not a measure of progress." : ""));
 }
@@ -1734,7 +2014,7 @@ function jumpToRecord(seq, { focus = false, done = null } = {}) {
         if (focus) node.focus({ preventScroll: true });
         if (done) done(node);
       }
-      const s = $("scroller");
+      const s = chatScroller();
       S.follow = C.atEnd(s.scrollTop, s.clientHeight, s.scrollHeight);
       updateJump();
     });
@@ -2113,6 +2393,15 @@ function groupHeadText(it) {
   return C.groupLabel(it, Date.now()).text;
 }
 
+/** The header's words in both lengths: the sentence, and on a phone the short form ("Worked 2m43s · 8 calls"). Both are hidden from assistive technology; the button's own name is the long sentence. */
+function fillGroupLabel(label, it) {
+  const long = groupHeadText(it);
+  const short = it.toolCount ? C.groupLabel(it, Date.now()).short : long;
+  if (!label.firstChild) label.append(el("span", "gl-long"), el("span", "gl-short"));
+  if (label.firstChild.textContent !== long) label.firstChild.textContent = long;
+  if (label.lastChild.textContent !== short) label.lastChild.textContent = short;
+}
+
 /** The accessible name of a group header: the same words without a clock that runs while the group does. */
 function groupSpoken(it) {
   if (!it.toolCount) return groupHeadText(it);
@@ -2153,7 +2442,8 @@ function updateGroup(entry, it, dirty) {
   const headSig = [it.toolCount, ...counts, it.partial || 0, it.missing, it.warnings, it.running, it.records, it.running ? "" : it.endTs].join("|");
   if (entry.headSig !== headSig) {
     entry.headSig = headSig;
-    const label = el("span", "group-label", groupHeadText(it));
+    const label = el("span", "group-label");
+    fillGroupLabel(label, it);
     label.dataset.groupLabel = "1";
     // The visible clock ticks; the name that is spoken does not, so a screen reader is not told a new number every second.
     label.setAttribute("aria-hidden", "true");
@@ -2308,8 +2598,7 @@ function tickGroups() {
   for (const [, entry] of R.nodes) {
     const it = entry.item;
     if (it.type !== "group" || !it.running || !entry.label) continue;
-    const text = groupHeadText(it);
-    if (entry.label.textContent !== text) entry.label.textContent = text;
+    fillGroupLabel(entry.label, it);
   }
 }
 
@@ -2325,7 +2614,7 @@ function renderBlocks() {
   const R = S.r;
   if (!store || !R || S.view !== "session") return;
   renderStats();
-  const scroller = $("scroller");
+  const scroller = chatScroller();
   const total = store.blocks.length;
   if (total > R.end) {
     if (S.follow) R.from = R.fresh ? C.initialFrom(total) : Math.max(R.from, C.trimFrom(total, R.from, C.MAX_RENDERED));
@@ -2333,26 +2622,74 @@ function renderBlocks() {
     R.end = total;
   }
   syncChat();
+  // Landing on a session that has its own open question: show the question, not the end of the record.
+  if (!R.landed && store.initialComplete) {
+    R.landed = true;
+    const need = S.section === "chat" ? ownBlockingBlock() : null;
+    if (need) {
+      S.follow = false;
+      jumpToRecord(need.seq);
+      updateJump();
+      return;
+    }
+  }
   if (S.follow) scroller.scrollTop = scroller.scrollHeight;
   updateJump();
 }
 
-/** The Jump button: shown while the chat is scrolled away from the end, and counting the records recorded since the operator left it. */
+/** The open session's own blocking question: the block that holds it, or null. */
+function ownBlockingBlock() {
+  const blocks = S.rec ? S.rec.blocks : [];
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i];
+    if (b.kind === "inbox" && b.item && b.item.blocking && !b.resolved) return b;
+  }
+  return null;
+}
+
+/** Is the card of `block` inside the chat's visible band (between the sticky tabs and the composer)? */
+function cardOnScreen(block) {
+  const node = $("blocks").querySelector(`[data-bid="${block.id}"]`);
+  if (!node) return false;
+  const view = chatScroller().getBoundingClientRect();
+  const r = node.getBoundingClientRect();
+  const top = COMPACT.matches ? Math.max(view.top, $("mission-tabs").getBoundingClientRect().bottom) : view.top;
+  const bottom = COMPACT.matches ? Math.min(view.bottom, $("composer").getBoundingClientRect().top) : view.bottom;
+  const visible = Math.min(r.bottom, bottom) - Math.max(r.top, top);
+  return visible >= Math.min(r.height * 0.25, 120);
+}
+
+/**
+ * The button over the chat's foot. "needs": the session's own question is off screen, and the button says what waits and takes
+ * the operator to it (amber: it is the one thing here that needs them). "latest": the chat is scrolled away from the end, with the
+ * count of records since. Hidden while the card is on screen, so it never covers the question.
+ */
 function updateJump() {
   const jump = $("jump");
-  jump.hidden = S.section !== "chat" || S.follow;
+  const block = S.section === "chat" && S.rec ? ownBlockingBlock() : null;
+  const shown = !!block && cardOnScreen(block);
+  const mode = C.jumpMode({ section: S.section, follow: S.follow, needsOffscreen: !!block && !shown, cardShown: shown });
   if (S.follow) S.jumpFrom = null;
-  if (jump.hidden || !S.rec) return;
+  S.jumpNeed = mode === "needs" ? block : null;
+  jump.hidden = mode === "hidden" || !S.rec;
+  jump.classList.toggle("needs", mode === "needs");
+  if (jump.hidden) return;
+  if (mode === "needs") {
+    const noun = C.waitingNoun(block.item.item_kind);
+    const label = `${noun} · Show`;
+    if (jump.dataset.label !== label) { jump.dataset.label = label; jump.replaceChildren(icon("diamond"), document.createTextNode(label)); }
+    return;
+  }
   if (S.jumpFrom === null) S.jumpFrom = C.lastSeq(S.rec);
   const label = C.jumpLabel(S.jumpFrom === null || S.jumpFrom === undefined ? 0 : C.recordsAfter(S.rec.blocks, S.jumpFrom, C.lastSeq(S.rec)));
-  if (jump.textContent !== label) jump.textContent = label;
+  if (jump.dataset.label !== label) { jump.dataset.label = label; jump.replaceChildren(document.createTextNode(label)); }
 }
 
 function showEarlier() {
   const store = S.rec;
   const R = S.r;
   if (!store || R.from === 0) return;
-  const scroller = $("scroller");
+  const scroller = chatScroller();
   const before = scroller.scrollHeight;
   R.from = C.earlierFrom(R.from);
   R.forced.clear();
@@ -2407,7 +2744,7 @@ function renderLive() {
     if (i === p.calls.length - 1 && !streamingText) row.classList.add("streaming");
     return row;
   }));
-  if (S.follow) $("scroller").scrollTop = $("scroller").scrollHeight;
+  if (S.follow) chatScroller().scrollTop = chatScroller().scrollHeight;
 }
 
 function oneLineArgs(s) {
@@ -2869,7 +3206,9 @@ function renderInbox() {
   for (const g of groups) g.root = rootId(g.mission);
   reconcileInbox($("inbox-list"), groups.flatMap(g => g.entries), "inbox", groups);
   const granted = notificationsAvailable() && Notification.permission === "granted";
-  $("notif-state").textContent = "Notifications: " + (granted ? "on" : "off");
+  // When they are off, say why: a phone browser often offers none, and a refusal is changed in the browser's site settings.
+  const why = !notificationsAvailable() ? "this browser does not offer page notifications here" : Notification.permission === "denied" ? "blocked in this browser's site settings" : "";
+  $("notif-state").textContent = "Notifications: " + (granted ? "on" : why ? "off, " + why : "off");
   $("notif-btn").hidden = !notificationsAvailable() || Notification.permission !== "default";
 }
 
@@ -3005,6 +3344,7 @@ async function loadWindow() {
     S.win.error = e.message;
   }
   if (S.tab === "context") want("right");
+  if (S.sheet.open) want("sheet");
 }
 
 async function loadNet() {
@@ -3143,17 +3483,17 @@ function noRepeat(button) {
 }
 
 /** A question with two buttons, placed where the operator is looking. Focus lands on the question, and returns to `opener` when it closes. */
-function confirmRow(q, onYes, onNo) {
+function confirmRow(q, onYes, onNo, prefix = "") {
   const box = el("div", "model-confirm");
   box.setAttribute("role", "group");
   const text = el("p", "model-confirm-text", q.text);
-  text.id = "ask-text";
-  box.setAttribute("aria-labelledby", "ask-text");
+  text.id = prefix.replace(/\W/g, "") + "ask-text";
+  box.setAttribute("aria-labelledby", text.id);
   const yes = btn(q.yes, "small primary", onYes);
-  yes.dataset.focusKey = "ask:yes";
+  yes.dataset.focusKey = prefix + "ask:yes";
   noRepeat(yes);
   const no = btn(q.no, "small", onNo);
-  no.dataset.focusKey = "ask:no";
+  no.dataset.focusKey = prefix + "ask:no";
   add(box, text, add(el("span", "model-confirm-actions"), yes, no));
   return box;
 }
@@ -3200,7 +3540,7 @@ function renderModels(p, info) {
   const kv = el("div", "model-rows");
   // The question of a change sits right after the row that raised it, so Tab from the select reaches its buttons.
   const row = (k, kind, role, ...v) => {
-    kv.append(add(el("div", "model-row"), el("div", "model-name", k), ...v));
+    kv.append(add(el("div", "models-row"), el("div", "model-name", k), ...v));
     if (q && ask.kind === kind && ask.role === role) {
       const done = ask.kind === "lead" ? () => setLeadModel(ask.lead, ask.value) : () => setRoleModel(ask.lead, ask.role, ask.value, ask.now);
       const opener = ask.kind === "lead" ? "ask:lead" : "ask:role:" + ask.role;
@@ -3400,24 +3740,126 @@ function renderLedger(p) {
   showLedger(p, frag);
 }
 
-function meterEl(m) {
-  const box = el("div", "meter big" + (m.over ? " over" : ""));
-  const fill = el("span", "fill");
-  fill.style.setProperty("width", m.inViewPct + "%");
-  box.append(fill);
-  if (m.floorPct !== null) {
-    const t = el("span", "tick floor");
-    t.style.setProperty("left", m.floorPct + "%");
-    t.title = "floor: a re-weave folds down to here";
-    box.append(t);
+/**
+ * The context card (the inspector's Context tab, and the CONTEXT section of the phone's details sheet): the figure and the
+ * share of the window, one bar whose segments are also the legend's swatches, the fold marks in words, the rows by group, how much
+ * of the last request came from the cache, and what each part means. `where` is "panel" or "sheet" (it keeps ids and focus keys
+ * apart); `ask` is the open question of that place, if any. Text nodes only; the fills are classes.
+ */
+function contextCard(w, where, ask) {
+  const m = C.contextCardModel(w);
+  const box = el("div", "ctx");
+  const hero = el("div", "ctx-hero");
+  const figure = el("span", "ctx-figure");
+  if (m.hero.approx) add(figure, el("span", "sr-only", "about "), el("span", "", "~"));
+  if (m.hero.approx) figure.lastChild.setAttribute("aria-hidden", "true");
+  figure.append(document.createTextNode(m.hero.figure.replace(/^~/, "")));
+  const denominator = el("span", "ctx-denominator", m.hero.denominator);
+  if (m.hero.exact) denominator.title = m.hero.exact;
+  add(hero, figure, denominator, m.hero.exact ? el("span", "sr-only", ` (${m.hero.exact})`) : null, m.hero.percent ? el("span", "ctx-percent", m.hero.percent) : null);
+  box.append(hero, el("p", "ctx-sub", m.sub));
+  if (!m.parts) {
+    box.append(el("p", "ctx-legacy", "This daemon does not report what the request is made of."));
+  } else {
+    const wrap = el("div", "ctx-barwrap");
+    const bar = el("div", "ctx-bar");
+    bar.setAttribute("role", "img");
+    bar.setAttribute("aria-label", m.bar.label);
+    const labels = el("div", "ctx-labels");
+    labels.setAttribute("aria-hidden", "true");
+    let at = 0;
+    for (const seg of m.bar.segments) {
+      const node = el("div", `ctx-seg fam-${seg.family} pat-${seg.pattern}`);
+      node.style.setProperty("width", seg.pct + "%");
+      bar.append(node);
+      if (seg.labelled) {
+        const label = el("span", "", seg.label);
+        label.style.setProperty("left", at + "%");
+        label.style.setProperty("width", seg.pct + "%");
+        labels.append(label);
+      }
+      at += seg.pct;
+    }
+    wrap.append(bar);
+    if (m.fold) {
+      for (const [cls, pct] of [["at", m.fold.atPct], ["to", m.fold.toPct]]) {
+        const tick = el("span", "ctx-tick " + cls);
+        tick.setAttribute("aria-hidden", "true");
+        tick.style.setProperty("left", pct + "%");
+        wrap.append(tick);
+      }
+    }
+    box.append(wrap, labels);
+    if (m.bar.scaleNote) box.append(el("p", "ctx-scale", m.bar.scaleNote));
+    if (m.fold) box.append(el("p", "ctx-foldline", m.fold.text + (m.fold.past ? " · " + m.fold.past.text : "")));
+    else if (m.parts && w.fold_at) box.append(el("p", "ctx-foldline", `Folds at ${C.tokens(w.fold_at)}, beyond this scale.`));
+    let group = "";
+    let list = null;
+    for (const r of m.rows) {
+      if (r.group !== group) {
+        group = r.group;
+        box.append(el("p", "ctx-group", C.CTX_GROUPS[group]));
+        list = el("ul", "ctx-rows");
+        box.append(list);
+      }
+      const li = el("li", "ctx-row");
+      const swatch = el("span", `ctx-swatch fam-${r.family} pat-${r.pattern}`);
+      swatch.setAttribute("aria-hidden", "true");
+      add(li, swatch, el("span", "ctx-name", r.label), add(el("span", "ctx-value"), el("span", "sr-only", "about "), add(el("span", "", "~"), null)));
+      li.lastChild.lastChild.setAttribute("aria-hidden", "true");
+      li.lastChild.append(document.createTextNode(r.value.slice(1)));
+      list.append(li);
+    }
+    box.append(el("p", "ctx-basis", m.basis));
+    if (m.cache) {
+      const cache = el("div", "ctx-cache");
+      const split = el("div", "ctx-cachebar");
+      split.setAttribute("role", "img");
+      split.setAttribute("aria-label", m.cache.text);
+      const a = el("span", "from-cache");
+      a.style.setProperty("width", (100 * m.cache.cached) / m.cache.of + "%");
+      const b = el("span", "read-anew");
+      b.style.setProperty("width", (100 * m.cache.fresh) / m.cache.of + "%");
+      split.append(a, b);
+      add(cache, el("p", "ctx-group", "Cache"), split, el("p", "ctx-cachetext", m.cache.text), el("p", "ctx-basis", "Harness state is always read anew."));
+      box.append(cache);
+    }
+    if (m.notes.length) {
+      const d = el("details", "ctx-notes");
+      const dl = el("dl");
+      for (const n of m.notes) add(dl, el("dt", "", n.label), el("dd", "", n.note));
+      add(d, el("summary", "", "What these mean"), dl);
+      box.append(d);
+    }
   }
-  if (m.targetPct !== null) {
-    const t = el("span", "tick target");
-    t.style.setProperty("left", m.targetPct + "%");
-    t.title = "target: a re-weave starts above here";
-    box.append(t);
+  const actions = el("div", "ctx-actions");
+  const prefix = where === "sheet" ? "sheet:" : "";
+  const fold = btn("Fold now…", "", () => {
+    if (where === "sheet") { S.sheet.ask = { kind: "fold", focus: true }; want("sheet"); } else { S.ask = { kind: "fold", focus: true }; want("right"); }
+  });
+  fold.dataset.focusKey = prefix + "ask:fold";
+  fold.setAttribute("aria-label", "Fold now");
+  fold.title = "Fold older output out of view now. Asks first.";
+  const refresh = btn("Refresh", "", loadWindow);
+  refresh.dataset.focusKey = prefix + "ctx-refresh";
+  add(actions, fold, refresh);
+  if (ask && ask.kind === "fold") {
+    // Folding is silent until a later record lands, so say it was asked for and pull the view.
+    actions.append(confirmRow(modelAsk(ask), async () => {
+      if (where === "sheet") { S.sheet.ask = null; want("sheet"); } else askClose("ask:fold");
+      if (await act(api("POST", "/api/sessions/" + encodeURIComponent(S.openId) + "/reweave")) !== undefined) {
+        notice(C.FOLD_RECEIPT);
+        loadWindow();
+      }
+    }, () => { if (where === "sheet") { S.sheet.ask = null; want("sheet"); requestAnimationFrame(() => focusKey("sheet:ask:fold")); } else askClose("ask:fold"); }, prefix));
   }
+  box.append(actions);
   return box;
+}
+
+function focusKey(key) {
+  const t = document.querySelector(`[data-focus-key="${key}"]`);
+  if (t) t.focus({ preventScroll: true });
 }
 
 function renderContext(p) {
@@ -3425,33 +3867,10 @@ function renderContext(p) {
   if (S.win.error && !w) return p.replaceChildren(el("p", "dim", S.win.error));
   if (!w) return p.replaceChildren(el("p", "dim", "loading…"));
   const frag = document.createDocumentFragment();
-  const m = C.windowMeter(w);
   const sum = C.windowSummary(w);
-  frag.append(meterEl(m));
-  const nums = el("div", "nums");
-  nums.append(
-    numItem("in view", "~" + C.tokens(w.est_tokens)),
-    numItem("last prompt", C.tokens(w.prompt_tokens)),
-    numItem("cached", sum.cached || "n/a"),
-    numItem("epoch", String(w.epoch)),
-  );
-  if (m.known) nums.append(numItem("window", C.tokens(w.context_window)));
-  frag.append(nums);
-  frag.append(el("div", "dim", `${sum.counts.live} live · ${sum.counts.stubbed} stubbed · ${sum.counts.reasoning_dropped} reasoning dropped · ${sum.counts.dropped} dropped · ${sum.pinned} pinned`));
+  frag.append(contextCard(w, "panel", S.ask));
   const bar = el("div", "nums");
-  const fold = btn("Fold now", "", () => { S.ask = { kind: "fold", focus: true }; want("right"); });
-  fold.dataset.focusKey = "ask:fold";
-  add(bar, fold, btn("Refresh", "", loadWindow));
-  if (S.ask && S.ask.kind === "fold") {
-    // Reweave is silent until a later record lands, so confirm it was asked for and pull the view.
-    frag.append(confirmRow(modelAsk(S.ask), async () => {
-      askClose("ask:fold");
-      if (await act(api("POST", "/api/sessions/" + encodeURIComponent(S.openId) + "/reweave")) !== undefined) {
-        notice(C.FOLD_RECEIPT);
-        loadWindow();
-      }
-    }, () => askClose("ask:fold")));
-  }
+  frag.append(el("div", "dim", `${sum.counts.live} live · ${sum.counts.stubbed} stubbed · ${sum.counts.reasoning_dropped} reasoning dropped · ${sum.counts.dropped} dropped · ${sum.pinned} pinned`));
   const hide = el("label", "dim");
   const cb = el("input");
   cb.type = "checkbox";
@@ -3484,12 +3903,6 @@ function renderContext(p) {
     frag.append(row);
   }
   p.replaceChildren(frag);
-}
-
-function numItem(label, value) {
-  const s = el("span", "", label + " ");
-  s.append(el("b", "", value));
-  return s;
 }
 
 function renderNetwork(p) {
@@ -4302,6 +4715,7 @@ function openFind() {
   if (S.section !== "chat") setSection("chat");
   $("find-bar").hidden = false;
   $("btn-find").setAttribute("aria-expanded", "true");
+  $("bar-find").setAttribute("aria-expanded", "true");
   const q = $("find-q");
   q.focus();
   q.select();
@@ -4319,8 +4733,9 @@ function closeFind(restore = true) {
   const was = !$("find-bar").hidden;
   $("find-bar").hidden = true;
   $("btn-find").setAttribute("aria-expanded", "false");
+  $("bar-find").setAttribute("aria-expanded", "false");
   $("find-count").textContent = "";
-  if (was && restore) $("btn-find").focus({ preventScroll: true });
+  if (was && restore) (PHONE.matches ? $("bar-find") : $("btn-find")).focus({ preventScroll: true });
 }
 
 let findSaid = "";
@@ -4364,6 +4779,7 @@ function findStep(dir) {
 
 function wireFind() {
   $("btn-find").addEventListener("click", () => { if ($("find-bar").hidden) openFind(); else closeFind(); });
+  $("bar-find").addEventListener("click", () => { if ($("find-bar").hidden) openFind(); else closeFind(); });
   $("find-close").addEventListener("click", () => closeFind());
   $("find-go").addEventListener("click", () => { if (FIND.node && FIND.node.isConnected) FIND.node.focus(); });
   $("find-next").addEventListener("click", () => findStep(1));
@@ -4890,6 +5306,7 @@ function toolOpenRow(b) {
 
 function wire() {
   wireKeyboard();
+  wireSheet();
   $("btn-inbox").addEventListener("click", () => {
     if (location.hash === "#/inbox") route();
     else location.hash = "#/inbox";
@@ -4938,15 +5355,23 @@ function wire() {
     b.addEventListener("keydown", e => tabKeys(e, missionTabs, tab => setSection(tab.dataset.view)));
   }
 
-  $("scroller").addEventListener("scroll", () => {
-    const s = $("scroller");
-    if (S.jumping) return;
+  const onScroll = (e) => {
+    const s = chatScroller();
+    if (e.currentTarget !== s || S.jumping || S.section !== "chat") return;
     const was = S.follow;
     S.follow = C.atEnd(s.scrollTop, s.clientHeight, s.scrollHeight);
     updateJump();
     if (S.follow && !was) want("blocks");
-  });
+  };
+  $("scroller").addEventListener("scroll", onScroll);
+  $("view-session").addEventListener("scroll", onScroll);
+  const layoutChanged = () => { if (S.view === "session") want("blocks", "header"); };
+  COMPACT.addEventListener("change", layoutChanged);
+  COARSE.addEventListener("change", layoutChanged);
+  PHONE.addEventListener("change", layoutChanged);
   $("jump").addEventListener("click", () => {
+    const need = S.jumpNeed;
+    if (need) { jumpToRecord(need.seq, { focus: true }); return; }
     S.follow = true;
     want("blocks");
   });
@@ -4964,7 +5389,9 @@ function wire() {
   // The composer's height, for what has to sit above it when it overlays the page (the jump button on a phone).
   if (typeof ResizeObserver === "function") {
     new ResizeObserver(() => document.body.style.setProperty("--composer-h", Math.round($("composer").getBoundingClientRect().height) + "px")).observe($("composer"));
+    new ResizeObserver(() => document.body.style.setProperty("--tabs-h", Math.round($("mission-tabs").getBoundingClientRect().height) + "px")).observe($("mission-tabs"));
   }
+  $("composer-go").addEventListener("click", () => { setSection("chat"); requestAnimationFrame(() => $("msg").focus()); });
   $("s-id").addEventListener("click", copySessionId);
   $("s-goal-toggle").addEventListener("click", () => { S.goalOpen = !S.goalOpen; renderHeader(); });
   $("b-rename").addEventListener("click", renameSession);
@@ -4990,7 +5417,7 @@ function wire() {
   msg.addEventListener("input", () => { if (S.openId) C.setDraft(S.drafts, "message:" + S.openId, msg.value); renderHeader(); });
   $("send").addEventListener("click", sendMessage);
   msg.addEventListener("keydown", (e) => {
-    if (C.composerAction({ key: e.key, shiftKey: e.shiftKey, isComposing: e.isComposing, text: msg.value }) !== "none") {
+    if (C.composerAction({ key: e.key, shiftKey: e.shiftKey, isComposing: e.isComposing, text: msg.value, coarse: COARSE.matches, mod: e.ctrlKey || e.metaKey }) !== "none") {
       e.preventDefault();
       sendMessage();
     }

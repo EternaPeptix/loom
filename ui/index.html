@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="color-scheme" content="dark light">
 <title>loom</title>
 <link rel="stylesheet" href="/style.css">
@@ -32,13 +32,17 @@
 
   <main id="mid" class="col mid">
     <div class="bar">
-      <button id="open-left" type="button" class="btn drawer-btn" aria-controls="left" aria-expanded="false">Missions</button>
-      <span id="bar-identity" class="bar-identity" role="group" aria-label="Open session">
-        <span id="bar-model" class="id-chip id-model bar-chip" hidden></span>
-        <span id="bar-run" class="id-chip id-run bar-chip" hidden></span>
-      </span>
+      <button id="open-left" type="button" class="btn drawer-btn with-icon" aria-controls="left" aria-expanded="false"><svg class="icon" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 3.5h10M2 7h10M2 10.5h10"/></svg><span class="btn-label">Missions</span><span id="bar-needs" class="bar-needs" hidden><svg class="icon solid" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 1 11 6 6 11 1 6Z"/></svg><span id="bar-needs-n"></span></span></button>
+      <button id="bar-details" type="button" class="bar-identity" aria-haspopup="dialog" aria-controls="session-sheet" title="Session details" hidden>
+        <span class="bar-lines">
+          <span id="bar-title" class="bar-title"></span>
+          <span class="bar-caption"><span id="bar-offline" class="bar-offline" aria-hidden="true" hidden><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 2.5v4.5M6 9.4v.1"/></svg>Offline ·</span><span id="bar-model" class="id-chip id-model bar-chip" hidden></span><span id="bar-run" class="id-chip id-run bar-chip" hidden></span></span>
+        </span>
+        <svg class="icon bar-chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5 6 8l3.5-3.5"/></svg>
+      </button>
       <span id="bar-connection" class="bar-connection" role="status"></span>
       <span class="spacer"></span>
+      <button id="bar-find" type="button" class="btn bar-find with-icon" aria-controls="find-bar" aria-expanded="false" aria-label="Find in this record" title="Find in this record" hidden><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><circle cx="5.2" cy="5.2" r="3"/><path d="M7.5 7.5l3 3"/></svg></button>
       <button id="open-right" type="button" class="btn drawer-btn" aria-controls="right" aria-expanded="false">Inspector</button>
     </div>
     <div id="notice" class="notice" role="alert" hidden>
@@ -107,10 +111,10 @@
             <option value="tools">Tool calls and outputs</option>
             <option value="failures">Failures only</option>
           </select>
-          <button id="find-prev" type="button" class="btn small" title="Previous match (Shift+Enter)">Previous</button>
-          <button id="find-next" type="button" class="btn small" title="Next match (Enter)">Next</button>
+          <button id="find-prev" type="button" class="btn small with-icon find-step" title="Previous match (Shift+Enter)"><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 7.5 6 4l3.5 3.5"/></svg><span class="btn-label">Previous</span></button>
+          <button id="find-next" type="button" class="btn small with-icon find-step" title="Next match (Enter)"><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5 6 8l3.5-3.5"/></svg><span class="btn-label">Next</span></button>
           <button id="find-go" type="button" class="btn small" title="Move the keyboard to the match" disabled>Go to match</button>
-          <button id="find-close" type="button" class="btn small" title="Close Find (Escape)">Close</button>
+          <button id="find-close" type="button" class="btn small with-icon find-step" title="Close Find (Escape)"><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6"/></svg><span class="btn-label">Close</span></button>
           <span id="find-count" class="find-count dim" role="status" aria-live="polite"></span>
           <span id="find-hint" class="find-count dim"></span>
         </div>
@@ -143,7 +147,9 @@
             </div>
             <button id="send" type="button" class="send-btn" aria-label="Send" title="Send (Enter)"><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 10V2.5M2.8 5.6 6 2.4l3.2 3.2"/></svg></button>
           </div>
+          <button id="s-caption" type="button" class="s-caption" aria-haspopup="dialog" aria-controls="session-sheet" hidden><span id="s-caption-text" class="s-caption-text"></span><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 2.5 8 6 4.5 9.5"/></svg></button>
         </div>
+        <button id="composer-go" type="button" class="btn composer-go" hidden>Message the lead…</button>
         <div id="s-stats" class="stats" role="group" aria-label="Session statistics">
           <span id="s-speed" title="generation speed of the open session: the latest reply, then the latest replies together; the wait for the first token is left out"></span>
           <span id="s-cache" title="share of the latest request's prompt tokens served from the cache"></span>
@@ -169,7 +175,7 @@
         <div class="field">
           <label for="f-workspace">Workspace</label>
           <div class="field-row">
-            <input id="f-workspace" type="text" required placeholder="/path/to/workspace" aria-describedby="f-workspace-note" spellcheck="false" autocapitalize="off">
+            <input id="f-workspace" type="text" required placeholder="/path/to/workspace" aria-describedby="f-workspace-note" spellcheck="false" autocapitalize="off" autocorrect="off">
             <button id="f-browse" type="button" class="btn" aria-haspopup="dialog">Browse…</button>
           </div>
           <p id="f-workspace-note" class="dim field-note" hidden></p>
@@ -264,6 +270,15 @@
     </div>
   </dialog>
 
+  <dialog id="session-sheet" class="sheet session-sheet" aria-labelledby="session-sheet-title">
+    <header class="sheet-head">
+      <span class="grabber" aria-hidden="true"></span>
+      <h2 id="session-sheet-title">Session details</h2>
+      <button id="session-sheet-close" type="button" class="btn">Close</button>
+    </header>
+    <div id="session-sheet-body" class="sheet-body sheet-sections"></div>
+  </dialog>
+
   <dialog id="keys" class="sheet keys" aria-labelledby="keys-title">
     <header class="vhead">
       <h2 id="keys-title">Keyboard shortcuts</h2>
@@ -332,6 +347,7 @@
   <svg data-icon="folder" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M1.5 3a.8.8 0 0 1 .8-.8h2.4l1 1.2h3.9a.8.8 0 0 1 .8.8v4.6a.8.8 0 0 1-.8.8H2.3a.8.8 0 0 1-.8-.8Z"/></svg>
   <svg data-icon="link" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M5 7a2 2 0 0 0 2.8 0l1.6-1.6a2 2 0 0 0-2.8-2.8l-.5.5M7 5a2 2 0 0 0-2.8 0L2.6 6.6a2 2 0 0 0 2.8 2.8l.5-.5"/></svg>
   <svg data-icon="refresh" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M10 6a4 4 0 1 1-1.2-2.8M10 1.8V4H7.8"/></svg>
+  <svg data-icon="menu" class="icon" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 3.5h10M2 7h10M2 10.5h10"/></svg>
   <svg data-icon="pin" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.4 1.5h3.2l-.4 3 1.5 2H3.3l1.5-2ZM6 6.5v4"/></svg>
 </template>
 <script type="module" src="/app.js"></script>
