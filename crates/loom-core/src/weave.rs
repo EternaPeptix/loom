@@ -1177,7 +1177,7 @@ mod tests {
                     pack: "p".into(),
                     role: "lead".into(),
                     termination: Termination::Free,
-                    model: ModelRef { profile: "p".into(), model: "m".into(), context_window: 1000 },
+                    model: ModelRef { profile: "p".into(), model: "m".into(), context_window: 1000, lineage: None },
                     reasoning_replay: replay,
                     system_prompt: "SYSTEM".into(),
                     tools: vec![ToolSpec {

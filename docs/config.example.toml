@@ -26,6 +26,9 @@ max_concurrent = 4                      # concurrent requests to this server acr
 stall_timeout_s = 240                   # abort and retry a stream that delivers nothing this long
 retry_window_s = 300                    # keep retrying an unreachable or failing server this long; 0 = until it returns
 retry_max_delay_s = 30                  # longest pause between retries
+# family = ["deepseek"]                 # lineage, for the adversarial monitor: see the model policy at the end of this file
+# alignment = "stock"
+# recipient = "local"                   # this server is on this machine; its loopback address says nothing, so declare it
 
 # Request fields sent verbatim on every call. Fixed for a session's life: some chat templates render
 # them into the prompt head, and changing one would break the prompt cache.
@@ -154,87 +157,125 @@ copy_max_mb = 20480        # nor one with more MiB of file content, where a copy
 repeat_minutes = 0         # re-notify an unanswered blocking item this often; 0 = never (example: 30)
 
 # ---------------------------------------------------------------------------------------------------
-# The adversarial monitor (docs/MONITOR.md). NOT YET ACCEPTED by this build: the daemon rejects unknown
-# keys, so these tables stay commented until the phase that adds them (M1 for the profile keys, M2 for
-# [monitor], M9 for [keep_going], E2 for sandbox.allow_fetch_services) says so in CHANGELOG.md. They are
-# written down now so the defaults and one worked example exist in one place.
+# The adversarial monitor (docs/MONITOR.md). Built so far: the model policy (M1), which decides who may review
+# whom. The rest of [monitor] and [keep_going] and sandbox.allow_fetch_services are NOT YET ACCEPTED by this
+# build (the daemon rejects unknown keys); the phase that adds each says so in CHANGELOG.md. They stay commented.
 #
-# Defaults (every key below is shown with its default unless a comment says "example"):
+# Model policy. Each profile has a family (a set: a distill belongs to both), an alignment (are its refusals
+# intact), a recipient (who receives its traffic) and optionally a purpose. Left out, loom infers the family from
+# the model id and says so (`loom models show`); an unknown alignment makes an agent profile count as relaxed and
+# a reviewer ineligible; a loopback base_url has the recipient `unknown` until you declare it.
 #
-# [monitor]
-# enabled = true                      # Duty W; S4 tripwires and canaries cannot be disabled
-# mode = "shadow"                     # starting state; a tripwire is promoted per cause (loom monitor promote)
-# reviewers = []                      # profile names, in preference order; example below
-# tripwires_only_profiles = []        # profiles with no eligible reviewer, named on purpose (shown as "not LLM-reviewed")
-# gate = true
-# gate_timeout_s = 90
-# gate_queue_max_s = 30
-# step_every_calls = 8
-# step_every_s = 120
-# fleet_every_s = 300
-# unreviewed_pause_min = 60           # real-target and relaxed-agent missions only
-# review_max_tokens = 48000
-# repeat_minutes = 30
-# canaries = true
-# retention_days = 30                 # review inputs under <home>/monitor/inputs, collected by `loom gc`
-# monitor_down = "pause_real_targets" # or "notify"
+#   [models.<name>]
+#   family = ["deepseek"]        # one of: deepseek, qwen, mistral, glm, kimi, llama, thinking-machines, openai,
+#                                # anthropic, google (or a name listed in [monitor] known_families)
+#   alignment = "stock"          # "stock", "relaxed" or "unknown"; only a declared "stock" can review
+#   recipient = "lan"            # "local" (this machine), "lan" (a host you own) or a provider name such as "alibaba"
+#   purpose = "review"           # marks a review profile (give it its own bounded effort and max_tokens)
+#
+# A reviewer must be of a different family than every profile the reviewed mission can reach (its lead, its roles'
+# models, escalation_model and alloy_models), declared stock, and on `local`/`lan`, or on a recipient that already
+# receives the reviewed sessions' data, or one the pack consents to below. A profile with no eligible reviewer must be
+# named in tripwires_only_profiles, or `loom config check` fails and prints the lines to add.
+# `loom config check` prints each profile's resolved values; `loom models show` prints them with who reviews it.
+#
+# This file's own profile has no reviewer, on purpose, so the file checks clean as shipped:
+[monitor]
+tripwires_only_profiles = ["local"]   # profiles whose missions are watched by the deterministic tripwires only ("not LLM-reviewed")
+# reviewers = []                      # profile names, in preference order; the first eligible for a mission reviews it
+# known_families = []                 # family names beyond the built-in list
 #
 # [monitor.recipients]                # per-pack consent to a reviewer that is a new data recipient
-# ctf = []
+# ctf = []                            # example: ["alibaba"]
 # core = []
 #
 # [monitor.content]
-# new_recipient_real_targets = "features"   # or "redacted"; secrets are redacted in every case
+# new_recipient_real_targets = "features"   # or "redacted": what a new-recipient reviewer gets for a mission with real targets; secrets are redacted in every case
 #
-# [monitor.capacity.<endpoint profile>]     # keyed by endpoint: every profile on that base_url shares it
-# gate_slots = 1
-# review_slots = 1
+# Keys of later phases (not accepted yet; their defaults, for reference):
+# enabled = true / mode = "shadow" / gate = true / gate_timeout_s = 90 / gate_queue_max_s = 30 / step_every_calls = 8 /
+# step_every_s = 120 / fleet_every_s = 300 / unreviewed_pause_min = 60 / review_max_tokens = 48000 / repeat_minutes = 30 /
+# canaries = true / retention_days = 30 / monitor_down = "pause_real_targets" (or "notify") under [monitor];
+# [monitor.capacity.<endpoint profile>] gate_slots = 1, review_slots = 1;
+# [keep_going] (no "on" key: the operator arms a mission) max_reopens = 3 (hard maximum 10), max_reopens_real_targets = 1
+# (hard maximum 3; also the cap for a relaxed agent), delay_s = 120, per_reopen_max_steps = 200, per_reopen_max_minutes = 120;
+# [sandbox] allow_fetch_services = false (true marks egress unbounded and refuses keep-going).
 #
-# [keep_going]                        # defaults only; there is no "on" key: the operator arms a mission
-# max_reopens = 3                     # hard maximum 10
-# max_reopens_real_targets = 1        # hard maximum 3; also the cap for a relaxed agent
-# delay_s = 120                       # 30 to 3600
-# per_reopen_max_steps = 200          # mission-wide, summed over every session of the mission
-# per_reopen_max_minutes = 120
+# Worked example: one operator's fleet, decided 2026-11-16 (the profile names, hosts and ids are theirs; replace them).
+#   - The LAN-hosted DeepSeek profile (dsv41) has no reviewer without a new recipient, so a Qwen model hosted by
+#     Alibaba (qwen4max) reviews it, with the operator's consent for each pack (ctf, core, harnessmm, redteam, vr).
+#     For a mission with real targets that reviewer is sent features only (hashes, lengths, classes), and secrets are redacted in every case.
+#   - The four profiles hosted by Alibaba declare that provider as their recipient: it already receives their traffic,
+#     so qwen4max is not a new recipient for the DeepSeek-on-Alibaba missions.
+#   - Everything else (Qwen, relaxed Kimi and GLM, Mistral, inklingv5) is reviewed by dsv41_review, a bounded-effort
+#     profile on the LAN endpoint of dsv41. It shares DeepSeek's family, so only missions that reach a DeepSeek profile
+#     fall through to the hosted reviewer. Relaxed profiles are never reviewers.
+#   - Consent is per pack, not per fleet: qwen4max could review any fleet's mission in those packs, so the LAN
+#     profile is listed first and the hosted one is reached only when the LAN one is ineligible.
+#   - inklingv5's alignment is unknown (it counts as relaxed). It declares its recipient: until it does, it is `unknown`.
 #
-# [sandbox]
-# allow_fetch_services = false        # true marks egress unbounded and refuses keep-going
-#
-# Model profile keys (each profile): the model family as a set, whether its refusals are intact, who receives
-# its traffic, and whether it is a review profile. Left out, loom infers the family from the model name and
-# records that it did; an unknown alignment makes an agent profile count as relaxed and a reviewer ineligible;
-# a loopback base_url has the recipient `unknown` until you declare it.
-# [models.<name>]
-# family = ["deepseek"]
-# alignment = "stock"                 # "stock", "relaxed" or "unknown"
-# recipient = "lan"                   # "local", "lan" (a host you own) or a provider name such as "alibaba"
-# purpose = "review"                  # marks a review profile (own effort and max_tokens)
-#
-# Worked example (one operator's fleet, decided 2026-11-16; the profile names are theirs):
-#   - the LAN-hosted DeepSeek profile has no reviewer without a new recipient, so a Qwen model hosted by Alibaba reviews
-#     it, with the operator's consent for both packs, and real-target missions send it features only;
-#   - the four profiles hosted by Alibaba declare that provider as their recipient (it already receives their traffic);
-#   - Qwen agents are reviewed by a bounded-effort profile on the LAN endpoint; relaxed profiles are never reviewers.
-#   - Consent is per pack, not per fleet: the first profile of `reviewers` that is eligible for the whole mission is
-#     used, so the LAN profile is listed first. It shares DeepSeek's family, so only DeepSeek missions fall through to
-#     the hosted one; every other fleet stays on the LAN.
-#
+# BEGIN worked example
+# default_model = "dsv41"
 # [monitor]
-# reviewers = ["dsv41_review", "qwen4max", "mistral"]   # the LAN reviewer first (see below)
-# [monitor.recipients]
+# reviewers = ["dsv41_review", "qwen4max", "mistral"]
+# [monitor.recipients]               # one line per pack the fleet runs: consent is per pack
 # ctf = ["alibaba"]
 # core = ["alibaba"]
+# harnessmm = ["alibaba"]
+# redteam = ["alibaba"]
+# vr = ["alibaba"]
 # [monitor.content]
 # new_recipient_real_targets = "features"
 # [models.dsv41]
+# base_url = "http://dsv41.lan:8000/v1"
 # family = ["deepseek"]
 # alignment = "stock"
 # recipient = "lan"
 # [models.dsv41_review]               # same base_url as dsv41, bounded effort
+# base_url = "http://dsv41.lan:8000/v1"
 # purpose = "review"
 # family = ["deepseek"]
 # alignment = "stock"
 # recipient = "lan"
+# max_concurrent = 1
+# [models.dseekv41]
+# base_url = "https://token-plan.maas.qwencloudapi.com/v1"
+# family = ["deepseek"]
+# alignment = "stock"
+# recipient = "alibaba"
+# [models.dseek4pro]
+# base_url = "https://token-plan.maas.qwencloudapi.com/v1"
+# family = ["deepseek"]
+# alignment = "stock"
+# recipient = "alibaba"
+# [models.qwen]
+# base_url = "https://token-plan.maas.qwencloudapi.com/v1"
+# family = ["qwen"]
+# alignment = "stock"
+# recipient = "alibaba"
+# [models.qwen4max]
+# base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/v1"
+# family = ["qwen"]
+# alignment = "stock"
+# recipient = "alibaba"
 # [models.necromicon]
+# base_url = "http://necromicon.lan:8000/v1"
 # family = ["kimi"]
 # alignment = "relaxed"
+# recipient = "lan"
+# [models.glm_unc]
+# base_url = "http://glm-unc.lan:8000/v1"
+# family = ["glm"]
+# alignment = "relaxed"
+# recipient = "lan"
+# [models.mistral]
+# base_url = "https://api.mistral.ai/v1"
+# family = ["mistral"]
+# alignment = "stock"
+# recipient = "mistral"
+# [models.inklingv5]
+# base_url = "http://127.0.0.1:9000/v1"   # a loopback address: declare where the traffic really goes
+# family = ["thinking-machines"]
+# alignment = "unknown"
+# recipient = "thinking-machines"
+# END worked example

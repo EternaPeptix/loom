@@ -3881,7 +3881,12 @@ mod tests {
                 pack: "core".into(),
                 role: self.role.clone(),
                 termination: self.shared.role.termination,
-                model: ModelRef { profile: "mock".into(), model: "mock".into(), context_window: 1_000_000 },
+                model: ModelRef {
+                    profile: "mock".into(),
+                    model: "mock".into(),
+                    context_window: 1_000_000,
+                    lineage: None,
+                },
                 reasoning_replay: ReasoningReplay::All,
                 system_prompt: "You are a test agent.".into(),
                 tools: Vec::new(),

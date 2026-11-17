@@ -352,6 +352,10 @@ pub struct ModelRef {
     pub profile: String,
     pub model: String,
     pub context_window: u64,
+    /// What the monitor knew of the profile's family, alignment and recipient when this was recorded
+    /// (`lineage::resolve`). Absent in records written before the monitor's model policy (M1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<crate::lineage::Lineage>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -918,7 +922,7 @@ mod tests {
                     pack: "core".into(),
                     role: "lead".into(),
                     termination: Termination::Explicit,
-                    model: ModelRef { profile: "local".into(), model: "m".into(), context_window: 1000 },
+                    model: ModelRef { profile: "local".into(), model: "m".into(), context_window: 1000, lineage: None },
                     reasoning_replay: ReasoningReplay::All,
                     system_prompt: "sys".into(),
                     tools: vec![ToolSpec {

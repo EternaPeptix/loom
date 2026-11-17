@@ -19,7 +19,9 @@ commit.
 headers and types of `loom_agent::monitor`) changes no behaviour: nothing in the daemon calls the monitor module yet,
 the configuration keys of §7.1 are not accepted yet, and none of the routes, commands or records of §7 exist. Every
 function of the module that a later phase fills returns `MonitorError::NotBuilt`, so a premature caller fails closed.
-Where this text says "is" for something a later phase builds, read "will be, once that phase lands"; the phase column
+M1 (the model policy of §2.6) is built: the profile keys, the `[monitor]` keys it names (`reviewers`,
+`tripwires_only_profiles`, `recipients`, `content`, `known_families`), the eligibility and selection functions, the check in
+`loom config check`, `loom models show`, and the lineage in `session_start`. Where this text says "is" for something a later phase builds, read "will be, once that phase lands"; the phase column
 of §9.1 says which.
 
 **Vocabulary.** Controls of the deterministic floor are `E1`..`E4` (§2.2); build phases are `P0`, `E1`..`E4`,
@@ -424,6 +426,23 @@ Two views. Agent-influenced strings always go inside DATA, never in harness-comp
 `glm_unc` and `necromicon` are never reviewers.
 
 **Consent is per pack, not per fleet.** `[monitor.recipients] ctf = ["alibaba"]` lets any fleet's mission in that pack reach `qwen4max`; what keeps the other fleets off it is the order of `[monitor] reviewers`, which selects the first profile eligible for the whole mission. List `dsv41_review` before `qwen4max`: the LAN reviewer then wins wherever it is eligible (every fleet but the DeepSeek ones, which share its family), and `qwen4max` is reached only by missions whose reachable set includes DeepSeek. The table above is an M1 selection test: each fleet gets the reviewer listed for it.
+
+**As built (M1).** `loom_core::lineage` resolves a profile (inference, loopback, source per value); `loom_agent::monitor::lineage`
+holds `eligible`, `select`, `select_with_verifier`, `reachable_profiles`, `check_config`, `creation_refusal` and `show_lines`
+(its CONTRACT is the precise form). Choices where this text was silent:
+- An unknown family (empty set) matches every family, so it is never eligible as a reviewer and never disjoint from one; an
+  empty reached set counts as an unknown profile.
+- The reachable set takes every role of the pack, not only the roles a mission has started: a role that was not used yet can be.
+- `config check` treats every agent profile (not `purpose = "review"`) in the file as in use, in every loaded pack, because
+  any of them can lead a mission. A profile listed in `tripwires_only_profiles` need not declare its family or recipient.
+  An agent with an unknown alignment is a note, not a failure (it counts as relaxed); a reviewer must be declared stock.
+- The reviewer's recipient clause also passes when the reviewer's recipient is the recipient of **every** session whose data
+  the review includes (the intersection rule, `Request::data_recipients`); with no data recipients nothing passes by it.
+- Not wired yet (they need the monitor to be on, M2): the refusal of a real-target mission on a profile with no reviewer
+  (`creation_refusal` is the tested sentence), the monitor's configuration (reviewer, mode) in `session_start`, the status
+  words "not LLM-reviewed" in `loom ls`/`loom status`, reachability and vet facts (`Facts`), and the refusal of a spawn that
+  collides with the reviewer. `model_switched` does not exist in this tree: the lineage is carried by `ModelRef`, which that
+  record will carry.
 
 **No eligible reviewer.**
 - The profile must be listed in `[monitor] tripwires_only_profiles` (an explicit, recorded choice). Otherwise `loom config check` fails, and **real-target** missions on that profile are refused at creation with a sentence naming the choices. Lab missions are not refused.
@@ -1143,9 +1162,10 @@ P0 writes the documents; each later phase updates the ones its behaviour changes
   park the operator) and §12 (the monitor routes, as specified and not yet served) carry the matching fixes.
 - `SECURITY.md`: the threat model of the monitor and the residual risks X1 to X17 (§9.5).
 - `docs/UI.md`, `docs/RUN.md` (the operator's chapter), `README.md` (command list), `CHANGELOG.md` and
-  `docs/config.example.toml`: updated by the phase that adds the behaviour. P0 adds the commented `[monitor]`,
-  `[keep_going]` and profile keys to `docs/config.example.toml` so that the shipped defaults are written down; they are
-  commented out because the daemon rejects unknown keys until M1 adds them.
+  `docs/config.example.toml`: updated by the phase that adds the behaviour. P0 added the commented `[monitor]`,
+  `[keep_going]` and profile keys to `docs/config.example.toml` so that the shipped defaults are written down; M1 made
+  the profile keys and the model-policy keys of `[monitor]` live (the worked example of the operator's fleet is a block
+  that a test uncomments and checks) and left the keys of later phases commented, because the daemon rejects unknown keys.
 
 ---
 
@@ -1287,7 +1307,7 @@ Contracts and docs come first in every PR. Sizes: S < 1 day, M a few days, L a w
 | 0 | **E2** Fetch services and self-probe (built) | Fetch-service `mach-lookup` deny in all modes; default-deny with a probed allowlist; start and hourly probe; "egress unbounded" state | S–M | #41 (git metadata, trustd, daemon port; merged) | No sandboxed command reaches the network except through the proxy (as probed), and the daemon knows hourly whether that still holds |
 | 0 | **E3** Process identity and limits (built) | RLIMIT_NPROC; libproc inspection and signal on Unknown; sandbox-identity marker and probe; 60 s process and listener census | M | — | Every process a session started can be found and killed, including setsid'd ones with cleared environments (where the probe passes); fork bombs cannot stop the responder |
 | 0 | **E4** Proxy controls (built) | `Proxy::cut`; synchronous audit-hook veto; SNI binding; canary users; lab-listener identity; box counters | M | #39 (merged) | A hold or cut takes effect on open tunnels within 1 s. Fronted SNI and squatted lab ports are refused. Canary credential use is caught before any byte flows |
-| 1 Observe | **M1** Lineage, recipients, eligibility | `family`, `alignment`, `recipient`, `purpose`; inference; loopback = unknown; reachable-profile set; eligibility function with tests; failing `config check`; `tripwires_only_profiles`; recorded in `session_start` | S–M | #39 (both change config.rs; land after it) | Every profile has a known lineage and recipient. "Not LLM-reviewed" is an explicit, visible choice. Reviewer eligibility is a tested function |
+| 1 Observe | **M1** Lineage, recipients, eligibility (built) | `family`, `alignment`, `recipient`, `purpose`; inference; loopback = unknown; reachable-profile set; eligibility function with tests; failing `config check`; `tripwires_only_profiles`; recorded in `session_start` | S–M | #39 (both change config.rs; land after it) | Every profile has a known lineage and recipient. "Not LLM-reviewed" is an explicit, visible choice. Reviewer eligibility is a tested function |
 | 1 | **M2** Monitor core (shadow) | Cursors; log, fold barrier, heartbeat, reserve file; tripwires TW-01..28 with the §6.1 matching rules; flags and dedupe; R0; FS joins; `loom monitor replay`; GET routes; `loom monitor status\|log\|replay` | M–L | #34, #36, #39; E3 and E4 inputs (stubbed until landed) | Every record is checked. History replay reports per-tripwire precision and would-be pauses. Nothing changes for agents yet |
 | 2 Respond | **M3** Durable pause, contain, halt | WAL pause state; `may_run` everywhere; hold policy; hold state of `session::Control`; lead park without killing; children held; job SIGSTOP with frozen timeouts; R4 (snapshot, cut, census kill); R5 via `may_run`; fixed answer rendering; monitor items without echo; leak, crash and concurrency tests | L | M2, E3, E4; a `creating` state that blocks lead activation, and Parked/Blocker resolution that exempts monitor items; #37 (merged) | A paused mission stays paused across restarts, answers and spawns, and its open connections are gone. No reviewer text reaches the agent |
 | 2 | **M4** Enforcement and operator controls | Precision list enforcing; promotion; R1 (`monitor_note`, monitor-state denies, route-closure overlay); grant supersedes deny; FP reverts; bulk dispositions; digests; observe-only; `harness_test`; `loom scope --lab`; TW-03 annotations | M | M3; #37 (note eviction classes) | The precision-list behaviours (canaries, infra, other missions' records, git hooks, fetch services, squatting, idle egress) pause or contain within 2 s, with the operator notified. Everything else stays shadow until measured |

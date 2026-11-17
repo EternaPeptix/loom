@@ -44,7 +44,7 @@ daemon reads it only when it starts: configure first, then start, and restart af
 ```
 loom config init       # writes a starting file; refuses to overwrite an existing one
 loom config path       # prints the path
-loom config check      # loads the file and checks it: prints "ok", or the error and exits 1
+loom config check      # loads the file and checks it: prints each profile's lineage, then "ok", or the error and exits 1
 ```
 
 Edit `base_url` (the server's `/v1` URL) and `model` in the `[models.<name>]` table. If the server
@@ -73,6 +73,26 @@ default. Unknown keys are errors, so a typo does not go unnoticed. The values th
   whole reply has arrived.
 - `reasoning_effort` and the other `extra_body` fields are fixed for a session's life (the chat
   template may render them into the prompt head, so changing them mid-session would break the cache).
+
+### Who may review whom (model policy)
+
+The adversarial monitor (`docs/MONITOR.md`) reviews a mission with a model of another family than any model the
+mission can reach, so each profile says what it is:
+
+```toml
+[models.dsv41]
+family = ["deepseek"]      # a set; a distill lists both. Left out, loom infers it from the model id
+alignment = "stock"        # "stock", "relaxed" or "unknown"; only a declared stock model can review
+recipient = "lan"          # "local", "lan" (a host you own) or a provider name such as "alibaba"
+```
+
+A loopback `base_url` has the recipient `unknown` until you declare it (it could be a tunnel to anyone's cloud). Under
+`[monitor]`, `reviewers` lists review profiles in preference order, `[monitor.recipients]` consents, per pack, to a
+provider that does not receive the transcripts yet, and `tripwires_only_profiles` names the profiles that have no
+reviewer on purpose (their missions are "not LLM-reviewed"). `loom config check` prints each profile's resolved values
+and where each came from, and **fails** on a profile that has no eligible reviewer and is not listed, with the lines to
+add; `loom models show [profile]` shows who reviews what in each pack. `docs/config.example.toml` holds one operator's
+fleet as a worked example.
 
 ### Model API keys
 
@@ -400,6 +420,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | command | does |
 |---|---|
 | `loom daemon` / `up` / `down` | run the daemon in the foreground / in the background / stop it |
+| `loom models show [profile]` | each model profile's family, alignment and recipient, and who reviews its missions in each pack (needs no daemon) |
 | `loom status` | the daemon, each model server and whether it answered, counts, free disk space, the sandbox self-probe's egress line |
 | `loom open [--print]` | open the web UI in the browser (`--print` prints the address instead) |
 | `loom run [options] <task...>` | start a session and follow it; `-d` starts it and returns |

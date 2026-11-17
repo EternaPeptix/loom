@@ -151,7 +151,8 @@
 //!    named. They are read before the session is made (`prior::read` on a blocking thread, the lead's
 //!    meta giving the title) and `meta.prior` keeps them in the given order.
 //! 4. `SessionStart{session, mission, parent: None, workspace, pack, role, termination,
-//!    model: ModelRef{profile, model, context_window}, reasoning_replay (profile),
+//!    model: ModelRef{profile, model, context_window, lineage: `lineage::resolve` of the profile with the served
+//!    model id (family, alignment, recipient and where each came from)}, reasoning_replay (profile),
 //!    system_prompt: pack::system_prompt(role, &pack.preamble, &PromptEnv{workspace,
 //!    platform: "{OS} ({ARCH})" from std::env::consts, sandbox: sandbox.describe(),
 //!    network: texts::network_sentence(mode, allow, deny, allow_private)}), tools: empty,
@@ -2977,6 +2978,11 @@ impl Inner {
                 profile: meta.profile.clone(),
                 model: meta.model.clone(),
                 context_window: meta.context_window.unwrap_or(0),
+                lineage: self.config.models.get(&meta.profile).map(|p| {
+                    // The family is read from the id the server serves, which discovery may have filled in.
+                    let served = loom_core::config::ModelProfile { model: meta.model.clone(), ..p.clone() };
+                    loom_core::lineage::resolve(&meta.profile, &served)
+                }),
             },
             reasoning_replay: replay,
             system_prompt: pack::system_prompt(role, &pack.preamble, &env),

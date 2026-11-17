@@ -77,8 +77,15 @@
 //! - `out <handle> [--lines <a>:<b>]`: the stored output's lines (all of it, paged 5 000 lines at a
 //!   time, without `--lines`), passed through `render::clean`.
 //! - `config path` prints the config file's path; `config check` loads and checks it and reads every
-//!   `api_key_file` (`check_model_keys`): `ok`, or the error and exit 1; with `ok`, each line of
-//!   `key_env_warnings` judged against this shell's environment on stderr as `warning: {line}`; `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
+//!   `api_key_file` (`check_model_keys`), then checks the model policy against the packs
+//!   (`loom_agent::monitor::lineage::check_config`): one line per profile with its resolved family, alignment and
+//!   recipient and where each came from (stdout), each note on stderr as `note: {line}`, and, when a problem is found
+//!   (an agent profile with no eligible reviewer that is not in `[monitor] tripwires_only_profiles`, an undeclared
+//!   family or recipient, a reviewer that is not declared stock), the error `The model policy is not settled (n to fix):`
+//!   with each problem and the exact lines to add, exit 1; else `ok`, and each line of `key_env_warnings` judged
+//!   against this shell's environment on stderr as `warning: {line}`. `models show [profile]` prints the same
+//!   lines with, for each agent profile and pack, who reviews it (`lineage::show_lines`); it reads the configuration
+//!   and the packs and needs no daemon. `DEFAULT_CONFIG` lists its one profile in `tripwires_only_profiles`; `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
 //!   overwrite: `{path} already exists.`).
 //! - `service install|uninstall|status` (macOS; elsewhere `This command is for macOS (launchd).`):
 //!   `install` first loads the config and refuses (nothing written) a profile that sets `api_key_env`: a
@@ -165,6 +172,12 @@ allow_private = []
 max_children = 6
 verify_finish = true
 unavailable_notice_s = 300   # tell you (inbox item, notification) when a request has retried this long; 0 = never
+
+[monitor]
+# Who may review whose missions is a model-policy choice (docs/MONITOR.md). A profile with no reviewer must be named here
+# on purpose; its missions are then watched by the deterministic tripwires only. Remove "local" once you configure a
+# reviewer: `loom config check` says what to add, and `loom models show` shows who reviews what.
+tripwires_only_profiles = ["local"]
 "#;
 
 #[derive(Parser, Debug)]
@@ -243,6 +256,11 @@ pub enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// The model profiles as the monitor sees them
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
     },
     /// Run the daemon as a login service (macOS)
     Service {
@@ -473,6 +491,15 @@ pub enum ConfigAction {
     Path,
     Check,
     Init,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum ModelsAction {
+    /// Each profile's family, alignment and recipient (and where each came from), and who reviews its missions
+    Show {
+        /// Only this profile
+        profile: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1108,6 +1135,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
         Command::Up => cmd_up(&paths).await,
         Command::Down => cmd_down(&paths).await,
         Command::Config { action } => cmd_config(&paths, action),
+        Command::Models { action } => cmd_models(&paths, action),
         Command::Service { action } => cmd_service(&paths, action),
         Command::Status => {
             let view = client_of(&paths)?.status().await?;
@@ -1568,6 +1596,21 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
         ConfigAction::Check => {
             let config = Config::load(&file).map_err(|e| e.to_string())?;
             config.check_model_keys(&paths.model_keys_dir())?;
+            let packs = loom_agent::pack::Packs::load(&paths.packs_dir())?;
+            let report = loom_agent::monitor::lineage::check_config(&config, &packs);
+            for line in &report.table {
+                outln(line)?;
+            }
+            for note in &report.notes {
+                errln(&format!("note: {note}"));
+            }
+            if !report.problems.is_empty() {
+                return Err(format!(
+                    "The model policy is not settled ({} to fix):\n\n{}",
+                    report.problems.len(),
+                    report.problems.join("\n\n")
+                ));
+            }
             outln("ok")?;
             for line in config.key_env_warnings(&paths.model_keys_dir(), env_var_is_set) {
                 errln(&format!("warning: {line}"));
@@ -1587,6 +1630,20 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
             };
             f.write_all(DEFAULT_CONFIG.as_bytes()).map_err(|e| format!("Cannot write {} ({e}).", file.display()))?;
             outln(&format!("wrote {}", file.display())).map(|()| 0)
+        }
+    }
+}
+
+/// `loom models show [profile]`: reads the configuration and the packs; needs no daemon.
+fn cmd_models(paths: &Paths, action: ModelsAction) -> Result<i32, String> {
+    match action {
+        ModelsAction::Show { profile } => {
+            let config = Config::load(&paths.config_file()).map_err(|e| e.to_string())?;
+            let packs = loom_agent::pack::Packs::load(&paths.packs_dir())?;
+            for line in loom_agent::monitor::lineage::show_lines(&config, &packs, profile.as_deref())? {
+                outln(&line)?;
+            }
+            Ok(0)
         }
     }
 }
@@ -1877,6 +1934,11 @@ mod tests {
         assert!(matches!(ok(&["config", "path"]), Command::Config { action: ConfigAction::Path }));
         assert!(matches!(ok(&["config", "check"]), Command::Config { action: ConfigAction::Check }));
         assert!(matches!(ok(&["config", "init"]), Command::Config { action: ConfigAction::Init }));
+        assert!(matches!(ok(&["models", "show"]), Command::Models { action: ModelsAction::Show { profile: None } }));
+        assert!(matches!(
+            ok(&["models", "show", "dsv41"]),
+            Command::Models { action: ModelsAction::Show { profile: Some(p) } } if p == "dsv41"
+        ));
         assert!(matches!(ok(&["service", "install"]), Command::Service { action: ServiceAction::Install }));
         assert!(matches!(ok(&["service", "uninstall"]), Command::Service { action: ServiceAction::Uninstall }));
         assert!(matches!(ok(&["service", "status"]), Command::Service { action: ServiceAction::Status }));
@@ -2181,6 +2243,25 @@ mod tests {
         std::fs::write(paths.config_file(), "[models.m]\napi_key_file = \"m\"\n").unwrap();
         let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
         assert!(err.starts_with("models.m: ") && err.contains(&paths.model_keys_dir().join("m").display().to_string()));
+    }
+
+    #[test]
+    fn config_check_fails_on_a_profile_nobody_reviews_and_says_what_to_add() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        std::fs::create_dir_all(&paths.home).unwrap();
+        let text = "[models.dsv41]\nbase_url = \"http://10.0.0.5:8000/v1\"\nfamily = [\"deepseek\"]\nalignment = \"stock\"\nrecipient = \"lan\"\n";
+        std::fs::write(paths.config_file(), text).unwrap();
+        let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
+        assert!(err.contains("models.dsv41 has no eligible reviewer in the core pack"), "{err}");
+        assert!(err.contains("tripwires_only_profiles = [\"dsv41\"]"), "{err}");
+        std::fs::write(paths.config_file(), format!("{text}[monitor]\ntripwires_only_profiles = [\"dsv41\"]\n"))
+            .unwrap();
+        assert_eq!(cmd_config(&paths, ConfigAction::Check), Ok(0));
+        assert_eq!(cmd_models(&paths, ModelsAction::Show { profile: None }), Ok(0));
+        assert_eq!(cmd_models(&paths, ModelsAction::Show { profile: Some("dsv41".into()) }), Ok(0));
+        let err = cmd_models(&paths, ModelsAction::Show { profile: Some("nope".into()) }).unwrap_err();
+        assert!(err.contains("\"nope\"") && err.contains("dsv41"), "{err}");
     }
 
     #[test]

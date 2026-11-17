@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Monitor M1: model lineage, recipients and reviewer eligibility
+
+- **New profile keys** (all optional): `[models.<p>] family` (a list), `alignment` (`stock`, `relaxed`, `unknown`), `recipient`
+  (`local`, `lan` or a provider name) and `purpose = "review"`. Unset, the family is inferred from the model id, a relaxed
+  marker in the id or name makes the alignment `relaxed`, and the recipient is the `base_url` host, except that a loopback
+  address is `unknown` until declared. `loom_core::lineage` is the resolution; a family outside the known list is refused
+  unless `[monitor] known_families` names it.
+- **New `[monitor]` keys:** `reviewers`, `tripwires_only_profiles`, `recipients` (per-pack consent), `content.new_recipient_real_targets`
+  (`features` or `redacted`) and `known_families`. The other keys of the monitor are still rejected as unknown until their phases.
+  There is no global `allow_new_recipient`.
+- **`loom config check` checks the model policy** and now fails (exit 1) when an agent profile has no eligible reviewer in some
+  pack and is not in `tripwires_only_profiles`, or its family or recipient is undeclared, or a reviewer is not declared stock;
+  the message gives the exact lines to add. `DEFAULT_CONFIG` lists its `local` profile in `tripwires_only_profiles`. An existing
+  `config.toml` that has no `[monitor]` fails the check until it says what to do: this is the point, nothing else changes and the
+  daemon still starts.
+- **`loom models show [profile]`** prints each profile's resolved family, alignment, recipient and where each came from, and who
+  reviews its missions in each pack. Needs no daemon.
+- **`session_start`** records the resolved lineage in `model.lineage` (a new optional field of `ModelRef`; older logs read as before).
+- `loom_agent::monitor::lineage`: `eligible` (the six clauses, overrides that never cover a relaxed agent or reviewer),
+  `select` and `select_with_verifier`, `reachable_profiles`, `check_config`, `creation_refusal`, `show_lines`. Nothing in the
+  runtime consults them yet; the refusal of a real-target mission with no reviewer waits for the monitor (M2).
+- `docs/config.example.toml` has the model-policy keys live and the operator's fleet as a worked example that a test checks.
+
 ### Monitor E4 review fixes
 
 - **Server-name binding** reads a hello behind a TLS alert or change-cipher-spec, or in a record whose version is not 3.x, as

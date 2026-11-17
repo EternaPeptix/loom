@@ -57,9 +57,26 @@
 //! quote the path; profiles `gpt 4`, `gpt/4` and `GPT-4` and a profile with `api_key_file = "gpt-4-2"` get
 //! four distinct names (case-insensitively); every suggested write uses `noclobber`.
 
+//! CONTRACT (model lineage and `[monitor]`, docs/MONITOR.md section 2.6).
+//!
+//! A model profile may also set `family` (a list: `["deepseek"]`), `alignment` (`"stock"`, `"relaxed"` or `"unknown"`),
+//! `recipient` (`"local"`, `"lan"` or a provider name) and `purpose = "review"`; what unset ones resolve to is
+//! `lineage::resolve`. `[monitor]` accepts `reviewers` (profile names, in preference order), `tripwires_only_profiles`,
+//! `recipients` (per pack: the recipients the operator consents to), `content.new_recipient_real_targets`
+//! (`"features"` default, or `"redacted"`) and `known_families`; later phases add the other keys of the monitor.
+//! `Config::check` refuses, each with a sentence that names the key and the fix: an empty `family` list or a family
+//! outside `lineage::FAMILIES` and `known_families`; an empty `recipient`; a `reviewers` or `tripwires_only_profiles`
+//! entry that is not a configured profile; a profile twice in `reviewers`; a reviewer whose alignment resolves to
+//! relaxed; a `recipients` list that names `unknown` or nothing; an empty `known_families` entry. Whether a profile has
+//! an eligible reviewer is not decided here (it depends on the packs): `loom_agent::monitor::lineage::check_config`.
+//!
+//! Tests required: each refusal above with its sentence; an accepted `[monitor]` example; the default config holds no
+//! monitor setting.
+
 use crate::admit::AdmitPolicy;
 use crate::event::ReasoningReplay;
 use crate::ids::{MissionId, SessionId};
+use crate::lineage::{known_family, normalize_name, resolve, Alignment, FAMILIES};
 use crate::weave::ReweavePolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -97,6 +114,49 @@ pub struct Config {
     /// The remote Docker container the agent runs commands in (`box_exec`). Disabled by default.
     #[serde(rename = "box")]
     pub boxed: BoxCfg,
+    /// The adversarial monitor's settings (`docs/MONITOR.md`); M1 accepts the model-policy keys only.
+    pub monitor: MonitorCfg,
+}
+
+/// What a model profile is for. Absent means an agent profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfilePurpose {
+    /// A reviewer profile of the monitor: not an agent's.
+    Review,
+}
+
+/// What a reviewer in a new-recipient provider receives for a mission that has real targets (decision D9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipientContent {
+    /// Hashes, lengths and classes; no raw target content. Secrets are redacted in every case.
+    #[default]
+    Features,
+    /// The content with secrets redacted.
+    Redacted,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct MonitorContentCfg {
+    pub new_recipient_real_targets: RecipientContent,
+}
+
+/// `[monitor]`: the model policy (`docs/MONITOR.md` section 2.6). The later phases add keys; until then the daemon
+/// rejects them as unknown keys.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct MonitorCfg {
+    /// Review profiles in preference order: the first one eligible for a mission reviews it.
+    pub reviewers: Vec<String>,
+    /// Profiles that have no eligible reviewer on purpose; their missions are shown as "not LLM-reviewed".
+    pub tripwires_only_profiles: Vec<String>,
+    /// Per pack, the recipients the operator consents to receive that pack's transcripts for review.
+    pub recipients: BTreeMap<String, Vec<String>>,
+    pub content: MonitorContentCfg,
+    /// Family names beyond the ones loom infers (`lineage::FAMILIES`) that a `family` key may use.
+    pub known_families: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -150,6 +210,17 @@ pub struct ModelProfile {
     pub retry_window_s: u64,
     /// Longest pause between retries.
     pub retry_max_delay_s: u64,
+    /// The model family as a set (`["deepseek"]`; a distill belongs to both of its families). Unset: inferred from the
+    /// model id (`lineage`), else unknown, which matches every family.
+    pub family: Option<Vec<String>>,
+    /// Whether the model's refusals are intact. Unset: `relaxed` when the model id or profile name holds a marker
+    /// such as `uncensored`, else `unknown` (an agent profile then counts as relaxed and a reviewer is ineligible).
+    pub alignment: Option<Alignment>,
+    /// Who receives this profile's traffic: `local`, `lan` (a host the operator owns) or a provider name. Unset: the
+    /// host of `base_url`, or `unknown` when that is a loopback address.
+    pub recipient: Option<String>,
+    /// `review` marks a reviewer profile of the monitor.
+    pub purpose: Option<ProfilePurpose>,
 }
 
 impl Default for ModelProfile {
@@ -167,6 +238,10 @@ impl Default for ModelProfile {
             stall_timeout_s: 240,
             retry_window_s: 300,
             retry_max_delay_s: 30,
+            family: None,
+            alignment: None,
+            recipient: None,
+            purpose: None,
         }
     }
 }
@@ -818,6 +893,88 @@ impl Config {
             }
             if let Some(file) = &profile.api_key_file {
                 check_key_file_name(file).map_err(|rule| ConfigError::Invalid(format!("models.{name}: {rule}")))?;
+            }
+            self.check_lineage_keys(name, profile).map_err(ConfigError::Invalid)?;
+        }
+        self.check_monitor().map_err(ConfigError::Invalid)?;
+        Ok(())
+    }
+
+    /// The profile's `family` and `recipient` keys.
+    fn check_lineage_keys(&self, name: &str, profile: &ModelProfile) -> Result<(), String> {
+        if let Some(family) = &profile.family {
+            if family.is_empty() {
+                return Err(format!(
+                    "models.{name}.family is an empty list. List the families of the model (for example family = [\"deepseek\"]; a distill lists two), or remove the key to have loom infer it from the model id."
+                ));
+            }
+            for f in family {
+                if !known_family(f, &self.monitor.known_families) {
+                    return Err(format!(
+                        "models.{name}.family lists \"{f}\", which is not a family loom knows ({}). Fix the spelling, or, for a family that is new, add \"{}\" to known_families under [monitor]: a misspelt family would make a reviewer of the same family look unrelated.",
+                        FAMILIES.join(", "),
+                        normalize_name(f)
+                    ));
+                }
+            }
+        }
+        if let Some(recipient) = &profile.recipient {
+            if normalize_name(recipient).is_empty() {
+                return Err(format!(
+                    "models.{name}.recipient is empty. Name who receives this profile's traffic: \"local\", \"lan\" (a host you own) or the provider's name, or remove the key."
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `[monitor]`: every profile it names exists, a reviewer is not relaxed, consents name a recipient.
+    fn check_monitor(&self) -> Result<(), String> {
+        let m = &self.monitor;
+        let known = |p: &str| -> Result<(), String> {
+            self.models.get(p).map(|_| ()).ok_or_else(|| {
+                let names: Vec<&str> = self.models.keys().map(String::as_str).collect();
+                format!(
+                    "{p:?} is not a configured model profile ({}). Add [models.{p}] or fix the name.",
+                    names.join(", ")
+                )
+            })
+        };
+        let mut seen = HashSet::new();
+        for r in &m.reviewers {
+            known(r).map_err(|e| format!("monitor.reviewers: {e}"))?;
+            if !seen.insert(r.as_str()) {
+                return Err(format!(
+                    "monitor.reviewers lists \"{r}\" twice. List each profile once, in preference order."
+                ));
+            }
+            if let Some(profile) = self.models.get(r) {
+                if resolve(r, profile).alignment == Alignment::Relaxed {
+                    return Err(format!(
+                        "monitor.reviewers lists \"{r}\", whose refusals are relaxed. A relaxed model is never a reviewer: remove it from the list."
+                    ));
+                }
+            }
+        }
+        for t in &m.tripwires_only_profiles {
+            known(t).map_err(|e| format!("monitor.tripwires_only_profiles: {e}"))?;
+        }
+        for (pack, list) in &m.recipients {
+            if pack.trim().is_empty() {
+                return Err("monitor.recipients has a pack name that is empty. Name the pack (for example `ctf = [\"alibaba\"]`).".into());
+            }
+            for r in list {
+                let n = normalize_name(r);
+                if n.is_empty() || n == "unknown" {
+                    return Err(format!(
+                        "monitor.recipients.{pack} lists \"{r}\". Consent names a provider (for example \"alibaba\"); an unknown recipient is never eligible, so a consent to it means nothing."
+                    ));
+                }
+            }
+        }
+        for f in &m.known_families {
+            if normalize_name(f).is_empty() {
+                return Err("monitor.known_families lists an empty name. Remove it or write the family.".into());
             }
         }
         Ok(())
@@ -1717,5 +1874,72 @@ allow = ["*.example.test"]
             with("\"/var/run/box.sock\"", "docker_socket = \"/var/run/box.sock\"").check_box_paths(home).unwrap_err();
         assert!(err.contains("box.docker_socket"), "{err}");
         assert!(with("\"/var/run/box.sock\"", ssh).check_box_paths(home).is_ok());
+    }
+
+    #[test]
+    fn lineage_keys_and_monitor_table_parse() {
+        let c = Config::parse(
+            r#"
+[models.dsv41]
+model = "deepseek-v4.1"
+family = ["deepseek"]
+alignment = "stock"
+recipient = "lan"
+[models.dsv41_review]
+purpose = "review"
+[models.qwen4max]
+family = ["Qwen"]
+recipient = "alibaba"
+[monitor]
+reviewers = ["dsv41_review", "qwen4max"]
+tripwires_only_profiles = ["dsv41"]
+known_families = ["acme"]
+[monitor.recipients]
+ctf = ["alibaba"]
+[monitor.content]
+new_recipient_real_targets = "redacted"
+"#,
+        )
+        .unwrap();
+        c.check().unwrap();
+        assert_eq!(c.models["dsv41"].alignment, Some(Alignment::Stock));
+        assert_eq!(c.models["dsv41_review"].purpose, Some(ProfilePurpose::Review));
+        assert_eq!(c.monitor.content.new_recipient_real_targets, RecipientContent::Redacted);
+        assert_eq!(Config::default().monitor, MonitorCfg::default());
+        assert_eq!(MonitorCfg::default().content.new_recipient_real_targets, RecipientContent::Features);
+        assert!(Config::parse("[models.a]\nalignment = \"uncensored\"\n").is_err(), "alignment is a closed set");
+        assert!(Config::parse("[models.a]\npurpose = \"agent\"\n").is_err());
+        assert!(Config::parse("[monitor]\nallow_new_recipient = true\n").is_err(), "there is no global key");
+    }
+
+    #[test]
+    fn check_refuses_bad_lineage_and_monitor_settings() {
+        let with = |text: &str| Config::parse(text).unwrap().check().unwrap_err().to_string();
+        let e = with("[models.a]\nfamily = []\n");
+        assert!(e.contains("models.a.family") && e.contains("empty list"), "{e}");
+        let e = with("[models.a]\nfamily = [\"deepseeq\"]\n");
+        assert!(e.contains("\"deepseeq\"") && e.contains("known_families") && e.contains("deepseek"), "{e}");
+        assert!(Config::parse("[models.a]\nfamily = [\"acme\"]\n[monitor]\nknown_families = [\"Acme\"]\n")
+            .unwrap()
+            .check()
+            .is_ok());
+        let e = with("[models.a]\nrecipient = \" \"\n");
+        assert!(e.contains("models.a.recipient is empty"), "{e}");
+        let e = with("[models.a]\n[monitor]\nreviewers = [\"b\"]\n");
+        assert!(e.contains("monitor.reviewers") && e.contains("\"b\"") && e.contains("[models.b]"), "{e}");
+        let e = with("[models.a]\n[monitor]\nreviewers = [\"a\", \"a\"]\n");
+        assert!(e.contains("twice"), "{e}");
+        let e = with("[models.a]\nalignment = \"relaxed\"\n[monitor]\nreviewers = [\"a\"]\n");
+        assert!(e.contains("never a reviewer"), "{e}");
+        let e = with("[models.glm_uncensored]\nmodel = \"glm-5\"\n[monitor]\nreviewers = [\"glm_uncensored\"]\n");
+        assert!(e.contains("never a reviewer"), "a relaxed marker in the name counts: {e}");
+        let e = with("[models.a]\n[monitor]\ntripwires_only_profiles = [\"zzz\"]\n");
+        assert!(e.contains("tripwires_only_profiles") && e.contains("zzz"), "{e}");
+        let e = with("[monitor.recipients]\nctf = [\"unknown\"]\n");
+        assert!(e.contains("monitor.recipients.ctf") && e.contains("never eligible"), "{e}");
+        let e = with("[monitor.recipients]\n\"\" = [\"x\"]\n");
+        assert!(e.contains("pack name"), "{e}");
+        let e = with("[monitor]\nknown_families = [\" \"]\n");
+        assert!(e.contains("known_families"), "{e}");
     }
 }

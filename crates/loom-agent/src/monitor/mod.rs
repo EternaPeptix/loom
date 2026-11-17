@@ -5,13 +5,16 @@
 //! CONTRACT.
 //!
 //! ## Status
-//! Phase P0 (this tree): the vocabulary (`taxonomy`), the record and log shapes (`log`), the tripwire table
+//! Phases P0 and M1 (this tree): the vocabulary (`taxonomy`), the record and log shapes (`log`), the tripwire table
 //! (`tripwire`), the gated classes (`classify`), the review-input rules (`input`), the verdict schema
-//! (`reviewer`), lineage and eligibility (`lineage`), the response ladder (`respond`), keep-going's parameters and
+//! (`reviewer`), lineage and eligibility (`lineage`, built by M1), the response ladder (`respond`), keep-going's parameters and
 //! conditions (`keepgoing`), canaries and fleet joins (`canary`, `fleet`), the operator-authored authorization block
-//! (`auth`) and the fixed sentences the agent may see (`sentences`). **Nothing calls this module**: the daemon, the
-//! runtime and the session loop do not know it exists, no configuration key, route, command or record of it is
-//! accepted or written, and a build with it behaves exactly as one without. Every function that a later phase fills
+//! (`auth`) and the fixed sentences the agent may see (`sentences`). **Nothing but the model policy calls this
+//! module**: the daemon, the runtime and the session loop do not know the monitor exists. M1 added the profile keys
+//! `family`, `alignment`, `recipient` and `purpose`, the `[monitor]` keys `reviewers`, `tripwires_only_profiles`,
+//! `recipients`, `content` and `known_families`, the check `loom config check` runs on them, `loom models show`, and
+//! the resolved lineage in `session_start`; no route, other command or other record is accepted or written, and a
+//! build with it behaves as one without the monitor. Every function that a later phase fills
 //! returns `Err(MonitorError::NotBuilt { .. })`, never an empty or permissive value, so a caller wired in too early
 //! fails closed (nothing is cleared, nothing is allowed on the monitor's say-so).
 //!
@@ -36,7 +39,8 @@
 //! - `classify`: `GatedClass` G1..G8 and opaque code, `Decision`, and the classifier.
 //! - `input`: `ReviewKind`, `Content`, the budgets, fence and redaction-tag formats, and the input builder.
 //! - `reviewer`: the `monitor_verdict` schema (`Verdict`), its validation, `RecommendedResponse`.
-//! - `lineage`: profile `family`, `alignment`, `recipient`, and the eligibility function (M1).
+//! - `lineage`: eligibility, selection, the reachable profile set and the model-policy check (M1); the lineage of a
+//!   profile itself is `loom_core::lineage`.
 //! - `respond`: `Responder` (note, hold, cut, pause, resume, contain, halt, notify) and the R3 sequence's steps.
 //! - `keepgoing`: `KeepGoingParams` and its limits, `Blocker` (K1..K10 and the refusals), `KeepGoingAction`.
 //! - `canary`: `Canary` CN-1..CN-6. `fleet`: `Join` FS-1..FS-10.
