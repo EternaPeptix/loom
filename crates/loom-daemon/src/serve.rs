@@ -16,7 +16,8 @@
 //!    answer is the "already running" sentence below (pid and address from `daemon.json` when it is readable
 //!    and its pid is alive; otherwise the sentence says the daemon is starting and its address is not written yet).
 //!    `Config::load(paths.config_file())`, then
-//!    `check()`; an error is returned as `{path}: {error}`.
+//!    `check()`; an error is returned as `{path}: {error}`. Then `check_model_keys(paths.model_keys_dir())`;
+//!    its error is returned as it is (the key files are read again by the model clients in step 5).
 //! 2. If `daemon.json` exists and its `pid` is alive (`libc::kill(pid, 0)` succeeds or fails with
 //!    `EPERM`) and `GET http://{bind}/healthz` answers within 2 s: return `A loom daemon is already
 //!    running for {home} (pid {pid}, {bind}).` A stale file is removed.
@@ -41,11 +42,24 @@
 //! prove it holds the token, `/healthz?nonce=`, unless `--unverified-daemon`): `Ok(Already)`. A listener that answers
 //! without the proof is refused with the identity sentence (no child is started, `daemon.json` is left alone; the
 //! same in `run_until`). Otherwise `prepare_home(paths)` (as in step 1 of `run`) and start
-//! `std::env::current_exe()` with the single argument `daemon`, `LOOM_HOME` set to `paths.home`,
-//! stdin `/dev/null`, stdout and stderr appended to `{logs}/loomd.log` (`open_daemon_log`: created 0600 when
+//! `std::env::current_exe()` with the single argument `daemon` and only the environment
+//! `daemon_env(&config, std::env::vars_os(), &paths.home)` (`env_clear` first), stdin `/dev/null`, stdout and stderr appended to `{logs}/loomd.log` (`open_daemon_log`: created 0600 when
 //! missing), in its own session (`pre_exec` + `libc::setsid`) so it outlives the terminal. Then poll `healthz` every 100 ms for
 //! up to 20 s. If the child exits first or the time runs out: `Err` with `The daemon did not come
 //! up. Last lines of {log}:` followed by the log's last 15 lines.
+//!
+//! ## `daemon_env(config, parent, home)` — the environment `loom up` gives the daemon
+//! From `parent` (`loom up`'s own variables, `OsString` pairs, values kept as they are), only the
+//! variables named `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `TZ`, `TMPDIR`, `LOOM_LOG`,
+//! `RUST_BACKTRACE`, any name that starts with `LC_`, every model profile's `api_key_env`, and every
+//! `sandbox.env_pass` name; then `LOOM_HOME` = `home` (replacing one from `parent`). Nothing else: a
+//! secret exported in the shell (`GITHUB_TOKEN`, `AWS_*`, …), proxy variables and loader variables
+//! (`DYLD_*`) do not reach the daemon, where any command could read them from the environment the
+//! daemon was started with (macOS `KERN_PROCARGS2`) and where commands and the notify command would
+//! inherit them. The `api_key_env` variables are kept so that existing configurations keep working;
+//! `Config::key_env_warnings` says what that exposes. A daemon started by launchd gets the plist's
+//! variables (below) and launchd's own, and a `loom daemon` run straight from a shell keeps that
+//! shell's whole environment: both are reported by the start warnings (runtime), not changed.
 //!
 //! ## `launch_agent_plist(exe, home)` — for `loom service install` (macOS)
 //! A LaunchAgent property list with `Label` [`SERVICE_LABEL`], `ProgramArguments` `[exe, "daemon"]`,
@@ -60,7 +74,13 @@
 //! is 0600; cancelling `stop` returns `Ok` and removes `daemon.json`; a second `run` against a live
 //! first one is refused with the sentence above; a stale `daemon.json` is replaced; an invalid
 //! config is reported with its path; the plist (escaping, both paths present); `prepare_home` tightens a
-//! 0755 home and makes the top-level directories 0700.
+//! 0755 home and makes the top-level directories 0700; a profile whose key file is missing stops `run_until`
+//! with a sentence naming the profile and the file. `daemon_env`: keeps each listed name, an `LC_` name, a
+//! profile's `api_key_env` and an `env_pass` name; drops `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`,
+//! `HTTP_PROXY`, `ALL_PROXY`, `DYLD_INSERT_LIBRARIES` and an unlisted `FOO`; sets `LOOM_HOME` over a
+//! parent's. `daemon_command(program, config, home)` (the `Command` `spawn_background` starts from, before
+//! it adds the argument, stdio and `setsid`), run with `/usr/bin/env` as `program`, prints exactly
+//! `daemon_env`'s variables, so `env_clear` is in force.
 
 use crate::api::{self, ApiState};
 use crate::auth;

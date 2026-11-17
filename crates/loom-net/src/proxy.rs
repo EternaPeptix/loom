@@ -2,8 +2,9 @@
 //!
 //! CONTRACT.
 //!
-//! `Proxy::start(port, sink)` binds `127.0.0.1:{port}` (0 = any free port) and serves until
-//! `shutdown` or drop. It speaks HTTP/1.1 proxying only:
+//! `Proxy::start(port, sink)` binds the shared listener `127.0.0.1:{port}` (0 = any free port; `port()`
+//! is the port bound) and serves until `shutdown` or drop; each session's grant adds a listener of its
+//! own (see *Sessions*). Every listener speaks HTTP/1.1 proxying only:
 //! - `CONNECT host:port` → on success `HTTP/1.1 200 Connection established\r\n\r\n`, then bytes are
 //!   copied both ways until either side closes;
 //! - a request with an absolute `http://` URI → the proxy connects to that host (port 80 by
@@ -24,21 +25,37 @@
 //! HTTP client does not show what the proxy answered to its CONNECT.
 //!
 //! ## Sessions
-//! `grant(session, policy)` returns a [`SessionGrant`] with fresh random credentials (user = the
-//! session id, password = 32 hex chars). The client authenticates with `Proxy-Authorization: Basic`.
+//! `grant(session, policy) -> Result<SessionGrant, ProxyError>` returns fresh random credentials (user =
+//! the session id, password = 32 hex chars) and the port of the session's own listener. The first grant
+//! of a session binds that listener on `127.0.0.1:0` (a failure is `ProxyError::Bind`, and nothing is
+//! granted); a later grant of the same session keeps its listener and port and replaces the password, so
+//! the old one gets `407`. It must be called inside a Tokio runtime. A command's environment names only
+//! its own session's port, and the sandbox lets the command connect to that port and no other of the
+//! proxy's, so credentials a command reads from another process (another session's command, through
+//! the environment it was started with) are of no use to it: **command credentials are accepted only on
+//! their session's listener, and reference credentials only on the shared listener.** Credentials that
+//! arrive on another listener are refused as unknown ones are (`407`), with the decision rule
+//! `proxy authentication failed: credentials of session {owner} on the port of session {listener}`
+//! (or `… on the shared port`, `reference credentials on the port of session {listener}`), recorded for
+//! the listener's session (the session whose sandbox may connect there) or, on the shared listener,
+//! unattributed. The check is by the listener a connection was accepted on, before anything else of the
+//! request is acted on. The client authenticates with `Proxy-Authorization: Basic`.
 //! Missing or unknown credentials → `407` with `Proxy-Authenticate: Basic realm="loom"`.
-//! `grant_reference(session, cfg)` returns a separate `ReferenceGrant` (URL and host matcher, no env).
-//! Its random credential is kept only in trusted in-process tools, with GET/check/CONNECT permitted.
+//! `grant_reference(session, cfg)` returns a separate `ReferenceGrant` (URL and host matcher, no env) on the
+//! shared listener. Its random credential is kept only in trusted in-process tools, with GET/check/CONNECT permitted.
 //! Plain HTTP strips Authorization, Cookie and Referer. HTTPS CONNECT is opaque: the trusted client
 //! enforces GET, no URL user-info, no credential headers and redirect policy at every hop. Neither a
 //! host reservation nor GET-only access prevents exfiltration in URL paths/queries.
-//! `revoke(session)` drops both command and reference grants; connections already open are left to finish.
+//! `revoke(session)` drops both command and reference grants and closes the session's listener (it
+//! accepts nothing more; the port is released); connections already open are left to finish.
 //! `set_policy(session, policy)` replaces the policy of a session that holds a grant and keeps its
 //! credentials, so commands already running pick the change up on their next connection.
 //! `SessionGrant::env()` gives the variables to place in a command's environment so that ordinary
 //! clients use the proxy: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case forms, all
-//! `http://{user}:{password}@127.0.0.1:{port}`, plus `NO_PROXY`/`no_proxy` = `` (empty, so loopback
-//! labs also pass policy unless the sandbox opens their ports directly).
+//! `http://{user}:{password}@127.0.0.1:{port}` with the session's own port, plus `NO_PROXY`/`no_proxy` = ``
+//! (empty, so loopback labs also pass policy unless the sandbox opens their ports directly).
+//! `shutdown` and `stop` close every listener. The limits below are of the proxy as a whole, across
+//! listeners, as before.
 //!
 //! ## Deciding and connecting
 //! For each request: `policy.check_name` → if allowed, resolve the name (`tokio::net::lookup_host`;
@@ -77,7 +94,12 @@
 //! refused as private-address with `resolved` set; allowlist miss; unreachable port → 502 and an
 //! allowed decision with the suffix; exactly one decision per request and the right session id on
 //! each when two sessions use the proxy at once; malformed heads → 400 and the server keeps serving;
-//! oversized head; `env()` contents; shutdown stops accepting.
+//! oversized head; `env()` contents; shutdown stops accepting. Listeners: two sessions' grants have
+//! different ports, neither the shared one; session B's valid credentials on A's port → `407`, nothing
+//! connected, one refused decision recorded for A naming B; A's credentials on the shared port → `407`
+//! (unattributed); a reference grant works on the shared port and is refused on a session's port; a second
+//! grant of A keeps the port and the first password gets `407`; after `revoke(A)` a connect to A's port
+//! fails; `shutdown` closes the session listeners too.
 //!
 //! ## Audit
 //! `start_with` takes an audit hook ([`AuditFn`]), called on a blocking thread with the session (or

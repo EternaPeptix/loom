@@ -49,6 +49,20 @@ harness's.
   to stop a daemon from a version that cannot give the proof; do not use it otherwise.
 - To use a daemon on another machine, forward its port over SSH. Do not change the bind address to a
   non-loopback one; the daemon will not accept it.
+- **The daemon's environment holds only what it needs.** `loom up` starts the daemon with `PATH`, `HOME`,
+  `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TZ`, `TMPDIR`, `LOOM_LOG`, `RUST_BACKTRACE`, the variables
+  your profiles name in `api_key_env` and those listed in `[sandbox] env_pass`, and nothing else of the
+  shell that ran it: tokens, cloud credentials and proxy or loader variables exported there do not reach
+  the daemon or the commands it runs. A login service (`loom service install`) gets `LOOM_HOME` and a fixed
+  `PATH` from its property list. `loom daemon` run straight from a shell keeps that shell's environment.
+- **Model API keys belong in files.** `api_key_file = "<name>"` reads `~/.loom/keys/models/<name>` once at
+  start; the file must be yours, a regular file and mode 0600, and the daemon does not start otherwise.
+  Commands cannot read `~/.loom/keys`. `api_key_env` still works, but then the key is in the daemon's
+  environment, where commands can read it (see *Known limits*); `loom up`, `loom config check` and the
+  daemon's log warn about every such profile, and `loom service install` refuses one.
+- **Model requests use no proxy.** `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (in either case) and the
+  system's proxy settings are ignored for model requests, which go to the configured `base_url` only. A
+  proxy exported in your shell (an intercepting proxy, say) never sees a transcript or the key.
 
 ### What a command run by the model can and cannot do
 
@@ -72,15 +86,19 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   Safari profiles. So are
   the loom token and keys and your `unreadable_paths`. A listed directory that is or contains the
   workspace is skipped.
-- **The network** is closed except for loopback connections to the egress proxy (and any ports or sockets
-  you list). The proxy applies `[network]`: by default (`deny_all`) it forwards nothing. It resolves
+- **The network** is closed except for loopback connections to the session's own port of the egress
+  proxy (and any ports or sockets you list). Each session has a proxy port of its own, and its proxy
+  credentials are accepted on that port only. The proxy applies `[network]`: by default (`deny_all`) it forwards nothing. It resolves
   names itself, refuses private, loopback and link-local addresses (including IPv4 addresses hidden in
   IPv6 forms) unless you list them, applies the deny list to the resolved address, and records every
   decision in a hash-chained audit file. Commands that listen on loopback can be reached by other
   local processes.
 - **Scope is the operator's.** The agent can ask for hosts with `request_scope`, which opens an inbox
   item and changes nothing. Hosts are granted only by the operator, per session, with a record in the
-  ledger; a grant dies with the session. `loom release` records that the operator closed a mission
+  ledger; a grant dies with the session. Under `deny_all` a grant allows exactly the granted hosts (the
+  configured `allow` list stays off). `*`, a wildcard over a top-level domain (`*.com`) and the
+  unspecified address (`0.0.0.0`, `::`, which reaches this machine's own services) can be neither
+  requested nor granted, so approving a request cannot open everything at once. `loom release` records that the operator closed a mission
   without the goal established, with a reason, and it is shown as that, not as finished.
 - **No LaunchServices opens, Apple Events or launchd jobs**, so a command cannot start a program
   outside the sandbox that way.
@@ -180,6 +198,19 @@ These are the places where loom does less than the text above might suggest.
   webhook or private parts, every model profile's `api_key_env`, and values that are URLs with a
   password in them are withheld. A secret in a variable called something else, in another form, is
   passed through. `env_pass` passes more.
+- **Any process of yours can read the environment and arguments another of your processes was started
+  with**, sandboxed commands included (macOS `KERN_PROCARGS2`; the seatbelt profile cannot deny it
+  without breaking common interpreters, and clearing a variable inside a running process does not erase
+  the copy that is read). So a command can read: a key named by `api_key_env`, and anything else in the
+  daemon's environment (with `loom daemon` run straight from a shell, that shell's whole environment);
+  the command lines and environments of other sessions' commands, other missions' included; and those of
+  every other program you run that is not a platform binary. loom narrows what is there: `loom up`
+  clears the daemon's environment, `api_key_file` keeps keys out of it, and a session's proxy credentials
+  work only on that session's own proxy port, which other sessions' commands cannot connect to. With
+  `loopback_all = true` (or a `loopback_ports` entry that happens to be a session's port) they can, and a
+  command that read another running session's proxy credentials can then reach what that session may
+  reach, recorded in that session's audit log. Do not export secrets in the shell you start loom from,
+  and do not pass secrets to commands on their command lines.
 - **A process that leaves its command's process group is not tracked.** After `setsid`, `daemon()`,
   `redis-server --daemonize yes` or `tmux new -d`, `job_kill`, stop, the end of the session and daemon
   shutdown do not stop it, although it stays under the seatbelt profile.

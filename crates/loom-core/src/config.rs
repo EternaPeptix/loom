@@ -2,6 +2,45 @@
 //!
 //! Every field has a default, so an empty file is a valid config. Unknown keys are rejected so that a
 //! typo is an error rather than a silently ignored setting.
+//!
+//! CONTRACT (model API keys).
+//!
+//! A model profile names its API key in one of two ways, or not at all; `Config::check` refuses a profile
+//! that sets both (`models.{p}: set api_key_file or api_key_env, not both.`).
+//! - `api_key_file = "{name}"`: the file `{name}` in `Paths::model_keys_dir()` (`<loom home>/keys/models`,
+//!   which commands cannot read). `check` refuses a name that is empty, longer than 64 characters, starts
+//!   with `.`, or holds a character outside `[A-Za-z0-9._-]` (so it can name nothing outside that
+//!   directory), with a sentence naming the profile and the rule.
+//! - `api_key_env = "{VAR}"`: the variable `{VAR}` of the daemon's environment. Commands are never given it
+//!   (`secret_env`), but every process of the user, sandboxed commands included, can read the environment
+//!   another process was started with (macOS `KERN_PROCARGS2`), so a key held this way is readable by
+//!   commands. It stays supported so that existing configurations keep working.
+//!
+//! `read_model_key(dir, name) -> Result<String, String>`: the key in `dir/name`. The file is opened
+//! without following a link (`O_NOFOLLOW`) and judged by the open descriptor. Refused, each with a
+//! sentence that names the path and says how to fix it: a missing file (the sentence gives the commands
+//! that make one: `mkdir -p -m 700 {dir}` and `(umask 077; cat > {path})`, then the key and Ctrl-D); a link;
+//! anything but a regular file; a file another user owns; a file with any group or other permission bit
+//! (`chmod 600 {path}`); more than 16 KiB; content that is not UTF-8; content that, with leading and
+//! trailing white space removed, is empty or still holds white space or a control character. Returns the
+//! trimmed content. Never puts the key in a message.
+//!
+//! `Config::check_model_keys(dir) -> Result<(), String>`: `read_model_key` for every profile that sets
+//! `api_key_file`, in name order; the first refusal as `models.{p}: {sentence}`.
+//!
+//! `Config::key_env_warnings(dir, is_set) -> Vec<String>`: one sentence per profile that sets `api_key_env`,
+//! in name order (`dir` is `Paths::model_keys_dir()`). When `is_set(var)` (the variable is present and not
+//! empty in the environment the daemon has or will be started with): the key of `models.{p}` is in the
+//! daemon's environment, where every command can read it, and how to move it: write it to `{dir}/{p}`
+//! (`mkdir -p -m 700 {dir}`, then `(umask 077; printenv {VAR} > {dir}/{p})`), replace
+//! `api_key_env = "{VAR}"` with `api_key_file = "{p}"` in `[models.{p}]`, and restart the daemon. Otherwise:
+//! `{VAR}` is not set, so requests of `models.{p}` carry no key, and the same move. Never the value.
+//!
+//! Tests required: both forms refused together; each name rule; `read_model_key` returns the trimmed key
+//! and refuses a missing file (with the commands), a link, a directory, mode 0640 and 0604, an empty or
+//! all-blank file, inner white space, a control character, non-UTF-8 and 16 KiB + 1 bytes, no message
+//! holding the key; `check_model_keys` names the profile; `key_env_warnings` for a set and an unset
+//! variable, holding the variable's name and the move and never its value.
 
 use crate::admit::AdmitPolicy;
 use crate::event::ReasoningReplay;
@@ -66,8 +105,13 @@ pub struct ModelProfile {
     /// Base URL of an OpenAI-compatible API, including `/v1`.
     pub base_url: String,
     pub model: String,
-    /// Name of an environment variable holding the API key, when the server wants one.
+    /// Name of an environment variable holding the API key, when the server wants one. A key held this
+    /// way is in the daemon's environment, which commands can read; prefer `api_key_file` (see *model API
+    /// keys* above).
     pub api_key_env: Option<String>,
+    /// Name of a file in `<loom home>/keys/models` holding the API key, when the server wants one. Read
+    /// once at daemon start (see *model API keys* above). Set this or `api_key_env`, not both.
+    pub api_key_file: Option<String>,
     /// Context window in tokens. When absent it is discovered from the server's model list.
     pub context_window: Option<u64>,
     /// `max_tokens` sent with each request. Absent = not sent (the server's default applies).
@@ -99,6 +143,7 @@ impl Default for ModelProfile {
             base_url: "http://127.0.0.1:8000/v1".into(),
             model: "default".into(),
             api_key_env: None,
+            api_key_file: None,
             context_window: None,
             max_output_tokens: None,
             reasoning_replay: ReasoningReplay::All,
@@ -681,6 +726,10 @@ impl Paths {
     }
     pub fn keys_dir(&self) -> PathBuf {
         self.home.join("keys")
+    }
+    /// Where model API key files are (`api_key_file`).
+    pub fn model_keys_dir(&self) -> PathBuf {
+        self.keys_dir().join("models")
     }
     pub fn journal_key(&self) -> PathBuf {
         self.keys_dir().join("journal.key")

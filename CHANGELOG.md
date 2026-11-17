@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Model traffic, the daemon's environment and proxy credentials stay where they belong
+
+- Model requests ignore `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and the system's proxy settings. Before,
+  a proxy exported in the shell that ran `loom up` received every transcript and the bearer key, or, when
+  closed, made every step fail after the whole retry window.
+- `loom up` starts the daemon with a cleared environment: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`,
+  `LANG`, `LC_*`, `TZ`, `TMPDIR`, `LOOM_LOG`, `RUST_BACKTRACE`, the profiles' `api_key_env` variables and
+  the `[sandbox] env_pass` names. Any process of the user, sandboxed commands included, can read the
+  environment a process was started with (macOS `KERN_PROCARGS2`), so the shell's tokens and cloud
+  credentials no longer sit where commands can read them. **Commands no longer inherit other variables
+  of that shell**: list one they need (`JAVA_HOME`, say) in `env_pass`.
+- New profile key `api_key_file`: a file name in `~/.loom/keys/models` (yours, mode 0600), read once at
+  start; the daemon refuses to start, naming the profile and the file, when it cannot use it. `api_key_env`
+  keeps working unchanged, with a warning from `loom up`, `loom config check` and the daemon log that the
+  key is readable by commands, and how to move it (RUN.md, *Model API keys*). `loom service install`
+  refuses a profile with `api_key_env`, which a login service never had. A profile may not set both.
+- Each session gets a proxy listener of its own; its sandbox allows that port only, and its credentials
+  are refused on any other listener. A command that reads another session's proxy credentials from the
+  environment of that session's commands can no longer use them (except with `loopback_all`).
+- Under `deny_all`, a scope grant allows exactly the granted hosts: before, the first grant also switched
+  on every host in the configured `allow` list.
+- `request_scope` and `loom scope` refuse `*`, a wildcard over a top-level domain (`*.com`) and the
+  unspecified address (`0.0.0.0`, `::`). Grants already in a ledger are kept as they are.
+- `ModelClient::new` takes the key directory; `Proxy::grant` returns a `Result` and must run inside a
+  Tokio runtime. SECURITY.md lists what `KERN_PROCARGS2` still exposes.
+
 ### security_record reads near misses
 
 - `security_record` now reads an operation where its meaning is unambiguous (`ops`/`items` for

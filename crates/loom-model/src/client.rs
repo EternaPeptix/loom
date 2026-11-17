@@ -8,7 +8,7 @@
 //! 1. emit `StreamEvent::AttemptStart { attempt }` (attempts count from 1);
 //! 2. `POST {base_url}/chat/completions` with `ChatRequest::body(model, profile.extra_body)`, where
 //!    `model` is the id `discover` last selected, else `profile.model` (see **unknown model** below),
-//!    header `Authorization: Bearer {key}` when `profile.api_key_env` names a non-empty variable,
+//!    header `Authorization: Bearer {key}` when the profile has a key (see **Keys**),
 //!    `Accept: text/event-stream`. No request timeout is set on the whole request; instead:
 //! 3. while reading (headers and every body chunk), waiting longer than `profile.stall_timeout_s`
 //!    for the next bytes fails the attempt as a stall. Connecting has a 10 s timeout;
@@ -79,6 +79,21 @@
 //! ## `health`
 //! `GET {base_url}/models` with a 5 s timeout → true on 2xx.
 //!
+//! ## `new(name, profile, keys_dir)`: keys and proxies
+//! Fails with `ModelError::Config` when `base_url` is not an http(s) URL. `keys_dir` is where key files are
+//! (`Paths::model_keys_dir()`, `<loom home>/keys/models`). **Keys**, the bearer a request carries:
+//! - `profile.api_key_file` set: the key `loom_core::config::read_model_key(keys_dir, file)` returns, read
+//!   once, here. Its refusal (missing file, a link, not this user's, any group or other permission bit, …) is
+//!   `ModelError::Config` with `model profile '{name}': ` before its sentence, so the daemon does not start
+//!   with a key it cannot send. The key is kept in this client's memory only, never put in an environment.
+//! - else `profile.api_key_env` names a variable that is set and not empty: its value, read per request.
+//! - else none, and no `Authorization` header is sent.
+//! **No proxy.** The HTTP client is built with `no_proxy()`: `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` in
+//! either case, and the system's proxy settings, are ignored. `complete`, `discover` and `health` connect
+//! only to `base_url` (DESIGN §2, principle 9), so a proxy exported in the shell that started the daemon
+//! (an intercepting proxy, say) never receives a transcript or the bearer key, and a closed one cannot
+//! make every step fail.
+//!
 //! Tests required (all against `crate::mock::MockServer`): a plain reply; a tool-call reply; events
 //! arrive in order with `AttemptStart` first; retry after 500 then success (attempts == 2, events of
 //! the failed attempt precede a second `AttemptStart`); connection dropped mid-stream is retried and
@@ -86,7 +101,14 @@
 //! `Retry-After` honoured; retry window exhausted → `Unavailable`; 400 → `Rejected` with the
 //! server's message; overflow wording → `ContextOverflow` with parsed numbers; cancellation during
 //! a stream and during a retry sleep; server unreachable then started later is picked up; bearer
-//! header sent only when configured; `discover` for each source; `timing` is plausible.
+//! header sent only when configured; `discover` for each source; `timing` is plausible. Keys: a key
+//! file's trimmed content is the bearer (and wins over nothing else: `Config::check` refuses a profile
+//! with both forms); a missing key file and one with mode 0644 make `new` fail with a `Config` naming the
+//! profile and the path. Proxies, in a child process (the test binary run again for that one test, since
+//! the variables are read when a client is built): with `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their
+//! lower-case forms all set to `http://127.0.0.1:{port}` of a port nothing listens on, `complete`,
+//! `discover` and `health` against a `MockServer` succeed, and a `reqwest::Client::new()` GET of the same
+//! mock URL in the same child fails (the control showing the variables are in force).
 
 use crate::assemble::{AssembleError, Assembler, Completion, SseParser, StreamEvent};
 use crate::request::ChatRequest;

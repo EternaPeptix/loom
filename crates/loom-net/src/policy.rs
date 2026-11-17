@@ -53,12 +53,27 @@
 //!
 //! ## Per-session grants — `Policy::with_hosts(cfg, hosts)`, `check_hosts(hosts)`
 //! `with_hosts` is `Policy::new(cfg)` plus the operator-granted `hosts` (same pattern syntax as `allow`).
-//! Mode `deny_all` with at least one host becomes `allowlist` allowing exactly the granted hosts; mode
-//! `allowlist` gets them appended to `allow`; mode `open` is unchanged. `deny` and `allow_private` are
-//! the config's, so a granted host that is denied, or resolves to a private address, is still refused.
-//! An entry that is not a valid pattern is an error sentence naming it. `check_hosts` trims and
-//! validates a list of hosts to grant (non-empty, no blank entry, no whitespace or comma inside an
-//! entry, each a valid pattern) and returns them as written, trimmed.
+//! Mode `deny_all` with at least one host becomes `allowlist` allowing exactly the granted hosts: the
+//! configured `allow` list is not in force under `deny_all`, so it is emptied first and a grant never
+//! switches it on. Mode `allowlist` gets them appended to `allow`; mode `open` is unchanged. `deny` and
+//! `allow_private` are the config's, so a granted host that is denied, or resolves to a private address,
+//! is still refused. An entry that is not a valid pattern is an error sentence naming it. `with_hosts`
+//! does not apply the refusals of `check_hosts` below: hosts restored from a ledger written before them
+//! are honoured as they were granted.
+//!
+//! `check_hosts` trims and validates a list of hosts to grant (non-empty, no blank entry, no whitespace
+//! or comma inside an entry, each a valid pattern) and returns them as written, trimmed. It is the check
+//! of both a model's `request_scope` and the operator's grant (`Runtime::grant_scope`, which the approve
+//! action of a scope request calls with the hosts the model wrote), and it also refuses, each with a
+//! sentence that names the entry, says why and what to write instead, and grants nothing of the list:
+//! - `*` with or without a port: it would authorize every host;
+//! - a wildcard over a single label, `*.{label}` with or without a port (`*.com`, `*.io`, `*.htb`): it
+//!   would authorize a whole top-level domain; a wildcard under a domain (`*.example.test`) is kept. A
+//!   public suffix of more than one label (`*.co.uk`) is not recognised;
+//! - an IP literal that is unspecified or in `0.0.0.0/8` (`0.0.0.0`, `0.0.0.0:8080`, `0.1.2.3`, `::`,
+//!   `[::]:80`), also in an IPv6 form that carries such an IPv4 address (`[::ffff:0.0.0.0]`): a literal
+//!   grant unlocks its exact address against the private-address rule (below), and a connection to the
+//!   unspecified address reaches this machine's own services.
 //!
 //! **Loopback/private literals granted to a session unlock that exact address**: a granted host that is
 //! an IP literal (`127.0.0.1`, `[::1]:8080`, `10.0.0.5:443`) additionally authorizes connections to that
@@ -75,6 +90,12 @@
 //! matching; port-specific patterns; case and trailing dot; each numbered rule and their order (deny
 //! beats allow); every special range at its edges (first/last address in, neighbours out); mapped
 //! IPv6; `allow_private` by name, by CIDR and by address; open mode still refuses private addresses.
+//! `with_hosts` under `deny_all` with a non-empty configured `allow` and one granted host: the granted
+//! host is allowed and every `allow` entry is refused (`not in allow list`); under `allowlist` both are
+//! allowed. `check_hosts` refuses `*`, `*:443`, `*.com`, `*.com:443`, `0.0.0.0`, `0.0.0.0:8080`,
+//! `0.1.2.3`, `::`, `[::]`, `[::]:80`, `[::ffff:0.0.0.0]` with a sentence naming the entry, refuses a
+//! list holding one of them besides valid hosts, and accepts `*.example.test`, `api.example.test:443`,
+//! `127.0.0.1:19201`, `10.0.0.5` and `[::1]:8080`.
 
 #![allow(clippy::doc_lazy_continuation)]
 

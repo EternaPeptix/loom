@@ -855,8 +855,12 @@ the precise specification.
 
 The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the precise specification.
 
-- `POST {base_url}/chat/completions` with `Authorization: Bearer …` when `api_key_env` names a
-  non-empty variable. The body's keys come in a fixed order — `model`, `messages`, `tools`,
+- The key, when a profile has one: `api_key_file` names a file in `<home>/keys/models` (the user's,
+  a regular file, mode 0600), read once when the daemon starts, which refuses to start without it;
+  `api_key_env` names a variable of the daemon's environment, read per request, which commands can read
+  there too (macOS `KERN_PROCARGS2`), so the daemon warns about it. The HTTP client uses no proxy: proxy
+  variables and the system's proxy settings are ignored, so requests reach `base_url` only (principle 9).
+- `POST {base_url}/chat/completions` with `Authorization: Bearer …` when the profile has a key. The body's keys come in a fixed order — `model`, `messages`, `tools`,
   `tool_choice` (omitted: the session always uses `auto`), `stream: true`,
   `stream_options.include_usage: true`, `max_tokens` when `max_output_tokens` is set, `seed` (votes
   only), then `extra_body` (`reasoning_effort`, sampling, `vllm_xargs`, …) verbatim — and the same
@@ -1088,7 +1092,7 @@ The Seatbelt policy:
   nor created as a link, since that would carry what it holds out of its rule;
 - denied: LaunchServices opens (`lsopen`), Apple Events, launchd job creation, and signals to anything
   outside the sandbox;
-- network: denied, except loopback connections to the egress proxy, to `sandbox.loopback_ports` (or
+- network: denied, except loopback connections to the session's own egress proxy listener, to `sandbox.loopback_ports` (or
   every loopback port with `loopback_all`) and to `sandbox.unix_sockets`; listening on loopback is
   allowed.
 
@@ -1115,7 +1119,7 @@ relative to that descriptor. A file name that is itself a link is read and follo
 most 8 links, so the directory checked is the target's. A role with `read_only` gets no `extra_writable`
 and its workspace is added to the never-writable paths, so it can still write in its session temp dir,
 and to the device files, and nowhere else. This is a write policy; readable untrusted files remain
-untrusted inputs. In `none`, read-only roles do not constrain shell commands. Commands get the daemon's environment without any variable whose
+untrusted inputs. In `none`, read-only roles do not constrain shell commands. Commands get the daemon's environment (which `loom up` limits, §12) without any variable whose
 name (case-insensitive) contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`,
 `CREDENTIAL`, `AUTH_TOKEN`, `COOKIE`, `SESSION_KEY` or `PRIVATE`, has `SESSION`, `AUTH`, `PASS`, `JWT`
 or `WEBHOOK` as a part delimited by `_` or the ends of the name, ends in `_PAT`, `_DSN`, `_PWD` or `_PW`,
@@ -1126,15 +1130,20 @@ whose value holds, anywhere, a URL with a password in its user-info part (`schem
 dir, and the proxy variables.
 
 **Egress proxy** (`loom-net::proxy`, `policy`; their module documentation is the precise
-specification). One HTTP/1.1 proxy on `127.0.0.1:daemon.proxy_port` (0 = any free port): `CONNECT`
-tunnels, plain-HTTP forwarding of absolute `http://` URIs (one request per connection, proxy headers
+specification). One HTTP/1.1 proxy: a shared listener on `127.0.0.1:daemon.proxy_port` (0 = any free
+port) for the in-process reference clients, and a listener of each session's own on a free loopback
+port. Every listener serves `CONNECT` tunnels, plain-HTTP forwarding of absolute `http://` URIs (one request per connection, proxy headers
 dropped, `Connection: close`), and the check `LOOM-CHECK`. Anything else, a head above 64 KiB, or no
 head within 10 s gets `400`.
 
-- Every session, also under `deny_all`, gets credentials (user = session id, a random password) and
-  the variables `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case forms, with `NO_PROXY`
-  empty; so every decision is attributed. Missing or wrong credentials get `407`. A session's grant is
-  revoked when it settles.
+- Every session, also under `deny_all`, gets credentials (user = session id, a random password), a
+  listener of its own, and the variables `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case
+  forms naming that listener, with `NO_PROXY` empty; so every decision is attributed. Missing or wrong
+  credentials get `407`, and so do a session's credentials on any listener but its own (recorded for the
+  listener's session). The sandbox lets a session's commands connect to its own listener only, so
+  credentials a command reads from another command's environment (`KERN_PROCARGS2`) are of no use to it,
+  unless `loopback_all` opens every port. A session's grant is revoked, and its listener closed, when it
+  settles.
 - **Policy** (`[network]`): `mode` is `deny_all` (the default: tools reach no host; model requests are
   not affected), `allowlist` (only hosts matching `allow`: `host` or `*.suffix`, optional `:port`) or
   `open` (every public destination). The name is checked first: a `deny` entry wins, then the mode.
@@ -1150,8 +1159,11 @@ head within 10 s gets `400`.
 - **Per-session scope grants.** The operator can authorize more hosts for a running mission without a
   restart (`Runtime::grant_scope`, `POST /api/sessions/{id}/scope`, `loom scope`). The egress policy of
   every running session of the mission becomes the configured network plus the granted hosts: under
-  `deny_all` the granted hosts become an allowlist, under `allowlist` they are added to `allow`, under
-  `open` nothing changes. The configured `deny` list still binds a granted host. A granted host that
+  `deny_all` the granted hosts become an allowlist of exactly those hosts (the configured `allow` list,
+  which `deny_all` keeps off, stays off), under `allowlist` they are added to `allow`, under `open`
+  nothing changes. `*`, a wildcard over one label (`*.com`) and an unspecified IP literal (`0.0.0.0/8`,
+  `::`) are refused for a model's request and the operator's grant alike (`check_hosts`); hosts restored
+  from an older ledger are honoured as granted. The configured `deny` list still binds a granted host. A granted host that
   is an IP literal additionally authorizes that exact address (and port, when written) against the
   private-address rule, for this mission only; names granted stay bound to the private-address rule
   even when they resolve to a private address. The lead records the grant in the ledger (`ScopeGrant`, when the mission keeps one) and gets a
@@ -1352,11 +1364,16 @@ log, then its live records, deltas and statuses, without duplicates. A subscribe
 8 192 events behind gets `lagged` (a session stream then replays the records it missed from the log).
 Streams end when the daemon stops.
 
-**Running.** `loom daemon` (and `loom up`, which starts it in the background, or `loom service install`,
-a launchd agent that restarts it after a crash) raises its open-file limit, creates the home and its top-level directories (0700, tightened if they exist looser) and
+**Running.** `loom up` starts the daemon in the background with a cleared environment
+(`serve::daemon_env`: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TZ`, `TMPDIR`,
+`LOOM_LOG`, `RUST_BACKTRACE`, the profiles' `api_key_env` variables and the `sandbox.env_pass` names, then
+`LOOM_HOME`), so the shell's other variables never reach the daemon, where commands could read them; it
+prints a warning for each `api_key_env` key it passes on. `loom service install` (a launchd agent that
+restarts the daemon after a crash; its plist gives `LOOM_HOME` and a fixed `PATH`) refuses a profile with
+`api_key_env`, which the agent would not have. `loom daemon` raises its open-file limit, creates the home and its top-level directories (0700, tightened if they exist looser) and
 takes an exclusive lock on `daemon.lock` for its lifetime, so a second daemon on the same home is
 refused (`A loom daemon is already running for <home> (pid N, <addr>).`) even when both start at once.
-It then loads and checks the config, checks that the sandbox mode can work on this host, creates or
+It then loads and checks the config, reads every `api_key_file`, checks that the sandbox mode can work on this host, creates or
 reads the token (0600, atomically, never replaced), binds, starts the runtime, writes `daemon.json`, and
 serves until SIGINT, SIGTERM or `POST /api/shutdown` (`loom down`), giving open requests 3 s.
 

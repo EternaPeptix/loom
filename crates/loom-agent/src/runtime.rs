@@ -95,7 +95,11 @@
 //!   (created, canonical), blobs: BlobStore::open(paths.blobs_dir()), cfg: tools config, sandbox,
 //!   env, files: new FileTracker, jobs: JobTable::new(<session dir>/jobs, blobs, sender,
 //!   tools.max_output_bytes), cancel: new token}`.
-//!   - `sandbox`: `Sandbox::new(&cfg, workspace, tmp_dir, paths.home, Some(proxy port))` with the
+//!   - The proxy grant is made first (`proxy.grant(id, policy)`; a failure to open the session's
+//!     listener fails the set-up with `The egress proxy cannot open a port for this session: {error}`).
+//!   - `sandbox`: `Sandbox::new(&cfg, workspace, tmp_dir, paths.home, Some(grant.port))` (the session's
+//!     own proxy listener, never the shared `proxy.port()`, so a command can connect to no other
+//!     session's listener and other sessions' credentials are of no use to it; `None` under bubblewrap) with the
 //!     config's `SandboxCfg`; for a role with `read_only`, `extra_writable` is retained as internal
 //!     replay-untrusted metadata before its grants are emptied, and the
 //!     workspace is added to `protected_paths`; every model profile's `api_key_env` name is added to
@@ -263,7 +267,9 @@
 //! holds [`BUS_CAPACITY`] events.
 //!
 //! ## Network decisions
-//! One `loom_net::Proxy` for the runtime (`config.daemon.proxy_port`). Every decision it reports is
+//! One `loom_net::Proxy` for the runtime: its shared listener on `config.daemon.proxy_port` serves the
+//! in-process reference clients, and each session's grant has a listener of its own, closed when the
+//! grant is revoked. Every decision it reports is
 //! appended to the session's `net.jsonl` and published as [`BusEvent::Net`]. Decisions that name no
 //! session are appended to `logs/net-unattributed.jsonl`.
 //!
@@ -342,7 +348,11 @@
 //! ## Start (`Runtime::start`)
 //! 1. `config.check()`; create the directories; load packs (`Packs::load(paths.packs_dir())`) and
 //!    check every role's tools against `Registry::builtin().names()` plus `rtools::NAMES`; journal
-//!    key; blob store; clients and limiters; proxy.
+//!    key; blob store; clients (`ModelClient::new(name, profile, paths.model_keys_dir())`, so a profile's
+//!    `api_key_file` is read here and a refusal stops the start) and limiters; proxy. The start warnings
+//!    (`tracing::warn!`) include `config.key_env_warnings(paths.model_keys_dir(), …)` judged against the
+//!    daemon's own environment: a key named by `api_key_env` that is in it, where commands can read it,
+//!    and one that is missing.
 //! 2. Read every session's `meta.json` and `status.json` (missing status = default idle status).
 //! 3. Activate as described under *Active sessions*. A session that cannot be opened is skipped
 //!    with `tracing::error!` and a `BusEvent::Error`; a child that cannot be opened while its lead
@@ -475,7 +485,10 @@
 //!   attended one idle; open inbox items are back; an ended child is not activated; a finish
 //!   verifier whose `child_spawned` a crash kept out of the lead's log is still the gate's;
 //! - a read-only role's sandbox configuration protects the workspace; every session's environment
-//!   names the proxy;
+//!   names the proxy, on the session's own port: two sessions' `HTTP_PROXY` ports differ, neither is
+//!   `proxy_port()`, and each session's sandbox description lists its own port and not the other's;
+//!   `start_warnings` holds the `api_key_env` warning when the variable is set and when it is not, and
+//!   none for a profile with `api_key_file`; a profile whose key file is missing stops `Runtime::start`;
 //! - `archive` hides, refuses messages, and survives a restart;
 //! - copies: an agent started with `Workspace::Copy` is told where it works and its command runs
 //!   there, the lead's workspace is unchanged until `agent_adopt` and has the agent's files after it,

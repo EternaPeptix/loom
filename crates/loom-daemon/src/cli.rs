@@ -10,7 +10,10 @@
 //!
 //! ## Commands
 //! - `daemon`: `serve::run`. `up`: `serve::spawn_background`, then print `loom is running on
-//!   {bind}` (or `already running`). `down`: `client.shutdown()`, wait until it stops answering
+//!   {bind}` (or `already running`). When it started the daemon, each line of
+//!   `config.key_env_warnings(paths.model_keys_dir(), …)` judged against `loom up`'s own environment (which
+//!   `daemon_env` passes on) is printed first, on stderr, as `warning: {line}`; a config that cannot be
+//!   loaded prints none (`spawn_background` reports it). `down`: `client.shutdown()`, wait until it stops answering
 //!   (10 s), then until the old process lets go of `<home>/daemon.lock` (2 × `tools.kill_grace_s` + 30 s;
 //!   past that an error names its pid), print `stopped`. When nothing answers, the lock is held and
 //!   `daemon.json` names a live pid (a daemon still shutting down), only the second wait.
@@ -57,11 +60,16 @@
 //!   `render::granted_hosts_line` from the mission's ledger (left out when the ledger cannot be read).
 //! - `out <handle> [--lines <a>:<b>]`: the stored output's lines (all of it, paged 5 000 lines at a
 //!   time, without `--lines`), passed through `render::clean`.
-//! - `config path` prints the config file's path; `config check` loads and checks it (`ok`, or the
-//!   error and exit 1); `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
+//! - `config path` prints the config file's path; `config check` loads and checks it and reads every
+//!   `api_key_file` (`check_model_keys`): `ok`, or the error and exit 1; with `ok`, each line of
+//!   `key_env_warnings` judged against this shell's environment on stderr as `warning: {line}`; `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
 //!   overwrite: `{path} already exists.`).
 //! - `service install|uninstall|status` (macOS; elsewhere `This command is for macOS (launchd).`):
-//!   `install` prepares the home (`serve::prepare_home`), creates `{logs}/loomd.log` (0600) if it is missing,
+//!   `install` first loads the config and refuses (nothing written) a profile that sets `api_key_env`: a
+//!   launchd agent does not have the shell's variables, so its requests would carry no key, and putting
+//!   the key in the plist would write it to disk and the daemon's environment; the sentence names the
+//!   profile and the variable and gives the move of `key_env_warnings`. It also refuses what
+//!   `check_model_keys` refuses. Then it prepares the home (`serve::prepare_home`), creates `{logs}/loomd.log` (0600) if it is missing,
 //!   writes `serve::launch_agent_plist` to `~/Library/LaunchAgents/{SERVICE_LABEL}.plist`
 //!   and runs `launchctl bootstrap gui/{uid} {plist}`; `uninstall` runs `launchctl bootout
 //!   gui/{uid}/{SERVICE_LABEL}` and removes the file; `status` runs `launchctl print` and says
@@ -87,7 +95,9 @@
 //! client's tests): every command parses with its options and rejects a missing argument; `run`
 //! and `send` message joining and `-`; `--lines` parsing (`10:20`, `10:`, `:20`, bad forms);
 //! `follow_exit_code` for every turn end; `DEFAULT_CONFIG` parses with `Config::parse` and passes
-//! `check()`; `open_url`; `open` hands the address to the browser and writes it only with `--print`.
+//! `check()`; `open_url`; `open` hands the address to the browser and writes it only with `--print`;
+//! the service-install key check refuses a profile with `api_key_env` (naming it and the variable) and a
+//! missing key file, and passes a config whose profiles use `api_key_file` or no key.
 
 use crate::client::{self, Client};
 use crate::render::{self, RecordOpts, Style};

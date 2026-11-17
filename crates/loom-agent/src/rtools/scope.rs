@@ -11,7 +11,8 @@
 //!   continue.`
 //! - `why` must contain non-whitespace (else an error saying so); `hosts` must pass
 //!   `loom_net::policy::check_hosts` (at least one, none blank, one host per entry, each a valid host
-//!   pattern); a failure is returned as the error, and nothing is opened.
+//!   pattern, no `*`, no wildcard over a top-level domain such as `*.com`, no unspecified address such as
+//!   `0.0.0.0`); a failure is returned as the error, and nothing is opened.
 //! - emits one `InboxOpened(InboxItem { kind: Question, text: texts::scope_request(hosts, why),
 //!   blocking: false, options: hosts, call_id: Some(ctx.call_id), reference: None })`. The surfaces read
 //!   the hosts from `options` and show an approve action. The text names the
@@ -21,7 +22,8 @@
 //!   authorization appears in the harness-state.
 //!
 //! Tests required: one non-blocking inbox item naming hosts and reason, no effect, no ledger entry;
-//! invalid, empty and blank hosts and a blank reason refused with nothing opened; refused in a child.
+//! invalid, empty and blank hosts, `*`, `*.com`, `0.0.0.0:8080` and a blank reason refused with nothing
+//! opened; refused in a child.
 
 use super::Shared;
 use crate::texts;
