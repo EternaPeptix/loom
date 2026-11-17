@@ -2198,6 +2198,12 @@ impl Inner {
                 pack.command_guard,
                 pack.target_concurrency,
             )),
+            // The session sets it again for every call from its admission of that moment.
+            view_chars: self
+                .config
+                .admit
+                .for_window(meta.context_window)
+                .view_chars(&loom_core::estimate::TokenEstimator::default()),
         };
         // The mission journal is shared by the lead and all its children; a child is always bound to
         // it, so that it has explicit access to the mission state.

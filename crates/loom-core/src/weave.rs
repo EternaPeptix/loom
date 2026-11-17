@@ -67,15 +67,23 @@
 //! region starts at the first response or at the last `keep_recent_steps` records that render other
 //! than tool results, whichever is later (at the latter alone when there is no response; records
 //! that render nothing are not counted). [`Woven`] plans on a weave
-//! already rendered, so that a step renders its records once. Order of sacrifice, each class oldest
-//! first unless stated:
+//! already rendered, so that a step renders its records once. `keep_recent_steps = 0` protects nothing:
+//! `upto_seq` is the seq of the last record. Order of sacrifice, each class oldest first unless stated,
+//! every class limited to live items at or before `upto_seq`:
 //!   1. `DropReasoning` on model responses;
-//!   2. stub `ToolClass::Nav` results;
-//!   3. stub `ToolClass::Read` results, largest first;
-//!   4. stub every other unpinned tool result and agent report, largest first;
-//!   5. only when `allow_text_eviction`: `Drop` assistant text.
-//!      Results already stubbed are skipped. Returns `None` when nothing can be evicted. Stub text comes
-//!      from [`stub_text`].
+//!   2. `Drop` harness notes of kind `nudge`, `stall`, `verdict`, `output_cut`, `budget` and
+//!      `interrupted` (what the harness said about a step long past);
+//!   3. stub `ToolClass::Nav` results;
+//!   4. stub `ToolClass::Read` results, largest first;
+//!   5. stub every other unpinned tool result and agent report, largest first;
+//!   6. `Drop` every other harness note that is not protected (`arrival`, `info`, including the
+//!      messages of other agents): its words stay in the log, where `log_search` finds them;
+//!   7. only when `allow_text_eviction`: `Drop` assistant text.
+//!      Results already stubbed are skipped. Protected notes (`constraint`, `approval`, `assignment`)
+//!      are never candidates. The estimate of a dropped note subtracts its characters and the blank
+//!      line that joined it to its message, or the whole message (with its overhead) when the note was
+//!      the only item in it. Returns `None` when nothing can be evicted. Stub text comes from
+//!      [`stub_text`].
 //!
 //! `plan_fresh_start` chooses the evictions of a fresh start: the fold made when a result was not
 //! accepted, so that the session goes on from the mission state and not from its own account of the
@@ -101,7 +109,10 @@
 //! other records); the fresh-start plan (each class of eviction, pins and other notes kept, the cut,
 //! the estimate, nothing to evict); `request_messages` HUD placement;
 //! a payload of each kind carrying harness tags stays inside its one block, a fork's contract renders
-//! as written, and records without such text render the bytes they always did.
+//! as written, and records without such text render the bytes they always did; the two note classes
+//! (their order against results, protected notes and the recent region never touched, the estimate
+//! matching the weave rendered with the plan); `keep_recent_steps = 0` lets the plan stub the latest
+//! step's results; the stub of a view names the viewed output's handle.
 
 use crate::estimate::TokenEstimator;
 use crate::event::{
@@ -912,8 +923,11 @@ fn plan_on(
 /// For `ToolClass::Exec`, the last `stub_tail_lines` lines of `result.text` follow under the line
 /// `[last {n} lines as first shown]`. The final line is:
 /// `[evicted from view, not from the record: {lines} lines / {bytes} bytes. Full output: {handle} — read it again with out_read or out_grep before relying on it.]`
-/// (`{lines}`/`{bytes}`/`{handle}` from `result.output`; when there is no stored output the final line
-/// is `[evicted from view, not from the record. Run it again if the result matters.]`).
+/// (`{lines}`/`{bytes}`/`{handle}` from `result.output`). A view (no stored output of its own, and
+/// `meta[META_OF_BLOB]` a non-empty string) ends with `[evicted from view, not from the record. It
+/// showed lines of out:{the first 16 characters of that id} — read them again with out_read or out_grep
+/// before relying on it.]`, so its stub keeps the handle. With neither, the final line is `[evicted
+/// from view, not from the record. Run it again if the result matters.]`.
 pub fn stub_text(call: Option<&ToolCall>, result: &ToolResult, stub_tail_lines: u32) -> String {
     let mut out = String::new();
     let first = result.text.lines().next().unwrap_or("");

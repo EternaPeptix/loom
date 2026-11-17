@@ -13,12 +13,24 @@
 //!   (`ansi_removed` = number of sequences);
 //! - within a line, text before the last `\r` that is not at the end of the line is removed, and a
 //!   trailing `\r` is removed (`cr_collapsed` = number of lines changed by the first rule);
-//! - remaining C0 control characters other than `\t` and `\n`, and DEL, are written as `\xNN`
-//!   (`controls_escaped`).
-//! - `binary` is true when the input contains a NUL byte or more than 30% of the first 8 KiB is
-//!   neither printable ASCII, whitespace, nor part of valid UTF-8. For binary input `text` is a
-//!   one-line description: `binary data, {n} bytes, starts with {first 32 bytes as hex}`.
+//! - remaining C0 control characters other than `\t` and `\n` (NUL included), and DEL, are written as
+//!   `\xNN` (`controls_escaped`).
+//! - `binary` is true when NUL bytes are more than 1% of the input (`nuls * 100 > len`), or more than
+//!   30% of the first 8 KiB is neither printable ASCII, whitespace, nor part of valid UTF-8 (a NUL
+//!   counts against it like any other control character). A text output with a stray NUL is text: the
+//!   NUL is escaped as `\x00` and every other line stays readable and quotable. For binary input
+//!   `text` is a one-line description: `binary data, {n} bytes, starts with {first 32 bytes as hex}`.
 //!   `changed` is true when `text` differs from the input bytes.
+//!
+//! ## The policy for a session
+//! `AdmitPolicy::for_window(window)`: a copy whose `max_inline_tokens` is the smaller of the
+//! configured value and `window / 8` when `window` is `Some(w)` with `w > 0`; `None` or `Some(0)`
+//! returns the policy unchanged. Every other field is copied. The session computes it from its
+//! current window each time it admits, so a session moved to a model with another window uses the new
+//! bound from its next call: one output never takes more than an eighth of the window (DESIGN §2,
+//! principle 3; §6).
+//! `AdmitPolicy::view_chars(estimator)` = `estimator.chars(max_inline_tokens)`: the most characters
+//! the text of a view (`read`, `out_read`, `out_grep`, other numbered views) may hold.
 //!
 //! ## The envelope
 //! `admit` returns `{header}\n{body}\n{footer}`:
@@ -62,7 +74,10 @@
 //! `policy.salient_patterns` are regexes matched case-insensitively against single lines. An invalid
 //! pattern is skipped (never an error). The defaults are in `AdmitPolicy::default`.
 //!
-//! Tests required: normalize (each rule, line-count preservation on random-ish inputs, binary); whole
+//! Tests required: normalize (each rule, line-count preservation on random-ish inputs, binary; one NUL
+//! in a text output is escaped and the output stays text; NULs above 1% make it binary); `for_window`
+//! (smaller window lowers the bound, larger or unknown keeps the configured one, other fields kept);
+//! `view_chars` follows the estimator; whole
 //! admission is byte-identical to the stored text; envelope shape incl. empty output; cut boundaries
 //! (exact line numbers in marker and `shown`); tiny head/tail when lines are huge; long-line cut;
 //! scan lines present, capped, evenly spread, and included in `shown`; invalid pattern ignored;
@@ -103,6 +118,22 @@ impl Default for AdmitPolicy {
                 r"\bexit(ed)? (code|status) [1-9]".to_string(),
             ],
         }
+    }
+}
+
+impl AdmitPolicy {
+    /// This policy for a session whose window is `window` (see the module contract).
+    pub fn for_window(&self, window: Option<u64>) -> AdmitPolicy {
+        let mut p = self.clone();
+        if let Some(w) = window.filter(|w| *w > 0) {
+            p.max_inline_tokens = p.max_inline_tokens.min(w / 8);
+        }
+        p
+    }
+
+    /// The most characters the text of a view may hold under this policy.
+    pub fn view_chars(&self, estimator: &TokenEstimator) -> usize {
+        estimator.chars(self.max_inline_tokens)
     }
 }
 

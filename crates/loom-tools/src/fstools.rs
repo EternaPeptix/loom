@@ -38,17 +38,21 @@
 //! A directory → error sentence suggesting `glob`. A missing file → error sentence; when files with
 //! a similar name exist in the same directory (edit distance ≤ 2, or same name ignoring case), name
 //! up to 3 of them. Otherwise: read the bytes, record them as seen, `view::store_text`, then exactly
-//! as `out_read` (window with `cfg.read_max_lines`, numbered lines, `max_line_chars` 20_000) and
-//! return `Body::View` of the stored text. Facts: the path as given, `view::range_fact`, the handle of
-//! the stored text (`out:…`, whose line numbers are the ones shown; `evidence` quotes it), the
-//! normalisation notes when there are any. Binary content: the body is the one-line description from
+//! as `out_read` (window with `cfg.read_max_lines`, numbered lines, `max_line_chars` 20_000,
+//! `max_chars` = `ctx.view_chars`) and return `Body::View` of the stored text. Facts: the path as
+//! given, `view::range_fact(first, numbered.last, total)`, `view::ended_fact(numbered.last)` when the
+//! size bound ended the window early, the handle of the stored text (`out:…`, whose line numbers are
+//! the ones shown; `evidence` quotes it), the normalisation notes when there are any. Binary content: the body is the one-line description from
 //! `normalize`. An empty file: body `(empty file)`.
 //!
 //! A file above `READ_CAP`: without `start`/`end` → error sentence stating its size, saying to pass a
 //! range or to search it with `bash` (`grep` skips files of that size). With a range the file is
 //! streamed and only the lines of the window are kept: at most 80_000 bytes of each line, and at most
-//! `WINDOW_BYTES` (4 MiB) in all — a window that reaches that size ends after the line that reached it
-//! and the range fact says so and where to continue. The window has no handle (its stored lines are
+//! the smaller of `WINDOW_BYTES` (4 MiB) and `ctx.view_chars` bytes in all — a window that reaches that
+//! size ends before the line that would pass it (the first line is always kept) and the range fact
+//! says so and where to continue. Each line is shown at most `min(20_000, ctx.view_chars)` characters,
+//! so the numbered text exceeds `ctx.view_chars` by no more than its line numbers, which `finalize`
+//! bounds (a window this tool shapes itself should not reach that backstop in practice). The window has no handle (its stored lines are
 //! numbered from 1, the text shows the file's own numbers): a fact says to quote it from `bash`. The kept lines are normalised and stored like a
 //! whole read and returned as `Body::View` of that stored window: the text numbers the lines as in
 //! the file, `shown` counts them in the stored window. The file is then recorded as seen by size and

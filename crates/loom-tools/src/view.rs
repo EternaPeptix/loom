@@ -10,12 +10,23 @@
 //!   that states how many lines there are. `end < start` is an error sentence. Total 0 → `None`.
 //! - [`numbered`]: the lines `first..=last` rendered as `{n}\t{line}` joined by `\n`, where a line
 //!   longer than `max_line_chars` characters is shown as its first `max_line_chars` characters
-//!   followed by `…[+{k} chars]`. Returns the text and how many lines were shortened.
+//!   followed by `…[+{k} chars]`, and no more lines than fit in `max_chars` characters: lines are
+//!   added in order while the text, joining `\n`s included, stays within `max_chars`; the line that
+//!   would pass it and every later one are left out, so the text always ends at a whole line. The first
+//!   line is always included: when it alone would pass `max_chars`, it is shortened (as a long line is)
+//!   to the most characters that keep `{n}\t{head}…[+{k} chars]` within `max_chars`, and never below
+//!   one character of the line. Returns a [`Numbered`]: the text, how many lines were shortened, and
+//!   `last`, the number of the last line included (`last` as asked when everything fit).
+//! - [`ended_fact`]`(last)`: `window ended at line {last} to stay within the size one result may
+//!   show; continue with start {last+1}` — the fact a caller adds when `Numbered::last` is below the
+//!   last line it asked for, with `range_fact(first, Numbered::last, total)` as its range.
 //! - [`range_fact`]: `lines {first}-{last} of {total}` (or `line {n} of {total}`), followed by
 //!   ` — {total-last} more below` when `last < total` and ` — {first-1} above` when `first > 1`.
 //!
 //! Tests required: defaults, clamping, the two errors, empty output, long-line shortening on
-//! multi-byte text, the fact strings.
+//! multi-byte text, the fact strings; `max_chars` stops at a whole line and reports the last line
+//! included, the text length never passes `max_chars` (multi-byte text), a first line longer than
+//! `max_chars` is shortened to fit, and paging with `start = last + 1` covers every line once.
 
 use loom_core::admit::{normalize, Normalized};
 use loom_core::{BlobId, BlobRef, BlobStore};

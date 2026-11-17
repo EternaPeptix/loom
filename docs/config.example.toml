@@ -42,7 +42,7 @@ stub_tail_lines = 12       # trailing lines of a folded command result kept in i
 
 [admit]
 # How much of a tool output the model sees inline. The whole output is always stored and can be paged.
-max_inline_tokens = 60000  # outputs up to about this size are shown whole
+max_inline_tokens = 60000  # outputs up to about this size are shown whole (at most an eighth of the session's window)
 head_lines = 400           # a larger output shows this many lines from the start ...
 tail_lines = 400           # ... and this many from the end
 max_line_chars = 4000      # longest line shown inside a cut output

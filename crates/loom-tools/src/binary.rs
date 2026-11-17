@@ -11,7 +11,8 @@
 //! staging outside actor write grants. Unconfined mode is explicitly labelled and never cached.
 //! Every readable process observation, including failure/cancellation/timeout/limit prefixes, is Raw
 //! output with completion/termination metadata. Read failures retain the protected output file.
-//! ProducedView stores and indexes full normalized decompiler output while showing at most 120 lines.
+//! ProducedView stores and indexes full normalized decompiler output while showing at most 120 lines,
+//! and no more of them than fit in `ctx.view_chars` (`view::numbered`); the fact names the lines displayed.
 
 use crate::{
     params::{opt, req, spec},

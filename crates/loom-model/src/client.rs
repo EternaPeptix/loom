@@ -45,11 +45,17 @@
 //!     clone of the client) moves on to it.
 //!
 //!   In every other case the 404 is **rejected** as below;
-//! - **context overflow** (no retry): HTTP 400 or 413 whose message matches the server's wording for
-//!   an over-long prompt — any of `maximum context length`, `context length`, `too many tokens`,
-//!   `prompt is too long`, `max_model_len`, case-insensitive → `ModelError::ContextOverflow`, with
-//!   `limit`/`requested` parsed from the first two integers ≥ 1000 in the message when present, in
-//!   that order, except that the wording `A > B` ("70000 > 65536") names the request first;
+//! - **context overflow** (no retry): HTTP 400, 413 or 422 whose message matches the server's wording
+//!   for an over-long prompt — any of `maximum context length`, `context length`, `too many tokens`,
+//!   `prompt is too long`, `max_model_len`, `exceeds the available context size` (llama.cpp),
+//!   `input is too long`, case-insensitive — or whose JSON error object has a `type` or `code` (string)
+//!   of `exceed_context_size_error` (llama.cpp) or `context_length_exceeded` → `ModelError::ContextOverflow`.
+//!   `limit`/`requested`: the error object's `n_ctx` / `n_prompt_tokens` when they are positive
+//!   integers; otherwise from the first two integers ≥ 1000 in the message, `limit` the smaller and
+//!   `requested` the larger (servers name them in either order: llama.cpp states the request first);
+//!   with one such integer it is `limit`, with none both are `None`. The same applies to an error
+//!   object inside a 200 stream (`AssembleError::Server`) whose message matches those phrases: it is
+//!   an overflow (no retry), not a server error to retry;
 //! - **rejected** (no retry): any other 4xx → `ModelError::Rejected { status, message }`. `message`
 //!   is the server's `error.message` (or `message`, or `detail`) when the body is JSON, else the
 //!   first 2000 characters of the body.
@@ -84,7 +90,10 @@
 //! the failed attempt precede a second `AttemptStart`); connection dropped mid-stream is retried and
 //! the partial text does not leak into the result; stall detection (short `stall_timeout_s`);
 //! `Retry-After` honoured; retry window exhausted → `Unavailable`; 400 → `Rejected` with the
-//! server's message; overflow wording → `ContextOverflow` with parsed numbers; cancellation during
+//! server's message; overflow wording → `ContextOverflow` with parsed numbers (each phrase; llama.cpp's
+//! 400 body with `n_ctx`/`n_prompt_tokens`, and the same message without them, both giving limit =
+//! the smaller; the type code alone; a 422; an overflow error inside a 200 stream, sent once); a 422
+//! without overflow wording stays `Rejected`; cancellation during
 //! a stream and during a retry sleep; server unreachable then started later is picked up; bearer
 //! header sent only when configured; `discover` for each source; `timing` is plausible.
 

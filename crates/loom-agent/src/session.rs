@@ -244,6 +244,17 @@
 //!    - `Err(ContextOverflow{limit, ..})`: once per step, run the re-weave procedure forced with reason
 //!      `overflow` and that `limit`; if it appended a `reweave`, go back to the start of this point (new weave, new
 //!      `model_request`). Otherwise *fail* with `texts::OVERFLOW_UNFOLDABLE`.
+//!    - `Err(Rejected{status, message})` with `status` 400, 413 or 422 (a *refusal*: what a provider
+//!      answers when it refuses what the request carries, such as a content filter refusing a page or a
+//!      payload in the window): when the session's previous step request also ended in a refusal and
+//!      no re-weave has been appended since (its epoch is the current one: the refused prefix is still
+//!      the start of this request), and this step has not re-woven for a refusal yet, run the re-weave
+//!      procedure forced with reason `refused`; if it appended a `reweave`, go back to the start of this
+//!      point. Otherwise remember this epoch as refused and *fail* with the refusal texts:
+//!      `texts::refused(status, message, folded)` as the why (`folded` = the latest `reweave` record's
+//!      reason is `refused`: the window was already folded for a refusal), and for a lead the inbox text `texts::refused_park(status, message, folded)` in place
+//!      of `texts::turn_failed(why)`. The epoch of the last refusal is kept in memory only: after a
+//!      restart the first refusal parks again before the next one re-weaves.
 //!    - any other error: *fail* with `texts::sentence(&error.to_string())`.
 //!    - `Ok(c)`: calibrate the estimator with the characters sent (every message's `chars()`
 //!      including the HUD message, plus the length of each tool spec's `to_openai()` JSON) against
@@ -289,8 +300,11 @@
 //!   carries its parent's tool list): `refused(…, texts::not_in_assignment(name, role name,
 //!   registry names), …)`;
 //! - else `loom_tools::execute(registry, ctx, name, arguments, admission)` with a `ToolCtx` cloned
-//!   from `deps.ctx` with this call's id and the turn's token, and `Admission{policy: &deps.admit,
-//!   estimator}`.
+//!   from `deps.ctx` with this call's id, the turn's token and `view_chars` =
+//!   `policy.view_chars(estimator)`, and `Admission{policy: &policy, estimator}`, where `policy` =
+//!   `deps.admit.for_window(deps.context_window)` computed for this call (so a change of the session's
+//!   window applies from the next call). Early starts take `view_chars` the same way when they start,
+//!   and are admitted with the policy of the moment they are claimed.
 //!
 //! Append the `tool_result`, then every record the call queued (`shared.take_emitted()`), then take
 //! the effect (`shared.take_effect()`). After the last call, a fresh start that a call asked for
@@ -354,7 +368,7 @@
 //! `detail` is the first line of the report cut to 200 characters. For settlements this file makes
 //! itself, `full` is `None` and `payload` is `Value::Null`.
 //!
-//! ## Re-weave procedure (`reason`: `target`, `overflow`, `operator`)
+//! ## Re-weave procedure (`reason`: `target`, `overflow`, `refused`, `operator`)
 //! `est = estimator.tokens_for_messages(&w.messages)` plus the tokens of the tool specs' JSON.
 //! `size` is the size of the next request as the server counts it, when it has counted one in this
 //! epoch: with `m` the latest own-or-inherited step `model_request` of epoch `w.epoch` whose
@@ -380,15 +394,19 @@
 //! `limit`, × `est / size`.
 //! 1. `plan = w.plan(records, estimator, &policy, false)` (`plan_reweave` on the step's weave) with
 //!    `policy = deps.context`. While
-//!    the plan is not enough and `policy.keep_recent_steps` is above `MIN_KEEP_RECENT_STEPS`, halve
+//!    the plan is not enough and `policy.keep_recent_steps` is above the minimum, halve
 //!    `keep_recent_steps` (not below the minimum) and plan again: when folding what lies outside the
 //!    protected recent steps does not make room, it is the output of recent steps that fills the
-//!    window, so fewer of them are protected.
+//!    window, so fewer of them are protected. The minimum is `MIN_KEEP_RECENT_STEPS` (2), and 0 for an
+//!    `overflow` (one output of the latest step can be the whole problem: kept in view, it would make
+//!    every request overflow again). For `refused`, and for an `operator` re-weave while the current
+//!    epoch is the one the last refusal recorded, `keep_recent_steps` is 0 from the start (what the
+//!    server refuses may be the newest output). A result folded this way keeps its handle in its stub.
 //! 2. Still not enough: `text_plan = w.plan(records, estimator, &policy, true)`. Not forced
 //!    and `text_plan` is not enough either: return without a record and without a digest request (see
 //!    "Why a re-weave must be worth it"). Otherwise, when `text_plan` exists and the re-weave is not
-//!    for an `overflow` (the server has just refused this prefix, and would refuse a digest request
-//!    on it as well), ask for a digest — a
+//!    for an `overflow` or a `refused` (the server has just refused this prefix, and would refuse a
+//!    digest request on it as well), ask for a digest — a
 //!    request of the current stable messages plus one `user` message `texts::DIGEST_PROMPT`, same
 //!    tools, `max_tokens: DIGEST_MAX_TOKENS`, recorded as `model_request{purpose: Digest, hud: None}`
 //!    only (its reply is not appended as a record), and sent once the limiter grants it at
@@ -473,7 +491,16 @@
 //!   request no longer carries the stubbed output, and no `cache_break` is recorded for it; the
 //!   digest path (plan insufficient → digest request → text eviction) and its failure path;
 //!   `ContextOverflow` from the server triggers a forced re-weave and a retry; unfoldable overflow
-//!   fails the turn with an inbox item;
+//!   fails the turn with an inbox item; an overflow caused by one huge result of the latest step
+//!   (above what two protected steps allow) is folded (keep 0) and the retry goes out with its stub;
+//! - a refusal: a 400 parks a lead with `refused_park(.., false)`; an answer that meets the same 400
+//!   re-weaves with reason `refused` (the latest result is stubbed, with its handle) and the retry gets
+//!   200; a 400 after that re-weave parks with `refused_park(.., true)`; a refusal after a re-weave in
+//!   between parks again first; a 401 or 404 never re-weaves; a child settles `Failed` with
+//!   `refused(..)`; an `operator` re-weave after a refusal folds the latest step's results;
+//! - window-scaled admission: with a small `context_window` a large `bash` output is cut at
+//!   `window / 8` and a `read` of a large file ends at a whole line within `view_chars` and says where to
+//!   continue;
 //! - a fresh start: after a `finish` its verifier did not accept, one `reweave` with the fresh-start
 //!   reason follows the call's records, the next request carries the brief with the objection and
 //!   nothing of the attempt (no `finish` or `conclude` call, none of the reply texts, the reasoning or

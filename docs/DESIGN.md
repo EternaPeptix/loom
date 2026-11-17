@@ -73,9 +73,9 @@ That inverts the usual cloud trade-offs:
     reading, and refuses evidence whose quote is not in the stored text.
 12. **Tool calls are replayed exactly.** Every complete call the model made is replayed with its
     arguments byte for byte, paired with exactly one result, in call order, for the life of the
-    session. When the window must shrink, replayed reasoning goes first, navigation output second,
-    file reads third, every other output after them, and what is evicted leaves a stub that names the
-    call, its outcome and the handle. A call without a recorded result is rendered as such; a call
+    session. When the window must shrink, replayed reasoning goes first, then the harness's old nudges
+    and notices, navigation output, file reads, every other output, and the remaining harness notes,
+    and what is evicted leaves a stub that names the call, its outcome and the handle. A call without a recorded result is rendered as such; a call
     that was cut off by an output limit, or whose arguments are not a JSON object, is never run or
     replayed, and the model is told so.
 
@@ -241,14 +241,20 @@ fresh start plans one (below). Evictions that name a protected item are ignored.
 soon as it is:
 
 1. replayed reasoning of model responses (the calls and their results stay);
-2. navigation output (`ToolClass::Nav`: listings, searches), oldest first;
-3. file reads and other lookups (`ToolClass::Read`), largest first;
-4. every other unpinned tool output and agent report, largest first;
-5. assistant text, only in the second plan the session makes when the first cannot free enough
+2. harness notes of kind `nudge`, `stall`, `verdict`, `output_cut`, `budget` and `interrupted`, oldest
+   first (what the harness said about a step long past);
+3. navigation output (`ToolClass::Nav`: listings, searches), oldest first;
+4. file reads and other lookups (`ToolClass::Read`), largest first;
+5. every other unpinned tool output and agent report, largest first;
+6. every other harness note that is not protected (`arrival`, `info`, the messages of other agents),
+   oldest first — its words stay in the log, where `log_search` finds them;
+7. assistant text, only in the second plan the session makes when the first cannot free enough
    (see below);
-6. never: the system message, user messages, the `forked` record, harness notes of kind
+8. never: the system message, user messages, the `forked` record, harness notes of kind
    `constraint`, `approval` and `assignment`, pinned output, and the protected recent region — the
    last `keep_recent_steps` model responses (rendered or not) and everything after the first of them.
+   Without the note classes, arrival notes, nudges and verdicts piled up for the life of a long
+   mission and no re-weave could take them out.
 
 **Fresh start** (`plan_fresh_start`). The fold made when a verifier did not accept a lead's finish (§8)
 is another plan: it is not driven by size and protects no recent region (`upto_seq` is the last record,
@@ -261,8 +267,10 @@ about the attempt). User messages, constraints, approvals, the assignment and pi
 A stub is the evicted result's first line (its envelope header: call, outcome, size, handle); for an
 execution, the last `stub_tail_lines` (12) lines follow under `[last N lines as first shown]`; then
 `[evicted from view, not from the record: {lines} lines / {bytes} bytes. Full output: out:… — read it
-again with out_read or out_grep before relying on it.]`, or, when nothing was stored, `[evicted from
-view, not from the record. Run it again if the result matters.]`. Tool call/result pairs always stay
+again with out_read or out_grep before relying on it.]`; for a view (`read`, `out_read`, `out_grep`),
+which stores nothing of its own, `[evicted from view, not from the record. It showed lines of out:… —
+read them again with out_read or out_grep before relying on it.]`; and when there is neither, `[evicted
+from view, not from the record. Run it again if the result matters.]`. Tool call/result pairs always stay
 paired (a stub is still a `tool` message).
 
 **When and how much.** `target_tokens`, `floor_tokens` and `keep_recent_steps` (defaults 400 000,
@@ -282,15 +290,19 @@ the known one and the limit stated in the error.
 A re-weave that nobody asked for (`target`) happens only when it is worth it: every re-weave starts a
 new epoch and loses the server's cache, so one that frees little would be needed again a step later.
 The plan must bring the size to the midpoint between floor and limit; if it cannot, the session halves
-`keep_recent_steps` (down to 2) and plans again, then plans once more allowing assistant text to go.
+`keep_recent_steps` (down to 2, and down to 0 for an `overflow`, since one output of the latest step can
+be what overflows) and plans again, then plans once more allowing assistant text to go.
 When even that is not enough, nothing is recorded and the context grows until the window forces an
-`overflow` re-weave. Forced re-weaves (`overflow`, and `operator` from `POST …/reweave` or
-`loom reweave`) take what the plan can free. Re-weaves happen only between steps (or while idle, on
+`overflow` re-weave. Forced re-weaves (`overflow`, `refused`, and `operator` from `POST …/reweave` or
+`loom reweave`) take what the plan can free. A `refused` re-weave (§10: a provider refusing what the
+request carries, refused twice on the same prefix) protects no recent step, and neither does an
+`operator` one made while the current prefix is the one refused: what the server refuses may be the
+newest output, and its stub keeps the handle. Re-weaves happen only between steps (or while idle, on
 operator request), never while a tool call is outstanding. The model can `pin` a result it wants
 kept.
 
 **Digest (cache-friendly).** Before a re-weave that evicts assistant text, unless it is for an
-overflow (the server has just refused that prefix), the session sends the *existing* stable prefix
+overflow or a refusal (the server has just refused that prefix), the session sends the *existing* stable prefix
 plus one appended instruction asking for a digest. That request is a full cache hit; it is recorded as
 a `model_request` with purpose `digest` (its reply is not a record), capped at 8 000 tokens, and waits
 for a request slot at the session's own priority. A non-empty reply is stored in the `reweave` record
@@ -343,19 +355,27 @@ in the blob store first. `admit` then builds what the model sees — always an e
   is a cut, the normalisation notes when any (`3 terminal escape sequences removed`, …) and the handle:
   `out:` and the first 16 hex characters of the blob id (any unambiguous prefix of 8 or more is
   accepted back);
-- at or below `max_inline_tokens` (default 60 000 estimated tokens) the body is the stored text,
-  unmodified;
+- at or below `max_inline_tokens` (default 60 000 estimated tokens, and never more than an eighth of
+  the session's window: `min(max_inline_tokens, window / 8)`, computed from the session's window at
+  each call, so a 128k model admits 16 000) the body is the stored text, unmodified;
 - above, the body is the first `head_lines` and last `tail_lines` (defaults 400 / 400; halved until
   they fit when they would cover everything) around a marker that names the omitted line range, its
   size, that nothing was discarded and how to read it, followed by a *pattern scan* of the omitted
   region (lines matching error-like patterns, with their line numbers, at most `salient_max` (40)
   spread evenly, labelled as a text match, not a reading). In a cut body, lines longer than
   `max_line_chars` (4 000) are cut with an inline `…[+N chars]` marker. Binary output is described
-  (`binary data, N bytes, starts with …`), not inlined; empty output is `(no output)`.
+  (`binary data, N bytes, starts with …`), not inlined; output is binary when NUL bytes are more than
+  1% of it or most of its first 8 KiB is not text — a stray NUL in a text output is escaped as `\x00`
+  and the output stays text. Empty output is `(no output)`.
 - results that store nothing of their own (views such as `read`, `out_read`, `out_grep`, and plain
   messages) carry the same header and footer around their text, without the admission's line count
   and handle (their facts state the range shown; a `read` names the handle of the file text it
-  stored).
+  stored). They obey the same bound: a view holds at most `max_inline_tokens` worth of characters
+  (`AdmitPolicy::view_chars`), ending at a whole line with `window ended at line N …; continue with
+  start N+1`, and `out_grep` stops adding match groups at the bound and says how many it left out. A
+  view or message that still exceeds it is cut by the harness at a line boundary, with the handle
+  (`loom-tools::finalize`). An oversized result in the recent region could not be folded and made
+  every later request overflow.
 
 The outcome is stated first and last, so it is adjacent to wherever the model is reading. The lines
 shown are recorded on the `tool_result` (`meta.shown`); views record which blob they showed
@@ -906,10 +926,22 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   has (the server was relaunched with another model), the 404 is refused with a sentence naming the
   model now served — loom never follows a new model by itself, because what a session recorded at its
   start describes the old one.
-- **Context overflow.** A 400 or 413 whose message reads like an over-long prompt (`maximum context
-  length`, `context length`, `too many tokens`, `prompt is too long`, `max_model_len`) is reported with
-  the limit and request size parsed from it; the session then re-weaves (`overflow`) and sends again,
-  once per step, and fails the step when nothing can be folded.
+- **Context overflow.** A 400, 413 or 422 whose message reads like an over-long prompt (`maximum context
+  length`, `context length`, `too many tokens`, `prompt is too long`, `max_model_len`, llama.cpp's
+  `exceeds the available context size`, `input is too long`) or whose error type or code is
+  `exceed_context_size_error` or `context_length_exceeded`, and an error object with such a message
+  inside a 200 stream, is reported with the limit and request size: the error's `n_ctx` and
+  `n_prompt_tokens` when present, else the smaller and the larger of the numbers in the message
+  (servers name them in either order). The session then re-weaves (`overflow`, protecting no recent
+  step when it must) and sends again, once per step, and fails the step when nothing can be folded.
+- **Refusals** (400, 413 or 422 that is not an overflow): a provider refusing what the request carries,
+  a content filter refusing a scraped page or a payload, for instance, refuses the same window every
+  time. The first refusal fails the step (§8) with an item that says so; when the next request on the
+  same prefix (an answer, a resume) is refused again, the session re-weaves (`refused`: every tool
+  output out of view, each stub keeping its handle) and sends once more before parking again, now
+  saying that what is refused is still in view or is the request itself, and that the session must
+  move to another model or change its settings. One mission was parked 17 times, about 27 hours of
+  waiting, by such a loop before this rule.
 - **Other 4xx** are refused with the server's message; the step fails (§8).
 - **Discovery and the window.** The first session created for a profile asks `GET {base_url}/models`
   (the first success is remembered for the process). The window is the first positive integer of

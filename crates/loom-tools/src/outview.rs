@@ -7,20 +7,29 @@
 //! `Body::View` so the record states exactly which stored lines the text contains.
 //!
 //! `out_read`: `view::window(start, end, total, cfg.read_max_lines)`, then `view::numbered` with
-//! `max_line_chars` 20_000. Outcome `ok`; facts: `view::range_fact`, and `{k} long lines shortened`
-//! when any were. An empty output has the body `(no output)`.
+//! `max_line_chars` 20_000 and `max_chars` = `ctx.view_chars`. Outcome `ok`; facts:
+//! `view::range_fact(first, numbered.last, total)`, then `view::ended_fact(numbered.last)` when the
+//! size bound stopped the window before the line asked for, and `{k} long lines shortened` when any
+//! were. `shown` is `[(first, numbered.last)]`. An empty output has the body `(no output)`.
 //!
 //! `out_grep`: `BlobStore::grep` with `context` (default 2, at most 50) and at most
 //! `cfg.search_max_results` matches; an invalid pattern is an error sentence carrying the regex
-//! error. Body: each match excerpt as returned by the store (lines numbered), groups separated by a
-//! line `--`. Facts: `{shown} of {total} matching lines` and, when more matched than shown, `narrow
-//! the pattern or read ranges with out_read`. No match → outcome `no match`, body `(no line
-//! matches)`, and `shown` empty. `shown` covers every line present in the body (matches and
-//! context). `ignore_case` prefixes the pattern with `(?i)`.
+//! error. Body: each match excerpt as returned by the store (lines numbered, long lines shortened),
+//! groups separated by a line `--`. Groups are added in order while the body, separators included,
+//! stays within `ctx.view_chars` characters; the first group is always added (`finalize` bounds a
+//! first group that alone passes it). Facts: `{shown} of {total} matching lines` (`shown` = the
+//! groups in the body), then, when groups were left out for size, `{k} more matches not shown to stay
+//! within the size one result may show: narrow the pattern, lower context, or read ranges with
+//! out_read`, else, when more matched than the store returned, `narrow the pattern or read ranges with
+//! out_read`. No match → outcome `no match`, body `(no line matches)`, and `shown` empty. `shown`
+//! covers every line present in the body (matches and context) and nothing of the groups left out.
+//! `ignore_case` prefixes the pattern with `(?i)`.
 //!
 //! Tests required: paging through an output larger than one page covers every line exactly once;
 //! clamping and both `window` errors; unknown handle; grep with context, cap, no match, invalid
-//! pattern; `shown` ranges are exact.
+//! pattern; `shown` ranges are exact; with a small `view_chars`, out_read ends at a whole line and
+//! says where to continue (paging with that start covers every line once), and out_grep stops adding
+//! groups, says how many it left out, and its `shown` names only the groups in the body.
 
 use crate::{params, view, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;

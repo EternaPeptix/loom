@@ -9,6 +9,21 @@
 //! 3. raw output is normalised without changing its line count, stored whole, and admitted — the
 //!    result records which stored lines its text shows.
 //!
+//! No result's text may exceed what admission allows (DESIGN §2, principle 3): a result in the recent
+//! region cannot be folded out of view, so one oversized result would make every later request
+//! overflow. Views bound themselves with `ctx.view_chars` (see `view`, `outview`, `fstools`), and
+//! [`finalize`] is the backstop, with `budget = admission.policy.view_chars(admission.estimator)`:
+//! - a `View` or `ProducedView` whose text is longer than `budget` characters keeps its text up to and
+//!   including the last `\n` at or before character `budget` (cut on a character boundary at `budget`
+//!   when there is none), followed by the line `[cut by harness: this view is {n} characters, more than
+//!   one result may show ({budget}); the rest is not shown. Nothing was discarded: ask for fewer lines
+//!   (start/end, or a narrower pattern) of {handle}.]` where `{handle}` is the `out:` handle of the
+//!   viewed blob. Its `meta[META_SHOWN]` becomes `[]` (what a cut view showed is not claimed) and `cut`
+//!   is true;
+//! - a `Message` longer than `budget` characters is stored and admitted exactly as `Raw` of its UTF-8
+//!   bytes would be (handle, line count, cut marker), so it is cut explicitly with a handle;
+//! - anything within `budget` is unchanged, byte for byte.
+//!
 //! The three steps are also public on their own ([`prepare`], [`Prepared::run`], [`Ran::finish`]), so
 //! that a call of a [`Tool::speculative`] tool can run before its turn and be finished — stored and
 //! admitted with the admission of that moment — only when the session claims it.
@@ -84,6 +99,9 @@ pub struct ToolCtx {
     pub cancel: CancellationToken,
     /// Session-local PTY/HTTP state. Cloned contexts share it; children start with fresh state.
     pub capabilities: Arc<capabilities::SessionTools>,
+    /// The most characters the text of a view (`read`, `out_read`, `out_grep`, other numbered views)
+    /// may hold: `AdmitPolicy::view_chars` of the session's admission when the call was started.
+    pub view_chars: usize,
 }
 
 /// What a tool hands back.
@@ -524,6 +542,7 @@ pub mod testutil {
             jobs: Arc::new(jobs),
             cancel: CancellationToken::new(),
             capabilities: Arc::new(capabilities::SessionTools::default()),
+            view_chars: AdmitPolicy::default().view_chars(&TokenEstimator::default()),
         };
         TestEnv {
             dir,
