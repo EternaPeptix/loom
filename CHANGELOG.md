@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Sandbox: Git metadata, the trustd route, the daemon port, and adoption by descriptor
+
+- Commands and the file tools can no longer plant what Git runs as the operator. In every writable root (the
+  workspace, the session temp dir, `extra_writable`) the profile and `check_write` refuse Git configuration,
+  hooks and `commondir`/`gitdir` pointers of linked worktrees (`.git/worktrees/<n>/`) and submodule repositories
+  (`.git/modules/<n>/`, deinitialized and nested ones included), and refuse making or moving a `.git`, a
+  worktree gitdir or a submodule repository into place. Before, a command could point an external worktree's
+  `commondir` at a config of its own, plant a submodule hook, or `git init` a repository in `$TMPDIR` and move it
+  into the workspace behind a gitlink, and the operator's next `git status` ran its command (reproduced on macOS
+  27, Git 2.50). Existing worktree and submodule gitdirs are discovered at construction and protected (and
+  mounted read-only by Bubblewrap). `git init` and non-bare clones no longer work anywhere commands write: a bare
+  clone does; `git worktree add` and `git submodule update --init` are for the operator, and the refusal and the
+  system prompt say so.
+- Under `network.mode = deny_all`, commands can no longer reach `com.apple.trustd.agent`, `com.apple.trustd` or
+  `com.apple.ocspd`. A command could have trustd fetch any URL named in a certificate (AIA), past the proxy and
+  `net.jsonl`. Programs that check certificates through macOS (Swift, Go, `security`, `codesign --verify`) now
+  fail in deny_all; curl and Python are unaffected. In the other modes this stays a documented residual.
+- The daemon's own port is refused to commands in every profile, even with `loopback_all` or when listed in
+  `loopback_ports`, so a `loom open` login code on another process's command line cannot be redeemed. New
+  non-configuration fields `SandboxCfg::daemon_port` and `SandboxCfg::network_deny_all` carry what the profile
+  needs.
+- `agent_adopt` writes, makes and removes relative to directories it opened without following a link and judged
+  by their real path (as `write` does), so a background command that swaps a workspace directory for a link
+  during adoption can no longer redirect an unsandboxed write (into `~/.ssh` or `.git/hooks`, say).
+
 ### The sandbox hides the whole loom home
 
 - Commands (seatbelt profile) and the file tools (`check_read`) can no longer read anything under the loom

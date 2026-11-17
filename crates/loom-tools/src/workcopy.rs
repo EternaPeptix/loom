@@ -77,12 +77,35 @@
 //! - `may_write(path)` is asked for every path to be written or removed; one refusal and nothing is
 //!   written (`AdoptError::Refused`, with the refusals).
 //!
-//! Then each file is copied beside its place and renamed over it, with the copy's time and
-//! permission bits, from the file opened in the copy and judged by `readable` as in `make` (a file that
-//! is refused fails the adoption as `AdoptError::Io`, and what it names is not copied); directories are made as needed, and a directory of `dest` that a removal left
-//! empty and that the copy no longer has is removed. What Git stores (`.git`) is never touched:
-//! commits a child made in its copy stay there. A failure while writing is `AdoptError::Io`, with
-//! what had been written by then.
+//! When a path in `dest` is compared with the copy's file (`as the copy has it`), the file in `dest` is opened
+//! and judged by `readable` as the copy's is; one it refuses is not the same as anything.
+//!
+//! Then the changes are written. Adoption runs in the daemon, outside the sandbox, while the lead's commands
+//! may still run (a background job), and one of them can swap a directory of `dest` for a link at any
+//! moment, so nothing is written, made or removed by a path that was judged earlier: every step works
+//! relative to a directory descriptor whose real path was judged (as `write` and `edit` do, through the
+//! same `fstools` helper):
+//! - the directory of each path is opened without following a link in its last component; missing ones are
+//!   made one at a time below the nearest one that exists, each only after `may_write` accepted the real
+//!   path of the open directory it is made in joined with its name, and opened without following a link.
+//!   `may_write` then judges the real path of the open directory joined with the file name. A link where a
+//!   directory is expected, or a refusal, fails the adoption as `AdoptError::Io` with a sentence that names
+//!   the path and says that no link is followed there;
+//! - a file is made beside its place under a fresh name that nothing may hold yet (exclusive create, no link
+//!   followed), from the copy's file opened and judged by `readable` as in `make` (a file that is refused
+//!   fails the adoption as `AdoptError::Io`, and what it names is not copied): on macOS cloned from that open
+//!   file into the open directory (`fclonefileat`), otherwise its bytes copied from it. The new file is opened
+//!   without following a link and given the copy's permission bits and modification time through that
+//!   descriptor (`fchmod`, `futimens`), synced, and renamed over its place within the open directory
+//!   (`renameat`). A link is made beside its place (`symlinkat`) and renamed the same way. Whatever fails
+//!   after the new entry was made removes it again (`unlinkat`);
+//! - a removal opens the directory the same way but makes nothing; `may_write` judges the real path joined
+//!   with the name, and the entry is removed within that directory (`unlinkat`). A directory of `dest` that a
+//!   removal left empty and that the copy no longer has is removed within its open, judged parent
+//!   (`unlinkat` with `AT_REMOVEDIR`), and so on upwards.
+//!
+//! What Git stores (`.git`) is never touched: commits a child made in its copy stay there. A failure while
+//! writing is `AdoptError::Io`, with what had been written by then.
 //!
 //! Tests required (temp dirs): a copy holds files, links, modes and times, leaves out `.loom`, and
 //! its manifest leaves out ignored files and `.git`; a Git pointer that leaves the tree is left out
@@ -96,6 +119,20 @@
 //! workspace has the size and time of the copy's and other bytes — takes the same change on both
 //! sides for no conflict, and does not touch `.git`; a file swapped for a link to a file `readable`
 //! refuses is not copied by `make` (it is counted as skipped) nor by `adopt`.
+//!
+//! Swap-race tests for `adopt`, each with a directory `outside` that `may_write` refuses (as the sandbox
+//! refuses what lies outside its writable roots) and whose content is compared before and after, the swap
+//! made deterministically from inside `may_write` after the up-front check of every path has passed: the
+//! directory `x` of an added `x/f` swapped for a link to `outside` (the adoption fails, naming the link,
+//! and nothing appears in `outside`); a directory above it (`x` of `x/y/f`) swapped the same way (refused,
+//! as the real path judged lies in `outside`); `x` swapped after `x/a` was written and before `x/b` (what
+//! follows lands in the directory that was opened and judged, or fails, never in `outside`); the `x` of a
+//! deleted `x/old` swapped for a link to an `outside` that holds `old` (it is not removed); a missing
+//! directory that is made by `adopt`, swapped for a link before it is entered; and a `.{name}…` file beside
+//! the place planted in advance as a link to a file in `outside` (that file is unchanged). And one race left
+//! to the scheduler: a thread swapping `x` for a link to `outside` and back in a tight loop while `adopt`
+//! runs, repeated until enough runs met both states: nothing in `outside` changes, and every run either
+//! adopted into `x` or failed.
 
 use crate::files::{open_readable, NotOpened, Readable};
 use serde::{Deserialize, Serialize};

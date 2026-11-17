@@ -22,7 +22,11 @@
 //!   runs again for the file it names (relative to the link's directory), at most `MAX_LINKS` (8)
 //!   times, so the target's directory is the one judged; more links → error sentence.
 //!
-//! `write_file_checked` is the same write for callers outside these tools (`box_get`).
+//! `write_file_checked` is the same write for callers outside these tools (`box_get`). The descriptor
+//! steps themselves — opening (and making) a directory without following a link with a judge of the real
+//! path given as a function, and the `*at` calls — are `pub(crate)` for `workcopy::adopt`, which must not
+//! have a weaker way to write the workspace either; the sentence for a link in the way names the caller's
+//! action, not `write` and `edit`, when another caller uses it.
 //!
 //! All three tools work only on regular files. A device, FIFO or socket → error sentence naming what
 //! the path is and what to use instead; it is never opened (`files::open_readable`). At most `READ_CAP`

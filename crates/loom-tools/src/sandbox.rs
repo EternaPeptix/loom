@@ -5,12 +5,44 @@
 //! ## Policy
 //! - writable roots: the workspace, the session temp dir and `cfg.extra_writable`. System temp
 //!   directories have no blanket write grant. Standard device literals remain writable;
-//! - never writable, even inside a writable root: `<workspace>/.loom`, the loom home directory, and
-//!   Git config/hooks/pointers (including discovered worktree gitdir/commondir), and `cfg.protected_paths` (relative entries are relative to the workspace). One exception: the
+//! - never writable, even inside a writable root: `<workspace>/.loom`, the loom home directory, the
+//!   Git metadata of the next item, and `cfg.protected_paths` (relative entries are relative to the workspace). One exception: the
 //!   session temp dir lies inside the loom home (`<loom home>/sessions/<id>/tmp`) and what is in it
 //!   is writable all the same — but not the directory entry itself (it cannot be removed, renamed,
 //!   replaced or made anew, yet tests as writable), and not a protected path that is the temp dir or
 //!   lies inside it. A temp dir that is `/`, or is or contains the loom home, is refused at construction;
+//! - Git metadata, so that a command cannot plant what Git runs as the operator (`core.fsmonitor` and the
+//!   other commands a config names, hooks, a `commondir` or `gitdir` that points at a config of its own)
+//!   on their next `git status`, commit or `git submodule update`, in the workspace, in a linked worktree
+//!   outside it, or in a repository moved into place. In every writable root (the workspace, the session
+//!   temp dir — the exception above does not reach it — and `cfg.extra_writable`), whether it exists yet or
+//!   not, and comparing names without regard to case:
+//!   - no `.git` entry can be written, made, removed or renamed, nor, below one, `config`,
+//!     `config.worktree`, `hooks`, `commondir` or `gitdir` (or anything below those) — of the repository,
+//!     of a linked worktree's private gitdir (`.git/worktrees/<name>/…`) and of a submodule's repository
+//!     (`.git/modules/<name>/…`, where `<name>` has one or more components; nested submodules'
+//!     `…/modules/<name>/…` included);
+//!   - nothing can be made or removed (renames included) at `.git/modules`, `.git/worktrees`, a direct child
+//!     of either, or the same below `.git/modules/…/`: no rule judges what a directory moved into place
+//!     holds, so a directory moved there would bring its own `config` and `hooks`;
+//!   - for the same reason, nothing can be made in a directory below a `modules` directory that is not itself
+//!     a repository (the `third_party` of a submodule named `third_party/x`), except inside the repositories
+//!     found below it at construction.
+//!
+//!   Git's own writes still work in the workspace's repository and every existing submodule's: objects,
+//!   refs, the index, `HEAD`, logs. What a session cannot do, and must ask the operator for: `git init` or a
+//!   clone that is not bare anywhere commands write, `git worktree add`/`remove`/`prune`, and `git submodule
+//!   add`/`init`/`update`/`deinit` (a bare repository, `<name>.git`, can be made and used with `--git-dir` and
+//!   `--work-tree`). Existing repositories are found at construction without running Git or following a link
+//!   to a directory: every `.git` directory in the workspace and the target of every `.git` file's `gitdir:`;
+//!   then for each repository found, its `commondir` target, every directory in its `worktrees`, and below its
+//!   `modules` every directory that is a repository (a regular file `HEAD` and an `objects` directory or a
+//!   `commondir` file), whose own `worktrees` and `modules` are searched in turn. A directory below a
+//!   `modules` directory that is not a repository is searched further and recorded (with the repositories
+//!   below it) for the rule above. The `config`, `config.worktree`, `hooks`, `commondir` and `gitdir` of every
+//!   repository found are protected paths, as found and as resolved, and Bubblewrap mounts every repository
+//!   found read-only as a whole (`git_dirs`). A pointer larger than 4096 bytes, more than 100000 workspace
+//!   directories, or more than 4096 repositories and recorded directories together refuse construction;
 //! - not readable: the whole loom home — its records, stored outputs, journals, logs, configuration,
 //!   packs, `token` and `keys` among them — except the session temp dir and `<session dir>/analysis`, the
 //!   harness's staging of binary-analysis inputs (readable, never writable; in an isolated replay: its
@@ -45,7 +77,23 @@
 //!   jobs;
 //! - network: denied, except loopback connections to the egress proxy port (when there is one), to
 //!   `cfg.loopback_ports` — or to every loopback port when `cfg.loopback_all` — and to
-//!   `cfg.unix_sockets`. Listening on loopback is allowed.
+//!   `cfg.unix_sockets`. Listening on loopback is allowed. The daemon's own port (`cfg.daemon_port`, which
+//!   the daemon sets; not a configuration key) is refused whatever allows it, at every address: Seatbelt
+//!   counts the host's own addresses as loopback, and a command that read a `loom open` login code from the
+//!   process list could otherwise redeem it. (Probed on macOS 27: a deny of `localhost:<port>` after an
+//!   allow of `localhost:*` has no effect; a deny of `*:<port>` refuses 127.0.0.1, ::1 and the host's own
+//!   address.)
+//! - system services that fetch a URL for a process, outside its sandbox: when `[network] mode` is
+//!   `deny_all` (`cfg.network_deny_all`, which the runtime sets; not a configuration key) commands cannot
+//!   look up `com.apple.trustd.agent`, `com.apple.trustd` or `com.apple.ocspd`. Certificate evaluation
+//!   fetches the issuer a certificate names (its AIA `caIssuers` URL, which a command chooses), with DNS,
+//!   through `com.apple.trustd.agent`: probed on macOS 27 with `security verify-cert -p ssl` under
+//!   `(deny network*)`, the request reaches a listener unless that service is denied (denying
+//!   `com.apple.trustd` alone does not stop it); `ocspd` is the older service for the same fetches. Denied,
+//!   evaluation through Security.framework fails for every certificate, valid ones too
+//!   (`SecTrustEvaluateWithError` returns false, errSecInternalComponent, so it fails closed), and so does
+//!   `codesign --verify`; curl, Python and OpenSSL check certificates against their own files and are not
+//!   affected. In the other network modes these services stay reachable: a residual, in SECURITY.md.
 //!
 //! All paths are made canonical when the sandbox is built (macOS: `/tmp` is `/private/tmp`); a
 //! configured path that does not exist is kept as written after resolving its deepest existing
@@ -73,6 +121,9 @@
 //! (allow file-write* (subpath "<session temp dir>"))
 //! (deny file-write-unlink file-write-create (literal "<session temp dir>"))
 //! (deny file-write* (subpath "<protected, at or inside the temp dir>") …)
+//! (deny file-write* (require-all (require-any (subpath "<writable root>") …) (regex #"^.*/[.]git(/((worktrees/[^/]+|modules/(.+/)?[^/]+)/)?(config|config[.]worktree|hooks|commondir|gitdir)(/.*)?)?$")))
+//! (deny file-write-create file-write-unlink (require-all (require-any (subpath "<writable root>") …) (regex #"^.*/[.]git/(modules/.+/)?(modules|worktrees)(/[^/]+)?$")))
+//! (deny file-write-create (require-all (subpath "<directory below modules that is not a repository>") (require-not (subpath "<repository below it>")) …)) …
 //! (deny file-write* (subpath "<unreadable or credential store>") …)
 //! (deny file-read* file-test-existence (subpath "<unreadable or credential store>") …)
 //! (deny file-read* file-test-existence (subpath "<loom home>"))
@@ -90,9 +141,16 @@
 //! (deny network*)
 //! (allow network-outbound (remote ip "localhost:<port>")) …      ; or "localhost:*" for loopback_all
 //! (allow network-outbound (remote unix-socket (path-literal "<socket>"))) …
+//! (deny network-outbound (remote ip "*:<daemon port>"))          ; only with `cfg.daemon_port`
 //! (allow network-bind (local ip "localhost:*"))
 //! (allow network-inbound (local ip "localhost:*"))
+//! (deny mach-lookup (global-name "com.apple.trustd.agent") (global-name "com.apple.trustd") (global-name "com.apple.ocspd"))   ; only with `cfg.network_deny_all`
 //! ```
+//!
+//! The Git regexes are written with every letter as a class of both cases (`[gG][iI][tT]`); the writable
+//! roots in them are those of `writable`, in its order. The rules for directories below `modules` come one
+//! per recorded directory that is the direct child of a `modules` directory (deeper ones lie inside it),
+//! sorted, each with the repositories below it, sorted.
 //!
 //! A process that leaves its command's process group (`setsid`, `daemon()`, `redis-server --daemonize
 //! yes`, `tmux new -d`) is not tracked: `job_kill`, stop, the end of the session and daemon shutdown do
@@ -129,6 +187,15 @@
 //! lies there; in mode `none` the sentence says the file tools cannot read it, as commands are not confined. In mode `none` only
 //! the never-writable and not-readable rules apply (the loom home rule included: it is the file tools'
 //! own rule in that mode).
+//!
+//! `check_write` applies the Git rules of the policy as the profile does — in every mode, to the path as
+//! given and as resolved, each judged relative to the writable root it lies in (the workspace when it lies
+//! in none) — and treats every write as making the entry, since the file tools write by renaming a new file
+//! into place. Its refusal says that the path is Git metadata that commands and file tools may not write or
+//! create anywhere they write, because Git could run what it holds as the operator; that the operator is
+//! the one to change repository configuration, add a worktree or set up a submodule
+//! (`git worktree add`, `git submodule update --init`); and that a repository of the session's own can be
+//! cloned bare (`git clone --bare <url> <dir>.git`) and used with `git --git-dir=<dir>.git --work-tree=<dir>`.
 //!
 //! ## `oracle_staging_root()` / `isolated_replay(workspace, tmp)`
 //! Staging is `<loom home>/oracle-runs`, outside all session temp trees. The harness creates a private
@@ -167,7 +234,12 @@
 //! stores when protected), how network access works. Deterministic. In
 //! mode `none` it says commands are not confined and what the file tools still refuse: the rule about loom's
 //! own files is worded as the file tools' (`File tools also refuse to read loom's own files under …`), not
-//! as one that binds commands.
+//! as one that binds commands. In seatbelt mode it also says that no Git repository can be made where
+//! commands write and no Git configuration, hooks, worktree or submodule repository written, that the
+//! operator does `git worktree add` and `git submodule update --init`, and that a bare clone
+//! (`git clone --bare <url> <dir>.git`, used with `--git-dir`/`--work-tree`) works; and, with
+//! `cfg.network_deny_all`, that programs that check certificates through macOS (Swift and Go programs,
+//! `security`, `codesign --verify`) fail here, while curl and Python use their own certificate files.
 //!
 //! ## `preflight(cfg)`
 //! Whether the configured mode can work on this host: seatbelt needs macOS and an executable
@@ -193,6 +265,34 @@
 //! keep their output, while `cat` and `ls` of the jobs directory fail; `check_read` and construction judge
 //! a path written through `/System/Volumes/Data` as the plain one; the analysis staging dir is readable and
 //! not writable; the `check_read` test also builds a Bubblewrap sandbox where that is possible.
+//!
+//! Git (built with real `git` where it runs, skipped otherwise, beside `check_write` cases on hand-made trees):
+//! construction finds an external linked worktree's `.git/worktrees/<n>`, an initialized and a deinitialized
+//! submodule's `.git/modules/<n>`, a submodule named `third/party` (with `third` recorded as not a repository),
+//! and a nested submodule's `.git/modules/<a>/modules/<b>`, and gives them to Bubblewrap as `git_dirs`;
+//! `check_write` refuses, in the workspace and in the temp dir, `commondir`, `gitdir` and `config.worktree` of
+//! a worktree's gitdir, `config` and `hooks/post-checkout` of each of those submodules, `.git/modules/<new>`,
+//! `.git/modules/<new>/hooks/x`, `.git/worktrees/<new>`, `.git/modules/third/<new>`, `<tmp>/x/.git` and
+//! `<tmp>/x/.git/config`, each refusal naming the operator and the bare clone, and accepts `objects/` and
+//! `refs/heads/` paths of the workspace's and the submodules' repositories, `<tmp>/x.git/config` and
+//! `<tmp>/x.git/hooks/h`. Under `sandbox-exec`: each of those writes fails, as does making
+//! `.git/modules/<new>/hooks` with `mkdir -p`; moving a directory from `$TMPDIR` to `.git/modules/<new>`,
+//! `.git/worktrees/<new>`, `.git/modules/third/<new>` and `.git/modules/<sub>/modules`; renaming `.git/modules`
+//! and `.git/modules/<sub>` away; `git init` in `$TMPDIR`; and moving a bare repository to `$TMPDIR/<d>/.git` —
+//! while a commit and a new branch in the workspace, in a submodule and in `third/party`, and
+//! `git init --bare $TMPDIR/x.git`, succeed. End to end, with the operator's `git` run outside the sandbox
+//! afterwards: a command that points the external worktree's `commondir` at a config of its own that sets
+//! `core.fsmonitor`, or that moves a repository with such a config into the workspace and adds a gitlink for
+//! it, does not make `git status` (in the worktree, in the workspace) run that command (a marker file it would
+//! make stays absent; the same steps without the profile make it, or the test is skipped).
+//!
+//! Network: the profile has the daemon-port deny after the allows exactly when `cfg.daemon_port` is set, and
+//! the `mach-lookup` deny exactly when `cfg.network_deny_all`. Under `sandbox-exec`: with `loopback_all`, and
+//! with the daemon port listed in `loopback_ports`, a connection to that port fails at 127.0.0.1 and ::1 (and
+//! at the host's own address when it has one) while another loopback port still connects; a command that runs
+//! `security verify-cert -p ssl` on a certificate whose AIA `caIssuers` names a unique URL on a local
+//! listener makes no request reach it with `network_deny_all`, and does without it (otherwise skipped: the
+//! host does not fetch); `describe` says what is said above.
 
 mod linux;
 

@@ -24,7 +24,9 @@
 //! 4. Bind `config.daemon.bind` (`TcpListener`; `SO_REUSEADDR`). A failure is `Cannot listen on
 //!    {bind}: {error}.` The port actually bound is the port used everywhere below (so port 0
 //!    works, for tests).
-//! 5. `Runtime::start(config, paths)`.
+//! 5. `Runtime::start(config, paths)`, with `config.sandbox.daemon_port` set to the port bound, so that no
+//!    sandboxed command can connect to this daemon (a `loom open` login code on another process's
+//!    command line could otherwise be redeemed).
 //! 6. Write `daemon.json` (`DaemonFile`, atomically). Log one line at info level with the address.
 //! 7. Serve `api::router` until SIGINT, SIGTERM, or the state's `shutdown` token (graceful
 //!    shutdown: stop accepting, give open requests 3 s — event streams are simply dropped).
@@ -56,7 +58,8 @@
 //! XML-escaped (`&`, `<`, `>`).
 //!
 //! Tests required: `run_until` over a temporary home with port 0 and a `MockServer`-backed config:
-//! `ready` fires, `daemon.json` exists and names the bound port, `/healthz` answers, the token file
+//! `ready` fires, `daemon.json` exists and names the bound port (and the runtime's `config.sandbox.daemon_port`
+//! is that port), `/healthz` answers, the token file
 //! is 0600; cancelling `stop` returns `Ok` and removes `daemon.json`; a second `run` against a live
 //! first one is refused with the sentence above; a stale `daemon.json` is replaced; an invalid
 //! config is reported with its path; the plist (escaping, both paths present); `prepare_home` tightens a

@@ -100,7 +100,10 @@
 //!     not their content), with the config's `SandboxCfg`; for a role with `read_only`, `extra_writable` is retained as internal
 //!     replay-untrusted metadata before its grants are emptied, and the
 //!     workspace is added to `protected_paths`; every model profile's `api_key_env` name is added to
-//!     `secret_env`, so commands never see it.
+//!     `secret_env`, so commands never see it. `Runtime::start` sets `config.sandbox.network_deny_all` to
+//!     whether `network.mode` is `deny_all` before anything is built from the configuration, so every
+//!     sandbox it makes (sessions, agents' copies, judges) has it; `daemon_port` is whatever the caller set
+//!     (the daemon's port; `None` without one).
 //!   - `env`: the session's proxy grant (`proxy.grant(id, policy)`), `env()`. The policy is
 //!     `Policy::with_hosts(&config.network, granted)`, `granted` being the hosts the operator authorized
 //!     for the mission (`grant_scope`): the ledger's `granted_hosts()` and those granted since the daemon
