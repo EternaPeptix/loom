@@ -1908,6 +1908,7 @@ mod tests {
             sessions_running: 1,
             inbox_open: 3,
             egress: None,
+            monitor: None,
         };
         assert_eq!(
             status(&view, &MONO),
@@ -1945,6 +1946,7 @@ mod tests {
             sessions_running: 0,
             inbox_open: 0,
             egress: None,
+            monitor: None,
         };
         assert!(!status(&view, &MONO).contains("egress"), "an older daemon says nothing");
         view.egress = Some(EgressView { level: Level::Unprobed, ..EgressView::default() });
@@ -1981,6 +1983,7 @@ mod tests {
             sessions_running: 0,
             inbox_open: 0,
             egress: None,
+            monitor: None,
         };
         let warning = "! Low disk space: sessions will fail when the disk fills. Run `loom gc`.\n";
         // (free, total, low): under 5 GiB whatever the volume, under 5 percent whatever the bytes; neither at the line.

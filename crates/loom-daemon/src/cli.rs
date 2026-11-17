@@ -89,6 +89,15 @@
 //!   and the packs and needs no daemon. `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
 //!   overwrite: `{path} already exists.`). `DEFAULT_CONFIG` leaves `tripwires_only_profiles` commented out, so a first
 //!   `config check` fails and lays out the three choices: not LLM-reviewed is a choice the operator makes, never a default.
+//! - `monitor [status]`: `client.monitor_status`; the monitor's state (`shadow`, `degraded`, `down` with its reason), what it
+//!   has read, its open flags, the faults of its sources and one row per tripwire with its hits by severity
+//!   (`monitor_status_lines`). `monitor log <mission|session> [--json] [--since 90m|12h|7d|<ms>] [--all] [-n N]`:
+//!   `client.monitor_log` (`mission_of` resolves the word), paged until N entries; one line per entry in words
+//!   (`monitor_entry_line`), or the stored JSON per line with `--json`; `--all` includes `cursor` and `heartbeat`.
+//!   `monitor replay [--since …] [--positives FILE] [--home DIR] [--no-journal-key] [--json]`: runs
+//!   `loom_agent::monitor::replay::run` in this process over the home (the current one, or a copy), read-only and with
+//!   no daemon; reads `keys/journal.key` unless `--no-journal-key`; prints the report as a table with notes, or as JSON.
+//!   A `--since` that is not `90m`, `12h`, `7d` or milliseconds is an error that says so (`parse_since`).
 //! - `service install|uninstall|status` (macOS; elsewhere `This command is for macOS (launchd).`):
 //!   `install` first loads the config and refuses (nothing written) a profile that sets `api_key_env`: a
 //!   launchd agent does not have the shell's variables, so its requests would carry no key, and putting
@@ -259,6 +268,8 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// The adversarial monitor in shadow: its state, its log, a replay over history
+    Monitor(MonitorArgs),
     /// The model profiles as the monitor sees them
     Models {
         #[command(subcommand)]
@@ -462,6 +473,59 @@ pub struct ScopeRevokeArgs {
     /// Why (kept in the ledger and shown to the lead)
     #[arg(long)]
     pub reason: String,
+}
+
+#[derive(Args, Debug)]
+pub struct MonitorArgs {
+    #[command(subcommand)]
+    pub action: Option<MonitorAction>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MonitorAction {
+    /// The monitor's state, its open flags and what each tripwire has fired (the default)
+    Status,
+    /// The monitor-log entries about a mission
+    Log(MonitorLogArgs),
+    /// Run the tripwires over the history of a loom home, read-only, and report per tripwire
+    Replay(MonitorReplayArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct MonitorLogArgs {
+    /// A mission id (`m-…`), or a session id, the beginning of one, or `last`
+    pub target: String,
+    /// One JSON object per line, as stored
+    #[arg(long)]
+    pub json: bool,
+    /// Only entries newer than this: `90m`, `12h`, `7d`, or a time in milliseconds since the epoch
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Include the housekeeping entries (`cursor`, `heartbeat`)
+    #[arg(long)]
+    pub all: bool,
+    /// At most this many entries
+    #[arg(short = 'n', long, default_value_t = 200)]
+    pub limit: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct MonitorReplayArgs {
+    /// Only hits newer than this: `90m`, `12h`, `7d`, or a time in milliseconds since the epoch
+    #[arg(long)]
+    pub since: Option<String>,
+    /// The report as JSON
+    #[arg(long)]
+    pub json: bool,
+    /// A file of mission ids, one per line, known to be positives: precision and recall are reported against them
+    #[arg(long)]
+    pub positives: Option<PathBuf>,
+    /// Replay this loom home instead of the current one (a copy of one; it is only read)
+    #[arg(long)]
+    pub home: Option<PathBuf>,
+    /// Do not read `keys/journal.key`: the ledgers are read unverified
+    #[arg(long)]
+    pub no_journal_key: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1138,6 +1202,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
         Command::Down => cmd_down(&paths).await,
         Command::Config { action } => cmd_config(&paths, action),
         Command::Models { action } => cmd_models(&paths, action),
+        Command::Monitor(a) => cmd_monitor(&paths, a).await,
         Command::Service { action } => cmd_service(&paths, action),
         Command::Status => {
             let view = client_of(&paths)?.status().await?;
@@ -1637,6 +1702,167 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
 }
 
 /// `loom models show [profile]`: reads the configuration and the packs; needs no daemon.
+/// `5m`, `12h`, `7d` (before `now_ms`), or a time in milliseconds since the epoch.
+pub(crate) fn parse_since(word: &str, now_ms: u64) -> Result<u64, String> {
+    let w = word.trim();
+    let bad = || format!("--since \"{word}\" is not a time. Use 90m, 12h or 7d, or milliseconds since the epoch.");
+    if let Some((n, unit)) = w.char_indices().last().and_then(|(i, u)| w.get(..i).map(|n| (n, u))) {
+        let mult: Option<u64> = match unit {
+            'm' => Some(60_000),
+            'h' => Some(3_600_000),
+            'd' => Some(86_400_000),
+            _ => None,
+        };
+        if let (Some(m), Ok(n)) = (mult, n.parse::<u64>()) {
+            return Ok(now_ms.saturating_sub(n.saturating_mul(m)));
+        }
+    }
+    w.parse::<u64>().map_err(|_| bad())
+}
+
+fn monitor_status_lines(m: &loom_agent::monitor::core::MonitorStatus) -> Vec<String> {
+    let mut l = vec![format!(
+        "monitor: {} ({} mode){}",
+        m.state,
+        m.mode,
+        m.down_reason.as_deref().map_or(String::new(), |r| format!(": {r}"))
+    )];
+    l.push(format!(
+        "read {} records, {} net decisions and {} floor events from {} sessions; {} open flags; {} paused, {} halted",
+        m.counts.records,
+        m.counts.net,
+        m.counts.floor,
+        m.sources,
+        m.open_flags,
+        m.paused.len(),
+        m.halts.len()
+    ));
+    if m.egress_unbounded {
+        l.push("egress: UNBOUNDED (the sandbox self-probe found a route outside the proxy)".to_string());
+    }
+    for f in &m.faults {
+        l.push(format!("source fault: {f}"));
+    }
+    l.push(format!(
+        "{:<6} {:<34} {:<9} {:>6} {:>5} {:>5} {:>5} {:>5}",
+        "id", "tripwire", "starts", "fired", "S1", "S2", "S3", "S4"
+    ));
+    for t in &m.tripwires {
+        l.push(format!(
+            "{:<6} {:<34} {:<9} {:>6} {:>5} {:>5} {:>5} {:>5}",
+            t.id, t.name, t.start, t.fired, t.by_severity[1], t.by_severity[2], t.by_severity[3], t.by_severity[4]
+        ));
+    }
+    l.push(
+        "Every tripwire is in shadow: a finding is recorded and shown, and changes nothing for any agent.".to_string(),
+    );
+    l
+}
+
+fn monitor_entry_line(e: &loom_agent::monitor::log::Entry) -> String {
+    let get = |k: &str| e.fields.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let when = e.ts_ms / 1000;
+    match e.kind.slug() {
+        "tripwire" => format!(
+            "#{} {when} {} {} {} would {}{} {} ({})",
+            e.seq,
+            get("id"),
+            get("severity"),
+            get("session"),
+            get("would"),
+            if e.fields.get("precision").and_then(|v| v.as_bool()).unwrap_or(false) { " precision-list" } else { "" },
+            get("detail"),
+            get("category")
+        ),
+        "flag" => format!(
+            "#{} {when} flag {} {} {} x{} {} [{}]",
+            e.seq,
+            get("flag"),
+            get("severity"),
+            get("category"),
+            e.fields.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
+            get("key"),
+            e.fields.get("causes").map_or(String::new(), |c| c.to_string())
+        ),
+        "response" => format!(
+            "#{} {when} response {} would {} {}",
+            e.seq,
+            get("level"),
+            get("would"),
+            e.fields.get("causes").map_or(String::new(), |c| c.to_string())
+        ),
+        other => format!("#{} {when} {other} {}", e.seq, serde_json::to_string(&e.fields).unwrap_or_default()),
+    }
+}
+
+async fn cmd_monitor(paths: &Paths, args: MonitorArgs) -> Result<i32, String> {
+    match args.action.unwrap_or(MonitorAction::Status) {
+        MonitorAction::Status => {
+            let m = client_of(paths)?.monitor_status().await?;
+            for line in monitor_status_lines(&m) {
+                outln(&line)?;
+            }
+            Ok(0)
+        }
+        MonitorAction::Log(a) => {
+            let c = client_of(paths)?;
+            let mission = c.mission_of(&a.target).await?;
+            let since = a.since.as_deref().map(|w| parse_since(w, loom_core::now_ms())).transpose()?;
+            let mut after = 0;
+            let mut left = a.limit.max(1);
+            loop {
+                let page = c.monitor_log(&mission, after, left.min(2000), !a.all).await?;
+                for e in &page.entries {
+                    if since.is_some_and(|s| e.ts_ms < s) {
+                        continue;
+                    }
+                    if a.json {
+                        outln(&serde_json::to_string(e).map_err(|x| x.to_string())?)?;
+                    } else {
+                        outln(&monitor_entry_line(e))?;
+                    }
+                    left = left.saturating_sub(1);
+                }
+                match page.next_after {
+                    Some(n) if left > 0 => after = n,
+                    _ => break,
+                }
+            }
+            Ok(0)
+        }
+        MonitorAction::Replay(a) => {
+            let home = a.home.as_ref().map_or_else(|| paths.clone(), |h| Paths::at(h.clone()));
+            let since = a.since.as_deref().map(|w| parse_since(w, loom_core::now_ms())).transpose()?;
+            let positives = match &a.positives {
+                Some(f) => std::fs::read_to_string(f)
+                    .map_err(|e| format!("{} cannot be read: {e}.", f.display()))?
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(MissionId::from)
+                    .collect(),
+                None => Default::default(),
+            };
+            let key = if a.no_journal_key { None } else { loom_core::journal::load_existing_key(&home.journal_key()) };
+            let report = tokio::task::spawn_blocking(move || {
+                let env = loom_agent::monitor::replay::env_for_home(&home)?;
+                let opts = loom_agent::monitor::replay::ReplayOpts { since_ms: since, positives };
+                Ok::<_, String>(loom_agent::monitor::replay::run(&home, std::sync::Arc::new(env), key, &opts))
+            })
+            .await
+            .map_err(|e| format!("The replay stopped: {e}."))??;
+            if a.json {
+                outln(&serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?)?;
+            } else {
+                for line in report.lines() {
+                    outln(&line)?;
+                }
+            }
+            Ok(0)
+        }
+    }
+}
+
 fn cmd_models(paths: &Paths, action: ModelsAction) -> Result<i32, String> {
     match action {
         ModelsAction::Show { profile } => {
@@ -1747,6 +1973,94 @@ mod tests {
 
     fn rejected(args: &[&str]) {
         assert!(parse(args).is_err(), "{args:?} should be rejected");
+    }
+
+    #[test]
+    fn monitor_commands_parse_and_since_reads_a_duration_or_a_time() {
+        assert!(matches!(ok(&["monitor"]), Command::Monitor(MonitorArgs { action: None })));
+        assert!(matches!(
+            ok(&["monitor", "status"]),
+            Command::Monitor(MonitorArgs { action: Some(MonitorAction::Status) })
+        ));
+        match ok(&["monitor", "log", "m-1", "--json", "--since", "7d", "--all", "-n", "5"]) {
+            Command::Monitor(MonitorArgs { action: Some(MonitorAction::Log(a)) }) => {
+                assert_eq!((a.target.as_str(), a.json, a.all, a.limit), ("m-1", true, true, 5));
+                assert_eq!(a.since.as_deref(), Some("7d"));
+            }
+            other => panic!("not log: {other:?}"),
+        }
+        match ok(&["monitor", "replay", "--positives", "p.txt", "--home", "/h", "--no-journal-key", "--json"]) {
+            Command::Monitor(MonitorArgs { action: Some(MonitorAction::Replay(a)) }) => {
+                assert_eq!((a.json, a.no_journal_key), (true, true));
+                assert_eq!(a.positives.as_deref(), Some(std::path::Path::new("p.txt")));
+                assert_eq!(a.home.as_deref(), Some(std::path::Path::new("/h")));
+            }
+            other => panic!("not replay: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["loom", "monitor", "log"]).is_err(), "log needs a mission or session");
+        let now = 10_000_000_000u64;
+        assert_eq!(parse_since("90m", now).ok(), Some(now - 90 * 60_000));
+        assert_eq!(parse_since("12h", now).ok(), Some(now - 12 * 3_600_000));
+        assert_eq!(parse_since("7d", now).ok(), Some(now - 7 * 86_400_000));
+        assert_eq!(parse_since("1234567", now).ok(), Some(1_234_567));
+        let e = parse_since("soon", now).err().unwrap_or_default();
+        assert!(e.contains("90m, 12h or 7d"), "{e}");
+        assert_eq!(parse_since("99999d", 5).ok(), Some(0), "a window longer than the history starts at the beginning");
+    }
+
+    #[test]
+    fn monitor_status_and_entries_print_in_words() {
+        let t = loom_agent::monitor::core::TwStatus {
+            id: "TW-10".into(),
+            name: "other sessions and processes".into(),
+            start: "precision".into(),
+            state: "shadow".into(),
+            fired: 3,
+            by_severity: [0, 0, 1, 2, 0],
+            missions: 2,
+        };
+        let m = loom_agent::monitor::core::MonitorStatus {
+            state: "degraded".into(),
+            mode: "shadow".into(),
+            enabled: true,
+            egress_unbounded: true,
+            open_flags: 2,
+            paused: vec![],
+            halts: vec![],
+            backlog_s: 0,
+            heartbeat_ms: 1,
+            last_seq: 9,
+            sources: 4,
+            counts: Default::default(),
+            tripwires: vec![t],
+            faults: vec!["a log does not continue its chain".into()],
+            fleet_runs: 0,
+            fleet_hits: 0,
+            reviewers: vec![],
+            down_reason: None,
+        };
+        let text = monitor_status_lines(&m).join("\n");
+        assert!(text.contains("monitor: degraded (shadow mode)") && text.contains("2 open flags"), "{text}");
+        assert!(text.contains("egress: UNBOUNDED") && text.contains("source fault: a log does not continue"), "{text}");
+        assert!(text.contains("TW-10") && text.contains("changes nothing for any agent"), "{text}");
+        let mut fields = serde_json::Map::new();
+        fields.insert("id".into(), "TW-09".into());
+        fields.insert("severity".into(), "s3".into());
+        fields.insert("session".into(), "s-1".into());
+        fields.insert("would".into(), "r3".into());
+        fields.insert("precision".into(), true.into());
+        fields.insert("detail".into(), "writes a hook".into());
+        fields.insert("category".into(), "harness_attack".into());
+        let e = loom_agent::monitor::log::Entry {
+            seq: 7,
+            ts_ms: 5_000,
+            prev: String::new(),
+            mac: String::new(),
+            kind: loom_agent::monitor::log::EntryKind::Tripwire,
+            fields,
+        };
+        let line = monitor_entry_line(&e);
+        assert_eq!(line, "#7 5 TW-09 s3 s-1 would r3 precision-list writes a hook (harness_attack)");
     }
 
     #[test]

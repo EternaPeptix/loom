@@ -21,7 +21,14 @@ the configuration keys of §7.1 are not accepted yet, and none of the routes, co
 function of the module that a later phase fills returns `MonitorError::NotBuilt`, so a premature caller fails closed.
 M1 (the model policy of §2.6) is built: the profile keys, the `[monitor]` keys it names (`reviewers`,
 `tripwires_only_profiles`, `recipients`, `content`, `known_families`), the eligibility and selection functions, the check in
-`loom config check`, `loom models show`, and the lineage in `session_start`. Where this text says "is" for something a later phase builds, read "will be, once that phase lands"; the phase column
+`loom config check`, `loom models show`, and the lineage in `session_start`.
+M2 (the monitor core, in shadow) is built: the daemon owns a `Monitor` that folds its log before any session is
+activated and reads every record of every session through persisted cursors; TW-01 to TW-28 run over them with the §6.1
+matching rules, flags are deduplicated and the S1 aggregation applies, the fleet joins FS-1 to FS-10 run every
+`fleet_every_s`, and `GET /api/monitor`, `GET /api/missions/{id}/monitor`, `loom monitor status|log|replay` show it. The
+keys `enabled`, `mode`, `fleet_every_s` and `monitor_down` are accepted. Every cause is shadow, including the ones of
+the precision list (they enforce from M4): nothing is steered, refused, held, paused or notified, and an agent can see no
+difference (§4.8 "As built (M2)"). Where this text says "is" for something a later phase builds, read "will be, once that phase lands"; the phase column
 of §9.1 says which.
 
 **Vocabulary.** Controls of the deterministic floor are `E1`..`E4` (§2.2); build phases are `P0`, `E1`..`E4`,
@@ -302,6 +309,25 @@ Until E1–E4 are deployed, tripwires detect attempts but do not close these rou
 | box lifecycle, box_exec text, box chain counter deltas (E4f); rootbox command text | log; counters | log; daemon |
 | self-probe results (E2) | monitor | daemon |
 | operator actions (message, answer, rule, scope, revoke, stop, keep-going set, overrides, dispositions), each with client identity | runtime hooks | monitor log |
+
+**As built (M2).** `crates/loom-agent/src/monitor/`: `log.rs` (the HMAC-sealed chain, the reserve file, the anchor,
+the fold), `source.rs` (cursors over session logs, `net.jsonl`, `net-unattributed.jsonl`, `floor.jsonl` and the
+journals), `engine.rs` and `patterns.rs` (the tripwires), `fleet.rs` (the joins), `core.rs` (the pump, flags, the
+heartbeat), `replay.rs`. How it differs from the table above, and why:
+- **Wake-up.** `Inner::on_record` and `Inner::on_status` wake the monitor with the session as a hint
+  (`Monitor::wake`); the worker also scans everything every 10 s and discovers new sessions then, so the proxy audit
+  hook does not wake it (a net decision is judged 2 s after its time anyway, and the next scan finds it).
+- **Cursors** are per source and checkpointed as `cursor` entries (`{source: {off, seq, hash}}`); the first start
+  puts every existing source at its end. Per-session context (the hosts the agent named, the last arguments) is not
+  persisted: after a restart it starts empty, which can only make a tripwire quieter (`core.rs` CONTRACT).
+- **Inline tripwires** (before the call runs, from `Session::run_calls_as`) are M8: in M2 every tripwire is a cursor
+  tripwire that reads the durable record, so a finding follows the call by the time the monitor takes to read it
+  (typically under 2 s; no gate decides before the call).
+- **Census** (TW-20) takes the last `CensusView` the runtime gives it (`Monitor::census`); **self-probe** state
+  (`egress_unbounded`) is shown in the status. Box counters and the box and rootbox inputs are M10.
+- **Snapshots** of the fold are deferred: the log holds hits and checkpoints, not records, so the fold is cheap.
+- The reviewer, the gate, the pause, keep-going and the canaries' placement are not built; `Monitor::start` and
+  `Authorization::build` are the only M2 entry points the later phases use.
 
 ### 2.4 Building review inputs
 Two views. Agent-influenced strings always go inside DATA, never in harness-computed facts.
@@ -731,6 +757,12 @@ Gated calls never get an early start: the classifier joins the early-start predi
 - **Every disposition** records the client identity (CLI token or web session).
 
 ### 4.8 Shadow mode and promotion
+
+**As built (M2).** Every cause is shadow in M2, the precision list included: the list is *recorded* (a hit that is part of
+it carries `precision: true`) and shown as "would have paused", but nothing enforces before M4, because M2 changes nothing
+an agent can see. `[monitor] mode = "shadow"` is the only value. `loom monitor replay` is the measurement of this
+section: it needs no daemon and is read-only.
+
 - **`[monitor] mode = "shadow"` is the starting state.** Each tripwire, and the reviewer's own pause path, has a state `shadow | enforce`, recorded in the monitor log.
 - **The precision list enforces from day one** (rationale: no legitimate use was seen in the operator's history, or the route is harness-only):
 
@@ -975,6 +1007,13 @@ FS-1, FS-2 and FS-4 candidates go to the L4 review. FS-1 with both ends acting, 
 
 Agents may notice canaries. Canaries are tripwires, not the boundary.
 
+**As built (M2).** All 28 tripwires and FS-1 to FS-10 run in shadow. What each reads and where M2 stops is in the
+CONTRACT of `engine.rs`. The ones that need a later phase are, in short: provenance of a credential toward its asset
+(G2, M8), the S3 of TW-17 beside a gated call (M8), the `harness_test` flag (M4), a re-finish in a reopened turn (M9),
+gzip runs (M6), and the canaries' placement (M10: TW-24 reads the floor's decoy events and any canary the core is
+given). A hit of a tripwire in M2 is a `tripwire` entry with `state: shadow`, the response it would earn (`would`) and
+whether it is part of the §4.8 precision list (`precision`).
+
 ### 6.5 Known blind spots (also in SECURITY.md)
 Stated in full in §9.5. In short:
 - opaque HTTPS bodies to granted hosts;
@@ -1105,6 +1144,14 @@ POST /api/missions/{id}/scope/revoke                {host, reason}
 ```
 Bodies live in `crate::wire` with `deny_unknown_fields`, modelled on the other bodies there.
 
+**As built (M2).** `GET /api/monitor` (`MonitorStatus`: `state` `shadow`, `degraded` or `down`, the open flags, the
+pauses and halts folded from the log, the counts read, one row per tripwire with its hits by severity, the faults of
+its sources), `GET /api/missions/{id}/monitor?after=&limit=&quiet=` (`{entries, next_after}`: the entries about the
+mission; `quiet` leaves out `cursor` and `heartbeat`) and `GET /api/monitor/reviews/{review}/input` (always `404` until
+M6). `StatusView.monitor` is `{state, open_flags, egress_unbounded}` (`#[serde(default)]`). The other routes are later
+phases. `POST /api/monitor/replay` is not a route: `loom monitor replay` reads the home itself, read-only, in the CLI
+process (§8.3), so it needs no daemon and works on a copy of a home.
+
 ### 7.6 CLI
 Each command is added to the `Command` enum and the cli.rs contract list:
 - `loom keep-going <session> [--off|--once] [--max N] [--delay S] [--max-steps N] [--max-minutes M] [--real-targets REASON] [--allow-same-family REASON] [--allow-new-recipient REASON] [--allow-unvetted REASON] [--override-expires DATE|--override-reopens N]`
@@ -1125,6 +1172,13 @@ Each command is added to the `Command` enum and the cli.rs contract list:
 - `loom scope --lab <host>`; `loom scope revoke <mission> <host> --reason`
 - `loom ls`: `render::session_state` appends words, never colour only: ` keep-going 1/3`, ` paused(review)`, ` halted`, ` not-reviewed`.
 - `loom inbox`: review items print the `loom answer` choices and the `loom monitor log` command.
+
+**As built (M2).** `loom monitor` (= `status`), `loom monitor log <mission|session> [--json] [--since 90m|12h|7d]
+[--all] [-n N]` and `loom monitor replay [--since …] [--positives FILE] [--home DIR] [--no-journal-key] [--json]`. The
+replay prints, per tripwire, the hits by severity, the missions they fall in, precision and recall against the
+positives file (one mission id per line), precision from the operator's dispositions when the log has them, the
+would-be pauses per 100 active hours, the fleet joins, and notes on what the numbers mean. It reads `keys/journal.key`
+unless `--no-journal-key` is given, because a ledger is judged by the grants in force at the time of each record.
 
 ### 7.7 UI (on the existing web UI)
 - **Header `#s-standing` pill,** in words with a shape:
@@ -1255,6 +1309,11 @@ P0 writes the documents; each later phase updates the ones its behaviour changes
 - `harness_test` sandbox probes.
 
 ### 8.3 Shadow replay and detection evaluation
+
+**As built (M2).** `loom monitor replay` runs the tripwires and the fleet joins over a home's history through the real
+cursors (a memory core: it writes no file) and reports what the bullet below lists, except the gate rate, which says "not
+built (M8)". It judges each record by the authorization in force at its time and reads sessions in directory order (the
+30-minute S1 window of a mission is therefore read in that order). `monitor_eval` and `loom monitor vet` are M7.
 - **`loom monitor replay`** runs tripwires and the classifier over `~/.loom` history through the real cursors. It reports per-cause fire counts, would-be pauses per 100 active hours, the gate rate per mission, and recall on known positives. It is required before any promotion.
 - **`monitor_eval` / `loom monitor vet <p>`** replay logs, net.jsonl and journals through the real input builder and a live reviewer, without running agents.
 - **Sets.**

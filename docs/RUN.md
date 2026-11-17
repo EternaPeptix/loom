@@ -421,6 +421,9 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 |---|---|
 | `loom daemon` / `up` / `down` | run the daemon in the foreground / in the background / stop it |
 | `loom models show [profile]` | each model profile's family, alignment and recipient, and who reviews its missions in each pack (needs no daemon) |
+| `loom monitor [status]` | the monitor in shadow: its state, open flags, how often each of the 28 tripwires fired by severity, the faults of its sources |
+| `loom monitor log <mission\|session> [--json] [--since 7d] [--all] [-n N]` | the monitor-log entries about a mission: hits, flags, what each would earn once promoted |
+| `loom monitor replay [--since 7d] [--positives FILE] [--home DIR] [--json]` | the tripwires over the history of a home, read-only and without a daemon: per-tripwire hits, would-be pauses per 100 active hours, precision and recall against known positives |
 | `loom status` | the daemon, each model server and whether it answered, counts, free disk space, the sandbox self-probe's egress line |
 | `loom open [--print]` | open the web UI in the browser (`--print` prints the address instead) |
 | `loom run [options] <task...>` | start a session and follow it; `-d` starts it and returns |

@@ -1544,13 +1544,17 @@ POST /api/inbox/{item_id}                     {answer} → 202 {}
 GET  /api/blobs/{handle}                      → BlobRef {id, bytes, lines}
 GET  /api/blobs/{handle}/raw                  the stored bytes (application/octet-stream, attachment)
 GET  /api/blobs/{handle}/lines?start=&end=    → {text, first, last, total}  (1-based; default 1–2000, ≤ 5000 lines)
+GET  /api/monitor                             → MonitorStatus   (the monitor in shadow; 404 when [monitor] enabled = false)
+GET  /api/missions/{id}/monitor?after=&limit=&quiet=   → {entries, next_after}   (the monitor-log entries about a mission)
+GET  /api/monitor/reviews/{review}/input      → 404 until the reviewer exists (M6)
 GET  /api/events?deltas=true|false            SSE, below
 POST /api/gc                                  {apply?} → SweepReport
 POST /api/shutdown                            → 202 {}
 ```
 
-**Monitor routes (specified, not served).** The routes above are the ones this build serves. `docs/MONITOR.md` §7.5
-specifies those the monitor adds (`GET /api/monitor`, `GET /api/missions/{id}/monitor`, `POST
+**Monitor routes (three served, the rest specified).** The routes above are the ones this build serves, including `GET
+/api/monitor`, `GET /api/missions/{id}/monitor` and the `404` of `GET /api/monitor/reviews/{review}/input` (M2).
+`docs/MONITOR.md` §7.5 specifies those the monitor adds beyond them (`POST
 /api/sessions/{id}/keep-going`, the flag, review, pause, observe-only, halt, promote, vet, replay and capacity routes;
 `POST /api/missions/{id}/scope/revoke` is served since phase E1), the `monitor` bus event (an unknown `type` is ignored by the UI and CLI) and
 the `monitor` fields of `StatusView` and `MissionInfo` (`#[serde(default)]`); each phase adds its routes to the list
@@ -1782,9 +1786,11 @@ as workspace content.
 ## 15. Monitor (`loom-agent::monitor`; specification `docs/MONITOR.md`)
 
 *Status: specified in full in `docs/MONITOR.md`; phase P0 put the specification, the contracts and the vocabulary in the
-tree. Nothing in this section is enforced by the running daemon until the phase named for it in `docs/MONITOR.md` §9.1
-lands; each such phase updates the text here in the same commit. Until then the residual risks of `SECURITY.md` apply
-unchanged.*
+tree. Phase M2 makes the monitor **watch**: the daemon owns a monitor that reads every record of every session through
+persisted cursors and runs the 28 tripwires and the fleet joins in shadow, recording to `<home>/monitor/log.jsonl`,
+shown by `loom monitor` and `GET /api/monitor`, changing nothing an agent can see. Nothing else in this section is
+enforced by the running daemon until the phase named for it in `docs/MONITOR.md` §9.1 lands; each such phase updates the
+text here in the same commit. Until then the residual risks of `SECURITY.md` apply unchanged.*
 
 The agents are the adversary (`SECURITY.md`): whatever the cause, an agent may reach for something the operator did not
 authorize, and it can write every word the harness reads about it. §2 principle 8 already puts enforcement outside the

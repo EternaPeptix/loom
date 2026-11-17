@@ -24,15 +24,24 @@
 //!   ignored when it is `None`). A grant lapsed with its reopen (`expires_with_reopen` not 0 and not `active_reopen`)
 //!   gives nothing. When several grants cover the host the strictest mark wins (`Prod` over `None` over `Lab`), so a
 //!   host first granted `[lab]` and later re-granted `[prod]` is `Prod`.
-//! - `for_mission` reads the ledger's sealed state and the config at call time; the monitor keeps a read-only
-//!   `Arc<Authorization>` per mission and replaces it when the ledger changes (M2).
+//! - `Authorization::build(mission, entries, upto_ms, facts)` (M2) folds the mission's journal entries up to a time
+//!   (`upto_ms`, so a record is judged by the authorization in force when it was made, and a replay is not judged by a
+//!   grant that came later) and takes the rest from `AuthFacts`: the goal (`LedgerState::goal`, verbatim), the
+//!   constraints that are not retired (rules), the operator's grants (`LedgerState::granted_hosts`, each with the note
+//!   of its grant, `Mark::None`: `loom scope --lab` is M4), the operator's chat messages and the answer part of their
+//!   inbox answers (`AuthFacts::operator_messages`, from the records authored by the user, cut to `MAX_MESSAGES` of
+//!   `MAX_MESSAGE_CHARS`), and the configuration's allow and deny lists, network mode, `solvable`,
+//!   `requires_restricted_network` and the role. Nothing an agent wrote reaches it: not a `why`, a claim, a decision,
+//!   a note, an asset, a plan or a report. The monitor keeps an `Authorization` per mission and rebuilds it when the
+//!   ledger changes.
 //!
 //! Tests required (M2): no agent-authored string is reachable from `Authorization`; a scope request's `why` does not
-//! change `authorizes`; grants made in a reopened turn carry an expiry; the mission's goal is verbatim. In P0:
+//! change `authorizes`; grants made in a reopened turn carry an expiry; the mission's goal is verbatim; the entries
+//! after `upto_ms` do not count; a revoked grant is gone. In P0:
 //! `a_grant_gives_its_mark_and_nothing_else_does`, `wildcard_and_port_grants_give_their_mark`,
 //! `the_strictest_mark_wins_and_lapsed_grants_give_nothing`, `real_targets_are_derived_from_mode_allow_list_and_grants`.
 
-use crate::monitor::{not_built, MonitorError};
+use loom_core::ledger::{Entry, LedgerState};
 use loom_core::MissionId;
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +72,24 @@ impl Mark {
             Mark::Prod => 2,
         }
     }
+}
+
+/// The most operator messages an `Authorization` keeps (the newest), and the longest of each.
+pub const MAX_MESSAGES: usize = 50;
+pub const MAX_MESSAGE_CHARS: usize = 2_048;
+
+/// What `Authorization::build` takes besides the journal: the configuration, the pack and the operator's words.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuthFacts {
+    pub network_mode: String,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+    pub box_targets: Vec<String>,
+    pub solvable: bool,
+    pub requires_restricted_network: bool,
+    pub role: String,
+    /// (time, text) of the operator's chat messages and the answer part of their inbox answers.
+    pub operator_messages: Vec<(u64, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,9 +134,45 @@ impl Authorization {
         self.allow.iter().any(|a| !lab_grant(a)) || self.grants.iter().any(|g| self.active(g) && g.mark != Mark::Lab)
     }
 
-    /// Build the block for `mission` from its sealed ledger and the configuration (M2).
-    pub fn for_mission(_mission: &MissionId) -> Result<Authorization, MonitorError> {
-        not_built("authorization snapshot", "M2")
+    /// The block for `mission` from its journal `entries` up to `upto_ms`, and `facts` (see the CONTRACT).
+    pub fn build(mission: &MissionId, entries: &[Entry], upto_ms: u64, facts: &AuthFacts) -> Authorization {
+        let upto: Vec<Entry> = entries.iter().filter(|e| e.ts_ms <= upto_ms).cloned().collect();
+        let state = LedgerState::fold(&upto);
+        let note_of = |host: &str| -> String {
+            state
+                .scope_grants
+                .iter()
+                .rev()
+                .find(|g| g.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)))
+                .and_then(|g| g.note.clone())
+                .unwrap_or_default()
+        };
+        let messages: Vec<String> = facts
+            .operator_messages
+            .iter()
+            .filter(|(t, _)| *t <= upto_ms)
+            .map(|(_, m)| m.chars().take(MAX_MESSAGE_CHARS).collect::<String>())
+            .collect();
+        let skip = messages.len().saturating_sub(MAX_MESSAGES);
+        Authorization {
+            mission: mission.clone(),
+            goal: state.goal.clone().unwrap_or_default(),
+            operator_messages: messages.into_iter().skip(skip).collect(),
+            rules: state.constraints.iter().filter(|c| c.retired.is_none()).map(|c| c.text.clone()).collect(),
+            grants: state
+                .granted_hosts()
+                .into_iter()
+                .map(|h| Grant { note: note_of(&h), host: h, mark: Mark::None, expires_with_reopen: 0 })
+                .collect(),
+            allow: facts.allow.clone(),
+            deny: facts.deny.clone(),
+            network_mode: facts.network_mode.clone(),
+            box_targets: facts.box_targets.clone(),
+            solvable: facts.solvable,
+            requires_restricted_network: facts.requires_restricted_network,
+            role: facts.role.clone(),
+            active_reopen: 0,
+        }
     }
 
     /// The mark the active operator grants give `host` (on `port`, when known), if any grant covers it.
@@ -203,9 +266,83 @@ mod tests {
         assert!(!a.has_real_targets(), "a restricted-network pack is a lab");
     }
 
+    fn entry(n: u64, ts: u64, session: &str, op: loom_core::ledger::LedgerOp) -> Entry {
+        Entry { n, ts_ms: ts, session: loom_core::SessionId::from(session), from_user: false, op, mac: String::new() }
+    }
+
+    fn facts() -> AuthFacts {
+        AuthFacts {
+            network_mode: "allowlist".into(),
+            allow: vec!["*.target.example".into()],
+            solvable: true,
+            role: "web".into(),
+            operator_messages: vec![(5, "go on, stay in scope".into()), (500, "later message".into())],
+            ..AuthFacts::default()
+        }
+    }
+
     #[test]
-    fn building_it_is_not_built_yet() {
-        assert!(Authorization::for_mission(&MissionId::from("m-test")).is_err());
+    fn it_is_built_from_the_journal_up_to_a_time_and_the_facts() {
+        use loom_core::ledger::LedgerOp;
+        let entries = vec![
+            entry(1, 10, "s-1", LedgerOp::GoalSet { text: "find the flag at *.target.example".into() }),
+            entry(2, 20, "s-1", LedgerOp::ConstraintAdd { text: "no brute force".into() }),
+            entry(
+                3,
+                30,
+                "s-1",
+                LedgerOp::ScopeGrant { hosts: vec!["extra.example".into()], note: Some("ok by me".into()) },
+            ),
+            entry(4, 90, "s-1", LedgerOp::ScopeGrant { hosts: vec!["late.example".into()], note: None }),
+            entry(
+                5,
+                95,
+                "s-1",
+                LedgerOp::Decision { text: "use late.example".into(), reason: "the operator said so".into() },
+            ),
+        ];
+        let m = MissionId::from("m-1");
+        let a = Authorization::build(&m, &entries, 50, &facts());
+        assert_eq!(a.goal, "find the flag at *.target.example", "the goal is verbatim");
+        assert_eq!(a.rules, vec!["no brute force".to_string()]);
+        assert_eq!(a.grants.len(), 1);
+        assert_eq!((a.grants[0].host.as_str(), a.grants[0].note.as_str()), ("extra.example", "ok by me"));
+        assert_eq!(
+            a.operator_messages,
+            vec!["go on, stay in scope".to_string()],
+            "a later message is not in force yet"
+        );
+        assert!(a.mark_of("late.example", None).is_none(), "an entry after the time does not count");
+        assert!(a.solvable && a.role == "web" && a.network_mode == "allowlist");
+        let later = Authorization::build(&m, &entries, 100, &facts());
+        assert!(later.mark_of("late.example", None).is_some());
+    }
+
+    #[test]
+    fn no_agent_authored_string_is_reachable() {
+        use loom_core::ledger::LedgerOp;
+        let entries = vec![
+            entry(1, 10, "s-1", LedgerOp::GoalSet { text: "goal".into() }),
+            entry(2, 11, "s-1", LedgerOp::Decision { text: "AGENT-DECISION".into(), reason: "AGENT-REASON".into() }),
+            entry(3, 12, "s-1", LedgerOp::ClaimAdd { text: "AGENT-CLAIM".into() }),
+            entry(4, 13, "s-1", LedgerOp::DeadEnd { what: "AGENT-WHAT".into(), why: "AGENT-WHY".into() }),
+            entry(5, 14, "s-1", LedgerOp::PlanSet { steps: vec!["AGENT-STEP".into()] }),
+        ];
+        let a = Authorization::build(&MissionId::from("m-1"), &entries, u64::MAX, &facts());
+        let json = serde_json::to_string(&a).unwrap_or_default();
+        assert!(!json.contains("AGENT-"), "{json}");
+    }
+
+    #[test]
+    fn a_revoked_grant_is_gone() {
+        use loom_core::ledger::LedgerOp;
+        let entries = vec![
+            entry(1, 10, "s-1", LedgerOp::ScopeGrant { hosts: vec!["h.example".into()], note: None }),
+            entry(2, 20, "s-1", LedgerOp::ScopeRevoke { host: "h.example".into(), reason: "done".into() }),
+        ];
+        let m = MissionId::from("m-1");
+        assert!(Authorization::build(&m, &entries, 15, &facts()).mark_of("h.example", None).is_some());
+        assert!(Authorization::build(&m, &entries, 25, &facts()).mark_of("h.example", None).is_none());
     }
 
     #[test]

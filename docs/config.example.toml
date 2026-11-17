@@ -158,8 +158,10 @@ repeat_minutes = 0         # re-notify an unanswered blocking item this often; 0
 
 # ---------------------------------------------------------------------------------------------------
 # The adversarial monitor (docs/MONITOR.md). Built so far: the model policy (M1), which decides who may review
-# whom. The rest of [monitor] and [keep_going] and sandbox.allow_fetch_services are NOT YET ACCEPTED by this
-# build (the daemon rejects unknown keys); the phase that adds each says so in CHANGELOG.md. They stay commented.
+# whom, and the watcher (M2): deterministic tripwires over every record of every session, in shadow (they record and
+# show; nothing changes for an agent). The rest of [monitor] and [keep_going] and sandbox.allow_fetch_services are NOT
+# YET ACCEPTED by this build (the daemon rejects unknown keys); the phase that adds each says so in CHANGELOG.md.
+# They stay commented.
 #
 # Model policy. Each profile has a family (a set: a distill belongs to both), an alignment (are its refusals
 # intact), a recipient (who receives its traffic) and optionally a purpose. Left out, loom infers the family from
@@ -181,6 +183,10 @@ repeat_minutes = 0         # re-notify an unanswered blocking item this often; 0
 #
 # This file's own profile has no reviewer, on purpose, so the file checks clean as shipped:
 [monitor]
+enabled = true                        # the watcher: false builds no monitor at all (no log, no tripwires, no routes)
+mode = "shadow"                       # the only mode until M4: every cause is recorded and shown as "would have paused"
+fleet_every_s = 300                   # seconds between the fleet joins (FS-1 to FS-10); at least 10
+monitor_down = "pause_real_targets"   # what a down monitor does to missions it cannot watch: or "notify" (M3 applies it)
 tripwires_only_profiles = ["local"]   # profiles whose missions are watched by the deterministic tripwires only ("not LLM-reviewed")
 # reviewers = []                      # profile names, in preference order; the first eligible for a mission reviews it
 # known_families = []                 # family names beyond the built-in list
@@ -193,9 +199,9 @@ tripwires_only_profiles = ["local"]   # profiles whose missions are watched by t
 # new_recipient_real_targets = "features"   # or "redacted": what a new-recipient reviewer gets for a mission with real targets; secrets are redacted in every case
 #
 # Keys of later phases (not accepted yet; their defaults, for reference):
-# enabled = true / mode = "shadow" / gate = true / gate_timeout_s = 90 / gate_queue_max_s = 30 / step_every_calls = 8 /
-# step_every_s = 120 / fleet_every_s = 300 / unreviewed_pause_min = 60 / review_max_tokens = 48000 / repeat_minutes = 30 /
-# canaries = true / retention_days = 30 / monitor_down = "pause_real_targets" (or "notify") under [monitor];
+# gate = true / gate_timeout_s = 90 / gate_queue_max_s = 30 / step_every_calls = 8 /
+# step_every_s = 120 / unreviewed_pause_min = 60 / review_max_tokens = 48000 / repeat_minutes = 30 /
+# canaries = true / retention_days = 30 under [monitor];
 # [monitor.capacity.<endpoint profile>] gate_slots = 1, review_slots = 1;
 # [keep_going] (no "on" key: the operator arms a mission) max_reopens = 3 (hard maximum 10), max_reopens_real_targets = 1
 # (hard maximum 3; also the cap for a relaxed agent), delay_s = 120, per_reopen_max_steps = 200, per_reopen_max_minutes = 120;

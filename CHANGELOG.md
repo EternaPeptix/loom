@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Monitor M2: the monitor core, in shadow
+
+- **The daemon now watches.** `Runtime::start` builds one `Monitor` per loom home (unless `[monitor] enabled = false`), folds
+  its log before any session is activated, and runs it on a worker. It reads every record of every session (`log.jsonl`),
+  `net.jsonl`, `logs/net-unattributed.jsonl`, `logs/floor.jsonl` and the mission journals through persisted cursors, and runs
+  the 28 tripwires (TW-01 to TW-28, `docs/MONITOR.md` §6.2) and the 10 fleet joins (FS-1 to FS-10, every `fleet_every_s`)
+  over them. **Everything is shadow**, the precision list included: findings are recorded and shown; nothing is steered,
+  refused, held, paused or notified, and an agent can see no difference.
+- **New files** under the home: `monitor/log.jsonl` (hash-chained and HMAC-sealed with the new `keys/monitor.key`; entry kinds
+  `cursor`, `heartbeat`, `tripwire`, `flag`, `response`, and the rest of §7.3 for later phases), `monitor/reserve`
+  (preallocated, takes pause entries on a full disk), `monitor/first-start`, `keys/monitor.anchor`. A log that does not
+  verify, was cut short or is missing makes the monitor `down` (the daemon still starts; `loom monitor` says why).
+  The first start begins every source at its end, so it raises nothing about history.
+- **New `[monitor]` keys:** `enabled` (default true), `mode` (`"shadow"`), `fleet_every_s` (default 300, at least 10),
+  `monitor_down` (`"pause_real_targets"` or `"notify"`; M3 applies it).
+- **New routes** (additive): `GET /api/monitor`, `GET /api/missions/{id}/monitor?after=&limit=&quiet=`,
+  `GET /api/monitor/reviews/{review}/input` (`404` until M6); `StatusView.monitor` (`#[serde(default)]`).
+- **New commands:** `loom monitor [status]`, `loom monitor log <mission|session> [--json] [--since] [--all] [-n]` and
+  `loom monitor replay [--since] [--positives FILE] [--home DIR] [--no-journal-key] [--json]`: the tripwires over a home's
+  history through the real cursors, read-only, reporting per-tripwire hits, precision and recall against known positives,
+  would-be pauses per 100 active hours and the fleet joins.
+- `loom_core::journal::hmac_sha256_hex` and `load_existing_key`; `Authorization::build` replaces the M0 stub `for_mission`;
+  `tripwire::Hit` gains `key`, `at_ms`, `basis`, `precision` and `from_s1` (all `#[serde(default)]`).
+- Deferred to later phases and said so in `docs/MONITOR.md` §2.1, §6.2 and in the CONTRACT of `monitor/engine.rs`: inline
+  (pre-call) tripwires and the gate (M8), provenance of a credential toward its asset (M8), the canaries' placement (M10),
+  gzip runs (M6), fold snapshots, `POST /api/monitor/replay` (the replay runs in the CLI).
+
 ### Monitor M1: model lineage, recipients and reviewer eligibility
 
 - **New profile keys** (all optional): `[models.<p>] family` (a list), `alignment` (`stock`, `relaxed`, `unknown`), `recipient`

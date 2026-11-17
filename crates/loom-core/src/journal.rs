@@ -463,6 +463,14 @@ fn new_mac(key: &[u8]) -> std::io::Result<HmacSha256> {
     HmacSha256::new_from_slice(key).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))
 }
 
+/// Lowercase hex HMAC-SHA256 of `data` under `key` (the monitor log's seal; `docs/MONITOR.md` section 7.3). `Err` only for a
+/// key the MAC cannot take, which no 32-byte key file is.
+pub fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> std::io::Result<String> {
+    let mut m = new_mac(key)?;
+    m.update(data);
+    Ok(hex::encode(m.finalize().into_bytes()))
+}
+
 fn mac_hex(key: &[u8], prev_mac: &str, body: &[u8]) -> std::io::Result<String> {
     let mut m = new_mac(key)?;
     m.update(prev_mac.as_bytes());
@@ -588,6 +596,11 @@ fn verify_all(key: &[u8], bytes: &[u8]) -> Result<Loaded, JournalError> {
     }
     loaded.last_mac = prev_mac;
     Ok(loaded)
+}
+
+/// The key stored at `path`, or `None` when the file is missing or does not hold a key. Never creates one.
+pub fn load_existing_key(path: &Path) -> Option<Vec<u8>> {
+    read_key(path).ok()
 }
 
 /// Load the journal key, creating it when missing. See the module contract.

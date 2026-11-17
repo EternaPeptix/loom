@@ -49,6 +49,8 @@ loom config init                          # writes ~/.loom/config.toml
 $EDITOR ~/.loom/config.toml               # set base_url and model for your server
 loom config check                         # prints each profile's lineage, then "ok", or what is wrong
 loom models show [profile]                # each profile's family, alignment, recipient and who reviews it
+loom monitor                              # the watcher in shadow: what its tripwires have found (changes nothing for an agent)
+loom monitor replay --home /path/to/copy  # the tripwires over a home's history, read-only
 loom up                                   # start the daemon in the background
 loom status                               # the daemon, ✓ or ✗ for your model server, what is running
 loom run -w /path/to/workspace "your task in one sentence"

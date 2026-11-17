@@ -35,6 +35,19 @@ pub struct StatusView {
     /// `null` from a daemon that predates it.
     #[serde(default)]
     pub egress: Option<loom_agent::egress::EgressView>,
+    /// What the monitor says in a word, from `GET /api/monitor`'s `MonitorStatus`; `null` when `[monitor] enabled =
+    /// false` or from a daemon that predates it.
+    #[serde(default)]
+    pub monitor: Option<MonitorBrief>,
+}
+
+/// The monitor in one line of `loom status`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MonitorBrief {
+    /// `shadow`, `degraded` or `down`.
+    pub state: String,
+    pub open_flags: u64,
+    pub egress_unbounded: bool,
 }
 
 /// Free space below which `loom status` warns that sessions will soon fail to write: 5 GiB, or 5 percent of the

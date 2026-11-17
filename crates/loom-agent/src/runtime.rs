@@ -463,6 +463,17 @@
 //!   Archived sessions are listed only by `sessions(true)` and are not activated at start;
 //!   `send_message`/`resume` on one are refused (`This session is archived; unarchive it first.`).
 //!
+//! ## The monitor (`crate::monitor`, M2)
+//! `Runtime::start` builds one `Monitor` (unless `[monitor] enabled = false`) after the journal key and before `Inner` is
+//! built, from `Env::from_config` (the home, the packs, the `[network]` lists, the floor's infrastructure policy) and the
+//! journal key; its log folds there, before `load_known` and before any session is activated. A log that does not
+//! verify makes `Monitor::down(reason)`, which the daemon keeps (the status says "down" and why); the daemon starts
+//! either way. `Inner::on_record` and `Inner::on_status` call `Monitor::wake(session)` (never blocking, never dropping:
+//! the monitor reads the durable files by cursor); `run_census` gives it each census view and `record_egress` the
+//! egress level; `shutdown` stops its worker. The worker is spawned only outside `cfg(test)`; a test pumps it with
+//! `Runtime::monitor().pump_now(true)`. `Runtime::monitor_status()` and `monitor_log(mission, after, limit, quiet)` serve
+//! `GET /api/monitor` and `GET /api/missions/{id}/monitor`. In M2 the monitor changes nothing a session can see.
+//!
 //! ## Start (`Runtime::start`)
 //! 1. `config.check()`; create the directories; load packs (`Packs::load(paths.packs_dir())`) and
 //!    check every role's tools against `Registry::builtin().names()` plus `rtools::NAMES`; journal
@@ -923,7 +934,7 @@ pub struct ScopeRevokeReceipt {
 
 /// The infrastructure the daemon knows about, for the implicit deny of every command policy (E1): its own
 /// port, the `host:port` of every model endpoint, the box's Docker host and `network.infrastructure`.
-fn infra_spec(config: &Config) -> InfraSpec {
+pub(crate) fn infra_spec(config: &Config) -> InfraSpec {
     let model_endpoints = config.models.values().filter_map(|m| endpoint_of(&m.base_url)).collect::<BTreeSet<_>>();
     let ssh = config.boxed.ssh_host.trim();
     let mut docker_hosts = Vec::new();
@@ -971,7 +982,7 @@ fn infra_spec_resolved(config: &Config, res: &crate::infra::Resolution) -> Infra
 }
 
 /// A policy of the daemon's infrastructure alone, which the floor's veto asks (`crate::floor`).
-fn infra_policy(config: &Config, res: &crate::infra::Resolution) -> Result<Policy, String> {
+pub(crate) fn infra_policy(config: &Config, res: &crate::infra::Resolution) -> Result<Policy, String> {
     Policy::new(&loom_core::config::NetworkCfg::default())
         .and_then(|p| p.with_infrastructure(&infra_spec_resolved(config, res)))
 }
@@ -1637,6 +1648,9 @@ struct Inner {
     census_blind_told: AtomicBool,
     /// The proxy's veto, canary hooks and lab-listener check (`crate::floor`, E4).
     floor: crate::floor::Floor,
+    /// The adversarial monitor in shadow (`crate::monitor`, M2): `None` when `[monitor] enabled = false`; a handle
+    /// that says "down" when its log did not fold or verify.
+    monitor: Option<crate::monitor::Monitor>,
     /// The missions whose box counters could not be read at the last poll and the operator's log was told so,
     /// until a poll works again (`poll_box_counters`).
     box_counters_failed: Mutex<BTreeSet<MissionId>>,
@@ -1683,6 +1697,9 @@ impl Inner {
         let home = self.paths.home.clone();
         let confined = self.census_confined();
         let view = tokio::task::spawn_blocking(move || crate::census::take(&home, &members, confined)).await.ok()?;
+        if let Some(m) = &self.monitor {
+            m.census(&view);
+        }
         let lines = {
             let mut told = self.census_told.lock().unwrap_or_else(|p| p.into_inner());
             crate::census::tell(&mut told, &view, &ended)
@@ -1804,6 +1821,9 @@ impl Inner {
             }
         }
         let level = view.level;
+        if let Some(m) = &self.monitor {
+            m.egress(level == crate::egress::Level::Unbounded);
+        }
         let view_problem = view.probe_problem && level == crate::egress::Level::Unbounded;
         for reason in &view.reasons {
             tracing::warn!("Egress is {level:?}: {reason}");
@@ -2455,10 +2475,16 @@ impl Inner {
                 self.repeat_notice(&kind, session, &title, &item);
             }
         }
+        if let Some(m) = &self.monitor {
+            m.wake(Some(session));
+        }
         self.publish(BusEvent::Record { session: session.clone(), record: Box::new(record.clone()) });
     }
 
     fn on_status(&self, session: &SessionId, status: &Status) {
+        if let Some(m) = &self.monitor {
+            m.wake(Some(session));
+        }
         let held: Vec<SessionId> = {
             let mut st = self.st();
             let started = match st.known.get_mut(session) {
@@ -4395,6 +4421,25 @@ impl Runtime {
         let key = journal::load_or_create_key(&paths.journal_key())
             .map_err(|e| format!("cannot read or create the journal key {}: {e}", paths.journal_key().display()))?;
         let blobs = BlobStore::open(paths.blobs_dir()).map_err(|e| format!("cannot open the blob store: {e}"))?;
+        // The monitor folds its log before any session is activated (I9). A log that does not verify leaves a monitor
+        // that says so; it never stops the daemon, and it never lifts a pause (M3 holds the missions).
+        let monitor = if config.monitor.enabled {
+            let env = crate::monitor::engine::Env::from_config(
+                &config,
+                &paths,
+                &packs,
+                infra_policy(&config, &resolution).ok().map(Arc::new),
+            );
+            match crate::monitor::Monitor::start(&paths, &config.monitor, env, Some(key.clone())) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    tracing::error!("The monitor is down: {e}");
+                    Some(crate::monitor::Monitor::down(&paths, &config.monitor, e.to_string()))
+                }
+            }
+        } else {
+            None
+        };
         let mut profiles = BTreeMap::new();
         for (name, profile) in &config.models {
             let client = ModelClient::new(name, profile.clone(), &paths.model_keys_dir()).map_err(|e| e.to_string())?;
@@ -4463,6 +4508,7 @@ impl Runtime {
             census_told: Mutex::new(crate::census::Told::new()),
             census_blind_told: AtomicBool::new(false),
             floor: crate::floor::Floor::new(floor_policy),
+            monitor,
             box_counters_failed: Mutex::new(BTreeSet::new()),
         });
 
@@ -4593,6 +4639,12 @@ impl Runtime {
             inner.st().tasks.push(census);
         }
 
+        // The monitor's worker. Not under test: a test runtime pumps the monitor itself, when it wants to.
+        #[cfg(not(test))]
+        if let Some(m) = &inner.monitor {
+            let worker = m.spawn();
+            inner.st().tasks.push(worker);
+        }
         inner.load_known();
         let mut restored: Vec<SessionId> = Vec::new();
         // The flag marks a session that is wanted only for a job (its turn yielded while the job ran,
@@ -4715,6 +4767,31 @@ impl Runtime {
     /// (`crate::egress`), `Unprobed` until the first one finishes.
     pub fn egress(&self) -> crate::egress::EgressView {
         self.inner.egress.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The monitor's status (`GET /api/monitor`); `None` when `[monitor] enabled = false`.
+    pub fn monitor_status(&self) -> Option<crate::monitor::core::MonitorStatus> {
+        self.inner.monitor.as_ref().map(|m| m.status())
+    }
+
+    /// A page of the monitor log, optionally the entries about one mission (`GET /api/missions/{id}/monitor`).
+    pub fn monitor_log(
+        &self,
+        mission: Option<&MissionId>,
+        after: u64,
+        limit: usize,
+        quiet: bool,
+    ) -> Result<crate::monitor::LogPage, String> {
+        let Some(m) = self.inner.monitor.as_ref() else {
+            return Err("The monitor is off ([monitor] enabled = false), so there is no log. Set enabled = true and restart the daemon.".into());
+        };
+        m.entries(&crate::monitor::LogFilter { mission: mission.cloned(), after, limit, quiet })
+            .map_err(|e| e.to_string())
+    }
+
+    /// The monitor handle, for the tests of this crate and the daemon's replay.
+    pub fn monitor(&self) -> Option<crate::monitor::Monitor> {
+        self.inner.monitor.clone()
     }
 
     /// The last process and listener census (`crate::census`), `None` until the first one has finished.
@@ -5842,6 +5919,9 @@ impl Runtime {
             }
             (actives, std::mem::take(&mut st.tasks))
         };
+        if let Some(m) = &inner.monitor {
+            m.shutdown();
+        }
         let grace = Duration::from_secs(inner.config.tools.kill_grace_s);
         let mut tasks = Vec::new();
         let mut jobs = Vec::new();

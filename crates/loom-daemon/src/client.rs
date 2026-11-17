@@ -547,6 +547,23 @@ impl Client {
         self.call(Method::GET, &format!("/api/sessions/{}/net", segment(id.as_str())), &query, None).await
     }
 
+    /// The monitor's status (`GET /api/monitor`).
+    pub async fn monitor_status(&self) -> Result<loom_agent::monitor::core::MonitorStatus, String> {
+        self.call(Method::GET, "/api/monitor", &[], None).await
+    }
+
+    /// The monitor-log entries about a mission (`GET /api/missions/{id}/monitor`).
+    pub async fn monitor_log(
+        &self,
+        mission: &MissionId,
+        after: u64,
+        limit: usize,
+        quiet: bool,
+    ) -> Result<loom_agent::monitor::LogPage, String> {
+        let query = [("after", after.to_string()), ("limit", limit.to_string()), ("quiet", quiet.to_string())];
+        self.call(Method::GET, &format!("/api/missions/{}/monitor", segment(mission.as_str())), &query, None).await
+    }
+
     pub async fn missions(&self) -> Result<Vec<MissionInfo>, String> {
         self.call(Method::GET, "/api/missions", &[], None).await
     }
@@ -928,6 +945,7 @@ mod tests {
             sessions_running: 1,
             inbox_open: 0,
             egress: None,
+            monitor: None,
         }
     }
 

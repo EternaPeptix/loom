@@ -13,7 +13,7 @@
 //! - [`session`] one session: its log, its step loop, and its reactions to what happens to it
 //! - [`runtime`] every session of a loom home: starting, restoring, parents and children, the operator's actions
 //! - [`monitor`] the adversarial monitor: tripwires, reviewer, gate, durable pause, keep going (specified in
-//!   `docs/MONITOR.md`; phase P0 has the contracts and vocabulary only, and nothing calls it)
+//!   `docs/MONITOR.md`; phase M2 watches every record in shadow and changes nothing an agent can see)
 //! - [`evalkit`] scripted models played against the runtime, and the scorecard of each run
 
 pub mod census;

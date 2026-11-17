@@ -55,6 +55,9 @@
 //! | `POST /sessions/{id}/resume` | `runtime.resume` | `202` `{}` |
 //! | `POST /sessions/{id}/reweave` | `runtime.reweave` | `202` `{}` |
 //! | `POST /sessions/{id}/archive` (`ArchiveBody`) | `runtime.archive` | `200` `{}` |
+//! | `GET /monitor` | `runtime.monitor_status()`: the monitor in shadow (M2): state (`shadow`, `degraded`, `down`), open flags, the pauses and halts folded from its log, the counts it has read, every tripwire with how often it fired by severity, the faults of its sources (`404` when `[monitor] enabled = false`) | `MonitorStatus` |
+//! | `GET /missions/{id}/monitor?after={seq}&limit={n}&quiet={bool}` | `runtime.monitor_log`: the monitor-log entries about the mission (tripwire hits, flags, responses, pauses; `quiet` leaves out `cursor` and `heartbeat`, default true; `limit` default 200, at most 2000) | `{entries, next_after}` |
+//! | `GET /monitor/reviews/{review}/input` | the exact rendered input of a review; `404` until M6 (no review exists) | `text/plain` |
 //! | `GET /census` | `runtime.census()`: the last process and listener census of the sessions, found by sandbox identity (`null` until the first has finished; `?now=true` takes one first) | `CensusView` or `null` |
 //! | `POST /sessions/{id}/census/kill` | `runtime.census_kill`: SIGSTOP then SIGKILL of every process the census finds for the session (`404` for an id that is not a session) | `200` `Killed` (`rounds`, `killed`, `left`) |
 //! | `GET /sessions/{id}/window` | `runtime.window` | `WindowView` |
@@ -176,6 +179,8 @@ const RECORDS_DEFAULT: usize = 500;
 const RECORDS_MAX: usize = 2_000;
 const NET_DEFAULT: usize = 200;
 const NET_MAX: usize = 2_000;
+const MONITOR_LOG_DEFAULT: usize = 200;
+const MONITOR_LOG_MAX: usize = 2_000;
 const LINES_DEFAULT_END: u64 = 2_000;
 const LINES_MAX: u64 = 5_000;
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
@@ -209,6 +214,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/resume", post(resume))
         .route("/api/sessions/{id}/reweave", post(reweave))
         .route("/api/sessions/{id}/archive", post(archive))
+        .route("/api/monitor", get(monitor_status))
+        .route("/api/missions/{id}/monitor", get(monitor_log))
+        .route("/api/monitor/reviews/{review}/input", get(monitor_review_input))
         .route("/api/census", get(census))
         .route("/api/sessions/{id}/census/kill", post(census_kill))
         .route("/api/sessions/{id}/window", get(window))
@@ -559,6 +567,11 @@ async fn status(State(s): State<ApiState>) -> Json<StatusView> {
         sessions_running: sessions.iter().filter(|i| i.status.phase == Phase::Running).count(),
         inbox_open,
         egress: Some(s.runtime.egress()),
+        monitor: s.runtime.monitor_status().map(|m| crate::wire::MonitorBrief {
+            state: m.state,
+            open_flags: m.open_flags,
+            egress_unbounded: m.egress_unbounded,
+        }),
     })
 }
 
@@ -678,6 +691,38 @@ async fn release(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes)
     let body: ReleaseBody = json_body(&body)?;
     let receipt = s.runtime.release(&SessionId::from(id), &body.reason).await.map_err(rt_err)?;
     Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
+}
+
+/// `GET /api/monitor`: the monitor's status. `404` with a sentence when `[monitor] enabled = false`.
+async fn monitor_status(State(s): State<ApiState>) -> Res<Response> {
+    match s.runtime.monitor_status() {
+        Some(m) => Ok(Json(m).into_response()),
+        None => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "The monitor is off ([monitor] enabled = false). Set enabled = true and restart the daemon.".to_string(),
+        )),
+    }
+}
+
+/// `GET /api/missions/{id}/monitor?after=&limit=`: the monitor-log entries about one mission, as `{entries, next_after}`.
+async fn monitor_log(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery) -> Res<Response> {
+    let p = params(q)?;
+    let after = number(&p, "after")?.unwrap_or(0);
+    let limit = clamp_limit(number(&p, "limit")?, MONITOR_LOG_DEFAULT, MONITOR_LOG_MAX);
+    let mission = MissionId::from(id);
+    let quiet = flag(&p, "quiet")?.unwrap_or(true);
+    let page = s.runtime.monitor_log(Some(&mission), after, limit, quiet).map_err(rt_err)?;
+    Ok(Json(page).into_response())
+}
+
+/// `GET /api/monitor/reviews/{review}/input`: the exact input of a review. No review exists before M6.
+async fn monitor_review_input(Path(review): Path<String>) -> Res<Response> {
+    Err(ApiError::new(
+        StatusCode::NOT_FOUND,
+        format!(
+            "There is no review {review}: the monitor does not run reviews yet (phase M6), so no review input exists."
+        ),
+    ))
 }
 
 async fn census(State(s): State<ApiState>, q: RawQuery) -> Res<Response> {
@@ -1838,6 +1883,37 @@ mod tests {
             assert_eq!(s, 404, "{bad}: {b}");
             assert!(b["error"].as_str().unwrap().starts_with("There is no mission"), "{b}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_monitor_routes_show_the_shadow_monitor_and_its_log() {
+        let e = env(lead_script(json!({"question": "CHILDMARK find it"}))).await;
+        let id = e.create("go").await;
+        e.wait_turn_ends(&id, 1).await;
+        let monitor = e.rt.monitor().expect("the monitor is on by default");
+        monitor.pump_now(true);
+        let (s, b) = e.get("/api/monitor").await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!(
+            (b["state"].clone(), b["mode"].clone(), b["enabled"].clone()),
+            (json!("shadow"), json!("shadow"), json!(true))
+        );
+        assert!(b["sources"].as_u64().unwrap_or(0) >= 1, "{b}");
+        assert_eq!(b["tripwires"].as_array().map(Vec::len), Some(28));
+        assert!(b["counts"]["records"].as_u64().unwrap_or(0) > 0, "{b}");
+        let (s, st) = e.get("/api/status").await;
+        assert_eq!((s, st["monitor"]["state"].clone()), (200, json!("shadow")));
+        // The log of a mission: nothing was found about an honest session, so the page is empty and complete.
+        let (_, detail) = e.get(&format!("/api/sessions/{id}")).await;
+        let mission = detail["session"]["mission"].as_str().unwrap_or("").to_string();
+        let (s, b) = e.get(&format!("/api/missions/{mission}/monitor?limit=10")).await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!((b["entries"].clone(), b["next_after"].clone()), (json!([]), json!(null)));
+        let (s, b) = e.get(&format!("/api/missions/{mission}/monitor?limit=x")).await;
+        assert_eq!(s, 400, "{b}");
+        let (s, b) = e.get("/api/monitor/reviews/r-1/input").await;
+        assert_eq!(s, 404, "{b}");
+        assert!(b["error"].as_str().unwrap_or("").contains("M6"), "{b}");
     }
 
     #[tokio::test]

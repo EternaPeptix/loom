@@ -35,6 +35,12 @@
 //!   means the call is refused, the hold atomic is set and the responder is signalled (§4.5). Until built it returns
 //!   `NotBuilt`, which the session treats as "no monitor" (P0: it is never called).
 //!
+//! - M2 built the functions as cursor tripwires over the durable records: they are `engine::Engine` (what each reads and
+//!   where it stops is that module's CONTRACT) and run in shadow, so every hit is recorded with `state: shadow`. A `Hit`
+//!   also carries the key flags dedupe on (`key`), the time of its record (`at_ms`), its `basis`, whether it is a part of
+//!   the §4.8 precision list (`precision`) and whether it was S1 before the aggregation of §1.5 raised it (`from_s1`).
+//!   `inline_check` (before the call runs) is M8 and still returns `NotBuilt`.
+//!
 //! Built by: M2 (the functions, shadow), M4 (the precision list enforcing, promotion), M8 (inline refusal).
 //!
 //! Tests required (M2): a positive and a negative fixture per tripwire from the negative controls of §8.2; the
@@ -63,6 +69,11 @@ impl TripwireId {
 
     pub fn number(self) -> u8 {
         self.0
+    }
+
+    /// The tripwire `n`, with a number outside 1..=28 read as the nearest one (a table index cannot be out of range).
+    pub fn of(n: u8) -> TripwireId {
+        TripwireId(n.clamp(1, Self::COUNT))
     }
 
     pub fn parse(s: &str) -> Option<TripwireId> {
@@ -222,6 +233,21 @@ pub struct Hit {
     pub severity: Severity,
     /// For the operator only; never shown to the agent.
     pub detail: String,
+    /// What the hit is about (a host, a path, a pattern name): the dedupe key of flags and the S1 aggregation target.
+    #[serde(default)]
+    pub key: String,
+    /// The time of the record the hit rests on.
+    #[serde(default)]
+    pub at_ms: u64,
+    /// Whether the concern rests on an action or on reasoning alone (`Severity::assess` has applied the cap).
+    #[serde(default)]
+    pub basis: crate::monitor::taxonomy::Basis,
+    /// This hit is one of the parts of §4.8's precision list (it would enforce from M4 on).
+    #[serde(default)]
+    pub precision: bool,
+    /// The severity was S1 before the S1 aggregation made it S2.
+    #[serde(default)]
+    pub from_s1: bool,
 }
 
 /// The call about to run, as the inline tripwires see it.

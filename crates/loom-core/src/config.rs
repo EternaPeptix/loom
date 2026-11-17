@@ -63,7 +63,9 @@
 //! `recipient` (`"local"`, `"lan"` or a provider name) and `purpose = "review"`; what unset ones resolve to is
 //! `lineage::resolve`. `[monitor]` accepts `reviewers` (profile names, in preference order), `tripwires_only_profiles`,
 //! `recipients` (per pack: the recipients the operator consents to), `content.new_recipient_real_targets`
-//! (`"features"` default, or `"redacted"`) and `known_families`; later phases add the other keys of the monitor.
+//! (`"features"` default, or `"redacted"`) and `known_families`; M2 adds `enabled` (default true; false builds no monitor),
+//! `mode` (`"shadow"`, the only value until M4), `fleet_every_s` (default 300, at least 10) and `monitor_down`
+//! (`"pause_real_targets"` default, or `"notify"`); later phases add the other keys of the monitor.
 //! `Config::check` refuses, each with a sentence that names the key and the fix: an empty `family` list or a family
 //! outside `lineage::FAMILIES` and `known_families`; an empty `recipient`; a `reviewers` or `tripwires_only_profiles`
 //! entry that is not a configured profile; a profile twice in `reviewers`; a reviewer whose alignment resolves to
@@ -145,11 +147,39 @@ pub struct MonitorContentCfg {
     pub new_recipient_real_targets: RecipientContent,
 }
 
-/// `[monitor]`: the model policy (`docs/MONITOR.md` section 2.6). The later phases add keys; until then the daemon
-/// rejects them as unknown keys.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+/// What the monitor does when its own log is unwritable or its fold failed (`docs/MONITOR.md` section 2.8).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorDown {
+    /// Missions with non-lab grants or relaxed agents are paused (M3 applies it); the default.
+    #[default]
+    PauseRealTargets,
+    /// Only the operator is told.
+    Notify,
+}
+
+/// The monitor's starting state of its causes (`docs/MONITOR.md` section 4.8). Only `shadow` exists until M4.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorMode {
+    /// Every cause is recorded and shown as "would have paused", with no effect an agent can see.
+    #[default]
+    Shadow,
+}
+
+/// `[monitor]`: the model policy (M1) and the watcher's own settings (M2). The later phases add keys; until then the
+/// daemon rejects them as unknown keys.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MonitorCfg {
+    /// Duty W: the tripwires run on every record of every session. `false` builds no monitor at all.
+    pub enabled: bool,
+    /// The starting state of the causes.
+    pub mode: MonitorMode,
+    /// Seconds between the fleet joins (FS-1 to FS-10).
+    pub fleet_every_s: u64,
+    /// What a down monitor does to the missions it can no longer watch.
+    pub monitor_down: MonitorDown,
     /// Review profiles in preference order: the first one eligible for a mission reviews it.
     pub reviewers: Vec<String>,
     /// Profiles that have no eligible reviewer on purpose; their missions are shown as "not LLM-reviewed".
@@ -159,6 +189,22 @@ pub struct MonitorCfg {
     pub content: MonitorContentCfg,
     /// Family names beyond the ones loom infers (`lineage::FAMILIES`) that a `family` key may use.
     pub known_families: Vec<String>,
+}
+
+impl Default for MonitorCfg {
+    fn default() -> Self {
+        MonitorCfg {
+            enabled: true,
+            mode: MonitorMode::Shadow,
+            fleet_every_s: 300,
+            monitor_down: MonitorDown::PauseRealTargets,
+            reviewers: Vec::new(),
+            tripwires_only_profiles: Vec::new(),
+            recipients: BTreeMap::new(),
+            content: MonitorContentCfg::default(),
+            known_families: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -946,6 +992,12 @@ impl Config {
     /// `[monitor]`: every profile it names exists, a reviewer is not relaxed, consents name a recipient.
     fn check_monitor(&self) -> Result<(), String> {
         let m = &self.monitor;
+        if m.fleet_every_s < 10 {
+            return Err(format!(
+                "monitor.fleet_every_s is {}. The fleet joins are not run more often than every 10 seconds: set 10 or more (default 300).",
+                m.fleet_every_s
+            ));
+        }
         let known = |p: &str| -> Result<(), String> {
             self.models.get(p).map(|_| ()).ok_or_else(|| {
                 let names: Vec<&str> = self.models.keys().map(String::as_str).collect();
