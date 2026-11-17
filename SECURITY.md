@@ -105,11 +105,18 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   local processes. Commands cannot connect to the daemon's own port, whatever you allow on loopback, so a
   `loom open` login code (which is no longer on any command line) could not be redeemed from inside the sandbox directly (the
   proxy, which refuses loopback addresses, could reach it only if you list loopback in `allow_private` or
-  grant a loopback address). Under `deny_all` commands also cannot reach the macOS services that fetch a
-  URL for a process (`com.apple.trustd.agent`, `com.apple.trustd`, `com.apple.ocspd`,
+  grant a loopback address). In every network mode commands also cannot reach the macOS services that fetch
+  a URL for a process (`com.apple.trustd.agent`, `com.apple.trustd`, `com.apple.ocspd`,
   `com.apple.nsurlsessiond`, WebKit's networking services); programs that check certificates through macOS
   (Swift and Go programs, `security`, `codesign --verify`), background URL sessions and WebKit-based tools
-  then fail, while curl and Python, which use their own certificate files, work.
+  then fail, while curl and Python, which use their own certificate files, work. `mach-lookup` is denied by
+  default and a short list of services is allowed (what the usual toolchains need; `sandbox.mach_allow` adds
+  one that a tool needs), so the keychain and security daemons, Spotlight (`mdfind`), the clipboard, audio and
+  the rest are out of reach too. At start and every hour the daemon runs a self-probe of this (a certificate
+  that names a URL, a background URL session, a WebKit view, and the daemon's port with a decoy process whose
+  argument vector is readable) against a local listener; `loom status` and the web header say
+  `egress: bounded`, or `UNBOUNDED` with the reason when a probe got through, could not run, or
+  `sandbox.allow_fetch_services` is set.
 - **Git cannot be made to run code as you.** Anywhere commands can write (workspace, temporary
   directory, `extra_writable`), they cannot write Git configuration, hooks or the `commondir`/`gitdir`
   pointers — of the repository, of linked worktrees (also ones checked out outside the workspace) and of
@@ -308,12 +315,16 @@ These are the places where loom does less than the text above might suggest.
 - **A command can talk to anything on loopback that you allow** (`loopback_ports`, `loopback_all`,
   `unix_sockets`), including services that run as you. With `loopback_all` that includes your
   machine's own network addresses, which the macOS sandbox counts as loopback.
-- **Outside `deny_all`, macOS fetches URLs for a command.** In `allowlist` and `open` modes a command
-  can have the certificate service (`trustd`) fetch a URL named in a certificate it made, or start a
-  background URL session (`nsurlsessiond`) or a WebKit view, which reach any host without the proxy and
-  without an entry in the network audit file. Under `deny_all` the sandbox denies those services. Other
-  system services that make network requests on a process's behalf are not denied in any mode: the
-  profile allows local inter-process communication in general.
+- **macOS fetches URLs for a command only if you allow it.** A command could have the certificate service
+  (`trustd`) fetch a URL named in a certificate it made, or start a background URL session
+  (`nsurlsessiond`) or a WebKit view, which reach any host without the proxy and without an entry in the
+  network audit file. The sandbox denies those services in every network mode and denies `mach-lookup` for
+  every service outside a short list, so other services that make network requests on a process's behalf
+  are out of reach as well (name resolution goes to a socket the network deny already refuses).
+  `sandbox.allow_fetch_services = true` opens the route again and marks the daemon's egress "unbounded"
+  (status, and keep-going refuses to turn on). The self-probe's controls fetch only from a loopback
+  listener of the probe's own. What the probe cannot see: a route that exists on a host whose services do not
+  fetch for a sandboxed command when the probe runs (the probe then says so) and any service in the allowed list.
 - **Git residuals.** Any directory in a writable root that has no `.git` of its own, your existing
   subdirectories included, can be turned into a repository (a `HEAD`, `objects`, `refs` and `config`),
   and Git runs its configuration if you run Git inside that directory. Set

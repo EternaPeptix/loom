@@ -108,10 +108,10 @@
 //!     `read_only`, `extra_writable` is retained as internal
 //!     replay-untrusted metadata before its grants are emptied, and the
 //!     workspace is added to `protected_paths`; every model profile's `api_key_env` name is added to
-//!     `secret_env`, so commands never see it. `Runtime::start` sets `config.sandbox.network_deny_all` to
-//!     whether `network.mode` is `deny_all` before anything is built from the configuration, so every
-//!     sandbox it makes (sessions, agents' copies, judges) has it; `daemon_port` is whatever the caller set
-//!     (the daemon's port; `None` without one).
+//!     `secret_env`, so commands never see it. The fetch-service deny and the `mach-lookup` default-deny are in
+//!     every sandbox it makes (sessions, agents' copies, judges), in every `network.mode`, unless the
+//!     configuration says `sandbox.allow_fetch_services` (`docs/MONITOR.md` §2.2, E2); `daemon_port` is whatever
+//!     the caller set (the daemon's port; `None` without one).
 //!   - `env`: the session's proxy grant (`proxy.grant(id, policy)`), `env()`. The policy is
 //!     `Policy::with_hosts(&config.network, granted)`, `granted` being the hosts the operator authorized
 //!     for the mission (`grant_scope`): the ledger's `granted_hosts()` and those granted since the daemon
@@ -1570,12 +1570,49 @@ struct Inner {
     box_host: Option<Arc<DockerHost>>,
     /// What the daemon resolved about its infrastructure (`crate::infra`), for every session's policy.
     infra: Mutex<crate::infra::Resolution>,
+    /// Whether commands can reach the network outside the proxy, as the last self-probe found it (`crate::egress`).
+    egress: Mutex<crate::egress::EgressView>,
+    /// The operator was told that egress is unbounded, and it has not been bounded since.
+    egress_told: AtomicBool,
 }
 
 impl Inner {
     /// The last resolution of the infrastructure names and this machine's addresses.
     fn infra(&self) -> crate::infra::Resolution {
         self.infra.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Take a self-probe's report (`crate::egress`): keep the view, write the report to `<home>/egress-probe.json`
+    /// and, when egress turned unbounded, tell the operator once (again only after it was bounded).
+    fn record_egress(&self, report: Option<loom_tools::sandbox::selfprobe::Report>) {
+        let now = loom_core::now_ms();
+        let view = crate::egress::assess(&self.config.sandbox, report.as_ref(), report.as_ref().map(|_| now));
+        if let Some(report) = &report {
+            let body = serde_json::json!({ "at_ms": now, "view": view, "report": report });
+            let path = self.paths.home.join("egress-probe.json");
+            let tmp = self.paths.home.join("egress-probe.json.tmp");
+            let written = serde_json::to_vec_pretty(&body)
+                .map_err(|e| e.to_string())
+                .and_then(|b| std::fs::write(&tmp, b).map_err(|e| e.to_string()))
+                .and_then(|()| std::fs::rename(&tmp, &path).map_err(|e| e.to_string()));
+            if let Err(e) = written {
+                tracing::warn!("The self-probe's result could not be written to {}: {e}", path.display());
+            }
+        }
+        let level = view.level;
+        for reason in &view.reasons {
+            tracing::warn!("Egress is {level:?}: {reason}");
+        }
+        *self.egress.lock().unwrap_or_else(|p| p.into_inner()) = view;
+        match level {
+            crate::egress::Level::Unbounded => {
+                if !self.egress_told.swap(true, Ordering::SeqCst) {
+                    self.notify("egress", &SessionId::from(""), "Egress is unbounded", crate::egress::UNBOUNDED_NOTICE);
+                }
+            }
+            crate::egress::Level::Bounded => self.egress_told.store(false, Ordering::SeqCst),
+            crate::egress::Level::Unprobed => {}
+        }
     }
 }
 
@@ -4094,8 +4131,6 @@ pub struct Runtime {
 impl Runtime {
     /// Bring the runtime up over `paths` and restore what was running. See *Start*.
     pub async fn start(mut config: Config, paths: Paths) -> Result<Runtime, String> {
-        // Every sandbox made from the configuration (sessions, agents' copies, judges) carries this.
-        config.sandbox.network_deny_all = config.network.mode == NetworkMode::DenyAll;
         // The loopback ports of infrastructure that no command may reach, whatever loopback it is allowed.
         config.sandbox.infra_ports = crate::infra::loopback_ports(&config);
         config.check().map_err(|e| e.to_string())?;
@@ -4150,6 +4185,8 @@ impl Runtime {
         let proxy = Proxy::start_with(config.daemon.proxy_port, net_tx, Some(audit), Default::default())
             .await
             .map_err(|e| e.to_string())?;
+        // Until the first self-probe finishes (`crate::egress`).
+        let initial_egress = crate::egress::assess(&config.sandbox, None, None);
         let inner = Arc::new_cyclic(|me: &Weak<Inner>| Inner {
             me: me.clone(),
             config,
@@ -4172,6 +4209,8 @@ impl Runtime {
             pagers: Mutex::new(Vec::new()),
             box_host,
             infra: Mutex::new(resolution),
+            egress_told: AtomicBool::new(initial_egress.level == crate::egress::Level::Unbounded),
+            egress: Mutex::new(initial_egress),
         });
 
         let weak = Arc::downgrade(&inner);
@@ -4220,6 +4259,24 @@ impl Runtime {
                 }
             });
             inner.st().tasks.push(refresher);
+        }
+
+        // The self-probe of the sandbox (E2): at start and every `PROBE_EVERY`. Not under test: a test runtime
+        // must not run commands against the machine's services.
+        #[cfg(not(test))]
+        {
+            let weak = Arc::downgrade(&inner);
+            let (cfg, home) = (inner.config.sandbox.clone(), inner.paths.home.clone());
+            let prober = tokio::spawn(async move {
+                loop {
+                    let report = crate::egress::probe(cfg.clone(), home.clone()).await;
+                    let Some(inner) = weak.upgrade() else { return };
+                    inner.record_egress(Some(report));
+                    drop(inner);
+                    tokio::time::sleep(crate::egress::PROBE_EVERY).await;
+                }
+            });
+            inner.st().tasks.push(prober);
         }
 
         inner.load_known();
@@ -4341,6 +4398,17 @@ impl Runtime {
     }
 
     /// Port of the egress proxy on 127.0.0.1.
+    /// Whether a sandboxed command can reach the network outside the egress proxy: the last self-probe's view
+    /// (`crate::egress`), `Unprobed` until the first one finishes.
+    pub fn egress(&self) -> crate::egress::EgressView {
+        self.inner.egress.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Take a self-probe report as the probe loop does (tests, and a caller that probed by other means).
+    pub fn record_egress_probe(&self, report: loom_tools::sandbox::selfprobe::Report) {
+        self.inner.record_egress(Some(report));
+    }
+
     pub fn proxy_port(&self) -> u16 {
         self.inner.proxy.port()
     }
@@ -8696,19 +8764,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_records_whether_the_network_is_deny_all_for_every_sandbox_it_makes() {
+    async fn egress_turns_unbounded_on_a_leak_the_operator_is_told_once_and_the_view_is_kept() {
+        use loom_tools::sandbox::selfprobe::{Outcome, Probe, ProbeResult, Report};
         let dir = tempfile::tempdir().unwrap();
         let server = MockServer::start(Script::new(|_, _| finish("ok"))).await.unwrap();
-        for (mode, deny_all) in [(NetworkMode::DenyAll, true), (NetworkMode::Open, false)] {
-            let mut config = config_for(&server, None);
-            config.network.mode = mode;
-            // The flag is the runtime's to set: whatever the caller passed is replaced.
-            config.sandbox.network_deny_all = !deny_all;
-            config.sandbox.daemon_port = Some(4242);
-            let rt = Runtime::start(config, Paths::at(dir.path().join(format!("home-{deny_all}")))).await.unwrap();
-            assert_eq!(rt.config().sandbox.network_deny_all, deny_all);
-            assert_eq!(rt.config().sandbox.daemon_port, Some(4242));
-            rt.shutdown().await;
+        let file = dir.path().join("notified");
+        let mut config = config_for(&server, Some(&file));
+        config.sandbox.mode = SandboxMode::Seatbelt;
+        let home = dir.path().join("home");
+        let rt = Runtime::start(config, Paths::at(&home)).await.unwrap();
+        let report = |outcome| Report {
+            ran: true,
+            results: Probe::ALL.iter().map(|p| ProbeResult { probe: *p, outcome, detail: "d".into() }).collect(),
+        };
+        // No probe has finished (the loop is not started under test): not probed, and keep-going waits.
+        assert_eq!(rt.egress().level, crate::egress::Level::Unprobed);
+        rt.record_egress_probe(report(Outcome::Held));
+        assert_eq!(rt.egress().level, crate::egress::Level::Bounded);
+        assert!(rt.egress().probed_at_ms.is_some());
+        let written = std::fs::read_to_string(home.join("egress-probe.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(json["view"]["level"], "bounded");
+        assert_eq!(json["report"]["results"].as_array().unwrap().len(), Probe::ALL.len());
+        assert!(!home.join("egress-probe.json.tmp").exists());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!file.exists(), "nothing to tell while bounded");
+        // A leak: unbounded, one notification, none for the next leak, one again after it was bounded.
+        rt.record_egress_probe(report(Outcome::Leaked));
+        assert_eq!(rt.egress().level, crate::egress::Level::Unbounded);
+        until("the notification", || file.exists() && std::fs::read_to_string(&file).unwrap().lines().count() == 1)
+            .await;
+        rt.record_egress_probe(report(Outcome::Failed));
+        rt.record_egress_probe(report(Outcome::Held));
+        assert_eq!(rt.egress().level, crate::egress::Level::Bounded);
+        rt.record_egress_probe(report(Outcome::Leaked));
+        until("the second notification", || std::fs::read_to_string(&file).unwrap().lines().count() == 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 2);
+        assert!(std::fs::read_to_string(&file).unwrap().lines().all(|l| l.starts_with("egress")));
+        rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn start_leaves_the_fetch_service_setting_as_configured_in_every_network_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start(Script::new(|_, _| finish("ok"))).await.unwrap();
+        for (i, mode) in [NetworkMode::DenyAll, NetworkMode::Allowlist, NetworkMode::Open].into_iter().enumerate() {
+            for allow in [false, true] {
+                let mut config = config_for(&server, None);
+                config.network.mode = mode;
+                config.sandbox.allow_fetch_services = allow;
+                config.sandbox.daemon_port = Some(4242);
+                let rt = Runtime::start(config, Paths::at(dir.path().join(format!("home-{i}-{allow}")))).await.unwrap();
+                assert_eq!(rt.config().sandbox.allow_fetch_services, allow);
+                assert_eq!(rt.config().sandbox.daemon_port, Some(4242));
+                rt.shutdown().await;
+            }
         }
     }
 

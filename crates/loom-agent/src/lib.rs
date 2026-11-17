@@ -15,6 +15,7 @@
 //! - [`evalkit`] scripted models played against the runtime, and the scorecard of each run
 
 pub mod continuation;
+pub mod egress;
 pub mod evalkit;
 pub mod frontier;
 pub mod gate;

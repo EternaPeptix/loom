@@ -31,6 +31,10 @@ pub struct StatusView {
     /// Sessions in the middle of a turn.
     pub sessions_running: usize,
     pub inbox_open: usize,
+    /// Whether sandboxed commands can reach the network outside the egress proxy, from the sandbox self-probe (E2);
+    /// `null` from a daemon that predates it.
+    #[serde(default)]
+    pub egress: Option<loom_agent::egress::EgressView>,
 }
 
 /// Free space below which `loom status` warns that sessions will soon fail to write: 5 GiB, or 5 percent of the

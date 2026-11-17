@@ -538,6 +538,18 @@ test("diskWarning: a sentence below 5 GiB or 5 percent free, null otherwise or w
   assert.equal(C.diskWarning({ free_bytes: 0, total_bytes: 0 }), null);
 });
 
+test("egressWarning: a sentence only when egress is unbounded", () => {
+  assert.equal(C.egressWarning(null), null);
+  assert.equal(C.egressWarning(undefined), null);
+  assert.equal(C.egressWarning({ level: "bounded", reasons: [] }), null);
+  assert.equal(C.egressWarning({ level: "unprobed", reasons: ["The first self-probe has not finished."] }), null);
+  const one = C.egressWarning({ level: "unbounded", reasons: ["sandbox.allow_fetch_services is set."] });
+  assert.match(one, /^Egress is unbounded: sandbox\.allow_fetch_services is set\. Commands may reach the network outside the egress proxy/);
+  assert.doesNotMatch(one, /more\)/);
+  assert.match(C.egressWarning({ level: "unbounded", reasons: ["a.", "b.", "c."] }), /a\. \(\+2 more\)/);
+  assert.match(C.egressWarning({ level: "unbounded" }), /self-probe in `loom status`/);
+});
+
 // ---- inbox ----
 
 test("inbox: records open and resolve items, blocking first, titles", () => {

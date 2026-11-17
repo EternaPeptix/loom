@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Monitor E2: fetch services denied in every network mode, `mach-lookup` default-deny, and the sandbox self-probe
+
+- **Commands cannot reach the macOS fetch services in any network mode.** `com.apple.trustd(.agent)`, `ocspd`,
+  `nsurlsessiond(.NSURLSessionProxyService)` and WebKit's XPC services were denied only under `deny_all`; they are now denied
+  under `allowlist` and `open` too (the last rule of the profile). Programs that check certificates through macOS
+  (`security verify-cert`, `codesign --verify`, Swift and Go programs), background URL sessions and WebKit-based tools fail
+  in those modes as they did under `deny_all`; Apple's curl, Python and OpenSSL are not affected (probed).
+  `SandboxCfg::network_deny_all` (never a configuration key) is removed: nothing reads `[network] mode` for this any more.
+- **`mach-lookup` is denied by default** with an allowlist of 17 services (`loom_core::config::MACH_LOOKUP_ALLOW`) found by
+  running bash, python3, node, git, curl, clang, swiftc, cargo, make, cmake, ssh, sqlite3, perl, ruby, java, codesign, lldb,
+  osascript and the usual utilities under `(deny mach-lookup)` until their output matched an unconfined run. The keychain
+  and security daemons, Spotlight (`mdfind`), the clipboard (`pbcopy`, `pbpaste`), audio, analytics, authorization and the
+  disk services are out of reach. A tool that needs one more: new `[sandbox] mach_allow = [...]` (exact names or a prefix
+  ending in `*`; refused when it would cover a fetch or disk service).
+- **`[sandbox] allow_fetch_services = true`** (new, default false) allows the fetch services again and marks egress unbounded.
+- **Sandbox self-probe** (`loom_tools::sandbox::selfprobe`): at start and every hour the daemon runs commands under its own
+  profile against local listeners: a certificate whose AIA URL names the listener, a background URL session and a
+  `WKWebView` made from `osascript -l JavaScript` (each with a control that proves the host fetches, else
+  `not_exercised`), the daemon's port with a decoy process whose argument vector holds a code, and a hook and Git
+  configuration write. Anything that arrives or lands, or a probe that cannot run, makes egress unbounded.
+- **Egress state** (`loom_agent::egress`): `Runtime::egress()`, `GET /api/status` field `egress` (`level`, `reasons`,
+  `basis`, `probes`, `probed_at_ms`; absent from older daemons), a line in `loom status` (`egress: bounded (…)` or
+  `egress: UNBOUNDED, <reason>`), a web banner when unbounded, `<home>/egress-probe.json` (the last probe) and one
+  `egress` notification when it turns unbounded. Keep-going will refuse while it is not bounded
+  (`EgressView::keep_going_blockers`). Nothing else is refused or stopped by it.
+
 ### Monitor E1: infrastructure deny and scope revoke
 
 - **Infrastructure no grant can reach.** Every command policy now refuses, before `deny`, any grant, `allow_private`

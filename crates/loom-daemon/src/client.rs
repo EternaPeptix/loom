@@ -927,6 +927,7 @@ mod tests {
             sessions_active: 1,
             sessions_running: 1,
             inbox_open: 0,
+            egress: None,
         }
     }
 

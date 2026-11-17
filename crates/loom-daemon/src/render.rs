@@ -84,7 +84,9 @@
 //!   {preview}`.
 //! - `status(view, style)`: the daemon line; the free space of the volume of the loom home (`{free}
 //!   GiB free of {total} GiB ({pct}%) on the volume of the loom home`, or `unknown`) and, when it is low
-//!   (`DiskSpace::is_low`), a warning that sessions will fail when the disk fills (bold yellow); one
+//!   (`DiskSpace::is_low`), a warning that sessions will fail when the disk fills (bold yellow); when the
+//!   daemon reports it (`view.egress`), the egress line of the sandbox self-probe (`EgressView::line`: `egress:
+//!   bounded (…)` plain, `egress: UNBOUNDED, …` bold yellow, `egress: not probed yet` plain); one
 //!   line per model (`✓`/`✗`, base URL, model, window, detail when unreachable); the counts.
 //! - `net_table(entries, style)`: `TIME  VERDICT  METHOD  HOST:PORT  RULE` (time as `HH:MM:SS` UTC).
 //! - `score_table(view, style)`: what a mission's work took. `SESSION  ROLE`, then the headings of
@@ -820,6 +822,14 @@ pub fn status(view: &StatusView, style: &Style) -> String {
             }
         }
         None => out.push(cut("free space on the volume of the loom home: unknown", width)),
+    }
+    if let Some(egress) = &view.egress {
+        let line = cut(&flat(&egress.line(loom_core::now_ms())), width);
+        out.push(if egress.level == loom_agent::egress::Level::Unbounded {
+            paint(style, BOLD_YELLOW, &line)
+        } else {
+            line
+        });
     }
     if view.models.is_empty() {
         out.push("no models configured".to_string());
@@ -1895,6 +1905,7 @@ mod tests {
             sessions_active: 2,
             sessions_running: 1,
             inbox_open: 3,
+            egress: None,
         };
         assert_eq!(
             status(&view, &MONO),
@@ -1909,6 +1920,41 @@ mod tests {
         assert!(colored.contains("\x1b[31m✗\x1b[0m http://"));
         view.models.clear();
         assert!(status(&view, &MONO).contains("no models configured\n"));
+        let narrow = status(&view, &Style { color: false, width: 20 });
+        for line in narrow.lines() {
+            assert!(line.chars().count() <= 20, "{line}");
+        }
+    }
+
+    #[test]
+    fn status_shows_the_egress_line_when_the_daemon_reports_one() {
+        use loom_agent::egress::{EgressView, Level};
+        let mut view = StatusView {
+            version: "0.1.0".into(),
+            pid: 1,
+            started_ms: 0,
+            bind: "127.0.0.1:7878".into(),
+            proxy_port: 7879,
+            home: "/h".into(),
+            disk: None,
+            models: vec![],
+            sessions_total: 0,
+            sessions_active: 0,
+            sessions_running: 0,
+            inbox_open: 0,
+            egress: None,
+        };
+        assert!(!status(&view, &MONO).contains("egress"), "an older daemon says nothing");
+        view.egress = Some(EgressView { level: Level::Unprobed, ..EgressView::default() });
+        assert!(status(&view, &MONO).contains("egress: not probed yet\n"));
+        view.egress = Some(EgressView {
+            level: Level::Unbounded,
+            reasons: vec!["sandbox.allow_fetch_services is set".into(), "second".into()],
+            ..EgressView::default()
+        });
+        let plain = status(&view, &MONO);
+        assert!(plain.contains("egress: UNBOUNDED, sandbox.allow_fetch_services is set (+1 more)\n"), "{plain}");
+        assert!(status(&view, &COLOR).contains("\x1b[1m\x1b[33megress: UNBOUNDED"), "{}", status(&view, &COLOR));
         let narrow = status(&view, &Style { color: false, width: 20 });
         for line in narrow.lines() {
             assert!(line.chars().count() <= 20, "{line}");
@@ -1932,6 +1978,7 @@ mod tests {
             sessions_active: 0,
             sessions_running: 0,
             inbox_open: 0,
+            egress: None,
         };
         let warning = "! Low disk space: sessions will fail when the disk fills. Run `loom gc`.\n";
         // (free, total, low): under 5 GiB whatever the volume, under 5 percent whatever the bytes; neither at the line.

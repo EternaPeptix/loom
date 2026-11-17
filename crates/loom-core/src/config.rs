@@ -262,10 +262,14 @@ pub struct SandboxCfg {
     /// before the runtime starts; not a config key.
     #[serde(skip)]
     pub daemon_port: Option<u16>,
-    /// Whether `[network] mode` is `deny_all`, so that commands also cannot reach the system services that fetch
-    /// URLs for a process (certificate evaluation). Set by the runtime; not a config key.
-    #[serde(skip)]
-    pub network_deny_all: bool,
+    /// Let commands look up the macOS services that fetch a URL for a process (`trustd`, `nsurlsessiond`, WebKit's
+    /// XPC services), which reach the network outside the egress proxy. Off by default, in every network mode.
+    /// Setting it marks the daemon's egress "unbounded" and keep-going refuses to turn on.
+    pub allow_fetch_services: bool,
+    /// Mach services commands may look up besides the built-in list (`MACH_LOOKUP_ALLOW`), for a
+    /// tool that fails under the default-deny of `mach-lookup`: exact names, or a name ending in `*` for a prefix.
+    /// An entry that would allow a fetch service or a disk-mounting service is refused.
+    pub mach_allow: Vec<String>,
     /// Loopback ports of infrastructure (a model endpoint or a `network.infrastructure` entry on this
     /// machine) that no command may connect to, whatever else allows loopback. Set by the runtime; not a
     /// config key.
@@ -276,6 +280,59 @@ pub struct SandboxCfg {
 /// Loopback ports that are never reachable to a command: Chrome DevTools, the Node inspector and the Docker
 /// API. `sandbox.loopback_ports` may not list them, and the sandbox refuses them under `loopback_all`.
 pub const DENIED_LOOPBACK_PORTS: [u16; 4] = [9222, 9229, 2375, 2376];
+
+/// The macOS services that fetch a URL for a process, outside its sandbox and outside the egress proxy: certificate
+/// evaluation (`trustd` fetches the issuer a certificate names), background URL sessions and WebKit.
+pub const FETCH_SERVICE_NAMES: [&str; 5] = [
+    "com.apple.trustd.agent",
+    "com.apple.trustd",
+    "com.apple.ocspd",
+    "com.apple.nsurlsessiond",
+    "com.apple.nsurlsessiond.NSURLSessionProxyService",
+];
+/// Name prefixes of the same (WebKit's networking and web-content XPC services).
+pub const FETCH_SERVICE_PREFIXES: [&str; 1] = ["com.apple.WebKit."];
+/// Services that mount a disk image or a volume for a process, outside its sandbox.
+pub const DISK_SERVICE_NAMES: [&str; 4] = [
+    "com.apple.DiskArbitration.diskarbitrationd",
+    "com.apple.diskimagesiod",
+    "com.apple.diskimagesiod.ram",
+    "com.apple.diskmanagementd",
+];
+/// The Mach services a command may look up under the default-deny of `mach-lookup`, probed on macOS 27 with a
+/// battery of bash, python3, node, git, curl, clang, swiftc, cargo, rustc, make, cmake, ssh, sqlite3, perl, ruby,
+/// java, codesign, lldb, osascript and the usual utilities: what they need to start, resolve users, notify and
+/// log, check a binary's execution policy, list processes (`pgrep`) and watch files. Everything else fails: the
+/// keychain and security daemons, Spotlight (`mdfind`), the pasteboard, audio, analytics, authorization, disk
+/// services, Launch Services' writers and every fetch service.
+pub const MACH_LOOKUP_ALLOW: [&str; 17] = [
+    "com.apple.CoreServices.coreservicesd",
+    "com.apple.FSEvents",
+    "com.apple.SystemConfiguration.DNSConfiguration",
+    "com.apple.SystemConfiguration.configd",
+    "com.apple.bsd.dirhelper",
+    "com.apple.coreservices.launchservicesd",
+    "com.apple.distributed_notifications@Uv3",
+    "com.apple.logd",
+    "com.apple.lsd.mapdb",
+    "com.apple.security.syspolicy.exec",
+    "com.apple.sysmond",
+    "com.apple.system.logger",
+    "com.apple.system.notification_center",
+    "com.apple.system.opendirectoryd.libinfo",
+    "com.apple.system.opendirectoryd.membership",
+    "com.apple.tccd",
+    "com.apple.tccd.system",
+];
+
+/// Whether a `sandbox.mach_allow` entry covers `name`: the same string, or, for an entry ending in `*`, a name that
+/// starts with what precedes it.
+pub fn mach_entry_covers(entry: &str, name: &str) -> bool {
+    match entry.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => entry == name,
+    }
+}
 
 /// Whether `path` names the socket of a container runtime (Docker, containerd, Podman, CRI-O), which would
 /// give a command the Docker host.
@@ -305,7 +362,8 @@ impl Default for SandboxCfg {
             secret_env: Vec::new(),
             replay_untrusted_paths: Vec::new(),
             daemon_port: None,
-            network_deny_all: false,
+            allow_fetch_services: false,
+            mach_allow: Vec::new(),
             infra_ports: Vec::new(),
         }
     }
@@ -683,6 +741,37 @@ impl Config {
             if DENIED_LOOPBACK_PORTS.contains(p) {
                 return Err(ConfigError::Invalid(format!(
                     "sandbox.loopback_ports lists {p}, a DevTools, inspector or Docker API port: no command may connect to it. Remove it from the list."
+                )));
+            }
+        }
+        for entry in &self.sandbox.mach_allow {
+            let valid = !entry.is_empty()
+                && entry.len() <= 128
+                && entry.chars().enumerate().all(|(i, c)| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, '.' | '_' | '-' | '@')
+                        || (c == '*' && i + 1 == entry.chars().count())
+                });
+            if !valid {
+                return Err(ConfigError::Invalid(format!(
+                    "sandbox.mach_allow lists \"{entry}\", which is not a Mach service name: use letters, digits and `.`, `_`, `-`, `@`, with at most one `*` at the end for a prefix. Fix or remove the entry."
+                )));
+            }
+            let fetch = FETCH_SERVICE_NAMES.iter().chain(DISK_SERVICE_NAMES.iter()).copied();
+            let covered = fetch.clone().find(|n| mach_entry_covers(entry, n)).or_else(|| {
+                FETCH_SERVICE_PREFIXES
+                    .iter()
+                    .copied()
+                    .find(|p| mach_entry_covers(entry, p) || entry.trim_end_matches('*').starts_with(p))
+            });
+            let broad = entry.strip_suffix('*').is_some_and(|p| p.len() < 8);
+            if broad || covered.is_some() {
+                let what = covered.map_or_else(
+                    || "nearly every service, which defeats the default-deny".to_string(),
+                    |n| format!("{n}, a service that fetches URLs or mounts disks outside the sandbox"),
+                );
+                return Err(ConfigError::Invalid(format!(
+                    "sandbox.mach_allow lists \"{entry}\", which would allow {what}. List the exact services the tool needs; for the fetch services the only switch is sandbox.allow_fetch_services, which marks the daemon's egress unbounded."
                 )));
             }
         }
@@ -1524,6 +1613,47 @@ allow = ["*.example.test"]
         assert!(check("docker_socket = \"relative.sock\"").unwrap_err().contains("absolute"));
         assert!(check("docker_socket = \"/s\"\ncpus = 0").unwrap_err().contains("cpus"));
         assert!(Config::parse("[box]\nenabled = true").unwrap().check().unwrap_err().to_string().contains("box.image"));
+    }
+
+    #[test]
+    fn mach_allow_takes_exact_names_and_prefixes_but_never_a_fetch_or_disk_service() {
+        let check = |entries: &str| {
+            Config::parse(&format!("[sandbox]\nmach_allow = [{entries}]")).unwrap().check().map_err(|e| e.to_string())
+        };
+        assert!(check("").is_ok());
+        assert!(check("\"com.apple.pasteboard.1\", \"com.apple.system.*\"").is_ok());
+        for bad in [
+            "\"com.apple.trustd\"",
+            "\"com.apple.trustd.*\"",
+            "\"com.apple.WebKit.Networking\"",
+            "\"com.apple.nsurlsessiond*\"",
+            "\"com.apple.diskimagesiod\"",
+            "\"com.apple.*\"",
+            "\"*\"",
+            "\"co*\"",
+        ] {
+            let err = check(bad).unwrap_err();
+            assert!(err.contains("sandbox.mach_allow") && err.contains("allow"), "{bad}: {err}");
+        }
+        let fetch = check("\"com.apple.ocspd\"").unwrap_err();
+        assert!(fetch.contains("com.apple.ocspd") && fetch.contains("sandbox.allow_fetch_services"), "{fetch}");
+        for malformed in ["\"\"", "\"a b\"", "\"x*y\"", "\"a\\\"b\""] {
+            assert!(check(malformed).unwrap_err().contains("not a Mach service name"), "{malformed}");
+        }
+        assert!(Config::parse("[sandbox]\nallow_fetch_services = true").unwrap().sandbox.allow_fetch_services);
+        assert!(!Config::default().sandbox.allow_fetch_services);
+    }
+
+    #[test]
+    fn the_built_in_mach_allowlist_has_no_fetch_or_disk_service() {
+        for name in MACH_LOOKUP_ALLOW {
+            assert!(
+                !FETCH_SERVICE_NAMES.contains(&name)
+                    && !DISK_SERVICE_NAMES.contains(&name)
+                    && !FETCH_SERVICE_PREFIXES.iter().any(|p| name.starts_with(p)),
+                "{name}"
+            );
+        }
     }
 
     #[test]

@@ -306,7 +306,8 @@ anything else.
 ```
 loom up                # start the daemon in the background; log: ~/.loom/logs/loomd.log
 loom daemon            # or run it in the foreground
-loom status            # the daemon, each model server and whether it answered, what is running, free disk space
+loom status            # the daemon, each model server and whether it answered, what is running, free disk space, and whether
+                       # commands can reach the network outside the proxy ("egress: bounded" or "UNBOUNDED, <reason>")
 loom down              # stop it; sessions resume when it starts again
 ```
 
@@ -317,7 +318,11 @@ The first start creates `~/.loom/token` (the API token, mode 0600). `LOOM_LOG` s
 now). The model and window it prints come from the config until a session of that profile has been
 created since the daemon started (`window unknown` when `context_window` is not set); from then on
 they are the model id the server serves and the window it reported. It also prints the free space on
-the volume of the loom home and warns when it is under 5 GiB or 5 percent.
+the volume of the loom home and warns when it is under 5 GiB or 5 percent. The `egress:` line is the sandbox
+self-probe (at start, then hourly): `bounded` when no command reached the network outside the egress proxy,
+`UNBOUNDED` with the reason when one did, a probe could not run, `sandbox.allow_fetch_services` is set or
+`sandbox.mode` is `none`. The web header shows the same as a banner, and the last probe is in
+`<loom home>/egress-probe.json`. Unbounded egress stops nothing; keep-going will refuse to turn on.
 
 On macOS `loom service install` makes the daemon a login service (a LaunchAgent) and
 `loom service uninstall` removes it; `loom service status` says whether it is loaded.
@@ -365,7 +370,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | command | does |
 |---|---|
 | `loom daemon` / `up` / `down` | run the daemon in the foreground / in the background / stop it |
-| `loom status` | the daemon, each model server and whether it answered, counts, free disk space |
+| `loom status` | the daemon, each model server and whether it answered, counts, free disk space, the sandbox self-probe's egress line |
 | `loom open [--print]` | open the web UI in the browser (`--print` prints the address instead) |
 | `loom run [options] <task...>` | start a session and follow it; `-d` starts it and returns |
 | `loom chat [options]` | turn-by-turn `chat` session; `--session <id>` continues one; `/quit` leaves |

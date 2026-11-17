@@ -38,7 +38,7 @@
 //! ## API (all under `/api`; JSON in, JSON out)
 //! | Route | Does | Answers |
 //! |---|---|---|
-//! | `GET /status` | `runtime.health()`, counts from `sessions(true)` and `inbox()`, `statvfs` of the loom home on a blocking thread (`disk`, `null` when it cannot be read) | `StatusView` |
+//! | `GET /status` | `runtime.health()`, counts from `sessions(true)` and `inbox()`, `statvfs` of the loom home on a blocking thread (`disk`, `null` when it cannot be read), `runtime.egress()` (`egress`: the sandbox self-probe's view) | `StatusView` |
 //! | `GET /sessions?archived=true` | `runtime.sessions(archived)` (default false) | `[SessionInfo]` |
 //! | `POST /sessions` (`NewSession`; `prior` may be left out) | `runtime.create_session` (`404` for a `prior` mission that does not exist, `409` for too many) | `201` `SessionInfo` |
 //! | `GET /sessions/{id}` | the session and its children (sessions whose `parent` is it) | `SessionDetail` |
@@ -554,6 +554,7 @@ async fn status(State(s): State<ApiState>) -> Json<StatusView> {
         sessions_active: sessions.iter().filter(|i| i.active).count(),
         sessions_running: sessions.iter().filter(|i| i.status.phase == Phase::Running).count(),
         inbox_open,
+        egress: Some(s.runtime.egress()),
     })
 }
 
@@ -1680,6 +1681,10 @@ mod tests {
         assert_eq!(status["sessions_total"], 1);
         assert_eq!(status["sessions_running"], 0);
         assert_eq!(status["inbox_open"], 1);
+        // The test runtime has no sandbox, so commands are not confined: egress is unbounded, and says why.
+        assert_eq!(status["egress"]["level"], "unbounded");
+        assert!(status["egress"]["reasons"][0].as_str().unwrap().contains("sandbox.mode"), "{status}");
+        assert_eq!(status["egress"]["probe_problem"], true);
         assert_eq!(status["bind"], format!("127.0.0.1:{}", e.port).as_str());
         assert_eq!(status["started_ms"], 1_234);
         assert_eq!(status["pid"], std::process::id());

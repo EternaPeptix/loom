@@ -362,6 +362,14 @@ function renderDiskWarning() {
   box.hidden = !text;
 }
 
+function renderEgressWarning() {
+  const box = $("egress-warning");
+  if (!box) return;
+  const text = C.egressWarning(S.status && S.status.egress);
+  box.textContent = text || "";
+  box.hidden = !text;
+}
+
 function updateInboxBadge() {
   const c = C.inboxCounts(S.inbox);
   const b = $("btn-inbox");
@@ -668,6 +676,7 @@ async function loadStatus() {
     S.statusError = null;
     renderDot();
     renderDiskWarning();
+    renderEgressWarning();
   } catch (e) {
     if (request !== S.requests.status) return;
     S.statusError = e.message;

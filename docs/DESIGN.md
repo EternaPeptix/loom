@@ -1225,15 +1225,17 @@ The Seatbelt policy:
   allowed. The daemon's own port is refused whatever allows it, at every address (Seatbelt counts the
   host's own addresses as loopback), so a command that reads a `loom open` login code from the process
   list cannot redeem it;
-- under `network.mode = deny_all`, the system services that fetch a URL for a process, outside its
-  sandbox, cannot be reached: `com.apple.trustd.agent`, `com.apple.trustd` and `com.apple.ocspd`.
+- in every `network.mode` (unless `sandbox.allow_fetch_services`), the system services that fetch a URL for a
+  process, outside its sandbox, cannot be reached: `com.apple.trustd.agent`, `com.apple.trustd` and `com.apple.ocspd`.
   Certificate evaluation fetches the issuer a certificate names (its AIA URL, which a command chooses),
   so through it a command could send data past the proxy and its audit file. With them denied,
   programs that check certificates through macOS (Swift and Go programs, `security`, `codesign
   --verify`) fail closed for every certificate; curl and Python use their own certificate files. The
   background URL session service (`com.apple.nsurlsessiond`) and WebKit's XPC services, which a command
-  can drive from `osascript -l JavaScript` to fetch a URL, are denied too. In `allowlist` and `open` modes
-  these routes stay open (SECURITY.md lists them);
+  can drive from `osascript -l JavaScript` to fetch a URL, are denied too. `mach-lookup` is denied by default with an allowlist of the services the usual toolchains need
+  (`MACH_LOOKUP_ALLOW`, plus `sandbox.mach_allow`). The daemon probes this at start and hourly against a local
+  listener (`loom_agent::egress`, `loom_tools::sandbox::selfprobe`) and shows `egress: bounded` or `UNBOUNDED`
+  in `loom status` and the web header; `allow_fetch_services` marks it unbounded and keep-going refuses it;
 - mounting is denied (`file-mount`, and the disk-image and DiskArbitration services that mount for a
   process: a command could otherwise attach an image of its own over `.git/hooks`, `~/.ssh` or
   `~/Library/LaunchAgents`), and so is writing preferences (`cfprefsd` writes `~/Library/Preferences`
