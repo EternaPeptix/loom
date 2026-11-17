@@ -75,7 +75,7 @@
 //!   command made mounted it over `.git/modules/<n>/hooks` (and over any directory the user owns: `~/.ssh`,
 //!   `~/Library/LaunchAgents`, the loom home), and the operator's next Git command ran a hook from it; with
 //!   these denied nothing is attached (`hdiutil attach` may still exit 0) and `diskutil` fails, while
-//!   `hdiutil makehybrid` and `create` still work;
+//!   `hdiutil makehybrid` still works (`hdiutil create` already fails under the write rules);
 //! - preferences: commands cannot write a preference domain (`user-preference-write`): `cfprefsd` writes
 //!   `~/Library/Preferences` for a process, outside its sandbox (probed: `defaults write <domain>` created the
 //!   plist under a profile that denies writing there), and some preferences name a command another program

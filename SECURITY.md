@@ -244,7 +244,8 @@ These are the places where loom does less than the text above might suggest.
   leave an interactive rebase or a cherry-pick in progress whose list holds `exec` lines: they run when
   you continue it, so do not continue an operation you did not start. Under Bubblewrap a command can make
   a new repository in a writable directory (existing ones are read-only); do not run Git inside one you
-  did not make.
+  did not make. Under Bubblewrap a `core.hooksPath` directory that does not exist yet in a writable
+  directory refuses the session (it cannot be held read-only): create it first.
 - **Tamper evidence has gaps.** Deleting a session's records together with their directory, deleting
   `journal.head` together with the last entries of its mission journal, deleting a mission journal and
   its `journal.head` together, or restoring an older matching pair, cannot be detected. A process
