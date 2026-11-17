@@ -404,8 +404,8 @@
 //!    epoch is the one the last refusal recorded, `keep_recent_steps` is 0 and `floor_tokens` is 0 from
 //!    the start: the plan folds everything it can (every live, unpinned result and report, the droppable
 //!    notes), whatever the size, because what the server refuses may be the newest output and is not a
-//!    matter of size; neither asks for a digest (the prefix was refused). A result folded this way keeps
-//!    its handle in its stub.
+//!    matter of size; neither asks for a digest (the prefix was refused) nor goes on to point 2 (at floor
+//!    0 a text plan would drop every reply). A result folded this way keeps its handle in its stub.
 //! 2. Still not enough: `text_plan = w.plan(records, estimator, &policy, true)`. Not forced
 //!    and `text_plan` is not enough either: return without a record and without a digest request (see
 //!    "Why a re-weave must be worth it"). Otherwise, when `text_plan` exists and the re-weave is not
@@ -3301,7 +3301,9 @@ impl Session {
             plan = woven.plan(&self.records, &self.estimator, &policy, false);
         }
         let mut digest = None;
-        if !enough(&plan) {
+        // A refusal fold takes the outputs out of view, never the replies: at floor 0 a text plan would
+        // drop every reply, with no digest to keep the map of the work.
+        if !enough(&plan) && !matches!(fold, Fold::Refused | Fold::KeepZero) {
             let text_plan = woven.plan(&self.records, &self.estimator, &policy, true);
             if !forced && !enough(&text_plan) {
                 return Ok(false);
@@ -7456,6 +7458,31 @@ mod tests {
             "no digest request after a refusal"
         );
         finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn a_refusal_fold_never_drops_the_replies_even_when_they_fill_the_window() {
+        // The replies alone (about 19k tokens) stay above the midpoint (15.5k) once every output is folded,
+        // and the whole request stays under the trigger (30k), so no `target` re-weave comes first.
+        let talk = "a reply that goes on at length. ".repeat(1_000);
+        let script = filter_over(vec![
+            bash("echo one").with_text(talk.clone()).into(),
+            bash(POISONED).with_text(talk.clone()).into(),
+            Reply::text("done").into(),
+        ]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context =
+            ReweavePolicy { target_tokens: 30_000, floor_tokens: 1_000, keep_recent_steps: 2, stub_tail_lines: 3 };
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        say(&mut session, "keep working").await;
+        let rs = session.records().to_vec();
+        let rw = reweave_records(&rs);
+        let refused: Vec<_> = rw.iter().filter(|w| w.reason == "refused").collect();
+        assert_eq!(refused.len(), 1, "{:?}", rw.iter().map(|w| w.reason.clone()).collect::<Vec<_>>());
+        assert!(refused[0].evictions.iter().all(|e| e.action != EvictAction::Drop), "{:?}", refused[0].evictions);
+        let reqs = fx.server.requests();
+        assert!(all_text(reqs.last().unwrap()).contains("a reply that goes on at length."), "the replies stay");
     }
 
     #[tokio::test]
