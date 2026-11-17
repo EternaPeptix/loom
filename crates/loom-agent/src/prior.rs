@@ -148,8 +148,10 @@ pub struct Recalled {
     pub recall: Recall,
 }
 
-/// What an earlier mission's journal gave.
+/// What an earlier mission's journal gave. At most eight are alive at once, so the size of the ledger variant
+/// costs nothing worth an indirection in the contract.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Recall {
     /// The verified, folded ledger, and the time of its last entry.
     Ledger { state: LedgerState, end_ms: u64 },
