@@ -505,7 +505,7 @@ use loom_core::event::{
     META_DEFERRED_OBSERVATION, META_EXIT_CODE, META_JOB, META_SIGNAL,
 };
 use loom_core::ids::{new_item_id, new_request_id, CallId, SessionId};
-use loom_core::ledger::{BriefOpts, LedgerOp, LedgerState};
+use loom_core::ledger::{LedgerOp, LedgerState};
 use loom_core::log::{fork_file, Durability, SessionLog};
 use loom_core::message::Message;
 use loom_core::prefix::{stable_hash, PrefixCheck, PrefixGuard};
@@ -2964,7 +2964,7 @@ impl Session {
             records: self.own(),
             ledger: ledger.as_ref(),
             ledger_skipped,
-            brief: BriefOpts::default(),
+            brief: hud::brief_opts(&shared.role.tools),
             unviewed_min_lines: self.deps.agents.unviewed_min_lines,
             jobs: &jobs,
             children: &children,
@@ -3493,7 +3493,7 @@ impl Session {
             Some(Ok(l)) => {
                 let mut f = frontier::frontier(&l, now_ms());
                 f.attempts_run = frontier::attempts_run(&self.records);
-                (l.brief(&BriefOpts::default()), frontier::render(&f))
+                (l.brief(&hud::brief_opts(&self.deps.shared.role.tools)), frontier::render(&f))
             }
             _ => (String::new(), None),
         }

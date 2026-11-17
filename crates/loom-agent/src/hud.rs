@@ -151,6 +151,16 @@ pub struct HudInput<'a> {
     pub solvable: bool,
 }
 
+/// The brief options for a reader holding `tools`: the capped defaults when it can call `ledger` to read
+/// what an elision line hides, else every item.
+pub fn brief_opts(tools: &[String]) -> BriefOpts {
+    if tools.iter().any(|t| t == "ledger") {
+        BriefOpts::default()
+    } else {
+        BriefOpts::uncapped()
+    }
+}
+
 pub fn render(input: &HudInput<'_>) -> String {
     let mut sections: Vec<String> = vec![format!("Now: {}", format_utc(input.now_ms))];
 
@@ -1074,5 +1084,14 @@ Waiting on the operator (1):\n- q2: Which branch should this target?",
         let text = render(&args);
         assert!(text.contains("missing or removed conclusions are unknown"));
         assert!(!text.contains("SECRET"));
+    }
+
+    #[test]
+    fn brief_opts_are_capped_only_for_a_reader_of_the_ledger() {
+        let with = vec!["bash".to_string(), "ledger".to_string()];
+        let without = vec!["bash".to_string(), "security_record".to_string()];
+        assert_eq!(brief_opts(&with), BriefOpts::default());
+        assert_eq!(brief_opts(&without), BriefOpts::uncapped());
+        assert_eq!(brief_opts(&[]), BriefOpts::uncapped());
     }
 }
