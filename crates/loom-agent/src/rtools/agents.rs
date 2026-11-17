@@ -1877,6 +1877,8 @@ mod tests {
                 quote: Some("line two\nline three".into()),
                 note: "shows both".into(),
                 attested: true,
+                tool: None,
+                grade: None,
             }));
         }
     }

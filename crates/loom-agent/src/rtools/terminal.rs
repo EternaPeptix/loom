@@ -1956,6 +1956,8 @@ mod tests {
             quote: None,
             note: "bounded fixture observation".into(),
             attested: true,
+            tool: None,
+            grade: None,
         }));
         r.model_op(LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: "observed".into() });
         "e1".into()
@@ -2556,6 +2558,8 @@ mod tests {
             quote: None,
             note: "ran the target".into(),
             attested: true,
+            tool: None,
+            grade: None,
         }));
         r.model_op(LedgerOp::ClaimUpdate { id: claim, status: ClaimStatus::Supported, note: String::new() });
         format!("e{}", r.shared.ledger().unwrap().evidence.len())
@@ -2920,6 +2924,8 @@ mod tests {
             quote: None,
             note: "read it".into(),
             attested: true,
+            tool: None,
+            grade: None,
         }));
         r.model_op(LedgerOp::ClaimUpdate {
             id: "c2".into(),
@@ -4102,6 +4108,8 @@ mod tests {
                 quote: blob.map(|_| "line two".to_string()),
                 note: "shows it".into(),
                 attested: true,
+                tool: None,
+                grade: None,
             },
             n: 1,
         };
@@ -4151,6 +4159,8 @@ mod tests {
             quote: Some("line two".into()),
             note: "the test passes".into(),
             attested: true,
+            tool: None,
+            grade: None,
         }));
         r.model_op(LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: String::new() });
         r.orch.settle("s-kid1", ChildOutcome::Returned, "fine", accepted_payload());

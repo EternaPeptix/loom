@@ -502,9 +502,9 @@ use futures_util::FutureExt;
 use loom_core::config::{ensure_private_dir, Config, NetworkMode, Paths, SandboxCfg, SandboxMode};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
-    Author, Brief, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, Forked, InboxItem, ModelRef, NetDecision,
-    Record, Seq, SessionOutcome, SessionStart, SpawnMode, Termination, ToolClass, ToolStatus, TurnEndReason, Usage,
-    META_EXIT_CODE, META_OF_BLOB, META_SIGNAL,
+    Author, Brief, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, EvidenceGrade, Forked, InboxItem, ModelRef,
+    NetDecision, Record, Seq, SessionOutcome, SessionStart, SpawnMode, Termination, ToolClass, ToolStatus,
+    TurnEndReason, Usage, META_EXIT_CODE, META_OF_BLOB, META_SIGNAL,
 };
 use loom_core::journal::{self, Journal};
 use loom_core::ledger::LedgerState;
@@ -937,8 +937,13 @@ fn produced_by(
 ) -> Option<(BlobId, Producer)> {
     match event {
         Event::ToolResult(t) => {
-            let p =
-                Producer { session: session.clone(), call_id: t.call_id.clone(), tool: t.name.clone(), class: t.class };
+            let p = Producer {
+                session: session.clone(),
+                call_id: t.call_id.clone(),
+                tool: t.name.clone(),
+                class: t.class,
+                grade: EvidenceGrade::of(t.class, &t.meta),
+            };
             if let Some(o) = &t.output {
                 return Some((o.id.clone(), p));
             }
@@ -954,6 +959,7 @@ fn produced_by(
                 call_id: call_id.clone(),
                 tool: "bash".into(),
                 class: ToolClass::Exec,
+                grade: EvidenceGrade::Run,
             };
             jobs.insert((session.clone(), job_id.clone()), p);
             None
@@ -5986,6 +5992,8 @@ mod tests {
                     quote: None,
                     note: "dummy credential fixture".into(),
                     attested: true,
+                    tool: None,
+                    grade: None,
                 }),
             )
             .unwrap();

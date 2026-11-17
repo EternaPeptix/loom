@@ -1266,6 +1266,18 @@ impl LedgerState {
         }
     }
 
+    /// The evidence ids `ids` named with where each came from, joined by `, `: `{id} {source_label}`, or the
+    /// bare id when there is no such record (see CONTRACT, brief).
+    pub fn evidence_labels(&self, ids: &[String]) -> String {
+        ids.iter()
+            .map(|id| match self.evidence.iter().find(|e| &e.id == id) {
+                Some(e) => format!("{id} {}", e.input.source_label()),
+                None => id.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Compact state text for the HUD and for re-weaves. Goal, constraints and approvals are the
     /// operator's words and are never cut; every other line is cut at `opts.max_line`.
     pub fn brief(&self, opts: &BriefOpts) -> String {
@@ -1801,6 +1813,8 @@ mod tests {
             quote: Some("hello ``` world".into()),
             note: "ran it".into(),
             attested,
+            tool: None,
+            grade: None,
         }
     }
 

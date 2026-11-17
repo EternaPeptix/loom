@@ -452,6 +452,8 @@ mod tests {
             quote: None,
             note: "synthetic scanner fixture".into(),
             attested: true,
+            tool: None,
+            grade: None,
         }));
     }
 
@@ -676,6 +678,8 @@ mod tests {
             quote: None,
             note: "opposing fixture observation".into(),
             attested: true,
+            tool: None,
+            grade: None,
         }));
         let counter = judge
             .call(

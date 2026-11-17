@@ -7,7 +7,7 @@ use super::{build_registry, ChildCopy, ChildInfo, Orchestrator, Producer, Settle
 use crate::pack::{Packs, RoleDef};
 use async_trait::async_trait;
 use loom_core::config::AgentsCfg;
-use loom_core::event::{ChildOutcome, ToolClass, ToolResult, Usage};
+use loom_core::event::{ChildOutcome, EvidenceGrade, ToolClass, ToolResult, Usage};
 use loom_core::journal::Journal;
 use loom_core::ledger::{LedgerOp, LedgerState};
 use loom_core::{BlobId, BlobRef, CallId, MissionId, SessionId};
@@ -74,11 +74,30 @@ impl FakeOrch {
             },
         );
     }
-    /// Declare which tool call produced a stored output.
+    /// Declare which tool call produced a stored output, graded by its class alone (no grade in its meta).
     pub fn produced(&self, blob: &BlobRef, session: &str, call: &str, tool: &str, class: ToolClass) {
+        let grade = EvidenceGrade::of(class, &serde_json::Map::new());
+        self.produced_graded(blob, session, call, tool, class, grade);
+    }
+    /// Declare which tool call produced a stored output, with the grade its result carried.
+    pub fn produced_graded(
+        &self,
+        blob: &BlobRef,
+        session: &str,
+        call: &str,
+        tool: &str,
+        class: ToolClass,
+        grade: EvidenceGrade,
+    ) {
         lock(&self.producers).insert(
             blob.id.clone(),
-            Producer { session: SessionId::from(session), call_id: CallId::from(call), tool: tool.into(), class },
+            Producer {
+                session: SessionId::from(session),
+                call_id: CallId::from(call),
+                tool: tool.into(),
+                class,
+                grade,
+            },
         );
     }
     pub fn running_child(&self, id: &str, role: &str) {
@@ -255,6 +274,7 @@ impl Rig {
                 call_id: result.call_id.clone(),
                 tool: result.name.clone(),
                 class: result.class,
+                grade: EvidenceGrade::of(result.class, &result.meta),
             });
         }
         result

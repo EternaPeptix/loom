@@ -91,7 +91,7 @@ use super::{observed_producer, Shared, NO_MISSION};
 use crate::gate::{check_quotes, Quote};
 use crate::{frontier, texts};
 use async_trait::async_trait;
-use loom_core::event::{ToolClass, ToolSpec, META_REFUSAL, REFUSAL_QUOTE};
+use loom_core::event::{EvidenceGrade, ToolClass, ToolSpec, META_REFUSAL, REFUSAL_QUOTE};
 use loom_core::ledger::{ClaimStatus, EvidenceInput, EvidenceKind, LedgerOp, LedgerState, StepStatus};
 use loom_tools::params::{opt, req, spec};
 use loom_tools::{Body, Tool, ToolCtx, ToolOutput};
@@ -399,7 +399,9 @@ impl Tool for Evidence {
             Ok(p) => p,
             Err(text) => return quote_refused(text),
         };
-        let kind = if producer.class == ToolClass::Exec { EvidenceKind::Execution } else { EvidenceKind::Static };
+        // Only a run is execution evidence; an Exec tool whose output is analysis (dep_scan) is not one.
+        let run = producer.grade == EvidenceGrade::Run && producer.class == ToolClass::Exec;
+        let kind = if run { EvidenceKind::Execution } else { EvidenceKind::Static };
         let recorded = by_lines.then(|| recorded_lines(&handle, v.start, v.end, &v.text));
         let input = EvidenceInput {
             claim: claim.clone(),
@@ -412,6 +414,8 @@ impl Tool for Evidence {
             quote: Some(v.text),
             note,
             attested: true,
+            tool: Some(producer.tool.clone()),
+            grade: Some(producer.grade),
         };
         match shared.ledger_append(false, LedgerOp::EvidenceAdd(input)) {
             Ok((_, state)) => {

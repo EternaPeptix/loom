@@ -655,6 +655,8 @@ mod tests {
             quote: None,
             note: "dummy fixture observation".into(),
             attested: true,
+            tool: None,
+            grade: None,
         }));
         let mut ids = Vec::new();
         for locator in ["first.test", "second.test"] {
