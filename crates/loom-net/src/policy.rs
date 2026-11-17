@@ -71,8 +71,10 @@
 //!   would authorize a whole top-level domain; a wildcard under a domain (`*.example.test`) is kept. A
 //!   public suffix of more than one label (`*.co.uk`) is not recognised, nor is a domain whose names
 //!   resolve to whatever address the name spells (wildcard DNS such as `*.nip.io`);
-//! - a wildcard whose last label is all digits (`*.0.1`, `*.1.168.192:80`): no top-level domain is
-//!   numeric, so it can only match IP literals written as host names, a whole range of addresses;
+//! - a wildcard whose last label is a number as the system's address parser reads one: all digits
+//!   (`*.0.1`, `*.1.168.192:80`, octal `*.8.010`) or `0x`/`0X` and hex digits (`*.8.0x8`): no top-level
+//!   domain is numeric, and the resolver reads `a.b.8.0x8` as the address `a.b.8.8`, so it can only match
+//!   addresses written as host names, a whole range of them;
 //! - an IP literal that is unspecified or in `0.0.0.0/8` (`0.0.0.0`, `0.0.0.0:8080`, `0.1.2.3`, `::`,
 //!   `[::]:80`), also in an IPv6 form that carries such an IPv4 address (`[::ffff:0.0.0.0]`): a literal
 //!   grant unlocks its exact address against the private-address rule (below), and a connection to the
@@ -99,10 +101,11 @@
 //! IPv6; `allow_private` by name, by CIDR and by address; open mode still refuses private addresses.
 //! `with_hosts` under `deny_all` with a non-empty configured `allow` and one granted host: the granted
 //! host is allowed and every `allow` entry is refused (`not in allow list`); under `allowlist` both are
-//! allowed. `check_hosts` refuses `*`, `*:443`, `*.com`, `*.com:443`, `*.0.1`, `*.1.168.192:80`, `0.0.0.0`,
+//! allowed. `check_hosts` refuses `*`, `*:443`, `*.com`, `*.com:443`, `*.0.1`, `*.1.168.192:80`, `*.8.0x8`,
+//! `*.8.0XfF`, `*.8.010`, `0.0.0.0`,
 //! `0.0.0.0:8080`, `0.1.2.3`, `::`, `[::]`, `[::]:80`, `[::ffff:0.0.0.0]`, `127.0.0.1`, `127.1.2.3`, `[::1]`,
 //! `::1` and `[::ffff:127.0.0.1]` with a sentence naming the entry, refuses a list holding one of them
-//! besides valid hosts, and accepts `*.example.test`, `*.a1.example.test`, `api.example.test:443`,
+//! besides valid hosts, and accepts `*.example.test`, `*.a1.example.test`, `*.0xide.example.test`, `api.example.test:443`,
 //! `127.0.0.1:19201`, `10.0.0.5` and `[::1]:8080`.
 
 #![allow(clippy::doc_lazy_continuation)]

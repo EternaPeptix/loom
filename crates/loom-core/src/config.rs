@@ -38,11 +38,15 @@
 //! `{VAR}` is not set, so requests of `models.{p}` carry no key, and the same move. Never the value.
 //!
 //! Every command these sentences suggest is one a shell runs as written: a path or name that holds a
-//! character outside `[A-Za-z0-9/._+:@%=,~-]` is single-quoted (`'` written `'\''`). The file name they
-//! suggest for a profile `{p}` is `{p}` when it passes the `api_key_file` rules, else `{p}` with every
-//! character outside `[A-Za-z0-9._-]` replaced by `-`, leading `.`s removed and cut to 64 characters (or
-//! `model-key` when nothing is left); a profile name that is not a bare TOML key is written
-//! `[models."{p}"]` (with `"` and `\` escaped).
+//! character outside `[A-Za-z0-9/._+:@%=,~-]` is single-quoted (`'` written `'\''`), and every command that
+//! writes a key file runs with `set -o noclobber`, so it fails rather than replace a file that is there
+//! (another profile's key). The file name they suggest for a profile `{p}` is `{p}` when it passes the
+//! `api_key_file` rules, else `{p}` with every character outside `[A-Za-z0-9._-]` replaced by `-`, leading
+//! `.`s removed and cut to 64 characters (or `model-key` when nothing is left); in `key_env_warnings` the
+//! names suggested are unique within the config, compared without regard to case (as macOS file systems
+//! compare them) with each other and with the `api_key_file` names in use, by appending `-2`, `-3`, … (cut
+//! to fit 64). A profile name that is not a bare TOML key is written `[models."{p}"]` (with `"` and `\`
+//! escaped).
 //!
 //! Tests required: both forms refused together; each name rule; `read_model_key` returns the trimmed key
 //! and refuses a missing file (with the commands), a link, a directory, mode 0640 and 0604, an empty or
@@ -50,7 +54,8 @@
 //! holding the key; `check_model_keys` names the profile; `key_env_warnings` for a set and an unset
 //! variable, holding the variable's name and the move and never its value; for a profile `gpt 4/o` and a
 //! keys directory with a space in its path, the suggested file name passes the rules and the commands
-//! quote the path.
+//! quote the path; profiles `gpt 4`, `gpt/4` and `GPT-4` and a profile with `api_key_file = "gpt-4-2"` get
+//! four distinct names (case-insensitively); every suggested write uses `noclobber`.
 
 use crate::admit::AdmitPolicy;
 use crate::event::ReasoningReplay;

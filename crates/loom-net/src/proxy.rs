@@ -50,17 +50,25 @@
 //! `session_port(session) -> Option<u16>`: the port of the session's own listener while it holds a
 //! command grant.
 //! `revoke(session)` drops both command and reference grants; connections already open are left to finish.
-//! The session's listener stays open until the proxy stops, answering `407` to every request (its
-//! credentials are gone), and `session_port` gives `None`: so no later session of this proxy's life is
-//! given a port that an earlier session's sandbox allows (a process that left its command's process group
-//! outlives its session and keeps its profile). A later grant of the same session uses that listener
-//! again. The cost is one descriptor per session granted since the proxy started.
+//! The session's listener is closed, and `session_port` gives `None`; its port is **retired**: kept, as a
+//! number only, among the proxy's own ports for the proxy's life. A listener for a session is opened with
+//! `tokio::net::TcpSocket`: bind `127.0.0.1:0`, read the port, and if it is retired (or otherwise one of
+//! the proxy's own ports) keep that socket aside and bind again, up to 64 times, else
+//! `ProxyError::Bind` saying that no fresh loopback port was found and that a daemon restart frees the
+//! retired ones; the sockets set aside are dropped once a fresh port is found. So no later session of this
+//! proxy's life is given a port that an earlier session's sandbox allows (a process that left its
+//! command's process group outlives its session and keeps its profile), and a revoked session holds no
+//! descriptor. The fresh port is added to the own ports **before** `listen`. A later grant of a session
+//! whose listener was closed opens a new one (on a fresh port; its new sandbox names it).
 //!
 //! **The proxy never connects to itself.** A destination address that is loopback (`127.0.0.0/8`, `::1`,
 //! and IPv6 forms carrying a `127.x` address) or unspecified (`0.0.0.0/8`, `::`, and such forms) with a
-//! port of one of the proxy's listeners (the shared one and every session's, open or kept after a revoke)
-//! is refused whatever the policy says, before `check_addr`, for a tunnel, a forwarded request and a check
-//! alike, with rule `deny the egress proxy's own port {port}`. Otherwise a session whose policy reaches
+//! port of one of the proxy's listeners (the shared one and every session's, open or retired) is refused
+//! whatever the policy says, before `check_addr`, for a tunnel, a forwarded request and a check alike,
+//! with rule `deny the egress proxy's own port {port}`. A connection that succeeds is checked again
+//! against the own ports before anything is recorded as allowed or sent (a listener opened between the
+//! first check and the connect is in the set by then, since its port is added before it listens); a hit
+//! closes it and refuses it the same way. Otherwise a session whose policy reaches
 //! loopback (`allow_private`, a granted `127.0.0.1:{port}`) could open a tunnel to another session's
 //! listener and present that session's credentials there, through the proxy, which would accept them.
 //! `set_policy(session, policy)` replaces the policy of a session that holds a grant and keeps its
@@ -113,9 +121,11 @@
 //! different ports, neither the shared one; session B's valid credentials on A's port → `407`, nothing
 //! connected, one refused decision recorded for A naming B; A's credentials on the shared port → `407`
 //! (unattributed); a reference grant works on the shared port and is refused on a session's port; a second
-//! grant of A keeps the port and the first password gets `407`; after `revoke(A)` A's port still accepts and
-//! answers `407` to A's old credentials, `session_port(A)` is `None`, and the grants of 20 new sessions
-//! never get A's port; `shutdown` closes the session listeners too. The foreign-credentials test asserts
+//! grant of A keeps the port and the first password gets `407`; after `revoke(A)` a connect to A's port
+//! fails, `session_port(A)` is `None`, the grants of 20 new sessions never get A's port, a grant of A again
+//! gets a port that is not the old one, and a proxy test with the retired check forced to hit every time
+//! gets `ProxyError::Bind` with the sentence and leaves no socket bound; `shutdown` closes the session
+//! listeners too. A connect to a retired port through the proxy is refused with the own-port rule. The foreign-credentials test asserts
 //! that the destination listener accepted nothing. Own ports: with a policy that allows `127.0.0.1`
 //! (`allow_private`) in open mode, a `CONNECT`, a forwarded `GET http://127.0.0.1:{port}/` and a check to
 //! another session's port, to the session's own port and to the shared port are each refused (`403`, rule
