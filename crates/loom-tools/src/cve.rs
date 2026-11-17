@@ -33,6 +33,9 @@
 //! (not raw JSON) whose first lines are the headline facts, so a cut still shows them; the complete
 //! upstream JSON of each source is stored too (see each tool). `outcome` is a few words. Numbers are
 //! plain. Every retrieval notes its source and that it was retrieved now (the record is a snapshot).
+//! Every result of the three tools, whatever its status, carries `meta[META_EVIDENCE_GRADE] = "reference"`:
+//! a CVE or advisory record is data about the world, not an observation of the target, so a quote of it is
+//! never a run (see `loom_core::event::EvidenceGrade`).
 //!
 //! ## `cve_lookup` — one consolidated CVE record (ToolClass::Read)
 //! Args: `id` (required string). Normalise to `CVE-YYYY-NNNN…` (uppercase; accept lowercase and a
@@ -84,7 +87,8 @@
 //! consolidates NVD+EPSS incl. KEV present/absent, unscored, and not-found; EPSS failure degrades
 //! gracefully; cve_search ranks by EPSS and applies min_cvss/min_epss and the no-filter refusal;
 //! advisory_lookup with and without version and the empty case; a proxy `403` with `X-Loom-Proxy`
-//! reads as `denied` naming the host; a bad CVE id is refused with the expected shape; cancellation.
+//! reads as `denied` naming the host; a bad CVE id is refused with the expected shape; cancellation; each
+//! tool's result (a found record and an error alike) is graded `reference`.
 
 use crate::web::{ProxyVerdict, Tunnel};
 use crate::{Body, Tool, ToolCtx, ToolOutput};

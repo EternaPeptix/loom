@@ -53,15 +53,19 @@
 //!      runtime registers that blob as produced by the `read` call (class `Read`, so static evidence);
 //!      the complete output of a background job is registered as produced by the call that started it.
 //!   3. `EvidenceAdd(EvidenceInput { claim, kind, supports, session, call_id, blob: Some, lines:
-//!      Some((start, end)) as verified, quote: the verified text, note, attested: true })` where `kind`
-//!      is `Execution` when the producer's class is `Exec`, else `Static`. The verified text has no
+//!      Some((start, end)) as verified, quote: the verified text, note, attested: true, tool:
+//!      Some(producer.tool), grade: Some(producer.grade) })` where `kind` is `Execution` when the producer's
+//!      grade is `Run` and its class is `Exec`, else `Static`. The class alone no longer decides: `dep_scan`,
+//!      `bin_decompile` and `bin_xrefs` are `Exec` tools whose output is analysis, so a quote of it is static
+//!      evidence and meets no rule that asks for a run. The verified text has no
 //!      line-number prefixes; a fragment is recorded as the complete line or lines it lies on, and `lines`
 //!      are their numbers (on lines longer than `observe::QUOTE_RECORD_CHARS` characters, a window of them
 //!      around the fragment, `…` marking what was left out).
 //!
-//!   Outcome `evidence {id} attached to {claim}`. Text: `{id} ({supports|undermines}; {execution|static}:
-//!   {tool} call in {session}) attached to {claim}.` and, when the claim is still `Open`, the line
-//!   `The claim is still open — set its status with `claim_update`.` After a quote by lines, what was
+//!   Outcome `evidence {id} attached to {claim}`. Text: `{id} ({supports|undermines}; {grade}: {tool} call
+//!   in {session}) attached to {claim}.` (`{grade}` is `run`, `analysis`, `read` or `reference`); when the
+//!   grade is `analysis` or `reference`, the line `texts::evidence_not_a_run(grade, tool)`; when the claim is
+//!   still `Open`, the line `The claim is still open — set its status with `claim_update`.` After a quote by lines, what was
 //!   recorded follows, since nothing compared the line numbers with a text and a miscounted range shows
 //!   nowhere else: `Recorded from {handle}, lines {start}-{end}, as stored:`, each line of the text as
 //!   `| {line}`, and `If these are not the lines you meant, attach the right ones.` A quote given with
@@ -78,7 +82,10 @@
 //! directly and as a view shows it, the diff of an `edit`); `evidence` kind by producer class, also
 //! when the quote is copied from a view of a command's output; evidence by lines: what is recorded and
 //! played back, its refusals, and the producer rule applying to it as well; a session without a mission
-//! gets `NO_MISSION` from every tool.
+//! gets `NO_MISSION` from every tool. Grades: a quote of a producer graded `Analysis` (as `dep_scan`'s) is
+//! recorded `Static` with `tool` and `grade` set, and the result says `analysis:` and carries the not-a-run
+//! line; `Reference` likewise; a `Run` producer is recorded `Execution`; a producer of class `Exec` whose grade
+//! is not `Run` is never recorded `Execution`; a `read` producer gets no not-a-run line.
 
 use super::{observed_producer, Shared, NO_MISSION};
 use crate::gate::{check_quotes, Quote};

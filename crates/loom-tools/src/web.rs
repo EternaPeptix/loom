@@ -36,6 +36,11 @@
 //!   says that the destination was not reached through the proxy, with the rule the proxy allows it by
 //!   or the fact that it gave no verdict, and that the session's egress log has the proxy's decision.
 //!   The stage of a failure is read from the causes of the error, never from text that contains the URL.
+//! - Evidence grade: when the final hop (the one whose response becomes the result) went through the
+//!   reference client (`reference_client` returned one for that URL), the result carries
+//!   `meta[META_EVIDENCE_GRADE] = "reference"`: a reference host's page is data about the world, not the
+//!   target. Any other result carries no grade (it is a `Read`). A redirect from a reference host to a
+//!   target host is graded by where it ended, and the other way round.
 //!
 //! Tests required (local `axum` server on loopback; no proxy): plain text; html rendered and raw
 //! stored; `raw: true`; redirect chain reported; redirect loop stops at 10; 404 is `Ok` with the
@@ -43,7 +48,9 @@
 //! from the end of the document is present in the stored output). Real-proxy reference tests:
 //! raw credentials cannot reach reference hosts; reference GET works without inherited credentials;
 //! redirects switch capabilities both ways, refuse ungranted destinations, and refuse URL user-info
-//! without echoing the credentials.
+//! without echoing the credentials; a page fetched through the reference client is graded `reference` and
+//! one fetched directly or through the session proxy carries no grade, including after a redirect from a
+//! reference host to a granted target host.
 
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;

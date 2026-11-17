@@ -420,7 +420,7 @@ pub fn check_finish_lead(ledger: &LedgerState, answer: &str) -> Result<(), Strin
         let objections = ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind == ObligationKind::Objection);
         if objections {
             text.push_str(
-                "\n- Objections: a verifier rejected an earlier finish. An objection is settled only by new work: run the target again, record the run with `evidence` (kind execution), then call finish again. Answering the operator or rewording the result settles nothing.",
+                "\n- Objections: a verifier rejected an earlier finish. An objection is settled only by new work: run the target again, record the run with `evidence` (it must be a run: a scan, a decompilation or a lookup is not one), then call finish again. Answering the operator or rewording the result settles nothing.",
             );
         }
         if ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind != ObligationKind::Objection) {

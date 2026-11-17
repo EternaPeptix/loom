@@ -83,8 +83,9 @@
 //! fresh execution evidence has been recorded since the last objection (otherwise the open-items gate
 //! refuses before the verifier starts), so the signal lives at the gate, not after the verdict. Whenever
 //! a lead's `finish` is refused before a verifier runs — the goal pre-gate (1) or the open-items check
-//! (2) — the session counts it (`Shared::record_finish_refusal`), unless attested `Execution` evidence
-//! was recorded after the last rejected `FinishVerdict` in the journal (a read failure counts as no fresh
+//! (2) — the session counts it (`Shared::record_finish_refusal`), unless attested `Execution` evidence (a
+//! run: analysis output, a read or reference data is `Static` and does not count) was recorded after the
+//! last rejected `FinishVerdict` in the journal (a read failure counts as no fresh
 //! evidence rather than failing the finish). At `STUCK_FINISH_REJECTIONS` consecutive refusals the
 //! operator is opened one non-blocking `InboxItem { kind: Question, blocking: false, options: Keep
 //!      working / Narrow the goal / Release the mission / Conclude unreachable }` (`texts::stuck_inbox_text`,
@@ -117,7 +118,8 @@
 //!
 //! **Objections.** Before the open-items check, each open `Objection` obligation is settled (`ObligationSettle`)
 //! when an attested evidence record of kind `Execution` was added after it (by journal entry order); the
-//! outcome names the record. When the operator released the mission every open objection is settled. Nothing
+//! outcome names the record. `Execution` is a run: a quote of analysis output (`dep_scan`, a decompilation,
+//! cross-references) or of reference data is `Static` and settles nothing. When the operator released the mission every open objection is settled. Nothing
 //! else settles one: answering an inbox item, a question, or calling finish again does not. While one is open
 //! `check_finish_lead` refuses finish.
 //!
@@ -148,8 +150,9 @@
 //! refused, with a sentence listing them and `These are routes still open; run one of them.`, while a plan
 //! step is open. Writes `GoalMetSet { Supported | Refuted, note,
 //! evidence }`; the ledger's own rules refuse a missing goal, a blank note, evidence that is missing,
-//! unattested, not supporting or static only, a repeat, and, for a goal a rejected finish reopened, evidence
-//! with no run recorded after the reopening. Output: ok, outcome `goal concluded: ...`, saying
+//! unattested, not supporting or not a run (the sentence names each cited record's grade and tool and says
+//! why analysis, a read or a lookup is not a run), a repeat, and, for a goal a rejected finish reopened,
+//! evidence with no run recorded after the reopening. The refusal is passed through verbatim. Output: ok, outcome `goal concluded: ...`, saying
 //! that `finish` may now be called.
 //!
 //! ## `verdict` (verifier role)
@@ -240,9 +243,14 @@
 //! non-blocking inbox item opened once at the threshold when no new execution evidence appeared, and the
 //! line for the model; nothing when a fresh run does appear), the
 //! count restarting at an accepted finish only, an answered inbox item changing nothing, the goal-met
-//! pre-gate, objections settled by new execution evidence, an operator release, verifier ending without a
+//! pre-gate, objections settled by new execution evidence and NOT by new analysis evidence (a quote of a
+//! `dep_scan` output recorded after the objection leaves it open and the finish refused), stuck detection
+//! not reset by analysis evidence (the count keeps rising), the verifier's assignment showing each evidence
+//! record's grade and tool, an operator release, verifier ending without a
 //! verdict and spawn failure (retried, then held with a notice, no inbox item), shutdown and cancellation
-//! (error, nothing recorded); `conclude` - met, unreachable with and without open plan steps, unreachable refused in a solvable pack (with and without `report_blocker`), a child;
+//! (error, nothing recorded); `conclude` - met, unreachable with and without open plan steps, unreachable refused in a solvable pack (with and without `report_blocker`), a child,
+//! met citing only analysis evidence refused with the ledger's sentence (`analysis is not a run`) and nothing
+//! recorded;
 //! `verdict` — each refusal, the settle effect and payload; `ask_user` — blocking and not, child
 //! refusal, missing `meanwhile`, ledger question recorded and referenced; `report_blocker` — child
 //! and lead; `wait` — nothing running, a running job, a running child.
@@ -390,7 +398,7 @@ pub fn quote_items() -> Value {
 ///   this goal cannot be met as stated. Name one route to it that was not tried, or get one step further
 ///   toward the goal yourself. Do not confirm that it is impossible: accept only if you tried and found no
 ///   untried route.`, and `context` has, after the goal, `The lead concluded the goal cannot be met as
-///   stated (evidence: {ids}):\n{note}`.
+///   stated (evidence: {labels}):\n{note}` (`LedgerState::evidence_labels`: `e1 run by bash, …`).
 /// - `context`: `Goal (set by the operator):\n{goal}`, then `Constraints:` with one `- ` line per
 ///   active constraint (omitted when none), then `The lead's summary of the result:\n{answer}`, then
 ///   `What the lead says it did not establish:` when it stated something, then
@@ -400,9 +408,10 @@ pub fn quote_items() -> Value {
 ///   with one line per record of `evidence` (the ids given to `finish`; omitted when none), then
 ///   `Claims recorded as supported:` with one line per supported claim `- {id}: {text}`, each followed
 ///   by its evidence records, indented (omitted when none).
-///   An evidence line has the form the `verify` tool uses: `- {id} ({supports|undermines}) {handle}
-///   lines {a}-{b}: {quote cut to 300 characters} — {note}`, so the assignment names the stored
-///   output of every piece of evidence the result rests on.
+///   An evidence line has the form the `verify` tool uses: `- {id} ({supports|undermines};
+///   {source_label}) {handle} lines {a}-{b}: {quote cut to 300 characters} — {note}`, so the assignment
+///   names the stored output of every piece of evidence the result rests on, and whether it is a run
+///   (`run by bash`) or not (`analysis by dep_scan`).
 /// - `returns`: `A verdict, delivered by calling verdict.`
 /// - `stop_when`: `You have checked the summary against the goal, each constraint, and the outputs
 ///   it relies on.`

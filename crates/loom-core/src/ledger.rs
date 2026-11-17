@@ -6,8 +6,11 @@
 //! Authorship rules enforced by the runtime before an op is appended:
 //! - `GoalSet`, `ConstraintAdd`, `ApprovalGrant`, `QuestionAnswer` come only from user input.
 //! - `EvidenceAdd` is attested: the runtime confirms the cited tool call exists in the cited session
-//!   log, copies the stored output's hash, and checks any quote verbatim.
+//!   log, copies the stored output's hash, and checks any quote verbatim. It also records the tool
+//!   that produced the output and the output's [`EvidenceGrade`]; `kind` is `Execution` exactly when
+//!   that grade is `Run`.
 
+pub use crate::event::EvidenceGrade;
 use crate::ids::{BlobId, CallId, SessionId};
 use serde::{Deserialize, Serialize};
 
@@ -181,9 +184,9 @@ pub enum ClaimStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
-    /// Something was run and its behaviour observed.
+    /// Something was run and its behaviour observed (grade `run`).
     Execution,
-    /// Something was read.
+    /// Anything else: something was read, analysed, or looked up (grades `analysis`, `read`, `reference`).
     Static,
 }
 
@@ -220,6 +223,35 @@ pub struct EvidenceInput {
     pub note: String,
     #[serde(default)]
     pub attested: bool,
+    /// Name of the tool whose output this quotes (`bash`, `dep_scan`, …). `None` in entries written before
+    /// it was recorded. Not serialized when `None`, so an old entry's bytes, and its MAC, are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// The output's grade (`event::EvidenceGrade::of` of the producing result). `None` in older entries;
+    /// [`EvidenceInput::grade_or_kind`] then reads it from `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade: Option<EvidenceGrade>,
+}
+
+impl EvidenceInput {
+    /// The recorded grade; for an entry written before grades were recorded, the one its `kind` implies
+    /// (`Run` for `Execution`, `Read` for `Static`).
+    pub fn grade_or_kind(&self) -> EvidenceGrade {
+        self.grade.unwrap_or(match self.kind {
+            EvidenceKind::Execution => EvidenceGrade::Run,
+            EvidenceKind::Static => EvidenceGrade::Read,
+        })
+    }
+
+    /// How the views name where a record came from: `{grade} by {tool}` (`run by bash`, `analysis by
+    /// dep_scan`), or `{grade}` alone when the tool was not recorded.
+    pub fn source_label(&self) -> String {
+        let grade = self.grade_or_kind().as_str();
+        match self.tool.as_deref().filter(|t| !t.is_empty()) {
+            Some(tool) => format!("{grade} by {tool}"),
+            None => grade.to_string(),
+        }
+    }
 }
 
 /// One line of a mission journal.
@@ -452,7 +484,10 @@ pub struct LedgerState {
 //   evidence id must exist; to `Dropped` requires a non-empty `note`;
 // - `ClaimUpdate` to `Supported` requires the claim to have at least one evidence record with
 //   `supports == true` and `attested == true`; to `Refuted`/`Withdrawn` requires a non-empty note;
-// - `EvidenceAdd` requires the claim id to exist and a non-empty `note`;
+// - `EvidenceAdd` requires the claim id to exist and a non-empty `note`; when `grade` is present it must agree
+//   with `kind` (`Execution` exactly when the grade is `Run`), else refused with a sentence saying the
+//   harness recorded a grade that contradicts the kind (a harness fault, not the model's: nothing to fix
+//   in the call). An entry without `grade` (written before grades were recorded) is not checked;
 // - `ObligationSettle`/`ApprovalUse` on an already settled/used item → refused, saying so;
 // - `FinishClaim` is refused while `open_items()` is not empty; the message lists every open item by
 //   id and first 80 characters, and for each kind how to close it;
@@ -466,8 +501,15 @@ pub struct LedgerState {
 // `GoalMetSet` with `Open` is refused by `validate` and ignored by `apply`), so the model can move the
 // claim toward a conclusion but never retract it. `validate` requires: a goal is set; the target is
 // `Supported` or `Refuted`; a non-blank `note`; at least one named evidence id, every id existing, every
-// one attested and supporting; at least one of them of kind `Execution` (reading source alone is
-// refused: run the target and cite the run). Once terminal it may be written again only with the OTHER
+// one attested and supporting; at least one of them of kind `Execution`, i.e. a run (a quote of analysis
+// output, of a read, or of reference data alone is refused: run the target and cite the run). That refusal
+// reads: `None of the cited evidence is a run: {labels}.`
+// where `{labels}` is `LedgerState::evidence_labels` of the cited ids, then, for each grade present among
+// them, in this order, one sentence: analysis → `Analysis output (a dependency scan, a decompilation,
+// cross-references) describes the target without running it: analysis is not a run.`; read → `Reading
+// source or a page does not show what the target does when it runs.`; reference → `Reference data (a CVE
+// or advisory record) is about the world, not this target: a lookup is not a run.`; then `Run the target,
+// record the run with `evidence`, and cite that record.` Once terminal it may be written again only with the OTHER
 // terminal status and at least one execution evidence record added after the entry that set the current
 // status (`GoalMet.n`); repeating the current status is refused. `apply` replaces status, note and
 // evidence and records the entry position.
@@ -500,24 +542,42 @@ pub struct LedgerState {
 // `brief(opts)` renders the compact state text used in the HUD and after a re-weave, in this order,
 // omitting empty sections: `Goal:` (full text), `Constraints:` (active only, verbatim), `Plan:` (one
 // line per non-dropped step: `[x] p1 text — note` / `[>] doing` / `[ ] todo`), `Open obligations:`,
-// `Claims:` (id, status, text, evidence ids), `Decisions:` (last `opts.max_decisions`),
+// `Claims:` (id, status, text, evidence labels), `Decisions:` (last `opts.max_decisions`),
 // `Dead ends:` (last `opts.max_dead_ends`) — each of these two starts, right under its heading, with the
 // line `(N older not shown: {first id}–{last id}, or the one id when N is 1; call `ledger` to read them)` when older items were left out —,
 // `Approvals:` (unused ones, verbatim, with scope),
 // `Unanswered questions:`. Right after `Goal:` (when a goal is set, or grants exist) comes a section of
-// lines: `Goal status: open (not yet concluded)` / `Goal status: met — note (evidence: ids)` /
-// `Goal status: cannot be met as stated — note (evidence: ids)`; when released `released by the operator
+// lines: `Goal status: open (not yet concluded)` / `Goal status: met — note (evidence: labels)` /
+// `Goal status: cannot be met as stated — note (evidence: labels)`; when released `released by the operator
 // (goal not established): reason`; and `authorized hosts: a, b, c` or `authorized hosts: none granted`.
 // The reason and the hosts are the operator's words and are never cut. Evidence quotes are not included. Each line is cut at `opts.max_line`
-// characters with `…`. The output is deterministic.
+// characters with `…`. The output is deterministic. Evidence "labels" (`evidence_labels(ids)`) name each id
+// with where it came from, joined by `, `: `{id} {source_label}` (`e1 run by bash, e2 analysis by dep_scan`;
+// `e3 run` for an older entry with no tool recorded), or the bare id when no such record exists. So the
+// model sees, wherever its evidence is listed, which of it is a run.
 //
 // `render_markdown()` renders everything (all sections, all records including evidence with handle,
-// line range and quote) as a Markdown document that begins with the line
+// line range and quote; an evidence record's bullet line reads `- {supports|undermines} the claim; kind:
+// {kind}; grade: {grade_or_kind}; attested: {yes|no}`, and its source line is `- source: {tool}, session
+// {session}, call {call}` when the tool is recorded and `- source: session {session}, call {call}` as before
+// when not) as a Markdown document that begins with the line
 // `<!-- generated from the mission journal; edits here are ignored -->`.
+//
+// `summarize(op)` of an `EvidenceAdd`: `evidence for {claim} ({supports|undermines}, {source_label}) from call
+// {call}: {note}`.
 //
 // Tests required: id assignment incl. PlanSet replacement; every validate rule (accept and refuse);
 // open_items; apply ignores unknown ids; fold == repeated apply; brief ordering/omission/cutting and
-// determinism; markdown contains every record; serde round trip of every op variant.
+// determinism; markdown contains every record; serde round trip of every op variant. Evidence grades: an
+// `EvidenceAdd` without `tool`/`grade` serializes to exactly the bytes it did before the fields existed
+// and reads back with both `None`; one with them round-trips; `grade_or_kind`/`source_label` with and
+// without a recorded grade and tool; a grade that contradicts `kind` is refused (both ways) and an absent
+// one is not checked; a goal-met conclusion citing only analysis evidence is refused with a sentence that
+// contains `analysis is not a run` and names the record as `e1 analysis by dep_scan`, citing only reference
+// evidence names `a lookup is not a run`, citing analysis plus a read gives both sentences in order, and
+// citing analysis plus a run is accepted; the brief's claim and goal-status lines carry the labels (an
+// older entry shows `run`/`read` with no tool); markdown shows `grade:` and the tool; `summarize` shows the
+// label.
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

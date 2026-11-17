@@ -12,6 +12,12 @@
 //! Every readable process observation, including failure/cancellation/timeout/limit prefixes, is Raw
 //! output with completion/termination metadata. Read failures retain the protected output file.
 //! ProducedView stores and indexes full normalized decompiler output while showing at most 120 lines.
+//! `bin_decompile` and `bin_xrefs` are of class `Exec` (they run a backend), but what they produce is
+//! analysis of the binary, not an observation of it running: every result of either, whatever its status,
+//! carries `meta[META_EVIDENCE_GRADE] = "analysis"` (`loom_core::event::EvidenceGrade`), so a quote of it is
+//! never execution evidence. `gdb_probe` runs the target and keeps the default grade (`run`); `bin_survey`
+//! is `Read`. Tests: `bin_decompile` and `bin_xrefs` results (a missing backend and a refusal of bad
+//! arguments included) are graded `analysis`; `gdb_probe` and `bin_survey` results carry no grade.
 
 use crate::{
     params::{opt, req, spec},

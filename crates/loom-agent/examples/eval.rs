@@ -11,6 +11,10 @@
 //! table has one row per scenario with the mission's scorecard. Run it on two versions of the harness
 //! and compare the rows: the scripted model does the same thing in both, so a difference is the harness's.
 //! Exits 1 when a scenario could not be played or a name is not a scenario.
+//!
+//! Before it starts any thread, it writes the kit's fake `depscan` (`evalkit::install_fake_depscan`) to a
+//! temporary directory and puts that directory first on its own PATH, so a scenario that scans plays the
+//! same on every host; the directory is removed when it exits.
 
 use loom_agent::evalkit::{self, Outcome, Scenario};
 

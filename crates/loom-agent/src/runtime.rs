@@ -246,7 +246,11 @@
 //! stored); a `job_settled` whose output is `blob`, or a `job_matched` whose stored part is, credited
 //! to the call named by the `job_registered` of that job (`bash`, class `Exec`). Views of runtime tools
 //! register nothing.
-//! `Producer{session, call_id, tool: name, class}`. Kept as an in-memory index fed by
+//! `Producer{session, call_id, tool: name, class, grade}`, where `grade` is `EvidenceGrade::of(class, meta)`
+//! of that `tool_result` (so `dep_scan`, `bin_decompile` and `bin_xrefs` give `Analysis`, the CVE and
+//! advisory tools and a reference-host `web_fetch` give `Reference`, any other `Exec` result `Run`, any
+//! other result `Read`), and a job's output is `Run` (the `bash` call that started it). A log written
+//! before the grade key existed grades by class alone, as before. Kept as an in-memory index fed by
 //! every record that passes through the sink; on a miss for a mission whose logs have not been
 //! scanned since start, scan the logs of all its sessions once, then answer.
 //!

@@ -21,14 +21,18 @@
 //!   the counts always cover every parsed finding.
 //! - dep-scan's `depscan:prioritized` / `depscan:insights` labels are its own static
 //!   (reachability) analysis. The summary says so: they are scanner data about the scanned
-//!   tree, not execution evidence that vulnerable code runs in a deployed system.
+//!   tree, not execution evidence that vulnerable code runs in a deployed system. The harness
+//!   enforces it: every result, whatever its status, carries `meta[META_EVIDENCE_GRADE] =
+//!   "analysis"`, so a quote of a scan is recorded as static evidence and never meets a rule that
+//!   asks for a run (see `loom_core::event::EvidenceGrade`), although the tool is of class `Exec`.
 //! - Status is `Ok` for a completed scan whether or not it found anything (a scan result is
 //!   an observation, like an HTTP error status in `web_fetch`); `Error` when the scanner did
 //!   not complete or produced no parseable VDR, `Interrupted`/`Timeout` when it was stopped.
 //!
 //! Tests required: VDR parsing/sorting/counts and the no-findings case as pure functions; a
 //! fake `depscan` on `PATH` that writes an SBOM+VDR (end to end, stored blobs, raw meta);
-//! a missing `depscan` (install guidance, nothing invented); a bad target; a bad project type.
+//! a missing `depscan` (install guidance, nothing invented); a bad target; a bad project type; the result
+//! of a completed scan and of a failed one are both graded `analysis`.
 
 use crate::binary::{command_bounded, quote, CommandOutcome};
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};

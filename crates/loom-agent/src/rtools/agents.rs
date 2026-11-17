@@ -166,7 +166,9 @@
 //! With `claim`: read `S.ledger()`; an unknown id is an error listing the claim ids. The brief:
 //! - `question`: `Try to refute this claim: {text}`
 //! - `context` (claim form only): `Evidence recorded for it:` and per evidence record of the claim
-//!   `- {id} ({supports|undermines}) {handle} lines {a}-{b}: {quote cut to 300 characters} — {note}`;
+//!   `- {id} ({supports|undermines}; {source_label}) {handle} lines {a}-{b}: {quote cut to 300 characters} —
+//!   {note}`, where `source_label` is `EvidenceInput::source_label` (`run by bash`, `analysis by dep_scan`),
+//!   so the verifier sees which evidence is a run;
 //!   `No evidence is recorded for it.` when there is none. With `handles` given (either form), a
 //!   further paragraph `Outputs to examine: {handles joined by ", "}`.
 //! - `returns`: `A verdict, delivered by calling verdict.`
@@ -183,7 +185,8 @@
 //! `agent_fanout` — element errors collected, limit refusal, spawn failure stops the started ones,
 //! ordering of the combined report, outcome line, cancellation; `agent_message`; `agent_stop` both
 //! forms and the refusal; `decide` — tally, split, invalid votes, option count refusals; `verify` —
-//! both forms, unknown claim, evidence listing, verdict outcomes, missing payload; copies (real
+//! both forms, unknown claim, evidence listing (with each record's grade and tool), verdict outcomes,
+//! missing payload; copies (real
 //! copies of the rig's workspace, the fake orchestrator answering `child_copy`) — `agent_spawn` and
 //! `agent_fanout` ask for a copy and report its changes, the agent's own commands and stale ones,
 //! no call about copies without `copy`; `attempt` — the check really runs in every copy and the

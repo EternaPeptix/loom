@@ -25,6 +25,8 @@
 //! ## Moves
 //! A [`Move`] is one reply of the scripted model, almost always one tool call:
 //! - `Run`: `bash` with the task's command. `Look`: `bash` printing `numbers.txt`, which does no work.
+//!   `Scan`: `dep_scan` with no arguments (the workspace): a dependency scan, which runs a scanner but not
+//!   the target, so its output is analysis (`loom_core::event::EvidenceGrade::Analysis`), not a run.
 //! - `Claim`: `claim` that `sum.txt` holds the sum. `Evidence(quote)`: `evidence` for claim `c1`.
 //!   `Support`: `claim_update` of `c1` to `supported`. `Conclude(id)`: `conclude` as `met`, citing the
 //!   evidence record `id`. `Finish(quote)`: `finish` with the answer and one quote.
@@ -32,8 +34,8 @@
 //! - `Say(text)`: a reply without a call. `Call(name, arguments)`: a call exactly as written, for calls
 //!   that are wrong. `Cut`: a `bash` call the output limit cut before its arguments ended.
 //!
-//! The quote of an `Evidence` or a `Finish` is of line 1 of the latest run the request shows: the handle
-//! in the header of the latest `bash` result, or, for a lead that delegated, the first handle of the
+//! The quote of an `Evidence` or a `Finish` is of line 1 of the latest output the request shows: the handle
+//! in the header of the latest `bash` or `dep_scan` result, or, for a lead that delegated, the first handle of the
 //! checked quotes in the latest agent's report. A [`Quote`] says how it is given: `ByLines` (handle and
 //! line numbers, no text), `Exact` (with the line's text) or `Retyped` (with the text as a model writes
 //! it from memory, `holds` become `contains`: it does not occur in the output). With no run in view the
@@ -51,8 +53,23 @@
 //! `sum.txt` with `bash`), then gives its `verdict` with that output as `opened`; a rejection carries the
 //! objection [`OBJECTION`].
 //!
+//! ## The fake scanner
+//! `dep_scan` runs the operator-installed `depscan` found on the PATH that commands inherit, which is the
+//! process's own. [`FAKE_DEPSCAN`] is a POSIX shell script standing in for it: it writes one CycloneDX SBOM
+//! (`sbom-eval.cdx.json`, one component) and one VDR (`sbom-eval.vdr.json`, one vulnerability marked
+//! prioritized and reachable) into the directory after `--reports-dir`, prints one line, and exits 0, so
+//! the scan's result is the same on every host. [`install_fake_depscan(dir)`] writes it to `dir/depscan`
+//! (mode 0755) and returns that path. The kit never changes the process environment: whoever plays a
+//! scenario that scans puts that directory first on the PATH of the process before it starts threads (the
+//! `eval` example does so first thing; the tests play such a scenario in a child process of the test
+//! binary whose PATH is set when it is spawned).
+//!
 //! ## `run(scenario, dir)`
-//! Plays one scenario in the empty directory `dir`: writes the workspace under `dir/workspace`, starts a
+//! Plays one scenario in the empty directory `dir`. A scenario with a `Scan` move among its lead's or
+//! worker's moves is refused first, with nothing started, unless the first `depscan` on the process's PATH
+//! is a file whose bytes are [`FAKE_DEPSCAN`]: the error says the scenario scans with `dep_scan`, that it
+//! needs the kit's fake `depscan` first on PATH (`install_fake_depscan`), and what was found instead (a
+//! path, or that there is none), because a real scanner, or none, would give another card. Then it writes the workspace under `dir/workspace`, starts a
 //! `MockServer` with the scenario's script and a `Runtime` whose home is `dir/home`, creates a lead
 //! session of the built-in `core` pack with [`MESSAGE`], and waits until its turn has ended for a reason
 //! other than `Waiting`. The configuration is the default one with: the mock server as the only model
@@ -81,6 +98,13 @@
 //! - `delegates`: hands the task to a worker, which retypes its quote wrong once, and cites the worker's
 //!   run as its own evidence.
 //! - `gives_up`: looks at the input, then replies in prose until the stop gate parks it.
+//! - `concludes_on_a_scan`: scans the dependencies instead of running the target, attaches the scan's
+//!   output as evidence, concludes and finishes on it, is refused both times, then runs the target and
+//!   concludes and finishes on the run. Moves: `Scan, Claim, Evidence(ByLines), Support, Conclude("e1"),
+//!   Finish(ByLines), Run, Evidence(ByLines), Conclude("e2"), Finish(ByLines)`. The `conclude` on `e1` is
+//!   refused because analysis is not a run, so the `finish` after it is held by the goal pre-gate; before
+//!   evidence grades, a scan was execution evidence because `dep_scan` is an `Exec` tool, and this model
+//!   finished on the scan with `sum.txt` never written.
 //!
 //! ## `table(outcomes)`
 //! The outcomes as text, one row each under a header line, columns separated by two spaces and as wide
@@ -90,7 +114,14 @@
 //!
 //! Tests required: every scenario of the suite gives its pinned outcome (end, solved, sessions, lead
 //! card, mission card); a lead whose moves run out is parked; the names of the suite are distinct;
-//! `table` for two outcomes, exactly.
+//! `table` for two outcomes, exactly. `concludes_on_a_scan` is played in a child process of the test binary
+//! (the test runs itself again, filtered to an ignored test that does nothing unless a marker variable is
+//! set, with a temporary directory holding the fake `depscan` first on the child's PATH); the child asserts
+//! the pinned outcome and that the lead's log holds a `conclude` result with status `error` whose text
+//! contains `analysis is not a run` and `e1 analysis by dep_scan`, and the parent asserts the child passed
+//! and that it did play the scenario. `run` refuses a scanning scenario when the fake is not first on PATH
+//! (in the test process itself, where it is not), with nothing started. `install_fake_depscan` writes an
+//! executable file with exactly `FAKE_DEPSCAN`.
 
 use crate::runtime::{NewSession, Runtime};
 use crate::session::Phase;
