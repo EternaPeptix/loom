@@ -244,7 +244,7 @@ mod tests {
     use super::*;
 
     fn cfg() -> RootBoxCfg {
-        RootBoxCfg { enabled: true, ssh_host: "omarchy-box".into(), ..RootBoxCfg::default() }
+        RootBoxCfg { enabled: true, ssh_host: "test-rootbox".into(), ..RootBoxCfg::default() }
     }
 
     #[test]
@@ -263,7 +263,7 @@ mod tests {
                 "-o",
                 "LogLevel=ERROR",
                 "--",
-                "omarchy-box",
+                "test-rootbox",
                 "/bin/bash",
                 "-s"
             ]

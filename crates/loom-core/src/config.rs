@@ -1059,9 +1059,9 @@ allow = ["*.example.test"]
         assert!(!d.rootbox.enabled && d.rootbox.ssh_cli == "ssh" && d.rootbox.exec_timeout_s == 300);
         assert_eq!(d.rootbox.max_output_mb, 8);
         assert!(Config::parse("").unwrap().check().is_ok());
-        let ok = Config::parse("[rootbox]\nenabled = true\nssh_host = \"omarchy-box\"").unwrap();
+        let ok = Config::parse("[rootbox]\nenabled = true\nssh_host = \"test-rootbox\"").unwrap();
         assert!(ok.check().is_ok());
-        assert_eq!(ok.rootbox.name(), "omarchy-box");
+        assert_eq!(ok.rootbox.name(), "test-rootbox");
         let labelled = Config::parse("[rootbox]\nssh_host = \"h\"\nlabel = \"vm\"").unwrap();
         assert_eq!(labelled.rootbox.name(), "vm");
         for host in ["", "  "] {
