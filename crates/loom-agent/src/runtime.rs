@@ -130,8 +130,9 @@
 //! 1. `workspace` must be an existing directory (canonicalised); `~` and `~/x` mean the daemon user's home
 //!    directory (`expand_home`, `HOME`). When it does not exist: with `create_workspace` unset the sentence is
 //!    `The workspace {path} does not exist. Create it from the new-mission form (Create), or run `loom run
-//!    --create-workspace`.`; with it set, [`plan_workspace`] checks and, once the role, models and model facts
-//!    of the request are accepted, `create_dir_all` makes it (process umask) and it is canonicalised;
+//!    --create-workspace`.`; with it set, [`plan_workspace`] checks and, once the role, models, model facts
+//!    and earlier missions to recall (`prior`, step 3) of the request are accepted, `create_dir_all` makes it
+//!    (process umask) and it is canonicalised;
 //!    `create_session_receipt` says `true` for it (`POST /api/sessions` answers `created`). Refused, naming the
 //!    path and what to do, before anything is made: a relative path; a path that is or lies inside the loom
 //!    home or the copies directory (the sandbox refuses those workspaces); a `..` component in a path that does
@@ -162,8 +163,8 @@
 //!    is trimmed; blanks dropped; repeats dropped (first kept); more than `prior::MAX_PRIOR` refused
 //!    (`Name at most {MAX_PRIOR} earlier missions to recall; {n} were named.`); every id must be the
 //!    mission of a known session (`There is no mission {id} to recall.`). Archived missions may be
-//!    named. They are read before the session is made (`prior::read` on a blocking thread, the lead's
-//!    meta giving the title) and `meta.prior` keeps them in the given order.
+//!    named. They are read before the session and a missing workspace are made (`prior::read` on a blocking
+//!    thread, the lead's meta giving the title) and `meta.prior` keeps them in the given order.
 //! 4. `SessionStart{session, mission, parent: None, workspace, pack, role, termination,
 //!    model: ModelRef{profile, model, context_window}, reasoning_replay (profile),
 //!    system_prompt: pack::system_prompt(role, &pack.preamble, &PromptEnv{workspace,
@@ -4635,6 +4636,8 @@ impl Runtime {
             }
         }
         let (model, window, from_config) = inner.facts(&profile_name).await?;
+        // The earlier missions to recall can refuse the request too, so they are read before the folder is made.
+        let (prior_ids, recalled) = self.recall_earlier(&new.prior).await?;
         let made = plan.make_tracked()?;
         let workspace = made.path.clone();
         let created = !made.created.is_empty();
@@ -4648,7 +4651,6 @@ impl Runtime {
                 }
             }
         };
-        let (prior_ids, recalled) = self.recall_earlier(&new.prior).await?;
         let id = SessionId::generate();
         let explicit = role.termination == Termination::Explicit;
         let meta = SessionMeta {
@@ -12115,6 +12117,30 @@ mod tests {
         assert!(!later.exists());
     }
 
+    #[tokio::test]
+    async fn earlier_missions_that_cannot_be_recalled_refuse_before_a_missing_workspace_is_made() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let missing = e.dir.path().join("recall/ws");
+        let make = |prior: Vec<MissionId>| NewSession {
+            workspace: missing.clone(),
+            create_workspace: true,
+            prior,
+            ..NewSession::default()
+        };
+        let err = e.rt.create_session_receipt(make(vec![MissionId::from("m-nope")])).await.unwrap_err();
+        assert_eq!(err, "There is no mission m-nope to recall.");
+        assert!(!e.dir.path().join("recall").exists(), "a refused request makes no folder");
+        let many = (0..9).map(|i| MissionId::from(format!("m-{i}"))).collect();
+        let err = e.rt.create_session_receipt(make(many)).await.unwrap_err();
+        assert!(err.starts_with("Name at most 8 earlier missions"), "{err}");
+        assert!(!e.dir.path().join("recall").exists());
+        // A mission that can be recalled: the folder is made and the new lead keeps what it recalls.
+        let earlier = mission_with_goal(&e, "one", "g").await;
+        let (info, created) = e.rt.create_session_receipt(make(vec![earlier.clone()])).await.unwrap();
+        assert!(created && missing.is_dir());
+        assert_eq!(info.meta.prior, vec![earlier]);
+        e.rt.shutdown().await;
+    }
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn the_data_volume_spelling_of_the_loom_home_does_not_get_around_the_refusal() {

@@ -485,6 +485,14 @@ async function createSession(data) {
   const path = cleanPath(expandHome(raw));
   if (!path.startsWith("/")) return { status: 409, error: `The workspace ${raw} is a relative path that does not exist. Give an absolute path, or one that starts with ~/.` };
   if (inside(path, LOOM_HOME)) return { status: 409, error: `The workspace ${path} is inside the loom home (${LOOM_HOME}) or its copies folder, which sessions cannot use. Choose a folder elsewhere.` };
+  // As the daemon does, the earlier missions to recall are checked before any folder is made.
+  if (data.prior !== undefined) {
+    if (!Array.isArray(data.prior)) return { status: 400, error: "prior must be a list of mission ids." };
+    const named = [...new Set(data.prior.map(m => String(m).trim()).filter(Boolean))];
+    if (named.length > 8) return { status: 409, error: `Name at most 8 earlier missions to recall; ${named.length} were named.` };
+    const unknown = named.find(m => !sessions.some(s => s.mission === m));
+    if (unknown !== undefined) return { status: 404, error: `There is no mission ${unknown} to recall.` };
+  }
   let created = false;
   if (fsDirs(path) === null) {
     if (!data.create_workspace) return { status: 409, error: `The workspace ${path} does not exist. Create it from the new-mission form (Create), or run \`loom run --create-workspace\`.` };
