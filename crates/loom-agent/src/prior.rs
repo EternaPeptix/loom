@@ -84,10 +84,15 @@
 //!   blank; then the lines of `frontier::render` of the frontier below, when it renders. Left out (label too)
 //!   when both are empty. Every line of the section is model text: every kind of line break in it (`\n`,
 //!   `\r`, `\v`, `\f`, U+0085, U+2028, U+2029) is written as a space, so one rendered line stays one quoted
-//!   line, and every URL in it is scrubbed: a whitespace-separated token containing `://` that, after its
-//!   leading `([{<'"` and trailing `.,;:)]}>'"` are set aside, parses as an absolute URL with a host is written without its query,
-//!   fragment, user name and password, and the set-aside characters are put back. A token that does not parse
-//!   stays as it is. The operator's text (goal, rules, answers) is not changed.
+//!   line, and every URL in it is scrubbed, at every occurrence of `://`: the URL runs from its scheme (back
+//!   over `[A-Za-z][A-Za-z0-9+.-]*`) to the first whitespace, quote, bracket (but a `[` right after `://` or `@` opens an IPv6 host, closed by
+//!   its `]`), `|`, `*`, `,` or curly quote, or
+//!   to the next `://`, less trailing `.;:!`, which stay as they are. A span that parses as an absolute URL
+//!   with a host is written without its query, fragment, user name and password. Any other span fails
+//!   closed: everything from just after `://` up to and including the last `@` before the first `/`, `?` or
+//!   `#` is dropped, then it is cut at its first `?` or `#`. The texts of the frontier's items are scrubbed
+//!   before `render` (which cuts lines and so can cut a URL in two) and every rendered line again after. The
+//!   operator's text (goal, rules, answers) is not changed.
 //! - The frontier: `frontier::frontier(&state, end_ms)` with `attempts_run` 0, then every hypothesis taken
 //!   out of it — items of `established`, `ruled_out` and `open_leads` whose id starts with `hy-`, every item of
 //!   `untested`, and `surfaces_total`/`surfaces_closed` set to 0 — so it shows claims, plan steps, dead ends,
@@ -106,10 +111,12 @@
 //!   - Routes to revisit when it ended: `{n}` = `security.newly_unlocked_at(end_ms).len()`, then ` (they are
 //!     among its open leads above)`; no id and no locator. Left out when there is none.
 //!   - A locator list shows at most 12, then ` (+{k} more)`, joined by `, `. Each locator is `{kind}
-//!     {locator}` (kind in lower case: `host`, `service`, `endpoint`, `file`, `identity`). An `endpoint` or
-//!     `service` locator is parsed as a URL and shown without its query, fragment and any user name or
-//!     password; one that does not parse is cut before its first `?` or `#`. Any other locator that parses as
-//!     an absolute URL with a host is shown the same way; one that does not is cut before its first `?`. Then one line, cut to 120 characters.
+//!     {locator}` (kind in lower case: `host`, `service`, `endpoint`, `file`, `identity`). A locator that
+//!     parses as an absolute URL with a host is shown without its query, fragment, user name and password.
+//!     One with `://` or a leading `//` that does not so parse fails closed as above (user information
+//!     dropped, cut before its first `?` or `#`). Any other loses a leading `[^/\s@]*@` (the scp form
+//!     `user@host:path`) and is cut before its first `?` (`endpoint` and `service`: `?` or `#`). Then one
+//!     line, cut to 120 characters.
 //! - `{YYYY-MM-DD HH:MM}`: `end_ms` in UTC (proleptic Gregorian).
 //!
 //! Tests required: `read` of a journal with entries (state and the last entry's time), of no file (Nothing),
@@ -326,6 +333,10 @@ fn work_frontier(state: &LedgerState, end_ms: u64) -> Frontier {
     drop_hypotheses(&mut f.established);
     drop_hypotheses(&mut f.ruled_out);
     drop_hypotheses(&mut f.open_leads);
+    // Scrubbed here as well as after `render`, which cuts a line and so can cut a URL in two.
+    for i in f.established.iter_mut().chain(&mut f.ruled_out).chain(&mut f.set_aside).chain(&mut f.open_leads) {
+        i.text = scrub_urls(&flat(&i.text));
+    }
     f.untested.clear();
     f.surfaces_total = 0;
     f.surfaces_closed = 0;
@@ -363,13 +374,11 @@ fn locator(a: &Asset) -> String {
         AssetKind::File => "file",
         AssetKind::Identity => "identity",
     };
-    let shown = match a.kind {
-        AssetKind::Endpoint | AssetKind::Service => url_without_secrets(&a.locator),
-        _ => match absolute_url(a.locator.trim()) {
-            Some(u) => strip_secrets(u),
-            None => before(&a.locator, &['?']),
-        },
+    let marks: &[char] = match a.kind {
+        AssetKind::Endpoint | AssetKind::Service => &['?', '#'],
+        _ => &['?'],
     };
+    let shown = scrub_locator(&a.locator, marks);
     format!("{kind} {}", flat(&shown))
 }
 
@@ -383,54 +392,153 @@ fn absolute_url(s: &str) -> Option<url::Url> {
     url::Url::parse(s).ok().filter(|u| u.host_str().is_some())
 }
 
-/// `u` without its query, fragment, user name and password.
-fn strip_secrets(mut u: url::Url) -> String {
+/// `s` as an absolute URL with a host, written without its query, fragment, user name and password; `None`
+/// when it does not parse or when the user name or password could not be removed.
+fn scrubbed_url(s: &str) -> Option<String> {
+    let mut u = absolute_url(s)?;
     u.set_query(None);
     u.set_fragment(None);
-    // A URL that cannot carry credentials has none to remove.
     let _ = u.set_username("");
     let _ = u.set_password(None);
-    u.to_string()
+    (u.username().is_empty() && u.password().is_none()).then(|| u.to_string())
 }
 
-/// A URL without its query, fragment, user name and password; text that is not a URL is cut before its
-/// first `?` or `#`.
-fn url_without_secrets(s: &str) -> String {
-    match url::Url::parse(s.trim()) {
-        Ok(u) => strip_secrets(u),
-        Err(_) => before(s.trim(), &['?', '#']),
-    }
+/// What follows `://` (or `//`) without its user information, cut before its first `?` or `#`: everything up to
+/// and including the last `@` that comes before the first `/`, `?` or `#` is dropped.
+fn drop_userinfo(rest: &str) -> String {
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let auth = rest.get(..auth_end).unwrap_or("");
+    let after = match auth.rfind('@') {
+        Some(i) => rest.get(i.saturating_add(1)..).unwrap_or(""),
+        None => rest,
+    };
+    before(after, &['?', '#'])
 }
 
-/// `text` with every URL token (see the contract) written without its query, fragment and credentials.
-fn scrub_urls(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut token = String::new();
-    for c in text.chars() {
-        if c.is_whitespace() {
-            out.push_str(&scrub_token(&token));
-            token.clear();
-            out.push(c);
-        } else {
-            token.push(c);
+/// The fail-closed form of text that holds `://` but is not a URL with a host: `scheme://` and the rest
+/// without user information, query or fragment.
+fn fail_closed(s: &str) -> String {
+    match s.find("://") {
+        None => before(s, &['?', '#']),
+        Some(i) => {
+            let split = i.saturating_add(3);
+            format!("{}{}", s.get(..split).unwrap_or(""), drop_userinfo(s.get(split..).unwrap_or("")))
         }
     }
-    out.push_str(&scrub_token(&token));
-    out
 }
 
-fn scrub_token(token: &str) -> String {
-    if !token.contains("://") {
-        return token.to_string();
+/// An asset locator without what can hold a secret. An absolute URL with a host loses its query, fragment,
+/// user name and password; other text with `://` or a leading `//` loses its user information and is cut
+/// before its first `?` or `#`; the rest loses a leading `user@` (the scp form) and is cut before its first
+/// character in `marks`.
+fn scrub_locator(s: &str, marks: &[char]) -> String {
+    let s = s.trim();
+    if let Some(u) = scrubbed_url(s) {
+        return u;
     }
-    let rest = token.trim_start_matches(['(', '[', '{', '<', '\'', '"']);
-    let head = token.get(..token.len().saturating_sub(rest.len())).unwrap_or("");
-    let core = rest.trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '>', '\'', '"']);
-    let tail = rest.get(core.len()..).unwrap_or("");
-    match absolute_url(core) {
-        Some(u) => format!("{head}{}{tail}", strip_secrets(u)),
-        None => token.to_string(),
+    if s.contains("://") {
+        return fail_closed(s);
     }
+    if let Some(rest) = s.strip_prefix("//") {
+        return format!("//{}", drop_userinfo(rest));
+    }
+    let s = match s.find('@') {
+        Some(i) if s.get(..i).is_some_and(|u| !u.contains(|c: char| c == '/' || c.is_whitespace())) => {
+            s.get(i.saturating_add(1)..).unwrap_or("")
+        }
+        _ => s,
+    };
+    before(s, marks)
+}
+
+/// Characters that end a URL in running text.
+fn ends_url(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '`' | '"'
+                | '\''
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '|'
+                | '*'
+                | ','
+                | '\u{2018}'
+                | '\u{2019}'
+                | '\u{201c}'
+                | '\u{201d}'
+                | '\u{ab}'
+                | '\u{bb}'
+        )
+}
+
+/// Where the scheme of the URL whose `://` is at `sep` starts: back over `[A-Za-z][A-Za-z0-9+.-]*`.
+fn scheme_start(text: &str, sep: usize) -> usize {
+    let head = text.get(..sep).unwrap_or("");
+    let mut start = sep;
+    for (i, c) in head.char_indices().rev() {
+        if c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-') {
+            start = i;
+        } else {
+            break;
+        }
+    }
+    while let Some(c) = text.get(start..sep).and_then(|t| t.chars().next()) {
+        if c.is_ascii_alphabetic() {
+            break;
+        }
+        start = start.saturating_add(c.len_utf8());
+    }
+    start
+}
+
+/// `text` with every URL written without its query, fragment, user name and password (see the contract): at
+/// every `://`, the span from its scheme to the next whitespace, quote or bracket (or the next `://`).
+fn scrub_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0usize;
+    let mut from = 0usize;
+    while let Some(rel) = text.get(from..).and_then(|t| t.find("://")) {
+        let sep = from.saturating_add(rel);
+        let body = sep.saturating_add(3);
+        let start = scheme_start(text, sep).max(copied);
+        let mut end = text.len();
+        // A `[` that opens the host (right after `://` or `@`) is an IPv6 address, closed by its `]`.
+        let mut in_host = false;
+        let mut prev = text.get(..body).and_then(|t| t.chars().last());
+        for (i, c) in text.get(body..).unwrap_or("").char_indices() {
+            if c == '[' && matches!(prev, Some('/' | '@')) {
+                in_host = true;
+            } else if c == ']' && in_host {
+                in_host = false;
+            } else if ends_url(c) {
+                end = body.saturating_add(i);
+                break;
+            }
+            prev = Some(c);
+        }
+        if let Some(n) = text.get(body..end).and_then(|t| t.find("://")) {
+            end = scheme_start(text, body.saturating_add(n)).max(body);
+        }
+        let span = text.get(start..end).unwrap_or("");
+        // Punctuation that closes a sentence is not part of the URL.
+        let core = span.trim_end_matches(['.', ';', ':', '!']);
+        let tail = span.get(core.len()..).unwrap_or("");
+        let scrubbed = scrubbed_url(core).unwrap_or_else(|| fail_closed(core));
+        out.push_str(text.get(copied..start).unwrap_or(""));
+        out.push_str(&scrubbed);
+        out.push_str(tail);
+        copied = end;
+        from = end.max(body);
+    }
+    out.push_str(text.get(copied..).unwrap_or(""));
+    out
 }
 
 /// `a, b, c`, at most `MAX_LOCATORS`, then ` (+k more)`.
@@ -992,8 +1100,9 @@ mod tests {
         let model = text.split(MODEL_LABEL).nth(1).unwrap_or("");
         assert!(model.contains("> Goal note: note (https://h.test/a), and https://h.test/a. "), "{model}");
         assert!(model.contains("latest c1: see https://h.test/a; <https://h2.test/p>."), "{model}");
-        // Tokens that do not parse as a URL with a host stay as they are.
-        assert!(model.contains("x://?q=SECRET2 http://[bad?y=SECRET3"), "{model}");
+        // Text that has `://` but is not a URL with a host fails closed.
+        assert!(model.contains("x:// http://[bad"), "{model}");
+        assert!(!model.contains("SECRET2") && !model.contains("SECRET3"), "{model}");
         assert!(!model.contains("SECRET4") && !model.contains("token=") && !model.contains("pw@"), "{model}");
     }
 
@@ -1153,6 +1262,78 @@ mod tests {
         assert_eq!(l(AssetKind::Host, "ssh://root:pw@h.test:2222/"), "host ssh://h.test:2222/");
         assert_eq!(l(AssetKind::File, "C:/a?b"), "file C:/a");
         assert_eq!(l(AssetKind::File, "a\nb"), "file a b");
+        // A locator that is not a URL still loses its user information.
+        assert_eq!(l(AssetKind::File, "root:SECRET1@10.0.0.5:/etc/shadow"), "file 10.0.0.5:/etc/shadow");
+        assert_eq!(l(AssetKind::File, "//u:SECRET2@h/share/x?k=1"), "file //h/share/x");
+        assert_eq!(l(AssetKind::File, "file://u:SECRET3@h/x?k#f"), "file file://h/x");
+        assert_eq!(l(AssetKind::File, "https://a@b:SECRET4@h.test:99999/x?k#f"), "file https://h.test:99999/x");
+        assert_eq!(l(AssetKind::Endpoint, "http://u:SECRET5@h.test%/x?k"), "endpoint http://h.test%/x");
+        assert_eq!(l(AssetKind::Host, "user@h.test"), "host h.test");
+        // A path with an @ after its first slash keeps it.
+        assert_eq!(l(AssetKind::File, "/home/a@b/x"), "file /home/a@b/x");
+    }
+
+    /// The text of a frontier whose latest established claim says `claim_text`.
+    fn model_text_of(claim_text: &str) -> String {
+        let text = one(LedgerState {
+            claims: vec![claim("c1", claim_text, ClaimStatus::Supported, &["e1"])],
+            ..Default::default()
+        });
+        text.split(MODEL_LABEL).nth(1).unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn a_url_that_the_line_cut_would_split_is_scrubbed_first() {
+        for pad in (100..=235).step_by(3) {
+            let claim_text = format!(
+                "{} https://admin:SECRETPW@internal.example.test/path?token=SECRETTOK#SECRETFRAG tail",
+                "p".repeat(pad)
+            );
+            let model = model_text_of(&claim_text);
+            assert!(!model.contains("SECRET") && !model.contains("admin:"), "pad {pad}: {model}");
+        }
+        // The cut still happens, after the scrub.
+        let model = model_text_of(&format!("{} https://u:pw@h.test/a?SECRETQ", "p".repeat(200)));
+        assert!(model.contains('…') && !model.contains("SECRET") && !model.contains("pw@"), "{model}");
+    }
+
+    #[test]
+    fn a_url_is_scrubbed_wherever_it_sits_in_the_text() {
+        let probes = [
+            "`https://u:pw@h.test/?token=SECRET1`",
+            "[x](https://u:pw@h.test/?token=SECRET2)",
+            "url=https://u:pw@h.test/?t=SECRET3",
+            "{\"url\":\"https://u:pw@h.test/?t=SECRET4\"}",
+            "\u{201c}https://u:pw@h.test/?t=SECRET5\u{201d}",
+            "-https://u:pw@h.test/?t=SECRET6",
+            "*https://u:pw@h.test/?t=SECRET7*",
+            "\u{200b}https://u:pw@h.test/?t=SECRET8",
+            "http://u:pw@h.test:99999/?t=SECRET9",
+            "http://u:pw@h.test%/?t=SECRET10",
+            "http://u:pw@[::1?t=SECRET11",
+            "http://u:pw@[::1]:8080/p?t=SECRET20",
+            "https://a.test/x,https://u:pw@b.test/?t=SECRET12",
+            "https://a.test/xhttps://u:pw@b.test/?t=SECRET13",
+            "ssh://root:pw@h.test:22/?t=SECRET14|https://u:pw@h.test/#SECRET15",
+            "\u{ab}https://u:pw@h.test/?t=SECRET16\u{bb}",
+            "a://b:SECRET17@@c://d:SECRET18@e",
+            "https://",
+            "https://@",
+            "://u:SECRET19@h",
+        ];
+        for probe in probes {
+            let model = model_text_of(&format!("see {probe} end"));
+            assert!(
+                !model.contains("SECRET") && !model.contains("pw@") && !model.contains("u:pw") && !model.contains("t="),
+                "{probe}: {model}"
+            );
+            assert!(model.contains("latest c1: see ") && model.contains(" end"), "{probe}: {model}");
+        }
+        // What is not a secret stays, and the text around a URL is untouched.
+        let model = model_text_of("a https://a.test/x,https://u:pw@b.test/?q=1 b");
+        assert!(model.contains("latest c1: a https://a.test/x,https://b.test/ b"), "{model}");
+        assert_eq!(scrub_urls("héllo wörld ünï — no url"), "héllo wörld ünï — no url");
+        assert_eq!(scrub_urls("end https://h.test/a?x=1."), "end https://h.test/a.");
     }
 
     #[test]

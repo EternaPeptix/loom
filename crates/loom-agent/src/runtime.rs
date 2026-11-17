@@ -7177,6 +7177,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_scans_the_mission_whatever_handle_is_asked_for_next() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let mission = e.rt.create_session(e.new_session(None)).await.unwrap().meta.mission;
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert!(!rt2.inner.st().scanned.contains(&mission));
+        let scope = MissionOutputs { runtime: Arc::downgrade(&rt2.inner), mission: mission.clone() };
+        // A handle that names nothing: the answer must not depend on whether this mission was scanned before.
+        scope.ready().await;
+        assert!(rt2.inner.st().scanned.contains(&mission));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_spawned_child_waits_on_its_own_watched_job_while_its_parent_blocks_in_join() {
         // Bounded, so a failed run leaves no loop behind. The job writes its line only when the test says so.
         let command = "echo scanning; i=0; while [ ! -f release ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done; \
