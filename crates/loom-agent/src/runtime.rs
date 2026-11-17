@@ -3442,8 +3442,14 @@ pub fn disk_is_low(free: u64, total: u64) -> bool {
     free < LOW_DISK_BYTES || u128::from(free) * 100 < u128::from(total) * u128::from(LOW_DISK_PERCENT)
 }
 
-/// What `start` warns about in the configuration, one sentence each.
-fn start_warnings(config: &Config, macos: bool) -> Vec<String> {
+/// What `start` warns about in the configuration, one sentence each. `key_is_set` says whether a variable
+/// is present and not empty in the daemon's environment.
+fn start_warnings(
+    config: &Config,
+    macos: bool,
+    keys_dir: &std::path::Path,
+    key_is_set: impl Fn(&str) -> bool,
+) -> Vec<String> {
     let mut out = Vec::new();
     if config.notify.command.is_empty() && !macos {
         out.push(
@@ -3457,6 +3463,7 @@ fn start_warnings(config: &Config, macos: bool) -> Vec<String> {
                 .to_string(),
         );
     }
+    out.extend(config.key_env_warnings(keys_dir, key_is_set));
     out
 }
 
@@ -3603,7 +3610,7 @@ impl Runtime {
         let blobs = BlobStore::open(paths.blobs_dir()).map_err(|e| format!("cannot open the blob store: {e}"))?;
         let mut profiles = BTreeMap::new();
         for (name, profile) in &config.models {
-            let client = ModelClient::new(name, profile.clone()).map_err(|e| e.to_string())?;
+            let client = ModelClient::new(name, profile.clone(), &paths.model_keys_dir()).map_err(|e| e.to_string())?;
             profiles.insert(
                 name.clone(),
                 ProfileRt {
@@ -3613,7 +3620,8 @@ impl Runtime {
                 },
             );
         }
-        for warning in start_warnings(&config, cfg!(target_os = "macos")) {
+        let env_key_is_set = |var: &str| std::env::var_os(var).is_some_and(|v| !v.is_empty());
+        for warning in start_warnings(&config, cfg!(target_os = "macos"), &paths.model_keys_dir(), env_key_is_set) {
             tracing::warn!("{warning}");
         }
         config.check_box_paths(&paths.home)?;
@@ -7146,6 +7154,8 @@ mod tests {
     #[test]
     fn start_warns_about_what_the_operator_must_know() {
         let mut c = Config::default();
+        let keys = std::path::Path::new("/h/keys/models");
+        let start_warnings = |c: &Config, macos: bool| start_warnings(c, macos, keys, |_| false);
         assert!(start_warnings(&c, true).is_empty());
         let off = start_warnings(&c, false);
         assert_eq!(off.len(), 1);
@@ -7156,6 +7166,47 @@ mod tests {
         let none = start_warnings(&c, true);
         assert_eq!(none.len(), 1);
         assert!(none[0].contains("unconfined"), "{none:?}");
+    }
+
+    #[test]
+    fn start_warns_about_a_key_held_in_the_environment() {
+        let keys = std::path::Path::new("/h/keys/models");
+        let mut c = Config::default();
+        c.notify.command = vec!["/bin/true".into()];
+        c.models.insert(
+            "env".into(),
+            loom_core::config::ModelProfile { api_key_env: Some("LOOM_TEST_KEY".into()), ..Default::default() },
+        );
+        c.models.insert(
+            "file".into(),
+            loom_core::config::ModelProfile { api_key_file: Some("file".into()), ..Default::default() },
+        );
+        let set = start_warnings(&c, true, keys, |v| v == "LOOM_TEST_KEY");
+        assert_eq!(set.len(), 1, "{set:?}");
+        assert!(set[0].contains("models.env") && set[0].contains("LOOM_TEST_KEY") && set[0].contains("can read it"));
+        let unset = start_warnings(&c, true, keys, |_| false);
+        assert_eq!(unset.len(), 1, "{unset:?}");
+        assert!(unset[0].contains("LOOM_TEST_KEY is not set") && unset[0].contains("api_key_file"), "{unset:?}");
+        assert!(set.iter().chain(&unset).all(|w| !w.contains("models.file")));
+    }
+
+    #[tokio::test]
+    async fn a_missing_key_file_stops_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start(Script::new(|_, _| finish("x"))).await.unwrap();
+        let mut config = config_for(&server, None);
+        if let Some(p) = config.models.get_mut("mock") {
+            p.api_key_file = Some("mock".into());
+        }
+        let paths = Paths::at(dir.path().join("home"));
+        plain_core_pack(&paths.packs_dir());
+        let key_path = paths.model_keys_dir().join("mock");
+        let err = match Runtime::start(config, paths).await {
+            Ok(_) => panic!("the runtime started without its key file"),
+            Err(e) => e,
+        };
+        assert!(err.contains("model profile 'mock'") && err.contains(&key_path.display().to_string()), "{err}");
+        server.shutdown().await;
     }
 
     #[test]

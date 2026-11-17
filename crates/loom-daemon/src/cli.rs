@@ -1198,8 +1198,36 @@ fn terminal_cfg<'a>(render_record: &'a dyn Fn(&Record) -> String, style: &Style,
     }
 }
 
+/// Whether the variable is present and not empty in this process's environment.
+fn env_var_is_set(var: &str) -> bool {
+    std::env::var_os(var).is_some_and(|v| !v.is_empty())
+}
+
+/// What `loom service install` refuses before it writes anything: a profile that sets `api_key_env` (a launchd
+/// agent does not have the shell's variables, and the key must not be written into the service file) and what
+/// `Config::check_model_keys` refuses.
+fn service_key_check(config: &Config, keys_dir: &Path) -> Result<(), String> {
+    let dir = keys_dir.display();
+    for (name, profile) in &config.models {
+        if let Some(var) = &profile.api_key_env {
+            return Err(format!(
+                "models.{name} sets api_key_env = \"{var}\", but a launchd service does not have your shell's variables, so its requests would carry no key, and putting the key in the service file would write it to disk and into the daemon's environment. Move the key to a file: `mkdir -p -m 700 {dir}`, then `(umask 077; printenv {var} > {dir}/{name})`, replace `api_key_env = \"{var}\"` with `api_key_file = \"{name}\"` in [models.{name}], and run `loom service install` again."
+            ));
+        }
+    }
+    config.check_model_keys(keys_dir)
+}
+
 async fn cmd_up(paths: &Paths) -> Result<i32, String> {
     let spawned = crate::serve::spawn_background(paths).await?;
+    if matches!(spawned, crate::serve::Spawned::Started) {
+        // `spawn_background` has already reported a config that cannot be loaded.
+        if let Ok(config) = Config::load(&paths.config_file()) {
+            for line in config.key_env_warnings(&paths.model_keys_dir(), env_var_is_set) {
+                errln(&format!("warning: {line}"));
+            }
+        }
+    }
     let bind = client::bind_from_home(paths)?;
     let line = match spawned {
         crate::serve::Spawned::Started => format!("loom is running on {bind}"),
@@ -1362,8 +1390,13 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
     match action {
         ConfigAction::Path => outln(&file.display().to_string()).map(|()| 0),
         ConfigAction::Check => {
-            Config::load(&file).map_err(|e| e.to_string())?;
-            outln("ok").map(|()| 0)
+            let config = Config::load(&file).map_err(|e| e.to_string())?;
+            config.check_model_keys(&paths.model_keys_dir())?;
+            outln("ok")?;
+            for line in config.key_env_warnings(&paths.model_keys_dir(), env_var_is_set) {
+                errln(&format!("warning: {line}"));
+            }
+            Ok(0)
         }
         ConfigAction::Init => {
             use std::os::unix::fs::OpenOptionsExt;
@@ -1424,6 +1457,8 @@ fn cmd_service(paths: &Paths, action: ServiceAction) -> Result<i32, String> {
     match action {
         ServiceAction::Install => {
             let exe = std::env::current_exe().map_err(|e| format!("Cannot find this program's path ({e})."))?;
+            let config = Config::load(&paths.config_file()).map_err(|e| e.to_string())?;
+            service_key_check(&config, &paths.model_keys_dir())?;
             write_service_files(paths, &plist, &exe)?;
             launchctl(&["bootstrap", &domain, &plist.display().to_string()])?;
             outln(&format!("installed {}; the daemon starts at login", plist.display())).map(|()| 0)
@@ -1884,6 +1919,47 @@ mod tests {
         assert_eq!(cmd_config(&paths, ConfigAction::Check), Ok(0));
         std::fs::write(paths.config_file(), "default_model = [").unwrap();
         assert!(cmd_config(&paths, ConfigAction::Check).unwrap_err().contains("config.toml"));
+    }
+
+    #[test]
+    fn config_check_reads_the_key_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        std::fs::create_dir_all(&paths.home).unwrap();
+        std::fs::write(paths.config_file(), "[models.m]\napi_key_file = \"m\"\n").unwrap();
+        let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
+        assert!(err.starts_with("models.m: ") && err.contains(&paths.model_keys_dir().join("m").display().to_string()));
+    }
+
+    #[test]
+    fn service_install_key_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        let profile = |env: Option<&str>, file: Option<&str>| loom_core::config::ModelProfile {
+            api_key_env: env.map(str::to_string),
+            api_key_file: file.map(str::to_string),
+            ..Default::default()
+        };
+        let mut c = Config::default();
+        c.models.insert("m".into(), profile(Some("MY_KEY"), None));
+        let err = service_key_check(&c, &keys).unwrap_err();
+        assert!(err.contains("models.m") && err.contains("MY_KEY") && err.contains("api_key_file = \"m\""), "{err}");
+        assert!(err.contains("printenv MY_KEY"), "{err}");
+
+        let mut c = Config::default();
+        c.models.insert("m".into(), profile(None, Some("m")));
+        let err = service_key_check(&c, &keys).unwrap_err();
+        assert!(err.starts_with("models.m: ") && err.contains(&keys.join("m").display().to_string()), "{err}");
+
+        let file = keys.join("m");
+        std::fs::write(&file, "sk-1\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        service_key_check(&c, &keys).unwrap();
+        c.models.insert("n".into(), profile(None, None));
+        service_key_check(&c, &keys).unwrap();
+        service_key_check(&Config::default(), &keys).unwrap();
     }
 
     #[test]
