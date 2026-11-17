@@ -188,7 +188,12 @@ With `[sandbox] mode = "seatbelt"` (the default) commands run under a macOS sand
   else, so output works but cannot be read back from a command. A workspace inside `~/.loom` is refused at
   start. `unreadable_paths` are neither readable nor writable;
 - no network except the egress proxy (plus `loopback_ports`, `loopback_all`, `unix_sockets`);
-- no LaunchServices opens, Apple Events or launchd jobs.
+- no LaunchServices opens, Apple Events or launchd jobs;
+- only the Mach services the usual toolchains need (Spotlight's `mdfind`, the clipboard, the keychain and audio fail): a
+  tool that needs one more is fixed with `[sandbox] mach_allow`. Headless Chromium (Playwright, Puppeteer) finds its child
+  processes through `org.chromium.Chromium`, `com.google.Chrome` and `com.google.chrome.for.testing` rendezvous names, which
+  are allowed (the launch itself was not run on the gate host); another build (Edge, Electron) needs
+  `mach_allow = ["<bundle id>.MachPortRendezvousServer.*"]`.
 
 Git config/hooks and metadata pointers are protected, including existing nested repositories and
 linked worktrees. Normal source edits still work. Commands that explicitly write shared `/tmp` or
@@ -322,7 +327,10 @@ the volume of the loom home and warns when it is under 5 GiB or 5 percent. The `
 self-probe (at start, then hourly): `bounded` when no command reached the network outside the egress proxy,
 `UNBOUNDED` with the reason when one did, a probe could not run, `sandbox.allow_fetch_services` is set or
 `sandbox.mode` is `none`. The web header shows the same as a banner, and the last probe is in
-`<loom home>/egress-probe.json`. Unbounded egress stops nothing; keep-going will refuse to turn on.
+`<loom home>/egress-probe.json`. `STALE` means the probe stopped recording (more than two hours old); `bounded (...; fetch
+routes not exercised)` means this host did not fetch for any control, so those routes were not judged; `grants:` lists
+loopback and unix-socket grants, which the probe runs without. `unix_sockets` naming `/var/run/mDNSResponder` is unbounded:
+DNS leaves outside the proxy. Unbounded egress stops nothing; keep-going will refuse to turn on.
 
 On macOS `loom service install` makes the daemon a login service (a LaunchAgent) and
 `loom service uninstall` removes it; `loom service status` says whether it is loaded.

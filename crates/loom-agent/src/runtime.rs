@@ -352,6 +352,10 @@
 //! - Low disk: when the volume of the loom home turns low ([`disk_is_low`]: under `LOW_DISK_BYTES` or
 //!   `LOW_DISK_PERCENT` free; checked once a minute, off the async workers) one notification of kind
 //!   `disk` is raised, and no other until the disk has recovered and turned low again.
+//! - Egress: when the sandbox self-probe (`crate::egress`) turns egress unbounded one notification of kind `egress` is
+//!   raised, and no other until it was bounded again; a problem the probe finds (a leak, a probe that cannot run,
+//!   the resolver's socket) is told once too, even while `sandbox.allow_fetch_services` already holds egress
+//!   unbounded, and again only after it cleared. `LOOM_KIND` is `egress` and `LOOM_SESSION` is empty.
 //! - At start, every restored open blocking item is notified once (`Still waiting: {text}`) and its
 //!   repeat notice is armed as for a live one.
 //!
@@ -1574,6 +1578,10 @@ struct Inner {
     egress: Mutex<crate::egress::EgressView>,
     /// The operator was told that egress is unbounded, and it has not been bounded since.
     egress_told: AtomicBool,
+    /// The operator was told that the self-probe found a problem (a leak, a probe that cannot run, the resolver's
+    /// socket) while the level was `Unbounded`, and the problem has not cleared since. Kept apart from
+    /// `egress_told` so a problem is told even when the setting `allow_fetch_services` already made egress unbounded.
+    egress_problem_told: AtomicBool,
 }
 
 impl Inner {
@@ -1600,18 +1608,28 @@ impl Inner {
             }
         }
         let level = view.level;
+        let view_problem = view.probe_problem && level == crate::egress::Level::Unbounded;
         for reason in &view.reasons {
             tracing::warn!("Egress is {level:?}: {reason}");
         }
         *self.egress.lock().unwrap_or_else(|p| p.into_inner()) = view;
-        match level {
-            crate::egress::Level::Unbounded => {
-                if !self.egress_told.swap(true, Ordering::SeqCst) {
-                    self.notify("egress", &SessionId::from(""), "Egress is unbounded", crate::egress::UNBOUNDED_NOTICE);
-                }
+        let problem = view_problem;
+        let fresh_problem = if problem {
+            !self.egress_problem_told.swap(true, Ordering::SeqCst)
+        } else {
+            self.egress_problem_told.store(false, Ordering::SeqCst);
+            false
+        };
+        let fresh_level = match level {
+            crate::egress::Level::Unbounded => !self.egress_told.swap(true, Ordering::SeqCst),
+            crate::egress::Level::Bounded => {
+                self.egress_told.store(false, Ordering::SeqCst);
+                false
             }
-            crate::egress::Level::Bounded => self.egress_told.store(false, Ordering::SeqCst),
-            crate::egress::Level::Unprobed => {}
+            crate::egress::Level::Unprobed => false,
+        };
+        if fresh_problem || fresh_level {
+            self.notify("egress", &SessionId::from(""), "Egress is unbounded", crate::egress::UNBOUNDED_NOTICE);
         }
     }
 }
@@ -4187,6 +4205,10 @@ impl Runtime {
             .map_err(|e| e.to_string())?;
         // Until the first self-probe finishes (`crate::egress`).
         let initial_egress = crate::egress::assess(&config.sandbox, None, None);
+        // A seatbelt start has no probe yet, which is not a problem to tell; mode `none` is one that stands.
+        let problem_told_at_start = initial_egress.level == crate::egress::Level::Unbounded
+            && initial_egress.probe_problem
+            && config.sandbox.mode != SandboxMode::Seatbelt;
         let inner = Arc::new_cyclic(|me: &Weak<Inner>| Inner {
             me: me.clone(),
             config,
@@ -4210,6 +4232,7 @@ impl Runtime {
             box_host,
             infra: Mutex::new(resolution),
             egress_told: AtomicBool::new(initial_egress.level == crate::egress::Level::Unbounded),
+            egress_problem_told: AtomicBool::new(problem_told_at_start),
             egress: Mutex::new(initial_egress),
         });
 
@@ -4397,7 +4420,6 @@ impl Runtime {
         &self.inner.blobs
     }
 
-    /// Port of the egress proxy on 127.0.0.1.
     /// Whether a sandboxed command can reach the network outside the egress proxy: the last self-probe's view
     /// (`crate::egress`), `Unprobed` until the first one finishes.
     pub fn egress(&self) -> crate::egress::EgressView {
@@ -4409,6 +4431,7 @@ impl Runtime {
         self.inner.record_egress(Some(report));
     }
 
+    /// Port of the egress proxy on 127.0.0.1.
     pub fn proxy_port(&self) -> u16 {
         self.inner.proxy.port()
     }
@@ -5489,6 +5512,8 @@ impl Runtime {
         for task in background {
             task.abort();
         }
+        // The self-probe's commands and decoys must not outlive the daemon.
+        loom_tools::sandbox::selfprobe::stop();
         if let Some(host) = &inner.box_host {
             host.shutdown().await;
         }
@@ -8802,6 +8827,37 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 2);
         assert!(std::fs::read_to_string(&file).unwrap().lines().all(|l| l.starts_with("egress")));
+        rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_leak_is_told_even_when_the_fetch_services_setting_already_made_egress_unbounded() {
+        use loom_tools::sandbox::selfprobe::{Outcome, Probe, ProbeResult, Report};
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start(Script::new(|_, _| finish("ok"))).await.unwrap();
+        let file = dir.path().join("notified");
+        let mut config = config_for(&server, Some(&file));
+        config.sandbox.mode = SandboxMode::Seatbelt;
+        config.sandbox.allow_fetch_services = true;
+        let rt = Runtime::start(config, Paths::at(dir.path().join("home"))).await.unwrap();
+        let report = |outcome| Report {
+            ran: true,
+            results: Probe::ALL.iter().map(|p| ProbeResult { probe: *p, outcome, detail: "d".into() }).collect(),
+        };
+        // The setting already holds egress unbounded, and a clean probe says nothing more.
+        rt.record_egress_probe(report(Outcome::Held));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!file.exists(), "the operator chose the setting");
+        // A leak is a new cause: told once, not again for the next report of it, and again after it cleared.
+        rt.record_egress_probe(report(Outcome::Leaked));
+        until("the notification", || file.exists() && std::fs::read_to_string(&file).unwrap().lines().count() == 1)
+            .await;
+        rt.record_egress_probe(report(Outcome::Failed));
+        rt.record_egress_probe(report(Outcome::Held));
+        rt.record_egress_probe(report(Outcome::Leaked));
+        until("the second notification", || std::fs::read_to_string(&file).unwrap().lines().count() == 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 2);
         rt.shutdown().await;
     }
 

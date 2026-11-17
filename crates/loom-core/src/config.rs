@@ -325,6 +325,19 @@ pub const MACH_LOOKUP_ALLOW: [&str; 17] = [
     "com.apple.tccd.system",
 ];
 
+/// Mach service name prefixes a command may look up under the default-deny, besides `MACH_LOOKUP_ALLOW`: the
+/// rendezvous servers (`<bundle id>.MachPortRendezvousServer.<pid>`) through which the child processes of a Chromium
+/// build (renderer, GPU and utility processes of Playwright, Puppeteer, headless Chrome) find their parent. A
+/// process registers its own name and its children look it up, so an exact list cannot name it. Probed on macOS 27
+/// with a process that registers such a name and a child that looks it up: refused without the prefix, found with it.
+/// Chromium itself was not run. Another build (Edge, Electron) needs `<its bundle id>.MachPortRendezvousServer.*` in
+/// `sandbox.mach_allow`. The server checks who asks, which is why a prefix is allowed and no regex is.
+pub const MACH_LOOKUP_ALLOW_PREFIXES: [&str; 3] = [
+    "org.chromium.Chromium.MachPortRendezvousServer.",
+    "com.google.Chrome.MachPortRendezvousServer.",
+    "com.google.chrome.for.testing.MachPortRendezvousServer.",
+];
+
 /// Whether a `sandbox.mach_allow` entry covers `name`: the same string, or, for an entry ending in `*`, a name that
 /// starts with what precedes it.
 pub fn mach_entry_covers(entry: &str, name: &str) -> bool {
@@ -1646,10 +1659,10 @@ allow = ["*.example.test"]
 
     #[test]
     fn the_built_in_mach_allowlist_has_no_fetch_or_disk_service() {
-        for name in MACH_LOOKUP_ALLOW {
+        for name in MACH_LOOKUP_ALLOW.iter().chain(MACH_LOOKUP_ALLOW_PREFIXES.iter()) {
             assert!(
-                !FETCH_SERVICE_NAMES.contains(&name)
-                    && !DISK_SERVICE_NAMES.contains(&name)
+                !FETCH_SERVICE_NAMES.contains(name)
+                    && !DISK_SERVICE_NAMES.contains(name)
                     && !FETCH_SERVICE_PREFIXES.iter().any(|p| name.starts_with(p)),
                 "{name}"
             );

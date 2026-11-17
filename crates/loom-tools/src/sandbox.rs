@@ -138,7 +138,7 @@
 //!   (loopback ICMP is not allowed then); with that allow, and with allows of single ports, a deny of
 //!   `*:<port>` refused 127.0.0.1, ::1 and the host's own address on every port tried.)
 //! - Mach services: `mach-lookup` is denied by default and a command may look up only the services of
-//!   `MACH_LOOKUP_ALLOW` (17 names: what the usual toolchains need to start, resolve users, notify, log, check
+//!   `MACH_LOOKUP_ALLOW` and `MACH_LOOKUP_ALLOW_PREFIXES` (17 names: what the usual toolchains need to start, resolve users, notify, log, check
 //!   an execution policy, list processes and watch files; probed on macOS 27 with bash, python3, node, git, curl,
 //!   clang, swiftc, cargo, make, cmake, ssh, sqlite3, perl, ruby, java, codesign, lldb, osascript and the usual
 //!   utilities, whose output matched an unconfined run), the names of `cfg.mach_allow` (an exact name, or a name
@@ -147,6 +147,12 @@
 //!   Spotlight (`mdfind` and `mds`, which would name files the profile hides), the pasteboard (`pbpaste`),
 //!   audio, analytics, authorization, Launch Services' writers, disk services. A tool that needs one more is
 //!   fixed with `sandbox.mach_allow`, found from `log show --predicate 'eventMessage CONTAINS "deny(1) mach-lookup"'`.
+//!   The prefixes are the rendezvous servers of Chromium builds (`org.chromium.Chromium.`, `com.google.Chrome.`,
+//!   `com.google.chrome.for.testing.` + `MachPortRendezvousServer.`): a process registers its own name and its child
+//!   processes look it up, which a list of exact names cannot say. Probed on macOS 27 with a python3 that registers
+//!   such a name and a new python3 that looks it up (refused without the prefix, found with it); Chromium itself was not
+//!   run on the gate host, and another build (Edge, Electron) needs its own `<bundle id>.MachPortRendezvousServer.*` in
+//!   `sandbox.mach_allow`.
 //! - system services that fetch a URL for a process, outside its sandbox, in every network mode: commands cannot
 //!   look up `com.apple.trustd.agent`, `com.apple.trustd`, `com.apple.ocspd`, `com.apple.nsurlsessiond` or
 //!   `com.apple.nsurlsessiond.NSURLSessionProxyService`, nor WebKit's XPC services (`com.apple.WebKit.*`)
@@ -159,8 +165,8 @@
 //!   through `com.apple.trustd.agent`: probed on macOS 27 with `security verify-cert -p ssl` under
 //!   `(deny network*)`, the request reaches a listener unless that service is denied (denying
 //!   `com.apple.trustd` alone does not stop it); `ocspd` is the older service for the same fetches. Denied,
-//!   evaluation through Security.framework may fail (`SecTrustEvaluateWithError` returns false,
-//!   errSecInternalComponent, so it fails closed), and so may `codesign --verify`; curl (also Apple's, which
+//!   evaluation through Security.framework fails for every certificate (`SecTrustEvaluateWithError` returns false,
+//!   errSecInternalComponent: probed with a valid Apple root, -26276, so it fails closed), and so does `codesign --verify`; curl (also Apple's, which
 //!   links SecureTransport: probed with an HTTPS fetch under the profile), Python and OpenSSL are not affected.
 //!   Name resolution needs no service: it goes to `/var/run/mDNSResponder`, which `(deny network*)` refuses.
 //!   The deny comes last in the profile, so nothing before it (`mach_allow` included) reaches these services.
@@ -326,8 +332,10 @@
 //! (`git clone --bare <url> <dir>.git`, used with `--git-dir`/`--work-tree`) works; and, with
 //! `cfg.allow_fetch_services` is not set, that programs that check certificates through macOS (Swift and Go programs,
 //! `security`, `codesign --verify`) fail here, while curl and Python use their own certificate files, and
-//! that WebKit-based tools and background URL sessions fail, and that Spotlight's `mdfind`, the clipboard, the keychain
-//! and audio fail with the other system services outside the list. In seatbelt mode it also says, in one sentence,
+//! that WebKit-based tools and background URL sessions fail; in every seatbelt description, whatever
+//! `allow_fetch_services` says (the default-deny of `mach-lookup` holds either way), that Spotlight's `mdfind`, the
+//! clipboard, the keychain and audio fail with the other system services outside the list, that
+//! `sandbox.mach_allow` is the operator's fix, and which headless Chromium names are allowed. In seatbelt mode it also says, in one sentence,
 //! that `git submodule update` (any form) is the operator's, that upstream tracking cannot be recorded, that
 //! dependencies from Git URLs (pip, npm, cargo, uv) cannot be installed (an archive URL can), that disk
 //! images cannot be mounted (extract them instead) and that preferences cannot be written (`defaults write`).
@@ -432,7 +440,9 @@
 mod linux;
 pub mod selfprobe;
 
-use loom_core::config::{SandboxCfg, SandboxMode, FETCH_SERVICE_NAMES, FETCH_SERVICE_PREFIXES, MACH_LOOKUP_ALLOW};
+use loom_core::config::{
+    SandboxCfg, SandboxMode, FETCH_SERVICE_NAMES, FETCH_SERVICE_PREFIXES, MACH_LOOKUP_ALLOW, MACH_LOOKUP_ALLOW_PREFIXES,
+};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -2094,7 +2104,7 @@ impl Sandbox {
             !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@'))
         };
         let mut exact: Vec<String> = MACH_LOOKUP_ALLOW.iter().map(|n| (*n).to_string()).collect();
-        let mut prefixes: Vec<String> = Vec::new();
+        let mut prefixes: Vec<String> = MACH_LOOKUP_ALLOW_PREFIXES.iter().map(|n| (*n).to_string()).collect();
         for entry in &self.mach_allow {
             match entry.strip_suffix('*') {
                 Some(prefix) if name_ok(prefix) => push_unique(&mut prefixes, prefix.to_string()),
@@ -2454,14 +2464,22 @@ impl Sandbox {
                    recorded, dependencies from Git URLs (pip, npm, cargo, uv) cannot be installed (an archive URL \
                    can), disk images cannot be mounted (extract them instead) and preferences cannot be written \
                    (`defaults write`).";
-        let certificates = if !self.allow_fetch_services {
+        let fetch = if !self.allow_fetch_services {
             " Programs that check certificates through macOS (Swift and Go programs, `security`, `codesign --verify`) \
               fail here; curl and Python use their own certificate files and are not affected. WebKit-based tools and \
-              background URL sessions fail here too. So do the system services outside the list of ones that commands \
-              need to run (Spotlight's `mdfind`, the clipboard's `pbcopy` and `pbpaste`, the keychain, audio)."
+              background URL sessions fail here too."
         } else {
             ""
         };
+        // The default-deny of `mach-lookup` holds in every seatbelt profile, with or without the fetch services.
+        let certificates = format!(
+            "{fetch} So do the system services outside the list of ones that commands need to run (Spotlight's \
+             `mdfind`, the clipboard's `pbcopy` and `pbpaste`, the keychain, audio); a tool that needs one is fixed \
+             by the operator with `sandbox.mach_allow`. A headless Chromium build (Playwright, Puppeteer) finds its \
+             child processes through the rendezvous names of `org.chromium.Chromium`, `com.google.Chrome` and \
+             `com.google.chrome.for.testing`; another build needs its own `<bundle id>.MachPortRendezvousServer.*` in \
+             `sandbox.mach_allow`."
+        );
         let ports = if self.loopback_all {
             "any loopback port".to_string()
         } else if self.loopback_ports.is_empty() {
@@ -2596,7 +2614,11 @@ mod tests {
         let holders: String = holders.iter().map(|a| format!(" (literal \"{}\")", s(a))).collect();
         let git = git_lines(&format!(" (subpath \"{r}/ws\") (subpath \"{r}/tmp\") (subpath \"{r}/extra\")"));
         let rx = regex_literal(&f.root).expect("regex-safe path");
-        let mach: String = MACH_LOOKUP_ALLOW.iter().map(|n| format!(" (global-name \"{n}\")")).collect();
+        let mach: String = MACH_LOOKUP_ALLOW
+            .iter()
+            .map(|n| format!(" (global-name \"{n}\")"))
+            .chain(MACH_LOOKUP_ALLOW_PREFIXES.iter().map(|n| format!(" (global-name-prefix \"{n}\")")))
+            .collect();
         let expected = format!(
             "(version 1)\n(allow default)\n(deny signal)\n(allow signal (target same-sandbox))\n(deny file-write*)\n\
              (allow file-write* (subpath \"{r}/ws\") (subpath \"{r}/tmp\") (subpath \"{r}/extra\") (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\"))\n\
@@ -6540,6 +6562,9 @@ mod tests {
         for name in MACH_LOOKUP_ALLOW {
             assert!(line.contains(&format!("(global-name \"{name}\")")), "{name}: {line}");
         }
+        for prefix in MACH_LOOKUP_ALLOW_PREFIXES {
+            assert!(line.contains(&format!("(global-name-prefix \"{prefix}\")")), "{prefix}: {line}");
+        }
         assert!(line.contains("(global-name \"com.apple.pasteboard.1\")"), "{line}");
         assert!(line.contains("(global-name-prefix \"com.example.svc\")"), "{line}");
         assert!(!line.contains("bad name"), "an entry that is not a service name is left out: {line}");
@@ -6551,6 +6576,20 @@ mod tests {
         assert!(build(&f, &cfg(SandboxMode::None), None).profile().is_none());
     }
 
+    /// `python3` registers `<prefix>MachPortRendezvousServer.<pid>` and runs a new python3 that looks it up; prints
+    /// `rendezvous <check_in status> <look_up exit>`.
+    const RENDEZVOUS_SCRIPT: &str = "python3 - <<'PY'\n\
+import ctypes, os, subprocess, sys\n\
+l = ctypes.CDLL('/usr/lib/libSystem.B.dylib')\n\
+bp = ctypes.c_uint.in_dll(l, 'bootstrap_port').value\n\
+prefix = 'org.chromium.Chromium.MachPortRendezvousServer.'\n\
+child = \"import ctypes,os,sys\\nl=ctypes.CDLL('/usr/lib/libSystem.B.dylib')\\nbp=ctypes.c_uint.in_dll(l,'bootstrap_port').value\\np=ctypes.c_uint()\\nsys.exit(0 if l.bootstrap_look_up(bp,(sys.argv[1]+str(os.getppid())).encode(),ctypes.byref(p))==0 else 3)\\n\"\n\
+port = ctypes.c_uint()\n\
+r = l.bootstrap_check_in(bp, (prefix + str(os.getpid())).encode(), ctypes.byref(port))\n\
+rc = subprocess.run([sys.executable, '-c', child, prefix]).returncode\n\
+print('rendezvous', r, rc)\n\
+PY";
+
     #[test]
     fn commands_run_under_the_default_deny_of_mach_lookup_in_every_setting() {
         if !available() {
@@ -6559,6 +6598,9 @@ mod tests {
         let f = fx();
         let script = "echo ok; id -u >/dev/null && sw_vers -productName >/dev/null && git --version >/dev/null && \
                       python3 -c 'import socket,json;socket.getaddrinfo(\"localhost\",80)' && /usr/bin/curl --version >/dev/null";
+        // A process that registers a service and a child that looks it up (how a Chromium build's renderer, GPU and
+        // utility processes find their parent), under the name Chromium gives: the child is a new process.
+        let rendezvous = RENDEZVOUS_SCRIPT;
         for c in [
             cfg(SandboxMode::Seatbelt),
             SandboxCfg { allow_fetch_services: true, ..cfg(SandboxMode::Seatbelt) },
@@ -6567,28 +6609,61 @@ mod tests {
         ] {
             let (ok, out) = run(&build(&f, &c, Some(8123)), &f.ws, script);
             assert!(ok && out.starts_with("ok"), "{out}");
+            let (ok, out) = run(&build(&f, &c, Some(8123)), &f.ws, rendezvous);
+            assert!(
+                ok && out.contains("rendezvous 0 0"),
+                "a child cannot find the service its parent registered: {out}"
+            );
         }
+        // Another build's name is refused until `mach_allow` names it, as for any other service.
+        let other = RENDEZVOUS_SCRIPT.replace("org.chromium.Chromium", "com.example.Browser");
+        let (_, out) = run(&build(&f, &cfg(SandboxMode::Seatbelt), None), &f.ws, &other);
+        assert!(out.contains("rendezvous 0 3"), "{out}");
+        let named = SandboxCfg {
+            mach_allow: vec!["com.example.Browser.MachPortRendezvousServer.*".into()],
+            ..cfg(SandboxMode::Seatbelt)
+        };
+        let (ok, out) = run(&build(&f, &named, None), &f.ws, &other);
+        assert!(ok && out.contains("rendezvous 0 0"), "{out}");
     }
 
     #[test]
     fn a_mach_service_outside_the_list_fails_until_mach_allow_names_it() {
         let test = "a_mach_service_outside_the_list_fails_until_mach_allow_names_it";
-        if !available() || !Path::new("/usr/bin/pbpaste").exists() {
+        let security = Path::new("/usr/bin/security");
+        if !available() || !security.exists() {
             return;
         }
         let f = fx();
-        // Control: outside the sandbox the clipboard answers (a host with no GUI session may not have one).
-        let free = Command::new("/usr/bin/pbpaste").output().is_ok_and(|o| o.status.success());
-        if !free {
-            return skipped(test, "this host has no pasteboard service for this user");
+        // `security find-certificate` reads the system roots through the security daemon (`com.apple.SecurityServer`),
+        // which needs no login session, so this runs on a host reached over ssh. Control: unconfined it finds one.
+        let script = "/usr/bin/security find-certificate -a -c 'Apple Root CA' -p \
+                      /System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null";
+        let unconfined = Command::new("/bin/sh").args(["-c", script]).output().expect("sh");
+        if !String::from_utf8_lossy(&unconfined.stdout).contains("BEGIN CERTIFICATE") {
+            return skipped(test, "this host's security daemon does not answer an unconfined command");
         }
-        let script = "/usr/bin/pbpaste >/dev/null 2>&1";
-        let denied = build(&f, &cfg(SandboxMode::Seatbelt), None);
-        assert!(!run(&denied, &f.ws, script).0, "the pasteboard service is reachable by default");
-        let named = SandboxCfg { mach_allow: vec!["com.apple.pasteboard.1".into()], ..cfg(SandboxMode::Seatbelt) };
-        assert!(run(&build(&f, &named, None), &f.ws, script).0, "mach_allow did not allow the service");
-        let prefix = SandboxCfg { mach_allow: vec!["com.apple.pasteboard*".into()], ..cfg(SandboxMode::Seatbelt) };
-        assert!(run(&build(&f, &prefix, None), &f.ws, script).0, "a prefix entry did not allow the service");
+        let found = |c: &SandboxCfg| {
+            let (_, out) = run(&build(&f, c, None), &f.ws, script);
+            out.contains("BEGIN CERTIFICATE")
+        };
+        assert!(!found(&cfg(SandboxMode::Seatbelt)), "the security daemon is reachable by default");
+        for entry in ["com.apple.SecurityServer", "com.apple.Security*"] {
+            let named = SandboxCfg { mach_allow: vec![entry.into()], ..cfg(SandboxMode::Seatbelt) };
+            assert!(found(&named), "mach_allow = [\"{entry}\"] did not allow the service");
+        }
+        // An unrelated entry does not.
+        let other = SandboxCfg { mach_allow: vec!["com.apple.pasteboard*".into()], ..cfg(SandboxMode::Seatbelt) };
+        assert!(!found(&other));
+        // The clipboard, where this host has one.
+        if Path::new("/usr/bin/pbpaste").exists()
+            && Command::new("/usr/bin/pbpaste").output().is_ok_and(|o| o.status.success())
+        {
+            let paste = "/usr/bin/pbpaste >/dev/null 2>&1";
+            assert!(!run(&build(&f, &cfg(SandboxMode::Seatbelt), None), &f.ws, paste).0);
+            let named = SandboxCfg { mach_allow: vec!["com.apple.pasteboard.1".into()], ..cfg(SandboxMode::Seatbelt) };
+            assert!(run(&build(&f, &named, None), &f.ws, paste).0, "mach_allow did not allow the pasteboard");
+        }
     }
 
     #[test]
@@ -6641,6 +6716,9 @@ mod tests {
         let allowed =
             build(&f, &SandboxCfg { allow_fetch_services: true, ..cfg(SandboxMode::Seatbelt) }, None).describe();
         assert!(!allowed.contains("codesign") && !allowed.contains("WebKit"), "{allowed}");
+        // The default-deny of `mach-lookup` holds with the fetch services allowed: the sentence stays.
+        assert!(allowed.contains("Spotlight's `mdfind`") && allowed.contains("`sandbox.mach_allow`"), "{allowed}");
+        assert!(d.contains("MachPortRendezvousServer"), "{d}");
         // The Git sentence is the seatbelt description's; mode none does not confine commands.
         let none = build(&f, &cfg(SandboxMode::None), None).describe();
         assert!(!none.contains("No Git repository") && !none.contains("codesign"), "{none}");

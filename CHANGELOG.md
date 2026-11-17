@@ -15,7 +15,11 @@
   osascript and the usual utilities under `(deny mach-lookup)` until their output matched an unconfined run. The keychain
   and security daemons, Spotlight (`mdfind`), the clipboard (`pbcopy`, `pbpaste`), audio, analytics, authorization and the
   disk services are out of reach. A tool that needs one more: new `[sandbox] mach_allow = [...]` (exact names or a prefix
-  ending in `*`; refused when it would cover a fetch or disk service).
+  ending in `*`; refused when it would cover a fetch or disk service). Chromium builds find their child processes through
+  `<bundle id>.MachPortRendezvousServer.<pid>`, a name the process registers itself, so the prefixes of `org.chromium.Chromium`,
+  `com.google.Chrome` and `com.google.chrome.for.testing` are allowed (`MACH_LOOKUP_ALLOW_PREFIXES`; probed with a registering
+  process and an exec'd child, headless Chromium itself not run); Edge, Electron and other builds need
+  `mach_allow = ["<bundle id>.MachPortRendezvousServer.*"]`.
 - **`[sandbox] allow_fetch_services = true`** (new, default false) allows the fetch services again and marks egress unbounded.
 - **Sandbox self-probe** (`loom_tools::sandbox::selfprobe`): at start and every hour the daemon runs commands under its own
   profile against local listeners: a certificate whose AIA URL names the listener, a background URL session and a
@@ -26,7 +30,11 @@
   `basis`, `probes`, `probed_at_ms`; absent from older daemons), a line in `loom status` (`egress: bounded (…)` or
   `egress: UNBOUNDED, <reason>`), a web banner when unbounded, `<home>/egress-probe.json` (the last probe) and one
   `egress` notification when it turns unbounded. Keep-going will refuse while it is not bounded
-  (`EgressView::keep_going_blockers`). Nothing else is refused or stopped by it.
+  (`EgressView::keep_going_blockers(now_ms)`), also when the last probe is older than two probe periods (`STALE`). Nothing else is
+  refused or stopped by it. Egress is also unbounded when `sandbox.unix_sockets` names the resolver (`/var/run/mDNSResponder`:
+  DNS carries data outside the proxy), and a problem the probe finds is notified even while `allow_fetch_services` holds egress
+  unbounded. The probe's listeners are bounded (4 KiB, 3 s per connection, never waited for), a probe is cut at five minutes,
+  its process groups are killed when the daemon shuts down, and a directory a cut-off probe left is removed at the next one.
 
 ### Monitor E1: infrastructure deny and scope revoke
 

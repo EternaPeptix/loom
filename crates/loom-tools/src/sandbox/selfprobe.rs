@@ -20,7 +20,7 @@
 //! - `daemon_port`: the credential flow of the audit. A decoy process outside the sandbox carries a code in its
 //!   argument vector; the sandboxed command looks for it with `pgrep -fl` and presents it to a listener standing in
 //!   for the daemon (which the profile names as `daemon_port`, with `loopback_all` on, as the daemon's own profile
-//!   does), and also tries a second listener named in `infra_ports`. Any connection to either is a leak. That the
+//!   does), and also tries a second listener named in `infra_ports`. A connection that carries the probe's code (`code=code-...`) to either is a leak; another connection (a port scan) is only noted. That the
 //!   argument vector is readable at all is recorded in the detail and is not a leak: the code is never put there.
 //!
 //! - `git_metadata`: a command writes a ref (the control, allowed) and tries a hook, `config` and `config.worktree`
@@ -39,7 +39,9 @@
 //! treat `Leaked` and `Failed` as "egress unbounded": a probe that cannot run proves nothing.
 //!
 //! Every command is killed after `SCRIPT_LIMIT`. `run` returns only after the listeners are closed and the
-//! directory removed. It blocks for up to about a minute: call it from a blocking thread.
+//! directory removed. It blocks for up to about a minute: call it from a blocking thread. `stop()` (the daemon shuts
+//! down) kills the process groups of every command and decoy a running probe made, and the commands that follow
+//! are killed as they start.
 //!
 //! In mode `none` and `bubblewrap` there is nothing to probe: `run` returns a report with no results and
 //! `Report::ran` false; the caller decides what that means (`loom-agent::egress`).
@@ -49,12 +51,16 @@
 //! `the_probes_hold_under_the_default_profile` and `allow_fetch_services_skips_the_fetch_probes_and_still_checks_the_daemon_port`,
 //! `a_profile_that_allows_the_fetch_services_is_seen_leaking` and
 //! `the_probe_sees_a_listener_that_the_profile_allows_as_a_leak` (macOS only; each fetch probe reports `NotExercised`
-//! when the host does not fetch).
+//! when the host does not fetch), `a_listener_is_not_held_by_a_peer_that_streams_without_a_newline`,
+//! `dropping_a_listener_does_not_wait_for_a_silent_peer`, `the_daemon_port_verdict_is_a_leak_only_for_the_probes_own_connection`,
+//! `the_git_verdict_reads_the_files_and_not_the_output`, `the_daemon_port_probe_reports_a_hole_in_the_profile_as_a_leak`
+//! (macOS), `the_processes_of_a_probe_are_tracked_and_can_be_killed` and
+//! `a_directory_a_dead_probe_left_is_removed_and_nothing_else`.
 
 use super::Sandbox;
 use loom_core::config::{SandboxCfg, SandboxMode};
 use serde::{Deserialize, Serialize};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -68,6 +74,48 @@ const CONTROL_WAIT: Duration = Duration::from_secs(10);
 const REAL_WAIT: Duration = Duration::from_secs(6);
 /// A command that runs longer than this is killed with its process group.
 pub const SCRIPT_LIMIT: Duration = Duration::from_secs(30);
+
+/// The process groups of the commands and decoys of a probe that is running, so that `stop` can end them.
+static LIVE_GROUPS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+/// Set by `stop`: no command is waited for any longer.
+static STOPPED: AtomicBool = AtomicBool::new(false);
+
+fn track(pid: u32) -> Option<i32> {
+    let pid = i32::try_from(pid).ok()?;
+    if let Ok(mut live) = LIVE_GROUPS.lock() {
+        live.push(pid);
+    }
+    Some(pid)
+}
+
+fn untrack(pid: Option<i32>) {
+    if let (Some(pid), Ok(mut live)) = (pid, LIVE_GROUPS.lock()) {
+        live.retain(|p| *p != pid);
+    }
+}
+
+fn kill_group(pid: i32) {
+    // SAFETY: killpg on a group a probe made; a stale pid names nothing we own.
+    unsafe {
+        libc::killpg(pid, libc::SIGKILL);
+    }
+}
+
+/// Kill every process group a running probe has made (commands and decoys). Returns how many.
+fn kill_live() -> usize {
+    let groups: Vec<i32> = LIVE_GROUPS.lock().map(|mut l| std::mem::take(&mut *l)).unwrap_or_default();
+    for g in &groups {
+        kill_group(*g);
+    }
+    groups.len()
+}
+
+/// End a probe that is running (the daemon is shutting down): its commands and decoys are killed and the probes
+/// that have not started do not start. `run` still removes its directory.
+pub fn stop() {
+    STOPPED.store(true, Ordering::SeqCst);
+    kill_live();
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,12 +184,51 @@ fn result(probe: Probe, outcome: Outcome, detail: impl Into<String>) -> ProbeRes
     ProbeResult { probe, outcome, detail: detail.into() }
 }
 
-/// A listener on a loopback port that records what connects.
+/// How much of a request line a listener keeps, and for how long it reads one connection. A peer that streams
+/// bytes without a newline, or says nothing, is cut off at either.
+const LINE_MAX: usize = 4096;
+const CONNECTION_LIMIT: Duration = Duration::from_secs(3);
+/// How many connections are served at once; a connection beyond that is counted and closed.
+const CONNECTIONS_AT_ONCE: usize = 64;
+
+/// A listener on a loopback port that records what connects. Each connection is served on its own thread that
+/// reads at most `LINE_MAX` bytes for at most `CONNECTION_LIMIT`, so no peer can hold it, and dropping the listener
+/// never waits for a peer.
 struct Listener {
     port: u16,
     seen: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Read the first line of `conn` (at most `LINE_MAX` bytes, within `CONNECTION_LIMIT`, until `stop`).
+fn read_first_line(conn: &mut std::net::TcpStream, stop: &AtomicBool) -> String {
+    use std::io::Read;
+    let _ = conn.set_nonblocking(false);
+    let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
+    let deadline = Instant::now() + CONNECTION_LIMIT;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 512];
+    while buf.len() < LINE_MAX && Instant::now() < deadline && !stop.load(Ordering::SeqCst) {
+        match conn.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let room = LINE_MAX.saturating_sub(buf.len());
+                buf.extend_from_slice(chunk.get(..n.min(room)).unwrap_or_default());
+                if buf.contains(&b'\n') {
+                    break;
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => break,
+        }
+    }
+    let end = buf.iter().position(|b| *b == b'\n').unwrap_or(buf.len());
+    String::from_utf8_lossy(buf.get(..end).unwrap_or_default()).trim().to_string()
 }
 
 impl Listener {
@@ -151,6 +238,7 @@ impl Listener {
         let port = listener.local_addr()?.port();
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let thread = {
             let (seen, stop) = (seen.clone(), stop.clone());
             std::thread::spawn(move || {
@@ -167,17 +255,22 @@ impl Listener {
                         }
                         Err(_) => continue,
                     };
-                    let _ = conn.set_nonblocking(false);
-                    let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
-                    let mut line = String::new();
-                    if BufReader::new(&conn).read_line(&mut line).is_ok() {
+                    if live.load(Ordering::SeqCst) >= CONNECTIONS_AT_ONCE {
+                        continue;
+                    }
+                    live.fetch_add(1, Ordering::SeqCst);
+                    let (seen, stop, live) = (seen.clone(), stop.clone(), live.clone());
+                    // Detached: nothing waits for a peer that does not finish.
+                    std::thread::spawn(move || {
+                        let line = read_first_line(&mut conn, &stop);
                         if let Ok(mut v) = seen.lock() {
                             if let Some(slot) = v.get_mut(index) {
-                                *slot = line.trim().to_string();
+                                *slot = line;
                             }
                         }
-                    }
-                    let _ = conn.write_all(reply);
+                        let _ = conn.write_all(reply);
+                        live.fetch_sub(1, Ordering::SeqCst);
+                    });
                 }
             })
         };
@@ -219,8 +312,10 @@ impl Drop for Listener {
 }
 
 fn unique(what: &str) -> String {
+    // The clock alone can repeat for two calls in one tick; the counter cannot.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    format!("{what}-{}-{nanos}", std::process::id())
+    format!("{what}-{}-{nanos}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::SeqCst))
 }
 
 fn quoted(p: &Path) -> String {
@@ -242,18 +337,21 @@ pub(crate) fn run_script(sb: &Sandbox, cwd: &Path, script: &str, limit: Duration
         .stderr(Stdio::from(out))
         .process_group(0)
         .spawn()?;
+    let group = track(child.id());
     let deadline = Instant::now() + limit;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
+        let waited = child.try_wait();
+        if !matches!(waited, Ok(None)) {
+            untrack(group);
+        }
+        if let Some(status) = waited? {
             break Some(status);
         }
-        if Instant::now() > deadline {
-            if let Ok(pid) = i32::try_from(child.id()) {
-                // SAFETY: killpg on the group this function made; a stale pid names nothing we own.
-                unsafe {
-                    libc::killpg(pid, libc::SIGKILL);
-                }
+        if Instant::now() > deadline || STOPPED.load(Ordering::SeqCst) {
+            if let Some(pid) = group {
+                kill_group(pid);
             }
+            untrack(group);
             let _ = child.kill();
             let _ = child.wait();
             break None;
@@ -341,6 +439,9 @@ struct Rig {
     loom_home: PathBuf,
     work: PathBuf,
     ws: PathBuf,
+    /// Tests only: leave the daemon and infrastructure ports out of the `daemon_port` probe's profile, which is the
+    /// hole that probe exists to find.
+    hole: bool,
 }
 
 impl Rig {
@@ -420,12 +521,16 @@ fn aia_fetch(rig: &Rig) -> ProbeResult {
     )
 }
 
-/// JavaScript for Automation that runs for `secs` seconds on the main run loop.
-fn jxa_script(body: &str, secs: u32) -> String {
-    format!("ObjC.import(\"Foundation\");\n{body}\n$.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow({secs}));\n")
+/// JavaScript for Automation that runs `body`, then `secs` seconds on the main run loop, then `tail` (what cleans up
+/// after `body`).
+fn jxa_script(body: &str, tail: &str, secs: u32) -> String {
+    format!("ObjC.import(\"Foundation\");\n{body}\n$.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow({secs}));\n{tail}\n")
 }
 
-fn jxa_probe(rig: &Rig, probe: Probe, body: &dyn Fn(u16, &str, &str) -> String, secs: u32) -> ProbeResult {
+/// The body and the tail of a JXA probe's script, from the listener's port, the path to request and an id.
+type JxaParts<'a> = dyn Fn(u16, &str, &str) -> (String, String) + 'a;
+
+fn jxa_probe(rig: &Rig, probe: Probe, parts: &JxaParts, secs: u32) -> ProbeResult {
     fetch_probe(
         rig,
         probe,
@@ -434,7 +539,8 @@ fn jxa_probe(rig: &Rig, probe: Probe, body: &dyn Fn(u16, &str, &str) -> String, 
         &|rig, sb, name, port, path| {
             let id = unique(&format!("loom-selfprobe-{name}"));
             let file = sb.tmp_dir.join(format!("{name}.js"));
-            std::fs::write(&file, jxa_script(&body(port, path, &id), secs))
+            let (body, tail) = parts(port, path, &id);
+            std::fs::write(&file, jxa_script(&body, &tail, secs))
                 .map_err(|e| format!("cannot write the script: {e}"))?;
             let script = format!("/usr/bin/osascript -l JavaScript {}", quoted(&file));
             run_script(sb, &rig.ws, &script, SCRIPT_LIMIT)
@@ -449,11 +555,15 @@ fn url_session(rig: &Rig) -> ProbeResult {
         rig,
         Probe::UrlSession,
         &|port, path, id| {
-            format!(
-                "var cfg = $.NSClassFromString(\"NSURLSessionConfiguration\").backgroundSessionConfigurationWithIdentifier(\"{id}\");\n\
-                 var session = $.NSClassFromString(\"NSURLSession\").sessionWithConfiguration(cfg);\n\
-                 var task = session.downloadTaskWithURL($.NSURL.URLWithString(\"http://127.0.0.1:{port}{path}\"));\n\
-                 task.resume;"
+            // The session is invalidated at the end, so `nsurlsessiond` drops it with its download.
+            (
+                format!(
+                    "var cfg = $.NSClassFromString(\"NSURLSessionConfiguration\").backgroundSessionConfigurationWithIdentifier(\"{id}\");\n\
+                     var session = $.NSClassFromString(\"NSURLSession\").sessionWithConfiguration(cfg);\n\
+                     var task = session.downloadTaskWithURL($.NSURL.URLWithString(\"http://127.0.0.1:{port}{path}\"));\n\
+                     task.resume;"
+                ),
+                "task.cancel; session.invalidateAndCancel;".to_string(),
             )
         },
         5,
@@ -465,10 +575,16 @@ fn web_kit(rig: &Rig) -> ProbeResult {
         rig,
         Probe::WebKit,
         &|port, path, _| {
-            format!(
-                "ObjC.import(\"WebKit\");\n\
-                 var view = $.WKWebView.alloc.initWithFrameConfiguration($.NSMakeRect(0, 0, 100, 100), $.WKWebViewConfiguration.alloc.init);\n\
-                 view.loadRequest($.NSClassFromString(\"NSURLRequest\").requestWithURL($.NSURL.URLWithString(\"http://127.0.0.1:{port}{path}\")));"
+            // A non-persistent data store: the view leaves no website data in the operator's Library.
+            (
+                format!(
+                    "ObjC.import(\"WebKit\");\n\
+                     var conf = $.WKWebViewConfiguration.alloc.init;\n\
+                     conf.websiteDataStore = $.WKWebsiteDataStore.nonPersistentDataStore;\n\
+                     var view = $.WKWebView.alloc.initWithFrameConfiguration($.NSMakeRect(0, 0, 100, 100), conf);\n\
+                     view.loadRequest($.NSClassFromString(\"NSURLRequest\").requestWithURL($.NSURL.URLWithString(\"http://127.0.0.1:{port}{path}\")));"
+                ),
+                "view.stopLoading;".to_string(),
             )
         },
         5,
@@ -503,10 +619,11 @@ fn daemon_port(rig: &Rig) -> ProbeResult {
         Ok(c) => c,
         Err(e) => return result(probe, Outcome::Failed, format!("the decoy process did not start: {e}")),
     };
+    let decoy_group = track(decoy.id());
     let cfg = SandboxCfg {
         loopback_all: true,
-        daemon_port: Some(daemon.port),
-        infra_ports: vec![infra.port],
+        daemon_port: if rig.hole { None } else { Some(daemon.port) },
+        infra_ports: if rig.hole { Vec::new() } else { vec![infra.port] },
         ..rig.cfg.clone()
     };
     let verdict = (|| -> Result<(bool, String), String> {
@@ -524,28 +641,57 @@ fn daemon_port(rig: &Rig) -> ProbeResult {
             run_script(&sb, &rig.ws, &script, SCRIPT_LIMIT).map_err(|e| format!("the command did not run: {e}"))?;
         Ok((out.contains("argv=yes"), out))
     })();
-    // A connection that carries the code is the worst case; any connection is a hole in the profile.
-    let waited = daemon.saw("code=", Duration::from_secs(2)) || infra.connections() > 0 || daemon.connections() > 0;
+    // A connection that carries the probe's own code (`code=code-...`, which only its script sends) is a leak; a
+    // connection that does not (a port scan of the machine, another process) is noted and is not.
+    let daemon_hit = daemon.saw(CODE_PREFIX, Duration::from_secs(2));
+    let infra_hit = infra.saw(CODE_PREFIX, Duration::ZERO);
+    let strays =
+        (daemon.connections() + infra.connections()).saturating_sub(usize::from(daemon_hit) + usize::from(infra_hit));
+    let carried = daemon.lines().iter().any(|l| l.contains(&code));
     let _ = decoy.kill();
     let _ = decoy.wait();
+    untrack(decoy_group);
+    daemon_verdict(verdict, daemon_hit, infra_hit, carried, strays)
+}
+
+/// What the script's request line starts with after `GET /?`: only the probe's script sends it.
+const CODE_PREFIX: &str = "code=code-";
+
+/// The `daemon_port` probe's result from what it observed: the command's result (whether the decoy's argument vector
+/// was readable, or why the command did not run), whether a connection carrying the probe's code reached the daemon
+/// stand-in and the infrastructure stand-in, whether the code the command read arrived, and how many other
+/// connections arrived.
+fn daemon_verdict(
+    verdict: Result<(bool, String), String>,
+    daemon_hit: bool,
+    infra_hit: bool,
+    carried: bool,
+    strays: usize,
+) -> ProbeResult {
+    let probe = Probe::DaemonPort;
     let readable = match &verdict {
         Ok((true, _)) => "The decoy's argument vector was readable (the daemon puts no code there)",
         Ok(_) => "The decoy's argument vector was not readable",
         Err(_) => "",
     };
-    let carried = daemon.lines().iter().any(|l| l.contains(&code));
+    let noise =
+        if strays > 0 { format!(" ({strays} other connection(s) were not the probe's)") } else { String::new() };
     match verdict {
         Err(e) => result(probe, Outcome::Failed, e),
-        Ok(_) if waited => result(
+        Ok(_) if daemon_hit || infra_hit => result(
             probe,
             Outcome::Leaked,
             format!(
                 "A sandboxed command connected to {} (the daemon's port in the probe profile, or an infrastructure port){}.",
-                if daemon.connections() > 0 { "the daemon port" } else { "an infrastructure port" },
+                if daemon_hit { "the daemon port" } else { "an infrastructure port" },
                 if carried { " and presented the code it read from a process list" } else { "" }
             ),
         ),
-        Ok(_) => result(probe, Outcome::Held, format!("{readable}; the connections to the daemon and infrastructure ports were refused.")),
+        Ok(_) => result(
+            probe,
+            Outcome::Held,
+            format!("{readable}; the connections to the daemon and infrastructure ports were refused{noise}."),
+        ),
     }
 }
 
@@ -575,7 +721,14 @@ fn git_metadata(rig: &Rig) -> ProbeResult {
     let planted = git.join("hooks/pre-commit").exists()
         || git.join("config.worktree").exists()
         || std::fs::read(git.join("config")).unwrap_or_default() != before;
-    if !git.join("refs/heads/probe").exists() {
+    git_verdict(git.join("refs/heads/probe").exists(), planted)
+}
+
+/// The `git_metadata` probe's result: whether the control write (a ref) landed and whether a hook or Git
+/// configuration did.
+fn git_verdict(control_landed: bool, planted: bool) -> ProbeResult {
+    let probe = Probe::GitMetadata;
+    if !control_landed {
         return result(probe, Outcome::Failed, "The control write (a ref, which Git may write) did not land.");
     }
     if planted {
@@ -588,11 +741,28 @@ fn git_metadata(rig: &Rig) -> ProbeResult {
     result(probe, Outcome::Held, "A ref was written; a hook, `config` and `config.worktree` could not be.")
 }
 
+/// A probe directory older than this was left by a daemon that ended while probing.
+const STALE_AFTER: Duration = Duration::from_secs(600);
+
+/// Remove the `loom-selfprobe-*` directories of `parent` that were last modified more than `older` ago.
+fn remove_stale_directories(parent: &Path, older: Duration) {
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    for entry in entries.flatten() {
+        let named = entry.file_name().to_string_lossy().starts_with("loom-selfprobe-");
+        let age = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+        if named && entry.path().is_dir() && age.is_some_and(|a| a > older) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Run the probes against `cfg` (the profile sessions get). See the contract.
 pub fn run(cfg: &SandboxCfg, loom_home: &Path) -> Report {
     if cfg.mode != SandboxMode::Seatbelt || !Path::new(super::SANDBOX_EXEC).exists() {
         return Report::default();
     }
+    STOPPED.store(false, Ordering::SeqCst);
+    remove_stale_directories(&std::env::temp_dir(), STALE_AFTER);
     let work = std::env::temp_dir().join(unique("loom-selfprobe"));
     let setup = std::fs::create_dir_all(work.join("ws")).and_then(|()| work.canonicalize());
     let work = match setup {
@@ -620,6 +790,7 @@ pub fn run(cfg: &SandboxCfg, loom_home: &Path) -> Report {
         loom_home: loom_home.to_path_buf(),
         ws: work.join("ws"),
         work: work.clone(),
+        hole: false,
     };
     let mut results = Vec::new();
     if cfg.allow_fetch_services {
@@ -779,6 +950,7 @@ mod tests {
             loom_home: dir.path().to_path_buf(),
             ws: work.join("ws"),
             work: work.clone(),
+            hole: false,
         };
         let listener = Listener::start(b"").expect("listener");
         let sb = rig.sandbox(&rig.cfg, "hole").expect("sandbox");
@@ -809,6 +981,7 @@ mod tests {
             loom_home: dir.path().to_path_buf(),
             ws: work.join("ws"),
             work: work.clone(),
+            hole: false,
         };
         let aia = aia_fetch(&rig);
         let session = url_session(&rig);
@@ -819,5 +992,141 @@ mod tests {
                 assert!(r.detail.contains("past the egress proxy"), "{r:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_listener_is_not_held_by_a_peer_that_streams_without_a_newline() {
+        let l = Listener::start(b"").expect("listener");
+        let port = l.port;
+        let ended = Arc::new(AtomicBool::new(false));
+        let peer = {
+            let ended = ended.clone();
+            std::thread::spawn(move || {
+                let Ok(mut conn) = std::net::TcpStream::connect(("127.0.0.1", port)) else { return };
+                let chunk = [b'a'; 1024];
+                while !ended.load(Ordering::SeqCst) {
+                    if conn.write_all(&chunk).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        // A second connection is served while the first streams.
+        std::thread::sleep(Duration::from_millis(200));
+        let mut conn = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        conn.write_all(b"GET /second HTTP/1.0\r\n\r\n").expect("write");
+        assert!(l.saw("/second", Duration::from_secs(3)), "{:?}", l.lines().len());
+        let started = Instant::now();
+        // The streamed line is cut at LINE_MAX once the connection's limit passes.
+        std::thread::sleep(CONNECTION_LIMIT + Duration::from_millis(500));
+        assert!(l.lines().iter().all(|line| line.len() <= LINE_MAX), "a line is not bounded");
+        drop(l);
+        ended.store(true, Ordering::SeqCst);
+        assert!(
+            started.elapsed() < CONNECTION_LIMIT + Duration::from_secs(2),
+            "dropping the listener waited for a peer"
+        );
+        let _ = peer.join();
+    }
+
+    #[test]
+    fn dropping_a_listener_does_not_wait_for_a_silent_peer() {
+        let l = Listener::start(b"").expect("listener");
+        let _silent = std::net::TcpStream::connect(("127.0.0.1", l.port)).expect("connect");
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        drop(l);
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn the_daemon_port_verdict_is_a_leak_only_for_the_probes_own_connection() {
+        let readable = || Ok((true, "argv=yes".to_string()));
+        let held = daemon_verdict(readable(), false, false, false, 0);
+        assert_eq!(held.outcome, Outcome::Held, "{held:?}");
+        // A port scan of the machine connects without the code: noted, not a leak.
+        let scanned = daemon_verdict(readable(), false, false, false, 3);
+        assert_eq!(scanned.outcome, Outcome::Held, "{scanned:?}");
+        assert!(scanned.detail.contains("3 other connection"), "{scanned:?}");
+        let leaked = daemon_verdict(readable(), true, false, true, 0);
+        assert_eq!(leaked.outcome, Outcome::Leaked, "{leaked:?}");
+        assert!(
+            leaked.detail.contains("the daemon port") && leaked.detail.contains("presented the code"),
+            "{leaked:?}"
+        );
+        let infra = daemon_verdict(Ok((false, String::new())), false, true, false, 0);
+        assert_eq!(infra.outcome, Outcome::Leaked, "{infra:?}");
+        assert!(infra.detail.contains("an infrastructure port"), "{infra:?}");
+        let failed = daemon_verdict(Err("the command did not run".into()), true, true, true, 0);
+        assert_eq!(failed.outcome, Outcome::Failed, "{failed:?}");
+    }
+
+    #[test]
+    fn the_git_verdict_reads_the_files_and_not_the_output() {
+        assert_eq!(git_verdict(true, true).outcome, Outcome::Leaked);
+        assert_eq!(git_verdict(true, false).outcome, Outcome::Held);
+        // A control that did not land proves nothing, whatever else was seen.
+        assert_eq!(git_verdict(false, false).outcome, Outcome::Failed);
+        assert_eq!(git_verdict(false, true).outcome, Outcome::Failed);
+    }
+
+    #[test]
+    fn the_daemon_port_probe_reports_a_hole_in_the_profile_as_a_leak() {
+        if !available() || !Path::new("/usr/bin/pgrep").exists() {
+            return;
+        }
+        // The same probe that holds under the daemon's profile, run with the ports left out of the profile.
+        let dir = home();
+        let work = std::env::temp_dir().join(unique("loom-selfprobe-test"));
+        std::fs::create_dir_all(work.join("ws")).expect("mkdir");
+        let work = work.canonicalize().expect("canonical");
+        let rig = Rig {
+            cfg: SandboxCfg { protect_credentials: false, ..cfg() },
+            loom_home: dir.path().to_path_buf(),
+            ws: work.join("ws"),
+            work: work.clone(),
+            hole: true,
+        };
+        let leaked = daemon_port(&rig);
+        let held = daemon_port(&Rig { hole: false, ..rig_like(&rig) });
+        let _ = std::fs::remove_dir_all(&work);
+        assert_eq!(leaked.outcome, Outcome::Leaked, "{leaked:?}");
+        assert!(leaked.detail.contains("presented the code"), "{leaked:?}");
+        assert_eq!(held.outcome, Outcome::Held, "{held:?}");
+    }
+
+    fn rig_like(r: &Rig) -> Rig {
+        Rig { cfg: r.cfg.clone(), loom_home: r.loom_home.clone(), work: r.work.clone(), ws: r.ws.clone(), hole: r.hole }
+    }
+
+    #[test]
+    fn the_processes_of_a_probe_are_tracked_and_can_be_killed() {
+        let mut child = Command::new("/bin/sleep").arg("30").process_group(0).spawn().expect("sleep");
+        let group = track(child.id());
+        assert!(group.is_some_and(|g| LIVE_GROUPS.lock().expect("lock").contains(&g)));
+        if let Some(g) = group {
+            kill_group(g);
+        }
+        let started = Instant::now();
+        let status = child.wait().expect("wait");
+        assert!(!status.success() && started.elapsed() < Duration::from_secs(5));
+        untrack(group);
+        assert!(group.is_some_and(|g| !LIVE_GROUPS.lock().expect("lock").contains(&g)));
+    }
+
+    #[test]
+    fn a_directory_a_dead_probe_left_is_removed_and_nothing_else() {
+        let dir = home();
+        for name in ["loom-selfprobe-1-2", "loom-selfprobe-test-3", "other"] {
+            std::fs::create_dir_all(dir.path().join(name).join("ws")).expect("mkdir");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        // Too young to be stale: kept.
+        remove_stale_directories(dir.path(), Duration::from_secs(3600));
+        assert!(dir.path().join("loom-selfprobe-1-2").exists());
+        remove_stale_directories(dir.path(), Duration::from_millis(1));
+        assert!(!dir.path().join("loom-selfprobe-1-2").exists() && !dir.path().join("loom-selfprobe-test-3").exists());
+        assert!(dir.path().join("other").exists());
     }
 }

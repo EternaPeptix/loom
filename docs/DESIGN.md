@@ -123,6 +123,7 @@ monitor/log.jsonl                    the monitor's hash-chained, HMAC-sealed log
 monitor/inputs/<sha256>              the exact rendered input of each review, content-addressed (§15; not written yet)
 daemon.lock                          0600, empty; locked by the running daemon, never removed
 daemon.json                          {pid, bind, started_ms} of the running daemon
+egress-probe.json                    the latest sandbox self-probe: {at_ms, view, report}, replaced atomically (hidden from commands)
 packs/<name>/                        installed packs (one named core replaces the built-in one)
 sessions/<sid>/log.jsonl             the session event log
 sessions/<sid>/log.jsonl.damaged-<ms>   bytes cut off a damaged log
@@ -1233,7 +1234,7 @@ The Seatbelt policy:
   --verify`) fail closed for every certificate; curl and Python use their own certificate files. The
   background URL session service (`com.apple.nsurlsessiond`) and WebKit's XPC services, which a command
   can drive from `osascript -l JavaScript` to fetch a URL, are denied too. `mach-lookup` is denied by default with an allowlist of the services the usual toolchains need
-  (`MACH_LOOKUP_ALLOW`, plus `sandbox.mach_allow`). The daemon probes this at start and hourly against a local
+  (`MACH_LOOKUP_ALLOW` and the Chromium rendezvous prefixes `MACH_LOOKUP_ALLOW_PREFIXES`, plus `sandbox.mach_allow`). The daemon probes this at start and hourly against a local
   listener (`loom_agent::egress`, `loom_tools::sandbox::selfprobe`) and shows `egress: bounded` or `UNBOUNDED`
   in `loom status` and the web header; `allow_fetch_services` marks it unbounded and keep-going refuses it;
 - mounting is denied (`file-mount`, and the disk-image and DiskArbitration services that mount for a
@@ -1645,7 +1646,9 @@ interval while it stays open. The text of an item a tool call opened (written by
 ledger carries the same label. A child's title was written by the model and starts with `unverified: `.
 When the volume of the loom home turns low (under 5 GiB or 5 percent free, checked once a minute) one
 notification of kind `disk` is raised, and no other until the disk has recovered and turned low again;
-the web UI shows a warning line while `GET /api/status` reports the disk as low.
+the web UI shows a warning line while `GET /api/status` reports the disk as low. When the sandbox self-probe turns
+egress unbounded one notification of kind `egress` is raised (`LOOM_KIND=egress`), and a problem the probe finds is
+raised too even while `sandbox.allow_fetch_services` already holds egress unbounded; neither again until it cleared.
 
 **Garbage collection.** Stored outputs are never deleted except by an explicit collection: `POST
 /api/gc {"apply": bool}` (default a dry run), `loom gc [--apply]`. A blob is kept when its full id

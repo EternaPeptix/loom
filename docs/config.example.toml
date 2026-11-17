@@ -81,6 +81,7 @@ loopback_all = false       # true lets commands connect to any loopback port
 # services the usual toolchains need. Programs that check certificates through macOS (`security`, `codesign --verify`,
 # Swift and Go programs), `mdfind`, `pbpaste` and the keychain fail; curl and Python do not.
 # mach_allow = ["com.apple.pasteboard.1", "com.example.helper*"]  # more services a tool needs: exact names, or a prefix ending in *
+#   (headless Chromium of Playwright/Puppeteer works as is; Edge or Electron need "<bundle id>.MachPortRendezvousServer.*")
 # (found with: log show --last 5m --predicate 'eventMessage CONTAINS "deny(1) mach-lookup"'; never a fetch or disk service)
 allow_fetch_services = false  # true lets commands use the fetch services: egress is then reported "unbounded" (loom status) and keep-going refuses to turn on
 
