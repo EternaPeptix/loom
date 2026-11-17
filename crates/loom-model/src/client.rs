@@ -769,14 +769,51 @@ fn has_overflow_phrase(message: &str) -> bool {
     OVERFLOW_PHRASES.iter().any(|p| lower.contains(p))
 }
 
-/// `limit` and `requested` from a message: the first two integers >= 1000, the smaller as the limit
-/// and the larger as the request (servers name them in either order); one integer is the limit.
+/// The integers of `message` that are at least 1000, in order.
+fn big_numbers(message: &str) -> impl Iterator<Item = u64> + '_ {
+    message.split(|c: char| !c.is_ascii_digit()).filter_map(|t| t.parse::<u64>().ok()).filter(|n| *n >= 1000)
+}
+
+/// The integer that starts `text` (after no characters at all).
+fn leading_number(text: &str) -> Option<u64> {
+    let end = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+    text.get(..end).and_then(|t| t.parse().ok())
+}
+
+/// The integer right after the first of `markers` found in `message` (ASCII case-insensitively).
+fn number_after(message: &str, markers: &[&str]) -> Option<u64> {
+    let lower = message.to_ascii_lowercase();
+    markers.iter().find_map(|m| {
+        let at = lower.find(m)?.checked_add(m.len())?;
+        leading_number(message.get(at..)?)
+    })
+}
+
+/// The integers either side of the first `A > B` in `message`.
+fn greater_than_pair(message: &str) -> Option<(u64, u64)> {
+    message.match_indices('>').find_map(|(at, _)| {
+        let before = message.get(..at)?.trim_end();
+        let start = before.rfind(|c: char| !c.is_ascii_digit()).map_or(0, |i| i.saturating_add(1));
+        let a = leading_number(before.get(start..)?)?;
+        let b = leading_number(message.get(at.checked_add(1)?..)?.trim_start())?;
+        (a > b).then_some((a, b))
+    })
+}
+
+/// `limit` and `requested` from a message, in this order: the integer after `maximum context length
+/// is ` or `context size (` / `context size of ` is the limit, and the request is the first integer
+/// of at least 1000 larger than it, if any (vLLM's `max_tokens` refusal names `max_tokens` first); else the
+/// wording `A` greater than `B` (`A > B`) names the request first; else the first two integers of at least 1000, the smaller the limit
+/// and the larger the request (servers name them in either order); one integer is the limit.
 fn overflow_numbers(message: &str) -> (Option<u64>, Option<u64>) {
-    let mut found = message
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|t| !t.is_empty())
-        .filter_map(|t| t.parse::<u64>().ok())
-        .filter(|n| *n >= 1000);
+    let named = number_after(message, &["maximum context length is ", "context size (", "context size of "]);
+    if let Some(limit) = named {
+        return (Some(limit), big_numbers(message).find(|n| *n > limit));
+    }
+    if let Some((requested, limit)) = greater_than_pair(message) {
+        return (Some(limit), Some(requested));
+    }
+    let mut found = big_numbers(message);
     match (found.next(), found.next()) {
         (Some(a), Some(b)) => (Some(a.min(b)), Some(a.max(b))),
         (one, _) => (one, None),
@@ -1588,6 +1625,32 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(s.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn vllm_max_tokens_overflow_names_the_window_as_the_limit() {
+        // vLLM's wording when prompt + max_tokens passes max_model_len.
+        let message = "'max_tokens' or 'max_completion_tokens' is too large: 32768. This model's maximum context length is 131072 tokens and your request has 100000 input tokens (32768 > 131072 - 100000).";
+        let body = json!({"object": "error", "message": message, "type": "BadRequestError", "code": 400});
+        let (err, _) = overflow_of(400, &body.to_string()).await;
+        assert!(matches!(err, ModelError::ContextOverflow { limit: Some(131072), .. }), "{err:?}");
+    }
+
+    #[test]
+    fn overflow_numbers_follow_the_named_window_then_the_ordering_rules() {
+        // No larger number follows the named window: the request is unknown.
+        assert_eq!(overflow_numbers("This model's maximum context length is 8192 tokens."), (Some(8192), None));
+        assert_eq!(overflow_numbers("Maximum Context Length is 8192, you sent 9000"), (Some(8192), Some(9000)));
+        assert_eq!(
+            overflow_numbers("exceeds the available context size of 4096 (5000 requested)"),
+            (Some(4096), Some(5000))
+        );
+        // `A > B` names the request first.
+        assert_eq!(overflow_numbers("Prompt is too long: 70000 > 65536"), (Some(65536), Some(70000)));
+        assert_eq!(overflow_numbers("too long: 70000>65536"), (Some(65536), Some(70000)));
+        // The last resort: the first two large integers.
+        assert_eq!(overflow_numbers("got 5000, limit 4096"), (Some(4096), Some(5000)));
+        assert_eq!(overflow_numbers("only 4096 here"), (Some(4096), None));
     }
 
     #[tokio::test]
