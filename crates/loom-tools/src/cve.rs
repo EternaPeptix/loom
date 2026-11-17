@@ -1740,7 +1740,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = loom_net::Proxy::start(0, tx).await.unwrap();
         let mut e = env();
-        let raw = proxy.grant(&e.ctx.session, loom_net::Policy::new(&cfg).unwrap());
+        let raw = proxy.grant(&e.ctx.session, loom_net::Policy::new(&cfg).unwrap()).unwrap();
         e.ctx.env = Arc::new(raw.env());
         seamed(&mut e, &base);
         let denied = e.call("cve_lookup", json!({"id": "CVE-2024-0001"})).await;
@@ -1782,7 +1782,7 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = loom_net::Proxy::start(0, tx).await.unwrap();
-        let grant = proxy.grant(&loom_core::SessionId::from("s-cve"), loom_net::Policy::new(&cfg).unwrap());
+        let grant = proxy.grant(&loom_core::SessionId::from("s-cve"), loom_net::Policy::new(&cfg).unwrap()).unwrap();
         let mut e = env();
         e.ctx.env = Arc::new(grant.env());
         seamed(&mut e, "https://nvd.blocked.test");
@@ -1826,7 +1826,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = loom_net::Proxy::start_with(0, tx, Some(audit), loom_net::Limits::default()).await.unwrap();
         let _ = cell.set(proxy.clone());
-        let grant = proxy.grant(&SessionId::from("s-cve-again"), loom_net::Policy::new(&cfg).unwrap());
+        let grant = proxy.grant(&SessionId::from("s-cve-again"), loom_net::Policy::new(&cfg).unwrap()).unwrap();
         let mut e = env();
         e.ctx.env = Arc::new(grant.env());
         seamed(&mut e, "https://127.0.0.1:9");
@@ -1839,7 +1839,7 @@ mod tests {
         let limits = loom_net::Limits { max_per_session: 0, ..loom_net::Limits::default() };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = loom_net::Proxy::start_with(0, tx, None, limits).await.unwrap();
-        let grant = proxy.grant(&SessionId::from("s-cve-busy"), loom_net::Policy::new(&cfg).unwrap());
+        let grant = proxy.grant(&SessionId::from("s-cve-busy"), loom_net::Policy::new(&cfg).unwrap()).unwrap();
         let mut e = env();
         e.ctx.env = Arc::new(grant.env());
         seamed(&mut e, "https://127.0.0.1:9");

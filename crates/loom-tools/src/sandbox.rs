@@ -1057,6 +1057,11 @@ impl Sandbox {
         out
     }
 
+    /// The loopback ports commands may connect to (the session's proxy port, then the configured ones).
+    pub fn loopback_ports(&self) -> &[u16] {
+        &self.loopback_ports
+    }
+
     pub fn describe(&self) -> String {
         let protected = join_list(&self.protected);
         let unreadable = join_list(&self.unreadable);
