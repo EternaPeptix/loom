@@ -134,7 +134,8 @@
 //!
 //! ## Creating a root session (`create_session`)
 //! 1. `workspace` must be an existing directory (canonicalised). Role: `packs.role(pack, role)`.
-//!    Profile: `config.profile(model)`.
+//!    Profile: `config.profile(model)`; a profile with `purpose = "review"` is refused (`The model profile "{p}" has
+//!    purpose = "review": it is a reviewer's, …`), since a mission led by it would run unreviewed.
 //! 2. Model facts: `client.discover()` once per profile (the first success with a window is
 //!    remembered; a discovery that finds no window refuses the creation and is not remembered). On
 //!    `Unavailable`, carry on with the profile's `model` and `context_window` (logged as coming from
@@ -151,8 +152,9 @@
 //!    named. They are read before the session is made (`prior::read` on a blocking thread, the lead's
 //!    meta giving the title) and `meta.prior` keeps them in the given order.
 //! 4. `SessionStart{session, mission, parent: None, workspace, pack, role, termination,
-//!    model: ModelRef{profile, model, context_window, lineage: `lineage::resolve` of the profile with the served
-//!    model id (family, alignment, recipient and where each came from)}, reasoning_replay (profile),
+//!    model: ModelRef{profile, model, context_window, lineage: `lineage::resolve_served` of the profile and the served
+//!    model id (family, alignment, recipient and where each came from; an undeclared family covers the configured id and the
+//!    served one).}, reasoning_replay (profile),
 //!    system_prompt: pack::system_prompt(role, &pack.preamble, &PromptEnv{workspace,
 //!    platform: "{OS} ({ARCH})" from std::env::consts, sandbox: sandbox.describe(),
 //!    network: texts::network_sentence(mode, allow, deny, allow_private)}), tools: empty,
@@ -645,7 +647,7 @@ use crate::session::{queue_input, Control, Deps, End, Input, Phase, Session, Sin
 use crate::texts;
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use loom_core::config::{ensure_private_dir, Config, NetworkMode, Paths, SandboxCfg, SandboxMode};
+use loom_core::config::{ensure_private_dir, Config, NetworkMode, Paths, ProfilePurpose, SandboxCfg, SandboxMode};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
     Author, Brief, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, EvidenceGrade, Forked, InboxItem, ModelRef,
@@ -2978,11 +2980,12 @@ impl Inner {
                 profile: meta.profile.clone(),
                 model: meta.model.clone(),
                 context_window: meta.context_window.unwrap_or(0),
-                lineage: self.config.models.get(&meta.profile).map(|p| {
-                    // The family is read from the id the server serves, which discovery may have filled in.
-                    let served = loom_core::config::ModelProfile { model: meta.model.clone(), ..p.clone() };
-                    loom_core::lineage::resolve(&meta.profile, &served)
-                }),
+                // The family covers the configured id and the id the server serves (discovery may have replaced it).
+                lineage: self
+                    .config
+                    .models
+                    .get(&meta.profile)
+                    .map(|p| loom_core::lineage::resolve_served(&meta.profile, p, &meta.model)),
             },
             reasoning_replay: replay,
             system_prompt: pack::system_prompt(role, &pack.preamble, &env),
@@ -4817,6 +4820,11 @@ impl Runtime {
             .map_err(|e| e.to_string())?
             .0
             .to_string();
+        if inner.config.models.get(&profile_name).is_some_and(|p| p.purpose == Some(ProfilePurpose::Review)) {
+            return Err(format!(
+                "The model profile \"{profile_name}\" has purpose = \"review\": it is a reviewer's, and a mission led by it would run unreviewed. Choose an agent profile (--model), or change its purpose."
+            ));
+        }
         let (model, window, from_config) = inner.facts(&profile_name).await?;
         let title = match new.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
             Some(t) => t.to_string(),
@@ -9496,6 +9504,57 @@ mod tests {
         }
         let (_, recalled) = e.rt.recall_earlier(&[earlier]).await.unwrap();
         assert_eq!(recalled[0].title, "untitled");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_start_records_the_lineage_of_the_profile_and_the_served_id() {
+        use loom_core::lineage::{Alignment, Source};
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            if let Some(p) = c.models.get_mut("mock") {
+                p.model = "qwen3-max".into();
+                p.alignment = Some(Alignment::Stock);
+                p.recipient = Some("LAN".into());
+            }
+        })
+        .await;
+        // The server serves one model, a different family from the configured id: the record shows both.
+        e.server.set_model("deepseek-v4.1", Some(1_000_000));
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))).await;
+        let lineage = e
+            .records(&id)
+            .into_iter()
+            .find_map(|r| match r.event {
+                Event::SessionStart(s) => s.model.lineage,
+                _ => None,
+            })
+            .expect("session_start records a lineage");
+        assert_eq!(lineage.profile, "mock");
+        assert_eq!(lineage.family_word(), "deepseek+qwen", "the configured id and the served one");
+        assert_eq!(
+            (lineage.fields.family, lineage.fields.alignment, lineage.fields.recipient),
+            (Source::Inferred, Source::Declared, Source::Declared)
+        );
+        assert_eq!((lineage.alignment, lineage.recipient.as_str()), (Alignment::Stock, "lan"), "declared values win");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_review_profile_cannot_lead_a_session() {
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            if let Some(p) = c.models.get_mut("mock") {
+                p.purpose = Some(loom_core::config::ProfilePurpose::Review);
+            }
+            c.default_model.clear();
+        })
+        .await;
+        let err = e.rt.create_session(e.new_session(Some("go"))).await.unwrap_err();
+        assert!(
+            err.contains("\"mock\"") && err.contains("purpose = \"review\"") && err.contains("Choose an agent profile"),
+            "{err}"
+        );
+        assert!(e.rt.sessions(true).is_empty(), "nothing was created");
         e.rt.shutdown().await;
     }
 

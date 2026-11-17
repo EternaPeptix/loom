@@ -13,8 +13,9 @@
   (`features` or `redacted`) and `known_families`. The other keys of the monitor are still rejected as unknown until their phases.
   There is no global `allow_new_recipient`.
 - **`loom config check` checks the model policy** and now fails (exit 1) when an agent profile has no eligible reviewer in some
-  pack and is not in `tripwires_only_profiles`, or its family or recipient is undeclared, or a reviewer is not declared stock;
-  the message gives the exact lines to add. `DEFAULT_CONFIG` lists its `local` profile in `tripwires_only_profiles`. An existing
+  pack and is not in `tripwires_only_profiles`, or its family or recipient is unknown, or a reviewer's family, alignment or recipient is not declared (an inferred one is
+  not enough), or the policy cannot be evaluated; the message gives the exact lines to add. `DEFAULT_CONFIG` leaves
+  `tripwires_only_profiles` commented out, so a first check fails until the operator chooses. An existing
   `config.toml` that has no `[monitor]` fails the check until it says what to do: this is the point, nothing else changes and the
   daemon still starts.
 - **`loom models show [profile]`** prints each profile's resolved family, alignment, recipient and where each came from, and who
@@ -24,6 +25,26 @@
   `select` and `select_with_verifier`, `reachable_profiles`, `check_config`, `creation_refusal`, `show_lines`. Nothing in the
   runtime consults them yet; the refusal of a real-target mission with no reviewer waits for the monitor (M2).
 - `docs/config.example.toml` has the model-policy keys live and the operator's fleet as a worked example that a test checks.
+
+### Monitor M1 review fixes
+
+- **Recipient inference reads `base_url` as the model client does** (the `url` crate): `127.1`, `2130706433`, `0x7f.1`, `0`,
+  `[::ffff:127.0.0.1]` and `[::]` are loopback and so `unknown` until declared, a backslash ends the authority, and a bare `lan`,
+  `local` or `unknown` host is `unknown` rather than the operator's own recipient.
+- **`unknown`, `any`, `none` and `*` name no family**: `Config::check` refuses them in `family` and `known_families` (and no longer
+  suggests adding them), and `resolve` ignores them, so an unknown family stays unknown and matches every family.
+- **A `purpose = "review"` profile is not an agent**: refused as `default_model`, as a pack role's `model`, `escalation_model` or
+  `alloy_models` entry, and as the model of a new session. `creation_refusal` looks at every profile a mission can reach and
+  refuses, with a sentence, when the reachable set cannot be computed; `loom config check` fails when the policy cannot be evaluated.
+- **Overrides** are bound to a mission and to what they cover (the recipient, or the reviewer profile) and are honoured nowhere,
+  including the per-profile picks of `select`, on a mission that reaches a relaxed agent. `eligible` returns the `Basis` of the
+  recipient (`OperatorOwned`, `Intersection`, `Consent`, `Override`), carried in `Selection`, so a new recipient can be told apart.
+  `Override` and `Request` gained fields (`mission`, `target`); nothing serialized yet.
+- **`session_start`'s lineage covers the served id**: an undeclared family is the union of the configured and the served id's families.
+- **`loom models show`** prints the fallback reviewer after a fault, `config check` notes a fallback to a recipient the fleet does not
+  otherwise use (consent is per pack, not per fleet), and a profile name with `:` is shown. `config check` requires a reviewer's family
+  and recipient to be declared.
+- **`config init` no longer writes `tripwires_only_profiles = ["local"]`** (a commented line): not LLM-reviewed is the operator's choice.
 
 ### Monitor E4 review fixes
 

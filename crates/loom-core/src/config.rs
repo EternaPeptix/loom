@@ -67,7 +67,9 @@
 //! `Config::check` refuses, each with a sentence that names the key and the fix: an empty `family` list or a family
 //! outside `lineage::FAMILIES` and `known_families`; an empty `recipient`; a `reviewers` or `tripwires_only_profiles`
 //! entry that is not a configured profile; a profile twice in `reviewers`; a reviewer whose alignment resolves to
-//! relaxed; a `recipients` list that names `unknown` or nothing; an empty `known_families` entry. Whether a profile has
+//! relaxed; a `recipients` list that names `unknown` or nothing; an empty `known_families` entry; a reserved word
+//! (`unknown`, `any`, `none`, `*`) in a `family` list or in `known_families` (it names no family: remove the key and the
+//! family stays unknown, which matches every family); a `default_model` that has `purpose = "review"`. Whether a profile has
 //! an eligible reviewer is not decided here (it depends on the packs): `loom_agent::monitor::lineage::check_config`.
 //!
 //! Tests required: each refusal above with its sentence; an accepted `[monitor]` example; the default config holds no
@@ -76,7 +78,7 @@
 use crate::admit::AdmitPolicy;
 use crate::event::ReasoningReplay;
 use crate::ids::{MissionId, SessionId};
-use crate::lineage::{known_family, normalize_name, resolve, Alignment, FAMILIES};
+use crate::lineage::{is_reserved_family_word, known_family, normalize_name, resolve, Alignment, FAMILIES};
 use crate::weave::ReweavePolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -823,6 +825,14 @@ impl Config {
                 names.join(", ")
             )));
         }
+        if let Some(profile) = self.models.get(&self.default_model) {
+            if profile.purpose == Some(ProfilePurpose::Review) {
+                return Err(ConfigError::Invalid(format!(
+                    "default_model \"{}\" has purpose = \"review\": a reviewer profile is not an agent's, and its sessions would run unreviewed. Name an agent profile.",
+                    self.default_model
+                )));
+            }
+        }
         let host = self.daemon.bind.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
         if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
             return Err(ConfigError::Invalid(format!(
@@ -909,6 +919,11 @@ impl Config {
                 ));
             }
             for f in family {
+                if is_reserved_family_word(f) {
+                    return Err(format!(
+                        "models.{name}.family lists \"{f}\", which names no family. If the family of this model is not known, remove the key: an unknown family matches every family, which is the safe reading. Do not add it to known_families."
+                    ));
+                }
                 if !known_family(f, &self.monitor.known_families) {
                     return Err(format!(
                         "models.{name}.family lists \"{f}\", which is not a family loom knows ({}). Fix the spelling, or, for a family that is new, add \"{}\" to known_families under [monitor]: a misspelt family would make a reviewer of the same family look unrelated.",
@@ -975,6 +990,11 @@ impl Config {
         for f in &m.known_families {
             if normalize_name(f).is_empty() {
                 return Err("monitor.known_families lists an empty name. Remove it or write the family.".into());
+            }
+            if is_reserved_family_word(f) {
+                return Err(format!(
+                    "monitor.known_families lists \"{f}\", which names no family. Remove it: a model whose family is not known has no family key, and then matches every family; a family called \"{f}\" would be unrelated to all others."
+                ));
             }
         }
         Ok(())
@@ -1909,6 +1929,19 @@ new_recipient_real_targets = "redacted"
         assert_eq!(MonitorCfg::default().content.new_recipient_real_targets, RecipientContent::Features);
         assert!(Config::parse("[models.a]\nalignment = \"uncensored\"\n").is_err(), "alignment is a closed set");
         assert!(Config::parse("[models.a]\npurpose = \"agent\"\n").is_err());
+        // A reserved word names no family, in a profile's key and in known_families.
+        for w in ["unknown", "Any", "none", "*"] {
+            let c = Config::parse(&format!("[models.a]\nfamily = [\"{w}\"]\n[monitor]\nknown_families = [\"{w}\"]\n"))
+                .unwrap();
+            let e = c.check().unwrap_err().to_string();
+            assert!(e.contains("models.a.family") && e.contains("remove the key") && !e.contains("add \""), "{e}");
+            let c = Config::parse(&format!("[models.a]\n[monitor]\nknown_families = [\"{w}\"]\n")).unwrap();
+            let e = c.check().unwrap_err().to_string();
+            assert!(e.contains("monitor.known_families") && e.contains("Remove it"), "{e}");
+        }
+        // A review profile is not the default agent profile.
+        let c = Config::parse("default_model = \"r\"\n[models.r]\npurpose = \"review\"\n").unwrap();
+        assert!(c.check().unwrap_err().to_string().contains("default_model \"r\" has purpose = \"review\""));
         assert!(Config::parse("[monitor]\nallow_new_recipient = true\n").is_err(), "there is no global key");
     }
 

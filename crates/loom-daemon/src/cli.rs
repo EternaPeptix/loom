@@ -80,13 +80,15 @@
 //!   `api_key_file` (`check_model_keys`), then checks the model policy against the packs
 //!   (`loom_agent::monitor::lineage::check_config`): one line per profile with its resolved family, alignment and
 //!   recipient and where each came from (stdout), each note on stderr as `note: {line}`, and, when a problem is found
-//!   (an agent profile with no eligible reviewer that is not in `[monitor] tripwires_only_profiles`, an undeclared
-//!   family or recipient, a reviewer that is not declared stock), the error `The model policy is not settled (n to fix):`
+//!   (an agent profile with no eligible reviewer that is not in `[monitor] tripwires_only_profiles`, an unknown
+//!   family or recipient, a reviewer whose family, alignment or recipient is not declared, a policy that cannot be
+//!   evaluated), the error `The model policy is not settled (n to fix):`
 //!   with each problem and the exact lines to add, exit 1; else `ok`, and each line of `key_env_warnings` judged
 //!   against this shell's environment on stderr as `warning: {line}`. `models show [profile]` prints the same
 //!   lines with, for each agent profile and pack, who reviews it (`lineage::show_lines`); it reads the configuration
-//!   and the packs and needs no daemon. `DEFAULT_CONFIG` lists its one profile in `tripwires_only_profiles`; `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
-//!   overwrite: `{path} already exists.`).
+//!   and the packs and needs no daemon. `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
+//!   overwrite: `{path} already exists.`). `DEFAULT_CONFIG` leaves `tripwires_only_profiles` commented out, so a first
+//!   `config check` fails and lays out the three choices: not LLM-reviewed is a choice the operator makes, never a default.
 //! - `service install|uninstall|status` (macOS; elsewhere `This command is for macOS (launchd).`):
 //!   `install` first loads the config and refuses (nothing written) a profile that sets `api_key_env`: a
 //!   launchd agent does not have the shell's variables, so its requests would carry no key, and putting
@@ -175,9 +177,9 @@ unavailable_notice_s = 300   # tell you (inbox item, notification) when a reques
 
 [monitor]
 # Who may review whose missions is a model-policy choice (docs/MONITOR.md). A profile with no reviewer must be named here
-# on purpose; its missions are then watched by the deterministic tripwires only. Remove "local" once you configure a
-# reviewer: `loom config check` says what to add, and `loom models show` shows who reviews what.
-tripwires_only_profiles = ["local"]
+# on purpose; its missions are then watched by the deterministic tripwires only. `loom config check` says what to add
+# (a reviewer, or this line), and `loom models show` shows who reviews what. Uncommenting the line is that choice:
+# tripwires_only_profiles = ["local"]
 "#;
 
 #[derive(Parser, Debug)]
@@ -2056,6 +2058,21 @@ mod tests {
         assert_eq!(config.daemon.bind, "127.0.0.1:7878");
         assert_eq!(config.network.mode, loom_core::config::NetworkMode::DenyAll);
         assert_eq!(config.agents.unavailable_notice_s, 300);
+        assert!(config.monitor.tripwires_only_profiles.is_empty(), "not LLM-reviewed is the operator's choice");
+    }
+
+    #[test]
+    fn a_fresh_config_fails_the_check_until_the_operator_chooses() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        assert_eq!(cmd_config(&paths, ConfigAction::Init), Ok(0));
+        let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
+        assert!(err.starts_with("The model policy is not settled"), "{err}");
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        let chosen = text.replace("# tripwires_only_profiles", "tripwires_only_profiles");
+        let rest = chosen.replace("[models.local]", "[models.local]\nfamily = [\"qwen\"]\nrecipient = \"local\"");
+        std::fs::write(paths.config_file(), rest).unwrap();
+        assert_eq!(cmd_config(&paths, ConfigAction::Check), Ok(0));
     }
 
     #[test]
@@ -2230,7 +2247,9 @@ mod tests {
             cmd_config(&paths, ConfigAction::Init).unwrap_err(),
             format!("{} already exists.", paths.config_file().display())
         );
-        assert_eq!(cmd_config(&paths, ConfigAction::Check), Ok(0));
+        // The generated file does not choose "not LLM-reviewed" for the operator: the check asks.
+        let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
+        assert!(err.starts_with("The model policy is not settled (2 to fix)"), "{err}");
         std::fs::write(paths.config_file(), "default_model = [").unwrap();
         assert!(cmd_config(&paths, ConfigAction::Check).unwrap_err().contains("config.toml"));
     }

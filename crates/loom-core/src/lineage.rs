@@ -20,17 +20,29 @@
 //!   - **Alignment** is inferred only as `relaxed`, from the markers `uncensored`, `abliterat`, `dealign`, `crack`,
 //!     `heretic` or `unchained` in the model id or the profile name. It is never inferred as `stock`: `stock` is a
 //!     declaration. No marker and no declaration is `unknown`.
-//!   - **Recipient** is the host of `base_url`, ASCII-lowercased, **except** that a loopback host (`localhost`,
-//!     `*.localhost`, `127.0.0.0/8`, `::1`, `0.0.0.0`) or one that cannot be read is `unknown` until declared: a loopback
-//!     address can be a tunnel to anyone's cloud. A private LAN address is its own name, not `lan`, until declared.
+//!   - **Recipient** is the host of `base_url` as the model client reads it (the WHATWG parser of the `url` crate, so
+//!     `127.1`, `2130706433`, `0x7f.1`, `0` and `[::ffff:127.0.0.1]` are the addresses the client connects to, and a
+//!     backslash ends the authority), ASCII-lowercased, **except** that a loopback host (`localhost`, `*.localhost`, any
+//!     `127.0.0.0/8` or `::1` address, `0.0.0.0`, `::`, or an IPv4-mapped one of those), a host that cannot be read, or
+//!     a host that is a reserved word (`local`, `lan`, `unknown`: a bare LAN hostname must not pass for the operator's
+//!     own recipient) is `unknown` until declared: a loopback address can be a tunnel to anyone's cloud. A private LAN
+//!     address is its own name, not `lan`, until declared.
+//!   - **Reserved words.** `unknown`, `any`, `none` and `*` name no family: a declared family list holding one is
+//!     ignored by `resolve` (and refused by `Config::check`), so a model whose family is not known stays unknown, which
+//!     matches every family, and never becomes a family disjoint from all others.
+//! - `resolve_served(name, profile, served_id)` is `resolve` for a session that runs the id the server serves: when the
+//!   family is not declared it is the union of the families of the configured id and the served id, and a relaxed marker
+//!   in either id counts. Policy (`loom_agent::monitor::lineage`) reads the configured id; the record in `session_start`
+//!   reads both, so a server that changed model shows as a wider family set instead of a narrower one.
 //! - `normalize_name` trims, ASCII-lowercases and maps `_` to `-`; family and recipient names are compared normalized
 //!   (`shares_family`, `is_operator_owned` normalize both sides themselves, whatever a caller built). `resolve` stores
 //!   normalized names. `FAMILIES` is the vocabulary above; a declared family outside it, and outside `[monitor]
 //!   known_families`, is a `Config::check` error, so a typo cannot make a same-family reviewer look disjoint.
 //!
 //! Tests required: inference for every pattern and for ids that match none; a distill; `o` followed by a digit only as a
-//! word; relaxed markers in the id and in the name; declared values win over inference; loopback, `localhost`, IPv6 and
-//! an unreadable URL are `unknown` and a hosted URL is its host (userinfo, port and path ignored); the source rules;
+//! word; relaxed markers in the id and in the name; declared values win over inference; loopback, `localhost`, IPv6, the
+//! non-canonical loopback spellings, a backslash before `@`, a bare `lan` host and an unreadable URL are `unknown` and a
+//! hosted URL is its host (userinfo, port and path ignored); the served id widening the family; the source rules;
 //! normalized comparison; serde forms and that an older record without `fields` reads.
 
 use crate::config::ModelProfile;
@@ -153,40 +165,63 @@ pub fn relaxed_marker(text: &str) -> Option<&'static str> {
     RELAXED_MARKERS.iter().copied().find(|m| t.contains(m))
 }
 
-/// The host of a base URL, lowercased, without userinfo, port or path; `None` when there is none.
+/// Words that name no family.
+pub const RESERVED_FAMILY_WORDS: [&str; 4] = ["unknown", "any", "none", "*"];
+
+/// True when `name` (normalized) is a word that names no family.
+pub fn is_reserved_family_word(name: &str) -> bool {
+    RESERVED_FAMILY_WORDS.contains(&normalize_name(name).as_str())
+}
+
+/// The host of a base URL as the model client reads it, lowercased, without userinfo, port, path or the brackets of an
+/// IPv6 address; `None` when there is none. A URL without a scheme is read as `http://`.
 pub fn host_of(url: &str) -> Option<String> {
-    let rest = url.trim().split_once("://").map_or(url.trim(), |(_, r)| r);
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let host_port = authority.rsplit('@').next()?;
-    let host = if let Some(inner) = host_port.strip_prefix('[') {
-        inner.split(']').next()?
-    } else {
-        host_port.split(':').next()?
-    };
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    let name_like = host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'));
-    if host.is_empty() || !name_like {
-        None
-    } else {
-        Some(host)
+    let parsed = parse_base_url(url)?;
+    match parsed.host()? {
+        url::Host::Domain(d) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            if d.is_empty() {
+                None
+            } else {
+                Some(d)
+            }
+        }
+        url::Host::Ipv4(a) => Some(a.to_string()),
+        url::Host::Ipv6(a) => Some(a.to_string()),
     }
 }
 
-/// True for a host that is this machine.
+fn parse_base_url(url: &str) -> Option<url::Url> {
+    let t = url.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let with_scheme = if t.contains("://") { t.to_string() } else { format!("http://{t}") };
+    url::Url::parse(&with_scheme).ok()
+}
+
+/// True for a host that is this machine: `localhost`, `*.localhost`, a loopback or unspecified address, or an
+/// IPv4-mapped one. `host` is as `host_of` returns it.
 pub fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if host == "localhost" || host.ends_with(".localhost") {
         return true;
     }
     match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Ok(std::net::IpAddr::V4(a)) => a.is_loopback() || a.is_unspecified(),
+        Ok(std::net::IpAddr::V6(a)) => {
+            a.is_loopback()
+                || a.is_unspecified()
+                || a.to_ipv4_mapped().is_some_and(|m| m.is_loopback() || m.is_unspecified())
+        }
         Err(_) => false,
     }
 }
 
-/// The recipient a base URL implies: its host, or `None` for a loopback or unreadable one.
+/// The recipient a base URL implies: its host, or `None` for a loopback, unreadable or reserved-word one.
 pub fn recipient_from_base_url(url: &str) -> Option<String> {
     let host = host_of(url)?;
-    if is_loopback_host(&host) {
+    if is_loopback_host(&host) || matches!(normalize_name(&host).as_str(), "local" | "lan" | "unknown") {
         None
     } else {
         Some(host)
@@ -201,18 +236,39 @@ pub fn known_family(name: &str, extra: &[String]) -> bool {
 
 /// What profile `name` resolves to: declared values, else inference (see the module contract).
 pub fn resolve(name: &str, profile: &ModelProfile) -> Lineage {
-    let declared_family: BTreeSet<String> =
-        profile.family.iter().flatten().map(|f| normalize_name(f)).filter(|f| !f.is_empty()).collect();
+    resolve_ids(name, profile, None)
+}
+
+/// `resolve` for a session that runs `served_id` (the id the server serves, which may differ from the configured one):
+/// an undeclared family is the union of both ids' families, and a relaxed marker in either id counts.
+pub fn resolve_served(name: &str, profile: &ModelProfile, served_id: &str) -> Lineage {
+    resolve_ids(name, profile, Some(served_id))
+}
+
+fn resolve_ids(name: &str, profile: &ModelProfile, served_id: Option<&str>) -> Lineage {
+    let declared_family: BTreeSet<String> = profile
+        .family
+        .iter()
+        .flatten()
+        .map(|f| normalize_name(f))
+        .filter(|f| !f.is_empty() && !is_reserved_family_word(f))
+        .collect();
     let (family, family_source) = if !declared_family.is_empty() {
         (declared_family, Source::Declared)
     } else {
-        let inferred = infer_family(&profile.model);
+        let mut inferred = infer_family(&profile.model);
+        if let Some(served) = served_id {
+            inferred.extend(infer_family(served));
+        }
         let source = if inferred.is_empty() { Source::Unknown } else { Source::Inferred };
         (inferred, source)
     };
     let (alignment, alignment_source) = match profile.alignment {
         Some(a) => (a, if a == Alignment::Unknown { Source::Unknown } else { Source::Declared }),
-        None if relaxed_marker(&profile.model).is_some() || relaxed_marker(name).is_some() => {
+        None if relaxed_marker(&profile.model).is_some()
+            || relaxed_marker(name).is_some()
+            || served_id.is_some_and(|s| relaxed_marker(s).is_some()) =>
+        {
             (Alignment::Relaxed, Source::Inferred)
         }
         None => (Alignment::Unknown, Source::Unknown),
@@ -387,6 +443,15 @@ mod tests {
             "http://127.4.5.6/v1",
             "http://0.0.0.0:1/v1",
             "http://foo.localhost/v1",
+            "http://127.1:9920/v1",
+            "http://2130706433:8000/v1",
+            "http://0x7f.1/v1",
+            "http://0:8000/v1",
+            "http://[::ffff:127.0.0.1]:8000/v1",
+            "http://[::]:8000/v1",
+            "http://lan:8000/v1",
+            "http://local/v1",
+            "http://LAN./v1",
             "not a url at all",
             "",
         ] {
@@ -404,6 +469,38 @@ mod tests {
         assert_eq!(hosted.recipient, "token-plan.example.com");
         assert_eq!(resolve("x", &p("m", "https://[2001:db8::1]:443/v1")).recipient, "2001:db8::1");
         assert_eq!(resolve("x", &p("m", "api.example.com/v1")).recipient, "api.example.com");
+        // The authority ends at a backslash, as the client reads it: the host is the one contacted.
+        let tricky = resolve("x", &p("m", "https://evil.example\\@token-plan.maas.qwencloudapi.com/v1"));
+        assert_eq!(tricky.recipient, "evil.example");
+    }
+
+    #[test]
+    fn the_served_id_widens_the_family_and_can_add_a_relaxed_marker() {
+        let prof = p("qwen3-max", "https://x.example/v1");
+        let configured = resolve("q", &prof);
+        assert_eq!(configured.family_word(), "qwen");
+        let served = resolve_served("q", &prof, "deepseek-v4.1");
+        assert_eq!(served.family_word(), "deepseek+qwen", "the record shows both, so a changed server is not hidden");
+        let relaxed = resolve_served("q", &prof, "qwen3-uncensored");
+        assert_eq!((relaxed.alignment, relaxed.fields.alignment), (Alignment::Relaxed, Source::Inferred));
+        let mut declared = prof.clone();
+        declared.family = Some(vec!["qwen".into()]);
+        assert_eq!(resolve_served("q", &declared, "deepseek-v4.1").family_word(), "qwen", "declared values win");
+    }
+
+    #[test]
+    fn a_reserved_word_is_not_a_family() {
+        for w in ["unknown", "Any", " none ", "*"] {
+            assert!(is_reserved_family_word(w), "{w}");
+            let mut prof = p("deepseek-v4", "https://x.example/v1");
+            prof.family = Some(vec![w.into()]);
+            let l = resolve("x", &prof);
+            assert_eq!((l.family_word().as_str(), l.fields.family), ("deepseek", Source::Inferred), "{w}");
+            prof.model = "default".into();
+            let l = resolve("x", &prof);
+            assert!(l.family.is_empty() && l.fields.family == Source::Unknown, "{w}: stays unknown, matches all");
+        }
+        assert!(!is_reserved_family_word("qwen"));
     }
 
     #[test]

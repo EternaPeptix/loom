@@ -516,8 +516,14 @@ impl Packs {
         for pack in self.packs.values() {
             for role in pack.roles.values() {
                 for name in role.model.iter().chain(role.escalation_model.iter()).chain(role.alloy_models.iter()) {
-                    if !models.contains_key(name) {
-                        return Err(format!("pack {} role {}: model profile \"{}\" is not configured; add [models.{}] or change the role", pack.name, role.name, name, name));
+                    match models.get(name) {
+                        None => {
+                            return Err(format!("pack {} role {}: model profile \"{}\" is not configured; add [models.{}] or change the role", pack.name, role.name, name, name));
+                        }
+                        Some(m) if m.purpose == Some(loom_core::config::ProfilePurpose::Review) => {
+                            return Err(format!("pack {} role {}: model profile \"{}\" has purpose = \"review\", which is a reviewer's and not an agent's, so its sessions would run unreviewed; name an agent profile", pack.name, role.name, name));
+                        }
+                        Some(_) => {}
                     }
                 }
             }
@@ -989,6 +995,12 @@ mod tests {
             models.insert(name.into(), Default::default());
         }
         packs.check_profiles(&models).unwrap();
+        // A reviewer's profile is never a role's model: its sessions would run unreviewed.
+        if let Some(m) = models.get_mut("strong") {
+            m.purpose = Some(loom_core::config::ProfilePurpose::Review);
+        }
+        let e = packs.check_profiles(&models).unwrap_err();
+        assert!(e.contains("\"strong\"") && e.contains("purpose = \"review\""), "{e}");
         for extra in ["command_guard = \"typo\"", "target_concurrency = 0"] {
             assert!(Packs::load(mk(&format!("{extra}\n{GOOD}")).path()).is_err());
         }

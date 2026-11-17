@@ -11,9 +11,11 @@
 //!   `escalation_model` and every `alloy_models` entry, and every profile `role_models` maps a role to. Sorted, without
 //!   repeats. A pack that is not loaded, or a name that is not a configured profile, is an `Err` that names it. A role
 //!   with no `model` inherits its parent's profile, which is in P already.
-//! - **Eligibility** (`eligible(reviewer, &Request)`): `Ok(used)` when the reviewer may review a mission whose sessions
-//!   run the profiles `request.reached`, listing the overrides it needed; else the first failing clause as `Ineligible`,
-//!   checked in this order:
+//! - **Eligibility** (`eligible(reviewer, &Request)`): `Ok(Admitted { overrides, basis })` when the reviewer may review a
+//!   mission whose sessions run the profiles `request.reached`, listing the overrides it needed and the `Basis` of clause 4
+//!   (`OperatorOwned`, `Intersection`, `Consent` or `Override`, tried in that order; `Basis::new_recipient()` is true for
+//!   `Consent` and `Override`: the content builder sends features only for a real-target mission, D9); else the first
+//!   failing clause as `Ineligible`, checked in this order:
 //!   1. `UnknownRecipient`: the reviewer's recipient is unknown or empty. Never overridable.
 //!   2. `NotStock`: the reviewer's alignment is not `stock` (a relaxed or an undeclared one). Never overridable.
 //!   3. `SameFamily`: the reviewer's family set meets the family set of any reached profile; an unknown family (empty)
@@ -26,37 +28,56 @@
 //!      record for the model id the reviewer currently serves).
 //!
 //!   Clauses 3, 4 and 6 can be met by a live override of the same kind (`OverrideKind::{SameFamily, NewRecipient,
-//!   Unvetted}`: non-empty reason, `now_ms < expires_ms`, default lifetime `OVERRIDE_TTL_MS` = 7 days). **No override
-//!   counts** when a reached profile counts as a relaxed agent (`Lineage::counts_as_relaxed_agent`: alignment not
-//!   declared `stock`), and none ever covers clauses 1, 2 or an empty reviewer list, so a relaxed profile is never a
-//!   reviewer and "no reviewer" cannot be overridden. There is no global `allow_new_recipient`. `Ineligible::sentence`
-//!   says what to change.
+//!   Unvetted}`: non-empty reason, `now_ms < expires_ms`, default lifetime `OVERRIDE_TTL_MS` = 7 days). An override is
+//!   bound to what it covers: `mission` (must equal `Request::mission`) and `target` (the reviewer's recipient for
+//!   `NewRecipient`, the reviewer's profile name for `SameFamily` and `Unvetted`; compared normalized), so consent to one
+//!   provider is not consent to every provider in `reviewers`. **No override counts** when a reached profile counts as a
+//!   relaxed agent (`Lineage::counts_as_relaxed_agent`: alignment not declared `stock`), and none ever covers clauses 1, 2
+//!   or an empty reviewer list, so a relaxed profile is never a reviewer and "no reviewer" cannot be overridden. There is
+//!   no global `allow_new_recipient`. `Ineligible::sentence` says what to change.
 //! - **Selection** (`select(order, lineages, &Request, exclude)` to `Selection`): `order` is `[monitor] reviewers`.
 //!   `mission` is the first profile of `order`, not in `exclude`, eligible for the whole reached set (with
 //!   `request.data_recipients`). `per_profile` holds, for each reached profile, the first profile of `order` eligible
 //!   for that profile alone (its own recipient as the data recipient), or `None`. A mission without `mission` has
-//!   no mission-level review and no keep-going (`Selection::mission_level`). After a fault the caller selects again with
+//!   no mission-level review and no keep-going (`Selection::mission_level`). Whether the mission reaches a relaxed
+//!   agent is decided once, from the whole reached set: the per-profile picks then take no override either. `mission_basis`
+//!   and `per_profile_basis` carry the `Basis` of each pick. After a fault the caller selects again with
 //!   the faulted profile in `exclude`: the next profile is chosen by the same rules, so it is never outside the allowed
 //!   recipients. `select_with_verifier` adds a verifier's profile to the reached set and the data recipients before
 //!   selecting: a verifier that collides with the reviewer re-chooses the reviewer, it never refuses the verifier.
 //! - **No eligible reviewer** (`check_config(config, packs)`, used by `loom config check`; `coverage` and `describe_all`,
 //!   used by `loom models show`): for every agent profile (not `purpose = "review"`) and every pack, the reviewers of
-//!   `select` with the pack's consent and `Facts::STATIC` (reachable, no vet needed). The `Report` has `table` (one
+//!   `select` with the pack's consent and `Facts::STATIC` (reachable, no vet needed), and `Row::fallback`, the reviewer
+//!   that `select` picks once the first one has faulted: consent is per pack, so after a fault any fleet of a consented
+//!   pack can fall through to a hosted reviewer (`loom models show` prints it; `check_config` notes it when its recipient is
+//!   one the fleet does not otherwise use). The `Report` has `table` (one
 //!   line per profile: the resolved values and where each came from; `loom config check` prints it), `problems` (each
 //!   ends with the exact lines to add) and `notes`. A problem is: an agent profile not in `tripwires_only_profiles` whose
 //!   family or recipient is unknown (the sentence says to declare it); a profile of `reviewers` whose family, alignment
-//!   (must be declared `stock`) or recipient is not declared; an agent profile not in `tripwires_only_profiles` that
+//!   (must be declared `stock`) or recipient is not declared (an inferred one is not enough: a reviewer's lineage is the
+//!   operator's word); a policy that cannot be evaluated (a pack role names a profile that is not configured, or a pack is
+//!   missing: the problem carries the error's sentence, so `config check` never prints `ok` without having checked); an agent profile not in `tripwires_only_profiles` that
 //!   has, in some pack, no reviewer for itself, with the three choices (consent to the first reviewer that fails only on
 //!   its recipient, a stock model of another family on a host the operator owns, or the profile in
 //!   `tripwires_only_profiles`), each with its lines. A note: an agent profile with an unknown alignment (it counts as
 //!   relaxed); a profile with no reviewer for the whole mission of a pack but one of its own (mission-level review and
 //!   keep-going unavailable); a profile in `tripwires_only_profiles` (shown as "not LLM-reviewed"); a review profile not
 //!   in `reviewers`. `creation_refusal(config, packs, profile, pack)` is the sentence for refusing a mission of
-//!   `profile` in `pack` at creation (`None` when it has a reviewer or is listed); the daemon uses it for real-target
-//!   missions once the monitor is on (M2); lab missions are never refused by it.
+//!   `profile` in `pack` at creation: it looks at every profile the mission can reach (`reachable_profiles`), not only
+//!   the lead, and refuses when one has no reviewer of its own and is not listed, when one has `purpose = "review"`, or
+//!   when the reachable set cannot be computed (the sentence says why). It is `None` only when every reached profile has
+//!   a reviewer or is listed in `tripwires_only_profiles`, or when `profile` is not configured (session creation refuses
+//!   that itself); the daemon uses it for real-target missions once the monitor is on (M2); lab missions are never
+//!   refused by it.
 //! - `show_lines(config, packs, only)` is `loom models show`: `describe_all`'s line of each profile, and under an agent
 //!   profile one line per pack: `reviewed by X`, `reviewed by X per session only (…)`, `not LLM-reviewed (tripwires only,
-//!   by your choice)` or `no eligible reviewer: …`; an unknown profile name is an `Err` listing the profiles.
+//!   by your choice)` or `no eligible reviewer: …`, followed by `; on a fault of X: Y (recipient R)` when a fallback exists; an unknown profile name is an `Err` listing the profiles.
+//! - **Review profiles** (`purpose = "review"`) are not agents: `Config::check` refuses one as `default_model`,
+//!   `Packs::check_profiles` as a role's `model`, `escalation_model` or `alloy_models` entry, and session creation as a
+//!   lead, so `coverage` and `check_config` leave them out and nothing runs under one unreviewed.
+//! - **Which model id the policy reads.** The configured `model` of the profile (`lineages_of`); the record in
+//!   `session_start` is `loom_core::lineage::resolve_served`, which adds the families of the served id, so a server that
+//!   was redeployed with another model shows a wider family set than the one policy used.
 //! - **Who the reviewer is not**: relaxed profiles. `Config::check` already refuses one in `reviewers`.
 //! - The §2.6 assignment table is a selection test over the operator's fleet; so is "a non-DeepSeek fleet never reaches
 //!   `qwen4max` while `dsv41_review` is eligible".
@@ -66,7 +87,10 @@
 //! need the model switching of the ui work, `docs/MONITOR.md` section 9.2).
 //!
 //! Tests required: inference (in `loom_core::lineage`); every clause with a failing and a passing case; overrides (live,
-//! expired, empty reason, never on a relaxed agent, never for clauses 1 and 2); the intersection rule; selection order,
+//! expired, empty reason, never on a relaxed agent, also in the per-profile picks of `select`, never for clauses 1 and 2,
+//! bound to a recipient, a reviewer and a mission); the basis of clause 4 (operator-owned, intersection, consent,
+//! override); a review profile refused; `creation_refusal` over every reached profile and when coverage errs;
+//! `check_config` failing on an inferred reviewer lineage and on a coverage error; a profile name with `:`; the intersection rule; selection order,
 //! fallback never leaving the allowed recipients, a colliding verifier re-choosing; the reachable set from a pack with role
 //! models; the §2.6 table over the operator's fleet; `check_config` failing with the lines to add and passing once the
 //! lines are added; the shipped example parses and passes.
@@ -131,6 +155,11 @@ pub enum OverrideKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Override {
     pub kind: OverrideKind,
+    /// The mission it was given for.
+    pub mission: String,
+    /// What it covers: the reviewer's recipient for `NewRecipient`; the reviewer's profile for `SameFamily` and
+    /// `Unvetted`.
+    pub target: String,
     pub reason: String,
     /// Wall-clock milliseconds at which it stops counting.
     pub expires_ms: u64,
@@ -141,6 +170,43 @@ impl Override {
     pub fn live(&self, now_ms: u64) -> bool {
         now_ms < self.expires_ms && !self.reason.trim().is_empty()
     }
+
+    /// True when it is live and was given for `kind`, `mission` and `target` (compared normalized).
+    pub fn covers(&self, kind: OverrideKind, mission: &str, target: &str, now_ms: u64) -> bool {
+        self.kind == kind
+            && self.live(now_ms)
+            && self.mission == mission
+            && normalize_name(&self.target) == normalize_name(target)
+    }
+}
+
+/// Why a reviewer passed clause 4 (where its provider stands).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Basis {
+    /// The reviewer runs on `local` or `lan`.
+    OperatorOwned,
+    /// The reviewer's provider already receives every session's data in the review.
+    Intersection,
+    /// The pack's `[monitor.recipients]` names the provider: a new recipient.
+    Consent,
+    /// A live `NewRecipient` override: a new recipient.
+    Override,
+}
+
+impl Basis {
+    /// True when the reviewer's provider is a new recipient of the mission's data (a real-target mission then sends
+    /// features only, `[monitor.content] new_recipient_real_targets`).
+    pub fn new_recipient(self) -> bool {
+        matches!(self, Basis::Consent | Basis::Override)
+    }
+}
+
+/// An eligible reviewer: the overrides it needed and why its recipient is allowed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Admitted {
+    pub overrides: Vec<OverrideKind>,
+    pub basis: Basis,
 }
 
 /// What the runtime knows about a reviewer at the time of the question (clauses 5 and 6).
@@ -161,6 +227,8 @@ impl Facts {
 /// One eligibility question.
 #[derive(Clone, Copy)]
 pub struct Request<'a> {
+    /// The mission the question is about (overrides are bound to it).
+    pub mission: &'a str,
     /// The profiles of the sessions the review covers and of everything else they can reach.
     pub reached: &'a [Lineage],
     /// The recipient of each session whose data the review includes.
@@ -178,8 +246,9 @@ pub fn recipients_of(reached: &[Lineage]) -> Vec<String> {
     reached.iter().map(|l| l.recipient.clone()).collect()
 }
 
-/// Is `reviewer` eligible for the review `req` asks about? `Ok` lists the overrides it needed.
-pub fn eligible(reviewer: &Lineage, req: &Request) -> Result<Vec<OverrideKind>, Ineligible> {
+/// Is `reviewer` eligible for the review `req` asks about? `Ok` lists the overrides it needed and the basis of its
+/// recipient.
+pub fn eligible(reviewer: &Lineage, req: &Request) -> Result<Admitted, Ineligible> {
     if reviewer.recipient_is_unknown() {
         return Err(Ineligible::UnknownRecipient);
     }
@@ -188,31 +257,39 @@ pub fn eligible(reviewer: &Lineage, req: &Request) -> Result<Vec<OverrideKind>, 
     }
     let relaxed_agent = req.reached.iter().any(Lineage::counts_as_relaxed_agent);
     let mut used = Vec::new();
-    let mut overridden = |kind: OverrideKind| -> bool {
-        let live = !relaxed_agent && req.overrides.iter().any(|o| o.kind == kind && o.live(req.now_ms));
+    let mut overridden = |kind: OverrideKind, target: &str| -> bool {
+        let live = !relaxed_agent && req.overrides.iter().any(|o| o.covers(kind, req.mission, target, req.now_ms));
         if live && !used.contains(&kind) {
             used.push(kind);
         }
         live
     };
     let same_family = req.reached.is_empty() || req.reached.iter().any(|p| reviewer.shares_family(p));
-    if same_family && !overridden(OverrideKind::SameFamily) {
+    if same_family && !overridden(OverrideKind::SameFamily, &reviewer.profile) {
         return Err(Ineligible::SameFamily);
     }
     let me = normalize_name(&reviewer.recipient);
     let same_as_data = !req.data_recipients.is_empty() && req.data_recipients.iter().all(|d| normalize_name(d) == me);
     let consent = req.consented.iter().any(|c| normalize_name(c) == me);
-    if !(reviewer.is_operator_owned() || same_as_data || consent || overridden(OverrideKind::NewRecipient)) {
+    let basis = if reviewer.is_operator_owned() {
+        Basis::OperatorOwned
+    } else if same_as_data {
+        Basis::Intersection
+    } else if consent {
+        Basis::Consent
+    } else if overridden(OverrideKind::NewRecipient, &reviewer.recipient) {
+        Basis::Override
+    } else {
         return Err(Ineligible::NewRecipient);
-    }
+    };
     let facts = (req.facts)(&reviewer.profile);
     if !facts.reachable {
         return Err(Ineligible::Unreachable);
     }
-    if facts.needs_vet && !facts.vetted && !overridden(OverrideKind::Unvetted) {
+    if facts.needs_vet && !facts.vetted && !overridden(OverrideKind::Unvetted, &reviewer.profile) {
         return Err(Ineligible::Unvetted);
     }
-    Ok(used)
+    Ok(Admitted { overrides: used, basis })
 }
 
 /// Who reviews what, for one mission.
@@ -222,8 +299,12 @@ pub struct Selection {
     pub mission: Option<String>,
     /// The overrides the mission-level choice needed.
     pub mission_overrides: Vec<OverrideKind>,
+    /// Why the mission-level reviewer's recipient is allowed.
+    pub mission_basis: Option<Basis>,
     /// For each reached profile, the reviewer eligible for that profile alone.
     pub per_profile: BTreeMap<String, Option<String>>,
+    /// Why each per-profile reviewer's recipient is allowed (only profiles that have a reviewer).
+    pub per_profile_basis: BTreeMap<String, Basis>,
 }
 
 impl Selection {
@@ -254,20 +335,36 @@ pub fn select(order: &[String], lineages: &BTreeMap<String, Lineage>, req: &Requ
         order.iter().filter(|n| !exclude.contains(n)).filter_map(|n| lineages.get(n)).collect();
     let mut out = Selection::default();
     for c in &candidates {
-        if let Ok(used) = eligible(c, req) {
+        if let Ok(admitted) = eligible(c, req) {
             out.mission = Some(c.profile.clone());
-            out.mission_overrides = used;
+            out.mission_overrides = admitted.overrides;
+            out.mission_basis = Some(admitted.basis);
             break;
         }
     }
+    // A mission that reaches a relaxed agent takes no override anywhere, including in the picks for one profile.
+    let mission_relaxed = req.reached.iter().any(Lineage::counts_as_relaxed_agent);
     for p in req.reached {
         if out.per_profile.contains_key(&p.profile) {
             continue;
         }
         let own_recipients = [p.recipient.clone()];
-        let own = Request { reached: std::slice::from_ref(p), data_recipients: &own_recipients, ..*req };
-        let pick = candidates.iter().find(|c| eligible(c, &own).is_ok()).map(|c| c.profile.clone());
-        out.per_profile.insert(p.profile.clone(), pick);
+        let own = Request {
+            reached: std::slice::from_ref(p),
+            data_recipients: &own_recipients,
+            overrides: if mission_relaxed { &[] } else { req.overrides },
+            ..*req
+        };
+        let pick = candidates.iter().find_map(|c| eligible(c, &own).ok().map(|a| (c.profile.clone(), a.basis)));
+        match pick {
+            Some((name, basis)) => {
+                out.per_profile.insert(p.profile.clone(), Some(name));
+                out.per_profile_basis.insert(p.profile.clone(), basis);
+            }
+            None => {
+                out.per_profile.insert(p.profile.clone(), None);
+            }
+        }
     }
     out
 }
@@ -342,6 +439,8 @@ pub struct Row {
     pub whole: Option<String>,
     /// The reviewer for the profile's own sessions.
     pub own: Option<String>,
+    /// The reviewer chosen once the first one (`whole`, else `own`) has faulted, when there is one.
+    pub fallback: Option<String>,
 }
 
 fn static_facts(_: &str) -> Facts {
@@ -363,6 +462,7 @@ pub fn coverage(config: &Config, packs: &Packs) -> Result<Vec<Row>, String> {
             let reached: Vec<Lineage> = reached_names.iter().filter_map(|n| lineages.get(n).cloned()).collect();
             let data = recipients_of(&reached);
             let req = Request {
+                mission: "",
                 reached: &reached,
                 data_recipients: &data,
                 consented: consent_of(config, &pack),
@@ -372,7 +472,21 @@ pub fn coverage(config: &Config, packs: &Packs) -> Result<Vec<Row>, String> {
             };
             let sel = select(&config.monitor.reviewers, &lineages, &req, &[]);
             let own = sel.per_profile.get(profile).cloned().flatten();
-            rows.push(Row { profile: profile.clone(), pack, reached: reached_names, whole: sel.mission, own });
+            let first = sel.reviewer_for(profile).map(str::to_string);
+            let fallback = first.and_then(|f| {
+                select(&config.monitor.reviewers, &lineages, &req, std::slice::from_ref(&f))
+                    .reviewer_for(profile)
+                    .map(str::to_string)
+                    .filter(|n| *n != f)
+            });
+            rows.push(Row {
+                profile: profile.clone(),
+                pack,
+                reached: reached_names,
+                whole: sel.mission,
+                own,
+                fallback,
+            });
         }
     }
     Ok(rows)
@@ -392,6 +506,7 @@ fn choices(config: &Config, lineages: &BTreeMap<String, Lineage>, profile: &str,
     let consent_to = config.monitor.reviewers.iter().filter_map(|n| lineages.get(n)).find_map(|c| {
         let all = [c.recipient.clone()];
         let req = Request {
+            mission: "",
             reached: &own_list,
             data_recipients: &data,
             consented: &all,
@@ -423,22 +538,57 @@ fn choices(config: &Config, lineages: &BTreeMap<String, Lineage>, profile: &str,
     )
 }
 
-/// The sentence that refuses a mission of `profile` in `pack` that has no eligible reviewer, naming the three choices;
-/// `None` when it has one, when the profile is listed in `tripwires_only_profiles`, or when it is not configured.
+/// The sentence that refuses a mission of `profile` in `pack` when a profile it can reach has no eligible reviewer, names
+/// a `purpose = "review"` profile, or cannot be evaluated; `None` when every reached profile has a reviewer or is listed
+/// in `tripwires_only_profiles`, when `profile` itself is listed, or when it is not configured.
 pub fn creation_refusal(config: &Config, packs: &Packs, profile: &str, pack: &str) -> Option<String> {
     if config.monitor.tripwires_only_profiles.iter().any(|p| p == profile) || !config.models.contains_key(profile) {
         return None;
     }
-    let rows = coverage(config, packs).ok()?;
-    let row = rows.iter().find(|r| r.profile == profile && r.pack == pack)?;
-    if row.own.is_some() {
-        return None;
-    }
     let lineages = lineages_of(config);
-    Some(format!(
-        "No reviewer is eligible for {profile} in the {pack} pack, and a mission with real targets is not run unreviewed by accident. Choose one and restart the daemon:\n{}",
-        choices(config, &lineages, profile, pack)
-    ))
+    let reached_names = match reachable_profiles(config, packs, profile, pack, &BTreeMap::new()) {
+        Ok(r) => r,
+        Err(e) => {
+            return Some(format!(
+                "The reviewers of a mission of {profile} in the {pack} pack cannot be chosen, and a mission with real targets is not run unreviewed by accident. {e}"
+            ))
+        }
+    };
+    if let Some(n) = reached_names.iter().find(|n| config.models.get(*n).is_some_and(is_review_profile)) {
+        return Some(format!(
+            "A mission of {profile} in the {pack} pack can reach {n}, which has purpose = \"review\": a reviewer's profile is not an agent's, and its sessions would run unreviewed. Name an agent profile for that role."
+        ));
+    }
+    let reached: Vec<Lineage> = reached_names.iter().filter_map(|n| lineages.get(n).cloned()).collect();
+    let data = recipients_of(&reached);
+    let req = Request {
+        mission: "",
+        reached: &reached,
+        data_recipients: &data,
+        consented: consent_of(config, pack),
+        overrides: &[],
+        now_ms: 0,
+        facts: &static_facts,
+    };
+    let sel = select(&config.monitor.reviewers, &lineages, &req, &[]);
+    let listed = &config.monitor.tripwires_only_profiles;
+    // The lead first, then the rest in name order.
+    let order = std::iter::once(profile.to_string()).chain(reached_names.iter().filter(|n| *n != profile).cloned());
+    for n in order {
+        if (n != profile && listed.contains(&n)) || sel.reviewer_for(&n).is_some() {
+            continue;
+        }
+        let whose = if n == profile { n.clone() } else { format!("{n}, which a mission of {profile} can reach") };
+        return Some(format!(
+            "No reviewer is eligible for {whose} in the {pack} pack, and a mission with real targets is not run unreviewed by accident. Choose one and restart the daemon:\n{}",
+            choices(config, &lineages, &n, pack)
+        ));
+    }
+    None
+}
+
+fn is_review_profile(p: &loom_core::config::ModelProfile) -> bool {
+    p.purpose == Some(ProfilePurpose::Review)
 }
 
 /// What `loom config check` found: the table to print, what fails it, and what to know.
@@ -449,19 +599,24 @@ pub struct Report {
     pub notes: Vec<String>,
 }
 
-/// One line per profile for `loom config check` and `loom models show`.
-pub fn describe_all(config: &Config) -> Vec<String> {
+/// `(name, line)` for every profile: the resolved values and the role.
+fn describe_pairs(config: &Config) -> Vec<(String, String)> {
     let lineages = lineages_of(config);
     config
         .models
         .iter()
         .map(|(name, p)| {
             let l = lineages.get(name).map_or_else(String::new, Lineage::describe);
-            let role = if p.purpose == Some(ProfilePurpose::Review) { "review profile" } else { "agent profile" };
+            let role = if is_review_profile(p) { "review profile" } else { "agent profile" };
             let trip = if config.monitor.tripwires_only_profiles.contains(name) { ", tripwires only" } else { "" };
-            format!("{name}: {l} [{role}{trip}]")
+            (name.clone(), format!("{name}: {l} [{role}{trip}]"))
         })
         .collect()
+}
+
+/// One line per profile for `loom config check` and `loom models show`.
+pub fn describe_all(config: &Config) -> Vec<String> {
+    describe_pairs(config).into_iter().map(|(_, line)| line).collect()
 }
 
 /// What `loom models show` prints: each profile's resolved values, and for an agent profile, who reviews its missions
@@ -474,9 +629,9 @@ pub fn show_lines(config: &Config, packs: &Packs, only: Option<&str>) -> Result<
         }
     }
     let rows = coverage(config, packs)?;
+    let lineages = lineages_of(config);
     let mut out = Vec::new();
-    for line in describe_all(config) {
-        let name = line.split(':').next().unwrap_or("").to_string();
+    for (name, line) in describe_pairs(config) {
         if only.is_some_and(|o| o != name) {
             continue;
         }
@@ -490,6 +645,14 @@ pub fn show_lines(config: &Config, packs: &Packs, only: Option<&str>) -> Result<
                 (None, _, true) => "not LLM-reviewed (tripwires only, by your choice)".to_string(),
                 (None, _, false) => "no eligible reviewer: `loom config check` says what to add".to_string(),
             };
+            let first = row.whole.as_ref().or(row.own.as_ref());
+            let who = match (first, &row.fallback) {
+                (Some(f), Some(fb)) => {
+                    let rec = lineages.get(fb).map_or("unknown", |l| l.recipient.as_str());
+                    format!("{who}; on a fault of {f}: {fb} (recipient {rec})")
+                }
+                _ => who,
+            };
             out.push(format!("  {}: {who}", row.pack));
         }
     }
@@ -502,6 +665,15 @@ pub fn check_config(config: &Config, packs: &Packs) -> Report {
     let mut report = Report { table: describe_all(config), ..Report::default() };
     let tripwires = &config.monitor.tripwires_only_profiles;
     let reviewers = &config.monitor.reviewers;
+    let rows = match coverage(config, packs) {
+        Ok(rows) => rows,
+        Err(e) => {
+            report.problems.push(format!(
+                "The model policy could not be evaluated, so no profile was checked for a reviewer: {e}"
+            ));
+            Vec::new()
+        }
+    };
     for (name, p) in &config.models {
         let Some(l) = lineages.get(name) else { continue };
         if reviewers.contains(name) {
@@ -509,6 +681,12 @@ pub fn check_config(config: &Config, packs: &Packs) -> Report {
                 report.problems.push(format!(
                     "models.{name} is a reviewer but its family is unknown, so it matches every family and would never be eligible. Declare it, for example\n    [models.{name}]\n    family = [\"qwen\"]    # one of: {}",
                     FAMILIES.join(", ")
+                ));
+            } else if l.fields.family != Source::Declared {
+                report.problems.push(format!(
+                    "models.{name} is a reviewer but its family ({}) is only inferred from the model id, and a reviewer's family is your word: a distill named for one parent is judged disjoint from the other. Declare it:\n    [models.{name}]\n    family = [{}]",
+                    l.family_word(),
+                    l.family.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(", ")
                 ));
             }
             if l.alignment != Alignment::Stock {
@@ -520,6 +698,11 @@ pub fn check_config(config: &Config, packs: &Packs) -> Report {
             if l.recipient_is_unknown() {
                 report.problems.push(format!(
                     "models.{name} is a reviewer but its recipient is unknown. Declare who receives its traffic:\n    [models.{name}]\n    recipient = \"lan\"    # or \"local\", or the provider's name"
+                ));
+            } else if l.fields.recipient != Source::Declared {
+                report.problems.push(format!(
+                    "models.{name} is a reviewer but its recipient ({}) is only inferred from base_url, and a reviewer's recipient is your word (a hostname can front anyone's cloud). Declare it:\n    [models.{name}]\n    recipient = \"{}\"",
+                    l.recipient, l.recipient
                 ));
             }
         }
@@ -554,7 +737,6 @@ pub fn check_config(config: &Config, packs: &Packs) -> Report {
         if !declared_ok {
             continue;
         }
-        let Ok(rows) = coverage(config, packs) else { continue };
         for row in rows.iter().filter(|r| &r.profile == name) {
             if row.own.is_none() {
                 report.problems.push(format!(
@@ -562,7 +744,19 @@ pub fn check_config(config: &Config, packs: &Packs) -> Report {
                     row.pack,
                     choices(config, &lineages, name, &row.pack)
                 ));
-            } else if row.whole.is_none() {
+            } else if let Some((fb, first)) = row.fallback.as_ref().zip(row.whole.as_ref().or(row.own.as_ref())) {
+                let rec = lineages.get(fb).map_or("unknown", |l| l.recipient.as_str());
+                let used: Vec<String> =
+                    row.reached.iter().filter_map(|n| lineages.get(n)).map(|l| normalize_name(&l.recipient)).collect();
+                let owned = lineages.get(fb).is_some_and(Lineage::is_operator_owned);
+                if !owned && !used.contains(&normalize_name(rec)) {
+                    report.notes.push(format!(
+                        "{name}: in the {} pack, if {first} faults the review falls back to {fb} and sends transcripts to \"{rec}\", a recipient this fleet does not otherwise use. Consent is per pack, not per fleet; narrow it in [monitor.recipients] if that is not what you meant.",
+                        row.pack
+                    ));
+                }
+            }
+            if row.own.is_some() && row.whole.is_none() {
                 report.notes.push(format!(
                     "{name}: in the {} pack no one reviewer is eligible for everything its missions can reach ({}), so each session is reviewed on its own; mission-level review and keep-going are unavailable.",
                     row.pack,
@@ -593,12 +787,17 @@ mod tests {
         lin(profile, family, Alignment::Stock, recipient)
     }
 
+    /// `super::eligible` with only the overrides it needed (the basis has its own test).
+    fn eligible(reviewer: &Lineage, r: &Request) -> Result<Vec<OverrideKind>, Ineligible> {
+        super::eligible(reviewer, r).map(|a| a.overrides)
+    }
+
     fn up(_: &str) -> Facts {
         Facts { reachable: true, needs_vet: false, vetted: false }
     }
 
     fn req<'a>(reached: &'a [Lineage], data: &'a [String], consented: &'a [String]) -> Request<'a> {
-        Request { reached, data_recipients: data, consented, overrides: &[], now_ms: 1_000, facts: &up }
+        Request { mission: "m1", reached, data_recipients: data, consented, overrides: &[], now_ms: 1_000, facts: &up }
     }
 
     fn s(items: &[&str]) -> Vec<String> {
@@ -606,7 +805,8 @@ mod tests {
     }
 
     fn ov(kind: OverrideKind, expires_ms: u64) -> Override {
-        Override { kind, reason: "the operator asked".into(), expires_ms }
+        let target = if kind == OverrideKind::NewRecipient { "alibaba" } else { "r" };
+        Override { kind, mission: "m1".into(), target: target.into(), reason: "the operator asked".into(), expires_ms }
     }
 
     #[test]
@@ -742,7 +942,13 @@ mod tests {
             eligible(&reviewer, &Request { overrides: &expired, ..req(&on_lan, &lan, &[]) }),
             Err(Ineligible::NewRecipient)
         );
-        let no_reason = [Override { kind: OverrideKind::NewRecipient, reason: "  ".into(), expires_ms: 9_999 }];
+        let no_reason = [Override {
+            kind: OverrideKind::NewRecipient,
+            mission: "m1".into(),
+            target: "alibaba".into(),
+            reason: "  ".into(),
+            expires_ms: 9_999,
+        }];
         assert_eq!(
             eligible(&reviewer, &Request { overrides: &no_reason, ..req(&on_lan, &lan, &[]) }),
             Err(Ineligible::NewRecipient)
@@ -884,6 +1090,7 @@ recipient = "lan"
 [models.mistral]
 base_url = "https://api.mistral.ai/v1"
 model = "mistral-large"
+family = ["mistral"]
 alignment = "stock"
 recipient = "mistral"
 [models.inklingv5]
@@ -959,7 +1166,8 @@ reviewers = ["dsv41_review", "qwen4max", "mistral"]
         let consent = s(&["alibaba"]);
         let first = select(&order, &lineages, &req(&necro, &data, &consent), &[]);
         assert_eq!(first.mission.as_deref(), Some("dsv41_review"));
-        // dsv41_review faults: the next in the list is qwen4max, which the pack consented to.
+        // dsv41_review faults: the next in the list is qwen4max, which the pack consented to. Consent is per pack, so a
+        // fault of the LAN reviewer lets any fleet's mission in the pack fall through to Alibaba (docs/MONITOR.md, D16).
         let second = select(&order, &lineages, &req(&necro, &data, &consent), &s(&["dsv41_review"]));
         assert_eq!(second.mission.as_deref(), Some("qwen4max"));
         // Both fault: mistral's recipient is not consented to, so there is no third.
@@ -1100,6 +1308,7 @@ reviewers = ["dsv41_review", "qwen4max", "mistral"]
         let mut c = fleet_config(consent_alibaba());
         if let Some(p) = c.models.get_mut("mistral") {
             p.model = "default".into();
+            p.family = None;
         }
         let j = check_config(&c, &packs).problems.join("\n");
         assert!(j.contains("models.mistral: the family is unknown") && j.contains("family = [\"deepseek\"]"), "{j}");
@@ -1151,7 +1360,13 @@ reviewers = ["dsv41_review", "qwen4max", "mistral"]
         let one = show_lines(&c, &packs, Some("necromicon")).unwrap_or_else(|e| panic!("{e}"));
         assert!(one[0]
             .starts_with("necromicon: family kimi (declared), alignment relaxed (declared), recipient lan (declared)"));
-        assert!(one.iter().any(|l| l == "  ctf: reviewed by dsv41_review") && one.len() == 1 + packs.names().len());
+        assert!(
+            one.iter()
+                .any(|l| l
+                    == "  ctf: reviewed by dsv41_review; on a fault of dsv41_review: qwen4max (recipient alibaba)")
+                && one.len() == 1 + packs.names().len(),
+            "the fallback hosted reviewer is shown: {one:?}"
+        );
         let e = show_lines(&c, &packs, Some("nope")).unwrap_err();
         assert!(e.contains("\"nope\"") && e.contains("dsv41"), "{e}");
         let bare = show_lines(&fleet_config(""), &packs, Some("dsv41")).unwrap_or_else(|e| panic!("{e}"));
@@ -1203,6 +1418,206 @@ reviewers = ["dsv41_review", "qwen4max", "mistral"]
             rep.notes
         );
         assert!(!rep.problems.iter().any(|p| p.starts_with("models.dseekv41")), "{:?}", rep.problems);
+    }
+
+    #[test]
+    fn a_mission_with_a_relaxed_agent_takes_no_override_in_the_per_profile_picks_either() {
+        let order = s(&["dsv41_review"]);
+        let mut lineages = BTreeMap::new();
+        lineages.insert("dsv41_review".to_string(), stock("dsv41_review", &["deepseek"], "lan"));
+        let dsv41 = stock("dsv41", &["deepseek"], "lan");
+        let necro = lin("necromicon", &["kimi"], Alignment::Relaxed, "lan");
+        let reached = [dsv41.clone(), necro];
+        let data = recipients_of(&reached);
+        let live = [Override { target: "dsv41_review".into(), ..ov(OverrideKind::SameFamily, 9_999) }];
+        let sel = select(&order, &lineages, &Request { overrides: &live, ..req(&reached, &data, &[]) }, &[]);
+        assert_eq!(sel.mission, None);
+        assert_eq!(sel.per_profile["dsv41"], None, "the override does not count for dsv41 alone either");
+        assert_eq!(sel.reviewer_for("dsv41"), None);
+        // Without the relaxed agent the same override is honoured, for the mission and for the profile.
+        let only = [dsv41];
+        let data = recipients_of(&only);
+        let sel = select(&order, &lineages, &Request { overrides: &live, ..req(&only, &data, &[]) }, &[]);
+        assert_eq!(sel.mission.as_deref(), Some("dsv41_review"));
+        assert_eq!(sel.mission_overrides, vec![OverrideKind::SameFamily]);
+    }
+
+    #[test]
+    fn an_override_is_bound_to_its_mission_reviewer_and_recipient() {
+        let agent = [stock("dsv41", &["deepseek"], "lan")];
+        let lan = s(&["lan"]);
+        let on_alibaba = stock("qwen4max", &["qwen"], "alibaba");
+        let on_mistral = stock("mistral", &["mistral"], "mistral");
+        let live = [ov(OverrideKind::NewRecipient, 9_999)];
+        let r = Request { overrides: &live, ..req(&agent, &lan, &[]) };
+        assert_eq!(eligible(&on_alibaba, &r), Ok(vec![OverrideKind::NewRecipient]));
+        assert_eq!(
+            eligible(&on_mistral, &r),
+            Err(Ineligible::NewRecipient),
+            "an override for recipient alibaba is no consent to mistral"
+        );
+        // Another mission's override does not count.
+        let elsewhere = Request { mission: "m2", ..r };
+        assert_eq!(eligible(&on_alibaba, &elsewhere), Err(Ineligible::NewRecipient));
+        // A same-family override names the reviewer it admits.
+        let kin = stock("r", &["deepseek"], "lan");
+        let other_kin = stock("other", &["deepseek"], "lan");
+        let fam = [ov(OverrideKind::SameFamily, 9_999)];
+        let r = Request { overrides: &fam, ..req(&agent, &lan, &[]) };
+        assert_eq!(eligible(&kin, &r), Ok(vec![OverrideKind::SameFamily]));
+        assert_eq!(eligible(&other_kin, &r), Err(Ineligible::SameFamily));
+        // Through select: the override admits qwen4max and nobody after it when qwen4max faults.
+        let mut lineages = BTreeMap::new();
+        lineages.insert("qwen4max".to_string(), on_alibaba);
+        lineages.insert("mistral".to_string(), on_mistral);
+        let order = s(&["qwen4max", "mistral"]);
+        let r = Request { overrides: &live, ..req(&agent, &lan, &[]) };
+        assert_eq!(select(&order, &lineages, &r, &[]).mission.as_deref(), Some("qwen4max"));
+        assert_eq!(select(&order, &lineages, &r, &s(&["qwen4max"])).mission, None);
+    }
+
+    #[test]
+    fn the_basis_of_a_new_recipient_tells_consent_from_the_intersection() {
+        let reviewer = stock("qwen4max", &["qwen"], "alibaba");
+        let basis = |reached: &[Lineage], data: &[String], consent: &[String], overrides: &[Override]| {
+            super::eligible(&reviewer, &Request { overrides, ..req(reached, data, consent) }).map(|a| a.basis)
+        };
+        let consent = s(&["alibaba"]);
+        // dsv41 on the LAN, consented: a new recipient. dseekv41 on Alibaba: the provider already has the data.
+        let dsv41 = [stock("dsv41", &["deepseek"], "lan")];
+        let dseek = [stock("dseekv41", &["deepseek"], "alibaba")];
+        assert_eq!(basis(&dsv41, &s(&["lan"]), &consent, &[]), Ok(Basis::Consent));
+        assert_eq!(basis(&dseek, &s(&["alibaba"]), &consent, &[]), Ok(Basis::Intersection));
+        assert_eq!(basis(&dseek, &s(&["alibaba"]), &[], &[]), Ok(Basis::Intersection));
+        let live = [ov(OverrideKind::NewRecipient, 9_999)];
+        assert_eq!(basis(&dsv41, &s(&["lan"]), &[], &live), Ok(Basis::Override));
+        let lan_reviewer = stock("r", &["qwen"], "lan");
+        assert_eq!(
+            super::eligible(&lan_reviewer, &req(&dsv41, &s(&["lan"]), &[])).map(|a| a.basis),
+            Ok(Basis::OperatorOwned)
+        );
+        assert!(Basis::Consent.new_recipient() && Basis::Override.new_recipient());
+        assert!(!Basis::Intersection.new_recipient() && !Basis::OperatorOwned.new_recipient());
+        // Through select: the same reviewer, told apart.
+        let c = fleet_config(consent_alibaba());
+        let lineages = lineages_of(&c);
+        let order = c.monitor.reviewers.clone();
+        let lead = [lineages["dsv41"].clone()];
+        let sel = select(&order, &lineages, &req(&lead, &recipients_of(&lead), &consent), &[]);
+        assert_eq!((sel.mission.as_deref(), sel.mission_basis), (Some("qwen4max"), Some(Basis::Consent)));
+        assert_eq!(sel.per_profile_basis["dsv41"], Basis::Consent);
+        let lead = [lineages["dseekv41"].clone()];
+        let sel = select(&order, &lineages, &req(&lead, &recipients_of(&lead), &consent), &[]);
+        assert_eq!((sel.mission.as_deref(), sel.mission_basis), (Some("qwen4max"), Some(Basis::Intersection)));
+        assert_eq!(sel.per_profile_basis["dseekv41"], Basis::Intersection);
+    }
+
+    #[test]
+    fn a_review_profile_is_never_a_lead_and_creation_is_refused_for_what_a_mission_can_reach() {
+        let packs = repo_packs();
+        let c = fleet_config("");
+        // Led by the review profile itself: refused, not "no refusal".
+        let t = creation_refusal(&c, &packs, "dsv41_review", "core").unwrap_or_default();
+        assert!(t.contains("dsv41_review") && t.contains("purpose = \"review\""), "{t}");
+        // A role that names a profile with no reviewer: the lead has one, the judge does not.
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let with_judge = pack_with_role_models(dir.path());
+        let mut c = fleet_config(consent_alibaba());
+        c.monitor.reviewers = s(&["qwen4max"]);
+        let t = creation_refusal(&c, &with_judge, "dsv41", "core").unwrap_or_default();
+        assert!(t.starts_with("No reviewer is eligible for qwen, which a mission of dsv41 can reach"), "{t}");
+        // Listing the reached profile on purpose is an explicit choice; the lead has a reviewer.
+        c.monitor.tripwires_only_profiles.push("qwen".into());
+        assert_eq!(creation_refusal(&c, &with_judge, "dsv41", "core"), None);
+        // A reachable profile that is not configured, or a pack that is missing: a refusal, never silence.
+        let t = creation_refusal(&fleet_config(consent_alibaba()), &packs, "qwen", "nope").unwrap_or_default();
+        assert!(t.contains("cannot be chosen") && t.contains("\"nope\""), "{t}");
+        // A reachable review profile is refused.
+        let mut c = fleet_config(consent_alibaba());
+        if let Some(p) = c.models.get_mut("glm_unc") {
+            p.purpose = Some(ProfilePurpose::Review);
+        }
+        let t = creation_refusal(&c, &with_judge, "mistral", "core").unwrap_or_default();
+        assert!(t.contains("can reach glm_unc") && t.contains("purpose = \"review\""), "{t}");
+    }
+
+    #[test]
+    fn config_check_fails_when_the_policy_cannot_be_evaluated() {
+        let c = fleet_config(consent_alibaba());
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let ghost = pack_with_role_models(dir.path());
+        // A configuration that lacks a profile the pack's worker role names.
+        let mut c = c;
+        c.models.remove("glm_unc");
+        let rep = check_config(&c, &ghost);
+        assert!(
+            rep.problems.iter().any(|p| p.starts_with("The model policy could not be evaluated")
+                && p.contains("\"glm_unc\"")
+                && p.contains("[models.glm_unc]")),
+            "{:?}",
+            rep.problems
+        );
+    }
+
+    #[test]
+    fn a_reviewers_family_and_recipient_must_be_declared_not_inferred() {
+        let packs = repo_packs();
+        let mut c = fleet_config(consent_alibaba());
+        if let Some(p) = c.models.get_mut("mistral") {
+            p.family = None;
+            p.recipient = None;
+        }
+        let j = check_config(&c, &packs).problems.join("\n");
+        assert!(
+            j.contains("models.mistral is a reviewer but its family (mistral) is only inferred")
+                && j.contains("family = [\"mistral\"]"),
+            "{j}"
+        );
+        assert!(
+            j.contains("models.mistral is a reviewer but its recipient (api.mistral.ai) is only inferred")
+                && j.contains("recipient = \"api.mistral.ai\""),
+            "{j}"
+        );
+        // An agent profile need not declare them (it only has to be known).
+        let mut c = fleet_config(consent_alibaba());
+        if let Some(p) = c.models.get_mut("qwen") {
+            p.family = None;
+            p.recipient = None;
+        }
+        assert!(check_config(&c, &packs).problems.is_empty());
+    }
+
+    #[test]
+    fn a_profile_name_with_a_colon_is_shown() {
+        let packs = repo_packs();
+        let mut c = fleet_config(consent_alibaba());
+        let moved = c.models.remove("qwen").unwrap_or_default();
+        c.models.insert("qwen:72b".to_string(), moved);
+        let one = show_lines(&c, &packs, Some("qwen:72b")).unwrap_or_else(|e| panic!("{e}"));
+        assert!(one[0].starts_with("qwen:72b: family qwen"), "{one:?}");
+        assert!(one.iter().any(|l| l.starts_with("  core: reviewed by dsv41_review")), "{one:?}");
+        let all = show_lines(&c, &packs, None).unwrap_or_else(|e| panic!("{e}"));
+        assert!(all.iter().any(|l| l.starts_with("qwen:72b: ")));
+    }
+
+    #[test]
+    fn the_fallback_reviewer_is_shown_and_a_new_recipient_through_it_is_noted() {
+        let packs = repo_packs();
+        let c = fleet_config(consent_alibaba());
+        let rows = coverage(&c, &packs).unwrap_or_else(|e| panic!("{e}"));
+        let necro =
+            rows.iter().find(|r| r.profile == "necromicon" && r.pack == "core").unwrap_or_else(|| panic!("row"));
+        assert_eq!(necro.fallback.as_deref(), Some("qwen4max"));
+        let rep = check_config(&c, &packs);
+        assert!(
+            rep.notes.iter().any(|n| n.starts_with("necromicon: in the core pack, if dsv41_review faults")
+                && n.contains("falls back to qwen4max")
+                && n.contains("\"alibaba\"")),
+            "{:?}",
+            rep.notes
+        );
+        // DeepSeek on Alibaba already sends to Alibaba: no new recipient through the fallback, so no note.
+        assert!(!rep.notes.iter().any(|n| n.starts_with("dseekv41: in the core pack, if")), "{:?}", rep.notes);
     }
 
     #[test]
