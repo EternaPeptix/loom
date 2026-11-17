@@ -23,6 +23,21 @@
   `com.apple.ocspd`. A command could have trustd fetch any URL named in a certificate (AIA), past the proxy and
   `net.jsonl`. Programs that check certificates through macOS (Swift, Go, `security`, `codesign --verify`) now
   fail in deny_all; curl and Python are unaffected. In the other modes this stays a documented residual.
+- Commands can no longer mount a file system or attach a disk image over a directory (`file-mount` and the
+  DiskArbitration/disk-image services are denied): `hdiutil attach -mountpoint` of an image a command made
+  replaced `.git/hooks`, and works over `~/.ssh` or `~/Library/LaunchAgents` (reproduced on macOS 27; this
+  predates the release). `hdiutil attach` and `diskutil` now fail in every session.
+- Commands can no longer write macOS preferences (`user-preference-write`): `cfprefsd` wrote
+  `~/Library/Preferences` for them outside the sandbox. Reading preferences still works.
+- Under `deny_all`, background URL sessions (`nsurlsessiond`) and WebKit's networking services are denied as
+  well: each fetched a URL for a command driven from `osascript -l JavaScript`.
+- Below `.git/modules/<name>/` nothing can be made or removed except inside the submodule repositories found
+  when the sandbox was built (a slash-named submodule set up mid-session could be replaced by a copy carrying
+  `core.fsmonitor`). The `core.hooksPath` directory and included files named by each repository's and the
+  user's global Git configuration are protected (husky's `.husky/` hooks could be planted). Bare repositories
+  in the workspace are found; pointer targets count only when they are repositories. `agent_adopt` asks the
+  sandbox about every path before it looks at the workspace (no more existence oracle through a link) and
+  again once each file is in place.
 - The daemon's own port is refused to commands in every profile, even with `loopback_all` or when listed in
   `loopback_ports`, so a `loom open` login code on another process's command line cannot be redeemed. New
   non-configuration fields `SandboxCfg::daemon_port` and `SandboxCfg::network_deny_all` carry what the profile
