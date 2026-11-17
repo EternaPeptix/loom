@@ -1578,6 +1578,17 @@ impl Session {
         Ok(session)
     }
 
+    /// Put the recall note (`prior::brief`) in the log of a session that has had no turn yet, so that it comes
+    /// before its first model request. See the module contract.
+    pub fn recall(&mut self, text: String) -> Result<(), String> {
+        if self.own().iter().any(|r| matches!(r.event, Event::TurnStart { .. })) {
+            return Err("This session has already had a turn, so earlier missions can no longer be recalled into it. \
+Name them when you start a new mission instead."
+                .into());
+        }
+        self.note(Author::Harness, NoteKind::Info, text).map_err(|e| e.0)
+    }
+
     /// A new session whose log starts as a copy of `parent_log` up to `upto_seq`.
     pub fn fork(deps: Deps, parent_log: &Path, upto_seq: Seq, forked: Forked) -> Result<Session, String> {
         let registry = Session::prepare(&deps)?;
@@ -4097,6 +4108,36 @@ mod tests {
         assert_eq!(fx.server.requests().len(), 6);
         assert_eq!(fx.sink.last_status().unwrap().open_inbox, 1);
         assert_no_cache_break(&rs);
+    }
+
+    // ---- recall ------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_recall_note_sits_right_after_session_start_and_is_in_the_first_request() {
+        let mut fx = Fx::build("lead", false, true, AgentsCfg::default(), seq(vec![Reply::text("ok").into()])).await;
+        let mut session = fx.create();
+        session.recall("EARLIER-MISSION-NOTE".into()).unwrap();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let ks = kinds(&rs);
+        assert_eq!(&ks[..2], ["session_start", "harness_note"]);
+        assert!(ks.iter().position(|k| k == "model_request").unwrap() > 1);
+        assert_eq!(rs[1].author, Author::Harness);
+        assert_eq!(notes(&rs, NoteKind::Info)[0], "EARLIER-MISSION-NOTE");
+        assert!(all_text(&fx.server.requests()[0]).contains("EARLIER-MISSION-NOTE"));
+    }
+
+    #[tokio::test]
+    async fn a_recall_after_a_turn_is_refused_and_appends_nothing() {
+        let mut fx = Fx::build("lead", false, true, AgentsCfg::default(), seq(vec![Reply::text("ok").into()])).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let mut reopened = Session::open(fx.deps()).unwrap();
+        let reopened_len = reopened.records().len();
+        let err = reopened.recall("LATE".into()).unwrap_err();
+        assert!(err.contains("already had a turn") && err.contains("new mission"), "{err}");
+        assert_eq!(reopened.records().len(), reopened_len);
+        assert!(!std::fs::read_to_string(fx.log_path()).unwrap().contains("LATE"));
     }
 
     // ---- output limit ------------------------------------------------------------------------

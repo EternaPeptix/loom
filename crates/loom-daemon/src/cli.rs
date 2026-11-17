@@ -21,7 +21,8 @@
 //!   joined by spaces; `-` or no message reads standard input to its end. Options → `NewSession`
 //!   (`--workspace` defaults to the current directory; `--attended` sets `unattended: false`;
 //!   `--max-steps`/`--max-minutes` → budget; `--prior <mission>`, repeatable, → `prior` in the order
-//!   given: earlier missions for this one to recall, `loom_agent::prior`; `chat` takes it too). A
+//!   given: earlier missions for this one to recall, `loom_agent::prior`; `chat` takes it too, and refuses it
+//!   with `--session`: a mission recalls when it starts). A
 //!   `--prior` word that starts with `m-` is a mission id, sent as it is; any other word is resolved as a
 //!   session (`client.resolve`: an id, a prefix, or `last`) and its `mission` is sent. Prints `session {id}` to stderr first. With
 //!   `--detach`, stops there. Otherwise *follows* (below).
@@ -99,7 +100,8 @@ use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt
 use loom_agent::session::Phase;
 use loom_core::config::{Config, Paths};
 use loom_core::event::{Budget, Event, Record, Seq, SessionOutcome, TurnEndReason};
-use loom_core::SessionId;
+use loom_core::{MissionId, SessionId};
+use std::future::Future;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -255,6 +257,10 @@ pub struct StartOpts {
     pub max_steps: u32,
     #[arg(long, default_value_t = 0)]
     pub max_minutes: u32,
+    /// An earlier mission for this one to recall: a mission id (m-…), or a session id, prefix or `last`
+    /// (its mission). Repeat for more
+    #[arg(long, value_name = "MISSION")]
+    pub prior: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -635,8 +641,23 @@ fn non_zero(n: u32) -> Option<u32> {
     (n > 0).then_some(n)
 }
 
-/// The request `loom run` and `loom chat` make; `cwd` is the default workspace.
-fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path) -> NewSession {
+/// The missions `--prior` names, in the order given: a word starting with `m-` is a mission id and is sent as
+/// it is; any other word goes to `resolve` (a session id, prefix or `last`), which gives its mission.
+async fn prior_missions<F, Fut>(words: &[String], resolve: F) -> Result<Vec<MissionId>, String>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<MissionId, String>>,
+{
+    let mut out = Vec::new();
+    for word in words {
+        let word = word.trim();
+        out.push(if word.starts_with("m-") { MissionId::from(word) } else { resolve(word.to_string()).await? });
+    }
+    Ok(out)
+}
+
+/// The request `loom run` and `loom chat` make; `cwd` is the default workspace; `prior` the missions to recall.
+fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path, prior: Vec<MissionId>) -> NewSession {
     let workspace = opts.workspace.clone().unwrap_or_else(|| cwd.to_path_buf());
     NewSession {
         workspace: std::path::absolute(&workspace).unwrap_or(workspace),
@@ -647,6 +668,7 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path) -> NewSess
         unattended: opts.attended.then_some(false),
         budget: Budget { max_steps: non_zero(opts.max_steps), max_minutes: non_zero(opts.max_minutes) },
         message,
+        prior,
     }
 }
 
@@ -1298,7 +1320,9 @@ async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
     let c = client_of(paths)?;
     let cwd =
         std::env::current_dir().map_err(|e| format!("Cannot find the current directory ({e}). Pass --workspace."))?;
-    let info = c.create(&new_session(&a.start, Some(message), &cwd)).await?;
+    let client = &c;
+    let prior = prior_missions(&a.start.prior, |word| async move { client.mission_of(&word).await }).await?;
+    let info = c.create(&new_session(&a.start, Some(message), &cwd, prior)).await?;
     let id = info.meta.id;
     errln(&format!("session {id}"));
     if a.detach {
@@ -1311,11 +1335,18 @@ async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
 async fn cmd_chat(paths: &Paths, a: ChatArgs) -> Result<i32, String> {
     let c = client_of(paths)?;
     let id = match &a.session {
+        Some(_) if !a.start.prior.is_empty() => {
+            return Err("Earlier missions are recalled when a mission starts. Drop --session to start a new chat \
+that recalls them, or drop --prior to continue this one."
+                .to_string());
+        }
         Some(word) => c.resolve(word).await?,
         None => {
             let cwd = std::env::current_dir()
                 .map_err(|e| format!("Cannot find the current directory ({e}). Pass --workspace."))?;
-            let mut new = new_session(&a.start, None, &cwd);
+            let client = &c;
+            let prior = prior_missions(&a.start.prior, |word| async move { client.mission_of(&word).await }).await?;
+            let mut new = new_session(&a.start, None, &cwd, prior);
             if new.role.is_none() {
                 new.role = Some("chat".to_string());
             }
@@ -1515,6 +1546,10 @@ mod tests {
             "5",
             "--max-minutes",
             "9",
+            "--prior",
+            "m-1",
+            "--prior",
+            "last",
             "-d",
             "--reasoning",
             "--full",
@@ -1532,16 +1567,20 @@ mod tests {
         assert_eq!(a.start.title.as_deref(), Some("T"));
         assert!(a.start.attended);
         assert_eq!((a.start.max_steps, a.start.max_minutes), (5, 9));
+        assert_eq!(a.start.prior, words(&["m-1", "last"]));
         assert!(a.detach && a.show.reasoning && a.show.full && a.show.verbose);
         assert_eq!(a.message, words(&["fix", "the", "bug"]));
         let Command::Run(a) = ok(&["run"]) else { panic!("not run") };
-        assert!(a.message.is_empty() && !a.detach && !a.start.attended);
+        assert!(a.message.is_empty() && !a.detach && !a.start.attended && a.start.prior.is_empty());
         assert_eq!((a.start.max_steps, a.start.max_minutes), (0, 0));
         let Command::Run(a) = ok(&["run", "-"]) else { panic!("not run") };
         assert_eq!(a.message, words(&["-"]));
         let Command::Run(a) = ok(&["run", "--", "-5", "is", "negative"]) else { panic!("not run") };
         assert_eq!(a.message, words(&["-5", "is", "negative"]));
         rejected(&["run", "--max-steps", "many"]);
+        rejected(&["run", "--prior"]);
+        let Command::Chat(a) = ok(&["chat", "--prior", "s-9"]) else { panic!("not chat") };
+        assert_eq!(a.start.prior, words(&["s-9"]));
         rejected(&["run", "--no-such-flag"]);
     }
 
@@ -1899,8 +1938,9 @@ mod tests {
     #[test]
     fn new_session_from_options() {
         let cwd = Path::new("/here");
-        let n = new_session(&StartOpts::default(), Some("go".into()), cwd);
+        let n = new_session(&StartOpts::default(), Some("go".into()), cwd, Vec::new());
         assert_eq!(n.workspace, PathBuf::from("/here"));
+        assert!(n.prior.is_empty());
         assert_eq!(n.message.as_deref(), Some("go"));
         assert_eq!(n.unattended, None);
         assert_eq!(n.budget, Budget { max_steps: None, max_minutes: None });
@@ -1913,8 +1953,10 @@ mod tests {
             attended: true,
             max_steps: 7,
             max_minutes: 3,
+            prior: Vec::new(),
         };
-        let n = new_session(&opts, None, cwd);
+        let n = new_session(&opts, None, cwd, vec![MissionId::from("m-1"), MissionId::from("m-2")]);
+        assert_eq!(n.prior, [MissionId::from("m-1"), MissionId::from("m-2")]);
         assert_eq!(n.workspace, PathBuf::from("/w"));
         assert_eq!(
             (n.pack.as_deref(), n.role.as_deref(), n.model.as_deref(), n.title.as_deref()),
@@ -1923,6 +1965,29 @@ mod tests {
         assert_eq!(n.unattended, Some(false));
         assert_eq!(n.budget, Budget { max_steps: Some(7), max_minutes: Some(3) });
         assert!(n.message.is_none());
+    }
+
+    #[tokio::test]
+    async fn prior_words_are_mission_ids_as_they_are_or_sessions_resolved_to_their_mission() {
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        let resolve = |word: String| {
+            asked.lock().unwrap().push(word.clone());
+            async move {
+                match word.as_str() {
+                    "last" => Ok(MissionId::from("m-of-last")),
+                    "s-1" => Ok(MissionId::from("m-of-s1")),
+                    w => Err(format!("No session matches `{w}`.")),
+                }
+            }
+        };
+        let got = prior_missions(&words(&["m-9", "last", "s-1", " m-3 "]), resolve).await.unwrap();
+        let want: Vec<MissionId> = ["m-9", "m-of-last", "m-of-s1", "m-3"].into_iter().map(MissionId::from).collect();
+        assert_eq!(got, want);
+        // Only the words that are not mission ids were looked up.
+        assert_eq!(*asked.lock().unwrap(), ["last", "s-1"]);
+        let resolve = |word: String| async move { Err::<MissionId, _>(format!("No session matches `{word}`.")) };
+        assert_eq!(prior_missions(&words(&["m-1", "zzz"]), resolve).await.unwrap_err(), "No session matches `zzz`.");
+        assert!(prior_missions(&[], resolve).await.unwrap().is_empty());
     }
 
     #[test]
