@@ -127,8 +127,19 @@ const HEAD_BYTES: usize = 400;
 /// Keys a server may report its context window under, in order of preference.
 const WINDOW_KEYS: [&str; 4] = ["max_model_len", "context_window", "context_length", "max_context_length"];
 /// Phrases (lower case) a server uses for "the prompt does not fit".
-const OVERFLOW_PHRASES: [&str; 5] =
-    ["maximum context length", "context length", "too many tokens", "prompt is too long", "max_model_len"];
+const OVERFLOW_PHRASES: [&str; 7] = [
+    "maximum context length",
+    "context length",
+    "too many tokens",
+    "prompt is too long",
+    "max_model_len",
+    "exceeds the available context size",
+    "input is too long",
+];
+/// Values of an error object's `type` or `code` that mean "the prompt does not fit", whatever the message.
+const OVERFLOW_CODES: [&str; 2] = ["exceed_context_size_error", "context_length_exceeded"];
+/// HTTP statuses on which a body may be an overflow report (TGI answers 422).
+const OVERFLOW_STATUSES: [u16; 3] = [400, 413, 422];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -561,6 +572,11 @@ impl ModelClient {
                 AssembleError::Oversize(m) => sticky(format!(
                     "the server sent a malformed stream: {m}. Check that base_url points at an OpenAI-compatible /v1 endpoint."
                 )),
+                // An overflow reported inside a 200 stream cannot be cured by sending the same request again.
+                AssembleError::Server(m) if has_overflow_phrase(&m) => {
+                    let (limit, requested) = overflow_numbers(&m);
+                    Fail::Fatal(ModelError::ContextOverflow { limit, requested, message: m })
+                }
                 other => retry(other.to_string()),
             }
             };
@@ -742,28 +758,58 @@ fn error_message(body: &str) -> String {
     clip(body, MESSAGE_CHARS)
 }
 
-/// `limit` and `requested`: the first two integers >= 1000 in the message, in that order, unless
-/// the message puts them as `requested > limit`.
+/// True when the message contains one of the overflow phrases, case-insensitively.
+fn has_overflow_phrase(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    OVERFLOW_PHRASES.iter().any(|p| lower.contains(p))
+}
+
+/// `limit` and `requested` from a message: the first two integers >= 1000, the smaller as the limit
+/// and the larger as the request (servers name them in either order); one integer is the limit.
 fn overflow_numbers(message: &str) -> (Option<u64>, Option<u64>) {
     let mut found = message
         .split(|c: char| !c.is_ascii_digit())
         .filter(|t| !t.is_empty())
         .filter_map(|t| t.parse::<u64>().ok())
         .filter(|n| *n >= 1000);
-    let (first, second) = (found.next(), found.next());
-    // "Prompt is too long: 70000 > 65536" names the request before the limit.
-    match (first, second) {
-        (Some(a), Some(b)) if message.contains(&format!("{a} > {b}")) => (Some(b), Some(a)),
-        other => other,
+    match (found.next(), found.next()) {
+        (Some(a), Some(b)) => (Some(a.min(b)), Some(a.max(b))),
+        (one, _) => (one, None),
+    }
+}
+
+/// The body's `error` object (or the body itself when it has `type`/`code` at the top level).
+fn error_object(body: &str) -> Option<Value> {
+    let v = serde_json::from_str::<Value>(body).ok()?;
+    match v.get("error") {
+        Some(e) if e.is_object() => Some(e.clone()),
+        _ => Some(v).filter(Value::is_object),
+    }
+}
+
+/// Reads the overflow report in a 400/413/422 body: `Some((limit, requested))` when it is one.
+/// It is one when the message has an overflow phrase or the error object's `type` or `code` is an
+/// overflow code. `n_ctx` / `n_prompt_tokens` of the error object win over numbers in the message.
+fn read_overflow(body: &str, message: &str) -> Option<(Option<u64>, Option<u64>)> {
+    let object = error_object(body);
+    let field = |k: &str| object.as_ref().and_then(|o| o.get(k));
+    let coded = ["type", "code"]
+        .iter()
+        .any(|k| field(k).and_then(Value::as_str).is_some_and(|c| OVERFLOW_CODES.contains(&c.to_lowercase().as_str())));
+    if !coded && !has_overflow_phrase(message) {
+        return None;
+    }
+    let positive = |k: &str| field(k).and_then(Value::as_u64).filter(|n| *n > 0);
+    match (positive("n_ctx"), positive("n_prompt_tokens")) {
+        (None, None) => Some(overflow_numbers(message)),
+        (limit, requested) => Some((limit, requested)),
     }
 }
 
 fn classify_status(status: u16, body: &str, retry_after: Option<Duration>) -> Fail {
     let message = error_message(body);
-    if matches!(status, 400 | 413) {
-        let lower = message.to_lowercase();
-        if OVERFLOW_PHRASES.iter().any(|p| lower.contains(p)) {
-            let (limit, requested) = overflow_numbers(&message);
+    if OVERFLOW_STATUSES.contains(&status) {
+        if let Some((limit, requested)) = read_overflow(body, &message) {
             return Fail::Fatal(ModelError::ContextOverflow { limit, requested, message });
         }
     }
@@ -1464,6 +1510,88 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(s.requests().len(), 1);
+    }
+
+    async fn overflow_of(status: u16, body: &str) -> (ModelError, usize) {
+        let s = server(vec![Action::Status { status, body: body.into(), retry_after_s: None }]).await;
+        let err = client(&s.base_url()).complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
+        (err, s.requests().len())
+    }
+
+    #[tokio::test]
+    async fn each_overflow_phrase_is_recognised() {
+        for phrase in OVERFLOW_PHRASES {
+            let body = json!({"error": {"message": format!("Oops: {} (limit 8192, got 9000)", phrase.to_uppercase())}});
+            let (err, sent) = overflow_of(400, &body.to_string()).await;
+            assert!(
+                matches!(err, ModelError::ContextOverflow { limit: Some(8192), requested: Some(9000), .. }),
+                "{phrase}: {err:?}"
+            );
+            assert_eq!(sent, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_body_with_fields_gives_limit_and_request_the_right_way_round() {
+        let body = r#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error","n_prompt_tokens":70000,"n_ctx":65536}}"#;
+        let (err, _) = overflow_of(400, body).await;
+        assert!(
+            matches!(err, ModelError::ContextOverflow { limit: Some(65536), requested: Some(70000), .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn llama_cpp_message_alone_gives_the_same_numbers() {
+        let body =
+            r#"{"error":{"message":"request (70000 tokens) exceeds the available context size (65536 tokens)"}}"#;
+        let (err, _) = overflow_of(400, body).await;
+        assert!(
+            matches!(err, ModelError::ContextOverflow { limit: Some(65536), requested: Some(70000), .. }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn type_code_alone_is_an_overflow() {
+        for (key, code) in [("type", "exceed_context_size_error"), ("code", "context_length_exceeded")] {
+            let body = json!({"error": {"message": "something unrelated", key: code}});
+            let (err, _) = overflow_of(400, &body.to_string()).await;
+            assert!(matches!(err, ModelError::ContextOverflow { limit: None, requested: None, .. }), "{err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_422_is_an_overflow_only_with_overflow_wording() {
+        let (err, _) =
+            overflow_of(422, r#"{"error":"Input is too long: 9000 > 8192","error_type":"validation"}"#).await;
+        assert!(matches!(err, ModelError::ContextOverflow { limit: Some(8192), requested: Some(9000), .. }), "{err:?}");
+        let (err, _) = overflow_of(422, r#"{"detail":"temperature must be positive"}"#).await;
+        match err {
+            ModelError::Rejected { status: 422, message } => assert_eq!(message, "temperature must be positive"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_inside_a_200_stream_is_fatal_and_sent_once() {
+        let message = "request (70000 tokens) exceeds the available context size (65536 tokens)";
+        let s = server(vec![Action::StreamError { message: message.into() }, Reply::text("ok").into()]).await;
+        let err = client(&s.base_url()).complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
+        assert!(
+            matches!(err, ModelError::ContextOverflow { limit: Some(65536), requested: Some(70000), .. }),
+            "{err:?}"
+        );
+        assert_eq!(s.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn other_errors_inside_a_200_stream_are_still_retried() {
+        let s =
+            server(vec![Action::StreamError { message: "engine overloaded".into() }, Reply::text("ok").into()]).await;
+        let done = client(&s.base_url()).complete(&req("x"), None, &CancellationToken::new()).await.unwrap();
+        assert_eq!(done.attempts, 2);
+        assert_eq!(s.requests().len(), 2);
     }
 
     #[tokio::test]
