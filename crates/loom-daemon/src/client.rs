@@ -64,13 +64,13 @@
 //! and the client prints `unverified_warning` to stderr, once. `Client::new` alone does not ask.
 
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody, RecordsPage,
-    ReleaseBody, RuleBody, ScopeBody, ScopeReceipt, ScopeRevokeBody, ScopeRevokeReceipt, SessionDetail, StatusView,
-    WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody,
+    ModelBody, ModelsView, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeReceipt,
+    ScopeRevokeBody, ScopeRevokeReceipt, SessionDetail, StatusView, WithdrawBody,
 };
 use loom_agent::runtime::{
-    BusEvent, InboxEntry, LedgerView, MissionInfo, NetEntry, NewSession, RuleReceipt, ScoreView, SessionInfo,
-    WindowView,
+    BusEvent, InboxEntry, LedgerView, MissionInfo, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry,
+    NewSession, RoleModelReceipt, RuleReceipt, ScoreView, SessionInfo, WindowView,
 };
 use loom_core::config::{Config, Paths};
 use loom_core::event::Seq;
@@ -454,6 +454,12 @@ impl Client {
         self.call(Method::POST, "/api/sessions", &[], Some(body)).await
     }
 
+    /// [`Client::create`] with the receipt: the session and whether the request made its workspace folder.
+    pub async fn create_receipt(&self, new: &NewSession) -> Result<CreatedSession, String> {
+        let body = serde_json::to_value(new).map_err(|e| format!("The session request cannot be encoded ({e})."))?;
+        self.call(Method::POST, "/api/sessions", &[], Some(body)).await
+    }
+
     pub async fn send(&self, id: &SessionId, text: &str) -> Result<(), String> {
         let body = serde_json::to_value(MessageBody { text: text.to_string() })
             .map_err(|e| format!("The message cannot be encoded ({e})."))?;
@@ -528,6 +534,47 @@ impl Client {
         let body = serde_json::to_value(ArchiveBody { archived })
             .map_err(|e| format!("The request cannot be encoded ({e})."))?;
         self.call_unit(Method::POST, &format!("/api/sessions/{}/archive", segment(id.as_str())), Some(body)).await
+    }
+
+    pub async fn rename(&self, id: &SessionId, title: &str) -> Result<(), String> {
+        let body = serde_json::to_value(RenameBody { title: title.to_string() })
+            .map_err(|e| format!("The request cannot be encoded ({e})."))?;
+        self.call_unit(Method::POST, &format!("/api/sessions/{}/rename", segment(id.as_str())), Some(body)).await
+    }
+
+    /// The live model profiles and the default one.
+    pub async fn models(&self) -> Result<ModelsView, String> {
+        self.call(Method::GET, "/api/models", &[], None).await
+    }
+
+    /// Read `[models]` from the configuration file again (`loom models reload`).
+    pub async fn reload_models(&self) -> Result<ModelsReload, String> {
+        self.call(Method::POST, "/api/models/reload", &[], None).await
+    }
+
+    /// The models of a mission (`loom models show`).
+    pub async fn mission_models(&self, id: &SessionId) -> Result<MissionModels, String> {
+        self.call(Method::GET, &format!("/api/sessions/{}/models", segment(id.as_str())), &[], None).await
+    }
+
+    /// Choose or clear the model a mission starts its agents of a role on (`loom models role`).
+    pub async fn set_role_model(
+        &self,
+        id: &SessionId,
+        role: &str,
+        profile: Option<&str>,
+        now: bool,
+    ) -> Result<RoleModelReceipt, String> {
+        let body = RoleModelBody { role: role.to_string(), profile: profile.map(str::to_string), now };
+        let body = serde_json::to_value(body).map_err(|e| format!("The request cannot be encoded ({e})."))?;
+        self.call(Method::POST, &format!("/api/sessions/{}/role-model", segment(id.as_str())), &[], Some(body)).await
+    }
+
+    /// Switch a session to another model profile (`loom models set`).
+    pub async fn set_model(&self, id: &SessionId, profile: &str) -> Result<ModelSwitchReceipt, String> {
+        let body = serde_json::to_value(ModelBody { profile: profile.to_string() })
+            .map_err(|e| format!("The request cannot be encoded ({e})."))?;
+        self.call(Method::POST, &format!("/api/sessions/{}/model", segment(id.as_str())), &[], Some(body)).await
     }
 
     pub async fn records(&self, id: &SessionId, after: Option<Seq>, limit: usize) -> Result<RecordsPage, String> {
@@ -897,6 +944,7 @@ pub(crate) mod testkit {
                 archived,
                 gate: None,
                 prior: Vec::new(),
+                role_models: Default::default(),
             },
             active: false,
             status: status(Phase::Idle),
@@ -930,6 +978,8 @@ mod tests {
             bind: "127.0.0.1:7878".into(),
             proxy_port: 9000,
             home: "/h".into(),
+            sandbox: "seatbelt".into(),
+            network: "deny_all".into(),
             disk: Some(crate::wire::DiskSpace { free_bytes: 3 << 30, total_bytes: 1 << 40 }),
             models: vec![ModelHealth {
                 profile: "local".into(),
@@ -973,6 +1023,7 @@ mod tests {
             context_window: None,
             prompt_tokens: 5,
             cached_tokens: 4,
+            ..Default::default()
         };
         let ledger = loom_agent::runtime::LedgerView { markdown: "# ledger".into(), ..Default::default() };
         let blob = BlobRef { id: BlobId("ab".into()), bytes: 9, lines: 3 };

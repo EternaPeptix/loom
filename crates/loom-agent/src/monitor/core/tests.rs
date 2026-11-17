@@ -787,3 +787,46 @@ fn the_credential_index_survives_a_restart() {
         of_kind(&h, EntryKind::Tripwire).iter().map(|e| (text(e, "id"), text(e, "mission"))).collect();
     assert!(ids.contains(&("TW-06".into(), "m-b".into())), "{ids:?}");
 }
+
+#[test]
+fn a_switch_onto_a_relaxed_model_uptiers_the_session_and_a_switch_back_does_not_lower_it() {
+    use loom_core::event::ModelSwitched;
+    let h = home();
+    let mut core = open(&h);
+    let now = loom_core::now_ms();
+    core.pump(now, &all(), true);
+    let mut s = new_session(&h, "s-1", "m-1");
+    bash(&mut s, "c1", "ps eww 101");
+    core.pump(now + 1_000, &all(), true);
+    let sev = |h: &Home| of_kind(h, EntryKind::Tripwire).iter().map(|e| text(e, "severity")).collect::<Vec<_>>();
+    assert_eq!(sev(&h), ["s3"], "a stock session's process inspection");
+    let relaxed = loom_core::config::ModelProfile {
+        alignment: Some(loom_core::lineage::Alignment::Relaxed),
+        ..Default::default()
+    };
+    let stock = ModelRef { profile: "p".into(), model: "m".into(), context_window: 10, lineage: None };
+    let unc = ModelRef {
+        profile: "unc".into(),
+        model: "unc".into(),
+        context_window: 10,
+        lineage: Some(loom_core::lineage::resolve("unc", &relaxed)),
+    };
+    let switch = |from: &ModelRef, to: &ModelRef| {
+        Event::ModelSwitched(ModelSwitched {
+            from: from.clone(),
+            to: to.clone(),
+            reasoning_replay: Default::default(),
+            reason: "operator".into(),
+        })
+    };
+    s.append(Author::Harness, switch(&stock, &unc)).expect("switch");
+    bash(&mut s, "c2", "ps eww 102");
+    core.pump(now + 2_000, &all(), true);
+    assert_eq!(sev(&h), ["s3", "s4"], "one tier up from the switch on");
+    s.append(Author::Harness, switch(&unc, &stock)).expect("switch back");
+    bash(&mut s, "c3", "ps eww 103");
+    core.pump(now + 3_000, &all(), true);
+    let relaxed_now = |core: &Core| core.engine.ctx(&SessionId::from("s-1")).map(|c| c.relaxed);
+    assert_eq!(relaxed_now(&core), Some(true), "a switch back does not lower it");
+    assert_eq!(core.srcs.get("s-1").and_then(|s| s.primed.as_ref()).map(|p| p.ctx.relaxed), Some(true));
+}

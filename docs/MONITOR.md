@@ -21,7 +21,7 @@ the configuration keys of §7.1 are not accepted yet, and none of the routes, co
 function of the module that a later phase fills returns `MonitorError::NotBuilt`, so a premature caller fails closed.
 M1 (the model policy of §2.6) is built: the profile keys, the `[monitor]` keys it names (`reviewers`,
 `tripwires_only_profiles`, `recipients`, `content`, `known_families`), the eligibility and selection functions, the check in
-`loom config check`, `loom models show`, and the lineage in `session_start`.
+`loom config check`, `loom models lineage`, and the lineage in `session_start`.
 M2 (the monitor core, in shadow) is built: the daemon owns a `Monitor` that folds its log before any session is
 activated and reads every record of every session through persisted cursors; TW-01 to TW-28 run over them with the §6.1
 matching rules, flags are deduplicated and the S1 aggregation applies, the fleet joins FS-1 to FS-10 run every
@@ -451,7 +451,7 @@ Two views. Agent-influenced strings always go inside DATA, never in harness-comp
 
 `glm_unc` and `necromicon` are never reviewers.
 
-**Consent is per pack, not per fleet.** `[monitor.recipients] ctf = ["alibaba"]` lets any fleet's mission in that pack reach `qwen4max`; what keeps the other fleets off it is the order of `[monitor] reviewers`, which selects the first profile eligible for the whole mission. List `dsv41_review` before `qwen4max`: the LAN reviewer then wins wherever it is eligible (every fleet but the DeepSeek ones, which share its family), and `qwen4max` is the first choice only of missions whose reachable set includes DeepSeek. **After a fault of `dsv41_review`, any fleet's mission in a consented pack falls through to `qwen4max`**: consent to Alibaba given for the DeepSeek fleet then also lets other fleets' transcripts reach Alibaba, which the operator consented to only for `dsv41` missions. `loom models show` prints each fleet's fallback and `loom config check` notes a fallback to a recipient the fleet does not otherwise use. Narrowing it (consent per agent profile, e.g. `[monitor.recipients.core] alibaba = ["dsv41"]`, or a rule that a fallback never newly uses a consented recipient the first choice did not need) is an open operator decision (D16); nothing changes silently. The table above is an M1 selection test: each fleet gets the reviewer listed for it.
+**Consent is per pack, not per fleet.** `[monitor.recipients] ctf = ["alibaba"]` lets any fleet's mission in that pack reach `qwen4max`; what keeps the other fleets off it is the order of `[monitor] reviewers`, which selects the first profile eligible for the whole mission. List `dsv41_review` before `qwen4max`: the LAN reviewer then wins wherever it is eligible (every fleet but the DeepSeek ones, which share its family), and `qwen4max` is the first choice only of missions whose reachable set includes DeepSeek. **After a fault of `dsv41_review`, any fleet's mission in a consented pack falls through to `qwen4max`**: consent to Alibaba given for the DeepSeek fleet then also lets other fleets' transcripts reach Alibaba, which the operator consented to only for `dsv41` missions. `loom models lineage` prints each fleet's fallback and `loom config check` notes a fallback to a recipient the fleet does not otherwise use. Narrowing it (consent per agent profile, e.g. `[monitor.recipients.core] alibaba = ["dsv41"]`, or a rule that a fallback never newly uses a consented recipient the first choice did not need) is an open operator decision (D16); nothing changes silently. The table above is an M1 selection test: each fleet gets the reviewer listed for it.
 
 **As built (M1).** `loom_core::lineage` resolves a profile (inference, loopback, source per value); `loom_agent::monitor::lineage`
 holds `eligible`, `select`, `select_with_verifier`, `reachable_profiles`, `check_config`, `creation_refusal` and `show_lines`
@@ -467,8 +467,9 @@ holds `eligible`, `select`, `select_with_verifier`, `reachable_profiles`, `check
 - Not wired yet (they need the monitor to be on, M2): the refusal of a real-target mission on a profile with no reviewer
   (`creation_refusal` is the tested sentence), the monitor's configuration (reviewer, mode) in `session_start`, the status
   words "not LLM-reviewed" in `loom ls`/`loom status`, reachability and vet facts (`Facts`), and the refusal of a spawn that
-  collides with the reviewer. `model_switched` does not exist in this tree: the lineage is carried by `ModelRef`, which that
-  record will carry.
+  collides with the reviewer. Since the merge of model switching (below), `model_switched` carries the new profile's
+  lineage in `to.lineage` (resolved from the live profile, as `session_start`'s now is), and the core treats a session
+  switched onto a relaxed model as relaxed from that record on (a switch back does not lower it).
 
 **No eligible reviewer.**
 - The profile must be listed in `[monitor] tripwires_only_profiles` (an explicit, recorded choice). Otherwise `loom config check` fails, and **real-target** missions on that profile are refused at creation with a sentence naming the choices. Lab missions are not refused.
@@ -1399,7 +1400,7 @@ These are in the tree at P0 and the phases rely on them:
   every network mode. TW-09 and TW-22 detect attempts either way; the deny closes the routes.
 
 Not in the tree yet, needed by named phases:
-- **Model switching (the ui/pass-2 work), a dependency of M1 and M3:** the `model_switched` record, a `role_models` configuration key, `loom models set` and `loom models reload`, and role-model `--now`. None exists in this tree. Until they land, the reachable profile set P is built from the keys that do exist (the lead model, each pack role's model, `escalation_model`, `alloy_models`, the verifier and `session_start`), lineage is recorded in `session_start` only, and the re-choice of a reviewer on a model switch (§2.6) is built with the switch itself.
+- **Model switching (the ui/pass-2 work), a dependency of M1 and M3:** the `model_switched` record, a mission's `role_models`, `loom models set` and `loom models reload`, and role-model `--now` are in the tree since the merge of the 2026-11-17 release. What the merge settled: a profile with `purpose = "review"` is refused as a role choice, a switch, and a reload that would put a session or a mission's choice on one; `model_switched` records the lineage; the infrastructure deny takes the endpoints of profiles a reload adds; and the monitor's `loom models show [profile]` is `loom models lineage [profile]`, since `loom models show <session>` is a mission's models. Still to build: passing a mission's `role_models` to `reachable_profiles` where `creation_refusal` is wired (M3), the monitor's own view of a reload (`Env` and the reviewer selection read the start-up `[models]`), and the re-choice of a reviewer on a model switch (§2.6).
 - **The web UI's Agents tab and notification planner (not in this tree yet):** M11.
 - **The audit's open items:** the daemon-port deny and login code off argv (E1); RLIMIT, libproc and box teardown
   (E3); a request-owned seed in the model client (M5); the `creating` state and Parked/Blocker resolution (M3); the

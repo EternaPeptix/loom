@@ -21,6 +21,12 @@ pub struct StatusView {
     pub proxy_port: u16,
     /// The loom home directory.
     pub home: String,
+    /// The command sandbox mode: `seatbelt`, `bubblewrap` or `none` (unconfined).
+    #[serde(default)]
+    pub sandbox: String,
+    /// The egress network mode for tools: `deny_all`, `allowlist` or `open`.
+    #[serde(default)]
+    pub network: String,
     /// Space on the volume that holds the loom home; `null` when it cannot be read.
     #[serde(default)]
     pub disk: Option<DiskSpace>,
@@ -66,6 +72,98 @@ impl DiskSpace {
     pub fn is_low(&self) -> bool {
         loom_agent::runtime::disk_is_low(self.free_bytes, self.total_bytes)
     }
+}
+
+/// `POST /api/sessions` answers `201` with this: the session, as `GET /api/sessions` lists it, and whether the
+/// request made the workspace folder (`create_workspace`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CreatedSession {
+    #[serde(flatten)]
+    pub info: SessionInfo,
+    #[serde(default)]
+    pub created: bool,
+}
+
+/// `GET /api/fs/dirs`: the folders inside one folder of the daemon's machine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirsView {
+    /// The folder, absolute, symlinks resolved.
+    pub path: String,
+    /// Its parent; `null` for `/`.
+    pub parent: Option<String>,
+    /// The daemon user's home directory; `null` when it is not known.
+    pub home: Option<String>,
+    /// Folders only, sorted case-insensitively, at most [`FS_MAX_ENTRIES`].
+    pub entries: Vec<DirEntryView>,
+    /// Folders that were left out because of the cap.
+    #[serde(default)]
+    pub more: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntryView {
+    pub name: String,
+    /// Absolute; for a symlink to a folder, the folder it resolves to.
+    pub path: String,
+    /// The name starts with a dot.
+    pub hidden: bool,
+    /// A symlink to a folder.
+    #[serde(default)]
+    pub link: bool,
+}
+
+/// Entries one listing returns at most (`GET /api/fs/dirs`, `GET /api/sessions/{id}/files`).
+pub const FS_MAX_ENTRIES: usize = 2_000;
+
+/// `GET /api/sessions/{id}/files`: one folder of the session's workspace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesView {
+    /// The canonical workspace.
+    pub root: String,
+    /// The folder, relative to the root, `/`-separated; empty for the root.
+    pub path: String,
+    /// Folders first, then the rest; each group sorted case-insensitively; at most [`FS_MAX_ENTRIES`].
+    pub entries: Vec<FileEntryView>,
+    /// Entries that were left out because of the cap.
+    #[serde(default)]
+    pub more: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntryView {
+    pub name: String,
+    /// `dir`, `file`, `link` (a symlink, never followed by the listing) or `other` (socket, FIFO, device).
+    pub kind: String,
+    /// Bytes (of the link itself for a `link`); 0 when it could not be read.
+    pub size: u64,
+    /// Modification time, milliseconds since the epoch; 0 when it could not be read.
+    pub mtime_ms: u64,
+    /// The name starts with a dot.
+    pub hidden: bool,
+    /// Present when the entry is shown but cannot be opened (`.loom`: harness files are not shown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Present when the entry could not be examined: why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `GET /api/sessions/{id}/files/lines`: lines of one file of the session's workspace.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileLinesView {
+    /// As asked, normalised: relative to the workspace, `/`-separated.
+    pub path: String,
+    /// As [`LinesView`]: the lines `first..=last` (1-based), each with its newline.
+    pub text: String,
+    pub first: u64,
+    pub last: u64,
+    /// Lines in the whole file; also sent as `total_lines`.
+    pub total: u64,
+    pub total_lines: u64,
+    pub bytes: u64,
+    pub mtime_ms: u64,
+    /// The file holds a NUL byte in its first 8 KiB: no lines are sent.
+    pub binary: bool,
 }
 
 /// `GET /api/sessions/{id}`.
@@ -186,6 +284,41 @@ pub struct AnswerBody {
 #[serde(deny_unknown_fields)]
 pub struct ArchiveBody {
     pub archived: bool,
+}
+
+/// Body of `POST /api/sessions/{id}/rename`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenameBody {
+    pub title: String,
+}
+
+/// Body of `POST /api/sessions/{id}/model`: the model profile to switch the session to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelBody {
+    pub profile: String,
+}
+
+/// Body of `POST /api/sessions/{id}/role-model`: choose (or clear, `profile` null) the model the
+/// mission starts its agents of `role` on; `role` `*` covers every role the lead starts. `now` also moves
+/// the mission's running agents of that role.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleModelBody {
+    pub role: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub now: bool,
+}
+
+/// Answer of `GET /api/models`: the live model profiles, as `loom models reload` last read them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelsView {
+    /// The profile a session uses when none is named (empty: none set).
+    pub default_model: String,
+    pub models: Vec<ModelHealth>,
 }
 
 /// Body of `POST /api/gc`. An empty object is a dry run.

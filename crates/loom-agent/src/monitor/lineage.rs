@@ -46,10 +46,10 @@
 //!   recipients. `select_with_verifier` adds a verifier's profile to the reached set and the data recipients before
 //!   selecting: a verifier that collides with the reviewer re-chooses the reviewer, it never refuses the verifier.
 //! - **No eligible reviewer** (`check_config(config, packs)`, used by `loom config check`; `coverage` and `describe_all`,
-//!   used by `loom models show`): for every agent profile (not `purpose = "review"`) and every pack, the reviewers of
+//!   used by `loom models lineage`): for every agent profile (not `purpose = "review"`) and every pack, the reviewers of
 //!   `select` with the pack's consent and `Facts::STATIC` (reachable, no vet needed), and `Row::fallback`, the reviewer
 //!   that `select` picks once the first one has faulted: consent is per pack, so after a fault any fleet of a consented
-//!   pack can fall through to a hosted reviewer (`loom models show` prints it; `check_config` notes it when its recipient is
+//!   pack can fall through to a hosted reviewer (`loom models lineage` prints it; `check_config` notes it when its recipient is
 //!   one the fleet does not otherwise use). The `Report` has `table` (one
 //!   line per profile: the resolved values and where each came from; `loom config check` prints it), `problems` (each
 //!   ends with the exact lines to add) and `notes`. A problem is: an agent profile not in `tripwires_only_profiles` whose
@@ -69,7 +69,7 @@
 //!   a reviewer or is listed in `tripwires_only_profiles`, or when `profile` is not configured (session creation refuses
 //!   that itself); the daemon uses it for real-target missions once the monitor is on (M2); lab missions are never
 //!   refused by it.
-//! - `show_lines(config, packs, only)` is `loom models show`: `describe_all`'s line of each profile, and under an agent
+//! - `show_lines(config, packs, only)` is `loom models lineage`: `describe_all`'s line of each profile, and under an agent
 //!   profile one line per pack: `reviewed by X`, `reviewed by X per session only (…)`, `not LLM-reviewed (tripwires only,
 //!   by your choice)` or `no eligible reviewer: …`, followed by `; on a fault of X: Y (recipient R)` when a fallback exists; an unknown profile name is an `Err` listing the profiles.
 //! - **Review profiles** (`purpose = "review"`) are not agents: `Config::check` refuses one as `default_model`,
@@ -614,12 +614,12 @@ fn describe_pairs(config: &Config) -> Vec<(String, String)> {
         .collect()
 }
 
-/// One line per profile for `loom config check` and `loom models show`.
+/// One line per profile for `loom config check` and `loom models lineage`.
 pub fn describe_all(config: &Config) -> Vec<String> {
     describe_pairs(config).into_iter().map(|(_, line)| line).collect()
 }
 
-/// What `loom models show` prints: each profile's resolved values, and for an agent profile, who reviews its missions
+/// What `loom models lineage` prints: each profile's resolved values, and for an agent profile, who reviews its missions
 /// in each pack. `only` names one profile; an unknown one is an `Err` that lists them.
 pub fn show_lines(config: &Config, packs: &Packs, only: Option<&str>) -> Result<Vec<String>, String> {
     if let Some(name) = only {

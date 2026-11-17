@@ -118,12 +118,17 @@ fn is_local(ip: IpAddr) -> bool {
 /// address) with a port: a model endpoint's, and a `network.infrastructure` entry's. The sandbox refuses
 /// them to every command whatever loopback it allows (`SandboxCfg::infra_ports`).
 pub fn loopback_ports(config: &Config) -> Vec<u16> {
-    let mut out: Vec<u16> = Vec::new();
     let entries = config
         .models
         .values()
         .filter_map(|m| crate::runtime::endpoint_of(&m.base_url))
         .chain(config.network.infrastructure.iter().cloned());
+    endpoint_loopback_ports(entries)
+}
+
+/// The ports of the `host:port` entries that name this machine, as [`loopback_ports`] reads them, sorted.
+pub fn endpoint_loopback_ports(entries: impl IntoIterator<Item = String>) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::new();
     for e in entries {
         let e = e.trim();
         let (host, port) = match e.strip_prefix('[') {

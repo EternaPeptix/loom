@@ -15,6 +15,7 @@
 //!   they would in the parent.
 //! - `model_response` → `assistant` message with `text`, the tool calls whose `complete` is true (id =
 //!   call id, arguments string verbatim), and `reasoning` when the session's `reasoning_replay` is `All`
+//!   (`session_start`'s, or the latest `model_switched`'s, which applies to the whole history)
 //!   and the reasoning is non-empty. Responses with `finish` `Aborted` or `Error` are not rendered. A
 //!   response with no text and no complete tool calls is not rendered.
 //! - `tool_result` → `tool` message, `tool_call_id` = call id, content = `text` verbatim.
@@ -55,7 +56,8 @@
 //! brief (plus its digest, when present, under the line `Leads from earlier work (written by the
 //! model, not verified — re-check before relying on them):`) is rendered as a `user`-role
 //! `<harness kind="resume">` item directly after the last item whose seq is `<= upto_seq`.
-//! `Weave::epoch` is the latest re-weave's epoch, or 0.
+//! `Weave::epoch` is the latest re-weave's epoch, or 0. `Weave::resume_chars` is the length of that
+//! resume item (0 with none); `WindowItem::note` names the kind of a `harness_note` item.
 //!
 //! Pins: `pin`/`unpin` records set `WindowItem::pinned` for a call's result; `plan_reweave` never
 //! evicts a pinned result.
@@ -165,6 +167,9 @@ pub struct WindowItem {
     pub class: Option<ToolClass>,
     /// First 160 characters of the rendered content, single line.
     pub preview: String,
+    /// For a `harness_note`: which kind of note it is (its `kind` attribute in the request).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<NoteKind>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -176,6 +181,9 @@ pub struct Weave {
     pub epoch: u32,
     /// One entry per record that renders (or would render if not evicted), in log order.
     pub items: Vec<WindowItem>,
+    /// Characters of the resume block the latest re-weave added to the request (0 with none). The block
+    /// has no item of its own: it is made from the re-weave's brief and digest.
+    pub resume_chars: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -261,6 +269,7 @@ fn item(seq: Seq, kind: &str, role: Role, chars: usize, state: ItemState, shown:
         call_id: None,
         class: None,
         preview: preview(shown),
+        note: None,
     }
 }
 
@@ -295,6 +304,14 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
             tools = s.tools.clone();
             break;
         }
+    }
+    // A model switch carries the replay policy of the new model; the latest one applies to the whole
+    // history (the switch is a cold cache already, so re-rendering earlier replies costs nothing more).
+    if let Some(m) = records.iter().rev().find_map(|r| match &r.event {
+        Event::ModelSwitched(m) => Some(m),
+        _ => None,
+    }) {
+        replay_all = m.reasoning_replay == ReasoningReplay::All;
     }
 
     // Pass 1: whole-log state.
@@ -373,7 +390,9 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
             }
             Event::HarnessNote { note, text } => {
                 if !note.is_protected() && matches!(evictions.get(&seq), Some(EvictAction::Drop)) {
-                    entries.push((item(seq, "harness_note", Role::User, 0, ItemState::Dropped, ""), Aux::none()));
+                    let mut it = item(seq, "harness_note", Role::User, 0, ItemState::Dropped, "");
+                    it.note = Some(*note);
+                    entries.push((it, Aux::none()));
                     continue;
                 }
                 let content = match &rec.author {
@@ -382,7 +401,9 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
                 };
                 let mut aux = Aux::none();
                 aux.payload = text.len();
-                entries.push((item(seq, "harness_note", Role::User, content.len(), ItemState::Live, &content), aux));
+                let mut it = item(seq, "harness_note", Role::User, content.len(), ItemState::Live, &content);
+                it.note = Some(*note);
+                entries.push((it, aux));
                 let mut msg = Message::user(content);
                 msg.origin = vec![seq];
                 elems.push(Elem { group: seq, msg, entry: Some(entries.len() - 1) });
@@ -540,8 +561,10 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
     }
 
     // The resume brief goes after the last group at or before the latest re-weave's cut.
+    let mut resume_chars = 0;
     if let Some(rw) = latest {
         if let Some(text) = resume_text(rw) {
+            resume_chars = text.len();
             let at = elems.iter().rposition(|e| e.group <= rw.upto_seq).map_or(0, |i| i + 1);
             let mut msg = Message::user(text);
             msg.origin = vec![rw.upto_seq];
@@ -573,7 +596,7 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
 
     entries.sort_by_key(|(it, _)| it.seq);
     let (items, aux): (Vec<WindowItem>, Vec<Aux>) = entries.into_iter().unzip();
-    (Weave { messages, tools, epoch, items }, aux)
+    (Weave { messages, tools, epoch, items, resume_chars }, aux)
 }
 
 /// Render the stable prefix from a session's records.
@@ -1542,6 +1565,34 @@ mod tests {
     }
 
     #[test]
+    fn a_model_switch_sets_the_reasoning_replay_for_the_whole_history() {
+        let switch = |replay: ReasoningReplay| {
+            Event::ModelSwitched(crate::event::ModelSwitched {
+                from: ModelRef { profile: "p".into(), model: "m".into(), context_window: 1000, lineage: None },
+                to: ModelRef { profile: "q".into(), model: "n".into(), context_window: 2000, lineage: None },
+                reasoning_replay: replay,
+                reason: "operator".into(),
+            })
+        };
+        let replayed =
+            |recs: &[Record]| weave(recs).messages.iter().any(|m| m.reasoning.as_deref() == Some("thinking"));
+        let mut l = Log::with_replay(ReasoningReplay::All);
+        l.user("go");
+        l.resp("answer", "thinking", &[]);
+        assert!(replayed(&l.recs));
+        // The new model's policy applies to the replies made before the switch too.
+        l.push(Author::Harness, switch(ReasoningReplay::None));
+        assert!(!replayed(&l.recs));
+        // The latest switch wins.
+        l.push(Author::Harness, switch(ReasoningReplay::All));
+        assert!(replayed(&l.recs));
+        // A switch renders nothing of its own: the model is not told.
+        let n = weave(&l.recs).messages.len();
+        l.push(Author::Harness, switch(ReasoningReplay::All));
+        assert_eq!(weave(&l.recs).messages.len(), n);
+    }
+
+    #[test]
     fn response_rules() {
         let mut l = Log::with_replay(ReasoningReplay::None);
         l.user("go");
@@ -1836,6 +1887,27 @@ mod tests {
         l2.reweave(t1, vec![], "BRIEF", None);
         let w2 = weave(&l2.recs);
         assert!(w2.messages[4].content.contains("BRIEF"));
+    }
+
+    #[test]
+    fn a_note_item_names_its_kind_and_the_resume_block_is_counted() {
+        let mut l = Log::new();
+        l.user("go");
+        l.note(NoteKind::Constraint, "no pushing");
+        l.note(NoteKind::Info, "fyi");
+        let r1 = l.resp("done", "", &[]);
+        let w = weave(&l.recs);
+        let notes: Vec<Option<NoteKind>> = w.items.iter().map(|i| i.note).collect();
+        assert_eq!(notes, [None, None, Some(NoteKind::Constraint), Some(NoteKind::Info), None]);
+        assert_eq!(w.resume_chars, 0);
+        // Only notes carry the field on the wire.
+        let wire = serde_json::to_value(&w.items).unwrap();
+        assert_eq!(wire[2]["note"], "constraint");
+        assert!(wire[1].get("note").is_none());
+        l.reweave(r1, vec![], "BRIEF", None);
+        let w = weave(&l.recs);
+        let block = "<harness kind=\"resume\">\nBRIEF\n</harness>";
+        assert_eq!(w.resume_chars, block.len());
     }
 
     #[test]

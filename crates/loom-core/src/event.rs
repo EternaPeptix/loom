@@ -280,9 +280,27 @@ pub enum Event {
         outcome: SessionOutcome,
         detail: String,
     },
+    /// The session's model changed while the daemon ran: the operator switched it, or its profile was
+    /// reloaded with new settings. Requests from here on go to `to`, and the weave replays reasoning as
+    /// `reasoning_replay` says. Never shown to the model: a different model is a cold cache by nature,
+    /// not something to reason about.
+    ModelSwitched(ModelSwitched),
     /// A kind this build does not know. Preserved on disk, ignored by the weave.
     #[serde(other)]
     Unknown,
+}
+
+/// See [`Event::ModelSwitched`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelSwitched {
+    pub from: ModelRef,
+    pub to: ModelRef,
+    /// The reasoning replay of `to`'s profile, which the weave applies from here on.
+    #[serde(default)]
+    pub reasoning_replay: ReasoningReplay,
+    /// Why: `operator`, `profile reloaded`, or `changed while the session was idle`.
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1141,6 +1159,15 @@ mod tests {
             ("interrupted", Event::Interrupted { reason: "r".into() }),
             ("turn_end", Event::TurnEnd { reason: TurnEndReason::Finished }),
             ("session_end", Event::SessionEnd { outcome: SessionOutcome::Done, detail: "d".into() }),
+            (
+                "model_switched",
+                Event::ModelSwitched(ModelSwitched {
+                    from: ModelRef { profile: "a".into(), model: "m1".into(), context_window: 1000, lineage: None },
+                    to: ModelRef { profile: "b".into(), model: "m2".into(), context_window: 2000, lineage: None },
+                    reasoning_replay: ReasoningReplay::None,
+                    reason: "operator".into(),
+                }),
+            ),
         ]
     }
 

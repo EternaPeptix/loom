@@ -165,7 +165,7 @@ repeat_minutes = 0         # re-notify an unanswered blocking item this often; 0
 #
 # Model policy. Each profile has a family (a set: a distill belongs to both), an alignment (are its refusals
 # intact), a recipient (who receives its traffic) and optionally a purpose. Left out, loom infers the family from
-# the model id and says so (`loom models show`); an unknown alignment makes an agent profile count as relaxed and
+# the model id and says so (`loom models lineage`); an unknown alignment makes an agent profile count as relaxed and
 # a reviewer ineligible; a loopback base_url has the recipient `unknown` until you declare it.
 #
 #   [models.<name>]
@@ -179,7 +179,7 @@ repeat_minutes = 0         # re-notify an unanswered blocking item this often; 0
 # models, escalation_model and alloy_models), declared stock, and on `local`/`lan`, or on a recipient that already
 # receives the reviewed sessions' data, or one the pack consents to below. A profile with no eligible reviewer must be
 # named in tripwires_only_profiles, or `loom config check` fails and prints the lines to add.
-# `loom config check` prints each profile's resolved values; `loom models show` prints them with who reviews it.
+# `loom config check` prints each profile's resolved values; `loom models lineage` prints them with who reviews it.
 #
 # This file's own profile has no reviewer, on purpose, so the file checks clean as shipped:
 [monitor]

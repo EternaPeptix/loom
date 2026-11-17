@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Monitor and the 2026-11-17 release together
+
+- **`loom models lineage [profile]`** is the monitor's command that was `loom models show [profile]`: `loom models show
+  <session>` is a mission's models (the release). `loom models` has both, with `list`, `reload`, `set` and `role`.
+- **A profile with `purpose = "review"` never runs an agent**, also through the release's model choices: it is refused as a
+  mission's `role_models` (at creation and with `loom models role`), as a switch (`loom models set`), and a reload is refused,
+  changing nothing, when it would give that purpose to the profile of a session that has not ended or of a mission's choice.
+  `GET /api/sessions/{id}/models` leaves it out of `profiles`.
+- **`model_switched` records the lineage** of the new model in `to.lineage`, and `session_start`'s lineage comes from the
+  live profile (a reloaded one too). A switch is recorded when the profile, model id or window changed, not the lineage. The
+  monitor treats a session switched onto a relaxed model as relaxed from that record on.
+- **The infrastructure deny follows `loom models reload`**: the endpoint of a profile a reload adds or changes is refused to
+  every command at once (the sessions' proxy policies, `grant_scope`, the floor's veto, the periodic resolve), and its loopback
+  port is refused to the sandboxes made from then on; the start-up endpoints stay denied.
+- **`loom config check`** runs the release's start-up checks (key files, sandbox preflight, box paths) and the monitor's
+  (the infrastructure deny it can build, `The network configuration cannot be used: …`), then the model policy, and prints
+  `ok: <path>`.
+
 ### Monitor M2: the monitor core, in shadow
 
 - **The daemon now watches.** `Runtime::start` builds one `Monitor` per loom home (`[monitor] enabled = false` keeps only the precision-list, S4 and canary tripwires), folds
@@ -57,7 +75,7 @@
   `tripwires_only_profiles` commented out, so a first check fails until the operator chooses. An existing
   `config.toml` that has no `[monitor]` fails the check until it says what to do: this is the point, nothing else changes and the
   daemon still starts.
-- **`loom models show [profile]`** prints each profile's resolved family, alignment, recipient and where each came from, and who
+- **`loom models lineage [profile]`** prints each profile's resolved family, alignment, recipient and where each came from, and who
   reviews its missions in each pack. Needs no daemon.
 - **`session_start`** records the resolved lineage in `model.lineage` (a new optional field of `ModelRef`; older logs read as before).
 - `loom_agent::monitor::lineage`: `eligible` (the six clauses, overrides that never cover a relaxed agent or reviewer),
@@ -80,7 +98,7 @@
   recipient (`OperatorOwned`, `Intersection`, `Consent`, `Override`), carried in `Selection`, so a new recipient can be told apart.
   `Override` and `Request` gained fields (`mission`, `target`); nothing serialized yet.
 - **`session_start`'s lineage covers the served id**: an undeclared family is the union of the configured and the served id's families.
-- **`loom models show`** prints the fallback reviewer after a fault, `config check` notes a fallback to a recipient the fleet does not
+- **`loom models lineage`** prints the fallback reviewer after a fault, `config check` notes a fallback to a recipient the fleet does not
   otherwise use (consent is per pack, not per fleet), and a profile name with `:` is shown. `config check` requires a reviewer's family
   and recipient to be declared.
 - **`config init` no longer writes `tripwires_only_profiles = ["local"]`** (a commented line): not LLM-reviewed is the operator's choice.
@@ -428,6 +446,133 @@
 - `security_record` returns what the write touched (`recorded`, `removed`, `counts`, `more`) instead of
   the whole security state; `entry` and `normalized` are unchanged. The `state` key is gone from its
   result; read the state with `security_query`.
+
+### Daemon: what a request is made of (`GET /api/sessions/{id}/window`)
+
+- Additive fields on `WindowView` (old keys unchanged; a reader of an older answer gets defaults): `breakdown`
+  (`basis`, `chars_per_token`, `total_tokens` and 14 `segments`: system, tools, rules, assignment, resume,
+  conversation, tool_output, pinned, agent_reports, notes, stubs, other, framing, hud, each with `chars`, `tokens`
+  and, for the parts that hold several things, `count`; the tokens always add up to `total_tokens`), `measured_now`
+  (the server's count for the latest answered step request of the epoch plus an estimate of what was added since;
+  `null` before the first), `last_request` (the latest step request with the server's count for its reply, 0 while
+  missing) and `fold_at` / `fold_to` (`reweave_bounds` of the configured target and floor for the session's window
+  and profile). `items[].note` names the kind of a `harness_note` item; `Weave::resume_chars` counts the resume block.
+- `est_tokens` now counts the tool list in bytes, as `session` does (it counted characters). No stored shape changed.
+
+### Web UI: phone pass 1 and the context card
+
+- **Phones (699px and under).** The session scrolls as one: `#view-session` is the only vertical scroller, the tabs stick under the
+  bar and the composer to the bottom, a tool output has no scroll box of its own (visible chat at 375x812 was 191px, now about
+  590px). A session with its own open question lands on that card, and the Jump button never covers it (an amber "Approval
+  waiting · Show" while it is off screen). The bar is one row of about 52px: Missions (with the count that need you), the
+  title over the model and run state, and Find; its button opens the new **Session details sheet** (run with a confirmed
+  Stop, context, model, view, session actions). Find is a two-row sticky bar of about 100px. The composer is a grid of about 110-130px
+  with a one-line caption ("Plan 1 of 3 · context 9% · cache 98% ›") that opens the sheet; on the other tabs it is one "Message
+  the lead…" button. With a coarse pointer Enter adds a line and Ctrl/Cmd+Enter sends; a narrow window with a mouse still sends
+  on Enter. Work-group headers have a short form, text is 16px and targets 44px for touch, and the viewport allows safe areas.
+- **Context card** (the inspector's Context tab and the sheet): the size with its window and share, one bar whose segments are
+  also the legend (colour family plus a pattern, never colour alone), rows by group, the fold marks from the daemon's effective
+  `fold_at` / `fold_to` in words and shapes (no amber), the cached/read-anew split, and notes. Estimates carry "~". Needs the
+  additive `/window` fields below; an older daemon's answer shows the hero only.
+- Riders: a profile named for its model is said once; the session id chip ends in an ellipsis when cut; the page title counts what
+  needs you; the Models-panel row class no longer collides with the chat's chip row; the inspector tabs scroll instead of wrapping;
+  the notification line says why they are off; `#f-workspace` turns autocorrect off. UI only apart from the `/window` fields.
+
+### Web UI: copy buttons and opt-in copy on select
+
+- Copy buttons: Copy reply (the exact raw text), Copy code (a fenced block without its fence), Copy message
+  (operator and agent), Copy reasoning, and on an open tool row Copy command / Copy path / Copy arguments (named for what it copies: the bash command, a file tool's path,
+  else the arguments as JSON), Copy output and Copy full output… (the whole stored output through
+  `/api/blobs/{handle}/raw`, refused above 2 MiB with a pointer to the viewer). The stored-output and file viewers
+  gain Copy lines (the selected lines, else every loaded line, without numbers) beside Copy reference / Copy path;
+  inbox cards gain Copy text and evidence cards Copy quote. Icon buttons have names and tooltips, show on hover and
+  focus and always on touch, and are 44 px on coarse pointers. Success shows "Copied" and is announced politely.
+- One `copyText` helper does every copy: the clipboard API, else the selected text and the copy command, else the
+  text left selected for Ctrl+C; the session-id chip uses it too. What each button copies is decided in `core.js`
+  (tested). An opt-in **Copy on select** checkbox (inspector Session tab, off by default, `localStorage` key
+  `loom_copy_on_select`) copies a selection wholly inside the chat or the viewer on mouseup/keyup, never while typing
+  in a field, never twice for the same selection, and says "Copied N characters".
+- loom-desk needs no change: its `WKWebView` offers `navigator.clipboard.writeText` and the copy command (checked
+  with a stand-alone view configured like `WebPane`, by injected script, which WebKit counts as a user gesture, so a real
+  click is not covered; Copy full output… therefore starts its write inside the click with the fetch as a promise, and keeps
+  the text for a "Copy now" click if the browser still refuses). The fixture serves the raw blob route. UI only; no stored shape
+  changed. `docs/UI.md` has a "Copying" section.
+
+### Workspace folders: create a missing workspace, pick a folder, browse the workspace
+
+- `POST /api/sessions` accepts `create_workspace` (default false). When the workspace does not exist and the flag is
+  set, the daemon makes it (`create_dir_all`) and the 201 answer carries `created: true`; without the flag the refusal
+  says the folder does not exist and how to create it. Refused before anything is made: a relative path, a path inside
+  the loom home or its copies folder, a path under a file, `.`/`..` in the part that does not exist, `/` or the home
+  itself. `~` and `~/x` expand to the daemon user's home. `loom run --create-workspace` (and `loom chat`) does the same
+  and prints `created workspace <path>`.
+- `GET /api/fs/dirs?path=` lists the folders in a folder (folders only, never file names; links marked; the loom home
+  refused). `GET /api/sessions/{id}/files?path=` and `.../files/lines?path=&start=&count=` read a session's workspace
+  (read-only, confined to it, `.loom` never shown, links that leave are not followed, files over 32 MiB refused, binary
+  files named as such); they record nothing in the session. Additive; no stored shape changed.
+- Web UI: a **Browse…** folder picker and a "Create and start" confirmation on the New mission form; a **Files** tab in
+  the inspector (and a Files button in the session header), a file viewer mode, and **Open file** on tool rows. The
+  fixture (`tools/ui-preview.mjs`) mirrors the routes. `docs/UI.md`, `docs/DESIGN.md` section 12 and `docs/RUN.md`
+  are updated.
+- Hardening: "inside the loom home or copies folder" is judged by file identity, so `/System/Volumes/Data/...` and links
+  no longer get around it (also re-judged once a new workspace exists, which is removed again if it landed there); a new
+  workspace gets its `.loom` (0700), so Bubblewrap can start in it, and a request that fails after the folder was made
+  removes what it made; an existing workspace inside the loom home is refused. Both listings read a folder through one
+  open descriptor, and the Files routes refuse anything that resolves into the loom home (a workspace may hold it); a
+  line page keeps no per-line index. UI: the first read of the workspace root is no longer started twice, the folder
+  lists no longer leak scroll height, the focused row is scrolled into view, coarse-pointer targets are 44 px, and
+  Backspace/Alt+Up go up from an empty folder. Additive; no stored shape changed.
+
+### Web UI pass 2: supervising many missions
+
+- Switcher (Ctrl/Cmd+K, `Switch…`), Alt+Up/Down and Alt+Shift+Up/Down (next mission that needs you), and a `?`
+  shortcut sheet; no key stops a session.
+- An **Agents** tab (`#/s/<id>/agents`): agents grouped Needs you, Running, Waiting, Idle, Ended in stable
+  creation order, with per-agent figures from `GET /api/missions/{id}/score` (on open, Refresh, at most every 120 s).
+- **Find in the record** (`/`): literal search of the whole loaded record including folded groups, with an honest
+  count; cut outputs are searched in the viewer.
+- Browser notifications for blocking items, results and mission endings: only when the page is hidden, batched within
+  5 s, never for a stop this tab asked for, closed when the item resolves.
+- A quiet indicator ("no new record for 41m"), a "New since your last visit" divider, "Jump to latest · N new" and
+  a progress line (plan, current step, budget as a limit) above the composer.
+- Tool statuses have their own shapes (`exit N`, denied, invalid, timeout, interrupted) with counts in group
+  headers, and a "partial" mark when the model saw only part of an output.
+- "Ways out" on parked and blocker cards (fold the context, switch model, last recorded error); the inbox is
+  grouped by mission with Ctrl/Cmd+Enter to send, focus to the next card, and "Refuse…" on scope requests.
+- Fixes: snapshot merge keeps live session state, Overview work only runs on its tab, the ledger is re-read after
+  a reconnect or `lagged`, an approved scope request is no longer shown as "Dismissed", Fold now and the model
+  selects confirm first, code blocks render in linear time, and the inbox self-heals every 60 s.
+- UI only; `docs/UI.md` is updated.
+
+### Web UI: chat-first layout and visible model identity
+
+- The session opens on **Chat**, the whole record as a conversation (`#/s/<id>` and `/chat`; `/record` is
+  rewritten to `/chat`), then Overview and Evidence. Operator messages are bubbles; replies are plain prose
+  with a collapsed `Thought` row; consecutive tool calls, text-less replies and ledger/job lines fold into
+  work groups headed `Worked for <duration> · <n> tool calls` (failed and running counts included), open
+  for the last group, a running call or an operator click. **Expand all work** opens them; deep links and
+  Activity links expand the group they point into.
+- The header is an identity bar: breadcrumb, chips for the model in effect (`profile · model · window`,
+  with an "unreachable" warning), role, a copyable short id and the run state with elapsed time, the
+  standing facts, and a one-line goal with Show all.
+- Each stretch of assistant output carries a chip naming the profile that produced it, and a
+  `model_switched` record is a visible line showing both sides.
+- The composer has a model seat: choosing another profile asks for confirmation, then
+  `POST /api/sessions/{id}/model`; the switch takes effect at the next step and re-reads the prompt once.
+- A stats line under the composer replaces the top-bar speed: tok/s, cache share, context use, step.
+- The sidebar groups missions by workspace with a pinned **Needs you** group; each row has one mark by
+  strict precedence and an identity line `<profile> · <role> · <age>`.
+- The preview fixture signs in from `/#code=fixture` and covers models, the model switch, an unreachable
+  profile and `POST /__fixture/stream`.
+- The top bar (below 1100px) carries the open session's model profile and run state; the sidebar's
+  connection line is short (`Live`, `Reconnecting…`) with the detail in its tooltip; a row's identity line
+  never truncates the profile, and a waiting reason has its own line, including nonblocking questions and
+  ready results. A row's age comes from recorded activity (kept across a reload) or reads "activity not
+  loaded"; an ended-stopped session has its own shape.
+- Work groups update by member, so an open Thought, focus and the output viewer survive live records, a
+  long open group is windowed, warnings are counted in its header, and request-detail lines no longer
+  change the groups. The model seat is disabled for ended sessions and per-session while switching.
+- `loom ls` shows a MODEL column (the session's profile) after ROLE.
 
 ### security_record reads near misses
 

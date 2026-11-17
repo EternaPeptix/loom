@@ -10,6 +10,7 @@
 //! - [`api`]    the HTTP API over a runtime
 //! - [`ui`]     the web UI's files, embedded
 //! - [`serve`]  running the daemon: start, serve, shut down; starting it in the background
+//! - [`fsview`] read-only folder and file views for the folder picker and the Files panel
 //! - [`client`] the API as typed calls, for the command line
 //! - [`render`] records and listings as terminal text
 //! - [`cli`]    the `loom` command
@@ -18,6 +19,7 @@ pub mod api;
 pub mod auth;
 pub mod cli;
 pub mod client;
+pub mod fsview;
 pub mod render;
 pub mod serve;
 pub mod ui;

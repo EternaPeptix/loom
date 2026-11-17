@@ -1000,7 +1000,7 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   while the server was down), the new one is remembered and the request is sent again once; when one
   has (the server was relaunched with another model), the 404 is refused with a sentence naming the
   model now served — loom never follows a new model by itself, because what a session recorded at its
-  start describes the old one.
+  start describes the old one (the operator switches it: `loom models set`, below).
 - **Context overflow.** A 400 or 413 whose message reads like an over-long prompt (`maximum context
   length`, `context length`, `too many tokens`, `prompt is too long`, `max_model_len`, llama.cpp's
   `exceeds the available context size`, `input is too long`) or whose error type or code is
@@ -1025,8 +1025,42 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   is refused when the server cannot be asked and the profile sets no window, and when the server
   answers but reports none and the profile sets none. With the server down and a configured window, the
   session starts with the configured model and window, and the daemon log says so. The window is
-  recorded in the session's `session_start` and fixed for its life.
-- No provider fallback. A profile's `extra_body` is fixed for the life of a session.
+  recorded in the session's `session_start` and changes only at a recorded `model_switched` (below).
+- No provider fallback. A session's profile settings, `extra_body` included, change only at a recorded
+  `model_switched`, or when a session that had no task is next opened after a reload or a restart.
+- **Live model set.** The profiles in use are the daemon's own copy of `[models]` and `default_model`;
+  `loom models reload` (`POST /api/models/reload`) reads them from the configuration file again
+  without a restart — nothing else in the file is reread. A new profile is usable at once; an
+  unchanged one keeps its client, request slots and discovery; a changed one gets new ones, and every
+  session on it that has not ended is switched to it again; a removed one is no longer offered (a
+  session running on it keeps its client; an idle one is refused activation until it is switched). A
+  reload that fails to load the file, has no `[models]`, or leaves a pack's role naming a missing
+  profile changes nothing. The daemon's environment is the one it started with: a profile whose
+  `api_key_env` is unset there is reported. `loom models set <session> <profile>`
+  (`POST /api/sessions/{id}/model`) switches one session — a lead or an agent; its agents keep their
+  own models — after discovery as for a new session: `meta.json` first, then the running task, which
+  applies it between steps (a running request finishes on the old model). The session records
+  `model_switched{from, to, reasoning_replay, reason}` (`operator`, `profile reloaded`, or `changed
+  while the session was idle` when it is next opened). The weave takes `reasoning_replay` from the
+  latest one for the whole history, and a switch is never reported as a cache break: a new model is
+  a cold cache by nature. The model is not told.
+- **A mission's agents' models.** The operator chooses, per mission, the profile its agents of a
+  role start on: `loom models role <session> <role> <profile>` (`POST /api/sessions/{id}/role-model`,
+  the web UI's Models tab), or at creation (`--agent-model ROLE=PROFILE`, the new-mission form's
+  "Agents' model"). `all` (`*`) covers every role without a choice of its own, but not the finish
+  gate's verifier, whose model is a separate decision (and refused on the lead's profile when the
+  pack wants them distinct). The choices live in the lead's `meta.json` (`role_models`) and are read
+  at each fresh spawn before the pack's `model`, `alloy_models` and `escalation_model`; a fork never
+  takes one, since it shares the lead's prefix and model. A choice applies to agents started from
+  then on; `--now` (the Models tab's checkbox) also switches the role's running, unforked agents as
+  `loom models set` would. `loom models show` (`GET /api/sessions/{id}/models`) shows the lead's
+  model, each role's choice or the pack's, and the agents running with their models.
+- **Review profiles and the infrastructure deny.** A profile with `purpose = "review"` (the monitor's,
+  `docs/MONITOR.md` §2.6) never runs an agent: it is refused as a lead, a role choice, a switch, and in a
+  reload that would give that purpose to the profile of a running session or a mission's choice, and it is
+  not offered in a mission's `profiles`. `model_switched` records the new model's lineage as
+  `session_start` does. The endpoint of every live profile is infrastructure (E1): a reload that adds or
+  changes one has every session's proxy policy derived again at once.
 
 ## 11. Tools, sandbox, network (`loom-tools`, `loom-net`)
 
@@ -1518,8 +1552,11 @@ POST /api/login-codes                         → {code, expires_in_s: 60}
 API token or web-session secret:
 GET  /api/status                              → StatusView
 GET  /api/sessions?archived=true|false        → [SessionInfo], newest first
-POST /api/sessions                            NewSession → 201 SessionInfo
-                                              {workspace, pack?, role?, model?, title?, unattended?, budget?, message?}
+POST /api/sessions                            NewSession → 201 SessionInfo + created
+                                              {workspace, pack?, role?, model?, title?, unattended?, budget?, message?,
+                                               role_models?, prior?, create_workspace?}; `~` and `~/x` in workspace mean the daemon user's
+                                              home; a missing workspace is made only when create_workspace is true, and
+                                              `created: true` in the answer says it was (409 otherwise, with the sentence)
 GET  /api/sessions/{id}                       → SessionDetail (SessionInfo + children, oldest first)
 GET  /api/sessions/{id}/records?after=&limit= → {records, next_after}   (limit: default 500, at most 2000)
 GET  /api/sessions/{id}/stream?after=         SSE, below (Last-Event-ID when after is absent)
@@ -1534,7 +1571,12 @@ POST /api/sessions/{id}/stop                  → 202 {}
 POST /api/sessions/{id}/resume                → 202 {}
 POST /api/sessions/{id}/reweave               → 202 {}
 POST /api/sessions/{id}/archive               {archived} → 200 {}
-GET  /api/sessions/{id}/window                → WindowView
+GET  /api/sessions/{id}/window                → WindowView (+ breakdown, measured_now, last_request, fold_at, fold_to)
+GET  /api/sessions/{id}/files?path=           → FilesView {root, path, entries: [{name, kind: dir|file|link|other, size, mtime_ms,
+                                              hidden, note?, error?}], more}   (read-only, inside the session's workspace)
+GET  /api/sessions/{id}/files/lines?path=&start=&count=
+                                              → {path, text, first, last, total, total_lines, bytes, mtime_ms, binary}
+                                              (1-based; count default 2000, 1–5000; at most 32 MiB of a file is read)
 GET  /api/sessions/{id}/net?limit=            → [NetEntry], the last `limit` (default 200, at most 2000)
 GET  /api/missions                            → [MissionInfo]
 GET  /api/missions/{id}/ledger                → LedgerView {state, markdown, skipped, skipped_detail, torn_tail, ahead_of_head}
@@ -1544,6 +1586,8 @@ POST /api/inbox/{item_id}                     {answer} → 202 {}
 GET  /api/blobs/{handle}                      → BlobRef {id, bytes, lines}
 GET  /api/blobs/{handle}/raw                  the stored bytes (application/octet-stream, attachment)
 GET  /api/blobs/{handle}/lines?start=&end=    → {text, first, last, total}  (1-based; default 1–2000, ≤ 5000 lines)
+GET  /api/fs/dirs?path=                       → DirsView {path, parent, home, entries: [{name, path, hidden, link}], more}
+                                              (folders only; default the daemon user's home; the loom home is refused)
 GET  /api/monitor                             → MonitorStatus   (the monitor in shadow)
 GET  /api/missions/{id}/monitor?after=&limit=&quiet=   → {entries, next_after}   (the monitor-log entries about a mission)
 GET  /api/monitor/reviews/{review}/input      → 404 until the reviewer exists (M6)
@@ -1551,6 +1595,17 @@ GET  /api/events?deltas=true|false            SSE, below
 POST /api/gc                                  {apply?} → SweepReport
 POST /api/shutdown                            → 202 {}
 ```
+
+**Folders and files.** `fs/dirs` and the two `files` routes are operator-side reads: they register no
+observation or evidence, write nothing and add nothing to a session's record. `fs/dirs` returns folder names
+only (at most 2,000, the rest counted in `more`; a link to a folder is listed with `link: true` and the folder
+it resolves to as `path`; the loom home is refused and entries that lead into it are left out). The `files`
+routes are confined to the session's canonical workspace: `..`, absolute paths and NUL are refused (409), a link
+that leads outside is shown as `link` and not followed, and the root's `.loom` is listed as a closed hidden entry
+(`note: "harness files are not shown"`) and never opened by name, case or link. A file is opened with
+`loom_tools::files::open_readable`, which judges the real path of the descriptor; a binary file (a NUL in its
+first 8 KiB) answers `binary: true` with no lines. A session's workspace may be created by `POST /api/sessions`
+only after the path is checked (not relative, not in the loom home or its copies folder, not under a file).
 
 **Monitor routes (three served, the rest specified).** The routes above are the ones this build serves, including `GET
 /api/monitor`, `GET /api/missions/{id}/monitor` and the `404` of `GET /api/monitor/reviews/{review}/input` (M2).

@@ -20,7 +20,7 @@
 //! value, so a caller wired in too early fails closed (nothing is cleared, nothing is allowed on the monitor's say-so).
 //! M1 added the profile keys `family`, `alignment`, `recipient` and `purpose`, the `[monitor]` keys `reviewers`,
 //! `tripwires_only_profiles`, `recipients`, `content` and `known_families`, the check `loom config check` runs on them,
-//! `loom models show`, and the resolved lineage in `session_start`; M2 adds `[monitor] enabled`, `mode`,
+//! `loom models lineage`, and the resolved lineage in `session_start`; M2 adds `[monitor] enabled`, `mode`,
 //! `fleet_every_s` and `monitor_down`.
 //!
 //! ## Placement (built by M2; invariants I1 to I12 of `docs/MONITOR.md` §2.1)

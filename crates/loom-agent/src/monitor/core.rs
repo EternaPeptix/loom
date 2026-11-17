@@ -54,6 +54,9 @@
 //!   and the operator's messages up to `ts`, cached per mission until the journal or the messages change. A mission's
 //!   journal is read when a session of it wrote a `ledger` record (debounced by `LEDGER_DEBOUNCE_MS`), verified with
 //!   the journal key when the core has it.
+//! - **Model switches:** a session is relaxed-alignment (one tier up for six categories) when its `session_start`'s
+//!   lineage or its profile says so (`source::prime`), and from a `model_switched` onto a relaxed model on (its
+//!   `to.lineage`, or `to.profile` among the configuration's relaxed profiles); a switch back does not lower it.
 //! - **Census:** `Monitor::census` hands the core the last process census and the sessions that have ended; the core
 //!   runs TW-20 over it (S2 for processes of an ended session, S3 when one listens or connects) and feeds the fleet
 //!   book's listeners.
@@ -66,7 +69,8 @@
 //! net decision that waited out no grace is read again after a restart; the credential index survives a restart; a
 //! disabled core keeps the precision list; an S1 target back inside the window counts; a net decision is judged after its grace and after the log; a
 //! mission's authorization follows its journal and its operator messages; the fleet scan runs on its period and reports
-//! once; a memory core writes no file; the status counts what was read.
+//! once; a memory core writes no file; the status counts what was read; a switch onto a relaxed model uptiers the
+//! session's later hits and a switch back does not lower them.
 
 use crate::census::CensusView;
 use crate::monitor::auth::{AuthFacts, Authorization};
@@ -840,6 +844,15 @@ impl Core {
                         self.engine.set_ctx(ctx.clone());
                     }
                 }
+                // A switch onto a relaxed-alignment model uptiers the session from here on, as its `session_start` would
+                // have; a switch off one does not lower it, since its context holds what the relaxed model wrote. Read
+                // in the parent's copy too: a fork runs on the model its parent had when it was made.
+                if let Event::ModelSwitched(m) = &rec.event {
+                    if !ctx.relaxed && self.switched_to_relaxed(m) {
+                        ctx.relaxed = true;
+                        self.engine.set_ctx(ctx.clone());
+                    }
+                }
                 if skip {
                     continue;
                 }
@@ -871,6 +884,13 @@ impl Core {
             self.pump_net(name, now, replay);
         }
         progress
+    }
+
+    /// The model a `model_switched` moved to is relaxed-alignment: by the lineage it was recorded with, or by the
+    /// configuration's profiles as `prime` reads them.
+    fn switched_to_relaxed(&self, m: &loom_core::event::ModelSwitched) -> bool {
+        m.to.lineage.as_ref().is_some_and(|l| l.alignment == loom_core::lineage::Alignment::Relaxed)
+            || self.env.relaxed_profiles.contains(&m.to.profile)
     }
 
     fn observe(&mut self, ctx: &mut SessionCtx, rec: &loom_core::event::Record, name: &str) {

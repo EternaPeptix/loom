@@ -17,6 +17,7 @@ struct ConnectionsView: View {
                     editing = Connection(name: "")
                 } label: { Image(systemName: "plus") }
                 .help("Add a connection")
+                .accessibilityLabel("Add a connection")
             }
             if let err = state.storageError {
                 Text(err).font(.caption).foregroundStyle(.red)
@@ -145,6 +146,8 @@ struct ConnectionEditor: View {
                 if needsToken {
                     SecureField("Token", text: $token,
                                 prompt: Text(hasStoredToken ? "stored in Keychain — leave blank to keep" : "64 hex characters"))
+                    Text("The daemon writes its token to ~/.loom/token on its host (`loom` reads it there).")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
             if let p = problem {

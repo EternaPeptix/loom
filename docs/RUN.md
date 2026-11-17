@@ -39,12 +39,14 @@ node --test ui/core.test.js
 ## Configure
 
 The configuration is `~/.loom/config.toml` (`LOOM_HOME` moves the whole `~/.loom` directory). The
-daemon reads it only when it starts: configure first, then start, and restart after any change.
+daemon reads it only when it starts: configure first, then start, and restart after any change —
+except `[models]` and `default_model`, which `loom models reload` applies to the running daemon.
 
 ```
 loom config init       # writes a starting file; refuses to overwrite an existing one
 loom config path       # prints the path
-loom config check      # loads the file and checks it: prints each profile's lineage, then "ok", or the error and exits 1
+loom config check      # loads and checks it, with the daemon's start-up checks, then the model policy: prints each
+                       # profile's lineage, then "ok: <path>", or the error and exits 1
 ```
 
 Edit `base_url` (the server's `/v1` URL) and `model` in the `[models.<name>]` table. If the server
@@ -91,7 +93,7 @@ A loopback `base_url` has the recipient `unknown` until you declare it (it could
 provider that does not receive the transcripts yet, and `tripwires_only_profiles` names the profiles that have no
 reviewer on purpose (their missions are "not LLM-reviewed"). `loom config check` prints each profile's resolved values
 and where each came from, and **fails** on a profile that has no eligible reviewer and is not listed, with the lines to
-add; `loom models show [profile]` shows who reviews what in each pack. `docs/config.example.toml` holds one operator's
+add; `loom models lineage [profile]` shows who reviews what in each pack. `docs/config.example.toml` holds one operator's
 fleet as a worked example.
 
 ### Model API keys
@@ -387,7 +389,10 @@ loom run -w /path/to/workspace "the task, in plain words"
 ```
 
 `run` starts a lead session whose workspace is the `-w` / `--workspace` directory (without it, the
-current directory) and follows its record on the terminal. Everything after the options is the task;
+current directory; `~` and `~/x` mean your home directory). A workspace that does not exist is refused
+with a sentence saying so; add `--create-workspace` to make it (and the folders above it that are missing),
+and `run` prints `created workspace <path>` before the session id. A path inside the loom home or a relative
+path that does not exist is refused either way and follows its record on the terminal. Everything after the options is the task;
 `-` or no words reads it from standard input. The lead owns a mission ledger (goal, constraints,
 plan, claims with evidence), may delegate to workers and have a verifier attack its `finish`, and
 stops only through a terminating tool. Ctrl-C stops following, not the session.
@@ -420,7 +425,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | command | does |
 |---|---|
 | `loom daemon` / `up` / `down` | run the daemon in the foreground / in the background / stop it |
-| `loom models show [profile]` | each model profile's family, alignment and recipient, and who reviews its missions in each pack (needs no daemon) |
+| `loom models lineage [profile]` | each model profile's family, alignment and recipient, and who reviews its missions in each pack (needs no daemon) |
 | `loom monitor [status]` | the monitor in shadow: its state, open flags, how often each of the 28 tripwires fired by severity, the faults of its sources |
 | `loom monitor log <mission\|session> [--json] [--since 7d] [--all] [-n N]` | the monitor-log entries about a mission: hits, flags, what each would earn once promoted |
 | `loom monitor replay [--since 7d] [--positives FILE] [--home DIR] [--json]` | the tripwires over the history of a home, read-only and without a daemon: per-tripwire hits, would-be pauses per 100 active hours, precision and recall against known positives |
@@ -434,6 +439,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom stop <session>` / `resume <session>` | stop the turn, its jobs and agents / let a stopped session carry on |
 | `loom reweave <session>` | fold old tool output out of the context now |
 | `loom archive <session> [--undo]` | hide a finished session; archiving settles the mission's agents |
+| `loom rename <session> <title...>` | rename a mission (its lead's title) |
 | `loom rule <session> <text...>` | set a standing rule (a ledger constraint) for the mission |
 | `loom rule <session> --withdraw <rule-id> [--reason <text>]` | withdraw a rule |
 | `loom approve <session> <text...> [--scope <text>]` | record an approval |
@@ -448,9 +454,17 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom out <handle> [--lines a:b]` | print a stored tool output |
 | `loom gc [--apply]` | delete stored outputs that nothing refers to |
 | `loom config path` / `check` / `init` | the configuration file |
+| `loom models list` | the model profiles in use (the default marked), each server ✓/✗ |
+| `loom models reload` | read `[models]` and `default_model` from the config again and use them now, without a restart; sessions on a changed profile move to its new settings |
+| `loom models set <session> <profile>` | switch a session (lead or agent) to another model profile from its next step, without a restart; logged as `model_switched`; a profile with `purpose = "review"` is refused |
+| `loom models show <session>` | a mission's models: the lead's, the choice for each role of its agents (or what the pack picks), the agents running and their models |
+| `loom models role <session> <role> <profile> [--now]` | start the mission's new agents of `role` (`all`: every role without a choice of its own, not the finish gate's verifier) on `profile`; `--now` also moves its running agents of that role (not forked ones) |
+| `loom models role <session> <role> --clear` | drop that choice: the pack picks again for agents started later |
 | `loom service install` / `uninstall` / `status` | the macOS login service |
 
-Options of `run` and `chat`: `-w/--workspace`, `--pack`, `--role`, `-m/--model` (a profile name),
+Options of `run` and `chat`: `-w/--workspace`, `--create-workspace`, `--pack`, `--role`, `-m/--model` (a profile name),
+`--agent-model ROLE=PROFILE` (repeatable; `all=PROFILE` for every role: the mission's agents start on
+it from the first one, as `loom models role` sets later),
 `-t/--title`, `--attended` (do not resume by itself after a restart), `--max-steps`, `--max-minutes`,
 `--prior <mission>` (repeatable: earlier missions to recall; not with `chat --session`, which continues a
 mission that has already started);
@@ -579,7 +593,7 @@ and `--undo` does not bring them back. Nothing else deletes them.
 
 ## First run checklist
 
-1. `loom config check` prints `ok`, then `loom up`, then `loom status` shows ✓ beside your server's
+1. `loom config check` prints `ok: <path>`, then `loom up`, then `loom status` shows ✓ beside your server's
    URL (it answered a request for its models).
 2. `loom run -w <a tiny workspace> "how many .rs files are here and how many lines in total?"` (or a
    question about your own files). Confirm: the lead calls `bash`, the result carries the
