@@ -1019,6 +1019,11 @@ impl LedgerState {
                     return Err(needs_text("the evidence", "note")
                         + " Say what the observation shows and what it does not show.");
                 }
+                if let Some(grade) = input.grade {
+                    if (grade == EvidenceGrade::Run) != (input.kind == EvidenceKind::Execution) {
+                        return Err(format!("The harness recorded the grade {} for this evidence, which contradicts its kind ({}). This is a fault in the harness, not in your call: there is nothing to change in it. Report it to the operator and carry on with other work.", grade.as_str(), if input.kind == EvidenceKind::Execution { "execution" } else { "static" }));
+                    }
+                }
             }
             LedgerOp::ObligationOpen { text, .. } => {
                 if blank(text) {
@@ -1195,7 +1200,19 @@ impl LedgerState {
         }
         let executed: Vec<&&Evidence> = cited.iter().filter(|e| e.input.kind == EvidenceKind::Execution).collect();
         if executed.is_empty() {
-            return Err("The cited evidence is static only (something was read, nothing was run). Reading source does not show the goal is met or unmeetable: run the target, record the run with `evidence`, and cite that execution.".to_string());
+            let mut m = format!("None of the cited evidence is a run: {}.", self.evidence_labels(evidence));
+            let has = |g: EvidenceGrade| cited.iter().any(|e| e.input.grade_or_kind() == g);
+            if has(EvidenceGrade::Analysis) {
+                m.push_str(" Analysis output (a dependency scan, a decompilation, cross-references) describes the target without running it: analysis is not a run.");
+            }
+            if has(EvidenceGrade::Read) {
+                m.push_str(" Reading source or a page does not show what the target does when it runs.");
+            }
+            if has(EvidenceGrade::Reference) {
+                m.push_str(" Reference data (a CVE or advisory record) is about the world, not this target: a lookup is not a run.");
+            }
+            m.push_str(" Run the target, record the run with `evidence`, and cite that record.");
+            return Err(m);
         }
         if current.status != GoalMetStatus::Open && !executed.iter().any(|e| e.n > current.n) {
             return Err(format!("The goal is recorded as {}. To change it, run the target again and cite execution evidence recorded after that conclusion (entry {}).", goal_met_label(current.status), current.n));
@@ -1299,7 +1316,7 @@ impl LedgerState {
                         l.push_str(&format!(" — {}", gm.note));
                     }
                     if !gm.evidence.is_empty() {
-                        l.push_str(&format!(" (evidence: {})", gm.evidence.join(", ")));
+                        l.push_str(&format!(" (evidence: {})", self.evidence_labels(&gm.evidence)));
                     }
                     s.push_str(&line(&l, max));
                 }
@@ -1364,7 +1381,7 @@ impl LedgerState {
             for c in &self.claims {
                 let mut l = format!("- {} [{}] {}", c.id, claim_status(c.status), c.text);
                 if !c.evidence.is_empty() {
-                    l.push_str(&format!(" (evidence: {})", c.evidence.join(", ")));
+                    l.push_str(&format!(" (evidence: {})", self.evidence_labels(&c.evidence)));
                 }
                 s.push('\n');
                 s.push_str(&line(&l, max));
@@ -1551,7 +1568,7 @@ impl LedgerState {
         for e in &self.evidence {
             let i = &e.input;
             o.push_str(&format!(
-                "\n### {} (entry {})\n\n- claim: {}\n- {} the claim; kind: {}; attested: {}\n- source: session {}, call {}\n",
+                "\n### {} (entry {})\n\n- claim: {}\n- {} the claim; kind: {}; grade: {}; attested: {}\n- source: {}session {}, call {}\n",
                 e.id,
                 e.n,
                 i.claim,
@@ -1560,7 +1577,12 @@ impl LedgerState {
                     EvidenceKind::Execution => "execution",
                     EvidenceKind::Static => "static",
                 },
+                i.grade_or_kind().as_str(),
                 if i.attested { "yes" } else { "no" },
+                match i.tool.as_deref().filter(|t| !t.is_empty()) {
+                    Some(t) => format!("{t}, "),
+                    None => String::new(),
+                },
                 i.session,
                 i.call_id,
             ));
@@ -1680,10 +1702,7 @@ impl LedgerState {
                 "evidence for {} ({}, {}) from call {}: {}",
                 i.claim,
                 if i.supports { "supports" } else { "undermines" },
-                match i.kind {
-                    EvidenceKind::Execution => "execution",
-                    EvidenceKind::Static => "static",
-                },
+                i.source_label(),
                 i.call_id,
                 i.note
             ),
@@ -2363,7 +2382,7 @@ mod tests {
             "Constraints:\n- k1: never touch prod",
             "Plan:\n[x] p1 read — read it\n[>] p2 write\n[ ] p3 test",
             "Open obligations:\n- o1 (job) bench running [pid 7]",
-            "Claims:\n- c1 [open] parser handles nesting (evidence: e1)",
+            "Claims:\n- c1 [open] parser handles nesting (evidence: e1 run)",
             "Decisions:",
             "Dead ends:",
             "Approvals:\n- a1 [git push]: ok to push",
@@ -2564,7 +2583,7 @@ mod tests {
         ]);
         for st in [GoalMetStatus::Supported, GoalMetStatus::Refuted] {
             let m = refusal(&s, conclude(st, &["e1"]), false);
-            assert!(m.contains("static only") && m.contains("run the target"), "{m}");
+            assert!(m.contains("None of the cited evidence is a run") && m.contains("Run the target"), "{m}");
         }
         // static plus execution is enough
         assert!(s.validate(&conclude(GoalMetStatus::Supported, &["e1", "e2"]), false).is_ok());
@@ -2603,7 +2622,8 @@ mod tests {
         let m = refusal(&s, conclude(GoalMetStatus::Refuted, &["e1"]), false);
         assert!(m.contains("run the target again") && m.contains("entry 4"), "{m}");
         s.apply(&entry(5, LedgerOp::EvidenceAdd(static_ev("c1"))));
-        assert!(refusal(&s, conclude(GoalMetStatus::Refuted, &["e2"]), false).contains("static only"));
+        assert!(refusal(&s, conclude(GoalMetStatus::Refuted, &["e2"]), false)
+            .contains("None of the cited evidence is a run"));
         s.apply(&entry(6, LedgerOp::EvidenceAdd(ev("c1", true, true))));
         assert!(s.validate(&conclude(GoalMetStatus::Refuted, &["e3"]), false).is_ok());
         s.apply(&entry(7, conclude(GoalMetStatus::Refuted, &["e3"])));
@@ -2690,7 +2710,8 @@ mod tests {
         // A static record added afterwards is not a run; a new run is, for either conclusion (the same
         // one as before included).
         s.apply(&entry(8, LedgerOp::EvidenceAdd(static_ev("c1"))));
-        assert!(refusal(&s, conclude(GoalMetStatus::Refuted, &["e2"]), false).contains("static only"));
+        assert!(refusal(&s, conclude(GoalMetStatus::Refuted, &["e2"]), false)
+            .contains("None of the cited evidence is a run"));
         s.apply(&entry(9, LedgerOp::EvidenceAdd(ev("c1", true, true))));
         assert!(s.validate(&conclude(GoalMetStatus::Refuted, &["e3"]), false).is_ok());
         assert!(s.validate(&conclude(GoalMetStatus::Supported, &["e1", "e3"]), false).is_ok());
@@ -2748,12 +2769,12 @@ mod tests {
             ]
         };
         let met = build(ops(GoalMetStatus::Supported));
-        assert!(met.brief(&BriefOpts::default()).contains("Goal status: met — ran the target (evidence: e1)"));
+        assert!(met.brief(&BriefOpts::default()).contains("Goal status: met — ran the target (evidence: e1 run)"));
         assert!(met.render_markdown().contains("met — ran the target (evidence: e1) (entry 4)"));
         let no = build(ops(GoalMetStatus::Refuted));
         assert!(no
             .brief(&BriefOpts::default())
-            .contains("Goal status: cannot be met as stated — ran the target (evidence: e1)"));
+            .contains("Goal status: cannot be met as stated — ran the target (evidence: e1 run)"));
         assert!(!no.brief(&BriefOpts::default()).contains("not yet concluded"));
     }
 
@@ -2848,5 +2869,132 @@ mod tests {
         // Optional fields may be absent on the wire for the new ops.
         let op: Result<LedgerOp, _> = serde_json::from_str(r#"{"op":"scope_grant","hosts":["a.example"]}"#);
         assert!(matches!(op, Ok(LedgerOp::ScopeGrant { note: None, .. })));
+    }
+
+    fn graded(claim: &str, tool: &str, grade: EvidenceGrade) -> EvidenceInput {
+        EvidenceInput {
+            kind: if grade == EvidenceGrade::Run { EvidenceKind::Execution } else { EvidenceKind::Static },
+            tool: Some(tool.into()),
+            grade: Some(grade),
+            ..ev(claim, true, true)
+        }
+    }
+
+    fn goal_with(evs: Vec<EvidenceInput>) -> LedgerState {
+        let mut ops = vec![LedgerOp::GoalSet { text: "g".into() }, LedgerOp::ClaimAdd { text: "c".into() }];
+        ops.extend(evs.into_iter().map(LedgerOp::EvidenceAdd));
+        build(ops)
+    }
+
+    fn conclude_with(ids: &[&str]) -> LedgerOp {
+        LedgerOp::GoalMetSet {
+            status: GoalMetStatus::Supported,
+            note: "done".into(),
+            evidence: ids.iter().map(|e| e.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn evidence_without_tool_or_grade_keeps_its_old_bytes() {
+        let old = r#"{"op":"evidence_add","claim":"c1","kind":"execution","supports":true,"session":"s-x","call_id":"call-1","blob":"ab12","lines":[2,4],"quote":"q","note":"ran it","attested":true}"#;
+        let input = EvidenceInput { quote: Some("q".into()), ..ev("c1", true, true) };
+        assert_eq!(serde_json::to_string(&LedgerOp::EvidenceAdd(input)).unwrap_or_default(), old);
+        let back: Result<LedgerOp, _> = serde_json::from_str(old);
+        match back {
+            Ok(LedgerOp::EvidenceAdd(i)) => assert_eq!((i.tool, i.grade), (None, None)),
+            other => panic!("{other:?}"),
+        }
+        let with = LedgerOp::EvidenceAdd(graded("c1", "dep_scan", EvidenceGrade::Analysis));
+        let json = serde_json::to_string(&with).unwrap_or_default();
+        assert!(json.contains(r#""tool":"dep_scan""#) && json.contains(r#""grade":"analysis""#), "{json}");
+        assert_eq!(serde_json::from_str::<LedgerOp>(&json).ok(), Some(with));
+    }
+
+    #[test]
+    fn grade_and_source_label_with_and_without_records() {
+        let old = ev("c1", true, true);
+        assert_eq!((old.grade_or_kind(), old.source_label()), (EvidenceGrade::Run, "run".to_string()));
+        let read = static_ev("c1");
+        assert_eq!((read.grade_or_kind(), read.source_label()), (EvidenceGrade::Read, "read".to_string()));
+        let a = graded("c1", "dep_scan", EvidenceGrade::Analysis);
+        assert_eq!(
+            (a.grade_or_kind(), a.source_label()),
+            (EvidenceGrade::Analysis, "analysis by dep_scan".to_string())
+        );
+        let toolless = EvidenceInput { tool: None, ..a };
+        assert_eq!(toolless.source_label(), "analysis");
+    }
+
+    #[test]
+    fn a_grade_that_contradicts_the_kind_is_refused() {
+        let s = build(vec![LedgerOp::ClaimAdd { text: "c".into() }]);
+        let run_but_static = EvidenceInput { kind: EvidenceKind::Static, ..graded("c1", "bash", EvidenceGrade::Run) };
+        let analysis_but_exec =
+            EvidenceInput { kind: EvidenceKind::Execution, ..graded("c1", "dep_scan", EvidenceGrade::Analysis) };
+        for bad in [run_but_static, analysis_but_exec] {
+            let m = refusal(&s, LedgerOp::EvidenceAdd(bad), false);
+            assert!(m.contains("contradicts its kind") && m.contains("fault in the harness"), "{m}");
+        }
+        for ok in [
+            graded("c1", "bash", EvidenceGrade::Run),
+            graded("c1", "x", EvidenceGrade::Reference),
+            static_ev("c1"),
+            ev("c1", true, true),
+        ] {
+            assert!(s.validate(&LedgerOp::EvidenceAdd(ok), false).is_ok());
+        }
+    }
+
+    #[test]
+    fn goal_met_names_what_the_cited_evidence_is() {
+        let s = goal_with(vec![graded("c1", "dep_scan", EvidenceGrade::Analysis)]);
+        let m = refusal(&s, conclude_with(&["e1"]), false);
+        assert_eq!(
+            m,
+            "None of the cited evidence is a run: e1 analysis by dep_scan. Analysis output (a dependency scan, a decompilation, cross-references) describes the target without running it: analysis is not a run. Run the target, record the run with `evidence`, and cite that record."
+        );
+        let s = goal_with(vec![graded("c1", "cve", EvidenceGrade::Reference)]);
+        let m = refusal(&s, conclude_with(&["e1"]), false);
+        assert!(m.contains("e1 reference by cve") && m.contains("a lookup is not a run"), "{m}");
+        assert!(!m.contains("analysis is not a run"));
+        let s = goal_with(vec![
+            graded("c1", "dep_scan", EvidenceGrade::Analysis),
+            graded("c1", "read_file", EvidenceGrade::Read),
+        ]);
+        let m = refusal(&s, conclude_with(&["e1", "e2"]), false);
+        assert!(m.contains("e1 analysis by dep_scan, e2 read by read_file."), "{m}");
+        let (a, r) = (m.find("analysis is not a run"), m.find("Reading source or a page"));
+        assert!(a.is_some() && r.is_some() && a < r && m.ends_with("cite that record."), "{m}");
+        let s = goal_with(vec![
+            graded("c1", "dep_scan", EvidenceGrade::Analysis),
+            graded("c1", "bash", EvidenceGrade::Run),
+        ]);
+        assert!(s.validate(&conclude_with(&["e1", "e2"]), false).is_ok());
+    }
+
+    #[test]
+    fn views_carry_the_grade_and_the_tool() {
+        let s =
+            goal_with(vec![graded("c1", "dep_scan", EvidenceGrade::Analysis), ev("c1", true, true), static_ev("c1")]);
+        let brief = s.brief(&BriefOpts::default());
+        assert!(brief.contains("- c1 [open] c (evidence: e1 analysis by dep_scan, e2 run, e3 read)"), "{brief}");
+        let met = build(vec![
+            LedgerOp::GoalSet { text: "g".into() },
+            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::EvidenceAdd(graded("c1", "bash", EvidenceGrade::Run)),
+            conclude_with(&["e1"]),
+        ]);
+        assert!(met.brief(&BriefOpts::default()).contains("Goal status: met — done (evidence: e1 run by bash)"));
+        let md = s.render_markdown();
+        assert!(
+            md.contains("kind: static; grade: analysis; attested: yes\n- source: dep_scan, session s-x, call call-1"),
+            "{md}"
+        );
+        assert!(md.contains("kind: execution; grade: run; attested: yes\n- source: session s-x, call call-1"), "{md}");
+        assert_eq!(
+            LedgerState::summarize(&LedgerOp::EvidenceAdd(graded("c1", "dep_scan", EvidenceGrade::Analysis))),
+            "evidence for c1 (supports, analysis by dep_scan) from call call-1: ran it"
+        );
+        assert!(LedgerState::summarize(&LedgerOp::EvidenceAdd(ev("c1", false, true))).contains("(undermines, run)"));
     }
 }
