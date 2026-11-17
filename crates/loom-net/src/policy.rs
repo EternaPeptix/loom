@@ -358,9 +358,45 @@ pub fn check_hosts(hosts: &[String]) -> Result<Vec<String>, String> {
             return Err(format!("The host entry \"{h}\" contains whitespace or a comma. Give one host per entry."));
         }
         grant_pattern(h)?;
+        refuse_too_broad(h)?;
         out.push(h.to_string());
     }
     Ok(out)
+}
+
+/// Whether an IP literal is unspecified or in `0.0.0.0/8`, also when an IPv6 form carries such an address.
+fn is_unspecified_literal(ip: IpAddr) -> bool {
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => v4.octets().first() == Some(&0),
+        IpAddr::V6(v6) => v6.is_unspecified(),
+    }
+}
+
+/// The refusals of [`check_hosts`] beyond pattern validity: `*`, a wildcard over a single label and an
+/// unspecified address. `host` is a trimmed, valid pattern.
+fn refuse_too_broad(host: &str) -> Result<(), String> {
+    let (name, _) = split_host_port(host)?;
+    if name == "*" {
+        return Err(format!(
+            "The host \"{host}\" would authorize every host. Name the hosts you need, such as `api.example.test` or `*.example.test`."
+        ));
+    }
+    if let Some(rest) = name.strip_prefix("*.") {
+        let label = normalize_host(rest);
+        if !label.contains('.') {
+            return Err(format!(
+                "The host \"{host}\" would authorize a whole top-level domain. Name the hosts you need, such as `api.example.{label}` or `*.example.{label}`."
+            ));
+        }
+    }
+    if let Ok(ip) = normalize_host(name).parse::<IpAddr>() {
+        if is_unspecified_literal(ip) {
+            return Err(format!(
+                "The host \"{host}\" is an unspecified address, and a connection to it reaches this machine's own services. Write the address of the host you need, or `127.0.0.1` with a port for a service on this machine."
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_list<T>(list: &str, entries: &[String], parse: fn(&str) -> Result<T, String>) -> Result<Vec<T>, String> {
@@ -409,6 +445,10 @@ impl Policy {
         let mut policy = Policy::new(cfg)?;
         if hosts.is_empty() || policy.mode == NetworkMode::Open {
             return Ok(policy);
+        }
+        if policy.mode == NetworkMode::DenyAll {
+            // The configured `allow` list is not in force under deny_all; a grant must not switch it on.
+            policy.allow.clear();
         }
         for h in hosts {
             let p = grant_pattern(h)?;
@@ -690,6 +730,52 @@ mod tests {
         assert!(s(&["a.test,b.test"]).unwrap_err().contains("one host per entry"));
         assert!(s(&["a b"]).unwrap_err().contains("one host per entry"));
         assert!(s(&["a*b"]).unwrap_err().contains("cannot be authorized"));
+    }
+
+    #[test]
+    fn grant_under_deny_all_does_not_switch_on_the_configured_allow_list() {
+        let hosts = |h: &[&str]| h.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let c = cfg(NetworkMode::DenyAll, &["cfg.test", "*.cfg.test:443"], &[], &[]);
+        let p = Policy::with_hosts(&c, &hosts(&["granted.test"])).unwrap();
+        assert!(p.check_name("granted.test", 80).allowed);
+        for (h, port) in [("cfg.test", 80), ("api.cfg.test", 443)] {
+            let v = p.check_name(h, port);
+            assert!(!v.allowed, "{h}");
+            assert_eq!(v.rule, "not in allow list", "{h}");
+        }
+        let c = cfg(NetworkMode::Allowlist, &["cfg.test"], &[], &[]);
+        let p = Policy::with_hosts(&c, &hosts(&["granted.test"])).unwrap();
+        assert!(p.check_name("granted.test", 80).allowed);
+        assert!(p.check_name("cfg.test", 80).allowed);
+    }
+
+    #[test]
+    fn check_hosts_refuses_everything_hosts_and_unspecified_addresses() {
+        let s = |h: &[&str]| check_hosts(&h.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        for e in [
+            "*",
+            "*:443",
+            "*.com",
+            "*.com:443",
+            "0.0.0.0",
+            "0.0.0.0:8080",
+            "0.1.2.3",
+            "::",
+            "[::]",
+            "[::]:80",
+            "[::ffff:0.0.0.0]",
+        ] {
+            let err = s(&[e]).unwrap_err();
+            assert!(err.contains(&format!("\"{e}\"")), "{e}: {err}");
+            let err = s(&["a.test", e]).unwrap_err();
+            assert!(err.contains(&format!("\"{e}\"")), "{e}: {err}");
+        }
+        for e in ["*.example.test", "api.example.test:443", "127.0.0.1:19201", "10.0.0.5", "[::1]:8080"] {
+            assert_eq!(s(&[e]).unwrap(), [e], "{e}");
+        }
+        // with_hosts honours what a ledger restored.
+        let c = cfg(NetworkMode::DenyAll, &[], &[], &[]);
+        assert!(Policy::with_hosts(&c, &["*.com".to_string()]).is_ok());
     }
 
     #[test]

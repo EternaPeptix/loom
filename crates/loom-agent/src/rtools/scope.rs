@@ -152,6 +152,9 @@ mod tests {
             json!({"hosts": [], "why": "x"}),
             json!({"hosts": ["a.test", "  "], "why": "x"}),
             json!({"hosts": ["bad host"], "why": "x"}),
+            json!({"hosts": ["*"], "why": "x"}),
+            json!({"hosts": ["*.com"], "why": "x"}),
+            json!({"hosts": ["0.0.0.0:8080"], "why": "x"}),
             json!({"hosts": ["a.test"], "why": "  "}),
         ] {
             let res = r.call("request_scope", args.clone()).await;

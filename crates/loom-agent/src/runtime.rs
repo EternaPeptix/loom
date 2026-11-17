@@ -5279,6 +5279,7 @@ mod tests {
             .await
             .unwrap_err()
             .contains("cannot be authorized"));
+        assert!(e.rt.grant_scope(&id, &["*.com".to_string()], None).await.unwrap_err().contains("top-level domain"));
         let unknown = SessionId::from("s-nope");
         let err = e.rt.grant_scope(&unknown, &["a.test".to_string()], None).await.unwrap_err();
         assert_eq!(err, "There is no session s-nope.");
