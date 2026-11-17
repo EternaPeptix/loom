@@ -764,14 +764,28 @@ fn is_repository(dir: &Path) -> bool {
         && (kind("objects").is_some_and(|m| m.is_dir()) || kind("commondir").is_some_and(|m| m.is_file()))
 }
 
+/// The text of a Git pointer file (`commondir`, `gitdir`, a `.git` file); `None` when it is missing or not a file.
+fn git_pointer(path: &Path) -> io::Result<Option<String>> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() && m.len() <= 4096 => Ok(Some(std::fs::read_to_string(path)?)),
+        Ok(m) if m.is_file() => Err(invalid(format!(
+            "Git metadata pointer {} is larger than 4096 bytes. Inspect it before starting a session.",
+            path.display()
+        ))),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Discover existing repositories without running host Git or following a link to a directory: every directory in
-/// the workspace that is a repository (a bare one included; it is not searched further), every `.git` directory and
+/// the workspace that is a repository and holds no `.git` of its own (a bare one included; the search goes on below
+/// it, but not into its `objects`), every `.git` directory and
 /// the target of every `.git` file's `gitdir:` when that target is a repository; then, for each repository found, its
 /// `commondir` target (relative to it) when that is a repository, every directory in its `worktrees`, and every
 /// repository below its `modules` (searched in turn the same way; a directory there that is not one is searched
 /// further). Refuse an unreadable or oversized tree rather than silently leaving discovered metadata unprotected.
 fn git_directories(workspace: &Path) -> io::Result<GitFound> {
-    use std::collections::BTreeSet;
     let canon = |p: &Path| resolve_path(p, true).map_err(invalid);
     let unreadable = |dir: &Path, e: io::Error| {
         invalid(format!(
@@ -779,18 +793,6 @@ fn git_directories(workspace: &Path) -> io::Result<GitFound> {
              that Git metadata can be protected.",
             dir.display()
         ))
-    };
-    let pointer = |path: &Path| -> io::Result<Option<String>> {
-        match std::fs::metadata(path) {
-            Ok(m) if m.is_file() && m.len() <= 4096 => Ok(Some(std::fs::read_to_string(path)?)),
-            Ok(m) if m.is_file() => Err(invalid(format!(
-                "Git metadata pointer {} is larger than 4096 bytes. Inspect it before starting a session.",
-                path.display()
-            ))),
-            Ok(_) => Ok(None),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
     };
     let mut pending = vec![workspace.to_path_buf()];
     let mut roots = Vec::new();
@@ -800,18 +802,24 @@ fn git_directories(workspace: &Path) -> io::Result<GitFound> {
         if visited > 100_000 {
             return Err(invalid("The workspace has more than 100000 directories. Choose a smaller workspace so Git metadata can be protected.".to_string()));
         }
-        if is_repository(&dir) {
-            push_unique(&mut roots, canon(&dir)?);
-            continue;
-        }
+        let mut entries = Vec::new();
         for entry in std::fs::read_dir(&dir).map_err(|e| unreadable(&dir, e))? {
             let entry = entry.map_err(|e| unreadable(&dir, e))?;
-            let path = entry.path();
             let kind = entry.file_type().map_err(|e| unreadable(&dir, e))?;
-            if fold(&entry.file_name().to_string_lossy()) == ".git" {
+            entries.push((entry.path(), entry.file_name(), kind));
+        }
+        // A directory that holds a `.git` entry is a working tree, whatever else a command made in it.
+        let has_git = entries.iter().any(|(_, name, _)| fold(&name.to_string_lossy()) == ".git");
+        let bare = !has_git && is_repository(&dir);
+        if bare {
+            push_unique(&mut roots, canon(&dir)?);
+        }
+        for (path, name, kind) in entries {
+            let name = name.to_string_lossy();
+            if fold(&name) == ".git" {
                 if path.is_dir() {
                     push_unique(&mut roots, canon(&path)?);
-                } else if let Some(text) = pointer(&path)? {
+                } else if let Some(text) = git_pointer(&path)? {
                     if let Some(target) = text.trim().strip_prefix("gitdir:") {
                         let target = canon(&dir.join(target.trim()))?;
                         if is_repository(&target) {
@@ -819,11 +827,20 @@ fn git_directories(workspace: &Path) -> io::Result<GitFound> {
                         }
                     }
                 }
-            } else if kind.is_dir() {
+            } else if kind.is_dir() && !(bare && name == "objects") {
                 pending.push(path);
             }
         }
     }
+    git_expand(roots)
+}
+
+/// What lies around the repositories `roots`: for each, its `commondir` target (relative to it) when that is a
+/// repository, every directory in its `worktrees`, and every repository below its `modules` (searched in turn the
+/// same way; a directory there that is not one is searched further).
+fn git_expand(roots: Vec<PathBuf>) -> io::Result<GitFound> {
+    use std::collections::BTreeSet;
+    let canon = |p: &Path| resolve_path(p, true).map_err(invalid);
     let too_many = || {
         invalid(
             "More than 4096 Git repositories and directories that hold them were found below the Git metadata. \
@@ -842,7 +859,7 @@ fn git_directories(workspace: &Path) -> io::Result<GitFound> {
     }
     while let Some(dir) = pending.pop() {
         let mut found = Vec::new();
-        if let Some(text) = pointer(&dir.join("commondir"))? {
+        if let Some(text) = git_pointer(&dir.join("commondir"))? {
             let target = canon(&dir.join(text.trim()))?;
             if is_repository(&target) {
                 found.push(target);
@@ -886,6 +903,8 @@ enum ConfigPath {
     HooksPath(String),
     /// `include.path` or `includeIf.<condition>.path`, whatever the condition
     Include(String),
+    /// `core.worktree`
+    WorkTree(String),
 }
 
 /// How long a configuration file this reading looks at can be; the rest of a longer one is not read.
@@ -945,6 +964,7 @@ fn config_paths(text: &str) -> Vec<ConfigPath> {
             let Some((name, has_sub)) = &section else { continue };
             match (name.as_str(), *has_sub, key.as_str()) {
                 ("core", false, "hookspath") => out.push(ConfigPath::HooksPath(value)),
+                ("core", false, "worktree") => out.push(ConfigPath::WorkTree(value)),
                 ("include", false, "path") | ("includeif", true, "path") => out.push(ConfigPath::Include(value)),
                 _ => {}
             }
@@ -1065,16 +1085,50 @@ fn read_config(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// A path as a configuration names it: `~/` is the home directory, a relative one is taken from `base`.
+/// The home directory of the user `name`, from the user database; `None` for a user that is not known.
+fn user_home(name: &str) -> Option<PathBuf> {
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    let name = CString::new(name).ok()?;
+    let mut size = 1024_usize;
+    loop {
+        let mut buf: Vec<libc::c_char> = vec![0; size];
+        // SAFETY: an all-zero `passwd` (null pointers, zero numbers) is a valid value; `getpwnam_r` fills it in.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `name` is a NUL-terminated string, `pwd` and `result` are valid for writes, and `buf` is valid for
+        // `buf.len()` bytes; on success the strings in `pwd` point into `buf`, which outlives their use below.
+        let rc = unsafe { libc::getpwnam_r(name.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+        if rc == libc::ERANGE && size < (1 << 20) {
+            size = size.saturating_mul(2);
+            continue;
+        }
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: `pw_dir` is non-null and points to a NUL-terminated string inside `buf`.
+        let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
+        let dir = Path::new(OsStr::from_bytes(dir.to_bytes()));
+        return dir.is_absolute().then(|| dir.to_path_buf());
+    }
+}
+
+/// A path as a configuration names it: `~/` is the home directory, `~<user>/` that user's (a user that is not
+/// known gives no path, never a relative one), any other relative one is taken from `base`.
 fn config_value_path(value: &str, home: Option<&Path>, base: &Path) -> Option<PathBuf> {
     if value.is_empty() {
         return None;
     }
-    if value == "~" {
-        return home.map(Path::to_path_buf);
-    }
-    if let Some(rest) = value.strip_prefix("~/") {
-        return home.map(|h| h.join(rest));
+    if let Some(tilde) = value.strip_prefix('~') {
+        let (user, rest) = match tilde.split_once('/') {
+            Some((user, rest)) => (user, Some(rest)),
+            None => (tilde, None),
+        };
+        let dir = if user.is_empty() { home.map(Path::to_path_buf) } else { user_home(user) }?;
+        return Some(match rest {
+            Some(rest) => dir.join(rest),
+            None => dir,
+        });
     }
     let path = Path::new(value);
     Some(if path.is_absolute() { path.to_path_buf() } else { base.join(path) })
@@ -1087,6 +1141,8 @@ struct ConfigFacts {
     hooks: Vec<String>,
     /// The files included, as written (absolute).
     includes: Vec<PathBuf>,
+    /// The raw `core.worktree` values.
+    worktrees: Vec<String>,
 }
 
 /// Read `files` and, in turn, the files they include (conditions ignored), each file once and at most
@@ -1103,6 +1159,7 @@ fn read_config_files(files: &[PathBuf], home: Option<&Path>) -> ConfigFacts {
         for item in config_paths(&text) {
             match item {
                 ConfigPath::HooksPath(value) => facts.hooks.push(value),
+                ConfigPath::WorkTree(value) => facts.worktrees.push(value),
                 ConfigPath::Include(value) => {
                     let Some(target) = config_value_path(&value, home, dir) else { continue };
                     push_unique(&mut facts.includes, target.clone());
@@ -1121,31 +1178,77 @@ fn read_config_files(files: &[PathBuf], home: Option<&Path>) -> ConfigFacts {
     facts
 }
 
-/// The top of the working tree that the repository `repo` belongs to: the parent of a `.git` directory or of the
-/// `.git` file a linked worktree's private gitdir names; for any other repository the repository itself.
-fn work_tree_top(repo: &Path) -> PathBuf {
+/// The tops of the working trees the repository `repo` may serve: the repository itself (what a relative path is
+/// joined to for a bare one), the parent of a `.git` directory, the working tree a linked worktree's private gitdir
+/// names in its `gitdir` file, and each `core.worktree` (`worktrees`, as its configuration wrote them), resolved
+/// from the repository.
+fn work_tree_tops(repo: &Path, worktrees: &[String]) -> Vec<PathBuf> {
     let is_dot_git = |p: &Path| p.file_name().is_some_and(|n| fold(&n.to_string_lossy()) == ".git");
+    let mut tops = vec![repo.to_path_buf()];
     if is_dot_git(repo) {
-        return repo.parent().unwrap_or(repo).to_path_buf();
+        push_unique(&mut tops, repo.parent().unwrap_or(repo).to_path_buf());
     }
     if std::fs::metadata(repo.join("commondir")).is_ok_and(|m| m.is_file()) {
         let small = std::fs::metadata(repo.join("gitdir")).is_ok_and(|m| m.is_file() && m.len() <= 4096);
         let text = if small { std::fs::read_to_string(repo.join("gitdir")).ok() } else { None };
         if let Some(file) = text.map(|t| repo.join(t.trim())).filter(|f| is_dot_git(f)) {
-            return file.parent().unwrap_or(repo).to_path_buf();
+            push_unique(&mut tops, file.parent().unwrap_or(repo).to_path_buf());
         }
     }
-    repo.to_path_buf()
+    for value in worktrees {
+        if let Some(top) = config_value_path(value, None, repo).and_then(|p| resolve_path(&p, true).ok()) {
+            push_unique(&mut tops, top);
+        }
+    }
+    tops
+}
+
+/// The repository Git finds when it looks up from the workspace's parent for a `.git` (a directory that is a
+/// repository, or a file whose `gitdir:` names one), with the repository its `commondir` names; empty when there is
+/// none, and the directory that holds the `.git` (a top its working tree may have). Nothing is protected for it
+/// unless it lies in a writable root; its configuration is read.
+fn enclosing_repositories(workspace: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
+    let mut dir = workspace.parent();
+    while let Some(d) = dir {
+        let dot_git = d.join(".git");
+        let repo = match std::fs::symlink_metadata(&dot_git) {
+            Ok(m) if m.is_dir() => Some(dot_git.clone()),
+            Ok(m) if m.is_file() && m.len() <= 4096 => std::fs::read_to_string(&dot_git)
+                .ok()
+                .and_then(|t| t.trim().strip_prefix("gitdir:").map(|t| d.join(t.trim()))),
+            _ => None,
+        };
+        if let Some(repo) = repo.and_then(|r| resolve_path(&r, true).ok()).filter(|r| is_repository(r)) {
+            let mut out = vec![repo.clone()];
+            if let Ok(Some(text)) = git_pointer(&repo.join("commondir")) {
+                if let Ok(common) = resolve_path(&repo.join(text.trim()), true) {
+                    if is_repository(&common) {
+                        out.push(common);
+                    }
+                }
+            }
+            return (out, Some(d.to_path_buf()));
+        }
+        dir = d.parent();
+    }
+    (Vec::new(), None)
 }
 
 /// The paths the Git configuration names that must not be written, as written (absolute; each is protected when it
 /// lies in a writable root): the hooks directory (`core.hooksPath`) and the files included (`include.path`,
-/// `includeIf.<condition>.path`) by the `config` and `config.worktree` of every repository in `repos` and by the
-/// user's global configuration, and that configuration itself, `~/.gitconfig` and the `git` directory of the XDG
-/// configuration (`$XDG_CONFIG_HOME/git`, else `~/.config/git`). A relative hooks path is taken from the top of the
-/// repository's working tree, for a global value from that of each repository; a relative include from the directory
-/// of the file that names it.
-fn git_config_paths(repos: &[PathBuf], home: Option<&Path>, xdg: Option<&Path>) -> Vec<PathBuf> {
+/// `includeIf.<condition>.path`) by the `config` and `config.worktree` of every repository in `repos` and `others`
+/// (the enclosing repository, whose own files are not protected here) and by the user's global configuration, and
+/// that configuration itself, `~/.gitconfig` and the `git` directory of the XDG configuration
+/// (`$XDG_CONFIG_HOME/git`, else `~/.config/git`). A relative hooks path, wherever it was read, is taken from the top
+/// of every working tree found (`work_tree_tops`), as one configuration serves several; a relative include from the
+/// directory of the file that names it.
+fn git_config_paths(
+    repos: &[PathBuf],
+    others: &[PathBuf],
+    extra_tops: &[PathBuf],
+    home: Option<&Path>,
+    xdg: Option<&Path>,
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut global_files = Vec::new();
     if let Some(home) = home {
@@ -1162,22 +1265,50 @@ fn git_config_paths(repos: &[PathBuf], home: Option<&Path>, xdg: Option<&Path>) 
     }
     let global = read_config_files(&global_files, home);
     out.extend(global.includes.iter().cloned());
-    for repo in repos {
-        let top = work_tree_top(repo);
+    let mut hooks: Vec<String> = Vec::new();
+    let mut tops: Vec<PathBuf> = extra_tops.to_vec();
+    for repo in repos.iter().chain(others) {
         let facts = read_config_files(&[repo.join("config"), repo.join("config.worktree")], home);
         out.extend(facts.includes);
-        for value in facts.hooks.iter().chain(&global.hooks) {
-            out.extend(config_value_path(value, home, &top));
+        for value in facts.hooks {
+            push_unique(&mut hooks, value);
+        }
+        for top in work_tree_tops(repo, &facts.worktrees) {
+            push_unique(&mut tops, top);
+        }
+    }
+    for value in global.hooks {
+        push_unique(&mut hooks, value);
+    }
+    for value in &hooks {
+        if value.starts_with('~') || Path::new(value).is_absolute() {
+            out.extend(config_value_path(value, home, Path::new("/")));
+            continue;
+        }
+        for top in &tops {
+            out.extend(config_value_path(value, home, top));
         }
     }
     out
 }
 
 /// The repositories `found` that are given to Bubblewrap as a whole: all but those that are or contain the loom home
-/// or the user's home directory, which a pointer could name to mount back what Bubblewrap hides there.
-fn mountable(found: &[PathBuf], loom_home: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+/// or the user's home directory, and those that lie inside the loom home, or inside the user's home while
+/// credentials are protected (`hidden_home`), unless they lie in a writable root: a pointer could name one to mount
+/// back what Bubblewrap hides there.
+fn mountable(
+    found: &[PathBuf],
+    loom_home: &Path,
+    home: Option<&Path>,
+    hidden_home: bool,
+    writable: &[PathBuf],
+) -> Vec<PathBuf> {
     let holds = |repo: &Path| under(loom_home, repo) || home.is_some_and(|h| under(h, repo));
-    found.iter().filter(|repo| !holds(repo)).cloned().collect()
+    let hidden = |repo: &Path| {
+        (under(repo, loom_home) || (hidden_home && home.is_some_and(|h| under(repo, h))))
+            && !writable.iter().any(|root| under(repo, root))
+    };
+    found.iter().filter(|repo| !holds(repo) && !hidden(repo)).cloned().collect()
 }
 
 /// macOS names the folders of the data volume `/System/Volumes/Data/...` as well, and `realpath` keeps that
@@ -1468,8 +1599,22 @@ impl Sandbox {
             }
         }
 
-        let GitFound { repos: found, modules: git_modules } = git_directories(&workspace)?;
-        let git_dirs = mountable(&found, &loom_home, home.as_deref());
+        let GitFound { repos: mut found, modules: mut git_modules } = git_directories(&workspace)?;
+        // The repository that encloses the workspace: its configuration is read; its own files are protected only
+        // where it lies in a writable root.
+        let (mut enclosing, enclosing_top) = enclosing_repositories(&workspace);
+        if enclosing.iter().any(|repo| writable.iter().any(|root| under(repo, root))) {
+            let more = git_expand(std::mem::take(&mut enclosing))?;
+            for repo in more.repos {
+                push_unique(&mut found, repo);
+            }
+            for repo in more.modules {
+                push_unique(&mut git_modules, repo);
+            }
+            found.sort();
+            git_modules.sort();
+        }
+        let git_dirs = mountable(&found, &loom_home, home.as_deref(), cfg.protect_credentials, &writable);
         let mut protected = vec![canon(&workspace.join(".loom"))?, loom_home.clone()];
         push_unique(&mut protected, workspace.join(".loom"));
         for dir in &found {
@@ -1480,7 +1625,9 @@ impl Sandbox {
             }
         }
         // What a configuration makes Git run or read: the hooks directory and the files it includes.
-        for path in git_config_paths(&found, home.as_deref(), xdg_config_home.as_deref()) {
+        for path in
+            git_config_paths(&found, &enclosing, enclosing_top.as_slice(), home.as_deref(), xdg_config_home.as_deref())
+        {
             for form in [Some(canon(&path)?), lexical(&path)].into_iter().flatten() {
                 if writable.iter().any(|root| under(&form, root)) {
                     push_unique(&mut protected, form);
@@ -1718,7 +1865,13 @@ impl Sandbox {
         push_unique(&mut replay.unreadable, secrets);
         let found = git_directories(&workspace)
             .map_err(|e| format!("Replay Git metadata cannot be protected: {e}. Inspect the staged workspace."))?;
-        replay.git_dirs = mountable(&found.repos, &self.loom_home, self.home.as_deref());
+        replay.git_dirs = mountable(
+            &found.repos,
+            &self.loom_home,
+            self.home.as_deref(),
+            !self.credentials.is_empty(),
+            &replay.writable,
+        );
         replay.git_modules = found.modules;
         if replay.mode == SandboxMode::Bubblewrap {
             replay.linux_pins = linux::pin(
@@ -4554,9 +4707,9 @@ mod tests {
     }
 
     #[test]
-    fn discovery_finds_every_repository_in_the_workspace_and_bare_ones_are_not_searched_further() {
+    fn discovery_finds_every_repository_in_the_workspace_and_searches_below_bare_ones() {
         let f = fx();
-        // A bare repository the operator made, and a `.git` directory inside it that is no concern of Git's.
+        // A bare repository the operator made, and a `.git` directory inside it (found too: the search goes on).
         let bare = f.ws.join("fixtures/remote.git");
         std::fs::create_dir_all(bare.join("objects")).expect("mkdir");
         std::fs::create_dir_all(bare.join("hooks")).expect("mkdir");
@@ -4566,9 +4719,12 @@ mod tests {
         std::fs::create_dir_all(f.ws.join("almost")).expect("mkdir");
         std::fs::write(f.ws.join("almost/HEAD"), "x").expect("write");
         let found = git_directories(&f.ws).expect("found");
-        assert_eq!(found.repos, std::slice::from_ref(&bare));
+        // The search goes on below a bare repository: its `.git` directory is found as any other.
+        let mut want = vec![bare.clone(), bare.join("deeper/.git")];
+        want.sort();
+        assert_eq!(found.repos, want);
         let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
-        assert_eq!(sb.git_dirs, std::slice::from_ref(&bare));
+        assert_eq!(sb.git_dirs, want);
         assert!(sb.protected.contains(&bare.join("hooks")) && sb.protected.contains(&bare.join("config")));
         for hook in ["hooks/pre-receive", "config"] {
             assert!(sb.check_write(&bare.join(hook)).is_err(), "{hook}");
@@ -5294,13 +5450,320 @@ mod tests {
         {
             assert!(sb.protected.contains(&protected), "{}: {:?}", protected.display(), sb.protected);
         }
-        assert!(!sb.protected.contains(&f.ws.join("wt-hooks")), "{:?}", sb.protected);
-        assert_eq!(work_tree_top(&git), f.ws);
-        assert_eq!(work_tree_top(&private), top);
-        assert_eq!(work_tree_top(&bare), bare);
+        // One configuration serves every working tree, so a hooks path read in one is joined to each top.
+        // Every top a repository may serve (the repository itself among them, for a bare one).
+        assert_eq!(work_tree_tops(&git, &[]), [git.clone(), f.ws.clone()]);
+        assert_eq!(work_tree_tops(&private, &[]), [private.clone(), top.clone()]);
+        assert_eq!(work_tree_tops(&bare, &[]), std::slice::from_ref(&bare));
+        // One configuration serves every working tree: the main repository's hooks path protects the linked one.
+        assert!(sb.protected.contains(&top.join("main-hooks")), "{:?}", sb.protected);
         // The same, as the file tools' and the profile's rules.
         refused_as_protected(&sb, &top.join("wt-hooks/post-merge"));
         refused_as_protected(&sb, &bare.join("rel/pre-receive"));
+    }
+
+    /// A sandbox of `mode` for the workspace `ws` (made with a `.loom` directory), in the fixture's other places.
+    fn build_ws(f: &Fx, ws: &Path, mode: SandboxMode) -> Sandbox {
+        std::fs::create_dir_all(ws.join(".loom")).expect("mkdir");
+        Sandbox::new(&cfg(mode), ws, &f.tmp, &f.home, None).expect("sandbox")
+    }
+
+    /// Under the sandbox `sb` a command in `cwd` writes `<rel>/.husky/post-checkout`, which touches `marker`; then the
+    /// operator (outside it) runs `git checkout -b` in `checkout`. (the command succeeded, the hook ran)
+    fn plant_husky_and_checkout(sb: &Sandbox, cwd: &Path, rel: &str, checkout: &Path, marker: &Path) -> (bool, bool) {
+        let plant = format!(
+            "mkdir -p {rel}/.husky && printf '#!/bin/sh\\ntouch {}\\n' > {rel}/.husky/post-checkout && \
+             chmod +x {rel}/.husky/post-checkout",
+            s(marker)
+        );
+        let (planted, _) = run(sb, cwd, &format!("{GIT_SH}{plant}"));
+        git_ok(checkout, &["checkout", "-q", "-b", "x"]);
+        (planted, marker.exists())
+    }
+
+    /// The reproduction of a real-Git case: `make` builds the fixture (false when Git cannot) and returns where the
+    /// workspace is, where a command plants, and where the operator checks out. Without the profile the hook must
+    /// run (else the case is skipped); under it nothing is planted and nothing runs. Also returns the profile's
+    /// sandbox for further checks.
+    fn husky_case(test: &str, make: impl Fn(&Fx) -> Option<(PathBuf, String, PathBuf)>) -> Option<()> {
+        if !available() || !git_runs() {
+            return None;
+        }
+        let attempt = |mode: SandboxMode| -> Option<(bool, bool)> {
+            let f = fx();
+            let (ws, rel, checkout) = make(&f)?;
+            let sb = build_ws(&f, &ws, mode);
+            let marker = f.root.join("husky-ran");
+            Some(plant_husky_and_checkout(&sb, &ws, &rel, &checkout, &marker))
+        };
+        match attempt(SandboxMode::None) {
+            None => {
+                skipped(test, "git cannot make the fixture");
+                return None;
+            }
+            Some((true, true)) => {}
+            Some(other) => {
+                skipped(test, &format!("the hook does not run here: {other:?}"));
+                return None;
+            }
+        }
+        assert_eq!(attempt(SandboxMode::Seatbelt), Some((false, false)), "{test}: the planted hook ran");
+        Some(())
+    }
+
+    #[test]
+    fn core_worktree_of_a_submodule_repository_names_the_top_its_hooks_path_is_joined_to() {
+        let f = fx();
+        let uhome = f.root.join("uhome");
+        std::fs::create_dir_all(&uhome).expect("mkdir");
+        let git = f.ws.join(".git");
+        hand_repo(&git, "");
+        hand_repo(&git.join("modules/n"), "[core]\n\tworktree = ../../../n\n\thooksPath = .husky\n");
+        std::fs::create_dir_all(f.ws.join("n")).expect("mkdir");
+        let sb = build_env(&f, &uhome, None);
+        assert!(sb.protected.contains(&f.ws.join("n/.husky")), "{:?}", sb.protected);
+        // The old join, from the repository itself, stays.
+        assert!(sb.protected.contains(&git.join("modules/n/.husky")), "{:?}", sb.protected);
+        refused_as_protected(&sb, &f.ws.join("n/.husky/post-checkout"));
+        assert_eq!(
+            work_tree_tops(&git.join("modules/n"), &["../../../n".to_string()]),
+            [git.join("modules/n"), f.ws.join("n")]
+        );
+        // An absolute `core.worktree` is taken as it is.
+        let elsewhere = f.ws.join("abs");
+        assert!(work_tree_tops(&git, &[s(&elsewhere).to_string()]).contains(&elsewhere));
+    }
+
+    #[test]
+    fn a_real_submodules_hooks_path_protects_the_submodule_and_its_hook_does_not_run() {
+        let test = "a_real_submodules_hooks_path_protects_the_submodule_and_its_hook_does_not_run";
+        let made = husky_case(test, |f| {
+            let src = f.root.join("subsrc");
+            std::fs::create_dir_all(&src).expect("mkdir");
+            let steps = git_ok(&src, &["init", "-q"])
+                && git_ok(&src, &["commit", "-q", "--allow-empty", "-m", "s"])
+                && git_ok(&f.ws, &["init", "-q"])
+                && git_ok(&f.ws, &["commit", "-q", "--allow-empty", "-m", "i"])
+                && git_ok(&f.ws, &["submodule", "add", "-q", s(&src), "sm"])
+                && git_ok(&f.ws, &["commit", "-q", "-m", "sm"])
+                && git_ok(&f.ws.join("sm"), &["config", "core.hooksPath", ".husky"]);
+            steps.then(|| (f.ws.clone(), "sm".to_string(), f.ws.join("sm")))
+        });
+        if made.is_none() {
+            return;
+        }
+        let f = fx();
+        let src = f.root.join("subsrc");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        let ok = git_ok(&src, &["init", "-q"])
+            && git_ok(&src, &["commit", "-q", "--allow-empty", "-m", "s"])
+            && git_ok(&f.ws, &["init", "-q"])
+            && git_ok(&f.ws, &["commit", "-q", "--allow-empty", "-m", "i"])
+            && git_ok(&f.ws, &["submodule", "add", "-q", s(&src), "sm"])
+            && git_ok(&f.ws.join("sm"), &["config", "core.hooksPath", ".husky"]);
+        assert!(ok);
+        let sb = build_ws(&f, &f.ws, SandboxMode::Seatbelt);
+        refused_as_protected(&sb, &f.ws.join("sm/.husky/post-checkout"));
+        assert!(!run(&sb, &f.ws, "mkdir -p sm/.husky").0);
+    }
+
+    #[test]
+    fn a_common_configs_hooks_path_protects_the_linked_worktree_that_is_the_workspace() {
+        let test = "a_common_configs_hooks_path_protects_the_linked_worktree_that_is_the_workspace";
+        // Hand-made: the common configuration is the main repository's, the workspace the linked worktree.
+        let f = fx();
+        let uhome = f.root.join("uhome");
+        std::fs::create_dir_all(&uhome).expect("mkdir");
+        let (main, wt) = (f.root.join("main"), f.root.join("wt"));
+        let private = main.join(".git/worktrees/wt");
+        hand_repo(&main.join(".git"), "[core]\nhooksPath = .husky\n");
+        std::fs::create_dir_all(&private).expect("mkdir");
+        std::fs::create_dir_all(wt.join(".loom")).expect("mkdir");
+        std::fs::write(private.join("HEAD"), "ref: refs/heads/w\n").expect("write");
+        std::fs::write(private.join("commondir"), "../..\n").expect("write");
+        std::fs::write(private.join("gitdir"), format!("{}/.git\n", s(&wt))).expect("write");
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", s(&private))).expect("write");
+        let sb = Sandbox::with_env(&cfg(SandboxMode::Seatbelt), &wt, &f.tmp, &f.home, None, Some(uhome), None)
+            .expect("sandbox");
+        assert!(sb.protected.contains(&wt.join(".husky")), "{:?}", sb.protected);
+        refused_as_protected(&sb, &wt.join(".husky/post-checkout"));
+        // With real Git.
+        husky_case(test, |f| {
+            let (main, wt) = (f.root.join("main"), f.root.join("wt"));
+            std::fs::create_dir_all(&main).expect("mkdir");
+            let ok = git_ok(&main, &["init", "-q"])
+                && git_ok(&main, &["commit", "-q", "--allow-empty", "-m", "i"])
+                && git_ok(&main, &["config", "core.hooksPath", ".husky"])
+                && git_ok(&main, &["worktree", "add", "-q", "-b", "w", s(&wt)]);
+            ok.then(|| (wt.clone(), ".".to_string(), wt))
+        });
+    }
+
+    #[test]
+    fn a_planted_bare_shape_does_not_hide_what_lies_below_it() {
+        let f = fx();
+        let uhome = f.root.join("uhome");
+        std::fs::create_dir_all(&uhome).expect("mkdir");
+        let git = f.ws.join(".git");
+        hand_repo(&git, "[core]\nhooksPath = .husky\n");
+        hand_repo(&git.join("modules/sub"), "[core]\nworktree = ../../../sub\nhooksPath = .sub-hooks\n");
+        hand_repo(&f.ws.join("vendor/inner/.git"), "[core]\nhooksPath = .vh\n");
+        // What a command writes under the profile: `HEAD` and `objects` at the root and where a repository lies below.
+        let shape = "echo ref: refs/heads/x > HEAD && mkdir objects && echo ref: refs/heads/x > vendor/HEAD && \
+                     mkdir vendor/objects && mkdir vendor/objects/pack";
+        if available() {
+            let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+            let (ok, text) = run(&sb, &f.ws, shape);
+            assert!(ok, "{text}");
+        } else {
+            for (file, dir) in [("HEAD", "objects"), ("vendor/HEAD", "vendor/objects")] {
+                std::fs::write(f.ws.join(file), "ref: refs/heads/x\n").expect("write");
+                std::fs::create_dir_all(f.ws.join(dir)).expect("mkdir");
+            }
+        }
+        assert!(is_repository(&f.ws) && is_repository(&f.ws.join("vendor")), "the shape is a repository");
+        let found = git_directories(&f.ws).expect("found");
+        for repo in [git.clone(), git.join("modules/sub"), f.ws.join("vendor/inner/.git")] {
+            assert!(found.repos.contains(&repo), "{} is not in {:?}", repo.display(), found.repos);
+        }
+        // A directory with a `.git` is no bare repository (one without, such as `vendor` here, counts as one).
+        assert!(!found.repos.contains(&f.ws), "{:?}", found.repos);
+        let sb = build_env(&f, &uhome, None);
+        assert!(sb.git_dirs.contains(&git), "{:?}", sb.git_dirs);
+        for protected in [".husky", ".vh", "vendor/inner/.vh", "sub/.sub-hooks"] {
+            assert!(sb.protected.contains(&f.ws.join(protected)), "{protected}: {:?}", sb.protected);
+        }
+        refused_as_protected(&sb, &f.ws.join(".husky/post-checkout"));
+        refused_as_protected(&sb, &git.join("modules/sub/hooks/x"));
+    }
+
+    #[test]
+    fn the_search_goes_on_below_a_bare_repository_but_not_into_its_objects() {
+        let f = fx();
+        let bare = f.ws.join("fixtures/remote.git");
+        hand_repo(&bare, "");
+        hand_repo(&bare.join("sub/.git"), "");
+        hand_repo(&bare.join("objects/zz/.git"), "");
+        let found = git_directories(&f.ws).expect("found");
+        let mut want = vec![bare.join("sub/.git"), bare.clone()];
+        want.sort();
+        assert_eq!(found.repos, want);
+    }
+
+    #[test]
+    fn a_user_name_in_a_value_is_looked_up_and_an_unknown_one_names_nothing() {
+        let Some((name, dir)) = current_user() else { return };
+        let base = Path::new("/base");
+        assert_eq!(config_value_path(&format!("~{name}/x/y"), None, base), Some(dir.join("x/y")));
+        assert_eq!(config_value_path(&format!("~{name}"), None, base), Some(dir.clone()));
+        for unknown in ["~no-such-user-loom-3f9a/x", "~no-such-user-loom-3f9a"] {
+            assert_eq!(config_value_path(unknown, Some(Path::new("/h")), base), None, "{unknown}");
+        }
+        assert_eq!(config_value_path("~/x", Some(Path::new("/h")), base), Some(PathBuf::from("/h/x")));
+        // A workspace in the user's home, named as `~<user>/…/.husky`.
+        let Ok(tmp) = tempfile::Builder::new().prefix("loom-sbx-").tempdir_in(&dir) else { return };
+        let ws = tmp.path().canonicalize().expect("canonical");
+        let f = fx();
+        let rel = tmp.path().strip_prefix(&dir).expect("under home").to_path_buf();
+        hand_repo(&ws.join(".git"), &format!("[core]\nhooksPath = ~{name}/{}/.husky\n", rel.display()));
+        std::fs::create_dir_all(ws.join(".loom")).expect("mkdir");
+        let c = SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) };
+        let sb = Sandbox::with_env(&c, &ws, &f.tmp, &f.home, None, Some(dir), None).expect("sandbox");
+        assert!(sb.protected.contains(&ws.join(".husky")), "{:?}", sb.protected);
+        refused_as_protected(&sb, &ws.join(".husky/post-checkout"));
+        // An unknown user protects nothing.
+        hand_repo(&ws.join(".git"), "[core]\nhooksPath = ~no-such-user-loom-3f9a/.husky\n");
+        let sb = Sandbox::with_env(&c, &ws, &f.tmp, &f.home, None, Some(PathBuf::from("/nonexistent")), None)
+            .expect("sandbox");
+        assert!(!sb.protected.contains(&ws.join("~no-such-user-loom-3f9a/.husky")), "{:?}", sb.protected);
+    }
+
+    /// The name and home directory of the user running the tests, from the user database.
+    fn current_user() -> Option<(String, PathBuf)> {
+        use std::ffi::{CStr, OsStr};
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf: Vec<libc::c_char> = vec![0; 4096];
+        // SAFETY: an all-zero `passwd` is a valid value for `getpwuid_r` to fill in.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `pwd` and `result` are valid for writes and `buf` for `buf.len()` bytes, which outlive the use below.
+        let rc = unsafe { libc::getpwuid_r(libc::getuid(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+        if rc != 0 || result.is_null() || pwd.pw_name.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: both pointers are non-null and point to NUL-terminated strings inside `buf`.
+        let (name, dir) = unsafe { (CStr::from_ptr(pwd.pw_name), CStr::from_ptr(pwd.pw_dir)) };
+        let dir = PathBuf::from(OsStr::from_bytes(dir.to_bytes()));
+        dir.is_absolute().then(|| (name.to_string_lossy().into_owned(), dir))
+    }
+
+    #[test]
+    fn the_configuration_of_the_repository_that_encloses_the_workspace_is_read_not_protected() {
+        let test = "the_configuration_of_the_repository_that_encloses_the_workspace_is_read_not_protected";
+        let f = fx();
+        let (mono, app) = (f.root.join("mono"), f.root.join("mono/app"));
+        hand_repo(&mono.join(".git"), "[core]\nhooksPath = app/.husky\n");
+        let sb = build_ws(&f, &app, SandboxMode::Seatbelt);
+        assert!(sb.protected.contains(&app.join(".husky")), "{:?}", sb.protected);
+        refused_as_protected(&sb, &app.join(".husky/post-checkout"));
+        // Its own files are outside the writable roots: not in `git_dirs`, not protected.
+        assert!(sb.git_dirs.is_empty(), "{:?}", sb.git_dirs);
+        assert!(!sb.protected.iter().any(|p| p.starts_with(mono.join(".git"))), "{:?}", sb.protected);
+        // Where the repository lies in a writable root it is found like any other.
+        let c = SandboxCfg { extra_writable: vec![s(&mono).to_string()], ..cfg(SandboxMode::Seatbelt) };
+        let sb = Sandbox::new(&c, &app, &f.tmp, &f.home, None).expect("sandbox");
+        assert!(sb.git_dirs.contains(&mono.join(".git")), "{:?}", sb.git_dirs);
+        assert!(sb.protected.contains(&mono.join(".git/hooks")), "{:?}", sb.protected);
+        // A `.git` file that names a repository counts too, and a `.git` that names none is passed over.
+        let f = fx();
+        let mono = f.root.join("mono");
+        hand_repo(&f.root.join("store"), "[core]\nhooksPath = bad/app/.husky2\n");
+        std::fs::create_dir_all(mono.join("bad")).expect("mkdir");
+        std::fs::write(mono.join(".git"), format!("gitdir: {}\n", s(&f.root.join("store")))).expect("write");
+        std::fs::write(mono.join("bad/.git"), "gitdir: /nonexistent\n").expect("write");
+        let sb = build_ws(&f, &mono.join("bad/app"), SandboxMode::Seatbelt);
+        assert!(sb.protected.contains(&mono.join("bad/app/.husky2")), "{:?}", sb.protected);
+        // With real Git, a hook under the workspace subdirectory does not run.
+        husky_case(test, |f| {
+            let mono = f.root.join("mono");
+            std::fs::create_dir_all(mono.join("app")).expect("mkdir");
+            let ok = git_ok(&mono, &["init", "-q"])
+                && git_ok(&mono, &["commit", "-q", "--allow-empty", "-m", "i"])
+                && git_ok(&mono, &["config", "core.hooksPath", "app/.husky"]);
+            ok.then(|| (mono.join("app"), ".".to_string(), mono.join("app")))
+        });
+    }
+
+    #[test]
+    fn a_repository_inside_a_hidden_home_is_not_mounted_unless_it_lies_in_a_writable_root() {
+        let (loom, home) = (PathBuf::from("/l/home"), PathBuf::from("/u/home"));
+        let ws = home.join("proj");
+        let repos = [
+            loom.join("sessions/s/repo.git"),
+            home.join("other/.git"),
+            ws.join(".git"),
+            PathBuf::from("/srv/outer/.git"),
+            home.join(".git"),
+            PathBuf::from("/l"),
+        ];
+        let writable = [ws.clone()];
+        // Credentials protected: the home is hidden, so a repository inside it is mounted only when it lies in a
+        // writable root; one that holds a home is never.
+        assert_eq!(
+            mountable(&repos, &loom, Some(&home), true, &writable),
+            [ws.join(".git"), PathBuf::from("/srv/outer/.git")]
+        );
+        // Credentials not protected: the user's home is not hidden; the loom home always is.
+        assert_eq!(
+            mountable(&repos, &loom, Some(&home), false, &writable),
+            [home.join("other/.git"), ws.join(".git"), PathBuf::from("/srv/outer/.git"), home.join(".git")]
+        );
+        // A repository in the loom home that lies in a writable root (a replay's staged workspace) stays.
+        let staged = [loom.join("oracle-runs/r/ws")];
+        assert_eq!(
+            mountable(&[loom.join("oracle-runs/r/ws/.git")], &loom, Some(&home), true, &staged),
+            [loom.join("oracle-runs/r/ws/.git")]
+        );
     }
 
     /// The husky case: the operator's Git runs `.husky/post-checkout`, which a command wrote. Whether the hook ran
