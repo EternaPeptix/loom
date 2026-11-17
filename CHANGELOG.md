@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Sandbox: macOS developer-tool stubs keep a lookup cache of the session's own
+
+- In seatbelt mode commands get `xcrun_db=<session temp dir>/.xcrun_db`. `/usr/bin/python3`, `git`, `clang`,
+  `make` and the other developer-tool stubs find their tool in a per-user cache,
+  `$(getconf DARWIN_USER_TEMP_DIR)xcrun_db`; when it lacked the tool (cleaned, reset after an Xcode update, or
+  never used with that `SDKROOT`/`DEVELOPER_DIR`) the stub tried to write a new cache beside it, the sandbox
+  refused, and every run printed `python3: error: couldn't create cache file '…' (errno=Operation not permitted)`
+  on stderr before the tool's own output. That line reached the agent and broke anything that compares output
+  exactly (on 512S1 two tests failed until an unsandboxed `python3` filled the cache; reproduced on macOS 26.5
+  and 27 by moving the cache aside). Now the stubs fill and read a cache in the session's temp dir; the
+  operator's cache stays unwritable, so a session cannot point the operator's own `git` at a program of its
+  choosing. The first use of each stub in a session looks it up with `xcodebuild -find` (about half a second).
+  The profile, and modes `none` and `bubblewrap`, are unchanged. The sandbox tests' commands get the variables
+  `env` adds (they inherited the test runner's environment, and with it the operator's cache).
+
 ### Stored outputs are the mission's own
 
 - `out_read`, `out_grep`, `pin`, `evidence` and `finish` quotes, `security_record` secret handles,
