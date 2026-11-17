@@ -176,13 +176,13 @@
 //! until the destination closes is cut: the relay ends with the bytes that carried its head, or at once
 //! when they have already been relayed.
 
-use crate::policy::{normalize_host, Policy};
+use crate::policy::{is_local_literal, normalize_host, Policy, Verdict};
 use base64::Engine as _;
 use loom_core::event::NetDecision;
 use loom_core::SessionId;
 use rand::RngExt;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -363,9 +363,21 @@ struct Shared {
     unattributed: Mutex<Budget>,
     /// The tasks that serve or refuse a connection.
     tasks: TaskTracker,
+    /// The ports of the proxy's own listeners: the shared one and every session's (kept bound after a
+    /// revoke). A connection to one of them is refused whatever the policy says.
+    own_ports: Mutex<HashSet<u16>>,
 }
 
 impl Shared {
+    /// The verdict on one resolved address: refused when it reaches one of the proxy's own listeners
+    /// (a loopback or unspecified address with an own port), else the policy's.
+    fn check_addr(&self, policy: &Policy, host: &str, port: u16, ip: IpAddr, name_rule: &str) -> Verdict {
+        if is_local_literal(ip) && lock(&self.own_ports).contains(&port) {
+            return Verdict { allowed: false, rule: format!("deny the egress proxy's own port {port}") };
+        }
+        policy.check_addr(host, port, ip, name_rule)
+    }
+
     /// Registers a new connection, which has not sent its head yet, as pending; returns its id and the
     /// token that closes it.
     fn add_pending(&self, permit: OwnedSemaphorePermit) -> (u64, CancellationToken) {
@@ -476,7 +488,8 @@ struct Inner {
     port: u16,
     shared: Arc<Shared>,
     cancel: CancellationToken,
-    /// The session listeners: session id to its port and the token that closes it (a child of `cancel`).
+    /// The session listeners: session id to its port and its token (a child of `cancel`). A listener
+    /// stays bound, whatever happens to the session's grant, until the proxy stops.
     listeners: Mutex<HashMap<String, (u16, CancellationToken)>>,
 }
 
@@ -531,6 +544,7 @@ impl Proxy {
             refusals: semaphore(REFUSALS),
             unattributed: Mutex::new(Budget { since: std::time::Instant::now(), used: 0, left_out: 0 }),
             tasks: TaskTracker::new(),
+            own_ports: Mutex::new(HashSet::from([bound])),
         });
         let cancel = CancellationToken::new();
         tokio::spawn(accept_loop(listener, shared.clone(), cancel.clone(), cancel.clone(), Origin::Shared));
@@ -544,6 +558,10 @@ impl Proxy {
 
     /// The port of the session's own listener while it holds a command grant.
     pub fn session_port(&self, session: &SessionId) -> Option<u16> {
+        let held = lock(&self.inner.shared.sessions).get(session.as_str()).is_some_and(|e| !e.reference);
+        if !held {
+            return None;
+        }
         lock(&self.inner.listeners).get(session.as_str()).filter(|(_, t)| !t.is_cancelled()).map(|(p, _)| *p)
     }
 
@@ -574,6 +592,7 @@ impl Proxy {
             token.clone(),
             Origin::Session(session.clone()),
         ));
+        lock(&self.inner.shared.own_ports).insert(port);
         listeners.insert(session.as_str().to_string(), (port, token));
         Ok(port)
     }
@@ -637,11 +656,9 @@ impl Proxy {
         lock(&self.inner.shared.sessions).get(session.as_str()).map(|e| e.policy.check_name(host, port))
     }
 
+    /// Drops the session's credentials. Its listener stays bound and answers `407` (see the module contract).
     pub fn revoke(&self, session: &SessionId) {
         lock(&self.inner.shared.sessions).retain(|_, entry| &entry.session != session);
-        if let Some((_, token)) = lock(&self.inner.listeners).remove(session.as_str()) {
-            token.cancel();
-        }
     }
 
     /// Stop accepting connections. Open tunnels are closed.
@@ -1193,7 +1210,7 @@ async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<(TcpStream, Allo
     let mut first_refusal: Option<(String, IpAddr)> = None;
     let mut first_failure: Option<(String, IpAddr, String)> = None;
     for ip in addrs {
-        let cv = policy.check_addr(cx.host, cx.port, ip, &name_rule);
+        let cv = cx.shared.check_addr(policy, cx.host, cx.port, ip, &name_rule);
         if !cv.allowed {
             first_refusal.get_or_insert((cv.rule, ip));
             continue;
@@ -1246,7 +1263,7 @@ async fn check(client: &mut TcpStream, cx: &Ctx<'_>, policy: &Policy, slot: Owne
         // The first address the policy allows, else the first refusal.
         addrs.and_then(|addrs| {
             let mut checked =
-                addrs.into_iter().map(|ip| (policy.check_addr(cx.host, cx.port, ip, &name.rule), Some(ip)));
+                addrs.into_iter().map(|ip| (cx.shared.check_addr(policy, cx.host, cx.port, ip, &name.rule), Some(ip)));
             let first = checked.next().ok_or("the name has no addresses")?;
             Ok(if first.0.allowed { first } else { checked.find(|(v, _)| v.allowed).unwrap_or(first) })
         })
@@ -2619,12 +2636,8 @@ mod tests {
         let garbage = raw(g.port, b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nProxy-Authorization: Basic !!!\r\n\r\n").await;
         assert_eq!(status(&garbage), 407);
         p.revoke(&sid);
-        // The session's listener is closed; its credentials are unknown elsewhere.
-        let deadline = tokio::time::Instant::now() + T;
-        while TcpStream::connect(("127.0.0.1", g.port)).await.is_ok() {
-            assert!(tokio::time::Instant::now() < deadline, "the revoked listener still accepts");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // The session's listener stays bound and refuses its old credentials; they are unknown elsewhere.
+        assert_eq!(status(&raw(g.port, connect_req(&g, "127.0.0.1:9").as_bytes()).await), 407);
         assert_eq!(status(&raw(p.port(), connect_req(&g, "127.0.0.1:9").as_bytes()).await), 407);
         no_more(&mut rx);
     }
@@ -3634,6 +3647,21 @@ mod tests {
         lock(seen).iter().map(|(s, d)| (s.as_ref().map(|s| s.as_str().to_string()), d.rule.clone())).collect()
     }
 
+    /// A destination that counts the connections it accepts.
+    async fn counting_server() -> (u16, Arc<AtomicU64>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let count = Arc::new(AtomicU64::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                drop(s);
+            }
+        });
+        (port, count)
+    }
+
     #[tokio::test]
     async fn each_session_has_its_own_listener_and_foreign_credentials_get_407() {
         let (p, _rx, seen) = start_audited(false, Limits::default(), None).await;
@@ -3649,9 +3677,12 @@ mod tests {
         assert_eq!(status(&raw(ga.port, connect_req(&ga, &dest).as_bytes()).await), 200);
         assert_eq!(status(&raw(gb.port, connect_req(&gb, &dest).as_bytes()).await), 200);
         // B's valid credentials on A's port: 407, nothing connected, one refusal recorded for A naming B.
-        let r = raw(ga.port, connect_req(&gb, &dest).as_bytes()).await;
+        let (counted, accepted) = counting_server().await;
+        let r = raw(ga.port, connect_req(&gb, &format!("127.0.0.1:{counted}")).as_bytes()).await;
         assert_eq!(status(&r), 407, "{r}");
         assert!(r.contains("Proxy-Authenticate: Basic"), "{r}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 0, "the destination listener accepted a connection");
         let refusals = |seen: &Seen| -> Vec<(Option<String>, String)> {
             audited(seen).into_iter().filter(|(_, rule)| rule.starts_with("proxy authentication failed")).collect()
         };
@@ -3718,8 +3749,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revoke_closes_the_session_listener_and_shutdown_closes_all() {
+    async fn revoke_keeps_the_listener_bound_and_shutdown_closes_all() {
         let (p, _rx) = start().await;
+        let echo = echo_server().await;
         let (a, b) = (SessionId::from("s-rv-a"), SessionId::from("s-rv-b"));
         let (ga, gb) = (p.grant(&a, lab()).unwrap(), p.grant(&b, lab()).unwrap());
         let gone = async |port: u16| {
@@ -3736,13 +3768,63 @@ mod tests {
         };
         assert!(TcpStream::connect(("127.0.0.1", ga.port)).await.is_ok());
         p.revoke(&a);
-        assert!(gone(ga.port).await, "the listener of a revoked session still accepts");
+        // The port still accepts, answers 407 to the old credentials, and the session holds no port.
+        let dest = format!("127.0.0.1:{echo}");
+        let r = raw(ga.port, connect_req(&ga, &dest).as_bytes()).await;
+        assert_eq!(status(&r), 407, "{r}");
         assert_eq!(p.session_port(&a), None);
+        // 20 new sessions never get A's port.
+        for i in 0..20 {
+            let g = p.grant(&SessionId::from(format!("s-rv-new-{i}").as_str()), lab()).unwrap();
+            assert_ne!(g.port, ga.port);
+        }
+        // A later grant of A uses the same listener, and the old password does not work.
+        let again = p.grant(&a, lab()).unwrap();
+        assert_eq!(again.port, ga.port);
+        assert_eq!(p.session_port(&a), Some(ga.port));
+        assert_eq!(status(&raw(again.port, connect_req(&ga, &dest).as_bytes()).await), 407);
+        assert_eq!(status(&raw(again.port, connect_req(&again, &dest).as_bytes()).await), 200);
         assert!(TcpStream::connect(("127.0.0.1", gb.port)).await.is_ok());
         assert!(TcpStream::connect(("127.0.0.1", p.port())).await.is_ok());
         p.shutdown();
+        assert!(gone(ga.port).await, "a session listener still accepts after shutdown");
         assert!(gone(gb.port).await, "a session listener still accepts after shutdown");
         assert!(gone(p.port()).await, "the shared listener still accepts after shutdown");
+    }
+
+    #[tokio::test]
+    async fn the_proxy_never_connects_to_its_own_ports() {
+        let resolver: Resolver =
+            Arc::new(|name: &str| if name == "localhost" { vec![IpAddr::from([127, 0, 0, 1])] } else { Vec::new() });
+        let (p, mut rx, _seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let echo = echo_server().await;
+        let (a, b) = (SessionId::from("s-own-a"), SessionId::from("s-own-b"));
+        let (ga, gb) = (p.grant(&a, lab()).unwrap(), p.grant(&b, lab()).unwrap());
+        // A revoked session's port is still the proxy's own.
+        let c = SessionId::from("s-own-c");
+        let gc = p.grant(&c, lab()).unwrap();
+        p.revoke(&c);
+        while rx.try_recv().is_ok() {}
+        for port in [gb.port, ga.port, p.port(), gc.port] {
+            let rule = format!("deny the egress proxy's own port {port}");
+            for host in ["127.0.0.1", "[::ffff:127.0.0.1]", "0.0.0.0", "localhost", "[::1]", "127.1.2.3"] {
+                let dest = format!("{host}:{port}");
+                let connect = raw(ga.port, connect_req(&ga, &dest).as_bytes()).await;
+                let forwarded =
+                    raw(ga.port, format!("GET http://{dest}/ HTTP/1.1\r\n{}\r\n", auth(&ga)).as_bytes()).await;
+                let checked =
+                    raw(ga.port, format!("{CHECK_METHOD} {dest} HTTP/1.1\r\n{}\r\n", auth(&ga)).as_bytes()).await;
+                for (what, r) in [("CONNECT", connect), ("GET", forwarded), ("check", checked)] {
+                    assert_eq!(status(&r), 403, "{what} {dest}: {r}");
+                    assert!(r.contains(&rule), "{what} {dest}: {r}");
+                }
+            }
+        }
+        // Another loopback port is still allowed, by tunnel and by check.
+        let dest = format!("127.0.0.1:{echo}");
+        assert_eq!(status(&raw(ga.port, connect_req(&ga, &dest).as_bytes()).await), 200);
+        let r = raw(ga.port, format!("{CHECK_METHOD} {dest} HTTP/1.1\r\n{}\r\n", auth(&ga)).as_bytes()).await;
+        assert_eq!(status(&r), 200, "{r}");
     }
 
     #[tokio::test]

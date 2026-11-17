@@ -1207,11 +1207,11 @@ fn env_var_is_set(var: &str) -> bool {
 /// agent does not have the shell's variables, and the key must not be written into the service file) and what
 /// `Config::check_model_keys` refuses.
 fn service_key_check(config: &Config, keys_dir: &Path) -> Result<(), String> {
-    let dir = keys_dir.display();
     for (name, profile) in &config.models {
         if let Some(var) = &profile.api_key_env {
+            let steps = loom_core::config::key_move_steps(keys_dir, name, var, true);
             return Err(format!(
-                "models.{name} sets api_key_env = \"{var}\", but a launchd service does not have your shell's variables, so its requests would carry no key, and putting the key in the service file would write it to disk and into the daemon's environment. Move the key to a file: `mkdir -p -m 700 {dir}`, then `(umask 077; printenv {var} > {dir}/{name})`, replace `api_key_env = \"{var}\"` with `api_key_file = \"{name}\"` in [models.{name}], and run `loom service install` again."
+                "models.{name} sets api_key_env = \"{var}\", but a launchd service does not have your shell's variables, so its requests would carry no key, and putting the key in the service file would write it to disk and into the daemon's environment. Move the key to a file: {steps}, and run `loom service install` again."
             ));
         }
     }
@@ -1947,6 +1947,12 @@ mod tests {
         let err = service_key_check(&c, &keys).unwrap_err();
         assert!(err.contains("models.m") && err.contains("MY_KEY") && err.contains("api_key_file = \"m\""), "{err}");
         assert!(err.contains("printenv MY_KEY"), "{err}");
+        c.models.insert("gpt 4/o".into(), profile(Some("MY_KEY"), None));
+        c.models.remove("m");
+        let spaced = dir.path().join("my keys");
+        let err = service_key_check(&c, &spaced).unwrap_err();
+        assert!(err.contains(&format!("printenv MY_KEY > '{}'", spaced.join("gpt-4-o").display())), "{err}");
+        assert!(err.contains("[models.\"gpt 4/o\"]") && err.contains("api_key_file = \"gpt-4-o\""), "{err}");
 
         let mut c = Config::default();
         c.models.insert("m".into(), profile(None, Some("m")));

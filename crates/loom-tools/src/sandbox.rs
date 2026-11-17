@@ -494,6 +494,12 @@ pub fn preflight(cfg: &SandboxCfg) -> Result<(), String> {
     preflight_at(cfg.mode, Path::new(SANDBOX_EXEC), cfg!(target_os = "macos"))
 }
 
+/// Whether a command is not given the variable `name` with `value`, by its name or by a password in a URL
+/// in its value (leaving out `secret_env` and `env_pass`): what the daemon's start warning reports.
+pub fn withheld(name: &str, value: &str) -> bool {
+    secret_name(name) || url_with_password(value)
+}
+
 /// Whether the environment variable `name` looks like it holds a secret and is withheld from commands.
 fn secret_name(name: &str) -> bool {
     let upper = name.to_uppercase();

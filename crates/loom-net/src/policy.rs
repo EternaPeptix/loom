@@ -380,10 +380,23 @@ fn is_unspecified_literal(ip: IpAddr) -> bool {
     }
 }
 
+/// Whether an IP is loopback (`127.0.0.0/8`, `::1`), also when an IPv6 form carries a `127.x` address.
+pub(crate) fn is_loopback_literal(ip: IpAddr) -> bool {
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => v4.octets().first() == Some(&127),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+/// Whether an IP is loopback or unspecified (the addresses that reach this machine's own listeners).
+pub(crate) fn is_local_literal(ip: IpAddr) -> bool {
+    is_loopback_literal(ip) || is_unspecified_literal(ip)
+}
+
 /// The refusals of [`check_hosts`] beyond pattern validity: `*`, a wildcard over a single label and an
 /// unspecified address. `host` is a trimmed, valid pattern.
 fn refuse_too_broad(host: &str) -> Result<(), String> {
-    let (name, _) = split_host_port(host)?;
+    let (name, port) = split_host_port(host)?;
     if name == "*" {
         return Err(format!(
             "The host \"{host}\" would authorize every host. Name the hosts you need, such as `api.example.test` or `*.example.test`."
@@ -397,7 +410,21 @@ fn refuse_too_broad(host: &str) -> Result<(), String> {
             ));
         }
     }
+    if let Some(rest) = name.strip_prefix("*.") {
+        let last = normalize_host(rest);
+        let last = last.rsplit('.').next().unwrap_or("");
+        if !last.is_empty() && last.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!(
+                "The host \"{host}\" ends in a number, which no top-level domain does, so it would authorize a whole range of IP addresses written as host names. Name the hosts you need."
+            ));
+        }
+    }
     if let Ok(ip) = normalize_host(name).parse::<IpAddr>() {
+        if is_loopback_literal(ip) && port.is_none() {
+            return Err(format!(
+                "The host \"{host}\" is a loopback address without a port, which would unlock every service on this machine. Write the port of the service you need, such as `127.0.0.1:8080`."
+            ));
+        }
         if is_unspecified_literal(ip) {
             return Err(format!(
                 "The host \"{host}\" is an unspecified address, and a connection to it reaches this machine's own services. Write the address of the host you need, or `127.0.0.1` with a port for a service on this machine."
@@ -566,7 +593,7 @@ fn embedded_v4(a: Ipv6Addr) -> Option<Ipv4Addr> {
 
 /// IPv6 addresses that carry an IPv4 address (see [`embedded_v4`]) as that address; `::`, `::1` and the
 /// other IPv4-compatible addresses in `::/104` stay IPv6 addresses.
-fn canonical_ip(addr: IpAddr) -> IpAddr {
+pub(crate) fn canonical_ip(addr: IpAddr) -> IpAddr {
     match addr {
         IpAddr::V6(a) => match (embedded_v4(a), a.segments()) {
             (Some(v4), [0, 0, 0, 0, 0, 0, ..]) if v4.octets().first() == Some(&0) => addr,
@@ -765,6 +792,8 @@ mod tests {
             "*:443",
             "*.com",
             "*.com:443",
+            "*.0.1",
+            "*.1.168.192:80",
             "0.0.0.0",
             "0.0.0.0:8080",
             "0.1.2.3",
@@ -772,13 +801,20 @@ mod tests {
             "[::]",
             "[::]:80",
             "[::ffff:0.0.0.0]",
+            "127.0.0.1",
+            "127.1.2.3",
+            "[::1]",
+            "::1",
+            "[::ffff:127.0.0.1]",
         ] {
             let err = s(&[e]).unwrap_err();
             assert!(err.contains(&format!("\"{e}\"")), "{e}: {err}");
             let err = s(&["a.test", e]).unwrap_err();
             assert!(err.contains(&format!("\"{e}\"")), "{e}: {err}");
         }
-        for e in ["*.example.test", "api.example.test:443", "127.0.0.1:19201", "10.0.0.5", "[::1]:8080"] {
+        for e in
+            ["*.example.test", "*.a1.example.test", "api.example.test:443", "127.0.0.1:19201", "10.0.0.5", "[::1]:8080"]
+        {
             assert_eq!(s(&[e]).unwrap(), [e], "{e}");
         }
         // with_hosts honours what a ledger restored.

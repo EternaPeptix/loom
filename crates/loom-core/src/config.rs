@@ -674,17 +674,9 @@ impl Config {
         let mut out = Vec::new();
         for (name, profile) in &self.models {
             let Some(var) = &profile.api_key_env else { continue };
-            let dir = dir.display();
             let set = is_set(var);
             // Where the variable is not set, `printenv` would write an empty file: the key is pasted instead.
-            let write = if set {
-                format!("`(umask 077; printenv {var} > {dir}/{name})`")
-            } else {
-                format!("`(umask 077; cat > {dir}/{name})` and paste the key, then Ctrl-D")
-            };
-            let mv = format!(
-                "To move it, write the key to {dir}/{name} (`mkdir -p -m 700 {dir}`, then {write}), replace `api_key_env = \"{var}\"` with `api_key_file = \"{name}\"` in [models.{name}], and restart the daemon."
-            );
+            let mv = format!("To move it, {}, and restart the daemon.", key_move_steps(dir, name, var, set));
             if set {
                 out.push(format!(
                     "The key of models.{name} is in the daemon's environment as {var}, where every command can read it. {mv}"
@@ -711,6 +703,70 @@ impl Config {
     }
 }
 
+/// `s` as one word of a POSIX shell: as it is when it holds only `[A-Za-z0-9/._+:@%=,~-]`, else in single
+/// quotes (`'` written `'\''`).
+pub fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '+' | ':' | '@' | '%' | '=' | ',' | '~' | '-')
+        });
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// The file name to suggest for the key of model profile `profile`: the name itself when it passes the
+/// `api_key_file` rules, else the name with every character outside `[A-Za-z0-9._-]` replaced by `-`,
+/// leading dots removed and cut to 64 characters (`model-key` when nothing is left).
+pub fn suggested_key_file(profile: &str) -> String {
+    if check_key_file_name(profile).is_ok() {
+        return profile.to_string();
+    }
+    let cleaned: String = profile
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '-' })
+        .skip_while(|c| *c == '.')
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "model-key".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// The TOML table header of model profile `profile`: `[models.{p}]`, with the name quoted when it is not a
+/// bare key.
+fn models_header(profile: &str) -> String {
+    let bare = !profile.is_empty() && profile.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+    if bare {
+        format!("[models.{profile}]")
+    } else {
+        format!("[models.\"{}\"]", profile.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+/// The steps that move the key of model profile `profile` from `api_key_env = "{var}"` to a file in `dir`,
+/// as a clause for a sentence: every command in it runs in a shell as written. `printenv` is used when the
+/// variable is set, else the key is pasted. Never holds a value.
+pub fn key_move_steps(dir: &Path, profile: &str, var: &str, printenv: bool) -> String {
+    let file = suggested_key_file(profile);
+    let path = shell_quote(&dir.join(&file).display().to_string());
+    let dir = shell_quote(&dir.display().to_string());
+    let var_word = shell_quote(var);
+    let write = if printenv {
+        format!("`(umask 077; printenv {var_word} > {path})`")
+    } else {
+        format!("`(umask 077; cat > {path})` and paste the key, then Ctrl-D")
+    };
+    format!(
+        "write the key to {path} (`mkdir -p -m 700 {dir}`, then {write}), replace `api_key_env = \"{var}\"` with `api_key_file = \"{file}\"` in {}",
+        models_header(profile)
+    )
+}
+
 /// Ok when `file` is a plain file name for the model keys directory, else the sentence saying which rule it breaks.
 fn check_key_file_name(file: &str) -> Result<(), String> {
     const RULE: &str = "an api_key_file is a file name of at most 64 characters made of letters, digits, '.', '_' and '-', not starting with '.', so that it names nothing outside the model keys directory";
@@ -734,7 +790,7 @@ pub fn read_model_key(dir: &Path, name: &str) -> Result<String, String> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let path = dir.join(name);
-    let shown = path.display();
+    let shown = shell_quote(&path.display().to_string());
     // Non-blocking, so that a FIFO put in the key's place is refused below instead of hanging the start.
     let open = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path);
     let file = match open {
@@ -742,7 +798,7 @@ pub fn read_model_key(dir: &Path, name: &str) -> Result<String, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(format!(
                 "The key file {shown} does not exist. Make it with `mkdir -p -m 700 {dir}` and `(umask 077; cat > {shown})`, then type or paste the key and press Ctrl-D.",
-                dir = dir.display()
+                dir = shell_quote(&dir.display().to_string())
             ));
         }
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
@@ -1147,6 +1203,43 @@ allow = ["*.example.test"]
         // An unset variable would give an empty file through printenv: the key is pasted instead.
         assert!(!w[1].contains("printenv") && w[1].contains("cat > /h/keys/models/b"), "{}", w[1]);
         assert!(Config::default().key_env_warnings(dir, |_| true).is_empty());
+    }
+
+    #[test]
+    fn key_commands_are_shell_safe_for_unusual_profile_names_and_paths() {
+        assert_eq!(shell_quote("/h/keys/a.b-c_d+e:f@g%h=i,j~k"), "/h/keys/a.b-c_d+e:f@g%h=i,j~k");
+        assert_eq!(shell_quote("/h/my keys"), "'/h/my keys'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(suggested_key_file("good-name_1.k"), "good-name_1.k");
+        assert_eq!(suggested_key_file("gpt 4/o"), "gpt-4-o");
+        assert_eq!(suggested_key_file("..hid"), "hid");
+        assert_eq!(suggested_key_file("..."), "model-key");
+        assert_eq!(suggested_key_file(&"a".repeat(80)), "a".repeat(64));
+        assert_eq!(suggested_key_file("日本"), "--");
+        for p in ["gpt 4/o", "..x y", "", "日本", &"b c".repeat(40)] {
+            assert!(check_key_file_name(&suggested_key_file(p)).is_ok(), "{p:?}");
+        }
+        assert_eq!(models_header("m-1_x"), "[models.m-1_x]");
+        assert_eq!(models_header("gpt 4/o"), "[models.\"gpt 4/o\"]");
+        assert_eq!(models_header("a\"b\\c"), "[models.\"a\\\"b\\\\c\"]");
+
+        let dir = Path::new("/h/my keys/models");
+        let mut c = Config::default();
+        c.models.insert("gpt 4/o".into(), ModelProfile { api_key_env: Some("A_KEY".into()), ..Default::default() });
+        let w = c.key_env_warnings(dir, |_| true);
+        let line = &w[0];
+        assert!(line.contains("mkdir -p -m 700 '/h/my keys/models'"), "{line}");
+        assert!(line.contains("printenv A_KEY > '/h/my keys/models/gpt-4-o'"), "{line}");
+        assert!(line.contains("api_key_file = \"gpt-4-o\"") && line.contains("[models.\"gpt 4/o\"]"), "{line}");
+        let w = c.key_env_warnings(dir, |_| false);
+        assert!(w[0].contains("cat > '/h/my keys/models/gpt-4-o'") && !w[0].contains("printenv"), "{}", w[0]);
+
+        let d = tempfile::tempdir().unwrap();
+        let spaced = d.path().join("my keys");
+        let e = read_model_key(&spaced, "k").unwrap_err();
+        assert!(e.contains(&format!("mkdir -p -m 700 '{}'", spaced.display())), "{e}");
+        assert!(e.contains(&format!("cat > '{}'", spaced.join("k").display())), "{e}");
     }
 
     #[test]

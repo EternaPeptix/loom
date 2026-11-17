@@ -3477,12 +3477,13 @@ pub fn disk_is_low(free: u64, total: u64) -> bool {
 }
 
 /// What `start` warns about in the configuration, one sentence each. `key_is_set` says whether a variable
-/// is present and not empty in the daemon's environment.
+/// is present and not empty in the daemon's environment; `env` is that environment (names and values).
 fn start_warnings(
     config: &Config,
     macos: bool,
     keys_dir: &std::path::Path,
     key_is_set: impl Fn(&str) -> bool,
+    env: &[(String, String)],
 ) -> Vec<String> {
     let mut out = Vec::new();
     if config.notify.command.is_empty() && !macos {
@@ -3498,7 +3499,31 @@ fn start_warnings(
         );
     }
     out.extend(config.key_env_warnings(keys_dir, key_is_set));
+    out.extend(secret_env_warning(config, env));
     out
+}
+
+/// The warning that names (never with their values) the variables of the daemon's environment that
+/// commands are not given as secrets but can read from the daemon's environment: all but `LOOM_*`, the
+/// profiles' `api_key_env` (reported on their own) and the `sandbox.env_pass` names.
+fn secret_env_warning(config: &Config, env: &[(String, String)]) -> Option<String> {
+    let known = |name: &str| {
+        name.to_ascii_uppercase().starts_with("LOOM_")
+            || config.models.values().any(|p| p.api_key_env.as_deref() == Some(name))
+            || config.sandbox.env_pass.iter().any(|n| n == name)
+    };
+    let names: std::collections::BTreeSet<&str> = env
+        .iter()
+        .filter(|(name, value)| loom_tools::sandbox::withheld(name, value) && !known(name))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let list = names.into_iter().collect::<Vec<_>>().join(", ");
+    Some(format!(
+        "The daemon's environment holds variables that look like secrets: {list}. Commands are not given them, but every command can read them from the daemon's environment. Start the daemon with `loom up` or `loom service install`, which pass only what it needs; a `loom daemon` run from a shell keeps all of that shell's variables."
+    ))
 }
 
 /// The warning for a profile whose configured window is larger than the one its server reports.
@@ -3655,7 +3680,12 @@ impl Runtime {
             );
         }
         let env_key_is_set = |var: &str| std::env::var_os(var).is_some_and(|v| !v.is_empty());
-        for warning in start_warnings(&config, cfg!(target_os = "macos"), &paths.model_keys_dir(), env_key_is_set) {
+        let daemon_env: Vec<(String, String)> = std::env::vars_os()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+            .collect();
+        for warning in
+            start_warnings(&config, cfg!(target_os = "macos"), &paths.model_keys_dir(), env_key_is_set, &daemon_env)
+        {
             tracing::warn!("{warning}");
         }
         config.check_box_paths(&paths.home)?;
@@ -7190,7 +7220,7 @@ mod tests {
     fn start_warns_about_what_the_operator_must_know() {
         let mut c = Config::default();
         let keys = std::path::Path::new("/h/keys/models");
-        let start_warnings = |c: &Config, macos: bool| start_warnings(c, macos, keys, |_| false);
+        let start_warnings = |c: &Config, macos: bool| start_warnings(c, macos, keys, |_| false, &[]);
         assert!(start_warnings(&c, true).is_empty());
         let off = start_warnings(&c, false);
         assert_eq!(off.len(), 1);
@@ -7216,13 +7246,52 @@ mod tests {
             "file".into(),
             loom_core::config::ModelProfile { api_key_file: Some("file".into()), ..Default::default() },
         );
-        let set = start_warnings(&c, true, keys, |v| v == "LOOM_TEST_KEY");
+        let set = start_warnings(&c, true, keys, |v| v == "LOOM_TEST_KEY", &[]);
         assert_eq!(set.len(), 1, "{set:?}");
         assert!(set[0].contains("models.env") && set[0].contains("LOOM_TEST_KEY") && set[0].contains("can read it"));
-        let unset = start_warnings(&c, true, keys, |_| false);
+        let unset = start_warnings(&c, true, keys, |_| false, &[]);
         assert_eq!(unset.len(), 1, "{unset:?}");
         assert!(unset[0].contains("LOOM_TEST_KEY is not set") && unset[0].contains("api_key_file"), "{unset:?}");
         assert!(set.iter().chain(&unset).all(|w| !w.contains("models.file")));
+    }
+
+    #[test]
+    fn start_names_the_secret_variables_of_the_daemon_environment_without_their_values() {
+        let keys = std::path::Path::new("/h/keys/models");
+        let mut c = Config::default();
+        c.notify.command = vec!["/bin/true".into()];
+        c.models.insert(
+            "m".into(),
+            loom_core::config::ModelProfile { api_key_env: Some("OPENAI_API_KEY".into()), ..Default::default() },
+        );
+        c.sandbox.env_pass = vec!["PASSED_TOKEN".into()];
+        let var = |n: &str, v: &str| (n.to_string(), v.to_string());
+        let env = [
+            var("GITHUB_TOKEN", "ghp_valueone"),
+            var("DATABASE", "https://u:p@h/"),
+            var("LOOM_HOME", "/h"),
+            var("LOOM_SECRET_TOKEN", "valuethree"),
+            var("OPENAI_API_KEY", "sk-valuefour"),
+            var("PASSED_TOKEN", "valuefive"),
+            var("PATH", "/usr/bin"),
+            var("EDITOR", "vi"),
+        ];
+        let w = start_warnings(&c, true, keys, |_| true, &env);
+        let secret: Vec<_> = w.iter().filter(|x| x.contains("look like secrets")).collect();
+        assert_eq!(secret.len(), 1, "{w:?}");
+        let line = secret[0];
+        assert!(line.contains("GITHUB_TOKEN") && line.contains("DATABASE"), "{line}");
+        for left_out in ["LOOM_HOME", "LOOM_SECRET_TOKEN", "PASSED_TOKEN", "PATH", "EDITOR"] {
+            assert!(!line.contains(left_out), "{left_out}: {line}");
+        }
+        assert!(!line.contains("OPENAI_API_KEY"), "{line}");
+        for value in ["ghp_valueone", "u:p@h", "sk-valuefour", "valuefive"] {
+            assert!(w.iter().all(|x| !x.contains(value)), "{value}: {w:?}");
+        }
+        assert!(line.contains("loom up") && line.contains("loom service install"), "{line}");
+        // Nothing left: no warning.
+        let env = [var("LOOM_HOME", "/h"), var("OPENAI_API_KEY", "x"), var("PATH", "/usr/bin")];
+        assert!(start_warnings(&c, true, keys, |_| false, &env).iter().all(|x| !x.contains("look like secrets")));
     }
 
     #[tokio::test]
@@ -8940,18 +9009,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_session_that_ends_gives_its_proxy_port_back() {
+    async fn a_session_that_ends_holds_no_proxy_port_but_the_port_stays_bound() {
         let e = env(Script::new(|_, _| finish("ok"))).await;
         let id = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta.id;
         until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
         let port = e.rt.inner.proxy.session_port(&id).unwrap();
         e.rt.inner.proxy.revoke(&id);
         assert_eq!(e.rt.inner.proxy.session_port(&id), None);
-        let deadline = tokio::time::Instant::now() + WAIT;
-        while tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            assert!(tokio::time::Instant::now() < deadline, "the port still accepts");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // The listener stays bound, so no later session is given the port.
+        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok());
         e.rt.shutdown().await;
     }
 
