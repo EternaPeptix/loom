@@ -59,7 +59,8 @@
 //! inherit them. The `api_key_env` variables are kept so that existing configurations keep working;
 //! `Config::key_env_warnings` says what that exposes. A daemon started by launchd gets the plist's
 //! variables (below) and launchd's own, and a `loom daemon` run straight from a shell keeps that
-//! shell's whole environment: both are reported by the start warnings (runtime), not changed.
+//! shell's whole environment: neither is changed, and the start warnings (runtime) name the variables in
+//! it that look like secrets.
 //!
 //! ## `launch_agent_plist(exe, home)` — for `loom service install` (macOS)
 //! A LaunchAgent property list with `Label` [`SERVICE_LABEL`], `ProgramArguments` `[exe, "daemon"]`,

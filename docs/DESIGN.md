@@ -1140,10 +1140,12 @@ head within 10 s gets `400`.
   listener of its own, and the variables `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case
   forms naming that listener, with `NO_PROXY` empty; so every decision is attributed. Missing or wrong
   credentials get `407`, and so do a session's credentials on any listener but its own (recorded for the
-  listener's session). The sandbox lets a session's commands connect to its own listener only, so
+  listener's session). The sandbox lets a session's commands connect to its own listener only, and the
+  proxy refuses any loopback or unspecified destination on one of its own ports whatever the policy, so
   credentials a command reads from another command's environment (`KERN_PROCARGS2`) are of no use to it,
-  unless `loopback_all` opens every port. A session's grant is revoked, and its listener closed, when it
-  settles.
+  unless `loopback_all` opens every port. A session's grant is revoked when it settles; its listener stays
+  bound, answering `407`, until the daemon stops, so no later session is given a port an earlier
+  session's profile allows.
 - **Policy** (`[network]`): `mode` is `deny_all` (the default: tools reach no host; model requests are
   not affected), `allowlist` (only hosts matching `allow`: `host` or `*.suffix`, optional `:port`) or
   `open` (every public destination). The name is checked first: a `deny` entry wins, then the mode.
@@ -1161,9 +1163,10 @@ head within 10 s gets `400`.
   every running session of the mission becomes the configured network plus the granted hosts: under
   `deny_all` the granted hosts become an allowlist of exactly those hosts (the configured `allow` list,
   which `deny_all` keeps off, stays off), under `allowlist` they are added to `allow`, under `open`
-  nothing changes. `*`, a wildcard over one label (`*.com`) and an unspecified IP literal (`0.0.0.0/8`,
-  `::`) are refused for a model's request and the operator's grant alike (`check_hosts`); hosts restored
-  from an older ledger are honoured as granted. The configured `deny` list still binds a granted host. A granted host that
+  nothing changes. `*`, a wildcard over one label (`*.com`) or with an all-digit last label (`*.0.1`), an
+  unspecified IP literal (`0.0.0.0/8`, `::`) and a loopback IP literal without a port are refused for a
+  model's request and the operator's grant alike (`check_hosts`); hosts restored from an older ledger are
+  honoured as granted. The configured `deny` list still binds a granted host. A granted host that
   is an IP literal additionally authorizes that exact address (and port, when written) against the
   private-address rule, for this mission only; names granted stay bound to the private-address rule
   even when they resolve to a private address. The lead records the grant in the ledger (`ScopeGrant`, when the mission keeps one) and gets a
@@ -1368,7 +1371,9 @@ Streams end when the daemon stops.
 (`serve::daemon_env`: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TZ`, `TMPDIR`,
 `LOOM_LOG`, `RUST_BACKTRACE`, the profiles' `api_key_env` variables and the `sandbox.env_pass` names, then
 `LOOM_HOME`), so the shell's other variables never reach the daemon, where commands could read them; it
-prints a warning for each `api_key_env` key it passes on. `loom service install` (a launchd agent that
+prints a warning for each profile with `api_key_env` (the key it passes on is readable by commands; an
+unset one sends no key). The daemon logs the same at start, and names the variables of its environment
+that look like secrets (a `loom daemon` run from a shell keeps that shell's environment). `loom service install` (a launchd agent that
 restarts the daemon after a crash; its plist gives `LOOM_HOME` and a fixed `PATH`) refuses a profile with
 `api_key_env`, which the agent would not have. `loom daemon` raises its open-file limit, creates the home and its top-level directories (0700, tightened if they exist looser) and
 takes an exclusive lock on `daemon.lock` for its lifetime, so a second daemon on the same home is

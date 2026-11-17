@@ -122,7 +122,8 @@
 //! `cfg.secret_env` (the `api_key_env` of every model profile), or starts with `LOOM_`, and without
 //! any whose value holds a URL with a password in its user-info part (`scheme://user:password@host`):
 //! every `://` in the value starts an authority that ends at `/`, `?`, `#`, `"`, `]` or white space.
-//! A variable listed in `cfg.env_pass` is passed whatever its name and value. Bubblewrap additionally
+//! A variable listed in `cfg.env_pass` is passed whatever its name and value. `withheld(name, value)` is the
+//! name and value test alone (without `secret_env` and `env_pass`), for the daemon's start warning. Bubblewrap additionally
 //! always removes LD_*, DYLD_*, BASH_FUNC_*, BASH_ENV, ENV, SHELLOPTS and BASHOPTS before its trusted
 //! host launcher; tools can set needed library variables inside the confined script. Added: `TERM=dumb`,
 //! `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR=<session temp dir>`.

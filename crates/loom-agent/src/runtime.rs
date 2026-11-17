@@ -354,7 +354,11 @@
 //!    `api_key_file` is read here and a refusal stops the start) and limiters; proxy. The start warnings
 //!    (`tracing::warn!`) include `config.key_env_warnings(paths.model_keys_dir(), …)` judged against the
 //!    daemon's own environment: a key named by `api_key_env` that is in it, where commands can read it,
-//!    and one that is missing.
+//!    and one that is missing. And one sentence naming, never with their values, the variables of the
+//!    daemon's environment that commands are not given as secrets (`loom_tools::sandbox::withheld(name,
+//!    value)`), other than `LOOM_*` ones, the profiles' `api_key_env` and the `sandbox.env_pass` names:
+//!    every command can read them from the daemon's environment; start the daemon with `loom up` or
+//!    `loom service install`, which pass only what it needs (a `loom daemon` run from a shell keeps it all).
 //! 2. Read every session's `meta.json` and `status.json` (missing status = default idle status).
 //! 3. Activate as described under *Active sessions*. A session that cannot be opened is skipped
 //!    with `tracing::error!` and a `BusEvent::Error`; a child that cannot be opened while its lead
@@ -488,9 +492,12 @@
 //!   verifier whose `child_spawned` a crash kept out of the lead's log is still the gate's;
 //! - a read-only role's sandbox configuration protects the workspace; every session's environment
 //!   names the proxy, on the session's own port: two sessions' `HTTP_PROXY` ports differ, neither is
-//!   `proxy_port()`, and each session's sandbox description lists its own port and not the other's;
+//!   `proxy_port()`, and each session's sandbox allows (`loopback_ports`) its own port and not the other's;
 //!   `start_warnings` holds the `api_key_env` warning when the variable is set and when it is not, and
-//!   none for a profile with `api_key_file`; a profile whose key file is missing stops `Runtime::start`;
+//!   none for a profile with `api_key_file`; the secret-variable warning names `GITHUB_TOKEN` and a variable
+//!   whose value is `https://u:p@h/`, holds neither value, and leaves out `LOOM_HOME`, an `api_key_env` and an
+//!   `env_pass` name, and there is none when nothing is left; a profile whose key file is missing stops
+//!   `Runtime::start`;
 //! - `archive` hides, refuses messages, and survives a restart;
 //! - copies: an agent started with `Workspace::Copy` is told where it works and its command runs
 //!   there, the lead's workspace is unchanged until `agent_adopt` and has the agent's files after it,

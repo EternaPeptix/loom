@@ -37,11 +37,20 @@
 //! `api_key_env = "{VAR}"` with `api_key_file = "{p}"` in `[models.{p}]`, and restart the daemon. Otherwise:
 //! `{VAR}` is not set, so requests of `models.{p}` carry no key, and the same move. Never the value.
 //!
+//! Every command these sentences suggest is one a shell runs as written: a path or name that holds a
+//! character outside `[A-Za-z0-9/._+:@%=,~-]` is single-quoted (`'` written `'\''`). The file name they
+//! suggest for a profile `{p}` is `{p}` when it passes the `api_key_file` rules, else `{p}` with every
+//! character outside `[A-Za-z0-9._-]` replaced by `-`, leading `.`s removed and cut to 64 characters (or
+//! `model-key` when nothing is left); a profile name that is not a bare TOML key is written
+//! `[models."{p}"]` (with `"` and `\` escaped).
+//!
 //! Tests required: both forms refused together; each name rule; `read_model_key` returns the trimmed key
 //! and refuses a missing file (with the commands), a link, a directory, mode 0640 and 0604, an empty or
 //! all-blank file, inner white space, a control character, non-UTF-8 and 16 KiB + 1 bytes, no message
 //! holding the key; `check_model_keys` names the profile; `key_env_warnings` for a set and an unset
-//! variable, holding the variable's name and the move and never its value.
+//! variable, holding the variable's name and the move and never its value; for a profile `gpt 4/o` and a
+//! keys directory with a space in its path, the suggested file name passes the rules and the commands
+//! quote the path.
 
 use crate::admit::AdmitPolicy;
 use crate::event::ReasoningReplay;

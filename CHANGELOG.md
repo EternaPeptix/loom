@@ -18,13 +18,19 @@
   keeps working unchanged, with a warning from `loom up`, `loom config check` and the daemon log that the
   key is readable by commands, and how to move it (RUN.md, *Model API keys*). `loom service install`
   refuses a profile with `api_key_env`, which a login service never had. A profile may not set both.
-- Each session gets a proxy listener of its own; its sandbox allows that port only, and its credentials
-  are refused on any other listener. A command that reads another session's proxy credentials from the
-  environment of that session's commands can no longer use them (except with `loopback_all`).
+- Each session gets a proxy listener of its own; its sandbox allows that port only, its credentials are
+  refused on any other listener, and the proxy refuses to connect to any of its own ports whatever the
+  policy allows. A session's port stays bound (answering `407`) until the daemon stops, so no later session
+  is given a port a leftover process may still be allowed. A command that reads another session's proxy
+  credentials from the environment of that session's commands can no longer use them (except with
+  `loopback_all`).
 - Under `deny_all`, a scope grant allows exactly the granted hosts: before, the first grant also switched
   on every host in the configured `allow` list.
-- `request_scope` and `loom scope` refuse `*`, a wildcard over a top-level domain (`*.com`) and the
-  unspecified address (`0.0.0.0`, `::`). Grants already in a ledger are kept as they are.
+- `request_scope` and `loom scope` refuse `*`, a wildcard over a top-level domain (`*.com`) or over IP
+  addresses (`*.0.1`), the unspecified address (`0.0.0.0`, `::`) and a loopback address without a port
+  (`127.0.0.1`). Grants already in a ledger are kept as they are.
+- The daemon's start warnings name the variables of its environment that look like secrets (a
+  `loom daemon` run straight from a shell keeps that shell's environment).
 - `ModelClient::new` takes the key directory; `Proxy::grant` returns a `Result` and must run inside a
   Tokio runtime. SECURITY.md lists what `KERN_PROCARGS2` still exposes.
 

@@ -138,14 +138,16 @@ calls `request_scope`; an item naming the hosts and why waits in your inbox, and
 working. `loom scope <session> <host>...` grants them (the UI and the app have an Approve button on the
 item). The grant is recorded in the mission's ledger, applies to that mission only, and ends with the
 session. `loom net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
-granted hosts; the `allow` list stays off. `*`, a wildcard over a whole top-level domain (`*.com`) and
-the unspecified address (`0.0.0.0`, `::`) cannot be requested or granted: name the hosts, or a wildcard
+granted hosts; the `allow` list stays off. `*`, a wildcard over a whole top-level domain (`*.com`) or
+over IP addresses (`*.0.1`), the unspecified address (`0.0.0.0`, `::`) and a loopback address without a
+port (`127.0.0.1`; write `127.0.0.1:8080`) cannot be requested or granted: name the hosts, or a wildcard
 under a domain (`*.example.test`), or set the mode in the config.
 
 Each session's commands reach the proxy on a port of that session's own, and the proxy accepts a
-session's credentials only on that port, so a command that reads another session's proxy credentials
-(from the environment another command was started with) cannot use them. `loopback_all = true` lets
-commands connect to every port, these included: see `SECURITY.md`.
+session's credentials only on that port and never connects to its own ports, so a command that reads
+another session's proxy credentials (from the environment another command was started with) cannot use
+them. A session's port stays bound until the daemon stops, so no later session gets it.
+`loopback_all = true` lets commands connect to every port, these included: see `SECURITY.md`.
 
 ### Sandbox
 

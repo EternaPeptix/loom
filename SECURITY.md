@@ -88,7 +88,9 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   workspace is skipped.
 - **The network** is closed except for loopback connections to the session's own port of the egress
   proxy (and any ports or sockets you list). Each session has a proxy port of its own, and its proxy
-  credentials are accepted on that port only. The proxy applies `[network]`: by default (`deny_all`) it forwards nothing. It resolves
+  credentials are accepted on that port only; the proxy never connects to one of its own ports, whatever
+  the policy allows, and while the daemon runs no session is given a port an earlier session had. The
+  proxy applies `[network]`: by default (`deny_all`) it forwards nothing. It resolves
   names itself, refuses private, loopback and link-local addresses (including IPv4 addresses hidden in
   IPv6 forms) unless you list them, applies the deny list to the resolved address, and records every
   decision in a hash-chained audit file. Commands that listen on loopback can be reached by other
@@ -96,9 +98,12 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
 - **Scope is the operator's.** The agent can ask for hosts with `request_scope`, which opens an inbox
   item and changes nothing. Hosts are granted only by the operator, per session, with a record in the
   ledger; a grant dies with the session. Under `deny_all` a grant allows exactly the granted hosts (the
-  configured `allow` list stays off). `*`, a wildcard over a top-level domain (`*.com`) and the
-  unspecified address (`0.0.0.0`, `::`, which reaches this machine's own services) can be neither
-  requested nor granted, so approving a request cannot open everything at once. `loom release` records that the operator closed a mission
+  configured `allow` list stays off). `*`, a wildcard over a top-level domain (`*.com`) or over IP
+  addresses (`*.0.1`), the unspecified address (`0.0.0.0`, `::`, which reaches this machine's own
+  services) and a loopback address without a port (`127.0.0.1`) can be neither requested nor granted, so
+  approving a request cannot open everything at once. Still read what you approve: a wildcard under a
+  domain whose names resolve to any address (wildcard DNS such as `*.nip.io`) or one of this machine's own
+  LAN addresses is not recognised as broad. `loom release` records that the operator closed a mission
   without the goal established, with a reason, and it is shown as that, not as finished.
 - **No LaunchServices opens, Apple Events or launchd jobs**, so a command cannot start a program
   outside the sandbox that way.
@@ -206,11 +211,15 @@ These are the places where loom does less than the text above might suggest.
   the command lines and environments of other sessions' commands, other missions' included; and those of
   every other program you run that is not a platform binary. loom narrows what is there: `loom up`
   clears the daemon's environment, `api_key_file` keeps keys out of it, and a session's proxy credentials
-  work only on that session's own proxy port, which other sessions' commands cannot connect to. With
-  `loopback_all = true` (or a `loopback_ports` entry that happens to be a session's port) they can, and a
-  command that read another running session's proxy credentials can then reach what that session may
-  reach, recorded in that session's audit log. Do not export secrets in the shell you start loom from,
-  and do not pass secrets to commands on their command lines.
+  work only on that session's own proxy port, which other sessions' commands cannot connect to, directly
+  or through the proxy. With `loopback_all = true` (or a `loopback_ports` entry that happens to be a
+  session's port) they can, and a command that read another running session's proxy credentials can then
+  reach what that session may reach, recorded in that session's audit log. A daemon restart releases the
+  ports: a process that left its command's process group under the previous daemon keeps a profile that
+  allows its old port, which a session of the new daemon may be given. A command that holds every free
+  loopback port stops new sessions from starting (they cannot get a port), as it stops other outgoing
+  connections. Do not export secrets in the shell you start loom from, and do not pass secrets to
+  commands on their command lines.
 - **A process that leaves its command's process group is not tracked.** After `setsid`, `daemon()`,
   `redis-server --daemonize yes` or `tmux new -d`, `job_kill`, stop, the end of the session and daemon
   shutdown do not stop it, although it stays under the seatbelt profile.

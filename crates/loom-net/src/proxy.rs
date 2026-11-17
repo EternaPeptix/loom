@@ -32,7 +32,8 @@
 //! the old one gets `407`. It must be called inside a Tokio runtime. A command's environment names only
 //! its own session's port, and the sandbox lets the command connect to that port and no other of the
 //! proxy's, so credentials a command reads from another process (another session's command, through
-//! the environment it was started with) are of no use to it: **command credentials are accepted only on
+//! the environment it was started with) are of no use to it, and the proxy will not open a tunnel to
+//! one of its own listeners for it either (below): **command credentials are accepted only on
 //! their session's listener, and reference credentials only on the shared listener.** Credentials that
 //! arrive on another listener are refused as unknown ones are (`407`), with the decision rule
 //! `proxy authentication failed: credentials of session {owner} on the port of session {listener}`
@@ -48,8 +49,20 @@
 //! host reservation nor GET-only access prevents exfiltration in URL paths/queries.
 //! `session_port(session) -> Option<u16>`: the port of the session's own listener while it holds a
 //! command grant.
-//! `revoke(session)` drops both command and reference grants and closes the session's listener (it
-//! accepts nothing more; the port is released); connections already open are left to finish.
+//! `revoke(session)` drops both command and reference grants; connections already open are left to finish.
+//! The session's listener stays open until the proxy stops, answering `407` to every request (its
+//! credentials are gone), and `session_port` gives `None`: so no later session of this proxy's life is
+//! given a port that an earlier session's sandbox allows (a process that left its command's process group
+//! outlives its session and keeps its profile). A later grant of the same session uses that listener
+//! again. The cost is one descriptor per session granted since the proxy started.
+//!
+//! **The proxy never connects to itself.** A destination address that is loopback (`127.0.0.0/8`, `::1`,
+//! and IPv6 forms carrying a `127.x` address) or unspecified (`0.0.0.0/8`, `::`, and such forms) with a
+//! port of one of the proxy's listeners (the shared one and every session's, open or kept after a revoke)
+//! is refused whatever the policy says, before `check_addr`, for a tunnel, a forwarded request and a check
+//! alike, with rule `deny the egress proxy's own port {port}`. Otherwise a session whose policy reaches
+//! loopback (`allow_private`, a granted `127.0.0.1:{port}`) could open a tunnel to another session's
+//! listener and present that session's credentials there, through the proxy, which would accept them.
 //! `set_policy(session, policy)` replaces the policy of a session that holds a grant and keeps its
 //! credentials, so commands already running pick the change up on their next connection.
 //! `SessionGrant::env()` gives the variables to place in a command's environment so that ordinary
@@ -100,8 +113,14 @@
 //! different ports, neither the shared one; session B's valid credentials on A's port → `407`, nothing
 //! connected, one refused decision recorded for A naming B; A's credentials on the shared port → `407`
 //! (unattributed); a reference grant works on the shared port and is refused on a session's port; a second
-//! grant of A keeps the port and the first password gets `407`; after `revoke(A)` a connect to A's port
-//! fails; `shutdown` closes the session listeners too.
+//! grant of A keeps the port and the first password gets `407`; after `revoke(A)` A's port still accepts and
+//! answers `407` to A's old credentials, `session_port(A)` is `None`, and the grants of 20 new sessions
+//! never get A's port; `shutdown` closes the session listeners too. The foreign-credentials test asserts
+//! that the destination listener accepted nothing. Own ports: with a policy that allows `127.0.0.1`
+//! (`allow_private`) in open mode, a `CONNECT`, a forwarded `GET http://127.0.0.1:{port}/` and a check to
+//! another session's port, to the session's own port and to the shared port are each refused (`403`, rule
+//! `deny the egress proxy's own port {port}`), also written as `[::ffff:127.0.0.1]:{port}` and
+//! `0.0.0.0:{port}`, while another loopback port is still allowed.
 //!
 //! ## Audit
 //! `start_with` takes an audit hook ([`AuditFn`]), called on a blocking thread with the session (or

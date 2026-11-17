@@ -69,11 +69,18 @@
 //! - `*` with or without a port: it would authorize every host;
 //! - a wildcard over a single label, `*.{label}` with or without a port (`*.com`, `*.io`, `*.htb`): it
 //!   would authorize a whole top-level domain; a wildcard under a domain (`*.example.test`) is kept. A
-//!   public suffix of more than one label (`*.co.uk`) is not recognised;
+//!   public suffix of more than one label (`*.co.uk`) is not recognised, nor is a domain whose names
+//!   resolve to whatever address the name spells (wildcard DNS such as `*.nip.io`);
+//! - a wildcard whose last label is all digits (`*.0.1`, `*.1.168.192:80`): no top-level domain is
+//!   numeric, so it can only match IP literals written as host names, a whole range of addresses;
 //! - an IP literal that is unspecified or in `0.0.0.0/8` (`0.0.0.0`, `0.0.0.0:8080`, `0.1.2.3`, `::`,
 //!   `[::]:80`), also in an IPv6 form that carries such an IPv4 address (`[::ffff:0.0.0.0]`): a literal
 //!   grant unlocks its exact address against the private-address rule (below), and a connection to the
-//!   unspecified address reaches this machine's own services.
+//!   unspecified address reaches this machine's own services;
+//! - a loopback IP literal without a port (`127.0.0.1`, `127.1.2.3`, `[::1]`, `[::ffff:127.0.0.1]`): it would
+//!   unlock every service listening on this machine's loopback; the sentence asks for the port
+//!   (`127.0.0.1:8080`). With a port it is kept. A grant of one of this machine's own non-loopback
+//!   addresses (its LAN address, say) is not recognised as this machine.
 //!
 //! **Loopback/private literals granted to a session unlock that exact address**: a granted host that is
 //! an IP literal (`127.0.0.1`, `[::1]:8080`, `10.0.0.5:443`) additionally authorizes connections to that
@@ -92,9 +99,10 @@
 //! IPv6; `allow_private` by name, by CIDR and by address; open mode still refuses private addresses.
 //! `with_hosts` under `deny_all` with a non-empty configured `allow` and one granted host: the granted
 //! host is allowed and every `allow` entry is refused (`not in allow list`); under `allowlist` both are
-//! allowed. `check_hosts` refuses `*`, `*:443`, `*.com`, `*.com:443`, `0.0.0.0`, `0.0.0.0:8080`,
-//! `0.1.2.3`, `::`, `[::]`, `[::]:80`, `[::ffff:0.0.0.0]` with a sentence naming the entry, refuses a
-//! list holding one of them besides valid hosts, and accepts `*.example.test`, `api.example.test:443`,
+//! allowed. `check_hosts` refuses `*`, `*:443`, `*.com`, `*.com:443`, `*.0.1`, `*.1.168.192:80`, `0.0.0.0`,
+//! `0.0.0.0:8080`, `0.1.2.3`, `::`, `[::]`, `[::]:80`, `[::ffff:0.0.0.0]`, `127.0.0.1`, `127.1.2.3`, `[::1]`,
+//! `::1` and `[::ffff:127.0.0.1]` with a sentence naming the entry, refuses a list holding one of them
+//! besides valid hosts, and accepts `*.example.test`, `*.a1.example.test`, `api.example.test:443`,
 //! `127.0.0.1:19201`, `10.0.0.5` and `[::1]:8080`.
 
 #![allow(clippy::doc_lazy_continuation)]
