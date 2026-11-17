@@ -421,11 +421,16 @@ impl Tool for Evidence {
             Ok((_, state)) => {
                 let id = state.evidence.last().map(|e| e.id.as_str()).unwrap_or("");
                 let side = if supports { "supports" } else { "undermines" };
-                let kind_word = if kind == EvidenceKind::Execution { "execution" } else { "static" };
                 let mut text = format!(
-                    "{id} ({side}; {kind_word}: {} call in {}) attached to {claim}.",
-                    producer.tool, producer.session
+                    "{id} ({side}; {}: {} call in {}) attached to {claim}.",
+                    producer.grade.as_str(),
+                    producer.tool,
+                    producer.session
                 );
+                if let Some(line) = texts::evidence_not_a_run(producer.grade, &producer.tool) {
+                    text.push('\n');
+                    text.push_str(&line);
+                }
                 if state.claims.iter().any(|c| c.id == claim && c.status == ClaimStatus::Open) {
                     text.push_str("\nThe claim is still open — set its status with `claim_update`.");
                 }
@@ -475,8 +480,9 @@ impl Tool for Ledger {
 mod tests {
     use super::super::testkit::{rig, Rig};
     use super::super::NO_MISSION;
-    use loom_core::event::{Event, ToolClass, ToolStatus};
-    use loom_core::ledger::LedgerOp;
+    use crate::texts;
+    use loom_core::event::{Event, EvidenceGrade, ToolClass, ToolStatus};
+    use loom_core::ledger::{EvidenceKind, LedgerOp};
     use serde_json::{json, Value};
 
     async fn ok(rig: &Rig, name: &str, args: Value) -> String {
@@ -613,7 +619,7 @@ mod tests {
         )
         .await;
         assert!(t.contains("evidence e1 attached to c1"), "{t}");
-        assert!(t.contains("e1 (supports; execution: bash call in s-test) attached to c1."), "{t}");
+        assert!(t.contains("e1 (supports; run: bash call in s-test) attached to c1."), "{t}");
         assert!(t.contains("The claim is still open — set its status with `claim_update`."), "{t}");
 
         let t = ok(&rig, "claim_update", json!({"id": "c1", "status": "supported"})).await;
@@ -627,7 +633,7 @@ mod tests {
             json!({"claim": "c1", "handle": h, "start": 1, "end": 3, "quote": "omega", "note": "tail", "supports": false}),
         )
         .await;
-        assert!(t.contains("e2 (undermines; execution:"), "{t}");
+        assert!(t.contains("e2 (undermines; run:"), "{t}");
         assert!(!t.contains("still open"), "{t}");
         assert_eq!(ledger_records(&rig), vec![1, 2, 3, 4]);
 
@@ -677,13 +683,56 @@ mod tests {
             json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "quote": "line one", "note": "n"}),
         )
         .await;
-        assert!(t.contains("static: read call in s-test"), "{t}");
+        assert!(t.contains("read: read call in s-test"), "{t}");
         let state = rig.shared.ledger().unwrap();
         let e = &state.evidence[0].input;
         assert_eq!(e.kind, loom_core::ledger::EvidenceKind::Static);
         assert!(e.attested);
         assert_eq!(e.lines, Some((1, 1)));
         assert_eq!(e.call_id.as_str(), "call-0");
+    }
+
+    #[tokio::test]
+    async fn evidence_is_graded_by_what_the_producer_did() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let args =
+            |h: &str| json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "quote": "line one", "note": "n"});
+        let cases = [
+            ("dep_scan", ToolClass::Exec, EvidenceGrade::Analysis, "analysis"),
+            ("cve_lookup", ToolClass::Exec, EvidenceGrade::Reference, "reference"),
+        ];
+        for (tool, class, grade, word) in cases {
+            let h = rig.output_graded("line one\n", tool, class, grade);
+            let t = ok(&rig, "evidence", args(&h)).await;
+            assert!(t.contains(&format!("supports; {word}: {tool} call in s-test")), "{t}");
+            let line = texts::evidence_not_a_run(grade, tool).expect("a line for a non-run");
+            assert!(t.contains(&line), "{t}");
+            // The not-a-run line comes before the claim-still-open line.
+            let (a, b) = (t.find(&line).unwrap_or(0), t.find("still open").unwrap_or(0));
+            assert!(a < b, "{t}");
+        }
+        let state = rig.shared.ledger().unwrap();
+        for (e, (tool, _, grade, _)) in state.evidence.iter().zip(cases) {
+            assert_eq!(e.input.kind, EvidenceKind::Static, "an Exec producer graded {grade:?} is never Execution");
+            assert_eq!(e.input.tool.as_deref(), Some(tool));
+            assert_eq!(e.input.grade, Some(grade));
+        }
+
+        // A run is Execution and gets no extra line; a read gets none either.
+        let h = rig.output_graded("line one\n", "bash", ToolClass::Exec, EvidenceGrade::Run);
+        let t = ok(&rig, "evidence", args(&h)).await;
+        assert!(t.contains("supports; run: bash call in s-test"), "{t}");
+        assert!(!t.contains("not a run"), "{t}");
+        let h = rig.output("line one\n", "read", ToolClass::Read);
+        let t = ok(&rig, "evidence", args(&h)).await;
+        assert!(t.contains("supports; read: read call in s-test"), "{t}");
+        assert!(!t.contains("not a run"), "{t}");
+        let state = rig.shared.ledger().unwrap();
+        assert_eq!(state.evidence[2].input.kind, EvidenceKind::Execution);
+        assert_eq!(state.evidence[2].input.grade, Some(EvidenceGrade::Run));
+        assert_eq!(state.evidence[3].input.kind, EvidenceKind::Static);
+        assert_eq!(state.evidence[3].input.grade, Some(EvidenceGrade::Read));
     }
 
     #[tokio::test]
@@ -698,7 +747,7 @@ mod tests {
         // No `quote`: the lines are taken from the stored output, blank ends left out, indentation kept.
         let t = ok(&rig, "evidence", json!({"claim": "c1", "handle": h, "start": 2, "end": 5, "note": "the failure"}))
             .await;
-        assert!(t.contains("e1 (supports; execution: bash call in s-test) attached to c1."), "{t}");
+        assert!(t.contains("e1 (supports; run: bash call in s-test) attached to c1."), "{t}");
         let played = format!(
             "Recorded from {h}, lines 3-4, as stored:\n|   test a ... FAILED\n|   left: 1, right: 2\nIf these are not the lines you meant, attach the right ones."
         );
@@ -890,7 +939,7 @@ mod tests {
                 json!({"claim": "c1", "handle": h, "start": 2, "end": 2, "quote": shown, "note": "n"}),
             )
             .await;
-            assert!(t.contains("execution: bash call in s-test"), "{tool}: {t}");
+            assert!(t.contains("run: bash call in s-test"), "{tool}: {t}");
         }
         let state = rig.shared.ledger().unwrap();
         assert_eq!(state.evidence.len(), 2);

@@ -6888,7 +6888,7 @@ mod tests {
         until("three evidence calls", || evidence(&e).len() == 3).await;
         let got = evidence(&e);
         assert_eq!(got[0].0, ToolStatus::Ok, "{}", got[0].1);
-        assert!(got[0].1.contains("static: read call"), "{}", got[0].1);
+        assert!(got[0].1.contains("read: read call"), "{}", got[0].1);
         assert_eq!(got[1].0, ToolStatus::Error, "{}", got[1].1);
         assert_eq!(got[2].0, ToolStatus::Error, "{}", got[2].1);
         assert!(got[2].1.contains("is the result of `ledger`"), "{}", got[2].1);
@@ -6942,8 +6942,8 @@ mod tests {
         assert_eq!(got[0].0, ToolStatus::Ok, "{}", got[0].1);
         assert_eq!(got[1].0, ToolStatus::Ok, "{}", got[1].1);
         // The blob is content-addressed: the wait that returned the whole output may be the first call to
-        // store it, so the producer is that wait or the starting bash call. Either way it is execution.
-        assert!(got[1].1.contains("execution: "), "{}", got[1].1);
+        // store it, so the producer is that wait or the starting bash call. Either way it is a run.
+        assert!(got[1].1.contains("run: "), "{}", got[1].1);
         e.rt.shutdown().await;
     }
 
@@ -7014,6 +7014,47 @@ mod tests {
         // A job nothing is known about registers nothing.
         let other = Event::JobSettled { job_id: "j9".into(), exit_code: None, output: None, detail: String::new() };
         assert!(produced_by(&s, &mut jobs, &other).is_none());
+    }
+
+    #[test]
+    fn produced_by_grades_what_it_registers() {
+        use loom_core::event::META_EVIDENCE_GRADE as KEY;
+        let s = SessionId::from("s-a");
+        let mut jobs = HashMap::new();
+        let grade = |jobs: &mut HashMap<_, _>, e: &Event| produced_by(&s, jobs, e).map(|(_, p)| p.grade);
+        // A result that says its output is analysis is analysis, though its tool is class Exec.
+        let scan = tool_result("c1", "dep_scan", ToolClass::Exec, Some("aa01"), json!({KEY: "analysis"}));
+        assert_eq!(grade(&mut jobs, &scan), Some(EvidenceGrade::Analysis));
+        let lookup = tool_result("c2", "cve_lookup", ToolClass::Exec, Some("aa02"), json!({KEY: "reference"}));
+        assert_eq!(grade(&mut jobs, &lookup), Some(EvidenceGrade::Reference));
+        // A plain command result is a run.
+        let bash = tool_result("c3", "bash", ToolClass::Exec, Some("aa03"), json!({}));
+        assert_eq!(grade(&mut jobs, &bash), Some(EvidenceGrade::Run));
+        // The key cannot raise a read to a run.
+        let lying = tool_result("c4", "fetch", ToolClass::Read, Some("aa04"), json!({KEY: "run"}));
+        assert_eq!(grade(&mut jobs, &lying), Some(EvidenceGrade::Read));
+        // The text a read showed is a read.
+        let read = tool_result("c5", "read", ToolClass::Read, None, json!({"of_blob": "ff01", "shown": [[1, 2]]}));
+        assert_eq!(grade(&mut jobs, &read), Some(EvidenceGrade::Read));
+        // A background job's output is a run, complete or matched.
+        let reg = Event::JobRegistered { job_id: "j1".into(), call_id: CallId::from("c6"), command: "make".into() };
+        assert!(produced_by(&s, &mut jobs, &reg).is_none());
+        let matched = Event::JobMatched {
+            job_id: "j1".into(),
+            pattern: "FOUND".into(),
+            output: Some(loom_core::BlobRef { id: BlobId::from("cc02"), bytes: 10, lines: 2 }),
+            from: 0,
+            shown: vec![1],
+            matches: 1,
+        };
+        assert_eq!(grade(&mut jobs, &matched), Some(EvidenceGrade::Run));
+        let settled = Event::JobSettled {
+            job_id: "j1".into(),
+            exit_code: Some(0),
+            output: Some(loom_core::BlobRef { id: BlobId::from("dd03"), bytes: 10, lines: 2 }),
+            detail: String::new(),
+        };
+        assert_eq!(grade(&mut jobs, &settled), Some(EvidenceGrade::Run));
     }
 
     #[tokio::test]

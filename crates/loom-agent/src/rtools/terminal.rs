@@ -431,7 +431,7 @@ pub fn finish_brief(
     if let Some(g) = unreachable {
         parts.push(format!(
             "The lead concluded the goal cannot be met as stated (evidence: {}):\n{}",
-            g.evidence.join(", "),
+            ledger.evidence_labels(&g.evidence),
             g.note
         ));
     }
@@ -504,7 +504,7 @@ fn evidence_line(e: &Evidence) -> String {
     let handle = i.blob.as_ref().map(handle_of).unwrap_or_else(|| "no stored output".to_string());
     let range = i.lines.map(|(a, b)| format!(" lines {a}-{b}")).unwrap_or_default();
     let quote = cut_chars(i.quote.as_deref().unwrap_or(""), QUOTE_RECORD_CHARS);
-    format!("- {} ({side}) {handle}{range}: {quote} \u{2014} {}", e.id, i.note)
+    format!("- {} ({side}; {}) {handle}{range}: {quote} \u{2014} {}", e.id, i.source_label(), i.note)
 }
 
 /// `s` cut to `max` characters, with `…` appended when something was removed.
@@ -1877,7 +1877,7 @@ mod tests {
     use super::*;
     use crate::rtools::testkit::{core_role, rig, rig_with, Rig};
     use crate::rtools::ChildInfo;
-    use loom_core::event::{ToolResult, ToolStatus as Status};
+    use loom_core::event::{EvidenceGrade, ToolResult, ToolStatus as Status};
     use loom_core::ledger::{EvidenceInput, EvidenceKind};
     use loom_core::log::{Durability, SessionLog};
 
@@ -2565,6 +2565,29 @@ mod tests {
         format!("e{}", r.shared.ledger().unwrap().evidence.len())
     }
 
+    /// Record analysis of the target (a supported claim with attested evidence from `dep_scan`, an `Exec` tool
+    /// whose output is analysis), graded the way the evidence tool grades it. Returns the evidence id.
+    fn record_analysis(r: &Rig) -> String {
+        let claim = format!("c{}", r.shared.ledger().unwrap().claims.len() + 1);
+        r.model_op(LedgerOp::ClaimAdd { text: "the target has a vulnerable dependency".into() });
+        r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
+            claim: claim.clone(),
+            kind: EvidenceKind::Static,
+            supports: true,
+            session: "s-test".into(),
+            call_id: "call-0".into(),
+            blob: None,
+            lines: None,
+            quote: None,
+            note: "scanned the target".into(),
+            attested: true,
+            tool: Some("dep_scan".into()),
+            grade: Some(EvidenceGrade::Analysis),
+        }));
+        r.model_op(LedgerOp::ClaimUpdate { id: claim, status: ClaimStatus::Supported, note: String::new() });
+        format!("e{}", r.shared.ledger().unwrap().evidence.len())
+    }
+
     /// Conclude the goal as met through the tool, after a recorded run.
     async fn conclude_met(r: &Rig) {
         let e = record_run(r);
@@ -2729,7 +2752,8 @@ mod tests {
         assert!(brief.question.contains("Name one route to it that was not tried"), "{}", brief.question);
         let context = brief.context.clone().unwrap();
         assert!(
-            context.contains("The lead concluded the goal cannot be met as stated (evidence: e1):\nevery route fails"),
+            context
+                .contains("The lead concluded the goal cannot be met as stated (evidence: e1 run):\nevery route fails"),
             "{context}"
         );
     }
@@ -2942,6 +2966,83 @@ mod tests {
         assert_eq!(open_objections(&r), 0);
         let st = r.shared.ledger().unwrap();
         assert!(st.obligations[0].outcome.clone().unwrap().contains(&new_run));
+    }
+
+    #[tokio::test]
+    async fn analysis_evidence_does_not_settle_an_objection_and_a_run_does() {
+        let r = lead_without_fresh_start();
+        conclude_met(&r).await;
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "I could not reproduce the fix.", rejected_payload());
+        r.orch.settle("s-kid2", ChildOutcome::Returned, "fine", accepted_payload());
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert_eq!(open_objections(&r), 2);
+        // An analysis record after the objections answers nothing: the finish is still refused, no verifier.
+        record_analysis(&r);
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("An objection is settled only by new work"), "{}", res.text);
+        assert_eq!(spawn_count(&r), 1);
+        assert_eq!(open_objections(&r), 2);
+        // A run does.
+        let run = record_run(&r);
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert_eq!(open_objections(&r), 0);
+        let st = r.shared.ledger().unwrap();
+        assert!(st.obligations[0].outcome.clone().unwrap().contains(&run));
+    }
+
+    #[tokio::test]
+    async fn analysis_evidence_does_not_reset_the_stuck_count() {
+        let r = lead_without_fresh_start();
+        conclude_met(&r).await;
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "no", rejected_payload());
+        r.orch.settle("s-kid2", ChildOutcome::Returned, "fine", accepted_payload());
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        r.shared.take_emitted();
+        // Analysis recorded since the rejection is not fresh work: the count keeps rising and the item opens
+        // at the threshold, exactly as without it.
+        record_analysis(&r);
+        r.shared.take_emitted();
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(!res.text.contains("non-blocking item"), "{}", res.text);
+        record_analysis(&r);
+        r.shared.take_emitted();
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("The operator has been notified as a non-blocking item"), "{}", res.text);
+        let (items, _) = drain(&r);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(items[0].text.contains("has not advanced in 2 finish attempts"), "{}", items[0].text);
+    }
+
+    #[tokio::test]
+    async fn conclude_met_citing_only_analysis_is_refused_and_records_nothing() {
+        let r = lead_with_goal();
+        let e = record_analysis(&r);
+        let before = r.shared.ledger().unwrap();
+        let res = r.call("conclude", json!({"status": "met", "note": "the scan shows it", "evidence": [e]})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("analysis is not a run"), "{}", res.text);
+        // The ledger's own sentence, verbatim.
+        let rule = r
+            .shared
+            .ledger_append(
+                false,
+                LedgerOp::GoalMetSet {
+                    status: GoalMetStatus::Supported,
+                    note: "the scan shows it".into(),
+                    evidence: vec![e.clone()],
+                },
+            )
+            .expect_err("the rule refuses it");
+        assert!(res.text.contains(&rule), "{} vs {rule}", res.text);
+        let after = r.shared.ledger().unwrap();
+        assert_eq!(after, before, "nothing was recorded");
+        assert_ne!(after.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Supported));
     }
 
     #[tokio::test]
@@ -4095,11 +4196,15 @@ mod tests {
 
     #[test]
     fn brief_names_the_stored_output_of_every_piece_of_evidence() {
-        let evidence = |id: &str, blob: Option<&str>, supports: bool| Evidence {
+        let evidence = |id: &str, blob: Option<&str>, supports: bool, from: Option<(&str, EvidenceGrade)>| Evidence {
             id: id.into(),
             input: EvidenceInput {
                 claim: "c1".into(),
-                kind: EvidenceKind::Execution,
+                kind: if from.is_some_and(|(_, g)| g != EvidenceGrade::Run) {
+                    EvidenceKind::Static
+                } else {
+                    EvidenceKind::Execution
+                },
                 supports,
                 session: "s-test".into(),
                 call_id: "call-0".into(),
@@ -4108,8 +4213,8 @@ mod tests {
                 quote: blob.map(|_| "line two".to_string()),
                 note: "shows it".into(),
                 attested: true,
-                tool: None,
-                grade: None,
+                tool: from.map(|(t, _)| t.to_string()),
+                grade: from.map(|(_, g)| g),
             },
             n: 1,
         };
@@ -4122,9 +4227,10 @@ mod tests {
                 evidence: vec!["e1".into(), "e3".into()],
             }],
             evidence: vec![
-                evidence("e1", Some("ab"), true),
-                evidence("e2", Some("cd"), false),
-                evidence("e3", None, true),
+                evidence("e1", Some("ab"), true, Some(("bash", EvidenceGrade::Run))),
+                evidence("e2", Some("cd"), false, Some(("dep_scan", EvidenceGrade::Analysis))),
+                // An older entry, with no tool or grade recorded.
+                evidence("e3", None, true, None),
             ],
             ..LedgerState::default()
         };
@@ -4132,12 +4238,12 @@ mod tests {
         let c = finish_brief(&st, "done", &[], None, &["e2".to_string(), "e9".to_string()]).context.unwrap();
         let (ab, cd) = ("ab".repeat(8), "cd".repeat(8));
         assert!(
-            c.contains(&format!("Evidence the lead names for the result:\n- e2 (undermines) out:{cd} lines 2-3: line two \u{2014} shows it\n\n")),
+            c.contains(&format!("Evidence the lead names for the result:\n- e2 (undermines; analysis by dep_scan) out:{cd} lines 2-3: line two \u{2014} shows it\n\n")),
             "{c}"
         );
         assert!(
             c.ends_with(&format!(
-                "Claims recorded as supported:\n- c1: it works\n  - e1 (supports) out:{ab} lines 2-3: line two \u{2014} shows it\n  - e3 (supports) no stored output:  \u{2014} shows it"
+                "Claims recorded as supported:\n- c1: it works\n  - e1 (supports; run by bash) out:{ab} lines 2-3: line two \u{2014} shows it\n  - e3 (supports; run) no stored output:  \u{2014} shows it"
             )),
             "{c}"
         );
@@ -4159,8 +4265,8 @@ mod tests {
             quote: Some("line two".into()),
             note: "the test passes".into(),
             attested: true,
-            tool: None,
-            grade: None,
+            tool: Some("bash".into()),
+            grade: Some(EvidenceGrade::Run),
         }));
         r.model_op(LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: String::new() });
         r.orch.settle("s-kid1", ChildOutcome::Returned, "fine", accepted_payload());
@@ -4169,7 +4275,7 @@ mod tests {
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         let spawned = r.orch.spawned.lock().unwrap().clone();
         let ctx_text = spawned[0].1.brief.context.clone().unwrap();
-        let line = format!("- e1 (supports) {h} lines 2-2: line two \u{2014} the test passes");
+        let line = format!("- e1 (supports; run by bash) {h} lines 2-2: line two \u{2014} the test passes");
         assert!(ctx_text.contains(&format!("Evidence the lead names for the result:\n{line}")), "{ctx_text}");
         assert!(
             ctx_text.contains(&format!("Claims recorded as supported:\n- c1: the parser is fixed\n  {line}")),
