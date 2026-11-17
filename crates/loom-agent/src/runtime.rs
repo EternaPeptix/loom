@@ -119,7 +119,12 @@
 //!     The policy then has the infrastructure deny (E1): `with_infrastructure(infra_spec(&config))`: the
 //!     daemon's port (`sandbox.daemon_port`), the `host:port` of every model profile's `base_url`, the box's
 //!     `ssh_host` when the box is enabled, and `network.infrastructure`; `Runtime::start` parses them once
-//!     and refuses to start on an entry it cannot read (`The network configuration cannot be used: …`).
+//!     and refuses to start on an entry it cannot read (`The network configuration cannot be used: …`). The
+//!     spec also carries what `crate::infra` resolved (the box's Docker host from `ssh -G`, the addresses of
+//!     every named entry, this machine's own addresses), at start and every `RESOLVE_EVERY`; a `box.ssh_host`
+//!     of the form `user@host` or `ssh://user@host:2222` is reduced to its host, and one whose host the policy
+//!     cannot read is left out with a warning. `Runtime::start` sets `config.sandbox.infra_ports` (the loopback
+//!     ports of model endpoints and `network.infrastructure`, `crate::infra::loopback_ports`).
 //!     Hosts the operator revoked in this run (`revoke_scope`) are left out of `granted_hosts`.
 //!     Every session gets a grant, also under `deny_all` (in-process fetches go through the proxy
 //!     too, so the policy is what refuses them).
@@ -375,17 +380,29 @@
 //!   state block then lists it), and a protected note in the lead's window. No turn is started.
 //!   The answer is a [`RuleReceipt`]: the lead, whether it was in a turn (`queued`), whether the
 //!   mission keeps a ledger, and the stock text when one was used.
+//! - `grant_scope` refuses a host that infrastructure refuses (`Policy::infrastructure_refusal`: a literal
+//!   address of a model endpoint, the box's Docker host, cloud metadata, DevTools or Docker API ports on this
+//!   machine; `The host `{h}` is infrastructure …`) and grants nothing of the list; it reaches every known session
+//!   of the mission, not only the active ones, and bumps the mission's `scope_gen`.
 //! - `revoke_scope(mission, host, reason)`: the operator withdraws one granted host (exactly as granted, case
 //!   ignored). Blank host or reason refused with a sentence saying what to write; a mission without a lead
-//!   or a host that is not granted refused (the sentence lists the granted hosts). In order: the revoke is
-//!   appended to the mission's journal as `ScopeRevoke` (a mission without a ledger skips this; a grant the
-//!   lead has not recorded yet is revoked without a record and the receipt says `recorded: false`; any other
-//!   journal failure refuses the call and changes nothing); the host leaves the in-memory grants and
-//!   `scope_revoked` keeps it out of `granted_hosts` until granted again (`grant_scope` of it clears that);
-//!   every running session of the mission gets its rebuilt policy through `Proxy::set_policy` and
-//!   `Proxy::cut_hosts` ends its open connections to the host; the box rules are applied again; a running
+//!   or a host that is not granted refused (the sentence lists the granted hosts, and names the wildcard grant
+//!   that covers the host when there is one: revoke that). In order: the revoke is
+//!   appended to the mission's journal as `ScopeRevoke` when the ledger lists the host as granted (a mission
+//!   without a ledger skips this; a grant the lead has not recorded yet, still queued on disk, is revoked
+//!   without a record and the receipt says `recorded: false`; revoking the host again once the lead has recorded
+//!   the grant records it; any journal failure refuses the call and changes nothing); the host leaves the
+//!   in-memory grants and the mission's revoked hosts (`<mission dir>/scope_revoked.json`, written durably, read
+//!   at start; `scope_revoked` in memory) keep it out of `granted_hosts` until granted again (`grant_scope` of it
+//!   clears that) — also after a restart, whatever the ledger says of a grant recorded later. Every session of
+//!   the mission that is known, started or being started, gets its rebuilt policy through `Proxy::set_policy`,
+//!   which refuses the revoked host whatever else allows it (`Policy::with_revoked`: `deny revoked {host}`: a
+//!   wildcard grant, `network.allow` and `mode open` do not reach it), and `Proxy::cut_hosts` ends its open
+//!   connections to the host; a session that is built while this runs derives its policy again when the
+//!   mission's grants changed meanwhile (`scope_gen`); the box rules are applied again; a running
 //!   lead gets `Input::ScopeRevoked` (a protected note, no turn). Receipt: [`ScopeRevokeReceipt`]. A policy
-//!   that cannot be rebuilt for a session is an error naming it, after everything else was done.
+//!   that cannot be rebuilt for a session is an error naming it, after everything else was done; a revoke
+//!   that is not recorded and could not be saved says that a restart undoes it.
 //! - `stop(id)`: any session. Active: `control.stop_turn()` and `Input::Stop`. Not active: nothing.
 //! - `resume(id)`: root only; activate; `Input::Resume` to it and to each of its unsettled children
 //!   that a restart left idle and that have not been resumed since (activating them): each gets one
@@ -869,17 +886,53 @@ pub struct ScopeRevokeReceipt {
 fn infra_spec(config: &Config) -> InfraSpec {
     let model_endpoints = config.models.values().filter_map(|m| endpoint_of(&m.base_url)).collect::<BTreeSet<_>>();
     let ssh = config.boxed.ssh_host.trim();
+    let mut docker_hosts = Vec::new();
+    if config.boxed.enabled && !ssh.is_empty() {
+        // The host of the ssh destination (`user@host`, `ssh://user@host:2222`), as the policy reads one. A
+        // destination whose host the policy cannot read does not stop the daemon: it is left out, loudly.
+        match crate::infra::docker_host_of(ssh) {
+            Some(h)
+                if Policy::new(&loom_core::config::NetworkCfg::default())
+                    .and_then(|p| {
+                        p.with_infrastructure(&InfraSpec { docker_hosts: vec![h.clone()], ..InfraSpec::default() })
+                    })
+                    .is_ok() =>
+            {
+                docker_hosts.push(h)
+            }
+            _ => tracing::warn!(
+                "box.ssh_host \"{ssh}\" has no host name the egress policy can read, so the box's Docker host is not \
+                 refused by name: add its address to network.infrastructure"
+            ),
+        }
+    }
     InfraSpec {
         daemon_port: config.sandbox.daemon_port,
         model_endpoints: model_endpoints.into_iter().collect(),
-        docker_hosts: if config.boxed.enabled && !ssh.is_empty() { vec![ssh.to_string()] } else { Vec::new() },
+        docker_hosts,
         extra: config.network.infrastructure.clone(),
+        resolved: Vec::new(),
+        local_addrs: Vec::new(),
     }
+}
+
+/// `infra_spec` with what the daemon resolved (see `crate::infra`): the Docker host's other names, the
+/// addresses of every named entry and this machine's own addresses.
+fn infra_spec_resolved(config: &Config, res: &crate::infra::Resolution) -> InfraSpec {
+    let mut spec = infra_spec(config);
+    for h in &res.docker_hosts {
+        if !spec.docker_hosts.contains(h) {
+            spec.docker_hosts.push(h.clone());
+        }
+    }
+    spec.resolved = res.addrs.clone();
+    spec.local_addrs = res.local.clone();
+    spec
 }
 
 /// The `host:port` a base URL connects to (`http://h:8000/v1` is `h:8000`; no port is 80 for http and 443
 /// for https; user information and the path are left out). `None` for text that is not an http(s) URL.
-fn endpoint_of(base_url: &str) -> Option<String> {
+pub(crate) fn endpoint_of(base_url: &str) -> Option<String> {
     let (scheme, rest) = base_url.trim().split_once("://")?;
     let default = match scheme.to_ascii_lowercase().as_str() {
         "http" => 80,
@@ -896,6 +949,33 @@ fn endpoint_of(base_url: &str) -> Option<String> {
         None => authority.contains(':'),
     };
     Some(if has_port { authority.to_string() } else { format!("{authority}:{default}") })
+}
+
+/// The hosts kept in `path` (a JSON list); none when the file is missing or unreadable (with a warning for
+/// the second).
+fn load_revoked(path: &Path) -> Vec<String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::warn!("the revoked hosts in {} cannot be read ({e}); they are not applied", path.display());
+            Vec::new()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            tracing::warn!("the revoked hosts in {} cannot be read ({e}); they are not applied", path.display());
+            Vec::new()
+        }
+    }
+}
+
+/// The grant among `granted` that covers `host` by its wildcard (`*.suffix` covers `x.suffix`), if any.
+fn covering_grant<'a>(granted: &'a [String], host: &str) -> Option<&'a str> {
+    let h = host.to_ascii_lowercase();
+    let name = h.rsplit_once(':').map_or(h.as_str(), |(n, _)| n);
+    granted.iter().map(String::as_str).find(|g| {
+        g.strip_prefix("*.").is_some_and(|suffix| {
+            name.len() > suffix.len() && name.ends_with(&format!(".{}", suffix.to_ascii_lowercase()))
+        })
+    })
 }
 
 /// The scope recorded in the ledger for an approval given without one.
@@ -1424,6 +1504,9 @@ struct State {
     /// at once, whatever the ledger or `scope` still holds (a grant that is queued, a revoke that is not
     /// recorded). A grant of the same host again takes it out of here.
     scope_revoked: HashMap<MissionId, Vec<String>>,
+    /// Bumped by every grant and revoke of a mission, before the sessions are told: a session that was
+    /// built with an older value has its policy derived again (see `Inner::policy_is_current`).
+    scope_gen: HashMap<MissionId, u64>,
     /// The box of each mission that has used one (see `Inner::box_for`).
     boxes: HashMap<MissionId, Arc<MissionBox>>,
     /// Missions whose box was removed because the mission was stopped, ended or archived: no box is made for
@@ -1485,6 +1568,15 @@ struct Inner {
     pagers: Mutex<Vec<(SessionId, Arc<Mutex<PageReader>>)>>,
     /// The Docker host of `[box]`, when the operator enabled one (see `loom_tools::boxctl`).
     box_host: Option<Arc<DockerHost>>,
+    /// What the daemon resolved about its infrastructure (`crate::infra`), for every session's policy.
+    infra: Mutex<crate::infra::Resolution>,
+}
+
+impl Inner {
+    /// The last resolution of the infrastructure names and this machine's addresses.
+    fn infra(&self) -> crate::infra::Resolution {
+        self.infra.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
 }
 
 impl Drop for Inner {
@@ -2406,17 +2498,70 @@ impl Inner {
                 Err(e) => tracing::warn!(session = %meta.id, "granted hosts not read from the ledger: {e}"),
             }
         }
-        let st = self.st();
+        let mut st = self.st();
         for h in st.scope.get(&meta.mission).into_iter().flatten() {
             if !hosts.iter().any(|x| x.eq_ignore_ascii_case(h)) {
                 hosts.push(h.clone());
             }
         }
-        // What the operator revoked in this run leaves at once, recorded or not.
-        if let Some(revoked) = st.scope_revoked.get(&meta.mission) {
-            hosts.retain(|h| !revoked.iter().any(|r| r.eq_ignore_ascii_case(h)));
-        }
+        // What the operator revoked leaves at once, recorded or not (the overlay is kept on disk).
+        let revoked = st
+            .scope_revoked
+            .entry(meta.mission.clone())
+            .or_insert_with(|| load_revoked(&self.revoked_path(&meta.mission)));
+        hosts.retain(|h| !revoked.iter().any(|r| r.eq_ignore_ascii_case(h)));
         hosts
+    }
+
+    /// Where the hosts the operator revoked from `mission` are kept, so that a revoke the ledger does not
+    /// hold (a grant still queued for the lead) survives a restart.
+    fn revoked_path(&self, mission: &MissionId) -> PathBuf {
+        self.paths.mission_dir(mission).join("scope_revoked.json")
+    }
+
+    /// The hosts revoked from `mission` (kept on disk, read once).
+    fn revoked_hosts(&self, mission: &MissionId) -> Vec<String> {
+        let mut st = self.st();
+        st.scope_revoked.entry(mission.clone()).or_insert_with(|| load_revoked(&self.revoked_path(mission))).clone()
+    }
+
+    /// Write the revoked hosts of `mission` durably.
+    fn save_revoked(&self, mission: &MissionId, hosts: &[String]) -> Result<(), String> {
+        let path = self.revoked_path(mission);
+        let dir = path.parent().ok_or_else(|| format!("{} has no directory", path.display()))?;
+        ensure_private_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let text = serde_json::to_vec(hosts).map_err(|e| e.to_string())?;
+        let tmp = dir.join(".scope_revoked.json.tmp");
+        std::fs::write(&tmp, text)
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))
+    }
+
+    /// The generation of the mission's grants and revokes.
+    fn scope_generation(&self, mission: &MissionId) -> u64 {
+        self.st().scope_gen.get(mission).copied().unwrap_or(0)
+    }
+
+    /// A grant or revoke of `mission` is about to be applied to its sessions.
+    fn bump_scope_generation(&self, mission: &MissionId) {
+        let mut st = self.st();
+        let g = st.scope_gen.entry(mission.clone()).or_insert(0);
+        *g = g.wrapping_add(1);
+    }
+
+    /// After a session's proxy grant was made from a policy derived at generation `built`: when the mission's
+    /// grants changed since, derive the policy again and give it to the session. A grant or revoke that
+    /// comes later finds the session's proxy grant and sets its own policy.
+    fn policy_is_current(&self, meta: &SessionMeta, explicit: bool, built: u64) {
+        if self.scope_generation(&meta.mission) == built {
+            return;
+        }
+        match self.session_policy(meta, explicit) {
+            Ok(policy) => {
+                self.proxy.set_policy(&meta.id, policy);
+            }
+            Err(e) => tracing::warn!(session = %meta.id, "policy not derived again after a scope change: {e}"),
+        }
     }
 
     /// The proxy policy of a session: the configured network plus the mission's granted hosts. A
@@ -2432,7 +2577,15 @@ impl Inner {
             }
             Err(e) => Err(e),
         }?;
-        policy.with_infrastructure(&infra_spec(&self.config))
+        let revoked = self.revoked_hosts(&meta.mission);
+        let policy = match policy.clone().with_revoked(&revoked) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(session = %meta.id, "revoked hosts ignored: {e}");
+                policy
+            }
+        };
+        policy.with_infrastructure(&infra_spec_resolved(&self.config, &self.infra()))
     }
 
     /// The `Deps` of a session (granting it its proxy credentials).
@@ -2463,12 +2616,15 @@ impl Inner {
             return Err("Bubblewrap requires network.mode = deny_all. Explicit mission grants apply only to trusted in-process HTTP tools; subprocess proxy bridges are unsupported.".into());
         }
         let jobs_dir = self.paths.session_dir(id).join("jobs");
+        let built_at = self.scope_generation(&meta.mission);
         let policy = self.session_policy(meta, explicit)?;
         // The session's own proxy listener comes first: its port is the only one the sandbox allows.
         let grant = self
             .proxy
             .grant(id, policy)
             .map_err(|e| format!("The egress proxy cannot open a port for this session: {e}"))?;
+        // A grant or revoke that ran while the policy was being derived reached no proxy grant of this session.
+        self.policy_is_current(meta, explicit, built_at);
         // From here a failure takes the grant, and with it the listener, back.
         let mut revoke = RevokeOnDrop { proxy: &self.proxy, session: id, armed: true };
         let sandbox = Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, (!bubblewrap).then_some(grant.port))
@@ -3940,10 +4096,17 @@ impl Runtime {
     pub async fn start(mut config: Config, paths: Paths) -> Result<Runtime, String> {
         // Every sandbox made from the configuration (sessions, agents' copies, judges) carries this.
         config.sandbox.network_deny_all = config.network.mode == NetworkMode::DenyAll;
+        // The loopback ports of infrastructure that no command may reach, whatever loopback it is allowed.
+        config.sandbox.infra_ports = crate::infra::loopback_ports(&config);
         config.check().map_err(|e| e.to_string())?;
         // The infrastructure every command policy refuses is checked now, not at the first session.
+        // The names are resolved here, once, and again every `RESOLVE_EVERY` (see `crate::infra`).
+        let resolution = {
+            let config = config.clone();
+            tokio::task::spawn_blocking(move || crate::infra::resolve_system(&config)).await.unwrap_or_default()
+        };
         Policy::new(&loom_core::config::NetworkCfg::default())
-            .and_then(|p| p.with_infrastructure(&infra_spec(&config)))
+            .and_then(|p| p.with_infrastructure(&infra_spec_resolved(&config, &resolution)))
             .map_err(|e| format!("The network configuration cannot be used: {e}"))?;
         paths
             .ensure_private_layout()
@@ -4008,6 +4171,7 @@ impl Runtime {
             sink: Arc::new(SinkImpl(me.clone())),
             pagers: Mutex::new(Vec::new()),
             box_host,
+            infra: Mutex::new(resolution),
         });
 
         let weak = Arc::downgrade(&inner);
@@ -4039,6 +4203,23 @@ impl Runtime {
                 }
             });
             inner.st().tasks.push(watcher);
+        }
+
+        // Not under test: a resolver of the machine that runs the tests must not change them.
+        #[cfg(not(test))]
+        {
+            let weak = Arc::downgrade(&inner);
+            let config = inner.config.clone();
+            let refresher = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(crate::infra::RESOLVE_EVERY).await;
+                    let config = config.clone();
+                    let fresh = tokio::task::spawn_blocking(move || crate::infra::resolve_system(&config)).await;
+                    let (Some(inner), Ok(fresh)) = (weak.upgrade(), fresh) else { return };
+                    *inner.infra.lock().unwrap_or_else(|p| p.into_inner()) = fresh;
+                }
+            });
+            inner.st().tasks.push(refresher);
         }
 
         inner.load_known();
@@ -4551,15 +4732,35 @@ impl Runtime {
         note: Option<&str>,
     ) -> Result<ScopeReceipt, String> {
         let hosts = loom_net::policy::check_hosts(hosts)?;
+        // Infrastructure is refused to every command whatever is granted: say so now, not at the first connect.
+        let infra = Policy::new(&self.inner.config.network)
+            .and_then(|p| p.with_infrastructure(&infra_spec_resolved(&self.inner.config, &self.inner.infra())))?;
+        for h in &hosts {
+            if let Some(rule) = infra.infrastructure_refusal(h) {
+                return Err(format!(
+                    "The host `{h}` is infrastructure of this machine or of loom ({rule}); no grant lets a command reach it, so nothing was granted. Grant the target by its own name or address instead."
+                ));
+            }
+        }
         let note = note.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
         let lead = self.lead_of(id)?;
         let ledger = self.inner.mission_explicit(&lead)?;
         // Held by the mission from now on, so that a lead activated by the send below gets the policy.
-        let added: Vec<String> = {
+        let (added, unrevoked): (Vec<String>, Vec<String>) = {
             let mut st = self.inner.st();
             // A host granted again after a revoke is granted again.
-            if let Some(revoked) = st.scope_revoked.get_mut(&lead.mission) {
-                revoked.retain(|r| !hosts.iter().any(|h| h.eq_ignore_ascii_case(r)));
+            let revoked = st
+                .scope_revoked
+                .entry(lead.mission.clone())
+                .or_insert_with(|| load_revoked(&self.inner.revoked_path(&lead.mission)));
+            let unrevoked: Vec<String> =
+                revoked.iter().filter(|r| hosts.iter().any(|h| h.eq_ignore_ascii_case(r))).cloned().collect();
+            if !unrevoked.is_empty() {
+                revoked.retain(|r| !unrevoked.iter().any(|u| u.eq_ignore_ascii_case(r)));
+                let kept = revoked.clone();
+                if let Err(e) = self.inner.save_revoked(&lead.mission, &kept) {
+                    tracing::warn!("the revoked hosts could not be saved: {e}");
+                }
             }
             let granted = st.scope.entry(lead.mission.clone()).or_default();
             let mut added = Vec::new();
@@ -4569,16 +4770,31 @@ impl Runtime {
                     added.push(h.clone());
                 }
             }
-            added
+            let g = st.scope_gen.entry(lead.mission.clone()).or_insert(0);
+            *g = g.wrapping_add(1);
+            (added, unrevoked)
         };
         let input = Input::Scope { hosts: hosts.clone(), note };
         if let Err(e) = self.send_to_lead(&lead.id, input, ledger, None) {
-            if let Some(granted) = self.inner.st().scope.get_mut(&lead.mission) {
-                granted.retain(|h| !added.contains(h));
+            {
+                let mut st = self.inner.st();
+                if let Some(granted) = st.scope.get_mut(&lead.mission) {
+                    granted.retain(|h| !added.contains(h));
+                }
+                // The revokes that this grant lifted stand again.
+                if !unrevoked.is_empty() {
+                    let revoked = st.scope_revoked.entry(lead.mission.clone()).or_default();
+                    revoked.extend(unrevoked.iter().cloned());
+                    let kept = revoked.clone();
+                    if let Err(e) = self.inner.save_revoked(&lead.mission, &kept) {
+                        tracing::warn!("the revoked hosts could not be saved: {e}");
+                    }
+                }
             }
             // A lead activated by the failed send was built with the new hosts: take them back.
-            if !added.is_empty() {
-                for meta in self.active_family(&lead.mission) {
+            if !added.is_empty() || !unrevoked.is_empty() {
+                self.inner.bump_scope_generation(&lead.mission);
+                for meta in self.mission_family(&lead.mission) {
                     if let Ok(policy) = self.inner.session_policy(&meta, ledger) {
                         self.inner.proxy.set_policy(&meta.id, policy);
                     }
@@ -4586,7 +4802,7 @@ impl Runtime {
             }
             return Err(e);
         }
-        let family = self.active_family(&lead.mission);
+        let family = self.mission_family(&lead.mission);
         let mut lead_set = false;
         for meta in &family {
             let policy = self.inner.session_policy(meta, ledger)?;
@@ -4637,7 +4853,17 @@ impl Runtime {
         })?;
         let ledger = self.inner.mission_explicit(&lead)?;
         let granted = self.inner.granted_hosts(&lead, ledger);
-        let entry = match granted.iter().find(|h| h.eq_ignore_ascii_case(host)) {
+        // What the ledger holds as granted now, apart from what was revoked here and not recorded: the lead
+        // may have recorded the grant since, and then the revoke can be recorded too.
+        let journal = Journal::new(self.inner.paths.journal(mission), self.inner.key.clone());
+        let in_ledger: Vec<String> = if ledger {
+            journal.state().map(|state| state.granted_hosts()).map_err(|e| {
+                format!("The ledger of the mission cannot be read ({e}); nothing was changed. Try again.")
+            })?
+        } else {
+            Vec::new()
+        };
+        let entry = match granted.iter().chain(&in_ledger).find(|h| h.eq_ignore_ascii_case(host)) {
             Some(h) => h.clone(),
             None => {
                 let now = if granted.is_empty() {
@@ -4645,19 +4871,20 @@ impl Runtime {
                 } else {
                     format!("granted to this mission: {}", granted.join(", "))
                 };
-                return Err(format!("The host `{host}` is not granted, so there is nothing to revoke ({now}). Write the host exactly as it was granted."));
+                return Err(match covering_grant(&granted, host) {
+                    Some(g) => format!("The host `{host}` is not granted by itself; the grant `{g}` covers it. Revoke `{g}` (a revoke names a grant exactly as it was written), then grant the hosts that should stay. ({now})"),
+                    None => format!("The host `{host}` is not granted, so there is nothing to revoke ({now}). Write the host exactly as it was granted."),
+                });
             }
         };
-        // (1) The record first: a revoke that is not recorded would come back at the next start.
+        // (1) The record first: a revoke that is not recorded would come back at the next start. The ledger
+        // holds the grant when it lists the host itself; a grant the lead has not recorded yet (it is queued
+        // on disk) is revoked here without a record, and the revoked-hosts file keeps it out.
         let mut recorded = false;
-        if ledger {
-            let journal = Journal::new(self.inner.paths.journal(mission), self.inner.key.clone());
+        if ledger && in_ledger.iter().any(|h| h.eq_ignore_ascii_case(&entry)) {
             let op = LedgerOp::ScopeRevoke { host: entry.clone(), reason: reason.to_string() };
             match journal.append(&lead.id, true, op, &|_| Ok(())) {
                 Ok(_) => recorded = true,
-                // The ledger does not hold the grant yet (the lead has not recorded it): revoke it here
-                // anyway; the receipt says it is not recorded.
-                Err(journal::JournalError::Rule(why)) if why.contains("not granted") => {}
                 Err(e) => {
                     return Err(format!(
                         "The revoke could not be recorded in the ledger ({e}); nothing was changed. Try again."
@@ -4665,20 +4892,28 @@ impl Runtime {
                 }
             }
         }
-        // (2) Out of the grants held in memory, and kept out until granted again.
-        {
+        // (2) Out of the grants held in memory, and kept out until granted again: in memory and on disk, so
+        // that it holds after a restart, whatever the ledger says of a grant recorded later.
+        self.inner.bump_scope_generation(mission);
+        let kept = {
             let mut st = self.inner.st();
             if let Some(held) = st.scope.get_mut(mission) {
                 held.retain(|h| !h.eq_ignore_ascii_case(&entry));
             }
-            let revoked = st.scope_revoked.entry(mission.clone()).or_default();
+            let revoked = st
+                .scope_revoked
+                .entry(mission.clone())
+                .or_insert_with(|| load_revoked(&self.inner.revoked_path(mission)));
             if !revoked.iter().any(|r| r.eq_ignore_ascii_case(&entry)) {
                 revoked.push(entry.clone());
             }
-        }
-        // (3) The running sessions: the narrowed policy, then the open connections.
+            revoked.clone()
+        };
+        let saved = self.inner.save_revoked(mission, &kept);
+        // (3) Every session of the mission, started or being started: the narrowed policy, then the open
+        // connections.
         let (mut sessions, mut cut, mut failed) = (0u32, 0u32, Vec::new());
-        for meta in self.active_family(mission) {
+        for meta in self.mission_family(mission) {
             match self.inner.session_policy(&meta, ledger) {
                 Ok(policy) => {
                     if self.inner.proxy.set_policy(&meta.id, policy) {
@@ -4698,6 +4933,14 @@ impl Runtime {
                 let _ = a.inputs.send(Input::ScopeRevoked { host: entry.clone(), reason: reason.to_string() });
             }
         }
+        if let Err(e) = saved {
+            if !recorded {
+                return Err(format!(
+                    "The revoke of {entry} is applied to the running sessions but could not be saved ({e}), and the ledger does not hold the grant yet: it is undone by a restart of the daemon. Free the disk or fix the permissions of the loom home, then revoke it again."
+                ));
+            }
+            tracing::warn!("the revoked hosts of {} could not be saved: {e}", mission.as_str());
+        }
         if !failed.is_empty() {
             return Err(format!(
                 "The revoke of {entry} is recorded and kept out of every new session, but the egress policy of {} could not be rebuilt ({}): stop that session so that it restarts without the host.",
@@ -4708,10 +4951,11 @@ impl Runtime {
         Ok(ScopeRevokeReceipt { lead: lead.id, host: entry, ledger, recorded, sessions, cut })
     }
 
-    /// The metas of the active sessions of `mission`.
-    fn active_family(&self, mission: &MissionId) -> Vec<SessionMeta> {
+    /// The metas of every session of `mission` that is known, started or not: one that is being started
+    /// holds its proxy grant before it is active, and a grant or revoke must reach it.
+    fn mission_family(&self, mission: &MissionId) -> Vec<SessionMeta> {
         let st = self.inner.st();
-        st.known.values().filter(|k| &k.meta.mission == mission && k.active.is_some()).map(|k| k.meta.clone()).collect()
+        st.known.values().filter(|k| &k.meta.mission == mission).map(|k| k.meta.clone()).collect()
     }
 
     pub async fn stop(&self, id: &SessionId) -> Result<(), String> {
@@ -5879,7 +6123,7 @@ mod tests {
                 cut: 0
             }
         );
-        assert_eq!(rule(&e.rt, "api.example.test").as_deref(), Some("not in allow list"));
+        assert_eq!(rule(&e.rt, "api.example.test").as_deref(), Some("deny revoked api.example.test"));
         assert_eq!(rule(&e.rt, "x.cdn.test").as_deref(), Some("allow *.cdn.test"), "the other grant stands");
         let state = e.rt.ledger(&mission).unwrap().state;
         assert_eq!(state.granted_hosts(), ["*.cdn.test"]);
@@ -5909,7 +6153,7 @@ mod tests {
         // A new daemon builds the session from the ledger: the revoked host stays out.
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         rt2.inner.activate(&id).unwrap();
-        assert_eq!(rule(&rt2, "api.example.test").as_deref(), Some("not in allow list"));
+        assert_eq!(rule(&rt2, "api.example.test").as_deref(), Some("deny revoked api.example.test"));
         assert_eq!(rule(&rt2, "x.cdn.test").as_deref(), Some("allow *.cdn.test"));
         rt2.shutdown().await;
     }
@@ -5920,12 +6164,16 @@ mod tests {
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         let id = info.meta.id.clone();
         until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
-        let hosts: Vec<String> =
-            ["169.254.169.254", "127.0.0.1:9222", "127.0.0.1:2375", "metadata.google.internal", "lab.example.test"]
-                .iter()
-                .map(|h| h.to_string())
-                .collect();
-        e.rt.grant_scope(&id, &hosts, None).await.unwrap();
+        // The grant is refused up front, with the rule, and grants nothing of the list.
+        for bad in ["169.254.169.254", "127.0.0.1:9222", "127.0.0.1:2375", "metadata.google.internal"] {
+            let hosts = vec![bad.to_string(), "lab.example.test".to_string()];
+            let err = e.rt.grant_scope(&id, &hosts, None).await.unwrap_err();
+            assert!(
+                err.contains(bad) && err.contains("deny infrastructure: ") && err.contains("nothing was granted"),
+                "{err}"
+            );
+        }
+        e.rt.grant_scope(&id, &["lab.example.test".to_string()], None).await.unwrap();
         let check =
             |host: &str, port: u16| e.rt.inner.proxy.check_name(&id, host, port).map(|v| v.rule).unwrap_or_default();
         assert_eq!(check("lab.example.test", 443), "allow lab.example.test");
@@ -5935,6 +6183,116 @@ mod tests {
             let r = check(host, port);
             assert!(r.starts_with("deny infrastructure: "), "{host}:{port} {r}");
         }
+        e.rt.shutdown().await;
+    }
+
+    /// The tailnet case: the model host is configured by name, the agent asks for its IP address.
+    #[tokio::test]
+    async fn a_literal_grant_of_the_address_a_model_host_resolves_to_is_refused() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        *e.rt.inner.infra.lock().unwrap() = crate::infra::Resolution {
+            addrs: vec![loom_net::InfraAddr {
+                label: "model endpoint spark-one.tail1234.ts.net:8000".into(),
+                addr: "100.101.102.103".parse().unwrap(),
+                port: Some(8000),
+            }],
+            ..Default::default()
+        };
+        let err = e.rt.grant_scope(&id, &["100.101.102.103:8000".to_string()], None).await.unwrap_err();
+        assert!(err.contains("deny infrastructure: model endpoint spark-one"), "{err}");
+        // A grant that was recorded before the address was known is inert at the connection.
+        let meta = e.rt.inner.st().known.get(&id).unwrap().meta.clone();
+        e.rt.inner.st().scope.entry(mission).or_default().push("100.101.102.103:8000".into());
+        let policy = e.rt.inner.session_policy(&meta, true).unwrap();
+        let v = policy.check_addr("100.101.102.103", 8000, "100.101.102.103".parse().unwrap(), "r");
+        assert!(!v.allowed && v.rule.starts_with("deny infrastructure: model endpoint"), "{v:?}");
+        e.rt.shutdown().await;
+    }
+
+    /// A revoke is a withdrawal: a wildcard grant that also covers the host does not keep it reachable.
+    #[tokio::test]
+    async fn a_revoked_host_stays_refused_under_a_covering_wildcard_and_after_a_restart() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        let rule = |rt: &Runtime, host: &str| rt.inner.proxy.check_name(&id, host, 443).map(|v| v.rule);
+        let hosts = vec!["*.lab.test".to_string(), "api.lab.test".to_string()];
+        e.rt.grant_scope(&id, &hosts, None).await.unwrap();
+        until("grants in ledger", || e.rt.ledger(&mission).is_ok_and(|l| l.state.scope_grants.len() == 1)).await;
+        // A host only the wildcard grants: the sentence names the wildcard.
+        let err = e.rt.revoke_scope(&mission, "web.lab.test", "r").await.unwrap_err();
+        assert!(err.contains("not granted by itself") && err.contains("`*.lab.test` covers it"), "{err}");
+        e.rt.revoke_scope(&mission, "api.lab.test", "out of scope").await.unwrap();
+        assert_eq!(rule(&e.rt, "api.lab.test").as_deref(), Some("deny revoked api.lab.test"));
+        assert_eq!(rule(&e.rt, "web.lab.test").as_deref(), Some("allow *.lab.test"));
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        rt2.inner.activate(&id).unwrap();
+        assert_eq!(rule(&rt2, "api.lab.test").as_deref(), Some("deny revoked api.lab.test"));
+        // Granting it again lifts the revoke.
+        rt2.grant_scope(&id, &["api.lab.test".to_string()], None).await.unwrap();
+        assert_eq!(rule(&rt2, "api.lab.test").as_deref(), Some("allow *.lab.test"));
+        rt2.shutdown().await;
+    }
+
+    /// The grant is held in memory (its input is queued for the lead); the revoke holds across a restart and
+    /// can be recorded once the lead has recorded the grant.
+    #[tokio::test]
+    async fn a_revoke_of_a_grant_the_lead_has_not_recorded_survives_a_restart_and_can_be_recorded_later() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        e.rt.inner.st().scope.entry(mission.clone()).or_default().push("late.example.test".into());
+        let receipt = e.rt.revoke_scope(&mission, "late.example.test", "wrong target").await.unwrap();
+        assert!(!receipt.recorded, "{receipt:?}");
+        assert!(e.rt.inner.revoked_path(&mission).exists());
+        // The lead records the queued grant afterwards.
+        let journal = Journal::new(e.rt.inner.paths.journal(&mission), e.rt.inner.key.clone());
+        let op = LedgerOp::ScopeGrant { hosts: vec!["late.example.test".into()], note: None };
+        journal.append(&id, true, op, &|_| Ok(())).unwrap();
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        rt2.inner.activate(&id).unwrap();
+        let rule = |host: &str| rt2.inner.proxy.check_name(&id, host, 443).map(|v| v.rule);
+        assert_eq!(
+            rule("late.example.test").as_deref(),
+            Some("deny revoked late.example.test"),
+            "the ledger grant does not win"
+        );
+        // The documented remedy works: run the revoke again and it is recorded.
+        let again = rt2.revoke_scope(&mission, "late.example.test", "wrong target").await.unwrap();
+        assert!(again.recorded, "{again:?}");
+        assert!(rt2.ledger(&mission).unwrap().state.granted_hosts().is_empty());
+        rt2.shutdown().await;
+    }
+
+    /// A session built while a revoke runs derives its policy again when the mission's grants changed.
+    #[tokio::test]
+    async fn a_session_built_while_a_scope_change_runs_gets_the_current_policy() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        let meta = e.rt.inner.st().known.get(&id).unwrap().meta.clone();
+        let rule = |host: &str| e.rt.inner.proxy.check_name(&id, host, 443).map(|v| v.rule);
+        let built_at = e.rt.inner.scope_generation(&mission);
+        // The grant lands after the policy was derived and before the session was told: no `set_policy` of
+        // the grant reached it.
+        e.rt.inner.st().scope.entry(mission.clone()).or_default().push("late.example.test".into());
+        e.rt.inner.bump_scope_generation(&mission);
+        assert_eq!(rule("late.example.test").as_deref(), Some("mode deny_all"));
+        e.rt.inner.policy_is_current(&meta, true, built_at);
+        assert_eq!(rule("late.example.test").as_deref(), Some("allow late.example.test"));
+        // Nothing changed since: nothing is derived again.
+        let now = e.rt.inner.scope_generation(&mission);
+        e.rt.inner.st().scope.clear();
+        e.rt.inner.policy_is_current(&meta, true, now);
+        assert_eq!(rule("late.example.test").as_deref(), Some("allow late.example.test"));
         e.rt.shutdown().await;
     }
 
@@ -5975,6 +6333,14 @@ mod tests {
         config.boxed.enabled = true;
         config.boxed.ssh_host = "loom-box".into();
         assert_eq!(infra_spec(&config).docker_hosts, ["loom-box"]);
+        // An ssh destination is reduced to its host; one that has none does not stop the daemon.
+        for target in ["jeweled@loom-box", "ssh://jeweled@loom-box:2222", "loom-box:22"] {
+            config.boxed.ssh_host = target.into();
+            assert_eq!(infra_spec(&config).docker_hosts, ["loom-box"], "{target}");
+        }
+        config.boxed.ssh_host = "user@".into();
+        assert!(infra_spec(&config).docker_hosts.is_empty());
+        config.boxed.ssh_host = "loom-box".into();
         // Every entry it produces is one the policy reads.
         assert!(Policy::new(&loom_core::config::NetworkCfg::default())
             .unwrap()
@@ -10273,9 +10639,15 @@ mod tests {
         // Without the box, a socket elsewhere is none of its business.
         let mut config = e.config.clone();
         config.boxed.enabled = false;
-        config.sandbox.unix_sockets = vec![fake.socket.display().to_string()];
+        config.sandbox.unix_sockets = vec![dir.path().join("lab.sock").display().to_string()];
         let rt = Runtime::start(config, Paths::at(home.clone())).await.expect("no box, no restriction");
         rt.shutdown().await;
+        // A container runtime's socket is refused with or without the box.
+        let mut config = e.config.clone();
+        config.boxed.enabled = false;
+        config.sandbox.unix_sockets = vec![fake.socket.display().to_string()];
+        let err = Runtime::start(config, Paths::at(home.clone())).await.err().expect("start must refuse");
+        assert!(err.contains("container runtime"), "{err}");
     }
 
     #[tokio::test]

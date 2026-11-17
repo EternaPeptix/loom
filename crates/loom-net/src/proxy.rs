@@ -76,7 +76,10 @@
 //! `cut_hosts(session, pattern) -> usize` ends the session's open tunnels and forwarded requests whose
 //! destination the grant pattern covers (`policy::pattern_covers`; a port in the pattern must match), and
 //! a connection accepted but not yet connected is refused when it would open (it is registered before the
-//! destination is opened). Each ended connection that was on record as allowed gets the second decision
+//! destination is opened, and the policy it is judged by is read after it is registered, from the
+//! session's current entry, not from the one taken when it authenticated: a `set_policy` that ran in
+//! between is seen; a forwarded request whose destination was cut while its name resolved or its connection
+//! opened is not written to it, the client gets `502` and the record says why). Each ended connection that was on record as allowed gets the second decision
 //! with the reason "the operator revoked the destination". It is what the operator's `loom scope revoke`
 //! calls after `set_policy`; the other sessions' connections to the same destination are not touched.
 //! `SessionGrant::env()` gives the variables to place in a command's environment so that ordinary
@@ -417,6 +420,15 @@ impl<'a> LiveGuard<'a> {
         lock(&shared.live).insert(id, live);
         LiveGuard { shared, id, cut }
     }
+}
+
+/// The policy of the session's current entry (the one `set_policy` last gave it), `fallback` when the
+/// session holds no entry any more.
+fn current_policy(shared: &Shared, session: &SessionId, reference: bool, fallback: Arc<Policy>) -> Arc<Policy> {
+    lock(&shared.sessions)
+        .values()
+        .find(|e| &e.session == session && e.reference == reference)
+        .map_or(fallback, |e| e.policy.clone())
 }
 
 impl Drop for LiveGuard<'_> {
@@ -1527,6 +1539,7 @@ async fn handle(
                 let cx = Ctx { shared, session, lookups, method, host: &host, port };
                 if connect {
                     let live = LiveGuard::register(shared, session, &host, port);
+                    let policy = current_policy(shared, session, reference, policy);
                     tunnel(client, extra, &cx, &policy, slot, cancel, live.cut.clone()).await;
                 } else {
                     check(&mut client, &cx, &policy, slot).await;
@@ -1551,6 +1564,7 @@ async fn handle(
             let cx = Ctx { shared, session, lookups, method: &head.method, host: &host, port };
             let live = LiveGuard::register(shared, session, &host, port);
             let cut = live.cut.clone();
+            let policy = current_policy(shared, session, reference, policy);
             forward(client, extra, &head, &cx, &policy, &authority, &path, reference, slot, cancel, cut).await;
         }
         Err(m) => reject(&mut client, &shared, slot, &session, &head, &m).await,
@@ -2207,6 +2221,12 @@ async fn forward(
         Ok(s) => s,
         Err((status, text)) => return answer(&mut client, cx.shared, slot, status, "", &text).await,
     };
+    // Cut while the name resolved or the connection opened: nothing is written to the destination.
+    if cut.is_cancelled() {
+        cx.failed_after_allow(&allowed, CUT).await;
+        let (status, text) = cx.unreachable(CUT);
+        return answer(&mut client, cx.shared, slot, status, "", &text).await;
+    }
 
     let mut out: Vec<u8> = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", head.method, path, authority).into_bytes();
     for (n, v) in &head.headers {
@@ -3593,6 +3613,40 @@ mod tests {
         // A wildcard without a port covers every port of its hosts; the host form `127.0.0.1` covers both.
         assert_eq!(p.cut_hosts(&a, "127.0.0.1"), 1);
         assert_eq!(p.cut_hosts(&a, "127.0.0.1"), 0, "nothing left to cut");
+    }
+
+    /// A forwarded request whose destination is cut while its name still resolves is not delivered.
+    #[tokio::test]
+    async fn a_forward_cut_while_its_name_resolves_is_not_delivered() {
+        let (port, server) = http_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let resolver: Resolver = Arc::new(|_: &str| {
+            std::thread::sleep(Duration::from_millis(800));
+            vec!["127.0.0.1".parse().unwrap()]
+        });
+        let (p, _rx, _seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let s = SessionId::from("s-cut-forward");
+        let g = p.grant(&s, lab()).unwrap();
+        let req = format!("POST http://slow.test:{port}/x HTTP/1.1\r\n{}Content-Length: 5\r\n\r\nhello", auth(&g));
+        let gp = g.port;
+        let client = tokio::spawn(async move { raw(gp, req.as_bytes()).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(p.cut_hosts(&s, "slow.test"), 1);
+        let resp = timeout(T, client).await.unwrap().unwrap();
+        assert_eq!(status(&resp), 502, "{resp}");
+        let got = timeout(T, server).await.unwrap().unwrap();
+        assert!(got.is_empty(), "the destination received {:?}", String::from_utf8_lossy(&got));
+    }
+
+    #[tokio::test]
+    async fn a_connection_is_judged_by_the_policy_the_session_holds_when_it_is_registered() {
+        let (p, _rx) = start().await;
+        let s = SessionId::from("s-current");
+        let _g = p.grant(&s, lab()).unwrap();
+        let shared = &p.inner.shared;
+        let stale = lock(&shared.sessions).values().next().map(|e| e.policy.clone()).unwrap();
+        assert!(current_policy(shared, &s, false, stale.clone()).check_name("127.0.0.1", 80).allowed);
+        assert!(p.set_policy(&s, policy(NetworkMode::DenyAll, &[], &[], &[])));
+        assert!(!current_policy(shared, &s, false, stale).check_name("127.0.0.1", 80).allowed);
     }
 
     /// A response as an HTTP client sees it: status, headers (names lower-cased), body.

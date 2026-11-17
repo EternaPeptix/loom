@@ -20,6 +20,20 @@
   is built without the host, and granting it again grants it again. A host that is not granted is refused with the list
   of what is (a wildcard grant that covers it is named). The ledger's Markdown view lists revokes; `granted_hosts()`
   leaves revoked hosts out.
+- **Review fixes (E1).** The Docker host is refused by its resolved names and addresses: `ssh_host` may be
+  `user@host` or `ssh://user@host:2222` (it no longer stops the daemon), and the `HostName` from `ssh -G` and every
+  address of a model endpoint, `network.infrastructure` name or Docker host (resolved at start and every five
+  minutes) is refused, as are this machine's own LAN, tailnet and global addresses; a grant naming one is refused when
+  made. Only `metadata`, `instance-data`, `metadata.goog` and `metadata.*`/`instance-data.*` under `.internal` are
+  metadata names (`metadata.target.example` is an ordinary host). The sandbox profile now denies 9222, 9229, 2375, 2376
+  and the loopback ports of model endpoints and `network.infrastructure` after every loopback allow
+  (`loopback_all` is written for TCP and UDP); the config refuses `loopback_ports` naming them and Docker, containerd
+  and Podman sockets in `unix_sockets`. A revoke is a real withdrawal: the host is refused (`deny revoked …`) under a
+  covering wildcard, `network.allow` and `mode open`, kept in `<mission>/scope_revoked.json` across restarts (new,
+  additive file), reaches sessions that are starting, and a revoke of a grant the lead had not recorded can be run again
+  once the ledger holds it. The proxy judges a connection by the session's current policy after it is registered for
+  cutting, and does not write a forwarded request to a destination cut while its name resolved. `loom open` prints a
+  line to use `--print` when an editor opened the page.
 - **The login code is off `/usr/bin/open`'s command line.** `loom open` writes a page file (mode 0600 in
   `<home>/login`, removed by the next `open` after five minutes) that redirects to the address, and hands the opener
   the file's path. `loom open --print` is unchanged.

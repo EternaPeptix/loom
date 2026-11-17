@@ -17,23 +17,39 @@
 //! granted host, a literal grant, `allow_private` and `mode open` do not lift it), in `check_name` and in
 //! `check_addr` (so a name that resolves to one of them is refused, and an address written in any form):
 //! rule `deny infrastructure: {what}`. `Policy::new` always has: cloud metadata (169.254.0.0/16,
-//! `fd00:ec2::254`, `100.100.100.200`, `192.0.0.192`, and every name whose first label is `metadata` or
-//! `instance-data`, on every port) and, on this machine (`127.0.0.0/8`, `::1`, the unspecified
+//! `fd00:ec2::254`, `100.100.100.200`, `192.0.0.192`, and the cloud metadata names below, on every port) and, on this machine (`127.0.0.0/8`, `::1`, the unspecified
 //! addresses and their IPv6 forms, `localhost`, `*.localhost`), the DevTools and inspector ports 9222 and
 //! 9229 and the Docker API ports 2375 and 2376. `with_infrastructure` adds what the daemon knows:
 //! `InfraSpec.daemon_port` (this machine's loopback, that port), `model_endpoints` (`host:port` of each
-//! profile's `base_url`), `docker_hosts` (the box's `ssh_host`, every port) and `extra`
+//! profile's `base_url`), `docker_hosts` (the box's Docker host: its ssh target's host name, and the
+//! `hostname` ssh resolves it to; every port) and `extra`
 //! (`network.infrastructure`, same grammar as `deny`, CIDR blocks too). An entry naming this machine
 //! (`localhost`, a loopback or unspecified literal) is a rule for the machine, so the name and every
 //! address spelling are one thing; any other IP literal is its exact address (and port). A name entry
-//! matches the name only: an endpoint reached by an IP alias is refused only while the address is
-//! private (tailnet, LAN, loopback) and not in `allow_private`. The loom proxy's own listeners (every other
+//! matches the name only, so the daemon also passes `InfraSpec.resolved`: the addresses it resolved for
+//! those names (each an exact-address rule on the entry's port, every port for a Docker host), which
+//! refuse the same host reached by an IP literal (granted or not), a short name or an alias, and
+//! `InfraSpec.local_addrs`: this machine's own interface addresses, which are this machine for every
+//! loopback rule (a listener on `0.0.0.0` or `[::]` answers on its LAN, tailnet and global addresses).
+//! A name that resolved to nothing, or addresses that changed since, are covered only as the daemon last
+//! resolved them. `Policy::infrastructure_refusal(entry)` names the rule that refuses a grant entry
+//! (its IP literal, with its port, or every port when it has none), for the early sentence. Cloud
+//! metadata names are `metadata`, `instance-data`, `metadata.goog` and `metadata.*` / `instance-data.*`
+//! under `.internal` (not `metadata.target.example`, an ordinary host). The loom proxy's own listeners (every other
 //! session's port) are refused by the proxy itself (`deny the egress proxy's own port`), not here. An
 //! entry that cannot be parsed is an error sentence naming the entry and its list.
+//!
+//! ## Revoked hosts — `Policy::with_revoked(hosts)`
+//! The operator's revokes of a mission's grants (`Runtime::revoke_scope`): each entry (as granted, a host,
+//! `*.suffix`, an IP literal, optionally with a port) is refused in `check_name` and `check_addr`, rule
+//! `deny revoked {entry}`, right after infrastructure and before `deny`, so a wildcard grant that also
+//! covers the host, `allow`, `mode open` and `allow_private` do not let it through. An entry that cannot
+//! be read is an error sentence naming it.
 //!
 //! ## Decision — `check_name(host, port)` runs before resolving, `check_addr` after
 //! `check_name`, first match wins:
 //!   0. an infrastructure rule matches → refused, rule `deny infrastructure: {what}` (above);
+//!   0b. a revoked entry matches → refused, rule `deny revoked {entry}`;
 //!   1. `deny` pattern matches → refused, rule `deny {pattern}`;
 //!   2. `reference_hosts` matches → refused on the raw command policy, regardless of mode/grants;
 //!   3. mode `deny_all` → refused, rule `mode deny_all`;
@@ -133,7 +149,11 @@
 //! the infrastructure rule, by name and by resolved address (`localhost` resolving to 127.0.0.1,
 //! `::ffff:127.0.0.1`, `0.0.0.0`) and with the rule's port respected (another loopback port is allowed);
 //! `network.infrastructure` entries (name, `host:port`, CIDR) refuse and a bad entry is a sentence;
-//! `docker_hosts` refuse every port; the infrastructure rule comes before `deny`.
+//! `docker_hosts` refuse every port; the infrastructure rule comes before `deny`; resolved addresses of a
+//! model endpoint and a Docker host refuse a literal grant of that address (`infrastructure_refusal`
+//! names it too); this machine's own addresses refuse the loopback rules' ports; `metadata.target.test`
+//! is an ordinary host; a revoked host is refused (`deny revoked`) in open mode, under a covering wildcard
+//! grant and by address, and its sibling hosts are not.
 
 #![allow(clippy::doc_lazy_continuation)]
 
@@ -377,6 +397,11 @@ pub struct Policy {
     granted_private: Vec<(IpAddr, Option<u16>)>,
     /// The implicit infrastructure deny list (E1): checked before everything else, beating grants.
     infra: Vec<InfraRule>,
+    /// Hosts the operator revoked from the session's grants: refused right after infrastructure, whatever
+    /// else allows them (a wildcard grant, `allow`, `mode open`).
+    revoked: Vec<PrivEntry>,
+    /// This machine's own interface addresses (canonical), for the loopback infrastructure rules.
+    local_addrs: Vec<IpAddr>,
 }
 
 /// What the daemon knows about its own infrastructure, for [`Policy::with_infrastructure`]. Every field
@@ -394,6 +419,22 @@ pub struct InfraSpec {
     /// `network.infrastructure`: anything else the operator wants refused to every command (tailnet
     /// infrastructure, desktop-app ports). Written like `network.deny`.
     pub extra: Vec<String>,
+    /// Addresses the daemon resolved for the name entries above (the box's Docker host and its ssh
+    /// alias, model endpoints, `network.infrastructure` names): each is refused as an address, so a literal
+    /// grant, a short name or an IP alias of the same host is refused too.
+    pub resolved: Vec<InfraAddr>,
+    /// This machine's own interface addresses (LAN, tailnet, global IPv6): they count as this machine
+    /// for every loopback rule, since a listener bound to `0.0.0.0` or `[::]` answers on them.
+    pub local_addrs: Vec<IpAddr>,
+}
+
+/// One address that is infrastructure, with the port it is refused on (`None`: every port).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InfraAddr {
+    /// What the address is (`Docker host loom-box`), for the refusal's rule text.
+    pub label: String,
+    pub addr: IpAddr,
+    pub port: Option<u16>,
 }
 
 #[derive(Clone, Debug)]
@@ -411,13 +452,21 @@ enum InfraKind {
     /// This machine: `127.0.0.0/8`, `::1`, the unspecified addresses (and IPv6 forms carrying them) and
     /// the names `localhost` and `*.localhost`, on the listed ports (`None`: every port).
     Loopback { ports: Option<Vec<u16>> },
-    /// Names whose first label is one of these (cloud metadata services), on every port.
-    FirstLabel(&'static [&'static str]),
+    /// The names of cloud metadata services (see [`is_metadata_name`]), on every port.
+    MetadataNames,
 }
 
-/// The first labels of cloud metadata host names (`metadata.google.internal`, `metadata.goog`,
-/// `instance-data.ec2.internal`).
-const METADATA_LABELS: &[&str] = &["metadata", "instance-data"];
+/// Whether `host` (lower case, no trailing dot) is the name of a cloud metadata service: `metadata`,
+/// `instance-data`, `metadata.goog`, and any `metadata.*` or `instance-data.*` name under `.internal`
+/// (`metadata.google.internal`, `instance-data.ec2.internal`). `metadata.example.com` is an ordinary
+/// host: a public domain's own `metadata` label is not a metadata service.
+fn is_metadata_name(host: &str) -> bool {
+    let first = host.split('.').next().unwrap_or("");
+    let single = !host.contains('.');
+    (single && (first == "metadata" || first == "instance-data"))
+        || host == "metadata.goog"
+        || (host.ends_with(".internal") && (first == "metadata" || first == "instance-data"))
+}
 
 impl InfraRule {
     fn new(label: impl Into<String>, kind: InfraKind) -> InfraRule {
@@ -433,8 +482,8 @@ impl InfraRule {
     /// The rules every policy has, whatever the configuration says.
     fn builtin() -> Vec<InfraRule> {
         let mut rules = vec![InfraRule::new(
-            "cloud metadata names (metadata.*, instance-data.*)",
-            InfraKind::FirstLabel(METADATA_LABELS),
+            "cloud metadata names (metadata, instance-data, metadata.goog, metadata.*.internal)",
+            InfraKind::MetadataNames,
         )];
         for (label, cidr) in [
             ("cloud metadata addresses 169.254.0.0/16", "169.254.0.0/16"),
@@ -486,7 +535,7 @@ impl InfraRule {
         Ok(InfraRule::new(label, kind))
     }
 
-    fn hits(&self, host: &str, port: u16, addr: Option<IpAddr>) -> bool {
+    fn hits(&self, host: &str, port: u16, addr: Option<IpAddr>, locals: &[IpAddr]) -> bool {
         match &self.kind {
             InfraKind::Name(p) => p.matches(host, port),
             InfraKind::Net { net, port: want } => {
@@ -494,9 +543,11 @@ impl InfraRule {
             }
             InfraKind::Loopback { ports } => {
                 ports.as_ref().is_none_or(|ps| ps.contains(&port))
-                    && (addr.is_some_and(is_local_literal) || host == "localhost" || host.ends_with(".localhost"))
+                    && (addr.is_some_and(|a| is_local_literal(a) || locals.contains(&canonical_ip(a)))
+                        || host == "localhost"
+                        || host.ends_with(".localhost"))
             }
-            InfraKind::FirstLabel(labels) => host.split('.').next().is_some_and(|first| labels.contains(&first)),
+            InfraKind::MetadataNames => is_metadata_name(host),
         }
     }
 }
@@ -632,6 +683,8 @@ impl Policy {
             allow_private: parse_list("allow_private", &cfg.allow_private, PrivEntry::parse_private)?,
             granted_private: Vec::new(),
             infra: InfraRule::builtin(),
+            revoked: Vec::new(),
+            local_addrs: Vec::new(),
         })
     }
 
@@ -661,12 +714,48 @@ impl Policy {
                 .map_err(|w| bad("network.infrastructure", e, w))?;
             self.infra.push(rule);
         }
+        for a in &spec.resolved {
+            let full = if a.addr.is_ipv4() { 32 } else { 128 };
+            let net = IpNet::new(canonical_ip(a.addr), full).canonical();
+            self.infra.push(InfraRule::new(a.label.clone(), InfraKind::Net { net, port: a.port }));
+        }
+        for a in &spec.local_addrs {
+            let a = canonical_ip(*a);
+            if !self.local_addrs.contains(&a) {
+                self.local_addrs.push(a);
+            }
+        }
         Ok(self)
+    }
+
+    /// This policy with `hosts` (entries as granted) refused as revoked, in the rule `deny revoked {entry}`:
+    /// after infrastructure and before every other rule, so a wildcard grant, `allow` and `mode open` do
+    /// not reach them. An entry that cannot be read is an error sentence naming it.
+    pub fn with_revoked(mut self, hosts: &[String]) -> Result<Policy, String> {
+        for h in hosts {
+            let e = PrivEntry::parse(h).map_err(|why| format!("The revoked host \"{h}\" is not valid: {why}."))?;
+            self.revoked.push(e);
+        }
+        Ok(self)
+    }
+
+    /// The infrastructure rule that refuses an entry written for a grant (`host`, `host:port`, an IP
+    /// literal), if any: the entry's own port (every port when it has none) and, for an IP literal, its
+    /// address. Names are judged by name only; a grant that infrastructure refuses is refused at
+    /// connection time whatever is granted, so this is the early, clear sentence.
+    pub fn infrastructure_refusal(&self, entry: &str) -> Option<String> {
+        let (h, port) = split_host_port(entry.trim()).ok()?;
+        let h = normalize_host(h);
+        let literal = h.parse::<IpAddr>().ok();
+        self.infra_hit(&h, port.unwrap_or(0), literal)
     }
 
     /// The `deny infrastructure ...` rule that matches the name or the address, if any.
     fn infra_hit(&self, host: &str, port: u16, addr: Option<IpAddr>) -> Option<String> {
-        self.infra.iter().find(|r| r.hits(host, port, addr)).map(|r| format!("deny infrastructure: {}", r.label))
+        self.infra
+            .iter()
+            .find(|r| r.hits(host, port, addr, &self.local_addrs))
+            .map(|r| format!("deny infrastructure: {}", r.label))
     }
 
     /// Reference-only policy for trusted in-process GET clients. Deny/address checks still apply.
@@ -711,6 +800,9 @@ impl Policy {
         if let Some(rule) = self.infra_hit(&h, port, literal) {
             return Verdict::no(rule);
         }
+        if let Some(rule) = self.revoked_hit(&h, port, literal) {
+            return Verdict::no(rule);
+        }
         if let Some(rule) = self.deny_hit(&h, port, literal) {
             return Verdict::no(rule);
         }
@@ -730,7 +822,16 @@ impl Policy {
     /// The `deny ...` rule that matches the name, or the address when there is one. Addresses and
     /// address entries are compared in canonical form, so `::ffff:10.0.0.5` is `10.0.0.5`.
     fn deny_hit(&self, host: &str, port: u16, addr: Option<IpAddr>) -> Option<String> {
-        for e in &self.deny {
+        Self::list_hit(&self.deny, "deny", host, port, addr)
+    }
+
+    /// The `revoked ...` rule that matches the name, or the address when there is one.
+    fn revoked_hit(&self, host: &str, port: u16, addr: Option<IpAddr>) -> Option<String> {
+        Self::list_hit(&self.revoked, "deny revoked", host, port, addr)
+    }
+
+    fn list_hit(list: &[PrivEntry], prefix: &str, host: &str, port: u16, addr: Option<IpAddr>) -> Option<String> {
+        for e in list {
             match e {
                 PrivEntry::Name(p) => {
                     let literal = match (&p.kind, addr) {
@@ -741,12 +842,12 @@ impl Policy {
                         _ => false,
                     };
                     if literal || p.matches(host, port) {
-                        return Some(format!("deny {}", p.text));
+                        return Some(format!("{prefix} {}", p.text));
                     }
                 }
                 PrivEntry::Net { text, net } => {
                     if addr.is_some_and(|a| net.contains(a)) {
-                        return Some(format!("deny {text}"));
+                        return Some(format!("{prefix} {text}"));
                     }
                 }
             }
@@ -759,6 +860,9 @@ impl Policy {
     pub fn check_addr(&self, host: &str, port: u16, addr: IpAddr, name_rule: &str) -> Verdict {
         let h = normalize_host(host);
         if let Some(rule) = self.infra_hit(&h, port, Some(addr)) {
+            return Verdict::no(rule);
+        }
+        if let Some(rule) = self.revoked_hit(&h, port, Some(addr)) {
             return Verdict::no(rule);
         }
         if let Some(rule) = self.deny_hit(&h, port, Some(addr)) {
@@ -1553,6 +1657,7 @@ mod tests {
             ],
             docker_hosts: vec!["loom-box".into()],
             extra: vec!["*.tailnet.test".into(), "100.64.1.0/24".into(), "localhost:5555".into()],
+            ..InfraSpec::default()
         };
         let p =
             Policy::new(&cfg(NetworkMode::Open, &[], &[], &["0.0.0.0/0"])).unwrap().with_infrastructure(&spec).unwrap();
@@ -1602,6 +1707,91 @@ mod tests {
             .with_infrastructure(&InfraSpec { docker_hosts: vec!["x/99".into()], ..InfraSpec::default() })
             .unwrap_err();
         assert!(e.contains("box.ssh_host"), "{e}");
+    }
+
+    /// The tailnet case: the model host is a name in the configuration, an IP alias of it is what an
+    /// agent asks for, and the operator approves that literal.
+    #[test]
+    fn a_named_infrastructure_host_is_refused_by_the_addresses_it_resolves_to_whatever_is_granted() {
+        let spec = InfraSpec {
+            model_endpoints: vec!["spark-one.tail1234.ts.net:8000".into()],
+            docker_hosts: vec!["h510".into()],
+            resolved: vec![
+                InfraAddr {
+                    label: "model endpoint spark-one.tail1234.ts.net:8000".into(),
+                    addr: ip("100.101.102.103"),
+                    port: Some(8000),
+                },
+                InfraAddr { label: "Docker host h510".into(), addr: ip("192.168.1.50"), port: None },
+            ],
+            ..InfraSpec::default()
+        };
+        let grants = hosts(&["100.101.102.103:8000", "192.168.1.50:2375", "h510.lan:2375"]);
+        let c = cfg(NetworkMode::Open, &[], &[], &["100.64.0.0/10", "192.168.0.0/16"]);
+        let p = Policy::with_hosts(&c, &grants).unwrap().with_infrastructure(&spec).unwrap();
+        assert!(infra_rule(&p.check_name("100.101.102.103", 8000)));
+        assert!(infra_rule(&p.check_addr("spark-one", 8000, ip("100.101.102.103"), "r")));
+        assert!(infra_rule(&p.check_name("192.168.1.50", 2375)));
+        assert!(infra_rule(&p.check_name("192.168.1.50", 22)));
+        assert!(infra_rule(&p.check_addr("h510.lan", 22, ip("192.168.1.50"), "r")));
+        // Other ports of the model host and other hosts of the tailnet are not infrastructure.
+        assert!(p.check_name("100.101.102.103", 22).allowed);
+        assert!(p.check_addr("lab.test", 8000, ip("100.101.102.104"), "r").allowed);
+        // The early sentence for a grant: the literal with its port.
+        assert!(p.infrastructure_refusal("100.101.102.103:8000").is_some());
+        assert!(p.infrastructure_refusal("192.168.1.50").is_some());
+        assert!(p.infrastructure_refusal("lab.test:8000").is_none());
+        assert!(p.infrastructure_refusal("100.101.102.103:22").is_none());
+    }
+
+    #[test]
+    fn this_machines_own_addresses_are_this_machine_for_the_loopback_rules() {
+        let spec = InfraSpec {
+            daemon_port: Some(9920),
+            local_addrs: vec![ip("192.168.1.10"), ip("2601:db8:abcd::1234")],
+            ..InfraSpec::default()
+        };
+        let c = cfg(NetworkMode::Open, &[], &[], &["192.168.1.0/24"]);
+        let p = Policy::new(&c).unwrap().with_infrastructure(&spec).unwrap();
+        assert!(infra_rule(&p.check_name("192.168.1.10", 9920)));
+        assert!(infra_rule(&p.check_name("192.168.1.10", 2375)));
+        assert!(infra_rule(&p.check_addr("x.test", 9920, ip("2601:db8:abcd::1234"), "r")));
+        assert!(p.check_name("192.168.1.10", 8080).allowed, "only the listed ports");
+        assert!(p.check_name("192.168.1.11", 9920).allowed, "another host of the LAN");
+    }
+
+    #[test]
+    fn only_the_cloud_metadata_names_are_metadata_names() {
+        let p = pol(NetworkMode::Open, &[], &[], &[]);
+        for h in
+            ["metadata", "instance-data", "metadata.goog", "metadata.google.internal", "instance-data.ec2.internal"]
+        {
+            assert!(infra_rule(&p.check_name(h, 80)), "{h}");
+        }
+        for h in ["metadata.target-company.com", "instance-data.example.test", "metadata.goog.example.test"] {
+            assert!(p.check_name(h, 443).allowed, "{h} is an ordinary host");
+        }
+    }
+
+    #[test]
+    fn a_revoked_host_is_refused_whatever_else_allows_it() {
+        let revoked = hosts(&["api.lab.test", "10.0.0.5:8080", "other.test"]);
+        // Open mode, a wildcard grant covering the host, and an `allow` entry for it.
+        for c in [
+            cfg(NetworkMode::Open, &[], &[], &["10.0.0.0/8"]),
+            cfg(NetworkMode::Allowlist, &["api.lab.test", "other.test"], &[], &["10.0.0.0/8"]),
+        ] {
+            let p = Policy::with_hosts(&c, &hosts(&["*.lab.test"])).unwrap().with_revoked(&revoked).unwrap();
+            let v = p.check_name("API.lab.test.", 443);
+            assert!(!v.allowed && v.rule == "deny revoked api.lab.test", "{v:?}");
+            assert!(!p.check_name("10.0.0.5", 8080).allowed);
+            assert!(!p.check_addr("alias.test", 8080, ip("10.0.0.5"), "r").allowed);
+        }
+        let c = cfg(NetworkMode::DenyAll, &[], &[], &[]);
+        let p = Policy::with_hosts(&c, &hosts(&["*.lab.test"])).unwrap().with_revoked(&revoked).unwrap();
+        assert!(p.check_name("web.lab.test", 443).allowed, "a sibling under the wildcard stays granted");
+        assert!(infra_rule(&p.with_revoked(&[]).unwrap().check_name("169.254.169.254", 80)));
+        assert!(Policy::new(&c).unwrap().with_revoked(&hosts(&["a b"])).unwrap_err().contains("a b"));
     }
 
     #[test]

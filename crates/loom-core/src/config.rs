@@ -266,6 +266,28 @@ pub struct SandboxCfg {
     /// URLs for a process (certificate evaluation). Set by the runtime; not a config key.
     #[serde(skip)]
     pub network_deny_all: bool,
+    /// Loopback ports of infrastructure (a model endpoint or a `network.infrastructure` entry on this
+    /// machine) that no command may connect to, whatever else allows loopback. Set by the runtime; not a
+    /// config key.
+    #[serde(skip)]
+    pub infra_ports: Vec<u16>,
+}
+
+/// Loopback ports that are never reachable to a command: Chrome DevTools, the Node inspector and the Docker
+/// API. `sandbox.loopback_ports` may not list them, and the sandbox refuses them under `loopback_all`.
+pub const DENIED_LOOPBACK_PORTS: [u16; 4] = [9222, 9229, 2375, 2376];
+
+/// Whether `path` names the socket of a container runtime (Docker, containerd, Podman, CRI-O), which would
+/// give a command the Docker host.
+pub fn is_container_socket(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or("");
+    name.contains("docker.sock")
+        || name.contains("containerd.sock")
+        || name.contains("crio.sock")
+        || name.contains("cri-dockerd.sock")
+        || (name.ends_with(".sock") && name.contains("podman"))
+        || (lower.contains("/podman/") && name.ends_with(".sock"))
 }
 
 impl Default for SandboxCfg {
@@ -284,6 +306,7 @@ impl Default for SandboxCfg {
             replay_untrusted_paths: Vec::new(),
             daemon_port: None,
             network_deny_all: false,
+            infra_ports: Vec::new(),
         }
     }
 }
@@ -655,6 +678,20 @@ impl Config {
         }
         if self.context.floor_tokens >= self.context.target_tokens {
             return Err(ConfigError::Invalid("context.floor_tokens must be below context.target_tokens".into()));
+        }
+        for p in &self.sandbox.loopback_ports {
+            if DENIED_LOOPBACK_PORTS.contains(p) {
+                return Err(ConfigError::Invalid(format!(
+                    "sandbox.loopback_ports lists {p}, a DevTools, inspector or Docker API port: no command may connect to it. Remove it from the list."
+                )));
+            }
+        }
+        for entry in &self.sandbox.unix_sockets {
+            if is_container_socket(entry) {
+                return Err(ConfigError::Invalid(format!(
+                    "sandbox.unix_sockets lists {entry}, the socket of a container runtime: a command that could connect to it would control the Docker host (a container can mount the whole home). Remove the entry."
+                )));
+            }
         }
         self.boxed.check().map_err(ConfigError::Invalid)?;
         if self.boxed.enabled && self.sandbox.mode == SandboxMode::None {

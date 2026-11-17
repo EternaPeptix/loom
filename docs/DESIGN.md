@@ -1332,13 +1332,17 @@ head within 10 s gets `400`.
 - **Implicit infrastructure deny (E1).** Every command policy refuses a fixed list before everything else: a
   grant, a literal grant, `allow_private` and `mode open` do not lift it, and it is checked on the name and
   on every resolved address (`deny infrastructure: {what}`). Always: cloud metadata (169.254.0.0/16,
-  `fd00:ec2::254`, `100.100.100.200`, `192.0.0.192`, names whose first label is `metadata` or
-  `instance-data`) and, on this machine, DevTools and inspector ports 9222 and 9229 and the Docker API ports
+  `fd00:ec2::254`, `100.100.100.200`, `192.0.0.192`, the names `metadata`, `instance-data`, `metadata.goog` and
+  `metadata.*` / `instance-data.*` under `.internal`) and, on this machine, DevTools and inspector ports 9222 and 9229 and the Docker API ports
   2375 and 2376. From the configuration: the daemon's port, the `host:port` of every model profile's
   `base_url`, the box's `ssh_host` and `network.infrastructure`. The proxy's own listeners (every other
-  session's port) are refused by the proxy itself. A named endpoint is refused by name; reached by an IP
-  alias it is refused while that address is private and not in `allow_private`. `Runtime::start` refuses a
-  `network.infrastructure` entry it cannot read.
+  session's port) are refused by the proxy itself. A named endpoint is refused by name and by the addresses the
+  daemon resolves for it (at start and every five minutes: model endpoints, `network.infrastructure` names, the
+  box's `ssh_host` and the `HostName` of `ssh -G`), and this machine's own interface addresses count as this machine
+  for the loopback rules, so an IP alias or a short name of the same host is refused too; a grant that names
+  infrastructure is refused when it is made. The sandbox refuses the loopback ports of these (and 9222, 9229, 2375,
+  2376) directly, also under `loopback_all`. `Runtime::start` refuses a `network.infrastructure` entry it cannot
+  read; a `ssh_host` of the form `user@host` or `ssh://user@host:2222` is reduced to its host.
 - **Per-session scope grants.** The operator can authorize more hosts for a running mission without a
   restart (`Runtime::grant_scope`, `POST /api/sessions/{id}/scope`, `loom scope`). The egress policy of
   every running session of the mission becomes the configured network plus the granted hosts: under

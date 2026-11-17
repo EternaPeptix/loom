@@ -23,7 +23,10 @@
 //!   neither is the login code: the opener is given the path of a page file (`<home>/login/login-{random}.html`,
 //!   mode 0600 in a private directory, a refresh and `location.replace` to the address, no referrer) and
 //!   not the address; pages older than five minutes are removed by the next `open`. A file that cannot be
-//!   written, or an opener that fails, is an error that says to use `loom open --print`.
+//!   written, or an opener that fails, is an error that says to use `loom open --print`. The opener gets a
+//!   `.html` file, which the desktop opens with whatever handles `.html` (not always a browser), so after a
+//!   successful hand-over one line is printed: `OPENED_NOTE`, which says to run `loom open --print` when an
+//!   editor opened instead.
 //! - `run [options] <message…>`: start a session and follow it. The message is the arguments
 //!   joined by spaces; `-` or no message reads standard input to its end. Options → `NewSession`
 //!   (`--workspace` defaults to the current directory; `--attended` sets `unattended: false`;
@@ -1382,9 +1385,13 @@ async fn open_with(
         put(out, &format!("{url}\n"))?;
     } else {
         launch(&url)?;
+        put(out, OPENED_NOTE)?;
     }
     Ok(0)
 }
+
+/// Printed after the login page was handed to the desktop's opener.
+const OPENED_NOTE: &str = "Opened the loom login page. If an editor opened instead of a browser (your .html files open there), run `loom open --print` and open the address in a browser.\n";
 
 /// How long a login page stays on disk before the next `open` removes it (its code is dead long before).
 const LOGIN_PAGE_KEEP: Duration = Duration::from_secs(300);
@@ -2079,7 +2086,7 @@ mod tests {
         let (c, _) = start(script).await;
         let url = format!("{}/#code=c0de", c.base());
 
-        // Without --print the browser gets the address and nothing is written.
+        // Without --print the browser gets the address; the one line written says what to do if an editor opened.
         let mut out = Vec::new();
         let mut launched = Vec::new();
         let code = open_with(&c, &OpenArgs { print: false }, &mut out, |u| {
@@ -2089,7 +2096,9 @@ mod tests {
         .await;
         assert_eq!(code, Ok(0));
         assert_eq!(launched, [url.as_str()]);
-        assert_eq!(String::from_utf8(out).unwrap(), "");
+        let note = String::from_utf8(out).unwrap();
+        assert_eq!(note, OPENED_NOTE);
+        assert!(note.contains("loom open --print") && !note.contains("c0de"), "{note}");
 
         // With --print it is written and nothing is started.
         let mut out = Vec::new();

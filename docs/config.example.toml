@@ -72,9 +72,9 @@ protect_credentials = true # ~/.ssh, ~/.aws, ~/.gnupg, keychains, browser profil
 # unreadable_paths = ["~/private"]       # more paths commands and file tools cannot read or write ("~" is expanded)
 # extra_writable = ["/path/to/scratch"]  # more directories commands may write to (absolute)
 # protected_paths = ["secrets"]          # never writable, even inside the workspace (absolute, or relative to it)
-# loopback_ports = [5432]                # loopback TCP ports commands may connect to directly
+# loopback_ports = [5432]                # loopback TCP ports commands may connect to directly (not 9222, 9229, 2375, 2376)
 loopback_all = false       # true lets commands connect to any loopback port
-# unix_sockets = ["/var/run/docker.sock"]  # unix sockets commands may connect to
+# unix_sockets = ["/path/to/lab.sock"]  # unix sockets commands may connect to (never a Docker, containerd or Podman socket)
 # env_pass = ["MY_TOKEN"]  # environment variables passed to commands although their names look like secrets
 
 [network]
@@ -93,7 +93,8 @@ mode = "deny_all"
 # allow_private = ["10.1.2.3"]   # private, loopback or link-local destinations that are permitted (host pattern, IP or CIDR)
 # Refused to every command whatever is granted or allowed (checked first): your tailnet machines, a desktop app's
 # debugging port. Same syntax as `deny`. Loom also always refuses cloud metadata, DevTools ports 9222 and 9229 and
-# Docker API ports 2375 and 2376 on this machine, the daemon's port, every model endpoint above and the box's ssh_host.
+# Docker API ports 2375 and 2376 on this machine, the daemon's port, every model endpoint above and the box's ssh_host
+# (and the addresses these names resolve to, and this machine's own addresses). The sandbox refuses their loopback ports too.
 # infrastructure = ["*.tail1234.ts.net", "100.64.0.0/10", "127.0.0.1:9333"]
 
 [box]
@@ -102,7 +103,7 @@ mode = "deny_all"
 enabled = false
 # Reach Docker one of two ways, not both:
 #   over ssh: loom starts `ssh -N -L <loom home>/keys/box.sock:<remote_socket> <ssh_host>` itself
-# ssh_host = "loom-box"                  # an alias from your ssh config (it may use ProxyJump); batch mode, no prompts
+# ssh_host = "loom-box"                  # an alias from your ssh config (it may use ProxyJump), `user@host` or `ssh://user@host:22`; batch mode, no prompts. loom also refuses the HostName `ssh -G` finds
 # remote_socket = "/var/run/docker.sock" # the Docker socket inside that machine
 #   or a socket on this machine:
 # docker_socket = "/var/run/docker.sock"

@@ -136,9 +136,18 @@ A pack that sets `requires_restricted_network` (`vr` does) is refused while the 
 Some destinations are refused to every command whatever you grant or allow (`deny infrastructure: …` in `loom net`):
 cloud metadata addresses and names, the DevTools and inspector ports 9222 and 9229 and the Docker API ports 2375 and
 2376 on this machine, the daemon's own port, every model endpoint of the configuration and the box's Docker host.
+These are refused by name and by the addresses the daemon resolves for them (at start and every five minutes), so the
+same host reached by its IP address, a short name or a tailnet alias is refused too, and this machine's own LAN, tailnet
+and global addresses count as this machine. The box's Docker host is the host of `ssh_host` (`user@host` and
+`ssh://user@host:2222` work) and the `HostName` that `ssh -G` resolves it to. A grant that names one is refused when you
+make it. The proxy is not the only door: the sandbox also refuses the DevTools, inspector and Docker API ports and the
+loopback ports of model endpoints and `network.infrastructure` entries directly, also with `loopback_all = true` or a
+`loopback_ports` entry (config refuses listing those ports, and Docker, containerd and Podman sockets in
+`unix_sockets`). A destination with no listing here is not protected: add it to `network.infrastructure`.
 List more with `network.infrastructure` (same syntax as `deny`: hosts, `host:port`, CIDR blocks), for example a tailnet
-machine or a desktop app's debugging port. `loom open` hands the browser a short-lived page file instead of the address,
-so the login code is never on a command line.
+machine or a desktop app's debugging port. `loom open` hands the desktop's opener a short-lived page file instead of the address,
+so the login code is never on a command line; if your `.html` files open in an editor, it prints a line saying to use
+`loom open --print`.
 
 A session can also be given hosts by you while it runs. When it needs one it does not have, the agent
 calls `request_scope`; an item naming the hosts and why waits in your inbox, and the session keeps
@@ -146,7 +155,11 @@ working. `loom scope <session> <host>...` grants them (the UI and the app have a
 item). The grant is recorded in the mission's ledger, applies to that mission only, and ends with the
 session. `loom scope revoke <mission> <host> --reason <text>` takes one granted host back (the host as it was
 granted; the mission is an `m-` id or any session of it): it is recorded in the ledger, refused to the running
-sessions at once, and its open connections are cut. `loom net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
+sessions at once (also under a wildcard grant that covers it, `network.allow` and `mode open`: it is refused as
+`deny revoked <host>` until you grant it again), and its open connections are cut. The revoke is kept on disk, so a
+restart does not bring the host back. A host only a wildcard grant covers is revoked by revoking the wildcard. A grant
+the lead has not recorded yet is revoked without a ledger entry (`recorded: false`); run the revoke again once
+`loom ledger` lists the grant and it is recorded. `loom net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
 granted hosts; the `allow` list stays off. `*`, a wildcard over a whole top-level domain (`*.com`) or
 over IP addresses (`*.0.1`), the unspecified address (`0.0.0.0`, `::`) and a loopback address without a
 port (`127.0.0.1`; write `127.0.0.1:8080`) cannot be requested or granted: name the hosts, or a wildcard

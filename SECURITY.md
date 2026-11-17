@@ -98,8 +98,10 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   decision in a hash-chained audit file. Whatever you grant or allow, the proxy also refuses cloud metadata, the
   DevTools and inspector ports 9222 and 9229 and Docker API ports 2375 and 2376 on this machine, the daemon's
   port, the model endpoints of the configuration, the box's Docker host and `network.infrastructure`
-  (`deny infrastructure: …` in the audit file); `loom scope revoke` takes a grant back and cuts its open
-  connections. Commands that listen on loopback can be reached by other
+  (`deny infrastructure: …` in the audit file), by name and by the addresses the daemon resolves for the named
+  entries and for this machine, and the sandbox refuses those loopback ports directly (also under `loopback_all`);
+  `loom scope revoke` takes a grant back for good (it is refused whatever else allows it, and kept across a restart)
+  and cuts its open connections. Commands that listen on loopback can be reached by other
   local processes. Commands cannot connect to the daemon's own port, whatever you allow on loopback, so a
   `loom open` login code (which is no longer on any command line) could not be redeemed from inside the sandbox directly (the
   proxy, which refuses loopback addresses, could reach it only if you list loopback in `allow_private` or

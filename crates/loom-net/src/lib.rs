@@ -9,5 +9,5 @@ pub mod netlog;
 pub mod policy;
 pub mod proxy;
 
-pub use policy::{InfraSpec, Policy, Verdict};
+pub use policy::{InfraAddr, InfraSpec, Policy, Verdict};
 pub use proxy::{AuditFn, Limits, Proxy, ProxyError, ReferenceGrant, SessionGrant, CHECK_METHOD, RULE_HEADER};

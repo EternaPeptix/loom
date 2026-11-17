@@ -125,12 +125,15 @@
 //!   jobs;
 //! - network: denied, except loopback connections to the egress proxy port (when there is one), to
 //!   `cfg.loopback_ports` — or to every loopback port when `cfg.loopback_all` — and to
-//!   `cfg.unix_sockets`. Listening on loopback is allowed. The daemon's own port (`cfg.daemon_port`, which
+//!   `cfg.unix_sockets`. Listening on loopback is allowed. DevTools and the inspector (9222, 9229), the Docker
+//!   API (2375, 2376) and every `cfg.infra_ports` port (loopback model endpoints and `network.infrastructure`
+//!   entries on this machine; set by the runtime, not a configuration key) are refused the same way, whatever
+//!   `loopback_all` or `loopback_ports` allows; `loopback_all` is always written for TCP and UDP. The daemon's own port (`cfg.daemon_port`, which
 //!   the daemon sets; not a configuration key) is refused whatever allows it, at every address: Seatbelt
 //!   counts the host's own addresses as loopback, and a command that read a `loom open` login code from the
 //!   process list could otherwise redeem it. (Probed on macOS 27: after an allow of `(remote ip
 //!   "localhost:*")` a deny of one port, written `localhost:<port>` or `*:<port>`, is not reliable — about two
-//!   ports in five stay connectable, the same port every time — so with `cfg.daemon_port` the allow for
+//!   ports in five stay connectable, the same port every time — so the allow for
 //!   `loopback_all` is written for TCP and UDP, `(remote tcp "localhost:*") (remote udp "localhost:*")`
 //!   (loopback ICMP is not allowed then); with that allow, and with allows of single ports, a deny of
 //!   `*:<port>` refused 127.0.0.1, ::1 and the host's own address on every port tried.)
@@ -197,9 +200,9 @@
 //! (deny user-preference-write)
 //! (deny mach-lookup (global-name "com.apple.DiskArbitration.diskarbitrationd") (global-name "com.apple.diskimagesiod") (global-name "com.apple.diskimagesiod.ram") (global-name "com.apple.diskmanagementd"))
 //! (deny network*)
-//! (allow network-outbound (remote ip "localhost:<port>")) …      ; or "localhost:*" for loopback_all (with
-//!                                                                 ; `cfg.daemon_port`: `(remote tcp "localhost:*") (remote udp "localhost:*")`)
+//! (allow network-outbound (remote ip "localhost:<port>")) …      ; for loopback_all: `(remote tcp "localhost:*") (remote udp "localhost:*")`
 //! (allow network-outbound (remote unix-socket (path-literal "<socket>"))) …
+//! (deny network-outbound (remote ip "*:<port>")) …               ; 9222, 9229, 2375, 2376 and `cfg.infra_ports`
 //! (deny network-outbound (remote ip "*:<daemon port>"))          ; only with `cfg.daemon_port`
 //! (allow network-bind (local ip "localhost:*"))
 //! (allow network-inbound (local ip "localhost:*"))
@@ -392,7 +395,9 @@
 //! `defaults write <unique domain> k v` leaves no value (read back outside the sandbox), while
 //! `defaults read -g` works; without these rules both succeed (or the test is skipped).
 //!
-//! Network: the profile has the daemon-port deny after the allows exactly when `cfg.daemon_port` is set, and
+//! Network: the profile has the deny of 9222, 9229, 2375, 2376 and every `cfg.infra_ports` port after the
+//! allows (a port that is the session's own proxy port excepted), the daemon-port deny after the allows exactly
+//! when `cfg.daemon_port` is set, and
 //! the `mach-lookup` deny exactly when `cfg.network_deny_all`. Under `sandbox-exec`: with `loopback_all`, and
 //! with the daemon port listed in `loopback_ports`, a connection to that port fails at 127.0.0.1 and ::1 (and
 //! at the host's own address when it has one) while another loopback port still connects; a command that runs
@@ -539,6 +544,9 @@ pub struct Sandbox {
     loopback_all: bool,
     /// The daemon's own port, refused whatever else allows it.
     daemon_port: Option<u16>,
+    /// Loopback ports refused whatever else allows loopback: `DENIED_LOOPBACK_PORTS` and `cfg.infra_ports`,
+    /// without the session's own proxy port.
+    denied_ports: Vec<u16>,
     /// Commands cannot reach the system services that fetch a URL for a process (certificate evaluation).
     network_deny_all: bool,
     unix_sockets: Vec<PathBuf>,
@@ -1688,6 +1696,14 @@ impl Sandbox {
             push_unique(&mut loopback_ports, *p);
         }
 
+        let mut denied_ports: Vec<u16> = Vec::new();
+        for p in loom_core::config::DENIED_LOOPBACK_PORTS.iter().chain(&cfg.infra_ports) {
+            if Some(*p) != proxy_port && !denied_ports.contains(p) {
+                denied_ports.push(*p);
+            }
+        }
+        loopback_ports.retain(|p| Some(*p) == proxy_port || !denied_ports.contains(p));
+
         let mut unix_sockets = Vec::new();
         for p in &cfg.unix_sockets {
             push_unique(&mut unix_sockets, anchored(p)?);
@@ -1760,6 +1776,7 @@ impl Sandbox {
             loopback_ports,
             loopback_all: cfg.loopback_all,
             daemon_port: cfg.daemon_port,
+            denied_ports,
             network_deny_all: cfg.network_deny_all,
             unix_sockets,
             env_pass: cfg.env_pass.clone(),
@@ -2007,13 +2024,11 @@ impl Sandbox {
              (global-name \"com.apple.diskmanagementd\"))\n",
         );
         out.push_str("(deny network*)\n");
-        if self.loopback_all && self.daemon_port.is_some() {
+        if self.loopback_all {
             // A later deny of one port is not reliable after an allow of `(remote ip "localhost:*")`: probed on
             // macOS 27, about two ports in five are still connectable. After an allow written for TCP and UDP it
             // holds for every port tried.
             out.push_str("(allow network-outbound (remote tcp \"localhost:*\") (remote udp \"localhost:*\"))\n");
-        } else if self.loopback_all {
-            out.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
         } else {
             for p in &self.loopback_ports {
                 out.push_str(&format!("(allow network-outbound (remote ip \"localhost:{p}\"))\n"));
@@ -2024,6 +2039,11 @@ impl Sandbox {
         }
         // After the allows, and written `*:<port>`: Seatbelt counts the host's own addresses as loopback, so the
         // deny names every address.
+        // DevTools, the inspector, the Docker API and the loopback ports of infrastructure are refused the same
+        // way, so `loopback_all` and `loopback_ports` do not reach them without the proxy.
+        for port in &self.denied_ports {
+            out.push_str(&format!("(deny network-outbound (remote ip \"*:{port}\"))\n"));
+        }
         if let Some(port) = self.daemon_port {
             out.push_str(&format!("(deny network-outbound (remote ip \"*:{port}\"))\n"));
         }
@@ -2540,13 +2560,17 @@ mod tests {
              (allow network-outbound (remote ip \"localhost:8080\"))\n\
              (allow network-outbound (remote ip \"localhost:9000\"))\n\
              (allow network-outbound (remote unix-socket (path-literal \"{r}/run.sock\")))\n\
+             (deny network-outbound (remote ip \"*:9222\"))\n\
+             (deny network-outbound (remote ip \"*:9229\"))\n\
+             (deny network-outbound (remote ip \"*:2375\"))\n\
+             (deny network-outbound (remote ip \"*:2376\"))\n\
              (allow network-bind (local ip \"localhost:*\"))\n\
              (allow network-inbound (local ip \"localhost:*\"))\n"
         );
         let actual = sb.profile().expect("profile");
         assert_eq!(actual, expected);
         // Neither the daemon port nor the certificate services are mentioned unless the configuration says so.
-        assert!(!actual.contains(FETCH_SERVICES) && !actual.contains("network-outbound (remote ip \"*:"));
+        assert!(!actual.contains(FETCH_SERVICES) && !actual.contains("(remote ip \"*:7"));
         let (prog, args) = sb.command("echo hi");
         assert_eq!(prog, "/usr/bin/sandbox-exec");
         assert_eq!(args[0], "-p");
@@ -2798,8 +2822,8 @@ mod tests {
         let f = fx();
         let c = SandboxCfg { loopback_all: true, loopback_ports: vec![9000], ..cfg(SandboxMode::Seatbelt) };
         let p = build(&f, &c, Some(8080)).profile().expect("profile");
-        assert!(p.contains("(allow network-outbound (remote ip \"localhost:*\"))\n"));
-        assert!(!p.contains("localhost:9000"));
+        assert!(p.contains("(allow network-outbound (remote tcp \"localhost:*\") (remote udp \"localhost:*\"))\n"));
+        assert!(!p.contains("localhost:9000") && !p.contains("(remote ip \"localhost:*\")"));
     }
 
     #[test]
@@ -6081,9 +6105,30 @@ mod tests {
         assert!(!all.contains("(remote ip \"localhost:*\")"), "{all}");
         let no_port = SandboxCfg { loopback_all: true, ..cfg(SandboxMode::Seatbelt) };
         let no_port = build(&f, &no_port, None).profile().expect("profile");
-        assert!(no_port.contains("(allow network-outbound (remote ip \"localhost:*\"))\n"), "{no_port}");
+        assert!(no_port.contains(wildcard) && !no_port.contains("(remote ip \"localhost:*\")"), "{no_port}");
         // Bubblewrap has no profile; mode none neither.
         assert!(build(&f, &SandboxCfg { daemon_port: Some(1), ..cfg(SandboxMode::None) }, None).profile().is_none());
+    }
+
+    /// DevTools, the inspector, the Docker API and an infrastructure port on loopback are refused after the
+    /// allows, whether loopback is allowed whole or by port: the proxy is not the only door to them.
+    #[test]
+    fn devtools_docker_and_infrastructure_ports_are_denied_after_every_loopback_allow() {
+        let f = fx();
+        let deny = |p: u16| format!("(deny network-outbound (remote ip \"*:{p}\"))\n");
+        let all = SandboxCfg { loopback_all: true, infra_ports: vec![9920, 9222], ..cfg(SandboxMode::Seatbelt) };
+        let prof = build(&f, &all, None).profile().expect("profile");
+        let allow = prof.find("(allow network-outbound (remote tcp \"localhost:*\")").expect("allow");
+        for p in [9222, 9229, 2375, 2376, 9920] {
+            let at = prof.find(&deny(p)).unwrap_or_else(|| panic!("no deny of {p}: {prof}"));
+            assert!(allow < at, "{p} is denied after the allow: {prof}");
+        }
+        assert_eq!(prof.matches(&deny(9222)).count(), 1, "listed twice, denied once");
+        // Written the same without loopback_all, and a port that is the session's own proxy is not denied.
+        let some = SandboxCfg { loopback_ports: vec![9000], ..cfg(SandboxMode::Seatbelt) };
+        let prof = build(&f, &some, Some(2375)).profile().expect("profile");
+        assert!(prof.contains(&deny(9222)) && prof.contains(&deny(2376)), "{prof}");
+        assert!(!prof.contains(&deny(2375)), "the session's proxy port stays reachable: {prof}");
     }
 
     #[test]
@@ -6148,6 +6193,31 @@ mod tests {
                 }
             }
             drop((daemon, other, v6, own));
+        }
+    }
+
+    /// An infrastructure port (a loopback model endpoint, DevTools, the Docker API) is refused to a command
+    /// that is allowed all of loopback or that port, and another port still connects.
+    #[test]
+    fn an_infrastructure_port_is_refused_under_loopback_all_and_loopback_ports() {
+        if !available() {
+            return;
+        }
+        let f = fx();
+        for _ in 0..5 {
+            let infra = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = infra.local_addr().expect("addr").port();
+            let other = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let other_port = other.local_addr().expect("addr").port();
+            for c in [
+                SandboxCfg { loopback_all: true, infra_ports: vec![port], ..cfg(SandboxMode::Seatbelt) },
+                SandboxCfg { loopback_ports: vec![other_port], infra_ports: vec![port], ..cfg(SandboxMode::Seatbelt) },
+            ] {
+                let sb = build(&f, &c, None);
+                assert!(!connects(&sb, &f.ws, "127.0.0.1", port), "{port} connected under {c:?}");
+                assert!(connects(&sb, &f.ws, "127.0.0.1", other_port), "{other_port} must connect under {c:?}");
+            }
+            drop((infra, other));
         }
     }
 

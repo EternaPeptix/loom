@@ -19,6 +19,7 @@ pub mod evalkit;
 pub mod frontier;
 pub mod gate;
 pub mod hud;
+pub mod infra;
 pub mod monitor;
 pub mod pack;
 pub mod prior;
