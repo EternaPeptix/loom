@@ -834,7 +834,7 @@ the precise specification.
   outputs: its title and the time of its last ledger entry; the operator's goal, rules in force and
   answers to questions, labelled as operator text from an earlier mission; its goal status; where its
   work stood (the frontier evaluated at that last entry's time, not now, with no attempt count and no
-  security item), labelled as written by the model there and not verified; and its security record as
+  hypothesis or asset), labelled as written by the model there and not verified; and its security record as
   counts and asset locators only (no hypothesis id or text, no credential, no URL query). Every line
   taken from an old ledger is quoted with `>`. A journal that fails verification or holds an entry
   written by a newer loom is named unreadable and nothing from it is shown. The note says that the old

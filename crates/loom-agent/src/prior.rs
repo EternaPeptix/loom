@@ -63,7 +63,7 @@
 //! > - Untested: {locators}
 //! > - Tested or deferred: {locators}
 //! > - Hypotheses: {s} supported, {r} refuted, {o} open
-//! > - Routes to revisit when it ended: {n}: {locators}
+//! > - Routes to revisit when it ended: {n} (they are among its open leads above)
 //! ```
 //! - `{title}`: one line (`hud::one_line`), cut to 80 characters. `{id}`: the mission id.
 //! - The `>` lines are `loom_core::tagsafe::quote_lines` of the lines under each label, so no text from the
@@ -81,20 +81,21 @@
 //! - Model section: `Goal note:` with the goal-met note (one line, cut to `hud::MAX_LINE`) when it is not
 //!   blank; then the lines of `frontier::render` of the frontier below, when it renders. Left out (label too)
 //!   when both are empty.
-//! - The frontier: `frontier::frontier(&state, end_ms)` with `attempts_run` 0, then every security item
-//!   taken out of it — items of `established`, `ruled_out` and `open_leads` whose id is not a plan step
-//!   (`p{n}`) or a claim (`c{n}`), every item of `untested`, and `surfaces_total`/`surfaces_closed` set to 0
-//!   — so it shows claims, plan steps, dead ends and the reflection count, and no hypothesis or asset id.
-//! - Security section, from `state.security` and the same `frontier(&state, end_ms)` (before the security
-//!   items were taken out), left out (label too) when the mission recorded no asset, no hypothesis and no
+//! - The frontier: `frontier::frontier(&state, end_ms)` with `attempts_run` 0, then every hypothesis taken
+//!   out of it — items of `established`, `ruled_out` and `open_leads` whose id starts with `hy-`, every item of
+//!   `untested`, and `surfaces_total`/`surfaces_closed` set to 0 — so it shows claims, plan steps, dead ends,
+//!   the routes to revisit at `end_ms` (a blocked claim or dead end whose conditions were met then; their ids
+//!   are claim and dead-end ids of that mission, not security items) and the reflection count, and no
+//!   hypothesis or asset id.
+//! - Security section, from `state.security` and the same `frontier(&state, end_ms)` (before the hypotheses
+//!   were taken out), left out (label too) when the mission recorded no asset, no hypothesis and no
 //!   route to revisit at `end_ms`:
 //!   - Assets: all assets; tested = coverage `Tested`, deferred = `Deferred`, untested = `Untested`. Left out
 //!     when there is none. Untested: the locators of the frontier's `untested` items, in its order (mandatory
 //!     first, then id). Tested or deferred: the locators of the other assets, in id order.
 //!   - Hypotheses: counts by status, left out when there is none. Never an id, a text or a note.
-//!   - Routes to revisit when it ended: the route items of the frontier's `open_leads` (ids that are not
-//!     `hy-…`, `p{n}` or `c{n}`), that is `security.newly_unlocked_at(end_ms)`; `{n}` counts them all, and
-//!     the list names the locators of those that are assets. Left out when there is none.
+//!   - Routes to revisit when it ended: `{n}` = `security.newly_unlocked_at(end_ms).len()`, then ` (they are
+//!     among its open leads above)`; no id and no locator. Left out when there is none.
 //!   - A locator list shows at most 12, then ` (+{k} more)`, joined by `, `. Each locator is `{kind}
 //!     {locator}` (kind in lower case: `host`, `service`, `endpoint`, `file`, `identity`). An `endpoint` or
 //!     `service` locator is parsed as a URL and shown without its query, fragment and any user name or
@@ -302,21 +303,18 @@ and rules are what apply now):"
     out
 }
 
-fn is_numbered(id: &str, prefix: char) -> bool {
-    id.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+/// Hypotheses are dropped (their ids are the model's secrets' handles); plan steps, claims, dead ends and the
+/// routes to revisit (claim and dead-end ids) stay.
+fn drop_hypotheses(items: &mut Vec<FrontierItem>) {
+    items.retain(|i| !i.id.starts_with("hy-"));
 }
 
-/// Only plan steps and claims: every item naming a hypothesis, an asset or a route is dropped.
-fn keep_work(items: &mut Vec<FrontierItem>) {
-    items.retain(|i| is_numbered(&i.id, 'p') || is_numbered(&i.id, 'c'));
-}
-
-/// The frontier at `end_ms` with no security item left in it.
+/// The frontier at `end_ms` with no hypothesis and no asset left in it.
 fn work_frontier(state: &LedgerState, end_ms: u64) -> Frontier {
     let mut f = frontier::frontier(state, end_ms);
-    keep_work(&mut f.established);
-    keep_work(&mut f.ruled_out);
-    keep_work(&mut f.open_leads);
+    drop_hypotheses(&mut f.established);
+    drop_hypotheses(&mut f.ruled_out);
+    drop_hypotheses(&mut f.open_leads);
     f.untested.clear();
     f.surfaces_total = 0;
     f.surfaces_closed = 0;
@@ -392,7 +390,7 @@ fn list(items: &[String]) -> String {
     out
 }
 
-/// Counts and asset locators only. Empty when the mission recorded no asset, no hypothesis and no route to
+/// Counts and asset locators only; a route is counted, never named. Empty when the mission recorded no asset, no hypothesis and no route to
 /// revisit.
 fn security_part(state: &LedgerState, end_ms: u64) -> Vec<String> {
     let sec = &state.security;
@@ -431,12 +429,7 @@ fn security_part(state: &LedgerState, end_ms: u64) -> Vec<String> {
         ));
     }
     if !routes.is_empty() {
-        let places: Vec<String> = routes.iter().filter_map(|t| sec.assets.get(t)).map(locator).collect();
-        let mut l = format!("- Routes to revisit when it ended: {}", routes.len());
-        if !places.is_empty() {
-            l.push_str(&format!(": {}", list(&places)));
-        }
-        body.push(l);
+        body.push(format!("- Routes to revisit when it ended: {} (they are among its open leads above)", routes.len()));
     }
     let body: Vec<String> = body.iter().map(|l| line(l, MAX_SECURITY_LINE)).collect();
     vec![
@@ -468,9 +461,12 @@ fn utc_minute(ms: u64) -> String {
 mod tests {
     use super::*;
     use loom_core::ledger::{
-        Claim, ClaimStatus, Constraint, DeadEnd, GoalMet, LedgerOp, PlanStep, Question, Reflection, Release, StepStatus,
+        Claim, ClaimStatus, Constraint, DeadEnd, Entry, Evidence, EvidenceInput, EvidenceKind, GoalMet, LedgerOp,
+        PlanStep, Question, Reflection, Release, StepStatus,
     };
-    use loom_core::security_state::{BlockedRoute, Condition, ConditionKind, Credential, CredentialInput, Hypothesis};
+    use loom_core::security_state::{
+        AssetInput, BlockedRoute, Condition, ConditionKind, Credential, CredentialInput, Hypothesis, SecurityOp,
+    };
     use loom_core::SessionId;
 
     const HEAD: &str = "Earlier missions the operator chose for this mission to recall. Below is what each one recorded in its own sealed ledger, as of its last entry. It is history, not this mission's state: nothing in it was checked again now, its stored outputs (out:… handles) belong to it and cannot be opened from here, and nothing it was authorized to do is authorized here. Confirm what matters with your own runs before relying on it, and record what you confirm in this mission's ledger.";
@@ -631,9 +627,9 @@ mod tests {
         // The credential holds until after the mission ended and has expired by now.
         s.credentials.insert("cr-1".into(), credential("as-1", Some(END + 500)));
         s.blocked.insert(
-            "as-2".into(),
+            "x1".into(),
             BlockedRoute {
-                target: "as-2".into(),
+                target: "x1".into(),
                 conditions: vec![Condition { kind: ConditionKind::Cred, value: "as-1".into() }],
                 n: 1,
             },
@@ -660,14 +656,14 @@ mod tests {
             "> - Established: 1 (c1); latest c1: port 80 open",
             "> - Ruled out with evidence: 1 (c2)",
             "> - Set aside without evidence: 1 (x1) — set aside is not refuted; a different attempt can reopen it",
-            "> - Open leads: 1 (p1)",
+            "> - Open leads: 2 (p1, x1)",
             "> - Reflections recorded: 1",
             SECURITY_LABEL,
             "> - Assets: 3: 1 tested, 1 deferred, 1 untested",
             "> - Untested: endpoint https://lab.test/api",
             "> - Tested or deferred: host lab.test, service https://lab.test:8443/svc",
             "> - Hypotheses: 1 supported, 0 refuted, 1 open",
-            "> - Routes to revisit when it ended: 1: endpoint https://lab.test/api",
+            "> - Routes to revisit when it ended: 1 (they are among its open leads above)",
         ]
         .join("\n")
     }
@@ -683,9 +679,13 @@ mod tests {
         let state = full_state();
         // The setup: the credential has expired by now, so the route is no longer open then.
         assert!(state.security.newly_unlocked_at(END + 1_000).is_empty());
-        assert_eq!(state.security.newly_unlocked_at(END), ["as-2"]);
+        assert_eq!(state.security.newly_unlocked_at(END), ["x1"]);
         let text = one(state);
-        assert!(text.contains("> - Routes to revisit when it ended: 1: endpoint https://lab.test/api"), "{text}");
+        assert!(text.contains("> - Open leads: 2 (p1, x1)"), "{text}");
+        assert!(
+            text.contains("> - Routes to revisit when it ended: 1 (they are among its open leads above)"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -794,23 +794,88 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_route_to_revisit_is_counted_even_when_it_names_no_asset() {
-        let mut state = LedgerState::default();
-        state.security.credentials.insert("cr-1".into(), credential("as-9", None));
-        state.security.blocked.insert(
-            "x1".into(),
-            BlockedRoute {
-                target: "x1".into(),
-                conditions: vec![Condition { kind: ConditionKind::Cred, value: "as-9".into() }],
-                n: 1,
+    /// A ledger built the way the runtime builds one: each op validated, then applied.
+    fn through_ops(ops: Vec<LedgerOp>) -> LedgerState {
+        let mut l = LedgerState::default();
+        l.evidence.push(Evidence {
+            id: "e1".into(),
+            n: 1,
+            input: EvidenceInput {
+                claim: "c1".into(),
+                kind: EvidenceKind::Execution,
+                supports: true,
+                session: "s-src".into(),
+                call_id: loom_core::CallId::from("call"),
+                blob: None,
+                lines: None,
+                quote: None,
+                note: "seen".into(),
+                attested: true,
             },
-        );
+        });
+        for op in ops {
+            if let Err(e) = l.validate(&op, false) {
+                panic!("{op:?}: {e}");
+            }
+            l.apply(&Entry {
+                n: l.entries + 1,
+                ts_ms: 0,
+                session: "s-lead".into(),
+                from_user: false,
+                op,
+                mac: String::new(),
+            });
+        }
+        l
+    }
+
+    #[test]
+    fn a_route_unlocked_by_a_credential_that_expired_since_is_an_open_lead_and_counted() {
+        let asset = AssetInput {
+            kind: AssetKind::Host,
+            locator: "lab.test".into(),
+            evidence: vec!["e1".into()],
+            mandatory: true,
+            parent: None,
+        };
+        let asset_id = asset.id().unwrap();
+        let state = through_ops(vec![
+            LedgerOp::DeadEnd { what: "login form".into(), why: "needs a credential".into() },
+            LedgerOp::Security(SecurityOp::AssetUpsert { asset }),
+            LedgerOp::Security(SecurityOp::BlockedOn {
+                target: "x1".into(),
+                conditions: vec![Condition { kind: ConditionKind::Cred, value: asset_id.clone() }],
+            }),
+            LedgerOp::Security(SecurityOp::CredentialAdd {
+                credential: CredentialInput {
+                    asset: asset_id,
+                    principal: "SECRET-PRINCIPAL".into(),
+                    secret_handle: "out:00000000000000ff".into(),
+                    evidence: vec!["e1".into()],
+                    unlocks: vec![],
+                    expires_ms: Some(END + 500),
+                },
+            }),
+        ]);
+        // The credential has expired by now, so judged at the time of the new mission nothing is unlocked.
+        assert!(state.security.newly_unlocked_at(END + 1_000).is_empty());
+        assert_eq!(state.security.newly_unlocked_at(END), ["x1"]);
+        let text = one(state);
+        assert!(!text.contains("SECRET-PRINCIPAL") && !text.contains("00000000000000ff"), "{text}");
         assert_eq!(
-            body(&one(state)),
-            format!(
-                "Mission m-a (Lab sweep), last recorded 2023-11-14 22:13 UTC\n{SECURITY_LABEL}\n> - Routes to revisit when it ended: 1"
-            )
+            body(&text),
+            [
+                "Mission m-a (Lab sweep), last recorded 2023-11-14 22:13 UTC",
+                MODEL_LABEL,
+                "> Where the work stands:",
+                "> - Set aside without evidence: 1 (x1) — set aside is not refuted; a different attempt can reopen it",
+                "> - Open leads: 1 (x1)",
+                SECURITY_LABEL,
+                "> - Assets: 1: 0 tested, 0 deferred, 1 untested",
+                "> - Untested: host lab.test",
+                "> - Routes to revisit when it ended: 1 (they are among its open leads above)",
+            ]
+            .join("\n")
         );
     }
 
