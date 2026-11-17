@@ -696,6 +696,8 @@ pub(crate) fn symlink_at(dir: &File, target: &OsStr, name: &OsStr) -> std::io::R
 
 /// Open the existing entry `name` of the open directory `dir` for reading, without following a link. It is
 /// opened without waiting (a FIFO put there would otherwise block) and the caller checks that it is a file.
+/// Only adoption's clone uses it, and only macOS clones.
+#[cfg(target_os = "macos")]
 pub(crate) fn open_file_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
     let c = c_name(name)?;
     let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
