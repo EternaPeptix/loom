@@ -295,9 +295,10 @@ be what overflows) and plans again, then plans once more allowing assistant text
 When even that is not enough, nothing is recorded and the context grows until the window forces an
 `overflow` re-weave. Forced re-weaves (`overflow`, `refused`, and `operator` from `POST …/reweave` or
 `loom reweave`) take what the plan can free. A `refused` re-weave (§10: a provider refusing what the
-request carries, refused twice on the same prefix) protects no recent step, and neither does an
-`operator` one made while the current prefix is the one refused: what the server refuses may be the
-newest output, and its stub keeps the handle. Re-weaves happen only between steps (or while idle, on
+request carries, refused twice on the same prefix) protects no recent step and folds everything it
+can whatever the size, and so does an `operator` one made while the current prefix is the one refused:
+what the server refuses may be the newest output, and is not a matter of size; each stub keeps its
+handle. Neither asks for a digest. Re-weaves happen only between steps (or while idle, on
 operator request), never while a tool call is outstanding. The model can `pin` a result it wants
 kept.
 

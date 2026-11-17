@@ -80,7 +80,9 @@
 //!      messages of other agents): its words stay in the log, where `log_search` finds them;
 //!   7. only when `allow_text_eviction`: `Drop` assistant text.
 //!      Results already stubbed are skipped. Protected notes (`constraint`, `approval`, `assignment`)
-//!      are never candidates. The estimate of a dropped note subtracts its characters and the blank
+//!      are never candidates, and neither is a note after the latest `model_response` record (the model
+//!      has not seen it yet; with `keep_recent_steps = 0` that is the region the plan would otherwise
+//!      reach). The estimate of a dropped note subtracts its characters and the blank
 //!      line that joined it to its message, or the whole message (with its overhead) when the note was
 //!      the only item in it. Returns `None` when nothing can be evicted. Stub text comes from
 //!      [`stub_text`].

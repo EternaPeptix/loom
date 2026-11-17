@@ -48,9 +48,10 @@
 //! A file above `READ_CAP`: without `start`/`end` → error sentence stating its size, saying to pass a
 //! range or to search it with `bash` (`grep` skips files of that size). With a range the file is
 //! streamed and only the lines of the window are kept: at most 80_000 bytes of each line, and at most
-//! the smaller of `WINDOW_BYTES` (4 MiB) and `ctx.view_chars` bytes in all — a window that reaches that
-//! size ends before the line that would pass it (the first line is always kept) and the range fact
-//! says so and where to continue. Each line is shown at most `min(20_000, ctx.view_chars)` characters,
+//! the smaller of `WINDOW_BYTES` (4 MiB) and `ctx.view_chars` bytes in all, each line counted with the
+//! `{n}\t` it will be shown with — a window that reaches that size ends before the line that would pass
+//! it (the first line is always kept; the last line of a file without a final newline is checked like
+//! any other) and the range fact says so and where to continue. Each line is shown at most `min(20_000, ctx.view_chars)` characters,
 //! so the numbered text exceeds `ctx.view_chars` by no more than its line numbers, which `finalize`
 //! bounds (a window this tool shapes itself should not reach that backstop in practice). The window has no handle (its stored lines are
 //! numbered from 1, the text shows the file's own numbers): a fact says to quote it from `bash`. The kept lines are normalised and stored like a

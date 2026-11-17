@@ -12,7 +12,10 @@
 //! No result's text may exceed what admission allows (DESIGN §2, principle 3): a result in the recent
 //! region cannot be folded out of view, so one oversized result would make every later request
 //! overflow. Views bound themselves with `ctx.view_chars` (see `view`, `outview`, `fstools`), and
-//! [`finalize`] is the backstop, with `budget = admission.policy.view_chars(admission.estimator)`:
+//! [`finalize`] is the backstop, with
+//! `budget = max(ctx.view_chars, admission.policy.view_chars(admission.estimator))` (`ctx` being the
+//! context the call ran with: a call started early sized its view before the estimator was calibrated by
+//! the reply that holds it, and is not cut for that):
 //! - a `View` or `ProducedView` whose text is longer than `budget` characters keeps its text up to and
 //!   including the last `\n` at or before character `budget` (cut on a character boundary at `budget`
 //!   when there is none), followed by the line `[cut by harness: this view is {n} characters, more than

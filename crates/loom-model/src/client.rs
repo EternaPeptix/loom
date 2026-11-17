@@ -51,9 +51,13 @@
 //!   `input is too long`, case-insensitive — or whose JSON error object has a `type` or `code` (string)
 //!   of `exceed_context_size_error` (llama.cpp) or `context_length_exceeded` → `ModelError::ContextOverflow`.
 //!   `limit`/`requested`: the error object's `n_ctx` / `n_prompt_tokens` when they are positive
-//!   integers; otherwise from the first two integers ≥ 1000 in the message, `limit` the smaller and
-//!   `requested` the larger (servers name them in either order: llama.cpp states the request first);
-//!   with one such integer it is `limit`, with none both are `None`. The same applies to an error
+//!   integers. Otherwise from the message, in this order: the integer right after `maximum context
+//!   length is ` or after `context size (` / `context size of ` (case-insensitive) is `limit`, and
+//!   `requested` is then the first integer ≥ 1000 in the message larger than it, or `None` (vLLM's
+//!   `max_tokens` refusal names `max_tokens` first: "…is too large: 32768. This model's maximum context
+//!   length is 131072 tokens…"); else the wording `A > B` ("70000 > 65536") names the request first;
+//!   else the first two integers ≥ 1000, `limit` the smaller and `requested` the larger (llama.cpp states
+//!   the request first); with one such integer it is `limit`, with none both are `None`. The same applies to an error
 //!   object inside a 200 stream (`AssembleError::Server`) whose message matches those phrases: it is
 //!   an overflow (no retry), not a server error to retry;
 //! - **rejected** (no retry): any other 4xx → `ModelError::Rejected { status, message }`. `message`
@@ -92,7 +96,8 @@
 //! `Retry-After` honoured; retry window exhausted → `Unavailable`; 400 → `Rejected` with the
 //! server's message; overflow wording → `ContextOverflow` with parsed numbers (each phrase; llama.cpp's
 //! 400 body with `n_ctx`/`n_prompt_tokens`, and the same message without them, both giving limit =
-//! the smaller; the type code alone; a 422; an overflow error inside a 200 stream, sent once); a 422
+//! the smaller; vLLM's `max_tokens` refusal giving the window as the limit; `A > B`; the type code alone;
+//! a 422; an overflow error inside a 200 stream, sent once); a 422
 //! without overflow wording stays `Rejected`; cancellation during
 //! a stream and during a retry sleep; server unreachable then started later is picked up; bearer
 //! header sent only when configured; `discover` for each source; `timing` is plausible.

@@ -251,8 +251,9 @@
 //!      the start of this request), and this step has not re-woven for a refusal yet, run the re-weave
 //!      procedure forced with reason `refused`; if it appended a `reweave`, go back to the start of this
 //!      point. Otherwise remember this epoch as refused and *fail* with the refusal texts:
-//!      `texts::refused(status, message, folded)` as the why (`folded` = the latest `reweave` record's
-//!      reason is `refused`: the window was already folded for a refusal), and for a lead the inbox text `texts::refused_park(status, message, folded)` in place
+//!      `texts::refused(status, message, folded)` as the why (`folded` = a `reweave` with reason
+//!      `refused` was appended after the session's latest `model_response`: the window was folded for a
+//!      refusal and no reply has come since), and for a lead the inbox text `texts::refused_park(status, message, folded)` in place
 //!      of `texts::turn_failed(why)`. The epoch of the last refusal is kept in memory only: after a
 //!      restart the first refusal parks again before the next one re-weaves.
 //!    - any other error: *fail* with `texts::sentence(&error.to_string())`.
@@ -400,8 +401,11 @@
 //!    window, so fewer of them are protected. The minimum is `MIN_KEEP_RECENT_STEPS` (2), and 0 for an
 //!    `overflow` (one output of the latest step can be the whole problem: kept in view, it would make
 //!    every request overflow again). For `refused`, and for an `operator` re-weave while the current
-//!    epoch is the one the last refusal recorded, `keep_recent_steps` is 0 from the start (what the
-//!    server refuses may be the newest output). A result folded this way keeps its handle in its stub.
+//!    epoch is the one the last refusal recorded, `keep_recent_steps` is 0 and `floor_tokens` is 0 from
+//!    the start: the plan folds everything it can (every live, unpinned result and report, the droppable
+//!    notes), whatever the size, because what the server refuses may be the newest output and is not a
+//!    matter of size; neither asks for a digest (the prefix was refused). A result folded this way keeps
+//!    its handle in its stub.
 //! 2. Still not enough: `text_plan = w.plan(records, estimator, &policy, true)`. Not forced
 //!    and `text_plan` is not enough either: return without a record and without a digest request (see
 //!    "Why a re-weave must be worth it"). Otherwise, when `text_plan` exists and the re-weave is not
@@ -497,7 +501,10 @@
 //!   re-weaves with reason `refused` (the latest result is stubbed, with its handle) and the retry gets
 //!   200; a 400 after that re-weave parks with `refused_park(.., true)`; a refusal after a re-weave in
 //!   between parks again first; a 401 or 404 never re-weaves; a child settles `Failed` with
-//!   `refused(..)`; an `operator` re-weave after a refusal folds the latest step's results;
+//!   `refused(..)`; an `operator` re-weave after a refusal folds the latest step's results and asks for
+//!   no digest; with the default context policy (a floor far above the window's size) the refusal fold
+//!   still folds every output, the refused one included; a refusal long after a fold that worked parks
+//!   with `folded` false;
 //! - window-scaled admission: with a small `context_window` a large `bash` output is cut at
 //!   `window / 8` and a `read` of a large file ends at a whole line within `view_chars` and says where to
 //!   continue;
