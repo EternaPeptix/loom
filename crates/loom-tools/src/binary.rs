@@ -11,8 +11,7 @@
 //! staging outside actor write grants. Unconfined mode is explicitly labelled and never cached.
 //! Every readable process observation, including failure/cancellation/timeout/limit prefixes, is Raw
 //! output with completion/termination metadata. Read failures retain the protected output file.
-//! ProducedView stores and indexes full normalized decompiler output while showing at most 120 lines,
-//! and no more of them than fit in `ctx.view_chars` (`view::numbered`); the fact names the lines displayed.
+//! ProducedView stores and indexes full normalized decompiler output while showing at most 120 lines.
 
 use crate::{
     params::{opt, req, spec},
@@ -455,6 +454,8 @@ fn xref_failure(rows: Vec<Value>, target: &str, result: Option<CommandOutcome>, 
     output
 }
 
+/// Stores the whole output and shows at most 120 of its lines, and no more of them than fit in
+/// `ctx.view_chars` (`view::numbered`); the fact names the lines displayed.
 fn limited_backend_view(ctx: &ToolCtx, mut output: ToolOutput, bytes: &[u8]) -> ToolOutput {
     let (blob, normalized) = match crate::view::store_text(&ctx.blobs, bytes) {
         Ok(v) => v,

@@ -1096,6 +1096,24 @@ pub fn flag_candidate(handle: &str) -> String {
 mod tests {
     use super::*;
 
+    fn tools_all() -> FinishTools {
+        FinishTools { conclude: true, block: true, ask_for: true, spawn: true, plan: true, solvable: false }
+    }
+
+    const OPEN: &str = "finish is not available yet: the goal is not concluded, so nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result.";
+    const MET: &str = " Once a run shows the goal met, call conclude with status met and that run as evidence.";
+    const UNREACHABLE: &str = " If every route is closed, conclude with status unreachable and its execution evidence: a well-evidenced unreachable conclusion is a reportable outcome, not a failure.";
+    const STUCK: &str = "If you are stuck rather than done: ask_for (budget, a tool, a hint or direction); start a fresh agent with agent_spawn for another view; report_blocker if something only the operator can supply is missing; keep working meanwhile.";
+
+    #[test]
+    fn finish_unavailable_lists_the_open_routes() {
+        let d = vec!["- untested surface as-1".to_string(), "- open plan step p1: read".to_string()];
+        assert_eq!(
+            finish_unavailable(&tools_all(), &d),
+            format!("{OPEN}{MET}{UNREACHABLE}\nRoutes the mission ledger still shows open:\n- untested surface as-1\n- open plan step p1: read\nPick one and run it; record what the run shows.\n{STUCK}")
+        );
+    }
+
     #[test]
     fn a_refusal_quotes_the_server_and_says_what_the_next_answer_does() {
         let said = "Input text data may contain inappropriate content";
@@ -1115,24 +1133,6 @@ mod tests {
         let folded = refused_park(400, said, true);
         assert!(folded.contains("Move the session to another model") && !folded.contains("folds every tool output"));
         assert_ne!(park, folded);
-    }
-
-    fn tools_all() -> FinishTools {
-        FinishTools { conclude: true, block: true, ask_for: true, spawn: true, plan: true, solvable: false }
-    }
-
-    const OPEN: &str = "finish is not available yet: the goal is not concluded, so nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result.";
-    const MET: &str = " Once a run shows the goal met, call conclude with status met and that run as evidence.";
-    const UNREACHABLE: &str = " If every route is closed, conclude with status unreachable and its execution evidence: a well-evidenced unreachable conclusion is a reportable outcome, not a failure.";
-    const STUCK: &str = "If you are stuck rather than done: ask_for (budget, a tool, a hint or direction); start a fresh agent with agent_spawn for another view; report_blocker if something only the operator can supply is missing; keep working meanwhile.";
-
-    #[test]
-    fn finish_unavailable_lists_the_open_routes() {
-        let d = vec!["- untested surface as-1".to_string(), "- open plan step p1: read".to_string()];
-        assert_eq!(
-            finish_unavailable(&tools_all(), &d),
-            format!("{OPEN}{MET}{UNREACHABLE}\nRoutes the mission ledger still shows open:\n- untested surface as-1\n- open plan step p1: read\nPick one and run it; record what the run shows.\n{STUCK}")
-        );
     }
 
     #[test]

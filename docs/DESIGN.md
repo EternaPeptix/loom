@@ -926,12 +926,12 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   has (the server was relaunched with another model), the 404 is refused with a sentence naming the
   model now served — loom never follows a new model by itself, because what a session recorded at its
   start describes the old one.
-- **Context overflow.** A 400, 413 or 422 whose message reads like an over-long prompt (`maximum context
+- **Context overflow.** A 400 or 413 whose message reads like an over-long prompt (`maximum context
   length`, `context length`, `too many tokens`, `prompt is too long`, `max_model_len`, llama.cpp's
   `exceeds the available context size`, `input is too long`) or whose error type or code is
-  `exceed_context_size_error` or `context_length_exceeded`, and an error object with such a message
-  inside a 200 stream, is reported with the limit and request size: the error's `n_ctx` and
-  `n_prompt_tokens` when present, else the smaller and the larger of the numbers in the message
+  `exceed_context_size_error` or `context_length_exceeded`, a 422 of the same kind, and an error object
+  with such a message inside a 200 stream, is reported with the limit and request size: the error's
+  `n_ctx` and `n_prompt_tokens` when present, else the smaller and the larger of the numbers in the message
   (servers name them in either order). The session then re-weaves (`overflow`, protecting no recent
   step when it must) and sends again, once per step, and fails the step when nothing can be folded.
 - **Refusals** (400, 413 or 422 that is not an overflow): a provider refusing what the request carries,
