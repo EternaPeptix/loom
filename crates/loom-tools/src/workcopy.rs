@@ -884,8 +884,16 @@ fn bring(
     };
     if finished.is_err() {
         let _ = remove_at(&dir, &tmp);
+        return finished;
     }
-    finished
+    // A command may have moved the open directory since it was judged: judge where it is now, and take the
+    // entry out again if that is a place the session may not write.
+    if let Err(e) = judge_in(&dir, name, may_write) {
+        let _ = remove_at(&dir, name);
+        let why = format!("the directory was moved while the file was being put there, so it was removed again: {e}");
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, why));
+    }
+    Ok(())
 }
 
 /// Remove the file or link `rel` of `dest` within its directory, opened without following a link and
@@ -910,6 +918,18 @@ pub fn adopt(
     readable: Readable<'_>,
 ) -> Result<Changes, AdoptError> {
     let all = changes(manifest, copy).map_err(|message| AdoptError::Io { message, written: Vec::new() })?;
+    // Before anything in `dest` is looked at: a path through a link to where the session may not write is
+    // refused here and never examined, so a comparison cannot tell whether a name exists there.
+    let refused: Vec<(String, String)> = all
+        .added
+        .iter()
+        .chain(&all.modified)
+        .chain(&all.deleted)
+        .filter_map(|rel| may_write(&dest.join(rel)).err().map(|why| (rel.clone(), why)))
+        .collect();
+    if !refused.is_empty() {
+        return Err(AdoptError::Refused(refused));
+    }
     let mut todo = Changes { newest_ms: all.newest_ms, ..Changes::default() };
     let mut conflicts = Vec::new();
     for (rel, added) in all.added.iter().map(|r| (r, true)).chain(all.modified.iter().map(|r| (r, false))) {
@@ -948,16 +968,6 @@ pub fn adopt(
     }
     if !conflicts.is_empty() {
         return Err(AdoptError::Conflicts(conflicts));
-    }
-    let refused: Vec<(String, String)> = todo
-        .added
-        .iter()
-        .chain(&todo.modified)
-        .chain(&todo.deleted)
-        .filter_map(|rel| may_write(&dest.join(rel)).err().map(|why| (rel.clone(), why)))
-        .collect();
-    if !refused.is_empty() {
-        return Err(AdoptError::Refused(refused));
     }
     let mut written = Vec::new();
     for rel in todo.added.iter().chain(&todo.modified) {
@@ -1122,11 +1132,12 @@ mod tests {
         let done = adopt(&made.manifest, &f.copy, &f.ws, &may, &allow).unwrap();
         assert_eq!(done.lines(), ["D docs/old.md", "M src/a.rs", "A tests/deep/t.rs"]);
         // Every path is asked once up front (added, modified, deleted), then for each directory made and for
-        // each path written or removed, by its real path.
+        // each path written or removed, by its real path; a path written is judged once more when it is in
+        // place.
         let ws = &f.ws;
         let up_front = [ws.join("tests/deep/t.rs"), ws.join("src/a.rs"), ws.join("docs/old.md")];
-        let writing = [ws.join("tests"), ws.join("tests/deep"), ws.join("tests/deep/t.rs")];
-        let rest = [ws.join("src/a.rs"), ws.join("docs/old.md"), ws.join("docs")];
+        let writing = [ws.join("tests"), ws.join("tests/deep"), ws.join("tests/deep/t.rs"), ws.join("tests/deep/t.rs")];
+        let rest = [ws.join("src/a.rs"), ws.join("src/a.rs"), ws.join("docs/old.md"), ws.join("docs")];
         assert_eq!(*asked.borrow(), [up_front.as_slice(), writing.as_slice(), rest.as_slice()].concat());
         assert_eq!(fs::read_to_string(f.ws.join("src/a.rs")).unwrap(), "fn a() { 1 }\n");
         assert_eq!(fs::read_to_string(f.ws.join("tests/deep/t.rs")).unwrap(), "#[test] fn t() {}\n");
@@ -1208,7 +1219,13 @@ mod tests {
         };
         let done = adopt(&made.manifest, &f.copy, &f.ws, &may, &allow).unwrap();
         assert_eq!(done.lines(), ["M src/b.rs"]);
-        assert_eq!(*asked.borrow(), [f.ws.join("src/b.rs"), f.ws.join("src/b.rs")]);
+        // Every changed path is asked up front, those already as the copy has them too; `src/b.rs` is asked
+        // again for its place and once more when it is in place.
+        let ws = &f.ws;
+        assert_eq!(
+            *asked.borrow(),
+            [ws.join("notes.txt"), ws.join("src/a.rs"), ws.join("src/b.rs"), ws.join("src/b.rs"), ws.join("src/b.rs")]
+        );
         assert_eq!(fs::read_to_string(f.ws.join("src/b.rs")).unwrap(), "fn b() { 2 }\n");
     }
 
@@ -1431,6 +1448,62 @@ mod tests {
         assert_eq!(listing(&r.outside), before);
     }
 
+    /// A `may_write` that judges the real path of a path's directory, as the sandbox does: what leads through a
+    /// link to somewhere outside `ws` is refused.
+    fn real_judge(ws: &Path) -> impl Fn(&Path) -> Result<(), String> + '_ {
+        move |p| match p.parent().map(fs::canonicalize) {
+            Some(Ok(real)) if real.starts_with(ws) => Ok(()),
+            _ => Err(format!("{} leads outside the writable roots", p.display())),
+        }
+    }
+
+    #[test]
+    fn a_path_through_a_link_to_where_nothing_may_be_written_is_refused_whatever_is_there() {
+        // The name is not there; it is there with the copy's bytes; it is there with other bytes.
+        for there in [None, Some("from the copy\n"), Some("something else\n")] {
+            let r = raced(&[("seed", "s")], &[("keep", "k")]);
+            let made = make(&r.ws, &r.copy, &ROOMY, &allow).unwrap();
+            fs::create_dir_all(r.copy.join("k")).unwrap();
+            fs::write(r.copy.join("k/name"), "from the copy\n").unwrap();
+            std::os::unix::fs::symlink(&r.outside, r.ws.join("k")).unwrap();
+            if let Some(text) = there {
+                fs::write(r.outside.join("name"), text).unwrap();
+            }
+            let before = listing(&r.outside);
+            let reads = std::cell::Cell::new(0);
+            let counting = |_: &Path| {
+                reads.set(reads.get() + 1);
+                Ok(())
+            };
+            let result = adopt(&made.manifest, &r.copy, &r.ws, &real_judge(&r.ws), &counting);
+            let Err(AdoptError::Refused(refused)) = result else {
+                panic!("{there:?}: a refusal expected, got {result:?}")
+            };
+            assert_eq!(refused.len(), 1, "{there:?}");
+            assert_eq!(refused[0].0, "k/name", "{there:?}");
+            assert_eq!(reads.get(), 0, "{there:?}: nothing was read there");
+            assert_eq!(listing(&r.outside), before, "{there:?}");
+        }
+    }
+
+    #[test]
+    fn a_directory_moved_to_where_nothing_may_be_written_while_its_file_is_judged_keeps_no_file() {
+        let r = raced(&[("x/seed", "s")], &[("keep", "k")]);
+        let made = make(&r.ws, &r.copy, &ROOMY, &allow).unwrap();
+        fs::write(r.copy.join("x/f"), "from the copy\n").unwrap();
+        let calls = std::cell::Cell::new(0);
+        // Call 1 is the check, call 2 judges the place of `x/f` in the directory that was opened; the directory
+        // is moved, with that open directory, to where `may_write` refuses.
+        let moved = || fs::rename(r.ws.join("x"), r.outside.join("x")).unwrap();
+        let may = judge(&r.ws, &calls, 2, &moved);
+        let (message, written) = io_message(adopt(&made.manifest, &r.copy, &r.ws, &may, &allow));
+        assert!(message.contains("x/f could not be written") && message.contains("moved"), "{message}");
+        assert!(message.contains("lies outside the writable roots"), "{message}");
+        assert!(written.is_empty());
+        let names: Vec<String> = listing(&r.outside.join("x")).into_keys().collect();
+        assert_eq!(names, ["seed"], "no adopted file, and nothing half-made, is left there");
+    }
+
     #[test]
     fn a_directory_swapped_after_it_was_opened_takes_the_file_there_and_nothing_goes_outside() {
         let r = raced(&[("x/seed", "s")], &[("keep", "k")]);
@@ -1496,13 +1569,9 @@ mod tests {
             let may = judge(&r.ws, &calls, swap_at, &swap);
             let result = adopt(&made.manifest, &r.copy, &r.ws, &may, &allow);
             if swap_at == 1 {
-                // Swapped after the check, before the directory was opened: the link is refused.
-                let (message, written) = io_message(result);
-                assert!(
-                    message.contains("x/old could not be removed") && message.contains("symbolic link"),
-                    "{message}"
-                );
-                assert!(written.is_empty());
+                // Swapped after the check of the paths, before anything of `dest` was looked at: the file the
+                // link leads to is not the one the copy was made from, so it is a conflict and nothing is touched.
+                assert!(matches!(result, Err(AdoptError::Conflicts(_))), "{result:?}");
                 assert!(r.ws.join("x.orig/old").exists(), "the file of the workspace was not touched either");
             } else {
                 // Swapped once the directory was open and judged: the file goes from that directory.
@@ -1592,7 +1661,7 @@ mod tests {
             fs::create_dir(r.ws.join("f")).unwrap();
             fs::write(r.ws.join("f/inside"), "i").unwrap();
         };
-        let may = judge(&r.ws, &calls, 1, &appear);
+        let may = judge(&r.ws, &calls, 2, &appear);
         let (message, written) = io_message(adopt(&made.manifest, &r.copy, &r.ws, &may, &allow));
         assert!(message.contains("f could not be written"), "{message}");
         assert!(written.is_empty());
