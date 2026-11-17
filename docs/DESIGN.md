@@ -1317,7 +1317,10 @@ is `DATABASE_URL`, `SSH_AUTH_SOCK` or the `api_key_env` of any model profile, or
 whose value holds, anywhere, a URL with a password in its user-info part (`scheme://user:password@host`)
 (unless listed in `sandbox.env_pass`), plus
 `TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR` = the temp
-dir, and the proxy variables.
+dir, and the proxy variables. In `seatbelt` mode also `xcrun_db` = `<temp dir>/.xcrun_db`: the lookup cache of
+macOS's developer-tool stubs (`/usr/bin/python3`, `git`, `clang`, …), whose per-user default commands may not
+write; without one of their own, a stub whose cache lacked the tool printed `couldn't create cache file` on
+every run.
 
 **Egress proxy** (`loom-net::proxy`, `policy`; their module documentation is the precise
 specification). One HTTP/1.1 proxy: a shared listener on `127.0.0.1:daemon.proxy_port` (0 = any free

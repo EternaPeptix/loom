@@ -74,7 +74,10 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   `protected_paths` are never writable, with one exception: the session's temporary directory lies in
   `~/.loom` (`sessions/<id>/tmp`), and everything inside it is writable, though the directory entry
   itself cannot be removed, renamed or replaced. A directory that holds a protected path cannot be
-  renamed or removed.
+  renamed or removed. The lookup cache that macOS's developer-tool stubs (`/usr/bin/python3`, `git`,
+  `clang`, `make`, …) keep for your user (`xcrun_db` in your temporary directory) is not writable either, so
+  a command cannot point your own `git` at a program of its choosing: commands get a cache of the session's
+  own in its temporary directory (the variable `xcrun_db`), which they can write and only they use.
 - **Credential stores are unreadable and unwritable** by default (`protect_credentials = true`): `~/.ssh`,
   `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`,
   `~/.docker/config.json`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, cargo and git credential files, password
