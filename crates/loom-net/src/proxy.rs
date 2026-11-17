@@ -72,7 +72,123 @@
 //! loopback (`allow_private`, a granted `127.0.0.1:{port}`) could open a tunnel to another session's
 //! listener and present that session's credentials there, through the proxy, which would accept them.
 //! `set_policy(session, policy)` replaces the policy of a session that holds a grant and keeps its
-//! credentials, so commands already running pick the change up on their next connection.
+//! credentials, so commands already running pick the change up on their next connection. It does not touch the
+//! session's reference grant, which has a policy of its own. `hold(session, policy)` is the replacement for a hold:
+//! it sets the policy of **both** the command grant and the reference grant (so that an in-process GET that follows
+//! redirects cannot open a new reference connection after the cut), and the reference entry keeps it until
+//! `grant_reference` mints it again or the session is revoked.
+//! `cut_hosts(session, pattern) -> usize` ends the session's open tunnels and forwarded requests whose
+//! destination the grant pattern covers (`policy::pattern_covers`; a port in the pattern must match), and
+//! a connection accepted but not yet connected is refused when it would open (it is registered before the
+//! destination is opened, and the policy it is judged by is read after it is registered, from the
+//! session's current entry, not from the one taken when it authenticated: a `set_policy` that ran in
+//! between is seen; a forwarded request whose destination was cut while its name resolved or its connection
+//! opened is not written to it, the client gets `502` and the record says why). Each ended connection that was on record as allowed gets the second decision
+//! with the reason "the operator revoked the destination". It is what the operator's `loom scope revoke`
+//! calls after `set_policy`; the other sessions' connections to the same destination are not touched.
+//! `cut(session) -> usize` and `cut_sessions(sessions) -> usize` (E4a, `docs/MONITOR.md` §2.2) end every open
+//! tunnel and forwarded request of the session or sessions whatever the destination, **reference grants'
+//! connections included** (they are the session's: a connection is registered under the session id of its
+//! credentials, command or reference). The proxy does not know missions: the runtime's `cut_mission` lists the
+//! sessions of a mission. The bytes of an open tunnel stop within milliseconds (the relay is dropped, so both
+//! sockets close); each ended connection that was on record as allowed gets the second decision with the fixed
+//! reason "the session's connections were closed by loom" (never anything the monitor decided or wrote). A
+//! connection that authenticated before the call and is registered after it is ended when it registers (each
+//! cut bumps a counter and marks its sessions with it; a connection remembers the counter at its
+//! authentication), and one that is only resolving or connecting is ended when it has opened its destination,
+//! before the `200` and before any byte upstream (a connect that hangs is bounded by its 10 s timeout and
+//! carries no bytes). It does not touch the policy, the credentials or the listener: the caller sets a hold
+//! with `set_policy` first so that nothing new opens. It returns how many were ended; `0` for a session with
+//! nothing open.
+//!
+//! ## Veto (E4b)
+//! `set_veto(Some(f))` installs a synchronous, in-process veto, `f(session, &Dest) -> Option<rule>`, with
+//! `Dest { host, port, method, resolved, sni }`. It is asked for every connection the name policy allowed, for a
+//! `CONNECT`, a forwarded request and a check alike: (1) at the name stage, before any lookup (`resolved` and
+//! `sni` are `None`), so a canary host is never resolved; (2) for each address the policy allowed, before the
+//! connect (`resolved` is the address), so nothing is opened toward a vetoed address (a check asks it for the
+//! address it would use, the first the policy allows, and answers and records a veto of it as for a connect); (3) for the server name of a
+//! tunnel's ClientHello when it differs from the destination (`sni`, see *Server names*). `Some(rule)` ends the
+//! request: `502` with `X-Loom-Proxy: 1` and a fixed sentence that says the destination is closed to the mission
+//! by loom's own rules, that nothing was opened or sent, that it must not be retried and that `report_blocker`
+//! with class `needs_approval` is the way out; the rule is **not** in the body. The decision is recorded as
+//! refused (`allowed: false`) with the rule `vetoed: {rule}` (cut to 200 characters; ` (check only)` is added for
+//! a check) and the resolved address when there is one. The rule is a class word chosen by the hook and is
+//! readable by the agent (it is in the net record): the monitor's veto uses fixed class words and never a
+//! reviewer's or a tripwire's text. The hook runs on the proxy's tasks and must not block; the decision that
+//! a refusal is recorded is the proxy's, the hook's own events are its own. This is the design's "synchronous
+//! veto in the audit hook", as a separate hook because the monitor is built after the proxy and the audit hook
+//! is fixed at start; it also runs before the connect, not only before the `200`. `set_veto(None)` removes it.
+//!
+//! ## Observing refusals
+//! `set_refusal_observer(Some(f))` installs `f(session, &Dest)`, told of each request whose destination name the
+//! session's policy refused (`CONNECT`, forwarded request and check alike; `resolved` and `sni` are `None`) and of a
+//! tunnel whose ClientHello server name the policy refused or whose encrypted-ClientHello extension names another
+//! host (`sni` is that name). It only observes: the answer, the record and the refusal are the policy's own. The
+//! veto is asked only of what the policy allowed, and the default modes (`deny_all`, an allowlist) refuse most
+//! names before it, so this is how the daemon sees a decoy host named in a mission whose policy does not allow it
+//! (CN-4). It runs on the proxy's own tasks and must not block. `set_refusal_observer(None)` removes it.
+//!
+//! ## Server names (E4c)
+//! After the `200` of a `CONNECT` and before one byte goes upstream, the proxy reads the client's first flight
+//! (the bytes that came with the head, then more) and looks at it with `clienthello::parse`:
+//! - not TLS (the stream does not start like a TLS record: a first byte outside `0x14..=0x17`, or a second byte of
+//!   `0x10` or more, which a Go `crypto/tls` server also treats as not TLS): passed unchanged, nothing to bind
+//!   (an SSH or SMTP banner, plain HTTP, STARTTLS before its upgrade); a server that speaks before the client
+//!   does ends the wait the same way. A stream that **does** start like a TLS record but whose first record is not a
+//!   handshake record of version `3.x` (a warning alert, a change-cipher-spec, application data, a record header
+//!   with version `0.0` or `1.0`) is refused as a hello that cannot be read: servers (Go, BoringSSL, rustls) skip a
+//!   leading alert or accept such a version and read the hello behind it, so passing it would let the name be
+//!   hidden;
+//! - a ClientHello whose server name is the destination (compared in the policy's normal form) passes, with
+//!   no extra record; an IP-literal destination with no name passes;
+//! - another name passes only when the session's current policy allows it (`check_name`, which applies deny
+//!   rules in every mode and the allowlist in allowlist mode) and the veto lets it through; the decision
+//!   that follows the allow is recorded as allowed with `sni` set and the rule `{rule} (sni {name}, another
+//!   name the policy allows)`;
+//! - a ClientHello with an encrypted-ClientHello extension whose outer server name **is** the destination passes as
+//!   an ordinary one: Chromium (Playwright, Puppeteer, curl-impersonate and the like) sends a placeholder (GREASE)
+//!   extension, type `0xfe0d`, with the real name in the clear on every hello, and the proxy cannot tell it from a
+//!   real one. The residual is a real ECH hello to an ECH-capable granted front whose public name is the
+//!   destination: its inner name is hidden (`docs/MONITOR.md` X4);
+//! - refused (nothing sent upstream, the tunnel closed, one more decision recorded as refused with the rule and
+//!   `sni` when there was one): an encrypted-ClientHello extension with another outer name or none (`deny an
+//!   encrypted ClientHello whose outer server name is not the destination: the server name is hidden from the
+//!   proxy (browsers send a placeholder extension with the destination's own name, which passes)`), a ClientHello that cannot be read or is larger than 64 KiB, one that does not
+//!   arrive in full within the head timeout, no server name to a destination that is a name, a name the policy
+//!   denies, a name the veto closes.
+//!
+//! Only the first flight is judged: a second ClientHello later in the stream (a renegotiation, a hello retry) and
+//! a tunnel that upgrades to TLS after a plaintext start are not (`docs/MONITOR.md` X4); Host-header fronting
+//! inside a session whose name matches is not stopped either. A tunnel that sends nothing and hears nothing is
+//! closed at the idle limit, as before, with the same record.
+//!
+//! ## Canary users (E4d)
+//! `add_canary_user(user, label)` registers a decoy user in the session table; `remove_canary_user(user)` takes it
+//! out; `set_canary_hook(Some(f))` installs `f(&CanaryHit)`. A request that presents a registered user as its
+//! Basic user, with any password, on any listener, is a canary event: the hook runs (on a blocking thread, and
+//! has returned before the answer is written, so the event exists before any byte flows), then the attempt is
+//! recorded **uncapped** (the limit on unattributed answers does not apply) and attributed to the session whose
+//! listener received it (`CanaryHit::listener`; unattributed on the shared listener), with the rule and the
+//! answer of any unknown user (`proxy authentication failed: unknown user`, `407`, the same bytes): nothing a
+//! client can read says the user was a decoy. A decoy user never authenticates, whatever its password, and no
+//! connection is opened. `add_canary_user` refuses (with a sentence) an empty name, one over 128 bytes and the
+//! user of a session's grant; reference grants have random `reference-…` names no canary should take.
+//!
+//! ## Listeners (E4e)
+//! `set_listener_check(Some(f))` installs `f(session, addr, client) -> Option<rule>`, run on a blocking thread for
+//! each connection that reached an address of this machine (a loopback or unspecified address, or one of its own
+//! interface addresses given by `set_local_addrs`; never one of the proxy's own ports) **after** the connect and
+//! before anything is recorded or sent. `addr` is the address connected to (with the destination port) and `client`
+//! the local end of the connection the proxy opened: the process that holds the other end is the one the bytes
+//! reach, which the check finds by the accepted socket (so a squatter that closes its listening socket as it
+//! accepts is still found) and, failing that, by the listeners that cover `addr`. `Some(rule)` refuses the
+//! connection like any policy refusal (`403`, the rule in the body and the record, the connection closed, the next
+//! address tried) so a lab port squatted by a sandboxed process of another mission is never used. The runtime's
+//! check is `loom_tools::sandbox::census::listener_of` (TW-05): a holder attributed to a loom sandbox is refused
+//! unless it belongs to the connector's own mission; the operator's own services, a connection nobody holds and an
+//! unreadable table pass. The scans of the process table that run at once are bounded (4): the others wait their
+//! turn, so a swarm of loopback connections cannot starve the proxy's other work.
 //! `SessionGrant::env()` gives the variables to place in a command's environment so that ordinary
 //! clients use the proxy: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case forms, all
 //! `http://{user}:{password}@127.0.0.1:{port}` with the session's own port, plus `NO_PROXY`/`no_proxy` = ``
@@ -87,7 +203,8 @@
 //! that checked address, never by name, so a second lookup cannot change the destination. If every
 //! address is refused the decision is the first refusal.
 //! Every request produces exactly one `NetDecision` (and a second one when it fails after an allow,
-//! see below) sent to `sink` together with the session id:
+//! see below, or, for a tunnel, when its ClientHello names another allowed name or is refused, see *Server
+//! names*) sent to `sink` together with the session id:
 //! `host`, `port`, `method` (`CONNECT` or the request method), `allowed`, `rule`, `resolved` (the
 //! address connected to, or the refused address, when there is one). Resolution or connect failures
 //! after an allow are reported as allowed with the rule suffixed ` (unreachable: {why})`.
@@ -130,7 +247,31 @@
 //! (`allow_private`) in open mode, a `CONNECT`, a forwarded `GET http://127.0.0.1:{port}/` and a check to
 //! another session's port, to the session's own port and to the shared port are each refused (`403`, rule
 //! `deny the egress proxy's own port {port}`), also written as `[::ffff:127.0.0.1]:{port}` and
-//! `0.0.0.0:{port}`, while another loopback port is still allowed.
+//! `0.0.0.0:{port}`, while another loopback port is still allowed. `cut_hosts`: a pattern that covers
+//! nothing, or only another port, cuts nothing; one that covers a tunnel closes it (bytes stop) and leaves
+//! the same session's tunnel to another destination and another session's tunnel to the same one; the
+//! second decision names the reason. `cut`: every connection of the session ends within a second and the bytes
+//! stop, a reference grant's tunnel with them, another session's tunnel stays, each ended one is on record
+//! with the fixed reason, `cut_sessions` ends several sessions' connections, a connection that authenticated
+//! before a cut and registers after it is ended while one that authenticated after is not, a hold followed by a
+//! cut leaves nothing open and nothing new, the proxy still serves the session afterwards. Veto: a vetoed name is
+//! not looked up and nothing connects to it (`502`, marker, fixed body without the rule, one refused record with
+//! `vetoed: …`), a check of it is answered the same way, a vetoed address stops the connect, the hook is asked at
+//! the name stage and again with the address, removing it opens the name. Server names: the destination's own
+//! name passes and the hello arrives whole, another allowed name passes and is recorded with `sni`, a denied name
+//! is refused with nothing received upstream, an encrypted hello, an unreadable one and a missing name are
+//! refused, an IP destination takes no name but not a denied one, a hello sent in pieces is read whole, plain
+//! HTTP and a server's banner pass, a stalled hello is refused after the head timeout. Canaries: the hook has
+//! run when the answer arrives, the answer equals an unknown user's byte for byte, the record is attributed to
+//! the listener's session and says nothing of a decoy, a run of them on the shared listener is never capped, a
+//! removed decoy is an unknown user. Listeners: a refusal names the rule in the `403` and the record, another
+//! loopback port passes, a forwarded request is checked too, the check is given the local end of the connection, and
+//! this machine's own addresses are told apart from others. Hold: a hold sets the reference grant's policy too, so
+//! after a cut a reference connection is refused. Observer: a canary name refused by an allowlist, as a `CONNECT`, a
+//! check and a tunnel's server name, is seen by the observer. Veto: a check asks it for the resolved address. Server
+//! names: a placeholder encrypted hello naming the destination passes and one naming another host does not, an alert
+//! or a record of version `0.0` in front of a hello naming a denied name is refused with nothing sent upstream.
+//! `clienthello` has its own list.
 //!
 //! ## Audit
 //! `start_with` takes an audit hook ([`AuditFn`]), called on a blocking thread with the session (or
@@ -186,6 +327,7 @@
 //! until the destination closes is cut: the relay ends with the bytes that carried its head, or at once
 //! when they have already been relayed.
 
+use crate::clienthello::{self, Hello};
 use crate::policy::{is_local_literal, normalize_host, Policy, Verdict};
 use base64::Engine as _;
 use loom_core::event::NetDecision;
@@ -213,6 +355,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Addresses of one name that are examined; a name with more is cut here.
 const MAX_ADDRS: usize = 32;
+/// Lab-listener scans (of the process table) that run at once; the others wait for a turn.
+const MAX_SCANS: usize = 4;
 /// Tasks that answer connections over the limit of all sessions with a `503` the client can read.
 const REFUSALS: usize = 16;
 /// Records a minute of answers that name no granted session.
@@ -231,6 +375,51 @@ pub const RULE_HEADER: &str = "X-Loom-Rule";
 /// runs on a blocking thread). For an allowed connection the proxy calls it before the upstream socket
 /// is used and refuses the connection (502) when it fails.
 pub type AuditFn = Arc<dyn Fn(Option<&SessionId>, &NetDecision) -> std::io::Result<()> + Send + Sync>;
+
+/// A destination as the veto and the listener check see it.
+#[derive(Clone, Copy, Debug)]
+pub struct Dest<'a> {
+    pub host: &'a str,
+    pub port: u16,
+    /// `CONNECT`, `LOOM-CHECK` or the HTTP method of a plain request.
+    pub method: &'a str,
+    /// The address about to be connected to; `None` at the name stage, before any lookup.
+    pub resolved: Option<IpAddr>,
+    /// The server name of the TLS ClientHello of a tunnel, when it is not the destination's own name.
+    pub sni: Option<&'a str>,
+}
+
+/// The synchronous veto (E4b, see *Veto*): the session and the destination in, a refusal rule out. It runs on the
+/// proxy's own tasks and must not block.
+pub type VetoFn = Arc<dyn Fn(&SessionId, &Dest<'_>) -> Option<String> + Send + Sync>;
+
+/// The lab-listener identity check (E4e, see *Listeners*): the session, the address about to be used (on this
+/// machine) and the local end of the connection the proxy opened to it in, a refusal rule out when the process
+/// that holds the other end is not one the session may reach. It runs on a blocking thread.
+pub type ListenerFn = Arc<dyn Fn(&SessionId, SocketAddr, Option<SocketAddr>) -> Option<String> + Send + Sync>;
+
+/// Told of each request whose destination name the session's policy refused (see *Observing refusals*): the session
+/// and the destination (`resolved` is `None`; `sni` is the server name of a tunnel's hello when that is the name
+/// refused). It only observes: the answer is the policy's. It runs on the proxy's own tasks and must not block.
+pub type RefusalFn = Arc<dyn Fn(&SessionId, &Dest<'_>) + Send + Sync>;
+
+/// An authentication with a canary user (E4d, see *Canary users*).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanaryHit {
+    /// The decoy user name the client presented.
+    pub user: String,
+    /// What the registrant called the canary.
+    pub label: String,
+    /// The session whose listener received the attempt (the session whose sandbox may connect there); `None` on
+    /// the shared listener.
+    pub listener: Option<SessionId>,
+    pub method: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// Called with each [`CanaryHit`] before the answer is written, on a blocking thread.
+pub type CanaryFn = Arc<dyn Fn(&CanaryHit) + Send + Sync>;
 
 /// Test hook: name to addresses, instead of a system lookup.
 type Resolver = Arc<dyn Fn(&str) -> Vec<IpAddr> + Send + Sync>;
@@ -379,6 +568,112 @@ struct Shared {
     /// The ports of session listeners that were closed by a revoke, as numbers only. Always also in
     /// `own_ports`.
     retired: Mutex<HashSet<u16>>,
+    /// The tunnels and forwarded requests being served, by connection id, so that [`Proxy::cut_hosts`] can
+    /// end the ones to a destination the operator withdrew.
+    live: Mutex<HashMap<u64, Live>>,
+    next_live: AtomicU64,
+    /// Bumped by every cut; `cut_marks` holds the value of the last cut of each session, so that a connection
+    /// that authenticated before a cut and registers after it is ended at once.
+    cut_seq: AtomicU64,
+    cut_marks: Mutex<HashMap<String, u64>>,
+    hooks: Mutex<Hooks>,
+    /// Canary users (decoys in the session table) by user name, with their labels.
+    canaries: Mutex<HashMap<String, String>>,
+    /// This machine's own interface addresses besides loopback (`Proxy::set_local_addrs`): a connection to one
+    /// is checked by the listener check as a loopback one is.
+    local_addrs: Mutex<Vec<IpAddr>>,
+    /// Lab-listener scans in flight (a scan reads the process table).
+    scans: Arc<Semaphore>,
+}
+
+#[derive(Default)]
+struct Hooks {
+    veto: Option<VetoFn>,
+    listener: Option<ListenerFn>,
+    canary: Option<CanaryFn>,
+    refused: Option<RefusalFn>,
+}
+
+/// One connection being served, as `cut_hosts` and `cut` see it.
+struct Live {
+    session: SessionId,
+    host: String,
+    port: u16,
+    cut: Cut,
+}
+
+/// The way a connection is ended from outside: a token, and the reason the second decision gives. The first cut
+/// wins.
+#[derive(Clone)]
+struct Cut {
+    token: CancellationToken,
+    why: Arc<Mutex<&'static str>>,
+}
+
+impl Cut {
+    fn new() -> Cut {
+        Cut { token: CancellationToken::new(), why: Arc::new(Mutex::new("")) }
+    }
+
+    /// Ends the connection with `why`; false when it was already ended.
+    fn fire(&self, why: &'static str) -> bool {
+        let mut w = lock(&self.why);
+        if self.token.is_cancelled() {
+            return false;
+        }
+        *w = why;
+        self.token.cancel();
+        true
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
+
+    fn why(&self) -> &'static str {
+        *lock(&self.why)
+    }
+}
+
+/// Registers a connection in [`Shared::live`] and takes it out again when dropped.
+struct LiveGuard<'a> {
+    shared: &'a Shared,
+    id: u64,
+    cut: Cut,
+}
+
+impl<'a> LiveGuard<'a> {
+    /// `seen` is the value of `Shared::cut_seq` when the connection authenticated: a cut of its session after
+    /// that ends it as soon as it is registered.
+    fn register(shared: &'a Shared, session: &SessionId, host: &str, port: u16, seen: u64) -> LiveGuard<'a> {
+        let id = shared.next_live.fetch_add(1, Ordering::Relaxed);
+        let cut = Cut::new();
+        let live = Live { session: session.clone(), host: host.to_string(), port, cut: cut.clone() };
+        lock(&shared.live).insert(id, live);
+        if lock(&shared.cut_marks).get(session.as_str()).is_some_and(|mark| *mark > seen) {
+            cut.fire(CUT_REVIEW);
+        }
+        LiveGuard { shared, id, cut }
+    }
+}
+
+/// The policy of the session's current entry (the one `set_policy` last gave it), `fallback` when the
+/// session holds no entry any more.
+fn current_policy(shared: &Shared, session: &SessionId, reference: bool, fallback: Arc<Policy>) -> Arc<Policy> {
+    lock(&shared.sessions)
+        .values()
+        .find(|e| &e.session == session && e.reference == reference)
+        .map_or(fallback, |e| e.policy.clone())
+}
+
+impl Drop for LiveGuard<'_> {
+    fn drop(&mut self) {
+        lock(&self.shared.live).remove(&self.id);
+    }
 }
 
 impl Shared {
@@ -389,6 +684,15 @@ impl Shared {
             return refused;
         }
         policy.check_addr(host, port, ip, name_rule)
+    }
+
+    /// Whether a connection to `ip` reaches this machine: a loopback or unspecified address, or one of its own
+    /// interface addresses (`Proxy::set_local_addrs`).
+    fn reaches_this_machine(&self, ip: IpAddr) -> bool {
+        is_local_literal(ip) || {
+            let ip = crate::policy::canonical_ip(ip);
+            lock(&self.local_addrs).iter().any(|a| crate::policy::canonical_ip(*a) == ip)
+        }
     }
 
     /// The refusal for an address that reaches one of the proxy's own ports, else `None`.
@@ -496,6 +800,12 @@ impl Drop for PendingGuard<'_> {
 /// Why a connection on record as allowed ended when the proxy was cancelled.
 const SHUTDOWN: &str = "the egress proxy shut down";
 
+/// Why a connection on record as allowed ended when the operator withdrew its destination.
+const CUT: &str = "the operator revoked the destination";
+/// Why a connection on record as allowed ended when [`Proxy::cut`] ended the session's connections. A fixed
+/// sentence: nothing the monitor decided or wrote reaches a record the agent can read.
+const CUT_REVIEW: &str = "the session's connections were closed by loom";
+
 /// The listener a connection was accepted on.
 #[derive(Clone)]
 enum Origin {
@@ -567,6 +877,14 @@ impl Proxy {
             tasks: TaskTracker::new(),
             own_ports: Mutex::new(HashSet::from([bound])),
             retired: Mutex::new(HashSet::new()),
+            live: Mutex::new(HashMap::new()),
+            next_live: AtomicU64::new(0),
+            cut_seq: AtomicU64::new(0),
+            cut_marks: Mutex::new(HashMap::new()),
+            hooks: Mutex::new(Hooks::default()),
+            canaries: Mutex::new(HashMap::new()),
+            local_addrs: Mutex::new(Vec::new()),
+            scans: semaphore(MAX_SCANS),
         });
         let cancel = CancellationToken::new();
         tokio::spawn(accept_loop(listener, shared.clone(), cancel.clone(), cancel.clone(), Origin::Shared));
@@ -651,6 +969,21 @@ impl Proxy {
         Ok(ReferenceGrant { grant: SessionGrant { port: self.inner.port, user, password }, raw_policy })
     }
 
+    /// Replaces the policy of **both** entries of a session, the command grant and its reference grant, with
+    /// `policy` (a hold: nothing new opens for the session, whichever credentials it presents), so that a cut
+    /// after it leaves nothing open and nothing new, in-process tools that follow redirects included. The
+    /// credentials stay. The reference entry keeps the hold until `grant_reference` mints it again or the session
+    /// is revoked. False when the session holds no grant.
+    pub fn hold(&self, session: &SessionId, policy: Policy) -> bool {
+        let policy = Arc::new(policy);
+        let mut any = false;
+        for entry in lock(&self.inner.shared.sessions).values_mut().filter(|e| &e.session == session) {
+            entry.policy = policy.clone();
+            any = true;
+        }
+        any
+    }
+
     /// Replace the policy of a session that holds a grant. Its credentials stay as they are. False
     /// when the session holds no grant.
     pub fn set_policy(&self, session: &SessionId, policy: Policy) -> bool {
@@ -661,6 +994,106 @@ impl Proxy {
             }
             None => false,
         }
+    }
+
+    /// Ends the tunnels and forwarded requests of `session` whose destination `pattern` covers (a grant's
+    /// host pattern, with or without a port; see [`crate::policy::pattern_covers`]), including a
+    /// connection that has been accepted but has not opened its destination yet (it is refused when it
+    /// would). Each ended connection is recorded as failed after the allow, reason "the operator revoked
+    /// the destination". Returns how many were ended. The caller sets the narrowed policy first, so a
+    /// connection that starts afterwards is refused by it.
+    pub fn cut_hosts(&self, session: &SessionId, pattern: &str) -> usize {
+        let live = lock(&self.inner.shared.live);
+        let mut cut = 0usize;
+        for l in live.values().filter(|l| &l.session == session) {
+            if !l.cut.is_cancelled() && crate::policy::pattern_covers(pattern, &l.host, Some(l.port)) && l.cut.fire(CUT)
+            {
+                cut = cut.saturating_add(1);
+            }
+        }
+        cut
+    }
+
+    /// Ends every open tunnel and forwarded request of `session`, reference grants' included, whatever the
+    /// destination (E4a). Returns how many were ended. Each ended connection that was on record as allowed gets
+    /// the second decision, with the fixed reason "the session's connections were closed by loom". A
+    /// connection the session authenticated before this call and has not registered yet is ended when it
+    /// registers; one that is only resolving or connecting its destination is ended when that finishes, before
+    /// the `200` or any byte upstream. The bytes of an open tunnel stop within a few milliseconds. It does not
+    /// change the policy: the caller sets a hold with `set_policy` first, so a connection that starts afterwards
+    /// is refused by it.
+    pub fn cut(&self, session: &SessionId) -> usize {
+        self.cut_sessions(std::iter::once(session))
+    }
+
+    /// [`Proxy::cut`] for each of `sessions`: the sessions of one mission (the proxy does not know missions;
+    /// the runtime's `cut_mission` lists them).
+    pub fn cut_sessions<'a>(&self, sessions: impl IntoIterator<Item = &'a SessionId>) -> usize {
+        let shared = &self.inner.shared;
+        let sessions: HashSet<&SessionId> = sessions.into_iter().collect();
+        let mark = shared.cut_seq.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        {
+            let mut marks = lock(&shared.cut_marks);
+            for s in &sessions {
+                marks.insert(s.as_str().to_string(), mark);
+            }
+        }
+        let live = lock(&shared.live);
+        let mut cut = 0usize;
+        for l in live.values().filter(|l| sessions.contains(&l.session)) {
+            if l.cut.fire(CUT_REVIEW) {
+                cut = cut.saturating_add(1);
+            }
+        }
+        cut
+    }
+
+    /// Installs the synchronous veto (E4b, see *Veto*), replacing the one before; `None` removes it.
+    pub fn set_veto(&self, veto: Option<VetoFn>) {
+        lock(&self.inner.shared.hooks).veto = veto;
+    }
+
+    /// Installs the lab-listener identity check (E4e, see *Listeners*); `None` removes it.
+    pub fn set_listener_check(&self, check: Option<ListenerFn>) {
+        lock(&self.inner.shared.hooks).listener = check;
+    }
+
+    /// Installs the observer of refused names (see *Observing refusals*); `None` removes it.
+    pub fn set_refusal_observer(&self, observer: Option<RefusalFn>) {
+        lock(&self.inner.shared.hooks).refused = observer;
+    }
+
+    /// Tells the proxy this machine's own interface addresses (LAN, tailnet, global IPv6), which the listener check
+    /// treats as loopback; the daemon refreshes them with its infrastructure.
+    pub fn set_local_addrs(&self, addrs: Vec<IpAddr>) {
+        *lock(&self.inner.shared.local_addrs) = addrs;
+    }
+
+    /// Installs the canary hook (E4d, see *Canary users*); `None` removes it.
+    pub fn set_canary_hook(&self, hook: Option<CanaryFn>) {
+        lock(&self.inner.shared.hooks).canary = hook;
+    }
+
+    /// Registers a decoy user (CN-1) in the session table: any request that presents `user` as its Basic user,
+    /// with any password, on any listener, fires the canary hook and gets the answer of an unknown user. Refused
+    /// (with a sentence) when `user` is empty, longer than 128 bytes, or already the user of a session or a
+    /// reference grant. Registering a user again replaces its label.
+    pub fn add_canary_user(&self, user: &str, label: &str) -> Result<(), String> {
+        if user.is_empty() || user.len() > 128 {
+            return Err("A canary user must be 1 to 128 bytes long. Give it a longer or shorter name.".to_string());
+        }
+        if lock(&self.inner.shared.sessions).contains_key(user) {
+            return Err(format!(
+                "{user:?} is the user of a session's proxy grant, so it cannot be a canary. Choose a name no session can have."
+            ));
+        }
+        lock(&self.inner.shared.canaries).insert(user.to_string(), label.to_string());
+        Ok(())
+    }
+
+    /// Takes a decoy user out of the table; false when it was not there.
+    pub fn remove_canary_user(&self, user: &str) -> bool {
+        lock(&self.inner.shared.canaries).remove(user).is_some()
     }
 
     /// What the name check of the session's current policy says about `host:port`; `None` when the
@@ -1015,6 +1448,7 @@ fn local_decision(head: Option<&Head>, rule: &str) -> NetDecision {
         allowed: false,
         rule: cut(rule, 300),
         resolved: None,
+        sni: None,
     }
 }
 
@@ -1048,9 +1482,18 @@ struct Authed {
     lookups: Arc<Semaphore>,
 }
 
+/// Why a request carries no usable credentials.
+enum AuthError {
+    /// The reason, as it is recorded.
+    Failed(String),
+    /// The request presented a decoy user (E4d): its label. It is recorded and answered as an unknown user.
+    Canary { user: String, label: String },
+}
+
 /// The session whose Basic credentials the request carries, or why there is none.
-fn authenticate(shared: &Shared, head: &Head) -> Result<Authed, String> {
-    let Some(value) = head.header("proxy-authorization") else { return Err("no credentials".into()) };
+fn authenticate(shared: &Shared, head: &Head) -> Result<Authed, AuthError> {
+    let failed = |why: &str| AuthError::Failed(why.to_string());
+    let Some(value) = head.header("proxy-authorization") else { return Err(failed("no credentials")) };
     let decoded = (|| {
         let value = std::str::from_utf8(value).ok()?;
         let (scheme, encoded) = value.trim().split_once(' ')?;
@@ -1062,15 +1505,19 @@ fn authenticate(shared: &Shared, head: &Head) -> Result<Authed, String> {
     })();
     // Passwords are hex, so the last colon separates the two.
     let Some((user, password)) = decoded.as_deref().and_then(|d| d.rsplit_once(':')) else {
-        return Err("the credentials are not Basic user:password".into());
+        return Err(failed("the credentials are not Basic user:password"));
     };
+    // A decoy user is looked for first, whatever the password: presenting it is the event.
+    if let Some(label) = lock(&shared.canaries).get(user) {
+        return Err(AuthError::Canary { user: user.to_string(), label: label.clone() });
+    }
     let sessions = lock(&shared.sessions);
-    let Some(e) = sessions.get(user) else { return Err("unknown user".into()) };
+    let Some(e) = sessions.get(user) else { return Err(failed("unknown user")) };
     if constant_time_eq(e.password.as_bytes(), password.as_bytes()) {
         let (session, policy) = (e.session.clone(), e.policy.clone());
         Ok(Authed { reference: e.reference, session, policy, permits: e.permits.clone(), lookups: e.lookups.clone() })
     } else {
-        Err(format!("wrong password for session {}", e.session.as_str()))
+        Err(AuthError::Failed(format!("wrong password for session {}", e.session.as_str())))
     }
 }
 
@@ -1126,6 +1573,17 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     /// Audits and publishes this request's decision.
     async fn record(&self, allowed: bool, rule: String, resolved: Option<IpAddr>) -> std::io::Result<()> {
+        self.record_sni(allowed, rule, resolved, None).await
+    }
+
+    /// `record` for a decision that names the TLS server name of the tunnel.
+    async fn record_sni(
+        &self,
+        allowed: bool,
+        rule: String,
+        resolved: Option<IpAddr>,
+        sni: Option<String>,
+    ) -> std::io::Result<()> {
         let d = NetDecision {
             host: self.host.to_string(),
             port: self.port,
@@ -1133,13 +1591,61 @@ impl Ctx<'_> {
             allowed,
             rule,
             resolved: resolved.map(|a| a.to_string()),
+            sni,
         };
         audit_decision(self.shared, Some(self.session), d, true).await
     }
 
+    /// The refusal rule of the synchronous veto for this destination, `None` when there is no veto or it lets the
+    /// destination through (see *Veto*).
+    fn veto(&self, resolved: Option<IpAddr>, sni: Option<&str>) -> Option<String> {
+        let hook = lock(&self.shared.hooks).veto.clone()?;
+        let dest = Dest { host: self.host, port: self.port, method: self.method, resolved, sni };
+        hook(self.session, &dest).map(|rule| cut(&rule, 200))
+    }
+
+    /// Records a veto and returns the answer: `502` with the marker and a fixed sentence.
+    async fn vetoed(&self, rule: &str, resolved: Option<IpAddr>, sni: Option<String>) -> (&'static str, String) {
+        let rule = if self.method == CHECK_METHOD {
+            format!("vetoed: {rule} (check only)")
+        } else {
+            format!("vetoed: {rule}")
+        };
+        if let Err(e) = self.record_sni(false, rule, resolved, sni).await {
+            tracing::warn!("cannot write the egress audit record of {}: {e}", self.session.as_str());
+        }
+        (
+            "502 Bad Gateway",
+            format!(
+                "loom proxy: {} is closed to this mission by loom's own rules, so the connection was not opened and nothing was sent. Do not retry it. If the goal cannot be reached without it, report_blocker with class needs_approval.\n",
+                self.dest()
+            ),
+        )
+    }
+
+    /// The refusal rule of the lab-listener identity check for a connection to the loopback address `ip`
+    /// (see *Listeners*), `None` when there is no check or it finds nothing.
+    async fn listener_refusal(&self, ip: IpAddr, client: Option<SocketAddr>) -> Option<String> {
+        let hook = lock(&self.shared.hooks).listener.clone()?;
+        let (session, addr) = (self.session.clone(), SocketAddr::new(ip, self.port));
+        // At most `MAX_SCANS` scans of the process table run at once; a swarm of loopback connections waits here.
+        let _turn = self.shared.scans.clone().acquire_owned().await.ok()?;
+        tokio::task::spawn_blocking(move || hook(&session, addr, client)).await.ok().flatten().map(|r| cut(&r, 200))
+    }
+
+    /// Tells the refusal observer that the policy refused the name `host`, or the server name `sni` of a tunnel.
+    fn observe_refusal(&self, sni: Option<&str>) {
+        let Some(hook) = lock(&self.shared.hooks).refused.clone() else { return };
+        hook(self.session, &Dest { host: self.host, port: self.port, method: self.method, resolved: None, sni });
+    }
+
     /// Like `record`, for decisions that need no audit to succeed: a failure is only logged.
     async fn record_best_effort(&self, allowed: bool, rule: String, resolved: Option<IpAddr>) {
-        if let Err(e) = self.record(allowed, rule, resolved).await {
+        self.record_best_effort_sni(allowed, rule, resolved, None).await;
+    }
+
+    async fn record_best_effort_sni(&self, allowed: bool, rule: String, resolved: Option<IpAddr>, sni: Option<String>) {
+        if let Err(e) = self.record_sni(allowed, rule, resolved, sni).await {
             tracing::warn!("cannot write the egress audit record of {}: {e}", self.session.as_str());
         }
     }
@@ -1246,10 +1752,15 @@ struct Allowed {
 async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<(TcpStream, Allowed), (&'static str, String)> {
     let v = policy.check_name(cx.host, cx.port);
     if !v.allowed {
+        cx.observe_refusal(None);
         cx.record_best_effort(false, v.rule.clone(), None).await;
         return Err(cx.refused(&v.rule));
     }
     let name_rule = v.rule;
+    // Before any lookup: a vetoed name is never resolved.
+    if let Some(rule) = cx.veto(None, None) {
+        return Err(cx.vetoed(&rule, None, None).await);
+    }
 
     let addrs: Vec<IpAddr> = match cx.host.parse::<IpAddr>() {
         Ok(ip) => vec![ip],
@@ -1270,6 +1781,10 @@ async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<(TcpStream, Allo
             first_refusal.get_or_insert((cv.rule, ip));
             continue;
         }
+        // Before the connect: nothing is opened toward an address the veto closes.
+        if let Some(rule) = cx.veto(Some(ip), None) {
+            return Err(cx.vetoed(&rule, Some(ip), None).await);
+        }
         match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(SocketAddr::new(ip, cx.port))).await {
             Ok(Ok(s)) => {
                 // A listener opened between the first check and the connect is in the set by now.
@@ -1277,6 +1792,15 @@ async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<(TcpStream, Allo
                     drop(s);
                     first_refusal.get_or_insert((refused.rule, ip));
                     continue;
+                }
+                // The process that holds the other end of a connection to this machine is not another session's
+                // sandbox process.
+                if cx.shared.reaches_this_machine(ip) {
+                    if let Some(rule) = cx.listener_refusal(ip, s.local_addr().ok()).await {
+                        drop(s);
+                        first_refusal.get_or_insert((rule, ip));
+                        continue;
+                    }
                 }
                 let _ = s.set_nodelay(true);
                 // Nothing has been sent upstream yet; the connection is used only once it is on record.
@@ -1316,6 +1840,16 @@ async fn unreachable_decision(cx: &Ctx<'_>, rule: &str, ip: Option<IpAddr>, why:
 /// Answers a check (see *Checks*): the decision `open_upstream` would make, without connecting.
 async fn check(client: &mut TcpStream, cx: &Ctx<'_>, policy: &Policy, slot: OwnedSemaphorePermit) {
     let name = policy.check_name(cx.host, cx.port);
+    if !name.allowed {
+        cx.observe_refusal(None);
+    }
+    // A vetoed destination is answered as `open_upstream` answers it, without a lookup.
+    if name.allowed {
+        if let Some(rule) = cx.veto(None, None) {
+            let (status, body) = cx.vetoed(&rule, None, None).await;
+            return answer(client, cx.shared, slot, status, "", &body).await;
+        }
+    }
     let found = if name.allowed {
         let addrs = match cx.host.parse::<IpAddr>() {
             Ok(ip) => Ok(vec![ip]),
@@ -1331,6 +1865,15 @@ async fn check(client: &mut TcpStream, cx: &Ctx<'_>, policy: &Policy, slot: Owne
     } else {
         Ok((name.clone(), None))
     };
+    // The address the connect would use is asked of the veto too, as `open_upstream` asks it.
+    if let Ok((v, Some(ip))) = &found {
+        if v.allowed {
+            if let Some(rule) = cx.veto(Some(*ip), None) {
+                let (status, body) = cx.vetoed(&rule, Some(*ip), None).await;
+                return answer(client, cx.shared, slot, status, "", &body).await;
+            }
+        }
+    }
     let (allowed, rule, resolved, (status, body)) = match found {
         Ok((v, ip)) if v.allowed => {
             let body = format!("loom network policy: a connection to {} is allowed by rule `{}`.\n", cx.dest(), v.rule);
@@ -1362,6 +1905,27 @@ async fn unauthorized(client: &mut TcpStream, shared: &Shared, slot: OwnedSemaph
     let body = "loom proxy: missing or unknown proxy credentials. Use the proxy settings from the command's environment (HTTP_PROXY / HTTPS_PROXY), which carry this session's credentials.\n";
     let challenge = "Proxy-Authenticate: Basic realm=\"loom\"\r\n";
     answer(client, shared, slot, "407 Proxy Authentication Required", challenge, body).await;
+}
+
+/// A decoy user was presented (E4d): the hook runs first (so the event exists before any answer is written), then
+/// the attempt is recorded, attributed to the session whose listener received it and never counted against the
+/// limit of unattributed answers, as an unknown user's: nothing on the record or in the answer tells a client
+/// that the user was a decoy.
+async fn canary_used(shared: &Arc<Shared>, origin: &Origin, head: &Head, user: String, label: String) {
+    let listener = match origin {
+        Origin::Shared => None,
+        Origin::Session(l) => Some(l.clone()),
+    };
+    let (host, port) = destination(head).unwrap_or_else(|| ("-".to_string(), 0));
+    let hit = CanaryHit { user, label, listener: listener.clone(), method: cut(&head.method, 32), host, port };
+    let hook = lock(&shared.hooks).canary.clone();
+    if let Some(hook) = hook {
+        let _ = tokio::task::spawn_blocking(move || hook(&hit)).await;
+    }
+    let d = local_decision(Some(head), "proxy authentication failed: unknown user");
+    if let Err(e) = audit_decision(shared, listener.as_ref(), d, false).await {
+        tracing::warn!("cannot write the egress audit record of a rejected request: {e}");
+    }
 }
 
 /// Serves one connection. It is pending (`id`, closed through `evicted`) until its head is complete.
@@ -1398,12 +1962,18 @@ async fn handle(
     };
     let auth = match authenticate(&shared, &head) {
         Ok(a) => a,
-        Err(why) => {
+        Err(AuthError::Failed(why)) => {
             let rule = format!("proxy authentication failed: {why}");
             audit_local(&shared, None, local_decision(Some(&head), &rule)).await;
             return unauthorized(&mut client, &shared, slot).await;
         }
+        Err(AuthError::Canary { user, label }) => {
+            canary_used(&shared, &origin, &head, user, label).await;
+            return unauthorized(&mut client, &shared, slot).await;
+        }
     };
+    // Cuts made from here on end the connection once it is registered (see `Proxy::cut`).
+    let seen = shared.cut_seq.load(Ordering::SeqCst);
     let Authed { reference, session, policy, permits, lookups } = auth;
     // Command credentials count only on their own session's listener, reference ones only on the shared
     // one; nothing else of the request is acted on before this.
@@ -1459,7 +2029,9 @@ async fn handle(
                 let method = if connect { "CONNECT" } else { CHECK_METHOD };
                 let cx = Ctx { shared, session, lookups, method, host: &host, port };
                 if connect {
-                    tunnel(client, extra, &cx, &policy, slot, cancel).await;
+                    let live = LiveGuard::register(shared, session, &host, port, seen);
+                    let policy = current_policy(shared, session, reference, policy);
+                    tunnel(client, extra, &cx, &policy, slot, cancel, live.cut.clone()).await;
                 } else {
                     check(&mut client, &cx, &policy, slot).await;
                 }
@@ -1481,7 +2053,10 @@ async fn handle(
         Ok((host, port, authority, path)) => {
             let (shared, session, lookups) = (&*shared, &session, &lookups);
             let cx = Ctx { shared, session, lookups, method: &head.method, host: &host, port };
-            forward(client, extra, &head, &cx, &policy, &authority, &path, reference, slot, cancel).await;
+            let live = LiveGuard::register(shared, session, &host, port, seen);
+            let cut = live.cut.clone();
+            let policy = current_policy(shared, session, reference, policy);
+            forward(client, extra, &head, &cx, &policy, &authority, &path, reference, slot, cancel, cut).await;
         }
         Err(m) => reject(&mut client, &shared, slot, &session, &head, &m).await,
     }
@@ -1504,6 +2079,104 @@ fn plain_target(target: &str) -> Result<(String, u16, String, String), String> {
     Ok((host, port, authority.to_string(), path))
 }
 
+/// What the first flight of a tunnel's client came to (see `bind_sni`).
+enum Bound {
+    /// Relay it: the bytes read so far, and the server name when it was not the destination's own name.
+    Pass(Vec<u8>, Option<String>),
+    /// Refuse the tunnel: the rule and the server name read, if any.
+    Refused(String, Option<String>),
+    /// Nothing came for the idle period.
+    Idle(Duration),
+}
+
+/// Binds a tunnel to the name it was opened for (E4c): the proxy reads the client's first flight before one byte
+/// goes upstream. A flight that is not TLS passes as it is (there is no name to bind); a TLS ClientHello passes
+/// when its server name is the destination or another name the policy allows and the veto lets through, and is
+/// refused when it carries an encrypted-ClientHello extension, cannot be read, or has no name for a destination
+/// that is a name. A server that speaks first (an SSH banner) ends the wait.
+async fn bind_sni(client: &mut TcpStream, up: &TcpStream, mut first: Vec<u8>, cx: &Ctx<'_>, policy: &Policy) -> Bound {
+    let limits = &cx.shared.limits;
+    let mut buf = vec![0u8; 4096];
+    loop {
+        match clienthello::parse(&first) {
+            Hello::NotTls => return Bound::Pass(first, None),
+            Hello::Malformed(why) => {
+                return Bound::Refused(format!("deny a TLS ClientHello that cannot be read ({why})"), None)
+            }
+            Hello::Tls { sni, ech } => return judge_sni(first, sni, ech, cx, policy),
+            Hello::Empty | Hello::Incomplete => {}
+        }
+        if first.len() >= clienthello::MAX_HELLO {
+            return Bound::Refused("deny a TLS ClientHello larger than a ClientHello can be".to_string(), None);
+        }
+        let waiting = first.is_empty();
+        let wait = if waiting { limits.idle_timeout } else { limits.head_timeout };
+        let read = tokio::select! {
+            r = tokio::time::timeout(wait, client.read(&mut buf)) => r,
+            // A server that speaks first is not a TLS server: nothing to bind.
+            _ = up.readable(), if waiting => return Bound::Pass(first, None),
+        };
+        match read {
+            Err(_) if waiting => return Bound::Idle(wait),
+            Err(_) => {
+                let rule = format!("deny a TLS ClientHello that did not arrive in full within {}", human(wait));
+                return Bound::Refused(rule, None);
+            }
+            // Nothing was said: the relay sees the client's end as it always has.
+            Ok(Ok(0)) if waiting => return Bound::Pass(first, None),
+            // The client ended in the middle of its hello: what it sent is not relayed as a name-bound flight.
+            Ok(Ok(0)) => {
+                return Bound::Refused("deny a TLS ClientHello that ended before it was complete".to_string(), None)
+            }
+            Ok(Ok(n)) => first.extend_from_slice(buf.get(..n).unwrap_or(&[])),
+            Ok(Err(_)) => return Bound::Pass(first, None),
+        }
+    }
+}
+
+/// The verdict on a complete ClientHello of a tunnel to `cx.host`.
+fn judge_sni(first: Vec<u8>, sni: Option<String>, ech: bool, cx: &Ctx<'_>, policy: &Policy) -> Bound {
+    // Chromium sends a placeholder encrypted-ClientHello extension (GREASE) on every hello, with the real name in the
+    // clear: that one names the destination and passes. Any other hello that carries the extension is refused,
+    // because the proxy cannot tell a placeholder from a real one whose inner name is hidden.
+    let names_the_destination = sni.as_deref().is_some_and(|n| normalize_host(n) == normalize_host(cx.host));
+    if ech && !names_the_destination {
+        cx.observe_refusal(sni.as_deref());
+        let rule = "deny an encrypted ClientHello whose outer server name is not the destination: the server name is hidden from the proxy (browsers send a placeholder extension with the destination's own name, which passes)".to_string();
+        return Bound::Refused(rule, sni);
+    }
+    let literal = cx.host.parse::<IpAddr>().is_ok();
+    let Some(name) = sni else {
+        return if literal {
+            Bound::Pass(first, None)
+        } else {
+            Bound::Refused(format!("deny a TLS connection without a server name to the name {}", cx.host), None)
+        };
+    };
+    let name = normalize_host(&name);
+    if name == normalize_host(cx.host) {
+        return Bound::Pass(first, None);
+    }
+    let verdict = policy.check_name(&name, cx.port);
+    if !verdict.allowed {
+        cx.observe_refusal(Some(&name));
+        let rule = format!("deny the server name {name}, which is not the destination {}: {}", cx.host, verdict.rule);
+        return Bound::Refused(rule, Some(name));
+    }
+    if let Some(rule) = cx.veto(None, Some(&name)) {
+        return Bound::Refused(format!("vetoed: {rule}"), Some(name));
+    }
+    Bound::Pass(first, Some(name))
+}
+
+/// How a tunnel's relay phase ended.
+enum Phase {
+    Relayed(RelayEnd),
+    Refused(String, Option<String>),
+    Idle(Duration),
+    UpstreamWrite,
+}
+
 async fn tunnel(
     mut client: TcpStream,
     extra: Vec<u8>,
@@ -1511,6 +2184,7 @@ async fn tunnel(
     policy: &Policy,
     slot: OwnedSemaphorePermit,
     cancel: CancellationToken,
+    cut: Cut,
 ) {
     let idle = cx.shared.limits.idle_timeout;
     let (mut up, allowed) = match open_upstream(cx, policy).await {
@@ -1518,16 +2192,48 @@ async fn tunnel(
         Err((status, body)) => return answer(&mut client, cx.shared, slot, status, "", &body).await,
     };
     let _slot = slot;
+    if cut.is_cancelled() {
+        return cx.failed_after_allow(&allowed, cut.why()).await;
+    }
     if client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.is_err() {
         return cx.failed_after_allow(&allowed, "the client closed the connection before the tunnel was open").await;
     }
-    if !extra.is_empty() && !write_within(&mut up, &extra, idle).await {
-        let why = "the bytes the client sent ahead could not be written to the destination";
-        return cx.failed_after_allow(&allowed, why).await;
-    }
-    let end = tokio::select! {
-        end = relay(&mut client, &mut up, idle, None) => end,
+    let phase = tokio::select! {
+        phase = async {
+            let first = match bind_sni(&mut client, &up, extra, cx, policy).await {
+                Bound::Pass(first, sni) => {
+                    if let Some(name) = sni {
+                        let rule = format!("{} (sni {name}, another name the policy allows)", allowed.rule);
+                        cx.record_best_effort_sni(true, rule, Some(allowed.ip), Some(name)).await;
+                    }
+                    first
+                }
+                Bound::Refused(rule, sni) => return Phase::Refused(rule, sni),
+                Bound::Idle(after) => return Phase::Idle(after),
+            };
+            if !first.is_empty() && !write_within(&mut up, &first, idle).await {
+                return Phase::UpstreamWrite;
+            }
+            Phase::Relayed(relay(&mut client, &mut up, idle, None).await)
+        } => phase,
         _ = cancel.cancelled() => return cx.failed_after_allow(&allowed, SHUTDOWN).await,
+        _ = cut.cancelled() => return cx.failed_after_allow(&allowed, cut.why()).await,
+    };
+    let end = match phase {
+        Phase::Relayed(end) => end,
+        Phase::Refused(rule, sni) => {
+            // Nothing was sent upstream. The refusal follows the allow, so the trail never ends at a bare allow.
+            cx.record_best_effort_sni(false, rule, Some(allowed.ip), sni).await;
+            return;
+        }
+        Phase::Idle(after) => {
+            let why = format!("the tunnel was idle for {} before the destination sent a byte", human(after));
+            return cx.failed_after_allow(&allowed, &why).await;
+        }
+        Phase::UpstreamWrite => {
+            let why = "the bytes the client sent ahead could not be written to the destination";
+            return cx.failed_after_allow(&allowed, why).await;
+        }
     };
     // Once bytes have come from the destination, a failure cannot be told from a routine close.
     let why = match end {
@@ -2121,6 +2827,7 @@ async fn forward(
     reference: bool,
     slot: OwnedSemaphorePermit,
     cancel: CancellationToken,
+    cut: Cut,
 ) {
     let idle = cx.shared.limits.idle_timeout;
     let body = match body_kind(head) {
@@ -2131,6 +2838,12 @@ async fn forward(
         Ok(s) => s,
         Err((status, text)) => return answer(&mut client, cx.shared, slot, status, "", &text).await,
     };
+    // Cut while the name resolved or the connection opened: nothing is written to the destination.
+    if cut.is_cancelled() {
+        cx.failed_after_allow(&allowed, cut.why()).await;
+        let (status, text) = cx.unreachable(cut.why());
+        return answer(&mut client, cx.shared, slot, status, "", &text).await;
+    }
 
     let mut out: Vec<u8> = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", head.method, path, authority).into_bytes();
     for (n, v) in &head.headers {
@@ -2173,6 +2886,7 @@ async fn forward(
     let end = tokio::select! {
         r = relay(&mut client, &mut up, idle, Some(fwd)) => r,
         _ = cancel.cancelled() => return cx.failed_after_allow(&allowed, SHUTDOWN).await,
+        _ = cut.cancelled() => return cx.failed_after_allow(&allowed, cut.why()).await,
     };
     let (why, reply) = match end {
         RelayEnd::Done(_) => return,
@@ -2783,7 +3497,7 @@ mod tests {
         };
         let teredo = "2001:0:4136:e378:8000:63bf:3fff:fdd2";
         let mut table: Vec<(String, String)> = vec![("teredo.test".into(), teredo.into())];
-        for v4 in ["10.0.0.5", "127.0.0.1", "169.254.169.254", "8.8.8.8"] {
+        for v4 in ["10.0.0.5", "127.0.0.1", "192.168.1.5", "8.8.8.8"] {
             for (i, a) in carried(v4).into_iter().enumerate() {
                 table.push((format!("f{i}-{v4}.test"), a));
             }
@@ -3466,6 +4180,828 @@ mod tests {
         let back = timeout(Duration::from_secs(30), both).await.expect("the tunnel stalled");
         assert!(back.len() == N && back.iter().all(|b| *b == b'd'));
         assert_eq!(timeout(T, server).await.unwrap().unwrap(), N);
+    }
+
+    #[tokio::test]
+    async fn cut_hosts_ends_the_tunnels_of_a_withdrawn_destination_and_only_those() {
+        let echo = echo_server().await;
+        let other_echo = echo_server().await;
+        let (p, mut rx) = start().await;
+        let (a, b) = (SessionId::from("s-cut-a"), SessionId::from("s-cut-b"));
+        let (ga, gb) = (p.grant(&a, lab()).unwrap(), p.grant(&b, lab()).unwrap());
+        let open = |g: &SessionGrant, port: u16| {
+            let req = connect_req(g, &format!("127.0.0.1:{port}"));
+            let port = g.port;
+            async move {
+                let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                s.write_all(req.as_bytes()).await.unwrap();
+                assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
+                s
+            }
+        };
+        let mut a_cut = open(&ga, echo).await;
+        let mut a_kept = open(&ga, other_echo).await;
+        let mut b_same = open(&gb, echo).await;
+        async fn echoes(s: &mut TcpStream) -> Option<[u8; 4]> {
+            s.write_all(b"ping").await.unwrap();
+            let mut got = [0u8; 4];
+            timeout(T, s.read_exact(&mut got)).await.ok().and_then(|r| r.ok()).map(|_| got)
+        }
+        assert_eq!(echoes(&mut a_cut).await, Some(*b"ping"));
+        // A pattern that covers nothing of the session cuts nothing.
+        assert_eq!(p.cut_hosts(&a, "example.test"), 0);
+        // (Not `echo + 1`: the system hands out ports in sequence, so that can be `other_echo`'s.)
+        let unused = (1..u16::MAX).map(|d| echo.wrapping_add(d)).find(|p| *p != other_echo && *p != echo).unwrap();
+        assert_eq!(p.cut_hosts(&a, &format!("127.0.0.1:{unused}")), 0, "another port");
+        // The destination of one tunnel of A: only that tunnel ends, and the other session's tunnel to the
+        // same destination stays.
+        assert_eq!(p.cut_hosts(&a, &format!("127.0.0.1:{echo}")), 1);
+        let mut gone = Vec::new();
+        let ended = timeout(T, a_cut.read_to_end(&mut gone)).await;
+        assert!(ended.is_ok(), "the cut tunnel must close");
+        assert_eq!(echoes(&mut a_kept).await, Some(*b"ping"));
+        assert_eq!(echoes(&mut b_same).await, Some(*b"ping"));
+        // The cut is on record as a failure after the allow, with its reason.
+        let mut reasons = Vec::new();
+        while let Ok(Some((sid, d))) = timeout(Duration::from_millis(500), rx.recv()).await {
+            if sid == a && d.rule.contains("failed after the allow") {
+                reasons.push(d.rule);
+            }
+        }
+        assert!(reasons.iter().any(|r| r.contains("the operator revoked the destination")), "{reasons:?}");
+        // A wildcard without a port covers every port of its hosts; the host form `127.0.0.1` covers both.
+        assert_eq!(p.cut_hosts(&a, "127.0.0.1"), 1);
+        assert_eq!(p.cut_hosts(&a, "127.0.0.1"), 0, "nothing left to cut");
+    }
+
+    /// A forwarded request whose destination is cut while its name still resolves is not delivered.
+    #[tokio::test]
+    async fn a_forward_cut_while_its_name_resolves_is_not_delivered() {
+        let (port, server) = http_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let resolver: Resolver = Arc::new(|_: &str| {
+            std::thread::sleep(Duration::from_millis(800));
+            vec!["127.0.0.1".parse().unwrap()]
+        });
+        let (p, _rx, _seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let s = SessionId::from("s-cut-forward");
+        let g = p.grant(&s, lab()).unwrap();
+        let req = format!("POST http://slow.test:{port}/x HTTP/1.1\r\n{}Content-Length: 5\r\n\r\nhello", auth(&g));
+        let gp = g.port;
+        let client = tokio::spawn(async move { raw(gp, req.as_bytes()).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(p.cut_hosts(&s, "slow.test"), 1);
+        let resp = timeout(T, client).await.unwrap().unwrap();
+        assert_eq!(status(&resp), 502, "{resp}");
+        let got = timeout(T, server).await.unwrap().unwrap();
+        assert!(got.is_empty(), "the destination received {:?}", String::from_utf8_lossy(&got));
+    }
+
+    /// A tunnel through `g` to `dest`, answered `200`.
+    async fn tunnel_to(g: &SessionGrant, dest: &str) -> TcpStream {
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        s.write_all(connect_req(g, dest).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
+        s
+    }
+
+    /// A resolver that maps every name to 127.0.0.1 and counts its calls.
+    fn loopback_resolver() -> (Resolver, Arc<AtomicU64>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let c = calls.clone();
+        let r: Resolver = Arc::new(move |_: &str| {
+            c.fetch_add(1, Ordering::SeqCst);
+            vec!["127.0.0.1".parse().unwrap()]
+        });
+        (r, calls)
+    }
+
+    async fn echoes(s: &mut TcpStream) -> bool {
+        s.write_all(b"ping").await.is_ok() && {
+            let mut got = [0u8; 4];
+            timeout(Duration::from_millis(800), s.read_exact(&mut got)).await.is_ok_and(|r| r.is_ok())
+        }
+    }
+
+    #[tokio::test]
+    async fn cut_ends_every_connection_of_the_session_within_a_second_and_no_other() {
+        let echo = echo_server().await;
+        let (p, mut rx) = start().await;
+        let (a, b) = (SessionId::from("s-cut-all-a"), SessionId::from("s-cut-all-b"));
+        let (ga, gb) = (p.grant(&a, lab()).unwrap(), p.grant(&b, lab()).unwrap());
+        // Two tunnels of A to different ports, a forwarded request of A, and a reference grant of A.
+        let other = echo_server().await;
+        let mut a1 = tunnel_to(&ga, &format!("127.0.0.1:{echo}")).await;
+        let mut a2 = tunnel_to(&ga, &format!("127.0.0.1:{other}")).await;
+        let cfg = NetworkCfg {
+            mode: NetworkMode::Open,
+            reference_hosts: vec![format!("127.0.0.1:{echo}")],
+            allow_private: vec!["127.0.0.1".into()],
+            ..NetworkCfg::default()
+        };
+        let reference = p.grant_reference(&a, &cfg).unwrap();
+        let mut a3 = TcpStream::connect(("127.0.0.1", reference.grant.port)).await.unwrap();
+        let ref_auth = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", reference.grant.user, reference.grant.password));
+        a3.write_all(
+            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nProxy-Authorization: Basic {ref_auth}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status(&read_until(&mut a3, "\r\n\r\n").await), 200);
+        let mut b1 = tunnel_to(&gb, &format!("127.0.0.1:{echo}")).await;
+        for s in [&mut a1, &mut a2, &mut a3, &mut b1] {
+            assert!(echoes(s).await);
+        }
+        let started = tokio::time::Instant::now();
+        assert_eq!(p.cut(&a), 3, "two tunnels and the reference tunnel");
+        for s in [&mut a1, &mut a2, &mut a3] {
+            let mut gone = Vec::new();
+            let ended = timeout(Duration::from_secs(1), s.read_to_end(&mut gone)).await;
+            assert!(ended.is_ok(), "a cut tunnel must close within a second");
+        }
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(echoes(&mut b1).await, "another session's tunnel is not touched");
+        assert_eq!(p.cut(&a), 0, "nothing is left to cut");
+        // Each ended connection is on record after its allow, with the fixed reason.
+        let mut reasons = Vec::new();
+        while let Ok(Some((sid, d))) = timeout(Duration::from_millis(500), rx.recv()).await {
+            if sid == a && d.rule.contains("failed after the allow") {
+                reasons.push(d.rule);
+            }
+        }
+        let closed = reasons.iter().filter(|r| r.contains("the session's connections were closed by loom")).count();
+        assert_eq!(closed, 3, "{reasons:?}");
+        // The proxy still serves the session afterwards: a cut is not a revoke.
+        let mut again = tunnel_to(&ga, &format!("127.0.0.1:{echo}")).await;
+        assert!(echoes(&mut again).await);
+    }
+
+    #[tokio::test]
+    async fn cut_sessions_ends_the_connections_of_every_session_named() {
+        let echo = echo_server().await;
+        let (p, _rx) = start().await;
+        let ids: Vec<SessionId> = ["s-m-1", "s-m-2", "s-m-3"].iter().map(|s| SessionId::from(*s)).collect();
+        let grants: Vec<SessionGrant> = ids.iter().map(|i| p.grant(i, lab()).unwrap()).collect();
+        let mut conns = Vec::new();
+        for g in &grants {
+            conns.push(tunnel_to(g, &format!("127.0.0.1:{echo}")).await);
+        }
+        assert_eq!(p.cut_sessions(ids.iter().take(2)), 2);
+        for c in conns.iter_mut().take(2) {
+            let mut gone = Vec::new();
+            assert!(timeout(Duration::from_secs(1), c.read_to_end(&mut gone)).await.is_ok());
+        }
+        assert!(echoes(&mut conns[2]).await);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_authenticated_before_a_cut_is_ended_when_it_registers() {
+        let (p, _rx) = start().await;
+        let s = SessionId::from("s-cut-race");
+        let _g = p.grant(&s, lab()).unwrap();
+        let shared = &p.inner.shared;
+        let before = shared.cut_seq.load(Ordering::SeqCst);
+        assert_eq!(p.cut(&s), 0, "no connection is open yet");
+        let late = LiveGuard::register(shared, &s, "h.test", 443, before);
+        assert!(late.cut.is_cancelled(), "authenticated before the cut, registered after it");
+        assert_eq!(late.cut.why(), CUT_REVIEW);
+        let after = shared.cut_seq.load(Ordering::SeqCst);
+        let fresh = LiveGuard::register(shared, &s, "h.test", 443, after);
+        assert!(!fresh.cut.is_cancelled(), "authenticated after the cut");
+        let other = LiveGuard::register(shared, &SessionId::from("s-other"), "h.test", 443, before);
+        assert!(!other.cut.is_cancelled(), "another session is not cut");
+    }
+
+    #[tokio::test]
+    async fn a_hold_then_a_cut_leaves_the_session_nothing_open_and_nothing_new() {
+        let echo = echo_server().await;
+        let (p, _rx) = start().await;
+        let s = SessionId::from("s-hold");
+        let g = p.grant(&s, lab()).unwrap();
+        let mut open = tunnel_to(&g, &format!("127.0.0.1:{echo}")).await;
+        assert!(echoes(&mut open).await);
+        assert!(p.set_policy(&s, policy(NetworkMode::DenyAll, &[], &[], &[])));
+        assert_eq!(p.cut(&s), 1);
+        let mut gone = Vec::new();
+        assert!(timeout(Duration::from_secs(1), open.read_to_end(&mut gone)).await.is_ok());
+        let mut fresh = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        fresh.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        let _ = timeout(T, fresh.read_to_string(&mut resp)).await;
+        assert_eq!(status(&resp), 403, "{resp}");
+    }
+
+    #[tokio::test]
+    async fn a_hold_also_holds_the_reference_grant_so_no_new_reference_connection_opens() {
+        let echo = echo_server().await;
+        let (p, _rx) = start().await;
+        let s = SessionId::from("s-hold-ref");
+        let g = p.grant(&s, lab()).unwrap();
+        let cfg = NetworkCfg {
+            mode: NetworkMode::Open,
+            reference_hosts: vec![format!("127.0.0.1:{echo}")],
+            allow_private: vec!["127.0.0.1".into()],
+            ..NetworkCfg::default()
+        };
+        let reference = p.grant_reference(&s, &cfg).unwrap();
+        let ref_connect = |port: u16| {
+            let auth = base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", reference.grant.user, reference.grant.password));
+            async move {
+                let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                let req = format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nProxy-Authorization: Basic {auth}\r\n\r\n");
+                c.write_all(req.as_bytes()).await.unwrap();
+                let mut resp = String::new();
+                let _ = timeout(T, c.read_to_string(&mut resp)).await;
+                status(&resp)
+            }
+        };
+        // A hop of an in-process GET that follows redirects opens a reference tunnel while nothing is held.
+        let mut open = TcpStream::connect(("127.0.0.1", reference.grant.port)).await.unwrap();
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", reference.grant.user, reference.grant.password));
+        open.write_all(
+            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nProxy-Authorization: Basic {auth}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status(&read_until(&mut open, "\r\n\r\n").await), 200);
+        // The hold, then the cut: the next hop is refused, not let through by a stale reference policy.
+        assert!(p.hold(&s, policy(NetworkMode::DenyAll, &[], &[], &[])));
+        assert_eq!(p.cut(&s), 1);
+        assert_eq!(ref_connect(reference.grant.port).await, 403);
+        let mut fresh = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        fresh.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        let _ = timeout(T, fresh.read_to_string(&mut resp)).await;
+        assert_eq!(status(&resp), 403, "{resp}");
+        assert!(!p.hold(&SessionId::from("nobody"), lab()));
+    }
+
+    #[tokio::test]
+    async fn a_refused_canary_name_is_observed_in_every_path_whatever_the_policy_says() {
+        let (resolver, _) = loopback_resolver();
+        let (p, _rx, _seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let s = SessionId::from("s-observe");
+        // Deny-all but one granted name: every canary name is refused by the policy, never reaching the veto.
+        let g = p.grant(&s, policy(NetworkMode::Allowlist, &["granted.test"], &[], &["127.0.0.1"])).unwrap();
+        type Seen = Arc<Mutex<Vec<(String, String, Option<String>)>>>;
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        p.set_refusal_observer(Some(Arc::new(move |_: &SessionId, d: &Dest<'_>| {
+            lock(&log).push((d.host.to_string(), d.method.to_string(), d.sni.map(str::to_string)));
+        })));
+        p.set_veto(Some(Arc::new(|_: &SessionId, _: &Dest<'_>| None)));
+        // A CONNECT and a check of a name the allowlist refuses.
+        let mut c = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        c.write_all(connect_req(&g, "decoy.test:443").as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        timeout(T, c.read_to_string(&mut resp)).await.unwrap().unwrap();
+        assert_eq!(status(&resp), 403, "{resp}");
+        let mut c = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        c.write_all(format!("LOOM-CHECK decoy2.test:443 HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        timeout(T, c.read_to_string(&mut resp)).await.unwrap().unwrap();
+        assert_eq!(status(&resp), 403, "{resp}");
+        // The server name of a tunnel to the granted name that the allowlist refuses.
+        let echo = echo_server().await;
+        let mut c = tunnel_to(&g, &format!("granted.test:{echo}")).await;
+        c.write_all(&hello_for(Some("decoy3.test"), &[])).await.unwrap();
+        assert!(drained(&mut c, T).await.is_empty());
+        let seen = lock(&seen).clone();
+        assert!(seen.contains(&("decoy.test".into(), "CONNECT".into(), None)), "{seen:?}");
+        assert!(seen.contains(&("decoy2.test".into(), CHECK_METHOD.into(), None)), "{seen:?}");
+        assert!(seen.contains(&("granted.test".into(), "CONNECT".into(), Some("decoy3.test".into()))), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn this_machines_own_addresses_are_told_to_the_listener_check() {
+        let (p, _rx) = start().await;
+        let lan: IpAddr = "192.0.2.7".parse().unwrap();
+        let shared = &p.inner.shared;
+        assert!(shared.reaches_this_machine("127.0.0.1".parse().unwrap()));
+        assert!(shared.reaches_this_machine("::".parse().unwrap()));
+        assert!(!shared.reaches_this_machine(lan));
+        p.set_local_addrs(vec![lan, "::ffff:198.51.100.9".parse().unwrap()]);
+        assert!(shared.reaches_this_machine(lan));
+        assert!(shared.reaches_this_machine("198.51.100.9".parse().unwrap()));
+        assert!(!shared.reaches_this_machine("192.0.2.8".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn the_veto_closes_a_destination_before_any_lookup_connect_or_byte() {
+        let (server, got) = silent_server().await;
+        let (resolver, lookups) = loopback_resolver();
+        let (p, _rx, seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let s = SessionId::from("s-veto");
+        let g = p.grant(&s, lab()).unwrap();
+        type Asked = Arc<Mutex<Vec<(String, u16, String, Option<IpAddr>)>>>;
+        let asked: Asked = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        p.set_veto(Some(Arc::new(move |who: &SessionId, d: &Dest<'_>| {
+            assert_eq!(who.as_str(), "s-veto");
+            lock(&log).push((d.host.to_string(), d.port, d.method.to_string(), d.resolved));
+            d.host.ends_with(".canary.test").then(|| "closed by loom".to_string())
+        })));
+        // A vetoed name: 502 with the marker and a fixed sentence, no lookup, nothing connected.
+        let mut c = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        c.write_all(connect_req(&g, &format!("bait.canary.test:{server}")).as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        timeout(T, c.read_to_string(&mut resp)).await.unwrap().unwrap();
+        assert_eq!(status(&resp), 502, "{resp}");
+        assert!(
+            resp.contains("X-Loom-Proxy: 1\r\n") && resp.contains("closed to this mission by loom's own rules"),
+            "{resp}"
+        );
+        assert!(!resp.contains("closed by loom\n"), "the hook's own words are not in the body");
+        assert_eq!(lookups.load(Ordering::SeqCst), 0, "a vetoed name is not looked up");
+        {
+            let seen = lock(&seen);
+            let rows: Vec<&NetDecision> =
+                seen.iter().map(|(_, d)| d).filter(|d| d.host == "bait.canary.test").collect();
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert!(
+                !rows[0].allowed && rows[0].rule == "vetoed: closed by loom" && rows[0].resolved.is_none(),
+                "{rows:?}"
+            );
+        }
+        // A check of the name is answered the same way and recorded as a check.
+        let (status_of_check, d) = {
+            let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+            let req = format!("LOOM-CHECK x.canary.test:443 HTTP/1.1\r\n{}\r\n", auth(&g));
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut resp = String::new();
+            timeout(T, s.read_to_string(&mut resp)).await.unwrap().unwrap();
+            let d = lock(&seen).iter().map(|(_, d)| d.clone()).find(|d| d.host == "x.canary.test").unwrap();
+            (status(&resp), d)
+        };
+        assert_eq!(status_of_check, 502);
+        assert!(d.rule.ends_with("(check only)") && !d.allowed, "{d:?}");
+        // A name the veto lets through is looked up, and the hook then saw the address too.
+        let mut ok = tunnel_to(&g, &format!("fine.test:{server}")).await;
+        ok.write_all(b"x").await.unwrap();
+        drop(ok);
+        let _ = timeout(T, got).await;
+        let queries = lock(&asked).clone();
+        assert!(queries.iter().any(|(h, _, m, r)| h == "fine.test" && m == "CONNECT" && r.is_none()), "{queries:?}");
+        assert!(
+            queries.iter().any(|(h, _, _, r)| h == "fine.test" && *r == Some("127.0.0.1".parse().unwrap())),
+            "{queries:?}"
+        );
+        // Removing the veto opens the name again.
+        p.set_veto(None);
+        let (server2, _got2) = silent_server().await;
+        let _open = tunnel_to(&g, &format!("bait.canary.test:{server2}")).await;
+    }
+
+    #[tokio::test]
+    async fn a_veto_of_the_resolved_address_stops_the_connect() {
+        let (server, got) = silent_server().await;
+        let (p, _rx, seen) = start_audited(false, Limits::default(), None).await;
+        let s = SessionId::from("s-veto-ip");
+        let g = p.grant(&s, lab()).unwrap();
+        p.set_veto(Some(Arc::new(move |_: &SessionId, d: &Dest<'_>| {
+            (d.resolved == Some("127.0.0.1".parse().unwrap()) && d.port == server).then(|| "closed by loom".to_string())
+        })));
+        let mut c = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        c.write_all(connect_req(&g, &format!("127.0.0.1:{server}")).as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        timeout(T, c.read_to_string(&mut resp)).await.unwrap().unwrap();
+        assert_eq!(status(&resp), 502, "{resp}");
+        let rows: Vec<NetDecision> = lock(&seen).iter().map(|(_, d)| d.clone()).collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(!rows[0].allowed && rows[0].resolved.as_deref() == Some("127.0.0.1"), "{rows:?}");
+        // The destination was never connected to: its accept is still pending.
+        assert!(timeout(Duration::from_millis(300), got).await.is_err());
+        // A check of the same destination is answered the same way, as the real connect would be.
+        let mut c = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        let req = format!("LOOM-CHECK 127.0.0.1:{server} HTTP/1.1\r\n{}\r\n", auth(&g));
+        c.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        timeout(T, c.read_to_string(&mut resp)).await.unwrap().unwrap();
+        assert_eq!(status(&resp), 502, "{resp}");
+        let last = lock(&seen).last().map(|(_, d)| d.clone()).unwrap();
+        assert!(!last.allowed && last.rule.starts_with("vetoed:") && last.rule.ends_with("(check only)"), "{last:?}");
+    }
+
+    /// The ClientHello bytes a client sends for `name` (`None`: no server name), with `extra` extensions.
+    fn hello_for(name: Option<&str>, extra: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        use crate::clienthello::fixtures::{message, record, sni_ext};
+        let mut ext: Vec<(u16, Vec<u8>)> = vec![(10, vec![0, 2, 0, 29])];
+        if let Some(n) = name {
+            ext.push(sni_ext(&[n]));
+        }
+        ext.extend(extra.iter().cloned());
+        record(&message(&ext, true))
+    }
+
+    /// Reads until the peer ends or `wait` passes.
+    async fn drained(s: &mut TcpStream, wait: Duration) -> Vec<u8> {
+        let mut got = Vec::new();
+        let _ = timeout(wait, s.read_to_end(&mut got)).await;
+        got
+    }
+
+    #[tokio::test]
+    async fn a_tls_tunnel_must_name_its_destination_or_another_name_the_policy_allows() {
+        let echo = echo_server().await;
+        let (resolver, _) = loopback_resolver();
+        let (p, _rx, seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let s = SessionId::from("s-sni");
+        let denying = policy(NetworkMode::Open, &[], &["evil.test"], &["127.0.0.1"]);
+        let g = p.grant(&s, denying).unwrap();
+        let dest = format!("bound.test:{echo}");
+        // The destination's own name passes, and the hello reaches the destination whole (the echo returns it).
+        let hello = hello_for(Some("Bound.Test"), &[]);
+        let mut c = tunnel_to(&g, &dest).await;
+        c.write_all(&hello).await.unwrap();
+        let mut back = vec![0u8; hello.len()];
+        timeout(T, c.read_exact(&mut back)).await.unwrap().unwrap();
+        assert_eq!(back, hello);
+        assert!(echoes(&mut c).await, "the tunnel carries on after the hello");
+        let own: Vec<NetDecision> = lock(&seen).iter().map(|(_, d)| d.clone()).filter(|d| d.sni.is_some()).collect();
+        assert!(own.is_empty(), "the destination's own name adds no record: {own:?}");
+        // Another name the policy allows passes and is recorded with the name.
+        let other = hello_for(Some("cdn.test"), &[]);
+        let mut c = tunnel_to(&g, &dest).await;
+        c.write_all(&other).await.unwrap();
+        let mut back = vec![0u8; other.len()];
+        timeout(T, c.read_exact(&mut back)).await.unwrap().unwrap();
+        let rows: Vec<NetDecision> = lock(&seen).iter().map(|(_, d)| d.clone()).filter(|d| d.sni.is_some()).collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].allowed && rows[0].sni.as_deref() == Some("cdn.test"), "{rows:?}");
+        assert_eq!(rows[0].host, "bound.test");
+        // A name the policy denies is refused: nothing reaches the destination, the tunnel closes.
+        let (server, got) = silent_server().await;
+        let mut c = tunnel_to(&g, &format!("bound.test:{server}")).await;
+        c.write_all(&hello_for(Some("evil.test"), &[])).await.unwrap();
+        assert!(drained(&mut c, T).await.is_empty());
+        let (received, _) = timeout(T, got).await.unwrap().unwrap();
+        assert!(received.is_empty(), "the destination received {received:?}");
+        let refused: Vec<NetDecision> = lock(&seen).iter().map(|(_, d)| d.clone()).filter(|d| !d.allowed).collect();
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].sni.as_deref() == Some("evil.test") && refused[0].rule.contains("evil.test"), "{refused:?}");
+        assert_eq!(refused[0].host, "bound.test");
+    }
+
+    #[tokio::test]
+    async fn an_encrypted_hello_an_unreadable_one_and_a_missing_name_are_refused() {
+        let (resolver, _) = loopback_resolver();
+        let (p, _rx, seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let s = SessionId::from("s-sni-bad");
+        let g = p.grant(&s, lab()).unwrap();
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("ech", hello_for(Some("other.test"), &[(0xfe0d, vec![0, 1])]), "encrypted ClientHello"),
+            ("ech without a name", hello_for(None, &[(0xfe0d, vec![0, 1])]), "encrypted ClientHello"),
+            ("no name", hello_for(None, &[]), "without a server name"),
+            (
+                "two names",
+                {
+                    use crate::clienthello::fixtures::{message, record, sni_ext};
+                    record(&message(&[sni_ext(&["bound.test"]), sni_ext(&["bound.test"])], true))
+                },
+                "cannot be read",
+            ),
+        ];
+        for (what, hello, rule) in cases {
+            let (server, got) = silent_server().await;
+            let mut c = tunnel_to(&g, &format!("bound.test:{server}")).await;
+            c.write_all(&hello).await.unwrap();
+            assert!(drained(&mut c, T).await.is_empty(), "{what}");
+            let (received, _) = timeout(T, got).await.unwrap().unwrap();
+            assert!(received.is_empty(), "{what}: the destination received {received:?}");
+            let last = lock(&seen).last().map(|(_, d)| d.clone()).unwrap();
+            assert!(!last.allowed && last.rule.contains(rule), "{what}: {last:?}");
+        }
+    }
+
+    /// The placeholder (GREASE) encrypted-ClientHello extension a Chromium hello carries: outer type, one KDF and
+    /// AEAD, a config id, a 32-byte encapsulated key and a payload of the usual padded size.
+    fn grease_ech() -> (u16, Vec<u8>) {
+        let mut d = vec![0u8, 0, 1, 0, 1, 0x5a, 0, 32];
+        d.extend([0xa5; 32]);
+        d.extend(144u16.to_be_bytes());
+        d.extend([0x3c; 144]);
+        (0xfe0d, d)
+    }
+
+    #[tokio::test]
+    async fn a_browsers_placeholder_encrypted_hello_naming_the_destination_passes() {
+        let echo = echo_server().await;
+        let (resolver, _) = loopback_resolver();
+        let (p, _rx, seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let g = p.grant(&SessionId::from("s-grease"), lab()).unwrap();
+        let hello = hello_for(Some("bound.test"), &[grease_ech()]);
+        let mut c = tunnel_to(&g, &format!("bound.test:{echo}")).await;
+        c.write_all(&hello).await.unwrap();
+        let mut back = vec![0u8; hello.len()];
+        timeout(T, c.read_exact(&mut back)).await.unwrap().unwrap();
+        assert_eq!(back, hello);
+        assert!(lock(&seen).iter().all(|(_, d)| d.allowed), "{:?}", lock(&seen));
+        // The same extension in front of a name that is not the destination is refused, nothing sent upstream.
+        let (server, got) = silent_server().await;
+        let mut c = tunnel_to(&g, &format!("bound.test:{server}")).await;
+        c.write_all(&hello_for(Some("front.test"), &[grease_ech()])).await.unwrap();
+        assert!(drained(&mut c, T).await.is_empty());
+        let (received, _) = timeout(T, got).await.unwrap().unwrap();
+        assert!(received.is_empty(), "{received:?}");
+    }
+
+    #[tokio::test]
+    async fn a_record_in_front_of_the_hello_does_not_hide_a_fronted_name() {
+        use crate::clienthello::fixtures::{message, record, sni_ext};
+        let (resolver, _) = loopback_resolver();
+        let (p, _rx, seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let g = p
+            .grant(&SessionId::from("s-alert"), policy(NetworkMode::Open, &[], &["evil.test"], &["127.0.0.1"]))
+            .unwrap();
+        let hello = record(&message(&[sni_ext(&["evil.test"])], true));
+        let mut skewed = hello.clone();
+        skewed[1] = 0;
+        skewed[2] = 0;
+        let mut alerted = vec![0x15, 3, 1, 0, 2, 1, 0x5a];
+        alerted.extend(&hello);
+        for (what, flight) in [("alert first", alerted), ("record version 0.0", skewed)] {
+            let (server, got) = silent_server().await;
+            let mut c = tunnel_to(&g, &format!("bound.test:{server}")).await;
+            c.write_all(&flight).await.unwrap();
+            assert!(drained(&mut c, T).await.is_empty(), "{what}");
+            let (received, _) = timeout(T, got).await.unwrap().unwrap();
+            assert!(received.is_empty(), "{what}: the destination received {received:?}");
+            let last = lock(&seen).last().map(|(_, d)| d.clone()).unwrap();
+            assert!(!last.allowed && last.rule.contains("cannot be read"), "{what}: {last:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_to_an_address_may_send_no_name_but_not_a_foreign_denied_one() {
+        let echo = echo_server().await;
+        let (p, _rx, _seen) = start_audited(false, Limits::default(), None).await;
+        let s = SessionId::from("s-sni-ip");
+        let g = p.grant(&s, policy(NetworkMode::Open, &[], &["evil.test"], &["127.0.0.1"])).unwrap();
+        let hello = hello_for(None, &[]);
+        let mut c = tunnel_to(&g, &format!("127.0.0.1:{echo}")).await;
+        c.write_all(&hello).await.unwrap();
+        let mut back = vec![0u8; hello.len()];
+        timeout(T, c.read_exact(&mut back)).await.unwrap().unwrap();
+        assert_eq!(back, hello);
+        let mut c = tunnel_to(&g, &format!("127.0.0.1:{echo}")).await;
+        c.write_all(&hello_for(Some("evil.test"), &[])).await.unwrap();
+        assert!(drained(&mut c, T).await.is_empty());
+    }
+
+    /// A destination that accepts connections, records the first bytes of each and closes.
+    async fn recording_server() -> (u16, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let got: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = got.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n =
+                        timeout(Duration::from_secs(3), s.read(&mut buf)).await.ok().and_then(|r| r.ok()).unwrap_or(0);
+                    buf.truncate(n);
+                    lock(&log).push(buf);
+                });
+            }
+        });
+        (port, got)
+    }
+
+    /// A real TLS client (the system `curl`) through the proxy: its own ClientHello, whatever extensions its
+    /// library sends, is read; a hello for the destination passes, one for another allowed name passes, one for a
+    /// denied name never reaches the destination. Skipped where `curl` is missing.
+    #[tokio::test]
+    async fn a_real_tls_clients_hello_is_read_and_a_fronted_one_is_refused() {
+        let Some(curl) = ["/usr/bin/curl", "/usr/local/bin/curl", "/opt/homebrew/bin/curl"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+        else {
+            return;
+        };
+        let (port, got) = recording_server().await;
+        let (resolver, _) = loopback_resolver();
+        let (p, _rx, seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let s = SessionId::from("s-curl");
+        let g = p.grant(&s, policy(NetworkMode::Open, &[], &["evil.test"], &["127.0.0.1"])).unwrap();
+        let proxy_url = format!("http://{}:{}@127.0.0.1:{}", g.user, g.password, g.port);
+        let run = |url: String, connect_to: Option<String>| {
+            let (curl, proxy_url) = (curl.to_string(), proxy_url.clone());
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let mut cmd = std::process::Command::new(curl);
+                    cmd.args(["-sk", "--max-time", "4", "--proxytunnel", "--proxy", &proxy_url]);
+                    if let Some(c) = connect_to {
+                        cmd.args(["--connect-to", &c]);
+                    }
+                    cmd.arg(url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                    let _ = cmd.status();
+                })
+                .await
+                .unwrap();
+            }
+        };
+        // The destination's connections that carried bytes (a refused tunnel's connection carried none).
+        let hellos =
+            || -> Vec<Hello> { lock(&got).iter().filter(|b| !b.is_empty()).map(|b| clienthello::parse(b)).collect() };
+        let seen_hello = |at: usize| -> Option<Hello> { hellos().into_iter().nth(at) };
+        // The destination's own name.
+        run(format!("https://bound.test:{port}/"), None).await;
+        let own = timeout(T, async {
+            loop {
+                if let Some(h) = seen_hello(0) {
+                    return h;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the hello of a real client reached the destination");
+        assert!(matches!(&own, Hello::Tls { sni: Some(n), ech: false } if n == "bound.test"), "{own:?}");
+        // Fronting through the same destination with a denied name: curl connects (by CONNECT) to bound.test but
+        // its hello names evil.test.
+        run(format!("https://evil.test:{port}/"), Some(format!("evil.test:{port}:bound.test:{port}"))).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(hellos().len(), 1, "the fronted hello must not reach the destination: {:?}", lock(&seen));
+        let refused: Vec<NetDecision> = lock(&seen).iter().map(|(_, d)| d.clone()).filter(|d| !d.allowed).collect();
+        assert!(refused.iter().any(|d| d.sni.as_deref() == Some("evil.test") && d.host == "bound.test"), "{refused:?}");
+        // Another name the policy allows passes.
+        run(format!("https://cdn.test:{port}/"), Some(format!("cdn.test:{port}:bound.test:{port}"))).await;
+        let deadline = tokio::time::Instant::now() + T;
+        while hellos().len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            matches!(seen_hello(1), Some(Hello::Tls { sni: Some(n), .. }) if n == "cdn.test"),
+            "{:?}",
+            seen_hello(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hello_sent_in_pieces_is_read_whole_and_other_traffic_is_not_held_up() {
+        let echo = echo_server().await;
+        let (resolver, _) = loopback_resolver();
+        let (p, _rx, _seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let s = SessionId::from("s-sni-pieces");
+        let g = p.grant(&s, lab()).unwrap();
+        let hello = hello_for(Some("bound.test"), &[]);
+        let mut c = tunnel_to(&g, &format!("bound.test:{echo}")).await;
+        for piece in hello.chunks(7) {
+            c.write_all(piece).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut back = vec![0u8; hello.len()];
+        timeout(T, c.read_exact(&mut back)).await.unwrap().unwrap();
+        assert_eq!(back, hello);
+        // Not TLS: an HTTP request passes at once, whatever the destination is called.
+        let mut c = tunnel_to(&g, &format!("bound.test:{echo}")).await;
+        c.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut back = [0u8; 18];
+        timeout(T, c.read_exact(&mut back)).await.unwrap().unwrap();
+        assert_eq!(&back, b"GET / HTTP/1.1\r\n\r\n");
+        // A server that speaks first needs nothing from the client.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let banner_port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = l.accept().await {
+                let _ = s.write_all(b"SSH-2.0-test\r\n").await;
+                let _ = timeout(T, s.read_to_end(&mut Vec::new())).await;
+            }
+        });
+        let mut c = tunnel_to(&g, &format!("127.0.0.1:{banner_port}")).await;
+        let mut banner = [0u8; 14];
+        timeout(Duration::from_secs(2), c.read_exact(&mut banner)).await.unwrap().unwrap();
+        assert_eq!(&banner, b"SSH-2.0-test\r\n");
+        // A hello that stops half way is refused after the head timeout, not held for ever.
+        let (server, got) = silent_server().await;
+        let limits = Limits { head_timeout: Duration::from_millis(400), ..Limits::default() };
+        let (p2, _rx2, seen2) = start_audited(false, limits, None).await;
+        let g2 = p2.grant(&SessionId::from("s-sni-stall"), lab()).unwrap();
+        let mut c = tunnel_to(&g2, &format!("127.0.0.1:{server}")).await;
+        c.write_all(&hello[..10]).await.unwrap();
+        assert!(drained(&mut c, T).await.is_empty());
+        assert!(timeout(T, got).await.unwrap().unwrap().0.is_empty());
+        let last = lock(&seen2).last().map(|(_, d)| d.clone()).unwrap();
+        assert!(!last.allowed && last.rule.contains("did not arrive in full"), "{last:?}");
+    }
+
+    #[tokio::test]
+    async fn a_canary_user_fires_the_hook_before_the_answer_and_is_answered_as_an_unknown_user() {
+        let (p, _rx, seen) = start_audited(false, Limits::default(), None).await;
+        let s = SessionId::from("s-canary");
+        let g = p.grant(&s, lab()).unwrap();
+        let hits: Arc<Mutex<Vec<CanaryHit>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = hits.clone();
+        p.set_canary_hook(Some(Arc::new(move |h: &CanaryHit| lock(&log).push(h.clone()))));
+        assert!(p.add_canary_user("loom-helper-7f3a", "CN-1 mission m1").is_ok());
+        assert!(p.add_canary_user("", "x").is_err());
+        let err = p.add_canary_user(s.as_str(), "x").err().unwrap_or_default();
+        assert!(err.contains("cannot be a canary"), "{err}");
+        let creds = base64::engine::general_purpose::STANDARD.encode("loom-helper-7f3a:0123456789abcdef");
+        let req = format!("CONNECT 169.254.169.254:80 HTTP/1.1\r\nProxy-Authorization: Basic {creds}\r\n\r\n");
+        // On the session's listener: attributed to the session, answered 407 as an unknown user is.
+        let mut c = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        c.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        timeout(T, c.read_to_string(&mut resp)).await.unwrap().unwrap();
+        assert_eq!(status(&resp), 407, "{resp}");
+        assert!(resp.contains("Proxy-Authenticate"), "{resp}");
+        let unknown = base64::engine::general_purpose::STANDARD.encode("nobody:0123456789abcdef");
+        let plain = raw(
+            g.port,
+            format!("CONNECT 169.254.169.254:80 HTTP/1.1\r\nProxy-Authorization: Basic {unknown}\r\n\r\n").as_bytes(),
+        )
+        .await;
+        assert_eq!(resp, plain, "a decoy's answer is an unknown user's, byte for byte");
+        // The hook had run when the answer arrived.
+        {
+            let hits = lock(&hits);
+            assert_eq!(hits.len(), 1, "{hits:?}");
+            assert_eq!(hits[0].user, "loom-helper-7f3a");
+            assert_eq!(hits[0].label, "CN-1 mission m1");
+            assert_eq!(hits[0].listener.as_ref(), Some(&s));
+            assert_eq!(
+                (hits[0].host.as_str(), hits[0].port, hits[0].method.as_str()),
+                ("169.254.169.254", 80, "CONNECT")
+            );
+        }
+        // The record is attributed to the listener's session and says only what an unknown user's says.
+        let rules: Vec<(Option<String>, String)> =
+            lock(&seen).iter().map(|(s, d)| (s.as_ref().map(|s| s.as_str().to_string()), d.rule.clone())).collect();
+        assert!(rules.iter().all(|(_, r)| !r.to_lowercase().contains("canary") && !r.contains("CN-1")), "{rules:?}");
+        assert!(
+            rules.contains(&(Some("s-canary".to_string()), "proxy authentication failed: unknown user".to_string())),
+            "{rules:?}"
+        );
+        // On the shared listener the attempt is unattributed, and a run of them is never capped.
+        for _ in 0..(UNATTRIBUTED_PER_MINUTE + 15) {
+            let resp = raw(p.port(), req.as_bytes()).await;
+            assert_eq!(status(&resp), 407);
+        }
+        assert_eq!(lock(&hits).len(), 1 + (UNATTRIBUTED_PER_MINUTE as usize) + 15);
+        assert!(lock(&hits).iter().skip(1).all(|h| h.listener.is_none()));
+        let unattributed = lock(&seen)
+            .iter()
+            .filter(|(s, d)| s.is_none() && d.rule == "proxy authentication failed: unknown user")
+            .count();
+        // (One more: the unknown user of the comparison above.)
+        assert_eq!(unattributed, (UNATTRIBUTED_PER_MINUTE as usize) + 15 + 1, "none of them was left out");
+        // A removed decoy is an unknown user again, and no hook fires.
+        assert!(p.remove_canary_user("loom-helper-7f3a"));
+        let _ = raw(g.port, req.as_bytes()).await;
+        assert_eq!(lock(&hits).len(), 1 + (UNATTRIBUTED_PER_MINUTE as usize) + 15);
+    }
+
+    #[tokio::test]
+    async fn the_listener_check_refuses_a_loopback_destination_whose_listener_it_names() {
+        let (allowed_port, _) = silent_server().await;
+        let echo = echo_server().await;
+        let (p, _rx, seen) = start_audited(false, Limits::default(), None).await;
+        let s = SessionId::from("s-listener");
+        let g = p.grant(&s, lab()).unwrap();
+        let asked: Arc<Mutex<Vec<(String, SocketAddr)>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        p.set_listener_check(Some(Arc::new(move |who: &SessionId, to: SocketAddr, client: Option<SocketAddr>| {
+            // The local end of the connection the proxy opened is what names the process that holds the other end.
+            assert!(client.is_some_and(|c| c.ip().is_loopback() && c.port() != 0), "{client:?}");
+            lock(&log).push((who.as_str().to_string(), to));
+            (to.port() == echo).then(|| "deny a listener started inside a loom sandbox".to_string())
+        })));
+        let mut c = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        c.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        timeout(T, c.read_to_string(&mut resp)).await.unwrap().unwrap();
+        assert_eq!(status(&resp), 403, "{resp}");
+        assert!(resp.contains("deny a listener started inside a loom sandbox"), "{resp}");
+        let last = lock(&seen).last().map(|(_, d)| d.clone()).unwrap();
+        assert!(
+            !last.allowed && last.rule.contains("listener") && last.resolved.as_deref() == Some("127.0.0.1"),
+            "{last:?}"
+        );
+        // Another port on loopback is let through, and the hook saw both asks with the session.
+        let _ok = tunnel_to(&g, &format!("127.0.0.1:{allowed_port}")).await;
+        let asked = lock(&asked).clone();
+        assert!(asked.iter().all(|(who, _)| who == "s-listener"), "{asked:?}");
+        assert!(asked.iter().any(|(_, to)| to.port() == echo) && asked.iter().any(|(_, to)| to.port() == allowed_port));
+        // A forwarded request is checked the same way.
+        let req = format!("GET http://127.0.0.1:{echo}/ HTTP/1.1\r\n{}\r\n", auth(&g));
+        assert_eq!(status(&raw(g.port, req.as_bytes()).await), 403);
+    }
+
+    #[tokio::test]
+    async fn a_connection_is_judged_by_the_policy_the_session_holds_when_it_is_registered() {
+        let (p, _rx) = start().await;
+        let s = SessionId::from("s-current");
+        let _g = p.grant(&s, lab()).unwrap();
+        let shared = &p.inner.shared;
+        let stale = lock(&shared.sessions).values().next().map(|e| e.policy.clone()).unwrap();
+        assert!(current_policy(shared, &s, false, stale.clone()).check_name("127.0.0.1", 80).allowed);
+        assert!(p.set_policy(&s, policy(NetworkMode::DenyAll, &[], &[], &[])));
+        assert!(!current_policy(shared, &s, false, stale).check_name("127.0.0.1", 80).allowed);
     }
 
     /// A response as an HTTP client sees it: status, headers (names lower-cased), body.

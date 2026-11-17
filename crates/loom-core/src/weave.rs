@@ -1200,7 +1200,7 @@ mod tests {
                     pack: "p".into(),
                     role: "lead".into(),
                     termination: Termination::Free,
-                    model: ModelRef { profile: "p".into(), model: "m".into(), context_window: 1000 },
+                    model: ModelRef { profile: "p".into(), model: "m".into(), context_window: 1000, lineage: None },
                     reasoning_replay: replay,
                     system_prompt: "SYSTEM".into(),
                     tools: vec![ToolSpec {
@@ -1568,8 +1568,8 @@ mod tests {
     fn a_model_switch_sets_the_reasoning_replay_for_the_whole_history() {
         let switch = |replay: ReasoningReplay| {
             Event::ModelSwitched(crate::event::ModelSwitched {
-                from: ModelRef { profile: "p".into(), model: "m".into(), context_window: 1000 },
-                to: ModelRef { profile: "q".into(), model: "n".into(), context_window: 2000 },
+                from: ModelRef { profile: "p".into(), model: "m".into(), context_window: 1000, lineage: None },
+                to: ModelRef { profile: "q".into(), model: "n".into(), context_window: 2000, lineage: None },
                 reasoning_replay: replay,
                 reason: "operator".into(),
             })

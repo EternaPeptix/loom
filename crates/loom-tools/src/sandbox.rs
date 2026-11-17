@@ -125,19 +125,39 @@
 //!   jobs;
 //! - network: denied, except loopback connections to the egress proxy port (when there is one), to
 //!   `cfg.loopback_ports` — or to every loopback port when `cfg.loopback_all` — and to
-//!   `cfg.unix_sockets`. Listening on loopback is allowed. The daemon's own port (`cfg.daemon_port`, which
+//!   `cfg.unix_sockets`. Listening on loopback is allowed. DevTools and the inspector (9222, 9229), the Docker
+//!   API (2375, 2376) and every `cfg.infra_ports` port (loopback model endpoints and `network.infrastructure`
+//!   entries on this machine; set by the runtime, not a configuration key) are refused the same way, whatever
+//!   `loopback_all` or `loopback_ports` allows; `loopback_all` is always written for TCP and UDP. The daemon's own port (`cfg.daemon_port`, which
 //!   the daemon sets; not a configuration key) is refused whatever allows it, at every address: Seatbelt
 //!   counts the host's own addresses as loopback, and a command that read a `loom open` login code from the
 //!   process list could otherwise redeem it. (Probed on macOS 27: after an allow of `(remote ip
 //!   "localhost:*")` a deny of one port, written `localhost:<port>` or `*:<port>`, is not reliable — about two
-//!   ports in five stay connectable, the same port every time — so with `cfg.daemon_port` the allow for
+//!   ports in five stay connectable, the same port every time — so the allow for
 //!   `loopback_all` is written for TCP and UDP, `(remote tcp "localhost:*") (remote udp "localhost:*")`
 //!   (loopback ICMP is not allowed then); with that allow, and with allows of single ports, a deny of
 //!   `*:<port>` refused 127.0.0.1, ::1 and the host's own address on every port tried.)
-//! - system services that fetch a URL for a process, outside its sandbox: when `[network] mode` is
-//!   `deny_all` (`cfg.network_deny_all`, which the runtime sets; not a configuration key) commands cannot
+//! - Mach services: `mach-lookup` is denied by default and a command may look up only the services of
+//!   `MACH_LOOKUP_ALLOW` and `MACH_LOOKUP_ALLOW_PREFIXES` (17 names: what the usual toolchains need to start, resolve users, notify, log, check
+//!   an execution policy, list processes and watch files; probed on macOS 27 with bash, python3, node, git, curl,
+//!   clang, swiftc, cargo, make, cmake, ssh, sqlite3, perl, ruby, java, codesign, lldb, osascript and the usual
+//!   utilities, whose output matched an unconfined run), the names of `cfg.mach_allow` (an exact name, or a name
+//!   ending in `*` for a prefix; `loom-core` refuses an entry that would cover a fetch or disk service) and, with
+//!   `cfg.allow_fetch_services`, the fetch services. What else fails: the keychain and the security daemons,
+//!   Spotlight (`mdfind` and `mds`, which would name files the profile hides), the pasteboard (`pbpaste`),
+//!   audio, analytics, authorization, Launch Services' writers, disk services. A tool that needs one more is
+//!   fixed with `sandbox.mach_allow`, found from `log show --predicate 'eventMessage CONTAINS "deny(1) mach-lookup"'`.
+//!   The prefixes are the rendezvous servers of Chromium builds (`org.chromium.Chromium.`, `com.google.Chrome.`,
+//!   `com.google.chrome.for.testing.` + `MachPortRendezvousServer.`): a process registers its own name and its child
+//!   processes look it up, which a list of exact names cannot say. Probed on macOS 27 with a python3 that registers
+//!   such a name and a new python3 that looks it up (refused without the prefix, found with it); Chromium itself was not
+//!   run on the gate host, and another build (Edge, Electron) needs its own `<bundle id>.MachPortRendezvousServer.*` in
+//!   `sandbox.mach_allow`.
+//! - system services that fetch a URL for a process, outside its sandbox, in every network mode: commands cannot
 //!   look up `com.apple.trustd.agent`, `com.apple.trustd`, `com.apple.ocspd`, `com.apple.nsurlsessiond` or
-//!   `com.apple.nsurlsessiond.NSURLSessionProxyService`, nor WebKit's XPC services (`com.apple.WebKit.*`):
+//!   `com.apple.nsurlsessiond.NSURLSessionProxyService`, nor WebKit's XPC services (`com.apple.WebKit.*`)
+//!   (`FETCH_SERVICE_NAMES`, `FETCH_SERVICE_PREFIXES` in `loom-core`), unless `cfg.allow_fetch_services`, which
+//!   is the only way and which the daemon reports as "egress unbounded" (`docs/MONITOR.md` §2.2, E2):
 //!   probed on macOS 27, a background URL session started from `osascript -l JavaScript` and a `WKWebView`
 //!   made there each fetched a URL from a listener the profile does not allow; denied, nothing arrives, and
 //!   background URL sessions and WebKit-based tools fail. Certificate evaluation
@@ -145,10 +165,13 @@
 //!   through `com.apple.trustd.agent`: probed on macOS 27 with `security verify-cert -p ssl` under
 //!   `(deny network*)`, the request reaches a listener unless that service is denied (denying
 //!   `com.apple.trustd` alone does not stop it); `ocspd` is the older service for the same fetches. Denied,
-//!   evaluation through Security.framework fails for every certificate, valid ones too
-//!   (`SecTrustEvaluateWithError` returns false, errSecInternalComponent, so it fails closed), and so does
-//!   `codesign --verify`; curl, Python and OpenSSL check certificates against their own files and are not
-//!   affected. In the other network modes these services stay reachable: a residual, in SECURITY.md.
+//!   evaluation through Security.framework fails for every certificate (`SecTrustEvaluateWithError` returns false,
+//!   errSecInternalComponent: probed with a valid Apple root, -26276, so it fails closed), and so does `codesign --verify`; curl (also Apple's, which
+//!   links SecureTransport: probed with an HTTPS fetch under the profile), Python and OpenSSL are not affected.
+//!   Name resolution needs no service: it goes to `/var/run/mDNSResponder`, which `(deny network*)` refuses.
+//!   The deny comes last in the profile, so nothing before it (`mach_allow` included) reaches these services.
+//!   `crate::sandbox::selfprobe` runs a command under the real profile against a local listener to check that
+//!   this holds on the host (`docs/MONITOR.md` §2.2).
 //!
 //! All paths are made canonical when the sandbox is built (macOS: `/tmp` is `/private/tmp`); a
 //! configured path that does not exist is kept as written after resolving its deepest existing
@@ -195,15 +218,17 @@
 //! (deny file-search)
 //! (deny file-mount)
 //! (deny user-preference-write)
+//! (deny mach-lookup)
+//! (allow mach-lookup (global-name "<MACH_LOOKUP_ALLOW>") … (global-name "<cfg.mach_allow exact>") … (global-name-prefix "<cfg.mach_allow prefix*>") … <the fetch services, only with `cfg.allow_fetch_services`>)
 //! (deny mach-lookup (global-name "com.apple.DiskArbitration.diskarbitrationd") (global-name "com.apple.diskimagesiod") (global-name "com.apple.diskimagesiod.ram") (global-name "com.apple.diskmanagementd"))
 //! (deny network*)
-//! (allow network-outbound (remote ip "localhost:<port>")) …      ; or "localhost:*" for loopback_all (with
-//!                                                                 ; `cfg.daemon_port`: `(remote tcp "localhost:*") (remote udp "localhost:*")`)
+//! (allow network-outbound (remote ip "localhost:<port>")) …      ; for loopback_all: `(remote tcp "localhost:*") (remote udp "localhost:*")`
 //! (allow network-outbound (remote unix-socket (path-literal "<socket>"))) …
+//! (deny network-outbound (remote ip "*:<port>")) …               ; 9222, 9229, 2375, 2376 and `cfg.infra_ports`
 //! (deny network-outbound (remote ip "*:<daemon port>"))          ; only with `cfg.daemon_port`
 //! (allow network-bind (local ip "localhost:*"))
 //! (allow network-inbound (local ip "localhost:*"))
-//! (deny mach-lookup (global-name "com.apple.trustd.agent") (global-name "com.apple.trustd") (global-name "com.apple.ocspd") (global-name "com.apple.nsurlsessiond") (global-name "com.apple.nsurlsessiond.NSURLSessionProxyService") (xpc-service-name-prefix "com.apple.WebKit."))   ; only with `cfg.network_deny_all`
+//! (deny mach-lookup (global-name "com.apple.trustd.agent") (global-name "com.apple.trustd") (global-name "com.apple.ocspd") (global-name "com.apple.nsurlsessiond") (global-name "com.apple.nsurlsessiond.NSURLSessionProxyService") (xpc-service-name-prefix "com.apple.WebKit."))   ; unless `cfg.allow_fetch_services`
 //! ```
 //!
 //! The Git regexes are written with every letter as a class of both cases (`[gG][iI][tT]`) and, where the
@@ -220,7 +245,19 @@
 //!
 //! A process that leaves its command's process group (`setsid`, `daemon()`, `redis-server --daemonize
 //! yes`, `tmux new -d`) is not tracked: `job_kill`, stop, the end of the session and daemon shutdown do
-//! not stop it, although it stays under this profile.
+//! not stop it, although it stays under this profile. `sandbox::census` finds it by that profile (the session's
+//! temp directory, which only that session's profile opens, and the loom home, which every profile refuses: a
+//! process is the session's when it may read the first and not the second) whatever it did to its process group
+//! and environment, and can stop it (`docs/MONITOR.md` §2.2, E3).
+//!
+//! ## `with_identity(id)`, `identity()` and `nproc_limit()`
+//! `with_identity(id)` gives the sandbox the id of its session (1 to 64 letters, digits, `-` and `_`; anything else is
+//! an error that says to use the session id); `env` then adds `LOOM_SANDBOX_ID=<id>`, the fallback by which
+//! `census` finds a session's processes where the sandbox cannot be asked (a command can clear it). The profile is
+//! not changed. `nproc_limit()` is the RLIMIT_NPROC a command started now gets (`procinfo::nproc_limit_now` of
+//! `cfg.nproc_headroom`: the machine's limit less the headroom, whatever else exists; `Ok(None)` when the headroom is
+//! 0): `proc::spawn` and the PTY apply it to the command before it starts, and refuse to start one (an error that says
+//! what to do) when the user already holds as many processes as that limit.
 //!
 //! A sandboxed process can signal itself and the other processes of its sandbox, and nothing else:
 //! not the harness, not other sessions, not any other process of the same user.
@@ -263,6 +300,10 @@
 //! (`git worktree add`, `git submodule update --init`); and that a repository of the session's own can be
 //! cloned bare (`git clone --bare <url> <dir>.git`) and used with `git --git-dir=<dir>.git --work-tree=<dir>`.
 //!
+//! `stop_replay_leftovers(tmp)` (blocking) stops, by sandbox identity, whatever a replay's command left running under
+//! the replay profile (it refuses every session's temp dir, so no session's census lists it): the oracle calls it when
+//! the replay's command has returned, before the staging is removed (`census::kill_under`).
+//!
 //! ## `oracle_staging_root()` / `isolated_replay(workspace, tmp)`
 //! Staging is `<loom home>/oracle-runs`, outside all session temp trees. The harness creates a private
 //! random child with workspace/tmp siblings. Both must already exist under that protected root and
@@ -293,7 +334,8 @@
 //! name and value test alone (without `secret_env` and `env_pass`), for the daemon's start warning. Bubblewrap additionally
 //! always removes LD_*, DYLD_*, BASH_FUNC_*, BASH_ENV, ENV, SHELLOPTS and BASHOPTS before its trusted
 //! host launcher; tools can set needed library variables inside the confined script. Added: `TERM=dumb`,
-//! `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR=<session temp dir>`.
+//! `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR=<session temp dir>`, and
+//! `LOOM_SANDBOX_ID=<id>` when the sandbox has an identity.
 //!
 //! ## `describe()`
 //! Two or three plain sentences for the system prompt: where commands may write, what they may not
@@ -305,9 +347,12 @@
 //! commands write and no Git configuration, hooks, worktree or submodule repository written, that the
 //! operator does `git worktree add` and `git submodule update --init`, and that a bare clone
 //! (`git clone --bare <url> <dir>.git`, used with `--git-dir`/`--work-tree`) works; and, with
-//! `cfg.network_deny_all`, that programs that check certificates through macOS (Swift and Go programs,
+//! `cfg.allow_fetch_services` is not set, that programs that check certificates through macOS (Swift and Go programs,
 //! `security`, `codesign --verify`) fail here, while curl and Python use their own certificate files, and
-//! that WebKit-based tools and background URL sessions fail. In seatbelt mode it also says, in one sentence,
+//! that WebKit-based tools and background URL sessions fail; in every seatbelt description, whatever
+//! `allow_fetch_services` says (the default-deny of `mach-lookup` holds either way), that Spotlight's `mdfind`, the
+//! clipboard, the keychain and audio fail with the other system services outside the list, that
+//! `sandbox.mach_allow` is the operator's fix, and which headless Chromium names are allowed. In seatbelt mode it also says, in one sentence,
 //! that `git submodule update` (any form) is the operator's, that upstream tracking cannot be recorded, that
 //! dependencies from Git URLs (pip, npm, cargo, uv) cannot be installed (an archive URL can), that disk
 //! images cannot be mounted (extract them instead) and that preferences cannot be written (`defaults write`).
@@ -392,19 +437,30 @@
 //! `defaults write <unique domain> k v` leaves no value (read back outside the sandbox), while
 //! `defaults read -g` works; without these rules both succeed (or the test is skipped).
 //!
-//! Network: the profile has the daemon-port deny after the allows exactly when `cfg.daemon_port` is set, and
-//! the `mach-lookup` deny exactly when `cfg.network_deny_all`. Under `sandbox-exec`: with `loopback_all`, and
+//! Network: the profile has the deny of 9222, 9229, 2375, 2376 and every `cfg.infra_ports` port after the
+//! allows (a port that is the session's own proxy port excepted), the daemon-port deny after the allows exactly
+//! when `cfg.daemon_port` is set, and
+//! the fetch services' `mach-lookup` deny (last) exactly unless `cfg.allow_fetch_services`, and the default-deny of
+//! `mach-lookup` with its allows always. Under `sandbox-exec`: with `loopback_all`, and
 //! with the daemon port listed in `loopback_ports`, a connection to that port fails at 127.0.0.1 and ::1 (and
 //! at the host's own address when it has one) while another loopback port still connects; a command that runs
 //! `security verify-cert -p ssl` on a certificate whose AIA `caIssuers` names a unique URL on a local
-//! listener makes no request reach it with `network_deny_all`, and does without it (otherwise skipped: the
-//! host does not fetch); with `network_deny_all` the profile has the nsurlsessiond and WebKit denies too, and a
+//! listener makes no request reach it by default, and does with `allow_fetch_services` (otherwise skipped: the
+//! host does not fetch); by default the profile has the nsurlsessiond and WebKit denies too, and a
 //! background URL session started from `osascript -l JavaScript` gets no request to a local listener the
-//! profile does not allow (skipped when it does not reach it without them); `describe` says what is said above.
+//! profile does not allow (skipped when it does not reach it with `allow_fetch_services`); in every
+//! network mode (no proxy, a proxy port, `loopback_all`); `mach_allow` cannot reach a fetch service (the deny is
+//! last) or a disk service; the usual tools run under the default-deny (`bash`, `python3`, `git`, `curl`,
+//! `sw_vers`, `id`); a `mach_allow` entry makes a service lookup work that fails without it (the pasteboard:
+//! `pbpaste` exits 0 with it); `describe` says what is said above.
 
+pub mod census;
 mod linux;
+pub mod selfprobe;
 
-use loom_core::config::{SandboxCfg, SandboxMode};
+use loom_core::config::{
+    SandboxCfg, SandboxMode, FETCH_SERVICE_NAMES, FETCH_SERVICE_PREFIXES, MACH_LOOKUP_ALLOW, MACH_LOOKUP_ALLOW_PREFIXES,
+};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -539,11 +595,20 @@ pub struct Sandbox {
     loopback_all: bool,
     /// The daemon's own port, refused whatever else allows it.
     daemon_port: Option<u16>,
-    /// Commands cannot reach the system services that fetch a URL for a process (certificate evaluation).
-    network_deny_all: bool,
+    /// Loopback ports refused whatever else allows loopback: `DENIED_LOOPBACK_PORTS` and `cfg.infra_ports`,
+    /// without the session's own proxy port.
+    denied_ports: Vec<u16>,
+    /// Commands may look up the system services that fetch a URL for a process (`cfg.allow_fetch_services`).
+    allow_fetch_services: bool,
+    /// `cfg.mach_allow`: Mach services besides `MACH_LOOKUP_ALLOW` that commands may look up.
+    mach_allow: Vec<String>,
     unix_sockets: Vec<PathBuf>,
     env_pass: Vec<String>,
     secret_env: Vec<String>,
+    /// `cfg.nproc_headroom`: processes of the user's limit that a command leaves unused.
+    nproc_headroom: u32,
+    /// The session this sandbox belongs to (`with_identity`): the id `Sandbox::env` gives commands.
+    identity: Option<String>,
 }
 
 fn invalid(msg: String) -> io::Error {
@@ -1688,6 +1753,14 @@ impl Sandbox {
             push_unique(&mut loopback_ports, *p);
         }
 
+        let mut denied_ports: Vec<u16> = Vec::new();
+        for p in loom_core::config::DENIED_LOOPBACK_PORTS.iter().chain(&cfg.infra_ports) {
+            if Some(*p) != proxy_port && !denied_ports.contains(p) {
+                denied_ports.push(*p);
+            }
+        }
+        loopback_ports.retain(|p| Some(*p) == proxy_port || !denied_ports.contains(p));
+
         let mut unix_sockets = Vec::new();
         for p in &cfg.unix_sockets {
             push_unique(&mut unix_sockets, anchored(p)?);
@@ -1760,10 +1833,14 @@ impl Sandbox {
             loopback_ports,
             loopback_all: cfg.loopback_all,
             daemon_port: cfg.daemon_port,
-            network_deny_all: cfg.network_deny_all,
+            denied_ports,
+            allow_fetch_services: cfg.allow_fetch_services,
+            mach_allow: cfg.mach_allow.clone(),
             unix_sockets,
             env_pass: cfg.env_pass.clone(),
             secret_env: cfg.secret_env.clone(),
+            nproc_headroom: cfg.nproc_headroom,
+            identity: None,
         })
     }
 
@@ -1793,6 +1870,34 @@ impl Sandbox {
         sbpl(&dir)?;
         self.jobs_dir = Some(dir);
         Ok(self)
+    }
+
+    /// This sandbox with the identity of session `id`, which `Sandbox::env` gives commands as `LOOM_SANDBOX_ID`
+    /// (the fallback of `census`; the census finds a session's processes by the profile they run under, which
+    /// needs no identity here: see `sandbox::census`). `id` is 1 to 64 letters, digits, `-` and `_`.
+    pub fn with_identity(mut self, id: &str) -> io::Result<Sandbox> {
+        census::valid_id(id).map_err(invalid)?;
+        self.identity = Some(id.to_string());
+        Ok(self)
+    }
+
+    /// The session this sandbox was given (`with_identity`).
+    pub fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+
+    /// Stops what a replay of this sandbox left running once its command has returned (blocking): processes under
+    /// the profile of `isolated_replay` that may read the replay's temp dir `tmp` and not the loom home, which no
+    /// census of a session's temp dir lists (`census::kill_under`). Nothing outside that profile is touched.
+    pub fn stop_replay_leftovers(&self, tmp: &Path) -> census::Killed {
+        census::kill_under(&self.loom_home, tmp)
+    }
+
+    /// The RLIMIT_NPROC of a command started now (`cfg.nproc_headroom`; `loom_tools::procinfo`): `Ok(None)` when
+    /// the headroom is 0 or the machine's limit is unknown, an error (what to do next) when the user already holds
+    /// as many processes as the limit allows.
+    pub fn nproc_limit(&self) -> Result<Option<u64>, String> {
+        crate::procinfo::nproc_limit_now(u64::from(self.nproc_headroom))
     }
 
     /// Harness-owned staging lives outside all sessions, whose mutable temp trees are excluded from
@@ -2000,6 +2105,7 @@ impl Sandbox {
         // A file system mounted over a directory (a disk image attached over `.git/hooks` or `~/.ssh`) escapes
         // every path rule; DiskArbitration and the disk-image services mount for a process outside its sandbox;
         // `cfprefsd` writes `~/Library/Preferences` for one.
+        out.push_str(&self.mach_lookup_rules());
         out.push_str(
             "(deny file-mount)\n(deny user-preference-write)\n\
              (deny mach-lookup (global-name \"com.apple.DiskArbitration.diskarbitrationd\") \
@@ -2007,13 +2113,11 @@ impl Sandbox {
              (global-name \"com.apple.diskmanagementd\"))\n",
         );
         out.push_str("(deny network*)\n");
-        if self.loopback_all && self.daemon_port.is_some() {
+        if self.loopback_all {
             // A later deny of one port is not reliable after an allow of `(remote ip "localhost:*")`: probed on
             // macOS 27, about two ports in five are still connectable. After an allow written for TCP and UDP it
             // holds for every port tried.
             out.push_str("(allow network-outbound (remote tcp \"localhost:*\") (remote udp \"localhost:*\"))\n");
-        } else if self.loopback_all {
-            out.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
         } else {
             for p in &self.loopback_ports {
                 out.push_str(&format!("(allow network-outbound (remote ip \"localhost:{p}\"))\n"));
@@ -2024,6 +2128,11 @@ impl Sandbox {
         }
         // After the allows, and written `*:<port>`: Seatbelt counts the host's own addresses as loopback, so the
         // deny names every address.
+        // DevTools, the inspector, the Docker API and the loopback ports of infrastructure are refused the same
+        // way, so `loopback_all` and `loopback_ports` do not reach them without the proxy.
+        for port in &self.denied_ports {
+            out.push_str(&format!("(deny network-outbound (remote ip \"*:{port}\"))\n"));
+        }
         if let Some(port) = self.daemon_port {
             out.push_str(&format!("(deny network-outbound (remote ip \"*:{port}\"))\n"));
         }
@@ -2031,15 +2140,45 @@ impl Sandbox {
         out.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
         // Certificate evaluation fetches the issuer a certificate names through these services, outside the
         // sandbox; without them it fails closed. Background URL sessions and WebKit fetch a URL the same way.
-        if self.network_deny_all {
-            out.push_str(
-                "(deny mach-lookup (global-name \"com.apple.trustd.agent\") (global-name \"com.apple.trustd\") \
-                 (global-name \"com.apple.ocspd\") (global-name \"com.apple.nsurlsessiond\") \
-                 (global-name \"com.apple.nsurlsessiond.NSURLSessionProxyService\") \
-                 (xpc-service-name-prefix \"com.apple.WebKit.\"))\n",
-            );
+        // This comes last, so no allow above (`mach_allow` included) reaches them; only `allow_fetch_services`
+        // lets a command look them up.
+        if !self.allow_fetch_services {
+            out.push_str(&Self::fetch_services_deny());
         }
         Some(out)
+    }
+
+    /// The default-deny of `mach-lookup`: a command looks up what `MACH_LOOKUP_ALLOW`, `cfg.mach_allow` and (with
+    /// `cfg.allow_fetch_services`) the fetch services name, and nothing else. It comes before the disk services'
+    /// deny, which then holds whatever `mach_allow` lists.
+    fn mach_lookup_rules(&self) -> String {
+        let name_ok = |n: &str| {
+            !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@'))
+        };
+        let mut exact: Vec<String> = MACH_LOOKUP_ALLOW.iter().map(|n| (*n).to_string()).collect();
+        let mut prefixes: Vec<String> = MACH_LOOKUP_ALLOW_PREFIXES.iter().map(|n| (*n).to_string()).collect();
+        for entry in &self.mach_allow {
+            match entry.strip_suffix('*') {
+                Some(prefix) if name_ok(prefix) => push_unique(&mut prefixes, prefix.to_string()),
+                None if name_ok(entry) => push_unique(&mut exact, entry.clone()),
+                _ => {}
+            }
+        }
+        if self.allow_fetch_services {
+            exact.extend(FETCH_SERVICE_NAMES.iter().map(|n| (*n).to_string()));
+            prefixes.extend(FETCH_SERVICE_PREFIXES.iter().map(|n| (*n).to_string()));
+        }
+        let names: String = exact.iter().map(|n| format!(" (global-name \"{n}\")")).collect();
+        let prefixed: String = prefixes.iter().map(|n| format!(" (global-name-prefix \"{n}\")")).collect();
+        format!("(deny mach-lookup)\n(allow mach-lookup{names}{prefixed})\n")
+    }
+
+    /// The deny of the fetch services (`FETCH_SERVICE_NAMES` and `FETCH_SERVICE_PREFIXES`).
+    fn fetch_services_deny() -> String {
+        let names: String = FETCH_SERVICE_NAMES.iter().map(|n| format!(" (global-name \"{n}\")")).collect();
+        let prefixes: String =
+            FETCH_SERVICE_PREFIXES.iter().map(|n| format!(" (xpc-service-name-prefix \"{n}\")")).collect();
+        format!("(deny mach-lookup{names}{prefixes})\n")
     }
 
     /// The Git rules of the profile, which must come after every allow and deny that concerns the session temp
@@ -2298,6 +2437,10 @@ impl Sandbox {
             out.insert(k.to_string(), v.to_string());
         }
         out.insert("TMPDIR".to_string(), self.tmp_dir.display().to_string());
+        if let Some(id) = &self.identity {
+            // Where the sandbox identity cannot be asked (a host without it), `census` falls back to this.
+            out.insert(census::ENV_MARK.to_string(), id.clone());
+        }
         out
     }
 
@@ -2377,13 +2520,22 @@ impl Sandbox {
                    recorded, dependencies from Git URLs (pip, npm, cargo, uv) cannot be installed (an archive URL \
                    can), disk images cannot be mounted (extract them instead) and preferences cannot be written \
                    (`defaults write`).";
-        let certificates = if self.network_deny_all {
+        let fetch = if !self.allow_fetch_services {
             " Programs that check certificates through macOS (Swift and Go programs, `security`, `codesign --verify`) \
               fail here; curl and Python use their own certificate files and are not affected. WebKit-based tools and \
               background URL sessions fail here too."
         } else {
             ""
         };
+        // The default-deny of `mach-lookup` holds in every seatbelt profile, with or without the fetch services.
+        let certificates = format!(
+            "{fetch} So do the system services outside the list of ones that commands need to run (Spotlight's \
+             `mdfind`, the clipboard's `pbcopy` and `pbpaste`, the keychain, audio); a tool that needs one is fixed \
+             by the operator with `sandbox.mach_allow`. A headless Chromium build (Playwright, Puppeteer) finds its \
+             child processes through the rendezvous names of `org.chromium.Chromium`, `com.google.Chrome` and \
+             `com.google.chrome.for.testing`; another build needs its own `<bundle id>.MachPortRendezvousServer.*` in \
+             `sandbox.mach_allow`."
+        );
         let ports = if self.loopback_all {
             "any loopback port".to_string()
         } else if self.loopback_ports.is_empty() {
@@ -2482,7 +2634,7 @@ mod tests {
     const MOUNT_LINES: &str = "(deny file-mount)\n(deny user-preference-write)\n\
          (deny mach-lookup (global-name \"com.apple.DiskArbitration.diskarbitrationd\") (global-name \"com.apple.diskimagesiod\") (global-name \"com.apple.diskimagesiod.ram\") (global-name \"com.apple.diskmanagementd\"))\n";
 
-    /// The `mach-lookup` deny that only `network_deny_all` adds.
+    /// The `mach-lookup` deny of the fetch services.
     const FETCH_SERVICES: &str = "(deny mach-lookup (global-name \"com.apple.trustd.agent\") (global-name \"com.apple.trustd\") (global-name \"com.apple.ocspd\") (global-name \"com.apple.nsurlsessiond\") (global-name \"com.apple.nsurlsessiond.NSURLSessionProxyService\") (xpc-service-name-prefix \"com.apple.WebKit.\"))\n";
 
     fn cfg(mode: SandboxMode) -> SandboxCfg {
@@ -2518,6 +2670,11 @@ mod tests {
         let holders: String = holders.iter().map(|a| format!(" (literal \"{}\")", s(a))).collect();
         let git = git_lines(&format!(" (subpath \"{r}/ws\") (subpath \"{r}/tmp\") (subpath \"{r}/extra\")"));
         let rx = regex_literal(&f.root).expect("regex-safe path");
+        let mach: String = MACH_LOOKUP_ALLOW
+            .iter()
+            .map(|n| format!(" (global-name \"{n}\")"))
+            .chain(MACH_LOOKUP_ALLOW_PREFIXES.iter().map(|n| format!(" (global-name-prefix \"{n}\")")))
+            .collect();
         let expected = format!(
             "(version 1)\n(allow default)\n(deny signal)\n(allow signal (target same-sandbox))\n(deny file-write*)\n\
              (allow file-write* (subpath \"{r}/ws\") (subpath \"{r}/tmp\") (subpath \"{r}/extra\") (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\"))\n\
@@ -2535,18 +2692,23 @@ mod tests {
              (deny file-write-unlink{holders})\n\
              (deny file-write-create (require-all (vnode-type SYMLINK) (require-any{holders})))\n\
              (deny lsopen)\n(deny appleevent-send)\n(deny job-creation)\n(deny file-search)\n\
+             (deny mach-lookup)\n(allow mach-lookup{mach})\n\
              {MOUNT_LINES}\
              (deny network*)\n\
              (allow network-outbound (remote ip \"localhost:8080\"))\n\
              (allow network-outbound (remote ip \"localhost:9000\"))\n\
              (allow network-outbound (remote unix-socket (path-literal \"{r}/run.sock\")))\n\
+             (deny network-outbound (remote ip \"*:9222\"))\n\
+             (deny network-outbound (remote ip \"*:9229\"))\n\
+             (deny network-outbound (remote ip \"*:2375\"))\n\
+             (deny network-outbound (remote ip \"*:2376\"))\n\
              (allow network-bind (local ip \"localhost:*\"))\n\
-             (allow network-inbound (local ip \"localhost:*\"))\n"
+             (allow network-inbound (local ip \"localhost:*\"))\n{FETCH_SERVICES}"
         );
         let actual = sb.profile().expect("profile");
         assert_eq!(actual, expected);
-        // Neither the daemon port nor the certificate services are mentioned unless the configuration says so.
-        assert!(!actual.contains(FETCH_SERVICES) && !actual.contains("network-outbound (remote ip \"*:"));
+        // The daemon port is not mentioned unless the configuration says so.
+        assert!(!actual.contains("(remote ip \"*:7"));
         let (prog, args) = sb.command("echo hi");
         assert_eq!(prog, "/usr/bin/sandbox-exec");
         assert_eq!(args[0], "-p");
@@ -2798,8 +2960,8 @@ mod tests {
         let f = fx();
         let c = SandboxCfg { loopback_all: true, loopback_ports: vec![9000], ..cfg(SandboxMode::Seatbelt) };
         let p = build(&f, &c, Some(8080)).profile().expect("profile");
-        assert!(p.contains("(allow network-outbound (remote ip \"localhost:*\"))\n"));
-        assert!(!p.contains("localhost:9000"));
+        assert!(p.contains("(allow network-outbound (remote tcp \"localhost:*\") (remote udp \"localhost:*\"))\n"));
+        assert!(!p.contains("localhost:9000") && !p.contains("(remote ip \"localhost:*\")"));
     }
 
     #[test]
@@ -6043,7 +6205,7 @@ mod tests {
     // ---- network ----
 
     #[test]
-    fn the_profile_denies_the_daemon_port_and_the_certificate_services_exactly_when_told_to() {
+    fn the_profile_denies_the_daemon_port_when_told_to_and_the_fetch_services_unless_allowed() {
         let f = fx();
         let base = SandboxCfg {
             loopback_ports: vec![9000],
@@ -6056,22 +6218,43 @@ mod tests {
         let services = FETCH_SERVICES;
         let bind = "(allow network-bind (local ip \"localhost:*\"))\n";
         let tail = format!("{bind}(allow network-inbound (local ip \"localhost:*\"))\n");
-        assert!(plain.ends_with(&tail) && !plain.contains("*:7777") && !plain.contains("trustd"), "{plain}");
+        // The fetch services are denied last, in every network mode, with no setting.
+        assert!(plain.ends_with(&format!("{tail}{services}")) && !plain.contains("*:7777"), "{plain}");
         assert!(plain.contains(MOUNT_LINES), "{plain}");
         let only_port = SandboxCfg { daemon_port: Some(7777), ..base.clone() };
         let only_port = build(&f, &only_port, None).profile().expect("profile");
         assert_eq!(only_port, plain.replace(bind, &format!("{port}{bind}")));
-        let only_services = SandboxCfg { network_deny_all: true, ..base.clone() };
-        let only_services = build(&f, &only_services, None).profile().expect("profile");
-        assert_eq!(only_services, format!("{plain}{services}"));
-        let both = SandboxCfg { daemon_port: Some(7777), network_deny_all: true, ..base };
+        // The same profile with a proxy port and under `loopback_all`: the deny is still last.
+        for variant in [
+            build(&f, &base, Some(8123)).profile().expect("profile"),
+            build(&f, &SandboxCfg { loopback_all: true, ..base.clone() }, None).profile().expect("profile"),
+        ] {
+            assert!(variant.ends_with(services), "{variant}");
+        }
+        // `allow_fetch_services` leaves the deny out and allows the services instead.
+        let allowed = SandboxCfg { allow_fetch_services: true, ..base.clone() };
+        let allowed = build(&f, &allowed, None).profile().expect("profile");
+        assert!(
+            !allowed.contains(services) && !allowed.contains("(deny mach-lookup (global-name \"com.apple.trustd"),
+            "{allowed}"
+        );
+        assert!(allowed.ends_with(&tail), "{allowed}");
+        for name in FETCH_SERVICE_NAMES {
+            assert!(
+                allowed.contains(&format!("(global-name \"{name}\")"))
+                    && !plain.lines().any(|l| l.starts_with("(allow mach-lookup") && l.contains(name)),
+                "{name}"
+            );
+        }
+        assert!(allowed.contains("(global-name-prefix \"com.apple.WebKit.\")"), "{allowed}");
+        let both = SandboxCfg { daemon_port: Some(7777), ..base };
         let both = build(&f, &both, None).profile().expect("profile");
         // After the allows (the last is the unix socket), before the bind and inbound allows; the services last.
         let socket = both.find("(allow network-outbound (remote unix-socket").expect("socket");
         let (deny, bind_at) = (both.find(port).expect("port deny"), both.find(bind).expect("bind"));
         assert!(socket < deny && deny < bind_at, "{both}");
         assert!(both.ends_with(&format!("{tail}{services}")), "{both}");
-        assert_eq!(both, plain.replace(bind, &format!("{port}{bind}")) + services);
+        assert_eq!(both, plain.replace(bind, &format!("{port}{bind}")));
         // `loopback_all` is written first and the deny still follows it; with a daemon port the allow is written
         // for TCP and UDP (a deny of one port after an allow written `ip` is not reliable).
         let all = SandboxCfg { loopback_all: true, daemon_port: Some(7777), ..cfg(SandboxMode::Seatbelt) };
@@ -6081,9 +6264,30 @@ mod tests {
         assert!(!all.contains("(remote ip \"localhost:*\")"), "{all}");
         let no_port = SandboxCfg { loopback_all: true, ..cfg(SandboxMode::Seatbelt) };
         let no_port = build(&f, &no_port, None).profile().expect("profile");
-        assert!(no_port.contains("(allow network-outbound (remote ip \"localhost:*\"))\n"), "{no_port}");
+        assert!(no_port.contains(wildcard) && !no_port.contains("(remote ip \"localhost:*\")"), "{no_port}");
         // Bubblewrap has no profile; mode none neither.
         assert!(build(&f, &SandboxCfg { daemon_port: Some(1), ..cfg(SandboxMode::None) }, None).profile().is_none());
+    }
+
+    /// DevTools, the inspector, the Docker API and an infrastructure port on loopback are refused after the
+    /// allows, whether loopback is allowed whole or by port: the proxy is not the only door to them.
+    #[test]
+    fn devtools_docker_and_infrastructure_ports_are_denied_after_every_loopback_allow() {
+        let f = fx();
+        let deny = |p: u16| format!("(deny network-outbound (remote ip \"*:{p}\"))\n");
+        let all = SandboxCfg { loopback_all: true, infra_ports: vec![9920, 9222], ..cfg(SandboxMode::Seatbelt) };
+        let prof = build(&f, &all, None).profile().expect("profile");
+        let allow = prof.find("(allow network-outbound (remote tcp \"localhost:*\")").expect("allow");
+        for p in [9222, 9229, 2375, 2376, 9920] {
+            let at = prof.find(&deny(p)).unwrap_or_else(|| panic!("no deny of {p}: {prof}"));
+            assert!(allow < at, "{p} is denied after the allow: {prof}");
+        }
+        assert_eq!(prof.matches(&deny(9222)).count(), 1, "listed twice, denied once");
+        // Written the same without loopback_all, and a port that is the session's own proxy is not denied.
+        let some = SandboxCfg { loopback_ports: vec![9000], ..cfg(SandboxMode::Seatbelt) };
+        let prof = build(&f, &some, Some(2375)).profile().expect("profile");
+        assert!(prof.contains(&deny(9222)) && prof.contains(&deny(2376)), "{prof}");
+        assert!(!prof.contains(&deny(2375)), "the session's proxy port stays reachable: {prof}");
     }
 
     #[test]
@@ -6151,6 +6355,31 @@ mod tests {
         }
     }
 
+    /// An infrastructure port (a loopback model endpoint, DevTools, the Docker API) is refused to a command
+    /// that is allowed all of loopback or that port, and another port still connects.
+    #[test]
+    fn an_infrastructure_port_is_refused_under_loopback_all_and_loopback_ports() {
+        if !available() {
+            return;
+        }
+        let f = fx();
+        for _ in 0..5 {
+            let infra = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = infra.local_addr().expect("addr").port();
+            let other = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let other_port = other.local_addr().expect("addr").port();
+            for c in [
+                SandboxCfg { loopback_all: true, infra_ports: vec![port], ..cfg(SandboxMode::Seatbelt) },
+                SandboxCfg { loopback_ports: vec![other_port], infra_ports: vec![port], ..cfg(SandboxMode::Seatbelt) },
+            ] {
+                let sb = build(&f, &c, None);
+                assert!(!connects(&sb, &f.ws, "127.0.0.1", port), "{port} connected under {c:?}");
+                assert!(connects(&sb, &f.ws, "127.0.0.1", other_port), "{other_port} must connect under {c:?}");
+            }
+            drop((infra, other));
+        }
+    }
+
     /// A certificate for `leaf.example` whose `caIssuers` names `url`, made with the system's `openssl`.
     fn aia_certificate(dir: &Path, url: &str) -> Option<PathBuf> {
         std::fs::create_dir_all(dir).ok()?;
@@ -6210,10 +6439,10 @@ mod tests {
     }
 
     #[test]
-    fn certificate_evaluation_fetches_no_url_for_a_command_under_deny_all() {
+    fn certificate_evaluation_fetches_no_url_for_a_command_by_default() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
-        let test = "certificate_evaluation_fetches_no_url_for_a_command_under_deny_all";
+        let test = "certificate_evaluation_fetches_no_url_for_a_command_by_default";
         if !available() || !Path::new("/usr/bin/security").exists() || !Path::new("/usr/bin/openssl").exists() {
             return;
         }
@@ -6269,29 +6498,30 @@ mod tests {
             Some((path, run(sb, &f.ws, &script).0))
         };
         let c = SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) };
+        let control = SandboxCfg { allow_fetch_services: true, ..c.clone() };
         (|| {
-            // Control: without the setting the service fetches the URL the certificate names.
-            let Some((path, _)) = verify(&build(&f, &c, None), "control") else {
+            // Control: with the services allowed the service fetches the URL the certificate names.
+            let Some((path, _)) = verify(&build(&f, &control, None), "control") else {
                 return skipped(test, "openssl cannot make the certificates");
             };
             if !fetched(&path, 10) {
                 return skipped(test, "this host does not fetch the issuer of a certificate for a sandboxed command");
             }
-            let denied = SandboxCfg { network_deny_all: true, ..c.clone() };
+            let denied = c.clone();
             let Some((path, _)) = verify(&build(&f, &denied, None), "denied") else {
                 return skipped(test, "openssl cannot make the certificates");
             };
-            assert!(!fetched(&path, 6), "the URL a certificate names was fetched for a command under deny_all");
+            assert!(!fetched(&path, 6), "the URL a certificate names was fetched for a command by default");
         })();
         stop.store(true, Ordering::SeqCst);
         let _ = thread.join();
     }
 
     #[test]
-    fn a_background_url_session_fetches_nothing_for_a_command_under_deny_all() {
+    fn a_background_url_session_fetches_nothing_for_a_command_by_default() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
-        let test = "a_background_url_session_fetches_nothing_for_a_command_under_deny_all";
+        let test = "a_background_url_session_fetches_nothing_for_a_command_by_default";
         if !available() || !Path::new("/usr/bin/osascript").exists() {
             return;
         }
@@ -6352,19 +6582,161 @@ mod tests {
             path
         };
         let c = SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) };
+        let control = SandboxCfg { allow_fetch_services: true, ..c.clone() };
         (|| {
-            // Control: without the setting the session service fetches the URL for the command.
-            let path = start(&c, "control");
+            // Control: with the services allowed the session service fetches the URL for the command.
+            let path = start(&control, "control");
             if !fetched(&path, 10) {
                 return skipped(test, "this host does not fetch a background session's URL for a sandboxed command");
             }
-            let denied = SandboxCfg { network_deny_all: true, ..c.clone() };
+            let denied = c.clone();
             assert!(build(&f, &denied, None).profile().expect("profile").contains(FETCH_SERVICES));
             let path = start(&denied, "denied");
-            assert!(!fetched(&path, 8), "a background URL session fetched a URL for a command under deny_all");
+            assert!(!fetched(&path, 8), "a background URL session fetched a URL for a command by default");
         })();
         stop.store(true, Ordering::SeqCst);
         let _ = thread.join();
+    }
+
+    #[test]
+    fn mach_lookup_is_denied_by_default_with_the_allowlist_then_mach_allow_then_the_fetch_deny() {
+        let f = fx();
+        let c = SandboxCfg {
+            mach_allow: vec!["com.apple.pasteboard.1".into(), "com.example.svc*".into(), "bad name\"".into()],
+            protect_credentials: false,
+            ..cfg(SandboxMode::Seatbelt)
+        };
+        let p = build(&f, &c, None).profile().expect("profile");
+        let deny = p.find("(deny mach-lookup)\n").expect("default deny");
+        let allow = p.find("(allow mach-lookup").expect("allow");
+        let disk =
+            p.find("(deny mach-lookup (global-name \"com.apple.DiskArbitration.diskarbitrationd\")").expect("disk");
+        let fetch = p.rfind(FETCH_SERVICES).expect("fetch deny");
+        // Default-deny, then the allows, then the disk services, and the fetch services last of all.
+        assert!(deny < allow && allow < disk && disk < fetch && p.ends_with(FETCH_SERVICES), "{p}");
+        let line = p.lines().find(|l| l.starts_with("(allow mach-lookup")).expect("allow line");
+        for name in MACH_LOOKUP_ALLOW {
+            assert!(line.contains(&format!("(global-name \"{name}\")")), "{name}: {line}");
+        }
+        for prefix in MACH_LOOKUP_ALLOW_PREFIXES {
+            assert!(line.contains(&format!("(global-name-prefix \"{prefix}\")")), "{prefix}: {line}");
+        }
+        assert!(line.contains("(global-name \"com.apple.pasteboard.1\")"), "{line}");
+        assert!(line.contains("(global-name-prefix \"com.example.svc\")"), "{line}");
+        assert!(!line.contains("bad name"), "an entry that is not a service name is left out: {line}");
+        // Neither the fetch nor the disk services are in the built-in list.
+        for name in FETCH_SERVICE_NAMES.iter().chain(loom_core::config::DISK_SERVICE_NAMES.iter()) {
+            assert!(!line.contains(name), "{name}: {line}");
+        }
+        // No mach-lookup rule is added in mode none.
+        assert!(build(&f, &cfg(SandboxMode::None), None).profile().is_none());
+    }
+
+    /// `python3` registers `<prefix>MachPortRendezvousServer.<pid>` and runs a new python3 that looks it up; prints
+    /// `rendezvous <check_in status> <look_up exit>`.
+    const RENDEZVOUS_SCRIPT: &str = "python3 - <<'PY'\n\
+import ctypes, os, subprocess, sys\n\
+l = ctypes.CDLL('/usr/lib/libSystem.B.dylib')\n\
+bp = ctypes.c_uint.in_dll(l, 'bootstrap_port').value\n\
+prefix = 'org.chromium.Chromium.MachPortRendezvousServer.'\n\
+child = \"import ctypes,os,sys\\nl=ctypes.CDLL('/usr/lib/libSystem.B.dylib')\\nbp=ctypes.c_uint.in_dll(l,'bootstrap_port').value\\np=ctypes.c_uint()\\nsys.exit(0 if l.bootstrap_look_up(bp,(sys.argv[1]+str(os.getppid())).encode(),ctypes.byref(p))==0 else 3)\\n\"\n\
+port = ctypes.c_uint()\n\
+r = l.bootstrap_check_in(bp, (prefix + str(os.getpid())).encode(), ctypes.byref(port))\n\
+rc = subprocess.run([sys.executable, '-c', child, prefix]).returncode\n\
+print('rendezvous', r, rc)\n\
+PY";
+
+    #[test]
+    fn commands_run_under_the_default_deny_of_mach_lookup_in_every_setting() {
+        if !available() {
+            return;
+        }
+        let f = fx();
+        let script = "echo ok; id -u >/dev/null && sw_vers -productName >/dev/null && git --version >/dev/null && \
+                      python3 -c 'import socket,json;socket.getaddrinfo(\"localhost\",80)' && /usr/bin/curl --version >/dev/null";
+        // A process that registers a service and a child that looks it up (how a Chromium build's renderer, GPU and
+        // utility processes find their parent), under the name Chromium gives: the child is a new process.
+        let rendezvous = RENDEZVOUS_SCRIPT;
+        for c in [
+            cfg(SandboxMode::Seatbelt),
+            SandboxCfg { allow_fetch_services: true, ..cfg(SandboxMode::Seatbelt) },
+            SandboxCfg { loopback_all: true, daemon_port: Some(7777), ..cfg(SandboxMode::Seatbelt) },
+            SandboxCfg { mach_allow: vec!["com.apple.pasteboard*".into()], ..cfg(SandboxMode::Seatbelt) },
+        ] {
+            let (ok, out) = run(&build(&f, &c, Some(8123)), &f.ws, script);
+            assert!(ok && out.starts_with("ok"), "{out}");
+            let (ok, out) = run(&build(&f, &c, Some(8123)), &f.ws, rendezvous);
+            assert!(
+                ok && out.contains("rendezvous 0 0"),
+                "a child cannot find the service its parent registered: {out}"
+            );
+        }
+        // Another build's name is refused until `mach_allow` names it, as for any other service.
+        let other = RENDEZVOUS_SCRIPT.replace("org.chromium.Chromium", "com.example.Browser");
+        let (_, out) = run(&build(&f, &cfg(SandboxMode::Seatbelt), None), &f.ws, &other);
+        assert!(out.contains("rendezvous 0 3"), "{out}");
+        let named = SandboxCfg {
+            mach_allow: vec!["com.example.Browser.MachPortRendezvousServer.*".into()],
+            ..cfg(SandboxMode::Seatbelt)
+        };
+        let (ok, out) = run(&build(&f, &named, None), &f.ws, &other);
+        assert!(ok && out.contains("rendezvous 0 0"), "{out}");
+    }
+
+    #[test]
+    fn a_mach_service_outside_the_list_fails_until_mach_allow_names_it() {
+        let test = "a_mach_service_outside_the_list_fails_until_mach_allow_names_it";
+        let security = Path::new("/usr/bin/security");
+        if !available() || !security.exists() {
+            return;
+        }
+        let f = fx();
+        // `security find-certificate` reads the system roots through the security daemon (`com.apple.SecurityServer`),
+        // which needs no login session, so this runs on a host reached over ssh. Control: unconfined it finds one.
+        let script = "/usr/bin/security find-certificate -a -c 'Apple Root CA' -p \
+                      /System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null";
+        let unconfined = Command::new("/bin/sh").args(["-c", script]).output().expect("sh");
+        if !String::from_utf8_lossy(&unconfined.stdout).contains("BEGIN CERTIFICATE") {
+            return skipped(test, "this host's security daemon does not answer an unconfined command");
+        }
+        let found = |c: &SandboxCfg| {
+            let (_, out) = run(&build(&f, c, None), &f.ws, script);
+            out.contains("BEGIN CERTIFICATE")
+        };
+        assert!(!found(&cfg(SandboxMode::Seatbelt)), "the security daemon is reachable by default");
+        for entry in ["com.apple.SecurityServer", "com.apple.Security*"] {
+            let named = SandboxCfg { mach_allow: vec![entry.into()], ..cfg(SandboxMode::Seatbelt) };
+            assert!(found(&named), "mach_allow = [\"{entry}\"] did not allow the service");
+        }
+        // An unrelated entry does not.
+        let other = SandboxCfg { mach_allow: vec!["com.apple.pasteboard*".into()], ..cfg(SandboxMode::Seatbelt) };
+        assert!(!found(&other));
+        // The clipboard, where this host has one.
+        if Path::new("/usr/bin/pbpaste").exists()
+            && Command::new("/usr/bin/pbpaste").output().is_ok_and(|o| o.status.success())
+        {
+            let paste = "/usr/bin/pbpaste >/dev/null 2>&1";
+            assert!(!run(&build(&f, &cfg(SandboxMode::Seatbelt), None), &f.ws, paste).0);
+            let named = SandboxCfg { mach_allow: vec!["com.apple.pasteboard.1".into()], ..cfg(SandboxMode::Seatbelt) };
+            assert!(run(&build(&f, &named, None), &f.ws, paste).0, "mach_allow did not allow the pasteboard");
+        }
+    }
+
+    #[test]
+    fn mach_allow_cannot_reach_a_fetch_or_a_disk_service() {
+        let f = fx();
+        let c = SandboxCfg {
+            mach_allow: vec!["com.apple.trustd*".into(), "com.apple.diskimagesiod".into(), "com.apple.WebKit.*".into()],
+            ..cfg(SandboxMode::Seatbelt)
+        };
+        let p = build(&f, &c, None).profile().expect("profile");
+        // The entries are written (config.check is what refuses them), and the denies come after every allow.
+        let last_allow = p.rfind("(allow mach-lookup").expect("allow");
+        assert!(
+            last_allow < p.find("(deny mach-lookup (global-name \"com.apple.DiskArbitration").expect("disk"),
+            "{p}"
+        );
+        assert!(last_allow < p.rfind(FETCH_SERVICES).expect("fetch"), "{p}");
     }
 
     #[test]
@@ -6387,17 +6759,24 @@ mod tests {
         ] {
             assert!(seatbelt.contains(needle), "{needle}: {seatbelt}");
         }
-        assert!(!seatbelt.contains("codesign") && !seatbelt.contains("WebKit"), "{seatbelt}");
-        let deny_all = SandboxCfg { network_deny_all: true, ..cfg(SandboxMode::Seatbelt) };
+        let deny_all = cfg(SandboxMode::Seatbelt);
         let d = build(&f, &deny_all, None).describe();
         assert!(
             d.contains("Swift and Go programs, `security`, `codesign --verify`") && d.contains("curl and Python"),
             "{d}"
         );
         assert!(d.contains("WebKit-based tools and background URL sessions fail"), "{d}");
+        assert!(d.contains("Spotlight's `mdfind`") && d.contains("`pbpaste`"), "{d}");
         assert_eq!(d, build(&f, &deny_all, None).describe());
+        // With the fetch services allowed the sentence about them is gone.
+        let allowed =
+            build(&f, &SandboxCfg { allow_fetch_services: true, ..cfg(SandboxMode::Seatbelt) }, None).describe();
+        assert!(!allowed.contains("codesign") && !allowed.contains("WebKit"), "{allowed}");
+        // The default-deny of `mach-lookup` holds with the fetch services allowed: the sentence stays.
+        assert!(allowed.contains("Spotlight's `mdfind`") && allowed.contains("`sandbox.mach_allow`"), "{allowed}");
+        assert!(d.contains("MachPortRendezvousServer"), "{d}");
         // The Git sentence is the seatbelt description's; mode none does not confine commands.
-        let none = build(&f, &SandboxCfg { network_deny_all: true, ..cfg(SandboxMode::None) }, None).describe();
+        let none = build(&f, &cfg(SandboxMode::None), None).describe();
         assert!(!none.contains("No Git repository") && !none.contains("codesign"), "{none}");
         assert!(!none.contains("disk images") && !none.contains("WebKit") && !none.contains("defaults"), "{none}");
     }

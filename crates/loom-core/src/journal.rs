@@ -463,6 +463,14 @@ fn new_mac(key: &[u8]) -> std::io::Result<HmacSha256> {
     HmacSha256::new_from_slice(key).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))
 }
 
+/// Lowercase hex HMAC-SHA256 of `data` under `key` (the monitor log's seal; `docs/MONITOR.md` section 7.3). `Err` only for a
+/// key the MAC cannot take, which no 32-byte key file is.
+pub fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> std::io::Result<String> {
+    let mut m = new_mac(key)?;
+    m.update(data);
+    Ok(hex::encode(m.finalize().into_bytes()))
+}
+
 fn mac_hex(key: &[u8], prev_mac: &str, body: &[u8]) -> std::io::Result<String> {
     let mut m = new_mac(key)?;
     m.update(prev_mac.as_bytes());
@@ -588,6 +596,11 @@ fn verify_all(key: &[u8], bytes: &[u8]) -> Result<Loaded, JournalError> {
     }
     loaded.last_mac = prev_mac;
     Ok(loaded)
+}
+
+/// The key stored at `path`, or `None` when the file is missing or does not hold a key. Never creates one.
+pub fn load_existing_key(path: &Path) -> Option<Vec<u8>> {
+    read_key(path).ok()
 }
 
 /// Load the journal key, creating it when missing. See the module contract.
@@ -1436,5 +1449,19 @@ mod tests {
         // A trailing newline is tolerated.
         std::fs::write(&path, format!("{}\n", "ab".repeat(32))).unwrap_or_default();
         assert_eq!(load_or_create_key(&path).map(|k| k.len()).ok(), Some(32));
+    }
+
+    #[test]
+    fn a_float_survives_a_json_round_trip_exactly() {
+        // A sealed line is checked by parsing it and serializing it again, so a float must come back as the same
+        // text. serde_json's default parser can be one unit in the last place off; `float_roundtrip` makes it exact.
+        for n in 1u64..400 {
+            for d in [3u64, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 97] {
+                let x = (n * 1_000_003) as f64 / d as f64 * 3.6;
+                let text = serde_json::to_string(&serde_json::json!({ "x": x })).expect("ser");
+                let back: serde_json::Value = serde_json::from_str(&text).expect("de");
+                assert_eq!(back.to_string(), text, "{n}/{d}");
+            }
+        }
     }
 }

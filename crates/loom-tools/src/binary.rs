@@ -1005,8 +1005,9 @@ mod tests {
         vars.insert("ENV".into(), hook.to_string_lossy().into_owned());
         vars.insert("LD_PRELOAD".into(), "untrusted".into());
         env.ctx.env = std::sync::Arc::new(vars);
-        let result = command(&env.ctx, "printf real_target".into(), 2).await.unwrap();
-        assert!(result.success());
+        // The limit is generous: under a loaded full test run a 2 s limit expired before `printf` ran.
+        let result = command(&env.ctx, "printf real_target".into(), 30).await.unwrap();
+        assert!(result.success(), "{:?}", result.ended);
         assert_eq!(result.bytes, b"real_target");
     }
 

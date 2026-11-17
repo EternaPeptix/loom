@@ -370,6 +370,10 @@ pub struct ModelRef {
     pub profile: String,
     pub model: String,
     pub context_window: u64,
+    /// What the monitor knew of the profile's family, alignment and recipient when this was recorded
+    /// (`lineage::resolve`). Absent in records written before the monitor's model policy (M1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<crate::lineage::Lineage>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -841,6 +845,11 @@ pub struct NetDecision {
     pub rule: String,
     #[serde(default)]
     pub resolved: Option<String>,
+    /// The server name the TLS ClientHello of a `CONNECT` tunnel carried, when the proxy read it and it was
+    /// not the destination's own name (another granted name, or the name of a refused tunnel). Absent from
+    /// older records and from every record whose tunnel named its own destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -931,7 +940,7 @@ mod tests {
                     pack: "core".into(),
                     role: "lead".into(),
                     termination: Termination::Explicit,
-                    model: ModelRef { profile: "local".into(), model: "m".into(), context_window: 1000 },
+                    model: ModelRef { profile: "local".into(), model: "m".into(), context_window: 1000, lineage: None },
                     reasoning_replay: ReasoningReplay::All,
                     system_prompt: "sys".into(),
                     tools: vec![ToolSpec {
@@ -1143,6 +1152,7 @@ mod tests {
                     allowed: false,
                     rule: "deny".into(),
                     resolved: Some("1.2.3.4".into()),
+                    sni: None,
                 }),
             ),
             ("cache_break", Event::CacheBreak { req_id: "r-1".into(), first_diff_message: 2, detail: "d".into() }),
@@ -1152,8 +1162,8 @@ mod tests {
             (
                 "model_switched",
                 Event::ModelSwitched(ModelSwitched {
-                    from: ModelRef { profile: "a".into(), model: "m1".into(), context_window: 1000 },
-                    to: ModelRef { profile: "b".into(), model: "m2".into(), context_window: 2000 },
+                    from: ModelRef { profile: "a".into(), model: "m1".into(), context_window: 1000, lineage: None },
+                    to: ModelRef { profile: "b".into(), model: "m2".into(), context_window: 2000, lineage: None },
                     reasoning_replay: ReasoningReplay::None,
                     reason: "operator".into(),
                 }),

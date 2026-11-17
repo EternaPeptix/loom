@@ -27,4 +27,5 @@ url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+base64.workspace = true
 loom-tools = { workspace = true, features = ["testutil"] }

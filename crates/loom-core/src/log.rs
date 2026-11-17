@@ -1403,7 +1403,7 @@ mod tests {
             pack: "p".into(),
             role: "r".into(),
             termination: Termination::Free,
-            model: ModelRef { profile: "p".into(), model: "m".into(), context_window: 1 },
+            model: ModelRef { profile: "p".into(), model: "m".into(), context_window: 1, lineage: None },
             reasoning_replay: ReasoningReplay::All,
             system_prompt: "s".into(),
             tools: vec![],

@@ -87,7 +87,9 @@
 //!   {preview}`.
 //! - `status(view, style)`: the daemon line; the free space of the volume of the loom home (`{free}
 //!   GiB free of {total} GiB ({pct}%) on the volume of the loom home`, or `unknown`) and, when it is low
-//!   (`DiskSpace::is_low`), a warning that sessions will fail when the disk fills (bold yellow); one
+//!   (`DiskSpace::is_low`), a warning that sessions will fail when the disk fills (bold yellow); when the
+//!   daemon reports it (`view.egress`), the egress line of the sandbox self-probe (`EgressView::line`: `egress:
+//!   bounded (…)` plain, `egress: UNBOUNDED, …` bold yellow, `egress: not probed yet` plain); one
 //!   line per model (`✓`/`✗`, base URL, model, window, detail when unreachable); the counts.
 //! - `models_table(view, style)`: one line per live profile, `✓`/`✗ {profile}[ (default)] · {model} ·
 //!   {base_url} · window {window} · {max_concurrent} at once[ · {detail}]`; then a line when no
@@ -862,6 +864,14 @@ pub fn status(view: &StatusView, style: &Style) -> String {
         }
         None => out.push(cut("free space on the volume of the loom home: unknown", width)),
     }
+    if let Some(egress) = &view.egress {
+        let line = cut(&flat(&egress.line(loom_core::now_ms())), width);
+        out.push(if egress.level == loom_agent::egress::Level::Unbounded {
+            paint(style, BOLD_YELLOW, &line)
+        } else {
+            line
+        });
+    }
     if view.models.is_empty() {
         out.push("no models configured".to_string());
     }
@@ -1191,7 +1201,7 @@ mod tests {
                 pack: s.into(),
                 role: s.into(),
                 termination: Termination::Explicit,
-                model: ModelRef { profile: s.into(), model: s.into(), context_window: 1000 },
+                model: ModelRef { profile: s.into(), model: s.into(), context_window: 1000, lineage: None },
                 reasoning_replay: ReasoningReplay::All,
                 system_prompt: s.into(),
                 tools: vec![],
@@ -1309,14 +1319,20 @@ mod tests {
                 allowed: false,
                 rule: s.into(),
                 resolved: None,
+                sni: None,
             }),
             Event::CacheBreak { req_id: s.into(), first_diff_message: 2, detail: s.into() },
             Event::Interrupted { reason: s.into() },
             Event::TurnEnd { reason: TurnEndReason::Finished },
             Event::SessionEnd { outcome: SessionOutcome::Failed, detail: s.into() },
             Event::ModelSwitched(loom_core::event::ModelSwitched {
-                from: loom_core::event::ModelRef { profile: s.into(), model: s.into(), context_window: 1000 },
-                to: loom_core::event::ModelRef { profile: s.into(), model: s.into(), context_window: 0 },
+                from: loom_core::event::ModelRef {
+                    profile: s.into(),
+                    model: s.into(),
+                    context_window: 1000,
+                    lineage: None,
+                },
+                to: loom_core::event::ModelRef { profile: s.into(), model: s.into(), context_window: 0, lineage: None },
                 reasoning_replay: loom_core::event::ReasoningReplay::None,
                 reason: s.into(),
             }),
@@ -1437,7 +1453,7 @@ mod tests {
             pack: "core".into(),
             role: "lead".into(),
             termination: Termination::Free,
-            model: ModelRef { profile: "local".into(), model: "mm".into(), context_window: 1 },
+            model: ModelRef { profile: "local".into(), model: "mm".into(), context_window: 1, lineage: None },
             reasoning_replay: ReasoningReplay::All,
             system_prompt: String::new(),
             tools: vec![],
@@ -1814,6 +1830,7 @@ mod tests {
             allowed: true,
             rule: "r".into(),
             resolved: None,
+            sni: None,
         });
         assert_eq!(record(&rec(Author::Harness, net), &MONO, &verbose), "");
         assert_eq!(record(&rec(Author::Harness, Event::Unknown), &MONO, &verbose), "");
@@ -2150,7 +2167,12 @@ mod tests {
 
         let receipt = |live: bool| ModelSwitchReceipt {
             session: SessionId::from("s-1"),
-            model: loom_core::event::ModelRef { profile: "fast".into(), model: "m".into(), context_window: 200_000 },
+            model: loom_core::event::ModelRef {
+                profile: "fast".into(),
+                model: "m".into(),
+                context_window: 200_000,
+                lineage: None,
+            },
             live,
         };
         assert_eq!(model_switch_line(&receipt(true)), "s-1 now uses fast (m, window 200.0k), from its next step");
@@ -2187,6 +2209,7 @@ mod tests {
                 profile: "big".into(),
                 model: "b".into(),
                 context_window: 1_000_000,
+                lineage: None,
             },
             any_role: None,
             roles: vec![worker, solver, verifier],
@@ -2236,6 +2259,8 @@ mod tests {
             sessions_active: 2,
             sessions_running: 1,
             inbox_open: 3,
+            egress: None,
+            monitor: None,
         };
         assert_eq!(
             status(&view, &MONO),
@@ -2267,6 +2292,44 @@ mod tests {
     }
 
     #[test]
+    fn status_shows_the_egress_line_when_the_daemon_reports_one() {
+        use loom_agent::egress::{EgressView, Level};
+        let mut view = StatusView {
+            version: "0.1.0".into(),
+            pid: 1,
+            started_ms: 0,
+            bind: "127.0.0.1:7878".into(),
+            proxy_port: 7879,
+            home: "/h".into(),
+            sandbox: "seatbelt".into(),
+            network: "deny_all".into(),
+            disk: None,
+            models: vec![],
+            sessions_total: 0,
+            sessions_active: 0,
+            sessions_running: 0,
+            inbox_open: 0,
+            egress: None,
+            monitor: None,
+        };
+        assert!(!status(&view, &MONO).contains("egress"), "an older daemon says nothing");
+        view.egress = Some(EgressView { level: Level::Unprobed, ..EgressView::default() });
+        assert!(status(&view, &MONO).contains("egress: not probed yet\n"));
+        view.egress = Some(EgressView {
+            level: Level::Unbounded,
+            reasons: vec!["sandbox.allow_fetch_services is set".into(), "second".into()],
+            ..EgressView::default()
+        });
+        let plain = status(&view, &MONO);
+        assert!(plain.contains("egress: UNBOUNDED, sandbox.allow_fetch_services is set (+1 more)\n"), "{plain}");
+        assert!(status(&view, &COLOR).contains("\x1b[1m\x1b[33megress: UNBOUNDED"), "{}", status(&view, &COLOR));
+        let narrow = status(&view, &Style { color: false, width: 20 });
+        for line in narrow.lines() {
+            assert!(line.chars().count() <= 20, "{line}");
+        }
+    }
+
+    #[test]
     fn status_warns_below_5_gib_or_5_percent_free_and_says_when_space_is_unknown() {
         use crate::wire::DiskSpace;
         let g = |n: u64| n << 30;
@@ -2287,6 +2350,8 @@ mod tests {
             sessions_active: 0,
             sessions_running: 0,
             inbox_open: 0,
+            egress: None,
+            monitor: None,
         };
         let warning = "! Low disk space: sessions will fail when the disk fills. Run `loom gc`.\n";
         // (free, total, low): under 5 GiB whatever the volume, under 5 percent whatever the bytes; neither at the line.
@@ -2325,6 +2390,7 @@ mod tests {
                 allowed,
                 rule: "default deny".into(),
                 resolved: None,
+                sni: None,
             },
         };
         let text = net_table(&[e(3_723_000, false), e(86_400_000 + 59_000, true)], &MONO);

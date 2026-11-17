@@ -291,6 +291,15 @@ pub fn scope_granted(hosts: &[String], note: Option<&str>) -> String {
     )
 }
 
+/// The operator withdrew network access to `host`; `reason` is the operator's.
+pub fn scope_revoked(host: &str, reason: &str) -> String {
+    let reason = reason.trim();
+    let why = if reason.is_empty() { String::new() } else { format!(" Operator's reason: {}", sentence(reason)) };
+    format!(
+        "The operator withdrew network access to {host}. Connections to it are cut and new ones are refused; do not look for another route to it. Work with the hosts that are still authorized.{why}"
+    )
+}
+
 /// The protected note recorded when the operator closes a mission short of its goal.
 pub fn released(reason: &str) -> String {
     format!(
@@ -494,6 +503,15 @@ pub fn job_arrival(
 pub fn inbox_answer(item_text: &str, answer: &str) -> String {
     let echoed = cut(&one_line(item_text), 240);
     format!("[The operator's answer to: {}]\n{answer}", loom_core::tagsafe::neutralize(&echoed))
+}
+
+/// The operator's own words in an `inbox_answer` message: the echoed header, which carries the agent's text, is
+/// dropped. A text that is not such a message is returned as it is.
+pub fn without_inbox_echo(text: &str) -> &str {
+    match text.strip_prefix("[The operator's answer to: ") {
+        Some(rest) => rest.split_once("]\n").map_or("", |(_, answer)| answer),
+        None => text,
+    }
 }
 
 /// The ledger answer of a question the operator dismissed without answering.
@@ -1108,6 +1126,23 @@ pub fn flag_candidate(handle: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_inbox_echo_header_is_not_the_operators_words() {
+        let m = inbox_answer("Am I authorized to use the Docker API on h510.lan?", "No.");
+        assert_eq!(without_inbox_echo(&m), "No.");
+        assert_eq!(without_inbox_echo("plain operator text"), "plain operator text");
+        assert_eq!(without_inbox_echo("[The operator's answer to: only a header"), "");
+    }
+
+    #[test]
+    fn a_scope_revoke_note_names_the_host_the_reason_and_that_there_is_no_other_route() {
+        let t = scope_revoked("api.example.test", " wrong target ");
+        assert!(t.contains("withdrew network access to api.example.test"), "{t}");
+        assert!(t.contains("Operator's reason: wrong target."), "{t}");
+        assert!(t.contains("do not look for another route"), "{t}");
+        assert!(!scope_revoked("a.test", "  ").contains("reason"));
+    }
 
     #[test]
     fn evidence_not_a_run_names_the_tool_for_analysis_and_reference_only() {

@@ -17,7 +17,11 @@
 //! with stdin `/dev/null`, stdout = `out_path` and stderr = `exit_path` (both created fresh: a
 //! leftover file of that name is removed first, never appended to), working directory `spec.cwd`,
 //! environment exactly `spec.env` (cleared first), and its
-//! own process group (`process_group(0)`). So `out_path` holds stdout and stderr of the command in
+//! own process group (`process_group(0)`). A sandboxed command (`Sandbox::nproc_limit`, set by
+//! `sandbox.nproc_headroom`; not a `spawn_launched` one) also has its RLIMIT_NPROC, soft and hard, lowered to that limit
+//! before it starts (`procinfo::set_nproc` in a `pre_exec` hook), so that nothing it starts can fill the user's process
+//! table: the daemon, whose own limit is higher, can still fork the processes that stop it. When the user already
+//! holds as many processes as that limit, `spawn` is an error that says what to do and starts nothing. So `out_path` holds stdout and stderr of the command in
 //! the order they were written, and `exit_path` ends up holding the status as a decimal number.
 //! Anything else in `exit_path` (the sandbox launcher or the shell complaining) means the command did
 //! not start properly: [`Ended::Failed`] carries that text.
@@ -38,6 +42,11 @@
 //! which. It never kills anything.
 //!
 //! ## Process groups
+//! Who is in a group, and in what state, is read from the kernel's tables (`procinfo`: libproc on macOS, `/proc` on
+//! Linux). No process is started to look: `/bin/ps` is never run, so a full process table does not blind the harness
+//! and polling costs no fork. A group state the kernel would not give is `Unknown`. A command that has run for 10 s
+//! is looked at every 200 ms instead of every 50.
+//!
 //! A command is not over while its group has live members. `poll` and `wait` report the leader;
 //! `group_alive` and `wait_group` look at the whole group. Once the leader has ended and the group has
 //! been seen empty the command is over for good: its group id may be reused, so it is never probed or
@@ -59,7 +68,10 @@
 //! then reports. Safe to call after the leader exits while descendants remain: a group that outlived
 //! its leader is stopped all the same. A persisted owner marker (an inert argument of the wrapper,
 //! kept beside the status file) refuses a replacement leader when adopting an old pid; an
-//! uninspectable group is never signalled blindly and is reported as [`Ended::TrackingFailed`].
+//! group whose state is `Unknown` (the kernel's tables could not be read) is still signalled, unless its recorded
+//! leader is known to have been replaced (its start time was read at spawn and the pid now has another); a group
+//! that is signalled and then cannot be confirmed gone, and a group that was replaced, is reported as
+//! [`Ended::TrackingFailed`] and keeps its pid record (`jobs` leaves it for the next start to clear).
 //! On a command that has already ended it does nothing.
 //! `terminate_within(grace, max_bytes)` also ends the grace period as soon as the output file passes
 //! `max_bytes`, so that a command which ignores TERM cannot write through it.
@@ -85,10 +97,16 @@
 //! Tests required (real processes, `Sandbox` in mode `none`, everything under a `tempfile` dir):
 //! exit 0 and non-zero; stdout/stderr interleaved in order; a command killed by a signal; a command
 //! that does not exist (exit 127); `wait` ending by deadline, by cancel and by size; `terminate`
-//! kills a whole tree (`sleep 300 & sleep 300 & wait`) and a process that ignores TERM; environment
+//! kills a whole tree (`sleep 300 & sleep 300 & wait`) and a process that ignores TERM; a group the kernel's table
+//! would not list is still stopped, and an adopted one is refused only when its leader was replaced
+//! (`a_group_that_cannot_be_inspected_is_still_stopped`,
+//! `an_unreadable_table_signals_an_adopted_group_unless_its_leader_was_replaced`); in a process that cannot fork at all
+//! a command started earlier is still found and stopped (`a_full_process_table_does_not_stop_a_command_from_being_stopped`);
+//! a command that forks until it cannot stops at its limit (`a_command_cannot_fill_the_process_table`); environment
 //! is exactly what was given; cwd; output readable incrementally while running; `adopt` of a running
 //! command sees it end and reads its status; scripts with quotes, newlines and `$` reach bash intact.
 
+use crate::procinfo;
 use crate::sandbox::Sandbox;
 use std::collections::BTreeMap;
 use std::io;
@@ -106,6 +124,9 @@ const WRAPPER: &str = "/bin/bash -c \"$0\" 2>&1; echo $? >&2";
 /// Runs the launcher's program and arguments (`$@`, an inert owner marker is `$0`) and then appends the
 /// exit status, as `WRAPPER` does. The arguments are never parsed by this shell.
 const LAUNCH_WRAPPER: &str = "\"$@\" 2>&1; echo $? >&2";
+
+/// A command that has run this long is looked at less often (every 200 ms instead of every 50).
+const LONG_WAIT: Duration = Duration::from_secs(10);
 
 /// How long `terminate` waits for the leader and group to disappear after KILL.
 const KILL_SETTLE: Duration = Duration::from_secs(5);
@@ -270,30 +291,7 @@ pub fn pid_path(out_path: &Path) -> PathBuf {
 /// The start time of process `pid` as the OS reports it (text, comparable only with itself), or `None`
 /// when it cannot be read or the process is gone.
 pub fn process_start(pid: u32) -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let p = i32::try_from(pid).ok()?;
-        let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-        // SAFETY: proc_bsdinfo is plain integers, for which all-zero is a valid value.
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        // SAFETY: the buffer is `size` bytes of a live, exclusively borrowed struct.
-        let n = unsafe {
-            libc::proc_pidinfo(p, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size)
-        };
-        (n == size).then(|| format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        // Field 22 (start time in ticks); fields after the parenthesised name begin at field 3.
-        let rest = stat.rsplit_once(')')?.1;
-        rest.split_whitespace().nth(19).map(str::to_string)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = pid;
-        None
-    }
+    procinfo::start_of(pid)
 }
 
 /// What a pid record says about a command's process group.
@@ -391,39 +389,10 @@ fn pgid_of(pid: u32) -> Option<u32> {
     u32::try_from(unsafe { libc::getpgid(p) }).ok()
 }
 
-/// The pids of the processes in group `pgid`, as far as the OS lists them.
-fn group_pids(pgid: u32) -> Vec<u32> {
-    #[cfg(target_os = "macos")]
-    {
-        const MAX_PIDS: usize = 1024;
-        let Some(pg) = target(pgid) else { return Vec::new() };
-        let mut buf: [libc::pid_t; MAX_PIDS] = [0; MAX_PIDS];
-        let bytes = i32::try_from(std::mem::size_of_val(&buf)).unwrap_or(0);
-        // SAFETY: the buffer is `bytes` bytes of live, exclusively borrowed integers.
-        let n = unsafe { libc::proc_listpgrppids(pg, buf.as_mut_ptr().cast(), bytes) };
-        let n = usize::try_from(n).unwrap_or(0).min(MAX_PIDS);
-        buf.iter().take(n).filter_map(|p| u32::try_from(*p).ok()).filter(|p| target(*p).is_some()).collect()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
-        entries
-            .flatten()
-            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-            .filter(|pid| pgid_of(*pid) == Some(pgid))
-            .collect()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = pgid;
-        Vec::new()
-    }
-}
-
 /// The live processes of group `pgid` with their start times: what identifies a group whose leader is gone.
 fn group_members(pgid: u32) -> Vec<(u32, String)> {
     let mut members: Vec<(u32, String)> =
-        group_pids(pgid).into_iter().filter_map(|pid| Some((pid, process_start(pid)?))).collect();
+        procinfo::group(pgid).unwrap_or_default().into_iter().filter(|p| !p.zombie).map(|p| (p.pid, p.start)).collect();
     members.sort();
     members.truncate(MAX_RECORDED_MEMBERS);
     members
@@ -586,63 +555,54 @@ fn new_owner(spec: &Spawn) -> String {
     format!("loom-owner-{}", loom_core::sha256_hex(nonce.as_bytes()))
 }
 
-/// `kill(-pgid, 0)` counts unreaped zombies. Query only ids and states until a live group leader
-/// needs an ownership check; other processes' command lines are never read.
+/// `kill(-pgid, 0)` counts unreaped zombies. The kernel's tables (`procinfo`: no process is started) say who
+/// is in the group and in what state; the leader's argument vector is read only when a live group leader
+/// needs an ownership check. `Unknown` is a table the kernel would not give.
 fn group_state(pgid: u32, owner: Option<&str>, own_leader: bool) -> GroupState {
     if !group_alive(pgid) {
         return GroupState::Gone;
     }
-    let output =
-        match std::process::Command::new("/bin/ps").args(["-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="]).output() {
-            Ok(output) if output.status.success() => output,
-            _ => return GroupState::Unknown,
-        };
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut live = false;
-    let mut leader = false;
-    for line in text.lines() {
-        let mut fields = line.split_whitespace();
-        let pid = fields.next().and_then(|p| p.parse::<u32>().ok());
-        let group = fields.next().and_then(|p| p.parse::<u32>().ok());
-        let state = fields.next();
-        if group == Some(pgid) && state.is_some_and(|s| !s.starts_with('Z')) {
-            live = true;
-            leader |= pid == Some(pgid);
-        }
+    let Some(members) = procinfo::group(pgid) else { return GroupState::Unknown };
+    // The kernel says the group is alive and no member can be listed: the table is not telling, which is not "gone".
+    if members.is_empty() {
+        return GroupState::Unknown;
     }
-    if !live {
+    if members.iter().all(|m| m.zombie) {
         return GroupState::Gone;
     }
+    let leader = members.iter().any(|m| m.pid == pgid && !m.zombie);
     if !leader || own_leader {
         return GroupState::Live;
     }
     let Some(owner) = owner else { return GroupState::Replaced };
-    // A leader that is exiting can briefly show no (or a partial) command line, so a mismatch is
-    // confirmed by a second look before it is believed.
+    // A leader that is exiting can briefly show no command line, so a mismatch is confirmed by a second
+    // look before it is believed.
+    let mut unreadable = false;
     for attempt in 0..2 {
-        let args = match std::process::Command::new("/bin/ps")
-            .args(["-ww", "-p", &pgid.to_string(), "-o", "stat=", "-o", "command="])
-            .output()
-        {
-            Ok(output) if output.status.success() => output,
-            // The wrapper can disappear between the membership snapshot and this lookup. A missing
-            // leader cannot be a replacement leader; the next poll checks remaining members again.
-            _ if !process_alive(pgid) => return GroupState::Live,
-            _ => return GroupState::Unknown,
-        };
-        let text = String::from_utf8_lossy(&args.stdout);
-        let mut fields = text.split_whitespace();
-        // A leader can exit after the membership snapshot: zombies have no original argv, and do not
-        // mean its pid was reused. The next poll inspects any remaining live descendants.
-        match fields.next() {
-            None => return GroupState::Live,
-            Some(state) if state.starts_with('Z') => return GroupState::Live,
-            Some(_) if fields.any(|argument| argument == owner) => return GroupState::Live,
-            Some(_) if attempt == 0 => std::thread::sleep(Duration::from_millis(30)),
-            Some(_) => {}
+        match procinfo::info(pgid) {
+            // The wrapper can disappear between the membership snapshot and this lookup. A missing leader
+            // cannot be a replacement leader; the next poll checks the remaining members again. A zombie
+            // has no original argv, and does not mean its pid was reused.
+            None if !process_alive(pgid) => return GroupState::Live,
+            Some(leader) if leader.zombie => return GroupState::Live,
+            _ => {}
+        }
+        match procinfo::command_line(pgid) {
+            Some(line) if line.args.iter().any(|argument| argument == owner) => return GroupState::Live,
+            Some(_) => unreadable = false,
+            None => unreadable = true,
+        }
+        if attempt == 0 {
+            std::thread::sleep(Duration::from_millis(30));
         }
     }
-    GroupState::Replaced
+    // A command line the kernel would not give is not a different one: the group cannot be told from a
+    // replacement, which is not the same as being one.
+    if unreadable {
+        GroupState::Unknown
+    } else {
+        GroupState::Replaced
+    }
 }
 
 fn signal_group(pgid: u32, sig: i32) {
@@ -679,6 +639,11 @@ enum How<'a> {
 }
 
 fn spawn_with(how: How<'_>, spec: &Spawn) -> io::Result<Running> {
+    // Asked first: a command that cannot be given room leaves nothing behind.
+    let nproc = match &how {
+        How::Sandboxed(sandbox) => sandbox.nproc_limit().map_err(io::Error::other)?,
+        How::Launched(_) => None,
+    };
     let pid_file = pid_path(&spec.out_path);
     for stale in [&spec.out_path, &spec.exit_path, &pid_file, &owner_path(&spec.exit_path)] {
         remove_stale(stale)?;
@@ -715,6 +680,12 @@ fn spawn_with(how: How<'_>, spec: &Spawn) -> io::Result<Running> {
         .stderr(Stdio::from(exit))
         .process_group(0)
         .kill_on_drop(false);
+    if let Some(limit) = nproc {
+        // SAFETY: the hook only calls setrlimit(2), which is safe between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || procinfo::set_nproc(limit));
+        }
+    }
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -930,7 +901,11 @@ impl Running {
             if self.output_len() > max_bytes {
                 return WaitEnd::TooMuchOutput;
             }
-            let step = Duration::from_millis(if elapsed < Duration::from_secs(1) { 25 } else { 50 });
+            let step = Duration::from_millis(match elapsed {
+                e if e < Duration::from_secs(1) => 25,
+                e if e < LONG_WAIT => 50,
+                _ => 200,
+            });
             tokio::select! {
                 () = cancel.cancelled() => {}
                 () = tokio::time::sleep(step) => {}
@@ -1006,7 +981,26 @@ impl Running {
                 signal_group(self.pid, signal);
                 true
             }
+            // A table the kernel would not give does not stop a command that must stop (a fork bomb is
+            // what fills it): the group is signalled unless its leader is known to be another process.
+            GroupState::Unknown if !self.leader_replaced() => {
+                signal_group(self.pid, signal);
+                true
+            }
             GroupState::Replaced | GroupState::Unknown => false,
+        }
+    }
+
+    /// Whether the leader recorded at spawn has been replaced by another process under the same id: its
+    /// start time was read and is not the one the pid has now. A child of this process cannot be replaced
+    /// while it is unreaped.
+    fn leader_replaced(&self) -> bool {
+        if self.child.is_some() {
+            return false;
+        }
+        match (self.start.as_deref(), process_start(self.pid)) {
+            (Some(recorded), Some(now)) => recorded != now,
+            _ => false,
         }
     }
 
@@ -1166,6 +1160,136 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the wrapper did not exit");
+    }
+
+    /// A group that cannot be inspected is still signalled (the kernel's table refused: the thread-local
+    /// stands for that), and a command that is the child of this process is never taken for a replacement.
+    #[tokio::test]
+    async fn a_group_that_cannot_be_inspected_is_still_stopped() {
+        let f = fx();
+        let pids = f.root.join("tmp/pids");
+        let mut running = f.start(&format!(
+            "sleep 300 & echo $! >> {}; sleep 300 & echo $! >> {}; wait",
+            pids.display(),
+            pids.display()
+        ));
+        let members = read_pids(&pids, 2).await;
+        procinfo::UNREADABLE.with(|u| u.set(true));
+        assert_eq!(group_state(running.pid, running.owner.as_deref(), true), GroupState::Unknown);
+        let ended = running.terminate(Duration::from_millis(300)).await;
+        procinfo::UNREADABLE.with(|u| u.set(false));
+        assert!(!matches!(ended, Ended::TrackingFailed(_)), "{ended:?}");
+        assert_gone(&members).await;
+        assert!(!group_alive(running.pid));
+    }
+
+    /// An adopted command (nothing here owns its pid) is signalled on an unreadable table unless its recorded
+    /// leader is known to have been replaced.
+    #[tokio::test]
+    async fn an_unreadable_table_signals_an_adopted_group_unless_its_leader_was_replaced() {
+        let f = fx();
+        let pids = f.root.join("tmp/pids");
+        let mut first = f.start(&format!("sleep 300 & echo $! >> {}; wait", pids.display()));
+        let members = read_pids(&pids, 1).await;
+        let (pid, start) = (first.pid, first.start.clone());
+        first.disarm();
+        let cleanup = GroupCleanup::for_running(&first);
+        // Another process's pid record: the leader's start time differs from the process that has the id.
+        let mut replaced = Running::adopt(pid, f.root.join("out"), f.root.join("exit"), 0);
+        replaced.start = Some("1.000000".to_string());
+        procinfo::UNREADABLE.with(|u| u.set(true));
+        let refused = replaced.signal(libc::SIGKILL);
+        // procinfo is unreadable here, so a start time cannot be compared: the record cannot say "replaced".
+        let mut adopted = Running::adopt(pid, f.root.join("out"), f.root.join("exit"), 0);
+        adopted.start = start;
+        let sent = adopted.signal(libc::SIGKILL);
+        procinfo::UNREADABLE.with(|u| u.set(false));
+        assert!(refused && sent, "an unreadable table must not stop a group from being signalled");
+        drop(cleanup);
+        assert_gone(&members).await;
+        // With the table readable, the replaced record is refused and nothing is signalled.
+        let mut second = f.start(&format!("sleep 300 & echo $! >> {}; wait", f.root.join("tmp/pids2").display()));
+        let members = read_pids(&f.root.join("tmp/pids2"), 1).await;
+        second.disarm();
+        let cleanup = GroupCleanup::for_running(&second);
+        // No owner marker of its own: the pid cannot be told from another process's but by its start time.
+        let mut stale = Running::adopt(second.pid, f.root.join("stale-out"), f.root.join("stale-exit"), 0);
+        stale.start = Some("1.000000".to_string());
+        assert!(stale.leader_replaced());
+        assert!(!stale.signal(libc::SIGKILL), "a group whose leader was replaced is never signalled");
+        assert!(members.iter().all(|p| alive(*p)));
+        drop(cleanup);
+        assert_gone(&members).await;
+    }
+
+    /// Inspecting and stopping a group starts no process: in a process that may not fork at all, a command
+    /// started earlier is still found and stopped. (The inner test runs in a child process of the test binary,
+    /// whose process limit is lowered; the outer one runs it.)
+    #[test]
+    fn a_full_process_table_does_not_stop_a_command_from_being_stopped() {
+        if std::env::var_os("LOOM_TEST_NO_FORK_ROOM").is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("the test binary");
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "proc::tests::inspection_and_kill_without_fork_room", "--nocapture", "--test-threads=1"])
+            .env("LOOM_TEST_NO_FORK_ROOM", "1")
+            .output()
+            .expect("run the inner test");
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn inspection_and_kill_without_fork_room() {
+        if std::env::var_os("LOOM_TEST_NO_FORK_ROOM").is_none() {
+            return;
+        }
+        let f = fx();
+        let pids = f.root.join("tmp/pids");
+        let mut running = f.start(&format!("sleep 300 & echo $! >> {}; wait", pids.display()));
+        let members = read_pids(&pids, 1).await;
+        // No process may be made from here on.
+        procinfo::set_nproc(1).expect("lower the limit");
+        assert!(std::process::Command::new("/usr/bin/true").spawn().is_err(), "a process could still be started");
+        assert!(running.group_alive());
+        assert_eq!(group_state(running.pid, running.owner.as_deref(), true), GroupState::Live);
+        let ended = running.terminate(Duration::from_millis(300)).await;
+        assert!(!matches!(ended, Ended::TrackingFailed(_)), "{ended:?}");
+        assert_gone(&members).await;
+        assert!(!group_alive(running.pid));
+    }
+
+    /// A sandboxed command's RLIMIT_NPROC leaves the daemon room: a loop that forks until it cannot stops at the
+    /// limit, with the shell's own sentence, and the group is stopped afterwards.
+    #[tokio::test]
+    async fn a_command_cannot_fill_the_process_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical");
+        for d in ["ws", "tmp", "home"] {
+            std::fs::create_dir_all(root.join(d)).expect("mkdir");
+        }
+        // A headroom that leaves the command 300 processes beyond the ones this user has now.
+        let base = procinfo::nproc_base().expect("a base limit");
+        // SAFETY: geteuid takes no arguments.
+        let mine = procinfo::user_tasks(unsafe { libc::geteuid() }).expect("the user's processes");
+        let headroom = u32::try_from(base.saturating_sub(mine).saturating_sub(300)).expect("headroom");
+        let cfg = SandboxCfg { mode: SandboxMode::None, nproc_headroom: headroom, ..SandboxCfg::default() };
+        let sb = Sandbox::new(&cfg, &root.join("ws"), &root.join("tmp"), &root.join("home"), None).expect("sandbox");
+        let limit = sb.nproc_limit().expect("room").expect("a limit");
+        assert!(limit <= base.saturating_sub(u64::from(headroom)).max(1));
+        let f = Fx { _dir: dir, root, sb };
+        let mut running = f.start("for i in $(seq 1 400); do /bin/sleep 60 & done; wait");
+        let end = running.wait(&never(), Some(Duration::from_secs(20)), u64::MAX).await;
+        let out = String::from_utf8_lossy(&running.read_output(0).expect("output")).to_string();
+        let ended = running.terminate(Duration::from_millis(300)).await;
+        assert!(!matches!(ended, Ended::TrackingFailed(_)), "{ended:?}");
+        assert!(out.contains("Resource temporarily unavailable"), "{end:?}: {out}");
+        // The default leaves a 256 headroom and a configured 0 sets nothing.
+        let cfg = SandboxCfg { mode: SandboxMode::None, nproc_headroom: 0, ..SandboxCfg::default() };
+        let none =
+            Sandbox::new(&cfg, &f.root.join("ws"), &f.root.join("tmp"), &f.root.join("home"), None).expect("sandbox");
+        assert_eq!(none.nproc_limit(), Ok(None));
     }
 
     #[tokio::test]
@@ -1523,8 +1647,15 @@ mod tests {
     async fn once_the_leader_has_exited_the_pid_record_names_who_is_in_the_group() {
         let f = fx();
         let p = f.pidfile();
-        // A subshell outlives the leader for a second, starts a long sleep and exits.
-        let mut r = f.start(&format!("(sleep 1; sleep 300 & echo $! >> {p}) & echo $! >> {p}", p = p.display()));
+        // A subshell outlives the leader until the test lets it go, then starts a long sleep and exits. The go file,
+        // not a fixed delay, orders the first refresh before the long sleep: on a loaded machine a refresh more than a
+        // second late would record the subshell and the sleep together, and the live sleep would keep that record.
+        let go = f.root.join("go");
+        let mut r = f.start(&format!(
+            "(while [ ! -e {go} ]; do sleep 0.05; done; sleep 300 & echo $! >> {p}) & echo $! >> {p}",
+            go = go.display(),
+            p = p.display()
+        ));
         assert_eq!(finish(&mut r).await, Ended::Exit(0));
         let path = pid_path(&r.out_path);
         assert!(read_pid_record(&path).expect("record").members.is_empty());
@@ -1535,6 +1666,7 @@ mod tests {
         assert!(record.members.contains(&(subshell, process_start(subshell).expect("start"))), "{record:?}");
 
         // When the recorded members are gone and the group is not, the record names who is in it now.
+        std::fs::write(&go, b"").expect("go");
         let sleeper = read_pids(&p, 2).await[1];
         let want = vec![(
             u32::try_from(sleeper).expect("pid"),

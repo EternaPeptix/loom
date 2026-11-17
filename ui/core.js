@@ -807,6 +807,18 @@ export function diskWarning(disk) {
   return `Low disk space: ${gib(free)} free of ${gib(disk.total_bytes)}. Sessions will fail when the disk fills; run "loom gc" or free space.`;
 }
 
+/**
+ * The banner for the sandbox self-probe's egress state (`status.egress`): a sentence when egress is unbounded (a
+ * command may reach the network outside the egress proxy), else null (bounded, not probed yet, or an older daemon).
+ */
+export function egressWarning(egress) {
+  if (!egress || egress.level !== "unbounded") return null;
+  const reasons = Array.isArray(egress.reasons) ? egress.reasons : [];
+  const first = reasons.length ? reasons[0] : "see the self-probe in `loom status`";
+  const more = reasons.length > 1 ? ` (+${reasons.length - 1} more)` : "";
+  return `Egress is unbounded: ${first}${more} Commands may reach the network outside the egress proxy, and keep-going cannot be turned on.`;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Inbox
 

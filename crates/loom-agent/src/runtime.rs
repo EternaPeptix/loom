@@ -110,18 +110,34 @@
 //!     the sandbox `child_copy` builds for commands run in an agent's copy uses the port of the session
 //!     whose environment those commands get, `proxy.session_port(..)`, and `None` when it holds no grant), then
 //!     `.with_jobs_dir(<session dir>/jobs)` (commands' own output files are there: their metadata can be read,
-//!     not their content; `child_copy` uses the parent's), with the config's `SandboxCfg`; for a role with
+//!     not their content; `child_copy` uses the parent's) and `.with_identity(<session id>)` (`child_copy`: the
+//!     parent's, whose environment and commands they are; the census finds a session's processes, `crate::census`),
+//!     with the config's `SandboxCfg`; for a role with
 //!     `read_only`, `extra_writable` is retained as internal
 //!     replay-untrusted metadata before its grants are emptied, and the
 //!     workspace is added to `protected_paths`; every model profile's `api_key_env` name is added to
-//!     `secret_env`, so commands never see it. `Runtime::start` sets `config.sandbox.network_deny_all` to
-//!     whether `network.mode` is `deny_all` before anything is built from the configuration, so every
-//!     sandbox it makes (sessions, agents' copies, judges) has it; `daemon_port` is whatever the caller set
-//!     (the daemon's port; `None` without one).
+//!     `secret_env`, so commands never see it. The fetch-service deny and the `mach-lookup` default-deny are in
+//!     every sandbox it makes (sessions, agents' copies, judges), in every `network.mode`, unless the
+//!     configuration says `sandbox.allow_fetch_services` (`docs/MONITOR.md` §2.2, E2); `daemon_port` is whatever
+//!     the caller set (the daemon's port; `None` without one).
 //!   - `env`: the session's proxy grant (`proxy.grant(id, policy)`), `env()`. The policy is
 //!     `Policy::with_hosts(&config.network, granted)`, `granted` being the hosts the operator authorized
 //!     for the mission (`grant_scope`): the ledger's `granted_hosts()` and those granted since the daemon
 //!     started and not yet recorded, so that a restored session keeps its authorizations.
+//!     The policy then has the infrastructure deny (E1): `with_infrastructure(infra_spec(&config))`: the
+//!     daemon's port (`sandbox.daemon_port`), the `host:port` of every model profile's `base_url` (those of the
+//!     start-up configuration, of the live set, and of every profile a reload made live since the start, kept after
+//!     a later reload removes or changes it: `Inner::infra_config`), the box's
+//!     `ssh_host` when the box is enabled, and `network.infrastructure`; `Runtime::start` parses them once
+//!     and refuses to start on an entry it cannot read (`The network configuration cannot be used: …`). The
+//!     spec also carries what `crate::infra` resolved (the box's Docker host from `ssh -G`, the addresses of
+//!     every named entry, this machine's own addresses), at start and every `RESOLVE_EVERY`; a `box.ssh_host`
+//!     of the form `user@host` or `ssh://user@host:2222` is reduced to its host, and one whose host the policy
+//!     cannot read is left out with a warning. `Runtime::start` sets `config.sandbox.infra_ports` (the loopback
+//!     ports of model endpoints and `network.infrastructure`, `crate::infra::loopback_ports`); `sandbox_cfg_for`
+//!     adds those of the endpoints of the profiles `Inner::infra_config` holds, when the sandbox is made: a running
+//!     session's sandbox keeps the ports it was made with.
+//!     Hosts the operator revoked in this run (`revoke_scope`) are left out of `granted_hosts`.
 //!     Every session gets a grant, also under `deny_all` (in-process fetches go through the proxy
 //!     too, so the policy is what refuses them).
 //! - `job_events`: the receiver of the job table's channel; `sink`: the runtime; `control`: new.
@@ -147,7 +163,8 @@
 //!    folders were made (`build`, the start record, `Session::create`, `meta.json`) removes them again
 //!    (`MadeWorkspace::undo`, `remove_dir`, so nothing that holds files is deleted). The log records nothing extra.
 //!    Role: `packs.role(pack, role)`.
-//!    Profile: `config.profile(model)`.
+//!    Profile: `config.profile(model)`; a profile with `purpose = "review"` is refused (`The model profile "{p}" has
+//!    purpose = "review": it is a reviewer's, …`), since a mission led by it would run unreviewed.
 //! 2. Model facts: `client.discover()` once per profile (the first success with a window is
 //!    remembered; a discovery that finds no window refuses the creation and is not remembered). On
 //!    `Unavailable`, carry on with the profile's `model` and `context_window` (logged as coming from
@@ -166,7 +183,9 @@
 //!    named. They are read before the session and a missing workspace are made (`prior::read` on a blocking
 //!    thread, the lead's meta giving the title) and `meta.prior` keeps them in the given order.
 //! 4. `SessionStart{session, mission, parent: None, workspace, pack, role, termination,
-//!    model: ModelRef{profile, model, context_window}, reasoning_replay (profile),
+//!    model: ModelRef{profile, model, context_window, lineage: `lineage::resolve_served` of the profile and the served
+//!    model id (family, alignment, recipient and where each came from; an undeclared family covers the configured id and the
+//!    served one).}, reasoning_replay (profile),
 //!    system_prompt: pack::system_prompt(role, &pack.preamble, &PromptEnv{workspace,
 //!    platform: "{OS} ({ARCH})" from std::env::consts, sandbox: sandbox.describe(),
 //!    network: texts::network_sentence(mode, allow, deny, allow_private)}), tools: empty,
@@ -196,6 +215,11 @@
 //!   A fork selecting a different profile is refused. Distinct verifier profile checks compare names,
 //!   not model families. Discovery and limiter selection follow the chosen profile.
 //! - a request with `harness: true` (the finish gate's verifier) is exempt from both of the last two rules.
+//! - whatever selected the profile (the mission's choice, the pack, the lead's own), `harness` requests included, one
+//!   with `purpose = "review"` in the live set is refused (`The model profile "{p}" has purpose = "review": it is a
+//!   reviewer's, and agents started on it would run unreviewed. …`). `set_role_model` and `reload_models` refuse to make such a choice,
+//!   but `Runtime::start` checks no saved `role_models`: a restart onto a config that turned a chosen profile into
+//!   a reviewer's is caught here, and the choice stays until the operator changes it (`loom models role`).
 //! - the actual child role's `requires_credential` requires explicit matching asset/credential IDs from
 //!   the parent's mission. Missing, unattested, wrong-asset and expired observations refuse dispatch
 //!   before allocation, including harness requests. Canonical IDs are persisted in the brief context.
@@ -351,6 +375,25 @@
 //! grant is revoked. Every decision it reports is
 //! appended to the session's `net.jsonl` and published as [`BusEvent::Net`]. Decisions that name no
 //! session are appended to `logs/net-unattributed.jsonl`.
+//! The floor's controls are put into it at start (`crate::floor::Floor::install`, E4): the synchronous veto, the
+//! canary hook and the lab-listener check; `Runtime::floor()` is the handle (canary users and hosts, the events).
+//! `Runtime::cut_mission(mission)` ends the open tunnels and forwards of every session of a mission
+//! (`Proxy::cut_sessions`) and returns how many. The infrastructure policy the veto asks is rebuilt whenever the
+//! daemon resolves its infrastructure names again (every `infra::RESOLVE_EVERY`). A floor event of severity S4
+//! (a decoy credential or host) or S3 (an infrastructure attempt, a squatted lab port) raises a notification of
+//! kind `floor` (`LOOM_KIND=floor`, `LOOM_SESSION` the attributed session or empty), at most once per label (S4) or
+//! per kind and session (S3) every 10 minutes. Every floor event is also appended, one JSON line, to
+//! `logs/floor.jsonl` (synced before the hook that raised it answers), where the monitor reads it by cursor. The
+//! lab-listener check is given the connecting session, the address and the local end of the connection, and leaves
+//! out the processes of the session's own mission; the proxy is told this machine's interface addresses
+//! (`Proxy::set_local_addrs`, refreshed with the infrastructure) so that the check also covers them.
+//!
+//! ## Box counters
+//! Every `BOX_COUNTERS_EVERY` (60 s, not under test) the runtime reads the rule counters of each mission box it has a
+//! handle for (`MissionBox::poll_counters`), warns when a DROP rule counted, and appends one line per mission that
+//! moved to `logs/box-counters.jsonl`: `{"ts_ms", "mission", "chain", "rules": [{"rule", "packets", "bytes",
+//! "drop"}]}` with the deltas since the last poll. A box that cannot be read is logged once until it can be again.
+//! `Runtime::box_counters_now()` polls and records now and returns the deltas.
 //!
 //! ## Notifying the operator
 //! For every `inbox_opened` and every `End::Fatal`. `kind` is the inbox kind in snake case
@@ -372,6 +415,18 @@
 //! - Low disk: when the volume of the loom home turns low ([`disk_is_low`]: under `LOW_DISK_BYTES` or
 //!   `LOW_DISK_PERCENT` free; checked once a minute, off the async workers) one notification of kind
 //!   `disk` is raised, and no other until the disk has recovered and turned low again.
+//! - Egress: when the sandbox self-probe (`crate::egress`) turns egress unbounded one notification of kind `egress` is
+//!   raised, and no other until it was bounded again; a problem the probe finds (a leak, a probe that cannot run,
+//!   the resolver's socket) is told once too, even while `sandbox.allow_fetch_services` already holds egress
+//!   unbounded, and again only after it cleared. `LOOM_KIND` is `egress` and `LOOM_SESSION` is empty.
+//! - Census (`crate::census`, `docs/MONITOR.md` §2.2, E3): every 60 s (not under test) the daemon finds the
+//!   processes of its non-archived sessions by sandbox identity, keeps the view (`census()`; `census_now()` takes
+//!   one), and logs once a warning for each process an ended (finished or stopped) session left running, however long
+//!   the process had been running before. `census_kill(session)` stops what the census finds for one session and its
+//!   known process groups (`There is no session …` for an id that is not known; an error when the process table could
+//!   not be read). Nothing is stopped by the periodic census. A census that runs without sandbox identity although
+//!   commands are confined is logged and notified once (kind `census`). Archiving stops, once the family's tasks
+//!   have ended, what the sessions left running by sandbox identity (an archived session is not in the census).
 //! - At start, every restored open blocking item is notified once (`Still waiting: {text}`) and its
 //!   repeat notice is armed as for a live one.
 //!
@@ -400,6 +455,29 @@
 //!   state block then lists it), and a protected note in the lead's window. No turn is started.
 //!   The answer is a [`RuleReceipt`]: the lead, whether it was in a turn (`queued`), whether the
 //!   mission keeps a ledger, and the stock text when one was used.
+//! - `grant_scope` refuses a host that infrastructure refuses (`Policy::infrastructure_refusal`: a literal
+//!   address of a model endpoint, the box's Docker host, cloud metadata, DevTools or Docker API ports on this
+//!   machine; `The host `{h}` is infrastructure …`) and grants nothing of the list; it reaches every known session
+//!   of the mission, not only the active ones, and bumps the mission's `scope_gen`.
+//! - `revoke_scope(mission, host, reason)`: the operator withdraws one granted host (exactly as granted, case
+//!   ignored). Blank host or reason refused with a sentence saying what to write; a mission without a lead
+//!   or a host that is not granted refused (the sentence lists the granted hosts, and names the wildcard grant
+//!   that covers the host when there is one: revoke that). In order: the revoke is
+//!   appended to the mission's journal as `ScopeRevoke` when the ledger lists the host as granted (a mission
+//!   without a ledger skips this; a grant the lead has not recorded yet, still queued on disk, is revoked
+//!   without a record and the receipt says `recorded: false`; revoking the host again once the lead has recorded
+//!   the grant records it; any journal failure refuses the call and changes nothing); the host leaves the
+//!   in-memory grants and the mission's revoked hosts (`<mission dir>/scope_revoked.json`, written durably, read
+//!   at start; `scope_revoked` in memory) keep it out of `granted_hosts` until granted again (`grant_scope` of it
+//!   clears that) — also after a restart, whatever the ledger says of a grant recorded later. Every session of
+//!   the mission that is known, started or being started, gets its rebuilt policy through `Proxy::set_policy`,
+//!   which refuses the revoked host whatever else allows it (`Policy::with_revoked`: `deny revoked {host}`: a
+//!   wildcard grant, `network.allow` and `mode open` do not reach it), and `Proxy::cut_hosts` ends its open
+//!   connections to the host; a session that is built while this runs derives its policy again when the
+//!   mission's grants changed meanwhile (`scope_gen`); the box rules are applied again; a running
+//!   lead gets `Input::ScopeRevoked` (a protected note, no turn). Receipt: [`ScopeRevokeReceipt`]. A policy
+//!   that cannot be rebuilt for a session is an error naming it, after everything else was done; a revoke
+//!   that is not recorded and could not be saved says that a restart undoes it.
 //! - `stop(id)`: any session. Active: `control.stop_turn()` and `Input::Stop`. Not active: nothing.
 //! - `resume(id)`: root only; activate; `Input::Resume` to it and to each of its unsettled children
 //!   that a restart left idle and that have not been resumed since (activating them): each gets one
@@ -420,12 +498,15 @@
 //!   task applies it between steps and records `model_switched{reason: operator}`); a session without a
 //!   task records it when it is next opened. Publishes a `session` event. Its agents keep their models.
 //!   The receipt says whether a task took it (`live`). A lead whose pack wants the finish gate's
-//!   verifier on another profile is refused the profile chosen for that verifier.
+//!   verifier on another profile is refused the profile chosen for that verifier. A profile with
+//!   `purpose = "review"` is refused (`… it is a reviewer's, and a session switched to it would run
+//!   unreviewed. …`).
 //! - `set_role_model(id, role, profile, now)`: any session of the mission (acts on its lead); refused
 //!   for an archived mission (`This session is archived; unarchive it first.`). `role` is one the lead
 //!   starts (`may_spawn`, then the finish gate's verifier) or `*` (every role without a choice of its
 //!   own, not the verifier); otherwise refused naming the roles (a lead that starts none: `A {role}
-//!   lead starts no agents…`). A `profile` must be in the live set, and the verifier's may not be the
+//!   lead starts no agents…`). A `profile` must be in the live set and not have `purpose = "review"`
+//!   (`… agents started on it would run unreviewed. …`), and the verifier's may not be the
 //!   lead's when the pack wants them distinct; `None` clears the choice. Under `model_changes`: the
 //!   lead's `meta.role_models` in memory, then `meta.json` (memory restored if the write fails), then a
 //!   `session` event. With `now` and a profile: each of the lead's agents the choice covers that has
@@ -434,17 +515,29 @@
 //!   and carries the mission's models as `mission_models` reads them.
 //! - `reload_models()`: reads the configuration file again and replaces the live `[models]` and
 //!   `default_model`, without a restart; nothing else in the file is reread. Refused, changing
-//!   nothing, when the file does not load, it has no `[models]`, or `Packs::check_profiles` fails. A
+//!   nothing, when the file does not load, it has no `[models]`, `Packs::check_profiles` fails (a pack
+//!   role naming a missing profile or one with `purpose = "review"`), or a profile that has `purpose =
+//!   "review"` in the file is the profile of a session that has not ended or a mission's `role_models`
+//!   choice (archived ones included). A
 //!   profile whose settings are unchanged keeps its client, slots and discovery; a new or changed one
 //!   gets new ones, made as at start (`ModelClient::new(name, profile, paths.model_keys_dir())`), so its
 //!   `api_key_file` is read again and one it cannot use refuses the reload, changing nothing. Every session
 //!   on a changed profile that has not ended (archived ones included) is switched to it again as above,
 //!   with reason `profile reloaded`: a running one records it whatever changed (`settings_changed`: the
 //!   server or `extra_body` may have); one without a task records it
-//!   when next opened only if its model, window or replay policy changed. Sessions still on a removed profile are named in the report: a
+//!   when next opened only if its model, window, lineage (what the monitor knows of it) or replay policy changed. Sessions still on a removed profile are named in the report: a
 //!   running one keeps its client; an idle one cannot be activated until it is switched. A new or
 //!   changed profile whose `api_key_env` is not set in the daemon's environment is noted too (the
-//!   environment is the one the daemon started with). The report is a [`ModelsReload`].
+//!   environment is the one the daemon started with). A new or changed profile whose endpoint the infrastructure
+//!   deny cannot read (`http://gpu:/v1`, a host that is not ASCII) refuses the reload, changing nothing (`Profile
+//!   "{name}" cannot be used, so nothing was changed: …`), as `Runtime::start` refuses such a start-up profile. When a
+//!   profile was added or changed, the infrastructure deny takes its endpoint at once (`refresh_infrastructure`: the
+//!   names resolved again outside tests, the floor's policy rebuilt, the policy of every session holding a proxy
+//!   grant derived again); a removed or changed profile's old endpoint, a start-up one or one a reload made live,
+//!   stays denied until the restart (`Inner::reloaded_profiles`). A loopback endpoint's port is refused by the
+//!   sandboxes made from then on, not by those of running sessions (a sandbox is made with its session): when
+//!   `sandbox.loopback_all` or `sandbox.loopback_ports` lets commands connect to that port, the report notes that
+//!   the commands of running sessions can still reach it until the restart. The report is a [`ModelsReload`].
 //! - `answer(item_id, answer)`: the item must be open (`There is no open inbox item {item_id}.`);
 //!   an empty answer to a blocking item is refused (`This item is waiting for an answer; write
 //!   one.`); activate the session; `Input::Answer`; a non-empty answer also resumes the session's
@@ -463,6 +556,17 @@
 //!   sessions of the family that have no task before it returns; the others' are emptied as their tasks end.
 //!   Archived sessions are listed only by `sessions(true)` and are not activated at start;
 //!   `send_message`/`resume` on one are refused (`This session is archived; unarchive it first.`).
+//!
+//! ## The monitor (`crate::monitor`, M2)
+//! `Runtime::start` builds one `Monitor` (with `[monitor] enabled = false` it keeps only the precision-list, S4 and canary tripwires) after the journal key and before `Inner` is
+//! built, from `Env::from_config` (the home, the packs, the `[network]` lists, the floor's infrastructure policy) and the
+//! journal key; its log folds there, before `load_known` and before any session is activated. A log that does not
+//! verify makes `Monitor::down(reason)`, which the daemon keeps (the status says "down" and why); the daemon starts
+//! either way. `Inner::on_record` and `Inner::on_status` call `Monitor::wake(session)` (never blocking, never dropping:
+//! the monitor reads the durable files by cursor); `run_census` gives it each census view and `record_egress` the
+//! egress level; `shutdown` stops its worker. The worker is spawned only outside `cfg(test)`; a test pumps it with
+//! `Runtime::monitor().pump_now(true)`. `Runtime::monitor_status()` and `monitor_log(mission, after, limit, quiet)` serve
+//! `GET /api/monitor` and `GET /api/missions/{id}/monitor`. In M2 the monitor changes nothing a session can see.
 //!
 //! ## Start (`Runtime::start`)
 //! 1. `config.check()`; create the directories; load packs (`Packs::load(paths.packs_dir())`) and
@@ -585,9 +689,10 @@
 //!   parent's. The id is checked as for `ledger`. It counts records and judges nothing: whether the
 //!   result was right is not in a log.
 //! - `mission_models(id)`: for the mission of any of its sessions, archived ones included: the lead's
-//!   model, its `*` choice, one entry per role it starts (the choice, the pack's `model`,
+//!   model (with its lineage), its `*` choice, one entry per role it starts (the choice, the pack's `model`,
 //!   `alloy_models` and `escalation_model`, whether it is the verifier, its agents that have not ended
-//!   with their profile and whether each was forked), the live profiles and the default one.
+//!   with their profile and whether each was forked), the live profiles that can be chosen (not those with
+//!   `purpose = "review"`) and the default one.
 //! - `inbox()`: open items, oldest first. `net(id, limit)`: the last `limit` entries.
 //! - `health()`: for every profile, `client.health()` and what discovery last reported.
 //!
@@ -606,6 +711,10 @@
 //! - background child: its settlement arrives in the parent as an `agent-report` and resumes a
 //!   parent that ended its turn with `wait`;
 //! - `max_children`, unknown role, spawning from a child: refused with the sentences above;
+//! - the floor (E4): `cut_mission` ends the tunnels of one mission's sessions within a second and not another's,
+//!   the runtime's proxy has the veto and the canary hook installed (a decoy user is a `407` and an S4 event
+//!   attributed to the session), the box counters are polled, recorded as deltas only when they moved, and a box
+//!   that cannot be read is not a record;
 //! - stop: stopping the lead while its awaited child is mid-request settles the child `Stopped`
 //!   and ends the lead's turn `Stopped`; `stop_child` on an idle child settles it;
 //! - `poll`: `k` requests whose messages equal the session's stable prefix plus the vote prompt,
@@ -656,7 +765,7 @@ use crate::session::{queue_input, Control, Deps, End, Input, Phase, Session, Sin
 use crate::texts;
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use loom_core::config::{ensure_private_dir, Config, NetworkMode, Paths, SandboxCfg, SandboxMode};
+use loom_core::config::{ensure_private_dir, Config, NetworkMode, Paths, ProfilePurpose, SandboxCfg, SandboxMode};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
     Author, Brief, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, EvidenceGrade, Forked, InboxItem, ModelRef,
@@ -664,13 +773,13 @@ use loom_core::event::{
     TurnEndReason, Usage, META_ALSO_STORED, META_EXIT_CODE, META_OF_BLOB, META_RAW_BLOB, META_SIGNAL,
 };
 use loom_core::journal::{self, Journal};
-use loom_core::ledger::LedgerState;
+use loom_core::ledger::{LedgerOp, LedgerState};
 use loom_core::log::{read_records, Durability, PageReader, SessionLog, StoredRecord};
 use loom_core::scorecard::{self, Scorecard};
 use loom_core::weave::{render_brief, weave, WindowItem};
 use loom_core::{now_ms, BlobId, BlobRef, BlobStore, CallId, MissionId, SessionId};
 use loom_model::{ChatRequest, Discovered, Limiter, ModelClient, ModelError, Priority, StreamEvent, ToolChoice};
-use loom_net::policy::Policy;
+use loom_net::policy::{InfraSpec, Policy};
 use loom_net::proxy::Proxy;
 use loom_tools::boxctl::{DockerHost, MissionBox};
 use loom_tools::jobs::JobTable;
@@ -680,7 +789,7 @@ use loom_tools::workcopy;
 use loom_tools::ToolCtx;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -834,7 +943,7 @@ pub struct MissionModels {
     pub any_role: Option<String>,
     /// One per role the lead starts (`may_spawn`, then the finish gate's verifier), in that order.
     pub roles: Vec<RoleModels>,
-    /// The live profiles, to choose from.
+    /// The live profiles, to choose from (a profile with `purpose = "review"` is left out: it never runs an agent).
     pub profiles: Vec<String>,
     pub default_model: String,
 }
@@ -1200,6 +1309,136 @@ pub struct ScopeReceipt {
     pub hosts: Vec<String>,
     /// The mission keeps a ledger, so the grant is recorded there as well as in a note.
     pub ledger: bool,
+}
+
+/// What became of a scope revoke the operator made (see [`Runtime::revoke_scope`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeRevokeReceipt {
+    /// The lead session of the mission.
+    pub lead: SessionId,
+    /// The host revoked, as it was granted.
+    pub host: String,
+    /// The mission keeps a ledger.
+    pub ledger: bool,
+    /// The revoke is in the ledger (false when the mission keeps none, or the grant itself was not recorded
+    /// there yet).
+    pub recorded: bool,
+    /// The sessions of the mission whose egress policy was narrowed.
+    pub sessions: u32,
+    /// The open connections ended.
+    pub cut: u32,
+}
+
+/// The infrastructure the daemon knows about, for the implicit deny of every command policy (E1): its own
+/// port, the `host:port` of every model endpoint, the box's Docker host and `network.infrastructure`.
+pub(crate) fn infra_spec(config: &Config) -> InfraSpec {
+    let model_endpoints = config.models.values().filter_map(|m| endpoint_of(&m.base_url)).collect::<BTreeSet<_>>();
+    let ssh = config.boxed.ssh_host.trim();
+    let mut docker_hosts = Vec::new();
+    if config.boxed.enabled && !ssh.is_empty() {
+        // The host of the ssh destination (`user@host`, `ssh://user@host:2222`), as the policy reads one. A
+        // destination whose host the policy cannot read does not stop the daemon: it is left out, loudly.
+        match crate::infra::docker_host_of(ssh) {
+            Some(h)
+                if Policy::new(&loom_core::config::NetworkCfg::default())
+                    .and_then(|p| {
+                        p.with_infrastructure(&InfraSpec { docker_hosts: vec![h.clone()], ..InfraSpec::default() })
+                    })
+                    .is_ok() =>
+            {
+                docker_hosts.push(h)
+            }
+            _ => tracing::warn!(
+                "box.ssh_host \"{ssh}\" has no host name the egress policy can read, so the box's Docker host is not \
+                 refused by name: add its address to network.infrastructure"
+            ),
+        }
+    }
+    InfraSpec {
+        daemon_port: config.sandbox.daemon_port,
+        model_endpoints: model_endpoints.into_iter().collect(),
+        docker_hosts,
+        extra: config.network.infrastructure.clone(),
+        resolved: Vec::new(),
+        local_addrs: Vec::new(),
+    }
+}
+
+/// `infra_spec` with what the daemon resolved (see `crate::infra`): the Docker host's other names, the
+/// addresses of every named entry and this machine's own addresses.
+fn infra_spec_resolved(config: &Config, res: &crate::infra::Resolution) -> InfraSpec {
+    let mut spec = infra_spec(config);
+    for h in &res.docker_hosts {
+        if !spec.docker_hosts.contains(h) {
+            spec.docker_hosts.push(h.clone());
+        }
+    }
+    spec.resolved = res.addrs.clone();
+    spec.local_addrs = res.local.clone();
+    spec
+}
+
+/// A policy of the daemon's infrastructure alone, which the floor's veto asks (`crate::floor`).
+pub(crate) fn infra_policy(config: &Config, res: &crate::infra::Resolution) -> Result<Policy, String> {
+    Policy::new(&loom_core::config::NetworkCfg::default())
+        .and_then(|p| p.with_infrastructure(&infra_spec_resolved(config, res)))
+}
+
+/// Whether the infrastructure deny can be built from `config` (`network.infrastructure`, the model endpoints, the box's
+/// host), as [`Runtime::start`] builds it before anything else: `loom config check` refuses what the start would, with
+/// the same sentence. Names are not resolved here, so the answer does not depend on this machine's resolver.
+pub fn check_infrastructure(config: &Config) -> Result<(), String> {
+    infra_policy(config, &crate::infra::Resolution::default())
+        .map(|_| ())
+        .map_err(|e| format!("The network configuration cannot be used: {e}"))
+}
+
+/// The `host:port` a base URL connects to (`http://h:8000/v1` is `h:8000`; no port is 80 for http and 443
+/// for https; user information and the path are left out). `None` for text that is not an http(s) URL.
+pub(crate) fn endpoint_of(base_url: &str) -> Option<String> {
+    let (scheme, rest) = base_url.trim().split_once("://")?;
+    let default = match scheme.to_ascii_lowercase().as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, a)| a);
+    if authority.is_empty() {
+        return None;
+    }
+    let has_port = match authority.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').is_some_and(|(_, after)| after.starts_with(':')),
+        None => authority.contains(':'),
+    };
+    Some(if has_port { authority.to_string() } else { format!("{authority}:{default}") })
+}
+
+/// The hosts kept in `path` (a JSON list); none when the file is missing or unreadable (with a warning for
+/// the second).
+fn load_revoked(path: &Path) -> Vec<String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::warn!("the revoked hosts in {} cannot be read ({e}); they are not applied", path.display());
+            Vec::new()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            tracing::warn!("the revoked hosts in {} cannot be read ({e}); they are not applied", path.display());
+            Vec::new()
+        }
+    }
+}
+
+/// The grant among `granted` that covers `host` by its wildcard (`*.suffix` covers `x.suffix`), if any.
+fn covering_grant<'a>(granted: &'a [String], host: &str) -> Option<&'a str> {
+    let h = host.to_ascii_lowercase();
+    let name = h.rsplit_once(':').map_or(h.as_str(), |(n, _)| n);
+    granted.iter().map(String::as_str).find(|g| {
+        g.strip_prefix("*.").is_some_and(|suffix| {
+            name.len() > suffix.len() && name.ends_with(&format!(".{}", suffix.to_ascii_lowercase()))
+        })
+    })
 }
 
 /// The scope recorded in the ledger for an approval given without one.
@@ -1791,6 +2030,29 @@ impl Drop for RevokeOnDrop<'_> {
     }
 }
 
+/// What a reload tells the operator of the profiles it made live (`made`: name and profile) that are served on this
+/// machine at a port the sandbox settings let commands connect to (`loopback_all`, `loopback_ports`): the sandboxes
+/// made from now on refuse that port (`infra_ports`), but those of running sessions were made without it. Nothing
+/// under `mode = "none"`, which confines no command anyway.
+fn loopback_reload_notes(sandbox: &SandboxCfg, made: &[(String, loom_core::config::ModelProfile)]) -> Vec<String> {
+    if sandbox.mode == SandboxMode::None {
+        return Vec::new();
+    }
+    let mut notes = Vec::new();
+    for (name, p) in made {
+        for port in crate::infra::endpoint_loopback_ports(endpoint_of(&p.base_url)) {
+            let open = sandbox.loopback_all || sandbox.loopback_ports.contains(&port);
+            if open && !sandbox.infra_ports.contains(&port) {
+                let by = if sandbox.loopback_all { "sandbox.loopback_all" } else { "sandbox.loopback_ports" };
+                notes.push(format!(
+                    "Profile \"{name}\" is served on this machine at port {port}, which {by} lets commands connect to: the sandboxes made from now on refuse it, but the commands of sessions already running can still reach it until the daemon restarts (`loom down && loom up`)."
+                ));
+            }
+        }
+    }
+    notes
+}
+
 /// The sandbox configuration a session of `role` runs under.
 /// Every model profile's `api_key_env` name is withheld from its commands.
 fn sandbox_cfg_for(
@@ -1804,6 +2066,18 @@ fn sandbox_cfg_for(
         if !cfg.secret_env.iter().any(|n| n == name) {
             cfg.secret_env.push(name.to_string());
         }
+    }
+    // The loopback ports of these profiles' endpoints too (`base` has those of the start-up profiles and of
+    // `network.infrastructure`): a profile a reload added is infrastructure for the sandboxes made from then on.
+    let mut ports = cfg.infra_ports.clone();
+    for p in crate::infra::endpoint_loopback_ports(models.values().filter_map(|m| endpoint_of(&m.base_url))) {
+        if !ports.contains(&p) {
+            ports.push(p);
+        }
+    }
+    if ports.len() != cfg.infra_ports.len() {
+        ports.sort_unstable();
+        cfg.infra_ports = ports;
     }
     if role.read_only {
         for path in &cfg.extra_writable {
@@ -1915,6 +2189,11 @@ impl Known {
         self.settlement.is_some() || self.status.phase == Phase::Ended
     }
 
+    /// Nothing of it should be running: it finished or it was stopped (`census::has_ended`).
+    fn census_ended(&self) -> bool {
+        crate::census::has_ended(self.finished(), self.status.phase, self.status.last_end)
+    }
+
     fn outcome(&self) -> ChildOutcome {
         match (&self.settlement, self.status.outcome) {
             (Some(s), _) => s.outcome,
@@ -1942,6 +2221,13 @@ struct State {
     /// Hosts the operator granted to each mission since the daemon started (a superset of what the
     /// ledger records of them until the lead has recorded a grant that is still queued).
     scope: HashMap<MissionId, Vec<String>>,
+    /// Hosts the operator revoked from each mission since the daemon started: left out of `granted_hosts`
+    /// at once, whatever the ledger or `scope` still holds (a grant that is queued, a revoke that is not
+    /// recorded). A grant of the same host again takes it out of here.
+    scope_revoked: HashMap<MissionId, Vec<String>>,
+    /// Bumped by every grant and revoke of a mission, before the sessions are told: a session that was
+    /// built with an older value has its policy derived again (see `Inner::policy_is_current`).
+    scope_gen: HashMap<MissionId, u64>,
     /// The box of each mission that has used one (see `Inner::box_for`).
     boxes: HashMap<MissionId, Arc<MissionBox>>,
     /// Missions whose box was removed because the mission was stopped, ended or archived: no box is made for
@@ -2032,9 +2318,24 @@ fn check_choice_role(lead: &RoleDef, role: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A profile with `purpose = "review"`: a reviewer's, never an agent's, since its sessions would run unreviewed
+/// (`docs/MONITOR.md` §2.6). No lead, agent, role choice or switch runs on one.
+fn is_review_profile(p: &loom_core::config::ModelProfile) -> bool {
+    p.purpose == Some(ProfilePurpose::Review)
+}
+
+/// Why no agent is chosen for, or started on, the review profile `profile` (a role choice, and a spawn whatever
+/// selected the profile: a choice saved before a restart made the profile a reviewer's is refused here too).
+fn review_agent_refusal(profile: &str) -> String {
+    format!(
+        "The model profile \"{profile}\" has purpose = \"review\": it is a reviewer's, and agents started on it would run unreviewed. Choose an agent profile, or change its purpose."
+    )
+}
+
 /// Refusal of choosing `profile` for `role` in a mission whose lead has role `lead` and runs on
-/// `lead_profile`: the role (as [`check_choice_role`]), an unknown profile, or the finish gate's verifier
-/// on the lead's own profile when the pack wants them distinct.
+/// `lead_profile`: the role (as [`check_choice_role`]), an unknown profile, a review profile
+/// (`purpose = "review"`), or the finish gate's verifier on the lead's own profile when the pack wants
+/// them distinct.
 fn check_role_choice(
     lead: &RoleDef,
     lead_profile: &str,
@@ -2043,11 +2344,15 @@ fn check_role_choice(
     profile: &str,
 ) -> Result<(), String> {
     check_choice_role(lead, role)?;
-    if models.get(profile).is_none() {
-        return Err(format!(
-            "There is no model profile \"{profile}\" ({}). Add it to [models] in the config and run `loom models reload`.",
-            models.names()
-        ));
+    match models.get(profile) {
+        None => {
+            return Err(format!(
+                "There is no model profile \"{profile}\" ({}). Add it to [models] in the config and run `loom models reload`.",
+                models.names()
+            ));
+        }
+        Some(rt) if is_review_profile(rt.client.profile()) => return Err(review_agent_refusal(profile)),
+        Some(_) => {}
     }
     if lead.verifier.as_deref() == Some(role) && lead.require_distinct_verifier_profile && profile == lead_profile {
         return Err(format!(
@@ -2088,6 +2393,10 @@ struct Inner {
     models: std::sync::RwLock<Arc<ModelTable>>,
     /// Held by a reload and by a switch, so that model changes apply one at a time.
     model_changes: tokio::sync::Mutex<()>,
+    /// Every profile a reload made live since the start (added or changed), kept when a later reload removes or
+    /// changes it again: a session may still run on it, so its endpoint stays infrastructure until the restart
+    /// (`infra_config`). It only grows.
+    reloaded_profiles: Mutex<Vec<loom_core::config::ModelProfile>>,
     proxy: Proxy,
     state: Mutex<State>,
     /// Held across a scan of a mission's logs (`scan_outputs`).
@@ -2107,6 +2416,270 @@ struct Inner {
     pagers: Mutex<Vec<(SessionId, Arc<Mutex<PageReader>>)>>,
     /// The Docker host of `[box]`, when the operator enabled one (see `loom_tools::boxctl`).
     box_host: Option<Arc<DockerHost>>,
+    /// What the daemon resolved about its infrastructure (`crate::infra`), for every session's policy.
+    infra: Mutex<crate::infra::Resolution>,
+    /// Whether commands can reach the network outside the proxy, as the last self-probe found it (`crate::egress`).
+    egress: Mutex<crate::egress::EgressView>,
+    /// The operator was told that egress is unbounded, and it has not been bounded since.
+    egress_told: AtomicBool,
+    /// The operator was told that the self-probe found a problem (a leak, a probe that cannot run, the resolver's
+    /// socket) while the level was `Unbounded`, and the problem has not cleared since. Kept apart from
+    /// `egress_told` so a problem is told even when the setting `allow_fetch_services` already made egress unbounded.
+    egress_problem_told: AtomicBool,
+    /// The last process and listener census of the sessions (`crate::census`), `None` until the first finishes.
+    census: Mutex<Option<crate::census::CensusView>>,
+    /// The survivors the operator was told of (`crate::census::tell`).
+    census_told: Mutex<crate::census::Told>,
+    /// The operator was told that the census runs without sandbox identity, and it has not had identity since.
+    census_blind_told: AtomicBool,
+    /// The proxy's veto, canary hooks and lab-listener check (`crate::floor`, E4).
+    floor: crate::floor::Floor,
+    /// The adversarial monitor in shadow (`crate::monitor`, M2): always built (a handle
+    /// that says "down" when its log did not fold or verify.
+    monitor: Option<crate::monitor::Monitor>,
+    /// The missions whose box counters could not be read at the last poll and the operator's log was told so,
+    /// until a poll works again (`poll_box_counters`).
+    box_counters_failed: Mutex<BTreeSet<MissionId>>,
+}
+
+impl Inner {
+    /// The sessions a census asks about (every one that is not archived) and those of them that have ended or were
+    /// stopped: nothing of those should be running.
+    fn census_sessions(&self) -> (Vec<(String, PathBuf)>, BTreeSet<String>) {
+        // The state lock is held only to list the sessions: `members` canonicalizes each one's temp dir.
+        let (live, ended): (Vec<SessionId>, BTreeSet<String>) = {
+            let st = self.st();
+            let live = st.known.iter().filter(|(_, k)| !k.meta.archived).map(|(id, _)| id.clone()).collect();
+            let ended = st
+                .known
+                .iter()
+                .filter(|(_, k)| !k.meta.archived && k.census_ended())
+                .map(|(id, _)| id.as_str().to_string())
+                .collect();
+            (live, ended)
+        };
+        (crate::census::members(&self.paths, &live), ended)
+    }
+
+    /// The sessions of the mission `who` belongs to (itself included): what the lab-listener check does not take
+    /// for a squatter. Just `who` for a session that is not known.
+    fn mission_peers(&self, who: &SessionId) -> Vec<String> {
+        let st = self.st();
+        let Some(mission) = st.known.get(who).map(|k| k.meta.mission.clone()) else {
+            return vec![who.as_str().to_string()];
+        };
+        st.known.iter().filter(|(_, k)| k.meta.mission == mission).map(|(id, _)| id.as_str().to_string()).collect()
+    }
+
+    /// Whether commands run under Seatbelt, the only mode in which a process can be told by its profile.
+    fn census_confined(&self) -> bool {
+        self.config.sandbox.mode == SandboxMode::Seatbelt
+    }
+
+    /// Takes a census on a blocking thread, keeps it, and logs what an ended session left running that the
+    /// operator was not told yet.
+    async fn run_census(&self) -> Option<crate::census::CensusView> {
+        let (members, ended) = self.census_sessions();
+        let home = self.paths.home.clone();
+        let confined = self.census_confined();
+        let view = tokio::task::spawn_blocking(move || crate::census::take(&home, &members, confined)).await.ok()?;
+        if let Some(m) = &self.monitor {
+            m.census(&view);
+        }
+        let lines = {
+            let mut told = self.census_told.lock().unwrap_or_else(|p| p.into_inner());
+            crate::census::tell(&mut told, &view, &ended)
+        };
+        for line in lines {
+            tracing::warn!("{line}");
+        }
+        // A census that cannot tell by sandbox is not a failure to hide: it is told, once, until identity returns.
+        if view.readable && confined && !view.identity {
+            let notice = crate::census::blind_notice(&view.identity_detail);
+            tracing::warn!("{notice}");
+            if !self.census_blind_told.swap(true, Ordering::SeqCst) {
+                self.notify("census", &SessionId::from(""), "The process census is blind", &notice);
+            }
+        } else if view.identity {
+            self.census_blind_told.store(false, Ordering::SeqCst);
+        }
+        *self.census.lock().unwrap_or_else(|p| p.into_inner()) = Some(view.clone());
+        Some(view)
+    }
+
+    /// Reads the rule counters of every mission box that is up, appends what moved since the last poll to
+    /// `<home>/logs/box-counters.jsonl` (one line per mission with a delta: `ts_ms`, `mission`, `chain`, `rules`) and
+    /// returns the deltas. A box that cannot be read is logged once until it can again; a failed write is logged.
+    async fn poll_box_counters(&self) -> Vec<(MissionId, Vec<loom_tools::boxctl::RuleCount>)> {
+        let boxes: Vec<(MissionId, Arc<MissionBox>)> =
+            self.st().boxes.iter().map(|(m, b)| (m.clone(), b.clone())).collect();
+        let mut moved = Vec::new();
+        for (mission, b) in boxes {
+            match b.poll_counters().await {
+                Ok(Some(rules)) => {
+                    self.box_counters_failed.lock().unwrap_or_else(|p| p.into_inner()).remove(&mission);
+                    if rules.is_empty() {
+                        continue;
+                    }
+                    let dropped: u64 = rules.iter().filter(|r| r.drop).map(|r| r.packets).sum();
+                    if dropped > 0 {
+                        tracing::warn!(
+                            "The box of mission {} had {dropped} packet(s) dropped by its egress rules since the last poll.",
+                            mission.as_str()
+                        );
+                    }
+                    let line = serde_json::json!({
+                        "ts_ms": now_ms(),
+                        "mission": mission.as_str(),
+                        "chain": b.names().chain,
+                        "rules": rules,
+                    });
+                    if let Err(e) = append_line(&self.paths.logs_dir().join(BOX_COUNTERS_FILE), &line.to_string()) {
+                        tracing::warn!("The box counters of mission {} could not be recorded: {e}", mission.as_str());
+                    }
+                    moved.push((mission, rules));
+                }
+                Ok(None) => {
+                    self.box_counters_failed.lock().unwrap_or_else(|p| p.into_inner()).remove(&mission);
+                }
+                Err(e) => {
+                    let first =
+                        self.box_counters_failed.lock().unwrap_or_else(|p| p.into_inner()).insert(mission.clone());
+                    if first {
+                        tracing::warn!(
+                            "The rule counters of the box of mission {} could not be read: {e}",
+                            mission.as_str()
+                        );
+                    }
+                }
+            }
+        }
+        moved
+    }
+
+    /// Waits until the tasks of `family` have ended, then stops by sandbox identity what each left running (see
+    /// `Runtime::archive`), and says so in the log.
+    async fn stop_leftovers(&self, family: &[SessionId]) {
+        self.until_closed(family).await;
+        let (home, confined) = (self.paths.home.clone(), self.census_confined());
+        let members = crate::census::members(&self.paths, family);
+        let killed = tokio::task::spawn_blocking(move || {
+            let home = crate::census::canonical_home(&home);
+            let mut stopped = Vec::new();
+            for (id, tmp) in &members {
+                let member = loom_tools::sandbox::census::Member { id, tmp };
+                let done = loom_tools::sandbox::census::kill(&home, &[member], &[], &[], confined);
+                if done.killed > 0 || !done.left.is_empty() {
+                    stopped.push((id.clone(), done.killed, done.left.len()));
+                }
+            }
+            stopped
+        })
+        .await
+        .unwrap_or_default();
+        for (id, stopped, left) in killed {
+            tracing::warn!(
+                "Session {id} was archived with processes still running under its sandbox: {stopped} stopped, {left} could not be stopped"
+            );
+        }
+    }
+
+    /// The last resolution of the infrastructure names and this machine's addresses.
+    fn infra(&self) -> crate::infra::Resolution {
+        self.infra.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The configuration the infrastructure deny is built from: the start-up one, whose `[models]` also holds every
+    /// profile of the live set and every profile a reload made live since the start (`reloaded_profiles`). A profile
+    /// that was removed or changed, at the start or by a reload, keeps its old endpoint denied until the restart: a
+    /// session may still run on it. The sandboxes take the loopback ports of the same profiles (`sandbox_cfg_for`).
+    fn infra_config(&self) -> Config {
+        let mut config = self.config.clone();
+        for (name, profile) in self.models().configs() {
+            // Keyed apart from the start-up profiles; only the values are read.
+            config.models.insert(format!("{name} (live)"), profile);
+        }
+        let reloaded = self.reloaded_profiles.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        for (i, profile) in reloaded.into_iter().enumerate() {
+            config.models.insert(format!("{i} (reloaded)"), profile);
+        }
+        config
+    }
+
+    /// After the live model set changed: the infrastructure is resolved again over every profile (not under test, as
+    /// the periodic refresh), the floor's veto gets the new infrastructure policy, and every session that holds a proxy
+    /// grant has its policy derived again, so that no command reaches a model endpoint a reload added.
+    async fn refresh_infrastructure(&self) {
+        #[cfg(not(test))]
+        {
+            let config = self.infra_config();
+            if let Ok(fresh) = tokio::task::spawn_blocking(move || crate::infra::resolve_system(&config)).await {
+                self.proxy.set_local_addrs(fresh.local.clone());
+                *self.infra.lock().unwrap_or_else(|p| p.into_inner()) = fresh;
+            }
+        }
+        match infra_policy(&self.infra_config(), &self.infra()) {
+            Ok(policy) => self.floor.set_infrastructure(policy),
+            Err(e) => tracing::warn!("the infrastructure policy was not rebuilt after the model reload: {e}"),
+        }
+        // The sessions that hold a proxy grant: one made later derives its policy from the live set anyway.
+        let metas: Vec<SessionMeta> = self.st().known.values().map(|k| k.meta.clone()).collect();
+        for meta in metas.into_iter().filter(|m| self.proxy.session_port(&m.id).is_some()) {
+            let policy = self.mission_explicit(&meta).and_then(|explicit| self.session_policy(&meta, explicit));
+            match policy {
+                Ok(policy) => {
+                    self.proxy.set_policy(&meta.id, policy);
+                }
+                Err(e) => tracing::warn!(session = %meta.id, "policy not derived again after the model reload: {e}"),
+            }
+        }
+    }
+
+    /// Take a self-probe's report (`crate::egress`): keep the view, write the report to `<home>/egress-probe.json`
+    /// and, when egress turned unbounded, tell the operator once (again only after it was bounded).
+    fn record_egress(&self, report: Option<loom_tools::sandbox::selfprobe::Report>) {
+        let now = loom_core::now_ms();
+        let view = crate::egress::assess(&self.config.sandbox, report.as_ref(), report.as_ref().map(|_| now));
+        if let Some(report) = &report {
+            let body = serde_json::json!({ "at_ms": now, "view": view, "report": report });
+            let path = self.paths.home.join("egress-probe.json");
+            let tmp = self.paths.home.join("egress-probe.json.tmp");
+            let written = serde_json::to_vec_pretty(&body)
+                .map_err(|e| e.to_string())
+                .and_then(|b| std::fs::write(&tmp, b).map_err(|e| e.to_string()))
+                .and_then(|()| std::fs::rename(&tmp, &path).map_err(|e| e.to_string()));
+            if let Err(e) = written {
+                tracing::warn!("The self-probe's result could not be written to {}: {e}", path.display());
+            }
+        }
+        let level = view.level;
+        if let Some(m) = &self.monitor {
+            m.egress(level == crate::egress::Level::Unbounded);
+        }
+        let view_problem = view.probe_problem && level == crate::egress::Level::Unbounded;
+        for reason in &view.reasons {
+            tracing::warn!("Egress is {level:?}: {reason}");
+        }
+        *self.egress.lock().unwrap_or_else(|p| p.into_inner()) = view;
+        let problem = view_problem;
+        let fresh_problem = if problem {
+            !self.egress_problem_told.swap(true, Ordering::SeqCst)
+        } else {
+            self.egress_problem_told.store(false, Ordering::SeqCst);
+            false
+        };
+        let fresh_level = match level {
+            crate::egress::Level::Unbounded => !self.egress_told.swap(true, Ordering::SeqCst),
+            crate::egress::Level::Bounded => {
+                self.egress_told.store(false, Ordering::SeqCst);
+                false
+            }
+            crate::egress::Level::Unprobed => false,
+        };
+        if fresh_problem || fresh_level {
+            self.notify("egress", &SessionId::from(""), "Egress is unbounded", crate::egress::UNBOUNDED_NOTICE);
+        }
+    }
 }
 
 impl Drop for Inner {
@@ -2221,9 +2794,10 @@ impl Orchestrator for Orch {
         let (record, log) = (inner.paths.session_dir(&child).join(COPY_MANIFEST), inner.paths.session_log(&child));
         let (tmp, home, copies) = (inner.paths.session_tmp(parent), inner.paths.home.clone(), inner.paths.copies_dir());
         let parent_jobs = inner.paths.session_dir(parent).join("jobs");
+        let identity = parent.as_str().to_string();
         let (base, models, port) = (
             inner.config.sandbox.clone(),
-            inner.models().configs(),
+            inner.infra_config().models,
             // The commands run with the parent's environment, so on the parent's listener.
             inner.proxy.session_port(parent),
         );
@@ -2251,6 +2825,7 @@ impl Orchestrator for Orch {
             let bubblewrap = cfg.mode == SandboxMode::Bubblewrap;
             let sandbox = Sandbox::new(&cfg, &dir, &tmp, &home, if bubblewrap { None } else { port })
                 .and_then(|s| s.with_jobs_dir(&parent_jobs))
+                .and_then(|s| s.with_identity(&identity))
                 .map_err(|e| format!("The sandbox for the copy of agent {} cannot be set up: {e}", child.as_str()))?;
             Ok(ChildCopy { agent: child, dir, manifest, running, runs, sandbox: Arc::new(sandbox) })
         });
@@ -2747,10 +3322,16 @@ impl Inner {
                 self.repeat_notice(&kind, session, &title, &item);
             }
         }
+        if let Some(m) = &self.monitor {
+            m.wake(Some(session));
+        }
         self.publish(BusEvent::Record { session: session.clone(), record: Box::new(record.clone()) });
     }
 
     fn on_status(&self, session: &SessionId, status: &Status) {
+        if let Some(m) = &self.monitor {
+            m.wake(Some(session));
+        }
         let held: Vec<SessionId> = {
             let mut st = self.st();
             let started = match st.known.get_mut(session) {
@@ -3043,26 +3624,94 @@ impl Inner {
                 Err(e) => tracing::warn!(session = %meta.id, "granted hosts not read from the ledger: {e}"),
             }
         }
-        for h in self.st().scope.get(&meta.mission).into_iter().flatten() {
+        let mut st = self.st();
+        for h in st.scope.get(&meta.mission).into_iter().flatten() {
             if !hosts.iter().any(|x| x.eq_ignore_ascii_case(h)) {
                 hosts.push(h.clone());
             }
         }
+        // What the operator revoked leaves at once, recorded or not (the overlay is kept on disk).
+        let revoked = st
+            .scope_revoked
+            .entry(meta.mission.clone())
+            .or_insert_with(|| load_revoked(&self.revoked_path(&meta.mission)));
+        hosts.retain(|h| !revoked.iter().any(|r| r.eq_ignore_ascii_case(h)));
         hosts
+    }
+
+    /// Where the hosts the operator revoked from `mission` are kept, so that a revoke the ledger does not
+    /// hold (a grant still queued for the lead) survives a restart.
+    fn revoked_path(&self, mission: &MissionId) -> PathBuf {
+        self.paths.mission_dir(mission).join("scope_revoked.json")
+    }
+
+    /// The hosts revoked from `mission` (kept on disk, read once).
+    fn revoked_hosts(&self, mission: &MissionId) -> Vec<String> {
+        let mut st = self.st();
+        st.scope_revoked.entry(mission.clone()).or_insert_with(|| load_revoked(&self.revoked_path(mission))).clone()
+    }
+
+    /// Write the revoked hosts of `mission` durably.
+    fn save_revoked(&self, mission: &MissionId, hosts: &[String]) -> Result<(), String> {
+        let path = self.revoked_path(mission);
+        let dir = path.parent().ok_or_else(|| format!("{} has no directory", path.display()))?;
+        ensure_private_dir(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let text = serde_json::to_vec(hosts).map_err(|e| e.to_string())?;
+        let tmp = dir.join(".scope_revoked.json.tmp");
+        std::fs::write(&tmp, text)
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))
+    }
+
+    /// The generation of the mission's grants and revokes.
+    fn scope_generation(&self, mission: &MissionId) -> u64 {
+        self.st().scope_gen.get(mission).copied().unwrap_or(0)
+    }
+
+    /// A grant or revoke of `mission` is about to be applied to its sessions.
+    fn bump_scope_generation(&self, mission: &MissionId) {
+        let mut st = self.st();
+        let g = st.scope_gen.entry(mission.clone()).or_insert(0);
+        *g = g.wrapping_add(1);
+    }
+
+    /// After a session's proxy grant was made from a policy derived at generation `built`: when the mission's
+    /// grants changed since, derive the policy again and give it to the session. A grant or revoke that
+    /// comes later finds the session's proxy grant and sets its own policy.
+    fn policy_is_current(&self, meta: &SessionMeta, explicit: bool, built: u64) {
+        if self.scope_generation(&meta.mission) == built {
+            return;
+        }
+        match self.session_policy(meta, explicit) {
+            Ok(policy) => {
+                self.proxy.set_policy(&meta.id, policy);
+            }
+            Err(e) => tracing::warn!(session = %meta.id, "policy not derived again after a scope change: {e}"),
+        }
     }
 
     /// The proxy policy of a session: the configured network plus the mission's granted hosts. A
     /// granted host that cannot be parsed is left out (with a warning), which only narrows the policy.
+    /// The infrastructure that policy refuses to every command, grants or not (E1), is added last.
     fn session_policy(&self, meta: &SessionMeta, explicit: bool) -> Result<Policy, String> {
         let hosts = self.granted_hosts(meta, explicit);
-        match Policy::with_hosts(&self.config.network, &hosts) {
+        let policy = match Policy::with_hosts(&self.config.network, &hosts) {
             Ok(p) => Ok(p),
             Err(e) if !hosts.is_empty() => {
                 tracing::warn!(session = %meta.id, "granted hosts ignored: {e}");
                 Policy::new(&self.config.network)
             }
             Err(e) => Err(e),
-        }
+        }?;
+        let revoked = self.revoked_hosts(&meta.mission);
+        let policy = match policy.clone().with_revoked(&revoked) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(session = %meta.id, "revoked hosts ignored: {e}");
+                policy
+            }
+        };
+        policy.with_infrastructure(&infra_spec_resolved(&self.infra_config(), &self.infra()))
     }
 
     /// The `Deps` of a session (granting it its proxy credentials).
@@ -3086,7 +3735,7 @@ impl Inner {
         let tmp = std::fs::canonicalize(&tmp).map_err(|e| format!("cannot resolve {}: {e}", tmp.display()))?;
         let copies = self.paths.copies_dir();
         let cfg = with_copies(
-            sandbox_cfg_for(&self.config.sandbox, &role, &workspace, &models.configs()),
+            sandbox_cfg_for(&self.config.sandbox, &role, &workspace, &self.infra_config().models),
             &copies,
             meta.copy_of.as_deref(),
         );
@@ -3099,16 +3748,20 @@ impl Inner {
             return Err("Bubblewrap requires network.mode = deny_all. Explicit mission grants apply only to trusted in-process HTTP tools; subprocess proxy bridges are unsupported.".into());
         }
         let jobs_dir = self.paths.session_dir(id).join("jobs");
+        let built_at = self.scope_generation(&meta.mission);
         let policy = self.session_policy(meta, explicit)?;
         // The session's own proxy listener comes first: its port is the only one the sandbox allows.
         let grant = self
             .proxy
             .grant(id, policy)
             .map_err(|e| format!("The egress proxy cannot open a port for this session: {e}"))?;
+        // A grant or revoke that ran while the policy was being derived reached no proxy grant of this session.
+        self.policy_is_current(meta, explicit, built_at);
         // From here a failure takes the grant, and with it the listener, back.
         let mut revoke = RevokeOnDrop { proxy: &self.proxy, session: id, armed: true };
         let sandbox = Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, (!bubblewrap).then_some(grant.port))
             .and_then(|s| s.with_jobs_dir(&jobs_dir))
+            .and_then(|s| s.with_identity(id.as_str()))
             .map_err(|e| format!("The sandbox for this session cannot be set up: {e}"))?;
         let (events_tx, job_events) = unbounded_channel();
         let jobs = Arc::new(JobTable::new(jobs_dir, self.blobs.clone(), events_tx, self.config.tools.max_output_bytes));
@@ -3177,6 +3830,8 @@ impl Inner {
                 profile: meta.profile.clone(),
                 model: meta.model.clone(),
                 context_window: meta.context_window.unwrap_or(0),
+                // What a `model_switched` this session records names as its new model.
+                lineage: Some(loom_core::lineage::resolve_served(&meta.profile, profile.client.profile(), &meta.model)),
             },
             reasoning_replay: profile.client.profile().reasoning_replay,
             shared: shared.clone(),
@@ -3212,6 +3867,12 @@ impl Inner {
                 profile: meta.profile.clone(),
                 model: meta.model.clone(),
                 context_window: meta.context_window.unwrap_or(0),
+                // The family covers the configured id and the id the server serves (discovery may have replaced it).
+                // The live profile: one a reload added or changed is described as it is now.
+                lineage: self
+                    .models()
+                    .get(&meta.profile)
+                    .map(|p| loom_core::lineage::resolve_served(&meta.profile, p.client.profile(), &meta.model)),
             },
             reasoning_replay: replay,
             system_prompt: pack::system_prompt(role, &pack.preamble, &env),
@@ -3518,7 +4179,7 @@ impl Inner {
             .map(|p| (p.meta.pack.clone(), p.meta.role.clone()))
             .ok_or_else(|| "Only the lead session of a mission can start agents.".to_string())?;
         let role = self.packs.role(Some(&pack), Some(&role))?.clone();
-        let mut judge_cfg = sandbox_cfg_for(&self.config.sandbox, &role, &source, &self.models().configs());
+        let mut judge_cfg = sandbox_cfg_for(&self.config.sandbox, &role, &source, &self.infra_config().models);
         judge_cfg.mode = loom_core::config::SandboxMode::None;
         let (home, tmp) = (self.paths.home.clone(), self.paths.session_tmp(parent));
         let limits = workcopy::Limits {
@@ -3595,6 +4256,7 @@ impl Inner {
         }
         // Reserve rotation before discovery: parallel fanout siblings get different slots. Restarts
         // derive the initial cursor from persisted child metadata rather than a process-global counter.
+        let models = self.models();
         let (profile_name, inherited_model, inherited_window) = {
             let mut st = self.st();
             let p = st
@@ -3656,6 +4318,11 @@ impl Inner {
             };
             *cursor = cursor.saturating_add(1);
             let profile = selected.unwrap_or_else(|| inherited.0.clone());
+            // Whatever selected it: a mission's choice saved before the profile became a reviewer's (a restart
+            // onto a config with `purpose = "review"` checks no saved choice), the pack's, or the lead's own.
+            if models.get(&profile).is_some_and(|rt| is_review_profile(rt.client.profile())) {
+                return Err(review_agent_refusal(&profile));
+            }
             if req.mode == SpawnMode::Fork && profile != inherited.0 {
                 return Err(texts::cross_profile_fork(&inherited.0, &profile));
             }
@@ -4565,6 +5232,27 @@ fn record_net(inner: &Inner, session: SessionId, decision: NetDecision) {
 /// Where the proxy's decisions that name no session are kept, under `logs/`.
 const UNATTRIBUTED_NET: &str = "net-unattributed.jsonl";
 
+/// Where the rule counters of the mission boxes are recorded, under `logs/`.
+const BOX_COUNTERS_FILE: &str = "box-counters.jsonl";
+
+/// Where the floor's events (decoy hits, vetoes, squatted lab ports) are appended, under `logs/`.
+const FLOOR_EVENTS_FILE: &str = "floor.jsonl";
+
+/// How often the mission boxes' rule counters are read.
+#[cfg_attr(test, allow(dead_code))]
+const BOX_COUNTERS_EVERY: Duration = Duration::from_secs(60);
+
+/// Appends `line` and a newline to `path` (made, with its directory, when missing) and syncs it.
+fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(format!("{line}\n").as_bytes())?;
+    f.sync_data()
+}
+
 /// The proxy's audit hook: appends the decision to the session's `net.jsonl` as a chained line, syncs
 /// it to disk, and then publishes the same entry as [`BusEvent::Net`]; so an allowed connection is on
 /// record before it is used. A decision that names no session goes to `logs/net-unattributed.jsonl`.
@@ -4597,9 +5285,17 @@ pub struct Runtime {
 impl Runtime {
     /// Bring the runtime up over `paths` and restore what was running. See *Start*.
     pub async fn start(mut config: Config, paths: Paths) -> Result<Runtime, String> {
-        // Every sandbox made from the configuration (sessions, agents' copies, judges) carries this.
-        config.sandbox.network_deny_all = config.network.mode == NetworkMode::DenyAll;
+        // The loopback ports of infrastructure that no command may reach, whatever loopback it is allowed.
+        config.sandbox.infra_ports = crate::infra::loopback_ports(&config);
         config.check().map_err(|e| e.to_string())?;
+        // The infrastructure every command policy refuses is checked now, not at the first session.
+        // The names are resolved here, once, and again every `RESOLVE_EVERY` (see `crate::infra`).
+        let resolution = {
+            let config = config.clone();
+            tokio::task::spawn_blocking(move || crate::infra::resolve_system(&config)).await.unwrap_or_default()
+        };
+        let floor_policy =
+            infra_policy(&config, &resolution).map_err(|e| format!("The network configuration cannot be used: {e}"))?;
         paths
             .ensure_private_layout()
             .map_err(|e| format!("cannot create {} as a private directory: {e}", paths.home.display()))?;
@@ -4609,6 +5305,23 @@ impl Runtime {
         let key = journal::load_or_create_key(&paths.journal_key())
             .map_err(|e| format!("cannot read or create the journal key {}: {e}", paths.journal_key().display()))?;
         let blobs = BlobStore::open(paths.blobs_dir()).map_err(|e| format!("cannot open the blob store: {e}"))?;
+        // The monitor folds its log before any session is activated (I9). A log that does not verify leaves a monitor
+        // that says so; it never stops the daemon, and it never lifts a pause (M3 holds the missions).
+        let monitor = {
+            let env = crate::monitor::engine::Env::from_config(
+                &config,
+                &paths,
+                &packs,
+                infra_policy(&config, &resolution).ok().map(Arc::new),
+            );
+            match crate::monitor::Monitor::start(&paths, &config.monitor, env, Some(key.clone())) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    tracing::error!("The monitor is down: {e}");
+                    Some(crate::monitor::Monitor::down(&paths, &config.monitor, e.to_string()))
+                }
+            }
+        };
         let mut profiles = BTreeMap::new();
         for (name, profile) in &config.models {
             let client = ModelClient::new(name, profile.clone(), &paths.model_keys_dir()).map_err(|e| e.to_string())?;
@@ -4636,6 +5349,12 @@ impl Runtime {
         let proxy = Proxy::start_with(config.daemon.proxy_port, net_tx, Some(audit), Default::default())
             .await
             .map_err(|e| e.to_string())?;
+        // Until the first self-probe finishes (`crate::egress`).
+        let initial_egress = crate::egress::assess(&config.sandbox, None, None);
+        // A seatbelt start has no probe yet, which is not a problem to tell; mode `none` is one that stands.
+        let problem_told_at_start = initial_egress.level == crate::egress::Level::Unbounded
+            && initial_egress.probe_problem
+            && config.sandbox.mode != SandboxMode::Seatbelt;
         let inner = Arc::new_cyclic(|me: &Weak<Inner>| Inner {
             me: me.clone(),
             config,
@@ -4646,6 +5365,7 @@ impl Runtime {
             key,
             models: std::sync::RwLock::new(models),
             model_changes: tokio::sync::Mutex::new(()),
+            reloaded_profiles: Mutex::new(Vec::new()),
             proxy,
             state: Mutex::new(State::default()),
             scan_lock: tokio::sync::Mutex::new(()),
@@ -4658,6 +5378,16 @@ impl Runtime {
             sink: Arc::new(SinkImpl(me.clone())),
             pagers: Mutex::new(Vec::new()),
             box_host,
+            infra: Mutex::new(resolution),
+            egress_told: AtomicBool::new(initial_egress.level == crate::egress::Level::Unbounded),
+            egress_problem_told: AtomicBool::new(problem_told_at_start),
+            egress: Mutex::new(initial_egress),
+            census: Mutex::new(None),
+            census_told: Mutex::new(crate::census::Told::new()),
+            census_blind_told: AtomicBool::new(false),
+            floor: crate::floor::Floor::new(floor_policy),
+            monitor,
+            box_counters_failed: Mutex::new(BTreeSet::new()),
         });
 
         let weak = Arc::downgrade(&inner);
@@ -4691,6 +5421,108 @@ impl Runtime {
             inner.st().tasks.push(watcher);
         }
 
+        // Not under test: a resolver of the machine that runs the tests must not change them.
+        #[cfg(not(test))]
+        {
+            let weak = Arc::downgrade(&inner);
+            let refresher = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(crate::infra::RESOLVE_EVERY).await;
+                    // The live profiles as they are now: a reload may have added endpoints since the start.
+                    let Some(config) = weak.upgrade().map(|inner| inner.infra_config()) else { return };
+                    let fresh = tokio::task::spawn_blocking(move || crate::infra::resolve_system(&config)).await;
+                    let (Some(inner), Ok(fresh)) = (weak.upgrade(), fresh) else { return };
+                    if let Ok(policy) = infra_policy(&inner.infra_config(), &fresh) {
+                        inner.floor.set_infrastructure(policy);
+                    }
+                    inner.proxy.set_local_addrs(fresh.local.clone());
+                    *inner.infra.lock().unwrap_or_else(|p| p.into_inner()) = fresh;
+                }
+            });
+            inner.st().tasks.push(refresher);
+        }
+
+        // The self-probe of the sandbox (E2): at start and every `PROBE_EVERY`. Not under test: a test runtime
+        // must not run commands against the machine's services.
+        #[cfg(not(test))]
+        {
+            let weak = Arc::downgrade(&inner);
+            let (cfg, home) = (inner.config.sandbox.clone(), inner.paths.home.clone());
+            let prober = tokio::spawn(async move {
+                loop {
+                    let report = crate::egress::probe(cfg.clone(), home.clone()).await;
+                    let Some(inner) = weak.upgrade() else { return };
+                    inner.record_egress(Some(report));
+                    drop(inner);
+                    tokio::time::sleep(crate::egress::PROBE_EVERY).await;
+                }
+            });
+            inner.st().tasks.push(prober);
+        }
+
+        // The floor's controls in the proxy (E4): the veto, the canary hooks and the lab-listener check. The
+        // listener check asks the census's machinery who listens on a loopback port, over the sessions known now.
+        {
+            let weak = Arc::downgrade(&inner);
+            let probe: crate::floor::ListenerProbe = Arc::new(move |who, to, client| {
+                let Some(inner) = weak.upgrade() else { return loom_tools::sandbox::census::Listening::Unknown };
+                let (members, _) = inner.census_sessions();
+                let asked: Vec<loom_tools::sandbox::census::Member<'_>> =
+                    members.iter().map(|(id, tmp)| loom_tools::sandbox::census::Member { id, tmp }).collect();
+                let peers = inner.mission_peers(who);
+                let own: Vec<&str> = peers.iter().map(String::as_str).collect();
+                let home = crate::census::canonical_home(&inner.paths.home);
+                loom_tools::sandbox::census::listener_of(&home, &asked, to, client, inner.census_confined(), &own)
+            });
+            inner.floor.set_log(Some(inner.paths.logs_dir().join(FLOOR_EVENTS_FILE)));
+            inner.proxy.set_local_addrs(inner.infra().local);
+            inner.floor.install(&inner.proxy, Some(probe));
+            let weak = Arc::downgrade(&inner);
+            inner.floor.set_notifier(Some(Arc::new(move |e: &crate::floor::FloorEvent| {
+                let Some(inner) = weak.upgrade() else { return };
+                let session = e.session.clone().unwrap_or_else(|| SessionId::from(""));
+                let (title, text) = crate::floor::notice(e);
+                inner.notify("floor", &session, &title, &text);
+            })));
+        }
+
+        // The mission boxes' rule counters (E4f): every `BOX_COUNTERS_EVERY`. Not under test: a test runtime
+        // has no Docker host to ask unless the test provides one.
+        #[cfg(not(test))]
+        if inner.box_host.is_some() {
+            let weak = Arc::downgrade(&inner);
+            let poller = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(BOX_COUNTERS_EVERY).await;
+                    let Some(inner) = weak.upgrade() else { return };
+                    inner.poll_box_counters().await;
+                }
+            });
+            inner.st().tasks.push(poller);
+        }
+
+        // The process and listener census of the sessions (E3): every `census::EVERY`. Not under test: a test
+        // runtime must not scan the machine's process table.
+        #[cfg(not(test))]
+        {
+            let weak = Arc::downgrade(&inner);
+            let census = tokio::spawn(async move {
+                loop {
+                    let Some(inner) = weak.upgrade() else { return };
+                    inner.run_census().await;
+                    drop(inner);
+                    tokio::time::sleep(crate::census::EVERY).await;
+                }
+            });
+            inner.st().tasks.push(census);
+        }
+
+        // The monitor's worker. Not under test: a test runtime pumps the monitor itself, when it wants to.
+        #[cfg(not(test))]
+        if let Some(m) = &inner.monitor {
+            let worker = m.spawn();
+            inner.st().tasks.push(worker);
+        }
         inner.load_known();
         let mut restored: Vec<SessionId> = Vec::new();
         // The flag marks a session that is wanted only for a job (its turn yielded while the job ran,
@@ -4811,6 +5643,115 @@ impl Runtime {
         &self.inner.blobs
     }
 
+    /// Whether a sandboxed command can reach the network outside the egress proxy: the last self-probe's view
+    /// (`crate::egress`), `Unprobed` until the first one finishes.
+    pub fn egress(&self) -> crate::egress::EgressView {
+        self.inner.egress.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The monitor's status (`GET /api/monitor`); `None` when `[monitor] enabled = false`.
+    pub fn monitor_status(&self) -> Option<crate::monitor::core::MonitorStatus> {
+        self.inner.monitor.as_ref().map(|m| m.status())
+    }
+
+    /// A page of the monitor log, optionally the entries about one mission (`GET /api/missions/{id}/monitor`).
+    pub fn monitor_log(
+        &self,
+        mission: Option<&MissionId>,
+        after: u64,
+        limit: usize,
+        quiet: bool,
+    ) -> Result<crate::monitor::LogPage, String> {
+        let Some(m) = self.inner.monitor.as_ref() else {
+            return Err("The monitor is off ([monitor] enabled = false), so there is no log. Set enabled = true and restart the daemon.".into());
+        };
+        m.entries(&crate::monitor::LogFilter { mission: mission.cloned(), after, limit, quiet })
+            .map_err(|e| e.to_string())
+    }
+
+    /// The monitor handle, for the tests of this crate and the daemon's replay.
+    pub fn monitor(&self) -> Option<crate::monitor::Monitor> {
+        self.inner.monitor.clone()
+    }
+
+    /// The last process and listener census (`crate::census`), `None` until the first one has finished.
+    pub fn census(&self) -> Option<crate::census::CensusView> {
+        self.inner.census.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// A census taken now, and kept as the last one.
+    pub async fn census_now(&self) -> Result<crate::census::CensusView, String> {
+        self.inner
+            .run_census()
+            .await
+            .ok_or_else(|| "The census could not be taken: the thread that reads the process table failed.".to_string())
+    }
+
+    /// Stops every process the census finds for `session` (a lead or an agent; a child's commands in the
+    /// parent's copy are the parent's): SIGSTOP then SIGKILL, repeated until none is left. Nothing else is stopped.
+    pub async fn census_kill(&self, session: &SessionId) -> Result<loom_tools::sandbox::census::Killed, String> {
+        let known = self.inner.st().known.contains_key(session);
+        if !known {
+            return Err(no_session(session));
+        }
+        let hints = crate::census::known_groups(self.census().as_ref(), session.as_str());
+        let (id, home) = (session.as_str().to_string(), self.inner.paths.home.clone());
+        let tmp = crate::census::members(&self.inner.paths, std::slice::from_ref(session)).remove(0).1;
+        let confined = self.inner.census_confined();
+        let killed = tokio::task::spawn_blocking(move || {
+            let member = loom_tools::sandbox::census::Member { id: &id, tmp: &tmp };
+            loom_tools::sandbox::census::kill(&crate::census::canonical_home(&home), &[member], &[], &hints, confined)
+        })
+        .await
+        .map_err(|e| format!("The census kill failed to run: {e}."))?;
+        if !killed.readable {
+            return Err(format!(
+                "The process table could not be read, so nothing of session {} was stopped. Try again, or stop its processes by hand.",
+                session.as_str()
+            ));
+        }
+        if !killed.left.is_empty() {
+            tracing::warn!(
+                "{} process(es) of session {} survived the census kill; ask for the census again or stop them by hand",
+                killed.left.len(),
+                session.as_str()
+            );
+        }
+        Ok(killed)
+    }
+
+    /// The floor's controls of the proxy (`crate::floor`): canary users and hosts, and the events of the veto, the
+    /// canary hook and the lab-listener check.
+    pub fn floor(&self) -> crate::floor::Floor {
+        self.inner.floor.clone()
+    }
+
+    /// Ends every open tunnel and forwarded request of the sessions of `mission` (its lead, its agents and their
+    /// copies), reference grants' included (`loom_net::Proxy::cut_sessions`, E4a), and returns how many were
+    /// ended. It does not change any policy: a caller that is holding the mission sets the hold first.
+    pub fn cut_mission(&self, mission: &MissionId) -> usize {
+        let sessions: Vec<SessionId> = self
+            .inner
+            .st()
+            .known
+            .iter()
+            .filter(|(_, k)| &k.meta.mission == mission)
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.inner.proxy.cut_sessions(sessions.iter())
+    }
+
+    /// The rule counters of the mission boxes that moved since the last poll, read now (and recorded in
+    /// `<home>/logs/box-counters.jsonl` as the periodic poll does).
+    pub async fn box_counters_now(&self) -> Vec<(MissionId, Vec<loom_tools::boxctl::RuleCount>)> {
+        self.inner.poll_box_counters().await
+    }
+
+    /// Take a self-probe report as the probe loop does (tests, and a caller that probed by other means).
+    pub fn record_egress_probe(&self, report: loom_tools::sandbox::selfprobe::Report) {
+        self.inner.record_egress(Some(report));
+    }
+
     /// Port of the egress proxy on 127.0.0.1.
     pub fn proxy_port(&self) -> u16 {
         self.inner.proxy.port()
@@ -4834,6 +5775,11 @@ impl Runtime {
         let role = inner.packs.role(new.pack.as_deref(), new.role.as_deref())?.clone();
         inner.check_network(&role.pack)?;
         let profile_name = inner.models().resolve(new.model.as_deref().or(role.model.as_deref()))?;
+        if inner.models().get(&profile_name).is_some_and(|p| is_review_profile(p.client.profile())) {
+            return Err(format!(
+                "The model profile \"{profile_name}\" has purpose = \"review\": it is a reviewer's, and a mission led by it would run unreviewed. Choose an agent profile (--model), or change its purpose."
+            ));
+        }
         // The agents' models are checked before anything exists, so a bad one refuses the creation.
         let role_models: BTreeMap<String, String> =
             new.role_models.iter().map(|(r, p)| (r.trim().to_string(), p.trim().to_string())).collect();
@@ -5204,9 +6150,34 @@ impl Runtime {
         }
         // The packs name profiles in their roles (`model`, `alloy_models`, `escalation_model`).
         self.inner.packs.check_profiles(&cfg.models)?;
+        // A review profile never runs an agent: a reload cannot turn the profile of a session or a mission's
+        // choice into one (`purpose = "review"`), or that session would go on unreviewed.
+        for name in cfg.models.iter().filter(|(_, p)| is_review_profile(p)).map(|(n, _)| n) {
+            let on = self.inner.sessions_on(name);
+            let chosen = {
+                let st = self.inner.st();
+                st.known.values().filter(|k| k.meta.role_models.values().any(|v| v == name)).count()
+            };
+            if !on.is_empty() || chosen > 0 {
+                return Err(format!(
+                    "Profile \"{name}\" has purpose = \"review\" in the file, but {} session(s) run on it and {chosen} mission(s) choose it for their agents: a reviewer's profile never runs an agent, so nothing was changed. Switch them to another profile first (`loom models set`, `loom models role`), or keep its purpose.",
+                    on.len()
+                ));
+            }
+        }
         let old = self.inner.models();
+        // A new or changed endpoint is infrastructure from the reload on, so the deny must be able to read it, as
+        // `Runtime::start` requires of the start-up profiles: otherwise every policy built afterwards (a new session,
+        // an activation, an agent, a grant) would fail. `ModelClient::new` accepts more than the deny reads.
+        for (name, p) in cfg.models.iter().filter(|(n, p)| old.get(n).is_none_or(|rt| rt.client.profile() != *p)) {
+            let mut one = self.inner.config.clone();
+            one.models = BTreeMap::from([(name.clone(), p.clone())]);
+            infra_policy(&one, &crate::infra::Resolution::default())
+                .map_err(|e| format!("Profile \"{name}\" cannot be used, so nothing was changed: {e}"))?;
+        }
         let mut report = ModelsReload { default_model: cfg.default_model.clone(), ..ModelsReload::default() };
         let mut profiles = BTreeMap::new();
+        let mut made_live = Vec::new();
         for (name, p) in &cfg.models {
             match old.get(name) {
                 Some(rt) if rt.client.profile() == p => {
@@ -5216,6 +6187,7 @@ impl Runtime {
                     let client = ModelClient::new(name, p.clone(), &self.inner.paths.model_keys_dir())
                         .map_err(|e| e.to_string())?;
                     profiles.insert(name.clone(), Arc::new(ProfileRt::new(client, p.max_concurrent)));
+                    made_live.push((name.clone(), p.clone()));
                     if before.is_some() {
                         report.changed.push(name.clone());
                     } else {
@@ -5233,8 +6205,22 @@ impl Runtime {
             }
         }
         report.removed = old.profiles.keys().filter(|n| !cfg.models.contains_key(*n)).cloned().collect();
+        report.notes.extend(loopback_reload_notes(&self.inner.config.sandbox, &made_live));
+        // Kept before the table changes, and after the next reload too: the deny never loses an endpoint until the
+        // restart, though a later reload removes or changes the profile (a session may still run on it).
+        self.inner
+            .reloaded_profiles
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(made_live.into_iter().map(|(_, p)| p));
         *self.inner.models.write().unwrap_or_else(|p| p.into_inner()) =
             Arc::new(ModelTable { default_model: cfg.default_model.clone(), profiles });
+        // A new or changed endpoint is infrastructure at once for every connection through the proxy, those of every
+        // session's commands included (E1). A loopback endpoint's port is refused by the sandboxes made from now on:
+        // those of running sessions keep the ports they were made with until they are made again (`sandbox_cfg_for`).
+        if !report.added.is_empty() || !report.changed.is_empty() {
+            self.inner.refresh_infrastructure().await;
+        }
         for name in report.changed.clone() {
             for id in self.inner.sessions_on(&name) {
                 match self.switch(&id, &name, crate::session::SWITCH_RELOADED).await {
@@ -5280,11 +6266,19 @@ impl Runtime {
         }
         let _one_at_a_time = self.inner.model_changes.lock().await;
         let models = self.inner.models();
-        if models.get(profile).is_none() {
-            return Err(format!(
-                "There is no model profile \"{profile}\" ({}). Add it to [models] in the config and run `loom models reload`.",
-                models.names()
-            ));
+        match models.get(profile) {
+            None => {
+                return Err(format!(
+                    "There is no model profile \"{profile}\" ({}). Add it to [models] in the config and run `loom models reload`.",
+                    models.names()
+                ));
+            }
+            Some(rt) if is_review_profile(rt.client.profile()) => {
+                return Err(format!(
+                    "The model profile \"{profile}\" has purpose = \"review\": it is a reviewer's, and a session switched to it would run unreviewed. Choose an agent profile, or change its purpose."
+                ));
+            }
+            Some(_) => {}
         }
         // A lead whose finish gate wants its verifier on another profile cannot move onto the one chosen
         // for that verifier: the next `finish` would be refused.
@@ -5343,10 +6337,19 @@ impl Runtime {
                 profile: lead.profile.clone(),
                 model: lead.model.clone(),
                 context_window: lead.context_window.unwrap_or(0),
+                lineage: models
+                    .get(&lead.profile)
+                    .map(|p| loom_core::lineage::resolve_served(&lead.profile, p.client.profile(), &lead.model)),
             },
             any_role: lead.role_models.get(ANY_ROLE).cloned(),
             roles,
-            profiles: models.profiles.keys().cloned().collect(),
+            // What can be chosen: a review profile never runs an agent.
+            profiles: models
+                .profiles
+                .iter()
+                .filter(|(_, rt)| !is_review_profile(rt.client.profile()))
+                .map(|(name, _)| name.clone())
+                .collect(),
             default_model: models.default_model.clone(),
         })
     }
@@ -5444,7 +6447,12 @@ impl Runtime {
             .cloned()
             .ok_or_else(|| format!("The model profile \"{profile}\" is not configured."))?;
         let (model, window, _) = self.inner.facts(profile).await?;
-        let to = ModelRef { profile: profile.to_string(), model: model.clone(), context_window: window.unwrap_or(0) };
+        let to = ModelRef {
+            profile: profile.to_string(),
+            model: model.clone(),
+            context_window: window.unwrap_or(0),
+            lineage: Some(loom_core::lineage::resolve_served(profile, rt.client.profile(), &model)),
+        };
         // Memory, then disk, then the task: a session activated meanwhile is opened on the new model
         // (and `open` records the switch); a restart that cuts this short opens it on the new model too.
         let (meta, before) = {
@@ -5558,12 +6566,37 @@ impl Runtime {
         note: Option<&str>,
     ) -> Result<ScopeReceipt, String> {
         let hosts = loom_net::policy::check_hosts(hosts)?;
+        // Infrastructure is refused to every command whatever is granted: say so now, not at the first connect.
+        let infra = Policy::new(&self.inner.config.network).and_then(|p| {
+            p.with_infrastructure(&infra_spec_resolved(&self.inner.infra_config(), &self.inner.infra()))
+        })?;
+        for h in &hosts {
+            if let Some(rule) = infra.infrastructure_refusal(h) {
+                return Err(format!(
+                    "The host `{h}` is infrastructure of this machine or of loom ({rule}); no grant lets a command reach it, so nothing was granted. Grant the target by its own name or address instead."
+                ));
+            }
+        }
         let note = note.map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
         let lead = self.lead_of(id)?;
         let ledger = self.inner.mission_explicit(&lead)?;
         // Held by the mission from now on, so that a lead activated by the send below gets the policy.
-        let added: Vec<String> = {
+        let (added, unrevoked): (Vec<String>, Vec<String>) = {
             let mut st = self.inner.st();
+            // A host granted again after a revoke is granted again.
+            let revoked = st
+                .scope_revoked
+                .entry(lead.mission.clone())
+                .or_insert_with(|| load_revoked(&self.inner.revoked_path(&lead.mission)));
+            let unrevoked: Vec<String> =
+                revoked.iter().filter(|r| hosts.iter().any(|h| h.eq_ignore_ascii_case(r))).cloned().collect();
+            if !unrevoked.is_empty() {
+                revoked.retain(|r| !unrevoked.iter().any(|u| u.eq_ignore_ascii_case(r)));
+                let kept = revoked.clone();
+                if let Err(e) = self.inner.save_revoked(&lead.mission, &kept) {
+                    tracing::warn!("the revoked hosts could not be saved: {e}");
+                }
+            }
             let granted = st.scope.entry(lead.mission.clone()).or_default();
             let mut added = Vec::new();
             for h in &hosts {
@@ -5572,16 +6605,31 @@ impl Runtime {
                     added.push(h.clone());
                 }
             }
-            added
+            let g = st.scope_gen.entry(lead.mission.clone()).or_insert(0);
+            *g = g.wrapping_add(1);
+            (added, unrevoked)
         };
         let input = Input::Scope { hosts: hosts.clone(), note };
         if let Err(e) = self.send_to_lead(&lead.id, input, ledger, None) {
-            if let Some(granted) = self.inner.st().scope.get_mut(&lead.mission) {
-                granted.retain(|h| !added.contains(h));
+            {
+                let mut st = self.inner.st();
+                if let Some(granted) = st.scope.get_mut(&lead.mission) {
+                    granted.retain(|h| !added.contains(h));
+                }
+                // The revokes that this grant lifted stand again.
+                if !unrevoked.is_empty() {
+                    let revoked = st.scope_revoked.entry(lead.mission.clone()).or_default();
+                    revoked.extend(unrevoked.iter().cloned());
+                    let kept = revoked.clone();
+                    if let Err(e) = self.inner.save_revoked(&lead.mission, &kept) {
+                        tracing::warn!("the revoked hosts could not be saved: {e}");
+                    }
+                }
             }
             // A lead activated by the failed send was built with the new hosts: take them back.
-            if !added.is_empty() {
-                for meta in self.active_family(&lead.mission) {
+            if !added.is_empty() || !unrevoked.is_empty() {
+                self.inner.bump_scope_generation(&lead.mission);
+                for meta in self.mission_family(&lead.mission) {
                     if let Ok(policy) = self.inner.session_policy(&meta, ledger) {
                         self.inner.proxy.set_policy(&meta.id, policy);
                     }
@@ -5589,7 +6637,7 @@ impl Runtime {
             }
             return Err(e);
         }
-        let family = self.active_family(&lead.mission);
+        let family = self.mission_family(&lead.mission);
         let mut lead_set = false;
         for meta in &family {
             let policy = self.inner.session_policy(meta, ledger)?;
@@ -5607,10 +6655,142 @@ impl Runtime {
         Ok(ScopeReceipt { lead: lead.id, hosts, ledger })
     }
 
-    /// The metas of the active sessions of `mission`.
-    fn active_family(&self, mission: &MissionId) -> Vec<SessionMeta> {
+    /// Withdraw the operator's grant of `host` (exactly as it was granted, ignoring case) from `mission`, for
+    /// `reason`. In this order: (1) the revoke is appended to the mission's ledger (`ScopeRevoke`, the
+    /// ledger refuses a host that is not granted, with a sentence listing what is; a mission without a
+    /// ledger checks the grants held in memory); (2) the host leaves the mission's grants held in memory and
+    /// is kept out of `granted_hosts` until it is granted again; (3) every running session of the mission
+    /// gets its narrowed egress policy and its open tunnels and forwards to the host are cut
+    /// (`Proxy::cut_hosts`); (4) the mission's box rules are applied again; (5) the lead, when it is
+    /// running, gets a protected note (`Input::ScopeRevoked`, no turn). A session that starts later is built
+    /// without the host. The infrastructure deny (E1) is not touched. A step after the first that fails
+    /// does not undo the earlier ones: the error says what stands. Refused: a blank host or reason, a mission
+    /// with no lead, a host that is not granted.
+    pub async fn revoke_scope(
+        &self,
+        mission: &MissionId,
+        host: &str,
+        reason: &str,
+    ) -> Result<ScopeRevokeReceipt, String> {
+        self.inner.check_open()?;
+        let (host, reason) = (host.trim(), reason.trim());
+        if host.is_empty() {
+            return Err(
+                "Name the host to revoke, exactly as it was granted (a host or `*.suffix`, optionally with `:port`)."
+                    .into(),
+            );
+        }
+        if reason.is_empty() {
+            return Err("Say why the host is revoked: the reason is kept in the ledger and shown to the lead.".into());
+        }
+        let lead = self.inner.mission_lead(mission).ok_or_else(|| {
+            format!("There is no mission {} with a lead session; `loom ls` lists the missions.", mission.as_str())
+        })?;
+        let ledger = self.inner.mission_explicit(&lead)?;
+        let granted = self.inner.granted_hosts(&lead, ledger);
+        // What the ledger holds as granted now, apart from what was revoked here and not recorded: the lead
+        // may have recorded the grant since, and then the revoke can be recorded too.
+        let journal = Journal::new(self.inner.paths.journal(mission), self.inner.key.clone());
+        let in_ledger: Vec<String> = if ledger {
+            journal.state().map(|state| state.granted_hosts()).map_err(|e| {
+                format!("The ledger of the mission cannot be read ({e}); nothing was changed. Try again.")
+            })?
+        } else {
+            Vec::new()
+        };
+        let entry = match granted.iter().chain(&in_ledger).find(|h| h.eq_ignore_ascii_case(host)) {
+            Some(h) => h.clone(),
+            None => {
+                let now = if granted.is_empty() {
+                    "no host is granted to this mission".to_string()
+                } else {
+                    format!("granted to this mission: {}", granted.join(", "))
+                };
+                return Err(match covering_grant(&granted, host) {
+                    Some(g) => format!("The host `{host}` is not granted by itself; the grant `{g}` covers it. Revoke `{g}` (a revoke names a grant exactly as it was written), then grant the hosts that should stay. ({now})"),
+                    None => format!("The host `{host}` is not granted, so there is nothing to revoke ({now}). Write the host exactly as it was granted."),
+                });
+            }
+        };
+        // (1) The record first: a revoke that is not recorded would come back at the next start. The ledger
+        // holds the grant when it lists the host itself; a grant the lead has not recorded yet (it is queued
+        // on disk) is revoked here without a record, and the revoked-hosts file keeps it out.
+        let mut recorded = false;
+        if ledger && in_ledger.iter().any(|h| h.eq_ignore_ascii_case(&entry)) {
+            let op = LedgerOp::ScopeRevoke { host: entry.clone(), reason: reason.to_string() };
+            match journal.append(&lead.id, true, op, &|_| Ok(())) {
+                Ok(_) => recorded = true,
+                Err(e) => {
+                    return Err(format!(
+                        "The revoke could not be recorded in the ledger ({e}); nothing was changed. Try again."
+                    ))
+                }
+            }
+        }
+        // (2) Out of the grants held in memory, and kept out until granted again: in memory and on disk, so
+        // that it holds after a restart, whatever the ledger says of a grant recorded later.
+        self.inner.bump_scope_generation(mission);
+        let kept = {
+            let mut st = self.inner.st();
+            if let Some(held) = st.scope.get_mut(mission) {
+                held.retain(|h| !h.eq_ignore_ascii_case(&entry));
+            }
+            let revoked = st
+                .scope_revoked
+                .entry(mission.clone())
+                .or_insert_with(|| load_revoked(&self.inner.revoked_path(mission)));
+            if !revoked.iter().any(|r| r.eq_ignore_ascii_case(&entry)) {
+                revoked.push(entry.clone());
+            }
+            revoked.clone()
+        };
+        let saved = self.inner.save_revoked(mission, &kept);
+        // (3) Every session of the mission, started or being started: the narrowed policy, then the open
+        // connections.
+        let (mut sessions, mut cut, mut failed) = (0u32, 0u32, Vec::new());
+        for meta in self.mission_family(mission) {
+            match self.inner.session_policy(&meta, ledger) {
+                Ok(policy) => {
+                    if self.inner.proxy.set_policy(&meta.id, policy) {
+                        sessions = sessions.saturating_add(1);
+                        let n = self.inner.proxy.cut_hosts(&meta.id, &entry);
+                        cut = cut.saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
+                    }
+                }
+                Err(e) => failed.push(format!("{}: {e}", meta.id.as_str())),
+            }
+        }
+        // (4) The box.
+        self.inner.box_resync(mission).await;
+        // (5) The lead is told; no turn, and nothing when it is not running.
+        if let Some(k) = self.inner.st().known.get(&lead.id) {
+            if let Some(a) = k.active.as_ref() {
+                let _ = a.inputs.send(Input::ScopeRevoked { host: entry.clone(), reason: reason.to_string() });
+            }
+        }
+        if let Err(e) = saved {
+            if !recorded {
+                return Err(format!(
+                    "The revoke of {entry} is applied to the running sessions but could not be saved ({e}), and the ledger does not hold the grant yet: it is undone by a restart of the daemon. Free the disk or fix the permissions of the loom home, then revoke it again."
+                ));
+            }
+            tracing::warn!("the revoked hosts of {} could not be saved: {e}", mission.as_str());
+        }
+        if !failed.is_empty() {
+            return Err(format!(
+                "The revoke of {entry} is recorded and kept out of every new session, but the egress policy of {} could not be rebuilt ({}): stop that session so that it restarts without the host.",
+                failed.len(),
+                failed.join("; ")
+            ));
+        }
+        Ok(ScopeRevokeReceipt { lead: lead.id, host: entry, ledger, recorded, sessions, cut })
+    }
+
+    /// The metas of every session of `mission` that is known, started or not: one that is being started
+    /// holds its proxy grant before it is active, and a grant or revoke must reach it.
+    fn mission_family(&self, mission: &MissionId) -> Vec<SessionMeta> {
         let st = self.inner.st();
-        st.known.values().filter(|k| &k.meta.mission == mission && k.active.is_some()).map(|k| k.meta.clone()).collect()
+        st.known.values().filter(|k| &k.meta.mission == mission).map(|k| k.meta.clone()).collect()
     }
 
     pub async fn stop(&self, id: &SessionId) -> Result<(), String> {
@@ -5685,6 +6865,12 @@ impl Runtime {
         // which reaches the lead when the mission is unarchived.
         drop(closing);
         if archived {
+            // An archived session is not in the census, so what its task did not take with it (a process that left
+            // its process group) is stopped now, once the tasks have ended, while it can still be found.
+            let inner = self.inner.clone();
+            let ids = family.clone();
+            let leftovers = tokio::spawn(async move { inner.stop_leftovers(&ids).await });
+            self.inner.st().tasks.push(leftovers);
             // The operator is done with this mission, so its open inbox items stop waiting: they are
             // dropped from the index and stop notifying (the repeat notice ends when the item leaves the
             // index). Archived sessions are not activated at the next start, so the items do not come
@@ -6100,6 +7286,9 @@ impl Runtime {
             }
             (actives, std::mem::take(&mut st.tasks))
         };
+        if let Some(m) = &inner.monitor {
+            m.shutdown();
+        }
         let grace = Duration::from_secs(inner.config.tools.kill_grace_s);
         let mut tasks = Vec::new();
         let mut jobs = Vec::new();
@@ -6145,6 +7334,8 @@ impl Runtime {
         for task in background {
             task.abort();
         }
+        // The self-probe's commands and decoys must not outlive the daemon.
+        loom_tools::sandbox::selfprobe::stop();
         if let Some(host) = &inner.box_host {
             host.shutdown().await;
         }
@@ -6926,6 +8117,404 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_scope_revoke_narrows_the_running_policy_is_recorded_and_survives_a_restart() {
+        use loom_core::event::NoteKind;
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        let rule = |rt: &Runtime, host: &str| rt.inner.proxy.check_name(&id, host, 443).map(|v| v.rule);
+        let hosts = vec!["api.example.test".to_string(), "*.cdn.test".to_string()];
+        e.rt.grant_scope(&id, &hosts, None).await.unwrap();
+        until("grants in ledger", || e.rt.ledger(&mission).is_ok_and(|l| l.state.scope_grants.len() == 1)).await;
+        assert_eq!(rule(&e.rt, "api.example.test").as_deref(), Some("allow api.example.test"));
+        let turns = || e.kinds(&id).iter().filter(|k| *k == "turn_start").count();
+        let before = turns();
+
+        // Refusals say what to write.
+        let m = mission.clone();
+        let err = e.rt.revoke_scope(&m, "api.example.test", "  ").await.unwrap_err();
+        assert!(err.contains("Say why"), "{err}");
+        let err = e.rt.revoke_scope(&m, " ", "r").await.unwrap_err();
+        assert!(err.contains("Name the host"), "{err}");
+        let err = e.rt.revoke_scope(&m, "nope.example.test", "r").await.unwrap_err();
+        assert!(err.contains("not granted") && err.contains("api.example.test, *.cdn.test"), "{err}");
+        let err = e.rt.revoke_scope(&MissionId::from("m-nope"), "api.example.test", "r").await.unwrap_err();
+        assert!(err.contains("no mission m-nope"), "{err}");
+        assert_eq!(
+            rule(&e.rt, "api.example.test").as_deref(),
+            Some("allow api.example.test"),
+            "refusals change nothing"
+        );
+
+        // The revoke: recorded, narrowed at once (the lead was running), noted, no turn.
+        let receipt = e.rt.revoke_scope(&m, " API.example.test ", " wrong target ").await.unwrap();
+        assert_eq!(
+            receipt,
+            ScopeRevokeReceipt {
+                lead: id.clone(),
+                host: "api.example.test".into(),
+                ledger: true,
+                recorded: true,
+                sessions: 1,
+                cut: 0
+            }
+        );
+        assert_eq!(rule(&e.rt, "api.example.test").as_deref(), Some("deny revoked api.example.test"));
+        assert_eq!(rule(&e.rt, "x.cdn.test").as_deref(), Some("allow *.cdn.test"), "the other grant stands");
+        let state = e.rt.ledger(&mission).unwrap().state;
+        assert_eq!(state.granted_hosts(), ["*.cdn.test"]);
+        assert_eq!(
+            (state.scope_revokes[0].host.as_str(), state.scope_revokes[0].reason.as_str()),
+            ("api.example.test", "wrong target")
+        );
+        until("note", || {
+            e.has(&id, |ev| matches!(ev, Event::HarnessNote { note: NoteKind::Approval, text } if text.contains("withdrew network access to api.example.test") && text.contains("wrong target")))
+        })
+        .await;
+        assert_eq!(turns(), before, "a revoke must not start a turn");
+        // Twice: the ledger no longer has it.
+        let err = e.rt.revoke_scope(&m, "api.example.test", "again").await.unwrap_err();
+        assert!(err.contains("not granted"), "{err}");
+
+        // Granted again, it is allowed again.
+        e.rt.grant_scope(&id, &["api.example.test".to_string()], None).await.unwrap();
+        assert_eq!(rule(&e.rt, "api.example.test").as_deref(), Some("allow api.example.test"));
+        until("regrant in ledger", || {
+            e.rt.ledger(&mission).is_ok_and(|l| l.state.granted_hosts() == ["*.cdn.test", "api.example.test"])
+        })
+        .await;
+        e.rt.revoke_scope(&m, "api.example.test", "once more").await.unwrap();
+        e.rt.shutdown().await;
+
+        // A new daemon builds the session from the ledger: the revoked host stays out.
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        rt2.inner.activate(&id).unwrap();
+        assert_eq!(rule(&rt2, "api.example.test").as_deref(), Some("deny revoked api.example.test"));
+        assert_eq!(rule(&rt2, "x.cdn.test").as_deref(), Some("allow *.cdn.test"));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn no_grant_reaches_the_infrastructure() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        // The grant is refused up front, with the rule, and grants nothing of the list.
+        for bad in ["169.254.169.254", "127.0.0.1:9222", "127.0.0.1:2375", "metadata.google.internal"] {
+            let hosts = vec![bad.to_string(), "lab.example.test".to_string()];
+            let err = e.rt.grant_scope(&id, &hosts, None).await.unwrap_err();
+            assert!(
+                err.contains(bad) && err.contains("deny infrastructure: ") && err.contains("nothing was granted"),
+                "{err}"
+            );
+        }
+        e.rt.grant_scope(&id, &["lab.example.test".to_string()], None).await.unwrap();
+        let check =
+            |host: &str, port: u16| e.rt.inner.proxy.check_name(&id, host, port).map(|v| v.rule).unwrap_or_default();
+        assert_eq!(check("lab.example.test", 443), "allow lab.example.test");
+        for (host, port) in
+            [("169.254.169.254", 80), ("127.0.0.1", 9222), ("127.0.0.1", 2375), ("metadata.google.internal", 80)]
+        {
+            let r = check(host, port);
+            assert!(r.starts_with("deny infrastructure: "), "{host}:{port} {r}");
+        }
+        e.rt.shutdown().await;
+    }
+
+    /// A profile a reload adds is infrastructure at once: a host the mission was granted becomes unreachable when it
+    /// turns out to be a model endpoint, and a loopback endpoint's port is refused to the sandboxes made from then on.
+    #[tokio::test]
+    async fn a_model_endpoint_a_reload_adds_is_infrastructure_at_once() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        e.rt.grant_scope(&id, &["llm.example.test:9000".to_string()], None).await.unwrap();
+        let check =
+            |host: &str, port: u16| e.rt.inner.proxy.check_name(&id, host, port).map(|v| v.rule).unwrap_or_default();
+        let before = check("llm.example.test", 9000);
+        assert!(before.starts_with("allow "), "{before}");
+        let mut cfg = e.config.clone();
+        for (name, url) in [("remote", "http://llm.example.test:9000/v1"), ("near", "http://127.0.0.1:9123/v1")] {
+            let mut p = cfg.models["mock"].clone();
+            p.base_url = url.into();
+            cfg.models.insert(name.into(), p);
+        }
+        std::fs::write(e.rt.paths().config_file(), toml::to_string(&cfg).unwrap()).unwrap();
+        let r = e.rt.reload_models().await.unwrap();
+        assert_eq!(r.added, ["near", "remote"]);
+        let rule = check("llm.example.test", 9000);
+        assert!(rule.starts_with("deny infrastructure: model endpoint llm.example.test:9000"), "{rule}");
+        let err = e.rt.grant_scope(&id, &["127.0.0.1:9123".to_string()], None).await.unwrap_err();
+        assert!(err.contains("deny infrastructure: "), "{err}");
+        let role = e.rt.inner.packs.role(None, None).unwrap().clone();
+        let cfg = sandbox_cfg_for(&e.rt.inner.config.sandbox, &role, Path::new("/ws"), &e.rt.inner.models().configs());
+        assert!(cfg.infra_ports.contains(&9123), "{:?}", cfg.infra_ports);
+        e.rt.shutdown().await;
+    }
+
+    /// A session may still run on a profile a later reload removed, so its endpoint stays infrastructure until the
+    /// restart: for the grants refused, the policies derived again, and the sandboxes made from then on.
+    #[tokio::test]
+    async fn an_endpoint_a_reload_made_live_stays_infrastructure_after_a_later_reload_removes_it() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        // The operator granted the host before it was a model endpoint.
+        e.rt.grant_scope(&id, &["gpu2.example.com:443".to_string()], None).await.unwrap();
+        let rule = || e.rt.inner.proxy.check_name(&id, "gpu2.example.com", 443).map(|v| v.rule).unwrap_or_default();
+        assert!(rule().starts_with("allow "), "{}", rule());
+        let file = e.rt.paths().config_file();
+        let mut cfg = e.config.clone();
+        for (name, url) in [("gpu2", "https://gpu2.example.com/v1"), ("near", "http://127.0.0.1:9124/v1")] {
+            let mut p = cfg.models["mock"].clone();
+            p.base_url = url.into();
+            cfg.models.insert(name.into(), p);
+        }
+        std::fs::write(&file, toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(e.rt.reload_models().await.unwrap().added, ["gpu2", "near"]);
+        assert!(rule().starts_with("deny infrastructure: model endpoint gpu2.example.com:443"), "{}", rule());
+        // Reload 2 removes both; nothing on the books may reach them before the restart.
+        std::fs::write(&file, toml::to_string(&e.config).unwrap()).unwrap();
+        assert_eq!(e.rt.reload_models().await.unwrap().removed, ["gpu2", "near"]);
+        // What the periodic refresher does: the floor and every granted session's policy are built again.
+        e.rt.inner.refresh_infrastructure().await;
+        assert!(rule().starts_with("deny infrastructure: model endpoint gpu2.example.com:443"), "{}", rule());
+        let err = e.rt.grant_scope(&id, &["127.0.0.1:9124".to_string()], None).await.unwrap_err();
+        assert!(err.contains("deny infrastructure: "), "{err}");
+        let spec = infra_spec(&e.rt.inner.infra_config());
+        assert!(spec.model_endpoints.iter().any(|m| m == "gpu2.example.com:443"), "{:?}", spec.model_endpoints);
+        let role = e.rt.inner.packs.role(None, None).unwrap().clone();
+        let cfg =
+            sandbox_cfg_for(&e.rt.inner.config.sandbox, &role, Path::new("/ws"), &e.rt.inner.infra_config().models);
+        assert!(cfg.infra_ports.contains(&9124), "{:?}", cfg.infra_ports);
+        e.rt.shutdown().await;
+    }
+
+    /// The start refuses an endpoint the infrastructure deny cannot read; so does a reload, changing nothing, rather
+    /// than leave every policy built afterwards failing.
+    #[tokio::test]
+    async fn a_reload_refuses_an_endpoint_the_infrastructure_deny_cannot_read() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let file = e.rt.paths().config_file();
+        for url in ["http://gpu:/v1", "http://mod\u{e8}le.lan:8000/v1"] {
+            let mut cfg = e.config.clone();
+            let mut p = cfg.models["mock"].clone();
+            p.base_url = url.into();
+            cfg.models.insert("gpu".into(), p);
+            std::fs::write(&file, toml::to_string(&cfg).unwrap()).unwrap();
+            let err = e.rt.reload_models().await.unwrap_err();
+            assert!(err.starts_with("Profile \"gpu\" cannot be used, so nothing was changed: "), "{url}: {err}");
+            assert!(e.rt.health().await.iter().all(|h| h.profile != "gpu"), "{url}");
+            assert!(check_infrastructure(&e.rt.inner.infra_config()).is_ok(), "{url}");
+        }
+        // Every session is still built: the deny was not handed an endpoint it cannot read.
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        e.rt.grant_scope(&id, &["lab.example.test".to_string()], None).await.unwrap();
+        e.rt.shutdown().await;
+    }
+
+    #[test]
+    fn a_reload_says_when_running_sandboxes_still_allow_a_new_loopback_endpoint() {
+        let near =
+            |url: &str| vec![("near".to_string(), ModelProfile { base_url: url.into(), ..ModelProfile::default() })];
+        let mut sandbox = SandboxCfg { loopback_ports: vec![8001], infra_ports: vec![8000], ..SandboxCfg::default() };
+        let notes = loopback_reload_notes(&sandbox, &near("http://127.0.0.1:8001/v1"));
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("\"near\"")
+                && notes[0].contains("port 8001")
+                && notes[0].contains("sandbox.loopback_ports")
+        );
+        assert!(notes[0].contains("sessions already running"), "{}", notes[0]);
+        // Not reachable under the loopback settings, already refused at the start, or not on this machine: nothing.
+        assert!(loopback_reload_notes(&sandbox, &near("http://127.0.0.1:8002/v1")).is_empty());
+        assert!(loopback_reload_notes(&sandbox, &near("http://localhost:8000/v1")).is_empty());
+        assert!(loopback_reload_notes(&sandbox, &near("http://10.0.0.5:8001/v1")).is_empty());
+        sandbox.loopback_all = true;
+        let notes = loopback_reload_notes(&sandbox, &near("http://localhost:8002/v1"));
+        assert!(notes.len() == 1 && notes[0].contains("sandbox.loopback_all"), "{notes:?}");
+        sandbox.mode = SandboxMode::None;
+        assert!(loopback_reload_notes(&sandbox, &near("http://localhost:8002/v1")).is_empty(), "nothing is confined");
+    }
+
+    /// The tailnet case: the model host is configured by name, the agent asks for its IP address.
+    #[tokio::test]
+    async fn a_literal_grant_of_the_address_a_model_host_resolves_to_is_refused() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        *e.rt.inner.infra.lock().unwrap() = crate::infra::Resolution {
+            addrs: vec![loom_net::InfraAddr {
+                label: "model endpoint spark-one.tail1234.ts.net:8000".into(),
+                addr: "100.101.102.103".parse().unwrap(),
+                port: Some(8000),
+            }],
+            ..Default::default()
+        };
+        let err = e.rt.grant_scope(&id, &["100.101.102.103:8000".to_string()], None).await.unwrap_err();
+        assert!(err.contains("deny infrastructure: model endpoint spark-one"), "{err}");
+        // A grant that was recorded before the address was known is inert at the connection.
+        let meta = e.rt.inner.st().known.get(&id).unwrap().meta.clone();
+        e.rt.inner.st().scope.entry(mission).or_default().push("100.101.102.103:8000".into());
+        let policy = e.rt.inner.session_policy(&meta, true).unwrap();
+        let v = policy.check_addr("100.101.102.103", 8000, "100.101.102.103".parse().unwrap(), "r");
+        assert!(!v.allowed && v.rule.starts_with("deny infrastructure: model endpoint"), "{v:?}");
+        e.rt.shutdown().await;
+    }
+
+    /// A revoke is a withdrawal: a wildcard grant that also covers the host does not keep it reachable.
+    #[tokio::test]
+    async fn a_revoked_host_stays_refused_under_a_covering_wildcard_and_after_a_restart() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        let rule = |rt: &Runtime, host: &str| rt.inner.proxy.check_name(&id, host, 443).map(|v| v.rule);
+        let hosts = vec!["*.lab.test".to_string(), "api.lab.test".to_string()];
+        e.rt.grant_scope(&id, &hosts, None).await.unwrap();
+        until("grants in ledger", || e.rt.ledger(&mission).is_ok_and(|l| l.state.scope_grants.len() == 1)).await;
+        // A host only the wildcard grants: the sentence names the wildcard.
+        let err = e.rt.revoke_scope(&mission, "web.lab.test", "r").await.unwrap_err();
+        assert!(err.contains("not granted by itself") && err.contains("`*.lab.test` covers it"), "{err}");
+        e.rt.revoke_scope(&mission, "api.lab.test", "out of scope").await.unwrap();
+        assert_eq!(rule(&e.rt, "api.lab.test").as_deref(), Some("deny revoked api.lab.test"));
+        assert_eq!(rule(&e.rt, "web.lab.test").as_deref(), Some("allow *.lab.test"));
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        rt2.inner.activate(&id).unwrap();
+        assert_eq!(rule(&rt2, "api.lab.test").as_deref(), Some("deny revoked api.lab.test"));
+        // Granting it again lifts the revoke.
+        rt2.grant_scope(&id, &["api.lab.test".to_string()], None).await.unwrap();
+        assert_eq!(rule(&rt2, "api.lab.test").as_deref(), Some("allow *.lab.test"));
+        rt2.shutdown().await;
+    }
+
+    /// The grant is held in memory (its input is queued for the lead); the revoke holds across a restart and
+    /// can be recorded once the lead has recorded the grant.
+    #[tokio::test]
+    async fn a_revoke_of_a_grant_the_lead_has_not_recorded_survives_a_restart_and_can_be_recorded_later() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        e.rt.inner.st().scope.entry(mission.clone()).or_default().push("late.example.test".into());
+        let receipt = e.rt.revoke_scope(&mission, "late.example.test", "wrong target").await.unwrap();
+        assert!(!receipt.recorded, "{receipt:?}");
+        assert!(e.rt.inner.revoked_path(&mission).exists());
+        // The lead records the queued grant afterwards.
+        let journal = Journal::new(e.rt.inner.paths.journal(&mission), e.rt.inner.key.clone());
+        let op = LedgerOp::ScopeGrant { hosts: vec!["late.example.test".into()], note: None };
+        journal.append(&id, true, op, &|_| Ok(())).unwrap();
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        rt2.inner.activate(&id).unwrap();
+        let rule = |host: &str| rt2.inner.proxy.check_name(&id, host, 443).map(|v| v.rule);
+        assert_eq!(
+            rule("late.example.test").as_deref(),
+            Some("deny revoked late.example.test"),
+            "the ledger grant does not win"
+        );
+        // The documented remedy works: run the revoke again and it is recorded.
+        let again = rt2.revoke_scope(&mission, "late.example.test", "wrong target").await.unwrap();
+        assert!(again.recorded, "{again:?}");
+        assert!(rt2.ledger(&mission).unwrap().state.granted_hosts().is_empty());
+        rt2.shutdown().await;
+    }
+
+    /// A session built while a revoke runs derives its policy again when the mission's grants changed.
+    #[tokio::test]
+    async fn a_session_built_while_a_scope_change_runs_gets_the_current_policy() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        let meta = e.rt.inner.st().known.get(&id).unwrap().meta.clone();
+        let rule = |host: &str| e.rt.inner.proxy.check_name(&id, host, 443).map(|v| v.rule);
+        let built_at = e.rt.inner.scope_generation(&mission);
+        // The grant lands after the policy was derived and before the session was told: no `set_policy` of
+        // the grant reached it.
+        e.rt.inner.st().scope.entry(mission.clone()).or_default().push("late.example.test".into());
+        e.rt.inner.bump_scope_generation(&mission);
+        assert_eq!(rule("late.example.test").as_deref(), Some("mode deny_all"));
+        e.rt.inner.policy_is_current(&meta, true, built_at);
+        assert_eq!(rule("late.example.test").as_deref(), Some("allow late.example.test"));
+        // Nothing changed since: nothing is derived again.
+        let now = e.rt.inner.scope_generation(&mission);
+        e.rt.inner.st().scope.clear();
+        e.rt.inner.policy_is_current(&meta, true, now);
+        assert_eq!(rule("late.example.test").as_deref(), Some("allow late.example.test"));
+        e.rt.shutdown().await;
+    }
+
+    #[test]
+    fn the_infrastructure_of_a_configuration_names_its_endpoints_daemon_port_and_docker_host() {
+        let mut config = Config::default();
+        config.models.clear();
+        for (name, url) in [
+            ("a", "http://127.0.0.1:9920/v1"),
+            ("b", "https://spark-one.tail1234.ts.net:8000/v1"),
+            ("c", "https://api.example.test/v1/"),
+            ("d", "http://user:secret@10.0.0.5/v1"),
+            ("e", "http://[fd00::5]:8080/v1"),
+            ("same", "http://127.0.0.1:9920/v1"),
+            ("junk", "not a url"),
+            ("scheme", "ftp://x:21/"),
+        ] {
+            let p = ModelProfile { base_url: url.into(), ..ModelProfile::default() };
+            config.models.insert(name.into(), p);
+        }
+        config.sandbox.daemon_port = Some(7878);
+        config.network.infrastructure = vec!["*.tailnet.test".into()];
+        let spec = infra_spec(&config);
+        assert_eq!(spec.daemon_port, Some(7878));
+        assert_eq!(
+            spec.model_endpoints,
+            [
+                "10.0.0.5:80",
+                "127.0.0.1:9920",
+                "[fd00::5]:8080",
+                "api.example.test:443",
+                "spark-one.tail1234.ts.net:8000"
+            ]
+            .map(String::from)
+        );
+        assert!(spec.docker_hosts.is_empty(), "a disabled box has no Docker host");
+        assert_eq!(spec.extra, ["*.tailnet.test"]);
+        config.boxed.enabled = true;
+        config.boxed.ssh_host = "loom-box".into();
+        assert_eq!(infra_spec(&config).docker_hosts, ["loom-box"]);
+        // An ssh destination is reduced to its host; one that has none does not stop the daemon.
+        for target in ["jeweled@loom-box", "ssh://jeweled@loom-box:2222", "loom-box:22"] {
+            config.boxed.ssh_host = target.into();
+            assert_eq!(infra_spec(&config).docker_hosts, ["loom-box"], "{target}");
+        }
+        config.boxed.ssh_host = "user@".into();
+        assert!(infra_spec(&config).docker_hosts.is_empty());
+        config.boxed.ssh_host = "loom-box".into();
+        // Every entry it produces is one the policy reads.
+        assert!(Policy::new(&loom_core::config::NetworkCfg::default())
+            .unwrap()
+            .with_infrastructure(&infra_spec(&config))
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_network_infrastructure_entry_that_cannot_be_read_stops_the_start() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        e.rt.shutdown().await;
+        let mut config = e.config.clone();
+        config.network.infrastructure = vec!["10.0.0.0/99".into()];
+        let err = Runtime::start(config, Paths::at(e.dir.path().join("home2"))).await.err().unwrap();
+        assert!(err.contains("network.infrastructure") && err.contains("10.0.0.0/99"), "{err}");
+    }
+
+    #[tokio::test]
     async fn a_scope_grant_that_could_not_be_handed_to_the_lead_leaves_no_host_allowed() {
         let e = env(Script::new(|_, _| finish("ok"))).await;
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
@@ -7236,6 +8825,7 @@ mod tests {
             allowed: true,
             rule: "mode open".into(),
             resolved: None,
+            sni: None,
         };
         let path = e.rt.paths().session_dir(&id).join("net.jsonl");
         // Lines written before the chain existed still load; new lines chain after them.
@@ -9263,19 +10853,186 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_records_whether_the_network_is_deny_all_for_every_sandbox_it_makes() {
+    async fn the_census_is_kept_and_a_kill_names_only_a_known_session() {
         let dir = tempfile::tempdir().unwrap();
         let server = MockServer::start(Script::new(|_, _| finish("ok"))).await.unwrap();
-        for (mode, deny_all) in [(NetworkMode::DenyAll, true), (NetworkMode::Open, false)] {
-            let mut config = config_for(&server, None);
-            config.network.mode = mode;
-            // The flag is the runtime's to set: whatever the caller passed is replaced.
-            config.sandbox.network_deny_all = !deny_all;
-            config.sandbox.daemon_port = Some(4242);
-            let rt = Runtime::start(config, Paths::at(dir.path().join(format!("home-{deny_all}")))).await.unwrap();
-            assert_eq!(rt.config().sandbox.network_deny_all, deny_all);
-            assert_eq!(rt.config().sandbox.daemon_port, Some(4242));
-            rt.shutdown().await;
+        let config = config_for(&server, None);
+        let rt = Runtime::start(config, Paths::at(dir.path().join("home"))).await.unwrap();
+        // The loop is not started under test: no view until one is asked for.
+        assert!(rt.census().is_none());
+        let view = rt.census_now().await.unwrap();
+        assert!(view.readable && view.sessions.is_empty(), "{view:?}");
+        assert_eq!(rt.census().map(|v| v.taken_ms), Some(view.taken_ms));
+        assert_eq!(rt.census_kill(&SessionId::from("s-nope")).await.unwrap_err(), "There is no session s-nope.");
+        rt.shutdown().await;
+    }
+
+    /// A session's job starts a process that leaves its process group and clears its environment; the census lists
+    /// it under that session (through the runtime's own sandbox, members and home), a kill stops it and nothing of
+    /// another session, and archiving a session stops what it left.
+    #[tokio::test]
+    async fn the_census_finds_what_a_session_job_left_and_a_kill_stops_only_that_session() {
+        if !cfg!(target_os = "macos") || !Path::new("/usr/bin/sandbox-exec").exists() {
+            return;
+        }
+        let orphan = |seconds: u32| {
+            format!(
+                "/usr/bin/env -i /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); fork && exit 0; exec \"/bin/sleep\", \"{seconds}\"'"
+            )
+        };
+        let (mine, theirs) = (orphan(73), orphan(74));
+        let e = env_with(
+            Script::new(move |body, _| {
+                let replies =
+                    body["messages"].as_array().map_or(0, |m| m.iter().filter(|m| m["role"] == "assistant").count());
+                match replies {
+                    0 if mentions(body, "ORPHANTWO") => call("bash", json!({ "command": theirs })),
+                    0 => call("bash", json!({ "command": mine })),
+                    _ => finish("ok"),
+                }
+            }),
+            false,
+            with_os_sandbox,
+        )
+        .await;
+        std::fs::create_dir_all(e.ws.join(".loom")).unwrap();
+        let first = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id.clone();
+        let second = e.rt.create_session(e.new_session(Some("ORPHANTWO go"))).await.unwrap().meta.id.clone();
+        let sleeping = |view: &crate::census::CensusView, id: &SessionId| {
+            view.sessions.get(id.as_str()).is_some_and(|p| p.iter().any(|p| p.exe.ends_with("sleep") && p.ppid == 1))
+        };
+        let end = tokio::time::Instant::now() + WAIT;
+        let view = loop {
+            let view = e.rt.census_now().await.unwrap();
+            if sleeping(&view, &first) && sleeping(&view, &second) {
+                break view;
+            }
+            assert!(tokio::time::Instant::now() < end, "the orphans were not listed: {view:?}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(view.identity && view.readable, "{view:?}");
+        // The two sessions' processes are told apart.
+        assert!(view.sessions[first.as_str()].iter().all(|p| p.exe.ends_with("sleep") || p.exe.ends_with("perl")));
+        // Another session's census kill touches only that session.
+        until("the first session has ended its turn", || {
+            e.rt.session(&first).is_some_and(|s| s.status.phase == Phase::Idle)
+        })
+        .await;
+        let killed = e.rt.census_kill(&first).await.unwrap();
+        assert!(killed.left.is_empty() && killed.killed >= 1, "{killed:?}");
+        let view = e.rt.census_now().await.unwrap();
+        assert!(!sleeping(&view, &first), "{view:?}");
+        assert!(sleeping(&view, &second), "another session's process was stopped: {view:?}");
+        // Archiving a session takes with it what its task left (the archived session is no longer in the census).
+        until("the second session has ended its turn", || {
+            e.rt.session(&second).is_some_and(|s| s.status.phase == Phase::Idle)
+        })
+        .await;
+        e.rt.archive(&second, true).await.unwrap();
+        let end = tokio::time::Instant::now() + WAIT;
+        loop {
+            let again = crate::census::take(
+                &e.rt.inner.paths.home,
+                &crate::census::members(&e.rt.inner.paths, std::slice::from_ref(&second)),
+                true,
+            );
+            if !again.sessions.contains_key(second.as_str()) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < end, "the archived session's process survived: {again:?}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn egress_turns_unbounded_on_a_leak_the_operator_is_told_once_and_the_view_is_kept() {
+        use loom_tools::sandbox::selfprobe::{Outcome, Probe, ProbeResult, Report};
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start(Script::new(|_, _| finish("ok"))).await.unwrap();
+        let file = dir.path().join("notified");
+        let mut config = config_for(&server, Some(&file));
+        config.sandbox.mode = SandboxMode::Seatbelt;
+        let home = dir.path().join("home");
+        let rt = Runtime::start(config, Paths::at(&home)).await.unwrap();
+        let report = |outcome| Report {
+            ran: true,
+            results: Probe::ALL.iter().map(|p| ProbeResult { probe: *p, outcome, detail: "d".into() }).collect(),
+        };
+        // No probe has finished (the loop is not started under test): not probed, and keep-going waits.
+        assert_eq!(rt.egress().level, crate::egress::Level::Unprobed);
+        rt.record_egress_probe(report(Outcome::Held));
+        assert_eq!(rt.egress().level, crate::egress::Level::Bounded);
+        assert!(rt.egress().probed_at_ms.is_some());
+        let written = std::fs::read_to_string(home.join("egress-probe.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(json["view"]["level"], "bounded");
+        assert_eq!(json["report"]["results"].as_array().unwrap().len(), Probe::ALL.len());
+        assert!(!home.join("egress-probe.json.tmp").exists());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!file.exists(), "nothing to tell while bounded");
+        // A leak: unbounded, one notification, none for the next leak, one again after it was bounded.
+        rt.record_egress_probe(report(Outcome::Leaked));
+        assert_eq!(rt.egress().level, crate::egress::Level::Unbounded);
+        until("the notification", || file.exists() && std::fs::read_to_string(&file).unwrap().lines().count() == 1)
+            .await;
+        rt.record_egress_probe(report(Outcome::Failed));
+        rt.record_egress_probe(report(Outcome::Held));
+        assert_eq!(rt.egress().level, crate::egress::Level::Bounded);
+        rt.record_egress_probe(report(Outcome::Leaked));
+        until("the second notification", || std::fs::read_to_string(&file).unwrap().lines().count() == 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 2);
+        assert!(std::fs::read_to_string(&file).unwrap().lines().all(|l| l.starts_with("egress")));
+        rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_leak_is_told_even_when_the_fetch_services_setting_already_made_egress_unbounded() {
+        use loom_tools::sandbox::selfprobe::{Outcome, Probe, ProbeResult, Report};
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start(Script::new(|_, _| finish("ok"))).await.unwrap();
+        let file = dir.path().join("notified");
+        let mut config = config_for(&server, Some(&file));
+        config.sandbox.mode = SandboxMode::Seatbelt;
+        config.sandbox.allow_fetch_services = true;
+        let rt = Runtime::start(config, Paths::at(dir.path().join("home"))).await.unwrap();
+        let report = |outcome| Report {
+            ran: true,
+            results: Probe::ALL.iter().map(|p| ProbeResult { probe: *p, outcome, detail: "d".into() }).collect(),
+        };
+        // The setting already holds egress unbounded, and a clean probe says nothing more.
+        rt.record_egress_probe(report(Outcome::Held));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!file.exists(), "the operator chose the setting");
+        // A leak is a new cause: told once, not again for the next report of it, and again after it cleared.
+        rt.record_egress_probe(report(Outcome::Leaked));
+        until("the notification", || file.exists() && std::fs::read_to_string(&file).unwrap().lines().count() == 1)
+            .await;
+        rt.record_egress_probe(report(Outcome::Failed));
+        rt.record_egress_probe(report(Outcome::Held));
+        rt.record_egress_probe(report(Outcome::Leaked));
+        until("the second notification", || std::fs::read_to_string(&file).unwrap().lines().count() == 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 2);
+        rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn start_leaves_the_fetch_service_setting_as_configured_in_every_network_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start(Script::new(|_, _| finish("ok"))).await.unwrap();
+        for (i, mode) in [NetworkMode::DenyAll, NetworkMode::Allowlist, NetworkMode::Open].into_iter().enumerate() {
+            for allow in [false, true] {
+                let mut config = config_for(&server, None);
+                config.network.mode = mode;
+                config.sandbox.allow_fetch_services = allow;
+                config.sandbox.daemon_port = Some(4242);
+                let rt = Runtime::start(config, Paths::at(dir.path().join(format!("home-{i}-{allow}")))).await.unwrap();
+                assert_eq!(rt.config().sandbox.allow_fetch_services, allow);
+                assert_eq!(rt.config().sandbox.daemon_port, Some(4242));
+                rt.shutdown().await;
+            }
         }
     }
 
@@ -9435,6 +11192,57 @@ mod tests {
         }
         let (_, recalled) = e.rt.recall_earlier(&[earlier]).await.unwrap();
         assert_eq!(recalled[0].title, "untitled");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_start_records_the_lineage_of_the_profile_and_the_served_id() {
+        use loom_core::lineage::{Alignment, Source};
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            if let Some(p) = c.models.get_mut("mock") {
+                p.model = "qwen3-max".into();
+                p.alignment = Some(Alignment::Stock);
+                p.recipient = Some("LAN".into());
+            }
+        })
+        .await;
+        // The server serves one model, a different family from the configured id: the record shows both.
+        e.server.set_model("deepseek-v4.1", Some(1_000_000));
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))).await;
+        let lineage = e
+            .records(&id)
+            .into_iter()
+            .find_map(|r| match r.event {
+                Event::SessionStart(s) => s.model.lineage,
+                _ => None,
+            })
+            .expect("session_start records a lineage");
+        assert_eq!(lineage.profile, "mock");
+        assert_eq!(lineage.family_word(), "deepseek+qwen", "the configured id and the served one");
+        assert_eq!(
+            (lineage.fields.family, lineage.fields.alignment, lineage.fields.recipient),
+            (Source::Inferred, Source::Declared, Source::Declared)
+        );
+        assert_eq!((lineage.alignment, lineage.recipient.as_str()), (Alignment::Stock, "lan"), "declared values win");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_review_profile_cannot_lead_a_session() {
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            if let Some(p) = c.models.get_mut("mock") {
+                p.purpose = Some(loom_core::config::ProfilePurpose::Review);
+            }
+            c.default_model.clear();
+        })
+        .await;
+        let err = e.rt.create_session(e.new_session(Some("go"))).await.unwrap_err();
+        assert!(
+            err.contains("\"mock\"") && err.contains("purpose = \"review\"") && err.contains("Choose an agent profile"),
+            "{err}"
+        );
+        assert!(e.rt.sessions(true).is_empty(), "nothing was created");
         e.rt.shutdown().await;
     }
 
@@ -11030,6 +12838,140 @@ mod tests {
         e.rt.shutdown().await;
     }
 
+    // ---- the proxy's floor controls (E4) ---------------------------------------------------------------
+
+    /// A tunnel through the session's own proxy listener to `dest`, answered `200`.
+    async fn tunnel_of(e: &Env, id: &SessionId, dest: &str) -> tokio::net::TcpStream {
+        use base64::Engine as _;
+        use tokio::io::AsyncWriteExt;
+        let policy = Policy::new(&loom_core::config::NetworkCfg {
+            mode: loom_core::config::NetworkMode::Open,
+            allow_private: vec!["127.0.0.1".into()],
+            ..loom_core::config::NetworkCfg::default()
+        })
+        .unwrap();
+        let grant = e.rt.inner.proxy.grant(id, policy).unwrap();
+        let creds = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", grant.user, grant.password));
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", grant.port)).await.unwrap();
+        s.write_all(format!("CONNECT {dest} HTTP/1.1\r\nProxy-Authorization: Basic {creds}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            tokio::io::AsyncReadExt::read_exact(&mut s, &mut b).await.unwrap();
+            head.push(b[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&head));
+        s
+    }
+
+    #[tokio::test]
+    async fn cut_mission_ends_the_tunnels_of_the_missions_sessions_and_no_others() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let a = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta;
+        let b = e.rt.create_session(e.new_session(Some("b"))).await.unwrap().meta;
+        assert_ne!(a.mission, b.mission);
+        let dest = format!("127.0.0.1:{port}");
+        let (mut ta, mut tb) = (tunnel_of(&e, &a.id, &dest).await, tunnel_of(&e, &b.id, &dest).await);
+        async fn echoes(s: &mut tokio::net::TcpStream) -> Option<()> {
+            s.write_all(b"ping").await.ok()?;
+            let mut got = [0u8; 4];
+            tokio::time::timeout(Duration::from_millis(800), s.read_exact(&mut got)).await.ok()?.ok().map(|_| ())
+        }
+        assert!(echoes(&mut ta).await.is_some() && echoes(&mut tb).await.is_some());
+        assert_eq!(e.rt.cut_mission(&a.mission), 1);
+        let mut rest = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(1), ta.read_to_end(&mut rest)).await;
+        assert!(ended.is_ok(), "the mission's tunnel closes within a second");
+        assert!(echoes(&mut tb).await.is_some(), "another mission's tunnel is not touched");
+        assert_eq!(e.rt.cut_mission(&a.mission), 0);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_lab_listener_check_leaves_out_the_connectors_own_mission() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let a = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta;
+        let b = e.rt.create_session(e.new_session(Some("b"))).await.unwrap().meta;
+        assert_ne!(a.mission, b.mission);
+        // A mission's own sessions are not squatters for each other; another mission's are.
+        assert_eq!(e.rt.inner.mission_peers(&a.id), vec![a.id.as_str().to_string()]);
+        assert_eq!(e.rt.inner.mission_peers(&SessionId::from("unknown")), vec!["unknown".to_string()]);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_runtimes_proxy_has_the_floor_installed() {
+        use base64::Engine as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let a = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta;
+        let floor = e.rt.floor();
+        floor.add_canary_host("bait.example.test", "CN-4 test").unwrap();
+        floor.add_canary_user("loom-decoy-1", "CN-1 test").unwrap();
+        let port = e.rt.inner.proxy.session_port(&a.id).unwrap();
+        let ask = |creds: String, dest: &'static str| async move {
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            s.write_all(format!("CONNECT {dest} HTTP/1.1\r\nProxy-Authorization: Basic {creds}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut resp = String::new();
+            let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_string(&mut resp)).await;
+            resp
+        };
+        // The decoy user: 407, an S4 event attributed to the session whose port it was sent to.
+        let resp = ask(base64::engine::general_purpose::STANDARD.encode("loom-decoy-1:x"), "93.184.216.34:443").await;
+        assert!(resp.starts_with("HTTP/1.1 407"), "{resp}");
+        // The session's own credentials to the decoy host: refused before any lookup.
+        let grant =
+            e.rt.inner.proxy.grant(&a.id, Policy::new(&loom_core::config::NetworkCfg::default()).unwrap()).unwrap();
+        let own = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", grant.user, grant.password));
+        let resp = ask(own, "bait.example.test:443").await;
+        // The policy (deny_all, the default) refuses the name with its 403, and the floor saw it all the same.
+        assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+        let events = floor.events();
+        assert!(
+            events
+                .iter()
+                .any(|ev| ev.kind == crate::floor::FloorKind::CanaryCredential && ev.session.as_ref() == Some(&a.id)),
+            "{events:?}"
+        );
+        let hosts = |floor: &crate::floor::Floor| {
+            floor.events().iter().filter(|ev| ev.kind == crate::floor::FloorKind::CanaryHost).count()
+        };
+        assert_eq!(hosts(&floor), 1, "a deny_all mission naming a decoy host is an S4 event: {events:?}");
+        // With a policy that lets the name through, the veto is what closes it (502, the fixed sentence).
+        let open = Policy::new(&loom_core::config::NetworkCfg {
+            mode: loom_core::config::NetworkMode::Open,
+            ..loom_core::config::NetworkCfg::default()
+        })
+        .unwrap();
+        let grant = e.rt.inner.proxy.grant(&a.id, open).unwrap();
+        let own = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", grant.user, grant.password));
+        let resp = ask(own, "bait.example.test:443").await;
+        assert!(
+            resp.starts_with("HTTP/1.1 502") && resp.contains("closed to this mission by loom's own rules"),
+            "{resp}"
+        );
+        assert_eq!(hosts(&floor), 2);
+        // Every event is also on disk.
+        let log = std::fs::read_to_string(e.rt.paths().logs_dir().join("floor.jsonl")).unwrap();
+        assert!(log.lines().count() >= 3 && log.contains("canary_host"), "{log}");
+        e.rt.shutdown().await;
+    }
+
     // ---- the box (I1, I5) -------------------------------------------------------------------------
 
     use loom_tools::boxctl::fake::FakeDocker;
@@ -11106,6 +13048,58 @@ mod tests {
         assert!(rules.contains("-d 198.51.100.4/32 -p tcp -j ACCEPT"), "{rules}");
         assert!(!rules.contains("wild") && rules.trim_end().ends_with("COMMIT"));
         assert!(fake.running(&box_container(&mission)));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_boxs_rule_counters_are_polled_recorded_as_deltas_and_only_when_they_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let e = box_env(&fake).await;
+        let (id, mission) = idle_lead(&e).await;
+        // No box yet: nothing to poll, no record.
+        assert!(e.rt.box_counters_now().await.is_empty());
+        let b = e.rt.inner.orch.box_access(&id).await.unwrap();
+        b.ready().await.unwrap();
+        let counters = fake.dir.join(format!("counters-{}", b.names().chain));
+        let listing = |accepted: u32, dropped: u32| {
+            format!(
+                "Chain {} (1 references)\n    pkts      bytes target     prot opt in     out     source               destination\n    {accepted:>4} {:>9} ACCEPT     tcp  --  *      *       0.0.0.0/0            198.51.100.4         tcp dpt:443\n    {dropped:>4} {:>9} DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0           \n",
+                b.names().chain,
+                accepted * 60,
+                dropped * 60
+            )
+        };
+        std::fs::write(&counters, listing(3, 0)).unwrap();
+        let first = e.rt.box_counters_now().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, mission);
+        assert_eq!(first[0].1.len(), 1);
+        assert_eq!((first[0].1[0].packets, first[0].1[0].drop), (3, false));
+        // Nothing moved: nothing is recorded.
+        assert!(e.rt.box_counters_now().await.is_empty());
+        // A drop is recorded as a delta, the accept as none.
+        std::fs::write(&counters, listing(3, 5)).unwrap();
+        let second = e.rt.box_counters_now().await;
+        assert_eq!(second[0].1.len(), 1, "{second:?}");
+        assert!(second[0].1[0].drop && second[0].1[0].packets == 5 && second[0].1[0].bytes == 300, "{second:?}");
+        let text = std::fs::read_to_string(e.rt.paths().logs_dir().join("box-counters.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(lines[1]["mission"], mission.as_str());
+        assert_eq!(lines[1]["chain"], b.names().chain.as_str());
+        assert_eq!(lines[1]["rules"][0]["packets"], 5);
+        assert_eq!(lines[1]["rules"][0]["drop"], true);
+        assert!(lines[1]["ts_ms"].as_u64().unwrap_or(0) > 0);
+        // A chain that cannot be read is not a record, and the next good poll goes on from where it was.
+        std::fs::remove_file(fake.dir.join(format!("chain-{}", b.names().chain))).unwrap();
+        assert!(e.rt.box_counters_now().await.is_empty());
+        assert!(e.rt.inner.box_counters_failed.lock().unwrap().contains(&mission));
+        std::fs::write(fake.dir.join(format!("chain-{}", b.names().chain)), "").unwrap();
+        std::fs::write(&counters, listing(3, 6)).unwrap();
+        let third = e.rt.box_counters_now().await;
+        assert_eq!(third[0].1[0].packets, 1, "{third:?}");
+        assert!(e.rt.inner.box_counters_failed.lock().unwrap().is_empty());
         e.rt.shutdown().await;
     }
 
@@ -11206,9 +13200,15 @@ mod tests {
         // Without the box, a socket elsewhere is none of its business.
         let mut config = e.config.clone();
         config.boxed.enabled = false;
-        config.sandbox.unix_sockets = vec![fake.socket.display().to_string()];
+        config.sandbox.unix_sockets = vec![dir.path().join("lab.sock").display().to_string()];
         let rt = Runtime::start(config, Paths::at(home.clone())).await.expect("no box, no restriction");
         rt.shutdown().await;
+        // A container runtime's socket is refused with or without the box.
+        let mut config = e.config.clone();
+        config.boxed.enabled = false;
+        config.sandbox.unix_sockets = vec![fake.socket.display().to_string()];
+        let err = Runtime::start(config, Paths::at(home.clone())).await.err().expect("start must refuse");
+        assert!(err.contains("container runtime"), "{err}");
     }
 
     #[tokio::test]
@@ -11554,6 +13554,119 @@ mod tests {
         assert_eq!(r.models.any_role, None);
         assert!(e.rt.session(&id).unwrap().meta.role_models.is_empty());
         e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_review_profile_runs_no_agent_by_choice_switch_or_reload_and_a_switch_records_the_lineage() {
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            let mock = c.models["mock"].clone();
+            c.models.insert("other".into(), mock.clone());
+            let mut rev = mock;
+            rev.purpose = Some(loom_core::config::ProfilePurpose::Review);
+            c.models.insert("rev".into(), rev);
+            c.default_model = "mock".into();
+        })
+        .await;
+        let mut bad = e.new_session(None);
+        bad.role_models = std::collections::BTreeMap::from([(ANY_ROLE.to_string(), "rev".to_string())]);
+        let refused = e.rt.create_session(bad).await.unwrap_err();
+        assert!(refused.contains("\"rev\" has purpose = \"review\"") && refused.contains("unreviewed"), "{refused}");
+        assert!(e.rt.sessions(true).is_empty(), "nothing was created");
+        let id = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let choice = e.rt.set_role_model(&id, ANY_ROLE, Some("rev"), false).await.unwrap_err();
+        assert!(choice.contains("purpose = \"review\""), "{choice}");
+        assert!(e.rt.session(&id).unwrap().meta.role_models.is_empty());
+        let switch = e.rt.set_session_model(&id, "rev").await.unwrap_err();
+        assert!(switch.contains("purpose = \"review\"") && switch.contains("switched to it"), "{switch}");
+        assert_eq!(e.rt.session(&id).unwrap().meta.profile, "mock");
+        // A switch to an agent profile carries what the monitor knows of the new model.
+        let moved = e.rt.set_session_model(&id, "other").await.unwrap();
+        assert_eq!(moved.model.lineage.as_ref().map(|l| l.profile.as_str()), Some("other"));
+        // A reload cannot turn the profile a session runs on into a reviewer's: nothing changes.
+        let mut cfg = e.config.clone();
+        if let Some(p) = cfg.models.get_mut("other") {
+            p.purpose = Some(loom_core::config::ProfilePurpose::Review);
+        }
+        std::fs::write(e.rt.paths().config_file(), toml::to_string(&cfg).unwrap()).unwrap();
+        let reload = e.rt.reload_models().await.unwrap_err();
+        assert!(reload.contains("\"other\"") && reload.contains("nothing was changed"), "{reload}");
+        let live = e.rt.mission_models(&id).unwrap();
+        assert_eq!(live.lead_model.profile, "other");
+        assert_eq!(live.profiles, ["mock", "other"], "a review profile is not offered");
+        e.rt.shutdown().await;
+    }
+
+    /// `loom down && loom up` onto a config that makes a chosen profile a reviewer's checks no saved choice: the agent
+    /// is refused when it would start on it.
+    #[tokio::test]
+    async fn a_saved_choice_of_a_profile_a_restart_made_a_reviewers_starts_no_agent() {
+        let e = env_with(Script::new(|_, _| Action::Stall { ms: 600_000 }), false, |c| {
+            let mock = c.models["mock"].clone();
+            c.models.insert("other".into(), mock);
+        })
+        .await;
+        let mut new = e.new_session(None);
+        new.role_models = std::collections::BTreeMap::from([("worker".to_string(), "other".to_string())]);
+        let id = e.rt.create_session(new).await.unwrap().meta.id;
+        e.rt.shutdown().await;
+        let mut cfg = e.config.clone();
+        cfg.models.get_mut("other").unwrap().purpose = Some(loom_core::config::ProfilePurpose::Review);
+        let rt2 = Runtime::start(cfg, Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert_eq!(rt2.session(&id).unwrap().meta.role_models.get("worker").map(String::as_str), Some("other"));
+        rt2.send_message(&id, "go").await.unwrap();
+        let req = || SpawnReq {
+            role: "worker".into(),
+            mode: SpawnMode::Fresh,
+            brief: Default::default(),
+            budget: Budget::default(),
+            call_id: CallId::from("c1"),
+            title: "t".into(),
+            awaited: false,
+            harness: false,
+            prerequisite: None,
+            workspace: Workspace::Shared,
+        };
+        let err = rt2.inner.orch.spawn(&id, req()).await.unwrap_err();
+        assert!(err.contains("\"other\" has purpose = \"review\"") && err.contains("unreviewed"), "{err}");
+        assert!(rt2.inner.st().known.values().all(|k| k.meta.parent.is_none()), "no agent was made");
+        // The operator's way out: another choice, and the agent starts.
+        rt2.set_role_model(&id, "worker", Some("mock"), false).await.unwrap();
+        let child = rt2.inner.orch.spawn(&id, req()).await.unwrap();
+        assert_eq!(rt2.session(&child).unwrap().meta.profile, "mock");
+        rt2.shutdown().await;
+    }
+
+    /// A reload that only reclassifies a profile (its `alignment`) reaches a session without a task through its
+    /// `meta.json`; the switch is recorded when the session is next opened, so the monitor sees the new lineage.
+    #[tokio::test]
+    async fn a_reload_that_reclassifies_the_profile_of_an_idle_session_is_recorded_when_it_next_runs() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("inbox", || e.rt.inbox().iter().any(|i| i.session == id)).await;
+        // Dismissed, nothing asks for the session at the next start: it stays without a task.
+        let item = e.rt.inbox().remove(0).item.item_id;
+        e.rt.answer(&item, "").await.unwrap();
+        let status = e.rt.paths().session_dir(&id).join("status.json");
+        until("status published", || std::fs::read_to_string(&status).is_ok_and(|s| s.contains("\"open_inbox\": 0")))
+            .await;
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert!(!rt2.session(&id).unwrap().active);
+        let mut cfg = e.config.clone();
+        cfg.models.get_mut("mock").unwrap().alignment = Some(loom_core::lineage::Alignment::Relaxed);
+        std::fs::write(rt2.paths().config_file(), toml::to_string(&cfg).unwrap()).unwrap();
+        let r = rt2.reload_models().await.unwrap();
+        assert_eq!((r.changed.as_slice(), r.rebound.as_slice()), (&["mock".to_string()][..], &[id.clone()][..]));
+        assert!(switches(rt2.records(&id, None, 2_000).unwrap()).is_empty(), "recorded when it runs");
+        rt2.send_message(&id, "again").await.unwrap();
+        until("the switch recorded", || !switches(rt2.records(&id, None, 2_000).unwrap()).is_empty()).await;
+        let sw = switches(rt2.records(&id, None, 2_000).unwrap());
+        assert_eq!(sw.len(), 1);
+        assert_eq!((sw[0].to.profile.as_str(), sw[0].reason.as_str()), ("mock", crate::session::SWITCH_IDLE));
+        let alignment = |m: &ModelRef| m.lineage.as_ref().map(|l| l.alignment);
+        assert_eq!(alignment(&sw[0].to), Some(loom_core::lineage::Alignment::Relaxed));
+        assert_ne!(alignment(&sw[0].from), alignment(&sw[0].to));
+        rt2.shutdown().await;
     }
 
     #[tokio::test]

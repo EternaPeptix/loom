@@ -403,7 +403,9 @@ mod tests {
         *rig.orch.boxed.lock().unwrap() = Some(Ok(b.clone()));
         let r = rig.call("box_exec", json!({"command": "true", "timeout_s": 20})).await;
         assert!(!r.text.contains("Not resolvable"), "{}", r.text);
-        grants.lock().unwrap().push("localhost".to_string());
+        // With a port: the whole of this machine's loopback is not grantable (E1 refuses some of its ports),
+        // so a name that resolves there is pinned only for the port it was granted.
+        grants.lock().unwrap().push("localhost:8080".to_string());
         b.resync().await;
         let line =
             "Not resolvable inside the box until box_reset: localhost (127.0.0.1). Their addresses are reachable now.";

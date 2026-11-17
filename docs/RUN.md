@@ -45,7 +45,8 @@ except `[models]` and `default_model`, which `loom models reload` applies to the
 ```
 loom config init       # writes a starting file; refuses to overwrite an existing one
 loom config path       # prints the path
-loom config check      # loads and checks it, with the daemon's start-up checks: "ok: <path>", or the error and exit 1
+loom config check      # loads and checks it, with the daemon's start-up checks, then the model policy: prints each
+                       # profile's lineage, then "ok: <path>", or the error and exits 1
 ```
 
 Edit `base_url` (the server's `/v1` URL) and `model` in the `[models.<name>]` table. If the server
@@ -74,6 +75,26 @@ default. Unknown keys are errors, so a typo does not go unnoticed. The values th
   whole reply has arrived.
 - `reasoning_effort` and the other `extra_body` fields are fixed for a session's life (the chat
   template may render them into the prompt head, so changing them mid-session would break the cache).
+
+### Who may review whom (model policy)
+
+The adversarial monitor (`docs/MONITOR.md`) reviews a mission with a model of another family than any model the
+mission can reach, so each profile says what it is:
+
+```toml
+[models.dsv41]
+family = ["deepseek"]      # a set; a distill lists both. Left out, loom infers it from the model id
+alignment = "stock"        # "stock", "relaxed" or "unknown"; only a declared stock model can review
+recipient = "lan"          # "local", "lan" (a host you own) or a provider name such as "alibaba"
+```
+
+A loopback `base_url` has the recipient `unknown` until you declare it (it could be a tunnel to anyone's cloud). Under
+`[monitor]`, `reviewers` lists review profiles in preference order, `[monitor.recipients]` consents, per pack, to a
+provider that does not receive the transcripts yet, and `tripwires_only_profiles` names the profiles that have no
+reviewer on purpose (their missions are "not LLM-reviewed"). `loom config check` prints each profile's resolved values
+and where each came from, and **fails** on a profile that has no eligible reviewer and is not listed, with the lines to
+add; `loom models lineage [profile]` shows who reviews what in each pack. `docs/config.example.toml` holds one operator's
+fleet as a worked example.
 
 ### Model API keys
 
@@ -134,11 +155,43 @@ against the resolved address too. Private, loopback and link-local destinations 
 listed in `allow_private`. Every decision is recorded in the session's audit log (`loom net <session>`).
 A pack that sets `requires_restricted_network` (`vr` does) is refused while the mode is `open`.
 
+Some destinations are refused to every command whatever you grant or allow (`deny infrastructure: …` in `loom net`):
+cloud metadata addresses and names, the DevTools and inspector ports 9222 and 9229 and the Docker API ports 2375 and
+2376 on this machine, the daemon's own port, every model endpoint of the configuration and the box's Docker host.
+These are refused by name and by the addresses the daemon resolves for them (at start and every five minutes), so the
+same host reached by its IP address, a short name or a tailnet alias is refused too, and this machine's own LAN, tailnet
+and global addresses count as this machine. The box's Docker host is the host of `ssh_host` (`user@host` and
+`ssh://user@host:2222` work) and the `HostName` that `ssh -G` resolves it to. A grant that names one is refused when you
+make it. The proxy is not the only door: the sandbox also refuses the DevTools, inspector and Docker API ports and the
+loopback ports of model endpoints and `network.infrastructure` entries directly, also with `loopback_all = true` or a
+`loopback_ports` entry (config refuses listing those ports, and Docker, containerd and Podman sockets in
+`unix_sockets`). A destination with no listing here is not protected: add it to `network.infrastructure`.
+List more with `network.infrastructure` (same syntax as `deny`: hosts, `host:port`, CIDR blocks), for example a tailnet
+machine or a desktop app's debugging port. `loom open` hands the desktop's opener a short-lived page file instead of the address,
+so the login code is never on a command line; if your `.html` files open in an editor, it prints a line saying to use
+`loom open --print`.
+
 A session can also be given hosts by you while it runs. When it needs one it does not have, the agent
 calls `request_scope`; an item naming the hosts and why waits in your inbox, and the session keeps
 working. `loom scope <session> <host>...` grants them (the UI and the app have an Approve button on the
 item). The grant is recorded in the mission's ledger, applies to that mission only, and ends with the
-session. `loom net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
+session. `loom scope revoke <mission> <host> --reason <text>` takes one granted host back (the host as it was
+granted; the mission is an `m-` id or any session of it): it is recorded in the ledger, refused to the running
+sessions at once (also under a wildcard grant that covers it, `network.allow` and `mode open`: it is refused as
+`deny revoked <host>` until you grant it again), and its open connections are cut. The revoke is kept on disk, so a
+restart does not bring the host back. A host only a wildcard grant covers is revoked by revoking the wildcard.
+
+The proxy also looks at the name a command asks an HTTPS server for. A tunnel's TLS ClientHello must name the host the command
+connected to, or another host its policy allows; a hello that hides the name (an encrypted ClientHello naming another host),
+cannot be read (a TLS alert or a record with an odd version in front of it included), or names
+nothing for a host given by name is refused, and the refusal is recorded in the session's `net.jsonl` with the name it asked for
+(`sni`). Programs that are not TLS (ssh, plain HTTP) are not affected. Headless Chromium (Playwright, Puppeteer) sends a placeholder
+encrypted-ClientHello extension with the real name in the clear on every hello; that passes when the name is the host it connected to,
+so browsers work through the proxy without a switch. A decoy host or a loom-internal address the daemon
+vetoes answers `502` ("closed to this mission by loom's own rules"), and a lab port on this machine that another mission's sandboxed
+process listens on is refused with `403`. A grant
+the lead has not recorded yet is revoked without a ledger entry (`recorded: false`); run the revoke again once
+`loom ledger` lists the grant and it is recorded. `loom net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
 granted hosts; the `allow` list stays off. `*`, a wildcard over a whole top-level domain (`*.com`) or
 over IP addresses (`*.0.1`), the unspecified address (`0.0.0.0`, `::`) and a loopback address without a
 port (`127.0.0.1`; write `127.0.0.1:8080`) cannot be requested or granted: name the hosts, or a wildcard
@@ -167,7 +220,24 @@ With `[sandbox] mode = "seatbelt"` (the default) commands run under a macOS sand
   else, so output works but cannot be read back from a command. A workspace inside `~/.loom` is refused at
   start. `unreadable_paths` are neither readable nor writable;
 - no network except the egress proxy (plus `loopback_ports`, `loopback_all`, `unix_sockets`);
-- no LaunchServices opens, Apple Events or launchd jobs.
+- no LaunchServices opens, Apple Events or launchd jobs;
+- only the Mach services the usual toolchains need (Spotlight's `mdfind`, the clipboard, the keychain and audio fail): a
+  tool that needs one more is fixed with `[sandbox] mach_allow`. Headless Chromium (Playwright, Puppeteer) finds its child
+  processes through `org.chromium.Chromium`, `com.google.Chrome` and `com.google.chrome.for.testing` rendezvous names, which
+  are allowed (the launch itself was not run on the gate host); another build (Edge, Electron) needs
+  `mach_allow = ["<bundle id>.MachPortRendezvousServer.*"]`;
+- a limit on how many processes a command can start: `[sandbox] nproc_headroom` (default 256, 0 for none) is how many
+  of the user's process slots (RLIMIT_NPROC) a command leaves unused, so a fork bomb stops before the daemon cannot
+  start the processes that stop it. If the user already holds that many processes (leftovers: see the census), a command
+  does not start, and the error says to stop them or lower the headroom.
+
+The daemon finds what every session left running, whatever it did to its process group and environment, every minute:
+`GET /api/census` (`?now=true` takes one) lists each session's processes and the ports they listen on, the daemon's log
+warns once about what an ended or stopped session left, and `POST /api/sessions/<id>/census/kill` stops them. Nothing
+is stopped on its own. Archiving a session stops what it still has running under its sandbox once its tasks have ended (the census no
+longer lists archived sessions), and logs it. If the macOS query it uses does not work on a host (or `sandbox.mode` is `none`), the census falls back to
+an environment variable and the known process groups, says so (`identity_detail`), is logged and notified once
+(`LOOM_KIND=census`) when commands are confined, and never reports a session as having no processes.
 
 Git config/hooks and metadata pointers are protected, including existing nested repositories and
 linked worktrees. Normal source edits still work. Commands that explicitly write shared `/tmp` or
@@ -285,7 +355,8 @@ anything else.
 ```
 loom up                # start the daemon in the background; log: ~/.loom/logs/loomd.log
 loom daemon            # or run it in the foreground
-loom status            # the daemon, each model server and whether it answered, what is running, free disk space
+loom status            # the daemon, each model server and whether it answered, what is running, free disk space, and whether
+                       # commands can reach the network outside the proxy ("egress: bounded" or "UNBOUNDED, <reason>")
 loom down              # stop it; sessions resume when it starts again
 ```
 
@@ -296,7 +367,14 @@ The first start creates `~/.loom/token` (the API token, mode 0600). `LOOM_LOG` s
 now). The model and window it prints come from the config until a session of that profile has been
 created since the daemon started (`window unknown` when `context_window` is not set); from then on
 they are the model id the server serves and the window it reported. It also prints the free space on
-the volume of the loom home and warns when it is under 5 GiB or 5 percent.
+the volume of the loom home and warns when it is under 5 GiB or 5 percent. The `egress:` line is the sandbox
+self-probe (at start, then hourly): `bounded` when no command reached the network outside the egress proxy,
+`UNBOUNDED` with the reason when one did, a probe could not run, `sandbox.allow_fetch_services` is set or
+`sandbox.mode` is `none`. The web header shows the same as a banner, and the last probe is in
+`<loom home>/egress-probe.json`. `STALE` means the probe stopped recording (more than two hours old); `bounded (...; fetch
+routes not exercised)` means this host did not fetch for any control, so those routes were not judged; `grants:` lists
+loopback and unix-socket grants, which the probe runs without. `unix_sockets` naming `/var/run/mDNSResponder` is unbounded:
+DNS leaves outside the proxy. Unbounded egress stops nothing; keep-going will refuse to turn on.
 
 On macOS `loom service install` makes the daemon a login service (a LaunchAgent) and
 `loom service uninstall` removes it; `loom service status` says whether it is loaded.
@@ -347,7 +425,11 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | command | does |
 |---|---|
 | `loom daemon` / `up` / `down` | run the daemon in the foreground / in the background / stop it |
-| `loom status` | the daemon, each model server and whether it answered, counts, free disk space |
+| `loom models lineage [profile]` | each model profile's family, alignment and recipient, and who reviews its missions in each pack (needs no daemon) |
+| `loom monitor [status]` | the monitor in shadow: its state, open flags, how often each of the 28 tripwires fired by severity, the faults of its sources |
+| `loom monitor log <mission\|session> [--json] [--since 7d] [--all] [-n N]` | the monitor-log entries about a mission: hits, flags, what each would earn once promoted |
+| `loom monitor replay [--since 7d] [--positives FILE] [--home DIR] [--json]` | the tripwires over the history of a home, read-only and without a daemon: per-tripwire hits, would-be pauses per 100 active hours, precision and recall against known positives |
+| `loom status` | the daemon, each model server and whether it answered, counts, free disk space, the sandbox self-probe's egress line |
 | `loom open [--print]` | open the web UI in the browser (`--print` prints the address instead) |
 | `loom run [options] <task...>` | start a session and follow it; `-d` starts it and returns |
 | `loom chat [options]` | turn-by-turn `chat` session; `--session <id>` continues one; `/quit` leaves |
@@ -362,6 +444,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom rule <session> --withdraw <rule-id> [--reason <text>]` | withdraw a rule |
 | `loom approve <session> <text...> [--scope <text>]` | record an approval |
 | `loom scope <session> <host>... [--note <text>]` | let the mission's tools reach these hosts (one host per argument) |
+| `loom scope revoke <mission> <host> --reason <text>` | take a granted host back: recorded, refused at once, open connections cut |
 | `loom release <session> <reason...>` | accept a blocked mission as it is and close it: "closed by operator, goal not established" |
 | `loom inbox` / `loom answer <item> <text...>` | what waits for you / answer one |
 | `loom ledger <session>` | the mission ledger |
@@ -373,7 +456,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom config path` / `check` / `init` | the configuration file |
 | `loom models list` | the model profiles in use (the default marked), each server ✓/✗ |
 | `loom models reload` | read `[models]` and `default_model` from the config again and use them now, without a restart; sessions on a changed profile move to its new settings |
-| `loom models set <session> <profile>` | switch a session (lead or agent) to another model profile from its next step, without a restart; logged as `model_switched` |
+| `loom models set <session> <profile>` | switch a session (lead or agent) to another model profile from its next step, without a restart; logged as `model_switched`; a profile with `purpose = "review"` is refused |
 | `loom models show <session>` | a mission's models: the lead's, the choice for each role of its agents (or what the pack picks), the agents running and their models |
 | `loom models role <session> <role> <profile> [--now]` | start the mission's new agents of `role` (`all`: every role without a choice of its own, not the finish gate's verifier) on `profile`; `--now` also moves its running agents of that role (not forked ones) |
 | `loom models role <session> <role> --clear` | drop that choice: the pack picks again for agents started later |
@@ -493,7 +576,8 @@ the finish is then delivered at once, marked `not verified`.
 ## Files
 
 Under the loom home: `config.toml`, `token`, `daemon.json`, `daemon.lock`, `keys/`, `logs/loomd.log`,
-`packs/`, `blobs/` (stored outputs), `sessions/<id>/` (`log.jsonl`, `meta.json`, `status.json`, `jobs/`,
+`logs/net-unattributed.jsonl`, `logs/floor.jsonl` (decoy hits, vetoes and squatted lab ports, one line each) and
+`logs/box-counters.jsonl` (the box's per-rule packet counts, one line a minute per box that counted something), `packs/`, `blobs/` (stored outputs), `sessions/<id>/` (`log.jsonl`, `meta.json`, `status.json`, `jobs/`,
 `tmp/`, `queued/`, `net.jsonl`, and for a child `settlement.json` and, when it works in its own copy
 of the workspace, `copy.json`), `missions/<id>/` (`journal.jsonl`, `journal.head`). Session ids made
 of anything other than letters, digits, `-`, `_` and `.` never map to a path outside the home.

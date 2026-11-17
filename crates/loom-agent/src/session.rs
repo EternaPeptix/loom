@@ -74,7 +74,9 @@
 //!   with no `turn_start` since; the runtime starts a turn for a session that was waiting. Calls
 //!   `deps.ctx.jobs.resume_from(n)` with the highest job number in the log's `job_registered`
 //!   records, those just appended included (`j7` → 7). Then, unless the session has ended, the model:
-//!   when `deps.model` or `deps.reasoning_replay` differs from the model the log names (`session_start`'s,
+//!   when `deps.model` (its profile, model id or window, and its `lineage` when the log's model has one too: a
+//!   reload that only reclassified the profile is a new model for the monitor) or
+//!   `deps.reasoning_replay` differs from the model the log names (`session_start`'s,
 //!   a fork's from its parent's, then the latest `model_switched`'s), `model_switched{from, to:
 //!   deps.model, reasoning_replay, reason: SWITCH_IDLE}` is appended (it was switched while no task
 //!   ran it, its profile was reloaded meanwhile, or a restart cut a switch short). Last, unless the
@@ -149,6 +151,10 @@
 //!   `shared.ledger_append(true, ScopeGrant{hosts, note})` and append what it queued (failure: warn,
 //!   carry on). Append `harness_note{Approval, texts::scope_granted(hosts, note)}` with author `User`.
 //!   It starts no turn. (The runtime widens the egress policy itself, not the session.)
+//! - `Input::ScopeRevoked{host, reason}`: the operator withdrew `host`; the runtime has already recorded
+//!   `ScopeRevoke` in the ledger and narrowed the egress policy. Append `harness_note{Approval,
+//!   texts::scope_revoked(host, reason)}` with author `User`. A blank host is ignored. No ledger entry, no
+//!   turn, nothing kept on disk.
 //! - `Input::Queued{file, input}`: rename `file` to `{stem}.{seq}.taking`, `seq` being the log's
 //!   next seq; then `input` as above, then delete the renamed file. When `file` is gone it was taken
 //!   already (at the start of `run`), and nothing happens.
@@ -596,6 +602,11 @@ pub enum Input {
     Withdraw { id: String, reason: String },
     /// The operator authorized network access to `hosts` for the mission.
     Scope { hosts: Vec<String>, note: Option<String> },
+    /// The operator withdrew network access to `host` (the revoke is already recorded in the ledger by the
+    /// runtime, which also narrowed the egress policy and cut the open connections): the session only says so
+    /// in a protected note. Not kept on disk: the ledger holds the record, and the state block shows the hosts
+    /// authorized now.
+    ScopeRevoked { host: String, reason: String },
     /// The operator closed the mission short of its goal, with a reason.
     Release { reason: String },
     /// A child that nobody was waiting for has settled.
@@ -645,6 +656,18 @@ pub const SWITCH_OPERATOR: &str = "operator";
 pub const SWITCH_RELOADED: &str = "profile reloaded";
 /// The `reason` of a `model_switched` recorded when the session is opened on another model than its log names.
 pub const SWITCH_IDLE: &str = "changed while the session was idle";
+
+/// Whether two records name the same model for the log: profile, served id and window, and the lineage the
+/// monitor records with it (`ModelRef::lineage`) when both have one. A reload that changes only a profile's
+/// `family` or `alignment` is a new model for the monitor (a relaxed one uptiers the session), so an idle session
+/// records it when it is next opened. A log written before the lineage was recorded has none: that is not a
+/// change.
+fn same_model(a: &ModelRef, b: &ModelRef) -> bool {
+    a.profile == b.profile
+        && a.model == b.model
+        && a.context_window == b.context_window
+        && (a.lineage.is_none() || b.lineage.is_none() || a.lineage == b.lineage)
+}
 
 /// One input of a session's `queued/` directory.
 #[derive(Serialize, Deserialize)]
@@ -1846,7 +1869,7 @@ Name them when you start a new mission instead."
     fn record_model(&mut self, reason: &str, always: bool) -> R<()> {
         let to = (self.deps.model.clone(), self.deps.reasoning_replay);
         let Some(from) = self.st.model.clone() else { return Ok(()) };
-        if from == to && !always {
+        if same_model(&from.0, &to.0) && from.1 == to.1 && !always {
             return Ok(());
         }
         let replay_changed = from.1 != to.1;
@@ -2359,6 +2382,12 @@ Name them when you start a new mission instead."
                 }
                 self.operator_op(LedgerOp::ScopeGrant { hosts: hosts.clone(), note: note.clone() })?;
                 self.note(Author::User, NoteKind::Approval, texts::scope_granted(&hosts, note.as_deref()))?;
+            }
+            Input::ScopeRevoked { host, reason } => {
+                if host.trim().is_empty() {
+                    return Ok(out);
+                }
+                self.note(Author::User, NoteKind::Approval, texts::scope_revoked(&host, &reason))?;
             }
             Input::Release { reason } => {
                 if reason.trim().is_empty() {
@@ -3855,6 +3884,24 @@ mod tests {
     use serde_json::json;
     use tokio::sync::mpsc::UnboundedSender;
 
+    /// The log records a reclassified model (a new lineage) as a switch, and a log written before the lineage was
+    /// recorded as none.
+    #[test]
+    fn same_model_compares_the_lineage_when_both_records_have_one() {
+        use loom_core::lineage::Alignment;
+        let lineage = |a: Alignment| {
+            loom_core::lineage::resolve("p", &ModelProfile { alignment: Some(a), ..ModelProfile::default() })
+        };
+        let m = |lineage| ModelRef { profile: "p".into(), model: "m".into(), context_window: 10, lineage };
+        let stock = m(Some(lineage(Alignment::Stock)));
+        assert!(same_model(&stock, &stock.clone()));
+        assert!(same_model(&m(None), &stock), "an old log has no lineage: no change");
+        assert!(same_model(&stock, &m(None)));
+        assert!(!same_model(&stock, &m(Some(lineage(Alignment::Relaxed)))), "reclassified");
+        let wider = ModelRef { context_window: 20, ..stock.clone() };
+        assert!(!same_model(&stock, &wider));
+    }
+
     include!("continuation_tests.rs");
 
     // ---- rig ---------------------------------------------------------------------------------
@@ -3977,7 +4024,12 @@ mod tests {
                 priority: Priority::Lead,
                 context_window: self.window,
                 // As `start` records it, so opening a log it wrote records no switch.
-                model: ModelRef { profile: "mock".into(), model: "mock".into(), context_window: 1_000_000 },
+                model: ModelRef {
+                    profile: "mock".into(),
+                    model: "mock".into(),
+                    context_window: 1_000_000,
+                    lineage: None,
+                },
                 reasoning_replay: ReasoningReplay::All,
                 shared: self.shared.clone(),
                 ctx: self.ctx.clone(),
@@ -3996,7 +4048,12 @@ mod tests {
                 pack: "core".into(),
                 role: self.role.clone(),
                 termination: self.shared.role.termination,
-                model: ModelRef { profile: "mock".into(), model: "mock".into(), context_window: 1_000_000 },
+                model: ModelRef {
+                    profile: "mock".into(),
+                    model: "mock".into(),
+                    context_window: 1_000_000,
+                    lineage: None,
+                },
                 reasoning_replay: ReasoningReplay::All,
                 system_prompt: "You are a test agent.".into(),
                 tools: Vec::new(),
@@ -8038,7 +8095,7 @@ mod tests {
             client: Arc::new(ModelClient::new("other", fx.profile.clone(), &fx.paths.model_keys_dir()).unwrap()),
             limiter: Arc::new(Limiter::new(4)),
             context_window: fx.window,
-            model: ModelRef { profile: "other".into(), model: "mock".into(), context_window: 1_000_000 },
+            model: ModelRef { profile: "other".into(), model: "mock".into(), context_window: 1_000_000, lineage: None },
             reasoning_replay: ReasoningReplay::None,
             reason: SWITCH_OPERATOR.into(),
             settings_changed: false,

@@ -38,7 +38,7 @@
 //! ## API (all under `/api`; JSON in, JSON out)
 //! | Route | Does | Answers |
 //! |---|---|---|
-//! | `GET /status` | `runtime.health()`, counts from `sessions(true)` and `inbox()`, `statvfs` of the loom home on a blocking thread (`disk`, `null` when it cannot be read) | `StatusView` |
+//! | `GET /status` | `runtime.health()`, counts from `sessions(true)` and `inbox()`, `statvfs` of the loom home on a blocking thread (`disk`, `null` when it cannot be read), `runtime.egress()` (`egress`: the sandbox self-probe's view) | `StatusView` |
 //! | `GET /sessions?archived=true` | `runtime.sessions(archived)` (default false) | `[SessionInfo]` |
 //! | `POST /sessions` (`NewSession`; `prior` may be left out; `create_workspace` makes a missing workspace folder) | `runtime.create_session_receipt` (`404` for a `prior` mission that does not exist, `409` for too many) | `201` `CreatedSession` (a `SessionInfo` plus `created`: the folder was made) |
 //! | `GET /sessions/{id}` | the session and its children (sessions whose `parent` is it) | `SessionDetail` |
@@ -49,6 +49,7 @@
 //! | `POST /sessions/{id}/approvals` (`ApprovalBody`; `scope` may be left out) | `runtime.approve` | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/rules/{rule_id}/withdraw` (`WithdrawBody`; `reason` may be left out) | `runtime.withdraw_rule` (`404` when the mission has no such rule, `409` when it is already withdrawn) | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/scope` (`ScopeBody`; `note` may be left out) | `runtime.grant_scope` (operator only; a child's id goes to its lead; `409` for no hosts or a host that is not a plain name) | `202` `ScopeReceipt` |
+//! | `POST /missions/{id}/scope/revoke` (`ScopeRevokeBody`; both fields required) | `runtime.revoke_scope` (operator only; `404` for an unknown mission, `409` for a blank field or a host that is not granted; the sentence lists what is) | `202` `ScopeRevokeReceipt` |
 //! | `POST /sessions/{id}/release` (`ReleaseBody`; `reason` required) | `runtime.release` (operator only; closes the mission without the goal established; `409` for a blank reason) | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/stop` | `runtime.stop` | `202` `{}` |
 //! | `POST /sessions/{id}/resume` | `runtime.resume` | `202` `{}` |
@@ -60,6 +61,11 @@
 //! | `POST /sessions/{id}/role-model` (`RoleModelBody`) | `runtime.set_role_model` | `RoleModelReceipt` |
 //! | `GET /models` | `runtime.default_model()`, `runtime.health()` | `ModelsView` |
 //! | `POST /models/reload` | `runtime.reload_models` (no body) | `ModelsReload` |
+//! | `GET /monitor` | `runtime.monitor_status()`: the monitor in shadow (M2): state (`shadow`, `degraded`, `down`), open flags, the pauses and halts folded from its log, the counts it has read, every tripwire with how often it fired by severity, the faults of its sources | `MonitorStatus` |
+//! | `GET /missions/{id}/monitor?after={seq}&limit={n}&quiet={bool}` | `runtime.monitor_log`: the monitor-log entries about the mission (tripwire hits, flags, responses, pauses; `quiet` leaves out `cursor` and `heartbeat`, default true; `limit` default 200, at most 2000) | `{entries, next_after}` |
+//! | `GET /monitor/reviews/{review}/input` | the exact rendered input of a review; `404` until M6 (no review exists) | `text/plain` |
+//! | `GET /census` | `runtime.census()`: the last process and listener census of the sessions, found by sandbox identity (`null` until the first has finished; `?now=true` takes one first) | `CensusView` or `null` |
+//! | `POST /sessions/{id}/census/kill` | `runtime.census_kill`: SIGSTOP then SIGKILL of every process the census finds for the session (`404` for an id that is not a session) | `200` `Killed` (`rounds`, `killed`, `left`) |
 //! | `GET /sessions/{id}/window` | `runtime.window` | `WindowView` |
 //! | `GET /sessions/{id}/net?limit={n}` | `runtime.net` (default 200, at most 2000) | `[NetEntry]` |
 //! | `GET /missions` | `runtime.missions` | `[MissionInfo]` |
@@ -135,7 +141,7 @@ use crate::ui;
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DirsView, DiskSpace, ErrorBody, FileLinesView, FilesView,
     GcBody, LinesView, MessageBody, ModelBody, ModelsView, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody,
-    SessionDetail, StatusView, WithdrawBody,
+    ScopeRevokeBody, SessionDetail, StatusView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -184,6 +190,8 @@ const RECORDS_DEFAULT: usize = 500;
 const RECORDS_MAX: usize = 2_000;
 const NET_DEFAULT: usize = 200;
 const NET_MAX: usize = 2_000;
+const MONITOR_LOG_DEFAULT: usize = 200;
+const MONITOR_LOG_MAX: usize = 2_000;
 const LINES_DEFAULT_END: u64 = 2_000;
 const LINES_MAX: u64 = 5_000;
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
@@ -223,11 +231,17 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/role-model", post(set_role_model))
         .route("/api/models", get(models))
         .route("/api/models/reload", post(reload_models))
+        .route("/api/monitor", get(monitor_status))
+        .route("/api/missions/{id}/monitor", get(monitor_log))
+        .route("/api/monitor/reviews/{review}/input", get(monitor_review_input))
+        .route("/api/census", get(census))
+        .route("/api/sessions/{id}/census/kill", post(census_kill))
         .route("/api/sessions/{id}/window", get(window))
         .route("/api/sessions/{id}/net", get(net))
         .route("/api/missions", get(missions))
         .route("/api/missions/{id}/ledger", get(ledger))
         .route("/api/missions/{id}/score", get(score))
+        .route("/api/missions/{id}/scope/revoke", post(revoke_scope))
         .route("/api/inbox", get(inbox))
         .route("/api/inbox/{item_id}", post(answer))
         .route("/api/blobs/{handle}", get(blob_meta))
@@ -574,6 +588,12 @@ async fn status(State(s): State<ApiState>) -> Json<StatusView> {
         sessions_active: sessions.iter().filter(|i| i.active).count(),
         sessions_running: sessions.iter().filter(|i| i.status.phase == Phase::Running).count(),
         inbox_open,
+        egress: Some(s.runtime.egress()),
+        monitor: s.runtime.monitor_status().map(|m| crate::wire::MonitorBrief {
+            state: m.state,
+            open_flags: m.open_flags,
+            egress_unbounded: m.egress_unbounded,
+        }),
     })
 }
 
@@ -676,6 +696,12 @@ async fn grant_scope(State(s): State<ApiState>, Path(id): Path<String>, body: By
     Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
 }
 
+async fn revoke_scope(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: ScopeRevokeBody = json_body(&body)?;
+    let receipt = s.runtime.revoke_scope(&MissionId::from(id), &body.host, &body.reason).await.map_err(rt_err)?;
+    Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
+}
+
 /// NEEDS `Runtime::release` (not in this slice, which may not edit runtime.rs and session.rs): the one
 /// runtime method the finish/scope slice must add, exactly
 /// `pub async fn release(&self, id: &SessionId, reason: &str) -> Result<RuleReceipt, String>`.
@@ -687,6 +713,49 @@ async fn release(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes)
     let body: ReleaseBody = json_body(&body)?;
     let receipt = s.runtime.release(&SessionId::from(id), &body.reason).await.map_err(rt_err)?;
     Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
+}
+
+/// `GET /api/monitor`: the monitor's status. `404` only if the runtime has no monitor handle.
+async fn monitor_status(State(s): State<ApiState>) -> Res<Response> {
+    match s.runtime.monitor_status() {
+        Some(m) => Ok(Json(m).into_response()),
+        None => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "The runtime has no monitor handle; restart the daemon.".to_string(),
+        )),
+    }
+}
+
+/// `GET /api/missions/{id}/monitor?after=&limit=`: the monitor-log entries about one mission, as `{entries, next_after}`.
+async fn monitor_log(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery) -> Res<Response> {
+    let p = params(q)?;
+    let after = number(&p, "after")?.unwrap_or(0);
+    let limit = clamp_limit(number(&p, "limit")?, MONITOR_LOG_DEFAULT, MONITOR_LOG_MAX);
+    let mission = MissionId::from(id);
+    let quiet = flag(&p, "quiet")?.unwrap_or(true);
+    let page = s.runtime.monitor_log(Some(&mission), after, limit, quiet).map_err(rt_err)?;
+    Ok(Json(page).into_response())
+}
+
+/// `GET /api/monitor/reviews/{review}/input`: the exact input of a review. No review exists before M6.
+async fn monitor_review_input(Path(review): Path<String>) -> Res<Response> {
+    Err(ApiError::new(
+        StatusCode::NOT_FOUND,
+        format!(
+            "There is no review {review}: the monitor does not run reviews yet (phase M6), so no review input exists."
+        ),
+    ))
+}
+
+async fn census(State(s): State<ApiState>, q: RawQuery) -> Res<Response> {
+    let now = params(q)?.get("now").is_some_and(|v| v == "true");
+    let view = if now { Some(s.runtime.census_now().await.map_err(rt_err)?) } else { s.runtime.census() };
+    Ok(Json(view).into_response())
+}
+
+async fn census_kill(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
+    let killed = s.runtime.census_kill(&SessionId::from(id)).await.map_err(rt_err)?;
+    Ok(Json(killed).into_response())
 }
 
 async fn stop(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
@@ -1786,6 +1855,10 @@ mod tests {
         assert_eq!(status["sessions_total"], 1);
         assert_eq!(status["sessions_running"], 0);
         assert_eq!(status["inbox_open"], 1);
+        // The test runtime has no sandbox, so commands are not confined: egress is unbounded, and says why.
+        assert_eq!(status["egress"]["level"], "unbounded");
+        assert!(status["egress"]["reasons"][0].as_str().unwrap().contains("sandbox.mode"), "{status}");
+        assert_eq!(status["egress"]["probe_problem"], true);
         assert_eq!(status["bind"], format!("127.0.0.1:{}", e.port).as_str());
         assert_eq!(status["started_ms"], 1_234);
         assert_eq!(status["pid"], std::process::id());
@@ -1924,6 +1997,104 @@ mod tests {
             assert_eq!(s, 404, "{bad}: {b}");
             assert!(b["error"].as_str().unwrap().starts_with("There is no mission"), "{b}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_monitor_routes_show_the_shadow_monitor_and_its_log() {
+        let e = env(lead_script(json!({"question": "CHILDMARK find it"}))).await;
+        let id = e.create("go").await;
+        e.wait_turn_ends(&id, 1).await;
+        let monitor = e.rt.monitor().expect("the monitor is on by default");
+        monitor.pump_now(true);
+        let (s, b) = e.get("/api/monitor").await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!(
+            (b["state"].clone(), b["mode"].clone(), b["enabled"].clone()),
+            (json!("shadow"), json!("shadow"), json!(true))
+        );
+        assert!(b["sources"].as_u64().unwrap_or(0) >= 1, "{b}");
+        assert_eq!(b["tripwires"].as_array().map(Vec::len), Some(28));
+        assert!(b["counts"]["records"].as_u64().unwrap_or(0) > 0, "{b}");
+        let (s, st) = e.get("/api/status").await;
+        assert_eq!((s, st["monitor"]["state"].clone()), (200, json!("shadow")));
+        // The log of a mission: nothing was found about an honest session, so the page is empty and complete.
+        let (_, detail) = e.get(&format!("/api/sessions/{id}")).await;
+        let mission = detail["session"]["mission"].as_str().unwrap_or("").to_string();
+        let (s, b) = e.get(&format!("/api/missions/{mission}/monitor?limit=10")).await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!((b["entries"].clone(), b["next_after"].clone()), (json!([]), json!(null)));
+        let (s, b) = e.get(&format!("/api/missions/{mission}/monitor?limit=x")).await;
+        assert_eq!(s, 400, "{b}");
+        let (s, b) = e.get("/api/monitor/reviews/r-1/input").await;
+        assert_eq!(s, 404, "{b}");
+        assert!(b["error"].as_str().unwrap_or("").contains("M6"), "{b}");
+    }
+
+    #[tokio::test]
+    async fn the_census_routes_show_what_sessions_run_and_stop_only_a_known_one() {
+        let e = env(lead_script(json!({"question": "CHILDMARK find it"}))).await;
+        let id = e.create("go").await;
+        e.wait_turn_ends(&id, 1).await;
+        // The background census may or may not have finished: the view or `null`. `now=true` takes one, which names
+        // no session without processes.
+        let (s, b) = e.get("/api/census").await;
+        assert!(s == 200 && (b.is_null() || b["readable"] == json!(true)), "{b}");
+        let (s, b) = e.get("/api/census?now=true").await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!((b["readable"].clone(), b["sessions"].clone()), (json!(true), json!({})));
+        let (s, b) = e.get("/api/census").await;
+        assert_eq!((s, b["readable"].clone()), (200, json!(true)));
+        // A known session with nothing running: nothing to kill.
+        let (s, b) = e.post(&format!("/api/sessions/{id}/census/kill"), json!({})).await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!((b["killed"].clone(), b["left"].clone()), (json!(0), json!([])));
+        let (s, b) = e.post("/api/sessions/s-nope/census/kill", json!({})).await;
+        assert_eq!(s, 404, "{b}");
+        assert_eq!(b["error"], "There is no session s-nope.");
+    }
+
+    #[tokio::test]
+    async fn the_scope_revoke_route_withdraws_a_granted_host_and_refuses_what_is_not_granted() {
+        let e = env(lead_script(json!({"question": "CHILDMARK find it"}))).await;
+        let id = e.create("go").await;
+        e.wait_turn_ends(&id, 1).await;
+        let (_, missions) = e.get("/api/missions").await;
+        let mission = missions[0]["id"].as_str().unwrap().to_string();
+        let (s, b) =
+            e.post(&format!("/api/sessions/{id}/scope"), json!({"hosts": ["a.example.test", "*.b.test"]})).await;
+        assert_eq!(s, 202, "{b}");
+        e.ledger_state(&mission, "the grant", |l| l["scope_grants"].as_array().is_some_and(|g| !g.is_empty())).await;
+
+        let path = format!("/api/missions/{mission}/scope/revoke");
+        let (s, b) = e.post(&path, json!({"host": "A.example.test", "reason": "wrong target"})).await;
+        assert_eq!(
+            (s, &b["lead"], &b["host"], &b["recorded"]),
+            (202, &json!(id), &json!("a.example.test"), &json!(true)),
+            "{b}"
+        );
+        let state = e
+            .ledger_state(&mission, "the revoke", |l| l["scope_revokes"].as_array().is_some_and(|r| !r.is_empty()))
+            .await;
+        assert_eq!(state["scope_revokes"][0]["reason"], "wrong target");
+
+        // Refused: not granted any more (the sentence lists what is), a host a wildcard covers, a blank
+        // reason, an unknown mission; unknown fields and missing fields are bad bodies.
+        let (s, b) = e.post(&path, json!({"host": "a.example.test", "reason": "again"})).await;
+        assert_eq!(s, 409, "{b}");
+        assert!(b["error"].as_str().unwrap().contains("*.b.test"), "{b}");
+        let (s, b) = e.post(&path, json!({"host": "x.b.test", "reason": "r"})).await;
+        assert_eq!(s, 409, "{b}");
+        let (s, b) = e.post(&path, json!({"host": "*.b.test", "reason": " "})).await;
+        assert_eq!(s, 409, "{b}");
+        assert!(b["error"].as_str().unwrap().contains("Say why"), "{b}");
+        let (s, b) = e.post("/api/missions/m-nope/scope/revoke", json!({"host": "a.test", "reason": "r"})).await;
+        assert_eq!(s, 404, "{b}");
+        let (s, _) = e.post(&path, json!({"host": "a.test", "reason": "r", "extra": 1})).await;
+        assert_eq!(s, 400);
+        let (s, _) = e.post(&path, json!({"host": "a.test"})).await;
+        assert_eq!(s, 400);
+        let (s, b) = e.post(&path, json!({"host": "*.b.test", "reason": "done with it"})).await;
+        assert_eq!(s, 202, "{b}");
     }
 
     #[tokio::test]

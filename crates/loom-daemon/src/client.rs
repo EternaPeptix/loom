@@ -24,6 +24,7 @@
 //!   sessions (archived included): the one whose id equals `word`; else those whose id starts with
 //!   `word` or with `s-{word}`. One → it. None → `No session matches `{word}`.` Several → `` `{word}`
 //!   matches {n} sessions: {ids, at most 5, then "…"}. Give more of the id. ``
+//! - `revoke_scope(mission, host, reason)`: `POST /api/missions/{id}/scope/revoke`, the `ScopeRevokeReceipt`.
 //! - `grant_scope(id, hosts, note)`: `POST /api/sessions/{id}/scope`, the `ScopeReceipt`. `release(id, reason)`:
 //!   `POST /api/sessions/{id}/release`, the `RuleReceipt`. Both are the operator's, like `add_rule`.
 //! - `mission_of(word)`: a word starting with `m-` is taken as a mission id as it is; otherwise
@@ -65,7 +66,7 @@
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody,
     ModelBody, ModelsView, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeReceipt,
-    SessionDetail, StatusView, WithdrawBody,
+    ScopeRevokeBody, ScopeRevokeReceipt, SessionDetail, StatusView, WithdrawBody,
 };
 use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry,
@@ -497,6 +498,19 @@ impl Client {
         self.call(Method::POST, &format!("/api/sessions/{}/scope", segment(id.as_str())), &[], Some(body)).await
     }
 
+    /// Withdraw `host` (as it was granted) from `mission` (the operator's revoke).
+    pub async fn revoke_scope(
+        &self,
+        mission: &MissionId,
+        host: &str,
+        reason: &str,
+    ) -> Result<ScopeRevokeReceipt, String> {
+        let body = serde_json::to_value(ScopeRevokeBody { host: host.to_string(), reason: reason.to_string() })
+            .map_err(|e| format!("The revoke cannot be encoded ({e})."))?;
+        let path = format!("/api/missions/{}/scope/revoke", segment(mission.as_str()));
+        self.call(Method::POST, &path, &[], Some(body)).await
+    }
+
     /// Close the mission of `id` without the goal established, for `reason`.
     pub async fn release(&self, id: &SessionId, reason: &str) -> Result<RuleReceipt, String> {
         let body = serde_json::to_value(ReleaseBody { reason: reason.to_string() })
@@ -578,6 +592,23 @@ impl Client {
     pub async fn net(&self, id: &SessionId, limit: usize) -> Result<Vec<NetEntry>, String> {
         let query = [("limit", limit.to_string())];
         self.call(Method::GET, &format!("/api/sessions/{}/net", segment(id.as_str())), &query, None).await
+    }
+
+    /// The monitor's status (`GET /api/monitor`).
+    pub async fn monitor_status(&self) -> Result<loom_agent::monitor::core::MonitorStatus, String> {
+        self.call(Method::GET, "/api/monitor", &[], None).await
+    }
+
+    /// The monitor-log entries about a mission (`GET /api/missions/{id}/monitor`).
+    pub async fn monitor_log(
+        &self,
+        mission: &MissionId,
+        after: u64,
+        limit: usize,
+        quiet: bool,
+    ) -> Result<loom_agent::monitor::LogPage, String> {
+        let query = [("after", after.to_string()), ("limit", limit.to_string()), ("quiet", quiet.to_string())];
+        self.call(Method::GET, &format!("/api/missions/{}/monitor", segment(mission.as_str())), &query, None).await
     }
 
     pub async fn missions(&self) -> Result<Vec<MissionInfo>, String> {
@@ -963,6 +994,8 @@ mod tests {
             sessions_active: 1,
             sessions_running: 1,
             inbox_open: 0,
+            egress: None,
+            monitor: None,
         }
     }
 

@@ -37,6 +37,23 @@ pub struct StatusView {
     /// Sessions in the middle of a turn.
     pub sessions_running: usize,
     pub inbox_open: usize,
+    /// Whether sandboxed commands can reach the network outside the egress proxy, from the sandbox self-probe (E2);
+    /// `null` from a daemon that predates it.
+    #[serde(default)]
+    pub egress: Option<loom_agent::egress::EgressView>,
+    /// What the monitor says in a word, from `GET /api/monitor`'s `MonitorStatus`; `null` when `[monitor] enabled =
+    /// false` or from a daemon that predates it.
+    #[serde(default)]
+    pub monitor: Option<MonitorBrief>,
+}
+
+/// The monitor in one line of `loom status`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MonitorBrief {
+    /// `shadow`, `degraded` or `down`.
+    pub state: String,
+    pub open_flags: u64,
+    pub egress_unbounded: bool,
 }
 
 /// Free space below which `loom status` warns that sessions will soon fail to write: 5 GiB, or 5 percent of the
@@ -233,6 +250,19 @@ pub struct ScopeBody {
 
 /// The answer to `POST /api/sessions/{id}/scope`.
 pub use loom_agent::runtime::ScopeReceipt;
+
+/// Body of `POST /api/missions/{id}/scope/revoke`: the operator withdraws one granted host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeRevokeBody {
+    /// The host exactly as it was granted (compared ignoring case).
+    pub host: String,
+    /// Why; kept in the ledger and shown to the lead. Required.
+    pub reason: String,
+}
+
+/// The answer to `POST /api/missions/{id}/scope/revoke`.
+pub use loom_agent::runtime::ScopeRevokeReceipt;
 
 /// Body of `POST /api/sessions/{id}/release`: the operator closes the mission without the goal established.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

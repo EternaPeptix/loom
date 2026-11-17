@@ -47,7 +47,10 @@ mkdir -p ~/.local/bin                     # or use any other directory on your P
 install -m 755 target/release/loom ~/.local/bin/loom
 loom config init                          # writes ~/.loom/config.toml
 $EDITOR ~/.loom/config.toml               # set base_url and model for your server
-loom config check                         # prints "ok", or what is wrong
+loom config check                         # prints each profile's lineage, then "ok: <path>", or what is wrong
+loom models lineage [profile]             # each profile's family, alignment, recipient and who reviews it
+loom monitor                              # the watcher in shadow: what its tripwires have found (changes nothing for an agent)
+loom monitor replay --home /path/to/copy  # the tripwires over a home's history, read-only
 loom up                                   # start the daemon in the background
 loom status                               # the daemon, ✓ or ✗ for your model server, what is running
 loom run -w /path/to/workspace "your task in one sentence"
@@ -168,6 +171,7 @@ loom rule <session> "text"                set a standing rule for the mission
 loom rule <session> --withdraw <rule-id> [--reason "..."]
 loom approve <session> "text" [--scope "..."]
 loom scope <session> <host>...            let the mission's tools reach these hosts (a session asks with request_scope)
+loom scope revoke <mission> <host> --reason "..."   take a granted host back (recorded, cut at once)
 loom release <session> "reason"           accept a blocked mission as it is and close it
 loom ledger <session>                     the mission ledger
 loom score <session> [--json]             what the mission's work took: steps, refused finishes, malformed calls
@@ -237,6 +241,12 @@ see [CTF](packs/ctf/README.md), [Redteam](packs/redteam/README.md), and the
 
 `harnessmm` is an opt-in experimental pack for bounded guarded continuations. See
 [`docs/HARNESSMM.md`](docs/HARNESSMM.md) for its limits and evaluation protocol.
+
+The adversarial monitor (deterministic tripwires, a cross-family reviewer, a gate for irreversible actions, a durable
+pause, and the operator-armed "keep going") is specified in [`docs/MONITOR.md`](docs/MONITOR.md) and built in phases;
+this build has the floor (infrastructure deny, fetch-service and mach-lookup denies, process census, proxy controls),
+model lineage, and the tripwire monitor in shadow: the daemon runs it, and it records what it finds without steering,
+pausing or refusing anything. The reviewer, the action gate, the pause and "keep going" are later phases.
 
 ## Building and testing
 

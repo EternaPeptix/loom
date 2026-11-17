@@ -19,7 +19,14 @@
 //!   `daemon.json` names a live pid (a daemon still shutting down), only the second wait.
 //! - `status`: `render::status`. Exit 1 when the daemon is not running (with the usual sentence).
 //! - `open`: request a login code and open `http://{bind}/#code={code}` (`/usr/bin/open` on macOS,
-//!   `xdg-open` elsewhere); `--print` only prints it. The API token is never printed or passed on argv.
+//!   `xdg-open` elsewhere); `--print` only prints it. The API token is never printed or passed on argv, and
+//!   neither is the login code: the opener is given the path of a page file (`<home>/login/login-{random}.html`,
+//!   mode 0600 in a private directory, a refresh and `location.replace` to the address, no referrer) and
+//!   not the address; pages older than five minutes are removed by the next `open`. A file that cannot be
+//!   written, or an opener that fails, is an error that says to use `loom open --print`. The opener gets a
+//!   `.html` file, which the desktop opens with whatever handles `.html` (not always a browser), so after a
+//!   successful hand-over one line is printed: `OPENED_NOTE`, which says to run `loom open --print` when an
+//!   editor opened instead.
 //! - `run [options] <message…>`: start a session and follow it. The message is the arguments
 //!   joined by spaces; `-` or no message reads standard input to its end. Options → `NewSession`
 //!   (`--workspace` defaults to the current directory; `--attended` sets `unattended: false`;
@@ -54,6 +61,11 @@
 //!   quoted); the operator's grant of network hosts to the mission, for the session's lifetime. Prints
 //!   `scope granted for {lead}: a, b` (`scope_line`, from the daemon's receipt), and says when the mission
 //!   keeps no ledger. The command an agent's scope request (`loom inbox`) asks the operator to run.
+//! - `scope revoke <mission> --reason <text> <host>`: `client.revoke_scope` (`mission_of`: an `m-` id as it is, or
+//!   the mission of a session word); the operator withdraws one granted host, written as it was granted. Prints
+//!   `scope revoked for {lead}: {host}; {n} session(s) narrowed, {n} connection(s) cut` (`scope_revoke_line`),
+//!   and says when the mission keeps no ledger or the grant was not in the ledger yet. A host that is not
+//!   granted is refused with the list of what is. `--reason` is required.
 //!   `release <session> <reason…>` (`-` = standard input): `client.release`; the operator closes the mission
 //!   without the goal established. Prints `closed by operator, goal not established: release sent to {lead}`
 //!   (`release_line`). A blank reason is refused.
@@ -69,16 +81,36 @@
 //!   time, without `--lines`), passed through `render::clean`.
 //! - `config path` prints the config file's path; `config check` loads and checks it, reads every
 //!   `api_key_file` (`check_model_keys`) and runs the daemon's other start-up checks (sandbox preflight, box
-//!   paths): `ok: {path}`, or the error (naming the file) and exit 1; with `ok`, each line of
-//!   `key_env_warnings` judged against this shell's environment on stderr as `warning: {line}`; `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
-//!   overwrite: `{path} already exists.`).
+//!   paths, the infrastructure deny: `loom_agent::runtime::check_infrastructure`): the error (naming the file
+//!   when it is the file's) and exit 1 for any of them. Then it checks the model policy against the packs
+//!   (`loom_agent::monitor::lineage::check_config`): one line per profile with its resolved family, alignment and
+//!   recipient and where each came from (stdout), each note on stderr as `note: {line}`, and, when a problem is found
+//!   (an agent profile with no eligible reviewer that is not in `[monitor] tripwires_only_profiles`, an unknown
+//!   family or recipient, a reviewer whose family, alignment or recipient is not declared, a policy that cannot be
+//!   evaluated), the error `The model policy is not settled (n to fix):`
+//!   with each problem and the exact lines to add, exit 1; else `ok: {path}`, and each line of `key_env_warnings` judged
+//!   against this shell's environment on stderr as `warning: {line}`. `config init` writes [`DEFAULT_CONFIG`] if no
+//!   file exists (refuses to overwrite: `{path} already exists.`). `DEFAULT_CONFIG` leaves `tripwires_only_profiles`
+//!   commented out, so a first `config check` fails and lays out the three choices: not LLM-reviewed is a choice the
+//!   operator makes, never a default.
 //! - `models list`: `render::models_table` of `GET /api/models`. `models reload`: `POST
 //!   /api/models/reload`, `render::models_reload` of the report. `models set <session> <profile>`:
 //!   resolves the session, `POST /api/sessions/{id}/model`, `render::model_switch_line`. `models show
 //!   <session>`: `render::mission_models_table` of `GET /api/sessions/{id}/models`. `models role
 //!   <session> <role> <profile> [--now]` / `--clear`: `POST /api/sessions/{id}/role-model` (`all` sent
 //!   as `*`), `render::role_model_receipt`. None needs a restart; the daemon refuses with its sentence
-//!   (an unknown profile names the configured ones).
+//!   (an unknown profile names the configured ones). `models lineage [profile]` prints the lines of `config check`
+//!   with, for each agent profile and pack, who reviews it (`lineage::show_lines`); it reads the configuration
+//!   and the packs and needs no daemon.
+//! - `monitor [status]`: `client.monitor_status`; the monitor's state (`shadow`, `degraded`, `down` with its reason), what it
+//!   has read, its open flags, the faults of its sources and one row per tripwire with its hits by severity
+//!   (`monitor_status_lines`; every line goes through `render::clean` and has no line break, since a tripwire's detail and key carry strings an agent chose). `monitor log <mission|session> [--json] [--since 90m|12h|7d|<ms>] [--all] [-n N]`:
+//!   `client.monitor_log` (`mission_of` resolves the word), paged until N entries; one line per entry in words
+//!   (`monitor_entry_line`), or the stored JSON per line with `--json`; `--all` includes `cursor` and `heartbeat`.
+//!   `monitor replay [--since …] [--positives FILE] [--home DIR] [--no-journal-key] [--json]`: runs
+//!   `loom_agent::monitor::replay::run` in this process over the home (the current one, or a copy), read-only and with
+//!   no daemon; reads `keys/journal.key` unless `--no-journal-key`; prints the report as a table with notes, or as JSON.
+//!   A `--since` that is not `90m`, `12h`, `7d` or milliseconds is an error that says so (`parse_since`).
 //! - `service install|uninstall|status` (macOS; elsewhere `This command is for macOS (launchd).`):
 //!   `install` first loads the config and refuses (nothing written) a profile that sets `api_key_env`: a
 //!   launchd agent does not have the shell's variables, so its requests would carry no key, and putting
@@ -117,7 +149,7 @@
 use crate::client::{self, Client};
 use crate::render::{self, RecordOpts, Style};
 use clap::{Args, Parser, Subcommand};
-use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt, ANY_ROLE};
+use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt, ScopeRevokeReceipt, ANY_ROLE};
 use loom_agent::session::Phase;
 use loom_core::config::{Config, ConfigError, Paths};
 use loom_core::event::{Budget, Event, Record, Seq, SessionOutcome, TurnEndReason};
@@ -164,6 +196,12 @@ allow_private = []
 max_children = 6
 verify_finish = true
 unavailable_notice_s = 300   # tell you (inbox item, notification) when a request has retried this long; 0 = never
+
+[monitor]
+# Who may review whose missions is a model-policy choice (docs/MONITOR.md). A profile with no reviewer must be named here
+# on purpose; its missions are then watched by the deterministic tripwires only. `loom config check` says what to add
+# (a reviewer, or this line), and `loom models lineage` shows who reviews what. Uncommenting the line is that choice:
+# tripwires_only_profiles = ["local"]
 "#;
 
 #[derive(Parser, Debug)]
@@ -245,7 +283,9 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// The model profiles: list them, reload them from the config, switch a session's model
+    /// The adversarial monitor in shadow: its state, its log, a replay over history
+    Monitor(MonitorArgs),
+    /// The model profiles: list them, reload them from the config, switch a session's model, and who reviews them
     Models {
         #[command(subcommand)]
         action: ModelsAction,
@@ -435,15 +475,89 @@ pub struct ApproveArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct ScopeArgs {
+    #[command(subcommand)]
+    pub action: Option<ScopeAction>,
     /// A session id, the beginning of one, or `last`
-    pub session: String,
+    #[arg(required = true)]
+    pub session: Option<String>,
     /// Why the hosts are granted (kept in the ledger)
     #[arg(long)]
     pub note: Option<String>,
     /// The hosts, one per argument, such as api.example.com or '*.example.com'
     #[arg(required = true)]
     pub hosts: Vec<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ScopeAction {
+    /// Withdraw a granted host from a mission: its open connections are cut and new ones refused
+    Revoke(ScopeRevokeArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ScopeRevokeArgs {
+    /// A mission id (`m-…`), or a session id, the beginning of one, or `last`
+    pub mission: String,
+    /// The host exactly as it was granted
+    pub host: String,
+    /// Why (kept in the ledger and shown to the lead)
+    #[arg(long)]
+    pub reason: String,
+}
+
+#[derive(Args, Debug)]
+pub struct MonitorArgs {
+    #[command(subcommand)]
+    pub action: Option<MonitorAction>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MonitorAction {
+    /// The monitor's state, its open flags and what each tripwire has fired (the default)
+    Status,
+    /// The monitor-log entries about a mission
+    Log(MonitorLogArgs),
+    /// Run the tripwires over the history of a loom home, read-only, and report per tripwire
+    Replay(MonitorReplayArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct MonitorLogArgs {
+    /// A mission id (`m-…`), or a session id, the beginning of one, or `last`
+    pub target: String,
+    /// One JSON object per line, as stored
+    #[arg(long)]
+    pub json: bool,
+    /// Only entries newer than this: `90m`, `12h`, `7d`, or a time in milliseconds since the epoch
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Include the housekeeping entries (`cursor`, `heartbeat`)
+    #[arg(long)]
+    pub all: bool,
+    /// At most this many entries
+    #[arg(short = 'n', long, default_value_t = 200)]
+    pub limit: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct MonitorReplayArgs {
+    /// Only hits newer than this: `90m`, `12h`, `7d`, or a time in milliseconds since the epoch
+    #[arg(long)]
+    pub since: Option<String>,
+    /// The report as JSON
+    #[arg(long)]
+    pub json: bool,
+    /// A file of mission ids, one per line, known to be positives: precision and recall are reported against them
+    #[arg(long)]
+    pub positives: Option<PathBuf>,
+    /// Replay this loom home instead of the current one (a copy of one; it is only read)
+    #[arg(long)]
+    pub home: Option<PathBuf>,
+    /// Do not read `keys/journal.key`: the ledgers are read unverified
+    #[arg(long)]
+    pub no_journal_key: bool,
 }
 
 #[derive(Args, Debug)]
@@ -492,6 +606,12 @@ pub enum ModelsAction {
     Show(ModelsShowArgs),
     /// Choose the model a mission starts its agents of a role on (`all` for every role), or clear it
     Role(ModelsRoleArgs),
+    /// Each profile's family, alignment and recipient (and where each came from), and who reviews its missions
+    /// (reads the configuration and the packs; needs no daemon)
+    Lineage {
+        /// Only this profile
+        profile: Option<String>,
+    },
 }
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -717,6 +837,23 @@ fn scope_line(r: &ScopeReceipt) -> String {
     let mut line = format!("scope granted for {}: {}", r.lead.as_str(), r.hosts.join(", "));
     if !r.ledger {
         line.push_str("; this mission keeps no ledger, so the grant is not listed");
+    }
+    line
+}
+
+/// The line printed once the daemon accepted a scope revoke.
+fn scope_revoke_line(r: &ScopeRevokeReceipt) -> String {
+    let mut line = format!(
+        "scope revoked for {}: {}; {} session(s) narrowed, {} connection(s) cut",
+        r.lead.as_str(),
+        r.host,
+        r.sessions,
+        r.cut
+    );
+    if !r.ledger {
+        line.push_str("; this mission keeps no ledger, so the revoke is not listed and a restart does not keep it");
+    } else if !r.recorded {
+        line.push_str("; the grant was not in the ledger yet, so the revoke is not recorded there: run it again once `loom ledger` lists the grant");
     }
     line
 }
@@ -1170,6 +1307,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
         Command::Down => cmd_down(&paths).await,
         Command::Config { action } => cmd_config(&paths, action),
         Command::Models { action } => cmd_models(&paths, action).await,
+        Command::Monitor(a) => cmd_monitor(&paths, a).await,
         Command::Service { action } => cmd_service(&paths, action),
         Command::Status => {
             let view = client_of(&paths)?.status().await?;
@@ -1251,9 +1389,17 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             let receipt = c.approve(&id, &text, a.scope.as_deref().unwrap_or("")).await?;
             outln(&receipt_line("approval", "scope", &receipt)).map(|()| 0)
         }
+        Command::Scope(ScopeArgs { action: Some(ScopeAction::Revoke(a)), .. }) => {
+            let c = client_of(&paths)?;
+            let mission = c.mission_of(&a.mission).await?;
+            let receipt = c.revoke_scope(&mission, &a.host, &a.reason).await?;
+            outln(&scope_revoke_line(&receipt)).map(|()| 0)
+        }
         Command::Scope(a) => {
             let c = client_of(&paths)?;
-            let id = c.resolve(&a.session).await?;
+            let word =
+                a.session.as_deref().ok_or("Name the session to grant the hosts to: loom scope <session> <host>…")?;
+            let id = c.resolve(word).await?;
             let receipt = c.grant_scope(&id, &a.hosts, a.note.as_deref()).await?;
             outln(&scope_line(&receipt)).map(|()| 0)
         }
@@ -1450,34 +1596,114 @@ async fn open_with(
         put(out, &format!("{url}\n"))?;
     } else {
         launch(&url)?;
+        put(out, OPENED_NOTE)?;
     }
     Ok(0)
 }
 
-/// Hand `url` to the desktop's opener.
-fn launch_browser(url: &str) -> Result<(), String> {
-    let program = if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
-    let status = std::process::Command::new(program)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| {
-            format!("Cannot start {program} ({e}). Run `loom open --print` and open the address in a browser yourself.")
-        })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{program} could not open the address. Run `loom open --print` and open it in a browser yourself."))
+/// Printed after the login page was handed to the desktop's opener.
+const OPENED_NOTE: &str = "Opened the loom login page. If an editor opened instead of a browser (your .html files open there), run `loom open --print` and open the address in a browser.\n";
+
+/// How long a login page stays on disk before the next `open` removes it (its code is dead long before).
+const LOGIN_PAGE_KEEP: Duration = Duration::from_secs(300);
+
+/// The page that sends the browser to `url` (which holds the login code in its fragment), as a file in
+/// `dir` (a private directory under the loom home) that only this user can read. The opener is given the
+/// path of this file and never the address, so the code is not in any process's arguments, where another
+/// local process could read it while the opener runs. Pages older than [`LOGIN_PAGE_KEEP`] are removed.
+fn write_login_page(dir: &Path, url: &str) -> Result<PathBuf, String> {
+    loom_core::config::ensure_private_dir(dir).map_err(|e| {
+        format!(
+            "Cannot create {} ({e}). Run `loom open --print` and open the address in a browser yourself.",
+            dir.display()
+        )
+    })?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > LOGIN_PAGE_KEEP);
+            if old && entry.file_name().to_string_lossy().starts_with("login-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
+    let escaped = url.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;");
+    let script = serde_json::to_string(url).map_err(|e| format!("The address cannot be encoded ({e})."))?;
+    let page = format!(
+        "<!doctype html><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><title>loom</title>\n\
+         <meta http-equiv=\"refresh\" content=\"0;url={escaped}\">\n\
+         <script>location.replace({script});</script>\n\
+         <p>Opening loom. If nothing happens, <a href=\"{escaped}\">continue</a>.</p>\n"
+    );
+    let path = dir.join(format!("login-{}.html", hex::encode(rand::random::<[u8; 16]>())));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&path).map_err(|e| {
+        format!(
+            "Cannot write {} ({e}). Run `loom open --print` and open the address in a browser yourself.",
+            path.display()
+        )
+    })?;
+    file.write_all(page.as_bytes()).map_err(|e| {
+        format!(
+            "Cannot write {} ({e}). Run `loom open --print` and open the address in a browser yourself.",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+/// Hand `url` to the desktop's opener, through a page file in `dir` so that the address (with its login
+/// code) is not on the opener's command line. `run(program, page)` starts the opener.
+fn launch_browser_with(
+    dir: &Path,
+    url: &str,
+    run: impl FnOnce(&str, &Path) -> std::io::Result<bool>,
+) -> Result<(), String> {
+    let program = if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
+    let page = write_login_page(dir, url)?;
+    match run(program, &page) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            let _ = std::fs::remove_file(&page);
+            Err(format!(
+                "{program} could not open the address. Run `loom open --print` and open it in a browser yourself."
+            ))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&page);
+            Err(format!(
+                "Cannot start {program} ({e}). Run `loom open --print` and open the address in a browser yourself."
+            ))
+        }
+    }
+}
+
+/// Hand `url` to the desktop's opener (see [`launch_browser_with`]).
+fn launch_browser(dir: &Path, url: &str) -> Result<(), String> {
+    launch_browser_with(dir, url, |program, page| {
+        std::process::Command::new(program)
+            .arg(page)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+    })
 }
 
 async fn cmd_open(paths: &Paths, a: &OpenArgs) -> Result<i32, String> {
     let c = client_of(paths)?;
     // Say "not running" here rather than hand the browser an address nothing answers on.
     c.status().await?;
-    open_with(&c, a, &mut StdoutSink, launch_browser).await
+    let dir = paths.home.join("login");
+    open_with(&c, a, &mut StdoutSink, |url| launch_browser(&dir, url)).await
 }
 
 async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
@@ -1558,20 +1784,30 @@ that recalls them, or drop --prior to continue this one."
 }
 
 async fn cmd_models(paths: &Paths, action: ModelsAction) -> Result<i32, String> {
-    let c = client_of(paths)?;
     match action {
-        ModelsAction::List => block(&render::models_table(&c.models().await?, &style())).map(|()| 0),
-        ModelsAction::Reload => block(&render::models_reload(&c.reload_models().await?)).map(|()| 0),
+        // Read from the configuration and the packs, so it works with no daemon running.
+        ModelsAction::Lineage { profile } => cmd_models_lineage(paths, profile.as_deref()),
+        ModelsAction::List => {
+            let c = client_of(paths)?;
+            block(&render::models_table(&c.models().await?, &style())).map(|()| 0)
+        }
+        ModelsAction::Reload => {
+            let c = client_of(paths)?;
+            block(&render::models_reload(&c.reload_models().await?)).map(|()| 0)
+        }
         ModelsAction::Set(a) => {
+            let c = client_of(paths)?;
             let id = c.resolve(&a.session).await?;
             let receipt = c.set_model(&id, &a.profile).await?;
             outln(&render::model_switch_line(&receipt)).map(|()| 0)
         }
         ModelsAction::Show(a) => {
+            let c = client_of(paths)?;
             let id = c.resolve(&a.session).await?;
             block(&render::mission_models_table(&c.mission_models(&id).await?, &style())).map(|()| 0)
         }
         ModelsAction::Role(a) => {
+            let c = client_of(paths)?;
             let id = c.resolve(&a.session).await?;
             let role = cli_role(&a.role);
             let receipt = c.set_role_model(&id, &role, a.profile.as_deref(), a.now).await?;
@@ -1597,6 +1833,23 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
             cfg.check_model_keys(&paths.model_keys_dir())?;
             loom_tools::sandbox::preflight(&cfg.sandbox).map_err(|e| e.to_string())?;
             cfg.check_box_paths(&paths.home).map_err(|e| e.to_string())?;
+            loom_agent::runtime::check_infrastructure(&cfg)?;
+            // Then the model policy, which the daemon does not refuse to start on: who reviews each profile.
+            let packs = loom_agent::pack::Packs::load(&paths.packs_dir())?;
+            let report = loom_agent::monitor::lineage::check_config(&cfg, &packs);
+            for line in &report.table {
+                outln(line)?;
+            }
+            for note in &report.notes {
+                errln(&format!("note: {note}"));
+            }
+            if !report.problems.is_empty() {
+                return Err(format!(
+                    "The model policy is not settled ({} to fix):\n\n{}",
+                    report.problems.len(),
+                    report.problems.join("\n\n")
+                ));
+            }
             outln(&format!("ok: {}", file.display()))?;
             for line in cfg.key_env_warnings(&paths.model_keys_dir(), env_var_is_set) {
                 errln(&format!("warning: {line}"));
@@ -1618,6 +1871,191 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
             outln(&format!("wrote {}", file.display())).map(|()| 0)
         }
     }
+}
+
+/// `5m`, `12h`, `7d` (before `now_ms`), or a time in milliseconds since the epoch.
+pub(crate) fn parse_since(word: &str, now_ms: u64) -> Result<u64, String> {
+    let w = word.trim();
+    let bad = || format!("--since \"{word}\" is not a time. Use 90m, 12h or 7d, or milliseconds since the epoch.");
+    if let Some((n, unit)) = w.char_indices().last().and_then(|(i, u)| w.get(..i).map(|n| (n, u))) {
+        let mult: Option<u64> = match unit {
+            'm' => Some(60_000),
+            'h' => Some(3_600_000),
+            'd' => Some(86_400_000),
+            _ => None,
+        };
+        if let (Some(m), Ok(n)) = (mult, n.parse::<u64>()) {
+            return Ok(now_ms.saturating_sub(n.saturating_mul(m)));
+        }
+    }
+    w.parse::<u64>().map_err(|_| bad())
+}
+
+/// One line for the terminal: every control and bidirectional override replaced (a tripwire's detail and key carry
+/// strings an agent chose), and no line break inside it.
+fn terminal_line(text: &str) -> String {
+    render::clean(text).replace(['\n', '\t'], "·")
+}
+
+fn monitor_status_lines(m: &loom_agent::monitor::core::MonitorStatus) -> Vec<String> {
+    monitor_status_raw(m).iter().map(|l| terminal_line(l)).collect()
+}
+
+fn monitor_status_raw(m: &loom_agent::monitor::core::MonitorStatus) -> Vec<String> {
+    let mut l = vec![format!(
+        "monitor: {} ({} mode){}",
+        m.state,
+        m.mode,
+        m.down_reason.as_deref().map_or(String::new(), |r| format!(": {r}"))
+    )];
+    l.push(format!(
+        "read {} records, {} net decisions and {} floor events from {} sessions; {} open flags; {} paused, {} halted",
+        m.counts.records,
+        m.counts.net,
+        m.counts.floor,
+        m.sources,
+        m.open_flags,
+        m.paused.len(),
+        m.halts.len()
+    ));
+    if m.egress_unbounded {
+        l.push("egress: UNBOUNDED (the sandbox self-probe found a route outside the proxy)".to_string());
+    }
+    for f in &m.faults {
+        l.push(format!("source fault: {f}"));
+    }
+    l.push(format!(
+        "{:<6} {:<34} {:<9} {:>6} {:>5} {:>5} {:>5} {:>5}",
+        "id", "tripwire", "starts", "fired", "S1", "S2", "S3", "S4"
+    ));
+    for t in &m.tripwires {
+        l.push(format!(
+            "{:<6} {:<34} {:<9} {:>6} {:>5} {:>5} {:>5} {:>5}",
+            t.id, t.name, t.start, t.fired, t.by_severity[1], t.by_severity[2], t.by_severity[3], t.by_severity[4]
+        ));
+    }
+    l.push(
+        "Every tripwire is in shadow: a finding is recorded and shown, and changes nothing for any agent.".to_string(),
+    );
+    l
+}
+
+fn monitor_entry_line(e: &loom_agent::monitor::log::Entry) -> String {
+    terminal_line(&monitor_entry_raw(e))
+}
+
+fn monitor_entry_raw(e: &loom_agent::monitor::log::Entry) -> String {
+    let get = |k: &str| e.fields.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let when = e.ts_ms / 1000;
+    match e.kind.slug() {
+        "tripwire" => format!(
+            "#{} {when} {} {} {} would {}{} {} ({})",
+            e.seq,
+            get("id"),
+            get("severity"),
+            get("session"),
+            get("would"),
+            if e.fields.get("precision").and_then(|v| v.as_bool()).unwrap_or(false) { " precision-list" } else { "" },
+            get("detail"),
+            get("category")
+        ),
+        "flag" => format!(
+            "#{} {when} flag {} {} {} x{} {} [{}]",
+            e.seq,
+            get("flag"),
+            get("severity"),
+            get("category"),
+            e.fields.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
+            get("key"),
+            e.fields.get("causes").map_or(String::new(), |c| c.to_string())
+        ),
+        "response" => format!(
+            "#{} {when} response {} would {} {}",
+            e.seq,
+            get("level"),
+            get("would"),
+            e.fields.get("causes").map_or(String::new(), |c| c.to_string())
+        ),
+        other => format!("#{} {when} {other} {}", e.seq, serde_json::to_string(&e.fields).unwrap_or_default()),
+    }
+}
+
+async fn cmd_monitor(paths: &Paths, args: MonitorArgs) -> Result<i32, String> {
+    match args.action.unwrap_or(MonitorAction::Status) {
+        MonitorAction::Status => {
+            let m = client_of(paths)?.monitor_status().await?;
+            for line in monitor_status_lines(&m) {
+                outln(&line)?;
+            }
+            Ok(0)
+        }
+        MonitorAction::Log(a) => {
+            let c = client_of(paths)?;
+            let mission = c.mission_of(&a.target).await?;
+            let since = a.since.as_deref().map(|w| parse_since(w, loom_core::now_ms())).transpose()?;
+            let mut after = 0;
+            let mut left = a.limit.max(1);
+            loop {
+                let page = c.monitor_log(&mission, after, left.min(2000), !a.all).await?;
+                for e in &page.entries {
+                    if since.is_some_and(|s| e.ts_ms < s) {
+                        continue;
+                    }
+                    if a.json {
+                        outln(&serde_json::to_string(e).map_err(|x| x.to_string())?)?;
+                    } else {
+                        outln(&monitor_entry_line(e))?;
+                    }
+                    left = left.saturating_sub(1);
+                }
+                match page.next_after {
+                    Some(n) if left > 0 => after = n,
+                    _ => break,
+                }
+            }
+            Ok(0)
+        }
+        MonitorAction::Replay(a) => {
+            let home = a.home.as_ref().map_or_else(|| paths.clone(), |h| Paths::at(h.clone()));
+            let since = a.since.as_deref().map(|w| parse_since(w, loom_core::now_ms())).transpose()?;
+            let positives = match &a.positives {
+                Some(f) => std::fs::read_to_string(f)
+                    .map_err(|e| format!("{} cannot be read: {e}.", f.display()))?
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(MissionId::from)
+                    .collect(),
+                None => Default::default(),
+            };
+            let key = if a.no_journal_key { None } else { loom_core::journal::load_existing_key(&home.journal_key()) };
+            let report = tokio::task::spawn_blocking(move || {
+                let env = loom_agent::monitor::replay::env_for_home(&home)?;
+                let opts = loom_agent::monitor::replay::ReplayOpts { since_ms: since, positives };
+                Ok::<_, String>(loom_agent::monitor::replay::run(&home, std::sync::Arc::new(env), key, &opts))
+            })
+            .await
+            .map_err(|e| format!("The replay stopped: {e}."))??;
+            if a.json {
+                outln(&serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?)?;
+            } else {
+                for line in report.lines() {
+                    outln(&line)?;
+                }
+            }
+            Ok(0)
+        }
+    }
+}
+
+/// `loom models lineage [profile]`: reads the configuration and the packs; needs no daemon.
+fn cmd_models_lineage(paths: &Paths, profile: Option<&str>) -> Result<i32, String> {
+    let config = Config::load(&paths.config_file()).map_err(|e| e.to_string())?;
+    let packs = loom_agent::pack::Packs::load(&paths.packs_dir())?;
+    for line in loom_agent::monitor::lineage::show_lines(&config, &packs, profile)? {
+        outln(&line)?;
+    }
+    Ok(0)
 }
 
 /// Run `launchctl` and return its output when it succeeds, else its complaint.
@@ -1717,6 +2155,134 @@ mod tests {
 
     fn rejected(args: &[&str]) {
         assert!(parse(args).is_err(), "{args:?} should be rejected");
+    }
+
+    #[test]
+    fn monitor_commands_parse_and_since_reads_a_duration_or_a_time() {
+        assert!(matches!(ok(&["monitor"]), Command::Monitor(MonitorArgs { action: None })));
+        assert!(matches!(
+            ok(&["monitor", "status"]),
+            Command::Monitor(MonitorArgs { action: Some(MonitorAction::Status) })
+        ));
+        match ok(&["monitor", "log", "m-1", "--json", "--since", "7d", "--all", "-n", "5"]) {
+            Command::Monitor(MonitorArgs { action: Some(MonitorAction::Log(a)) }) => {
+                assert_eq!((a.target.as_str(), a.json, a.all, a.limit), ("m-1", true, true, 5));
+                assert_eq!(a.since.as_deref(), Some("7d"));
+            }
+            other => panic!("not log: {other:?}"),
+        }
+        match ok(&["monitor", "replay", "--positives", "p.txt", "--home", "/h", "--no-journal-key", "--json"]) {
+            Command::Monitor(MonitorArgs { action: Some(MonitorAction::Replay(a)) }) => {
+                assert_eq!((a.json, a.no_journal_key), (true, true));
+                assert_eq!(a.positives.as_deref(), Some(std::path::Path::new("p.txt")));
+                assert_eq!(a.home.as_deref(), Some(std::path::Path::new("/h")));
+            }
+            other => panic!("not replay: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["loom", "monitor", "log"]).is_err(), "log needs a mission or session");
+        let now = 10_000_000_000u64;
+        assert_eq!(parse_since("90m", now).ok(), Some(now - 90 * 60_000));
+        assert_eq!(parse_since("12h", now).ok(), Some(now - 12 * 3_600_000));
+        assert_eq!(parse_since("7d", now).ok(), Some(now - 7 * 86_400_000));
+        assert_eq!(parse_since("1234567", now).ok(), Some(1_234_567));
+        let e = parse_since("soon", now).err().unwrap_or_default();
+        assert!(e.contains("90m, 12h or 7d"), "{e}");
+        assert_eq!(parse_since("99999d", 5).ok(), Some(0), "a window longer than the history starts at the beginning");
+    }
+
+    #[test]
+    fn monitor_status_and_entries_print_in_words() {
+        let t = loom_agent::monitor::core::TwStatus {
+            id: "TW-10".into(),
+            name: "other sessions and processes".into(),
+            start: "precision".into(),
+            state: "shadow".into(),
+            fired: 3,
+            by_severity: [0, 0, 1, 2, 0],
+            missions: 2,
+        };
+        let m = loom_agent::monitor::core::MonitorStatus {
+            state: "degraded".into(),
+            mode: "shadow".into(),
+            enabled: true,
+            egress_unbounded: true,
+            open_flags: 2,
+            paused: vec![],
+            halts: vec![],
+            backlog_s: 0,
+            heartbeat_ms: 1,
+            last_seq: 9,
+            sources: 4,
+            counts: Default::default(),
+            tripwires: vec![t],
+            faults: vec!["a log does not continue its chain".into()],
+            fleet_runs: 0,
+            fleet_hits: 0,
+            reviewers: vec![],
+            down_reason: None,
+        };
+        let text = monitor_status_lines(&m).join("\n");
+        assert!(text.contains("monitor: degraded (shadow mode)") && text.contains("2 open flags"), "{text}");
+        assert!(text.contains("egress: UNBOUNDED") && text.contains("source fault: a log does not continue"), "{text}");
+        assert!(text.contains("TW-10") && text.contains("changes nothing for any agent"), "{text}");
+        let mut fields = serde_json::Map::new();
+        fields.insert("id".into(), "TW-09".into());
+        fields.insert("severity".into(), "s3".into());
+        fields.insert("session".into(), "s-1".into());
+        fields.insert("would".into(), "r3".into());
+        fields.insert("precision".into(), true.into());
+        fields.insert("detail".into(), "writes a hook".into());
+        fields.insert("category".into(), "harness_attack".into());
+        let e = loom_agent::monitor::log::Entry {
+            seq: 7,
+            ts_ms: 5_000,
+            prev: String::new(),
+            mac: String::new(),
+            kind: loom_agent::monitor::log::EntryKind::Tripwire,
+            fields,
+        };
+        let line = monitor_entry_line(&e);
+        assert_eq!(line, "#7 5 TW-09 s3 s-1 would r3 precision-list writes a hook (harness_attack)");
+        // What an agent chose reaches the terminal as text: no escape, no OSC, no bidi override, no line break.
+        let mut hostile = e.clone();
+        hostile
+            .fields
+            .insert("detail".into(), "x\u{1b}[2K\u{1b}[1Ahidden\u{1b}]52;c;ZWNobyBoaQ==\u{7}\u{202e}\nTW-99".into());
+        hostile.fields.insert("key".into(), "k\u{1b}[2J".into());
+        let line = monitor_entry_line(&hostile);
+        assert!(!line.chars().any(|c| c.is_control() || ('\u{202a}'..='\u{202e}').contains(&c)), "{line:?}");
+        assert!(!line.contains('\n'), "{line:?}");
+        let mut flag = hostile.clone();
+        flag.kind = loom_agent::monitor::log::EntryKind::Flag;
+        let line = monitor_entry_line(&flag);
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        m_faults_are_clean();
+    }
+
+    fn m_faults_are_clean() {
+        let m = loom_agent::monitor::core::MonitorStatus {
+            state: "degraded".into(),
+            mode: "shadow".into(),
+            enabled: true,
+            egress_unbounded: false,
+            open_flags: 0,
+            paused: vec![],
+            halts: vec![],
+            backlog_s: 0,
+            heartbeat_ms: 1,
+            last_seq: 1,
+            sources: 1,
+            counts: Default::default(),
+            tripwires: vec![],
+            faults: vec!["bad\u{1b}[2Jfault\nnext".into()],
+            fleet_runs: 0,
+            fleet_hits: 0,
+            reviewers: vec![],
+            down_reason: Some("why\u{1b}]52;c;AAAA\u{7}".into()),
+        };
+        for line in monitor_status_lines(&m) {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
     }
 
     #[test]
@@ -1870,11 +2436,21 @@ mod tests {
         assert_eq!((a.text, a.scope.as_deref()), (words(&["ship", "it"]), Some("staging")));
         rejected(&["approve"]);
         let Command::Scope(a) = ok(&["scope", "last", "docs.example.test", "*.cdn.test"]) else { panic!("not scope") };
-        assert_eq!((a.session.as_str(), a.hosts, a.note), ("last", words(&["docs.example.test", "*.cdn.test"]), None));
+        assert_eq!(
+            (a.session.as_deref(), a.hosts, a.note),
+            (Some("last"), words(&["docs.example.test", "*.cdn.test"]), None)
+        );
         let Command::Scope(a) = ok(&["scope", "s-1", "a.test", "--note", "for the docs"]) else { panic!("not scope") };
         assert_eq!((a.hosts, a.note.as_deref()), (words(&["a.test"]), Some("for the docs")));
         rejected(&["scope"]);
         rejected(&["scope", "s-1"]);
+        let Command::Scope(a) = ok(&["scope", "revoke", "m-1", "a.test", "--reason", "wrong target"]) else {
+            panic!("not scope revoke")
+        };
+        let Some(ScopeAction::Revoke(r)) = a.action else { panic!("not revoke") };
+        assert_eq!((r.mission.as_str(), r.host.as_str(), r.reason.as_str()), ("m-1", "a.test", "wrong target"));
+        rejected(&["scope", "revoke", "m-1", "a.test"]);
+        rejected(&["scope", "revoke", "m-1", "--reason", "x"]);
         let Command::Release(a) = ok(&["release", "s-1", "target", "is", "gone"]) else { panic!("not release") };
         assert_eq!((a.session.as_str(), a.reason), ("s-1", words(&["target", "is", "gone"])));
         rejected(&["release"]);
@@ -1901,6 +2477,15 @@ mod tests {
         assert!(matches!(ok(&["config", "path"]), Command::Config { action: ConfigAction::Path }));
         assert!(matches!(ok(&["config", "check"]), Command::Config { action: ConfigAction::Check }));
         assert!(matches!(ok(&["config", "init"]), Command::Config { action: ConfigAction::Init }));
+        assert!(matches!(
+            ok(&["models", "lineage"]),
+            Command::Models { action: ModelsAction::Lineage { profile: None } }
+        ));
+        assert!(matches!(
+            ok(&["models", "lineage", "dsv41"]),
+            Command::Models { action: ModelsAction::Lineage { profile: Some(p) } } if p == "dsv41"
+        ));
+        rejected(&["models", "show"]); // a session: `models show` is a mission's models
         assert!(matches!(ok(&["service", "install"]), Command::Service { action: ServiceAction::Install }));
         assert!(matches!(ok(&["service", "uninstall"]), Command::Service { action: ServiceAction::Uninstall }));
         assert!(matches!(ok(&["service", "status"]), Command::Service { action: ServiceAction::Status }));
@@ -2051,6 +2636,25 @@ mod tests {
         assert_eq!(config.daemon.bind, "127.0.0.1:7878");
         assert_eq!(config.network.mode, loom_core::config::NetworkMode::DenyAll);
         assert_eq!(config.agents.unavailable_notice_s, 300);
+        assert!(config.monitor.tripwires_only_profiles.is_empty(), "not LLM-reviewed is the operator's choice");
+    }
+
+    #[test]
+    fn a_fresh_config_fails_the_check_until_the_operator_chooses() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        assert_eq!(cmd_config(&paths, ConfigAction::Init), Ok(0));
+        // The start-up checks run before the model policy, and seatbelt (the default) is macOS's: with no OS
+        // sandbox they pass on every host, so the check reaches the policy on Linux too.
+        let init = std::fs::read_to_string(paths.config_file()).unwrap();
+        std::fs::write(paths.config_file(), format!("{init}\n[sandbox]\nmode = \"none\"\n")).unwrap();
+        let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
+        assert!(err.starts_with("The model policy is not settled"), "{err}");
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        let chosen = text.replace("# tripwires_only_profiles", "tripwires_only_profiles");
+        let rest = chosen.replace("[models.local]", "[models.local]\nfamily = [\"qwen\"]\nrecipient = \"local\"");
+        std::fs::write(paths.config_file(), rest).unwrap();
+        assert_eq!(cmd_config(&paths, ConfigAction::Check), Ok(0));
     }
 
     #[test]
@@ -2081,13 +2685,69 @@ mod tests {
         assert_eq!(script.seen[0].auth.as_deref(), Some("Bearer tok-123"));
     }
 
+    #[test]
+    fn the_login_code_is_in_a_private_page_file_and_not_on_the_openers_command_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let login = dir.path().join("login");
+        let url = "http://127.0.0.1:7878/#code=c0de1234&x=\"<y>";
+        let mut argv: Vec<String> = Vec::new();
+        let mut page_text = String::new();
+        let res = launch_browser_with(&login, url, |program, page| {
+            argv = vec![program.to_string(), page.display().to_string()];
+            page_text = std::fs::read_to_string(page).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(std::fs::metadata(page).unwrap().permissions().mode() & 0o777, 0o600);
+                assert_eq!(std::fs::metadata(page.parent().unwrap()).unwrap().permissions().mode() & 0o077, 0);
+            }
+            Ok(true)
+        });
+        assert_eq!(res, Ok(()));
+        // Nothing the opener is started with holds the code or the address.
+        assert!(argv.iter().all(|a| !a.contains("c0de1234") && !a.contains("127.0.0.1:7878")), "{argv:?}");
+        assert!(argv[1].starts_with(login.to_str().unwrap()) && argv[1].ends_with(".html"), "{argv:?}");
+        // The page sends the browser on, with the address escaped where it is markup.
+        assert!(page_text.contains("http://127.0.0.1:7878/#code=c0de1234&amp;x=&quot;&lt;y&gt;"), "{page_text}");
+        assert!(page_text.contains("location.replace(") && page_text.contains("no-referrer"), "{page_text}");
+        // Another page is another file; an old page is removed by the next open, a fresh one is not.
+        let old = login.join("login-old.html");
+        std::fs::write(&old, "x").unwrap();
+        let aged = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(aged).unwrap();
+        let keep = login.join("notes.txt");
+        std::fs::write(&keep, "mine").unwrap();
+        assert_eq!(launch_browser_with(&login, url, |_, _| Ok(true)), Ok(()));
+        assert!(!old.exists(), "a stale page is removed");
+        assert!(keep.exists(), "other files are left alone");
+        assert_eq!(
+            std::fs::read_dir(&login)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("login-"))
+                .count(),
+            2
+        );
+        // An opener that fails leaves no page and says what to do.
+        let before = std::fs::read_dir(&login).unwrap().count();
+        let err = launch_browser_with(&login, url, |_, _| Ok(false)).unwrap_err();
+        assert!(err.contains("loom open --print"), "{err}");
+        let err = launch_browser_with(&login, url, |_, _| Err(std::io::Error::other("no opener"))).unwrap_err();
+        assert!(err.contains("no opener") && err.contains("loom open --print"), "{err}");
+        assert_eq!(std::fs::read_dir(&login).unwrap().count(), before);
+        // A directory that cannot be made is an error that says what to do.
+        std::fs::write(dir.path().join("file"), "x").unwrap();
+        let err = launch_browser_with(&dir.path().join("file").join("login"), url, |_, _| Ok(true)).unwrap_err();
+        assert!(err.contains("loom open --print"), "{err}");
+    }
+
     #[tokio::test]
     async fn open_writes_the_address_only_with_print() {
         let script = Script::default().route("POST", "/api/login-codes", 200, r#"{"code":"c0de","expires_in_s":60}"#);
         let (c, _) = start(script).await;
         let url = format!("{}/#code=c0de", c.base());
 
-        // Without --print the browser gets the address and nothing is written.
+        // Without --print the browser gets the address; the one line written says what to do if an editor opened.
         let mut out = Vec::new();
         let mut launched = Vec::new();
         let code = open_with(&c, &OpenArgs { print: false }, &mut out, |u| {
@@ -2097,7 +2757,9 @@ mod tests {
         .await;
         assert_eq!(code, Ok(0));
         assert_eq!(launched, [url.as_str()]);
-        assert_eq!(String::from_utf8(out).unwrap(), "");
+        let note = String::from_utf8(out).unwrap();
+        assert_eq!(note, OPENED_NOTE);
+        assert!(note.contains("loom open --print") && !note.contains("c0de"), "{note}");
 
         // With --print it is written and nothing is started.
         let mut out = Vec::new();
@@ -2168,12 +2830,12 @@ mod tests {
             format!("{} already exists.", paths.config_file().display())
         );
         // `check` runs the start-up checks, so the default sandbox (seatbelt) passes only where `up` would
-        // accept it; on any other host it is refused with the sentence `up` gives.
-        let check = cmd_config(&paths, ConfigAction::Check);
+        // accept it; on any other host it is refused with the sentence `up` gives. Past them, the generated file
+        // does not choose "not LLM-reviewed" for the operator: the check asks.
+        let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
         if cfg!(target_os = "macos") {
-            assert_eq!(check, Ok(0));
+            assert!(err.starts_with("The model policy is not settled (2 to fix)"), "{err}");
         } else {
-            let err = check.unwrap_err();
             assert!(err.contains("seatbelt") && err.contains("not macOS"), "{err}");
         }
         std::fs::write(paths.config_file(), "default_model = [").unwrap();
@@ -2188,6 +2850,27 @@ mod tests {
         std::fs::write(paths.config_file(), "[models.m]\napi_key_file = \"m\"\n").unwrap();
         let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
         assert!(err.starts_with("models.m: ") && err.contains(&paths.model_keys_dir().join("m").display().to_string()));
+    }
+
+    #[test]
+    fn config_check_fails_on_a_profile_nobody_reviews_and_says_what_to_add() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        std::fs::create_dir_all(&paths.home).unwrap();
+        // The start-up checks run before the model policy, and seatbelt (the default) is macOS's: with no OS
+        // sandbox they pass on every host, so the check reaches the policy on Linux too.
+        let text = "[sandbox]\nmode = \"none\"\n\n[models.dsv41]\nbase_url = \"http://10.0.0.5:8000/v1\"\nfamily = [\"deepseek\"]\nalignment = \"stock\"\nrecipient = \"lan\"\n";
+        std::fs::write(paths.config_file(), text).unwrap();
+        let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
+        assert!(err.contains("models.dsv41 has no eligible reviewer in the core pack"), "{err}");
+        assert!(err.contains("tripwires_only_profiles = [\"dsv41\"]"), "{err}");
+        std::fs::write(paths.config_file(), format!("{text}[monitor]\ntripwires_only_profiles = [\"dsv41\"]\n"))
+            .unwrap();
+        assert_eq!(cmd_config(&paths, ConfigAction::Check), Ok(0));
+        assert_eq!(cmd_models_lineage(&paths, None), Ok(0));
+        assert_eq!(cmd_models_lineage(&paths, Some("dsv41")), Ok(0));
+        let err = cmd_models_lineage(&paths, Some("nope")).unwrap_err();
+        assert!(err.contains("\"nope\"") && err.contains("dsv41"), "{err}");
     }
 
     #[test]
