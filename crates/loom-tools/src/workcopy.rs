@@ -134,12 +134,19 @@
 //! runs, repeated until enough runs met both states: nothing in `outside` changes, and every run either
 //! adopted into `x` or failed.
 
-use crate::files::{open_readable, NotOpened, Readable};
+use crate::files::{open_readable, real_path, NotOpened, Readable};
+use crate::fstools::{
+    create_new_at, open_dir_creating, open_dir_existing, remove_at, remove_dir_at, rename_at, symlink_at, WriteFail,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How large a workspace may be to be copied.
@@ -418,8 +425,9 @@ fn settled_at(files: &BTreeMap<String, Entry>) -> Option<SystemTime> {
         .max()
 }
 
-/// Whether two files hold the same bytes. One that cannot be read is not the same as anything.
-fn same_bytes(a: &Path, b: &Path) -> bool {
+/// Whether two files hold the same bytes. Both are opened as `make` opens a file to copy and judged by
+/// `readable`; one that cannot be opened, or that `readable` refuses, is not the same as anything.
+fn same_bytes(a: &Path, b: &Path, readable: Readable<'_>) -> bool {
     use std::io::Read;
     fn fill(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut have = 0;
@@ -433,7 +441,9 @@ fn same_bytes(a: &Path, b: &Path) -> bool {
         }
         Ok(have)
     }
-    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else { return false };
+    let (Ok((mut fa, _)), Ok((mut fb, _))) = (open_readable(a, readable), open_readable(b, readable)) else {
+        return false;
+    };
     let (mut ba, mut bb) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
     loop {
         let (Ok(na), Ok(nb)) = (fill(&mut fa, &mut ba), fill(&mut fb, &mut bb)) else { return false };
@@ -667,10 +677,12 @@ fn unchanged_in_copy(entry: &Entry, now: &Seen) -> bool {
 /// Whether a path is in the workspace (`there`) as the copy has it (`here`): a link with the same
 /// target, or a file with the same permission bits and bytes. Their times are not asked: two files
 /// written at one moment have the same time, and a file system may round the one it is given.
-fn as_the_copy_has_it(there: &Seen, here: &Seen, in_dest: &Path, in_copy: &Path) -> bool {
+fn as_the_copy_has_it(there: &Seen, here: &Seen, in_dest: &Path, in_copy: &Path, readable: Readable<'_>) -> bool {
     match (there, here) {
         (Seen::Link(a), Seen::Link(b)) => a == b,
-        (Seen::File(a), Seen::File(b)) => a.size == b.size && a.mode == b.mode && same_bytes(in_dest, in_copy),
+        (Seen::File(a), Seen::File(b)) => {
+            a.size == b.size && a.mode == b.mode && same_bytes(in_dest, in_copy, readable)
+        }
         _ => false,
     }
 }
@@ -716,45 +728,167 @@ pub fn changes(manifest: &Manifest, copy: &Path) -> Result<Changes, String> {
     Ok(out)
 }
 
+/// The sentence for a link where a directory of `dest` is expected.
+fn link_in_the_way(dir: &Path) -> String {
+    format!(
+        "{} is a symbolic link where a directory is expected, and no link is followed there, so nothing was \
+         written or removed through it.",
+        dir.display()
+    )
+}
+
+/// A failure of the descriptor steps as the error `adopt` reports after the path.
+fn io_of(fail: WriteFail) -> std::io::Error {
+    match fail {
+        WriteFail::Denied(why) => std::io::Error::new(std::io::ErrorKind::PermissionDenied, why),
+        WriteFail::Refused(why) => std::io::Error::other(why),
+        WriteFail::Io(e) => e,
+    }
+}
+
+/// Judge the real path of the open directory `dir` joined with `name`.
+fn judge_in(dir: &File, name: &OsStr, may_write: &dyn Fn(&Path) -> Result<(), String>) -> std::io::Result<()> {
+    let real = real_path(dir.as_fd())?;
+    may_write(&real.join(name)).map_err(|why| std::io::Error::new(std::io::ErrorKind::PermissionDenied, why))
+}
+
 /// A path in `dest` that a removal may have left an empty directory at: removed, with its empty
-/// parents, as far as the copy has no such directory either.
-fn prune(dest: &Path, copy: &Path, rel: &str) {
+/// parents, as far as the copy has no such directory either. Each is removed within its parent, opened
+/// without following a link and judged by its real path, never by the path it was reached by.
+fn prune(dest: &Path, copy: &Path, rel: &str, may_write: &dyn Fn(&Path) -> Result<(), String>) {
     let mut dir = Path::new(rel).parent();
     while let Some(d) = dir.filter(|d| !d.as_os_str().is_empty()) {
-        if copy.join(d).exists() || std::fs::remove_dir(dest.join(d)).is_err() {
+        let Some(name) = d.file_name() else { return };
+        if copy.join(d).exists() {
+            return;
+        }
+        let parent = dest.join(d.parent().unwrap_or_else(|| Path::new("")));
+        let Ok(open) = open_dir_existing(&parent, &link_in_the_way) else { return };
+        if judge_in(&open, name, may_write).is_err() || remove_dir_at(&open, name).is_err() {
             return;
         }
         dir = d.parent();
     }
 }
 
-/// Bring one path of the copy to `dest`: beside its place first, then renamed over it.
-fn bring(copy: &Path, dest: &Path, rel: &str, readable: Readable<'_>) -> std::io::Result<()> {
-    let (from, to) = (copy.join(rel), dest.join(rel));
-    if let Some(parent) = to.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Set the modification time of the open file to that of `s`; its access time is left alone.
+fn set_mtime_fd(file: &File, s: &Stamp) -> std::io::Result<()> {
+    let omit = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT };
+    let modified = libc::timespec { tv_sec: s.secs as libc::time_t, tv_nsec: s.nanos as libc::c_long };
+    let times = [omit, modified];
+    // SAFETY: `file` is an open descriptor and `times` is the two-element array futimens(2) reads; the call
+    // has no other memory effects.
+    let rc = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
-    let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let beside = to.with_file_name(format!(".{name}.loom-adopt"));
-    let _ = std::fs::remove_file(&beside);
-    let made = match seen(&from) {
-        Seen::Link(target) => std::os::unix::fs::symlink(PathBuf::from(target), &beside),
-        Seen::File(s) => copy_file(&from, &beside, readable)
-            .map_err(|e| match e {
+}
+
+/// Make the file `tmp` in the open directory `dir` from the open file `from`, which has `mode`, and open
+/// it without following a link. Nothing may exist under `tmp` (the call fails if it does). On macOS the file
+/// is cloned where the file system can and the owner can read and write the clone; otherwise a file made
+/// private (0600) gets the bytes. `Err((_, false))`: nothing was made; `Err((_, true))`: `tmp` exists.
+fn make_file_in(dir: &File, tmp: &OsStr, from: &mut File, mode: u32) -> Result<File, (std::io::Error, bool)> {
+    #[cfg(target_os = "macos")]
+    if mode & 0o600 == 0o600 && crate::fstools::clone_at(from, dir, tmp).is_ok() {
+        // A clone has the mode of its source, which here lets the owner open it. Another process may have
+        // put something else under the name since: it is opened without following a link and must be a
+        // file with no other name.
+        use std::os::unix::fs::MetadataExt;
+        let opened = crate::fstools::open_file_at(dir, tmp).map_err(|e| (e, true))?;
+        let md = opened.metadata().map_err(|e| (e, true))?;
+        if !md.is_file() || md.nlink() != 1 {
+            let why = "what was made beside its place is not the new file any more";
+            return Err((std::io::Error::other(why), true));
+        }
+        return Ok(opened);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = mode;
+    let mut out = create_new_at(dir, tmp, 0o600).map_err(|e| (e, false))?;
+    std::io::copy(from, &mut out).map_err(|e| (e, true))?;
+    Ok(out)
+}
+
+/// Makes the name of each file made beside its place different from every other made by this process.
+static ADOPT_NAMES: AtomicU64 = AtomicU64::new(0);
+
+/// What a path of the copy is, opened as far as it is a file.
+enum Source {
+    File { file: File, stamp: Stamp },
+    Link(String),
+}
+
+/// Bring one path of the copy to `dest`: beside its place first, then renamed over it. Everything is
+/// relative to the open directory of the path (see the module contract), not to a path judged earlier.
+fn bring(
+    copy: &Path,
+    dest: &Path,
+    rel: &str,
+    may_write: &dyn Fn(&Path) -> Result<(), String>,
+    readable: Readable<'_>,
+) -> std::io::Result<()> {
+    let (from, to) = (copy.join(rel), dest.join(rel));
+    let (Some(name), Some(parent)) = (to.file_name(), to.parent()) else {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "it has no file name"));
+    };
+    let gone = || std::io::Error::new(std::io::ErrorKind::NotFound, "it is no longer a file in the copy");
+    let mut source = match seen(&from) {
+        Seen::Link(target) => Source::Link(target),
+        Seen::File(_) => {
+            let (file, meta) = open_readable(&from, readable).map_err(|e| match e {
                 NotOpened::Io(e) => e,
                 NotOpened::Denied(sentence) => std::io::Error::new(std::io::ErrorKind::PermissionDenied, sentence),
-                NotOpened::NotRegular(_) => {
-                    std::io::Error::new(std::io::ErrorKind::NotFound, "it is no longer a file in the copy")
-                }
-            })
-            .and_then(|()| set_mtime(&beside, &s)),
-        _ => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "it is no longer a file in the copy")),
+                NotOpened::NotRegular(_) => gone(),
+            })?;
+            Source::File { file, stamp: stamp(&meta) }
+        }
+        _ => return Err(gone()),
     };
-    let moved = made.and_then(|()| std::fs::rename(&beside, &to));
-    if moved.is_err() {
-        let _ = std::fs::remove_file(&beside);
+    let dir = open_dir_creating(may_write, &link_in_the_way, parent).map_err(io_of)?;
+    judge_in(&dir, name, may_write)?;
+    let n = ADOPT_NAMES.fetch_add(1, Ordering::Relaxed);
+    let tmp = OsString::from(format!(".{}.loom-adopt-{}-{n}", name.to_string_lossy(), std::process::id()));
+    let finished = match &mut source {
+        Source::Link(target) => {
+            symlink_at(&dir, OsStr::new(target), &tmp)?;
+            rename_at(&dir, &tmp, name)
+        }
+        Source::File { file, stamp } => {
+            let made = match make_file_in(&dir, &tmp, file, stamp.mode) {
+                Ok(made) => made,
+                Err((e, false)) => return Err(e),
+                Err((e, true)) => {
+                    let _ = remove_at(&dir, &tmp);
+                    return Err(e);
+                }
+            };
+            (|| {
+                set_mtime_fd(&made, stamp)?;
+                made.set_permissions(std::fs::Permissions::from_mode(stamp.mode))?;
+                made.sync_all()?;
+                rename_at(&dir, &tmp, name)
+            })()
+        }
+    };
+    if finished.is_err() {
+        let _ = remove_at(&dir, &tmp);
     }
-    moved
+    finished
+}
+
+/// Remove the file or link `rel` of `dest` within its directory, opened without following a link and
+/// judged by its real path.
+fn remove_entry(dest: &Path, rel: &str, may_write: &dyn Fn(&Path) -> Result<(), String>) -> std::io::Result<()> {
+    let to = dest.join(rel);
+    let (Some(name), Some(parent)) = (to.file_name(), to.parent()) else {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "it has no file name"));
+    };
+    let dir = open_dir_existing(parent, &link_in_the_way).map_err(io_of)?;
+    judge_in(&dir, name, may_write)?;
+    remove_at(&dir, name)
 }
 
 /// See the module contract. `Ok`: what was brought over (paths already as the copy has them are not
@@ -773,7 +907,7 @@ pub fn adopt(
         let (in_dest, in_copy) = (dest.join(rel), copy.join(rel));
         let there = seen(&in_dest);
         // Adopted already, or the same change was made on both sides.
-        if as_the_copy_has_it(&there, &seen(&in_copy), &in_dest, &in_copy) {
+        if as_the_copy_has_it(&there, &seen(&in_copy), &in_dest, &in_copy, readable) {
             continue;
         }
         let as_copied = match manifest.files.get(rel) {
@@ -818,17 +952,17 @@ pub fn adopt(
     }
     let mut written = Vec::new();
     for rel in todo.added.iter().chain(&todo.modified) {
-        if let Err(e) = bring(copy, dest, rel, readable) {
+        if let Err(e) = bring(copy, dest, rel, may_write, readable) {
             return Err(AdoptError::Io { message: format!("{rel} could not be written: {e}"), written });
         }
         written.push(rel.clone());
     }
     for rel in &todo.deleted {
-        if let Err(e) = std::fs::remove_file(dest.join(rel)) {
+        if let Err(e) = remove_entry(dest, rel, may_write) {
             return Err(AdoptError::Io { message: format!("{rel} could not be removed: {e}"), written });
         }
         written.push(rel.clone());
-        prune(dest, copy, rel);
+        prune(dest, copy, rel, may_write);
     }
     Ok(todo)
 }
@@ -978,7 +1112,13 @@ mod tests {
         };
         let done = adopt(&made.manifest, &f.copy, &f.ws, &may, &allow).unwrap();
         assert_eq!(done.lines(), ["D docs/old.md", "M src/a.rs", "A tests/deep/t.rs"]);
-        assert_eq!(asked.borrow().len(), 3);
+        // Every path is asked once up front (added, modified, deleted), then for each directory made and for
+        // each path written or removed, by its real path.
+        let ws = &f.ws;
+        let up_front = [ws.join("tests/deep/t.rs"), ws.join("src/a.rs"), ws.join("docs/old.md")];
+        let writing = [ws.join("tests"), ws.join("tests/deep"), ws.join("tests/deep/t.rs")];
+        let rest = [ws.join("src/a.rs"), ws.join("docs/old.md"), ws.join("docs")];
+        assert_eq!(*asked.borrow(), [up_front.as_slice(), writing.as_slice(), rest.as_slice()].concat());
         assert_eq!(fs::read_to_string(f.ws.join("src/a.rs")).unwrap(), "fn a() { 1 }\n");
         assert_eq!(fs::read_to_string(f.ws.join("tests/deep/t.rs")).unwrap(), "#[test] fn t() {}\n");
         assert!(!f.ws.join("docs").exists(), "the directory the removal emptied is gone");
@@ -1059,7 +1199,7 @@ mod tests {
         };
         let done = adopt(&made.manifest, &f.copy, &f.ws, &may, &allow).unwrap();
         assert_eq!(done.lines(), ["M src/b.rs"]);
-        assert_eq!(*asked.borrow(), [f.ws.join("src/b.rs")]);
+        assert_eq!(*asked.borrow(), [f.ws.join("src/b.rs"), f.ws.join("src/b.rs")]);
         assert_eq!(fs::read_to_string(f.ws.join("src/b.rs")).unwrap(), "fn b() { 2 }\n");
     }
 
@@ -1183,5 +1323,425 @@ mod tests {
         let made = make(&src2, &dest2, &Limits { max_files: 100, max_bytes: 0 }, &allow).unwrap();
         assert!(made.git_left_out.is_empty());
         assert!(dest2.join(".git/HEAD").is_file());
+    }
+
+    // ---- Swap races for `adopt` -------------------------------------------------------------------
+
+    /// A workspace, a copy of it and a directory `outside` that `may_write` refuses.
+    struct Raced {
+        _dir: tempfile::TempDir,
+        ws: PathBuf,
+        copy: PathBuf,
+        outside: PathBuf,
+    }
+
+    /// The workspace holds `files` (their directories made); `outside` holds `outside_files`.
+    fn raced(files: &[(&str, &str)], outside_files: &[(&str, &str)]) -> Raced {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (ws, outside) = (root.join("ws"), root.join("outside"));
+        for (base, list) in [(&ws, files), (&outside, outside_files)] {
+            fs::create_dir_all(base).unwrap();
+            for (rel, text) in list {
+                fs::create_dir_all(base.join(rel).parent().unwrap()).unwrap();
+                fs::write(base.join(rel), text).unwrap();
+            }
+        }
+        Raced { copy: root.join("copies/c1"), ws, outside, _dir: dir }
+    }
+
+    /// Everything under `dir`: each path with its bytes, a directory with `None`.
+    fn listing(dir: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+        fn walk(base: &Path, at: &Path, out: &mut BTreeMap<String, Option<Vec<u8>>>) {
+            for entry in fs::read_dir(at).unwrap().flatten() {
+                let path = entry.path();
+                let rel = path.strip_prefix(base).unwrap().display().to_string();
+                if fs::symlink_metadata(&path).unwrap().is_dir() {
+                    out.insert(rel, None);
+                    walk(base, &path, out);
+                } else {
+                    out.insert(rel, Some(fs::read(&path).unwrap_or_default()));
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(dir, dir, &mut out);
+        out
+    }
+
+    /// Replace the directory `dir` by a link to `to`; the directory is kept as `<dir>.orig`.
+    fn swap_for_link(dir: &Path, to: &Path) {
+        fs::rename(dir, dir.with_extension("orig")).unwrap();
+        std::os::unix::fs::symlink(to, dir).unwrap();
+    }
+
+    /// A `may_write` that refuses what is not under `ws`, as the sandbox refuses what lies outside its
+    /// writable roots, and runs `swap` after it has answered its `swap_at`-th call (the first is 1).
+    fn judge<'a>(
+        ws: &'a Path,
+        calls: &'a std::cell::Cell<usize>,
+        swap_at: usize,
+        swap: &'a dyn Fn(),
+    ) -> impl Fn(&Path) -> Result<(), String> + 'a {
+        move |path: &Path| {
+            calls.set(calls.get() + 1);
+            let verdict = if path.starts_with(ws) {
+                Ok(())
+            } else {
+                Err(format!("{} lies outside the writable roots", path.display()))
+            };
+            if calls.get() == swap_at {
+                swap();
+            }
+            verdict
+        }
+    }
+
+    fn io_message(result: Result<Changes, AdoptError>) -> (String, Vec<String>) {
+        match result {
+            Err(AdoptError::Io { message, written }) => (message, written),
+            other => panic!("an I/O failure expected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_directory_swapped_for_a_link_before_a_file_is_brought_gets_nothing_outside() {
+        let r = raced(&[("x/seed", "s")], &[("keep", "k")]);
+        let made = make(&r.ws, &r.copy, &ROOMY, &allow).unwrap();
+        fs::write(r.copy.join("x/f"), "from the copy\n").unwrap();
+        let before = listing(&r.outside);
+        let calls = std::cell::Cell::new(0);
+        // The only up-front call is the last of the check: the swap comes after the check has passed.
+        let swap = || swap_for_link(&r.ws.join("x"), &r.outside);
+        let may = judge(&r.ws, &calls, 1, &swap);
+        let (message, written) = io_message(adopt(&made.manifest, &r.copy, &r.ws, &may, &allow));
+        assert!(message.contains("x/f could not be written"), "{message}");
+        assert!(message.contains("symbolic link") && message.contains("no link is followed"), "{message}");
+        assert!(message.contains(&r.ws.join("x").display().to_string()), "{message}");
+        assert!(written.is_empty());
+        assert_eq!(listing(&r.outside), before);
+    }
+
+    #[test]
+    fn a_directory_swapped_after_it_was_opened_takes_the_file_there_and_nothing_goes_outside() {
+        let r = raced(&[("x/seed", "s")], &[("keep", "k")]);
+        let made = make(&r.ws, &r.copy, &ROOMY, &allow).unwrap();
+        fs::write(r.copy.join("x/f"), "from the copy\n").unwrap();
+        let before = listing(&r.outside);
+        let calls = std::cell::Cell::new(0);
+        // The second call judges the real path of the directory that was opened, joined with the name.
+        let swap = || swap_for_link(&r.ws.join("x"), &r.outside);
+        let may = judge(&r.ws, &calls, 2, &swap);
+        let done = adopt(&made.manifest, &r.copy, &r.ws, &may, &allow).unwrap();
+        assert_eq!(done.added, ["x/f"]);
+        assert_eq!(fs::read_to_string(r.ws.join("x.orig/f")).unwrap(), "from the copy\n");
+        assert_eq!(listing(&r.outside), before);
+    }
+
+    #[test]
+    fn a_directory_above_the_one_of_a_file_swapped_for_a_link_is_refused_by_the_real_path() {
+        let r = raced(&[("x/y/seed", "s")], &[("y/keep", "k"), ("keep", "k")]);
+        let made = make(&r.ws, &r.copy, &ROOMY, &allow).unwrap();
+        fs::write(r.copy.join("x/y/f"), "from the copy\n").unwrap();
+        let before = listing(&r.outside);
+        let calls = std::cell::Cell::new(0);
+        let swap = || swap_for_link(&r.ws.join("x"), &r.outside);
+        let may = judge(&r.ws, &calls, 1, &swap);
+        // `x/y` opens: it is no link itself. What is judged is where it really is.
+        let (message, written) = io_message(adopt(&made.manifest, &r.copy, &r.ws, &may, &allow));
+        assert!(message.contains("x/y/f could not be written"), "{message}");
+        assert!(message.contains("lies outside the writable roots"), "{message}");
+        assert!(message.contains(&r.outside.join("y/f").display().to_string()), "{message}");
+        assert!(written.is_empty());
+        assert_eq!(listing(&r.outside), before);
+    }
+
+    #[test]
+    fn a_directory_swapped_between_two_files_is_not_followed_for_the_second() {
+        let r = raced(&[("x/seed", "s")], &[("keep", "k")]);
+        let made = make(&r.ws, &r.copy, &ROOMY, &allow).unwrap();
+        fs::write(r.copy.join("x/a"), "a\n").unwrap();
+        fs::write(r.copy.join("x/b"), "b\n").unwrap();
+        let before = listing(&r.outside);
+        let calls = std::cell::Cell::new(0);
+        // Calls 1 and 2 are the check; the third judges `x/a` in the directory that was opened, and the
+        // swap follows it: `x/a` lands in that directory, `x/b` meets the link.
+        let swap = || swap_for_link(&r.ws.join("x"), &r.outside);
+        let may = judge(&r.ws, &calls, 3, &swap);
+        let (message, written) = io_message(adopt(&made.manifest, &r.copy, &r.ws, &may, &allow));
+        assert!(message.contains("x/b could not be written") && message.contains("symbolic link"), "{message}");
+        assert_eq!(written, ["x/a"]);
+        assert_eq!(fs::read_to_string(r.ws.join("x.orig/a")).unwrap(), "a\n");
+        assert_eq!(listing(&r.outside), before);
+    }
+
+    #[test]
+    fn a_directory_swapped_for_a_link_does_not_get_a_file_removed_there() {
+        for swap_at in [1, 2] {
+            let r = raced(&[("x/old", "old\n"), ("x/seed", "s")], &[("old", "old\n"), ("keep", "k")]);
+            let made = make(&r.ws, &r.copy, &ROOMY, &allow).unwrap();
+            fs::remove_file(r.copy.join("x/old")).unwrap();
+            let before = listing(&r.outside);
+            let calls = std::cell::Cell::new(0);
+            let swap = || swap_for_link(&r.ws.join("x"), &r.outside);
+            let may = judge(&r.ws, &calls, swap_at, &swap);
+            let result = adopt(&made.manifest, &r.copy, &r.ws, &may, &allow);
+            if swap_at == 1 {
+                // Swapped after the check, before the directory was opened: the link is refused.
+                let (message, written) = io_message(result);
+                assert!(
+                    message.contains("x/old could not be removed") && message.contains("symbolic link"),
+                    "{message}"
+                );
+                assert!(written.is_empty());
+                assert!(r.ws.join("x.orig/old").exists(), "the file of the workspace was not touched either");
+            } else {
+                // Swapped once the directory was open and judged: the file goes from that directory.
+                assert_eq!(result.unwrap().deleted, ["x/old"]);
+                assert!(!r.ws.join("x.orig/old").exists());
+            }
+            assert_eq!(fs::read_to_string(r.outside.join("old")).unwrap(), "old\n", "swap at {swap_at}");
+            assert_eq!(listing(&r.outside), before, "swap at {swap_at}");
+        }
+    }
+
+    #[test]
+    fn an_emptied_directory_swapped_for_a_link_is_not_removed_through_it() {
+        let r = raced(&[("x/y/old", "old\n"), ("seed", "s")], &[("y/keep", "k")]);
+        let made = make(&r.ws, &r.copy, &ROOMY, &allow).unwrap();
+        fs::remove_file(r.copy.join("x/y/old")).unwrap();
+        fs::remove_dir(r.copy.join("x/y")).unwrap();
+        fs::remove_dir(r.copy.join("x")).unwrap();
+        let before = listing(&r.outside);
+        let calls = std::cell::Cell::new(0);
+        // Call 1 is the check, 2 the removal; the swap comes with the judging of the directory `x/y`.
+        let swap = || swap_for_link(&r.ws.join("x"), &r.outside);
+        let may = judge(&r.ws, &calls, 3, &swap);
+        let done = adopt(&made.manifest, &r.copy, &r.ws, &may, &allow).unwrap();
+        assert_eq!(done.deleted, ["x/y/old"]);
+        assert!(fs::symlink_metadata(r.ws.join("x")).unwrap().file_type().is_symlink());
+        assert_eq!(listing(&r.outside), before);
+    }
+
+    #[test]
+    fn a_missing_directory_swapped_for_a_link_before_it_is_entered_is_not_followed() {
+        let r = raced(&[("seed", "s")], &[("keep", "k")]);
+        let made = make(&r.ws, &r.copy, &ROOMY, &allow).unwrap();
+        fs::create_dir_all(r.copy.join("n/m")).unwrap();
+        fs::write(r.copy.join("n/m/f"), "from the copy\n").unwrap();
+        let before = listing(&r.outside);
+        let calls = std::cell::Cell::new(0);
+        // Call 1 is the check; call 2 judges the making of `n`: a link is put there in its place.
+        let plant = || std::os::unix::fs::symlink(&r.outside, r.ws.join("n")).unwrap();
+        let may = judge(&r.ws, &calls, 2, &plant);
+        let (message, written) = io_message(adopt(&made.manifest, &r.copy, &r.ws, &may, &allow));
+        assert!(message.contains("n/m/f could not be written") && message.contains("symbolic link"), "{message}");
+        assert!(message.contains(&r.ws.join("n").display().to_string()), "{message}");
+        assert!(written.is_empty());
+        assert_eq!(listing(&r.outside), before);
+    }
+
+    #[test]
+    fn a_name_planted_beside_the_place_as_a_link_is_not_written_through() {
+        let r = raced(&[("seed", "s")], &[("victim", "victim\n")]);
+        let made = make(&r.ws, &r.copy, &ROOMY, &allow).unwrap();
+        fs::write(r.copy.join("f"), "from the copy\n").unwrap();
+        let before = listing(&r.outside);
+        // The names the new file may get: the counter is shared by the tests that run at once, so many are
+        // planted. A hit makes the exclusive create fail; a miss leaves the planted links alone.
+        let victim = r.outside.join("victim");
+        let next = ADOPT_NAMES.load(Ordering::Relaxed);
+        std::os::unix::fs::symlink(&victim, r.ws.join(".f.loom-adopt")).unwrap();
+        for n in next..next + 300 {
+            let name = format!(".f.loom-adopt-{}-{n}", std::process::id());
+            std::os::unix::fs::symlink(&victim, r.ws.join(name)).unwrap();
+        }
+        match adopt(&made.manifest, &r.copy, &r.ws, &allow_in(&r.ws), &allow) {
+            Ok(done) => {
+                assert_eq!(done.added, ["f"]);
+                assert_eq!(fs::read_to_string(r.ws.join("f")).unwrap(), "from the copy\n");
+            }
+            Err(AdoptError::Io { message, .. }) => assert!(message.contains("exists"), "{message}"),
+            Err(other) => panic!("{other:?}"),
+        }
+        assert_eq!(listing(&r.outside), before);
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "victim\n");
+    }
+
+    fn allow_in(ws: &Path) -> impl Fn(&Path) -> Result<(), String> + '_ {
+        move |p| if p.starts_with(ws) { Ok(()) } else { Err(format!("{} is outside", p.display())) }
+    }
+
+    #[test]
+    fn a_failure_after_the_new_file_was_made_removes_it_again() {
+        let r = raced(&[("seed", "s")], &[]);
+        let made = make(&r.ws, &r.copy, &ROOMY, &allow).unwrap();
+        fs::write(r.copy.join("f"), "from the copy\n").unwrap();
+        let calls = std::cell::Cell::new(0);
+        // After the check a directory with something in it appears where the file is to be renamed to.
+        let appear = || {
+            fs::create_dir(r.ws.join("f")).unwrap();
+            fs::write(r.ws.join("f/inside"), "i").unwrap();
+        };
+        let may = judge(&r.ws, &calls, 1, &appear);
+        let (message, written) = io_message(adopt(&made.manifest, &r.copy, &r.ws, &may, &allow));
+        assert!(message.contains("f could not be written"), "{message}");
+        assert!(written.is_empty());
+        let names: Vec<String> = listing(&r.ws).into_keys().collect();
+        assert_eq!(names, ["f", "f/inside", "seed"], "no half-made file is left beside its place");
+    }
+
+    #[test]
+    fn what_is_brought_has_the_mode_and_time_of_the_copys_file() {
+        let r = raced(&[("seed", "s")], &[]);
+        let made = make(&r.ws, &r.copy, &ROOMY, &allow).unwrap();
+        // Modes that a clone of the file would not let its owner write, and an executable; and a link.
+        for (name, mode) in [("ro", 0o400), ("exec", 0o755), ("plain", 0o644)] {
+            fs::write(r.copy.join(name), format!("{name}\n")).unwrap();
+            fs::set_permissions(r.copy.join(name), fs::Permissions::from_mode(mode)).unwrap();
+        }
+        std::os::unix::fs::symlink("seed", r.copy.join("lnk")).unwrap();
+        let done = adopt(&made.manifest, &r.copy, &r.ws, &allow_in(&r.ws), &allow).unwrap();
+        assert_eq!(done.added, ["exec", "lnk", "plain", "ro"]);
+        for (name, mode) in [("ro", 0o400), ("exec", 0o755), ("plain", 0o644)] {
+            let md = fs::metadata(r.ws.join(name)).unwrap();
+            assert_eq!(md.permissions().mode() & 0o7777, mode, "{name}");
+            assert_eq!(md.modified().unwrap(), mtime(&r.copy.join(name)), "{name}");
+            assert_eq!(fs::read_to_string(r.ws.join(name)).unwrap(), format!("{name}\n"));
+        }
+        assert_eq!(fs::read_link(r.ws.join("lnk")).unwrap(), PathBuf::from("seed"));
+        let left: Vec<String> = listing(&r.ws).into_keys().filter(|n| n.contains("loom-adopt")).collect();
+        assert!(left.is_empty(), "{left:?}");
+        // And once more: nothing is left to bring, so the files are seen as the copy has them.
+        assert!(adopt(&made.manifest, &r.copy, &r.ws, &allow_in(&r.ws), &allow).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_file_of_the_workspace_that_may_not_be_read_is_not_the_same_as_the_copys() {
+        let f = fx();
+        fs::write(f.ws.join("src/secret"), "A").unwrap();
+        let made = make(&f.ws, &f.copy, &ROOMY, &allow).unwrap();
+        // The file that `readable` refuses by name was edited alike on both sides, down to the time.
+        fs::write(f.copy.join("src/secret"), "B").unwrap();
+        fs::write(f.ws.join("src/secret"), "B").unwrap();
+        set_mtime(&f.ws.join("src/secret"), &stamp(&fs::metadata(f.copy.join("src/secret")).unwrap())).unwrap();
+        assert_eq!(seen(&f.ws.join("src/secret")), seen(&f.copy.join("src/secret")));
+        // Judged fit to read, the two are the same and nothing is to be brought; refused, they are not.
+        assert!(adopt(&made.manifest, &f.copy, &f.ws, &allow, &allow).unwrap().is_empty());
+        let Err(AdoptError::Conflicts(conflicts)) = adopt(&made.manifest, &f.copy, &f.ws, &allow, &refuse_secret)
+        else {
+            panic!("a conflict expected")
+        };
+        assert_eq!(conflicts, [("src/secret".to_string(), "the file there has changed".to_string())]);
+        assert_eq!(fs::read_to_string(f.ws.join("src/secret")).unwrap(), "B");
+    }
+
+    /// A thread that turns the directory `dir` into the link `link` and back, over and over: each turn
+    /// renames the directory to `<dir>.real`, the link to `dir`, and both back, so `dir` names the
+    /// directory, nothing, the link, nothing and the directory again (plain renames: they are fast). A
+    /// directory that `adopt` makes at `dir` while it names nothing is moved aside to a new name first.
+    struct Flipper {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        turns: std::sync::Arc<AtomicU64>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Flipper {
+        fn start(dir: PathBuf, link: PathBuf) -> Flipper {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let turns = std::sync::Arc::new(AtomicU64::new(0));
+            let (stopped, turned) = (stop.clone(), turns.clone());
+            let thread = std::thread::spawn(move || {
+                let real = dir.with_extension("real");
+                let mut strays = 0u64;
+                let mut rename = |from: &Path, to: &Path| {
+                    let mut tries = 0;
+                    while let Err(e) = fs::rename(from, to) {
+                        tries += 1;
+                        assert!(tries < 1000, "{} cannot be renamed to {}: {e}", from.display(), to.display());
+                        strays += 1;
+                        let _ = fs::rename(to, to.with_extension(format!("stray{strays}")));
+                    }
+                };
+                while !stopped.load(Ordering::SeqCst) {
+                    rename(&dir, &real);
+                    rename(&link, &dir);
+                    rename(&dir, &link);
+                    rename(&real, &dir);
+                    turned.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            Flipper { stop, turns, thread: Some(thread) }
+        }
+
+        /// Stop at the end of the turn, so that `dir` is the directory again; how many turns were made.
+        fn finish(mut self) -> u64 {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+            self.turns.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Flipper {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Where a file of that content is under `dir`, however the flipping moved its directory.
+    fn found(dir: &Path, name: &str, text: &str) -> bool {
+        listing(dir).iter().any(|(rel, bytes)| {
+            Path::new(rel).file_name().is_some_and(|n| n == name) && bytes.as_deref() == Some(text.as_bytes())
+        })
+    }
+
+    /// The scheduler decides when `x` is the directory, nothing or a link to `outside` while `adopt` runs
+    /// (the adoptions are many, each in a fresh workspace). Nothing in `outside` ever changes; each run
+    /// either brought its file into the workspace or failed. It ends on counts, not on time: once at least
+    /// 40 runs have been made, the directory has been the link at least 400 times, and a run was adopted
+    /// and a run was refused for the link or the path it really was at, so the runs met both states.
+    #[test]
+    fn a_directory_swapped_for_a_link_while_adopting_gets_no_file_outside() {
+        let r = raced(&[], &[("keep", "k")]);
+        let before = listing(&r.outside);
+        let started = std::time::Instant::now();
+        let (mut runs, mut turns, mut adopted, mut refused) = (0u64, 0u64, 0u64, 0u64);
+        while runs < 40 || turns < 400 || adopted == 0 || refused == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the race did not run within 60 s: {runs} runs, {turns} turns, {adopted} adopted, {refused} refused"
+            );
+            let ws = r.ws.join(format!("run{runs}"));
+            let copy = r.copy.join(format!("run{runs}"));
+            fs::create_dir_all(ws.join("x")).unwrap();
+            fs::write(ws.join("x/seed"), "s").unwrap();
+            std::os::unix::fs::symlink(&r.outside, ws.join("x.link")).unwrap();
+            let made = make(&ws, &copy, &ROOMY, &allow).unwrap();
+            fs::write(copy.join("x/evil.txt"), "from the copy\n").unwrap();
+            fs::create_dir_all(copy.join("x/n/deep")).unwrap();
+            fs::write(copy.join("x/n/deep/evil.txt"), "from the copy\n").unwrap();
+            let flipper = Flipper::start(ws.join("x"), ws.join("x.link"));
+            let result = adopt(&made.manifest, &copy, &ws, &allow_in(&ws), &allow);
+            turns += flipper.finish();
+            match result {
+                Ok(done) => {
+                    assert_eq!(done.added, ["x/evil.txt", "x/n/deep/evil.txt"]);
+                    assert!(found(&ws, "evil.txt", "from the copy\n"));
+                    adopted += 1;
+                }
+                Err(AdoptError::Io { message, .. }) => {
+                    if message.contains("symbolic link") || message.contains("outside") {
+                        refused += 1;
+                    }
+                }
+                // The workspace is changed under it, as the flipping does: a conflict is no harm either.
+                Err(AdoptError::Conflicts(_)) => {}
+                Err(other) => panic!("{other:?}"),
+            }
+            assert_eq!(listing(&r.outside), before, "run {runs} wrote outside the workspace");
+            runs += 1;
+        }
     }
 }
