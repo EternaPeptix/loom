@@ -25,7 +25,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use goblin::Object;
-use loom_core::event::{ToolClass, ToolSpec, ToolStatus};
+use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_EVIDENCE_GRADE};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -520,6 +520,7 @@ impl Tool for BinDecompile {
         spec("bin_decompile","Ask an installed rizin/pdg backend for one function. Content-hash cached, max 120 displayed lines; missing backend is an explicit error. Output is analysis, not execution proof.",ToolClass::Exec,&[req("path","string","Binary path."),req("symbol_or_addr","string","Symbol or 0x address.")])
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        async {
         let target = args.get("symbol_or_addr").and_then(Value::as_str).unwrap_or_default();
         if let Err(e) = selector(target) {
             return ToolOutput::error(e);
@@ -554,6 +555,9 @@ impl Tool for BinDecompile {
             if input.enforced { "enforced" } else { "not enforced; uncached observation only" }
         ));
         limited_backend_view(ctx, output, &bytes)
+        }
+        .await
+        .with_meta(META_EVIDENCE_GRADE, json!("analysis"))
     }
 }
 #[async_trait]
@@ -562,6 +566,7 @@ impl Tool for BinXrefs {
         spec("bin_xrefs","Bounded incoming-reference BFS using an installed rizin backend. Depth 1..4, at most 12 expanded nodes; cache keys include binary content hash.",ToolClass::Exec,&[req("path","string","Binary path."),req("target","string","Symbol or 0x address."),opt("depth","integer","BFS depth, default 1.").min(1).max(4)])
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        async {
         let target = args.get("target").and_then(Value::as_str).unwrap_or_default();
         if let Err(e) = selector(target) {
             return ToolOutput::error(e);
@@ -610,6 +615,9 @@ impl Tool for BinXrefs {
             "xref query",
             Body::Raw(json!({"sha256":hash,"queries":rows,"bounded":seen.len()>=12,"input_isolation_enforced":input.enforced}).to_string().into_bytes()),
         )
+        }
+        .await
+        .with_meta(META_EVIDENCE_GRADE, json!("analysis"))
     }
 }
 
@@ -1071,5 +1079,40 @@ mod tests {
         assert_eq!(data["relocations"][0], json!({"symbol": "puts", "address": "0x404018"}));
         assert!(data["symbols"].as_array().unwrap().iter().any(|s| s["name"] == "entry_label" && s["bytes"] == 0));
         assert!(data["symbols"].as_array().unwrap().iter().any(|s| s["name"] == "stage_buf" && s["kind"] == "object"));
+    }
+
+    fn grade(r: &loom_core::event::ToolResult) -> Option<&str> {
+        r.meta.get(META_EVIDENCE_GRADE).and_then(Value::as_str)
+    }
+
+    #[tokio::test]
+    async fn decompile_and_xrefs_results_are_graded_analysis_and_the_others_are_not() {
+        let mut env = crate::testutil::env();
+        let file = env.ctx.workspace.join("blob.bin");
+        std::fs::write(&file, b"\x7fELF not a real binary").unwrap();
+        let empty = env.ctx.workspace.join("emptybin");
+        std::fs::create_dir_all(&empty).unwrap();
+        let mut vars = (*env.ctx.env).clone();
+        vars.insert("PATH".to_string(), empty.to_string_lossy().into_owned());
+        env.ctx.env = std::sync::Arc::new(vars);
+        let path = file.to_string_lossy().into_owned();
+        for (tool, args) in [
+            ("bin_decompile", json!({"path": path, "symbol_or_addr": "main"})),
+            ("bin_decompile", json!({"path": path, "symbol_or_addr": "main;id"})),
+            ("bin_decompile", json!({"path": "no-such-file", "symbol_or_addr": "main"})),
+            ("bin_xrefs", json!({"path": path, "target": "main"})),
+            ("bin_xrefs", json!({"path": path, "target": "a b"})),
+            ("bin_xrefs", json!({"path": "no-such-file", "target": "main"})),
+        ] {
+            let r = env.call(tool, args).await;
+            assert_ne!(r.status, ToolStatus::Ok, "{tool}: {}", r.text);
+            assert_eq!(grade(&r), Some("analysis"), "{tool}: {}", r.text);
+        }
+        let r = env.call("gdb_probe", json!({"binary": "no-such-file", "sink": "main"})).await;
+        assert_eq!(r.status, ToolStatus::Error, "{}", r.text);
+        assert_eq!(grade(&r), None);
+        let r = env.call("bin_survey", json!({"path": path})).await;
+        assert_eq!(r.status, ToolStatus::Error, "{}", r.text);
+        assert_eq!(grade(&r), None);
     }
 }
