@@ -2688,11 +2688,12 @@ impl Session {
                         }
                     }
                     self.refused_epoch = Some(woven.weave.epoch);
-                    let folded = self.records.iter().rev().find_map(|r| match &r.event {
-                        Event::Reweave(rw) => Some(rw.reason == "refused"),
-                        _ => None,
-                    });
-                    let folded = folded.unwrap_or(false);
+                    let folded = self
+                        .records
+                        .iter()
+                        .rev()
+                        .take_while(|r| !matches!(r.event, Event::ModelResponse(_)))
+                        .any(|r| matches!(&r.event, Event::Reweave(rw) if rw.reason == "refused"));
                     return self.fail_with(
                         &texts::refused(status, &message, folded),
                         texts::refused_park(status, &message, folded),
@@ -3290,7 +3291,7 @@ impl Session {
             return Ok(false);
         }
         // The plan counts in the estimator's units, the check in the server's when it has counted.
-        policy.floor_tokens = scaled(floor, est, size);
+        policy.floor_tokens = if matches!(fold, Fold::KeepZero | Fold::Refused) { 0 } else { scaled(floor, est, size) };
         let midpoint = scaled(floor.saturating_add(limit) / 2, est, size);
         let enough =
             |p: &Option<loom_core::weave::ReweavePlan>| p.as_ref().is_some_and(|p| p.after_tokens_est <= midpoint);
@@ -3307,7 +3308,7 @@ impl Session {
             }
             // After an overflow or a refusal the server has just refused this prefix: a digest request on
             // it would be refused as well.
-            if text_plan.is_some() && matches!(fold, Fold::Normal | Fold::KeepZero) {
+            if text_plan.is_some() && matches!(fold, Fold::Normal) {
                 digest = self.ask_digest(&woven.weave, token).await?;
                 if token.is_cancelled() {
                     return Ok(false);
@@ -7449,7 +7450,87 @@ mod tests {
         let rw = reweave_records(&fx.sink.records());
         assert_eq!(rw[0].reason, "operator");
         assert!(matches!(&rw[0].evictions[..], [Eviction { action: EvictAction::Stub { .. }, .. }]), "{rw:?}");
+        let rs = fx.sink.records();
+        assert!(
+            !rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest)),
+            "no digest request after a refusal"
+        );
         finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn refusal_folds_with_the_default_policy() {
+        let mut fx =
+            Fx::new("chat", false, false, filter_over(vec![bash(POISONED).into(), Reply::text("done").into()])).await;
+        // fx.context is ReweavePolicy::default(): floor 180k, target 400k, keep 60.
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        say(&mut session, "keep working").await;
+        say(&mut session, "and again").await;
+        let rs = session.records().to_vec();
+        let rw = reweave_records(&rs);
+        assert_eq!(
+            rw.len(),
+            1,
+            "refused re-weaves {:?}; turn ends {:?}; inbox {}",
+            rw.iter().map(|w| w.reason.clone()).collect::<Vec<_>>(),
+            turn_ends(&rs),
+            inbox(&rs).len()
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_fold_stops_at_the_floor_and_keeps_the_refused_output() {
+        let mut fx = Fx::new(
+            "chat",
+            false,
+            false,
+            filter_over(vec![bash(BIG).into(), bash(POISONED).into(), Reply::text("done").into()]),
+        )
+        .await;
+        fx.context =
+            ReweavePolicy { target_tokens: 400_000, floor_tokens: 6_000, keep_recent_steps: 2, stub_tail_lines: 3 };
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        say(&mut session, "keep working").await;
+        let rs = session.records().to_vec();
+        let rw = reweave_records(&rs);
+        assert_eq!(rw.iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["refused"]);
+        let reqs = fx.server.requests();
+        let items = inbox(&rs);
+        assert!(
+            !body_has(reqs.last().unwrap(), "POISON"),
+            "the retry after the refused fold still carries the refused output; evictions {}; turn ends {:?}; last inbox: {}",
+            rw[0].evictions.len(),
+            turn_ends(&rs),
+            items.last().map(|i| i.text.clone()).unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_refusal_long_after_a_successful_fold_says_an_answer_cannot_help() {
+        let script = filter_over(vec![
+            bash(POISONED).into(),
+            bash(POISONED).into(),
+            Reply::text("done").into(),
+            Reply::text("done again").into(),
+        ]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context = refuse_context();
+        let mut session = fx.create();
+        say(&mut session, "go").await; // refused: park
+        say(&mut session, "keep working").await; // refused again: fold, retry ok, new poisoned output refused: park
+        say(&mut session, "again").await; // refused again on that prefix: fold, retry ok
+        let rs = session.records().to_vec();
+        let items = inbox(&rs);
+        assert_eq!(reweave_records(&rs).iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["refused", "refused"]);
+        assert_eq!(turn_ends(&rs).last(), Some(&TurnEndReason::Yielded), "the answer alone was enough");
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[1].text,
+            texts::refused_park(400, FILTER_SAYS, false),
+            "the park told the operator an answer cannot help"
+        );
     }
 
     #[tokio::test]

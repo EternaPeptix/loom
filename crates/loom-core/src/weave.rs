@@ -846,12 +846,16 @@ fn plan_on(
             _ => None,
         })
         .collect();
+    // A note after the latest model response has not been seen by the model: never a candidate.
+    let latest_response: Option<Seq> =
+        records.iter().rev().find(|r| matches!(r.event, Event::ModelResponse(_))).map(|r| r.seq);
     let notes_where = |pick: &dyn Fn(NoteKind) -> bool| -> Vec<usize> {
         (0..w.items.len())
             .filter(|&i| {
                 w.items.get(i).is_some_and(|it| {
                     it.kind == "harness_note"
                         && live(i)
+                        && latest_response.is_some_and(|lr| it.seq < lr)
                         && note_kinds.get(&it.seq).is_some_and(|k| !k.is_protected() && pick(*k))
                 })
             })
@@ -2003,6 +2007,22 @@ mod tests {
         for e in plan.evictions.iter().filter(|e| e.action == EvictAction::Drop) {
             assert_eq!(after.items.iter().find(|i| i.seq == e.seq).map(|i| i.state), Some(ItemState::Dropped));
         }
+    }
+
+    #[test]
+    fn plan_keeps_a_note_after_the_latest_response_even_with_keep_zero_and_floor_zero() {
+        let mut l = Log::new();
+        l.user("start");
+        l.resp("old reply", "", &[]);
+        let old = l.note(NoteKind::Nudge, "an old nudge the model has seen");
+        l.user("more");
+        l.resp("latest reply", "", &[]);
+        let fresh = l.note(NoteKind::Nudge, "a nudge the model has not seen");
+        let est = TokenEstimator::with_ratio(4.0);
+        let policy = ReweavePolicy { target_tokens: 0, floor_tokens: 0, keep_recent_steps: 0, stub_tail_lines: 3 };
+        let plan = plan_reweave(&l.recs, &est, &policy, false).expect("plan");
+        assert!(plan.evictions.iter().any(|e| e.seq == old), "the older note is dropped: {plan:?}");
+        assert!(plan.evictions.iter().all(|e| e.seq != fresh), "the note after the latest response stays");
     }
 
     #[test]
