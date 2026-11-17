@@ -24,10 +24,9 @@
 //! pattern; `shown` ranges are exact; for both tools, a stored output outside `ctx.outputs` is refused
 //! with exactly the sentence of a handle that names nothing, and its text is not in the result.
 
-use crate::{params, view, Body, Tool, ToolCtx, ToolOutput};
+use crate::{outputs, params, view, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
 use loom_core::event::{ToolClass, ToolSpec};
-use loom_core::BlobId;
 use regex::Regex;
 use serde_json::{Map, Value};
 
@@ -48,19 +47,6 @@ pub(crate) fn uint(args: &Map<String, Value>, key: &str) -> Option<u64> {
 /// A string argument, empty when absent.
 pub(crate) fn string<'a>(args: &'a Map<String, Value>, key: &str) -> &'a str {
     args.get(key).and_then(Value::as_str).unwrap_or("")
-}
-
-/// Find the stored output a handle names, or say what to do about it.
-fn resolve(ctx: &ToolCtx, handle: &str) -> Result<BlobId, String> {
-    ctx.blobs.resolve(handle).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!("There is no stored output for the handle `{handle}`. Handles look like `out:1a2b3c4d` and appear in the header of a result; copy one exactly.")
-        } else if e.to_string().contains("ambiguous") {
-            format!("The handle `{handle}` matches more than one stored output. Give more characters of it; handles look like `out:1a2b3c4d`.")
-        } else {
-            format!("`{handle}` is not an output handle. Handles look like `out:1a2b3c4d` and appear in the header of a result; copy one exactly.")
-        }
-    })
 }
 
 /// Sorted ranges with overlapping or adjacent ones joined.
@@ -117,9 +103,9 @@ impl Tool for OutRead {
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let handle = string(args, "handle");
-        let id = match resolve(ctx, handle) {
+        let id = match outputs::open(ctx, handle).await {
             Ok(id) => id,
-            Err(e) => return ToolOutput::error(e),
+            Err(e) => return ToolOutput::error(e.sentence(handle)),
         };
         let total = match ctx.blobs.meta(&id) {
             Ok(m) => m.lines,
@@ -171,9 +157,9 @@ impl Tool for OutGrep {
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let handle = string(args, "handle");
-        let id = match resolve(ctx, handle) {
+        let id = match outputs::open(ctx, handle).await {
             Ok(id) => id,
-            Err(e) => return ToolOutput::error(e),
+            Err(e) => return ToolOutput::error(e.sentence(handle)),
         };
         let pattern = string(args, "pattern");
         let ignore_case = args.get("ignore_case").and_then(Value::as_bool).unwrap_or(false);
@@ -312,9 +298,34 @@ mod tests {
         let e = env();
         let r = e.call("out_read", json!({"handle": "out:deadbeef"})).await;
         assert_eq!(r.status, loom_core::event::ToolStatus::Error);
-        assert!(r.text.contains("out:deadbeef") && r.text.contains("out:1a2b3c4d"), "{}", r.text);
+        assert!(r.text.contains("out:deadbeef") && r.text.contains("No output of this mission"), "{}", r.text);
         let r = e.call("out_grep", json!({"handle": "nonsense", "pattern": "x"})).await;
         assert!(r.text.contains("nonsense") && r.text.contains("out:1a2b3c4d"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn an_output_outside_the_scope_is_refused_like_one_never_stored() {
+        use crate::outputs::OutputSet;
+        let mut e = env();
+        let stored = e.ctx.blobs.put_bytes(b"TOPSECRET alpha\nbeta\n").expect("put");
+        let (id, h) = (stored.id.clone(), stored.handle());
+        e.ctx.outputs = std::sync::Arc::new(OutputSet::default());
+        let never = "out:0123456789abcdef";
+        for (tool, extra) in [("out_read", json!({})), ("out_grep", json!({"pattern": "TOPSECRET"}))] {
+            let mut foreign = extra.clone();
+            foreign["handle"] = json!(h);
+            let mut absent = extra;
+            absent["handle"] = json!(never);
+            let a = e.call(tool, foreign).await;
+            let b = e.call(tool, absent).await;
+            assert_eq!(a.status, loom_core::event::ToolStatus::Error);
+            assert_eq!(a.text.replace(&h, "H"), b.text.replace(never, "H"), "{tool}");
+            assert!(!a.text.contains("TOPSECRET") && !a.text.contains("alpha"), "{}", a.text);
+        }
+        // Once the output is in scope the same call reads it.
+        e.ctx.outputs = std::sync::Arc::new(OutputSet::with([id]));
+        let r = e.call("out_read", json!({"handle": h})).await;
+        assert!(r.text.contains("TOPSECRET"), "{}", r.text);
     }
 
     #[tokio::test]

@@ -379,7 +379,7 @@ impl Tool for Evidence {
         // A refusal over the quote says so in the record: a scorecard counts the steps spent on quotes.
         let quote_refused = |text: String| ToolOutput::error(text).with_meta(META_REFUSAL, json!(REFUSAL_QUOTE));
         let q = Quote { handle: handle.clone(), start, end, text: quote };
-        let verified = match check_quotes(&ctx.blobs, &[q]) {
+        let verified = match check_quotes(ctx, &[q]).await {
             Ok(v) => v,
             Err(text) => return quote_refused(format!("{text}\nNothing was attached.")),
         };
@@ -763,8 +763,27 @@ mod tests {
         .await;
         assert!(t.contains("\nNothing was attached.\n"), "{t}");
 
+        // Stored, and not an output of this mission at all: the sentence of a handle that names nothing, and
+        // nothing of the output (not even that its range is past its end) is said.
+        let foreign = rig.env.ctx.blobs.put_bytes(b"another mission's text\n").unwrap();
+        let t = refused(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": foreign.handle(), "start": 1, "end": 1, "quote": "x", "note": "n"}),
+        )
+        .await;
+        assert!(t.contains("no output of this mission has the handle") && !t.contains("another mission"), "{t}");
+        let t = refused(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": foreign.handle(), "start": 9, "end": 9, "quote": "x", "note": "n"}),
+        )
+        .await;
+        assert!(t.contains("no output of this mission has the handle") && !t.contains("lines"), "{t}");
+
         // Stored but never produced by a tool call of the mission.
         let blob = rig.env.ctx.blobs.put_bytes(b"orphan text\n").unwrap();
+        rig.orch.in_scope(&blob.id);
         let t = refused(
             &rig,
             "evidence",

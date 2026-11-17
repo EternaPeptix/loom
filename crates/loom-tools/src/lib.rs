@@ -75,6 +75,8 @@ pub struct ToolCtx {
     /// The session's scratch directory. Canonical.
     pub tmp_dir: PathBuf,
     pub blobs: BlobStore,
+    /// Which stored outputs this session may open (`outputs::open`).
+    pub outputs: Arc<dyn outputs::OutputScope>,
     pub cfg: Arc<ToolsCfg>,
     pub sandbox: Arc<sandbox::Sandbox>,
     /// Environment variables added to every command (proxy settings and the like).
@@ -536,6 +538,7 @@ pub mod testutil {
             workspace: ws,
             tmp_dir: tmp,
             blobs,
+            outputs: Arc::new(outputs::AnyStored),
             cfg: Arc::new(cfg),
             sandbox: Arc::new(sandbox),
             env: Arc::new(BTreeMap::new()),

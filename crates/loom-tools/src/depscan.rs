@@ -41,7 +41,7 @@
 use crate::binary::{command_bounded, quote, CommandOutcome};
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
-use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_RAW_BLOB};
+use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_ALSO_STORED, META_RAW_BLOB};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -534,6 +534,8 @@ async fn run(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         render(&resolved.display().to_string(), components, std::mem::take(&mut findings), &artifact_names);
 
     let mut out = ToolOutput::ok(outcome_text, Body::Raw(summary.into_bytes()));
+    // The ids of every further blob a fact names, so they count as outputs of the mission.
+    let mut also: Vec<String> = Vec::new();
     // Store the artifacts so they outlive the temp directory and can be cited.
     if let Some(first) = vdrs.first() {
         match ctx.blobs.put_bytes(&first.bytes) {
@@ -545,19 +547,25 @@ async fn run(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         }
         for extra in vdrs.iter().skip(1) {
             if let Ok(stored) = ctx.blobs.put_bytes(&extra.bytes) {
+                also.push(stored.id.as_str().to_string());
                 out = out.with_more(format!("VDR {}: {}", extra.name, stored.handle()));
             }
         }
     }
     for bom in &boms {
         if let Ok(stored) = ctx.blobs.put_bytes(&bom.bytes) {
+            also.push(stored.id.as_str().to_string());
             out = out.with_more(format!("SBOM {}: {}", bom.name, stored.handle()));
         }
     }
     if !outcome.bytes.is_empty() {
         if let Ok(stored) = ctx.blobs.put_bytes(&outcome.bytes) {
+            also.push(stored.id.as_str().to_string());
             out = out.with_more(format!("scanner console: {}", stored.handle()));
         }
+    }
+    if !also.is_empty() {
+        out = out.with_meta(META_ALSO_STORED, json!(also));
     }
     if unparseable > 0 {
         out = out.with_more(format!("{unparseable} VDR file(s) were not parseable and were left out"));
@@ -755,6 +763,16 @@ echo "fake depscan ran: $*"
         assert!(String::from_utf8(raw).unwrap().contains("RUSTSEC-2020-0071"));
         assert!(r.text.contains("SBOM sbom-rust.cdx.json: out:"), "{}", r.text);
         assert!(r.text.contains("scanner console: out:"), "{}", r.text);
+        // Every other blob a fact names is in META_ALSO_STORED, as full ids that the store holds.
+        let also: Vec<&str> =
+            r.meta.get(META_ALSO_STORED).and_then(Value::as_array).unwrap().iter().filter_map(Value::as_str).collect();
+        assert_eq!(also.len(), 2, "{also:?}");
+        for id in &also {
+            assert_eq!(id.len(), 64);
+            assert!(e.ctx.blobs.resolve(id).is_ok());
+            assert!(r.text.contains(&format!("out:{}", &id[..16])), "{}", r.text);
+        }
+        assert!(!also.contains(&raw_id));
     }
 
     /// Every byte stored under the loom home's blob directory.

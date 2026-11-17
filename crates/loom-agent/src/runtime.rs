@@ -541,7 +541,7 @@ use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
     Author, Brief, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, Forked, InboxItem, ModelRef, NetDecision,
     Record, Seq, SessionOutcome, SessionStart, SpawnMode, Termination, ToolClass, ToolStatus, TurnEndReason, Usage,
-    META_EXIT_CODE, META_OF_BLOB, META_SIGNAL,
+    META_ALSO_STORED, META_EXIT_CODE, META_OF_BLOB, META_RAW_BLOB, META_SIGNAL,
 };
 use loom_core::journal::{self, Journal};
 use loom_core::ledger::LedgerState;
@@ -554,6 +554,7 @@ use loom_net::policy::Policy;
 use loom_net::proxy::Proxy;
 use loom_tools::boxctl::{DockerHost, MissionBox};
 use loom_tools::jobs::JobTable;
+use loom_tools::outputs::OutputScope;
 use loom_tools::sandbox::Sandbox;
 use loom_tools::workcopy;
 use loom_tools::ToolCtx;
@@ -1007,6 +1008,48 @@ fn produced_by(
     }
 }
 
+/// The stored outputs an event names besides what `produced_by` finds: of a result that is not a view
+/// (`out_read`, `out_grep`), its output, the text it shows, its raw bytes and its further stored
+/// reports; the output of a settled or matched job; the complete report of a child.
+fn also_outputs(event: &Event) -> Vec<BlobId> {
+    let mut out: Vec<BlobId> = Vec::new();
+    let mut add = |id: &str| {
+        if !id.is_empty() {
+            out.push(BlobId::from(id));
+        }
+    };
+    match event {
+        Event::ToolResult(t) if t.name != "out_read" && t.name != "out_grep" => {
+            if let Some(o) = &t.output {
+                add(o.id.as_str());
+            }
+            for key in [META_OF_BLOB, META_RAW_BLOB] {
+                if let Some(id) = t.meta.get(key).and_then(Value::as_str) {
+                    add(id);
+                }
+            }
+            for id in t.meta.get(META_ALSO_STORED).and_then(Value::as_array).into_iter().flatten() {
+                if let Some(id) = id.as_str() {
+                    add(id);
+                }
+            }
+        }
+        Event::JobSettled { output: Some(o), .. } | Event::JobMatched { output: Some(o), .. } => add(o.id.as_str()),
+        Event::ChildSettled(c) => {
+            if let Some(f) = &c.full {
+                add(f.id.as_str());
+            }
+        }
+        Event::ChildCompleted(c) => {
+            if let Some(f) = &c.full {
+                add(f.id.as_str());
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 /// The completed result is authoritative even when a later terminal/status write was interrupted.
 fn completed_settlement(records: &[Record], child: &SessionId) -> Option<Settlement> {
     own_records(records).iter().rev().find_map(|record| match &record.event {
@@ -1226,6 +1269,8 @@ struct State {
     route_cursor: HashMap<(SessionId, String), usize>,
     inbox: Vec<InboxEntry>,
     producers: HashMap<(MissionId, BlobId), Producer>,
+    /// The outputs of a mission that the producer index does not cover (see *Outputs of a mission*).
+    extra_outputs: HashSet<(MissionId, BlobId)>,
     scanned: HashSet<MissionId>,
     /// The call that started each background job, by session and job id (for the job's complete output).
     job_starts: HashMap<(SessionId, String), Producer>,
@@ -1658,39 +1703,31 @@ impl Orchestrator for Orch {
     async fn producer(&self, mission: &MissionId, blob: &BlobId) -> Option<Producer> {
         let inner = self.0.upgrade()?;
         let key = (mission.clone(), blob.clone());
-        let ids = {
-            let st = inner.st();
-            if let Some(p) = st.producers.get(&key) {
-                return Some(p.clone());
-            }
-            if st.scanned.contains(mission) {
-                return None;
-            }
-            st.known.iter().filter(|(_, k)| &k.meta.mission == mission).map(|(id, _)| id.clone()).collect::<Vec<_>>()
-        };
-        let paths = inner.paths.clone();
-        let found = tokio::task::spawn_blocking(move || {
-            let mut out: Vec<(BlobId, Producer)> = Vec::new();
-            let mut jobs: HashMap<(SessionId, String), Producer> = HashMap::new();
-            for id in ids {
-                let Ok(report) = read_records(&paths.session_log(&id)) else { continue };
-                for r in own_records(&report.records) {
-                    out.extend(produced_by(&id, &mut jobs, &r.event));
-                }
-            }
-            out
-        })
-        .await
-        .unwrap_or_default();
-        let mut st = inner.st();
-        for (b, p) in found {
-            let mission = st.known.get(&p.session).map(|k| k.meta.mission.clone());
-            if let Some(m) = mission {
-                st.producers.entry((m, b)).or_insert(p);
-            }
+        if let Some(p) = inner.st().producers.get(&key) {
+            return Some(p.clone());
         }
-        st.scanned.insert(mission.clone());
-        st.producers.get(&key).cloned()
+        inner.scan_outputs(mission).await;
+        let found = inner.st().producers.get(&key).cloned();
+        found
+    }
+}
+
+/// The outputs of one mission, for the tools of one of its sessions (`loom_tools::outputs`).
+struct MissionOutputs {
+    runtime: Weak<Inner>,
+    mission: MissionId,
+}
+
+#[async_trait]
+impl OutputScope for MissionOutputs {
+    async fn holds(&self, blob: &BlobId) -> bool {
+        let Some(inner) = self.runtime.upgrade() else { return false };
+        let key = (self.mission.clone(), blob.clone());
+        if inner.holds_output(&key) {
+            return true;
+        }
+        inner.scan_outputs(&self.mission).await;
+        inner.holds_output(&key)
     }
 }
 
@@ -1821,6 +1858,51 @@ impl Inner {
         }
     }
 
+    /// Whether the indexes already hold `key` as an output of its mission.
+    fn holds_output(&self, key: &(MissionId, BlobId)) -> bool {
+        let st = self.st();
+        st.producers.contains_key(key) || st.extra_outputs.contains(key)
+    }
+
+    /// Read the logs of every session of `mission` once (off the async workers) and fill the producer index
+    /// and the index of other outputs from them. Does nothing for a mission already scanned.
+    async fn scan_outputs(self: &Arc<Self>, mission: &MissionId) {
+        let ids = {
+            let st = self.st();
+            if st.scanned.contains(mission) {
+                return;
+            }
+            st.known.iter().filter(|(_, k)| &k.meta.mission == mission).map(|(id, _)| id.clone()).collect::<Vec<_>>()
+        };
+        let paths = self.paths.clone();
+        let (found, extra) = tokio::task::spawn_blocking(move || {
+            let mut out: Vec<(BlobId, Producer)> = Vec::new();
+            let mut extra: Vec<BlobId> = Vec::new();
+            let mut jobs: HashMap<(SessionId, String), Producer> = HashMap::new();
+            for id in ids {
+                let Ok(report) = read_records(&paths.session_log(&id)) else { continue };
+                for r in own_records(&report.records) {
+                    out.extend(produced_by(&id, &mut jobs, &r.event));
+                    extra.extend(also_outputs(&r.event));
+                }
+            }
+            (out, extra)
+        })
+        .await
+        .unwrap_or_default();
+        let mut st = self.st();
+        for (b, p) in found {
+            let owner = st.known.get(&p.session).map(|k| k.meta.mission.clone());
+            if let Some(m) = owner {
+                st.producers.entry((m, b)).or_insert(p);
+            }
+        }
+        for b in extra {
+            st.extra_outputs.insert((mission.clone(), b));
+        }
+        st.scanned.insert(mission.clone());
+    }
+
     // ---- sink -------------------------------------------------------------------------------
 
     fn on_record(self: &Arc<Self>, session: &SessionId, record: &Record) {
@@ -1833,9 +1915,14 @@ impl Inner {
                     Event::ToolResult(_)
                     | Event::JobRegistered { .. }
                     | Event::JobSettled { .. }
-                    | Event::JobMatched { .. } => {
+                    | Event::JobMatched { .. }
+                    | Event::ChildSettled(_)
+                    | Event::ChildCompleted(_) => {
                         if let Some((blob, p)) = produced_by(session, &mut st.job_starts, &record.event) {
                             st.producers.entry((mission.clone(), blob)).or_insert(p);
+                        }
+                        for blob in also_outputs(&record.event) {
+                            st.extra_outputs.insert((mission.clone(), blob));
                         }
                     }
                     Event::InboxOpened(item) => {
@@ -2227,6 +2314,7 @@ impl Inner {
             workspace,
             tmp_dir: tmp,
             blobs: self.blobs.clone(),
+            outputs: Arc::new(MissionOutputs { runtime: self.me.clone(), mission: meta.mission.clone() }),
             cfg: Arc::new(self.config.tools.clone()),
             sandbox: Arc::new(sandbox),
             env: Arc::new(grant.env()),
@@ -6788,6 +6876,187 @@ mod tests {
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         let p2 = rt2.inner.orch.producer(&info.meta.mission, &blob).await.unwrap();
         assert_eq!(p2.call_id, call_id);
+        rt2.shutdown().await;
+    }
+
+    /// The first `out:` handle of 16 or more digits anywhere in a request.
+    fn any_handle(body: &Value) -> String {
+        let text = body.to_string();
+        text.match_indices("out:")
+            .find_map(|(at, _)| {
+                let hex: String = text[at + 4..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                (hex.len() >= 16).then(|| format!("out:{}", &hex[..16]))
+            })
+            .unwrap_or_default()
+    }
+
+    /// The text of every `out_read` result of a session, in order.
+    fn out_read_texts(e: &Env, id: &SessionId) -> Vec<String> {
+        e.records(id)
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::ToolResult(t) if t.name == "out_read" => Some(t.text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn out_read_opens_the_outputs_of_its_own_mission_and_nothing_of_another() {
+        let foreign = Arc::new(Mutex::new(String::new()));
+        let f = foreign.clone();
+        let e = env(Script::new(move |body, _| {
+            if has_tool(body, "agent_spawn") {
+                match tool_msgs(body) {
+                    0 => call("bash", json!({"command": "echo OWNMARK"})),
+                    1 => call("out_read", json!({"handle": handle_in_tool_msg(body, 0)})),
+                    2 => call("out_read", json!({"handle": lock(&f).clone()})),
+                    3 => call(
+                        "agent_spawn",
+                        json!({"question": format!("Read {} and say what it holds.", handle_in_tool_msg(body, 0))}),
+                    ),
+                    _ => finish("lead done"),
+                }
+            } else if tool_msgs(body) == 0 {
+                call("out_read", json!({"handle": any_handle(body)}))
+            } else {
+                finish("child done")
+            }
+        }))
+        .await;
+        // Stored by someone else (another mission): its handle reaches the session in a message.
+        let other = e.rt.blobs().put_bytes(b"FOREIGNMARK of another mission\n").unwrap();
+        *lock(&foreign) = other.handle();
+        let info = e.rt.create_session(e.new_session(Some(&format!("Look at {} too.", other.handle())))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("the lead's turn ends", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let lead = out_read_texts(&e, &id);
+        assert_eq!(lead.len(), 2, "{lead:?}");
+        assert!(lead[0].contains("1\tOWNMARK"), "{}", lead[0]);
+        let want = loom_tools::outputs::Unopened::Unknown.sentence(&other.handle());
+        assert!(lead[1].contains(&want), "{}", lead[1]);
+        assert!(!lead[1].contains("FOREIGNMARK") && !lead[1].contains("lines"), "{}", lead[1]);
+        // A fresh child reads its lead's output.
+        let kid = e.children(&id).first().map(|c| c.meta.id.clone()).expect("a child");
+        let child = out_read_texts(&e, &kid);
+        assert_eq!(child.len(), 1, "{child:?}");
+        assert!(child[0].contains("1\tOWNMARK"), "{}", child[0]);
+        e.rt.shutdown().await;
+    }
+
+    fn named_result(call_id: &str, name: &str, output: Option<&BlobRef>, meta: Value) -> Event {
+        Event::ToolResult(loom_core::event::ToolResult {
+            call_id: call_id.into(),
+            name: name.into(),
+            status: ToolStatus::Ok,
+            text: "x".into(),
+            output: output.cloned(),
+            cut: false,
+            class: ToolClass::Exec,
+            meta: meta.as_object().cloned().unwrap_or_default(),
+            duration_ms: 1,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_outputs_a_mission_names_are_its_own_live_and_after_a_restart() {
+        use loom_core::event::{ChildCompleted, META_ALSO_STORED, META_RAW_BLOB};
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let put = |text: &str| e.rt.blobs().put_bytes(text.as_bytes()).unwrap();
+        let (raw, also, text_of, job, full, report) =
+            (put("raw\n"), put("also\n"), put("of\n"), put("job\n"), put("full\n"), put("report\n"));
+        let (foreign, viewed, never) = (put("foreign\n"), put("viewed\n"), put("never named\n"));
+        let events = vec![
+            named_result(
+                "n1",
+                "web_fetch",
+                None,
+                json!({ META_RAW_BLOB: raw.id.as_str(), META_ALSO_STORED: [also.id.as_str()], "of_blob": text_of.id.as_str() }),
+            ),
+            Event::JobSettled {
+                job_id: "j1".into(),
+                exit_code: Some(0),
+                output: Some(job.clone()),
+                detail: "d".into(),
+            },
+            Event::ChildSettled(loom_core::event::ChildSettled {
+                child: SessionId::from("s-kid"),
+                outcome: ChildOutcome::Returned,
+                report: "r".into(),
+                full: Some(full.clone()),
+                usage: Default::default(),
+                steps: 1,
+                inline: false,
+            }),
+            Event::ChildCompleted(ChildCompleted {
+                child: SessionId::from("s-kid"),
+                role: "worker".into(),
+                outcome: ChildOutcome::Returned,
+                report: "r".into(),
+                full: Some(report.clone()),
+                payload: Value::Null,
+                steps: 1,
+                usage: Default::default(),
+            }),
+            // Views of outputs, whoever's: they name nothing.
+            named_result(
+                "v1",
+                "out_read",
+                None,
+                json!({ "of_blob": viewed.id.as_str(), META_RAW_BLOB: foreign.id.as_str() }),
+            ),
+            named_result("v2", "out_grep", None, json!({ "of_blob": foreign.id.as_str() })),
+        ];
+        let named = [&raw, &also, &text_of, &job, &full, &report];
+        let unnamed = [&foreign, &viewed, &never];
+        let scope = |rt: &Runtime| MissionOutputs { runtime: Arc::downgrade(&rt.inner), mission: mission.clone() };
+        let check = |rt: &Runtime, what: &'static str| {
+            let scope = scope(rt);
+            let (named, unnamed) = (named.map(|b| b.id.clone()), unnamed.map(|b| b.id.clone()));
+            async move {
+                for b in &named {
+                    assert!(scope.holds(b).await, "{what}: {b}");
+                }
+                for b in &unnamed {
+                    assert!(!scope.holds(b).await, "{what}: {b}");
+                }
+            }
+        };
+        // Live: the sink's records are enough, with no scan of the mission's logs.
+        for (n, event) in events.iter().enumerate() {
+            let record = Record {
+                seq: 1_000 + n as u64,
+                ts_ms: 1,
+                author: Author::Tool,
+                prev: String::new(),
+                event: event.clone(),
+            };
+            e.rt.inner.on_record(&id, &record);
+        }
+        assert!(e.rt.inner.holds_output(&(mission.clone(), raw.id.clone())));
+        assert!(!e.rt.inner.holds_output(&(mission.clone(), foreign.id.clone())));
+        // Another mission's session does not make them its own.
+        assert!(!e.rt.inner.holds_output(&(MissionId::from("m-other"), raw.id.clone())));
+        check(&e.rt, "live").await;
+        e.rt.shutdown().await;
+        // After a restart: the same records, read from the session's log by the one scan.
+        let paths = Paths::at(e.dir.path().join("home"));
+        {
+            let (mut log, _) = SessionLog::open(&paths.session_log(&id), Durability::Always).unwrap();
+            for event in &events {
+                log.append(Author::Tool, event.clone()).unwrap();
+            }
+        }
+        let rt2 = Runtime::start(e.config.clone(), paths).await.unwrap();
+        assert!(!rt2.inner.st().scanned.contains(&mission));
+        check(&rt2, "after a restart").await;
+        assert!(rt2.inner.st().scanned.contains(&mission));
+        // A runtime that is gone holds nothing.
+        let gone = MissionOutputs { runtime: Weak::new(), mission: mission.clone() };
+        assert!(!gone.holds(&raw.id).await);
         rt2.shutdown().await;
     }
 

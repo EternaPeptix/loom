@@ -120,8 +120,8 @@ fn relative(path: &Path) -> bool {
 fn hash_ok(bytes: &[u8], expected: &str) -> bool {
     hex::encode(Sha256::digest(bytes)).eq_ignore_ascii_case(expected)
 }
-fn read_candidate(ctx: &ToolCtx, handle: &str) -> Result<Vec<u8>, String> {
-    let id = ctx.blobs.resolve(handle).map_err(|e| format!("Use a complete candidate output handle: {e}."))?;
+async fn read_candidate(ctx: &ToolCtx, handle: &str) -> Result<Vec<u8>, String> {
+    let id = crate::outputs::open(ctx, handle).await.map_err(|e| e.sentence(handle))?;
     if ctx.blobs.meta(&id).map_err(|e| e.to_string())?.bytes > 1_000_000 {
         return Err("Candidate exceeds one million bytes; store only the flag or PoC input in its blob.".into());
     }
@@ -442,7 +442,7 @@ impl Tool for OracleCheck {
         let candidate = match if let Some(path) = given_file {
             read_candidate_file(ctx, path)
         } else {
-            read_candidate(ctx, candidate_handle)
+            read_candidate(ctx, candidate_handle).await
         } {
             Ok(v) => v,
             Err(e) => return ToolOutput::error(e),

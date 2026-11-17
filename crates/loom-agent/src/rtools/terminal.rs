@@ -267,6 +267,7 @@ use loom_core::log::read_records;
 use loom_core::observe::QUOTE_RECORD_CHARS;
 use loom_core::{BlobId, BlobRef, SessionId};
 use loom_tools::jobs::JobState;
+use loom_tools::outputs;
 use loom_tools::params::{opt, req, spec};
 use loom_tools::{Body, Tool, ToolCtx, ToolOutput};
 use serde_json::{json, Map, Value};
@@ -1256,7 +1257,7 @@ impl Tool for Finish {
         };
         // A refusal over a quote says so in the record: a scorecard counts the steps spent on quotes.
         let quote_refused = |text: String| ToolOutput::error(text).with_meta(META_REFUSAL, json!(REFUSAL_QUOTE));
-        let verified = match gate::check_quotes(&ctx.blobs, &quotes) {
+        let verified = match gate::check_quotes(ctx, &quotes).await {
             Ok(v) => v,
             Err(text) => {
                 return quote_refused(format!(
@@ -1475,7 +1476,7 @@ impl Tool for Verdict {
 
         let seen = outputs_seen(&s.log_path);
         for handle in &opened {
-            let known = ctx.blobs.resolve(handle).ok().is_some_and(|id| seen.contains(&id));
+            let known = outputs::open(ctx, handle).await.ok().is_some_and(|id| seen.contains(&id));
             if !known {
                 return ToolOutput::error(format!(
                     "You listed {handle} as examined, but this session never opened it. Open it with out_read, or take it off the list."
@@ -1484,7 +1485,12 @@ impl Tool for Verdict {
         }
 
         let assigned = assigned_outputs(&s.log_path, &ctx.blobs);
-        let opened_ids: HashSet<BlobId> = opened.iter().filter_map(|h| ctx.blobs.resolve(h).ok()).collect();
+        let mut opened_ids: HashSet<BlobId> = HashSet::new();
+        for h in &opened {
+            if let Ok(id) = outputs::open(ctx, h).await {
+                opened_ids.insert(id);
+            }
+        }
         if !assigned.is_empty() && !assigned.iter().any(|(_, id)| opened_ids.contains(id)) {
             let named: Vec<&str> = assigned.iter().map(|(h, _)| h.as_str()).collect();
             return ToolOutput::error(format!(
@@ -2204,6 +2210,7 @@ mod tests {
         }
         // An output no tool call of the mission produced.
         let blob = r.env.ctx.blobs.put_bytes(b"orphan line of output\n").unwrap();
+        r.orch.in_scope(&blob.id);
         let quotes = json!([{"handle": blob.handle(), "start": 1, "end": 1, "text": "orphan line of output"}]);
         let res = r.call("finish", json!({"answer": "done", "quotes": quotes})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
@@ -3438,6 +3445,9 @@ mod tests {
         let produced = r.env.ctx.blobs.put_bytes(b"produced\n").unwrap();
         let viewed = r.env.ctx.blobs.put_bytes(b"viewed\n").unwrap();
         let view_text = r.env.ctx.blobs.put_bytes(b"a view\n").unwrap();
+        for b in [&produced, &viewed, &view_text] {
+            r.orch.in_scope(&b.id);
+        }
         let mut log = SessionLog::create(&r.shared.log_path, Durability::Batch).unwrap();
         let result = |output: Option<BlobRef>, meta: Map<String, Value>| {
             Event::ToolResult(ToolResult {
@@ -3485,7 +3495,9 @@ mod tests {
             res.text
         );
         // Stored, but not by this session.
-        let other = r.env.ctx.blobs.put_bytes(b"someone else's\n").unwrap().handle();
+        let other = r.env.ctx.blobs.put_bytes(b"someone else's\n").unwrap();
+        r.orch.in_scope(&other.id);
+        let other = other.handle();
         let res = r.call("verdict", json!({"accepted": true, "opened": [other]})).await;
         assert!(res.text.contains("never opened it. Open it with out_read, or take it off the list."), "{}", res.text);
         assert!(effect(&r).is_none());

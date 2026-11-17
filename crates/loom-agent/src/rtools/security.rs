@@ -48,6 +48,7 @@ use async_trait::async_trait;
 use loom_core::event::{ToolClass, ToolSpec};
 use loom_core::ledger::LedgerOp;
 use loom_core::security_state::{Condition, ConditionKind, Fact, SecurityOp, SecurityState};
+use loom_tools::outputs;
 use loom_tools::params::{opt, req, spec};
 use loom_tools::{Body, Tool, ToolCtx, ToolOutput};
 use serde::de::DeserializeOwned;
@@ -172,23 +173,31 @@ fn resolve_conditions(state: &SecurityState, conditions: &mut [Condition]) -> Re
     Ok(())
 }
 
-fn resolve_secrets(ctx: &ToolCtx, op: &mut SecurityOp) -> Result<(), String> {
-    match op {
-        SecurityOp::CredentialAdd { credential } => {
-            let id = ctx.blobs.resolve(&credential.secret_handle).map_err(|_| {
-                "Use an existing stored out: handle for the credential secret; no secret material was recorded."
-                    .to_string()
-            })?;
-            credential.secret_handle = format!("out:{id}");
-        }
-        SecurityOp::Batch { operations } => {
-            for op in operations {
-                resolve_secrets(ctx, op)?;
+const SECRET_HANDLE_REFUSAL: &str =
+    "Use an existing stored out: handle for the credential secret; no secret material was recorded.";
+
+/// Open every credential `secret_handle` of `op` (an output of this mission) and record it as `out:{full id}`.
+fn resolve_secrets<'a>(
+    ctx: &'a ToolCtx,
+    op: &'a mut SecurityOp,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        match op {
+            SecurityOp::CredentialAdd { credential } => {
+                let id = outputs::open(ctx, &credential.secret_handle)
+                    .await
+                    .map_err(|_| SECRET_HANDLE_REFUSAL.to_string())?;
+                credential.secret_handle = format!("out:{id}");
             }
+            SecurityOp::Batch { operations } => {
+                for op in operations {
+                    resolve_secrets(ctx, op).await?;
+                }
+            }
+            _ => {}
         }
-        _ => {}
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[async_trait]
@@ -218,22 +227,39 @@ impl Tool for SecurityRecord {
             && operation.get("action").and_then(Value::as_str) != Some("batch");
         let notes = read.notes;
         let mut op = read.op;
-        let prepare = |op: &mut SecurityOp| {
-            resolve_op(&state.security, op)
-                .and_then(|_| resolve_secrets(ctx, op))
-                .and_then(|_| authorize(&self.0, &state.security, op))
-        };
+        let prepare = |op: &mut SecurityOp| resolve_op(&state.security, op);
+        let authorized = |op: &SecurityOp| authorize(&self.0, &state.security, op);
         // A batch element that fails is named, the way the core names one that fails validation.
         let prepared = match &mut op {
             SecurityOp::Batch { operations } => {
                 let n = operations.len();
-                operations.iter_mut().enumerate().try_for_each(|(i, element)| {
-                    prepare(element).map_err(|e| {
-                        format!("Operation {} of {n} in the batch ({}): {e}", i.saturating_add(1), element.action())
-                    })
-                })
+                let mut result = Ok(());
+                for (i, element) in operations.iter_mut().enumerate() {
+                    let step = match prepare(element) {
+                        Ok(()) => match resolve_secrets(ctx, element).await {
+                            Ok(()) => authorized(element),
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = step {
+                        result = Err(format!(
+                            "Operation {} of {n} in the batch ({}): {e}",
+                            i.saturating_add(1),
+                            element.action()
+                        ));
+                        break;
+                    }
+                }
+                result
             }
-            single => prepare(single),
+            single => match prepare(single) {
+                Ok(()) => match resolve_secrets(ctx, single).await {
+                    Ok(()) => authorized(single),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            },
         };
         if let Err(e) = prepared {
             return ToolOutput::error(e);
@@ -373,9 +399,9 @@ impl Tool for SecurityIngest {
             return ToolOutput::error(super::NO_MISSION);
         };
         let handle = args.get("handle").and_then(Value::as_str).unwrap_or("");
-        let blob = match ctx.blobs.resolve(handle) {
+        let blob = match outputs::open(ctx, handle).await {
             Ok(b) => b,
-            Err(e) => return ToolOutput::error(format!("Open a valid scanner output handle first: {e}.")),
+            Err(e) => return ToolOutput::error(e.sentence(handle)),
         };
         if let Err(e) = observed_producer(&self.0, mission, handle, &blob).await {
             return ToolOutput::error(e);
@@ -760,6 +786,18 @@ mod tests {
             )
             .await;
         assert_eq!(invalid.status, Status::Error);
+        assert!(r.shared.ledger().unwrap().security.credentials.is_empty());
+        // A stored output of another mission is refused with the same sentence as a handle that names nothing.
+        let foreign = r.env.ctx.blobs.put_bytes(b"another mission's secret\n").unwrap().handle();
+        let refused = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"credential_add","credential":{
+            "asset":id,"principal":"dummy","secret_handle":foreign,"evidence":["e1"]}}}),
+            )
+            .await;
+        assert_eq!(refused.status, Status::Error);
+        assert!(refused.text.contains(SECRET_HANDLE_REFUSAL), "{}", refused.text);
         assert!(r.shared.ledger().unwrap().security.credentials.is_empty());
         let secret = r.output("dummy fixture secret", "read", ToolClass::Read);
         let full = format!("out:{}", r.env.ctx.blobs.resolve(&secret).unwrap());
