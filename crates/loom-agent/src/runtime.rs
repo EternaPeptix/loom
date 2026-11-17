@@ -563,7 +563,15 @@
 //!   recently paged sessions keep theirs. `stored_records(id, after, limit)`: the same page from
 //!   `PageReader::read_stored`, so that a record read as `Event::Unknown` keeps its stored line.
 //! - `window(id)`: `log::read_records` → `weave` → [`WindowView`] (`est_tokens` with a default
-//!   `TokenEstimator` over the messages plus the tool specs' JSON).
+//!   `TokenEstimator` over the messages plus the tool specs' JSON, in bytes as `session` counts them).
+//!   Its additive fields: `breakdown` (the request by part: system, tools, rules, assignment, resume,
+//!   conversation, tool_output, pinned, agent_reports, notes, stubs, other, framing, hud; each part
+//!   estimated from its characters, and, when `measured_now` exists, scaled so that the segments add up
+//!   to it exactly, `framing` taking the remainder; without a count, `basis` is `default_ratio` and the
+//!   total is the estimate), `measured_now` (`session`'s size of the request it would send now, `None`
+//!   before the first counted request of the epoch), `last_request` (the latest step request and the
+//!   server's count for its reply, 0 while missing) and `fold_at`/`fold_to` (`reweave_bounds` of the
+//!   configured target and floor for the session's window and profile).
 //! - `missions()`: one per root session. `ledger(mission)`: the journal read and folded
 //!   (`No ledger: this mission's lead does not keep one.` when there is no journal file and the
 //!   lead's role keeps none or can no longer be looked up; a lead that keeps one but has no journal
@@ -885,7 +893,9 @@ pub struct NetEntry {
 }
 
 /// What is in a session's request now.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// The fields after `cached_tokens` are additive: a reader of an older answer gets their defaults.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowView {
     pub epoch: u32,
     pub items: Vec<WindowItem>,
@@ -897,6 +907,202 @@ pub struct WindowView {
     /// As reported by the server for the latest request.
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
+    /// What the request is made of, in tokens. `segments` is empty in an answer from an older daemon.
+    #[serde(default)]
+    pub breakdown: WindowBreakdown,
+    /// The size of the request the session would send now: what the server counted for the latest step
+    /// request of this epoch, plus an estimate of what was added since. `None` before the first counted
+    /// request of the epoch.
+    #[serde(default)]
+    pub measured_now: Option<u64>,
+    /// The latest step request, with the server's count for its reply once that is in.
+    #[serde(default)]
+    pub last_request: Option<WindowRequest>,
+    /// The size at which the session folds, and the size it folds down to, for this window and profile
+    /// (the configured target and floor, lowered so that a request leaves room for the reply).
+    #[serde(default)]
+    pub fold_at: Option<u64>,
+    #[serde(default)]
+    pub fold_to: Option<u64>,
+}
+
+/// One part of the request in a [`WindowBreakdown`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WindowSegment {
+    /// `system`, `tools`, `rules`, `assignment`, `resume`, `conversation`, `tool_output`, `pinned`,
+    /// `agent_reports`, `notes`, `stubs`, `other`, `framing` or `hud`. The page words them.
+    pub key: String,
+    pub chars: u64,
+    pub tokens: u64,
+    /// How many things the part holds, for the parts that hold several.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+}
+
+/// The request in tokens by part. The tokens of the segments always add up to `total_tokens`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WindowBreakdown {
+    /// `scaled_to_measured`: the parts are estimated from characters and scaled so that they add up to
+    /// `measured_now`. `default_ratio`: estimated at the default characters per token and not checked
+    /// against a count. Empty in an answer from an older daemon.
+    pub basis: String,
+    pub chars_per_token: f64,
+    pub total_tokens: u64,
+    pub segments: Vec<WindowSegment>,
+}
+
+/// A step request as the window shows it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WindowRequest {
+    pub req_id: String,
+    pub step: u32,
+    pub epoch: u32,
+    pub n_messages: u32,
+    pub est_tokens: u64,
+    /// What the server counted for the request; 0 until its reply is in, or when it did not say.
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+    /// Bytes of the harness state sent after the stable messages (0 when none).
+    pub hud_bytes: u64,
+}
+
+/// The part of the request an item belongs to (see [`window_breakdown`]).
+fn window_part(item: &WindowItem) -> &'static str {
+    use loom_core::event::NoteKind;
+    if item.state == loom_core::weave::ItemState::Dropped {
+        return "";
+    }
+    match (item.kind.as_str(), item.note) {
+        ("session_start", _) => "system",
+        ("forked", _) | ("harness_note", Some(NoteKind::Assignment)) => "assignment",
+        ("harness_note", Some(NoteKind::Constraint | NoteKind::Approval)) => "rules",
+        ("harness_note", _) => "notes",
+        _ if item.state == loom_core::weave::ItemState::Stubbed => "stubs",
+        ("tool_result", _) if item.pinned => "pinned",
+        ("tool_result", _) => "tool_output",
+        ("child_settled", _) => "agent_reports",
+        ("user_message" | "model_response" | "stored_action", _) => "conversation",
+        _ => "other",
+    }
+}
+
+/// The request by part. `est_total` is the estimate for the whole request at the default estimator,
+/// `measured_now` the count the server gave (plus what was added since), when there is one.
+///
+/// Each part is estimated from its characters. With a count the parts are scaled by `measured_now`
+/// over the estimate and `framing` takes what is left, so the segments add up to the count exactly;
+/// without one they are the estimates and `framing` is what the estimate holds beyond them (never
+/// below 0). Parts with nothing in them are listed with 0.
+pub(crate) fn window_breakdown(
+    items: &[WindowItem],
+    tools: (usize, usize),
+    resume_chars: usize,
+    hud_bytes: usize,
+    est_total: u64,
+    measured_now: Option<u64>,
+    estimator: &TokenEstimator,
+) -> WindowBreakdown {
+    const PARTS: [&str; 12] = [
+        "system",
+        "tools",
+        "rules",
+        "assignment",
+        "resume",
+        "conversation",
+        "tool_output",
+        "pinned",
+        "agent_reports",
+        "notes",
+        "stubs",
+        "other",
+    ];
+    let mut chars = [0u64; PARTS.len()];
+    let mut counts = [0u64; PARTS.len()];
+    let slot = |key: &str| PARTS.iter().position(|k| *k == key);
+    for item in items {
+        if let Some(i) = slot(window_part(item)) {
+            if let (Some(c), Some(n)) = (chars.get_mut(i), counts.get_mut(i)) {
+                *c = c.saturating_add(item.chars as u64);
+                *n = n.saturating_add(1);
+            }
+        }
+    }
+    // The tool list and the resume block are not items of the window: they come with their own sizes.
+    if let (Some(c), Some(n)) =
+        (slot("tools").and_then(|i| chars.get_mut(i)), slot("tools").and_then(|i| counts.get_mut(i)))
+    {
+        (*c, *n) = (tools.0 as u64, tools.1 as u64);
+    }
+    if let Some(c) = slot("resume").and_then(|i| chars.get_mut(i)) {
+        *c = resume_chars as u64;
+    }
+    let chars_of = |key: &str| slot(key).and_then(|i| chars.get(i).copied()).unwrap_or(0);
+    let tokens_of = |c: u64| estimator.tokens(usize::try_from(c).unwrap_or(usize::MAX));
+    let raw: Vec<u64> = PARTS.iter().map(|k| tokens_of(chars_of(k))).collect();
+    let raw_hud = estimator.tokens(hud_bytes);
+    let raw_sum = raw.iter().sum::<u64>().saturating_add(raw_hud);
+    // The estimate for the whole, never smaller than its parts.
+    let den = est_total.max(raw_sum);
+    let (basis, total, factor) = match measured_now.filter(|m| *m > 0 && den > 0) {
+        Some(m) => ("scaled_to_measured", m, m as f64 / den as f64),
+        None => ("default_ratio", den, 1.0),
+    };
+    let scale = |t: u64| if basis == "default_ratio" { t } else { (t as f64 * factor).floor() as u64 };
+    let mut segments: Vec<WindowSegment> = Vec::with_capacity(PARTS.len() + 2);
+    for (i, key) in PARTS.iter().enumerate() {
+        let counted = matches!(
+            *key,
+            "tools"
+                | "rules"
+                | "assignment"
+                | "conversation"
+                | "tool_output"
+                | "pinned"
+                | "agent_reports"
+                | "notes"
+                | "stubs"
+                | "other"
+        );
+        segments.push(WindowSegment {
+            key: (*key).to_string(),
+            chars: chars.get(i).copied().unwrap_or(0),
+            tokens: scale(raw.get(i).copied().unwrap_or(0)),
+            count: counted.then(|| counts.get(i).copied().unwrap_or(0)),
+        });
+    }
+    let hud = WindowSegment { key: "hud".into(), chars: hud_bytes as u64, tokens: scale(raw_hud), count: None };
+    let used = segments.iter().map(|s| s.tokens).sum::<u64>().saturating_add(hud.tokens);
+    segments.push(WindowSegment { key: "framing".into(), chars: 0, tokens: total.saturating_sub(used), count: None });
+    segments.push(hud);
+    let ratio = estimator.ratio();
+    WindowBreakdown {
+        basis: basis.to_string(),
+        chars_per_token: if factor > 0.0 { ratio / factor } else { ratio },
+        total_tokens: segments.iter().map(|s| s.tokens).sum(),
+        segments,
+    }
+}
+
+/// The latest step request in `records`, with the server's count for its reply when that is recorded.
+fn last_step_request(records: &[loom_core::event::Record]) -> Option<WindowRequest> {
+    let (req, _) = records.iter().rev().find_map(|r| match &r.event {
+        Event::ModelRequest(m) if m.purpose == loom_core::event::Purpose::Step => Some((m, r.seq)),
+        _ => None,
+    })?;
+    let usage = records.iter().rev().find_map(|r| match &r.event {
+        Event::ModelResponse(m) if m.req_id == req.req_id => Some(m.usage),
+        _ => None,
+    });
+    Some(WindowRequest {
+        req_id: req.req_id.clone(),
+        step: req.step,
+        epoch: req.epoch,
+        n_messages: req.n_messages,
+        est_tokens: req.est_tokens,
+        prompt_tokens: usage.as_ref().map_or(0, |u| u.prompt_tokens),
+        cached_tokens: usage.as_ref().map_or(0, |u| u.cached_tokens),
+        hud_bytes: req.hud.as_ref().map_or(0, |h| h.bytes),
+    })
 }
 
 /// A mission's ledger as the operator sees it, with what the read could not show.
@@ -5690,25 +5896,47 @@ impl Runtime {
 
     pub fn window(&self, id: &SessionId) -> Result<WindowView, String> {
         self.inner.check_open()?;
-        let (context_window, status) = {
+        let (context_window, status, profile) = {
             let st = self.inner.st();
             let k = st.known.get(id).ok_or_else(|| no_session(id))?;
-            (k.meta.context_window, k.status.clone())
+            (k.meta.context_window, k.status.clone(), k.meta.profile.clone())
         };
         let records = read_records(&self.inner.paths.session_log(id)).map_err(|e| e.to_string())?.records;
         let w = weave(&records);
         let estimator = TokenEstimator::default();
-        let tools_chars: usize = w.tools.iter().map(|t| t.to_openai().to_string().chars().count()).sum();
+        let tools_chars = crate::session::tools_chars(&w.tools);
+        let last_request = last_step_request(&records);
+        let hud_bytes = last_request.as_ref().map_or(0, |r| r.hud_bytes);
         let est_tokens = estimator.tokens_for_messages(&w.messages) + estimator.tokens(tools_chars);
+        let est_total = est_tokens
+            + if hud_bytes > 0 { estimator.tokens(usize::try_from(hud_bytes).unwrap_or(usize::MAX)) + 4 } else { 0 };
+        let measured_now = crate::session::measured_now(&records, &w, &estimator);
+        let breakdown = window_breakdown(
+            &w.items,
+            (tools_chars, w.tools.len()),
+            w.resume_chars,
+            usize::try_from(hud_bytes).unwrap_or(usize::MAX),
+            est_total,
+            measured_now,
+            &estimator,
+        );
+        let max_output = self.inner.models().get(&profile).and_then(|p| p.client.profile().max_output_tokens);
+        let policy = &self.inner.config.context;
+        let (fold_at, fold_to) = crate::session::reweave_bounds(policy, context_window, max_output);
         Ok(WindowView {
             epoch: w.epoch,
             items: w.items,
             est_tokens,
-            target_tokens: self.inner.config.context.target_tokens,
-            floor_tokens: self.inner.config.context.floor_tokens,
+            target_tokens: policy.target_tokens,
+            floor_tokens: policy.floor_tokens,
             context_window,
             prompt_tokens: status.prompt_tokens,
             cached_tokens: status.cached_tokens,
+            breakdown,
+            measured_now,
+            last_request,
+            fold_at: Some(fold_at),
+            fold_to: Some(fold_to),
         })
     }
 
@@ -6371,6 +6599,122 @@ mod tests {
         }
     }
 
+    fn window_item(seq: u64, kind: &str, chars: usize) -> WindowItem {
+        WindowItem {
+            seq,
+            kind: kind.into(),
+            role: loom_core::message::Role::User,
+            chars,
+            state: loom_core::weave::ItemState::Live,
+            pinned: false,
+            call_id: None,
+            class: None,
+            preview: String::new(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn the_breakdown_adds_up_with_and_without_a_count() {
+        use loom_core::event::NoteKind;
+        use loom_core::weave::ItemState;
+        let note = |seq, kind: NoteKind, chars| {
+            let mut i = window_item(seq, "harness_note", chars);
+            i.note = Some(kind);
+            i
+        };
+        let mut pinned = window_item(8, "tool_result", 900);
+        pinned.pinned = true;
+        let mut stub = window_item(9, "tool_result", 100);
+        stub.state = ItemState::Stubbed;
+        let mut dropped = window_item(10, "model_response", 0);
+        dropped.state = ItemState::Dropped;
+        let items = vec![
+            window_item(0, "session_start", 3_000),
+            window_item(1, "user_message", 400),
+            note(2, NoteKind::Constraint, 200),
+            note(3, NoteKind::Approval, 100),
+            note(4, NoteKind::Assignment, 50),
+            note(5, NoteKind::Info, 80),
+            window_item(6, "model_response", 1_200),
+            window_item(7, "tool_result", 5_000),
+            pinned,
+            stub,
+            dropped,
+            window_item(11, "child_settled", 700),
+            window_item(12, "forked", 600),
+            window_item(13, "something_new", 10),
+        ];
+        let est = TokenEstimator::default();
+        let key = |b: &WindowBreakdown, k: &str| b.segments.iter().find(|s| s.key == k).cloned().unwrap();
+        // No count: the estimates, framing holds the rest of the estimate for the whole.
+        let est_total = 9_000;
+        let b = window_breakdown(&items, (6_000, 7), 500, 300, est_total, None, &est);
+        assert_eq!(b.basis, "default_ratio");
+        assert_eq!(b.segments.iter().map(|s| s.tokens).sum::<u64>(), b.total_tokens);
+        assert_eq!(b.total_tokens, est_total);
+        assert_eq!(b.chars_per_token, est.ratio());
+        assert_eq!((key(&b, "rules").chars, key(&b, "rules").count), (300, Some(2)));
+        assert_eq!((key(&b, "assignment").chars, key(&b, "assignment").count), (650, Some(2)));
+        assert_eq!((key(&b, "notes").chars, key(&b, "notes").count), (80, Some(1)));
+        assert_eq!((key(&b, "conversation").chars, key(&b, "conversation").count), (1_600, Some(2)));
+        assert_eq!((key(&b, "tool_output").chars, key(&b, "pinned").chars, key(&b, "stubs").chars), (5_000, 900, 100));
+        assert_eq!((key(&b, "agent_reports").chars, key(&b, "other").chars), (700, 10));
+        assert_eq!((key(&b, "tools").chars, key(&b, "tools").count, key(&b, "resume").chars), (6_000, Some(7), 500));
+        assert_eq!((key(&b, "hud").chars, key(&b, "system").chars), (300, 3_000));
+        // The dropped item counts for nothing.
+        assert_eq!(b.segments.iter().filter_map(|s| s.count).sum::<u64>(), 7 + 2 + 2 + 1 + 2 + 1 + 1 + 1 + 1 + 1);
+        // An estimate smaller than its parts is not a negative framing: the total grows to the parts.
+        let small = window_breakdown(&items, (6_000, 7), 500, 300, 10, None, &est);
+        assert_eq!(small.segments.iter().map(|s| s.tokens).sum::<u64>(), small.total_tokens);
+        assert_eq!(key(&small, "framing").tokens, 0);
+        // A count: the parts are scaled and add up to it exactly, framing takes the remainder.
+        for measured in [1_000, 3_333, 9_000, 9_001, 151_200] {
+            let b = window_breakdown(&items, (6_000, 7), 500, 300, est_total, Some(measured), &est);
+            assert_eq!(b.basis, "scaled_to_measured");
+            assert_eq!(b.total_tokens, measured, "{measured}");
+            assert_eq!(b.segments.iter().map(|s| s.tokens).sum::<u64>(), measured);
+        }
+        let b = window_breakdown(&items, (6_000, 7), 500, 300, est_total, Some(4_500), &est);
+        assert!((b.chars_per_token - est.ratio() * 2.0).abs() < 1e-9, "{}", b.chars_per_token);
+        // The same order every time; zero parts are listed.
+        let keys: Vec<&str> = b.segments.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "system",
+                "tools",
+                "rules",
+                "assignment",
+                "resume",
+                "conversation",
+                "tool_output",
+                "pinned",
+                "agent_reports",
+                "notes",
+                "stubs",
+                "other",
+                "framing",
+                "hud"
+            ]
+        );
+        let empty = window_breakdown(&[], (0, 0), 0, 0, 0, None, &est);
+        assert_eq!((empty.total_tokens, empty.segments.len()), (0, 14));
+    }
+
+    #[test]
+    fn an_older_window_answer_still_parses() {
+        let old = json!({"epoch": 1, "items": [], "est_tokens": 5, "target_tokens": 9, "floor_tokens": 4,
+            "context_window": null, "prompt_tokens": 0, "cached_tokens": 0});
+        let v: WindowView = serde_json::from_value(old).unwrap();
+        assert!(v.breakdown.segments.is_empty() && v.measured_now.is_none() && v.last_request.is_none());
+        assert!(v.fold_at.is_none() && v.fold_to.is_none());
+        let item = json!({"seq": 1, "kind": "tool_result", "role": "tool", "chars": 3, "state": "live",
+            "preview": "x"});
+        let i: WindowItem = serde_json::from_value(item).unwrap();
+        assert!(i.note.is_none());
+    }
+
     #[tokio::test]
     async fn create_and_message_runs_a_turn() {
         let e = env(Script::new(|_, _| finish("all good"))).await;
@@ -6406,6 +6750,12 @@ mod tests {
         assert!(page[0].seq > 1);
         let w = e.rt.window(&id).unwrap();
         assert!(w.est_tokens > 0 && !w.items.is_empty());
+        // The breakdown is the request by part, adds up, and has a system prompt and tools.
+        let by_key = |k: &str| w.breakdown.segments.iter().find(|s| s.key == k).cloned().unwrap();
+        assert_eq!(w.breakdown.segments.iter().map(|s| s.tokens).sum::<u64>(), w.breakdown.total_tokens);
+        assert!(by_key("system").tokens > 0 && by_key("tools").tokens > 0 && by_key("tools").count.unwrap() > 0);
+        assert!(w.last_request.as_ref().is_some_and(|r| r.step >= 1 && r.n_messages > 0));
+        assert!(w.fold_at.is_some_and(|at| at > 0) && w.fold_to.is_some_and(|to| to > 0));
         assert_eq!(e.rt.missions().len(), 1);
         e.rt.shutdown().await;
         assert_eq!(e.rt.send_message(&id, "x").await.unwrap_err(), "The harness is shutting down.");

@@ -990,6 +990,7 @@ mod tests {
             context_window: None,
             prompt_tokens: 5,
             cached_tokens: 4,
+            ..Default::default()
         };
         let ledger = loom_agent::runtime::LedgerView { markdown: "# ledger".into(), ..Default::default() };
         let blob = BlobRef { id: BlobId("ab".into()), bytes: 9, lines: 3 };

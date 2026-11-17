@@ -1477,7 +1477,7 @@ fn to_u32(n: usize) -> u32 {
 }
 
 /// Characters of the tool specs as they are sent.
-fn tools_chars(tools: &[ToolSpec]) -> usize {
+pub(crate) fn tools_chars(tools: &[ToolSpec]) -> usize {
     tools.iter().map(|t| t.to_openai().to_string().len()).sum()
 }
 
@@ -1490,7 +1490,7 @@ fn tools_chars(tools: &[ToolSpec]) -> usize {
 /// the trigger can drop to 1 and the floor to 0. A `max_output` at or above the window cannot be
 /// honoured and counts as none. From a window of 81_920 tokens up the quarter of the window cuts
 /// nothing.
-fn reweave_bounds(policy: &ReweavePolicy, window: Option<u64>, max_output: Option<u64>) -> (u64, u64) {
+pub(crate) fn reweave_bounds(policy: &ReweavePolicy, window: Option<u64>, max_output: Option<u64>) -> (u64, u64) {
     let (mut limit, mut floor) = (policy.target_tokens, policy.floor_tokens);
     if let Some(window) = window {
         let slack = 4_096_u64.min(window / 4);
@@ -1509,6 +1509,31 @@ fn reweave_bounds(policy: &ReweavePolicy, window: Option<u64>, max_output: Optio
         }
     }
     (limit, floor)
+}
+
+/// [`Session::measured_size`] for a counted request `m` (the latest step request of `w`'s epoch that
+/// the server answered with a prompt size) and an estimator.
+fn measured_size(m: Option<&Measured>, w: &Weave, estimator: &TokenEstimator) -> Option<u64> {
+    let m = m.filter(|m| m.epoch == w.epoch)?;
+    let n = usize::try_from(m.n_messages).unwrap_or(usize::MAX);
+    let merged = n.checked_sub(1).and_then(|i| w.messages.get(i)).map_or(0, |last| {
+        let item = |seq: Seq| w.items.binary_search_by_key(&seq, |i| i.seq).ok().and_then(|i| w.items.get(i));
+        let since = last.origin.iter().filter(|s| **s > m.seq);
+        since.fold(0usize, |sum, s| sum.saturating_add(item(*s).map_or(0, |i| i.chars)).saturating_add(2))
+    });
+    let added = estimator.tokens(merged);
+    let after = estimator.tokens_for_messages(w.messages.get(n..).unwrap_or_default());
+    Some(m.prompt_tokens.saturating_add(added).saturating_add(after))
+}
+
+/// The size of the request a session whose log is `records` would send now with `w` (its weave), in
+/// tokens, as `Session::measured_size` gives it; `None` before the first counted request of the epoch.
+pub(crate) fn measured_now(records: &[Record], w: &Weave, estimator: &TokenEstimator) -> Option<u64> {
+    let mut st = State::default();
+    for (idx, rec) in records.iter().enumerate() {
+        st.absorb(idx, rec);
+    }
+    measured_size(st.measured.as_ref(), w, estimator)
 }
 
 /// `x × num / den`: a token count carried from units where a request measures `den` into units where
@@ -3372,16 +3397,7 @@ Name them when you start a new mission instead."
     /// its last message since (with the blank line joining each), and the messages after it. `None`
     /// before the first such answer of the epoch.
     fn measured_size(&self, w: &Weave) -> Option<u64> {
-        let m = self.st.measured.as_ref().filter(|m| m.epoch == w.epoch)?;
-        let n = usize::try_from(m.n_messages).unwrap_or(usize::MAX);
-        let merged = n.checked_sub(1).and_then(|i| w.messages.get(i)).map_or(0, |last| {
-            let item = |seq: Seq| w.items.binary_search_by_key(&seq, |i| i.seq).ok().and_then(|i| w.items.get(i));
-            let since = last.origin.iter().filter(|s| **s > m.seq);
-            since.fold(0usize, |sum, s| sum.saturating_add(item(*s).map_or(0, |i| i.chars)).saturating_add(2))
-        });
-        let added = self.estimator.tokens(merged);
-        let after = self.estimator.tokens_for_messages(w.messages.get(n..).unwrap_or_default());
-        Some(m.prompt_tokens.saturating_add(added).saturating_add(after))
+        measured_size(self.st.measured.as_ref(), w, &self.estimator)
     }
 
     /// Fold older material out of view when the request has grown past the limit (or `forced`).

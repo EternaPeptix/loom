@@ -521,7 +521,8 @@ test("inbox from the api list and the page title", () => {
   assert.deepEqual(C.inboxCounts(inbox), { open: 1, blocking: 1 });
   assert.equal(C.pageTitle({ open: 0, blocking: 0 }), "loom");
   assert.equal(C.pageTitle({ open: 2, blocking: 0 }), "(2) loom");
-  assert.equal(C.pageTitle({ open: 2, blocking: 1 }), "(2) needs you · loom");
+  assert.equal(C.pageTitle({ open: 2, blocking: 1 }), "(1) needs you · loom");
+  assert.equal(C.pageTitle({ open: 5, blocking: 3 }), "(3) needs you · loom");
 });
 
 test("inbox list does not resurrect an item the operator already answered", () => {
@@ -743,6 +744,62 @@ test("composer keys", () => {
   assert.equal(C.composerAction({ key: "a", shiftKey: false, isComposing: false, text: "hi" }), "none");
 });
 
+test("composer keys on a coarse pointer: Enter adds a line, Ctrl or Cmd with Enter sends", () => {
+  const e = { key: "Enter", shiftKey: false, isComposing: false, text: "hi" };
+  assert.equal(C.composerAction({ ...e, coarse: true }), "none");
+  assert.equal(C.composerAction({ ...e, coarse: true, mod: true }), "send");
+  assert.equal(C.composerAction({ ...e, mod: true }), "send");
+  assert.equal(C.composerAction({ ...e, mod: true, shiftKey: true }), "send");
+  assert.equal(C.composerAction({ ...e, mod: true, text: " " }), "ignore");
+  assert.equal(C.composerAction({ ...e, mod: true, isComposing: true }), "none");
+  // a narrow window with a fine pointer keeps Enter-to-send: only `coarse` changes the key
+  assert.equal(C.composerAction({ ...e, coarse: false }), "send");
+});
+
+test("composerHelp names the keys only for a fine pointer and keeps its note whole", () => {
+  assert.deepEqual(C.composerHelp({ coarse: true }), { keys: "", note: "" });
+  assert.equal(C.composerHelp({}).keys, "Enter sends · Shift+Enter adds a line.");
+  const h = C.composerHelp({ coarse: true, paused: true, running: true, lead: true });
+  assert.equal(h.note, "A message does not answer the open question. It reaches the lead between steps.");
+  assert.equal(C.composerHelp({ running: true }).note, "It is read between steps.");
+});
+
+test("composerCaption: the phone composer's one line and its full name", () => {
+  const line = C.progressLine({ plan: [{ status: "done", text: "a" }, { status: "doing", text: "b" }, { status: "todo", text: "c" }], step: 0, budget: null });
+  const c = C.composerCaption({ line, stats: { context: "context 9% of 1M", cache: "cache 98%" } });
+  assert.equal(c.text, "Plan 1 of 3 · context 9% · cache 98%");
+  assert.equal(c.label, "Session details: Plan 1 of 3 done, context 9% of 1M, cache 98%");
+  assert.deepEqual(C.composerCaption({ line: null, stats: { context: "", cache: "" } }), { text: "Session details", label: "Session details" });
+  assert.equal(C.composerCaption({ line: null, stats: { context: "context 3% of 262k", cache: "" } }).text, "context 3%");
+});
+
+test("missionsLabel and jumpMode", () => {
+  assert.equal(C.missionsLabel(0), "Missions");
+  assert.equal(C.missionsLabel(1), "Missions, 1 needs you");
+  assert.equal(C.missionsLabel(3), "Missions, 3 need you");
+  assert.equal(C.jumpMode({ section: "overview", follow: false, needsOffscreen: true }), "hidden");
+  assert.equal(C.jumpMode({ section: "chat", follow: true, needsOffscreen: false }), "hidden");
+  assert.equal(C.jumpMode({ section: "chat", follow: false, needsOffscreen: false }), "latest");
+  assert.equal(C.jumpMode({ section: "chat", follow: false, needsOffscreen: true }), "needs");
+  assert.equal(C.jumpMode({ section: "chat", follow: true, needsOffscreen: true }), "needs");
+  // while the question is on screen the button is hidden, so it never covers an answer
+  assert.equal(C.jumpMode({ section: "chat", follow: false, needsOffscreen: false, cardShown: true }), "hidden");
+});
+
+test("groupLabel has a short form for a phone, with the same words in its long one", () => {
+  const g = { toolCount: 8, startTs: 0, endTs: 163000, running: false };
+  assert.equal(C.groupLabel(g, 0).short, "Worked 2m43s · 8 calls");
+  assert.equal(C.groupLabel({ ...g, toolCount: 1, running: true }, 5000).short, "Worked 5.0s · 1 call · running");
+  assert.match(C.groupLabel(g, 0).text, /^Worked for 2m43s · 8 tool calls$/);
+});
+
+test("a profile named for its model is said once", () => {
+  const same = C.identityChips(infoOf("s", { profile: "dsv41", model: "dsv41", context_window: 1048576 }), null);
+  assert.equal(same.model.text, "dsv41 · 1M");
+  const other = C.identityChips(infoOf("s", { profile: "qwen", model: "qwen4-max-preview", context_window: 262144 }), null);
+  assert.equal(other.model.text, "qwen · qwen4-max-preview · 262k");
+});
+
 // ---- blob viewer ----
 
 test("blob viewer pages in order until the end", () => {
@@ -819,17 +876,17 @@ test("a copied reference names the line gone to, else the cited lines, else what
 // ---- context, ledger, network ----
 
 test("context meter has marks at floor and target", () => {
-  const m = C.windowMeter({ est_tokens: 150_000, context_window: 1_000_000, floor_tokens: 180_000, target_tokens: 400_000 });
+  const m = C.meterModel({ inView: 150_000, windowSize: 1_000_000, floor: 180_000, target: 400_000 });
   assert.equal(m.inViewPct, 15);
   assert.equal(m.floorPct, 18);
   assert.equal(m.targetPct, 40);
   assert.equal(m.over, false);
   assert.equal(m.label, "150k of 1M");
-  const unknown = C.windowMeter({ est_tokens: 500_000, context_window: null, floor_tokens: 180_000, target_tokens: 400_000 });
+  const unknown = C.meterModel({ inView: 500_000, windowSize: 0, floor: 180_000, target: 400_000 });
   assert.equal(unknown.known, false);
   assert.equal(unknown.over, true);
   assert.ok(unknown.inViewPct <= 100 && unknown.targetPct < 100);
-  assert.equal(C.windowMeter({ est_tokens: 5e9, context_window: 1000, floor_tokens: 0, target_tokens: 0 }).inViewPct, 100);
+  assert.equal(C.meterModel({ inView: 5e9, windowSize: 1000, floor: 0, target: 0 }).inViewPct, 100);
   const s = C.statusMeter(info("a", { context_window: 1000, status: st({ prompt_tokens: 250 }) }));
   assert.equal(s.inViewPct, 25);
 });
@@ -1169,6 +1226,7 @@ async function loadSignedOutPage(t, hash) {
     window: { addEventListener: (type, fn) => type === "hashchange" && page.hashchange.push(fn) },
     location: { hash, pathname: "/", search: "", reload: () => page.reloads++ },
     history: { replaceState: (_state, _title, url) => page.replaced.push(url) },
+    matchMedia: () => ({ matches: false, addEventListener() {} }),
     sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     fetch: async (url, init) => {
       page.requests.push({ url, ...init });
@@ -1859,7 +1917,7 @@ test("identityChips: model, role, id and run", () => {
   assert.match(chips.model.tip, /http:\/\/x\.test\/v1/);
   assert.match(chips.model.tip, /reachable/);
   assert.equal(chips.role.text, "core / lead");
-  assert.equal(chips.id.text, "session-ab");
+  assert.equal(chips.id.text, "session-ab…");
   assert.equal(chips.id.full, "session-abcdef-0123");
   assert.equal(chips.run.text, "Running · step 4 · 6s");
 });
@@ -1869,7 +1927,7 @@ test("identityChips: an unreachable profile warns, an unknown one is not a warni
   const down = C.identityChips(info, { models: [{ profile: "necromicon", base_url: "b", model: "necromicon", reachable: false, detail: "connection refused", context_window: 0 }] });
   assert.deepEqual(down.model.warn, { icon: "alert", word: "unreachable" });
   assert.equal(down.model.reachable, false);
-  assert.equal(down.model.text, "necromicon · necromicon");
+  assert.equal(down.model.text, "necromicon");
   assert.match(down.model.tip, /unreachable: connection refused/);
   // other profiles' health does not matter; no status at all is not a warning
   assert.equal(C.identityChips(info, { models: [{ profile: "other", reachable: false }] }).model.warn, null);
@@ -1877,7 +1935,7 @@ test("identityChips: an unreachable profile warns, an unknown one is not a warni
   assert.equal(none.model.warn, null);
   assert.equal(none.model.reachable, null);
   // the window falls back to the daemon's figure
-  assert.equal(C.identityChips(info, { models: [{ profile: "necromicon", reachable: true, context_window: 262144 }] }).model.text, "necromicon · necromicon · 262k");
+  assert.equal(C.identityChips(info, { models: [{ profile: "necromicon", reachable: true, context_window: 262144 }] }).model.text, "necromicon · 262k");
   // no profile on the info: the record store's model is used
   const fromStore = C.identityChips({ id: "s", role: "lead" }, null, { current: { profile: "qwen", model: "q", context_window: 8000 } });
   assert.equal(fromStore.model.text, "qwen · q · 8k");
@@ -1914,7 +1972,8 @@ test("breadcrumbs: a root is its own title; an agent has linked ancestors; a lon
 });
 
 test("shortId is the first ten characters", () => {
-  assert.equal(C.shortId("0123456789abcdef"), "0123456789");
+  assert.equal(C.shortId("0123456789abcdef"), "0123456789…");
+  assert.equal(C.shortId("0123456789"), "0123456789");
   assert.equal(C.shortId("s-1"), "s-1");
   assert.equal(C.shortId(null), "");
 });
@@ -3075,4 +3134,277 @@ test("the Files tab reads a folder once: the root's empty path counts as being r
 test("Open file's accessible name begins with its visible label", () => {
   assert.ok(C.openFileLabel("notes/a.txt").startsWith("Open file"));
   assert.equal(C.openFileLabel(""), "Open file the workspace folder in the Files tab");
+});
+
+// ---- copying
+
+test("copy texts: a reply's raw text, a message, reasoning, and a code block without its fence", () => {
+  assert.equal(C.replyCopyText({ kind: "response", text: "**hi**\n```js\nx()\n```" }), "**hi**\n```js\nx()\n```");
+  assert.equal(C.replyCopyText({ kind: "response", text: "" }), null);
+  assert.equal(C.replyCopyText({ kind: "user", text: "x" }), null);
+  assert.equal(C.messageCopyText({ kind: "user", text: "  keep my spaces\n" }), "  keep my spaces\n");
+  assert.equal(C.messageCopyText({ kind: "response", text: "x" }), null);
+  assert.equal(C.reasoningCopyText({ kind: "response", reasoning: "think" }), "think");
+  assert.equal(C.reasoningCopyText({ kind: "response", reasoning: "" }), null);
+  const tree = C.proseTree("before\n```rust\nfn a() {}\n\nfn b() {}\n```\nafter");
+  const pre = tree.find((b) => b.type === "pre");
+  assert.equal(C.codeCopyText(pre), "fn a() {}\n\nfn b() {}");
+  assert.equal(C.codeCopyText(tree[0]), null);
+  assert.equal(C.codeCopyText(null), null);
+});
+
+test("toolCommandCopy: the bash command, a file tool's path, else the arguments as pretty JSON", () => {
+  assert.deepEqual(C.toolCommandCopy({ name: "bash", args: { command: "ls -la | wc -l" } }), { text: "ls -la | wc -l", what: "Command" });
+  assert.deepEqual(C.toolCommandCopy({ name: "read", args: { path: "src/a.rs", start: 1 } }), { text: "src/a.rs", what: "Path" });
+  assert.deepEqual(C.toolCommandCopy({ name: "edit", args: { file_path: "/w/x" } }), { text: "/w/x", what: "Path" });
+  assert.deepEqual(C.toolCommandCopy({ name: "grep", args: { pattern: "a", path: "." } }), { text: '{\n  "pattern": "a",\n  "path": "."\n}', what: "Arguments" });
+  assert.deepEqual(C.toolCommandCopy({ name: "weird", args: "raw text" }), { text: "raw text", what: "Arguments" });
+  assert.deepEqual(C.toolCommandCopy({ name: "bash", args: { cmd: 1 } }), { text: '{\n  "cmd": 1\n}', what: "Arguments" });
+  assert.equal(C.toolCommandCopy({ name: "bash", args: undefined }), null);
+  assert.equal(C.toolCommandCopy({ name: "bash", args: null }), null);
+  assert.equal(C.toolCommandCopy(null), null);
+});
+
+test("toolOutputCopy is all the recorded output, and null when there is none", () => {
+  assert.equal(C.toolOutputCopy({ result: { text: "a\nb\nc" } }), "a\nb\nc");
+  assert.equal(C.toolOutputCopy({ result: { text: "" } }), null);
+  assert.equal(C.toolOutputCopy({ result: null }), null);
+});
+
+test("fullOutputPlan: only a cut output with a stored copy, and the cap is judged from the recorded size", () => {
+  const id = "cd".repeat(32);
+  assert.equal(C.fullOutputPlan({ result: { text: "x", cut: false } }), null);
+  assert.equal(C.fullOutputPlan({ result: { text: "x", cut: true } }), null);
+  assert.equal(C.fullOutputPlan({ result: null }), null);
+  assert.deepEqual(C.fullOutputPlan({ result: { text: "x", cut: true, output: { id, bytes: 128000, lines: 5000 } } }), { blob: id, bytes: 128000, tooBig: false });
+  assert.equal(C.fullOutputPlan({ result: { text: "x", cut: true, output: { id, bytes: C.COPY_FULL_CAP, lines: 5 } } }).tooBig, false);
+  assert.equal(C.fullOutputPlan({ result: { text: "x", cut: true, output: { id, bytes: C.COPY_FULL_CAP + 1, lines: 5 } } }).tooBig, true);
+  // a view of another blob: its size is not the output's, so it is found out when it is read
+  assert.deepEqual(C.fullOutputPlan({ result: { text: "x", cut: true, output: { id: "ef".repeat(32), bytes: 9, lines: 1 }, meta: { of_blob: id } } }), { blob: id, bytes: null, tooBig: false });
+  assert.equal(C.rawUrl("a b"), "/api/blobs/a%20b/raw");
+  assert.match(C.COPY_FULL_BIG, /2 MiB/);
+});
+
+test("viewerLinesCopy: the loaded lines, or the whole lines the selection touches, without numbers", () => {
+  const v = { first: 10, lines: ["ten", "eleven", "twelve", "thirteen"] };
+  assert.deepEqual(C.viewerLinesCopy(v, null), { text: "ten\neleven\ntwelve\nthirteen", from: 10, to: 13, count: 4, selected: false });
+  assert.deepEqual(C.viewerLinesCopy(v, { from: 11, to: 12 }), { text: "eleven\ntwelve", from: 11, to: 12, count: 2, selected: true });
+  assert.deepEqual(C.viewerLinesCopy(v, { from: 12, to: 11 }), { text: "eleven\ntwelve", from: 11, to: 12, count: 2, selected: true });
+  assert.deepEqual(C.viewerLinesCopy(v, { from: 12, to: 99 }), { text: "twelve\nthirteen", from: 12, to: 13, count: 2, selected: true });
+  assert.equal(C.viewerLinesCopy(v, { from: 40, to: 50 }).selected, false);
+  assert.equal(C.viewerLinesCopy({ first: 1, lines: [] }, null), null);
+  assert.equal(C.viewerLinesCopy(null, null), null);
+  assert.equal(C.viewerLinesWords(C.viewerLinesCopy(v, { from: 11, to: 12 })), "Copied the selected lines: lines 11–12.");
+  assert.equal(C.viewerLinesWords(C.viewerLinesCopy(v, null)), "Copied the loaded lines: lines 10–13.");
+});
+
+test("evidence and inbox copy texts", () => {
+  assert.equal(C.quoteCopyText({ quote: "full: None," }), "full: None,");
+  assert.equal(C.quoteCopyText({ quote: "" }), null);
+  assert.equal(C.inboxCopyText({ text: "Which branch?" }), "Which branch?");
+  assert.equal(C.inboxCopyText({}), null);
+});
+
+test("copy words say what happened and how to finish by hand", () => {
+  assert.equal(C.copiedChars(1), "Copied 1 character");
+  assert.equal(C.copiedChars(1204), "Copied 1,204 characters");
+  assert.equal(C.copyWords("Reply", "clipboard"), "Reply copied");
+  assert.equal(C.copyWords("Reply", "command"), "Reply copied");
+  assert.equal(C.copyWords("Session id", "selected"), "Session id selected; press Ctrl+C to copy it");
+  assert.equal(C.copyWords("Session id", "selected", true), "Session id selected; press Cmd+C to copy it");
+  assert.equal(C.copyWords("Reply", "none"), "Could not copy reply; this browser did not allow it");
+});
+
+test("copyOnSelectDecision copies only an enabled, new, non-empty selection inside the record, never while typing", () => {
+  const base = { enabled: true, text: "abc", scoped: true, typing: false, same: false };
+  assert.equal(C.copyOnSelectDecision(base), "copy");
+  assert.equal(C.copyOnSelectDecision({ ...base, enabled: false }), "off");
+  assert.equal(C.copyOnSelectDecision({ ...base, typing: true }), "typing");
+  assert.equal(C.copyOnSelectDecision({ ...base, text: "" }), "empty");
+  assert.equal(C.copyOnSelectDecision({ ...base, text: " \n " }), "empty");
+  assert.equal(C.copyOnSelectDecision({ ...base, text: null }), "empty");
+  assert.equal(C.copyOnSelectDecision({ ...base, scoped: false }), "outside");
+  assert.equal(C.copyOnSelectDecision({ ...base, same: true }), "same");
+  // off wins over everything, so nothing is read or said while the preference is off
+  assert.equal(C.copyOnSelectDecision({ enabled: false, text: "", scoped: false, typing: true, same: true }), "off");
+  // typing wins over an empty or foreign selection: the composer is never touched
+  assert.equal(C.copyOnSelectDecision({ ...base, typing: true, scoped: false, text: "" }), "typing");
+});
+
+test("app.js copies only from a user gesture and only through copyText", () => {
+  const app = stripComments(readFileSync(join(here, "app.js"), "utf8"));
+  assert.equal([...app.matchAll(/navigator\.clipboard/g)].length, 1, "one clipboard call, inside copyText");
+  assert.equal([...app.matchAll(/execCommand\("copy"\)/g)].length, 1, "one command fallback, inside copyText");
+  assert.ok(!/execCommand\("(cut|paste)"\)/.test(app));
+  assert.ok(app.includes('"loom_copy_on_select"'));
+});
+
+test("viewerSelectionEdges: edge rows with none of their text selected are left out", () => {
+  assert.deepEqual(C.viewerSelectionEdges({ from: 6, to: 7, startAt: "lead", endAt: "lead" }), { from: 6, to: 6 }); // triple-click
+  assert.deepEqual(C.viewerSelectionEdges({ from: 5, to: 7, startAt: "tail", endAt: "text" }), { from: 6, to: 7 }); // drag from the blank space
+  assert.deepEqual(C.viewerSelectionEdges({ from: 5, to: 7, startAt: "text", endAt: "tail" }), { from: 5, to: 7 });
+  assert.deepEqual(C.viewerSelectionEdges({ from: 5, to: 6, startAt: "tail", endAt: "lead" }), { from: 6, to: 6 });
+  assert.deepEqual(C.viewerSelectionEdges({ from: 5, to: 5, startAt: "tail", endAt: "lead" }), { from: 5, to: 5 });
+});
+
+// ---- the context card ----
+
+const CARD_SEGMENTS = [
+  { key: "system", chars: 18234, tokens: 4914 },
+  { key: "tools", chars: 61230, tokens: 16503, count: 42 },
+  { key: "rules", chars: 640, tokens: 172, count: 2 },
+  { key: "assignment", chars: 0, tokens: 0, count: 0 },
+  { key: "resume", chars: 5200, tokens: 1401 },
+  { key: "conversation", chars: 172850, tokens: 46590, count: 96 },
+  { key: "tool_output", chars: 229560, tokens: 61877, count: 128 },
+  { key: "pinned", chars: 11575, tokens: 3120, count: 3 },
+  { key: "agent_reports", chars: 16361, tokens: 4410, count: 2 },
+  { key: "notes", chars: 3636, tokens: 980, count: 6 },
+  { key: "stubs", chars: 36506, tokens: 9840, count: 57 },
+  { key: "other", chars: 0, tokens: 0, count: 0 },
+  { key: "framing", chars: 0, tokens: 770 },
+  { key: "hud", chars: 2310, tokens: 623 },
+];
+function cardWindow(over = {}) {
+  return {
+    epoch: 3, items: [], est_tokens: 152340, target_tokens: 400000, floor_tokens: 180000, context_window: 262144,
+    prompt_tokens: 148812, cached_tokens: 131072,
+    breakdown: { basis: "scaled_to_measured", chars_per_token: 3.71, total_tokens: 151200, segments: CARD_SEGMENTS },
+    measured_now: 151200,
+    last_request: { req_id: "r-41", step: 41, epoch: 3, n_messages: 120, est_tokens: 150020, prompt_tokens: 148812, cached_tokens: 131072, hud_bytes: 2310 },
+    fold_at: 209712, fold_to: 131072,
+    ...over,
+  };
+}
+
+test("segmentLayout: widths add up to the tokens, a small part is never inflated past what it takes from the large ones", () => {
+  const sum = (l) => l.reduce((n, s) => n + s.pct, 0);
+  const plain = C.segmentLayout([{ key: "a", tokens: 5000 }, { key: "b", tokens: 100 }, { key: "z", tokens: 0 }], 10000);
+  assert.deepEqual(plain.map((s) => s.key), ["a", "b"]);
+  assert.ok(Math.abs(sum(plain) - 51) < 0.01, String(sum(plain)));
+  assert.ok(plain[1].pct >= 0.8 && plain[1].pct < 1.01, "widened to the minimum, and no more");
+  // a card-like fill: every width is at least the minimum, the sum is the fill
+  const card = C.segmentLayout(CARD_SEGMENTS.map((s) => ({ key: s.key, tokens: s.tokens })), 262144);
+  const fill = (100 * 151200) / 262144;
+  assert.ok(Math.abs(sum(card) - fill) < 0.01, `${sum(card)} vs ${fill}`);
+  assert.ok(card.every((s) => s.pct >= 0.8 - 1e-9));
+  // too small a fill to hold every minimum: the narrow parts become one sliver of their true width
+  const tiny = C.segmentLayout([{ key: "a", tokens: 30 }, { key: "b", tokens: 20 }, { key: "c", tokens: 10 }], 1000000);
+  assert.equal(tiny.length, 1);
+  assert.deepEqual(tiny[0].merged, ["a", "b", "c"]);
+  assert.ok(Math.abs(tiny[0].pct - 0.006) < 1e-6);
+  // one large part and a few small, with room: nothing merges
+  const some = C.segmentLayout([{ key: "big", tokens: 600000 }, { key: "s1", tokens: 1000 }, { key: "s2", tokens: 1200 }], 1000000);
+  assert.deepEqual(some.map((s) => s.key), ["big", "s1", "s2"]);
+  assert.ok(Math.abs(sum(some) - 60.22) < 0.01);
+  assert.deepEqual(C.segmentLayout([], 100), []);
+});
+
+test("contextCardModel: the hero line, with ~ on estimates and the window in words", () => {
+  const m = C.contextCardModel(cardWindow());
+  assert.equal(m.parts, true);
+  assert.equal(m.hero.figure, "~151k");
+  assert.equal(m.hero.denominator, "of 262k tokens");
+  assert.equal(m.hero.exact, "262,144 tokens");
+  assert.equal(m.hero.percent, "58%");
+  assert.equal(m.sub, "Last request 149k, counted by the server · about 2.4k added since");
+  assert.equal(m.basis, "Parts estimated from characters and scaled to the total (3.71 characters a token).");
+  // a figure that is exactly the server's count has no ~
+  const exact = C.contextCardModel(cardWindow({ measured_now: 148812, breakdown: { basis: "scaled_to_measured", chars_per_token: 3.7, total_tokens: 148812, segments: CARD_SEGMENTS.map((s) => ({ ...s, tokens: Math.floor(s.tokens * 0.984) })) } }));
+  assert.equal(exact.hero.approx, false);
+  assert.equal(exact.sub, "Last request 149k, counted by the server");
+  assert.equal(exact.hero.figure, "149k");
+  // nothing counted yet: estimated, no server sentence, the default-ratio note
+  const fresh = C.contextCardModel(cardWindow({ measured_now: null, last_request: null, prompt_tokens: 0, cached_tokens: 0, breakdown: { basis: "default_ratio", chars_per_token: 3.3, total_tokens: 152340, segments: CARD_SEGMENTS } }));
+  assert.equal(fresh.hero.figure, "~152k");
+  assert.equal(fresh.sub, "Estimated from characters; no request in this context epoch has been counted yet.");
+  assert.equal(fresh.basis, "Parts estimated from characters at 3.3 a token; not yet checked against a server count.");
+  assert.equal(fresh.cache, null);
+  // 1,048,576 is "1.05M" tokens, never a bare "1M"
+  assert.equal(C.contextCardModel(cardWindow({ context_window: 1048576 })).hero.denominator, "of 1.05M tokens");
+  // a tiny share reads "<1%"
+  assert.equal(C.percentWords(0.3), "<1%");
+  assert.equal(C.percentWords(0), "0%");
+  assert.equal(C.percentWords(57.6), "58%");
+});
+
+test("contextCardModel: rows and bar share their order, zero parts are dropped except Messages and replies, and the parts add up", () => {
+  const m = C.contextCardModel(cardWindow());
+  const keys = m.rows.map((r) => r.key);
+  assert.deepEqual(keys, ["system", "tools", "rules", "resume", "notes", "conversation", "tool_output", "pinned", "agent_reports", "stubs", "framing", "hud"]);
+  assert.deepEqual(m.bar.segments.map((s) => s.key), keys);
+  assert.equal(m.rows.find((r) => r.key === "tools").label, "Tool definitions · 42");
+  assert.equal(m.rows.find((r) => r.key === "system").value, "~4.9k");
+  assert.equal(m.rows.reduce((n, r) => n + r.tokens, 0), 151200);
+  // an empty conversation still has its row; other zero parts do not
+  const quiet = C.contextCardModel(cardWindow({ breakdown: { basis: "default_ratio", chars_per_token: 3.3, total_tokens: 5000, segments: [{ key: "system", chars: 1, tokens: 5000 }, { key: "conversation", chars: 0, tokens: 0, count: 0 }, { key: "tools", chars: 0, tokens: 0, count: 0 }] } }));
+  assert.deepEqual(quiet.rows.map((r) => r.key), ["system", "conversation"]);
+  // every row says which pattern and family it draws with, so the swatch is the segment
+  for (const r of m.rows) assert.ok(r.family && r.pattern && r.group, r.key);
+  // the legend colours are not the state colours: no row is in a state family
+  assert.deepEqual([...new Set(m.rows.map((r) => r.family))].sort(), ["carry", "conv", "fold", "setup"]);
+  assert.match(m.bar.label, /^Context use 58% of 262,144 tokens: System prompt 2%, Tool definitions 6%/);
+  assert.match(m.bar.label, /, free 42%$/);
+  // the bar's fill is what the tokens say
+  const fill = m.bar.segments.reduce((n, s) => n + s.pct, 0);
+  assert.ok(Math.abs(fill - (100 * 151200) / 262144) < 0.01);
+  assert.ok(Math.abs(m.bar.free.pct - (100 - fill)) < 0.01);
+  // a segment 18% wide or more also carries its short label
+  assert.deepEqual(m.bar.segments.filter((s) => s.labelled).map((s) => s.key), ["tool_output"]);
+  const wide = C.contextCardModel(cardWindow({ context_window: 160000 }));
+  assert.ok(wide.bar.segments.find((s) => s.key === "tool_output").labelled);
+});
+
+test("contextCardModel: fold marks use the effective bounds, with their own shapes in words", () => {
+  const m = C.contextCardModel(cardWindow());
+  assert.equal(m.fold.text, "▼ folds at 210k · ▽ down to 131k");
+  assert.equal(m.fold.past, null);
+  const over = C.contextCardModel(cardWindow({ fold_at: 120000, fold_to: 60000 }));
+  assert.equal(over.fold.past.text, "Past the fold mark: older output folds at the next step.");
+  // the raw 400k target lies beyond a 262k window: nothing is drawn rather than a mark off the bar
+  assert.equal(C.contextCardModel(cardWindow({ fold_at: 400000, fold_to: 180000 })).fold, null);
+  assert.equal(C.contextCardModel(cardWindow({ fold_at: undefined, fold_to: undefined })).fold, null);
+});
+
+test("contextCardModel: the cache split, an unknown window and an answer from an older daemon", () => {
+  const m = C.contextCardModel(cardWindow());
+  assert.equal(m.cache.text, "Last request: 131k from the cache · 17.7k read anew");
+  const none = C.contextCardModel(cardWindow({ last_request: { ...cardWindow().last_request, cached_tokens: 0 } }));
+  assert.equal(none.cache.text, "No cached tokens reported. The server may not report caching.");
+  const nowin = C.contextCardModel(cardWindow({ context_window: null }));
+  assert.equal(nowin.hero.denominator, "tokens · limit unknown");
+  assert.equal(nowin.hero.percent, "");
+  assert.equal(nowin.bar.known, false);
+  assert.equal(nowin.bar.scaleNote, "scale: fold mark + 25%");
+  assert.equal(nowin.bar.free, null);
+  const old = C.contextCardModel({ epoch: 1, items: [], est_tokens: 86000, target_tokens: 400000, floor_tokens: 180000, context_window: 1000000, prompt_tokens: 86000, cached_tokens: 84000 });
+  assert.equal(old.parts, false);
+  assert.equal(old.hero.figure, "~86k");
+  assert.deepEqual(old.rows, []);
+  assert.equal(old.basis, null);
+});
+
+test("contextCardModel: row notes carry the facts the parts' words depend on", () => {
+  const m = C.contextCardModel(cardWindow());
+  const notes = Object.fromEntries(m.notes.map((n) => [n.label, n.note]));
+  assert.equal(notes["Rules and approvals"], "Yours, verbatim; never folded.");
+  assert.match(notes["Re-weave brief"], /may include leads written by the model, not verified/);
+  assert.match(notes["Harness state (as last sent)"], /never cached or folded/);
+  assert.match(notes["Folded-out stubs"], /full output stays in the record/);
+});
+
+test("stopQuestion: only a root says it can be resumed", () => {
+  const root = C.stopQuestion({ id: "s-1", title: "Net" });
+  assert.match(root, /It can be resumed\./);
+  const agent = C.stopQuestion({ id: "s-2", title: "Worker", parent: "s-1" });
+  assert.doesNotMatch(agent, /can be resumed/);
+  assert.match(agent, /cannot be resumed/);
+});
+
+test("contextCardModel: a fold mark inside the scale is drawn even when it folds down to nothing", () => {
+  const m = C.contextCardModel(cardWindow({ context_window: 16000, fold_at: 1, fold_to: 0 }));
+  assert.ok(m.fold);
+  assert.equal(m.fold.toPct, null);
+  assert.match(m.fold.text, /folds at/);
+  assert.doesNotMatch(m.fold.text, /down to/);
 });

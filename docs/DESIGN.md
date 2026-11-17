@@ -1519,7 +1519,7 @@ POST /api/sessions/{id}/stop                  → 202 {}
 POST /api/sessions/{id}/resume                → 202 {}
 POST /api/sessions/{id}/reweave               → 202 {}
 POST /api/sessions/{id}/archive               {archived} → 200 {}
-GET  /api/sessions/{id}/window                → WindowView
+GET  /api/sessions/{id}/window                → WindowView (+ breakdown, measured_now, last_request, fold_at, fold_to)
 GET  /api/sessions/{id}/files?path=           → FilesView {root, path, entries: [{name, kind: dir|file|link|other, size, mtime_ms,
                                               hidden, note?, error?}], more}   (read-only, inside the session's workspace)
 GET  /api/sessions/{id}/files/lines?path=&start=&count=

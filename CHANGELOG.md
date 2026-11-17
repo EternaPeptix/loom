@@ -200,6 +200,57 @@
   the whole security state; `entry` and `normalized` are unchanged. The `state` key is gone from its
   result; read the state with `security_query`.
 
+### Daemon: what a request is made of (`GET /api/sessions/{id}/window`)
+
+- Additive fields on `WindowView` (old keys unchanged; a reader of an older answer gets defaults): `breakdown`
+  (`basis`, `chars_per_token`, `total_tokens` and 14 `segments`: system, tools, rules, assignment, resume,
+  conversation, tool_output, pinned, agent_reports, notes, stubs, other, framing, hud, each with `chars`, `tokens`
+  and, for the parts that hold several things, `count`; the tokens always add up to `total_tokens`), `measured_now`
+  (the server's count for the latest answered step request of the epoch plus an estimate of what was added since;
+  `null` before the first), `last_request` (the latest step request with the server's count for its reply, 0 while
+  missing) and `fold_at` / `fold_to` (`reweave_bounds` of the configured target and floor for the session's window
+  and profile). `items[].note` names the kind of a `harness_note` item; `Weave::resume_chars` counts the resume block.
+- `est_tokens` now counts the tool list in bytes, as `session` does (it counted characters). No stored shape changed.
+
+### Web UI: phone pass 1 and the context card
+
+- **Phones (699px and under).** The session scrolls as one: `#view-session` is the only vertical scroller, the tabs stick under the
+  bar and the composer to the bottom, a tool output has no scroll box of its own (visible chat at 375x812 was 191px, now about
+  590px). A session with its own open question lands on that card, and the Jump button never covers it (an amber "Approval
+  waiting · Show" while it is off screen). The bar is one row of about 52px: Missions (with the count that need you), the
+  title over the model and run state, and Find; its button opens the new **Session details sheet** (run with a confirmed
+  Stop, context, model, view, session actions). Find is a two-row sticky bar of about 100px. The composer is a grid of about 110-130px
+  with a one-line caption ("Plan 1 of 3 · context 9% · cache 98% ›") that opens the sheet; on the other tabs it is one "Message
+  the lead…" button. With a coarse pointer Enter adds a line and Ctrl/Cmd+Enter sends; a narrow window with a mouse still sends
+  on Enter. Work-group headers have a short form, text is 16px and targets 44px for touch, and the viewport allows safe areas.
+- **Context card** (the inspector's Context tab and the sheet): the size with its window and share, one bar whose segments are
+  also the legend (colour family plus a pattern, never colour alone), rows by group, the fold marks from the daemon's effective
+  `fold_at` / `fold_to` in words and shapes (no amber), the cached/read-anew split, and notes. Estimates carry "~". Needs the
+  additive `/window` fields below; an older daemon's answer shows the hero only.
+- Riders: a profile named for its model is said once; the session id chip ends in an ellipsis when cut; the page title counts what
+  needs you; the Models-panel row class no longer collides with the chat's chip row; the inspector tabs scroll instead of wrapping;
+  the notification line says why they are off; `#f-workspace` turns autocorrect off. UI only apart from the `/window` fields.
+
+### Web UI: copy buttons and opt-in copy on select
+
+- Copy buttons: Copy reply (the exact raw text), Copy code (a fenced block without its fence), Copy message
+  (operator and agent), Copy reasoning, and on an open tool row Copy command / Copy path / Copy arguments (named for what it copies: the bash command, a file tool's path,
+  else the arguments as JSON), Copy output and Copy full output… (the whole stored output through
+  `/api/blobs/{handle}/raw`, refused above 2 MiB with a pointer to the viewer). The stored-output and file viewers
+  gain Copy lines (the selected lines, else every loaded line, without numbers) beside Copy reference / Copy path;
+  inbox cards gain Copy text and evidence cards Copy quote. Icon buttons have names and tooltips, show on hover and
+  focus and always on touch, and are 44 px on coarse pointers. Success shows "Copied" and is announced politely.
+- One `copyText` helper does every copy: the clipboard API, else the selected text and the copy command, else the
+  text left selected for Ctrl+C; the session-id chip uses it too. What each button copies is decided in `core.js`
+  (tested). An opt-in **Copy on select** checkbox (inspector Session tab, off by default, `localStorage` key
+  `loom_copy_on_select`) copies a selection wholly inside the chat or the viewer on mouseup/keyup, never while typing
+  in a field, never twice for the same selection, and says "Copied N characters".
+- loom-desk needs no change: its `WKWebView` offers `navigator.clipboard.writeText` and the copy command (checked
+  with a stand-alone view configured like `WebPane`, by injected script, which WebKit counts as a user gesture, so a real
+  click is not covered; Copy full output… therefore starts its write inside the click with the fetch as a promise, and keeps
+  the text for a "Copy now" click if the browser still refuses). The fixture serves the raw blob route. UI only; no stored shape
+  changed. `docs/UI.md` has a "Copying" section.
+
 ### Workspace folders: create a missing workspace, pick a folder, browse the workspace
 
 - `POST /api/sessions` accepts `create_workspace` (default false). When the workspace does not exist and the flag is

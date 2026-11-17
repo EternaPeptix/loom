@@ -1742,6 +1742,12 @@ mod tests {
         let (s, w) = e.get(&format!("/api/sessions/{id}/window")).await;
         assert_eq!(s, 200);
         assert!(w["est_tokens"].as_u64().unwrap() > 0 && !w["items"].as_array().unwrap().is_empty());
+        // The additive fields: the parts of the request add up to its total, the fold bounds are given.
+        let parts = w["breakdown"]["segments"].as_array().unwrap();
+        assert_eq!(parts.len(), 14);
+        assert_eq!(parts.iter().map(|p| p["tokens"].as_u64().unwrap()).sum::<u64>(), w["breakdown"]["total_tokens"]);
+        assert!(w["fold_at"].as_u64().unwrap() > w["fold_to"].as_u64().unwrap());
+        assert!(w.get("measured_now").is_some() && w.get("last_request").is_some());
 
         let (s, net) = e.get(&format!("/api/sessions/{id}/net?limit=5")).await;
         assert_eq!((s, net), (200, json!([])));
