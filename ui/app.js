@@ -14,6 +14,7 @@ const S = {
   inbox: C.createInbox(),
   status: null,
   connected: false,
+  connectedSince: null, // when the event stream last connected: the quiet note counts only the time the page has listened
   everConnected: false,
   lastUpdate: 0,
   lastStatus: 0,
@@ -27,10 +28,14 @@ const S = {
   answered: new Map(),
   messageState: new Map(),
   actionState: new Map(),
-  requests: { ledger: 0, window: 0, net: 0, inbox: 0, sessions: 0, status: 0, models: 0 },
+  stopAsked: new Set(), // sessions this tab asked to stop: their ending is not announced
+  notes: { pending: [], shown: new Map(), timer: 0 },
+  requests: { ledger: 0, window: 0, net: 0, inbox: 0, status: 0, models: 0 },
   inboxRevision: 0,
-  sessionsRevision: 0,
+  inboxTouched: new Map(), // item id -> {rev, entry|null}: what inbox records changed, kept over an older snapshot
   sinceSeq: null,
+  jumpFrom: null, // the last record seq held when the operator scrolled away from the end (the count behind Jump to latest)
+  ask: null, // an inline confirmation waiting in the inspector: {kind:"fold"} | {kind:"lead", lead, value} | {kind:"role", lead, role, value}
   section: "chat",
   profiles: null, // GET /api/models for the model seat: {default_model, models: [...]} (null until fetched)
   seat: null, // a model switch waiting for the operator's answer: {session, profile}
@@ -53,6 +58,9 @@ const S = {
   r: null, // what is rendered of it: {from, end, nodes, fresh}
   follow: true,
   tab: "ledger",
+  score: { mission: null, view: null, error: null, lastMs: null, loading: false }, // GET /api/missions/{id}/score of the open mission (Agents tab)
+  agentsEnded: false, // the Ended group of the Agents tab is open (this page only)
+  agentsActive: null, // the agent row that holds the roving tab stop
   ledger: { mission: null, model: null, state: null, error: null, stale: true },
   // The Models tab: the open mission's models (`GET /api/sessions/{id}/models`).
   models: { view: null, error: "", loading: false, busy: false, now: false },
@@ -136,7 +144,10 @@ function preserveFocus(container, render) {
   const active = document.activeElement;
   const key = container.contains(active) ? active.dataset.focusKey || active.dataset.draftKey : null;
   const selection = key && typeof active.selectionStart === "number" ? [active.selectionStart, active.selectionEnd] : null;
+  const inside = container.contains(active) && active !== container;
   render();
+  // Moving a node in the list blurs it even though it is still there: give the focus back to the same element.
+  if (!key && inside && active.isConnected && document.activeElement !== active) { active.focus({ preventScroll: true }); return; }
   if (!key || document.activeElement === active) return;
   const target = [...container.querySelectorAll("[data-focus-key], [data-draft-key]")]
     .find((n) => n.dataset.focusKey === key || n.dataset.draftKey === key);
@@ -155,38 +166,21 @@ function setDraft(key, text, origin) {
 
 function prose(text) {
   const root = el("div", "prose");
-  const lines = String(text).split("\n");
-  let paragraph = [], list = null, code = null;
-  const inline = (target, value) => {
-    const re = /(\*\*[^*\n]+\*\*|`[^`\n]+`)/g;
-    let from = 0;
-    for (const match of value.matchAll(re)) {
-      target.append(document.createTextNode(value.slice(from, match.index)));
-      const bold = match[0].startsWith("**");
-      target.append(el(bold ? "strong" : "code", "", match[0].slice(bold ? 2 : 1, bold ? -2 : -1)));
-      from = match.index + match[0].length;
+  const inline = (target, parts) => {
+    for (const part of parts) target.append(part.type === "text" ? document.createTextNode(part.text) : el(part.type, "", part.text));
+  };
+  for (const block of C.proseTree(text)) {
+    if (block.type === "pre") root.append(add(el("pre", "out"), el("code", "", block.text)));
+    else if (block.type === "ul" || block.type === "ol") {
+      const list = el(block.type);
+      for (const item of block.items) { const li = el("li"); inline(li, item); list.append(li); }
+      root.append(list);
+    } else {
+      const node = el(block.type === "h" ? "h3" : "p");
+      inline(node, block.inline);
+      root.append(node);
     }
-    target.append(document.createTextNode(value.slice(from)));
-  };
-  const flush = () => {
-    if (paragraph.length) { const p = el("p"); inline(p, paragraph.join("\n")); root.append(p); paragraph = []; }
-  };
-  for (const line of lines) {
-    if (/^\s*```/.test(line)) {
-      flush(); list = null;
-      if (code) code = null;
-      else { code = el("code"); root.append(add(el("pre", "out"), code)); }
-    } else if (code) code.append(document.createTextNode((code.textContent ? "\n" : "") + line));
-    else if (/^#{1,6}\s+/.test(line)) {
-      flush(); list = null; const h = el("h3"); inline(h, line.replace(/^#{1,6}\s+/, "")); root.append(h);
-    } else if (/^\s*(?:[-*+]\s+|\d+[.)]\s+)/.test(line)) {
-      flush(); const ordered = /^\s*\d/.test(line);
-      if (!list || list.tagName !== (ordered ? "OL" : "UL")) { list = el(ordered ? "ol" : "ul"); root.append(list); }
-      const item = el("li"); inline(item, line.replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/, "")); list.append(item);
-    } else if (!line.trim()) { flush(); list = null; }
-    else { list = null; paragraph.push(line); }
   }
-  flush();
   return root;
 }
 
@@ -352,7 +346,9 @@ function identityEl(identity) {
   add(line, add(el("span", "ident-line"), el("span", "ident-profile", profile), el("span", "ident-text", " · " + rest)));
   if (identity.waiting) {
     const w = identity.waiting;
-    add(line, add(el("span", "ident-wait tone-" + w.tone), icon(w.icon), el("span", "ident-text", w.text)));
+    const note = add(el("span", "ident-wait tone-" + (w.tone || "quiet")), icon(w.icon), el("span", "ident-text", w.text));
+    if (w.tip) note.title = w.tip;
+    add(line, note);
   }
   return line;
 }
@@ -379,7 +375,10 @@ function renderList() {
       a.dataset.focusKey = "session:" + info.id;
       if (info.id === S.openId) a.setAttribute("aria-current", "page");
       const m = add(el("span", "mark mark-" + (mark.tone || "dim")), icon(mark.icon), el("span", "sr-only", mark.words + ": "));
-      const main = add(el("span", "row-main"), el("span", "name", info.title || info.id), identityEl(row.identity));
+      // What waits on the operator is the row's reason; failing that, a running session with no new record for a while says so.
+      const quiet = row.identity.waiting ? null : C.quietFor(info, row.recordedMs, S.now, S.connectedSince);
+      const identity = quiet ? { ...row.identity, waiting: quiet } : row.identity;
+      const main = add(el("span", "row-main"), el("span", "name", info.title || info.id), identityEl(identity));
       add(a, m, main);
       // Everything the old second line said stays reachable as the row's description.
       a.title = C.rowSummary(row, S.latest.get(info.id), S.now);
@@ -489,6 +488,7 @@ function setView(v) {
 }
 
 function openSession(id) {
+  closeNotes({ session: id });
   if (S.openId === id && S.rec) {
     if (S.view !== "session") S.sinceSeq = recalled("seen." + id, null);
     setView("session");
@@ -516,6 +516,9 @@ function openSession(id) {
   S.win = { ...S.win, data: null, error: null, stale: true, from: null };
   S.ledger = { mission: null, model: null, state: null, error: null, stale: true };
   S.rules = null;
+  S.ask = null;
+  S.jumpFrom = null;
+  closeFind(false);
   const opened = S.sessions.byId.get(id);
   S.ledger.mission = opened ? opened.mission : null;
   clear($("blocks"));
@@ -524,7 +527,10 @@ function openSession(id) {
   $("earlier").hidden = true;
   setView("session");
   clear($("mission-overview"));
+  clear($("mission-agents"));
   clear($("mission-evidence"));
+  if (!opened || S.score.mission !== opened.mission) S.score = { mission: null, view: null, error: null, lastMs: null, loading: false };
+  S.agentsActive = null;
   $("msg").value = C.getDraft(S.drafts, "message:" + id);
   $("msg").dataset.draftKey = "message:" + id;
   want("header", "blocks", "live", "right", "overview");
@@ -603,7 +609,7 @@ function noteActivity(session, record) {
   if (!last || record.seq >= last.seq) S.latest.set(session, record);
 }
 
-const SECTION_PANEL = { chat: "mission-record", overview: "mission-overview", evidence: "mission-evidence" };
+const SECTION_PANEL = { chat: "mission-record", overview: "mission-overview", agents: "mission-agents", evidence: "mission-evidence" };
 function setSection(section, navigate = true) {
   S.section = Object.hasOwn(SECTION_PANEL, section) ? section : "chat";
   for (const tab of document.querySelectorAll("#mission-tabs [data-view]")) {
@@ -612,10 +618,11 @@ function setSection(section, navigate = true) {
     tab.tabIndex = selected ? 0 : -1;
   }
   for (const [name, id] of Object.entries(SECTION_PANEL)) $(id).hidden = name !== S.section;
-  $("jump").hidden = S.section !== "chat" || S.follow;
+  updateJump();
   if (navigate && S.openId) location.hash = C.sessionHash(S.openId, S.section);
   if (S.section === "chat") want("blocks", "live");
   if (S.section === "evidence" && S.ledger.stale) loadLedger();
+  if (S.section === "agents") loadScore(true);
   want("overview");
 }
 
@@ -626,6 +633,7 @@ function ctx() {
   return {
     openId: S.openId,
     ledgerMission: S.ledger.mission,
+    ledgerPending: S.ledger.pending === true,
     known: (id) => S.sessions.byId.has(id),
     missionOf: (id) => (S.sessions.byId.get(id) || {}).mission || null,
   };
@@ -636,18 +644,24 @@ function handleEvent(ev) {
   if (ev.type === "record" && ev.record) noteActivity(ev.session, ev.record);
   for (const f of C.planEvent(ev, ctx())) {
     switch (f.fx) {
-      case "session":
-        S.sessionsRevision++;
+      case "session": {
+        const before = f.info && S.sessions.byId.get(f.info.id);
+        const was = before && { ...before, status: before.status };
         C.applySessionEvent(S.sessions, f.info);
+        if (was) announceEnding(was, f.info);
         want("list", "header", "overview");
         // A model switched, a choice made, or an agent started in the mission the Models tab shows.
         if (S.tab === "models" && S.models.view && f.info && f.info.mission === S.models.view.mission) loadModels();
         break;
-      case "status":
-        S.sessionsRevision++;
+      }
+      case "status": {
+        const before = S.sessions.byId.get(f.session);
+        const was = before && { ...before, status: before.status };
         C.applyStatus(S.sessions, f.session, f.status);
+        if (was) announceEnding(was, { ...was, status: f.status });
         want("list", "header", "overview");
         break;
+      }
       case "header":
         want("header");
         break;
@@ -657,14 +671,22 @@ function handleEvent(ev) {
       case "refetch_inbox":
         loadInbox();
         break;
+      case "refetch_status":
+        loadStatus();
+        break;
+      case "load_ledger":
+        loadLedger();
+        break;
       case "refetch_records":
         if (S.rec) loadRecords(S.rec, 0);
         break;
       case "inbox_record": {
         S.inboxRevision++;
         const res = C.applyInboxRecord(S.inbox, f.session, f.record, (id) => S.sessions.byId.get(id));
+        if (res) S.inboxTouched.set(f.record.item_id, { rev: S.inboxRevision, entry: res === "opened" ? S.inbox.items.get(f.record.item_id) : null });
         if (res === "opened") announce(S.inbox.items.get(f.record.item_id));
         updateInboxBadge();
+        closeNotes();
         break;
       }
       case "apply_record":
@@ -721,6 +743,7 @@ async function connect() {
       if (!r.ok || !r.body) throw new Error("The event stream answered " + r.status + ".");
       const again = S.everConnected;
       S.connected = true;
+      S.connectedSince = Date.now();
       S.everConnected = true;
       S.attempts = 0;
       S.lastUpdate = Date.now();
@@ -745,6 +768,8 @@ async function connect() {
     // After lost() the page is the sign-in sentence: there is no dot to update.
     if (streamStopped) return;
     S.connected = false;
+    S.connectedSince = null;
+    want("list", "header", "overview"); // the quiet notes go with the stream
     S.attempts++;
     renderDot();
     await new Promise((resolve) => setTimeout(resolve, C.reconnectDelayMs(attempt++)));
@@ -756,32 +781,54 @@ function refetchAll() {
   loadInbox();
   loadStatus();
   if (S.rec) loadRecords(S.rec, 0);
+  // Ledger records missed while the stream was down are not in the records the open session refetches by seq: read the ledger again.
+  if (S.openId) {
+    S.ledger.stale = true;
+    loadLedger();
+    if (S.tab === "network") loadNet();
+  }
 }
 
+// One request in flight and one queued: a request that arrives while one is out runs after it, so a busy stream cannot starve the list.
+let sessionsLoading = false;
+let sessionsQueued = false;
 async function loadSessions() {
-  const request = ++S.requests.sessions;
-  const revision = S.sessionsRevision;
+  if (sessionsLoading) { sessionsQueued = true; return; }
+  sessionsLoading = true;
   try {
-    const sessions = await api("GET", "/api/sessions?archived=true");
-    if (request !== S.requests.sessions) return;
-    if (revision !== S.sessionsRevision) return loadSessions();
-    C.applySessionList(S.sessions, sessions);
-    S.lastUpdate = Date.now();
-    want("list", "header", "overview");
-  } catch (e) {
-    if (request === S.requests.sessions) notice(e.message);
+    do {
+      sessionsQueued = false;
+      const sinceRev = S.sessions.rev || 0; // sessions an event changed after this point survive the snapshot
+      try {
+        const sessions = await api("GET", "/api/sessions?archived=true");
+        const held = new Map(S.sessions.byId);
+        C.applySessionList(S.sessions, sessions, { sinceRev });
+        // An ending that landed while the stream was down or lagged is only in this snapshot.
+        for (const [id, now] of S.sessions.byId) if (held.has(id) && held.get(id) !== now) announceEnding(held.get(id), now);
+        S.lastUpdate = Date.now();
+        want("list", "header", "overview");
+        // The open session may only now be known: its ledger was not loaded before.
+        const open = S.openId && S.sessions.byId.get(S.openId);
+        if (open && open.mission && (S.ledger.mission !== open.mission || (!S.ledger.model && S.ledger.stale && !S.ledger.pending))) loadLedger();
+      } catch (e) {
+        notice(e.message);
+      }
+    } while (sessionsQueued);
+  } finally {
+    sessionsLoading = false;
   }
 }
 async function loadInbox() {
   const request = ++S.requests.inbox;
-  const revision = S.inboxRevision;
+  const since = S.inboxRevision; // what inbox records change after this point outranks the snapshot
   try {
-    const inbox = await api("GET", "/api/inbox");
+    const inbox = C.mergeInboxList(await api("GET", "/api/inbox"), S.inboxTouched, since);
     if (request !== S.requests.inbox) return;
-    if (revision !== S.inboxRevision) return loadInbox();
     C.applyInboxList(S.inbox, inbox, S.answered);
+    for (const [id, t] of [...S.inboxTouched]) if (t.rev <= since) S.inboxTouched.delete(id);
     S.lastUpdate = Date.now();
     updateInboxBadge();
+    closeNotes();
   } catch (e) {
     if (request === S.requests.inbox) notice(e.message);
   }
@@ -809,18 +856,62 @@ async function loadStatus() {
 function notificationsAvailable() {
   return typeof Notification !== "undefined";
 }
+/** Desktop notifications: only when the page is hidden or unfocused, combined within 5 s, closed when what they say is dealt with. */
+function pageSeen() {
+  return document.visibilityState === "visible" && (typeof document.hasFocus !== "function" || document.hasFocus());
+}
+function queueNotice(notice) {
+  if (!notice || !notificationsAvailable() || Notification.permission !== "granted") return;
+  const N = S.notes;
+  if (N.pending.some((n) => n.tag === notice.tag)) return;
+  N.pending.push(notice);
+  flushNotes();
+}
 function announce(entry) {
-  if (!entry || !entry.item.blocking) return;
-  if (!notificationsAvailable() || Notification.permission !== "granted") return;
+  queueNotice(C.noticeOfInbox(entry, Date.now()));
+}
+function announceEnding(prev, next) {
+  queueNotice(C.noticeOfEnding(C.missionEnding(prev, next, { requested: S.stopAsked }), Date.now()));
+}
+/** The notices still true when the window closes: an item answered meanwhile, or a session now open and seen, is dropped. */
+function liveNotice(n) {
+  if (n.kind === "ended") return true;
+  return S.inbox.items.has(n.tag);
+}
+function flushNotes() {
+  const N = S.notes;
+  clearTimeout(N.timer);
+  N.timer = 0;
+  N.pending = N.pending.filter(liveNotice);
+  const plan = C.planNotifications(N.pending, { now: Date.now(), visible: pageSeen() });
+  if (!plan.due) {
+    if (plan.wait !== null) N.timer = setTimeout(flushNotes, plan.wait + 20);
+    return;
+  }
+  N.pending = plan.rest;
+  const n = plan.notification;
+  if (!n) return;
   try {
-    const n = C.notificationFor(entry);
     const note = new Notification(n.title, { body: n.body, tag: n.tag });
+    N.shown.set(n.tag, { note, n });
     note.addEventListener("click", () => {
       window.focus();
-      location.hash = "#/inbox";
+      location.hash = n.target.hash;
+      note.close();
     });
+    note.addEventListener("close", () => N.shown.delete(n.tag));
   } catch {
     // some browsers refuse outside a user gesture; the badge and title still show it
+  }
+}
+/** Close what the operator has dealt with: items now resolved, the session just opened, or the inbox just opened. */
+function closeNotes(opened = {}) {
+  const N = S.notes;
+  const tags = C.closableNotifications([...N.shown.values()].map((x) => x.n), { openItems: new Set(S.inbox.items.keys()), opened });
+  for (const tag of tags) {
+    const shown = N.shown.get(tag);
+    N.shown.delete(tag);
+    try { if (shown) shown.note.close(); } catch { /* already gone */ }
   }
 }
 
@@ -846,8 +937,11 @@ function renderRun(info) {
   const live = S.connected;
   const run = C.runWords(info, { now: Date.now(), startMs: live && S.rec && S.rec.turn ? S.rec.turn.ts : null, attention: inboxCount(info.id) });
   // With the stream down nothing says the run still goes on: show the last known state, as that, without a clock.
-  const text = live ? run.text : "Last known · " + run.text;
+  // A running session with no new record for a while says so, as a fact and in neutral words; nothing while the age is unknown or the stream is down.
+  const quiet = live && run.running ? C.quietFor(info, S.activity.get(info.id), Date.now(), S.connectedSince) : null;
+  const text = live ? run.text + (quiet ? " · " + quiet.text : "") : "Last known · " + run.text;
   for (const node of [$("s-run"), $("bar-run")]) {
+    node.title = quiet ? quiet.tip : "";
     node.className = (node.id === "s-run" ? "id-chip id-run" : "id-chip id-run bar-chip") + (run.tone ? " tone-" + run.tone : "");
     chipContent(node, icon(run.icon), document.createTextNode(text));
     node.hidden = node.id === "bar-run" && S.view !== "session";
@@ -858,6 +952,7 @@ function renderRun(info) {
     renderRun(current);
     S.now = Date.now();
     tickGroups();
+    renderProgress(current);
   }, 1000);
   else if (!run.running || !live) stopRunTimer();
 }
@@ -1030,6 +1125,10 @@ function renderHeader() {
   const openClaims = (S.ledger.state?.claims || []).filter(claim => claim.status === "open").length;
   $("evidence-count").textContent = `${openClaims} open`;
   $("evidence-count").hidden = openClaims === 0;
+  const running = [...S.sessions.byId.values()].filter(s => s.mission === info.mission && s.status?.phase === "running").length;
+  $("agents-count").textContent = `${running} running`;
+  $("agents-count").hidden = running === 0;
+  renderProgress(info);
   renderStats();
   const a = C.sessionActions(info);
   $("b-stop").hidden = !a.stop;
@@ -1089,6 +1188,9 @@ function missionAgents(info) {
 
 function renderOverview() {
   if (S.view !== "session" || !S.rec) return;
+  // Hidden panels are not kept current: setSection asks for a render when one is shown.
+  if (S.section === "agents") { loadScore(false); renderAgents(); return; }
+  if (S.section !== "overview" && S.section !== "evidence") return;
   const panel = $("mission-overview");
   if (!panel.firstElementChild) {
     const main = add(el("div", "overview-main"), el("div", "overview-decisions"), el("section", "overview-section overview-plan"), el("section", "overview-section overview-changes"));
@@ -1187,7 +1289,11 @@ function railSection(model) {
     if (lead) body.append(card("Part of", sessionLink(lead)));
   } else {
     const agents = missionAgents(info);
-    if (agents.length) body.append(card("Agents", ...agents.map(sessionLink)));
+    if (agents.length) {
+      const all = link(`All agents (${agents.length})`, C.sessionHash(S.openId, "agents"));
+      all.className = "rail-all";
+      body.append(card("Agents", ...agents.map(sessionLink), all));
+    }
   }
   if (S.ledger.state) {
     const stats = el("dl", "rail-stats");
@@ -1215,11 +1321,175 @@ function railSection(model) {
   return body;
 }
 
-function jumpToRecord(seq) {
+// ---------------------------------------------------------------------------------------------
+// Agents tab
+
+/**
+ * GET /api/missions/{id}/score, for the Agents tab. Forced when the tab opens or Refresh is pressed; otherwise only while the tab is
+ * shown and an agent runs, and at most every SCORE_EVERY_MS (C.scoreDue). Events never fetch it on their own: they only ask for a
+ * render, and the render asks here, where the throttle decides.
+ */
+async function loadScore(force) {
+  const info = S.sessions.byId.get(S.openId);
+  if (!info || S.view !== "session") return;
+  const mission = info.mission;
+  if (S.score.mission !== mission) S.score = { mission, view: null, error: null, lastMs: null, loading: false };
+  if (S.score.loading) return;
+  const running = [...S.sessions.byId.values()].some(s => s.mission === mission && s.status?.phase === "running");
+  if (!C.scoreDue({ shown: S.section === "agents", lastMs: S.score.lastMs, running, now: Date.now(), force })) return;
+  const score = S.score;
+  score.loading = true;
+  score.lastMs = Date.now(); // a failed fetch also waits out the interval
+  want("overview");
+  try {
+    const v = await api("GET", "/api/missions/" + encodeURIComponent(mission) + "/score");
+    if (S.score !== score) return;
+    const rows = C.scoreRows(v);
+    score.view = rows;
+    score.error = rows ? null : "The daemon sent a scorecard this page cannot read.";
+  } catch (e) {
+    if (S.score !== score) return;
+    score.error = e.message;
+  }
+  score.loading = false;
+  want("overview");
+}
+
+function agentRow(row, active) {
+  const li = el("li", "agent-row indent-" + row.indent);
+  li.dataset.agent = row.id;
+  const a = el("a", "agent-main");
+  a.setAttribute("href", C.sessionHash(row.id));
+  a.dataset.focusKey = "agent:" + row.id;
+  a.tabIndex = active ? 0 : -1;
+  const text = el("span", "agent-text");
+  text.append(el("span", "agent-title", row.title));
+  const meta = [row.roleLine, `step ${C.num(row.step)}`];
+  meta.push(row.ageText ? `last record ${row.ageText}` : "last record not loaded");
+  if (row.generated) meta.push(row.generated);
+  text.append(el("span", "dim agent-meta", meta.join(" · ")));
+  if (row.crumbs.length) text.append(el("span", "dim agent-meta", "Under " + row.crumbs.join(" › ")));
+  const reason = row.waiting || row.quiet;
+  if (reason) text.append(add(el("span", "sw-reason tone-" + (reason.tone || "quiet")), icon(reason.icon), el("span", "", reason.text)));
+  if (row.outcome) text.append(el("span", "agent-outcome", "Ended: " + row.outcome));
+  if (row.score) text.append(el("span", "dim agent-score", row.score.text + (row.score.unrecorded ? " · verifier counts not recorded" : "")));
+  const mk = add(el("span", "mark mark-" + (row.mark.tone || "dim")), icon(row.mark.icon), el("span", "sr-only", row.mark.words + ": "));
+  mk.title = row.mark.words;
+  add(a, mk, text);
+  li.append(a);
+  if (row.spawnSeq !== null) {
+    const jump = btn("Where it was spawned", "link small agent-spawn", () => jumpToRecord(row.spawnSeq, { focus: true }));
+    jump.tabIndex = active ? 0 : -1;
+    jump.dataset.focusKey = "agent-spawn:" + row.id;
+    li.append(jump);
+  }
+  return li;
+}
+
+function renderAgents() {
+  const panel = $("mission-agents");
+  const info = S.sessions.byId.get(S.openId);
+  if (!info || !S.rec) return;
+  const score = S.score.mission === info.mission ? S.score : null;
+  const model = C.agentGroups(S.sessions, S.inbox, info.mission, {
+    now: S.now, activity: S.activity, since: S.connectedSince, score: score && score.view, spawns: C.spawnSeqs(S.rec.blocks),
+  });
+  const frag = document.createDocumentFragment();
+  const refresh = btn(score && score.loading ? "Refreshing…" : "Refresh scores", "small", () => loadScore(true));
+  refresh.dataset.focusKey = "agents-refresh";
+  if (score && score.loading) refresh.setAttribute("aria-disabled", "true");
+  frag.append(heading("h2", "Agents", el("span", "dim", `${C.num(model.total)} in this mission${model.running ? " · " + model.badge : ""}`), refresh));
+  const note = score && score.error ? el("p", "error", "Scores could not be read: " + score.error)
+    : score && score.lastMs && !score.view ? el("p", "dim", "Reading the scores…")
+    : score && score.view ? el("p", "dim", `Scores read ${ago(score.lastMs)}. They refresh when this tab opens, on Refresh, and at most every 2 minutes while an agent runs.`) : null;
+  if (note) frag.append(note);
+  if (score && score.view) {
+    const total = score.view.total;
+    frag.append(add(el("section", "agents-total"), el("h3", "", score.view.label), el("p", "", `${C.num(total.steps)} steps · ${total.text}${total.unrecorded ? " · verifier counts not recorded for some logs" : ""}`), el("p", "dim fineprint", score.view.fineprint)));
+  }
+  if (!model.groups.length) frag.append(el("p", "dim", "No agents in this mission yet."));
+  const first = model.groups[0] && model.groups[0].rows[0];
+  const active = S.agentsActive && model.groups.some(g => g.rows.some(r => r.id === S.agentsActive) && (!g.folded || S.agentsEnded)) ? S.agentsActive : first && first.id;
+  for (const group of model.groups) {
+    const section = el("section", "agent-group");
+    const label = `${group.label} · ${C.num(group.rows.length)}`;
+    const open = !group.folded || S.agentsEnded;
+    if (group.folded) {
+      const head = el("h3");
+      const toggle = btn(`${C.num(group.rows.length)} ended`, "small agent-fold", () => { S.agentsEnded = !S.agentsEnded; renderAgents(); });
+      toggle.setAttribute("aria-expanded", String(open));
+      toggle.dataset.focusKey = "agents-ended";
+      section.append(add(head, toggle));
+    } else section.append(el("h3", "", label));
+    if (open) {
+      const list = el("ul", "agent-list");
+      list.setAttribute("aria-label", group.label);
+      for (const row of group.rows) list.append(agentRow(row, row.id === active));
+      section.append(list);
+    }
+    frag.append(section);
+  }
+  preserveFocus(panel, () => panel.replaceChildren(frag));
+}
+
+/** Roving tab stop across the agent rows: arrows, Home and End move between them; Enter opens the one in focus. */
+function agentsKeys(e) {
+  if (e.altKey || e.ctrlKey || e.metaKey) return; // Alt+Up/Down belongs to the mission stepper
+  if (e.target.closest && e.target.closest(".agent-spawn")) return;
+  const rows = [...$("mission-agents").querySelectorAll(".agent-main")];
+  const at = rows.indexOf(e.target);
+  if (at < 0) return;
+  let next = null;
+  if (e.key === "ArrowDown") next = Math.min(rows.length - 1, at + 1);
+  else if (e.key === "ArrowUp") next = Math.max(0, at - 1);
+  else if (e.key === "Home") next = 0;
+  else if (e.key === "End") next = rows.length - 1;
+  if (next === null) return;
+  e.preventDefault();
+  setAgentsActive(rows, next);
+}
+function setAgentsActive(rows, index) {
+  rows.forEach((r, i) => {
+    r.tabIndex = i === index ? 0 : -1;
+    const spawn = r.parentElement.querySelector(".agent-spawn");
+    if (spawn) spawn.tabIndex = i === index ? 0 : -1;
+  });
+  S.agentsActive = rows[index].parentElement.dataset.agent;
+  rows[index].focus();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Progress line above the composer
+
+function renderProgress(info) {
+  const node = $("s-progress");
+  const ended = !info || info.status?.phase === "ended";
+  // The plan is the mission's, recorded by its lead: an agent's own line shows only its own budget.
+  // The budget is counted from the record as the daemon counts it: active time and own steps since it was last granted.
+  const used = S.rec ? C.budgetUsed(S.rec, Date.now()) : { steps: 0, minutes: null };
+  const line = ended || S.view !== "session" ? null : C.progressLine({
+    plan: info.parent ? [] : S.ledger.model?.plan, step: used.steps, minutes: used.minutes,
+    budget: S.rec && S.rec.start ? S.rec.start.budget : null,
+  });
+  const sig = line ? line.text : "";
+  if (node.dataset.sig === sig) return;
+  node.dataset.sig = sig;
+  node.hidden = !line;
+  if (!line) { node.replaceChildren(); return; }
+  node.replaceChildren(...line.parts.map(p => el("span", "progress-part progress-" + p.key, p.text)), el("span", "sr-only", line.parts.some(p => p.key === "budget") ? ". The budget is a limit, not a measure of progress." : ""));
+}
+
+/**
+ * Go to the block that holds record `seq`, highlight it, and (with `focus`) put the keyboard on it, so a screen reader reads it and the
+ * next Tab continues from there. `done(node)` is called once it is shown. While the jump settles `S.jumping` keeps the scroll handler
+ * from deciding that the chat is following the end again (widening the window keeps the bottom offset and would say so).
+ */
+function jumpToRecord(seq, { focus = false, done = null } = {}) {
   setSection("chat");
+  S.jumping = true;
   requestAnimationFrame(() => {
     const block = S.rec?.blocks.find(b => b.seq === seq || b.callSeq === seq || b.result?.seq === seq || b.resolved?.seq === seq);
-    if (!block || !S.r) return;
+    if (!block || !S.r) { S.jumping = false; return; }
     S.follow = false;
     while (block.id < S.r.from && S.r.from > 0) showEarlier();
     // A folded group holding the record opens, and so does the call's own row.
@@ -1230,7 +1500,18 @@ function jumpToRecord(seq) {
     // One more frame: a pending render may still replace the node.
     requestAnimationFrame(() => {
       const node = $("blocks").querySelector(`[data-bid="${block.id}"]`);
-      if (node) { node.scrollIntoView({ block: "center" }); node.classList.add("record-highlight"); setTimeout(() => node.classList.remove("record-highlight"), 2500); }
+      S.jumping = false;
+      if (node) {
+        node.scrollIntoView({ block: "center" });
+        node.classList.add("record-highlight");
+        setTimeout(() => node.classList.remove("record-highlight"), 2500);
+        node.tabIndex = -1;
+        if (focus) node.focus({ preventScroll: true });
+        if (done) done(node);
+      }
+      const s = $("scroller");
+      S.follow = C.atEnd(s.scrollTop, s.clientHeight, s.scrollHeight);
+      updateJump();
     });
   });
 }
@@ -1441,7 +1722,7 @@ function buildBlock(b, ctx = {}) {
     case "inbox": {
       root.classList.add("block-inbox", b.item.blocking ? "decision-card" : "informational");
       if (b.resolved) root.classList.add("done");
-      add(root, inboxCard({ session: S.openId, title: S.sessions.byId.get(S.openId)?.title, item: b.item, opened_ms: b.ts }, b.resolved || S.answered.get(b.item.item_id), "record"));
+      add(root, inboxCard({ session: S.openId, title: S.sessions.byId.get(S.openId)?.title, item: b.item, opened_ms: b.ts }, C.cardResolution(b.item, b.resolved, S.answered.get(b.item.item_id), S.ledger.model ? S.ledger.model.scope : null), "record"));
       break;
     }
     case "divider":
@@ -1479,11 +1760,11 @@ function collapsible(b, key, text, max) {
 /** One tool call as a one-line row; the row opens to today's full output UI. */
 function buildTool(root, b) {
   const res = b.result;
-  const bad = res && res.status !== "ok";
   const row = C.toolRow(b);
   const open = !!b.ui.open;
-  root.classList.add("trow");
-  if (bad) root.classList.add("bad");
+  root.classList.add("trow", "out-" + row.outcome);
+  // Red is for a call that reported failure; an exit code, a refusal or a timeout each have their own look.
+  if (row.outcome === "failed") root.classList.add("bad");
   const head = el("button", "thead");
   head.type = "button";
   head.setAttribute("aria-expanded", String(open));
@@ -1495,7 +1776,15 @@ function buildTool(root, b) {
   if (row.capsule) {
     const cap = el("span", "capsule tone-" + row.capsule.tone);
     add(cap, icon(row.capsule.icon), document.createTextNode(row.capsule.text));
+    if (row.words) cap.title = row.words;
     add(head, cap);
+  }
+  if (row.partial) {
+    // An outline mark, in words: the model saw only part of this output.
+    const mark = el("span", "partial-mark");
+    add(mark, icon("half"), document.createTextNode("partial"));
+    mark.title = row.partial.words;
+    add(head, mark);
   }
   if (row.duration) add(head, el("span", "dur", row.duration));
   head.addEventListener("click", () => {
@@ -1551,6 +1840,12 @@ function toggleGroup(it) {
   syncChat();
 }
 
+// The group's counts, in the order the header words say them: [field, outcome kind, words].
+const GROUP_MARKS = [
+  ["exited", "exit", "exited non-zero"], ["failed", "failed", "failed"], ["denied", "denied", "denied by policy"],
+  ["invalid", "invalid", "invalid"], ["timedOut", "timeout", "timed out"], ["interrupted", "interrupted", "interrupted"],
+];
+
 /** The frame of a work group: its header button and, while it is open, its body. Members are kept between updates. */
 function newGroupEntry(it) {
   const root = el("div", "work-group");
@@ -1568,9 +1863,10 @@ function newGroupEntry(it) {
 function updateGroup(entry, it, dirty) {
   const { node, head } = entry;
   node.className = "work-group" + (it.open ? " open" : "") + (it.failed ? " has-failed" : "") + (it.warnings ? " has-warn" : "");
+  const counts = GROUP_MARKS.map(([field]) => it[field] || 0);
   head.setAttribute("aria-expanded", String(it.open));
   head.title = it.open ? "Fold this work away; every call stays in the record." : "Show the calls in this work.";
-  const headSig = [it.toolCount, it.failed, it.missing, it.warnings, it.running, it.records, it.running ? "" : it.endTs].join("|");
+  const headSig = [it.toolCount, ...counts, it.partial || 0, it.missing, it.warnings, it.running, it.records, it.running ? "" : it.endTs].join("|");
   if (entry.headSig !== headSig) {
     entry.headSig = headSig;
     const label = el("span", "group-label", groupHeadText(it));
@@ -1580,12 +1876,15 @@ function updateGroup(entry, it, dirty) {
     entry.label = label;
     head.setAttribute("aria-label", groupSpoken(it));
     head.replaceChildren(icon("chevron"), label);
-    if (it.failed) {
-      const fail = el("span", "group-fail");
-      fail.title = `${C.count(it.failed, "call")} failed`;
-      add(fail, icon("cross"));
-      head.append(fail);
-    }
+    // Each way a call can end has its own small shape and number, so a refusal is not read as a failure.
+    GROUP_MARKS.forEach(([, kind, noun], i) => {
+      if (!counts[i]) return;
+      const look = C.TOOL_OUTCOME_LOOK[kind];
+      const mark = el("span", "group-mark tone-" + look.tone);
+      mark.title = `${counts[i]} ${noun}`;
+      add(mark, icon(look.icon), el("span", "group-mark-n", String(counts[i])));
+      head.append(mark);
+    });
     if (it.warnings) {
       const warn = el("span", "group-warn");
       warn.title = C.count(it.warnings, "warning");
@@ -1640,13 +1939,21 @@ function buildItem(it) {
     add(row, modelChip(it));
     return row;
   }
+  if (it.type === "since") {
+    const line = el("div", "block divider since");
+    line.setAttribute("role", "separator");
+    add(line, el("span", "", it.text));
+    if (it.straddles) line.title = "The work group below began before your last visit and has grown since.";
+    return line;
+  }
   return buildBlock(it.block, { differs: it.differs, model: it.model });
 }
 
-const itemKey = (it) => it.type === "model" ? `m${it.seq}${it.reason}` : it.type === "group" ? it.key : "b" + it.block.id;
+const itemKey = (it) => it.type === "model" ? `m${it.seq}${it.reason}` : it.type === "since" ? "since" : it.type === "group" ? it.key : "b" + it.block.id;
 
 function itemSig(it) {
   if (it.type === "model") return it.profile + "|" + it.model;
+  if (it.type === "since") return it.text + "|" + it.straddles;
   return (it.differs ? "d" : "") + (it.model ? it.model.profile : "");
 }
 
@@ -1658,7 +1965,7 @@ function itemDirty(it, dirty) {
 function chatView() {
   const store = S.rec;
   const open = new Set([...S.workState].filter(([, v]) => v).map(([k]) => k));
-  const items = C.chatItems(store.blocks, { expandAll: S.expandAll, details: S.details, open, models: store.models });
+  const items = C.chatItems(store.blocks, { expandAll: S.expandAll, details: S.details, open, models: store.models, sinceSeq: S.sinceSeq, lastSeq: C.lastSeq(store) });
   if (!S.expandAll) for (const it of items) if (it.type === "group" && S.workState.has(it.key)) it.open = S.workState.get(it.key);
   // A group that crosses the window start keeps only its members inside it, so a long open run is not rendered in full.
   return C.windowItems(items, S.r.from);
@@ -1743,7 +2050,18 @@ function renderBlocks() {
   }
   syncChat();
   if (S.follow) scroller.scrollTop = scroller.scrollHeight;
-  $("jump").hidden = S.section !== "chat" || S.follow;
+  updateJump();
+}
+
+/** The Jump button: shown while the chat is scrolled away from the end, and counting the records recorded since the operator left it. */
+function updateJump() {
+  const jump = $("jump");
+  jump.hidden = S.section !== "chat" || S.follow;
+  if (S.follow) S.jumpFrom = null;
+  if (jump.hidden || !S.rec) return;
+  if (S.jumpFrom === null) S.jumpFrom = C.lastSeq(S.rec);
+  const label = C.jumpLabel(S.jumpFrom === null || S.jumpFrom === undefined ? 0 : C.recordsAfter(S.rec.blocks, S.jumpFrom, C.lastSeq(S.rec)));
+  if (jump.textContent !== label) jump.textContent = label;
 }
 
 function showEarlier() {
@@ -1815,6 +2133,110 @@ function oneLineArgs(s) {
 // ---------------------------------------------------------------------------------------------
 // Inbox cards and view
 
+/** Keycaps for a button that has keys: a run of <kbd>, hidden from assistive technology (the button carries aria-keyshortcuts). */
+function keycaps(keys) {
+  const caps = el("span", "keycaps");
+  caps.setAttribute("aria-hidden", "true");
+  keys.forEach((k, i) => { if (i) caps.append(document.createTextNode(" ")); caps.append(el("kbd", "", k)); });
+  return caps;
+}
+
+/**
+ * After an answer is sent: focus the next open card of the same list (its answer field, else the card itself, so one more Enter never
+ * lands on a button that grants something), else the receipt of the one just sent, else the list itself when the receipt went with the item.
+ */
+function focusCard(id, receipt, scope) {
+  const root = scope && scope.isConnected ? scope : document;
+  const shown = (n) => n.getClientRects().length > 0;
+  const next = id && [...root.querySelectorAll(`[data-answer-item="${CSS.escape(id)}"]`)].find(shown);
+  if (next) {
+    const field = [...next.querySelectorAll("textarea:not([disabled])")].find(shown);
+    if (field) { field.focus({ preventScroll: false }); return; }
+    next.tabIndex = -1;
+    next.focus({ preventScroll: false });
+    return;
+  }
+  const given = receipt && receipt.isConnected && receipt.querySelector(".given");
+  if (given) { given.tabIndex = -1; given.focus({ preventScroll: true }); return; }
+  const stable = root.querySelector(".inbox-empty") || (root !== document && shown(root) ? root : null);
+  if (stable) { stable.tabIndex = -1; stable.focus({ preventScroll: true }); }
+}
+
+/**
+ * "Ways out" of a blocker or park: fold the context, or switch the model. Both confirm first and nothing runs on its own. The latest
+ * recorded error is shown when this card's session is the open one, because only its record is loaded.
+ */
+function waysOut(entry, context) {
+  const box = el("div", "ways-out");
+  box.setAttribute("role", "group");
+  box.setAttribute("aria-label", "Ways out");
+  const info = S.sessions.byId.get(entry.session);
+  const title = (info && info.title) || entry.title || entry.session;
+  add(box, el("div", "ways-head", "Ways out"));
+  const known = entry.session === S.openId && S.rec ? C.lastRecordedError(S.rec.blocks) : null;
+  if (known) {
+    const line = el("p", "ways-error");
+    add(line, el("span", "label", "Last recorded error "), el("span", "txt", known));
+    box.append(line);
+  }
+  const confirm = el("div", "model-confirm");
+  confirm.setAttribute("role", "group");
+  confirm.hidden = true;
+  const q = C.foldConfirm(title);
+  const qid = "fold-q-" + entry.item.item_id;
+  const text = el("p", "model-confirm-text", q.text);
+  text.id = qid;
+  confirm.setAttribute("aria-labelledby", qid);
+  const receipt = el("p", "dim ways-receipt");
+  receipt.setAttribute("role", "status");
+  const failure = el("p", "error");
+  failure.setAttribute("role", "alert");
+  failure.hidden = true;
+  const fold = btn("Fold the context…", "", () => {
+    confirm.hidden = !confirm.hidden;
+    fold.setAttribute("aria-expanded", String(!confirm.hidden));
+    receipt.textContent = "";
+    failure.hidden = true;
+    if (!confirm.hidden) keep.focus();
+  });
+  fold.setAttribute("aria-expanded", "false");
+  fold.dataset.focusKey = "fold:" + entry.item.item_id;
+  const yes = btn(q.yes, "small primary", async () => {
+    yes.disabled = true;
+    failure.hidden = true;
+    try {
+      await api("POST", "/api/sessions/" + encodeURIComponent(entry.session) + "/reweave");
+      confirm.hidden = true;
+      fold.setAttribute("aria-expanded", "false");
+      receipt.textContent = C.FOLD_RECEIPT;
+      fold.focus();
+    } catch (e) {
+      fail(failure, e.message);
+    } finally {
+      yes.disabled = false;
+    }
+  });
+  noRepeat(yes);
+  const keep = btn(q.no, "small", () => { confirm.hidden = true; fold.setAttribute("aria-expanded", "false"); fold.focus(); });
+  add(confirm, text, add(el("span", "model-confirm-actions"), yes, keep));
+  const sw = btn("Switch model…", "", () => {
+    const go = () => {
+      const seat = $("model-seat");
+      if (!seat) return;
+      if (seat.disabled) { notice(seat.title || "This session's model cannot be changed now."); return; }
+      seat.focus();
+    };
+    if (location.hash === C.sessionHash(entry.session) && S.view === "session" && S.openId === entry.session) { go(); return; }
+    location.hash = C.sessionHash(entry.session);
+    // The route opens the session and draws its seat; focus it once that has happened.
+    let tries = 0;
+    const wait = () => { if (S.openId === entry.session && S.view === "session" && $("model-seat").options.length) go(); else if (tries++ < 40) setTimeout(wait, 50); };
+    wait();
+  });
+  add(box, add(el("div", "ways-actions"), fold, sw), confirm, receipt, failure);
+  return box;
+}
+
 /**
  * One inbox item. `context` is where the card is shown: "inbox" (every mission), "overview" (the
  * open mission) or "record" (the open session). Nothing is sent until the operator presses the
@@ -1826,6 +2248,8 @@ function inboxCard(entry, resolved, context = "inbox") {
   const result = item.item_kind === "finished";
   const card = el("div", "inbox-card");
   card.dataset.answerItem = item.item_id;
+  card.setAttribute("role", "group");
+  card.setAttribute("aria-label", `${result ? "Result ready" : C.inboxCardKind(item)}${entry.title ? ": " + entry.title : ""}`);
   const h = el("div", "ih");
   add(h, el("span", "kind", result ? "Result ready" : C.inboxCardKind(item)));
   add(h, el("span", item.blocking ? "state" : "dim", item.blocking ? "Needs your answer" : result ? "Review when ready" : "Work can continue"));
@@ -1842,7 +2266,8 @@ function inboxCard(entry, resolved, context = "inbox") {
   add(card, h, textBox(item.text, "txt prose-text item-text"));
   if (resolved) {
     const given = el("div", "given");
-    add(given, el("div", "label", resolved.answer === "" ? "Dismissed" : "Answered"));
+    // A scope request the operator approved is not "Dismissed": the hosts were granted first.
+    add(given, el("div", "label", resolved.approved ? "Approved · hosts granted: " + resolved.approved.join(", ") : C.isRefusal(resolved.answer) ? "Refused" : resolved.answer === "" ? (C.scopeRequestHosts(item) ? "Closed" : "Dismissed") : "Answered"));
     if (resolved.answer !== "") given.append(textBox(resolved.answer, "txt prose-text"));
     card.append(given);
     return card;
@@ -1852,19 +2277,27 @@ function inboxCard(entry, resolved, context = "inbox") {
   err.hidden = true;
   const form = el("div", "answer");
   form.dataset.blocking = String(!!item.blocking);
-  const send = async (answer) => {
+  const send = async (answer, approved = null) => {
     if (S.answering.has(item.item_id)) return;
+    // Focus in this card moves on to the next open card once this one has turned into its receipt.
+    const hadFocus = card.contains(document.activeElement);
+    // The cards of this list only: the session's copy of a card is hidden while the Inbox shows it, and the other way round.
+    const scope = card.closest("#inbox-list, #mission-overview, #blocks") || document;
+    const next = C.nextCardId([...new Set([...scope.querySelectorAll("[data-answer-item]")].filter((c) => !c.querySelector(".given")).map((c) => c.dataset.answerItem))], item.item_id);
     S.answering.add(item.item_id);
     syncAnswerState(item.item_id);
     err.hidden = true;
     try {
       await api("POST", "/api/inbox/" + encodeURIComponent(item.item_id), { answer });
-      S.answered.set(item.item_id, { answer });
+      const receipt = approved ? { answer, approved } : { answer };
+      S.answered.set(item.item_id, receipt);
       S.inbox.items.delete(item.item_id);
       if (C.clearDraftIfUnchanged(S.drafts, key, answer)) setDraft(key, "");
       updateInboxBadge();
       await loadInbox();
-      if (document.contains(card)) card.replaceWith(inboxCard(entry, { answer }, context));
+      let shown = card;
+      if (document.contains(card)) { shown = inboxCard(entry, receipt, context); card.replaceWith(shown); }
+      if (hadFocus) focusCard(next, shown, scope);
     } catch (e) {
       err.textContent = e.message;
       err.hidden = false;
@@ -1899,9 +2332,32 @@ function inboxCard(entry, resolved, context = "inbox") {
         return fail(err, e.message);
       }
       S.answering.delete(item.item_id);
-      await send("");
+      await send("", scopeHosts);
     });
-    add(foot, words, approve, btn("Dismiss", "", () => send("")));
+    const refusal = ruleInput("Why it is refused (the agent reads it)");
+    refusal.setAttribute("aria-label", "Reason for refusing");
+    const refuseRow = el("div", "rule-row refuse-row");
+    refuseRow.hidden = true;
+    const refuse = btn("Refuse…", "", () => {
+      refuseRow.hidden = !refuseRow.hidden;
+      refuse.setAttribute("aria-expanded", String(!refuseRow.hidden));
+      if (!refuseRow.hidden) refusal.focus();
+    });
+    refuse.setAttribute("aria-expanded", "false");
+    refuse.dataset.focusKey = "refuse:" + item.item_id;
+    const sendRefusal = btn("Send refusal", "small", () => {
+      const r = C.refusalAnswer(refusal.value);
+      if (r.error) return fail(err, r.error);
+      send(r.answer);
+    });
+    refusal.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); sendRefusal.click(); }
+      else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); refuseRow.hidden = true; refuse.setAttribute("aria-expanded", "false"); refuse.focus(); }
+    });
+    add(refuseRow, refusal, sendRefusal, btn("Cancel", "small", () => { refuseRow.hidden = true; refuse.setAttribute("aria-expanded", "false"); refuse.focus(); }));
+    add(form, refuseRow);
+    add(words, el("span", "dim", "Refusing sends your reason to the agent and grants nothing."));
+    add(foot, words, approve, btn("Dismiss", "", () => send("")), refuse);
   } else {
     const options = park ? [] : item.options || [];
     const ta = el("textarea");
@@ -1915,6 +2371,12 @@ function inboxCard(entry, resolved, context = "inbox") {
       syncAnswerState(item.item_id);
     };
     ta.addEventListener("input", sync);
+    // Ctrl/Cmd+Enter sends, the same as the button; an empty draft sends nothing (Enter alone still adds a line).
+    ta.addEventListener("keydown", (e) => {
+      if (!C.answerSendKey(e)) return;
+      e.preventDefault();
+      if (ta.value.trim() && !ta.disabled) send(ta.value);
+    });
     const own = add(el("div", "answer-own"), ta);
     if (options.length) {
       // Suggested answers are toggles over the one draft: the pressed one is the draft as it stands.
@@ -1940,8 +2402,12 @@ function inboxCard(entry, resolved, context = "inbox") {
     if (park) add(form, parkControls(entry, park, ta, sync, send, err));
     form.append(own);
     if (park) add(form, el("p", "dim", C.PARK_HELP));
+    if (park) add(form, waysOut(entry, context));
     add(words, el("span", "answer-hint"), el("span", "dim answer-recipient", "Reply to: " + (entry.title || entry.session)));
-    add(foot, words, btn("Send answer", "primary answer-submit", () => send(ta.value)));
+    const submit = btn("", "primary answer-submit", () => send(ta.value));
+    submit.setAttribute("aria-keyshortcuts", "Control+Enter Meta+Enter");
+    add(submit, el("span", "submit-label"), keycaps(MAC ? ["⌘", "Enter"] : ["Ctrl", "Enter"]));
+    add(foot, words, submit);
   }
   add(card, add(form, foot), err);
   syncAnswerCard(card, S.answering.has(item.item_id));
@@ -2020,7 +2486,14 @@ function syncAnswerCard(card, busy) {
   for (const button of card.querySelectorAll("button")) {
     const submit = button.classList.contains("answer-submit");
     button.disabled = busy || (submit && blocking && !!ta && !draft.trim());
-    if (submit) button.textContent = busy ? "Sending…" : !ta ? "Dismiss result" : !blocking && !draft.trim() ? "Dismiss" : "Send answer";
+    if (submit) {
+      const text = busy ? "Sending…" : !ta ? "Dismiss result" : !blocking && !draft.trim() ? "Dismiss" : "Send answer";
+      const label = button.querySelector(".submit-label");
+      if (label) label.textContent = text; else button.textContent = text;
+      // The keys send a non-empty draft only, so the caps show only then.
+      const caps = button.querySelector(".keycaps");
+      if (caps) caps.hidden = busy || !draft.trim();
+    }
   }
   const hint = card.querySelector(".answer-hint");
   if (hint) {
@@ -2038,15 +2511,16 @@ function syncAnswerState(id) {
   }
 }
 
-function reconcileInbox(box, entries, context) {
+function reconcileInbox(box, entries, context, groups = null) {
   if (!box.cardNodes) box.cardNodes = new Map();
   const cards = box.cardNodes;
   const keep = new Set(entries.map(e => e.item.item_id));
-  for (const id of cards.keys()) if (!keep.has(id)) cards.delete(id);
-  const nodes = [];
-  for (const entry of entries) {
+  for (const key of [...cards.keys()]) if (!key.startsWith("group:") && !keep.has(key)) cards.delete(key);
+  const cardNode = (entry) => {
     const id = entry.item.item_id;
-    const signature = JSON.stringify([entry.session, entry.title, entry.item, S.answered.get(id)]);
+    // The open session's last error and seat are part of what the card shows, so a change in them redraws it.
+    const known = entry.session === S.openId && S.rec && C.parkChoices(entry.item) ? C.lastRecordedError(S.rec.blocks) : null;
+    const signature = JSON.stringify([entry.session, entry.title, entry.item, S.answered.get(id), known, S.sessions.byId.get(entry.session)?.title]);
     let saved = cards.get(id);
     if (!saved || saved.signature !== signature) {
       const wrap = el("div", "block inbox" + (entry.item.blocking ? " decision-card" : " informational"));
@@ -2054,9 +2528,32 @@ function reconcileInbox(box, entries, context) {
       saved = { signature, node: wrap };
       cards.set(id, saved);
     }
-    nodes.push(saved.node);
+    return saved.node;
+  };
+  const nodes = [];
+  if (groups) {
+    // One heading per mission, missions that block work first; the heading says how many items block.
+    const seenGroups = new Set();
+    for (const g of groups) {
+      const key = "group:" + g.key;
+      seenGroups.add(key);
+      const text = `${g.open} open${g.blocking ? `, ${g.blocking} ${g.blocking === 1 ? "needs" : "need"} you` : ""}`;
+      const signature = JSON.stringify([g.title, text, g.mission, g.root || g.entries[0].session]);
+      let saved = cards.get(key);
+      if (!saved || saved.signature !== signature) {
+        const h = el("h2", "inbox-group" + (g.blocking ? " blocking" : ""));
+        add(h, link(g.title, C.sessionHash(g.root || g.entries[0].session)), el("span", "dim inbox-group-count", " · " + text));
+        saved = { signature, node: h };
+        cards.set(key, saved);
+      }
+      nodes.push(saved.node);
+      for (const entry of g.entries) nodes.push(cardNode(entry));
+    }
+    for (const key of [...cards.keys()]) if (key.startsWith("group:") && !seenGroups.has(key)) cards.delete(key);
+  } else {
+    for (const entry of entries) nodes.push(cardNode(entry));
   }
-  if (!nodes.length && context === "inbox") nodes.push(el("p", "dim", "Nothing is waiting for you."));
+  if (!nodes.length && context === "inbox") nodes.push(emptyInbox);
   preserveFocus(box, () => {
     nodes.forEach((node, i) => { if (box.children[i] !== node) box.insertBefore(node, box.children[i] || null); });
     while (box.children.length > nodes.length) box.lastElementChild.remove();
@@ -2064,13 +2561,27 @@ function reconcileInbox(box, entries, context) {
   for (const entry of entries) syncAnswerState(entry.item.item_id);
 }
 
+// One node, so the focus placed on it survives the redraws.
+const emptyInbox = el("p", "dim inbox-empty", "Nothing is waiting for you.");
+emptyInbox.tabIndex = -1;
+
 function showInbox() {
+  closeNotes({ inbox: true });
   setView("inbox");
   renderInbox();
 }
 
 function renderInbox() {
-  reconcileInbox($("inbox-list"), C.inboxSorted(S.inbox), "inbox");
+  const rootOf = (mission) => {
+    if (!mission) return null;
+    for (const i of S.sessions.byId.values()) if (i.mission === mission && !i.parent) return i;
+    return null;
+  };
+  const rootTitle = (mission) => { const r = rootOf(mission); return r ? r.title || r.id : null; };
+  const rootId = (mission) => { const r = rootOf(mission); return r ? r.id : null; };
+  const groups = C.inboxGroups(S.inbox, rootTitle);
+  for (const g of groups) g.root = rootId(g.mission);
+  reconcileInbox($("inbox-list"), groups.flatMap(g => g.entries), "inbox", groups);
   const granted = notificationsAvailable() && Notification.permission === "granted";
   $("notif-state").textContent = "Notifications: " + (granted ? "on" : "off");
   $("notif-btn").hidden = !notificationsAvailable() || Notification.permission !== "default";
@@ -2137,6 +2648,7 @@ async function submitNew(ev) {
 
 function setTab(t) {
   S.tab = t;
+  S.ask = null;
   for (const b of document.querySelectorAll("#tabs .tab")) {
     const selected = b.dataset.tab === t;
     b.classList.toggle("sel", selected);
@@ -2162,15 +2674,16 @@ async function loadLedger() {
   const info = S.sessions.byId.get(S.openId);
   if (!info) return;
   S.ledger.mission = info.mission;
+  S.ledger.pending = true;
   const mission = info.mission;
   const request = ++S.requests.ledger;
   try {
     const v = await api("GET", "/api/missions/" + encodeURIComponent(mission) + "/ledger");
     if (request !== S.requests.ledger || S.ledger.mission !== mission) return;
-    S.ledger = { mission, model: C.ledgerModel(v), state: v.state, error: null, stale: false };
+    S.ledger = { mission, model: C.ledgerModel(v), state: v.state, error: null, stale: false, pending: false };
   } catch (e) {
     if (request !== S.requests.ledger || S.ledger.mission !== mission) return;
-    S.ledger = { ...S.ledger, error: e.message, stale: false };
+    S.ledger = { ...S.ledger, error: e.message, stale: false, pending: false };
   }
   if (S.tab === "ledger" || S.tab === "network") want("right");
   want("header", "overview");
@@ -2225,6 +2738,17 @@ function li(...kids) {
 }
 
 function renderRight() {
+  renderRightBody();
+  // A question that has just been raised takes the focus once, so the keyboard lands on its answer.
+  if (S.ask && S.ask.focus) {
+    S.ask.focus = false;
+    // The safe answer takes the focus, so a held or doubled Enter cannot confirm what the operator has not yet read.
+    const safe = document.querySelector('#panel [data-focus-key="ask:no"]');
+    if (safe) safe.focus({ preventScroll: true });
+  }
+}
+
+function renderRightBody() {
   const p = $("panel");
   for (const b of document.querySelectorAll("#tabs .tab")) b.classList.toggle("sel", b.dataset.tab === S.tab);
   const info = S.sessions.byId.get(S.openId);
@@ -2262,9 +2786,10 @@ async function loadModels() {
 }
 
 /** A select of the live profiles; `first` labels an empty first option (no choice), or null for none. */
-function modelSelect(label, profiles, value, first, choose) {
+function modelSelect(label, profiles, value, first, choose, focusKey = "") {
   const s = el("select");
   s.setAttribute("aria-label", label);
+  if (focusKey) s.dataset.focusKey = focusKey;
   if (first !== null) s.append(new Option(first, ""));
   for (const p of profiles) s.append(new Option(p, p));
   s.value = value || "";
@@ -2288,6 +2813,55 @@ async function changeModels(work) {
   }
 }
 
+/** The inline question before a Models-tab change; the same words as the model seat, and nothing is sent until the operator answers. */
+function modelAsk(ask) {
+  if (ask.kind === "fold") {
+    const open = S.sessions.byId.get(S.openId);
+    return C.foldConfirm(open && open.title);
+  }
+  const models = seatModels();
+  if (ask.kind === "lead") {
+    const q = C.seatConfirm(models, S.models.view && S.models.view.lead_model, ask.value);
+    if (!q) return null;
+    return { ...q, text: q.text.replace("Switch this session to", "Switch the lead to") };
+  }
+  const who = ask.role === "*" ? "every role" : ask.role;
+  if (!ask.value) return { text: `Clear the choice for ${who}? New agents of it use the pack's setting again.`, yes: "Clear the choice", no: "Keep it" };
+  const entry = models.find((m) => m && m.profile === ask.value);
+  const down = entry && entry.reachable === false ? ` ${ask.value} is not reachable now; the next step fails until it answers.` : "";
+  const moved = ask.now
+    ? " The running agents of it move too; each one's next request re-reads its whole prompt once."
+    : " Agents already running keep their model.";
+  return { text: `New agents of ${who} start on ${ask.value}.${moved}${down}`, yes: "Use it", no: "Keep it" };
+}
+
+/** A held key must not confirm: an auto-repeated Enter on the affirmative button is ignored. */
+function noRepeat(button) {
+  button.addEventListener("keydown", (e) => { if (e.repeat) e.preventDefault(); });
+}
+
+/** A question with two buttons, placed where the operator is looking. Focus lands on the question, and returns to `opener` when it closes. */
+function confirmRow(q, onYes, onNo) {
+  const box = el("div", "model-confirm");
+  box.setAttribute("role", "group");
+  const text = el("p", "model-confirm-text", q.text);
+  text.id = "ask-text";
+  box.setAttribute("aria-labelledby", "ask-text");
+  const yes = btn(q.yes, "small primary", onYes);
+  yes.dataset.focusKey = "ask:yes";
+  noRepeat(yes);
+  const no = btn(q.no, "small", onNo);
+  no.dataset.focusKey = "ask:no";
+  add(box, text, add(el("span", "model-confirm-actions"), yes, no));
+  return box;
+}
+
+function askClose(opener) {
+  S.ask = null;
+  want("right");
+  if (opener) requestAnimationFrame(() => { const t = document.querySelector(`[data-focus-key="${opener}"]`); if (t) t.focus({ preventScroll: true }); });
+}
+
 function setLeadModel(lead, profile) {
   return changeModels(async () => {
     const r = await api("POST", "/api/sessions/" + encodeURIComponent(lead) + "/model", { profile });
@@ -2295,9 +2869,9 @@ function setLeadModel(lead, profile) {
   });
 }
 
-function setRoleModel(lead, role, value) {
+function setRoleModel(lead, role, value, now) {
   return changeModels(async () => {
-    const body = C.roleModelBody(role, value, S.models.now);
+    const body = C.roleModelBody(role, value, now);
     const r = await api("POST", "/api/sessions/" + encodeURIComponent(lead) + "/role-model", body);
     S.models.view = r.models;
     const who = role === "*" ? "every role" : role;
@@ -2306,6 +2880,7 @@ function setRoleModel(lead, role, value) {
   });
 }
 
+let askSaid = null;
 function renderModels(p, info) {
   const m = S.models.view;
   if (S.models.error) {
@@ -2321,36 +2896,56 @@ function renderModels(p, info) {
   // Stacked rows (name, a full-width select, a note): the inspector is narrow, and a two-column grid
   // squeezed the selects until their labels were cut.
   const kv = el("div", "model-rows");
-  const row = (k, ...v) => {
+  // The question of a change sits right after the row that raised it, so Tab from the select reaches its buttons.
+  const row = (k, kind, role, ...v) => {
     kv.append(add(el("div", "model-row"), el("div", "model-name", k), ...v));
+    if (q && ask.kind === kind && ask.role === role) {
+      const done = ask.kind === "lead" ? () => setLeadModel(ask.lead, ask.value) : () => setRoleModel(ask.lead, ask.role, ask.value, ask.now);
+      const opener = ask.kind === "lead" ? "ask:lead" : "ask:role:" + ask.role;
+      kv.append(confirmRow(q, () => { askClose(opener); done(); }, () => askClose(opener)));
+    }
   };
   const lead = m.lead_model;
+  const ask = S.ask && S.ask.kind !== "fold" && S.ask.lead === m.lead ? S.ask : null;
+  const q = ask ? modelAsk(ask) : null;
+  if (ask && !q) S.ask = null;
+  const pending = (kind, role) => q && ask.kind === kind && ask.role === role ? ask.value : null;
   row(
-    "lead",
-    modelSelect("Model of the lead", m.profiles, lead.profile, null, (v) => setLeadModel(m.lead, v)),
+    "lead", "lead", undefined,
+    modelSelect("Model of the lead", m.profiles, pending("lead") ?? lead.profile, null, (v) => {
+      S.ask = v === lead.profile ? null : { kind: "lead", lead: m.lead, value: v };
+      want("right");
+    }, "ask:lead"),
     el("div", "dim", `${lead.model} · context ${lead.context_window ? C.tokens(lead.context_window) : "unknown"}`),
   );
   if (m.roles.length) {
     row(
-      "every role",
-      modelSelect("Model for agents of every role", m.profiles, m.any_role, "As each role's pack setting says", (v) => setRoleModel(m.lead, "*", v)),
+      "every role", "role", "*",
+      modelSelect("Model for agents of every role", m.profiles, pending("role", "*") ?? m.any_role, "As each role's pack setting says", (v) => {
+        S.ask = v === (m.any_role || "") ? null : { kind: "role", lead: m.lead, role: "*", value: v, now: S.models.now };
+        want("right");
+      }, "ask:role:*"),
     );
     for (const r of m.roles) {
       row(
-        r.verifier ? `${r.role} (finish gate)` : r.role,
-        modelSelect(`Model for ${r.role} agents`, m.profiles, r.chosen, C.roleDefaultLabel(r, m.any_role), (v) => setRoleModel(m.lead, r.role, v)),
+        r.verifier ? `${r.role} (finish gate)` : r.role, "role", r.role,
+        modelSelect(`Model for ${r.role} agents`, m.profiles, pending("role", r.role) ?? r.chosen, C.roleDefaultLabel(r, m.any_role), (v) => {
+          S.ask = v === (r.chosen || "") ? null : { kind: "role", lead: m.lead, role: r.role, value: v, now: S.models.now };
+          want("right");
+        }, "ask:role:" + r.role),
         el("div", "dim", C.runningAgentsWords(r.agents)),
       );
     }
   }
-  const parts = [kv];
+  const parts = [];
+  parts.push(kv);
   if (m.roles.length) {
     const now = el("input");
     now.type = "checkbox";
     now.checked = S.models.now;
     now.disabled = S.models.busy;
     now.addEventListener("change", () => { S.models.now = now.checked; });
-    parts.push(add(el("label", "check"), now, document.createTextNode(" Also move the running agents of a role when choosing for it")));
+    parts.push(add(el("label", "check"), now, document.createTextNode(" Also move the running agents of a role when choosing for it (read when a choice is made)")));
   }
   parts.push(
     el("p", "dim", m.roles.length
@@ -2358,7 +2953,10 @@ function renderModels(p, info) {
       : "This lead starts no agents."),
     btn("Refresh", "", () => loadModels()),
   );
-  p.replaceChildren(...parts);
+  // The question is read out once when it opens; focus stays on the select.
+  if (q && askSaid !== q.text) toast(q.text);
+  askSaid = q ? q.text : null;
+  preserveFocus(p, () => p.replaceChildren(...parts));
 }
 
 function ruleInput(placeholder) {
@@ -2539,13 +3137,19 @@ function renderContext(p) {
   frag.append(nums);
   frag.append(el("div", "dim", `${sum.counts.live} live · ${sum.counts.stubbed} stubbed · ${sum.counts.reasoning_dropped} reasoning dropped · ${sum.counts.dropped} dropped · ${sum.pinned} pinned`));
   const bar = el("div", "nums");
-  add(bar, btn("Fold now", "", async () => {
+  const fold = btn("Fold now", "", () => { S.ask = { kind: "fold", focus: true }; want("right"); });
+  fold.dataset.focusKey = "ask:fold";
+  add(bar, fold, btn("Refresh", "", loadWindow));
+  if (S.ask && S.ask.kind === "fold") {
     // Reweave is silent until a later record lands, so confirm it was asked for and pull the view.
-    if (await act(api("POST", "/api/sessions/" + encodeURIComponent(S.openId) + "/reweave")) !== undefined) {
-      notice("Folding now — the view updates when it is done.");
-      loadWindow();
-    }
-  }), btn("Refresh", "", loadWindow));
+    frag.append(confirmRow(modelAsk(S.ask), async () => {
+      askClose("ask:fold");
+      if (await act(api("POST", "/api/sessions/" + encodeURIComponent(S.openId) + "/reweave")) !== undefined) {
+        notice(C.FOLD_RECEIPT);
+        loadWindow();
+      }
+    }, () => askClose("ask:fold")));
+  }
   const hide = el("label", "dim");
   const cb = el("input");
   cb.type = "checkbox";
@@ -2569,7 +3173,10 @@ function renderContext(p) {
   }
   for (const r of rows.slice(S.win.from)) {
     const row = el("div", "wrow" + (r.folded ? " folded" : ""));
-    add(row, el("span", "k", "#" + r.seq), el("span", "pv", (r.pinned ? "📌 " : "") + r.preview));
+    const pv = el("span", "pv");
+    if (r.pinned) add(pv, icon("pin"), el("span", "sr-only", "Pinned: "));
+    pv.append(document.createTextNode(r.preview));
+    add(row, el("span", "k", "#" + r.seq), pv);
     add(row, el("span", "meta", `${r.kind.replace(/_/g, " ")} · `));
     row.lastChild.append(el("span", "st-" + r.state, r.stateWords), document.createTextNode(` · ${r.size}${r.pinned ? " · pinned" : ""}`));
     frag.append(row);
@@ -3034,6 +3641,8 @@ async function sessionAction(name, body) {
   const id = S.openId;
   if (!id || S.actionState.has(id)) return;
   const label = name === "stop" ? "Stopping…" : name === "resume" ? "Resuming…" : body?.archived ? "Archiving…" : "Unarchiving…";
+  if (name === "stop") S.stopAsked.add(id);
+  else if (name === "resume") S.stopAsked.delete(id);
   S.actionState.set(id, { name, label, archived: body?.archived, accepted: false });
   renderHeader();
   try {
@@ -3045,7 +3654,7 @@ async function sessionAction(name, body) {
     // Archiving a mission drops its open inbox items on the daemon without emitting a resolve
     // record, so pull the authoritative inbox to clear them here too (and bring them back on undo).
     if (name === "archive") loadInbox();
-  } catch (e) { S.actionState.delete(id); notice(e.message); }
+  } catch (e) { S.actionState.delete(id); S.stopAsked.delete(id); notice(e.message); }
   if (S.openId === id) renderHeader();
 }
 
@@ -3098,7 +3707,278 @@ function resizeInspector(width) {
 // ---------------------------------------------------------------------------------------------
 // Wiring
 
+// ---------------------------------------------------------------------------------------------
+// Keyboard: the switcher, the shortcut sheet, stepping through missions
+
+const MAC = /Mac|iPhone|iPad/.test((typeof navigator === "object" && (navigator.platform || navigator.userAgent)) || "");
+let toastTimer = 0;
+/** A short line for everyone: shown for a few seconds and read out politely. Never an alert. */
+function toast(text) {
+  const t = $("keys-live");
+  t.textContent = text;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.textContent = ""; }, 4000);
+}
+
+const SW_SHOWN = 60;
+const SW = { rows: [], active: 0, opener: null, chose: false };
+
+function openSwitcher() {
+  const dialog = $("switcher");
+  if (dialog.open) { $("switcher-q").focus(); return; }
+  if (document.querySelector("dialog[open]")) return;
+  SW.opener = document.activeElement;
+  SW.chose = false;
+  SW.active = 0;
+  $("switcher-q").value = "";
+  renderSwitcher();
+  dialog.showModal();
+  $("switcher-q").focus();
+}
+
+function renderSwitcher() {
+  const q = $("switcher-q").value;
+  S.now = Date.now();
+  SW.rows = C.switcherRows(S.sessions, S.inbox, q, { now: S.now, activity: S.activity, since: S.connectedSince, showArchived: S.showArchived });
+  SW.active = Math.max(0, Math.min(SW.active, Math.min(SW.rows.length, SW_SHOWN) - 1));
+  const list = $("switcher-list");
+  const frag = document.createDocumentFragment();
+  SW.rows.slice(0, SW_SHOWN).forEach((row, i) => {
+    const li = el("li", "sw-row" + (i === SW.active ? " active" : ""));
+    li.id = "sw-" + i;
+    li.setAttribute("role", "option");
+    li.setAttribute("aria-selected", String(i === SW.active));
+    const m = add(el("span", "mark mark-" + (row.mark.tone || "dim")), icon(row.mark.icon), el("span", "sr-only", row.mark.words + ": "));
+    const main = add(el("span", "sw-main"),
+      add(el("span", "sw-line"), el("span", "sw-name", row.title), row.root ? null : el("span", "sw-kind dim", "agent")),
+      el("span", "sw-ident mono dim", row.identity.text));
+    if (row.reason) {
+      const why = add(el("span", "sw-reason tone-" + (row.reason.tone || "quiet")), icon(row.reason.icon), el("span", "", row.reason.text));
+      if (row.reason.tip) why.title = row.reason.tip;
+      main.append(why);
+    }
+    add(li, m, main);
+    li.addEventListener("click", () => chooseSwitcher(i));
+    frag.append(li);
+  });
+  list.replaceChildren(frag);
+  const input = $("switcher-q");
+  if (SW.rows.length) input.setAttribute("aria-activedescendant", "sw-" + SW.active); else input.removeAttribute("aria-activedescendant");
+  const more = SW.rows.length > SW_SHOWN ? `, first ${SW_SHOWN} shown: type to narrow` : "";
+  $("switcher-status").textContent = SW.rows.length
+    ? `${C.count(SW.rows.length, "session")}${q.trim() ? (SW.rows.length === 1 ? " matches" : " match") : ""}${more}`
+    : `No session matches "${q.trim()}"`;
+  list.querySelector(".active")?.scrollIntoView({ block: "nearest" });
+}
+
+function moveSwitcher(delta) {
+  const n = Math.min(SW.rows.length, SW_SHOWN);
+  if (!n) return;
+  SW.active = (SW.active + delta + n) % n;
+  renderSwitcher();
+}
+
+function chooseSwitcher(i = SW.active) {
+  const row = SW.rows[i];
+  if (!row) return;
+  SW.chose = true;
+  $("switcher").close();
+  const hash = C.sessionHash(row.id);
+  if (location.hash === hash) route(); else location.hash = hash;
+  // The record is on screen now: focus lands on its selected tab, so the keyboard goes on from there.
+  setTimeout(() => document.querySelector('#mission-tabs [aria-selected="true"]')?.focus({ preventScroll: true }), 60);
+}
+
+function openKeys() {
+  if (document.querySelector("dialog[open]")) return;
+  const body = $("keys-body");
+  body.replaceChildren();
+  for (const group of C.keySheet(MAC)) {
+    const list = el("dl", "keys-list");
+    for (const row of group.rows) {
+      const caps = el("dt", "keys-caps");
+      row.keys.forEach((k, i) => { if (i) caps.append(document.createTextNode(" ")); caps.append(el("kbd", "", k)); });
+      add(list, caps, el("dd", "", row.text));
+    }
+    add(body, el("h3", "keys-group", group.title), list);
+  }
+  add(body, el("p", "dim keys-note", "No key stops a session or interrupts work: Stop is a button, with its scope stated. Shortcuts without a modifier do nothing while you type in a field."));
+  $("keys").showModal();
+}
+
+/** Alt+Down / Alt+Up: the next or previous row of the sidebar, without wrapping. */
+/** After a step to another mission the focused control may have gone with the view it was in: the selected mission tab takes the focus. */
+function rescueFocus() {
+  setTimeout(() => {
+    const a = document.activeElement;
+    if (a && a !== document.body && a.isConnected && a.getClientRects().length) return;
+    const tab = document.querySelector('#mission-tabs [role="tab"][aria-selected="true"]') || $("mission-tab-chat");
+    if (tab && tab.getClientRects().length) tab.focus({ preventScroll: true });
+  }, 150);
+}
+
+function stepRow(dir) {
+  const rows = [...document.querySelectorAll("#sessions a.row")];
+  const at = rows.findIndex(a => a.getAttribute("aria-current") === "page");
+  const i = C.stepIndex(rows.length, at, dir);
+  if (i === null) { toast(rows.length ? (dir > 0 ? "Last row of the sidebar" : "First row of the sidebar") : "No missions listed"); return; }
+  const a = rows[i];
+  const inList = !!document.activeElement?.closest?.("#sessions");
+  location.hash = a.getAttribute("href");
+  toast(`${a.querySelector(".name")?.textContent || "Mission"}, row ${i + 1} of ${rows.length}`);
+  if (inList) setTimeout(() => document.querySelector(`[data-focus-key="${a.dataset.focusKey}"]`)?.focus({ preventScroll: true }), 0);
+  else rescueFocus();
+}
+
+/** Alt+Shift+Down / Up: the next mission that blocks on the operator, cycling; said aloud as "2 of 3 needing you". */
+function stepNeeds(dir) {
+  const next = C.nextNeedsYou(S.sessions, S.inbox, S.view === "session" ? S.openId : null, dir);
+  if (!next) { toast("Nothing needs you"); return; }
+  const info = S.sessions.byId.get(next.id);
+  toast(`${next.words}: ${info?.title || next.id}`);
+  const hash = C.sessionHash(next.id);
+  if (location.hash === hash) route(); else location.hash = hash;
+  rescueFocus();
+}
+
+function keyboard(e) {
+  if (e.defaultPrevented) return; // a widget that handled the key itself (the agent rows) keeps it
+  const action = C.shortcutFor(e, { typing: C.typingTarget(e.target), mac: MAC });
+  if (!action) return;
+  const modal = document.querySelector("dialog[open]");
+  if (action === "switch") {
+    e.preventDefault(); // browsers bind Ctrl+K to their own search; the button does the same
+    if (!modal || modal === $("switcher")) openSwitcher();
+    return;
+  }
+  if (modal) return;
+  // A modal drawer makes the main column inert: Find would open where the keyboard cannot go.
+  if (action === "find" && document.querySelector('#left[aria-modal="true"], #right[aria-modal="true"]')) return;
+  e.preventDefault();
+  if (action === "row-next") stepRow(1);
+  else if (action === "row-prev") stepRow(-1);
+  else if (action === "needs-next") stepNeeds(1);
+  else if (action === "needs-prev") stepNeeds(-1);
+  else if (action === "keys") openKeys();
+  else if (action === "find") openFind();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Find in the record
+
+const FIND = { result: null, cur: -1, timer: 0, node: null };
+
+function openFind() {
+  if (S.view !== "session" || !S.rec) return false;
+  if (S.section !== "chat") setSection("chat");
+  $("find-bar").hidden = false;
+  $("btn-find").setAttribute("aria-expanded", "true");
+  const q = $("find-q");
+  q.focus();
+  q.select();
+  if (q.value.trim()) findRun(false);
+  return true;
+}
+
+function closeFind(restore = true) {
+  clearTimeout(FIND.timer);
+  FIND.result = null;
+  FIND.cur = -1;
+  FIND.node = null;
+  findSaid = "";
+  $("find-hint").textContent = "";
+  const was = !$("find-bar").hidden;
+  $("find-bar").hidden = true;
+  $("btn-find").setAttribute("aria-expanded", "false");
+  $("find-count").textContent = "";
+  if (was && restore) $("btn-find").focus({ preventScroll: true });
+}
+
+let findSaid = "";
+function renderFind() {
+  const r = FIND.result;
+  let text = r ? C.findWords(r, FIND.cur, false) : "";
+  const hit = r && FIND.cur >= 0 ? r.hits[FIND.cur] : null;
+  // What matched is said in words too, not only drawn: the snippet of the current hit follows the count.
+  if (hit) text += ": " + C.findSnippet(hit);
+  if (text && S.rec && !S.rec.initialComplete) text += " (the record is still loading)";
+  // The live region is written only when its words change, so typing does not repeat itself.
+  if (text !== findSaid) { findSaid = text; $("find-count").textContent = text; }
+  const hint = r ? C.findHint(r) : "";
+  if ($("find-hint").textContent !== hint) $("find-hint").textContent = hint;
+  $("find-go").disabled = !hit;
+}
+
+/** Search the whole loaded record. `jump` goes to the first match; without it nothing becomes current, except a hit kept by id. */
+function findRun(jump) {
+  if (!S.rec) return;
+  const kept = FIND.result && FIND.cur >= 0 ? FIND.result.hits[FIND.cur]?.id : undefined;
+  const result = C.findInRecord(S.rec.blocks, $("find-q").value, $("find-kind").value, S.rec.records.size);
+  let cur = jump && result.count ? 0 : -1;
+  if (!jump && kept !== undefined) { const at = result.hits.findIndex(h => h.id === kept); if (at >= 0) cur = at; }
+  FIND.result = result;
+  FIND.cur = cur;
+  renderFind();
+  if (jump && cur >= 0) jumpToRecord(result.hits[cur].seq, { done: (node) => { FIND.node = node; } });
+}
+
+function findStep(dir) {
+  if (!$("find-q").value.trim()) return;
+  findRun(false); // the record may have grown since the last search
+  const r = FIND.result;
+  if (!r || !r.count) return;
+  // With no current hit (Enter before the search ran, or Find reopened) the first Enter lands on the first hit, the last for Shift+Enter.
+  FIND.cur = FIND.cur < 0 ? (dir > 0 ? 0 : r.count - 1) : (FIND.cur + (dir < 0 ? -1 : 1) + r.count) % r.count;
+  renderFind();
+  jumpToRecord(r.hits[FIND.cur].seq, { done: (node) => { FIND.node = node; } });
+}
+
+function wireFind() {
+  $("btn-find").addEventListener("click", () => { if ($("find-bar").hidden) openFind(); else closeFind(); });
+  $("find-close").addEventListener("click", () => closeFind());
+  $("find-go").addEventListener("click", () => { if (FIND.node && FIND.node.isConnected) FIND.node.focus(); });
+  $("find-next").addEventListener("click", () => findStep(1));
+  $("find-prev").addEventListener("click", () => findStep(-1));
+  $("find-q").addEventListener("input", () => {
+    clearTimeout(FIND.timer);
+    FIND.cur = -1; // a hit kept from a shorter query is not stepped past when Enter beats the timer
+    if (!$("find-q").value.trim()) { FIND.result = null; renderFind(); return; }
+    // Typing only counts (after a pause); Enter, Next and Previous go to a match.
+    FIND.timer = setTimeout(() => findRun(false), 350);
+  });
+  $("find-kind").addEventListener("change", () => findRun(true));
+  $("find-bar").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeFind(); }
+    else if (e.key === "Enter" && e.target === $("find-q")) { e.preventDefault(); clearTimeout(FIND.timer); findStep(e.shiftKey ? -1 : 1); }
+  });
+}
+
+function wireKeyboard() {
+  $("switch-cap").textContent = MAC ? "⌘K" : "Ctrl+K";
+  $("btn-switch").setAttribute("aria-keyshortcuts", MAC ? "Meta+K" : "Control+K");
+  $("btn-switch").addEventListener("click", openSwitcher);
+  $("btn-keys").addEventListener("click", openKeys);
+  const sw = $("switcher");
+  const q = $("switcher-q");
+  q.addEventListener("input", () => { SW.active = 0; renderSwitcher(); });
+  q.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowDown") { e.preventDefault(); moveSwitcher(1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); moveSwitcher(-1); }
+    else if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); chooseSwitcher(); }
+  });
+  $("switcher-close").addEventListener("click", () => sw.close());
+  $("keys-close").addEventListener("click", () => $("keys").close());
+  for (const d of [sw, $("keys")]) d.addEventListener("click", (e) => { if (e.target === d) d.close(); }); // the backdrop
+  sw.addEventListener("close", () => {
+    if (!SW.chose && SW.opener && document.contains(SW.opener)) SW.opener.focus({ preventScroll: true });
+    SW.opener = null;
+  });
+  document.addEventListener("keydown", keyboard);
+  wireFind();
+}
+
 function wire() {
+  wireKeyboard();
   $("btn-inbox").addEventListener("click", () => {
     if (location.hash === "#/inbox") route();
     else location.hash = "#/inbox";
@@ -3126,6 +4006,21 @@ function wire() {
     b.addEventListener("click", () => setTab(b.dataset.tab));
     b.addEventListener("keydown", e => tabKeys(e, tabs, tab => setTab(tab.dataset.tab)));
   }
+  $("mission-agents").addEventListener("keydown", agentsKeys);
+  $("mission-agents").addEventListener("focusin", (e) => {
+    const main = e.target.closest && e.target.closest(".agent-main");
+    if (!main) return;
+    const rows = [...$("mission-agents").querySelectorAll(".agent-main")];
+    const at = rows.indexOf(main);
+    rows.forEach((r, i) => {
+      r.tabIndex = i === at ? 0 : -1;
+      const spawn = r.parentElement.querySelector(".agent-spawn");
+      if (spawn) spawn.tabIndex = i === at ? 0 : -1;
+    });
+    S.agentsActive = main.parentElement.dataset.agent;
+  });
+  // Events never fetch the scores: this is the one clock, and scoreDue keeps it to once in two minutes.
+  setInterval(() => { if (S.view === "session" && S.section === "agents" && !document.hidden) loadScore(false); }, 15000);
   const missionTabs = [...document.querySelectorAll("#mission-tabs [data-view]")];
   for (const b of missionTabs) {
     b.addEventListener("click", () => setSection(b.dataset.view));
@@ -3134,9 +4029,10 @@ function wire() {
 
   $("scroller").addEventListener("scroll", () => {
     const s = $("scroller");
+    if (S.jumping) return;
     const was = S.follow;
     S.follow = C.atEnd(s.scrollTop, s.clientHeight, s.scrollHeight);
-    $("jump").hidden = S.section !== "chat" || S.follow;
+    updateJump();
     if (S.follow && !was) want("blocks");
   });
   $("jump").addEventListener("click", () => {
@@ -3154,6 +4050,10 @@ function wire() {
     syncChat();
   });
 
+  // The composer's height, for what has to sit above it when it overlays the page (the jump button on a phone).
+  if (typeof ResizeObserver === "function") {
+    new ResizeObserver(() => document.body.style.setProperty("--composer-h", Math.round($("composer").getBoundingClientRect().height) + "px")).observe($("composer"));
+  }
   $("s-id").addEventListener("click", copySessionId);
   $("s-goal-toggle").addEventListener("click", () => { S.goalOpen = !S.goalOpen; renderHeader(); });
   $("b-rename").addEventListener("click", renameSession);
@@ -3186,6 +4086,10 @@ function wire() {
   });
 
   $("new-form").addEventListener("submit", submitNew);
+  // Coming back to the page is opening what it shows: the notifications about it are withdrawn.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") closeNotes(S.view === "inbox" ? { inbox: true } : S.view === "session" ? { session: S.openId } : {});
+  });
   $("notif-btn").addEventListener("click", async () => {
     try {
       await Notification.requestPermission();
@@ -3234,7 +4138,7 @@ function wire() {
     window.addEventListener("pointercancel", done);
   });
   document.addEventListener("keydown", (e) => {
-    if ($("viewer").open) return;
+    if (document.querySelector("dialog[open]")) return;
     const side = matchMedia("(max-width: 1099px)").matches && document.body.classList.contains("show-right") ? "right"
       : matchMedia("(max-width: 699px)").matches && document.body.classList.contains("show-left") ? "left" : null;
     if (e.key === "Escape" && side) { e.preventDefault(); setDrawer(side, false); }
@@ -3275,6 +4179,8 @@ async function start() {
     want("list", "header", "overview");
   }, 30000);
   setInterval(loadStatus, 60000);
+  // The inbox is also read again on a timer, so a missed record cannot leave an item standing or missing.
+  setInterval(loadInbox, 60000);
 }
 
 start();

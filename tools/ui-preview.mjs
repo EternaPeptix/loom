@@ -3,6 +3,11 @@
 // Fixture-only routes: GET /__fixture/state, POST /__fixture/question, POST /__fixture/reconnect, and
 // POST /__fixture/stream (streams a short live reply into s-other: reasoning, text and a tool call as delta frames, then
 // the model_response, tool_call and tool_result records; a second step follows, so a work group grows while it runs).
+// Pass 2 adds: GET /api/missions/{id}/score (the daemon's ScoreView), POST /__fixture/end {session?, outcome?} (ends the
+// running s-notify mission live and opens its "finished" inbox item), and POST /api/sessions/{id}/reweave (202, writes a
+// reweave record). New sessions: m-fleet (13 agents to depth 4, s-fl-*), s-parked (parked on necromicon with a recorded
+// error), s-quiet (running, last record 41 min old), s-notify (running, for /__fixture/end), s-tools (every ToolStatus),
+// s-big (5,000 records for Find).
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -27,9 +32,9 @@ const profiles = [
 ];
 const modelRef = p => ({ profile: p.profile, model: p.model, context_window: p.context_window });
 const profileOf = name => profiles.find(p => p.profile === name);
-function session(id, title, { parent = null, phase = "running", last_end = null, outcome = null, workspace = "/fixture/loom", profile = "dsv41", prompt = 86000, cached = 84000 } = {}) {
+function session(id, title, { parent = null, phase = "running", last_end = null, outcome = null, workspace = "/fixture/loom", profile = "dsv41", prompt = 86000, cached = 84000, mission = null, role = null, pack = "core", age = 3600000, step = 48, completion = 18000 } = {}) {
   const p = profileOf(profile);
-  return { id, title, mission: parent || id === "s-audit" ? "m-audit" : "m-" + id, parent, workspace, pack: "core", role: parent ? "worker" : "lead", profile: p.profile, model: p.model, context_window: p.context_window, created_ms: now - 3600000, unattended: true, archived: false, active: phase === "running", status: { phase, step: 48, last_end, outcome, epoch: 1, prompt_tokens: prompt, cached_tokens: cached, completion_tokens_total: 18000, open_inbox: 0 } };
+  return { id, title, mission: mission || (parent || id === "s-audit" ? "m-audit" : "m-" + id), parent, workspace, pack, role: role || (parent ? "worker" : "lead"), profile: p.profile, model: p.model, context_window: p.context_window, created_ms: now - age, unattended: true, archived: false, active: phase === "running", status: { phase, step, last_end, outcome, epoch: 1, prompt_tokens: prompt, cached_tokens: cached, completion_tokens_total: completion, open_inbox: 0 } };
 }
 const sessions = [
   session("s-audit", "Audit harness reliability", { phase: "idle", last_end: "waiting", profile: "dsv41" }),
@@ -37,6 +42,38 @@ const sessions = [
   session("s-other", "Indexer benchmark", { workspace: "/fixture/indexer", profile: "qwen", prompt: 190000, cached: 150000 }),
   session("s-result", "Dependency review", { phase: "ended", last_end: "finished", outcome: "done", workspace: "/fixture/docs", profile: "necromicon", prompt: 40000, cached: 0 }),
 ];
+// Pass-2 fixtures. `custom` sessions write their own start records below (with chosen timestamps); the generic loop skips them.
+const MIN = 60000;
+const custom = new Set();
+const budgets = new Map([["s-audit", { max_steps: 120, max_minutes: 90 }], ["s-fl-lead", { max_steps: 200, max_minutes: 240 }]]);
+// [id, title, parent, role, phase, last_end, outcome, profile, step, completion tokens, minutes since created, minutes since its last record]
+const fleet = [
+  ["s-fl-lead", "Fleet: audit the build pipeline", null, "lead", "running", null, null, "dsv41", 142, 1240000, 300, 0.5],
+  ["s-fl-dispatch", "Dispatch: split the audit", "s-fl-lead", "dispatcher", "running", null, null, "dsv41", 61, 310000, 290, 1],
+  ["s-fl-web", "Solver: web build hooks", "s-fl-dispatch", "web_solver", "running", null, null, "qwen", 88, 480000, 270, 2],
+  ["s-fl-webcheck", "Verifier: web build hooks", "s-fl-web", "verifier", "running", null, null, "qwen", 12, 41000, 40, 0.2],
+  ["s-fl-crypto", "Solver: artifact signing", "s-fl-dispatch", "crypto_solver", "idle", "asked", null, "dsv41", 54, 220000, 262, 22],
+  ["s-fl-bin", "Solver: release binary", "s-fl-dispatch", "binary_solver", "ended", "finished", "done", "dsv41", 73, 390000, 255, 95],
+  ["s-fl-judge", "Judge: release binary claims", "s-fl-bin", "judge", "ended", "error", "failed", "qwen", 9, 22000, 120, 70],
+  ["s-fl-deep", "Re-check: signature offsets", "s-fl-judge", "worker", "ended", "finished", "done", "qwen", 6, 15000, 100, 80],
+  ["s-fl-recon", "Recon: dependency inventory", "s-fl-lead", "worker", "idle", "waiting", null, "qwen", 37, 150000, 280, 7],
+  ["s-fl-docs", "Docs: write up findings", "s-fl-lead", "worker", "ended", "finished", "done", "dsv41", 25, 98000, 200, 31],
+  ["s-fl-net", "Net: registry mirrors", "s-fl-lead", "worker", "running", null, null, "qwen", 44, 260000, 150, 3],
+  ["s-fl-verify", "Verifier: lead claims", "s-fl-lead", "verifier", "ended", "budget_exhausted", "budget_exhausted", "dsv41", 30, 120000, 180, 55],
+  ["s-fl-stopped", "Probe: retry timings", "s-fl-recon", "worker", "idle", "stopped", null, "qwen", 18, 64000, 140, 44],
+];
+for (const [id, title, parent, role, phase, last_end, outcome, profile, step, completion, age] of fleet) {
+  sessions.push(session(id, title, { parent, role, phase, last_end, outcome, profile, step, completion, age: age * MIN, mission: "m-fleet", pack: "ctf", workspace: "/fixture/pipeline", prompt: 60000 + step * 700, cached: 50000 + step * 600 }));
+  custom.add(id);
+}
+sessions.push(
+  session("s-parked", "Fix the flaky recovery test", { phase: "idle", last_end: "parked", profile: "necromicon", workspace: "/fixture/loom", step: 63, completion: 71000, prompt: 90000, cached: 0, age: 5 * 3600000 }),
+  session("s-quiet", "Rebuild the search index", { phase: "running", profile: "dsv41", workspace: "/fixture/indexer", step: 27, completion: 33000, prompt: 410000, cached: 380000, age: 2 * 3600000 }),
+  session("s-notify", "Nightly dependency sweep", { phase: "running", profile: "qwen", workspace: "/fixture/docs", step: 12, completion: 9000, age: 40 * MIN }),
+  session("s-tools", "Tool result shapes", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 9, completion: 6000, age: 90 * MIN }),
+  session("s-big", "Long investigation (5,000 records)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 1250, completion: 900000, prompt: 300000, cached: 280000, age: 6 * 3600000 }),
+);
+for (const id of ["s-parked", "s-quiet", "s-notify", "s-tools", "s-big"]) custom.add(id);
 let inbox = [
   { session: "s-audit", mission: "m-audit", title: "Audit harness reliability", opened_ms: now - 240000, item: { item_id: "i-scope", item_kind: "question", text: "Include the desktop app in this audit?", options: ["Include desktop", "Runtime only"], blocking: true, call_id: "question", reference: "q1" } },
   { session: "s-result", mission: "m-s-result", title: "Dependency review", opened_ms: now - 600000, item: { item_id: "i-result", item_kind: "finished", text: "The review is ready to read.", options: [], blocking: false, call_id: "finish" } },
@@ -44,13 +81,13 @@ let inbox = [
 let startupClock = now - 16 * 60000; // the records written at startup are spread over the minutes before it
 function append(id, kind, fields = {}, author = "harness", live = false) {
   const log = logs.get(id) || []; logs.set(id, log);
-  const record = { seq: log.length, ts_ms: live ? Date.now() : (startupClock += 40000), author, prev: "0".repeat(64), kind, ...fields };
+  const record = { seq: log.length, ts_ms: fields.ts_ms ?? (live ? Date.now() : (startupClock += 40000)), author, prev: "0".repeat(64), kind, ...fields };
   log.push(record);
   if (live) emit({ type: "record", session: id, record });
   return record;
 }
-for (const info of sessions) {
-  append(info.id, "session_start", { session: info.id, mission: info.mission, parent: info.parent, workspace: info.workspace, pack: info.pack, role: info.role, termination: "explicit", model: info.id === "s-audit" ? modelRef(profileOf("necromicon")) : modelRef(profileOf(info.profile)), budget: {}, reasoning_replay: "all", tools: [] });
+for (const info of sessions.filter(s => !custom.has(s.id))) {
+  append(info.id, "session_start", { session: info.id, mission: info.mission, parent: info.parent, workspace: info.workspace, pack: info.pack, role: info.role, termination: "explicit", model: info.id === "s-audit" ? modelRef(profileOf("necromicon")) : modelRef(profileOf(info.profile)), budget: budgets.get(info.id) || {}, reasoning_replay: "all", tools: [] });
   append(info.id, "user_message", { text: "Review reliability and preserve the evidence." }, "user");
 }
 append("s-audit", "tool_call", { call_id: "bash1", req_id: "r1", name: "bash", args: { command: "cargo test recovery" }, class: "exec" }, "model");
@@ -62,7 +99,183 @@ append("s-audit", "model_response", { req_id: "r1", text: "## Preliminary findin
 append("s-audit", "ledger", { n: 9, summary: "Claim and source evidence recorded." });
 append("s-audit", "inbox_opened", inbox[0].item);
 append("s-audit", "turn_end", { reason: "waiting" });
+// ---- Pass-2 records -------------------------------------------------------------------------------------------------
+const startOf = (info, ts_ms, text) => {
+  append(info.id, "session_start", { ts_ms, session: info.id, mission: info.mission, parent: info.parent, workspace: info.workspace, pack: info.pack, role: info.role, termination: "explicit", model: modelRef(profileOf(info.profile)), budget: budgets.get(info.id) || {}, reasoning_replay: "all", tools: [] });
+  append(info.id, "user_message", { ts_ms: ts_ms + 1000, text }, "user");
+};
+const sessionOf = id => sessions.find(s => s.id === id);
+let callN = 0;
+/** One model step (request, response with one call, the call, its result) starting at `t`; returns the next free time. */
+function step(id, t, { text = "", command = "make check", status = "ok", out = "ok", exit = null, ms = 1500, meta = {}, cut = false, output = null, name = "bash", cls = "exec", args = null }) {
+  const n = ++callN; const req_id = `fx-r${n}`; const call_id = `fx-c${n}`;
+  const a = args || { command };
+  append(id, "model_request", { ts_ms: t, req_id, step: n, epoch: 1, purpose: "step", est_tokens: 80000 }, "harness");
+  append(id, "model_response", { ts_ms: t + 800, req_id, text, reasoning: "", tool_calls: [{ call_id, name, arguments: JSON.stringify(a), complete: status !== "invalid" }], finish: "tool_calls", usage: { prompt_tokens: 80000, cached_tokens: 76000, completion_tokens: 50 }, timing: { ttft_ms: 300, total_ms: 800 }, attempts: 1 }, "model");
+  append(id, "tool_call", { ts_ms: t + 900, call_id, req_id, name, args: status === "invalid" ? null : a, class: cls }, "model");
+  append(id, "tool_result", { ts_ms: t + 900 + ms, call_id, name, status, text: out, ...(output ? { output } : {}), cut, class: cls, meta: { ...(exit === null ? {} : { exit_code: exit }), ...meta }, duration_ms: ms }, "tool");
+  return t + 1000 + ms;
+}
+
+// The fleet. Each agent's records end at its "minutes since last record"; parents record each spawn and each settle.
+for (const [id, title, parent, , , , , , , , age] of fleet) {
+  const created = now - age * MIN;
+  startOf(sessionOf(id), created, parent ? `Assignment from ${parent}: ${title}.` : "Audit the build pipeline: find where a release could ship unverified.");
+  if (parent) append(id, "harness_note", { ts_ms: created + 2000, note: "assignment", text: `Your brief: ${title}. Return findings with evidence.` }, "harness");
+}
+for (const [id, title, parent, role, , , , , , , age] of fleet) {
+  if (!parent) continue;
+  append(parent, "child_spawned", { ts_ms: now - age * MIN - 500, child: id, role, mode: "fresh", brief: { question: title.replace(/^[^:]+: /, "") + "?", scope: "/fixture/pipeline", return: "findings with evidence" }, budget: { max_steps: 60, max_minutes: 90 }, call_id: "fx-spawn-" + id }, "harness");
+}
+for (const [id, , parent, , phase, last_end, outcome, , nsteps, , age, quiet] of fleet) {
+  const lastTs = now - quiet * MIN; let t = now - age * MIN + 60000;
+  const rounds = Math.min(3, Math.max(1, Math.floor(nsteps / 20)));
+  for (let i = 0; i < rounds; i++) t = step(id, Math.min(t, lastTs - 8000), { text: i === 0 ? "Starting with the build configuration." : "", command: ["make check", "rg -n 'verify' build/", "cat release.toml"][i], out: ["ok: 214 tests", "build/sign.sh:12: verify=false", "channel = \"stable\""][i], exit: 0 });
+  if (phase === "ended") {
+    const failed = outcome === "failed";
+    append(id, "turn_end", { ts_ms: lastTs - 2000, reason: outcome === "done" ? "finished" : failed ? "error" : "budget_exhausted" }, "harness");
+    append(id, "session_end", { ts_ms: lastTs, outcome, detail: failed ? "The model request failed after 3 attempts." : outcome === "budget_exhausted" ? "The step budget was used up." : "Finished." }, "harness");
+    append(parent, "child_settled", { ts_ms: lastTs + 500, child: id, outcome: outcome === "done" ? "returned" : outcome, report: failed ? "No report: the child failed." : `Report from ${id}: findings recorded in the ledger.`, full: null, usage: {}, steps: nsteps, inline: false }, "harness");
+  } else if (phase === "idle") {
+    append(id, "turn_end", { ts_ms: lastTs, reason: last_end }, "harness");
+  } else {
+    append(id, "model_request", { ts_ms: lastTs, req_id: "fx-run-" + id, step: nsteps, epoch: 1, purpose: "step", est_tokens: 80000 }, "harness");
+  }
+}
+// Parent logs were appended to out of time order: sort each by timestamp and renumber.
+for (const [id] of fleet) { const log = logs.get(id); log.sort((a, b) => a.ts_ms - b.ts_ms || a.seq - b.seq); log.forEach((r, i) => { r.seq = i; }); }
+
+// A blocking question, a scope request and a parked card for the inbox. The parked text is the daemon's texts::turn_failed(why).
+const err = "connection refused: http://10.0.0.9:8000/v1 did not answer; start the server or run `loom models reload` after fixing the profile's base_url.";
+inbox.push(
+  { session: "s-fl-crypto", mission: "m-fleet", title: "Solver: artifact signing", opened_ms: now - 22 * MIN, item: { item_id: "i-fl-key", item_kind: "question", text: "The signing key is not in the workspace. Is it in the vault, or should the signature check be skipped?", options: ["Use the vault key", "Skip the signature check"], blocking: true, call_id: "question", reference: "q2" } },
+  { session: "s-fl-net", mission: "m-fleet", title: "Net: registry mirrors", opened_ms: now - 9 * MIN, item: { item_id: "i-fl-scope", item_kind: "approval", text: "Needs to read the package index to compare mirror hashes.", options: ["registry.fixture.invalid", "mirror.fixture.invalid"], blocking: false, call_id: "request_scope" } },
+  { session: "s-parked", mission: "m-s-parked", title: "Fix the flaky recovery test", opened_ms: now - 50 * MIN, item: { item_id: "i-parked", item_kind: "parked", text: "The session could not continue. The model request failed after 3 attempts: " + err + " Nothing was lost: answer here, or send the session a message, to make it try again.", options: [], blocking: true, call_id: "stop_gate" } },
+);
+append("s-fl-crypto", "inbox_opened", { ts_ms: now - 22 * MIN + 1, ...inbox.find(e => e.item.item_id === "i-fl-key").item }, "harness");
+append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.item.item_id === "i-fl-scope").item }, "harness");
+
+// s-parked: on necromicon (unreachable); the model request failed three times and the record keeps the error sentence.
+{
+  const t0 = now - 5 * 3600000;
+  startOf(sessionOf("s-parked"), t0, "Fix the flaky recovery test and show it passing 20 times in a row.");
+  step("s-parked", t0 + 60000, { text: "Running the test once to see the failure.", command: "cargo test recovery::report_after_crash", status: "error", out: "error: test recovery::report_after_crash failed\nassertion failed: report.answer.is_some()", exit: 101, ms: 4200 });
+  append("s-parked", "model_request", { ts_ms: now - 62 * MIN, req_id: "fx-park-1", step: 63, epoch: 1, purpose: "step", est_tokens: 90000 }, "harness");
+  append("s-parked", "model_response", { ts_ms: now - 61 * MIN, req_id: "fx-park-1", text: "", reasoning: "", tool_calls: [], finish: "error", usage: { prompt_tokens: 0, cached_tokens: 0, completion_tokens: 0 }, timing: { total_ms: 3000 }, attempts: 3 }, "model");
+  append("s-parked", "harness_note", { ts_ms: now - 61 * MIN + 500, note: "info", text: "The model request failed after 3 attempts: " + err }, "harness");
+  append("s-parked", "turn_end", { ts_ms: now - 60 * MIN, reason: "error" }, "harness");
+  append("s-parked", "harness_note", { ts_ms: now - 55 * MIN, note: "nudge", text: "Nothing is recorded since the last error. Continue the goal or ask the operator." }, "harness");
+  append("s-parked", "turn_end", { ts_ms: now - 50 * MIN, reason: "parked" }, "harness");
+  append("s-parked", "inbox_opened", { ts_ms: now - 50 * MIN + 1, ...inbox.find(e => e.item.item_id === "i-parked").item }, "harness");
+}
+// s-quiet: running, and its last record is 41 minutes old.
+{
+  const t0 = now - 2 * 3600000;
+  startOf(sessionOf("s-quiet"), t0, "Rebuild the search index from the full corpus.");
+  step("s-quiet", t0 + 5 * MIN, { text: "Starting the rebuild.", command: "indexer rebuild --full", out: "ok: rebuild started, 4 shards", exit: 0 });
+  append("s-quiet", "model_request", { ts_ms: now - 41 * MIN, req_id: "fx-quiet", step: 27, epoch: 1, purpose: "step", est_tokens: 410000 }, "harness");
+}
+// s-notify: running with fresh records; POST /__fixture/end finishes it.
+{
+  const t0 = now - 40 * MIN;
+  startOf(sessionOf("s-notify"), t0, "Check every dependency for a newer release and list the breaking ones.");
+  step("s-notify", t0 + 3 * MIN, { text: "Listing the manifests.", command: "ls */Cargo.toml", out: "crates/a/Cargo.toml\ncrates/b/Cargo.toml", exit: 0 });
+  append("s-notify", "model_request", { ts_ms: now - 20000, req_id: "fx-notify", step: 12, epoch: 1, purpose: "step", est_tokens: 60000 }, "harness");
+}
+// s-tools: one result of each failure shape, back to back so they sit in one work group.
+{
+  const t0 = now - 90 * MIN; let t = t0 + 2 * MIN;
+  startOf(sessionOf("s-tools"), t0, "Try the build, write the config, and read the log.");
+  t = step("s-tools", t, { text: "Running the tests.", command: "make test", status: "error", out: "make: *** [test] Error 2", exit: 2 });
+  t = step("s-tools", t, { command: "make lint", out: "lint: clean", exit: 0 });
+  t = step("s-tools", t, { name: "write", cls: "write", args: { path: "/etc/hosts", text: "127.0.0.1 fixture" }, status: "denied", out: "denied: /etc/hosts is outside the sandbox's writable paths (the workspace and /tmp). Nothing was written." });
+  t = step("s-tools", t, { name: "read", cls: "read", args: { path: "big.log", start: "top" }, status: "invalid", out: "invalid arguments for read: `start` must be an integer, got \"top\". Nothing ran.", ms: 5 });
+  t = step("s-tools", t, { command: "sleep 600", status: "timeout", out: "timed out after 120s; the process was killed. Its output so far is stored.", ms: 120000 });
+  t = step("s-tools", t, { command: "cargo build --release", status: "interrupted", out: "interrupted: the session was stopped while this ran; its effects are unknown.", ms: 30000 });
+  t = step("s-tools", t, { name: "read", cls: "read", args: { path: "big.log", start: 1, end: 200 }, out: lines.slice(0, 200).join("\n"), cut: true, output: { id: blob, bytes: 128000, lines: 5000 }, meta: { shown: [[1, 200]] }, ms: 6 });
+  t = step("s-tools", t, { command: "make test", status: "error", out: "make: *** [test] Error 1", exit: 1 });
+  append("s-tools", "turn_end", { ts_ms: t + 1000, reason: "waiting" }, "harness");
+}
+// s-big: 5,000 records (1,250 steps of request, response, call, result) with known needles for Find.
+{
+  const id = "s-big"; const t0 = now - 6 * 3600000;
+  startOf(sessionOf(id), t0, "Investigate the slow shutdown and keep notes as you go.");
+  append(id, "turn_start", { ts_ms: t0 + 2000, trigger: "user" }, "harness");
+  lines[4199] = "deep-needle: only in the stored output, past the cut";
+  for (let i = 0; i < 1250; i++) {
+    const t = t0 + 10000 + i * 15000; const req_id = `big-r${i}`; const call_id = `big-c${i}`;
+    let out = `ok: step ${i} listed ${i % 7 + 1} files`, text = "";
+    if (i % 97 === 0) out += `\nneedle ${i}: shutdown waits on the flush`;
+    if (i === 7 || i === 1203) out += "\nrare-token-xyz appears here";
+    if (i === 500) out += "\nNeedle (capitalised) in the middle";
+    if (i === 640) text = "Notes: the naïve café path skips the flush.";
+    if (i === 900) out += "\nliteral a.b*c(d) [x] must match as typed";
+    if (i % 50 === 0) text = text || `Checkpoint ${i}: still reading the shutdown path.`;
+    const cut = i === 1100;
+    if (cut) out = lines.slice(0, 40).join("\n") + "\n[output cut: 5000 lines stored]";
+    if (i === 600) append(id, "user_message", { ts_ms: t - 500, text: "Please also check the retry path." }, "user");
+    append(id, "model_request", { ts_ms: t, req_id, step: i + 1, epoch: 1, purpose: "step", est_tokens: 300000 }, "harness");
+    append(id, "model_response", { ts_ms: t + 3000, req_id, text, reasoning: "", tool_calls: [{ call_id, name: "bash", arguments: JSON.stringify({ command: `ls dir${i}` }), complete: true }], finish: "tool_calls", usage: { prompt_tokens: 300000, cached_tokens: 280000, completion_tokens: 40 }, timing: { ttft_ms: 400, total_ms: 3000 }, attempts: 1 }, "model");
+    append(id, "tool_call", { ts_ms: t + 3100, call_id, req_id, name: "bash", args: { command: `ls dir${i}` }, class: "exec" }, "model");
+    append(id, "tool_result", { ts_ms: t + 3300, call_id, name: "bash", status: "ok", text: out, ...(cut ? { output: { id: blob, bytes: 128000, lines: 5000 } } : {}), cut, class: "exec", meta: { exit_code: 0 }, duration_ms: 200 }, "tool");
+  }
+  append(id, "turn_end", { ts_ms: t0 + 10000 + 1250 * 15000, reason: "waiting" }, "harness");
+}
+
 const ledger = { entries: 9, goal: "Find actionable reliability defects and preserve source evidence.", constraints: [{ id: "k1", text: "Read-only review." }], plan: [{ id: "p1", text: "Inspect recovery paths", status: "done", note: "Source finding recorded." }, { id: "p2", text: "Review tool execution", status: "doing" }, { id: "p3", text: "Independently verify findings", status: "todo" }], claims: [{ id: "c1", text: "Recovered reports may omit the answer.", status: "open", evidence: ["e1"], note: "Crash reproduction pending." }, { id: "c2", text: "Process tracking ends when the shell exits.", status: "supported", evidence: ["e2", "e3"] }], evidence: [{ id: "e1", supports: true, kind: "static", attested: true, quote: "full: None,", blob, lines: [1596, 1596], session: "s-audit", call_id: "read1", note: "Source text only." }, { id: "e2", supports: true, kind: "execution", attested: true, quote: "job settled (exit 0) while pid 4127 still running", blob, lines: [212, 214], session: "s-worker", call_id: "bash7" }, { id: "e3", supports: false, kind: "note", attested: false, quote: "a foreground pipeline was tracked to completion", note: "Only observed with a backgrounded child." }], obligations: [{ id: "o1", kind: "agent", text: "Recovery review", outcome: null }], decisions: [], dead_ends: [], questions: [] };
+
+// m-fleet keeps a ledger too: a six-step plan (two done, one doing) for the progress line, and an open claim.
+const fleetLedger = { entries: 14, goal: "Find where a release of the build pipeline could ship unverified.", constraints: [{ id: "k1", text: "Read-only: change nothing in the pipeline." }], plan: [{ id: "p1", text: "Inventory the dependencies", status: "done", note: "" }, { id: "p2", text: "Trace the release signing path", status: "done", note: "Signing key is out of the workspace." }, { id: "p3", text: "Audit the web build hooks", status: "doing", note: "" }, { id: "p4", text: "Check the registry mirrors", status: "todo", note: "" }, { id: "p5", text: "Re-check the release binary claims", status: "todo", note: "" }, { id: "p6", text: "Write up the findings", status: "todo", note: "" }], claims: [{ id: "c1", text: "build/sign.sh skips verification when verify=false.", status: "open", evidence: [], note: "Reproduction pending." }], evidence: [], obligations: [], decisions: [], dead_ends: [], questions: [{ id: "q2", text: "Is the signing key in the vault?", status: "open" }] };
+const ledgers = new Map([["m-audit", ledger], ["m-fleet", fleetLedger]]);
+
+// GET /api/missions/{id}/score: the daemon's ScoreView, { mission, sessions: [{ session, role, parent, card }], total }.
+// Cards are folded from each log the way loom-core's scorecard::score does (steps, calls, malformed, finish refusals,
+// quote refusals, finished), except where `cardOverride` gives a hand-set one so the fleet shows varied counts.
+const card0 = () => ({ steps: 0, finished: false, steps_to_finish: null, calls: 0, malformed_calls: 0, finish_calls: 0, finish_refusals: 0, quote_refusals: 0, verifier_accepts: 0, verifier_rejections: 0, fresh_starts: 0, hand_offs: 0, asks: 0, unrecorded: false });
+const cardOverride = {
+  "s-fl-lead": { steps: 142, calls: 131, malformed_calls: 4, finish_calls: 2, finish_refusals: 1, quote_refusals: 3, verifier_accepts: 1, verifier_rejections: 2, fresh_starts: 1, asks: 2 },
+  "s-fl-dispatch": { steps: 61, calls: 70, malformed_calls: 1 },
+  "s-fl-web": { steps: 88, calls: 104, malformed_calls: 9, quote_refusals: 5, finish_calls: 3, finish_refusals: 3 },
+  "s-fl-webcheck": { steps: 12, calls: 15, verifier_rejections: 1 },
+  "s-fl-crypto": { steps: 54, calls: 60, asks: 1, hand_offs: 1 },
+  "s-fl-bin": { steps: 73, calls: 80, finish_calls: 1, finished: true, steps_to_finish: 73, verifier_accepts: 1 },
+  "s-fl-judge": { steps: 9, calls: 7, malformed_calls: 2 },
+  "s-fl-deep": { steps: 6, calls: 6, finish_calls: 1, finished: true, steps_to_finish: 6 },
+  "s-fl-recon": { steps: 37, calls: 41 },
+  "s-fl-docs": { steps: 25, calls: 19, finish_calls: 1, finished: true, steps_to_finish: 25 },
+  "s-fl-net": { steps: 44, calls: 52, malformed_calls: 3, asks: 1 },
+  "s-fl-verify": { steps: 30, calls: 33, finish_refusals: 2, finish_calls: 2, verifier_rejections: 1 },
+  "s-fl-stopped": { unrecorded: true, steps: 18, calls: 20 },
+};
+function cardOf(id) {
+  if (cardOverride[id]) return { ...card0(), ...cardOverride[id] };
+  const card = card0();
+  for (const r of logs.get(id) || []) {
+    if (r.kind === "model_request" && r.purpose === "step") card.steps++;
+    if (r.kind === "model_response") { card.calls += (r.tool_calls || []).length; card.malformed_calls += (r.tool_calls || []).filter(c => !c.complete).length; }
+    if (r.kind === "tool_result") {
+      if (r.status === "invalid") card.malformed_calls++;
+      if (r.meta && r.meta.refusal === "quote") card.quote_refusals++;
+      if (r.name === "finish") { card.finish_calls++; if (r.status !== "ok") card.finish_refusals++; }
+    }
+    if (r.kind === "session_end" && r.outcome === "done") card.finished = true;
+  }
+  return card;
+}
+/** The lead's card with every other session's added (Scorecard::add): counts sum, `unrecorded` ORs, the lead keeps finished/steps_to_finish. */
+function scoreView(mission) {
+  const members = sessions.filter(s => s.mission === mission);
+  if (!members.length) return null;
+  members.sort((a, b) => (a.parent !== null) - (b.parent !== null) || a.created_ms - b.created_ms || (a.id < b.id ? -1 : 1));
+  const scored = members.map(s => ({ session: s.id, role: s.role, parent: s.parent, card: cardOf(s.id) }));
+  const total = { ...scored[0].card };
+  for (const o of scored.slice(1)) for (const k of Object.keys(total)) {
+    if (k === "unrecorded") total[k] = total[k] || o.card[k];
+    else if (typeof total[k] === "number") total[k] += o.card[k];
+  }
+  return { mission, sessions: scored, total };
+}
+let scoreCalls = 0;
 
 let streaming = false;
 const delta = (id, req_id, d) => emit({ type: "delta", session: id, req_id, delta: d });
@@ -97,7 +310,13 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://localhost");
     const path = url.pathname;
-    if (path === "/__fixture/state") return json(res, { requests, inbox });
+    if (path === "/__fixture/state") return json(res, { requests, inbox, scoreCalls });
+    const scoreMatch = path.match(/^\/api\/missions\/([^/]+)\/score$/);
+    if (scoreMatch && req.method === "GET") {
+      scoreCalls++;
+      const view = scoreView(decodeURIComponent(scoreMatch[1]));
+      return view ? json(res, view) : json(res, { error: `There is no mission ${decodeURIComponent(scoreMatch[1])}.` }, 404);
+    }
     if (path === "/__fixture/question" && req.method === "POST") {
       const item = { session: "s-audit", mission: "m-audit", title: "Audit harness reliability", opened_ms: Date.now(), item: { item_id: "i-extra-" + inbox.length, item_kind: "question", text: "A second question arrived while you were typing.", options: [], blocking: false } };
       inbox.push(item); append("s-audit", "inbox_opened", item.item, "harness", true); return json(res, {});
@@ -106,6 +325,31 @@ const server = createServer(async (req, res) => {
       if (streaming) return json(res, { error: "A fixture reply is already streaming into s-other." }, 409);
       streaming = true; streamReply().catch(() => {}).finally(() => { streaming = false; });
       return json(res, { started: true, session: "s-other" });
+    }
+    if (path === "/__fixture/end" && req.method === "POST") {
+      // Ends a running mission as the daemon would: turn_end, session_end, the status and session frames, and (for a
+      // finish) the "finished" inbox item. Body: { session?: "s-notify", outcome?: "done" | "failed" | "budget_exhausted" | "stopped" }.
+      const data = await body(req); const id = data.session || "s-notify"; const info = sessions.find(s => s.id === id);
+      if (!info) return json(res, { error: "No such fixture session." }, 404);
+      if (info.status.phase === "ended") return json(res, { error: `Session ${id} has already ended.` }, 409);
+      const outcome = ["done", "failed", "budget_exhausted", "stopped"].includes(data.outcome) ? data.outcome : "done";
+      const last_end = outcome === "done" ? "finished" : outcome === "failed" ? "error" : outcome;
+      append(id, "turn_end", { reason: last_end }, "harness", true);
+      if (info.parent) {
+        // An agent settles: session_end and phase "ended". A root lead does neither; it goes back to idle with last_end.
+        append(id, "session_end", { outcome, detail: outcome === "done" ? "Finished." : "Ended by the fixture." }, "harness", true);
+        info.active = false; info.status = { ...info.status, phase: "ended", last_end, outcome, step: info.status.step + 1 };
+      } else {
+        info.active = false; info.status = { ...info.status, phase: "idle", last_end, outcome: null, step: info.status.step + 1 };
+      }
+      if (outcome === "done") {
+        const item = { item_id: "i-end-" + id, item_kind: "finished", text: "The sweep is finished: 3 breaking releases listed.", options: [], blocking: false, call_id: "finish" };
+        inbox.push({ session: id, mission: info.mission, title: info.title, opened_ms: Date.now(), item });
+        append(id, "inbox_opened", item, "harness", true);
+      }
+      emit({ type: "status", session: id, status: info.status });
+      emit({ type: "session", info: { ...info, status: { ...info.status, open_inbox: inbox.filter(e => e.session === id).length } } });
+      return json(res, { session: id, outcome });
     }
     if (path === "/__fixture/reconnect" && req.method === "POST") { for (const client of clients) client.end(); clients.clear(); return json(res, {}); }
     if (path === "/api/events") {
@@ -144,6 +388,12 @@ const server = createServer(async (req, res) => {
       }
       if (parts[4] === "messages") {
         await wait(2500); append(id, "user_message", { text: data.text }, "user", true); append(id, "model_request", { req_id: "fixture-delivery", purpose: "step", step: 49 }, "harness", true);
+      } else if (parts[4] === "reweave") {
+        if (info.status.phase === "ended") return json(res, { error: `Session ${id} has ended, so there is nothing to re-weave.` }, 409);
+        await wait(400);
+        const log = logs.get(id) || [];
+        append(id, "reweave", { epoch: info.status.epoch + 1, upto_seq: Math.max(0, log.length - 1), evictions: [], brief: "Fixture re-weave: older outputs became stubs; the ledger snapshot follows.", digest: null, reason: "operator", before_tokens: info.status.prompt_tokens, after_tokens_est: 30000 }, "harness", true);
+        info.status = { ...info.status, epoch: info.status.epoch + 1 };
       } else if (parts[4] === "stop") { await wait(500); info.status = { ...info.status, phase: "idle", last_end: "stopped" }; }
       else if (parts[4] === "resume") info.status = { ...info.status, phase: "running", last_end: null };
       else if (parts[4] === "archive") info.archived = data.archived;
@@ -154,7 +404,7 @@ const server = createServer(async (req, res) => {
     if (path === "/api/status") return json(res, { version: "fixture", pid: 0, started_ms: now, bind: "127.0.0.1:7878", proxy_port: 0, home: "/fixture/home", sandbox: "seatbelt", network: "allowlist", disk: { free_bytes: 200e9, total_bytes: 500e9 }, models: profiles, sessions_total: sessions.length, sessions_active: sessions.filter(s => s.active).length, sessions_running: sessions.filter(s => s.status.phase === "running").length, inbox_open: inbox.length });
     if (path === "/api/models") return json(res, { default_model: "dsv41", models: profiles });
     if (path.endsWith("/records")) { const after = Number(url.searchParams.get("after") ?? -1); return json(res, { records: (logs.get(path.split("/")[3]) || []).filter(r => r.seq > after), next_after: null }); }
-    if (path.endsWith("/ledger")) return json(res, { state: path.includes("m-audit") ? ledger : { entries: 0 }, markdown: "" });
+    if (path.endsWith("/ledger")) return json(res, { state: ledgers.get(decodeURIComponent(path.split("/")[3] || "")) || { entries: 0 }, markdown: "" });
     if (path.endsWith("/window")) return json(res, { est_tokens: 86000, prompt_tokens: 86000, cached_tokens: 84000, epoch: 1, context_window: 1000000, floor_tokens: 180000, target_tokens: 400000, items: [] });
     if (path.endsWith("/net")) return json(res, []);
     if (path.endsWith("/lines")) {

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Web UI pass 2: supervising many missions
+
+- Switcher (Ctrl/Cmd+K, `Switch…`), Alt+Up/Down and Alt+Shift+Up/Down (next mission that needs you), and a `?`
+  shortcut sheet; no key stops a session.
+- An **Agents** tab (`#/s/<id>/agents`): agents grouped Needs you, Running, Waiting, Idle, Ended in stable
+  creation order, with per-agent figures from `GET /api/missions/{id}/score` (on open, Refresh, at most every 120 s).
+- **Find in the record** (`/`): literal search of the whole loaded record including folded groups, with an honest
+  count; cut outputs are searched in the viewer.
+- Browser notifications for blocking items, results and mission endings: only when the page is hidden, batched within
+  5 s, never for a stop this tab asked for, closed when the item resolves.
+- A quiet indicator ("no new record for 41m"), a "New since your last visit" divider, "Jump to latest · N new" and
+  a progress line (plan, current step, budget as a limit) above the composer.
+- Tool statuses have their own shapes (`exit N`, denied, invalid, timeout, interrupted) with counts in group
+  headers, and a "partial" mark when the model saw only part of an output.
+- "Ways out" on parked and blocker cards (fold the context, switch model, last recorded error); the inbox is
+  grouped by mission with Ctrl/Cmd+Enter to send, focus to the next card, and "Refuse…" on scope requests.
+- Fixes: snapshot merge keeps live session state, Overview work only runs on its tab, the ledger is re-read after
+  a reconnect or `lagged`, an approved scope request is no longer shown as "Dismissed", Fold now and the model
+  selects confirm first, code blocks render in linear time, and the inbox self-heals every 60 s.
+- UI only; `docs/UI.md` is updated.
+
 ### Web UI: chat-first layout and visible model identity
 
 - The session opens on **Chat**, the whole record as a conversation (`#/s/<id>` and `/chat`; `/record` is

@@ -207,22 +207,6 @@ test("session store: list, event, status", () => {
   assert.equal(C.applyStatus(store, "s-nope", st({})), false);
 });
 
-test("session rows: roots newest first, agents nested oldest first, archived hidden", () => {
-  const store = C.createSessionStore();
-  C.applySessionList(store, [
-    info("s-old", { created_ms: 1000 }),
-    info("s-new", { created_ms: 5000 }),
-    info("s-new-b", { created_ms: 5200, parent: "s-new" }),
-    info("s-new-a", { created_ms: 5100, parent: "s-new" }),
-    info("s-arch", { created_ms: 9000, archived: true }),
-    info("s-orphan", { created_ms: 100, parent: "s-gone" }),
-  ]);
-  let rows = C.sessionRows(store);
-  assert.deepEqual(rows.map((r) => [r.info.id, r.depth]), [["s-new", 0], ["s-new-a", 1], ["s-new-b", 1], ["s-old", 0], ["s-orphan", 0]]);
-  rows = C.sessionRows(store, { showArchived: true });
-  assert.equal(rows[0].info.id, "s-arch");
-});
-
 test("state mark", () => {
   assert.equal(C.stateMark(info("a", { status: st({ phase: "running" }) }), 0), "running");
   assert.equal(C.stateMark(info("a", { status: st({ phase: "running" }) }), 1), "needs_you");
@@ -260,33 +244,6 @@ test("classified attention separates blockers, nonblocking questions and results
   assert.equal(C.stateMark(info("s-2", { status: st({ phase: "running" }) }), C.attentionFor(inbox, "s-2")), "needs_you");
   assert.equal(C.markWords("result_ready"), "result ready");
   assert.match(C.markWords("question"), /work can continue/);
-});
-
-test("mission groups aggregate descendant attention and collapse agents", () => {
-  const store = C.createSessionStore();
-  C.applySessionList(store, [
-    info("old", { created_ms: 100, status: st({ phase: "running" }) }),
-    info("new", { created_ms: 300, status: st({ phase: "running" }) }),
-    info("needs", { created_ms: 200 }),
-    info("worker", { parent: "needs", created_ms: 210 }),
-    info("grandchild", { parent: "worker", created_ms: 220 }),
-    info("ready", { status: st({ last_end: "finished" }) }),
-    info("archived", { archived: true }),
-  ]);
-  const inbox = C.createInbox();
-  C.applyInboxList(inbox, [{ session: "grandchild", item: { item_id: "i", item_kind: "question", blocking: true } }]);
-  let groups = C.missionGroups(store, inbox);
-  assert.deepEqual(groups.map((g) => g.key), ["needs_answer", "running", "ready"]);
-  assert.deepEqual(groups[0].rows.map((r) => r.info.id), ["needs"]);
-  assert.equal(groups[0].rows[0].agentCount, 2);
-  assert.equal(groups[0].rows[0].attention.blocking, 1);
-  assert.deepEqual(groups[1].rows.map((r) => r.info.id), ["new", "old"]);
-  groups = C.missionGroups(store, inbox, { expanded: new Set(["needs"]) });
-  assert.deepEqual(groups[0].rows.map((r) => [r.info.id, r.depth, r.mission]), [["needs", 0, "needs"], ["worker", 1, "needs"], ["grandchild", 2, "needs"]]);
-  C.applyStatus(store, "old", st({ phase: "running", step: 900 }));
-  assert.deepEqual(C.missionGroups(store, inbox)[1].rows.map((r) => r.info.id), ["new", "old"], "step updates do not reorder peers");
-  groups = C.missionGroups(store, inbox, { showArchived: true });
-  assert(groups.flatMap((g) => g.rows).some((r) => r.info.id === "archived"));
 });
 
 test("row activity uses recorded update time, never creation age", () => {
@@ -372,21 +329,17 @@ test("what waits on the operator is tallied by class with the oldest opening tim
   assert.equal(C.waitingFor(inbox, new Set(["none"])).blocking.count, 0);
 });
 
-test("mission rows carry running agents and what is waiting", () => {
-  const store = C.createSessionStore();
-  C.applySessionList(store, [
-    info("lead", { status: st({ last_end: "waiting" }) }),
-    info("w1", { parent: "lead", role: "worker", created_ms: 1100, status: st({ phase: "running" }) }),
-    info("w2", { parent: "lead", role: "worker", created_ms: 1200 }),
-  ]);
+test("mission rows carry what is waiting, and the second line of each", () => {
   const inbox = C.createInbox();
   C.applyInboxList(inbox, [{ session: "w1", opened_ms: 1000, item: { item_id: "i", item_kind: "question", blocking: true } }]);
-  const rows = C.missionGroups(store, inbox, { expanded: new Set(["lead"]) })[0].rows;
-  assert.deepEqual(rows.map((r) => [r.info.id, r.agentCount, r.agentsRunning]), [["lead", 2, 1], ["w1", 0, 0], ["w2", 0, 0]]);
+  const rows = [
+    { info: info("lead", { status: st({ last_end: "waiting" }) }), waiting: C.waitingFor(inbox, ["lead", "w1", "w2"]) },
+    { info: info("w1", { parent: "lead", role: "worker", status: st({ phase: "running" }) }), waiting: C.waitingFor(inbox, ["w1"]) },
+    { info: info("w2", { parent: "lead", role: "worker" }), waiting: C.waitingFor(inbox, ["w2"]) },
+  ];
   assert.equal(rows[0].waiting.blocking.count, 1, "the mission row counts what its agents are waiting for");
   assert.equal(rows[1].waiting.blocking.count, 1);
   assert.equal(rows[2].waiting.blocking.count, 0);
-  // the second line of each row
   const now = 1000 + 7 * 60000;
   assert.equal(C.rowSummary(rows[0], null, now), "Question waiting 7m · lead waiting");
   assert.equal(C.rowSummary(rows[1], null, now), "worker · question waiting 7m");
@@ -522,9 +475,7 @@ test("session actions", () => {
   assert.equal(C.sessionActions(info("a", { status: st({ phase: "ended", outcome: "done", last_end: "stopped" }) })).resume, false);
 });
 
-test("row detail and health dot", () => {
-  const i = info("a", { role: "lead", created_ms: 0, status: st({ step: 7, prompt_tokens: 12345 }) });
-  assert.equal(C.rowDetail(i, 2 * 3600_000), "lead · step 7 · 12.3k · 2h");
+test("health dot", () => {
   assert.equal(C.healthDot({ connected: false, models: [] }).state, "red");
   assert.equal(C.healthDot({ connected: true, models: [{ profile: "p", reachable: true }] }).state, "green");
   const amber = C.healthDot({ connected: true, models: [{ profile: "p", reachable: false, detail: "refused" }] });
@@ -557,7 +508,6 @@ test("inbox: records open and resolve items, blocking first, titles", () => {
   assert.equal(C.applyInboxRecord(inbox, "s-1", q, lookup), null, "announced once");
   assert.deepEqual(C.inboxSorted(inbox).map((e) => e.item.item_id), ["i-1", "i-0", "i-2"]);
   assert.deepEqual(C.inboxCounts(inbox), { open: 3, blocking: 1 });
-  assert.equal(C.inboxCountFor(inbox, "s-1"), 3);
   assert.equal(inbox.items.get("i-1").title, "T s-1");
   assert.deepEqual(inbox.items.get("i-1").item.options, ["y", "n"]);
   assert.equal(C.applyInboxRecord(inbox, "s-1", rec("inbox_resolved", { item_id: "i-1", answer: "y" }), lookup), "resolved");
@@ -572,9 +522,6 @@ test("inbox from the api list and the page title", () => {
   assert.equal(C.pageTitle({ open: 0, blocking: 0 }), "loom");
   assert.equal(C.pageTitle({ open: 2, blocking: 0 }), "(2) loom");
   assert.equal(C.pageTitle({ open: 2, blocking: 1 }), "(2) needs you · loom");
-  const n = C.notificationFor(inbox.items.get("i-9"));
-  assert.equal(n.tag, "i-9");
-  assert.match(n.title, /blocker/);
 });
 
 test("inbox list does not resurrect an item the operator already answered", () => {
@@ -1059,10 +1006,18 @@ test("planEvent", () => {
   assert.deepEqual(fx({ type: "delta", session: "s-2", req_id: "r", delta: { delta: "text", text: "x" } }), []);
   assert.deepEqual(fx({ type: "net", session: "s-1", entry: {} }), ["net"]);
   assert.deepEqual(fx({ type: "session", info: { id: "s-1", archived: false } }), ["session"], "a plain session event only updates the list");
+  // the open session's ledger is loaded once its session is known, and only while none is held or loading
+  const open = (ctxOver) => C.planEvent({ type: "session", info: { id: "s-1", mission: "m-5", archived: false } }, { ...ctx, ...ctxOver }).map((e) => e.fx);
+  assert.deepEqual(open({}), ["session", "load_ledger"]);
+  assert.deepEqual(open({ ledgerMission: "m-5" }), ["session"]);
+  assert.deepEqual(open({ ledgerPending: true }), ["session"]);
+  assert.deepEqual(C.planEvent({ type: "session", info: { id: "s-2", mission: "m-5" } }, ctx).map((e) => e.fx), ["session"], "another session");
+  assert.deepEqual(C.planEvent({ type: "session", info: { id: "s-1", mission: "m-5" } }, ctx).find((e) => e.fx === "load_ledger"), { fx: "load_ledger", mission: "m-5" });
   assert.deepEqual(fx({ type: "session", info: { id: "s-1", archived: true, status: { open_inbox: 1 } } }), ["session", "refetch_inbox"], "an archived session clears its inbox items");
   assert.deepEqual(fx({ type: "session", info: { id: "s-1", archived: false, status: { open_inbox: 2 } } }), ["session", "refetch_inbox"], "a session that reports open inbox items pulls them");
-  assert.deepEqual(fx({ type: "lagged", missed: 5 }), ["refetch_sessions", "refetch_inbox", "refetch_records"]);
-  assert.deepEqual(C.planEvent({ type: "lagged", missed: 5 }, { ...ctx, openId: null }).map((e) => e.fx), ["refetch_sessions", "refetch_inbox"]);
+  assert.deepEqual(fx({ type: "lagged", missed: 5 }), ["refetch_sessions", "refetch_inbox", "refetch_status", "refetch_ledger", "refetch_records"], "a lag re-reads the ledger and the status too");
+  assert.deepEqual(C.planEvent({ type: "lagged", missed: 5 }, { ...ctx, openId: null, ledgerMission: null }).map((e) => e.fx), ["refetch_sessions", "refetch_inbox", "refetch_status"]);
+  assert.deepEqual(C.planEvent({ type: "lagged", missed: 5 }, ctx).find((e) => e.fx === "refetch_ledger"), { fx: "refetch_ledger", mission: "m-1" });
   assert.deepEqual(fx({ type: "error", session: null, message: "boom" }), ["notice"]);
   assert.deepEqual(fx({ type: "settled", session: "s-1" }), []);
   assert.deepEqual(fx({ type: "from_the_future" }), []);
@@ -1361,8 +1316,6 @@ test("approving hosts builds the /scope request, refusing an empty list", () => 
   assert.deepEqual(C.scopeRequest("s/1", ["a.test"]).body, { hosts: ["a.test"] });
   assert.equal(C.scopeRequest("s/1", ["a.test"]).path, "/api/sessions/s%2F1/scope");
   assert.deepEqual(C.scopeRequest("s-1", [" ", ""]), { error: "Name the hosts to grant." });
-  assert.equal(C.scopeNotice({ hosts: ["a.test"], ledger: true }), "Granted: a.test.");
-  assert.match(C.scopeNotice({ hosts: ["a.test"], ledger: false }), /keeps no ledger/);
 });
 
 test("a blocking blocker or park offers its choices, cheapest first, and closing needs a reason", () => {
@@ -1465,8 +1418,6 @@ test("the store keeps the start model and follows model_switched", () => {
   assert.equal(sw.switch.from.profile, "dsv41");
   assert.equal(sw.switch.to.model, "qwen4-max-preview");
   assert.equal(sw.switch.reason, "operator");
-  assert.deepEqual(C.switchLine(sw), { from: "dsv41 · deepseek-v4.1 · 1M", to: "qwen · qwen4-max-preview · 262k", reason: "operator", text: sw.text });
-  assert.equal(C.switchLine({ kind: "user" }), null);
 });
 function createEmpty() { return C.createRecordStore("x"); }
 
@@ -1665,7 +1616,8 @@ test("tool rows: icon by class and name, capsule by state", () => {
   assert.deepEqual(rows[0].capsule, { text: "exit 0", tone: "ok", icon: "check" });
   assert.equal(rows[0].duration, "500ms");
   assert.equal(rows[0].icon, "tool-exec");
-  assert.deepEqual(rows[1].capsule, { text: "exit 2", tone: "bad", icon: "cross" });
+  assert.deepEqual(rows[1].capsule, { text: "exit 2", tone: "neutral", icon: "exit" }, "a non-zero exit is its own neutral shape, not the red cross");
+  assert.equal(rows[1].outcome, "exit");
   assert.deepEqual(rows[2].capsule, { text: "no result", tone: "warn", icon: "alert" });
   assert.equal(rows[3].icon, "tool-read");
   assert.equal(rows[0].argsLine, "ls");
@@ -2156,4 +2108,749 @@ test("sendStateText: the newer of the switch note and the message state wins; lo
   assert.equal(C.sendStateText({ seat, message: null }), seat.text);
   assert.equal(C.sendStateText({ seat, message: { text: "m", at: 9 }, loaded: false }), "Loading the record before messages can be sent.");
   assert.equal(C.sendStateText({}), "");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Pass 2
+
+test("applySessionList without sinceRev replaces; with it, entries changed by events since the request are kept", () => {
+  const store = C.createSessionStore();
+  C.applySessionList(store, [info("a"), info("b")]);
+  assert.deepEqual([...store.byId.keys()], ["a", "b"]);
+  // a request goes out at this rev; events arrive while it is in flight
+  const rev = store.rev;
+  C.applyStatus(store, "a", st({ phase: "running", step: 9 }));
+  C.applySessionEvent(store, info("c", { title: "born during the request" }));
+  const snapshot = [info("a", { status: st({ step: 1 }) }), info("b", { title: "newer b" })];
+  C.applySessionList(store, snapshot, { sinceRev: rev });
+  assert.equal(store.byId.get("a").status.step, 9, "the status event is newer than the snapshot");
+  assert.equal(store.byId.get("a").status.phase, "running");
+  assert.equal(store.byId.get("b").title, "newer b", "an untouched session takes the snapshot");
+  assert.equal(store.byId.get("c").title, "born during the request", "a session the snapshot does not list yet is kept");
+  // the next snapshot, requested after those events, replaces them
+  const rev2 = store.rev;
+  C.applySessionList(store, [info("a", { title: "from the list" })], { sinceRev: rev2 });
+  assert.deepEqual([...store.byId.keys()], ["a"]);
+  assert.equal(store.byId.get("a").title, "from the list");
+  // without sinceRev nothing is kept
+  C.applySessionEvent(store, info("d"));
+  C.applySessionList(store, [info("a")]);
+  assert.deepEqual([...store.byId.keys()], ["a"]);
+  assert.equal(store.changed.size, 0);
+});
+
+test("proseTree: paragraphs, headings, lists, bold and code, and fenced code collected in one pass", () => {
+  const t = C.proseTree("# Title with `x`\n\nfirst **bold** line\nsecond line\n\n- a\n- b\n1. one\n2) two\n\n```sh\nls -l\n\ncat x\n```\nafter");
+  assert.deepEqual(t.map((b) => b.type), ["h", "p", "ul", "ol", "pre", "p"]);
+  assert.deepEqual(t[0].inline, [{ type: "text", text: "Title with " }, { type: "code", text: "x" }]);
+  assert.deepEqual(t[1].inline, [{ type: "text", text: "first " }, { type: "strong", text: "bold" }, { type: "text", text: " line\nsecond line" }]);
+  assert.deepEqual(t[2].items, [[{ type: "text", text: "a" }], [{ type: "text", text: "b" }]]);
+  assert.equal(t[3].items.length, 2);
+  assert.equal(t[4].text, "ls -l\n\ncat x", "lines, blank ones included, joined once");
+  assert.deepEqual(t[5].inline, [{ type: "text", text: "after" }]);
+  // an unterminated fence runs to the end; markup inside a fence is not read
+  assert.deepEqual(C.proseTree("```\n**no**\n- x"), [{ type: "pre", text: "**no**\n- x" }]);
+  assert.deepEqual(C.proseTree(""), []);
+  assert.deepEqual(C.proseTree(null), []);
+  // a switch of list kind starts a new list; a blank line ends one
+  assert.deepEqual(C.proseTree("- a\n1. b\n\n- c").map((b) => b.type), ["ul", "ol", "ul"]);
+  // raw HTML stays text
+  assert.deepEqual(C.proseTree("<img src=x onerror=1>")[0].inline, [{ type: "text", text: "<img src=x onerror=1>" }]);
+  // linear: a 200k-line fence is one pass
+  const big = "```\n" + "x".repeat(20) + "\n".repeat(0) + Array.from({ length: 200000 }, () => "line").join("\n") + "\n```";
+  const t0 = performance.now();
+  assert.equal(C.proseTree(big)[0].text.split("\n").length, 200000);
+  assert.ok(performance.now() - t0 < 1000, "O(L), not O(L squared)");
+});
+
+test("quietFor: only a running session with a known old last record, neutral and factual", () => {
+  const run = info("a", { status: st({ phase: "running" }) });
+  const now = 10_000_000;
+  assert.equal(C.quietFor(run, { ts: now - 5 * 60000 }, now), null, "5 minutes is not quiet");
+  assert.equal(C.quietFor(run, { ts: now - C.QUIET_MS }, now), null, "the threshold itself is not past it");
+  const q = C.quietFor(run, { ts: now - 41 * 60000 - 5000 }, now);
+  assert.equal(q.text, "no new record for 41m");
+  assert.equal(q.icon, "hourglass");
+  assert.equal(q.tone, "", "never amber");
+  assert.match(q.tip, /can be normal/);
+  assert.doesNotMatch(JSON.stringify(q), /stall(ed)?\b.*stuck|stuck|hung/i);
+  assert.equal(C.quietFor(run, now - 3 * 3600000, now).text, "no new record for 3h", "a bare time works too");
+  assert.equal(C.quietFor(run, null, now), null, "unknown age shows nothing");
+  assert.equal(C.quietFor(run, { seq: 3 }, now), null);
+  assert.equal(C.quietFor(info("a", { status: st({ phase: "idle" }) }), { ts: 0 }, now), null, "only running sessions");
+  assert.equal(C.quietFor(info("a", { status: st({ phase: "ended" }) }), { ts: 0 }, now), null);
+  assert.equal(C.quietFor(null, { ts: 0 }, now), null);
+  // ranked below what waits on the operator
+  const waiting = C.waitingFor(inboxWith([blockingItem("a")]), ["a"]);
+  assert.equal(C.rowReason(waiting, run, { ts: 0 }, now).tone, "attention");
+  assert.equal(C.rowReason(C.waitingFor(C.createInbox(), ["a"]), run, { ts: 0 }, now).icon, "hourglass");
+});
+
+test("switcherRows: needs you, then running, then recent; plain substring over title, id prefix, workspace, profile, role", () => {
+  const store = sessionStore([
+    info("s-idle-old", { title: "Old thing", created_ms: 1000 }),
+    info("s-idle-new", { title: "New thing", created_ms: 9000 }),
+    info("s-run", { title: "Scan hosts", status: st({ phase: "running" }), workspace: "/w/necro", profile: "necromicon" }),
+    info("s-need", { title: "Port 8443", status: st({ phase: "running" }), role: "solver", parent: "s-run", created_ms: 2000 }),
+    info("s-need2", { title: "Port 22", workspace: "/w/ssh" }),
+    info("s-gone", { title: "Archived", archived: true }),
+  ]);
+  const inbox = inboxWith([blockingItem("s-need", "approval", 5000), blockingItem("s-need2", "blocker", 3000)]);
+  const rows = C.switcherRows(store, inbox, "", { now: 100000 });
+  assert.deepEqual(rows.map((r) => r.id), ["s-need2", "s-need", "s-run", "s-idle-new", "s-idle-old"], "oldest wait first; archived left out");
+  assert.deepEqual(rows.map((r) => r.group), ["needs_you", "needs_you", "running", "other", "other"]);
+  assert.equal(rows[0].mark.icon, "diamond");
+  assert.match(rows[1].reason.text, /^Approval waiting/);
+  assert.equal(rows[2].identity.parts[1], "lead");
+  assert.equal(C.switcherRows(store, inbox, "", { showArchived: true, now: 1 }).length, 6);
+  // with activity, recent first among the rest
+  const activity = new Map([["s-idle-old", { seq: 1, ts: 90000 }]]);
+  assert.equal(C.switcherRows(store, inbox, "", { now: 100000, activity }).at(-2).id, "s-idle-old");
+  assert.equal(C.switcherRows(store, inbox, "", { now: 100000, activity }).find((r) => r.id === "s-idle-old").identity.age, "10s");
+  const ids = (q) => C.switcherRows(store, inbox, q, { now: 100000 }).map((r) => r.id);
+  assert.deepEqual(ids("port"), ["s-need2", "s-need"], "title, case-insensitive");
+  assert.deepEqual(ids("8443"), ["s-need"]);
+  assert.deepEqual(ids("s-need"), ["s-need2", "s-need"], "id prefix");
+  assert.deepEqual(ids("need"), [], "an id is matched by its prefix, not from the middle");
+  assert.deepEqual(ids("-need"), []);
+  assert.deepEqual(ids("necro"), ["s-run"], "workspace name");
+  assert.deepEqual(ids("ssh"), ["s-need2"], "workspace name");
+  assert.deepEqual(ids("solver"), ["s-need"], "role");
+  assert.deepEqual(ids("necromicon"), ["s-run"], "profile");
+  assert.equal(C.switcherRows(store, inbox, "port", { now: 1 })[0].matched, "title");
+  assert.deepEqual(ids("p.rt"), [], "no pattern matching");
+  assert.deepEqual(ids("   "), ids(""), "a blank query is no query");
+});
+
+test("nextNeedsYou cycles the missions that need you and says where it is", () => {
+  const store = sessionStore([
+    info("a", { mission: "ma" }), info("a-kid", { mission: "ma", parent: "a" }),
+    info("b", { mission: "mb" }), info("c", { mission: "mc" }), info("quiet", { mission: "mq" }),
+    info("done", { mission: "md", status: st({ phase: "ended", outcome: "done" }) }),
+  ]);
+  const inbox = inboxWith([
+    blockingItem("a-kid", "approval", 3000), blockingItem("a", "question", 4000),
+    blockingItem("b", "blocker", 1000), blockingItem("c", "approval", 2000), blockingItem("done", "parked", 500),
+    { session: "quiet", item: { item_id: "q", item_kind: "question", blocking: false }, opened_ms: 1 },
+  ]);
+  const n = C.nextNeedsYou(store, inbox, "quiet", 1);
+  assert.deepEqual([n.id, n.index, n.total, n.words], ["b", 1, 3, "1 of 3 needing you"], "from elsewhere, the longest-waiting mission");
+  assert.equal(C.nextNeedsYou(store, inbox, "b", 1).id, "c");
+  assert.equal(C.nextNeedsYou(store, inbox, "c", 1).id, "a-kid", "lands on the session holding the oldest blocking item");
+  assert.equal(C.nextNeedsYou(store, inbox, "a", 1).id, "b", "cycles");
+  assert.equal(C.nextNeedsYou(store, inbox, "a-kid", 1).words, "1 of 3 needing you");
+  assert.equal(C.nextNeedsYou(store, inbox, "b", -1).id, "a-kid");
+  assert.equal(C.nextNeedsYou(store, inbox, "quiet", -1).words, "3 of 3 needing you");
+  assert.equal(C.nextNeedsYou(store, C.createInbox(), "a", 1), null);
+});
+
+test("missionEnding: a root that goes to ended, once, never for this tab's own stop", () => {
+  const was = info("m", { title: "Mission", status: st({ phase: "running" }) });
+  const ended = (outcome) => info("m", { title: "Mission", status: st({ phase: "ended", outcome }) });
+  assert.deepEqual(C.missionEnding(was, ended("failed")), { session: "m", mission: "m-m", title: "Mission", outcome: "failed", words: "failed" });
+  assert.equal(C.missionEnding(was, ended("done")).words, "done");
+  assert.equal(C.missionEnding(was, ended("budget_exhausted")).words, "budget exhausted");
+  assert.equal(C.missionEnding(ended("done"), ended("done")), null, "already ended: no second notice");
+  assert.equal(C.missionEnding(was, was), null);
+  assert.equal(C.missionEnding(null, ended("done")), null, "a session not seen before is history, not news");
+  assert.equal(C.missionEnding(was, { ...ended("done"), parent: "p" }), null, "agents are not missions");
+  assert.equal(C.missionEnding(was, ended("stopped"), { requested: new Set(["m"]) }), null, "a stop this tab asked for");
+  assert.equal(C.missionEnding(was, ended("stopped"), { requested: new Set(["other"]) }).outcome, "stopped");
+  assert.equal(C.missionEnding(was, ended("failed"), { requested: new Set(["m"]) }).outcome, "failed", "only a stop is excused");
+  // a status frame: the held info with the new status
+  assert.equal(C.missionEnding(was, { ...was, status: st({ phase: "ended", outcome: "done" }) }).outcome, "done");
+  // through the store, the way the page holds it
+  const store = sessionStore([was]);
+  const before = store.byId.get("m");
+  C.applyStatus(store, "m", st({ phase: "ended", outcome: "done" }));
+  assert.ok(C.missionEnding(before, store.byId.get("m")));
+});
+
+const notice = (over = {}) => C.noticeOfInbox({ session: "s-1", title: "Scan", item: { item_id: "i-1", item_kind: "approval", blocking: true, text: "May I curl x?" }, ...over }, 1000);
+
+test("notices: blocking and result items and endings, with the sidebar's nouns", () => {
+  assert.deepEqual(notice(), { tag: "i-1", session: "s-1", title: "Scan", at: 1000, kind: "needs_you", noun: "Approval waiting", text: "May I curl x?" });
+  assert.equal(notice({ item: { item_id: "i", item_kind: "parked", blocking: true, text: "t" } }).noun, "Parked session waiting");
+  assert.equal(notice({ item: { item_id: "i", item_kind: "finished", blocking: false, text: "ok" } }).noun, "Result ready");
+  assert.equal(notice({ item: { item_id: "i", item_kind: "finished", blocking: false, text: "ok" } }).kind, "result");
+  assert.equal(notice({ item: { item_id: "i", item_kind: "question", blocking: false, text: "q" } }), null, "a question work can go on without");
+  assert.equal(C.noticeOfInbox(null, 1), null);
+  const end = C.noticeOfEnding(C.missionEnding(info("m", { status: st({ phase: "running" }) }), info("m", { status: st({ phase: "ended", outcome: "failed" }) })), 2000);
+  assert.deepEqual([end.tag, end.kind, end.noun, end.outcome], ["end:m", "ended", "Mission failed", "failed"]);
+  assert.equal(C.noticeOfEnding(null, 1), null);
+  assert.equal(C.noticeOfEnding({ session: "m", title: "t", outcome: "done", words: "done" }, 1).noun, "Mission finished");
+});
+
+test("planNotifications: a 5 s window, one combined notification, a click target, tags to close", () => {
+  const a = notice();
+  const b = notice({ session: "s-2", title: "Brute", item: { item_id: "i-2", item_kind: "blocker", blocking: true, text: "Stuck" } });
+  const fin = C.noticeOfEnding({ session: "m-3", title: "Recon", outcome: "done", words: "done" }, 3000);
+  // waiting inside the window
+  let plan = C.planNotifications([a], { now: 1000 + 4999 });
+  assert.deepEqual([plan.due, plan.wait, plan.notification, plan.rest], [false, 1, null, [a]]);
+  assert.deepEqual(C.planNotifications([], { now: 1 }), { due: false, wait: null, notification: null, rest: [] });
+  // one item: its own noun and mission, and the session as the target
+  plan = C.planNotifications([a], { now: 6000 });
+  assert.equal(plan.due, true);
+  assert.deepEqual(plan.rest, []);
+  assert.deepEqual(plan.notification, {
+    tag: "i-1", title: "Approval waiting", body: "Scan: May I curl x?", target: { hash: "#/s/s-1/chat", session: "s-1" },
+    covers: ["i-1"], sessions: ["s-1"], counts: { needs: 1, results: 0, ended: 0 },
+  });
+  // several: counts in the title, the inbox as the target
+  plan = C.planNotifications([a, b, fin], { now: 8000 });
+  assert.equal(plan.notification.title, "2 need you · 1 finished");
+  assert.equal(plan.notification.target.hash, "#/inbox");
+  assert.equal(plan.notification.target.session, null);
+  assert.deepEqual(plan.notification.covers, ["i-1", "i-2", "end:m-3"]);
+  assert.deepEqual(plan.notification.body.split("\n"), ["Approval waiting: Scan", "Blocker waiting: Brute", "Mission finished: Recon"]);
+  assert.match(plan.notification.tag, /^batch:/);
+  assert.equal(C.planNotifications([a, b, fin], { now: 8000 }).notification.tag, plan.notification.tag, "stable for the same batch");
+  // an item announced twice is one
+  assert.equal(C.planNotifications([a, { ...a, at: 1500 }], { now: 8000 }).notification.title, "Approval waiting");
+  // mixed endings and results, and a long list is cut honestly
+  const many = Array.from({ length: 6 }, (_, i) => notice({ item: { item_id: "x" + i, item_kind: "approval", blocking: true, text: "t" }, title: "T" + i }));
+  const lines = C.planNotifications(many, { now: 9000 }).notification.body.split("\n");
+  assert.equal(lines.length, 5);
+  assert.equal(lines.at(-1), "and 2 more");
+  const mixed = C.planNotifications([fin, C.noticeOfEnding({ session: "m-4", title: "x", outcome: "failed", words: "failed" }, 3000), notice({ item: { item_id: "r", item_kind: "finished", blocking: false, text: "" } })], { now: 9000 });
+  assert.equal(mixed.notification.title, "1 result ready · 1 finished · 1 failed");
+  // the page is shown and focused: nothing is shown, the batch is consumed
+  assert.deepEqual(C.planNotifications([a, b], { now: 9000, visible: true }), { due: true, wait: 0, notification: null, rest: [] });
+  assert.equal(C.planNotifications([a], { now: 1000 + C.NOTIFY_WINDOW_MS }).due, true);
+  assert.equal(C.planNotifications([a], { now: 3000, windowMs: 1000 }).due, true);
+});
+
+test("closableNotifications: on resolve, when the session or the inbox is opened", () => {
+  const one = C.planNotifications([notice()], { now: 9000 }).notification;
+  const two = C.planNotifications([notice(), notice({ session: "s-2", item: { item_id: "i-2", item_kind: "blocker", blocking: true, text: "t" } })], { now: 9000 }).notification;
+  const ended = C.planNotifications([C.noticeOfEnding({ session: "m", title: "t", outcome: "done", words: "done" }, 1000)], { now: 9000 }).notification;
+  const shown = [one, two, ended];
+  const close = (ctx) => C.closableNotifications(shown, ctx);
+  assert.deepEqual(close({ openItems: new Set(["i-1", "i-2"]), opened: {} }), [], "still open: stays");
+  assert.deepEqual(close({ openItems: new Set(["i-2"]), opened: {} }), ["i-1"], "its item resolved");
+  assert.deepEqual(close({ openItems: new Set(), opened: {} }), [one.tag, two.tag], "all resolved; an ending has nothing to resolve");
+  assert.deepEqual(close({ openItems: new Set(["i-1", "i-2"]), opened: { session: "s-1" } }), ["i-1"], "its session was opened");
+  assert.deepEqual(close({ openItems: new Set(["i-1", "i-2"]), opened: { session: "m" } }), [ended.tag]);
+  assert.deepEqual(close({ openItems: ["i-1", "i-2"], opened: { inbox: true } }), [two.tag], "the inbox closes the combined one");
+  assert.deepEqual(C.closableNotifications(null, {}), []);
+});
+
+const scoreView = () => ({
+  mission: "m-1",
+  sessions: [
+    { session: "lead", role: "lead", parent: null, card: { steps: 40, finished: true, steps_to_finish: 40, calls: 90, malformed_calls: 2, finish_calls: 1, finish_refusals: 1, quote_refusals: 0, verifier_accepts: 3, verifier_rejections: 1, fresh_starts: 0, hand_offs: 0, asks: 1, unrecorded: false } },
+    { session: "kid", role: "solver", parent: "lead", card: { steps: 5, finished: false, steps_to_finish: null, calls: 0, malformed_calls: 0, finish_calls: 0, finish_refusals: 0, quote_refusals: 0, verifier_accepts: 0, verifier_rejections: 0, fresh_starts: 0, hand_offs: 1, asks: 0, unrecorded: true } },
+  ],
+  total: { steps: 45, finished: true, steps_to_finish: 40, calls: 90, malformed_calls: 2, finish_calls: 1, finish_refusals: 1, quote_refusals: 0, verifier_accepts: 3, verifier_rejections: 1, fresh_starts: 0, hand_offs: 1, asks: 1, unrecorded: false },
+});
+
+test("scoreRows shapes /score: eight cells per session, the total, and the fine print", () => {
+  const s = C.scoreRows(scoreView());
+  assert.equal(s.mission, "m-1");
+  assert.deepEqual(s.rows.map((r) => r.session), ["lead", "kid"]);
+  assert.equal(s.bySession.get("kid").role, "solver");
+  const lead = s.bySession.get("lead");
+  assert.deepEqual(lead.cells.map((c) => c.key), ["calls", "malformed_calls", "quote_refusals", "finish_refusals", "verifier_accepts", "verifier_rejections", "hand_offs", "asks"]);
+  assert.equal(lead.cells.length, 8, "zeros are kept: the count is the fact");
+  assert.equal(lead.text, "90 calls · 2 malformed calls · 1 finish refusal · 3 verifier accepts · 1 verifier reject · 1 ask");
+  assert.deepEqual([lead.steps, lead.finished, lead.stepsToFinish, lead.unrecorded], [40, true, 40, false]);
+  assert.equal(s.bySession.get("kid").text, "1 hand-off");
+  assert.equal(s.bySession.get("kid").unrecorded, true);
+  assert.equal(s.total.cells.find((c) => c.key === "hand_offs").value, 1);
+  assert.equal(s.label, "Mission total: the result is the lead's, the effort everyone's");
+  assert.equal(s.fineprint, "Run numbers describe effort, not completion.");
+  assert.equal(C.scoreRows({ mission: "m", sessions: [{ session: "x", card: {} }], total: {} }).rows[0].text, "no calls recorded");
+  for (const bad of [null, {}, { sessions: [] }, { sessions: "x", total: {} }]) assert.equal(C.scoreRows(bad), null);
+});
+
+test("scoreDue: on open and Refresh, then at most every 120 s while shown and something runs", () => {
+  assert.equal(C.scoreDue({ force: true, shown: false }), true);
+  assert.equal(C.scoreDue({ shown: true, running: true, lastMs: undefined, now: 5 }), true, "never fetched");
+  assert.equal(C.scoreDue({ shown: true, running: true, lastMs: 1000, now: 1000 + 119999 }), false);
+  assert.equal(C.scoreDue({ shown: true, running: true, lastMs: 1000, now: 1000 + 120000 }), true);
+  assert.equal(C.scoreDue({ shown: false, running: true, lastMs: 0, now: 1e9 }), false, "not while the tab is hidden");
+  assert.equal(C.scoreDue({ shown: true, running: false, lastMs: 0, now: 1e9 }), false, "not again when nothing runs");
+  assert.equal(C.scoreDue({ shown: true, running: false, lastMs: null }), true, "a finished mission is read once when its tab is shown");
+  assert.equal(C.scoreDue(), false);
+});
+
+test("agentGroups: fixed groups, creation order that never re-sorts, depth 3 and breadcrumbs, the score row", () => {
+  const mk = (id, over = {}) => info(id, { mission: "M", parent: null, created_ms: 1000, role: "solver", title: "agent " + id, ...over });
+  const store = sessionStore([
+    mk("lead", { role: "lead", status: st({ phase: "running", step: 40, completion_tokens_total: 1_200_000 }) }),
+    mk("b", { parent: "lead", created_ms: 3000, status: st({ phase: "running" }) }),
+    mk("a", { parent: "lead", created_ms: 2000, status: st({ phase: "running", step: 7 }) }),
+    mk("a1", { parent: "a", created_ms: 2500, status: st({ phase: "idle", last_end: "waiting" }) }),
+    mk("a2", { parent: "a1", created_ms: 2600 }),
+    mk("a3", { parent: "a2", created_ms: 2700 }),
+    mk("a4", { parent: "a3", created_ms: 2800, status: st({ phase: "ended", outcome: "failed" }) }),
+    mk("ask", { parent: "lead", created_ms: 4000, status: st({ phase: "running" }) }),
+    mk("other", { mission: "other" }),
+  ]);
+  const inbox = inboxWith([blockingItem("ask")]);
+  const activity = new Map([["a", { seq: 9, ts: 100000 - 41 * 60000 }]]);
+  const g = C.agentGroups(store, inbox, "M", { now: 100000, activity, score: C.scoreRows({ ...scoreView(), sessions: [{ session: "a", role: "solver", parent: "lead", card: { calls: 4 } }] }), spawns: new Map([["a", 12]]) });
+  assert.deepEqual(g.groups.map((x) => x.key), ["needs_you", "running", "waiting", "idle", "ended"]);
+  assert.equal(g.total, 8, "only this mission");
+  assert.equal(g.running, 4, "the one that needs you is running too");
+  assert.equal(g.badge, "4 running");
+  assert.deepEqual(g.groups.find((x) => x.key === "running").rows.map((r) => r.id), ["lead", "a", "b"], "creation order");
+  assert.equal(g.groups.find((x) => x.key === "ended").folded, true);
+  assert.equal(g.groups[0].folded, false);
+  const row = (id) => g.groups.flatMap((x) => x.rows).find((r) => r.id === id);
+  assert.deepEqual([row("lead").depth, row("a").depth, row("a3").depth, row("a4").depth], [0, 1, 4, 5]);
+  assert.deepEqual([row("a3").indent, row("a4").indent], [3, 3], "indented to depth 3");
+  assert.deepEqual(row("a4").crumbs, ["agent lead", "agent a", "agent a1", "agent a2", "agent a3"].slice(0, 5), "deeper ones carry the way down");
+  assert.deepEqual(row("a2").crumbs, []);
+  assert.equal(row("a4").outcome, "failed");
+  assert.equal(row("lead").generated, "1.2M generated");
+  assert.equal(row("a").roleLine, "solver · local");
+  assert.equal(row("a").ageText, "41m ago");
+  assert.equal(row("a").quiet.text, "no new record for 41m");
+  assert.equal(row("b").ageText, null, "unknown age is not made up");
+  assert.equal(row("a").score.cells[0].value, 4);
+  assert.equal(row("b").score, null);
+  assert.equal(row("a").spawnSeq, 12);
+  assert.equal(row("b").spawnSeq, null);
+  assert.equal(row("ask").waiting.tone, "attention");
+  assert.equal(row("a").step, 7);
+  // a step update or a new record changes no order
+  C.applyStatus(store, "b", st({ phase: "running", step: 500 }));
+  const again = C.agentGroups(store, inbox, "M", { now: 100000, activity: new Map([["b", { seq: 1, ts: 99999 }]]) });
+  assert.deepEqual(again.groups.find((x) => x.key === "running").rows.map((r) => r.id), ["lead", "a", "b"]);
+  assert.deepEqual(C.agentGroups(store, inbox, "nope").groups, []);
+  assert.equal(C.agentGroups(sessionStore([mk("x")]), C.createInbox(), "M").badge, "");
+});
+
+test("a mission with 12 agents at mixed phases: every agent in exactly one group", () => {
+  const phases = [{ phase: "running" }, { phase: "idle", last_end: "waiting" }, { phase: "idle" }, { phase: "ended", outcome: "done" }];
+  const list = [info("lead", { mission: "M", role: "lead", created_ms: 1 })];
+  for (let i = 0; i < 12; i++) list.push(info("w" + i, { mission: "M", parent: i < 4 ? "lead" : "w" + (i % 4), created_ms: 10 + i, status: st(phases[i % 4]) }));
+  const g = C.agentGroups(sessionStore(list), C.createInbox(), "M", { now: 1 });
+  assert.equal(g.groups.reduce((n, x) => n + x.rows.length, 0), 13);
+  assert.equal(new Set(g.groups.flatMap((x) => x.rows.map((r) => r.id))).size, 13);
+});
+
+test("toolOutcome and toolRow say how each ToolStatus ended, each with its own shape", () => {
+  const row = (status, meta = {}) => C.toolRow({ kind: "tool", name: "bash", cls: "exec", state: "done", result: { status, meta, duration_ms: 0, shown: { complete: true } } });
+  assert.deepEqual(row("ok").capsule, { text: "ok", tone: "ok", icon: "check" });
+  assert.deepEqual(row("ok", { exit_code: 0 }).capsule, { text: "exit 0", tone: "ok", icon: "check" });
+  assert.deepEqual(row("error", { exit_code: 1 }).capsule, { text: "exit 1", tone: "neutral", icon: "exit" });
+  assert.deepEqual(row("error").capsule, { text: "error", tone: "bad", icon: "cross" }, "a failure without an exit code keeps the cross");
+  assert.deepEqual(row("error", { exit_code: 0 }).capsule, { text: "error", tone: "bad", icon: "cross" });
+  assert.deepEqual(row("denied").capsule, { text: "denied", tone: "warn", icon: "lock" });
+  assert.deepEqual(row("invalid").capsule, { text: "invalid", tone: "neutral", icon: "invalid" });
+  assert.deepEqual(row("timeout").capsule, { text: "timeout", tone: "warn", icon: "clock" });
+  assert.deepEqual(row("interrupted").capsule, { text: "interrupted", tone: "warn", icon: "interrupted" });
+  const shapes = ["exit", "failed", "denied", "invalid", "timeout", "interrupted"].map((k) => C.TOOL_OUTCOME_LOOK[k].icon);
+  assert.equal(new Set(shapes).size, 6, "one shape per outcome");
+  assert.equal(row("denied").outcome, "denied");
+  assert.match(row("denied").words, /Refused by policy/);
+  assert.match(row("invalid").words, /nothing ran/);
+  assert.match(row("error", { exit_code: 3 }).words, /exited with code 3/);
+  assert.match(row("interrupted").words, /effects are unknown/);
+  assert.equal(row("ok").words, "");
+  assert.equal(C.toolOutcome(null).kind, "ok");
+  assert.equal(C.toolOutcome({ status: "weird" }).kind, "failed", "an unknown status is not called ok");
+  assert.deepEqual(C.toolRow({ state: "missing", result: null }).capsule, { text: "no result", tone: "warn", icon: "alert" });
+});
+
+test("a group counts each ToolStatus on its own and says so in its header", () => {
+  reset();
+  const store = storeOf([
+    start(), call("c1"), result("c1", "ok"), call("c2"), result("c2", "error", { meta: { exit_code: 1 } }), call("c3"), result("c3", "error", { meta: { exit_code: 2 } }),
+    call("c4"), result("c4", "denied"), call("c5"), result("c5", "invalid"), call("c6"), result("c6", "timeout"), call("c7"), result("c7", "interrupted"),
+    call("c8"), result("c8", "error"), call("c9"), R("turn_end", { reason: "stopped" }),
+  ]);
+  const g = C.chatItems(store.blocks, { models: store.models }).find((i) => i.type === "group");
+  assert.deepEqual([g.toolCount, g.exited, g.failed, g.denied, g.invalid, g.timedOut, g.interrupted, g.missing], [9, 2, 1, 1, 1, 1, 1, 1]);
+  const label = C.groupLabel(g, 0);
+  assert.match(label.text, / · 9 tool calls · 2 exited non-zero · 1 failed · 1 denied by policy · 1 invalid · 1 timed out · 1 interrupted · 1 without a result$/);
+  assert.deepEqual([label.exited, label.denied, label.invalid, label.timedOut, label.interrupted], [2, 1, 1, 1, 1]);
+  // the old shape of a group (no new counts) still reads
+  assert.equal(C.groupLabel({ type: "group", toolCount: 2, failed: 1, missing: 0, running: false, startTs: 0, endTs: 5000 }, 0).text, "Worked for 5.0s · 2 tool calls · 1 failed");
+  assert.equal(C.groupLabel({ type: "group", toolCount: 1, denied: 1, missing: 0, running: false, startTs: 0, endTs: 5000 }, 0).spoken, "Worked for 5.0s · 1 tool call · 1 denied by policy");
+});
+
+test("partialView marks a call whose output the model saw only in part", () => {
+  const out = { id: "blob1", lines: 18442 };
+  const cut = { status: "ok", cut: true, output: out, meta: { shown: [[1, 200]] } };
+  assert.deepEqual(C.partialView(cut), { words: "The model was shown 200 of 18,442 lines (output cut).", shown: 200, total: 18442, cut: true });
+  assert.equal(C.partialView({ status: "ok", cut: false, output: out, meta: { shown: [[1, 18442]] } }), null, "all shown");
+  assert.equal(C.partialView({ status: "ok", cut: false, output: null, meta: {} }), null, "nothing stored, nothing cut");
+  assert.equal(C.partialView({ status: "ok", cut: true, output: null, meta: {} }).words, "Output was cut.");
+  assert.equal(C.partialView({ status: "ok", output: out, meta: { of_blob: "blob1", shown: [[10, 20]] } }), null, "a view the model asked for is not a cut");
+  assert.equal(C.partialView({ status: "ok", output: { id: "b", lines: 10 }, meta: { shown: [[1, 4]] } }).shown, 4);
+  assert.equal(C.partialView(null), null);
+  const r = C.toolRow({ kind: "tool", name: "bash", cls: "exec", state: "done", result: { ...cut, shown: C.shownOfTotal(cut) } });
+  assert.equal(r.partial.words, "The model was shown 200 of 18,442 lines (output cut).");
+  assert.equal(C.toolRow({ kind: "tool", name: "bash", state: "done", result: { status: "ok", meta: {} } }).partial, null);
+  // counted by the group
+  reset();
+  const store = storeOf([start(), call("c1"), result("c1", "ok", { cut: true, output: out, meta: { shown: [[1, 200]] } }), call("c2"), result("c2")]);
+  assert.equal(C.chatItems(store.blocks, { models: store.models }).find((i) => i.type === "group").partial, 1);
+});
+
+test("chatItems puts a 'New since your last visit' item at the watermark, and windowItems keeps it with what follows", () => {
+  reset();
+  const store = storeOf([
+    start(), R("user_message", { text: "go" }, undefined, "user"), call("c1"), result("c1"), reply("r1", "one"), // seqs 0..4
+    R("user_message", { text: "more" }, undefined, "user"), reply("r2", "two"),                                 // 5, 6
+  ]);
+  const items = C.chatItems(store.blocks, { models: store.models, sinceSeq: 4 });
+  assert.deepEqual(kinds(items), ["user", "model", "group", "response", "since", "user", "model", "response"]);
+  const at = items.findIndex((i) => i.type === "since");
+  assert.deepEqual(kinds(items).slice(at - 1, at + 2), ["response", "since", "user"]);
+  assert.deepEqual([items[at].seq, items[at].count, items[at].straddles, items[at].text], [4, 2, false, "New since your last visit · 2 records"]);
+  // nothing new, or everything new, or no watermark: no item
+  assert.equal(C.chatItems(store.blocks, { models: store.models, sinceSeq: 6 }).some((i) => i.type === "since"), false);
+  assert.equal(C.chatItems(store.blocks, { models: store.models, sinceSeq: -1 }).some((i) => i.type === "since"), false, "everything is new: no divider");
+  assert.equal(C.chatItems(store.blocks, { models: store.models }).some((i) => i.type === "since"), false);
+  assert.equal(C.chatItems(store.blocks, { models: store.models, sinceSeq: null }).some((i) => i.type === "since"), false);
+  // one new record reads in the singular; a tool's result counts on its own
+  assert.equal(C.chatItems(store.blocks, { models: store.models, sinceSeq: 5 }).find((i) => i.type === "since").text, "New since your last visit · 1 record");
+  const r1 = C.chatItems(store.blocks, { models: store.models, sinceSeq: 2 });
+  assert.equal(r1.find((i) => i.type === "since").count, 4, "result 3, reply 4, user 5, reply 6");
+  assert.equal(r1.find((i) => i.type === "since").straddles, true, "the group began before it");
+  assert.equal(r1[r1.findIndex((i) => i.type === "since") + 1].type, "group");
+  // the last item is still the last real item
+  assert.equal(items.at(-1).last, true);
+  assert.notEqual(items.find((i) => i.type === "since").last, true);
+  // a model chip that opens the new part moves the divider before it
+  const sw = storeOf((reset(), [start(), reply("a", "x"), R("model_switched", { from: MODEL_A, to: MODEL_B, reason: "operator" }), reply("b", "y")]));
+  const si = C.chatItems(sw.blocks, { models: sw.models, sinceSeq: 1 });
+  assert.deepEqual(kinds(si), ["model", "response", "since", "line", "model", "response"]);
+  assert.equal(si[2].count, 2);
+  // when the chip itself is the first new thing, the divider goes before the chip
+  const chipFirst = C.chatItems([{ id: 0, kind: "user", seq: 1, ts: 1, text: "a" }, { id: 1, kind: "response", seq: 5, ts: 1, text: "b" }], { models: [{ seq: 0, profile: "p", model: "m", context_window: 0 }], sinceSeq: 3 });
+  assert.deepEqual(kinds(chipFirst), ["user", "since", "model", "response"]);
+  // windowItems drops a divider whose item is out of the window and keeps one whose item stays
+  const all = C.chatItems(store.blocks, { models: store.models, sinceSeq: 4 });
+  const idOf = (it) => (it.type === "block" ? it.block.id : it.type === "group" ? it.blocks[0].id : -1);
+  const firstNew = all[all.findIndex((i) => i.type === "since") + 1];
+  assert.equal(C.windowItems(all, idOf(firstNew)).some((i) => i.type === "since"), true);
+  assert.equal(C.windowItems(all, idOf(firstNew) + 1).some((i) => i.type === "since"), false);
+});
+
+test("recordsAfter counts new records for Jump, and jumpLabel says it", () => {
+  reset();
+  const store = storeOf([start(), call("c1"), R("user_message", { text: "x" }, undefined, "user"), result("c1"), reply("r", "t")]); // 0..4, the start is no block
+  assert.equal(C.recordsAfter(store.blocks, -1), 4);
+  assert.equal(C.recordsAfter(store.blocks, 1), 3);
+  assert.equal(C.recordsAfter(store.blocks, 2), 2, "the result (3) and the reply (4)");
+  assert.equal(C.recordsAfter(store.blocks, 4), 0);
+  assert.equal(C.recordsAfter(store.blocks, null), 0);
+  assert.equal(C.recordsAfter(null, 1), 0);
+  assert.equal(C.jumpLabel(0), "Jump to latest");
+  assert.equal(C.jumpLabel(12), "Jump to latest · 12 new");
+  assert.equal(C.jumpLabel(12000), "Jump to latest · 12,000 new");
+});
+
+test("findInRecord: literal, over every loaded block including folded groups, with an honest count", () => {
+  reset();
+  const recs = [start(), R("user_message", { text: "Check port 8443 please" }, undefined, "user"), reply("r1", "", { tool_calls: [{ call_id: "c1", name: "bash", arguments: "{}", complete: true }] })];
+  recs.push(call("c1"), result("c1", "ok", { text: "listening on PORT 8443\nand more" }));
+  recs.push(call("c2"), result("c2", "denied", { text: "refused by sandbox" }));
+  recs.push(call("c3"), result("c3", "error", { text: "no such file", meta: { exit_code: 2 } }));
+  recs.push(reply("r2", "The [port] (8443) is open. a.b"), R("inbox_opened", { item_id: "i1", item_kind: "question", text: "Scan 8443 too?", options: [], blocking: false }));
+  const store = storeOf(recs);
+  const all = C.findInRecord(store.blocks, "8443");
+  assert.equal(all.count, 4);
+  assert.deepEqual(all.hits.map((h) => h.field), ["text", "result", "text", "text"]);
+  assert.deepEqual(all.hits.map((h) => h.id), [...all.hits.map((h) => h.id)].sort((a, b) => a - b), "record order");
+  assert.equal(all.hits[1].seq, store.blocks[all.hits[1].id].result.seq, "a hit in an output jumps to the result record");
+  assert.deepEqual(all.hits[1].snippet, { before: "listening on PORT ", match: "8443", after: " and more" }, "case-insensitive on the text around it; the match keeps its own case");
+  assert.equal(all.searched, 10, "every loaded record, tools counted as call and result");
+  assert.equal(C.findInRecord(store.blocks, "  8443 ").query, "8443");
+  assert.equal(C.findInRecord(store.blocks, "8443", "messages").count, 3);
+  assert.equal(C.findInRecord(store.blocks, "8443", "tools").count, 1);
+  assert.equal(C.findInRecord(store.blocks, "refused", "failures").count, 1);
+  assert.equal(C.findInRecord(store.blocks, "no such", "failures").count, 1);
+  assert.equal(C.findInRecord(store.blocks, "listening", "failures").count, 0, "an ok call is not a failure");
+  assert.equal(C.findInRecord(store.blocks, "listening", "nonsense").count, 1, "an unknown kind is all");
+  assert.equal(C.findInRecord(store.blocks, "(8443)").count, 1, "literal, not a pattern");
+  assert.equal(C.findInRecord(store.blocks, "a.b").count, 1);
+  assert.equal(C.findInRecord(store.blocks, "a.c").count, 0, "the dot is not a wildcard");
+  assert.equal(C.findInRecord(store.blocks, "bash").count, 3, "a call is found by its name");
+  assert.equal(C.findInRecord(store.blocks, "").count, 0);
+  assert.equal(C.findInRecord(null, "x").count, 0);
+  // inside a folded group and outside the rendered window: the search reads blocks, not the page
+  const items = C.chatItems(store.blocks, { models: store.models });
+  const inGroup = items.find((i) => i.type === "group" && !i.open);
+  assert.ok(inGroup, "the group is folded");
+  assert.ok(all.hits.some((h) => inGroup.blocks.some((b) => b.id === h.id)));
+});
+
+test("findWords: the count wording is honest about scope and cut outputs", () => {
+  const r = { query: "x", count: 17, capped: false, searched: 12480, cutOutputs: 0 };
+  assert.equal(C.findWords(r, 2), "3 of 17 in 12,480 loaded records");
+  assert.equal(C.findWords(r), "17 matches in 12,480 loaded records");
+  assert.equal(C.findWords({ ...r, count: 1 }), "1 match in 12,480 loaded records");
+  assert.equal(C.findWords({ ...r, count: 0 }), "No match in 12,480 loaded records");
+  assert.equal(C.findWords({ ...r, searched: 1, count: 0 }), "No match in 1 loaded record");
+  assert.equal(C.findWords({ ...r, capped: true, count: 2000 }, 0), "1 of 2,000+ in 12,480 loaded records");
+  assert.equal(C.findWords({ ...r, cutOutputs: 2 }, 0), "1 of 17 in 12,480 loaded records. 2 outputs cut before the end: search them in the output viewer");
+  assert.match(C.findWords({ ...r, cutOutputs: 1 }), /1 output cut before the end: search it in the output viewer$/);
+  assert.equal(C.findWords({ ...r, query: "" }), "");
+  assert.equal(C.findWords(null), "");
+  assert.equal(C.findWords(r, 99), "17 matches in 12,480 loaded records", "an index outside the hits is no position");
+  // cut outputs are counted from what was searched
+  reset();
+  const store = storeOf([start(), call("c1"), result("c1", "ok", { text: "found", cut: true, output: { id: "b", lines: 5000 } }), call("c2"), result("c2", "ok", { text: "found" })]);
+  const res = C.findInRecord(store.blocks, "found");
+  assert.equal(res.cutOutputs, 1);
+  assert.match(C.findWords(res, 0), /^1 of 2 in 4 loaded records\. 1 output cut/);
+});
+
+test("findInRecord stays quick over 100k records", () => {
+  const blocks = Array.from({ length: 100000 }, (_, i) => ({ id: i, seq: i, kind: "response", text: i === 99999 ? "the needle here" : "plain text " + i }));
+  const t0 = performance.now();
+  const r = C.findInRecord(blocks, "needle");
+  assert.equal(r.count, 1);
+  assert.equal(r.searched, 100000);
+  assert.ok(performance.now() - t0 < 500);
+  assert.equal(C.findInRecord(blocks, "plain", "all").capped, true);
+  assert.equal(C.findInRecord(blocks, "plain", "all").count, 2000);
+});
+
+test("progressLine: plan, the step in progress, and the budget as a limit", () => {
+  const plan = [{ text: "recon", status: "done" }, { text: "scan the hosts and read the first banner", status: "doing" }, { text: "report", status: "todo" }, { text: "old", status: "dropped" }];
+  const p = C.progressLine({ plan, step: 214, budget: { max_steps: 400, max_minutes: 480 }, minutes: 3 * 60 + 12 });
+  assert.equal(p.text, "Plan 1 of 3 done · now: scan the hosts and read the first banner · budget 214 of 400 steps · 3h12m of 8h");
+  assert.deepEqual(p.parts.map((x) => x.key), ["plan", "now", "budget"]);
+  assert.match(p.label, /The budget is a limit, not a measure of progress\.$/);
+  assert.equal(C.progressLine({ plan: [{ text: "a", status: "todo" }] }).text, "Plan 0 of 1 done");
+  assert.equal(C.progressLine({ plan: [{ text: "a", status: "todo" }] }).label, "Plan 0 of 1 done", "no budget, no caveat");
+  assert.equal(C.progressLine({ step: 9, budget: { max_steps: 100 } }).text, "budget 9 of 100 steps");
+  assert.equal(C.progressLine({ budget: { max_minutes: 45 }, minutes: 12 }).text, "budget 12m of 45m");
+  assert.equal(C.progressLine({ budget: { max_minutes: 90 }, minutes: 70 }).text, "budget 1h10m of 1h30m");
+  assert.equal(C.progressLine({ budget: { max_minutes: 45 } }), null, "a limit with no known start is not a figure");
+  assert.equal(C.progressLine({ plan: [{ text: "x", status: "dropped" }], step: 5, budget: {} }), null);
+  assert.equal(C.progressLine({ plan: [], budget: { max_steps: null, max_minutes: null } }), null, "nothing known: hidden");
+  assert.equal(C.progressLine(), null);
+  assert.equal(C.progressLine({ plan: [{ text: "x", status: "done" }, { text: "y", status: "done" }] }).text, "Plan 2 of 2 done");
+});
+
+test("parseRoute and sessionHash know the Agents tab", () => {
+  assert.equal(C.sessionHash("s-1", "agents"), "#/s/s-1/agents");
+  assert.deepEqual(C.parseRoute("#/s/s-1/agents"), { view: "session", session: "s-1", section: "agents" });
+  assert.equal(C.sessionHash("s-1", "nope"), "#/s/s-1/chat");
+});
+
+// The drawings the new outcomes name.
+test("the icon template draws the pass-2 shapes", () => {
+  const html = readFileSync(join(here, "index.html"), "utf8");
+  const drawn = new Set([...html.match(/<template id="icons">([\s\S]*?)<\/template>/)[1].matchAll(/data-icon="([a-z-]+)"/g)].map((m) => m[1]));
+  const named = new Set(Object.values(C.TOOL_OUTCOME_LOOK).map((l) => l.icon));
+  named.add(C.quietFor(info("a", { status: st({ phase: "running" }) }), { ts: 0 }, 1e9).icon);
+  for (const name of named) assert.ok(drawn.has(name), `index.html has no drawing for "${name}"`);
+});
+
+// ---- keyboard
+
+test("typingTarget: text fields type, buttons and checkboxes do not", () => {
+  assert.equal(C.typingTarget({ tagName: "TEXTAREA" }), true);
+  assert.equal(C.typingTarget({ tagName: "SELECT" }), true);
+  assert.equal(C.typingTarget({ tagName: "INPUT", type: "search" }), true);
+  assert.equal(C.typingTarget({ tagName: "INPUT" }), true);
+  assert.equal(C.typingTarget({ tagName: "INPUT", type: "checkbox" }), false);
+  assert.equal(C.typingTarget({ tagName: "DIV", isContentEditable: true }), true);
+  assert.equal(C.typingTarget({ tagName: "BUTTON" }), false);
+  assert.equal(C.typingTarget(null), false);
+});
+
+test("shortcutFor: Ctrl/Cmd+K anywhere, other keys never while typing, Escape and Stop have none", () => {
+  const f = (e, o) => C.shortcutFor({ key: "", ...e }, o);
+  assert.equal(f({ key: "k", ctrlKey: true }, { typing: true }), "switch");
+  assert.equal(f({ key: "K", metaKey: true }), "switch");
+  assert.equal(f({ key: "k" }), null, "a bare k is nothing");
+  assert.equal(f({ key: "k", ctrlKey: true }, { mac: true, typing: true }), null, "on a Mac Ctrl+K stays the system's delete-to-end-of-line");
+  assert.equal(f({ key: "k", metaKey: true }, { mac: true }), "switch");
+  assert.equal(f({ key: "k", metaKey: true }, { mac: false }), null, "elsewhere only Ctrl");
+  assert.equal(f({ key: "k", ctrlKey: true }, { mac: false }), "switch");
+  assert.equal(f({ key: "/", shiftKey: true }), "find", "a layout where / needs Shift");
+  assert.equal(f({ key: "/" }), "find");
+  assert.equal(f({ key: "/" }, { typing: true }), null);
+  assert.equal(f({ key: "?", shiftKey: true }), "keys");
+  assert.equal(f({ key: "?" }, { typing: true }), null);
+  assert.equal(f({ key: "ArrowDown", altKey: true }), "row-next");
+  assert.equal(f({ key: "ArrowUp", altKey: true }), "row-prev");
+  assert.equal(f({ key: "ArrowDown", altKey: true, shiftKey: true }), "needs-next");
+  assert.equal(f({ key: "ArrowUp", altKey: true, shiftKey: true }), "needs-prev");
+  assert.equal(f({ key: "ArrowDown", altKey: true }, { typing: true }), null);
+  assert.equal(f({ key: "ArrowDown" }), null);
+  assert.equal(f({ key: "/", ctrlKey: true }), null, "a browser chord is left alone");
+  assert.equal(f({ key: "k", ctrlKey: true, isComposing: true }), null);
+  for (const key of ["Escape", "s", "c", "x", "."]) assert.equal(f({ key, ctrlKey: key === "c" }), null, key + " binds nothing");
+});
+
+test("stepIndex steps without wrapping and starts at an end", () => {
+  assert.equal(C.stepIndex(0, -1, 1), null);
+  assert.equal(C.stepIndex(3, -1, 1), 0);
+  assert.equal(C.stepIndex(3, -1, -1), 2);
+  assert.equal(C.stepIndex(3, 0, 1), 1);
+  assert.equal(C.stepIndex(3, 2, 1), null);
+  assert.equal(C.stepIndex(3, 0, -1), null);
+  assert.equal(C.stepIndex(3, 9, -1), 2);
+});
+
+test("keySheet lists real keys, spells Cmd and Option on a Mac, and offers no key to stop", () => {
+  const flat = (mac) => C.keySheet(mac).flatMap((g) => g.rows);
+  assert.ok(flat(false).some((r) => r.keys.join("+") === "Ctrl+K"));
+  assert.ok(flat(true).some((r) => r.keys.join("+") === "Cmd+K"));
+  assert.ok(flat(true).some((r) => r.keys.join("+") === "Option+Shift+↓"));
+  assert.ok(!flat(false).some((r) => /stop|interrupt/i.test(r.text.replace(/never stops anything/, ""))));
+});
+
+test("foldConfirm names the session and says what a fold does", () => {
+  const q = C.foldConfirm("Fix the flaky test");
+  assert.match(q.text, /^Fold Fix the flaky test's context now\? Older outputs become stubs that keep their out: handles; the next request re-reads the whole prompt once\.$/);
+  assert.equal(q.yes, "Fold now");
+  assert.match(C.foldConfirm().text, /^Fold the context of this session now\?/);
+});
+
+test("lastRecordedError reads the failure sentence the daemon records in a parked item or a failed-request answer", () => {
+  const parked = { kind: "inbox", item: { item_kind: "parked", text: "The session could not continue. The model request failed after 3 attempts: connection refused: http://x/v1 Nothing was lost: answer here, or send the session a message, to make it try again." }, resolved: null };
+  assert.equal(C.lastRecordedError([parked]), "The model request failed after 3 attempts: connection refused: http://x/v1");
+  const unavailable = { kind: "inbox", item: { item_kind: "blocker", text: "The model server at http://x has been unavailable since 2026-11-12 14:03:07 UTC." }, resolved: { answer: "Answered automatically: the request ended without a reply at 2026-11-12 14:09:41 UTC: request timed out. The session handles that as any failed request." } };
+  assert.equal(C.lastRecordedError([parked, unavailable]), "request timed out.", "the latest one");
+  assert.equal(C.lastRecordedError([unavailable, parked]), "The model request failed after 3 attempts: connection refused: http://x/v1");
+  assert.equal(C.lastRecordedError([{ kind: "inbox", item: { item_kind: "parked", text: "The session could not continue. The session's budget is used up. Nothing was lost: answer." }, resolved: null }]), null, "a budget end is not an error");
+  assert.equal(C.lastRecordedError([{ kind: "line", sub: "interrupted", reason: "model request failed: x" }]), null, "an interruption is an operator stop, a restart or damage, not a failure");
+  assert.equal(C.lastRecordedError([]), null);
+  assert.equal(C.lastRecordedError(null), null);
+});
+
+test("inboxGroups puts missions that block first, each group oldest first", () => {
+  const mk = (id, mission, blocking, at) => [id, { session: id, mission, title: "t-" + id, opened_ms: at, item: { item_id: id, item_kind: blocking ? "question" : "finished", blocking } }];
+  const inbox = { items: new Map([mk("a", "m1", false, 10), mk("b", "m2", true, 30), mk("c", "m1", true, 50), mk("d", "m3", false, 5), mk("e", "m2", false, 1)]) };
+  const g = C.inboxGroups(inbox, (m) => "Mission " + m);
+  assert.deepEqual(g.map((x) => x.mission), ["m2", "m1", "m3"]);
+  assert.deepEqual(g[0].entries.map((e) => e.item.item_id), ["b", "e"]);
+  assert.deepEqual([g[0].open, g[0].blocking, g[2].blocking], [2, 1, 0]);
+  assert.equal(g[0].title, "Mission m2");
+  assert.deepEqual(C.inboxGroups({ items: new Map() }), []);
+  const lone = C.inboxGroups({ items: new Map([mk("z", "", true, 1)]) });
+  assert.equal(lone[0].title, "t-z");
+});
+
+test("refusalAnswer needs a reason and prefixes it; isRefusal reads it back", () => {
+  assert.ok(C.refusalAnswer("  ").error);
+  assert.equal(C.refusalAnswer(" too broad ").answer, "Refused: too broad");
+  assert.ok(C.isRefusal("Refused: x"));
+  assert.ok(!C.isRefusal("Keep going"));
+});
+
+test("answerSendKey is Ctrl or Cmd with Enter only", () => {
+  assert.ok(C.answerSendKey({ key: "Enter", ctrlKey: true }));
+  assert.ok(C.answerSendKey({ key: "Enter", metaKey: true }));
+  assert.ok(!C.answerSendKey({ key: "Enter" }));
+  assert.ok(!C.answerSendKey({ key: "Enter", ctrlKey: true, isComposing: true }));
+  assert.ok(!C.answerSendKey({ key: "Enter", ctrlKey: true, shiftKey: true }));
+});
+
+test("nextCardId prefers the card after, then the one before", () => {
+  assert.equal(C.nextCardId(["a", "b", "c"], "b"), "c");
+  assert.equal(C.nextCardId(["a", "b", "c"], "c"), "b");
+  assert.equal(C.nextCardId(["a"], "a"), null);
+  assert.equal(C.nextCardId(["a", "b"], "zz"), "a");
+});
+
+test("missionEnding: a root lead ends by going idle with last_end, as the daemon records it", () => {
+  const was = info("m", { title: "Mission", status: st({ phase: "running" }) });
+  const idle = (last_end) => info("m", { title: "Mission", status: st({ phase: "idle", last_end }) });
+  assert.equal(C.missionEnding(was, idle("finished")).outcome, "done");
+  assert.equal(C.missionEnding(was, idle("error")).outcome, "failed");
+  assert.equal(C.missionEnding(was, idle("budget_exhausted")).outcome, "budget_exhausted");
+  assert.equal(C.missionEnding(was, idle("stopped")).outcome, "stopped");
+  assert.equal(C.missionEnding(was, idle("yielded")), null, "every ordinary chat reply is a yield");
+  assert.equal(C.missionEnding(was, idle("waiting")), null);
+  assert.equal(C.missionEnding(was, idle("asked")), null);
+  assert.equal(C.missionEnding(idle("finished"), idle("finished")), null, "already idle");
+  assert.equal(C.missionEnding(was, idle("stopped"), { requested: new Set(["m"]) }), null);
+});
+
+test("planNotifications: a mission ending and its own Finished item are one notice that opens the session", () => {
+  const end = C.noticeOfEnding({ session: "m", mission: "m-m", title: "Mission", outcome: "done", words: "done" }, 1000);
+  const item = C.noticeOfInbox({ session: "m", title: "Mission", item: { item_id: "i1", item_kind: "finished", text: "All done", blocking: false, options: [] } }, 1100);
+  const plan = C.planNotifications([end, item], { now: 7000 });
+  assert.equal(plan.notification.target.hash, "#/s/m/chat");
+  assert.equal(plan.notification.title, "Mission finished");
+  assert.deepEqual(plan.notification.covers.sort(), ["end:m", "i1"]);
+});
+
+test("budgetUsed: active intervals and own steps since the budget was last granted, as the daemon counts them", () => {
+  const store = C.createRecordStore("s");
+  let seq = 0;
+  const rec = (kind, ts_ms, more = {}) => C.applyRecord(store, { seq: seq++, kind, ts_ms, author: "harness", ...more });
+  const min = 60000;
+  rec("session_start", 0, { budget: { max_steps: 400, max_minutes: 480 } });
+  rec("turn_start", 0, { trigger: "start" });
+  rec("budget_clock", 0, { running: true });
+  rec("model_request", 1 * min, { req_id: "a", step: 1, epoch: 0, est_tokens: 10, purpose: "step" });
+  rec("model_request", 2 * min, { req_id: "b", step: 2, epoch: 0, est_tokens: 10, purpose: "summary" });
+  rec("budget_clock", 10 * min, { running: false });
+  rec("turn_end", 10 * min, { reason: "waiting" });
+  // Parked for a day: the clock was paused, so only 10 active minutes count.
+  assert.deepEqual(C.budgetUsed(store, 27 * 60 * min), { steps: 1, minutes: 10 });
+  rec("turn_start", 27 * 60 * min, { trigger: "user" });
+  rec("budget_clock", 27 * 60 * min, { running: true });
+  assert.equal(C.budgetUsed(store, 27 * 60 * min + 5 * min).minutes, 15, "an open interval counts up to now");
+  rec("turn_end", 27 * 60 * min + 6 * min, { reason: "budget_exhausted" });
+  assert.equal(C.budgetUsed(store, 40 * 60 * min).minutes, 16, "closed at the end of the turn");
+  rec("turn_start", 40 * 60 * min, { trigger: "user" });
+  assert.deepEqual(C.budgetUsed(store, 40 * 60 * min), { steps: 0, minutes: 0 }, "a renewed budget starts again");
+  const wall = C.createRecordStore("w");
+  C.applyRecord(wall, { seq: 0, kind: "session_start", ts_ms: 1000, author: "harness" });
+  assert.equal(C.budgetUsed(wall, 1000 + 7 * min).minutes, 7, "a log with no budget_clock keeps wall time");
+  assert.equal(C.progressLine({ step: 450, minutes: 600, budget: { max_steps: 400, max_minutes: 480 } }).text, "budget 400 of 400 steps · 8h of 8h", "never above the limit");
+});
+
+test("cardResolution: an approved scope request does not read as dismissed", () => {
+  const scope = { item_id: "i", item_kind: "approval", blocking: false, options: ["a.example", "B.example"], text: "" };
+  const done = { seq: 9, ts: 1, answer: "" };
+  assert.deepEqual(C.cardResolution(scope, done, { answer: "", approved: ["a.example"] }, null).approved, ["a.example"], "this tab's receipt wins over the record");
+  assert.deepEqual(C.cardResolution(scope, done, undefined, ["A.example", "b.example"]).approved, ["a.example", "B.example"], "after a reload: the hosts are in the grants");
+  assert.equal(C.cardResolution(scope, done, undefined, ["a.example"]).approved, undefined, "only some granted: not claimed");
+  assert.equal(C.cardResolution(scope, done, undefined, null).approved, undefined, "grants unknown: not claimed");
+  assert.equal(C.cardResolution(scope, { ...done, answer: "Refused: no" }, undefined, ["a.example", "b.example"]).approved, undefined);
+  assert.deepEqual(C.cardResolution(scope, null, { answer: "x" }, null), { answer: "x" });
+});
+
+test("quietFor: nothing while the stream is down, and only the time the page has listened counts", () => {
+  const now = 10 * 3600000;
+  const run = info("a", { status: st({ phase: "running" }) });
+  assert.equal(C.quietFor(run, { ts: now - 3 * 3600000 }, now, null), null, "disconnected");
+  assert.equal(C.quietFor(run, { ts: now - 2 * 3600000 }, now, now - 2 * 60000), null, "reconnected 2 minutes ago, record 2 h old");
+  const q = C.quietFor(run, { ts: now - 2 * 3600000 }, now, now - 11 * 60000);
+  assert.equal(q.text, "no new record for 11m", "listened 11 minutes and heard nothing");
+  assert.equal(C.quietFor(run, { ts: now - 30 * 60000 }, now, now - 3600000).text, "no new record for 30m", "a record heard since connecting keeps its own age");
+  assert.equal(C.quietFor(run, { ts: now - 30 * 60000 }, now).text, "no new record for 30m", "since not given: as before");
+});
+
+test("record counts are honest: new and loaded records include the ones that make no block", () => {
+  reset();
+  const store = storeOf([start(), call("c1"), R("user_message", { text: "x" }, undefined, "user"), result("c1"), reply("r", "t")]);
+  assert.equal(C.recordsAfter(store.blocks, 1, C.lastSeq(store)), 3);
+  assert.equal(C.recordsAfter(store.blocks, 4, C.lastSeq(store)), 0);
+  assert.equal(C.recordsAfter(store.blocks, 9, C.lastSeq(store)), 0);
+  assert.equal(C.findInRecord(store.blocks, "x", "all", store.records.size).searched, store.records.size);
+});
+
+test("findSnippet and findHint: what matched is said in words, and the cut-output sentence stands apart", () => {
+  reset();
+  const r = C.findInRecord(storeOf([start(), reply("r", "the shutdown waits on the flush")]).blocks, "waits");
+  assert.equal(C.findSnippet(r.hits[0]), "…the shutdown waits on the flush…");
+  assert.equal(C.findHint({ query: "x", cutOutputs: 1 }), "1 output cut before the end: search it in the output viewer");
+  assert.equal(C.findHint({ query: "x", cutOutputs: 0 }), "");
+  assert.equal(C.findWords({ query: "x", searched: 5, count: 1, cutOutputs: 1 }, 0, false), "1 of 1 in 5 loaded records");
+});
+
+test("mergeInboxList: a record that landed while the snapshot was out outranks it", () => {
+  const e = (id) => ({ session: "s", mission: "m", title: "t", opened_ms: 1, item: { item_id: id, item_kind: "question", text: id, options: [], blocking: true } });
+  const touched = new Map([["gone", { rev: 5, entry: null }], ["new", { rev: 6, entry: e("new") }], ["old", { rev: 2, entry: null }]]);
+  const ids = (l) => l.map((x) => x.item.item_id).sort();
+  assert.deepEqual(ids(C.mergeInboxList([e("gone"), e("old"), e("kept")], touched, 4)), ["kept", "new", "old"], "a change from before the request is already in the snapshot");
+  assert.deepEqual(ids(C.mergeInboxList([e("kept")], new Map(), 0)), ["kept"]);
 });

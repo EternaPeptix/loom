@@ -297,17 +297,41 @@ export function recordsUrl(session, after, limit) {
 // Sessions
 
 export function createSessionStore() {
-  return { byId: new Map() };
+  // `rev` counts changes made by events; `changed` maps an id to the rev of its last event, so a snapshot that was
+  // requested before an event cannot overwrite what the event said.
+  return { byId: new Map(), rev: 0, changed: new Map() };
 }
 
-export function applySessionList(store, list) {
-  store.byId = new Map((list || []).map((s) => [s.id, s]));
+/**
+ * applySessionList(store, list, {sinceRev}): a session-list snapshot. Without `sinceRev` it replaces everything. With
+ * `sinceRev` (store.rev read when the request was sent) it keeps every session an event changed after that point,
+ * including one the snapshot does not list yet, and takes the snapshot for the rest. Returns the store.
+ */
+export function applySessionList(store, list, opts = {}) {
+  const since = opts && Number.isFinite(opts.sinceRev) ? opts.sinceRev : null;
+  const next = new Map((list || []).map((s) => [s.id, s]));
+  if (since !== null && store.changed) {
+    for (const [id, rev] of store.changed) {
+      if (rev > since && store.byId.has(id)) next.set(id, store.byId.get(id));
+    }
+    for (const [id, rev] of [...store.changed]) if (rev <= since) store.changed.delete(id);
+  } else if (store.changed) store.changed.clear();
+  store.byId = next;
   return store;
+}
+
+function sessionChanged(store, id) {
+  store.rev = (store.rev || 0) + 1;
+  if (!store.changed) store.changed = new Map();
+  store.changed.set(id, store.rev);
 }
 
 /** A `session` event: {type:"session", info}. */
 export function applySessionEvent(store, info) {
-  if (info && info.id) store.byId.set(info.id, info);
+  if (info && info.id) {
+    store.byId.set(info.id, info);
+    sessionChanged(store, info.id);
+  }
   return store;
 }
 
@@ -316,6 +340,7 @@ export function applyStatus(store, id, status) {
   const s = store.byId.get(id);
   if (!s) return false;
   store.byId.set(id, { ...s, status });
+  sessionChanged(store, id);
   return true;
 }
 
@@ -323,7 +348,7 @@ export function applyStatus(store, id, status) {
  * Rows for the left column: root sessions newest first, each followed by its descendants in
  * creation order, with a depth. A session whose parent is not in the store is a root.
  */
-export function sessionRows(store, { showArchived = false } = {}) {
+function sessionRows(store, { showArchived = false } = {}) {
   const all = [...store.byId.values()];
   const kids = new Map();
   const roots = [];
@@ -399,57 +424,6 @@ export function executionWord(info) {
   if (st.last_end === "waiting") return "waiting";
   if (st.last_end === "stopped") return "stopped";
   return "idle";
-}
-
-/**
- * Mission navigation, with stable creation order inside attention groups. Root rows carry
- * aggregate attention; child rows keep their own attention and appear only when expanded.
- */
-export function missionGroups(store, inbox, { showArchived = false, expanded = new Set() } = {}) {
-  const groups = [
-    { key: "needs_answer", label: "Needs your answer", rows: [] },
-    { key: "running", label: "Running", rows: [] },
-    { key: "ready", label: "Ready to review", rows: [] },
-    { key: "other", label: "Other missions", rows: [] },
-  ];
-  const byKey = new Map(groups.map((g) => [g.key, g]));
-  const ordered = sessionRows(store, { showArchived });
-  let mission = null;
-  let members = [];
-  const publish = () => {
-    if (!mission) return;
-    const attention = { open: 0, blocking: 0, questions: 0, results: 0 };
-    for (const row of members) {
-      const own = attentionFor(inbox, row.info.id);
-      for (const key of Object.keys(attention)) attention[key] += own[key];
-    }
-    const executing = members.some(({ info }) => {
-      const mark = stateMark(info, attentionFor(inbox, info.id));
-      return mark === "running" || mark === "waiting";
-    });
-    const rootMark = stateMark(mission, attentionFor(inbox, mission.id));
-    const key = attention.blocking ? "needs_answer" : executing ? "running"
-      : attention.results || attention.questions || rootMark === "finished" || rootMark === "failed" ? "ready" : "other";
-    const agentCount = members.length - 1;
-    const agentsRunning = members.slice(1).filter(({ info }) => (info.status || {}).phase === "running").length;
-    const waiting = waitingFor(inbox, members.map((row) => row.info.id));
-    byKey.get(key).rows.push({ info: mission, depth: 0, mission: mission.id, agentCount, agentsRunning, expanded: expanded.has(mission.id), attention, waiting });
-    if (expanded.has(mission.id)) {
-      for (const row of members.slice(1)) {
-        byKey.get(key).rows.push({ ...row, mission: mission.id, agentCount: 0, agentsRunning: 0, expanded: false, attention: attentionFor(inbox, row.info.id), waiting: waitingFor(inbox, [row.info.id]) });
-      }
-    }
-  };
-  for (const row of ordered) {
-    if (row.depth === 0) {
-      publish();
-      mission = row.info;
-      members = [];
-    }
-    members.push(row);
-  }
-  publish();
-  return groups.filter((g) => g.rows.length);
 }
 
 /**
@@ -545,15 +519,6 @@ export function sessionActions(info) {
     send: root && !info.archived && !ended,
     running,
   };
-}
-
-/** The dim second line of a session row: role, step, context size, age. */
-export function rowDetail(info, now) {
-  const st = info.status || {};
-  const parts = [info.role, `step ${st.step || 0}`];
-  if (st.prompt_tokens) parts.push(tokens(st.prompt_tokens));
-  parts.push(age(now, info.created_ms));
-  return parts.join(" · ");
 }
 
 /** Human-readable activity from one recorded event; null for background bookkeeping. */
@@ -763,8 +728,8 @@ export function sendFailure(state, message, { rejected = false } = {}) {
   };
 }
 
-const SESSION_SECTIONS = new Set(["chat", "overview", "evidence"]);
-/** Hash of a session view: `#/s/<id>/<chat|overview|evidence>`; "record" (the old name of chat) and unknown sections give chat. */
+const SESSION_SECTIONS = new Set(["chat", "overview", "agents", "evidence"]);
+/** Hash of a session view: `#/s/<id>/<chat|overview|agents|evidence>`; "record" (the old name of chat) and unknown sections give chat. */
 export function sessionHash(session, section = "chat") {
   return `#/s/${encodeURIComponent(session)}/${SESSION_SECTIONS.has(section) ? section : "chat"}`;
 }
@@ -847,6 +812,20 @@ export function applyInboxList(inbox, list, answered) {
   return inbox;
 }
 
+/**
+ * mergeInboxList(list, touched, since): a `/api/inbox` snapshot with what inbox records changed after it was asked for put back.
+ * `touched` maps item id -> {rev, entry} (entry null when the record resolved it); a change newer than `since` wins over the snapshot,
+ * so an item resolved while the request was out stays gone and one opened meanwhile stays.
+ */
+export function mergeInboxList(list, touched, since) {
+  const out = new Map((list || []).map((e) => [e.item.item_id, e]));
+  for (const [id, t] of touched || []) {
+    if (!(t.rev > since)) continue;
+    if (t.entry) out.set(id, t.entry); else out.delete(id);
+  }
+  return [...out.values()];
+}
+
 const ITEM_FIELDS = ["item_id", "item_kind", "text", "options", "blocking", "call_id", "reference"];
 
 /**
@@ -893,24 +872,9 @@ export function inboxCounts(inbox) {
   return { open, blocking };
 }
 
-export function inboxCountFor(inbox, session) {
-  let n = 0;
-  for (const e of inbox.items.values()) if (e.session === session) n++;
-  return n;
-}
-
 export function pageTitle({ open, blocking }) {
   if (!open) return "loom";
   return blocking ? `(${open}) needs you · loom` : `(${open}) loom`;
-}
-
-export function notificationFor(entry) {
-  const kind = entry.item.item_kind;
-  return {
-    title: `loom: ${kind} — ${entry.title}`,
-    body: oneLine(entry.item.text, 200),
-    tag: entry.item.item_id,
-  };
 }
 
 export function inboxKindWords(kind) {
@@ -926,6 +890,22 @@ export function scopeRequestHosts(item) {
   return item && item.item_kind === "approval" && !item.blocking && hosts.length ? hosts : null;
 }
 
+/**
+ * What an inbox card shows as its resolution. The record's `inbox_resolved` says only that the item closed with an empty answer, so an
+ * approved scope request would read as dismissed. The operator's own receipt (this tab) carries the approved hosts; failing that, an
+ * empty-answer scope request whose every host is among the mission's granted hosts is read as approved. `granted` is null when unknown.
+ */
+export function cardResolution(item, resolved, receipt, granted) {
+  if (!resolved) return receipt || null;
+  if (receipt && receipt.approved) return { ...resolved, approved: receipt.approved };
+  const hosts = scopeRequestHosts(item);
+  if (hosts && resolved.answer === "" && Array.isArray(granted)) {
+    const have = new Set(granted.map((h) => String(h).toLowerCase()));
+    if (hosts.every((h) => have.has(String(h).toLowerCase()))) return { ...resolved, approved: hosts };
+  }
+  return resolved;
+}
+
 /** The kind label of an inbox card: a scope request reads as one, not as an approval. */
 export function inboxCardKind(item) {
   return scopeRequestHosts(item) ? "scope request" : inboxKindWords(item.item_kind);
@@ -939,13 +919,6 @@ export function scopeRequest(session, hosts, note) {
   const n = String(note || "").trim();
   if (n) body.note = n;
   return { path: `/api/sessions/${encodeURIComponent(session)}/scope`, body };
-}
-
-/** What the card says once the grant is accepted, from the daemon's receipt. */
-export function scopeNotice(receipt) {
-  const r = receipt || {};
-  const hosts = (r.hosts || []).join(", ");
-  return r.ledger === false ? `Granted: ${hosts}. This mission keeps no ledger, so the grant is not listed.` : `Granted: ${hosts}.`;
 }
 
 /** The choice that closes a blocked session without the goal established. */
@@ -1080,8 +1053,54 @@ function base(rec) {
   return { seq: rec.seq, ts: rec.ts_ms, author: rec.author };
 }
 
+/**
+ * The budget as the daemon counts it (session.rs): own model steps and the active clock since the budget was last granted. A
+ * budget is granted at the start, and again by the turn_start (trigger user, inbox_answer or resume) after a budget_exhausted
+ * turn. Time is the sum of the budget_clock intervals; a log with none keeps the wall clock from the grant.
+ */
+function trackBudget(store, rec) {
+  const b = store.budgetUse || (store.budgetUse = { steps: 0, fromMs: null, startMs: null, accrued: 0, open: null, clock: false, lastEnd: null });
+  const ts = Number.isFinite(rec.ts_ms) ? rec.ts_ms : null;
+  switch (rec.kind) {
+    case "session_start":
+      if (ts !== null) b.startMs = ts;
+      break;
+    case "model_request":
+      if (!rec.purpose || rec.purpose === "step") b.steps++;
+      break;
+    case "budget_clock":
+      if (ts === null) break;
+      if (!b.clock) { b.clock = true; b.accrued = Math.max(0, ts - (b.fromMs ?? b.startMs ?? ts)); }
+      if (b.open !== null) b.accrued += Math.max(0, ts - b.open);
+      b.open = rec.running ? ts : null;
+      break;
+    case "turn_start":
+      if (["user", "inbox_answer", "resume"].includes(rec.trigger) && b.lastEnd === "budget_exhausted") {
+        b.steps = 0; b.fromMs = ts; b.accrued = 0; b.open = null;
+      }
+      break;
+    case "turn_end":
+      b.lastEnd = rec.reason;
+      if (b.open !== null && ts !== null) { b.accrued += Math.max(0, ts - b.open); b.open = null; }
+      break;
+    default:
+      break;
+  }
+}
+
+/** budgetUsed(store, now): {steps, minutes|null} counted since the budget was granted, as the daemon counts them. */
+export function budgetUsed(store, now) {
+  const b = store && store.budgetUse;
+  if (!b) return { steps: 0, minutes: null };
+  let ms = null;
+  if (b.clock) ms = b.accrued + (b.open !== null && Number.isFinite(now) ? Math.max(0, now - b.open) : 0);
+  else if (Number.isFinite(now) && (b.fromMs ?? b.startMs) !== null) ms = Math.max(0, now - (b.fromMs ?? b.startMs));
+  return { steps: b.steps, minutes: ms === null ? null : Math.floor(ms / 60000) };
+}
+
 function step(store, rec) {
   store.records.set(rec.seq, rec);
+  trackBudget(store, rec);
   switch (rec.kind) {
     case "user_message":
       push(store, { ...base(rec), kind: "user", text: rec.text || "" });
@@ -1230,7 +1249,7 @@ function step(store, rec) {
       break;
     }
     case "interrupted":
-      push(store, { ...base(rec), kind: "line", sub: "interrupted", tone: "warn", text: `interrupted: ${oneLine(rec.reason, 300)}` });
+      push(store, { ...base(rec), kind: "line", sub: "interrupted", tone: "warn", reason: String(rec.reason || ""), text: `interrupted: ${oneLine(rec.reason, 300)}` });
       store.turn = null;
       lostCalls(store);
       clearPending(store);
@@ -1745,6 +1764,7 @@ export function applyNet(list, entry, keep = 2000) {
  *   ledgerMission the mission whose ledger the right column holds (or null)
  *   known(id)    is this session in the store
  *   missionOf(id) its mission or null
+ *   ledgerPending a ledger load is in flight (optional; stops a repeated load_ledger)
  * Returns a list of effects for app.js to carry out, each {fx, ...}.
  */
 export function planEvent(ev, ctx) {
@@ -1757,6 +1777,10 @@ export function planEvent(ev, ctx) {
       // pull the authoritative inbox so it is not left stale. Mirrors the macOS shell.
       const open = (ev.info && ev.info.status && ev.info.status.open_inbox) || 0;
       if (ev.info && (ev.info.archived || open > 0)) out.push({ fx: "refetch_inbox" });
+      // The open session's ledger is not held yet (the page opened it before it knew the session): load it now.
+      if (ev.info && ev.info.id === ctx.openId && ev.info.mission && ctx.ledgerMission !== ev.info.mission && !ctx.ledgerPending) {
+        out.push({ fx: "load_ledger", mission: ev.info.mission });
+      }
       break;
     }
     case "status":
@@ -1789,7 +1813,8 @@ export function planEvent(ev, ctx) {
       out.push({ fx: "notice", text: ev.message || "Error.", session: ev.session || null });
       break;
     case "lagged":
-      out.push({ fx: "refetch_sessions" }, { fx: "refetch_inbox" });
+      out.push({ fx: "refetch_sessions" }, { fx: "refetch_inbox" }, { fx: "refetch_status" });
+      if (ctx.ledgerMission) out.push({ fx: "refetch_ledger", mission: ctx.ledgerMission });
       if (ctx.openId) out.push({ fx: "refetch_records" });
       break;
     default:
@@ -1993,8 +2018,41 @@ const groupKey = (firstBlock) => "g" + firstBlock.seq;
 /** A member that is itself a warning: a cut, aborted or failed reply, a job that exited non-zero, a cache break. */
 const isWarningBlock = (b) => !b.detail && ((b.kind === "response" && ((b.cutCalls && b.cutCalls.length > 0) || b.warning)) || (b.kind === "line" && b.tone === "warn"));
 
+/**
+ * How a finished tool call ended, by the daemon's ToolStatus (never merged into one "failed"):
+ * "ok" | "exit" (the tool ran and exited non-zero) | "failed" (the tool ran and reported failure without an exit code) |
+ * "denied" (refused by policy) | "invalid" (arguments failed validation, nothing ran) | "timeout" | "interrupted" (cut off,
+ * effects unknown). `exit` is the code for "exit".
+ */
+export function toolOutcome(result) {
+  if (!result) return { kind: "ok", exit: null };
+  const code = result.meta && Number.isInteger(result.meta.exit_code) ? result.meta.exit_code : null;
+  switch (result.status) {
+    case "ok": return { kind: "ok", exit: code };
+    case "error": return code !== null && code !== 0 ? { kind: "exit", exit: code } : { kind: "failed", exit: code };
+    case "denied": return { kind: "denied", exit: code };
+    case "invalid": return { kind: "invalid", exit: code };
+    case "timeout": return { kind: "timeout", exit: code };
+    case "interrupted": return { kind: "interrupted", exit: code };
+    default: return { kind: "failed", exit: code };
+  }
+}
+
+/**
+ * Whether the model saw only part of a finished call's output: {words} (the shownOfTotal sentence) or null. A view of a stored
+ * output the model asked for (`of_blob`) is a request, not a cut, so it is not partial.
+ */
+export function partialView(result) {
+  if (!result) return null;
+  const v = result.shown || shownOfTotal(result);
+  if (v.ofBlob || v.complete) return null;
+  const part = v.cut || (v.shown !== null && v.total !== null && v.shown < v.total);
+  return part && v.words ? { words: v.words, shown: v.shown, total: v.total, cut: !!v.cut } : null;
+}
+
 function makeGroup(blocks) {
-  let toolCount = 0, failed = 0, missing = 0, warnings = 0, records = 0, running = false;
+  let toolCount = 0, exited = 0, failed = 0, denied = 0, invalid = 0, timedOut = 0, interrupted = 0, partial = 0;
+  let missing = 0, warnings = 0, records = 0, running = false;
   let startTs = blocks[0].ts, endTs = blocks[0].ts;
   for (const b of blocks) {
     if (!b.detail) records++;
@@ -2008,10 +2066,21 @@ function makeGroup(blocks) {
     toolCount++;
     if (b.state === "running") running = true;
     else if (b.state === "missing") missing++;
-    else if (b.result && b.result.status !== "ok") failed++;
+    else if (b.result) {
+      switch (toolOutcome(b.result).kind) {
+        case "exit": exited++; break;
+        case "failed": failed++; break;
+        case "denied": denied++; break;
+        case "invalid": invalid++; break;
+        case "timeout": timedOut++; break;
+        case "interrupted": interrupted++; break;
+        default: break;
+      }
+      if (partialView(b.result)) partial++;
+    }
     if (b.result && Number.isFinite(b.result.ts) && b.result.ts > endTs) endTs = b.result.ts;
   }
-  return { type: "group", key: groupKey(blocks[0]), blocks, shown: blocks, earlier: 0, records, toolCount, failed, missing, warnings, running, startTs, endTs, open: false, last: false };
+  return { type: "group", key: groupKey(blocks[0]), blocks, shown: blocks, earlier: 0, records, toolCount, exited, failed, denied, invalid, timedOut, interrupted, partial, missing, warnings, running, startTs, endTs, open: false, last: false };
 }
 
 /**
@@ -2020,6 +2089,9 @@ function makeGroup(blocks) {
  *                                                   serving it and `differs` says it is not the segment chip's model
  *   {type:"group", key, blocks, toolCount, failed, missing, running, startTs, endTs, open, last}
  *                                                   a maximal run of tool blocks, text-less replies and job/ledger/cache lines
+ *   {type:"since", seq, count, straddles, text}   (opts.sinceSeq, the last seq seen on the previous visit) the divider "New since
+ *                                                   your last visit · N records", before the first item with a newer record;
+ *                                                   `straddles` when that item is a group that began before it
  *   {type:"model", profile, model, context_window, seq, reason:"start"|"switch"}   chip before the first assistant item of a
  *                                                   segment (after a user message, note, inbox card, divider, child card or
  *                                                   model switch)
@@ -2092,7 +2164,59 @@ export function chatItems(blocks, opts = {}) {
   for (const it of items) if (!(it.type === "block" && it.block.detail)) last = it;
   if (last) last.last = true;
   for (const it of items) if (it.type === "group") it.open = !!(expandAll || it.running || it.last || open.has(it.key));
+  if (Number.isInteger(opts.sinceSeq)) placeSince(items, blocks, opts.sinceSeq, opts.lastSeq);
   return items;
+}
+
+/** The record seqs a block stands for: a tool block holds its call and its result. */
+function blockSeqs(b) {
+  if (b.kind === "tool") {
+    const out = [];
+    if (Number.isInteger(b.callSeq)) out.push(b.callSeq);
+    if (b.result && Number.isInteger(b.result.seq)) out.push(b.result.seq);
+    return out.length ? out : [b.seq];
+  }
+  return [b.seq];
+}
+
+/**
+ * recordsAfter(blocks, seq, lastSeq): how many records were recorded after `seq`. With `lastSeq` (the store's last seq, as lastSeq()
+ * gives) every record counts, bookkeeping ones included; without it the blocks are counted (not request-detail lines; a tool block counts
+ * its call and its result on their own). The number of "new" records for the divider and for Jump to latest.
+ */
+export function recordsAfter(blocks, seq, lastSeq) {
+  if (!Number.isInteger(seq)) return 0;
+  // Seqs are contiguous: when the last one is known the count is a subtraction, and it counts bookkeeping records too (O(1)).
+  if (Number.isInteger(lastSeq)) return Math.max(0, lastSeq - seq);
+  let n = 0;
+  for (const b of blocks || []) {
+    if (!b || b.detail) continue;
+    for (const q of blockSeqs(b)) if (Number.isInteger(q) && q > seq) n++;
+  }
+  return n;
+}
+
+/** The label of the Jump button: "Jump to latest" or "Jump to latest · 12 new". */
+export function jumpLabel(newCount) {
+  return newCount > 0 ? `Jump to latest · ${num(newCount)} new` : "Jump to latest";
+}
+
+// Put the "since your last visit" item before the first item that holds a record after `sinceSeq`. Nothing is put when every
+// item is new (a first sight has no watermark) or none is.
+function placeSince(items, blocks, sinceSeq, lastSeq) {
+  const newIn = (it) => {
+    if (it.type === "block") return blockSeqs(it.block).some((q) => q > sinceSeq);
+    if (it.type === "group") return it.blocks.some((b) => !b.detail && blockSeqs(b).some((q) => q > sinceSeq));
+    if (it.type === "model") return it.seq > sinceSeq;
+    return false;
+  };
+  const at = items.findIndex(newIn);
+  const count = recordsAfter(blocks, sinceSeq, lastSeq);
+  if (at <= 0 || !count) return;
+  const first = items[at];
+  const head = first.type === "group" ? first.blocks.find((b) => !b.detail) : null;
+  const straddles = !!head && Math.min(...blockSeqs(head)) <= sinceSeq;
+  items.splice(at, 0, { type: "since", seq: sinceSeq, count, straddles, text: `New since your last visit · ${count === 1 ? "1 record" : num(count) + " records"}` });
 }
 
 /** The key of the group of `items` that holds record `seq` (a block's own seq, a tool's call or result seq); null when none. */
@@ -2106,22 +2230,29 @@ export function groupKeyForSeq(items, seq) {
   return null;
 }
 
-/** The header words of a work group: {text, spoken, duration, tools, failed, missing, warnings, running} where text is
- *  "Worked for 12s · 4 tool calls · 1 failed · running" (the running group's duration runs to `now`). `spoken` is the
+/** The header words of a work group: {text, spoken, duration, tools, exited, failed, denied, invalid, timedOut, interrupted, partial,
+ *  missing, warnings, running} where text is "Worked for 4m · 12 calls · 2 exited non-zero · 1 denied by policy · 1 without a result ·
+ *  running" (each non-ok ToolStatus counted on its own; the running group's duration runs to `now`). `spoken` is the
  *  accessible name: the same without the duration while the group runs, so a ticking clock is not read out every second. */
 export function groupLabel(group, now) {
   const end = group.running && Number.isFinite(now) ? now : group.endTs;
   const ms = Math.max(0, (Number(end) || 0) - (Number(group.startTs) || 0));
   const duration = ms < 1000 ? "under 1s" : seconds(ms);
   const rest = [count(group.toolCount, "tool call")];
+  if (group.exited) rest.push(`${group.exited} exited non-zero`);
   if (group.failed) rest.push(`${group.failed} failed`);
+  if (group.denied) rest.push(`${group.denied} denied by policy`);
+  if (group.invalid) rest.push(`${group.invalid} invalid`);
+  if (group.timedOut) rest.push(`${group.timedOut} timed out`);
+  if (group.interrupted) rest.push(`${group.interrupted} interrupted`);
   if (group.missing) rest.push(`${group.missing} without a result`);
   if (group.warnings) rest.push(count(group.warnings, "warning"));
   if (group.running) rest.push("running");
   return {
     text: [`Worked for ${duration}`, ...rest].join(" · "),
     spoken: [group.running ? "Work in progress" : `Worked for ${duration}`, ...rest].join(" · "),
-    duration, tools: group.toolCount, failed: group.failed, missing: group.missing, warnings: group.warnings || 0, running: group.running,
+    duration, tools: group.toolCount, failed: group.failed || 0, exited: group.exited || 0, denied: group.denied || 0, invalid: group.invalid || 0,
+    timedOut: group.timedOut || 0, interrupted: group.interrupted || 0, partial: group.partial || 0, missing: group.missing, warnings: group.warnings || 0, running: group.running,
   };
 }
 
@@ -2137,8 +2268,10 @@ export function windowItems(items, from) {
   const out = [];
   for (let i = 0; i < items.length; i++) {
     const it = items[i];
-    if (it.type === "model") {
-      if (keeps(items[i + 1])) out.push(it);
+    if (it.type === "model" || it.type === "since") {
+      let j = i + 1;
+      while (items[j] && (items[j].type === "model" || items[j].type === "since")) j++;
+      if (keeps(items[j])) out.push(it);
     } else if (it.type === "group") {
       if (!keeps(it)) continue;
       const shown = it.blocks.filter((b) => b.id >= from);
@@ -2171,20 +2304,48 @@ export function toolIcon(block) {
   }
 }
 
-/** One tool row in a group: {icon, name, argsLine, capsule, duration, state}. `capsule` is {text, tone, icon} or null
- *  (tone "ok" | "bad" | "warn" | "running"; icon is a template name with its own shape: check / cross / alert / dot). */
+/** The look of each way a call can end: its capsule words are `text`, `tone` "ok" | "neutral" | "bad" | "warn" | "running", `icon` a
+ *  template name with its own shape per outcome (check, exit, cross, lock, invalid, clock, interrupted, alert, dot). */
+export const TOOL_OUTCOME_LOOK = {
+  exit: { tone: "neutral", icon: "exit" },
+  failed: { tone: "bad", icon: "cross" },
+  denied: { tone: "warn", icon: "lock" },
+  invalid: { tone: "neutral", icon: "invalid" },
+  timeout: { tone: "warn", icon: "clock" },
+  interrupted: { tone: "warn", icon: "interrupted" },
+};
+const TOOL_OUTCOME_WORDS = {
+  exit: (o) => `The tool ran and exited with code ${o.exit}.`,
+  failed: () => "The tool ran and reported failure.",
+  denied: () => "Refused by policy (sandbox, scope or approval).",
+  invalid: () => "The arguments failed validation or the tool does not exist; nothing ran.",
+  timeout: () => "The call timed out.",
+  interrupted: () => "Cut off; its effects are unknown.",
+};
+
+/** One tool row in a group: {icon, name, argsLine, capsule, duration, state, outcome, words, partial}. `capsule` is {text, tone, icon}
+ *  or null (see TOOL_OUTCOME_LOOK); `outcome` is toolOutcome().kind ("running" / "missing" while there is no result), `words` the
+ *  sentence for its tooltip, `partial` {words, shown, total, cut} when the model saw only part of the output, else null. */
 export function toolRow(block) {
   const r = block.result;
   let capsule = null;
+  let outcome = block.state === "running" ? "running" : block.state === "missing" ? "missing" : "ok";
+  let words = "";
   if (block.state === "running") capsule = { text: "running", tone: "running", icon: "dot" };
-  else if (block.state === "missing") capsule = { text: "no result", tone: "warn", icon: "alert" };
+  else if (block.state === "missing") { capsule = { text: "no result", tone: "warn", icon: "alert" }; words = "No result was recorded for this call."; }
   else if (r) {
-    const code = r.meta && Number.isInteger(r.meta.exit_code) ? r.meta.exit_code : null;
-    if (r.status === "ok") capsule = { text: code === null ? "ok" : `exit ${code}`, tone: "ok", icon: "check" };
-    else capsule = { text: code !== null && code !== 0 ? `exit ${code}` : oneLine(r.status || "error", 24), tone: "bad", icon: "cross" };
+    const o = toolOutcome(r);
+    outcome = o.kind;
+    if (o.kind === "ok") capsule = { text: o.exit === null ? "ok" : `exit ${o.exit}`, tone: "ok", icon: "check" };
+    else {
+      const look = TOOL_OUTCOME_LOOK[o.kind];
+      const text = o.kind === "exit" ? `exit ${o.exit}` : o.kind === "failed" ? oneLine(r.status || "error", 24) : o.kind;
+      capsule = { text, tone: look.tone, icon: look.icon };
+      words = TOOL_OUTCOME_WORDS[o.kind](o);
+    }
   }
   const duration = r && r.duration_ms ? seconds(r.duration_ms) : "";
-  return { icon: toolIcon(block), name: block.name, argsLine: block.argsLine || "", capsule, duration, state: block.state };
+  return { icon: toolIcon(block), name: block.name, argsLine: block.argsLine || "", capsule, duration, state: block.state, outcome, words, partial: partialView(r) };
 }
 
 /** Footer of a reply, quiet: [profile ·] tok/s · seconds · cache N%. Pass `profile` only when the reply's model differs
@@ -2199,14 +2360,6 @@ export function replyMeta(block, profile = "") {
   const share = cachedShare((block.usage || {}).cached_tokens || 0, (block.usage || {}).prompt_tokens || 0);
   if (share) parts.push(`cache ${share}`);
   return parts.join(" · ");
-}
-
-/** The model-switched line in full: {from, to, text} with each side "profile · model · window" and `reason`. */
-export function switchLine(block) {
-  const sw = block && block.switch;
-  if (!sw) return null;
-  const side = (m) => [m.profile || "?", m.model || "?", formatWindow(m.context_window)].filter(Boolean).join(" · ");
-  return { from: side(sw.from), to: side(sw.to), reason: sw.reason, text: block.text };
 }
 
 // ---- sidebar
@@ -2581,4 +2734,704 @@ export function sendStateText({ loaded = true, seat = null, message = null } = {
   const m = message && message.text ? message : null;
   if (s && m) return (Number(s.at) || 0) > (Number(m.at) || 0) ? s.text : m.text;
   return (s || m || { text: "" }).text;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pass 2: prose, switcher, quiet indicator, endings and notifications, agents, find, progress, inbox triage
+
+/**
+ * proseTree(text): the prose subset as a tree, in one pass over the lines (a fenced block is collected, not re-read per line).
+ * Returns blocks: {type:"p"|"h", inline} | {type:"ul"|"ol", items: inline[]} | {type:"pre", text}; `inline` is a list of
+ * {type:"text"|"strong"|"code", text}. Nothing here is HTML: the caller makes elements and text nodes.
+ */
+export function proseTree(text) {
+  const out = [];
+  let paragraph = [], list = null, code = null;
+  const inline = (value) => {
+    const parts = [];
+    let from = 0;
+    for (const m of value.matchAll(/(\*\*[^*\n]+\*\*|`[^`\n]+`)/g)) {
+      if (m.index > from) parts.push({ type: "text", text: value.slice(from, m.index) });
+      const bold = m[0].startsWith("**");
+      parts.push({ type: bold ? "strong" : "code", text: m[0].slice(bold ? 2 : 1, bold ? -2 : -1) });
+      from = m.index + m[0].length;
+    }
+    if (from < value.length) parts.push({ type: "text", text: value.slice(from) });
+    return parts;
+  };
+  const flush = () => {
+    if (paragraph.length) { out.push({ type: "p", inline: inline(paragraph.join("\n")) }); paragraph = []; }
+  };
+  for (const line of String(text ?? "").split("\n")) {
+    if (/^\s*```/.test(line)) {
+      flush(); list = null;
+      if (code) { out.push({ type: "pre", text: code.join("\n") }); code = null; } else code = [];
+    } else if (code) code.push(line);
+    else if (/^#{1,6}\s+/.test(line)) {
+      flush(); list = null;
+      out.push({ type: "h", inline: inline(line.replace(/^#{1,6}\s+/, "")) });
+    } else if (/^\s*(?:[-*+]\s+|\d+[.)]\s+)/.test(line)) {
+      flush();
+      const type = /^\s*\d/.test(line) ? "ol" : "ul";
+      if (!list || list.type !== type) { list = { type, items: [] }; out.push(list); }
+      list.items.push(inline(line.replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/, "")));
+    } else if (!line.trim()) { flush(); list = null; }
+    else { list = null; paragraph.push(line); }
+  }
+  flush();
+  if (code) out.push({ type: "pre", text: code.join("\n") }); // a fence left open runs to the end, as it is read
+  return out;
+}
+
+// ---- switcher
+
+/** The quiet threshold: a running session with no new record for longer than this says so. */
+export const QUIET_MS = 10 * 60 * 1000;
+
+/**
+ * quietFor(info, activity, now): for a RUNNING session whose latest known record (`activity` is {ts} or a time) is older than
+ * QUIET_MS: {text:"no new record for 41m", icon:"hourglass", tone:"", ms, tip}; otherwise null, including when the age is
+ * unknown. Factual and neutral: never "stalled", never amber. `since` (optional) is the time the page's event stream connected, or null
+ * while it is down: the note is null with no stream, and counts only the time the page has been listening.
+ */
+export function quietFor(info, activity, now, since) {
+  if (!info || !info.status || info.status.phase !== "running") return null;
+  let ts = activity && typeof activity === "object" ? activity.ts : activity;
+  if (!Number.isFinite(ts) || !Number.isFinite(now)) return null;
+  // `since`: when this page's stream last (re)connected. With the stream down (null) nothing is known; otherwise only the time since
+  // it connected is known to be silent, so a record age from before that (a restored watermark) cannot drive the note.
+  if (since !== undefined) {
+    if (!Number.isFinite(since)) return null;
+    ts = Math.max(ts, since);
+  }
+  const ms = now - ts;
+  if (!(ms > QUIET_MS)) return null;
+  return {
+    text: `no new record for ${age(now, ts)}`, icon: "hourglass", tone: "", ms,
+    tip: "Nothing was recorded for this session for a while. That can be normal: a cold prompt of a million tokens takes minutes to read, requests queue, and a model may be given up to 240 seconds before a stall is declared.",
+  };
+}
+
+/** What a row says on its own line: what waits on the operator, else the quiet note, else null. {text, icon, tone}. */
+export function rowReason(waiting, info, activity, now, since) {
+  return waitingReason(waiting, now) || quietFor(info, activity, now, since);
+}
+
+/**
+ * switcherRows(store, inbox, query, opts): the rows of the Ctrl/Cmd+K switcher, every session (roots and agents; archived ones
+ * only with opts.showArchived). opts: {now, activity (Map id -> {seq, ts}), showArchived, since (the stream's connect time, or null: see quietFor)}. Order with no query: Needs you
+ * (oldest wait first), Running, then the rest by latest record (creation time when none). A non-empty `query` keeps rows
+ * where it is a plain, case-insensitive substring of the title, the profile, the role or the workspace name, or a prefix of the id.
+ * Row: {id, info, mission, root, title, workspace, group:"needs_you"|"running"|"other", mark, identity, reason, matched}.
+ */
+export function switcherRows(store, inbox, query, opts = {}) {
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+  const activity = opts.activity instanceof Map ? opts.activity : new Map();
+  const q = String(query ?? "").trim().toLowerCase();
+  const rows = [];
+  for (const info of store.byId.values()) {
+    if (info.archived && !opts.showArchived) continue;
+    const ws = workspaceName(info.workspace);
+    const title = info.title || info.id;
+    let matched = null;
+    if (q) {
+      if (title.toLowerCase().includes(q)) matched = "title";
+      else if (String(info.id).toLowerCase().startsWith(q)) matched = "id";
+      else if (ws.toLowerCase().includes(q)) matched = "workspace";
+      else if (String(info.profile || "").toLowerCase().includes(q)) matched = "profile";
+      else if (String(info.role || "").toLowerCase().includes(q)) matched = "role";
+      if (!matched) continue;
+    }
+    const attention = attentionFor(inbox, info.id);
+    const waiting = waitingFor(inbox, [info.id]);
+    const a = activity.get(info.id);
+    const recordedMs = a && Number.isFinite(a.ts) ? a.ts : null;
+    const st = info.status || {};
+    const group = attention.blocking > 0 && st.phase !== "ended" ? "needs_you" : st.phase === "running" ? "running" : "other";
+    rows.push({
+      id: info.id, info, mission: info.mission || info.id, root: !info.parent, title, workspace: ws, group,
+      mark: rowMark(info, attention), identity: identityLine(info, recordedMs, waiting, now),
+      reason: rowReason(waiting, info, a, now, opts.since), matched,
+      sort: recordedMs ?? (Number(info.created_ms) || 0), since: waiting.blocking.since,
+    });
+  }
+  const rank = { needs_you: 0, running: 1, other: 2 };
+  rows.sort((x, y) => rank[x.group] - rank[y.group]
+    || (x.group === "needs_you" ? (x.since ?? Infinity) - (y.since ?? Infinity) : 0)
+    || y.sort - x.sort || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+  return rows.map(({ sort, since, ...row }) => row);
+}
+
+/**
+ * nextNeedsYou(store, inbox, currentId, dir): the next mission waiting on the operator, cycling (dir 1 forward, -1 back). Missions are
+ * ordered by their oldest blocking item. Returns {id (the session holding that oldest item), mission, index (1-based), total,
+ * words:"2 of 3 needing you"}, or null when nothing blocks. A session of the current mission counts as being at it.
+ */
+export function nextNeedsYou(store, inbox, currentId, dir = 1) {
+  const byMission = new Map();
+  for (const e of inbox.items.values()) {
+    if (!e.item.blocking) continue;
+    const info = store.byId.get(e.session);
+    if (info && info.status && info.status.phase === "ended") continue;
+    const m = (info && info.mission) || e.mission || e.session;
+    const opened = Number.isFinite(e.opened_ms) ? e.opened_ms : Infinity;
+    const cur = byMission.get(m);
+    if (!cur || opened < cur.opened) byMission.set(m, { mission: m, id: e.session, opened });
+  }
+  const list = [...byMission.values()].sort((a, b) => a.opened - b.opened || (a.mission < b.mission ? -1 : 1));
+  if (!list.length) return null;
+  const here = store.byId.get(currentId);
+  const at = list.findIndex((m) => m.mission === (here ? here.mission : currentId));
+  const step = dir < 0 ? -1 : 1;
+  const i = at < 0 ? (step > 0 ? 0 : list.length - 1) : (at + step + list.length) % list.length;
+  return { id: list[i].id, mission: list[i].mission, index: i + 1, total: list.length, words: `${i + 1} of ${list.length} needing you` };
+}
+
+// ---- keyboard
+
+const NON_TEXT_INPUTS = new Set(["checkbox", "radio", "button", "submit", "reset", "range", "color", "file", "image"]);
+
+/** Whether a key press aimed at `target` ({tagName, type, isContentEditable}) is typing text: no single-key shortcut may fire. */
+export function typingTarget(target) {
+  if (!target) return false;
+  if (target.isContentEditable) return true;
+  const tag = String(target.tagName || "").toLowerCase();
+  if (tag === "textarea" || tag === "select") return true;
+  return tag === "input" && !NON_TEXT_INPUTS.has(String(target.type || "text").toLowerCase());
+}
+
+/**
+ * shortcutFor(event, {typing, mac}): the page's keyboard action for a key press, or null. `event` is {key, ctrlKey, metaKey, altKey,
+ * shiftKey, isComposing}. Ctrl/Cmd+K (the switcher) works anywhere; every other key is ignored while `typing`, while composing
+ * text, and with a modifier it does not use. Escape and Stop have no entry here: Escape only closes surfaces, and no key stops a session.
+ * Actions: "switch", "row-next", "row-prev" (Alt+Down/Up), "needs-next", "needs-prev" (Alt+Shift+Down/Up), "find" (/), "keys" (?).
+ */
+export function shortcutFor(e, opts = {}) {
+  if (!e || e.isComposing) return null;
+  const mod = !!(e.ctrlKey || e.metaKey);
+  // On a Mac Ctrl+K is the system's delete-to-end-of-line, so the switcher takes Cmd only there; elsewhere Ctrl only.
+  const chord = opts.mac === undefined ? mod : opts.mac ? !!e.metaKey : !!e.ctrlKey;
+  if (chord && !e.altKey && !e.shiftKey && (e.key === "k" || e.key === "K")) return "switch";
+  if (opts.typing || mod) return null;
+  if (e.altKey) {
+    if (e.key === "ArrowDown") return e.shiftKey ? "needs-next" : "row-next";
+    if (e.key === "ArrowUp") return e.shiftKey ? "needs-prev" : "row-prev";
+    return null;
+  }
+  if (e.key === "?") return "keys";
+  if (e.key === "/") return "find"; // on layouts where / needs Shift the key is still "/"
+  return null;
+}
+
+/**
+ * stepIndex(length, current, dir): the index one step from `current` (-1 or out of range: none) within a list, not wrapping; null
+ * at an end or for an empty list. With no current, forward gives the first and back the last.
+ */
+export function stepIndex(length, current, dir) {
+  if (!(length > 0)) return null;
+  const step = dir < 0 ? -1 : 1;
+  if (!Number.isInteger(current) || current < 0 || current >= length) return step > 0 ? 0 : length - 1;
+  const next = current + step;
+  return next < 0 || next >= length ? null : next;
+}
+
+/**
+ * keySheet(mac): the shortcut sheet as groups [{title, rows:[{keys:[cap...], text}]}]; `mac` writes Cmd and Option for Ctrl and Alt.
+ * It lists only keys the page binds, and says that no key stops a session.
+ */
+export function keySheet(mac = false) {
+  const ctrl = mac ? "Cmd" : "Ctrl";
+  const alt = mac ? "Option" : "Alt";
+  return [
+    { title: "Move between missions", rows: [
+      { keys: [ctrl, "K"], text: "Switch to a mission or agent by name, workspace, profile or role" },
+      { keys: [alt, "↓"], text: "Next mission in the sidebar" },
+      { keys: [alt, "↑"], text: "Previous mission in the sidebar" },
+      { keys: [alt, "Shift", "↓"], text: "Next mission that needs you" },
+      { keys: [alt, "Shift", "↑"], text: "Previous mission that needs you" },
+    ] },
+    { title: "In a record", rows: [
+      { keys: ["/"], text: "Find in this record" },
+      { keys: ["Enter"], text: "In Find: next match" },
+      { keys: ["Shift", "Enter"], text: "In Find: previous match" },
+      { keys: ["Enter"], text: "In the message box: send" },
+      { keys: ["Shift", "Enter"], text: "In the message box: new line" },
+    ] },
+    { title: "Answering", rows: [
+      { keys: [ctrl, "Enter"], text: "Send the answer you are writing in an inbox card, then go to the next open card" },
+    ] },
+    { title: "Everywhere", rows: [
+      { keys: ["?"], text: "This sheet" },
+      { keys: ["Esc"], text: "Close the open dialog, drawer or Find. It never stops anything." },
+    ] },
+  ];
+}
+
+// ---- endings and notifications
+
+/**
+ * missionEnding(prev, next, opts): a root session that has just ended (phase "ended", or running to idle with last_end finished,
+ * error, budget_exhausted or stopped: the daemon never sets "ended" on a root), seen as two infos (the one held
+ * and the one a `session` or `status` frame brings; for a status frame pass {...prev, status}). null when it is not a root, was
+ * not seen before, was already ended, or was stopped by this tab (opts.requested: Set of session ids this tab asked to stop).
+ * Returns {session, mission, title, outcome, words}.
+ */
+export function missionEnding(prev, next, opts = {}) {
+  if (!prev || !next || next.parent) return null;
+  const was = prev.status && prev.status.phase;
+  const now = next.status && next.status.phase;
+  let outcome = null;
+  if (now === "ended" && was !== "ended" && was) outcome = next.status.outcome || "done";
+  else if (was === "running" && now === "idle") {
+    // A root lead never reaches phase "ended": it goes back to idle and records how its turn ended. A yield (every chat
+    // reply), a wait and an ask are not endings.
+    outcome = { finished: "done", error: "failed", budget_exhausted: "budget_exhausted", stopped: "stopped" }[next.status.last_end] || null;
+  }
+  if (!outcome) return null;
+  if (outcome === "stopped" && opts.requested && opts.requested.has(next.id)) return null;
+  return { session: next.id, mission: next.mission || next.id, title: next.title || next.id, outcome, words: outcomeWords(outcome) };
+}
+
+/** How a mission ending is said in a count line. */
+const ENDING_COUNT = { done: "finished", failed: "failed", budget_exhausted: "ran out of budget", stopped: "stopped", returned: "returned", blocked: "blocked" };
+const ENDING_NOUN = { done: "Mission finished", failed: "Mission failed", budget_exhausted: "Mission ran out of budget", stopped: "Mission stopped", returned: "Mission returned", blocked: "Mission blocked" };
+
+/**
+ * noticeOfInbox(entry, at): the notice for an open inbox entry: {tag, session, title, kind:"needs_you"|"result", noun, text, at}, or
+ * null for a nonblocking item that is not a result. The noun is the sidebar's ("Approval waiting"), not the item kind.
+ */
+export function noticeOfInbox(entry, at) {
+  const item = entry && entry.item;
+  if (!item) return null;
+  const result = item.item_kind === "finished";
+  if (!item.blocking && !result) return null;
+  return {
+    tag: item.item_id, session: entry.session, title: entry.title || entry.session, at,
+    kind: item.blocking ? "needs_you" : "result",
+    noun: item.blocking ? `${WAITING_NOUN[item.item_kind] || "Request"} waiting` : "Result ready",
+    text: oneLine(item.text || "", 200),
+  };
+}
+
+/** noticeOfEnding(ending, at): the notice for a missionEnding() result: {tag:"end:<session>", kind:"ended", noun, outcome, ...}. */
+export function noticeOfEnding(ending, at) {
+  if (!ending) return null;
+  return {
+    tag: "end:" + ending.session, session: ending.session, title: ending.title, at, kind: "ended", outcome: ending.outcome,
+    noun: ENDING_NOUN[ending.outcome] || `Mission ${ending.words}`, text: "",
+  };
+}
+
+/** Events that arrive within this long of the first waiting one are shown as one notification. */
+export const NOTIFY_WINDOW_MS = 5000;
+
+/**
+ * planNotifications(pending, {now, windowMs, visible}): `pending` are notices (noticeOfInbox / noticeOfEnding) not yet shown, each with
+ * its arrival time `at`. Returns {due, wait, notification, rest}: while the oldest is younger than the window, {due:false, wait: ms
+ * left, notification:null, rest: pending}; after it, {due:true, wait:0, rest:[], notification} with everything combined, or
+ * notification null when `visible` (the page is shown and focused: the badge and title already say it).
+ * notification: {tag, title, body, target:{hash, session}, covers: tags, sessions, counts:{needs, results, ended}}, e.g. title "2 need you · 1 finished".
+ * One notice: its noun as the title, its mission and text as the body, target its session. Several: target "#/inbox".
+ */
+export function planNotifications(pending, opts = {}) {
+  const list = (pending || []).filter(Boolean);
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+  const windowMs = Number.isFinite(opts.windowMs) ? opts.windowMs : NOTIFY_WINDOW_MS;
+  if (!list.length) return { due: false, wait: null, notification: null, rest: [] };
+  const oldest = Math.min(...list.map((n) => (Number.isFinite(n.at) ? n.at : now)));
+  if (now - oldest < windowMs) return { due: false, wait: windowMs - (now - oldest), notification: null, rest: list };
+  if (opts.visible) return { due: true, wait: 0, notification: null, rest: [] };
+  const seen = new Set();
+  const all = list.filter((n) => (seen.has(n.tag) ? false : (seen.add(n.tag), true)));
+  // A mission that ends also opens its Finished or Parked item: one ending, one notice, so the item notice folds into it.
+  const ended = new Set(all.filter((n) => n.kind === "ended").map((n) => n.session));
+  const batch = all.filter((n) => n.kind === "ended" || !ended.has(n.session));
+  const counts = { needs: 0, results: 0, ended: 0 };
+  const endWords = new Map();
+  for (const n of batch) {
+    if (n.kind === "needs_you") counts.needs++;
+    else if (n.kind === "result") counts.results++;
+    else { counts.ended++; const w = ENDING_COUNT[n.outcome] || outcomeWords(n.outcome || "ended"); endWords.set(w, (endWords.get(w) || 0) + 1); }
+  }
+  const sessions = [...new Set(batch.map((n) => n.session))];
+  const covers = all.map((n) => n.tag);
+  if (batch.length === 1) {
+    const n = batch[0];
+    return {
+      due: true, wait: 0, rest: [],
+      notification: {
+        tag: n.tag, title: n.noun, body: oneLine(n.text ? `${n.title}: ${n.text}` : n.title, 200),
+        target: { hash: sessionHash(n.session), session: n.session }, covers, sessions, counts,
+      },
+    };
+  }
+  const parts = [];
+  if (counts.needs) parts.push(`${counts.needs} ${counts.needs === 1 ? "needs" : "need"} you`);
+  if (counts.results) parts.push(`${counts.results} ${counts.results === 1 ? "result" : "results"} ready`);
+  for (const [w, n] of endWords) parts.push(`${n} ${w}`);
+  const lines = batch.slice(0, 4).map((n) => `${n.noun}: ${oneLine(n.title, 60)}`);
+  if (batch.length > 4) lines.push(`and ${batch.length - 4} more`);
+  return {
+    due: true, wait: 0, rest: [],
+    notification: {
+      tag: `batch:${oldest}:${batch.length}`, title: parts.join(" · "), body: lines.join("\n"),
+      target: { hash: "#/inbox", session: null }, covers, sessions, counts,
+    },
+  };
+}
+
+/**
+ * closableNotifications(shown, ctx): which shown notifications (planNotifications().notification objects) to close. ctx: {openItems: Set
+ * of item ids still open, opened: {session, inbox}} (what the operator just opened). A notification closes when its session
+ * was opened (one session), when the inbox was opened (several), or when every item it covers has been resolved (a notification that
+ * covers a mission ending has nothing to resolve and closes only on opening). Returns the tags to close.
+ */
+export function closableNotifications(shown, ctx = {}) {
+  const open = ctx.openItems instanceof Set ? ctx.openItems : new Set(ctx.openItems || []);
+  const opened = ctx.opened || {};
+  const out = [];
+  for (const n of shown || []) {
+    const items = (n.covers || []).filter((t) => !String(t).startsWith("end:"));
+    const allItems = items.length === (n.covers || []).length && items.length > 0;
+    const byOpen = (opened.session && n.target && n.target.session === opened.session) || (opened.inbox && n.target && n.target.hash === "#/inbox");
+    if (byOpen || (allItems && items.every((t) => !open.has(t)))) out.push(n.tag);
+  }
+  return out;
+}
+
+// ---- agents
+
+const AGENT_GROUPS = [
+  ["needs_you", "Needs you"], ["running", "Running"], ["waiting", "Waiting"], ["idle", "Idle"], ["ended", "Ended"],
+];
+
+/** The cells of a score row: [key in the card, singular, plural]. */
+const SCORE_CELLS = [
+  ["calls", "call", "calls"], ["malformed_calls", "malformed call", "malformed calls"], ["quote_refusals", "quote refusal", "quote refusals"],
+  ["finish_refusals", "finish refusal", "finish refusals"], ["verifier_accepts", "verifier accept", "verifier accepts"],
+  ["verifier_rejections", "verifier reject", "verifier rejects"], ["hand_offs", "hand-off", "hand-offs"], ["asks", "ask", "asks"],
+];
+export const SCORE_TOTAL_LABEL = "Mission total: the result is the lead's, the effort everyone's";
+export const SCORE_FINEPRINT = "Run numbers describe effort, not completion.";
+
+function scoreCard(card) {
+  const c = card || {};
+  const n = (k) => (Number.isFinite(c[k]) ? c[k] : 0);
+  const cells = SCORE_CELLS.map(([key, one, many]) => ({ key, label: many, value: n(key), text: count(n(key), one, many) }));
+  const shown = cells.filter((x) => x.value > 0);
+  return {
+    steps: n("steps"), finished: !!c.finished, stepsToFinish: Number.isFinite(c.steps_to_finish) ? c.steps_to_finish : null,
+    unrecorded: !!c.unrecorded, cells,
+    text: shown.length ? shown.map((x) => x.text).join(" · ") : "no calls recorded",
+  };
+}
+
+/**
+ * scoreRows(view): `GET /api/missions/{id}/score` ({mission, sessions:[{session, role, parent, card}], total}) as rows. Returns
+ * {mission, rows, bySession: Map id -> row, total, label, fineprint} or null for anything else. A row is {session, role, parent,
+ * steps, finished, stepsToFinish, unrecorded, cells:[{key, label, value, text}] (calls, malformed calls, quote refusals, finish
+ * refusals, verifier accepts and rejects, hand-offs, asks: all eight, zeros included), text (the non-zero ones)}.
+ */
+export function scoreRows(view) {
+  if (!view || !Array.isArray(view.sessions) || !view.total || typeof view.total !== "object") return null;
+  const rows = view.sessions.filter((s) => s && s.session).map((s) => ({ session: s.session, role: s.role || "", parent: s.parent || null, ...scoreCard(s.card) }));
+  return {
+    mission: view.mission || null, rows, bySession: new Map(rows.map((r) => [r.session, r])),
+    total: { session: null, role: "", parent: null, ...scoreCard(view.total) }, label: SCORE_TOTAL_LABEL, fineprint: SCORE_FINEPRINT,
+  };
+}
+
+/** Score refresh cadence: at most this often while the Agents tab is shown and an agent runs. */
+export const SCORE_EVERY_MS = 120000;
+
+/**
+ * scoreDue({shown, lastMs, running, now, force}): whether to fetch /score now. Always on `force` (opening the tab, Refresh); while the
+ * tab is shown and nothing was fetched yet, even when nothing runs; after that only while something runs, and not within SCORE_EVERY_MS of the last fetch.
+ */
+export function scoreDue({ shown, lastMs, running, now, force } = {}) {
+  if (force) return true;
+  if (!shown) return false;
+  if (!Number.isFinite(lastMs)) return true; // a finished mission is read once too: reviewing it is the common case
+  return !!running && now - lastMs >= SCORE_EVERY_MS;
+}
+
+/** The seq of each child's `child_spawned` block, for the "where it was spawned" link: Map child session id -> seq. */
+export function spawnSeqs(blocks) {
+  const m = new Map();
+  for (const b of blocks || []) if (b && b.kind === "child_spawned" && b.child) m.set(b.child, b.seq);
+  return m;
+}
+
+/**
+ * agentGroups(store, inbox, missionId, opts): the Agents tab. opts: {now, activity (Map id -> {seq, ts}), since (see quietFor), score (scoreRows() or null),
+ * spawns (spawnSeqs())}. Groups in fixed order: Needs you, Running, Waiting, Idle, Ended (folded); inside a group, creation order, never
+ * by activity. Returns {groups:[{key, label, folded, rows}], total, running, badge:"3 running"|""}. Row: {id, info, depth, indent (depth up
+ * to 3), crumbs (ancestor titles, root first, only when deeper than 3), title, role, roleLine "role · profile", mark, step, ageText
+ * ("12m ago", "just now", or null while unknown), recordedMs, quiet, generated ("1.2M generated" or ""), outcome (ended agents,
+ * in words), waiting, score (scoreRows row or null), spawnSeq (number or null)}.
+ */
+export function agentGroups(store, inbox, missionId, opts = {}) {
+  const now = Number.isFinite(opts.now) ? opts.now : Date.now();
+  const activity = opts.activity instanceof Map ? opts.activity : new Map();
+  const members = [...store.byId.values()].filter((s) => (s.mission || s.id) === missionId);
+  const ids = new Set(members.map((s) => s.id));
+  const depthOf = (info) => {
+    const chain = [];
+    const seen = new Set([info.id]);
+    for (let p = info.parent && store.byId.get(info.parent); p && ids.has(p.id) && !seen.has(p.id); p = p.parent && store.byId.get(p.parent)) {
+      chain.unshift(p);
+      seen.add(p.id);
+    }
+    return chain;
+  };
+  const groups = new Map(AGENT_GROUPS.map(([key, label]) => [key, { key, label, folded: key === "ended", rows: [] }]));
+  let running = 0;
+  const ordered = members.slice().sort((a, b) => (Number(a.created_ms) || 0) - (Number(b.created_ms) || 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  for (const info of ordered) {
+    const st = info.status || {};
+    const attention = attentionFor(inbox, info.id);
+    const waiting = waitingFor(inbox, [info.id]);
+    const key = st.phase === "ended" ? "ended" : attention.blocking > 0 ? "needs_you" : st.phase === "running" ? "running" : st.last_end === "waiting" ? "waiting" : "idle";
+    if (st.phase === "running") running++;
+    const chain = depthOf(info);
+    const depth = chain.length;
+    const a = activity.get(info.id);
+    const recordedMs = a && Number.isFinite(a.ts) ? a.ts : null;
+    const when = recordedMs === null ? null : age(now, recordedMs);
+    groups.get(key).rows.push({
+      id: info.id, info, depth, indent: Math.min(depth, 3), crumbs: depth > 3 ? chain.map((p) => p.title || p.id) : [],
+      title: info.title || info.id, role: info.role || "session", roleLine: `${info.role || "session"} · ${info.profile || "?"}`,
+      mark: rowMark(info, attention), step: Number(st.step) || 0,
+      ageText: when === null ? null : when === "now" ? "just now" : `${when} ago`, recordedMs,
+      quiet: quietFor(info, a, now, opts.since),
+      generated: st.completion_tokens_total > 0 ? `${tokens(st.completion_tokens_total)} generated` : "",
+      outcome: st.phase === "ended" ? (st.outcome ? outcomeWords(st.outcome) : "ended") : "",
+      waiting: waitingReason(waiting, now),
+      score: (opts.score && opts.score.bySession.get(info.id)) || null,
+      spawnSeq: opts.spawns && opts.spawns.has(info.id) ? opts.spawns.get(info.id) : null,
+    });
+  }
+  return { groups: [...groups.values()].filter((g) => g.rows.length), total: members.length, running, badge: running ? `${running} running` : "" };
+}
+
+// ---- find in the record
+
+const FIND_KINDS = new Set(["all", "messages", "tools", "failures"]);
+const FIND_CAP = 2000;
+
+// The searchable pieces of a block: [field, text]; `seq` is the record that holds the text (for the jump).
+function findFields(b) {
+  switch (b.kind) {
+    case "user": return [["text", b.text, b.seq]];
+    case "note": return [["text", b.text, b.seq]];
+    case "response": return [["text", b.text, b.seq]];
+    case "inbox": return [["text", b.item && b.item.text, b.seq], ["answer", b.resolved && b.resolved.answer, b.resolved && b.resolved.seq]];
+    case "child_settled": return [["text", b.report, b.seq]];
+    case "child_spawned": return [["text", typeof b.brief === "string" ? b.brief : b.brief && (b.brief.task || b.brief.text || b.brief.goal), b.seq]];
+    case "tool": return [["call", `${b.name || ""} ${b.argsLine || ""}`, Number.isInteger(b.callSeq) ? b.callSeq : b.seq], ["result", b.result && b.result.text, b.result && b.result.seq]];
+    case "reweave": return [["text", b.summary, b.seq]];
+    case "line": case "divider": case "end": return [["text", b.text, b.seq]];
+    default: return [];
+  }
+}
+
+const isFailureBlock = (b) => (b.kind === "tool" && (b.state === "missing" || (b.result && toolOutcome(b.result).kind !== "ok"))) || isWarningBlock(b) || (b.kind === "end" && (b.outcome === "failed" || b.outcome === "budget_exhausted")) || (b.kind === "line" && b.sub === "interrupted");
+const FIND_IN = {
+  all: () => true,
+  messages: (b) => b.kind === "user" || b.kind === "note" || b.kind === "response" || b.kind === "inbox" || b.kind === "child_settled" || b.kind === "child_spawned",
+  tools: (b) => b.kind === "tool" || (b.kind === "line" && b.sub === "job"),
+  failures: isFailureBlock,
+};
+
+/**
+ * findInRecord(blocks, query, kind, loaded): a literal, case-insensitive search of every loaded block (folded groups and blocks outside the
+ * rendered window included; request-detail lines and reasoning are not searched). kind: "all" | "messages" | "tools" (calls, outputs,
+ * jobs) | "failures" (calls that did not end ok, warnings, failed ends). Returns {query, kind, hits, count, capped, searched, cutOutputs}:
+ * a hit is {id (block id), seq (the record holding the text), field, snippet:{before, match, after}}, one per block, in record
+ * order; `searched` the number of loaded records (whatever the kind; `loaded`, the store's record count, when given); `cutOutputs` how many results are longer than the text held here, which the output viewer
+ * searches instead.
+ */
+export function findInRecord(blocks, query, kind = "all", loaded) {
+  const k = FIND_KINDS.has(kind) ? kind : "all";
+  const needle = String(query ?? "").trim().toLowerCase();
+  const out = { query: String(query ?? "").trim(), kind: k, hits: [], count: 0, capped: false, searched: 0, cutOutputs: 0 };
+  const inKind = FIND_IN[k];
+  for (const b of blocks || []) {
+    if (!b || b.detail) continue;
+    out.searched += blockSeqs(b).length;
+    if (!needle || !inKind(b)) continue;
+    if (b.kind === "tool" && b.result && (b.result.cut || (b.result.output && b.result.output.lines > b.result.lines))) out.cutOutputs++;
+    if (out.hits.length >= FIND_CAP) { out.capped = true; continue; }
+    for (const [field, text, seq] of findFields(b)) {
+      if (!text) continue;
+      const s = String(text);
+      const at = s.toLowerCase().indexOf(needle);
+      if (at < 0) continue;
+      const clean = (t) => t.replace(/\s+/g, " ");
+      out.hits.push({
+        id: b.id, seq: Number.isInteger(seq) ? seq : b.seq, field,
+        snippet: { before: clean(s.slice(Math.max(0, at - 40), at)), match: clean(s.slice(at, at + needle.length)), after: clean(s.slice(at + needle.length, at + needle.length + 60)) },
+      });
+      break;
+    }
+  }
+  if (Number.isInteger(loaded) && loaded >= 0) out.searched = loaded; // every loaded record, bookkeeping ones too
+  out.count = out.hits.length;
+  return out;
+}
+
+/**
+ * findWords(result, current): the count line, honest about scope: "3 of 17 in 12,480 loaded records" (`current` is the 0-based hit
+ * shown), "17 matches in 12,480 loaded records", "No match in 12,480 loaded records", "" for an empty query. A capped search says
+ * "2,000+"; a result with cut outputs adds that their full text is searched in the output viewer.
+ */
+export function findWords(result, current = null, withHint = true) {
+  if (!result || !result.query) return "";
+  const of = `${num(result.searched)} loaded ${result.searched === 1 ? "record" : "records"}`;
+  const n = result.count ? `${num(result.count)}${result.capped ? "+" : ""}` : "";
+  let text;
+  if (!result.count) text = `No match in ${of}`;
+  else if (Number.isInteger(current) && current >= 0 && current < result.count) text = `${num(current + 1)} of ${n} in ${of}`;
+  else text = `${n} ${result.count === 1 && !result.capped ? "match" : "matches"} in ${of}`;
+  const hint = findHint(result);
+  if (withHint && hint) text += `. ${hint}`;
+  return text;
+}
+
+/** The sentence about outputs cut before their end, which only the output viewer searches in full; "" when none. */
+export function findHint(result) {
+  if (!result || !result.query || !result.cutOutputs) return "";
+  return `${count(result.cutOutputs, "output")} cut before the end: search ${result.cutOutputs === 1 ? "it" : "them"} in the output viewer`;
+}
+
+/** A hit's words for a screen reader and the count line: "…text before MATCH text after…". */
+export function findSnippet(hit) {
+  const sn = hit && hit.snippet;
+  if (!sn) return "";
+  return `…${sn.before}${sn.match}${sn.after}…`.replace(/\s+/g, " ");
+}
+
+// ---- progress line
+
+const fmtMinutes = (m) => (m < 60 ? `${m}m` : m % 60 === 0 ? `${m / 60}h` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`);
+
+/**
+ * progressLine({plan, step, budget, minutes}): the line above the composer, or null when nothing is known. `plan` is
+ * ledgerModel().plan, `step` the own steps and `minutes` the active minutes counted since the budget was granted (budgetUsed), `budget`
+ * start.budget ({max_steps, max_minutes}). A step count above the limit (a renewed budget) is shown as the limit. Returns
+ * {text, parts:[{key:"plan"|"now"|"budget", text}], label}: "Plan 3 of 9 done · now: <doing step> · budget 214 of 400 steps · 3h12m of 8h".
+ * Budget is a limit, not a measure of completion, and `label` (the accessible name) says so.
+ */
+export function progressLine({ plan, step, budget, minutes } = {}) {
+  const parts = [];
+  const steps = (plan || []).filter((s) => s.status !== "dropped");
+  if (steps.length) {
+    parts.push({ key: "plan", text: `Plan ${steps.filter((s) => s.status === "done").length} of ${steps.length} done` });
+    const doing = steps.find((s) => s.status === "doing");
+    if (doing) parts.push({ key: "now", text: `now: ${oneLine(doing.text, 80)}` });
+  }
+  const b = budget || {};
+  const bits = [];
+  if (Number.isFinite(b.max_steps) && b.max_steps > 0) bits.push(`${num(Math.min(Number(step) || 0, b.max_steps))} of ${num(b.max_steps)} steps`);
+  if (Number.isFinite(b.max_minutes) && b.max_minutes > 0 && Number.isFinite(minutes)) {
+    bits.push(`${fmtMinutes(Math.min(Math.max(0, minutes), b.max_minutes))} of ${fmtMinutes(b.max_minutes)}`);
+  }
+  if (bits.length) parts.push({ key: "budget", text: `budget ${bits.join(" · ")}` });
+  if (!parts.length) return null;
+  const text = parts.map((p) => p.text).join(" · ");
+  return { text, parts, label: parts.some((p) => p.key === "budget") ? `${text}. The budget is a limit, not a measure of progress.` : text };
+}
+
+// ---- inbox triage
+
+// ---------------------------------------------------------------------------------------------
+// Pass 2, part 4: ways out, inbox triage
+
+/**
+ * foldConfirm(title): the question before folding a session's context, {text, yes, no}. One wording for the Context tab and for the
+ * "Ways out" row of a parked or blocker card; `title` is the session's name (omit it for "this session").
+ */
+export function foldConfirm(title) {
+  const who = title ? `${oneLine(title, 80)}'s context` : "the context of this session";
+  return {
+    text: `Fold ${who} now? Older outputs become stubs that keep their out: handles; the next request re-reads the whole prompt once.`,
+    yes: "Fold now",
+    no: "Keep as it is",
+  };
+}
+
+/** The receipt line after a fold was asked for. */
+export const FOLD_RECEIPT = "Folding now. The view updates when it is done.";
+
+/**
+ * lastRecordedError(blocks): the error sentence of the latest failed request or turn of a session, as the daemon recorded it, or null.
+ * The daemon records a failure in two places: the Parked item a failed turn opens (`The session could not continue. <why> Nothing was
+ * lost: ...`) and the answer of a model-unavailable notice whose request ended (`Answered automatically: the request ended without a
+ * reply at <time>: <why> The session handles that ...`). Never composed: it is the record's own text, cut.
+ */
+export function lastRecordedError(blocks) {
+  const list = Array.isArray(blocks) ? blocks : [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const b = list[i];
+    if (!b || b.kind !== "inbox" || !b.item) continue;
+    const answer = b.resolved && typeof b.resolved.answer === "string" ? b.resolved.answer : "";
+    const failed = /^Answered automatically: the request ended without a reply at [^:]*(?::\d\d)*[^:]*: ([\s\S]*?)(?: The session handles that as any failed request\.)?$/.exec(answer);
+    if (failed && failed[1].trim()) return oneLine(failed[1], 400);
+    const text = typeof b.item.text === "string" ? b.item.text : "";
+    const parked = /^The session could not continue\. ([\s\S]*?) Nothing was lost:/.exec(text);
+    if (b.item.item_kind === "parked" && parked && parked[1].trim() && !/budget is used up/i.test(parked[1])) return oneLine(parked[1], 400);
+  }
+  return null;
+}
+
+/**
+ * inboxGroups(inbox, titleOf): the inbox grouped by mission, missions that block work first (then by the oldest blocking item), the
+ * rest by their oldest item. Items inside a group keep inboxSorted order. `titleOf(mission, entries)` names a group (default: the
+ * title of its first entry). Returns [{key, mission, title, open, blocking, entries}].
+ */
+export function inboxGroups(inbox, titleOf) {
+  const groups = new Map();
+  for (const e of inboxSorted(inbox)) {
+    const key = e.mission || "session:" + e.session;
+    if (!groups.has(key)) groups.set(key, { key, mission: e.mission || "", entries: [], open: 0, blocking: 0, oldest: e.opened_ms || 0, oldestBlocking: Infinity });
+    const g = groups.get(key);
+    g.entries.push(e);
+    g.open++;
+    if (e.item.blocking) { g.blocking++; g.oldestBlocking = Math.min(g.oldestBlocking, e.opened_ms || 0); }
+  }
+  const out = [...groups.values()];
+  for (const g of out) {
+    g.title = (typeof titleOf === "function" && titleOf(g.mission, g.entries)) || g.entries[0].title || g.entries[0].session;
+  }
+  out.sort((a, b) => (b.blocking > 0) - (a.blocking > 0) || (a.blocking ? a.oldestBlocking - b.oldestBlocking : a.oldest - b.oldest));
+  return out.map(({ oldest, oldestBlocking, ...g }) => g);
+}
+
+/** The words that open a refusal answer; the daemon starts a turn that delivers any non-empty answer to the agent. */
+export const REFUSED_PREFIX = "Refused: ";
+
+/** refusalAnswer(reason): {answer} for a refused scope request, or {error} when no reason was written. */
+export function refusalAnswer(reason) {
+  const r = String(reason || "").trim();
+  if (!r) return { error: "Write why the request is refused; the agent reads it." };
+  return { answer: REFUSED_PREFIX + r };
+}
+
+/** Whether a sent answer was a refusal (for the receipt). */
+export function isRefusal(answer) {
+  return typeof answer === "string" && answer.startsWith(REFUSED_PREFIX);
+}
+
+/** answerSendKey(e): true for Ctrl/Cmd+Enter (alone, not composing): the key that sends from an answer field. */
+export function answerSendKey(e) {
+  return !!e && !e.isComposing && e.key === "Enter" && !!(e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey;
+}
+
+/** nextCardId(ids, from): the open card after `from` in `ids` (page order), else the one before it, else null. */
+export function nextCardId(ids, from) {
+  const list = (ids || []).filter((x) => x !== from);
+  const at = (ids || []).indexOf(from);
+  if (!list.length) return null;
+  if (at < 0) return list[0];
+  return (ids || [])[at + 1] !== undefined ? ids[at + 1] : ids[at - 1] !== undefined ? ids[at - 1] : null;
 }

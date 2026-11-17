@@ -81,8 +81,10 @@ running. Token counts and step counters are run details rather than a measure of
 - Opening a session: `GET /api/sessions/{id}/records` page by page (`after`, `next_after`) until
   the end, then keep it current from the event stream (records carry `seq`: apply one only if it
   is the next one; a gap means fetch the missing page). Sessions not open are not fetched.
-- `lagged`, or the stream reconnecting: refetch the session list, the inbox, the status and the open
-  session's records after the last seq held.
+- `lagged`, or the stream reconnecting: refetch the session list, the inbox, the status, the open
+  mission's ledger and the open session's records after the last seq held. The session list is one request
+  in flight plus one queued, and a session an event changed while it was out is kept over the snapshot;
+  the inbox is also read every 60 s.
 - A blocking inbox item is also announced with the browser's `Notification` API when permission was
   granted (a button in the inbox view asks for it; never ask unprompted).
 
@@ -143,14 +145,16 @@ the first token is left out; a reply of fewer than two tokens, or one recorded b
 this timing, contributes none. The same figure is on every model reply's footer. The line is blank off
 a session view.
 
-Chat is the default tab, then Overview, then Evidence. Overview's main column holds the questions
+Chat is the default tab, then Overview, Agents, then Evidence. Overview's main column holds the questions
 waiting on the operator, the recorded plan with a progress bar over the steps still in it, and recent
 activity. Its rail holds the agents (or, for an agent, the mission it is part of), the counts of
 claims and obligations, and the run numbers. Activity lists the latest ten recorded changes, newest
 first, and says so when more were recorded. After a prior visit, the changes recorded after the last
 fully loaded sequence seen when leaving are grouped under “New since your last visit”; the earlier
-ones stay listed below them. Only sequence watermarks and inspector width are saved in tab-scoped
-storage; message and answer text stays in memory.
+ones stay listed below them. Tab-scoped `sessionStorage` holds only the sign-in secret, sequence watermarks (`seen.<id>`), the latest
+record seen per session (`activity.<id>`, which keeps ages across a reload) and the inspector width. The
+switcher, Find, notifications, Agents and the progress line store nothing; message and answer text stays
+in memory.
 
 Evidence lists claims with their recorded status, source quotes and remaining notes, and can be
 filtered by that status. Each evidence item shows two separate facts: whether its quote matches the
@@ -366,9 +370,143 @@ reply, the running work group and its ticking label can be exercised. A model sw
 session is refused with the daemon's sentence (409). `GET /__fixture/state` lists only
 synthetic submission receipts.
 
+Pass 2 adds to the fixture: `GET /api/missions/{id}/score`, a mission of about 12 agents at mixed phases
+and depth 3, a parked item on `necromicon` with a recorded error, a running session whose last record is
+old, a plan and budget for the progress line (with `budget_clock` records), about 5,000 records in one session for Find beyond the
+rendered window, tool results with denied, invalid, timeout and non-zero exit, and `POST /__fixture/end`,
+which ends a mission to exercise notifications (a root goes idle with `last_end`, as the daemon does; an
+agent settles with `session_end`). Check also: Ctrl/Cmd+K and the shortcut sheet, Agents
+groups and refresh, Find across a folded group and a cut output, a notification stub batching one result
+and one ending, Fold now and Switch model from a parked card, inbox triage with Ctrl/Cmd+Enter and Refuse,
+and 320px, 800px and desktop in light and dark with no horizontal scroll. Not checked in a real browser: the
+notification permission prompt, 44px coarse-pointer sizes and screen-reader output.
+
 Check mission and answer draft isolation, focus after an arrival/reconnect, duplicate submission
 prevention, evidence jumps/search/copy, Enter in both fields of the stored output dialog, paging to
 earlier lines, the model switch (confirm, Escape revert, error sentence, header chip update), work-group folding and deep links into a folded group, Back/Forward, inspector tabs/resizing, closed-drawer tab order, modal focus
 restoration, light and dark appearance, and 320px/desktop layouts. The preview binds loopback and never reads
 credentials, starts a model or writes a workspace. Rust/native builds follow the separate-host rule
 in `docs/IMPLEMENTING.md` and `gui/DESIGN.md`.
+
+## Pass 2: supervising many missions
+
+- **Quiet indicator.** A running session whose latest known record is more than 10 minutes old says
+  "no new record for 41m" (hourglass, neutral, never amber) on its sidebar row when nothing waits on the
+  operator, and as a suffix on the run chip, the switcher and the Agents tab while the stream is up. The
+  tooltip says why a long silence can be normal. Nothing is shown while the age is unknown or the stream is
+  down, and only the time the page has been listening counts: a record age restored from an earlier visit
+  can order rows but does not by itself say "no new record" until the page has listened for 10 minutes.
+- **How a call ended.** Each tool status has its own capsule and shape: `exit N` (neutral, the tool ran),
+  `denied` (lock), `invalid` (nothing ran), `timeout` (clock), `interrupted`, and a red cross only for a
+  tool that reported failure with no exit code. A work group header counts each and shows a mark with its
+  own shape. An outline "partial" mark on a row says the model saw only part of the output; its tooltip is
+  the sentence the row's note gives.
+- **Since your last visit.** After a prior visit a divider "New since your last visit · N records" sits
+  before the first newer record. While the chat is scrolled away from the end, "Jump to latest · N new"
+  counts the records recorded since.
+- **Ledger and confirmations.** The ledger is read again after a reconnect or `lagged`, and once the open
+  session becomes known. Fold now and the Models-tab selects ask first, with the re-read cost, inline.
+  An approved scope request is said as "Approved · hosts granted: …", not "Dismissed": the tab's own receipt
+  wins over the record's empty-answer resolution, and after a reload the hosts are matched against the
+  mission's granted hosts (the Evidence ledger); when that is not known the card says "Closed". A held or
+  repeated Enter never confirms: a confirmation opens with focus on its safe button ("Keep as it is",
+  "Keep it"), the affirmative button ignores auto-repeat, and a Models-tab change keeps focus on its select
+  (the question is read out politely and sits right after its row). The "also move the running agents"
+  choice is the one the question was asked with.
+- **Inbox self-heal.** The inbox list is read again every 60 s, so an item resolved elsewhere leaves it
+  without a reload.
+
+### Switcher and keyboard
+
+- **Switcher.** Ctrl/Cmd+K or the Switch button (`#btn-switch`) opens the native dialog `#switcher`: a
+  combobox (`#switcher-q`) over a listbox (`#switcher-list`) of every mission and agent, matched by title,
+  id, workspace, profile or role. Arrow keys move, Enter goes to the session (`#/s/<id>`), Escape closes and
+  focus returns to the opener. `#switcher-status` is a polite live region that says the result count.
+- **Moving about.** Alt+Down and Alt+Up go to the next and previous mission in the sidebar; Alt+Shift+Down
+  and Alt+Shift+Up go to the next and previous mission that needs you, and say where they went in the polite
+  `#keys-live` line; if the focused control went with the view, the selected mission tab takes the focus.
+  Option replaces Alt on a Mac. Each control carries `aria-keyshortcuts`. The switcher takes Cmd+K on a Mac
+  and Ctrl+K elsewhere, so Ctrl+K stays the system's delete-to-end-of-line in a Mac text field.
+- **Shortcut sheet.** `?` or the Keyboard button (`#btn-keys`) opens the dialog `#keys`, drawn from
+  `keySheet()` in `core.js` so it lists only keys the page binds. No single-key shortcut (`/`, `?`) acts
+  while the operator is typing in a field. Escape only closes a surface (dialog, drawer, Find); no key
+  stops a session, since Stop stays a button.
+
+### Agents tab
+
+`#mission-tab-agents` (route `#/s/<id>/agents`, between Overview and Evidence) shows every session of
+the mission in `#mission-agents`, grouped Needs you, Running, Waiting, Idle and Ended (folded). Inside a
+group the order is creation order, never activity, so rows do not jump. A row has its mark, title,
+`role · profile`, step, age ("12m ago", or nothing while unknown), the quiet indicator, tokens generated and
+the outcome of an ended agent ("Where it was spawned" jumps to the spawn record and focuses it); indentation stops at depth 3 and deeper rows carry their ancestors as a
+breadcrumb. The tab badge says how many are running. Per-agent figures come from
+`GET /api/missions/{id}/score`, read when the tab is shown and nothing was read yet (also for a finished
+mission), on Refresh, and at most every 120 s while the tab is shown and something runs; never per event. The page does not compute a score of its own.
+
+### Find in the record
+
+`/` (when not typing) or the Find button opens `#find-bar` in the record tools: `#find-q`, `#find-kind`
+(everything, messages and replies, tool calls and outputs, failures only), Previous, Next, Close and the
+polite count `#find-count`, a hint line `#find-hint` and "Go to match" (`#find-go`). `findInRecord()` is a literal, case-insensitive search of the whole loaded
+store, including folded work groups and blocks outside the rendered window; a hit opens its group and
+scrolls to the record through the same jump path as an Activity link. The count is exact about what was
+searched ("3 of 17 in 12,480 loaded records"), says when the record is only partly loaded, and, where a
+tool output is cut before its end, says (in `#find-hint`, outside the live text) that the rest is searched in
+the output viewer. Typing only updates the count after a 350 ms pause; Enter (or Next) goes to the first
+match, Shift+Enter (or Previous) to the last, then they step and wrap. Reopening Find shows the count with no
+current match. The count line also says what the current match says ("3 of 17: …text around it…"), it is
+rewritten only when its words change, and "Go to match" moves the keyboard to the highlighted block. The
+counts are of records, bookkeeping ones included (the last seq), not of visible blocks. `/` works on layouts
+where it needs Shift, and does nothing while a modal drawer holds the page.
+
+### Notifications
+
+Browser notifications are asked for only by the Inbox button (`#notif-btn`), never on load. A notice is made
+for a blocking item, an available result and a root mission that has ended (done, failed, out of budget,
+stopped, returned or blocked), with the nouns the sidebar uses ("Approval waiting", "Result ready"). It is
+not made while the page is visible and focused, for an item answered a moment ago, or for a stop this tab
+asked for. Notices arriving within 5 s are one notification ("1 result ready · 1 finished"). A click goes to
+`#/s/<id>` for one item and `#/inbox` for several. A notification closes when its item resolves, when the
+session or Inbox is opened, and when the page becomes visible. Nothing leaves the machine.
+
+The daemon never sets phase `ended` on a root lead: a lead that finishes, fails, runs out of budget or is
+stopped goes back to idle and records `last_end` (`finished`, `error`, `budget_exhausted`, `stopped`). The
+page reads a root going from running to idle with one of those as the ending (a `yielded`, `waiting` or
+`asked` end is an ordinary reply, not an ending), and also an ending that only a session-list snapshot shows
+after a disconnect. A mission's ending and its own Finished or Parked item are one notice and open the
+session.
+
+### Quiet indicator, since-divider and progress
+
+- The quiet indicator is described above; its threshold is 10 minutes (`QUIET_MS`).
+- The "New since your last visit · N records" divider is drawn from the stored watermark; "Jump to latest ·
+  N new" appears only while the chat is scrolled away from the end.
+- `#s-progress` above the composer reads "Plan 3 of 9 done · now: <step> · budget 214 of 400 steps · 3h12m of
+  8h" from the ledger plan and the record's budget accounting (`budgetUsed()`): own model steps and active
+  time since the budget was last granted, as the daemon counts them (time from `budget_clock` intervals, so a
+  mission parked overnight does not read as hours used; a renewed budget starts again; never above the
+  limit). Budget is a limit, not completion, and its accessible name says so. The line is hidden when nothing
+  is known.
+
+### Ways out
+
+A parked item (a turn that ended parked for the operator) and a blocker card carry a
+"Ways out" group. **Fold the context…** opens an inline confirmation with the re-read cost (the same wording
+as Fold now on the Context tab, `foldConfirm()`); "Fold now" sends `POST /api/sessions/{id}/reweave` and
+shows a receipt or an alert, "Keep as it is" closes it. **Switch model…** goes to the session and focuses the
+model seat `#model-seat`; a disabled seat shows its reason. When the card's session is the open one, "Last
+recorded error" shows the failure the daemon recorded as plain text: the reason in the latest parked item
+("The session could not continue. <why> Nothing was lost…") or the answer of a model-unavailable notice that
+ended without a reply. Neither action resumes or stops the session.
+
+### Inbox triage
+
+The Inbox is grouped by mission, one heading per mission linking to it with "N open, N need you";
+missions with a blocking item come first, items keep their sorted order inside. Ctrl/Cmd+Enter in an answer
+field sends a non-empty draft (the Send button shows the keycaps, hidden on coarse pointers and under
+700px), and focus then moves to the next open card of the same list (its answer field, else the card
+itself, never a granting button), or to the receipt, or to the list when the answered item has left it.
+The mission heading links to the mission's lead. A scope request has
+"Refuse…": a reason field (Enter sends, Escape closes) and "Send refusal", which sends
+`Refused: <reason>` and grants nothing; an empty reason shows an error and sends nothing. An approved scope
+request reads "Approved · hosts granted: …", a refused one "Refused".
