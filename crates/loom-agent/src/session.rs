@@ -233,7 +233,7 @@
 //!    append `cache_break{req_id, first_diff_message, detail}` and carry on. Render the HUD
 //!    (`hud::render`, over own records, with `jobs.list()` entries that are running — their output
 //!    lines counted on from where the previous request's count stopped —, `orch.children(session)`
-//!    entries that are running, the ledger when there is a journal, `BriefOpts::default()`,
+//!    entries that are running, the ledger when there is a journal, `hud::brief_opts(&role.tools)`,
 //!    `agents.unviewed_min_lines`, own steps and start time counted from where the budget was granted
 //!    (see point 3), budget).
 //!    Store the HUD text (`blobs.put_bytes`; a failure gives `hud: None`). Append
@@ -426,7 +426,7 @@
 //!    The plan becomes `text_plan`, with or without a digest: the ledger brief is the durable state,
 //!    the digest an addition to it.
 //! 3. No plan: return without a record. Otherwise append `reweave{epoch: current + 1, upto_seq,
-//!    evictions, brief: texts::reweave_brief(<ledger.brief(default) or "">, <the rendered frontier, with
+//!    evictions, brief: texts::reweave_brief(<ledger.brief(hud::brief_opts) or "">, <the rendered frontier, with
 //!    `attempts_run` of the records, when the session has a journal>), digest, reason,
 //!    before_tokens: size, after_tokens_est: size − (plan.before_tokens_est − plan.after_tokens_est)
 //!    × size / est}`.
@@ -453,7 +453,7 @@
 //! result and agent report, and drops the nudge, stall and verdict notes (`weave` has the rules). No
 //! plan: nothing is appended. Otherwise `reweave{epoch: current + 1, upto_seq: the last record's seq,
 //! evictions, brief: texts::fresh_start_brief(objections, reopened, <the rendered frontier, as for a
-//! re-weave>, <ledger.brief(default) or "">),
+//! re-weave>, <ledger.brief(hud::brief_opts) or "">),
 //! digest: None, reason: texts::FRESH_START_REASON, before_tokens, after_tokens_est}` with the sizes
 //! computed as in point 3 above, and status is published. The next request ends with the brief: what
 //! the verifier found and how to go on. Nothing leaves the record: the attempt stays in the log and
@@ -544,7 +544,7 @@ use loom_core::event::{
     META_DEFERRED_OBSERVATION, META_EXIT_CODE, META_JOB, META_SIGNAL,
 };
 use loom_core::ids::{new_item_id, new_request_id, CallId, SessionId};
-use loom_core::ledger::{BriefOpts, LedgerOp, LedgerState};
+use loom_core::ledger::{LedgerOp, LedgerState};
 use loom_core::log::{fork_file, Durability, SessionLog};
 use loom_core::message::Message;
 use loom_core::prefix::{stable_hash, PrefixCheck, PrefixGuard};
@@ -3081,7 +3081,7 @@ Name them when you start a new mission instead."
             records: self.own(),
             ledger: ledger.as_ref(),
             ledger_skipped,
-            brief: BriefOpts::default(),
+            brief: hud::brief_opts(&shared.role.tools),
             unviewed_min_lines: self.deps.agents.unviewed_min_lines,
             jobs: &jobs,
             children: &children,
@@ -3625,7 +3625,7 @@ Name them when you start a new mission instead."
             Some(Ok(l)) => {
                 let mut f = frontier::frontier(&l, now_ms());
                 f.attempts_run = frontier::attempts_run(&self.records);
-                (l.brief(&BriefOpts::default()), frontier::render(&f))
+                (l.brief(&hud::brief_opts(&self.deps.shared.role.tools)), frontier::render(&f))
             }
             _ => (String::new(), None),
         }

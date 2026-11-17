@@ -53,6 +53,10 @@
 //! Details:
 //! - `Now`: `input.now_ms` as UTC, minute precision (implement the civil-date arithmetic here; no
 //!   date crate).
+//! - `brief_opts(tools)`: `BriefOpts::default()` when `tools` holds `ledger` (the capped lists' elision
+//!   lines send the model there), else `BriefOpts::uncapped()`: a role that cannot read the ledger
+//!   (the ctf and redteam roles) is shown every item, as before the caps. The session passes the role's
+//!   tools, for the HUD and for the re-weave and fresh-start briefs alike.
 //! - Mission state: only when `input.ledger` is `Some` and the brief is non-empty. Followed, when
 //!   `input.ledger_skipped` is `n > 0`, by its own line `{n} ledger entries written by a newer loom are
 //!   not shown` (`1 ledger entry … is not shown`): the ledger as read lacks entries this build cannot parse.
@@ -145,6 +149,16 @@ pub struct HudInput<'a> {
     pub finish_gated: bool,
     /// The role's pack is solvable: the finish line never offers a conclusion of `unreachable`.
     pub solvable: bool,
+}
+
+/// The brief options for a reader holding `tools`: the capped defaults when it can call `ledger` to read
+/// what an elision line hides, else every item.
+pub fn brief_opts(tools: &[String]) -> BriefOpts {
+    if tools.iter().any(|t| t == "ledger") {
+        BriefOpts::default()
+    } else {
+        BriefOpts::uncapped()
+    }
 }
 
 pub fn render(input: &HudInput<'_>) -> String {
@@ -1070,5 +1084,14 @@ Waiting on the operator (1):\n- q2: Which branch should this target?",
         let text = render(&args);
         assert!(text.contains("missing or removed conclusions are unknown"));
         assert!(!text.contains("SECRET"));
+    }
+
+    #[test]
+    fn brief_opts_are_capped_only_for_a_reader_of_the_ledger() {
+        let with = vec!["bash".to_string(), "ledger".to_string()];
+        let without = vec!["bash".to_string(), "security_record".to_string()];
+        assert_eq!(brief_opts(&with), BriefOpts::default());
+        assert_eq!(brief_opts(&without), BriefOpts::uncapped());
+        assert_eq!(brief_opts(&[]), BriefOpts::uncapped());
     }
 }
