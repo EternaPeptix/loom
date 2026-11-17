@@ -1350,7 +1350,12 @@ impl Tool for Verify {
                             .unwrap_or_else(|| "no stored output".into());
                         let range = i.lines.map(|(a, b)| format!(" lines {a}-{b}")).unwrap_or_default();
                         let quote = cut(i.quote.as_deref().unwrap_or(""), 300);
-                        format!("- {} ({side}) {handle}{range}: {quote} \u{2014} {}", e.id, i.note)
+                        format!(
+                            "- {} ({side}; {}) {handle}{range}: {quote} \u{2014} {}",
+                            e.id,
+                            i.source_label(),
+                            i.note
+                        )
                     })
                     .collect();
                 let context = if lines.is_empty() {
@@ -1904,7 +1909,7 @@ mod tests {
         assert_eq!(sp[0].brief.question, "Try to refute this claim: The cache is never stale");
         assert_eq!(sp[0].brief.returns.as_deref(), Some("A verdict, delivered by calling verdict."));
         let ctx = sp[0].brief.context.clone().unwrap();
-        assert!(ctx.starts_with("Evidence recorded for it:\n- e1 (supports) out:"), "{ctx}");
+        assert!(ctx.starts_with("Evidence recorded for it:\n- e1 (supports; run) out:"), "{ctx}");
         assert!(ctx.contains(" lines 2-3: line two\nline three \u{2014} shows both"), "{ctx}");
         assert!(ctx.ends_with("\n\nOutputs to examine: out:aaa, out:bbb"), "{ctx}");
     }

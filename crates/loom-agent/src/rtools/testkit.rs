@@ -310,6 +310,14 @@ impl Rig {
         self.orch.produced(&blob, "s-test", "call-0", tool, class);
         blob.handle()
     }
+
+    /// As [`Rig::output`], with the grade the producing result carried (a tool whose class says `Exec` but
+    /// whose output is analysis).
+    pub fn output_graded(&self, text: &str, tool: &str, class: ToolClass, grade: EvidenceGrade) -> String {
+        let blob = self.env.ctx.blobs.put_bytes(text.as_bytes()).expect("store output");
+        self.orch.produced_graded(&blob, "s-test", "call-0", tool, class, grade);
+        blob.handle()
+    }
 }
 
 /// The registry of a role that has the three box tools (and the job tools that follow their jobs).

@@ -1084,6 +1084,17 @@ pub fn flag_candidate(handle: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn evidence_not_a_run_names_the_tool_for_analysis_and_reference_only() {
+        let a = evidence_not_a_run(EvidenceGrade::Analysis, "dep_scan").expect("analysis is not a run");
+        assert!(a.contains("`dep_scan`") && a.contains("analysis, not a run"), "{a}");
+        assert!(a.contains("cannot conclude the goal, settle a verifier's objection"), "{a}");
+        let r = evidence_not_a_run(EvidenceGrade::Reference, "cve_lookup").expect("reference is not a run");
+        assert!(r.contains("`cve_lookup`") && r.contains("reference data, not a run"), "{r}");
+        assert!(evidence_not_a_run(EvidenceGrade::Run, "bash").is_none());
+        assert!(evidence_not_a_run(EvidenceGrade::Read, "read").is_none());
+    }
+
     fn tools_all() -> FinishTools {
         FinishTools { conclude: true, block: true, ask_for: true, spawn: true, plan: true, solvable: false }
     }
