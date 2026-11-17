@@ -2065,6 +2065,7 @@ mod tests {
             call_id: None,
             class: None,
             preview: "first\nline".into(),
+            note: None,
         }
     }
 
@@ -2079,6 +2080,7 @@ mod tests {
             context_window: None,
             prompt_tokens: 120_000,
             cached_tokens: 90_000,
+            ..Default::default()
         };
         let empty = window_table(&view, &Style { color: false, width: 200 });
         assert_eq!(

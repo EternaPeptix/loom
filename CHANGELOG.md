@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Daemon: what a request is made of (`GET /api/sessions/{id}/window`)
+
+- Additive fields on `WindowView` (old keys unchanged; a reader of an older answer gets defaults): `breakdown`
+  (`basis`, `chars_per_token`, `total_tokens` and 14 `segments`: system, tools, rules, assignment, resume,
+  conversation, tool_output, pinned, agent_reports, notes, stubs, other, framing, hud, each with `chars`, `tokens`
+  and, for the parts that hold several things, `count`; the tokens always add up to `total_tokens`), `measured_now`
+  (the server's count for the latest answered step request of the epoch plus an estimate of what was added since;
+  `null` before the first), `last_request` (the latest step request with the server's count for its reply, 0 while
+  missing) and `fold_at` / `fold_to` (`reweave_bounds` of the configured target and floor for the session's window
+  and profile). `items[].note` names the kind of a `harness_note` item; `Weave::resume_chars` counts the resume block.
+- `est_tokens` now counts the tool list in bytes, as `session` does (it counted characters). No stored shape changed.
+
 ### Web UI: copy buttons and opt-in copy on select
 
 - Copy buttons: Copy reply (the exact raw text), Copy code (a fenced block without its fence), Copy message
