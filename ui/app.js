@@ -11,7 +11,8 @@ const PHONE = matchMedia("(max-width: 699px)");
 const COMPACT = matchMedia("(max-width: 699px), (max-height: 700px)"); // the whole session scrolls as one
 const COARSE = matchMedia("(pointer: coarse)");
 /** The one element that scrolls the chat: the session view where it scrolls as a whole, else the record's own scroller. */
-const chatScroller = () => (COMPACT.matches ? $("view-session") : $("scroller"));
+// Phones scroll the whole session as one, but only the Chat tab follows the stream: other tabs write to the hidden chat scroller.
+const chatScroller = () => (COMPACT.matches && S.section === "chat" ? $("view-session") : $("scroller"));
 
 // ---------------------------------------------------------------------------------------------
 // State
@@ -66,7 +67,7 @@ const S = {
   follow: true,
   scrollAt: {}, // the session view's scroll position per section, kept in memory while it scrolls as a whole
   jumpNeed: null,
-  sheet: { open: false, ask: null, opener: null, sig: "", say: "", restore: true }, // the session details sheet
+  sheet: { open: false, notesOpen: false, ask: null, opener: null, sig: "", say: "", restore: true }, // the session details sheet
   tab: "ledger",
   score: { mission: null, view: null, error: null, lastMs: null, loading: false }, // GET /api/missions/{id}/score of the open mission (Agents tab)
   agentsEnded: false, // the Ended group of the Agents tab is open (this page only)
@@ -735,7 +736,7 @@ function handleEvent(ev) {
         break;
       case "refetch_window":
         S.win.stale = true;
-        if (S.tab === "context") loadWindow();
+        if (S.tab === "context" || S.sheet.open) loadWindow();
         break;
       case "refetch_ledger":
         S.ledger.stale = true;
@@ -1426,6 +1427,7 @@ function renderHeader() {
   $("msg").enterKeyHint = COARSE.matches ? "enter" : "send";
   $("composer").classList.toggle("off-chat", S.section !== "chat");
   $("composer-go").hidden = !a.send;
+  $("composer-go").textContent = lead ? "Message the lead…" : "Message this session…";
   $("s-caption").hidden = false;
   let action = S.actionState.get(info.id);
   if (action?.accepted && ((action.name === "stop" && !a.stop) || (action.name === "resume" && a.running) || (action.name === "archive" && info.archived === action.archived))) {
@@ -1620,6 +1622,7 @@ function sheetSection(key, title, ...kids) {
   const h = el("h3", "", title);
   h.id = "sheet-h-" + key;
   h.tabIndex = -1;
+  h.dataset.focusKey = "sheet:h:" + key;
   sec.setAttribute("aria-labelledby", h.id);
   return add(sec, h, ...kids);
 }
@@ -1694,8 +1697,8 @@ function buildSheet(info) {
     }
     runCard.append(srow("", null, { full: holder, cls: "run-actions" }));
     if (S.sheet.ask && S.sheet.ask.kind === "stop") {
-      const q = { text: `Stop ${info.title || info.id}? It, its agents and their tracked jobs stop. It can be resumed.`, yes: "Stop it", no: "Keep running" };
-      runCard.append(confirmRow(q, () => { S.sheet.ask = null; want("sheet"); sessionAction("stop"); }, () => { S.sheet.ask = null; want("sheet"); requestAnimationFrame(() => focusKey("sheet:stop")); }, "sheet:"));
+      const q = { text: C.stopQuestion(info), yes: "Stop it", no: "Keep running" };
+      runCard.append(confirmRow(q, () => { S.sheet.ask = null; want("sheet"); sessionAction("stop"); requestAnimationFrame(() => focusKey("sheet:h:run")); }, () => { S.sheet.ask = null; want("sheet"); requestAnimationFrame(() => focusKey("sheet:stop")); }, "sheet:"));
     }
   }
   out.push(sheetSection("run", "Run", runCard));
@@ -1710,11 +1713,12 @@ function buildSheet(info) {
   const current = C.currentModel(S.rec, info) || { profile: info.profile, model: info.model, context_window: info.context_window };
   const health = ((S.status && S.status.models) || []).find((m) => m.profile === current.profile) || null;
   const reach = health ? add(el("span", "runwords"), icon(health.reachable ? "check" : "alert"), document.createTextNode(health.reachable ? "reachable" : "unreachable")) : null;
-  const win = current.context_window || (health && health.context_window) || 0;
+  const win = current.context_window || (S.win.data && S.win.data.context_window) || 0;
+  const profileWin = !win && health && health.context_window ? health.context_window : 0;
   const modelCard = sheetCard(srow("Profile", current.profile || "unknown"));
   if (reach) modelCard.append(srow("Reachability", reach));
   if (current.model && current.model !== current.profile) modelCard.append(srow("Model id", current.model, { mono: true }));
-  modelCard.append(srow("Context limit", win ? `${C.num(win)} tokens` : "unknown"));
+  modelCard.append(srow("Context limit", win ? `${C.num(win)} tokens` : profileWin ? `unknown for this session (the profile reports ${C.num(profileWin)} tokens)` : "unknown"));
   const host = endpointHost(current.profile);
   if (host) modelCard.append(srow("Endpoint", host, { mono: true }));
   const seat = $("model-seat");
@@ -1735,7 +1739,7 @@ function buildSheet(info) {
   const copied = el("p", "scope", S.sheet.say || "");
   copied.setAttribute("role", "status");
   const copy = copyButton("Copy session id", () => info.id, { what: "Session id", text: true, key: "sheet:copy-id", say: (t) => { S.sheet.say = t; want("sheet"); } });
-  const inspector = btn("Open inspector", "", () => { closeSheet(false); setDrawer("right", true); });
+  const inspector = btn("Open inspector", "", () => { closeSheet(false); nextOpener = $("bar-details"); setDrawer("right", true); });
   inspector.dataset.focusKey = "sheet:inspector";
   inspector.title = "Ledger, Network, Models, Session and Files";
   const rows = [];
@@ -1764,7 +1768,7 @@ function renderSheet() {
   const frag = document.createDocumentFragment();
   frag.append(...buildSheet(info));
   // Rebuild only what changed, so a tap is never lost to a redraw and a question being read keeps its place.
-  const sig = [...frag.querySelectorAll("*")].map((n) => n.tagName + n.className + (n.firstChild && n.firstChild.nodeType === 3 ? n.firstChild.data : "") + (n.getAttribute("style") || "") + (n.disabled ? "d" : "") + (n.checked ? "c" : "") + (n.getAttribute("aria-label") || "")).join("|");
+  const sig = [...frag.querySelectorAll("*")].map((n) => n.tagName + (n.getAttribute("class") || "") + (n.getAttribute("data-icon") || "") + [...n.childNodes].filter((c) => c.nodeType === 3).map((c) => c.data).join("") + (n.getAttribute("style") || "") + (n.disabled ? "d" : "") + (n.checked ? "c" : "") + (n.getAttribute("aria-label") || "")).join("|");
   if (S.sheet.sig !== sig) {
     S.sheet.sig = sig;
     preserveFocus(body, () => body.replaceChildren(frag));
@@ -2007,7 +2011,7 @@ function jumpToRecord(seq, { focus = false, done = null } = {}) {
       const node = $("blocks").querySelector(`[data-bid="${block.id}"]`);
       S.jumping = false;
       if (node) {
-        node.scrollIntoView({ block: "center" });
+        node.scrollIntoView({ block: jumpBlock(node) });
         node.classList.add("record-highlight");
         setTimeout(() => node.classList.remove("record-highlight"), 2500);
         node.tabIndex = -1;
@@ -2019,6 +2023,14 @@ function jumpToRecord(seq, { focus = false, done = null } = {}) {
       updateJump();
     });
   });
+}
+
+/** Where a jump lands: the middle, unless the node is taller than the band between the sticky tabs and composer (then its top). */
+function jumpBlock(node) {
+  if (!COMPACT.matches) return "center";
+  const top = $("mission-tabs").getBoundingClientRect().bottom;
+  const bottom = $("composer").getBoundingClientRect().top;
+  return node.classList.contains("block-inbox") || node.getBoundingClientRect().height > bottom - top ? "start" : "center";
 }
 
 function renderEvidence(panel) {
@@ -3783,6 +3795,7 @@ function contextCard(w, where, ask) {
     wrap.append(bar);
     if (m.fold) {
       for (const [cls, pct] of [["at", m.fold.atPct], ["to", m.fold.toPct]]) {
+      if (pct == null) continue;
         const tick = el("span", "ctx-tick " + cls);
         tick.setAttribute("aria-hidden", "true");
         tick.style.setProperty("left", pct + "%");
@@ -3828,7 +3841,13 @@ function contextCard(w, where, ask) {
       const d = el("details", "ctx-notes");
       const dl = el("dl");
       for (const n of m.notes) add(dl, el("dt", "", n.label), el("dd", "", n.note));
-      add(d, el("summary", "", "What these mean"), dl);
+      const sum = el("summary", "", "What these mean");
+      if (where === "sheet") {
+        sum.dataset.focusKey = "sheet:notes";
+        d.open = !!S.sheet.notesOpen;
+        d.addEventListener("toggle", () => { S.sheet.notesOpen = d.open; });
+      }
+      add(d, sum, dl);
       box.append(d);
     }
   }
@@ -3846,7 +3865,7 @@ function contextCard(w, where, ask) {
   if (ask && ask.kind === "fold") {
     // Folding is silent until a later record lands, so say it was asked for and pull the view.
     actions.append(confirmRow(modelAsk(ask), async () => {
-      if (where === "sheet") { S.sheet.ask = null; want("sheet"); } else askClose("ask:fold");
+      if (where === "sheet") { S.sheet.ask = null; want("sheet"); requestAnimationFrame(() => focusKey("sheet:ask:fold")); } else askClose("ask:fold");
       if (await act(api("POST", "/api/sessions/" + encodeURIComponent(S.openId) + "/reweave")) !== undefined) {
         notice(C.FOLD_RECEIPT);
         loadWindow();
@@ -5389,6 +5408,7 @@ function wire() {
   // The composer's height, for what has to sit above it when it overlays the page (the jump button on a phone).
   if (typeof ResizeObserver === "function") {
     new ResizeObserver(() => document.body.style.setProperty("--composer-h", Math.round($("composer").getBoundingClientRect().height) + "px")).observe($("composer"));
+    new ResizeObserver(() => document.body.style.setProperty("--find-h", Math.round($("find-bar").getBoundingClientRect().height) + "px")).observe($("find-bar"));
     new ResizeObserver(() => document.body.style.setProperty("--tabs-h", Math.round($("mission-tabs").getBoundingClientRect().height) + "px")).observe($("mission-tabs"));
   }
   $("composer-go").addEventListener("click", () => { setSection("chat"); requestAnimationFrame(() => $("msg").focus()); });

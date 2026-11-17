@@ -1163,7 +1163,7 @@ details.reasoning > .copy-row { margin: 4px 0 2px; }
   .record-tools { display: none; }
 
   /* ---- Find on two rows ---- */
-  .find-bar { display: grid; grid-template-columns: minmax(0, 1fr) 44px 44px 44px; gap: 4px 6px; position: sticky; top: var(--tabs-h, 45px); z-index: 3; padding: 4px 16px; align-items: center; }
+  .find-bar { display: grid; grid-template-columns: minmax(0, 1fr) 44px 44px 44px; gap: 4px 6px; padding: 4px 16px; align-items: center; }
   .find-q { grid-column: 1; width: 100%; min-width: 0; }
   .find-step { min-width: 44px; min-height: 44px; justify-content: center; padding: 0; }
   .find-step .icon { width: 16px; height: 16px; }
@@ -1208,7 +1208,8 @@ details.reasoning > .copy-row { margin: 4px 0 2px; }
   .view.session .scroller, .view.session .mission-panel { overflow: visible; flex: 1 0 auto; min-height: auto; }
   .view.session .out { max-height: none; overflow-y: visible; overflow-x: auto; }
   #mission-tabs { position: sticky; top: 0; z-index: 3; background: var(--bg); }
-  .block, .work-group, .block-inbox { scroll-margin-top: calc(var(--tabs-h, 45px) + 8px); scroll-margin-bottom: calc(var(--composer-h, 0px) + 8px); }
+  .find-bar { position: sticky; top: var(--tabs-h, 45px); z-index: 3; }
+  .block, .work-group, .block-inbox { scroll-margin-top: calc(var(--tabs-h, 45px) + var(--find-h, 0px) + 8px); scroll-margin-bottom: calc(var(--composer-h, 0px) + 8px); }
 }
 
 @media (pointer: coarse) {

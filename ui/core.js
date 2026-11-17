@@ -504,6 +504,14 @@ export function missionStanding(info, attention, agentsRunning = 0) {
   return { mark, pills };
 }
 
+/** The question the Stop confirmation asks. Only a root can be resumed; an agent just ends. */
+export function stopQuestion(info) {
+  const name = info.title || info.id;
+  return info.parent
+    ? `Stop ${name}? It and its tracked jobs stop. An agent cannot be resumed; its lead can start a new one.`
+    : `Stop ${name}? It, its agents and their tracked jobs stop. It can be resumed.`;
+}
+
 /** Which buttons the transcript header offers. */
 export function sessionActions(info) {
   const st = info.status || {};
@@ -4087,9 +4095,9 @@ export function contextCardModel(w) {
     ? `Context use ${hero.percent} of ${num(win)} tokens: ${spoken.join(", ")}`
     : `Context use about ${tokens(total)} tokens, limit unknown: ${spoken.join(", ")}`;
   const inside = (v) => v > 0 && v <= scale;
-  const foldInfo = foldAt > 0 && foldTo > 0 && inside(foldAt) ? {
-    at: foldAt, to: foldTo, atPct: ctxPercent(foldAt, scale), toPct: ctxPercent(foldTo, scale),
-    text: `▼ folds at ${tokens(foldAt)} · ▽ down to ${tokens(foldTo)}`,
+  const foldInfo = foldAt > 0 && inside(foldAt) ? {
+    at: foldAt, to: foldTo, atPct: ctxPercent(foldAt, scale), toPct: foldTo > 0 && inside(foldTo) ? ctxPercent(foldTo, scale) : null,
+    text: foldTo > 0 ? `▼ folds at ${tokens(foldAt)} · ▽ down to ${tokens(foldTo)}` : `▼ folds at ${tokens(foldAt)}`,
     past: total > foldAt ? { text: "Past the fold mark: older output folds at the next step." } : null,
   } : null;
   let cache = null;

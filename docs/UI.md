@@ -334,7 +334,9 @@ on Close, Escape or a tap on the backdrop; there is no swipe, so no gesture is t
    copy button, with its status in the sheet since the page behind is inert) and Open inspector.
 
 While open it redraws on session frames, new records and window loads, and only when what it shows changed, so a tap is not
-lost and an open question keeps its focus.
+lost and an open question keeps its focus. "What these mean" keeps its open state, section headings take the focus back
+after a redraw, and Stop's confirmation says only a root can be resumed (an agent ends; its lead can start a new one). The
+MODEL row shows the session's own context limit; if only the profile reports one, it says so.
 
 ## Drafts, submissions and updates
 
@@ -438,7 +440,7 @@ light/dark appearance and reduced-motion support. Avoid dependence on color or h
   Messages and replies, group under captions and say "about 4.9k". The parts add up to the figure (the daemon's `framing`
   takes the remainder). Fold marks use the effective bounds `fold_at` and `fold_to` (not the raw target and floor), drawn as
   two shapes (a solid tick with a filled triangle: folds at; a dashed tick with an outline triangle: down to) and said in a
-  line ("▼ folds at 210k · ▽ down to 131k"), with "Past the fold mark: older output folds at the next step." in neutral
+  line ("▼ folds at 210k · ▽ down to 131k"; only the first mark and half of the line when the floor is 0), with "Past the fold mark: older output folds at the next step." in neutral
   words; no amber. Under the bar a two-part bar says how much of the last request came from the cache and how much was read
   anew (server numbers, no "~"), or that none was reported. "What these mean" holds one-line notes (rules are yours,
   verbatim; the re-weave brief may hold unverified leads; stubs keep the output in the record; harness state is sent fresh

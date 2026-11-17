@@ -3367,3 +3367,19 @@ test("contextCardModel: row notes carry the facts the parts' words depend on", (
   assert.match(notes["Harness state (as last sent)"], /never cached or folded/);
   assert.match(notes["Folded-out stubs"], /full output stays in the record/);
 });
+
+test("stopQuestion: only a root says it can be resumed", () => {
+  const root = C.stopQuestion({ id: "s-1", title: "Net" });
+  assert.match(root, /It can be resumed\./);
+  const agent = C.stopQuestion({ id: "s-2", title: "Worker", parent: "s-1" });
+  assert.doesNotMatch(agent, /can be resumed/);
+  assert.match(agent, /cannot be resumed/);
+});
+
+test("contextCardModel: a fold mark inside the scale is drawn even when it folds down to nothing", () => {
+  const m = C.contextCardModel(cardWindow({ context_window: 16000, fold_at: 1, fold_to: 0 }));
+  assert.ok(m.fold);
+  assert.equal(m.fold.toPct, null);
+  assert.match(m.fold.text, /folds at/);
+  assert.doesNotMatch(m.fold.text, /down to/);
+});
