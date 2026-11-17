@@ -33,8 +33,10 @@
   well: each fetched a URL for a command driven from `osascript -l JavaScript`.
 - Below `.git/modules/<name>/` nothing can be made or removed except inside the submodule repositories found
   when the sandbox was built (a slash-named submodule set up mid-session could be replaced by a copy carrying
-  `core.fsmonitor`). The `core.hooksPath` directory and included files named by each repository's and the
-  user's global Git configuration are protected (husky's `.husky/` hooks could be planted). Bare repositories
+  `core.fsmonitor`). The `core.hooksPath` directory and included files named by each repository's, the
+  enclosing repository's and the user's global Git configuration are protected (husky's `.husky/` hooks could be
+  planted), resolved against every working tree they serve: submodules (`core.worktree`), linked worktrees,
+  `~user/` values. A `HEAD` and `objects` planted in a directory no longer stop the next session's discovery. Bare repositories
   in the workspace are found; pointer targets count only when they are repositories. `agent_adopt` asks the
   sandbox about every path before it looks at the workspace (no more existence oracle through a link) and
   again once each file is in place.
