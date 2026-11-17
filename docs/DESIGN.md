@@ -835,7 +835,10 @@ the precise specification.
   answers to questions, labelled as operator text from an earlier mission; its goal status; where its
   work stood (the frontier evaluated at that last entry's time, not now, with no attempt count and no
   hypothesis or asset), labelled as written by the model there and not verified; and its security record as
-  counts and asset locators only (no hypothesis id or text, no credential, no URL query). Every line
+  counts and asset locators only (no hypothesis id or text, no credential, no identity named, no URL query,
+  fragment or password in a locator). The operator's words are shown as written; what the model wrote is
+  shown with the query, fragment and userinfo removed from every URL in it, but may still hold whatever
+  was written there. Every line
   taken from an old ledger is quoted with `>`. A journal that fails verification or holds an entry
   written by a newer loom is named unreadable and nothing from it is shown. The note says that the old
   mission's outputs cannot be opened and its authorizations do not apply, and a re-weave may drop it

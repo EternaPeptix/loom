@@ -651,6 +651,9 @@ where
     let mut out = Vec::new();
     for word in words {
         let word = word.trim();
+        if word.is_empty() {
+            continue;
+        }
         out.push(if word.starts_with("m-") { MissionId::from(word) } else { resolve(word.to_string()).await? });
     }
     Ok(out)
@@ -1980,7 +1983,7 @@ mod tests {
                 }
             }
         };
-        let got = prior_missions(&words(&["m-9", "last", "s-1", " m-3 "]), resolve).await.unwrap();
+        let got = prior_missions(&words(&["m-9", "", "last", "  ", "s-1", " m-3 "]), resolve).await.unwrap();
         let want: Vec<MissionId> = ["m-9", "m-of-last", "m-of-s1", "m-3"].into_iter().map(MissionId::from).collect();
         assert_eq!(got, want);
         // Only the words that are not mission ids were looked up.

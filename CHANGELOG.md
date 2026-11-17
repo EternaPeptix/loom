@@ -21,7 +21,9 @@
   `meta.json` (left out when empty, so older files are unchanged). Before the lead's first model request it gets
   one `info` note per the new `loom_agent::prior`: each mission's goal, rules and answers (the operator's words),
   goal status, where its work stood when its ledger was last written (written by the model there, not
-  verified), and its security record as counts and asset locators. The source is each mission's sealed
+  verified), and its security record as counts and asset locators (identities are counted, never named; URLs in model
+  text and in locators lose query, fragment and userinfo; the operator's words are verbatim; a request that names
+  no earlier mission is sent without the `prior` key, so an older daemon still accepts it). The source is each mission's sealed
   journal; one that fails verification or was written by a newer loom is named unreadable. No log-schema change.
 
 ### The sandbox hides the whole loom home

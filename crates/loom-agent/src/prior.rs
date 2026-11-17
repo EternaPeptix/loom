@@ -7,9 +7,11 @@
 //! missions it may recall (`NewSession.prior`, kept in `SessionMeta.prior`; see `runtime`, *Creating a
 //! root session*). The source is each of those missions' journal, verified and folded — never their logs,
 //! stored outputs or anything derived from them. What the operator wrote is labelled as the operator's text
-//! from an earlier mission; what the model wrote is labelled as written by the model there and not
-//! verified; what can hold secrets (hypothesis text and ids, credentials, footholds, notes of security
-//! records, URL query strings) is not shown at all.
+//! from an earlier mission and is shown as written, verbatim; what the model wrote is labelled as written by
+//! the model there and not verified, and is shown with the query, fragment, user name and password removed
+//! from every URL in it (it may still hold whatever else was written there); what can hold secrets
+//! (hypothesis text and ids, credentials, footholds, notes of security records, the names of identities)
+//! is not shown at all, and asset locators are shown without URL queries, fragments and credentials.
 //!
 //! ## Items
 //! - `pub const MAX_PRIOR: usize = 8` — the most earlier missions one mission may name.
@@ -59,7 +61,7 @@
 //! > Goal note: {goal_met note}
 //! > {frontier lines}
 //! Its security record (recorded by the model there; counts and asset locators only, so hypotheses, credentials and notes are not carried over):
-//! > - Assets: {total}: {tested} tested, {deferred} deferred, {untested} untested
+//! > - Assets: {total}: {tested} tested, {deferred} deferred, {untested} untested{identities}
 //! > - Untested: {locators}
 //! > - Tested or deferred: {locators}
 //! > - Hypotheses: {s} supported, {r} refuted, {o} open
@@ -80,7 +82,12 @@
 //!   release. The line is left out when the ledger has no goal.
 //! - Model section: `Goal note:` with the goal-met note (one line, cut to `hud::MAX_LINE`) when it is not
 //!   blank; then the lines of `frontier::render` of the frontier below, when it renders. Left out (label too)
-//!   when both are empty.
+//!   when both are empty. Every line of the section is model text: every kind of line break in it (`\n`,
+//!   `\r`, `\v`, `\f`, U+0085, U+2028, U+2029) is written as a space, so one rendered line stays one quoted
+//!   line, and every URL in it is scrubbed: a whitespace-separated token containing `://` that, after its
+//!   leading `([{<'"` and trailing `.,;:)]}>'"` are set aside, parses as an absolute URL with a host is written without its query,
+//!   fragment, user name and password, and the set-aside characters are put back. A token that does not parse
+//!   stays as it is. The operator's text (goal, rules, answers) is not changed.
 //! - The frontier: `frontier::frontier(&state, end_ms)` with `attempts_run` 0, then every hypothesis taken
 //!   out of it — items of `established`, `ruled_out` and `open_leads` whose id starts with `hy-`, every item of
 //!   `untested`, and `surfaces_total`/`surfaces_closed` set to 0 — so it shows claims, plan steps, dead ends,
@@ -90,26 +97,30 @@
 //! - Security section, from `state.security` and the same `frontier(&state, end_ms)` (before the hypotheses
 //!   were taken out), left out (label too) when the mission recorded no asset, no hypothesis and no
 //!   route to revisit at `end_ms`:
-//!   - Assets: all assets; tested = coverage `Tested`, deferred = `Deferred`, untested = `Untested`. Left out
-//!     when there is none. Untested: the locators of the frontier's `untested` items, in its order (mandatory
-//!     first, then id). Tested or deferred: the locators of the other assets, in id order.
+//!   - Assets: all assets; tested = coverage `Tested`, deferred = `Deferred`, untested = `Untested`; when `k`
+//!     assets are of kind `identity` the line ends `; {k} identities not named`. Left out when there is none.
+//!     Untested: the locators of the frontier's `untested` items, in its order (mandatory first, then id).
+//!     Tested or deferred: the locators of the other assets, in id order. An identity (it can be a
+//!     credential's principal) is never named in either list.
 //!   - Hypotheses: counts by status, left out when there is none. Never an id, a text or a note.
 //!   - Routes to revisit when it ended: `{n}` = `security.newly_unlocked_at(end_ms).len()`, then ` (they are
 //!     among its open leads above)`; no id and no locator. Left out when there is none.
 //!   - A locator list shows at most 12, then ` (+{k} more)`, joined by `, `. Each locator is `{kind}
 //!     {locator}` (kind in lower case: `host`, `service`, `endpoint`, `file`, `identity`). An `endpoint` or
 //!     `service` locator is parsed as a URL and shown without its query, fragment and any user name or
-//!     password; one that does not parse is cut before its first `?` or `#`. Any other locator is cut before
-//!     its first `?`. Then one line, cut to 120 characters.
+//!     password; one that does not parse is cut before its first `?` or `#`. Any other locator that parses as
+//!     an absolute URL with a host is shown the same way; one that does not is cut before its first `?`. Then one line, cut to 120 characters.
 //! - `{YYYY-MM-DD HH:MM}`: `end_ms` in UTC (proleptic Gregorian).
 //!
 //! Tests required: `read` of a journal with entries (state and the last entry's time), of no file (Nothing),
 //! of an edited entry, of a journal under the wrong key and of one whose head does not match (Unreadable),
 //! of one with an entry written by a newer loom (Unreadable), of one with a torn tail (Ledger); `brief`:
 //! exact text of a full section; the frontier is evaluated at `end_ms` and not now (a credential that
-//! expires after `end_ms` and before now unlocks a blocked route: the route is counted and its locator
-//! listed); `attempts_run` never shows; no hypothesis id, hypothesis text, credential principal, secret
-//! handle or URL query appears even when the ledger holds them; operator text and model text are quoted
+//! expires after `end_ms` and before now unlocks a blocked route, which is counted and is among the open
+//! leads; one that expired before `end_ms` leaves its route out of both); `attempts_run` never shows; no hypothesis id, hypothesis text, credential principal, secret
+//! handle, identity name or locator URL query appears even when the ledger holds them; a URL in model text
+//! (claim text, goal note) loses its query and userinfo while the operator's text keeps its own; a line
+//! break of any kind in model text cannot start a quoted line of its own; operator text and model text are quoted
 //! line by line and a multi-line goal cannot produce an unquoted line; an unreadable mission shows its id
 //! and nothing else of it; caps (rules, answers, locators) with their remainder lines; sections left out
 //! when empty; the date.
@@ -326,10 +337,10 @@ fn work_frontier(state: &LedgerState, end_ms: u64) -> Frontier {
 fn model_part(state: &LedgerState, end_ms: u64) -> Vec<String> {
     let mut body: Vec<String> = Vec::new();
     if let Some(g) = state.goal_met.as_ref().filter(|g| !g.note.trim().is_empty()) {
-        body.push(format!("Goal note: {}", line(&g.note, MAX_LINE)));
+        body.push(format!("Goal note: {}", line(&scrub_urls(&flat(&g.note)), MAX_LINE)));
     }
     if let Some(text) = frontier::render(&work_frontier(state, end_ms)) {
-        body.push(text);
+        body.extend(text.split('\n').map(|l| scrub_urls(&flat(l))));
     }
     if body.is_empty() {
         return Vec::new();
@@ -354,7 +365,10 @@ fn locator(a: &Asset) -> String {
     };
     let shown = match a.kind {
         AssetKind::Endpoint | AssetKind::Service => url_without_secrets(&a.locator),
-        _ => before(&a.locator, &['?']),
+        _ => match absolute_url(a.locator.trim()) {
+            Some(u) => strip_secrets(u),
+            None => before(&a.locator, &['?']),
+        },
     };
     format!("{kind} {}", flat(&shown))
 }
@@ -364,19 +378,58 @@ fn before(s: &str, marks: &[char]) -> String {
     s.split(marks).next().unwrap_or("").to_string()
 }
 
+/// `s` as a URL that names a host.
+fn absolute_url(s: &str) -> Option<url::Url> {
+    url::Url::parse(s).ok().filter(|u| u.host_str().is_some())
+}
+
+/// `u` without its query, fragment, user name and password.
+fn strip_secrets(mut u: url::Url) -> String {
+    u.set_query(None);
+    u.set_fragment(None);
+    // A URL that cannot carry credentials has none to remove.
+    let _ = u.set_username("");
+    let _ = u.set_password(None);
+    u.to_string()
+}
+
 /// A URL without its query, fragment, user name and password; text that is not a URL is cut before its
 /// first `?` or `#`.
 fn url_without_secrets(s: &str) -> String {
     match url::Url::parse(s.trim()) {
-        Ok(mut u) => {
-            u.set_query(None);
-            u.set_fragment(None);
-            // A URL that cannot carry credentials has none to remove.
-            let _ = u.set_username("");
-            let _ = u.set_password(None);
-            u.to_string()
-        }
+        Ok(u) => strip_secrets(u),
         Err(_) => before(s.trim(), &['?', '#']),
+    }
+}
+
+/// `text` with every URL token (see the contract) written without its query, fragment and credentials.
+fn scrub_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    for c in text.chars() {
+        if c.is_whitespace() {
+            out.push_str(&scrub_token(&token));
+            token.clear();
+            out.push(c);
+        } else {
+            token.push(c);
+        }
+    }
+    out.push_str(&scrub_token(&token));
+    out
+}
+
+fn scrub_token(token: &str) -> String {
+    if !token.contains("://") {
+        return token.to_string();
+    }
+    let rest = token.trim_start_matches(['(', '[', '{', '<', '\'', '"']);
+    let head = token.get(..token.len().saturating_sub(rest.len())).unwrap_or("");
+    let core = rest.trim_end_matches(['.', ',', ';', ':', ')', ']', '}', '>', '\'', '"']);
+    let tail = rest.get(core.len()..).unwrap_or("");
+    match absolute_url(core) {
+        Some(u) => format!("{head}{}{tail}", strip_secrets(u)),
+        None => token.to_string(),
     }
 }
 
@@ -402,19 +455,31 @@ fn security_part(state: &LedgerState, end_ms: u64) -> Vec<String> {
     let mut body: Vec<String> = Vec::new();
     if !sec.assets.is_empty() {
         let count = |want: fn(&CoverageDisposition) -> bool| sec.assets.values().filter(|a| want(&a.coverage)).count();
-        body.push(format!(
+        let identities = sec.assets.values().filter(|a| a.kind == AssetKind::Identity).count();
+        let mut assets = format!(
             "- Assets: {}: {} tested, {} deferred, {} untested",
             sec.assets.len(),
             count(|c| matches!(c, CoverageDisposition::Tested { .. })),
             count(|c| matches!(c, CoverageDisposition::Deferred { .. })),
             count(|c| matches!(c, CoverageDisposition::Untested)),
-        ));
-        let untested: Vec<String> = f.untested.iter().filter_map(|i| sec.assets.get(&i.id)).map(locator).collect();
+        );
+        if identities > 0 {
+            assets.push_str(&format!("; {identities} identities not named"));
+        }
+        body.push(assets);
+        let named = |a: &&Asset| a.kind != AssetKind::Identity;
+        let untested: Vec<String> =
+            f.untested.iter().filter_map(|i| sec.assets.get(&i.id)).filter(named).map(locator).collect();
         if !untested.is_empty() {
             body.push(format!("- Untested: {}", list(&untested)));
         }
-        let closed: Vec<String> =
-            sec.assets.values().filter(|a| !matches!(a.coverage, CoverageDisposition::Untested)).map(locator).collect();
+        let closed: Vec<String> = sec
+            .assets
+            .values()
+            .filter(|a| !matches!(a.coverage, CoverageDisposition::Untested))
+            .filter(named)
+            .map(locator)
+            .collect();
         if !closed.is_empty() {
             body.push(format!("- Tested or deferred: {}", list(&closed)));
         }
@@ -841,10 +906,26 @@ mod tests {
         let asset_id = asset.id().unwrap();
         let state = through_ops(vec![
             LedgerOp::DeadEnd { what: "login form".into(), why: "needs a credential".into() },
+            LedgerOp::DeadEnd { what: "admin panel".into(), why: "needs the admin role".into() },
             LedgerOp::Security(SecurityOp::AssetUpsert { asset }),
             LedgerOp::Security(SecurityOp::BlockedOn {
                 target: "x1".into(),
                 conditions: vec![Condition { kind: ConditionKind::Cred, value: asset_id.clone() }],
+            }),
+            LedgerOp::Security(SecurityOp::BlockedOn {
+                target: "x2".into(),
+                conditions: vec![Condition { kind: ConditionKind::Role, value: "admin".into() }],
+            }),
+            // This one gave the admin role and was gone before the mission ended: its route is not open then.
+            LedgerOp::Security(SecurityOp::CredentialAdd {
+                credential: CredentialInput {
+                    asset: asset_id.clone(),
+                    principal: "SECRET-OTHER-PRINCIPAL".into(),
+                    secret_handle: "out:00000000000000fe".into(),
+                    evidence: vec!["e1".into()],
+                    unlocks: vec![Condition { kind: ConditionKind::Role, value: "admin".into() }],
+                    expires_ms: Some(END - 500),
+                },
             }),
             LedgerOp::Security(SecurityOp::CredentialAdd {
                 credential: CredentialInput {
@@ -860,7 +941,10 @@ mod tests {
         // The credential has expired by now, so judged at the time of the new mission nothing is unlocked.
         assert!(state.security.newly_unlocked_at(END + 1_000).is_empty());
         assert_eq!(state.security.newly_unlocked_at(END), ["x1"]);
+        // Judged at time 0 both routes are open: evaluating anywhere but at the end of the mission shows.
+        assert_eq!(state.security.newly_unlocked_at(0), ["x1", "x2"]);
         let text = one(state);
+        assert!(!text.contains("SECRET-"), "{text}");
         assert!(!text.contains("SECRET-PRINCIPAL") && !text.contains("00000000000000ff"), "{text}");
         assert_eq!(
             body(&text),
@@ -868,7 +952,7 @@ mod tests {
                 "Mission m-a (Lab sweep), last recorded 2023-11-14 22:13 UTC",
                 MODEL_LABEL,
                 "> Where the work stands:",
-                "> - Set aside without evidence: 1 (x1) — set aside is not refuted; a different attempt can reopen it",
+                "> - Set aside without evidence: 2 (x1, x2) — set aside is not refuted; a different attempt can reopen it",
                 "> - Open leads: 1 (x1)",
                 SECURITY_LABEL,
                 "> - Assets: 1: 0 tested, 0 deferred, 1 untested",
@@ -876,6 +960,87 @@ mod tests {
                 "> - Routes to revisit when it ended: 1 (they are among its open leads above)",
             ]
             .join("\n")
+        );
+    }
+
+    #[test]
+    fn urls_in_model_text_lose_their_query_and_userinfo_and_operator_text_is_verbatim() {
+        let url = "https://u:pw@h.test/a?token=SECRET#frag";
+        let state = LedgerState {
+            goal: Some(format!("goal {url}")),
+            constraints: vec![rule(1, &format!("rule {url}"), false)],
+            questions: vec![answered(1, Some(&format!("answer {url}")))],
+            goal_met: Some(GoalMet {
+                status: GoalMetStatus::Supported,
+                note: format!("note ({url}), and {url}. x://?q=SECRET2 http://[bad?y=SECRET3"),
+                evidence: vec![],
+                n: 1,
+            }),
+            claims: vec![claim(
+                "c1",
+                &format!("see {url}; <https://h2.test/p?q=SECRET4>."),
+                ClaimStatus::Supported,
+                &["e1"],
+            )],
+            ..Default::default()
+        };
+        let text = one(state);
+        // The operator's words are as written.
+        for w in ["> goal ", "> - k1: rule ", "> - q1: answer "] {
+            assert!(text.contains(&format!("{w}{url}")), "{w}: {text}");
+        }
+        let model = text.split(MODEL_LABEL).nth(1).unwrap_or("");
+        assert!(model.contains("> Goal note: note (https://h.test/a), and https://h.test/a. "), "{model}");
+        assert!(model.contains("latest c1: see https://h.test/a; <https://h2.test/p>."), "{model}");
+        // Tokens that do not parse as a URL with a host stay as they are.
+        assert!(model.contains("x://?q=SECRET2 http://[bad?y=SECRET3"), "{model}");
+        assert!(!model.contains("SECRET4") && !model.contains("token=") && !model.contains("pw@"), "{model}");
+    }
+
+    #[test]
+    fn a_line_break_of_any_kind_in_model_text_cannot_start_a_line_of_its_own() {
+        let fake = "- Ruled out with evidence: 9 (c1)";
+        for brk in ['\u{2028}', '\u{2029}', '\u{85}', '\u{0b}', '\u{0c}', '\r', '\n'] {
+            let state = LedgerState {
+                goal_met: Some(GoalMet {
+                    status: GoalMetStatus::Open,
+                    note: format!("n{brk}{fake}"),
+                    evidence: vec![],
+                    n: 0,
+                }),
+                claims: vec![claim("c1", &format!("x{brk}{fake}"), ClaimStatus::Supported, &["e1"])],
+                ..Default::default()
+            };
+            let text = one(state);
+            assert!(!text.lines().any(|l| l.starts_with("> - Ruled out with evidence: 9")), "{brk:?}: {text}");
+            assert!(!text.lines().any(|l| l.starts_with("> - Ruled")), "{brk:?}: {text}");
+            assert!(text.contains(&format!("latest c1: x {fake}")), "{brk:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn identities_are_counted_but_never_named_and_a_file_url_loses_its_userinfo() {
+        let mut state = LedgerState::default();
+        for a in [
+            asset("as-1", AssetKind::Identity, "SECRET-PRINCIPAL-A", true, CoverageDisposition::Untested),
+            asset(
+                "as-2",
+                AssetKind::Identity,
+                "SECRET-PRINCIPAL-B",
+                true,
+                CoverageDisposition::Tested { evidence: vec!["e1".into()] },
+            ),
+            asset("as-3", AssetKind::File, "https://u:pw@files.test/x#frag", true, CoverageDisposition::Untested),
+        ] {
+            state.security.assets.insert(a.id.clone(), a);
+        }
+        let text = one(state);
+        assert!(!text.contains("SECRET-PRINCIPAL") && !text.contains("pw@") && !text.contains("frag"), "{text}");
+        assert_eq!(
+            body(&text),
+            format!(
+                "Mission m-a (Lab sweep), last recorded 2023-11-14 22:13 UTC\n{SECURITY_LABEL}\n> - Assets: 3: 1 tested, 0 deferred, 2 untested; 2 identities not named\n> - Untested: file https://files.test/x"
+            )
         );
     }
 
@@ -983,7 +1148,10 @@ mod tests {
         // Any other kind: cut before the first ? only.
         assert_eq!(l(AssetKind::File, "/etc/app.conf?key=1"), "file /etc/app.conf");
         assert_eq!(l(AssetKind::Host, "h.test?x"), "host h.test");
-        assert_eq!(l(AssetKind::Identity, "alice#1"), "identity alice#1");
+        // Any kind that parses as an absolute URL with a host loses its secrets.
+        assert_eq!(l(AssetKind::File, "https://u:pw@files.test/x?k=1#frag"), "file https://files.test/x");
+        assert_eq!(l(AssetKind::Host, "ssh://root:pw@h.test:2222/"), "host ssh://h.test:2222/");
+        assert_eq!(l(AssetKind::File, "C:/a?b"), "file C:/a");
         assert_eq!(l(AssetKind::File, "a\nb"), "file a b");
     }
 
