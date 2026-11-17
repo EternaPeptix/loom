@@ -373,19 +373,30 @@ struct Shared {
     unattributed: Mutex<Budget>,
     /// The tasks that serve or refuse a connection.
     tasks: TaskTracker,
-    /// The ports of the proxy's own listeners: the shared one and every session's (kept bound after a
-    /// revoke). A connection to one of them is refused whatever the policy says.
+    /// The ports of the proxy's own listeners: the shared one, every session's open one and every retired
+    /// one. A connection to one of them is refused whatever the policy says.
     own_ports: Mutex<HashSet<u16>>,
+    /// The ports of session listeners that were closed by a revoke, as numbers only. Always also in
+    /// `own_ports`.
+    retired: Mutex<HashSet<u16>>,
 }
 
 impl Shared {
     /// The verdict on one resolved address: refused when it reaches one of the proxy's own listeners
     /// (a loopback or unspecified address with an own port), else the policy's.
     fn check_addr(&self, policy: &Policy, host: &str, port: u16, ip: IpAddr, name_rule: &str) -> Verdict {
-        if is_local_literal(ip) && lock(&self.own_ports).contains(&port) {
-            return Verdict { allowed: false, rule: format!("deny the egress proxy's own port {port}") };
+        if let Some(refused) = self.own_port_verdict(ip, port) {
+            return refused;
         }
         policy.check_addr(host, port, ip, name_rule)
+    }
+
+    /// The refusal for an address that reaches one of the proxy's own ports, else `None`.
+    fn own_port_verdict(&self, ip: IpAddr, port: u16) -> Option<Verdict> {
+        if is_local_literal(ip) && lock(&self.own_ports).contains(&port) {
+            return Some(Verdict { allowed: false, rule: format!("deny the egress proxy's own port {port}") });
+        }
+        None
     }
 
     /// Registers a new connection, which has not sent its head yet, as pending; returns its id and the
@@ -498,8 +509,8 @@ struct Inner {
     port: u16,
     shared: Arc<Shared>,
     cancel: CancellationToken,
-    /// The session listeners: session id to its port and its token (a child of `cancel`). A listener
-    /// stays bound, whatever happens to the session's grant, until the proxy stops.
+    /// The session listeners: session id to its port and its token (a child of `cancel`). A revoke closes
+    /// the session's listener and removes it from here.
     listeners: Mutex<HashMap<String, (u16, CancellationToken)>>,
 }
 
@@ -555,6 +566,7 @@ impl Proxy {
             unattributed: Mutex::new(Budget { since: std::time::Instant::now(), used: 0, left_out: 0 }),
             tasks: TaskTracker::new(),
             own_ports: Mutex::new(HashSet::from([bound])),
+            retired: Mutex::new(HashSet::new()),
         });
         let cancel = CancellationToken::new();
         tokio::spawn(accept_loop(listener, shared.clone(), cancel.clone(), cancel.clone(), Origin::Shared));
@@ -575,34 +587,25 @@ impl Proxy {
         lock(&self.inner.listeners).get(session.as_str()).filter(|(_, t)| !t.is_cancelled()).map(|(p, _)| *p)
     }
 
-    /// The port of the session's listener, bound (inside a Tokio runtime) on the first call.
+    /// The port of the session's listener, opened (inside a Tokio runtime) on the first call.
     fn session_listener(&self, session: &SessionId) -> Result<u16, ProxyError> {
-        let bind = |source: std::io::Error| ProxyError::Bind { port: 0, source };
         let mut listeners = lock(&self.inner.listeners);
         if let Some((port, token)) = listeners.get(session.as_str()) {
             if !token.is_cancelled() {
                 return Ok(*port);
             }
         }
-        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
-            bind(std::io::Error::other("a session's listener can only be opened inside a Tokio runtime"))
-        })?;
-        let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(bind)?;
-        std_listener.set_nonblocking(true).map_err(bind)?;
-        let port = std_listener.local_addr().map_err(bind)?.port();
-        let listener = {
-            let _guard = runtime.enter();
-            TcpListener::from_std(std_listener).map_err(bind)?
-        };
+        let shared = &self.inner.shared;
+        let listener = open_fresh_listener(shared, &|port| lock(&shared.retired).contains(&port))?;
+        let port = listener.local_addr().map_err(|source| ProxyError::Bind { port: 0, source })?.port();
         let token = self.inner.cancel.child_token();
         tokio::spawn(accept_loop(
             listener,
-            self.inner.shared.clone(),
+            shared.clone(),
             self.inner.cancel.clone(),
             token.clone(),
             Origin::Session(session.clone()),
         ));
-        lock(&self.inner.shared.own_ports).insert(port);
         listeners.insert(session.as_str().to_string(), (port, token));
         Ok(port)
     }
@@ -666,9 +669,14 @@ impl Proxy {
         lock(&self.inner.shared.sessions).get(session.as_str()).map(|e| e.policy.check_name(host, port))
     }
 
-    /// Drops the session's credentials. Its listener stays bound and answers `407` (see the module contract).
+    /// Drops the session's credentials and closes its listener; its port is retired (see the module
+    /// contract).
     pub fn revoke(&self, session: &SessionId) {
         lock(&self.inner.shared.sessions).retain(|_, entry| &entry.session != session);
+        if let Some((port, token)) = lock(&self.inner.listeners).remove(session.as_str()) {
+            lock(&self.inner.shared.retired).insert(port);
+            token.cancel();
+        }
     }
 
     /// Stop accepting connections. Open tunnels are closed.
@@ -685,6 +693,43 @@ impl Proxy {
         tasks.close();
         let _ = tokio::time::timeout(within, tasks.wait()).await;
     }
+}
+
+/// How many sockets are bound in a row to find a loopback port that is not one of the proxy's own.
+const LISTENER_ATTEMPTS: usize = 64;
+
+/// Opens a listener on a loopback port that is neither retired (`is_retired`) nor one of the proxy's own
+/// ports. The port is added to the own ports before `listen`. Sockets bound to unusable ports are held
+/// until a fresh one is found, so the system hands out another each time, and dropped on return.
+fn open_fresh_listener(shared: &Shared, is_retired: &dyn Fn(u16) -> bool) -> Result<TcpListener, ProxyError> {
+    let bind = |source: std::io::Error| ProxyError::Bind { port: 0, source };
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Err(bind(std::io::Error::other("a session's listener can only be opened inside a Tokio runtime")));
+    }
+    let mut aside = Vec::new();
+    for _ in 0..LISTENER_ATTEMPTS {
+        let socket = tokio::net::TcpSocket::new_v4().map_err(bind)?;
+        socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).map_err(bind)?;
+        let port = socket.local_addr().map_err(bind)?.port();
+        if is_retired(port) || !lock(&shared.own_ports).insert(port) {
+            aside.push(socket);
+            continue;
+        }
+        return match socket.listen(1024) {
+            Ok(listener) => Ok(listener),
+            Err(e) => {
+                lock(&shared.own_ports).remove(&port);
+                Err(bind(e))
+            }
+        };
+    }
+    Err(ProxyError::Bind {
+        port: 0,
+        source: std::io::Error::other(format!(
+            "No fresh loopback port was found in {LISTENER_ATTEMPTS} attempts, because the ports the system offered \
+             were all in use by the proxy or retired by a revoked session; restarting the daemon frees the retired ports."
+        )),
+    })
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1227,6 +1272,12 @@ async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<(TcpStream, Allo
         }
         match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(SocketAddr::new(ip, cx.port))).await {
             Ok(Ok(s)) => {
+                // A listener opened between the first check and the connect is in the set by now.
+                if let Some(refused) = cx.shared.own_port_verdict(ip, cx.port) {
+                    drop(s);
+                    first_refusal.get_or_insert((refused.rule, ip));
+                    continue;
+                }
                 let _ = s.set_nodelay(true);
                 // Nothing has been sent upstream yet; the connection is used only once it is on record.
                 return match cx.record(true, cv.rule.clone(), Some(ip)).await {
@@ -2646,8 +2697,7 @@ mod tests {
         let garbage = raw(g.port, b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nProxy-Authorization: Basic !!!\r\n\r\n").await;
         assert_eq!(status(&garbage), 407);
         p.revoke(&sid);
-        // The session's listener stays bound and refuses its old credentials; they are unknown elsewhere.
-        assert_eq!(status(&raw(g.port, connect_req(&g, "127.0.0.1:9").as_bytes()).await), 407);
+        // The session's listener is closed; the old credentials are unknown on the shared port.
         assert_eq!(status(&raw(p.port(), connect_req(&g, "127.0.0.1:9").as_bytes()).await), 407);
         no_more(&mut rx);
     }
@@ -3759,7 +3809,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revoke_keeps_the_listener_bound_and_shutdown_closes_all() {
+    async fn revoke_closes_the_listener_and_retires_its_port() {
         let (p, _rx) = start().await;
         let echo = echo_server().await;
         let (a, b) = (SessionId::from("s-rv-a"), SessionId::from("s-rv-b"));
@@ -3778,20 +3828,19 @@ mod tests {
         };
         assert!(TcpStream::connect(("127.0.0.1", ga.port)).await.is_ok());
         p.revoke(&a);
-        // The port still accepts, answers 407 to the old credentials, and the session holds no port.
-        let dest = format!("127.0.0.1:{echo}");
-        let r = raw(ga.port, connect_req(&ga, &dest).as_bytes()).await;
-        assert_eq!(status(&r), 407, "{r}");
+        assert!(gone(ga.port).await, "a revoked session's listener still accepts");
         assert_eq!(p.session_port(&a), None);
+        assert!(lock(&p.inner.listeners).get("s-rv-a").is_none());
         // 20 new sessions never get A's port.
         for i in 0..20 {
             let g = p.grant(&SessionId::from(format!("s-rv-new-{i}").as_str()), lab()).unwrap();
             assert_ne!(g.port, ga.port);
         }
-        // A later grant of A uses the same listener, and the old password does not work.
+        // A later grant of A opens a new listener on another port; the old credentials do not work there.
         let again = p.grant(&a, lab()).unwrap();
-        assert_eq!(again.port, ga.port);
-        assert_eq!(p.session_port(&a), Some(ga.port));
+        assert_ne!(again.port, ga.port);
+        assert_eq!(p.session_port(&a), Some(again.port));
+        let dest = format!("127.0.0.1:{echo}");
         assert_eq!(status(&raw(again.port, connect_req(&ga, &dest).as_bytes()).await), 407);
         assert_eq!(status(&raw(again.port, connect_req(&again, &dest).as_bytes()).await), 200);
         assert!(TcpStream::connect(("127.0.0.1", gb.port)).await.is_ok());
@@ -3800,6 +3849,26 @@ mod tests {
         assert!(gone(ga.port).await, "a session listener still accepts after shutdown");
         assert!(gone(gb.port).await, "a session listener still accepts after shutdown");
         assert!(gone(p.port()).await, "the shared listener still accepts after shutdown");
+    }
+
+    #[tokio::test]
+    async fn no_fresh_port_gives_a_bind_error_and_leaves_nothing_bound() {
+        let (p, _rx) = start().await;
+        let tried = Mutex::new(Vec::new());
+        let e = open_fresh_listener(&p.inner.shared, &|port| {
+            lock(&tried).push(port);
+            true
+        })
+        .expect_err("every port is retired, so no listener opens");
+        let text = e.to_string();
+        assert!(text.contains("No fresh loopback port was found") && text.contains("restarting the daemon"), "{text}");
+        let tried = lock(&tried).clone();
+        assert_eq!(tried.len(), LISTENER_ATTEMPTS);
+        // The sockets set aside are closed: each of those ports can be bound again.
+        for port in tried {
+            assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(), "port {port} is still bound");
+        }
+        assert!(lock(&p.inner.shared.own_ports).len() == 1);
     }
 
     #[tokio::test]

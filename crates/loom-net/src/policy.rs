@@ -416,7 +416,11 @@ fn refuse_too_broad(host: &str) -> Result<(), String> {
     if let Some(rest) = name.strip_prefix("*.") {
         let last = normalize_host(rest);
         let last = last.rsplit('.').next().unwrap_or("");
-        if !last.is_empty() && last.chars().all(|c| c.is_ascii_digit()) {
+        let hex = last.strip_prefix("0x").or_else(|| last.strip_prefix("0X"));
+        let numeric = !last.is_empty()
+            && (last.chars().all(|c| c.is_ascii_digit())
+                || hex.is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit())));
+        if numeric {
             return Err(format!(
                 "The host \"{host}\" ends in a number, which no top-level domain does, so it would authorize a whole range of IP addresses written as host names. Name the hosts you need."
             ));
@@ -796,6 +800,9 @@ mod tests {
             "*.com",
             "*.com:443",
             "*.0.1",
+            "*.8.0x8",
+            "*.8.0XfF",
+            "*.8.010",
             "*.1.168.192:80",
             "0.0.0.0",
             "0.0.0.0:8080",
@@ -815,9 +822,15 @@ mod tests {
             let err = s(&["a.test", e]).unwrap_err();
             assert!(err.contains(&format!("\"{e}\"")), "{e}: {err}");
         }
-        for e in
-            ["*.example.test", "*.a1.example.test", "api.example.test:443", "127.0.0.1:19201", "10.0.0.5", "[::1]:8080"]
-        {
+        for e in [
+            "*.example.test",
+            "*.a1.example.test",
+            "*.0xide.example.test",
+            "api.example.test:443",
+            "127.0.0.1:19201",
+            "10.0.0.5",
+            "[::1]:8080",
+        ] {
             assert_eq!(s(&[e]).unwrap(), [e], "{e}");
         }
         // with_hosts honours what a ledger restored.

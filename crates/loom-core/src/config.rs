@@ -19,7 +19,7 @@
 //! `read_model_key(dir, name) -> Result<String, String>`: the key in `dir/name`. The file is opened
 //! without following a link (`O_NOFOLLOW`) and judged by the open descriptor. Refused, each with a
 //! sentence that names the path and says how to fix it: a missing file (the sentence gives the commands
-//! that make one: `mkdir -p -m 700 {dir}` and `(umask 077; cat > {path})`, then the key and Ctrl-D); a link;
+//! that make one: `mkdir -p -m 700 {dir}` and `(set -o noclobber; umask 077; cat > {path})`, then the key and Ctrl-D); a link;
 //! anything but a regular file; a file another user owns; a file with any group or other permission bit
 //! (`chmod 600 {path}`); more than 16 KiB; content that is not UTF-8; content that, with leading and
 //! trailing white space removed, is empty or still holds white space or a control character. Returns the
@@ -32,8 +32,8 @@
 //! in name order (`dir` is `Paths::model_keys_dir()`). When `is_set(var)` (the variable is present and not
 //! empty in the environment the daemon has or will be started with): the key of `models.{p}` is in the
 //! daemon's environment, where every command can read it, and how to move it: write it to `{dir}/{p}`
-//! (`mkdir -p -m 700 {dir}`, then `(umask 077; printenv {VAR} > {dir}/{p})`, or, when the variable is not
-//! set, `(umask 077; cat > {dir}/{p})` and the key pasted), replace
+//! (`mkdir -p -m 700 {dir}`, then `(set -o noclobber; umask 077; printenv {VAR} > {dir}/{p})`, or, when the variable is not
+//! set, `(set -o noclobber; umask 077; cat > {dir}/{p})` and the key pasted), replace
 //! `api_key_env = "{VAR}"` with `api_key_file = "{p}"` in `[models.{p}]`, and restart the daemon. Otherwise:
 //! `{VAR}` is not set, so requests of `models.{p}` carry no key, and the same move. Never the value.
 //!
@@ -63,7 +63,7 @@ use crate::ids::{MissionId, SessionId};
 use crate::weave::ReweavePolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -677,11 +677,13 @@ impl Config {
     /// Never holds a value.
     pub fn key_env_warnings(&self, dir: &Path, is_set: impl Fn(&str) -> bool) -> Vec<String> {
         let mut out = Vec::new();
+        let files = self.suggested_key_files();
         for (name, profile) in &self.models {
             let Some(var) = &profile.api_key_env else { continue };
             let set = is_set(var);
+            let file = files.get(name).cloned().unwrap_or_else(|| suggested_key_file(name));
             // Where the variable is not set, `printenv` would write an empty file: the key is pasted instead.
-            let mv = format!("To move it, {}, and restart the daemon.", key_move_steps(dir, name, var, set));
+            let mv = format!("To move it, {}, and restart the daemon.", key_move_steps(dir, name, &file, var, set));
             if set {
                 out.push(format!(
                     "The key of models.{name} is in the daemon's environment as {var}, where every command can read it. {mv}"
@@ -689,6 +691,32 @@ impl Config {
             } else {
                 out.push(format!("{var} is not set, so requests of models.{name} carry no key. {mv}"));
             }
+        }
+        out
+    }
+
+    /// The key file name to suggest for each profile that names its key by `api_key_env`: unique within the
+    /// config, compared without regard to case with each other and with the `api_key_file` names in use, by
+    /// appending `-2`, `-3`, … (the name cut to fit 64 characters).
+    pub fn suggested_key_files(&self) -> BTreeMap<String, String> {
+        let mut used: HashSet<String> =
+            self.models.values().filter_map(|p| p.api_key_file.as_ref()).map(|f| f.to_lowercase()).collect();
+        let mut out = BTreeMap::new();
+        for (name, profile) in &self.models {
+            if profile.api_key_env.is_none() {
+                continue;
+            }
+            let base = suggested_key_file(name);
+            let mut chosen = base.clone();
+            let mut n = 1u32;
+            while used.contains(&chosen.to_lowercase()) {
+                n += 1;
+                let suffix = format!("-{n}");
+                let keep = 64usize.saturating_sub(suffix.len());
+                chosen = format!("{}{suffix}", base.chars().take(keep).collect::<String>());
+            }
+            used.insert(chosen.to_lowercase());
+            out.insert(name.clone(), chosen);
         }
         out
     }
@@ -756,15 +784,16 @@ fn models_header(profile: &str) -> String {
 /// The steps that move the key of model profile `profile` from `api_key_env = "{var}"` to a file in `dir`,
 /// as a clause for a sentence: every command in it runs in a shell as written. `printenv` is used when the
 /// variable is set, else the key is pasted. Never holds a value.
-pub fn key_move_steps(dir: &Path, profile: &str, var: &str, printenv: bool) -> String {
-    let file = suggested_key_file(profile);
-    let path = shell_quote(&dir.join(&file).display().to_string());
+/// `file` is the file name to use (see [`Config::suggested_key_files`]). Every write runs with `noclobber`, so
+/// it fails rather than replace a file that is there.
+pub fn key_move_steps(dir: &Path, profile: &str, file: &str, var: &str, printenv: bool) -> String {
+    let path = shell_quote(&dir.join(file).display().to_string());
     let dir = shell_quote(&dir.display().to_string());
     let var_word = shell_quote(var);
     let write = if printenv {
-        format!("`(umask 077; printenv {var_word} > {path})`")
+        format!("`(set -o noclobber; umask 077; printenv {var_word} > {path})`")
     } else {
-        format!("`(umask 077; cat > {path})` and paste the key, then Ctrl-D")
+        format!("`(set -o noclobber; umask 077; cat > {path})` and paste the key, then Ctrl-D")
     };
     format!(
         "write the key to {path} (`mkdir -p -m 700 {dir}`, then {write}), replace `api_key_env = \"{var}\"` with `api_key_file = \"{file}\"` in {}",
@@ -802,18 +831,18 @@ pub fn read_model_key(dir: &Path, name: &str) -> Result<String, String> {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(format!(
-                "The key file {shown} does not exist. Make it with `mkdir -p -m 700 {dir}` and `(umask 077; cat > {shown})`, then type or paste the key and press Ctrl-D.",
+                "The key file {shown} does not exist. Make it with `mkdir -p -m 700 {dir}` and `(set -o noclobber; umask 077; cat > {shown})`, then type or paste the key and press Ctrl-D.",
                 dir = shell_quote(&dir.display().to_string())
             ));
         }
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
             return Err(format!(
-                "The key file {shown} is a symbolic link, which loom does not follow. Replace it with a regular file holding the key: `rm {shown}`, then `(umask 077; cat > {shown})`."
+                "The key file {shown} is a symbolic link, which loom does not follow. Replace it with a regular file holding the key: `rm {shown}`, then `(set -o noclobber; umask 077; cat > {shown})`."
             ));
         }
         Err(e) => {
             return Err(format!(
-                "The key file {shown} cannot be opened: {e}. Fix its permissions or recreate it with `(umask 077; cat > {shown})`."
+                "The key file {shown} cannot be opened: {e}. Fix its permissions or recreate it with `rm {shown}`, then `(set -o noclobber; umask 077; cat > {shown})`."
             ));
         }
     };
@@ -827,7 +856,7 @@ pub fn read_model_key(dir: &Path, name: &str) -> Result<String, String> {
     let me = unsafe { libc::geteuid() };
     if meta.uid() != me {
         return Err(format!(
-            "The key file {shown} belongs to another user (uid {}), not to you (uid {me}). Recreate it as yourself with `(umask 077; cat > {shown})`.",
+            "The key file {shown} belongs to another user (uid {}), not to you (uid {me}). Recreate it as yourself with `rm {shown}`, then `(set -o noclobber; umask 077; cat > {shown})`.",
             meta.uid()
         ));
     }
@@ -1141,7 +1170,10 @@ allow = ["*.example.test"]
         let d = tempfile::tempdir().unwrap();
         let dir = d.path();
         let missing = read_model_key(dir, "nope").unwrap_err();
-        assert!(missing.contains("mkdir -p -m 700") && missing.contains("umask 077; cat >"), "{missing}");
+        assert!(
+            missing.contains("mkdir -p -m 700") && missing.contains("set -o noclobber; umask 077; cat >"),
+            "{missing}"
+        );
         assert!(missing.contains(&dir.join("nope").display().to_string()));
         write_key(dir, "real", b"sk-topsecret", 0o600);
         std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
@@ -1208,6 +1240,43 @@ allow = ["*.example.test"]
         // An unset variable would give an empty file through printenv: the key is pasted instead.
         assert!(!w[1].contains("printenv") && w[1].contains("cat > /h/keys/models/b"), "{}", w[1]);
         assert!(Config::default().key_env_warnings(dir, |_| true).is_empty());
+    }
+
+    #[test]
+    fn suggested_key_names_are_unique_and_every_write_is_noclobber() {
+        let dir = Path::new("/h/keys/models");
+        let mut c = Config::default();
+        for name in ["gpt 4", "gpt/4", "GPT-4"] {
+            c.models.insert(name.into(), ModelProfile { api_key_env: Some("K".into()), ..Default::default() });
+        }
+        c.models.insert("taken".into(), ModelProfile { api_key_file: Some("gpt-4-2".into()), ..Default::default() });
+        let names = c.suggested_key_files();
+        assert_eq!(names.len(), 3, "{names:?}");
+        let mut all: Vec<String> = names.values().map(|n| n.to_lowercase()).collect();
+        all.push("gpt-4-2".into());
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 4, "{names:?}");
+        for n in names.values() {
+            assert!(check_key_file_name(n).is_ok(), "{n}");
+        }
+        // A long name is cut to fit 64 characters with its suffix.
+        let mut c = Config::default();
+        for name in ["a".repeat(64), format!("{}!", "a".repeat(70))] {
+            c.models.insert(name, ModelProfile { api_key_env: Some("K".into()), ..Default::default() });
+        }
+        let names = c.suggested_key_files();
+        assert!(names.values().all(|n| n.len() <= 64), "{names:?}");
+        assert_ne!(names.values().next(), names.values().nth(1));
+        for set in [true, false] {
+            for line in c.key_env_warnings(dir, |_| set) {
+                assert!(line.contains("set -o noclobber; umask 077; "), "{line}");
+                assert!(!line.contains("(umask"), "{line}");
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let e = read_model_key(d.path(), "missing").unwrap_err();
+        assert!(e.contains("set -o noclobber; umask 077; cat >") && !e.contains("(umask"), "{e}");
     }
 
     #[test]

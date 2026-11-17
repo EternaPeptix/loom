@@ -9009,15 +9009,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_session_that_ends_holds_no_proxy_port_but_the_port_stays_bound() {
+    async fn a_session_that_ends_holds_no_proxy_port_and_its_port_is_not_reissued() {
         let e = env(Script::new(|_, _| finish("ok"))).await;
         let id = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta.id;
         until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
         let port = e.rt.inner.proxy.session_port(&id).unwrap();
         e.rt.inner.proxy.revoke(&id);
         assert_eq!(e.rt.inner.proxy.session_port(&id), None);
-        // The listener stays bound, so no later session is given the port.
-        assert!(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok());
+        // The port is retired, so no later session is given it.
+        let next = e.rt.create_session(e.new_session(Some("b"))).await.unwrap().meta.id;
+        until("second turn end", || e.has(&next, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let other = e.rt.inner.proxy.session_port(&next).unwrap();
+        assert_ne!(other, port);
         e.rt.shutdown().await;
     }
 

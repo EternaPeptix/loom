@@ -1209,7 +1209,8 @@ fn env_var_is_set(var: &str) -> bool {
 fn service_key_check(config: &Config, keys_dir: &Path) -> Result<(), String> {
     for (name, profile) in &config.models {
         if let Some(var) = &profile.api_key_env {
-            let steps = loom_core::config::key_move_steps(keys_dir, name, var, true);
+            let file = config.suggested_key_files().get(name).cloned().unwrap_or_else(|| name.clone());
+            let steps = loom_core::config::key_move_steps(keys_dir, name, &file, var, true);
             return Err(format!(
                 "models.{name} sets api_key_env = \"{var}\", but a launchd service does not have your shell's variables, so its requests would carry no key, and putting the key in the service file would write it to disk and into the daemon's environment. Move the key to a file: {steps}, and run `loom service install` again."
             ));
