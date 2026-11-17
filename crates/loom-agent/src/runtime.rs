@@ -340,7 +340,11 @@
 //! daemon resolves its infrastructure names again (every `infra::RESOLVE_EVERY`). A floor event of severity S4
 //! (a decoy credential or host) or S3 (an infrastructure attempt, a squatted lab port) raises a notification of
 //! kind `floor` (`LOOM_KIND=floor`, `LOOM_SESSION` the attributed session or empty), at most once per label (S4) or
-//! per kind and session (S3) every 10 minutes.
+//! per kind and session (S3) every 10 minutes. Every floor event is also appended, one JSON line, to
+//! `logs/floor.jsonl` (synced before the hook that raised it answers), where the monitor reads it by cursor. The
+//! lab-listener check is given the connecting session, the address and the local end of the connection, and leaves
+//! out the processes of the session's own mission; the proxy is told this machine's interface addresses
+//! (`Proxy::set_local_addrs`, refreshed with the infrastructure) so that the check also covers them.
 //!
 //! ## Box counters
 //! Every `BOX_COUNTERS_EVERY` (60 s, not under test) the runtime reads the rule counters of each mission box it has a
@@ -1639,16 +1643,29 @@ impl Inner {
     /// The sessions a census asks about (every one that is not archived) and those of them that have ended or were
     /// stopped: nothing of those should be running.
     fn census_sessions(&self) -> (Vec<(String, PathBuf)>, BTreeSet<String>) {
-        let st = self.st();
-        let live: Vec<SessionId> =
-            st.known.iter().filter(|(_, k)| !k.meta.archived).map(|(id, _)| id.clone()).collect();
-        let ended = st
-            .known
-            .iter()
-            .filter(|(_, k)| !k.meta.archived && k.census_ended())
-            .map(|(id, _)| id.as_str().to_string());
-        let ended: BTreeSet<String> = ended.collect();
+        // The state lock is held only to list the sessions: `members` canonicalizes each one's temp dir.
+        let (live, ended): (Vec<SessionId>, BTreeSet<String>) = {
+            let st = self.st();
+            let live = st.known.iter().filter(|(_, k)| !k.meta.archived).map(|(id, _)| id.clone()).collect();
+            let ended = st
+                .known
+                .iter()
+                .filter(|(_, k)| !k.meta.archived && k.census_ended())
+                .map(|(id, _)| id.as_str().to_string())
+                .collect();
+            (live, ended)
+        };
         (crate::census::members(&self.paths, &live), ended)
+    }
+
+    /// The sessions of the mission `who` belongs to (itself included): what the lab-listener check does not take
+    /// for a squatter. Just `who` for a session that is not known.
+    fn mission_peers(&self, who: &SessionId) -> Vec<String> {
+        let st = self.st();
+        let Some(mission) = st.known.get(who).map(|k| k.meta.mission.clone()) else {
+            return vec![who.as_str().to_string()];
+        };
+        st.known.iter().filter(|(_, k)| k.meta.mission == mission).map(|(id, _)| id.as_str().to_string()).collect()
     }
 
     /// Whether commands run under Seatbelt, the only mode in which a process can be told by its profile.
@@ -4299,6 +4316,9 @@ const UNATTRIBUTED_NET: &str = "net-unattributed.jsonl";
 /// Where the rule counters of the mission boxes are recorded, under `logs/`.
 const BOX_COUNTERS_FILE: &str = "box-counters.jsonl";
 
+/// Where the floor's events (decoy hits, vetoes, squatted lab ports) are appended, under `logs/`.
+const FLOOR_EVENTS_FILE: &str = "floor.jsonl";
+
 /// How often the mission boxes' rule counters are read.
 #[cfg_attr(test, allow(dead_code))]
 const BOX_COUNTERS_EVERY: Duration = Duration::from_secs(60);
@@ -4482,6 +4502,7 @@ impl Runtime {
                     if let Ok(policy) = infra_policy(&inner.config, &fresh) {
                         inner.floor.set_infrastructure(policy);
                     }
+                    inner.proxy.set_local_addrs(fresh.local.clone());
                     *inner.infra.lock().unwrap_or_else(|p| p.into_inner()) = fresh;
                 }
             });
@@ -4510,14 +4531,18 @@ impl Runtime {
         // listener check asks the census's machinery who listens on a loopback port, over the sessions known now.
         {
             let weak = Arc::downgrade(&inner);
-            let probe: crate::floor::ListenerProbe = Arc::new(move |port| {
+            let probe: crate::floor::ListenerProbe = Arc::new(move |who, to, client| {
                 let Some(inner) = weak.upgrade() else { return loom_tools::sandbox::census::Listening::Unknown };
                 let (members, _) = inner.census_sessions();
                 let asked: Vec<loom_tools::sandbox::census::Member<'_>> =
                     members.iter().map(|(id, tmp)| loom_tools::sandbox::census::Member { id, tmp }).collect();
+                let peers = inner.mission_peers(who);
+                let own: Vec<&str> = peers.iter().map(String::as_str).collect();
                 let home = crate::census::canonical_home(&inner.paths.home);
-                loom_tools::sandbox::census::listener_of(&home, &asked, port, inner.census_confined())
+                loom_tools::sandbox::census::listener_of(&home, &asked, to, client, inner.census_confined(), &own)
             });
+            inner.floor.set_log(Some(inner.paths.logs_dir().join(FLOOR_EVENTS_FILE)));
+            inner.proxy.set_local_addrs(inner.infra().local);
             inner.floor.install(&inner.proxy, Some(probe));
             let weak = Arc::downgrade(&inner);
             inner.floor.set_notifier(Some(Arc::new(move |e: &crate::floor::FloorEvent| {
@@ -11123,6 +11148,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_lab_listener_check_leaves_out_the_connectors_own_mission() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let a = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta;
+        let b = e.rt.create_session(e.new_session(Some("b"))).await.unwrap().meta;
+        assert_ne!(a.mission, b.mission);
+        // A mission's own sessions are not squatters for each other; another mission's are.
+        assert_eq!(e.rt.inner.mission_peers(&a.id), vec![a.id.as_str().to_string()]);
+        assert_eq!(e.rt.inner.mission_peers(&SessionId::from("unknown")), vec!["unknown".to_string()]);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn the_runtimes_proxy_has_the_floor_installed() {
         use base64::Engine as _;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11149,7 +11186,8 @@ mod tests {
             e.rt.inner.proxy.grant(&a.id, Policy::new(&loom_core::config::NetworkCfg::default()).unwrap()).unwrap();
         let own = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", grant.user, grant.password));
         let resp = ask(own, "bait.example.test:443").await;
-        assert!(resp.starts_with("HTTP/1.1 4") || resp.starts_with("HTTP/1.1 502"), "{resp}");
+        // The policy (deny_all, the default) refuses the name with its 403, and the floor saw it all the same.
+        assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
         let events = floor.events();
         assert!(
             events
@@ -11157,6 +11195,27 @@ mod tests {
                 .any(|ev| ev.kind == crate::floor::FloorKind::CanaryCredential && ev.session.as_ref() == Some(&a.id)),
             "{events:?}"
         );
+        let hosts = |floor: &crate::floor::Floor| {
+            floor.events().iter().filter(|ev| ev.kind == crate::floor::FloorKind::CanaryHost).count()
+        };
+        assert_eq!(hosts(&floor), 1, "a deny_all mission naming a decoy host is an S4 event: {events:?}");
+        // With a policy that lets the name through, the veto is what closes it (502, the fixed sentence).
+        let open = Policy::new(&loom_core::config::NetworkCfg {
+            mode: loom_core::config::NetworkMode::Open,
+            ..loom_core::config::NetworkCfg::default()
+        })
+        .unwrap();
+        let grant = e.rt.inner.proxy.grant(&a.id, open).unwrap();
+        let own = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", grant.user, grant.password));
+        let resp = ask(own, "bait.example.test:443").await;
+        assert!(
+            resp.starts_with("HTTP/1.1 502") && resp.contains("closed to this mission by loom's own rules"),
+            "{resp}"
+        );
+        assert_eq!(hosts(&floor), 2);
+        // Every event is also on disk.
+        let log = std::fs::read_to_string(e.rt.paths().logs_dir().join("floor.jsonl")).unwrap();
+        assert!(log.lines().count() >= 3 && log.contains("canary_host"), "{log}");
         e.rt.shutdown().await;
     }
 

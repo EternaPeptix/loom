@@ -72,7 +72,11 @@
 //! loopback (`allow_private`, a granted `127.0.0.1:{port}`) could open a tunnel to another session's
 //! listener and present that session's credentials there, through the proxy, which would accept them.
 //! `set_policy(session, policy)` replaces the policy of a session that holds a grant and keeps its
-//! credentials, so commands already running pick the change up on their next connection.
+//! credentials, so commands already running pick the change up on their next connection. It does not touch the
+//! session's reference grant, which has a policy of its own. `hold(session, policy)` is the replacement for a hold:
+//! it sets the policy of **both** the command grant and the reference grant (so that an in-process GET that follows
+//! redirects cannot open a new reference connection after the cut), and the reference entry keeps it until
+//! `grant_reference` mints it again or the session is revoked.
 //! `cut_hosts(session, pattern) -> usize` ends the session's open tunnels and forwarded requests whose
 //! destination the grant pattern covers (`policy::pattern_covers`; a port in the pattern must match), and
 //! a connection accepted but not yet connected is refused when it would open (it is registered before the
@@ -102,7 +106,8 @@
 //! `Dest { host, port, method, resolved, sni }`. It is asked for every connection the name policy allowed, for a
 //! `CONNECT`, a forwarded request and a check alike: (1) at the name stage, before any lookup (`resolved` and
 //! `sni` are `None`), so a canary host is never resolved; (2) for each address the policy allowed, before the
-//! connect (`resolved` is the address), so nothing is opened toward a vetoed address; (3) for the server name of a
+//! connect (`resolved` is the address), so nothing is opened toward a vetoed address (a check asks it for the
+//! address it would use, the first the policy allows, and answers and records a veto of it as for a connect); (3) for the server name of a
 //! tunnel's ClientHello when it differs from the destination (`sni`, see *Server names*). `Some(rule)` ends the
 //! request: `502` with `X-Loom-Proxy: 1` and a fixed sentence that says the destination is closed to the mission
 //! by loom's own rules, that nothing was opened or sent, that it must not be retried and that `report_blocker`
@@ -115,21 +120,41 @@
 //! veto in the audit hook", as a separate hook because the monitor is built after the proxy and the audit hook
 //! is fixed at start; it also runs before the connect, not only before the `200`. `set_veto(None)` removes it.
 //!
+//! ## Observing refusals
+//! `set_refusal_observer(Some(f))` installs `f(session, &Dest)`, told of each request whose destination name the
+//! session's policy refused (`CONNECT`, forwarded request and check alike; `resolved` and `sni` are `None`) and of a
+//! tunnel whose ClientHello server name the policy refused or whose encrypted-ClientHello extension names another
+//! host (`sni` is that name). It only observes: the answer, the record and the refusal are the policy's own. The
+//! veto is asked only of what the policy allowed, and the default modes (`deny_all`, an allowlist) refuse most
+//! names before it, so this is how the daemon sees a decoy host named in a mission whose policy does not allow it
+//! (CN-4). It runs on the proxy's own tasks and must not block. `set_refusal_observer(None)` removes it.
+//!
 //! ## Server names (E4c)
 //! After the `200` of a `CONNECT` and before one byte goes upstream, the proxy reads the client's first flight
 //! (the bytes that came with the head, then more) and looks at it with `clienthello::parse`:
-//! - not TLS (the first byte is not a handshake record of version 3.x): passed unchanged, nothing to bind
+//! - not TLS (the stream does not start like a TLS record: a first byte outside `0x14..=0x17`, or a second byte of
+//!   `0x10` or more, which a Go `crypto/tls` server also treats as not TLS): passed unchanged, nothing to bind
 //!   (an SSH or SMTP banner, plain HTTP, STARTTLS before its upgrade); a server that speaks before the client
-//!   does ends the wait the same way;
+//!   does ends the wait the same way. A stream that **does** start like a TLS record but whose first record is not a
+//!   handshake record of version `3.x` (a warning alert, a change-cipher-spec, application data, a record header
+//!   with version `0.0` or `1.0`) is refused as a hello that cannot be read: servers (Go, BoringSSL, rustls) skip a
+//!   leading alert or accept such a version and read the hello behind it, so passing it would let the name be
+//!   hidden;
 //! - a ClientHello whose server name is the destination (compared in the policy's normal form) passes, with
 //!   no extra record; an IP-literal destination with no name passes;
 //! - another name passes only when the session's current policy allows it (`check_name`, which applies deny
 //!   rules in every mode and the allowlist in allowlist mode) and the veto lets it through; the decision
 //!   that follows the allow is recorded as allowed with `sni` set and the rule `{rule} (sni {name}, another
 //!   name the policy allows)`;
+//! - a ClientHello with an encrypted-ClientHello extension whose outer server name **is** the destination passes as
+//!   an ordinary one: Chromium (Playwright, Puppeteer, curl-impersonate and the like) sends a placeholder (GREASE)
+//!   extension, type `0xfe0d`, with the real name in the clear on every hello, and the proxy cannot tell it from a
+//!   real one. The residual is a real ECH hello to an ECH-capable granted front whose public name is the
+//!   destination: its inner name is hidden (`docs/MONITOR.md` X4);
 //! - refused (nothing sent upstream, the tunnel closed, one more decision recorded as refused with the rule and
-//!   `sni` when there was one): an encrypted-ClientHello extension (`deny an encrypted ClientHello: the server
-//!   name is hidden from the proxy`), a ClientHello that cannot be read or is larger than 64 KiB, one that does not
+//!   `sni` when there was one): an encrypted-ClientHello extension with another outer name or none (`deny an
+//!   encrypted ClientHello whose outer server name is not the destination: the server name is hidden from the
+//!   proxy (browsers send a placeholder extension with the destination's own name, which passes)`), a ClientHello that cannot be read or is larger than 64 KiB, one that does not
 //!   arrive in full within the head timeout, no server name to a destination that is a name, a name the policy
 //!   denies, a name the veto closes.
 //!
@@ -151,14 +176,19 @@
 //! user of a session's grant; reference grants have random `reference-…` names no canary should take.
 //!
 //! ## Listeners (E4e)
-//! `set_listener_check(Some(f))` installs `f(session, addr) -> Option<rule>`, run on a blocking thread for each
-//! connection that reached a loopback or unspecified address (that is not one of the proxy's own ports) **after**
-//! the connect and before anything is recorded or sent: the process listening at `addr` is the one that accepted.
-//! `Some(rule)` refuses the connection like any policy refusal (`403`, the rule in the body and the record,
-//! the connection closed, the next address tried) so a lab port squatted by a sandboxed process of a session
-//! is never used. The runtime's check refuses a listener whose process is inside a loom sandbox identity
-//! (`loom_tools::sandbox::census::listener_in_sandbox`, TW-05). It costs a scan of this user's processes per
-//! loopback connection, so only loopback connections pay it.
+//! `set_listener_check(Some(f))` installs `f(session, addr, client) -> Option<rule>`, run on a blocking thread for
+//! each connection that reached an address of this machine (a loopback or unspecified address, or one of its own
+//! interface addresses given by `set_local_addrs`; never one of the proxy's own ports) **after** the connect and
+//! before anything is recorded or sent. `addr` is the address connected to (with the destination port) and `client`
+//! the local end of the connection the proxy opened: the process that holds the other end is the one the bytes
+//! reach, which the check finds by the accepted socket (so a squatter that closes its listening socket as it
+//! accepts is still found) and, failing that, by the listeners that cover `addr`. `Some(rule)` refuses the
+//! connection like any policy refusal (`403`, the rule in the body and the record, the connection closed, the next
+//! address tried) so a lab port squatted by a sandboxed process of another mission is never used. The runtime's
+//! check is `loom_tools::sandbox::census::listener_of` (TW-05): a holder attributed to a loom sandbox is refused
+//! unless it belongs to the connector's own mission; the operator's own services, a connection nobody holds and an
+//! unreadable table pass. The scans of the process table that run at once are bounded (4): the others wait their
+//! turn, so a swarm of loopback connections cannot starve the proxy's other work.
 //! `SessionGrant::env()` gives the variables to place in a command's environment so that ordinary
 //! clients use the proxy: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case forms, all
 //! `http://{user}:{password}@127.0.0.1:{port}` with the session's own port, plus `NO_PROXY`/`no_proxy` = ``
@@ -235,7 +265,13 @@
 //! run when the answer arrives, the answer equals an unknown user's byte for byte, the record is attributed to
 //! the listener's session and says nothing of a decoy, a run of them on the shared listener is never capped, a
 //! removed decoy is an unknown user. Listeners: a refusal names the rule in the `403` and the record, another
-//! loopback port passes, a forwarded request is checked too. `clienthello` has its own list.
+//! loopback port passes, a forwarded request is checked too, the check is given the local end of the connection, and
+//! this machine's own addresses are told apart from others. Hold: a hold sets the reference grant's policy too, so
+//! after a cut a reference connection is refused. Observer: a canary name refused by an allowlist, as a `CONNECT`, a
+//! check and a tunnel's server name, is seen by the observer. Veto: a check asks it for the resolved address. Server
+//! names: a placeholder encrypted hello naming the destination passes and one naming another host does not, an alert
+//! or a record of version `0.0` in front of a hello naming a denied name is refused with nothing sent upstream.
+//! `clienthello` has its own list.
 //!
 //! ## Audit
 //! `start_with` takes an audit hook ([`AuditFn`]), called on a blocking thread with the session (or
@@ -319,6 +355,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Addresses of one name that are examined; a name with more is cut here.
 const MAX_ADDRS: usize = 32;
+/// Lab-listener scans (of the process table) that run at once; the others wait for a turn.
+const MAX_SCANS: usize = 4;
 /// Tasks that answer connections over the limit of all sessions with a `503` the client can read.
 const REFUSALS: usize = 16;
 /// Records a minute of answers that name no granted session.
@@ -355,10 +393,15 @@ pub struct Dest<'a> {
 /// proxy's own tasks and must not block.
 pub type VetoFn = Arc<dyn Fn(&SessionId, &Dest<'_>) -> Option<String> + Send + Sync>;
 
-/// The lab-listener identity check (E4e, see *Listeners*): the session and the loopback address about to be used
-/// in, a refusal rule out when the process listening there is not one the session may reach. It runs on a blocking
-/// thread.
-pub type ListenerFn = Arc<dyn Fn(&SessionId, SocketAddr) -> Option<String> + Send + Sync>;
+/// The lab-listener identity check (E4e, see *Listeners*): the session, the address about to be used (on this
+/// machine) and the local end of the connection the proxy opened to it in, a refusal rule out when the process
+/// that holds the other end is not one the session may reach. It runs on a blocking thread.
+pub type ListenerFn = Arc<dyn Fn(&SessionId, SocketAddr, Option<SocketAddr>) -> Option<String> + Send + Sync>;
+
+/// Told of each request whose destination name the session's policy refused (see *Observing refusals*): the session
+/// and the destination (`resolved` is `None`; `sni` is the server name of a tunnel's hello when that is the name
+/// refused). It only observes: the answer is the policy's. It runs on the proxy's own tasks and must not block.
+pub type RefusalFn = Arc<dyn Fn(&SessionId, &Dest<'_>) + Send + Sync>;
 
 /// An authentication with a canary user (E4d, see *Canary users*).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -536,6 +579,11 @@ struct Shared {
     hooks: Mutex<Hooks>,
     /// Canary users (decoys in the session table) by user name, with their labels.
     canaries: Mutex<HashMap<String, String>>,
+    /// This machine's own interface addresses besides loopback (`Proxy::set_local_addrs`): a connection to one
+    /// is checked by the listener check as a loopback one is.
+    local_addrs: Mutex<Vec<IpAddr>>,
+    /// Lab-listener scans in flight (a scan reads the process table).
+    scans: Arc<Semaphore>,
 }
 
 #[derive(Default)]
@@ -543,6 +591,7 @@ struct Hooks {
     veto: Option<VetoFn>,
     listener: Option<ListenerFn>,
     canary: Option<CanaryFn>,
+    refused: Option<RefusalFn>,
 }
 
 /// One connection being served, as `cut_hosts` and `cut` see it.
@@ -635,6 +684,15 @@ impl Shared {
             return refused;
         }
         policy.check_addr(host, port, ip, name_rule)
+    }
+
+    /// Whether a connection to `ip` reaches this machine: a loopback or unspecified address, or one of its own
+    /// interface addresses (`Proxy::set_local_addrs`).
+    fn reaches_this_machine(&self, ip: IpAddr) -> bool {
+        is_local_literal(ip) || {
+            let ip = crate::policy::canonical_ip(ip);
+            lock(&self.local_addrs).iter().any(|a| crate::policy::canonical_ip(*a) == ip)
+        }
     }
 
     /// The refusal for an address that reaches one of the proxy's own ports, else `None`.
@@ -825,6 +883,8 @@ impl Proxy {
             cut_marks: Mutex::new(HashMap::new()),
             hooks: Mutex::new(Hooks::default()),
             canaries: Mutex::new(HashMap::new()),
+            local_addrs: Mutex::new(Vec::new()),
+            scans: semaphore(MAX_SCANS),
         });
         let cancel = CancellationToken::new();
         tokio::spawn(accept_loop(listener, shared.clone(), cancel.clone(), cancel.clone(), Origin::Shared));
@@ -909,6 +969,21 @@ impl Proxy {
         Ok(ReferenceGrant { grant: SessionGrant { port: self.inner.port, user, password }, raw_policy })
     }
 
+    /// Replaces the policy of **both** entries of a session, the command grant and its reference grant, with
+    /// `policy` (a hold: nothing new opens for the session, whichever credentials it presents), so that a cut
+    /// after it leaves nothing open and nothing new, in-process tools that follow redirects included. The
+    /// credentials stay. The reference entry keeps the hold until `grant_reference` mints it again or the session
+    /// is revoked. False when the session holds no grant.
+    pub fn hold(&self, session: &SessionId, policy: Policy) -> bool {
+        let policy = Arc::new(policy);
+        let mut any = false;
+        for entry in lock(&self.inner.shared.sessions).values_mut().filter(|e| &e.session == session) {
+            entry.policy = policy.clone();
+            any = true;
+        }
+        any
+    }
+
     /// Replace the policy of a session that holds a grant. Its credentials stay as they are. False
     /// when the session holds no grant.
     pub fn set_policy(&self, session: &SessionId, policy: Policy) -> bool {
@@ -981,6 +1056,17 @@ impl Proxy {
     /// Installs the lab-listener identity check (E4e, see *Listeners*); `None` removes it.
     pub fn set_listener_check(&self, check: Option<ListenerFn>) {
         lock(&self.inner.shared.hooks).listener = check;
+    }
+
+    /// Installs the observer of refused names (see *Observing refusals*); `None` removes it.
+    pub fn set_refusal_observer(&self, observer: Option<RefusalFn>) {
+        lock(&self.inner.shared.hooks).refused = observer;
+    }
+
+    /// Tells the proxy this machine's own interface addresses (LAN, tailnet, global IPv6), which the listener check
+    /// treats as loopback; the daemon refreshes them with its infrastructure.
+    pub fn set_local_addrs(&self, addrs: Vec<IpAddr>) {
+        *lock(&self.inner.shared.local_addrs) = addrs;
     }
 
     /// Installs the canary hook (E4d, see *Canary users*); `None` removes it.
@@ -1539,10 +1625,18 @@ impl Ctx<'_> {
 
     /// The refusal rule of the lab-listener identity check for a connection to the loopback address `ip`
     /// (see *Listeners*), `None` when there is no check or it finds nothing.
-    async fn listener_refusal(&self, ip: IpAddr) -> Option<String> {
+    async fn listener_refusal(&self, ip: IpAddr, client: Option<SocketAddr>) -> Option<String> {
         let hook = lock(&self.shared.hooks).listener.clone()?;
         let (session, addr) = (self.session.clone(), SocketAddr::new(ip, self.port));
-        tokio::task::spawn_blocking(move || hook(&session, addr)).await.ok().flatten().map(|r| cut(&r, 200))
+        // At most `MAX_SCANS` scans of the process table run at once; a swarm of loopback connections waits here.
+        let _turn = self.shared.scans.clone().acquire_owned().await.ok()?;
+        tokio::task::spawn_blocking(move || hook(&session, addr, client)).await.ok().flatten().map(|r| cut(&r, 200))
+    }
+
+    /// Tells the refusal observer that the policy refused the name `host`, or the server name `sni` of a tunnel.
+    fn observe_refusal(&self, sni: Option<&str>) {
+        let Some(hook) = lock(&self.shared.hooks).refused.clone() else { return };
+        hook(self.session, &Dest { host: self.host, port: self.port, method: self.method, resolved: None, sni });
     }
 
     /// Like `record`, for decisions that need no audit to succeed: a failure is only logged.
@@ -1658,6 +1752,7 @@ struct Allowed {
 async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<(TcpStream, Allowed), (&'static str, String)> {
     let v = policy.check_name(cx.host, cx.port);
     if !v.allowed {
+        cx.observe_refusal(None);
         cx.record_best_effort(false, v.rule.clone(), None).await;
         return Err(cx.refused(&v.rule));
     }
@@ -1698,9 +1793,10 @@ async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<(TcpStream, Allo
                     first_refusal.get_or_insert((refused.rule, ip));
                     continue;
                 }
-                // The process that accepted a connection to a loopback port is not a loom sandbox's.
-                if is_local_literal(ip) {
-                    if let Some(rule) = cx.listener_refusal(ip).await {
+                // The process that holds the other end of a connection to this machine is not another session's
+                // sandbox process.
+                if cx.shared.reaches_this_machine(ip) {
+                    if let Some(rule) = cx.listener_refusal(ip, s.local_addr().ok()).await {
                         drop(s);
                         first_refusal.get_or_insert((rule, ip));
                         continue;
@@ -1744,6 +1840,9 @@ async fn unreachable_decision(cx: &Ctx<'_>, rule: &str, ip: Option<IpAddr>, why:
 /// Answers a check (see *Checks*): the decision `open_upstream` would make, without connecting.
 async fn check(client: &mut TcpStream, cx: &Ctx<'_>, policy: &Policy, slot: OwnedSemaphorePermit) {
     let name = policy.check_name(cx.host, cx.port);
+    if !name.allowed {
+        cx.observe_refusal(None);
+    }
     // A vetoed destination is answered as `open_upstream` answers it, without a lookup.
     if name.allowed {
         if let Some(rule) = cx.veto(None, None) {
@@ -1766,6 +1865,15 @@ async fn check(client: &mut TcpStream, cx: &Ctx<'_>, policy: &Policy, slot: Owne
     } else {
         Ok((name.clone(), None))
     };
+    // The address the connect would use is asked of the veto too, as `open_upstream` asks it.
+    if let Ok((v, Some(ip))) = &found {
+        if v.allowed {
+            if let Some(rule) = cx.veto(Some(*ip), None) {
+                let (status, body) = cx.vetoed(&rule, Some(*ip), None).await;
+                return answer(client, cx.shared, slot, status, "", &body).await;
+            }
+        }
+    }
     let (allowed, rule, resolved, (status, body)) = match found {
         Ok((v, ip)) if v.allowed => {
             let body = format!("loom network policy: a connection to {} is allowed by rule `{}`.\n", cx.dest(), v.rule);
@@ -2028,8 +2136,13 @@ async fn bind_sni(client: &mut TcpStream, up: &TcpStream, mut first: Vec<u8>, cx
 
 /// The verdict on a complete ClientHello of a tunnel to `cx.host`.
 fn judge_sni(first: Vec<u8>, sni: Option<String>, ech: bool, cx: &Ctx<'_>, policy: &Policy) -> Bound {
-    if ech {
-        let rule = "deny an encrypted ClientHello: the server name is hidden from the proxy".to_string();
+    // Chromium sends a placeholder encrypted-ClientHello extension (GREASE) on every hello, with the real name in the
+    // clear: that one names the destination and passes. Any other hello that carries the extension is refused,
+    // because the proxy cannot tell a placeholder from a real one whose inner name is hidden.
+    let names_the_destination = sni.as_deref().is_some_and(|n| normalize_host(n) == normalize_host(cx.host));
+    if ech && !names_the_destination {
+        cx.observe_refusal(sni.as_deref());
+        let rule = "deny an encrypted ClientHello whose outer server name is not the destination: the server name is hidden from the proxy (browsers send a placeholder extension with the destination's own name, which passes)".to_string();
         return Bound::Refused(rule, sni);
     }
     let literal = cx.host.parse::<IpAddr>().is_ok();
@@ -2046,6 +2159,7 @@ fn judge_sni(first: Vec<u8>, sni: Option<String>, ech: bool, cx: &Ctx<'_>, polic
     }
     let verdict = policy.check_name(&name, cx.port);
     if !verdict.allowed {
+        cx.observe_refusal(Some(&name));
         let rule = format!("deny the server name {name}, which is not the destination {}: {}", cx.host, verdict.rule);
         return Bound::Refused(rule, Some(name));
     }
@@ -4278,6 +4392,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hold_also_holds_the_reference_grant_so_no_new_reference_connection_opens() {
+        let echo = echo_server().await;
+        let (p, _rx) = start().await;
+        let s = SessionId::from("s-hold-ref");
+        let g = p.grant(&s, lab()).unwrap();
+        let cfg = NetworkCfg {
+            mode: NetworkMode::Open,
+            reference_hosts: vec![format!("127.0.0.1:{echo}")],
+            allow_private: vec!["127.0.0.1".into()],
+            ..NetworkCfg::default()
+        };
+        let reference = p.grant_reference(&s, &cfg).unwrap();
+        let ref_connect = |port: u16| {
+            let auth = base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", reference.grant.user, reference.grant.password));
+            async move {
+                let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                let req = format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nProxy-Authorization: Basic {auth}\r\n\r\n");
+                c.write_all(req.as_bytes()).await.unwrap();
+                let mut resp = String::new();
+                let _ = timeout(T, c.read_to_string(&mut resp)).await;
+                status(&resp)
+            }
+        };
+        // A hop of an in-process GET that follows redirects opens a reference tunnel while nothing is held.
+        let mut open = TcpStream::connect(("127.0.0.1", reference.grant.port)).await.unwrap();
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", reference.grant.user, reference.grant.password));
+        open.write_all(
+            format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nProxy-Authorization: Basic {auth}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status(&read_until(&mut open, "\r\n\r\n").await), 200);
+        // The hold, then the cut: the next hop is refused, not let through by a stale reference policy.
+        assert!(p.hold(&s, policy(NetworkMode::DenyAll, &[], &[], &[])));
+        assert_eq!(p.cut(&s), 1);
+        assert_eq!(ref_connect(reference.grant.port).await, 403);
+        let mut fresh = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        fresh.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        let _ = timeout(T, fresh.read_to_string(&mut resp)).await;
+        assert_eq!(status(&resp), 403, "{resp}");
+        assert!(!p.hold(&SessionId::from("nobody"), lab()));
+    }
+
+    #[tokio::test]
+    async fn a_refused_canary_name_is_observed_in_every_path_whatever_the_policy_says() {
+        let (resolver, _) = loopback_resolver();
+        let (p, _rx, _seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let s = SessionId::from("s-observe");
+        // Deny-all but one granted name: every canary name is refused by the policy, never reaching the veto.
+        let g = p.grant(&s, policy(NetworkMode::Allowlist, &["granted.test"], &[], &["127.0.0.1"])).unwrap();
+        type Seen = Arc<Mutex<Vec<(String, String, Option<String>)>>>;
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        p.set_refusal_observer(Some(Arc::new(move |_: &SessionId, d: &Dest<'_>| {
+            lock(&log).push((d.host.to_string(), d.method.to_string(), d.sni.map(str::to_string)));
+        })));
+        p.set_veto(Some(Arc::new(|_: &SessionId, _: &Dest<'_>| None)));
+        // A CONNECT and a check of a name the allowlist refuses.
+        let mut c = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        c.write_all(connect_req(&g, "decoy.test:443").as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        timeout(T, c.read_to_string(&mut resp)).await.unwrap().unwrap();
+        assert_eq!(status(&resp), 403, "{resp}");
+        let mut c = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        c.write_all(format!("LOOM-CHECK decoy2.test:443 HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        timeout(T, c.read_to_string(&mut resp)).await.unwrap().unwrap();
+        assert_eq!(status(&resp), 403, "{resp}");
+        // The server name of a tunnel to the granted name that the allowlist refuses.
+        let echo = echo_server().await;
+        let mut c = tunnel_to(&g, &format!("granted.test:{echo}")).await;
+        c.write_all(&hello_for(Some("decoy3.test"), &[])).await.unwrap();
+        assert!(drained(&mut c, T).await.is_empty());
+        let seen = lock(&seen).clone();
+        assert!(seen.contains(&("decoy.test".into(), "CONNECT".into(), None)), "{seen:?}");
+        assert!(seen.contains(&("decoy2.test".into(), CHECK_METHOD.into(), None)), "{seen:?}");
+        assert!(seen.contains(&("granted.test".into(), "CONNECT".into(), Some("decoy3.test".into()))), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn this_machines_own_addresses_are_told_to_the_listener_check() {
+        let (p, _rx) = start().await;
+        let lan: IpAddr = "192.0.2.7".parse().unwrap();
+        let shared = &p.inner.shared;
+        assert!(shared.reaches_this_machine("127.0.0.1".parse().unwrap()));
+        assert!(shared.reaches_this_machine("::".parse().unwrap()));
+        assert!(!shared.reaches_this_machine(lan));
+        p.set_local_addrs(vec![lan, "::ffff:198.51.100.9".parse().unwrap()]);
+        assert!(shared.reaches_this_machine(lan));
+        assert!(shared.reaches_this_machine("198.51.100.9".parse().unwrap()));
+        assert!(!shared.reaches_this_machine("192.0.2.8".parse().unwrap()));
+    }
+
+    #[tokio::test]
     async fn the_veto_closes_a_destination_before_any_lookup_connect_or_byte() {
         let (server, got) = silent_server().await;
         let (resolver, lookups) = loopback_resolver();
@@ -4362,6 +4573,15 @@ mod tests {
         assert!(!rows[0].allowed && rows[0].resolved.as_deref() == Some("127.0.0.1"), "{rows:?}");
         // The destination was never connected to: its accept is still pending.
         assert!(timeout(Duration::from_millis(300), got).await.is_err());
+        // A check of the same destination is answered the same way, as the real connect would be.
+        let mut c = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        let req = format!("LOOM-CHECK 127.0.0.1:{server} HTTP/1.1\r\n{}\r\n", auth(&g));
+        c.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        timeout(T, c.read_to_string(&mut resp)).await.unwrap().unwrap();
+        assert_eq!(status(&resp), 502, "{resp}");
+        let last = lock(&seen).last().map(|(_, d)| d.clone()).unwrap();
+        assert!(!last.allowed && last.rule.starts_with("vetoed:") && last.rule.ends_with("(check only)"), "{last:?}");
     }
 
     /// The ClientHello bytes a client sends for `name` (`None`: no server name), with `extra` extensions.
@@ -4431,7 +4651,8 @@ mod tests {
         let s = SessionId::from("s-sni-bad");
         let g = p.grant(&s, lab()).unwrap();
         let cases: Vec<(&str, Vec<u8>, &str)> = vec![
-            ("ech", hello_for(Some("bound.test"), &[(0xfe0d, vec![0, 1])]), "encrypted ClientHello"),
+            ("ech", hello_for(Some("other.test"), &[(0xfe0d, vec![0, 1])]), "encrypted ClientHello"),
+            ("ech without a name", hello_for(None, &[(0xfe0d, vec![0, 1])]), "encrypted ClientHello"),
             ("no name", hello_for(None, &[]), "without a server name"),
             (
                 "two names",
@@ -4451,6 +4672,64 @@ mod tests {
             assert!(received.is_empty(), "{what}: the destination received {received:?}");
             let last = lock(&seen).last().map(|(_, d)| d.clone()).unwrap();
             assert!(!last.allowed && last.rule.contains(rule), "{what}: {last:?}");
+        }
+    }
+
+    /// The placeholder (GREASE) encrypted-ClientHello extension a Chromium hello carries: outer type, one KDF and
+    /// AEAD, a config id, a 32-byte encapsulated key and a payload of the usual padded size.
+    fn grease_ech() -> (u16, Vec<u8>) {
+        let mut d = vec![0u8, 0, 1, 0, 1, 0x5a, 0, 32];
+        d.extend([0xa5; 32]);
+        d.extend(144u16.to_be_bytes());
+        d.extend([0x3c; 144]);
+        (0xfe0d, d)
+    }
+
+    #[tokio::test]
+    async fn a_browsers_placeholder_encrypted_hello_naming_the_destination_passes() {
+        let echo = echo_server().await;
+        let (resolver, _) = loopback_resolver();
+        let (p, _rx, seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let g = p.grant(&SessionId::from("s-grease"), lab()).unwrap();
+        let hello = hello_for(Some("bound.test"), &[grease_ech()]);
+        let mut c = tunnel_to(&g, &format!("bound.test:{echo}")).await;
+        c.write_all(&hello).await.unwrap();
+        let mut back = vec![0u8; hello.len()];
+        timeout(T, c.read_exact(&mut back)).await.unwrap().unwrap();
+        assert_eq!(back, hello);
+        assert!(lock(&seen).iter().all(|(_, d)| d.allowed), "{:?}", lock(&seen));
+        // The same extension in front of a name that is not the destination is refused, nothing sent upstream.
+        let (server, got) = silent_server().await;
+        let mut c = tunnel_to(&g, &format!("bound.test:{server}")).await;
+        c.write_all(&hello_for(Some("front.test"), &[grease_ech()])).await.unwrap();
+        assert!(drained(&mut c, T).await.is_empty());
+        let (received, _) = timeout(T, got).await.unwrap().unwrap();
+        assert!(received.is_empty(), "{received:?}");
+    }
+
+    #[tokio::test]
+    async fn a_record_in_front_of_the_hello_does_not_hide_a_fronted_name() {
+        use crate::clienthello::fixtures::{message, record, sni_ext};
+        let (resolver, _) = loopback_resolver();
+        let (p, _rx, seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let g = p
+            .grant(&SessionId::from("s-alert"), policy(NetworkMode::Open, &[], &["evil.test"], &["127.0.0.1"]))
+            .unwrap();
+        let hello = record(&message(&[sni_ext(&["evil.test"])], true));
+        let mut skewed = hello.clone();
+        skewed[1] = 0;
+        skewed[2] = 0;
+        let mut alerted = vec![0x15, 3, 1, 0, 2, 1, 0x5a];
+        alerted.extend(&hello);
+        for (what, flight) in [("alert first", alerted), ("record version 0.0", skewed)] {
+            let (server, got) = silent_server().await;
+            let mut c = tunnel_to(&g, &format!("bound.test:{server}")).await;
+            c.write_all(&flight).await.unwrap();
+            assert!(drained(&mut c, T).await.is_empty(), "{what}");
+            let (received, _) = timeout(T, got).await.unwrap().unwrap();
+            assert!(received.is_empty(), "{what}: the destination received {received:?}");
+            let last = lock(&seen).last().map(|(_, d)| d.clone()).unwrap();
+            assert!(!last.allowed && last.rule.contains("cannot be read"), "{what}: {last:?}");
         }
     }
 
@@ -4686,7 +4965,9 @@ mod tests {
         let g = p.grant(&s, lab()).unwrap();
         let asked: Arc<Mutex<Vec<(String, SocketAddr)>>> = Arc::new(Mutex::new(Vec::new()));
         let log = asked.clone();
-        p.set_listener_check(Some(Arc::new(move |who: &SessionId, to: SocketAddr| {
+        p.set_listener_check(Some(Arc::new(move |who: &SessionId, to: SocketAddr, client: Option<SocketAddr>| {
+            // The local end of the connection the proxy opened is what names the process that holds the other end.
+            assert!(client.is_some_and(|c| c.ip().is_loopback() && c.port() != 0), "{client:?}");
             lock(&log).push((who.as_str().to_string(), to));
             (to.port() == echo).then(|| "deny a listener started inside a loom sandbox".to_string())
         })));

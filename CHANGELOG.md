@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Monitor E4 review fixes
+
+- **Server-name binding** reads a hello behind a TLS alert or change-cipher-spec, or in a record whose version is not 3.x, as
+  unreadable and refuses it (servers skip such records); a first byte outside `0x14..=0x17` or a second byte of `0x10` or more is
+  not TLS. An encrypted-ClientHello extension whose outer name is the destination passes (Chromium's placeholder), others are refused.
+- **Lab-listener identity** finds the process that holds the accepted socket of the connection (a one-shot squatter is named), then
+  every listener that covers the address (a decoy listener of the connector no longer masks another's), also for this machine's
+  interface addresses (`Proxy::set_local_addrs`), leaves out the connector's own mission, and bounds the scans (four at once; the
+  state lock is no longer held while session directories are resolved). `ListenerFn` and `listener_of` take the destination and the
+  local end of the connection; `procinfo::tcp_sockets` is new.
+- **Canary hosts** are S4 events in `deny_all` and allowlist missions too (`Proxy::set_refusal_observer`). Floor events are appended
+  to `logs/floor.jsonl`. The floor and the proxy no longer hold each other alive. A check asks the veto for the resolved address.
+  `Proxy::hold` holds the reference grant too. Box counters keep every window between installs and are not double counted.
+
 ### Monitor E4: proxy controls
 
 - **Cut.** `Proxy::cut(session)` / `cut_sessions` end every open tunnel and forwarded request of a session (reference grants'

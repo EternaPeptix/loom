@@ -20,6 +20,11 @@
 //!   process is gone, belongs to another user or is exiting). `split_procargs` is the macOS format's parser.
 //! - `listeners(pid)`: the TCP sockets in the listening state and the bound UDP sockets of a process
 //!   (`Listener { pid, proto, addr, port }`), empty when it has none or they cannot be read.
+//! - `tcp_sockets(pid)`: the TCP sockets of a process that are listening or established
+//!   (`Socket { pid, addr, port, peer_port, listening }`: the local address and port, and the remote port of an
+//!   established one, `0` for a listener). A process names the connection it accepted by it: the accepting side
+//!   of a connection from `client` to `dest` is the socket with `port == dest.port` and `peer_port ==
+//!   client.port`. Empty when it has none or they cannot be read.
 //! - `exe_path(pid)`: the path of the executable a process runs, when the kernel gives it.
 //! - `process_count()`: how many processes the machine has.
 //! - `user_tasks(uid)`: what RLIMIT_NPROC counts for `uid`: its processes (macOS) or its processes' threads
@@ -43,7 +48,7 @@
 //! Tests required: `a_process_is_described_by_the_kernel_and_a_gone_one_is_not`,
 //! `a_group_lists_its_members_with_zombies_flagged`, `a_command_line_is_read_without_ps`,
 //! `procargs_are_split_into_arguments_and_environment` (malformed input included),
-//! `a_listening_socket_is_found_by_its_process` (macOS and Linux), `the_pid_table_lists_this_process`,
+//! `a_listening_socket_is_found_by_its_process` and `an_accepted_connection_is_found_by_the_clients_port` (macOS and Linux), `the_pid_table_lists_this_process`,
 //! `the_nproc_limit_is_the_base_minus_the_headroom_whatever_exists` and
 //! `an_unreadable_table_reads_as_unknown_not_as_gone`.
 
@@ -95,6 +100,18 @@ pub struct Listener {
     pub port: u16,
 }
 
+/// A TCP socket of a process, listening or established; see `tcp_sockets`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Socket {
+    pub pid: u32,
+    /// The local address as text.
+    pub addr: String,
+    pub port: u16,
+    /// The remote port of an established socket; 0 for a listener.
+    pub peer_port: u16,
+    pub listening: bool,
+}
+
 #[cfg(test)]
 thread_local! {
     /// Makes the table unreadable on this thread, as a table the kernel refuses is.
@@ -144,7 +161,9 @@ mod sys {
     const OFF_KIND: usize = 256;
     const OFF_PROTO: usize = 264;
     // Within `in_sockinfo` (at OFF_PROTO): `insi_lport`, `insi_vflag`, `insi_laddr`; `tcpsi_state` follows it.
+    const IN_FPORT: usize = 0;
     const IN_LPORT: usize = 4;
+    const TSI_S_ESTABLISHED: i32 = 4;
     const IN_VFLAG: usize = 24;
     const IN_LADDR: usize = 48;
     const IN_SIZE: usize = 80;
@@ -336,7 +355,8 @@ mod sys {
         Some(Listener { pid, proto, addr, port })
     }
 
-    pub fn listeners(pid: u32) -> Vec<Listener> {
+    /// The descriptors of `pid` that are sockets.
+    fn socket_fds(pid: u32) -> Vec<i32> {
         let Some(p) = pid_arg(pid) else { return Vec::new() };
         // SAFETY: a null buffer asks for the size of the descriptor list.
         let need = unsafe { libc::proc_pidinfo(p, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
@@ -349,12 +369,57 @@ mod sys {
         // SAFETY: the buffer is `bytes` bytes of live, exclusively borrowed structs.
         let n = unsafe { libc::proc_pidinfo(p, libc::PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), bytes) };
         let count = usize::try_from(n).unwrap_or(0) / entry;
-        let mut out: Vec<Listener> = fds
-            .iter()
-            .take(count)
-            .filter(|f| f.proc_fdtype == libc::PROX_FDTYPE_SOCKET as u32)
-            .filter_map(|f| fd_listener(pid, f.proc_fd))
-            .collect();
+        fds.iter().take(count).filter(|f| f.proc_fdtype == libc::PROX_FDTYPE_SOCKET as u32).map(|f| f.proc_fd).collect()
+    }
+
+    pub fn listeners(pid: u32) -> Vec<Listener> {
+        let mut out: Vec<Listener> = socket_fds(pid).into_iter().filter_map(|fd| fd_listener(pid, fd)).collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// A listening or established TCP socket on descriptor `fd`.
+    fn fd_tcp(pid: u32, fd: i32) -> Option<Socket> {
+        let p = pid_arg(pid)?;
+        let mut buf = [0u8; SOCKET_INFO_BYTES];
+        let size = i32::try_from(SOCKET_INFO_BYTES).ok()?;
+        // SAFETY: the buffer is `size` writable bytes.
+        let n = unsafe { libc::proc_pidfdinfo(p, fd, PROC_PIDFDSOCKETINFO, buf.as_mut_ptr().cast(), size) };
+        let n = usize::try_from(n).ok().filter(|n| *n >= OFF_PROTO + IN_SIZE + 4)?;
+        let bytes = buf.get(..n)?;
+        if i32::from_ne_bytes(bytes.get(OFF_KIND..OFF_KIND + 4)?.try_into().ok()?) != SOCKINFO_TCP {
+            return None;
+        }
+        let state = i32::from_ne_bytes(bytes.get(OFF_PROTO + IN_SIZE..OFF_PROTO + IN_SIZE + 4)?.try_into().ok()?);
+        let listening = match state {
+            TSI_S_LISTEN => true,
+            TSI_S_ESTABLISHED => false,
+            _ => return None,
+        };
+        // Ports are kept in network byte order in the low 16 bits of an int.
+        let port_at = |at: usize| -> Option<u16> {
+            let raw = le_u32(bytes, OFF_PROTO + at)?;
+            Some(u16::from_be(u16::try_from(raw & 0xffff).ok()?))
+        };
+        let (port, peer_port) = (port_at(IN_LPORT)?, port_at(IN_FPORT)?);
+        if port == 0 {
+            return None;
+        }
+        let vflag = *bytes.get(OFF_PROTO + IN_VFLAG)?;
+        let laddr = bytes.get(OFF_PROTO + IN_LADDR..OFF_PROTO + IN_LADDR + 16)?;
+        let addr = if vflag & INI_IPV6 != 0 && vflag & INI_IPV4 == 0 {
+            let octets: [u8; 16] = laddr.try_into().ok()?;
+            std::net::Ipv6Addr::from(octets).to_string()
+        } else {
+            let octets: [u8; 4] = laddr.get(12..16)?.try_into().ok()?;
+            std::net::Ipv4Addr::from(octets).to_string()
+        };
+        Some(Socket { pid, addr, port, peer_port: if listening { 0 } else { peer_port }, listening })
+    }
+
+    pub fn tcp_sockets(pid: u32) -> Vec<Socket> {
+        let mut out: Vec<Socket> = socket_fds(pid).into_iter().filter_map(|fd| fd_tcp(pid, fd)).collect();
         out.sort();
         out.dedup();
         out
@@ -454,6 +519,62 @@ mod sys {
             .collect()
     }
 
+    /// The TCP sockets of `path` (`/proc/net/tcp` or `tcp6`) that listen (`0A`) or are established (`01`):
+    /// inode, local address, local port, remote port, listening.
+    fn tcp_table(path: &str, v6: bool) -> Vec<(u64, String, u16, u16, bool)> {
+        let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+        text.lines()
+            .skip(1)
+            .filter_map(|line| {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                let (local, remote, state, inode) = (f.get(1)?, f.get(2)?, f.get(3)?, f.get(9)?);
+                let listening = match *state {
+                    "0A" => true,
+                    "01" => false,
+                    _ => return None,
+                };
+                let (addr, port) = local.rsplit_once(':')?;
+                let port = u16::from_str_radix(port, 16).ok()?;
+                let peer_port = u16::from_str_radix(remote.rsplit_once(':')?.1, 16).ok()?;
+                let addr = if v6 {
+                    let mut octets = [0u8; 16];
+                    for (i, chunk) in octets.chunks_mut(4).enumerate() {
+                        let word = u32::from_str_radix(addr.get(i * 8..i * 8 + 8)?, 16).ok()?;
+                        chunk.copy_from_slice(&word.to_ne_bytes());
+                    }
+                    std::net::Ipv6Addr::from(octets).to_string()
+                } else {
+                    let word = u32::from_str_radix(addr, 16).ok()?;
+                    std::net::Ipv4Addr::from(word.to_ne_bytes()).to_string()
+                };
+                Some((inode.parse().ok()?, addr, port, if listening { 0 } else { peer_port }, listening))
+            })
+            .collect()
+    }
+
+    pub fn tcp_sockets(pid: u32) -> Vec<Socket> {
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { return Vec::new() };
+        let inodes: std::collections::BTreeSet<u64> = fds
+            .flatten()
+            .filter_map(|e| {
+                let target = std::fs::read_link(e.path()).ok()?;
+                let text = target.to_str()?;
+                text.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok()
+            })
+            .collect();
+        let mut out = Vec::new();
+        for (path, v6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
+            for (inode, addr, port, peer_port, listening) in tcp_table(path, v6) {
+                if inodes.contains(&inode) {
+                    out.push(Socket { pid, addr, port, peer_port, listening });
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     pub fn listeners(pid: u32) -> Vec<Listener> {
         let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { return Vec::new() };
         let inodes: std::collections::BTreeSet<u64> = fds
@@ -502,6 +623,9 @@ mod sys {
         None
     }
     pub fn listeners(_pid: u32) -> Vec<Listener> {
+        Vec::new()
+    }
+    pub fn tcp_sockets(_pid: u32) -> Vec<Socket> {
         Vec::new()
     }
 }
@@ -559,6 +683,11 @@ pub fn command_line(pid: u32) -> Option<CommandLine> {
 /// The listening TCP and bound UDP sockets of a process; see the contract.
 pub fn listeners(pid: u32) -> Vec<Listener> {
     sys::listeners(pid)
+}
+
+/// The listening and established TCP sockets of a process; see the contract.
+pub fn tcp_sockets(pid: u32) -> Vec<Socket> {
+    sys::tcp_sockets(pid)
 }
 
 /// How many processes exist.
@@ -799,6 +928,30 @@ mod tests {
         let found = listeners(std::process::id());
         assert!(!found.iter().any(|l| l.proto == Proto::Tcp && l.port == port), "{found:?}");
         assert_eq!(listeners(u32::MAX), Vec::new());
+    }
+
+    #[test]
+    fn an_accepted_connection_is_found_by_the_clients_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let client_port = client.local_addr().expect("addr").port();
+        let (accepted, _) = listener.accept().expect("accept");
+        let me = std::process::id();
+        let found = tcp_sockets(me);
+        assert!(found.iter().any(|s| s.listening && s.port == port && s.peer_port == 0), "{found:?}");
+        assert!(
+            found.iter().any(|s| !s.listening && s.port == port && s.peer_port == client_port && s.addr == "127.0.0.1"),
+            "the accepted end: {found:?}"
+        );
+        assert!(found.iter().any(|s| !s.listening && s.port == client_port && s.peer_port == port), "{found:?}");
+        // A listener closed after the accept leaves the accepted socket, which still names the process.
+        drop(listener);
+        let found = tcp_sockets(me);
+        assert!(!found.iter().any(|s| s.listening && s.port == port), "{found:?}");
+        assert!(found.iter().any(|s| !s.listening && s.port == port && s.peer_port == client_port), "{found:?}");
+        drop((client, accepted));
+        assert_eq!(tcp_sockets(u32::MAX), Vec::new());
     }
 
     #[test]

@@ -12,6 +12,6 @@ pub mod proxy;
 
 pub use policy::{InfraAddr, InfraSpec, Policy, Verdict};
 pub use proxy::{
-    AuditFn, CanaryFn, CanaryHit, Dest, Limits, ListenerFn, Proxy, ProxyError, ReferenceGrant, SessionGrant, VetoFn,
-    CHECK_METHOD, RULE_HEADER,
+    AuditFn, CanaryFn, CanaryHit, Dest, Limits, ListenerFn, Proxy, ProxyError, ReferenceGrant, RefusalFn, SessionGrant,
+    VetoFn, CHECK_METHOD, RULE_HEADER,
 };

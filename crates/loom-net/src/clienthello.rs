@@ -9,16 +9,23 @@
 //!
 //! `parse(buf) -> Hello`, over the bytes the client has sent so far:
 //! - `Hello::Empty`: no byte yet.
-//! - `Hello::NotTls`: the first byte is not a TLS handshake record (`0x16`) with a `3.x` version, so the stream is
-//!   not TLS (an SSH banner, a plain HTTP request, a binary protocol). There is no server name to bind.
+//! - `Hello::NotTls`: the stream does not start like a TLS record, so it is not TLS (an SSH banner, a plain HTTP
+//!   request, a binary protocol). There is no server name to bind. A stream starts like a TLS record when its
+//!   first byte is a record type (`0x14` to `0x17`: change-cipher-spec, alert, handshake, application data) and
+//!   its second byte, the major version, is below `0x10`: that is the test a Go `crypto/tls` server applies, and
+//!   BoringSSL and rustls accept a warning alert before the hello, so a stream that passes it may be read as TLS
+//!   by the server whatever the record's version says. Anything else is not TLS.
 //! - `Hello::Incomplete`: a TLS handshake record whose ClientHello is not all there yet (the record, or the
 //!   handshake message that spans several records, is cut). The caller reads more and parses again, up to
 //!   [`MAX_HELLO`] bytes.
 //! - `Hello::Malformed(why)`: a TLS handshake record that does not hold a well-formed ClientHello: the handshake is
 //!   not a ClientHello, a length does not fit, the extensions overrun the message, the `server_name` extension
 //!   appears twice or holds two host names or a name that is not a host name (letters, digits, `-`, `_` and `.`,
-//!   at most 253 bytes, labels of 1 to 63 bytes), or the handshake is split over a record of another type. A
-//!   caller refuses it: two parsers that read one hello differently are how a name is hidden.
+//!   at most 253 bytes, labels of 1 to 63 bytes), or the handshake is split over a record of another type, or the
+//!   stream starts like a TLS record (above) that is not a handshake record of version `3.x` (an alert, a
+//!   change-cipher-spec or application data before the hello, or a handshake record whose version is not `3.x`):
+//!   a server may skip such a record and read the hello behind it. A caller refuses it: two parsers that read one
+//!   hello differently are how a name is hidden.
 //! - `Hello::Tls { sni, ech }`: a complete ClientHello. `sni` is the host name in lower case without a trailing
 //!   dot, `None` when there is no `server_name` extension (or it lists no host name). `ech` is true when the hello
 //!   carries an encrypted-ClientHello extension (types `0xfe08` to `0xfe0d` and the earlier encrypted SNI
@@ -47,6 +54,11 @@ pub enum Hello {
 }
 
 const HANDSHAKE: u8 = 0x16;
+/// The record types a TLS stream may start with (change-cipher-spec, alert, handshake, application data).
+const RECORD_FIRST: u8 = 0x14;
+const RECORD_LAST: u8 = 0x17;
+/// A first record whose major version is at least this is not TLS framing (a Go server applies the same test).
+const MAJOR_LIMIT: u8 = 0x10;
 const CLIENT_HELLO: u8 = 0x01;
 const EXT_SERVER_NAME: u16 = 0;
 
@@ -94,8 +106,16 @@ impl<'a> Cur<'a> {
 /// Reads the ClientHello at the start of `buf`; see the module contract.
 pub fn parse(buf: &[u8]) -> Hello {
     let Some(first) = buf.first() else { return Hello::Empty };
-    if *first != HANDSHAKE {
+    if !(RECORD_FIRST..=RECORD_LAST).contains(first) {
         return Hello::NotTls;
+    }
+    // The second byte tells TLS framing from another protocol; one byte is not enough to say.
+    let Some(major) = buf.get(1) else { return Hello::Incomplete };
+    if *major >= MAJOR_LIMIT {
+        return Hello::NotTls;
+    }
+    if *first != HANDSHAKE {
+        return Hello::Malformed("the stream starts with a TLS record that is not a handshake record");
     }
     // The handshake message, joined from consecutive handshake records.
     let mut message: Vec<u8> = Vec::new();
@@ -109,7 +129,7 @@ pub fn parse(buf: &[u8]) -> Hello {
             usize::from(u16::from_be_bytes([header.get(3).copied().unwrap_or(0), header.get(4).copied().unwrap_or(0)])),
         );
         if at == 0 && major != 3 {
-            return Hello::NotTls;
+            return Hello::Malformed("the first TLS record has a version that is not 3.x");
         }
         if kind != HANDSHAKE || major != 3 {
             return Hello::Malformed("the ClientHello is continued in a record that is not a handshake record");
@@ -319,10 +339,9 @@ mod tests {
     fn what_is_not_a_hello_is_told_from_what_is_malformed() {
         assert_eq!(parse(b"GET / HTTP/1.1\r\n"), Hello::NotTls);
         assert_eq!(parse(b"SSH-2.0-OpenSSH_9\r\n"), Hello::NotTls);
-        // A handshake record of a version that is not 3.x is not TLS either.
-        assert_eq!(parse(&[0x16, 2, 0, 0, 5, 1, 2, 3, 4, 5]), Hello::NotTls);
-        // A TLS alert is not a handshake.
-        assert_eq!(parse(&[0x15, 3, 3, 0, 2, 2, 40]), Hello::NotTls);
+        // A first byte that is a record type followed by a byte of 0x10 or more is another protocol.
+        assert_eq!(parse(&[0x16, 0x20, 0, 0, 5, 1, 2, 3, 4, 5]), Hello::NotTls);
+        assert_eq!(parse(&[0x15, 0x80, 0, 0, 2, 2, 40]), Hello::NotTls);
         // A handshake that is not a ClientHello.
         let mut other = message(&[], false);
         other[0] = 2;
@@ -341,6 +360,30 @@ mod tests {
         mixed.extend((second.len() as u16).to_be_bytes());
         mixed.extend(second);
         assert!(matches!(parse(&mixed), Hello::Malformed(_)));
+    }
+
+    #[test]
+    fn a_record_in_front_of_the_hello_or_a_version_that_is_not_3_is_malformed() {
+        let hello = record(&message(&[sni_ext(&["evil.example.test"])], true));
+        // A warning alert, a change-cipher-spec and application data before the hello: a server may skip them.
+        for lead in [vec![0x15, 3, 1, 0, 2, 1, 0x5a], vec![0x14, 3, 3, 0, 1, 1], vec![0x17, 3, 3, 0, 1, 0]] {
+            let mut flight = lead.clone();
+            flight.extend(&hello);
+            let got = parse(&flight);
+            assert!(matches!(got, Hello::Malformed(_)), "{lead:?} gave {got:?}");
+            let alone = parse(&lead);
+            assert!(matches!(alone, Hello::Malformed(_)), "{lead:?} alone gave {alone:?}");
+        }
+        // A handshake record whose version is not 3.x (Go accepts any below 0x1000), whole hello behind it.
+        for version in [[0u8, 0], [1, 0], [2, 0], [0, 3]] {
+            let mut flight = hello.clone();
+            flight[1..3].copy_from_slice(&version);
+            let got = parse(&flight);
+            assert!(matches!(got, Hello::Malformed(_)), "{version:?} gave {got:?}");
+        }
+        // One byte of a record type is not enough to say.
+        assert_eq!(parse(&[0x15]), Hello::Incomplete);
+        assert_eq!(parse(&[0x16]), Hello::Incomplete);
     }
 
     #[test]

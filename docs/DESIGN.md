@@ -143,6 +143,7 @@ missions/<mid>/journal.head          its sealed head record
 logs/loomd.log                       the daemon's output when started by `loom up` or as a service
 logs/net-unattributed.jsonl          proxy answers that name no session, hash-chained
 logs/box-counters.jsonl              per-minute deltas of the packet counters of each mission box's egress rules
+logs/floor.jsonl                     the floor's events (decoy hits, vetoes, squatted lab ports), one JSON line each, synced
 ```
 
 Files made atomically (the token, the journal key) go through a synced temporary file

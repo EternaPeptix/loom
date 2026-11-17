@@ -160,10 +160,13 @@ sessions at once (also under a wildcard grant that covers it, `network.allow` an
 restart does not bring the host back. A host only a wildcard grant covers is revoked by revoking the wildcard.
 
 The proxy also looks at the name a command asks an HTTPS server for. A tunnel's TLS ClientHello must name the host the command
-connected to, or another host its policy allows; a hello that hides the name (encrypted ClientHello), cannot be read, or names
+connected to, or another host its policy allows; a hello that hides the name (an encrypted ClientHello naming another host),
+cannot be read (a TLS alert or a record with an odd version in front of it included), or names
 nothing for a host given by name is refused, and the refusal is recorded in the session's `net.jsonl` with the name it asked for
-(`sni`). Programs that are not TLS (ssh, plain HTTP) are not affected. A decoy host or a loom-internal address the daemon
-vetoes answers `502` ("closed to this mission by loom's own rules"), and a loopback lab port that another session's sandboxed
+(`sni`). Programs that are not TLS (ssh, plain HTTP) are not affected. Headless Chromium (Playwright, Puppeteer) sends a placeholder
+encrypted-ClientHello extension with the real name in the clear on every hello; that passes when the name is the host it connected to,
+so browsers work through the proxy without a switch. A decoy host or a loom-internal address the daemon
+vetoes answers `502` ("closed to this mission by loom's own rules"), and a lab port on this machine that another mission's sandboxed
 process listens on is refused with `403`. A grant
 the lead has not recorded yet is revoked without a ledger entry (`recorded: false`); run the revoke again once
 `loom ledger` lists the grant and it is recorded. `loom net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
@@ -535,8 +538,8 @@ the finish is then delivered at once, marked `not verified`.
 ## Files
 
 Under the loom home: `config.toml`, `token`, `daemon.json`, `daemon.lock`, `keys/`, `logs/loomd.log`,
-`logs/net-unattributed.jsonl` and `logs/box-counters.jsonl` (the box's per-rule packet counts, one line a minute per box that
-counted something), `packs/`, `blobs/` (stored outputs), `sessions/<id>/` (`log.jsonl`, `meta.json`, `status.json`, `jobs/`,
+`logs/net-unattributed.jsonl`, `logs/floor.jsonl` (decoy hits, vetoes and squatted lab ports, one line each) and
+`logs/box-counters.jsonl` (the box's per-rule packet counts, one line a minute per box that counted something), `packs/`, `blobs/` (stored outputs), `sessions/<id>/` (`log.jsonl`, `meta.json`, `status.json`, `jobs/`,
 `tmp/`, `queued/`, `net.jsonl`, and for a child `settlement.json` and, when it works in its own copy
 of the workspace, `copy.json`), `missions/<id>/` (`journal.jsonl`, `journal.head`). Session ids made
 of anything other than letters, digits, `-`, `_` and `.` never map to a path outside the home.

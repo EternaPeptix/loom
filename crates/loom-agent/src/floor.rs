@@ -10,9 +10,11 @@
 //! - `Floor::new(infrastructure)`: `infrastructure` is a policy built only from the daemon's infrastructure
 //!   (`Policy::new(default).with_infrastructure(spec)`), the same classes every session's policy refuses first
 //!   (`docs/MONITOR.md` E1). `set_infrastructure` replaces it when the daemon resolves its names again.
-//! - `install(proxy, probe)` puts the veto, the canary hook and, when `probe` is given, the listener check into the
-//!   proxy and keeps a handle on it for `add_canary_user`. `probe(port)` is `loom_tools::sandbox::census::listener_of`
-//!   over the sessions the daemon knows.
+//! - `install(proxy, probe)` puts the veto, the refusal observer, the canary hook and, when `probe` is given, the
+//!   listener check into the proxy and keeps a handle on it for `add_canary_user`. The hooks hold the floor weakly (the
+//!   proxy holds the hooks, the floor holds the proxy: neither keeps the other alive, so dropping the last handles of
+//!   both stops the proxy). `probe(session, to, client)` is `loom_tools::sandbox::census::listener_of` over the
+//!   sessions the daemon knows, with the connecting session's mission as `own`.
 //! - The **veto** (E4b) refuses, with the rule `closed by loom` and nothing else, a connection when (1) the
 //!   destination name or the TLS server name is a registered canary host (CN-4; matched case-insensitively, a trailing
 //!   dot removed, and `*.suffix` entries matching every name under them), event `CanaryHost`, severity S4, category
@@ -22,19 +24,30 @@
 //!   severity S3 (an attempt; TW-02), category `harness_attack`. Every session's own policy refuses these first
 //!   (`403`); the veto is the second line, for a policy that is stale (a session's is rebuilt at its next spawn,
 //!   grant or revoke) and for the canary hosts, which no policy knows. The rule text is a fixed class word because
-//!   the agent can read it in the net record; which class matched is in the event only.
+//!   the agent can read it in the net record; which class matched is in the event only. A veto raises its event
+//!   with a durable append (`set_log`) before it answers, which is a brief write on the proxy's task.
+//! - The **refusal observer** (CN-4 in every mode): the proxy tells it each request whose destination name, or whose
+//!   tunnel's server name, the session's own policy refused (`deny_all`, an allowlist miss, a deny rule: the default
+//!   modes). A canary host among the names raises the same `CanaryHost` event; the answer stays the policy's `403`.
+//!   A canary host the policy allowed reaches the veto instead, so each attempt is one event.
 //! - **Canary users** (E4d): `add_canary_user(user, label)` registers a decoy user in the proxy's session table (a
 //!   refused name is the proxy's sentence); `remove_canary_user`. Presenting one is the event `CanaryCredential`,
 //!   severity S4, category `credential_misuse`, attributed to the session whose listener received it, raised before
 //!   the answer is written. `add_canary_host(host, label)` / `remove_canary_host` register CN-4 names; a host that is
 //!   empty, longer than 253 bytes, an IP literal or contains anything but letters, digits, `-`, `_`, `.` (and a
 //!   leading `*.`) is refused with a sentence.
-//! - The **listener check** (E4e): for a connection that reached a loopback address, `probe(port)` says who listens.
-//!   `Sandboxed` by a session other than the connecting one is refused with the rule
-//!   `deny a listener started inside a loom sandbox on this port` and the event `Squatter` (severity S3, category
-//!   `covert_coordination`; TW-05); a listener of the connecting session itself (its own test server) is let
-//!   through, as is `Outside`, `Nobody` and `Unknown` (a process table that cannot be read is told by the census, and
-//!   a lab does not stop for it).
+//! - The **listener check** (E4e): for a connection that reached an address of this machine (loopback, unspecified or
+//!   one of its interface addresses), `probe(session, to, client)` says which process holds the other end (the census:
+//!   the process that holds the accepted socket of the connection, else every listener that covers the address).
+//!   `Sandboxed` is refused with the rule `deny a listener started inside a loom sandbox on this port` and the event
+//!   `Squatter` (severity S3, category `covert_coordination`; TW-05). The census leaves out the connector's own
+//!   mission (its lead, agents and copies: a lead's callback or payload server is its children's lab, not a
+//!   squatter) and reports a foreign holder even when an own one is listed first, so only another mission's
+//!   sandboxed process is refused. `Outside`, `Nobody` and `Unknown` (a process table that cannot be read is told by
+//!   the census, and a lab does not stop for it) are let through.
+//! - `set_log(path)`: every event is also appended as one JSON line to `path` (the daemon's `logs/floor.jsonl`) and
+//!   synced before the hook that raised it returns, so which label a decoy hit survives a restart and a flood of
+//!   later events; M2 reads it by cursor, and the ring below is only a cache of it.
 //! - `events()` is the last `EVENTS_KEPT` (1024) events, oldest first; `drain_events()` takes them. `set_notifier(f)`
 //!   calls `f(&event)` for each event of severity S4 at most once per label every 10 minutes, and for each S3 at most
 //!   once per (kind, session) every 10 minutes: an attempt repeated a hundred times is one notification. Events are
@@ -43,6 +56,9 @@
 //! Tests required: `a_canary_host_is_vetoed_by_name_by_server_name_and_by_suffix`,
 //! `an_infrastructure_class_is_vetoed_even_when_the_session_policy_is_stale`, `a_canary_user_through_the_real_proxy_fires_an_s4_event_before_the_answer`,
 //! `the_veto_and_the_hook_say_nothing_a_client_can_use`, `a_squatted_lab_port_is_refused_and_an_own_listener_is_not`,
+//! `a_canary_host_is_an_s4_event_in_deny_all_and_allowlist_missions_too`,
+//! `every_event_is_appended_to_the_log_before_the_hook_returns_and_outlives_the_ring`,
+//! `the_floor_and_the_proxy_do_not_keep_each_other_alive`,
 //! `events_are_kept_bounded_and_notified_once_per_label`, `bad_canary_names_are_refused`, `the_floor_is_installed_and_removed_cleanly`.
 
 use crate::monitor::taxonomy::{Category, Severity};
@@ -52,7 +68,8 @@ use loom_tools::sandbox::census::Listening;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 /// How many events are kept.
 pub const EVENTS_KEPT: usize = 1024;
@@ -89,8 +106,10 @@ pub struct FloorEvent {
     pub detail: String,
 }
 
-/// Who listens on a loopback port; `listener_of` over the daemon's sessions.
-pub type ListenerProbe = Arc<dyn Fn(u16) -> Listening + Send + Sync>;
+/// Who holds the other end of a connection of the session to an address of this machine: the connecting session, the
+/// address, and the local end of the connection (`listener_of` over the daemon's sessions, with the connector's own
+/// mission as `own`).
+pub type ListenerProbe = Arc<dyn Fn(&SessionId, SocketAddr, Option<SocketAddr>) -> Listening + Send + Sync>;
 /// Told about an event that deserves the operator's attention (see the contract).
 pub type Notifier = Arc<dyn Fn(&FloorEvent) + Send + Sync>;
 
@@ -101,6 +120,8 @@ struct Inner {
     told: Mutex<HashMap<String, u64>>,
     notifier: Mutex<Option<Notifier>>,
     proxy: Mutex<Option<Proxy>>,
+    /// Where each event is appended (`set_log`), synced before the hook that raised it returns.
+    log: Mutex<Option<PathBuf>>,
 }
 
 /// The title and text of the operator notification for `e` (kind `floor`). Plain sentences: what happened, where, and
@@ -152,6 +173,7 @@ impl Floor {
                 told: Mutex::new(HashMap::new()),
                 notifier: Mutex::new(None),
                 proxy: Mutex::new(None),
+                log: Mutex::new(None),
             }),
         }
     }
@@ -159,6 +181,12 @@ impl Floor {
     /// Replaces the infrastructure policy (the daemon resolved its names again).
     pub fn set_infrastructure(&self, infrastructure: Policy) {
         *self.inner.infra.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(infrastructure);
+    }
+
+    /// Appends every event, as a JSON line, to `path` (synced before the hook that raised it returns, so the
+    /// evidence survives a restart and a flood of later events); `None` stops.
+    pub fn set_log(&self, path: Option<PathBuf>) {
+        *lock(&self.inner.log) = path;
     }
 
     pub fn set_notifier(&self, notifier: Option<Notifier>) {
@@ -201,15 +229,31 @@ impl Floor {
         lock(&self.inner.proxy).as_ref().is_some_and(|p| p.remove_canary_user(user))
     }
 
-    /// Puts the veto, the canary hook and (with `probe`) the listener check into `proxy`.
+    /// Puts the veto, the refusal observer, the canary hook and (with `probe`) the listener check into `proxy`. The
+    /// hooks hold the floor weakly: the proxy holds them and the floor holds the proxy, and neither may keep the
+    /// other alive.
     pub fn install(&self, proxy: &Proxy, probe: Option<ListenerProbe>) {
-        let me = self.clone();
-        proxy.set_veto(Some(Arc::new(move |who: &SessionId, d: &Dest<'_>| me.veto(who, d))));
-        let me = self.clone();
-        proxy.set_canary_hook(Some(Arc::new(move |hit: &CanaryHit| me.canary_used(hit))));
-        let me = self.clone();
+        let weak: Weak<Inner> = Arc::downgrade(&self.inner);
+        let floor = move || weak.upgrade().map(|inner| Floor { inner });
+        let me = floor.clone();
+        proxy.set_veto(Some(Arc::new(move |who: &SessionId, d: &Dest<'_>| me().and_then(|f| f.veto(who, d)))));
+        let me = floor.clone();
+        proxy.set_refusal_observer(Some(Arc::new(move |who: &SessionId, d: &Dest<'_>| {
+            if let Some(f) = me() {
+                f.observe_refusal(who, d);
+            }
+        })));
+        let me = floor.clone();
+        proxy.set_canary_hook(Some(Arc::new(move |hit: &CanaryHit| {
+            if let Some(f) = me() {
+                f.canary_used(hit);
+            }
+        })));
+        let me = floor;
         proxy.set_listener_check(probe.map(|probe| {
-            Arc::new(move |who: &SessionId, to: SocketAddr| me.listener(&probe, who, to)) as loom_net::ListenerFn
+            Arc::new(move |who: &SessionId, to: SocketAddr, client: Option<SocketAddr>| {
+                me().and_then(|f| f.listener(&probe, who, to, client))
+            }) as loom_net::ListenerFn
         }));
         *lock(&self.inner.proxy) = Some(proxy.clone());
     }
@@ -252,13 +296,27 @@ impl Floor {
         d.sni.and_then(|sni| refused(policy.check_name(sni, d.port)))
     }
 
-    fn veto(&self, who: &SessionId, d: &Dest<'_>) -> Option<String> {
+    /// Raises the event of a canary host named by the destination or its server name; true when one was.
+    fn canary_named(&self, who: &SessionId, d: &Dest<'_>) -> bool {
         for name in std::iter::once(d.host).chain(d.sni) {
             if let Some(label) = self.canary_label(name) {
                 let detail = format!("{} {}:{} named the canary host {name}", d.method, d.host, d.port);
                 self.event(FloorKind::CanaryHost, Category::ScopeEscape, Severity::S4, Some(who), label, detail);
-                return Some(CLOSED.to_string());
+                return true;
             }
+        }
+        false
+    }
+
+    /// A request the session's policy refused (`deny_all`, an allowlist miss, a deny rule): the answer stays the
+    /// policy's, but a canary host among the names is still an S4 event, whatever the mode.
+    fn observe_refusal(&self, who: &SessionId, d: &Dest<'_>) {
+        self.canary_named(who, d);
+    }
+
+    fn veto(&self, who: &SessionId, d: &Dest<'_>) -> Option<String> {
+        if self.canary_named(who, d) {
+            return Some(CLOSED.to_string());
         }
         if let Some(rule) = self.infrastructure_class(d) {
             let to = d.resolved.map_or_else(|| d.host.to_string(), |ip| format!("{} ({ip})", d.host));
@@ -281,8 +339,14 @@ impl Floor {
         );
     }
 
-    fn listener(&self, probe: &ListenerProbe, who: &SessionId, to: SocketAddr) -> Option<String> {
-        match probe(to.port()) {
+    fn listener(
+        &self,
+        probe: &ListenerProbe,
+        who: &SessionId,
+        to: SocketAddr,
+        client: Option<SocketAddr>,
+    ) -> Option<String> {
+        match probe(who, to, client) {
             Listening::Sandboxed { session, .. } if session.as_deref() == Some(who.as_str()) => None,
             Listening::Sandboxed { pid, session, .. } => {
                 let owner = session.unwrap_or_else(|| "an unknown session".to_string());
@@ -292,6 +356,24 @@ impl Floor {
                 Some(SQUATTED.to_string())
             }
             Listening::Outside | Listening::Nobody | Listening::Unknown => None,
+        }
+    }
+
+    /// Appends `e` to the event log and syncs it; a failure is logged, the event is still kept in memory.
+    fn append(&self, e: &FloorEvent) {
+        let Some(path) = lock(&self.inner.log).clone() else { return };
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let line = serde_json::to_string(e).map_err(std::io::Error::other)?;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+            f.write_all(format!("{line}\n").as_bytes())?;
+            f.sync_data()
+        })();
+        if let Err(err) = written {
+            tracing::warn!("cannot append the floor event to {}: {err}", path.display());
         }
     }
 
@@ -334,6 +416,7 @@ impl Floor {
             }
             fresh
         });
+        self.append(&e);
         {
             let mut events = lock(&self.inner.events);
             if events.len() >= EVENTS_KEPT {
@@ -538,7 +621,12 @@ mod tests {
             own.local_addr().unwrap().port(),
             outside.local_addr().unwrap().port(),
         );
-        let probe: ListenerProbe = Arc::new(move |port| {
+        type Asked = Arc<Mutex<Vec<(String, SocketAddr, Option<SocketAddr>)>>>;
+        let asked: Asked = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        let probe: ListenerProbe = Arc::new(move |who, to, client| {
+            lock(&log).push((who.as_str().to_string(), to, client));
+            let port = to.port();
             let sandboxed = |s: &str| Listening::Sandboxed {
                 pid: 4242,
                 session: Some(s.to_string()),
@@ -582,6 +670,160 @@ mod tests {
             assert_eq!(&head, b"HTTP/1.1 200", "port {port}");
         }
         assert_eq!(floor.events().len(), 1);
+        // The probe was given the connecting session, the destination and the local end of the connection.
+        let asked = lock(&asked).clone();
+        assert!(asked.iter().all(|(who, to, client)| who == "s-lab"
+            && to.ip().is_loopback()
+            && client.is_some_and(|c| c.ip().is_loopback() && c.port() != to.port())));
+        assert_eq!(asked.len(), 3);
+    }
+
+    /// A ClientHello (one record) naming `name`.
+    fn hello(name: &str) -> Vec<u8> {
+        let mut list = vec![0u8];
+        list.extend((name.len() as u16).to_be_bytes());
+        list.extend(name.as_bytes());
+        let mut ext = (list.len() as u16).to_be_bytes().to_vec();
+        ext.extend(list);
+        let mut exts = vec![0u8, 0];
+        exts.extend((ext.len() as u16).to_be_bytes());
+        exts.extend(ext);
+        let mut body = vec![3u8, 3];
+        body.extend([7u8; 32]);
+        body.push(0);
+        body.extend([0, 2, 0x13, 0x01, 1, 0]);
+        body.extend((exts.len() as u16).to_be_bytes());
+        body.extend(exts);
+        let mut msg = vec![1u8, 0, (body.len() >> 8) as u8, body.len() as u8];
+        msg.extend(body);
+        let mut rec = vec![0x16u8, 3, 1];
+        rec.extend((msg.len() as u16).to_be_bytes());
+        rec.extend(msg);
+        rec
+    }
+
+    #[tokio::test]
+    async fn a_canary_host_is_an_s4_event_in_deny_all_and_allowlist_missions_too() {
+        let proxy = proxy().await;
+        let floor = Floor::new(infra());
+        floor.install(&proxy, None);
+        floor.add_canary_host("bait.canary.test", "CN-4 m1").unwrap();
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let allowlist = Policy::new(&NetworkCfg {
+            mode: NetworkMode::Allowlist,
+            allow: vec!["127.0.0.1".into()],
+            allow_private: vec!["127.0.0.1".into()],
+            ..NetworkCfg::default()
+        })
+        .unwrap();
+        for (what, policy) in [("deny_all", Policy::new(&NetworkCfg::default()).unwrap()), ("allowlist", allowlist)] {
+            let sid = SessionId::from(format!("s-canary-{what}").as_str());
+            let grant = proxy.grant(&sid, policy).unwrap();
+            let before = floor.events().len();
+            // A CONNECT to the decoy host: the policy answers 403, and the floor still saw the name.
+            let (code, resp) =
+                status_of(grant.port, &connect(&grant.user, &grant.password, "bait.canary.test:443")).await;
+            assert_eq!(code, 403, "{what}: {resp}");
+            // A check of it.
+            let auth = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", grant.user, grant.password));
+            let check =
+                format!("LOOM-CHECK bait.canary.test:443 HTTP/1.1\r\nProxy-Authorization: Basic {auth}\r\n\r\n");
+            assert_eq!(status_of(grant.port, &check).await.0, 403, "{what}");
+            let after = floor.events();
+            let mine: Vec<&FloorEvent> = after.iter().skip(before).collect();
+            assert_eq!(mine.len(), 2, "{what}: {mine:?}");
+            assert!(mine.iter().all(|e| {
+                e.kind == FloorKind::CanaryHost && e.severity == Severity::S4 && e.session.as_ref() == Some(&sid)
+            }));
+        }
+        // The server name of a tunnel to a granted address: refused by the allowlist, seen by the floor.
+        let sid = SessionId::from("s-canary-sni");
+        let allow = Policy::new(&NetworkCfg {
+            mode: NetworkMode::Allowlist,
+            allow: vec!["127.0.0.1".into()],
+            allow_private: vec!["127.0.0.1".into()],
+            ..NetworkCfg::default()
+        })
+        .unwrap();
+        let grant = proxy.grant(&sid, allow).unwrap();
+        let before = floor.events().len();
+        let mut s = TcpStream::connect(("127.0.0.1", grant.port)).await.unwrap();
+        s.write_all(connect(&grant.user, &grant.password, &format!("127.0.0.1:{echo_port}")).as_bytes()).await.unwrap();
+        let mut head = [0u8; 12];
+        tokio::time::timeout(std::time::Duration::from_secs(5), s.read_exact(&mut head)).await.unwrap().unwrap();
+        assert_eq!(&head, b"HTTP/1.1 200");
+        let mut rest = [0u8; 4];
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), s.read_exact(&mut rest)).await;
+        s.write_all(&hello("bait.canary.test")).await.unwrap();
+        let mut gone = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), s.read_to_end(&mut gone)).await;
+        let after = floor.events();
+        assert!(
+            after.iter().skip(before).any(|e| e.kind == FloorKind::CanaryHost && e.session.as_ref() == Some(&sid)),
+            "{:?}",
+            after.iter().skip(before).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn every_event_is_appended_to_the_log_before_the_hook_returns_and_outlives_the_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs").join("floor.jsonl");
+        let floor = Floor::new(infra());
+        floor.set_log(Some(path.clone()));
+        floor.add_canary_host("a.test", "label-a").unwrap();
+        floor.add_canary_host("b.test", "label-b").unwrap();
+        let who = SessionId::from("s-log");
+        let _ = floor.veto(&who, &dest("a.test", 80, None, None));
+        // The line is on disk already, as the hook returns.
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(first.lines().count(), 1, "{first}");
+        let row: serde_json::Value = serde_json::from_str(first.lines().next().unwrap()).unwrap();
+        assert_eq!(row["kind"], "canary_host");
+        assert_eq!(row["label"], "label-a");
+        assert_eq!(row["session"], "s-log");
+        // A flood of later events evicts it from the ring, not from the log.
+        for _ in 0..(EVENTS_KEPT + 10) {
+            let _ = floor.veto(&who, &dest("b.test", 80, None, None));
+        }
+        assert!(floor.events().iter().all(|e| e.label == "label-b"), "the ring lost the first event");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), EVENTS_KEPT + 11);
+        assert!(text.lines().next().unwrap().contains("label-a"));
+    }
+
+    #[tokio::test]
+    async fn the_floor_and_the_proxy_do_not_keep_each_other_alive() {
+        let proxy = proxy().await;
+        let port = proxy.port();
+        let floor = Floor::new(infra());
+        floor.install(&proxy, None);
+        assert!(TcpStream::connect(("127.0.0.1", port)).await.is_ok());
+        drop(proxy);
+        drop(floor);
+        // Every handle is gone: the proxy stops serving (its listener closes) instead of living on in a cycle.
+        let mut closed = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "the proxy still accepts after its last handle was dropped");
     }
 
     #[test]

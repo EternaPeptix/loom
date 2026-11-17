@@ -89,7 +89,10 @@
 //! `counter_deltas(previous, now)` is the arithmetic: a counter below its previous value means the chain was
 //! installed again (a grant changed) and counts from zero. The rules are installed with an explicit flush, so
 //! every install resets the counters; when a poll has happened before, the counters are read just before an
-//! install and banked, so what the box did since the last poll is reported by the next one, not lost. `Ok(None)` when the
+//! install and banked, so what the box did since the last poll is reported by the next one, not lost (every
+//! window between installs too, however many installs come between two polls). A poll and an install exclude each
+//! other from the read of the counters to the update of the baseline, so a reading of the old chain is never
+//! combined with the baseline of the new one. `Ok(None)` when the
 //! mission has no running box (nothing to poll), `Err` with a sentence when the helper cannot be run or the chain is
 //! missing. A paused box is polled too. The counters say how much, not what: the box has no per-connection
 //! record (`docs/MONITOR.md` X5).
@@ -154,7 +157,7 @@ use std::ffi::OsStr;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1227,6 +1230,11 @@ pub struct MissionBox {
     counted: StdMutex<BTreeMap<String, (u64, u64)>>,
     /// Deltas read just before the rules were installed again, for the next poll to report.
     banked: StdMutex<Vec<RuleCount>>,
+    /// Whether a poll has run: only then does an install read and bank the counters it is about to reset.
+    polling: AtomicBool,
+    /// Held by a poll from its read of the counters to its deltas, and by an install from its read to the reset of
+    /// the baseline, so a poll never combines a reading of the old chain with the baseline of the new one.
+    counter_gate: Mutex<()>,
 }
 
 impl MissionBox {
@@ -1244,6 +1252,8 @@ impl MissionBox {
             told: StdMutex::new(HashSet::new()),
             counted: StdMutex::new(BTreeMap::new()),
             banked: StdMutex::new(Vec::new()),
+            polling: AtomicBool::new(false),
+            counter_gate: Mutex::new(()),
         })
     }
 
@@ -1264,7 +1274,9 @@ impl MissionBox {
                 return Ok(None);
             }
         }
+        let _gate = self.counter_gate.lock().await;
         let now = self.read_counts().await?;
+        self.polling.store(true, Ordering::SeqCst);
         let banked = std::mem::take(&mut *self.banked.lock().unwrap_or_else(|p| p.into_inner()));
         let fresh = counter_deltas(&mut self.counted.lock().unwrap_or_else(|p| p.into_inner()), &now);
         let mut deltas: Vec<RuleCount> = Vec::new();
@@ -1323,8 +1335,8 @@ impl MissionBox {
         let text = rules_text(&self.names, &plan.allowed).into_bytes();
         // The install flushes the chain and so resets its counters: what they counted since the last poll is
         // read first (only once polling has begun), and banked for the next one.
-        let polled = !self.counted.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
-        if polled {
+        let _gate = self.counter_gate.lock().await;
+        if self.polling.load(Ordering::SeqCst) {
             if let Ok(now) = self.read_counts().await {
                 let fresh = counter_deltas(&mut self.counted.lock().unwrap_or_else(|p| p.into_inner()), &now);
                 self.banked.lock().unwrap_or_else(|p| p.into_inner()).extend(fresh);
@@ -3207,6 +3219,35 @@ exit 2
         // A torn-down box has nothing to poll.
         b.teardown().await;
         assert_eq!(b.poll_counters().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn counters_survive_two_installs_between_polls_and_a_poll_waits_for_an_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let b = MissionBox::new(f.host(), "m-1", source(&["203.0.113.7"]));
+        b.ready().await.unwrap();
+        let counters = f.dir.join(format!("counters-{}", b.names().chain));
+        let tcp = "ACCEPT tcp 203.0.113.7 tcp dpt:443";
+        let with = |packets: u64| COUNTERS.replace("       3      180", &format!("{packets:>8} {:>8}", packets * 60));
+        std::fs::write(&counters, with(3)).unwrap();
+        b.poll_counters().await.unwrap();
+        // The old chain counted 6 more, then an install; the new chain counted 4, then a second install; the
+        // newest chain counted 1: the poll reports every window, not only the first.
+        std::fs::write(&counters, with(9)).unwrap();
+        b.resync().await;
+        std::fs::write(&counters, with(4)).unwrap();
+        b.resync().await;
+        std::fs::write(&counters, with(1)).unwrap();
+        let after = b.poll_counters().await.unwrap().unwrap();
+        let row = after.iter().find(|r| r.rule == tcp).unwrap_or_else(|| panic!("{after:?}"));
+        assert_eq!((row.packets, row.bytes), (6 + 4 + 1, 660), "{after:?}");
+        // A poll and an install exclude each other: while one holds the gate the other waits.
+        let gate = b.counter_gate.lock().await;
+        let waiting = tokio::time::timeout(Duration::from_millis(300), b.poll_counters()).await;
+        assert!(waiting.is_err(), "a poll read the counters while an install held the gate");
+        drop(gate);
+        assert!(b.poll_counters().await.is_ok());
     }
 
     #[tokio::test]

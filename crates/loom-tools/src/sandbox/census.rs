@@ -72,19 +72,30 @@
 //! `kill_under(home, tmp)` is the same for what runs under a profile that may read `tmp` and not the home (the oracle's
 //! replay, once it has returned).
 //!
-//! ## `listener_of(home, sessions, port, confined)` (E4e)
-//! Who listens on loopback TCP `port` (an address of `127.0.0.0/8`, `::1` or the unspecified address), for the proxy's
-//! check that a lab port is not squatted by a sandboxed process: `Listening::Nobody` (no process of this table listens
-//! there), `Outside` (listeners found, none attributed to a loom sandbox: the operator's own service, which a lab
-//! target usually is), `Sandboxed { pid, session, via }` (a listener is attributed to a loom sandbox: by identity
-//! when `confined` and `probe().works`, `session` being the listed session whose temp dir its profile opens, or,
-//! for a sandbox no listed session matches, the session its `LOOM_SANDBOX_ID` names; without identity, by the
-//! variable alone; `session` is `None` only when an identity-attributed process names no session) and `Unknown` (the
-//! process table could not be read, so nothing is claimed). Attribution is the census's: a process under a profile
-//! that no session claims, and carries no mark, is not attributed (a sandboxed application of the operator's
-//! refuses the home too). When several processes listen (a shared port), any sandboxed one is reported. It reads
-//! every process's descriptors, so it costs a scan of the table: call it on a blocking thread, and only for
-//! loopback connections.
+//! ## `listener_of(home, sessions, to, client, confined, own)` (E4e)
+//! Who holds the other end of the proxy's connection to `to`, an address of this machine (loopback, unspecified or one
+//! of its interface addresses), for the proxy's check that a lab port is not squatted by a sandboxed process.
+//! `client` is the local end of the connection the proxy opened (its ephemeral port names the connection). The
+//! holders are, in this order: the processes that hold the **accepted** socket of that connection (a TCP socket
+//! whose local port is `to.port` and whose remote port is `client.port`), which are the processes the bytes reach
+//! whatever else listens, and so a squatter that closes its listening socket as it accepts is still named; when no
+//! process holds one (the connection waits in a backlog, or `client` is `None`), every process with a **listening**
+//! socket on `to.port` bound to `to.ip` or to the wildcard (a listener on another address of the machine does not
+//! answer the connection). `own` lists the sessions of the connector's own mission: a holder attributed to one of
+//! them is skipped, so a lead's callback server is not a squatter for its children, but a foreign holder is still
+//! reported when an own one is listed first, or later, in the table. Results: `Nobody` (no process holds the
+//! connection or listens there), `Outside` (holders found, none attributed to a loom sandbox of another mission: the
+//! operator's own service, which a lab target usually is, or the connector's own mission's), `Sandboxed { pid,
+//! session, via }` (the first holder attributed to a loom sandbox that is not `own`: by identity when `confined` and
+//! `probe().works`, `session` being the listed session whose temp dir its profile opens, or, for a sandbox no listed
+//! session matches, the session its `LOOM_SANDBOX_ID` names; without identity, by the variable alone; `session` is
+//! `None` only when an identity-attributed process names no session) and `Unknown` (the process table could not be
+//! read, so nothing is claimed). Attribution is the census's: a process under a profile that no session claims, and
+//! carries no mark, is not attributed (a sandboxed application of the operator's refuses the home too). Sandboxes
+//! run as this user, so every process that could hold such a socket is readable here: `Nobody` after a connection
+//! that succeeded means that the holder belongs to another user (a service of the machine), not to a sandbox. It
+//! reads every process's descriptors, so it costs a scan of the table: call it on a blocking thread, and only for
+//! connections to this machine (the proxy bounds the scans that run at once).
 //!
 //! Tests required (macOS with `sandbox-exec`; others skip): `an_identity_is_validated_and_marks_the_environment`,
 //! `the_identity_probe_works_on_this_host`, `a_probe_that_could_not_run_is_asked_again`,
@@ -94,11 +105,14 @@
 //! `the_census_lists_what_a_session_listens_on`, `a_pid_that_was_reused_is_not_signalled`,
 //! `without_identity_the_environment_and_the_groups_find_what_they_can`,
 //! `an_unconfined_daemon_does_not_claim_an_empty_census`, `an_unreadable_table_is_not_an_empty_one`,
-//! `a_listener_is_told_apart_by_the_profile_it_runs_under` and `an_unreadable_table_says_unknown_for_a_listener`.
+//! `a_listener_is_told_apart_by_the_profile_it_runs_under`, `a_one_shot_listener_is_found_by_the_connection_it_accepted`,
+//! `another_sessions_listener_is_found_behind_the_connectors_own_wildcard_listener`,
+//! `a_socket_covers_its_address_and_the_wildcard_and_no_other` and `an_unreadable_table_says_unknown_for_a_listener`.
 
 use crate::procinfo::{self, Listener};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -349,46 +363,75 @@ pub enum Listening {
     Unknown,
 }
 
-/// Whether `addr` (as `procinfo::Listener` prints it) is a loopback or unspecified address.
-fn is_local_text(addr: &str) -> bool {
-    addr.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+/// Whether a socket bound to `bound` (as `procinfo::Socket` prints it) answers a connection to `dest`: it is bound to
+/// that address, or to the wildcard.
+fn covers(bound: &str, dest: IpAddr) -> bool {
+    let Ok(bound) = bound.parse::<IpAddr>() else { return false };
+    let canon = |ip: IpAddr| match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 => v4,
+    };
+    let (bound, dest) = (canon(bound), canon(dest));
+    bound.is_unspecified() || bound == dest
 }
 
-/// Who listens on loopback TCP `port`; see the contract.
-pub fn listener_of(home: &Path, sessions: &[Member<'_>], port: u16, confined: bool) -> Listening {
+/// The session a sandboxed `pid` is attributed to, and how; `None` for a process that is not attributed to a loom
+/// sandbox (outside any, or under a profile no listed session claims and carrying no mark).
+fn attribute(pid: u32, identity: bool, home: &Path, sessions: &[Member<'_>]) -> Option<(Option<String>, Via)> {
+    if identity {
+        if !in_a_sandbox(pid, home) {
+            return None;
+        }
+        if let Some(m) = sessions.iter().find(|m| in_session(pid, m.tmp)) {
+            return Some((Some(m.id.to_string()), Via::Identity));
+        }
+    }
+    marked_session(pid).map(|mark| (Some(mark), Via::Environment))
+}
+
+/// Who holds the other end of a connection to `to` on this machine; see the contract.
+pub fn listener_of(
+    home: &Path,
+    sessions: &[Member<'_>],
+    to: SocketAddr,
+    client: Option<SocketAddr>,
+    confined: bool,
+    own: &[&str],
+) -> Listening {
     let Some(pids) = procinfo::pids() else { return Listening::Unknown };
     let identity = confined && probe().works;
-    let mut found = false;
+    // The processes that hold the accepted end of the connection, else every listener that covers `to`.
+    let (mut accepted, mut listening): (BTreeSet<u32>, BTreeSet<u32>) = (BTreeSet::new(), BTreeSet::new());
     for pid in pids {
         if pid <= 1 {
             continue;
         }
-        let listens = procinfo::listeners(pid)
-            .iter()
-            .any(|l| l.proto == procinfo::Proto::Tcp && l.port == port && is_local_text(&l.addr));
-        if !listens {
-            continue;
-        }
-        found = true;
-        if identity {
-            if !in_a_sandbox(pid, home) {
+        for socket in procinfo::tcp_sockets(pid) {
+            if socket.port != to.port() || !covers(&socket.addr, to.ip()) {
                 continue;
             }
-            if let Some(m) = sessions.iter().find(|m| in_session(pid, m.tmp)) {
-                return Listening::Sandboxed { pid, session: Some(m.id.to_string()), via: Via::Identity };
+            if socket.listening {
+                listening.insert(pid);
+            } else if client.is_some_and(|c| c.port() == socket.peer_port) {
+                accepted.insert(pid);
             }
-            if let Some(mark) = marked_session(pid) {
-                return Listening::Sandboxed { pid, session: Some(mark), via: Via::Environment };
-            }
-        } else if let Some(mark) = marked_session(pid) {
-            return Listening::Sandboxed { pid, session: Some(mark), via: Via::Environment };
         }
     }
-    if found {
-        Listening::Outside
-    } else {
-        Listening::Nobody
+    // A listener that closed after accepting is gone from the table but its accepted socket is not: the process
+    // that holds the connection is the one the bytes reach, whatever else listens there.
+    let holders = if accepted.is_empty() { listening } else { accepted };
+    if holders.is_empty() {
+        return Listening::Nobody;
     }
+    for pid in holders {
+        let Some((session, via)) = attribute(pid, identity, home, sessions) else { continue };
+        // The connector's own processes (its mission's) are not what the check looks for.
+        if session.as_deref().is_some_and(|s| own.contains(&s)) {
+            continue;
+        }
+        return Listening::Sandboxed { pid, session, via };
+    }
+    Listening::Outside
 }
 
 /// The census; see the contract.
@@ -923,7 +966,8 @@ mod tests {
         // The operator's own service: this process.
         let own = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let own_port = own.local_addr().expect("addr").port();
-        let ours = |port: u16| listener_of(&home, &members, port, true);
+        let at = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        let ours = |port: u16| listener_of(&home, &members, at(port), None, true, &[]);
         match ours(plain_port) {
             Listening::Sandboxed { session, via, .. } => {
                 assert_eq!(session.as_deref(), Some("s-listen-1"));
@@ -944,22 +988,121 @@ mod tests {
         assert_eq!(ours(free), Listening::Nobody);
         // A sandbox that no listed session claims and that carries no mark is not attributed: only the first
         // session is listed here, so the second's listener without its variable reads as outside.
-        assert_eq!(listener_of(&home, &members[..1], cleared_port, true), Listening::Outside);
+        assert_eq!(listener_of(&home, &members[..1], at(cleared_port), None, true, &[]), Listening::Outside);
         // Without identity (the daemon runs commands unconfined) only the variable tells, so a cleared
         // environment is missed: the stated limit of the fallback.
         assert!(matches!(
-            listener_of(&home, &members, plain_port, false),
+            listener_of(&home, &members, at(plain_port), None, false, &[]),
             Listening::Sandboxed { via: Via::Environment, .. }
         ));
-        assert_eq!(listener_of(&home, &members, cleared_port, false), Listening::Outside);
+        assert_eq!(listener_of(&home, &members, at(cleared_port), None, false, &[]), Listening::Outside);
         assert!(kill(&rig.home, &members, &[], &[], true).left.is_empty());
+    }
+
+    /// Starts a perl listener under `sb` on `bind`:`port` (0: any), with SO_REUSEADDR; with `one_shot` it accepts one
+    /// connection, closes its listening socket and keeps the accepted one. Returns the port.
+    fn listen_on(rig: &mut Rig, sb: &Sandbox, tmp: &Path, bind: &str, port: u16, one_shot: bool) -> u16 {
+        let port_file = tmp.join(format!("port-{}", rig.spawned.len()));
+        let after = if one_shot { "$c=$s->accept; close $s; sleep 60;" } else { "sleep 60;" };
+        let script = format!(
+            "/usr/bin/perl -MIO::Socket::INET -e '$s=IO::Socket::INET->new(Listen=>5,LocalAddr=>\"{bind}\",\
+             LocalPort=>{port},Proto=>\"tcp\",ReuseAddr=>1) or die; open F,\">{}\"; print F $s->sockport; close F; {after}'",
+            port_file.display()
+        );
+        rig.run(sb, &script, false);
+        for _ in 0..100 {
+            if let Some(p) = std::fs::read_to_string(&port_file).ok().and_then(|t| t.trim().parse().ok()) {
+                return p;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the listener did not start");
+    }
+
+    #[test]
+    fn a_one_shot_listener_is_found_by_the_connection_it_accepted() {
+        if !available() {
+            return;
+        }
+        let mut rig = Rig::new();
+        let squatter = rig.sandbox("s-shot-1");
+        let tmp = rig.tmp("s-shot-1");
+        let members = [Member { id: "s-shot-1", tmp: &tmp }];
+        let home = rig.home.clone();
+        let port = listen_on(&mut rig, &squatter, &tmp, "127.0.0.1", 0, true);
+        let to = SocketAddr::from(([127, 0, 0, 1], port));
+        let client = std::net::TcpStream::connect(to).expect("connect");
+        let me = client.local_addr().expect("addr");
+        // The squatter accepts and closes its listening socket; only the accepted socket names it from then on.
+        let mut found = Listening::Nobody;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            let listening = procinfo::pids()
+                .unwrap_or_default()
+                .into_iter()
+                .any(|p| procinfo::tcp_sockets(p).iter().any(|s| s.listening && s.port == port));
+            found = listener_of(&home, &members, to, Some(me), true, &[]);
+            if !listening {
+                break;
+            }
+        }
+        match found {
+            Listening::Sandboxed { session, via, .. } => {
+                assert_eq!(session.as_deref(), Some("s-shot-1"));
+                assert_eq!(via, Via::Identity);
+            }
+            other => panic!("a one-shot squatter was read as {other:?}"),
+        }
+        // Without the connection's end the listener, if it still listened, would be all there is: nobody now.
+        assert_eq!(listener_of(&home, &members, to, None, true, &[]), Listening::Nobody);
+        // The connector's own mission's processes are not what the check looks for.
+        assert_eq!(listener_of(&home, &members, to, Some(me), true, &["s-shot-1"]), Listening::Outside);
+        assert!(kill(&rig.home, &members, &[], &[], true).left.is_empty());
+    }
+
+    #[test]
+    fn another_sessions_listener_is_found_behind_the_connectors_own_wildcard_listener() {
+        if !available() {
+            return;
+        }
+        let mut rig = Rig::new();
+        let (squat, decoy) = (rig.sandbox("s-wild-b"), rig.sandbox("s-wild-a"));
+        let (tmp_b, tmp_a) = (rig.tmp("s-wild-b"), rig.tmp("s-wild-a"));
+        let members = [Member { id: "s-wild-a", tmp: &tmp_a }, Member { id: "s-wild-b", tmp: &tmp_b }];
+        let home = rig.home.clone();
+        // B listens on the loopback address; A, the connector, listens on the wildcard of the same port.
+        let port = listen_on(&mut rig, &squat, &tmp_b, "127.0.0.1", 0, false);
+        listen_on(&mut rig, &decoy, &tmp_a, "0.0.0.0", port, false);
+        let to = SocketAddr::from(([127, 0, 0, 1], port));
+        // Whichever listener the table lists first, B's is reported and A's own is not an excuse.
+        match listener_of(&home, &members, to, None, true, &["s-wild-a"]) {
+            Listening::Sandboxed { session, .. } => assert_eq!(session.as_deref(), Some("s-wild-b")),
+            other => panic!("the squatter was masked: {other:?}"),
+        }
+        // A listener on another address of the machine does not answer a connection to this one.
+        let elsewhere = SocketAddr::from(([127, 0, 0, 2], port));
+        assert_eq!(listener_of(&home, &members, elsewhere, None, true, &["s-wild-a"]), Listening::Outside);
+        assert!(kill(&rig.home, &members, &[], &[], true).left.is_empty());
+    }
+
+    #[test]
+    fn a_socket_covers_its_address_and_the_wildcard_and_no_other() {
+        let ip = |s: &str| s.parse::<IpAddr>().expect("ip");
+        assert!(covers("127.0.0.1", ip("127.0.0.1")));
+        assert!(covers("0.0.0.0", ip("127.0.0.1")));
+        assert!(covers("::", ip("::1")));
+        assert!(covers("::ffff:127.0.0.1", ip("127.0.0.1")));
+        assert!(covers("192.168.0.2", ip("::ffff:192.168.0.2")));
+        assert!(!covers("127.0.0.2", ip("127.0.0.1")));
+        assert!(!covers("192.168.0.2", ip("127.0.0.1")));
+        assert!(!covers("not an address", ip("127.0.0.1")));
     }
 
     #[test]
     fn an_unreadable_table_says_unknown_for_a_listener() {
         let home = std::env::temp_dir();
         procinfo::UNREADABLE.with(|u| u.set(true));
-        let got = listener_of(&home, &[], 1, true);
+        let got = listener_of(&home, &[], SocketAddr::from(([127, 0, 0, 1], 1)), None, true, &[]);
         procinfo::UNREADABLE.with(|u| u.set(false));
         assert_eq!(got, Listening::Unknown);
     }
