@@ -11,8 +11,8 @@
 //! the review-input rules (`input`), the verdict schema (`reviewer`), lineage and eligibility (`lineage`, M1), the
 //! response ladder (`respond`), keep-going's parameters and conditions (`keepgoing`), canaries (`canary`), the
 //! operator-authored authorization block (`auth`) and the fixed sentences the agent may see (`sentences`).
-//! **M2 makes the monitor watch and nothing else.** The daemon builds one `Monitor` per loom home at start (when
-//! `[monitor] enabled`, the default), folds its log before any session is activated, and runs every tripwire over every
+//! **M2 makes the monitor watch and nothing else.** The daemon builds one `Monitor` per loom home at start (with
+//! `[monitor] enabled = false` it keeps only the precision-list, S4 and canary tripwires, which have no off switch), folds its log before any session is activated, and runs every tripwire over every
 //! record of every session in **shadow**: findings are recorded in `<home>/monitor/log.jsonl`, shown by
 //! `GET /api/monitor`, `GET /api/missions/{id}/monitor`, `loom monitor status|log|replay`, and nothing changes for an
 //! agent: no note, no refusal, no hold, no pause, no notification. The functions that later phases fill (the reviewer, the
@@ -62,7 +62,14 @@
 //! ## Tests required
 //! Each submodule's own list. In `mod.rs`: `not_built_names_the_phase`; `not_built_is_a_fault_not_a_verdict`; the
 //! `Monitor` handle: `a_monitor_watches_a_home_and_shows_it`, `a_down_monitor_says_why_and_reads_nothing`,
-//! `the_worker_pumps_when_woken`, `entries_are_filtered_by_mission_and_paged`, `a_disabled_monitor_builds_nothing`.
+//! `the_worker_pumps_when_woken`, `entries_are_filtered_by_mission_and_paged`, `a_disabled_monitor_keeps_the_causes_that_have_no_off_switch`,
+//! `status_does_not_wait_for_a_pump_and_a_stalled_worker_is_degraded`.
+//!
+//! ## The handle
+//! `status()` reads a snapshot the worker publishes at the end of each pass, so a status request, the census and the
+//! egress probe never wait for a pass (which holds the core). The snapshot says `degraded` when its heartbeat is older
+//! than `STALE_HEARTBEAT_MS` (the worker is not running) and, after a failed log write that later works again,
+//! `down` is lifted.
 
 pub mod auth;
 pub mod canary;
@@ -139,11 +146,19 @@ struct Shared {
     cfg: loom_core::config::MonitorCfg,
     core: std::sync::Mutex<Option<core::Core>>,
     down: std::sync::Mutex<Option<String>>,
+    /// The status as the last pass left it (read without taking the core).
+    status: std::sync::Mutex<Option<core::MonitorStatus>>,
+    /// The latest census and egress verdict, applied at the start of the next pass.
+    census: std::sync::Mutex<Option<crate::census::CensusView>>,
+    egress: std::sync::Mutex<Option<bool>>,
     hints: std::sync::Mutex<std::collections::BTreeSet<String>>,
     notify: tokio::sync::Notify,
     stop: std::sync::atomic::AtomicBool,
     last_full: std::sync::atomic::AtomicU64,
 }
+
+/// A snapshot older than this means the worker is not running.
+pub const STALE_HEARTBEAT_MS: u64 = 30_000;
 
 fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -190,12 +205,16 @@ impl Monitor {
         core: Option<core::Core>,
         down: Option<String>,
     ) -> Monitor {
+        let status = core.as_ref().map(|c| c.status(cfg.enabled, "shadow"));
         Monitor {
             shared: std::sync::Arc::new(Shared {
                 paths: paths.clone(),
                 cfg: cfg.clone(),
                 core: std::sync::Mutex::new(core),
                 down: std::sync::Mutex::new(down),
+                status: std::sync::Mutex::new(status),
+                census: std::sync::Mutex::new(None),
+                egress: std::sync::Mutex::new(None),
                 hints: std::sync::Mutex::new(std::collections::BTreeSet::new()),
                 notify: tokio::sync::Notify::new(),
                 stop: std::sync::atomic::AtomicBool::new(false),
@@ -223,13 +242,16 @@ impl Monitor {
         let hints = std::mem::take(&mut *lock(&self.shared.hints));
         let mut guard = lock(&self.shared.core);
         let Some(core) = guard.as_mut() else { return false };
-        let was_down = core.is_down().is_some();
-        let progress = core.pump(now, &hints, full);
-        if !was_down {
-            if let Some(why) = core.is_down() {
-                *lock(&self.shared.down) = Some(why.to_string());
-            }
+        if let Some(unbounded) = lock(&self.shared.egress).take() {
+            core.set_egress_unbounded(unbounded);
         }
+        if let Some(view) = lock(&self.shared.census).take() {
+            core.census(&view, now);
+        }
+        let progress = core.pump(now, &hints, full);
+        // The reason follows the core: a log that takes writes again lifts it.
+        *lock(&self.shared.down) = core.is_down().map(str::to_string);
+        *lock(&self.shared.status) = Some(core.status(self.shared.cfg.enabled, "shadow"));
         progress
     }
 
@@ -269,12 +291,22 @@ impl Monitor {
         self.shared.notify.notify_one();
     }
 
-    /// The monitor's status.
+    /// The monitor's status (the snapshot of the last pass; see the contract).
     pub fn status(&self) -> core::MonitorStatus {
         let mode = "shadow";
-        let guard = lock(&self.shared.core);
-        match guard.as_ref() {
-            Some(c) => c.status(self.shared.cfg.enabled, mode),
+        let snap = lock(&self.shared.status).clone();
+        match snap {
+            Some(mut st) => {
+                let age = loom_core::now_ms().saturating_sub(st.heartbeat_ms);
+                if st.heartbeat_ms > 0 && age > STALE_HEARTBEAT_MS && st.state != "down" {
+                    st.state = "degraded".into();
+                    st.faults.push(format!(
+                        "The monitor's worker has not run for {} s. Restart the daemon if this does not clear.",
+                        age / 1000
+                    ));
+                }
+                st
+            }
             None => core::MonitorStatus {
                 state: "down".into(),
                 mode: mode.into(),
@@ -298,18 +330,17 @@ impl Monitor {
         }
     }
 
-    /// The last process census, from the runtime (TW-20, the fleet's listeners).
+    /// The last process census, from the runtime (TW-20, the fleet's listeners). Applied at the start of the next pass.
     pub fn census(&self, view: &crate::census::CensusView) {
-        if let Some(c) = lock(&self.shared.core).as_mut() {
-            c.census(view, loom_core::now_ms());
-        }
+        *lock(&self.shared.census) = Some(view.clone());
+        self.shared.notify.notify_one();
     }
 
-    /// Whether commands can reach the network outside the proxy, as the last self-probe found it.
+    /// Whether commands can reach the network outside the proxy, as the last self-probe found it. Applied at the start
+    /// of the next pass.
     pub fn egress(&self, unbounded: bool) {
-        if let Some(c) = lock(&self.shared.core).as_mut() {
-            c.set_egress_unbounded(unbounded);
-        }
+        *lock(&self.shared.egress) = Some(unbounded);
+        self.shared.notify.notify_one();
     }
 
     /// A page of the monitor log (see `LogFilter`). The log is read from disk, so a down monitor still shows it.
@@ -529,14 +560,45 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_monitor_builds_nothing() {
+    fn a_disabled_monitor_keeps_the_causes_that_have_no_off_switch() {
         let (_d, paths) = fixture();
         let cfg = MonitorCfg { enabled: false, ..MonitorCfg::default() };
         let m = Monitor::start(&paths, &cfg, env_of(&paths), None).expect("start");
+        m.pump_now(true);
         let _s = session_with(&paths, "s-1", "m-1", "ps eww 7");
-        assert!(!m.pump_now(true));
-        assert!(!m.status().enabled);
-        assert_eq!(m.status().counts.records, 0);
+        m.pump_now(true);
+        let st = m.status();
+        assert!(!st.enabled);
+        assert_eq!(st.tripwires.iter().find(|t| t.id == "TW-10").map(|t| t.fired), Some(1), "the precision list runs");
+    }
+
+    #[test]
+    fn status_does_not_wait_for_a_pump_and_a_stalled_worker_is_degraded() {
+        let (_d, paths) = fixture();
+        let m = Monitor::start(&paths, &MonitorCfg::default(), env_of(&paths), None).expect("start");
+        m.pump_now(true);
+        // A pass holds the core; the status is the snapshot it left, and a census waits for the next pass.
+        let held = lock(&m.shared.core);
+        let st = m.status();
+        assert_eq!(st.state, "shadow");
+        m.census(&crate::census::CensusView {
+            taken_ms: 1,
+            readable: false,
+            identity: false,
+            identity_detail: String::new(),
+            sessions: Default::default(),
+        });
+        m.egress(true);
+        drop(held);
+        m.pump_now(true);
+        assert!(m.status().egress_unbounded, "applied at the start of the next pass");
+        // A snapshot whose heartbeat is old means the worker is not running.
+        if let Some(snap) = lock(&m.shared.status).as_mut() {
+            snap.heartbeat_ms = 1_000;
+        }
+        let st = m.status();
+        assert_eq!(st.state, "degraded");
+        assert!(st.faults.iter().any(|f| f.contains("worker has not run")), "{:?}", st.faults);
     }
 
     #[tokio::test]

@@ -17,16 +17,21 @@
 //!
 //! - M2 builds the joins over `FleetBook`, which the engine and the core feed as they read records; `joins(now)` runs
 //!   all ten and returns the `FleetHit`s that are new since the last run (a hit is reported once per key). Each join
-//!   states its own thresholds in its function: FS-1 a path written by one mission and read by another that did not
-//!   write it (or a loopback port that one mission listens on and another connected to), R5 when the channel runs both
-//!   ways between two missions; FS-2 a token of 16 to 64 characters, with a digit and a letter, that is not a hash and
+//!   states its own thresholds in its function: FS-1 a path written by one mission and read by another, unless the
+//!   reader's own write is the later one (it reads its own output; or a loopback port that one mission listens on and
+//!   another connected to), R5 when the channel runs both ways between two missions (a board over one file counts both
+//!   ways, and a finding that grows is reported again; reads and writes are kept per path and mission, so one mission
+//!   reading its own file many times hides nobody's read); FS-2 a token of 16 to 64 characters, with a digit and a letter, that is not a hash and
 //!   has at most 3 occurrences in all, in two missions within 24 h; FS-3 an idle-egress decision (TW-21) whose host
 //!   another mission's call named within 2 s (R5); FS-4 three missions that reached a host none of them was granted
 //!   within 30 minutes (a notification and an L4 review, never R5); FS-5 30 refused connections of one mission in 5
 //!   minutes or 10 new hosts in 10 minutes; FS-6 one port listened on by two missions within 5 minutes; FS-7 three
 //!   budget exhaustions of a mission with no evidence added after the first of them; FS-8 a non-lead session that wrote
 //!   at least 60 % of a mission's ledger entries (20 or more); FS-9 five assets off scope in an hour; FS-10 a host a
-//!   mission was refused that a recalled earlier mission reached. Retention is 24 h and every table is capped.
+//!   mission was refused that a recalled earlier mission reached. Retention is 24 h (paths too) and every table is capped;
+//!   at the cap the oldest path goes and new ones are still taken. `joins_over_history` is the replay's: nothing is
+//!   forgotten and FS-5, FS-6 and FS-9 are also read at the time of the events, so a burst long before the newest
+//!   record is found.
 //! - A `FleetHit` is shadow like every M2 finding: the core records it as a `flag` with the join as its cause and a
 //!   `response` that says what it would earn (`r5` for the R5 conditions), and nothing acts.
 //!
@@ -125,8 +130,12 @@ struct TokenRec {
 /// The fleet's memory: what the joins read.
 #[derive(Debug, Default)]
 pub struct FleetBook {
-    writes: BTreeMap<String, Vec<(MissionId, SessionId, u64)>>,
+    /// Per path, per mission: (mission, session, first write, last write).
+    writes: BTreeMap<String, Vec<(MissionId, SessionId, u64, u64)>>,
+    /// Per path, per mission: (mission, session, latest read).
     reads: BTreeMap<String, Vec<(MissionId, SessionId, u64)>>,
+    /// Paths in the order they were first written, for eviction at the cap.
+    write_order: VecDeque<(u64, String)>,
     tokens: BTreeMap<String, TokenRec>,
     call_hosts: VecDeque<(u64, MissionId, Vec<String>)>,
     idle: VecDeque<(u64, MissionId, SessionId, String, u16)>,
@@ -170,12 +179,24 @@ fn private_name(host: &str) -> bool {
 
 impl FleetBook {
     pub fn write(&mut self, mission: &MissionId, session: &SessionId, path: &str, ts: u64) {
-        if self.writes.len() >= CAP_PATHS && !self.writes.contains_key(path) {
-            return;
+        if !self.writes.contains_key(path) {
+            // At the cap the oldest path goes: a long-lived daemon keeps seeing new ones.
+            while self.writes.len() >= CAP_PATHS {
+                let Some((_, old)) = self.write_order.pop_front() else { break };
+                self.writes.remove(&old);
+                self.reads.remove(&old);
+            }
+            self.write_order.push_back((ts, path.to_string()));
         }
         let v = self.writes.entry(path.to_string()).or_default();
-        if v.len() < 8 {
-            v.push((mission.clone(), session.clone(), ts));
+        match v.iter().position(|(m, ..)| m == mission) {
+            Some(i) => {
+                if let Some(w) = v.get_mut(i) {
+                    w.3 = w.3.max(ts);
+                }
+            }
+            None if v.len() < 8 => v.push((mission.clone(), session.clone(), ts, ts)),
+            None => {}
         }
     }
 
@@ -184,8 +205,14 @@ impl FleetBook {
             return;
         }
         let v = self.reads.entry(path.to_string()).or_default();
-        if v.len() < 8 {
-            v.push((mission.clone(), session.clone(), ts));
+        match v.iter().position(|(m, ..)| m == mission) {
+            Some(i) => {
+                if let Some(r) = v.get_mut(i) {
+                    r.2 = r.2.max(ts);
+                }
+            }
+            None if v.len() < 16 => v.push((mission.clone(), session.clone(), ts)),
+            None => {}
         }
     }
 
@@ -308,8 +335,37 @@ impl FleetBook {
     /// Run the ten joins over what the book holds and return what is new. `now` is the clock of the records (a
     /// replay passes the time of its newest record).
     pub fn joins(&mut self, now: u64) -> Vec<FleetHit> {
-        let mut out = Vec::new();
         self.prune(now);
+        let out = self.run_all(now);
+        self.unreported(out)
+    }
+
+    /// The joins of a replay: nothing is forgotten, and the windowed joins (FS-5, FS-6 and FS-9) are also read at the
+    /// time of the events themselves, so a burst of day 3 is found in a replay of 30 days.
+    pub fn joins_over_history(&mut self, now: u64) -> Vec<FleetHit> {
+        let mut times: Vec<u64> = self
+            .denials
+            .iter()
+            .map(|(t, _)| *t)
+            .chain(self.new_hosts.iter().map(|(t, _)| *t))
+            .chain(self.offscope.iter().map(|(t, _)| *t))
+            .chain(self.listeners.values().flat_map(|m| m.values().map(|(_, t)| *t)))
+            .collect();
+        times.sort_unstable();
+        times.dedup();
+        let stride = times.len().div_ceil(6_000).max(1);
+        let mut out = Vec::new();
+        for t in times.iter().step_by(stride) {
+            self.fs5(*t, &mut out);
+            self.fs6(*t, &mut out);
+            self.fs9(*t, &mut out);
+        }
+        out.extend(self.run_all(now));
+        self.unreported(out)
+    }
+
+    fn run_all(&self, now: u64) -> Vec<FleetHit> {
+        let mut out = Vec::new();
         self.fs1(now, &mut out);
         self.fs2(now, &mut out);
         self.fs3(&mut out);
@@ -320,8 +376,19 @@ impl FleetBook {
         self.fs8(now, &mut out);
         self.fs9(now, &mut out);
         self.fs10(now, &mut out);
+        out
+    }
+
+    fn unreported(&mut self, mut out: Vec<FleetHit>) -> Vec<FleetHit> {
         out.retain(|h| {
-            self.reported.insert(format!("{}|{}", serde_json::to_string(&h.join).unwrap_or_default(), h.key))
+            // A finding that grows (a one-way channel that becomes two-way) is reported again.
+            self.reported.insert(format!(
+                "{}|{}|{:?}|{}",
+                serde_json::to_string(&h.join).unwrap_or_default(),
+                h.key,
+                h.severity,
+                h.r5
+            ))
         });
         if self.reported.len() > 100_000 {
             self.reported.clear();
@@ -337,6 +404,19 @@ impl FleetBook {
         self.new_hosts.retain(|(t, _)| *t >= floor);
         self.loopback_net.retain(|(t, ..)| *t >= floor);
         self.offscope.retain(|(t, _)| *t >= floor);
+        // Paths nobody wrote or read within the retention are forgotten.
+        self.writes.retain(|_, ws| {
+            ws.retain(|w| w.3 >= floor);
+            !ws.is_empty()
+        });
+        let writes = &self.writes;
+        self.reads.retain(|p, rs| {
+            rs.retain(|r| r.2 >= floor);
+            !rs.is_empty() && writes.contains_key(p)
+        });
+        while self.write_order.front().is_some_and(|(t, _)| *t < floor) {
+            self.write_order.pop_front();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -361,11 +441,17 @@ impl FleetBook {
         for (path, rs) in &self.reads {
             let Some(ws) = self.writes.get(path) else { continue };
             for (rm, rsess, rt) in rs {
-                let own_write = ws.iter().any(|(wm, _, wt)| wm == rm && wt <= rt);
-                if own_write {
-                    continue;
-                }
-                if let Some((wm, _, _)) = ws.iter().find(|(wm, _, wt)| wm != rm && wt <= rt) {
+                // The time of a mission's write that a read at `rt` can have seen: its last before `rt`, else its first.
+                let seen = |first: u64, last: u64| if last <= *rt { last } else { first };
+                let own =
+                    ws.iter().filter(|(wm, ..)| wm == rm).map(|(_, _, f, l)| seen(*f, *l)).filter(|t| t <= rt).max();
+                // A read of another mission's write counts, whatever the reader wrote itself, unless the reader's own
+                // write is the later one (it reads its own output).
+                let other = ws.iter().find(|(wm, _, f, l)| {
+                    let t = seen(*f, *l);
+                    wm != rm && t <= *rt && own.is_none_or(|o| t > o)
+                });
+                if let Some((wm, _, _, _)) = other {
                     pairs.insert((wm.clone(), rm.clone()));
                     found.push((path.clone(), wm.clone(), rm.clone(), rsess.clone(), *rt));
                 }
@@ -884,5 +970,65 @@ mod tests {
             b.write(&m("m-a"), &s("s"), "/p", i);
         }
         assert!(b.writes.get("/p").is_some_and(|v| v.len() <= 8));
+        for i in 0..(CAP_PATHS + 10) {
+            b.write(&m("m-a"), &s("s"), &format!("/q/{i}"), i as u64);
+        }
+        assert!(b.writes.len() <= CAP_PATHS, "the oldest path goes, new ones are still taken");
+        assert!(b.writes.contains_key(&format!("/q/{}", CAP_PATHS + 9)));
+    }
+
+    #[test]
+    fn fs1_reads_are_kept_per_mission_and_a_two_way_board_over_one_file_is_r5() {
+        // The writer reading its own file many times does not hide another mission's read.
+        let mut b = FleetBook::default();
+        b.write(&m("m-a"), &s("s-a"), "/shared/a.txt", 10);
+        for i in 0..20 {
+            b.read(&m("m-a"), &s("s-a"), "/shared/a.txt", 11 + i);
+        }
+        b.read(&m("m-b"), &s("s-b"), "/shared/a.txt", 50);
+        let hits = b.joins(60);
+        assert_eq!(only(&hits, Join::WriterReader).len(), 1, "{hits:?}");
+        // One file, both ways: e writes, f reads, f writes back, e reads.
+        let mut b = FleetBook::default();
+        b.write(&m("m-e"), &s("s-e"), "/shared/board.txt", 10);
+        b.read(&m("m-f"), &s("s-f"), "/shared/board.txt", 20);
+        let first = b.joins(25);
+        assert!(only(&first, Join::WriterReader).iter().all(|h| !h.r5 && h.severity == Severity::S3));
+        b.write(&m("m-f"), &s("s-f"), "/shared/board.txt", 30);
+        b.read(&m("m-e"), &s("s-e"), "/shared/board.txt", 40);
+        let second = b.joins(45);
+        assert!(
+            only(&second, Join::WriterReader).iter().any(|h| h.r5 && h.severity == Severity::S4),
+            "the later escalation of the same path is reported: {second:?}"
+        );
+    }
+
+    #[test]
+    fn a_replay_finds_a_burst_that_is_older_than_the_retention() {
+        let mut b = FleetBook::default();
+        let day = 24 * 60 * 60 * 1000u64;
+        for i in 0..40u64 {
+            b.net(&m("m-a"), &s("s"), "x.example", 443, false, 3 * day + i * 1_000, false);
+        }
+        b.net(&m("m-a"), &s("s"), "y.example", 443, true, 30 * day, false);
+        let hits = b.joins_over_history(30 * day);
+        assert!(
+            only(&hits, Join::Bursts).iter().any(|h| h.key.starts_with("denials:m-a")),
+            "a burst of day 3 in a replay that ends on day 30: {hits:?}"
+        );
+        let mut live = FleetBook::default();
+        for i in 0..40u64 {
+            live.net(&m("m-a"), &s("s"), "x.example", 443, false, 3 * day + i * 1_000, false);
+        }
+        assert!(only(&live.joins(30 * day), Join::Bursts).is_empty(), "the live joins read the last window only");
+    }
+
+    #[test]
+    fn fs1_forgets_paths_after_the_retention() {
+        let mut b = FleetBook::default();
+        b.write(&m("m-a"), &s("s-a"), "/old", 10);
+        b.read(&m("m-b"), &s("s-b"), "/old", 20);
+        let _ = b.joins(RETENTION_MS + 1_000);
+        assert!(b.writes.is_empty() && b.reads.is_empty());
     }
 }

@@ -183,7 +183,7 @@ repeat_minutes = 0         # re-notify an unanswered blocking item this often; 0
 #
 # This file's own profile has no reviewer, on purpose, so the file checks clean as shipped:
 [monitor]
-enabled = true                        # the watcher: false builds no monitor at all (no log, no tripwires, no routes)
+enabled = true                        # the watcher; false keeps only the precision-list, S4 and canary tripwires (they have no off switch)
 mode = "shadow"                       # the only mode until M4: every cause is recorded and shown as "would have paused"
 fleet_every_s = 300                   # seconds between the fleet joins (FS-1 to FS-10); at least 10
 monitor_down = "pause_real_targets"   # what a down monitor does to missions it cannot watch: or "notify" (M3 applies it)

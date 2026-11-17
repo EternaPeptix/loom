@@ -45,7 +45,8 @@
 //!   open flags, the cursors, the per-mission tripwire history, the paused and halted sets, the allow rules, the
 //!   keep-going state, the promotions and the open reviews. It is a hard barrier: the runtime activates no session
 //!   before it is done (I9).
-//! - `append` writes one entry, syncs it, and only then returns; a pause, halt or halt-cleared entry that cannot be
+//! - `append` writes one entry, syncs it, and only then returns; a write that works after a failed one lifts the down
+//!   state (a full disk is not forever) when the reserve holds nothing; a pause, halt or halt-cleared entry that cannot be
 //!   written to the log is written to the reserve file, the entry is applied to no state, and the monitor goes down
 //!   (`monitor_down`, `is_down`). Appending is the single point at which state changes: nothing is applied before the
 //!   entry that records it (write-ahead). A failed write of any kind is truncated back, so the log never keeps half an
@@ -54,6 +55,9 @@
 //!   with `torn_bytes`.
 //! - First-start cursors begin at the end of each source log (the monitor core does this when the fold has no cursor at
 //!   all and the first-start marker was just written), so the first run raises no retroactive pause.
+//! - A `cursor` entry may carry `secrets: [[tag, mission, ts_ms], ...]`: the hashed credential values that missions'
+//!   results showed since the last checkpoint (TW-06). The fold keeps them as a `SecretIndex` (30 days; at most
+//!   `SECRETS_PER_MISSION` per mission, the oldest of that mission first), so a restart keeps the index.
 //! - A restart marks every review that was requested and has no verdict `fault: restart`; that is not counted (I10).
 //!
 //! Built by: M2 (open, fold, append, heartbeat, reserve, anchor); M3 (pause and halt entries are applied through
@@ -271,6 +275,11 @@ impl HitBook {
         self.recent.iter().filter(|r| r.at_ms >= since_ms).map(|r| r.key.as_str()).collect::<BTreeSet<_>>().len()
     }
 
+    /// Is `key` among the hits at or after `since_ms` (the window's count, not the mission's)?
+    pub fn has_key_since(&self, key: &str, since_ms: u64) -> bool {
+        self.recent.iter().any(|r| r.at_ms >= since_ms && r.key == key)
+    }
+
     /// Hits at or after `since_ms`.
     pub fn count_since(&self, since_ms: u64) -> usize {
         self.recent.iter().filter(|r| r.at_ms >= since_ms).count()
@@ -304,9 +313,101 @@ pub struct TwStat {
     pub missions: BTreeSet<String>,
 }
 
+/// How long a credential tag is remembered.
+pub const SECRET_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// The most credential tags one mission may have in the index; its oldest go first, so one agent printing many
+/// fake keys can evict only its own.
+pub const SECRETS_PER_MISSION: usize = 10_000;
+
+/// The credential values the missions' results showed, as hashed tags (never the values), for TW-06: which missions
+/// saw a tag, when. Persisted in the `secrets` field of `cursor` entries, so a restart keeps it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SecretIndex {
+    tags: BTreeMap<String, BTreeMap<MissionId, u64>>,
+    order: VecDeque<(u64, String, MissionId)>,
+    counts: BTreeMap<MissionId, usize>,
+}
+
+impl SecretIndex {
+    /// Remember that `mission`'s results showed `tag` at `ts`; true when that is new.
+    pub fn note(&mut self, tag: &str, mission: &MissionId, ts: u64) -> bool {
+        self.expire(ts);
+        let slot = self.tags.entry(tag.to_string()).or_default();
+        if slot.contains_key(mission) {
+            return false;
+        }
+        slot.insert(mission.clone(), ts);
+        self.order.push_back((ts, tag.to_string(), mission.clone()));
+        let n = self.counts.entry(mission.clone()).or_default();
+        *n = n.saturating_add(1);
+        if *n > SECRETS_PER_MISSION.saturating_add(SECRETS_PER_MISSION / 10) {
+            self.evict(mission);
+        }
+        true
+    }
+
+    /// A mission, other than `mission`, whose results showed `tag`, when `mission`'s own did not.
+    pub fn other_owner(&self, tag: &str, mission: &MissionId) -> Option<&MissionId> {
+        let owners = self.tags.get(tag)?;
+        if owners.contains_key(mission) {
+            return None;
+        }
+        owners.keys().next()
+    }
+
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    fn remove(&mut self, tag: &str, mission: &MissionId) {
+        if let Some(s) = self.tags.get_mut(tag) {
+            s.remove(mission);
+            if s.is_empty() {
+                self.tags.remove(tag);
+            }
+        }
+        if let Some(n) = self.counts.get_mut(mission) {
+            *n = n.saturating_sub(1);
+        }
+    }
+
+    fn expire(&mut self, now: u64) {
+        while self.order.front().is_some_and(|(t, _, _)| t.saturating_add(SECRET_RETENTION_MS) < now) {
+            if let Some((_, tag, mission)) = self.order.pop_front() {
+                self.remove(&tag, &mission);
+            }
+        }
+    }
+
+    /// Drop `mission`'s oldest tags down to the cap.
+    fn evict(&mut self, mission: &MissionId) {
+        let mut drop = self.counts.get(mission).copied().unwrap_or(0).saturating_sub(SECRETS_PER_MISSION);
+        let mut kept = VecDeque::with_capacity(self.order.len());
+        let mut gone: Vec<(String, MissionId)> = Vec::new();
+        for (t, tag, m) in std::mem::take(&mut self.order) {
+            if drop > 0 && &m == mission {
+                drop = drop.saturating_sub(1);
+                gone.push((tag, m));
+            } else {
+                kept.push_back((t, tag, m));
+            }
+        }
+        self.order = kept;
+        for (tag, m) in gone {
+            self.remove(&tag, &m);
+        }
+    }
+}
+
 /// The state the log folds to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Fold {
+    /// Credential tags by mission (TW-06), from the `secrets` of `cursor` entries.
+    pub secrets: SecretIndex,
     pub last_seq: u64,
     pub last_mac: String,
     /// Each paused mission with its open pause flags. `Inner::may_run` is false while the set is non-empty.
@@ -371,6 +472,17 @@ impl Fold {
                 }
             }
             EntryKind::Cursor => {
+                if let Some(rows) = e.fields.get("secrets").and_then(Value::as_array) {
+                    for row in rows {
+                        if let (Some(tag), Some(m), Some(ts)) = (
+                            row.get(0).and_then(Value::as_str),
+                            row.get(1).and_then(Value::as_str),
+                            row.get(2).and_then(Value::as_u64),
+                        ) {
+                            self.secrets.note(tag, &MissionId::from(m), ts);
+                        }
+                    }
+                }
                 if let Some(map) = e.fields.get("cursors").and_then(Value::as_object) {
                     for (source, v) in map {
                         if let Ok(c) = serde_json::from_value::<Cursor>(v.clone()) {
@@ -555,7 +667,7 @@ impl MonitorLog {
         let anchor_path = keys.join(ANCHOR_FILE);
         if !log_path.exists() && marker_before {
             return Err(MonitorError::Unavailable(format!(
-                "The monitor log {} is missing although the monitor has run here before ({} exists). Restore it from a backup; to accept the loss, acknowledge with `loom monitor ack-down`.",
+                "The monitor log {} is missing although the monitor has run here before ({} exists). Restore it from a backup; to accept the loss, stop the daemon, move monitor/log.jsonl, monitor/first-start, monitor/reserve and keys/monitor.anchor out of the loom home and start it again (`loom monitor ack-down` will do this from M3).",
                 log_path.display(),
                 marker.display()
             )));
@@ -579,7 +691,7 @@ impl MonitorLog {
             let n = i.saturating_add(1);
             let bad = |why: &str| {
                 MonitorError::Unavailable(format!(
-                    "The monitor log {} fails verification at line {n}: {why}. Nothing was cleared and the monitor is down; restore the log from a backup or acknowledge with `loom monitor ack-down`.",
+                    "The monitor log {} fails verification at line {n}: {why}. Nothing was cleared and the monitor is down; restore the log from a backup or accept the loss by stopping the daemon, moving monitor/log.jsonl, monitor/first-start, monitor/reserve and keys/monitor.anchor out of the loom home and starting it again (`loom monitor ack-down` will do this from M3).",
                     log_path.display()
                 ))
             };
@@ -604,14 +716,14 @@ impl MonitorLog {
                 let amac = v.get("mac").and_then(Value::as_str).unwrap_or("");
                 if fold.last_seq < aseq {
                     return Err(MonitorError::Unavailable(format!(
-                        "The monitor log {} ends at entry {} but entry {aseq} was written: it was cut short. Restore it from a backup or acknowledge with `loom monitor ack-down`.",
+                        "The monitor log {} ends at entry {} but entry {aseq} was written: it was cut short. Restore it from a backup or accept the loss by stopping the daemon, moving monitor/log.jsonl, monitor/first-start, monitor/reserve and keys/monitor.anchor out of the loom home and starting it again (`loom monitor ack-down` will do this from M3).",
                         log_path.display(),
                         fold.last_seq
                     )));
                 }
                 if fold.last_seq == aseq && aseq > 0 && fold.last_mac != amac {
                     return Err(MonitorError::Unavailable(format!(
-                        "The last entry of the monitor log {} is not the one that was anchored. Restore it from a backup or acknowledge with `loom monitor ack-down`.",
+                        "The last entry of the monitor log {} is not the one that was anchored. Restore it from a backup or accept the loss by stopping the daemon, moving monitor/log.jsonl, monitor/first-start, monitor/reserve and keys/monitor.anchor out of the loom home and starting it again (`loom monitor ack-down` will do this from M3).",
                         log_path.display()
                     )));
                 }
@@ -690,6 +802,14 @@ impl MonitorLog {
         }
     }
 
+    /// Make writes work again, as freed space does (tests only).
+    #[cfg(test)]
+    pub(crate) fn mend_for_test(&mut self) {
+        if let Ok(f) = std::fs::OpenOptions::new().append(true).open(self.dir.join(LOG_FILE)) {
+            self.file = f;
+        }
+    }
+
     /// The directory of the log (`<home>/monitor`).
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -750,6 +870,11 @@ impl MonitorLog {
         }
         self.seq = entry.seq;
         self.last_mac = entry.mac.clone();
+        // A write that works again lifts the down state, unless pause entries sit in the reserve (those are folded in
+        // at the next open and the operator acknowledges them).
+        if self.down.is_some() && self.read_reserve().is_ok_and(|r| r.is_empty()) {
+            self.down = None;
+        }
         let anchor = serde_json::json!({"seq": entry.seq, "mac": entry.mac}).to_string();
         // Not synced: the anchor only has to survive a deletion of the tail, which a sync would not stop either.
         let _ = std::fs::write(&self.anchor, anchor);
@@ -800,7 +925,7 @@ impl MonitorLog {
         for line in text.lines().filter(|l| !l.trim().is_empty()) {
             let bad = || {
                 MonitorError::Unavailable(format!(
-                    "The reserve file {} holds a line that does not verify. Nothing was cleared; acknowledge with `loom monitor ack-down` after checking the pauses by hand.",
+                    "The reserve file {} holds a line that does not verify. Nothing was cleared; check the pauses by hand, then accept the loss by stopping the daemon, moving monitor/log.jsonl, monitor/first-start, monitor/reserve and keys/monitor.anchor out of the loom home and starting it again (`loom monitor ack-down` will do this from M3).",
                     p.display()
                 ))
             };

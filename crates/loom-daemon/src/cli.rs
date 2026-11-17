@@ -91,7 +91,7 @@
 //!   `config check` fails and lays out the three choices: not LLM-reviewed is a choice the operator makes, never a default.
 //! - `monitor [status]`: `client.monitor_status`; the monitor's state (`shadow`, `degraded`, `down` with its reason), what it
 //!   has read, its open flags, the faults of its sources and one row per tripwire with its hits by severity
-//!   (`monitor_status_lines`). `monitor log <mission|session> [--json] [--since 90m|12h|7d|<ms>] [--all] [-n N]`:
+//!   (`monitor_status_lines`; every line goes through `render::clean` and has no line break, since a tripwire's detail and key carry strings an agent chose). `monitor log <mission|session> [--json] [--since 90m|12h|7d|<ms>] [--all] [-n N]`:
 //!   `client.monitor_log` (`mission_of` resolves the word), paged until N entries; one line per entry in words
 //!   (`monitor_entry_line`), or the stored JSON per line with `--json`; `--all` includes `cursor` and `heartbeat`.
 //!   `monitor replay [--since …] [--positives FILE] [--home DIR] [--no-journal-key] [--json]`: runs
@@ -1701,7 +1701,6 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
     }
 }
 
-/// `loom models show [profile]`: reads the configuration and the packs; needs no daemon.
 /// `5m`, `12h`, `7d` (before `now_ms`), or a time in milliseconds since the epoch.
 pub(crate) fn parse_since(word: &str, now_ms: u64) -> Result<u64, String> {
     let w = word.trim();
@@ -1720,7 +1719,17 @@ pub(crate) fn parse_since(word: &str, now_ms: u64) -> Result<u64, String> {
     w.parse::<u64>().map_err(|_| bad())
 }
 
+/// One line for the terminal: every control and bidirectional override replaced (a tripwire's detail and key carry
+/// strings an agent chose), and no line break inside it.
+fn terminal_line(text: &str) -> String {
+    render::clean(text).replace(['\n', '\t'], "·")
+}
+
 fn monitor_status_lines(m: &loom_agent::monitor::core::MonitorStatus) -> Vec<String> {
+    monitor_status_raw(m).iter().map(|l| terminal_line(l)).collect()
+}
+
+fn monitor_status_raw(m: &loom_agent::monitor::core::MonitorStatus) -> Vec<String> {
     let mut l = vec![format!(
         "monitor: {} ({} mode){}",
         m.state,
@@ -1760,6 +1769,10 @@ fn monitor_status_lines(m: &loom_agent::monitor::core::MonitorStatus) -> Vec<Str
 }
 
 fn monitor_entry_line(e: &loom_agent::monitor::log::Entry) -> String {
+    terminal_line(&monitor_entry_raw(e))
+}
+
+fn monitor_entry_raw(e: &loom_agent::monitor::log::Entry) -> String {
     let get = |k: &str| e.fields.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let when = e.ts_ms / 1000;
     match e.kind.slug() {
@@ -1863,6 +1876,7 @@ async fn cmd_monitor(paths: &Paths, args: MonitorArgs) -> Result<i32, String> {
     }
 }
 
+/// `loom models show [profile]`: reads the configuration and the packs; needs no daemon.
 fn cmd_models(paths: &Paths, action: ModelsAction) -> Result<i32, String> {
     match action {
         ModelsAction::Show { profile } => {
@@ -2061,6 +2075,46 @@ mod tests {
         };
         let line = monitor_entry_line(&e);
         assert_eq!(line, "#7 5 TW-09 s3 s-1 would r3 precision-list writes a hook (harness_attack)");
+        // What an agent chose reaches the terminal as text: no escape, no OSC, no bidi override, no line break.
+        let mut hostile = e.clone();
+        hostile
+            .fields
+            .insert("detail".into(), "x\u{1b}[2K\u{1b}[1Ahidden\u{1b}]52;c;ZWNobyBoaQ==\u{7}\u{202e}\nTW-99".into());
+        hostile.fields.insert("key".into(), "k\u{1b}[2J".into());
+        let line = monitor_entry_line(&hostile);
+        assert!(!line.chars().any(|c| c.is_control() || ('\u{202a}'..='\u{202e}').contains(&c)), "{line:?}");
+        assert!(!line.contains('\n'), "{line:?}");
+        let mut flag = hostile.clone();
+        flag.kind = loom_agent::monitor::log::EntryKind::Flag;
+        let line = monitor_entry_line(&flag);
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        m_faults_are_clean();
+    }
+
+    fn m_faults_are_clean() {
+        let m = loom_agent::monitor::core::MonitorStatus {
+            state: "degraded".into(),
+            mode: "shadow".into(),
+            enabled: true,
+            egress_unbounded: false,
+            open_flags: 0,
+            paused: vec![],
+            halts: vec![],
+            backlog_s: 0,
+            heartbeat_ms: 1,
+            last_seq: 1,
+            sources: 1,
+            counts: Default::default(),
+            tripwires: vec![],
+            faults: vec!["bad\u{1b}[2Jfault\nnext".into()],
+            fleet_runs: 0,
+            fleet_hits: 0,
+            reviewers: vec![],
+            down_reason: Some("why\u{1b}]52;c;AAAA\u{7}".into()),
+        };
+        for line in monitor_status_lines(&m) {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
     }
 
     #[test]

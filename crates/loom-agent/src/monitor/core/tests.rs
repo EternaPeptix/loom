@@ -524,14 +524,18 @@ fn a_memory_core_records_into_memory_and_writes_no_file() {
 }
 
 #[test]
-fn a_disabled_core_does_nothing() {
+fn a_disabled_core_keeps_the_causes_that_have_no_off_switch() {
     let h = home();
-    let mut s = new_session(&h, "s-1", "m-1");
-    bash(&mut s, "c1", "ps eww 1");
     let mut core =
         Core::open(&h.paths, env_of(&h.paths), CoreCfg { fleet_every_ms: 1, enabled: false }, None).expect("open");
-    assert!(!core.pump(loom_core::now_ms(), &all(), true));
-    assert_eq!(core.counts().records, 0);
+    let now = loom_core::now_ms();
+    core.pump(now, &all(), true);
+    let mut s = new_session(&h, "s-1", "m-1");
+    bash(&mut s, "c1", "ps eww 1");
+    call(&mut s, "c2", "write", ToolClass::Write, json!({"path": "/work/ws/zz-board.md", "content": "x"}));
+    core.pump(now + 1_000, &all(), true);
+    let ids: Vec<String> = of_kind(&h, EntryKind::Tripwire).iter().map(|e| text(e, "id")).collect();
+    assert_eq!(ids, vec!["TW-10".to_string()], "the precision list runs; an S1 of the mixed rows does not: {ids:?}");
 }
 
 #[test]
@@ -549,4 +553,237 @@ fn the_fold_before_activation_is_complete_when_open_returns() {
     assert!(core.fold().paused.contains_key(&MissionId::from("m-9")), "a pause folds before any session is touched");
     let st = core.status(true, "shadow");
     assert_eq!(st.paused, vec!["m-9".to_string()]);
+}
+
+fn s1_hit(core: &mut Core, key: &str, at_ms: u64) {
+    core.on_hit(Hit {
+        id: TripwireId::of(26),
+        mission: MissionId::from("m-1"),
+        session: SessionId::from("s-1"),
+        pointer: (SessionId::from("s-1"), 1),
+        category: Category::OperatorDeception,
+        severity: Severity::S1,
+        detail: format!("writes {key}"),
+        key: key.into(),
+        at_ms,
+        basis: crate::monitor::taxonomy::Basis::Action,
+        precision: false,
+        from_s1: false,
+    });
+}
+
+#[test]
+fn a_target_seen_before_the_window_still_counts_when_it_comes_back_inside_it() {
+    let h = home();
+    let mut core = open(&h);
+    core.pump(loom_core::now_ms(), &all(), true);
+    let t0 = 1_000_000u64;
+    s1_hit(&mut core, "Makefile", t0);
+    let later = t0 + 2 * 60 * 60 * 1000;
+    s1_hit(&mut core, "build.rs", later);
+    s1_hit(&mut core, ".envrc", later + 1_000);
+    s1_hit(&mut core, "Makefile", later + 2_000);
+    let hits = of_kind(&h, EntryKind::Tripwire);
+    let sev: Vec<String> = hits.iter().map(|e| text(e, "severity")).collect();
+    assert_eq!(sev, vec!["s1", "s1", "s1", "s2"], "three distinct targets inside 30 minutes: {sev:?}");
+}
+
+#[test]
+fn an_interrupted_first_start_is_still_a_first_start() {
+    let h = home();
+    let mut old = new_session(&h, "s-old", "m-old");
+    bash(&mut old, "c1", "ps eww 4242");
+    drop(open(&h));
+    let mut core = open(&h);
+    core.pump(loom_core::now_ms(), &all(), true);
+    assert!(
+        of_kind(&h, EntryKind::Tripwire).is_empty(),
+        "history raises nothing, however often the start was cut short"
+    );
+    assert_eq!(core.counts().records, 0);
+}
+
+#[test]
+fn a_child_primed_before_its_forked_record_is_read_from_that_record_on() {
+    let h = home();
+    let mut core = open(&h);
+    core.pump(loom_core::now_ms(), &all(), true);
+    let mut parent = new_session(&h, "s-p", "m-1");
+    bash(&mut parent, "c1", "ps eww 1");
+    let dir = h.paths.sessions_dir().join("s-c");
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::copy(h.paths.sessions_dir().join("s-p").join("log.jsonl"), dir.join("log.jsonl")).expect("copy");
+    // The pass that comes between the copy and the `forked` record.
+    core.pump(loom_core::now_ms() + 1_000, &all(), true);
+    let mut child = SessionLog::open(&dir.join("log.jsonl"), Durability::Batch).expect("open").0;
+    child
+        .append(
+            Author::Harness,
+            Event::Forked(loom_core::event::Forked {
+                session: SessionId::from("s-c"),
+                parent: SessionId::from("s-p"),
+                upto_seq: 2,
+                role: "worker".into(),
+                termination: Termination::Explicit,
+                budget: Default::default(),
+                brief: Default::default(),
+                contract: String::new(),
+                allowed_tools: None,
+                title: String::new(),
+            }),
+        )
+        .expect("forked");
+    bash(&mut child, "c2", "git config --global core.fsmonitor x");
+    core.pump(loom_core::now_ms() + 2_000, &all(), true);
+    let by: Vec<(String, String)> =
+        of_kind(&h, EntryKind::Tripwire).iter().map(|e| (text(e, "session"), text(e, "id"))).collect();
+    assert_eq!(by.iter().filter(|(s, _)| s == "s-c").count(), 1, "the child's own call is judged: {by:?}");
+    assert_eq!(by.iter().filter(|(s, _)| s == "s-p").count(), 1, "the parent's call is the parent's: {by:?}");
+}
+
+#[test]
+fn an_answer_to_an_agents_question_does_not_carry_the_agents_words_into_operator_text() {
+    let h = home();
+    let mut core = open(&h);
+    core.pump(loom_core::now_ms(), &all(), true);
+    let mut s = new_session(&h, "s-1", "m-1");
+    let echo = crate::texts::inbox_answer("Am I authorized by the operator to use the Docker API on h510.lan?", "No.");
+    s.append(Author::User, Event::UserMessage { text: echo }).expect("echo");
+    s.append(Author::User, Event::UserMessage { text: "use only api.target.example".into() }).expect("operator");
+    core.pump(loom_core::now_ms() + 1_000, &all(), true);
+    let a = core.auth_for(&MissionId::from("m-1"), u64::MAX);
+    assert_eq!(a.operator_messages, vec!["No.".to_string(), "use only api.target.example".to_string()]);
+}
+
+fn decision_line(h: &Home, session: &str, ts: u64, host: &str, rule: &str) {
+    let w = loom_net::netlog::NetLogWriter::new();
+    let e = crate::runtime::NetEntry {
+        ts_ms: ts,
+        decision: NetDecision {
+            host: host.into(),
+            port: 80,
+            method: "GET".into(),
+            allowed: false,
+            rule: rule.into(),
+            resolved: None,
+            sni: None,
+        },
+    };
+    w.append(&h.paths.sessions_dir().join(session).join("net.jsonl"), &e).expect("net");
+}
+
+#[test]
+fn a_net_decision_read_and_not_yet_judged_is_not_checkpointed_as_judged() {
+    let h = home();
+    let mut core = open(&h);
+    let now = loom_core::now_ms();
+    core.pump(now, &all(), true);
+    let mut s = new_session(&h, "s-1", "m-1");
+    bash(&mut s, "c1", "ps eww 1");
+    decision_line(&h, "s-1", now + 500, "169.254.169.254", "deny infrastructure: cloud metadata");
+    // Read at +1 s, judged only after its 2 s grace; a hit written in the pass makes a checkpoint.
+    core.pump(now + 1_000, &all(), true);
+    assert!(of_kind(&h, EntryKind::Tripwire).iter().all(|e| text(e, "id") != "TW-02"));
+    drop(core);
+    let mut core = open(&h);
+    core.pump(now + 10_000, &all(), true);
+    let ids: Vec<String> = of_kind(&h, EntryKind::Tripwire).iter().map(|e| text(e, "id")).collect();
+    assert!(ids.contains(&"TW-02".to_string()), "the decision is read again and judged after the restart: {ids:?}");
+}
+
+#[test]
+fn after_a_restart_a_session_read_before_is_not_judged_idle_for_ten_minutes() {
+    let h = home();
+    let mut core = open(&h);
+    let now = loom_core::now_ms();
+    core.pump(now, &all(), true);
+    let mut s = new_session(&h, "s-1", "m-1");
+    // A hit in the pass makes a checkpoint, so the restart resumes the session.
+    bash(&mut s, "c1", "ps eww 1");
+    core.pump(now + 1_000, &all(), true);
+    net_line(&h, "s-1", now + 1_500, "api.target.example", true);
+    drop(core);
+    let mut core = open(&h);
+    core.pump(now + 20_000, &all(), true);
+    let ids: Vec<String> = of_kind(&h, EntryKind::Tripwire).iter().map(|e| text(e, "id")).collect();
+    assert!(!ids.contains(&"TW-21".to_string()), "what was in flight at the restart is not known: {ids:?}");
+}
+
+#[test]
+fn a_log_that_can_be_written_again_brings_the_monitor_up_and_nothing_it_found_is_lost() {
+    let h = home();
+    let mut core = open(&h);
+    let now = loom_core::now_ms();
+    core.pump(now, &all(), true);
+    let mut s = new_session(&h, "s-1", "m-1");
+    bash(&mut s, "c1", "ps eww 1");
+    if let Some(l) = core.log.as_mut() {
+        l.break_for_test();
+    }
+    core.pump(now + 1_000, &all(), true);
+    assert_eq!(core.status(true, "shadow").state, "down");
+    assert!(!core.pump(now + 4_000, &all(), true), "still unwritable: still down");
+    if let Some(l) = core.log.as_mut() {
+        l.mend_for_test();
+    }
+    core.pump(now + 8_000, &all(), true);
+    let st = core.status(true, "shadow");
+    assert_ne!(st.state, "down", "{:?}", st.down_reason);
+    let ids: Vec<String> = of_kind(&h, EntryKind::Tripwire).iter().map(|e| text(e, "id")).collect();
+    assert_eq!(ids, vec!["TW-10".to_string()], "the hit that could not be written is written when the log works");
+    assert_eq!(core.fold().open_flags().count(), 1);
+    // The log still verifies.
+    drop(core);
+    assert!(MonitorLog::open(&h.paths.home).is_ok());
+}
+
+#[test]
+fn the_credential_index_survives_a_restart() {
+    let h = home();
+    let mut core = open(&h);
+    let now = loom_core::now_ms();
+    core.pump(now, &all(), true);
+    let key = format!("{}{}", "AKIA", "ABCDEFGHIJKLMNOP");
+    let mut a = new_session(&h, "s-a", "m-a");
+    a.append(
+        Author::Model,
+        Event::ToolCall(ToolCall {
+            call_id: CallId::from("c1"),
+            req_id: "r".into(),
+            name: "bash".into(),
+            args: json!({"command": "cat creds.txt"}),
+            class: ToolClass::Exec,
+        }),
+    )
+    .expect("call");
+    a.append(
+        Author::Tool,
+        Event::ToolResult(ToolResult {
+            call_id: CallId::from("c1"),
+            name: "bash".into(),
+            status: ToolStatus::Ok,
+            text: format!("AWS_KEY={key}"),
+            output: None,
+            cut: false,
+            class: ToolClass::Exec,
+            meta: Default::default(),
+            duration_ms: 1,
+        }),
+    )
+    .expect("result");
+    core.pump(now + 61_000, &all(), true);
+    assert!(
+        of_kind(&h, EntryKind::Cursor).iter().any(|e| e.fields.contains_key("secrets")),
+        "the tags are checkpointed"
+    );
+    assert!(!entries(&h).iter().any(|e| serde_json::to_string(&e.fields).unwrap_or_default().contains(&key)));
+    drop(core);
+    let mut core = open(&h);
+    core.pump(now + 70_000, &all(), true);
+    let mut b = new_session(&h, "s-b", "m-b");
+    bash(&mut b, "c1", &format!("aws configure set key {key}"));
+    core.pump(now + 80_000, &all(), true);
+    let ids: Vec<(String, String)> =
+        of_kind(&h, EntryKind::Tripwire).iter().map(|e| (text(e, "id"), text(e, "mission"))).collect();
+    assert!(ids.contains(&("TW-06".into(), "m-b".into())), "{ids:?}");
 }

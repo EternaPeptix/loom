@@ -1544,7 +1544,7 @@ POST /api/inbox/{item_id}                     {answer} → 202 {}
 GET  /api/blobs/{handle}                      → BlobRef {id, bytes, lines}
 GET  /api/blobs/{handle}/raw                  the stored bytes (application/octet-stream, attachment)
 GET  /api/blobs/{handle}/lines?start=&end=    → {text, first, last, total}  (1-based; default 1–2000, ≤ 5000 lines)
-GET  /api/monitor                             → MonitorStatus   (the monitor in shadow; 404 when [monitor] enabled = false)
+GET  /api/monitor                             → MonitorStatus   (the monitor in shadow)
 GET  /api/missions/{id}/monitor?after=&limit=&quiet=   → {entries, next_after}   (the monitor-log entries about a mission)
 GET  /api/monitor/reviews/{review}/input      → 404 until the reviewer exists (M6)
 GET  /api/events?deltas=true|false            SSE, below

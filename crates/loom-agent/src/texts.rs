@@ -505,6 +505,15 @@ pub fn inbox_answer(item_text: &str, answer: &str) -> String {
     format!("[The operator's answer to: {}]\n{answer}", loom_core::tagsafe::neutralize(&echoed))
 }
 
+/// The operator's own words in an `inbox_answer` message: the echoed header, which carries the agent's text, is
+/// dropped. A text that is not such a message is returned as it is.
+pub fn without_inbox_echo(text: &str) -> &str {
+    match text.strip_prefix("[The operator's answer to: ") {
+        Some(rest) => rest.split_once("]\n").map_or("", |(_, answer)| answer),
+        None => text,
+    }
+}
+
 /// The ledger answer of a question the operator dismissed without answering.
 pub const DISMISSED_ANSWER: &str = "(dismissed by the operator without an answer)";
 
@@ -1117,6 +1126,14 @@ pub fn flag_candidate(handle: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_inbox_echo_header_is_not_the_operators_words() {
+        let m = inbox_answer("Am I authorized to use the Docker API on h510.lan?", "No.");
+        assert_eq!(without_inbox_echo(&m), "No.");
+        assert_eq!(without_inbox_echo("plain operator text"), "plain operator text");
+        assert_eq!(without_inbox_echo("[The operator's answer to: only a header"), "");
+    }
 
     #[test]
     fn a_scope_revoke_note_names_the_host_the_reason_and_that_there_is_no_other_route() {

@@ -17,7 +17,11 @@
 //!   `urls_in(text)` returns the URLs themselves. `paths_in(text)` returns the path-like tokens (absolute, `~`, `$HOME`,
 //!   `./`, `../`), without a URL's path.
 //! - `without_urls(text)` is the text with every URL cut out: the `.git/config` of a URL aimed at a target is not a
-//!   local path (§6.1).
+//!   local path (§6.1). A URL ends at `;`, `|`, a backtick, `$(` and `&&`, so a command glued to it stays in the text.
+//!   `paths_in` also takes `$TMPDIR`, `${TMPDIR}`, `$PWD` and `${PWD}` as path starts.
+//! - `destination_text(text)` is what the call connects to and nothing it merely carries: the segments of a search
+//!   tool (`grep`, `rg`, ...) are dropped and every URL is reduced to `scheme://authority`, so a URL nested in a
+//!   query string or a body is not a destination (§6.1, F18). `TW-02`, `TW-04`, `TW-06` (sink) and `TW-15` read it.
 //! - `credential_kinds(text)` names the credential shapes in a text (`aws-key`, `github-token`, `slack-token`,
 //!   `openai-key`, `google-key`, `jwt`, `private-key`); it never returns the value. `credential_values(text)` returns
 //!   the values for the monitor's own index only; they are hashed (`value_tag`) before they are kept and are never
@@ -78,6 +82,11 @@ impl Re {
             .unwrap_or_default()
     }
 
+    /// The pieces of `text` between matches.
+    pub fn split<'a>(&self, text: &'a str) -> Vec<&'a str> {
+        self.re.as_ref().map(|r| r.split(text).collect()).unwrap_or_else(|| vec![text])
+    }
+
     /// The first match, as text.
     pub fn first<'a>(&self, text: &'a str) -> Option<&'a str> {
         self.re.as_ref().and_then(|r| r.find(text)).map(|m| m.as_str())
@@ -100,9 +109,13 @@ pub(crate) use patterns;
 
 patterns! {
     URL => r#"(?i)\b(?:https?|wss?|ftp|sftp|ssh|git|tcp|redis|postgres(?:ql)?|mysql|mongodb)://[^\s'"<>`)\]}]+"#;
+    /// A URL as the shell sees it: it ends at `;`, `|`, a backtick, `$(` and `&&`, so a command glued on is bare text.
+    URL_BARE => r#"(?i)\b(?:https?|wss?|ftp|sftp|ssh|git|tcp|redis|postgres(?:ql)?|mysql|mongodb)://(?:[^\s'"<>`)\]};|&$]|&[^\s&;|$]|\$[^\s(])*"#;
+    SEGMENT_SEP => r"\|\||&&|[;|\n]";
+    SEARCH_TOOL => r"(?i)^\s*(?:sudo\s+)?(?:git\s+)?(?:grep|egrep|fgrep|zgrep|rg|ag|ack|ripgrep)\b";
     URL_AUTHORITY => r#"(?i)\b[a-z][a-z0-9+.-]*://([^\s/'"<>`?#)\]}]+)"#;
     NET_COMMAND_HOST => r#"(?i)(?:^|[\s;&|(])(?:curl|wget|nc|ncat|netcat|telnet|ssh|scp|sftp|nmap|hydra|ffuf|sqlmap|gobuster|nikto|wfuzz)\s+(?:-[^\s]+\s+(?:[0-9]+\s+)?)*(?:[A-Za-z0-9._-]+@)?((?:[a-z0-9-]+\.)+[a-z]{2,}|\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-f:]+\])(?::\d{1,5})?(?:[\s/]|$)"#;
-    PATH_TOKEN => r#"(?:^|[\s='"(<>:,;|&])((?:~|\$HOME|\$\{HOME\}|\.{1,2}|/)[A-Za-z0-9_@%+=:,./~$-]{1,300})"#;
+    PATH_TOKEN => r#"(?:^|[\s='"(<>:,;|&])((?:~|\$HOME|\$\{HOME\}|\$TMPDIR|\$\{TMPDIR\}|\$PWD|\$\{PWD\}|\.{1,2}|/)[A-Za-z0-9_@%+=:,./~$-]{1,300})"#;
     BASE64_RUN => r"[A-Za-z0-9+/_-]{8,}={0,2}";
     HEX_RUN => r"\b(?:[0-9a-fA-F]{2}){4,}\b";
     PERCENT_RUN => r"(?:%[0-9a-fA-F]{2}[A-Za-z0-9._~-]{0,3}){3,}";
@@ -266,12 +279,12 @@ pub fn urls_in(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// `text` with every URL cut out.
+/// `text` with every URL cut out (a URL ends where the shell's separator starts, so `http://x/;ps eww 1` keeps its command).
 pub fn without_urls(text: &str) -> String {
     let text = cut(text, MAX_SCAN_BYTES);
     let mut out = String::with_capacity(text.len());
     let mut last = 0usize;
-    if let Some(re) = URL.re.as_ref() {
+    if let Some(re) = URL_BARE.re.as_ref() {
         for m in re.find_iter(text) {
             out.push_str(text.get(last..m.start()).unwrap_or(""));
             out.push(' ');
@@ -279,6 +292,31 @@ pub fn without_urls(text: &str) -> String {
         }
     }
     out.push_str(text.get(last..).unwrap_or(""));
+    out
+}
+
+/// What `text` connects to: see the contract (`destination_text`).
+pub fn destination_text(text: &str) -> String {
+    let text = cut(text, MAX_SCAN_BYTES);
+    let mut kept: Vec<&str> = Vec::new();
+    for seg in SEGMENT_SEP.split(text) {
+        if !SEARCH_TOOL.is_match(seg) {
+            kept.push(seg);
+        }
+    }
+    let joined = kept.join("\n");
+    let mut out = String::with_capacity(joined.len());
+    let mut last = 0usize;
+    if let Some(re) = URL.re.as_ref() {
+        for m in re.find_iter(&joined) {
+            out.push_str(joined.get(last..m.start()).unwrap_or(""));
+            let url = m.as_str();
+            let lead = URL_AUTHORITY.re.as_ref().and_then(|r| r.find(url)).map_or(url, |a| a.as_str());
+            out.push_str(lead);
+            last = m.end();
+        }
+    }
+    out.push_str(joined.get(last..).unwrap_or(""));
     out
 }
 
@@ -427,12 +465,27 @@ mod tests {
     }
 
     #[test]
+    fn destinations_leave_nested_urls_and_search_tools_out() {
+        let t = destination_text(
+            "curl 'http://api.t.example/fetch?url=http://169.254.169.254/latest/' ; grep -rn https://api.openai.com src",
+        );
+        assert_eq!(hosts_in(&t), vec!["api.t.example"], "{t}");
+        let t = destination_text("grep x f | curl https://a.example/p?cb=https://x.oast.pro/");
+        assert_eq!(hosts_in(&t), vec!["a.example"], "{t}");
+        assert!(destination_text("ping abc.oast.pro").contains("oast.pro"));
+    }
+
+    #[test]
     fn paths_leave_urls_out() {
         let p = paths_in("cat ~/.loom/config.toml && curl https://t.test/.git/config -o ./out ; ls /etc/hosts");
         assert!(p.contains(&"~/.loom/config.toml".to_string()), "{p:?}");
         assert!(p.contains(&"./out".to_string()) && p.contains(&"/etc/hosts".to_string()), "{p:?}");
         assert!(!p.iter().any(|x| x.contains(".git/config")), "{p:?}");
         assert!(!without_urls("a https://x.test/p b").contains("x.test"));
+        let glued = without_urls("true http://x.test/;ps eww 1 && curl http://y.test/a?b=1&c=2 | cat $TMPDIR/f");
+        assert!(glued.contains("ps eww 1") && glued.contains("cat") && !glued.contains("y.test"), "{glued}");
+        assert!(!glued.contains("c=2"), "{glued}");
+        assert!(paths_in("cat $TMPDIR/../../s-x/log.jsonl").contains(&"$TMPDIR/../../s-x/log.jsonl".to_string()));
     }
 
     #[test]

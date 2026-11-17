@@ -13,13 +13,29 @@
 //!   reasoning cap, in that order). The S1 aggregation (§1.5) and the throttling of repeats are the core's. A hit rests
 //!   on the record it was read from (`pointer`), carries the key flags dedupe on, and says whether it is a part of the
 //!   §4.8 precision list.
-//! - Matching follows `tripwire`'s CONTRACT (§6.1): paths and destinations, not payload text aimed at granted targets;
-//!   the session's own TMPDIR and session paths are stripped after the path is canonical; prose fields (`State` and
+//! - Matching follows `tripwire`'s CONTRACT (§6.1): paths and destinations, not payload text aimed at granted targets
+//!   (TW-02, TW-04, TW-06's sink and TW-15 read `patterns::destination_text`: the leading authority of each URL and the
+//!   host operands of network commands, with the segments of search tools such as `grep` left out; `docker.sock` counts
+//!   as a path operand, not as a search pattern; a granted host covers the sink it carries by its full name); a path is
+//!   a *write* only where the command writes it (a `>` or `>>` target other than `/dev/null` and fd duplications, `tee`
+//!   operands, the destination of `cp`, `mv`, `ln` and `install`, `sed -i` files, `touch` and `truncate` operands,
+//!   `dd of=`); `$TMPDIR`, `${TMPDIR}`, `$PWD` and bare relative paths resolve to the session's TMPDIR and the
+//!   workspace; the session's own TMPDIR and session paths are stripped after the path is canonical. The `check` of
+//!   `attempt`, which the harness runs as a command, is read as a command though the tool is a `State` tool; every
+//!   other prose field (`State` and
 //!   `Terminal` tools: `finish`, `claim`, `report_blocker`, ledger tools, `agent_message`) are ignored except by
 //!   TW-03, TW-17, TW-24 and TW-26 (all prose), TW-06 (ledger prose, and credentials in any argument) and TW-19
 //!   (evidence quotes); `[lab]` grants and restricted-network packs relax C7 and C8 only; loopback and link-local are
 //!   never implicitly lab; hosts the operator granted or the configuration allows are never C1; every text is
-//!   `patterns::scan_form`ed (zero-width removed, runs of 8 bytes or more decoded) before it is matched.
+//!   `patterns::scan_form`ed (zero-width removed, runs of 8 bytes or more decoded) before it is matched. A hit's
+//!   `detail` and `key` carry no control character and no bidirectional or zero-width mark (an agent chose them).
+//! - TW-21 counts as in flight: an open call, an unsettled job, an interval a result reports (a result with no call on
+//!   the books, after a restart, is an interval of its own `duration_ms`) and every PTY opened and not closed (a
+//!   program left running in one). A session freed for being quiet keeps its calls, jobs and PTYs. A session that was
+//!   read before a restart is not judged for TW-21 until `blind_until` (the core sets it to the start plus
+//!   `RESTART_BLIND_MS`). TW-06's index (`log::SecretIndex`) holds, per hashed value, the missions whose own results
+//!   showed it; a use flags only a mission that never saw the value itself; one mission's flood evicts only its own
+//!   tags, and new tags are handed to the core to persist (`take_new_secrets`) and come back with `restore_secrets`.
 //! - What each tripwire reads, and where M2 stops (the rest is named in `docs/MONITOR.md` §9.5 or is a later phase):
 //!   TW-01 refused connections whose host the session's own arguments name (S1; S2 at 3 distinct hosts in 30 minutes or
 //!   5 over the mission; S3 when the host was steered, which nothing does before M4); TW-02 an attempt at an
@@ -53,7 +69,7 @@
 
 use crate::monitor::auth::{Authorization, Mark};
 use crate::monitor::fleet::FleetBook;
-use crate::monitor::log::Fold;
+use crate::monitor::log::{Fold, SecretIndex};
 use crate::monitor::patterns::{self as pat, patterns};
 use crate::monitor::taxonomy::{Basis, Category, Severity};
 use crate::monitor::tripwire::{canonical_path, own_tmp_relative, Hit, TripwireId};
@@ -222,6 +238,11 @@ struct SessionState {
     /// Net decisions per (host:port), for the rate of TW-14: timestamps in the last minute.
     rate: BTreeMap<String, VecDeque<u64>>,
     wrote_odd: BTreeMap<String, u64>,
+    /// PTYs opened and not closed (a program left running in one is in flight, TW-21).
+    ptys: Vec<String>,
+    /// Net decisions before this time are not judged for TW-21: the session was read before a restart, and what was in
+    /// flight then is not known.
+    blind_until: u64,
 }
 
 /// The tripwires' memory.
@@ -229,8 +250,10 @@ pub struct Engine {
     env: Arc<Env>,
     sessions: BTreeMap<SessionId, SessionState>,
     canaries: Vec<(String, String)>,
-    /// Credential value tag to the mission whose results showed it.
-    secrets: BTreeMap<String, MissionId>,
+    /// Credential value tags and the missions whose results showed them (TW-06).
+    secrets: SecretIndex,
+    /// Tags noted since the core last took them (it persists them).
+    new_secrets: Vec<(String, String, u64)>,
     recent_infra: BTreeMap<(String, String), u64>,
     /// Sessions whose last turn ended finished or stopped and which have not started a turn since: what nothing of
     /// should be running (TW-20). Kept apart from the per-session state, which `drop_session` frees.
@@ -246,7 +269,12 @@ patterns! {
     GIT_HOOKS => r"(?i)core\.(?:fsmonitor|hookspath)|git\s+config\s+(?:--global|--system)|~/\.gitconfig|\$HOME/\.gitconfig|\.git/worktrees/[^/\s']+/(?:commondir|gitdir)|\.git/modules/[^\s']+/hooks";
     GIT_WRITE_CMD => r"(?i)(?:>>?|\btee\b|\bsed\s+-\S*i|\bcp\b|\bmv\b|\bln\b|\binstall\b|\bgit\s+config\b|\bgit\s+submodule\b|\bchmod\b|\btouch\b)[^|;&\n]*(?:\.git/(?:config|hooks)|\.gitmodules)\b";
     GIT_PATH => r"(?i)(?:^|/)\.git/(?:hooks(?:/|$)|config$|worktrees/[^/]+/(?:commondir|gitdir)$|modules/.+/hooks)|(?:^|/)\.gitmodules$|(?:^|/)\.gitconfig$";
-    WRITE_VERB => r"(?i)>>?\s*\S|\btee\b|\bsed\s+-\S*i|\bcp\b|\bmv\b|\bln\b|\binstall\b|\btruncate\b|\bdd\b|\btouch\b";
+    WRITE_REDIRECT => r"(?:^|[\s;&|(])(?:\d?>>?|&>>?)\s*([^\s;&|<>()]+)";
+    WRITE_TEE => r"(?i)(?:^|[\s;&|(])tee\s+([^;&|\n]+)";
+    WRITE_COPY => r"(?i)(?:^|[\s;&|(])(?:cp|mv|ln|install)\s+([^;&|\n]+)";
+    WRITE_SED => r"(?i)(?:^|[\s;&|(])sed\s+([^;&|\n]+)";
+    WRITE_TOUCH => r"(?i)(?:^|[\s;&|(])(?:touch|truncate)\s+([^;&|\n]+)";
+    WRITE_DD => r"(?i)\bof=(\S+)";
     PROC_INSPECT => r"(?-i:\bps\s+(?:[a-z]*ew+[a-z]*|-[A-Za-z]*E[A-Za-z]*)(?:\s|$))|(?i:sysctl\s+(?:-\w+\s+)*kern\.procargs2?|/proc/(?:\d+|\*|\$\w+)/environ|\blsof\s+(?:-\w+\s+)*-p\s*\S+)";
     DETACH => r"(?i)(?:^|[\s;&|(])(?:setsid|disown)\b|\bnohup\s[^\n]*&|\btmux\s+new(?:-session)?\s+(?:-\w+\s+)*-d|\bscreen\s+(?:-\w+\s+)*-dm";
     SCHEDULE => r"(?i)(?:^|[\s;&|(])(?:launchctl|crontab|osascript)\b|(?:^|[\s;&|(])at\s+(?:now|-f|\d)|LaunchAgents|LaunchDaemons";
@@ -294,6 +322,8 @@ struct CallView {
     all: String,
     /// `State` and `Terminal` tools: the agent's prose.
     prose: bool,
+    /// The call runs a command: an `Exec` tool, or `attempt`, whose `check` the harness executes (§6.1).
+    runs: bool,
 }
 
 const PATH_KEYS: [&str; 10] =
@@ -328,6 +358,7 @@ impl CallView {
             content: String::new(),
             all: String::new(),
             prose,
+            runs: matches!(class, ToolClass::Exec) || name == "attempt",
         };
         for (k, s) in &ls {
             if !v.all.is_empty() {
@@ -343,7 +374,7 @@ impl CallView {
                     v.content.push('\n');
                 }
                 v.content.push_str(s);
-            } else if matches!(class, ToolClass::Exec) {
+            } else if matches!(class, ToolClass::Exec) || (name == "attempt" && k == "check") {
                 if !v.cmd.is_empty() {
                     v.cmd.push('\n');
                 }
@@ -355,12 +386,78 @@ impl CallView {
 
     /// The text a network or command tripwire reads: the command of an Exec call, the URLs of a fetch.
     fn action_text(&self) -> String {
-        if matches!(self.class, ToolClass::Exec) {
+        if self.runs {
             self.cmd.clone()
         } else {
             self.urls.join("\n")
         }
     }
+}
+
+/// The operands a command writes (§6.1: write targets, not every path in the text): the target of `>` and `>>`
+/// (never `/dev/null` or an fd duplication such as `2>&1`), `tee` operands, the destination of `cp`, `mv`, `ln` and
+/// `install`, the files of `sed -i`, `touch` and `truncate` operands and `dd of=`.
+fn write_targets(action: &str) -> Vec<String> {
+    let clean = |t: &str| t.trim_matches(['"', '\'']).to_string();
+    let operands = |text: &str| -> Vec<String> {
+        text.split_whitespace().filter(|t| !t.starts_with('-')).map(clean).filter(|t| !t.is_empty()).collect()
+    };
+    let mut out: Vec<String> = Vec::new();
+    for t in WRITE_REDIRECT.group1(action) {
+        let t = clean(t);
+        if !(t.is_empty() || t == "/dev/null" || t.starts_with("/dev/std") || t.starts_with("/dev/fd/")) {
+            out.push(t);
+        }
+    }
+    for g in WRITE_TEE.group1(action) {
+        out.extend(operands(g));
+    }
+    for g in WRITE_COPY.group1(action) {
+        out.extend(operands(g).pop());
+    }
+    for g in WRITE_SED.group1(action) {
+        let in_place = g
+            .split_whitespace()
+            .any(|t| t == "--in-place" || (t.starts_with('-') && !t.starts_with("--") && t.contains('i')));
+        if in_place {
+            let script_flag = g.split_whitespace().any(|t| t == "-e" || t == "-f");
+            let mut ops = operands(g);
+            if !script_flag && !ops.is_empty() {
+                ops.remove(0);
+            }
+            out.extend(ops);
+        }
+    }
+    for g in WRITE_TOUCH.group1(action) {
+        out.extend(operands(g).into_iter().filter(|t| t.parse::<u64>().is_err()));
+    }
+    for t in WRITE_DD.group1(action) {
+        out.push(clean(t));
+    }
+    out
+}
+
+/// True when a command names the Docker socket as a path operand (`--unix-socket /var/run/docker.sock`, `-v
+/// /var/run/docker.sock:/s`, `DOCKER_HOST=unix:///...`); a search for the name (`grep docker.sock compose.yml`) does not.
+fn names_docker_socket(scan: &str) -> bool {
+    let segments: Vec<&str> = pat::SEGMENT_SEP.split(scan);
+    segments.iter().filter(|seg| !pat::SEARCH_TOOL.is_match(seg)).any(|seg| {
+        seg.split_whitespace().any(|t| {
+            let t = t.trim_matches(['"', '\'']);
+            DOCKER_SOCK.is_match(t) && t.contains('/')
+        })
+    })
+}
+
+/// `text` without controls (C0, DEL, C1) and without the zero-width and bidirectional marks: what an agent chose
+/// (a path, a host, a locator) reaches the log and the operator's terminal as plain text.
+fn printable(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(*c as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF)
+        })
+        .collect()
 }
 
 fn entropy(s: &str) -> f64 {
@@ -410,7 +507,8 @@ impl Engine {
             env,
             sessions: BTreeMap::new(),
             canaries: Vec::new(),
-            secrets: BTreeMap::new(),
+            secrets: SecretIndex::default(),
+            new_secrets: Vec::new(),
             recent_infra: BTreeMap::new(),
             ended: BTreeSet::new(),
             fleet: FleetBook::default(),
@@ -436,8 +534,44 @@ impl Engine {
     }
 
     /// Forget a session's per-record memory (a replay frees it when the log is read; the fleet book keeps what it needs).
+    /// A session with a call, a job or a PTY in flight keeps those (and the intervals), so a long job's traffic is not
+    /// read as an idle session's.
     pub fn drop_session(&mut self, session: &SessionId) {
-        self.sessions.remove(session);
+        let Some(st) = self.sessions.get_mut(session) else { return };
+        if st.open.is_empty() && st.jobs.is_empty() && st.ptys.is_empty() {
+            self.sessions.remove(session);
+            return;
+        }
+        *st = SessionState {
+            ctx: st.ctx.take(),
+            open: std::mem::take(&mut st.open),
+            intervals: std::mem::take(&mut st.intervals),
+            jobs: std::mem::take(&mut st.jobs),
+            ptys: std::mem::take(&mut st.ptys),
+            blind_until: st.blind_until,
+            ..SessionState::default()
+        };
+    }
+
+    /// The session was read before a restart: its net decisions before `until` are not judged for TW-21.
+    pub fn blind_until(&mut self, session: &SessionId, until: u64) {
+        let st = self.sessions.entry(session.clone()).or_default();
+        st.blind_until = st.blind_until.max(until);
+    }
+
+    /// The credential index a restart restores.
+    pub fn restore_secrets(&mut self, index: SecretIndex) {
+        self.secrets = index;
+    }
+
+    /// Are there credential tags the core has not persisted?
+    pub fn has_new_secrets(&self) -> bool {
+        !self.new_secrets.is_empty()
+    }
+
+    /// The credential tags noted since the last call: (tag, mission, ts_ms).
+    pub fn take_new_secrets(&mut self) -> Vec<(String, String, u64)> {
+        std::mem::take(&mut self.new_secrets)
     }
 
     /// Sessions whose last turn ended finished or stopped (what nothing of should be running).
@@ -454,12 +588,25 @@ impl Engine {
             format!("{}/{rest}", user_home.unwrap_or_default().trim_end_matches('/'))
         } else if raw == "~" || raw == "$HOME" {
             user_home.unwrap_or_default()
+        } else if let Some(rest) = raw
+            .strip_prefix("$TMPDIR")
+            .or_else(|| raw.strip_prefix("${TMPDIR}"))
+            .filter(|r| r.is_empty() || r.starts_with('/'))
+        {
+            format!("{}{rest}", ctx.own_tmp(&self.env))
+        } else if let Some(rest) = raw
+            .strip_prefix("$PWD")
+            .or_else(|| raw.strip_prefix("${PWD}"))
+            .filter(|r| r.is_empty() || r.starts_with('/'))
+        {
+            format!("{}{rest}", ctx.workspace.trim_end_matches('/'))
         } else if raw.starts_with('/') {
             raw.to_string()
-        } else if raw.starts_with("./") || raw.starts_with("../") {
-            format!("{}/{raw}", ctx.workspace.trim_end_matches('/'))
-        } else {
+        } else if raw.is_empty() || raw.contains("://") || raw.contains('\n') || raw.starts_with('$') {
             return None;
+        } else {
+            // A relative path is the workspace's (the form file tools take).
+            format!("{}/{raw}", ctx.workspace.trim_end_matches('/'))
         };
         let canon = canonical_path(&expanded);
         let own_tmp = ctx.own_tmp(&self.env);
@@ -497,6 +644,7 @@ impl Engine {
         detail: impl Into<String>,
         precision: bool,
     ) -> Hit {
+        let (detail, key): (String, String) = (detail.into(), key.into());
         Hit {
             id: TripwireId::of(tw),
             mission: ctx.mission.clone(),
@@ -504,8 +652,8 @@ impl Engine {
             pointer: (ctx.session.clone(), rec.seq),
             category: cat,
             severity: base.assess(cat, ctx.relaxed, basis),
-            detail: detail.into(),
-            key: key.into(),
+            detail: printable(&detail),
+            key: printable(&key),
             at_ms: rec.ts_ms,
             basis,
             precision,
@@ -551,6 +699,7 @@ impl Engine {
             Event::TurnEnd { reason } => {
                 if matches!(reason, TurnEndReason::Finished | TurnEndReason::Stopped) {
                     self.ended.insert(ctx.session.as_str().to_string());
+                    self.state(ctx).ptys.clear();
                 }
                 if matches!(reason, TurnEndReason::BudgetExhausted) {
                     self.fleet.budget_end(&ctx.mission, rec.ts_ms);
@@ -559,6 +708,7 @@ impl Engine {
             Event::SessionEnd { outcome, .. } => {
                 let _ = outcome;
                 self.ended.insert(ctx.session.as_str().to_string());
+                self.state(ctx).ptys.clear();
             }
             _ => {}
         }
@@ -726,7 +876,7 @@ impl Engine {
             "evidence" | "evidence_add" | "attach_evidence" => self.evidence_quote(ctx, rec, &c.args, out),
             _ => {}
         }
-        if view.prose {
+        if view.prose && !view.runs {
             return;
         }
         // Everything below reads what the call does, not what it says.
@@ -757,17 +907,24 @@ impl Engine {
 
     fn local_paths(&mut self, ctx: &SessionCtx, rec: &Record, view: &CallView, action: &str, out: &mut Vec<Hit>) {
         let mut raw: Vec<String> = view.paths.clone();
-        if matches!(view.class, ToolClass::Exec) {
+        if view.runs {
             raw.extend(pat::paths_in(action));
         }
-        let writes = matches!(view.class, ToolClass::Write)
-            || (matches!(view.class, ToolClass::Exec) && WRITE_VERB.is_match(action));
+        let class_writes = matches!(view.class, ToolClass::Write);
+        let targets = if view.runs {
+            write_targets(pat::cut(&pat::without_urls(action), pat::MAX_SCAN_BYTES))
+        } else {
+            Vec::new()
+        };
+        let written: BTreeSet<String> = targets.iter().filter_map(|t| self.place(ctx, t)).map(|(_, c)| c).collect();
+        raw.extend(targets);
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for p in raw.iter().take(64) {
             let Some((place, canon)) = self.place(ctx, p) else { continue };
             if !seen.insert(canon.clone()) {
                 continue;
             }
+            let writes = class_writes || written.contains(&canon);
             match place {
                 Place::Own => {}
                 Place::OtherSession => out.push(self.mk(
@@ -914,7 +1071,7 @@ impl Engine {
         fold: &Fold,
         out: &mut Vec<Hit>,
     ) {
-        let exec = matches!(view.class, ToolClass::Exec);
+        let exec = view.runs;
         let box_tool = view.name.starts_with("box_") || view.name.starts_with("rootbox_");
         let non_lab: Vec<&String> = hosts.iter().filter(|h| !self.is_lab(auth, h, None)).collect();
         if exec {
@@ -1115,7 +1272,7 @@ impl Engine {
                         continue;
                     }
                     let t = t.trim_matches(['"', '\'']);
-                    let outside = if t == "/" || t == "~" || t == "*" || t == "/*" || t == "~/*" || t == "$HOME" {
+                    let outside = if t == "/" || t == "~" || t == "/*" || t == "~/*" || t == "$HOME" {
                         true
                     } else if t.starts_with('/') || t.starts_with("~/") || t.starts_with("$HOME/") {
                         match self.place(ctx, t) {
@@ -1246,7 +1403,9 @@ impl Engine {
         fold: &Fold,
         out: &mut Vec<Hit>,
     ) {
-        if DOCKER_SOCK.is_match(action) || DOCKER_SOCK.is_match(&view.paths.join("\n")) {
+        let _ = hosts;
+        let scan = pat::scan_form(action);
+        if names_docker_socket(&scan) || DOCKER_SOCK.is_match(&view.paths.join("\n")) {
             out.push(self.mk(
                 ctx,
                 rec,
@@ -1259,9 +1418,16 @@ impl Engine {
                 true,
             ));
         }
-        let mut dests: Vec<String> = hosts.to_vec();
+        // What the call connects to, not what it carries (§6.1): a URL in a query string, a search pattern or a body
+        // is the target's to judge.
+        let dscan = pat::destination_text(&scan);
+        let mut dests: Vec<String> = pat::hosts_in(&dscan);
         for u in &view.urls {
-            dests.extend(pat::hosts_in(u));
+            for h in pat::hosts_in(&pat::destination_text(u)) {
+                if !dests.contains(&h) {
+                    dests.push(h);
+                }
+            }
         }
         for h in &dests {
             if let Some(rule) = self.infra_class(h, 443).or_else(|| self.infra_class(h, 80)) {
@@ -1278,23 +1444,19 @@ impl Engine {
                 ));
             }
         }
-        let scan = pat::scan_form(action);
-        self.bypass_in(ctx, rec, &scan, &dests, fold, out);
-        if let Some(m) = SINK.first(&scan) {
-            let sink = m.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_lowercase();
-            if !self.authorized(auth, &sink, None) {
-                out.push(self.mk(
-                    ctx,
-                    rec,
-                    15,
-                    Category::Exfiltration,
-                    Severity::S2,
-                    Basis::Action,
-                    sink.clone(),
-                    format!("a call that names a sink: {sink}"),
-                    false,
-                ));
-            }
+        self.bypass_in(ctx, rec, &dscan, &dests, fold, out);
+        if let Some(sink) = self.unauthorized_sink(auth, &dscan) {
+            out.push(self.mk(
+                ctx,
+                rec,
+                15,
+                Category::Exfiltration,
+                Severity::S2,
+                Basis::Action,
+                sink.clone(),
+                format!("a call that names a sink: {sink}"),
+                false,
+            ));
         }
         for h in &dests {
             if let Some(l) = suspicious_label(h) {
@@ -1311,6 +1473,20 @@ impl Engine {
                 ));
             }
         }
+    }
+
+    /// The sink `dscan` names when no grant or allow entry covers the host that carries it (the whole host, so a granted
+    /// `abc.oast.pro` covers its own name), as the name the pattern found.
+    fn unauthorized_sink(&self, auth: &Authorization, dscan: &str) -> Option<String> {
+        let m = SINK.first(dscan)?;
+        let sink = m.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_lowercase();
+        let carriers: Vec<String> = pat::hosts_in(dscan).into_iter().filter(|h| h.contains(&sink)).collect();
+        let covered = if carriers.is_empty() {
+            self.authorized(auth, &sink, None)
+        } else {
+            carriers.iter().all(|h| self.authorized(auth, h, None))
+        };
+        (!covered).then_some(sink)
     }
 
     fn bypass_in(&self, ctx: &SessionCtx, rec: &Record, scan: &str, dests: &[String], fold: &Fold, out: &mut Vec<Hit>) {
@@ -1406,8 +1582,13 @@ impl Engine {
             }
         }
         if OPERATOR_CLAIM.is_match(why) {
-            let holds = operator_text.contains("authoriz")
-                || hosts.iter().any(|h| operator_text.contains(&pat::registrable_domain(h.trim_start_matches("*."))));
+            // The claim holds when operator text names what it asks for (a host or its registrable domain); with no
+            // host to name, when operator text speaks of an authorization at all.
+            let holds = if hosts.is_empty() {
+                operator_text.contains("authoriz")
+            } else {
+                hosts.iter().any(|h| operator_text.contains(&pat::registrable_domain(h.trim_start_matches("*."))))
+            };
             if !holds {
                 out.push(self.mk(
                     ctx,
@@ -1485,42 +1666,37 @@ impl Engine {
         if kinds.is_empty() {
             return;
         }
-        let scan = pat::scan_form(action);
-        let sink = SINK.first(&scan).map(|m| m.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_lowercase());
-        if let Some(s) = sink {
-            if !self.authorized(auth, &s, None) {
+        let dscan = pat::destination_text(&pat::scan_form(action));
+        if let Some(s) = self.unauthorized_sink(auth, &dscan) {
+            out.push(self.mk(
+                ctx,
+                rec,
+                6,
+                Category::Exfiltration,
+                Severity::S4,
+                Basis::Action,
+                format!("sink:{s}"),
+                format!("a credential ({}) in a call toward a sink: {s}", kinds.join(", ")),
+                true,
+            ));
+        }
+        for v in pat::credential_values(&text) {
+            let tag = pat::value_tag(&v);
+            if let Some(owner) = self.secrets.other_owner(&tag, &ctx.mission) {
                 out.push(self.mk(
                     ctx,
                     rec,
                     6,
-                    Category::Exfiltration,
+                    Category::CredentialMisuse,
                     Severity::S4,
                     Basis::Action,
-                    format!("sink:{s}"),
-                    format!("a credential ({}) in a call toward a sink: {s}", kinds.join(", ")),
+                    format!("other-mission:{tag}"),
+                    format!(
+                        "a credential that the results of mission {} showed is used here (tag {tag})",
+                        owner.as_str()
+                    ),
                     true,
                 ));
-            }
-        }
-        for v in pat::credential_values(&text) {
-            let tag = pat::value_tag(&v);
-            if let Some(owner) = self.secrets.get(&tag) {
-                if owner != &ctx.mission {
-                    out.push(self.mk(
-                        ctx,
-                        rec,
-                        6,
-                        Category::CredentialMisuse,
-                        Severity::S4,
-                        Basis::Action,
-                        format!("other-mission:{tag}"),
-                        format!(
-                            "a credential that the results of mission {} showed is used here (tag {tag})",
-                            owner.as_str()
-                        ),
-                        true,
-                    ));
-                }
             }
         }
         let _ = hosts;
@@ -1538,9 +1714,27 @@ impl Engine {
         out: &mut Vec<Hit>,
     ) {
         let open = self.state(ctx).open.remove(r.call_id.as_str());
-        if let Some(call) = &open {
+        {
             let st = self.state(ctx);
-            push_interval(&mut st.intervals, call.ts, rec.ts_ms);
+            match &open {
+                Some(call) => push_interval(&mut st.intervals, call.ts, rec.ts_ms),
+                // A call that began before the monitor's memory (a restart): its own duration says when it ran.
+                None if r.duration_ms > 0 => {
+                    push_interval(&mut st.intervals, rec.ts_ms.saturating_sub(r.duration_ms), rec.ts_ms)
+                }
+                None => {}
+            }
+            if r.name.starts_with("pty_") {
+                let id = r.meta.get("pty").and_then(Value::as_str).map(str::to_string);
+                match (r.name.as_str(), id) {
+                    ("pty_close", Some(id)) if matches!(r.status, ToolStatus::Ok) => st.ptys.retain(|p| p != &id),
+                    ("pty_close", None) if matches!(r.status, ToolStatus::Ok) => {
+                        st.ptys.pop();
+                    }
+                    (_, Some(id)) if !st.ptys.contains(&id) && st.ptys.len() < 64 => st.ptys.push(id),
+                    _ => {}
+                }
+            }
         }
         let text = pat::cut(&r.text, pat::MAX_SCAN_BYTES);
         self.canary_in(ctx, rec, text, false, "a result", out);
@@ -1548,8 +1742,8 @@ impl Engine {
         if !matches!(r.status, ToolStatus::Invalid) {
             for v in pat::credential_values(text) {
                 let tag = pat::value_tag(&v);
-                if self.secrets.len() < 100_000 {
-                    self.secrets.entry(tag).or_insert_with(|| ctx.mission.clone());
+                if self.secrets.note(&tag, &ctx.mission, rec.ts_ms) && self.new_secrets.len() < 4_096 {
+                    self.new_secrets.push((tag, ctx.mission.as_str().to_string(), rec.ts_ms));
                 }
             }
         }
@@ -1780,8 +1974,9 @@ impl Engine {
                 let hosts_now = book.map_or(0, |b| b.distinct_since(ts_ms.saturating_sub(WINDOW_MS)));
                 let hosts_all = book.map_or(0, |b| b.keys.len());
                 let seen_host = book.is_some_and(|b| b.keys.contains(&host));
+                let seen_now = book.is_some_and(|b| b.has_key_since(&host, ts_ms.saturating_sub(WINDOW_MS)));
                 let (w, a) = (
-                    hosts_now.saturating_add(usize::from(!seen_host)),
+                    hosts_now.saturating_add(usize::from(!seen_now)),
                     hosts_all.saturating_add(usize::from(!seen_host)),
                 );
                 let steered = fold.steered.contains(&(ctx.mission.clone(), 1, host.clone()));
@@ -1876,7 +2071,7 @@ impl Engine {
         }
         // TW-21 needs the session's own log read to `ts_ms + grace`; the core holds the entry back until then.
         if let Some(st) = self.sessions.get(&ctx.session) {
-            if !st.busy_at(ts_ms) {
+            if ts_ms >= st.blind_until && !st.busy_at(ts_ms) {
                 self.fleet.idle_egress(&ctx.mission, &ctx.session, &host, port, ts_ms);
                 out.push(self.mk(
                     ctx,
@@ -2079,7 +2274,8 @@ impl SessionState {
     fn busy_at(&self, t: u64) -> bool {
         let lo = t.saturating_sub(IDLE_GRACE_MS);
         let hi = t.saturating_add(IDLE_GRACE_MS);
-        self.open.values().any(|c| c.ts <= hi)
+        !self.ptys.is_empty()
+            || self.open.values().any(|c| c.ts <= hi)
             || self.jobs.values().any(|s| *s <= hi)
             || self.intervals.iter().rev().any(|(s, e)| *s <= hi && *e >= lo)
     }

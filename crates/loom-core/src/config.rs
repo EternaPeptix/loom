@@ -63,7 +63,7 @@
 //! `recipient` (`"local"`, `"lan"` or a provider name) and `purpose = "review"`; what unset ones resolve to is
 //! `lineage::resolve`. `[monitor]` accepts `reviewers` (profile names, in preference order), `tripwires_only_profiles`,
 //! `recipients` (per pack: the recipients the operator consents to), `content.new_recipient_real_targets`
-//! (`"features"` default, or `"redacted"`) and `known_families`; M2 adds `enabled` (default true; false builds no monitor),
+//! (`"features"` default, or `"redacted"`) and `known_families`; M2 adds `enabled` (default true; false keeps only the precision-list, S4 and canary tripwires),
 //! `mode` (`"shadow"`, the only value until M4), `fleet_every_s` (default 300, at least 10) and `monitor_down`
 //! (`"pause_real_targets"` default, or `"notify"`); later phases add the other keys of the monitor.
 //! `Config::check` refuses, each with a sentence that names the key and the fix: an empty `family` list or a family
@@ -172,7 +172,8 @@ pub enum MonitorMode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MonitorCfg {
-    /// Duty W: the tripwires run on every record of every session. `false` builds no monitor at all.
+    /// Duty W: the tripwires run on every record of every session. `false` keeps only the precision-list, S4 and canary
+    /// tripwires, which have no off switch (design 7.1); the monitor still reads, logs and shows its status.
     pub enabled: bool,
     /// The starting state of the causes.
     pub mode: MonitorMode,

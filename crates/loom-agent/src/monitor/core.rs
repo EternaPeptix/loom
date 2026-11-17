@@ -28,16 +28,28 @@
 //!   their hits are deduplicated by the throttle above. A source that cannot be read (a chain that breaks, a file that
 //!   is shorter than its cursor) is recorded once as a `cursor` entry with a `fault` and is not read again until the
 //!   process restarts; it is shown in the status as faulty and is never an agent's misbehaviour (I10). On the very first
-//!   start (no entry, no cursor) every source that exists begins at its end, so a first run raises nothing retroactive.
+//!   start (a log with no cursor, flag or tripwire: nothing was ever read, whatever the first-start marker says, so a
+//!   start that was cut short is still the first) every source that exists begins at its end, so a first run raises
+//!   nothing retroactive. The `n:<dir>` cursor a checkpoint holds is the one after the last net decision that was
+//!   *judged*: decisions that wait out their grace are read again after a restart. A checkpoint may carry `secrets`
+//!   (the new credential tags, `log::SecretIndex`), which the fold keeps and `Core::open` hands to the engine.
 //! - **Context after a restart:** the engine's per-session memory (the calls in flight, the hosts the agent named, the
 //!   last arguments, the baseline of the script) starts empty for a session that was read before; the counters
-//!   (distinct hosts, S1 targets, repeats) are exact, because they come from the log. This is the one thing a restart
-//!   loses; it can only make a tripwire quieter (TW-01 reads a refused host as unnamed, TW-19 and TW-25 start over).
+//!   (distinct hosts, S1 targets, repeats) and the credential index are exact, because they come from the log. What a
+//!   restart loses can only make a tripwire quieter (TW-01 reads a refused host as unnamed, TW-19 and TW-25 start
+//!   over), and the one tripwire it could make louder, TW-21, is held: a session read before the restart is not
+//!   judged for idle egress until `RESTART_BLIND_MS` after the start (what was in flight is not known), and a result
+//!   whose call is not on the books is an interval of its own duration.
 //! - **Heartbeat:** `heartbeat_ms` is set at every pump, and a `heartbeat` entry is written every `HEARTBEAT_LOG_MS`.
 //!   `Monitor::status().heartbeat_ms` older than 30 s means the worker is not running.
 //! - **Faults of its own** (an unwritable log, a source that cannot be read) never open a flag, never count toward a
 //!   denial counter and are not evaluation data (I10). An unwritable log makes the monitor `down`: pumping stops, the
-//!   status says why, and pause entries go to the reserve (`log.rs`). Nothing is applied before it is recorded.
+//!   status says why, and pause entries go to the reserve (`log.rs`). Nothing is applied before it is recorded. A
+//!   full disk is not forever: the entries that failed are kept in order (4096 at most), every pump tries the log
+//!   again after `RETRY_DOWN_MS`, writes them first and a heartbeat after, and the monitor is up again (no restart);
+//!   the cursors were not checkpointed meanwhile, so nothing unread is lost.
+//! - **`enabled = false`** keeps the precision-list, S4 and canary tripwires (they have no off switch, design 7.1): the
+//!   core reads and logs only the hits that are `precision`, S4 or TW-24; the rest are dropped.
 //! - **Authorization:** `auth_for(mission, ts)` is `Authorization::build` over the mission's journal entries up to `ts`
 //!   and the operator's messages up to `ts`, cached per mission until the journal or the messages change. A mission's
 //!   journal is read when a session of it wrote a `ledger` record (debounced by `LEDGER_DEBOUNCE_MS`), verified with
@@ -49,7 +61,10 @@
 //! Tests required: a first run starts at the end of every source and raises nothing; a hit becomes a tripwire entry, a
 //! flag and a response, once; repeats are throttled and counted; the S1 aggregation raises the third distinct target;
 //! a restart resumes from its cursors and does not read twice; a source with a broken chain is recorded once and not
-//! read again; an unwritable log makes the monitor down; a net decision is judged after its grace and after the log; a
+//! read again; an unwritable log makes the monitor down and a log that works again lifts it without losing the hits;
+//! an interrupted first start is still a first start; a child primed before its `forked` record is read from it on; a
+//! net decision that waited out no grace is read again after a restart; the credential index survives a restart; a
+//! disabled core keeps the precision list; an S1 target back inside the window counts; a net decision is judged after its grace and after the log; a
 //! mission's authorization follows its journal and its operator messages; the fleet scan runs on its period and reports
 //! once; a memory core writes no file; the status counts what was read.
 
@@ -85,6 +100,13 @@ pub const LEDGER_DEBOUNCE_MS: u64 = 2_000;
 pub const DISCOVER_EVERY_MS: u64 = 10_000;
 /// A session with no record for this long has its tripwire memory freed.
 pub const QUIET_FREE_MS: u64 = 60 * 60 * 1000;
+/// How long after a start a resumed session's net decisions are not judged for TW-21: what was in flight when the
+/// daemon stopped is not known.
+pub const RESTART_BLIND_MS: u64 = 10 * 60 * 1000;
+/// The longest a failed entry waits to be written again.
+const RETRY_DOWN_MS: u64 = 2_000;
+/// The most entries held for a log that cannot be written.
+const UNWRITTEN_MAX: usize = 4_096;
 /// Passes over one source per pump (each reads at most `source::MAX_BYTES`).
 const PASSES: usize = 8;
 
@@ -95,7 +117,11 @@ struct Src {
     net: Cursor,
     primed: Option<Primed>,
     skip_below: u64,
-    pending_net: VecDeque<NetEntry>,
+    /// Net decisions read and not yet judged, each with the cursor after it.
+    pending_net: VecDeque<(NetEntry, Cursor)>,
+    /// The cursor after the last net decision that was judged: what a checkpoint may say about `n:<dir>` while
+    /// decisions wait out their grace.
+    net_judged: Cursor,
     fault: Option<String>,
     net_fault: Option<String>,
     last_ts: u64,
@@ -150,7 +176,8 @@ pub struct TwStatus {
 /// The monitor's status (`GET /api/monitor`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MonitorStatus {
-    /// `shadow`, `degraded` (a source is faulty or the worker lags) or `down` (the log cannot be written or verified).
+    /// `shadow`, `degraded` (a source is faulty, or `Monitor::status` found the heartbeat older than
+    /// `STALE_HEARTBEAT_MS`: the worker is not running) or `down` (the log cannot be written or verified).
     pub state: String,
     pub mode: String,
     pub enabled: bool,
@@ -212,6 +239,10 @@ pub struct Core {
     enabled: bool,
     down: Option<String>,
     backlog_since: Option<u64>,
+    /// Entries that could not be written (a full disk), in order, written first when the log takes writes again.
+    unwritten: VecDeque<(EntryKind, Map<String, Value>)>,
+    last_retry: u64,
+    started_ms: u64,
 }
 
 fn word(r: Response) -> &'static str {
@@ -241,9 +272,13 @@ impl Core {
         journal_key: Option<Vec<u8>>,
     ) -> Result<Core, MonitorError> {
         let (log, fold, opened) = MonitorLog::open_with_report(&paths.home)?;
-        let first = opened.first_start && fold.cursors.is_empty() && fold.last_seq <= 1;
+        // A log that holds no cursor, flag or tripwire has read nothing yet, whatever the marker says: a start that
+        // was cut short before its first checkpoint is still the first start.
+        let first = fold.cursors.is_empty() && fold.flags.is_empty() && fold.stats.is_empty();
+        let _ = opened;
         let mut c = Core::blank(paths, env, cfg, journal_key);
         c.log = Some(log);
+        c.engine.restore_secrets(fold.secrets.clone());
         c.fold = fold;
         c.first_start = first;
         Ok(c)
@@ -288,6 +323,9 @@ impl Core {
             enabled: cfg.enabled,
             down: None,
             backlog_since: None,
+            unwritten: VecDeque::new(),
+            last_retry: 0,
+            started_ms: 0,
         }
     }
 
@@ -320,6 +358,16 @@ impl Core {
     // ---- recording ------------------------------------------------------------------------------------------------------
 
     fn emit(&mut self, kind: EntryKind, fields: Map<String, Value>) -> Option<Entry> {
+        if self.log.is_some() && !self.unwritten.is_empty() {
+            // Order is kept: what failed before is written first, or this one waits behind it.
+            if self.down.is_some() {
+                if self.unwritten.len() < UNWRITTEN_MAX {
+                    self.unwritten.push_back((kind, fields));
+                }
+                return None;
+            }
+        }
+        let fields_back = if self.log.is_some() { fields.clone() } else { Map::new() };
         match self.log.as_mut() {
             Some(log) => match log.append(kind, fields) {
                 Ok(e) => {
@@ -331,6 +379,9 @@ impl Core {
                         tracing::error!("the monitor log cannot be written: {e}");
                     }
                     self.down = Some(e.to_string());
+                    if self.unwritten.len() < UNWRITTEN_MAX {
+                        self.unwritten.push_back((kind, fields_back));
+                    }
                     None
                 }
             },
@@ -351,6 +402,38 @@ impl Core {
         }
     }
 
+    /// Try the log again after a failed write (a full disk is not forever): what failed is written first and, when all of
+    /// it is, the monitor is up again. Nothing was read meanwhile that the failed entries do not cover.
+    fn recover(&mut self, now: u64) -> bool {
+        if self.down.is_none() && !self.log.as_ref().is_some_and(|l| l.is_down()) {
+            return true;
+        }
+        if now.saturating_sub(self.last_retry) < RETRY_DOWN_MS {
+            return false;
+        }
+        self.last_retry = now;
+        let Some(log) = self.log.as_mut() else { return true };
+        while let Some((kind, fields)) = self.unwritten.pop_front() {
+            match log.append(kind, fields.clone()) {
+                Ok(e) => self.fold.apply(&e),
+                Err(_) => {
+                    self.unwritten.push_front((kind, fields));
+                    return false;
+                }
+            }
+        }
+        // The heartbeat proves the log takes writes again.
+        match log.append(EntryKind::Heartbeat, Map::new()) {
+            Ok(e) => {
+                self.fold.apply(&e);
+                self.down = None;
+                tracing::warn!("the monitor log takes writes again; the monitor is up");
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     fn flag_id(mission: &MissionId, category: &str, key: &str) -> String {
         let h = loom_core::sha256_hex(format!("{}|{category}|{key}", mission.as_str()).as_bytes());
         format!("f-{}", h.get(..8).unwrap_or(&h))
@@ -361,13 +444,18 @@ impl Core {
         if hit.severity == Severity::S0 {
             return;
         }
+        // With `[monitor] enabled = false` only what has no off switch runs: the precision list, S4 and the canaries.
+        let kept = hit.precision || hit.severity >= Severity::S4 || hit.id.number() == 24;
+        if !self.enabled && !kept {
+            return;
+        }
         let number = hit.id.number();
         let cat = hit.category.slug().to_string();
         if hit.severity == Severity::S1 {
             let book = self.fold.s1.get(&(hit.mission.clone(), cat.clone()));
             let since = hit.at_ms.saturating_sub(S1_WINDOW_MS);
-            let known = book.is_some_and(|b| b.keys.contains(&hit.key));
-            let window = book.map_or(0, |b| b.distinct_since(since)).saturating_add(usize::from(!known));
+            let in_window = book.is_some_and(|b| b.has_key_since(&hit.key, since));
+            let window = book.map_or(0, |b| b.distinct_since(since)).saturating_add(usize::from(!in_window));
             let lifetime = book.map_or(0, |b| b.count).saturating_add(1);
             if s1_escalates(u32::try_from(window).unwrap_or(u32::MAX), u32::try_from(lifetime).unwrap_or(u32::MAX)) {
                 hit.severity = Severity::S2;
@@ -412,9 +500,8 @@ impl Core {
         if hit.from_s1 {
             f.insert("from_s1".into(), Value::Bool(true));
         }
-        if self.emit(EntryKind::Tripwire, f).is_none() {
-            return;
-        }
+        // An entry the log would not take is held and written when it can (`recover`); the flag follows it either way.
+        self.emit(EntryKind::Tripwire, f);
         if hit.severity >= Severity::S2 {
             self.flag(
                 &hit.mission,
@@ -480,9 +567,7 @@ impl Core {
         }
         let causes: Vec<String> = rec.causes.iter().cloned().collect();
         let fields = obj(serde_json::to_value(&rec).unwrap_or(Value::Null));
-        if self.emit(EntryKind::Flag, fields).is_none() {
-            return;
-        }
+        self.emit(EntryKind::Flag, fields);
         if announce {
             self.emit(
                 EntryKind::Response,
@@ -664,6 +749,7 @@ impl Core {
                 Src {
                     dir,
                     cur,
+                    net_judged: net.clone(),
                     net,
                     primed: None,
                     skip_below: 0,
@@ -689,6 +775,10 @@ impl Core {
         let (pack, role) = (ctx.pack.clone(), ctx.role.clone());
         let prior = p.prior.clone();
         self.engine.set_ctx(ctx.clone());
+        if self.srcs.get(name).is_some_and(|s| s.cur.off > 0) && self.started_ms > 0 {
+            // Read before (or begun at its end): what was in flight at the start is not known.
+            self.engine.blind_until(&ctx.session, self.started_ms.saturating_add(RESTART_BLIND_MS));
+        }
         let ms = self.mstate(&mission, &pack, &role);
         if ms.prior.is_empty() && !prior.is_empty() {
             ms.prior = prior.clone();
@@ -720,7 +810,7 @@ impl Core {
                 break;
             }
             let read = source::read_session(&src.dir.join("log.jsonl"), &src.cur);
-            let skip_below = src.skip_below;
+            let mut skip_below = src.skip_below;
             let mut ctx = match src.primed.as_ref() {
                 Some(p) => p.ctx.clone(),
                 None => return progress,
@@ -733,18 +823,25 @@ impl Core {
             for rec in &read.records {
                 self.counts.records = self.counts.records.saturating_add(1);
                 self.clock_ms = self.clock_ms.max(rec.ts_ms);
-                if rec.seq < skip_below {
-                    continue;
-                }
+                // The child's own `forked` record ends the parent's copy, so it is judged before the skip test: a
+                // child primed between its copy and that record (the fork writes them apart) is read from here on.
+                let mut skip = rec.seq < skip_below;
                 if let Event::Forked(f) = &rec.event {
-                    if let Some(src) = self.srcs.get_mut(name) {
-                        if src.skip_below == u64::MAX {
-                            src.skip_below = rec.seq;
+                    if f.session.as_str() == name {
+                        if let Some(src) = self.srcs.get_mut(name) {
+                            if src.skip_below == u64::MAX {
+                                src.skip_below = rec.seq;
+                                skip_below = rec.seq;
+                            }
                         }
+                        skip = false;
+                        ctx.role = f.role.clone();
+                        ctx.parent = Some(f.parent.clone());
+                        self.engine.set_ctx(ctx.clone());
                     }
-                    ctx.role = f.role.clone();
-                    ctx.parent = Some(f.parent.clone());
-                    self.engine.set_ctx(ctx.clone());
+                }
+                if skip {
+                    continue;
                 }
                 self.observe(&mut ctx, rec, name);
             }
@@ -781,11 +878,13 @@ impl Core {
         // Operator words are authorization.
         if matches!(rec.author, Author::User) {
             let text = match &rec.event {
-                Event::UserMessage { text } => Some(text.clone()),
+                // The echo of an answered item carries the agent's own text in its header; only the operator's
+                // answer is authorization (the answer itself is in `InboxResolved`).
+                Event::UserMessage { text } => Some(crate::texts::without_inbox_echo(text).to_string()),
                 Event::InboxResolved { answer, .. } => Some(answer.clone()),
                 _ => None,
             };
-            if let Some(t) = text {
+            if let Some(t) = text.filter(|t| !t.is_empty()) {
                 let m = self.mstate(&mission, &ctx.pack.clone(), &ctx.role.clone());
                 m.facts.operator_messages.push((rec.ts_ms, t));
                 m.cache = None;
@@ -832,17 +931,12 @@ impl Core {
                 let read = source::read_net(&src.dir.join("net.jsonl"), &src.net);
                 let more = read.more;
                 let n = read.entries.len();
-                src.pending_net.extend(read.entries);
+                src.pending_net.extend(read.entries.into_iter().zip(read.ends));
                 self.counts.net = self.counts.net.saturating_add(n as u64);
-                let key = format!("n:{name}");
-                if read.cursor != src.net {
-                    src.net = read.cursor.clone();
-                    self.fold.cursors.insert(key.clone(), read.cursor);
-                    self.dirty_cursors.insert(key.clone());
-                }
+                src.net = read.cursor.clone();
                 if let Some(f) = read.fault {
                     src.net_fault = Some(f.clone());
-                    self.shared_faults.insert(key, f);
+                    self.shared_faults.insert(format!("n:{name}"), f);
                     break;
                 }
                 if !more || n == 0 {
@@ -856,16 +950,34 @@ impl Core {
                 .srcs
                 .get(name)
                 .and_then(|s| s.pending_net.front())
-                .is_some_and(|e| replay || e.ts_ms.saturating_add(IDLE_GRACE_MS) <= horizon);
+                .is_some_and(|(e, _)| replay || e.ts_ms.saturating_add(IDLE_GRACE_MS) <= horizon);
             if !ready {
                 break;
             }
-            let Some(e) = self.srcs.get_mut(name).and_then(|s| s.pending_net.pop_front()) else { break };
+            let Some((e, after)) = self.srcs.get_mut(name).and_then(|s| s.pending_net.pop_front()) else { break };
+            if let Some(src) = self.srcs.get_mut(name) {
+                src.net_judged = after;
+            }
             self.clock_ms = self.clock_ms.max(e.ts_ms);
+            if let Some(src) = self.srcs.get_mut(name) {
+                src.last_ts = src.last_ts.max(e.ts_ms);
+            }
             let auth = self.auth_for(&ctx.mission, e.ts_ms);
             let hits = self.engine.net(&ctx, e.ts_ms, &e.decision, &auth, &self.fold);
             for h in hits {
                 self.on_hit(h);
+            }
+        }
+        // A checkpoint says only what was judged: decisions that wait out their grace are read again after a restart.
+        let key = format!("n:{name}");
+        if let Some(src) = self.srcs.get_mut(name) {
+            let at = if src.pending_net.is_empty() { src.net.clone() } else { src.net_judged.clone() };
+            if self.fold.cursors.get(&key) != Some(&at)
+                && (at != Cursor::default() || self.fold.cursors.contains_key(&key))
+            {
+                src.net_judged = at.clone();
+                self.fold.cursors.insert(key.clone(), at);
+                self.dirty_cursors.insert(key);
             }
         }
     }
@@ -945,6 +1057,7 @@ impl Core {
             return;
         }
         self.started = true;
+        self.started_ms = now;
         self.discover();
         self.last_discover = now;
         if self.first_start {
@@ -970,7 +1083,7 @@ impl Core {
 
     /// One pass (see the contract). `hints` are session directory names that wrote something; `full` reads every source.
     pub fn pump(&mut self, now: u64, hints: &BTreeSet<String>, full: bool) -> bool {
-        if !self.enabled || self.is_down().is_some() {
+        if self.is_down().is_some() && !self.recover(now) {
             return false;
         }
         self.start(now);
@@ -1034,18 +1147,29 @@ impl Core {
 
     fn housekeeping(&mut self, now: u64, before_seq: u64) {
         if self.log.is_none() {
+            self.engine.take_new_secrets();
             return;
         }
         let wrote = self.fold.last_seq != before_seq;
-        if !self.dirty_cursors.is_empty() && (wrote || now.saturating_sub(self.last_checkpoint) >= CHECKPOINT_EVERY_MS)
-        {
+        let pending = !self.dirty_cursors.is_empty() || self.engine.has_new_secrets();
+        if pending && (wrote || now.saturating_sub(self.last_checkpoint) >= CHECKPOINT_EVERY_MS) {
             let mut map = Map::new();
             for k in std::mem::take(&mut self.dirty_cursors) {
                 if let Some(c) = self.fold.cursors.get(&k) {
                     map.insert(k, serde_json::to_value(c).unwrap_or(Value::Null));
                 }
             }
-            self.emit(EntryKind::Cursor, obj(serde_json::json!({ "cursors": map })));
+            let secrets: Vec<Value> = self
+                .engine
+                .take_new_secrets()
+                .into_iter()
+                .map(|(tag, mission, ts)| serde_json::json!([tag, mission, ts]))
+                .collect();
+            let mut f = obj(serde_json::json!({ "cursors": map }));
+            if !secrets.is_empty() {
+                f.insert("secrets".into(), Value::Array(secrets));
+            }
+            self.emit(EntryKind::Cursor, f);
             self.last_checkpoint = now;
         }
         if now.saturating_sub(self.last_log_heartbeat) >= HEARTBEAT_LOG_MS {
@@ -1081,8 +1205,13 @@ impl Core {
                 break;
             }
         }
+        // A replay reads the whole history, so the joins read it too (the live ones read the last window).
+        self.fleet_runs = self.fleet_runs.saturating_add(1);
         let now = self.clock_ms;
-        self.run_fleet(now);
+        let hits = self.engine.fleet.joins_over_history(now);
+        for h in hits {
+            self.on_fleet_hit(h);
+        }
     }
 
     /// Active time of a mission in milliseconds: the budget clock when the mission has one, else the sum of the gaps

@@ -4,7 +4,7 @@
 
 ### Monitor M2: the monitor core, in shadow
 
-- **The daemon now watches.** `Runtime::start` builds one `Monitor` per loom home (unless `[monitor] enabled = false`), folds
+- **The daemon now watches.** `Runtime::start` builds one `Monitor` per loom home (`[monitor] enabled = false` keeps only the precision-list, S4 and canary tripwires), folds
   its log before any session is activated, and runs it on a worker. It reads every record of every session (`log.jsonl`),
   `net.jsonl`, `logs/net-unattributed.jsonl`, `logs/floor.jsonl` and the mission journals through persisted cursors, and runs
   the 28 tripwires (TW-01 to TW-28, `docs/MONITOR.md` §6.2) and the 10 fleet joins (FS-1 to FS-10, every `fleet_every_s`)
@@ -25,6 +25,18 @@
   would-be pauses per 100 active hours and the fleet joins.
 - `loom_core::journal::hmac_sha256_hex` and `load_existing_key`; `Authorization::build` replaces the M0 stub `for_mission`;
   `tripwire::Hit` gains `key`, `at_ms`, `basis`, `precision` and `from_s1` (all `#[serde(default)]`).
+- **Review fixes (M2).** The `check` of `attempt` is read as a command; a forked child primed before its `forked` record is
+  read from it on; the inbox answer's echo no longer lends the agent's words to operator text (TW-03 needs the host in
+  operator text); `loom monitor log` and `status` print no control or bidirectional character; TW-06's credential index is
+  persisted (a `secrets` field on `cursor` entries, additive), capped per mission and flags only a mission that never saw the
+  value; `$TMPDIR`, `$PWD`, relative paths and commands glued to a URL are matched; TW-02, TW-04, TW-06 and TW-15 read the
+  call's destinations, not payload text, and a path is a write only where the command writes it; a log that takes writes
+  again lifts `down` without a restart and loses no hit; the `n:` cursor is checkpointed only up to the last judged decision;
+  `[monitor] enabled = false` keeps the precision-list, S4 and canary tripwires and the monitor is always built; TW-21 counts a
+  PTY left running, keeps a quiet session's jobs and is held for 10 minutes after a restart; FS-1 keeps reads per mission, counts a
+  two-way board over one file and forgets old paths; the replay reads the windowed joins over the whole history; a first
+  start that was cut short is still a first start; `GET /api/monitor` reads a snapshot, so it never waits for a pass; the status
+  says `degraded` when the worker's heartbeat is older than 30 s. The messages of a down monitor name steps that work in M2.
 - Deferred to later phases and said so in `docs/MONITOR.md` §2.1, §6.2 and in the CONTRACT of `monitor/engine.rs`: inline
   (pre-call) tripwires and the gate (M8), provenance of a credential toward its asset (M8), the canaries' placement (M10),
   gzip runs (M6), fold snapshots, `POST /api/monitor/replay` (the replay runs in the CLI).

@@ -21,8 +21,10 @@
 //!   the source as it is now, for the first run (no retroactive pause).
 //! - `prime(paths, dir)` finds who a session is: from `meta.json` when it is there (mission, parent, pack, role,
 //!   workspace, profile, prior), else from the `session_start` record; and, for a forked child (whose log starts with a
-//!   byte-for-byte copy of its parent's), the seq of its `forked` record: records before it are the parent's and are
-//!   never observed as the child's (`skip_below`).
+//!   byte-for-byte copy of its parent's), the seq of its own `forked` record (the one whose `session` is this
+//!   directory's): records before it are the parent's and are never observed as the child's (`skip_below`). A child
+//!   primed before that record exists (the fork writes the copy first) has `skip_below = u64::MAX`, which the core
+//!   resolves when the record is read.
 //! - `read_journal(paths, mission, key)` reads a mission's journal as `Journal::read` does (verified) when the key is
 //!   known, else as unverified lines (a replay of a copy); it returns the entries it understands and says which.
 //!
@@ -61,6 +63,8 @@ pub struct SessionRead {
 #[derive(Debug, Default)]
 pub struct NetRead {
     pub entries: Vec<NetEntry>,
+    /// The cursor after each entry of `entries`, in order.
+    pub ends: Vec<Cursor>,
     pub cursor: Cursor,
     pub fault: Option<String>,
     pub more: bool,
@@ -199,10 +203,11 @@ pub fn read_net(path: &Path, cur: &Cursor) -> NetRead {
                 break;
             }
         }
+        c = Cursor { off: end, seq: c.seq.saturating_add(1), hash: hash_of(&line) };
         if let Ok(e) = serde_json::from_str::<NetEntry>(&line) {
             out.entries.push(e);
+            out.ends.push(c.clone());
         }
-        c = Cursor { off: end, seq: c.seq.saturating_add(1), hash: hash_of(&line) };
     }
     out.cursor = c;
     out
@@ -317,7 +322,7 @@ pub fn prime(dir: &Path, name: &str) -> Option<Primed> {
         for rec in &r.records {
             match &rec.event {
                 Event::SessionStart(s) if start.is_none() => start = Some((rec.clone(), s.clone())),
-                Event::Forked(_) if forked.is_none() => forked = Some(rec.seq),
+                Event::Forked(f) if forked.is_none() && f.session.as_str() == name => forked = Some(rec.seq),
                 _ => {}
             }
         }

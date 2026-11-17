@@ -55,7 +55,7 @@
 //! | `POST /sessions/{id}/resume` | `runtime.resume` | `202` `{}` |
 //! | `POST /sessions/{id}/reweave` | `runtime.reweave` | `202` `{}` |
 //! | `POST /sessions/{id}/archive` (`ArchiveBody`) | `runtime.archive` | `200` `{}` |
-//! | `GET /monitor` | `runtime.monitor_status()`: the monitor in shadow (M2): state (`shadow`, `degraded`, `down`), open flags, the pauses and halts folded from its log, the counts it has read, every tripwire with how often it fired by severity, the faults of its sources (`404` when `[monitor] enabled = false`) | `MonitorStatus` |
+//! | `GET /monitor` | `runtime.monitor_status()`: the monitor in shadow (M2): state (`shadow`, `degraded`, `down`), open flags, the pauses and halts folded from its log, the counts it has read, every tripwire with how often it fired by severity, the faults of its sources | `MonitorStatus` |
 //! | `GET /missions/{id}/monitor?after={seq}&limit={n}&quiet={bool}` | `runtime.monitor_log`: the monitor-log entries about the mission (tripwire hits, flags, responses, pauses; `quiet` leaves out `cursor` and `heartbeat`, default true; `limit` default 200, at most 2000) | `{entries, next_after}` |
 //! | `GET /monitor/reviews/{review}/input` | the exact rendered input of a review; `404` until M6 (no review exists) | `text/plain` |
 //! | `GET /census` | `runtime.census()`: the last process and listener census of the sessions, found by sandbox identity (`null` until the first has finished; `?now=true` takes one first) | `CensusView` or `null` |
@@ -693,13 +693,13 @@ async fn release(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes)
     Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
 }
 
-/// `GET /api/monitor`: the monitor's status. `404` with a sentence when `[monitor] enabled = false`.
+/// `GET /api/monitor`: the monitor's status. `404` only if the runtime has no monitor handle.
 async fn monitor_status(State(s): State<ApiState>) -> Res<Response> {
     match s.runtime.monitor_status() {
         Some(m) => Ok(Json(m).into_response()),
         None => Err(ApiError::new(
             StatusCode::NOT_FOUND,
-            "The monitor is off ([monitor] enabled = false). Set enabled = true and restart the daemon.".to_string(),
+            "The runtime has no monitor handle; restart the daemon.".to_string(),
         )),
     }
 }

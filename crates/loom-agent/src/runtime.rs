@@ -464,7 +464,7 @@
 //!   `send_message`/`resume` on one are refused (`This session is archived; unarchive it first.`).
 //!
 //! ## The monitor (`crate::monitor`, M2)
-//! `Runtime::start` builds one `Monitor` (unless `[monitor] enabled = false`) after the journal key and before `Inner` is
+//! `Runtime::start` builds one `Monitor` (with `[monitor] enabled = false` it keeps only the precision-list, S4 and canary tripwires) after the journal key and before `Inner` is
 //! built, from `Env::from_config` (the home, the packs, the `[network]` lists, the floor's infrastructure policy) and the
 //! journal key; its log folds there, before `load_known` and before any session is activated. A log that does not
 //! verify makes `Monitor::down(reason)`, which the daemon keeps (the status says "down" and why); the daemon starts
@@ -1648,7 +1648,7 @@ struct Inner {
     census_blind_told: AtomicBool,
     /// The proxy's veto, canary hooks and lab-listener check (`crate::floor`, E4).
     floor: crate::floor::Floor,
-    /// The adversarial monitor in shadow (`crate::monitor`, M2): `None` when `[monitor] enabled = false`; a handle
+    /// The adversarial monitor in shadow (`crate::monitor`, M2): always built (a handle
     /// that says "down" when its log did not fold or verify.
     monitor: Option<crate::monitor::Monitor>,
     /// The missions whose box counters could not be read at the last poll and the operator's log was told so,
@@ -4423,7 +4423,7 @@ impl Runtime {
         let blobs = BlobStore::open(paths.blobs_dir()).map_err(|e| format!("cannot open the blob store: {e}"))?;
         // The monitor folds its log before any session is activated (I9). A log that does not verify leaves a monitor
         // that says so; it never stops the daemon, and it never lifts a pause (M3 holds the missions).
-        let monitor = if config.monitor.enabled {
+        let monitor = {
             let env = crate::monitor::engine::Env::from_config(
                 &config,
                 &paths,
@@ -4437,8 +4437,6 @@ impl Runtime {
                     Some(crate::monitor::Monitor::down(&paths, &config.monitor, e.to_string()))
                 }
             }
-        } else {
-            None
         };
         let mut profiles = BTreeMap::new();
         for (name, profile) in &config.models {
