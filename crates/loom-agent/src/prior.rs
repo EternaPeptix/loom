@@ -984,6 +984,8 @@ mod tests {
                 quote: None,
                 note: "seen".into(),
                 attested: true,
+                tool: Some("bash".into()),
+                grade: Some(loom_core::event::EvidenceGrade::Run),
             },
         });
         for op in ops {
