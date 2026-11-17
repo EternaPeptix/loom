@@ -67,15 +67,25 @@
 //! region starts at the first response or at the last `keep_recent_steps` records that render other
 //! than tool results, whichever is later (at the latter alone when there is no response; records
 //! that render nothing are not counted). [`Woven`] plans on a weave
-//! already rendered, so that a step renders its records once. Order of sacrifice, each class oldest
-//! first unless stated:
+//! already rendered, so that a step renders its records once. `keep_recent_steps = 0` protects nothing:
+//! `upto_seq` is the seq of the last record. Order of sacrifice, each class oldest first unless stated,
+//! every class limited to live items at or before `upto_seq`:
 //!   1. `DropReasoning` on model responses;
-//!   2. stub `ToolClass::Nav` results;
-//!   3. stub `ToolClass::Read` results, largest first;
-//!   4. stub every other unpinned tool result and agent report, largest first;
-//!   5. only when `allow_text_eviction`: `Drop` assistant text.
-//!      Results already stubbed are skipped. Returns `None` when nothing can be evicted. Stub text comes
-//!      from [`stub_text`].
+//!   2. `Drop` harness notes of kind `nudge`, `stall`, `verdict`, `output_cut`, `budget` and
+//!      `interrupted` (what the harness said about a step long past);
+//!   3. stub `ToolClass::Nav` results;
+//!   4. stub `ToolClass::Read` results, largest first;
+//!   5. stub every other unpinned tool result and agent report, largest first;
+//!   6. `Drop` every other harness note that is not protected (`arrival`, `info`, including the
+//!      messages of other agents): its words stay in the log, where `log_search` finds them;
+//!   7. only when `allow_text_eviction`: `Drop` assistant text.
+//!      Results already stubbed are skipped. Protected notes (`constraint`, `approval`, `assignment`)
+//!      are never candidates, and neither is a note after the latest `model_response` record (the model
+//!      has not seen it yet; with `keep_recent_steps = 0` that is the region the plan would otherwise
+//!      reach). The estimate of a dropped note subtracts its characters and the blank
+//!      line that joined it to its message, or the whole message (with its overhead) when the note was
+//!      the only item in it. Returns `None` when nothing can be evicted. Stub text comes from
+//!      [`stub_text`].
 //!
 //! `plan_fresh_start` chooses the evictions of a fresh start: the fold made when a result was not
 //! accepted, so that the session goes on from the mission state and not from its own account of the
@@ -101,7 +111,10 @@
 //! other records); the fresh-start plan (each class of eviction, pins and other notes kept, the cut,
 //! the estimate, nothing to evict); `request_messages` HUD placement;
 //! a payload of each kind carrying harness tags stays inside its one block, a fork's contract renders
-//! as written, and records without such text render the bytes they always did.
+//! as written, and records without such text render the bytes they always did; the two note classes
+//! (their order against results, protected notes and the recent region never touched, the estimate
+//! matching the weave rendered with the plan); `keep_recent_steps = 0` lets the plan stub the latest
+//! step's results; the stub of a view names the viewed output's handle.
 
 use crate::estimate::TokenEstimator;
 use crate::event::{
@@ -825,6 +838,42 @@ fn plan_on(
             steps.push((i, EvictAction::DropReasoning));
         }
     }
+    // Harness notes at or before `upto`, by kind, oldest first (the items are in log order).
+    let note_kinds: HashMap<Seq, NoteKind> = records
+        .iter()
+        .filter_map(|r| match &r.event {
+            Event::HarnessNote { note, .. } => Some((r.seq, *note)),
+            _ => None,
+        })
+        .collect();
+    // A note after the latest model response has not been seen by the model: never a candidate.
+    let latest_response: Option<Seq> =
+        records.iter().rev().find(|r| matches!(r.event, Event::ModelResponse(_))).map(|r| r.seq);
+    let notes_where = |pick: &dyn Fn(NoteKind) -> bool| -> Vec<usize> {
+        (0..w.items.len())
+            .filter(|&i| {
+                w.items.get(i).is_some_and(|it| {
+                    it.kind == "harness_note"
+                        && live(i)
+                        && latest_response.is_some_and(|lr| it.seq < lr)
+                        && note_kinds.get(&it.seq).is_some_and(|k| !k.is_protected() && pick(*k))
+                })
+            })
+            .collect()
+    };
+    for i in notes_where(&|k| {
+        matches!(
+            k,
+            NoteKind::Nudge
+                | NoteKind::Stall
+                | NoteKind::Verdict
+                | NoteKind::OutputCut
+                | NoteKind::Budget
+                | NoteKind::Interrupted
+        )
+    }) {
+        steps.push((i, EvictAction::Drop));
+    }
     for (i, it) in w.items.iter().enumerate() {
         if it.kind == "tool_result" && it.class == Some(ToolClass::Nav) && live(i) {
             if let Some(s) = stub_for(i) {
@@ -850,6 +899,20 @@ fn plan_on(
         if let Some(s) = stub_for(i) {
             steps.push((i, s));
         }
+    }
+    // Every other note that is not protected (arrival, info), after the results.
+    for i in notes_where(&|k| {
+        !matches!(
+            k,
+            NoteKind::Nudge
+                | NoteKind::Stall
+                | NoteKind::Verdict
+                | NoteKind::OutputCut
+                | NoteKind::Budget
+                | NoteKind::Interrupted
+        )
+    }) {
+        steps.push((i, EvictAction::Drop));
     }
     if allow_text_eviction {
         for (i, it) in w.items.iter().enumerate() {
@@ -882,6 +945,12 @@ fn plan_on(
         let already_reasoning_planned =
             planned.and_then(|p| chosen.get(p)).is_some_and(|e| e.action == EvictAction::DropReasoning);
         let (delta, removes) = match &action {
+            // A note leaves with the blank line that joined it to its message, or takes the message
+            // with it when it was the only item in it.
+            EvictAction::Drop if it.kind == "harness_note" => {
+                let sole = old <= it.chars.saturating_add(Message::user("").chars());
+                (it.chars.saturating_add(2), sole)
+            }
             EvictAction::DropReasoning => (a.reasoning, false),
             EvictAction::Stub { text } => (a.payload.saturating_sub(text.len()), false),
             EvictAction::Drop => (a.text + if already_reasoning_planned { 0 } else { a.reasoning }, !a.has_calls),
@@ -912,8 +981,11 @@ fn plan_on(
 /// For `ToolClass::Exec`, the last `stub_tail_lines` lines of `result.text` follow under the line
 /// `[last {n} lines as first shown]`. The final line is:
 /// `[evicted from view, not from the record: {lines} lines / {bytes} bytes. Full output: {handle} — read it again with out_read or out_grep before relying on it.]`
-/// (`{lines}`/`{bytes}`/`{handle}` from `result.output`; when there is no stored output the final line
-/// is `[evicted from view, not from the record. Run it again if the result matters.]`).
+/// (`{lines}`/`{bytes}`/`{handle}` from `result.output`). A view (no stored output of its own, and
+/// `meta[META_OF_BLOB]` a non-empty string) ends with `[evicted from view, not from the record. It
+/// showed lines of out:{the first 16 characters of that id} — read them again with out_read or out_grep
+/// before relying on it.]`, so its stub keeps the handle. With neither, the final line is `[evicted
+/// from view, not from the record. Run it again if the result matters.]`.
 pub fn stub_text(call: Option<&ToolCall>, result: &ToolResult, stub_tail_lines: u32) -> String {
     let mut out = String::new();
     let first = result.text.lines().next().unwrap_or("");
@@ -943,7 +1015,14 @@ pub fn stub_text(call: Option<&ToolCall>, result: &ToolResult, stub_tail_lines: 
             b.bytes,
             b.handle()
         )),
-        None => out.push_str("[evicted from view, not from the record. Run it again if the result matters.]"),
+        None => match result.meta.get(crate::event::META_OF_BLOB).and_then(Value::as_str).filter(|id| !id.is_empty()) {
+            // A view stores nothing of its own; its stub names the output it showed.
+            Some(id) => out.push_str(&format!(
+                "[evicted from view, not from the record. It showed lines of out:{} — read them again with out_read or out_grep before relying on it.]",
+                id.chars().take(16).collect::<String>()
+            )),
+            None => out.push_str("[evicted from view, not from the record. Run it again if the result matters.]"),
+        },
     }
     out
 }
@@ -1860,6 +1939,162 @@ mod tests {
         assert!(plan.after_tokens_est < plan.before_tokens_est);
     }
 
+    /// A mission with old harness chatter between steps; returns the log and the seqs of its notes.
+    fn chatty() -> (Log, Vec<(NoteKind, Seq)>) {
+        let mut l = Log::new();
+        l.user("go");
+        let mut notes = Vec::new();
+        let kinds = [
+            NoteKind::Arrival,
+            NoteKind::Nudge,
+            NoteKind::Constraint,
+            NoteKind::Verdict,
+            NoteKind::Info,
+            NoteKind::Stall,
+        ];
+        for (i, k) in kinds.iter().enumerate() {
+            let id = format!("c{i}");
+            // Two notes in a row merge into one user message; the last one stands alone before the response.
+            let seq = l.note(*k, &format!("{k:?} note number {i} with some words in it"));
+            notes.push((*k, seq));
+            l.resp(&format!("step {i}"), "", &[(&id, "bash", "{}")]);
+            l.call(&id, ToolClass::Exec);
+            l.result(&id, ToolClass::Exec, &exec_text(20));
+        }
+        let seq = l.note(NoteKind::Arrival, "late arrival that merges with the next note");
+        notes.push((NoteKind::Arrival, seq));
+        let seq = l.note(NoteKind::Nudge, "late nudge merged into the same message");
+        notes.push((NoteKind::Nudge, seq));
+        l.resp("recent", "", &[("c9", "bash", "{}")]);
+        l.call("c9", ToolClass::Exec);
+        l.result("c9", ToolClass::Exec, &exec_text(20));
+        (l, notes)
+    }
+
+    #[test]
+    fn plan_drops_harness_notes_in_two_classes_around_the_results() {
+        let (l, notes) = chatty();
+        let est = TokenEstimator::with_ratio(4.0);
+        let plan = plan_reweave(&l.recs, &est, &FLOOR_ZERO, false).expect("plan");
+        let w = weave(&l.recs);
+        let note_kind = |seq: Seq| notes.iter().find(|(_, s)| *s == seq).map(|(k, _)| *k);
+        let phase = |e: &Eviction| match (&e.action, note_kind(e.seq)) {
+            (EvictAction::Drop, Some(NoteKind::Nudge | NoteKind::Stall | NoteKind::Verdict)) => 2,
+            (EvictAction::Stub { .. }, None) => 3,
+            (EvictAction::Drop, Some(NoteKind::Arrival | NoteKind::Info)) => 4,
+            other => panic!("unexpected {other:?}"),
+        };
+        let phases: Vec<u8> = plan.evictions.iter().map(phase).collect();
+        let mut sorted = phases.clone();
+        sorted.sort_unstable();
+        assert_eq!(phases, sorted, "early notes, then results, then arrival and info notes");
+        for c in [2, 3, 4] {
+            assert!(phases.contains(&c), "class {c} present: {phases:?}");
+        }
+        for class in [2, 4] {
+            let seqs: Vec<Seq> = plan.evictions.iter().filter(|e| phase(e) == class).map(|e| e.seq).collect();
+            assert!(seqs.windows(2).all(|p| p[0] < p[1]), "oldest first");
+        }
+        // Protected notes and the recent region are never touched.
+        let constraint = notes.iter().find(|(k, _)| *k == NoteKind::Constraint).map(|(_, s)| *s).unwrap();
+        assert!(plan.evictions.iter().all(|e| e.seq != constraint));
+        let recent = w.items.iter().rev().find(|i| i.kind == "model_response").map(|i| i.seq).unwrap();
+        assert!(plan.upto_seq < recent);
+        assert!(plan.evictions.iter().all(|e| e.seq <= plan.upto_seq));
+        // The estimate is that of the weave rendered with the plan.
+        assert_eq!(plan.after_tokens_est, est.tokens_for_messages(&with_plan(&l, &plan).messages));
+        let after = with_plan(&l, &plan);
+        for e in plan.evictions.iter().filter(|e| e.action == EvictAction::Drop) {
+            assert_eq!(after.items.iter().find(|i| i.seq == e.seq).map(|i| i.state), Some(ItemState::Dropped));
+        }
+    }
+
+    #[test]
+    fn plan_keeps_a_note_after_the_latest_response_even_with_keep_zero_and_floor_zero() {
+        let mut l = Log::new();
+        l.user("start");
+        l.resp("old reply", "", &[]);
+        let old = l.note(NoteKind::Nudge, "an old nudge the model has seen");
+        l.user("more");
+        l.resp("latest reply", "", &[]);
+        let fresh = l.note(NoteKind::Nudge, "a nudge the model has not seen");
+        let est = TokenEstimator::with_ratio(4.0);
+        let policy = ReweavePolicy { target_tokens: 0, floor_tokens: 0, keep_recent_steps: 0, stub_tail_lines: 3 };
+        let plan = plan_reweave(&l.recs, &est, &policy, false).expect("plan");
+        assert!(plan.evictions.iter().any(|e| e.seq == old), "the older note is dropped: {plan:?}");
+        assert!(plan.evictions.iter().all(|e| e.seq != fresh), "the note after the latest response stays");
+    }
+
+    #[test]
+    fn plan_notes_estimate_counts_merged_and_lone_notes_exactly() {
+        // Each prefix of the plan's evictions, applied alone, is estimated like the weave renders it.
+        let (l, _) = chatty();
+        let est = TokenEstimator::with_ratio(4.0);
+        let full = plan_reweave(&l.recs, &est, &FLOOR_ZERO, false).expect("plan");
+        for k in 1..=full.evictions.len() {
+            let partial = ReweavePlan { evictions: full.evictions[..k].to_vec(), ..full.clone() };
+            let floor = est.tokens_for_messages(&with_plan(&l, &partial).messages);
+            let p =
+                plan_reweave(&l.recs, &est, &ReweavePolicy { floor_tokens: floor, ..FLOOR_ZERO }, false).expect("plan");
+            assert_eq!(p.after_tokens_est, floor, "k={k}");
+        }
+        // Two notes in one message: dropping both leaves no message, dropping one keeps the other.
+        let mut m = Log::new();
+        m.user("go");
+        let a = m.note(NoteKind::Nudge, &"first ".repeat(40));
+        let b = m.note(NoteKind::Verdict, &"second ".repeat(40));
+        m.resp("x", "", &[("c0", "bash", "{}")]);
+        m.call("c0", ToolClass::Exec);
+        m.result("c0", ToolClass::Exec, "[bash ok]");
+        let plan = plan_reweave(&m.recs, &est, &FLOOR_ZERO, false).expect("plan");
+        assert_eq!(plan.evictions.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![a, b]);
+        assert_eq!(plan.after_tokens_est, est.tokens_for_messages(&with_plan(&m, &plan).messages));
+        let one = ReweavePlan { evictions: plan.evictions[..1].to_vec(), ..plan.clone() };
+        let floor = est.tokens_for_messages(&with_plan(&m, &one).messages);
+        let p = plan_reweave(&m.recs, &est, &ReweavePolicy { floor_tokens: floor, ..FLOOR_ZERO }, false).unwrap();
+        assert_eq!(p.evictions.len(), 1);
+        assert_eq!(p.after_tokens_est, floor);
+    }
+
+    #[test]
+    fn keep_zero_stubs_the_latest_steps_result_with_its_handle() {
+        let l = stepped(&[ToolClass::Exec, ToolClass::Exec], &[40, 60]);
+        let est = TokenEstimator::with_ratio(4.0);
+        let keep0 = ReweavePolicy { keep_recent_steps: 0, ..FLOOR_ZERO };
+        let plan = plan_reweave(&l.recs, &est, &keep0, false).expect("plan");
+        assert_eq!(plan.upto_seq, l.recs.last().map(|r| r.seq).unwrap());
+        let latest = l.recs.last().map(|r| r.seq).unwrap();
+        let ev = plan.evictions.iter().find(|e| e.seq == latest).expect("latest result evicted");
+        match &ev.action {
+            EvictAction::Stub { text } => assert!(text.contains("out:abababababababab"), "{text}"),
+            other => panic!("{other:?}"),
+        }
+        // With keep 1 the latest step stays.
+        let plan1 = plan_reweave(&l.recs, &est, &FLOOR_ZERO, false).expect("plan");
+        assert!(plan1.evictions.iter().all(|e| e.seq != latest));
+    }
+
+    #[test]
+    fn a_views_stub_names_the_output_it_showed() {
+        let mut l = Log::new();
+        l.result_of("v", "out_read", ToolStatus::Ok, "[out_read ok]\nbody");
+        let mut t = match &l.recs[1].event {
+            Event::ToolResult(t) => t.clone(),
+            _ => unreachable!(),
+        };
+        t.meta.insert(crate::event::META_OF_BLOB.into(), serde_json::json!("cd".repeat(32)));
+        assert_eq!(
+            stub_text(None, &t, 2),
+            "[out_read ok]\n[evicted from view, not from the record. It showed lines of out:cdcdcdcdcdcdcdcd — read them again with out_read or out_grep before relying on it.]"
+        );
+        // An empty id, or a result with its own output, keeps the old lines.
+        t.meta.insert(crate::event::META_OF_BLOB.into(), serde_json::json!(""));
+        assert!(stub_text(None, &t, 2).ends_with("Run it again if the result matters.]"));
+        t.meta.insert(crate::event::META_OF_BLOB.into(), serde_json::json!("cd".repeat(32)));
+        t.output = Some(BlobRef { id: BlobId::from("ab".repeat(32)), bytes: 5, lines: 1 });
+        assert!(stub_text(None, &t, 2).contains("Full output: out:abababababababab"));
+    }
+
     #[test]
     fn plan_stops_as_soon_as_floor_is_reached() {
         use ToolClass::*;
@@ -1885,8 +2120,8 @@ mod tests {
         use ToolClass::*;
         let mut l = Log::new();
         l.user("go");
-        l.note(NoteKind::Constraint, &"never evict me ".repeat(100));
-        l.note(NoteKind::Info, &"plain note ".repeat(100));
+        let constraint = l.note(NoteKind::Constraint, &"never evict me ".repeat(100));
+        let info = l.note(NoteKind::Info, &"plain note ".repeat(100));
         l.resp("", "", &[("a", "bash", "{}")]);
         let ta = l.result("a", Read, &exec_text(80));
         l.resp("", "", &[("b", "bash", "{}")]);
@@ -1899,7 +2134,9 @@ mod tests {
         let seqs: Vec<Seq> = plan.evictions.iter().map(|e| e.seq).collect();
         assert!(!seqs.contains(&ta), "pinned result");
         assert!(seqs.contains(&tb));
-        assert!(seqs.iter().all(|s| *s > 3), "no user message or note");
+        assert!(seqs.iter().all(|s| *s > constraint), "no user message or protected note");
+        assert!(seqs.contains(&info), "an info note goes after the results");
+        assert_eq!(seqs.last(), Some(&info), "and is the last class here");
         assert!(seqs.iter().all(|s| *s <= plan.upto_seq));
         // Already stubbed results are skipped by the next plan.
         l.reweave(plan.upto_seq, plan.evictions.iter().map(|e| (e.seq, e.action.clone())).collect(), "B", None);

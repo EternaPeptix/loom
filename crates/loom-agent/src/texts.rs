@@ -681,6 +681,31 @@ pub fn turn_failed(why: &str) -> String {
     format!("The session could not continue. {why} Nothing was lost: answer here, or send the session a message, to make it try again.")
 }
 
+/// Longest part of a model server's refusal quoted in [`refused`] and [`refused_park`].
+pub const REFUSAL_MESSAGE_CHARS: usize = 600;
+
+/// Why a step failed when the model server refused the request (HTTP 400, 413 or 422). `folded`: the
+/// window had already been folded out of view for an earlier refusal. A complete sentence.
+pub fn refused(status: u16, message: &str, folded: bool) -> String {
+    let said = sentence(&cut(message.trim(), REFUSAL_MESSAGE_CHARS));
+    if folded {
+        format!("The model server refused the request (HTTP {status}) again after every tool output had been folded out of view: {said}")
+    } else {
+        format!("The model server refused the request (HTTP {status}): {said}")
+    }
+}
+
+/// Inbox text for a lead parked by a refusal (see [`refused`]). It says what an answer will do and
+/// what the operator has to change when an answer alone cannot help.
+pub fn refused_park(status: u16, message: &str, folded: bool) -> String {
+    let why = refused(status, message, folded);
+    if folded {
+        format!("The session could not continue. {why} What the server refuses is still in view (the messages, the replies, the mission brief) or is the request itself, so an answer alone sends the same thing again. Move the session to another model, or change the model's settings, then answer here or send the session a message. Nothing was lost.")
+    } else {
+        format!("The session could not continue. {why} A provider that refuses what a request carries (a content filter, for instance) refuses the same window every time. If you answer here or send the session a message, loom sends the request again, and if the server refuses it the same way, loom folds every tool output out of view (each stays readable by its handle) and tries once more. If the server refuses the request itself (the model, a setting, the key), change that first. Nothing was lost.")
+    }
+}
+
 /// Longest part of the last error quoted in a model-unavailable notice.
 pub const UNAVAILABLE_ERROR_CHARS: usize = 600;
 
@@ -1111,6 +1136,27 @@ mod tests {
             finish_unavailable(&tools_all(), &d),
             format!("{OPEN}{MET}{UNREACHABLE}\nRoutes the mission ledger still shows open:\n- untested surface as-1\n- open plan step p1: read\nPick one and run it; record what the run shows.\n{STUCK}")
         );
+    }
+
+    #[test]
+    fn a_refusal_quotes_the_server_and_says_what_the_next_answer_does() {
+        let said = "Input text data may contain inappropriate content";
+        let first = refused(400, said, false);
+        assert_eq!(
+            first,
+            "The model server refused the request (HTTP 400): Input text data may contain inappropriate content."
+        );
+        let again = refused(422, said, true);
+        assert!(again.contains("(HTTP 422) again after every tool output had been folded out of view"), "{again}");
+        // What the server said is bounded, and the sentence still ends with a full stop.
+        let long = refused(400, &"x".repeat(5_000), false);
+        assert!(long.chars().count() < REFUSAL_MESSAGE_CHARS + 120 && long.ends_with('.'), "{}", long.len());
+        let park = refused_park(400, said, false);
+        assert!(park.starts_with("The session could not continue. The model server refused"), "{park}");
+        assert!(park.contains("folds every tool output out of view") && park.contains("readable by its handle"));
+        let folded = refused_park(400, said, true);
+        assert!(folded.contains("Move the session to another model") && !folded.contains("folds every tool output"));
+        assert_ne!(park, folded);
     }
 
     #[test]

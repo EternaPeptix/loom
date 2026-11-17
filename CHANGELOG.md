@@ -161,6 +161,32 @@
 - New evalkit scenario `concludes_on_a_scan`, played with a fake `depscan` that the `eval` example puts
   first on its own PATH.
 
+### Never wedge on an oversized view or a refused request
+
+- Views are admitted like any other output. `read`, `out_read`, `out_grep` and the `bin_*` views hold at
+  most `AdmitPolicy::view_chars` characters (`ToolCtx.view_chars`, new field), end at a whole line and
+  say where to continue (`window ended at line N …; continue with start N+1`); `out_grep` stops adding
+  match groups and says how many it left out. `finalize` cuts any view still over the bound at a line
+  boundary with the handle, and admits an oversized plain message like raw output. An oversized view in
+  the protected recent region used to make every request overflow and the session fail on every answer.
+- Admission follows the session's window: `max_inline_tokens` is at most `window / 8`
+  (`AdmitPolicy::for_window`, computed at each call). The configured value is unchanged.
+- A stray NUL byte no longer turns a whole text output into a one-line description: output is binary
+  only when NULs pass 1% of it or most of its first 8 KiB is not text; a NUL is shown as `\x00`.
+- llama.cpp's overflow (`exceeds the available context size`, `exceed_context_size_error`), 422s,
+  `input is too long`, `context_length_exceeded`, and overflow errors inside a 200 stream are context
+  overflows. The limit is `n_ctx`, else the number after `maximum context length is` or `context size (`
+  (vLLM's `max_tokens` refusal names `max_tokens` first), else the wording `A > B`, else the smaller of two
+  numbers. An overflow re-weave may fold the latest step's output (down to no protected step).
+- A refusal (400/413/422 that is not an overflow, such as a content filter refusing a page in the window)
+  refused again on the same prefix re-weaves once with every tool output out of view whatever the size,
+  the replies kept and no digest asked (reason `refused`), before parking; the park text says what an answer will do, and after that re-weave, that the model or
+  its settings must change. An operator re-weave right after a refusal folds the latest step too.
+- Re-weaves fold old harness notes: nudges, stall, verdict, output-cut, budget and interrupted notes
+  early, arrival and info notes (agents' messages included) after the tool outputs. A view's stub keeps
+  the handle of the output it showed.
+- No serialized shape changed. `reweave.reason` gains the value `refused`.
+
 ### security_record reads near misses
 
 - `security_record` now reads an operation where its meaning is unambiguous (`ops`/`items` for

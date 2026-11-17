@@ -8,21 +8,31 @@
 //! nothing and widens nothing: reading an output never makes another one readable.
 //!
 //! `out_read`: `view::window(start, end, total, cfg.read_max_lines)`, then `view::numbered` with
-//! `max_line_chars` 20_000. Outcome `ok`; facts: `view::range_fact`, and `{k} long lines shortened`
-//! when any were. An empty output has the body `(no output)`.
+//! `max_line_chars` 20_000 and `max_chars` = `ctx.view_chars`. Outcome `ok`; facts:
+//! `view::range_fact(first, numbered.last, total)`, then `view::ended_fact(numbered.last)` when the
+//! size bound stopped the window before the line asked for, and `{k} long lines shortened` when any
+//! were. `shown` is `[(first, numbered.last)]`. An empty output has the body `(no output)`.
 //!
 //! `out_grep`: `BlobStore::grep` with `context` (default 2, at most 50) and at most
 //! `cfg.search_max_results` matches; an invalid pattern is an error sentence carrying the regex
-//! error. Body: each match excerpt as returned by the store (lines numbered), groups separated by a
-//! line `--`. Facts: `{shown} of {total} matching lines` and, when more matched than shown, `narrow
-//! the pattern or read ranges with out_read`. No match → outcome `no match`, body `(no line
-//! matches)`, and `shown` empty. `shown` covers every line present in the body (matches and
-//! context). `ignore_case` prefixes the pattern with `(?i)`.
+//! error. Body: each match excerpt as returned by the store (lines numbered, long lines shortened),
+//! groups separated by a line `--`. Groups are added in order while the body, separators included,
+//! stays within `ctx.view_chars` characters; the first group is always added (`finalize` bounds a
+//! first group that alone passes it). Facts: `{shown} of {total} matching lines` (`shown` = the
+//! groups in the body), then, when groups were left out for size, `{k} more matches not shown to stay
+//! within the size one result may show: narrow the pattern, lower context, or read ranges with
+//! out_read`, else, when more matched than the store returned, `narrow the pattern or read ranges with
+//! out_read`. No match → outcome `no match`, body `(no line matches)`, and `shown` empty. `shown`
+//! covers every line present in the body (matches and context) and nothing of the groups left out.
+//! `ignore_case` prefixes the pattern with `(?i)`.
 //!
 //! Tests required: paging through an output larger than one page covers every line exactly once;
 //! clamping and both `window` errors; unknown handle; grep with context, cap, no match, invalid
 //! pattern; `shown` ranges are exact; for both tools, a stored output outside `ctx.outputs` is refused
-//! with exactly the sentence of a handle that names nothing, and its text is not in the result.
+//! with exactly the sentence of a handle that names nothing, and its text is not in the result; with a
+//! small `view_chars`, out_read ends at a whole line and says where to continue (paging with that start
+//! covers every line once), and out_grep stops adding groups, says how many it left out, and its `shown`
+//! names only the groups in the body.
 
 use crate::{outputs, params, view, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
@@ -34,6 +44,8 @@ use serde_json::{Map, Value};
 const MAX_LINE_CHARS: usize = 20_000;
 const DEFAULT_CONTEXT: u64 = 2;
 const MAX_CONTEXT: u64 = 50;
+/// The line between the groups of an `out_grep` body.
+const GROUP_SEP: &str = "\n--\n";
 
 pub struct OutRead;
 pub struct OutGrep;
@@ -122,14 +134,19 @@ impl Tool for OutRead {
             }
             Err(e) => return ToolOutput::error(e),
         };
-        let (text, shortened) = match view::numbered(&ctx.blobs, &id, first, last, MAX_LINE_CHARS) {
+        let numbered = match view::numbered(&ctx.blobs, &id, first, last, MAX_LINE_CHARS, ctx.view_chars) {
             Ok(r) => r,
             Err(e) => return ToolOutput::error(format!("The output `{handle}` could not be read ({e}). Try again.")),
         };
-        let mut out = ToolOutput::ok("ok", Body::View { of: id, text, shown: vec![(first, last)] })
-            .with_more(view::range_fact(first, last, total));
-        if shortened > 0 {
-            out = out.with_more(format!("{shortened} long lines shortened"));
+        let shown_last = numbered.last;
+        let mut out =
+            ToolOutput::ok("ok", Body::View { of: id, text: numbered.text, shown: vec![(first, shown_last)] })
+                .with_more(view::range_fact(first, shown_last, total));
+        if shown_last < last {
+            out = out.with_more(view::ended_fact(shown_last));
+        }
+        if numbered.shortened > 0 {
+            out = out.with_more(format!("{} long lines shortened", numbered.shortened));
         }
         out
     }
@@ -201,10 +218,29 @@ impl Tool for OutGrep {
             })
             .collect();
         let groups: Vec<String> = found.matches.iter().map(|m| shorten_lines(&m.excerpt)).collect();
-        let shown_count = found.matches.len() as u64;
-        let mut out = ToolOutput::ok("ok", Body::View { of: id, text: groups.join("\n--\n"), shown: merge(ranges) })
+        // Groups are added in order while the body, separators included, stays within the view size; the
+        // first is always added.
+        let mut included = 0usize;
+        let mut used = 0usize;
+        for g in &groups {
+            let need = g.chars().count().saturating_add(if included > 0 { GROUP_SEP.chars().count() } else { 0 });
+            if included > 0 && used.saturating_add(need) > ctx.view_chars {
+                break;
+            }
+            used = used.saturating_add(need);
+            included += 1;
+        }
+        let text = groups.iter().take(included).cloned().collect::<Vec<_>>().join(GROUP_SEP);
+        let shown_ranges = merge(ranges.into_iter().take(included).collect());
+        let shown_count = included as u64;
+        let left_out = groups.len().saturating_sub(included);
+        let mut out = ToolOutput::ok("ok", Body::View { of: id, text, shown: shown_ranges })
             .with_more(format!("{shown_count} of {} matching lines", found.total_matches));
-        if found.total_matches > shown_count {
+        if left_out > 0 {
+            out = out.with_more(format!(
+                "{left_out} more matches not shown to stay within the size one result may show: narrow the pattern, lower context, or read ranges with out_read"
+            ));
+        } else if found.total_matches > shown_count {
             out = out.with_more("narrow the pattern or read ranges with out_read");
         }
         out
@@ -372,5 +408,47 @@ mod tests {
         let r = e.call("out_grep", json!({"handle": h, "pattern": "(unclosed"})).await;
         assert_eq!(r.status, loom_core::event::ToolStatus::Error);
         assert!(r.text.contains("(unclosed") && r.text.contains("regular expression"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn a_small_view_size_ends_out_read_at_a_whole_line_and_paging_covers_every_line() {
+        let mut e = env();
+        e.ctx.view_chars = 120;
+        let h = put(&e, &lines(60));
+        let mut seen: Vec<u64> = Vec::new();
+        let mut start = 1u64;
+        let mut cut_seen = false;
+        while start <= 60 {
+            let r = e.call("out_read", json!({"handle": h, "start": start})).await;
+            let ranges = shown(&r);
+            let (a, b) = (ranges[0][0].as_u64().unwrap(), ranges[0][1].as_u64().unwrap());
+            assert!(r.text.chars().count() < 400, "{}", r.text);
+            assert!(r.text.contains(&format!("{b}\tline {b}")), "{}", r.text);
+            assert!(!r.text.contains(&format!("{}\tline", b + 1)), "{}", r.text);
+            if b < 60 {
+                cut_seen = true;
+                assert!(r.text.contains(&format!("continue with start {}", b + 1)), "{}", r.text);
+            }
+            seen.extend(a..=b);
+            start = b + 1;
+        }
+        assert!(cut_seen);
+        assert_eq!(seen, (1..=60).collect::<Vec<u64>>());
+    }
+
+    #[tokio::test]
+    async fn grep_stops_adding_groups_and_names_only_the_groups_in_the_body() {
+        let mut e = env();
+        e.ctx.view_chars = 60;
+        let h = put(&e, &lines(100));
+        let r = e.call("out_grep", json!({"handle": h, "pattern": "^line (10|50|90)$", "context": 0})).await;
+        // Three groups of 11 characters and two separators of 4 need 41.
+        assert!(r.text.contains("3 of 3 matching lines"), "{}", r.text);
+        e.ctx.view_chars = 30;
+        let r = e.call("out_grep", json!({"handle": h, "pattern": "^line (10|50|90)$", "context": 0})).await;
+        assert!(r.text.contains("2 of 3 matching lines"), "{}", r.text);
+        assert!(r.text.contains("1 more matches not shown to stay within the size one result may show"), "{}", r.text);
+        assert!(!r.text.contains("90: line 90"), "{}", r.text);
+        assert_eq!(shown(&r), json!([[10, 10], [50, 50]]));
     }
 }
