@@ -46,6 +46,13 @@ Missing/unattested evidence and blank deferral reasons are rejected. `mandatory_
 finish gate with remaining asset IDs. Tested coverage records that an observation exists; it does
 not mechanically establish exhaustive testing of the asset.
 
+Every evidence record carries the grade the harness gave the output it quotes (`docs/DESIGN.md` §7):
+`run`, `analysis` (`dep_scan`, `bin_decompile`, `bin_xrefs`), `read`, or `reference` (`cve_lookup`,
+`cve_search`, `advisory_lookup`, a reference-host `web_fetch`). Security records cite evidence ids and
+accept any attested grade. The goal-met conclusion, a verifier's objection and stuck detection accept
+only a run, so a scanner verdict, a decompilation, an imported scan or an advisory can locate a lead
+and support a claim, but cannot by itself show that the goal is met.
+
 ## How `security_record` reads near misses
 
 Logged missions refused many `security_record` calls for shape rather than substance, so the tool reads
