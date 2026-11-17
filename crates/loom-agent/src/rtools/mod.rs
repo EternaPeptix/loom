@@ -32,6 +32,7 @@ pub mod boxtools;
 pub mod continuation;
 pub mod ledger;
 pub mod misc;
+pub mod rootbox;
 pub mod scope;
 pub mod security;
 pub mod terminal;
@@ -306,6 +307,11 @@ pub trait Orchestrator: Send + Sync {
     async fn box_access(&self, _session: &SessionId) -> Result<Arc<loom_tools::boxctl::MissionBox>, String> {
         Err(boxtools::NO_BOX.to_string())
     }
+    /// The root box (`[rootbox]`), when the operator enabled one. The error is the sentence the tool
+    /// returns: [`rootbox::NO_ROOTBOX`], the default. It has no workspace, so a session in a copy has it too.
+    async fn rootbox_access(&self, _session: &SessionId) -> Result<Arc<loom_tools::rootbox::RootBox>, String> {
+        Err(rootbox::NO_ROOTBOX.to_string())
+    }
     /// Ask `k` independent copies of `session` (same context up to its current step, different
     /// seeds, no tools executed) to choose between `options`.
     async fn poll(
@@ -552,6 +558,7 @@ pub fn tool(name: &str, shared: &Arc<Shared>) -> Option<Arc<dyn loom_tools::Tool
         "box_exec" => Arc::new(boxtools::BoxExec(s)),
         "box_get" => Arc::new(boxtools::BoxGet(s)),
         "box_reset" => Arc::new(boxtools::BoxReset(s)),
+        "rootbox_exec" => Arc::new(rootbox::RootBoxExec(s)),
         "conclude" => Arc::new(terminal::Conclude(s)),
         "agent_spawn" => Arc::new(agents::AgentSpawn(s)),
         "agent_fanout" => Arc::new(agents::AgentFanout(s)),
@@ -589,12 +596,16 @@ pub fn known_tools() -> Vec<String> {
     let mut names = Registry::builtin().names();
     names.extend(NAMES.iter().map(|n| n.to_string()));
     names.extend(BOX_NAMES.iter().map(|n| n.to_string()));
+    names.extend(ROOTBOX_NAMES.iter().map(|n| n.to_string()));
     names
 }
 
 /// The box tools [`tool`] knows. They are not in [`NAMES`]: what `box_exec` prints is an observation of a
 /// command that ran, and may be quoted as evidence like the output of `bash`.
 pub const BOX_NAMES: &[&str] = &["box_exec", "box_get", "box_reset"];
+
+/// The root box tool [`tool`] knows. Like [`BOX_NAMES`] it is not in [`NAMES`]: only a role that lists it has it.
+pub const ROOTBOX_NAMES: &[&str] = &["rootbox_exec"];
 
 /// The names [`tool`] knows, other than [`BOX_NAMES`].
 pub const NAMES: &[&str] = &[
