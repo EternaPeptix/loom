@@ -2,6 +2,345 @@
 
 ## Unreleased
 
+### Stored outputs are the mission's own
+
+- `out_read`, `out_grep`, `pin`, `evidence` and `finish` quotes, `security_record` secret handles,
+  `security_ingest`, the oracle's candidate and a verdict's `opened` open a handle only among the outputs of the
+  session's mission (`loom_tools::outputs`): before, they resolved it against the whole blob store, which every
+  mission shares, so a session that learned another mission's handle could read that output. A foreign handle
+  gets exactly the refusal of one that names nothing, and a quote check no longer reports a line count or a
+  closest line of an output it may not read. `ToolCtx` has a new field, `outputs`.
+- `gate::check_quotes` is now `async fn check_quotes(ctx: &ToolCtx, quotes)`.
+- New `ToolResult::meta` key `also_stored` (`META_ALSO_STORED`): `dep_scan` lists there the further VDRs,
+  SBOMs and console it stores, so they count as the mission's outputs. Older logs stay readable.
+
+### Recall of earlier missions, chosen by the operator
+
+- `NewSession.prior` (`loom run --prior <mission>`, repeatable, at most 8; `POST /api/sessions`; the web form's
+  *Recall earlier missions*) names earlier missions for a new lead to recall, kept as `prior` in its
+  `meta.json` (left out when empty, so older files are unchanged). Before the lead's first model request it gets
+  one `info` note per the new `loom_agent::prior`: each mission's goal, rules and answers (the operator's words),
+  goal status, where its work stood when its ledger was last written (written by the model there, not
+  verified), and its security record as counts and asset locators (identities are counted, never named; URLs in model
+  text (found at every `://`, also when cut, quoted or glued to other text) and in locators lose query, fragment
+  and userinfo, and text that does not parse as a URL loses them by cutting; the operator's words are verbatim; a request that names
+  no earlier mission is sent without the `prior` key, so an older daemon still accepts it). The source is each mission's sealed
+  journal; one that fails verification or was written by a newer loom is named unreadable. No log-schema change.
+
+### Sandbox: Git metadata, the trustd route, the daemon port, and adoption by descriptor
+
+- Commands and the file tools can no longer plant what Git runs as the operator. In every writable root (the
+  workspace, the session temp dir, `extra_writable`) the profile and `check_write` refuse Git configuration,
+  hooks and `commondir`/`gitdir` pointers of linked worktrees (`.git/worktrees/<n>/`) and submodule repositories
+  (`.git/modules/<n>/`, deinitialized and nested ones included), and refuse making or moving a `.git`, a
+  worktree gitdir or a submodule repository into place. Before, a command could point an external worktree's
+  `commondir` at a config of its own, plant a submodule hook, or `git init` a repository in `$TMPDIR` and move it
+  into the workspace behind a gitlink, and the operator's next `git status` ran its command (reproduced on macOS
+  27, Git 2.50). Existing worktree and submodule gitdirs are discovered at construction and protected (and
+  mounted read-only by Bubblewrap). `git init` and non-bare clones no longer work anywhere commands write: a bare
+  clone does; `git worktree add` and `git submodule update --init` are for the operator, and the refusal and the
+  system prompt say so.
+- The file tools' `check_write` compares those Git names as APFS folds them (`ſ`, the Kelvin sign, `ß` and the
+  `ﬀ`–`ﬆ` ligatures), so `write` can no longer make `.git/moduleſ/<n>/hooks/<hook>`, which Git reads as
+  `.git/modules/<n>/hooks/<hook>`; the profile's Git regexes spell the same folds (Seatbelt already matched
+  the folded name on macOS 27).
+- Under `network.mode = deny_all`, commands can no longer reach `com.apple.trustd.agent`, `com.apple.trustd` or
+  `com.apple.ocspd`. A command could have trustd fetch any URL named in a certificate (AIA), past the proxy and
+  `net.jsonl`. Programs that check certificates through macOS (Swift, Go, `security`, `codesign --verify`) now
+  fail in deny_all; curl and Python are unaffected. In the other modes this stays a documented residual.
+- Commands can no longer mount a file system or attach a disk image over a directory (`file-mount` and the
+  DiskArbitration/disk-image services are denied): `hdiutil attach -mountpoint` of an image a command made
+  replaced `.git/hooks`, and works over `~/.ssh` or `~/Library/LaunchAgents` (reproduced on macOS 27; this
+  predates the release). `hdiutil attach` and `diskutil` now fail in every session.
+- Commands can no longer write macOS preferences (`user-preference-write`): `cfprefsd` wrote
+  `~/Library/Preferences` for them outside the sandbox. Reading preferences still works.
+- Under `deny_all`, background URL sessions (`nsurlsessiond`) and WebKit's networking services are denied as
+  well: each fetched a URL for a command driven from `osascript -l JavaScript`.
+- Below `.git/modules/<name>/` nothing can be made or removed except inside the submodule repositories found
+  when the sandbox was built (a slash-named submodule set up mid-session could be replaced by a copy carrying
+  `core.fsmonitor`). The `core.hooksPath` directory and included files named by each repository's, the
+  enclosing repository's and the user's global Git configuration are protected (husky's `.husky/` hooks could be
+  planted), resolved against every working tree they serve: submodules (`core.worktree`), linked worktrees,
+  `~user/` values. A `HEAD` and `objects` planted in a directory no longer stop the next session's discovery. Bare repositories
+  in the workspace are found; pointer targets count only when they are repositories. `agent_adopt` asks the
+  sandbox about every path before it looks at the workspace (no more existence oracle through a link) and
+  again once each file is in place.
+- The daemon's own port is refused to commands in every profile, even with `loopback_all` or when listed in
+  `loopback_ports`, so a `loom open` login code on another process's command line cannot be redeemed. New
+  non-configuration fields `SandboxCfg::daemon_port` and `SandboxCfg::network_deny_all` carry what the profile
+  needs. With `loopback_all` the loopback allow is written for TCP and UDP (not `ip`), because a deny of one port
+  after an allow of `(remote ip "localhost:*")` is unreliable on macOS 27; loopback ICMP is no longer allowed then.
+- `agent_adopt` writes, makes and removes relative to directories it opened without following a link and judged
+  by their real path (as `write` does), so a background command that swaps a workspace directory for a link
+  during adoption can no longer redirect an unsandboxed write (into `~/.ssh` or `.git/hooks`, say).
+
+### The sandbox hides the whole loom home
+
+- Commands (seatbelt profile) and the file tools (`check_read`) can no longer read anything under the loom
+  home except the session temp dir (an isolated replay: its staged workspace and temp); before, only `token`,
+  `keys` and `oracle-secrets` were hidden, so a command could read its own or another session's log, a stored
+  output, a mission journal or an earlier run's results. The home and the directories down to the temp dir stay
+  stat-able (`cd`, `pwd -P`, `mkdir -p` in `$TMPDIR` work) but cannot be listed. A hard link from the temp dir to
+  a file that is not readable is refused by seatbelt (probed on macOS 27). A workspace that is or lies inside
+  the loom home is now refused at construction, and the system prompt says loom's own files are not readable.
+  Linux Bubblewrap already hid the home; its file tools now agree.
+- The names under the home are hidden too (`file-test-existence`, and `file-search` everywhere), so a command
+  can no longer list the home by file id (`fsgetpath`) or `searchfs`. The session's job output directory gives
+  commands the metadata of its files, which `cat` and Python take of their inherited stdout; without it they
+  lost their output. Binary-analysis inputs are staged in `<session dir>/analysis/<random>/target`, which
+  commands can read (rizin and gdb open it) and never write.
+- A path written through `/System/Volumes/Data/...` is given its usual form back, so `grep`, `glob`,
+  `continuation` guards and the workspace check judge it as the plain path. `grep`, `dep_scan` report files, guard
+  hashing and the copy of a workspace made for an agent (and its adoption) now judge the real path of the file
+  they open, so a link swapped in after a check reads and copies nothing refused. `dep_scan` names the report
+  files it refused. `workcopy::make` and `adopt` take a read judge.
+- Missing names in the directories between the home and the temp dir answer "no such file" again (only their
+  direct children can be tested for existence; existing ones still give EPERM, nothing deeper is testable), so
+  `node a.js` and `require` from `$TMPDIR`, `npm test`, Node spawning `sh` by name with an ancestor's
+  `node_modules/.bin` on `PATH`, and Python 3.9's `pathlib` upward walks work, in a replay too.
+- `~/.fly` and `~/.pulumi` are protected as `~/.fly/config.yml` and `~/.pulumi/credentials.json` instead of whole
+  directories: with their `bin` directories on `PATH` (the installers add them) every Node spawn of a bare
+  command name failed with EPERM since names were hidden. `flyctl` and `pulumi` can run from there again.
+- Messages that told the model to read a job output file now say to run the command again; `describe()` in mode
+  `none` words the loom-home rule as the file tools' own.
+
+### Model traffic, the daemon's environment and proxy credentials stay where they belong
+
+- Model requests ignore `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and the system's proxy settings. Before,
+  a proxy exported in the shell that ran `loom up` received every transcript and the bearer key, or, when
+  closed, made every step fail after the whole retry window.
+- `loom up` starts the daemon with a cleared environment: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`,
+  `LANG`, `LC_*`, `TZ`, `TMPDIR`, `LOOM_LOG`, `RUST_BACKTRACE`, the profiles' `api_key_env` variables and
+  the `[sandbox] env_pass` names. Any process of the user, sandboxed commands included, can read the
+  environment a process was started with (macOS `KERN_PROCARGS2`), so the shell's tokens and cloud
+  credentials no longer sit where commands can read them. **Commands no longer inherit other variables
+  of that shell**: list one they need (`JAVA_HOME`, say) in `env_pass`.
+- New profile key `api_key_file`: a file name in `~/.loom/keys/models` (yours, mode 0600), read once at
+  start; the daemon refuses to start, naming the profile and the file, when it cannot use it. `api_key_env`
+  keeps working unchanged, with a warning from `loom up`, `loom config check` and the daemon log that the
+  key is readable by commands, and how to move it (RUN.md, *Model API keys*). `loom service install`
+  refuses a profile with `api_key_env`, which a login service never had. A profile may not set both.
+- Each session gets a proxy listener of its own; its sandbox allows that port only, its credentials are
+  refused on any other listener, and the proxy refuses to connect to any of its own ports whatever the
+  policy allows. A session's port is retired when it ends and never given to another session while the
+  daemon runs, so no later session gets a port a leftover process may still be allowed. A command that reads another session's proxy
+  credentials from the environment of that session's commands can no longer use them (except with
+  `loopback_all`).
+- Under `deny_all`, a scope grant allows exactly the granted hosts: before, the first grant also switched
+  on every host in the configured `allow` list.
+- `request_scope` and `loom scope` refuse `*`, a wildcard over a top-level domain (`*.com`) or over IP
+  addresses (`*.0.1`), the unspecified address (`0.0.0.0`, `::`) and a loopback address without a port
+  (`127.0.0.1`). Grants already in a ledger are kept as they are.
+- The daemon's start warnings name the variables of its environment that look like secrets (a
+  `loom daemon` run straight from a shell keeps that shell's environment).
+- `ModelClient::new` takes the key directory; `Proxy::grant` returns a `Result` and must run inside a
+  Tokio runtime. SECURITY.md lists what `KERN_PROCARGS2` still exposes.
+
+### Evidence grades: analysis no longer counts as a run
+
+- The harness now grades every quoted output: `run`, `analysis`, `read` or `reference`
+  (`loom_core::event::EvidenceGrade`). A tool states the grade in its result's meta under the new key
+  `META_EVIDENCE_GRADE` (`evidence_grade`); without it an `Exec` result is a `run` and anything else a
+  `read`, which is what the harness did before, so old logs grade as they did. The key can only lower a
+  grade. `dep_scan`, `bin_decompile` and `bin_xrefs` (all `Exec`) now say `analysis`; `cve_lookup`,
+  `cve_search`, `advisory_lookup`, and `web_fetch` through the reference client say `reference`.
+- Behaviour change: only a `run` is recorded as `kind: execution`. A quote of a dependency scan or a
+  decompilation used to be execution evidence because those tools are `Exec`, so it could conclude the goal
+  (the `vr` pack has no oracle), settle a verifier's objection and reset stuck detection; it no longer can.
+  A `conclude` that cites only such evidence is refused with a sentence that names each record's grade and
+  tool and says that analysis is not a run.
+- `Producer` gains `grade`. `EvidenceInput` gains `tool` and `grade` (`#[serde(default)]`, not serialized
+  when absent, so existing journal entries, and their MACs, are unchanged). Evidence lists in the
+  `evidence` result, the brief, the ledger Markdown, the journal summary and verifier assignments name each
+  record's grade and tool (`e1 run by bash`, `e2 analysis by dep_scan`).
+- A result of `dep_scan`, `bin_decompile`, `bin_xrefs` or the CVE/advisory tools logged before this
+  change (no grade key) is graded as those tools now state (`EvidenceGrade::of_tool_result`), so an output
+  stored before the upgrade does not become a run by being cited after it. Evidence records already in a
+  journal are not regraded: one recorded from a scan before the upgrade stays `execution`.
+- The same scanner run through `bash` is a `run`: the grade belongs to the tool, not the command.
+- New evalkit scenario `concludes_on_a_scan`, played with a fake `depscan` that the `eval` example puts
+  first on its own PATH.
+
+### Never wedge on an oversized view or a refused request
+
+- Views are admitted like any other output. `read`, `out_read`, `out_grep` and the `bin_*` views hold at
+  most `AdmitPolicy::view_chars` characters (`ToolCtx.view_chars`, new field), end at a whole line and
+  say where to continue (`window ended at line N …; continue with start N+1`); `out_grep` stops adding
+  match groups and says how many it left out. `finalize` cuts any view still over the bound at a line
+  boundary with the handle, and admits an oversized plain message like raw output. An oversized view in
+  the protected recent region used to make every request overflow and the session fail on every answer.
+- Admission follows the session's window: `max_inline_tokens` is at most `window / 8`
+  (`AdmitPolicy::for_window`, computed at each call). The configured value is unchanged.
+- A stray NUL byte no longer turns a whole text output into a one-line description: output is binary
+  only when NULs pass 1% of it or most of its first 8 KiB is not text; a NUL is shown as `\x00`.
+- llama.cpp's overflow (`exceeds the available context size`, `exceed_context_size_error`), 422s,
+  `input is too long`, `context_length_exceeded`, and overflow errors inside a 200 stream are context
+  overflows. The limit is `n_ctx`, else the number after `maximum context length is` or `context size (`
+  (vLLM's `max_tokens` refusal names `max_tokens` first), else the wording `A > B`, else the smaller of two
+  numbers. An overflow re-weave may fold the latest step's output (down to no protected step).
+- A refusal (400/413/422 that is not an overflow, such as a content filter refusing a page in the window)
+  refused again on the same prefix re-weaves once with every tool output out of view whatever the size,
+  the replies kept and no digest asked (reason `refused`), before parking; the park text says what an answer will do, and after that re-weave, that the model or
+  its settings must change. An operator re-weave right after a refusal folds the latest step too.
+- Re-weaves fold old harness notes: nudges, stall, verdict, output-cut, budget and interrupted notes
+  early, arrival and info notes (agents' messages included) after the tool outputs. A view's stub keeps
+  the handle of the output it showed.
+- No serialized shape changed. `reweave.reason` gains the value `refused`.
+
+### A smaller HUD on long missions
+
+- The ledger brief in the HUD (the last message of every request, never prompt-cached) lists every todo
+  and doing plan step but only the last 5 done ones, every open claim but only the last 10 settled ones,
+  and the last 20 open obligations; each capped list starts with `(N older done|settled|open not shown:
+  p1–p9, p12; call `ledger` to read them)`. `BriefOpts` gains `max_plan_done`, `max_claims` and
+  `max_obligations`. A brief with 65 done steps, 74 claims and 25 open obligations went from 35 485 to
+  11 625 characters; the 504-step mission this was measured on paid about 20 000 uncached tokens per step
+  for its HUD. The re-weave brief uses the same caps; `ledger` still shows everything.
+- `security_record` returns what the write touched (`recorded`, `removed`, `counts`, `more`) instead of
+  the whole security state; `entry` and `normalized` are unchanged. The `state` key is gone from its
+  result; read the state with `security_query`.
+
+### Daemon: what a request is made of (`GET /api/sessions/{id}/window`)
+
+- Additive fields on `WindowView` (old keys unchanged; a reader of an older answer gets defaults): `breakdown`
+  (`basis`, `chars_per_token`, `total_tokens` and 14 `segments`: system, tools, rules, assignment, resume,
+  conversation, tool_output, pinned, agent_reports, notes, stubs, other, framing, hud, each with `chars`, `tokens`
+  and, for the parts that hold several things, `count`; the tokens always add up to `total_tokens`), `measured_now`
+  (the server's count for the latest answered step request of the epoch plus an estimate of what was added since;
+  `null` before the first), `last_request` (the latest step request with the server's count for its reply, 0 while
+  missing) and `fold_at` / `fold_to` (`reweave_bounds` of the configured target and floor for the session's window
+  and profile). `items[].note` names the kind of a `harness_note` item; `Weave::resume_chars` counts the resume block.
+- `est_tokens` now counts the tool list in bytes, as `session` does (it counted characters). No stored shape changed.
+
+### Web UI: phone pass 1 and the context card
+
+- **Phones (699px and under).** The session scrolls as one: `#view-session` is the only vertical scroller, the tabs stick under the
+  bar and the composer to the bottom, a tool output has no scroll box of its own (visible chat at 375x812 was 191px, now about
+  590px). A session with its own open question lands on that card, and the Jump button never covers it (an amber "Approval
+  waiting · Show" while it is off screen). The bar is one row of about 52px: Missions (with the count that need you), the
+  title over the model and run state, and Find; its button opens the new **Session details sheet** (run with a confirmed
+  Stop, context, model, view, session actions). Find is a two-row sticky bar of about 100px. The composer is a grid of about 110-130px
+  with a one-line caption ("Plan 1 of 3 · context 9% · cache 98% ›") that opens the sheet; on the other tabs it is one "Message
+  the lead…" button. With a coarse pointer Enter adds a line and Ctrl/Cmd+Enter sends; a narrow window with a mouse still sends
+  on Enter. Work-group headers have a short form, text is 16px and targets 44px for touch, and the viewport allows safe areas.
+- **Context card** (the inspector's Context tab and the sheet): the size with its window and share, one bar whose segments are
+  also the legend (colour family plus a pattern, never colour alone), rows by group, the fold marks from the daemon's effective
+  `fold_at` / `fold_to` in words and shapes (no amber), the cached/read-anew split, and notes. Estimates carry "~". Needs the
+  additive `/window` fields below; an older daemon's answer shows the hero only.
+- Riders: a profile named for its model is said once; the session id chip ends in an ellipsis when cut; the page title counts what
+  needs you; the Models-panel row class no longer collides with the chat's chip row; the inspector tabs scroll instead of wrapping;
+  the notification line says why they are off; `#f-workspace` turns autocorrect off. UI only apart from the `/window` fields.
+
+### Web UI: copy buttons and opt-in copy on select
+
+- Copy buttons: Copy reply (the exact raw text), Copy code (a fenced block without its fence), Copy message
+  (operator and agent), Copy reasoning, and on an open tool row Copy command / Copy path / Copy arguments (named for what it copies: the bash command, a file tool's path,
+  else the arguments as JSON), Copy output and Copy full output… (the whole stored output through
+  `/api/blobs/{handle}/raw`, refused above 2 MiB with a pointer to the viewer). The stored-output and file viewers
+  gain Copy lines (the selected lines, else every loaded line, without numbers) beside Copy reference / Copy path;
+  inbox cards gain Copy text and evidence cards Copy quote. Icon buttons have names and tooltips, show on hover and
+  focus and always on touch, and are 44 px on coarse pointers. Success shows "Copied" and is announced politely.
+- One `copyText` helper does every copy: the clipboard API, else the selected text and the copy command, else the
+  text left selected for Ctrl+C; the session-id chip uses it too. What each button copies is decided in `core.js`
+  (tested). An opt-in **Copy on select** checkbox (inspector Session tab, off by default, `localStorage` key
+  `loom_copy_on_select`) copies a selection wholly inside the chat or the viewer on mouseup/keyup, never while typing
+  in a field, never twice for the same selection, and says "Copied N characters".
+- loom-desk needs no change: its `WKWebView` offers `navigator.clipboard.writeText` and the copy command (checked
+  with a stand-alone view configured like `WebPane`, by injected script, which WebKit counts as a user gesture, so a real
+  click is not covered; Copy full output… therefore starts its write inside the click with the fetch as a promise, and keeps
+  the text for a "Copy now" click if the browser still refuses). The fixture serves the raw blob route. UI only; no stored shape
+  changed. `docs/UI.md` has a "Copying" section.
+
+### Workspace folders: create a missing workspace, pick a folder, browse the workspace
+
+- `POST /api/sessions` accepts `create_workspace` (default false). When the workspace does not exist and the flag is
+  set, the daemon makes it (`create_dir_all`) and the 201 answer carries `created: true`; without the flag the refusal
+  says the folder does not exist and how to create it. Refused before anything is made: a relative path, a path inside
+  the loom home or its copies folder, a path under a file, `.`/`..` in the part that does not exist, `/` or the home
+  itself. `~` and `~/x` expand to the daemon user's home. `loom run --create-workspace` (and `loom chat`) does the same
+  and prints `created workspace <path>`.
+- `GET /api/fs/dirs?path=` lists the folders in a folder (folders only, never file names; links marked; the loom home
+  refused). `GET /api/sessions/{id}/files?path=` and `.../files/lines?path=&start=&count=` read a session's workspace
+  (read-only, confined to it, `.loom` never shown, links that leave are not followed, files over 32 MiB refused, binary
+  files named as such); they record nothing in the session. Additive; no stored shape changed.
+- Web UI: a **Browse…** folder picker and a "Create and start" confirmation on the New mission form; a **Files** tab in
+  the inspector (and a Files button in the session header), a file viewer mode, and **Open file** on tool rows. The
+  fixture (`tools/ui-preview.mjs`) mirrors the routes. `docs/UI.md`, `docs/DESIGN.md` section 12 and `docs/RUN.md`
+  are updated.
+- Hardening: "inside the loom home or copies folder" is judged by file identity, so `/System/Volumes/Data/...` and links
+  no longer get around it (also re-judged once a new workspace exists, which is removed again if it landed there); a new
+  workspace gets its `.loom` (0700), so Bubblewrap can start in it, and a request that fails after the folder was made
+  removes what it made; an existing workspace inside the loom home is refused. Both listings read a folder through one
+  open descriptor, and the Files routes refuse anything that resolves into the loom home (a workspace may hold it); a
+  line page keeps no per-line index. UI: the first read of the workspace root is no longer started twice, the folder
+  lists no longer leak scroll height, the focused row is scrolled into view, coarse-pointer targets are 44 px, and
+  Backspace/Alt+Up go up from an empty folder. Additive; no stored shape changed.
+
+### Web UI pass 2: supervising many missions
+
+- Switcher (Ctrl/Cmd+K, `Switch…`), Alt+Up/Down and Alt+Shift+Up/Down (next mission that needs you), and a `?`
+  shortcut sheet; no key stops a session.
+- An **Agents** tab (`#/s/<id>/agents`): agents grouped Needs you, Running, Waiting, Idle, Ended in stable
+  creation order, with per-agent figures from `GET /api/missions/{id}/score` (on open, Refresh, at most every 120 s).
+- **Find in the record** (`/`): literal search of the whole loaded record including folded groups, with an honest
+  count; cut outputs are searched in the viewer.
+- Browser notifications for blocking items, results and mission endings: only when the page is hidden, batched within
+  5 s, never for a stop this tab asked for, closed when the item resolves.
+- A quiet indicator ("no new record for 41m"), a "New since your last visit" divider, "Jump to latest · N new" and
+  a progress line (plan, current step, budget as a limit) above the composer.
+- Tool statuses have their own shapes (`exit N`, denied, invalid, timeout, interrupted) with counts in group
+  headers, and a "partial" mark when the model saw only part of an output.
+- "Ways out" on parked and blocker cards (fold the context, switch model, last recorded error); the inbox is
+  grouped by mission with Ctrl/Cmd+Enter to send, focus to the next card, and "Refuse…" on scope requests.
+- Fixes: snapshot merge keeps live session state, Overview work only runs on its tab, the ledger is re-read after
+  a reconnect or `lagged`, an approved scope request is no longer shown as "Dismissed", Fold now and the model
+  selects confirm first, code blocks render in linear time, and the inbox self-heals every 60 s.
+- UI only; `docs/UI.md` is updated.
+
+### Web UI: chat-first layout and visible model identity
+
+- The session opens on **Chat**, the whole record as a conversation (`#/s/<id>` and `/chat`; `/record` is
+  rewritten to `/chat`), then Overview and Evidence. Operator messages are bubbles; replies are plain prose
+  with a collapsed `Thought` row; consecutive tool calls, text-less replies and ledger/job lines fold into
+  work groups headed `Worked for <duration> · <n> tool calls` (failed and running counts included), open
+  for the last group, a running call or an operator click. **Expand all work** opens them; deep links and
+  Activity links expand the group they point into.
+- The header is an identity bar: breadcrumb, chips for the model in effect (`profile · model · window`,
+  with an "unreachable" warning), role, a copyable short id and the run state with elapsed time, the
+  standing facts, and a one-line goal with Show all.
+- Each stretch of assistant output carries a chip naming the profile that produced it, and a
+  `model_switched` record is a visible line showing both sides.
+- The composer has a model seat: choosing another profile asks for confirmation, then
+  `POST /api/sessions/{id}/model`; the switch takes effect at the next step and re-reads the prompt once.
+- A stats line under the composer replaces the top-bar speed: tok/s, cache share, context use, step.
+- The sidebar groups missions by workspace with a pinned **Needs you** group; each row has one mark by
+  strict precedence and an identity line `<profile> · <role> · <age>`.
+- The preview fixture signs in from `/#code=fixture` and covers models, the model switch, an unreachable
+  profile and `POST /__fixture/stream`.
+- The top bar (below 1100px) carries the open session's model profile and run state; the sidebar's
+  connection line is short (`Live`, `Reconnecting…`) with the detail in its tooltip; a row's identity line
+  never truncates the profile, and a waiting reason has its own line, including nonblocking questions and
+  ready results. A row's age comes from recorded activity (kept across a reload) or reads "activity not
+  loaded"; an ended-stopped session has its own shape.
+- Work groups update by member, so an open Thought, focus and the output viewer survive live records, a
+  long open group is windowed, warnings are counted in its header, and request-detail lines no longer
+  change the groups. The model seat is disabled for ended sessions and per-session while switching.
+- `loom ls` shows a MODEL column (the session's profile) after ROLE.
+
+### security_record reads near misses
+
+- `security_record` now reads an operation where its meaning is unambiguous (`ops`/`items` for
+  `operations`, wrapper fields at the top level, `username` for `principal`, a `hypothesis: {...}` wrapper,
+  word priorities, `verdict` for `status`, `host:port` or URL host locators, a method or trailing text on a
+  URL, a path under its `parent`) and lists each rewrite under a new `normalized` key of the result; the
+  key is present only when something was rewritten. Everything else is refused with the exact shape to send,
+  and role-forbidden actions (a verdict from a non-verifier, a child opening a hypothesis) are refused first.
+  Evidence still has to exist and be attested. A single `hypothesis_open` that carries evidence is recorded
+  with it in one atomic append.
+- The tool description now lists the shape of every action and differs for the lead, a child, and a
+  verifier. A failing operation inside a batch is named in the core's error (`SecurityOp::action`, added).
+  `loom-agent` depends on `url` for locator reading. No serialized shape changed; see `docs/SECURITY_STATE.md`.
+
 ### OWASP dep-scan tool
 
 - New built-in `dep_scan` tool wraps the operator-installed OWASP

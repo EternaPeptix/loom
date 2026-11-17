@@ -18,6 +18,10 @@ installation, and retraction reasons do not themselves constitute observations.
 {"operation":{"action":"asset_upsert","asset":{"kind":"host","locator":"Example.TEST.","evidence":["e1"],"mandatory":true}}}
 ```
 
+Its result names what the write changed, not the whole state: the journal `entry`, the touched records
+in full under `recorded` (their ids and a count per collection when they are many), `removed` ids, the
+size of each collection under `counts`, and where to read the rest (`security_query`).
+
 Asset kinds are `host`, `service`, `endpoint`, `file`, and `identity`. Host/IP spelling and URL scheme,
 host, and default port are canonicalized. URL paths, query strings, and identity/file locators retain
 case. URL credentials are rejected. IDs are full SHA-256 hashes of length-delimited typed tuples, so
@@ -45,6 +49,46 @@ one of these dispositions:
 Missing/unattested evidence and blank deferral reasons are rejected. `mandatory_open()` supplies the
 finish gate with remaining asset IDs. Tested coverage records that an observation exists; it does
 not mechanically establish exhaustive testing of the asset.
+
+Every evidence record carries the grade the harness gave the output it quotes (`docs/DESIGN.md` §7):
+`run`, `analysis` (`dep_scan`, `bin_decompile`, `bin_xrefs`), `read`, or `reference` (`cve_lookup`,
+`cve_search`, `advisory_lookup`, a reference-host `web_fetch`). Security records cite evidence ids and
+accept any attested grade. The goal-met conclusion, a verifier's objection and stuck detection accept
+only a run, so a scanner verdict, a decompilation, an imported scan or an advisory can locate a lead
+and support a claim, but cannot by itself show that the goal is met.
+
+## How `security_record` reads near misses
+
+Logged missions refused many `security_record` calls for shape rather than substance, so the tool reads
+an operation where its meaning is unambiguous and says exactly what it did. Each rewrite is one
+sentence under `normalized` in the result (`{"entry": n, "normalized": [...], "state": ...}`; the key is
+absent when nothing was rewritten). What is read:
+
+- `ops` or `items` for a batch's `operations`; a batch element is read on its own and a failing element
+  is named, whichever check refuses it ("Operation 2 of 3 in the batch (asset_upsert): ..."). A batch stays one atomic append.
+- Wrapper fields for `asset_upsert`, `credential_add`, `foothold_add`, `relation_add` given at the top
+  level, `evidence` given beside the wrapper, `username`/`user` for `principal`.
+- A hypothesis given as `hypothesis: {...}`, `statement` for `text`, a `status` (dropped: a new hypothesis
+  is always open), a missing or word-valued `priority` (`low`, `medium`, `high`; default 3), and evidence
+  given with a single `hypothesis_open` (recorded by a `hypothesis_evidence` operation in the same
+  atomic append). `hypothesis` or `hypothesis_id` for `id`, a missing `counterevidence`, and `verdict`
+  or `confirmed`/`rejected`-style words for a verdict's `status`.
+- A host locator written as `host:port` or a URL is recorded as the host; a service or endpoint locator
+  loses a leading HTTP method and any text after the URL, and a path is joined to the URL of its
+  `parent` when the scheme, host and port stay the same. A locator with URL user information is never
+  rewritten or quoted back, wherever in the locator it appears; the core refuses it. A description after
+  a relative path is cut like one after a URL, and `ftp:21`-style host names are not read as URLs.
+- A hypothesis opened with a refuted-style `status` and `evidence` records that evidence as
+  counterevidence. The asset in a `cred` or `auth` condition may be an alias or prefix; it is stored as
+  the full asset ID.
+
+What is refused, before anything is recorded and with the shape to send: an action that belongs to
+another tool, an unknown action, a hypothesis verdict from anyone but an independent read-only verifier,
+a hypothesis open or priority change from a child (a verifier included), a condition that is not a typed `{kind, value}`, a
+service or endpoint locator without a scheme or a bare path, and an unreadable priority. Evidence must
+still exist and be attested, authority is still checked by the tool and the core, and these records
+never authorize network access. The tool description lists the exact shape of every action and differs
+by the session's standing (lead, child, or verifier).
 
 ## Conditions, revisits, crashes, and hypotheses
 

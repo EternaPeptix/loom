@@ -26,6 +26,10 @@ pub const META_SIGNAL: &str = "signal";
 pub const META_PATH: &str = "path";
 /// `ToolResult::meta` key: full id of the raw bytes, when the stored text differs from them.
 pub const META_RAW_BLOB: &str = "raw_blob";
+/// `ToolResult::meta` key: full ids (an array of strings) of further outputs the call stored and names in
+/// its header, beside `output` and `META_RAW_BLOB` (dep-scan's further reports). They are outputs of the
+/// session's mission like the others (`loom_tools::outputs`).
+pub const META_ALSO_STORED: &str = "also_stored";
 /// `ToolResult::meta` key: id of the background job a call turned into or started.
 pub const META_JOB: &str = "job";
 /// Output was admitted for a stored action; coverage awaits an actual actor callback.
@@ -42,6 +46,93 @@ pub const REFUSAL_VERIFIER: &str = "verifier";
 /// accepted the result, `false` when it was delivered without one. Absent in logs written before the
 /// key existed.
 pub const META_VERIFIED: &str = "verified";
+/// `ToolResult::meta` key: how the result counts as evidence, set by the tool that produced it: the
+/// snake_case name of an [`EvidenceGrade`] (`run`, `analysis`, `read`, `reference`). Absent on most
+/// results; [`EvidenceGrade::of`] then grades by class. A tool sets it only to lower a grade.
+pub const META_EVIDENCE_GRADE: &str = "evidence_grade";
+
+/// What a quote from a tool's output can show, graded by the harness, never by the model. Only `Run` is
+/// execution evidence: every rule that asks for a run (concluding the goal, settling a verifier's
+/// objection, progress after a rejected finish) is met by a `Run` and by nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceGrade {
+    /// Something was run and its behaviour observed: a command, a request, a debugger, an oracle.
+    Run,
+    /// A tool's analysis of something it did not run: a dependency scanner's verdicts, a decompilation,
+    /// cross-references. It describes the target; it does not show what the target does.
+    Analysis,
+    /// Something was read: a file, a page, a listing, a search.
+    Read,
+    /// Reference data about the world rather than the target: a CVE or advisory record, a page fetched
+    /// from a reference host.
+    Reference,
+}
+
+impl EvidenceGrade {
+    /// The wire name: `run`, `analysis`, `read` or `reference`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EvidenceGrade::Run => "run",
+            EvidenceGrade::Analysis => "analysis",
+            EvidenceGrade::Read => "read",
+            EvidenceGrade::Reference => "reference",
+        }
+    }
+
+    /// The grade named `word` exactly (one of the wire names); `None` otherwise.
+    pub fn parse(word: &str) -> Option<EvidenceGrade> {
+        match word {
+            "run" => Some(EvidenceGrade::Run),
+            "analysis" => Some(EvidenceGrade::Analysis),
+            "read" => Some(EvidenceGrade::Read),
+            "reference" => Some(EvidenceGrade::Reference),
+            _ => None,
+        }
+    }
+
+    /// The grade of a tool result of class `class` whose meta is `meta`.
+    /// - No [`META_EVIDENCE_GRADE`]: `Run` for class `Exec`, `Read` for every other class (what the
+    ///   harness did before the key existed, so a log written then grades as it did).
+    /// - A grade's name: that grade, except that `run` counts only on an `Exec` result; on any other class
+    ///   it is `Read`. The key can lower a grade and never raise one.
+    /// - Anything else (not a string, or not a grade's name): `Analysis` for an `Exec` result and `Read`
+    ///   otherwise, so an unreadable grade never makes a run.
+    pub fn of(class: ToolClass, meta: &Map<String, Value>) -> EvidenceGrade {
+        let exec = class == ToolClass::Exec;
+        let Some(value) = meta.get(META_EVIDENCE_GRADE) else {
+            return if exec { EvidenceGrade::Run } else { EvidenceGrade::Read };
+        };
+        match value.as_str().and_then(EvidenceGrade::parse) {
+            Some(EvidenceGrade::Run) if !exec => EvidenceGrade::Read,
+            Some(grade) => grade,
+            None if exec => EvidenceGrade::Analysis,
+            None => EvidenceGrade::Read,
+        }
+    }
+
+    /// The grade of a recorded result of the tool `name`: [`EvidenceGrade::of`], except that a result of one
+    /// of the tools that state their grade ([`GRADED_ANALYSIS_TOOLS`], [`GRADED_REFERENCE_TOOLS`]) which
+    /// carries no [`META_EVIDENCE_GRADE`] (a log written before they stated it) gets the grade they state
+    /// now, never `Run`. So an output stored before an upgrade cannot become a run by being cited after it.
+    pub fn of_tool_result(name: &str, class: ToolClass, meta: &Map<String, Value>) -> EvidenceGrade {
+        if !meta.contains_key(META_EVIDENCE_GRADE) {
+            if GRADED_ANALYSIS_TOOLS.contains(&name) {
+                return EvidenceGrade::Analysis;
+            }
+            if GRADED_REFERENCE_TOOLS.contains(&name) {
+                return EvidenceGrade::Reference;
+            }
+        }
+        EvidenceGrade::of(class, meta)
+    }
+}
+
+/// Tools whose every result states the grade `analysis` (see [`EvidenceGrade::of_tool_result`]).
+pub const GRADED_ANALYSIS_TOOLS: &[&str] = &["dep_scan", "bin_decompile", "bin_xrefs"];
+/// Tools whose every result states the grade `reference` (`web_fetch` states it only for some, so it is not
+/// here: an old `web_fetch` result grades by class, as `read`).
+pub const GRADED_REFERENCE_TOOLS: &[&str] = &["cve_lookup", "cve_search", "advisory_lookup"];
 
 /// Who produced an item. Never changed by projection, eviction or summarisation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,9 +280,27 @@ pub enum Event {
         outcome: SessionOutcome,
         detail: String,
     },
+    /// The session's model changed while the daemon ran: the operator switched it, or its profile was
+    /// reloaded with new settings. Requests from here on go to `to`, and the weave replays reasoning as
+    /// `reasoning_replay` says. Never shown to the model: a different model is a cold cache by nature,
+    /// not something to reason about.
+    ModelSwitched(ModelSwitched),
     /// A kind this build does not know. Preserved on disk, ignored by the weave.
     #[serde(other)]
     Unknown,
+}
+
+/// See [`Event::ModelSwitched`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelSwitched {
+    pub from: ModelRef,
+    pub to: ModelRef,
+    /// The reasoning replay of `to`'s profile, which the weave applies from here on.
+    #[serde(default)]
+    pub reasoning_replay: ReasoningReplay,
+    /// Why: `operator`, `profile reloaded`, or `changed while the session was idle`.
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -764,6 +873,7 @@ pub enum SessionOutcome {
 mod tests {
     use super::*;
     use crate::ids::BlobId;
+    use serde_json::json;
 
     fn record(event: Event) -> Record {
         Record { seq: 3, ts_ms: 1, author: Author::Harness, prev: "0".repeat(64), event }
@@ -1039,6 +1149,15 @@ mod tests {
             ("interrupted", Event::Interrupted { reason: "r".into() }),
             ("turn_end", Event::TurnEnd { reason: TurnEndReason::Finished }),
             ("session_end", Event::SessionEnd { outcome: SessionOutcome::Done, detail: "d".into() }),
+            (
+                "model_switched",
+                Event::ModelSwitched(ModelSwitched {
+                    from: ModelRef { profile: "a".into(), model: "m1".into(), context_window: 1000 },
+                    to: ModelRef { profile: "b".into(), model: "m2".into(), context_window: 2000 },
+                    reasoning_replay: ReasoningReplay::None,
+                    reason: "operator".into(),
+                }),
+            ),
         ]
     }
 
@@ -1076,5 +1195,81 @@ mod tests {
         let brief = Brief { question: "q".into(), returns: Some("r".into()), ..Default::default() };
         let v = serde_json::to_value(&brief).unwrap();
         assert_eq!(v["return"], "r");
+    }
+
+    fn graded(value: Value) -> Map<String, Value> {
+        let mut meta = Map::new();
+        meta.insert(META_EVIDENCE_GRADE.into(), value);
+        meta
+    }
+
+    #[test]
+    fn without_a_grade_an_exec_result_is_a_run_and_anything_else_a_read() {
+        let none = Map::new();
+        assert_eq!(EvidenceGrade::of(ToolClass::Exec, &none), EvidenceGrade::Run);
+        for class in [ToolClass::Nav, ToolClass::Read, ToolClass::Write, ToolClass::State, ToolClass::Terminal] {
+            assert_eq!(EvidenceGrade::of(class, &none), EvidenceGrade::Read, "{class:?}");
+        }
+    }
+
+    #[test]
+    fn a_grade_in_the_meta_can_lower_a_result_but_never_raise_it() {
+        for grade in [EvidenceGrade::Analysis, EvidenceGrade::Read, EvidenceGrade::Reference] {
+            let meta = graded(json!(grade.as_str()));
+            assert_eq!(EvidenceGrade::of(ToolClass::Exec, &meta), grade);
+            assert_eq!(EvidenceGrade::of(ToolClass::Read, &meta), grade);
+        }
+        let run = graded(json!("run"));
+        assert_eq!(EvidenceGrade::of(ToolClass::Exec, &run), EvidenceGrade::Run);
+        // `run` on anything but an Exec result is not a run.
+        for class in [ToolClass::Nav, ToolClass::Read, ToolClass::Write, ToolClass::State, ToolClass::Terminal] {
+            assert_eq!(EvidenceGrade::of(class, &run), EvidenceGrade::Read, "{class:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_grade_fails_closed() {
+        for bad in [json!("RUN"), json!("execution"), json!(""), json!(true), json!(1), json!(null), json!(["run"])] {
+            let meta = graded(bad.clone());
+            assert_eq!(EvidenceGrade::of(ToolClass::Exec, &meta), EvidenceGrade::Analysis, "{bad}");
+            assert_eq!(EvidenceGrade::of(ToolClass::Read, &meta), EvidenceGrade::Read, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_self_grading_tools_result_without_a_grade_is_never_a_run() {
+        let none = Map::new();
+        for name in GRADED_ANALYSIS_TOOLS {
+            assert_eq!(EvidenceGrade::of_tool_result(name, ToolClass::Exec, &none), EvidenceGrade::Analysis);
+        }
+        for name in GRADED_REFERENCE_TOOLS {
+            for class in [ToolClass::Read, ToolClass::Nav] {
+                assert_eq!(EvidenceGrade::of_tool_result(name, class, &none), EvidenceGrade::Reference);
+            }
+        }
+        // Any other tool, and any result that states a grade, is graded by `of`.
+        assert_eq!(EvidenceGrade::of_tool_result("bash", ToolClass::Exec, &none), EvidenceGrade::Run);
+        assert_eq!(EvidenceGrade::of_tool_result("web_fetch", ToolClass::Read, &none), EvidenceGrade::Read);
+        assert_eq!(EvidenceGrade::of_tool_result("gdb_probe", ToolClass::Exec, &none), EvidenceGrade::Run);
+        let stated = graded(json!("analysis"));
+        assert_eq!(EvidenceGrade::of_tool_result("bash", ToolClass::Exec, &stated), EvidenceGrade::Analysis);
+        let reference = graded(json!("reference"));
+        assert_eq!(EvidenceGrade::of_tool_result("dep_scan", ToolClass::Exec, &reference), EvidenceGrade::Reference);
+    }
+
+    #[test]
+    fn grades_have_their_wire_names() {
+        for (grade, word) in [
+            (EvidenceGrade::Run, "run"),
+            (EvidenceGrade::Analysis, "analysis"),
+            (EvidenceGrade::Read, "read"),
+            (EvidenceGrade::Reference, "reference"),
+        ] {
+            assert_eq!(grade.as_str(), word);
+            assert_eq!(EvidenceGrade::parse(word), Some(grade));
+            assert_eq!(serde_json::to_value(grade).unwrap(), json!(word));
+            assert_eq!(serde_json::from_value::<EvidenceGrade>(json!(word)).unwrap(), grade);
+        }
+        assert_eq!(EvidenceGrade::parse("Run"), None);
     }
 }

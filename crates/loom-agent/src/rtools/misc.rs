@@ -5,8 +5,8 @@
 //! Both read this session's log with `loom_core::log::read_records(&shared.log_path)`.
 //!
 //! ## `pin`
-//! Resolve `handle` with `ctx.blobs.resolve` (failure → error ``There is no stored output {handle};
-//! handles are the out:… ids in result headers.``). Find every `tool_result` record in the log
+//! Open `handle` with `loom_tools::outputs::open` (failure → error `Unopened::sentence`, the same for an
+//! output of another mission as for one that does not exist). Find every `tool_result` record in the log
 //! whose `output` blob id is that blob, or whose `meta[META_OF_BLOB]` names it (the call that
 //! produced the output and every later view of it); none → error ``{handle} was not produced in this
 //! session, so it is not part of your context and cannot be pinned.`` Then, for each of them in log
@@ -44,6 +44,7 @@ use super::Shared;
 use async_trait::async_trait;
 use loom_core::event::{Author, Event, ToolClass, ToolSpec, META_OF_BLOB};
 use loom_core::log::read_records;
+use loom_tools::outputs;
 use loom_tools::params::{opt, req, spec};
 use loom_tools::{Body, Tool, ToolCtx, ToolOutput};
 use regex::Regex;
@@ -76,10 +77,9 @@ impl Tool for Pin {
         let handle = args.get("handle").and_then(Value::as_str).unwrap_or("");
         let reason = args.get("reason").and_then(Value::as_str).unwrap_or("").to_string();
         let unpin = args.get("unpin").and_then(Value::as_bool).unwrap_or(false);
-        let Ok(blob) = ctx.blobs.resolve(handle) else {
-            return ToolOutput::error(format!(
-                "There is no stored output {handle}; handles are the out:… ids in result headers."
-            ));
+        let blob = match outputs::open(ctx, handle).await {
+            Ok(blob) => blob,
+            Err(e) => return ToolOutput::error(e.sentence(handle)),
         };
         let report = match read_records(&self.0.log_path) {
             Ok(r) => r,
@@ -300,6 +300,7 @@ mod tests {
     fn build(rig: &Rig) -> BlobRef {
         let blob =
             rig.env.ctx.blobs.put_bytes(b"compiling\nerror: needle in output\nwarning: none\nneedle again\n").unwrap();
+        rig.orch.in_scope(&blob.id);
         let mut log = SessionLog::create(&rig.shared.log_path, Durability::Batch).unwrap();
         let mut put = |author: Author, event: Event| {
             log.append(author, event).unwrap();
@@ -371,6 +372,7 @@ mod tests {
     async fn pin_stored_output_without_a_later_view() {
         let rig = rig("lead", false, true);
         let blob = rig.env.ctx.blobs.put_bytes(b"only here\n").unwrap();
+        rig.orch.in_scope(&blob.id);
         let mut log = SessionLog::create(&rig.shared.log_path, Durability::Batch).unwrap();
         log.append(Author::Tool, result("c9", "bash", "only here", Some(blob.clone()), Map::new())).unwrap();
         let r = rig.call("pin", json!({"handle": blob.handle(), "reason": "r"})).await;
@@ -387,18 +389,20 @@ mod tests {
         build(&rig);
         let r = rig.call("pin", json!({"handle": "out:0123456789abcdef", "reason": "r"})).await;
         assert_eq!(r.status, ToolStatus::Error);
-        assert!(
-            r.text.contains(
-                "There is no stored output out:0123456789abcdef; handles are the out:… ids in result headers."
-            ),
-            "{}",
-            r.text
-        );
+        assert!(r.text.contains("No output of this mission has the handle `out:0123456789abcdef`."), "{}", r.text);
 
+        // Of this mission, but not of this session's log.
         let elsewhere = rig.env.ctx.blobs.put_bytes(b"from another session\n").unwrap();
+        rig.orch.in_scope(&elsewhere.id);
         let r = rig.call("pin", json!({"handle": elsewhere.handle(), "reason": "r"})).await;
         assert_eq!(r.status, ToolStatus::Error);
         assert!(r.text.contains("was not produced in this session"), "{}", r.text);
+        assert!(rig.shared.take_emitted().is_empty());
+        // Not of this mission at all: the sentence of a handle that names nothing.
+        let foreign = rig.env.ctx.blobs.put_bytes(b"another mission's\n").unwrap();
+        let r = rig.call("pin", json!({"handle": foreign.handle(), "reason": "r"})).await;
+        assert_eq!(r.status, ToolStatus::Error);
+        assert!(r.text.contains("No output of this mission has the handle"), "{}", r.text);
         assert!(rig.shared.take_emitted().is_empty());
     }
 

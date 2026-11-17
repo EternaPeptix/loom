@@ -9,6 +9,24 @@
 //! 3. raw output is normalised without changing its line count, stored whole, and admitted — the
 //!    result records which stored lines its text shows.
 //!
+//! No result's text may exceed what admission allows (DESIGN §2, principle 3): a result in the recent
+//! region cannot be folded out of view, so one oversized result would make every later request
+//! overflow. Views bound themselves with `ctx.view_chars` (see `view`, `outview`, `fstools`), and
+//! [`finalize`] is the backstop, with
+//! `budget = max(ctx.view_chars, admission.policy.view_chars(admission.estimator))` (`ctx` being the
+//! context the call ran with: a call started early sized its view before the estimator was calibrated by
+//! the reply that holds it, and is not cut for that):
+//! - a `View` or `ProducedView` whose text is longer than `budget` characters keeps its text up to and
+//!   including the last `\n` at or before character `budget` (cut on a character boundary at `budget`
+//!   when there is none), followed by the line `[cut by harness: this view is {n} characters, more than
+//!   one result may show ({budget}); the rest is not shown. Nothing was discarded: ask for fewer lines
+//!   (start/end, or a narrower pattern) of {handle}.]` where `{handle}` is the `out:` handle of the
+//!   viewed blob. Its `meta[META_SHOWN]` becomes `[]` (what a cut view showed is not claimed) and `cut`
+//!   is true;
+//! - a `Message` longer than `budget` characters is stored and admitted exactly as `Raw` of its UTF-8
+//!   bytes would be (handle, line count, cut marker), so it is cut explicitly with a handle;
+//! - anything within `budget` is unchanged, byte for byte.
+//!
 //! The three steps are also public on their own ([`prepare`], [`Prepared::run`], [`Ran::finish`]), so
 //! that a call of a [`Tool::speculative`] tool can run before its turn and be finished — stored and
 //! admitted with the admission of that moment — only when the session claims it.
@@ -20,6 +38,7 @@
 //! - [`jobs`]    background jobs
 //! - [`files`]   what a session has read, for refusing writes over unseen changes
 //! - [`view`]    numbered line views of stored output
+//! - [`outputs`] opening a stored output by handle, only among the outputs of the session's mission
 //! - [`workcopy`] a child's own copy of the workspace, and bringing one child's changes back
 //! - [`boxctl`], [`boxfs`] the remote Docker box: container life, egress, files in and out
 //! - [`bash`], [`fstools`], [`search`], [`outview`], [`web`]: the built-in tools
@@ -38,6 +57,7 @@ pub mod fstools;
 pub mod http;
 pub mod jobs;
 pub mod oracle;
+pub mod outputs;
 pub mod outview;
 pub mod params;
 pub mod proc;
@@ -74,6 +94,8 @@ pub struct ToolCtx {
     /// The session's scratch directory. Canonical.
     pub tmp_dir: PathBuf,
     pub blobs: BlobStore,
+    /// Which stored outputs this session may open (`outputs::open`).
+    pub outputs: Arc<dyn outputs::OutputScope>,
     pub cfg: Arc<ToolsCfg>,
     pub sandbox: Arc<sandbox::Sandbox>,
     /// Environment variables added to every command (proxy settings and the like).
@@ -85,6 +107,9 @@ pub struct ToolCtx {
     pub cancel: CancellationToken,
     /// Session-local PTY/HTTP state. Cloned contexts share it; children start with fresh state.
     pub capabilities: Arc<capabilities::SessionTools>,
+    /// The most characters the text of a view (`read`, `out_read`, `out_grep`, other numbered views)
+    /// may hold: `AdmitPolicy::view_chars` of the session's admission when the call was started.
+    pub view_chars: usize,
 }
 
 /// What a tool hands back.
@@ -376,18 +401,41 @@ pub fn finalize(
         meta,
         duration_ms,
     };
+    // A view sized for the bound the call ran with is not cut for a lower one that came after it.
+    let budget = ctx.view_chars.max(admission.policy.view_chars(admission.estimator));
+    // A message longer than one result may show is stored and admitted like raw output.
+    let body = match body {
+        Body::Message(text) if text.chars().count() > budget => Body::Raw(text.into_bytes()),
+        other => other,
+    };
     match body {
         Body::Message(text) => base(status, envelope_plain(&facts, &text), None, false, meta),
         Body::View { of, text, shown } => {
             meta.insert(META_OF_BLOB.into(), json!(of.as_str()));
-            meta.insert(META_SHOWN.into(), ranges_json(&shown));
-            base(status, envelope_plain(&facts, &text), None, false, meta)
+            match cut_view(&text, budget, &handle_of(of.as_str())) {
+                Some(cut) => {
+                    meta.insert(META_SHOWN.into(), ranges_json(&[]));
+                    base(status, envelope_plain(&facts, &cut), None, true, meta)
+                }
+                None => {
+                    meta.insert(META_SHOWN.into(), ranges_json(&shown));
+                    base(status, envelope_plain(&facts, &text), None, false, meta)
+                }
+            }
         }
         Body::ProducedView { blob, text, shown } => {
-            let cut = blob.lines > 0 && !(shown.len() == 1 && shown.first() == Some(&(1, blob.lines)));
             meta.insert(META_OF_BLOB.into(), json!(blob.id.as_str()));
-            meta.insert(META_SHOWN.into(), ranges_json(&shown));
-            base(status, envelope_plain(&facts, &text), Some(blob), cut, meta)
+            match cut_view(&text, budget, &blob.handle()) {
+                Some(cut) => {
+                    meta.insert(META_SHOWN.into(), ranges_json(&[]));
+                    base(status, envelope_plain(&facts, &cut), Some(blob), true, meta)
+                }
+                None => {
+                    let cut = blob.lines > 0 && !(shown.len() == 1 && shown.first() == Some(&(1, blob.lines)));
+                    meta.insert(META_SHOWN.into(), ranges_json(&shown));
+                    base(status, envelope_plain(&facts, &text), Some(blob), cut, meta)
+                }
+            }
         }
         Body::Raw(bytes) => {
             let normalized = normalize(&bytes);
@@ -414,6 +462,34 @@ pub fn finalize(
             }
         }
     }
+}
+
+/// The handle (`out:` and the first 16 characters) of a blob id.
+fn handle_of(id: &str) -> String {
+    format!("out:{}", id.chars().take(16).collect::<String>())
+}
+
+/// `text` cut to at most `budget` characters at a line end, with the line that says so, or `None` when
+/// it is within `budget`.
+fn cut_view(text: &str, budget: usize, handle: &str) -> Option<String> {
+    let total = text.chars().count();
+    if total <= budget {
+        return None;
+    }
+    let end = text.char_indices().nth(budget).map_or(text.len(), |(i, _)| i);
+    let head = text.get(..end).unwrap_or("");
+    let kept = match head.rfind('\n') {
+        Some(i) => head.get(..=i).unwrap_or(head),
+        None => head,
+    };
+    let mut out = kept.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "[cut by harness: this view is {total} characters, more than one result may show ({budget}); the rest is not shown. Nothing was discarded: ask for fewer lines (start/end, or a narrower pattern) of {handle}.]"
+    ));
+    Some(out)
 }
 
 /// The record of a call that was refused before it ran (status `Invalid`). Public so that
@@ -501,22 +577,41 @@ pub mod testutil {
     }
 
     pub fn env_with(cfg: ToolsCfg, sandbox_cfg: SandboxCfg) -> TestEnv {
+        make_env(cfg, sandbox_cfg, false)
+    }
+
+    /// `env_with` in the production layout: the session temp dir is `<dir>/home/sessions/s1/tmp`, inside the loom
+    /// home, and the job output files are in `<dir>/home/sessions/s1/jobs`, which the sandbox is told of.
+    pub fn env_prod(cfg: ToolsCfg, sandbox_cfg: SandboxCfg) -> TestEnv {
+        make_env(cfg, sandbox_cfg, true)
+    }
+
+    fn make_env(cfg: ToolsCfg, sandbox_cfg: SandboxCfg, prod: bool) -> TestEnv {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonical tempdir");
-        let (ws, tmp, home) = (root.join("ws"), root.join("tmp"), root.join("home"));
+        let (ws, home) = (root.join("ws"), root.join("home"));
+        let (tmp, jobs_dir) = if prod {
+            (home.join("sessions/s1/tmp"), home.join("sessions/s1/jobs"))
+        } else {
+            (root.join("tmp"), home.join("jobs"))
+        };
         for d in [&ws, &tmp, &home] {
             std::fs::create_dir_all(d).expect("create test dirs");
         }
         let blobs = BlobStore::open(home.join("blobs")).expect("blob store");
-        let sandbox = sandbox::Sandbox::new(&sandbox_cfg, &ws, &tmp, &home, None).expect("sandbox");
+        let mut sandbox = sandbox::Sandbox::new(&sandbox_cfg, &ws, &tmp, &home, None).expect("sandbox");
+        if prod {
+            sandbox = sandbox.with_jobs_dir(&jobs_dir).expect("jobs dir");
+        }
         let (tx, job_events) = tokio::sync::mpsc::unbounded_channel();
-        let jobs = jobs::JobTable::new(home.join("jobs"), blobs.clone(), tx, cfg.max_output_bytes);
+        let jobs = jobs::JobTable::new(jobs_dir, blobs.clone(), tx, cfg.max_output_bytes);
         let ctx = ToolCtx {
             session: SessionId::from("s-test"),
             call_id: CallId::from("call-1"),
             workspace: ws,
             tmp_dir: tmp,
             blobs,
+            outputs: Arc::new(outputs::AnyStored),
             cfg: Arc::new(cfg),
             sandbox: Arc::new(sandbox),
             env: Arc::new(BTreeMap::new()),
@@ -525,6 +620,7 @@ pub mod testutil {
             jobs: Arc::new(jobs),
             cancel: CancellationToken::new(),
             capabilities: Arc::new(capabilities::SessionTools::default()),
+            view_chars: AdmitPolicy::default().view_chars(&TokenEstimator::default()),
         };
         TestEnv {
             dir,
@@ -595,5 +691,132 @@ mod tests {
             assert_eq!(refused.status, ToolStatus::Invalid);
             assert!(refused.text.starts_with(&format!("[{name} · not run]\n{says}")), "{}", refused.text);
         }
+    }
+
+    fn small_admission() -> (AdmitPolicy, TokenEstimator) {
+        (AdmitPolicy { max_inline_tokens: 25, ..AdmitPolicy::default() }, TokenEstimator::default())
+    }
+
+    fn spec_of(e: &testutil::TestEnv, name: &str) -> ToolSpec {
+        e.registry.get(name).map(|t| t.spec()).unwrap_or_else(|| panic!("no tool {name}"))
+    }
+
+    fn body_of(text: &str) -> &str {
+        let after = text.split_once('\n').map_or("", |(_, b)| b);
+        after.rsplit_once('\n').map_or("", |(b, _)| b)
+    }
+
+    #[test]
+    fn a_view_over_the_budget_is_cut_at_a_line_with_the_handle() {
+        let mut e = testutil::env();
+        let (policy, estimator) = small_admission();
+        e.ctx.view_chars = policy.view_chars(&estimator);
+        let admission = Admission { policy: &policy, estimator: &estimator };
+        let budget = policy.view_chars(&estimator);
+        let stored = e.ctx.blobs.put_bytes(b"x\n").unwrap();
+        let text: String = (1..=200).map(|i| format!("{i}\tsome line of text\n")).collect();
+        let out = ToolOutput::ok("ok", Body::View { of: stored.id.clone(), text: text.clone(), shown: vec![(1, 200)] });
+        let r = finalize(&e.ctx, &spec_of(&e, "out_read"), out, &admission, Instant::now());
+        let body = body_of(&r.text);
+        let (kept, marker) = body.rsplit_once('\n').unwrap();
+        assert!(kept.chars().count() <= budget, "{} > {budget}", kept.chars().count());
+        assert!(text.starts_with(kept) && text.get(kept.len()..).unwrap().starts_with('\n'));
+        assert!(marker.starts_with("[cut by harness: this view is "), "{marker}");
+        assert!(marker.contains(&format!("({budget})")) && marker.contains(&stored.handle()), "{marker}");
+        assert!(r.cut && r.output.is_none());
+        assert_eq!(r.meta.get(META_SHOWN), Some(&json!([])));
+        assert_eq!(r.meta.get(META_OF_BLOB), Some(&json!(stored.id.as_str())));
+    }
+
+    #[test]
+    fn a_view_sized_for_the_calls_own_bound_is_not_cut_by_a_lower_admission() {
+        let mut e = testutil::env();
+        let (policy, estimator) = small_admission();
+        let admission = Admission { policy: &policy, estimator: &estimator };
+        let budget = policy.view_chars(&estimator);
+        e.ctx.view_chars = budget * 2;
+        let stored = e.ctx.blobs.put_bytes(b"x\n").unwrap();
+        let line = "some line of text\n";
+        let text: String = line.repeat(budget * 3 / 2 / line.len() + 1);
+        assert!(text.chars().count() > budget && text.chars().count() <= budget * 2);
+        let out = ToolOutput::ok("ok", Body::View { of: stored.id.clone(), text: text.clone(), shown: vec![(1, 1)] });
+        let r = finalize(&e.ctx, &spec_of(&e, "out_read"), out, &admission, Instant::now());
+        assert!(!r.cut && !r.text.contains("[cut by harness"), "{}", r.text);
+        // Over the call's own bound it is still cut.
+        let long = line.repeat(budget * 3 / line.len() + 1);
+        let out = ToolOutput::ok("ok", Body::View { of: stored.id.clone(), text: long, shown: vec![(1, 1)] });
+        let r = finalize(&e.ctx, &spec_of(&e, "out_read"), out, &admission, Instant::now());
+        assert!(r.cut && r.text.contains("[cut by harness"), "{}", r.text);
+    }
+
+    #[test]
+    fn a_view_with_no_line_end_is_cut_on_a_character_boundary() {
+        let mut e = testutil::env();
+        let (policy, estimator) = small_admission();
+        e.ctx.view_chars = policy.view_chars(&estimator);
+        let admission = Admission { policy: &policy, estimator: &estimator };
+        let budget = policy.view_chars(&estimator);
+        let stored = e.ctx.blobs.put_bytes(b"x\n").unwrap();
+        let text = "é✓".repeat(budget);
+        let out = ToolOutput::ok("ok", Body::View { of: stored.id.clone(), text, shown: vec![(1, 1)] });
+        let r = finalize(&e.ctx, &spec_of(&e, "out_read"), out, &admission, Instant::now());
+        let (kept, marker) = body_of(&r.text).rsplit_once('\n').unwrap();
+        assert_eq!(kept.chars().count(), budget);
+        assert!(marker.starts_with("[cut by harness"), "{marker}");
+    }
+
+    #[test]
+    fn a_produced_view_over_the_budget_keeps_its_blob_and_is_cut() {
+        let mut e = testutil::env();
+        let (policy, estimator) = small_admission();
+        e.ctx.view_chars = policy.view_chars(&estimator);
+        let admission = Admission { policy: &policy, estimator: &estimator };
+        let full: String = (1..=300).map(|i| format!("{i}\tdecompiled\n")).collect();
+        let blob = e.ctx.blobs.put_bytes(full.as_bytes()).unwrap();
+        let out = ToolOutput::ok(
+            "ok",
+            Body::ProducedView { blob: blob.clone(), text: full.clone(), shown: vec![(1, blob.lines)] },
+        );
+        let r = finalize(&e.ctx, &spec_of(&e, "bin_decompile"), out, &admission, Instant::now());
+        assert!(r.cut);
+        assert_eq!(r.output.as_ref().map(|b| b.id.clone()), Some(blob.id.clone()));
+        assert_eq!(r.meta.get(META_SHOWN), Some(&json!([])));
+        assert!(r.text.contains("[cut by harness") && r.text.contains(&blob.handle()), "{}", r.text);
+        assert!(r.text.chars().count() < full.chars().count());
+    }
+
+    #[test]
+    fn a_message_over_the_budget_is_admitted_with_a_handle() {
+        let mut e = testutil::env();
+        let (policy, estimator) = small_admission();
+        e.ctx.view_chars = policy.view_chars(&estimator);
+        let admission = Admission { policy: &policy, estimator: &estimator };
+        let text: String = (1..=500).map(|i| format!("message line {i}\n")).collect();
+        let out = ToolOutput::ok("ok", Body::Message(text.clone()));
+        let r = finalize(&e.ctx, &spec_of(&e, "bash"), out, &admission, Instant::now());
+        let stored = r.output.as_ref().expect("a handle");
+        assert_eq!(e.ctx.blobs.read_all(&stored.id).unwrap(), text.as_bytes());
+        assert!(r.cut && r.text.contains(&stored.handle()), "{}", r.text);
+        assert!(r.text.chars().count() < text.chars().count());
+    }
+
+    #[test]
+    fn views_and_messages_within_the_budget_are_unchanged() {
+        let mut e = testutil::env();
+        let (policy, estimator) = small_admission();
+        e.ctx.view_chars = policy.view_chars(&estimator);
+        let admission = Admission { policy: &policy, estimator: &estimator };
+        let budget = policy.view_chars(&estimator);
+        let stored = e.ctx.blobs.put_bytes(b"x\n").unwrap();
+        let text = "a".repeat(budget);
+        let out = ToolOutput::ok("ok", Body::View { of: stored.id.clone(), text: text.clone(), shown: vec![(1, 1)] });
+        let r = finalize(&e.ctx, &spec_of(&e, "out_read"), out, &admission, Instant::now());
+        assert_eq!(body_of(&r.text), text);
+        assert!(!r.cut);
+        assert_eq!(r.meta.get(META_SHOWN), Some(&json!([[1, 1]])));
+        let out = ToolOutput::ok("ok", Body::Message(text.clone()));
+        let r = finalize(&e.ctx, &spec_of(&e, "bash"), out, &admission, Instant::now());
+        assert_eq!(body_of(&r.text), text);
+        assert!(r.output.is_none() && !r.cut);
     }
 }

@@ -7,14 +7,16 @@ use super::{build_registry, ChildCopy, ChildInfo, Orchestrator, Producer, Settle
 use crate::pack::{Packs, RoleDef};
 use async_trait::async_trait;
 use loom_core::config::AgentsCfg;
-use loom_core::event::{ChildOutcome, ToolClass, ToolResult, Usage};
+use loom_core::event::{
+    ChildOutcome, EvidenceGrade, ToolClass, ToolResult, Usage, META_ALSO_STORED, META_OF_BLOB, META_RAW_BLOB,
+};
 use loom_core::journal::Journal;
 use loom_core::ledger::{LedgerOp, LedgerState};
 use loom_core::{BlobId, BlobRef, CallId, MissionId, SessionId};
 use loom_tools::testutil::{env, TestEnv};
 use loom_tools::{execute, Admission, Registry};
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -38,6 +40,8 @@ pub struct FakeOrch {
     pub children: Mutex<Vec<ChildInfo>>,
     pub votes: Mutex<Option<Result<Vec<Vote>, String>>>,
     pub producers: Mutex<HashMap<BlobId, Producer>>,
+    /// Outputs of the mission that no producer is declared for (raw bytes, further reports, job output).
+    pub extra_outputs: Mutex<HashSet<BlobId>>,
     /// Error returned by `stop_child` / `message_child` when set.
     pub refuse: Mutex<Option<String>>,
     /// Copies by child; a child with none works in its parent's workspace.
@@ -76,12 +80,35 @@ impl FakeOrch {
             },
         );
     }
-    /// Declare which tool call produced a stored output.
+    /// Declare which tool call produced a stored output, graded by its class alone (no grade in its meta).
     pub fn produced(&self, blob: &BlobRef, session: &str, call: &str, tool: &str, class: ToolClass) {
+        let grade = EvidenceGrade::of(class, &serde_json::Map::new());
+        self.produced_graded(blob, session, call, tool, class, grade);
+    }
+    /// Declare which tool call produced a stored output, with the grade its result carried.
+    pub fn produced_graded(
+        &self,
+        blob: &BlobRef,
+        session: &str,
+        call: &str,
+        tool: &str,
+        class: ToolClass,
+        grade: EvidenceGrade,
+    ) {
         lock(&self.producers).insert(
             blob.id.clone(),
-            Producer { session: SessionId::from(session), call_id: CallId::from(call), tool: tool.into(), class },
+            Producer {
+                session: SessionId::from(session),
+                call_id: CallId::from(call),
+                tool: tool.into(),
+                class,
+                grade,
+            },
         );
+    }
+    /// Declare a stored output an output of the mission without a producer.
+    pub fn in_scope(&self, id: &BlobId) {
+        lock(&self.extra_outputs).insert(id.clone());
     }
     pub fn running_child(&self, id: &str, role: &str) {
         lock(&self.children).push(ChildInfo {
@@ -205,6 +232,16 @@ impl Orchestrator for FakeOrch {
     }
 }
 
+/// The outputs of the mission as the fake orchestrator has them: the declared producers and the extra set.
+pub struct FakeScope(pub Arc<FakeOrch>);
+
+#[async_trait]
+impl loom_tools::outputs::OutputScope for FakeScope {
+    async fn holds(&self, blob: &BlobId) -> bool {
+        lock(&self.0.producers).contains_key(blob) || lock(&self.0.extra_outputs).contains(blob)
+    }
+}
+
 /// One session with its runtime tools, over a temporary directory.
 pub struct Rig {
     pub env: TestEnv,
@@ -225,8 +262,9 @@ pub fn rig(role: &str, child: bool, mission: bool) -> Rig {
 }
 
 pub fn rig_with(role: RoleDef, child: bool, mission: bool, agents: AgentsCfg) -> Rig {
-    let env = env();
+    let mut env = env();
     let orch = Arc::new(FakeOrch::default());
+    env.ctx.outputs = Arc::new(FakeScope(orch.clone()));
     let home = env.dir.path().join("home");
     let journal = mission.then(|| {
         let key = loom_core::journal::load_or_create_key(&home.join("keys/journal.key")).expect("journal key");
@@ -264,7 +302,25 @@ impl Rig {
                 call_id: result.call_id.clone(),
                 tool: result.name.clone(),
                 class: result.class,
+                grade: EvidenceGrade::of_tool_result(&result.name, result.class, &result.meta),
             });
+        }
+        // And the other outputs a result names, as the runtime's index of a mission's outputs has them (a view
+        // names none).
+        if result.name != "out_read" && result.name != "out_grep" {
+            if let Some(out) = &result.output {
+                self.orch.in_scope(&out.id);
+            }
+            for key in [META_OF_BLOB, META_RAW_BLOB] {
+                if let Some(id) = result.meta.get(key).and_then(Value::as_str) {
+                    self.orch.in_scope(&BlobId::from(id));
+                }
+            }
+            for id in result.meta.get(META_ALSO_STORED).and_then(Value::as_array).into_iter().flatten() {
+                if let Some(id) = id.as_str() {
+                    self.orch.in_scope(&BlobId::from(id));
+                }
+            }
         }
         result
     }
@@ -297,6 +353,14 @@ impl Rig {
     pub fn output(&self, text: &str, tool: &str, class: ToolClass) -> String {
         let blob = self.env.ctx.blobs.put_bytes(text.as_bytes()).expect("store output");
         self.orch.produced(&blob, "s-test", "call-0", tool, class);
+        blob.handle()
+    }
+
+    /// As [`Rig::output`], with the grade the producing result carried (a tool whose class says `Exec` but
+    /// whose output is analysis).
+    pub fn output_graded(&self, text: &str, tool: &str, class: ToolClass, grade: EvidenceGrade) -> String {
+        let blob = self.env.ctx.blobs.put_bytes(text.as_bytes()).expect("store output");
+        self.orch.produced_graded(&blob, "s-test", "call-0", tool, class, grade);
         blob.handle()
     }
 }

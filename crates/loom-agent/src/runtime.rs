@@ -12,7 +12,9 @@
 //! - `log.jsonl` — the session's log; written only by its [`Session`](crate::session::Session).
 //! - `meta.json` — [`SessionMeta`], written when the session is created (for a verifier the finish
 //!   gate starts, with `gate`, before its first turn); rewritten by [`Runtime::archive`] (the
-//!   `archived` flag) and [`Runtime::rename`] (the `title`). Writes
+//!   `archived` flag), [`Runtime::rename`] (the `title`), [`Runtime::set_role_model`] (a lead's
+//!   `role_models`) and a model switch (`profile`, `model`,
+//!   `context_window`: [`Runtime::set_session_model`], [`Runtime::reload_models`]). Writes
 //!   are atomic (temporary file in the same directory, then rename).
 //! - `status.json` — the latest [`Status`](crate::session::Status), rewritten atomically whenever
 //!   the session publishes one.
@@ -82,9 +84,12 @@
 //! - `paths`, `agents`, `context`, `admit` from the config (`agents.stall_steps` is 0 for a role
 //!   with none of the tools `note`, `claim`, `evidence`: the stall note asks for a ledger record,
 //!   and with the journal every child would otherwise be given it); `client` and `limiter` of the session's
-//!   model profile (one `ModelClient` and one `Limiter::new(profile.max_concurrent)` per profile,
-//!   made at start); `priority` `Lead` for a root session, `Child` for a child;
-//!   `context_window` from `meta`.
+//!   model profile in the live model set (one `ModelClient` and one `Limiter::new(profile.max_concurrent)`
+//!   per profile, made at start, and again for a profile `reload_models` adds or changes); `priority`
+//!   `Lead` for a root session, `Child` for a child; `context_window` from `meta`; `model` (`meta`'s
+//!   profile, model and window) and its profile's `reasoning_replay`, which `open` compares with the
+//!   log (see `Session::open`). A profile `meta` names that is no longer configured refuses the
+//!   activation, saying to switch the session or add the profile back.
 //! - `shared`: `Shared::new(id, Some(mission), parent, role, journal, paths.session_log(id),
 //!   agents, orchestrator)`. `journal` is `Some(Journal::new(paths.journal(mission), key))` when the
 //!   root session's role has `Termination::Explicit`, and for every child. Children read current
@@ -93,14 +98,26 @@
 //!   The orchestrator handed to `Shared` must not keep the runtime alive in a reference cycle
 //!   (hold a `Weak`, and answer "The harness is shutting down." when it is gone).
 //! - `ctx`: `ToolCtx{session, call_id: empty, workspace (canonical), tmp_dir: paths.session_tmp(id)
-//!   (created, canonical), blobs: BlobStore::open(paths.blobs_dir()), cfg: tools config, sandbox,
+//!   (created, canonical), blobs: BlobStore::open(paths.blobs_dir()), outputs: the outputs of
+//!   `meta.mission` (see *Outputs of a mission*), cfg: tools config, sandbox,
 //!   env, files: new FileTracker, jobs: JobTable::new(<session dir>/jobs, blobs, sender,
 //!   tools.max_output_bytes), cancel: new token}`.
-//!   - `sandbox`: `Sandbox::new(&cfg, workspace, tmp_dir, paths.home, Some(proxy port))` with the
-//!     config's `SandboxCfg`; for a role with `read_only`, `extra_writable` is retained as internal
+//!   - The proxy grant is made first (`proxy.grant(id, policy)`; a failure to open the session's
+//!     listener fails the set-up with `The egress proxy cannot open a port for this session: {error}`).
+//!   - `sandbox`: `Sandbox::new(&cfg, workspace, tmp_dir, paths.home, Some(grant.port))` (the session's
+//!     own proxy listener, never the shared `proxy.port()`, so a command can connect to no other
+//!     session's listener and other sessions' credentials are of no use to it; `None` under bubblewrap;
+//!     the sandbox `child_copy` builds for commands run in an agent's copy uses the port of the session
+//!     whose environment those commands get, `proxy.session_port(..)`, and `None` when it holds no grant), then
+//!     `.with_jobs_dir(<session dir>/jobs)` (commands' own output files are there: their metadata can be read,
+//!     not their content; `child_copy` uses the parent's), with the config's `SandboxCfg`; for a role with
+//!     `read_only`, `extra_writable` is retained as internal
 //!     replay-untrusted metadata before its grants are emptied, and the
 //!     workspace is added to `protected_paths`; every model profile's `api_key_env` name is added to
-//!     `secret_env`, so commands never see it.
+//!     `secret_env`, so commands never see it. `Runtime::start` sets `config.sandbox.network_deny_all` to
+//!     whether `network.mode` is `deny_all` before anything is built from the configuration, so every
+//!     sandbox it makes (sessions, agents' copies, judges) has it; `daemon_port` is whatever the caller set
+//!     (the daemon's port; `None` without one).
 //!   - `env`: the session's proxy grant (`proxy.grant(id, policy)`), `env()`. The policy is
 //!     `Policy::with_hosts(&config.network, granted)`, `granted` being the hosts the operator authorized
 //!     for the mission (`grant_scope`): the ledger's `granted_hosts()` and those granted since the daemon
@@ -110,23 +127,55 @@
 //! - `job_events`: the receiver of the job table's channel; `sink`: the runtime; `control`: new.
 //!
 //! ## Creating a root session (`create_session`)
-//! 1. `workspace` must be an existing directory (canonicalised). Role: `packs.role(pack, role)`.
+//! 1. `workspace` must be an existing directory (canonicalised); `~` and `~/x` mean the daemon user's home
+//!    directory (`expand_home`, `HOME`). When it does not exist: with `create_workspace` unset the sentence is
+//!    `The workspace {path} does not exist. Create it from the new-mission form (Create), or run `loom run
+//!    --create-workspace`.`; with it set, [`plan_workspace`] checks and, once the role, models, model facts
+//!    and earlier missions to recall (`prior`, step 3) of the request are accepted, `create_dir_all` makes it
+//!    (process umask) and it is canonicalised;
+//!    `create_session_receipt` says `true` for it (`POST /api/sessions` answers `created`). Refused, naming the
+//!    path and what to do, before anything is made: a relative path; a path that is or lies inside the loom
+//!    home or the copies directory (the sandbox refuses those workspaces); a `..` component in a path that does
+//!    not exist; a deepest existing ancestor that is not a directory; `/` or the user's home as the thing to
+//!    create; a failed `create_dir_all` (permission), which names the path; an existing workspace inside the
+//!    loom home. "Inside the loom home or the copies folder" is judged by file identity (`inside_loom_home`,
+//!    `loom_tools::files::is_or_inside`), not by path text, so `/System/Volumes/Data/...` or a link to the
+//!    home is refused too, and again on the canonical path after the folders are made (`make_tracked`): if a
+//!    link swapped in since the check leads the new folder there, what the call made is removed and the creation
+//!    refused. A new workspace gets its reserved `.loom` folder (mode 0700) at once, because a sandbox that
+//!    confines the workspace (Bubblewrap) refuses a workspace without it. A request that fails after the
+//!    folders were made (`build`, the start record, `Session::create`, `meta.json`) removes them again
+//!    (`MadeWorkspace::undo`, `remove_dir`, so nothing that holds files is deleted). The log records nothing extra.
+//!    Role: `packs.role(pack, role)`.
 //!    Profile: `config.profile(model)`.
 //! 2. Model facts: `client.discover()` once per profile (the first success with a window is
 //!    remembered; a discovery that finds no window refuses the creation and is not remembered). On
 //!    `Unavailable`, carry on with the profile's `model` and `context_window` (logged as coming from
 //!    the configuration); without a configured window the creation is refused. On
 //!    `Rejected`/`Config`: return its message.
+//!    `role_models` (trimmed) are checked as [`Runtime::set_role_model`] checks a choice, against the
+//!    lead's role and profile, before anything exists: a bad one refuses the creation.
 //! 3. New `SessionId`, new `MissionId`. `title`: the given one, else the first line of `message` cut
-//!    to 80 characters, else `untitled`.
+//!    to 80 characters, else `untitled`. `meta.role_models`: the checked choices.
+//!    `NewSession.prior: Vec<MissionId>` (serde default) names the earlier missions the operator chose
+//!    for this one to recall (`crate::prior`); `SessionMeta.prior: Vec<MissionId>` (serde default, not
+//!    written when empty; always empty for a child) keeps what was accepted. Each id
+//!    is trimmed; blanks dropped; repeats dropped (first kept); more than `prior::MAX_PRIOR` refused
+//!    (`Name at most {MAX_PRIOR} earlier missions to recall; {n} were named.`); every id must be the
+//!    mission of a known session (`There is no mission {id} to recall.`). Archived missions may be
+//!    named. They are read before the session and a missing workspace are made (`prior::read` on a blocking
+//!    thread, the lead's meta giving the title) and `meta.prior` keeps them in the given order.
 //! 4. `SessionStart{session, mission, parent: None, workspace, pack, role, termination,
 //!    model: ModelRef{profile, model, context_window}, reasoning_replay (profile),
 //!    system_prompt: pack::system_prompt(role, &pack.preamble, &PromptEnv{workspace,
 //!    platform: "{OS} ({ARCH})" from std::env::consts, sandbox: sandbox.describe(),
 //!    network: texts::network_sentence(mode, allow, deny, allow_private)}), tools: empty,
 //!    budget, unattended (default: the role's termination is `Explicit`), title}`.
-//! 5. `Session::create(deps, start, None)`, write `meta.json`, spawn the task, publish
-//!    [`BusEvent::Session`]. With a `message`: `send_message`.
+//! 5. `Session::create(deps, start, None)`; with a `prior`, `session.recall(prior::brief(&recalled))`
+//!    (one `harness_note` of kind `Info`, before any turn and so before the first model request; written
+//!    once, never again after a restart); write `meta.json`, spawn the task, publish
+//!    [`BusEvent::Session`]. With a `message`: `send_message`. A failure of any of these steps forgets
+//!    the session, as the earlier ones do.
 //!
 //! ## Children (`Orchestrator`)
 //! `spawn(parent, req)`:
@@ -138,6 +187,9 @@
 //!   verifiers (as in `children`): otherwise `{n} agents are already running, which is the most
 //!   allowed at once. Wait for one to finish (`wait`) or stop one (`agent_stop`), then start this
 //!   one.`
+//! - the operator's choice for the mission comes first for a fresh child: the parent's
+//!   `role_models` for the role, else its `*` entry (not for a `harness` request, the finish gate's
+//!   verifier). A fork never takes one (it shares the parent's model). Otherwise the pack decides:
 //! - role `model` selects a named profile; fresh children otherwise inherit. `alloy_models` rotates
 //!   fresh siblings, and `escalation_model` is selected for subsequent children of a role after a
 //!   failed/budget-exhausted result or a `hand_off` that asked for a `stronger_model`. This never mutates a running session or promises provider cache hits.
@@ -247,9 +299,39 @@
 //! stored); a `job_settled` whose output is `blob`, or a `job_matched` whose stored part is, credited
 //! to the call named by the `job_registered` of that job (`bash`, class `Exec`). Views of runtime tools
 //! register nothing.
-//! `Producer{session, call_id, tool: name, class}`. Kept as an in-memory index fed by
+//! `Producer{session, call_id, tool: name, class, grade}`, where `grade` is `EvidenceGrade::of_tool_result(name,
+//! class, meta)` of that `tool_result` (so `dep_scan`, `bin_decompile` and `bin_xrefs` give `Analysis`, the CVE
+//! and advisory tools and a reference-host `web_fetch` give `Reference`, any other `Exec` result `Run`, any
+//! other result `Read`), and a job's output is `Run` (the `bash` call that started it). A log written
+//! before the grade key existed grades by class, as before, except the results of those six tools, which get
+//! the grade the tools state now: an output a scan stored before an upgrade is not a run when it is cited
+//! after it. Kept as an in-memory index fed by
 //! every record that passes through the sink; on a miss for a mission whose logs have not been
 //! scanned since start, scan the logs of all its sessions once, then answer.
+//!
+//! ## Outputs of a mission
+//! The blob store is shared by every mission, so a session's tools open stored outputs only through
+//! `ToolCtx::outputs` (`loom_tools::outputs`). The runtime's `OutputScope` for a session holds `blob`
+//! when some record of a session of the session's mission names `blob` as an output (a session's own
+//! records; a fork's copied records are its parent's, of the same mission):
+//! - every blob `producer` would find (see above);
+//! - of a `tool_result` that is not `out_read` or `out_grep`: `output`, `meta[META_OF_BLOB]`,
+//!   `meta[META_RAW_BLOB]`, and every string in `meta[META_ALSO_STORED]` (every stored blob a result's text
+//!   names is one of these: `attempt` names the complete output of each check in `META_ALSO_STORED`);
+//! - the `output` of every `job_settled` and `job_matched`;
+//! - the `full` of every `child_settled` and `child_completed`.
+//!
+//! The ids that are not already in the producer index are kept in a second in-memory index keyed by
+//! (mission, blob), fed by the sink as the producer index is, and filled by the same once-per-mission
+//! scan (one scan fills both; `scanned` is shared). So `holds` is a map lookup once the mission has been
+//! scanned, and a miss before that scans the mission's logs once; `OutputScope::ready` (called by `open` before
+//! it lists the store) does that scan, so the first use takes the same time whatever the handle names. Scans
+//! are serialized (a second caller waits, then finds the mission scanned), and a scan that fails to run
+//! (its blocking task is lost) does not mark the mission scanned. The second index leaves out what the
+//! producer index already holds (a result's `output`, the text of a successful `read`). A view (`out_read`, `out_grep`) names
+//! nothing new, so reading an output never makes another one readable. The scope holds a `Weak` of the
+//! runtime (as the orchestrator does) and answers `false` once the runtime is gone. What the operator reads
+//! (`loom out`, the API) is not scoped.
 //!
 //! ## The sink
 //! The runtime is the `Sink` of every session.
@@ -264,7 +346,9 @@
 //! holds [`BUS_CAPACITY`] events.
 //!
 //! ## Network decisions
-//! One `loom_net::Proxy` for the runtime (`config.daemon.proxy_port`). Every decision it reports is
+//! One `loom_net::Proxy` for the runtime: its shared listener on `config.daemon.proxy_port` serves the
+//! in-process reference clients, and each session's grant has a listener of its own, closed when the
+//! grant is revoked. Every decision it reports is
 //! appended to the session's `net.jsonl` and published as [`BusEvent::Net`]. Decisions that name no
 //! session are appended to `logs/net-unattributed.jsonl`.
 //!
@@ -328,6 +412,39 @@
 //!   the new title.`). Trims `title`, sets it in the lead's `meta.json`, updates the titles cached on
 //!   that session's open inbox items, and publishes a `session` event. No turn is started. Allowed in
 //!   any state, archived included.
+//! - `set_session_model(id, profile)`: any session, lead or agent, that has not ended; the profile
+//!   must be in the live set (`There is no model profile "{p}" (configured profiles: …). Add it to
+//!   [models] in the config and run `loom models reload`.`). Under `model_changes`: discovery for the
+//!   profile as for a new session; then `meta` in memory, then `meta.json`, then, when a task runs the
+//!   session, `Input::SwitchModel` with the profile's client, limiter, window and replay policy (the
+//!   task applies it between steps and records `model_switched{reason: operator}`); a session without a
+//!   task records it when it is next opened. Publishes a `session` event. Its agents keep their models.
+//!   The receipt says whether a task took it (`live`). A lead whose pack wants the finish gate's
+//!   verifier on another profile is refused the profile chosen for that verifier.
+//! - `set_role_model(id, role, profile, now)`: any session of the mission (acts on its lead); refused
+//!   for an archived mission (`This session is archived; unarchive it first.`). `role` is one the lead
+//!   starts (`may_spawn`, then the finish gate's verifier) or `*` (every role without a choice of its
+//!   own, not the verifier); otherwise refused naming the roles (a lead that starts none: `A {role}
+//!   lead starts no agents…`). A `profile` must be in the live set, and the verifier's may not be the
+//!   lead's when the pack wants them distinct; `None` clears the choice. Under `model_changes`: the
+//!   lead's `meta.role_models` in memory, then `meta.json` (memory restored if the write fails), then a
+//!   `session` event. With `now` and a profile: each of the lead's agents the choice covers that has
+//!   not ended, was not forked and is on another profile is switched as `set_session_model` does; the
+//!   first that cannot be refuses with the choice already saved. The receipt names the agents moved
+//!   and carries the mission's models as `mission_models` reads them.
+//! - `reload_models()`: reads the configuration file again and replaces the live `[models]` and
+//!   `default_model`, without a restart; nothing else in the file is reread. Refused, changing
+//!   nothing, when the file does not load, it has no `[models]`, or `Packs::check_profiles` fails. A
+//!   profile whose settings are unchanged keeps its client, slots and discovery; a new or changed one
+//!   gets new ones, made as at start (`ModelClient::new(name, profile, paths.model_keys_dir())`), so its
+//!   `api_key_file` is read again and one it cannot use refuses the reload, changing nothing. Every session
+//!   on a changed profile that has not ended (archived ones included) is switched to it again as above,
+//!   with reason `profile reloaded`: a running one records it whatever changed (`settings_changed`: the
+//!   server or `extra_body` may have); one without a task records it
+//!   when next opened only if its model, window or replay policy changed. Sessions still on a removed profile are named in the report: a
+//!   running one keeps its client; an idle one cannot be activated until it is switched. A new or
+//!   changed profile whose `api_key_env` is not set in the daemon's environment is noted too (the
+//!   environment is the one the daemon started with). The report is a [`ModelsReload`].
 //! - `answer(item_id, answer)`: the item must be open (`There is no open inbox item {item_id}.`);
 //!   an empty answer to a blocking item is refused (`This item is waiting for an answer; write
 //!   one.`); activate the session; `Input::Answer`; a non-empty answer also resumes the session's
@@ -350,7 +467,15 @@
 //! ## Start (`Runtime::start`)
 //! 1. `config.check()`; create the directories; load packs (`Packs::load(paths.packs_dir())`) and
 //!    check every role's tools against `Registry::builtin().names()` plus `rtools::NAMES`; journal
-//!    key; blob store; clients and limiters; proxy.
+//!    key; blob store; clients (`ModelClient::new(name, profile, paths.model_keys_dir())`, so a profile's
+//!    `api_key_file` is read here and a refusal stops the start) and limiters; proxy. The start warnings
+//!    (`tracing::warn!`) include `config.key_env_warnings(paths.model_keys_dir(), …)` judged against the
+//!    daemon's own environment: a key named by `api_key_env` that is in it, where commands can read it,
+//!    and one that is missing. And one sentence naming, never with their values, the variables of the
+//!    daemon's environment that commands are not given as secrets (`loom_tools::sandbox::withheld(name,
+//!    value)`), other than `LOOM_*` ones, the profiles' `api_key_env` and the `sandbox.env_pass` names:
+//!    every command can read them from the daemon's environment; start the daemon with `loom up` or
+//!    `loom service install`, which pass only what it needs (a `loom daemon` run from a shell keeps it all).
 //! 2. Read every session's `meta.json` and `status.json` (missing status = default idle status).
 //! 3. Activate as described under *Active sessions*. A session that cannot be opened is skipped
 //!    with `tracing::error!` and a `BusEvent::Error`; a child that cannot be opened while its lead
@@ -438,7 +563,15 @@
 //!   recently paged sessions keep theirs. `stored_records(id, after, limit)`: the same page from
 //!   `PageReader::read_stored`, so that a record read as `Event::Unknown` keeps its stored line.
 //! - `window(id)`: `log::read_records` → `weave` → [`WindowView`] (`est_tokens` with a default
-//!   `TokenEstimator` over the messages plus the tool specs' JSON).
+//!   `TokenEstimator` over the messages plus the tool specs' JSON, in bytes as `session` counts them).
+//!   Its additive fields: `breakdown` (the request by part: system, tools, rules, assignment, resume,
+//!   conversation, tool_output, pinned, agent_reports, notes, stubs, other, framing, hud; each part
+//!   estimated from its characters, and, when `measured_now` exists, scaled so that the segments add up
+//!   to it exactly, `framing` taking the remainder; without a count, `basis` is `default_ratio` and the
+//!   total is the estimate), `measured_now` (`session`'s size of the request it would send now, `None`
+//!   before the first counted request of the epoch), `last_request` (the latest step request and the
+//!   server's count for its reply, 0 while missing) and `fold_at`/`fold_to` (`reweave_bounds` of the
+//!   configured target and floor for the session's window and profile).
 //! - `missions()`: one per root session. `ledger(mission)`: the journal read and folded
 //!   (`No ledger: this mission's lead does not keep one.` when there is no journal file and the
 //!   lead's role keeps none or can no longer be looked up; a lead that keeps one but has no journal
@@ -451,6 +584,10 @@
 //!   read on a blocking thread: a mission can have many, and a fork's begins with a copy of its
 //!   parent's. The id is checked as for `ledger`. It counts records and judges nothing: whether the
 //!   result was right is not in a log.
+//! - `mission_models(id)`: for the mission of any of its sessions, archived ones included: the lead's
+//!   model, its `*` choice, one entry per role it starts (the choice, the pack's `model`,
+//!   `alloy_models` and `escalation_model`, whether it is the verifier, its agents that have not ended
+//!   with their profile and whether each was forked), the live profiles and the default one.
 //! - `inbox()`: open items, oldest first. `net(id, limit)`: the last `limit` entries.
 //! - `health()`: for every profile, `client.health()` and what discovery last reported.
 //!
@@ -475,6 +612,15 @@
 //!   distinct seeds, votes parsed, a failed request counted as no choice;
 //! - `producer`: found through the live index and, after a restart, through the scan; the part a
 //!   watched job's match stored is found while the job runs, after the mission's logs were scanned;
+//! - outputs of a mission: a session's `out_read` opens its own output, its lead's (a fresh child), a
+//!   job's settled output and a result's `META_RAW_BLOB`, live and after a restart (the scan); it is
+//!   refused, with the sentence of an unknown handle, an output of another mission whose handle it was
+//!   given in a message; an `out_read` view of another mission's output already in a log (one written
+//!   before this rule) does not make that output readable;
+//! - `prior`: a lead created with `prior` has, right after `session_start` and before its first
+//!   `model_request`, one `harness_note{Info}` that is `prior::brief` of those missions; an unknown id and
+//!   more than `MAX_PRIOR` are refused and leave no session; `meta.json` keeps `prior`; a restart writes no
+//!   second note;
 //! - inbox: a `finish` opens an item and notifies (the command's file has the kind); `answer`
 //!   resolves it; an empty answer dismisses a non-blocking item without a turn and is refused for a
 //!   blocking one;
@@ -483,7 +629,13 @@
 //!   attended one idle; open inbox items are back; an ended child is not activated; a finish
 //!   verifier whose `child_spawned` a crash kept out of the lead's log is still the gate's;
 //! - a read-only role's sandbox configuration protects the workspace; every session's environment
-//!   names the proxy;
+//!   names the proxy, on the session's own port: two sessions' `HTTP_PROXY` ports differ, neither is
+//!   `proxy_port()`, and each session's sandbox allows (`loopback_ports`) its own port and not the other's;
+//!   `start_warnings` holds the `api_key_env` warning when the variable is set and when it is not, and
+//!   none for a profile with `api_key_file`; the secret-variable warning names `GITHUB_TOKEN` and a variable
+//!   whose value is `https://u:p@h/`, holds neither value, and leaves out `LOOM_HOME`, an `api_key_env` and an
+//!   `env_pass` name, and there is none when nothing is left; a profile whose key file is missing stops
+//!   `Runtime::start`;
 //! - `archive` hides, refuses messages, and survives a restart;
 //! - copies: an agent started with `Workspace::Copy` is told where it works and its command runs
 //!   there, the lead's workspace is unchanged until `agent_adopt` and has the agent's files after it,
@@ -496,6 +648,7 @@
 //!   a mission no session belongs to.
 
 use crate::pack::{self, Packs, PromptEnv, RoleDef};
+use crate::prior;
 use crate::rtools::{
     self, ChildCopy, ChildInfo, Orchestrator, Producer, Run, Settlement, Shared, SpawnReq, Vote, Workspace,
 };
@@ -506,9 +659,9 @@ use futures_util::FutureExt;
 use loom_core::config::{ensure_private_dir, Config, NetworkMode, Paths, SandboxCfg, SandboxMode};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
-    Author, Brief, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, Forked, InboxItem, ModelRef, NetDecision,
-    Record, Seq, SessionOutcome, SessionStart, SpawnMode, Termination, ToolClass, ToolStatus, TurnEndReason, Usage,
-    META_EXIT_CODE, META_OF_BLOB, META_SIGNAL,
+    Author, Brief, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, EvidenceGrade, Forked, InboxItem, ModelRef,
+    NetDecision, Record, Seq, SessionOutcome, SessionStart, SpawnMode, Termination, ToolClass, ToolStatus,
+    TurnEndReason, Usage, META_ALSO_STORED, META_EXIT_CODE, META_OF_BLOB, META_RAW_BLOB, META_SIGNAL,
 };
 use loom_core::journal::{self, Journal};
 use loom_core::ledger::LedgerState;
@@ -521,6 +674,7 @@ use loom_net::policy::Policy;
 use loom_net::proxy::Proxy;
 use loom_tools::boxctl::{DockerHost, MissionBox};
 use loom_tools::jobs::JobTable;
+use loom_tools::outputs::OutputScope;
 use loom_tools::sandbox::Sandbox;
 use loom_tools::workcopy;
 use loom_tools::ToolCtx;
@@ -556,6 +710,17 @@ pub struct NewSession {
     pub budget: Budget,
     /// The first message, sent as soon as the session exists.
     pub message: Option<String>,
+    /// Earlier missions this one may recall: what their sealed ledgers recorded is put into the lead's log
+    /// once, before its first model request (`crate::prior`). Not written when empty, so that a request that
+    /// names none is accepted by a daemon older than this field.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prior: Vec<MissionId>,
+    /// Model choices for the mission's agents (role → profile, [`ANY_ROLE`] for every role), set before
+    /// the first message so that the lead's first agents already use them.
+    pub role_models: BTreeMap<String, String>,
+    /// Make `workspace` (and the folders above it that are missing) when it does not exist. The receipt of
+    /// the creation says `created`; nothing is recorded in the log beyond what a session start records.
+    pub create_workspace: bool,
 }
 
 /// `meta.json`: what a session is, fixed when it is created.
@@ -596,7 +761,19 @@ pub struct SessionMeta {
     /// a restart, never to the parent as an agent's report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<Brief>,
+    /// The earlier missions the operator chose for this one to recall, in the order given. Empty for a child.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior: Vec<MissionId>,
+    /// A lead's model choices for its mission's agents: role → model profile, and [`ANY_ROLE`] for
+    /// every role it starts. They win over the pack's when a fresh agent is started (see
+    /// [`Runtime::set_role_model`]). Empty for an agent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub role_models: BTreeMap<String, String>,
 }
+
+/// The key of [`SessionMeta::role_models`] that stands for every role the lead starts (`may_spawn`),
+/// when the role has no choice of its own. The finish gate's verifier follows only its own.
+pub const ANY_ROLE: &str = "*";
 
 /// A session as listed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -619,6 +796,83 @@ pub struct MissionInfo {
     pub archived: bool,
 }
 
+/// What [`Runtime::reload_models`] changed.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelsReload {
+    /// Profiles that were not configured before.
+    pub added: Vec<String>,
+    /// Profiles whose settings changed: they have a new client and new request slots.
+    pub changed: Vec<String>,
+    /// Profiles no longer configured.
+    pub removed: Vec<String>,
+    /// The default profile after the reload (empty: none set).
+    pub default_model: String,
+    /// Sessions moved to the new settings of a changed profile (running ones from their next step).
+    pub rebound: Vec<SessionId>,
+    /// Sentences about what the reload could not do for the operator to act on.
+    pub notes: Vec<String>,
+}
+
+/// What [`Runtime::set_session_model`] did.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelSwitchReceipt {
+    pub session: SessionId,
+    pub model: ModelRef,
+    /// A running task took the switch: its requests go to the new model from its next step. Otherwise
+    /// the session records the switch when it next runs.
+    pub live: bool,
+}
+
+/// A mission's models: its lead's, the operator's choices for its agents, what the pack would choose,
+/// and the agents running now. See [`Runtime::mission_models`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MissionModels {
+    pub mission: MissionId,
+    pub lead: SessionId,
+    pub lead_model: ModelRef,
+    /// The choice for every role the lead starts ([`ANY_ROLE`]), when one is set.
+    pub any_role: Option<String>,
+    /// One per role the lead starts (`may_spawn`, then the finish gate's verifier), in that order.
+    pub roles: Vec<RoleModels>,
+    /// The live profiles, to choose from.
+    pub profiles: Vec<String>,
+    pub default_model: String,
+}
+
+/// One role of [`MissionModels`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoleModels {
+    pub role: String,
+    /// The finish gate's verifier: the [`ANY_ROLE`] choice does not apply to it.
+    pub verifier: bool,
+    /// The operator's choice for this role in this mission.
+    pub chosen: Option<String>,
+    /// What the pack chooses when nothing is: `escalation_model` after a failed agent, else
+    /// `alloy_models` in turn, else `model`, else the lead's.
+    pub pack_model: Option<String>,
+    pub alloy_models: Vec<String>,
+    pub escalation_model: Option<String>,
+    /// The mission's agents of this role that have not ended.
+    pub agents: Vec<AgentModel>,
+}
+
+/// An agent in [`RoleModels`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentModel {
+    pub session: SessionId,
+    pub profile: String,
+    /// Forked from the lead: it shares the lead's prefix, so a choice for its role does not move it.
+    pub forked: bool,
+}
+
+/// What [`Runtime::set_role_model`] did.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoleModelReceipt {
+    /// Running agents moved to the chosen model (`now`).
+    pub switched: Vec<SessionId>,
+    pub models: MissionModels,
+}
+
 /// An open inbox item and where it came from.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InboxEntry {
@@ -639,7 +893,9 @@ pub struct NetEntry {
 }
 
 /// What is in a session's request now.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// The fields after `cached_tokens` are additive: a reader of an older answer gets their defaults.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowView {
     pub epoch: u32,
     pub items: Vec<WindowItem>,
@@ -651,6 +907,202 @@ pub struct WindowView {
     /// As reported by the server for the latest request.
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
+    /// What the request is made of, in tokens. `segments` is empty in an answer from an older daemon.
+    #[serde(default)]
+    pub breakdown: WindowBreakdown,
+    /// The size of the request the session would send now: what the server counted for the latest step
+    /// request of this epoch, plus an estimate of what was added since. `None` before the first counted
+    /// request of the epoch.
+    #[serde(default)]
+    pub measured_now: Option<u64>,
+    /// The latest step request, with the server's count for its reply once that is in.
+    #[serde(default)]
+    pub last_request: Option<WindowRequest>,
+    /// The size at which the session folds, and the size it folds down to, for this window and profile
+    /// (the configured target and floor, lowered so that a request leaves room for the reply).
+    #[serde(default)]
+    pub fold_at: Option<u64>,
+    #[serde(default)]
+    pub fold_to: Option<u64>,
+}
+
+/// One part of the request in a [`WindowBreakdown`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WindowSegment {
+    /// `system`, `tools`, `rules`, `assignment`, `resume`, `conversation`, `tool_output`, `pinned`,
+    /// `agent_reports`, `notes`, `stubs`, `other`, `framing` or `hud`. The page words them.
+    pub key: String,
+    pub chars: u64,
+    pub tokens: u64,
+    /// How many things the part holds, for the parts that hold several.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+}
+
+/// The request in tokens by part. The tokens of the segments always add up to `total_tokens`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WindowBreakdown {
+    /// `scaled_to_measured`: the parts are estimated from characters and scaled so that they add up to
+    /// `measured_now`. `default_ratio`: estimated at the default characters per token and not checked
+    /// against a count. Empty in an answer from an older daemon.
+    pub basis: String,
+    pub chars_per_token: f64,
+    pub total_tokens: u64,
+    pub segments: Vec<WindowSegment>,
+}
+
+/// A step request as the window shows it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct WindowRequest {
+    pub req_id: String,
+    pub step: u32,
+    pub epoch: u32,
+    pub n_messages: u32,
+    pub est_tokens: u64,
+    /// What the server counted for the request; 0 until its reply is in, or when it did not say.
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+    /// Bytes of the harness state sent after the stable messages (0 when none).
+    pub hud_bytes: u64,
+}
+
+/// The part of the request an item belongs to (see [`window_breakdown`]).
+fn window_part(item: &WindowItem) -> &'static str {
+    use loom_core::event::NoteKind;
+    if item.state == loom_core::weave::ItemState::Dropped {
+        return "";
+    }
+    match (item.kind.as_str(), item.note) {
+        ("session_start", _) => "system",
+        ("forked", _) | ("harness_note", Some(NoteKind::Assignment)) => "assignment",
+        ("harness_note", Some(NoteKind::Constraint | NoteKind::Approval)) => "rules",
+        ("harness_note", _) => "notes",
+        _ if item.state == loom_core::weave::ItemState::Stubbed => "stubs",
+        ("tool_result", _) if item.pinned => "pinned",
+        ("tool_result", _) => "tool_output",
+        ("child_settled", _) => "agent_reports",
+        ("user_message" | "model_response" | "stored_action", _) => "conversation",
+        _ => "other",
+    }
+}
+
+/// The request by part. `est_total` is the estimate for the whole request at the default estimator,
+/// `measured_now` the count the server gave (plus what was added since), when there is one.
+///
+/// Each part is estimated from its characters. With a count the parts are scaled by `measured_now`
+/// over the estimate and `framing` takes what is left, so the segments add up to the count exactly;
+/// without one they are the estimates and `framing` is what the estimate holds beyond them (never
+/// below 0). Parts with nothing in them are listed with 0.
+pub(crate) fn window_breakdown(
+    items: &[WindowItem],
+    tools: (usize, usize),
+    resume_chars: usize,
+    hud_bytes: usize,
+    est_total: u64,
+    measured_now: Option<u64>,
+    estimator: &TokenEstimator,
+) -> WindowBreakdown {
+    const PARTS: [&str; 12] = [
+        "system",
+        "tools",
+        "rules",
+        "assignment",
+        "resume",
+        "conversation",
+        "tool_output",
+        "pinned",
+        "agent_reports",
+        "notes",
+        "stubs",
+        "other",
+    ];
+    let mut chars = [0u64; PARTS.len()];
+    let mut counts = [0u64; PARTS.len()];
+    let slot = |key: &str| PARTS.iter().position(|k| *k == key);
+    for item in items {
+        if let Some(i) = slot(window_part(item)) {
+            if let (Some(c), Some(n)) = (chars.get_mut(i), counts.get_mut(i)) {
+                *c = c.saturating_add(item.chars as u64);
+                *n = n.saturating_add(1);
+            }
+        }
+    }
+    // The tool list and the resume block are not items of the window: they come with their own sizes.
+    if let (Some(c), Some(n)) =
+        (slot("tools").and_then(|i| chars.get_mut(i)), slot("tools").and_then(|i| counts.get_mut(i)))
+    {
+        (*c, *n) = (tools.0 as u64, tools.1 as u64);
+    }
+    if let Some(c) = slot("resume").and_then(|i| chars.get_mut(i)) {
+        *c = resume_chars as u64;
+    }
+    let chars_of = |key: &str| slot(key).and_then(|i| chars.get(i).copied()).unwrap_or(0);
+    let tokens_of = |c: u64| estimator.tokens(usize::try_from(c).unwrap_or(usize::MAX));
+    let raw: Vec<u64> = PARTS.iter().map(|k| tokens_of(chars_of(k))).collect();
+    let raw_hud = estimator.tokens(hud_bytes);
+    let raw_sum = raw.iter().sum::<u64>().saturating_add(raw_hud);
+    // The estimate for the whole, never smaller than its parts.
+    let den = est_total.max(raw_sum);
+    let (basis, total, factor) = match measured_now.filter(|m| *m > 0 && den > 0) {
+        Some(m) => ("scaled_to_measured", m, m as f64 / den as f64),
+        None => ("default_ratio", den, 1.0),
+    };
+    let scale = |t: u64| if basis == "default_ratio" { t } else { (t as f64 * factor).floor() as u64 };
+    let mut segments: Vec<WindowSegment> = Vec::with_capacity(PARTS.len() + 2);
+    for (i, key) in PARTS.iter().enumerate() {
+        let counted = matches!(
+            *key,
+            "tools"
+                | "rules"
+                | "assignment"
+                | "conversation"
+                | "tool_output"
+                | "pinned"
+                | "agent_reports"
+                | "notes"
+                | "stubs"
+                | "other"
+        );
+        segments.push(WindowSegment {
+            key: (*key).to_string(),
+            chars: chars.get(i).copied().unwrap_or(0),
+            tokens: scale(raw.get(i).copied().unwrap_or(0)),
+            count: counted.then(|| counts.get(i).copied().unwrap_or(0)),
+        });
+    }
+    let hud = WindowSegment { key: "hud".into(), chars: hud_bytes as u64, tokens: scale(raw_hud), count: None };
+    let used = segments.iter().map(|s| s.tokens).sum::<u64>().saturating_add(hud.tokens);
+    segments.push(WindowSegment { key: "framing".into(), chars: 0, tokens: total.saturating_sub(used), count: None });
+    segments.push(hud);
+    let ratio = estimator.ratio();
+    WindowBreakdown {
+        basis: basis.to_string(),
+        chars_per_token: if factor > 0.0 { ratio / factor } else { ratio },
+        total_tokens: segments.iter().map(|s| s.tokens).sum(),
+        segments,
+    }
+}
+
+/// The latest step request in `records`, with the server's count for its reply when that is recorded.
+fn last_step_request(records: &[loom_core::event::Record]) -> Option<WindowRequest> {
+    let (req, _) = records.iter().rev().find_map(|r| match &r.event {
+        Event::ModelRequest(m) if m.purpose == loom_core::event::Purpose::Step => Some((m, r.seq)),
+        _ => None,
+    })?;
+    let usage = records.iter().rev().find_map(|r| match &r.event {
+        Event::ModelResponse(m) if m.req_id == req.req_id => Some(m.usage),
+        _ => None,
+    });
+    Some(WindowRequest {
+        req_id: req.req_id.clone(),
+        step: req.step,
+        epoch: req.epoch,
+        n_messages: req.n_messages,
+        est_tokens: req.est_tokens,
+        prompt_tokens: usage.as_ref().map_or(0, |u| u.prompt_tokens),
+        cached_tokens: usage.as_ref().map_or(0, |u| u.cached_tokens),
+        hud_bytes: req.hud.as_ref().map_or(0, |h| h.bytes),
+    })
 }
 
 /// A mission's ledger as the operator sees it, with what the read could not show.
@@ -843,6 +1295,224 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// The daemon user's home directory: `$HOME` when it is set and absolute.
+pub fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from).filter(|h| h.is_absolute())
+}
+
+/// `~` and `~/x` mean `home`; any other path is returned as it is (`~name` is not expanded and, being relative,
+/// is refused by the caller). Without a home, `~` paths are an error that says to give an absolute path.
+pub fn expand_home(path: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
+    let Some(text) = path.to_str() else { return Ok(path.to_path_buf()) };
+    let rest = match text {
+        "~" => "",
+        _ => match text.strip_prefix("~/") {
+            Some(r) => r,
+            None => return Ok(path.to_path_buf()),
+        },
+    };
+    let Some(home) = home else {
+        return Err(format!(
+            "The path {text} starts with ~, but the daemon does not know your home directory. Give an absolute path."
+        ));
+    };
+    Ok(if rest.is_empty() { home.to_path_buf() } else { home.join(rest) })
+}
+
+/// `path` (absolute, without `.` or `..` components in the part that does not exist) with its deepest existing
+/// ancestor resolved through symlinks: `(resolved path, that ancestor)`. `None` when no ancestor can be resolved.
+pub fn resolve_lenient(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        if let Ok(base) = std::fs::canonicalize(&cur) {
+            let mut resolved = base.clone();
+            resolved.extend(tail.iter().rev());
+            return Some((resolved, base));
+        }
+        tail.push(cur.file_name()?.to_os_string());
+        cur = cur.parent()?.to_path_buf();
+    }
+}
+
+/// Whether `resolved` (see [`resolve_lenient`]) is the loom home or lies inside it. Judged by file identity
+/// (`loom_tools::files::is_or_inside`), so a second spelling of the same folder (macOS
+/// `/System/Volumes/Data/...`, a link) does not get around it.
+pub fn inside_loom_home(paths: &Paths, resolved: &Path) -> bool {
+    loom_tools::files::is_or_inside(resolved, &paths.home)
+}
+
+/// A workspace that has been checked and, when it is to be made, not yet made.
+pub enum WorkspacePlan {
+    Existing(PathBuf),
+    /// `protected`: the loom home and the copies folder, which the made folder must not turn out to be inside.
+    Create {
+        path: PathBuf,
+        ancestor: PathBuf,
+        protected: Vec<PathBuf>,
+    },
+}
+
+/// A workspace made by [`WorkspacePlan::make_tracked`]: the canonical path and the folders this call made.
+#[derive(Debug)]
+pub struct MadeWorkspace {
+    pub path: PathBuf,
+    /// Folders made by this call, outermost first (empty when the workspace already existed). The workspace's own
+    /// `.loom` is made too and is not listed: `undo` removes it first.
+    pub created: Vec<PathBuf>,
+}
+
+impl MadeWorkspace {
+    /// Remove what this call made, the workspace's `.loom` first and then each folder innermost first, with
+    /// `remove_dir`, so a folder that has anything in it is left alone.
+    pub fn undo(&self) {
+        if self.created.is_empty() {
+            return;
+        }
+        let _ = std::fs::remove_dir(self.path.join(".loom"));
+        for dir in self.created.iter().rev() {
+            if std::fs::remove_dir(dir).is_err() {
+                break;
+            }
+        }
+    }
+}
+
+impl WorkspacePlan {
+    /// The canonical workspace, made first when the plan says so; `true` when it was made.
+    pub fn make(self) -> Result<(PathBuf, bool), String> {
+        let made = self.make_tracked()?;
+        let created = !made.created.is_empty();
+        Ok((made.path, created))
+    }
+
+    /// [`WorkspacePlan::make`] that also says which folders it made, so that a request that fails afterwards can
+    /// remove them. A new workspace gets its reserved `.loom` folder (mode 0700) at once, which a sandbox
+    /// that confines the workspace requires. After the folders exist the canonical result is judged again by
+    /// file identity: when a link swapped in since the check leads it into the loom home or the copies folder,
+    /// what this call made is removed and the creation refused.
+    pub fn make_tracked(self) -> Result<MadeWorkspace, String> {
+        match self {
+            WorkspacePlan::Existing(p) => Ok(MadeWorkspace { path: p, created: Vec::new() }),
+            WorkspacePlan::Create { path, ancestor, protected } => {
+                let mut created: Vec<PathBuf> = Vec::new();
+                for dir in path.ancestors() {
+                    if dir.exists() {
+                        break;
+                    }
+                    created.push(dir.to_path_buf());
+                }
+                created.reverse();
+                let made = MadeWorkspace { path: path.clone(), created };
+                let fail = |e: std::io::Error| {
+                    made.undo();
+                    format!(
+                        "The workspace {} could not be created: {e}. Check the permissions of {}, or choose another folder.",
+                        path.display(),
+                        ancestor.display()
+                    )
+                };
+                std::fs::create_dir_all(&path).map_err(fail)?;
+                let canonical = match std::fs::canonicalize(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        made.undo();
+                        return Err(format!("The workspace {} cannot be used: {e}", path.display()));
+                    }
+                };
+                if protected.iter().any(|p| loom_tools::files::is_or_inside(&canonical, p)) {
+                    made.undo();
+                    return Err(format!(
+                        "The workspace {} is inside the loom home or its copies folder, which sessions cannot use. Choose a folder elsewhere.",
+                        path.display()
+                    ));
+                }
+                if !canonical.is_dir() {
+                    made.undo();
+                    return Err(format!("The workspace {} is not a directory.", canonical.display()));
+                }
+                if let Err(e) = loom_core::config::ensure_private_dir(&canonical.join(".loom")) {
+                    made.undo();
+                    return Err(format!(
+                        "The workspace {} could not be prepared: its .loom folder cannot be made: {e}. Check the permissions, or choose another folder.",
+                        canonical.display()
+                    ));
+                }
+                Ok(MadeWorkspace { path: canonical, created: made.created })
+            }
+        }
+    }
+}
+
+/// Check `raw` as a session's workspace (see the contract of `create_session`, step 1) without making anything.
+pub fn plan_workspace(paths: &Paths, raw: &Path, create: bool) -> Result<WorkspacePlan, String> {
+    let path = expand_home(raw, user_home().as_deref())?;
+    match std::fs::metadata(&path) {
+        Ok(_) => {
+            let canonical = std::fs::canonicalize(&path)
+                .map_err(|e| format!("The workspace {} cannot be used: {e}", path.display()))?;
+            if !canonical.is_dir() {
+                return Err(format!("The workspace {} is not a directory.", canonical.display()));
+            }
+            if inside_loom_home(paths, &canonical) {
+                return Err(format!(
+                    "The workspace {} is inside the loom home ({}), which sessions cannot use. Choose a folder elsewhere.",
+                    path.display(),
+                    paths.home.display()
+                ));
+            }
+            return Ok(WorkspacePlan::Existing(canonical));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(format!("The workspace {} cannot be used: {e}", path.display()));
+        }
+        Err(_) => {}
+    }
+    if !path.is_absolute() {
+        return Err(format!(
+            "The workspace {} is a relative path that does not exist. Give an absolute path, or one that starts with ~/.",
+            path.display()
+        ));
+    }
+    if !create {
+        return Err(format!(
+            "The workspace {} does not exist. Create it from the new-mission form (Create), or run `loom run --create-workspace`.",
+            path.display()
+        ));
+    }
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)) {
+        return Err(format!(
+            "The workspace {} does not exist and its path contains . or .. . Write the path out in full.",
+            path.display()
+        ));
+    }
+    let Some((resolved, ancestor)) = resolve_lenient(&path) else {
+        return Err(format!(
+            "The workspace {} cannot be created: no folder above it exists. Choose another folder.",
+            path.display()
+        ));
+    };
+    if !ancestor.is_dir() {
+        return Err(format!(
+            "The workspace {} cannot be created: {} is not a directory. Choose a folder inside an existing directory.",
+            path.display(),
+            ancestor.display()
+        ));
+    }
+    if resolved == Path::new("/") || user_home().is_some_and(|h| h == resolved) {
+        return Err(format!("The workspace {} cannot be created: choose a folder of its own.", path.display()));
+    }
+    let copies = paths.copies_dir();
+    if inside_loom_home(paths, &resolved) || loom_tools::files::is_or_inside(&resolved, &copies) {
+        return Err(format!(
+            "The workspace {} is inside the loom home ({}) or its copies folder, which sessions cannot use. Choose a folder elsewhere.",
+            path.display(),
+            paths.home.display()
+        ));
+    }
+    Ok(WorkspacePlan::Create { path, ancestor, protected: vec![paths.home.clone(), copies] })
+}
+
 fn no_session(id: &SessionId) -> String {
     format!("There is no session {id}.", id = id.as_str())
 }
@@ -941,8 +1611,13 @@ fn produced_by(
 ) -> Option<(BlobId, Producer)> {
     match event {
         Event::ToolResult(t) => {
-            let p =
-                Producer { session: session.clone(), call_id: t.call_id.clone(), tool: t.name.clone(), class: t.class };
+            let p = Producer {
+                session: session.clone(),
+                call_id: t.call_id.clone(),
+                tool: t.name.clone(),
+                class: t.class,
+                grade: EvidenceGrade::of_tool_result(&t.name, t.class, &t.meta),
+            };
             if let Some(o) = &t.output {
                 return Some((o.id.clone(), p));
             }
@@ -958,6 +1633,7 @@ fn produced_by(
                 call_id: call_id.clone(),
                 tool: "bash".into(),
                 class: ToolClass::Exec,
+                grade: EvidenceGrade::Run,
             };
             jobs.insert((session.clone(), job_id.clone()), p);
             None
@@ -972,6 +1648,51 @@ fn produced_by(
         }
         _ => None,
     }
+}
+
+/// The stored outputs an event names besides what `produced_by` finds: of a result that is not a view
+/// (`out_read`, `out_grep`), the text it shows, its raw bytes and its further stored
+/// reports; the output of a settled or matched job; the complete report of a child.
+fn also_outputs(event: &Event) -> Vec<BlobId> {
+    let mut out: Vec<BlobId> = Vec::new();
+    let mut add = |id: &str| {
+        if !id.is_empty() {
+            out.push(BlobId::from(id));
+        }
+    };
+    match event {
+        Event::ToolResult(t) if t.name != "out_read" && t.name != "out_grep" => {
+            // `produced_by` indexes `output`, and the text of a successful `read` that has no output.
+            let indexed_of =
+                t.name == "read" && t.class == ToolClass::Read && t.status == ToolStatus::Ok && t.output.is_none();
+            for key in [META_OF_BLOB, META_RAW_BLOB] {
+                if key == META_OF_BLOB && indexed_of {
+                    continue;
+                }
+                if let Some(id) = t.meta.get(key).and_then(Value::as_str) {
+                    add(id);
+                }
+            }
+            for id in t.meta.get(META_ALSO_STORED).and_then(Value::as_array).into_iter().flatten() {
+                if let Some(id) = id.as_str() {
+                    add(id);
+                }
+            }
+        }
+        Event::JobSettled { output: Some(o), .. } | Event::JobMatched { output: Some(o), .. } => add(o.id.as_str()),
+        Event::ChildSettled(c) => {
+            if let Some(f) = &c.full {
+                add(f.id.as_str());
+            }
+        }
+        Event::ChildCompleted(c) => {
+            if let Some(f) = &c.full {
+                add(f.id.as_str());
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// The completed result is authoritative even when a later terminal/status write was interrupted.
@@ -1051,6 +1772,22 @@ fn child_outcome_of(outcome: SessionOutcome) -> ChildOutcome {
         SessionOutcome::Stopped => ChildOutcome::Stopped,
         SessionOutcome::Failed => ChildOutcome::Failed,
         SessionOutcome::BudgetExhausted => ChildOutcome::BudgetExhausted,
+    }
+}
+
+/// Revokes a session's proxy grant (closing its listener) when dropped while armed, so that a set-up
+/// that fails after the grant leaks no listener.
+struct RevokeOnDrop<'a> {
+    proxy: &'a Proxy,
+    session: &'a SessionId,
+    armed: bool,
+}
+
+impl Drop for RevokeOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.proxy.revoke(self.session);
+        }
     }
 }
 
@@ -1193,6 +1930,8 @@ struct State {
     route_cursor: HashMap<(SessionId, String), usize>,
     inbox: Vec<InboxEntry>,
     producers: HashMap<(MissionId, BlobId), Producer>,
+    /// The outputs of a mission that the producer index does not cover (see *Outputs of a mission*).
+    extra_outputs: HashSet<(MissionId, BlobId)>,
     scanned: HashSet<MissionId>,
     /// The call that started each background job, by session and job id (for the job's complete output).
     job_starts: HashMap<(SessionId, String), Producer>,
@@ -1210,11 +1949,112 @@ struct State {
     box_closed: HashSet<MissionId>,
 }
 
-/// One model profile, made at start.
+/// One model profile: its client, request slots and what discovery found. Made at start, and again for
+/// a profile a reload added or changed.
 struct ProfileRt {
     client: Arc<ModelClient>,
     limiter: Arc<Limiter>,
     discovered: Mutex<Option<Discovered>>,
+}
+
+impl ProfileRt {
+    fn new(client: ModelClient, max_concurrent: u32) -> ProfileRt {
+        ProfileRt {
+            client: Arc::new(client),
+            limiter: Arc::new(Limiter::new(max_concurrent)),
+            discovered: Mutex::new(None),
+        }
+    }
+}
+
+/// The model profiles in use: `[models]` and `default_model` as the daemon last read them (at start,
+/// or by [`Runtime::reload_models`]). Replaced whole by a reload; readers take an `Arc` of it and never
+/// hold the lock across an `.await`. A session keeps the client it was given until it is switched.
+struct ModelTable {
+    default_model: String,
+    profiles: BTreeMap<String, Arc<ProfileRt>>,
+}
+
+impl ModelTable {
+    fn get(&self, name: &str) -> Option<&Arc<ProfileRt>> {
+        self.profiles.get(name)
+    }
+
+    /// The profiles' settings, keyed as in the configuration.
+    fn configs(&self) -> BTreeMap<String, loom_core::config::ModelProfile> {
+        self.profiles.iter().map(|(name, rt)| (name.clone(), rt.client.profile().clone())).collect()
+    }
+
+    /// The profile to use for `name`, as [`Config::profile`] resolves it: the name, else `default_model`,
+    /// else the only one.
+    fn resolve(&self, name: Option<&str>) -> Result<String, String> {
+        let configs = self.configs();
+        loom_core::config::resolve_profile(&configs, &self.default_model, name)
+            .map(|(n, _)| n.to_string())
+            .map_err(|e| e.to_string())
+    }
+
+    /// `configured profiles: a, b` (or that none is), for refusals.
+    fn names(&self) -> String {
+        if self.profiles.is_empty() {
+            "no model profiles are configured".to_string()
+        } else {
+            format!("configured profiles: {}", self.profiles.keys().cloned().collect::<Vec<_>>().join(", "))
+        }
+    }
+}
+
+/// The roles a lead of role `lead` starts agents in: its `may_spawn`, then the finish gate's verifier.
+fn agent_roles(lead: &RoleDef) -> Vec<String> {
+    let mut roles = lead.may_spawn.clone();
+    if let Some(v) = lead.verifier.as_ref().filter(|v| !roles.contains(v)) {
+        roles.push(v.clone());
+    }
+    roles
+}
+
+/// Refusal of a model choice for `role` (a role the lead starts, or [`ANY_ROLE`]) in a mission whose lead
+/// has role `lead`.
+fn check_choice_role(lead: &RoleDef, role: &str) -> Result<(), String> {
+    let roles = agent_roles(lead);
+    if roles.is_empty() {
+        return Err(format!(
+            "A `{}` lead starts no agents, so there is no agent model to choose for its mission.",
+            lead.name
+        ));
+    }
+    if role != ANY_ROLE && !roles.iter().any(|r| r == role) {
+        return Err(format!(
+            "`{role}` is not a role this mission starts agents in. Its roles: {} (or `{ANY_ROLE}` for all of them).",
+            roles.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// Refusal of choosing `profile` for `role` in a mission whose lead has role `lead` and runs on
+/// `lead_profile`: the role (as [`check_choice_role`]), an unknown profile, or the finish gate's verifier
+/// on the lead's own profile when the pack wants them distinct.
+fn check_role_choice(
+    lead: &RoleDef,
+    lead_profile: &str,
+    models: &ModelTable,
+    role: &str,
+    profile: &str,
+) -> Result<(), String> {
+    check_choice_role(lead, role)?;
+    if models.get(profile).is_none() {
+        return Err(format!(
+            "There is no model profile \"{profile}\" ({}). Add it to [models] in the config and run `loom models reload`.",
+            models.names()
+        ));
+    }
+    if lead.verifier.as_deref() == Some(role) && lead.require_distinct_verifier_profile && profile == lead_profile {
+        return Err(format!(
+            "The finish gate's verifier (`{role}`) must run on another model profile than the lead's (\"{profile}\") in this pack: choose another one."
+        ));
+    }
+    Ok(())
 }
 
 /// What the runtime keeps of a session's `Deps`.
@@ -1244,9 +2084,14 @@ struct Inner {
     bus: broadcast::Sender<BusEvent>,
     packs: Packs,
     key: Vec<u8>,
-    profiles: BTreeMap<String, ProfileRt>,
+    /// The live model profiles (see [`ModelTable`]). `config.models` is the start-up snapshot only.
+    models: std::sync::RwLock<Arc<ModelTable>>,
+    /// Held by a reload and by a switch, so that model changes apply one at a time.
+    model_changes: tokio::sync::Mutex<()>,
     proxy: Proxy,
     state: Mutex<State>,
+    /// Held across a scan of a mission's logs (`scan_outputs`).
+    scan_lock: tokio::sync::Mutex<()>,
     /// Held while sessions are activated (never across an `.await`).
     activation: Mutex<()>,
     shutting: AtomicBool,
@@ -1381,7 +2226,13 @@ impl Orchestrator for Orch {
         let role = inner.packs.role(Some(&meta.pack), Some(&meta.role))?.clone();
         let (record, log) = (inner.paths.session_dir(&child).join(COPY_MANIFEST), inner.paths.session_log(&child));
         let (tmp, home, copies) = (inner.paths.session_tmp(parent), inner.paths.home.clone(), inner.paths.copies_dir());
-        let (base, models, port) = (inner.config.sandbox.clone(), inner.config.models.clone(), inner.proxy.port());
+        let parent_jobs = inner.paths.session_dir(parent).join("jobs");
+        let (base, models, port) = (
+            inner.config.sandbox.clone(),
+            inner.models().configs(),
+            // The commands run with the parent's environment, so on the parent's listener.
+            inner.proxy.session_port(parent),
+        );
         let read = tokio::task::spawn_blocking(move || {
             let dir = std::fs::canonicalize(&meta.workspace).map_err(|e| {
                 format!(
@@ -1404,7 +2255,8 @@ impl Orchestrator for Orch {
             // parent's own scratch directory, under the rules the agent itself ran under.
             let cfg = with_copies(sandbox_cfg_for(&base, &role, &dir, &models), &copies, Some(&source));
             let bubblewrap = cfg.mode == SandboxMode::Bubblewrap;
-            let sandbox = Sandbox::new(&cfg, &dir, &tmp, &home, (!bubblewrap).then_some(port))
+            let sandbox = Sandbox::new(&cfg, &dir, &tmp, &home, if bubblewrap { None } else { port })
+                .and_then(|s| s.with_jobs_dir(&parent_jobs))
                 .map_err(|e| format!("The sandbox for the copy of agent {} cannot be set up: {e}", child.as_str()))?;
             Ok(ChildCopy { agent: child, dir, manifest, running, runs, sandbox: Arc::new(sandbox) })
         });
@@ -1587,8 +2439,11 @@ impl Orchestrator for Orch {
                 "Nothing has been sent to the model in this session yet, so there is nothing to vote on.".to_string()
             );
         };
-        let rt =
-            inner.profiles.get(&profile).ok_or_else(|| format!("model profile \"{profile}\" is not configured."))?;
+        let models = inner.models();
+        let rt = models
+            .get(&profile)
+            .cloned()
+            .ok_or_else(|| format!("model profile \"{profile}\" is not configured ({}).", models.names()))?;
         let records = read_records(&inner.paths.session_log(session)).map_err(|e| e.to_string())?.records;
         let upto: Vec<Record> = records.into_iter().filter(|r| r.seq <= fork_point).collect();
         let w = weave(&upto);
@@ -1629,39 +2484,37 @@ impl Orchestrator for Orch {
     async fn producer(&self, mission: &MissionId, blob: &BlobId) -> Option<Producer> {
         let inner = self.0.upgrade()?;
         let key = (mission.clone(), blob.clone());
-        let ids = {
-            let st = inner.st();
-            if let Some(p) = st.producers.get(&key) {
-                return Some(p.clone());
-            }
-            if st.scanned.contains(mission) {
-                return None;
-            }
-            st.known.iter().filter(|(_, k)| &k.meta.mission == mission).map(|(id, _)| id.clone()).collect::<Vec<_>>()
-        };
-        let paths = inner.paths.clone();
-        let found = tokio::task::spawn_blocking(move || {
-            let mut out: Vec<(BlobId, Producer)> = Vec::new();
-            let mut jobs: HashMap<(SessionId, String), Producer> = HashMap::new();
-            for id in ids {
-                let Ok(report) = read_records(&paths.session_log(&id)) else { continue };
-                for r in own_records(&report.records) {
-                    out.extend(produced_by(&id, &mut jobs, &r.event));
-                }
-            }
-            out
-        })
-        .await
-        .unwrap_or_default();
-        let mut st = inner.st();
-        for (b, p) in found {
-            let mission = st.known.get(&p.session).map(|k| k.meta.mission.clone());
-            if let Some(m) = mission {
-                st.producers.entry((m, b)).or_insert(p);
-            }
+        if let Some(p) = inner.st().producers.get(&key) {
+            return Some(p.clone());
         }
-        st.scanned.insert(mission.clone());
-        st.producers.get(&key).cloned()
+        inner.scan_outputs(mission).await;
+        let found = inner.st().producers.get(&key).cloned();
+        found
+    }
+}
+
+/// The outputs of one mission, for the tools of one of its sessions (`loom_tools::outputs`).
+struct MissionOutputs {
+    runtime: Weak<Inner>,
+    mission: MissionId,
+}
+
+#[async_trait]
+impl OutputScope for MissionOutputs {
+    async fn holds(&self, blob: &BlobId) -> bool {
+        let Some(inner) = self.runtime.upgrade() else { return false };
+        let key = (self.mission.clone(), blob.clone());
+        if inner.holds_output(&key) {
+            return true;
+        }
+        inner.scan_outputs(&self.mission).await;
+        inner.holds_output(&key)
+    }
+
+    async fn ready(&self) {
+        if let Some(inner) = self.runtime.upgrade() {
+            inner.scan_outputs(&self.mission).await;
+        }
     }
 }
 
@@ -1690,6 +2543,18 @@ impl Inner {
 
     fn me(&self) -> Option<Arc<Inner>> {
         self.me.upgrade()
+    }
+
+    /// The live model profiles. Cheap: an `Arc` of the current table.
+    fn models(&self) -> Arc<ModelTable> {
+        self.models.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Sessions bound to `profile` that can still send a request (archived ones included: they take the
+    /// change when they are unarchived).
+    fn sessions_on(&self, profile: &str) -> Vec<SessionId> {
+        let st = self.st();
+        st.known.iter().filter(|(_, k)| k.meta.profile == profile && !k.finished()).map(|(id, _)| id.clone()).collect()
     }
 
     fn info_of(k: &Known) -> SessionInfo {
@@ -1792,6 +2657,57 @@ impl Inner {
         }
     }
 
+    /// Whether the indexes already hold `key` as an output of its mission.
+    fn holds_output(&self, key: &(MissionId, BlobId)) -> bool {
+        let st = self.st();
+        st.producers.contains_key(key) || st.extra_outputs.contains(key)
+    }
+
+    /// Read the logs of every session of `mission` once (off the async workers) and fill the producer index
+    /// and the index of other outputs from them. Does nothing for a mission already scanned.
+    async fn scan_outputs(self: &Arc<Self>, mission: &MissionId) {
+        if self.st().scanned.contains(mission) {
+            return;
+        }
+        // One scan at a time: a second caller waits for the first and then finds the mission scanned.
+        let _one = self.scan_lock.lock().await;
+        let ids = {
+            let st = self.st();
+            if st.scanned.contains(mission) {
+                return;
+            }
+            st.known.iter().filter(|(_, k)| &k.meta.mission == mission).map(|(id, _)| id.clone()).collect::<Vec<_>>()
+        };
+        let paths = self.paths.clone();
+        let scanned = tokio::task::spawn_blocking(move || {
+            let mut out: Vec<(BlobId, Producer)> = Vec::new();
+            let mut extra: Vec<BlobId> = Vec::new();
+            let mut jobs: HashMap<(SessionId, String), Producer> = HashMap::new();
+            for id in ids {
+                let Ok(report) = read_records(&paths.session_log(&id)) else { continue };
+                for r in own_records(&report.records) {
+                    out.extend(produced_by(&id, &mut jobs, &r.event));
+                    extra.extend(also_outputs(&r.event));
+                }
+            }
+            (out, extra)
+        })
+        .await;
+        // A scan that did not finish says nothing about the mission: it is tried again at the next miss.
+        let Ok((found, extra)) = scanned else { return };
+        let mut st = self.st();
+        for (b, p) in found {
+            let owner = st.known.get(&p.session).map(|k| k.meta.mission.clone());
+            if let Some(m) = owner {
+                st.producers.entry((m, b)).or_insert(p);
+            }
+        }
+        for b in extra {
+            st.extra_outputs.insert((mission.clone(), b));
+        }
+        st.scanned.insert(mission.clone());
+    }
+
     // ---- sink -------------------------------------------------------------------------------
 
     fn on_record(self: &Arc<Self>, session: &SessionId, record: &Record) {
@@ -1804,9 +2720,14 @@ impl Inner {
                     Event::ToolResult(_)
                     | Event::JobRegistered { .. }
                     | Event::JobSettled { .. }
-                    | Event::JobMatched { .. } => {
+                    | Event::JobMatched { .. }
+                    | Event::ChildSettled(_)
+                    | Event::ChildCompleted(_) => {
                         if let Some((blob, p)) = produced_by(session, &mut st.job_starts, &record.event) {
                             st.producers.entry((mission.clone(), blob)).or_insert(p);
+                        }
+                        for blob in also_outputs(&record.event) {
+                            st.extra_outputs.insert((mission.clone(), blob));
                         }
                     }
                     Event::InboxOpened(item) => {
@@ -2153,10 +3074,16 @@ impl Inner {
     /// The `Deps` of a session (granting it its proxy credentials).
     fn build(&self, meta: &SessionMeta, explicit: bool) -> Result<(Deps, Parts), String> {
         let role = self.packs.role(Some(&meta.pack), Some(&meta.role))?.clone();
-        let profile = self
-            .profiles
-            .get(&meta.profile)
-            .ok_or_else(|| format!("The model profile \"{}\" is not in the configuration.", meta.profile))?;
+        let models = self.models();
+        let profile = models.get(&meta.profile).cloned().ok_or_else(|| {
+            format!(
+                "The model profile \"{}\" of session {} is no longer configured ({}). Switch the session to another one with `loom models set {} <profile>`, or add it back to [models] and run `loom models reload`.",
+                meta.profile,
+                meta.id.as_str(),
+                models.names(),
+                meta.id.as_str()
+            )
+        })?;
         let id = &meta.id;
         let workspace = std::fs::canonicalize(&meta.workspace)
             .map_err(|e| format!("The workspace {} cannot be used: {e}", meta.workspace))?;
@@ -2165,7 +3092,7 @@ impl Inner {
         let tmp = std::fs::canonicalize(&tmp).map_err(|e| format!("cannot resolve {}: {e}", tmp.display()))?;
         let copies = self.paths.copies_dir();
         let cfg = with_copies(
-            sandbox_cfg_for(&self.config.sandbox, &role, &workspace, &self.config.models),
+            sandbox_cfg_for(&self.config.sandbox, &role, &workspace, &models.configs()),
             &copies,
             meta.copy_of.as_deref(),
         );
@@ -2177,18 +3104,20 @@ impl Inner {
         if bubblewrap && self.config.network.mode != loom_core::config::NetworkMode::DenyAll {
             return Err("Bubblewrap requires network.mode = deny_all. Explicit mission grants apply only to trusted in-process HTTP tools; subprocess proxy bridges are unsupported.".into());
         }
-        let sandbox =
-            Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, (!bubblewrap).then_some(self.proxy.port()))
-                .map_err(|e| format!("The sandbox for this session cannot be set up: {e}"))?;
+        let jobs_dir = self.paths.session_dir(id).join("jobs");
         let policy = self.session_policy(meta, explicit)?;
+        // The session's own proxy listener comes first: its port is the only one the sandbox allows.
+        let grant = self
+            .proxy
+            .grant(id, policy)
+            .map_err(|e| format!("The egress proxy cannot open a port for this session: {e}"))?;
+        // From here a failure takes the grant, and with it the listener, back.
+        let mut revoke = RevokeOnDrop { proxy: &self.proxy, session: id, armed: true };
+        let sandbox = Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, (!bubblewrap).then_some(grant.port))
+            .and_then(|s| s.with_jobs_dir(&jobs_dir))
+            .map_err(|e| format!("The sandbox for this session cannot be set up: {e}"))?;
         let (events_tx, job_events) = unbounded_channel();
-        let jobs = Arc::new(JobTable::new(
-            self.paths.session_dir(id).join("jobs"),
-            self.blobs.clone(),
-            events_tx,
-            self.config.tools.max_output_bytes,
-        ));
-        let grant = self.proxy.grant(id, policy);
+        let jobs = Arc::new(JobTable::new(jobs_dir, self.blobs.clone(), events_tx, self.config.tools.max_output_bytes));
         let reference_proxy = if self.config.network.reference_hosts.is_empty() {
             None
         } else {
@@ -2201,6 +3130,7 @@ impl Inner {
             workspace,
             tmp_dir: tmp,
             blobs: self.blobs.clone(),
+            outputs: Arc::new(MissionOutputs { runtime: self.me.clone(), mission: meta.mission.clone() }),
             cfg: Arc::new(self.config.tools.clone()),
             sandbox: Arc::new(sandbox),
             env: Arc::new(grant.env()),
@@ -2212,6 +3142,12 @@ impl Inner {
                 pack.command_guard,
                 pack.target_concurrency,
             )),
+            // The session sets it again for every call from its admission of that moment.
+            view_chars: self
+                .config
+                .admit
+                .for_window(meta.context_window)
+                .view_chars(&loom_core::estimate::TokenEstimator::default()),
         };
         // The mission journal is shared by the lead and all its children; a child is always bound to
         // it, so that it has explicit access to the mission state.
@@ -2243,12 +3179,19 @@ impl Inner {
             limiter: profile.limiter.clone(),
             priority: if meta.parent.is_some() { Priority::Child } else { Priority::Lead },
             context_window: meta.context_window,
+            model: ModelRef {
+                profile: meta.profile.clone(),
+                model: meta.model.clone(),
+                context_window: meta.context_window.unwrap_or(0),
+            },
+            reasoning_replay: profile.client.profile().reasoning_replay,
             shared: shared.clone(),
             ctx,
             job_events,
             sink: self.sink.clone(),
             control: control.clone(),
         };
+        revoke.armed = false;
         Ok((deps, Parts { control, shared, jobs }))
     }
 
@@ -2262,7 +3205,7 @@ impl Inner {
             sandbox: deps.ctx.sandbox.describe(),
             network: network_text(&self.config),
         };
-        let replay = self.config.models.get(&meta.profile).map(|p| p.reasoning_replay).unwrap_or_default();
+        let replay = deps.reasoning_replay;
         Ok(SessionStart {
             session: meta.id.clone(),
             mission: meta.mission.clone(),
@@ -2565,7 +3508,25 @@ impl Inner {
 
     /// Make the copy of the workspace `source` an agent will work in, at `dest`, and record what it
     /// was made from beside the agent's log. On `Err` nothing is left at `dest`.
-    async fn make_copy(&self, child: &SessionId, source: PathBuf, dest: PathBuf) -> Result<workcopy::Made, String> {
+    async fn make_copy(
+        &self,
+        parent: &SessionId,
+        child: &SessionId,
+        source: PathBuf,
+        dest: PathBuf,
+    ) -> Result<workcopy::Made, String> {
+        // What the parent's own session may read decides which files are copied: the rules are the same in every
+        // mode (the sandbox is built here only to judge paths, so no mode is needed).
+        let (pack, role) = self
+            .st()
+            .known
+            .get(parent)
+            .map(|p| (p.meta.pack.clone(), p.meta.role.clone()))
+            .ok_or_else(|| "Only the lead session of a mission can start agents.".to_string())?;
+        let role = self.packs.role(Some(&pack), Some(&role))?.clone();
+        let mut judge_cfg = sandbox_cfg_for(&self.config.sandbox, &role, &source, &self.models().configs());
+        judge_cfg.mode = loom_core::config::SandboxMode::None;
+        let (home, tmp) = (self.paths.home.clone(), self.paths.session_tmp(parent));
         let limits = workcopy::Limits {
             max_files: self.config.agents.copy_max_files,
             max_bytes: self.config.agents.copy_max_mb.saturating_mul(1024 * 1024),
@@ -2576,7 +3537,9 @@ impl Inner {
             if let Some(root) = dest.parent() {
                 ensure_private_dir(root).map_err(|e| format!("Cannot create {}: {e}", root.display()))?;
             }
-            let made = workcopy::make(&source, &dest, &limits)?;
+            let judge = Sandbox::new(&judge_cfg, &source, &tmp, &home, None)
+                .map_err(|e| format!("The copy of the workspace could not be made: {e}"))?;
+            let made = workcopy::make(&source, &dest, &limits, &|real| judge.check_read(real).map(|_| ()))?;
             let written = match record.parent() {
                 Some(dir) => ensure_private_dir(dir).and_then(|()| write_json_atomic(&record, &made.manifest)),
                 None => write_json_atomic(&record, &made.manifest),
@@ -2659,6 +3622,18 @@ impl Inner {
                     )
                 })?;
             let inherited = (p.meta.profile.clone(), p.meta.model.clone(), p.meta.context_window);
+            // The operator's choice for this mission wins over the pack's: the role's own, else the one
+            // for every role (not for the finish gate's verifier). Fresh agents only: a fork shares the
+            // lead's prefix, so it runs on the lead's model.
+            let chosen = if req.mode == SpawnMode::Fork {
+                None
+            } else {
+                p.meta
+                    .role_models
+                    .get(&req.role)
+                    .or_else(|| if req.harness { None } else { p.meta.role_models.get(ANY_ROLE) })
+                    .cloned()
+            };
             let prior: Vec<_> = st
                 .known
                 .values()
@@ -2676,7 +3651,9 @@ impl Inner {
             });
             let prior_count = prior.len();
             let cursor = st.route_cursor.entry((parent.clone(), req.role.clone())).or_insert(prior_count);
-            let selected = if failed && role.escalation_model.is_some() {
+            let selected = if chosen.is_some() {
+                chosen
+            } else if failed && role.escalation_model.is_some() {
                 role.escalation_model.clone()
             } else if !role.alloy_models.is_empty() {
                 role.alloy_models.get(*cursor % role.alloy_models.len()).cloned()
@@ -2770,6 +3747,8 @@ impl Inner {
             };
             let meta = SessionMeta {
                 id: child_id.clone(),
+                // Choices are the lead's, for the mission; an agent has none of its own.
+                role_models: BTreeMap::new(),
                 mission: p.meta.mission.clone(),
                 parent: Some(parent.clone()),
                 workspace,
@@ -2786,6 +3765,7 @@ impl Inner {
                 unattended: p.meta.unattended,
                 archived: false,
                 gate: req.harness.then(|| req.brief.clone()),
+                prior: Vec::new(),
             };
             let explicit = prole.termination == Termination::Explicit;
             st.known.insert(child_id.clone(), Known::new(meta.clone(), idle_status()));
@@ -2802,7 +3782,7 @@ impl Inner {
         };
         // The child is known (and counted against `max_children`) while its copy is made.
         if let (Some(source), Some(dest)) = (meta.copy_of.clone(), copy_dir.clone()) {
-            let made = match self.make_copy(&child_id, PathBuf::from(&source), dest).await {
+            let made = match self.make_copy(parent, &child_id, PathBuf::from(&source), dest).await {
                 // The daemon may have begun to stop while the files were copied.
                 Ok(made) => self.check_open().map(|()| made),
                 Err(e) => Err(e),
@@ -2899,10 +3879,11 @@ impl Inner {
     /// when the server could not be asked and the numbers come from the profile alone. Without a
     /// configured window that is refused: a session must not start with a window nobody knows.
     async fn facts(&self, profile_name: &str) -> Result<(String, Option<u64>, bool), String> {
-        let rt = self
-            .profiles
+        let models = self.models();
+        let rt = models
             .get(profile_name)
-            .ok_or_else(|| format!("The model profile \"{profile_name}\" is not configured."))?;
+            .cloned()
+            .ok_or_else(|| format!("The model profile \"{profile_name}\" is not configured ({}).", models.names()))?;
         let remembered = lock(&rt.discovered).clone();
         let profile = rt.client.profile();
         let found = match remembered {
@@ -2911,7 +3892,7 @@ impl Inner {
                 Ok(d) if d.context_window.is_none() => {
                     // Not remembered: every creation is refused until the profile sets a window.
                     return Err(format!(
-                        "The model server at {} answered but reports no context window for the model, so the session would start without knowing it. Set context_window in [models.{profile_name}] of the config and restart the daemon: the config is read only at start.",
+                        "The model server at {} answered but reports no context window for the model, so the session would start without knowing it. Set context_window in [models.{profile_name}] of the config, then run `loom models reload`.",
                         profile.base_url
                     ));
                 }
@@ -2926,7 +3907,7 @@ impl Inner {
                 Err(ModelError::Unavailable { last, .. }) => {
                     if profile.context_window.is_none() {
                         return Err(format!(
-                            "The model server at {} could not be asked for its models ({last}), and the profile \"{profile_name}\" sets no context_window, so the session would start without knowing the model's window. Start the model server, or set context_window in [models.{profile_name}] of the config and restart the daemon: the config is read only at start.",
+                            "The model server at {} could not be asked for its models ({last}), and the profile \"{profile_name}\" sets no context_window, so the session would start without knowing the model's window. Start the model server, or set context_window in [models.{profile_name}] of the config and run `loom models reload`.",
                             profile.base_url
                         ));
                     }
@@ -3441,8 +4422,15 @@ pub fn disk_is_low(free: u64, total: u64) -> bool {
     free < LOW_DISK_BYTES || u128::from(free) * 100 < u128::from(total) * u128::from(LOW_DISK_PERCENT)
 }
 
-/// What `start` warns about in the configuration, one sentence each.
-fn start_warnings(config: &Config, macos: bool) -> Vec<String> {
+/// What `start` warns about in the configuration, one sentence each. `key_is_set` says whether a variable
+/// is present and not empty in the daemon's environment; `env` is that environment (names and values).
+fn start_warnings(
+    config: &Config,
+    macos: bool,
+    keys_dir: &std::path::Path,
+    key_is_set: impl Fn(&str) -> bool,
+    env: &[(String, String)],
+) -> Vec<String> {
     let mut out = Vec::new();
     if config.notify.command.is_empty() && !macos {
         out.push(
@@ -3456,7 +4444,32 @@ fn start_warnings(config: &Config, macos: bool) -> Vec<String> {
                 .to_string(),
         );
     }
+    out.extend(config.key_env_warnings(keys_dir, key_is_set));
+    out.extend(secret_env_warning(config, env));
     out
+}
+
+/// The warning that names (never with their values) the variables of the daemon's environment that
+/// commands are not given as secrets but can read from the daemon's environment: all but `LOOM_*`, the
+/// profiles' `api_key_env` (reported on their own) and the `sandbox.env_pass` names.
+fn secret_env_warning(config: &Config, env: &[(String, String)]) -> Option<String> {
+    let known = |name: &str| {
+        name.to_ascii_uppercase().starts_with("LOOM_")
+            || config.models.values().any(|p| p.api_key_env.as_deref() == Some(name))
+            || config.sandbox.env_pass.iter().any(|n| n == name)
+    };
+    let names: std::collections::BTreeSet<&str> = env
+        .iter()
+        .filter(|(name, value)| loom_tools::sandbox::withheld(name, value) && !known(name))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let list = names.into_iter().collect::<Vec<_>>().join(", ");
+    Some(format!(
+        "The daemon's environment holds variables that look like secrets: {list}. Commands are not given them, but every command can read them from the daemon's environment. Start the daemon with `loom up` or `loom service install`, which pass only what it needs; a `loom daemon` run from a shell keeps all of that shell's variables."
+    ))
 }
 
 /// The warning for a profile whose configured window is larger than the one its server reports.
@@ -3589,7 +4602,9 @@ pub struct Runtime {
 
 impl Runtime {
     /// Bring the runtime up over `paths` and restore what was running. See *Start*.
-    pub async fn start(config: Config, paths: Paths) -> Result<Runtime, String> {
+    pub async fn start(mut config: Config, paths: Paths) -> Result<Runtime, String> {
+        // Every sandbox made from the configuration (sessions, agents' copies, judges) carries this.
+        config.sandbox.network_deny_all = config.network.mode == NetworkMode::DenyAll;
         config.check().map_err(|e| e.to_string())?;
         paths
             .ensure_private_layout()
@@ -3602,17 +4617,17 @@ impl Runtime {
         let blobs = BlobStore::open(paths.blobs_dir()).map_err(|e| format!("cannot open the blob store: {e}"))?;
         let mut profiles = BTreeMap::new();
         for (name, profile) in &config.models {
-            let client = ModelClient::new(name, profile.clone()).map_err(|e| e.to_string())?;
-            profiles.insert(
-                name.clone(),
-                ProfileRt {
-                    client: Arc::new(client),
-                    limiter: Arc::new(Limiter::new(profile.max_concurrent)),
-                    discovered: Mutex::new(None),
-                },
-            );
+            let client = ModelClient::new(name, profile.clone(), &paths.model_keys_dir()).map_err(|e| e.to_string())?;
+            profiles.insert(name.clone(), Arc::new(ProfileRt::new(client, profile.max_concurrent)));
         }
-        for warning in start_warnings(&config, cfg!(target_os = "macos")) {
+        let models = Arc::new(ModelTable { default_model: config.default_model.clone(), profiles });
+        let env_key_is_set = |var: &str| std::env::var_os(var).is_some_and(|v| !v.is_empty());
+        let daemon_env: Vec<(String, String)> = std::env::vars_os()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+            .collect();
+        for warning in
+            start_warnings(&config, cfg!(target_os = "macos"), &paths.model_keys_dir(), env_key_is_set, &daemon_env)
+        {
             tracing::warn!("{warning}");
         }
         config.check_box_paths(&paths.home)?;
@@ -3643,9 +4658,11 @@ impl Runtime {
             bus,
             packs,
             key,
-            profiles,
+            models: std::sync::RwLock::new(models),
+            model_changes: tokio::sync::Mutex::new(()),
             proxy,
             state: Mutex::new(State::default()),
+            scan_lock: tokio::sync::Mutex::new(()),
             activation: Mutex::new(()),
             shutting: AtomicBool::new(false),
             disk_low: AtomicBool::new(false),
@@ -3795,6 +4812,8 @@ impl Runtime {
         Ok(Runtime { inner })
     }
 
+    /// The configuration the daemon started with. Its `models` and `default_model` are that start-up
+    /// snapshot: the live set is what [`Runtime::health`] lists, and [`Runtime::reload_models`] replaces.
     pub fn config(&self) -> &Config {
         &self.inner.config
     }
@@ -3817,22 +4836,34 @@ impl Runtime {
     }
 
     pub async fn create_session(&self, new: NewSession) -> Result<SessionInfo, String> {
+        self.create_session_receipt(new).await.map(|(info, _)| info)
+    }
+
+    /// [`Runtime::create_session`] that also says whether it made the workspace folder (`create_workspace`
+    /// was set and the path did not exist).
+    pub async fn create_session_receipt(&self, new: NewSession) -> Result<(SessionInfo, bool), String> {
         let inner = &self.inner;
         inner.check_open()?;
-        let workspace = std::fs::canonicalize(&new.workspace)
-            .map_err(|e| format!("The workspace {} cannot be used: {e}", new.workspace.display()))?;
-        if !workspace.is_dir() {
-            return Err(format!("The workspace {} is not a directory.", workspace.display()));
-        }
+        // Checked before anything else; the folder itself is made only once the rest of the request is accepted.
+        let plan = plan_workspace(&inner.paths, &new.workspace, new.create_workspace)?;
         let role = inner.packs.role(new.pack.as_deref(), new.role.as_deref())?.clone();
         inner.check_network(&role.pack)?;
-        let profile_name = inner
-            .config
-            .profile(new.model.as_deref().or(role.model.as_deref()))
-            .map_err(|e| e.to_string())?
-            .0
-            .to_string();
+        let profile_name = inner.models().resolve(new.model.as_deref().or(role.model.as_deref()))?;
+        // The agents' models are checked before anything exists, so a bad one refuses the creation.
+        let role_models: BTreeMap<String, String> =
+            new.role_models.iter().map(|(r, p)| (r.trim().to_string(), p.trim().to_string())).collect();
+        {
+            let models = inner.models();
+            for (r, p) in &role_models {
+                check_role_choice(&role, &profile_name, &models, r, p)?;
+            }
+        }
         let (model, window, from_config) = inner.facts(&profile_name).await?;
+        // The earlier missions to recall can refuse the request too, so they are read before the folder is made.
+        let (prior_ids, recalled) = self.recall_earlier(&new.prior).await?;
+        let made = plan.make_tracked()?;
+        let workspace = made.path.clone();
+        let created = !made.created.is_empty();
         let title = match new.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
             Some(t) => t.to_string(),
             None => {
@@ -3863,11 +4894,15 @@ impl Runtime {
             unattended: new.unattended.unwrap_or(explicit),
             archived: false,
             gate: None,
+            prior: prior_ids,
+            role_models,
         };
         inner.st().known.insert(id.clone(), Known::new(meta.clone(), idle_status()));
+        // A request that fails from here on takes back the folders it made.
         let forget = |inner: &Inner| {
             inner.proxy.revoke(&id);
             inner.st().known.remove(&id);
+            made.undo();
         };
         let (deps, parts) = match inner.build(&meta, explicit) {
             Ok(x) => x,
@@ -3883,13 +4918,19 @@ impl Runtime {
                 return Err(e);
             }
         };
-        let session = match Session::create(deps, start, None) {
+        let mut session = match Session::create(deps, start, None) {
             Ok(s) => s,
             Err(e) => {
                 forget(inner);
                 return Err(e);
             }
         };
+        if !recalled.is_empty() {
+            if let Err(e) = session.recall(prior::brief(&recalled)) {
+                forget(inner);
+                return Err(e);
+            }
+        }
         if let Err(e) = write_json_atomic(&inner.paths.session_dir(&id).join("meta.json"), &meta) {
             forget(inner);
             return Err(format!("cannot write the session's meta.json: {e}"));
@@ -3915,7 +4956,56 @@ impl Runtime {
         if let Some(message) = new.message.as_deref().filter(|m| !m.trim().is_empty()) {
             self.send_message(&id, message).await?;
         }
-        self.session(&id).ok_or_else(|| no_session(&id))
+        self.session(&id).map(|info| (info, created)).ok_or_else(|| no_session(&id))
+    }
+
+    /// The earlier missions `named` by the operator: trimmed, blanks and repeats dropped, each the mission of a
+    /// known session, and what their sealed journals hold (read on a blocking thread).
+    async fn recall_earlier(&self, named: &[MissionId]) -> Result<(Vec<MissionId>, Vec<prior::Recalled>), String> {
+        let mut ids: Vec<MissionId> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for m in named {
+            let m = m.as_str().trim();
+            if !m.is_empty() && seen.insert(m) {
+                // Only the first MAX_PRIOR are kept; the rest are only counted.
+                if ids.len() <= prior::MAX_PRIOR {
+                    ids.push(MissionId::from(m));
+                }
+            }
+        }
+        if seen.len() > prior::MAX_PRIOR {
+            return Err(format!(
+                "Name at most {} earlier missions to recall; {} were named.",
+                prior::MAX_PRIOR,
+                seen.len()
+            ));
+        }
+        let mut found: Vec<(MissionId, String, Journal)> = Vec::new();
+        {
+            let st = self.inner.st();
+            for m in &ids {
+                let sessions = || st.known.values().filter(|k| &k.meta.mission == m);
+                if sessions().next().is_none() {
+                    return Err(format!("There is no mission {m} to recall."));
+                }
+                // The title is the lead's; a mission whose lead is not known has none (a child's title is
+                // written by the model).
+                let title = sessions().find(|k| k.meta.parent.is_none()).map(|k| k.meta.title.clone());
+                found.push((
+                    m.clone(),
+                    title.unwrap_or_else(|| "untitled".to_string()),
+                    Journal::new(self.inner.paths.journal(m), self.inner.key.clone()),
+                ));
+            }
+        }
+        let mut recalled = Vec::new();
+        for (id, title, journal) in found {
+            let recall = tokio::task::spawn_blocking(move || prior::read(&journal))
+                .await
+                .map_err(|e| format!("Reading the ledger of mission {id} failed ({e}); try again."))?;
+            recalled.push(prior::Recalled { id, title, recall });
+        }
+        Ok((ids, recalled))
     }
 
     pub fn sessions(&self, include_archived: bool) -> Vec<SessionInfo> {
@@ -3977,22 +5067,27 @@ impl Runtime {
     /// The lead session of `id`'s mission (a child's id leads to its root): the session that owns the
     /// mission's ledger and takes the operator's rules and approvals.
     fn lead_of(&self, id: &SessionId) -> Result<SessionMeta, String> {
+        let lead = self.lead_meta(id)?;
+        if lead.archived {
+            return Err("This session is archived; unarchive it first.".to_string());
+        }
+        Ok(lead)
+    }
+
+    /// [`Runtime::lead_of`], archived leads included.
+    fn lead_meta(&self, id: &SessionId) -> Result<SessionMeta, String> {
         self.inner.check_open()?;
         let st = self.inner.st();
         let k = st.known.get(id).ok_or_else(|| no_session(id))?;
-        let lead = match &k.meta.parent {
-            None => k.meta.clone(),
+        match &k.meta.parent {
+            None => Ok(k.meta.clone()),
             Some(_) => st
                 .known
                 .values()
                 .find(|r| r.meta.parent.is_none() && r.meta.mission == k.meta.mission)
                 .map(|r| r.meta.clone())
-                .ok_or_else(|| format!("There is no lead session for the mission of {}.", id.as_str()))?,
-        };
-        if lead.archived {
-            return Err("This session is archived; unarchive it first.".to_string());
+                .ok_or_else(|| format!("There is no lead session for the mission of {}.", id.as_str())),
         }
-        Ok(lead)
     }
 
     /// Hand `input` to the lead session `lead`, activating it. The session handles it at once when
@@ -4098,6 +5193,309 @@ impl Runtime {
             .map_err(|e| format!("cannot write the meta.json of {}: {e}", id.as_str()))?;
         self.inner.publish(BusEvent::Session { info: Box::new(info) });
         Ok(())
+    }
+
+    /// Read `[models]` and `default_model` from the configuration file again and use them from now on,
+    /// without a restart (the rest of the configuration is still read only at start). A new profile
+    /// can be used at once. One whose settings changed gets a new client and new request slots, and
+    /// every session bound to it that can still send a request is switched to it again (see
+    /// [`Runtime::set_session_model`]). One that is gone is no longer offered: a session running on it
+    /// keeps its client until it is switched, and an idle one cannot be resumed until then. Refused,
+    /// changing nothing, when the file does not load, it has no `[models]`, or a pack names a profile it
+    /// no longer has.
+    pub async fn reload_models(&self) -> Result<ModelsReload, String> {
+        self.inner.check_open()?;
+        let _one_at_a_time = self.inner.model_changes.lock().await;
+        let path = self.inner.paths.config_file();
+        let cfg = Config::load(&path).map_err(|e| match e {
+            loom_core::config::ConfigError::Parse { .. } => e.to_string(),
+            other => format!("{}: {other}", path.display()),
+        })?;
+        if cfg.models.is_empty() {
+            return Err(format!(
+                "{} has no [models]: a reload would leave the daemon without a model, so nothing was changed.",
+                path.display()
+            ));
+        }
+        // The packs name profiles in their roles (`model`, `alloy_models`, `escalation_model`).
+        self.inner.packs.check_profiles(&cfg.models)?;
+        let old = self.inner.models();
+        let mut report = ModelsReload { default_model: cfg.default_model.clone(), ..ModelsReload::default() };
+        let mut profiles = BTreeMap::new();
+        for (name, p) in &cfg.models {
+            match old.get(name) {
+                Some(rt) if rt.client.profile() == p => {
+                    profiles.insert(name.clone(), rt.clone());
+                }
+                before => {
+                    let client = ModelClient::new(name, p.clone(), &self.inner.paths.model_keys_dir())
+                        .map_err(|e| e.to_string())?;
+                    profiles.insert(name.clone(), Arc::new(ProfileRt::new(client, p.max_concurrent)));
+                    if before.is_some() {
+                        report.changed.push(name.clone());
+                    } else {
+                        report.added.push(name.clone());
+                    }
+                    // The daemon's environment is fixed when it starts; a reload cannot add a variable.
+                    if let Some(var) = p.api_key_env.as_deref().filter(|v| !v.is_empty()) {
+                        if std::env::var(var).map_or(true, |v| v.is_empty()) {
+                            report.notes.push(format!(
+                                "Profile \"{name}\" takes its key from {var}, which is not set in the daemon's environment (it is read when the daemon starts): its requests carry no key until the daemon is started with {var} set."
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        report.removed = old.profiles.keys().filter(|n| !cfg.models.contains_key(*n)).cloned().collect();
+        *self.inner.models.write().unwrap_or_else(|p| p.into_inner()) =
+            Arc::new(ModelTable { default_model: cfg.default_model.clone(), profiles });
+        for name in report.changed.clone() {
+            for id in self.inner.sessions_on(&name) {
+                match self.switch(&id, &name, crate::session::SWITCH_RELOADED).await {
+                    Ok(_) => report.rebound.push(id),
+                    Err(e) => report.notes.push(format!(
+                        "Session {} keeps the previous settings of \"{name}\" until it is switched again: {e}",
+                        id.as_str()
+                    )),
+                }
+            }
+        }
+        for name in &report.removed {
+            let left = self.inner.sessions_on(name);
+            if left.is_empty() {
+                continue;
+            }
+            const SHOWN: usize = 8;
+            let mut ids: Vec<&str> = left.iter().take(SHOWN).map(SessionId::as_str).collect();
+            if left.len() > SHOWN {
+                ids.push("…");
+            }
+            report.notes.push(format!(
+                "\"{name}\" is no longer configured, but {} {} still on it ({}): a running one goes on with it, and an idle one cannot be resumed until it is switched with `loom models set <session> <profile>`.",
+                left.len(),
+                if left.len() == 1 { "session is" } else { "sessions are" },
+                ids.join(", ")
+            ));
+        }
+        Ok(report)
+    }
+
+    /// Switch session `id` — a lead or an agent — to model profile `profile`, without a restart: a
+    /// running task sends its requests to the new model from its next step; an idle session from when
+    /// it next runs. The change goes to its `meta.json` first and is recorded in its log as
+    /// `model_switched` (by the task, or by `open`), so the weave keeps following the log. The model and
+    /// window are discovered as for a new session. Its agents keep their own models. Refused: a blank
+    /// or unknown profile, an unknown session, one that has ended.
+    pub async fn set_session_model(&self, id: &SessionId, profile: &str) -> Result<ModelSwitchReceipt, String> {
+        self.inner.check_open()?;
+        let profile = profile.trim();
+        if profile.is_empty() {
+            return Err("Name the model profile to switch to (`loom models list` shows them).".to_string());
+        }
+        let _one_at_a_time = self.inner.model_changes.lock().await;
+        let models = self.inner.models();
+        if models.get(profile).is_none() {
+            return Err(format!(
+                "There is no model profile \"{profile}\" ({}). Add it to [models] in the config and run `loom models reload`.",
+                models.names()
+            ));
+        }
+        // A lead whose finish gate wants its verifier on another profile cannot move onto the one chosen
+        // for that verifier: the next `finish` would be refused.
+        let meta = self.inner.st().known.get(id).map(|k| k.meta.clone()).ok_or_else(|| no_session(id))?;
+        if meta.parent.is_none() {
+            let lrole = self.inner.packs.role(Some(&meta.pack), Some(&meta.role))?;
+            if let Some(v) = lrole.verifier.as_deref().filter(|_| lrole.require_distinct_verifier_profile) {
+                if meta.role_models.get(v).map(String::as_str) == Some(profile) {
+                    return Err(format!(
+                        "The finish gate's verifier (`{v}`) is set to run on \"{profile}\", and this pack wants it on another profile than the lead's. Choose another model for the lead, or another for the verifier first (`loom models role`)."
+                    ));
+                }
+            }
+        }
+        let (model, live) = self.switch(id, profile, crate::session::SWITCH_OPERATOR).await?;
+        Ok(ModelSwitchReceipt { session: id.clone(), model, live })
+    }
+
+    /// The models of the mission of `id` (any of its sessions, archived ones included): the lead's, the
+    /// operator's choices for its agents, what the pack chooses otherwise, and its agents that have not
+    /// ended with the profile each runs on.
+    pub fn mission_models(&self, id: &SessionId) -> Result<MissionModels, String> {
+        let lead = self.lead_meta(id)?;
+        let lrole = self.inner.packs.role(Some(&lead.pack), Some(&lead.role))?;
+        let models = self.inner.models();
+        let st = self.inner.st();
+        let roles = agent_roles(lrole)
+            .into_iter()
+            .map(|name| {
+                let def = self.inner.packs.role(Some(&lead.pack), Some(&name)).ok();
+                let agents = st
+                    .known
+                    .values()
+                    .filter(|k| k.meta.parent.as_ref() == Some(&lead.id) && k.meta.role == name && !k.finished())
+                    .map(|k| AgentModel {
+                        session: k.meta.id.clone(),
+                        profile: k.meta.profile.clone(),
+                        forked: k.meta.mode == Some(SpawnMode::Fork),
+                    })
+                    .collect();
+                RoleModels {
+                    verifier: lrole.verifier.as_deref() == Some(name.as_str()),
+                    chosen: lead.role_models.get(&name).cloned(),
+                    pack_model: def.and_then(|d| d.model.clone()),
+                    alloy_models: def.map(|d| d.alloy_models.clone()).unwrap_or_default(),
+                    escalation_model: def.and_then(|d| d.escalation_model.clone()),
+                    agents,
+                    role: name,
+                }
+            })
+            .collect();
+        Ok(MissionModels {
+            mission: lead.mission.clone(),
+            lead: lead.id.clone(),
+            lead_model: ModelRef {
+                profile: lead.profile.clone(),
+                model: lead.model.clone(),
+                context_window: lead.context_window.unwrap_or(0),
+            },
+            any_role: lead.role_models.get(ANY_ROLE).cloned(),
+            roles,
+            profiles: models.profiles.keys().cloned().collect(),
+            default_model: models.default_model.clone(),
+        })
+    }
+
+    /// Choose the model profile the mission of `id` starts its agents of `role` on — [`ANY_ROLE`] for
+    /// every role the lead starts that has no choice of its own — or clear the choice (`profile` `None`).
+    /// Written to the lead's `meta.json` and used for every fresh agent from then on, before the pack's
+    /// own choice (a forked agent keeps the lead's model). With `now`, the mission's agents of that role
+    /// that have not ended and were not forked move to it too, as [`Runtime::set_session_model`] moves
+    /// one; clearing moves nobody. Refused: an archived mission, a role the lead does not start, an
+    /// unknown profile, the finish gate's verifier on the lead's own profile when the pack wants them
+    /// distinct.
+    pub async fn set_role_model(
+        &self,
+        id: &SessionId,
+        role: &str,
+        profile: Option<&str>,
+        now: bool,
+    ) -> Result<RoleModelReceipt, String> {
+        self.inner.check_open()?;
+        let role = role.trim();
+        let profile = profile.map(str::trim).filter(|p| !p.is_empty());
+        let _one_at_a_time = self.inner.model_changes.lock().await;
+        let lead = self.lead_of(id)?;
+        let lrole = self.inner.packs.role(Some(&lead.pack), Some(&lead.role))?.clone();
+        match profile {
+            Some(p) => check_role_choice(&lrole, &lead.profile, &self.inner.models(), role, p)?,
+            None => check_choice_role(&lrole, role)?,
+        }
+        let (meta, before) = {
+            let mut st = self.inner.st();
+            let k = st.known.get_mut(&lead.id).ok_or_else(|| no_session(&lead.id))?;
+            let before = k.meta.role_models.clone();
+            match profile {
+                Some(p) => k.meta.role_models.insert(role.to_string(), p.to_string()),
+                None => k.meta.role_models.remove(role),
+            };
+            (k.meta.clone(), before)
+        };
+        if let Err(e) = write_json_atomic(&self.inner.paths.session_dir(&lead.id).join("meta.json"), &meta) {
+            if let Some(k) = self.inner.st().known.get_mut(&lead.id) {
+                k.meta.role_models = before;
+            }
+            return Err(format!("cannot write the meta.json of {}: {e}", lead.id.as_str()));
+        }
+        if let Some(info) = self.inner.st().known.get(&lead.id).map(Inner::info_of) {
+            self.inner.publish(BusEvent::Session { info: Box::new(info) });
+        }
+        let mut switched = Vec::new();
+        if let (true, Some(p)) = (now, profile) {
+            let targets: Vec<SessionId> = {
+                let st = self.inner.st();
+                st.known
+                    .values()
+                    .filter(|k| {
+                        let m = &k.meta;
+                        let covered = if role == ANY_ROLE {
+                            m.gate.is_none() && !meta.role_models.contains_key(&m.role)
+                        } else {
+                            m.role == role
+                        };
+                        m.parent.as_ref() == Some(&lead.id)
+                            && covered
+                            && m.mode != Some(SpawnMode::Fork)
+                            && m.profile != p
+                            && !k.finished()
+                    })
+                    .map(|k| k.meta.id.clone())
+                    .collect()
+            };
+            for agent in targets {
+                self.switch(&agent, p, crate::session::SWITCH_OPERATOR).await.map_err(|e| {
+                    format!(
+                        "The choice is saved for agents started from now on, but agent {} could not be moved now: {e}",
+                        agent.as_str()
+                    )
+                })?;
+                switched.push(agent);
+            }
+        }
+        Ok(RoleModelReceipt { switched, models: self.mission_models(&lead.id)? })
+    }
+
+    /// Point session `id` at `profile`: discovery, then its meta (memory and `meta.json`), then its
+    /// running task when it has one. Returns the new model and whether a task took it. The caller holds
+    /// `model_changes`.
+    async fn switch(&self, id: &SessionId, profile: &str, reason: &str) -> Result<(ModelRef, bool), String> {
+        if self.inner.st().known.get(id).ok_or_else(|| no_session(id))?.finished() {
+            return Err(format!("Session {} has ended, so its model no longer changes.", id.as_str()));
+        }
+        let rt = self
+            .inner
+            .models()
+            .get(profile)
+            .cloned()
+            .ok_or_else(|| format!("The model profile \"{profile}\" is not configured."))?;
+        let (model, window, _) = self.inner.facts(profile).await?;
+        let to = ModelRef { profile: profile.to_string(), model: model.clone(), context_window: window.unwrap_or(0) };
+        // Memory, then disk, then the task: a session activated meanwhile is opened on the new model
+        // (and `open` records the switch); a restart that cuts this short opens it on the new model too.
+        let (meta, before) = {
+            let mut st = self.inner.st();
+            let k = st.known.get_mut(id).ok_or_else(|| no_session(id))?;
+            let before = (k.meta.profile.clone(), k.meta.model.clone(), k.meta.context_window);
+            k.meta.profile = profile.to_string();
+            k.meta.model = model;
+            k.meta.context_window = window;
+            (k.meta.clone(), before)
+        };
+        if let Err(e) = write_json_atomic(&self.inner.paths.session_dir(id).join("meta.json"), &meta) {
+            if let Some(k) = self.inner.st().known.get_mut(id) {
+                (k.meta.profile, k.meta.model, k.meta.context_window) = before;
+            }
+            return Err(format!("cannot write the meta.json of {}: {e}", id.as_str()));
+        }
+        let (info, live) = {
+            let st = self.inner.st();
+            let k = st.known.get(id).ok_or_else(|| no_session(id))?;
+            let input = Input::SwitchModel(Box::new(crate::session::ModelSwitch {
+                client: rt.client.clone(),
+                limiter: rt.limiter.clone(),
+                context_window: window,
+                model: to.clone(),
+                reasoning_replay: rt.client.profile().reasoning_replay,
+                reason: reason.to_string(),
+                // A reload switches a session to a profile whose settings changed: logged even when the
+                // model and window did not, since the server or the request's extra fields may have.
+                settings_changed: reason == crate::session::SWITCH_RELOADED,
+            }));
+            let live = k.active.as_ref().is_some_and(|a| a.inputs.send(input).is_ok());
+            (Inner::info_of(k), live)
+        };
+        self.inner.publish(BusEvent::Session { info: Box::new(info) });
+        Ok((to, live))
     }
 
     /// Record that the operator approved something, with what the approval covers. Handed to the
@@ -4513,25 +5911,47 @@ impl Runtime {
 
     pub fn window(&self, id: &SessionId) -> Result<WindowView, String> {
         self.inner.check_open()?;
-        let (context_window, status) = {
+        let (context_window, status, profile) = {
             let st = self.inner.st();
             let k = st.known.get(id).ok_or_else(|| no_session(id))?;
-            (k.meta.context_window, k.status.clone())
+            (k.meta.context_window, k.status.clone(), k.meta.profile.clone())
         };
         let records = read_records(&self.inner.paths.session_log(id)).map_err(|e| e.to_string())?.records;
         let w = weave(&records);
         let estimator = TokenEstimator::default();
-        let tools_chars: usize = w.tools.iter().map(|t| t.to_openai().to_string().chars().count()).sum();
+        let tools_chars = crate::session::tools_chars(&w.tools);
+        let last_request = last_step_request(&records);
+        let hud_bytes = last_request.as_ref().map_or(0, |r| r.hud_bytes);
         let est_tokens = estimator.tokens_for_messages(&w.messages) + estimator.tokens(tools_chars);
+        let est_total = est_tokens
+            + if hud_bytes > 0 { estimator.tokens(usize::try_from(hud_bytes).unwrap_or(usize::MAX)) + 4 } else { 0 };
+        let measured_now = crate::session::measured_now(&records, &w, &estimator);
+        let breakdown = window_breakdown(
+            &w.items,
+            (tools_chars, w.tools.len()),
+            w.resume_chars,
+            usize::try_from(hud_bytes).unwrap_or(usize::MAX),
+            est_total,
+            measured_now,
+            &estimator,
+        );
+        let max_output = self.inner.models().get(&profile).and_then(|p| p.client.profile().max_output_tokens);
+        let policy = &self.inner.config.context;
+        let (fold_at, fold_to) = crate::session::reweave_bounds(policy, context_window, max_output);
         Ok(WindowView {
             epoch: w.epoch,
             items: w.items,
             est_tokens,
-            target_tokens: self.inner.config.context.target_tokens,
-            floor_tokens: self.inner.config.context.floor_tokens,
+            target_tokens: policy.target_tokens,
+            floor_tokens: policy.floor_tokens,
             context_window,
             prompt_tokens: status.prompt_tokens,
             cached_tokens: status.cached_tokens,
+            breakdown,
+            measured_now,
+            last_request,
+            fold_at: Some(fold_at),
+            fold_to: Some(fold_to),
         })
     }
 
@@ -4648,9 +6068,15 @@ impl Runtime {
         Ok(entries)
     }
 
+    /// The live `default_model` (empty: none set): the profile a session uses when none is named.
+    pub fn default_model(&self) -> String {
+        self.inner.models().default_model.clone()
+    }
+
     pub async fn health(&self) -> Vec<ModelHealth> {
         let mut out = Vec::new();
-        for (name, rt) in &self.inner.profiles {
+        let models = self.inner.models();
+        for (name, rt) in &models.profiles {
             let reachable = rt.client.health().await;
             let profile = rt.client.profile();
             let discovered = lock(&rt.discovered).clone();
@@ -4951,7 +6377,7 @@ impl Inner {
 mod tests {
     use super::*;
     use loom_core::config::{ModelProfile, SandboxMode};
-    use loom_core::event::{Brief, InboxKind};
+    use loom_core::event::{Brief, InboxKind, NoteKind};
     use loom_model::mock::{Action, MockServer, Reply, Script};
     use serde_json::{json, Value};
 
@@ -5188,6 +6614,122 @@ mod tests {
         }
     }
 
+    fn window_item(seq: u64, kind: &str, chars: usize) -> WindowItem {
+        WindowItem {
+            seq,
+            kind: kind.into(),
+            role: loom_core::message::Role::User,
+            chars,
+            state: loom_core::weave::ItemState::Live,
+            pinned: false,
+            call_id: None,
+            class: None,
+            preview: String::new(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn the_breakdown_adds_up_with_and_without_a_count() {
+        use loom_core::event::NoteKind;
+        use loom_core::weave::ItemState;
+        let note = |seq, kind: NoteKind, chars| {
+            let mut i = window_item(seq, "harness_note", chars);
+            i.note = Some(kind);
+            i
+        };
+        let mut pinned = window_item(8, "tool_result", 900);
+        pinned.pinned = true;
+        let mut stub = window_item(9, "tool_result", 100);
+        stub.state = ItemState::Stubbed;
+        let mut dropped = window_item(10, "model_response", 0);
+        dropped.state = ItemState::Dropped;
+        let items = vec![
+            window_item(0, "session_start", 3_000),
+            window_item(1, "user_message", 400),
+            note(2, NoteKind::Constraint, 200),
+            note(3, NoteKind::Approval, 100),
+            note(4, NoteKind::Assignment, 50),
+            note(5, NoteKind::Info, 80),
+            window_item(6, "model_response", 1_200),
+            window_item(7, "tool_result", 5_000),
+            pinned,
+            stub,
+            dropped,
+            window_item(11, "child_settled", 700),
+            window_item(12, "forked", 600),
+            window_item(13, "something_new", 10),
+        ];
+        let est = TokenEstimator::default();
+        let key = |b: &WindowBreakdown, k: &str| b.segments.iter().find(|s| s.key == k).cloned().unwrap();
+        // No count: the estimates, framing holds the rest of the estimate for the whole.
+        let est_total = 9_000;
+        let b = window_breakdown(&items, (6_000, 7), 500, 300, est_total, None, &est);
+        assert_eq!(b.basis, "default_ratio");
+        assert_eq!(b.segments.iter().map(|s| s.tokens).sum::<u64>(), b.total_tokens);
+        assert_eq!(b.total_tokens, est_total);
+        assert_eq!(b.chars_per_token, est.ratio());
+        assert_eq!((key(&b, "rules").chars, key(&b, "rules").count), (300, Some(2)));
+        assert_eq!((key(&b, "assignment").chars, key(&b, "assignment").count), (650, Some(2)));
+        assert_eq!((key(&b, "notes").chars, key(&b, "notes").count), (80, Some(1)));
+        assert_eq!((key(&b, "conversation").chars, key(&b, "conversation").count), (1_600, Some(2)));
+        assert_eq!((key(&b, "tool_output").chars, key(&b, "pinned").chars, key(&b, "stubs").chars), (5_000, 900, 100));
+        assert_eq!((key(&b, "agent_reports").chars, key(&b, "other").chars), (700, 10));
+        assert_eq!((key(&b, "tools").chars, key(&b, "tools").count, key(&b, "resume").chars), (6_000, Some(7), 500));
+        assert_eq!((key(&b, "hud").chars, key(&b, "system").chars), (300, 3_000));
+        // The dropped item counts for nothing.
+        assert_eq!(b.segments.iter().filter_map(|s| s.count).sum::<u64>(), 7 + 2 + 2 + 1 + 2 + 1 + 1 + 1 + 1 + 1);
+        // An estimate smaller than its parts is not a negative framing: the total grows to the parts.
+        let small = window_breakdown(&items, (6_000, 7), 500, 300, 10, None, &est);
+        assert_eq!(small.segments.iter().map(|s| s.tokens).sum::<u64>(), small.total_tokens);
+        assert_eq!(key(&small, "framing").tokens, 0);
+        // A count: the parts are scaled and add up to it exactly, framing takes the remainder.
+        for measured in [1_000, 3_333, 9_000, 9_001, 151_200] {
+            let b = window_breakdown(&items, (6_000, 7), 500, 300, est_total, Some(measured), &est);
+            assert_eq!(b.basis, "scaled_to_measured");
+            assert_eq!(b.total_tokens, measured, "{measured}");
+            assert_eq!(b.segments.iter().map(|s| s.tokens).sum::<u64>(), measured);
+        }
+        let b = window_breakdown(&items, (6_000, 7), 500, 300, est_total, Some(4_500), &est);
+        assert!((b.chars_per_token - est.ratio() * 2.0).abs() < 1e-9, "{}", b.chars_per_token);
+        // The same order every time; zero parts are listed.
+        let keys: Vec<&str> = b.segments.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "system",
+                "tools",
+                "rules",
+                "assignment",
+                "resume",
+                "conversation",
+                "tool_output",
+                "pinned",
+                "agent_reports",
+                "notes",
+                "stubs",
+                "other",
+                "framing",
+                "hud"
+            ]
+        );
+        let empty = window_breakdown(&[], (0, 0), 0, 0, 0, None, &est);
+        assert_eq!((empty.total_tokens, empty.segments.len()), (0, 14));
+    }
+
+    #[test]
+    fn an_older_window_answer_still_parses() {
+        let old = json!({"epoch": 1, "items": [], "est_tokens": 5, "target_tokens": 9, "floor_tokens": 4,
+            "context_window": null, "prompt_tokens": 0, "cached_tokens": 0});
+        let v: WindowView = serde_json::from_value(old).unwrap();
+        assert!(v.breakdown.segments.is_empty() && v.measured_now.is_none() && v.last_request.is_none());
+        assert!(v.fold_at.is_none() && v.fold_to.is_none());
+        let item = json!({"seq": 1, "kind": "tool_result", "role": "tool", "chars": 3, "state": "live",
+            "preview": "x"});
+        let i: WindowItem = serde_json::from_value(item).unwrap();
+        assert!(i.note.is_none());
+    }
+
     #[tokio::test]
     async fn create_and_message_runs_a_turn() {
         let e = env(Script::new(|_, _| finish("all good"))).await;
@@ -5223,6 +6765,12 @@ mod tests {
         assert!(page[0].seq > 1);
         let w = e.rt.window(&id).unwrap();
         assert!(w.est_tokens > 0 && !w.items.is_empty());
+        // The breakdown is the request by part, adds up, and has a system prompt and tools.
+        let by_key = |k: &str| w.breakdown.segments.iter().find(|s| s.key == k).cloned().unwrap();
+        assert_eq!(w.breakdown.segments.iter().map(|s| s.tokens).sum::<u64>(), w.breakdown.total_tokens);
+        assert!(by_key("system").tokens > 0 && by_key("tools").tokens > 0 && by_key("tools").count.unwrap() > 0);
+        assert!(w.last_request.as_ref().is_some_and(|r| r.step >= 1 && r.n_messages > 0));
+        assert!(w.fold_at.is_some_and(|at| at > 0) && w.fold_to.is_some_and(|to| to > 0));
         assert_eq!(e.rt.missions().len(), 1);
         e.rt.shutdown().await;
         assert_eq!(e.rt.send_message(&id, "x").await.unwrap_err(), "The harness is shutting down.");
@@ -5361,6 +6909,7 @@ mod tests {
             .await
             .unwrap_err()
             .contains("cannot be authorized"));
+        assert!(e.rt.grant_scope(&id, &["*.com".to_string()], None).await.unwrap_err().contains("top-level domain"));
         let unknown = SessionId::from("s-nope");
         let err = e.rt.grant_scope(&unknown, &["a.test".to_string()], None).await.unwrap_err();
         assert_eq!(err, "There is no session s-nope.");
@@ -5752,9 +7301,10 @@ mod tests {
         let info = e.rt.create_session(e.new_session(Some("net"))).await.unwrap();
         let id = info.meta.id.clone();
         until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
-        let grant = e.rt.inner.proxy.grant(&id, Policy::new(&e.config.network).unwrap());
+        let grant = e.rt.inner.proxy.grant(&id, Policy::new(&e.config.network).unwrap()).unwrap();
         let mut bus = e.rt.subscribe();
-        let port = e.rt.proxy_port();
+        // Command credentials are served on the session's own listener.
+        let port = grant.port;
         let ask = move |req: String| async move {
             let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             s.write_all(req.as_bytes()).await.unwrap();
@@ -6079,6 +7629,8 @@ mod tests {
                     quote: None,
                     note: "dummy credential fixture".into(),
                     attested: true,
+                    tool: None,
+                    grade: None,
                 }),
             )
             .unwrap();
@@ -6821,10 +8373,234 @@ mod tests {
         let p = e.rt.inner.orch.producer(&info.meta.mission, &blob).await.unwrap();
         assert_eq!(p.session, id);
         assert_eq!(p.call_id, call_id);
+        assert_eq!(p.grade, EvidenceGrade::Run);
         e.rt.shutdown().await;
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         let p2 = rt2.inner.orch.producer(&info.meta.mission, &blob).await.unwrap();
         assert_eq!(p2.call_id, call_id);
+        // The scan of the logs after a restart grades the output as the live index did.
+        assert_eq!(p2.grade, p.grade);
+        rt2.shutdown().await;
+    }
+
+    /// The first `out:` handle of 16 or more digits anywhere in a request.
+    fn any_handle(body: &Value) -> String {
+        let text = body.to_string();
+        text.match_indices("out:")
+            .find_map(|(at, _)| {
+                let hex: String = text[at + 4..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                (hex.len() >= 16).then(|| format!("out:{}", &hex[..16]))
+            })
+            .unwrap_or_default()
+    }
+
+    /// The text of every `out_read` result of a session, in order.
+    fn out_read_texts(e: &Env, id: &SessionId) -> Vec<String> {
+        e.records(id)
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::ToolResult(t) if t.name == "out_read" => Some(t.text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn out_read_opens_the_outputs_of_its_own_mission_and_nothing_of_another() {
+        let foreign = Arc::new(Mutex::new(String::new()));
+        let f = foreign.clone();
+        let e = env(Script::new(move |body, _| {
+            if mentions(body, "SECONDMISSION") {
+                if tool_msgs(body) == 0 {
+                    call("bash", json!({"command": "echo FOREIGNMARK"}))
+                } else {
+                    finish("second done")
+                }
+            } else if has_tool(body, "agent_spawn") {
+                match tool_msgs(body) {
+                    0 => call("bash", json!({"command": "echo OWNMARK"})),
+                    1 => call("out_read", json!({"handle": handle_in_tool_msg(body, 0)})),
+                    2 => call("out_read", json!({"handle": lock(&f).clone()})),
+                    3 => call(
+                        "agent_spawn",
+                        json!({"question": format!("Read {} and say what it holds.", handle_in_tool_msg(body, 0))}),
+                    ),
+                    _ => finish("lead done"),
+                }
+            } else if tool_msgs(body) == 0 {
+                call("out_read", json!({"handle": any_handle(body)}))
+            } else {
+                finish("child done")
+            }
+        }))
+        .await;
+        // Another mission's lead produces an output; its handle reaches this session in a message.
+        let second = e.rt.create_session(e.new_session(Some("SECONDMISSION: print a marker"))).await.unwrap();
+        let sid = second.meta.id.clone();
+        until("the second mission's turn ends", || e.has(&sid, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let other = e
+            .records(&sid)
+            .into_iter()
+            .find_map(|r| match r.event {
+                Event::ToolResult(t) => t.output,
+                _ => None,
+            })
+            .expect("the second mission stored an output");
+        *lock(&foreign) = other.handle();
+        let info = e.rt.create_session(e.new_session(Some(&format!("Look at {} too.", other.handle())))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("the lead's turn ends", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let lead = out_read_texts(&e, &id);
+        assert_eq!(lead.len(), 2, "{lead:?}");
+        assert!(lead[0].contains("1\tOWNMARK"), "{}", lead[0]);
+        let want = loom_tools::outputs::Unopened::Unknown.sentence(&other.handle());
+        assert!(lead[1].contains(&want), "{}", lead[1]);
+        assert!(!lead[1].contains("FOREIGNMARK") && !lead[1].contains("lines"), "{}", lead[1]);
+        // A fresh child reads its lead's output.
+        let kid = e.children(&id).first().map(|c| c.meta.id.clone()).expect("a child");
+        let child = out_read_texts(&e, &kid);
+        assert_eq!(child.len(), 1, "{child:?}");
+        assert!(child[0].contains("1\tOWNMARK"), "{}", child[0]);
+        // After a restart over the same home the first mission still cannot open it, and the second still can.
+        let (m1, m2) = (info.meta.mission.clone(), second.meta.mission.clone());
+        assert_ne!(m1, m2);
+        let own = out_read_texts(&e, &id);
+        assert!(own.len() == 2);
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let scope = |m: &MissionId| MissionOutputs { runtime: Arc::downgrade(&rt2.inner), mission: m.clone() };
+        assert!(!scope(&m1).holds(&other.id).await);
+        assert!(scope(&m2).holds(&other.id).await);
+        rt2.shutdown().await;
+    }
+
+    fn named_result(call_id: &str, name: &str, output: Option<&BlobRef>, meta: Value) -> Event {
+        Event::ToolResult(loom_core::event::ToolResult {
+            call_id: call_id.into(),
+            name: name.into(),
+            status: ToolStatus::Ok,
+            text: "x".into(),
+            output: output.cloned(),
+            cut: false,
+            class: ToolClass::Exec,
+            meta: meta.as_object().cloned().unwrap_or_default(),
+            duration_ms: 1,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_outputs_a_mission_names_are_its_own_live_and_after_a_restart() {
+        use loom_core::event::{ChildCompleted, META_ALSO_STORED, META_RAW_BLOB};
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let put = |text: &str| e.rt.blobs().put_bytes(text.as_bytes()).unwrap();
+        let (raw, also, text_of, job, full, report) =
+            (put("raw\n"), put("also\n"), put("of\n"), put("job\n"), put("full\n"), put("report\n"));
+        let (foreign, viewed, never) = (put("foreign\n"), put("viewed\n"), put("never named\n"));
+        let events = vec![
+            named_result(
+                "n1",
+                "web_fetch",
+                None,
+                json!({ META_RAW_BLOB: raw.id.as_str(), META_ALSO_STORED: [also.id.as_str()], "of_blob": text_of.id.as_str() }),
+            ),
+            Event::JobSettled {
+                job_id: "j1".into(),
+                exit_code: Some(0),
+                output: Some(job.clone()),
+                detail: "d".into(),
+            },
+            Event::ChildSettled(loom_core::event::ChildSettled {
+                child: SessionId::from("s-kid"),
+                outcome: ChildOutcome::Returned,
+                report: "r".into(),
+                full: Some(full.clone()),
+                usage: Default::default(),
+                steps: 1,
+                inline: false,
+            }),
+            Event::ChildCompleted(ChildCompleted {
+                child: SessionId::from("s-kid"),
+                role: "worker".into(),
+                outcome: ChildOutcome::Returned,
+                report: "r".into(),
+                full: Some(report.clone()),
+                payload: Value::Null,
+                steps: 1,
+                usage: Default::default(),
+            }),
+            // Views of outputs, whoever's: they name nothing.
+            named_result(
+                "v1",
+                "out_read",
+                None,
+                json!({ "of_blob": viewed.id.as_str(), META_RAW_BLOB: foreign.id.as_str() }),
+            ),
+            named_result("v2", "out_grep", None, json!({ "of_blob": foreign.id.as_str() })),
+        ];
+        let named = [&raw, &also, &text_of, &job, &full, &report];
+        let unnamed = [&foreign, &viewed, &never];
+        let scope = |rt: &Runtime| MissionOutputs { runtime: Arc::downgrade(&rt.inner), mission: mission.clone() };
+        let check = |rt: &Runtime, what: &'static str| {
+            let scope = scope(rt);
+            let (named, unnamed) = (named.map(|b| b.id.clone()), unnamed.map(|b| b.id.clone()));
+            async move {
+                for b in &named {
+                    assert!(scope.holds(b).await, "{what}: {b}");
+                }
+                for b in &unnamed {
+                    assert!(!scope.holds(b).await, "{what}: {b}");
+                }
+            }
+        };
+        // Live: the sink's records are enough, with no scan of the mission's logs.
+        for (n, event) in events.iter().enumerate() {
+            let record = Record {
+                seq: 1_000 + n as u64,
+                ts_ms: 1,
+                author: Author::Tool,
+                prev: String::new(),
+                event: event.clone(),
+            };
+            e.rt.inner.on_record(&id, &record);
+        }
+        assert!(e.rt.inner.holds_output(&(mission.clone(), raw.id.clone())));
+        assert!(!e.rt.inner.holds_output(&(mission.clone(), foreign.id.clone())));
+        // Another mission's session does not make them its own.
+        assert!(!e.rt.inner.holds_output(&(MissionId::from("m-other"), raw.id.clone())));
+        check(&e.rt, "live").await;
+        e.rt.shutdown().await;
+        // After a restart: the same records, read from the session's log by the one scan.
+        let paths = Paths::at(e.dir.path().join("home"));
+        {
+            let (mut log, _) = SessionLog::open(&paths.session_log(&id), Durability::Always).unwrap();
+            for event in &events {
+                log.append(Author::Tool, event.clone()).unwrap();
+            }
+        }
+        let rt2 = Runtime::start(e.config.clone(), paths).await.unwrap();
+        assert!(!rt2.inner.st().scanned.contains(&mission));
+        check(&rt2, "after a restart").await;
+        assert!(rt2.inner.st().scanned.contains(&mission));
+        // A runtime that is gone holds nothing.
+        let gone = MissionOutputs { runtime: Weak::new(), mission: mission.clone() };
+        assert!(!gone.holds(&raw.id).await);
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ready_scans_the_mission_whatever_handle_is_asked_for_next() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let mission = e.rt.create_session(e.new_session(None)).await.unwrap().meta.mission;
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert!(!rt2.inner.st().scanned.contains(&mission));
+        let scope = MissionOutputs { runtime: Arc::downgrade(&rt2.inner), mission: mission.clone() };
+        // A handle that names nothing: the answer must not depend on whether this mission was scanned before.
+        scope.ready().await;
+        assert!(rt2.inner.st().scanned.contains(&mission));
         rt2.shutdown().await;
     }
 
@@ -6973,7 +8749,7 @@ mod tests {
         until("three evidence calls", || evidence(&e).len() == 3).await;
         let got = evidence(&e);
         assert_eq!(got[0].0, ToolStatus::Ok, "{}", got[0].1);
-        assert!(got[0].1.contains("static: read call"), "{}", got[0].1);
+        assert!(got[0].1.contains("read: read call"), "{}", got[0].1);
         assert_eq!(got[1].0, ToolStatus::Error, "{}", got[1].1);
         assert_eq!(got[2].0, ToolStatus::Error, "{}", got[2].1);
         assert!(got[2].1.contains("is the result of `ledger`"), "{}", got[2].1);
@@ -7027,8 +8803,8 @@ mod tests {
         assert_eq!(got[0].0, ToolStatus::Ok, "{}", got[0].1);
         assert_eq!(got[1].0, ToolStatus::Ok, "{}", got[1].1);
         // The blob is content-addressed: the wait that returned the whole output may be the first call to
-        // store it, so the producer is that wait or the starting bash call. Either way it is execution.
-        assert!(got[1].1.contains("execution: "), "{}", got[1].1);
+        // store it, so the producer is that wait or the starting bash call. Either way it is a run.
+        assert!(got[1].1.contains("run: "), "{}", got[1].1);
         e.rt.shutdown().await;
     }
 
@@ -7099,6 +8875,52 @@ mod tests {
         // A job nothing is known about registers nothing.
         let other = Event::JobSettled { job_id: "j9".into(), exit_code: None, output: None, detail: String::new() };
         assert!(produced_by(&s, &mut jobs, &other).is_none());
+    }
+
+    #[test]
+    fn produced_by_grades_what_it_registers() {
+        use loom_core::event::META_EVIDENCE_GRADE as KEY;
+        let s = SessionId::from("s-a");
+        let mut jobs = HashMap::new();
+        let grade = |jobs: &mut HashMap<_, _>, e: &Event| produced_by(&s, jobs, e).map(|(_, p)| p.grade);
+        // A result that says its output is analysis is analysis, though its tool is class Exec.
+        let scan = tool_result("c1", "dep_scan", ToolClass::Exec, Some("aa01"), json!({KEY: "analysis"}));
+        assert_eq!(grade(&mut jobs, &scan), Some(EvidenceGrade::Analysis));
+        let lookup = tool_result("c2", "cve_lookup", ToolClass::Exec, Some("aa02"), json!({KEY: "reference"}));
+        assert_eq!(grade(&mut jobs, &lookup), Some(EvidenceGrade::Reference));
+        // A plain command result is a run.
+        let bash = tool_result("c3", "bash", ToolClass::Exec, Some("aa03"), json!({}));
+        assert_eq!(grade(&mut jobs, &bash), Some(EvidenceGrade::Run));
+        // A scan or a lookup logged before the tools stated a grade is still not a run.
+        let old_scan = tool_result("c7", "bin_decompile", ToolClass::Exec, Some("aa07"), json!({}));
+        assert_eq!(grade(&mut jobs, &old_scan), Some(EvidenceGrade::Analysis));
+        let old_lookup = tool_result("c8", "advisory_lookup", ToolClass::Read, Some("aa08"), json!({}));
+        assert_eq!(grade(&mut jobs, &old_lookup), Some(EvidenceGrade::Reference));
+        // The key cannot raise a read to a run.
+        let lying = tool_result("c4", "fetch", ToolClass::Read, Some("aa04"), json!({KEY: "run"}));
+        assert_eq!(grade(&mut jobs, &lying), Some(EvidenceGrade::Read));
+        // The text a read showed is a read.
+        let read = tool_result("c5", "read", ToolClass::Read, None, json!({"of_blob": "ff01", "shown": [[1, 2]]}));
+        assert_eq!(grade(&mut jobs, &read), Some(EvidenceGrade::Read));
+        // A background job's output is a run, complete or matched.
+        let reg = Event::JobRegistered { job_id: "j1".into(), call_id: CallId::from("c6"), command: "make".into() };
+        assert!(produced_by(&s, &mut jobs, &reg).is_none());
+        let matched = Event::JobMatched {
+            job_id: "j1".into(),
+            pattern: "FOUND".into(),
+            output: Some(loom_core::BlobRef { id: BlobId::from("cc02"), bytes: 10, lines: 2 }),
+            from: 0,
+            shown: vec![1],
+            matches: 1,
+        };
+        assert_eq!(grade(&mut jobs, &matched), Some(EvidenceGrade::Run));
+        let settled = Event::JobSettled {
+            job_id: "j1".into(),
+            exit_code: Some(0),
+            output: Some(loom_core::BlobRef { id: BlobId::from("dd03"), bytes: 10, lines: 2 }),
+            detail: String::new(),
+        };
+        assert_eq!(grade(&mut jobs, &settled), Some(EvidenceGrade::Run));
     }
 
     #[tokio::test]
@@ -7227,6 +9049,8 @@ mod tests {
     #[test]
     fn start_warns_about_what_the_operator_must_know() {
         let mut c = Config::default();
+        let keys = std::path::Path::new("/h/keys/models");
+        let start_warnings = |c: &Config, macos: bool| start_warnings(c, macos, keys, |_| false, &[]);
         assert!(start_warnings(&c, true).is_empty());
         let off = start_warnings(&c, false);
         assert_eq!(off.len(), 1);
@@ -7237,6 +9061,86 @@ mod tests {
         let none = start_warnings(&c, true);
         assert_eq!(none.len(), 1);
         assert!(none[0].contains("unconfined"), "{none:?}");
+    }
+
+    #[test]
+    fn start_warns_about_a_key_held_in_the_environment() {
+        let keys = std::path::Path::new("/h/keys/models");
+        let mut c = Config::default();
+        c.notify.command = vec!["/bin/true".into()];
+        c.models.insert(
+            "env".into(),
+            loom_core::config::ModelProfile { api_key_env: Some("LOOM_TEST_KEY".into()), ..Default::default() },
+        );
+        c.models.insert(
+            "file".into(),
+            loom_core::config::ModelProfile { api_key_file: Some("file".into()), ..Default::default() },
+        );
+        let set = start_warnings(&c, true, keys, |v| v == "LOOM_TEST_KEY", &[]);
+        assert_eq!(set.len(), 1, "{set:?}");
+        assert!(set[0].contains("models.env") && set[0].contains("LOOM_TEST_KEY") && set[0].contains("can read it"));
+        let unset = start_warnings(&c, true, keys, |_| false, &[]);
+        assert_eq!(unset.len(), 1, "{unset:?}");
+        assert!(unset[0].contains("LOOM_TEST_KEY is not set") && unset[0].contains("api_key_file"), "{unset:?}");
+        assert!(set.iter().chain(&unset).all(|w| !w.contains("models.file")));
+    }
+
+    #[test]
+    fn start_names_the_secret_variables_of_the_daemon_environment_without_their_values() {
+        let keys = std::path::Path::new("/h/keys/models");
+        let mut c = Config::default();
+        c.notify.command = vec!["/bin/true".into()];
+        c.models.insert(
+            "m".into(),
+            loom_core::config::ModelProfile { api_key_env: Some("OPENAI_API_KEY".into()), ..Default::default() },
+        );
+        c.sandbox.env_pass = vec!["PASSED_TOKEN".into()];
+        let var = |n: &str, v: &str| (n.to_string(), v.to_string());
+        let env = [
+            var("GITHUB_TOKEN", "ghp_valueone"),
+            var("DATABASE", "https://u:p@h/"),
+            var("LOOM_HOME", "/h"),
+            var("LOOM_SECRET_TOKEN", "valuethree"),
+            var("OPENAI_API_KEY", "sk-valuefour"),
+            var("PASSED_TOKEN", "valuefive"),
+            var("PATH", "/usr/bin"),
+            var("EDITOR", "vi"),
+        ];
+        let w = start_warnings(&c, true, keys, |_| true, &env);
+        let secret: Vec<_> = w.iter().filter(|x| x.contains("look like secrets")).collect();
+        assert_eq!(secret.len(), 1, "{w:?}");
+        let line = secret[0];
+        assert!(line.contains("GITHUB_TOKEN") && line.contains("DATABASE"), "{line}");
+        for left_out in ["LOOM_HOME", "LOOM_SECRET_TOKEN", "PASSED_TOKEN", "PATH", "EDITOR"] {
+            assert!(!line.contains(left_out), "{left_out}: {line}");
+        }
+        assert!(!line.contains("OPENAI_API_KEY"), "{line}");
+        for value in ["ghp_valueone", "u:p@h", "sk-valuefour", "valuefive"] {
+            assert!(w.iter().all(|x| !x.contains(value)), "{value}: {w:?}");
+        }
+        assert!(line.contains("loom up") && line.contains("loom service install"), "{line}");
+        // Nothing left: no warning.
+        let env = [var("LOOM_HOME", "/h"), var("OPENAI_API_KEY", "x"), var("PATH", "/usr/bin")];
+        assert!(start_warnings(&c, true, keys, |_| false, &env).iter().all(|x| !x.contains("look like secrets")));
+    }
+
+    #[tokio::test]
+    async fn a_missing_key_file_stops_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start(Script::new(|_, _| finish("x"))).await.unwrap();
+        let mut config = config_for(&server, None);
+        if let Some(p) = config.models.get_mut("mock") {
+            p.api_key_file = Some("mock".into());
+        }
+        let paths = Paths::at(dir.path().join("home"));
+        plain_core_pack(&paths.packs_dir());
+        let key_path = paths.model_keys_dir().join("mock");
+        let err = match Runtime::start(config, paths).await {
+            Ok(_) => panic!("the runtime started without its key file"),
+            Err(e) => e,
+        };
+        assert!(err.contains("model profile 'mock'") && err.contains(&key_path.display().to_string()), "{err}");
+        server.shutdown().await;
     }
 
     #[test]
@@ -7374,6 +9278,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_records_whether_the_network_is_deny_all_for_every_sandbox_it_makes() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start(Script::new(|_, _| finish("ok"))).await.unwrap();
+        for (mode, deny_all) in [(NetworkMode::DenyAll, true), (NetworkMode::Open, false)] {
+            let mut config = config_for(&server, None);
+            config.network.mode = mode;
+            // The flag is the runtime's to set: whatever the caller passed is replaced.
+            config.sandbox.network_deny_all = !deny_all;
+            config.sandbox.daemon_port = Some(4242);
+            let rt = Runtime::start(config, Paths::at(dir.path().join(format!("home-{deny_all}")))).await.unwrap();
+            assert_eq!(rt.config().sandbox.network_deny_all, deny_all);
+            assert_eq!(rt.config().sandbox.daemon_port, Some(4242));
+            rt.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn start_clears_the_leftovers_of_a_session_nobody_activates() {
         use std::os::unix::process::CommandExt;
         let e = env(Script::new(|_, _| finish("ok"))).await;
@@ -7467,6 +9388,180 @@ mod tests {
         let rs = rt2.records(&b, None, 2_000).unwrap();
         assert!(!rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })));
         assert!(rt2.session(&b).unwrap().active);
+        rt2.shutdown().await;
+    }
+
+    /// A lead with a sealed ledger of its own that holds the goal `goal`; returns its mission.
+    async fn mission_with_goal(e: &Env, title: &str, goal: &str) -> MissionId {
+        let mut new = e.new_session(None);
+        new.title = Some(title.into());
+        let mission = e.rt.create_session(new).await.unwrap().meta.mission;
+        let paths = Paths::at(e.dir.path().join("home"));
+        let key = journal::load_or_create_key(&paths.journal_key()).unwrap();
+        Journal::new(paths.journal(&mission), key)
+            .append(&SessionId::from("s-op"), true, loom_core::ledger::LedgerOp::GoalSet { text: goal.into() }, &|_| {
+                Ok(())
+            })
+            .unwrap();
+        mission
+    }
+
+    fn recall_notes(rs: &[Record]) -> Vec<String> {
+        rs.iter()
+            .filter_map(|r| match &r.event {
+                Event::HarnessNote { note: NoteKind::Info, text }
+                    if text.starts_with("Earlier missions the operator") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_new_session_that_names_no_earlier_mission_is_sent_without_the_key() {
+        let none = serde_json::to_value(NewSession::default()).unwrap();
+        assert!(none.get("prior").is_none(), "{none}");
+        let some =
+            serde_json::to_value(NewSession { prior: vec![MissionId::from("m-1")], ..Default::default() }).unwrap();
+        assert_eq!(some["prior"], json!(["m-1"]));
+        // Both forms are read back.
+        assert!(serde_json::from_value::<NewSession>(none).unwrap().prior.is_empty());
+        assert_eq!(serde_json::from_value::<NewSession>(some).unwrap().prior, [MissionId::from("m-1")]);
+    }
+
+    #[tokio::test]
+    async fn a_mission_without_a_known_lead_has_no_title_to_show() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let earlier = mission_with_goal(&e, "Lead title", "g").await;
+        let lead = e.rt.sessions(true).into_iter().find(|s| s.meta.mission == earlier).unwrap().meta.id;
+        let (named, recalled) = e.rt.recall_earlier(std::slice::from_ref(&earlier)).await.unwrap();
+        assert_eq!((named, recalled[0].title.as_str()), (vec![earlier.clone()], "Lead title"));
+        // Only a child of the mission is known: its title (written by the model) is not the mission's.
+        {
+            let mut st = e.rt.inner.st();
+            let mut kid = st.known.get(&lead).unwrap().meta.clone();
+            kid.id = SessionId::from("s-kid");
+            kid.parent = Some(lead.clone());
+            kid.title = "MODEL-WRITTEN-TITLE".into();
+            st.known.remove(&lead);
+            st.known.insert(kid.id.clone(), Known::new(kid, idle_status()));
+        }
+        let (_, recalled) = e.rt.recall_earlier(&[earlier]).await.unwrap();
+        assert_eq!(recalled[0].title, "untitled");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_lead_recalls_the_missions_the_operator_named_before_its_first_request() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let earlier = mission_with_goal(&e, "Lab sweep", "Map the lab network").await;
+        let mut new = e.new_session(Some("go"));
+        // Blanks and repeats are dropped, the id is trimmed.
+        new.prior = vec![MissionId::from(format!("  {earlier}  ")), MissionId::from(""), earlier.clone()];
+        let info = e.rt.create_session(new).await.unwrap();
+        let id = info.meta.id.clone();
+        assert_eq!(info.meta.prior, vec![earlier.clone()]);
+        until("finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))).await;
+        let rs = e.records(&id);
+        let notes = recall_notes(&rs);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains(&format!("Mission {earlier} (Lab sweep), last recorded ")), "{}", notes[0]);
+        assert!(notes[0].contains("> Map the lab network"), "{}", notes[0]);
+        let kinds = e.kinds(&id);
+        let note_at = rs
+            .iter()
+            .position(|r| matches!(&r.event, Event::HarnessNote { text, .. } if text.starts_with("Earlier missions")))
+            .unwrap();
+        let request_at = kinds.iter().position(|k| k == "model_request").unwrap();
+        assert_eq!((kinds[0].as_str(), note_at), ("session_start", 1));
+        assert!(note_at < request_at, "{kinds:?}");
+        assert!(mentions(&e.server.requests()[0], "Map the lab network"));
+        // meta.json keeps the missions, in the given order.
+        let meta: Value = serde_json::from_slice(
+            &std::fs::read(e.dir.path().join("home").join("sessions").join(id.as_str()).join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["prior"], json!([earlier.as_str()]));
+        // A session without any has no such key.
+        let plain = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let meta: Value = serde_json::from_slice(
+            &std::fs::read(e.dir.path().join("home").join("sessions").join(plain.as_str()).join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(meta.get("prior").is_none());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_earlier_mission_is_recalled_as_unreadable() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let earlier = mission_with_goal(&e, "SECRET-TITLE", "SECRET-GOAL").await;
+        let journal_path = Paths::at(e.dir.path().join("home")).journal(&earlier);
+        let text = std::fs::read_to_string(&journal_path).unwrap();
+        std::fs::write(&journal_path, text.replace("SECRET-GOAL", "SECRET-G0AL")).unwrap();
+        let mut new = e.new_session(None);
+        new.prior = vec![earlier.clone()];
+        let id = e.rt.create_session(new).await.unwrap().meta.id;
+        let notes = recall_notes(&e.records(&id));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains(&format!("Mission {earlier}: its ledger could not be read")), "{}", notes[0]);
+        assert!(!notes[0].contains("SECRET"));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_mission_and_too_many_missions_are_refused_and_leave_no_session() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let earlier = mission_with_goal(&e, "one", "g").await;
+        let before = e.rt.sessions(true).len();
+        let mut new = e.new_session(Some("go"));
+        new.prior = vec![earlier.clone(), MissionId::from("m-nope")];
+        assert_eq!(e.rt.create_session(new).await.unwrap_err(), "There is no mission m-nope to recall.");
+        let mut new = e.new_session(Some("go"));
+        new.prior = (0..9).map(|i| MissionId::from(format!("m-{i}"))).collect();
+        assert_eq!(
+            e.rt.create_session(new).await.unwrap_err(),
+            "Name at most 8 earlier missions to recall; 9 were named."
+        );
+        assert_eq!(e.rt.sessions(true).len(), before);
+        assert!(e.server.requests().is_empty());
+        // A very long list is counted, not scanned quadratically, and says how many distinct ids it named.
+        let mut new = e.new_session(None);
+        new.prior = (0..200_000).map(|i| MissionId::from(format!("m-{}", i % 50_000))).collect();
+        assert_eq!(
+            e.rt.create_session(new).await.unwrap_err(),
+            "Name at most 8 earlier missions to recall; 50000 were named."
+        );
+        // Eight is fine, and a repeat counts once.
+        let mut new = e.new_session(None);
+        new.prior = vec![earlier.clone(); 12];
+        assert!(e.rt.create_session(new).await.is_ok());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_restart_writes_no_second_recall_note() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let earlier = mission_with_goal(&e, "one", "the first goal").await;
+        let mut new = e.new_session(Some("go"));
+        new.prior = vec![earlier.clone()];
+        let id = e.rt.create_session(new).await.unwrap().meta.id;
+        until("finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))).await;
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let info = rt2.session(&id).unwrap();
+        assert_eq!(info.meta.prior, vec![earlier]);
+        assert!(rt2.send_message(&id, "again").await.is_ok());
+        let again = rt2.clone();
+        until("a second turn", || {
+            again.records(&id, None, 2_000).is_ok_and(|rs| {
+                rs.iter().filter(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })).count() == 2
+            })
+        })
+        .await;
+        assert_eq!(recall_notes(&rt2.records(&id, None, 2_000).unwrap()).len(), 1);
         rt2.shutdown().await;
     }
 
@@ -8897,13 +10992,56 @@ mod tests {
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         let id = info.meta.id.clone();
         until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
-        let port = e.rt.proxy_port();
-        assert!(port != 0);
+        let port = e.rt.inner.proxy.session_port(&id).unwrap();
+        assert!(port != 0 && port != e.rt.proxy_port());
         let text = e.records(&id).into_iter().find_map(|r| match r.event {
             Event::ToolResult(t) if t.name == "bash" => Some(t.text),
             _ => None,
         });
-        assert!(text.unwrap_or_default().contains(&format!("@127.0.0.1:{port}")));
+        let text = text.unwrap_or_default();
+        assert!(text.contains(&format!("@127.0.0.1:{port}")), "{text}");
+        assert!(!text.contains(&format!("@127.0.0.1:{}", e.rt.proxy_port())), "{text}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sessions_have_proxy_ports_of_their_own_and_sandboxes_that_allow_only_their_own() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let a = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta;
+        let b = e.rt.create_session(e.new_session(Some("b"))).await.unwrap().meta;
+        let port_of = |env: &std::collections::BTreeMap<String, String>| -> u16 {
+            let url = env.get("HTTP_PROXY").expect("HTTP_PROXY");
+            url.rsplit(':').next().and_then(|p| p.parse().ok()).expect("a port at the end of HTTP_PROXY")
+        };
+        let shared = e.rt.proxy_port();
+        let (da, _) = e.rt.inner.build(&a, false).unwrap();
+        let (db, _) = e.rt.inner.build(&b, false).unwrap();
+        let (pa, pb) = (port_of(&da.ctx.env), port_of(&db.ctx.env));
+        assert!(pa != pb && pa != shared && pb != shared, "{pa} {pb} {shared}");
+        assert_eq!(e.rt.inner.proxy.session_port(&a.id), Some(pa));
+        assert_eq!(e.rt.inner.proxy.session_port(&b.id), Some(pb));
+        assert_eq!(da.ctx.sandbox.loopback_ports().first(), Some(&pa));
+        assert_eq!(db.ctx.sandbox.loopback_ports().first(), Some(&pb));
+        for (sandbox, own, other) in [(&da.ctx.sandbox, pa, pb), (&db.ctx.sandbox, pb, pa)] {
+            let ports = sandbox.loopback_ports();
+            assert!(ports.contains(&own) && !ports.contains(&other) && !ports.contains(&shared), "{ports:?}");
+        }
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_that_ends_holds_no_proxy_port_and_its_port_is_not_reissued() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let id = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta.id;
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let port = e.rt.inner.proxy.session_port(&id).unwrap();
+        e.rt.inner.proxy.revoke(&id);
+        assert_eq!(e.rt.inner.proxy.session_port(&id), None);
+        // The port is retired, so no later session is given it.
+        let next = e.rt.create_session(e.new_session(Some("b"))).await.unwrap().meta.id;
+        until("second turn end", || e.has(&next, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let other = e.rt.inner.proxy.session_port(&next).unwrap();
+        assert_ne!(other, port);
         e.rt.shutdown().await;
     }
 
@@ -9223,6 +11361,291 @@ mod tests {
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         assert_eq!(rt2.session(&id).unwrap().meta.title, "Grafana CVE hunt");
         rt2.shutdown().await;
+    }
+
+    /// A runtime whose config also has the profile "other", served by a mock server of its own.
+    async fn env_two_models(primary: Script, second: Script) -> (Env, MockServer) {
+        let other = MockServer::start(second).await.unwrap();
+        let url = other.base_url();
+        let e = env_with(primary, false, |c| {
+            let mut p = c.models["mock"].clone();
+            p.base_url = url;
+            c.models.insert("other".into(), p);
+        })
+        .await;
+        (e, other)
+    }
+
+    fn switches(records: Vec<Record>) -> Vec<loom_core::event::ModelSwitched> {
+        records
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::ModelSwitched(m) => Some(m),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_running_session_switches_model_at_its_next_step_and_keeps_it_across_a_restart() {
+        let (e, other) =
+            env_two_models(Script::new(|_, _| finish("from mock")), Script::new(|_, _| finish("from other"))).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("first turn", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase != Phase::Running)).await;
+        assert!(other.requests().is_empty());
+        assert!(e.rt.set_session_model(&id, "  ").await.is_err(), "a blank profile is refused");
+        let unknown = e.rt.set_session_model(&id, "nope").await.unwrap_err();
+        assert!(unknown.contains("configured profiles: mock, other"), "{unknown}");
+
+        let receipt = e.rt.set_session_model(&id, "other").await.unwrap();
+        assert!(receipt.live, "the session's task took the switch");
+        assert_eq!(receipt.model.profile, "other");
+        assert_eq!(e.rt.session(&id).unwrap().meta.profile, "other");
+        until("switch recorded", || !switches(e.records(&id)).is_empty()).await;
+        let sw = switches(e.records(&id)).remove(0);
+        assert_eq!((sw.from.profile.as_str(), sw.to.profile.as_str()), ("mock", "other"));
+        assert_eq!(sw.reason, crate::session::SWITCH_OPERATOR);
+
+        let before = e.server.requests().len();
+        e.rt.send_message(&id, "again").await.unwrap();
+        until("the next request went to the new model", || !other.requests().is_empty()).await;
+        let turn_ends = || e.records(&id).iter().filter(|r| matches!(r.event, Event::TurnEnd { .. })).count();
+        until("second turn", || turn_ends() == 2).await;
+        assert_eq!(e.server.requests().len(), before, "nothing more went to the old model");
+        assert!(!e.has(&id, |ev| matches!(ev, Event::CacheBreak { .. })), "{:?}", e.kinds(&id));
+
+        // Durable: the next start opens it on the new model and records no second switch.
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert_eq!(rt2.session(&id).unwrap().meta.profile, "other");
+        assert_eq!(switches(rt2.records(&id, None, 2_000).unwrap()).len(), 1);
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_switch_while_idle_is_recorded_when_the_session_next_runs() {
+        let (e, other) =
+            env_two_models(Script::new(|_, _| finish("from mock")), Script::new(|_, _| finish("from other"))).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("inbox", || e.rt.inbox().iter().any(|i| i.session == id)).await;
+        // Dismissed, nothing asks for the session at the next start: it stays without a task.
+        let item = e.rt.inbox().remove(0).item.item_id;
+        e.rt.answer(&item, "").await.unwrap();
+        let status = e.rt.paths().session_dir(&id).join("status.json");
+        until("status published", || std::fs::read_to_string(&status).is_ok_and(|s| s.contains("\"open_inbox\": 0")))
+            .await;
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert!(!rt2.session(&id).unwrap().active);
+
+        let receipt = rt2.set_session_model(&id, "other").await.unwrap();
+        assert!(!receipt.live, "no task runs it");
+        assert!(switches(rt2.records(&id, None, 2_000).unwrap()).is_empty(), "recorded when it runs");
+        rt2.send_message(&id, "again").await.unwrap();
+        until("a request on the new model", || !other.requests().is_empty()).await;
+        let sw = switches(rt2.records(&id, None, 2_000).unwrap());
+        assert_eq!(sw.len(), 1);
+        assert_eq!((sw[0].to.profile.as_str(), sw[0].reason.as_str()), ("other", crate::session::SWITCH_IDLE));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reload_models_adds_rebinds_and_removes_profiles_without_a_restart() {
+        let other = MockServer::start(Script::new(|_, _| finish("from other"))).await.unwrap();
+        let e = env(Script::new(|_, _| finish("from mock"))).await;
+        let file = e.rt.paths().config_file();
+        let write = |c: &Config| std::fs::write(&file, toml::to_string(c).unwrap()).unwrap();
+        let mut wanted = e.new_session(Some("go"));
+        wanted.model = Some("other".into());
+        let refused = e.rt.create_session(wanted.clone()).await.unwrap_err();
+        assert!(refused.contains("configured profiles: mock"), "{refused}");
+
+        // Added: usable at once.
+        let mut cfg = e.config.clone();
+        let mut p = cfg.models["mock"].clone();
+        p.base_url = other.base_url();
+        cfg.models.insert("other".into(), p);
+        write(&cfg);
+        let r = e.rt.reload_models().await.unwrap();
+        assert_eq!((r.added.as_slice(), r.changed.len(), r.removed.len()), (&["other".to_string()][..], 0, 0));
+        let id = e.rt.create_session(wanted).await.unwrap().meta.id;
+        until("a request on the added profile", || !other.requests().is_empty()).await;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase != Phase::Running)).await;
+
+        // Changed: a new client and slots, and the session on it is switched to them.
+        cfg.models.get_mut("other").unwrap().max_concurrent = 2;
+        write(&cfg);
+        let r = e.rt.reload_models().await.unwrap();
+        assert_eq!((r.changed.as_slice(), r.rebound.as_slice()), (&["other".to_string()][..], &[id.clone()][..]));
+        let health = e.rt.health().await;
+        assert_eq!(health.iter().find(|h| h.profile == "other").unwrap().max_concurrent, 2);
+        // Same model and window, but the profile changed under a running session: its log says so.
+        until("the reload in the session's log", || {
+            switches(e.records(&id)).iter().any(|s| s.reason == crate::session::SWITCH_RELOADED)
+        })
+        .await;
+
+        // Removed: no longer offered, and the session still on it is named with the way out.
+        cfg.models.remove("other");
+        write(&cfg);
+        let r = e.rt.reload_models().await.unwrap();
+        assert_eq!(r.removed, vec!["other".to_string()]);
+        assert!(r.notes.iter().any(|n| n.contains(id.as_str()) && n.contains("loom models set")), "{:?}", r.notes);
+        let gone = e.rt.set_session_model(&id, "other").await.unwrap_err();
+        assert!(gone.contains("loom models reload"), "{gone}");
+        assert_eq!(e.rt.set_session_model(&id, "mock").await.unwrap().model.profile, "mock");
+
+        // A file that does not load changes nothing.
+        std::fs::write(&file, "[models\n").unwrap();
+        assert!(e.rt.reload_models().await.is_err());
+        assert!(e.rt.health().await.iter().any(|h| h.profile == "mock"));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_reload_reads_the_key_file_of_a_new_profile_and_refuses_one_it_cannot_use() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let file = e.rt.paths().config_file();
+        let mut cfg = e.config.clone();
+        let mut p = cfg.models["mock"].clone();
+        p.api_key_env = None;
+        p.api_key_file = Some("keyed".into());
+        cfg.models.insert("keyed".into(), p);
+        std::fs::write(&file, toml::to_string(&cfg).unwrap()).unwrap();
+        // No key file yet: refused, naming the profile and the file, and nothing changes.
+        let key = e.rt.paths().model_keys_dir().join("keyed");
+        let err = e.rt.reload_models().await.unwrap_err();
+        assert!(err.contains("'keyed'") && err.contains(&key.display().to_string()), "{err}");
+        assert!(e.rt.health().await.iter().all(|h| h.profile != "keyed"));
+        // A key file others can read is refused too.
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::write(&key, "sk-test\n").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = e.rt.reload_models().await.unwrap_err();
+        assert!(err.contains("chmod 600") && !err.contains("sk-test"), "{err}");
+        assert!(e.rt.health().await.iter().all(|h| h.profile != "keyed"));
+        // With the key file in order, the profile is added.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let r = e.rt.reload_models().await.unwrap();
+        assert_eq!(r.added, vec!["keyed".to_string()]);
+        assert!(e.rt.health().await.iter().any(|h| h.profile == "keyed"));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_mission_starts_its_agents_on_the_models_chosen_for_their_roles() {
+        let args = json!({"question": "CHILDMARK", "role": "worker"});
+        let (e, other) = env_two_models(lead_script(args.clone()), lead_script(args)).await;
+        let mut new = e.new_session(Some("go"));
+        new.role_models = std::collections::BTreeMap::from([("worker".to_string(), "other".to_string())]);
+        let id = e.rt.create_session(new).await.unwrap().meta.id;
+        until("the lead finished", || {
+            e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))
+        })
+        .await;
+        let child = e.children(&id).remove(0).meta;
+        assert_eq!((child.role.as_str(), child.profile.as_str()), ("worker", "other"));
+        assert!(!other.requests().is_empty(), "the worker ran on the chosen model");
+        assert_eq!(e.rt.session(&id).unwrap().meta.profile, "mock", "the lead keeps its own");
+        // The same view from any session of the mission.
+        let m = e.rt.mission_models(&child.id).unwrap();
+        assert_eq!((&m.lead, m.lead_model.profile.as_str(), &m.any_role), (&id, "mock", &None));
+        assert_eq!(m.roles.iter().map(|r| r.role.as_str()).collect::<Vec<_>>(), ["worker", "verifier"]);
+        assert_eq!(m.roles[0].chosen.as_deref(), Some("other"));
+        assert_eq!(m.profiles, ["mock", "other"]);
+        // Kept in the lead's meta.json.
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert_eq!(rt2.session(&id).unwrap().meta.role_models.get("worker").map(String::as_str), Some("other"));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_choice_for_every_role_is_used_cleared_and_checked() {
+        let args = json!({"question": "CHILDMARK", "role": "worker"});
+        let (e, _other) = env_two_models(lead_script(args.clone()), lead_script(args)).await;
+        let mut bad = e.new_session(None);
+        bad.role_models = std::collections::BTreeMap::from([("nope".to_string(), "other".to_string())]);
+        let refused = e.rt.create_session(bad).await.unwrap_err();
+        assert!(refused.contains("Its roles: worker, verifier"), "{refused}");
+        let id = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let unknown = e.rt.set_role_model(&id, "worker", Some("nope"), false).await.unwrap_err();
+        assert!(unknown.contains("configured profiles: mock, other"), "{unknown}");
+
+        let r = e.rt.set_role_model(&id, ANY_ROLE, Some("other"), false).await.unwrap();
+        assert_eq!((r.models.any_role.as_deref(), r.switched.len()), (Some("other"), 0));
+        e.rt.send_message(&id, "go").await.unwrap();
+        until("the lead finished", || {
+            e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))
+        })
+        .await;
+        assert_eq!(e.children(&id)[0].meta.profile, "other", "`*` covers a role without a choice of its own");
+        let r = e.rt.set_role_model(&id, ANY_ROLE, None, false).await.unwrap();
+        assert_eq!(r.models.any_role, None);
+        assert!(e.rt.session(&id).unwrap().meta.role_models.is_empty());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn choosing_a_model_now_moves_the_running_agents_of_the_role() {
+        let script = || {
+            Script::new(|body, _| {
+                if !has_tool(body, "agent_spawn") {
+                    return idle_worker(body);
+                }
+                match tool_msgs(body) {
+                    0 => call("agent_spawn", json!({"question": "CHILDMARK", "background": true})),
+                    _ => call("wait", json!({})),
+                }
+            })
+        };
+        let (e, _other) = env_two_models(script(), script()).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("the lead waits", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Waiting })))
+            .await;
+        let child = e.children(&id)[0].meta.id.clone();
+        until_idle(&e, &child).await;
+        assert_eq!(e.rt.session(&child).unwrap().meta.profile, "mock");
+        let r = e.rt.set_role_model(&id, "worker", Some("other"), true).await.unwrap();
+        assert_eq!(r.switched, vec![child.clone()]);
+        assert_eq!(e.rt.session(&child).unwrap().meta.profile, "other");
+        let agents = &r.models.roles.iter().find(|x| x.role == "worker").unwrap().agents;
+        assert_eq!((agents.len(), agents[0].profile.as_str(), agents[0].forked), (1, "other", false));
+        until("the agent recorded the switch", || !switches(e.records(&child)).is_empty()).await;
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_verifier_is_kept_off_the_leads_profile_when_the_pack_wants_them_apart() {
+        let other = MockServer::start(Script::new(|_, _| finish("x"))).await.unwrap();
+        let url = other.base_url();
+        let e = env_with_packs(
+            Script::new(|_, _| finish("ok")),
+            |c| {
+                let mut p = c.models["mock"].clone();
+                p.base_url = url;
+                c.models.insert("other".into(), p);
+            },
+            |packs| {
+                let path = packs.join("core/pack.toml");
+                let text = std::fs::read_to_string(&path).unwrap().replace(
+                    "[roles.lead]",
+                    "[roles.lead]\nverifier = \"verifier\"\nrequire_distinct_verifier_profile = true",
+                );
+                std::fs::write(path, text).unwrap();
+            },
+        )
+        .await;
+        let id = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let same = e.rt.set_role_model(&id, "verifier", Some("mock"), false).await.unwrap_err();
+        assert!(same.contains("another model profile than the lead's"), "{same}");
+        e.rt.set_role_model(&id, "verifier", Some("other"), false).await.unwrap();
+        // Nor can the lead then move onto the verifier's.
+        let lead = e.rt.set_session_model(&id, "other").await.unwrap_err();
+        assert!(lead.contains("loom models role"), "{lead}");
+        e.rt.shutdown().await;
     }
 
     #[tokio::test]
@@ -10040,5 +12463,180 @@ mod tests {
         let copy = with_copies(shared.clone(), Path::new("/h-copies"), Some("/ws"));
         assert_eq!(copy.replay_untrusted_paths, ["/x", "/h-copies"]);
         assert_eq!(copy.protected_paths, ["/ws"]);
+    }
+
+    #[test]
+    fn home_is_expanded_only_for_tilde_paths() {
+        let home = Path::new("/Users/me");
+        assert_eq!(expand_home(Path::new("~"), Some(home)).unwrap(), PathBuf::from("/Users/me"));
+        assert_eq!(expand_home(Path::new("~/code/x"), Some(home)).unwrap(), PathBuf::from("/Users/me/code/x"));
+        assert_eq!(expand_home(Path::new("~you/x"), Some(home)).unwrap(), PathBuf::from("~you/x"));
+        assert_eq!(expand_home(Path::new("/a/~/b"), Some(home)).unwrap(), PathBuf::from("/a/~/b"));
+        assert!(expand_home(Path::new("~/x"), None).unwrap_err().contains("absolute path"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_workspace_is_made_only_when_asked_and_only_where_allowed() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let missing = e.dir.path().join("a/b/new");
+        let make = |path: &Path, create: bool| NewSession {
+            workspace: path.to_path_buf(),
+            create_workspace: create,
+            ..NewSession::default()
+        };
+
+        // Missing, flag unset: the sentence says how to create it, and nothing is made.
+        let err = e.rt.create_session_receipt(make(&missing, false)).await.unwrap_err();
+        assert!(err.contains("does not exist") && err.contains("--create-workspace"), "{err}");
+        assert!(!missing.exists());
+
+        // Missing, flag set: made (with the folders above it), the receipt says so, the session starts there.
+        let (info, created) = e.rt.create_session_receipt(make(&missing, true)).await.unwrap();
+        assert!(created && missing.is_dir());
+        assert_eq!(Path::new(&info.meta.workspace), std::fs::canonicalize(&missing).unwrap());
+        // An existing folder is not "created", flag or not.
+        let (_, created) = e.rt.create_session_receipt(make(&missing, true)).await.unwrap();
+        assert!(!created);
+
+        // Inside the loom home or beside it in the copies folder: refused, nothing made.
+        for inside in
+            [e.dir.path().join("home/x"), e.dir.path().join("home/sessions/new"), e.dir.path().join("home-copies/y")]
+        {
+            let err = e.rt.create_session_receipt(make(&inside, true)).await.unwrap_err();
+            assert!(err.contains("loom home"), "{err}");
+            assert!(!inside.exists(), "{}", inside.display());
+        }
+        // A symlink into the home does not get around it.
+        let link = e.dir.path().join("link");
+        std::os::unix::fs::symlink(e.dir.path().join("home"), &link).unwrap();
+        let err = e.rt.create_session_receipt(make(&link.join("viaink"), true)).await.unwrap_err();
+        assert!(err.contains("loom home"), "{err}");
+        assert!(!e.dir.path().join("home/viaink").exists());
+
+        // Relative, `..` in the part that is made, a file in the way.
+        let err = e.rt.create_session_receipt(make(Path::new("rel/ws"), true)).await.unwrap_err();
+        assert!(err.contains("relative path"), "{err}");
+        let err = e.rt.create_session_receipt(make(&e.dir.path().join("a/../zz/q"), true)).await.unwrap_err();
+        assert!(err.contains("..") && !e.dir.path().join("zz").exists(), "{err}");
+        let file = e.dir.path().join("afile");
+        std::fs::write(&file, "x").unwrap();
+        let err = e.rt.create_session_receipt(make(&file.join("sub"), true)).await.unwrap_err();
+        assert!(err.contains("is not a directory"), "{err}");
+        let err = e.rt.create_session_receipt(make(&file, true)).await.unwrap_err();
+        assert!(err.contains("is not a directory"), "{err}");
+
+        // A request refused for another reason makes nothing.
+        let later = e.dir.path().join("later");
+        let bad = NewSession { role: Some("nope".into()), ..make(&later, true) };
+        assert!(e.rt.create_session_receipt(bad).await.is_err());
+        assert!(!later.exists());
+    }
+
+    #[tokio::test]
+    async fn earlier_missions_that_cannot_be_recalled_refuse_before_a_missing_workspace_is_made() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let missing = e.dir.path().join("recall/ws");
+        let make = |prior: Vec<MissionId>| NewSession {
+            workspace: missing.clone(),
+            create_workspace: true,
+            prior,
+            ..NewSession::default()
+        };
+        let err = e.rt.create_session_receipt(make(vec![MissionId::from("m-nope")])).await.unwrap_err();
+        assert_eq!(err, "There is no mission m-nope to recall.");
+        assert!(!e.dir.path().join("recall").exists(), "a refused request makes no folder");
+        let many = (0..9).map(|i| MissionId::from(format!("m-{i}"))).collect();
+        let err = e.rt.create_session_receipt(make(many)).await.unwrap_err();
+        assert!(err.starts_with("Name at most 8 earlier missions"), "{err}");
+        assert!(!e.dir.path().join("recall").exists());
+        // A mission that can be recalled: the folder is made and the new lead keeps what it recalls.
+        let earlier = mission_with_goal(&e, "one", "g").await;
+        let (info, created) = e.rt.create_session_receipt(make(vec![earlier.clone()])).await.unwrap();
+        assert!(created && missing.is_dir());
+        assert_eq!(info.meta.prior, vec![earlier]);
+        e.rt.shutdown().await;
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn the_data_volume_spelling_of_the_loom_home_does_not_get_around_the_refusal() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let real = std::fs::canonicalize(e.dir.path()).unwrap();
+        let alias = Path::new("/System/Volumes/Data").join(real.strip_prefix("/").unwrap());
+        if !alias.join("home").is_dir() {
+            return;
+        }
+        for (inside, name) in
+            [(alias.join("home/made-by-create"), "home/made-by-create"), (alias.join("home-copies/x"), "home-copies/x")]
+        {
+            let make = NewSession { workspace: inside.clone(), create_workspace: true, ..NewSession::default() };
+            let err = e.rt.create_session_receipt(make).await.unwrap_err();
+            assert!(err.contains("loom home"), "{err}");
+            assert!(!e.dir.path().join(name).exists(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_workspace_gets_its_reserved_folder_and_an_existing_one_in_the_loom_home_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = env_with(Script::new(|_, _| finish("ok")), false, with_os_sandbox).await;
+        let made = e.dir.path().join("new/ws");
+        let new = NewSession { workspace: made.clone(), create_workspace: true, ..NewSession::default() };
+        let (info, created) = e.rt.create_session_receipt(new).await.unwrap();
+        assert!(created);
+        let loom = Path::new(&info.meta.workspace).join(".loom");
+        assert!(loom.is_dir(), "the sandbox needs the workspace's .loom");
+        assert_eq!(std::fs::metadata(&loom).unwrap().permissions().mode() & 0o777, 0o700);
+        // An existing workspace inside the loom home is refused like a new one.
+        let err =
+            e.rt.create_session(NewSession { workspace: e.dir.path().join("home"), ..NewSession::default() }).await;
+        assert!(err.unwrap_err().contains("inside the loom home"));
+        // A folder that merely holds the home is fine.
+        assert!(plan_workspace(&Paths::at(e.dir.path().join("home")), e.dir.path(), false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_request_that_fails_after_the_folder_was_made_takes_it_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let sessions = e.dir.path().join("home/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let made = e.dir.path().join("fresh/deeper/ws");
+        let new = NewSession { workspace: made.clone(), create_workspace: true, ..NewSession::default() };
+        let res = e.rt.create_session_receipt(new).await;
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(res.is_err(), "the session could not be written");
+        assert!(!e.dir.path().join("fresh").exists(), "the folders the request made are removed");
+        // What was there before stays, and a folder that has anything in it is not removed.
+        let plan = plan_workspace(&Paths::at(e.dir.path().join("home")), &e.dir.path().join("keep/ws"), true).unwrap();
+        let made = plan.make_tracked().unwrap();
+        assert_eq!(made.created.len(), 2);
+        std::fs::write(made.path.join("work.txt"), "x").unwrap();
+        made.undo();
+        assert!(made.path.join("work.txt").exists(), "a workspace with files is not deleted");
+        std::fs::remove_file(made.path.join("work.txt")).unwrap();
+        made.undo();
+        assert!(!e.dir.path().join("keep").exists());
+    }
+
+    #[test]
+    fn a_link_swapped_in_after_the_check_is_judged_again_once_the_folders_exist() {
+        let d = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(d.path()).unwrap();
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(base.join("elsewhere")).unwrap();
+        let link = base.join("swap");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        // The plan was made when `swap` led elsewhere; a plan made now is refused outright.
+        assert!(plan_workspace(&Paths::at(home.clone()), &link.join("a/b"), true).is_err());
+        let plan =
+            WorkspacePlan::Create { path: link.join("a/b"), ancestor: base.clone(), protected: vec![home.clone()] };
+        let err = plan.make_tracked().unwrap_err();
+        assert!(err.contains("loom home"), "{err}");
+        assert!(!home.join("a").exists(), "what the call made inside the home is removed again");
     }
 }

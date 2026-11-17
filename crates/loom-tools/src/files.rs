@@ -33,9 +33,25 @@
 //! the kind of file is judged on the descriptor too. A refusal is `NotOpened::Denied` with the judge's
 //! sentence, and the file is closed unread. `open_regular(path)` is the same open with no judge.
 //!
+//! `open_dir_readable(path, readable)` opens a directory the same way (never blocking) and has `readable`
+//! judge its real path, for a walk that lists names and never opens the files.
+//!
 //! `real_path(fd)` asks the operating system which file an open descriptor is: macOS `F_GETPATH`,
 //! Linux the link `/proc/self/fd/N`. Elsewhere it fails with a sentence saying that the file tools
 //! are not supported there, so nothing is read unjudged.
+//!
+//! `is_or_inside(path, protected)` says whether `path` is the folder `protected` or lies inside it, judged by file
+//! identity (device and inode) and not by the text of either path: it resolves the deepest part of `path` that
+//! exists and compares each of that folder's ancestors with `protected`, so a second spelling of the same
+//! folder (macOS `/System/Volumes/Data/...`, a link, a bind mount) is recognised. A `protected` that does not
+//! exist is compared by text, resolved as far as it exists.
+//!
+//! `list_dir_judged(path, readable)` lists a folder through one open descriptor: the folder is opened
+//! (`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`), `readable` judges `real_path` of that descriptor (refusal:
+//! `NotOpened::Denied`), then the entries are read from it and each is examined with `fstatat(dir, name,
+//! AT_SYMLINK_NOFOLLOW)`, so nothing is looked up again by path text. It returns the real path and a [`DirItem`]
+//! per entry (name, kind, size, modification time, device and inode, and for a link whether it leads to a
+//! folder); an entry that cannot be examined carries `error`.
 //!
 //! Tests required: each state; a rewrite with identical bytes stays `Current`; same size with
 //! different bytes is `Changed`; a size-and-time record with the same size and a different time is
@@ -148,6 +164,15 @@ fn open_judged(path: &Path, readable: Option<Readable<'_>>) -> Result<(File, Met
     Ok((file, meta))
 }
 
+/// Whether the session may list the directory at `path`, judged on the directory as it is opened: `readable`
+/// is given the real path of the open directory, wherever the path led when it was opened.
+pub fn open_dir_readable(path: &Path, readable: Readable<'_>) -> Result<(), NotOpened> {
+    let flags = libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_NOCTTY;
+    let dir = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(path).map_err(NotOpened::Io)?;
+    let real = real_path(dir.as_fd()).map_err(NotOpened::Io)?;
+    readable(&real).map_err(NotOpened::Denied)
+}
+
 /// The path of the file or directory that the open descriptor `fd` is, as the kernel knows it: links
 /// resolved, and the current name if it was renamed since it was opened.
 #[cfg(target_os = "macos")]
@@ -183,6 +208,172 @@ pub fn real_path(_fd: BorrowedFd<'_>) -> io::Result<PathBuf> {
         "the file tools are not supported on this operating system, because it cannot tell which file an open \
          descriptor is, so what was opened cannot be checked against the sandbox; use `bash` instead",
     ))
+}
+
+/// The (device, inode) of whatever `path` names, links followed.
+pub fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// `path` with its deepest existing part resolved through links, then the rest as written.
+fn resolve_deepest(path: &Path) -> (PathBuf, Option<PathBuf>) {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        if let Ok(base) = std::fs::canonicalize(&cur) {
+            let mut full = base.clone();
+            full.extend(tail.iter().rev());
+            return (full, Some(base));
+        }
+        match (cur.file_name().map(|n| n.to_os_string()), cur.parent().map(Path::to_path_buf)) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                cur = parent;
+            }
+            _ => return (path.to_path_buf(), None),
+        }
+    }
+}
+
+/// Whether `path` is the folder `protected` or lies inside it, by file identity (see the contract).
+pub fn is_or_inside(path: &Path, protected: &Path) -> bool {
+    let (full, existing) = resolve_deepest(path);
+    let (protected_full, _) = resolve_deepest(protected);
+    if full.starts_with(&protected_full) {
+        return true;
+    }
+    let (Some(base), Some(id)) = (existing, file_id(protected)) else { return false };
+    base.ancestors().any(|a| file_id(a) == Some(id))
+}
+
+/// A C integer of whatever width and sign as `u64` (0 when it is negative).
+fn num<T: TryInto<u64>>(v: T) -> u64 {
+    v.try_into().unwrap_or(0)
+}
+
+/// How an entry of a folder is, from `fstatat` without following links.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemKind {
+    Dir,
+    File,
+    Link,
+    Other,
+}
+
+/// One entry of [`list_dir_judged`].
+#[derive(Clone, Debug)]
+pub struct DirItem {
+    pub name: std::ffi::OsString,
+    pub kind: ItemKind,
+    pub size: u64,
+    pub mtime_ms: u64,
+    pub dev: u64,
+    pub ino: u64,
+    /// For a link: whether it leads to a folder (examined through the same descriptor).
+    pub link_to_dir: bool,
+    /// Why the entry could not be examined.
+    pub error: Option<String>,
+}
+
+/// List the folder at `path` through one open descriptor, once `readable` accepts its real path (see the
+/// contract). Returns the real path of the descriptor and every entry except `.` and `..`, in no order.
+pub fn list_dir_judged(path: &Path, readable: Readable<'_>) -> Result<(PathBuf, Vec<DirItem>), NotOpened> {
+    use std::ffi::{CStr, CString};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| NotOpened::Io(io::Error::new(io::ErrorKind::InvalidInput, "the path contains a NUL")))?;
+    // SAFETY: `c` is a NUL-terminated string that outlives the call.
+    let raw =
+        unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if raw < 0 {
+        return Err(NotOpened::Io(io::Error::last_os_error()));
+    }
+    // SAFETY: `raw` is a descriptor that was just opened and is owned by nothing else.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let real = real_path(fd.as_fd()).map_err(NotOpened::Io)?;
+    readable(&real).map_err(NotOpened::Denied)?;
+    // SAFETY: `fd` is a valid open descriptor; F_DUPFD_CLOEXEC returns a new one or -1.
+    let dup = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&fd), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return Err(NotOpened::Io(io::Error::last_os_error()));
+    }
+    // SAFETY: `dup` is a descriptor of a directory that we own; fdopendir takes it over (closed by closedir),
+    // and on failure it is still ours to close.
+    let dirp = unsafe { libc::fdopendir(dup) };
+    if dirp.is_null() {
+        let e = io::Error::last_os_error();
+        // SAFETY: fdopendir failed, so `dup` is still open and ours.
+        unsafe { libc::close(dup) };
+        return Err(NotOpened::Io(e));
+    }
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        // SAFETY: `dirp` is an open directory stream, used by this thread only.
+        let ent = unsafe { libc::readdir(dirp) };
+        if ent.is_null() {
+            break;
+        }
+        // SAFETY: readdir returned a valid entry whose d_name is NUL-terminated; it is copied before the next call.
+        let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes().to_vec();
+        if name != b"." && name != b".." {
+            names.push(std::ffi::OsString::from_vec(name));
+        }
+    }
+    // SAFETY: `dirp` came from fdopendir and is closed once.
+    unsafe { libc::closedir(dirp) };
+    let dirfd = std::os::fd::AsRawFd::as_raw_fd(&fd);
+    let mut items = Vec::with_capacity(names.len());
+    for name in names {
+        let blank = |error: String| DirItem {
+            name: name.clone(),
+            kind: ItemKind::Other,
+            size: 0,
+            mtime_ms: 0,
+            dev: 0,
+            ino: 0,
+            link_to_dir: false,
+            error: Some(error),
+        };
+        let Ok(cname) = CString::new(name.as_bytes()) else {
+            items.push(blank("the name contains a NUL".to_string()));
+            continue;
+        };
+        // SAFETY: an all-zero `stat` is a valid value that fstatat then fills.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `dirfd` is open, `cname` is NUL-terminated and `st` is a writable `stat`.
+        let rc = unsafe { libc::fstatat(dirfd, cname.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+        if rc != 0 {
+            items.push(blank(io::Error::last_os_error().to_string()));
+            continue;
+        }
+        let kind = match st.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => ItemKind::Dir,
+            libc::S_IFREG => ItemKind::File,
+            libc::S_IFLNK => ItemKind::Link,
+            _ => ItemKind::Other,
+        };
+        let link_to_dir = kind == ItemKind::Link && {
+            // SAFETY: as above; flags 0 follows the link.
+            let mut tst: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::fstatat(dirfd, cname.as_ptr(), &mut tst, 0) };
+            rc == 0 && tst.st_mode & libc::S_IFMT == libc::S_IFDIR
+        };
+        let secs = num(st.st_mtime);
+        let nanos = num(st.st_mtime_nsec);
+        items.push(DirItem {
+            name: name.clone(),
+            kind,
+            size: num(st.st_size),
+            mtime_ms: secs.saturating_mul(1000).saturating_add(nanos / 1_000_000),
+            dev: num(st.st_dev),
+            ino: num(st.st_ino),
+            link_to_dir,
+            error: None,
+        });
+    }
+    Ok((real, items))
 }
 
 /// What a file that is not a regular file is, for a sentence ("a FIFO (named pipe)").
@@ -491,5 +682,72 @@ mod tests {
         for h in handles {
             assert_eq!(h.join().unwrap(), Freshness::Current);
         }
+    }
+    #[test]
+    fn is_or_inside_judges_identity_not_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        std::os::unix::fs::symlink(&home, base.join("alias")).unwrap();
+        assert!(is_or_inside(&home, &home));
+        assert!(is_or_inside(&home.join("sessions"), &home));
+        assert!(is_or_inside(&home.join("not/yet/made"), &home));
+        assert!(is_or_inside(&base.join("alias/sessions"), &home), "a link spells the same folder");
+        assert!(is_or_inside(&base.join("alias/new"), &home));
+        assert!(!is_or_inside(&base.join("other/x"), &home));
+        assert!(!is_or_inside(&base, &home), "a folder that holds the home is not inside it");
+        // The same folder under a second spelling that the path text does not show (macOS data volume).
+        #[cfg(target_os = "macos")]
+        {
+            let data = Path::new("/System/Volumes/Data").join(home.strip_prefix("/").unwrap());
+            if data.exists() {
+                assert!(is_or_inside(&data, &home), "{}", data.display());
+                assert!(is_or_inside(&data.join("made-by-create"), &home));
+            }
+        }
+    }
+
+    #[test]
+    fn list_dir_judged_reads_one_descriptor_and_judges_its_real_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let d = base.join("d");
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("f.txt"), "hello").unwrap();
+        std::os::unix::fs::symlink(d.join("sub"), d.join("to-dir")).unwrap();
+        std::os::unix::fs::symlink(d.join("f.txt"), d.join("to-file")).unwrap();
+        std::os::unix::fs::symlink(d.join("missing"), d.join("dangling")).unwrap();
+        let (real, mut items) = list_dir_judged(&d, &|_| Ok(())).unwrap();
+        assert_eq!(real, d);
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+        let got: Vec<(String, ItemKind, bool)> =
+            items.iter().map(|i| (i.name.to_string_lossy().into_owned(), i.kind, i.link_to_dir)).collect();
+        assert_eq!(
+            got,
+            [
+                ("dangling".to_string(), ItemKind::Link, false),
+                ("f.txt".to_string(), ItemKind::File, false),
+                ("sub".to_string(), ItemKind::Dir, false),
+                ("to-dir".to_string(), ItemKind::Link, true),
+                ("to-file".to_string(), ItemKind::Link, false),
+            ]
+        );
+        let f = items.iter().find(|i| i.name == "f.txt").unwrap();
+        assert!(f.size == 5 && f.mtime_ms > 0 && f.ino > 0 && f.error.is_none());
+        // The last component is not followed: a link to a folder is refused, a file is not a folder.
+        assert!(matches!(list_dir_judged(&d.join("to-dir"), &|_| Ok(())), Err(NotOpened::Io(_))));
+        assert!(matches!(list_dir_judged(&d.join("f.txt"), &|_| Ok(())), Err(NotOpened::Io(_))));
+        // The judge sees the real path, and its refusal means nothing is listed.
+        let refuse = |p: &Path| -> Result<(), String> { Err(format!("no {}", p.display())) };
+        match list_dir_judged(&d, &refuse) {
+            Err(NotOpened::Denied(s)) => assert!(s.contains(d.to_str().unwrap()), "{s}"),
+            other => panic!("{other:?}"),
+        }
+        // A link in the middle of the path is followed and judged by what it leads to.
+        std::os::unix::fs::symlink(&d, base.join("mid")).unwrap();
+        let (real, _) = list_dir_judged(&base.join("mid/sub"), &|_| Ok(())).unwrap();
+        assert_eq!(real, d.join("sub"));
     }
 }

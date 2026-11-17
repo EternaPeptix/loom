@@ -59,7 +59,8 @@ shows the model and window written in the config; after that, the model id the s
 window it reported.
 
 The daemon reads the config file only when it starts, so write and edit the config before `loom up`,
-and run `loom down` then `loom up` after changing it. `loom up` starts the program it was run from,
+and run `loom down` then `loom up` after changing it — except `[models]` and `default_model`, which
+`loom models reload` applies without a restart. `loom up` starts the program it was run from,
 so keep the binary where it is while the daemon runs. If the server cannot be reached when a session
 is created and the profile sets no `context_window`, creation is refused with a sentence naming the
 URL; set `context_window` or start the server.
@@ -174,6 +175,11 @@ loom window <session>                     what is in the model's context right n
 loom net <session>                        every network request and how it was decided
 loom open                                 open the web UI in a browser
 loom gc [--apply]                         delete stored outputs nothing refers to (dry run unless --apply)
+loom models list                          the model profiles in use and whether each server answers
+loom models reload                        read [models] from the config again — no restart
+loom models set <session> <profile>       switch a session to another model from its next step — no restart
+loom models show <session>                a mission's models: the lead's, each agent role's, the agents running
+loom models role <session> <role> <profile>  start the mission's agents of a role (or `all`) on a profile
 ```
 
 A `<session>` is an id, the beginning of one, or `last`. `docs/RUN.md` lists every command and option.
@@ -203,8 +209,10 @@ daemon's token; `docs/RUN.md` has the recipe.
 
 ## Seeing it: the web UI and the desktop app
 
-The daemon serves a web UI at `/` (three columns: missions, the live transcript, and the mission
-state: ledger, context window with each item's standing, inbox, network decisions). It is static,
+The daemon serves a web UI at `/` (missions grouped by workspace on the left; in the middle a header
+that names the model and session running it, the chat of the live record with its tool calls folded
+into work groups, and a composer with a model seat to switch the session's model; on the right an
+inspector with the ledger, context window with each item's standing, inbox, network decisions). It is static,
 strict-CSP, has no build step, and updates live over SSE. Run `loom open` to open it: the command asks
 the daemon for a one-time login code and opens the page with it. The page needs no cookie; it keeps
 a secret in the tab's session storage and asks you to run `loom open` again when that is gone.

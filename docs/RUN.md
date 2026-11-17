@@ -39,12 +39,13 @@ node --test ui/core.test.js
 ## Configure
 
 The configuration is `~/.loom/config.toml` (`LOOM_HOME` moves the whole `~/.loom` directory). The
-daemon reads it only when it starts: configure first, then start, and restart after any change.
+daemon reads it only when it starts: configure first, then start, and restart after any change —
+except `[models]` and `default_model`, which `loom models reload` applies to the running daemon.
 
 ```
 loom config init       # writes a starting file; refuses to overwrite an existing one
 loom config path       # prints the path
-loom config check      # loads the file and checks it: prints "ok", or the error and exits 1
+loom config check      # loads and checks it, with the daemon's start-up checks: "ok: <path>", or the error and exit 1
 ```
 
 Edit `base_url` (the server's `/v1` URL) and `model` in the `[models.<name>]` table. If the server
@@ -64,6 +65,7 @@ default. Unknown keys are errors, so a typo does not go unnoticed. The values th
   with both at 300 the notice matters only for a longer window or `retry_window_s = 0`.
 - `[context] target_tokens` and `floor_tokens`: a re-weave folds old output out of view when the prompt
   passes the target, down to the floor. A session clamps both to a smaller model window automatically.
+- An API key, when the server wants one: see *Model API keys* below.
 - `[network] mode`: `deny_all` (the default), `allowlist` or `open`; see below.
 - `[sandbox] protect_credentials` (default `true`): see below.
 - `[tools] speculate` (default `true`): the leading read-only calls of a reply (`read`, `glob`, `grep`,
@@ -72,6 +74,50 @@ default. Unknown keys are errors, so a typo does not go unnoticed. The values th
   whole reply has arrived.
 - `reasoning_effort` and the other `extra_body` fields are fixed for a session's life (the chat
   template may render them into the prompt head, so changing them mid-session would break the cache).
+
+### Model API keys
+
+Keep a hosted model's key in a file under the loom home, which commands cannot read:
+
+```
+mkdir -p -m 700 ~/.loom/keys/models
+(umask 077; cat > ~/.loom/keys/models/hosted)   # paste the key, press Return, then Ctrl-D
+```
+
+and name the file (not a path) in the profile:
+
+```
+[models.hosted]
+base_url = "https://api.example.test/v1"
+model = "some-model"
+api_key_file = "hosted"
+```
+
+The file must be yours, a regular file (not a link) and mode 0600; white space around the key is
+ignored. The daemon reads it once when it starts, and refuses to start, naming the profile and the file,
+when it cannot use it. `loom config check` reads it too.
+
+`api_key_env = "VAR"` (the key in the variable `VAR` of the daemon's environment) still works, but every
+process of yours, sandboxed commands included, can read the environment a process was started with, so
+the key is readable by the commands the model runs. `loom up`, `loom config check` and the daemon's log
+warn about each such profile, and `loom service install` refuses it (a login service does not have your
+shell's variables). To move a key that is exported in your shell, for example from `~/.zshrc`:
+
+```
+mkdir -p -m 700 ~/.loom/keys/models
+(umask 077; printenv VAR > ~/.loom/keys/models/hosted)
+```
+
+then replace `api_key_env = "VAR"` with `api_key_file = "hosted"` in `[models.hosted]`, run
+`loom config check`, and restart the daemon (`loom down`, then `loom up`). Remove the export from your
+shell's start files once no profile names it.
+
+`loom up` starts the daemon with only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TZ`,
+`TMPDIR`, `LOOM_LOG`, `RUST_BACKTRACE`, the `api_key_env` variables of your profiles and the variables
+listed in `[sandbox] env_pass`, so the rest of your shell's environment (tokens, cloud credentials,
+proxy settings) does not reach the daemon or the commands it runs. List in `env_pass` a variable the
+commands need, such as `JAVA_HOME`. Model requests ignore `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and
+the system's proxy settings: they go to `base_url` only.
 
 ### Network
 
@@ -92,7 +138,17 @@ A session can also be given hosts by you while it runs. When it needs one it doe
 calls `request_scope`; an item naming the hosts and why waits in your inbox, and the session keeps
 working. `loom scope <session> <host>...` grants them (the UI and the app have an Approve button on the
 item). The grant is recorded in the mission's ledger, applies to that mission only, and ends with the
-session. `loom net <session>` lists the hosts granted so far.
+session. `loom net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
+granted hosts; the `allow` list stays off. `*`, a wildcard over a whole top-level domain (`*.com`) or
+over IP addresses (`*.0.1`), the unspecified address (`0.0.0.0`, `::`) and a loopback address without a
+port (`127.0.0.1`; write `127.0.0.1:8080`) cannot be requested or granted: name the hosts, or a wildcard
+under a domain (`*.example.test`), or set the mode in the config.
+
+Each session's commands reach the proxy on a port of that session's own, and the proxy accepts a
+session's credentials only on that port and never connects to its own ports, so a command that reads
+another session's proxy credentials (from the environment another command was started with) cannot use
+them. A session's port is never given to another session while the daemon runs.
+`loopback_all = true` lets commands connect to every port, these included: see `SECURITY.md`.
 
 ### Sandbox
 
@@ -103,7 +159,13 @@ With `[sandbox] mode = "seatbelt"` (the default) commands run under a macOS sand
 - `~/.loom`, `<workspace>/.loom` and `protected_paths` are never writable, with one exception: the
   session's temp directory is `~/.loom/sessions/<id>/tmp`, and everything inside it is writable (the
   directory entry itself cannot be removed, renamed or replaced);
-- the loom token and keys and `unreadable_paths` are neither readable nor writable;
+- the whole loom home (`~/.loom`: logs, records, stored outputs, missions, configuration, packs, token and keys) is
+  not readable by commands (and not by the file tools, in every mode), except the session's temp directory and
+  the harness's `analysis` staging directory (a replay: its staged workspace and temp instead); the home and the
+  directories down to the temp dir can be looked up (`stat`, `cd`) but not listed, and the names under the home
+  are hidden. A command's own output file is in `~/.loom/sessions/<id>/jobs`: its metadata can be read, nothing
+  else, so output works but cannot be read back from a command. A workspace inside `~/.loom` is refused at
+  start. `unreadable_paths` are neither readable nor writable;
 - no network except the egress proxy (plus `loopback_ports`, `loopback_all`, `unix_sockets`);
 - no LaunchServices opens, Apple Events or launchd jobs.
 
@@ -144,9 +206,10 @@ listed directory that is or contains the workspace is skipped. This needs a home
 
 Several of these are whole directories, so what else they hold is off limits too: commands cannot load
 models from the Hugging Face cache in `~/.cache/huggingface/hub` (set `HF_HUB_CACHE` to a directory
-elsewhere; moving `HF_HOME` moves the token out of protection too), run `flyctl` from `~/.fly/bin` or
-`pulumi` from `~/.pulumi/bin` (install them elsewhere), or use Terraform's plugin cache in
-`~/.terraform.d`. The only switch is `protect_credentials = false`, which lifts the protection of every
+elsewhere; moving `HF_HOME` moves the token out of protection too), or use Terraform's plugin cache in
+`~/.terraform.d`. (`~/.fly` and `~/.pulumi` are protected as their credential files only,
+`~/.fly/config.yml` and `~/.pulumi/credentials.json`, so `flyctl` and `pulumi` can run from their `bin`
+directories, which installers put on `PATH`: a hidden name on `PATH` makes Node stop its search with EPERM.) The only switch is `protect_credentials = false`, which lifts the protection of every
 store.
 
 Environment variables whose names look like secrets (in any case: containing `KEY`, `TOKEN`, `SECRET`,
@@ -248,10 +311,33 @@ loom run -w /path/to/workspace "the task, in plain words"
 ```
 
 `run` starts a lead session whose workspace is the `-w` / `--workspace` directory (without it, the
-current directory) and follows its record on the terminal. Everything after the options is the task;
+current directory; `~` and `~/x` mean your home directory). A workspace that does not exist is refused
+with a sentence saying so; add `--create-workspace` to make it (and the folders above it that are missing),
+and `run` prints `created workspace <path>` before the session id. A path inside the loom home or a relative
+path that does not exist is refused either way and follows its record on the terminal. Everything after the options is the task;
 `-` or no words reads it from standard input. The lead owns a mission ledger (goal, constraints,
 plan, claims with evidence), may delegate to workers and have a verifier attack its `finish`, and
 stops only through a terminating tool. Ctrl-C stops following, not the session.
+
+A mission that goes back to a target an earlier mission worked on can start from what that mission
+recorded: `--prior <mission>` (repeat it, at most 8) names earlier missions for this one to recall. A
+mission is its id (`m-…`) or any session of it, written as elsewhere (an id, the beginning of one, or
+`last`; `loom ls` lists them).
+
+```
+loom run -w /path/to/workspace --prior m-0abc… "the task"
+```
+
+Before its first model request the new lead gets one note with, per named mission, its title and when its
+ledger was last written; the goal, rules and answers you gave it (marked as your words from an earlier
+mission); its goal status; where its work stood when it ended (claims, plan, dead ends — marked as written
+by the model there and not verified); and its security record as counts and asset locators (no hypotheses,
+no credentials, no identities by name, no query strings in a locator). Your own words are shown exactly as you
+wrote them; what the model wrote is shown with URL queries, fragments and passwords removed, but may still hold
+whatever else the model wrote there. The source is each mission's sealed ledger; a ledger that fails
+verification or was written by a newer loom is named as unreadable and nothing from it is shown. Nothing
+else carries over: the earlier mission's stored outputs cannot be opened from the new one, and its
+approvals and network grants do not apply.
 
 Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are needed (`Asked`,
 `Blocked`, `Parked`: the inbox item was printed); 1 after `Stopped`, `BudgetExhausted` or an error.
@@ -271,6 +357,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom stop <session>` / `resume <session>` | stop the turn, its jobs and agents / let a stopped session carry on |
 | `loom reweave <session>` | fold old tool output out of the context now |
 | `loom archive <session> [--undo]` | hide a finished session; archiving settles the mission's agents |
+| `loom rename <session> <title...>` | rename a mission (its lead's title) |
 | `loom rule <session> <text...>` | set a standing rule (a ledger constraint) for the mission |
 | `loom rule <session> --withdraw <rule-id> [--reason <text>]` | withdraw a rule |
 | `loom approve <session> <text...> [--scope <text>]` | record an approval |
@@ -284,10 +371,20 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom out <handle> [--lines a:b]` | print a stored tool output |
 | `loom gc [--apply]` | delete stored outputs that nothing refers to |
 | `loom config path` / `check` / `init` | the configuration file |
+| `loom models list` | the model profiles in use (the default marked), each server ✓/✗ |
+| `loom models reload` | read `[models]` and `default_model` from the config again and use them now, without a restart; sessions on a changed profile move to its new settings |
+| `loom models set <session> <profile>` | switch a session (lead or agent) to another model profile from its next step, without a restart; logged as `model_switched` |
+| `loom models show <session>` | a mission's models: the lead's, the choice for each role of its agents (or what the pack picks), the agents running and their models |
+| `loom models role <session> <role> <profile> [--now]` | start the mission's new agents of `role` (`all`: every role without a choice of its own, not the finish gate's verifier) on `profile`; `--now` also moves its running agents of that role (not forked ones) |
+| `loom models role <session> <role> --clear` | drop that choice: the pack picks again for agents started later |
 | `loom service install` / `uninstall` / `status` | the macOS login service |
 
-Options of `run` and `chat`: `-w/--workspace`, `--pack`, `--role`, `-m/--model` (a profile name),
-`-t/--title`, `--attended` (do not resume by itself after a restart), `--max-steps`, `--max-minutes`;
+Options of `run` and `chat`: `-w/--workspace`, `--create-workspace`, `--pack`, `--role`, `-m/--model` (a profile name),
+`--agent-model ROLE=PROFILE` (repeatable; `all=PROFILE` for every role: the mission's agents start on
+it from the first one, as `loom models role` sets later),
+`-t/--title`, `--attended` (do not resume by itself after a restart), `--max-steps`, `--max-minutes`,
+`--prior <mission>` (repeatable: earlier missions to recall; not with `chat --session`, which continues a
+mission that has already started);
 and for display `--reasoning`, `--full`, `-v`. A `<session>` is an id, the beginning of one, or `last`.
 `-` as the text reads standard input.
 
@@ -412,7 +509,7 @@ and `--undo` does not bring them back. Nothing else deletes them.
 
 ## First run checklist
 
-1. `loom config check` prints `ok`, then `loom up`, then `loom status` shows ✓ beside your server's
+1. `loom config check` prints `ok: <path>`, then `loom up`, then `loom status` shows ✓ beside your server's
    URL (it answered a request for its models).
 2. `loom run -w <a tiny workspace> "how many .rs files are here and how many lines in total?"` (or a
    question about your own files). Confirm: the lead calls `bash`, the result carries the

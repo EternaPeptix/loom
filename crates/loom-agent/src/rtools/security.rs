@@ -1,17 +1,70 @@
 //! Typed mission security state tools.
 //!
-//! CONTRACT. `security_record { operation }` parses a deny-unknown-fields `SecurityOp`, resolves
-//! security-ID prefixes/aliases, checks actual session capabilities, then appends one sealed op.
-//! The lead opens/prioritizes hypotheses. Only an independent child with `read_only` and `verdict`
+//! CONTRACT. `security_record { operation }` reads `operation` with `shapes::read` (near misses read
+//! where unambiguous, each with a note; early role refusals; exact-shape guidance on a refusal), then
+//! resolves security-ID prefixes/aliases, checks actual session capabilities, then appends one sealed
+//! op. The lead opens/prioritizes hypotheses. Only an independent child with `read_only` and `verdict`
 //! may close one, and only its original lead may reprioritize it. The core checks all evidence and
 //! coverage invariants under the journal lock. Batches have the same authorization as individual ops.
+//! A credential's `secret_handle` is opened with `loom_tools::outputs::open` (only an output of the
+//! session's mission): any failure is ``Use an existing stored out: handle for the credential secret; no
+//! secret material was recorded.``, whether the handle names nothing or another mission's output, and the
+//! recorded handle is `out:{full id}`.
+//! A batch element that fails ID resolution, secret-handle resolution or authorization is refused with
+//! "Operation {i} of {n} in the batch ({action}): {error}", as the core names one that fails validation.
+//! The asset in a `cred` or `auth` condition (`blocked_on`, `condition_unlock`, a credential's or
+//! foothold's `unlocks`) is resolved from an alias or prefix to the full asset ID, because routes are
+//! revisited by exact match; a value that is not an ID or alias is kept, and one that starts with `as-`
+//! and matches nothing is refused.
+//!
+//! The caller passed to `shapes` is built from the session: `Standing::Lead` when it has no parent,
+//! `Standing::Judge` when it is a child whose role is `read_only` and has the `verdict` tool,
+//! `Standing::Child` otherwise; `tools` is the role's tool list. The tool description is
+//! `shapes::description` of that caller. On success the result is the JSON object
+//! `{"entry": n, "normalized": [notes…], "recorded": {…}, "removed": {…}, "counts": {…}, "more": "…"}`,
+//! with `normalized` present only when a note was made. It names what this write changed, never the
+//! whole state (after a scanner import that ran to tens of thousands of tokens at every write):
+//! - *touched*: for each id-keyed collection of `SecurityState` (`assets`, `credentials`,
+//!   `footholds`, `condition_evidence`, `blocked`, `revisited`, `crashes`, `vector_attempts`,
+//!   `hypotheses`, `relations`, `facts`, `rules`, `aliases`), the keys whose value differs between the
+//!   state read before the append and the state the append returned, new keys included; of
+//!   `unlocked`, the conditions added; and `died` and `retraction_limitation` when they differ (a
+//!   retraction's conclusions that no longer hold). A write by another session between the two reads
+//!   shows up too.
+//! - *addressed*: the ids the operation names or creates whatever the state held: the keys of every
+//!   collection of a `SecurityState::default()` to which the (resolved) operation was applied, kept when
+//!   the state after the append has them. An addressed id that was not touched is listed under
+//!   `unchanged` (`{collection: [ids]}`), so a repeated write (an asset already known under its
+//!   canonical locator, a hypothesis already open) still names its id; `unchanged` is omitted when empty.
+//! - `recorded`: `{collection: {id: record}}` of the touched entries (`unlocked`: the list of added
+//!   conditions; `died`: the list; `retraction_limitation`: the text), each in full, when their JSON
+//!   together, pretty-printed as the result is, is at most `RECORDED_CHARS` (8 000) characters;
+//!   otherwise `{collection: {"count": k, "ids": [first 20 ids, each cut to 80 characters]}}` for each
+//!   collection touched (`unlocked` and `died`: the count only). Collections with nothing touched are
+//!   left out.
+//! - `removed`: `{collection: [ids]}` of keys present before and gone after; omitted when empty.
+//! - `counts`: `{collection: number of entries}` after the write, for each non-empty collection.
+//! - `more`: `The rest of the security state is unchanged by this write; read it with security_query
+//!   (view: state, assets, coverage, revisit, hypotheses or facts).`
+//!
+//! Tests: a single upsert returns that asset in full and the counts, not the other assets; a batch
+//! over the size bound returns counts and ids, and stays near the bound with long keys and many
+//! conditions; a repeated hypothesis_open and an upsert of a known asset under another spelling name
+//! the id under `unchanged`; a fact retraction reports `died`; a hypothesis_open returns the new hypothesis id; a
+//! retraction returns the fact it deactivated (a retraction keeps the record, so `removed` stays empty; it
+//! lists ids a write deletes, tested on the report itself).
+//!
+//! When the read operation was expanded by N4d (a single hypothesis_open carrying evidence) and
+//! the append fails, the error gets the sentence " The evidence given with hypothesis_open was being
+//! attached by a second operation in the same atomic append; nothing was recorded." appended.
 //!
 //! `security_query` returns JSON for state/assets/coverage/revisit/hypotheses/facts/why/what_if/
 //! resolve/path_suggest. Hypothetical changes never write. Rule evaluation reports its bounds and
 //! incomplete closures. Path suggestions are bounded heuristics, not confirmed attack paths.
 //!
 //! `security_ingest` reads an existing observed blob (<=2 MiB, <=500 discovered assets), not model
-//! text. It requires attested mission evidence referring to that exact blob, parses a documented
+//! text. Its `handle` is opened with `loom_tools::outputs::open` (a refusal is `Unopened::sentence`), then
+//! must pass `rtools::observed_producer`. It requires attested mission evidence referring to that exact blob, parses a documented
 //! scanner format, and appends one atomic batch of asset observations (quarantined lifecycle/token
 //! URLs and queryless static assets import with `mandatory = false`, ordered after application/API
 //! endpoints). Every candidate is parsed
@@ -20,12 +73,14 @@
 //! labels never become confirmed vulnerabilities or scope grants.
 
 mod scanners;
+mod shapes;
 
 use super::{observed_producer, Shared};
 use async_trait::async_trait;
 use loom_core::event::{ToolClass, ToolSpec};
 use loom_core::ledger::LedgerOp;
-use loom_core::security_state::{Fact, SecurityOp, SecurityState};
+use loom_core::security_state::{Condition, ConditionKind, Fact, SecurityOp, SecurityState};
+use loom_tools::outputs;
 use loom_tools::params::{opt, req, spec};
 use loom_tools::{Body, Tool, ToolCtx, ToolOutput};
 use serde::de::DeserializeOwned;
@@ -106,8 +161,17 @@ fn resolve_op(state: &SecurityState, op: &mut SecurityOp) -> Result<(), String> 
                 }
             }
         }
-        SecurityOp::CredentialAdd { credential } => resolve(&mut credential.asset)?,
-        SecurityOp::FootholdAdd { foothold } => resolve(&mut foothold.asset)?,
+        SecurityOp::CredentialAdd { credential } => {
+            resolve(&mut credential.asset)?;
+            resolve_conditions(state, &mut credential.unlocks)?;
+        }
+        SecurityOp::FootholdAdd { foothold } => {
+            resolve(&mut foothold.asset)?;
+            resolve_conditions(state, &mut foothold.unlocks)?;
+        }
+        SecurityOp::ConditionUnlock { conditions, .. } | SecurityOp::BlockedOn { conditions, .. } => {
+            resolve_conditions(state, conditions)?;
+        }
         SecurityOp::CoverageSet { asset, .. } => resolve(asset)?,
         SecurityOp::HypothesisPriority { id, .. }
         | SecurityOp::HypothesisEvidence { id, .. }
@@ -124,51 +188,289 @@ fn resolve_op(state: &SecurityState, op: &mut SecurityOp) -> Result<(), String> 
     Ok(())
 }
 
-fn resolve_secrets(ctx: &ToolCtx, op: &mut SecurityOp) -> Result<(), String> {
-    match op {
-        SecurityOp::CredentialAdd { credential } => {
-            let id = ctx.blobs.resolve(&credential.secret_handle).map_err(|_| {
-                "Use an existing stored out: handle for the credential secret; no secret material was recorded."
-                    .to_string()
-            })?;
-            credential.secret_handle = format!("out:{id}");
+/// A cred or auth condition's value is an asset ID, matched exactly when routes are revisited: an alias or
+/// prefix is resolved to the full ID. A value that is not an ID or alias is kept; one that looks like a
+/// mistyped asset ID (`as-…`) is refused.
+fn resolve_conditions(state: &SecurityState, conditions: &mut [Condition]) -> Result<(), String> {
+    for condition in conditions {
+        if !matches!(condition.kind, ConditionKind::Cred | ConditionKind::Auth) {
+            continue;
         }
-        SecurityOp::Batch { operations } => {
-            for op in operations {
-                resolve_secrets(ctx, op)?;
-            }
+        match state.resolve(&condition.value) {
+            Ok(id) if id.starts_with("as-") => condition.value = id,
+            Err(e) if condition.value.starts_with("as-") && condition.value.len() != 67 => return Err(e),
+            _ => {}
         }
-        _ => {}
     }
     Ok(())
+}
+
+const SECRET_HANDLE_REFUSAL: &str =
+    "Use an existing stored out: handle for the credential secret; no secret material was recorded.";
+
+/// Open every credential `secret_handle` of `op` (an output of this mission) and record it as `out:{full id}`.
+fn resolve_secrets<'a>(
+    ctx: &'a ToolCtx,
+    op: &'a mut SecurityOp,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(async move {
+        match op {
+            SecurityOp::CredentialAdd { credential } => {
+                let id = outputs::open(ctx, &credential.secret_handle)
+                    .await
+                    .map_err(|_| SECRET_HANDLE_REFUSAL.to_string())?;
+                credential.secret_handle = format!("out:{id}");
+            }
+            SecurityOp::Batch { operations } => {
+                for op in operations {
+                    resolve_secrets(ctx, op).await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })
 }
 
 #[async_trait]
 impl Tool for SecurityRecord {
     fn spec(&self) -> ToolSpec {
-        spec("security_record", "Record typed evidence-linked security observations. operation.action is asset_upsert, credential_add (secret_handle only), foothold_add, condition_unlock, blocked_on, coverage_set, crash_record, hypothesis_open, hypothesis_priority, hypothesis_evidence, hypothesis_verdict, relation_add, fact_assert, fact_retract, rule_install, rule_retract, alias_add, or batch. Use security_query to inspect exact IDs. Assets: {action:asset_upsert,asset:{kind:host|service|endpoint|file|identity,locator:string,evidence:[e1],mandatory:true,parent?:assetID}}. Coverage: {action:coverage_set,asset:ID,disposition:{status:tested,evidence:[e1]}}, or {status:deferred,reason:string}. Facts: {action:fact_assert,fact:{predicate:string,args:[string]},evidence:[e1]}. Rules: {action:rule_install,rule:{name:string,head:{predicate:string,args:[?x]},body:[{atom:{predicate:string,args:[?x]},negated:false}]}}. Every evidence ID must already exist and be attested. These observations never authorize network access.", ToolClass::State,
-            &[req("operation", "object", "A SecurityOp object with action and its typed fields.")])
+        let caller = shapes::Caller { standing: standing(&self.0), tools: &self.0.role.tools };
+        spec(
+            "security_record",
+            &shapes::description(&caller),
+            ToolClass::State,
+            &[req("operation", "object", "A SecurityOp object with action and its typed fields.")],
+        )
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
-        let mut op: SecurityOp = match decode(args.get("operation"), "operation") {
-            Ok(op) => op,
-            Err(e) => return ToolOutput::error(e),
-        };
         let state = match self.0.ledger() {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(e),
         };
-        if let Err(e) = resolve_op(&state.security, &mut op)
-            .and_then(|_| resolve_secrets(ctx, &mut op))
-            .and_then(|_| authorize(&self.0, &state.security, &op))
-        {
+        let before = state.security.clone();
+        let caller = shapes::Caller { standing: standing(&self.0), tools: &self.0.role.tools };
+        let operation = args.get("operation").unwrap_or(&Value::Null);
+        let read = match shapes::read(&caller, &state.security, operation) {
+            Ok(read) => read,
+            Err(e) => return ToolOutput::error(e),
+        };
+        // A single hypothesis_open that carried evidence was read as a two-operation batch (N4d).
+        let expanded = matches!(read.op, SecurityOp::Batch { .. })
+            && operation.get("action").and_then(Value::as_str) != Some("batch");
+        let notes = read.notes;
+        let mut op = read.op;
+        let prepare = |op: &mut SecurityOp| resolve_op(&state.security, op);
+        let authorized = |op: &SecurityOp| authorize(&self.0, &state.security, op);
+        // A batch element that fails is named, the way the core names one that fails validation.
+        let prepared = match &mut op {
+            SecurityOp::Batch { operations } => {
+                let n = operations.len();
+                let mut result = Ok(());
+                for (i, element) in operations.iter_mut().enumerate() {
+                    let step = match prepare(element) {
+                        Ok(()) => match resolve_secrets(ctx, element).await {
+                            Ok(()) => authorized(element),
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = step {
+                        result = Err(format!(
+                            "Operation {} of {n} in the batch ({}): {e}",
+                            i.saturating_add(1),
+                            element.action()
+                        ));
+                        break;
+                    }
+                }
+                result
+            }
+            single => match prepare(single) {
+                Ok(()) => match resolve_secrets(ctx, single).await {
+                    Ok(()) => authorized(single),
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            },
+        };
+        if let Err(e) = prepared {
             return ToolOutput::error(e);
         }
         // Shared::ledger_append serializes all structural validation and writes under the journal lock.
+        let applied = op.clone();
         match self.0.ledger_append(false, LedgerOp::Security(op)) {
-            Ok((entry, state)) => output(&json!({"entry":entry.n,"state":state.security})),
+            Ok((entry, state)) => {
+                // The ids the operation names or creates, whatever the state held.
+                let mut addressed = SecurityState::default();
+                addressed.apply(&applied, entry.n, &entry.session);
+                let mut result = Map::new();
+                result.insert("entry".into(), json!(entry.n));
+                if !notes.is_empty() {
+                    result.insert("normalized".into(), json!(notes));
+                }
+                result.extend(touched_report(&before, &state.security, &addressed));
+                output(&result)
+            }
+            Err(e) if expanded => ToolOutput::error(format!(
+                "{e} The evidence given with hypothesis_open was being attached by a second operation in the same \
+                 atomic append; nothing was recorded."
+            )),
             Err(e) => ToolOutput::error(e),
         }
+    }
+}
+
+/// The most characters of full records `security_record` returns; past it, counts and the first ids.
+const RECORDED_CHARS: usize = 8_000;
+/// Ids named per collection when the touched records are too many to return in full.
+const RECORDED_IDS: usize = 20;
+/// The id-keyed collections of `SecurityState` whose touched entries a write reports.
+const KEYED: [&str; 13] = [
+    "assets",
+    "credentials",
+    "footholds",
+    "condition_evidence",
+    "blocked",
+    "revisited",
+    "crashes",
+    "vector_attempts",
+    "hypotheses",
+    "relations",
+    "facts",
+    "rules",
+    "aliases",
+];
+
+/// The longest id, in characters, the counts-and-ids form names.
+const RECORDED_ID_CHARS: usize = 80;
+
+/// `s` cut to at most `max` characters, on a character boundary.
+fn cut_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// Characters of `recorded` as the result prints it (pretty JSON).
+fn pretty_chars(recorded: &Map<String, Value>) -> usize {
+    serde_json::to_string_pretty(recorded).map(|t| t.chars().count()).unwrap_or(usize::MAX)
+}
+
+/// What a write changed, as the result fields `recorded`, `unchanged`, `removed`, `counts` and `more` (see
+/// CONTRACT): per collection the keys whose value differs between `before` and `after`, the addressed ids
+/// (`addressed` is a default state the operation was applied to) that the write left as they were, the ids
+/// that are gone, and the size of each non-empty collection after the write.
+fn touched_report(before: &SecurityState, after: &SecurityState, addressed: &SecurityState) -> Map<String, Value> {
+    let (before, after) = (json!(before), json!(after));
+    let empty = Map::new();
+    let mut touched: Map<String, Value> = Map::new();
+    let mut removed: Map<String, Value> = Map::new();
+    let mut counts: Map<String, Value> = Map::new();
+    let mut unchanged: Map<String, Value> = Map::new();
+    let addressed = json!(addressed);
+    for name in KEYED {
+        let old = before.get(name).and_then(Value::as_object).unwrap_or(&empty);
+        let new = after.get(name).and_then(Value::as_object).unwrap_or(&empty);
+        let changed: Map<String, Value> =
+            new.iter().filter(|(id, v)| old.get(*id) != Some(v)).map(|(id, v)| (id.clone(), v.clone())).collect();
+        if !changed.is_empty() {
+            touched.insert(name.into(), Value::Object(changed));
+        }
+        let gone: Vec<Value> = old.keys().filter(|id| !new.contains_key(*id)).map(|id| json!(id)).collect();
+        if !gone.is_empty() {
+            removed.insert(name.into(), Value::Array(gone));
+        }
+        if !new.is_empty() {
+            counts.insert(name.into(), json!(new.len()));
+        }
+        let same: Vec<Value> = addressed
+            .get(name)
+            .and_then(Value::as_object)
+            .map(|a| {
+                a.keys().filter(|id| new.contains_key(*id) && touched.get(name).is_none_or(|t| t.get(*id).is_none()))
+            })
+            .into_iter()
+            .flatten()
+            .map(|id| json!(id))
+            .collect();
+        if !same.is_empty() {
+            unchanged.insert(name.into(), Value::Array(same));
+        }
+    }
+    let old = before.get("unlocked").and_then(Value::as_array).cloned().unwrap_or_default();
+    let new = after.get("unlocked").and_then(Value::as_array).cloned().unwrap_or_default();
+    let added: Vec<Value> = new.iter().filter(|c| !old.contains(c)).cloned().collect();
+    if !added.is_empty() {
+        touched.insert("unlocked".into(), Value::Array(added));
+    }
+    if !new.is_empty() {
+        counts.insert("unlocked".into(), json!(new.len()));
+    }
+    for name in ["died", "retraction_limitation"] {
+        let new = after.get(name).filter(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()));
+        if let Some(new) = new.filter(|v| before.get(name) != Some(*v)) {
+            touched.insert(name.into(), new.clone());
+        }
+    }
+    let recorded: Map<String, Value> = if pretty_chars(&touched) <= RECORDED_CHARS {
+        touched
+    } else {
+        // Counts and ids; `unlocked`, `died` and the limitation text are named by count or a short cut.
+        let form = |with_ids: bool| -> Map<String, Value> {
+            touched
+                .iter()
+                .map(|(name, records)| {
+                    let count = match records {
+                        Value::Object(m) => m.len(),
+                        Value::Array(a) => a.len(),
+                        _ => 1,
+                    };
+                    let keyed = KEYED.contains(&name.as_str());
+                    let ids: Vec<Value> = match records {
+                        Value::Object(m) if with_ids && keyed => {
+                            m.keys().take(RECORDED_IDS).map(|id| json!(cut_chars(id, RECORDED_ID_CHARS))).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let entry =
+                        if keyed && with_ids { json!({"count": count, "ids": ids}) } else { json!({"count": count}) };
+                    (name.clone(), entry)
+                })
+                .collect()
+        };
+        let full = form(true);
+        if pretty_chars(&full) <= RECORDED_CHARS {
+            full
+        } else {
+            form(false)
+        }
+    };
+    let mut report = Map::new();
+    report.insert("recorded".into(), Value::Object(recorded));
+    if !unchanged.is_empty() {
+        report.insert("unchanged".into(), Value::Object(unchanged));
+    }
+    if !removed.is_empty() {
+        report.insert("removed".into(), Value::Object(removed));
+    }
+    report.insert("counts".into(), Value::Object(counts));
+    report.insert(
+        "more".into(),
+        json!(
+            "The rest of the security state is unchanged by this write; read it with security_query (view: state, \
+             assets, coverage, revisit, hypotheses or facts)."
+        ),
+    );
+    report
+}
+
+/// The session's standing for hypotheses: the lead, a read-only child with the verdict tool, or another child.
+fn standing(shared: &Shared) -> shapes::Standing {
+    if !shared.is_child() {
+        shapes::Standing::Lead
+    } else if shared.role.read_only && shared.role.tools.iter().any(|t| t == "verdict") {
+        shapes::Standing::Judge
+    } else {
+        shapes::Standing::Child
     }
 }
 
@@ -276,9 +578,9 @@ impl Tool for SecurityIngest {
             return ToolOutput::error(super::NO_MISSION);
         };
         let handle = args.get("handle").and_then(Value::as_str).unwrap_or("");
-        let blob = match ctx.blobs.resolve(handle) {
+        let blob = match outputs::open(ctx, handle).await {
             Ok(b) => b,
-            Err(e) => return ToolOutput::error(format!("Open a valid scanner output handle first: {e}.")),
+            Err(e) => return ToolOutput::error(e.sentence(handle)),
         };
         if let Err(e) = observed_producer(&self.0, mission, handle, &blob).await {
             return ToolOutput::error(e);
@@ -341,6 +643,11 @@ mod tests {
         role.tools.extend(["security_record".into(), "security_query".into(), "security_ingest".into()]);
         rig_with(role, child, mission, AgentsCfg::default())
     }
+    /// The JSON object a tool result carries after its header lines.
+    fn body_json(text: &str) -> Value {
+        let start = text.find("{\n").unwrap();
+        serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>().next().unwrap().unwrap()
+    }
     fn evidence(r: &Rig, handle: &str) {
         r.model_op(LedgerOp::ClaimAdd { text: "scanner output observed".into() });
         let blob = r.env.ctx.blobs.resolve(handle).unwrap();
@@ -355,7 +662,274 @@ mod tests {
             quote: None,
             note: "synthetic scanner fixture".into(),
             attested: true,
+            tool: None,
+            grade: None,
         }));
+    }
+
+    #[tokio::test]
+    async fn near_misses_are_read_and_listed_under_normalized() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        let host = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"asset_upsert","asset":{"kind":"host","locator":"127.0.0.1:19727",
+                    "evidence":["e1"]}}}),
+            )
+            .await;
+        assert_eq!(host.status, Status::Ok, "{}", host.text);
+        let body = body_json(&host.text);
+        assert_eq!(body["normalized"].as_array().map(Vec::len), Some(1), "{body}");
+        assert!(body["normalized"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("In the operation, the host was recorded as `127.0.0.1`"));
+        assert_eq!(r.shared.ledger().unwrap().security.assets.values().next().unwrap().locator, "127.0.0.1");
+        // An exact operation has no `normalized` key.
+        let exact = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"asset_upsert","asset":{"kind":"host","locator":"10.0.0.5",
+                    "evidence":["e1"]}}}),
+            )
+            .await;
+        assert_eq!(exact.status, Status::Ok, "{}", exact.text);
+        assert!(body_json(&exact.text).get("normalized").is_none());
+        // A hypothesis opened with evidence is two operations in one append.
+        let open = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"hypothesis_open","hypothesis":{"statement":"candidate","priority":"high",
+                    "evidence":["e1"]}}}),
+            )
+            .await;
+        assert_eq!(open.status, Status::Ok, "{}", open.text);
+        let id = stable_id("hy", &["candidate"]);
+        let state = r.shared.ledger().unwrap().security;
+        assert_eq!(state.hypotheses.get(&id).map(|h| (h.priority, h.evidence.clone())), Some((5, vec!["e1".into()])));
+        // When the second operation fails the whole append fails and the error says so.
+        let failed = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"hypothesis_open","text":"other","priority":2,"evidence":["e404"]}}),
+            )
+            .await;
+        assert_eq!(failed.status, Status::Error);
+        assert!(failed.text.contains("e404"), "{}", failed.text);
+        assert!(
+            failed.text.contains(
+                " The evidence given with hypothesis_open was being attached by a second operation in the same atomic \
+             append; nothing was recorded."
+            ),
+            "{}",
+            failed.text
+        );
+        assert!(!r.shared.ledger().unwrap().security.hypotheses.contains_key(&stable_id("hy", &["other"])));
+        // A failing batch element is named.
+        let batch = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"batch","ops":[
+                    {"action":"asset_upsert","asset":{"kind":"host","locator":"10.0.0.9","evidence":["e1"]}},
+                    {"action":"asset_upsert","asset":{"kind":"host","locator":"10.0.0.10","evidence":["e404"]}}]}}),
+            )
+            .await;
+        assert_eq!(batch.status, Status::Error);
+        assert!(batch.text.contains("Operation 2 of 2 in the batch (asset_upsert): "), "{}", batch.text);
+        assert!(r.shared.ledger().unwrap().security.assets.len() == 2);
+    }
+
+    fn upsert(locator: &str) -> Value {
+        json!({"action":"asset_upsert","asset":{"kind":"host","locator":locator,"evidence":["e1"]}})
+    }
+
+    #[tokio::test]
+    async fn a_single_upsert_returns_that_asset_and_the_counts_not_the_other_assets() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        for locator in ["10.0.0.1", "10.0.0.2"] {
+            let res = r.call("security_record", json!({ "operation": upsert(locator) })).await;
+            assert_eq!(res.status, Status::Ok, "{}", res.text);
+        }
+        let res = r.call("security_record", json!({"operation": upsert("10.0.0.3")})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let body = body_json(&res.text);
+        let assets = body["recorded"]["assets"].as_object().unwrap();
+        assert_eq!(assets.len(), 1, "{body}");
+        assert_eq!(assets.values().next().unwrap()["locator"], "10.0.0.3");
+        assert_eq!(body["counts"]["assets"], 3, "{body}");
+        assert!(body.get("state").is_none() && body.get("removed").is_none(), "{body}");
+        assert!(body["more"].as_str().unwrap().starts_with("The rest of the security state is unchanged"), "{body}");
+        assert!(!res.text.contains("10.0.0.1") && !res.text.contains("10.0.0.2"), "{}", res.text);
+    }
+
+    #[tokio::test]
+    async fn a_batch_over_the_size_bound_returns_counts_and_ids() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        let ops: Vec<Value> = (0..60).map(|i| upsert(&format!("10.1.0.{i}"))).collect();
+        let res = r.call("security_record", json!({"operation":{"action":"batch","ops":ops}})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let body = body_json(&res.text);
+        assert_eq!(body["recorded"]["assets"]["count"], 60, "{body}");
+        let ids = body["recorded"]["assets"]["ids"].as_array().unwrap();
+        assert_eq!(ids.len(), RECORDED_IDS);
+        assert!(ids.iter().all(|id| r.shared.ledger().unwrap().security.assets.contains_key(id.as_str().unwrap())));
+        assert_eq!(body["counts"]["assets"], 60, "{body}");
+        assert!(res.text.chars().count() < RECORDED_CHARS, "{}", res.text.chars().count());
+    }
+
+    #[tokio::test]
+    async fn a_hypothesis_open_returns_the_new_hypothesis_id() {
+        let r = rig("lead", false, true);
+        let res = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"hypothesis_open","hypothesis":{"statement":"candidate","priority":"high"}}}),
+            )
+            .await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let body = body_json(&res.text);
+        let id = stable_id("hy", &["candidate"]);
+        assert_eq!(body["recorded"]["hypotheses"][&id]["id"], json!(id), "{body}");
+        assert_eq!(body["counts"]["hypotheses"], 1, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_retraction_reports_the_fact_it_deactivated() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        let asserted = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"fact_assert","fact":{"predicate":"seen","args":["dummy"]},"evidence":["e1"]}}),
+            )
+            .await;
+        assert_eq!(asserted.status, Status::Ok, "{}", asserted.text);
+        let id = r.shared.ledger().unwrap().security.facts.keys().next().unwrap().clone();
+        let res =
+            r.call("security_record", json!({"operation":{"action":"fact_retract","id":id,"reason":"mistaken"}})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let body = body_json(&res.text);
+        assert_eq!(body["recorded"]["facts"][&id]["active"], false, "{body}");
+        assert_eq!(body["counts"]["facts"], 1, "{body}");
+    }
+
+    #[test]
+    fn touched_report_lists_removed_ids_and_added_conditions() {
+        let mut before = SecurityState::default();
+        before.aliases.insert("web".into(), "as-1".into());
+        before.aliases.insert("db".into(), "as-2".into());
+        before.revisited.insert("r1".into(), 3);
+        let mut after = before.clone();
+        after.aliases.remove("db");
+        after.revisited.insert("r1".into(), 4);
+        after.unlocked.insert(Condition { kind: ConditionKind::Cred, value: "admin".into() });
+        let report = touched_report(&before, &after, &SecurityState::default());
+        assert_eq!(report["removed"]["aliases"], json!(["db"]), "{report:?}");
+        assert_eq!(report["recorded"]["revisited"], json!({"r1": 4}), "{report:?}");
+        assert_eq!(report["recorded"]["unlocked"].as_array().map(Vec::len), Some(1), "{report:?}");
+        assert!(report["recorded"].get("aliases").is_none(), "{report:?}");
+        assert_eq!((report["counts"]["aliases"].clone(), report["counts"]["unlocked"].clone()), (json!(1), json!(1)));
+    }
+
+    #[tokio::test]
+    async fn condition_assets_resolve_and_every_batch_failure_is_named() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        let host = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"asset_upsert","asset":{"kind":"host","locator":"10.0.0.5",
+                    "evidence":["e1"]}}}),
+            )
+            .await;
+        assert_eq!(host.status, Status::Ok, "{}", host.text);
+        let full = r.shared.ledger().unwrap().security.assets.keys().next().unwrap().clone();
+        // A prefix in a cred condition is stored as the full asset ID, which is what a later unlock compares.
+        let blocked = |value: &str| json!({"operation":{"action":"blocked_on","target":"c1","conditions":[{"kind":"cred","value":value}]}});
+        let ok = r.call("security_record", blocked(&full[..12])).await;
+        assert_eq!(ok.status, Status::Ok, "{}", ok.text);
+        let stored = r.shared.ledger().unwrap().security.blocked.get("c1").unwrap().conditions[0].value.clone();
+        assert_eq!(stored, full);
+        // A mistyped asset ID is refused instead of waiting for an unlock that cannot come.
+        let bad = r.call("security_record", blocked("as-zzzzzzzz")).await;
+        assert_eq!(bad.status, Status::Error);
+        assert!(bad.text.contains("No security record matches `as-zzzzzzzz`"), "{}", bad.text);
+        // A value that is not an ID is kept.
+        assert_eq!(r.call("security_record", blocked("admin-session")).await.status, Status::Ok);
+        // A resolution failure inside a batch names the element.
+        let batch = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"batch","operations":[
+                    {"action":"coverage_set","asset":full,"disposition":{"status":"deferred","reason":"budget"}},
+                    {"action":"coverage_set","asset":"a1","disposition":{"status":"deferred","reason":"budget"}}]}}),
+            )
+            .await;
+        assert_eq!(batch.status, Status::Error);
+        assert!(
+            batch.text.contains("Operation 2 of 2 in the batch (coverage_set): Use an exact ID or alias"),
+            "{}",
+            batch.text
+        );
+        // So does a failing secret handle, and a nested batch.
+        let secret = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"batch","operations":[
+                    {"action":"coverage_set","asset":full,"disposition":{"status":"deferred","reason":"budget"}},
+                    {"action":"credential_add","credential":{"asset":full,"principal":"root","evidence":["e1"],
+                        "secret_handle":"out:nothere"}}]}}),
+            )
+            .await;
+        assert!(
+            secret.text.contains("Operation 2 of 2 in the batch (credential_add): Use an existing stored out:"),
+            "{}",
+            secret.text
+        );
+        let nested = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"batch","operations":[
+                    {"action":"coverage_set","asset":full,"disposition":{"status":"deferred","reason":"budget"}},
+                    {"action":"batch","operations":[
+                        {"action":"coverage_set","asset":full,"disposition":{"status":"deferred","reason":"budget"}}]}]}}),
+            )
+            .await;
+        assert!(
+            nested.text.contains("Operation 2 of 2 in the batch (batch): Nested security batches"),
+            "{}",
+            nested.text
+        );
+        // A child's early refusal inside a batch is named too.
+        let child = rig("worker", true, true);
+        let denied = child
+            .call(
+                "security_record",
+                json!({"operation":{"action":"batch","operations":[
+                    {"action":"alias_add","alias":"web","target":"as-0000"},
+                    {"action":"hypothesis_priority","id":"hy-0000","priority":3}]}}),
+            )
+            .await;
+        assert_eq!(denied.status, Status::Error);
+        assert!(denied.text.contains("Operation 2 of 2 in the batch (hypothesis_priority): Only"), "{}", denied.text);
+    }
+
+    #[tokio::test]
+    async fn the_description_follows_the_session_standing() {
+        let lead = SecurityRecord(rig("lead", false, true).shared.clone()).spec().description;
+        let child = SecurityRecord(rig("worker", true, true).shared.clone()).spec().description;
+        let judge = SecurityRecord(rig("verifier", true, true).shared.clone()).spec().description;
+        assert!(lead.contains("{action:hypothesis_open,") && !lead.contains("status:supported|refuted"));
+        assert!(!child.contains("{action:hypothesis_open,") && child.contains("the mission lead's"));
+        assert!(judge.contains("status:supported|refuted"));
     }
 
     #[tokio::test]
@@ -411,6 +985,8 @@ mod tests {
             quote: None,
             note: "opposing fixture observation".into(),
             attested: true,
+            tool: None,
+            grade: None,
         }));
         let counter = judge
             .call(
@@ -491,6 +1067,18 @@ mod tests {
             .await;
         assert_eq!(invalid.status, Status::Error);
         assert!(r.shared.ledger().unwrap().security.credentials.is_empty());
+        // A stored output of another mission is refused with the same sentence as a handle that names nothing.
+        let foreign = r.env.ctx.blobs.put_bytes(b"another mission's secret\n").unwrap().handle();
+        let refused = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"credential_add","credential":{
+            "asset":id,"principal":"dummy","secret_handle":foreign,"evidence":["e1"]}}}),
+            )
+            .await;
+        assert_eq!(refused.status, Status::Error);
+        assert!(refused.text.contains(SECRET_HANDLE_REFUSAL), "{}", refused.text);
+        assert!(r.shared.ledger().unwrap().security.credentials.is_empty());
         let secret = r.output("dummy fixture secret", "read", ToolClass::Read);
         let full = format!("out:{}", r.env.ctx.blobs.resolve(&secret).unwrap());
         for handle in [&secret, &full] {
@@ -528,5 +1116,97 @@ mod tests {
             assert_eq!(res.status, Status::Error);
             assert!(res.text.contains(super::super::NO_MISSION));
         }
+    }
+
+    #[tokio::test]
+    async fn a_fact_retraction_reports_the_conclusions_that_died() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        let rule = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"rule_install","rule":{"name":"v","head":{"predicate":"viable","args":["?x"]},
+                    "body":[{"atom":{"predicate":"seen","args":["?x"]},"negated":false}]}}}),
+            )
+            .await;
+        assert_eq!(rule.status, Status::Ok, "{}", rule.text);
+        let asserted = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"fact_assert","fact":{"predicate":"seen","args":["dummy"]},"evidence":["e1"]}}),
+            )
+            .await;
+        assert_eq!(asserted.status, Status::Ok, "{}", asserted.text);
+        let id = r.shared.ledger().unwrap().security.facts.keys().next().unwrap().clone();
+        let res =
+            r.call("security_record", json!({"operation":{"action":"fact_retract","id":id,"reason":"mistaken"}})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(!r.shared.ledger().unwrap().security.died.is_empty());
+        let body = body_json(&res.text);
+        assert!(body["recorded"]["died"].to_string().contains("viable"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_hypothesis_open_names_the_hypothesis_id_as_unchanged() {
+        let r = rig("lead", false, true);
+        let op =
+            json!({"operation":{"action":"hypothesis_open","hypothesis":{"statement":"candidate","priority":"high"}}});
+        let first = r.call("security_record", op.clone()).await;
+        assert_eq!(first.status, Status::Ok, "{}", first.text);
+        let again = r.call("security_record", op).await;
+        assert_eq!(again.status, Status::Ok, "{}", again.text);
+        let id = stable_id("hy", &["candidate"]);
+        let body = body_json(&again.text);
+        assert_eq!(body["unchanged"]["hypotheses"], json!([id]), "{body}");
+        let first = body_json(&first.text);
+        assert!(first.get("unchanged").is_none(), "{first}");
+    }
+
+    #[tokio::test]
+    async fn an_upsert_of_a_known_asset_names_its_canonical_id_as_unchanged() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        let first = r.call("security_record", json!({"operation": upsert("example.test")})).await;
+        assert_eq!(first.status, Status::Ok, "{}", first.text);
+        let again = r.call("security_record", json!({"operation": upsert("Example.TEST.")})).await;
+        assert_eq!(again.status, Status::Ok, "{}", again.text);
+        let id = r.shared.ledger().unwrap().security.assets.keys().next().unwrap().clone();
+        let body = body_json(&again.text);
+        assert_eq!(body["unchanged"]["assets"], json!([id]), "{body}");
+    }
+
+    #[test]
+    fn the_over_bound_form_stays_near_the_bound_with_long_conditions_and_keys() {
+        let before = SecurityState::default();
+        let mut after = before.clone();
+        for i in 0..64 {
+            after
+                .unlocked
+                .insert(Condition { kind: ConditionKind::Cred, value: format!("{i:02}{}", "v".repeat(4000)) });
+        }
+        for i in 0..40 {
+            after.aliases.insert(format!("{i:02}{}", "k".repeat(1000)), "x".into());
+        }
+        let report = touched_report(&before, &after, &SecurityState::default());
+        let recorded = report["recorded"].as_object().unwrap();
+        let size = serde_json::to_string_pretty(recorded).unwrap().chars().count();
+        assert!(size <= RECORDED_CHARS, "`recorded` is {size} characters (bound {RECORDED_CHARS})");
+        assert_eq!(recorded["unlocked"], json!({"count": 64}), "{recorded:?}");
+        assert_eq!(recorded["aliases"]["count"], 40, "{recorded:?}");
+    }
+
+    #[test]
+    fn the_counts_and_ids_form_cuts_ids_to_80_characters() {
+        let before = SecurityState::default();
+        let mut after = before.clone();
+        for i in 0..30 {
+            after.aliases.insert(format!("{i:02}{}", "é".repeat(500)), "x".into());
+        }
+        let report = touched_report(&before, &after, &SecurityState::default());
+        let ids = report["recorded"]["aliases"]["ids"].as_array().unwrap();
+        assert_eq!(ids.len(), RECORDED_IDS);
+        assert!(ids.iter().all(|id| id.as_str().unwrap().chars().count() == 80), "{ids:?}");
     }
 }

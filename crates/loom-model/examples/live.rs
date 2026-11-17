@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(effort) = args.get(2) {
         profile.extra_body.insert("reasoning_effort".into(), Value::String(effort.clone()));
     }
-    let client = ModelClient::new("live", profile)?;
+    let client = ModelClient::new("live", profile, &loom_core::config::Paths::from_env().model_keys_dir())?;
     let found = client.discover().await?;
     println!(
         "server: model {}, window {:?} ({:?}), server-reported window {:?}",

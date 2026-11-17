@@ -8,10 +8,19 @@
 //! They do not install/launch a daemon or modify targets. gdb_probe disables startup/auto-load files,
 //! runs under the same sandbox with timeout/output/cancellation limits, and labels its observation as
 //! debugger output rather than an independent privilege/success oracle. Backends use descriptor-hashed
-//! staging outside actor write grants. Unconfined mode is explicitly labelled and never cached.
+//! staging outside actor write grants: `<session dir>/analysis/<random>/target`, the sandbox's
+//! `analysis_dir()`, which the session's commands can read (the backends open their input) and never write.
+//! Unconfined mode is explicitly labelled and never cached.
 //! Every readable process observation, including failure/cancellation/timeout/limit prefixes, is Raw
-//! output with completion/termination metadata. Read failures retain the protected output file.
+//! output with completion/termination metadata. Read failures retain the output file, which lies in the loom home where the session cannot read it: the sentence says to run the analysis again and names the file for the operator.
 //! ProducedView stores and indexes full normalized decompiler output while showing at most 120 lines.
+//! `bin_decompile` and `bin_xrefs` are of class `Exec` (they run a backend), but what they produce is
+//! analysis of the binary, not an observation of it running: every result their `run` returns, whatever its
+//! status, carries `meta[META_EVIDENCE_GRADE] = "analysis"` (`loom_core::event::EvidenceGrade`), so a quote of
+//! it is never execution evidence (a call refused before `run` stores no output, and
+//! `EvidenceGrade::of_tool_result` grades their results without the key as analysis too). `gdb_probe` runs the target and keeps the default grade (`run`); `bin_survey`
+//! is `Read`. Tests: `bin_decompile` and `bin_xrefs` results (a missing backend and a refusal of bad
+//! arguments included) are graded `analysis`; `gdb_probe` and `bin_survey` results carry no grade.
 
 use crate::{
     params::{opt, req, spec},
@@ -19,7 +28,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use goblin::Object;
-use loom_core::event::{ToolClass, ToolSpec, ToolStatus};
+use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_EVIDENCE_GRADE};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -326,14 +335,13 @@ pub(crate) async fn command_bounded(
     let mut running =
         proc::spawn(&ctx.sandbox, &spec).map_err(|e| format!("The analysis command did not start: {e}."))?;
     let limit = ctx.cfg.max_output_bytes.min(2_000_000);
-    let wait =
-        running.wait(&ctx.cancel, Some(Duration::from_secs(seconds.clamp(1, ceiling.max(1)))), limit).await;
+    let wait = running.wait(&ctx.cancel, Some(Duration::from_secs(seconds.clamp(1, ceiling.max(1)))), limit).await;
     let background = matches!(wait, WaitEnd::Ended(_)) && running.group_alive();
     let ended = match &wait {
         WaitEnd::Ended(e) if !background => e.clone(),
         _ => running.terminate_within(Duration::from_secs(1), limit).await,
     };
-    let(bytes,written)=running.read_output_capped(limit).map_err(|e|format!("Analysis ran but its output could not be read: {e}. Output is retained at {}; inspect that protected file before retrying.",spec.out_path.display()))?;
+    let(bytes,written)=running.read_output_capped(limit).map_err(|e|format!("Analysis ran but its output could not be read: {e}. Run the analysis again. What it wrote is left for the operator in {}, which commands and file tools cannot read.",spec.out_path.display()))?;
     let mut reason = match wait {
         WaitEnd::Cancelled => Some("cancelled"),
         WaitEnd::Deadline => Some("timeout"),
@@ -362,8 +370,11 @@ impl BackendInput {
     fn create(ctx: &ToolCtx, bytes: &[u8], hash: &str) -> Result<Self, String> {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let parent = ctx.tmp_dir.parent().ok_or("The session has no protected parent for analysis staging.")?;
-        let root = parent.join(format!("analysis-{:032x}", rand::random::<u128>()));
+        // One fixed directory per session, which the sandbox lets commands read (never write), and a private
+        // random directory per call inside it.
+        let staging = ctx.sandbox.analysis_dir();
+        let root = staging.join(format!("{:032x}", rand::random::<u128>()));
+        loom_core::config::ensure_private_dir(staging).map_err(|e| format!("Analysis input staging failed: {e}."))?;
         loom_core::config::ensure_private_dir(&root).map_err(|e| format!("Analysis input staging failed: {e}."))?;
         let path = root.join("target");
         let enforced = ctx.sandbox.mode() != loom_core::config::SandboxMode::None;
@@ -455,6 +466,8 @@ fn xref_failure(rows: Vec<Value>, target: &str, result: Option<CommandOutcome>, 
     output
 }
 
+/// Stores the whole output and shows at most 120 of its lines, and no more of them than fit in
+/// `ctx.view_chars` (`view::numbered`); the fact names the lines displayed.
 fn limited_backend_view(ctx: &ToolCtx, mut output: ToolOutput, bytes: &[u8]) -> ToolOutput {
     let (blob, normalized) = match crate::view::store_text(&ctx.blobs, bytes) {
         Ok(v) => v,
@@ -469,12 +482,12 @@ fn limited_backend_view(ctx: &ToolCtx, mut output: ToolOutput, bytes: &[u8]) -> 
             output.meta.insert(loom_core::event::META_RAW_BLOB.into(), json!(raw.id.as_str()));
         }
     }
-    let last = blob.lines.min(120);
-    let text = if last == 0 {
-        String::new()
+    let wanted = blob.lines.min(120);
+    let (text, last) = if wanted == 0 {
+        (String::new(), 0)
     } else {
-        match crate::view::numbered(&ctx.blobs, &blob.id, 1, last, 20_000) {
-            Ok((text, _)) => text,
+        match crate::view::numbered(&ctx.blobs, &blob.id, 1, wanted, 20_000, ctx.view_chars) {
+            Ok(n) => (n.text, n.last),
             Err(e) => {
                 return output.with_more(format!(
                     "The bounded backend view could not be read: {e}; its bounded bytes are retained in this result."
@@ -515,6 +528,7 @@ impl Tool for BinDecompile {
         spec("bin_decompile","Ask an installed rizin/pdg backend for one function. Content-hash cached, max 120 displayed lines; missing backend is an explicit error. Output is analysis, not execution proof.",ToolClass::Exec,&[req("path","string","Binary path."),req("symbol_or_addr","string","Symbol or 0x address.")])
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        async {
         let target = args.get("symbol_or_addr").and_then(Value::as_str).unwrap_or_default();
         if let Err(e) = selector(target) {
             return ToolOutput::error(e);
@@ -549,6 +563,9 @@ impl Tool for BinDecompile {
             if input.enforced { "enforced" } else { "not enforced; uncached observation only" }
         ));
         limited_backend_view(ctx, output, &bytes)
+        }
+        .await
+        .with_meta(META_EVIDENCE_GRADE, json!("analysis"))
     }
 }
 #[async_trait]
@@ -557,6 +574,7 @@ impl Tool for BinXrefs {
         spec("bin_xrefs","Bounded incoming-reference BFS using an installed rizin backend. Depth 1..4, at most 12 expanded nodes; cache keys include binary content hash.",ToolClass::Exec,&[req("path","string","Binary path."),req("target","string","Symbol or 0x address."),opt("depth","integer","BFS depth, default 1.").min(1).max(4)])
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        async {
         let target = args.get("target").and_then(Value::as_str).unwrap_or_default();
         if let Err(e) = selector(target) {
             return ToolOutput::error(e);
@@ -605,6 +623,9 @@ impl Tool for BinXrefs {
             "xref query",
             Body::Raw(json!({"sha256":hash,"queries":rows,"bounded":seen.len()>=12,"input_isolation_enforced":input.enforced}).to_string().into_bytes()),
         )
+        }
+        .await
+        .with_meta(META_EVIDENCE_GRADE, json!("analysis"))
     }
 }
 
@@ -820,6 +841,40 @@ mod tests {
         assert!(!staged.enforced);
     }
 
+    /// In production the staging is `<session dir>/analysis/<random>/target`, inside the loom home, which commands
+    /// cannot read: the backends that run as commands (rizin, gdb) must still read their input, and never write it.
+    #[tokio::test]
+    async fn staged_input_is_readable_to_the_backend_and_not_writable_in_the_production_layout() {
+        use loom_core::config::{SandboxCfg, SandboxMode, ToolsCfg};
+        if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
+            return;
+        }
+        let env = crate::testutil::env_prod(
+            ToolsCfg::default(),
+            SandboxCfg { mode: SandboxMode::Seatbelt, ..SandboxCfg::default() },
+        );
+        let staged = BackendInput::create(&env.ctx, b"STAGED-TARGET-BYTES", "hash").unwrap();
+        assert!(staged.enforced);
+        assert!(staged.path.starts_with(env.ctx.sandbox.analysis_dir()), "{}", staged.path.display());
+        assert!(env.ctx.sandbox.check_read(&staged.path).is_ok());
+        assert!(env.ctx.sandbox.check_write(&staged.path).is_err());
+        let path = quote(&staged.path.to_string_lossy());
+        let read = command(&env.ctx, format!("cat {path}; /usr/bin/file {path}"), 10).await.unwrap();
+        let text = String::from_utf8_lossy(&read.bytes).into_owned();
+        assert!(read.completed && text.contains("STAGED-TARGET-BYTES") && !text.contains("cannot open"), "{text}");
+        for write in [format!("echo x >> {path}"), format!("rm {path}"), format!("echo x > {path}.new")] {
+            let r = command(&env.ctx, write.clone(), 10).await.unwrap();
+            assert!(r.ended != crate::proc::Ended::Exit(0), "{write}: {}", String::from_utf8_lossy(&r.bytes));
+        }
+        assert_eq!(std::fs::read(&staged.path).unwrap(), b"STAGED-TARGET-BYTES");
+        // Another session's files in the loom home stay unreadable.
+        let other = env.dir.path().canonicalize().unwrap().join("home/blobs/x");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, "STORED-OUTPUT").unwrap();
+        let r = command(&env.ctx, format!("cat {}", quote(&other.to_string_lossy())), 10).await.unwrap();
+        assert!(!String::from_utf8_lossy(&r.bytes).contains("STORED-OUTPUT"));
+    }
+
     #[test]
     fn a_limited_backend_view_retains_the_full_normalized_producer_blob() {
         let env = crate::testutil::env();
@@ -845,6 +900,32 @@ mod tests {
         assert_eq!(record.meta[loom_core::event::META_SHOWN], json!([[1, 120]]));
         assert!(env.stored(&record).contains("line 130"));
         assert!(!record.text.contains("130\tline 130"));
+    }
+
+    #[test]
+    fn a_limited_backend_view_shows_only_the_lines_that_fit_the_view_size() {
+        let mut env = crate::testutil::env();
+        env.ctx.view_chars = 60;
+        let bytes = (1..=130).map(|n| format!("line {n}\n")).collect::<String>().into_bytes();
+        let result = CommandOutcome {
+            written: bytes.len() as u64,
+            bytes: bytes.clone(),
+            ended: crate::proc::Ended::Exit(0),
+            completed: true,
+            stop_reason: None,
+        };
+        let output = limited_backend_view(&env.ctx, result.into_tool_output("backend"), &bytes);
+        let Body::ProducedView { blob, text, shown } = &output.body else { panic!("not a produced view") };
+        assert_eq!(blob.lines, 130);
+        let last = shown[0].1;
+        assert!(last < 120 && text.chars().count() <= 60, "{last}: {text}");
+        assert_eq!(shown, &vec![(1, last)]);
+        assert!(text.ends_with(&format!("{last}\tline {last}")), "{text}");
+        assert!(
+            output.more.iter().any(|f| f.contains(&format!("displayed first {last} of 130 lines"))),
+            "{:?}",
+            output.more
+        );
     }
 
     #[test]
@@ -1066,5 +1147,40 @@ mod tests {
         assert_eq!(data["relocations"][0], json!({"symbol": "puts", "address": "0x404018"}));
         assert!(data["symbols"].as_array().unwrap().iter().any(|s| s["name"] == "entry_label" && s["bytes"] == 0));
         assert!(data["symbols"].as_array().unwrap().iter().any(|s| s["name"] == "stage_buf" && s["kind"] == "object"));
+    }
+
+    fn grade(r: &loom_core::event::ToolResult) -> Option<&str> {
+        r.meta.get(META_EVIDENCE_GRADE).and_then(Value::as_str)
+    }
+
+    #[tokio::test]
+    async fn decompile_and_xrefs_results_are_graded_analysis_and_the_others_are_not() {
+        let mut env = crate::testutil::env();
+        let file = env.ctx.workspace.join("blob.bin");
+        std::fs::write(&file, b"\x7fELF not a real binary").unwrap();
+        let empty = env.ctx.workspace.join("emptybin");
+        std::fs::create_dir_all(&empty).unwrap();
+        let mut vars = (*env.ctx.env).clone();
+        vars.insert("PATH".to_string(), empty.to_string_lossy().into_owned());
+        env.ctx.env = std::sync::Arc::new(vars);
+        let path = file.to_string_lossy().into_owned();
+        for (tool, args) in [
+            ("bin_decompile", json!({"path": path, "symbol_or_addr": "main"})),
+            ("bin_decompile", json!({"path": path, "symbol_or_addr": "main;id"})),
+            ("bin_decompile", json!({"path": "no-such-file", "symbol_or_addr": "main"})),
+            ("bin_xrefs", json!({"path": path, "target": "main"})),
+            ("bin_xrefs", json!({"path": path, "target": "a b"})),
+            ("bin_xrefs", json!({"path": "no-such-file", "target": "main"})),
+        ] {
+            let r = env.call(tool, args).await;
+            assert_ne!(r.status, ToolStatus::Ok, "{tool}: {}", r.text);
+            assert_eq!(grade(&r), Some("analysis"), "{tool}: {}", r.text);
+        }
+        let r = env.call("gdb_probe", json!({"binary": "no-such-file", "sink": "main"})).await;
+        assert_eq!(r.status, ToolStatus::Error, "{}", r.text);
+        assert_eq!(grade(&r), None);
+        let r = env.call("bin_survey", json!({"path": path})).await;
+        assert_eq!(r.status, ToolStatus::Error, "{}", r.text);
+        assert_eq!(grade(&r), None);
     }
 }

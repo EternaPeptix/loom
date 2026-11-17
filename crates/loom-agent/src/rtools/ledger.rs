@@ -32,7 +32,8 @@
 //!   the write. Nothing else is recorded; a refutation or withdrawal gets no such line. (`claim` always
 //!   creates an open claim, so it never banks.)
 //! - `evidence`:
-//!   1. `gate::check_quotes(&ctx.blobs, &[Quote { handle, start, end, text: quote }])`; on `Err(text)`
+//!   1. `gate::check_quotes(ctx, &[Quote { handle, start, end, text: quote }])` (only an output of the
+//!      session's mission; another mission's is refused as a handle that names nothing); on `Err(text)`
 //!      → error `{text}\nNothing was attached.` `quote` may be left out (or blank): the quote is then
 //!      by lines, the lines `start`-`end` as the stored output has them (`gate`). This refusal and the
 //!      next carry `meta[META_REFUSAL] = REFUSAL_QUOTE` (what a scorecard counts as a step spent on a
@@ -53,15 +54,20 @@
 //!      runtime registers that blob as produced by the `read` call (class `Read`, so static evidence);
 //!      the complete output of a background job is registered as produced by the call that started it.
 //!   3. `EvidenceAdd(EvidenceInput { claim, kind, supports, session, call_id, blob: Some, lines:
-//!      Some((start, end)) as verified, quote: the verified text, note, attested: true })` where `kind`
-//!      is `Execution` when the producer's class is `Exec`, else `Static`. The verified text has no
+//!      Some((start, end)) as verified, quote: the verified text, note, attested: true, tool:
+//!      Some(producer.tool), grade: Some(producer.grade) })` where `kind` is `Execution` when the producer's
+//!      grade is `Run` and its class is `Exec`, else `Static`. The class alone does not decide: `dep_scan`,
+//!      `bin_decompile` and `bin_xrefs` are `Exec` tools whose output is analysis, so a quote of it is static
+//!      evidence and meets no rule that asks for a run. The verified text has no
 //!      line-number prefixes; a fragment is recorded as the complete line or lines it lies on, and `lines`
 //!      are their numbers (on lines longer than `observe::QUOTE_RECORD_CHARS` characters, a window of them
 //!      around the fragment, `…` marking what was left out).
 //!
-//!   Outcome `evidence {id} attached to {claim}`. Text: `{id} ({supports|undermines}; {execution|static}:
-//!   {tool} call in {session}) attached to {claim}.` and, when the claim is still `Open`, the line
-//!   `The claim is still open — set its status with `claim_update`.` After a quote by lines, what was
+//!   Outcome `evidence {id} attached to {claim}`. Text: `{id} ({supports|undermines}; {grade}: {tool} call
+//!   in {session}) attached to {claim}.` (`{grade}` is `run`, `analysis`, `read` or `reference`); when the
+//!   grade is `analysis` or `reference`, the line `texts::evidence_not_a_run(grade, tool)`; when the claim is
+//!   still `Open`, the line `The claim is still open — set its status with `claim_update`.` After a quote by lines,
+//!   what was
 //!   recorded follows, since nothing compared the line numbers with a text and a miscounted range shows
 //!   nowhere else: `Recorded from {handle}, lines {start}-{end}, as stored:`, each line of the text as
 //!   `| {line}`, and `If these are not the lines you meant, attach the right ones.` A quote given with
@@ -78,13 +84,16 @@
 //! directly and as a view shows it, the diff of an `edit`); `evidence` kind by producer class, also
 //! when the quote is copied from a view of a command's output; evidence by lines: what is recorded and
 //! played back, its refusals, and the producer rule applying to it as well; a session without a mission
-//! gets `NO_MISSION` from every tool.
+//! gets `NO_MISSION` from every tool. Grades: a quote of a producer graded `Analysis` (as `dep_scan`'s) is
+//! recorded `Static` with `tool` and `grade` set, and the result says `analysis:` and carries the not-a-run
+//! line; `Reference` likewise; a `Run` producer is recorded `Execution`; a producer of class `Exec` whose grade
+//! is not `Run` is never recorded `Execution`; a `read` producer gets no not-a-run line.
 
 use super::{observed_producer, Shared, NO_MISSION};
 use crate::gate::{check_quotes, Quote};
 use crate::{frontier, texts};
 use async_trait::async_trait;
-use loom_core::event::{ToolClass, ToolSpec, META_REFUSAL, REFUSAL_QUOTE};
+use loom_core::event::{EvidenceGrade, ToolClass, ToolSpec, META_REFUSAL, REFUSAL_QUOTE};
 use loom_core::ledger::{ClaimStatus, EvidenceInput, EvidenceKind, LedgerOp, LedgerState, StepStatus};
 use loom_tools::params::{opt, req, spec};
 use loom_tools::{Body, Tool, ToolCtx, ToolOutput};
@@ -378,7 +387,7 @@ impl Tool for Evidence {
         // A refusal over the quote says so in the record: a scorecard counts the steps spent on quotes.
         let quote_refused = |text: String| ToolOutput::error(text).with_meta(META_REFUSAL, json!(REFUSAL_QUOTE));
         let q = Quote { handle: handle.clone(), start, end, text: quote };
-        let verified = match check_quotes(&ctx.blobs, &[q]) {
+        let verified = match check_quotes(ctx, &[q]).await {
             Ok(v) => v,
             Err(text) => return quote_refused(format!("{text}\nNothing was attached.")),
         };
@@ -392,7 +401,9 @@ impl Tool for Evidence {
             Ok(p) => p,
             Err(text) => return quote_refused(text),
         };
-        let kind = if producer.class == ToolClass::Exec { EvidenceKind::Execution } else { EvidenceKind::Static };
+        // Only a run is execution evidence; an Exec tool whose output is analysis (dep_scan) is not one.
+        let run = producer.grade == EvidenceGrade::Run && producer.class == ToolClass::Exec;
+        let kind = if run { EvidenceKind::Execution } else { EvidenceKind::Static };
         let recorded = by_lines.then(|| recorded_lines(&handle, v.start, v.end, &v.text));
         let input = EvidenceInput {
             claim: claim.clone(),
@@ -405,16 +416,23 @@ impl Tool for Evidence {
             quote: Some(v.text),
             note,
             attested: true,
+            tool: Some(producer.tool.clone()),
+            grade: Some(producer.grade),
         };
         match shared.ledger_append(false, LedgerOp::EvidenceAdd(input)) {
             Ok((_, state)) => {
                 let id = state.evidence.last().map(|e| e.id.as_str()).unwrap_or("");
                 let side = if supports { "supports" } else { "undermines" };
-                let kind_word = if kind == EvidenceKind::Execution { "execution" } else { "static" };
                 let mut text = format!(
-                    "{id} ({side}; {kind_word}: {} call in {}) attached to {claim}.",
-                    producer.tool, producer.session
+                    "{id} ({side}; {}: {} call in {}) attached to {claim}.",
+                    producer.grade.as_str(),
+                    producer.tool,
+                    producer.session
                 );
+                if let Some(line) = texts::evidence_not_a_run(producer.grade, &producer.tool) {
+                    text.push('\n');
+                    text.push_str(&line);
+                }
                 if state.claims.iter().any(|c| c.id == claim && c.status == ClaimStatus::Open) {
                     text.push_str("\nThe claim is still open — set its status with `claim_update`.");
                 }
@@ -464,8 +482,9 @@ impl Tool for Ledger {
 mod tests {
     use super::super::testkit::{rig, Rig};
     use super::super::NO_MISSION;
-    use loom_core::event::{Event, ToolClass, ToolStatus};
-    use loom_core::ledger::LedgerOp;
+    use crate::texts;
+    use loom_core::event::{Event, EvidenceGrade, ToolClass, ToolStatus};
+    use loom_core::ledger::{EvidenceKind, LedgerOp};
     use serde_json::{json, Value};
 
     async fn ok(rig: &Rig, name: &str, args: Value) -> String {
@@ -602,7 +621,7 @@ mod tests {
         )
         .await;
         assert!(t.contains("evidence e1 attached to c1"), "{t}");
-        assert!(t.contains("e1 (supports; execution: bash call in s-test) attached to c1."), "{t}");
+        assert!(t.contains("e1 (supports; run: bash call in s-test) attached to c1."), "{t}");
         assert!(t.contains("The claim is still open — set its status with `claim_update`."), "{t}");
 
         let t = ok(&rig, "claim_update", json!({"id": "c1", "status": "supported"})).await;
@@ -616,7 +635,7 @@ mod tests {
             json!({"claim": "c1", "handle": h, "start": 1, "end": 3, "quote": "omega", "note": "tail", "supports": false}),
         )
         .await;
-        assert!(t.contains("e2 (undermines; execution:"), "{t}");
+        assert!(t.contains("e2 (undermines; run:"), "{t}");
         assert!(!t.contains("still open"), "{t}");
         assert_eq!(ledger_records(&rig), vec![1, 2, 3, 4]);
 
@@ -666,13 +685,56 @@ mod tests {
             json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "quote": "line one", "note": "n"}),
         )
         .await;
-        assert!(t.contains("static: read call in s-test"), "{t}");
+        assert!(t.contains("read: read call in s-test"), "{t}");
         let state = rig.shared.ledger().unwrap();
         let e = &state.evidence[0].input;
         assert_eq!(e.kind, loom_core::ledger::EvidenceKind::Static);
         assert!(e.attested);
         assert_eq!(e.lines, Some((1, 1)));
         assert_eq!(e.call_id.as_str(), "call-0");
+    }
+
+    #[tokio::test]
+    async fn evidence_is_graded_by_what_the_producer_did() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let args =
+            |h: &str| json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "quote": "line one", "note": "n"});
+        let cases = [
+            ("dep_scan", ToolClass::Exec, EvidenceGrade::Analysis, "analysis"),
+            ("cve_lookup", ToolClass::Exec, EvidenceGrade::Reference, "reference"),
+        ];
+        for (tool, class, grade, word) in cases {
+            let h = rig.output_graded("line one\n", tool, class, grade);
+            let t = ok(&rig, "evidence", args(&h)).await;
+            assert!(t.contains(&format!("supports; {word}: {tool} call in s-test")), "{t}");
+            let line = texts::evidence_not_a_run(grade, tool).expect("a line for a non-run");
+            assert!(t.contains(&line), "{t}");
+            // The not-a-run line comes before the claim-still-open line.
+            let (a, b) = (t.find(&line).unwrap_or(0), t.find("still open").unwrap_or(0));
+            assert!(a < b, "{t}");
+        }
+        let state = rig.shared.ledger().unwrap();
+        for (e, (tool, _, grade, _)) in state.evidence.iter().zip(cases) {
+            assert_eq!(e.input.kind, EvidenceKind::Static, "an Exec producer graded {grade:?} is never Execution");
+            assert_eq!(e.input.tool.as_deref(), Some(tool));
+            assert_eq!(e.input.grade, Some(grade));
+        }
+
+        // A run is Execution and gets no extra line; a read gets none either.
+        let h = rig.output_graded("line one\n", "bash", ToolClass::Exec, EvidenceGrade::Run);
+        let t = ok(&rig, "evidence", args(&h)).await;
+        assert!(t.contains("supports; run: bash call in s-test"), "{t}");
+        assert!(!t.contains("not a run"), "{t}");
+        let h = rig.output("line one\n", "read", ToolClass::Read);
+        let t = ok(&rig, "evidence", args(&h)).await;
+        assert!(t.contains("supports; read: read call in s-test"), "{t}");
+        assert!(!t.contains("not a run"), "{t}");
+        let state = rig.shared.ledger().unwrap();
+        assert_eq!(state.evidence[2].input.kind, EvidenceKind::Execution);
+        assert_eq!(state.evidence[2].input.grade, Some(EvidenceGrade::Run));
+        assert_eq!(state.evidence[3].input.kind, EvidenceKind::Static);
+        assert_eq!(state.evidence[3].input.grade, Some(EvidenceGrade::Read));
     }
 
     #[tokio::test]
@@ -687,7 +749,7 @@ mod tests {
         // No `quote`: the lines are taken from the stored output, blank ends left out, indentation kept.
         let t = ok(&rig, "evidence", json!({"claim": "c1", "handle": h, "start": 2, "end": 5, "note": "the failure"}))
             .await;
-        assert!(t.contains("e1 (supports; execution: bash call in s-test) attached to c1."), "{t}");
+        assert!(t.contains("e1 (supports; run: bash call in s-test) attached to c1."), "{t}");
         let played = format!(
             "Recorded from {h}, lines 3-4, as stored:\n|   test a ... FAILED\n|   left: 1, right: 2\nIf these are not the lines you meant, attach the right ones."
         );
@@ -762,8 +824,27 @@ mod tests {
         .await;
         assert!(t.contains("\nNothing was attached.\n"), "{t}");
 
+        // Stored, and not an output of this mission at all: the sentence of a handle that names nothing, and
+        // nothing of the output (not even that its range is past its end) is said.
+        let foreign = rig.env.ctx.blobs.put_bytes(b"another mission's text\n").unwrap();
+        let t = refused(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": foreign.handle(), "start": 1, "end": 1, "quote": "x", "note": "n"}),
+        )
+        .await;
+        assert!(t.contains("no output of this mission has the handle") && !t.contains("another mission"), "{t}");
+        let t = refused(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": foreign.handle(), "start": 9, "end": 9, "quote": "x", "note": "n"}),
+        )
+        .await;
+        assert!(t.contains("no output of this mission has the handle") && !t.contains("lines"), "{t}");
+
         // Stored but never produced by a tool call of the mission.
         let blob = rig.env.ctx.blobs.put_bytes(b"orphan text\n").unwrap();
+        rig.orch.in_scope(&blob.id);
         let t = refused(
             &rig,
             "evidence",
@@ -879,7 +960,7 @@ mod tests {
                 json!({"claim": "c1", "handle": h, "start": 2, "end": 2, "quote": shown, "note": "n"}),
             )
             .await;
-            assert!(t.contains("execution: bash call in s-test"), "{tool}: {t}");
+            assert!(t.contains("run: bash call in s-test"), "{tool}: {t}");
         }
         let state = rig.shared.ledger().unwrap();
         assert_eq!(state.evidence.len(), 2);

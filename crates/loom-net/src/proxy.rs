@@ -2,8 +2,9 @@
 //!
 //! CONTRACT.
 //!
-//! `Proxy::start(port, sink)` binds `127.0.0.1:{port}` (0 = any free port) and serves until
-//! `shutdown` or drop. It speaks HTTP/1.1 proxying only:
+//! `Proxy::start(port, sink)` binds the shared listener `127.0.0.1:{port}` (0 = any free port; `port()`
+//! is the port bound) and serves until `shutdown` or drop; each session's grant adds a listener of its
+//! own (see *Sessions*). Every listener speaks HTTP/1.1 proxying only:
 //! - `CONNECT host:port` → on success `HTTP/1.1 200 Connection established\r\n\r\n`, then bytes are
 //!   copied both ways until either side closes;
 //! - a request with an absolute `http://` URI → the proxy connects to that host (port 80 by
@@ -24,21 +25,60 @@
 //! HTTP client does not show what the proxy answered to its CONNECT.
 //!
 //! ## Sessions
-//! `grant(session, policy)` returns a [`SessionGrant`] with fresh random credentials (user = the
-//! session id, password = 32 hex chars). The client authenticates with `Proxy-Authorization: Basic`.
+//! `grant(session, policy) -> Result<SessionGrant, ProxyError>` returns fresh random credentials (user =
+//! the session id, password = 32 hex chars) and the port of the session's own listener. The first grant
+//! of a session binds that listener on `127.0.0.1:0` (a failure is `ProxyError::Bind`, and nothing is
+//! granted); a later grant of the same session keeps its listener and port and replaces the password, so
+//! the old one gets `407`. It must be called inside a Tokio runtime. A command's environment names only
+//! its own session's port, and the sandbox lets the command connect to that port and no other of the
+//! proxy's, so credentials a command reads from another process (another session's command, through
+//! the environment it was started with) are of no use to it, and the proxy will not open a tunnel to
+//! one of its own listeners for it either (below): **command credentials are accepted only on
+//! their session's listener, and reference credentials only on the shared listener.** Credentials that
+//! arrive on another listener are refused as unknown ones are (`407`), with the decision rule
+//! `proxy authentication failed: credentials of session {owner} on the port of session {listener}`
+//! (or `… on the shared port`, `reference credentials on the port of session {listener}`), recorded for
+//! the listener's session (the session whose sandbox may connect there) or, on the shared listener,
+//! unattributed. The check is by the listener a connection was accepted on, before anything else of the
+//! request is acted on. The client authenticates with `Proxy-Authorization: Basic`.
 //! Missing or unknown credentials → `407` with `Proxy-Authenticate: Basic realm="loom"`.
-//! `grant_reference(session, cfg)` returns a separate `ReferenceGrant` (URL and host matcher, no env).
-//! Its random credential is kept only in trusted in-process tools, with GET/check/CONNECT permitted.
+//! `grant_reference(session, cfg)` returns a separate `ReferenceGrant` (URL and host matcher, no env) on the
+//! shared listener. Its random credential is kept only in trusted in-process tools, with GET/check/CONNECT permitted.
 //! Plain HTTP strips Authorization, Cookie and Referer. HTTPS CONNECT is opaque: the trusted client
 //! enforces GET, no URL user-info, no credential headers and redirect policy at every hop. Neither a
 //! host reservation nor GET-only access prevents exfiltration in URL paths/queries.
+//! `session_port(session) -> Option<u16>`: the port of the session's own listener while it holds a
+//! command grant.
 //! `revoke(session)` drops both command and reference grants; connections already open are left to finish.
+//! The session's listener is closed, and `session_port` gives `None`; its port is **retired**: kept, as a
+//! number only, among the proxy's own ports for the proxy's life. A listener for a session is opened with
+//! `tokio::net::TcpSocket`: bind `127.0.0.1:0`, read the port, and if it is retired (or otherwise one of
+//! the proxy's own ports) keep that socket aside and bind again, up to 64 times, else
+//! `ProxyError::Bind` saying that no fresh loopback port was found and that a daemon restart frees the
+//! retired ones; the sockets set aside are dropped once a fresh port is found. So no later session of this
+//! proxy's life is given a port that an earlier session's sandbox allows (a process that left its
+//! command's process group outlives its session and keeps its profile), and a revoked session holds no
+//! descriptor. The fresh port is added to the own ports **before** `listen`. A later grant of a session
+//! whose listener was closed opens a new one (on a fresh port; its new sandbox names it).
+//!
+//! **The proxy never connects to itself.** A destination address that is loopback (`127.0.0.0/8`, `::1`,
+//! and IPv6 forms carrying a `127.x` address) or unspecified (`0.0.0.0/8`, `::`, and such forms) with a
+//! port of one of the proxy's listeners (the shared one and every session's, open or retired) is refused
+//! whatever the policy says, before `check_addr`, for a tunnel, a forwarded request and a check alike,
+//! with rule `deny the egress proxy's own port {port}`. A connection that succeeds is checked again
+//! against the own ports before anything is recorded as allowed or sent (a listener opened between the
+//! first check and the connect is in the set by then, since its port is added before it listens); a hit
+//! closes it and refuses it the same way. Otherwise a session whose policy reaches
+//! loopback (`allow_private`, a granted `127.0.0.1:{port}`) could open a tunnel to another session's
+//! listener and present that session's credentials there, through the proxy, which would accept them.
 //! `set_policy(session, policy)` replaces the policy of a session that holds a grant and keeps its
 //! credentials, so commands already running pick the change up on their next connection.
 //! `SessionGrant::env()` gives the variables to place in a command's environment so that ordinary
 //! clients use the proxy: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case forms, all
-//! `http://{user}:{password}@127.0.0.1:{port}`, plus `NO_PROXY`/`no_proxy` = `` (empty, so loopback
-//! labs also pass policy unless the sandbox opens their ports directly).
+//! `http://{user}:{password}@127.0.0.1:{port}` with the session's own port, plus `NO_PROXY`/`no_proxy` = ``
+//! (empty, so loopback labs also pass policy unless the sandbox opens their ports directly).
+//! `shutdown` and `stop` close every listener. The limits below are of the proxy as a whole, across
+//! listeners, as before.
 //!
 //! ## Deciding and connecting
 //! For each request: `policy.check_name` → if allowed, resolve the name (`tokio::net::lookup_host`;
@@ -77,7 +117,20 @@
 //! refused as private-address with `resolved` set; allowlist miss; unreachable port → 502 and an
 //! allowed decision with the suffix; exactly one decision per request and the right session id on
 //! each when two sessions use the proxy at once; malformed heads → 400 and the server keeps serving;
-//! oversized head; `env()` contents; shutdown stops accepting.
+//! oversized head; `env()` contents; shutdown stops accepting. Listeners: two sessions' grants have
+//! different ports, neither the shared one; session B's valid credentials on A's port → `407`, nothing
+//! connected, one refused decision recorded for A naming B; A's credentials on the shared port → `407`
+//! (unattributed); a reference grant works on the shared port and is refused on a session's port; a second
+//! grant of A keeps the port and the first password gets `407`; after `revoke(A)` a connect to A's port
+//! fails, `session_port(A)` is `None`, the grants of 20 new sessions never get A's port, a grant of A again
+//! gets a port that is not the old one, and a proxy test with the retired check forced to hit every time
+//! gets `ProxyError::Bind` with the sentence and leaves no socket bound; `shutdown` closes the session
+//! listeners too. A connect to a retired port through the proxy is refused with the own-port rule. The foreign-credentials test asserts
+//! that the destination listener accepted nothing. Own ports: with a policy that allows `127.0.0.1`
+//! (`allow_private`) in open mode, a `CONNECT`, a forwarded `GET http://127.0.0.1:{port}/` and a check to
+//! another session's port, to the session's own port and to the shared port are each refused (`403`, rule
+//! `deny the egress proxy's own port {port}`), also written as `[::ffff:127.0.0.1]:{port}` and
+//! `0.0.0.0:{port}`, while another loopback port is still allowed.
 //!
 //! ## Audit
 //! `start_with` takes an audit hook ([`AuditFn`]), called on a blocking thread with the session (or
@@ -133,13 +186,13 @@
 //! until the destination closes is cut: the relay ends with the bytes that carried its head, or at once
 //! when they have already been relayed.
 
-use crate::policy::{normalize_host, Policy};
+use crate::policy::{is_local_literal, normalize_host, Policy, Verdict};
 use base64::Engine as _;
 use loom_core::event::NetDecision;
 use loom_core::SessionId;
 use rand::RngExt;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -320,9 +373,32 @@ struct Shared {
     unattributed: Mutex<Budget>,
     /// The tasks that serve or refuse a connection.
     tasks: TaskTracker,
+    /// The ports of the proxy's own listeners: the shared one, every session's open one and every retired
+    /// one. A connection to one of them is refused whatever the policy says.
+    own_ports: Mutex<HashSet<u16>>,
+    /// The ports of session listeners that were closed by a revoke, as numbers only. Always also in
+    /// `own_ports`.
+    retired: Mutex<HashSet<u16>>,
 }
 
 impl Shared {
+    /// The verdict on one resolved address: refused when it reaches one of the proxy's own listeners
+    /// (a loopback or unspecified address with an own port), else the policy's.
+    fn check_addr(&self, policy: &Policy, host: &str, port: u16, ip: IpAddr, name_rule: &str) -> Verdict {
+        if let Some(refused) = self.own_port_verdict(ip, port) {
+            return refused;
+        }
+        policy.check_addr(host, port, ip, name_rule)
+    }
+
+    /// The refusal for an address that reaches one of the proxy's own ports, else `None`.
+    fn own_port_verdict(&self, ip: IpAddr, port: u16) -> Option<Verdict> {
+        if is_local_literal(ip) && lock(&self.own_ports).contains(&port) {
+            return Some(Verdict { allowed: false, rule: format!("deny the egress proxy's own port {port}") });
+        }
+        None
+    }
+
     /// Registers a new connection, which has not sent its head yet, as pending; returns its id and the
     /// token that closes it.
     fn add_pending(&self, permit: OwnedSemaphorePermit) -> (u64, CancellationToken) {
@@ -420,10 +496,22 @@ impl Drop for PendingGuard<'_> {
 /// Why a connection on record as allowed ended when the proxy was cancelled.
 const SHUTDOWN: &str = "the egress proxy shut down";
 
+/// The listener a connection was accepted on.
+#[derive(Clone)]
+enum Origin {
+    /// The shared listener, for the reference clients.
+    Shared,
+    /// The listener of one session's command grant.
+    Session(SessionId),
+}
+
 struct Inner {
     port: u16,
     shared: Arc<Shared>,
     cancel: CancellationToken,
+    /// The session listeners: session id to its port and its token (a child of `cancel`). A revoke closes
+    /// the session's listener and removes it from here.
+    listeners: Mutex<HashMap<String, (u16, CancellationToken)>>,
 }
 
 impl Drop for Inner {
@@ -477,10 +565,12 @@ impl Proxy {
             refusals: semaphore(REFUSALS),
             unattributed: Mutex::new(Budget { since: std::time::Instant::now(), used: 0, left_out: 0 }),
             tasks: TaskTracker::new(),
+            own_ports: Mutex::new(HashSet::from([bound])),
+            retired: Mutex::new(HashSet::new()),
         });
         let cancel = CancellationToken::new();
-        tokio::spawn(accept_loop(listener, shared.clone(), cancel.clone()));
-        Ok(Proxy { inner: Arc::new(Inner { port: bound, shared, cancel }) })
+        tokio::spawn(accept_loop(listener, shared.clone(), cancel.clone(), cancel.clone(), Origin::Shared));
+        Ok(Proxy { inner: Arc::new(Inner { port: bound, shared, cancel, listeners: Mutex::new(HashMap::new()) }) })
     }
 
     /// The port actually bound.
@@ -488,7 +578,40 @@ impl Proxy {
         self.inner.port
     }
 
-    pub fn grant(&self, session: &SessionId, policy: Policy) -> SessionGrant {
+    /// The port of the session's own listener while it holds a command grant.
+    pub fn session_port(&self, session: &SessionId) -> Option<u16> {
+        let held = lock(&self.inner.shared.sessions).get(session.as_str()).is_some_and(|e| !e.reference);
+        if !held {
+            return None;
+        }
+        lock(&self.inner.listeners).get(session.as_str()).filter(|(_, t)| !t.is_cancelled()).map(|(p, _)| *p)
+    }
+
+    /// The port of the session's listener, opened (inside a Tokio runtime) on the first call.
+    fn session_listener(&self, session: &SessionId) -> Result<u16, ProxyError> {
+        let mut listeners = lock(&self.inner.listeners);
+        if let Some((port, token)) = listeners.get(session.as_str()) {
+            if !token.is_cancelled() {
+                return Ok(*port);
+            }
+        }
+        let shared = &self.inner.shared;
+        let listener = open_fresh_listener(shared, &|port| lock(&shared.retired).contains(&port))?;
+        let port = listener.local_addr().map_err(|source| ProxyError::Bind { port: 0, source })?.port();
+        let token = self.inner.cancel.child_token();
+        tokio::spawn(accept_loop(
+            listener,
+            shared.clone(),
+            self.inner.cancel.clone(),
+            token.clone(),
+            Origin::Session(session.clone()),
+        ));
+        listeners.insert(session.as_str().to_string(), (port, token));
+        Ok(port)
+    }
+
+    pub fn grant(&self, session: &SessionId, policy: Policy) -> Result<SessionGrant, ProxyError> {
+        let port = self.session_listener(session)?;
         let password = format!("{:032x}", rand::rng().random::<u128>());
         let limits = &self.inner.shared.limits;
         let entry = Entry {
@@ -500,7 +623,7 @@ impl Proxy {
             lookups: semaphore(limits.max_lookups_per_session),
         };
         lock(&self.inner.shared.sessions).insert(session.as_str().to_string(), entry);
-        SessionGrant { port: self.inner.port, user: session.as_str().to_string(), password }
+        Ok(SessionGrant { port, user: session.as_str().to_string(), password })
     }
 
     /// Mint a credential for in-process reference GET clients. It is not added to command env.
@@ -546,8 +669,14 @@ impl Proxy {
         lock(&self.inner.shared.sessions).get(session.as_str()).map(|e| e.policy.check_name(host, port))
     }
 
+    /// Drops the session's credentials and closes its listener; its port is retired (see the module
+    /// contract).
     pub fn revoke(&self, session: &SessionId) {
         lock(&self.inner.shared.sessions).retain(|_, entry| &entry.session != session);
+        if let Some((port, token)) = lock(&self.inner.listeners).remove(session.as_str()) {
+            lock(&self.inner.shared.retired).insert(port);
+            token.cancel();
+        }
     }
 
     /// Stop accepting connections. Open tunnels are closed.
@@ -566,14 +695,59 @@ impl Proxy {
     }
 }
 
+/// How many sockets are bound in a row to find a loopback port that is not one of the proxy's own.
+const LISTENER_ATTEMPTS: usize = 64;
+
+/// Opens a listener on a loopback port that is neither retired (`is_retired`) nor one of the proxy's own
+/// ports. The port is added to the own ports before `listen`. Sockets bound to unusable ports are held
+/// until a fresh one is found, so the system hands out another each time, and dropped on return.
+fn open_fresh_listener(shared: &Shared, is_retired: &dyn Fn(u16) -> bool) -> Result<TcpListener, ProxyError> {
+    let bind = |source: std::io::Error| ProxyError::Bind { port: 0, source };
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Err(bind(std::io::Error::other("a session's listener can only be opened inside a Tokio runtime")));
+    }
+    let mut aside = Vec::new();
+    for _ in 0..LISTENER_ATTEMPTS {
+        let socket = tokio::net::TcpSocket::new_v4().map_err(bind)?;
+        socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).map_err(bind)?;
+        let port = socket.local_addr().map_err(bind)?.port();
+        if is_retired(port) || !lock(&shared.own_ports).insert(port) {
+            aside.push(socket);
+            continue;
+        }
+        return match socket.listen(1024) {
+            Ok(listener) => Ok(listener),
+            Err(e) => {
+                lock(&shared.own_ports).remove(&port);
+                Err(bind(e))
+            }
+        };
+    }
+    Err(ProxyError::Bind {
+        port: 0,
+        source: std::io::Error::other(format!(
+            "No fresh loopback port was found in {LISTENER_ATTEMPTS} attempts, because the ports the system offered \
+             were all in use by the proxy or retired by a revoked session; restarting the daemon frees the retired ports."
+        )),
+    })
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-async fn accept_loop(listener: TcpListener, shared: Arc<Shared>, cancel: CancellationToken) {
+/// Accepts on one listener until `stop`; connections are served until `cancel` (the proxy's own token),
+/// so closing a session's listener leaves its open connections to finish.
+async fn accept_loop(
+    listener: TcpListener,
+    shared: Arc<Shared>,
+    cancel: CancellationToken,
+    stop: CancellationToken,
+    origin: Origin,
+) {
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            _ = stop.cancelled() => break,
             r = listener.accept() => match r {
                 Ok((stream, _)) => {
                     // At the limit, the slot of a connection being drained, or else of the oldest one still
@@ -582,7 +756,7 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>, cancel: Cancell
                     match slot {
                         Some(permit) => {
                             let (id, evicted) = shared.add_pending(permit);
-                            shared.tasks.spawn(handle(stream, shared.clone(), cancel.clone(), id, evicted));
+                            shared.tasks.spawn(handle(stream, shared.clone(), cancel.clone(), id, evicted, origin.clone()));
                         }
                         None => refuse(stream, &shared),
                     }
@@ -1091,13 +1265,19 @@ async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<(TcpStream, Allo
     let mut first_refusal: Option<(String, IpAddr)> = None;
     let mut first_failure: Option<(String, IpAddr, String)> = None;
     for ip in addrs {
-        let cv = policy.check_addr(cx.host, cx.port, ip, &name_rule);
+        let cv = cx.shared.check_addr(policy, cx.host, cx.port, ip, &name_rule);
         if !cv.allowed {
             first_refusal.get_or_insert((cv.rule, ip));
             continue;
         }
         match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(SocketAddr::new(ip, cx.port))).await {
             Ok(Ok(s)) => {
+                // A listener opened between the first check and the connect is in the set by now.
+                if let Some(refused) = cx.shared.own_port_verdict(ip, cx.port) {
+                    drop(s);
+                    first_refusal.get_or_insert((refused.rule, ip));
+                    continue;
+                }
                 let _ = s.set_nodelay(true);
                 // Nothing has been sent upstream yet; the connection is used only once it is on record.
                 return match cx.record(true, cv.rule.clone(), Some(ip)).await {
@@ -1144,7 +1324,7 @@ async fn check(client: &mut TcpStream, cx: &Ctx<'_>, policy: &Policy, slot: Owne
         // The first address the policy allows, else the first refusal.
         addrs.and_then(|addrs| {
             let mut checked =
-                addrs.into_iter().map(|ip| (policy.check_addr(cx.host, cx.port, ip, &name.rule), Some(ip)));
+                addrs.into_iter().map(|ip| (cx.shared.check_addr(policy, cx.host, cx.port, ip, &name.rule), Some(ip)));
             let first = checked.next().ok_or("the name has no addresses")?;
             Ok(if first.0.allowed { first } else { checked.find(|(v, _)| v.allowed).unwrap_or(first) })
         })
@@ -1177,6 +1357,13 @@ async fn reject(
     bad_request(client, shared, slot, why).await;
 }
 
+/// Answers `407` to a request whose credentials are missing, unknown, or of no use on this listener.
+async fn unauthorized(client: &mut TcpStream, shared: &Shared, slot: OwnedSemaphorePermit) {
+    let body = "loom proxy: missing or unknown proxy credentials. Use the proxy settings from the command's environment (HTTP_PROXY / HTTPS_PROXY), which carry this session's credentials.\n";
+    let challenge = "Proxy-Authenticate: Basic realm=\"loom\"\r\n";
+    answer(client, shared, slot, "407 Proxy Authentication Required", challenge, body).await;
+}
+
 /// Serves one connection. It is pending (`id`, closed through `evicted`) until its head is complete.
 async fn handle(
     mut client: TcpStream,
@@ -1184,6 +1371,7 @@ async fn handle(
     cancel: CancellationToken,
     id: u64,
     evicted: CancellationToken,
+    origin: Origin,
 ) {
     let _ = client.set_nodelay(true);
     let pending = PendingGuard { shared: &shared, id };
@@ -1213,12 +1401,30 @@ async fn handle(
         Err(why) => {
             let rule = format!("proxy authentication failed: {why}");
             audit_local(&shared, None, local_decision(Some(&head), &rule)).await;
-            let body = "loom proxy: missing or unknown proxy credentials. Use the proxy settings from the command's environment (HTTP_PROXY / HTTPS_PROXY), which carry this session's credentials.\n";
-            let challenge = "Proxy-Authenticate: Basic realm=\"loom\"\r\n";
-            return answer(&mut client, &shared, slot, "407 Proxy Authentication Required", challenge, body).await;
+            return unauthorized(&mut client, &shared, slot).await;
         }
     };
     let Authed { reference, session, policy, permits, lookups } = auth;
+    // Command credentials count only on their own session's listener, reference ones only on the shared
+    // one; nothing else of the request is acted on before this.
+    let wrong_port = match (&origin, reference) {
+        (Origin::Shared, true) => None,
+        (Origin::Session(l), false) if *l == session => None,
+        (Origin::Shared, false) => Some(format!("credentials of session {} on the shared port", session.as_str())),
+        (Origin::Session(l), true) => Some(format!("reference credentials on the port of session {}", l.as_str())),
+        (Origin::Session(l), false) => {
+            Some(format!("credentials of session {} on the port of session {}", session.as_str(), l.as_str()))
+        }
+    };
+    if let Some(why) = wrong_port {
+        let rule = format!("proxy authentication failed: {why}");
+        let listener_session = match &origin {
+            Origin::Shared => None,
+            Origin::Session(l) => Some(l),
+        };
+        audit_local(&shared, listener_session, local_decision(Some(&head), &rule)).await;
+        return unauthorized(&mut client, &shared, slot).await;
+    }
     if reference && !matches!(head.method.as_str(), "GET" | "CONNECT" | CHECK_METHOD) {
         return reject(
             &mut client,
@@ -2200,13 +2406,13 @@ mod tests {
             allow_private: vec!["127.0.0.1".into()],
             ..NetworkCfg::default()
         };
-        let raw_grant = p.grant(&sid, Policy::new(&cfg).unwrap());
+        let raw_grant = p.grant(&sid, Policy::new(&cfg).unwrap()).unwrap();
         let reference = p.grant_reference(&sid, &cfg).unwrap();
         assert_ne!(reference.url(), raw_grant.url());
         assert!(reference.matches_host("127.0.0.1", port));
         assert!(!raw_grant.env().values().any(|value| value == &reference.url()));
         let url = format!("http://127.0.0.1:{port}/reference?q=public");
-        let denied = raw(p.port(), format!("GET {url} HTTP/1.1\r\n{}\r\n", auth(&raw_grant)).as_bytes()).await;
+        let denied = raw(raw_grant.port, format!("GET {url} HTTP/1.1\r\n{}\r\n", auth(&raw_grant)).as_bytes()).await;
         assert_eq!(status(&denied), 403);
         assert!(!lock(&seen).last().unwrap().1.allowed);
         let post = raw(
@@ -2241,8 +2447,8 @@ mod tests {
         let (p, mut rx) = start().await;
         let echo = echo_server().await;
         let sid = SessionId::from("s-one");
-        let g = p.grant(&sid, lab());
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let g = p.grant(&sid, lab()).unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
         let head = read_until(&mut s, "\r\n\r\n").await;
         assert_eq!(head, "HTTP/1.1 200 Connection established\r\n\r\n");
@@ -2264,8 +2470,8 @@ mod tests {
     async fn localhost_name_reaches_allowed_loopback_address() {
         let (p, mut rx) = start().await;
         let echo = echo_server().await;
-        let g = p.grant(&SessionId::from("s-lh"), lab());
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let g = p.grant(&SessionId::from("s-lh"), lab()).unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(connect_req(&g, &format!("localhost:{echo}")).as_bytes()).await.unwrap();
         let head = read_until(&mut s, "\r\n\r\n").await;
         assert_eq!(status(&head), 200);
@@ -2279,12 +2485,12 @@ mod tests {
         let (p, mut rx) = start().await;
         let (port, server) = http_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await;
         let sid = SessionId::from("s-fwd");
-        let g = p.grant(&sid, lab());
+        let g = p.grant(&sid, lab()).unwrap();
         let req = format!(
             "GET http://127.0.0.1:{port}/a/b?x=1#frag HTTP/1.1\r\nHost: wrong.test\r\n{}Proxy-Connection: keep-alive\r\nConnection: keep-alive\r\nX-Test: 1\r\n\r\n",
             auth(&g)
         );
-        let resp = raw(p.port(), req.as_bytes()).await;
+        let resp = raw(g.port, req.as_bytes()).await;
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
         assert!(resp.ends_with("\r\n\r\nok"), "{resp}");
         let got = String::from_utf8(server.await.unwrap()).unwrap();
@@ -2306,9 +2512,9 @@ mod tests {
     async fn plain_forward_relays_request_body() {
         let (p, _rx) = start().await;
         let (port, server) = http_server("HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n").await;
-        let g = p.grant(&SessionId::from("s-post"), lab());
+        let g = p.grant(&SessionId::from("s-post"), lab()).unwrap();
         let req = format!("POST http://127.0.0.1:{port} HTTP/1.1\r\n{}Content-Length: 11\r\n\r\nhello world", auth(&g));
-        let resp = raw(p.port(), req.as_bytes()).await;
+        let resp = raw(g.port, req.as_bytes()).await;
         assert_eq!(status(&resp), 201, "{resp}");
         let got = String::from_utf8(server.await.unwrap()).unwrap();
         assert!(got.starts_with("POST / HTTP/1.1\r\n"), "{got}");
@@ -2318,9 +2524,9 @@ mod tests {
     #[tokio::test]
     async fn a_chunked_request_body_is_forwarded_to_its_last_chunk_and_no_further() {
         let (p, _rx) = start().await;
-        let g = p.grant(&SessionId::from("s-chunked-post"), lab());
+        let g = p.grant(&SessionId::from("s-chunked-post"), lab()).unwrap();
         let (port, server) = two_answer_server("HTTP/1.0 200 OK\r\n\r\nfirst", FORGED, Duration::from_secs(2)).await;
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         let head = format!("POST http://127.0.0.1:{port}/ HTTP/1.1\r\n{}Transfer-Encoding: chunked\r\n\r\n", auth(&g));
         s.write_all(format!("{head}4\r\nbo").as_bytes()).await.unwrap();
         let begun = read_until(&mut s, "first").await;
@@ -2344,9 +2550,9 @@ mod tests {
     async fn failing_audit_refuses_the_connection_and_nothing_reaches_the_upstream() {
         let (p, mut rx, seen) = start_audited(true, Limits::default(), None).await;
         let (port, server) = silent_server().await;
-        let g = p.grant(&SessionId::from("s-af"), lab());
+        let g = p.grant(&SessionId::from("s-af"), lab()).unwrap();
         let req = format!("GET http://127.0.0.1:{port}/x HTTP/1.1\r\n{}\r\n", auth(&g));
-        let resp = raw(p.port(), req.as_bytes()).await;
+        let resp = raw(g.port, req.as_bytes()).await;
         assert_eq!(status(&resp), 502, "{resp}");
         assert!(
             resp.contains("X-Loom-Proxy: 1\r\n") && resp.contains("egress audit log could not be written"),
@@ -2359,7 +2565,7 @@ mod tests {
         assert!(!d.allowed && d.rule.contains("audit log not written"), "{d:?}");
         // CONNECT is refused before the 200 as well.
         let (port, server) = silent_server().await;
-        let r = raw(p.port(), connect_req(&g, &format!("127.0.0.1:{port}")).as_bytes()).await;
+        let r = raw(g.port, connect_req(&g, &format!("127.0.0.1:{port}")).as_bytes()).await;
         assert_eq!(status(&r), 502, "{r}");
         assert!(server.await.unwrap().0.is_empty());
     }
@@ -2387,9 +2593,9 @@ mod tests {
             let _ = s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await;
             (n, audited)
         });
-        let g = p.grant(&SessionId::from("s-ord"), lab());
+        let g = p.grant(&SessionId::from("s-ord"), lab()).unwrap();
         let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
-        let resp = raw(p.port(), req.as_bytes()).await;
+        let resp = raw(g.port, req.as_bytes()).await;
         assert_eq!(status(&resp), 204, "{resp}");
         assert_eq!(server.await.unwrap(), (1, true), "the upstream saw bytes before the audit record was written");
     }
@@ -2399,27 +2605,27 @@ mod tests {
         let limits = Limits { head_timeout: Duration::from_millis(300), ..Limits::default() };
         let (p, mut rx, seen) = start_audited(false, limits, None).await;
         let sid = SessionId::from("s-aud");
-        let g = p.grant(&sid, lab());
+        let g = p.grant(&sid, lab()).unwrap();
         // Requests of a session: under that session, with the destination when the target names one.
-        let r = raw(p.port(), format!("GET https://example.test/ HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await;
+        let r = raw(g.port, format!("GET https://example.test/ HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await;
         assert_eq!(status(&r), 400);
-        let r = raw(p.port(), connect_req(&g, "nohostport").as_bytes()).await;
+        let r = raw(g.port, connect_req(&g, "nohostport").as_bytes()).await;
         assert_eq!(status(&r), 400);
         // Requests that name no granted session: under no session, whatever user they claim.
-        let none = raw(p.port(), b"CONNECT 127.0.0.1:9 HTTP/1.1\r\n\r\n").await;
+        let none = raw(g.port, b"CONNECT 127.0.0.1:9 HTTP/1.1\r\n\r\n").await;
         assert_eq!(status(&none), 407);
         let unknown = SessionGrant { user: "s-nobody".into(), ..g.clone() };
-        assert_eq!(status(&raw(p.port(), connect_req(&unknown, "127.0.0.1:9").as_bytes()).await), 407);
+        assert_eq!(status(&raw(g.port, connect_req(&unknown, "127.0.0.1:9").as_bytes()).await), 407);
         let wrong = SessionGrant { password: "0".repeat(32), ..g.clone() };
-        assert_eq!(status(&raw(p.port(), connect_req(&wrong, "127.0.0.1:9").as_bytes()).await), 407);
-        assert_eq!(status(&raw(p.port(), b"garbage\r\n\r\n").await), 400);
-        let mut slow = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        assert_eq!(status(&raw(g.port, connect_req(&wrong, "127.0.0.1:9").as_bytes()).await), 407);
+        assert_eq!(status(&raw(g.port, b"garbage\r\n\r\n").await), 400);
+        let mut slow = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         slow.write_all(b"CONNECT 127.0.0.1:9 HT").await.unwrap();
         let mut out = Vec::new();
         timeout(T, slow.read_to_end(&mut out)).await.unwrap().unwrap();
         assert_eq!(status(&String::from_utf8_lossy(&out)), 400);
         let check = format!("{CHECK_METHOD} 127.0.0.1:9 HTTP/1.1\r\n\r\n");
-        assert_eq!(status(&raw(p.port(), check.as_bytes()).await), 407);
+        assert_eq!(status(&raw(g.port, check.as_bytes()).await), 407);
         let seen = lock(&seen).clone();
         assert_eq!(seen.len(), 8, "{seen:?}");
         assert!(seen.iter().all(|(_, d)| !d.allowed));
@@ -2462,10 +2668,10 @@ mod tests {
         assert_eq!(lock(&seen).len(), 11);
         assert!(last.ends_with("(3 similar answers before this one were not recorded)"), "{last}");
         // Long texts from the request are cut, and the cut is marked.
-        let g = p.grant(&SessionId::from("s-cut"), lab());
-        let r = raw(p.port(), format!("CONNECT {}!:1 HTTP/1.1\r\n{}\r\n", "b".repeat(500), auth(&g)).as_bytes()).await;
+        let g = p.grant(&SessionId::from("s-cut"), lab()).unwrap();
+        let r = raw(g.port, format!("CONNECT {}!:1 HTTP/1.1\r\n{}\r\n", "b".repeat(500), auth(&g)).as_bytes()).await;
         assert_eq!(status(&r), 400);
-        let r = raw(p.port(), format!("CONNECT {}:1 HTTP/1.1\r\n\r\n", "a".repeat(500)).as_bytes()).await;
+        let r = raw(g.port, format!("CONNECT {}:1 HTTP/1.1\r\n\r\n", "a".repeat(500)).as_bytes()).await;
         assert_eq!(status(&r), 407);
         let all = lock(&seen).clone();
         let (_, bad) = all.iter().find(|(s, _)| s.as_ref().is_some_and(|s| s.as_str() == "s-cut")).unwrap();
@@ -2478,19 +2684,20 @@ mod tests {
     async fn missing_wrong_and_revoked_credentials_get_407() {
         let (p, mut rx) = start().await;
         let sid = SessionId::from("s-auth");
-        let g = p.grant(&sid, lab());
-        let none = raw(p.port(), b"CONNECT 127.0.0.1:9 HTTP/1.1\r\n\r\n").await;
+        let g = p.grant(&sid, lab()).unwrap();
+        let none = raw(g.port, b"CONNECT 127.0.0.1:9 HTTP/1.1\r\n\r\n").await;
         assert_eq!(status(&none), 407, "{none}");
         assert!(none.contains("Proxy-Authenticate: Basic realm=\"loom\"\r\n"), "{none}");
         assert!(none.contains("X-Loom-Proxy: 1\r\n"));
         let wrong = SessionGrant { password: "0".repeat(32), ..g.clone() };
-        let r = raw(p.port(), connect_req(&wrong, "127.0.0.1:9").as_bytes()).await;
+        let r = raw(g.port, connect_req(&wrong, "127.0.0.1:9").as_bytes()).await;
         assert_eq!(status(&r), 407);
         let unknown = SessionGrant { user: "s-nobody".into(), ..g.clone() };
-        assert_eq!(status(&raw(p.port(), connect_req(&unknown, "127.0.0.1:9").as_bytes()).await), 407);
-        let garbage = raw(p.port(), b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nProxy-Authorization: Basic !!!\r\n\r\n").await;
+        assert_eq!(status(&raw(g.port, connect_req(&unknown, "127.0.0.1:9").as_bytes()).await), 407);
+        let garbage = raw(g.port, b"CONNECT 127.0.0.1:9 HTTP/1.1\r\nProxy-Authorization: Basic !!!\r\n\r\n").await;
         assert_eq!(status(&garbage), 407);
         p.revoke(&sid);
+        // The session's listener is closed; the old credentials are unknown on the shared port.
         assert_eq!(status(&raw(p.port(), connect_req(&g, "127.0.0.1:9").as_bytes()).await), 407);
         no_more(&mut rx);
     }
@@ -2499,8 +2706,8 @@ mod tests {
     async fn deny_rule_answers_403_with_one_decision() {
         let (p, mut rx) = start().await;
         let sid = SessionId::from("s-deny");
-        let g = p.grant(&sid, policy(NetworkMode::Open, &[], &["blocked.test"], &[]));
-        let r = raw(p.port(), connect_req(&g, "Blocked.test.:443").as_bytes()).await;
+        let g = p.grant(&sid, policy(NetworkMode::Open, &[], &["blocked.test"], &[])).unwrap();
+        let r = raw(g.port, connect_req(&g, "Blocked.test.:443").as_bytes()).await;
         assert_eq!(status(&r), 403, "{r}");
         assert!(r.contains("X-Loom-Proxy: 1\r\n"));
         assert!(r.contains("Connection: close\r\n"));
@@ -2516,19 +2723,19 @@ mod tests {
     async fn open_mode_loopback_is_refused_as_private() {
         let (p, mut rx) = start().await;
         let echo = echo_server().await;
-        let g = p.grant(&SessionId::from("s-priv"), policy(NetworkMode::Open, &[], &[], &[]));
-        let r = raw(p.port(), connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await;
+        let g = p.grant(&SessionId::from("s-priv"), policy(NetworkMode::Open, &[], &[], &[])).unwrap();
+        let r = raw(g.port, connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await;
         assert_eq!(status(&r), 403, "{r}");
         let (_, d) = decision(&mut rx).await;
         assert!(!d.allowed);
         assert_eq!(d.rule, "deny private-address 127.0.0.1");
         assert_eq!(d.resolved.as_deref(), Some("127.0.0.1"));
         // The same through a name that resolves to loopback, and through a mapped IPv6 literal.
-        let r = raw(p.port(), connect_req(&g, &format!("localhost:{echo}")).as_bytes()).await;
+        let r = raw(g.port, connect_req(&g, &format!("localhost:{echo}")).as_bytes()).await;
         assert_eq!(status(&r), 403, "{r}");
         let (_, d) = decision(&mut rx).await;
         assert!(!d.allowed && d.resolved.is_some(), "{d:?}");
-        let r = raw(p.port(), connect_req(&g, &format!("[::ffff:127.0.0.1]:{echo}")).as_bytes()).await;
+        let r = raw(g.port, connect_req(&g, &format!("[::ffff:127.0.0.1]:{echo}")).as_bytes()).await;
         assert_eq!(status(&r), 403, "{r}");
         let (_, d) = decision(&mut rx).await;
         assert_eq!(d.rule, "deny private-address ::ffff:127.0.0.1");
@@ -2550,7 +2757,7 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let p = Proxy::start_inner(0, tx, None, Limits::default(), Some(resolver)).await.unwrap();
         let deny = ["10.0.0.5", "10.1.0.0/16", "203.0.113.7"];
-        let g = p.grant(&SessionId::from("s-dr"), policy(NetworkMode::Open, &[], &deny, &["10.0.0.0/8"]));
+        let g = p.grant(&SessionId::from("s-dr"), policy(NetworkMode::Open, &[], &deny, &["10.0.0.0/8"])).unwrap();
         for (dest, rule) in [
             ("lab.test:80", "deny 10.0.0.5"),
             ("mapped.test:80", "deny 10.0.0.5"),
@@ -2558,7 +2765,7 @@ mod tests {
             ("cidr.test:80", "deny 10.1.0.0/16"),
             ("pub.test:443", "deny 203.0.113.7"),
         ] {
-            let r = raw(p.port(), connect_req(&g, dest).as_bytes()).await;
+            let r = raw(g.port, connect_req(&g, dest).as_bytes()).await;
             assert_eq!(status(&r), 403, "{dest}: {r}");
             let (_, d) = decision(&mut rx).await;
             assert!(!d.allowed, "{dest}: {d:?}");
@@ -2587,17 +2794,19 @@ mod tests {
         });
         let (tx, mut rx) = unbounded_channel();
         let p = Proxy::start_inner(0, tx, None, Limits::default(), Some(resolver)).await.unwrap();
-        let open = p.grant(&SessionId::from("s-c-open"), policy(NetworkMode::Open, &[], &[], &[]));
-        let al = p.grant(&SessionId::from("s-c-al"), policy(NetworkMode::Allowlist, &["*"], &[], &[]));
-        let listed = p.grant(&SessionId::from("s-c-ls"), policy(NetworkMode::Open, &[], &[], &["10.0.0.5", "8.8.8.8"]));
+        let open = p.grant(&SessionId::from("s-c-open"), policy(NetworkMode::Open, &[], &[], &[])).unwrap();
+        let al = p.grant(&SessionId::from("s-c-al"), policy(NetworkMode::Allowlist, &["*"], &[], &[])).unwrap();
+        let listed =
+            p.grant(&SessionId::from("s-c-ls"), policy(NetworkMode::Open, &[], &[], &["10.0.0.5", "8.8.8.8"])).unwrap();
         let deny = ["10.0.0.5", "8.8.8.0/24"];
-        let denied = p.grant(&SessionId::from("s-c-dn"), policy(NetworkMode::Open, &[], &deny, &["10.0.0.0/8"]));
+        let denied =
+            p.grant(&SessionId::from("s-c-dn"), policy(NetworkMode::Open, &[], &deny, &["10.0.0.0/8"])).unwrap();
         for (name, addr) in &table {
             let v4 = name.split_once('-').map_or("", |(_, rest)| rest.trim_end_matches(".test"));
             let shown = addr.parse::<IpAddr>().unwrap().to_string();
             for dest in [format!("{name}:443"), format!("[{addr}]:443")] {
                 for g in [&open, &al] {
-                    let (code, d) = check_on(p.port(), g, &dest, &mut rx).await;
+                    let (code, d) = check_on(g.port, g, &dest, &mut rx).await;
                     if v4 == "8.8.8.8" {
                         assert_eq!(code, 200, "{dest}: {d:?}");
                     } else {
@@ -2609,12 +2818,12 @@ mod tests {
                         assert_eq!(d.resolved.as_deref(), Some(shown.as_str()), "{dest}");
                     }
                 }
-                let (code, d) = check_on(p.port(), &listed, &dest, &mut rx).await;
+                let (code, d) = check_on(listed.port, &listed, &dest, &mut rx).await;
                 assert_eq!(code == 200, matches!(v4, "10.0.0.5" | "8.8.8.8"), "{dest}: {d:?}");
                 if v4 == "10.0.0.5" {
                     assert_eq!(d.rule, "allow_private 10.0.0.5 (check only)", "{dest}");
                 }
-                let (code, d) = check_on(p.port(), &denied, &dest, &mut rx).await;
+                let (code, d) = check_on(denied.port, &denied, &dest, &mut rx).await;
                 match v4 {
                     "10.0.0.5" => assert_eq!((code, d.rule.as_str()), (403, "deny 10.0.0.5 (check only)"), "{dest}"),
                     "8.8.8.8" => assert_eq!((code, d.rule.as_str()), (403, "deny 8.8.8.0/24 (check only)"), "{dest}"),
@@ -2623,7 +2832,7 @@ mod tests {
             }
         }
         // A real connection through a name to such an address is refused before connecting.
-        let r = raw(p.port(), connect_req(&open, "f2-127.0.0.1.test:443").as_bytes()).await;
+        let r = raw(open.port, connect_req(&open, "f2-127.0.0.1.test:443").as_bytes()).await;
         assert_eq!(status(&r), 403, "{r}");
         assert_eq!(decision(&mut rx).await.1.rule, "deny private-address 2002:7f00:1::1");
         no_more(&mut rx);
@@ -2645,10 +2854,10 @@ mod tests {
         let limits = Limits { max_lookups: 3, max_lookups_per_session: 2, ..Limits::default() };
         let (tx, _rx) = unbounded_channel();
         let p = Proxy::start_inner(0, tx, None, limits, Some(resolver)).await.unwrap();
-        let ga = p.grant(&SessionId::from("s-la"), policy(NetworkMode::Open, &[], &[], &[]));
-        let gb = p.grant(&SessionId::from("s-lb"), policy(NetworkMode::Open, &[], &[], &[]));
+        let ga = p.grant(&SessionId::from("s-la"), policy(NetworkMode::Open, &[], &[], &[])).unwrap();
+        let gb = p.grant(&SessionId::from("s-lb"), policy(NetworkMode::Open, &[], &[], &[])).unwrap();
         let ask = |g: &SessionGrant| {
-            let (port, req) = (p.port(), connect_req(g, "slow.test:80"));
+            let (port, req) = (g.port, connect_req(g, "slow.test:80"));
             tokio::spawn(async move { status(&raw(port, req.as_bytes()).await) })
         };
         let settled = |n: usize| {
@@ -2681,13 +2890,13 @@ mod tests {
     #[tokio::test]
     async fn allowlist_miss_is_refused_without_resolving() {
         let (p, mut rx) = start().await;
-        let g = p.grant(&SessionId::from("s-al"), policy(NetworkMode::Allowlist, &["only.test"], &[], &[]));
-        let r = raw(p.port(), connect_req(&g, "other.test:443").as_bytes()).await;
+        let g = p.grant(&SessionId::from("s-al"), policy(NetworkMode::Allowlist, &["only.test"], &[], &[])).unwrap();
+        let r = raw(g.port, connect_req(&g, "other.test:443").as_bytes()).await;
         assert_eq!(status(&r), 403);
         let (_, d) = decision(&mut rx).await;
         assert_eq!((d.rule.as_str(), d.resolved), ("not in allow list", None));
-        let g = p.grant(&SessionId::from("s-da"), policy(NetworkMode::DenyAll, &[], &[], &[]));
-        let r = raw(p.port(), format!("GET http://x.test/ HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await;
+        let g = p.grant(&SessionId::from("s-da"), policy(NetworkMode::DenyAll, &[], &[], &[])).unwrap();
+        let r = raw(g.port, format!("GET http://x.test/ HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await;
         assert_eq!(status(&r), 403);
         let (_, d) = decision(&mut rx).await;
         assert_eq!((d.rule.as_str(), d.method.as_str()), ("mode deny_all", "GET"));
@@ -2703,14 +2912,14 @@ mod tests {
         let (tx, mut rx) = unbounded_channel();
         let p = Proxy::start_inner(0, tx, None, Limits::default(), Some(resolver)).await.unwrap();
         let sid = SessionId::from("s-check");
-        let g = p.grant(&sid, policy(NetworkMode::Open, &[], &["blocked.test"], &["127.0.0.1"]));
+        let g = p.grant(&sid, policy(NetworkMode::Open, &[], &["blocked.test"], &["127.0.0.1"])).unwrap();
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
         let ask = |target: String| format!("{CHECK_METHOD} {target} HTTP/1.1\r\n{}\r\n", auth(&g));
         let rule = |r: &str| r.lines().find_map(|l| l.strip_prefix("X-Loom-Rule: ")).map(str::to_string);
         // Allowed, as host:port and as the absolute URI an HTTP client sends; nothing connects.
         for target in [format!("lab.test:{port}"), format!("http://lab.test:{port}/")] {
-            let r = raw(p.port(), ask(target).as_bytes()).await;
+            let r = raw(g.port, ask(target).as_bytes()).await;
             assert_eq!(status(&r), 200, "{r}");
             assert!(r.contains("X-Loom-Proxy: 1\r\n"), "{r}");
             assert_eq!(rule(&r).as_deref(), Some("allow_private 127.0.0.1"), "{r}");
@@ -2723,13 +2932,13 @@ mod tests {
         }
         assert!(timeout(Duration::from_millis(200), l.accept()).await.is_err(), "a check connected to the destination");
         // Refused, with the refusal text and the rule.
-        let r = raw(p.port(), ask("blocked.test:443".into()).as_bytes()).await;
+        let r = raw(g.port, ask("blocked.test:443".into()).as_bytes()).await;
         assert_eq!(status(&r), 403, "{r}");
         assert_eq!(rule(&r).as_deref(), Some("deny blocked.test"), "{r}");
         assert!(r.contains("refused by rule `deny blocked.test`"), "{r}");
         assert_eq!(decision(&mut rx).await.1.rule, "deny blocked.test (check only)");
         // A name that does not resolve.
-        let r = raw(p.port(), ask("nowhere.test:443".into()).as_bytes()).await;
+        let r = raw(g.port, ask("nowhere.test:443".into()).as_bytes()).await;
         assert_eq!(status(&r), 502, "{r}");
         let (_, d) = decision(&mut rx).await;
         assert!(
@@ -2737,7 +2946,7 @@ mod tests {
             "{d:?}"
         );
         // A check needs the session's credentials like any request.
-        let r = raw(p.port(), format!("{CHECK_METHOD} blocked.test:443 HTTP/1.1\r\n\r\n").as_bytes()).await;
+        let r = raw(g.port, format!("{CHECK_METHOD} blocked.test:443 HTTP/1.1\r\n\r\n").as_bytes()).await;
         assert_eq!(status(&r), 407, "{r}");
         no_more(&mut rx);
     }
@@ -2746,20 +2955,20 @@ mod tests {
     async fn set_policy_changes_what_the_same_credentials_may_reach() {
         let (p, mut rx) = start().await;
         let sid = SessionId::from("s-sp");
-        let g = p.grant(&sid, policy(NetworkMode::Allowlist, &["only.test"], &[], &[]));
-        let r = raw(p.port(), connect_req(&g, "other.test:443").as_bytes()).await;
+        let g = p.grant(&sid, policy(NetworkMode::Allowlist, &["only.test"], &[], &[])).unwrap();
+        let r = raw(g.port, connect_req(&g, "other.test:443").as_bytes()).await;
         assert_eq!(status(&r), 403);
         let (_, d) = decision(&mut rx).await;
         assert_eq!(d.rule.as_str(), "not in allow list");
         // The new policy lists the host; the same credentials now pass the name check.
         assert!(p.set_policy(&sid, policy(NetworkMode::Allowlist, &["only.test", "other.test"], &[], &[])));
-        let r = raw(p.port(), connect_req(&g, "other.test:443").as_bytes()).await;
+        let r = raw(g.port, connect_req(&g, "other.test:443").as_bytes()).await;
         assert_ne!(status(&r), 407, "{r}");
         let (_, d) = decision(&mut rx).await;
         assert_ne!(d.rule.as_str(), "not in allow list", "{d:?}");
         // And back.
         assert!(p.set_policy(&sid, policy(NetworkMode::DenyAll, &[], &[], &[])));
-        let r = raw(p.port(), connect_req(&g, "other.test:443").as_bytes()).await;
+        let r = raw(g.port, connect_req(&g, "other.test:443").as_bytes()).await;
         assert_eq!(status(&r), 403);
         let (_, d) = decision(&mut rx).await;
         assert_eq!(d.rule.as_str(), "mode deny_all");
@@ -2774,8 +2983,8 @@ mod tests {
             let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
             l.local_addr().unwrap().port()
         };
-        let g = p.grant(&SessionId::from("s-502"), lab());
-        let r = raw(p.port(), connect_req(&g, &format!("127.0.0.1:{dead}")).as_bytes()).await;
+        let g = p.grant(&SessionId::from("s-502"), lab()).unwrap();
+        let r = raw(g.port, connect_req(&g, &format!("127.0.0.1:{dead}")).as_bytes()).await;
         assert_eq!(status(&r), 502, "{r}");
         assert!(r.contains("X-Loom-Proxy: 1\r\n"));
         let (_, d) = decision(&mut rx).await;
@@ -2816,7 +3025,7 @@ mod tests {
         });
         let (tx, _rx) = unbounded_channel();
         let p = Proxy::start_inner(0, tx, Some(audit), Limits::default(), None).await.unwrap();
-        let g = p.grant(&SessionId::from("s-after"), lab());
+        let g = p.grant(&SessionId::from("s-after"), lab()).unwrap();
         let lines = |n: usize| {
             let path = path.clone();
             async move {
@@ -2832,19 +3041,19 @@ mod tests {
             }
         };
         // A forwarded request: the destination is gone before the request head can be written to it.
-        let r = raw(p.port(), format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await;
+        let r = raw(g.port, format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await;
         assert_eq!(status(&r), 502, "{r}");
         assert_eq!(timeout(T, allows.recv()).await.unwrap().as_deref(), Some("GET"));
         // A tunnel whose client resets while its allow is being recorded, before the proxy can answer.
         let echo = echo_server().await;
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
         assert_eq!(timeout(T, allows.recv()).await.unwrap().as_deref(), Some("CONNECT"));
         s.set_zero_linger().unwrap();
         drop(s);
         lines(4).await;
         // A tunnel whose destination resets before it sends a byte, while the client stays.
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(connect_req(&g, &format!("127.0.0.1:{port}")).as_bytes()).await.unwrap();
         assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
         let mut rest = Vec::new();
@@ -2852,7 +3061,7 @@ mod tests {
         assert!(rest.is_empty(), "{rest:?}");
         lines(6).await;
         // A tunnel both sides close before the destination sent a byte.
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
         assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
         s.shutdown().await.unwrap();
@@ -2882,19 +3091,18 @@ mod tests {
         let (p, mut rx) = start().await;
         let echo = echo_server().await;
         let (a, b) = (SessionId::from("s-aaa"), SessionId::from("s-bbb"));
-        let ga = p.grant(&a, lab());
-        let gb = p.grant(&b, policy(NetworkMode::Open, &[], &[], &[]));
+        let ga = p.grant(&a, lab()).unwrap();
+        let gb = p.grant(&b, policy(NetworkMode::Open, &[], &[], &[])).unwrap();
         let dest = format!("127.0.0.1:{echo}");
-        let port = p.port();
         let ra = connect_req(&ga, &dest);
         let rb = connect_req(&gb, &dest);
         let one = async {
-            let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let mut s = TcpStream::connect(("127.0.0.1", ga.port)).await.unwrap();
             s.write_all(ra.as_bytes()).await.unwrap();
             let h = read_until(&mut s, "\r\n\r\n").await;
             status(&h)
         };
-        let two = async { status(&raw(port, rb.as_bytes()).await) };
+        let two = async { status(&raw(gb.port, rb.as_bytes()).await) };
         let (sa, sb) = tokio::join!(one, two);
         assert_eq!((sa, sb), (200, 403));
         let mut seen = [decision(&mut rx).await, decision(&mut rx).await];
@@ -2910,7 +3118,7 @@ mod tests {
     async fn malformed_requests_get_400_and_server_keeps_serving() {
         let (p, mut rx) = start().await;
         let echo = echo_server().await;
-        let g = p.grant(&SessionId::from("s-bad"), lab());
+        let g = p.grant(&SessionId::from("s-bad"), lab()).unwrap();
         let a = auth(&g);
         let cases: Vec<String> = vec![
             "garbage\r\n\r\n".into(),
@@ -2928,17 +3136,17 @@ mod tests {
             format!("GET http://h\u{e9}.test/ HTTP/1.1\r\n{a}\r\n"),
         ];
         for c in cases {
-            let r = raw(p.port(), c.as_bytes()).await;
+            let r = raw(g.port, c.as_bytes()).await;
 
             assert_eq!(status(&r), 400, "request {c:?} got {r}");
             assert!(r.contains("X-Loom-Proxy: 1\r\n"), "{r}");
         }
         // A client that connects and leaves, or sends half a head, does not disturb anything.
-        drop(TcpStream::connect(("127.0.0.1", p.port())).await.unwrap());
-        let mut half = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        drop(TcpStream::connect(("127.0.0.1", g.port)).await.unwrap());
+        let mut half = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         half.write_all(b"CONNECT 127.0.0.1:1 HT").await.unwrap();
         drop(half);
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
         assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
         let (_, d) = decision(&mut rx).await;
@@ -2949,21 +3157,21 @@ mod tests {
     #[tokio::test]
     async fn oversized_head_gets_400() {
         let (p, _rx) = start().await;
-        let g = p.grant(&SessionId::from("s-big"), lab());
+        let g = p.grant(&SessionId::from("s-big"), lab()).unwrap();
         let req = format!("CONNECT 127.0.0.1:1 HTTP/1.1\r\n{}X-Pad: {}\r\n\r\n", auth(&g), "a".repeat(70 * 1024));
-        let r = raw(p.port(), req.as_bytes()).await;
+        let r = raw(g.port, req.as_bytes()).await;
         assert_eq!(status(&r), 400, "{}", &r[..r.len().min(200)]);
         assert!(r.contains("64 KiB"));
         // Still serving.
-        assert_eq!(status(&raw(p.port(), b"x\r\n\r\n").await), 400);
+        assert_eq!(status(&raw(g.port, b"x\r\n\r\n").await), 400);
     }
 
     #[tokio::test]
     async fn connection_caps_apply_globally_and_per_session() {
         let echo = echo_server().await;
         let dest = format!("127.0.0.1:{echo}");
-        let tunnel = |p: &Proxy, g: &SessionGrant| {
-            let (port, req) = (p.port(), connect_req(g, &dest));
+        let tunnel = |_p: &Proxy, g: &SessionGrant| {
+            let (port, req) = (g.port, connect_req(g, &dest));
             async move {
                 let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
                 s.write_all(req.as_bytes()).await.unwrap();
@@ -2974,10 +3182,11 @@ mod tests {
         // Per session: the second tunnel of a session at its cap gets 429; another session is unaffected.
         let limits = Limits { max_per_session: 1, ..Limits::default() };
         let (p, _rx, seen) = start_audited(false, limits, None).await;
-        let (ga, gb) = (p.grant(&SessionId::from("s-ca"), lab()), p.grant(&SessionId::from("s-cb"), lab()));
+        let (ga, gb) =
+            (p.grant(&SessionId::from("s-ca"), lab()).unwrap(), p.grant(&SessionId::from("s-cb"), lab()).unwrap());
         let (held, st) = tunnel(&p, &ga).await;
         assert_eq!(st, 200);
-        let r = raw(p.port(), connect_req(&ga, &dest).as_bytes()).await;
+        let r = raw(ga.port, connect_req(&ga, &dest).as_bytes()).await;
         assert_eq!(status(&r), 429, "{r}");
         assert!(r.contains("X-Loom-Proxy: 1\r\n"));
         assert!(lock(&seen).iter().any(|(_, d)| d.rule == "connection limit (per session)"));
@@ -2998,12 +3207,12 @@ mod tests {
         // recorded under no session.
         let limits = Limits { max_connections: 2, ..Limits::default() };
         let (p, _rx, seen) = start_audited(false, limits, None).await;
-        let g = p.grant(&SessionId::from("s-cg"), lab());
+        let g = p.grant(&SessionId::from("s-cg"), lab()).unwrap();
         let (_a, st) = tunnel(&p, &g).await;
         assert_eq!(st, 200);
         let (_b, st) = tunnel(&p, &g).await;
         assert_eq!(st, 200);
-        let r = raw(p.port(), connect_req(&g, &dest).as_bytes()).await;
+        let r = raw(g.port, connect_req(&g, &dest).as_bytes()).await;
         assert_eq!(status(&r), 503, "{r}");
         assert!(r.contains("X-Loom-Proxy: 1\r\n") && r.contains("limit 2") && r.contains("Retry-After: 5\r\n"), "{r}");
         let last = lock(&seen).last().cloned().unwrap();
@@ -3015,14 +3224,14 @@ mod tests {
         let echo = echo_server().await;
         let limits = Limits { max_connections: 2, ..Limits::default() };
         let (p, _rx, _seen) = start_audited(false, limits, None).await;
-        let g = p.grant(&SessionId::from("s-ev"), lab());
+        let g = p.grant(&SessionId::from("s-ev"), lab()).unwrap();
         // Two connections that never send a head hold both slots.
-        let mut oldest = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut oldest = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let mut newer = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut newer = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         // A real request still gets through, and the oldest silent connection is closed for it.
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
         assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
         let mut out = Vec::new();
@@ -3037,7 +3246,7 @@ mod tests {
         let echo = echo_server().await;
         let limits = Limits { max_connections: 2, ..Limits::default() };
         let (p, _rx, _seen) = start_audited(false, limits, None).await;
-        let g = p.grant(&SessionId::from("s-drain"), lab());
+        let g = p.grant(&SessionId::from("s-drain"), lab()).unwrap();
         // Each client reads its answer (407, 400, 403) and keeps the connection open, so the proxy is
         // left waiting for it to close.
         let mut held = Vec::new();
@@ -3046,18 +3255,18 @@ mod tests {
             "garbage\r\n\r\n".to_string(),
             connect_req(&g, "127.0.0.1:1"),
             connect_req(
-                &p.grant(&SessionId::from("s-drain-2"), policy(NetworkMode::DenyAll, &[], &[], &[])),
+                &p.grant(&SessionId::from("s-drain-2"), policy(NetworkMode::DenyAll, &[], &[], &[])).unwrap(),
                 "x.test:1",
             ),
         ];
         for req in requests.iter().cycle().take(12) {
-            let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+            let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
             s.write_all(req.as_bytes()).await.unwrap();
             let head = read_until(&mut s, "\r\n\r\n").await;
             assert!(matches!(status(&head), 400 | 403 | 407 | 502), "{head}");
             held.push(s);
         }
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
         assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
     }
@@ -3085,7 +3294,7 @@ mod tests {
         let echo = echo_server().await;
         let limits = Limits { max_connections: 3, ..Limits::default() };
         let (p, _rx, _seen) = start_audited(false, limits, None).await;
-        let g = p.grant(&SessionId::from("s-order"), lab());
+        let g = p.grant(&SessionId::from("s-order"), lab()).unwrap();
         let shared = p.inner.shared.clone();
         // The ids of the connections being drained, or of those still sending a head, oldest first.
         let queued = move |draining: bool| -> Vec<u64> {
@@ -3101,13 +3310,13 @@ mod tests {
             }
         }
         // The oldest connection has not sent its head.
-        let mut silent = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut silent = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         until("the silent connection was never accepted", || queued(false).len() == 1).await;
         // Two newer ones are answered 407 and stay open, so the proxy drains them.
         let mut answered = Vec::new();
         let mut drained: Vec<u64> = Vec::new();
         for _ in 0..2 {
-            let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+            let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
             s.write_all(b"CONNECT 127.0.0.1:9 HTTP/1.1\r\n\r\n").await.unwrap();
             assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 407);
             let new = || queued(true).into_iter().filter(|id| !drained.contains(id)).collect::<Vec<u64>>();
@@ -3118,7 +3327,7 @@ mod tests {
         }
         // Every slot is taken; a new connection gets the one of the older drained connection. A drain
         // lasts 500 ms, so that one may also have ended by itself; either way it is gone.
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
         assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
         assert!(!queued(true).contains(&drained[0]), "the newer drained connection was closed first: {drained:?}");
@@ -3134,10 +3343,10 @@ mod tests {
         let idle = Duration::from_secs(1);
         let limits = Limits { idle_timeout: idle, ..Limits::default() };
         let (p, _rx, seen) = start_audited(false, limits, None).await;
-        let g = p.grant(&SessionId::from("s-idle"), lab());
+        let g = p.grant(&SessionId::from("s-idle"), lab()).unwrap();
         // A tunnel to a peer that never speaks (and would hold its side open for a minute).
         let (port, server) = silent_server().await;
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(connect_req(&g, &format!("127.0.0.1:{port}")).as_bytes()).await.unwrap();
         assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
         let started = tokio::time::Instant::now();
@@ -3156,7 +3365,7 @@ mod tests {
         let (port, server) = silent_server().await;
         let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
         let started = tokio::time::Instant::now();
-        let resp = raw(p.port(), req.as_bytes()).await;
+        let resp = raw(g.port, req.as_bytes()).await;
         let waited = started.elapsed();
         assert_eq!(status(&resp), 504, "{resp}");
         assert!(resp.contains("X-Loom-Proxy: 1\r\n") && resp.contains("sent no response for 1 second"), "{resp}");
@@ -3164,7 +3373,7 @@ mod tests {
         assert!(timeout(T, server).await.unwrap().unwrap().1.is_some());
         // Traffic keeps a tunnel alive past the idle period.
         let echo = echo_server().await;
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
         assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
         for _ in 0..8 {
@@ -3179,10 +3388,10 @@ mod tests {
     async fn forward_ends_when_the_client_goes_away() {
         let limits = Limits { forward_grace: Duration::from_millis(300), ..Limits::default() };
         let (p, _rx, _seen) = start_audited(false, limits, None).await;
-        let g = p.grant(&SessionId::from("s-gone"), lab());
+        let g = p.grant(&SessionId::from("s-gone"), lab()).unwrap();
         let (port, server) = silent_server().await;
         let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(req.as_bytes()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         let gone = tokio::time::Instant::now();
@@ -3198,7 +3407,7 @@ mod tests {
     #[tokio::test]
     async fn forward_still_answers_a_client_that_half_closes() {
         let (p, _rx) = start().await;
-        let g = p.grant(&SessionId::from("s-half"), lab());
+        let g = p.grant(&SessionId::from("s-half"), lab()).unwrap();
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -3215,7 +3424,7 @@ mod tests {
             s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await.unwrap();
             let _ = s.shutdown().await;
         });
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await.unwrap();
         s.shutdown().await.unwrap();
         let mut out = Vec::new();
@@ -3243,8 +3452,8 @@ mod tests {
             got.len()
         });
         let (p, _rx) = start().await;
-        let g = p.grant(&SessionId::from("s-duplex"), lab());
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let g = p.grant(&SessionId::from("s-duplex"), lab()).unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(connect_req(&g, &format!("127.0.0.1:{port}")).as_bytes()).await.unwrap();
         assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
         let both = async {
@@ -3278,12 +3487,12 @@ mod tests {
     #[tokio::test]
     async fn upstream_proxy_marker_is_not_relayed() {
         let (p, _rx) = start().await;
-        let g = p.grant(&SessionId::from("s-mark"), lab());
+        let g = p.grant(&SessionId::from("s-mark"), lab()).unwrap();
         let (port, _server) =
             http_server("HTTP/1.1 403 Forbidden\r\nx-loom-proxy: 1\r\nX-Other: kept\r\nContent-Length: 4\r\n\r\nnope")
                 .await;
         let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
-        let resp = raw(p.port(), req.as_bytes()).await;
+        let resp = raw(g.port, req.as_bytes()).await;
         assert_eq!(status(&resp), 403, "{resp}");
         assert!(!resp.to_ascii_lowercase().contains("loom-proxy"), "{resp}");
         assert!(resp.contains("X-Other: kept\r\n") && resp.ends_with("\r\n\r\nnope"), "{resp}");
@@ -3296,7 +3505,7 @@ mod tests {
         for (reply, code, body) in cases {
             let (port, _server) = http_server(reply).await;
             let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
-            let resp = raw(p.port(), req.as_bytes()).await;
+            let resp = raw(g.port, req.as_bytes()).await;
             let (got_code, headers, got_body) = client_view(&resp);
             assert_eq!((got_code, got_body.as_str()), (code, body), "{reply:?} -> {resp:?}");
             assert!(!headers.iter().any(|(n, _)| n == "x-loom-proxy"), "{reply:?} -> {resp:?}");
@@ -3304,7 +3513,7 @@ mod tests {
         // A destination that does not speak HTTP gets a proxy-generated 502, which does carry the marker.
         let (port, _server) = http_server("not http at all\r\n\r\n").await;
         let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
-        let resp = raw(p.port(), req.as_bytes()).await;
+        let resp = raw(g.port, req.as_bytes()).await;
         assert_eq!(status(&resp), 502, "{resp}");
         assert!(resp.contains("X-Loom-Proxy: 1\r\n"));
     }
@@ -3312,11 +3521,11 @@ mod tests {
     #[tokio::test]
     async fn a_forwarded_response_says_connection_close_and_ends_the_connection() {
         let (p, _rx) = start().await;
-        let g = p.grant(&SessionId::from("s-close"), lab());
+        let g = p.grant(&SessionId::from("s-close"), lab()).unwrap();
         let first = "HTTP/1.1 302 Found\r\nLocation: /b\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\n\
                      Proxy-Connection: keep-alive\r\nContent-Length: 0\r\n\r\n";
         let (port, _server) = two_answer_server(first, FORGED, Duration::from_secs(2)).await;
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(format!("GET http://127.0.0.1:{port}/a HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await.unwrap();
         let head = read_until(&mut s, "\r\n\r\n").await;
         let started = tokio::time::Instant::now();
@@ -3370,7 +3579,7 @@ mod tests {
     #[tokio::test]
     async fn a_chunked_response_ends_after_its_last_chunk_and_trailers() {
         let (p, _rx) = start().await;
-        let g = p.grant(&SessionId::from("s-chunked"), lab());
+        let g = p.grant(&SessionId::from("s-chunked"), lab()).unwrap();
         let body = "2\r\nok\r\n3;note=x\r\nabc\r\n0\r\nX-Trailer: t\r\n\r\n";
         // The forged answer comes in the same segment as the last chunk, or later on the same connection.
         let together =
@@ -3382,7 +3591,7 @@ mod tests {
                 let one = format!("GET http://127.0.0.1:{port}/a HTTP/1.1\r\n{}\r\n", auth(&g));
                 let req = if pipelined { one.repeat(2) } else { one };
                 let started = tokio::time::Instant::now();
-                let resp = raw(p.port(), req.as_bytes()).await;
+                let resp = raw(g.port, req.as_bytes()).await;
                 assert!(started.elapsed() < Duration::from_secs(1), "{first:?}: {:?}", started.elapsed());
                 let (code, headers, got) = client_view(&resp);
                 assert_eq!((code, got.as_str()), (200, body), "{resp:?}");
@@ -3396,7 +3605,7 @@ mod tests {
     #[tokio::test]
     async fn a_response_ends_at_its_head_or_after_its_length() {
         let (p, _rx) = start().await;
-        let g = p.grant(&SessionId::from("s-length"), lab());
+        let g = p.grant(&SessionId::from("s-length"), lab()).unwrap();
         let cases: [(&str, &str, u16, &str); 5] = [
             // No body for HEAD, 204 and 304, whatever the length says.
             ("HEAD", "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n", 200, ""),
@@ -3410,7 +3619,7 @@ mod tests {
             let (port, _server) = two_answer_server(first, FORGED, Duration::from_secs(2)).await;
             let req = format!("{method} http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
             let started = tokio::time::Instant::now();
-            let resp = raw(p.port(), req.as_bytes()).await;
+            let resp = raw(g.port, req.as_bytes()).await;
             assert!(started.elapsed() < Duration::from_secs(1), "{first:?}: {:?}", started.elapsed());
             let (got_code, _, got_body) = client_view(&resp);
             assert_eq!((got_code, got_body.as_str()), (code, body), "{first:?} -> {resp:?}");
@@ -3423,7 +3632,7 @@ mod tests {
         for first in unclear {
             let (port, _server) = two_answer_server(first, "", Duration::from_secs(2)).await;
             let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
-            let resp = raw(p.port(), req.as_bytes()).await;
+            let resp = raw(g.port, req.as_bytes()).await;
             assert_eq!(status(&resp), 502, "{first:?} -> {resp:?}");
             assert!(
                 resp.contains("X-Loom-Proxy: 1\r\n") && resp.contains("invalid or conflicting Content-Length"),
@@ -3435,20 +3644,20 @@ mod tests {
     #[tokio::test]
     async fn a_client_that_sends_more_than_its_request_cuts_a_response_that_runs_until_close() {
         let (p, _rx) = start().await;
-        let g = p.grant(&SessionId::from("s-more"), lab());
+        let g = p.grant(&SessionId::from("s-more"), lab()).unwrap();
         let gap = Duration::from_secs(2);
         let get = |port: u16| format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
         // Two requests in one write: only the first is forwarded, and its answer ends the connection.
         let (port, server) = two_answer_server("HTTP/1.0 200 OK\r\n\r\nfirst", FORGED, gap).await;
         let started = tokio::time::Instant::now();
-        let resp = raw(p.port(), get(port).repeat(2).as_bytes()).await;
+        let resp = raw(g.port, get(port).repeat(2).as_bytes()).await;
         assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
         assert_eq!(client_view(&resp).2, "first", "{resp:?}");
         let got = String::from_utf8(server.await.unwrap()).unwrap();
         assert_eq!(got.matches("GET ").count(), 1, "{got}");
         // The end of a body and a further request in one read, while the destination is silent.
         let (port, server) = two_answer_server("HTTP/1.0 200 OK\r\n\r\nfirst", FORGED, gap).await;
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         let post = format!("POST http://127.0.0.1:{port}/ HTTP/1.1\r\n{}Content-Length: 4\r\n\r\nbo", auth(&g));
         s.write_all(post.as_bytes()).await.unwrap();
         let begun = read_until(&mut s, "first").await;
@@ -3467,18 +3676,19 @@ mod tests {
         // Empty lines after a body are not a further request.
         let (port, _server) = two_answer_server("HTTP/1.0 200 OK\r\n\r\none", "two", Duration::from_millis(300)).await;
         let req = format!("POST http://127.0.0.1:{port}/ HTTP/1.1\r\n{}Content-Length: 4\r\n\r\nbody\r\n", auth(&g));
-        assert_eq!(client_view(&raw(p.port(), req.as_bytes()).await).2, "onetwo");
+        assert_eq!(client_view(&raw(g.port, req.as_bytes()).await).2, "onetwo");
     }
 
     #[tokio::test]
     async fn env_and_grant_contents() {
         let (p, _rx) = start().await;
-        let g = p.grant(&SessionId::from("s-env"), lab());
-        assert_eq!(g.port, p.port());
+        let g = p.grant(&SessionId::from("s-env"), lab()).unwrap();
+        assert_ne!(g.port, p.port());
+        assert_eq!(Some(g.port), p.session_port(&SessionId::from("s-env")));
         assert_eq!(g.user, "s-env");
         assert_eq!(g.password.len(), 32);
         assert!(g.password.chars().all(|c| c.is_ascii_hexdigit()));
-        let url = format!("http://s-env:{}@127.0.0.1:{}", g.password, p.port());
+        let url = format!("http://s-env:{}@127.0.0.1:{}", g.password, g.port);
         assert_eq!(g.url(), url);
         let env = g.env();
         assert_eq!(env.len(), 8);
@@ -3487,20 +3697,249 @@ mod tests {
         }
         assert_eq!(env.get("NO_PROXY").map(String::as_str), Some(""));
         assert_eq!(env.get("no_proxy").map(String::as_str), Some(""));
-        let g2 = p.grant(&SessionId::from("s-env2"), lab());
+        let g2 = p.grant(&SessionId::from("s-env2"), lab()).unwrap();
         assert_ne!(g.password, g2.password);
+        assert_ne!(g.port, g2.port);
+    }
+
+    /// The decisions of the audit hook, as (session, rule).
+    fn audited(seen: &Seen) -> Vec<(Option<String>, String)> {
+        lock(seen).iter().map(|(s, d)| (s.as_ref().map(|s| s.as_str().to_string()), d.rule.clone())).collect()
+    }
+
+    /// A destination that counts the connections it accepts.
+    async fn counting_server() -> (u16, Arc<AtomicU64>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let count = Arc::new(AtomicU64::new(0));
+        let seen = count.clone();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                drop(s);
+            }
+        });
+        (port, count)
+    }
+
+    #[tokio::test]
+    async fn each_session_has_its_own_listener_and_foreign_credentials_get_407() {
+        let (p, _rx, seen) = start_audited(false, Limits::default(), None).await;
+        let echo = echo_server().await;
+        let (a, b) = (SessionId::from("s-la-a"), SessionId::from("s-la-b"));
+        let (ga, gb) = (p.grant(&a, lab()).unwrap(), p.grant(&b, lab()).unwrap());
+        assert_ne!(ga.port, gb.port);
+        assert!(ga.port != p.port() && gb.port != p.port());
+        assert_eq!((p.session_port(&a), p.session_port(&b)), (Some(ga.port), Some(gb.port)));
+        assert_eq!(p.session_port(&SessionId::from("s-none")), None);
+        let dest = format!("127.0.0.1:{echo}");
+        // Each works on its own port.
+        assert_eq!(status(&raw(ga.port, connect_req(&ga, &dest).as_bytes()).await), 200);
+        assert_eq!(status(&raw(gb.port, connect_req(&gb, &dest).as_bytes()).await), 200);
+        // B's valid credentials on A's port: 407, nothing connected, one refusal recorded for A naming B.
+        let (counted, accepted) = counting_server().await;
+        let r = raw(ga.port, connect_req(&gb, &format!("127.0.0.1:{counted}")).as_bytes()).await;
+        assert_eq!(status(&r), 407, "{r}");
+        assert!(r.contains("Proxy-Authenticate: Basic"), "{r}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 0, "the destination listener accepted a connection");
+        let refusals = |seen: &Seen| -> Vec<(Option<String>, String)> {
+            audited(seen).into_iter().filter(|(_, rule)| rule.starts_with("proxy authentication failed")).collect()
+        };
+        assert_eq!(
+            refusals(&seen),
+            [(
+                Some("s-la-a".to_string()),
+                "proxy authentication failed: credentials of session s-la-b on the port of session s-la-a".to_string()
+            )]
+        );
+        assert!(lock(&seen)
+            .iter()
+            .filter(|(_, d)| d.rule.starts_with("proxy authentication"))
+            .all(|(_, d)| !d.allowed));
+        // A's credentials on the shared port: 407, unattributed.
+        let r = raw(p.port(), connect_req(&ga, &dest).as_bytes()).await;
+        assert_eq!(status(&r), 407, "{r}");
+        assert_eq!(
+            refusals(&seen).last().unwrap(),
+            &(None, "proxy authentication failed: credentials of session s-la-a on the shared port".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_grants_work_on_the_shared_port_only() {
+        let (p, _rx, seen) = start_audited(false, Limits::default(), None).await;
+        let (port, _server) = http_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+        let sid = SessionId::from("s-ref-port");
+        let cfg = NetworkCfg {
+            mode: NetworkMode::Open,
+            reference_hosts: vec![format!("127.0.0.1:{port}")],
+            allow_private: vec!["127.0.0.1".into()],
+            ..NetworkCfg::default()
+        };
+        let g = p.grant(&sid, lab()).unwrap();
+        let reference = p.grant_reference(&sid, &cfg).unwrap();
+        assert_eq!(reference.grant.port, p.port());
+        let req = format!("GET http://127.0.0.1:{port}/x HTTP/1.1\r\n{}\r\n", auth(&reference.grant));
+        let refused = raw(g.port, req.as_bytes()).await;
+        assert_eq!(status(&refused), 407, "{refused}");
+        assert_eq!(
+            audited(&seen).last().unwrap(),
+            &(
+                Some("s-ref-port".to_string()),
+                "proxy authentication failed: reference credentials on the port of session s-ref-port".to_string()
+            )
+        );
+        let ok = raw(p.port(), req.as_bytes()).await;
+        assert_eq!(status(&ok), 200, "{ok}");
+    }
+
+    #[tokio::test]
+    async fn a_second_grant_keeps_the_port_and_replaces_the_password() {
+        let (p, _rx) = start().await;
+        let echo = echo_server().await;
+        let sid = SessionId::from("s-again");
+        let first = p.grant(&sid, lab()).unwrap();
+        let second = p.grant(&sid, lab()).unwrap();
+        assert_eq!(first.port, second.port);
+        assert_ne!(first.password, second.password);
+        let dest = format!("127.0.0.1:{echo}");
+        assert_eq!(status(&raw(first.port, connect_req(&first, &dest).as_bytes()).await), 407);
+        assert_eq!(status(&raw(second.port, connect_req(&second, &dest).as_bytes()).await), 200);
+    }
+
+    #[tokio::test]
+    async fn revoke_closes_the_listener_and_retires_its_port() {
+        let (p, _rx) = start().await;
+        let echo = echo_server().await;
+        let (a, b) = (SessionId::from("s-rv-a"), SessionId::from("s-rv-b"));
+        let (ga, gb) = (p.grant(&a, lab()).unwrap(), p.grant(&b, lab()).unwrap());
+        let gone = async |port: u16| {
+            let deadline = tokio::time::Instant::now() + T;
+            loop {
+                if TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        assert!(TcpStream::connect(("127.0.0.1", ga.port)).await.is_ok());
+        p.revoke(&a);
+        assert!(gone(ga.port).await, "a revoked session's listener still accepts");
+        assert_eq!(p.session_port(&a), None);
+        assert!(lock(&p.inner.listeners).get("s-rv-a").is_none());
+        // 20 new sessions never get A's port.
+        for i in 0..20 {
+            let g = p.grant(&SessionId::from(format!("s-rv-new-{i}").as_str()), lab()).unwrap();
+            assert_ne!(g.port, ga.port);
+        }
+        // A later grant of A opens a new listener on another port; the old credentials do not work there.
+        let again = p.grant(&a, lab()).unwrap();
+        assert_ne!(again.port, ga.port);
+        assert_eq!(p.session_port(&a), Some(again.port));
+        let dest = format!("127.0.0.1:{echo}");
+        assert_eq!(status(&raw(again.port, connect_req(&ga, &dest).as_bytes()).await), 407);
+        assert_eq!(status(&raw(again.port, connect_req(&again, &dest).as_bytes()).await), 200);
+        assert!(TcpStream::connect(("127.0.0.1", gb.port)).await.is_ok());
+        assert!(TcpStream::connect(("127.0.0.1", p.port())).await.is_ok());
+        p.shutdown();
+        assert!(gone(ga.port).await, "a session listener still accepts after shutdown");
+        assert!(gone(gb.port).await, "a session listener still accepts after shutdown");
+        assert!(gone(p.port()).await, "the shared listener still accepts after shutdown");
+    }
+
+    #[tokio::test]
+    async fn no_fresh_port_gives_a_bind_error_and_leaves_nothing_bound() {
+        let (p, _rx) = start().await;
+        let tried = Mutex::new(Vec::new());
+        let e = open_fresh_listener(&p.inner.shared, &|port| {
+            lock(&tried).push(port);
+            true
+        })
+        .expect_err("every port is retired, so no listener opens");
+        let text = e.to_string();
+        assert!(text.contains("No fresh loopback port was found") && text.contains("restarting the daemon"), "{text}");
+        let tried = lock(&tried).clone();
+        assert_eq!(tried.len(), LISTENER_ATTEMPTS);
+        // The sockets set aside are closed: each of those ports can be bound again.
+        for port in tried {
+            assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(), "port {port} is still bound");
+        }
+        assert!(lock(&p.inner.shared.own_ports).len() == 1);
+    }
+
+    #[tokio::test]
+    async fn the_proxy_never_connects_to_its_own_ports() {
+        let resolver: Resolver =
+            Arc::new(|name: &str| if name == "localhost" { vec![IpAddr::from([127, 0, 0, 1])] } else { Vec::new() });
+        let (p, mut rx, _seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let echo = echo_server().await;
+        let (a, b) = (SessionId::from("s-own-a"), SessionId::from("s-own-b"));
+        let (ga, gb) = (p.grant(&a, lab()).unwrap(), p.grant(&b, lab()).unwrap());
+        // A revoked session's port is still the proxy's own.
+        let c = SessionId::from("s-own-c");
+        let gc = p.grant(&c, lab()).unwrap();
+        p.revoke(&c);
+        while rx.try_recv().is_ok() {}
+        for port in [gb.port, ga.port, p.port(), gc.port] {
+            let rule = format!("deny the egress proxy's own port {port}");
+            for host in ["127.0.0.1", "[::ffff:127.0.0.1]", "0.0.0.0", "localhost", "[::1]", "127.1.2.3"] {
+                let dest = format!("{host}:{port}");
+                let connect = raw(ga.port, connect_req(&ga, &dest).as_bytes()).await;
+                let forwarded =
+                    raw(ga.port, format!("GET http://{dest}/ HTTP/1.1\r\n{}\r\n", auth(&ga)).as_bytes()).await;
+                let checked =
+                    raw(ga.port, format!("{CHECK_METHOD} {dest} HTTP/1.1\r\n{}\r\n", auth(&ga)).as_bytes()).await;
+                for (what, r) in [("CONNECT", connect), ("GET", forwarded), ("check", checked)] {
+                    assert_eq!(status(&r), 403, "{what} {dest}: {r}");
+                    assert!(r.contains(&rule), "{what} {dest}: {r}");
+                }
+            }
+        }
+        // Another loopback port is still allowed, by tunnel and by check.
+        let dest = format!("127.0.0.1:{echo}");
+        assert_eq!(status(&raw(ga.port, connect_req(&ga, &dest).as_bytes()).await), 200);
+        let r = raw(ga.port, format!("{CHECK_METHOD} {dest} HTTP/1.1\r\n{}\r\n", auth(&ga)).as_bytes()).await;
+        assert_eq!(status(&r), 200, "{r}");
+    }
+
+    #[tokio::test]
+    async fn an_open_connection_survives_the_revoke_of_its_session() {
+        let (p, _rx) = start().await;
+        let echo = echo_server().await;
+        let sid = SessionId::from("s-rv-open");
+        let g = p.grant(&sid, lab()).unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
+        p.revoke(&sid);
+        s.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        timeout(T, s.read_exact(&mut got)).await.unwrap().unwrap();
+        assert_eq!(&got, b"ping");
+    }
+
+    #[test]
+    fn grant_outside_a_runtime_is_an_error_not_a_panic() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (p, _rx) = rt.block_on(start());
+        let e = p.grant(&SessionId::from("s-no-rt"), lab()).unwrap_err();
+        assert!(e.to_string().contains("Tokio runtime"), "{e}");
     }
 
     #[tokio::test]
     async fn shutdown_during_a_tunnel_or_forward_is_recorded_after_the_allow() {
         let (p, _rx, seen) = start_audited(false, Limits::default(), None).await;
-        let g = p.grant(&SessionId::from("s-down"), lab());
+        let g = p.grant(&SessionId::from("s-down"), lab()).unwrap();
         let (port, _server) = silent_server().await;
-        let mut s = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         s.write_all(connect_req(&g, &format!("127.0.0.1:{port}")).as_bytes()).await.unwrap();
         assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
         let (port2, _server2) = silent_server().await;
-        let mut f = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        let mut f = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
         f.write_all(format!("GET http://127.0.0.1:{port2}/ HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await.unwrap();
         // The methods of the allowed requests recorded with `rule`, sorted.
         let methods = |rule: &str| -> Vec<String> {

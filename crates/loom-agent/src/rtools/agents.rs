@@ -109,7 +109,8 @@
 //! time: `loom_tools::bash::Bash` with `command` and `timeout_s`, on a clone of this call's context
 //! whose workspace and sandbox are the copy's (`ChildCopy::sandbox`), so the command can write to the
 //! copy and not to this session's workspace. It passed when its exit status is 0. Its complete output
-//! is stored. Then the copy is compared, so what the check wrote is part of what is listed. An
+//! is stored, and the stored ids of all of them are in `meta[META_ALSO_STORED]` of the result (so `out_read` and
+//! quotes open the handle the result names). Then the copy is compared, so what the check wrote is part of what is listed. An
 //! interruption during a check returns an error that says the attempts have ended and their copies
 //! are kept, with their ids.
 //!
@@ -166,7 +167,9 @@
 //! With `claim`: read `S.ledger()`; an unknown id is an error listing the claim ids. The brief:
 //! - `question`: `Try to refute this claim: {text}`
 //! - `context` (claim form only): `Evidence recorded for it:` and per evidence record of the claim
-//!   `- {id} ({supports|undermines}) {handle} lines {a}-{b}: {quote cut to 300 characters} — {note}`;
+//!   `- {id} ({supports|undermines}; {source_label}) {handle} lines {a}-{b}: {quote cut to 300 characters} —
+//!   {note}`, where `source_label` is `EvidenceInput::source_label` (`run by bash`, `analysis by dep_scan`),
+//!   so the verifier sees which evidence is a run;
 //!   `No evidence is recorded for it.` when there is none. With `handles` given (either form), a
 //!   further paragraph `Outputs to examine: {handles joined by ", "}`.
 //! - `returns`: `A verdict, delivered by calling verdict.`
@@ -183,7 +186,8 @@
 //! `agent_fanout` — element errors collected, limit refusal, spawn failure stops the started ones,
 //! ordering of the combined report, outcome line, cancellation; `agent_message`; `agent_stop` both
 //! forms and the refusal; `decide` — tally, split, invalid votes, option count refusals; `verify` —
-//! both forms, unknown claim, evidence listing, verdict outcomes, missing payload; copies (real
+//! both forms, unknown claim, evidence listing (with each record's grade and tool), verdict outcomes,
+//! missing payload; copies (real
 //! copies of the rig's workspace, the fake orchestrator answering `child_copy`) — `agent_spawn` and
 //! `agent_fanout` ask for a copy and report its changes, the agent's own commands and stale ones,
 //! no call about copies without `copy`; `attempt` — the check really runs in every copy and the
@@ -194,7 +198,9 @@
 
 use super::{ChildCopy, Settlement, Shared, SpawnReq, Workspace};
 use async_trait::async_trait;
-use loom_core::event::{Brief, Budget, ChildOutcome, SpawnMode, ToolClass, ToolSpec, ToolStatus, META_EXIT_CODE};
+use loom_core::event::{
+    Brief, Budget, ChildOutcome, SpawnMode, ToolClass, ToolSpec, ToolStatus, META_ALSO_STORED, META_EXIT_CODE,
+};
 use loom_core::SessionId;
 use loom_tools::params::{opt, req, spec, Param};
 use loom_tools::workcopy::{self, AdoptError, Changes};
@@ -761,6 +767,8 @@ struct Checked {
     /// The end of what it printed, every line marked as command output.
     tail: String,
     interrupted: bool,
+    /// The stored complete output, when there is one.
+    stored: Option<loom_core::BlobId>,
 }
 
 /// Run `command` in the copy, to its end or to `timeout_s`, as the parent's own `bash` would run it
@@ -778,7 +786,7 @@ async fn run_check(ctx: &ToolCtx, copy: &ChildCopy, command: &str, timeout_s: u6
     let seconds = out.more.first().map(|s| format!(" ({s})")).unwrap_or_default();
     let (stored, text) = match &out.body {
         Body::Raw(bytes) => match loom_tools::view::store_text(&ctx.blobs, bytes) {
-            Ok((blob, normalized)) => (Some(blob.handle()), normalized.text),
+            Ok((blob, normalized)) => (Some(blob), normalized.text),
             Err(_) => (None, String::from_utf8_lossy(bytes).into_owned()),
         },
         Body::Message(m) => (None, m.clone()),
@@ -794,11 +802,13 @@ async fn run_check(ctx: &ToolCtx, copy: &ChildCopy, command: &str, timeout_s: u6
         tail.push_str(&format!("| {}\n", crate::texts::cut(line, CHECK_LINE_CHARS)));
     }
     let verdict = if passed { "passed" } else { "FAILED" };
+    let stored_id = stored.as_ref().map(|b| b.id.clone());
     let output = match stored {
-        Some(handle) if !lines.is_empty() => format!("; complete output {handle}"),
+        Some(blob) if !lines.is_empty() => format!("; complete output {}", blob.handle()),
         _ => "; it printed nothing".to_string(),
     };
-    Checked { passed, line: format!("{}{seconds} \u{2014} {verdict}{output}", out.outcome), tail, interrupted }
+    let stored = stored_id.filter(|_| !lines.is_empty());
+    Checked { passed, line: format!("{}{seconds} \u{2014} {verdict}{output}", out.outcome), tail, interrupted, stored }
 }
 
 #[async_trait]
@@ -943,6 +953,8 @@ impl Tool for Attempt {
         let ids = started.iter().map(SessionId::as_str).collect::<Vec<_>>().join(", ");
         let mut body = format!("{ATTEMPT_LEGEND}\n\n");
         let (mut passed, mut unchecked) = (0usize, 0usize);
+        // The complete outputs of the checks: stored here, named only in the text, so the result records them.
+        let mut stored: Vec<String> = Vec::new();
         // One check at a time: several builds or test runs at once would slow each other into the timeout.
         for (i, (id, result)) in started.iter().zip(results).enumerate() {
             let (role, outcome, steps, report) = match result {
@@ -964,6 +976,7 @@ impl Tool for Attempt {
                         ));
                     }
                     passed += usize::from(checked.passed);
+                    stored.extend(checked.stored.iter().map(|id| id.as_str().to_string()));
                     body.push_str(&format!("check: {}\n{}", checked.line, checked.tail));
                     // After the check: what the check itself wrote counts as part of the copy's state.
                     match changes_of(&copy).await {
@@ -1007,6 +1020,9 @@ impl Tool for Attempt {
         let mut out = ToolOutput::ok(outcome, Body::Raw(body.into_bytes()));
         if let Some(fact) = lowered {
             out = out.with_more(fact);
+        }
+        if !stored.is_empty() {
+            out = out.with_meta(META_ALSO_STORED, json!(stored));
         }
         if passed == 0 {
             out.status = ToolStatus::Error;
@@ -1070,7 +1086,9 @@ impl Tool for AgentAdopt {
         let (manifest, dir, dest, sandbox) =
             (copy.manifest.clone(), copy.dir.clone(), ctx.workspace.clone(), ctx.sandbox.clone());
         let adopting = tokio::task::spawn_blocking(move || {
-            workcopy::adopt(&manifest, &dir, &dest, &|path| sandbox.check_write(path).map(|_| ()))
+            workcopy::adopt(&manifest, &dir, &dest, &|path| sandbox.check_write(path).map(|_| ()), &|real| {
+                sandbox.check_read(real).map(|_| ())
+            })
         });
         let adopted = match adopting.await {
             Ok(result) => result,
@@ -1347,7 +1365,12 @@ impl Tool for Verify {
                             .unwrap_or_else(|| "no stored output".into());
                         let range = i.lines.map(|(a, b)| format!(" lines {a}-{b}")).unwrap_or_default();
                         let quote = cut(i.quote.as_deref().unwrap_or(""), 300);
-                        format!("- {} ({side}) {handle}{range}: {quote} \u{2014} {}", e.id, i.note)
+                        format!(
+                            "- {} ({side}; {}) {handle}{range}: {quote} \u{2014} {}",
+                            e.id,
+                            i.source_label(),
+                            i.note
+                        )
                     })
                     .collect();
                 let context = if lines.is_empty() {
@@ -1874,6 +1897,8 @@ mod tests {
                 quote: Some("line two\nline three".into()),
                 note: "shows both".into(),
                 attested: true,
+                tool: None,
+                grade: None,
             }));
         }
     }
@@ -1899,7 +1924,7 @@ mod tests {
         assert_eq!(sp[0].brief.question, "Try to refute this claim: The cache is never stale");
         assert_eq!(sp[0].brief.returns.as_deref(), Some("A verdict, delivered by calling verdict."));
         let ctx = sp[0].brief.context.clone().unwrap();
-        assert!(ctx.starts_with("Evidence recorded for it:\n- e1 (supports) out:"), "{ctx}");
+        assert!(ctx.starts_with("Evidence recorded for it:\n- e1 (supports; run) out:"), "{ctx}");
         assert!(ctx.contains(" lines 2-3: line two\nline three \u{2014} shows both"), "{ctx}");
         assert!(ctx.ends_with("\n\nOutputs to examine: out:aaa, out:bbb"), "{ctx}");
     }
@@ -2020,7 +2045,7 @@ mod tests {
         let root = r.env.dir.path().canonicalize().unwrap();
         let dest = root.join("copies").join(child);
         let limits = workcopy::Limits { max_files: 1_000, max_bytes: 0 };
-        let made = workcopy::make(&r.env.ctx.workspace, &dest, &limits).unwrap();
+        let made = workcopy::make(&r.env.ctx.workspace, &dest, &limits, &|_| Ok(())).unwrap();
         edit(&dest);
         let cfg = SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() };
         let sandbox =
@@ -2197,6 +2222,13 @@ mod tests {
         // The check ran in the copies, and the workspace is as it was.
         assert_eq!(text_of(&r.env.ctx.workspace, "a.txt").as_deref(), Some("one\n"));
         assert!(text_of(&r.env.ctx.workspace, "done.txt").is_none());
+        // The complete output each check names is an output of the mission: out_read opens it.
+        let handles: Vec<&str> =
+            t.match_indices("complete output out:").map(|(at, m)| &t[at + m.len() - 4..][..20]).collect();
+        assert_eq!(handles.len(), 3, "{t}");
+        let read = r.call("out_read", json!({"handle": handles[1]})).await;
+        assert_eq!(read.status, ToolStatus::Ok, "{}", read.text);
+        assert!(read.text.contains("checking"), "{}", read.text);
     }
 
     #[tokio::test]

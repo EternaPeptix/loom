@@ -42,7 +42,9 @@ pub(crate) mod testkit;
 use crate::pack::RoleDef;
 use async_trait::async_trait;
 use loom_core::config::AgentsCfg;
-use loom_core::event::{Author, Brief, Budget, ChildOutcome, Event, SpawnMode, ToolClass, TurnEndReason, Usage};
+use loom_core::event::{
+    Author, Brief, Budget, ChildOutcome, Event, EvidenceGrade, SpawnMode, ToolClass, TurnEndReason, Usage,
+};
 use loom_core::journal::{Journal, JournalError};
 use loom_core::ledger::{Entry, LedgerOp, LedgerState};
 use loom_core::{BlobId, BlobRef, CallId, MissionId, SessionId};
@@ -258,6 +260,9 @@ pub struct Producer {
     pub call_id: CallId,
     pub tool: String,
     pub class: ToolClass,
+    /// What a quote of the output can show (`EvidenceGrade::of` the producing result's class and meta).
+    /// `evidence` records execution evidence only for `Run`.
+    pub grade: EvidenceGrade,
 }
 
 /// What a session's tools may ask of the runtime that owns all sessions. Every error is a sentence
@@ -661,6 +666,8 @@ mod tests {
             quote: None,
             note: "dummy fixture observation".into(),
             attested: true,
+            tool: None,
+            grade: None,
         }));
         let mut ids = Vec::new();
         for locator in ["first.test", "second.test"] {

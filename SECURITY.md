@@ -49,14 +49,27 @@ harness's.
   to stop a daemon from a version that cannot give the proof; do not use it otherwise.
 - To use a daemon on another machine, forward its port over SSH. Do not change the bind address to a
   non-loopback one; the daemon will not accept it.
+- **The daemon's environment holds only what it needs.** `loom up` starts the daemon with `PATH`, `HOME`,
+  `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TZ`, `TMPDIR`, `LOOM_LOG`, `RUST_BACKTRACE`, the variables
+  your profiles name in `api_key_env` and those listed in `[sandbox] env_pass`, and nothing else of the
+  shell that ran it: tokens, cloud credentials and proxy or loader variables exported there do not reach
+  the daemon or the commands it runs. A login service (`loom service install`) gets `LOOM_HOME` and a fixed
+  `PATH` from its property list. `loom daemon` run straight from a shell keeps that shell's environment.
+- **Model API keys belong in files.** `api_key_file = "<name>"` reads `~/.loom/keys/models/<name>` once at
+  start; the file must be yours, a regular file and mode 0600, and the daemon does not start otherwise.
+  Commands cannot read `~/.loom/keys`. `api_key_env` still works, but then the key is in the daemon's
+  environment, where commands can read it (see *Known limits*); `loom up`, `loom config check` and the
+  daemon's log warn about every such profile, and `loom service install` refuses one.
+- **Model requests use no proxy.** `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (in either case) and the
+  system's proxy settings are ignored for model requests, which go to the configured `base_url` only. A
+  proxy exported in your shell (an intercepting proxy, say) never sees a transcript or the key.
 
 ### What a command run by the model can and cannot do
 
 On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `sandbox-exec`:
 
-- **Writes** are allowed only in the session's workspace, the session's temporary directory, the
-  system temporary locations (`/private/tmp` and `/private/var/folders`), any `extra_writable`
-  directories, and the device files `/dev/null`, `/dev/tty` and `/dev/dtracehelper`. `~/.loom`
+- **Writes** are allowed only in the session's workspace, the session's temporary directory, any
+  `extra_writable` directories, and the device files `/dev/null`, `/dev/tty` and `/dev/dtracehelper`. `~/.loom`
   (including the token, keys, logs and every session record), `<workspace>/.loom` and your
   `protected_paths` are never writable, with one exception: the session's temporary directory lies in
   `~/.loom` (`sessions/<id>/tmp`), and everything inside it is writable, though the directory entry
@@ -70,17 +83,49 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   `~/.config/rclone`, and more), wallets, the macOS Keychains and Cookies folders, Mail, Messages,
   Telegram, Group Containers and the Chrome, Chromium, Brave, Edge, Arc, Vivaldi, Opera, Firefox and
   Safari profiles. So are
-  the loom token and keys and your `unreadable_paths`. A listed directory that is or contains the
+  the whole loom home but the session's temp directory and the harness's staging of analysis inputs (the
+  token and keys included), whose names are hidden as well as their content, and your `unreadable_paths`. A listed directory that is or contains the
   workspace is skipped.
-- **The network** is closed except for loopback connections to the egress proxy (and any ports or sockets
-  you list). The proxy applies `[network]`: by default (`deny_all`) it forwards nothing. It resolves
+- **The network** is closed except for loopback connections to the session's own port of the egress
+  proxy (and any ports or sockets you list). Each session has a proxy port of its own, and its proxy
+  credentials are accepted on that port only; the proxy never connects to one of its own ports, whatever
+  the policy allows, and while the daemon runs no session is given a port an earlier session had. The
+  proxy applies `[network]`: by default (`deny_all`) it forwards nothing. It resolves
   names itself, refuses private, loopback and link-local addresses (including IPv4 addresses hidden in
   IPv6 forms) unless you list them, applies the deny list to the resolved address, and records every
   decision in a hash-chained audit file. Commands that listen on loopback can be reached by other
-  local processes.
+  local processes. Commands cannot connect to the daemon's own port, whatever you allow on loopback, so a
+  `loom open` login code seen in the process list cannot be redeemed from inside the sandbox directly (the
+  proxy, which refuses loopback addresses, could reach it only if you list loopback in `allow_private` or
+  grant a loopback address). Under `deny_all` commands also cannot reach the macOS services that fetch a
+  URL for a process (`com.apple.trustd.agent`, `com.apple.trustd`, `com.apple.ocspd`,
+  `com.apple.nsurlsessiond`, WebKit's networking services); programs that check certificates through macOS
+  (Swift and Go programs, `security`, `codesign --verify`), background URL sessions and WebKit-based tools
+  then fail, while curl and Python, which use their own certificate files, work.
+- **Git cannot be made to run code as you.** Anywhere commands can write (workspace, temporary
+  directory, `extra_writable`), they cannot write Git configuration, hooks or the `commondir`/`gitdir`
+  pointers — of the repository, of linked worktrees (also ones checked out outside the workspace) and of
+  submodules, initialized or not — nor make or move a `.git`, a worktree's gitdir or a submodule's
+  repository into place; the hooks directory your Git configuration names (`core.hooksPath`, as husky
+  sets it) and the files it includes are protected too, read from each repository's and your global
+  configuration. Commits and branches in existing repositories work; upstream tracking cannot be recorded.
+  A session cannot run `git init`, a non-bare `git clone` (installs of pip, npm, cargo or uv dependencies
+  from Git URLs included), `git worktree add` or `git submodule update` in any form: you do those, and a
+  bare clone works. A submodule you set up during a mission is protected but cannot be committed in until
+  the next session.
+- **No mounts, no preference writes.** Commands cannot mount a file system or attach a disk image over a
+  directory (`hdiutil attach` and `diskutil` fail), which would otherwise replace `.git/hooks`, `~/.ssh`
+  or `~/Library/LaunchAgents` for you; and they cannot write macOS preferences (`defaults write`), which a
+  system service would otherwise write for them outside the sandbox.
 - **Scope is the operator's.** The agent can ask for hosts with `request_scope`, which opens an inbox
   item and changes nothing. Hosts are granted only by the operator, per session, with a record in the
-  ledger; a grant dies with the session. `loom release` records that the operator closed a mission
+  ledger; a grant dies with the session. Under `deny_all` a grant allows exactly the granted hosts (the
+  configured `allow` list stays off). `*`, a wildcard over a top-level domain (`*.com`) or over IP
+  addresses (`*.0.1`), the unspecified address (`0.0.0.0`, `::`, which reaches this machine's own
+  services) and a loopback address without a port (`127.0.0.1`) can be neither requested nor granted, so
+  approving a request cannot open everything at once. Still read what you approve: a wildcard under a
+  domain whose names resolve to any address (wildcard DNS such as `*.nip.io`) or one of this machine's own
+  LAN addresses is not recognised as broad. `loom release` records that the operator closed a mission
   without the goal established, with a reason, and it is shown as that, not as finished.
 - **No LaunchServices opens, Apple Events or launchd jobs**, so a command cannot start a program
   outside the sandbox that way.
@@ -148,8 +193,9 @@ truncation detectable, not impossible: see the limits below.
 
 These are the places where loom does less than the text above might suggest.
 
-- **Reads are allowed by default.** The sandbox denies reads of the credential list, the loom token
-  and keys, and `unreadable_paths`. Everything else your user can read, a command can read: your
+- **Reads are allowed by default.** The sandbox denies reads of the credential list, the whole loom home
+  (`~/.loom`: other sessions' and its own logs, stored outputs, mission journals, configuration, token and
+  keys; only the session's temp directory is readable), and `unreadable_paths`. Everything else your user can read, a command can read: your
   documents, shell history, other projects, source trees, tokens kept in files that are not on the
   list, and anything under a directory that is or contains the workspace. Set the workspace to the
   smallest directory that works, and add paths to `unreadable_paths`.
@@ -165,13 +211,16 @@ These are the places where loom does less than the text above might suggest.
   opens the directory, judges its real path with the file name, and creates and renames the file
   relative to that open directory. A command that swaps a directory for a link during such a call gets
   no content and no file out of it; it can still learn whether a path there exists and what kind of
-  file it is. `glob` and `grep` check each path and then open it by name, so a command that swaps a
-  link in between can in principle make them list or read through it. They also judge a path in the
-  form it was given, with links resolved: macOS shows `/Users`, `/private` and the other folders of the
-  data volume under `/System/Volumes/Data` too, and given a path in that form, which the rules are not
-  written in, `glob` and `grep` list and read what the rules refuse; `read`, `write` and `edit` judge
-  the name the system gives for the open file, which is the usual one. All of them refuse to touch
-  anything that is not a regular file.
+  file it is. `grep` checks each path as the walk finds it, and then judges the real path of the file it
+  opens, as `read` does; `dep_scan` reads its report files, `continuation` its guarded files and the copy of
+  a workspace made for an agent (and adopted back) its files the same way, so a link swapped in meanwhile
+  reads and copies nothing the rules refuse. Adopting an agent's copy writes, makes and removes as `write`
+  does, relative to directories it opened and judged, so a directory a background command swaps for a link
+  during adoption has nothing written through it. `glob` only lists names, checking each directory it walks
+  as the directory that was opened, so a command that swaps a link in during a walk can in principle make it
+  list names it should not (never content). macOS shows `/Users`, `/private` and the other folders of the
+  data volume under `/System/Volumes/Data` too; a path in that form is given its usual form back before the
+  rules are applied. All of them refuse to touch anything that is not a regular file.
 - **Without macOS there is no sandbox.** On other systems the daemon starts only with
   `[sandbox] mode = "none"`, and then commands are unconfined. The file tools still refuse the protected
   and credential paths, and the network proxy still exists, but a command can ignore it. Do not run
@@ -180,6 +229,25 @@ These are the places where loom does less than the text above might suggest.
   webhook or private parts, every model profile's `api_key_env`, and values that are URLs with a
   password in them are withheld. A secret in a variable called something else, in another form, is
   passed through. `env_pass` passes more.
+- **Any process of yours can read the environment and arguments another of your processes was started
+  with**, sandboxed commands included (macOS `KERN_PROCARGS2`; the seatbelt profile cannot deny it
+  without breaking common interpreters, and clearing a variable inside a running process does not erase
+  the copy that is read). So a command can read: a key named by `api_key_env`, and anything else in the
+  daemon's environment (with `loom daemon` run straight from a shell, that shell's whole environment);
+  the command lines and environments of other sessions' commands, other missions' included; and those of
+  every other program you run that is not a platform binary. loom narrows what is there: `loom up`
+  clears the daemon's environment, `api_key_file` keeps keys out of it, and a session's proxy credentials
+  work only on that session's own proxy port, which other sessions' commands cannot connect to, directly
+  or through the proxy. With `loopback_all = true` (or a `loopback_ports` entry that happens to be a
+  session's port) they can, and a command that read another running session's proxy credentials can then
+  reach what that session may reach, recorded in that session's audit log. A daemon restart releases the
+  ports: a process that left its command's process group under the previous daemon keeps a profile that
+  allows its old port, which a session of the new daemon may be given. A command that holds every free
+  loopback port stops new sessions from starting (they cannot get a port), as it stops other outgoing
+  connections. Ports of ended sessions are freed only by a restart, so after some sixteen thousand
+  sessions in one daemon run new sessions can fail to get a port (with a sentence saying so) until the
+  daemon is restarted. Do not export secrets in the shell you start loom from, and do not pass secrets to
+  commands on their command lines.
 - **A process that leaves its command's process group is not tracked.** After `setsid`, `daemon()`,
   `redis-server --daemonize yes` or `tmux new -d`, `job_kill`, stop, the end of the session and daemon
   shutdown do not stop it, although it stays under the seatbelt profile.
@@ -199,7 +267,27 @@ These are the places where loom does less than the text above might suggest.
   that moved directory then decides where a file written below it later, by something outside the
   sandbox, lands.
 - **A command can talk to anything on loopback that you allow** (`loopback_ports`, `loopback_all`,
-  `unix_sockets`), including services that run as you.
+  `unix_sockets`), including services that run as you. With `loopback_all` that includes your
+  machine's own network addresses, which the macOS sandbox counts as loopback.
+- **Outside `deny_all`, macOS fetches URLs for a command.** In `allowlist` and `open` modes a command
+  can have the certificate service (`trustd`) fetch a URL named in a certificate it made, or start a
+  background URL session (`nsurlsessiond`) or a WebKit view, which reach any host without the proxy and
+  without an entry in the network audit file. Under `deny_all` the sandbox denies those services. Other
+  system services that make network requests on a process's behalf are not denied in any mode: the
+  profile allows local inter-process communication in general.
+- **Git residuals.** Any directory in a writable root that has no `.git` of its own, your existing
+  subdirectories included, can be turned into a repository (a `HEAD`, `objects`, `refs` and `config`),
+  and Git runs its configuration if you run Git inside that directory. Set
+  `git config --global safe.bareRepository explicit`, which makes Git refuse such a repository unless you
+  name it. Scripts that your hooks or your configuration run from the working tree (`.pre-commit-config.yaml`,
+  `lefthook.yml`, a filter or `fsmonitor` script under the workspace) are ordinary files the session can
+  change: review them before you commit. Your configuration is read without running Git, so a
+  `core.hooksPath` or include written in a form that reading does not understand is not protected. A command can
+  leave an interactive rebase or a cherry-pick in progress whose list holds `exec` lines: they run when
+  you continue it, so do not continue an operation you did not start. Under Bubblewrap a command can make
+  a new repository in a writable directory (existing ones are read-only); do not run Git inside one you
+  did not make. Under Bubblewrap a `core.hooksPath` directory that does not exist yet in a writable
+  directory refuses the session (it cannot be held read-only): create it first.
 - **Tamper evidence has gaps.** Deleting a session's records together with their directory, deleting
   `journal.head` together with the last entries of its mission journal, deleting a mission journal and
   its `journal.head` together, or restoring an older matching pair, cannot be detected. A process

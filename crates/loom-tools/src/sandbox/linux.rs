@@ -265,6 +265,12 @@ pub(super) fn command(sb: &Sandbox, script: &str) -> (String, Vec<String>) {
     for path in sb.inside_tmp_protected() {
         bind(&mut args, "--ro-bind", &path);
     }
+    // The harness's staging of binary-analysis inputs: readable, never writable. It may not exist yet (it is
+    // made on first use), so a missing one is not an error.
+    if !sb.replay && under(&sb.analysis_dir, &sb.loom_home) {
+        let dir = sb.analysis_dir.display().to_string();
+        args.extend(["--ro-bind-try".to_string(), dir.clone(), dir]);
+    }
     for path in sb.unreadable.iter().chain(&sb.credentials) {
         let restored = sb.writable.iter().chain(&sb.git_dirs).any(|root| under(path, root));
         if !restored && (under(path, &sb.loom_home) || hidden_home.is_some_and(|home| under(path, home))) {

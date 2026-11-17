@@ -43,6 +43,11 @@
 //!   specs of the session's registry (`rtools::build_registry(&deps.shared)`, in registry order).
 //!   When `assignment` is `Some((parent, text))`, the second record is
 //!   `harness_note{Assignment, text}` authored `Agent(parent)`.
+//! - `recall(&mut self, text: String) -> Result<(), String>`: appends `harness_note{Info, text}` (author
+//!   `Harness`) to a session that has had no turn yet (no own `turn_start`), so that the note comes before
+//!   its first model request; on a session that has had one, `Err` and nothing is appended. Used once, by
+//!   `Runtime::create_session` for `prior` (`crate::prior::brief`). The note is an ordinary `Info` note: it
+//!   renders as one and a re-weave may drop it.
 //! - `fork`: `loom_core::log::fork_file(parent_log, <own log path>, upto_seq, …)`, whose checked copy
 //!   gives the session its records, then appends `Event::Forked(forked)` (author `Agent(forked.parent)`).
 //!   A parent prefix that is not a sound chain fails the fork with the copy's sentence and no log.
@@ -68,13 +73,20 @@
 //!   model was told of since the last own `turn_end` (a `job_settled` with its note right after it)
 //!   with no `turn_start` since; the runtime starts a turn for a session that was waiting. Calls
 //!   `deps.ctx.jobs.resume_from(n)` with the highest job number in the log's `job_registered`
-//!   records, those just appended included (`j7` → 7). Last, unless the session has ended, the
+//!   records, those just appended included (`j7` → 7). Then, unless the session has ended, the model:
+//!   when `deps.model` or `deps.reasoning_replay` differs from the model the log names (`session_start`'s,
+//!   a fork's from its parent's, then the latest `model_switched`'s), `model_switched{from, to:
+//!   deps.model, reasoning_replay, reason: SWITCH_IDLE}` is appended (it was switched while no task
+//!   ran it, its profile was reloaded meanwhile, or a restart cut a switch short). Last, unless the
+//!   session has ended, the
 //!   prefix guard is primed (`PrefixGuard::prime`) with the weave of the records up to the last `model_request` and that
 //!   record's epoch, so that the first request after a restart is checked like any other. When the
 //!   stable hash of those messages differs from the one stored on the record (the rendering of the
 //!   existing log changed, e.g. with an upgrade), `cache_break{req_id: that request's,
 //!   first_diff_message: 0, detail: texts::rendering_changed(..)}` is appended, unless a
-//!   `cache_break` already follows that record (an earlier open reported it).
+//!   `cache_break` already follows that record (an earlier open reported it). When a `model_switched`
+//!   follows that record, the guard is then primed again with the weave of the whole log: the switch
+//!   may re-render the history on purpose (its replay policy), which is no cache break.
 //!
 //! All three use `Durability::Always`, build the registry, and compute the state below from the
 //! log, so that a session opened from its log behaves as the one that wrote it would:
@@ -163,6 +175,12 @@
 //!   authored `Agent(from)`. Start a turn (`Trigger::Resume`) only if the last turn ended `Waiting`.
 //! - `Input::Resume`: start a turn (`Trigger::Resume`).
 //! - `Input::Reweave`: run the re-weave procedure with reason `operator` (forced). No turn.
+//! - `Input::SwitchModel(sw)`: from the next request on, `deps.client`, `limiter`, `context_window`,
+//!   `model` and `reasoning_replay` are `sw`'s. When the model or the replay policy differs from the
+//!   one the log names, or `sw.settings_changed` (a reload changed the profile: the server or the
+//!   request's extra fields may differ), append `model_switched{from, to, reasoning_replay, reason}` and publish; a
+//!   new replay policy re-renders the history, so the prefix guard is primed with the weave as it is
+//!   now. No turn. While a turn runs it is applied between steps, like a rule.
 //! - `Input::Stop`: a child appends `interrupted{REASON_PARENT}`, kills its jobs, stops its children
 //!   and settles `Stopped` with `texts::stopped_report(step)`, so its parent is not left waiting.
 //!   Anything else: `jobs.kill_all`, `orch.stop_children(session)`. When the last turn ended `Waiting`
@@ -228,7 +246,7 @@
 //!    append `cache_break{req_id, first_diff_message, detail}` and carry on. Render the HUD
 //!    (`hud::render`, over own records, with `jobs.list()` entries that are running — their output
 //!    lines counted on from where the previous request's count stopped —, `orch.children(session)`
-//!    entries that are running, the ledger when there is a journal, `BriefOpts::default()`,
+//!    entries that are running, the ledger when there is a journal, `hud::brief_opts(&role.tools)`,
 //!    `agents.unviewed_min_lines`, own steps and start time counted from where the budget was granted
 //!    (see point 3), budget).
 //!    Store the HUD text (`blobs.put_bytes`; a failure gives `hud: None`). Append
@@ -244,6 +262,18 @@
 //!    - `Err(ContextOverflow{limit, ..})`: once per step, run the re-weave procedure forced with reason
 //!      `overflow` and that `limit`; if it appended a `reweave`, go back to the start of this point (new weave, new
 //!      `model_request`). Otherwise *fail* with `texts::OVERFLOW_UNFOLDABLE`.
+//!    - `Err(Rejected{status, message})` with `status` 400, 413 or 422 (a *refusal*: what a provider
+//!      answers when it refuses what the request carries, such as a content filter refusing a page or a
+//!      payload in the window): when the session's previous step request also ended in a refusal and
+//!      no re-weave has been appended since (its epoch is the current one: the refused prefix is still
+//!      the start of this request), and this step has not re-woven for a refusal yet, run the re-weave
+//!      procedure forced with reason `refused`; if it appended a `reweave`, go back to the start of this
+//!      point. Otherwise remember this epoch as refused and *fail* with the refusal texts:
+//!      `texts::refused(status, message, folded)` as the why (`folded` = a `reweave` with reason
+//!      `refused` was appended after the session's latest `model_response`: the window was folded for a
+//!      refusal and no reply has come since), and for a lead the inbox text `texts::refused_park(status, message, folded)` in place
+//!      of `texts::turn_failed(why)`. The epoch of the last refusal is kept in memory only: after a
+//!      restart the first refusal parks again before the next one re-weaves.
 //!    - any other error: *fail* with `texts::sentence(&error.to_string())`.
 //!    - `Ok(c)`: calibrate the estimator with the characters sent (every message's `chars()`
 //!      including the HUD message, plus the length of each tool spec's `to_openai()` JSON) against
@@ -289,8 +319,11 @@
 //!   carries its parent's tool list): `refused(…, texts::not_in_assignment(name, role name,
 //!   registry names), …)`;
 //! - else `loom_tools::execute(registry, ctx, name, arguments, admission)` with a `ToolCtx` cloned
-//!   from `deps.ctx` with this call's id and the turn's token, and `Admission{policy: &deps.admit,
-//!   estimator}`.
+//!   from `deps.ctx` with this call's id, the turn's token and `view_chars` =
+//!   `policy.view_chars(estimator)`, and `Admission{policy: &policy, estimator}`, where `policy` =
+//!   `deps.admit.for_window(deps.context_window)` computed for this call (so a change of the session's
+//!   window applies from the next call). Early starts take `view_chars` the same way when they start,
+//!   and are admitted with the policy of the moment they are claimed.
 //!
 //! Append the `tool_result`, then every record the call queued (`shared.take_emitted()`), then take
 //! the effect (`shared.take_effect()`). After the last call, a fresh start that a call asked for
@@ -354,7 +387,7 @@
 //! `detail` is the first line of the report cut to 200 characters. For settlements this file makes
 //! itself, `full` is `None` and `payload` is `Value::Null`.
 //!
-//! ## Re-weave procedure (`reason`: `target`, `overflow`, `operator`)
+//! ## Re-weave procedure (`reason`: `target`, `overflow`, `refused`, `operator`)
 //! `est = estimator.tokens_for_messages(&w.messages)` plus the tokens of the tool specs' JSON.
 //! `size` is the size of the next request as the server counts it, when it has counted one in this
 //! epoch: with `m` the latest own-or-inherited step `model_request` of epoch `w.epoch` whose
@@ -380,15 +413,22 @@
 //! `limit`, × `est / size`.
 //! 1. `plan = w.plan(records, estimator, &policy, false)` (`plan_reweave` on the step's weave) with
 //!    `policy = deps.context`. While
-//!    the plan is not enough and `policy.keep_recent_steps` is above `MIN_KEEP_RECENT_STEPS`, halve
+//!    the plan is not enough and `policy.keep_recent_steps` is above the minimum, halve
 //!    `keep_recent_steps` (not below the minimum) and plan again: when folding what lies outside the
 //!    protected recent steps does not make room, it is the output of recent steps that fills the
-//!    window, so fewer of them are protected.
+//!    window, so fewer of them are protected. The minimum is `MIN_KEEP_RECENT_STEPS` (2), and 0 for an
+//!    `overflow` (one output of the latest step can be the whole problem: kept in view, it would make
+//!    every request overflow again). For `refused`, and for an `operator` re-weave while the current
+//!    epoch is the one the last refusal recorded, `keep_recent_steps` is 0 and `floor_tokens` is 0 from
+//!    the start: the plan folds everything it can (every live, unpinned result and report, the droppable
+//!    notes), whatever the size, because what the server refuses may be the newest output and is not a
+//!    matter of size; neither asks for a digest (the prefix was refused) nor goes on to point 2 (at floor
+//!    0 a text plan would drop every reply). A result folded this way keeps its handle in its stub.
 //! 2. Still not enough: `text_plan = w.plan(records, estimator, &policy, true)`. Not forced
 //!    and `text_plan` is not enough either: return without a record and without a digest request (see
 //!    "Why a re-weave must be worth it"). Otherwise, when `text_plan` exists and the re-weave is not
-//!    for an `overflow` (the server has just refused this prefix, and would refuse a digest request
-//!    on it as well), ask for a digest — a
+//!    for an `overflow` or a `refused` (the server has just refused this prefix, and would refuse a
+//!    digest request on it as well), ask for a digest — a
 //!    request of the current stable messages plus one `user` message `texts::DIGEST_PROMPT`, same
 //!    tools, `max_tokens: DIGEST_MAX_TOKENS`, recorded as `model_request{purpose: Digest, hud: None}`
 //!    only (its reply is not appended as a record), and sent once the limiter grants it at
@@ -399,7 +439,7 @@
 //!    The plan becomes `text_plan`, with or without a digest: the ledger brief is the durable state,
 //!    the digest an addition to it.
 //! 3. No plan: return without a record. Otherwise append `reweave{epoch: current + 1, upto_seq,
-//!    evictions, brief: texts::reweave_brief(<ledger.brief(default) or "">, <the rendered frontier, with
+//!    evictions, brief: texts::reweave_brief(<ledger.brief(hud::brief_opts) or "">, <the rendered frontier, with
 //!    `attempts_run` of the records, when the session has a journal>), digest, reason,
 //!    before_tokens: size, after_tokens_est: size − (plan.before_tokens_est − plan.after_tokens_est)
 //!    × size / est}`.
@@ -426,7 +466,7 @@
 //! result and agent report, and drops the nudge, stall and verdict notes (`weave` has the rules). No
 //! plan: nothing is appended. Otherwise `reweave{epoch: current + 1, upto_seq: the last record's seq,
 //! evictions, brief: texts::fresh_start_brief(objections, reopened, <the rendered frontier, as for a
-//! re-weave>, <ledger.brief(default) or "">),
+//! re-weave>, <ledger.brief(hud::brief_opts) or "">),
 //! digest: None, reason: texts::FRESH_START_REASON, before_tokens, after_tokens_est}` with the sizes
 //! computed as in point 3 above, and status is published. The next request ends with the brief: what
 //! the verifier found and how to go on. Nothing leaves the record: the attempt stays in the log and
@@ -473,7 +513,19 @@
 //!   request no longer carries the stubbed output, and no `cache_break` is recorded for it; the
 //!   digest path (plan insufficient → digest request → text eviction) and its failure path;
 //!   `ContextOverflow` from the server triggers a forced re-weave and a retry; unfoldable overflow
-//!   fails the turn with an inbox item;
+//!   fails the turn with an inbox item; an overflow caused by one huge result of the latest step
+//!   (above what two protected steps allow) is folded (keep 0) and the retry goes out with its stub;
+//! - a refusal: a 400 parks a lead with `refused_park(.., false)`; an answer that meets the same 400
+//!   re-weaves with reason `refused` (the latest result is stubbed, with its handle) and the retry gets
+//!   200; a 400 after that re-weave parks with `refused_park(.., true)`; a refusal after a re-weave in
+//!   between parks again first; a 401 or 404 never re-weaves; a child settles `Failed` with
+//!   `refused(..)`; an `operator` re-weave after a refusal folds the latest step's results and asks for
+//!   no digest; with the default context policy (a floor far above the window's size) the refusal fold
+//!   still folds every output, the refused one included; a refusal long after a fold that worked parks
+//!   with `folded` false;
+//! - window-scaled admission: with a small `context_window` a large `bash` output is cut at
+//!   `window / 8` and a `read` of a large file ends at a whole line within `view_chars` and says where to
+//!   continue;
 //! - a fresh start: after a `finish` its verifier did not accept, one `reweave` with the fresh-start
 //!   reason follows the call's records, the next request carries the brief with the objection and
 //!   nothing of the attempt (no `finish` or `conclude` call, none of the reply texts, the reasoning or
@@ -500,12 +552,12 @@ use loom_core::config::{AgentsCfg, Paths};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
     Author, Budget, ChildCompleted, ChildOutcome, ChildSettled, Event, FinishReason, Forked, InboxItem, InboxKind,
-    ModelRequest, ModelResponse, NoteKind, Purpose, Record, Reweave, Seq, SessionOutcome, SessionStart, StoredAction,
-    Termination, Timing, ToolCall, ToolCallRequest, ToolClass, ToolSpec, ToolStatus, Trigger, TurnEndReason, Usage,
-    META_DEFERRED_OBSERVATION, META_EXIT_CODE, META_JOB, META_SIGNAL,
+    ModelRef, ModelRequest, ModelResponse, ModelSwitched, NoteKind, Purpose, ReasoningReplay, Record, Reweave, Seq,
+    SessionOutcome, SessionStart, StoredAction, Termination, Timing, ToolCall, ToolCallRequest, ToolClass, ToolSpec,
+    ToolStatus, Trigger, TurnEndReason, Usage, META_DEFERRED_OBSERVATION, META_EXIT_CODE, META_JOB, META_SIGNAL,
 };
 use loom_core::ids::{new_item_id, new_request_id, CallId, SessionId};
-use loom_core::ledger::{BriefOpts, LedgerOp, LedgerState};
+use loom_core::ledger::{LedgerOp, LedgerState};
 use loom_core::log::{fork_file, Durability, SessionLog};
 use loom_core::message::Message;
 use loom_core::prefix::{stable_hash, PrefixCheck, PrefixGuard};
@@ -560,7 +612,39 @@ pub enum Input {
     /// A `Constraint`, `Approval`, `Withdraw` or `Scope` kept on disk at `file` until it is recorded (see
     /// [`queue_input`]).
     Queued { file: PathBuf, input: Box<Input> },
+    /// Use another model from the next request on (the operator switched it, or its profile was
+    /// reloaded). Applied between steps like a rule; it starts no turn. Not kept on disk: the runtime
+    /// writes the new model to `meta.json` first, and `open` records a switch a restart cut short.
+    SwitchModel(Box<ModelSwitch>),
 }
+
+/// What [`Input::SwitchModel`] carries: the new model's client, slots, window and replay policy.
+#[derive(Clone)]
+pub struct ModelSwitch {
+    pub client: Arc<ModelClient>,
+    pub limiter: Arc<Limiter>,
+    pub context_window: Option<u64>,
+    pub model: ModelRef,
+    pub reasoning_replay: ReasoningReplay,
+    /// For the record: `operator` or `profile reloaded`.
+    pub reason: String,
+    /// The profile's settings changed (a reload): recorded even when the model, window and replay policy
+    /// did not, since what a request carries may have (the server, `extra_body`, `max_output_tokens`).
+    pub settings_changed: bool,
+}
+
+impl std::fmt::Debug for ModelSwitch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelSwitch").field("model", &self.model).field("reason", &self.reason).finish()
+    }
+}
+
+/// The `reason` of a `model_switched` the operator asked for.
+pub const SWITCH_OPERATOR: &str = "operator";
+/// The `reason` of a `model_switched` made because the session's profile was reloaded with new settings.
+pub const SWITCH_RELOADED: &str = "profile reloaded";
+/// The `reason` of a `model_switched` recorded when the session is opened on another model than its log names.
+pub const SWITCH_IDLE: &str = "changed while the session was idle";
 
 /// One input of a session's `queued/` directory.
 #[derive(Serialize, Deserialize)]
@@ -740,6 +824,12 @@ pub struct Deps {
     pub priority: Priority,
     /// Context window of the served model, when known.
     pub context_window: Option<u64>,
+    /// The model the session is meant to use (from its `meta.json`). When the log says another one —
+    /// the operator switched it while it was idle, or its profile was reloaded — `open` records the
+    /// change as a `model_switched` before anything else is sent.
+    pub model: ModelRef,
+    /// The reasoning replay of `model`'s profile.
+    pub reasoning_replay: ReasoningReplay,
     pub shared: Arc<Shared>,
     /// Template for tool calls: `call_id` and `cancel` are replaced for each call.
     pub ctx: ToolCtx,
@@ -808,6 +898,9 @@ struct State {
     requested: Option<Measured>,
     /// The latest step request whose reply carried the prompt size the server counted.
     measured: Option<Measured>,
+    /// The model the log says requests go to, and its replay policy: `session_start`'s (a fork's comes
+    /// from its parent's), then each `model_switched`'s.
+    model: Option<(ModelRef, ReasoningReplay)>,
 }
 
 /// Durable intervals rather than subtracting response timings (which can overlap or never arrive).
@@ -855,7 +948,11 @@ impl CallPolicy {
                                 Some("tested" | "deferred")
                             )
                     }
-                    Some("hypothesis_evidence" | "hypothesis_verdict" | "fact_retract" | "rule_retract") => has("id"),
+                    Some("hypothesis_evidence" | "hypothesis_verdict") => {
+                        // shapes::read accepts `hypothesis` and `hypothesis_id` for `id`.
+                        has("id") || has("hypothesis") || has("hypothesis_id")
+                    }
+                    Some("fact_retract" | "rule_retract") => has("id"),
                     Some("revisit_acknowledge") => has("target"),
                     _ => false,
                 }
@@ -894,6 +991,7 @@ impl State {
                 if s.schema >= 2 {
                     self.clock = Some(ActiveClock::default());
                 }
+                self.model = Some((s.model.clone(), s.reasoning_replay));
             }
             Event::Forked(f) => {
                 *self = State {
@@ -905,9 +1003,12 @@ impl State {
                     clock: self.clock.take().map(|_| ActiveClock::default()),
                     requested: self.requested.take(),
                     measured: self.measured.take(),
+                    // A fork sends to its parent's model (a fork never changes profile).
+                    model: self.model.take(),
                     ..State::default()
                 };
             }
+            Event::ModelSwitched(m) => self.model = Some((m.to.clone(), m.reasoning_replay)),
             Event::ModelRequest(m) if m.purpose == Purpose::Step => {
                 self.step = self.step.saturating_add(1);
                 self.fork_point = rec.seq.checked_sub(1);
@@ -1342,6 +1443,22 @@ pub struct Session {
     #[cfg(test)]
     weaves: u32,
     early_counts: Arc<Mutex<EarlyCounts>>,
+    /// The epoch of the weave whose request the server last refused (400, 413, 422); in memory only.
+    refused_epoch: Option<u32>,
+}
+
+/// How hard a re-weave folds, beyond its trigger (see the module contract's re-weave procedure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fold {
+    /// Protect `keep_recent_steps` recent steps, halving down to `MIN_KEEP_RECENT_STEPS`; ask for a digest.
+    Normal,
+    /// Protect nothing from the start (what the server refuses may be the newest output); ask for a digest.
+    KeepZero,
+    /// The server refused the request as too large for a window of this many tokens: halve down to
+    /// protecting nothing; no digest request (the server would refuse it too).
+    Overflow(u64),
+    /// The server refused the request for what it carries: protect nothing from the start; no digest.
+    Refused,
 }
 
 /// Longest `session_end` detail.
@@ -1360,7 +1477,7 @@ fn to_u32(n: usize) -> u32 {
 }
 
 /// Characters of the tool specs as they are sent.
-fn tools_chars(tools: &[ToolSpec]) -> usize {
+pub(crate) fn tools_chars(tools: &[ToolSpec]) -> usize {
     tools.iter().map(|t| t.to_openai().to_string().len()).sum()
 }
 
@@ -1373,7 +1490,7 @@ fn tools_chars(tools: &[ToolSpec]) -> usize {
 /// the trigger can drop to 1 and the floor to 0. A `max_output` at or above the window cannot be
 /// honoured and counts as none. From a window of 81_920 tokens up the quarter of the window cuts
 /// nothing.
-fn reweave_bounds(policy: &ReweavePolicy, window: Option<u64>, max_output: Option<u64>) -> (u64, u64) {
+pub(crate) fn reweave_bounds(policy: &ReweavePolicy, window: Option<u64>, max_output: Option<u64>) -> (u64, u64) {
     let (mut limit, mut floor) = (policy.target_tokens, policy.floor_tokens);
     if let Some(window) = window {
         let slack = 4_096_u64.min(window / 4);
@@ -1392,6 +1509,31 @@ fn reweave_bounds(policy: &ReweavePolicy, window: Option<u64>, max_output: Optio
         }
     }
     (limit, floor)
+}
+
+/// [`Session::measured_size`] for a counted request `m` (the latest step request of `w`'s epoch that
+/// the server answered with a prompt size) and an estimator.
+fn measured_size(m: Option<&Measured>, w: &Weave, estimator: &TokenEstimator) -> Option<u64> {
+    let m = m.filter(|m| m.epoch == w.epoch)?;
+    let n = usize::try_from(m.n_messages).unwrap_or(usize::MAX);
+    let merged = n.checked_sub(1).and_then(|i| w.messages.get(i)).map_or(0, |last| {
+        let item = |seq: Seq| w.items.binary_search_by_key(&seq, |i| i.seq).ok().and_then(|i| w.items.get(i));
+        let since = last.origin.iter().filter(|s| **s > m.seq);
+        since.fold(0usize, |sum, s| sum.saturating_add(item(*s).map_or(0, |i| i.chars)).saturating_add(2))
+    });
+    let added = estimator.tokens(merged);
+    let after = estimator.tokens_for_messages(w.messages.get(n..).unwrap_or_default());
+    Some(m.prompt_tokens.saturating_add(added).saturating_add(after))
+}
+
+/// The size of the request a session whose log is `records` would send now with `w` (its weave), in
+/// tokens, as `Session::measured_size` gives it; `None` before the first counted request of the epoch.
+pub(crate) fn measured_now(records: &[Record], w: &Weave, estimator: &TokenEstimator) -> Option<u64> {
+    let mut st = State::default();
+    for (idx, rec) in records.iter().enumerate() {
+        st.absorb(idx, rec);
+    }
+    measured_size(st.measured.as_ref(), w, estimator)
 }
 
 /// `x × num / den`: a token count carried from units where a request measures `den` into units where
@@ -1543,6 +1685,7 @@ impl Session {
             #[cfg(test)]
             weaves: 0,
             early_counts: Arc::default(),
+            refused_epoch: None,
         }
     }
 
@@ -1567,6 +1710,17 @@ impl Session {
                 .map_err(|e| e.0)?;
         }
         Ok(session)
+    }
+
+    /// Put the recall note (`prior::brief`) in the log of a session that has had no turn yet, so that it comes
+    /// before its first model request. See the module contract.
+    pub fn recall(&mut self, text: String) -> Result<(), String> {
+        if self.own().iter().any(|r| matches!(r.event, Event::TurnStart { .. })) {
+            return Err("This session has already had a turn, so earlier missions can no longer be recalled into it. \
+Name them when you start a new mission instead."
+                .into());
+        }
+        self.note(Author::Harness, NoteKind::Info, text).map_err(|e| e.0)
     }
 
     /// A new session whose log starts as a copy of `parent_log` up to `upto_seq`.
@@ -1634,6 +1788,12 @@ impl Session {
             // `resume_from` only takes a lock; it never waits.
             let _ = session.deps.ctx.jobs.resume_from(n).now_or_never();
         }
+        // The model the runtime opened the session with may not be the one its log names: it was
+        // switched while the session was idle, its profile was reloaded meanwhile, or a restart cut a
+        // switch short. Recorded before anything is sent, so the log stays the truth.
+        if session.st.ended.is_none() {
+            session.record_model(SWITCH_IDLE, false).map_err(|e| e.0)?;
+        }
         session.seed_guard().map_err(|e| e.0)?;
         Ok(session)
     }
@@ -1657,6 +1817,52 @@ impl Session {
         if stable_hash(&messages) != sent.stable_hash && !reported {
             let detail = texts::rendering_changed(sent.n_messages, messages.len());
             self.append(Author::Harness, Event::CacheBreak { req_id: sent.req_id, first_diff_message: 0, detail })?;
+        }
+        // A model switch since that request may re-render the history on purpose (its replay policy):
+        // the next request is compared with the history as it renders now, not as it was sent.
+        if self.records.iter().skip(at).any(|r| matches!(r.event, Event::ModelSwitched(_))) {
+            let w = self.woven();
+            self.guard.prime(w.weave.epoch, &w.weave.messages);
+        }
+        Ok(())
+    }
+
+    /// Point the session at the model of `sw` from the next request on (see [`Input::SwitchModel`]).
+    fn switch_model(&mut self, sw: ModelSwitch) -> R<()> {
+        let ModelSwitch { client, limiter, context_window, model, reasoning_replay, reason, settings_changed } = sw;
+        self.deps.client = client;
+        self.deps.limiter = limiter;
+        self.deps.context_window = context_window;
+        self.deps.model = model;
+        self.deps.reasoning_replay = reasoning_replay;
+        self.record_model(&reason, settings_changed)
+    }
+
+    /// Record a `model_switched` when the log's model (or its replay policy) is not `deps.model`, or when
+    /// `always` (the profile's other settings changed), so the weave and every reader of the log follow
+    /// the change. Otherwise nothing is recorded when they agree. A new replay policy re-renders the
+    /// history on purpose, so the prefix guard is primed with it: that is not a cache break of the
+    /// session's making.
+    fn record_model(&mut self, reason: &str, always: bool) -> R<()> {
+        let to = (self.deps.model.clone(), self.deps.reasoning_replay);
+        let Some(from) = self.st.model.clone() else { return Ok(()) };
+        if from == to && !always {
+            return Ok(());
+        }
+        let replay_changed = from.1 != to.1;
+        self.append(
+            Author::Harness,
+            Event::ModelSwitched(ModelSwitched {
+                from: from.0,
+                to: to.0,
+                reasoning_replay: to.1,
+                reason: reason.to_string(),
+            }),
+        )?;
+        self.publish();
+        if replay_changed {
+            let w = self.woven();
+            self.guard.prime(w.weave.epoch, &w.weave.messages);
         }
         Ok(())
     }
@@ -1984,7 +2190,8 @@ impl Session {
             Input::Reweave => {
                 let token = self.deps.control.begin_turn();
                 let woven = self.woven();
-                self.reweave(&woven, "operator", true, &token, None).await?;
+                let fold = self.operator_fold(&woven);
+                self.reweave(&woven, "operator", true, &token, fold).await?;
                 Ok(None)
             }
             Input::Stop => {
@@ -2191,6 +2398,7 @@ impl Session {
                     out.trigger = Some(Trigger::Resume);
                 }
             }
+            Input::SwitchModel(sw) => self.switch_model(*sw)?,
             Input::Resume | Input::Reweave | Input::Stop | Input::Queued { .. } => {}
         }
         Ok(out)
@@ -2481,13 +2689,32 @@ impl Session {
         }
     }
 
+    /// How an operator's re-weave folds: from keep 0 while the weave is the one the server last refused.
+    fn operator_fold(&self, woven: &Woven) -> Fold {
+        if self.refused_epoch == Some(woven.weave.epoch) {
+            Fold::KeepZero
+        } else {
+            Fold::Normal
+        }
+    }
+
+    /// The admission policy for a call started now: the configured one scaled to the session's window.
+    fn admit_policy(&self) -> AdmitPolicy {
+        self.deps.admit.for_window(self.deps.context_window)
+    }
+
     /// The session cannot go on: a child settles `Failed`, anything else asks the operator.
     fn fail(&mut self, why: &str) -> R<Flow> {
+        self.fail_with(why, texts::turn_failed(why))
+    }
+
+    /// [`Session::fail`] with the text a lead's inbox item carries.
+    fn fail_with(&mut self, why: &str, inbox_text: String) -> R<Flow> {
         if self.deps.shared.is_child() {
             let report = texts::failed_report(why, &self.last_reply());
             Ok(Flow::Settle(delivery(ChildOutcome::Failed, report)))
         } else {
-            self.open_inbox(InboxKind::Parked, texts::turn_failed(why))?;
+            self.open_inbox(InboxKind::Parked, inbox_text)?;
             Ok(Flow::End(TurnEndReason::Error))
         }
     }
@@ -2518,7 +2745,8 @@ impl Session {
         // The weave of this step, rendered again only after a record that changes it.
         let mut woven = self.woven();
         let (reason, forced) = if force { ("operator", true) } else { ("target", false) };
-        if self.reweave(&woven, reason, forced, &token, None).await? {
+        let fold = if force { self.operator_fold(&woven) } else { Fold::Normal };
+        if self.reweave(&woven, reason, forced, &token, fold).await? {
             woven = self.woven();
         }
         if token.is_cancelled() {
@@ -2526,6 +2754,7 @@ impl Session {
         }
 
         let mut overflowed = false;
+        let mut refold = false;
         let (req_id, completion, queue_ms, tools, early, observed) = loop {
             let req_id = new_request_id();
             let w = &woven.weave;
@@ -2578,6 +2807,7 @@ impl Session {
                     if c.usage.prompt_tokens > 0 {
                         self.estimator.calibrate(sent_chars, c.usage.prompt_tokens);
                     }
+                    self.refused_epoch = None;
                     break (req_id, c, queue_ms, request.tools, early, observed);
                 }
                 Err(ModelError::Cancelled { .. }) => return self.cancelled().await,
@@ -2585,8 +2815,8 @@ impl Session {
                     if !overflowed {
                         overflowed = true;
                         // What the server refused bounds its window, whatever the session was told.
-                        let refused_at = Some(limit.unwrap_or(est_tokens));
-                        if self.reweave(&woven, "overflow", true, &token, refused_at).await? {
+                        let fold = Fold::Overflow(limit.unwrap_or(est_tokens));
+                        if self.reweave(&woven, "overflow", true, &token, fold).await? {
                             woven = self.woven();
                             continue;
                         }
@@ -2595,6 +2825,31 @@ impl Session {
                         }
                     }
                     return self.fail(texts::OVERFLOW_UNFOLDABLE);
+                }
+                Err(ModelError::Rejected { status, message }) if matches!(status, 400 | 413 | 422) => {
+                    // The provider refuses what the request carries. The same prefix refused again
+                    // (nothing re-woven since the last refusal) is folded out of view once per step.
+                    if !refold && self.refused_epoch == Some(woven.weave.epoch) {
+                        refold = true;
+                        if self.reweave(&woven, "refused", true, &token, Fold::Refused).await? {
+                            woven = self.woven();
+                            continue;
+                        }
+                        if token.is_cancelled() {
+                            return self.cancelled().await;
+                        }
+                    }
+                    self.refused_epoch = Some(woven.weave.epoch);
+                    let folded = self
+                        .records
+                        .iter()
+                        .rev()
+                        .take_while(|r| !matches!(r.event, Event::ModelResponse(_)))
+                        .any(|r| matches!(&r.event, Event::Reweave(rw) if rw.reason == "refused"));
+                    return self.fail_with(
+                        &texts::refused(status, &message, folded),
+                        texts::refused_park(status, &message, folded),
+                    );
                 }
                 Err(other) => return self.fail(&texts::sentence(&other.to_string())),
             }
@@ -2778,7 +3033,9 @@ impl Session {
         let session = self.deps.shared.session.clone();
         let on = self.deps.ctx.cfg.speculate;
         let logged = if on { self.logged_call_ids() } else { HashSet::new() };
-        let (registry, template, counts) = (self.registry.clone(), self.deps.ctx.clone(), self.early_counts.clone());
+        let mut template = self.deps.ctx.clone();
+        template.view_chars = self.admit_policy().view_chars(&self.estimator);
+        let (registry, counts) = (self.registry.clone(), self.early_counts.clone());
         let mut early = Early::new(on, registry, template, token, logged, counts);
         early.policy = CallPolicy { wrapup: self.st.budget_note_step.is_some() };
         let result = self
@@ -2960,7 +3217,7 @@ impl Session {
             records: self.own(),
             ledger: ledger.as_ref(),
             ledger_skipped,
-            brief: BriefOpts::default(),
+            brief: hud::brief_opts(&shared.role.tools),
             unviewed_min_lines: self.deps.agents.unviewed_min_lines,
             jobs: &jobs,
             children: &children,
@@ -3140,16 +3397,7 @@ impl Session {
     /// its last message since (with the blank line joining each), and the messages after it. `None`
     /// before the first such answer of the epoch.
     fn measured_size(&self, w: &Weave) -> Option<u64> {
-        let m = self.st.measured.as_ref().filter(|m| m.epoch == w.epoch)?;
-        let n = usize::try_from(m.n_messages).unwrap_or(usize::MAX);
-        let merged = n.checked_sub(1).and_then(|i| w.messages.get(i)).map_or(0, |last| {
-            let item = |seq: Seq| w.items.binary_search_by_key(&seq, |i| i.seq).ok().and_then(|i| w.items.get(i));
-            let since = last.origin.iter().filter(|s| **s > m.seq);
-            since.fold(0usize, |sum, s| sum.saturating_add(item(*s).map_or(0, |i| i.chars)).saturating_add(2))
-        });
-        let added = self.estimator.tokens(merged);
-        let after = self.estimator.tokens_for_messages(w.messages.get(n..).unwrap_or_default());
-        Some(m.prompt_tokens.saturating_add(added).saturating_add(after))
+        measured_size(self.st.measured.as_ref(), w, &self.estimator)
     }
 
     /// Fold older material out of view when the request has grown past the limit (or `forced`).
@@ -3161,13 +3409,24 @@ impl Session {
         reason: &str,
         forced: bool,
         token: &CancellationToken,
-        refused_at: Option<u64>,
+        fold: Fold,
     ) -> R<bool> {
+        let refused_at = match fold {
+            Fold::Overflow(at) => Some(at),
+            _ => None,
+        };
         let window = match (self.deps.context_window, refused_at) {
             (Some(known), Some(refused)) => Some(known.min(refused)),
             (known, refused) => known.or(refused),
         };
         let mut policy = self.deps.context.clone();
+        let min_keep = match fold {
+            Fold::Normal => MIN_KEEP_RECENT_STEPS,
+            Fold::KeepZero | Fold::Overflow(_) | Fold::Refused => 0,
+        };
+        if matches!(fold, Fold::KeepZero | Fold::Refused) {
+            policy.keep_recent_steps = 0;
+        }
         let (limit, floor) = reweave_bounds(&policy, window, self.deps.client.profile().max_output_tokens);
         let est = self.estimate(&woven.weave);
         let size = self.measured_size(&woven.weave).unwrap_or(est);
@@ -3175,24 +3434,26 @@ impl Session {
             return Ok(false);
         }
         // The plan counts in the estimator's units, the check in the server's when it has counted.
-        policy.floor_tokens = scaled(floor, est, size);
+        policy.floor_tokens = if matches!(fold, Fold::KeepZero | Fold::Refused) { 0 } else { scaled(floor, est, size) };
         let midpoint = scaled(floor.saturating_add(limit) / 2, est, size);
         let enough =
             |p: &Option<loom_core::weave::ReweavePlan>| p.as_ref().is_some_and(|p| p.after_tokens_est <= midpoint);
         let mut plan = woven.plan(&self.records, &self.estimator, &policy, false);
-        while !enough(&plan) && policy.keep_recent_steps > MIN_KEEP_RECENT_STEPS {
-            policy.keep_recent_steps = (policy.keep_recent_steps / 2).max(MIN_KEEP_RECENT_STEPS);
+        while !enough(&plan) && policy.keep_recent_steps > min_keep {
+            policy.keep_recent_steps = (policy.keep_recent_steps / 2).max(min_keep);
             plan = woven.plan(&self.records, &self.estimator, &policy, false);
         }
         let mut digest = None;
-        if !enough(&plan) {
+        // A refusal fold takes the outputs out of view, never the replies: at floor 0 a text plan would
+        // drop every reply, with no digest to keep the map of the work.
+        if !enough(&plan) && !matches!(fold, Fold::Refused | Fold::KeepZero) {
             let text_plan = woven.plan(&self.records, &self.estimator, &policy, true);
             if !forced && !enough(&text_plan) {
                 return Ok(false);
             }
-            // After an overflow the server has just refused this prefix: a digest request on it would be
-            // refused as well.
-            if text_plan.is_some() && refused_at.is_none() {
+            // After an overflow or a refusal the server has just refused this prefix: a digest request on
+            // it would be refused as well.
+            if text_plan.is_some() && matches!(fold, Fold::Normal) {
                 digest = self.ask_digest(&woven.weave, token).await?;
                 if token.is_cancelled() {
                     return Ok(false);
@@ -3414,6 +3675,8 @@ impl Session {
             let mut ctx = self.deps.ctx.clone();
             ctx.call_id = call.call_id.clone();
             ctx.cancel = self.token.clone();
+            let policy = self.admit_policy();
+            ctx.view_chars = policy.view_chars(&self.estimator);
             let started = Instant::now();
             let mut result = if let Some(first) = &ender {
                 refused(&ctx, &call.name, class, texts::not_run_after(first), started)
@@ -3438,7 +3701,7 @@ impl Session {
                 if class == ToolClass::Exec {
                     self.append(Author::Harness, Event::ExecStarted { call_id: call.call_id.clone() })?;
                 }
-                let admission = Admission { policy: &self.deps.admit, estimator: &self.estimator };
+                let admission = Admission { policy: &policy, estimator: &self.estimator };
                 execute(&self.registry, &ctx, &call.name, &call.arguments, &admission).await
             };
             if deferred {
@@ -3489,7 +3752,7 @@ impl Session {
             Some(Ok(l)) => {
                 let mut f = frontier::frontier(&l, now_ms());
                 f.attempts_run = frontier::attempts_run(&self.records);
-                (l.brief(&BriefOpts::default()), frontier::render(&f))
+                (l.brief(&hud::brief_opts(&self.deps.shared.role.tools)), frontier::render(&f))
             }
             _ => (String::new(), None),
         }
@@ -3552,7 +3815,8 @@ impl Session {
         call: &ToolCallRequest,
     ) -> loom_core::event::ToolResult {
         let reached = Instant::now();
-        let admission = Admission { policy: &self.deps.admit, estimator: &self.estimator };
+        let policy = self.admit_policy();
+        let admission = Admission { policy: &policy, estimator: &self.estimator };
         let ran = match (&mut run.task.handle).await {
             Ok(ran) => ran,
             // Only a discard aborts a task, and a claimed run is never discarded; the call runs in place.
@@ -3582,7 +3846,7 @@ mod tests {
     use super::*;
     use crate::rtools::testkit::{core_role, rig_with, FakeOrch, Rig};
     use loom_core::config::ModelProfile;
-    use loom_core::event::{Brief, ModelRef, ReasoningReplay};
+    use loom_core::event::{Brief, EvictAction, Eviction, ModelRef, ReasoningReplay};
     use loom_core::ids::MissionId;
     use loom_core::log::read_records;
     use loom_model::mock::{Action, MockServer, Reply, Script};
@@ -3708,10 +3972,13 @@ mod tests {
                 agents: self.agents.clone(),
                 context: self.context.clone(),
                 admit: self.admit.clone(),
-                client: Arc::new(ModelClient::new("mock", self.profile.clone()).unwrap()),
+                client: Arc::new(ModelClient::new("mock", self.profile.clone(), &self.paths.model_keys_dir()).unwrap()),
                 limiter: Arc::new(Limiter::new(4)),
                 priority: Priority::Lead,
                 context_window: self.window,
+                // As `start` records it, so opening a log it wrote records no switch.
+                model: ModelRef { profile: "mock".into(), model: "mock".into(), context_window: 1_000_000 },
+                reasoning_replay: ReasoningReplay::All,
                 shared: self.shared.clone(),
                 ctx: self.ctx.clone(),
                 job_events,
@@ -4088,6 +4355,36 @@ mod tests {
         assert_eq!(fx.server.requests().len(), 6);
         assert_eq!(fx.sink.last_status().unwrap().open_inbox, 1);
         assert_no_cache_break(&rs);
+    }
+
+    // ---- recall ------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_recall_note_sits_right_after_session_start_and_is_in_the_first_request() {
+        let mut fx = Fx::build("lead", false, true, AgentsCfg::default(), seq(vec![Reply::text("ok").into()])).await;
+        let mut session = fx.create();
+        session.recall("EARLIER-MISSION-NOTE".into()).unwrap();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let ks = kinds(&rs);
+        assert_eq!(&ks[..2], ["session_start", "harness_note"]);
+        assert!(ks.iter().position(|k| k == "model_request").unwrap() > 1);
+        assert_eq!(rs[1].author, Author::Harness);
+        assert_eq!(notes(&rs, NoteKind::Info)[0], "EARLIER-MISSION-NOTE");
+        assert!(all_text(&fx.server.requests()[0]).contains("EARLIER-MISSION-NOTE"));
+    }
+
+    #[tokio::test]
+    async fn a_recall_after_a_turn_is_refused_and_appends_nothing() {
+        let mut fx = Fx::build("lead", false, true, AgentsCfg::default(), seq(vec![Reply::text("ok").into()])).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let mut reopened = Session::open(fx.deps()).unwrap();
+        let reopened_len = reopened.records().len();
+        let err = reopened.recall("LATE".into()).unwrap_err();
+        assert!(err.contains("already had a turn") && err.contains("new mission"), "{err}");
+        assert_eq!(reopened.records().len(), reopened_len);
+        assert!(!std::fs::read_to_string(fx.log_path()).unwrap().contains("LATE"));
     }
 
     // ---- output limit ------------------------------------------------------------------------
@@ -6760,7 +7057,7 @@ mod tests {
         // ... while the server counts it far above the target, and the plan is made for that.
         let size = session.measured_size(&woven.weave).unwrap();
         assert!(size > 1_000_000);
-        assert!(session.reweave(&woven, "target", false, &CancellationToken::new(), None).await.unwrap());
+        assert!(session.reweave(&woven, "target", false, &CancellationToken::new(), Fold::Normal).await.unwrap());
         let rw = reweave_records(session.records());
         assert_eq!(rw.len(), 1);
         assert_eq!(rw[0].evictions.len(), 2, "both reports are folded");
@@ -6867,6 +7164,8 @@ mod tests {
                         quote: None,
                         note: "ran it".into(),
                         attested: true,
+                        tool: None,
+                        grade: None,
                     }),
                     LedgerOp::ClaimUpdate {
                         id: "c1".into(),
@@ -6991,10 +7290,11 @@ mod tests {
 
     #[tokio::test]
     async fn unfoldable_overflow_fails_the_turn_with_an_inbox_item() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![big(), Reply::text("ok").into()])).await;
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("ok").into()])).await;
         fx.server.set_model("mock", Some(10_000));
         let session = fx.create();
-        run_with(session, vec![user("go")]).await;
+        // The operator's own message is what does not fit: there is no tool output to fold.
+        run_with(session, vec![user(&"a long message. ".repeat(3_000))]).await;
         let rs = fx.sink.records();
         assert_eq!(reweave_records(&rs).len(), 0);
         let items = inbox(&rs);
@@ -7004,9 +7304,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_overflow_from_one_huge_result_of_the_latest_step_is_folded_to_keep_zero() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![big(), Reply::text("ok").into()])).await;
+        // One result of about 10k tokens is more than this window holds, and it is in the protected
+        // recent steps.
+        fx.server.set_model("mock", Some(10_000));
+        fx.context =
+            ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 2, stub_tail_lines: 3 };
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let rw = reweave_records(&rs);
+        assert_eq!(rw.len(), 1, "{:?}", kinds(&rs));
+        assert_eq!(rw[0].reason, "overflow");
+        assert!(rw[0].digest.is_none());
+        assert!(matches!(&rw[0].evictions[..], [Eviction { action: EvictAction::Stub { .. }, .. }]), "{rw:?}");
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+        assert!(inbox(&rs).is_empty());
+        let reqs = fx.server.requests();
+        let line = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(reqs.len(), 3, "the request, the refused one, the retry");
+        assert!(all_text(&reqs[1]).matches(line).count() >= 600);
+        assert!(all_text(&reqs[2]).matches(line).count() < 10, "the retry carries the stub");
+        assert!(all_text(&reqs[2]).contains("out:"));
+    }
+
+    #[tokio::test]
     async fn a_small_window_is_folded_at_its_trigger_before_the_server_refuses_it() {
-        let mut fx =
-            Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
+        // Each output is cut to an eighth of this window (4k tokens), so it takes more of them to fill it.
+        let mut replies: Vec<Action> = (0..12).map(|_| big()).collect();
+        replies.push(Reply::text("ok").into());
+        let mut fx = Fx::new("chat", false, false, seq(replies)).await;
         fx.server.set_model("mock", Some(32_000));
         fx.window = Some(32_000);
         // The configured floor (180k) is far above this window.
@@ -7131,6 +7459,376 @@ mod tests {
         finish_task(tx, task).await;
     }
 
+    // ---- refusals, and admission scaled to the window --------------------------------------------
+
+    /// A command whose output starts with the content the filter refuses and goes on for 300 lines. The
+    /// shell builds the word, so the command line the model sent does not hold it.
+    const POISONED: &str = "printf 'POI''SON\\n'; yes fillerfillerfillerfiller | head -n 300";
+    const FILTER_SAYS: &str = "Input text data may contain inappropriate content";
+
+    fn refusal(status: u16) -> Action {
+        let body = json!({ "error": { "message": FILTER_SAYS } }).to_string();
+        Action::Status { status, body, retry_after_s: None }
+    }
+
+    /// A server whose content filter refuses every request that carries the poisoned output, and that
+    /// otherwise plays `actions`.
+    fn filter_over(actions: Vec<Action>) -> Script {
+        let mut actions = std::collections::VecDeque::from(actions);
+        Script::new(move |body, _| {
+            if body.to_string().contains("POISON") {
+                return refusal(400);
+            }
+            actions.pop_front().unwrap_or_else(|| Reply::text("(script exhausted)").into())
+        })
+    }
+
+    /// A server that plays `first`, then answers every request with `status`.
+    fn then_refuse(first: Vec<Action>, status: u16) -> Script {
+        let mut first = std::collections::VecDeque::from(first);
+        Script::new(move |_, _| first.pop_front().unwrap_or_else(|| refusal(status)))
+    }
+
+    fn refuse_context() -> ReweavePolicy {
+        ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 2, stub_tail_lines: 3 }
+    }
+
+    /// Append the operator's message and run one turn, in place.
+    async fn say(session: &mut Session, text: &str) {
+        session.append(Author::User, Event::UserMessage { text: text.into() }).unwrap();
+        assert!(session.turn(Trigger::User).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refusal_parks_and_the_same_refusal_again_folds_every_output_out_of_view() {
+        let mut fx =
+            Fx::new("chat", false, false, filter_over(vec![bash(POISONED).into(), Reply::text("done").into()])).await;
+        fx.context = refuse_context();
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        let rs = session.records().to_vec();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error]);
+        assert_eq!(inbox(&rs).len(), 1);
+        assert_eq!(inbox(&rs)[0].text, texts::refused_park(400, FILTER_SAYS, false));
+        assert!(reweave_records(&rs).is_empty(), "the first refusal parks without folding");
+        assert_eq!(session.refused_epoch, Some(0));
+
+        // The answer appends to the same prefix; the server refuses it the same way; the session folds.
+        say(&mut session, "keep working").await;
+        let rs = session.records().to_vec();
+        let rw = reweave_records(&rs);
+        assert_eq!(rw.len(), 1, "{:?}", kinds(&rs));
+        assert_eq!(rw[0].reason, "refused");
+        assert!(rw[0].digest.is_none());
+        assert!(
+            matches!(&rw[0].evictions[..], [Eviction { action: EvictAction::Stub { text }, .. }] if text.contains("out:"))
+        );
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error, TurnEndReason::Yielded]);
+        assert_eq!(inbox(&rs).len(), 1);
+        assert_eq!(session.refused_epoch, None);
+        let reqs = fx.server.requests();
+        assert_eq!(reqs.len(), 4, "the call, the refusal, the refusal again, the retry");
+        assert!(body_has(&reqs[2], "POISON") && !body_has(&reqs[3], "POISON"));
+        assert!(all_text(&reqs[3]).contains("out:"), "the stub keeps the handle");
+        assert!(!rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest)));
+    }
+
+    fn body_has(body: &Value, what: &str) -> bool {
+        body.to_string().contains(what)
+    }
+
+    #[tokio::test]
+    async fn a_refusal_after_the_fold_parks_with_the_folded_texts() {
+        let script = then_refuse(vec![bash(BIG).into()], 400);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context = refuse_context();
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        say(&mut session, "again").await;
+        let rs = session.records().to_vec();
+        let rw = reweave_records(&rs);
+        assert_eq!(rw.iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["refused"]);
+        let items = inbox(&rs);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, texts::refused_park(400, FILTER_SAYS, false));
+        assert_eq!(items[1].text, texts::refused_park(400, FILTER_SAYS, true));
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error, TurnEndReason::Error]);
+        // The folded window is what was refused: one fold per step, and a third answer parks again.
+        say(&mut session, "once more").await;
+        let rs = session.records().to_vec();
+        assert_eq!(inbox(&rs).len(), 3);
+        assert_eq!(inbox(&rs)[2].text, texts::refused_park(400, FILTER_SAYS, true));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_after_an_unrelated_reweave_parks_before_it_folds_again() {
+        let script = then_refuse(vec![bash(BIG).into()], 400);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context =
+            ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 0, stub_tail_lines: 3 };
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        // Something else re-weaves in between: what the next request starts with is not what was refused.
+        let woven = session.woven();
+        let token = CancellationToken::new();
+        assert!(session.reweave(&woven, "target", true, &token, Fold::Normal).await.unwrap());
+        say(&mut session, "again").await;
+        let rs = session.records().to_vec();
+        assert_eq!(reweave_records(&rs).iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["target"]);
+        let items = inbox(&rs);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].text, texts::refused_park(400, FILTER_SAYS, false));
+    }
+
+    #[tokio::test]
+    async fn other_rejections_never_fold_and_a_413_and_a_422_are_refusals() {
+        for status in [401, 403] {
+            let mut fx = Fx::new("chat", false, false, then_refuse(vec![bash(BIG).into()], status)).await;
+            fx.context = refuse_context();
+            let mut session = fx.create();
+            for text in ["go", "again", "and again"] {
+                say(&mut session, text).await;
+            }
+            let rs = session.records().to_vec();
+            assert!(reweave_records(&rs).is_empty(), "{status}");
+            assert_eq!(session.refused_epoch, None, "{status}");
+            let items = inbox(&rs);
+            assert_eq!(items.len(), 3);
+            assert!(items.iter().all(|i| !i.text.contains("refused the request")), "{}", items[0].text);
+        }
+        for status in [413, 422] {
+            let mut fx = Fx::new("chat", false, false, then_refuse(vec![bash(BIG).into()], status)).await;
+            fx.context = refuse_context();
+            let mut session = fx.create();
+            say(&mut session, "go").await;
+            say(&mut session, "again").await;
+            let rs = session.records().to_vec();
+            assert_eq!(reweave_records(&rs).iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["refused"]);
+            assert_eq!(inbox(&rs)[0].text, texts::refused_park(status, FILTER_SAYS, false));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_that_is_refused_settles_failed_with_the_refusal() {
+        let mut kid = Fx::new("worker", true, true, then_refuse(Vec::new(), 400)).await;
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Do it.".into())));
+        let End::Settled(s) = run_with(session, vec![]).await else { panic!("expected a settlement") };
+        assert_eq!(s.outcome, ChildOutcome::Failed);
+        assert!(s.report.contains(&texts::refused(400, FILTER_SAYS, false)), "{}", s.report);
+    }
+
+    #[tokio::test]
+    async fn an_operator_reweave_after_a_refusal_folds_the_latest_steps_results() {
+        let script = then_refuse(vec![bash(BIG).into()], 400);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context = refuse_context();
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        let (tx, task) = spawn_run(session);
+        tx.send(Input::Reweave).unwrap();
+        wait_until(&fx.sink, "reweave", |rs| count(rs, "reweave") == 1).await;
+        let rw = reweave_records(&fx.sink.records());
+        assert_eq!(rw[0].reason, "operator");
+        assert!(matches!(&rw[0].evictions[..], [Eviction { action: EvictAction::Stub { .. }, .. }]), "{rw:?}");
+        let rs = fx.sink.records();
+        assert!(
+            !rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest)),
+            "no digest request after a refusal"
+        );
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn a_refusal_fold_never_drops_the_replies_even_when_they_fill_the_window() {
+        // The replies alone (about 19k tokens) stay above the midpoint (15.5k) once every output is folded,
+        // and the whole request stays under the trigger (30k), so no `target` re-weave comes first.
+        let talk = "a reply that goes on at length. ".repeat(1_000);
+        let script = filter_over(vec![
+            bash("echo one").with_text(talk.clone()).into(),
+            bash(POISONED).with_text(talk.clone()).into(),
+            Reply::text("done").into(),
+        ]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context =
+            ReweavePolicy { target_tokens: 30_000, floor_tokens: 1_000, keep_recent_steps: 2, stub_tail_lines: 3 };
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        say(&mut session, "keep working").await;
+        let rs = session.records().to_vec();
+        let rw = reweave_records(&rs);
+        let refused: Vec<_> = rw.iter().filter(|w| w.reason == "refused").collect();
+        assert_eq!(refused.len(), 1, "{:?}", rw.iter().map(|w| w.reason.clone()).collect::<Vec<_>>());
+        assert!(refused[0].evictions.iter().all(|e| e.action != EvictAction::Drop), "{:?}", refused[0].evictions);
+        let reqs = fx.server.requests();
+        assert!(all_text(reqs.last().unwrap()).contains("a reply that goes on at length."), "the replies stay");
+    }
+
+    #[tokio::test]
+    async fn refusal_folds_with_the_default_policy() {
+        let mut fx =
+            Fx::new("chat", false, false, filter_over(vec![bash(POISONED).into(), Reply::text("done").into()])).await;
+        // fx.context is ReweavePolicy::default(): floor 180k, target 400k, keep 60.
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        say(&mut session, "keep working").await;
+        say(&mut session, "and again").await;
+        let rs = session.records().to_vec();
+        let rw = reweave_records(&rs);
+        assert_eq!(
+            rw.len(),
+            1,
+            "refused re-weaves {:?}; turn ends {:?}; inbox {}",
+            rw.iter().map(|w| w.reason.clone()).collect::<Vec<_>>(),
+            turn_ends(&rs),
+            inbox(&rs).len()
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_fold_stops_at_the_floor_and_keeps_the_refused_output() {
+        let mut fx = Fx::new(
+            "chat",
+            false,
+            false,
+            filter_over(vec![bash(BIG).into(), bash(POISONED).into(), Reply::text("done").into()]),
+        )
+        .await;
+        fx.context =
+            ReweavePolicy { target_tokens: 400_000, floor_tokens: 6_000, keep_recent_steps: 2, stub_tail_lines: 3 };
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        say(&mut session, "keep working").await;
+        let rs = session.records().to_vec();
+        let rw = reweave_records(&rs);
+        assert_eq!(rw.iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["refused"]);
+        let reqs = fx.server.requests();
+        let items = inbox(&rs);
+        assert!(
+            !body_has(reqs.last().unwrap(), "POISON"),
+            "the retry after the refused fold still carries the refused output; evictions {}; turn ends {:?}; last inbox: {}",
+            rw[0].evictions.len(),
+            turn_ends(&rs),
+            items.last().map(|i| i.text.clone()).unwrap_or_default()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_refusal_long_after_a_successful_fold_says_an_answer_cannot_help() {
+        let script = filter_over(vec![
+            bash(POISONED).into(),
+            bash(POISONED).into(),
+            Reply::text("done").into(),
+            Reply::text("done again").into(),
+        ]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context = refuse_context();
+        let mut session = fx.create();
+        say(&mut session, "go").await; // refused: park
+        say(&mut session, "keep working").await; // refused again: fold, retry ok, new poisoned output refused: park
+        say(&mut session, "again").await; // refused again on that prefix: fold, retry ok
+        let rs = session.records().to_vec();
+        let items = inbox(&rs);
+        assert_eq!(reweave_records(&rs).iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["refused", "refused"]);
+        assert_eq!(turn_ends(&rs).last(), Some(&TurnEndReason::Yielded), "the answer alone was enough");
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[1].text,
+            texts::refused_park(400, FILTER_SAYS, false),
+            "the park told the operator an answer cannot help"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_operator_reweave_without_a_refusal_still_protects_the_recent_steps() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![bash(BIG).into(), Reply::text("ok").into()])).await;
+        fx.context = refuse_context();
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        let woven = session.woven();
+        assert_eq!(session.operator_fold(&woven), Fold::Normal);
+        assert!(!session.reweave(&woven, "operator", true, &CancellationToken::new(), Fold::Normal).await.unwrap());
+    }
+
+    /// The real `read` that reports the `view_chars` its call was given.
+    struct EchoViewChars;
+
+    #[async_trait::async_trait]
+    impl Tool for EchoViewChars {
+        fn spec(&self) -> ToolSpec {
+            loom_tools::fstools::Read.spec()
+        }
+        fn speculative(&self) -> bool {
+            true
+        }
+        async fn run(&self, ctx: &ToolCtx, _args: &Map<String, Value>) -> loom_tools::ToolOutput {
+            loom_tools::ToolOutput::ok("ok", loom_tools::Body::Message(format!("view_chars={}", ctx.view_chars)))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_call_is_admitted_with_the_policy_of_the_sessions_window() {
+        let window = 16_000u64;
+        let estimator = TokenEstimator::default();
+        let scaled = AdmitPolicy::default().for_window(Some(window));
+        assert_eq!(scaled.max_inline_tokens, window / 8);
+        for speculate in [false, true] {
+            let script = seq(vec![
+                bash(BIG).into(),
+                Reply::tool("read", r#"{"path":"a.txt"}"#).into(),
+                Reply::text("ok").into(),
+            ]);
+            let mut fx = Fx::new("chat", false, false, script).await;
+            fx.ctx.cfg = Arc::new(loom_core::config::ToolsCfg { speculate, ..(*fx.ctx.cfg).clone() });
+            fx.window = Some(window);
+            let mut session = fx.create();
+            session.registry.add(Arc::new(EchoViewChars));
+            // The session is configured with the global bound; the call gets the window's.
+            assert_eq!(session.deps.admit, AdmitPolicy::default());
+            run_with(session, vec![user("go")]).await;
+            let rs = fx.sink.records();
+            let results = results(&rs);
+            // About 10k tokens of output are cut to the window's eighth.
+            assert!(results[0].cut, "speculate {speculate}");
+            assert!(results[0].text.chars().count() < estimator.chars(window / 8) * 2, "{}", results[0].text.len());
+            // The estimator is calibrated by the replies, so the number is checked within a band.
+            let said = results[1].text.split("view_chars=").nth(1).and_then(|t| t.split('\n').next());
+            let said: usize = said.and_then(|n| n.parse().ok()).unwrap_or(0);
+            let (low, high) = (scaled.view_chars(&estimator) / 3, scaled.view_chars(&estimator) * 3);
+            assert!((low..=high).contains(&said), "speculate {speculate}: {said} not in {low}..={high}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_on_a_small_window_ends_at_a_whole_line_and_the_next_read_goes_on_from_there() {
+        let window = 16_000u64;
+        let script = seq(vec![
+            Reply::tool("read", r#"{"path":"big.jsonl"}"#).into(),
+            Reply::tool("read", r#"{"path":"big.jsonl","start":2}"#).into(),
+            Reply::text("ok").into(),
+        ]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.window = Some(window);
+        let line = format!("{{\"k\":\"{}\"}}", "v".repeat(240));
+        let text: String = (0..2_000).map(|_| format!("{line}\n")).collect();
+        std::fs::write(fx.ctx.workspace.join("big.jsonl"), &text).unwrap();
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let results = results(&fx.sink.records());
+        let first = &results[0];
+        let budget = AdmitPolicy::default().for_window(Some(window)).view_chars(&TokenEstimator::default());
+        // About 500k characters are asked for; what is shown is one view's worth, ending at a whole line.
+        assert!(first.text.chars().count() < budget * 2, "{}", first.text.chars().count());
+        let shown = first.meta.get(loom_core::event::META_SHOWN).cloned().unwrap_or_default();
+        let last = shown[0][1].as_u64().unwrap();
+        assert!(last > 1 && last < 2_000, "{shown}");
+        assert!(first.text.contains(&format!("window ended at line {last}")), "{}", first.text);
+        assert!(first.text.contains(&format!("continue with start {}", last + 1)), "{}", first.text);
+        assert!(first.text.contains(&format!("{last}\t{line}\n")), "the last line shown is whole");
+        assert_eq!(first.status, ToolStatus::Ok);
+        assert!(!first.cut, "the tool bounded itself; the harness did not have to cut it");
+        assert!(results[1].text.contains("2\t{\"k\""), "{}", results[1].text.chars().take(200).collect::<String>());
+    }
+
     // ---- stall -------------------------------------------------------------------------------
 
     #[tokio::test]
@@ -7190,6 +7888,20 @@ mod tests {
         assert!(!policy.allows("job_wait", &json!({})));
         assert!(policy.allows("job_wait", &json!({"timeout_s":2})));
         assert!(policy.allows("security_record", &json!({"operation":{"action":"coverage_set", "asset":"a1", "disposition":{"status":"deferred", "reason":"budget"}}})));
+        for key in ["id", "hypothesis", "hypothesis_id"] {
+            for action in ["hypothesis_evidence", "hypothesis_verdict"] {
+                assert!(
+                    policy.allows("security_record", &json!({"operation":{"action":action, key:"hy-3f2a"}})),
+                    "{action} {key}"
+                );
+            }
+        }
+        assert!(
+            !policy.allows("security_record", &json!({"operation":{"action":"hypothesis_evidence", "hypothesis":" "}}))
+        );
+        assert!(
+            !policy.allows("security_record", &json!({"operation":{"action":"fact_retract", "hypothesis":"hy-3f2a"}}))
+        );
         assert!(!policy.allows("security_record", &json!({"operation":{"action":"asset_upsert", "asset":"new"}})));
         assert!(!policy.allows("security_record", &json!({"operation":{"action":"batch", "operations":[]}})));
     }
@@ -7312,6 +8024,71 @@ mod tests {
         let session = Session::open(fx.deps()).unwrap();
         assert_eq!(session.exec_count(), 1);
         assert_eq!(session.st.clock.as_ref().unwrap().running_from, None);
+    }
+
+    #[tokio::test]
+    async fn a_switch_that_changes_reasoning_replay_re_renders_the_history_without_a_cache_break() {
+        let script = seq(vec![
+            Reply::text("first").with_reasoning("thought one").into(),
+            Reply::text("second").into(),
+            Reply::text("third").into(),
+        ]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        let (tx, task) = spawn_run(fx.create());
+        let turn_ends = |rs: &[Record]| rs.iter().filter(|r| matches!(r.event, Event::TurnEnd { .. })).count();
+        // Two turns, so the reply with reasoning is inside a prefix already sent (the guard compares the
+        // next request with the last one sent).
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "first reply", |rs| turn_ends(rs) == 1).await;
+        tx.send(user("again")).unwrap();
+        wait_until(&fx.sink, "second reply", |rs| turn_ends(rs) == 2).await;
+        // The same server behind a profile that replays no reasoning.
+        let switch = ModelSwitch {
+            client: Arc::new(ModelClient::new("other", fx.profile.clone(), &fx.paths.model_keys_dir()).unwrap()),
+            limiter: Arc::new(Limiter::new(4)),
+            context_window: fx.window,
+            model: ModelRef { profile: "other".into(), model: "mock".into(), context_window: 1_000_000 },
+            reasoning_replay: ReasoningReplay::None,
+            reason: SWITCH_OPERATOR.into(),
+            settings_changed: false,
+        };
+        tx.send(Input::SwitchModel(Box::new(switch.clone()))).unwrap();
+        // The same settings again record nothing.
+        tx.send(Input::SwitchModel(Box::new(switch))).unwrap();
+        tx.send(user("third")).unwrap();
+        wait_until(&fx.sink, "third reply", |rs| turn_ends(rs) == 3).await;
+        finish_task(tx, task).await;
+        let rs = fx.sink.records();
+        let switched: Vec<&Record> = rs.iter().filter(|r| matches!(r.event, Event::ModelSwitched(_))).collect();
+        assert_eq!(switched.len(), 1, "{:?}", kinds(&rs));
+        // The history re-renders on purpose: not a cache break of the session's making.
+        assert!(!rs.iter().any(|r| matches!(r.event, Event::CacheBreak { .. })), "{:?}", kinds(&rs));
+        let bodies = fx.server.requests();
+        assert!(bodies[1].to_string().contains("thought one"), "replayed before the switch");
+        assert!(bodies[2].to_string().contains("first"));
+        assert!(!bodies[2].to_string().contains("thought one"), "the new model is not sent the old reasoning");
+
+        // Opened again on its start-up model (as a restart that lost the switch would), the session
+        // records the switch back before anything is sent, and reports no cache break for it.
+        let reopened = Session::open(fx.deps()).unwrap();
+        let back: Vec<ModelSwitched> = reopened
+            .records()
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ModelSwitched(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(back.len(), 2);
+        assert_eq!((back[1].to.profile.as_str(), back[1].reason.as_str()), ("mock", SWITCH_IDLE));
+        assert!(!reopened.records().iter().any(|r| matches!(r.event, Event::CacheBreak { .. })));
+        // Its next request carries the reasoning again, and that is no cache break either.
+        let (tx, task) = spawn_run(reopened);
+        tx.send(user("fourth")).unwrap();
+        wait_until(&fx.sink, "fourth reply", |rs| turn_ends(rs) == 4).await;
+        finish_task(tx, task).await;
+        assert!(!fx.sink.records().iter().any(|r| matches!(r.event, Event::CacheBreak { .. })));
+        assert!(fx.server.requests()[3].to_string().contains("thought one"));
     }
 
     #[tokio::test]

@@ -954,6 +954,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -963,6 +964,7 @@ dependencies = [
  "fs2",
  "hex",
  "hmac",
+ "libc",
  "rand",
  "regex",
  "serde",

@@ -3,7 +3,9 @@
 //! CONTRACT: configuration is `<workspace>/.loom/security-oracle.json`, protected from agent writes
 //! by the sandbox. It is hash-pinned at first use in each session; subsequent changes require a new
 //! session. Unsandboxed mode is refused. Model input is only a candidate BlobStore handle, never
-//! an endpoint, expected answer, command, baseline or success rule. A passing receipt states exactly
+//! an endpoint, expected answer, command, baseline or success rule. The handle is opened with
+//! `outputs::open` (only an output of the session's mission; a refusal is `Unopened::sentence`), so
+//! another mission's stored output can never be submitted as a candidate. A passing receipt states exactly
 //! which operator contract passed; it is not a universal proof of exploitability. Clean replay copies
 //! only hash-pinned regular files into independent fresh attack/control directories, checks hashes
 //! after execution and requires both the attack criterion and the benign control. Timeout/OOM/exit71
@@ -118,8 +120,8 @@ fn relative(path: &Path) -> bool {
 fn hash_ok(bytes: &[u8], expected: &str) -> bool {
     hex::encode(Sha256::digest(bytes)).eq_ignore_ascii_case(expected)
 }
-fn read_candidate(ctx: &ToolCtx, handle: &str) -> Result<Vec<u8>, String> {
-    let id = ctx.blobs.resolve(handle).map_err(|e| format!("Use a complete candidate output handle: {e}."))?;
+async fn read_candidate(ctx: &ToolCtx, handle: &str) -> Result<Vec<u8>, String> {
+    let id = crate::outputs::open(ctx, handle).await.map_err(|e| e.sentence(handle))?;
     if ctx.blobs.meta(&id).map_err(|e| e.to_string())?.bytes > 1_000_000 {
         return Err("Candidate exceeds one million bytes; store only the flag or PoC input in its blob.".into());
     }
@@ -440,7 +442,7 @@ impl Tool for OracleCheck {
         let candidate = match if let Some(path) = given_file {
             read_candidate_file(ctx, path)
         } else {
-            read_candidate(ctx, candidate_handle)
+            read_candidate(ctx, candidate_handle).await
         } {
             Ok(v) => v,
             Err(e) => return ToolOutput::error(e),
@@ -488,6 +490,18 @@ mod tests {
         assert!(!authenticate(&a, "old", "candidate", key));
         a.uid = Some(1000);
         assert!(!authenticate(&a, "nonce", "candidate", key));
+    }
+    #[tokio::test]
+    async fn a_candidate_outside_the_mission_reads_as_one_that_does_not_exist() {
+        let mut env = crate::testutil::env();
+        let stored = env.ctx.blobs.put_bytes(b"flag{foreign}\n").unwrap();
+        assert_eq!(read_candidate(&env.ctx, &stored.handle()).await.unwrap(), b"flag{foreign}\n");
+        env.ctx.outputs = std::sync::Arc::new(crate::outputs::OutputSet::default());
+        let (h, never) = (stored.handle(), "out:0123456789abcdef");
+        let a = read_candidate(&env.ctx, &h).await.unwrap_err();
+        let b = read_candidate(&env.ctx, never).await.unwrap_err();
+        assert_eq!(a.replace(&h, "H"), b.replace(never, "H"));
+        assert!(a.contains("No output of this mission"), "{a}");
     }
     #[tokio::test]
     async fn candidate_text_does_not_self_attest() {
