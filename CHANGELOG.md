@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### A smaller HUD on long missions
+
+- The ledger brief in the HUD (the last message of every request, never prompt-cached) lists every todo
+  and doing plan step but only the last 5 done ones, every open claim but only the last 10 settled ones,
+  and the last 20 open obligations; each capped list starts with `(N older done|settled|open not shown:
+  p1–p9, p12; call `ledger` to read them)`. `BriefOpts` gains `max_plan_done`, `max_claims` and
+  `max_obligations`. A brief with 65 done steps, 74 claims and 25 open obligations went from 35 485 to
+  11 625 characters; the 504-step mission this was measured on paid about 20 000 uncached tokens per step
+  for its HUD. The re-weave brief uses the same caps; `ledger` still shows everything.
+- `security_record` returns what the write touched (`recorded`, `removed`, `counts`, `more`) instead of
+  the whole security state; `entry` and `normalized` are unchanged. The `state` key is gone from its
+  result; read the state with `security_query`.
+
 ### security_record reads near misses
 
 - `security_record` now reads an operation where its meaning is unambiguous (`ops`/`items` for
