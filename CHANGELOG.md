@@ -16,11 +16,12 @@
   only when NULs pass 1% of it or most of its first 8 KiB is not text; a NUL is shown as `\x00`.
 - llama.cpp's overflow (`exceeds the available context size`, `exceed_context_size_error`), 422s,
   `input is too long`, `context_length_exceeded`, and overflow errors inside a 200 stream are context
-  overflows; the limit is the smaller number (or `n_ctx`) and the request the larger. An overflow
-  re-weave may fold the latest step's output (down to no protected step).
+  overflows. The limit is `n_ctx`, else the number after `maximum context length is` or `context size (`
+  (vLLM's `max_tokens` refusal names `max_tokens` first), else the wording `A > B`, else the smaller of two
+  numbers. An overflow re-weave may fold the latest step's output (down to no protected step).
 - A refusal (400/413/422 that is not an overflow, such as a content filter refusing a page in the window)
-  refused again on the same prefix re-weaves once with every tool output out of view (reason `refused`)
-  before parking; the park text says what an answer will do, and after that re-weave, that the model or
+  refused again on the same prefix re-weaves once with every tool output out of view whatever the size,
+  the replies kept and no digest asked (reason `refused`), before parking; the park text says what an answer will do, and after that re-weave, that the model or
   its settings must change. An operator re-weave right after a refusal folds the latest step too.
 - Re-weaves fold old harness notes: nudges, stall, verdict, output-cut, budget and interrupted notes
   early, arrival and info notes (agents' messages included) after the tool outputs. A view's stub keeps
