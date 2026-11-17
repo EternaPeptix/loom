@@ -1373,6 +1373,22 @@ pub struct Session {
     #[cfg(test)]
     weaves: u32,
     early_counts: Arc<Mutex<EarlyCounts>>,
+    /// The epoch of the weave whose request the server last refused (400, 413, 422); in memory only.
+    refused_epoch: Option<u32>,
+}
+
+/// How hard a re-weave folds, beyond its trigger (see the module contract's re-weave procedure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fold {
+    /// Protect `keep_recent_steps` recent steps, halving down to `MIN_KEEP_RECENT_STEPS`; ask for a digest.
+    Normal,
+    /// Protect nothing from the start (what the server refuses may be the newest output); ask for a digest.
+    KeepZero,
+    /// The server refused the request as too large for a window of this many tokens: halve down to
+    /// protecting nothing; no digest request (the server would refuse it too).
+    Overflow(u64),
+    /// The server refused the request for what it carries: protect nothing from the start; no digest.
+    Refused,
 }
 
 /// Longest `session_end` detail.
@@ -1574,6 +1590,7 @@ impl Session {
             #[cfg(test)]
             weaves: 0,
             early_counts: Arc::default(),
+            refused_epoch: None,
         }
     }
 
@@ -2015,7 +2032,8 @@ impl Session {
             Input::Reweave => {
                 let token = self.deps.control.begin_turn();
                 let woven = self.woven();
-                self.reweave(&woven, "operator", true, &token, None).await?;
+                let fold = self.operator_fold(&woven);
+                self.reweave(&woven, "operator", true, &token, fold).await?;
                 Ok(None)
             }
             Input::Stop => {
@@ -2512,13 +2530,32 @@ impl Session {
         }
     }
 
+    /// How an operator's re-weave folds: from keep 0 while the weave is the one the server last refused.
+    fn operator_fold(&self, woven: &Woven) -> Fold {
+        if self.refused_epoch == Some(woven.weave.epoch) {
+            Fold::KeepZero
+        } else {
+            Fold::Normal
+        }
+    }
+
+    /// The admission policy for a call started now: the configured one scaled to the session's window.
+    fn admit_policy(&self) -> AdmitPolicy {
+        self.deps.admit.for_window(self.deps.context_window)
+    }
+
     /// The session cannot go on: a child settles `Failed`, anything else asks the operator.
     fn fail(&mut self, why: &str) -> R<Flow> {
+        self.fail_with(why, texts::turn_failed(why))
+    }
+
+    /// [`Session::fail`] with the text a lead's inbox item carries.
+    fn fail_with(&mut self, why: &str, inbox_text: String) -> R<Flow> {
         if self.deps.shared.is_child() {
             let report = texts::failed_report(why, &self.last_reply());
             Ok(Flow::Settle(delivery(ChildOutcome::Failed, report)))
         } else {
-            self.open_inbox(InboxKind::Parked, texts::turn_failed(why))?;
+            self.open_inbox(InboxKind::Parked, inbox_text)?;
             Ok(Flow::End(TurnEndReason::Error))
         }
     }
@@ -2549,7 +2586,8 @@ impl Session {
         // The weave of this step, rendered again only after a record that changes it.
         let mut woven = self.woven();
         let (reason, forced) = if force { ("operator", true) } else { ("target", false) };
-        if self.reweave(&woven, reason, forced, &token, None).await? {
+        let fold = if force { self.operator_fold(&woven) } else { Fold::Normal };
+        if self.reweave(&woven, reason, forced, &token, fold).await? {
             woven = self.woven();
         }
         if token.is_cancelled() {
@@ -2557,6 +2595,7 @@ impl Session {
         }
 
         let mut overflowed = false;
+        let mut refold = false;
         let (req_id, completion, queue_ms, tools, early, observed) = loop {
             let req_id = new_request_id();
             let w = &woven.weave;
@@ -2609,6 +2648,7 @@ impl Session {
                     if c.usage.prompt_tokens > 0 {
                         self.estimator.calibrate(sent_chars, c.usage.prompt_tokens);
                     }
+                    self.refused_epoch = None;
                     break (req_id, c, queue_ms, request.tools, early, observed);
                 }
                 Err(ModelError::Cancelled { .. }) => return self.cancelled().await,
@@ -2616,8 +2656,8 @@ impl Session {
                     if !overflowed {
                         overflowed = true;
                         // What the server refused bounds its window, whatever the session was told.
-                        let refused_at = Some(limit.unwrap_or(est_tokens));
-                        if self.reweave(&woven, "overflow", true, &token, refused_at).await? {
+                        let fold = Fold::Overflow(limit.unwrap_or(est_tokens));
+                        if self.reweave(&woven, "overflow", true, &token, fold).await? {
                             woven = self.woven();
                             continue;
                         }
@@ -2626,6 +2666,30 @@ impl Session {
                         }
                     }
                     return self.fail(texts::OVERFLOW_UNFOLDABLE);
+                }
+                Err(ModelError::Rejected { status, message }) if matches!(status, 400 | 413 | 422) => {
+                    // The provider refuses what the request carries. The same prefix refused again
+                    // (nothing re-woven since the last refusal) is folded out of view once per step.
+                    if !refold && self.refused_epoch == Some(woven.weave.epoch) {
+                        refold = true;
+                        if self.reweave(&woven, "refused", true, &token, Fold::Refused).await? {
+                            woven = self.woven();
+                            continue;
+                        }
+                        if token.is_cancelled() {
+                            return self.cancelled().await;
+                        }
+                    }
+                    self.refused_epoch = Some(woven.weave.epoch);
+                    let folded = self.records.iter().rev().find_map(|r| match &r.event {
+                        Event::Reweave(rw) => Some(rw.reason == "refused"),
+                        _ => None,
+                    });
+                    let folded = folded.unwrap_or(false);
+                    return self.fail_with(
+                        &texts::refused(status, &message, folded),
+                        texts::refused_park(status, &message, folded),
+                    );
                 }
                 Err(other) => return self.fail(&texts::sentence(&other.to_string())),
             }
@@ -2809,7 +2873,9 @@ impl Session {
         let session = self.deps.shared.session.clone();
         let on = self.deps.ctx.cfg.speculate;
         let logged = if on { self.logged_call_ids() } else { HashSet::new() };
-        let (registry, template, counts) = (self.registry.clone(), self.deps.ctx.clone(), self.early_counts.clone());
+        let mut template = self.deps.ctx.clone();
+        template.view_chars = self.admit_policy().view_chars(&self.estimator);
+        let (registry, counts) = (self.registry.clone(), self.early_counts.clone());
         let mut early = Early::new(on, registry, template, token, logged, counts);
         early.policy = CallPolicy { wrapup: self.st.budget_note_step.is_some() };
         let result = self
@@ -3192,13 +3258,24 @@ impl Session {
         reason: &str,
         forced: bool,
         token: &CancellationToken,
-        refused_at: Option<u64>,
+        fold: Fold,
     ) -> R<bool> {
+        let refused_at = match fold {
+            Fold::Overflow(at) => Some(at),
+            _ => None,
+        };
         let window = match (self.deps.context_window, refused_at) {
             (Some(known), Some(refused)) => Some(known.min(refused)),
             (known, refused) => known.or(refused),
         };
         let mut policy = self.deps.context.clone();
+        let min_keep = match fold {
+            Fold::Normal => MIN_KEEP_RECENT_STEPS,
+            Fold::KeepZero | Fold::Overflow(_) | Fold::Refused => 0,
+        };
+        if matches!(fold, Fold::KeepZero | Fold::Refused) {
+            policy.keep_recent_steps = 0;
+        }
         let (limit, floor) = reweave_bounds(&policy, window, self.deps.client.profile().max_output_tokens);
         let est = self.estimate(&woven.weave);
         let size = self.measured_size(&woven.weave).unwrap_or(est);
@@ -3211,8 +3288,8 @@ impl Session {
         let enough =
             |p: &Option<loom_core::weave::ReweavePlan>| p.as_ref().is_some_and(|p| p.after_tokens_est <= midpoint);
         let mut plan = woven.plan(&self.records, &self.estimator, &policy, false);
-        while !enough(&plan) && policy.keep_recent_steps > MIN_KEEP_RECENT_STEPS {
-            policy.keep_recent_steps = (policy.keep_recent_steps / 2).max(MIN_KEEP_RECENT_STEPS);
+        while !enough(&plan) && policy.keep_recent_steps > min_keep {
+            policy.keep_recent_steps = (policy.keep_recent_steps / 2).max(min_keep);
             plan = woven.plan(&self.records, &self.estimator, &policy, false);
         }
         let mut digest = None;
@@ -3221,9 +3298,9 @@ impl Session {
             if !forced && !enough(&text_plan) {
                 return Ok(false);
             }
-            // After an overflow the server has just refused this prefix: a digest request on it would be
-            // refused as well.
-            if text_plan.is_some() && refused_at.is_none() {
+            // After an overflow or a refusal the server has just refused this prefix: a digest request on
+            // it would be refused as well.
+            if text_plan.is_some() && matches!(fold, Fold::Normal | Fold::KeepZero) {
                 digest = self.ask_digest(&woven.weave, token).await?;
                 if token.is_cancelled() {
                     return Ok(false);
@@ -3445,6 +3522,8 @@ impl Session {
             let mut ctx = self.deps.ctx.clone();
             ctx.call_id = call.call_id.clone();
             ctx.cancel = self.token.clone();
+            let policy = self.admit_policy();
+            ctx.view_chars = policy.view_chars(&self.estimator);
             let started = Instant::now();
             let mut result = if let Some(first) = &ender {
                 refused(&ctx, &call.name, class, texts::not_run_after(first), started)
@@ -3469,7 +3548,7 @@ impl Session {
                 if class == ToolClass::Exec {
                     self.append(Author::Harness, Event::ExecStarted { call_id: call.call_id.clone() })?;
                 }
-                let admission = Admission { policy: &self.deps.admit, estimator: &self.estimator };
+                let admission = Admission { policy: &policy, estimator: &self.estimator };
                 execute(&self.registry, &ctx, &call.name, &call.arguments, &admission).await
             };
             if deferred {
@@ -3583,7 +3662,8 @@ impl Session {
         call: &ToolCallRequest,
     ) -> loom_core::event::ToolResult {
         let reached = Instant::now();
-        let admission = Admission { policy: &self.deps.admit, estimator: &self.estimator };
+        let policy = self.admit_policy();
+        let admission = Admission { policy: &policy, estimator: &self.estimator };
         let ran = match (&mut run.task.handle).await {
             Ok(ran) => ran,
             // Only a discard aborts a task, and a claimed run is never discarded; the call runs in place.
@@ -3613,7 +3693,7 @@ mod tests {
     use super::*;
     use crate::rtools::testkit::{core_role, rig_with, FakeOrch, Rig};
     use loom_core::config::ModelProfile;
-    use loom_core::event::{Brief, ModelRef, ReasoningReplay};
+    use loom_core::event::{Brief, EvictAction, Eviction, ModelRef, ReasoningReplay};
     use loom_core::ids::MissionId;
     use loom_core::log::read_records;
     use loom_model::mock::{Action, MockServer, Reply, Script};
@@ -6791,7 +6871,7 @@ mod tests {
         // ... while the server counts it far above the target, and the plan is made for that.
         let size = session.measured_size(&woven.weave).unwrap();
         assert!(size > 1_000_000);
-        assert!(session.reweave(&woven, "target", false, &CancellationToken::new(), None).await.unwrap());
+        assert!(session.reweave(&woven, "target", false, &CancellationToken::new(), Fold::Normal).await.unwrap());
         let rw = reweave_records(session.records());
         assert_eq!(rw.len(), 1);
         assert_eq!(rw[0].evictions.len(), 2, "both reports are folded");
@@ -7022,10 +7102,11 @@ mod tests {
 
     #[tokio::test]
     async fn unfoldable_overflow_fails_the_turn_with_an_inbox_item() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![big(), Reply::text("ok").into()])).await;
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("ok").into()])).await;
         fx.server.set_model("mock", Some(10_000));
         let session = fx.create();
-        run_with(session, vec![user("go")]).await;
+        // The operator's own message is what does not fit: there is no tool output to fold.
+        run_with(session, vec![user(&"a long message. ".repeat(3_000))]).await;
         let rs = fx.sink.records();
         assert_eq!(reweave_records(&rs).len(), 0);
         let items = inbox(&rs);
@@ -7035,9 +7116,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_overflow_from_one_huge_result_of_the_latest_step_is_folded_to_keep_zero() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![big(), Reply::text("ok").into()])).await;
+        // One result of about 10k tokens is more than this window holds, and it is in the protected
+        // recent steps.
+        fx.server.set_model("mock", Some(10_000));
+        fx.context =
+            ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 2, stub_tail_lines: 3 };
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let rw = reweave_records(&rs);
+        assert_eq!(rw.len(), 1, "{:?}", kinds(&rs));
+        assert_eq!(rw[0].reason, "overflow");
+        assert!(rw[0].digest.is_none());
+        assert!(matches!(&rw[0].evictions[..], [Eviction { action: EvictAction::Stub { .. }, .. }]), "{rw:?}");
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+        assert!(inbox(&rs).is_empty());
+        let reqs = fx.server.requests();
+        let line = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert_eq!(reqs.len(), 3, "the request, the refused one, the retry");
+        assert!(all_text(&reqs[1]).matches(line).count() >= 600);
+        assert!(all_text(&reqs[2]).matches(line).count() < 10, "the retry carries the stub");
+        assert!(all_text(&reqs[2]).contains("out:"));
+    }
+
+    #[tokio::test]
     async fn a_small_window_is_folded_at_its_trigger_before_the_server_refuses_it() {
-        let mut fx =
-            Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
+        // Each output is cut to an eighth of this window (4k tokens), so it takes more of them to fill it.
+        let mut replies: Vec<Action> = (0..12).map(|_| big()).collect();
+        replies.push(Reply::text("ok").into());
+        let mut fx = Fx::new("chat", false, false, seq(replies)).await;
         fx.server.set_model("mock", Some(32_000));
         fx.window = Some(32_000);
         // The configured floor (180k) is far above this window.
@@ -7160,6 +7269,240 @@ mod tests {
         assert_eq!(reweave_records(&rs)[0].reason, "operator");
         assert_eq!(count(&rs, "turn_start"), 1);
         finish_task(tx, task).await;
+    }
+
+    // ---- refusals, and admission scaled to the window --------------------------------------------
+
+    /// A command whose output starts with the content the filter refuses and goes on for 300 lines. The
+    /// shell builds the word, so the command line the model sent does not hold it.
+    const POISONED: &str = "printf 'POI''SON\\n'; yes fillerfillerfillerfiller | head -n 300";
+    const FILTER_SAYS: &str = "Input text data may contain inappropriate content";
+
+    fn refusal(status: u16) -> Action {
+        let body = json!({ "error": { "message": FILTER_SAYS } }).to_string();
+        Action::Status { status, body, retry_after_s: None }
+    }
+
+    /// A server whose content filter refuses every request that carries the poisoned output, and that
+    /// otherwise plays `actions`.
+    fn filter_over(actions: Vec<Action>) -> Script {
+        let mut actions = std::collections::VecDeque::from(actions);
+        Script::new(move |body, _| {
+            if body.to_string().contains("POISON") {
+                return refusal(400);
+            }
+            actions.pop_front().unwrap_or_else(|| Reply::text("(script exhausted)").into())
+        })
+    }
+
+    /// A server that plays `first`, then answers every request with `status`.
+    fn then_refuse(first: Vec<Action>, status: u16) -> Script {
+        let mut first = std::collections::VecDeque::from(first);
+        Script::new(move |_, _| first.pop_front().unwrap_or_else(|| refusal(status)))
+    }
+
+    fn refuse_context() -> ReweavePolicy {
+        ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 2, stub_tail_lines: 3 }
+    }
+
+    /// Append the operator's message and run one turn, in place.
+    async fn say(session: &mut Session, text: &str) {
+        session.append(Author::User, Event::UserMessage { text: text.into() }).unwrap();
+        assert!(session.turn(Trigger::User).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refusal_parks_and_the_same_refusal_again_folds_every_output_out_of_view() {
+        let mut fx =
+            Fx::new("chat", false, false, filter_over(vec![bash(POISONED).into(), Reply::text("done").into()])).await;
+        fx.context = refuse_context();
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        let rs = session.records().to_vec();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error]);
+        assert_eq!(inbox(&rs).len(), 1);
+        assert_eq!(inbox(&rs)[0].text, texts::refused_park(400, FILTER_SAYS, false));
+        assert!(reweave_records(&rs).is_empty(), "the first refusal parks without folding");
+        assert_eq!(session.refused_epoch, Some(0));
+
+        // The answer appends to the same prefix; the server refuses it the same way; the session folds.
+        say(&mut session, "keep working").await;
+        let rs = session.records().to_vec();
+        let rw = reweave_records(&rs);
+        assert_eq!(rw.len(), 1, "{:?}", kinds(&rs));
+        assert_eq!(rw[0].reason, "refused");
+        assert!(rw[0].digest.is_none());
+        assert!(
+            matches!(&rw[0].evictions[..], [Eviction { action: EvictAction::Stub { text }, .. }] if text.contains("out:"))
+        );
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error, TurnEndReason::Yielded]);
+        assert_eq!(inbox(&rs).len(), 1);
+        assert_eq!(session.refused_epoch, None);
+        let reqs = fx.server.requests();
+        assert_eq!(reqs.len(), 4, "the call, the refusal, the refusal again, the retry");
+        assert!(body_has(&reqs[2], "POISON") && !body_has(&reqs[3], "POISON"));
+        assert!(all_text(&reqs[3]).contains("out:"), "the stub keeps the handle");
+        assert!(!rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest)));
+    }
+
+    fn body_has(body: &Value, what: &str) -> bool {
+        body.to_string().contains(what)
+    }
+
+    #[tokio::test]
+    async fn a_refusal_after_the_fold_parks_with_the_folded_texts() {
+        let script = then_refuse(vec![bash(BIG).into()], 400);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context = refuse_context();
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        say(&mut session, "again").await;
+        let rs = session.records().to_vec();
+        let rw = reweave_records(&rs);
+        assert_eq!(rw.iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["refused"]);
+        let items = inbox(&rs);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, texts::refused_park(400, FILTER_SAYS, false));
+        assert_eq!(items[1].text, texts::refused_park(400, FILTER_SAYS, true));
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error, TurnEndReason::Error]);
+        // The folded window is what was refused: one fold per step, and a third answer parks again.
+        say(&mut session, "once more").await;
+        let rs = session.records().to_vec();
+        assert_eq!(inbox(&rs).len(), 3);
+        assert_eq!(inbox(&rs)[2].text, texts::refused_park(400, FILTER_SAYS, true));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_after_an_unrelated_reweave_parks_before_it_folds_again() {
+        let script = then_refuse(vec![bash(BIG).into()], 400);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context =
+            ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 0, stub_tail_lines: 3 };
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        // Something else re-weaves in between: what the next request starts with is not what was refused.
+        let woven = session.woven();
+        let token = CancellationToken::new();
+        assert!(session.reweave(&woven, "target", true, &token, Fold::Normal).await.unwrap());
+        say(&mut session, "again").await;
+        let rs = session.records().to_vec();
+        assert_eq!(reweave_records(&rs).iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["target"]);
+        let items = inbox(&rs);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].text, texts::refused_park(400, FILTER_SAYS, false));
+    }
+
+    #[tokio::test]
+    async fn other_rejections_never_fold_and_a_413_and_a_422_are_refusals() {
+        for status in [401, 403] {
+            let mut fx = Fx::new("chat", false, false, then_refuse(vec![bash(BIG).into()], status)).await;
+            fx.context = refuse_context();
+            let mut session = fx.create();
+            for text in ["go", "again", "and again"] {
+                say(&mut session, text).await;
+            }
+            let rs = session.records().to_vec();
+            assert!(reweave_records(&rs).is_empty(), "{status}");
+            assert_eq!(session.refused_epoch, None, "{status}");
+            let items = inbox(&rs);
+            assert_eq!(items.len(), 3);
+            assert!(items.iter().all(|i| !i.text.contains("refused the request")), "{}", items[0].text);
+        }
+        for status in [413, 422] {
+            let mut fx = Fx::new("chat", false, false, then_refuse(vec![bash(BIG).into()], status)).await;
+            fx.context = refuse_context();
+            let mut session = fx.create();
+            say(&mut session, "go").await;
+            say(&mut session, "again").await;
+            let rs = session.records().to_vec();
+            assert_eq!(reweave_records(&rs).iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["refused"]);
+            assert_eq!(inbox(&rs)[0].text, texts::refused_park(status, FILTER_SAYS, false));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_that_is_refused_settles_failed_with_the_refusal() {
+        let mut kid = Fx::new("worker", true, true, then_refuse(Vec::new(), 400)).await;
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Do it.".into())));
+        let End::Settled(s) = run_with(session, vec![]).await else { panic!("expected a settlement") };
+        assert_eq!(s.outcome, ChildOutcome::Failed);
+        assert!(s.report.contains(&texts::refused(400, FILTER_SAYS, false)), "{}", s.report);
+    }
+
+    #[tokio::test]
+    async fn an_operator_reweave_after_a_refusal_folds_the_latest_steps_results() {
+        let script = then_refuse(vec![bash(BIG).into()], 400);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context = refuse_context();
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        let (tx, task) = spawn_run(session);
+        tx.send(Input::Reweave).unwrap();
+        wait_until(&fx.sink, "reweave", |rs| count(rs, "reweave") == 1).await;
+        let rw = reweave_records(&fx.sink.records());
+        assert_eq!(rw[0].reason, "operator");
+        assert!(matches!(&rw[0].evictions[..], [Eviction { action: EvictAction::Stub { .. }, .. }]), "{rw:?}");
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn an_operator_reweave_without_a_refusal_still_protects_the_recent_steps() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![bash(BIG).into(), Reply::text("ok").into()])).await;
+        fx.context = refuse_context();
+        let mut session = fx.create();
+        say(&mut session, "go").await;
+        let woven = session.woven();
+        assert_eq!(session.operator_fold(&woven), Fold::Normal);
+        assert!(!session.reweave(&woven, "operator", true, &CancellationToken::new(), Fold::Normal).await.unwrap());
+    }
+
+    /// The real `read` that reports the `view_chars` its call was given.
+    struct EchoViewChars;
+
+    #[async_trait::async_trait]
+    impl Tool for EchoViewChars {
+        fn spec(&self) -> ToolSpec {
+            loom_tools::fstools::Read.spec()
+        }
+        fn speculative(&self) -> bool {
+            true
+        }
+        async fn run(&self, ctx: &ToolCtx, _args: &Map<String, Value>) -> loom_tools::ToolOutput {
+            loom_tools::ToolOutput::ok("ok", loom_tools::Body::Message(format!("view_chars={}", ctx.view_chars)))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_call_is_admitted_with_the_policy_of_the_sessions_window() {
+        let window = 16_000u64;
+        let estimator = TokenEstimator::default();
+        let scaled = AdmitPolicy::default().for_window(Some(window));
+        assert_eq!(scaled.max_inline_tokens, window / 8);
+        for speculate in [false, true] {
+            let script = seq(vec![
+                bash(BIG).into(),
+                Reply::tool("read", r#"{"path":"a.txt"}"#).into(),
+                Reply::text("ok").into(),
+            ]);
+            let mut fx = Fx::new("chat", false, false, script).await;
+            fx.ctx.cfg = Arc::new(loom_core::config::ToolsCfg { speculate, ..(*fx.ctx.cfg).clone() });
+            fx.window = Some(window);
+            let mut session = fx.create();
+            session.registry.add(Arc::new(EchoViewChars));
+            // The session is configured with the global bound; the call gets the window's.
+            assert_eq!(session.deps.admit, AdmitPolicy::default());
+            run_with(session, vec![user("go")]).await;
+            let rs = fx.sink.records();
+            let results = results(&rs);
+            // About 10k tokens of output are cut to the window's eighth.
+            assert!(results[0].cut, "speculate {speculate}");
+            assert!(results[0].text.chars().count() < estimator.chars(window / 8) * 2, "{}", results[0].text.len());
+            // The estimator is calibrated by the replies, so the number is checked within a band.
+            let said = results[1].text.split("view_chars=").nth(1).and_then(|t| t.split('\n').next());
+            let said: usize = said.and_then(|n| n.parse().ok()).unwrap_or(0);
+            let (low, high) = (scaled.view_chars(&estimator) / 3, scaled.view_chars(&estimator) * 3);
+            assert!((low..=high).contains(&said), "speculate {speculate}: {said} not in {low}..={high}");
+        }
     }
 
     // ---- stall -------------------------------------------------------------------------------

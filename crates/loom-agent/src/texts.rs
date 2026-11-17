@@ -1096,6 +1096,27 @@ pub fn flag_candidate(handle: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_refusal_quotes_the_server_and_says_what_the_next_answer_does() {
+        let said = "Input text data may contain inappropriate content";
+        let first = refused(400, said, false);
+        assert_eq!(
+            first,
+            "The model server refused the request (HTTP 400): Input text data may contain inappropriate content."
+        );
+        let again = refused(422, said, true);
+        assert!(again.contains("(HTTP 422) again after every tool output had been folded out of view"), "{again}");
+        // What the server said is bounded, and the sentence still ends with a full stop.
+        let long = refused(400, &"x".repeat(5_000), false);
+        assert!(long.chars().count() < REFUSAL_MESSAGE_CHARS + 120 && long.ends_with('.'), "{}", long.len());
+        let park = refused_park(400, said, false);
+        assert!(park.starts_with("The session could not continue. The model server refused"), "{park}");
+        assert!(park.contains("folds every tool output out of view") && park.contains("readable by its handle"));
+        let folded = refused_park(400, said, true);
+        assert!(folded.contains("Move the session to another model") && !folded.contains("folds every tool output"));
+        assert_ne!(park, folded);
+    }
+
     fn tools_all() -> FinishTools {
         FinishTools { conclude: true, block: true, ask_for: true, spawn: true, plan: true, solvable: false }
     }
