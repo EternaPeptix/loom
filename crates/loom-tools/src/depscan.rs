@@ -37,7 +37,7 @@
 use crate::binary::{command_bounded, quote, CommandOutcome};
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
-use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_RAW_BLOB};
+use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_EVIDENCE_GRADE, META_RAW_BLOB};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -76,7 +76,7 @@ impl Tool for DepScan {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
-        run(ctx, args).await
+        run(ctx, args).await.with_meta(META_EVIDENCE_GRADE, json!("analysis"))
     }
 }
 
@@ -758,5 +758,38 @@ echo "fake depscan ran: $*"
         assert_eq!(r.status, Status::Error, "{}", r.text);
         assert!(r.text.contains("cdxgen blew up"), "{}", r.text);
         assert!(r.text.contains("no CycloneDX VDR"), "{}", r.text);
+    }
+
+    fn grade(r: &loom_core::event::ToolResult) -> Option<&str> {
+        r.meta.get(META_EVIDENCE_GRADE).and_then(Value::as_str)
+    }
+
+    #[tokio::test]
+    async fn every_dep_scan_result_is_graded_analysis() {
+        let mut e = env();
+        // A missing depscan.
+        let empty = e.ctx.workspace.join("emptybin");
+        std::fs::create_dir_all(&empty).unwrap();
+        let mut vars = (*e.ctx.env).clone();
+        vars.insert("PATH".to_string(), empty.to_string_lossy().into_owned());
+        e.ctx.env = std::sync::Arc::new(vars);
+        let r = e.call("dep_scan", json!({})).await;
+        assert_eq!(r.status, Status::Error, "{}", r.text);
+        assert_eq!(grade(&r), Some("analysis"));
+        // A completed scan, a refused target and a failed scan.
+        let mut e = env();
+        with_fake_depscan(&mut e, FAKE_SCAN);
+        std::fs::write(e.ctx.workspace.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let r = e.call("dep_scan", json!({})).await;
+        assert_eq!(r.status, Status::Ok, "{}", r.text);
+        assert_eq!(grade(&r), Some("analysis"));
+        let r = e.call("dep_scan", json!({"path": "no-such-place"})).await;
+        assert_eq!(r.status, Status::Error, "{}", r.text);
+        assert_eq!(grade(&r), Some("analysis"));
+        let mut e = env();
+        with_fake_depscan(&mut e, "#!/bin/sh\nexit 3\n");
+        let r = e.call("dep_scan", json!({})).await;
+        assert_eq!(r.status, Status::Error, "{}", r.text);
+        assert_eq!(grade(&r), Some("analysis"));
     }
 }
