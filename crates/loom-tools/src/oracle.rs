@@ -492,6 +492,18 @@ mod tests {
         assert!(!authenticate(&a, "nonce", "candidate", key));
     }
     #[tokio::test]
+    async fn a_candidate_outside_the_mission_reads_as_one_that_does_not_exist() {
+        let mut env = crate::testutil::env();
+        let stored = env.ctx.blobs.put_bytes(b"flag{foreign}\n").unwrap();
+        assert_eq!(read_candidate(&env.ctx, &stored.handle()).await.unwrap(), b"flag{foreign}\n");
+        env.ctx.outputs = std::sync::Arc::new(crate::outputs::OutputSet::default());
+        let (h, never) = (stored.handle(), "out:0123456789abcdef");
+        let a = read_candidate(&env.ctx, &h).await.unwrap_err();
+        let b = read_candidate(&env.ctx, never).await.unwrap_err();
+        assert_eq!(a.replace(&h, "H"), b.replace(never, "H"));
+        assert!(a.contains("No output of this mission"), "{a}");
+    }
+    #[tokio::test]
     async fn candidate_text_does_not_self_attest() {
         let env = crate::testutil::env();
         let c = Contract::FlagExact { sha256: hex::encode(Sha256::digest(b"flag{correct}")) };

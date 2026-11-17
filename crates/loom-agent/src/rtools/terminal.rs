@@ -166,7 +166,8 @@
 //!   itself produced or opened: some `tool_result` record in `S.log_path` has that blob as `output`
 //!   or names it in `meta[META_OF_BLOB]`. Otherwise: ``You listed {handle} as examined, but this
 //!   session never opened it. Open it with out_read, or take it off the list.``
-//! - when the assignment (the `Assignment` note in `S.log_path`) names stored outputs (`out:…`), `opened`
+//! - when the assignment (the `Assignment` note in `S.log_path`) names outputs of this mission (`out:…`, each kept only when `outputs::open` opens it; any other handle
+//!   in the text, existing in another mission or not, is ignored), `opened`
 //!   must include at least one of them.
 //!
 //! Then `S.set_effect(Effect::Settle(Delivery { outcome: Returned, report, full: None, payload:
@@ -1199,8 +1200,9 @@ fn outputs_seen(log_path: &std::path::Path) -> HashSet<BlobId> {
     seen
 }
 
-/// The stored outputs (`out:…` handles, as written) that this session's assignment names and that exist.
-fn assigned_outputs(log_path: &std::path::Path, blobs: &loom_core::BlobStore) -> Vec<(String, BlobId)> {
+/// The outputs (`out:…` handles, as written) that this session's assignment names and that are outputs of the
+/// session's mission. The lead writes the assignment, so a handle outside the mission is dropped, not reported.
+async fn assigned_outputs(log_path: &std::path::Path, ctx: &ToolCtx) -> Vec<(String, BlobId)> {
     let mut out: Vec<(String, BlobId)> = Vec::new();
     let Ok(report) = read_records(log_path) else { return out };
     for record in report.records {
@@ -1217,7 +1219,7 @@ fn assigned_outputs(log_path: &std::path::Path, blobs: &loom_core::BlobStore) ->
                 continue;
             }
             let handle = format!("out:{hex}");
-            if let Ok(id) = blobs.resolve(&handle) {
+            if let Ok(id) = outputs::open(ctx, &handle).await {
                 if !out.iter().any(|(_, seen)| *seen == id) {
                     out.push((handle, id));
                 }
@@ -1484,7 +1486,7 @@ impl Tool for Verdict {
             }
         }
 
-        let assigned = assigned_outputs(&s.log_path, &ctx.blobs);
+        let assigned = assigned_outputs(&s.log_path, ctx).await;
         let mut opened_ids: HashSet<BlobId> = HashSet::new();
         for h in &opened {
             if let Ok(id) = outputs::open(ctx, h).await {
@@ -3586,6 +3588,33 @@ mod tests {
         let res = r.call("verdict", json!({"accepted": true, "opened": [produced, viewed]})).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         assert!(matches!(effect(&r), Some(Effect::Settle(_))));
+    }
+
+    #[tokio::test]
+    async fn an_assignment_naming_another_missions_output_is_no_oracle() {
+        let (r, produced, _) = verifier_with_log();
+        // Stored, but not an output of this mission: the lead names it in the assignment it writes.
+        let foreign = r.env.ctx.blobs.put_bytes(b"another mission's evidence\n").unwrap().handle();
+        let (mut log, _) = SessionLog::open(&r.shared.log_path, Durability::Batch).unwrap();
+        let text = format!("Question: check it.\n\nContext: {foreign} lines 1-1; and out:0123456789abcdef");
+        log.append(Author::Agent("s-lead".into()), Event::HarnessNote { note: NoteKind::Assignment, text }).unwrap();
+        // The same answer as for an assignment that names nothing: delivered, with no mention of the handle.
+        let res = r.call("verdict", json!({"accepted": true, "opened": [produced]})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert!(!res.text.contains("assignment names"), "{}", res.text);
+        assert!(matches!(effect(&r), Some(Effect::Settle(_))));
+    }
+
+    #[tokio::test]
+    async fn a_foreign_handle_in_opened_is_refused_like_one_never_opened() {
+        let (r, produced, _) = verifier_with_log();
+        let foreign = r.env.ctx.blobs.put_bytes(b"another mission's\n").unwrap().handle();
+        let a = r.call("verdict", json!({"accepted": true, "opened": [produced, foreign]})).await;
+        let b = r.call("verdict", json!({"accepted": true, "opened": [produced, "out:0123456789abcdef"]})).await;
+        assert_eq!(a.status, Status::Error, "{}", a.text);
+        assert_eq!(a.text.replace(&foreign, "H"), b.text.replace("out:0123456789abcdef", "H"));
+        assert!(a.text.contains("never opened it"), "{}", a.text);
+        assert!(effect(&r).is_none());
     }
 
     #[tokio::test]

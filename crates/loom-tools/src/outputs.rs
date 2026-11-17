@@ -12,7 +12,9 @@
 //!
 //! ## `OutputScope`
 //! `#[async_trait] pub trait OutputScope: Send + Sync { async fn holds(&self, blob: &BlobId) -> bool; }`
-//! True when `blob` is an output of the session's mission. The runtime's scope is described in
+//! True when `blob` is an output of the session's mission. `async fn ready(&self) {}` (default: nothing) is
+//! called by `open` first, before the store is listed, so that a scope's first-use work (the runtime's one
+//! read of the mission's logs) happens whether or not the handle names anything. The runtime's scope is described in
 //! `loom_agent::runtime` (*Outputs of a mission*); it costs a map lookup once the mission's logs have been
 //! read. Under `cfg(any(test, feature = "testutil"))` only:
 //! - `AnyStored`: holds every id (each test environment has its own temporary store, so this is "every
@@ -23,7 +25,8 @@
 //! ## `open(ctx, handle) -> Result<BlobId, Unopened>`
 //! - `handle` is trimmed and an `out:` prefix removed; what is left must be 8 to 64 hex digits (either
 //!   case, compared in lower case). Otherwise `Unopened::NotAHandle`.
-//! - The candidates are every stored id that starts with it (`BlobStore::candidates` with no limit), and
+//! - `ctx.outputs.ready()` is awaited. The candidates are every stored id that starts with it (`BlobStore::candidates`
+//!   with no limit; for a full 64-digit id the one path is looked at), and
 //!   only those for which `ctx.outputs.holds(id)` is true are kept. None → `Unopened::Unknown`; exactly one
 //!   → `Ok(id)`; more than one → `Unopened::Ambiguous`.
 //! - So an id outside the scope is never opened, named, counted or reported as making a handle ambiguous:
@@ -54,6 +57,11 @@ use loom_core::BlobId;
 pub trait OutputScope: Send + Sync {
     /// True when `blob` is an output of the session's mission.
     async fn holds(&self, blob: &BlobId) -> bool;
+
+    /// Called by `open` before it looks at the store, whatever the handle matches, so that what the scope
+    /// does to answer `holds` for the first time (the runtime reads the mission's logs) takes the same time
+    /// for a handle that names nothing as for one that names another mission's output. Default: nothing.
+    async fn ready(&self) {}
 }
 
 /// Holds every id (each test environment has its own temporary store).
@@ -135,8 +143,15 @@ pub async fn open(ctx: &ToolCtx, handle: &str) -> Result<BlobId, Unopened> {
     if !(8..=64).contains(&digits.len()) || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Unopened::NotAHandle);
     }
+    ctx.outputs.ready().await;
+    // A full id names one file: look at that path, not the whole shard.
+    let candidates = if digits.len() == 64 {
+        ctx.blobs.resolve(digits).map(|id| vec![id]).unwrap_or_default()
+    } else {
+        ctx.blobs.candidates(digits, usize::MAX)
+    };
     let mut held = Vec::new();
-    for id in ctx.blobs.candidates(digits, usize::MAX) {
+    for id in candidates {
         if ctx.outputs.holds(&id).await {
             held.push(id);
         }
@@ -214,6 +229,33 @@ mod tests {
         assert_eq!(open(&e.ctx, "out:abcdef01").await, Ok(mine.clone()));
         e.ctx.outputs = Arc::new(OutputSet::with([mine, other]));
         assert_eq!(open(&e.ctx, "out:abcdef01").await, Err(Unopened::Ambiguous));
+    }
+
+    #[tokio::test]
+    async fn ready_runs_first_whatever_the_handle_names() {
+        struct Counting(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl OutputScope for Counting {
+            async fn holds(&self, _: &BlobId) -> bool {
+                false
+            }
+            async fn ready(&self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let mut e = testutil::env();
+        let id = put(&e.ctx, "one\n");
+        let scope = Arc::new(Counting(Default::default()));
+        e.ctx.outputs = scope.clone();
+        for h in ["out:0123456789abcdef", &id.0[..16], &id.0] {
+            assert_eq!(open(&e.ctx, h).await, Err(Unopened::Unknown));
+        }
+        assert_eq!(scope.0.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(open(&e.ctx, "zz").await, Err(Unopened::NotAHandle));
+        // A full id of a stored blob is found by its path; an absent one is unknown.
+        e.ctx.outputs = Arc::new(AnyStored);
+        assert_eq!(open(&e.ctx, &id.0).await, Ok(id));
+        assert_eq!(open(&e.ctx, &"0".repeat(64)).await, Err(Unopened::Unknown));
     }
 
     #[test]

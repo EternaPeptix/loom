@@ -974,7 +974,8 @@ evidence kind and staleness. Each module's documentation is the precise specific
   The blob store is shared by every mission and content-addressed, so a handle names the same bytes for
   anyone who learns it. Every tool that takes a handle from the model — `out_read`, `out_grep`, `pin`,
   `evidence` and `finish` quotes, `security_record` secret handles, `security_ingest`, the oracle's
-  candidate, a verdict's `opened` — opens it only among the outputs some record of a session of its
+  candidate, a verdict's `opened`, and the handles of a verifier's assignment, which the lead writes and so
+  which count only when they open — opens it only among the outputs some record of a session of its
   mission names (a result's output, the file text a `read` stored, a raw or further report a result
   names in its meta, a job's output, an agent's full report). A view adds nothing, so reading an
   output never widens the set. A handle of another mission's output is refused with exactly the

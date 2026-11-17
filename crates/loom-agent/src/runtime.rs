@@ -270,14 +270,19 @@
 //! records; a fork's copied records are its parent's, of the same mission):
 //! - every blob `producer` would find (see above);
 //! - of a `tool_result` that is not `out_read` or `out_grep`: `output`, `meta[META_OF_BLOB]`,
-//!   `meta[META_RAW_BLOB]`, and every string in `meta[META_ALSO_STORED]`;
+//!   `meta[META_RAW_BLOB]`, and every string in `meta[META_ALSO_STORED]` (every stored blob a result's text
+//!   names is one of these: `attempt` names the complete output of each check in `META_ALSO_STORED`);
 //! - the `output` of every `job_settled` and `job_matched`;
 //! - the `full` of every `child_settled` and `child_completed`.
 //!
 //! The ids that are not already in the producer index are kept in a second in-memory index keyed by
 //! (mission, blob), fed by the sink as the producer index is, and filled by the same once-per-mission
 //! scan (one scan fills both; `scanned` is shared). So `holds` is a map lookup once the mission has been
-//! scanned, and a miss before that scans the mission's logs once. A view (`out_read`, `out_grep`) names
+//! scanned, and a miss before that scans the mission's logs once; `OutputScope::ready` (called by `open` before
+//! it lists the store) does that scan, so the first use takes the same time whatever the handle names. Scans
+//! are serialized (a second caller waits, then finds the mission scanned), and a scan that fails to run
+//! (its blocking task is lost) does not mark the mission scanned. The second index leaves out what the
+//! producer index already holds (a result's `output`, the text of a successful `read`). A view (`out_read`, `out_grep`) names
 //! nothing new, so reading an output never makes another one readable. The scope holds a `Weak` of the
 //! runtime (as the orchestrator does) and answers `false` once the runtime is gone. What the operator reads
 //! (`loom out`, the API) is not scoped.
@@ -1016,7 +1021,7 @@ fn produced_by(
 }
 
 /// The stored outputs an event names besides what `produced_by` finds: of a result that is not a view
-/// (`out_read`, `out_grep`), its output, the text it shows, its raw bytes and its further stored
+/// (`out_read`, `out_grep`), the text it shows, its raw bytes and its further stored
 /// reports; the output of a settled or matched job; the complete report of a child.
 fn also_outputs(event: &Event) -> Vec<BlobId> {
     let mut out: Vec<BlobId> = Vec::new();
@@ -1027,10 +1032,13 @@ fn also_outputs(event: &Event) -> Vec<BlobId> {
     };
     match event {
         Event::ToolResult(t) if t.name != "out_read" && t.name != "out_grep" => {
-            if let Some(o) = &t.output {
-                add(o.id.as_str());
-            }
+            // `produced_by` indexes `output`, and the text of a successful `read` that has no output.
+            let indexed_of =
+                t.name == "read" && t.class == ToolClass::Read && t.status == ToolStatus::Ok && t.output.is_none();
             for key in [META_OF_BLOB, META_RAW_BLOB] {
+                if key == META_OF_BLOB && indexed_of {
+                    continue;
+                }
                 if let Some(id) = t.meta.get(key).and_then(Value::as_str) {
                     add(id);
                 }
@@ -1332,6 +1340,8 @@ struct Inner {
     profiles: BTreeMap<String, ProfileRt>,
     proxy: Proxy,
     state: Mutex<State>,
+    /// Held across a scan of a mission's logs (`scan_outputs`).
+    scan_lock: tokio::sync::Mutex<()>,
     /// Held while sessions are activated (never across an `.await`).
     activation: Mutex<()>,
     shutting: AtomicBool,
@@ -1736,6 +1746,12 @@ impl OutputScope for MissionOutputs {
         inner.scan_outputs(&self.mission).await;
         inner.holds_output(&key)
     }
+
+    async fn ready(&self) {
+        if let Some(inner) = self.runtime.upgrade() {
+            inner.scan_outputs(&self.mission).await;
+        }
+    }
 }
 
 // ---- the runtime ------------------------------------------------------------------------------
@@ -1874,6 +1890,11 @@ impl Inner {
     /// Read the logs of every session of `mission` once (off the async workers) and fill the producer index
     /// and the index of other outputs from them. Does nothing for a mission already scanned.
     async fn scan_outputs(self: &Arc<Self>, mission: &MissionId) {
+        if self.st().scanned.contains(mission) {
+            return;
+        }
+        // One scan at a time: a second caller waits for the first and then finds the mission scanned.
+        let _one = self.scan_lock.lock().await;
         let ids = {
             let st = self.st();
             if st.scanned.contains(mission) {
@@ -1882,7 +1903,7 @@ impl Inner {
             st.known.iter().filter(|(_, k)| &k.meta.mission == mission).map(|(id, _)| id.clone()).collect::<Vec<_>>()
         };
         let paths = self.paths.clone();
-        let (found, extra) = tokio::task::spawn_blocking(move || {
+        let scanned = tokio::task::spawn_blocking(move || {
             let mut out: Vec<(BlobId, Producer)> = Vec::new();
             let mut extra: Vec<BlobId> = Vec::new();
             let mut jobs: HashMap<(SessionId, String), Producer> = HashMap::new();
@@ -1895,8 +1916,9 @@ impl Inner {
             }
             (out, extra)
         })
-        .await
-        .unwrap_or_default();
+        .await;
+        // A scan that did not finish says nothing about the mission: it is tried again at the next miss.
+        let Ok((found, extra)) = scanned else { return };
         let mut st = self.st();
         for (b, p) in found {
             let owner = st.known.get(&p.session).map(|k| k.meta.mission.clone());
@@ -3780,6 +3802,7 @@ impl Runtime {
             profiles,
             proxy,
             state: Mutex::new(State::default()),
+            scan_lock: tokio::sync::Mutex::new(()),
             activation: Mutex::new(()),
             shutting: AtomicBool::new(false),
             disk_low: AtomicBool::new(false),
@@ -6964,7 +6987,13 @@ mod tests {
         let foreign = Arc::new(Mutex::new(String::new()));
         let f = foreign.clone();
         let e = env(Script::new(move |body, _| {
-            if has_tool(body, "agent_spawn") {
+            if mentions(body, "SECONDMISSION") {
+                if tool_msgs(body) == 0 {
+                    call("bash", json!({"command": "echo FOREIGNMARK"}))
+                } else {
+                    finish("second done")
+                }
+            } else if has_tool(body, "agent_spawn") {
                 match tool_msgs(body) {
                     0 => call("bash", json!({"command": "echo OWNMARK"})),
                     1 => call("out_read", json!({"handle": handle_in_tool_msg(body, 0)})),
@@ -6982,8 +7011,18 @@ mod tests {
             }
         }))
         .await;
-        // Stored by someone else (another mission): its handle reaches the session in a message.
-        let other = e.rt.blobs().put_bytes(b"FOREIGNMARK of another mission\n").unwrap();
+        // Another mission's lead produces an output; its handle reaches this session in a message.
+        let second = e.rt.create_session(e.new_session(Some("SECONDMISSION: print a marker"))).await.unwrap();
+        let sid = second.meta.id.clone();
+        until("the second mission's turn ends", || e.has(&sid, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let other = e
+            .records(&sid)
+            .into_iter()
+            .find_map(|r| match r.event {
+                Event::ToolResult(t) => t.output,
+                _ => None,
+            })
+            .expect("the second mission stored an output");
         *lock(&foreign) = other.handle();
         let info = e.rt.create_session(e.new_session(Some(&format!("Look at {} too.", other.handle())))).await.unwrap();
         let id = info.meta.id.clone();
@@ -6999,7 +7038,17 @@ mod tests {
         let child = out_read_texts(&e, &kid);
         assert_eq!(child.len(), 1, "{child:?}");
         assert!(child[0].contains("1\tOWNMARK"), "{}", child[0]);
+        // After a restart over the same home the first mission still cannot open it, and the second still can.
+        let (m1, m2) = (info.meta.mission.clone(), second.meta.mission.clone());
+        assert_ne!(m1, m2);
+        let own = out_read_texts(&e, &id);
+        assert!(own.len() == 2);
         e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let scope = |m: &MissionId| MissionOutputs { runtime: Arc::downgrade(&rt2.inner), mission: m.clone() };
+        assert!(!scope(&m1).holds(&other.id).await);
+        assert!(scope(&m2).holds(&other.id).await);
+        rt2.shutdown().await;
     }
 
     fn named_result(call_id: &str, name: &str, output: Option<&BlobRef>, meta: Value) -> Event {

@@ -1198,6 +1198,34 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
     }
 
     #[tokio::test]
+    async fn an_output_outside_the_scope_is_refused_and_not_described() {
+        let (_d, mut ctx, h) = store_with("TOPSECRET one\nTOPSECRET two\nthree\n");
+        ctx.outputs = std::sync::Arc::new(loom_tools::outputs::OutputSet::default());
+        let never = "out:0123456789abcdef";
+        let want = |handle: &str| {
+            format!("quote 1: no output of this mission has the handle {handle}; copy the out:… handle exactly from a result header")
+        };
+        // Right text, wrong text, a range past the end, a quote by lines: all say the same, and the same as a
+        // handle that names nothing.
+        for (start, end, text) in
+            [(1, 1, "TOPSECRET one"), (1, 1, "wrong text"), (2, 9, "TOPSECRET"), (7, 9, ""), (1, 2, "")]
+        {
+            let e = check_quotes(&ctx, &[q(&h, start, end, text)]).await.err().unwrap_or_default();
+            assert_eq!(e, want(&h), "{start} {end} {text}");
+            let a = check_quotes(&ctx, &[q(never, start, end, text)]).await.err().unwrap_or_default();
+            assert_eq!(a, want(never));
+        }
+        // One output outside and one inside in the same call: only the first is refused.
+        let own = ctx.blobs.put_bytes(b"mine\n").unwrap_or_else(|e| panic!("{e}"));
+        ctx.outputs = std::sync::Arc::new(loom_tools::outputs::OutputSet::with([own.id.clone()]));
+        let e = check_quotes(&ctx, &[q(&h, 1, 1, "TOPSECRET one"), q(&own.handle(), 1, 1, "mine")])
+            .await
+            .err()
+            .unwrap_or_default();
+        assert_eq!(e, want(&h));
+    }
+
+    #[tokio::test]
     async fn several_failures_at_once() {
         let (_d, ctx, h) = store_with(OUT);
         let e = check_quotes(
