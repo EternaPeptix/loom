@@ -23,7 +23,9 @@ loom-net = { path = "crates/loom-net" }
 loom-agent = { path = "crates/loom-agent" }
 
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+# float_roundtrip: a float parsed from JSON is the exact value written, so a line re-serialized to check its MAC
+# (monitor log, journals) gives the same text it was sealed over.
+serde_json = { version = "1", features = ["preserve_order", "raw_value", "float_roundtrip"] }
 thiserror = "2"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }

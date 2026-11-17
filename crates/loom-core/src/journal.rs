@@ -1450,4 +1450,18 @@ mod tests {
         std::fs::write(&path, format!("{}\n", "ab".repeat(32))).unwrap_or_default();
         assert_eq!(load_or_create_key(&path).map(|k| k.len()).ok(), Some(32));
     }
+
+    #[test]
+    fn a_float_survives_a_json_round_trip_exactly() {
+        // A sealed line is checked by parsing it and serializing it again, so a float must come back as the same
+        // text. serde_json's default parser can be one unit in the last place off; `float_roundtrip` makes it exact.
+        for n in 1u64..400 {
+            for d in [3u64, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 97] {
+                let x = (n * 1_000_003) as f64 / d as f64 * 3.6;
+                let text = serde_json::to_string(&serde_json::json!({ "x": x })).expect("ser");
+                let back: serde_json::Value = serde_json::from_str(&text).expect("de");
+                assert_eq!(back.to_string(), text, "{n}/{d}");
+            }
+        }
+    }
 }

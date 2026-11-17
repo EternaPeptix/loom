@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Exact JSON floats
+
+- **A float parsed from JSON is the exact value that was written** (serde_json `float_roundtrip`). A sealed line of the monitor
+  log or a journal is checked by parsing it and serializing it again; with the default parser a float could come back one unit
+  in the last place off (`1200003.6` as `1200003.5999999999`), so a valid line would fail its MAC. It also made
+  `monitor::replay::tests::the_report_round_trips_as_json` flaky.
+
 ### Monitor and the 2026-11-17 release together
 
 - **`loom models lineage [profile]`** is the monitor's command that was `loom models show [profile]`: `loom models show
