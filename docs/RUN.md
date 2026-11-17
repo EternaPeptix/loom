@@ -315,7 +315,8 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 
 Options of `run` and `chat`: `-w/--workspace`, `--pack`, `--role`, `-m/--model` (a profile name),
 `-t/--title`, `--attended` (do not resume by itself after a restart), `--max-steps`, `--max-minutes`,
-`--prior <mission>` (repeatable: earlier missions to recall);
+`--prior <mission>` (repeatable: earlier missions to recall; not with `chat --session`, which continues a
+mission that has already started);
 and for display `--reasoning`, `--full`, `-v`. A `<session>` is an id, the beginning of one, or `last`.
 `-` as the text reads standard input.
 
