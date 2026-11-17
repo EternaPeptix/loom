@@ -5,12 +5,92 @@
 //! ## Policy
 //! - writable roots: the workspace, the session temp dir and `cfg.extra_writable`. System temp
 //!   directories have no blanket write grant. Standard device literals remain writable;
-//! - never writable, even inside a writable root: `<workspace>/.loom`, the loom home directory, and
-//!   Git config/hooks/pointers (including discovered worktree gitdir/commondir), and `cfg.protected_paths` (relative entries are relative to the workspace). One exception: the
+//! - never writable, even inside a writable root: `<workspace>/.loom`, the loom home directory, the
+//!   Git metadata of the next item, and `cfg.protected_paths` (relative entries are relative to the workspace). One exception: the
 //!   session temp dir lies inside the loom home (`<loom home>/sessions/<id>/tmp`) and what is in it
 //!   is writable all the same — but not the directory entry itself (it cannot be removed, renamed,
 //!   replaced or made anew, yet tests as writable), and not a protected path that is the temp dir or
 //!   lies inside it. A temp dir that is `/`, or is or contains the loom home, is refused at construction;
+//! - Git metadata, so that a command cannot plant what Git runs as the operator (`core.fsmonitor` and the
+//!   other commands a config names, hooks, a `commondir` or `gitdir` that points at a config of its own)
+//!   on their next `git status`, commit or `git submodule update`, in the workspace, in a linked worktree
+//!   outside it, or in a repository moved into place. In every writable root (the workspace, the session
+//!   temp dir — the exception above does not reach it — and `cfg.extra_writable`), whether it exists yet or
+//!   not, and comparing names as the volume folds case (APFS folds more than ASCII case: `ſ`, the Kelvin
+//!   sign and the `ﬁ` ligature count as `s`, `k` and `fi`, so a name made with them is the same name):
+//!   - no `.git` entry can be written, made, removed or renamed, nor, below one, `config`,
+//!     `config.worktree`, `hooks`, `commondir` or `gitdir` (or anything below those) — of the repository,
+//!     of a linked worktree's private gitdir (`.git/worktrees/<name>/…`) and of a submodule's repository
+//!     (`.git/modules/<name>/…`, where `<name>` has one or more components; nested submodules'
+//!     `…/modules/<name>/…` included);
+//!   - nothing can be made or removed (renames included) at `.git/modules`, `.git/worktrees`, a direct child
+//!     of either, or the same below `.git/modules/…/`: no rule judges what a directory moved into place
+//!     holds, so a directory moved there would bring its own `config` and `hooks`;
+//!   - for the same reason, below `.git/modules/<name>/` (and below the same in a submodule's repository)
+//!     nothing can be made or removed except inside the repositories found there at construction, and inside
+//!     those only outside their own `modules` and `worktrees` (which this rule covers in turn). A directory
+//!     on the way to a repository that is not one (the `third_party` of a submodule named `third_party/x`) and
+//!     a submodule repository made during the session (by the operator: it was not found) can neither be
+//!     replaced nor have anything made in them; Git can write in the latter from the next session on. (The
+//!     audit's review moved a copy carrying `core.fsmonitor` over a slash-named submodule's repository that
+//!     the operator had set up mid-session, and the operator's next `git status` ran it.)
+//!   - the hooks directory a repository's configuration names and the files it includes: `core.hooksPath`,
+//!     `include.path` and `includeIf.<condition>.path` (whatever the condition), read from the `config` and
+//!     `config.worktree` of every repository found and from the user's global configuration
+//!     (`~/.gitconfig`, and `$XDG_CONFIG_HOME/git/config` or else `~/.config/git/config`), included files
+//!     read in turn (at most 10 deep, each file once), and from the configuration of the repository that
+//!     encloses the workspace when the workspace lies below its working tree (found by looking up from the
+//!     workspace's parent for a `.git`, as Git does). A value is resolved as Git resolves it: `~/` from the
+//!     home directory and `~<user>/` from that user's (a user that is not known resolves to nothing, never to
+//!     a relative path); an include relative to the directory of the file that names it. Git takes a relative
+//!     `hooksPath` from the top of the working tree it runs in, and one configuration serves several (a
+//!     common directory's serves every linked worktree), so every relative `hooksPath` read anywhere is joined
+//!     to the top of every working tree found: of each repository found, its `core.worktree` (resolved from
+//!     the repository) when set — a submodule's repository sets it — else the parent of a `.git` directory,
+//!     the worktree named by a linked worktree's `gitdir` file, and for a bare repository the repository
+//!     itself. Each one that lies in a writable root is a protected path (as written and as resolved), and so
+//!     are `~/.gitconfig` and the `git` directory of the user's XDG configuration when they do. (Probed: with `core.hooksPath = .husky`
+//!     a command wrote `.husky/post-checkout` and the operator's next checkout ran it.) These files are read
+//!     without running Git: a syntax this reading does not understand protects nothing (a residual, in
+//!     SECURITY.md, with the scripts a hook or a config names in the working tree, which stay writable).
+//!
+//!   Git's own writes still work in the workspace's repository and every existing submodule's: objects,
+//!   refs, the index, `HEAD`, logs (not the configuration: `git branch --set-upstream-to` and the tracking of
+//!   `git switch -c <b> <remote>/<b>` cannot be recorded). What a session cannot do, and must ask the operator
+//!   for: `git init` or a clone that is not bare anywhere commands write (so are installs of dependencies
+//!   from Git URLs by pip, npm, cargo or uv, which clone into the temp dir), `git worktree add`/`remove`/`prune`,
+//!   and `git submodule add`/`init`/`update`/`deinit` (`update` of an initialized submodule too: it rewrites
+//!   `core.worktree`); a bare repository, `<name>.git`, can be made and used with `--git-dir` and
+//!   `--work-tree`. Existing repositories are found at construction without running Git or following a link
+//!   to a directory: every directory in the workspace that is a repository (a regular file `HEAD` and an
+//!   `objects` directory or a `commondir` file; a bare one included) and that holds no `.git` of its own,
+//!   every `.git` directory, and the target of every `.git` file's `gitdir:` when that target is a
+//!   repository. The search goes on below every directory, a repository's included (but not into its
+//!   `objects`): a command can give any directory a `HEAD` and an `objects`, and the next session must
+//!   still find what lies below it (the re-review made the whole workspace look like one bare repository,
+//!   and the next session found nothing else and protected no hooks directory);
+//!   then for each repository found, its `commondir` target (when it is a repository), every directory in its
+//!   `worktrees`, and below its `modules` every directory that is a repository, whose own `worktrees` and
+//!   `modules` are searched in turn. The `config`, `config.worktree`, `hooks`, `commondir` and `gitdir` of
+//!   every repository found are protected paths, as found and as resolved, and Bubblewrap mounts every
+//!   repository found read-only as a whole (`git_dirs`) — except one that is, contains or lies inside the
+//!   loom home, or (while credentials are protected, which hides it) the user's home directory, unless it lies
+//!   in a writable root: a pointer could otherwise name one to mount what Bubblewrap hides back in (its private
+//!   files stay protected). A directory of the workspace that cannot be read refuses construction with
+//!   a sentence naming it; so do a pointer larger than 4096 bytes, more than 100000 workspace directories,
+//!   and more than 4096 repositories and directories below `modules` together;
+//! - mounting: commands cannot mount a file system over a directory: `file-mount` is denied, and so are the
+//!   services that attach and mount disk images for a process, outside its sandbox
+//!   (`com.apple.DiskArbitration.diskarbitrationd`, `com.apple.diskimagesiod`, `com.apple.diskimagesiod.ram`,
+//!   `com.apple.diskmanagementd`). Probed on macOS 27: `hdiutil attach -mountpoint <dir>` of an image a
+//!   command made mounted it over `.git/modules/<n>/hooks` (and over any directory the user owns: `~/.ssh`,
+//!   `~/Library/LaunchAgents`, the loom home), and the operator's next Git command ran a hook from it; with
+//!   these denied nothing is attached (`hdiutil attach` may still exit 0) and `diskutil` fails, while
+//!   `hdiutil makehybrid` still works (`hdiutil create` already fails under the write rules);
+//! - preferences: commands cannot write a preference domain (`user-preference-write`): `cfprefsd` writes
+//!   `~/Library/Preferences` for a process, outside its sandbox (probed: `defaults write <domain>` created the
+//!   plist under a profile that denies writing there), and some preferences name a command another program
+//!   runs as the operator (a terminal's startup command). Reading preferences is allowed;
 //! - not readable: the whole loom home — its records, stored outputs, journals, logs, configuration,
 //!   packs, `token` and `keys` among them — except the session temp dir and `<session dir>/analysis`, the
 //!   harness's staging of binary-analysis inputs (readable, never writable; in an isolated replay: its
@@ -45,7 +125,30 @@
 //!   jobs;
 //! - network: denied, except loopback connections to the egress proxy port (when there is one), to
 //!   `cfg.loopback_ports` — or to every loopback port when `cfg.loopback_all` — and to
-//!   `cfg.unix_sockets`. Listening on loopback is allowed.
+//!   `cfg.unix_sockets`. Listening on loopback is allowed. The daemon's own port (`cfg.daemon_port`, which
+//!   the daemon sets; not a configuration key) is refused whatever allows it, at every address: Seatbelt
+//!   counts the host's own addresses as loopback, and a command that read a `loom open` login code from the
+//!   process list could otherwise redeem it. (Probed on macOS 27: after an allow of `(remote ip
+//!   "localhost:*")` a deny of one port, written `localhost:<port>` or `*:<port>`, is not reliable — about two
+//!   ports in five stay connectable, the same port every time — so with `cfg.daemon_port` the allow for
+//!   `loopback_all` is written for TCP and UDP, `(remote tcp "localhost:*") (remote udp "localhost:*")`
+//!   (loopback ICMP is not allowed then); with that allow, and with allows of single ports, a deny of
+//!   `*:<port>` refused 127.0.0.1, ::1 and the host's own address on every port tried.)
+//! - system services that fetch a URL for a process, outside its sandbox: when `[network] mode` is
+//!   `deny_all` (`cfg.network_deny_all`, which the runtime sets; not a configuration key) commands cannot
+//!   look up `com.apple.trustd.agent`, `com.apple.trustd`, `com.apple.ocspd`, `com.apple.nsurlsessiond` or
+//!   `com.apple.nsurlsessiond.NSURLSessionProxyService`, nor WebKit's XPC services (`com.apple.WebKit.*`):
+//!   probed on macOS 27, a background URL session started from `osascript -l JavaScript` and a `WKWebView`
+//!   made there each fetched a URL from a listener the profile does not allow; denied, nothing arrives, and
+//!   background URL sessions and WebKit-based tools fail. Certificate evaluation
+//!   fetches the issuer a certificate names (its AIA `caIssuers` URL, which a command chooses), with DNS,
+//!   through `com.apple.trustd.agent`: probed on macOS 27 with `security verify-cert -p ssl` under
+//!   `(deny network*)`, the request reaches a listener unless that service is denied (denying
+//!   `com.apple.trustd` alone does not stop it); `ocspd` is the older service for the same fetches. Denied,
+//!   evaluation through Security.framework fails for every certificate, valid ones too
+//!   (`SecTrustEvaluateWithError` returns false, errSecInternalComponent, so it fails closed), and so does
+//!   `codesign --verify`; curl, Python and OpenSSL check certificates against their own files and are not
+//!   affected. In the other network modes these services stay reachable: a residual, in SECURITY.md.
 //!
 //! All paths are made canonical when the sandbox is built (macOS: `/tmp` is `/private/tmp`); a
 //! configured path that does not exist is kept as written after resolving its deepest existing
@@ -73,6 +176,9 @@
 //! (allow file-write* (subpath "<session temp dir>"))
 //! (deny file-write-unlink file-write-create (literal "<session temp dir>"))
 //! (deny file-write* (subpath "<protected, at or inside the temp dir>") …)
+//! (deny file-write* (require-all (require-any (subpath "<writable root>") …) (regex #"^.*/[.]git(/((worktrees/[^/]+|modules/(.+/)?[^/]+)/)?(config|config[.]worktree|hooks|commondir|gitdir)(/.*)?)?$")))
+//! (deny file-write-create file-write-unlink (require-all (require-any (subpath "<writable root>") …) (regex #"^.*/[.]git/(modules/.+/)?(modules|worktrees)(/[^/]+)?$")))
+//! (deny file-write-create file-write-unlink (require-all (require-any (subpath "<writable root>") …) (regex #"^.*/[.]git/(modules/.+/)?modules/[^/]+/.+$") (require-not (require-all (subpath "<repository found below a modules directory>") (require-not (subpath "<it>/modules")) (require-not (subpath "<it>/worktrees")))) …))
 //! (deny file-write* (subpath "<unreadable or credential store>") …)
 //! (deny file-read* file-test-existence (subpath "<unreadable or credential store>") …)
 //! (deny file-read* file-test-existence (subpath "<loom home>"))
@@ -87,12 +193,30 @@
 //! (deny appleevent-send)
 //! (deny job-creation)
 //! (deny file-search)
+//! (deny file-mount)
+//! (deny user-preference-write)
+//! (deny mach-lookup (global-name "com.apple.DiskArbitration.diskarbitrationd") (global-name "com.apple.diskimagesiod") (global-name "com.apple.diskimagesiod.ram") (global-name "com.apple.diskmanagementd"))
 //! (deny network*)
-//! (allow network-outbound (remote ip "localhost:<port>")) …      ; or "localhost:*" for loopback_all
+//! (allow network-outbound (remote ip "localhost:<port>")) …      ; or "localhost:*" for loopback_all (with
+//!                                                                 ; `cfg.daemon_port`: `(remote tcp "localhost:*") (remote udp "localhost:*")`)
 //! (allow network-outbound (remote unix-socket (path-literal "<socket>"))) …
+//! (deny network-outbound (remote ip "*:<daemon port>"))          ; only with `cfg.daemon_port`
 //! (allow network-bind (local ip "localhost:*"))
 //! (allow network-inbound (local ip "localhost:*"))
+//! (deny mach-lookup (global-name "com.apple.trustd.agent") (global-name "com.apple.trustd") (global-name "com.apple.ocspd") (global-name "com.apple.nsurlsessiond") (global-name "com.apple.nsurlsessiond.NSURLSessionProxyService") (xpc-service-name-prefix "com.apple.WebKit."))   ; only with `cfg.network_deny_all`
 //! ```
+//!
+//! The Git regexes are written with every letter as a class of both cases (`[gG][iI][tT]`) and, where the
+//! volume folds other characters to it, an alternation that adds them: `(s|S|ſ)`, `(k|K|K)` (U+212A)
+//! and, for the two letters of `config`, `([fF][iI]|ﬁ)`. On macOS 27 Seatbelt was probed to match a path
+//! as the volume folds it already (a regex or subpath written in lower case refuses `MODULES`, `moduleſ` and
+//! `conﬁg`), so in the profile this is defence in depth against a version that does not; the file tools'
+//! own `check_write` compares names with the same fold, and before it did, `write` could make
+//! `.git/moduleſ/<n>/hooks/<hook>`, which Git then reads as `.git/modules/<n>/hooks/<hook>`. The writable
+//! roots in them are those of `writable`, in its order. The exceptions of the third Git rule are the
+//! repositories found below a `modules` directory, sorted (none: no `require-not`). Probed on macOS 27: the
+//! nested `require-not` keeps commits in found submodules, nested ones included, working while a name below
+//! `modules` outside them, or inside their own `modules`, cannot be made or moved.
 //!
 //! A process that leaves its command's process group (`setsid`, `daemon()`, `redis-server --daemonize
 //! yes`, `tmux new -d`) is not tracked: `job_kill`, stop, the end of the session and daemon shutdown do
@@ -129,6 +253,15 @@
 //! lies there; in mode `none` the sentence says the file tools cannot read it, as commands are not confined. In mode `none` only
 //! the never-writable and not-readable rules apply (the loom home rule included: it is the file tools'
 //! own rule in that mode).
+//!
+//! `check_write` applies the Git rules of the policy as the profile does — in every mode, to the path as
+//! given and as resolved, each judged relative to the writable root it lies in (the workspace when it lies
+//! in none) — and treats every write as making the entry, since the file tools write by renaming a new file
+//! into place. Its refusal says that the path is Git metadata that commands and file tools may not write or
+//! create anywhere they write, because Git could run what it holds as the operator; that the operator is
+//! the one to change repository configuration, add a worktree or set up a submodule
+//! (`git worktree add`, `git submodule update --init`); and that a repository of the session's own can be
+//! cloned bare (`git clone --bare <url> <dir>.git`) and used with `git --git-dir=<dir>.git --work-tree=<dir>`.
 //!
 //! ## `oracle_staging_root()` / `isolated_replay(workspace, tmp)`
 //! Staging is `<loom home>/oracle-runs`, outside all session temp trees. The harness creates a private
@@ -167,7 +300,16 @@
 //! stores when protected), how network access works. Deterministic. In
 //! mode `none` it says commands are not confined and what the file tools still refuse: the rule about loom's
 //! own files is worded as the file tools' (`File tools also refuse to read loom's own files under …`), not
-//! as one that binds commands.
+//! as one that binds commands. In seatbelt mode it also says that no Git repository can be made where
+//! commands write and no Git configuration, hooks, worktree or submodule repository written, that the
+//! operator does `git worktree add` and `git submodule update --init`, and that a bare clone
+//! (`git clone --bare <url> <dir>.git`, used with `--git-dir`/`--work-tree`) works; and, with
+//! `cfg.network_deny_all`, that programs that check certificates through macOS (Swift and Go programs,
+//! `security`, `codesign --verify`) fail here, while curl and Python use their own certificate files, and
+//! that WebKit-based tools and background URL sessions fail. In seatbelt mode it also says, in one sentence,
+//! that `git submodule update` (any form) is the operator's, that upstream tracking cannot be recorded, that
+//! dependencies from Git URLs (pip, npm, cargo, uv) cannot be installed (an archive URL can), that disk
+//! images cannot be mounted (extract them instead) and that preferences cannot be written (`defaults write`).
 //!
 //! ## `preflight(cfg)`
 //! Whether the configured mode can work on this host: seatbelt needs macOS and an executable
@@ -193,6 +335,71 @@
 //! keep their output, while `cat` and `ls` of the jobs directory fail; `check_read` and construction judge
 //! a path written through `/System/Volumes/Data` as the plain one; the analysis staging dir is readable and
 //! not writable; the `check_read` test also builds a Bubblewrap sandbox where that is possible.
+//!
+//! Git (built with real `git` where it runs, skipped otherwise, beside `check_write` cases on hand-made trees):
+//! construction finds an external linked worktree's `.git/worktrees/<n>`, an initialized and a deinitialized
+//! submodule's `.git/modules/<n>`, a submodule named `third/party` (with `third` recorded as not a repository),
+//! and a nested submodule's `.git/modules/<a>/modules/<b>`, and gives them to Bubblewrap as `git_dirs`;
+//! `check_write` refuses, in the workspace and in the temp dir, `commondir`, `gitdir` and `config.worktree` of
+//! a worktree's gitdir, `config` and `hooks/post-checkout` of each of those submodules, `.git/modules/<new>`,
+//! `.git/modules/<new>/hooks/x`, `.git/worktrees/<new>`, `.git/modules/third/<new>`, `<tmp>/x/.git` and
+//! `<tmp>/x/.git/config`, each refusal naming the operator and the bare clone, and accepts `objects/` and
+//! `refs/heads/` paths of the workspace's and the submodules' repositories, `<tmp>/x.git/config` and
+//! `<tmp>/x.git/hooks/h`; and refuses every spelling the volume folds to a Git name (`.git/moduleſ/x/hooks`,
+//! `.git/hooKs` with the Kelvin sign, `.git/hookſ`, `.git/conﬁg.worktree`, `.git/worktreeſ/w`, capitals included),
+//! where the profile's two regexes (matched with the `regex` crate) and `git_metadata`/`git_container` agree on
+//! each of them and on names that are none of theirs. Under `sandbox-exec`: each of those writes fails, as does making
+//! `.git/moduleſ/x/hooks`, a Kelvin-sign `hooks` where `hooks` is missing and `.git/conﬁg.worktree`, in a repository
+//! that has none of those names yet, while `.git/conﬂg` (a ligature that is not `fi`) can be made, and as does making
+//! `.git/modules/<new>/hooks` with `mkdir -p`; moving a directory from `$TMPDIR` to `.git/modules/<new>`,
+//! `.git/worktrees/<new>`, `.git/modules/third/<new>` and `.git/modules/<sub>/modules`; renaming `.git/modules`
+//! and `.git/modules/<sub>` away; `git init` in `$TMPDIR`; and moving a bare repository to `$TMPDIR/<d>/.git` —
+//! while a commit and a new branch in the workspace, in a submodule and in `third/party`, and
+//! `git init --bare $TMPDIR/x.git`, succeed. End to end, with the operator's `git` run outside the sandbox
+//! afterwards: a command that points the external worktree's `commondir` at a config of its own that sets
+//! `core.fsmonitor`, or that moves a repository with such a config into the workspace and adds a gitlink for
+//! it, does not make `git status` (in the worktree, in the workspace) run that command (a marker file it would
+//! make stays absent; the same steps without the profile make it, or the test is skipped).
+//!
+//! Git, second round (the audit review's reproductions, each failing without its rule): with a slash-named
+//! submodule `lib/foo` set up after construction (by the test, outside the sandbox), moving its repository
+//! away and a copy that sets `core.fsmonitor` into its place fails, as does making anything in it, and the
+//! operator's `git status` runs nothing; a found nested submodule's `modules/<a>/<c>` cannot be made while
+//! objects in found submodules (nested ones too) and `.git/refs/heads/modules/x/y` in the workspace can;
+//! `check_write` agrees on each. With `core.hooksPath = .husky` in the repository's config (and, in another
+//! case, set through a file the config includes, and in a global config given by `HOME`/`XDG_CONFIG_HOME`),
+//! `.husky/post-checkout` is a protected path and cannot be written by `check_write` or under the profile; a
+//! value in quotes, with `~/`, and relative to a linked worktree's top are resolved as Git does; an include
+//! cycle is read once. A bare repository the operator made in the workspace (`fixtures/remote.git`) is found
+//! and its `hooks/pre-receive` cannot be written. A `.git` file whose `gitdir:` names a directory that is not a
+//! repository (the user's home) and a `commondir` of `../../..` add nothing to `git_dirs`, and a repository
+//! that contains the loom home is not in `git_dirs`. A workspace directory that cannot be read refuses
+//! construction with a sentence that names it.
+//!
+//! Git, third round (the re-review's reproductions, with real `git`, each shown to fail before; `check_write`,
+//! the profile, and the operator's `git checkout` afterwards): `core.hooksPath = .husky` in a real
+//! submodule's repository (which sets `core.worktree`) protects `<submodule>/.husky`; in the common config of
+//! a repository whose linked worktree is the workspace, `<worktree>/.husky`; with `HEAD` and `objects/`
+//! planted at the workspace root (and, in another case, in a directory that holds a nested repository), the
+//! next sandbox still finds the `.git` and nested repositories and protects `.husky`; a value
+//! `~<user>/…/.husky` naming the workspace protects it; a workspace that is a subdirectory of a repository
+//! whose config has `hooksPath = <subdir>/.husky` protects it; a repository inside the (hidden) user home
+//! named by a planted `commondir` is not in `git_dirs`, while the workspace's own `.git` inside the home is.
+//!
+//! Mounting and preferences (under `sandbox-exec`): `hdiutil attach -nobrowse -mountpoint <dir>` of an image
+//! made with `hdiutil makehybrid` mounts nothing (checked with `mount`, as `hdiutil` may exit 0), and
+//! `defaults write <unique domain> k v` leaves no value (read back outside the sandbox), while
+//! `defaults read -g` works; without these rules both succeed (or the test is skipped).
+//!
+//! Network: the profile has the daemon-port deny after the allows exactly when `cfg.daemon_port` is set, and
+//! the `mach-lookup` deny exactly when `cfg.network_deny_all`. Under `sandbox-exec`: with `loopback_all`, and
+//! with the daemon port listed in `loopback_ports`, a connection to that port fails at 127.0.0.1 and ::1 (and
+//! at the host's own address when it has one) while another loopback port still connects; a command that runs
+//! `security verify-cert -p ssl` on a certificate whose AIA `caIssuers` names a unique URL on a local
+//! listener makes no request reach it with `network_deny_all`, and does without it (otherwise skipped: the
+//! host does not fetch); with `network_deny_all` the profile has the nsurlsessiond and WebKit denies too, and a
+//! background URL session started from `osascript -l JavaScript` gets no request to a local listener the
+//! profile does not allow (skipped when it does not reach it without them); `describe` says what is said above.
 
 mod linux;
 
@@ -305,7 +512,10 @@ pub struct Sandbox {
     mode: SandboxMode,
     linux_filter: Option<PathBuf>,
     linux_pins: Vec<linux::PinnedPath>,
+    /// Every repository found at construction (read-only to Bubblewrap as a whole).
     git_dirs: Vec<PathBuf>,
+    /// The repositories found below a `modules` directory: what the third Git rule leaves out.
+    git_modules: Vec<PathBuf>,
     workspace: PathBuf,
     loom_home: PathBuf,
     oracle_staging_root: PathBuf,
@@ -326,6 +536,10 @@ pub struct Sandbox {
     credentials: Vec<PathBuf>,
     loopback_ports: Vec<u16>,
     loopback_all: bool,
+    /// The daemon's own port, refused whatever else allows it.
+    daemon_port: Option<u16>,
+    /// Commands cannot reach the system services that fetch a URL for a process (certificate evaluation).
+    network_deny_all: bool,
     unix_sockets: Vec<PathBuf>,
     env_pass: Vec<String>,
     secret_env: Vec<String>,
@@ -341,85 +555,760 @@ fn push_unique<T: PartialEq>(v: &mut Vec<T>, item: T) {
     }
 }
 
-/// Git's configuration/hook entries and the `.git` entry itself cannot be written, including at
-/// locations created after construction. Ordinary object/ref updates remain possible on Seatbelt.
-fn git_metadata(path: &Path, workspace: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(workspace) else { return false };
-    let mut components = relative.components();
-    while let Some(component) = components.next() {
-        if component.as_os_str().to_string_lossy().eq_ignore_ascii_case(".git")
-            && components.next().is_none_or(|name| {
-                ["config", "config.worktree", "hooks", "commondir", "gitdir"]
-                    .iter()
-                    .any(|x| name.as_os_str().to_string_lossy().eq_ignore_ascii_case(x))
-            })
-        {
-            return true;
+/// The files of a Git directory that name what Git runs or where its configuration is.
+const GIT_PRIVATE: [&str; 5] = ["config", "config.worktree", "hooks", "commondir", "gitdir"];
+
+/// Characters that the volume (APFS, the macOS default) takes for an ASCII letter besides its two cases: the long s
+/// and the Kelvin sign. Probed on macOS 27; `char::to_lowercase` maps the Kelvin sign already, the long s it does not.
+const FOLD_LETTERS: [(char, char); 2] = [('\u{17f}', 's'), ('\u{212a}', 'k')];
+
+/// Characters that the volume takes for a run of ASCII letters (the sharp s and the Latin ligatures). The dotted and
+/// dotless i, the fullwidth letters and the zero-width characters are not folded.
+const FOLD_EXPANDS: [(char, &str); 9] = [
+    ('\u{df}', "ss"),
+    ('\u{1e9e}', "ss"),
+    ('\u{fb00}', "ff"),
+    ('\u{fb01}', "fi"),
+    ('\u{fb02}', "fl"),
+    ('\u{fb03}', "ffi"),
+    ('\u{fb04}', "ffl"),
+    ('\u{fb05}', "st"),
+    ('\u{fb06}', "st"),
+];
+
+/// `name` as the volume compares it: lower case, with the characters of `FOLD_LETTERS` and `FOLD_EXPANDS` replaced
+/// by the ASCII they stand for. Two names that name the same entry have the same fold; so does the ASCII name.
+fn fold(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars().flat_map(char::to_lowercase) {
+        if let Some((_, to)) = FOLD_LETTERS.iter().find(|(from, _)| *from == c) {
+            out.push(*to);
+        } else if let Some((_, to)) = FOLD_EXPANDS.iter().find(|(from, _)| *from == c) {
+            out.push_str(to);
+        } else {
+            out.push(c);
         }
     }
-    false
+    out
 }
 
-/// Discover existing nested repositories and linked-worktree metadata without running host Git or
-/// following arbitrary directory links. A worktree's `commondir` is resolved relative to its gitdir.
-/// Refuse an unreadable/oversized tree rather than silently leaving discovered metadata unprotected.
-fn git_directories(workspace: &Path) -> io::Result<Vec<PathBuf>> {
-    use std::collections::BTreeSet;
-    let canon = |p: &Path| resolve_path(p, true).map_err(invalid);
-    let pointer = |path: &Path| -> io::Result<Option<String>> {
-        match std::fs::metadata(path) {
-            Ok(m) if m.is_file() && m.len() <= 4096 => Ok(Some(std::fs::read_to_string(path)?)),
-            Ok(m) if m.is_file() => Err(invalid(format!(
-                "Git metadata pointer {} is larger than 4096 bytes. Inspect it before starting a session.",
-                path.display()
-            ))),
-            Ok(_) => Ok(None),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+/// The folded names of `path` below `root`, when it lies in it.
+fn names_below(path: &Path, root: &Path) -> Option<Vec<String>> {
+    if !under(path, root) {
+        return None;
+    }
+    let names = path.components().skip(root.components().count());
+    Some(names.map(|c| fold(&c.as_os_str().to_string_lossy())).collect())
+}
+
+/// The SBPL regex text that matches `text` (a lower-case name) however the volume spells it, character by
+/// character: a letter is both its cases and every character that folds to it (`(s|S|ſ)`), and a run of letters that
+/// a character folds to is that run or the character (`([fF][iI]|ﬁ)`), over the whole stretch where such runs overlap.
+fn fold_regex(text: &str) -> String {
+    let chars: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let mut out = String::new();
+    let mut at = 0_usize;
+    while at < chars.len() {
+        let end = fold_span_end(&chars, at);
+        let spellings = fold_spellings(chars.get(at..end).unwrap_or_default());
+        match spellings.as_slice() {
+            [one] => out.push_str(one),
+            many => {
+                out.push('(');
+                out.push_str(&many.join("|"));
+                out.push(')');
+            }
         }
+        at = end;
+    }
+    out
+}
+
+/// Where the stretch that starts at `at` and holds every run a folding character stands for ends (after `at`).
+fn fold_span_end(chars: &[char], at: usize) -> usize {
+    let mut end = at.saturating_add(1);
+    let mut p = at;
+    while p < end {
+        for (_, to) in FOLD_EXPANDS {
+            let to: Vec<char> = to.chars().collect();
+            if chars.get(p..).is_some_and(|rest| rest.starts_with(&to)) {
+                end = end.max(p.saturating_add(to.len()));
+            }
+        }
+        p = p.saturating_add(1);
+    }
+    end.min(chars.len())
+}
+
+/// Every way to spell `chars` (lower-case ASCII), each as the regex text of the spelling.
+fn fold_spellings(chars: &[char]) -> Vec<String> {
+    let Some((&first, rest)) = chars.split_first() else { return vec![String::new()] };
+    let head = fold_letter(first);
+    let mut out: Vec<String> = fold_spellings(rest).into_iter().map(|tail| format!("{head}{tail}")).collect();
+    for (from, to) in FOLD_EXPANDS {
+        let to: Vec<char> = to.chars().collect();
+        if chars.starts_with(&to) {
+            let after = chars.get(to.len()..).unwrap_or_default();
+            out.extend(fold_spellings(after).into_iter().map(|tail| format!("{from}{tail}")));
+        }
+    }
+    out
+}
+
+/// The regex text for one character: a letter in both cases and every character that folds to it, else itself.
+fn fold_letter(c: char) -> String {
+    if c.is_ascii_alphabetic() {
+        let upper = c.to_ascii_uppercase();
+        let others: String =
+            FOLD_LETTERS.iter().filter(|(_, to)| *to == c).map(|(from, _)| format!("|{from}")).collect();
+        if others.is_empty() {
+            format!("[{c}{upper}]")
+        } else {
+            format!("({c}|{upper}{others})")
+        }
+    } else if c.is_ascii_alphanumeric() {
+        c.to_string()
+    } else {
+        format!("[{c}]")
+    }
+}
+
+/// Git metadata that cannot be written, made, removed or renamed, at locations that do not exist yet as well,
+/// as `path` lies below the writable root `root`: any `.git` entry, and below one the `config`,
+/// `config.worktree`, `hooks`, `commondir` and `gitdir` of the repository, of a linked worktree's gitdir
+/// (`worktrees/<name>/…`) and of a submodule's repository (`modules/<name>/…`, nested ones included). Names are
+/// compared as the volume folds case (`fold`). The profile's first Git rule says the same.
+fn git_metadata(path: &Path, root: &Path) -> bool {
+    let Some(names) = names_below(path, root) else { return false };
+    let private = |name: &String| GIT_PRIVATE.contains(&name.as_str());
+    names.iter().enumerate().any(|(i, name)| {
+        if name != ".git" {
+            return false;
+        }
+        let rest = names.get(i.saturating_add(1)..).unwrap_or_default();
+        match rest.first().map(String::as_str) {
+            None => true,
+            Some(first) if GIT_PRIVATE.contains(&first) => true,
+            Some("worktrees") => rest.get(2).is_some_and(private),
+            Some("modules") => rest.iter().skip(2).any(private),
+            Some(_) => false,
+        }
+    })
+}
+
+/// Entries that cannot be made or removed (renames included) because no rule judges what a directory moved
+/// there holds: `.git/modules`, `.git/worktrees`, a direct child of either, and the same below
+/// `.git/modules/<name>/`. The profile's second Git rule says the same.
+fn git_container(path: &Path, root: &Path) -> bool {
+    let Some(names) = names_below(path, root) else { return false };
+    let container = |name: &String| name == "modules" || name == "worktrees";
+    names.iter().enumerate().any(|(i, name)| {
+        if name != ".git" {
+            return false;
+        }
+        let rest = names.get(i.saturating_add(1)..).unwrap_or_default();
+        let Some(first) = rest.first() else { return false };
+        if container(first) && rest.len() <= 2 {
+            return true;
+        }
+        first == "modules"
+            && rest.iter().enumerate().skip(2).any(|(k, name)| {
+                container(name) && (rest.len() == k.saturating_add(1) || rest.len() == k.saturating_add(2))
+            })
+    })
+}
+
+/// Whether `path` has the shape the profile's third Git rule judges below the writable root `root`: a name below
+/// `.git/modules/<name>/`. Its regex, `^.*/.git/(modules/.+/)?modules/[^/]+/.+$`, matches exactly the paths with
+/// `modules` and at least two more components after a `.git` (the optional group adds nothing). The repositories
+/// found below a `modules` directory are excepted from it (`Sandbox::git_refused`).
+fn git_below_module(path: &Path, root: &Path) -> bool {
+    let Some(names) = names_below(path, root) else { return false };
+    names.iter().enumerate().any(|(i, name)| {
+        let rest = names.get(i.saturating_add(1)..).unwrap_or_default();
+        name == ".git" && rest.first().is_some_and(|first| first == "modules") && rest.len() >= 3
+    })
+}
+
+/// What `git_directories` found: every repository (sorted), and those of them that lie below a `modules`
+/// directory (sorted), which are the third Git rule's exceptions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct GitFound {
+    repos: Vec<PathBuf>,
+    modules: Vec<PathBuf>,
+}
+
+/// The directories in `dir`, found without following a link; none when `dir` is missing or is not a directory
+/// itself (a link to one is not entered).
+fn real_subdirs(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            out.push(entry.path());
+        }
+    }
+    Ok(out)
+}
+
+/// A repository: a regular file `HEAD` and an `objects` directory or a `commondir` file (none of them a link).
+fn is_repository(dir: &Path) -> bool {
+    let kind = |name: &str| std::fs::symlink_metadata(dir.join(name)).ok();
+    kind("HEAD").is_some_and(|m| m.is_file())
+        && (kind("objects").is_some_and(|m| m.is_dir()) || kind("commondir").is_some_and(|m| m.is_file()))
+}
+
+/// The text of a Git pointer file (`commondir`, `gitdir`, a `.git` file); `None` when it is missing or not a file.
+fn git_pointer(path: &Path) -> io::Result<Option<String>> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() && m.len() <= 4096 => Ok(Some(std::fs::read_to_string(path)?)),
+        Ok(m) if m.is_file() => Err(invalid(format!(
+            "Git metadata pointer {} is larger than 4096 bytes. Inspect it before starting a session.",
+            path.display()
+        ))),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Discover existing repositories without running host Git or following a link to a directory: every directory in
+/// the workspace that is a repository and holds no `.git` of its own (a bare one included; the search goes on below
+/// it, but not into its `objects`), every `.git` directory and
+/// the target of every `.git` file's `gitdir:` when that target is a repository; then, for each repository found, its
+/// `commondir` target (relative to it) when that is a repository, every directory in its `worktrees`, and every
+/// repository below its `modules` (searched in turn the same way; a directory there that is not one is searched
+/// further). Refuse an unreadable or oversized tree rather than silently leaving discovered metadata unprotected.
+fn git_directories(workspace: &Path) -> io::Result<GitFound> {
+    let canon = |p: &Path| resolve_path(p, true).map_err(invalid);
+    let unreadable = |dir: &Path, e: io::Error| {
+        invalid(format!(
+            "The workspace directory {} cannot be read ({e}). Make it readable, or choose a workspace without it, so \
+             that Git metadata can be protected.",
+            dir.display()
+        ))
     };
     let mut pending = vec![workspace.to_path_buf()];
-    let mut dirs = Vec::new();
+    let mut roots = Vec::new();
     let mut visited = 0_u64;
     while let Some(dir) = pending.pop() {
         visited = visited.saturating_add(1);
         if visited > 100_000 {
             return Err(invalid("The workspace has more than 100000 directories. Choose a smaller workspace so Git metadata can be protected.".to_string()));
         }
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let kind = entry.file_type()?;
-            if entry.file_name().to_string_lossy().eq_ignore_ascii_case(".git") {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&dir).map_err(|e| unreadable(&dir, e))? {
+            let entry = entry.map_err(|e| unreadable(&dir, e))?;
+            let kind = entry.file_type().map_err(|e| unreadable(&dir, e))?;
+            entries.push((entry.path(), entry.file_name(), kind));
+        }
+        // A directory that holds a `.git` entry is a working tree, whatever else a command made in it.
+        let has_git = entries.iter().any(|(_, name, _)| fold(&name.to_string_lossy()) == ".git");
+        let bare = !has_git && is_repository(&dir);
+        if bare {
+            push_unique(&mut roots, canon(&dir)?);
+        }
+        for (path, name, kind) in entries {
+            let name = name.to_string_lossy();
+            if fold(&name) == ".git" {
                 if path.is_dir() {
-                    push_unique(&mut dirs, canon(&path)?);
-                } else if let Some(text) = pointer(&path)? {
+                    push_unique(&mut roots, canon(&path)?);
+                } else if let Some(text) = git_pointer(&path)? {
                     if let Some(target) = text.trim().strip_prefix("gitdir:") {
-                        push_unique(&mut dirs, canon(&dir.join(target.trim()))?);
+                        let target = canon(&dir.join(target.trim()))?;
+                        if is_repository(&target) {
+                            push_unique(&mut roots, target);
+                        }
                     }
                 }
-            } else if kind.is_dir() {
+            } else if kind.is_dir() && !(bare && name == "objects") {
                 pending.push(path);
             }
         }
     }
-    let mut checked = BTreeSet::new();
-    let mut pending = dirs.clone();
-    while let Some(dir) = pending.pop() {
-        if !checked.insert(dir.clone()) {
-            continue;
-        }
-        if checked.len() > 4096 {
-            return Err(invalid("Git commondir pointers exceed 4096 directories. Inspect repository metadata before starting a session.".to_string()));
-        }
-        if let Some(text) = pointer(&dir.join("commondir"))? {
-            let path = canon(&dir.join(text.trim()))?;
-            push_unique(&mut dirs, path.clone());
-            pending.push(path);
+    git_expand(roots)
+}
+
+/// What lies around the repositories `roots`: for each, its `commondir` target (relative to it) when that is a
+/// repository, every directory in its `worktrees`, and every repository below its `modules` (searched in turn the
+/// same way; a directory there that is not one is searched further).
+fn git_expand(roots: Vec<PathBuf>) -> io::Result<GitFound> {
+    use std::collections::BTreeSet;
+    let canon = |p: &Path| resolve_path(p, true).map_err(invalid);
+    let too_many = || {
+        invalid(
+            "More than 4096 Git repositories and directories that hold them were found below the Git metadata. \
+             Inspect the repositories before starting a session."
+                .to_string(),
+        )
+    };
+    let mut repos = BTreeSet::new();
+    let mut modules = BTreeSet::new();
+    let mut other_dirs = 0_usize;
+    let mut pending = Vec::new();
+    for root in roots {
+        if repos.insert(root.clone()) {
+            pending.push(root);
         }
     }
-    dirs.sort();
-    Ok(dirs)
+    while let Some(dir) = pending.pop() {
+        let mut found = Vec::new();
+        if let Some(text) = git_pointer(&dir.join("commondir"))? {
+            let target = canon(&dir.join(text.trim()))?;
+            if is_repository(&target) {
+                found.push(target);
+            }
+        }
+        for worktree in real_subdirs(&dir.join("worktrees"))? {
+            found.push(canon(&worktree)?);
+        }
+        let mut walk = vec![dir.join("modules")];
+        while let Some(parent) = walk.pop() {
+            for child in real_subdirs(&parent)? {
+                if is_repository(&child) {
+                    let child = canon(&child)?;
+                    modules.insert(child.clone());
+                    found.push(child);
+                } else {
+                    other_dirs = other_dirs.saturating_add(1);
+                    walk.push(child);
+                }
+            }
+            if repos.len().saturating_add(other_dirs) > 4096 {
+                return Err(too_many());
+            }
+        }
+        for repo in found {
+            if repos.insert(repo.clone()) {
+                pending.push(repo);
+            }
+        }
+        if repos.len().saturating_add(other_dirs) > 4096 {
+            return Err(too_many());
+        }
+    }
+    Ok(GitFound { repos: repos.into_iter().collect(), modules: modules.into_iter().collect() })
+}
+
+/// A path that a Git configuration file names and Git reads or runs from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConfigPath {
+    /// `core.hooksPath`
+    HooksPath(String),
+    /// `include.path` or `includeIf.<condition>.path`, whatever the condition
+    Include(String),
+    /// `core.worktree`
+    WorkTree(String),
+}
+
+/// How long a configuration file this reading looks at can be; the rest of a longer one is not read.
+const CONFIG_READ_LIMIT: u64 = 1 << 20;
+
+/// How many files deep includes are followed (Git's own limit).
+const CONFIG_INCLUDE_DEPTH: usize = 10;
+
+/// The `core.hooksPath`, `include.path` and `includeIf.<condition>.path` values in the text of a Git configuration
+/// file, in order. Section and key names are compared without regard to case; a section is `[name]`,
+/// `[name "subsection"]` (backslash escapes the next character) or the old `[name.subsection]`; a value runs to the
+/// end of the line and is quoted in part or whole with `"`, with the escapes `\n`, `\t`, `\b`, `\\` and `\"`, ends at
+/// an unquoted `#` or `;`, loses its unquoted trailing white space, and goes on in the next line after a `\` at the
+/// end of a line. A key may follow a section header in the same line. A line that is none of these is skipped.
+fn config_paths(text: &str) -> Vec<ConfigPath> {
+    let mut chars = text.strip_prefix('\u{feff}').unwrap_or(text).chars().peekable();
+    let mut out = Vec::new();
+    // The section in force: its name and whether it has a subsection; `None` before the first header and after a
+    // header that could not be read.
+    let mut section: Option<(String, bool)> = None;
+    fn skip_line(chars: &mut std::iter::Peekable<std::str::Chars>) {
+        for c in chars.by_ref() {
+            if c == '\n' {
+                break;
+            }
+        }
+    }
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else if c == '#' || c == ';' {
+            skip_line(&mut chars);
+        } else if c == '[' {
+            chars.next();
+            section = config_header(&mut chars);
+            if section.is_none() {
+                skip_line(&mut chars);
+            }
+        } else if c.is_ascii_alphabetic() {
+            let mut key = String::new();
+            while let Some(&k) = chars.peek() {
+                if !(k.is_ascii_alphanumeric() || k == '-') {
+                    break;
+                }
+                key.push(k.to_ascii_lowercase());
+                chars.next();
+            }
+            while chars.next_if(|k| *k == ' ' || *k == '\t').is_some() {}
+            let value = if chars.next_if_eq(&'=').is_some() {
+                config_value(&mut chars)
+            } else {
+                // A key with no `=` has no value.
+                skip_line(&mut chars);
+                None
+            };
+            let Some(value) = value else { continue };
+            let Some((name, has_sub)) = &section else { continue };
+            match (name.as_str(), *has_sub, key.as_str()) {
+                ("core", false, "hookspath") => out.push(ConfigPath::HooksPath(value)),
+                ("core", false, "worktree") => out.push(ConfigPath::WorkTree(value)),
+                ("include", false, "path") | ("includeif", true, "path") => out.push(ConfigPath::Include(value)),
+                _ => {}
+            }
+        } else {
+            skip_line(&mut chars);
+        }
+    }
+    out
+}
+
+/// The section a header opens, after its `[`: its lower-case name and whether it has a subsection. `None` when the
+/// header is not one that can be read.
+fn config_header(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<(String, bool)> {
+    let mut name = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() || c == ']' || c == '"' || c == '\n' {
+            break;
+        }
+        name.push(c.to_ascii_lowercase());
+        chars.next();
+    }
+    if name.is_empty() {
+        return None;
+    }
+    let mut has_sub = false;
+    if chars.peek().is_some_and(|c| *c == ' ' || *c == '\t') {
+        while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+        chars.next_if_eq(&'"')?;
+        loop {
+            match chars.next()? {
+                '"' => break,
+                '\\' => {
+                    chars.next().filter(|c| *c != '\n')?;
+                }
+                '\n' => return None,
+                _ => {}
+            }
+        }
+        has_sub = true;
+    }
+    chars.next_if_eq(&']')?;
+    // The old form, `[section.subsection]`: the part after the first dot is a subsection.
+    match name.split_once('.') {
+        Some((section, _)) => Some((section.to_string(), true)),
+        None => Some((name, has_sub)),
+    }
+}
+
+/// The value after an `=`, up to the end of its line; `None` for one that cannot be read (the rest of its line is
+/// skipped).
+fn config_value(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
+    while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+    let mut out = String::new();
+    // How much of `out` stays: trailing white space that is not quoted does not.
+    let mut keep = 0_usize;
+    let mut quoted = false;
+    let mut bad = false;
+    loop {
+        match chars.next() {
+            None | Some('\n') => {
+                bad |= quoted;
+                break;
+            }
+            Some('\\') => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('b') => out.push('\u{8}'),
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some('\n') => continue,
+                Some('\r') if chars.next_if_eq(&'\n').is_some() => continue,
+                _ => {
+                    bad = true;
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                    }
+                    break;
+                }
+            },
+            Some('"') => {
+                quoted = !quoted;
+                keep = out.len();
+                continue;
+            }
+            Some('#' | ';') if !quoted => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        break;
+                    }
+                }
+                break;
+            }
+            Some(c) => {
+                out.push(c);
+                if quoted || !c.is_whitespace() {
+                    keep = out.len();
+                }
+                continue;
+            }
+        }
+        keep = out.len();
+    }
+    if bad {
+        return None;
+    }
+    out.truncate(keep);
+    Some(out)
+}
+
+/// The text of a configuration file, when it is a regular file; at most `CONFIG_READ_LIMIT` bytes of it.
+fn read_config(path: &Path) -> Option<String> {
+    use std::io::Read;
+    std::fs::metadata(path).ok().filter(|m| m.is_file())?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).ok()?.take(CONFIG_READ_LIMIT).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The home directory of the user `name`, from the user database; `None` for a user that is not known.
+fn user_home(name: &str) -> Option<PathBuf> {
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    let name = CString::new(name).ok()?;
+    let mut size = 1024_usize;
+    loop {
+        let mut buf: Vec<libc::c_char> = vec![0; size];
+        // SAFETY: an all-zero `passwd` (null pointers, zero numbers) is a valid value; `getpwnam_r` fills it in.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `name` is a NUL-terminated string, `pwd` and `result` are valid for writes, and `buf` is valid for
+        // `buf.len()` bytes; on success the strings in `pwd` point into `buf`, which outlives their use below.
+        let rc = unsafe { libc::getpwnam_r(name.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+        if rc == libc::ERANGE && size < (1 << 20) {
+            size = size.saturating_mul(2);
+            continue;
+        }
+        if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: `pw_dir` is non-null and points to a NUL-terminated string inside `buf`.
+        let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
+        let dir = Path::new(OsStr::from_bytes(dir.to_bytes()));
+        return dir.is_absolute().then(|| dir.to_path_buf());
+    }
+}
+
+/// A path as a configuration names it: `~/` is the home directory, `~<user>/` that user's (a user that is not
+/// known gives no path, never a relative one), any other relative one is taken from `base`.
+fn config_value_path(value: &str, home: Option<&Path>, base: &Path) -> Option<PathBuf> {
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(tilde) = value.strip_prefix('~') {
+        let (user, rest) = match tilde.split_once('/') {
+            Some((user, rest)) => (user, Some(rest)),
+            None => (tilde, None),
+        };
+        let dir = if user.is_empty() { home.map(Path::to_path_buf) } else { user_home(user) }?;
+        return Some(match rest {
+            Some(rest) => dir.join(rest),
+            None => dir,
+        });
+    }
+    let path = Path::new(value);
+    Some(if path.is_absolute() { path.to_path_buf() } else { base.join(path) })
+}
+
+/// What the configuration files read from one starting point name.
+#[derive(Debug, Default)]
+struct ConfigFacts {
+    /// The raw `core.hooksPath` values.
+    hooks: Vec<String>,
+    /// The files included, as written (absolute).
+    includes: Vec<PathBuf>,
+    /// The raw `core.worktree` values.
+    worktrees: Vec<String>,
+}
+
+/// Read `files` and, in turn, the files they include (conditions ignored), each file once and at most
+/// `CONFIG_INCLUDE_DEPTH` files deep.
+fn read_config_files(files: &[PathBuf], home: Option<&Path>) -> ConfigFacts {
+    fn follow(file: &Path, depth: usize, home: Option<&Path>, seen: &mut Vec<PathBuf>, facts: &mut ConfigFacts) {
+        let key = resolve_path(file, true).unwrap_or_else(|_| file.to_path_buf());
+        if seen.contains(&key) {
+            return;
+        }
+        seen.push(key);
+        let Some(text) = read_config(file) else { return };
+        let dir = file.parent().unwrap_or(Path::new("/"));
+        for item in config_paths(&text) {
+            match item {
+                ConfigPath::HooksPath(value) => facts.hooks.push(value),
+                ConfigPath::WorkTree(value) => facts.worktrees.push(value),
+                ConfigPath::Include(value) => {
+                    let Some(target) = config_value_path(&value, home, dir) else { continue };
+                    push_unique(&mut facts.includes, target.clone());
+                    if depth < CONFIG_INCLUDE_DEPTH {
+                        follow(&target, depth.saturating_add(1), home, seen, facts);
+                    }
+                }
+            }
+        }
+    }
+    let mut facts = ConfigFacts::default();
+    let mut seen = Vec::new();
+    for file in files {
+        follow(file, 0, home, &mut seen, &mut facts);
+    }
+    facts
+}
+
+/// The tops of the working trees the repository `repo` may serve: the repository itself (what a relative path is
+/// joined to for a bare one), the parent of a `.git` directory, the working tree a linked worktree's private gitdir
+/// names in its `gitdir` file, and each `core.worktree` (`worktrees`, as its configuration wrote them), resolved
+/// from the repository.
+fn work_tree_tops(repo: &Path, worktrees: &[String]) -> Vec<PathBuf> {
+    let is_dot_git = |p: &Path| p.file_name().is_some_and(|n| fold(&n.to_string_lossy()) == ".git");
+    let mut tops = vec![repo.to_path_buf()];
+    if is_dot_git(repo) {
+        push_unique(&mut tops, repo.parent().unwrap_or(repo).to_path_buf());
+    }
+    if std::fs::metadata(repo.join("commondir")).is_ok_and(|m| m.is_file()) {
+        let small = std::fs::metadata(repo.join("gitdir")).is_ok_and(|m| m.is_file() && m.len() <= 4096);
+        let text = if small { std::fs::read_to_string(repo.join("gitdir")).ok() } else { None };
+        if let Some(file) = text.map(|t| repo.join(t.trim())).filter(|f| is_dot_git(f)) {
+            push_unique(&mut tops, file.parent().unwrap_or(repo).to_path_buf());
+        }
+    }
+    for value in worktrees {
+        if let Some(top) = config_value_path(value, None, repo).and_then(|p| resolve_path(&p, true).ok()) {
+            push_unique(&mut tops, top);
+        }
+    }
+    tops
+}
+
+/// The repository Git finds when it looks up from the workspace's parent for a `.git` (a directory that is a
+/// repository, or a file whose `gitdir:` names one), with the repository its `commondir` names; empty when there is
+/// none, and the directory that holds the `.git` (a top its working tree may have). Nothing is protected for it
+/// unless it lies in a writable root; its configuration is read.
+fn enclosing_repositories(workspace: &Path) -> (Vec<PathBuf>, Option<PathBuf>) {
+    let mut dir = workspace.parent();
+    while let Some(d) = dir {
+        let dot_git = d.join(".git");
+        let repo = match std::fs::symlink_metadata(&dot_git) {
+            Ok(m) if m.is_dir() => Some(dot_git.clone()),
+            Ok(m) if m.is_file() && m.len() <= 4096 => std::fs::read_to_string(&dot_git)
+                .ok()
+                .and_then(|t| t.trim().strip_prefix("gitdir:").map(|t| d.join(t.trim()))),
+            _ => None,
+        };
+        if let Some(repo) = repo.and_then(|r| resolve_path(&r, true).ok()).filter(|r| is_repository(r)) {
+            let mut out = vec![repo.clone()];
+            if let Ok(Some(text)) = git_pointer(&repo.join("commondir")) {
+                if let Ok(common) = resolve_path(&repo.join(text.trim()), true) {
+                    if is_repository(&common) {
+                        out.push(common);
+                    }
+                }
+            }
+            return (out, Some(d.to_path_buf()));
+        }
+        dir = d.parent();
+    }
+    (Vec::new(), None)
+}
+
+/// The paths the Git configuration names that must not be written, as written (absolute; each is protected when it
+/// lies in a writable root): the hooks directory (`core.hooksPath`) and the files included (`include.path`,
+/// `includeIf.<condition>.path`) by the `config` and `config.worktree` of every repository in `repos` and `others`
+/// (the enclosing repository, whose own files are not protected here) and by the user's global configuration, and
+/// that configuration itself, `~/.gitconfig` and the `git` directory of the XDG configuration
+/// (`$XDG_CONFIG_HOME/git`, else `~/.config/git`). A relative hooks path, wherever it was read, is taken from the top
+/// of every working tree found (`work_tree_tops`), as one configuration serves several; a relative include from the
+/// directory of the file that names it.
+fn git_config_paths(
+    repos: &[PathBuf],
+    others: &[PathBuf],
+    extra_tops: &[PathBuf],
+    home: Option<&Path>,
+    xdg: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut global_files = Vec::new();
+    if let Some(home) = home {
+        global_files.push(home.join(".gitconfig"));
+        out.push(home.join(".gitconfig"));
+    }
+    let xdg_dir = match xdg {
+        Some(x) if x.is_absolute() => Some(x.join("git")),
+        _ => home.map(|h| h.join(".config/git")),
+    };
+    if let Some(dir) = xdg_dir {
+        global_files.push(dir.join("config"));
+        out.push(dir);
+    }
+    let global = read_config_files(&global_files, home);
+    out.extend(global.includes.iter().cloned());
+    let mut hooks: Vec<String> = Vec::new();
+    let mut tops: Vec<PathBuf> = extra_tops.to_vec();
+    for repo in repos.iter().chain(others) {
+        let facts = read_config_files(&[repo.join("config"), repo.join("config.worktree")], home);
+        out.extend(facts.includes);
+        for value in facts.hooks {
+            push_unique(&mut hooks, value);
+        }
+        for top in work_tree_tops(repo, &facts.worktrees) {
+            push_unique(&mut tops, top);
+        }
+    }
+    for value in global.hooks {
+        push_unique(&mut hooks, value);
+    }
+    for value in &hooks {
+        if value.starts_with('~') || Path::new(value).is_absolute() {
+            out.extend(config_value_path(value, home, Path::new("/")));
+            continue;
+        }
+        for top in &tops {
+            out.extend(config_value_path(value, home, top));
+        }
+    }
+    out
+}
+
+/// The repositories `found` that are given to Bubblewrap as a whole: all but those that are or contain the loom home
+/// or the user's home directory, and those that lie inside the loom home, or inside the user's home while
+/// credentials are protected (`hidden_home`), unless they lie in a writable root: a pointer could name one to mount
+/// back what Bubblewrap hides there.
+fn mountable(
+    found: &[PathBuf],
+    loom_home: &Path,
+    home: Option<&Path>,
+    hidden_home: bool,
+    writable: &[PathBuf],
+) -> Vec<PathBuf> {
+    let holds = |repo: &Path| under(loom_home, repo) || home.is_some_and(|h| under(h, repo));
+    let hidden = |repo: &Path| {
+        (under(repo, loom_home) || (hidden_home && home.is_some_and(|h| under(repo, h))))
+            && !writable.iter().any(|root| under(repo, root))
+    };
+    found.iter().filter(|repo| !holds(repo) && !hidden(repo)).cloned().collect()
 }
 
 /// macOS names the folders of the data volume `/System/Volumes/Data/...` as well, and `realpath` keeps that
@@ -624,14 +1513,15 @@ impl Sandbox {
         loom_home: &Path,
         proxy_port: Option<u16>,
     ) -> io::Result<Sandbox> {
-        let home = match std::env::var_os("HOME") {
-            Some(h) if !h.is_empty() => Some(PathBuf::from(h)),
+        let var = |name: &str| match std::env::var_os(name) {
+            Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
             _ => None,
         };
-        Self::with_home(cfg, workspace, tmp_dir, loom_home, proxy_port, home)
+        Self::with_env(cfg, workspace, tmp_dir, loom_home, proxy_port, var("HOME"), var("XDG_CONFIG_HOME"))
     }
 
-    /// `new` with the user's home directory given instead of read from `HOME`.
+    /// `new` with the user's home directory given instead of read from `HOME`, and no `XDG_CONFIG_HOME`.
+    #[cfg(test)]
     pub(crate) fn with_home(
         cfg: &SandboxCfg,
         workspace: &Path,
@@ -639,6 +1529,19 @@ impl Sandbox {
         loom_home: &Path,
         proxy_port: Option<u16>,
         home: Option<PathBuf>,
+    ) -> io::Result<Sandbox> {
+        Self::with_env(cfg, workspace, tmp_dir, loom_home, proxy_port, home, None)
+    }
+
+    /// `new` with the user's home directory and `XDG_CONFIG_HOME` given instead of read from the environment.
+    pub(crate) fn with_env(
+        cfg: &SandboxCfg,
+        workspace: &Path,
+        tmp_dir: &Path,
+        loom_home: &Path,
+        proxy_port: Option<u16>,
+        home: Option<PathBuf>,
+        xdg_config_home: Option<PathBuf>,
     ) -> io::Result<Sandbox> {
         let canon = |p: &Path| resolve_path(p, true).map_err(invalid);
         let workspace = canon(workspace)?;
@@ -696,14 +1599,39 @@ impl Sandbox {
             }
         }
 
-        let git_dirs = git_directories(&workspace)?;
+        let GitFound { repos: mut found, modules: mut git_modules } = git_directories(&workspace)?;
+        // The repository that encloses the workspace: its configuration is read; its own files are protected only
+        // where it lies in a writable root.
+        let (mut enclosing, enclosing_top) = enclosing_repositories(&workspace);
+        if enclosing.iter().any(|repo| writable.iter().any(|root| under(repo, root))) {
+            let more = git_expand(std::mem::take(&mut enclosing))?;
+            for repo in more.repos {
+                push_unique(&mut found, repo);
+            }
+            for repo in more.modules {
+                push_unique(&mut git_modules, repo);
+            }
+            found.sort();
+            git_modules.sort();
+        }
+        let git_dirs = mountable(&found, &loom_home, home.as_deref(), cfg.protect_credentials, &writable);
         let mut protected = vec![canon(&workspace.join(".loom"))?, loom_home.clone()];
         push_unique(&mut protected, workspace.join(".loom"));
-        for dir in &git_dirs {
-            for name in ["config", "config.worktree", "hooks", "commondir", "gitdir"] {
+        for dir in &found {
+            for name in GIT_PRIVATE {
                 let path = dir.join(name);
                 push_unique(&mut protected, canon(&path)?);
                 push_unique(&mut protected, path);
+            }
+        }
+        // What a configuration makes Git run or read: the hooks directory and the files it includes.
+        for path in
+            git_config_paths(&found, &enclosing, enclosing_top.as_slice(), home.as_deref(), xdg_config_home.as_deref())
+        {
+            for form in [Some(canon(&path)?), lexical(&path)].into_iter().flatten() {
+                if writable.iter().any(|root| under(&form, root)) {
+                    push_unique(&mut protected, form);
+                }
             }
         }
         for p in &cfg.protected_paths {
@@ -791,7 +1719,15 @@ impl Sandbox {
             Vec::new()
         };
         // Every path that can reach a profile must be writable as a literal, whatever the mode.
-        for p in writable.iter().chain(&protected).chain(&unreadable).chain(&credentials).chain(&unix_sockets) {
+        let git_paths = git_dirs.iter().chain(&git_modules);
+        for p in writable
+            .iter()
+            .chain(&protected)
+            .chain(&unreadable)
+            .chain(&credentials)
+            .chain(&unix_sockets)
+            .chain(git_paths)
+        {
             sbpl(p)?;
         }
         let analysis_dir = tmp_dir.parent().map(|p| p.join("analysis")).unwrap_or_default();
@@ -800,6 +1736,7 @@ impl Sandbox {
             linux_filter,
             linux_pins,
             git_dirs,
+            git_modules,
             workspace,
             loom_home,
             oracle_staging_root,
@@ -815,6 +1752,8 @@ impl Sandbox {
             credentials,
             loopback_ports,
             loopback_all: cfg.loopback_all,
+            daemon_port: cfg.daemon_port,
+            network_deny_all: cfg.network_deny_all,
             unix_sockets,
             env_pass: cfg.env_pass.clone(),
             secret_env: cfg.secret_env.clone(),
@@ -924,8 +1863,16 @@ impl Sandbox {
         let secrets = workspace.join(".loom/oracle-secrets");
         push_unique(&mut replay.unreadable, resolve_path(&secrets, true)?);
         push_unique(&mut replay.unreadable, secrets);
-        replay.git_dirs = git_directories(&workspace)
+        let found = git_directories(&workspace)
             .map_err(|e| format!("Replay Git metadata cannot be protected: {e}. Inspect the staged workspace."))?;
+        replay.git_dirs = mountable(
+            &found.repos,
+            &self.loom_home,
+            self.home.as_deref(),
+            !self.credentials.is_empty(),
+            &replay.writable,
+        );
+        replay.git_modules = found.modules;
         if replay.mode == SandboxMode::Bubblewrap {
             replay.linux_pins = linux::pin(
                 &replay.writable,
@@ -955,24 +1902,6 @@ impl Sandbox {
         if !self.protected.is_empty() {
             out.push_str(&format!("(deny file-write*{})\n", subpaths(&self.protected)));
         }
-        // New nested Git metadata is covered too, even when it did not exist at construction.
-        let names = ["config", "config.worktree", "hooks", "commondir", "gitdir"]
-            .map(|name| {
-                name.chars()
-                    .map(|c| {
-                        if c.is_ascii_alphabetic() {
-                            format!("[{}{}]", c, c.to_ascii_uppercase())
-                        } else {
-                            "[.]".to_string()
-                        }
-                    })
-                    .collect::<String>()
-            })
-            .join("|");
-        let git = format!("^.*/[.][gG][iI][tT](/({names})(/.*)?)?$");
-        if let Ok(ws) = sbpl(&self.workspace) {
-            out.push_str(&format!("(deny file-write* (require-all (subpath \"{ws}\") (regex #\"{git}\")))\n"));
-        }
         // The session temp dir may lie inside a protected directory; this later rule wins. The directory
         // entry itself cannot be removed, renamed, replaced, or made anew once gone, so the next activation
         // of the session follows no link put there; a write deny would also make it test as unwritable.
@@ -985,6 +1914,7 @@ impl Sandbox {
         if !inside_tmp.is_empty() {
             out.push_str(&format!("(deny file-write*{})\n", subpaths(&inside_tmp)));
         }
+        out.push_str(&self.git_rules(&subpaths));
         // What cannot be read cannot be written, renamed or removed either: moved, it could be read
         // under another name.
         let unreadable: Vec<PathBuf> = self.unreadable.iter().chain(&self.credentials).cloned().collect();
@@ -1060,8 +1990,22 @@ impl Sandbox {
         // launchd a job, runs code outside the sandbox.
         // `searchfs(2)` finds files by name across a volume, the home's among them.
         out.push_str("(deny lsopen)\n(deny appleevent-send)\n(deny job-creation)\n(deny file-search)\n");
+        // A file system mounted over a directory (a disk image attached over `.git/hooks` or `~/.ssh`) escapes
+        // every path rule; DiskArbitration and the disk-image services mount for a process outside its sandbox;
+        // `cfprefsd` writes `~/Library/Preferences` for one.
+        out.push_str(
+            "(deny file-mount)\n(deny user-preference-write)\n\
+             (deny mach-lookup (global-name \"com.apple.DiskArbitration.diskarbitrationd\") \
+             (global-name \"com.apple.diskimagesiod\") (global-name \"com.apple.diskimagesiod.ram\") \
+             (global-name \"com.apple.diskmanagementd\"))\n",
+        );
         out.push_str("(deny network*)\n");
-        if self.loopback_all {
+        if self.loopback_all && self.daemon_port.is_some() {
+            // A later deny of one port is not reliable after an allow of `(remote ip "localhost:*")`: probed on
+            // macOS 27, about two ports in five are still connectable. After an allow written for TCP and UDP it
+            // holds for every port tried.
+            out.push_str("(allow network-outbound (remote tcp \"localhost:*\") (remote udp \"localhost:*\"))\n");
+        } else if self.loopback_all {
             out.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
         } else {
             for p in &self.loopback_ports {
@@ -1071,9 +2015,57 @@ impl Sandbox {
         for s in self.unix_sockets.iter().filter_map(|p| sbpl(p).ok()) {
             out.push_str(&format!("(allow network-outbound (remote unix-socket (path-literal \"{s}\")))\n"));
         }
+        // After the allows, and written `*:<port>`: Seatbelt counts the host's own addresses as loopback, so the
+        // deny names every address.
+        if let Some(port) = self.daemon_port {
+            out.push_str(&format!("(deny network-outbound (remote ip \"*:{port}\"))\n"));
+        }
         out.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
         out.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
+        // Certificate evaluation fetches the issuer a certificate names through these services, outside the
+        // sandbox; without them it fails closed. Background URL sessions and WebKit fetch a URL the same way.
+        if self.network_deny_all {
+            out.push_str(
+                "(deny mach-lookup (global-name \"com.apple.trustd.agent\") (global-name \"com.apple.trustd\") \
+                 (global-name \"com.apple.ocspd\") (global-name \"com.apple.nsurlsessiond\") \
+                 (global-name \"com.apple.nsurlsessiond.NSURLSessionProxyService\") \
+                 (xpc-service-name-prefix \"com.apple.WebKit.\"))\n",
+            );
+        }
         Some(out)
+    }
+
+    /// The Git rules of the profile, which must come after every allow and deny that concerns the session temp
+    /// dir (the last matching rule wins): they hold in every writable root, the temp dir included. Every letter
+    /// of a name is a class of both cases and of what the volume folds to it (`fold_regex`); `subpaths` writes
+    /// ` (subpath "<path>")` for each of a list.
+    fn git_rules(&self, subpaths: &dyn Fn(&[PathBuf]) -> String) -> String {
+        let (git, worktrees, modules) = (fold_regex(".git"), fold_regex("worktrees"), fold_regex("modules"));
+        let names = GIT_PRIVATE.map(fold_regex).join("|");
+        let roots = format!("(require-any{})", subpaths(&self.writable));
+        let mut out = format!(
+            "(deny file-write* (require-all {roots} (regex #\"^.*/{git}(/(({worktrees}/[^/]+|{modules}/(.+/)?[^/]+)/)?({names})(/.*)?)?$\")))\n\
+             (deny file-write-create file-write-unlink (require-all {roots} (regex #\"^.*/{git}/({modules}/.+/)?({modules}|{worktrees})(/[^/]+)?$\")))\n"
+        );
+        // What a directory moved below `.git/modules/<name>/` holds is judged by no rule: nothing can be made or
+        // removed there but inside the repositories found below a `modules` directory (and in those only outside
+        // their own `modules` and `worktrees`, which the rules above and this one cover in turn).
+        let inside: String = self
+            .git_modules
+            .iter()
+            .filter_map(|r| sbpl(r).ok())
+            .map(|r| {
+                format!(
+                    " (require-not (require-all (subpath \"{r}\") (require-not (subpath \"{r}/modules\")) \
+                     (require-not (subpath \"{r}/worktrees\"))))"
+                )
+            })
+            .collect();
+        out.push_str(&format!(
+            "(deny file-write-create file-write-unlink (require-all {roots} \
+             (regex #\"^.*/{git}/({modules}/.+/)?{modules}/[^/]+/.+$\"){inside}))\n"
+        ));
+        out
     }
 
     /// What is readable inside the loom home: the session temp dir and the analysis staging dir, or in a replay its
@@ -1188,10 +2180,34 @@ impl Sandbox {
         Ok(r)
     }
 
+    /// Whether the Git rules of the policy refuse `path`, as the profile does: each is judged relative to the
+    /// writable root `path` lies in (the workspace when it lies in none), and every write counts as making the
+    /// entry, as the file tools write by renaming a new file into place.
+    fn git_refused(&self, path: &Path) -> bool {
+        let mut roots: Vec<&Path> = self.writable.iter().map(PathBuf::as_path).filter(|w| under(path, w)).collect();
+        if roots.is_empty() {
+            roots.push(&self.workspace);
+        }
+        let inside_found = || {
+            self.git_modules.iter().any(|repo| {
+                under(path, repo) && !under(path, &repo.join("modules")) && !under(path, &repo.join("worktrees"))
+            })
+        };
+        roots.iter().any(|root| git_metadata(path, root) || git_container(path, root))
+            || (roots.iter().any(|root| git_below_module(path, root)) && !inside_found())
+    }
+
     pub fn check_write(&self, path: &Path) -> Result<PathBuf, String> {
         let r = self.resolved(path)?;
-        if git_metadata(&r, &self.workspace) || git_metadata(path, &self.workspace) {
-            return Err(format!("{} is Git configuration or hooks metadata, protected from writes. Ask the operator to change repository configuration outside the session.", path.display()));
+        if self.git_refused(&r) || self.git_refused(path) {
+            return Err(format!(
+                "{} is Git metadata, which commands and file tools may not write or create anywhere they write, because \
+                 Git could run what it holds as the operator. Ask the operator to change repository configuration, to \
+                 add a worktree (`git worktree add`) or to set up a submodule (`git submodule update --init`). A \
+                 repository of your own can be cloned bare, `git clone --bare <url> <dir>.git`, and used with \
+                 `git --git-dir=<dir>.git --work-tree=<dir>`.",
+                path.display()
+            ));
         }
         if self.mode == SandboxMode::Bubblewrap && self.git_dirs.iter().any(|dir| under(&r, dir)) {
             return Err(format!("{} is in Git metadata mounted read-only by Bubblewrap. Ask the operator to update Git metadata outside the session.", r.display()));
@@ -1341,6 +2357,21 @@ impl Sandbox {
         if self.mode == SandboxMode::Bubblewrap {
             return format!("Commands run in Linux bubblewrap with a read-only host filesystem, writable roots {}, a private /tmp, and all socket creation/connections denied. Protected paths {protected} and discovered Git metadata remain read-only; credential paths are hidden. {own}{exception} New Git repositories must be created by the operator outside the session. File tools additionally refuse Git config and hook writes.", join_list(&self.writable));
         }
+        let git = " No Git repository can be made where commands write, and no Git configuration, hooks, worktree or \
+                   submodule repository can be written or moved into place: ask the operator to run `git worktree add` \
+                   or `git submodule update --init`. A bare clone works (`git clone --bare <url> <dir>.git`, used with \
+                   `git --git-dir=<dir>.git --work-tree=<dir>`). `git submodule update` (any form) is the operator's, \
+                   upstream tracking (`git branch --set-upstream-to`, `git switch -c <b> <remote>/<b>`) cannot be \
+                   recorded, dependencies from Git URLs (pip, npm, cargo, uv) cannot be installed (an archive URL \
+                   can), disk images cannot be mounted (extract them instead) and preferences cannot be written \
+                   (`defaults write`).";
+        let certificates = if self.network_deny_all {
+            " Programs that check certificates through macOS (Swift and Go programs, `security`, `codesign --verify`) \
+              fail here; curl and Python use their own certificate files and are not affected. WebKit-based tools and \
+              background URL sessions fail here too."
+        } else {
+            ""
+        };
         let ports = if self.loopback_all {
             "any loopback port".to_string()
         } else if self.loopback_ports.is_empty() {
@@ -1355,8 +2386,8 @@ impl Sandbox {
         };
         format!(
             "Commands and file tools may write only under {}; writes under {protected} are refused even there.{exception} \
-             {unreadable} cannot be read or written. {own}{credentials} \
-             Direct network access is blocked except connections to {ports}{sockets}; reach other hosts through the proxy named in the environment, if there is one.",
+             {unreadable} cannot be read or written. {own}{credentials}{git} \
+             Direct network access is blocked except connections to {ports}{sockets}; reach other hosts through the proxy named in the environment, if there is one.{certificates}",
             join_list(&self.writable)
         )
     }
@@ -1403,6 +2434,45 @@ mod tests {
         Sandbox::with_home(c, &f.ws, &f.tmp, &f.home, None, Some(fake_home.to_path_buf())).expect("sandbox")
     }
 
+    // The Git rules' names, written out: a letter is a class of both cases, and where the volume folds other
+    // characters to it (the long s, the Kelvin sign U+212A, the `fi` ligature) an alternation that adds them.
+    const G: &str = "[.][gG][iI][tT]";
+    const WT: &str = "[wW][oO][rR](k|K|\u{212a})[tT][rR][eE][eE](s|S|\u{17f})";
+    const MO: &str = "[mM][oO][dD][uU][lL][eE](s|S|\u{17f})";
+    const NAMES: &str = "[cC][oO][nN]([fF][iI]|\u{fb01})[gG]|\
+                         [cC][oO][nN]([fF][iI]|\u{fb01})[gG][.][wW][oO][rR](k|K|\u{212a})[tT][rR][eE][eE]|\
+                         [hH][oO][oO](k|K|\u{212a})(s|S|\u{17f})|[cC][oO][mM][mM][oO][nN][dD][iI][rR]|[gG][iI][tT][dD][iI][rR]";
+
+    /// The three Git rules over the writable roots `roots` (each written ` (subpath "…")`); `found` is the
+    /// text of the third rule's exceptions, one for each repository found below a `modules` directory.
+    fn git_lines_with(roots: &str, found: &str) -> String {
+        format!(
+            "(deny file-write* (require-all (require-any{roots}) (regex #\"^.*/{G}(/(({WT}/[^/]+|{MO}/(.+/)?[^/]+)/)?({NAMES})(/.*)?)?$\")))\n\
+             (deny file-write-create file-write-unlink (require-all (require-any{roots}) (regex #\"^.*/{G}/({MO}/.+/)?({MO}|{WT})(/[^/]+)?$\")))\n\
+             (deny file-write-create file-write-unlink (require-all (require-any{roots}) (regex #\"^.*/{G}/({MO}/.+/)?{MO}/[^/]+/.+$\"){found}))\n"
+        )
+    }
+
+    /// The same with no repository found below a `modules` directory.
+    fn git_lines(roots: &str) -> String {
+        git_lines_with(roots, "")
+    }
+
+    /// The exception the third rule makes for the repository `dir`.
+    fn git_exception(dir: &Path) -> String {
+        let d = s(dir);
+        format!(
+            " (require-not (require-all (subpath \"{d}\") (require-not (subpath \"{d}/modules\")) (require-not (subpath \"{d}/worktrees\"))))"
+        )
+    }
+
+    /// The rules after `(deny file-search)` that every profile has.
+    const MOUNT_LINES: &str = "(deny file-mount)\n(deny user-preference-write)\n\
+         (deny mach-lookup (global-name \"com.apple.DiskArbitration.diskarbitrationd\") (global-name \"com.apple.diskimagesiod\") (global-name \"com.apple.diskimagesiod.ram\") (global-name \"com.apple.diskmanagementd\"))\n";
+
+    /// The `mach-lookup` deny that only `network_deny_all` adds.
+    const FETCH_SERVICES: &str = "(deny mach-lookup (global-name \"com.apple.trustd.agent\") (global-name \"com.apple.trustd\") (global-name \"com.apple.ocspd\") (global-name \"com.apple.nsurlsessiond\") (global-name \"com.apple.nsurlsessiond.NSURLSessionProxyService\") (xpc-service-name-prefix \"com.apple.WebKit.\"))\n";
+
     fn cfg(mode: SandboxMode) -> SandboxCfg {
         SandboxCfg { mode, ..SandboxCfg::default() }
     }
@@ -1434,21 +2504,26 @@ mod tests {
         let mut holders: Vec<&Path> = f.ws.ancestors().filter(|a| *a == f.ws).collect();
         holders.reverse();
         let holders: String = holders.iter().map(|a| format!(" (literal \"{}\")", s(a))).collect();
+        let git = git_lines(&format!(" (subpath \"{r}/ws\") (subpath \"{r}/tmp\") (subpath \"{r}/extra\")"));
+        let rx = regex_literal(&f.root).expect("regex-safe path");
         let expected = format!(
             "(version 1)\n(allow default)\n(deny signal)\n(allow signal (target same-sandbox))\n(deny file-write*)\n\
              (allow file-write* (subpath \"{r}/ws\") (subpath \"{r}/tmp\") (subpath \"{r}/extra\") (literal \"/dev/null\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\"))\n\
              (deny file-write* (subpath \"{r}/ws/.loom\") (subpath \"{r}/home\") (subpath \"{r}/ws/secrets\"))\n\
              (allow file-write* (subpath \"{r}/tmp\"))\n\
              (deny file-write-unlink file-write-create (literal \"{r}/tmp\"))\n\
+             {git}\
              (deny file-write* (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\") (subpath \"{r}/ws/.loom/oracle-secrets\") (subpath \"{r}/hidden\"))\n\
              (deny file-read* file-test-existence (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\") (subpath \"{r}/ws/.loom/oracle-secrets\") (subpath \"{r}/hidden\"))\n\
              (deny file-read* file-test-existence (subpath \"{r}/home\"))\n\
              (allow file-read-metadata file-test-existence (literal \"{r}/home\"))\n\
+             (allow file-test-existence (regex #\"^{rx}/home/[^/]+$\") (regex #\"^{rx}/home/node_modules/\"))\n\
              (allow file-read* file-test-existence (subpath \"{r}/tmp\"))\n\
              (deny file-read* file-test-existence (subpath \"{r}/home/token\") (subpath \"{r}/home/keys\"))\n\
              (deny file-write-unlink{holders})\n\
              (deny file-write-create (require-all (vnode-type SYMLINK) (require-any{holders})))\n\
              (deny lsopen)\n(deny appleevent-send)\n(deny job-creation)\n(deny file-search)\n\
+             {MOUNT_LINES}\
              (deny network*)\n\
              (allow network-outbound (remote ip \"localhost:8080\"))\n\
              (allow network-outbound (remote ip \"localhost:9000\"))\n\
@@ -1457,9 +2532,9 @@ mod tests {
              (allow network-inbound (local ip \"localhost:*\"))\n"
         );
         let actual = sb.profile().expect("profile");
-        let without_git: String =
-            actual.lines().filter(|line| !line.contains("(regex #")).map(|line| format!("{line}\n")).collect();
-        assert_eq!(without_git, expected);
+        assert_eq!(actual, expected);
+        // Neither the daemon port nor the certificate services are mentioned unless the configuration says so.
+        assert!(!actual.contains(FETCH_SERVICES) && !actual.contains("network-outbound (remote ip \"*:"));
         let (prog, args) = sb.command("echo hi");
         assert_eq!(prog, "/usr/bin/sandbox-exec");
         assert_eq!(args[0], "-p");
@@ -2292,6 +3367,9 @@ mod tests {
         std::fs::create_dir_all(common.join("hooks")).unwrap();
         std::fs::write(f.ws.join(".git"), "gitdir: metadata/worktrees/one\n").unwrap();
         std::fs::write(worktree.join("commondir"), "../..\n").unwrap();
+        std::fs::write(worktree.join("HEAD"), "ref: refs/heads/one\n").unwrap();
+        std::fs::create_dir_all(common.join("objects")).unwrap();
+        std::fs::write(common.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(common.join("config"), "original").unwrap();
         let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
         for root in [&worktree, &common] {
@@ -3336,5 +4414,1979 @@ mod tests {
         let (ok, text) = run(&build(&f, &cfg(SandboxMode::None), None), &f.ws, &format!("kill -9 {pid}"));
         assert!(ok, "{text}");
         let _ = other.wait();
+    }
+
+    // ---- Git metadata ----
+
+    /// Runs `git` in `dir` as the operator would, with no global configuration; whether it succeeded.
+    fn git_ok(dir: &Path, args: &[&str]) -> bool {
+        let mut git = Command::new("git");
+        git.args(["-c", "protocol.file.allow=always"]).args(args).current_dir(dir);
+        for (name, value) in GIT_ENV {
+            git.env(name, value);
+        }
+        for name in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+            git.env_remove(name);
+        }
+        git.output().is_ok_and(|o| o.status.success())
+    }
+
+    const GIT_ENV: [(&str, &str); 7] = [
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@t"),
+        ("GIT_COMMITTER_NAME", "t"),
+        ("GIT_COMMITTER_EMAIL", "t@t"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+    ];
+
+    /// The same environment for a script run under the profile.
+    const GIT_SH: &str =
+        "export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t \
+                          GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t GIT_TERMINAL_PROMPT=0; ";
+
+    fn git_runs() -> bool {
+        Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success())
+    }
+
+    /// The workspace is a repository with an external linked worktree `<root>/feature`, the submodules `sub`,
+    /// `sub2` (deinitialized), `third/party` and `nest` (which has a submodule `inner` of its own). False when
+    /// `git` could not make it.
+    fn git_fixture(f: &Fx) -> bool {
+        let (ws, root) = (&f.ws, &f.root);
+        let (src, nest_src, inner_src) = (root.join("subsrc"), root.join("nestsrc"), root.join("innersrc"));
+        for d in [&src, &nest_src, &inner_src] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        let (src_s, nest_s, inner_s) = (s(&src), s(&nest_src), s(&inner_src));
+        let steps: Vec<(&PathBuf, Vec<&str>)> = vec![
+            (&src, vec!["init", "-q"]),
+            (&src, vec!["commit", "-q", "--allow-empty", "-m", "s"]),
+            (&inner_src, vec!["init", "-q"]),
+            (&inner_src, vec!["commit", "-q", "--allow-empty", "-m", "i"]),
+            (&nest_src, vec!["init", "-q"]),
+            (&nest_src, vec!["submodule", "add", "-q", inner_s, "inner"]),
+            (&nest_src, vec!["commit", "-q", "-m", "n"]),
+            (ws, vec!["init", "-q"]),
+            (ws, vec!["commit", "-q", "--allow-empty", "-m", "init"]),
+            (ws, vec!["worktree", "add", "-q", "../feature"]),
+            (ws, vec!["submodule", "add", "-q", src_s, "sub"]),
+            (ws, vec!["submodule", "add", "-q", src_s, "sub2"]),
+            (ws, vec!["submodule", "add", "-q", src_s, "third/party"]),
+            (ws, vec!["submodule", "add", "-q", nest_s, "nest"]),
+            (ws, vec!["submodule", "update", "-q", "--init", "--recursive"]),
+            (ws, vec!["commit", "-q", "-m", "subs"]),
+            (ws, vec!["submodule", "deinit", "-q", "-f", "sub2"]),
+        ];
+        steps.iter().all(|(dir, args)| git_ok(dir, args))
+    }
+
+    fn written(f: &Fx, rel: &str) -> PathBuf {
+        f.ws.join(".git").join(rel)
+    }
+
+    #[test]
+    fn construction_finds_worktree_gitdirs_and_every_submodule_repository() {
+        let test = "construction_finds_worktree_gitdirs_and_every_submodule_repository";
+        let f = fx();
+        if !git_runs() || !git_fixture(&f) {
+            return skipped(test, "git cannot make the fixture");
+        }
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        for rel in [
+            "",
+            "worktrees/feature",
+            "modules/sub",
+            "modules/sub2",
+            "modules/third/party",
+            "modules/nest",
+            "modules/nest/modules/inner",
+        ] {
+            let dir = written(&f, rel);
+            assert!(sb.git_dirs.contains(&dir), "{} is not among {:?}", dir.display(), sb.git_dirs);
+            for name in GIT_PRIVATE {
+                assert!(sb.protected.contains(&dir.join(name)), "{}/{name} is not protected", dir.display());
+            }
+        }
+        // The repositories below a `modules` directory (`third` is none) are the third rule's exceptions, sorted.
+        let below: Vec<PathBuf> =
+            ["modules/nest", "modules/nest/modules/inner", "modules/sub", "modules/sub2", "modules/third/party"]
+                .iter()
+                .map(|r| written(&f, r))
+                .collect();
+        assert_eq!(sb.git_modules, below);
+        let profile = sb.profile().expect("profile");
+        let exceptions: String = below.iter().map(|d| git_exception(d)).collect();
+        let roots = format!(" (subpath \"{}\") (subpath \"{}\")", s(&f.ws), s(&f.tmp));
+        assert!(profile.contains(&git_lines_with(&roots, &exceptions)), "{profile}");
+        assert_eq!(profile.matches("(require-not (require-all (subpath").count(), 5, "{profile}");
+        // Nothing of the above depends on the mode: Bubblewrap gets the same repositories.
+        let none = build(&f, &cfg(SandboxMode::None), None);
+        assert_eq!(none.git_dirs, sb.git_dirs);
+    }
+
+    #[test]
+    fn check_write_refuses_git_metadata_in_the_workspace_and_the_temp_dir_and_accepts_what_git_writes() {
+        let test = "check_write_refuses_git_metadata_in_the_workspace_and_the_temp_dir_and_accepts_what_git_writes";
+        let f = fx();
+        if !git_runs() || !git_fixture(&f) {
+            return skipped(test, "git cannot make the fixture");
+        }
+        for mode in [SandboxMode::Seatbelt, SandboxMode::None] {
+            let sb = build(&f, &cfg(mode), None);
+            let mut refused = Vec::new();
+            for rel in ["worktrees/feature", "modules/sub", "modules/sub2", "modules/third/party", "modules/nest"] {
+                let private: &[&str] = if rel.starts_with("worktrees") {
+                    &["commondir", "gitdir", "config.worktree"]
+                } else {
+                    &["config", "hooks/post-checkout", "hooks"]
+                };
+                refused.extend(private.iter().map(|n| written(&f, &format!("{rel}/{n}"))));
+            }
+            refused.extend(
+                ["modules/nest/modules/inner/config", "modules/nest/modules/inner/hooks/pre-commit"]
+                    .map(|r| written(&f, r)),
+            );
+            refused.push(f.ws.join(".git"));
+            for new in [
+                "modules/new",
+                "modules/new/hooks/x",
+                "modules/new/config",
+                "worktrees/new",
+                "worktrees/new/commondir",
+                "modules/third/new",
+                "modules/sub/modules",
+                "modules/sub/modules/new",
+                "modules",
+                "worktrees",
+                "modules/sub",
+                "worktrees/feature",
+            ] {
+                refused.push(written(&f, new));
+            }
+            // Written in capitals or inside the temp dir: the same.
+            refused.push(f.ws.join(".GIT/Modules/sub/HOOKS/x"));
+            for root in [&f.tmp, &f.ws.join("deep/er")] {
+                refused.extend(
+                    [
+                        ".git",
+                        ".git/config",
+                        ".git/hooks/post-commit",
+                        ".git/worktrees/w/commondir",
+                        ".git/worktrees/w/gitdir",
+                        ".git/worktrees/w/config.worktree",
+                        ".git/modules/a/hooks/h",
+                        ".git/modules/a/b/c/config",
+                        ".git/modules/a/modules/b/hooks/h",
+                        ".git/modules/new",
+                        ".git/worktrees/new",
+                        "x/.git",
+                        "x/.git/config",
+                    ]
+                    .map(|r| root.join(r)),
+                );
+            }
+            for path in &refused {
+                let e = sb.check_write(path).expect_err(&format!("{mode:?}: {} is refused", path.display()));
+                assert!(
+                    e.contains("Git metadata")
+                        && e.contains("operator")
+                        && e.contains("git clone --bare <url> <dir>.git"),
+                    "{e}"
+                );
+                assert!(e.contains("git worktree add") && e.contains("git submodule update --init"), "{e}");
+            }
+            for ok in [
+                "objects/ab/cdef",
+                "refs/heads/feature",
+                "HEAD",
+                "index",
+                "logs/HEAD",
+                "worktrees/feature/HEAD",
+                "worktrees/feature/index",
+                "modules/sub/objects/ab/cdef",
+                "modules/sub/refs/heads/x",
+                "modules/sub/HEAD",
+                "modules/sub2/refs/heads/x",
+                "modules/third/party/refs/heads/nb/x",
+                "modules/third/party/objects/ab/cd",
+                "modules/nest/modules/inner/refs/heads/x",
+            ] {
+                let path = written(&f, ok);
+                assert!(sb.check_write(&path).is_ok(), "{mode:?}: {} is accepted", path.display());
+            }
+            for ok in [
+                f.ws.join("sub/file.txt"),
+                f.ws.join("third/party/lib.rs"),
+                f.ws.join("src/main.rs"),
+                f.tmp.join("x.git/config"),
+                f.tmp.join("x.git/hooks/h"),
+                f.tmp.join("x/gitignore"),
+            ] {
+                assert!(sb.check_write(&ok).is_ok(), "{mode:?}: {} is accepted", ok.display());
+            }
+        }
+    }
+
+    /// A repository and directories that are not one, made by hand below `<ws>/.git/modules`.
+    fn hand_made(f: &Fx) -> PathBuf {
+        let git = f.ws.join(".git");
+        let repo = |dir: &Path| {
+            std::fs::create_dir_all(dir.join("objects")).expect("mkdir");
+            std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").expect("write");
+        };
+        repo(&git);
+        repo(&git.join("modules/sub"));
+        repo(&git.join("modules/third/party"));
+        repo(&git.join("modules/third/deeper/more/repo"));
+        // A worktree's gitdir has a `commondir` file instead of `objects`.
+        let w = git.join("modules/viaw");
+        std::fs::create_dir_all(&w).expect("mkdir");
+        std::fs::write(w.join("HEAD"), "x").expect("write");
+        std::fs::write(w.join("commondir"), "../..").expect("write");
+        // Not repositories: no `HEAD`, no `objects`, a `HEAD` directory.
+        std::fs::create_dir_all(git.join("modules/headless/objects")).expect("mkdir");
+        std::fs::create_dir_all(git.join("modules/noobjects")).expect("mkdir");
+        std::fs::write(git.join("modules/noobjects/HEAD"), "x").expect("write");
+        std::fs::create_dir_all(git.join("modules/dirhead/HEAD")).expect("mkdir");
+        std::fs::create_dir_all(git.join("modules/dirhead/objects")).expect("mkdir");
+        git
+    }
+
+    #[test]
+    fn discovery_applies_the_repository_test_and_never_follows_a_link_to_a_directory() {
+        let f = fx();
+        let git = hand_made(&f);
+        // A link to a repository, and a link where `worktrees` and `modules` of another repository would be.
+        let elsewhere = f.root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("objects")).expect("mkdir");
+        std::fs::write(elsewhere.join("HEAD"), "x").expect("write");
+        symlink(&elsewhere, git.join("modules/linked")).expect("link");
+        std::fs::create_dir_all(elsewhere.join("modules/hidden/objects")).expect("mkdir");
+        std::fs::write(elsewhere.join("modules/hidden/HEAD"), "x").expect("write");
+        symlink(elsewhere.join("modules"), git.join("modules/viaw/modules")).expect("link");
+        symlink(&elsewhere, git.join("worktrees")).expect("link");
+        let found = git_directories(&f.ws).expect("found");
+        let repos: Vec<PathBuf> =
+            ["", "modules/sub", "modules/third/deeper/more/repo", "modules/third/party", "modules/viaw"]
+                .iter()
+                .map(|r| git.join(r))
+                .collect();
+        assert_eq!(found.repos, repos);
+        // Every one below a `modules` directory is an exception of the third rule, the workspace's own is not.
+        assert_eq!(found.modules, repos[1..].to_vec());
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let profile = sb.profile().expect("profile");
+        let exceptions: String = repos[1..].iter().map(|d| git_exception(d)).collect();
+        assert!(
+            profile.contains(&exceptions) && profile.matches("(require-not (require-all").count() == 4,
+            "{profile}"
+        );
+        // Below `.git/modules/<name>/` nothing can be made but inside the repositories found, and in them anything
+        // outside their own `modules` and `worktrees`.
+        for new in [
+            "modules/third/new",
+            "modules/third/new/hooks",
+            "modules/third/deeper/new",
+            "modules/headless/new",
+            "modules/noobjects/x",
+            "modules/sub/modules/x/y",
+            "modules/sub/worktrees/x/y",
+        ] {
+            assert!(sb.check_write(&git.join(new)).is_err(), "{new}");
+        }
+        for ok in [
+            "modules/third/party/refs/x",
+            "modules/third/deeper/more/repo/refs/x",
+            "modules/viaw/refs/x",
+            "modules/sub/refs/heads/nb/x",
+        ] {
+            assert!(sb.check_write(&git.join(ok)).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn discovery_finds_every_repository_in_the_workspace_and_searches_below_bare_ones() {
+        let f = fx();
+        // A bare repository the operator made, and a `.git` directory inside it (found too: the search goes on).
+        let bare = f.ws.join("fixtures/remote.git");
+        std::fs::create_dir_all(bare.join("objects")).expect("mkdir");
+        std::fs::create_dir_all(bare.join("hooks")).expect("mkdir");
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").expect("write");
+        std::fs::create_dir_all(bare.join("deeper/.git")).expect("mkdir");
+        // A directory that is not a repository: a `HEAD` and nothing else.
+        std::fs::create_dir_all(f.ws.join("almost")).expect("mkdir");
+        std::fs::write(f.ws.join("almost/HEAD"), "x").expect("write");
+        let found = git_directories(&f.ws).expect("found");
+        // The search goes on below a bare repository: its `.git` directory is found as any other.
+        let mut want = vec![bare.clone(), bare.join("deeper/.git")];
+        want.sort();
+        assert_eq!(found.repos, want);
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        assert_eq!(sb.git_dirs, want);
+        assert!(sb.protected.contains(&bare.join("hooks")) && sb.protected.contains(&bare.join("config")));
+        for hook in ["hooks/pre-receive", "config"] {
+            assert!(sb.check_write(&bare.join(hook)).is_err(), "{hook}");
+        }
+        assert!(sb.check_write(&bare.join("refs/heads/main")).is_ok());
+        assert!(sb.check_write(&f.ws.join("almost/x")).is_ok());
+        // Under the profile too.
+        if available() {
+            let (ok, text) = run(&sb, &f.ws, "echo '#!/bin/sh' > fixtures/remote.git/hooks/pre-receive");
+            assert!(!ok, "a hook of a bare repository was written: {text}");
+            let (ok, text) =
+                run(&sb, &f.ws, "mkdir -p fixtures/remote.git/refs/heads && echo x > fixtures/remote.git/refs/heads/b");
+            assert!(ok, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_pointer_counts_only_when_it_names_a_repository_and_no_repository_that_holds_a_home_is_mounted() {
+        let f = fx();
+        // `.git` files that name the user's home (not a repository) and a `commondir` of `../../..`.
+        std::fs::create_dir_all(f.ws.join("a")).expect("mkdir");
+        std::fs::write(f.ws.join("a/.git"), format!("gitdir: {}\n", s(&f.home))).expect("write");
+        let git = f.ws.join("b/.git");
+        std::fs::create_dir_all(git.join("objects")).expect("mkdir");
+        std::fs::write(git.join("HEAD"), "x").expect("write");
+        std::fs::write(git.join("commondir"), "../../..\n").expect("write");
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        assert_eq!(sb.git_dirs, std::slice::from_ref(&git));
+        assert!(!sb.protected.contains(&f.home.join("config")), "{:?}", sb.protected);
+        // A repository that contains the loom home (the fixture's root, which holds the workspace as well) is found
+        // and protected, but not given to Bubblewrap; one that contains the user's home is treated the same.
+        let outer = f.root.join("outer");
+        let (inner_home, inner_ws) = (outer.join("lm"), outer.join("w"));
+        for d in [&inner_home, &inner_ws.join(".loom"), &outer.join("objects")] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        std::fs::write(outer.join("HEAD"), "x").expect("write");
+        std::fs::write(inner_ws.join(".git"), format!("gitdir: {}\n", s(&outer))).expect("write");
+        let tmp = f.root.join("tmp2");
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let make = |home: &Path| {
+            Sandbox::with_home(
+                &SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) },
+                &inner_ws,
+                &tmp,
+                &inner_home,
+                None,
+                Some(home.to_path_buf()),
+            )
+            .expect("sandbox")
+        };
+        let sb = make(&f.home);
+        assert!(sb.git_dirs.is_empty(), "{:?}", sb.git_dirs);
+        assert!(sb.protected.contains(&outer.join("config")) && sb.protected.contains(&outer.join("hooks")));
+        // The same repository, with the loom home elsewhere: it holds the user's home instead.
+        let elsewhere = f.root.join("elsewhere-home");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+        let sb = Sandbox::with_home(
+            &SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) },
+            &inner_ws,
+            &tmp,
+            &elsewhere,
+            None,
+            Some(inner_home.clone()),
+        )
+        .expect("sandbox");
+        assert!(sb.git_dirs.is_empty(), "{:?}", sb.git_dirs);
+    }
+
+    #[test]
+    fn a_workspace_directory_that_cannot_be_read_refuses_construction_with_a_sentence_that_names_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fx();
+        let locked = f.ws.join("src/locked");
+        std::fs::create_dir_all(&locked).expect("mkdir");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        // A process that can read it anyway (root) makes this vacuous.
+        let readable = std::fs::read_dir(&locked).is_ok();
+        let made = Sandbox::new(&cfg(SandboxMode::Seatbelt), &f.ws, &f.tmp, &f.home, None);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        if readable {
+            return skipped("a_workspace_directory_that_cannot_be_read", "this user reads any directory");
+        }
+        let e = made.expect_err("refused").to_string();
+        assert!(e.contains(s(&locked)) && e.contains("cannot be read") && e.contains("Make it readable"), "{e}");
+    }
+
+    #[test]
+    fn discovery_refuses_more_than_4096_repositories_and_directories_below_modules() {
+        let f = fx();
+        let git = f.ws.join(".git");
+        std::fs::create_dir_all(git.join("objects")).expect("mkdir");
+        std::fs::write(git.join("HEAD"), "x").expect("write");
+        for i in 0..4096 {
+            std::fs::create_dir_all(git.join(format!("modules/d{i}"))).expect("mkdir");
+        }
+        // The repository itself is one more than 4096 together with the directories.
+        let e = Sandbox::new(&cfg(SandboxMode::Seatbelt), &f.ws, &f.tmp, &f.home, None).expect_err("too many");
+        assert!(e.to_string().contains("4096"), "{e}");
+        std::fs::remove_dir(git.join("modules/d0")).expect("rmdir");
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        assert!(sb.git_modules.is_empty());
+    }
+
+    #[test]
+    fn git_rules_hold_in_every_writable_root_and_are_judged_relative_to_it() {
+        let f = fx();
+        let extra = f.root.join("extra");
+        std::fs::create_dir_all(&extra).expect("mkdir");
+        let c = SandboxCfg { extra_writable: vec![s(&extra).to_string()], ..cfg(SandboxMode::Seatbelt) };
+        let sb = build(&f, &c, None);
+        for root in [&f.ws, &f.tmp, &extra] {
+            assert!(sb.check_write(&root.join("p/.git/config")).is_err(), "{}", root.display());
+            assert!(sb.check_write(&root.join("p/.git/modules/m")).is_err(), "{}", root.display());
+            assert!(sb.check_write(&root.join("p/src/.gitignore")).is_ok(), "{}", root.display());
+            assert!(sb.check_write(&root.join("p/.git/objects/ab")).is_ok(), "{}", root.display());
+        }
+        let profile = sb.profile().expect("profile");
+        let roots = format!(" (subpath \"{}\") (subpath \"{}\") (subpath \"{}\")", s(&f.ws), s(&f.tmp), s(&extra));
+        assert!(profile.contains(&git_lines(&roots)), "{profile}");
+        assert!(Sandbox::new(&cfg(SandboxMode::None), &f.ws, &f.tmp, &f.home, None)
+            .expect("sandbox")
+            .check_write(&f.tmp.join("x/.git"))
+            .is_err());
+    }
+
+    /// Every spelling of `name` that the volume takes for it, with a few of them: its own, in capitals, each
+    /// position replaced by each equivalent in turn, and every position replaced at once.
+    fn fold_variants(name: &str) -> Vec<String> {
+        let chars: Vec<char> = name.chars().collect();
+        // What can stand at `at`: (spelling, characters of `name` it takes).
+        let choices = |at: usize| -> Vec<(String, usize)> {
+            let c = chars.get(at).copied().unwrap_or('.');
+            let mut out = vec![(c.to_string(), 1), (c.to_ascii_uppercase().to_string(), 1)];
+            out.extend(FOLD_LETTERS.iter().filter(|(_, to)| *to == c).map(|(from, _)| (from.to_string(), 1)));
+            let rest: String = chars.iter().skip(at).collect();
+            out.extend(
+                FOLD_EXPANDS
+                    .iter()
+                    .filter(|(_, to)| rest.starts_with(to))
+                    .map(|(from, to)| (from.to_string(), to.len())),
+            );
+            out
+        };
+        let mut out = vec![name.to_string(), name.to_uppercase()];
+        for pos in 0..chars.len() {
+            for (alt, took) in choices(pos).into_iter().skip(2) {
+                let before: String = chars.iter().take(pos).collect();
+                let after: String = chars.iter().skip(pos + took).collect();
+                out.push(format!("{before}{alt}{after}"));
+            }
+        }
+        let mut all = String::new();
+        let mut at = 0;
+        while at < chars.len() {
+            let (alt, took) = choices(at).pop().unwrap_or((String::new(), 1));
+            all.push_str(&alt);
+            at += took;
+        }
+        out.push(all);
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn fold_is_the_volumes_and_the_regex_matches_what_it_folds() {
+        assert_eq!(fold("Module\u{17f}"), "modules");
+        assert_eq!(fold("HOO\u{212a}S"), "hooks");
+        assert_eq!(fold("con\u{fb01}g.worktree"), "config.worktree");
+        assert_eq!(fold("\u{fb03}"), "ffi");
+        assert_eq!(fold("\u{df}"), "ss");
+        // Not folded by the volume: the dotted and dotless i, the fullwidth s, a zero-width joiner.
+        for other in ["g\u{130}t", "g\u{131}t", "module\u{ff53}", "mo\u{200d}dules"] {
+            assert!(!fold(other).is_ascii(), "{other}");
+        }
+        assert_eq!(fold_regex("modules"), "[mM][oO][dD][uU][lL][eE](s|S|\u{17f})");
+        assert_eq!(fold_regex("hooks"), "[hH][oO][oO](k|K|\u{212a})(s|S|\u{17f})");
+        assert_eq!(fold_regex("config"), "[cC][oO][nN]([fF][iI]|\u{fb01})[gG]");
+        assert_eq!(fold_regex(".git"), "[.][gG][iI][tT]");
+        // Runs that overlap are spelled every way.
+        let re = regex::Regex::new(&format!("^{}$", fold_regex("ffi"))).expect("regex");
+        for yes in ["ffi", "FFI", "\u{fb00}i", "f\u{fb01}", "\u{fb03}", "F\u{fb01}"] {
+            assert!(re.is_match(yes), "{yes}");
+        }
+        for no in ["fi", "\u{fb01}", "ff", "\u{fb02}i"] {
+            assert!(!re.is_match(no), "{no}");
+        }
+        let re = regex::Regex::new(&format!("^{}$", fold_regex("sst"))).expect("regex");
+        for yes in ["sst", "\u{df}t", "s\u{fb06}", "\u{17f}\u{fb05}", "\u{17f}\u{17f}T"] {
+            assert!(re.is_match(yes), "{yes}");
+        }
+    }
+
+    #[test]
+    fn the_regexes_and_the_name_checks_agree_on_every_fold_of_the_git_names() {
+        let f = fx();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let profile = sb.profile().expect("profile");
+        let rules: Vec<regex::Regex> = profile
+            .lines()
+            .filter_map(|l| {
+                if !l.contains("(regex #\"^.*/") {
+                    return None;
+                }
+                let start = l.find("(regex #\"")? + "(regex #\"".len();
+                let end = l.rfind("\")))")?;
+                Some(regex::Regex::new(l.get(start..end)?).expect("the profile's regex"))
+            })
+            .collect();
+        assert_eq!(rules.len(), 3, "{profile}");
+        let root = &f.ws;
+        let names: Vec<&str> = GIT_PRIVATE.iter().copied().chain(["modules", "worktrees"]).collect();
+        let mut paths = Vec::new();
+        for gitv in fold_variants(".git") {
+            paths.push(format!("{gitv}/config"));
+            paths.push(gitv.clone());
+        }
+        for name in &names {
+            for v in fold_variants(name) {
+                for prefix in
+                    ["", "worktrees/w/", "modules/a/", "modules/a/b/", "modules/a/modules/b/", "modules/", "worktrees/"]
+                {
+                    for suffix in ["", "/x", "/x/y"] {
+                        paths.push(format!(".git/{prefix}{v}{suffix}"));
+                    }
+                }
+            }
+        }
+        for m in fold_variants("modules") {
+            for w in fold_variants("worktrees") {
+                paths.push(format!(".git/{w}/n/commondir"));
+                paths.push(format!(".git/{m}/n/{w}/x"));
+            }
+            for p in ["config", "hooks"].iter().flat_map(|n| fold_variants(n)) {
+                paths.push(format!(".git/{m}/evil/{p}"));
+                paths.push(format!(".git/{m}/{p}"));
+            }
+        }
+        for p in ["worktrees", "modules"].iter().flat_map(|n| fold_variants(n)) {
+            for q in ["commondir", "gitdir", "config.worktree"].iter().flat_map(|n| fold_variants(n)) {
+                paths.push(format!(".git/{p}/w/{q}"));
+            }
+        }
+        // Names that are none of theirs.
+        for other in [
+            "objects",
+            "refs/heads/x",
+            "modulez/x/hooks",
+            "hooks2",
+            "modules2/x",
+            "configs",
+            "worktree/x/config",
+            "conf\u{fb02}g",
+            "g\u{130}t",
+        ] {
+            paths.push(format!(".git/{other}"));
+        }
+        let mut refused = 0_usize;
+        for rel in &paths {
+            let full = root.join(rel);
+            let text = full.to_string_lossy().to_string();
+            let (meta, container) = (git_metadata(&full, root), git_container(&full, root));
+            let below = git_below_module(&full, root);
+            let hit = |re: &regex::Regex| re.is_match(&text);
+            assert_eq!(hit(rules.first().expect("rule")), meta, "metadata rule and git_metadata on {text}");
+            assert_eq!(hit(rules.get(1).expect("rule")), container, "container rule and git_container on {text}");
+            assert_eq!(hit(rules.get(2).expect("rule")), below, "third rule and git_below_module on {text}");
+            if meta || container || below {
+                refused += 1;
+                assert!(sb.check_write(&full).is_err(), "{text}");
+            }
+        }
+        assert!(refused > 500, "{refused}");
+        // And the ones that matter, by hand.
+        for rel in [
+            ".git/module\u{17f}/x/hooks",
+            ".git/hoo\u{212a}s",
+            ".git/hook\u{17f}/x",
+            ".git/con\u{fb01}g.worktree",
+            ".git/worktree\u{17f}/w",
+            ".git/modules/x/con\u{fb01}g",
+            ".GIT/MODULE\u{17f}/x/CON\u{fb01}G",
+        ] {
+            assert!(sb.check_write(&root.join(rel)).is_err(), "{rel}");
+        }
+        assert!(sb.check_write(&root.join(".git/objects/ab/cdef")).is_ok());
+    }
+
+    #[test]
+    fn names_the_volume_folds_to_the_git_names_cannot_be_made_under_the_profile() {
+        let test = "names_the_volume_folds_to_the_git_names_cannot_be_made_under_the_profile";
+        if !available() {
+            return skipped(test, "sandbox-exec is missing");
+        }
+        let f = fx();
+        // A repository with none of the names yet: an existing entry is judged by the name it is stored under, so
+        // what the profile has to refuse is making one under another spelling.
+        let git = f.ws.join(".git");
+        std::fs::create_dir_all(git.join("objects")).expect("mkdir");
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").expect("write");
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        for attempt in [
+            "mkdir -p .git/module\u{17f}/x/hooks",
+            "mkdir -p .git/hoo\u{212a}s",
+            "mkdir -p .git/hook\u{17f}",
+            "echo x > .git/con\u{fb01}g.worktree",
+            "mkdir -p .git/worktree\u{17f}/w",
+        ] {
+            let (ok, text) = run(&sb, &f.ws, attempt);
+            assert!(!ok, "`{attempt}` succeeded under the profile: {text}");
+        }
+        for (ok_script, what) in [
+            ("mkdir -p .git/objects/ab && echo x > .git/refs-x", "a name that is none of them"),
+            ("mkdir -p .git/con\u{fb02}g", "a ligature that is not `fi`"),
+        ] {
+            let (ok, text) = run(&sb, &f.ws, ok_script);
+            assert!(ok, "{what}: `{ok_script}` failed under the profile: {text}");
+        }
+    }
+
+    #[test]
+    fn the_git_rules_come_after_every_rule_about_the_temp_dir() {
+        let f = fx_prod();
+        let inside = f.tmp.join("kept");
+        let c = SandboxCfg { protected_paths: vec![s(&inside).to_string()], ..cfg(SandboxMode::Seatbelt) };
+        let profile = build(&f, &c, None).profile().expect("profile");
+        let last = |needle: &str| profile.rfind(needle).unwrap_or_else(|| panic!("{needle} is missing: {profile}"));
+        let (rule, container) = (
+            profile.find("(deny file-write* (require-all").expect("rule"),
+            last("(deny file-write-create file-write-unlink (require-all"),
+        );
+        for earlier in [
+            format!("(allow file-write* (subpath \"{}\"))", s(&f.tmp)),
+            format!("(deny file-write-unlink file-write-create (literal \"{}\"))", s(&f.tmp)),
+            format!("(deny file-write* (subpath \"{}\"))", s(&inside)),
+        ] {
+            assert!(rule > last(&earlier) && container > rule, "{earlier} must come before the Git rules: {profile}");
+        }
+        let unreadable = last("(deny file-read* file-test-existence (subpath");
+        assert!(container < unreadable, "{profile}");
+    }
+
+    #[test]
+    fn git_commands_under_the_profile_cannot_plant_what_git_runs() {
+        let test = "git_commands_under_the_profile_cannot_plant_what_git_runs";
+        if !available() {
+            return;
+        }
+        let f = fx();
+        if !git_runs() || !git_fixture(&f) {
+            return skipped(test, "git cannot make the fixture");
+        }
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let attempts = [
+            // The files Git reads configuration, hooks and pointers from.
+            "echo x > .git/worktrees/feature/commondir",
+            "echo x >> .git/worktrees/feature/gitdir",
+            "echo x > .git/worktrees/feature/config.worktree",
+            "echo x >> .git/modules/sub/config",
+            "echo x > .git/modules/sub/hooks/post-checkout",
+            "echo x >> .git/modules/sub2/config",
+            "echo x > .git/modules/sub2/hooks/post-checkout",
+            "echo x > .git/modules/third/party/hooks/post-checkout",
+            "echo x > .git/modules/nest/modules/inner/hooks/post-checkout",
+            "echo x >> .git/config",
+            "echo x > .git/hooks/pre-commit",
+            "mkdir -p .git/modules/new/hooks",
+            "mkdir -p .git/modules/third/new/hooks",
+            // A directory made elsewhere and moved into place brings its own `config` and `hooks`.
+            "mkdir -p $TMPDIR/m/hooks && mv $TMPDIR/m .git/modules/new",
+            "mkdir -p $TMPDIR/m/hooks && mv $TMPDIR/m .git/worktrees/new",
+            "mkdir -p $TMPDIR/m/hooks && mv $TMPDIR/m .git/modules/third/new",
+            "mkdir -p $TMPDIR/m/hooks && mv $TMPDIR/m .git/modules/sub/modules",
+            "mkdir -p $TMPDIR/m/hooks && mv $TMPDIR/m .git/modules/nest/modules/new",
+            // And what holds a rule's path cannot be moved away.
+            "mv .git/modules .git/modules-away",
+            "mv .git/modules/sub .git/sub-away",
+            "mv .git/worktrees .git/worktrees-away",
+            // Nor can a repository be made where commands write, or one moved in.
+            "git init -q $TMPDIR/x",
+            "git init -q nested",
+            "git init -q --bare $TMPDIR/e.git && mkdir $TMPDIR/e && mv $TMPDIR/e.git $TMPDIR/e/.git",
+            "git init -q --bare $TMPDIR/e.git && mkdir -p evil.git && mv $TMPDIR/e.git evil.git/.git",
+            "mkdir -p $TMPDIR/d/.GIT && mv $TMPDIR/d nested-dir",
+        ];
+        for attempt in attempts {
+            let (ok, text) = run(&sb, &f.ws, &format!("{GIT_SH}{attempt}"));
+            assert!(!ok, "`{attempt}` succeeded under the profile: {text}");
+        }
+        // Git's own writes still work: a commit and a branch in the workspace and in each existing submodule, a
+        // bare repository for the session's own use.
+        for script in [
+            "echo a > a.txt && git add a.txt && git commit -qm a && git branch nb/x",
+            "cd sub && echo a > a && git add a && git commit -qm a && git branch nb/x",
+            "cd third/party && echo a > a && git add a && git commit -qm a && git branch nb/x",
+            "cd nest/inner && echo a > a && git add a && git commit -qm a && git branch nb/x",
+            "git init -q --bare $TMPDIR/x.git && git --git-dir=$TMPDIR/x.git rev-parse --git-dir",
+        ] {
+            let (ok, text) = run(&sb, &f.ws, &format!("{GIT_SH}{script}"));
+            assert!(ok, "`{script}` failed under the profile: {text}");
+        }
+        // Outside the profile the same attempts work, so the refusals above are the profile's doing.
+        let none = build(&f, &cfg(SandboxMode::None), None);
+        let (ok, text) =
+            run(&none, &f.ws, &format!("{GIT_SH}mkdir -p $TMPDIR/m/hooks && mv $TMPDIR/m .git/modules/new"));
+        assert!(ok, "{text}");
+    }
+
+    /// Steps that a command might take to make the operator's next `git status` run its code: both end with
+    /// `marker` made by a `core.fsmonitor` that Git runs as the operator.
+    fn fsmonitor_attacks(marker: &Path) -> [String; 2] {
+        let config = format!("[core]\\n\\tfsmonitor = touch {}; false\\n\\trepositoryformatversion = 0\\n", s(marker));
+        [
+            // The external worktree's `commondir` points at a copy of the repository whose config runs it.
+            format!(
+                "mkdir -p $TMPDIR/evil && cp -R .git/* $TMPDIR/evil/ && printf '{config}' >> $TMPDIR/evil/config \
+                 && echo $TMPDIR/evil > .git/worktrees/feature/commondir"
+            ),
+            // A repository made elsewhere is moved into the workspace and a gitlink added for it.
+            format!(
+                "git init -q $TMPDIR/evil && git -C $TMPDIR/evil commit -q --allow-empty -m e \
+                 && git -C $TMPDIR/evil config core.fsmonitor 'touch {}; false' && mv $TMPDIR/evil evil \
+                 && git update-index --add --cacheinfo 160000,$(git -C evil rev-parse HEAD),evil",
+                s(marker)
+            ),
+        ]
+    }
+
+    #[test]
+    fn what_a_command_plants_does_not_run_in_the_operators_next_git_command() {
+        let test = "what_a_command_plants_does_not_run_in_the_operators_next_git_command";
+        if !available() {
+            return;
+        }
+        let ran = |mode: SandboxMode, step: usize| -> Option<bool> {
+            let f = fx();
+            if !git_runs() || !git_fixture(&f) {
+                return None;
+            }
+            let marker = f.root.join("pwned");
+            let script = &fsmonitor_attacks(&marker)[step];
+            let sb = build(&f, &cfg(mode), None);
+            let _ = run(&sb, &f.ws, &format!("{GIT_SH}{script}"));
+            // The operator's own Git, outside the sandbox.
+            for dir in [f.root.join("feature"), f.ws.clone()] {
+                git_ok(&dir, &["status"]);
+            }
+            Some(marker.exists())
+        };
+        for step in 0..2 {
+            match ran(SandboxMode::None, step) {
+                None => return skipped(test, "git cannot make the fixture"),
+                Some(false) => return skipped(test, &format!("step {step} does not make Git run its code here")),
+                Some(true) => {}
+            }
+            assert_eq!(ran(SandboxMode::Seatbelt, step), Some(false), "step {step} ran code under the profile");
+        }
+    }
+
+    // ---- Git, second round ----
+
+    /// A name that no other run of the tests makes.
+    fn unique(what: &str) -> String {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        format!("{what}-{}-{nanos}", std::process::id())
+    }
+
+    #[test]
+    fn the_config_reader_reads_sections_keys_and_values_as_git_does() {
+        let hooks = |v: &str| ConfigPath::HooksPath(v.to_string());
+        let include = |v: &str| ConfigPath::Include(v.to_string());
+        let read = |text: &str| config_paths(text);
+        // Names are compared without regard to case; a key may follow the header in its line.
+        assert_eq!(read("[core]\n\thooksPath = .husky\n"), [hooks(".husky")]);
+        assert_eq!(read("[CORE]\nHOOKSpath=.husky"), [hooks(".husky")]);
+        assert_eq!(read("[core] hooksPath = x\n"), [hooks("x")]);
+        assert_eq!(read("\u{feff}[core]\r\nhooksPath = x\r\n"), [hooks("x")]);
+        // Values: quotes keep what they hold, comments end an unquoted value, escapes, continuation.
+        assert_eq!(read("[core]\nhooksPath = \"~/my hooks\"  \n"), [hooks("~/my hooks")]);
+        assert_eq!(read("[core]\nhooksPath = a\"b c\"d # comment\n"), [hooks("ab cd")]);
+        assert_eq!(read("[core]\nhooksPath = x ; y\n"), [hooks("x")]);
+        assert_eq!(read("[core]\nhooksPath = x#y\n"), [hooks("x")]);
+        assert_eq!(read("[core]\nhooksPath = \"x # y ; z\"\n"), [hooks("x # y ; z")]);
+        assert_eq!(read("[core]\nhooksPath = \"x \" \n"), [hooks("x ")]);
+        assert_eq!(read("[core]\nhooksPath = a\\\nb\n"), [hooks("ab")]);
+        assert_eq!(read("[core]\nhooksPath = a\\\r\nb\r\n"), [hooks("ab")]);
+        assert_eq!(read("[core]\nhooksPath = \"a\\\\b\\\"c\\td\"\n"), [hooks("a\\b\"c\td")]);
+        assert_eq!(read("[core]\nhooksPath =\n"), [hooks("")]);
+        // Includes, with and without a condition, in every spelling of a subsection.
+        let text = "[include]\npath = a.inc\n[includeIf \"gitdir:~/work/\"]\n\tpath = ~/b.inc\n\
+                    [includeif.gitdir:/x/]\npath = c.inc\n[includeIf \"gitdir:C:\\\\x\\\"y\"]\npath = d.inc\n\
+                    [includeIf \"onbranch:main\"]\npath = \"e f.inc\"\n";
+        assert_eq!(
+            read(text),
+            [include("a.inc"), include("~/b.inc"), include("c.inc"), include("d.inc"), include("e f.inc")]
+        );
+        // Things that name no such path, or that cannot be read: nothing, and what follows is still read.
+        for none in [
+            "[core \"sub\"]\nhooksPath = x\n",
+            "[include \"sub\"]\npath = x\n",
+            "[include.sub]\npath = x\n",
+            "[includeIf]\npath = x\n",
+            "[other]\nhooksPath = x\npath = y\n",
+            "[core]\nhooksPathExtra = x\nhooksPat = y\n",
+            "[core]\nhooksPath\n",
+            "hooksPath = x\n[core]\n",
+            "[core]\n[other]\nhooksPath = x\n",
+            "# [core]\n; hooksPath = x\n",
+            "[core]\n# hooksPath = x\n",
+            "[core\nhooksPath = x\n",
+            "[core]\nhooksPath = \"x\n",
+            "[core]\nhooksPath = a\\qb\n",
+        ] {
+            assert_eq!(read(none), [], "{none:?}");
+        }
+        assert_eq!(read("[core]\nhooksPath = \"x\n[core]\nhooksPath = y\n"), [hooks("y")]);
+        assert_eq!(read("[core]\nhooksPath = a\\qb\nhooksPath = ok\n"), [hooks("ok")]);
+        assert_eq!(read("[core\n[core]\nhooksPath = ok\n"), [hooks("ok")]);
+        assert_eq!(read("[core]\nbare\nhooksPath = ok\n"), [hooks("ok")]);
+    }
+
+    #[test]
+    fn config_files_are_followed_ten_deep_each_file_once_and_values_are_resolved_as_git_does() {
+        let f = fx();
+        let dir = f.root.join("inc");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        for k in 0..13 {
+            let text = format!("[core]\nhooksPath = h{k}\n[include]\npath = c{}\n", k + 1);
+            std::fs::write(dir.join(format!("c{k}")), text).expect("write");
+        }
+        let facts = read_config_files(&[dir.join("c0")], None);
+        // The first file and ten that it includes in turn; the eleventh is named and not read.
+        assert_eq!(facts.hooks, (0..=10).map(|k| format!("h{k}")).collect::<Vec<_>>());
+        assert_eq!(facts.includes, (1..=11).map(|k| dir.join(format!("c{k}"))).collect::<Vec<_>>());
+        // A cycle, an include named twice and a file given twice are read once.
+        std::fs::write(dir.join("a"), "[core]\nhooksPath = a\n[include]\npath = b\n").expect("write");
+        std::fs::write(dir.join("b"), "[core]\nhooksPath = b\n[include]\npath = a\npath = ./b\n").expect("write");
+        let facts = read_config_files(&[dir.join("a"), dir.join("a"), dir.join("b")], None);
+        assert_eq!(facts.hooks, ["a", "b"]);
+        // `~/` is the home directory, a relative path is taken from the base, a missing file is named all the same.
+        let home = f.root.join("h");
+        assert_eq!(config_value_path("~/x", Some(&home), &dir), Some(home.join("x")));
+        assert_eq!(config_value_path("~/x", None, &dir), None);
+        assert_eq!(config_value_path("~", Some(&home), &dir), Some(home.clone()));
+        assert_eq!(config_value_path("x/y", Some(&home), &dir), Some(dir.join("x/y")));
+        assert_eq!(config_value_path("/x/y", Some(&home), &dir), Some(PathBuf::from("/x/y")));
+        assert_eq!(config_value_path("", Some(&home), &dir), None);
+        std::fs::write(dir.join("m"), "[include]\npath = missing.inc\n").expect("write");
+        assert_eq!(read_config_files(&[dir.join("m")], None).includes, [dir.join("missing.inc")]);
+        // What is not a regular file is not read (a directory, a link to nothing).
+        assert!(read_config(&dir).is_none() && read_config(&dir.join("none")).is_none());
+    }
+
+    /// A repository by hand in `dir` (`HEAD` and `objects`) with `config`.
+    fn hand_repo(dir: &Path, config: &str) {
+        std::fs::create_dir_all(dir.join("objects")).expect("mkdir");
+        std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").expect("write");
+        if !config.is_empty() {
+            std::fs::write(dir.join("config"), config).expect("write");
+        }
+    }
+
+    /// A sandbox whose user home directory and `XDG_CONFIG_HOME` are given.
+    fn build_env(f: &Fx, home: &Path, xdg: Option<&Path>) -> Sandbox {
+        let c = cfg(SandboxMode::Seatbelt);
+        Sandbox::with_env(&c, &f.ws, &f.tmp, &f.home, None, Some(home.to_path_buf()), xdg.map(Path::to_path_buf))
+            .expect("sandbox")
+    }
+
+    fn refused_as_protected(sb: &Sandbox, path: &Path) {
+        let e = sb.check_write(path).expect_err(&format!("{} is refused", path.display()));
+        assert!(e.contains("protected") || e.contains("Git metadata"), "{e}");
+        let profile = sb.profile().expect("profile");
+        let covered =
+            sb.protected.iter().any(|p| under(path, p) && profile.contains(&format!("(subpath \"{}\")", s(p))));
+        assert!(covered || sb.git_refused(path), "{} is in no rule of {profile}", path.display());
+    }
+
+    #[test]
+    fn the_hooks_directory_and_the_files_a_configuration_includes_are_protected() {
+        let f = fx();
+        let git = f.ws.join(".git");
+        let uhome = f.root.join("uhome");
+        std::fs::create_dir_all(&uhome).expect("mkdir");
+        // `core.hooksPath` relative to the top of the working tree, in the repository's own configuration.
+        hand_repo(&git, "[core]\n\thooksPath = .husky\n");
+        let sb = build_env(&f, &uhome, None);
+        assert!(sb.protected.contains(&f.ws.join(".husky")), "{:?}", sb.protected);
+        for hook in [".husky/post-checkout", ".husky", ".husky/_/husky.sh"] {
+            refused_as_protected(&sb, &f.ws.join(hook));
+        }
+        for ok in ["src/a.rs", ".husky-not/x", "husky/x"] {
+            assert!(sb.check_write(&f.ws.join(ok)).is_ok(), "{ok}");
+        }
+        // As written and as resolved: a link in the workspace to where hooks are written still protects what it
+        // names, and the target it leads to.
+        let elsewhere = f.root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir");
+        std::fs::write(git.join("config"), format!("[core]\nhooksPath = {}\n", s(&elsewhere))).expect("write");
+        let sb = build_env(&f, &uhome, None);
+        assert!(!sb.protected.contains(&elsewhere), "outside every writable root: {:?}", sb.protected);
+        symlink(&elsewhere, f.ws.join("linked")).expect("link");
+        std::fs::write(git.join("config"), "[core]\nhooksPath = linked/hooks\n").expect("write");
+        let sb = build_env(&f, &uhome, None);
+        assert!(sb.protected.contains(&f.ws.join("linked/hooks")), "{:?}", sb.protected);
+        assert!(!sb.protected.contains(&elsewhere.join("hooks")), "the target is outside the roots");
+        std::fs::remove_file(f.ws.join("linked")).expect("unlink");
+        // The hooks directory in the temp dir is a writable root too; `~/` is the user's home directory; a value
+        // in quotes is read as Git reads it.
+        std::fs::write(git.join("config"), format!("[core]\nhooksPath = \"{}/th ooks\"\n", s(&f.tmp))).expect("write");
+        assert!(build_env(&f, &uhome, None).protected.contains(&f.tmp.join("th ooks")));
+        let inside = f.ws.join("h");
+        std::fs::write(git.join("config"), "[core]\n\thooksPath = \"~/hk\" # the hooks\n").expect("write");
+        let sb = build_env(&f, &inside, None);
+        assert!(sb.protected.contains(&inside.join("hk")), "{:?}", sb.protected);
+        // `/dev/null` (hooks off) and `~/` with no home protect nothing and are no error.
+        std::fs::write(git.join("config"), "[core]\nhooksPath = /dev/null\n").expect("write");
+        assert!(!build_env(&f, &uhome, None).protected.iter().any(|p| p.starts_with("/dev")));
+        std::fs::write(git.join("config"), "[core]\nhooksPath = ~/hk\n").expect("write");
+        let c = SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) };
+        let sb = Sandbox::with_env(&c, &f.ws, &f.tmp, &f.home, None, None, None).expect("sandbox");
+        assert!(!sb.protected.iter().any(|p| p.ends_with("hk")), "{:?}", sb.protected);
+    }
+
+    #[test]
+    fn an_included_file_and_what_it_sets_are_protected() {
+        let f = fx();
+        let git = f.ws.join(".git");
+        let uhome = f.root.join("uhome");
+        std::fs::create_dir_all(&uhome).expect("mkdir");
+        let outside = f.root.join("outside.inc");
+        // An include is relative to the directory of the file that names it (`.git/` here), `includeIf` counts
+        // whatever its condition, and the included file's own hooks path and includes are read in turn.
+        let config = format!(
+            "[include]\n\tpath = ../shared.inc\n[includeIf \"gitdir:/never/\"]\n\tpath = conditional.inc\n\
+             [include]\n\tpath = {}\n",
+            s(&outside)
+        );
+        hand_repo(&git, &config);
+        std::fs::write(f.ws.join("shared.inc"), "[core]\nhooksPath = shared-hooks\n[include]\npath = nested.inc\n")
+            .expect("write");
+        std::fs::write(git.join("conditional.inc"), "[core]\nhooksPath = ~/never\n").expect("write");
+        std::fs::write(&outside, "[core]\nhooksPath = outside-hooks\n").expect("write");
+        let sb = build_env(&f, &uhome, None);
+        for protected in ["shared.inc", "shared-hooks", ".git/conditional.inc", "nested.inc"] {
+            assert!(sb.protected.contains(&f.ws.join(protected)), "{protected}: {:?}", sb.protected);
+            refused_as_protected(&sb, &f.ws.join(protected));
+        }
+        assert!(sb.protected.contains(&f.ws.join("outside-hooks")), "{:?}", sb.protected);
+        // Where the include lies outside every writable root nothing is added for it; its value still is.
+        assert!(!sb.protected.contains(&outside), "{:?}", sb.protected);
+        assert!(sb.check_write(&f.ws.join("src/a.rs")).is_ok());
+    }
+
+    #[test]
+    fn the_global_configuration_is_read_from_home_and_xdg_config_home() {
+        let f = fx();
+        hand_repo(&f.ws.join(".git"), "");
+        let uhome = f.root.join("uhome");
+        let xdg = f.root.join("xdg");
+        for d in [&uhome, &xdg.join("git")] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        // A relative value in the global configuration is taken from the top of each repository found.
+        std::fs::write(uhome.join(".gitconfig"), "[core]\nhooksPath = global-hooks\n[include]\npath = ~/more\n")
+            .expect("write");
+        std::fs::write(uhome.join("more"), "[core]\nhooksPath = more-hooks\n").expect("write");
+        std::fs::write(xdg.join("git/config"), format!("[core]\nhooksPath = {}/xdg-hooks\n", s(&f.tmp)))
+            .expect("write");
+        let sb = build_env(&f, &uhome, Some(&xdg));
+        for protected in [f.ws.join("global-hooks"), f.ws.join("more-hooks"), f.tmp.join("xdg-hooks")] {
+            assert!(sb.protected.contains(&protected), "{}: {:?}", protected.display(), sb.protected);
+            refused_as_protected(&sb, &protected.join("post-commit"));
+        }
+        // The user's configuration files are protected when they lie in a writable root, the XDG ones where
+        // `XDG_CONFIG_HOME` says, else under `~/.config/git`.
+        assert!(!sb.protected.iter().any(|p| p.ends_with(".gitconfig") || p.ends_with("git")), "{:?}", sb.protected);
+        let home_in_ws = f.ws.join("home");
+        std::fs::create_dir_all(home_in_ws.join(".config/git")).expect("mkdir");
+        std::fs::write(home_in_ws.join(".config/git/config"), "[core]\nhooksPath = from-xdg-default\n").expect("write");
+        let sb = build_env(&f, &home_in_ws, None);
+        for protected in [".gitconfig", ".config/git", "from-xdg-default"] {
+            let path = if protected == "from-xdg-default" { f.ws.join(protected) } else { home_in_ws.join(protected) };
+            assert!(sb.protected.contains(&path), "{}: {:?}", path.display(), sb.protected);
+        }
+        refused_as_protected(&sb, &home_in_ws.join(".gitconfig"));
+        refused_as_protected(&sb, &home_in_ws.join(".config/git/ignore"));
+        // With `XDG_CONFIG_HOME` set the default location is not the one read, and its own `git` directory is.
+        let xdg_in_ws = f.ws.join("xdgdir");
+        let sb = build_env(&f, &home_in_ws, Some(&xdg_in_ws));
+        assert!(sb.protected.contains(&xdg_in_ws.join("git")), "{:?}", sb.protected);
+        assert!(!sb.protected.contains(&home_in_ws.join(".config/git")), "{:?}", sb.protected);
+        assert!(!sb.protected.contains(&f.ws.join("from-xdg-default")), "{:?}", sb.protected);
+        // A relative `XDG_CONFIG_HOME` is not a place Git looks.
+        let sb = build_env(&f, &home_in_ws, Some(Path::new("relative")));
+        assert!(sb.protected.contains(&home_in_ws.join(".config/git")), "{:?}", sb.protected);
+    }
+
+    #[test]
+    fn a_relative_hooks_path_is_taken_from_the_top_of_the_working_tree() {
+        let f = fx();
+        let uhome = f.root.join("uhome");
+        std::fs::create_dir_all(&uhome).expect("mkdir");
+        let git = f.ws.join(".git");
+        hand_repo(&git, "[core]\nhooksPath = main-hooks\n");
+        // A linked worktree: its private gitdir names its `.git` file, and its `config.worktree` is read.
+        let (top, private) = (f.ws.join("wt"), git.join("worktrees/w"));
+        std::fs::create_dir_all(&top).expect("mkdir");
+        std::fs::create_dir_all(&private).expect("mkdir");
+        std::fs::write(private.join("HEAD"), "ref: refs/heads/w\n").expect("write");
+        std::fs::write(private.join("commondir"), "../..\n").expect("write");
+        std::fs::write(private.join("gitdir"), format!("{}/.git\n", s(&top))).expect("write");
+        std::fs::write(private.join("config.worktree"), "[core]\nhooksPath = wt-hooks\n").expect("write");
+        std::fs::write(top.join(".git"), format!("gitdir: {}\n", s(&private))).expect("write");
+        // A bare repository and a submodule repository: the repository itself.
+        let bare = f.ws.join("fx/remote.git");
+        hand_repo(&bare, "[core]\nhooksPath = rel\n");
+        hand_repo(&git.join("modules/sub"), "[core]\nhooksPath = sub-hooks\n");
+        let sb = build_env(&f, &uhome, None);
+        for protected in
+            [f.ws.join("main-hooks"), top.join("wt-hooks"), bare.join("rel"), git.join("modules/sub/sub-hooks")]
+        {
+            assert!(sb.protected.contains(&protected), "{}: {:?}", protected.display(), sb.protected);
+        }
+        // One configuration serves every working tree, so a hooks path read in one is joined to each top.
+        // Every top a repository may serve (the repository itself among them, for a bare one).
+        assert_eq!(work_tree_tops(&git, &[]), [git.clone(), f.ws.clone()]);
+        assert_eq!(work_tree_tops(&private, &[]), [private.clone(), top.clone()]);
+        assert_eq!(work_tree_tops(&bare, &[]), std::slice::from_ref(&bare));
+        // One configuration serves every working tree: the main repository's hooks path protects the linked one.
+        assert!(sb.protected.contains(&top.join("main-hooks")), "{:?}", sb.protected);
+        // The same, as the file tools' and the profile's rules.
+        refused_as_protected(&sb, &top.join("wt-hooks/post-merge"));
+        refused_as_protected(&sb, &bare.join("rel/pre-receive"));
+    }
+
+    /// A sandbox of `mode` for the workspace `ws` (made with a `.loom` directory), in the fixture's other places.
+    fn build_ws(f: &Fx, ws: &Path, mode: SandboxMode) -> Sandbox {
+        std::fs::create_dir_all(ws.join(".loom")).expect("mkdir");
+        Sandbox::new(&cfg(mode), ws, &f.tmp, &f.home, None).expect("sandbox")
+    }
+
+    /// Under the sandbox `sb` a command in `cwd` writes `<rel>/.husky/post-checkout`, which touches `marker`; then the
+    /// operator (outside it) runs `git checkout -b` in `checkout`. (the command succeeded, the hook ran)
+    fn plant_husky_and_checkout(sb: &Sandbox, cwd: &Path, rel: &str, checkout: &Path, marker: &Path) -> (bool, bool) {
+        let plant = format!(
+            "mkdir -p {rel}/.husky && printf '#!/bin/sh\\ntouch {}\\n' > {rel}/.husky/post-checkout && \
+             chmod +x {rel}/.husky/post-checkout",
+            s(marker)
+        );
+        let (planted, _) = run(sb, cwd, &format!("{GIT_SH}{plant}"));
+        git_ok(checkout, &["checkout", "-q", "-b", "x"]);
+        (planted, marker.exists())
+    }
+
+    /// The reproduction of a real-Git case: `make` builds the fixture (false when Git cannot) and returns where the
+    /// workspace is, where a command plants, and where the operator checks out. Without the profile the hook must
+    /// run (else the case is skipped); under it nothing is planted and nothing runs. Also returns the profile's
+    /// sandbox for further checks.
+    fn husky_case(test: &str, make: impl Fn(&Fx) -> Option<(PathBuf, String, PathBuf)>) -> Option<()> {
+        if !available() || !git_runs() {
+            return None;
+        }
+        let attempt = |mode: SandboxMode| -> Option<(bool, bool)> {
+            let f = fx();
+            let (ws, rel, checkout) = make(&f)?;
+            let sb = build_ws(&f, &ws, mode);
+            let marker = f.root.join("husky-ran");
+            Some(plant_husky_and_checkout(&sb, &ws, &rel, &checkout, &marker))
+        };
+        match attempt(SandboxMode::None) {
+            None => {
+                skipped(test, "git cannot make the fixture");
+                return None;
+            }
+            Some((true, true)) => {}
+            Some(other) => {
+                skipped(test, &format!("the hook does not run here: {other:?}"));
+                return None;
+            }
+        }
+        assert_eq!(attempt(SandboxMode::Seatbelt), Some((false, false)), "{test}: the planted hook ran");
+        Some(())
+    }
+
+    #[test]
+    fn core_worktree_of_a_submodule_repository_names_the_top_its_hooks_path_is_joined_to() {
+        let f = fx();
+        let uhome = f.root.join("uhome");
+        std::fs::create_dir_all(&uhome).expect("mkdir");
+        let git = f.ws.join(".git");
+        hand_repo(&git, "");
+        hand_repo(&git.join("modules/n"), "[core]\n\tworktree = ../../../n\n\thooksPath = .husky\n");
+        std::fs::create_dir_all(f.ws.join("n")).expect("mkdir");
+        let sb = build_env(&f, &uhome, None);
+        assert!(sb.protected.contains(&f.ws.join("n/.husky")), "{:?}", sb.protected);
+        // The old join, from the repository itself, stays.
+        assert!(sb.protected.contains(&git.join("modules/n/.husky")), "{:?}", sb.protected);
+        refused_as_protected(&sb, &f.ws.join("n/.husky/post-checkout"));
+        assert_eq!(
+            work_tree_tops(&git.join("modules/n"), &["../../../n".to_string()]),
+            [git.join("modules/n"), f.ws.join("n")]
+        );
+        // An absolute `core.worktree` is taken as it is.
+        let elsewhere = f.ws.join("abs");
+        assert!(work_tree_tops(&git, &[s(&elsewhere).to_string()]).contains(&elsewhere));
+    }
+
+    #[test]
+    fn a_real_submodules_hooks_path_protects_the_submodule_and_its_hook_does_not_run() {
+        let test = "a_real_submodules_hooks_path_protects_the_submodule_and_its_hook_does_not_run";
+        let made = husky_case(test, |f| {
+            let src = f.root.join("subsrc");
+            std::fs::create_dir_all(&src).expect("mkdir");
+            let steps = git_ok(&src, &["init", "-q"])
+                && git_ok(&src, &["commit", "-q", "--allow-empty", "-m", "s"])
+                && git_ok(&f.ws, &["init", "-q"])
+                && git_ok(&f.ws, &["commit", "-q", "--allow-empty", "-m", "i"])
+                && git_ok(&f.ws, &["submodule", "add", "-q", s(&src), "sm"])
+                && git_ok(&f.ws, &["commit", "-q", "-m", "sm"])
+                && git_ok(&f.ws.join("sm"), &["config", "core.hooksPath", ".husky"]);
+            steps.then(|| (f.ws.clone(), "sm".to_string(), f.ws.join("sm")))
+        });
+        if made.is_none() {
+            return;
+        }
+        let f = fx();
+        let src = f.root.join("subsrc");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        let ok = git_ok(&src, &["init", "-q"])
+            && git_ok(&src, &["commit", "-q", "--allow-empty", "-m", "s"])
+            && git_ok(&f.ws, &["init", "-q"])
+            && git_ok(&f.ws, &["commit", "-q", "--allow-empty", "-m", "i"])
+            && git_ok(&f.ws, &["submodule", "add", "-q", s(&src), "sm"])
+            && git_ok(&f.ws.join("sm"), &["config", "core.hooksPath", ".husky"]);
+        assert!(ok);
+        let sb = build_ws(&f, &f.ws, SandboxMode::Seatbelt);
+        refused_as_protected(&sb, &f.ws.join("sm/.husky/post-checkout"));
+        assert!(!run(&sb, &f.ws, "mkdir -p sm/.husky").0);
+    }
+
+    #[test]
+    fn a_common_configs_hooks_path_protects_the_linked_worktree_that_is_the_workspace() {
+        let test = "a_common_configs_hooks_path_protects_the_linked_worktree_that_is_the_workspace";
+        // Hand-made: the common configuration is the main repository's, the workspace the linked worktree.
+        let f = fx();
+        let uhome = f.root.join("uhome");
+        std::fs::create_dir_all(&uhome).expect("mkdir");
+        let (main, wt) = (f.root.join("main"), f.root.join("wt"));
+        let private = main.join(".git/worktrees/wt");
+        hand_repo(&main.join(".git"), "[core]\nhooksPath = .husky\n");
+        std::fs::create_dir_all(&private).expect("mkdir");
+        std::fs::create_dir_all(wt.join(".loom")).expect("mkdir");
+        std::fs::write(private.join("HEAD"), "ref: refs/heads/w\n").expect("write");
+        std::fs::write(private.join("commondir"), "../..\n").expect("write");
+        std::fs::write(private.join("gitdir"), format!("{}/.git\n", s(&wt))).expect("write");
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", s(&private))).expect("write");
+        let sb = Sandbox::with_env(&cfg(SandboxMode::Seatbelt), &wt, &f.tmp, &f.home, None, Some(uhome), None)
+            .expect("sandbox");
+        assert!(sb.protected.contains(&wt.join(".husky")), "{:?}", sb.protected);
+        refused_as_protected(&sb, &wt.join(".husky/post-checkout"));
+        // With real Git.
+        husky_case(test, |f| {
+            let (main, wt) = (f.root.join("main"), f.root.join("wt"));
+            std::fs::create_dir_all(&main).expect("mkdir");
+            let ok = git_ok(&main, &["init", "-q"])
+                && git_ok(&main, &["commit", "-q", "--allow-empty", "-m", "i"])
+                && git_ok(&main, &["config", "core.hooksPath", ".husky"])
+                && git_ok(&main, &["worktree", "add", "-q", "-b", "w", s(&wt)]);
+            ok.then(|| (wt.clone(), ".".to_string(), wt))
+        });
+    }
+
+    #[test]
+    fn a_planted_bare_shape_does_not_hide_what_lies_below_it() {
+        let f = fx();
+        let uhome = f.root.join("uhome");
+        std::fs::create_dir_all(&uhome).expect("mkdir");
+        let git = f.ws.join(".git");
+        hand_repo(&git, "[core]\nhooksPath = .husky\n");
+        hand_repo(&git.join("modules/sub"), "[core]\nworktree = ../../../sub\nhooksPath = .sub-hooks\n");
+        hand_repo(&f.ws.join("vendor/inner/.git"), "[core]\nhooksPath = .vh\n");
+        // What a command writes under the profile: `HEAD` and `objects` at the root and where a repository lies below.
+        let shape = "echo ref: refs/heads/x > HEAD && mkdir objects && echo ref: refs/heads/x > vendor/HEAD && \
+                     mkdir vendor/objects && mkdir vendor/objects/pack";
+        if available() {
+            let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+            let (ok, text) = run(&sb, &f.ws, shape);
+            assert!(ok, "{text}");
+        } else {
+            for (file, dir) in [("HEAD", "objects"), ("vendor/HEAD", "vendor/objects")] {
+                std::fs::write(f.ws.join(file), "ref: refs/heads/x\n").expect("write");
+                std::fs::create_dir_all(f.ws.join(dir)).expect("mkdir");
+            }
+        }
+        assert!(is_repository(&f.ws) && is_repository(&f.ws.join("vendor")), "the shape is a repository");
+        let found = git_directories(&f.ws).expect("found");
+        for repo in [git.clone(), git.join("modules/sub"), f.ws.join("vendor/inner/.git")] {
+            assert!(found.repos.contains(&repo), "{} is not in {:?}", repo.display(), found.repos);
+        }
+        // A directory with a `.git` is no bare repository (one without, such as `vendor` here, counts as one).
+        assert!(!found.repos.contains(&f.ws), "{:?}", found.repos);
+        let sb = build_env(&f, &uhome, None);
+        assert!(sb.git_dirs.contains(&git), "{:?}", sb.git_dirs);
+        for protected in [".husky", ".vh", "vendor/inner/.vh", "sub/.sub-hooks"] {
+            assert!(sb.protected.contains(&f.ws.join(protected)), "{protected}: {:?}", sb.protected);
+        }
+        refused_as_protected(&sb, &f.ws.join(".husky/post-checkout"));
+        refused_as_protected(&sb, &git.join("modules/sub/hooks/x"));
+    }
+
+    #[test]
+    fn the_search_goes_on_below_a_bare_repository_but_not_into_its_objects() {
+        let f = fx();
+        let bare = f.ws.join("fixtures/remote.git");
+        hand_repo(&bare, "");
+        hand_repo(&bare.join("sub/.git"), "");
+        hand_repo(&bare.join("objects/zz/.git"), "");
+        let found = git_directories(&f.ws).expect("found");
+        let mut want = vec![bare.join("sub/.git"), bare.clone()];
+        want.sort();
+        assert_eq!(found.repos, want);
+    }
+
+    #[test]
+    fn a_user_name_in_a_value_is_looked_up_and_an_unknown_one_names_nothing() {
+        let Some((name, dir)) = current_user() else { return };
+        let base = Path::new("/base");
+        assert_eq!(config_value_path(&format!("~{name}/x/y"), None, base), Some(dir.join("x/y")));
+        assert_eq!(config_value_path(&format!("~{name}"), None, base), Some(dir.clone()));
+        for unknown in ["~no-such-user-loom-3f9a/x", "~no-such-user-loom-3f9a"] {
+            assert_eq!(config_value_path(unknown, Some(Path::new("/h")), base), None, "{unknown}");
+        }
+        assert_eq!(config_value_path("~/x", Some(Path::new("/h")), base), Some(PathBuf::from("/h/x")));
+        // A workspace in the user's home, named as `~<user>/…/.husky`.
+        let Ok(tmp) = tempfile::Builder::new().prefix("loom-sbx-").tempdir_in(&dir) else { return };
+        let ws = tmp.path().canonicalize().expect("canonical");
+        let f = fx();
+        let rel = tmp.path().strip_prefix(&dir).expect("under home").to_path_buf();
+        hand_repo(&ws.join(".git"), &format!("[core]\nhooksPath = ~{name}/{}/.husky\n", rel.display()));
+        std::fs::create_dir_all(ws.join(".loom")).expect("mkdir");
+        let c = SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) };
+        let sb = Sandbox::with_env(&c, &ws, &f.tmp, &f.home, None, Some(dir), None).expect("sandbox");
+        assert!(sb.protected.contains(&ws.join(".husky")), "{:?}", sb.protected);
+        refused_as_protected(&sb, &ws.join(".husky/post-checkout"));
+        // An unknown user protects nothing.
+        hand_repo(&ws.join(".git"), "[core]\nhooksPath = ~no-such-user-loom-3f9a/.husky\n");
+        let sb = Sandbox::with_env(&c, &ws, &f.tmp, &f.home, None, Some(PathBuf::from("/nonexistent")), None)
+            .expect("sandbox");
+        assert!(!sb.protected.contains(&ws.join("~no-such-user-loom-3f9a/.husky")), "{:?}", sb.protected);
+    }
+
+    /// The name and home directory of the user running the tests, from the user database.
+    fn current_user() -> Option<(String, PathBuf)> {
+        use std::ffi::{CStr, OsStr};
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf: Vec<libc::c_char> = vec![0; 4096];
+        // SAFETY: an all-zero `passwd` is a valid value for `getpwuid_r` to fill in.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `pwd` and `result` are valid for writes and `buf` for `buf.len()` bytes, which outlive the use below.
+        let rc = unsafe { libc::getpwuid_r(libc::getuid(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+        if rc != 0 || result.is_null() || pwd.pw_name.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: both pointers are non-null and point to NUL-terminated strings inside `buf`.
+        let (name, dir) = unsafe { (CStr::from_ptr(pwd.pw_name), CStr::from_ptr(pwd.pw_dir)) };
+        let dir = PathBuf::from(OsStr::from_bytes(dir.to_bytes()));
+        dir.is_absolute().then(|| (name.to_string_lossy().into_owned(), dir))
+    }
+
+    #[test]
+    fn the_configuration_of_the_repository_that_encloses_the_workspace_is_read_not_protected() {
+        let test = "the_configuration_of_the_repository_that_encloses_the_workspace_is_read_not_protected";
+        let f = fx();
+        let (mono, app) = (f.root.join("mono"), f.root.join("mono/app"));
+        hand_repo(&mono.join(".git"), "[core]\nhooksPath = app/.husky\n");
+        let sb = build_ws(&f, &app, SandboxMode::Seatbelt);
+        assert!(sb.protected.contains(&app.join(".husky")), "{:?}", sb.protected);
+        refused_as_protected(&sb, &app.join(".husky/post-checkout"));
+        // Its own files are outside the writable roots: not in `git_dirs`, not protected.
+        assert!(sb.git_dirs.is_empty(), "{:?}", sb.git_dirs);
+        assert!(!sb.protected.iter().any(|p| p.starts_with(mono.join(".git"))), "{:?}", sb.protected);
+        // Where the repository lies in a writable root it is found like any other.
+        let c = SandboxCfg { extra_writable: vec![s(&mono).to_string()], ..cfg(SandboxMode::Seatbelt) };
+        let sb = Sandbox::new(&c, &app, &f.tmp, &f.home, None).expect("sandbox");
+        assert!(sb.git_dirs.contains(&mono.join(".git")), "{:?}", sb.git_dirs);
+        assert!(sb.protected.contains(&mono.join(".git/hooks")), "{:?}", sb.protected);
+        // A `.git` file that names a repository counts too, and a `.git` that names none is passed over.
+        let f = fx();
+        let mono = f.root.join("mono");
+        hand_repo(&f.root.join("store"), "[core]\nhooksPath = bad/app/.husky2\n");
+        std::fs::create_dir_all(mono.join("bad")).expect("mkdir");
+        std::fs::write(mono.join(".git"), format!("gitdir: {}\n", s(&f.root.join("store")))).expect("write");
+        std::fs::write(mono.join("bad/.git"), "gitdir: /nonexistent\n").expect("write");
+        let sb = build_ws(&f, &mono.join("bad/app"), SandboxMode::Seatbelt);
+        assert!(sb.protected.contains(&mono.join("bad/app/.husky2")), "{:?}", sb.protected);
+        // With real Git, a hook under the workspace subdirectory does not run.
+        husky_case(test, |f| {
+            let mono = f.root.join("mono");
+            std::fs::create_dir_all(mono.join("app")).expect("mkdir");
+            let ok = git_ok(&mono, &["init", "-q"])
+                && git_ok(&mono, &["commit", "-q", "--allow-empty", "-m", "i"])
+                && git_ok(&mono, &["config", "core.hooksPath", "app/.husky"]);
+            ok.then(|| (mono.join("app"), ".".to_string(), mono.join("app")))
+        });
+    }
+
+    #[test]
+    fn a_repository_inside_a_hidden_home_is_not_mounted_unless_it_lies_in_a_writable_root() {
+        let (loom, home) = (PathBuf::from("/l/home"), PathBuf::from("/u/home"));
+        let ws = home.join("proj");
+        let repos = [
+            loom.join("sessions/s/repo.git"),
+            home.join("other/.git"),
+            ws.join(".git"),
+            PathBuf::from("/srv/outer/.git"),
+            home.join(".git"),
+            PathBuf::from("/l"),
+        ];
+        let writable = [ws.clone()];
+        // Credentials protected: the home is hidden, so a repository inside it is mounted only when it lies in a
+        // writable root; one that holds a home is never.
+        assert_eq!(
+            mountable(&repos, &loom, Some(&home), true, &writable),
+            [ws.join(".git"), PathBuf::from("/srv/outer/.git")]
+        );
+        // Credentials not protected: the user's home is not hidden; the loom home always is.
+        assert_eq!(
+            mountable(&repos, &loom, Some(&home), false, &writable),
+            [home.join("other/.git"), ws.join(".git"), PathBuf::from("/srv/outer/.git"), home.join(".git")]
+        );
+        // A repository in the loom home that lies in a writable root (a replay's staged workspace) stays.
+        let staged = [loom.join("oracle-runs/r/ws")];
+        assert_eq!(
+            mountable(&[loom.join("oracle-runs/r/ws/.git")], &loom, Some(&home), true, &staged),
+            [loom.join("oracle-runs/r/ws/.git")]
+        );
+    }
+
+    /// The husky case: the operator's Git runs `.husky/post-checkout`, which a command wrote. Whether the hook ran
+    /// after `git checkout -b x`, with the command run under `mode`; `None` when Git cannot make the repository.
+    fn husky_hook_ran(mode: SandboxMode) -> Option<bool> {
+        let f = fx();
+        let ws = &f.ws;
+        let marker = f.root.join("husky-ran");
+        let steps: [&[&str]; 3] =
+            [&["init", "-q"], &["commit", "-q", "--allow-empty", "-m", "i"], &["config", "core.hooksPath", ".husky"]];
+        if !git_runs() || !steps.iter().all(|a| git_ok(ws, a)) {
+            return None;
+        }
+        let sb = build(&f, &cfg(mode), None);
+        let plant = format!(
+            "mkdir -p .husky && printf '#!/bin/sh\\ntouch {}\\n' > .husky/post-checkout && chmod +x .husky/post-checkout",
+            s(&marker)
+        );
+        let (planted, _) = run(&sb, ws, &format!("{GIT_SH}{plant}"));
+        assert_eq!(planted, mode == SandboxMode::None, "the hook was planted under the wrong mode ({mode:?})");
+        git_ok(ws, &["checkout", "-q", "-b", "x"]);
+        Some(marker.exists())
+    }
+
+    #[test]
+    fn a_hook_a_command_writes_to_the_configured_hooks_directory_does_not_run() {
+        let test = "a_hook_a_command_writes_to_the_configured_hooks_directory_does_not_run";
+        if !available() {
+            return;
+        }
+        match husky_hook_ran(SandboxMode::None) {
+            None => return skipped(test, "git cannot make the fixture"),
+            Some(false) => return skipped(test, "a hook in the configured directory does not run here"),
+            Some(true) => {}
+        }
+        assert_eq!(husky_hook_ran(SandboxMode::Seatbelt), Some(false), "the planted hook ran");
+    }
+
+    #[test]
+    fn construction_protects_the_hooks_directory_under_the_profile() {
+        if !available() {
+            return;
+        }
+        let f = fx();
+        hand_repo(&f.ws.join(".git"), "[core]\nhooksPath = .husky\n[include]\npath = ../shared.inc\n");
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        for attempt in [
+            "mkdir .husky",
+            "mkdir -p .husky/_ && echo x > .husky/_/h",
+            "echo x > shared.inc",
+            "mkdir -p $TMPDIR/hk && mv $TMPDIR/hk .husky",
+        ] {
+            assert!(!run(&sb, &f.ws, attempt).0, "`{attempt}` succeeded under the profile");
+        }
+        let (ok, text) = run(&sb, &f.ws, "mkdir -p src && echo x > src/a && echo x > .husky-other");
+        assert!(ok, "{text}");
+    }
+
+    /// The workspace is a repository (`git init`, one commit) and `lib/foo` a repository set up as a submodule
+    /// *after* the sandbox was built, by the operator (outside it). False when Git cannot make that.
+    fn slash_named_submodule_after_construction(f: &Fx, mode: SandboxMode) -> Option<Sandbox> {
+        let steps: [&[&str]; 2] = [&["init", "-q"], &["commit", "-q", "--allow-empty", "-m", "i"]];
+        if !git_runs() || !steps.iter().all(|a| git_ok(&f.ws, a)) {
+            return None;
+        }
+        let src = f.root.join("libsrc");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        let made = git_ok(&src, &["init", "-q"]) && git_ok(&src, &["commit", "-q", "--allow-empty", "-m", "s"]);
+        let sb = build(f, &cfg(mode), None);
+        let added = made && git_ok(&f.ws, &["submodule", "add", "-q", s(&src), "lib/foo"]);
+        let added = added && git_ok(&f.ws, &["commit", "-q", "-m", "lib"]);
+        (added && f.ws.join(".git/modules/lib/foo/HEAD").is_file()).then_some(sb)
+    }
+
+    #[test]
+    fn a_submodule_set_up_after_construction_cannot_be_replaced_by_a_copy_with_a_config_of_its_own() {
+        let test = "a_submodule_set_up_after_construction_cannot_be_replaced_by_a_copy_with_a_config_of_its_own";
+        if !available() {
+            return;
+        }
+        // The audit review's steps: move the repository away, copy it with `core.fsmonitor` set, move the copy in.
+        let attack = |mode: SandboxMode| -> Option<(bool, bool)> {
+            let f = fx();
+            let marker = f.root.join("fsmonitor-ran");
+            let sb = slash_named_submodule_after_construction(&f, mode)?;
+            let script = format!(
+                "mv .git/modules/lib/foo $TMPDIR/foo.orig && cp -R $TMPDIR/foo.orig $TMPDIR/evil && \
+                 printf '[core]\\n\\tfsmonitor = touch {}\\n' >> $TMPDIR/evil/config && \
+                 mv $TMPDIR/evil .git/modules/lib/foo",
+                s(&marker)
+            );
+            let (done, _) = run(&sb, &f.ws, &format!("{GIT_SH}{script}"));
+            git_ok(&f.ws, &["status"]);
+            Some((done, marker.exists()))
+        };
+        match attack(SandboxMode::None) {
+            None => return skipped(test, "git cannot make the fixture"),
+            Some((true, true)) => {}
+            Some(other) => return skipped(test, &format!("the same steps do not make Git run it here: {other:?}")),
+        }
+        assert_eq!(attack(SandboxMode::Seatbelt), Some((false, false)), "the copy was moved into place and ran");
+        // Nothing can be made or removed in it either, and what Git itself writes there still can be.
+        let f = fx();
+        let Some(sb) = slash_named_submodule_after_construction(&f, SandboxMode::Seatbelt) else {
+            return skipped(test, "git cannot make the fixture");
+        };
+        for attempt in [
+            "mkdir .git/modules/lib/foo/x",
+            "touch .git/modules/lib/foo/y",
+            "mv .git/modules/lib/foo/objects $TMPDIR/o",
+            "mv .git/modules/lib/foo $TMPDIR/o",
+            "mv .git/modules/lib $TMPDIR/o",
+            "rm -rf .git/modules/lib/foo/refs",
+            "mkdir -p $TMPDIR/m && mv $TMPDIR/m .git/modules/lib/foo/m",
+            "mkdir -p .git/modules/lib/bar/hooks",
+        ] {
+            assert!(!run(&sb, &f.ws, &format!("{GIT_SH}{attempt}")).0, "`{attempt}` succeeded under the profile");
+        }
+        for rel in
+            ["modules/lib/foo/x", "modules/lib/foo/objects/ab", "modules/lib/foo/refs/heads/x", "modules/lib/bar"]
+        {
+            assert!(sb.check_write(&written(&f, rel)).is_err(), "{rel}");
+        }
+        // From the next session on it is found, and Git's writes there work.
+        let next = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        assert!(next.git_modules.contains(&written(&f, "modules/lib/foo")), "{:?}", next.git_modules);
+        let (ok, text) =
+            run(&next, &f.ws, &format!("{GIT_SH}cd lib/foo && echo a > a && git add a && git commit -qm a"));
+        assert!(ok, "{text}");
+        assert!(next.check_write(&written(&f, "modules/lib/foo/objects/ab")).is_ok());
+    }
+
+    #[test]
+    fn below_a_found_submodule_only_the_repositories_found_can_be_written_and_the_rest_of_the_git_directory_can() {
+        let test = "below_a_found_submodule_only_the_repositories_found_can_be_written";
+        let f = fx();
+        if !git_runs() || !git_fixture(&f) {
+            return skipped(test, "git cannot make the fixture");
+        }
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let refused = [
+            "modules/sub/modules/a/c",
+            "modules/nest/modules/a/c",
+            "modules/nest/modules/inner/modules/a/c",
+            "modules/nest/modules/inner/modules",
+            "modules/nest/modules/a",
+            "modules/third/a/b",
+            "modules/sub/worktrees/a/b",
+        ];
+        let accepted = [
+            "modules/sub/objects/ab/cd",
+            "modules/nest/modules/inner/objects/ab/cd",
+            "modules/nest/objects/ab/cd",
+            "refs/heads/modules/x/y",
+            "objects/modules/x/y",
+            "logs/refs/heads/modules/x/y",
+        ];
+        for rel in refused {
+            assert!(sb.check_write(&written(&f, rel)).is_err(), "{rel} is refused by check_write");
+        }
+        for rel in accepted {
+            assert!(sb.check_write(&written(&f, rel)).is_ok(), "{rel} is accepted by check_write");
+        }
+        if !available() {
+            return;
+        }
+        // A branch named like a module in the workspace's own repository, and a commit in a nested submodule.
+        for script in [
+            "git branch modules/x/y && git branch -d modules/x/y",
+            "cd nest/inner && echo b > b && git add b && git commit -qm b",
+        ] {
+            let (ok, text) = run(&sb, &f.ws, &format!("{GIT_SH}{script}"));
+            assert!(ok, "`{script}` failed under the profile: {text}");
+        }
+        for rel in refused {
+            let script = format!("mkdir -p .git/{rel}");
+            assert!(!run(&sb, &f.ws, &script).0, "`{script}` succeeded under the profile");
+        }
+        for rel in accepted {
+            let script = format!("mkdir -p .git/{rel}/new && touch .git/{rel}/new/f && rm -r .git/{rel}/new");
+            let (ok, text) = run(&sb, &f.ws, &script);
+            assert!(ok, "`{script}` failed under the profile: {text}");
+        }
+    }
+
+    // ---- mounting and preferences ----
+
+    /// Whether `dir` is a mount point now, as `mount` says (`hdiutil` may exit 0 and mount nothing).
+    fn mounted(dir: &Path) -> bool {
+        let out = Command::new("/sbin/mount").output().expect("mount");
+        String::from_utf8_lossy(&out.stdout).contains(&format!(" on {} ", s(dir)))
+    }
+
+    /// Makes an image with `hdiutil makehybrid` and attaches it at a directory, in a command run under `mode`;
+    /// whether it is mounted afterwards (and then detached). `None` when `hdiutil` cannot make the image.
+    fn image_mounted(mode: SandboxMode) -> Option<bool> {
+        let f = fx();
+        let (img, mp) = (f.tmp.join("img"), f.tmp.join("mp"));
+        std::fs::create_dir_all(&img).expect("mkdir");
+        std::fs::create_dir_all(&mp).expect("mkdir");
+        std::fs::write(img.join("f"), "x").expect("write");
+        let sb = build(&f, &cfg(mode), None);
+        let script = format!(
+            "hdiutil makehybrid -quiet -iso -joliet -hfs -o $TMPDIR/h.iso {} && \
+             hdiutil attach -nobrowse -mountpoint {} $TMPDIR/h.iso",
+            s(&img),
+            s(&mp)
+        );
+        run(&sb, &f.ws, &script);
+        if !f.tmp.join("h.iso").is_file() {
+            return None;
+        }
+        let was = mounted(&mp);
+        if was {
+            let _ = Command::new("hdiutil").args(["detach", "-force", s(&mp)]).output();
+        }
+        Some(was)
+    }
+
+    #[test]
+    fn a_disk_image_cannot_be_mounted_by_a_command() {
+        let test = "a_disk_image_cannot_be_mounted_by_a_command";
+        if !available() || !Path::new("/usr/bin/hdiutil").exists() {
+            return;
+        }
+        match image_mounted(SandboxMode::None) {
+            None => return skipped(test, "hdiutil cannot make the image here"),
+            Some(false) => return skipped(test, "an image is not mounted here even outside the sandbox"),
+            Some(true) => {}
+        }
+        // The image is made under the profile too (`image_mounted` is `None` when it is not), so the refusal is
+        // the attach's.
+        assert_eq!(image_mounted(SandboxMode::Seatbelt), Some(false), "an image was mounted under the profile");
+    }
+
+    #[test]
+    fn a_preference_domain_cannot_be_written_by_a_command_while_preferences_can_be_read() {
+        let test = "a_preference_domain_cannot_be_written_by_a_command_while_preferences_can_be_read";
+        if !available() || !Path::new("/usr/bin/defaults").exists() {
+            return;
+        }
+        let f = fx();
+        let domain = format!("com.loom-test.{}", unique("p"));
+        let read_back = || {
+            Command::new("/usr/bin/defaults").args(["read", &domain, "k"]).output().is_ok_and(|o| o.status.success())
+        };
+        let write = |mode: SandboxMode| {
+            let sb = build(&f, &cfg(mode), None);
+            run(&sb, &f.ws, &format!("defaults write {domain} k v"))
+        };
+        let control = write(SandboxMode::None).0 && read_back();
+        let _ = Command::new("/usr/bin/defaults").args(["delete", &domain]).output();
+        if !control {
+            return skipped(test, "defaults does not write a domain here even outside the sandbox");
+        }
+        let (_, text) = write(SandboxMode::Seatbelt);
+        let stored = read_back();
+        let _ = Command::new("/usr/bin/defaults").args(["delete", &domain]).output();
+        assert!(!stored, "a command wrote a preference under the profile: {text}");
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let (ok, text) = run(&sb, &f.ws, "defaults read -g > /dev/null");
+        assert!(ok, "reading preferences must work: {text}");
+    }
+
+    // ---- network ----
+
+    #[test]
+    fn the_profile_denies_the_daemon_port_and_the_certificate_services_exactly_when_told_to() {
+        let f = fx();
+        let base = SandboxCfg {
+            loopback_ports: vec![9000],
+            unix_sockets: vec![format!("{}/run.sock", s(&f.root))],
+            protect_credentials: false,
+            ..cfg(SandboxMode::Seatbelt)
+        };
+        let plain = build(&f, &base, None).profile().expect("profile");
+        let port = "(deny network-outbound (remote ip \"*:7777\"))\n";
+        let services = FETCH_SERVICES;
+        let bind = "(allow network-bind (local ip \"localhost:*\"))\n";
+        let tail = format!("{bind}(allow network-inbound (local ip \"localhost:*\"))\n");
+        assert!(plain.ends_with(&tail) && !plain.contains("*:7777") && !plain.contains("trustd"), "{plain}");
+        assert!(plain.contains(MOUNT_LINES), "{plain}");
+        let only_port = SandboxCfg { daemon_port: Some(7777), ..base.clone() };
+        let only_port = build(&f, &only_port, None).profile().expect("profile");
+        assert_eq!(only_port, plain.replace(bind, &format!("{port}{bind}")));
+        let only_services = SandboxCfg { network_deny_all: true, ..base.clone() };
+        let only_services = build(&f, &only_services, None).profile().expect("profile");
+        assert_eq!(only_services, format!("{plain}{services}"));
+        let both = SandboxCfg { daemon_port: Some(7777), network_deny_all: true, ..base };
+        let both = build(&f, &both, None).profile().expect("profile");
+        // After the allows (the last is the unix socket), before the bind and inbound allows; the services last.
+        let socket = both.find("(allow network-outbound (remote unix-socket").expect("socket");
+        let (deny, bind_at) = (both.find(port).expect("port deny"), both.find(bind).expect("bind"));
+        assert!(socket < deny && deny < bind_at, "{both}");
+        assert!(both.ends_with(&format!("{tail}{services}")), "{both}");
+        assert_eq!(both, plain.replace(bind, &format!("{port}{bind}")) + services);
+        // `loopback_all` is written first and the deny still follows it; with a daemon port the allow is written
+        // for TCP and UDP (a deny of one port after an allow written `ip` is not reliable).
+        let all = SandboxCfg { loopback_all: true, daemon_port: Some(7777), ..cfg(SandboxMode::Seatbelt) };
+        let all = build(&f, &all, None).profile().expect("profile");
+        let wildcard = "(allow network-outbound (remote tcp \"localhost:*\") (remote udp \"localhost:*\"))\n";
+        assert!(all.find(wildcard).expect("allow") < all.find(port).expect("deny"), "{all}");
+        assert!(!all.contains("(remote ip \"localhost:*\")"), "{all}");
+        let no_port = SandboxCfg { loopback_all: true, ..cfg(SandboxMode::Seatbelt) };
+        let no_port = build(&f, &no_port, None).profile().expect("profile");
+        assert!(no_port.contains("(allow network-outbound (remote ip \"localhost:*\"))\n"), "{no_port}");
+        // Bubblewrap has no profile; mode none neither.
+        assert!(build(&f, &SandboxCfg { daemon_port: Some(1), ..cfg(SandboxMode::None) }, None).profile().is_none());
+    }
+
+    #[test]
+    fn the_daemon_port_is_refused_at_every_address_while_other_loopback_ports_connect() {
+        if !available() {
+            return;
+        }
+        let test = "the_daemon_port_is_refused_at_every_address_while_other_loopback_ports_connect";
+        let f = fx();
+        // Several ports, one after the other: a deny of one port that holds for some ports only was seen.
+        for _ in 0..10 {
+            let daemon = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = daemon.local_addr().expect("addr").port();
+            let other = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let other_port = other.local_addr().expect("addr").port();
+            // The same port on the other addresses of this host, where they can be had.
+            let v6 = std::net::TcpListener::bind(("::1", port)).ok();
+            let own = host_address().and_then(|ip| std::net::TcpListener::bind((ip, port)).ok().map(|l| (ip, l)));
+            let mut hosts = vec!["127.0.0.1".to_string()];
+            hosts.extend(v6.as_ref().map(|_| "::1".to_string()));
+            hosts.extend(own.as_ref().map(|(ip, _)| ip.to_string()));
+            let none = build(&f, &cfg(SandboxMode::None), None);
+            hosts.retain(|h| {
+                let reachable = connects(&none, &f.ws, h, port);
+                if !reachable {
+                    skipped(test, &format!("{h}:{port} cannot be reached even outside the sandbox"));
+                }
+                reachable
+            });
+            assert!(hosts.iter().any(|h| h == "127.0.0.1"), "loopback must be reachable outside the sandbox");
+            let variants = [
+                SandboxCfg { loopback_all: true, daemon_port: Some(port), ..cfg(SandboxMode::Seatbelt) },
+                SandboxCfg {
+                    loopback_ports: vec![port, other_port],
+                    daemon_port: Some(port),
+                    ..cfg(SandboxMode::Seatbelt)
+                },
+            ];
+            for c in &variants {
+                let sb = build(&f, c, None);
+                for h in &hosts {
+                    assert!(!connects(&sb, &f.ws, h, port), "{h}:{port} connected under {c:?}");
+                }
+                assert!(
+                    connects(&sb, &f.ws, "127.0.0.1", other_port),
+                    "another loopback port must still connect: {c:?}"
+                );
+                // As a proxy port too: the allow of the proxy does not outrank the deny.
+                assert!(!connects(
+                    &Sandbox::new(c, &f.ws, &f.tmp, &f.home, Some(port)).expect("sandbox"),
+                    &f.ws,
+                    "127.0.0.1",
+                    port
+                ));
+            }
+            // Without the daemon port the very same configuration connects, so the deny is what refuses it.
+            for c in &variants {
+                let open = SandboxCfg { daemon_port: None, ..c.clone() };
+                let sb = build(&f, &open, None);
+                for h in hosts.iter().filter(|h| h.as_str() == "127.0.0.1" || h.as_str() == "::1") {
+                    assert!(connects(&sb, &f.ws, h, port), "{h}:{port} must connect without the deny: {open:?}");
+                }
+            }
+            drop((daemon, other, v6, own));
+        }
+    }
+
+    /// A certificate for `leaf.example` whose `caIssuers` names `url`, made with the system's `openssl`.
+    fn aia_certificate(dir: &Path, url: &str) -> Option<PathBuf> {
+        std::fs::create_dir_all(dir).ok()?;
+        let extensions = format!(
+            "[v3]\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n\
+             subjectAltName=DNS:leaf.example\nauthorityInfoAccess=caIssuers;URI:{url}\n"
+        );
+        std::fs::write(dir.join("ext.cnf"), extensions).ok()?;
+        let openssl = |args: &[&str]| {
+            Command::new("/usr/bin/openssl").args(args).current_dir(dir).output().is_ok_and(|o| o.status.success())
+        };
+        let made = openssl(&[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "ca.key",
+            "-out",
+            "ca.pem",
+            "-subj",
+            "/CN=loom-test-ca",
+            "-days",
+            "2",
+        ]) && openssl(&[
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "leaf.key",
+            "-out",
+            "leaf.csr",
+            "-subj",
+            "/CN=leaf.example",
+        ]) && openssl(&[
+            "x509",
+            "-req",
+            "-in",
+            "leaf.csr",
+            "-CA",
+            "ca.pem",
+            "-CAkey",
+            "ca.key",
+            "-CAcreateserial",
+            "-days",
+            "2",
+            "-extfile",
+            "ext.cnf",
+            "-extensions",
+            "v3",
+            "-out",
+            "leaf.pem",
+        ]);
+        made.then(|| dir.join("leaf.pem"))
+    }
+
+    #[test]
+    fn certificate_evaluation_fetches_no_url_for_a_command_under_deny_all() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let test = "certificate_evaluation_fetches_no_url_for_a_command_under_deny_all";
+        if !available() || !Path::new("/usr/bin/security").exists() || !Path::new("/usr/bin/openssl").exists() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (requests, stop) = (requests.clone(), stop.clone());
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader, Write};
+                while !stop.load(Ordering::SeqCst) {
+                    let Ok((mut conn, _)) = listener.accept() else {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    };
+                    let _ = conn.set_nonblocking(false);
+                    let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                    let mut line = String::new();
+                    if BufReader::new(&conn).read_line(&mut line).is_ok() {
+                        if let Ok(mut seen) = requests.lock() {
+                            seen.push(line.trim().to_string());
+                        }
+                    }
+                    let _ = conn.write_all(b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                }
+            })
+        };
+        let fetched = |path: &str, wait: u64| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+            loop {
+                if requests.lock().is_ok_and(|seen| seen.iter().any(|l| l.contains(path))) {
+                    return true;
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        };
+        let f = fx();
+        let stamp = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos())
+        );
+        let verify = |sb: &Sandbox, name: &str| -> Option<(String, bool)> {
+            let path = format!("/loom-aia-{name}-{stamp}.cer");
+            let leaf =
+                aia_certificate(&sb.tmp_dir.join(format!("cert-{name}")), &format!("http://127.0.0.1:{port}{path}"))?;
+            let script = format!("/usr/bin/security verify-cert -c {} -p ssl -s leaf.example", s(&leaf));
+            Some((path, run(sb, &f.ws, &script).0))
+        };
+        let c = SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) };
+        (|| {
+            // Control: without the setting the service fetches the URL the certificate names.
+            let Some((path, _)) = verify(&build(&f, &c, None), "control") else {
+                return skipped(test, "openssl cannot make the certificates");
+            };
+            if !fetched(&path, 10) {
+                return skipped(test, "this host does not fetch the issuer of a certificate for a sandboxed command");
+            }
+            let denied = SandboxCfg { network_deny_all: true, ..c.clone() };
+            let Some((path, _)) = verify(&build(&f, &denied, None), "denied") else {
+                return skipped(test, "openssl cannot make the certificates");
+            };
+            assert!(!fetched(&path, 6), "the URL a certificate names was fetched for a command under deny_all");
+        })();
+        stop.store(true, Ordering::SeqCst);
+        let _ = thread.join();
+    }
+
+    #[test]
+    fn a_background_url_session_fetches_nothing_for_a_command_under_deny_all() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let test = "a_background_url_session_fetches_nothing_for_a_command_under_deny_all";
+        if !available() || !Path::new("/usr/bin/osascript").exists() {
+            return;
+        }
+        // The profile allows no loopback port, so a fetch that arrives here was made outside the sandbox.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (requests, stop) = (requests.clone(), stop.clone());
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader, Write};
+                while !stop.load(Ordering::SeqCst) {
+                    let Ok((mut conn, _)) = listener.accept() else {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    };
+                    let _ = conn.set_nonblocking(false);
+                    let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                    let mut line = String::new();
+                    if BufReader::new(&conn).read_line(&mut line).is_ok() {
+                        if let Ok(mut seen) = requests.lock() {
+                            seen.push(line.trim().to_string());
+                        }
+                    }
+                    let _ = conn.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+                }
+            })
+        };
+        let fetched = |path: &str, wait: u64| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+            loop {
+                if requests.lock().is_ok_and(|seen| seen.iter().any(|l| l.contains(path))) {
+                    return true;
+                }
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        };
+        let f = fx();
+        // A background session made and started from JavaScript for Automation, kept alive for a few seconds.
+        let start = |c: &SandboxCfg, name: &str| -> String {
+            let id = unique(&format!("loom-session-{name}"));
+            let path = format!("/{id}");
+            let js = format!(
+                "ObjC.import(\"Foundation\");\n\
+                 var cfg = $.NSClassFromString(\"NSURLSessionConfiguration\").backgroundSessionConfigurationWithIdentifier(\"{id}\");\n\
+                 var session = $.NSClassFromString(\"NSURLSession\").sessionWithConfiguration(cfg);\n\
+                 var task = session.downloadTaskWithURL($.NSURL.URLWithString(\"http://127.0.0.1:{port}{path}\"));\n\
+                 task.resume;\n\
+                 $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(6));\n"
+            );
+            std::fs::write(f.tmp.join(format!("{name}.js")), js).expect("write");
+            run(&build(&f, c, None), &f.ws, &format!("osascript -l JavaScript $TMPDIR/{name}.js"));
+            path
+        };
+        let c = SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) };
+        (|| {
+            // Control: without the setting the session service fetches the URL for the command.
+            let path = start(&c, "control");
+            if !fetched(&path, 10) {
+                return skipped(test, "this host does not fetch a background session's URL for a sandboxed command");
+            }
+            let denied = SandboxCfg { network_deny_all: true, ..c.clone() };
+            assert!(build(&f, &denied, None).profile().expect("profile").contains(FETCH_SERVICES));
+            let path = start(&denied, "denied");
+            assert!(!fetched(&path, 8), "a background URL session fetched a URL for a command under deny_all");
+        })();
+        stop.store(true, Ordering::SeqCst);
+        let _ = thread.join();
+    }
+
+    #[test]
+    fn describe_states_the_git_rules_and_the_certificate_services() {
+        let f = fx();
+        let seatbelt = build(&f, &cfg(SandboxMode::Seatbelt), None).describe();
+        for needle in [
+            "No Git repository can be made where commands write",
+            "no Git configuration, hooks, worktree or submodule repository",
+            "`git worktree add`",
+            "`git submodule update --init`",
+            "`git clone --bare <url> <dir>.git`",
+            "--git-dir=<dir>.git --work-tree=<dir>",
+            "`git submodule update` (any form) is the operator's",
+            "upstream tracking",
+            "cannot be recorded",
+            "dependencies from Git URLs (pip, npm, cargo, uv) cannot be installed (an archive URL can)",
+            "disk images cannot be mounted (extract them instead)",
+            "preferences cannot be written (`defaults write`)",
+        ] {
+            assert!(seatbelt.contains(needle), "{needle}: {seatbelt}");
+        }
+        assert!(!seatbelt.contains("codesign") && !seatbelt.contains("WebKit"), "{seatbelt}");
+        let deny_all = SandboxCfg { network_deny_all: true, ..cfg(SandboxMode::Seatbelt) };
+        let d = build(&f, &deny_all, None).describe();
+        assert!(
+            d.contains("Swift and Go programs, `security`, `codesign --verify`") && d.contains("curl and Python"),
+            "{d}"
+        );
+        assert!(d.contains("WebKit-based tools and background URL sessions fail"), "{d}");
+        assert_eq!(d, build(&f, &deny_all, None).describe());
+        // The Git sentence is the seatbelt description's; mode none does not confine commands.
+        let none = build(&f, &SandboxCfg { network_deny_all: true, ..cfg(SandboxMode::None) }, None).describe();
+        assert!(!none.contains("No Git repository") && !none.contains("codesign"), "{none}");
+        assert!(!none.contains("disk images") && !none.contains("WebKit") && !none.contains("defaults"), "{none}");
     }
 }

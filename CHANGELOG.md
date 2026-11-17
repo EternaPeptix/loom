@@ -27,6 +27,53 @@
   no earlier mission is sent without the `prior` key, so an older daemon still accepts it). The source is each mission's sealed
   journal; one that fails verification or was written by a newer loom is named unreadable. No log-schema change.
 
+### Sandbox: Git metadata, the trustd route, the daemon port, and adoption by descriptor
+
+- Commands and the file tools can no longer plant what Git runs as the operator. In every writable root (the
+  workspace, the session temp dir, `extra_writable`) the profile and `check_write` refuse Git configuration,
+  hooks and `commondir`/`gitdir` pointers of linked worktrees (`.git/worktrees/<n>/`) and submodule repositories
+  (`.git/modules/<n>/`, deinitialized and nested ones included), and refuse making or moving a `.git`, a
+  worktree gitdir or a submodule repository into place. Before, a command could point an external worktree's
+  `commondir` at a config of its own, plant a submodule hook, or `git init` a repository in `$TMPDIR` and move it
+  into the workspace behind a gitlink, and the operator's next `git status` ran its command (reproduced on macOS
+  27, Git 2.50). Existing worktree and submodule gitdirs are discovered at construction and protected (and
+  mounted read-only by Bubblewrap). `git init` and non-bare clones no longer work anywhere commands write: a bare
+  clone does; `git worktree add` and `git submodule update --init` are for the operator, and the refusal and the
+  system prompt say so.
+- The file tools' `check_write` compares those Git names as APFS folds them (`ſ`, the Kelvin sign, `ß` and the
+  `ﬀ`–`ﬆ` ligatures), so `write` can no longer make `.git/moduleſ/<n>/hooks/<hook>`, which Git reads as
+  `.git/modules/<n>/hooks/<hook>`; the profile's Git regexes spell the same folds (Seatbelt already matched
+  the folded name on macOS 27).
+- Under `network.mode = deny_all`, commands can no longer reach `com.apple.trustd.agent`, `com.apple.trustd` or
+  `com.apple.ocspd`. A command could have trustd fetch any URL named in a certificate (AIA), past the proxy and
+  `net.jsonl`. Programs that check certificates through macOS (Swift, Go, `security`, `codesign --verify`) now
+  fail in deny_all; curl and Python are unaffected. In the other modes this stays a documented residual.
+- Commands can no longer mount a file system or attach a disk image over a directory (`file-mount` and the
+  DiskArbitration/disk-image services are denied): `hdiutil attach -mountpoint` of an image a command made
+  replaced `.git/hooks`, and works over `~/.ssh` or `~/Library/LaunchAgents` (reproduced on macOS 27; this
+  predates the release). `hdiutil attach` and `diskutil` now fail in every session.
+- Commands can no longer write macOS preferences (`user-preference-write`): `cfprefsd` wrote
+  `~/Library/Preferences` for them outside the sandbox. Reading preferences still works.
+- Under `deny_all`, background URL sessions (`nsurlsessiond`) and WebKit's networking services are denied as
+  well: each fetched a URL for a command driven from `osascript -l JavaScript`.
+- Below `.git/modules/<name>/` nothing can be made or removed except inside the submodule repositories found
+  when the sandbox was built (a slash-named submodule set up mid-session could be replaced by a copy carrying
+  `core.fsmonitor`). The `core.hooksPath` directory and included files named by each repository's, the
+  enclosing repository's and the user's global Git configuration are protected (husky's `.husky/` hooks could be
+  planted), resolved against every working tree they serve: submodules (`core.worktree`), linked worktrees,
+  `~user/` values. A `HEAD` and `objects` planted in a directory no longer stop the next session's discovery. Bare repositories
+  in the workspace are found; pointer targets count only when they are repositories. `agent_adopt` asks the
+  sandbox about every path before it looks at the workspace (no more existence oracle through a link) and
+  again once each file is in place.
+- The daemon's own port is refused to commands in every profile, even with `loopback_all` or when listed in
+  `loopback_ports`, so a `loom open` login code on another process's command line cannot be redeemed. New
+  non-configuration fields `SandboxCfg::daemon_port` and `SandboxCfg::network_deny_all` carry what the profile
+  needs. With `loopback_all` the loopback allow is written for TCP and UDP (not `ip`), because a deny of one port
+  after an allow of `(remote ip "localhost:*")` is unreliable on macOS 27; loopback ICMP is no longer allowed then.
+- `agent_adopt` writes, makes and removes relative to directories it opened without following a link and judged
+  by their real path (as `write` does), so a background command that swaps a workspace directory for a link
+  during adoption can no longer redirect an unsandboxed write (into `~/.ssh` or `.git/hooks`, say).
+
 ### The sandbox hides the whole loom home
 
 - Commands (seatbelt profile) and the file tools (`check_read`) can no longer read anything under the loom

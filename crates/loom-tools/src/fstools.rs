@@ -22,7 +22,11 @@
 //!   runs again for the file it names (relative to the link's directory), at most `MAX_LINKS` (8)
 //!   times, so the target's directory is the one judged; more links → error sentence.
 //!
-//! `write_file_checked` is the same write for callers outside these tools (`box_get`).
+//! `write_file_checked` is the same write for callers outside these tools (`box_get`). The descriptor
+//! steps themselves — opening (and making) a directory without following a link with a judge of the real
+//! path given as a function, and the `*at` calls — are `pub(crate)` for `workcopy::adopt`, which must not
+//! have a weaker way to write the workspace either; the sentence for a link in the way names the caller's
+//! action, not `write` and `edit`, when another caller uses it.
 //!
 //! All three tools work only on regular files. A device, FIFO or socket → error sentence naming what
 //! the path is and what to use instead; it is never opened (`files::open_readable`). At most `READ_CAP`
@@ -172,7 +176,7 @@ impl From<NotOpened> for Fail {
 
 /// Why `write_atomic` wrote nothing.
 #[derive(Debug)]
-enum WriteFail {
+pub(crate) enum WriteFail {
     /// The sandbox refused the real path the file would have been written at: its sentence.
     Denied(String),
     /// A link where none is followed, or too many links: a sentence that says what to do.
@@ -423,7 +427,7 @@ fn write_atomic(sandbox: &Sandbox, path: &Path, bytes: &[u8]) -> Result<(), Writ
             )));
         };
         let name = name.to_os_string();
-        let dir = open_dir_creating(sandbox, parent)?;
+        let dir = open_dir_creating(&|real| sandbox.check_write(real).map(|_| ()), &write_edit_link, parent)?;
         match entry_at(&dir, &name)? {
             // A relative target is taken from the directory that holds the link.
             Entry::Link => target = real_path(dir.as_fd())?.join(read_link_at(&dir, &name)?),
@@ -447,7 +451,7 @@ fn replace_in(sandbox: &Sandbox, dir: &File, name: &OsStr, mode: Option<u32>, by
     sandbox.check_write(&real.join(name)).map_err(WriteFail::Denied)?;
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = OsString::from(format!(".{}.loom-{}-{n}.tmp", name.to_string_lossy(), std::process::id()));
-    let mut file = create_new_at(dir, &tmp)?;
+    let mut file = create_new_at(dir, &tmp, 0o666)?;
     let written = (|| {
         file.write_all(bytes)?;
         file.sync_data()?;
@@ -464,10 +468,15 @@ fn replace_in(sandbox: &Sandbox, dir: &File, name: &OsStr, mode: Option<u32>, by
 
 /// Open the directory `dir` without following a link in its last component. When it is missing, the
 /// nearest directory above it that exists is opened and the missing ones are made below it one at a
-/// time: each only after the sandbox has judged the real path of the open directory it is made in
-/// joined with its name, and each opened relative to that descriptor without following a link, so a
-/// link put in the place of one is never followed.
-fn open_dir_creating(sandbox: &Sandbox, dir: &Path) -> Result<File, WriteFail> {
+/// time: each only after `judge` has accepted the real path of the open directory it is made in
+/// joined with its name (its refusal is `WriteFail::Denied`), and each opened relative to that descriptor
+/// without following a link, so a link put in the place of one is never followed. `in_the_way` words the
+/// sentence for a link where a directory is expected, from the path of that link.
+pub(crate) fn open_dir_creating(
+    judge: &dyn Fn(&Path) -> Result<(), String>,
+    in_the_way: &dyn Fn(&Path) -> String,
+    dir: &Path,
+) -> Result<File, WriteFail> {
     let mut missing: Vec<&OsStr> = Vec::new();
     let mut at = dir;
     let mut open = loop {
@@ -482,45 +491,79 @@ fn open_dir_creating(sandbox: &Sandbox, dir: &Path) -> Result<File, WriteFail> {
             },
             // Whether a link is in the way only chooses the sentence; the open has already refused it.
             Err(e) => {
-                return Err(not_followed(at, e, || {
-                    std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_symlink())
-                }))
+                return Err(not_followed(
+                    at,
+                    e,
+                    || std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_symlink()),
+                    in_the_way,
+                ))
             }
         }
     };
     for name in missing.into_iter().rev() {
         let made = real_path(open.as_fd())?.join(name);
-        sandbox.check_write(&made).map_err(WriteFail::Denied)?;
+        judge(&made).map_err(WriteFail::Denied)?;
         match make_dir_at(&open, name) {
             Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(WriteFail::Io(e)),
             _ => {}
         }
-        open = descend(&open, name, &made)?;
+        open = descend_with(&open, name, &made, in_the_way)?;
     }
     Ok(open)
 }
 
 /// Open the directory `name` of the open directory `dir`, whose path with that name is `path`,
 /// without following a link: a link there is refused with a sentence.
+fn descend_with(
+    dir: &File,
+    name: &OsStr,
+    path: &Path,
+    in_the_way: &dyn Fn(&Path) -> String,
+) -> Result<File, WriteFail> {
+    open_dir_at(dir, name)
+        .map_err(|e| not_followed(path, e, || matches!(entry_at(dir, name), Ok(Entry::Link)), in_the_way))
+}
+
+/// `descend_with` as `write` and `edit` word a link in the way.
+#[cfg(test)]
 fn descend(dir: &File, name: &OsStr, path: &Path) -> Result<File, WriteFail> {
-    open_dir_at(dir, name).map_err(|e| not_followed(path, e, || matches!(entry_at(dir, name), Ok(Entry::Link))))
+    descend_with(dir, name, path, &write_edit_link)
+}
+
+/// Open the directory `dir`, which must exist, without following a link in its last component, and make
+/// nothing. A link there is refused with the sentence `in_the_way` gives.
+pub(crate) fn open_dir_existing(dir: &Path, in_the_way: &dyn Fn(&Path) -> String) -> Result<File, WriteFail> {
+    open_dir(dir).map_err(|e| {
+        not_followed(dir, e, || std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()), in_the_way)
+    })
 }
 
 /// A failure to open the directory `dir` without following a link: a sentence when `is_link` says a
-/// link was in the way (reported as `ELOOP`, or by macOS as `ENOTDIR` when a directory was asked for).
-fn not_followed(dir: &Path, e: std::io::Error, is_link: impl FnOnce() -> bool) -> WriteFail {
+/// link was in the way (reported as `ELOOP`, or by macOS as `ENOTDIR` when a directory was asked for);
+/// `in_the_way` gives the sentence then, from the path of the link.
+fn not_followed(
+    dir: &Path,
+    e: std::io::Error,
+    is_link: impl FnOnce() -> bool,
+    in_the_way: &dyn Fn(&Path) -> String,
+) -> WriteFail {
     if !matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) || !is_link() {
         return WriteFail::Io(e);
     }
-    WriteFail::Refused(format!(
+    WriteFail::Refused(in_the_way(dir))
+}
+
+/// The sentence of `write` and `edit` for a link where a directory is expected.
+fn write_edit_link(dir: &Path) -> String {
+    format!(
         "{} is a symbolic link where `write` and `edit` expect a directory, and they follow no link there. Name \
          the file by its real path and try again.",
         dir.display()
-    ))
+    )
 }
 
 /// What a directory holds under a name, not following a link.
-enum Entry {
+pub(crate) enum Entry {
     Missing,
     Link,
     /// Anything else, with its permission bits.
@@ -553,12 +596,12 @@ fn done(rc: libc::c_int) -> std::io::Result<()> {
 }
 
 /// Open the directory `path` for reading without following a link in its last component.
-fn open_dir(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_dir(path: &Path) -> std::io::Result<File> {
     std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(path)
 }
 
 /// Open the directory `name` of the open directory `dir` without following a link.
-fn open_dir_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
+pub(crate) fn open_dir_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
     let c = c_name(name)?;
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
@@ -566,26 +609,25 @@ fn open_dir_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
 }
 
 /// Make the directory `name` in the open directory `dir`, with permissions 0777 less the umask.
-fn make_dir_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
+pub(crate) fn make_dir_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
     let c = c_name(name)?;
     let mode: libc::mode_t = 0o777;
     // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
     done(unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), mode) })
 }
 
-/// Create the file `name` in the open directory `dir` for writing, with permissions 0666 less the
+/// Create the file `name` in the open directory `dir` for writing, with permissions `mode` less the
 /// umask. Nothing may exist under that name; a link there is not followed.
-fn create_new_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
+pub(crate) fn create_new_at(dir: &File, name: &OsStr, mode: libc::c_uint) -> std::io::Result<File> {
     let c = c_name(name)?;
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let mode: libc::c_uint = 0o666;
     // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
     // With O_CREAT, openat reads one more argument, the mode, which a C caller passes as an unsigned int.
     owned(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, mode) })
 }
 
 /// What the open directory `dir` holds under `name`.
-fn entry_at(dir: &File, name: &OsStr) -> std::io::Result<Entry> {
+pub(crate) fn entry_at(dir: &File, name: &OsStr) -> std::io::Result<Entry> {
     let c = c_name(name)?;
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `c` is a NUL-terminated name that outlives the call, `dir` is an open descriptor, and `st`
@@ -607,7 +649,7 @@ fn entry_at(dir: &File, name: &OsStr) -> std::io::Result<Entry> {
 }
 
 /// The target of the link `name` in the open directory `dir`, as written in the link.
-fn read_link_at(dir: &File, name: &OsStr) -> std::io::Result<PathBuf> {
+pub(crate) fn read_link_at(dir: &File, name: &OsStr) -> std::io::Result<PathBuf> {
     let c = c_name(name)?;
     let mut buf = vec![0u8; 4096];
     // SAFETY: `c` is a NUL-terminated name that outlives the call, `dir` is an open descriptor, and
@@ -623,17 +665,55 @@ fn read_link_at(dir: &File, name: &OsStr) -> std::io::Result<PathBuf> {
 }
 
 /// Rename `from` to `to`, both in the open directory `dir`, replacing what `to` was.
-fn rename_at(dir: &File, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+pub(crate) fn rename_at(dir: &File, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
     let (f, t) = (c_name(from)?, c_name(to)?);
     // SAFETY: `f` and `t` are NUL-terminated names that outlive the call, and `dir` is an open descriptor.
     done(unsafe { libc::renameat(dir.as_raw_fd(), f.as_ptr(), dir.as_raw_fd(), t.as_ptr()) })
 }
 
 /// Remove the file `name` from the open directory `dir`.
-fn remove_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
+pub(crate) fn remove_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
     let c = c_name(name)?;
     // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
     done(unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) })
+}
+
+/// Remove the empty directory `name` from the open directory `dir`; a link there is not followed (it is
+/// refused, as it is no directory).
+pub(crate) fn remove_dir_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
+    let c = c_name(name)?;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    done(unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) })
+}
+
+/// Make the link `name` in the open directory `dir`, pointing at `target` (as written). Nothing may exist
+/// under that name.
+pub(crate) fn symlink_at(dir: &File, target: &OsStr, name: &OsStr) -> std::io::Result<()> {
+    let (t, c) = (c_name(target)?, c_name(name)?);
+    // SAFETY: `t` and `c` are NUL-terminated strings that outlive the call, and `dir` is an open descriptor.
+    done(unsafe { libc::symlinkat(t.as_ptr(), dir.as_raw_fd(), c.as_ptr()) })
+}
+
+/// Open the existing entry `name` of the open directory `dir` for reading, without following a link. It is
+/// opened without waiting (a FIFO put there would otherwise block) and the caller checks that it is a file.
+/// Only adoption's clone uses it, and only macOS clones.
+#[cfg(target_os = "macos")]
+pub(crate) fn open_file_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
+    let c = c_name(name)?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    owned(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) })
+}
+
+/// Make the entry `name` in the open directory `dir` a clone of the open file `src` (copy-on-write, with
+/// its permission bits and no data copied). Fails when anything exists under that name, and when the file
+/// system cannot clone.
+#[cfg(target_os = "macos")]
+pub(crate) fn clone_at(src: &File, dir: &File, name: &OsStr) -> std::io::Result<()> {
+    let c = c_name(name)?;
+    // SAFETY: `src` and `dir` are open descriptors, `c` is a NUL-terminated name that outlives the call, and
+    // fclonefileat(2) has no other memory effects.
+    done(unsafe { libc::fclonefileat(src.as_raw_fd(), dir.as_raw_fd(), c.as_ptr(), 0) })
 }
 
 /// The names in the open directory `dir`, without `.` and `..`. An entry that cannot be read ends the

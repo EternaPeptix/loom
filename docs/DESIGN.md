@@ -796,7 +796,10 @@ the precise specification.
   the agent's copy has it — the same bytes and permission bits, compared as such and not by time —
   is no conflict and is left alone. Adopting twice is harmless, and two
   agents whose changes touch different paths can be adopted one after the other. `.git` is never
-  touched. Copies stay until the mission is archived, which removes them.
+  touched. Adoption runs in the daemon while the lead's background commands may run, so it writes the
+  way `write` does: relative to directories opened without following a link and judged by their real
+  path, never by a path judged earlier, so a directory swapped for a link meanwhile gets nothing
+  written, made or removed through it. Copies stay until the mission is archived, which removes them.
 - `attempt {question…, check, n?, approaches?, mode?, check_timeout_s?}` is best-of-N: `n` agents (3
   by default) get the same assignment at once, each in its own copy, by default as forks of the lead
   — so they share one cached prefix and differ only from the assignment on — optionally each with
@@ -1133,15 +1136,58 @@ The Seatbelt policy:
   outside the sandbox;
 - network: denied, except loopback connections to the egress proxy, to `sandbox.loopback_ports` (or
   every loopback port with `loopback_all`) and to `sandbox.unix_sockets`; listening on loopback is
-  allowed.
+  allowed. The daemon's own port is refused whatever allows it, at every address (Seatbelt counts the
+  host's own addresses as loopback), so a command that reads a `loom open` login code from the process
+  list cannot redeem it;
+- under `network.mode = deny_all`, the system services that fetch a URL for a process, outside its
+  sandbox, cannot be reached: `com.apple.trustd.agent`, `com.apple.trustd` and `com.apple.ocspd`.
+  Certificate evaluation fetches the issuer a certificate names (its AIA URL, which a command chooses),
+  so through it a command could send data past the proxy and its audit file. With them denied,
+  programs that check certificates through macOS (Swift and Go programs, `security`, `codesign
+  --verify`) fail closed for every certificate; curl and Python use their own certificate files. The
+  background URL session service (`com.apple.nsurlsessiond`) and WebKit's XPC services, which a command
+  can drive from `osascript -l JavaScript` to fetch a URL, are denied too. In `allowlist` and `open` modes
+  these routes stay open (SECURITY.md lists them);
+- mounting is denied (`file-mount`, and the disk-image and DiskArbitration services that mount for a
+  process: a command could otherwise attach an image of its own over `.git/hooks`, `~/.ssh` or
+  `~/Library/LaunchAgents`), and so is writing preferences (`cfprefsd` writes `~/Library/Preferences`
+  for a process outside its sandbox).
 
-Git configuration, hooks and gitdir/commondir pointers are protected by default. Existing nested
-repositories and linked worktrees are discovered without running host Git; resolved gitdir and
-commondir metadata is protected too. Discovery refuses unreadable or excessive trees (100000
-workspace directories, 4096 metadata pointers, 4096 bytes per pointer). Seatbelt and file tools also
-refuse future nested `.git` configuration/hook writes. Bubblewrap freezes discovered Git directories
-as a whole; it cannot reserve future `.git` names in writable directories, so new repositories must
-be created outside a session. These protections do not establish immunity to arbitrary host Git bugs.
+Git metadata is protected, because Git runs what it holds as the operator: a config's
+`core.fsmonitor` (and every other command a config names) and hooks run on the operator's next
+`git status`, commit or `git submodule update`, and a `commondir` or `gitdir` pointer decides which
+config that is. Under Seatbelt and in the file tools, in every writable root (the workspace, the
+session temp dir and `extra_writable`), existing or not, names compared as the volume folds them
+(APFS counts `ſ`, the Kelvin sign and the `ﬁ` ligature as `s`, `k` and `fi`): no
+`.git` can be made, written, removed or renamed; below one, nothing at `config`, `config.worktree`,
+`hooks`, `commondir` or `gitdir` can be written, for the repository itself, for linked worktrees'
+private gitdirs (`.git/worktrees/<name>/`) and for submodule repositories (`.git/modules/<name>/`,
+nested ones included); and nothing can be made or removed at `.git/modules`, `.git/worktrees`, a
+direct child of either or the same inside a submodule repository, nor anywhere in a directory below
+`modules` that is not a repository (outside the repositories found in it), since a directory moved
+there brings its own config and hooks and the profile cannot judge what a moved directory holds; below
+`.git/modules/<name>/` nothing can be made or removed except inside the submodule repositories found when
+the sandbox was built (so one the operator sets up mid-session can be neither replaced nor committed in
+until the next session). The hooks directory a configuration names (`core.hooksPath`) and the files it
+includes, read from each repository's and the user's global configuration without running Git, are
+protected when they lie in a writable root.
+Probed on macOS 27 with Git 2.50: a command could point an external worktree's `commondir` at a config
+of its own, plant a deinitialized submodule's hook, or `git init` a repository in the temp dir and
+move it into the workspace behind a gitlink, and the operator's next `git status` ran its command; all
+of these are refused now, while commits and branches in the workspace's repository and existing
+submodules still work. A session cannot `git init` or clone a non-bare repository where it writes, or
+add worktrees and submodules: the operator does that, and a bare clone used with `--git-dir` and
+`--work-tree` works. Existing repositories are found without running host Git or following directory
+links: every repository in the workspace (`.git` directories and bare ones), the targets of `.git`
+files and `commondir` pointers when they are repositories, the gitdirs in `worktrees/` and the
+repositories below `modules/` (and theirs, in turn); their config, hooks and pointers are protected paths
+too, and Bubblewrap mounts them read-only unless one is or contains the loom home or the user's home. Discovery refuses unreadable or excessive trees (100000 workspace
+directories, 4096 repositories and recorded directories, 4096 bytes per pointer). Bubblewrap freezes
+discovered Git directories as a whole; it cannot reserve future `.git` names in writable directories,
+so new repositories must be created outside a session. These protections do not establish immunity to
+arbitrary host Git bugs: a directory a command turns into a repository in place still runs its config for
+an operator who runs Git inside it (Git's `safe.bareRepository = explicit` prevents that), and scripts that
+hooks or configuration run from the working tree are files the session may change.
 
 Paths are made canonical when the sandbox is built. On macOS the rules that refuse are compared without
 regard to case (volumes are case-insensitive by default); the rules that allow are compared exactly. The

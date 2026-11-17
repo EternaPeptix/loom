@@ -54,9 +54,8 @@ harness's.
 
 On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `sandbox-exec`:
 
-- **Writes** are allowed only in the session's workspace, the session's temporary directory, the
-  system temporary locations (`/private/tmp` and `/private/var/folders`), any `extra_writable`
-  directories, and the device files `/dev/null`, `/dev/tty` and `/dev/dtracehelper`. `~/.loom`
+- **Writes** are allowed only in the session's workspace, the session's temporary directory, any
+  `extra_writable` directories, and the device files `/dev/null`, `/dev/tty` and `/dev/dtracehelper`. `~/.loom`
   (including the token, keys, logs and every session record), `<workspace>/.loom` and your
   `protected_paths` are never writable, with one exception: the session's temporary directory lies in
   `~/.loom` (`sessions/<id>/tmp`), and everything inside it is writable, though the directory entry
@@ -78,7 +77,29 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   names itself, refuses private, loopback and link-local addresses (including IPv4 addresses hidden in
   IPv6 forms) unless you list them, applies the deny list to the resolved address, and records every
   decision in a hash-chained audit file. Commands that listen on loopback can be reached by other
-  local processes.
+  local processes. Commands cannot connect to the daemon's own port, whatever you allow on loopback, so a
+  `loom open` login code seen in the process list cannot be redeemed from inside the sandbox directly (the
+  proxy, which refuses loopback addresses, could reach it only if you list loopback in `allow_private` or
+  grant a loopback address). Under `deny_all` commands also cannot reach the macOS services that fetch a
+  URL for a process (`com.apple.trustd.agent`, `com.apple.trustd`, `com.apple.ocspd`,
+  `com.apple.nsurlsessiond`, WebKit's networking services); programs that check certificates through macOS
+  (Swift and Go programs, `security`, `codesign --verify`), background URL sessions and WebKit-based tools
+  then fail, while curl and Python, which use their own certificate files, work.
+- **Git cannot be made to run code as you.** Anywhere commands can write (workspace, temporary
+  directory, `extra_writable`), they cannot write Git configuration, hooks or the `commondir`/`gitdir`
+  pointers — of the repository, of linked worktrees (also ones checked out outside the workspace) and of
+  submodules, initialized or not — nor make or move a `.git`, a worktree's gitdir or a submodule's
+  repository into place; the hooks directory your Git configuration names (`core.hooksPath`, as husky
+  sets it) and the files it includes are protected too, read from each repository's and your global
+  configuration. Commits and branches in existing repositories work; upstream tracking cannot be recorded.
+  A session cannot run `git init`, a non-bare `git clone` (installs of pip, npm, cargo or uv dependencies
+  from Git URLs included), `git worktree add` or `git submodule update` in any form: you do those, and a
+  bare clone works. A submodule you set up during a mission is protected but cannot be committed in until
+  the next session.
+- **No mounts, no preference writes.** Commands cannot mount a file system or attach a disk image over a
+  directory (`hdiutil attach` and `diskutil` fail), which would otherwise replace `.git/hooks`, `~/.ssh`
+  or `~/Library/LaunchAgents` for you; and they cannot write macOS preferences (`defaults write`), which a
+  system service would otherwise write for them outside the sandbox.
 - **Scope is the operator's.** The agent can ask for hosts with `request_scope`, which opens an inbox
   item and changes nothing. Hosts are granted only by the operator, per session, with a record in the
   ledger; a grant dies with the session. `loom release` records that the operator closed a mission
@@ -170,7 +191,9 @@ These are the places where loom does less than the text above might suggest.
   file it is. `grep` checks each path as the walk finds it, and then judges the real path of the file it
   opens, as `read` does; `dep_scan` reads its report files, `continuation` its guarded files and the copy of
   a workspace made for an agent (and adopted back) its files the same way, so a link swapped in meanwhile
-  reads and copies nothing the rules refuse. `glob` only lists names, checking each directory it walks
+  reads and copies nothing the rules refuse. Adopting an agent's copy writes, makes and removes as `write`
+  does, relative to directories it opened and judged, so a directory a background command swaps for a link
+  during adoption has nothing written through it. `glob` only lists names, checking each directory it walks
   as the directory that was opened, so a command that swaps a link in during a walk can in principle make it
   list names it should not (never content). macOS shows `/Users`, `/private` and the other folders of the
   data volume under `/System/Volumes/Data` too; a path in that form is given its usual form back before the
@@ -202,7 +225,27 @@ These are the places where loom does less than the text above might suggest.
   that moved directory then decides where a file written below it later, by something outside the
   sandbox, lands.
 - **A command can talk to anything on loopback that you allow** (`loopback_ports`, `loopback_all`,
-  `unix_sockets`), including services that run as you.
+  `unix_sockets`), including services that run as you. With `loopback_all` that includes your
+  machine's own network addresses, which the macOS sandbox counts as loopback.
+- **Outside `deny_all`, macOS fetches URLs for a command.** In `allowlist` and `open` modes a command
+  can have the certificate service (`trustd`) fetch a URL named in a certificate it made, or start a
+  background URL session (`nsurlsessiond`) or a WebKit view, which reach any host without the proxy and
+  without an entry in the network audit file. Under `deny_all` the sandbox denies those services. Other
+  system services that make network requests on a process's behalf are not denied in any mode: the
+  profile allows local inter-process communication in general.
+- **Git residuals.** Any directory in a writable root that has no `.git` of its own, your existing
+  subdirectories included, can be turned into a repository (a `HEAD`, `objects`, `refs` and `config`),
+  and Git runs its configuration if you run Git inside that directory. Set
+  `git config --global safe.bareRepository explicit`, which makes Git refuse such a repository unless you
+  name it. Scripts that your hooks or your configuration run from the working tree (`.pre-commit-config.yaml`,
+  `lefthook.yml`, a filter or `fsmonitor` script under the workspace) are ordinary files the session can
+  change: review them before you commit. Your configuration is read without running Git, so a
+  `core.hooksPath` or include written in a form that reading does not understand is not protected. A command can
+  leave an interactive rebase or a cherry-pick in progress whose list holds `exec` lines: they run when
+  you continue it, so do not continue an operation you did not start. Under Bubblewrap a command can make
+  a new repository in a writable directory (existing ones are read-only); do not run Git inside one you
+  did not make. Under Bubblewrap a `core.hooksPath` directory that does not exist yet in a writable
+  directory refuses the session (it cannot be held read-only): create it first.
 - **Tamper evidence has gaps.** Deleting a session's records together with their directory, deleting
   `journal.head` together with the last entries of its mission journal, deleting a mission journal and
   its `journal.head` together, or restoring an older matching pair, cannot be detected. A process
