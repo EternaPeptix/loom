@@ -244,7 +244,9 @@ see [CTF](packs/ctf/README.md), [Redteam](packs/redteam/README.md), and the
 
 The adversarial monitor (deterministic tripwires, a cross-family reviewer, a gate for irreversible actions, a durable
 pause, and the operator-armed "keep going") is specified in [`docs/MONITOR.md`](docs/MONITOR.md) and built in phases;
-this build has the specification and the contracts, and the daemon does not run it yet.
+this build has the floor (infrastructure deny, fetch-service and mach-lookup denies, process census, proxy controls),
+model lineage, and the tripwire monitor in shadow: the daemon runs it, and it records what it finds without steering,
+pausing or refusing anything. The reviewer, the action gate, the pause and "keep going" are later phases.
 
 ## Building and testing
 
