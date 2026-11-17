@@ -99,7 +99,9 @@
 //!     listener fails the set-up with `The egress proxy cannot open a port for this session: {error}`).
 //!   - `sandbox`: `Sandbox::new(&cfg, workspace, tmp_dir, paths.home, Some(grant.port))` (the session's
 //!     own proxy listener, never the shared `proxy.port()`, so a command can connect to no other
-//!     session's listener and other sessions' credentials are of no use to it; `None` under bubblewrap) with the
+//!     session's listener and other sessions' credentials are of no use to it; `None` under bubblewrap;
+//!     the sandbox `child_copy` builds for commands run in an agent's copy uses the port of the session
+//!     whose environment those commands get, `proxy.session_port(..)`, and `None` when it holds no grant) with the
 //!     config's `SandboxCfg`; for a role with `read_only`, `extra_writable` is retained as internal
 //!     replay-untrusted metadata before its grants are emptied, and the
 //!     workspace is added to `protected_paths`; every model profile's `api_key_env` name is added to

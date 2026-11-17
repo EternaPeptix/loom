@@ -46,6 +46,8 @@
 //! Plain HTTP strips Authorization, Cookie and Referer. HTTPS CONNECT is opaque: the trusted client
 //! enforces GET, no URL user-info, no credential headers and redirect policy at every hop. Neither a
 //! host reservation nor GET-only access prevents exfiltration in URL paths/queries.
+//! `session_port(session) -> Option<u16>`: the port of the session's own listener while it holds a
+//! command grant.
 //! `revoke(session)` drops both command and reference grants and closes the session's listener (it
 //! accepts nothing more; the port is released); connections already open are left to finish.
 //! `set_policy(session, policy)` replaces the policy of a session that holds a grant and keeps its
