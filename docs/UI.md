@@ -69,6 +69,11 @@ of completion.
 - A blocking inbox item is also announced with the browser's `Notification` API when permission was
   granted (a button in the inbox view asks for it; never ask unprompted).
 
+The New mission form (`#/new`) has an optional *Recall earlier missions* field: mission ids separated by
+spaces or commas (at most 8). They are sent as `prior` (`core.buildNewSession`); the daemon checks that each
+mission exists, and the new lead starts with one note of what those missions recorded in their sealed
+ledgers (`loom_agent::prior`), visible in its record like any harness note.
+
 Routes are `#/s/<id>/overview`, `/evidence`, and `/record`; the old `#/s/<id>` route opens Overview.
 `#/inbox` and `#/new` retain their meaning. Browser Back/Forward restores the selected mission view.
 

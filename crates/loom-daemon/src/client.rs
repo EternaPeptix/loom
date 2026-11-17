@@ -864,6 +864,7 @@ pub(crate) mod testkit {
                 unattended: true,
                 archived,
                 gate: None,
+                prior: Vec::new(),
             },
             active: false,
             status: status(Phase::Idle),

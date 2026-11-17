@@ -46,8 +46,14 @@
 //! Also `Err` when `answer` is empty or whitespace. Otherwise `Ok(())`.
 //!
 //! ## `check_quotes` — any `finish` with quotes
-//! For each quote, in order: resolve `handle` with `BlobStore::resolve` (failure → `quote {i}: there
-//! is no stored output {handle}; handles are the out:… ids in result headers`); `start`/`end` must be
+//! `pub async fn check_quotes(ctx: &ToolCtx, quotes: &[Quote]) -> Result<Vec<VerifiedQuote>, String>`.
+//! For each quote, in order: open `handle` with `loom_tools::outputs::open(ctx, handle)`, so only an
+//! output of the session's mission is ever read, counted or compared (`Unknown` or `NotAHandle` →
+//! `quote {i}: no output of this mission has the handle {handle}; copy the out:… handle exactly from a
+//! result header`; `Ambiguous` → `quote {i}: the handle {handle} matches more than one output of this
+//! mission; give more characters of it`). An output of another mission therefore gets the sentence of
+//! a handle that names nothing, and nothing of it (its line count, a closest line) is ever said. Then
+//! the checks below run on the opened id (a private sync helper over `ctx.blobs`); `start`/`end` must be
 //! `1 <= start <= end` and `start <= total lines` (else a sentence giving the output's line count);
 //! read the lines (`end` clamped to the last line) and check them with `observe::check_quote_at(lines,
 //! text, start)`, whose errors become these sentences:
@@ -119,7 +125,9 @@
 //! Tests required: every branch of `on_yield`, including each tool-availability variant of the
 //! closing paragraph and exact text of at least one full nudge; `looks_like_call` positives and
 //! negatives (ordinary prose and ordinary JSON must be negative); `check_finish_lead` for each kind
-//! of open item; `check_quotes` success, each failure sentence, clamping, several failures at once; a
+//! of open item; `check_quotes` success, each failure sentence, clamping, several failures at once; an
+//! output outside `ctx.outputs` refused with the unknown-handle sentence and none of its text or line
+//! count in the error (also when the quote's text is wrong or its range is past the end); a
 //! quote by lines recorded as stored, with its blank ends left out, and each of its four refusals;
 //! `render_report` full, minimal, and cut.
 
@@ -127,6 +135,8 @@ use loom_core::event::{ChildOutcome, Termination};
 use loom_core::ledger::{GoalMetStatus, LedgerState, ObligationKind, StepStatus};
 use loom_core::observe;
 use loom_core::{BlobId, BlobStore};
+use loom_tools::outputs::{self, Unopened};
+use loom_tools::ToolCtx;
 use serde::{Deserialize, Serialize};
 
 pub struct YieldCtx<'a> {
@@ -420,7 +430,7 @@ pub fn check_finish_lead(ledger: &LedgerState, answer: &str) -> Result<(), Strin
         let objections = ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind == ObligationKind::Objection);
         if objections {
             text.push_str(
-                "\n- Objections: a verifier rejected an earlier finish. An objection is settled only by new work: run the target again, record the run with `evidence` (kind execution), then call finish again. Answering the operator or rewording the result settles nothing.",
+                "\n- Objections: a verifier rejected an earlier finish. An objection is settled only by new work: run the target again, record the run with `evidence` (it must be a run: a scan, a decompilation or a lookup is not one), then call finish again. Answering the operator or rewording the result settles nothing.",
             );
         }
         if ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind != ObligationKind::Objection) {
@@ -451,12 +461,23 @@ pub fn check_finish_lead(ledger: &LedgerState, answer: &str) -> Result<(), Strin
     }
 }
 
-pub fn check_quotes(blobs: &BlobStore, quotes: &[Quote]) -> Result<Vec<VerifiedQuote>, String> {
+pub async fn check_quotes(ctx: &ToolCtx, quotes: &[Quote]) -> Result<Vec<VerifiedQuote>, String> {
     let mut verified = Vec::new();
     let mut problems: Vec<String> = Vec::new();
     for (idx, q) in quotes.iter().enumerate() {
         let i = idx.saturating_add(1);
-        match check_one(blobs, q, i) {
+        let checked = match outputs::open(ctx, &q.handle).await {
+            Ok(id) => check_one(&ctx.blobs, q, i, id),
+            Err(Unopened::Ambiguous) => Err(format!(
+                "quote {i}: the handle {} matches more than one output of this mission; give more characters of it",
+                q.handle
+            )),
+            Err(Unopened::Unknown | Unopened::NotAHandle) => Err(format!(
+                "quote {i}: no output of this mission has the handle {}; copy the out:… handle exactly from a result header",
+                q.handle
+            )),
+        };
+        match checked {
             Ok(v) => verified.push(v),
             Err(e) => problems.push(e),
         }
@@ -468,11 +489,9 @@ pub fn check_quotes(blobs: &BlobStore, quotes: &[Quote]) -> Result<Vec<VerifiedQ
     }
 }
 
-fn check_one(blobs: &BlobStore, q: &Quote, i: usize) -> Result<VerifiedQuote, String> {
+/// The checks on one quote whose handle opened as `id`.
+fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<VerifiedQuote, String> {
     let handle = &q.handle;
-    let id = blobs.resolve(handle).map_err(|_| {
-        format!("quote {i}: there is no stored output {handle}; handles are the out:… ids in result headers")
-    })?;
     let total = blobs
         .meta(&id)
         .map_err(|e| format!("quote {i}: the stored output {handle} could not be read ({e}); try again."))?
@@ -1014,12 +1033,12 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         assert_eq!(check_finish_lead(&q, "x"), Ok(()));
     }
 
-    fn store_with(text: &str) -> (tempfile::TempDir, BlobStore, String) {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
-        let store = BlobStore::open(dir.path().join("blobs")).unwrap_or_else(|e| panic!("open: {e}"));
-        let r = store.put_bytes(text.as_bytes()).unwrap_or_else(|e| panic!("put: {e}"));
+    fn store_with(text: &str) -> (loom_tools::testutil::TestEnv, ToolCtx, String) {
+        let env = loom_tools::testutil::env();
+        let ctx = env.ctx.clone();
+        let r = ctx.blobs.put_bytes(text.as_bytes()).unwrap_or_else(|e| panic!("put: {e}"));
         let h = r.handle();
-        (dir, store, h)
+        (env, ctx, h)
     }
 
     fn q(handle: &str, start: u64, end: u64, text: &str) -> Quote {
@@ -1028,13 +1047,13 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
 
     const OUT: &str = "alpha line one\nbeta line two\ngamma line three\ndelta line four\n";
 
-    #[test]
-    fn quotes_succeed_and_clamp() {
-        let (_d, store, h) = store_with(OUT);
-        let id = store.resolve(&h).unwrap_or_else(|e| panic!("{e}"));
-        let ok =
-            check_quotes(&store, &[q(&h, 2, 3, "beta line two\ngamma line three"), q(&h, 4, 99, "delta line four")])
-                .unwrap_or_else(|e| panic!("{e}"));
+    #[tokio::test]
+    async fn quotes_succeed_and_clamp() {
+        let (_d, ctx, h) = store_with(OUT);
+        let id = ctx.blobs.resolve(&h).unwrap_or_else(|e| panic!("{e}"));
+        let ok = check_quotes(&ctx, &[q(&h, 2, 3, "beta line two\ngamma line three"), q(&h, 4, 99, "delta line four")])
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(ok.len(), 2);
         assert_eq!(
             ok[0],
@@ -1042,36 +1061,36 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         );
         assert_eq!((ok[1].start, ok[1].end), (4, 4));
         // Line-number prefixes copied from a read are accepted.
-        assert!(check_quotes(&store, &[q(&h, 1, 2, "1: alpha line one\n2: beta line two")]).is_ok());
+        assert!(check_quotes(&ctx, &[q(&h, 1, 2, "1: alpha line one\n2: beta line two")]).await.is_ok());
     }
 
-    #[test]
-    fn quote_failures() {
-        let (_d, store, h) = store_with(OUT);
-        let e = check_quotes(&store, &[q("out:0123456789abcdef", 1, 1, "x")]).err().unwrap_or_default();
+    #[tokio::test]
+    async fn quote_failures() {
+        let (_d, ctx, h) = store_with(OUT);
+        let e = check_quotes(&ctx, &[q("out:0123456789abcdef", 1, 1, "x")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
-            "quote 1: there is no stored output out:0123456789abcdef; handles are the out:… ids in result headers"
+            "quote 1: no output of this mission has the handle out:0123456789abcdef; copy the out:… handle exactly from a result header"
         );
-        let e = check_quotes(&store, &[q(&h, 9, 12, "x")]).err().unwrap_or_default();
+        let e = check_quotes(&ctx, &[q(&h, 9, 12, "x")]).await.err().unwrap_or_default();
         assert!(e.starts_with("quote 1: ") && e.contains("has 4 lines") && e.contains("1-4"), "{e}");
-        let e = check_quotes(&store, &[q(&h, 0, 2, "x")]).err().unwrap_or_default();
+        let e = check_quotes(&ctx, &[q(&h, 0, 2, "x")]).await.err().unwrap_or_default();
         assert!(e.contains("not valid"), "{e}");
-        let e = check_quotes(&store, &[q(&h, 3, 2, "x")]).err().unwrap_or_default();
+        let e = check_quotes(&ctx, &[q(&h, 3, 2, "x")]).await.err().unwrap_or_default();
         assert!(e.contains("not valid"), "{e}");
-        let e = check_quotes(&store, &[q(&h, 1, 2, "nothing like it")]).err().unwrap_or_default();
+        let e = check_quotes(&ctx, &[q(&h, 1, 2, "nothing like it")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
             format!("quote 1: the text does not occur in {h} lines 1-2. Copy the text exactly from the output.")
         );
     }
 
-    #[test]
-    fn a_quote_without_its_text_is_the_lines_it_names() {
-        let (_d, store, h) = store_with(OUT);
-        let id = store.resolve(&h).unwrap_or_else(|e| panic!("{e}"));
+    #[tokio::test]
+    async fn a_quote_without_its_text_is_the_lines_it_names() {
+        let (_d, ctx, h) = store_with(OUT);
+        let id = ctx.blobs.resolve(&h).unwrap_or_else(|e| panic!("{e}"));
         // Nothing is typed, so nothing is compared: the stored lines are the quote. Blank text is no text.
-        let ok = check_quotes(&store, &[q(&h, 2, 3, ""), q(&h, 4, 4, " \n")]).unwrap_or_else(|e| panic!("{e}"));
+        let ok = check_quotes(&ctx, &[q(&h, 2, 3, ""), q(&h, 4, 4, " \n")]).await.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
             ok,
             vec![
@@ -1080,108 +1099,137 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
             ]
         );
         // Blank lines at the ends of the range are left out and the numbers follow; indentation stays.
-        let (_d, store, h) = store_with("head\n\n  indented   \n\nmore\n\n\ntail\n");
-        let ok = check_quotes(&store, &[q(&h, 2, 6, "")]).unwrap_or_else(|e| panic!("{e}"));
+        let (_d, ctx, h) = store_with("head\n\n  indented   \n\nmore\n\n\ntail\n");
+        let ok = check_quotes(&ctx, &[q(&h, 2, 6, "")]).await.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((ok[0].start, ok[0].end, ok[0].text.as_str()), (3, 5, "  indented\n\nmore"));
     }
 
-    #[test]
-    fn a_quote_without_its_text_is_taken_at_its_word_and_kept_small() {
-        let (_d, store, h) = store_with(OUT);
+    #[tokio::test]
+    async fn a_quote_without_its_text_is_taken_at_its_word_and_kept_small() {
+        let (_d, ctx, h) = store_with(OUT);
         // With no text to pin the place, a range past the end is not clamped.
-        let e = check_quotes(&store, &[q(&h, 3, 9, "")]).err().unwrap_or_default();
+        let e = check_quotes(&ctx, &[q(&h, 3, 9, "")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
             format!("quote 1: {h} has 4 lines, so end 9 is past its end. A quote without its text is exactly the lines you name; give a range within 1-4.")
         );
         // The checks of any quote come first.
-        let e = check_quotes(&store, &[q(&h, 9, 12, "")]).err().unwrap_or_default();
+        let e = check_quotes(&ctx, &[q(&h, 9, 12, "")]).await.err().unwrap_or_default();
         assert!(e.contains("start 9 is past its end"), "{e}");
-        let e = check_quotes(&store, &[q("out:0123456789abcdef", 1, 1, "")]).err().unwrap_or_default();
-        assert!(e.contains("there is no stored output"), "{e}");
+        let e = check_quotes(&ctx, &[q("out:0123456789abcdef", 1, 1, "")]).await.err().unwrap_or_default();
+        assert!(e.contains("no output of this mission has the handle"), "{e}");
         // At most 20 lines.
         let many: String = (1..=30).map(|n| format!("line {n}\n")).collect();
-        let (_d, store, h) = store_with(&many);
-        assert_eq!(check_quotes(&store, &[q(&h, 5, 24, "")]).map(|v| (v[0].start, v[0].end)), Ok((5, 24)));
-        let e = check_quotes(&store, &[q(&h, 5, 25, "")]).err().unwrap_or_default();
+        let (_d, ctx, h) = store_with(&many);
+        assert_eq!(check_quotes(&ctx, &[q(&h, 5, 24, "")]).await.map(|v| (v[0].start, v[0].end)), Ok((5, 24)));
+        let e = check_quotes(&ctx, &[q(&h, 5, 25, "")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
             "quote 1: lines 5-25 are 21 lines; a quote without its text takes at most 20. Name only the lines that show the point, or give several quotes."
         );
         // Blank lines carry nothing.
-        let (_d, store, h) = store_with("a\n\n  \nb\n");
-        let e = check_quotes(&store, &[q(&h, 2, 3, "")]).err().unwrap_or_default();
+        let (_d, ctx, h) = store_with("a\n\n  \nb\n");
+        let e = check_quotes(&ctx, &[q(&h, 2, 3, "")]).await.err().unwrap_or_default();
         assert_eq!(e, format!("quote 1: lines 2-3 of {h} are blank. Name the lines that carry the text."));
         // At most 2000 characters: a long line is quoted by the part that matters.
-        let (_d, store, h) = store_with(&format!("short\n{}\n", "x".repeat(2_001)));
-        let e = check_quotes(&store, &[q(&h, 2, 2, "")]).err().unwrap_or_default();
+        let (_d, ctx, h) = store_with(&format!("short\n{}\n", "x".repeat(2_001)));
+        let e = check_quotes(&ctx, &[q(&h, 2, 2, "")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
             format!("quote 1: lines 2-2 of {h} have 2001 characters; a quote without its text takes at most 2000. Name fewer lines, or give the text of the part that shows the point, copied exactly.")
         );
-        assert!(check_quotes(&store, &[q(&h, 1, 1, "")]).is_ok());
+        assert!(check_quotes(&ctx, &[q(&h, 1, 1, "")]).await.is_ok());
     }
 
-    #[test]
-    fn quote_line_numbers_are_checked_and_stripped() {
-        let (_d, store, h) = store_with(OUT);
+    #[tokio::test]
+    async fn quote_line_numbers_are_checked_and_stripped() {
+        let (_d, ctx, h) = store_with(OUT);
         // The numbers are absolute line numbers of the stored output, and the stored text is stripped.
-        let ok = check_quotes(&store, &[q(&h, 2, 3, "2\tbeta line two\n3\tgamma line three")])
+        let ok = check_quotes(&ctx, &[q(&h, 2, 3, "2\tbeta line two\n3\tgamma line three")])
+            .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(ok[0].text, "beta line two\ngamma line three");
-        let e = check_quotes(&store, &[q(&h, 2, 3, "7: beta line two")]).err().unwrap_or_default();
+        let e = check_quotes(&ctx, &[q(&h, 2, 3, "7: beta line two")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
             format!("quote 1: the text is on line 2 of {h}, not line 7. Fix the line number, or quote the text without line numbers.")
         );
-        let e = check_quotes(&store, &[q(&h, 1, 4, "line")]).err().unwrap_or_default();
+        let e = check_quotes(&ctx, &[q(&h, 1, 4, "line")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
             "quote 1: a quote that is only part of a line needs at least 8 non-space characters. Quote more of the line, or the whole line with its indentation."
         );
         // A numbered blank line at an end of the quote is not part of the recorded text.
-        let (_d, store, h) = store_with("first\n\n  ok\n");
-        let ok = check_quotes(&store, &[q(&h, 1, 3, "2\t\n3\t  ok")]).unwrap_or_else(|e| panic!("{e}"));
+        let (_d, ctx, h) = store_with("first\n\n  ok\n");
+        let ok = check_quotes(&ctx, &[q(&h, 1, 3, "2\t\n3\t  ok")]).await.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(ok[0].text, "  ok");
         // The whole of a short line counts with its indentation only.
-        let e = check_quotes(&store, &[q(&h, 3, 3, "ok")]).err().unwrap_or_default();
+        let e = check_quotes(&ctx, &[q(&h, 3, 3, "ok")]).await.err().unwrap_or_default();
         assert!(e.contains("the whole line with its indentation"), "{e}");
     }
 
-    #[test]
-    fn a_fragment_found_only_inside_a_word_or_number_is_told_so() {
-        let (_d, store, h) = store_with("ok\ntest result: FAILED. 5 passed; 10 failed; 0 ignored\n");
-        let e = check_quotes(&store, &[q(&h, 1, 2, "0 failed; 0 ignored")]).err().unwrap_or_default();
+    #[tokio::test]
+    async fn a_fragment_found_only_inside_a_word_or_number_is_told_so() {
+        let (_d, ctx, h) = store_with("ok\ntest result: FAILED. 5 passed; 10 failed; 0 ignored\n");
+        let e = check_quotes(&ctx, &[q(&h, 1, 2, "0 failed; 0 ignored")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
             format!("quote 1: the text occurs on line 2 of {h} only inside a longer word or number. Quote from the start of that word or number to its end, or quote the whole line.")
         );
         // Quoted from the start of the number, it is accepted, and recorded as its whole line.
-        let ok = check_quotes(&store, &[q(&h, 1, 2, "10 failed; 0 ignored")]).unwrap_or_else(|e| panic!("{e}"));
+        let ok = check_quotes(&ctx, &[q(&h, 1, 2, "10 failed; 0 ignored")]).await.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
             (ok[0].start, ok[0].end, ok[0].text.as_str()),
             (2, 2, "test result: FAILED. 5 passed; 10 failed; 0 ignored")
         );
     }
 
-    #[test]
-    fn quote_mismatch_names_the_closest_line() {
-        let (_d, store, h) = store_with(OUT);
-        let e = check_quotes(&store, &[q(&h, 2, 4, "gamma line THREE")]).err().unwrap_or_default();
+    #[tokio::test]
+    async fn quote_mismatch_names_the_closest_line() {
+        let (_d, ctx, h) = store_with(OUT);
+        let e = check_quotes(&ctx, &[q(&h, 2, 4, "gamma line THREE")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
             format!("quote 1: the text does not occur in {h} lines 2-4. The closest line there is 3: gamma line three Copy the text exactly from the output.")
         );
         // The range is clamped in the sentence too.
-        let e = check_quotes(&store, &[q(&h, 3, 50, "gamma line THREE")]).err().unwrap_or_default();
+        let e = check_quotes(&ctx, &[q(&h, 3, 50, "gamma line THREE")]).await.err().unwrap_or_default();
         assert!(e.contains("lines 3-4.") && e.contains("closest line there is 3:"), "{e}");
     }
 
-    #[test]
-    fn several_failures_at_once() {
-        let (_d, store, h) = store_with(OUT);
+    #[tokio::test]
+    async fn an_output_outside_the_scope_is_refused_and_not_described() {
+        let (_d, mut ctx, h) = store_with("TOPSECRET one\nTOPSECRET two\nthree\n");
+        ctx.outputs = std::sync::Arc::new(loom_tools::outputs::OutputSet::default());
+        let never = "out:0123456789abcdef";
+        let want = |handle: &str| {
+            format!("quote 1: no output of this mission has the handle {handle}; copy the out:… handle exactly from a result header")
+        };
+        // Right text, wrong text, a range past the end, a quote by lines: all say the same, and the same as a
+        // handle that names nothing.
+        for (start, end, text) in
+            [(1, 1, "TOPSECRET one"), (1, 1, "wrong text"), (2, 9, "TOPSECRET"), (7, 9, ""), (1, 2, "")]
+        {
+            let e = check_quotes(&ctx, &[q(&h, start, end, text)]).await.err().unwrap_or_default();
+            assert_eq!(e, want(&h), "{start} {end} {text}");
+            let a = check_quotes(&ctx, &[q(never, start, end, text)]).await.err().unwrap_or_default();
+            assert_eq!(a, want(never));
+        }
+        // One output outside and one inside in the same call: only the first is refused.
+        let own = ctx.blobs.put_bytes(b"mine\n").unwrap_or_else(|e| panic!("{e}"));
+        ctx.outputs = std::sync::Arc::new(loom_tools::outputs::OutputSet::with([own.id.clone()]));
+        let e = check_quotes(&ctx, &[q(&h, 1, 1, "TOPSECRET one"), q(&own.handle(), 1, 1, "mine")])
+            .await
+            .err()
+            .unwrap_or_default();
+        assert_eq!(e, want(&h));
+    }
+
+    #[tokio::test]
+    async fn several_failures_at_once() {
+        let (_d, ctx, h) = store_with(OUT);
         let e = check_quotes(
-            &store,
+            &ctx,
             &[
                 q(&h, 1, 1, "alpha line one"),
                 q(&h, 1, 1, "zzz"),
@@ -1190,20 +1238,21 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
                 q(&h, 2, 7, ""),
             ],
         )
+        .await
         .err()
         .unwrap_or_default();
         let lines: Vec<&str> = e.lines().collect();
         assert_eq!(lines.len(), 3);
         assert!(lines[0].starts_with("quote 2: the text does not occur"));
-        assert!(lines[1].starts_with("quote 3: there is no stored output"));
+        assert!(lines[1].starts_with("quote 3: no output of this mission has the handle"));
         assert!(lines[2].starts_with("quote 5: ") && lines[2].contains("end 7 is past its end"), "{}", lines[2]);
     }
 
-    #[test]
-    fn long_closest_line_is_cut() {
+    #[tokio::test]
+    async fn long_closest_line_is_cut() {
         let long = format!("prefix-match {}", "y".repeat(500));
-        let (_d, store, h) = store_with(&format!("{long}\n"));
-        let e = check_quotes(&store, &[q(&h, 1, 1, "prefix-match different")]).err().unwrap_or_default();
+        let (_d, ctx, h) = store_with(&format!("{long}\n"));
+        let e = check_quotes(&ctx, &[q(&h, 1, 1, "prefix-match different")]).await.err().unwrap_or_default();
         let want = format!("The closest line there is 1: {}… Copy", &long[..200]);
         assert!(e.contains(&want), "{e}");
     }

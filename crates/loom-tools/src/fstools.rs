@@ -22,7 +22,11 @@
 //!   runs again for the file it names (relative to the link's directory), at most `MAX_LINKS` (8)
 //!   times, so the target's directory is the one judged; more links → error sentence.
 //!
-//! `write_file_checked` is the same write for callers outside these tools (`box_get`).
+//! `write_file_checked` is the same write for callers outside these tools (`box_get`). The descriptor
+//! steps themselves — opening (and making) a directory without following a link with a judge of the real
+//! path given as a function, and the `*at` calls — are `pub(crate)` for `workcopy::adopt`, which must not
+//! have a weaker way to write the workspace either; the sentence for a link in the way names the caller's
+//! action, not `write` and `edit`, when another caller uses it.
 //!
 //! All three tools work only on regular files. A device, FIFO or socket → error sentence naming what
 //! the path is and what to use instead; it is never opened (`files::open_readable`). At most `READ_CAP`
@@ -38,17 +42,22 @@
 //! A directory → error sentence suggesting `glob`. A missing file → error sentence; when files with
 //! a similar name exist in the same directory (edit distance ≤ 2, or same name ignoring case), name
 //! up to 3 of them. Otherwise: read the bytes, record them as seen, `view::store_text`, then exactly
-//! as `out_read` (window with `cfg.read_max_lines`, numbered lines, `max_line_chars` 20_000) and
-//! return `Body::View` of the stored text. Facts: the path as given, `view::range_fact`, the handle of
-//! the stored text (`out:…`, whose line numbers are the ones shown; `evidence` quotes it), the
-//! normalisation notes when there are any. Binary content: the body is the one-line description from
+//! as `out_read` (window with `cfg.read_max_lines`, numbered lines, `max_line_chars` 20_000,
+//! `max_chars` = `ctx.view_chars`) and return `Body::View` of the stored text. Facts: the path as
+//! given, `view::range_fact(first, numbered.last, total)`, `view::ended_fact(numbered.last)` when the
+//! size bound ended the window early, the handle of the stored text (`out:…`, whose line numbers are
+//! the ones shown; `evidence` quotes it), the normalisation notes when there are any. Binary content: the body is the one-line description from
 //! `normalize`. An empty file: body `(empty file)`.
 //!
 //! A file above `READ_CAP`: without `start`/`end` → error sentence stating its size, saying to pass a
 //! range or to search it with `bash` (`grep` skips files of that size). With a range the file is
 //! streamed and only the lines of the window are kept: at most 80_000 bytes of each line, and at most
-//! `WINDOW_BYTES` (4 MiB) in all — a window that reaches that size ends after the line that reached it
-//! and the range fact says so and where to continue. The window has no handle (its stored lines are
+//! the smaller of `WINDOW_BYTES` (4 MiB) and `ctx.view_chars` bytes in all, each line counted with the
+//! `{n}\t` it will be shown with — a window that reaches that size ends before the line that would pass
+//! it (the first line is always kept; the last line of a file without a final newline is checked like
+//! any other) and the range fact says so and where to continue. Each line is shown at most `min(20_000, ctx.view_chars)` characters,
+//! so the numbered text exceeds `ctx.view_chars` by no more than its line numbers, which `finalize`
+//! bounds (a window this tool shapes itself should not reach that backstop in practice). The window has no handle (its stored lines are
 //! numbered from 1, the text shows the file's own numbers): a fact says to quote it from `bash`. The kept lines are normalised and stored like a
 //! whole read and returned as `Body::View` of that stored window: the text numbers the lines as in
 //! the file, `shown` counts them in the stored window. The file is then recorded as seen by size and
@@ -130,8 +139,9 @@ const CHUNK: usize = 1 << 20;
 const BINARY_PROBE: usize = 8192;
 /// Most bytes kept of one line of a streamed read: room for `MAX_LINE_CHARS` characters.
 const KEEP_LINE_BYTES: usize = MAX_LINE_CHARS * 4;
-/// Most bytes kept of all the lines of one streamed read (4 MiB). The window ends after the line
-/// that reaches it, so at most this much and one more line is held, normalised and stored.
+/// Most bytes kept of all the lines of one streamed read (4 MiB), and never more than `ctx.view_chars`.
+/// The window ends before the line that would pass it (the first line is always kept), so at most this
+/// much is held, normalised and stored, apart from a first line longer than it.
 const WINDOW_BYTES: usize = 4 * 1024 * 1024;
 
 /// The size limits of a `read`. Tests lower them.
@@ -172,7 +182,7 @@ impl From<NotOpened> for Fail {
 
 /// Why `write_atomic` wrote nothing.
 #[derive(Debug)]
-enum WriteFail {
+pub(crate) enum WriteFail {
     /// The sandbox refused the real path the file would have been written at: its sentence.
     Denied(String),
     /// A link where none is followed, or too many links: a sentence that says what to do.
@@ -423,7 +433,7 @@ fn write_atomic(sandbox: &Sandbox, path: &Path, bytes: &[u8]) -> Result<(), Writ
             )));
         };
         let name = name.to_os_string();
-        let dir = open_dir_creating(sandbox, parent)?;
+        let dir = open_dir_creating(&|real| sandbox.check_write(real).map(|_| ()), &write_edit_link, parent)?;
         match entry_at(&dir, &name)? {
             // A relative target is taken from the directory that holds the link.
             Entry::Link => target = real_path(dir.as_fd())?.join(read_link_at(&dir, &name)?),
@@ -447,7 +457,7 @@ fn replace_in(sandbox: &Sandbox, dir: &File, name: &OsStr, mode: Option<u32>, by
     sandbox.check_write(&real.join(name)).map_err(WriteFail::Denied)?;
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = OsString::from(format!(".{}.loom-{}-{n}.tmp", name.to_string_lossy(), std::process::id()));
-    let mut file = create_new_at(dir, &tmp)?;
+    let mut file = create_new_at(dir, &tmp, 0o666)?;
     let written = (|| {
         file.write_all(bytes)?;
         file.sync_data()?;
@@ -464,10 +474,15 @@ fn replace_in(sandbox: &Sandbox, dir: &File, name: &OsStr, mode: Option<u32>, by
 
 /// Open the directory `dir` without following a link in its last component. When it is missing, the
 /// nearest directory above it that exists is opened and the missing ones are made below it one at a
-/// time: each only after the sandbox has judged the real path of the open directory it is made in
-/// joined with its name, and each opened relative to that descriptor without following a link, so a
-/// link put in the place of one is never followed.
-fn open_dir_creating(sandbox: &Sandbox, dir: &Path) -> Result<File, WriteFail> {
+/// time: each only after `judge` has accepted the real path of the open directory it is made in
+/// joined with its name (its refusal is `WriteFail::Denied`), and each opened relative to that descriptor
+/// without following a link, so a link put in the place of one is never followed. `in_the_way` words the
+/// sentence for a link where a directory is expected, from the path of that link.
+pub(crate) fn open_dir_creating(
+    judge: &dyn Fn(&Path) -> Result<(), String>,
+    in_the_way: &dyn Fn(&Path) -> String,
+    dir: &Path,
+) -> Result<File, WriteFail> {
     let mut missing: Vec<&OsStr> = Vec::new();
     let mut at = dir;
     let mut open = loop {
@@ -482,45 +497,79 @@ fn open_dir_creating(sandbox: &Sandbox, dir: &Path) -> Result<File, WriteFail> {
             },
             // Whether a link is in the way only chooses the sentence; the open has already refused it.
             Err(e) => {
-                return Err(not_followed(at, e, || {
-                    std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_symlink())
-                }))
+                return Err(not_followed(
+                    at,
+                    e,
+                    || std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_symlink()),
+                    in_the_way,
+                ))
             }
         }
     };
     for name in missing.into_iter().rev() {
         let made = real_path(open.as_fd())?.join(name);
-        sandbox.check_write(&made).map_err(WriteFail::Denied)?;
+        judge(&made).map_err(WriteFail::Denied)?;
         match make_dir_at(&open, name) {
             Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(WriteFail::Io(e)),
             _ => {}
         }
-        open = descend(&open, name, &made)?;
+        open = descend_with(&open, name, &made, in_the_way)?;
     }
     Ok(open)
 }
 
 /// Open the directory `name` of the open directory `dir`, whose path with that name is `path`,
 /// without following a link: a link there is refused with a sentence.
+fn descend_with(
+    dir: &File,
+    name: &OsStr,
+    path: &Path,
+    in_the_way: &dyn Fn(&Path) -> String,
+) -> Result<File, WriteFail> {
+    open_dir_at(dir, name)
+        .map_err(|e| not_followed(path, e, || matches!(entry_at(dir, name), Ok(Entry::Link)), in_the_way))
+}
+
+/// `descend_with` as `write` and `edit` word a link in the way.
+#[cfg(test)]
 fn descend(dir: &File, name: &OsStr, path: &Path) -> Result<File, WriteFail> {
-    open_dir_at(dir, name).map_err(|e| not_followed(path, e, || matches!(entry_at(dir, name), Ok(Entry::Link))))
+    descend_with(dir, name, path, &write_edit_link)
+}
+
+/// Open the directory `dir`, which must exist, without following a link in its last component, and make
+/// nothing. A link there is refused with the sentence `in_the_way` gives.
+pub(crate) fn open_dir_existing(dir: &Path, in_the_way: &dyn Fn(&Path) -> String) -> Result<File, WriteFail> {
+    open_dir(dir).map_err(|e| {
+        not_followed(dir, e, || std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()), in_the_way)
+    })
 }
 
 /// A failure to open the directory `dir` without following a link: a sentence when `is_link` says a
-/// link was in the way (reported as `ELOOP`, or by macOS as `ENOTDIR` when a directory was asked for).
-fn not_followed(dir: &Path, e: std::io::Error, is_link: impl FnOnce() -> bool) -> WriteFail {
+/// link was in the way (reported as `ELOOP`, or by macOS as `ENOTDIR` when a directory was asked for);
+/// `in_the_way` gives the sentence then, from the path of the link.
+fn not_followed(
+    dir: &Path,
+    e: std::io::Error,
+    is_link: impl FnOnce() -> bool,
+    in_the_way: &dyn Fn(&Path) -> String,
+) -> WriteFail {
     if !matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) || !is_link() {
         return WriteFail::Io(e);
     }
-    WriteFail::Refused(format!(
+    WriteFail::Refused(in_the_way(dir))
+}
+
+/// The sentence of `write` and `edit` for a link where a directory is expected.
+fn write_edit_link(dir: &Path) -> String {
+    format!(
         "{} is a symbolic link where `write` and `edit` expect a directory, and they follow no link there. Name \
          the file by its real path and try again.",
         dir.display()
-    ))
+    )
 }
 
 /// What a directory holds under a name, not following a link.
-enum Entry {
+pub(crate) enum Entry {
     Missing,
     Link,
     /// Anything else, with its permission bits.
@@ -553,12 +602,12 @@ fn done(rc: libc::c_int) -> std::io::Result<()> {
 }
 
 /// Open the directory `path` for reading without following a link in its last component.
-fn open_dir(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_dir(path: &Path) -> std::io::Result<File> {
     std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(path)
 }
 
 /// Open the directory `name` of the open directory `dir` without following a link.
-fn open_dir_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
+pub(crate) fn open_dir_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
     let c = c_name(name)?;
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
@@ -566,26 +615,25 @@ fn open_dir_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
 }
 
 /// Make the directory `name` in the open directory `dir`, with permissions 0777 less the umask.
-fn make_dir_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
+pub(crate) fn make_dir_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
     let c = c_name(name)?;
     let mode: libc::mode_t = 0o777;
     // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
     done(unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), mode) })
 }
 
-/// Create the file `name` in the open directory `dir` for writing, with permissions 0666 less the
+/// Create the file `name` in the open directory `dir` for writing, with permissions `mode` less the
 /// umask. Nothing may exist under that name; a link there is not followed.
-fn create_new_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
+pub(crate) fn create_new_at(dir: &File, name: &OsStr, mode: libc::c_uint) -> std::io::Result<File> {
     let c = c_name(name)?;
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let mode: libc::c_uint = 0o666;
     // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
     // With O_CREAT, openat reads one more argument, the mode, which a C caller passes as an unsigned int.
     owned(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, mode) })
 }
 
 /// What the open directory `dir` holds under `name`.
-fn entry_at(dir: &File, name: &OsStr) -> std::io::Result<Entry> {
+pub(crate) fn entry_at(dir: &File, name: &OsStr) -> std::io::Result<Entry> {
     let c = c_name(name)?;
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `c` is a NUL-terminated name that outlives the call, `dir` is an open descriptor, and `st`
@@ -607,7 +655,7 @@ fn entry_at(dir: &File, name: &OsStr) -> std::io::Result<Entry> {
 }
 
 /// The target of the link `name` in the open directory `dir`, as written in the link.
-fn read_link_at(dir: &File, name: &OsStr) -> std::io::Result<PathBuf> {
+pub(crate) fn read_link_at(dir: &File, name: &OsStr) -> std::io::Result<PathBuf> {
     let c = c_name(name)?;
     let mut buf = vec![0u8; 4096];
     // SAFETY: `c` is a NUL-terminated name that outlives the call, `dir` is an open descriptor, and
@@ -623,17 +671,55 @@ fn read_link_at(dir: &File, name: &OsStr) -> std::io::Result<PathBuf> {
 }
 
 /// Rename `from` to `to`, both in the open directory `dir`, replacing what `to` was.
-fn rename_at(dir: &File, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+pub(crate) fn rename_at(dir: &File, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
     let (f, t) = (c_name(from)?, c_name(to)?);
     // SAFETY: `f` and `t` are NUL-terminated names that outlive the call, and `dir` is an open descriptor.
     done(unsafe { libc::renameat(dir.as_raw_fd(), f.as_ptr(), dir.as_raw_fd(), t.as_ptr()) })
 }
 
 /// Remove the file `name` from the open directory `dir`.
-fn remove_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
+pub(crate) fn remove_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
     let c = c_name(name)?;
     // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
     done(unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) })
+}
+
+/// Remove the empty directory `name` from the open directory `dir`; a link there is not followed (it is
+/// refused, as it is no directory).
+pub(crate) fn remove_dir_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
+    let c = c_name(name)?;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    done(unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) })
+}
+
+/// Make the link `name` in the open directory `dir`, pointing at `target` (as written). Nothing may exist
+/// under that name.
+pub(crate) fn symlink_at(dir: &File, target: &OsStr, name: &OsStr) -> std::io::Result<()> {
+    let (t, c) = (c_name(target)?, c_name(name)?);
+    // SAFETY: `t` and `c` are NUL-terminated strings that outlive the call, and `dir` is an open descriptor.
+    done(unsafe { libc::symlinkat(t.as_ptr(), dir.as_raw_fd(), c.as_ptr()) })
+}
+
+/// Open the existing entry `name` of the open directory `dir` for reading, without following a link. It is
+/// opened without waiting (a FIFO put there would otherwise block) and the caller checks that it is a file.
+/// Only adoption's clone uses it, and only macOS clones.
+#[cfg(target_os = "macos")]
+pub(crate) fn open_file_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
+    let c = c_name(name)?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    owned(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) })
+}
+
+/// Make the entry `name` in the open directory `dir` a clone of the open file `src` (copy-on-write, with
+/// its permission bits and no data copied). Fails when anything exists under that name, and when the file
+/// system cannot clone.
+#[cfg(target_os = "macos")]
+pub(crate) fn clone_at(src: &File, dir: &File, name: &OsStr) -> std::io::Result<()> {
+    let c = c_name(name)?;
+    // SAFETY: `src` and `dir` are open descriptors, `c` is a NUL-terminated name that outlives the call, and
+    // fclonefileat(2) has no other memory effects.
+    done(unsafe { libc::fclonefileat(src.as_raw_fd(), dir.as_raw_fd(), c.as_ptr(), 0) })
 }
 
 /// The names in the open directory `dir`, without `.` and `..`. An entry that cannot be read ends the
@@ -769,7 +855,7 @@ fn read_file(
             ))
             .into();
         }
-        return read_large_range(ctx, given, file, &meta, start, end, limits.window);
+        return read_large_range(ctx, given, file, &meta, start, end, limits.window.min(ctx.view_chars));
     }
     let bytes = match read_open(file, meta.len(), limits.whole, &ctx.cancel) {
         Ok(b) => b,
@@ -804,18 +890,23 @@ fn show_whole(ctx: &ToolCtx, given: &str, bytes: &[u8], start: Option<u64>, end:
         Ok(None) => return ToolOutput::ok("ok", Body::Message("(empty file)".into())).with_more(given.to_string()),
         Err(e) => return ToolOutput::error(e),
     };
-    let (text, shortened) = match view::numbered(&ctx.blobs, &stored.id, first, last, MAX_LINE_CHARS) {
+    let numbered = match view::numbered(&ctx.blobs, &stored.id, first, last, MAX_LINE_CHARS, ctx.view_chars) {
         Ok(r) => r,
         Err(e) => return ToolOutput::error(format!("{given} could not be shown ({e}). Try again.")),
     };
+    let shown_last = numbered.last;
     // The handle of the stored text: `evidence` quotes it, and its lines are the numbers shown here.
     let handle = stored.handle();
-    let mut out = ToolOutput::ok("ok", Body::View { of: stored.id, text, shown: vec![(first, last)] })
-        .with_more(given.to_string())
-        .with_more(view::range_fact(first, last, total))
-        .with_more(handle);
-    if shortened > 0 {
-        out = out.with_more(format!("{shortened} long lines shortened"));
+    let mut out =
+        ToolOutput::ok("ok", Body::View { of: stored.id, text: numbered.text, shown: vec![(first, shown_last)] })
+            .with_more(given.to_string())
+            .with_more(view::range_fact(first, shown_last, total));
+    if shown_last < last {
+        out = out.with_more(view::ended_fact(shown_last));
+    }
+    out = out.with_more(handle);
+    if numbered.shortened > 0 {
+        out = out.with_more(format!("{} long lines shortened", numbered.shortened));
     }
     if let Some(notes) = norm.notes() {
         out = out.with_more(notes);
@@ -874,8 +965,36 @@ fn end_line(w: &mut Window, line_start: usize, full_bytes: u64) {
     w.count += 1;
 }
 
+/// Close the line `lineno` (see `end_line`) and count it with its `{n}\t` prefix in `counted`. When it
+/// would take `counted` past `max_bytes` and is not the first line kept, it is dropped again, the window
+/// is marked full, and this returns true: the window ends before it.
+fn close_line(
+    w: &mut Window,
+    line_start: usize,
+    full_bytes: u64,
+    lineno: u64,
+    counted: &mut usize,
+    max_bytes: usize,
+) -> bool {
+    end_line(w, line_start, full_bytes);
+    let prefix = lineno.to_string().len().saturating_add(1);
+    let size = w.raw.len().saturating_sub(line_start).saturating_add(prefix);
+    if w.count > 1 && counted.saturating_add(size) > max_bytes {
+        w.raw.truncate(line_start);
+        w.count = w.count.saturating_sub(1);
+        if w.cut.last().is_some_and(|(at, _)| *at == w.count) {
+            w.cut.pop();
+        }
+        w.full = true;
+        return true;
+    }
+    *counted = counted.saturating_add(size);
+    false
+}
+
 /// Stream `file`, keeping only lines `first..=last`: at most `KEEP_LINE_BYTES` bytes of each, and no
-/// further line once `max_bytes` are kept.
+/// line that would take the kept bytes, each line counted with its `{n}\t` prefix, past `max_bytes` (the
+/// first line is always kept).
 fn stream_window(
     file: File,
     cancel: &CancellationToken,
@@ -890,6 +1009,8 @@ fn stream_window(
     let mut line_start = 0usize;
     let mut line_bytes = 0u64;
     let mut probed = false;
+    // The bytes of the kept lines as they will be shown: each with its `{n}\t` prefix.
+    let mut counted = 0usize;
     loop {
         if cancel.is_cancelled() {
             return Err(Fail::Cancelled);
@@ -904,7 +1025,7 @@ fn stream_window(
         }
         if !probed {
             probed = true;
-            // The rule a whole read applies to the file (a NUL, or mostly not text), on its head.
+            // The rule a whole read applies to the file (mostly NULs or not text), on its head.
             if normalize(buf.get(..buf.len().min(BINARY_PROBE)).unwrap_or(buf)).binary {
                 w.binary = true;
                 return Ok(w);
@@ -923,11 +1044,13 @@ fn stream_window(
         reader.consume(take + usize::from(ended));
         if ended {
             if in_range {
-                end_line(&mut w, line_start, line_bytes);
+                if close_line(&mut w, line_start, line_bytes, lineno, &mut counted, max_bytes) {
+                    return Ok(w);
+                }
                 line_start = w.raw.len();
             }
             line_bytes = 0;
-            let full = in_range && w.raw.len() >= max_bytes;
+            let full = in_range && counted >= max_bytes;
             if lineno >= last || full {
                 if reader.fill_buf().map_err(Fail::Io)?.is_empty() {
                     w.total = Some(lineno);
@@ -941,8 +1064,11 @@ fn stream_window(
     }
     if line_bytes > 0 {
         // The file ends without a final newline: what was collected is its last line.
-        if lineno >= first && lineno <= last {
-            end_line(&mut w, line_start, line_bytes);
+        if lineno >= first
+            && lineno <= last
+            && close_line(&mut w, line_start, line_bytes, lineno, &mut counted, max_bytes)
+        {
+            return Ok(w);
         }
         w.total = Some(lineno);
     } else {
@@ -952,9 +1078,9 @@ fn stream_window(
 }
 
 /// The lines of a normalised window as `{n}\t{line}`, numbered from `first` and shortened the way
-/// `view::numbered` shortens them; `cut` is `Window::cut`. Returns the text and how many lines were
-/// shortened.
-fn number_window(text: &str, first: u64, cut: &[(u64, u64)]) -> (String, u64) {
+/// `view::numbered` shortens them, each at most `max_line_chars` characters; `cut` is `Window::cut`.
+/// Returns the text and how many lines were shortened.
+fn number_window(text: &str, first: u64, cut: &[(u64, u64)], max_line_chars: usize) -> (String, u64) {
     let body = text.strip_suffix('\n').unwrap_or(text);
     let mut out = String::with_capacity(body.len() + 8);
     let mut shortened = 0u64;
@@ -966,7 +1092,7 @@ fn number_window(text: &str, first: u64, cut: &[(u64, u64)]) -> (String, u64) {
         out.push('\t');
         let full_bytes =
             cut.binary_search_by_key(&(i as u64), |(at, _)| *at).ok().and_then(|j| cut.get(j)).map(|(_, bytes)| *bytes);
-        let (head, rest) = match line.char_indices().nth(MAX_LINE_CHARS) {
+        let (head, rest) = match line.char_indices().nth(max_line_chars) {
             Some((at, _)) => line.split_at(at),
             None => (line, ""),
         };
@@ -1030,11 +1156,11 @@ fn read_large_range(
     };
     if norm.binary {
         return ToolOutput::error(format!(
-            "Lines {first}-{shown_last} of {given} are binary data (they contain a NUL byte, or are mostly not text), so they are not shown as lines. Use `bash` with a bounded command that makes them printable, such as `sed -n '{first},{shown_last}p' {given} | cat -v | head -100`."
+            "Lines {first}-{shown_last} of {given} are binary data (they are mostly NUL bytes or other bytes that are not text), so they are not shown as lines. Use `bash` with a bounded command that makes them printable, such as `sed -n '{first},{shown_last}p' {given} | cat -v | head -100`."
         ))
         .into();
     }
-    let (text, shortened) = number_window(&norm.text, first, &w.cut);
+    let (text, shortened) = number_window(&norm.text, first, &w.cut, MAX_LINE_CHARS.min(ctx.view_chars));
     let range = match w.total {
         Some(total) => view::range_fact(first, shown_last, total),
         None if w.full => format!(
@@ -1628,28 +1754,28 @@ mod tests {
     async fn a_streamed_window_is_bounded_in_bytes_and_says_where_to_continue() {
         let e = env();
         put(&e, "rows.txt", numbered_file(200).as_bytes());
-        // `row 10` and the newline are 7 bytes: the third such line takes the window past 20 bytes.
+        // `10\trow 10` and the newline are 10 bytes: the third such line would take the window past 20 bytes.
         let limits = ReadLimits { whole: 100, window: 20 };
         let out = read_limited(&e, "rows.txt", Some(10), Some(50), limits);
         let (text, shown, _) = view_of(&e, &out);
-        assert_eq!((text.as_str(), shown), ("10\trow 10\n11\trow 11\n12\trow 12", vec![(1, 3)]));
+        assert_eq!((text.as_str(), shown), ("10\trow 10\n11\trow 11", vec![(1, 2)]));
         let facts = out.more.join(" · ");
-        assert!(facts.contains("lines 10-12 — more below") && facts.contains("before line 50"), "{facts}");
-        assert!(facts.contains("size limit of 20 bytes") && facts.contains("continue with `start` 13"), "{facts}");
+        assert!(facts.contains("lines 10-11 — more below") && facts.contains("before line 50"), "{facts}");
+        assert!(facts.contains("size limit of 20 bytes") && facts.contains("continue with `start` 12"), "{facts}");
         // The stored window is numbered from 1 while the text shows the file's numbers: no handle, and it says so.
         assert!(
             facts.contains("has no handle") && facts.contains("bounded `bash` command") && !facts.contains("out:"),
             "{facts}"
         );
         // A window that ends at the line asked for, or with the file, was not cut by its size.
-        let out = read_limited(&e, "rows.txt", Some(10), Some(12), limits);
+        let out = read_limited(&e, "rows.txt", Some(10), Some(11), limits);
         assert!(
-            view_of(&e, &out).0.ends_with("12\trow 12") && !out.more.join(" · ").contains("size limit"),
+            view_of(&e, &out).0.ends_with("11\trow 11") && !out.more.join(" · ").contains("size limit"),
             "{:?}",
             out.more
         );
-        let out = read_limited(&e, "rows.txt", Some(198), Some(900), limits);
-        assert!(out.more.iter().any(|f| f.starts_with("lines 198-200 of 200")), "{:?}", out.more);
+        let out = read_limited(&e, "rows.txt", Some(199), Some(900), ReadLimits { whole: 100, window: 40 });
+        assert!(out.more.iter().any(|f| f.starts_with("lines 199-200 of 200")), "{:?}", out.more);
 
         // Of one line, 80,000 bytes are kept, cut on a character boundary, and 20,000 characters shown.
         put(&e, "long.txt", format!("short\na{}\nend\n", "é".repeat(60_000)).as_bytes());
@@ -1669,6 +1795,110 @@ mod tests {
             out.more.iter().filter(|f| f.contains("shortened") || f.contains("invalid")).collect::<Vec<_>>(),
             vec!["1 long lines shortened"]
         );
+    }
+
+    #[test]
+    fn a_whole_read_ends_at_a_whole_line_within_the_view_size() {
+        let mut e = env();
+        e.ctx.view_chars = 100;
+        put(&e, "rows.txt", numbered_file(500).as_bytes());
+        let mut start = 1u64;
+        let mut seen = Vec::new();
+        while start <= 500 {
+            let out = read_limited(&e, "rows.txt", Some(start), None, READ_LIMITS);
+            let (text, shown, _) = view_of(&e, &out);
+            assert!(text.chars().count() <= 100, "{}", text.chars().count());
+            let last = shown[0].1;
+            assert!(text.ends_with(&format!("{last}\trow {last}")), "{text}");
+            let facts = out.more.join(" · ");
+            if last < 500 && last - start + 1 < 200 {
+                assert!(facts.contains(&format!("lines {start}-{last} of 500")), "{facts}");
+                assert!(facts.contains(&format!("continue with start {}", last + 1)), "{facts}");
+            }
+            seen.extend(start..=last);
+            start = last + 1;
+        }
+        assert_eq!(seen, (1..=500).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn a_whole_read_of_long_lines_shows_the_first_line_shortened_to_fit() {
+        let mut e = env();
+        e.ctx.view_chars = 200;
+        put(&e, "big.jsonl", format!("{}\n{}\n", "a".repeat(2000), "b".repeat(2000)).as_bytes());
+        let out = read_limited(&e, "big.jsonl", None, None, READ_LIMITS);
+        let (text, shown, _) = view_of(&e, &out);
+        assert!(text.chars().count() <= 200 && text.starts_with("1\taaa"), "{text}");
+        assert_eq!(shown, vec![(1, 1)]);
+        let facts = out.more.join(" · ");
+        assert!(facts.contains("line 1 of 2") && facts.contains("continue with start 2"), "{facts}");
+    }
+
+    #[test]
+    fn large_window_cut_by_finalize_says_to_continue_past_lines_it_did_not_show() {
+        let mut e = env();
+        let policy = loom_core::admit::AdmitPolicy { max_inline_tokens: 91, ..Default::default() };
+        let estimator = loom_core::estimate::TokenEstimator::default();
+        e.ctx.view_chars = policy.view_chars(&estimator);
+        let body: String = "x\n".repeat(10_000);
+        put(&e, "short.txt", body.as_bytes());
+        let out = read_limited(&e, "short.txt", Some(5000), Some(7000), cap(10));
+        let spec = e.registry.get("read").unwrap().spec();
+        let r = crate::finalize(
+            &e.ctx,
+            &spec,
+            out,
+            &crate::Admission { policy: &policy, estimator: &estimator },
+            std::time::Instant::now(),
+        );
+        let last_seen = r.text.lines().filter_map(|l| l.split('\t').next()?.parse::<u64>().ok()).max().unwrap();
+        let cont = r
+            .text
+            .split("continue with `start` ")
+            .nth(1)
+            .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap();
+        assert_eq!(cont, last_seen + 1, "{}", r.text);
+    }
+
+    #[test]
+    fn a_last_line_without_a_newline_that_would_pass_the_window_size_is_not_kept() {
+        let mut e = env();
+        e.ctx.view_chars = 20;
+        put(&e, "tail.txt", format!("{}\n{}", "a".repeat(8), "b".repeat(12)).as_bytes());
+        let out = read_limited(&e, "tail.txt", Some(1), Some(5), cap(10));
+        let (text, shown, _) = view_of(&e, &out);
+        assert_eq!(shown, vec![(1, 1)]);
+        assert!(text.starts_with("1\taaaaaaaa") && !text.contains('b'), "{text}");
+        let facts = out.more.join(" · ");
+        assert!(facts.contains("continue with `start` 2"), "{facts}");
+        // As the first line it is kept however long it is.
+        put(&e, "lone.txt", "c".repeat(300).as_bytes());
+        let out = read_limited(&e, "lone.txt", Some(1), Some(5), cap(10));
+        let (_, shown, _) = view_of(&e, &out);
+        assert_eq!(shown, vec![(1, 1)]);
+    }
+
+    #[test]
+    fn a_large_file_window_ends_before_the_line_that_would_pass_the_view_size() {
+        let mut e = env();
+        e.ctx.view_chars = 40;
+        put(&e, "rows.txt", numbered_file(200).as_bytes());
+        // Ten bytes a line with its number: four lines are 40 bytes, a fifth would pass 40.
+        let out = read_limited(&e, "rows.txt", Some(10), Some(50), cap(100));
+        let (text, shown, _) = view_of(&e, &out);
+        assert_eq!(text, "10\trow 10\n11\trow 11\n12\trow 12\n13\trow 13");
+        assert_eq!(shown, vec![(1, 4)]);
+        let facts = out.more.join(" · ");
+        assert!(facts.contains("lines 10-13 — more below") && facts.contains("continue with `start` 14"), "{facts}");
+        // The first line is kept and shown at most `view_chars` characters even when it alone passes it.
+        put(&e, "long.txt", format!("{}\nnext\n", "z".repeat(500)).as_bytes());
+        let out = read_limited(&e, "long.txt", Some(1), Some(2), cap(100));
+        let (text, shown, _) = view_of(&e, &out);
+        assert_eq!(shown, vec![(1, 1)]);
+        assert!(text.starts_with("1\tzzz") && text.chars().count() < 80, "{text}");
+        assert!(out.more.iter().any(|f| f.contains("continue with `start` 2")), "{:?}", out.more);
     }
 
     #[tokio::test]
@@ -2168,7 +2398,9 @@ mod tests {
         if !Path::new(&key).exists() {
             return; // the temp directory is not on the data volume
         }
-        let refusal = format!("{} is not readable", secret.join("k.txt").display());
+        // The alias is turned back into the usual path before the rules are applied, so each tool refuses by
+        // the rule that names the file, which is the usual path.
+        let plain = secret.join("k.txt").display().to_string();
         for (tool, args) in [
             ("read", json!({"path": key})),
             ("write", json!({"path": key, "content": "x"})),
@@ -2176,7 +2408,10 @@ mod tests {
         ] {
             let r = e.call(tool, args).await;
             assert!(
-                r.status == ToolStatus::Denied && r.text.contains(&refusal) && !r.text.contains("PRIVATE"),
+                r.status == ToolStatus::Denied
+                    && (r.text.contains(&format!("{plain} is not readable"))
+                        || r.text.contains(&format!("{plain} is not writable")))
+                    && !r.text.contains("PRIVATE"),
                 "{tool}: {}",
                 r.text
             );

@@ -1674,6 +1674,7 @@ mod tests {
             unattended: false,
             archived: false,
             gate: None,
+            prior: Vec::new(),
         }
     }
 

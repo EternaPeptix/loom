@@ -10,7 +10,10 @@
 //!
 //! ## Commands
 //! - `daemon`: `serve::run`. `up`: `serve::spawn_background`, then print `loom is running on
-//!   {bind}` (or `already running`). `down`: `client.shutdown()`, wait until it stops answering
+//!   {bind}` (or `already running`). When it started the daemon, each line of
+//!   `config.key_env_warnings(paths.model_keys_dir(), …)` judged against `loom up`'s own environment (which
+//!   `daemon_env` passes on) is printed first, on stderr, as `warning: {line}`; a config that cannot be
+//!   loaded prints none (`spawn_background` reports it). `down`: `client.shutdown()`, wait until it stops answering
 //!   (10 s), then until the old process lets go of `<home>/daemon.lock` (2 × `tools.kill_grace_s` + 30 s;
 //!   past that an error names its pid), print `stopped`. When nothing answers, the lock is held and
 //!   `daemon.json` names a live pid (a daemon still shutting down), only the second wait.
@@ -20,7 +23,11 @@
 //! - `run [options] <message…>`: start a session and follow it. The message is the arguments
 //!   joined by spaces; `-` or no message reads standard input to its end. Options → `NewSession`
 //!   (`--workspace` defaults to the current directory; `--attended` sets `unattended: false`;
-//!   `--max-steps`/`--max-minutes` → budget). Prints `session {id}` to stderr first. With
+//!   `--max-steps`/`--max-minutes` → budget; `--prior <mission>`, repeatable, → `prior` in the order
+//!   given: earlier missions for this one to recall, `loom_agent::prior`; `chat` takes it too, and refuses it
+//!   with `--session`: a mission recalls when it starts). A
+//!   `--prior` word that starts with `m-` is a mission id, sent as it is; any other word is resolved as a
+//!   session (`client.resolve`: an id, a prefix, or `last`) and its `mission` is sent. Prints `session {id}` to stderr first. With
 //!   `--detach`, stops there. Otherwise *follows* (below).
 //! - `chat [options]`: a `chat`-role session on the terminal: prompt `› `, read a line (an empty
 //!   line is ignored, end of input or `/quit` leaves), send it, follow until the turn ends, repeat.
@@ -57,11 +64,16 @@
 //!   `render::granted_hosts_line` from the mission's ledger (left out when the ledger cannot be read).
 //! - `out <handle> [--lines <a>:<b>]`: the stored output's lines (all of it, paged 5 000 lines at a
 //!   time, without `--lines`), passed through `render::clean`.
-//! - `config path` prints the config file's path; `config check` loads and checks it (`ok`, or the
-//!   error and exit 1); `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
+//! - `config path` prints the config file's path; `config check` loads and checks it and reads every
+//!   `api_key_file` (`check_model_keys`): `ok`, or the error and exit 1; with `ok`, each line of
+//!   `key_env_warnings` judged against this shell's environment on stderr as `warning: {line}`; `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
 //!   overwrite: `{path} already exists.`).
 //! - `service install|uninstall|status` (macOS; elsewhere `This command is for macOS (launchd).`):
-//!   `install` prepares the home (`serve::prepare_home`), creates `{logs}/loomd.log` (0600) if it is missing,
+//!   `install` first loads the config and refuses (nothing written) a profile that sets `api_key_env`: a
+//!   launchd agent does not have the shell's variables, so its requests would carry no key, and putting
+//!   the key in the plist would write it to disk and the daemon's environment; the sentence names the
+//!   profile and the variable and gives the move of `key_env_warnings`. It also refuses what
+//!   `check_model_keys` refuses. Then it prepares the home (`serve::prepare_home`), creates `{logs}/loomd.log` (0600) if it is missing,
 //!   writes `serve::launch_agent_plist` to `~/Library/LaunchAgents/{SERVICE_LABEL}.plist`
 //!   and runs `launchctl bootstrap gui/{uid} {plist}`; `uninstall` runs `launchctl bootout
 //!   gui/{uid}/{SERVICE_LABEL}` and removes the file; `status` runs `launchctl print` and says
@@ -87,7 +99,9 @@
 //! client's tests): every command parses with its options and rejects a missing argument; `run`
 //! and `send` message joining and `-`; `--lines` parsing (`10:20`, `10:`, `:20`, bad forms);
 //! `follow_exit_code` for every turn end; `DEFAULT_CONFIG` parses with `Config::parse` and passes
-//! `check()`; `open_url`; `open` hands the address to the browser and writes it only with `--print`.
+//! `check()`; `open_url`; `open` hands the address to the browser and writes it only with `--print`;
+//! the service-install key check refuses a profile with `api_key_env` (naming it and the variable) and a
+//! missing key file, and passes a config whose profiles use `api_key_file` or no key.
 
 use crate::client::{self, Client};
 use crate::render::{self, RecordOpts, Style};
@@ -96,7 +110,8 @@ use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt
 use loom_agent::session::Phase;
 use loom_core::config::{Config, Paths};
 use loom_core::event::{Budget, Event, Record, Seq, SessionOutcome, TurnEndReason};
-use loom_core::SessionId;
+use loom_core::{MissionId, SessionId};
+use std::future::Future;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -252,6 +267,10 @@ pub struct StartOpts {
     pub max_steps: u32,
     #[arg(long, default_value_t = 0)]
     pub max_minutes: u32,
+    /// An earlier mission for this one to recall: a mission id (m-…), or a session id, prefix or `last`
+    /// (its mission). Repeat for more
+    #[arg(long, value_name = "MISSION")]
+    pub prior: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -632,8 +651,26 @@ fn non_zero(n: u32) -> Option<u32> {
     (n > 0).then_some(n)
 }
 
-/// The request `loom run` and `loom chat` make; `cwd` is the default workspace.
-fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path) -> NewSession {
+/// The missions `--prior` names, in the order given: a word starting with `m-` is a mission id and is sent as
+/// it is; any other word goes to `resolve` (a session id, prefix or `last`), which gives its mission.
+async fn prior_missions<F, Fut>(words: &[String], resolve: F) -> Result<Vec<MissionId>, String>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<MissionId, String>>,
+{
+    let mut out = Vec::new();
+    for word in words {
+        let word = word.trim();
+        if word.is_empty() {
+            continue;
+        }
+        out.push(if word.starts_with("m-") { MissionId::from(word) } else { resolve(word.to_string()).await? });
+    }
+    Ok(out)
+}
+
+/// The request `loom run` and `loom chat` make; `cwd` is the default workspace; `prior` the missions to recall.
+fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path, prior: Vec<MissionId>) -> NewSession {
     let workspace = opts.workspace.clone().unwrap_or_else(|| cwd.to_path_buf());
     NewSession {
         workspace: std::path::absolute(&workspace).unwrap_or(workspace),
@@ -644,6 +681,7 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path) -> NewSess
         unattended: opts.attended.then_some(false),
         budget: Budget { max_steps: non_zero(opts.max_steps), max_minutes: non_zero(opts.max_minutes) },
         message,
+        prior,
     }
 }
 
@@ -1188,8 +1226,37 @@ fn terminal_cfg<'a>(render_record: &'a dyn Fn(&Record) -> String, style: &Style,
     }
 }
 
+/// Whether the variable is present and not empty in this process's environment.
+fn env_var_is_set(var: &str) -> bool {
+    std::env::var_os(var).is_some_and(|v| !v.is_empty())
+}
+
+/// What `loom service install` refuses before it writes anything: a profile that sets `api_key_env` (a launchd
+/// agent does not have the shell's variables, and the key must not be written into the service file) and what
+/// `Config::check_model_keys` refuses.
+fn service_key_check(config: &Config, keys_dir: &Path) -> Result<(), String> {
+    for (name, profile) in &config.models {
+        if let Some(var) = &profile.api_key_env {
+            let file = config.suggested_key_files().get(name).cloned().unwrap_or_else(|| name.clone());
+            let steps = loom_core::config::key_move_steps(keys_dir, name, &file, var, true);
+            return Err(format!(
+                "models.{name} sets api_key_env = \"{var}\", but a launchd service does not have your shell's variables, so its requests would carry no key, and putting the key in the service file would write it to disk and into the daemon's environment. Move the key to a file: {steps}, and run `loom service install` again."
+            ));
+        }
+    }
+    config.check_model_keys(keys_dir)
+}
+
 async fn cmd_up(paths: &Paths) -> Result<i32, String> {
     let spawned = crate::serve::spawn_background(paths).await?;
+    if matches!(spawned, crate::serve::Spawned::Started) {
+        // `spawn_background` has already reported a config that cannot be loaded.
+        if let Ok(config) = Config::load(&paths.config_file()) {
+            for line in config.key_env_warnings(&paths.model_keys_dir(), env_var_is_set) {
+                errln(&format!("warning: {line}"));
+            }
+        }
+    }
     let bind = client::bind_from_home(paths)?;
     let line = match spawned {
         crate::serve::Spawned::Started => format!("loom is running on {bind}"),
@@ -1295,7 +1362,9 @@ async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
     let c = client_of(paths)?;
     let cwd =
         std::env::current_dir().map_err(|e| format!("Cannot find the current directory ({e}). Pass --workspace."))?;
-    let info = c.create(&new_session(&a.start, Some(message), &cwd)).await?;
+    let client = &c;
+    let prior = prior_missions(&a.start.prior, |word| async move { client.mission_of(&word).await }).await?;
+    let info = c.create(&new_session(&a.start, Some(message), &cwd, prior)).await?;
     let id = info.meta.id;
     errln(&format!("session {id}"));
     if a.detach {
@@ -1308,11 +1377,18 @@ async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
 async fn cmd_chat(paths: &Paths, a: ChatArgs) -> Result<i32, String> {
     let c = client_of(paths)?;
     let id = match &a.session {
+        Some(_) if !a.start.prior.is_empty() => {
+            return Err("Earlier missions are recalled when a mission starts. Drop --session to start a new chat \
+that recalls them, or drop --prior to continue this one."
+                .to_string());
+        }
         Some(word) => c.resolve(word).await?,
         None => {
             let cwd = std::env::current_dir()
                 .map_err(|e| format!("Cannot find the current directory ({e}). Pass --workspace."))?;
-            let mut new = new_session(&a.start, None, &cwd);
+            let client = &c;
+            let prior = prior_missions(&a.start.prior, |word| async move { client.mission_of(&word).await }).await?;
+            let mut new = new_session(&a.start, None, &cwd, prior);
             if new.role.is_none() {
                 new.role = Some("chat".to_string());
             }
@@ -1352,8 +1428,13 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
     match action {
         ConfigAction::Path => outln(&file.display().to_string()).map(|()| 0),
         ConfigAction::Check => {
-            Config::load(&file).map_err(|e| e.to_string())?;
-            outln("ok").map(|()| 0)
+            let config = Config::load(&file).map_err(|e| e.to_string())?;
+            config.check_model_keys(&paths.model_keys_dir())?;
+            outln("ok")?;
+            for line in config.key_env_warnings(&paths.model_keys_dir(), env_var_is_set) {
+                errln(&format!("warning: {line}"));
+            }
+            Ok(0)
         }
         ConfigAction::Init => {
             use std::os::unix::fs::OpenOptionsExt;
@@ -1414,6 +1495,8 @@ fn cmd_service(paths: &Paths, action: ServiceAction) -> Result<i32, String> {
     match action {
         ServiceAction::Install => {
             let exe = std::env::current_exe().map_err(|e| format!("Cannot find this program's path ({e})."))?;
+            let config = Config::load(&paths.config_file()).map_err(|e| e.to_string())?;
+            service_key_check(&config, &paths.model_keys_dir())?;
             write_service_files(paths, &plist, &exe)?;
             launchctl(&["bootstrap", &domain, &plist.display().to_string()])?;
             outln(&format!("installed {}; the daemon starts at login", plist.display())).map(|()| 0)
@@ -1512,6 +1595,10 @@ mod tests {
             "5",
             "--max-minutes",
             "9",
+            "--prior",
+            "m-1",
+            "--prior",
+            "last",
             "-d",
             "--reasoning",
             "--full",
@@ -1529,16 +1616,20 @@ mod tests {
         assert_eq!(a.start.title.as_deref(), Some("T"));
         assert!(a.start.attended);
         assert_eq!((a.start.max_steps, a.start.max_minutes), (5, 9));
+        assert_eq!(a.start.prior, words(&["m-1", "last"]));
         assert!(a.detach && a.show.reasoning && a.show.full && a.show.verbose);
         assert_eq!(a.message, words(&["fix", "the", "bug"]));
         let Command::Run(a) = ok(&["run"]) else { panic!("not run") };
-        assert!(a.message.is_empty() && !a.detach && !a.start.attended);
+        assert!(a.message.is_empty() && !a.detach && !a.start.attended && a.start.prior.is_empty());
         assert_eq!((a.start.max_steps, a.start.max_minutes), (0, 0));
         let Command::Run(a) = ok(&["run", "-"]) else { panic!("not run") };
         assert_eq!(a.message, words(&["-"]));
         let Command::Run(a) = ok(&["run", "--", "-5", "is", "negative"]) else { panic!("not run") };
         assert_eq!(a.message, words(&["-5", "is", "negative"]));
         rejected(&["run", "--max-steps", "many"]);
+        rejected(&["run", "--prior"]);
+        let Command::Chat(a) = ok(&["chat", "--prior", "s-9"]) else { panic!("not chat") };
+        assert_eq!(a.start.prior, words(&["s-9"]));
         rejected(&["run", "--no-such-flag"]);
     }
 
@@ -1877,6 +1968,53 @@ mod tests {
     }
 
     #[test]
+    fn config_check_reads_the_key_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        std::fs::create_dir_all(&paths.home).unwrap();
+        std::fs::write(paths.config_file(), "[models.m]\napi_key_file = \"m\"\n").unwrap();
+        let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
+        assert!(err.starts_with("models.m: ") && err.contains(&paths.model_keys_dir().join("m").display().to_string()));
+    }
+
+    #[test]
+    fn service_install_key_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        let profile = |env: Option<&str>, file: Option<&str>| loom_core::config::ModelProfile {
+            api_key_env: env.map(str::to_string),
+            api_key_file: file.map(str::to_string),
+            ..Default::default()
+        };
+        let mut c = Config::default();
+        c.models.insert("m".into(), profile(Some("MY_KEY"), None));
+        let err = service_key_check(&c, &keys).unwrap_err();
+        assert!(err.contains("models.m") && err.contains("MY_KEY") && err.contains("api_key_file = \"m\""), "{err}");
+        assert!(err.contains("printenv MY_KEY"), "{err}");
+        c.models.insert("gpt 4/o".into(), profile(Some("MY_KEY"), None));
+        c.models.remove("m");
+        let spaced = dir.path().join("my keys");
+        let err = service_key_check(&c, &spaced).unwrap_err();
+        assert!(err.contains(&format!("printenv MY_KEY > '{}'", spaced.join("gpt-4-o").display())), "{err}");
+        assert!(err.contains("[models.\"gpt 4/o\"]") && err.contains("api_key_file = \"gpt-4-o\""), "{err}");
+
+        let mut c = Config::default();
+        c.models.insert("m".into(), profile(None, Some("m")));
+        let err = service_key_check(&c, &keys).unwrap_err();
+        assert!(err.starts_with("models.m: ") && err.contains(&keys.join("m").display().to_string()), "{err}");
+
+        let file = keys.join("m");
+        std::fs::write(&file, "sk-1\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        service_key_check(&c, &keys).unwrap();
+        c.models.insert("n".into(), profile(None, None));
+        service_key_check(&c, &keys).unwrap();
+        service_key_check(&Config::default(), &keys).unwrap();
+    }
+
+    #[test]
     fn service_install_files_tighten_the_home_and_create_the_log_before_launchd_opens_it() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -1896,8 +2034,9 @@ mod tests {
     #[test]
     fn new_session_from_options() {
         let cwd = Path::new("/here");
-        let n = new_session(&StartOpts::default(), Some("go".into()), cwd);
+        let n = new_session(&StartOpts::default(), Some("go".into()), cwd, Vec::new());
         assert_eq!(n.workspace, PathBuf::from("/here"));
+        assert!(n.prior.is_empty());
         assert_eq!(n.message.as_deref(), Some("go"));
         assert_eq!(n.unattended, None);
         assert_eq!(n.budget, Budget { max_steps: None, max_minutes: None });
@@ -1910,8 +2049,10 @@ mod tests {
             attended: true,
             max_steps: 7,
             max_minutes: 3,
+            prior: Vec::new(),
         };
-        let n = new_session(&opts, None, cwd);
+        let n = new_session(&opts, None, cwd, vec![MissionId::from("m-1"), MissionId::from("m-2")]);
+        assert_eq!(n.prior, [MissionId::from("m-1"), MissionId::from("m-2")]);
         assert_eq!(n.workspace, PathBuf::from("/w"));
         assert_eq!(
             (n.pack.as_deref(), n.role.as_deref(), n.model.as_deref(), n.title.as_deref()),
@@ -1920,6 +2061,29 @@ mod tests {
         assert_eq!(n.unattended, Some(false));
         assert_eq!(n.budget, Budget { max_steps: Some(7), max_minutes: Some(3) });
         assert!(n.message.is_none());
+    }
+
+    #[tokio::test]
+    async fn prior_words_are_mission_ids_as_they_are_or_sessions_resolved_to_their_mission() {
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        let resolve = |word: String| {
+            asked.lock().unwrap().push(word.clone());
+            async move {
+                match word.as_str() {
+                    "last" => Ok(MissionId::from("m-of-last")),
+                    "s-1" => Ok(MissionId::from("m-of-s1")),
+                    w => Err(format!("No session matches `{w}`.")),
+                }
+            }
+        };
+        let got = prior_missions(&words(&["m-9", "", "last", "  ", "s-1", " m-3 "]), resolve).await.unwrap();
+        let want: Vec<MissionId> = ["m-9", "m-of-last", "m-of-s1", "m-3"].into_iter().map(MissionId::from).collect();
+        assert_eq!(got, want);
+        // Only the words that are not mission ids were looked up.
+        assert_eq!(*asked.lock().unwrap(), ["last", "s-1"]);
+        let resolve = |word: String| async move { Err::<MissionId, _>(format!("No session matches `{word}`.")) };
+        assert_eq!(prior_missions(&words(&["m-1", "zzz"]), resolve).await.unwrap_err(), "No session matches `zzz`.");
+        assert!(prior_missions(&[], resolve).await.unwrap().is_empty());
     }
 
     #[test]

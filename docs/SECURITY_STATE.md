@@ -18,6 +18,10 @@ installation, and retraction reasons do not themselves constitute observations.
 {"operation":{"action":"asset_upsert","asset":{"kind":"host","locator":"Example.TEST.","evidence":["e1"],"mandatory":true}}}
 ```
 
+Its result names what the write changed, not the whole state: the journal `entry`, the touched records
+in full under `recorded` (their ids and a count per collection when they are many), `removed` ids, the
+size of each collection under `counts`, and where to read the rest (`security_query`).
+
 Asset kinds are `host`, `service`, `endpoint`, `file`, and `identity`. Host/IP spelling and URL scheme,
 host, and default port are canonicalized. URL paths, query strings, and identity/file locators retain
 case. URL credentials are rejected. IDs are full SHA-256 hashes of length-delimited typed tuples, so
@@ -45,6 +49,13 @@ one of these dispositions:
 Missing/unattested evidence and blank deferral reasons are rejected. `mandatory_open()` supplies the
 finish gate with remaining asset IDs. Tested coverage records that an observation exists; it does
 not mechanically establish exhaustive testing of the asset.
+
+Every evidence record carries the grade the harness gave the output it quotes (`docs/DESIGN.md` §7):
+`run`, `analysis` (`dep_scan`, `bin_decompile`, `bin_xrefs`), `read`, or `reference` (`cve_lookup`,
+`cve_search`, `advisory_lookup`, a reference-host `web_fetch`). Security records cite evidence ids and
+accept any attested grade. The goal-met conclusion, a verifier's objection and stuck detection accept
+only a run, so a scanner verdict, a decompilation, an imported scan or an advisory can locate a lead
+and support a claim, but cannot by itself show that the goal is met.
 
 ## How `security_record` reads near misses
 

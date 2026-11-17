@@ -1739,7 +1739,17 @@ export function planEvent(ev, ctx) {
 
 export const ROLES = ["lead", "chat"];
 
-/** Validate the form; returns {body} for POST /api/sessions or {error}. */
+/** The most earlier missions one new mission may name (the daemon's `prior::MAX_PRIOR`). */
+export const MAX_PRIOR = 8;
+
+/**
+ * Validate the form; returns {body} for POST /api/sessions or {error}.
+ * `form.prior` (optional text): earlier missions for the new one to recall. Split on whitespace and commas;
+ * each must be a mission id as the daemon names them (1 to 128 of A-Z a-z 0-9 _ . -, not starting with `.`),
+ * else `"{word}" is not a mission id; mission ids look like m-….`; repeats dropped (first kept); more than 8 →
+ * `Name at most 8 earlier missions to recall.` A non-empty list is sent as `body.prior`, in order; none sends no
+ * `prior` key.
+ */
 export function buildNewSession(form) {
   const workspace = String(form.workspace || "").trim();
   const message = String(form.message || "").trim();
@@ -1750,6 +1760,16 @@ export function buildNewSession(form) {
   if (form.model) body.model = form.model;
   const title = String(form.title || "").trim();
   if (title) body.title = title;
+  const prior = [];
+  for (const word of String(form.prior || "").split(/[\s,]+/)) {
+    if (!word) continue;
+    if (!/^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}$/.test(word)) {
+      return { error: `"${oneLine(word, 40)}" is not a mission id; mission ids look like m-….` };
+    }
+    if (!prior.includes(word)) prior.push(word);
+  }
+  if (prior.length > MAX_PRIOR) return { error: `Name at most ${MAX_PRIOR} earlier missions to recall.` };
+  if (prior.length) body.prior = prior;
   return { body };
 }
 

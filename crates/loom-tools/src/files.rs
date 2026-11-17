@@ -33,6 +33,9 @@
 //! the kind of file is judged on the descriptor too. A refusal is `NotOpened::Denied` with the judge's
 //! sentence, and the file is closed unread. `open_regular(path)` is the same open with no judge.
 //!
+//! `open_dir_readable(path, readable)` opens a directory the same way (never blocking) and has `readable`
+//! judge its real path, for a walk that lists names and never opens the files.
+//!
 //! `real_path(fd)` asks the operating system which file an open descriptor is: macOS `F_GETPATH`,
 //! Linux the link `/proc/self/fd/N`. Elsewhere it fails with a sentence saying that the file tools
 //! are not supported there, so nothing is read unjudged.
@@ -146,6 +149,15 @@ fn open_judged(path: &Path, readable: Option<Readable<'_>>) -> Result<(File, Met
         return Err(NotOpened::NotRegular(meta.file_type()));
     }
     Ok((file, meta))
+}
+
+/// Whether the session may list the directory at `path`, judged on the directory as it is opened: `readable`
+/// is given the real path of the open directory, wherever the path led when it was opened.
+pub fn open_dir_readable(path: &Path, readable: Readable<'_>) -> Result<(), NotOpened> {
+    let flags = libc::O_DIRECTORY | libc::O_NONBLOCK | libc::O_NOCTTY;
+    let dir = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(path).map_err(NotOpened::Io)?;
+    let real = real_path(dir.as_fd()).map_err(NotOpened::Io)?;
+    readable(&real).map_err(NotOpened::Denied)
 }
 
 /// The path of the file or directory that the open descriptor `fd` is, as the kernel knows it: links

@@ -6,8 +6,11 @@
 //! Authorship rules enforced by the runtime before an op is appended:
 //! - `GoalSet`, `ConstraintAdd`, `ApprovalGrant`, `QuestionAnswer` come only from user input.
 //! - `EvidenceAdd` is attested: the runtime confirms the cited tool call exists in the cited session
-//!   log, copies the stored output's hash, and checks any quote verbatim.
+//!   log, copies the stored output's hash, and checks any quote verbatim. It also records the tool
+//!   that produced the output and the output's [`EvidenceGrade`]; `kind` is `Execution` exactly when
+//!   that grade is `Run`.
 
+pub use crate::event::EvidenceGrade;
 use crate::ids::{BlobId, CallId, SessionId};
 use serde::{Deserialize, Serialize};
 
@@ -181,9 +184,9 @@ pub enum ClaimStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
-    /// Something was run and its behaviour observed.
+    /// Something was run and its behaviour observed (grade `run`).
     Execution,
-    /// Something was read.
+    /// Anything else: something was read, analysed, or looked up (grades `analysis`, `read`, `reference`).
     Static,
 }
 
@@ -220,6 +223,35 @@ pub struct EvidenceInput {
     pub note: String,
     #[serde(default)]
     pub attested: bool,
+    /// Name of the tool whose output this quotes (`bash`, `dep_scan`, …). `None` in entries written before
+    /// it was recorded. Not serialized when `None`, so an old entry's bytes, and its MAC, are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// The output's grade (`event::EvidenceGrade::of` of the producing result). `None` in older entries;
+    /// [`EvidenceInput::grade_or_kind`] then reads it from `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade: Option<EvidenceGrade>,
+}
+
+impl EvidenceInput {
+    /// The recorded grade; for an entry written before grades were recorded, the one its `kind` implies
+    /// (`Run` for `Execution`, `Read` for `Static`).
+    pub fn grade_or_kind(&self) -> EvidenceGrade {
+        self.grade.unwrap_or(match self.kind {
+            EvidenceKind::Execution => EvidenceGrade::Run,
+            EvidenceKind::Static => EvidenceGrade::Read,
+        })
+    }
+
+    /// How the views name where a record came from: `{grade} by {tool}` (`run by bash`, `analysis by
+    /// dep_scan`), or `{grade}` alone when the tool was not recorded.
+    pub fn source_label(&self) -> String {
+        let grade = self.grade_or_kind().as_str();
+        match self.tool.as_deref().filter(|t| !t.is_empty()) {
+            Some(tool) => format!("{grade} by {tool}"),
+            None => grade.to_string(),
+        }
+    }
 }
 
 /// One line of a mission journal.
@@ -452,7 +484,10 @@ pub struct LedgerState {
 //   evidence id must exist; to `Dropped` requires a non-empty `note`;
 // - `ClaimUpdate` to `Supported` requires the claim to have at least one evidence record with
 //   `supports == true` and `attested == true`; to `Refuted`/`Withdrawn` requires a non-empty note;
-// - `EvidenceAdd` requires the claim id to exist and a non-empty `note`;
+// - `EvidenceAdd` requires the claim id to exist and a non-empty `note`; when `grade` is present it must agree
+//   with `kind` (`Execution` exactly when the grade is `Run`), else refused with a sentence saying the
+//   harness recorded a grade that contradicts the kind (a harness fault, not the model's: nothing to fix
+//   in the call). An entry without `grade` (written before grades were recorded) is not checked;
 // - `ObligationSettle`/`ApprovalUse` on an already settled/used item → refused, saying so;
 // - `FinishClaim` is refused while `open_items()` is not empty; the message lists every open item by
 //   id and first 80 characters, and for each kind how to close it;
@@ -466,8 +501,15 @@ pub struct LedgerState {
 // `GoalMetSet` with `Open` is refused by `validate` and ignored by `apply`), so the model can move the
 // claim toward a conclusion but never retract it. `validate` requires: a goal is set; the target is
 // `Supported` or `Refuted`; a non-blank `note`; at least one named evidence id, every id existing, every
-// one attested and supporting; at least one of them of kind `Execution` (reading source alone is
-// refused: run the target and cite the run). Once terminal it may be written again only with the OTHER
+// one attested and supporting; at least one of them of kind `Execution`, i.e. a run (a quote of analysis
+// output, of a read, or of reference data alone is refused: run the target and cite the run). That refusal
+// reads: `None of the cited evidence is a run: {labels}.`
+// where `{labels}` is `LedgerState::evidence_labels` of the cited ids, then, for each grade present among
+// them, in this order, one sentence: analysis → `Analysis output (a dependency scan, a decompilation,
+// cross-references) describes the target without running it: analysis is not a run.`; read → `Reading
+// source or a page does not show what the target does when it runs.`; reference → `Reference data (a CVE
+// or advisory record) is about the world, not this target: a lookup is not a run.`; then `Run the target,
+// record the run with `evidence`, and cite that record.` Once terminal it may be written again only with the OTHER
 // terminal status and at least one execution evidence record added after the entry that set the current
 // status (`GoalMet.n`); repeating the current status is refused. `apply` replaces status, note and
 // evidence and records the entry position.
@@ -497,27 +539,69 @@ pub struct LedgerState {
 // `open_items()`: plan steps `Todo`/`Doing`; obligations with no outcome; claims with status `Open`;
 // questions with `blocking` and no answer.
 //
+// Brief caps. The HUD is the last message of every request and is never cached, so every line of the
+// brief is paid for again at every step; lists that only grow are capped (`BriefOpts`), and what a cap
+// leaves out stays one `ledger` call away. Under `Plan:` every `Todo` and `Doing` step is listed, but of
+// the `Done` steps only the last `opts.max_plan_done` (in plan order). Under `Open obligations:` every
+// open `objection` (each one blocks `finish` and the HUD says to answer each) and, of the other open
+// obligations, only the last `opts.max_obligations`. Under `Claims:` every `Open` claim, but of the settled ones
+// (`Supported`, `Refuted`, `Withdrawn`) only the last `opts.max_claims` (in claim order). Listed items
+// keep their order and their line format. When a cap leaves items out, the section starts, right under
+// its heading, with the elision line `({N} older {what} not shown: {ids}; call `ledger` to read them)`,
+// `{what}` being `done` (plan), `open` (obligations) or `settled` (claims), and `{ids}` the ids left out
+// as runs: consecutive ids of one letter joined `{first}–{last}`, runs joined by `, ` (`p1–p11, p13`);
+// with more than `ELISION_RUNS` (6) runs, the first 3, then `…`, then the last 3, so the line stays short
+// however the ids interleave (`p1, p3, p5, …, p285, p287, p289`).
+// Decisions and dead ends use the same line without a `{what}` (`(2 older not shown: d1–d2; …)`, as
+// before). A cap of 0 lists none of those items. Defaults: `max_plan_done` 5, `max_claims` 10,
+// `max_obligations` 20, `max_decisions` 12, `max_dead_ends` 20, `max_line` 400. The elision line sends the
+// reader to `ledger`, so a caller whose reader holds no `ledger` tool uses `BriefOpts::uncapped()`:
+// the defaults with `max_plan_done`, `max_claims` and `max_obligations` at `usize::MAX` (the brief as it
+// was before the caps). Tests: the run limit with interleaved ids; objections never left out; `uncapped()`
+// lists everything; each cap at,
+// below and above its bound, the elision line with non-contiguous ids, open items never left out by the
+// plan and claim caps, and the size of a long mission's brief (65 done steps, 74 claims) with and
+// without the caps.
+//
 // `brief(opts)` renders the compact state text used in the HUD and after a re-weave, in this order,
 // omitting empty sections: `Goal:` (full text), `Constraints:` (active only, verbatim), `Plan:` (one
 // line per non-dropped step: `[x] p1 text — note` / `[>] doing` / `[ ] todo`), `Open obligations:`,
-// `Claims:` (id, status, text, evidence ids), `Decisions:` (last `opts.max_decisions`),
+// `Claims:` (id, status, text, evidence labels), `Decisions:` (last `opts.max_decisions`),
 // `Dead ends:` (last `opts.max_dead_ends`) — each of these two starts, right under its heading, with the
 // line `(N older not shown: {first id}–{last id}, or the one id when N is 1; call `ledger` to read them)` when older items were left out —,
 // `Approvals:` (unused ones, verbatim, with scope),
 // `Unanswered questions:`. Right after `Goal:` (when a goal is set, or grants exist) comes a section of
-// lines: `Goal status: open (not yet concluded)` / `Goal status: met — note (evidence: ids)` /
-// `Goal status: cannot be met as stated — note (evidence: ids)`; when released `released by the operator
+// lines: `Goal status: open (not yet concluded)` / `Goal status: met — note (evidence: labels)` /
+// `Goal status: cannot be met as stated — note (evidence: labels)`; when released `released by the operator
 // (goal not established): reason`; and `authorized hosts: a, b, c` or `authorized hosts: none granted`.
 // The reason and the hosts are the operator's words and are never cut. Evidence quotes are not included. Each line is cut at `opts.max_line`
-// characters with `…`. The output is deterministic.
+// characters with `…`. The output is deterministic. Evidence "labels" (`evidence_labels(ids)`) name each id
+// with where it came from, joined by `, `: `{id} {source_label}` (`e1 run by bash, e2 analysis by dep_scan`;
+// `e3 run` for an older entry with no tool recorded), or the bare id when no such record exists. So the
+// model sees, wherever its evidence is listed, which of it is a run.
 //
 // `render_markdown()` renders everything (all sections, all records including evidence with handle,
-// line range and quote) as a Markdown document that begins with the line
+// line range and quote; an evidence record's bullet line reads `- {supports|undermines} the claim; kind:
+// {kind}; grade: {grade_or_kind}; attested: {yes|no}`, and its source line is `- source: {tool}, session
+// {session}, call {call}` when the tool is recorded and `- source: session {session}, call {call}` as before
+// when not) as a Markdown document that begins with the line
 // `<!-- generated from the mission journal; edits here are ignored -->`.
+//
+// `summarize(op)` of an `EvidenceAdd`: `evidence for {claim} ({supports|undermines}, {source_label}) from call
+// {call}: {note}`.
 //
 // Tests required: id assignment incl. PlanSet replacement; every validate rule (accept and refuse);
 // open_items; apply ignores unknown ids; fold == repeated apply; brief ordering/omission/cutting and
-// determinism; markdown contains every record; serde round trip of every op variant.
+// determinism; markdown contains every record; serde round trip of every op variant. Evidence grades: an
+// `EvidenceAdd` without `tool`/`grade` serializes to exactly the bytes it did before the fields existed
+// and reads back with both `None`; one with them round-trips; `grade_or_kind`/`source_label` with and
+// without a recorded grade and tool; a grade that contradicts `kind` is refused (both ways) and an absent
+// one is not checked; a goal-met conclusion citing only analysis evidence is refused with a sentence that
+// contains `analysis is not a run` and names the record as `e1 analysis by dep_scan`, citing only reference
+// evidence names `a lookup is not a run`, citing analysis plus a read gives both sentences in order, and
+// citing analysis plus a run is accepted; the brief's claim and goal-status lines carry the labels (an
+// older entry shows `run`/`read` with no tool); markdown shows `grade:` and the tool; `summarize` shows the
+// label.
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -542,11 +626,32 @@ pub struct BriefOpts {
     pub max_decisions: usize,
     pub max_dead_ends: usize,
     pub max_line: usize,
+    /// `Done` plan steps listed (the last ones); `Todo` and `Doing` steps are always listed.
+    pub max_plan_done: usize,
+    /// Settled claims listed (the last ones); `Open` claims are always listed.
+    pub max_claims: usize,
+    /// Open obligations listed (the last ones); open objections are always listed.
+    pub max_obligations: usize,
+}
+
+impl BriefOpts {
+    /// The defaults with no cap on plan steps, claims or obligations: for a reader that cannot call
+    /// `ledger` to read what an elision line would hide.
+    pub fn uncapped() -> Self {
+        Self { max_plan_done: usize::MAX, max_claims: usize::MAX, max_obligations: usize::MAX, ..Self::default() }
+    }
 }
 
 impl Default for BriefOpts {
     fn default() -> Self {
-        Self { max_decisions: 12, max_dead_ends: 20, max_line: 400 }
+        Self {
+            max_decisions: 12,
+            max_dead_ends: 20,
+            max_line: 400,
+            max_plan_done: 5,
+            max_claims: 10,
+            max_obligations: 20,
+        }
     }
 }
 
@@ -596,15 +701,76 @@ fn ids<'a>(it: impl Iterator<Item = &'a str>) -> String {
     }
 }
 
-/// The line that tells the brief's reader that `hidden` oldest items were left out: it names the ids
-/// hidden and where to read them. `None` when nothing is hidden.
-fn elision<'a>(mut ids: impl Iterator<Item = &'a str>, hidden: usize) -> Option<String> {
-    let first = ids.next().filter(|_| hidden > 0)?;
-    let range = match ids.nth(hidden.saturating_sub(2)).filter(|_| hidden > 1) {
-        Some(last) => format!("{first}–{last}"),
-        None => first.to_string(),
-    };
-    Some(format!("({hidden} older not shown: {range}; call `ledger` to read them)"))
+/// The most runs an elision line names; with more, the first half, `…` and the last half.
+const ELISION_RUNS: usize = 6;
+
+/// Splits an id into letter prefix and number (`p12` -> (`p`, 12)); `None` when the id has another shape.
+fn id_parts(id: &str) -> Option<(&str, u64)> {
+    let at = id.find(|c: char| c.is_ascii_digit())?;
+    let (prefix, digits) = id.split_at(at);
+    Some((prefix, digits.parse().ok()?))
+}
+
+/// The ids joined as runs: consecutive numbers of one letter prefix become `first–last`, a lone id stays
+/// as it is, runs are joined by `, ` (`p1–p11, p13`).
+fn id_runs<'a>(ids: impl Iterator<Item = &'a str>) -> String {
+    type Run<'a> = (&'a str, &'a str, Option<(&'a str, u64)>);
+    let mut runs: Vec<Run> = Vec::new();
+    for id in ids {
+        let parts = id_parts(id);
+        if let Some(run) = runs.last_mut() {
+            if let (Some((prefix, n)), Some((last_prefix, last_n))) = (parts, run.2) {
+                if prefix == last_prefix && last_n.checked_add(1) == Some(n) {
+                    run.1 = id;
+                    run.2 = parts;
+                    continue;
+                }
+            }
+        }
+        runs.push((id, id, parts));
+    }
+    let runs: Vec<String> =
+        runs.iter().map(|(a, b, _)| if a == b { (*a).to_string() } else { format!("{a}–{b}") }).collect();
+    if runs.len() > ELISION_RUNS {
+        let half = ELISION_RUNS / 2;
+        let tail = runs.len().saturating_sub(half);
+        let (first, last) = (runs.get(..half).unwrap_or_default(), runs.get(tail..).unwrap_or_default());
+        return format!("{}, …, {}", first.join(", "), last.join(", "));
+    }
+    runs.join(", ")
+}
+
+/// The line that tells the brief's reader that older items were left out: it counts the hidden ids,
+/// names them as runs and says where to read them. `what` qualifies "older" (`done`, `settled`, `open`;
+/// empty for none). `None` when nothing is hidden.
+fn elision<'a>(hidden: impl Iterator<Item = &'a str>, what: &str) -> Option<String> {
+    let hidden: Vec<&str> = hidden.collect();
+    if hidden.is_empty() {
+        return None;
+    }
+    let what = if what.is_empty() { String::new() } else { format!(" {what}") };
+    Some(format!(
+        "({} older{what} not shown: {}; call `ledger` to read them)",
+        hidden.len(),
+        id_runs(hidden.iter().copied())
+    ))
+}
+
+/// Applies a cap to `items`: those for which `capped` is false are always kept; of the others only the
+/// last `keep` are. Returns (kept in order, left out in order).
+fn cap_last<T>(items: Vec<&T>, capped: impl Fn(&T) -> bool, keep: usize) -> (Vec<&T>, Vec<&T>) {
+    let total = items.iter().filter(|i| capped(i)).count();
+    let mut skip = total.saturating_sub(keep);
+    let (mut shown, mut hidden) = (Vec::new(), Vec::new());
+    for item in items {
+        if capped(item) && skip > 0 {
+            skip -= 1;
+            hidden.push(item);
+        } else {
+            shown.push(item);
+        }
+    }
+    (shown, hidden)
 }
 
 /// Refusal text for an id that does not exist: names the ids that do.
@@ -959,6 +1125,11 @@ impl LedgerState {
                     return Err(needs_text("the evidence", "note")
                         + " Say what the observation shows and what it does not show.");
                 }
+                if let Some(grade) = input.grade {
+                    if (grade == EvidenceGrade::Run) != (input.kind == EvidenceKind::Execution) {
+                        return Err(format!("The harness recorded the grade {} for this evidence, which contradicts its kind ({}). This is a fault in the harness, not in your call: there is nothing to change in it. Report it to the operator and carry on with other work.", grade.as_str(), if input.kind == EvidenceKind::Execution { "execution" } else { "static" }));
+                    }
+                }
             }
             LedgerOp::ObligationOpen { text, .. } => {
                 if blank(text) {
@@ -1135,7 +1306,19 @@ impl LedgerState {
         }
         let executed: Vec<&&Evidence> = cited.iter().filter(|e| e.input.kind == EvidenceKind::Execution).collect();
         if executed.is_empty() {
-            return Err("The cited evidence is static only (something was read, nothing was run). Reading source does not show the goal is met or unmeetable: run the target, record the run with `evidence`, and cite that execution.".to_string());
+            let mut m = format!("None of the cited evidence is a run: {}.", self.evidence_labels(evidence));
+            let has = |g: EvidenceGrade| cited.iter().any(|e| e.input.grade_or_kind() == g);
+            if has(EvidenceGrade::Analysis) {
+                m.push_str(" Analysis output (a dependency scan, a decompilation, cross-references) describes the target without running it: analysis is not a run.");
+            }
+            if has(EvidenceGrade::Read) {
+                m.push_str(" Reading source or a page does not show what the target does when it runs.");
+            }
+            if has(EvidenceGrade::Reference) {
+                m.push_str(" Reference data (a CVE or advisory record) is about the world, not this target: a lookup is not a run.");
+            }
+            m.push_str(" Run the target, record the run with `evidence`, and cite that record.");
+            return Err(m);
         }
         if current.status != GoalMetStatus::Open && !executed.iter().any(|e| e.n > current.n) {
             return Err(format!("The goal is recorded as {}. To change it, run the target again and cite execution evidence recorded after that conclusion (entry {}).", goal_met_label(current.status), current.n));
@@ -1206,6 +1389,18 @@ impl LedgerState {
         }
     }
 
+    /// The evidence ids `ids` named with where each came from, joined by `, `: `{id} {source_label}`, or the
+    /// bare id when there is no such record (see CONTRACT, brief).
+    pub fn evidence_labels(&self, ids: &[String]) -> String {
+        ids.iter()
+            .map(|id| match self.evidence.iter().find(|e| &e.id == id) {
+                Some(e) => format!("{id} {}", e.input.source_label()),
+                None => id.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Compact state text for the HUD and for re-weaves. Goal, constraints and approvals are the
     /// operator's words and are never cut; every other line is cut at `opts.max_line`.
     pub fn brief(&self, opts: &BriefOpts) -> String {
@@ -1227,7 +1422,7 @@ impl LedgerState {
                         l.push_str(&format!(" — {}", gm.note));
                     }
                     if !gm.evidence.is_empty() {
-                        l.push_str(&format!(" (evidence: {})", gm.evidence.join(", ")));
+                        l.push_str(&format!(" (evidence: {})", self.evidence_labels(&gm.evidence)));
                     }
                     s.push_str(&line(&l, max));
                 }
@@ -1255,8 +1450,13 @@ impl LedgerState {
         }
 
         let steps: Vec<&PlanStep> = self.plan.iter().filter(|p| p.status != StepStatus::Dropped).collect();
-        if !steps.is_empty() {
+        let (steps, steps_hidden) = cap_last(steps, |p| p.status == StepStatus::Done, opts.max_plan_done);
+        if !steps.is_empty() || !steps_hidden.is_empty() {
             let mut s = String::from("Plan:");
+            if let Some(hidden) = elision(steps_hidden.iter().map(|p| p.id.as_str()), "done") {
+                s.push('\n');
+                s.push_str(&hidden);
+            }
             for p in steps {
                 let mark = match p.status {
                     StepStatus::Done => "[x]",
@@ -1274,8 +1474,14 @@ impl LedgerState {
         }
 
         let obligations: Vec<&Obligation> = self.obligations.iter().filter(|o| o.outcome.is_none()).collect();
-        if !obligations.is_empty() {
+        let (obligations, obligations_hidden) =
+            cap_last(obligations, |o| o.kind != ObligationKind::Objection, opts.max_obligations);
+        if !obligations.is_empty() || !obligations_hidden.is_empty() {
             let mut s = String::from("Open obligations:");
+            if let Some(hidden) = elision(obligations_hidden.iter().map(|o| o.id.as_str()), "open") {
+                s.push('\n');
+                s.push_str(&hidden);
+            }
             for o in obligations {
                 let mut l = format!("- {} ({}) {}", o.id, obligation_kind(o.kind), o.text);
                 if !blank(&o.reference) {
@@ -1288,11 +1494,17 @@ impl LedgerState {
         }
 
         if !self.claims.is_empty() {
+            let (claims, claims_hidden) =
+                cap_last(self.claims.iter().collect(), |c| c.status != ClaimStatus::Open, opts.max_claims);
             let mut s = String::from("Claims:");
-            for c in &self.claims {
+            if let Some(hidden) = elision(claims_hidden.iter().map(|c| c.id.as_str()), "settled") {
+                s.push('\n');
+                s.push_str(&hidden);
+            }
+            for c in claims {
                 let mut l = format!("- {} [{}] {}", c.id, claim_status(c.status), c.text);
                 if !c.evidence.is_empty() {
-                    l.push_str(&format!(" (evidence: {})", c.evidence.join(", ")));
+                    l.push_str(&format!(" (evidence: {})", self.evidence_labels(&c.evidence)));
                 }
                 s.push('\n');
                 s.push_str(&line(&l, max));
@@ -1303,7 +1515,7 @@ impl LedgerState {
         if opts.max_decisions > 0 && !self.decisions.is_empty() {
             let skip = self.decisions.len().saturating_sub(opts.max_decisions);
             let mut s = String::from("Decisions:");
-            if let Some(hidden) = elision(self.decisions.iter().map(|d| d.id.as_str()), skip) {
+            if let Some(hidden) = elision(self.decisions.iter().take(skip).map(|d| d.id.as_str()), "") {
                 s.push('\n');
                 s.push_str(&hidden);
             }
@@ -1317,7 +1529,7 @@ impl LedgerState {
         if opts.max_dead_ends > 0 && !self.dead_ends.is_empty() {
             let skip = self.dead_ends.len().saturating_sub(opts.max_dead_ends);
             let mut s = String::from("Dead ends:");
-            if let Some(hidden) = elision(self.dead_ends.iter().map(|d| d.id.as_str()), skip) {
+            if let Some(hidden) = elision(self.dead_ends.iter().take(skip).map(|d| d.id.as_str()), "") {
                 s.push('\n');
                 s.push_str(&hidden);
             }
@@ -1479,7 +1691,7 @@ impl LedgerState {
         for e in &self.evidence {
             let i = &e.input;
             o.push_str(&format!(
-                "\n### {} (entry {})\n\n- claim: {}\n- {} the claim; kind: {}; attested: {}\n- source: session {}, call {}\n",
+                "\n### {} (entry {})\n\n- claim: {}\n- {} the claim; kind: {}; grade: {}; attested: {}\n- source: {}session {}, call {}\n",
                 e.id,
                 e.n,
                 i.claim,
@@ -1488,7 +1700,12 @@ impl LedgerState {
                     EvidenceKind::Execution => "execution",
                     EvidenceKind::Static => "static",
                 },
+                i.grade_or_kind().as_str(),
                 if i.attested { "yes" } else { "no" },
+                match i.tool.as_deref().filter(|t| !t.is_empty()) {
+                    Some(t) => format!("{t}, "),
+                    None => String::new(),
+                },
                 i.session,
                 i.call_id,
             ));
@@ -1608,10 +1825,7 @@ impl LedgerState {
                 "evidence for {} ({}, {}) from call {}: {}",
                 i.claim,
                 if i.supports { "supports" } else { "undermines" },
-                match i.kind {
-                    EvidenceKind::Execution => "execution",
-                    EvidenceKind::Static => "static",
-                },
+                i.source_label(),
                 i.call_id,
                 i.note
             ),
@@ -1741,6 +1955,8 @@ mod tests {
             quote: Some("hello ``` world".into()),
             note: "ran it".into(),
             attested,
+            tool: None,
+            grade: None,
         }
     }
 
@@ -2289,7 +2505,7 @@ mod tests {
             "Constraints:\n- k1: never touch prod",
             "Plan:\n[x] p1 read — read it\n[>] p2 write\n[ ] p3 test",
             "Open obligations:\n- o1 (job) bench running [pid 7]",
-            "Claims:\n- c1 [open] parser handles nesting (evidence: e1)",
+            "Claims:\n- c1 [open] parser handles nesting (evidence: e1 run)",
             "Decisions:",
             "Dead ends:",
             "Approvals:\n- a1 [git push]: ok to push",
@@ -2313,7 +2529,7 @@ mod tests {
     #[test]
     fn brief_limits_and_cuts() {
         let s = rich_state();
-        let b = s.brief(&BriefOpts { max_decisions: 2, max_dead_ends: 1, max_line: 400 });
+        let b = s.brief(&BriefOpts { max_decisions: 2, max_dead_ends: 1, max_line: 400, ..BriefOpts::default() });
         assert!(!b.contains("d1:") && b.contains("d2: drop serde — size") && b.contains("d3: pin rust — ci"), "{b}");
         assert!(!b.contains("x1:") && b.contains("x2: peg — slow"), "{b}");
         let long = "y".repeat(100);
@@ -2323,7 +2539,7 @@ mod tests {
             LedgerOp::PlanAdd { text: long.clone() },
             LedgerOp::ClaimAdd { text: "é".repeat(100) },
         ]);
-        let b = s.brief(&BriefOpts { max_decisions: 1, max_dead_ends: 1, max_line: 20 });
+        let b = s.brief(&BriefOpts { max_decisions: 1, max_dead_ends: 1, max_line: 20, ..BriefOpts::default() });
         // the operator's words are never cut
         assert!(b.contains(&format!("Goal: {long}")) && b.contains(&format!("k1: {long}")), "{b}");
         let plan_line = b.lines().find(|l| l.starts_with("[ ] p1")).unwrap_or("");
@@ -2332,18 +2548,313 @@ mod tests {
         let claim_line = b.lines().find(|l| l.starts_with("- c1")).unwrap_or("");
         assert_eq!(claim_line.chars().count(), 20);
         assert!(claim_line.ends_with('…'));
+        // a cap of 0 lists none of the capped items, and says how many it left out
+        let s = capped_state(3, 1, 3, 2);
+        let zero = BriefOpts { max_plan_done: 0, max_claims: 0, max_obligations: 0, ..BriefOpts::default() };
+        let b = s.brief(&zero);
+        assert!(!b.contains("[x]") && !b.contains("c1 [") && !b.contains("c2 [") && !b.contains("- o1"), "{b}");
+        assert!(
+            b.contains("(3 older done not shown: p1–p3;") && b.contains("(2 older settled not shown: c1–c2;"),
+            "{b}"
+        );
+        assert!(b.contains("(3 older open not shown: o1–o3;"), "{b}");
+    }
+
+    /// A ledger with `done` done plan steps, `todo` todo ones, `settled` withdrawn claims followed by `open`
+    /// open ones, and `obl` open obligations.
+    fn capped_state(done: usize, todo: usize, obl: usize, settled: usize) -> LedgerState {
+        let mut ops = Vec::new();
+        for i in 0..done + todo {
+            ops.push(LedgerOp::PlanAdd { text: format!("step {i}") });
+        }
+        for i in 0..done {
+            ops.push(LedgerOp::PlanUpdate {
+                id: format!("p{}", i + 1),
+                status: StepStatus::Done,
+                note: String::new(),
+                evidence: vec![],
+            });
+        }
+        for i in 0..obl {
+            ops.push(LedgerOp::ObligationOpen {
+                kind: ObligationKind::Job,
+                text: format!("job {i}"),
+                reference: String::new(),
+            });
+        }
+        for i in 0..settled {
+            ops.push(LedgerOp::ClaimAdd { text: format!("settled claim {i}") });
+            ops.push(LedgerOp::ClaimUpdate {
+                id: format!("c{}", i + 1),
+                status: ClaimStatus::Withdrawn,
+                note: "no".into(),
+            });
+        }
+        ops.push(LedgerOp::ClaimAdd { text: "still open".into() });
+        build(ops)
+    }
+
+    fn plan_ids(b: &str, mark: &str) -> Vec<String> {
+        b.lines()
+            .filter_map(|l| l.strip_prefix(mark))
+            .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn brief_caps_done_plan_steps_at_below_and_above_the_bound() {
+        let s = capped_state(7, 2, 0, 0);
+        let b = s.brief(&BriefOpts { max_plan_done: 3, ..BriefOpts::default() });
+        assert_eq!(plan_ids(&b, "[x]"), ["p5", "p6", "p7"], "{b}");
+        assert_eq!(plan_ids(&b, "[ ]"), ["p8", "p9"], "todo steps are always listed: {b}");
+        assert!(b.contains("Plan:\n(4 older done not shown: p1–p4; call `ledger` to read them)\n[x] p5"), "{b}");
+        // exactly at the bound and above it nothing is left out
+        for cap in [7, 8, usize::MAX] {
+            let b = s.brief(&BriefOpts { max_plan_done: cap, ..BriefOpts::default() });
+            assert_eq!(plan_ids(&b, "[x]").len(), 7, "{b}");
+            assert!(!b.contains("not shown"), "{b}");
+        }
+        // one below the bound leaves one out
+        let b = s.brief(&BriefOpts { max_plan_done: 6, ..BriefOpts::default() });
+        assert!(b.contains("(1 older done not shown: p1;"), "{b}");
+    }
+
+    #[test]
+    fn brief_caps_open_obligations_at_below_and_above_the_bound() {
+        let s = capped_state(0, 0, 6, 0);
+        let b = s.brief(&BriefOpts { max_obligations: 4, ..BriefOpts::default() });
+        assert!(
+            b.contains("Open obligations:\n(2 older open not shown: o1–o2; call `ledger` to read them)\n- o3"),
+            "{b}"
+        );
+        assert!(b.contains("- o6") && !b.contains("- o2 "), "{b}");
+        for cap in [6, 7, usize::MAX] {
+            let b = s.brief(&BriefOpts { max_obligations: cap, ..BriefOpts::default() });
+            assert!(b.contains("- o1 ") && !b.contains("not shown"), "{b}");
+        }
+        let b = s.brief(&BriefOpts { max_obligations: 5, ..BriefOpts::default() });
+        assert!(b.contains("(1 older open not shown: o1;"), "{b}");
+    }
+
+    #[test]
+    fn brief_caps_settled_claims_but_never_open_ones() {
+        // c1..c5 settled, c6 open
+        let s = capped_state(0, 0, 0, 5);
+        let b = s.brief(&BriefOpts { max_claims: 2, ..BriefOpts::default() });
+        assert!(
+            b.contains("Claims:\n(3 older settled not shown: c1–c3; call `ledger` to read them)\n- c4 [withdrawn]"),
+            "{b}"
+        );
+        assert!(b.contains("- c5 [withdrawn]") && b.contains("- c6 [open] still open"), "{b}");
+        for cap in [5, 6, usize::MAX] {
+            let b = s.brief(&BriefOpts { max_claims: cap, ..BriefOpts::default() });
+            assert!(b.contains("- c1 [withdrawn]") && !b.contains("not shown"), "{b}");
+        }
+        let b = s.brief(&BriefOpts { max_claims: 4, ..BriefOpts::default() });
+        assert!(b.contains("(1 older settled not shown: c1;"), "{b}");
+        // an open claim older than the settled ones is kept at cap 0
+        let s = build(vec![
+            LedgerOp::ClaimAdd { text: "first, open".into() },
+            LedgerOp::ClaimAdd { text: "second".into() },
+            LedgerOp::ClaimUpdate { id: "c2".into(), status: ClaimStatus::Withdrawn, note: "no".into() },
+        ]);
+        let b = s.brief(&BriefOpts { max_claims: 0, ..BriefOpts::default() });
+        assert!(b.contains("- c1 [open] first, open") && !b.contains("- c2 ") && b.contains("(1 older settled"), "{b}");
+    }
+
+    #[test]
+    fn brief_open_plan_steps_are_never_left_out() {
+        // p1 todo, p2 done, p3 doing, p4 done, p5 done: the todo and doing steps stay at cap 0
+        let s = build(vec![
+            LedgerOp::PlanSet { steps: (1..=5).map(|i| format!("s{i}")).collect() },
+            LedgerOp::PlanUpdate { id: "p2".into(), status: StepStatus::Done, note: String::new(), evidence: vec![] },
+            LedgerOp::PlanUpdate { id: "p3".into(), status: StepStatus::Doing, note: String::new(), evidence: vec![] },
+            LedgerOp::PlanUpdate { id: "p4".into(), status: StepStatus::Done, note: String::new(), evidence: vec![] },
+            LedgerOp::PlanUpdate { id: "p5".into(), status: StepStatus::Done, note: String::new(), evidence: vec![] },
+        ]);
+        let b = s.brief(&BriefOpts { max_plan_done: 1, ..BriefOpts::default() });
+        // non-contiguous hidden ids come out as runs
+        assert!(b.contains("(2 older done not shown: p2, p4;"), "{b}");
+        assert!(b.contains("[ ] p1 s1") && b.contains("[>] p3 s3") && b.contains("[x] p5 s5"), "{b}");
+        let b = s.brief(&BriefOpts { max_plan_done: 0, ..BriefOpts::default() });
+        assert!(b.contains("(3 older done not shown: p2, p4–p5;"), "{b}");
+        assert!(b.contains("[ ] p1 s1") && b.contains("[>] p3 s3") && !b.contains("[x]"), "{b}");
+    }
+
+    #[test]
+    fn elision_ids_are_joined_as_runs() {
+        let say = |ids: &[&str]| elision(ids.iter().copied(), "done");
+        assert_eq!(say(&[]), None);
+        let line =
+            say(&["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10", "p11", "p13"]).unwrap_or_default();
+        assert_eq!(line, "(12 older done not shown: p1–p11, p13; call `ledger` to read them)");
+        assert_eq!(id_runs(["p1", "c2", "c3", "p4", "x"].into_iter()), "p1, c2–c3, p4, x");
+        assert_eq!(
+            elision(["d1", "d2"].into_iter(), "").as_deref(),
+            Some("(2 older not shown: d1–d2; call `ledger` to read them)")
+        );
+    }
+
+    #[test]
+    fn long_mission_brief_is_much_smaller_with_the_caps() {
+        // 65 done and 5 todo steps, 74 claims (60 settled, 14 open), 25 open obligations, lines near 200 chars
+        let text = |what: &str, i: usize| format!("{what} {i} {}", "x".repeat(200 - what.len() - 8));
+        let mut ops = vec![LedgerOp::GoalSet { text: "audit the target".into() }];
+        for i in 0..70 {
+            ops.push(LedgerOp::PlanAdd { text: text("step", i) });
+        }
+        for i in 0..65 {
+            ops.push(LedgerOp::PlanUpdate {
+                id: format!("p{}", i + 1),
+                status: StepStatus::Done,
+                note: String::new(),
+                evidence: vec![],
+            });
+        }
+        for i in 0..25 {
+            ops.push(LedgerOp::ObligationOpen {
+                kind: ObligationKind::Job,
+                text: text("job", i),
+                reference: String::new(),
+            });
+        }
+        for i in 0..74 {
+            ops.push(LedgerOp::ClaimAdd { text: text("claim", i) });
+            if i < 60 {
+                ops.push(LedgerOp::ClaimUpdate {
+                    id: format!("c{}", i + 1),
+                    status: ClaimStatus::Withdrawn,
+                    note: "no".into(),
+                });
+            }
+        }
+        let s = build(ops);
+        let uncapped = s.brief(&BriefOpts {
+            max_plan_done: usize::MAX,
+            max_claims: usize::MAX,
+            max_obligations: usize::MAX,
+            ..BriefOpts::default()
+        });
+        let capped = s.brief(&BriefOpts::default());
+        let (u, c) = (uncapped.chars().count(), capped.chars().count());
+        println!("brief of a long mission: {u} characters uncapped, {c} capped");
+        assert!(c * 2 < u, "uncapped {u}, capped {c}");
+        assert!(capped.contains("(60 older done not shown: p1–p60;"), "{capped}");
+        assert!(capped.contains("(50 older settled not shown: c1–c50;"), "{capped}");
+        assert!(capped.contains("(5 older open not shown: o1–o5;"), "{capped}");
+        // every open claim and every todo step is still listed
+        assert_eq!(capped.matches("[open]").count(), 14, "{capped}");
+        assert_eq!(plan_ids(&capped, "[ ]").len(), 5, "{capped}");
     }
 
     #[test]
     fn brief_says_when_older_items_are_hidden() {
         let s = rich_state();
-        let b = s.brief(&BriefOpts { max_decisions: 2, max_dead_ends: 1, max_line: 400 });
+        let b = s.brief(&BriefOpts { max_decisions: 2, max_dead_ends: 1, max_line: 400, ..BriefOpts::default() });
         assert!(b.contains("(1 older not shown: d1; call `ledger` to read them)"), "{b}");
         assert!(b.contains("(1 older not shown: x1; call `ledger` to read them)"), "{b}");
-        let b = s.brief(&BriefOpts { max_decisions: 1, max_dead_ends: 2, max_line: 400 });
+        let b = s.brief(&BriefOpts { max_decisions: 1, max_dead_ends: 2, max_line: 400, ..BriefOpts::default() });
         assert!(b.contains("(2 older not shown: d1–d2; call `ledger` to read them)"), "{b}");
         let b = s.brief(&BriefOpts::default());
         assert!(!b.contains("not shown"), "{b}");
+    }
+
+    #[test]
+    fn elision_line_names_at_most_six_runs() {
+        let ids: Vec<String> = (1..=300).step_by(2).map(|i| format!("p{i}")).collect();
+        let line = elision(ids.iter().map(String::as_str), "done").unwrap_or_default();
+        assert_eq!(line, "(150 older done not shown: p1, p3, p5, …, p295, p297, p299; call `ledger` to read them)");
+        // six runs are named in full, seven are cut
+        let six = ["p1", "p3", "p5", "p7", "p9", "p11"];
+        assert_eq!(id_runs(six.into_iter()), "p1, p3, p5, p7, p9, p11");
+        let seven = ["p1", "p3", "p5", "p7", "p9", "p11", "p13"];
+        assert_eq!(id_runs(seven.into_iter()), "p1, p3, p5, …, p9, p11, p13");
+    }
+
+    #[test]
+    fn elision_line_with_interleaved_dropped_steps_stays_within_max_line() {
+        let mut ops = vec![LedgerOp::PlanSet { steps: (1..=300).map(|i| format!("s{i}")).collect() }];
+        for i in 1..=300 {
+            let status = if i % 2 == 1 { StepStatus::Done } else { StepStatus::Dropped };
+            ops.push(LedgerOp::PlanUpdate { id: format!("p{i}"), status, note: "n".into(), evidence: vec![] });
+        }
+        let b = build(ops).brief(&BriefOpts::default());
+        let elision = b.lines().find(|l| l.contains("not shown")).unwrap_or("");
+        assert!(elision.chars().count() <= BriefOpts::default().max_line, "{elision}");
+        assert!(elision.contains("p1, p3, p5, …, p285, p287, p289;"), "{elision}");
+    }
+
+    fn objection_ledger() -> LedgerState {
+        let mut ops = Vec::new();
+        for i in 0..4 {
+            ops.push(LedgerOp::ObligationOpen {
+                kind: ObligationKind::Job,
+                text: format!("job {i}"),
+                reference: String::new(),
+            });
+        }
+        ops.push(LedgerOp::ObligationOpen {
+            kind: ObligationKind::Objection,
+            text: "no test ran".into(),
+            reference: String::new(),
+        });
+        for i in 4..6 {
+            ops.push(LedgerOp::ObligationOpen {
+                kind: ObligationKind::Job,
+                text: format!("job {i}"),
+                reference: String::new(),
+            });
+        }
+        build(ops)
+    }
+
+    #[test]
+    fn open_objections_are_never_hidden_by_the_obligation_cap() {
+        let s = objection_ledger();
+        for cap in [0, 1, 3] {
+            let b = s.brief(&BriefOpts { max_obligations: cap, ..BriefOpts::default() });
+            assert!(b.contains("(objection) no test ran"), "cap {cap}: {b}");
+            assert_eq!(b.matches("(job)").count(), cap, "cap {cap}: {b}");
+        }
+        let b = s.brief(&BriefOpts { max_obligations: 0, ..BriefOpts::default() });
+        assert!(b.contains("(6 older open not shown: o1–o4, o6–o7;"), "{b}");
+        // the listed ones keep their order
+        let b = s.brief(&BriefOpts { max_obligations: 1, ..BriefOpts::default() });
+        let (obj, job) = (b.find("(objection)"), b.find("job 5"));
+        assert!(obj.is_some() && job.is_some() && obj < job, "{b}");
+    }
+
+    #[test]
+    fn uncapped_lists_everything() {
+        let o = BriefOpts::uncapped();
+        assert_eq!((o.max_plan_done, o.max_claims, o.max_obligations), (usize::MAX, usize::MAX, usize::MAX));
+        assert_eq!(
+            BriefOpts { max_plan_done: 5, max_claims: 10, max_obligations: 20, ..o.clone() },
+            BriefOpts::default()
+        );
+        let mut ops = vec![LedgerOp::PlanSet { steps: (1..=30).map(|i| format!("s{i}")).collect() }];
+        for i in 1..=30 {
+            ops.push(LedgerOp::PlanUpdate {
+                id: format!("p{i}"),
+                status: StepStatus::Done,
+                note: String::new(),
+                evidence: vec![],
+            });
+            ops.push(LedgerOp::ClaimAdd { text: format!("claim {i}") });
+            ops.push(LedgerOp::ClaimUpdate { id: format!("c{i}"), status: ClaimStatus::Withdrawn, note: "no".into() });
+            ops.push(LedgerOp::ObligationOpen {
+                kind: ObligationKind::Job,
+                text: format!("job {i}"),
+                reference: String::new(),
+            });
+        }
+        let s = build(ops);
+        let b = s.brief(&o);
+        assert!(!b.contains("not shown"), "{b}");
+        assert_eq!(b.matches("[x] p").count(), 30, "{b}");
+        assert_eq!(b.matches("[withdrawn]").count(), 30, "{b}");
+        assert_eq!(b.matches("(job)").count(), 30, "{b}");
+        assert!(s.brief(&BriefOpts::default()).contains("not shown"));
     }
 
     #[test]
@@ -2490,7 +3001,7 @@ mod tests {
         ]);
         for st in [GoalMetStatus::Supported, GoalMetStatus::Refuted] {
             let m = refusal(&s, conclude(st, &["e1"]), false);
-            assert!(m.contains("static only") && m.contains("run the target"), "{m}");
+            assert!(m.contains("None of the cited evidence is a run") && m.contains("Run the target"), "{m}");
         }
         // static plus execution is enough
         assert!(s.validate(&conclude(GoalMetStatus::Supported, &["e1", "e2"]), false).is_ok());
@@ -2529,7 +3040,8 @@ mod tests {
         let m = refusal(&s, conclude(GoalMetStatus::Refuted, &["e1"]), false);
         assert!(m.contains("run the target again") && m.contains("entry 4"), "{m}");
         s.apply(&entry(5, LedgerOp::EvidenceAdd(static_ev("c1"))));
-        assert!(refusal(&s, conclude(GoalMetStatus::Refuted, &["e2"]), false).contains("static only"));
+        assert!(refusal(&s, conclude(GoalMetStatus::Refuted, &["e2"]), false)
+            .contains("None of the cited evidence is a run"));
         s.apply(&entry(6, LedgerOp::EvidenceAdd(ev("c1", true, true))));
         assert!(s.validate(&conclude(GoalMetStatus::Refuted, &["e3"]), false).is_ok());
         s.apply(&entry(7, conclude(GoalMetStatus::Refuted, &["e3"])));
@@ -2616,7 +3128,8 @@ mod tests {
         // A static record added afterwards is not a run; a new run is, for either conclusion (the same
         // one as before included).
         s.apply(&entry(8, LedgerOp::EvidenceAdd(static_ev("c1"))));
-        assert!(refusal(&s, conclude(GoalMetStatus::Refuted, &["e2"]), false).contains("static only"));
+        assert!(refusal(&s, conclude(GoalMetStatus::Refuted, &["e2"]), false)
+            .contains("None of the cited evidence is a run"));
         s.apply(&entry(9, LedgerOp::EvidenceAdd(ev("c1", true, true))));
         assert!(s.validate(&conclude(GoalMetStatus::Refuted, &["e3"]), false).is_ok());
         assert!(s.validate(&conclude(GoalMetStatus::Supported, &["e1", "e3"]), false).is_ok());
@@ -2674,12 +3187,12 @@ mod tests {
             ]
         };
         let met = build(ops(GoalMetStatus::Supported));
-        assert!(met.brief(&BriefOpts::default()).contains("Goal status: met — ran the target (evidence: e1)"));
+        assert!(met.brief(&BriefOpts::default()).contains("Goal status: met — ran the target (evidence: e1 run)"));
         assert!(met.render_markdown().contains("met — ran the target (evidence: e1) (entry 4)"));
         let no = build(ops(GoalMetStatus::Refuted));
         assert!(no
             .brief(&BriefOpts::default())
-            .contains("Goal status: cannot be met as stated — ran the target (evidence: e1)"));
+            .contains("Goal status: cannot be met as stated — ran the target (evidence: e1 run)"));
         assert!(!no.brief(&BriefOpts::default()).contains("not yet concluded"));
     }
 
@@ -2774,5 +3287,132 @@ mod tests {
         // Optional fields may be absent on the wire for the new ops.
         let op: Result<LedgerOp, _> = serde_json::from_str(r#"{"op":"scope_grant","hosts":["a.example"]}"#);
         assert!(matches!(op, Ok(LedgerOp::ScopeGrant { note: None, .. })));
+    }
+
+    fn graded(claim: &str, tool: &str, grade: EvidenceGrade) -> EvidenceInput {
+        EvidenceInput {
+            kind: if grade == EvidenceGrade::Run { EvidenceKind::Execution } else { EvidenceKind::Static },
+            tool: Some(tool.into()),
+            grade: Some(grade),
+            ..ev(claim, true, true)
+        }
+    }
+
+    fn goal_with(evs: Vec<EvidenceInput>) -> LedgerState {
+        let mut ops = vec![LedgerOp::GoalSet { text: "g".into() }, LedgerOp::ClaimAdd { text: "c".into() }];
+        ops.extend(evs.into_iter().map(LedgerOp::EvidenceAdd));
+        build(ops)
+    }
+
+    fn conclude_with(ids: &[&str]) -> LedgerOp {
+        LedgerOp::GoalMetSet {
+            status: GoalMetStatus::Supported,
+            note: "done".into(),
+            evidence: ids.iter().map(|e| e.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn evidence_without_tool_or_grade_keeps_its_old_bytes() {
+        let old = r#"{"op":"evidence_add","claim":"c1","kind":"execution","supports":true,"session":"s-x","call_id":"call-1","blob":"ab12","lines":[2,4],"quote":"q","note":"ran it","attested":true}"#;
+        let input = EvidenceInput { quote: Some("q".into()), ..ev("c1", true, true) };
+        assert_eq!(serde_json::to_string(&LedgerOp::EvidenceAdd(input)).unwrap_or_default(), old);
+        let back: Result<LedgerOp, _> = serde_json::from_str(old);
+        match back {
+            Ok(LedgerOp::EvidenceAdd(i)) => assert_eq!((i.tool, i.grade), (None, None)),
+            other => panic!("{other:?}"),
+        }
+        let with = LedgerOp::EvidenceAdd(graded("c1", "dep_scan", EvidenceGrade::Analysis));
+        let json = serde_json::to_string(&with).unwrap_or_default();
+        assert!(json.contains(r#""tool":"dep_scan""#) && json.contains(r#""grade":"analysis""#), "{json}");
+        assert_eq!(serde_json::from_str::<LedgerOp>(&json).ok(), Some(with));
+    }
+
+    #[test]
+    fn grade_and_source_label_with_and_without_records() {
+        let old = ev("c1", true, true);
+        assert_eq!((old.grade_or_kind(), old.source_label()), (EvidenceGrade::Run, "run".to_string()));
+        let read = static_ev("c1");
+        assert_eq!((read.grade_or_kind(), read.source_label()), (EvidenceGrade::Read, "read".to_string()));
+        let a = graded("c1", "dep_scan", EvidenceGrade::Analysis);
+        assert_eq!(
+            (a.grade_or_kind(), a.source_label()),
+            (EvidenceGrade::Analysis, "analysis by dep_scan".to_string())
+        );
+        let toolless = EvidenceInput { tool: None, ..a };
+        assert_eq!(toolless.source_label(), "analysis");
+    }
+
+    #[test]
+    fn a_grade_that_contradicts_the_kind_is_refused() {
+        let s = build(vec![LedgerOp::ClaimAdd { text: "c".into() }]);
+        let run_but_static = EvidenceInput { kind: EvidenceKind::Static, ..graded("c1", "bash", EvidenceGrade::Run) };
+        let analysis_but_exec =
+            EvidenceInput { kind: EvidenceKind::Execution, ..graded("c1", "dep_scan", EvidenceGrade::Analysis) };
+        for bad in [run_but_static, analysis_but_exec] {
+            let m = refusal(&s, LedgerOp::EvidenceAdd(bad), false);
+            assert!(m.contains("contradicts its kind") && m.contains("fault in the harness"), "{m}");
+        }
+        for ok in [
+            graded("c1", "bash", EvidenceGrade::Run),
+            graded("c1", "x", EvidenceGrade::Reference),
+            static_ev("c1"),
+            ev("c1", true, true),
+        ] {
+            assert!(s.validate(&LedgerOp::EvidenceAdd(ok), false).is_ok());
+        }
+    }
+
+    #[test]
+    fn goal_met_names_what_the_cited_evidence_is() {
+        let s = goal_with(vec![graded("c1", "dep_scan", EvidenceGrade::Analysis)]);
+        let m = refusal(&s, conclude_with(&["e1"]), false);
+        assert_eq!(
+            m,
+            "None of the cited evidence is a run: e1 analysis by dep_scan. Analysis output (a dependency scan, a decompilation, cross-references) describes the target without running it: analysis is not a run. Run the target, record the run with `evidence`, and cite that record."
+        );
+        let s = goal_with(vec![graded("c1", "cve", EvidenceGrade::Reference)]);
+        let m = refusal(&s, conclude_with(&["e1"]), false);
+        assert!(m.contains("e1 reference by cve") && m.contains("a lookup is not a run"), "{m}");
+        assert!(!m.contains("analysis is not a run"));
+        let s = goal_with(vec![
+            graded("c1", "dep_scan", EvidenceGrade::Analysis),
+            graded("c1", "read_file", EvidenceGrade::Read),
+        ]);
+        let m = refusal(&s, conclude_with(&["e1", "e2"]), false);
+        assert!(m.contains("e1 analysis by dep_scan, e2 read by read_file."), "{m}");
+        let (a, r) = (m.find("analysis is not a run"), m.find("Reading source or a page"));
+        assert!(a.is_some() && r.is_some() && a < r && m.ends_with("cite that record."), "{m}");
+        let s = goal_with(vec![
+            graded("c1", "dep_scan", EvidenceGrade::Analysis),
+            graded("c1", "bash", EvidenceGrade::Run),
+        ]);
+        assert!(s.validate(&conclude_with(&["e1", "e2"]), false).is_ok());
+    }
+
+    #[test]
+    fn views_carry_the_grade_and_the_tool() {
+        let s =
+            goal_with(vec![graded("c1", "dep_scan", EvidenceGrade::Analysis), ev("c1", true, true), static_ev("c1")]);
+        let brief = s.brief(&BriefOpts::default());
+        assert!(brief.contains("- c1 [open] c (evidence: e1 analysis by dep_scan, e2 run, e3 read)"), "{brief}");
+        let met = build(vec![
+            LedgerOp::GoalSet { text: "g".into() },
+            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::EvidenceAdd(graded("c1", "bash", EvidenceGrade::Run)),
+            conclude_with(&["e1"]),
+        ]);
+        assert!(met.brief(&BriefOpts::default()).contains("Goal status: met — done (evidence: e1 run by bash)"));
+        let md = s.render_markdown();
+        assert!(
+            md.contains("kind: static; grade: analysis; attested: yes\n- source: dep_scan, session s-x, call call-1"),
+            "{md}"
+        );
+        assert!(md.contains("kind: execution; grade: run; attested: yes\n- source: session s-x, call call-1"), "{md}");
+        assert_eq!(
+            LedgerState::summarize(&LedgerOp::EvidenceAdd(graded("c1", "dep_scan", EvidenceGrade::Analysis))),
+            "evidence for c1 (supports, analysis by dep_scan) from call call-1: ran it"
+        );
+        assert!(LedgerState::summarize(&LedgerOp::EvidenceAdd(ev("c1", false, true))).contains("(undermines, run)"));
     }
 }

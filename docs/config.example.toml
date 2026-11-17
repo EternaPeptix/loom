@@ -17,7 +17,8 @@ proxy_port = 0            # egress proxy on 127.0.0.1; 0 = pick a free port
 [models.local]
 base_url = "http://127.0.0.1:8000/v1"   # example: replace with your server
 model = "default"                       # example: the id the server serves (a single served model is found automatically)
-# api_key_env = "MY_SERVER_KEY"         # name of an environment variable holding the API key, if the server wants one
+# api_key_file = "local"                # API key, if the server wants one: a file of that name in ~/.loom/keys/models (yours, mode 0600)
+# api_key_env = "MY_SERVER_KEY"         # or: an environment variable of the daemon holding it (commands can read it there; prefer api_key_file)
 # context_window = 1000000              # discovered from the server's model list when omitted; set it if the server does not report one
 # max_output_tokens = 32768             # max_tokens sent with each request; omitted = the server's default
 reasoning_replay = "all"                # "all" sends reasoning back with its response (cache-safe on templates that keep it); "none" never does
@@ -42,7 +43,7 @@ stub_tail_lines = 12       # trailing lines of a folded command result kept in i
 
 [admit]
 # How much of a tool output the model sees inline. The whole output is always stored and can be paged.
-max_inline_tokens = 60000  # outputs up to about this size are shown whole
+max_inline_tokens = 60000  # outputs up to about this size are shown whole (at most an eighth of the session's window)
 head_lines = 400           # a larger output shows this many lines from the start ...
 tail_lines = 400           # ... and this many from the end
 max_line_chars = 4000      # longest line shown inside a cut output

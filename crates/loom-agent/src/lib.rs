@@ -3,6 +3,7 @@
 //!
 //! - [`pack`]  roles: prompt, tool list, how a role ends
 //! - [`frontier`] the honest progress picture read from the ledger
+//! - [`prior`] recall of the earlier missions the operator chose for a new one, from their sealed ledgers
 //! - [`hud`]   the per-step state block appended to every request (never stored in the prefix)
 //! - [`gate`]  what happens when the model stops calling tools, and what `finish` must satisfy
 //! - [`rtools`] the tools the runtime owns: ledger, agents, and the tools that end a turn
@@ -17,6 +18,7 @@ pub mod frontier;
 pub mod gate;
 pub mod hud;
 pub mod pack;
+pub mod prior;
 pub mod rtools;
 pub mod runtime;
 pub mod session;

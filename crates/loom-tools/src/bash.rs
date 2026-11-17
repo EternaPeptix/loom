@@ -315,7 +315,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 fn read_all(running: &Running, limit: u64) -> Result<(Vec<u8>, Option<String>), String> {
     let (bytes, size) = running.read_output_capped(limit).map_err(|e| {
         format!(
-            "The command ran, but its output could not be read back ({e}). It is in the file {} — read it with `read`, or run the command again.",
+            "The command ran, but its output could not be read back ({e}). Run the command again. What it wrote is left for the operator in {}, which commands and file tools cannot read.",
             running.out_path.display()
         )
     })?;
@@ -668,7 +668,7 @@ async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&L
 mod tests {
     use crate::jobs::{JobEvent, JobState};
     use crate::proc::{self, Ended, Spawn, WaitEnd};
-    use crate::testutil::{env, env_with, TestEnv};
+    use crate::testutil::{env, env_prod, env_with, TestEnv};
     use loom_core::config::{SandboxCfg, SandboxMode, ToolsCfg};
     use loom_core::event::{ToolResult, ToolStatus, META_EXIT_CODE, META_JOB, META_SIGNAL};
     use serde_json::json;
@@ -930,6 +930,10 @@ mod tests {
                 "{}",
                 r.text
             );
+            // The file is in the loom home, which the session cannot read: the message says to run the command
+            // again and names the file only for the operator.
+            assert!(r.text.contains("Run the command again") && r.text.contains("cannot read"), "{}", r.text);
+            assert!(!r.text.contains("read it with `read`"), "{}", r.text);
             // The output file the message names stays; the status file and the pid record, which would
             // make the next daemon start take the command for a crashed one, are gone.
             assert!(out.is_dir(), "{id}");
@@ -1247,5 +1251,48 @@ mod tests {
         assert!(r.text.contains("sandboxed:"), "{}", r.text);
         let r = e.call("bash", json!({"command": "echo 'Operation not permitted'"})).await;
         assert!(!r.text.contains("sandboxed:"), "{}", r.text);
+    }
+
+    /// Every command's stdout and stderr is a file in the session's jobs directory, inside the loom home. The
+    /// sandbox gives commands the metadata of those files, which `cat` and Python take of the descriptors they
+    /// inherit, and nothing more.
+    #[tokio::test]
+    async fn commands_print_in_the_production_layout_and_cannot_read_their_job_files() {
+        if !std::path::Path::new("/usr/bin/sandbox-exec").exists() {
+            return;
+        }
+        let e = env_prod(ToolsCfg::default(), SandboxCfg { mode: SandboxMode::Seatbelt, ..SandboxCfg::default() });
+        std::fs::write(e.ctx.workspace.join("f.txt"), "hello world").expect("write");
+        let jobs = e.dir.path().canonicalize().expect("canonical").join("home/sessions/s1/jobs");
+        let mut commands =
+            vec![("cat f.txt", "hello world"), ("printf x | cat", "x"), ("echo err >&2; echo out", "err")];
+        if std::path::Path::new("/usr/bin/python3").exists() {
+            commands.push(("python3 -c 'print(42)'", "42"));
+            commands.push(("python3 -c 'import sys; sys.stderr.write(\"E\")'", "E"));
+        }
+        for (command, expected) in commands {
+            let r = e.call("bash", json!({"command": command})).await;
+            assert_eq!(r.status, ToolStatus::Ok, "{command}: {}", r.text);
+            assert!(r.text.contains(expected), "{command}: {}", r.text);
+            assert!(!r.text.contains("Operation not permitted"), "{command}: {}", r.text);
+        }
+        // What a command wrote is in its output file, which no command can read nor list.
+        let r = e.call("bash", json!({"command": "echo JOB-OUTPUT; sleep 30", "background": true})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        let id = r.meta[META_JOB].as_str().expect("job id").to_string();
+        let out = jobs.join(format!("{id}.out"));
+        for _ in 0..200 {
+            if std::fs::read_to_string(&out).is_ok_and(|s| s.contains("JOB-OUTPUT")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(std::fs::read_to_string(&out).is_ok_and(|s| s.contains("JOB-OUTPUT")));
+        for command in [format!("cat {}", out.display()), format!("ls {}", jobs.display())] {
+            let r = e.call("bash", json!({"command": command})).await;
+            assert_eq!(r.status, ToolStatus::Error, "{command}: {}", r.text);
+            assert!(r.text.contains("Operation not permitted") && !r.text.contains("JOB-OUTPUT"), "{}", r.text);
+        }
+        let _ = e.call("job_kill", json!({"job": id})).await;
     }
 }

@@ -12,7 +12,7 @@
 //! never phrased as a judgment of the work or the worker. A well-evidenced negative conclusion is
 //! a reportable outcome, and the texts that gate `conclude`/`finish` say so.
 
-use loom_core::event::ChildOutcome;
+use loom_core::event::{ChildOutcome, EvidenceGrade};
 
 /// Longest excerpt of a model reply quoted back in a harness text.
 pub const REPLY_EXCERPT_CHARS: usize = 2_000;
@@ -168,6 +168,19 @@ pub fn stall(steps: u32) -> String {
 /// result established in the mission after the write.
 pub fn result_banked(id: &str, n: usize, ids: &str) -> String {
     format!("Established: {id}. Results established in this mission so far: {n} ({ids}).")
+}
+
+/// The line `evidence` adds when it attached a quote of output that is not a run: analysis (`dep_scan`, a
+/// decompilation, cross-references) or reference data (a CVE or advisory record). `None` for a run or a read.
+pub fn evidence_not_a_run(grade: EvidenceGrade, tool: &str) -> Option<String> {
+    let what = match grade {
+        EvidenceGrade::Analysis => "analysis, not a run",
+        EvidenceGrade::Reference => "reference data, not a run",
+        EvidenceGrade::Run | EvidenceGrade::Read => return None,
+    };
+    Some(format!(
+        "The output of `{tool}` is {what}: it is recorded, but it cannot conclude the goal, settle a verifier's objection, or count as new progress after a rejected finish. To show what the target does, run it and record that run with `evidence`."
+    ))
 }
 
 /// A message from the parent agent to a running child.
@@ -668,6 +681,31 @@ pub fn turn_failed(why: &str) -> String {
     format!("The session could not continue. {why} Nothing was lost: answer here, or send the session a message, to make it try again.")
 }
 
+/// Longest part of a model server's refusal quoted in [`refused`] and [`refused_park`].
+pub const REFUSAL_MESSAGE_CHARS: usize = 600;
+
+/// Why a step failed when the model server refused the request (HTTP 400, 413 or 422). `folded`: the
+/// window had already been folded out of view for an earlier refusal. A complete sentence.
+pub fn refused(status: u16, message: &str, folded: bool) -> String {
+    let said = sentence(&cut(message.trim(), REFUSAL_MESSAGE_CHARS));
+    if folded {
+        format!("The model server refused the request (HTTP {status}) again after every tool output had been folded out of view: {said}")
+    } else {
+        format!("The model server refused the request (HTTP {status}): {said}")
+    }
+}
+
+/// Inbox text for a lead parked by a refusal (see [`refused`]). It says what an answer will do and
+/// what the operator has to change when an answer alone cannot help.
+pub fn refused_park(status: u16, message: &str, folded: bool) -> String {
+    let why = refused(status, message, folded);
+    if folded {
+        format!("The session could not continue. {why} What the server refuses is still in view (the messages, the replies, the mission brief) or is the request itself, so an answer alone sends the same thing again. Move the session to another model, or change the model's settings, then answer here or send the session a message. Nothing was lost.")
+    } else {
+        format!("The session could not continue. {why} A provider that refuses what a request carries (a content filter, for instance) refuses the same window every time. If you answer here or send the session a message, loom sends the request again, and if the server refuses it the same way, loom folds every tool output out of view (each stays readable by its handle) and tries once more. If the server refuses the request itself (the model, a setting, the key), change that first. Nothing was lost.")
+    }
+}
+
 /// Longest part of the last error quoted in a model-unavailable notice.
 pub const UNAVAILABLE_ERROR_CHARS: usize = 600;
 
@@ -936,7 +974,7 @@ pub fn finish_not_accepted_tail(tools: &FinishTools) -> String {
     let mut out = String::from(
         "Each objection is now an open obligation; the gate refuses another finish until new execution evidence is recorded after them. The objections name concrete gaps, and one of these closes them:",
     );
-    out.push_str("\n- Fix the problem, then run the target again and record the run with `evidence` (kind execution). An objection settles only by new execution evidence recorded after it — rewording the result, answering the operator, or calling finish again does not.");
+    out.push_str("\n- Fix the problem, then run the target again and record the run with `evidence` (it must be a run: a scan, a decompilation or a lookup is not one). An objection settles only by new execution evidence recorded after it — rewording the result, answering the operator, or calling finish again does not.");
     out.push_str("\n- Show with a new run that the objection is wrong, recorded the same way.");
     if tools.conclude && !tools.solvable {
         out.push_str("\n- If you have genuinely closed every route — every plan step done or dropped with a reason — conclude with status `unreachable`, citing attested execution evidence, then call finish. A rigorous \"cannot be met as stated\" is a complete, reportable outcome, not a failure.");
@@ -1071,6 +1109,17 @@ pub fn flag_candidate(handle: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn evidence_not_a_run_names_the_tool_for_analysis_and_reference_only() {
+        let a = evidence_not_a_run(EvidenceGrade::Analysis, "dep_scan").expect("analysis is not a run");
+        assert!(a.contains("`dep_scan`") && a.contains("analysis, not a run"), "{a}");
+        assert!(a.contains("cannot conclude the goal, settle a verifier's objection"), "{a}");
+        let r = evidence_not_a_run(EvidenceGrade::Reference, "cve_lookup").expect("reference is not a run");
+        assert!(r.contains("`cve_lookup`") && r.contains("reference data, not a run"), "{r}");
+        assert!(evidence_not_a_run(EvidenceGrade::Run, "bash").is_none());
+        assert!(evidence_not_a_run(EvidenceGrade::Read, "read").is_none());
+    }
+
     fn tools_all() -> FinishTools {
         FinishTools { conclude: true, block: true, ask_for: true, spawn: true, plan: true, solvable: false }
     }
@@ -1087,6 +1136,27 @@ mod tests {
             finish_unavailable(&tools_all(), &d),
             format!("{OPEN}{MET}{UNREACHABLE}\nRoutes the mission ledger still shows open:\n- untested surface as-1\n- open plan step p1: read\nPick one and run it; record what the run shows.\n{STUCK}")
         );
+    }
+
+    #[test]
+    fn a_refusal_quotes_the_server_and_says_what_the_next_answer_does() {
+        let said = "Input text data may contain inappropriate content";
+        let first = refused(400, said, false);
+        assert_eq!(
+            first,
+            "The model server refused the request (HTTP 400): Input text data may contain inappropriate content."
+        );
+        let again = refused(422, said, true);
+        assert!(again.contains("(HTTP 422) again after every tool output had been folded out of view"), "{again}");
+        // What the server said is bounded, and the sentence still ends with a full stop.
+        let long = refused(400, &"x".repeat(5_000), false);
+        assert!(long.chars().count() < REFUSAL_MESSAGE_CHARS + 120 && long.ends_with('.'), "{}", long.len());
+        let park = refused_park(400, said, false);
+        assert!(park.starts_with("The session could not continue. The model server refused"), "{park}");
+        assert!(park.contains("folds every tool output out of view") && park.contains("readable by its handle"));
+        let folded = refused_park(400, said, true);
+        assert!(folded.contains("Move the session to another model") && !folded.contains("folds every tool output"));
+        assert_ne!(park, folded);
     }
 
     #[test]
