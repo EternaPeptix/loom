@@ -1143,9 +1143,9 @@ head within 10 s gets `400`.
   listener's session). The sandbox lets a session's commands connect to its own listener only, and the
   proxy refuses any loopback or unspecified destination on one of its own ports whatever the policy, so
   credentials a command reads from another command's environment (`KERN_PROCARGS2`) are of no use to it,
-  unless `loopback_all` opens every port. A session's grant is revoked when it settles; its listener stays
-  bound, answering `407`, until the daemon stops, so no later session is given a port an earlier
-  session's profile allows.
+  unless `loopback_all` opens every port. A session's grant is revoked, and its listener closed, when it
+  settles; its port is retired (remembered as a number until the daemon stops), so no later session is
+  given a port an earlier session's profile allows.
 - **Policy** (`[network]`): `mode` is `deny_all` (the default: tools reach no host; model requests are
   not affected), `allowlist` (only hosts matching `allow`: `host` or `*.suffix`, optional `:port`) or
   `open` (every public destination). The name is checked first: a `deny` entry wins, then the mode.

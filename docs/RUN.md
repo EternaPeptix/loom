@@ -146,7 +146,7 @@ under a domain (`*.example.test`), or set the mode in the config.
 Each session's commands reach the proxy on a port of that session's own, and the proxy accepts a
 session's credentials only on that port and never connects to its own ports, so a command that reads
 another session's proxy credentials (from the environment another command was started with) cannot use
-them. A session's port stays bound until the daemon stops, so no later session gets it.
+them. A session's port is never given to another session while the daemon runs.
 `loopback_all = true` lets commands connect to every port, these included: see `SECURITY.md`.
 
 ### Sandbox

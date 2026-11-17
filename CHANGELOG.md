@@ -20,8 +20,8 @@
   refuses a profile with `api_key_env`, which a login service never had. A profile may not set both.
 - Each session gets a proxy listener of its own; its sandbox allows that port only, its credentials are
   refused on any other listener, and the proxy refuses to connect to any of its own ports whatever the
-  policy allows. A session's port stays bound (answering `407`) until the daemon stops, so no later session
-  is given a port a leftover process may still be allowed. A command that reads another session's proxy
+  policy allows. A session's port is retired when it ends and never given to another session while the
+  daemon runs, so no later session gets a port a leftover process may still be allowed. A command that reads another session's proxy
   credentials from the environment of that session's commands can no longer use them (except with
   `loopback_all`).
 - Under `deny_all`, a scope grant allows exactly the granted hosts: before, the first grant also switched
