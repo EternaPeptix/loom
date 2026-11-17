@@ -1114,8 +1114,14 @@ The Seatbelt policy:
   Certificate evaluation fetches the issuer a certificate names (its AIA URL, which a command chooses),
   so through it a command could send data past the proxy and its audit file. With them denied,
   programs that check certificates through macOS (Swift and Go programs, `security`, `codesign
-  --verify`) fail closed for every certificate; curl and Python use their own certificate files. In
-  `allowlist` and `open` modes the route stays open (SECURITY.md lists it).
+  --verify`) fail closed for every certificate; curl and Python use their own certificate files. The
+  background URL session service (`com.apple.nsurlsessiond`) and WebKit's XPC services, which a command
+  can drive from `osascript -l JavaScript` to fetch a URL, are denied too. In `allowlist` and `open` modes
+  these routes stay open (SECURITY.md lists them);
+- mounting is denied (`file-mount`, and the disk-image and DiskArbitration services that mount for a
+  process: a command could otherwise attach an image of its own over `.git/hooks`, `~/.ssh` or
+  `~/Library/LaunchAgents`), and so is writing preferences (`cfprefsd` writes `~/Library/Preferences`
+  for a process outside its sandbox).
 
 Git metadata is protected, because Git runs what it holds as the operator: a config's
 `core.fsmonitor` (and every other command a config names) and hooks run on the operator's next
@@ -1129,7 +1135,12 @@ private gitdirs (`.git/worktrees/<name>/`) and for submodule repositories (`.git
 nested ones included); and nothing can be made or removed at `.git/modules`, `.git/worktrees`, a
 direct child of either or the same inside a submodule repository, nor anywhere in a directory below
 `modules` that is not a repository (outside the repositories found in it), since a directory moved
-there brings its own config and hooks and the profile cannot judge what a moved directory holds.
+there brings its own config and hooks and the profile cannot judge what a moved directory holds; below
+`.git/modules/<name>/` nothing can be made or removed except inside the submodule repositories found when
+the sandbox was built (so one the operator sets up mid-session can be neither replaced nor committed in
+until the next session). The hooks directory a configuration names (`core.hooksPath`) and the files it
+includes, read from each repository's and the user's global configuration without running Git, are
+protected when they lie in a writable root.
 Probed on macOS 27 with Git 2.50: a command could point an external worktree's `commondir` at a config
 of its own, plant a deinitialized submodule's hook, or `git init` a repository in the temp dir and
 move it into the workspace behind a gitlink, and the operator's next `git status` ran its command; all
@@ -1137,14 +1148,16 @@ of these are refused now, while commits and branches in the workspace's reposito
 submodules still work. A session cannot `git init` or clone a non-bare repository where it writes, or
 add worktrees and submodules: the operator does that, and a bare clone used with `--git-dir` and
 `--work-tree` works. Existing repositories are found without running host Git or following directory
-links: `.git` directories, the targets of `.git` files, `commondir` targets, the gitdirs in
-`worktrees/` and the repositories below `modules/` (and theirs, in turn); their config, hooks and
-pointers are protected paths too. Discovery refuses unreadable or excessive trees (100000 workspace
+links: every repository in the workspace (`.git` directories and bare ones), the targets of `.git`
+files and `commondir` pointers when they are repositories, the gitdirs in `worktrees/` and the
+repositories below `modules/` (and theirs, in turn); their config, hooks and pointers are protected paths
+too, and Bubblewrap mounts them read-only unless one is or contains the loom home or the user's home. Discovery refuses unreadable or excessive trees (100000 workspace
 directories, 4096 repositories and recorded directories, 4096 bytes per pointer). Bubblewrap freezes
 discovered Git directories as a whole; it cannot reserve future `.git` names in writable directories,
 so new repositories must be created outside a session. These protections do not establish immunity to
-arbitrary host Git bugs, and a bare repository a command makes and moves into the workspace still runs
-its config for an operator who runs Git inside it (Git's `safe.bareRepository = explicit` prevents that).
+arbitrary host Git bugs: a directory a command turns into a repository in place still runs its config for
+an operator who runs Git inside it (Git's `safe.bareRepository = explicit` prevents that), and scripts that
+hooks or configuration run from the working tree are files the session may change.
 
 Paths are made canonical when the sandbox is built. On macOS the rules that refuse are compared without
 regard to case (volumes are case-insensitive by default); the rules that allow are compared exactly. The

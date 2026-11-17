@@ -67,15 +67,17 @@
 //! `adopt(manifest, copy, dest, may_write, readable)` brings those changes into `dest` (the workspace the copy
 //! was made from): the added and modified files and links are written, the deleted ones removed.
 //! Nothing is merged, and it is all or nothing as far as that can be known beforehand:
+//! - first, before anything in `dest` is looked at, `may_write(path)` is asked for every path the copy added,
+//!   modified or deleted; one refusal and nothing is written (`AdoptError::Refused`, with the refusals). So a
+//!   path that leads through a link to where the session may not write is refused, never examined: comparing
+//!   it would tell whether names exist there (below the loom home or a credential store, say);
 //! - a path that is in `dest` as the copy has it — a link with the same target, a file with the same
 //!   permission bits and the same bytes — is left alone (so adopting twice, or after a crash
 //!   part-way, is harmless, and the same change made on both sides is no conflict). The bytes are
 //!   compared, not the times: two files written at one moment have the same time;
 //! - otherwise the path must be in `dest` as the manifest recorded the source (for an added path:
 //!   must not exist). Any path that is not — it was changed in the workspace since the copy was made
-//!   — is a conflict, and with one conflict nothing is written (`AdoptError::Conflicts`);
-//! - `may_write(path)` is asked for every path to be written or removed; one refusal and nothing is
-//!   written (`AdoptError::Refused`, with the refusals).
+//!   — is a conflict, and with one conflict nothing is written (`AdoptError::Conflicts`).
 //!
 //! When a path in `dest` is compared with the copy's file (`as the copy has it`), the file in `dest` is opened
 //! and judged by `readable` as the copy's is; one it refuses is not the same as anything.
@@ -98,7 +100,11 @@
 //!   without following a link and given the copy's permission bits and modification time through that
 //!   descriptor (`fchmod`, `futimens`), synced, and renamed over its place within the open directory
 //!   (`renameat`). A link is made beside its place (`symlinkat`) and renamed the same way. Whatever fails
-//!   after the new entry was made removes it again (`unlinkat`);
+//!   after the new entry was made removes it again (`unlinkat`). A command may have moved the open directory
+//!   meanwhile, to anywhere the sandbox let it: the entry goes with it, so once it is in place the real path
+//!   of the open directory joined with the name is judged again, and a refusal removes the entry
+//!   (`unlinkat`) and fails the adoption — what is left is an entry that existed only between the rename and
+//!   that removal, in a directory the command could move there;
 //! - a removal opens the directory the same way but makes nothing; `may_write` judges the real path joined
 //!   with the name, and the entry is removed within that directory (`unlinkat`). A directory of `dest` that a
 //!   removal left empty and that the copy no longer has is removed within its open, judged parent
@@ -132,7 +138,10 @@
 //! the place planted in advance as a link to a file in `outside` (that file is unchanged). And one race left
 //! to the scheduler: a thread swapping `x` for a link to `outside` and back in a tight loop while `adopt`
 //! runs, repeated until enough runs met both states: nothing in `outside` changes, and every run either
-//! adopted into `x` or failed.
+//! adopted into `x` or failed. And: a link `k` to a directory `may_write` refuses (standing for the loom home)
+//! with the copy adding `k/<name>` gives the same `AdoptError::Refused` whether or not `<name>` exists there
+//! (never `Conflicts`); a directory moved, from inside `may_write`'s
+//! judgement of the file's place, to where `may_write` refuses leaves no adopted file there and fails.
 
 use crate::files::{open_readable, real_path, NotOpened, Readable};
 use crate::fstools::{
