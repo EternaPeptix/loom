@@ -3128,7 +3128,7 @@ test("copy words say what happened and how to finish by hand", () => {
   assert.equal(C.copyWords("Reply", "command"), "Reply copied");
   assert.equal(C.copyWords("Session id", "selected"), "Session id selected; press Ctrl+C to copy it");
   assert.equal(C.copyWords("Session id", "selected", true), "Session id selected; press Cmd+C to copy it");
-  assert.equal(C.copyWords("Reply", "none"), "Could not copy reply; select it and press Ctrl+C");
+  assert.equal(C.copyWords("Reply", "none"), "Could not copy reply; this browser did not allow it");
 });
 
 test("copyOnSelectDecision copies only an enabled, new, non-empty selection inside the record, never while typing", () => {
@@ -3153,4 +3153,12 @@ test("app.js copies only from a user gesture and only through copyText", () => {
   assert.equal([...app.matchAll(/execCommand\("copy"\)/g)].length, 1, "one command fallback, inside copyText");
   assert.ok(!/execCommand\("(cut|paste)"\)/.test(app));
   assert.ok(app.includes('"loom_copy_on_select"'));
+});
+
+test("viewerSelectionEdges: edge rows with none of their text selected are left out", () => {
+  assert.deepEqual(C.viewerSelectionEdges({ from: 6, to: 7, startAt: "lead", endAt: "lead" }), { from: 6, to: 6 }); // triple-click
+  assert.deepEqual(C.viewerSelectionEdges({ from: 5, to: 7, startAt: "tail", endAt: "text" }), { from: 6, to: 7 }); // drag from the blank space
+  assert.deepEqual(C.viewerSelectionEdges({ from: 5, to: 7, startAt: "text", endAt: "tail" }), { from: 5, to: 7 });
+  assert.deepEqual(C.viewerSelectionEdges({ from: 5, to: 6, startAt: "tail", endAt: "lead" }), { from: 6, to: 6 });
+  assert.deepEqual(C.viewerSelectionEdges({ from: 5, to: 5, startAt: "tail", endAt: "lead" }), { from: 5, to: 5 });
 });

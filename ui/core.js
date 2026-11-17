@@ -1592,6 +1592,19 @@ export function viewerLinesCopy(viewer, selected) {
   return { text, from, to, count: to - from + 1, selected: chosen };
 }
 
+/**
+ * The rows a selection touches, trimmed to the rows it really takes text from. `startAt` and `endAt` say where the two
+ * boundaries lie in their rows: "lead" (in the number or before the text), "text" or "tail" (after the text, in the newline).
+ * A selection that ends at the lead of a later row does not take that row; one that starts in the tail of an earlier row
+ * does not take that row (a triple-click, or a drag from the blank space right of a line).
+ */
+export function viewerSelectionEdges({ from, to, startAt, endAt }) {
+  if (!(from < to)) return { from, to };
+  if (startAt === "tail") from += 1;
+  if (endAt === "lead" && to > from) to -= 1;
+  return { from, to };
+}
+
 /** What the viewer says after "Copy lines". */
 export function viewerLinesWords(copy) {
   const range = sourceRangeWords(copy.from, copy.to);
@@ -1608,7 +1621,7 @@ export function copyWords(what, how, mac = false) {
   const keys = mac ? "Cmd+C" : "Ctrl+C";
   if (how === "clipboard" || how === "command") return `${what} copied`;
   if (how === "selected") return `${what} selected; press ${keys} to copy it`;
-  return `Could not copy ${what.toLowerCase()}; select it and press ${keys}`;
+  return `Could not copy ${what.toLowerCase()}; this browser did not allow it`;
 }
 
 /**

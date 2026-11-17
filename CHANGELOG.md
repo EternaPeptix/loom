@@ -5,7 +5,7 @@
 ### Web UI: copy buttons and opt-in copy on select
 
 - Copy buttons: Copy reply (the exact raw text), Copy code (a fenced block without its fence), Copy message
-  (operator and agent), Copy reasoning, and on an open tool row Copy command (the bash command, a file tool's path,
+  (operator and agent), Copy reasoning, and on an open tool row Copy command / Copy path / Copy arguments (named for what it copies: the bash command, a file tool's path,
   else the arguments as JSON), Copy output and Copy full output… (the whole stored output through
   `/api/blobs/{handle}/raw`, refused above 2 MiB with a pointer to the viewer). The stored-output and file viewers
   gain Copy lines (the selected lines, else every loaded line, without numbers) beside Copy reference / Copy path;
@@ -17,7 +17,9 @@
   `loom_copy_on_select`) copies a selection wholly inside the chat or the viewer on mouseup/keyup, never while typing
   in a field, never twice for the same selection, and says "Copied N characters".
 - loom-desk needs no change: its `WKWebView` offers `navigator.clipboard.writeText` and the copy command (checked
-  with a stand-alone view configured like `WebPane`). The fixture serves the raw blob route. UI only; no stored shape
+  with a stand-alone view configured like `WebPane`, by injected script, which WebKit counts as a user gesture, so a real
+  click is not covered; Copy full output… therefore starts its write inside the click with the fetch as a promise, and keeps
+  the text for a "Copy now" click if the browser still refuses). The fixture serves the raw blob route. UI only; no stored shape
   changed. `docs/UI.md` has a "Copying" section.
 
 ### Workspace folders: create a missing workspace, pick a folder, browse the workspace

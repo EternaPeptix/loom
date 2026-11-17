@@ -987,7 +987,7 @@ kbd { display: inline-block; min-width: 1.6em; padding: 0 5px; border: 1px solid
 }
 
 /* ---- copy buttons: the copy drawing with a name and a tooltip; text is never taken from them when text is selected ---- */
-.copy-btn { user-select: none; -webkit-user-select: none; }
+.copy-btn, #viewer-copy, #viewer-copy-lines { user-select: none; -webkit-user-select: none; }
 .copy-btn .icon { width: 14px; height: 14px; stroke-width: 1.2; }
 .copy-btn.icon-only { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 26px; padding: 3px 5px; background: transparent; border-color: transparent; color: var(--caption); }
 .copy-btn.icon-only:hover, .copy-btn.icon-only:focus-visible, .copy-btn.icon-only.done { background: var(--bg-3); border-color: var(--line); color: var(--fg); }

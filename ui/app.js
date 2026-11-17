@@ -1084,8 +1084,44 @@ async function copyText(text, { label = "Text", source = null, say = announceCop
     say(ok && copied ? copied : C.copyWords(label, how, MAC), !ok);
     return how;
   };
+  // `text` may be a promise (a fetch in flight). The clipboard write is then started at once, in the click that asked for it,
+  // with the promise inside the item: WebKit only accepts a write made while the click is still being handled.
+  const pending = text && typeof text.then === "function" ? text : null;
+  const clipboard = navigator.clipboard;
+  let write = null;
   try {
-    const clipboard = navigator.clipboard;
+    if (pending && clipboard && clipboard.write && typeof ClipboardItem !== "undefined") {
+      write = clipboard.write([new ClipboardItem({
+        "text/plain": pending.then((t) => {
+          if (t === null || t === undefined || t === "") throw new Error("Nothing to copy");
+          return new Blob([t], { type: "text/plain" });
+        }),
+      })]);
+    }
+  } catch {
+    write = null;
+  }
+  if (pending) {
+    try {
+      text = await pending;
+    } catch (e) {
+      if (write) write.catch(() => {});
+      throw e;
+    }
+    if (text === null || text === undefined || text === "") {
+      if (write) write.catch(() => {});
+      throw new Error("Nothing to copy");
+    }
+    if (write) {
+      try {
+        await write;
+        return done("clipboard");
+      } catch {
+        // refused: fall through to the plain write and the selection
+      }
+    }
+  }
+  try {
     if (clipboard && clipboard.writeText) {
       await clipboard.writeText(text);
       return done("clipboard");
@@ -1119,17 +1155,39 @@ async function copyText(text, { label = "Text", source = null, say = announceCop
 }
 
 /** Show "Copied" in a button for a moment, then put back what it held. */
+const RESTING = new WeakMap();
+/** Keep a text button as wide as it is while its label is swapped, so its neighbours do not move under the pointer. */
+function holdWidth(button) {
+  if (!button.style.minWidth) button.style.minWidth = button.offsetWidth + "px";
+}
+function releaseWidth(button) {
+  button.style.minWidth = "";
+}
+/** Drop a pending "Copied" at once (the button is about to be given another label). */
+function cancelFlash(button) {
+  delete button.dataset.flash;
+  button.classList.remove("done");
+  RESTING.delete(button);
+  releaseWidth(button);
+}
 function flashCopied(button) {
-  const saved = [...button.childNodes];
+  // The resting label is saved by the first flash only; a second click during the flash must not save "Copied" as the label.
+  if (button.dataset.flash === undefined || !RESTING.has(button)) {
+    RESTING.set(button, [...button.childNodes]);
+    holdWidth(button);
+  }
   const token = String(Date.now() + Math.random());
   button.dataset.flash = token;
   button.classList.add("done");
   button.replaceChildren(icon("check"), document.createTextNode("Copied"));
   setTimeout(() => {
     if (button.dataset.flash !== token) return;
+    const saved = RESTING.get(button);
     delete button.dataset.flash;
     button.classList.remove("done");
-    button.replaceChildren(...saved);
+    if (saved) button.replaceChildren(...saved);
+    RESTING.delete(button);
+    releaseWidth(button);
   }, 1500);
 }
 
@@ -1146,26 +1204,69 @@ function copyButton(label, getText, { what = "Text", text = false, source = null
   if (key) b.dataset.focusKey = key;
   b.append(icon("copy"));
   if (text) b.append(document.createTextNode(label));
+  // After a refused fetched copy the text is kept here and the button says "Copy now": that click copies it at once.
+  let held = null;
+  const resting = () => {
+    b.replaceChildren(icon("copy"), ...(text ? [document.createTextNode(label)] : []));
+    b.setAttribute("aria-label", label);
+  };
   b.addEventListener("click", async () => {
     if (b.getAttribute("aria-busy") === "true") return;
-    let value;
+    if (held !== null) {
+      const how = await copyText(held, { label: what, source, say });
+      if (how === "clipboard" || how === "command") {
+        held = null;
+        resting();
+        flashCopied(b);
+      }
+      return;
+    }
     if (busy) {
+      holdWidth(b);
       b.setAttribute("aria-busy", "true");
       b.replaceChildren(icon("refresh"), document.createTextNode(busy));
     }
     const rest = () => {
       if (!busy) return;
       b.removeAttribute("aria-busy");
-      b.replaceChildren(icon("copy"), ...(text ? [document.createTextNode(label)] : []));
+      resting();
+      releaseWidth(b);
     };
+    if (busy) {
+      // Started inside the click, before any await, and handed to the clipboard as a promise.
+      let fetched = null;
+      let got;
+      try {
+        got = Promise.resolve(getText());
+      } catch (e) {
+        got = Promise.reject(e);
+      }
+      got = got.then((t) => { fetched = t; return t; });
+      const speak = (words, failed) => say(failed && fetched ? "Could not copy it from here; press Copy now to try again." : words, failed);
+      let how;
+      try {
+        how = await copyText(got, { label: what, source, say: speak });
+      } catch (e) {
+        rest();
+        say(e.message, true);
+        return;
+      }
+      rest();
+      if (how === "clipboard" || how === "command") flashCopied(b);
+      else if (fetched) {
+        held = fetched;
+        b.replaceChildren(icon("copy"), document.createTextNode("Copy now"));
+        b.setAttribute("aria-label", "Copy now");
+      }
+      return;
+    }
+    let value;
     try {
       value = await getText();
     } catch (e) {
-      rest();
       say(e.message, true);
       return;
     }
-    rest();
     if (value === null || value === undefined || value === "") { say("Nothing to copy", true); return; }
     const how = await copyText(value, { label: what, source, say });
     if (how === "clipboard" || how === "command") flashCopied(b);
@@ -1965,7 +2066,7 @@ function toolCopyRow(b) {
   const plan = C.fullOutputPlan(b);
   if (!command && output === null && !plan) return null;
   const row = el("div", "copy-row");
-  if (command) add(row, copyButton("Copy command", () => command.text, { what: command.what, text: true, key: "copy-cmd:" + b.id, tip: `Copy this call's ${command.what.toLowerCase()}.` }));
+  if (command) add(row, copyButton("Copy " + command.what.toLowerCase(), () => command.text, { what: command.what, text: true, key: "copy-cmd:" + b.id, tip: `Copy this call's ${command.what.toLowerCase()}.` }));
   if (output !== null) add(row, copyButton("Copy output", () => output, { what: "Output", text: true, key: "copy-out:" + b.id, tip: "Copy the output recorded in this row: every line the model was shown, not only the folded part." }));
   if (plan) {
     add(row, copyButton("Copy full output…", async () => {
@@ -3740,16 +3841,30 @@ function viewerSelection() {
   const range = selection.getRangeAt(0);
   if (!root.contains(range.commonAncestorContainer)) return null;
   // A boundary in the lines' container itself points between rows: the row after it starts, the row before it ends.
+  // Where in its row a boundary lies: "lead" (in the number, or before the text), "tail" (after the text: the row's newline) or "text".
   const lineAt = (node, offset, end) => {
     if (node === root) {
       const row = root.children[end ? Math.max(0, offset - 1) : offset] || root.lastElementChild;
-      return row ? Number(row.dataset.line) : null;
+      return row ? { line: Number(row.dataset.line), kind: end ? "tail" : "lead" } : null;
     }
     const row = (node.nodeType === 1 ? node : node.parentElement)?.closest(".source-line");
-    return row ? Number(row.dataset.line) : null;
+    if (!row) return null;
+    const text = row.querySelector(".line-text");
+    const at = document.createRange();
+    at.setStart(node, offset);
+    at.collapse(true);
+    const span = document.createRange();
+    span.selectNodeContents(text);
+    const atStart = span.compareBoundaryPoints(Range.START_TO_START, at) >= 0;
+    const atEnd = span.compareBoundaryPoints(Range.END_TO_END, at) <= 0;
+    // An empty line has both; a start there counts as its end and an end as its start, so an edge row with nothing chosen drops out.
+    const kind = end ? (atStart ? "lead" : atEnd ? "tail" : "text") : (atEnd ? "tail" : atStart ? "lead" : "text");
+    return { line: Number(row.dataset.line), kind };
   };
-  const from = lineAt(range.startContainer, range.startOffset, false);
-  const to = lineAt(range.endContainer, range.endOffset, true);
+  const start = lineAt(range.startContainer, range.startOffset, false);
+  const stop = lineAt(range.endContainer, range.endOffset, true);
+  if (!start || !stop) return null;
+  const { from, to } = C.viewerSelectionEdges({ from: start.line, to: stop.line, startAt: start.kind, endAt: stop.kind });
   return Number.isFinite(from) && Number.isFinite(to) ? { from, to } : null;
 }
 
@@ -4746,7 +4861,9 @@ function openFileViewer(st, rel, entry, opener) {
 
 /** Words and labels of the dialog for a file (`file` set) or a stored output (null). */
 function setViewerMode(file) {
+  for (const id of ["viewer-copy", "viewer-copy-lines"]) cancelFlash($(id));
   $("viewer-copy").textContent = file ? "Copy path" : "Copy reference";
+  $("viewer-copy-lines").textContent = "Copy lines";
   $("viewer-controls").setAttribute("aria-label", file ? "Move through the file" : "Move through the stored output");
   $("viewer-scroll").setAttribute("aria-label", file ? "File lines" : "Stored output lines");
 }
@@ -4922,6 +5039,8 @@ $("picker").addEventListener("keydown", pickerEmptyKeys);
   $("viewer-find-prev").addEventListener("click", () => viewerFind(-1));
   $("viewer-copy").addEventListener("click", copyViewerReference);
   $("viewer-copy-lines").addEventListener("click", copyViewerLines);
+  // Pressing these must not collapse the selection in the lines, which Copy lines reads.
+  for (const id of ["viewer-copy", "viewer-copy-lines"]) $(id).addEventListener("mousedown", (e) => e.preventDefault());
   S.copyOnSelect = storedCopyOnSelect();
   document.addEventListener("mouseup", copySelection);
   document.addEventListener("keyup", copySelection);

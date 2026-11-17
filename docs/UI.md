@@ -232,10 +232,10 @@ there: nothing hidden, nothing the button does not name.
 | Fenced code in a reply | Copy code | that block's text, without the fence lines |
 | Operator or agent message | Copy message | the message as written |
 | Open Thought | Copy reasoning | the recorded reasoning |
-| Open tool row | Copy command | bash: the command; file tools: the path; others: the arguments as pretty JSON |
+| Open tool row | Copy command / Copy path / Copy arguments | named for what it copies: bash, the command; file tools, the path; others, the arguments as pretty JSON |
 | Open tool row | Copy output | the output the row records (all the lines the model was shown, not only the folded 24) |
 | Open tool row, output cut | Copy full output… | the whole stored output, fetched from `/api/blobs/{handle}/raw` |
-| Stored-output or file viewer | Copy lines | the lines the selection touches, else every loaded line; whole lines, no numbers |
+| Stored-output or file viewer | Copy lines | the lines the selection takes text from (a row where only its number or newline is touched is left out), else every loaded line; whole lines, no numbers |
 | Stored-output viewer | Copy reference | the citation line (unchanged) |
 | File viewer | Copy path | the absolute path (unchanged) |
 | Inbox card | Copy text | the request text |
@@ -251,7 +251,12 @@ selection that spans one never picks up its label.
 **Copy full output…** reads the recorded size first and refuses without fetching when it exceeds 2 MiB;
 when no size is recorded it reads the route's `Content-Length`, and a body with none is cut off as soon as
 it passes the cap. The refusal says to open the full output and use Copy lines. While it fetches, the button
-says "Fetching…" and is `aria-busy`; focus stays on it.
+says "Fetching…" and is `aria-busy`; focus stays on it. The clipboard write is started inside the click, before the
+fetch, with the fetch handed over as a promise in a `ClipboardItem` (WebKit refuses a write made after an await).
+If it is refused anyway, the fetched text is kept and the button says "Copy now": that click copies it at once.
+A copy button keeps its width while its label changes ("Copied", "Fetching…"), and a second click during "Copied"
+renews the flash without changing the resting label. Pressing the viewer's copy buttons keeps the selection in the lines.
+A failed copy with nothing visible to select says the browser did not allow it, never "select it".
 
 **Copy on select** is a checkbox at the foot of the inspector's Session tab, off by default. When on, a
 `mouseup` or `keyup` that leaves a non-empty selection wholly inside the chat or the viewer's lines (a tool
@@ -267,7 +272,7 @@ store, and `WebPane.swift` injects no script and sets no preference, so the page
 what run. Checked with a stand-alone `WKWebView` configured the same way (non-persistent store, `http://127.0.0.1`
 page): `isSecureContext` is true, `navigator.clipboard.writeText` is present and resolves, and
 `document.execCommand("copy")` is supported and returns true. That probe ran page script from the app,
-not a real click inside loom-desk, so what is confirmed is that the API is offered and allowed; the fallback
+not a real click inside loom-desk (and run as injected script, which WebKit treats as a user gesture), so what is confirmed is that the API is offered and allowed; the fallback
 (selection plus the copy command, then selected-for-Ctrl+C) is there for a build that refuses. The CSP needs no
 change (neither call is a script, style or request), and the purity tests allow exactly one clipboard use and one
 copy command, both inside `copyText`. No Swift change was needed.
