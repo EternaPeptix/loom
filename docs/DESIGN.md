@@ -826,6 +826,20 @@ the precise specification.
 - `verify {claim | statement, handles?}` runs the role's verifier on demand (it must be in
   `may_spawn`) and returns its verdict; it does not change the claim's status.
 - Agents share the mission's ledger (§7).
+- **Recall of earlier missions** (`loom_agent::prior`). Nothing carries from one mission to another by
+  itself: there is no store of past work the model can search. The operator may name, when creating a
+  lead, up to 8 earlier missions for it to recall (`NewSession.prior`, `loom run --prior`, the web
+  form), kept in its `meta.json`. Before the lead's first model request the harness writes one `info`
+  note built from each named mission's sealed journal, verified and folded, never from its logs or
+  outputs: its title and the time of its last ledger entry; the operator's goal, rules in force and
+  answers to questions, labelled as operator text from an earlier mission; its goal status; where its
+  work stood (the frontier evaluated at that last entry's time, not now, with no attempt count and no
+  security item), labelled as written by the model there and not verified; and its security record as
+  counts and asset locators only (no hypothesis id or text, no credential, no URL query). Every line
+  taken from an old ledger is quoted with `>`. A journal that fails verification or holds an entry
+  written by a newer loom is named unreadable and nothing from it is shown. The note says that the old
+  mission's outputs cannot be opened and its authorizations do not apply, and a re-weave may drop it
+  like any `info` note.
 - **Stop** cascades from a lead to its agents (§8). An archive settles a mission's agents `stopped`;
   unarchiving delivers what they settled with and restores those that had not settled.
 - **Request slots** (`loom-model::limit`): per model profile at most `max_concurrent` requests in
@@ -956,6 +970,18 @@ evidence kind and staleness. Each module's documentation is the precise specific
   a file returns `(new file)`, and one that replaces a file above 64 MiB says that there is no diff and
   why. Files above 64 MiB are not edited.
 - `out_read` / `out_grep` page and search a stored output by handle and record what they showed.
+- **Stored outputs are the mission's own** (`loom_tools::outputs`, `runtime.rs` *Outputs of a mission*).
+  The blob store is shared by every mission and content-addressed, so a handle names the same bytes for
+  anyone who learns it. Every tool that takes a handle from the model — `out_read`, `out_grep`, `pin`,
+  `evidence` and `finish` quotes, `security_record` secret handles, `security_ingest`, the oracle's
+  candidate, a verdict's `opened` — opens it only among the outputs some record of a session of its
+  mission names (a result's output, the file text a `read` stored, a raw or further report a result
+  names in its meta, a job's output, an agent's full report). A view adds nothing, so reading an
+  output never widens the set. A handle of another mission's output is refused with exactly the
+  sentence of a handle that names nothing, and no refusal says whether such an output exists (a quote
+  check never reports its line count or a closest line). The runtime answers from an in-memory index
+  fed by every record and filled once per mission from its logs. The operator's reads (`loom out`, the
+  API) are not scoped.
 - `bash` runs the command with `/bin/bash -c` under the sandbox, in its own process group, stdin
   `/dev/null`, stdout and stderr interleaved into one output file. It is over only when its whole
   process group is empty.
@@ -1293,7 +1319,8 @@ way (gui/DESIGN.md).
 
 **Routes.** JSON unless noted. The bodies of `crate::wire` and `NewSession` (at its top level) reject
 unknown fields; the `{code}` body of `POST /api/web-sessions` and the `budget` object inside
-`NewSession` ignore them.
+`NewSession` ignore them. `NewSession.prior` (a list of mission ids, may be left out) names earlier
+missions for the new lead to recall (§9); an unknown one is `404`, more than 8 is `409`.
 
 ```
 Open (no bearer):

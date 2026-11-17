@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Stored outputs are the mission's own
+
+- `out_read`, `out_grep`, `pin`, `evidence` and `finish` quotes, `security_record` secret handles,
+  `security_ingest`, the oracle's candidate and a verdict's `opened` open a handle only among the outputs of the
+  session's mission (`loom_tools::outputs`): before, they resolved it against the whole blob store, which every
+  mission shares, so a session that learned another mission's handle could read that output. A foreign handle
+  gets exactly the refusal of one that names nothing, and a quote check no longer reports a line count or a
+  closest line of an output it may not read. `ToolCtx` has a new field, `outputs`.
+- `gate::check_quotes` is now `async fn check_quotes(ctx: &ToolCtx, quotes)`.
+- New `ToolResult::meta` key `also_stored` (`META_ALSO_STORED`): `dep_scan` lists there the further VDRs,
+  SBOMs and console it stores, so they count as the mission's outputs. Older logs stay readable.
+
+### Recall of earlier missions, chosen by the operator
+
+- `NewSession.prior` (`loom run --prior <mission>`, repeatable, at most 8; `POST /api/sessions`; the web form's
+  *Recall earlier missions*) names earlier missions for a new lead to recall, kept as `prior` in its
+  `meta.json` (left out when empty, so older files are unchanged). Before the lead's first model request it gets
+  one `info` note per the new `loom_agent::prior`: each mission's goal, rules and answers (the operator's words),
+  goal status, where its work stood when its ledger was last written (written by the model there, not
+  verified), and its security record as counts and asset locators. The source is each mission's sealed
+  journal; one that fails verification or was written by a newer loom is named unreadable. No log-schema change.
+
 ### The sandbox hides the whole loom home
 
 - Commands (seatbelt profile) and the file tools (`check_read`) can no longer read anything under the loom

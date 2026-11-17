@@ -260,6 +260,24 @@ current directory) and follows its record on the terminal. Everything after the 
 plan, claims with evidence), may delegate to workers and have a verifier attack its `finish`, and
 stops only through a terminating tool. Ctrl-C stops following, not the session.
 
+A mission that goes back to a target an earlier mission worked on can start from what that mission
+recorded: `--prior <mission>` (repeat it, at most 8) names earlier missions for this one to recall. A
+mission is its id (`m-…`) or any session of it, written as elsewhere (an id, the beginning of one, or
+`last`; `loom ls` lists them).
+
+```
+loom run -w /path/to/workspace --prior m-0abc… "the task"
+```
+
+Before its first model request the new lead gets one note with, per named mission, its title and when its
+ledger was last written; the goal, rules and answers you gave it (marked as your words from an earlier
+mission); its goal status; where its work stood when it ended (claims, plan, dead ends — marked as written
+by the model there and not verified); and its security record as counts and asset locators (no hypotheses,
+no credentials, no query strings). The source is each mission's sealed ledger; a ledger that fails
+verification or was written by a newer loom is named as unreadable and nothing from it is shown. Nothing
+else carries over: the earlier mission's stored outputs cannot be opened from the new one, and its
+approvals and network grants do not apply.
+
 Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are needed (`Asked`,
 `Blocked`, `Parked`: the inbox item was printed); 1 after `Stopped`, `BudgetExhausted` or an error.
 
@@ -294,7 +312,8 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom service install` / `uninstall` / `status` | the macOS login service |
 
 Options of `run` and `chat`: `-w/--workspace`, `--pack`, `--role`, `-m/--model` (a profile name),
-`-t/--title`, `--attended` (do not resume by itself after a restart), `--max-steps`, `--max-minutes`;
+`-t/--title`, `--attended` (do not resume by itself after a restart), `--max-steps`, `--max-minutes`,
+`--prior <mission>` (repeatable: earlier missions to recall);
 and for display `--reasoning`, `--full`, `-v`. A `<session>` is an id, the beginning of one, or `last`.
 `-` as the text reads standard input.
 
