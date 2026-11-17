@@ -763,6 +763,8 @@ mod tests {
             quote: Some("q \"quoted\"\nnext".into()),
             note: "read it".into(),
             attested: true,
+            tool: None,
+            grade: None,
         };
         let e = add(&j, LedgerOp::EvidenceAdd(input.clone()));
         assert_eq!(e.session.as_str(), "s-lead");

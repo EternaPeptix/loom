@@ -6917,6 +6917,8 @@ mod tests {
                         quote: None,
                         note: "ran it".into(),
                         attested: true,
+                        tool: None,
+                        grade: None,
                     }),
                     LedgerOp::ClaimUpdate {
                         id: "c1".into(),

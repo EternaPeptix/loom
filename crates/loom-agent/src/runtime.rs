@@ -269,7 +269,13 @@
 //! stored); a `job_settled` whose output is `blob`, or a `job_matched` whose stored part is, credited
 //! to the call named by the `job_registered` of that job (`bash`, class `Exec`). Views of runtime tools
 //! register nothing.
-//! `Producer{session, call_id, tool: name, class}`. Kept as an in-memory index fed by
+//! `Producer{session, call_id, tool: name, class, grade}`, where `grade` is `EvidenceGrade::of_tool_result(name,
+//! class, meta)` of that `tool_result` (so `dep_scan`, `bin_decompile` and `bin_xrefs` give `Analysis`, the CVE
+//! and advisory tools and a reference-host `web_fetch` give `Reference`, any other `Exec` result `Run`, any
+//! other result `Read`), and a job's output is `Run` (the `bash` call that started it). A log written
+//! before the grade key existed grades by class, as before, except the results of those six tools, which get
+//! the grade the tools state now: an output a scan stored before an upgrade is not a run when it is cited
+//! after it. Kept as an in-memory index fed by
 //! every record that passes through the sink; on a miss for a mission whose logs have not been
 //! scanned since start, scan the logs of all its sessions once, then answer.
 //!
@@ -571,9 +577,9 @@ use futures_util::FutureExt;
 use loom_core::config::{ensure_private_dir, Config, NetworkMode, Paths, SandboxCfg, SandboxMode};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
-    Author, Brief, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, Forked, InboxItem, ModelRef, NetDecision,
-    Record, Seq, SessionOutcome, SessionStart, SpawnMode, Termination, ToolClass, ToolStatus, TurnEndReason, Usage,
-    META_ALSO_STORED, META_EXIT_CODE, META_OF_BLOB, META_RAW_BLOB, META_SIGNAL,
+    Author, Brief, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, EvidenceGrade, Forked, InboxItem, ModelRef,
+    NetDecision, Record, Seq, SessionOutcome, SessionStart, SpawnMode, Termination, ToolClass, ToolStatus,
+    TurnEndReason, Usage, META_ALSO_STORED, META_EXIT_CODE, META_OF_BLOB, META_RAW_BLOB, META_SIGNAL,
 };
 use loom_core::journal::{self, Journal};
 use loom_core::ledger::LedgerState;
@@ -1015,8 +1021,13 @@ fn produced_by(
 ) -> Option<(BlobId, Producer)> {
     match event {
         Event::ToolResult(t) => {
-            let p =
-                Producer { session: session.clone(), call_id: t.call_id.clone(), tool: t.name.clone(), class: t.class };
+            let p = Producer {
+                session: session.clone(),
+                call_id: t.call_id.clone(),
+                tool: t.name.clone(),
+                class: t.class,
+                grade: EvidenceGrade::of_tool_result(&t.name, t.class, &t.meta),
+            };
             if let Some(o) = &t.output {
                 return Some((o.id.clone(), p));
             }
@@ -1032,6 +1043,7 @@ fn produced_by(
                 call_id: call_id.clone(),
                 tool: "bash".into(),
                 class: ToolClass::Exec,
+                grade: EvidenceGrade::Run,
             };
             jobs.insert((session.clone(), job_id.clone()), p);
             None
@@ -6315,6 +6327,8 @@ mod tests {
                     quote: None,
                     note: "dummy credential fixture".into(),
                     attested: true,
+                    tool: None,
+                    grade: None,
                 }),
             )
             .unwrap();
@@ -7057,10 +7071,13 @@ mod tests {
         let p = e.rt.inner.orch.producer(&info.meta.mission, &blob).await.unwrap();
         assert_eq!(p.session, id);
         assert_eq!(p.call_id, call_id);
+        assert_eq!(p.grade, EvidenceGrade::Run);
         e.rt.shutdown().await;
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         let p2 = rt2.inner.orch.producer(&info.meta.mission, &blob).await.unwrap();
         assert_eq!(p2.call_id, call_id);
+        // The scan of the logs after a restart grades the output as the live index did.
+        assert_eq!(p2.grade, p.grade);
         rt2.shutdown().await;
     }
 
@@ -7430,7 +7447,7 @@ mod tests {
         until("three evidence calls", || evidence(&e).len() == 3).await;
         let got = evidence(&e);
         assert_eq!(got[0].0, ToolStatus::Ok, "{}", got[0].1);
-        assert!(got[0].1.contains("static: read call"), "{}", got[0].1);
+        assert!(got[0].1.contains("read: read call"), "{}", got[0].1);
         assert_eq!(got[1].0, ToolStatus::Error, "{}", got[1].1);
         assert_eq!(got[2].0, ToolStatus::Error, "{}", got[2].1);
         assert!(got[2].1.contains("is the result of `ledger`"), "{}", got[2].1);
@@ -7484,8 +7501,8 @@ mod tests {
         assert_eq!(got[0].0, ToolStatus::Ok, "{}", got[0].1);
         assert_eq!(got[1].0, ToolStatus::Ok, "{}", got[1].1);
         // The blob is content-addressed: the wait that returned the whole output may be the first call to
-        // store it, so the producer is that wait or the starting bash call. Either way it is execution.
-        assert!(got[1].1.contains("execution: "), "{}", got[1].1);
+        // store it, so the producer is that wait or the starting bash call. Either way it is a run.
+        assert!(got[1].1.contains("run: "), "{}", got[1].1);
         e.rt.shutdown().await;
     }
 
@@ -7556,6 +7573,52 @@ mod tests {
         // A job nothing is known about registers nothing.
         let other = Event::JobSettled { job_id: "j9".into(), exit_code: None, output: None, detail: String::new() };
         assert!(produced_by(&s, &mut jobs, &other).is_none());
+    }
+
+    #[test]
+    fn produced_by_grades_what_it_registers() {
+        use loom_core::event::META_EVIDENCE_GRADE as KEY;
+        let s = SessionId::from("s-a");
+        let mut jobs = HashMap::new();
+        let grade = |jobs: &mut HashMap<_, _>, e: &Event| produced_by(&s, jobs, e).map(|(_, p)| p.grade);
+        // A result that says its output is analysis is analysis, though its tool is class Exec.
+        let scan = tool_result("c1", "dep_scan", ToolClass::Exec, Some("aa01"), json!({KEY: "analysis"}));
+        assert_eq!(grade(&mut jobs, &scan), Some(EvidenceGrade::Analysis));
+        let lookup = tool_result("c2", "cve_lookup", ToolClass::Exec, Some("aa02"), json!({KEY: "reference"}));
+        assert_eq!(grade(&mut jobs, &lookup), Some(EvidenceGrade::Reference));
+        // A plain command result is a run.
+        let bash = tool_result("c3", "bash", ToolClass::Exec, Some("aa03"), json!({}));
+        assert_eq!(grade(&mut jobs, &bash), Some(EvidenceGrade::Run));
+        // A scan or a lookup logged before the tools stated a grade is still not a run.
+        let old_scan = tool_result("c7", "bin_decompile", ToolClass::Exec, Some("aa07"), json!({}));
+        assert_eq!(grade(&mut jobs, &old_scan), Some(EvidenceGrade::Analysis));
+        let old_lookup = tool_result("c8", "advisory_lookup", ToolClass::Read, Some("aa08"), json!({}));
+        assert_eq!(grade(&mut jobs, &old_lookup), Some(EvidenceGrade::Reference));
+        // The key cannot raise a read to a run.
+        let lying = tool_result("c4", "fetch", ToolClass::Read, Some("aa04"), json!({KEY: "run"}));
+        assert_eq!(grade(&mut jobs, &lying), Some(EvidenceGrade::Read));
+        // The text a read showed is a read.
+        let read = tool_result("c5", "read", ToolClass::Read, None, json!({"of_blob": "ff01", "shown": [[1, 2]]}));
+        assert_eq!(grade(&mut jobs, &read), Some(EvidenceGrade::Read));
+        // A background job's output is a run, complete or matched.
+        let reg = Event::JobRegistered { job_id: "j1".into(), call_id: CallId::from("c6"), command: "make".into() };
+        assert!(produced_by(&s, &mut jobs, &reg).is_none());
+        let matched = Event::JobMatched {
+            job_id: "j1".into(),
+            pattern: "FOUND".into(),
+            output: Some(loom_core::BlobRef { id: BlobId::from("cc02"), bytes: 10, lines: 2 }),
+            from: 0,
+            shown: vec![1],
+            matches: 1,
+        };
+        assert_eq!(grade(&mut jobs, &matched), Some(EvidenceGrade::Run));
+        let settled = Event::JobSettled {
+            job_id: "j1".into(),
+            exit_code: Some(0),
+            output: Some(loom_core::BlobRef { id: BlobId::from("dd03"), bytes: 10, lines: 2 }),
+            detail: String::new(),
+        };
+        assert_eq!(grade(&mut jobs, &settled), Some(EvidenceGrade::Run));
     }
 
     #[tokio::test]

@@ -89,7 +89,10 @@ read-only roles can scan without polluting the workspace. A missing `depscan` is
 install guidance, not an empty clean result. A first scan may download dep-scan's vulnerability
 database (and `cdxgen` may reach ecosystem registries) through the egress proxy, so those hosts
 need a network route. The tool parses and stores the CycloneDX VDR and SBOM as citable blobs;
-dep-scan's prioritized/reachable labels are its static analysis, not execution evidence.
+dep-scan's prioritized/reachable labels are its static analysis, not execution evidence, and the
+harness enforces that: a `dep_scan` result is graded `analysis` (as are `bin_decompile` and `bin_xrefs`),
+so a quote of it can support a claim but never concludes the goal, settles a verifier's objection or
+counts as progress after a rejected finish. Those need a run. See `docs/DESIGN.md` §7, evidence grade.
 
 All subprocess adapters use ordinary sandboxing, cancellation, process-group tracking, output caps
 and explicit deadlines. They do not install packages or change host services.

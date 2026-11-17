@@ -25,6 +25,8 @@
 //! ## Moves
 //! A [`Move`] is one reply of the scripted model, almost always one tool call:
 //! - `Run`: `bash` with the task's command. `Look`: `bash` printing `numbers.txt`, which does no work.
+//!   `Scan`: `dep_scan` with no arguments (the workspace): a dependency scan, which runs a scanner but not
+//!   the target, so its output is analysis (`loom_core::event::EvidenceGrade::Analysis`), not a run.
 //! - `Claim`: `claim` that `sum.txt` holds the sum. `Evidence(quote)`: `evidence` for claim `c1`.
 //!   `Support`: `claim_update` of `c1` to `supported`. `Conclude(id)`: `conclude` as `met`, citing the
 //!   evidence record `id`. `Finish(quote)`: `finish` with the answer and one quote.
@@ -32,8 +34,9 @@
 //! - `Say(text)`: a reply without a call. `Call(name, arguments)`: a call exactly as written, for calls
 //!   that are wrong. `Cut`: a `bash` call the output limit cut before its arguments ended.
 //!
-//! The quote of an `Evidence` or a `Finish` is of line 1 of the latest run the request shows: the handle
-//! in the header of the latest `bash` result, or, for a lead that delegated, the first handle of the
+//! The quote of an `Evidence` or a `Finish` is of line 1 of the latest output the request shows: the last
+//! handle in the header of the latest `bash` or `dep_scan` result (the output's own; a `dep_scan` header names
+//! its stored VDR, SBOM and console before it), or, for a lead that delegated, the first handle of the
 //! checked quotes in the latest agent's report. A [`Quote`] says how it is given: `ByLines` (handle and
 //! line numbers, no text), `Exact` (with the line's text) or `Retyped` (with the text as a model writes
 //! it from memory, `holds` become `contains`: it does not occur in the output). With no run in view the
@@ -51,10 +54,26 @@
 //! `sum.txt` with `bash`), then gives its `verdict` with that output as `opened`; a rejection carries the
 //! objection [`OBJECTION`].
 //!
+//! ## The fake scanner
+//! `dep_scan` runs the operator-installed `depscan` found on the PATH that commands inherit, which is the
+//! process's own. [`FAKE_DEPSCAN`] is a POSIX shell script standing in for it: it writes one CycloneDX SBOM
+//! (`sbom-eval.cdx.json`, one component) and one VDR (`sbom-eval.vdr.json`, one vulnerability marked
+//! prioritized and reachable) into the directory after `--reports-dir`, prints one line, and exits 0, so
+//! the scan's result is the same on every host. [`install_fake_depscan(dir)`] writes it to `dir/depscan`
+//! (mode 0755) and returns that path. The kit never changes the process environment: whoever plays a
+//! scenario that scans puts that directory first on the PATH of the process before it starts threads (the
+//! `eval` example does so first thing; the tests play such a scenario in a child process of the test
+//! binary whose PATH is set when it is spawned).
+//!
 //! ## `run(scenario, dir)`
-//! Plays one scenario in the empty directory `dir`: writes the workspace under `dir/workspace`, starts a
-//! `MockServer` with the scenario's script and a `Runtime` whose home is `dir/home`, creates a lead
-//! session of the built-in `core` pack with [`MESSAGE`], and waits until its turn has ended for a reason
+//! Plays one scenario in the empty directory `dir`. A scenario with a `Scan` move among its lead's or
+//! worker's moves is refused first, with nothing started, unless the first `depscan` on the process's PATH
+//! is a file whose bytes are [`FAKE_DEPSCAN`]: the error says the scenario scans with `dep_scan`, that it
+//! needs the kit's fake `depscan` first on PATH (`install_fake_depscan`), and what was found instead (a
+//! path, or that there is none), because a real scanner, or none, would give another card. Then it writes the
+//! workspace under `dir/workspace`, starts a `MockServer` with the scenario's script and a `Runtime` whose
+//! home is `dir/home`, creates a lead session of the built-in `core` pack with [`MESSAGE`], and waits until its turn
+//! has ended for a reason
 //! other than `Waiting`. The configuration is the default one with: the mock server as the only model
 //! (window 1 000 000), no sandbox, network `deny_all`, a notification command that does nothing (the
 //! default would raise a desktop notification per run), then `scenario.configure`. So the finish gate's
@@ -81,6 +100,13 @@
 //! - `delegates`: hands the task to a worker, which retypes its quote wrong once, and cites the worker's
 //!   run as its own evidence.
 //! - `gives_up`: looks at the input, then replies in prose until the stop gate parks it.
+//! - `concludes_on_a_scan`: scans the dependencies instead of running the target, attaches the scan's
+//!   output as evidence, concludes and finishes on it, is refused both times, then runs the target and
+//!   concludes and finishes on the run. Moves: `Scan, Claim, Evidence(ByLines), Support, Conclude("e1"),
+//!   Finish(ByLines), Run, Evidence(ByLines), Conclude("e2"), Finish(ByLines)`. The `conclude` on `e1` is
+//!   refused because analysis is not a run, so the `finish` after it is held by the goal pre-gate. A harness
+//!   that took a scan for a run (`dep_scan` is an `Exec` tool) would let this model finish on the scan with
+//!   `sum.txt` never written.
 //!
 //! ## `table(outcomes)`
 //! The outcomes as text, one row each under a header line, columns separated by two spaces and as wide
@@ -90,7 +116,14 @@
 //!
 //! Tests required: every scenario of the suite gives its pinned outcome (end, solved, sessions, lead
 //! card, mission card); a lead whose moves run out is parked; the names of the suite are distinct;
-//! `table` for two outcomes, exactly.
+//! `table` for two outcomes, exactly. `concludes_on_a_scan` is played in a child process of the test binary
+//! (the test runs itself again, filtered to an ignored test that does nothing unless a marker variable is
+//! set, with a temporary directory holding the fake `depscan` first on the child's PATH); the child asserts
+//! the pinned outcome and that the lead's log holds a `conclude` result with status `error` whose text
+//! contains `analysis is not a run` and `e1 analysis by dep_scan`, and the parent asserts the child passed
+//! and that it did play the scenario. `run` refuses a scanning scenario when the fake is not first on PATH
+//! (in the test process itself, where it is not), with nothing started. `install_fake_depscan` writes an
+//! executable file with exactly `FAKE_DEPSCAN`.
 
 use crate::runtime::{NewSession, Runtime};
 use crate::session::Phase;
@@ -100,7 +133,7 @@ use loom_core::scorecard::{self, Scorecard};
 use loom_model::mock::{Action, MockServer, Reply, Script};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// What the operator asks for in every scenario.
@@ -123,6 +156,24 @@ const RETYPED: &str = "sum.txt now contains 42";
 const ANSWER: &str = "sum.txt holds 42, the sum of the numbers in numbers.txt.";
 const NO_HANDLE: &str = "out:00000000";
 
+/// The `depscan` a scenario that scans runs: see *The fake scanner* in the module contract.
+pub const FAKE_DEPSCAN: &str = r#"#!/bin/sh
+reports=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--reports-dir" ]; then reports="$a"; fi
+  prev="$a"
+done
+mkdir -p "$reports"
+cat > "$reports/sbom-eval.cdx.json" <<'JSON'
+{"bomFormat":"CycloneDX","components":[{"bom-ref":"pkg:cargo/eval@1.0.0"}]}
+JSON
+cat > "$reports/sbom-eval.vdr.json" <<'JSON'
+{"bomFormat":"CycloneDX","vulnerabilities":[{"id":"EVAL-0001","ratings":[{"severity":"high","score":7.5}],"affects":[{"ref":"pkg:cargo/eval@1.0.0","versions":[{"version":"1.0.0","status":"affected"},{"version":"1.0.1","status":"unaffected"}]}],"properties":[{"name":"depscan:prioritized","value":"true"},{"name":"depscan:insights","value":"Reachable"}]}]}
+JSON
+echo "fake depscan ran: $*"
+"#;
+
 /// How a scripted model gives a quote. See the module contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quote {
@@ -136,6 +187,7 @@ pub enum Quote {
 pub enum Move {
     Run,
     Look,
+    Scan,
     Claim,
     Evidence(Quote),
     Support,
@@ -182,7 +234,7 @@ fn kept_in_view(config: &mut Config) {
 
 /// The scenarios, in the order they are reported. See the module contract.
 pub fn suite() -> Vec<Scenario> {
-    use Move::{Call, Claim, Conclude, Cut, Delegate, Evidence, Finish, Look, Run, Say, Support};
+    use Move::{Call, Claim, Conclude, Cut, Delegate, Evidence, Finish, Look, Run, Say, Scan, Support};
     use Quote::{ByLines, Exact, Retyped};
     let base = Scenario { name: "", plays: "", lead: &[], worker: &[], verdicts: &[], configure: as_configured };
     vec![
@@ -293,7 +345,59 @@ pub fn suite() -> Vec<Scenario> {
             ],
             ..base
         },
+        Scenario {
+            name: "concludes_on_a_scan",
+            plays: "scans the dependencies instead of running the target, concludes and finishes on the scan, and is refused",
+            lead: &[
+                Scan,
+                Claim,
+                Evidence(ByLines),
+                Support,
+                Conclude("e1"),
+                Finish(ByLines),
+                Run,
+                Evidence(ByLines),
+                Conclude("e2"),
+                Finish(ByLines),
+            ],
+            ..base
+        },
     ]
+}
+
+/// Write [`FAKE_DEPSCAN`] to `dir/depscan` (mode 0755) and return that path.
+pub fn install_fake_depscan(dir: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("depscan");
+    std::fs::write(&path, FAKE_DEPSCAN).map_err(|e| format!("Could not write {}: {e}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("Could not make {} executable: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// What stands in the way of a scenario that scans: `None` when the first `depscan` on the PATH is the fake.
+fn scanner_problem(scenario: &Scenario) -> Option<String> {
+    if !scenario.lead.iter().chain(scenario.worker).any(|m| *m == Move::Scan) {
+        return None;
+    }
+    let found = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).map(|dir| dir.join("depscan")).find(|candidate| candidate.is_file())
+    });
+    // The length first: a real scanner can be a large binary, not worth reading to tell it apart.
+    let is_fake = |path: &std::path::Path| {
+        std::fs::metadata(path).is_ok_and(|m| u64::try_from(FAKE_DEPSCAN.len()).ok() == Some(m.len()))
+            && std::fs::read(path).is_ok_and(|bytes| bytes == FAKE_DEPSCAN.as_bytes())
+    };
+    let seen = match found {
+        Some(path) if is_fake(&path) => return None,
+        Some(path) => format!("the first `depscan` on the PATH is {}", path.display()),
+        None => "there is no `depscan` on the PATH".to_string(),
+    };
+    Some(format!(
+        "The scenario `{}` scans with `dep_scan`, which needs the kit's fake `depscan` first on the PATH \
+         (`evalkit::install_fake_depscan`), but {seen}; a real scanner, or none, would give another card.",
+        scenario.name
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -337,8 +441,9 @@ fn handle_in(text: &str) -> Option<String> {
 fn run_in_view(body: &Value) -> Option<String> {
     texts_of(body, "tool").into_iter().rev().find_map(|text| {
         let header = text.lines().next().unwrap_or("");
-        if header.starts_with("[bash ") {
-            return handle_in(header);
+        if header.starts_with("[bash ") || header.starts_with("[dep_scan ") {
+            // The output's own handle closes the header; a scan's header names its report files before it.
+            return header.rsplit(" · ").next().and_then(handle_in);
         }
         let quotes = text.find("Quotes (checked against the stored output by the harness)")?;
         handle_in(text.get(quotes..).unwrap_or(""))
@@ -369,6 +474,7 @@ fn play(mv: Move, body: &Value) -> Action {
     match mv {
         Move::Run => call("bash", json!({ "command": RUN })),
         Move::Look => call("bash", json!({ "command": "cat numbers.txt" })),
+        Move::Scan => call("dep_scan", json!({})),
         Move::Claim => call("claim", json!({ "text": "sum.txt holds the sum of the numbers in numbers.txt, 42." })),
         Move::Evidence(how) => {
             let mut args = Map::new();
@@ -504,6 +610,9 @@ async fn play_out(rt: &Runtime, scenario: &Scenario, workspace: &Path) -> Result
 
 /// Play one scenario in the empty directory `dir`. See the module contract.
 pub async fn run(scenario: &Scenario, dir: &Path) -> Result<Outcome, String> {
+    if let Some(problem) = scanner_problem(scenario) {
+        return Err(problem);
+    }
     let workspace = dir.join("workspace");
     std::fs::create_dir_all(&workspace).map_err(|e| format!("Could not create {}: {e}", workspace.display()))?;
     for (name, text) in FILES {
@@ -710,6 +819,99 @@ mod tests {
         // The work was done, and nothing was delivered: solved by the outside check, not finished.
         assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Parked, true, 1));
         assert_eq!(o.lead, card(5, None, 1, 0, (0, 0), 0, (0, 0), 0));
+    }
+
+    /// Set in the child process that plays `concludes_on_a_scan`.
+    const CHILD_MARKER: &str = "LOOM_EVALKIT_SCAN_CHILD";
+    const CHILD_PLAYED: &str = "evalkit scan child played the scenario";
+
+    fn scan_scenario() -> Scenario {
+        suite().into_iter().find(|s| s.name == "concludes_on_a_scan").unwrap()
+    }
+
+    /// The `tool_result` of `conclude` with status `error` in some session log under `home`.
+    fn refused_conclusion(home: &Path) -> Option<String> {
+        let mut logs = Vec::new();
+        let mut pending = vec![home.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.file_name().is_some_and(|n| n == "log.jsonl")
+                    && path.to_string_lossy().contains("sessions")
+                {
+                    logs.push(path);
+                }
+            }
+        }
+        logs.iter().filter_map(|log| std::fs::read_to_string(log).ok()).find_map(|text| {
+            text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find_map(|v| {
+                let is_it = v["kind"] == "tool_result" && v["name"] == "conclude" && v["status"] == "error";
+                is_it.then(|| v["text"].as_str().unwrap_or("").to_string())
+            })
+        })
+    }
+
+    /// Runs only as the child of `concludes_on_a_scan_is_refused_and_the_run_is_not_finished_on_it`.
+    #[tokio::test]
+    #[ignore = "played by its parent test, in a process whose PATH starts with the fake depscan"]
+    async fn child_plays_the_scan_scenario() {
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let o = run(&scan_scenario(), dir.path()).await.unwrap();
+        assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Finished, true, 2));
+        // scan, claim, evidence, claim_update, conclude (refused), finish (held), run, evidence, conclude, finish.
+        assert_eq!(o.lead, card(10, Some(10), 10, 0, (2, 1), 0, (1, 0), 0));
+        assert_eq!(o.mission, card(12, Some(10), 12, 0, (2, 1), 0, (1, 0), 0));
+        let refusal = refused_conclusion(&dir.path().join("home")).expect("no refused conclude in the logs");
+        assert!(refusal.contains("analysis is not a run"), "{refusal}");
+        assert!(refusal.contains("e1 analysis by dep_scan"), "{refusal}");
+        println!("{CHILD_PLAYED}");
+    }
+
+    #[test]
+    fn a_scan_does_not_conclude_the_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        install_fake_depscan(dir.path()).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(dir.path().to_path_buf()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let name = module_path!().split_once("::").map(|(_, rest)| rest).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([&format!("{name}::child_plays_the_scan_scenario"), "--exact", "--ignored", "--nocapture"])
+            .arg("--test-threads=1")
+            .env("PATH", path)
+            .env(CHILD_MARKER, "1")
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "the child failed:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            stdout.contains(CHILD_PLAYED),
+            "the child did not play the scenario:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scanning_scenario_is_refused_when_the_fake_is_not_first_on_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = run(&scan_scenario(), dir.path()).await.unwrap_err();
+        assert!(e.contains("concludes_on_a_scan") && e.contains("fake `depscan` first on the PATH"), "{e}");
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none(), "nothing was started: {e}");
+    }
+
+    #[test]
+    fn the_fake_depscan_is_installed_executable_with_exactly_its_text() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = install_fake_depscan(dir.path()).unwrap();
+        assert_eq!(path, dir.path().join("depscan"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FAKE_DEPSCAN);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
     }
 
     #[test]

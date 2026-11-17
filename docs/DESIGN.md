@@ -437,8 +437,9 @@ the first two are singletons.
   the `GoalSet` on; its other states are `supported` (the goal is met) and `refuted` (the goal cannot be
   met as stated). There is no withdrawn state and `open` is never a write target, so the model can move
   it toward a conclusion but never retract it. A write needs a goal, a note, and cited evidence ids that
-  all exist and are attested and supporting, at least one of kind `execution` (a static-only basis is
-  refused: run the target and cite the run). A concluded claim may be written again only with the other
+  all exist and are attested and supporting, at least one of kind `execution`, which is a run (a basis
+  of analysis, reads or reference data alone is refused with a sentence that names each cited record's
+  grade and tool and says why it is not a run: run the target and cite the run). A concluded claim may be written again only with the other
   terminal state and at least one execution evidence record added after the entry that set the current
   state. A later gate and verifier check the claim; the ledger only holds it. The one way back to
   `open` is the harness's (`GoalReopen {finish}`, which no tool of a model writes): it records that a
@@ -481,10 +482,42 @@ The harness:
    return) is refused. The rule is one function, applied to every quote of `finish` too (a child's and a
    lead's): a quote of a ledger, a log search, an agent's report or a diff of the model's own edit is
    refused with `Nothing was delivered.`;
-4. records `{claim, kind, supports, session, call_id, blob, lines, quote, note, attested: true}`, where
-   `kind` is `execution` when the producer is of class `Exec` and `static` otherwise, and `quote` is
+4. records `{claim, kind, supports, session, call_id, blob, lines, quote, note, attested: true, tool,
+   grade}`, where `tool` and `grade` are the producer's name and evidence grade (below), `kind` is
+   `execution` exactly when that grade is `run`, and `static` otherwise, and `quote` is
    the verified text without line-number prefixes. A quote that is a part of a line is recorded as the
    complete line or lines it lies on, with their numbers (a window of them on long lines, below).
+
+**Evidence grade** (`loom-core::event::EvidenceGrade`). What a quote can show is decided by the harness
+from what produced it, never by the model: `run` (something was run and its behaviour observed: a
+command, a request, a debugger, an oracle), `analysis` (a tool's analysis of something it did not run: a
+dependency scan, a decompilation, cross-references), `read` (a file, a page, a listing) or `reference`
+(data about the world rather than the target: a CVE or advisory record, a page from a reference host).
+The class of a tool is not enough: `dep_scan`, `bin_decompile` and `bin_xrefs` are `Exec` tools, since
+they run a scanner or a backend, but what they produce describes the target without running it, and a
+model that concludes on a scanner's "reachable" label has shown nothing about what the target does. So a
+tool states its grade in its result's meta (`META_EVIDENCE_GRADE`): those three say `analysis`; the CVE and
+advisory tools, and `web_fetch` when its last hop used the reference client, say `reference`. A result that
+states none is graded by class, `run` for `Exec` and `read` otherwise, which is what the harness did before
+grades existed, so an old log grades as it did, with one exception: a result of one of the six tools that
+state a fixed grade (`event::GRADED_ANALYSIS_TOOLS`, `GRADED_REFERENCE_TOOLS`) gets that grade even from a
+log written before they stated it, so a scan stored before an upgrade does not become a run by being cited
+after it. Evidence records already written stay as they were: one recorded from a scan before the upgrade
+is still `execution`. The key can only lower a grade: `run` counts only on an
+`Exec` result, and an unreadable value is `analysis` on one. The producer index carries the grade, the
+evidence record stores it with the tool's name, and `kind` follows from it. Every rule that asks for
+execution evidence keeps asking for `kind: execution` and therefore for a run: concluding the goal (and
+concluding it again after a reopening), settling a verifier's objection, and the progress that resets stuck
+detection (§8). Analysis evidence can still support a claim. Where the model or a verifier weighs
+evidence, each record names its grade and tool (`e1 run by bash`, `e2 analysis by dep_scan`): in the
+`evidence` result (which adds, for analysis and reference, that it is not a run), the brief's claims and
+goal status, the refusal of a `conclude` that cites no run, and the evidence lines of a verifier's
+assignment (the finish verifier's and `verify`'s); the ledger Markdown and the journal summary show them too.
+Entries written before grades carry none and are shown by their kind (`run`, `read`). The grade is a fact
+about the producing tool, not about what a command did: the same scanner or decompiler started through
+`bash` (or `pty_exec`, `box_exec`) is a `run`, since the harness does not read commands to guess what they
+are. What stands against a "run" that only printed a scanner's verdict is the verifier, which sees the
+quote and its source.
 
 **Quote check** (`observe::check_quote`, also used for the quotes of `finish`). Both sides are prepared
 the same way: trailing whitespace is removed from every line, and blank lines at either end of the
@@ -656,7 +689,7 @@ only when every check passes and, where verification is required, a verifier acc
   `report_blocker`); outside a solvable pack it adds that a well-evidenced `unreachable` conclusion is a
   reportable outcome. The ledger, not the wording of a reply, decides whether a stop is a
   deliverable. Stuck detection: a lead's `finish` refused before a verifier runs (this gate or the
-  open-items check) twice in a row with no new attested execution evidence opens one non-blocking
+  open-items check) twice in a row with no new attested execution evidence (a run, §7) opens one non-blocking
   `Question` inbox item for the operator (Keep working / Narrow the goal / Release the mission, plus
   Conclude unreachable outside a solvable pack); the model is told it was opened, never given a count. `conclude {status: met|unreachable, note, evidence}` writes the goal-met claim (the
   ledger checks the evidence, §7); `unreachable` is also refused while a plan step is open, so every route
@@ -679,7 +712,7 @@ only when every check passes and, where verification is required, a verifier acc
   - rejected: the verdict is recorded and `finish` returns the objections as an error; the lead works
     on;
   - rejected, continued: each objection is opened as an `objection` obligation, which holds every later
-    finish until execution evidence is recorded after it (the harness settles it then, at the next
+    finish until execution evidence (a run, §7; a scan or a decompilation does not settle it) is recorded after it (the harness settles it then, at the next
     finish); answering an inbox item, rewording the result or finishing again settles nothing. From
     `MAX_FINISH_REJECTIONS` (2) rejections counted since the latest accepted finish, each rejection also
     writes a non-blocking note (`texts::finish_rejected_notice`, with no count; none when the session
@@ -956,7 +989,7 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
 set is frozen in `session_start`. Every call goes through one pipeline (`loom_tools::prepare` → `run`
 → `finish`): lookup, argument check, run (a panic becomes an error result), store and admit. Each tool
 has a class — `Nav`, `Read`, `Exec`, `Write`, `State`, `Terminal` — which drives eviction order,
-evidence kind and staleness. Each module's documentation is the precise specification of its tools.
+the default evidence grade (§7) and staleness. Each module's documentation is the precise specification of its tools.
 
 - `glob` and `grep` search the same file set: a walk that respects `.gitignore`, `.ignore` and global
   git excludes and skips hidden files unless `no_ignore` / `hidden` are set, always skips `.git`, does
@@ -1063,7 +1096,8 @@ evidence kind and staleness. Each module's documentation is the precise specific
   connect (a marker inside a tunnel comes from the destination and is not trusted).
 - `cve_lookup` (NVD record with EPSS), `cve_search` (NVD, ranked by EPSS) and `advisory_lookup` (OSV)
   reach only `services.nvd.nist.gov`, `api.first.org` and `api.osv.dev`, through the proxy, so the
-  network policy must allow them; each stores the upstream JSON beside its text report.
+  network policy must allow them; each stores the upstream JSON beside its text report. Their results
+  are graded `reference` (§7): a record about the world, not an observation of the target.
 - `dep_scan` runs the operator-installed OWASP dep-scan `depscan` command under the sandbox over a
   workspace directory (`--src`) or one CycloneDX SBOM file (`--bom`), never installing it and never
   using its server mode. Every write (reports, `HOME`, the `VDB_HOME` database cache, temp) goes to
@@ -1072,7 +1106,8 @@ evidence kind and staleness. Each module's documentation is the precise specific
   through the egress proxy. The `*.vdr.json` reports are parsed, deduplicated and summarised
   (prioritized/reachable first, then score, at most 50 lines; counts cover all findings), and the
   VDR, the generated SBOM and the scanner console are stored as blobs. dep-scan's
-  prioritized/reachable labels are its static analysis, stated as such, not execution evidence.
+  prioritized/reachable labels are its static analysis, stated as such, not execution evidence: its
+  results are graded `analysis` (§7), so a quote of a scan never counts as a run.
 - `pin {handle, reason, unpin?}` keeps a stored output and every view of it in view through re-weaves;
   `log_search {pattern, in?, max?}` searches the session's own record.
 

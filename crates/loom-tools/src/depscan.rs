@@ -28,7 +28,13 @@
 //!   the counts always cover every parsed finding.
 //! - dep-scan's `depscan:prioritized` / `depscan:insights` labels are its own static
 //!   (reachability) analysis. The summary says so: they are scanner data about the scanned
-//!   tree, not execution evidence that vulnerable code runs in a deployed system.
+//!   tree, not execution evidence that vulnerable code runs in a deployed system. The harness
+//!   enforces it: every result this tool's `run` returns, whatever its status, carries
+//!   `meta[META_EVIDENCE_GRADE] = "analysis"`, so a quote of a scan is recorded as static evidence
+//!   and never meets a rule that asks for a run (see `loom_core::event::EvidenceGrade`), although
+//!   the tool is of class `Exec`. A call refused before `run` (argument check, a cap) stores no
+//!   output, and `EvidenceGrade::of_tool_result` grades any `dep_scan` result without the key as
+//!   analysis too.
 //! - Status is `Ok` for a completed scan whether or not it found anything (a scan result is
 //!   an observation, like an HTTP error status in `web_fetch`); `Error` when the scanner did
 //!   not complete or produced no parseable VDR, `Interrupted`/`Timeout` when it was stopped.
@@ -36,12 +42,13 @@
 //! Tests required: VDR parsing/sorting/counts and the no-findings case as pure functions; a
 //! fake `depscan` on `PATH` that writes an SBOM+VDR (end to end, stored blobs, raw meta);
 //! a missing `depscan` (install guidance, nothing invented); a bad target; a bad project type; a report file that is a link to a file in the loom home or a
-//! credential store is refused and named and its bytes are in no stored blob, while a link to a readable file is read.
+//! credential store is refused and named and its bytes are in no stored blob, while a link to a readable file is read; the result
+//! of a completed scan and of a failed one are both graded `analysis`.
 
 use crate::binary::{command_bounded, quote, CommandOutcome};
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
-use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_ALSO_STORED, META_RAW_BLOB};
+use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_ALSO_STORED, META_EVIDENCE_GRADE, META_RAW_BLOB};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -80,7 +87,7 @@ impl Tool for DepScan {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
-        run(ctx, args).await
+        run(ctx, args).await.with_meta(META_EVIDENCE_GRADE, json!("analysis"))
     }
 }
 
@@ -874,5 +881,38 @@ echo "fake depscan ran: $*"
         assert_eq!(r.status, Status::Error, "{}", r.text);
         assert!(r.text.contains("cdxgen blew up"), "{}", r.text);
         assert!(r.text.contains("no CycloneDX VDR"), "{}", r.text);
+    }
+
+    fn grade(r: &loom_core::event::ToolResult) -> Option<&str> {
+        r.meta.get(META_EVIDENCE_GRADE).and_then(Value::as_str)
+    }
+
+    #[tokio::test]
+    async fn every_dep_scan_result_is_graded_analysis() {
+        let mut e = env();
+        // A missing depscan.
+        let empty = e.ctx.workspace.join("emptybin");
+        std::fs::create_dir_all(&empty).unwrap();
+        let mut vars = (*e.ctx.env).clone();
+        vars.insert("PATH".to_string(), empty.to_string_lossy().into_owned());
+        e.ctx.env = std::sync::Arc::new(vars);
+        let r = e.call("dep_scan", json!({})).await;
+        assert_eq!(r.status, Status::Error, "{}", r.text);
+        assert_eq!(grade(&r), Some("analysis"));
+        // A completed scan, a refused target and a failed scan.
+        let mut e = env();
+        with_fake_depscan(&mut e, FAKE_SCAN);
+        std::fs::write(e.ctx.workspace.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let r = e.call("dep_scan", json!({})).await;
+        assert_eq!(r.status, Status::Ok, "{}", r.text);
+        assert_eq!(grade(&r), Some("analysis"));
+        let r = e.call("dep_scan", json!({"path": "no-such-place"})).await;
+        assert_eq!(r.status, Status::Error, "{}", r.text);
+        assert_eq!(grade(&r), Some("analysis"));
+        let mut e = env();
+        with_fake_depscan(&mut e, "#!/bin/sh\nexit 3\n");
+        let r = e.call("dep_scan", json!({})).await;
+        assert_eq!(r.status, Status::Error, "{}", r.text);
+        assert_eq!(grade(&r), Some("analysis"));
     }
 }

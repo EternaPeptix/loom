@@ -136,6 +136,31 @@
 - `ModelClient::new` takes the key directory; `Proxy::grant` returns a `Result` and must run inside a
   Tokio runtime. SECURITY.md lists what `KERN_PROCARGS2` still exposes.
 
+### Evidence grades: analysis no longer counts as a run
+
+- The harness now grades every quoted output: `run`, `analysis`, `read` or `reference`
+  (`loom_core::event::EvidenceGrade`). A tool states the grade in its result's meta under the new key
+  `META_EVIDENCE_GRADE` (`evidence_grade`); without it an `Exec` result is a `run` and anything else a
+  `read`, which is what the harness did before, so old logs grade as they did. The key can only lower a
+  grade. `dep_scan`, `bin_decompile` and `bin_xrefs` (all `Exec`) now say `analysis`; `cve_lookup`,
+  `cve_search`, `advisory_lookup`, and `web_fetch` through the reference client say `reference`.
+- Behaviour change: only a `run` is recorded as `kind: execution`. A quote of a dependency scan or a
+  decompilation used to be execution evidence because those tools are `Exec`, so it could conclude the goal
+  (the `vr` pack has no oracle), settle a verifier's objection and reset stuck detection; it no longer can.
+  A `conclude` that cites only such evidence is refused with a sentence that names each record's grade and
+  tool and says that analysis is not a run.
+- `Producer` gains `grade`. `EvidenceInput` gains `tool` and `grade` (`#[serde(default)]`, not serialized
+  when absent, so existing journal entries, and their MACs, are unchanged). Evidence lists in the
+  `evidence` result, the brief, the ledger Markdown, the journal summary and verifier assignments name each
+  record's grade and tool (`e1 run by bash`, `e2 analysis by dep_scan`).
+- A result of `dep_scan`, `bin_decompile`, `bin_xrefs` or the CVE/advisory tools logged before this
+  change (no grade key) is graded as those tools now state (`EvidenceGrade::of_tool_result`), so an output
+  stored before the upgrade does not become a run by being cited after it. Evidence records already in a
+  journal are not regraded: one recorded from a scan before the upgrade stays `execution`.
+- The same scanner run through `bash` is a `run`: the grade belongs to the tool, not the command.
+- New evalkit scenario `concludes_on_a_scan`, played with a fake `depscan` that the `eval` example puts
+  first on its own PATH.
+
 ### security_record reads near misses
 
 - `security_record` now reads an operation where its meaning is unambiguous (`ops`/`items` for

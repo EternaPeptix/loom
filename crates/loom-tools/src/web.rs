@@ -36,6 +36,11 @@
 //!   says that the destination was not reached through the proxy, with the rule the proxy allows it by
 //!   or the fact that it gave no verdict, and that the session's egress log has the proxy's decision.
 //!   The stage of a failure is read from the causes of the error, never from text that contains the URL.
+//! - Evidence grade: when the final hop (the one whose response becomes the result) went through the
+//!   reference client (`reference_client` returned one for that URL), the result carries
+//!   `meta[META_EVIDENCE_GRADE] = "reference"`: a reference host's page is data about the world, not the
+//!   target. Any other result carries no grade (it is a `Read`). A redirect from a reference host to a
+//!   target host is graded by where it ended, and the other way round.
 //!
 //! Tests required (local `axum` server on loopback; no proxy): plain text; html rendered and raw
 //! stored; `raw: true`; redirect chain reported; redirect loop stops at 10; 404 is `Ok` with the
@@ -43,12 +48,14 @@
 //! from the end of the document is present in the stored output). Real-proxy reference tests:
 //! raw credentials cannot reach reference hosts; reference GET works without inherited credentials;
 //! redirects switch capabilities both ways, refuse ungranted destinations, and refuse URL user-info
-//! without echoing the credentials.
+//! without echoing the credentials; a page fetched through the reference client is graded `reference` and
+//! one fetched directly or through the session proxy carries no grade, including after a redirect from a
+//! reference host to a granted target host.
 
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_RAW_BLOB};
+use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_EVIDENCE_GRADE, META_RAW_BLOB};
 use reqwest::header::HeaderMap;
 use reqwest::{header, redirect, Client, Method, Proxy};
 use serde_json::{json, Map, Value};
@@ -314,8 +321,20 @@ fn chain_text(hops: &[Url]) -> String {
     hops.iter().map(Url::as_str).collect::<Vec<_>>().join(" → ")
 }
 
-/// Follow the redirects by hand, then turn the final response into the result.
+/// Follow the redirects by hand, then turn the final response into the result. The result is graded
+/// `reference` when the final hop went through the reference client.
 async fn fetch(ctx: &ToolCtx, client: &Client, start: Url, raw: bool) -> ToolOutput {
+    let mut via_reference = false;
+    let out = follow(ctx, client, start, raw, &mut via_reference).await;
+    if via_reference {
+        out.with_meta(META_EVIDENCE_GRADE, json!("reference"))
+    } else {
+        out
+    }
+}
+
+/// The redirect loop of [`fetch`]; `via_reference` says whether the last hop used the reference client.
+async fn follow(ctx: &ToolCtx, client: &Client, start: Url, raw: bool, via_reference: &mut bool) -> ToolOutput {
     let mut hops = vec![start];
     loop {
         let current = hops.last().cloned().unwrap_or_else(|| hops[0].clone());
@@ -326,6 +345,7 @@ async fn fetch(ctx: &ToolCtx, client: &Client, start: Url, raw: bool) -> ToolOut
             Ok(c) => c,
             Err(e) => return ToolOutput::error(e),
         };
+        *via_reference = reference.is_some();
         let client = reference.as_ref().unwrap_or(client);
         let proxied = session_proxy(ctx).is_some() || reference.is_some();
         // The proxy answers the CONNECT of an https URL out of the client's sight, so it is asked first.
@@ -560,6 +580,7 @@ mod tests {
         assert!(r.text.contains("11 bytes"), "{}", r.text);
         assert_eq!(e.stored(&r), "hello world");
         assert!(r.meta.get(META_RAW_BLOB).is_none());
+        assert!(!r.meta.contains_key(META_EVIDENCE_GRADE), "a direct fetch carries no grade");
     }
 
     #[tokio::test]
@@ -849,6 +870,7 @@ mod tests {
             .unwrap();
         let result = fetch(&e.ctx, &raw, Url::parse(&format!("{base}/data")).unwrap(), true).await;
         assert_eq!(result.status, ToolStatus::Ok);
+        assert_eq!(result.meta.get(META_EVIDENCE_GRADE).and_then(Value::as_str), Some("reference"));
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         for name in ["authorization", "cookie", "referer", "proxy-authorization"] {
@@ -906,10 +928,12 @@ mod tests {
         let ok = e.call("web_fetch", json!({"url": format!("{reference}/active")})).await;
         assert_eq!(ok.status, ToolStatus::Ok, "{}", ok.text);
         assert!(e.stored(&ok).contains("active body"));
+        assert!(!ok.meta.contains_key(META_EVIDENCE_GRADE), "reference to granted target host is not graded");
         assert_eq!(active_hits.load(Ordering::SeqCst), 1);
         let back = e.call("web_fetch", json!({"url": format!("{back}/reference")})).await;
         assert_eq!(back.status, ToolStatus::Ok, "{}", back.text);
         assert!(e.stored(&back).contains("reference body"));
+        assert_eq!(back.meta.get(META_EVIDENCE_GRADE).and_then(Value::as_str), Some("reference"));
         let denied = e.call("web_fetch", json!({"url": format!("{reference}/blocked")})).await;
         assert_eq!(denied.status, ToolStatus::Denied, "{}", denied.text);
         assert_eq!(blocked_hits.load(Ordering::SeqCst), 0);

@@ -33,6 +33,10 @@
 //! (not raw JSON) whose first lines are the headline facts, so a cut still shows them; the complete
 //! upstream JSON of each source is stored too (see each tool). `outcome` is a few words. Numbers are
 //! plain. Every retrieval notes its source and that it was retrieved now (the record is a snapshot).
+//! Every result the three tools' `run` returns, whatever its status, carries `meta[META_EVIDENCE_GRADE] =
+//! "reference"`: a CVE or advisory record is data about the world, not an observation of the target, so a
+//! quote of it is never a run (see `loom_core::event::EvidenceGrade`; a call refused before `run` stores no
+//! output, and `EvidenceGrade::of_tool_result` grades their results without the key as reference too).
 //!
 //! ## `cve_lookup` — one consolidated CVE record (ToolClass::Read)
 //! Args: `id` (required string). Normalise to `CVE-YYYY-NNNN…` (uppercase; accept lowercase and a
@@ -84,13 +88,14 @@
 //! consolidates NVD+EPSS incl. KEV present/absent, unscored, and not-found; EPSS failure degrades
 //! gracefully; cve_search ranks by EPSS and applies min_cvss/min_epss and the no-filter refusal;
 //! advisory_lookup with and without version and the empty case; a proxy `403` with `X-Loom-Proxy`
-//! reads as `denied` naming the host; a bad CVE id is refused with the expected shape; cancellation.
+//! reads as `denied` naming the host; a bad CVE id is refused with the expected shape; cancellation; each
+//! tool's result (a found record and an error alike) is graded `reference`.
 
 use crate::web::{ProxyVerdict, Tunnel};
 use crate::{Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_RAW_BLOB};
+use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_EVIDENCE_GRADE, META_RAW_BLOB};
 use reqwest::{redirect, Client, Proxy, RequestBuilder};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -142,7 +147,7 @@ impl Tool for CveLookup {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
-        cve_lookup(ctx, args, &Endpoints::default()).await
+        graded(cve_lookup(ctx, args, &Endpoints::default()).await)
     }
 }
 
@@ -164,7 +169,7 @@ impl Tool for CveSearch {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
-        cve_search(ctx, args, &Endpoints::default()).await
+        graded(cve_search(ctx, args, &Endpoints::default()).await)
     }
 }
 
@@ -184,7 +189,7 @@ impl Tool for AdvisoryLookup {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
-        advisory_lookup(ctx, args, &Endpoints::default()).await
+        graded(advisory_lookup(ctx, args, &Endpoints::default()).await)
     }
 }
 
@@ -702,6 +707,11 @@ fn normalize_cve_id(given: &str) -> Option<String> {
     }
 }
 
+/// A result of one of the three tools, graded `reference`: a record is data about the world.
+fn graded(out: ToolOutput) -> ToolOutput {
+    out.with_meta(META_EVIDENCE_GRADE, json!("reference"))
+}
+
 async fn cve_lookup(ctx: &ToolCtx, args: &Map<String, Value>, ep: &Endpoints) -> ToolOutput {
     let given = args.get("id").and_then(Value::as_str).unwrap_or_default();
     let Some(id) = normalize_cve_id(given) else {
@@ -1174,9 +1184,9 @@ mod tests {
 
         async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
             match self.which {
-                0 => cve_lookup(ctx, args, &self.ep).await,
-                1 => cve_search(ctx, args, &self.ep).await,
-                _ => advisory_lookup(ctx, args, &self.ep).await,
+                0 => graded(cve_lookup(ctx, args, &self.ep).await),
+                1 => graded(cve_search(ctx, args, &self.ep).await),
+                _ => graded(advisory_lookup(ctx, args, &self.ep).await),
             }
         }
     }
@@ -1383,6 +1393,29 @@ mod tests {
         assert!(t.contains("CVSS: not scored"), "{t}");
         assert!(t.contains("EPSS: EPSS not available"), "{t}");
         assert_eq!(r.status, ToolStatus::Ok);
+    }
+
+    fn grade(r: &loom_core::event::ToolResult) -> Option<&str> {
+        r.meta.get(META_EVIDENCE_GRADE).and_then(Value::as_str)
+    }
+
+    #[tokio::test]
+    async fn every_cve_and_advisory_result_is_graded_reference() {
+        let e = env_up(upstream()).await;
+        let results = [
+            e.call("cve_lookup", json!({"id": "CVE-2021-44228"})).await,
+            e.call("cve_lookup", json!({"id": "CVE-2099-99999"})).await,
+            e.call("cve_lookup", json!({"id": "nonsense"})).await,
+            e.call("cve_search", json!({"query": "x"})).await,
+            e.call("cve_search", json!({})).await,
+            e.call("advisory_lookup", json!({"name": "x", "ecosystem": "npm"})).await,
+            e.call("advisory_lookup", json!({"name": "x", "ecosystem": "bogus"})).await,
+        ];
+        for r in &results {
+            assert_eq!(grade(r), Some("reference"), "{:?}: {}", r.status, r.text);
+        }
+        assert_eq!(results[0].status, ToolStatus::Ok);
+        assert_eq!(results[2].status, ToolStatus::Error);
     }
 
     #[tokio::test]
@@ -1750,6 +1783,7 @@ mod tests {
         let result = e.call("cve_lookup", json!({"id": "CVE-2024-0001"})).await;
         assert_eq!(result.status, ToolStatus::Ok, "{}", result.text);
         assert!(e.stored(&result).contains("CVE-2024-0001"));
+        assert_eq!(grade(&result), Some("reference"));
         let url = Url::parse(&format!("{base}/rest/json/cves/2.0")).unwrap();
         let client = build_client(&e.ctx).unwrap();
         let request = client
@@ -1765,6 +1799,7 @@ mod tests {
         }
         let denied = e.call("advisory_lookup", json!({"name": "example", "ecosystem": "npm"})).await;
         assert_eq!(denied.status, ToolStatus::Denied, "{}", denied.text);
+        assert_eq!(grade(&denied), Some("reference"));
         assert!(denied.text.contains("GET-only"), "{}", denied.text);
         assert_eq!(posts.load(Ordering::SeqCst), 0);
     }

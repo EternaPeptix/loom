@@ -84,8 +84,9 @@
 //! fresh execution evidence has been recorded since the last objection (otherwise the open-items gate
 //! refuses before the verifier starts), so the signal lives at the gate, not after the verdict. Whenever
 //! a lead's `finish` is refused before a verifier runs — the goal pre-gate (1) or the open-items check
-//! (2) — the session counts it (`Shared::record_finish_refusal`), unless attested `Execution` evidence
-//! was recorded after the last rejected `FinishVerdict` in the journal (a read failure counts as no fresh
+//! (2) — the session counts it (`Shared::record_finish_refusal`), unless attested `Execution` evidence (a
+//! run: analysis output, a read or reference data is `Static` and does not count) was recorded after the
+//! last rejected `FinishVerdict` in the journal (a read failure counts as no fresh
 //! evidence rather than failing the finish). At `STUCK_FINISH_REJECTIONS` consecutive refusals the
 //! operator is opened one non-blocking `InboxItem { kind: Question, blocking: false, options: Keep
 //!      working / Narrow the goal / Release the mission / Conclude unreachable }` (`texts::stuck_inbox_text`,
@@ -118,7 +119,9 @@
 //!
 //! **Objections.** Before the open-items check, each open `Objection` obligation is settled (`ObligationSettle`)
 //! when an attested evidence record of kind `Execution` was added after it (by journal entry order); the
-//! outcome names the record. When the operator released the mission every open objection is settled. Nothing
+//! outcome names the record. `Execution` is a run: a quote of analysis output (`dep_scan`, a decompilation,
+//! cross-references) or of reference data is `Static` and settles nothing. When the operator released the mission
+//! every open objection is settled. Nothing
 //! else settles one: answering an inbox item, a question, or calling finish again does not. While one is open
 //! `check_finish_lead` refuses finish.
 //!
@@ -149,8 +152,10 @@
 //! refused, with a sentence listing them and `These are routes still open; run one of them.`, while a plan
 //! step is open. Writes `GoalMetSet { Supported | Refuted, note,
 //! evidence }`; the ledger's own rules refuse a missing goal, a blank note, evidence that is missing,
-//! unattested, not supporting or static only, a repeat, and, for a goal a rejected finish reopened, evidence
-//! with no run recorded after the reopening. Output: ok, outcome `goal concluded: ...`, saying
+//! unattested, not supporting or not a run (the sentence names each cited record's grade and tool and says
+//! why analysis, a read or a lookup is not a run), a repeat, and, for a goal a rejected finish reopened,
+//! evidence with no run recorded after the reopening. The refusal is passed through verbatim. Output: ok, outcome
+//! `goal concluded: ...`, saying
 //! that `finish` may now be called.
 //!
 //! ## `verdict` (verifier role)
@@ -242,9 +247,15 @@
 //! non-blocking inbox item opened once at the threshold when no new execution evidence appeared, and the
 //! line for the model; nothing when a fresh run does appear), the
 //! count restarting at an accepted finish only, an answered inbox item changing nothing, the goal-met
-//! pre-gate, objections settled by new execution evidence, an operator release, verifier ending without a
+//! pre-gate, objections settled by new execution evidence and NOT by new analysis evidence (a quote of a
+//! `dep_scan` output recorded after the objection leaves it open and the finish refused), stuck detection
+//! not reset by analysis evidence (the count keeps rising), the verifier's assignment showing each evidence
+//! record's grade and tool, an operator release, verifier ending without a
 //! verdict and spawn failure (retried, then held with a notice, no inbox item), shutdown and cancellation
-//! (error, nothing recorded); `conclude` - met, unreachable with and without open plan steps, unreachable refused in a solvable pack (with and without `report_blocker`), a child;
+//! (error, nothing recorded); `conclude` - met, unreachable with and without open plan steps, unreachable refused in
+//! a solvable pack (with and without `report_blocker`), a child,
+//! met citing only analysis evidence refused with the ledger's sentence (`analysis is not a run`) and nothing
+//! recorded;
 //! `verdict` — each refusal, the settle effect and payload; `ask_user` — blocking and not, child
 //! refusal, missing `meanwhile`, ledger question recorded and referenced; `report_blocker` — child
 //! and lead; `wait` — nothing running, a running job, a running child.
@@ -393,7 +404,7 @@ pub fn quote_items() -> Value {
 ///   this goal cannot be met as stated. Name one route to it that was not tried, or get one step further
 ///   toward the goal yourself. Do not confirm that it is impossible: accept only if you tried and found no
 ///   untried route.`, and `context` has, after the goal, `The lead concluded the goal cannot be met as
-///   stated (evidence: {ids}):\n{note}`.
+///   stated (evidence: {labels}):\n{note}` (`LedgerState::evidence_labels`: `e1 run by bash, …`).
 /// - `context`: `Goal (set by the operator):\n{goal}`, then `Constraints:` with one `- ` line per
 ///   active constraint (omitted when none), then `The lead's summary of the result:\n{answer}`, then
 ///   `What the lead says it did not establish:` when it stated something, then
@@ -403,9 +414,10 @@ pub fn quote_items() -> Value {
 ///   with one line per record of `evidence` (the ids given to `finish`; omitted when none), then
 ///   `Claims recorded as supported:` with one line per supported claim `- {id}: {text}`, each followed
 ///   by its evidence records, indented (omitted when none).
-///   An evidence line has the form the `verify` tool uses: `- {id} ({supports|undermines}) {handle}
-///   lines {a}-{b}: {quote cut to 300 characters} — {note}`, so the assignment names the stored
-///   output of every piece of evidence the result rests on.
+///   An evidence line has the form the `verify` tool uses: `- {id} ({supports|undermines};
+///   {source_label}) {handle} lines {a}-{b}: {quote cut to 300 characters} — {note}`, so the assignment
+///   names the stored output of every piece of evidence the result rests on, and whether it is a run
+///   (`run by bash`) or not (`analysis by dep_scan`).
 /// - `returns`: `A verdict, delivered by calling verdict.`
 /// - `stop_when`: `You have checked the summary against the goal, each constraint, and the outputs
 ///   it relies on.`
@@ -425,7 +437,7 @@ pub fn finish_brief(
     if let Some(g) = unreachable {
         parts.push(format!(
             "The lead concluded the goal cannot be met as stated (evidence: {}):\n{}",
-            g.evidence.join(", "),
+            ledger.evidence_labels(&g.evidence),
             g.note
         ));
     }
@@ -498,7 +510,7 @@ fn evidence_line(e: &Evidence) -> String {
     let handle = i.blob.as_ref().map(handle_of).unwrap_or_else(|| "no stored output".to_string());
     let range = i.lines.map(|(a, b)| format!(" lines {a}-{b}")).unwrap_or_default();
     let quote = cut_chars(i.quote.as_deref().unwrap_or(""), QUOTE_RECORD_CHARS);
-    format!("- {} ({side}) {handle}{range}: {quote} \u{2014} {}", e.id, i.note)
+    format!("- {} ({side}; {}) {handle}{range}: {quote} \u{2014} {}", e.id, i.source_label(), i.note)
 }
 
 /// `s` cut to `max` characters, with `…` appended when something was removed.
@@ -1292,7 +1304,7 @@ impl Tool for Conclude {
     fn spec(&self) -> ToolSpec {
         spec(
             "conclude",
-            "Record whether the mission's goal is met. This is what makes `finish` available: a finish is refused until the goal is concluded. Use `met` once a run of the target shows the goal achieved; use `unreachable` only once you have established that the goal cannot be met as stated: every plan step closed (done or dropped), every route tried, with execution evidence for it. Cite evidence records (ids from `evidence`) that are attested and show a run; reading source alone is refused. Not being there yet is neither: keep working. After concluding, call `finish` with the result; a verifier checks it.",
+            "Record whether the mission's goal is met. This is what makes `finish` available: a finish is refused until the goal is concluded. Use `met` once a run of the target shows the goal achieved; use `unreachable` only once you have established that the goal cannot be met as stated: every plan step closed (done or dropped), every route tried, with execution evidence for it. Cite evidence records (ids from `evidence`) that are attested and show a run; reading source, a dependency scan, a decompilation or a CVE lookup alone is refused. Not being there yet is neither: keep working. After concluding, call `finish` with the result; a verifier checks it.",
             ToolClass::State,
             &[
                 req("status", "string", "met: the goal is achieved. unreachable: it cannot be met as stated.").one_of(&["met", "unreachable"]),
@@ -1877,7 +1889,7 @@ mod tests {
     use super::*;
     use crate::rtools::testkit::{core_role, rig, rig_with, Rig};
     use crate::rtools::ChildInfo;
-    use loom_core::event::{ToolResult, ToolStatus as Status};
+    use loom_core::event::{EvidenceGrade, ToolResult, ToolStatus as Status};
     use loom_core::ledger::{EvidenceInput, EvidenceKind};
     use loom_core::log::{Durability, SessionLog};
 
@@ -1956,6 +1968,8 @@ mod tests {
             quote: None,
             note: "bounded fixture observation".into(),
             attested: true,
+            tool: None,
+            grade: None,
         }));
         r.model_op(LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: "observed".into() });
         "e1".into()
@@ -2557,9 +2571,35 @@ mod tests {
             quote: None,
             note: "ran the target".into(),
             attested: true,
+            tool: None,
+            grade: None,
         }));
         r.model_op(LedgerOp::ClaimUpdate { id: claim, status: ClaimStatus::Supported, note: String::new() });
         format!("e{}", r.shared.ledger().unwrap().evidence.len())
+    }
+
+    /// Record analysis of the target end to end: a supported claim with evidence attached through the `evidence`
+    /// tool, quoting an output of `dep_scan` (an `Exec` tool whose results say they are analysis). So a test using
+    /// it fails if the evidence tool records a scan as a run. Returns the evidence id.
+    async fn record_analysis(r: &Rig) -> String {
+        let claim = format!("c{}", r.shared.ledger().unwrap().claims.len() + 1);
+        r.model_op(LedgerOp::ClaimAdd { text: "the target has a vulnerable dependency".into() });
+        let h = r.output_graded(
+            "pkg:cargo/time@0.1.44 RUSTSEC-2020-0071 reachable\n",
+            "dep_scan",
+            ToolClass::Exec,
+            EvidenceGrade::Analysis,
+        );
+        let res = r
+            .call("evidence", json!({"claim": claim, "handle": h, "start": 1, "end": 1, "note": "scanned the target"}))
+            .await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let st = r.shared.ledger().unwrap();
+        let e = st.evidence.last().unwrap();
+        assert_eq!((e.input.kind, e.input.grade), (EvidenceKind::Static, Some(EvidenceGrade::Analysis)));
+        let id = e.id.clone();
+        r.model_op(LedgerOp::ClaimUpdate { id: claim, status: ClaimStatus::Supported, note: String::new() });
+        id
     }
 
     /// Conclude the goal as met through the tool, after a recorded run.
@@ -2726,7 +2766,8 @@ mod tests {
         assert!(brief.question.contains("Name one route to it that was not tried"), "{}", brief.question);
         let context = brief.context.clone().unwrap();
         assert!(
-            context.contains("The lead concluded the goal cannot be met as stated (evidence: e1):\nevery route fails"),
+            context
+                .contains("The lead concluded the goal cannot be met as stated (evidence: e1 run):\nevery route fails"),
             "{context}"
         );
     }
@@ -2921,6 +2962,8 @@ mod tests {
             quote: None,
             note: "read it".into(),
             attested: true,
+            tool: None,
+            grade: None,
         }));
         r.model_op(LedgerOp::ClaimUpdate {
             id: "c2".into(),
@@ -2937,6 +2980,83 @@ mod tests {
         assert_eq!(open_objections(&r), 0);
         let st = r.shared.ledger().unwrap();
         assert!(st.obligations[0].outcome.clone().unwrap().contains(&new_run));
+    }
+
+    #[tokio::test]
+    async fn analysis_evidence_does_not_settle_an_objection_and_a_run_does() {
+        let r = lead_without_fresh_start();
+        conclude_met(&r).await;
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "I could not reproduce the fix.", rejected_payload());
+        r.orch.settle("s-kid2", ChildOutcome::Returned, "fine", accepted_payload());
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert_eq!(open_objections(&r), 2);
+        // An analysis record after the objections answers nothing: the finish is still refused, no verifier.
+        record_analysis(&r).await;
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("An objection is settled only by new work"), "{}", res.text);
+        assert_eq!(spawn_count(&r), 1);
+        assert_eq!(open_objections(&r), 2);
+        // A run does.
+        let run = record_run(&r);
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        assert_eq!(open_objections(&r), 0);
+        let st = r.shared.ledger().unwrap();
+        assert!(st.obligations[0].outcome.clone().unwrap().contains(&run));
+    }
+
+    #[tokio::test]
+    async fn analysis_evidence_does_not_reset_the_stuck_count() {
+        let r = lead_without_fresh_start();
+        conclude_met(&r).await;
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "no", rejected_payload());
+        r.orch.settle("s-kid2", ChildOutcome::Returned, "fine", accepted_payload());
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        r.shared.take_emitted();
+        // Analysis recorded since the rejection is not fresh work: the count keeps rising and the item opens
+        // at the threshold, exactly as without it.
+        record_analysis(&r).await;
+        r.shared.take_emitted();
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(!res.text.contains("non-blocking item"), "{}", res.text);
+        record_analysis(&r).await;
+        r.shared.take_emitted();
+        let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("The operator has been notified as a non-blocking item"), "{}", res.text);
+        let (items, _) = drain(&r);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(items[0].text.contains("has not advanced in 2 finish attempts"), "{}", items[0].text);
+    }
+
+    #[tokio::test]
+    async fn conclude_met_citing_only_analysis_is_refused_and_records_nothing() {
+        let r = lead_with_goal();
+        let e = record_analysis(&r).await;
+        let before = r.shared.ledger().unwrap();
+        let res = r.call("conclude", json!({"status": "met", "note": "the scan shows it", "evidence": [e]})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(res.text.contains("analysis is not a run"), "{}", res.text);
+        // The ledger's own sentence, verbatim.
+        let rule = r
+            .shared
+            .ledger_append(
+                false,
+                LedgerOp::GoalMetSet {
+                    status: GoalMetStatus::Supported,
+                    note: "the scan shows it".into(),
+                    evidence: vec![e.clone()],
+                },
+            )
+            .expect_err("the rule refuses it");
+        assert!(res.text.contains(&rule), "{} vs {rule}", res.text);
+        let after = r.shared.ledger().unwrap();
+        assert_eq!(after, before, "nothing was recorded");
+        assert_ne!(after.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Supported));
     }
 
     #[tokio::test]
@@ -4122,11 +4242,15 @@ mod tests {
 
     #[test]
     fn brief_names_the_stored_output_of_every_piece_of_evidence() {
-        let evidence = |id: &str, blob: Option<&str>, supports: bool| Evidence {
+        let evidence = |id: &str, blob: Option<&str>, supports: bool, from: Option<(&str, EvidenceGrade)>| Evidence {
             id: id.into(),
             input: EvidenceInput {
                 claim: "c1".into(),
-                kind: EvidenceKind::Execution,
+                kind: if from.is_some_and(|(_, g)| g != EvidenceGrade::Run) {
+                    EvidenceKind::Static
+                } else {
+                    EvidenceKind::Execution
+                },
                 supports,
                 session: "s-test".into(),
                 call_id: "call-0".into(),
@@ -4135,6 +4259,8 @@ mod tests {
                 quote: blob.map(|_| "line two".to_string()),
                 note: "shows it".into(),
                 attested: true,
+                tool: from.map(|(t, _)| t.to_string()),
+                grade: from.map(|(_, g)| g),
             },
             n: 1,
         };
@@ -4147,9 +4273,10 @@ mod tests {
                 evidence: vec!["e1".into(), "e3".into()],
             }],
             evidence: vec![
-                evidence("e1", Some("ab"), true),
-                evidence("e2", Some("cd"), false),
-                evidence("e3", None, true),
+                evidence("e1", Some("ab"), true, Some(("bash", EvidenceGrade::Run))),
+                evidence("e2", Some("cd"), false, Some(("dep_scan", EvidenceGrade::Analysis))),
+                // An older entry, with no tool or grade recorded.
+                evidence("e3", None, true, None),
             ],
             ..LedgerState::default()
         };
@@ -4157,12 +4284,12 @@ mod tests {
         let c = finish_brief(&st, "done", &[], None, &["e2".to_string(), "e9".to_string()]).context.unwrap();
         let (ab, cd) = ("ab".repeat(8), "cd".repeat(8));
         assert!(
-            c.contains(&format!("Evidence the lead names for the result:\n- e2 (undermines) out:{cd} lines 2-3: line two \u{2014} shows it\n\n")),
+            c.contains(&format!("Evidence the lead names for the result:\n- e2 (undermines; analysis by dep_scan) out:{cd} lines 2-3: line two \u{2014} shows it\n\n")),
             "{c}"
         );
         assert!(
             c.ends_with(&format!(
-                "Claims recorded as supported:\n- c1: it works\n  - e1 (supports) out:{ab} lines 2-3: line two \u{2014} shows it\n  - e3 (supports) no stored output:  \u{2014} shows it"
+                "Claims recorded as supported:\n- c1: it works\n  - e1 (supports; run by bash) out:{ab} lines 2-3: line two \u{2014} shows it\n  - e3 (supports; run) no stored output:  \u{2014} shows it"
             )),
             "{c}"
         );
@@ -4184,6 +4311,8 @@ mod tests {
             quote: Some("line two".into()),
             note: "the test passes".into(),
             attested: true,
+            tool: Some("bash".into()),
+            grade: Some(EvidenceGrade::Run),
         }));
         r.model_op(LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: String::new() });
         r.orch.settle("s-kid1", ChildOutcome::Returned, "fine", accepted_payload());
@@ -4192,7 +4321,7 @@ mod tests {
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         let spawned = r.orch.spawned.lock().unwrap().clone();
         let ctx_text = spawned[0].1.brief.context.clone().unwrap();
-        let line = format!("- e1 (supports) {h} lines 2-2: line two \u{2014} the test passes");
+        let line = format!("- e1 (supports; run by bash) {h} lines 2-2: line two \u{2014} the test passes");
         assert!(ctx_text.contains(&format!("Evidence the lead names for the result:\n{line}")), "{ctx_text}");
         assert!(
             ctx_text.contains(&format!("Claims recorded as supported:\n- c1: the parser is fixed\n  {line}")),

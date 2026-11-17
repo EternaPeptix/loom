@@ -12,7 +12,7 @@
 //! never phrased as a judgment of the work or the worker. A well-evidenced negative conclusion is
 //! a reportable outcome, and the texts that gate `conclude`/`finish` say so.
 
-use loom_core::event::ChildOutcome;
+use loom_core::event::{ChildOutcome, EvidenceGrade};
 
 /// Longest excerpt of a model reply quoted back in a harness text.
 pub const REPLY_EXCERPT_CHARS: usize = 2_000;
@@ -168,6 +168,19 @@ pub fn stall(steps: u32) -> String {
 /// result established in the mission after the write.
 pub fn result_banked(id: &str, n: usize, ids: &str) -> String {
     format!("Established: {id}. Results established in this mission so far: {n} ({ids}).")
+}
+
+/// The line `evidence` adds when it attached a quote of output that is not a run: analysis (`dep_scan`, a
+/// decompilation, cross-references) or reference data (a CVE or advisory record). `None` for a run or a read.
+pub fn evidence_not_a_run(grade: EvidenceGrade, tool: &str) -> Option<String> {
+    let what = match grade {
+        EvidenceGrade::Analysis => "analysis, not a run",
+        EvidenceGrade::Reference => "reference data, not a run",
+        EvidenceGrade::Run | EvidenceGrade::Read => return None,
+    };
+    Some(format!(
+        "The output of `{tool}` is {what}: it is recorded, but it cannot conclude the goal, settle a verifier's objection, or count as new progress after a rejected finish. To show what the target does, run it and record that run with `evidence`."
+    ))
 }
 
 /// A message from the parent agent to a running child.
@@ -936,7 +949,7 @@ pub fn finish_not_accepted_tail(tools: &FinishTools) -> String {
     let mut out = String::from(
         "Each objection is now an open obligation; the gate refuses another finish until new execution evidence is recorded after them. The objections name concrete gaps, and one of these closes them:",
     );
-    out.push_str("\n- Fix the problem, then run the target again and record the run with `evidence` (kind execution). An objection settles only by new execution evidence recorded after it — rewording the result, answering the operator, or calling finish again does not.");
+    out.push_str("\n- Fix the problem, then run the target again and record the run with `evidence` (it must be a run: a scan, a decompilation or a lookup is not one). An objection settles only by new execution evidence recorded after it — rewording the result, answering the operator, or calling finish again does not.");
     out.push_str("\n- Show with a new run that the objection is wrong, recorded the same way.");
     if tools.conclude && !tools.solvable {
         out.push_str("\n- If you have genuinely closed every route — every plan step done or dropped with a reason — conclude with status `unreachable`, citing attested execution evidence, then call finish. A rigorous \"cannot be met as stated\" is a complete, reportable outcome, not a failure.");
@@ -1070,6 +1083,17 @@ pub fn flag_candidate(handle: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evidence_not_a_run_names_the_tool_for_analysis_and_reference_only() {
+        let a = evidence_not_a_run(EvidenceGrade::Analysis, "dep_scan").expect("analysis is not a run");
+        assert!(a.contains("`dep_scan`") && a.contains("analysis, not a run"), "{a}");
+        assert!(a.contains("cannot conclude the goal, settle a verifier's objection"), "{a}");
+        let r = evidence_not_a_run(EvidenceGrade::Reference, "cve_lookup").expect("reference is not a run");
+        assert!(r.contains("`cve_lookup`") && r.contains("reference data, not a run"), "{r}");
+        assert!(evidence_not_a_run(EvidenceGrade::Run, "bash").is_none());
+        assert!(evidence_not_a_run(EvidenceGrade::Read, "read").is_none());
+    }
 
     fn tools_all() -> FinishTools {
         FinishTools { conclude: true, block: true, ask_for: true, spawn: true, plan: true, solvable: false }

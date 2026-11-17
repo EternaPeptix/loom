@@ -1100,6 +1100,8 @@ mod tests {
                     quote: None,
                     note: "test observation".into(),
                     attested: true,
+                    tool: None,
+                    grade: None,
                 },
             });
         }
