@@ -1503,7 +1503,7 @@ GET  /api/status                              → StatusView
 GET  /api/sessions?archived=true|false        → [SessionInfo], newest first
 POST /api/sessions                            NewSession → 201 SessionInfo + created
                                               {workspace, pack?, role?, model?, title?, unattended?, budget?, message?,
-                                               create_workspace?}; `~` and `~/x` in workspace mean the daemon user's
+                                               role_models?, prior?, create_workspace?}; `~` and `~/x` in workspace mean the daemon user's
                                               home; a missing workspace is made only when create_workspace is true, and
                                               `created: true` in the answer says it was (409 otherwise, with the sentence)
 GET  /api/sessions/{id}                       → SessionDetail (SessionInfo + children, oldest first)
