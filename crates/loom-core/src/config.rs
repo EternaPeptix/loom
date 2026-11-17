@@ -636,8 +636,47 @@ impl Config {
             if profile.max_concurrent == 0 {
                 return Err(ConfigError::Invalid(format!("models.{name}.max_concurrent must be at least 1")));
             }
+            if profile.api_key_file.is_some() && profile.api_key_env.is_some() {
+                return Err(ConfigError::Invalid(format!("models.{name}: set api_key_file or api_key_env, not both.")));
+            }
+            if let Some(file) = &profile.api_key_file {
+                check_key_file_name(file).map_err(|rule| ConfigError::Invalid(format!("models.{name}: {rule}")))?;
+            }
         }
         Ok(())
+    }
+
+    /// Reads every profile's `api_key_file` from `dir` (`Paths::model_keys_dir()`), in name order; the first
+    /// refusal is returned as `models.{p}: {sentence}`. The keys are dropped.
+    pub fn check_model_keys(&self, dir: &Path) -> Result<(), String> {
+        for (name, profile) in &self.models {
+            if let Some(file) = &profile.api_key_file {
+                read_model_key(dir, file).map_err(|e| format!("models.{name}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One sentence per profile that names its key by `api_key_env`, in name order. `is_set(var)` says whether
+    /// the variable is present and not empty in the environment the daemon has or will be started with.
+    /// Never holds a value.
+    pub fn key_env_warnings(&self, dir: &Path, is_set: impl Fn(&str) -> bool) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, profile) in &self.models {
+            let Some(var) = &profile.api_key_env else { continue };
+            let dir = dir.display();
+            let mv = format!(
+                "To move it, write the key to {dir}/{name} (`mkdir -p -m 700 {dir}`, then `(umask 077; printenv {var} > {dir}/{name})`), replace `api_key_env = \"{var}\"` with `api_key_file = \"{name}\"` in [models.{name}], and restart the daemon."
+            );
+            if is_set(var) {
+                out.push(format!(
+                    "The key of models.{name} is in the daemon's environment as {var}, where every command can read it. {mv}"
+                ));
+            } else {
+                out.push(format!("{var} is not set, so requests of models.{name} carry no key. {mv}"));
+            }
+        }
+        out
     }
 
     /// The profile a session should use: `name` when given, else `default_model`, else the only one.
@@ -653,6 +692,97 @@ impl Config {
             .map(|(k, v)| (k.as_str(), v))
             .ok_or_else(|| ConfigError::Invalid(format!("no model profile named \"{wanted}\"")))
     }
+}
+
+/// Ok when `file` is a plain file name for the model keys directory, else the sentence saying which rule it breaks.
+fn check_key_file_name(file: &str) -> Result<(), String> {
+    const RULE: &str = "an api_key_file is a file name of at most 64 characters made of letters, digits, '.', '_' and '-', not starting with '.', so that it names nothing outside the model keys directory";
+    let ok = !file.is_empty()
+        && file.len() <= 64
+        && !file.starts_with('.')
+        && file.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("api_key_file \"{file}\" is not allowed: {RULE}."))
+    }
+}
+
+/// Largest key file `read_model_key` accepts.
+const MAX_KEY_FILE_BYTES: u64 = 16 * 1024;
+
+/// The key in `dir/name` (a model profile's `api_key_file`), trimmed. See *model API keys* above. The
+/// file is opened without following a link and judged by the open descriptor. No message holds the key.
+pub fn read_model_key(dir: &Path, name: &str) -> Result<String, String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let path = dir.join(name);
+    let shown = path.display();
+    let open = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path);
+    let file = match open {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "The key file {shown} does not exist. Make it with `mkdir -p -m 700 {dir}` and `(umask 077; cat > {shown})`, then type or paste the key and press Ctrl-D.",
+                dir = dir.display()
+            ));
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(format!(
+                "The key file {shown} is a symbolic link, which loom does not follow. Replace it with a regular file holding the key: `rm {shown}`, then `(umask 077; cat > {shown})`."
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "The key file {shown} cannot be opened: {e}. Fix its permissions or recreate it with `(umask 077; cat > {shown})`."
+            ));
+        }
+    };
+    let meta = file.metadata().map_err(|e| format!("The key file {shown} cannot be inspected: {e}."))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "The key file {shown} is not a regular file. Replace it with a regular file holding the key."
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me {
+        return Err(format!(
+            "The key file {shown} belongs to another user (uid {}), not to you (uid {me}). Recreate it as yourself with `(umask 077; cat > {shown})`.",
+            meta.uid()
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "The key file {shown} can be read by other users (mode {:04o}). Run `chmod 600 {shown}`.",
+            meta.mode() & 0o7777
+        ));
+    }
+    let too_big = format!(
+        "The key file {shown} is larger than 16 KiB, which is too big for a key. Replace it with a file holding only the key."
+    );
+    if meta.len() > MAX_KEY_FILE_BYTES {
+        return Err(too_big);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_KEY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("The key file {shown} cannot be read: {e}."))?;
+    if bytes.len() as u64 > MAX_KEY_FILE_BYTES {
+        return Err(too_big);
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| format!("The key file {shown} is not UTF-8 text. Replace it with a file holding only the key."))?;
+    let key = text.trim();
+    if key.is_empty() {
+        return Err(format!("The key file {shown} is empty. Write the key into it."));
+    }
+    if key.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!(
+            "The key file {shown} holds white space or a control character inside the key. It must hold the key and nothing else."
+        ));
+    }
+    Ok(key.to_string())
 }
 
 /// Directory (inside `sessions/` or `missions/`) that loom never creates. An id that is not a plain name maps to
@@ -883,6 +1013,122 @@ allow = ["*.example.test"]
         c.models.insert("a".into(), ModelProfile::default());
         c.default_model = "b".into();
         assert!(c.check().is_err());
+    }
+
+    fn write_key(dir: &Path, name: &str, content: &[u8], mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, content).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn both_key_forms_are_refused() {
+        let mut c = Config::default();
+        c.models.insert(
+            "m".into(),
+            ModelProfile { api_key_file: Some("m".into()), api_key_env: Some("K".into()), ..Default::default() },
+        );
+        let e = c.check().unwrap_err().to_string();
+        assert!(e.contains("models.m: set api_key_file or api_key_env, not both."), "{e}");
+    }
+
+    #[test]
+    fn key_file_names_follow_the_rules() {
+        for bad in ["", ".hidden", "a/b", "../x", "a b", "naïve", &"a".repeat(65), "a\u{0}b"] {
+            let mut c = Config::default();
+            c.models.insert("m".into(), ModelProfile { api_key_file: Some(bad.into()), ..Default::default() });
+            let e = c.check().unwrap_err().to_string();
+            assert!(e.contains("models.m") && e.contains("api_key_file"), "{bad:?}: {e}");
+        }
+        for good in ["m", "local-1", "a.b_c", &"a".repeat(64)] {
+            let mut c = Config::default();
+            c.models.insert("m".into(), ModelProfile { api_key_file: Some(good.into()), ..Default::default() });
+            c.check().unwrap();
+        }
+    }
+
+    #[test]
+    fn read_model_key_returns_the_trimmed_key() {
+        let d = tempfile::tempdir().unwrap();
+        write_key(d.path(), "k", b"  sk-secret-123\n", 0o600);
+        assert_eq!(read_model_key(d.path(), "k").unwrap(), "sk-secret-123");
+        write_key(d.path(), "k400", b"abc", 0o400);
+        assert_eq!(read_model_key(d.path(), "k400").unwrap(), "abc");
+    }
+
+    #[test]
+    fn read_model_key_refusals_name_the_fix_and_never_hold_the_key() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        let missing = read_model_key(dir, "nope").unwrap_err();
+        assert!(missing.contains("mkdir -p -m 700") && missing.contains("umask 077; cat >"), "{missing}");
+        assert!(missing.contains(&dir.join("nope").display().to_string()));
+        write_key(dir, "real", b"sk-topsecret", 0o600);
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        let e = read_model_key(dir, "link").unwrap_err();
+        assert!(e.contains("symbolic link") && !e.contains("sk-topsecret"), "{e}");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        assert!(read_model_key(dir, "sub").unwrap_err().contains("not a regular file"));
+        for (mode, name) in [(0o640, "m640"), (0o604, "m604")] {
+            write_key(dir, name, b"sk-topsecret", mode);
+            let e = read_model_key(dir, name).unwrap_err();
+            assert!(e.contains(&format!("chmod 600 {}", dir.join(name).display())), "{e}");
+            assert!(!e.contains("sk-topsecret"));
+        }
+        write_key(dir, "empty", b"", 0o600);
+        assert!(read_model_key(dir, "empty").unwrap_err().contains("empty"));
+        write_key(dir, "blank", b" \n\t \n", 0o600);
+        assert!(read_model_key(dir, "blank").unwrap_err().contains("empty"));
+        write_key(dir, "inner", b"sk-topsecret more", 0o600);
+        let e = read_model_key(dir, "inner").unwrap_err();
+        assert!(e.contains("white space") && !e.contains("sk-topsecret"), "{e}");
+        write_key(dir, "ctl", b"sk-top\x07secret", 0o600);
+        let e = read_model_key(dir, "ctl").unwrap_err();
+        assert!(e.contains("control") && !e.contains("sk-top"), "{e}");
+        write_key(dir, "bin", &[0xff, 0xfe, b'a'], 0o600);
+        assert!(read_model_key(dir, "bin").unwrap_err().contains("UTF-8"));
+        write_key(dir, "big", &vec![b'a'; 16 * 1024 + 1], 0o600);
+        let e = read_model_key(dir, "big").unwrap_err();
+        assert!(e.contains("16 KiB") && !e.contains("aaaa"), "{e}");
+        write_key(dir, "edge", &vec![b'a'; 16 * 1024], 0o600);
+        assert_eq!(read_model_key(dir, "edge").unwrap().len(), 16 * 1024);
+    }
+
+    #[test]
+    fn check_model_keys_names_the_profile() {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = Config::default();
+        c.models.insert("good".into(), ModelProfile { api_key_file: Some("good".into()), ..Default::default() });
+        c.models.insert("bad".into(), ModelProfile { api_key_file: Some("bad".into()), ..Default::default() });
+        c.models.insert("none".into(), ModelProfile::default());
+        write_key(d.path(), "good", b"k", 0o600);
+        let e = c.check_model_keys(d.path()).unwrap_err();
+        assert!(e.starts_with("models.bad: "), "{e}");
+        assert!(e.contains(&d.path().join("bad").display().to_string()));
+        write_key(d.path(), "bad", b"k", 0o600);
+        c.check_model_keys(d.path()).unwrap();
+    }
+
+    #[test]
+    fn key_env_warnings_for_a_set_and_an_unset_variable() {
+        let dir = Path::new("/h/keys/models");
+        let mut c = Config::default();
+        c.models.insert("a".into(), ModelProfile { api_key_env: Some("A_KEY".into()), ..Default::default() });
+        c.models.insert("b".into(), ModelProfile { api_key_env: Some("B_KEY".into()), ..Default::default() });
+        c.models.insert("f".into(), ModelProfile { api_key_file: Some("f".into()), ..Default::default() });
+        c.models.insert("n".into(), ModelProfile::default());
+        let w = c.key_env_warnings(dir, |v| v == "A_KEY");
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].contains("models.a") && w[0].contains("A_KEY") && w[0].contains("every command can read it"));
+        assert!(w[1].contains("models.b") && w[1].contains("B_KEY is not set"));
+        for line in &w {
+            assert!(
+                line.contains("printenv") && line.contains("api_key_file = ") && line.contains("restart the daemon")
+            );
+        }
+        assert!(w[0].contains("printenv A_KEY > /h/keys/models/a"));
+        assert!(Config::default().key_env_warnings(dir, |_| true).is_empty());
     }
 
     #[test]
