@@ -597,7 +597,9 @@ pub struct NewSession {
     /// The first message, sent as soon as the session exists.
     pub message: Option<String>,
     /// Earlier missions this one may recall: what their sealed ledgers recorded is put into the lead's log
-    /// once, before its first model request (`crate::prior`).
+    /// once, before its first model request (`crate::prior`). Not written when empty, so that a request that
+    /// names none is accepted by a daemon older than this field.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub prior: Vec<MissionId>,
 }
 
@@ -4086,17 +4088,21 @@ impl Runtime {
     /// known session, and what their sealed journals hold (read on a blocking thread).
     async fn recall_earlier(&self, named: &[MissionId]) -> Result<(Vec<MissionId>, Vec<prior::Recalled>), String> {
         let mut ids: Vec<MissionId> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
         for m in named {
-            let m = MissionId::from(m.as_str().trim());
-            if !m.as_str().is_empty() && !ids.contains(&m) {
-                ids.push(m);
+            let m = m.as_str().trim();
+            if !m.is_empty() && seen.insert(m) {
+                // Only the first MAX_PRIOR are kept; the rest are only counted.
+                if ids.len() <= prior::MAX_PRIOR {
+                    ids.push(MissionId::from(m));
+                }
             }
         }
-        if ids.len() > prior::MAX_PRIOR {
+        if seen.len() > prior::MAX_PRIOR {
             return Err(format!(
                 "Name at most {} earlier missions to recall; {} were named.",
                 prior::MAX_PRIOR,
-                ids.len()
+                seen.len()
             ));
         }
         let mut found: Vec<(MissionId, String, Journal)> = Vec::new();
@@ -4104,12 +4110,15 @@ impl Runtime {
             let st = self.inner.st();
             for m in &ids {
                 let sessions = || st.known.values().filter(|k| &k.meta.mission == m);
-                let Some(lead) = sessions().find(|k| k.meta.parent.is_none()).or_else(|| sessions().next()) else {
+                if sessions().next().is_none() {
                     return Err(format!("There is no mission {m} to recall."));
-                };
+                }
+                // The title is the lead's; a mission whose lead is not known has none (a child's title is
+                // written by the model).
+                let title = sessions().find(|k| k.meta.parent.is_none()).map(|k| k.meta.title.clone());
                 found.push((
                     m.clone(),
-                    lead.meta.title.clone(),
+                    title.unwrap_or_else(|| "untitled".to_string()),
                     Journal::new(self.inner.paths.journal(m), self.inner.key.clone()),
                 ));
             }
@@ -7837,6 +7846,40 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn a_new_session_that_names_no_earlier_mission_is_sent_without_the_key() {
+        let none = serde_json::to_value(NewSession::default()).unwrap();
+        assert!(none.get("prior").is_none(), "{none}");
+        let some =
+            serde_json::to_value(NewSession { prior: vec![MissionId::from("m-1")], ..Default::default() }).unwrap();
+        assert_eq!(some["prior"], json!(["m-1"]));
+        // Both forms are read back.
+        assert!(serde_json::from_value::<NewSession>(none).unwrap().prior.is_empty());
+        assert_eq!(serde_json::from_value::<NewSession>(some).unwrap().prior, [MissionId::from("m-1")]);
+    }
+
+    #[tokio::test]
+    async fn a_mission_without_a_known_lead_has_no_title_to_show() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let earlier = mission_with_goal(&e, "Lead title", "g").await;
+        let lead = e.rt.sessions(true).into_iter().find(|s| s.meta.mission == earlier).unwrap().meta.id;
+        let (named, recalled) = e.rt.recall_earlier(std::slice::from_ref(&earlier)).await.unwrap();
+        assert_eq!((named, recalled[0].title.as_str()), (vec![earlier.clone()], "Lead title"));
+        // Only a child of the mission is known: its title (written by the model) is not the mission's.
+        {
+            let mut st = e.rt.inner.st();
+            let mut kid = st.known.get(&lead).unwrap().meta.clone();
+            kid.id = SessionId::from("s-kid");
+            kid.parent = Some(lead.clone());
+            kid.title = "MODEL-WRITTEN-TITLE".into();
+            st.known.remove(&lead);
+            st.known.insert(kid.id.clone(), Known::new(kid, idle_status()));
+        }
+        let (_, recalled) = e.rt.recall_earlier(&[earlier]).await.unwrap();
+        assert_eq!(recalled[0].title, "untitled");
+        e.rt.shutdown().await;
+    }
+
     #[tokio::test]
     async fn a_lead_recalls_the_missions_the_operator_named_before_its_first_request() {
         let e = env(Script::new(|_, _| finish("ok"))).await;
@@ -7911,6 +7954,13 @@ mod tests {
         );
         assert_eq!(e.rt.sessions(true).len(), before);
         assert!(e.server.requests().is_empty());
+        // A very long list is counted, not scanned quadratically, and says how many distinct ids it named.
+        let mut new = e.new_session(None);
+        new.prior = (0..200_000).map(|i| MissionId::from(format!("m-{}", i % 50_000))).collect();
+        assert_eq!(
+            e.rt.create_session(new).await.unwrap_err(),
+            "Name at most 8 earlier missions to recall; 50000 were named."
+        );
         // Eight is fine, and a repeat counts once.
         let mut new = e.new_session(None);
         new.prior = vec![earlier.clone(); 12];

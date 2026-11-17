@@ -273,7 +273,9 @@ Before its first model request the new lead gets one note with, per named missio
 ledger was last written; the goal, rules and answers you gave it (marked as your words from an earlier
 mission); its goal status; where its work stood when it ended (claims, plan, dead ends — marked as written
 by the model there and not verified); and its security record as counts and asset locators (no hypotheses,
-no credentials, no query strings). The source is each mission's sealed ledger; a ledger that fails
+no credentials, no identities by name, no query strings in a locator). Your own words are shown exactly as you
+wrote them; what the model wrote is shown with URL queries, fragments and passwords removed, but may still hold
+whatever else the model wrote there. The source is each mission's sealed ledger; a ledger that fails
 verification or was written by a newer loom is named as unreadable and nothing from it is shown. Nothing
 else carries over: the earlier mission's stored outputs cannot be opened from the new one, and its
 approvals and network grants do not apply.
