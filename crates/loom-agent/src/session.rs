@@ -7505,6 +7505,37 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_read_on_a_small_window_ends_at_a_whole_line_and_the_next_read_goes_on_from_there() {
+        let window = 16_000u64;
+        let script = seq(vec![
+            Reply::tool("read", r#"{"path":"big.jsonl"}"#).into(),
+            Reply::tool("read", r#"{"path":"big.jsonl","start":2}"#).into(),
+            Reply::text("ok").into(),
+        ]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.window = Some(window);
+        let line = format!("{{\"k\":\"{}\"}}", "v".repeat(240));
+        let text: String = (0..2_000).map(|_| format!("{line}\n")).collect();
+        std::fs::write(fx.ctx.workspace.join("big.jsonl"), &text).unwrap();
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let results = results(&fx.sink.records());
+        let first = &results[0];
+        let budget = AdmitPolicy::default().for_window(Some(window)).view_chars(&TokenEstimator::default());
+        // About 500k characters are asked for; what is shown is one view's worth, ending at a whole line.
+        assert!(first.text.chars().count() < budget * 2, "{}", first.text.chars().count());
+        let shown = first.meta.get(loom_core::event::META_SHOWN).cloned().unwrap_or_default();
+        let last = shown[0][1].as_u64().unwrap();
+        assert!(last > 1 && last < 2_000, "{shown}");
+        assert!(first.text.contains(&format!("window ended at line {last}")), "{}", first.text);
+        assert!(first.text.contains(&format!("continue with start {}", last + 1)), "{}", first.text);
+        assert!(first.text.contains(&format!("{last}\t{line}\n")), "the last line shown is whole");
+        assert_eq!(first.status, ToolStatus::Ok);
+        assert!(!first.cut, "the tool bounded itself; the harness did not have to cut it");
+        assert!(results[1].text.contains("2\t{\"k\""), "{}", results[1].text.chars().take(200).collect::<String>());
+    }
+
     // ---- stall -------------------------------------------------------------------------------
 
     #[tokio::test]
