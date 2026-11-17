@@ -37,8 +37,7 @@ async fn all(wanted: &[String]) -> Result<Vec<Outcome>, String> {
     Ok(outcomes)
 }
 
-#[tokio::main]
-async fn main() {
+async fn run_all() -> i32 {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let json = args.iter().any(|a| a == "--json");
     args.retain(|a| a != "--json");
@@ -48,9 +47,50 @@ async fn main() {
         Err(e) => Err(e),
     };
     match text {
-        Ok(text) => println!("{text}"),
+        Ok(text) => {
+            println!("{text}");
+            0
+        }
         Err(e) => {
             eprintln!("eval: {e}");
+            1
+        }
+    }
+}
+
+fn main() {
+    let dir = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("eval: Could not create a temporary directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = evalkit::install_fake_depscan(dir.path()) {
+        eprintln!("eval: {e}");
+        std::process::exit(1);
+    }
+    let mut paths = vec![dir.path().to_path_buf()];
+    paths.extend(std::env::var_os("PATH").iter().flat_map(std::env::split_paths));
+    let path = match std::env::join_paths(paths) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("eval: Could not put the fake depscan on the PATH: {e}");
+            std::process::exit(1);
+        }
+    };
+    // The process is single-threaded here: no runtime or other thread exists yet, so changing the
+    // environment cannot race with a reader.
+    std::env::set_var("PATH", path);
+    match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => {
+            let code = rt.block_on(run_all());
+            // The directory holding the fake is removed before the process exits.
+            drop(dir);
+            std::process::exit(code);
+        }
+        Err(e) => {
+            eprintln!("eval: Could not start the runtime: {e}");
             std::process::exit(1);
         }
     }
