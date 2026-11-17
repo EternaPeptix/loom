@@ -274,7 +274,7 @@ impl Rig {
                 call_id: result.call_id.clone(),
                 tool: result.name.clone(),
                 class: result.class,
-                grade: EvidenceGrade::of(result.class, &result.meta),
+                grade: EvidenceGrade::of_tool_result(&result.name, result.class, &result.meta),
             });
         }
         result

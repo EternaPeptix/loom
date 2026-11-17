@@ -22,9 +22,12 @@
 //! - dep-scan's `depscan:prioritized` / `depscan:insights` labels are its own static
 //!   (reachability) analysis. The summary says so: they are scanner data about the scanned
 //!   tree, not execution evidence that vulnerable code runs in a deployed system. The harness
-//!   enforces it: every result, whatever its status, carries `meta[META_EVIDENCE_GRADE] =
-//!   "analysis"`, so a quote of a scan is recorded as static evidence and never meets a rule that
-//!   asks for a run (see `loom_core::event::EvidenceGrade`), although the tool is of class `Exec`.
+//!   enforces it: every result this tool's `run` returns, whatever its status, carries
+//!   `meta[META_EVIDENCE_GRADE] = "analysis"`, so a quote of a scan is recorded as static evidence
+//!   and never meets a rule that asks for a run (see `loom_core::event::EvidenceGrade`), although
+//!   the tool is of class `Exec`. A call refused before `run` (argument check, a cap) stores no
+//!   output, and `EvidenceGrade::of_tool_result` grades any `dep_scan` result without the key as
+//!   analysis too.
 //! - Status is `Ok` for a completed scan whether or not it found anything (a scan result is
 //!   an observation, like an HTTP error status in `web_fetch`); `Error` when the scanner did
 //!   not complete or produced no parseable VDR, `Interrupted`/`Timeout` when it was stopped.

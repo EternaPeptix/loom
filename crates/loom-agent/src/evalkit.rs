@@ -104,9 +104,9 @@
 //!   output as evidence, concludes and finishes on it, is refused both times, then runs the target and
 //!   concludes and finishes on the run. Moves: `Scan, Claim, Evidence(ByLines), Support, Conclude("e1"),
 //!   Finish(ByLines), Run, Evidence(ByLines), Conclude("e2"), Finish(ByLines)`. The `conclude` on `e1` is
-//!   refused because analysis is not a run, so the `finish` after it is held by the goal pre-gate; before
-//!   evidence grades, a scan was execution evidence because `dep_scan` is an `Exec` tool, and this model
-//!   finished on the scan with `sum.txt` never written.
+//!   refused because analysis is not a run, so the `finish` after it is held by the goal pre-gate. A harness
+//!   that took a scan for a run (`dep_scan` is an `Exec` tool) would let this model finish on the scan with
+//!   `sum.txt` never written.
 //!
 //! ## `table(outcomes)`
 //! The outcomes as text, one row each under a header line, columns separated by two spaces and as wide
@@ -383,8 +383,13 @@ fn scanner_problem(scenario: &Scenario) -> Option<String> {
     let found = std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path).map(|dir| dir.join("depscan")).find(|candidate| candidate.is_file())
     });
+    // The length first: a real scanner can be a large binary, not worth reading to tell it apart.
+    let is_fake = |path: &std::path::Path| {
+        std::fs::metadata(path).is_ok_and(|m| u64::try_from(FAKE_DEPSCAN.len()).ok() == Some(m.len()))
+            && std::fs::read(path).is_ok_and(|bytes| bytes == FAKE_DEPSCAN.as_bytes())
+    };
     let seen = match found {
-        Some(path) if std::fs::read(&path).is_ok_and(|bytes| bytes == FAKE_DEPSCAN.as_bytes()) => return None,
+        Some(path) if is_fake(&path) => return None,
         Some(path) => format!("the first `depscan` on the PATH is {}", path.display()),
         None => "there is no `depscan` on the PATH".to_string(),
     };

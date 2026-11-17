@@ -19,6 +19,11 @@
   when absent, so existing journal entries, and their MACs, are unchanged). Evidence lists in the
   `evidence` result, the brief, the ledger Markdown, the journal summary and verifier assignments name each
   record's grade and tool (`e1 run by bash`, `e2 analysis by dep_scan`).
+- A result of `dep_scan`, `bin_decompile`, `bin_xrefs` or the CVE/advisory tools logged before this
+  change (no grade key) is graded as those tools now state (`EvidenceGrade::of_tool_result`), so an output
+  stored before the upgrade does not become a run by being cited after it. Evidence records already in a
+  journal are not regraded: one recorded from a scan before the upgrade stays `execution`.
+- The same scanner run through `bash` is a `run`: the grade belongs to the tool, not the command.
 - New evalkit scenario `concludes_on_a_scan`, played with a fake `depscan` that the `eval` example puts
   first on its own PATH.
 

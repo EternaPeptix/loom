@@ -1300,7 +1300,7 @@ impl Tool for Conclude {
     fn spec(&self) -> ToolSpec {
         spec(
             "conclude",
-            "Record whether the mission's goal is met. This is what makes `finish` available: a finish is refused until the goal is concluded. Use `met` once a run of the target shows the goal achieved; use `unreachable` only once you have established that the goal cannot be met as stated: every plan step closed (done or dropped), every route tried, with execution evidence for it. Cite evidence records (ids from `evidence`) that are attested and show a run; reading source alone is refused. Not being there yet is neither: keep working. After concluding, call `finish` with the result; a verifier checks it.",
+            "Record whether the mission's goal is met. This is what makes `finish` available: a finish is refused until the goal is concluded. Use `met` once a run of the target shows the goal achieved; use `unreachable` only once you have established that the goal cannot be met as stated: every plan step closed (done or dropped), every route tried, with execution evidence for it. Cite evidence records (ids from `evidence`) that are attested and show a run; reading source, a dependency scan, a decompilation or a CVE lookup alone is refused. Not being there yet is neither: keep working. After concluding, call `finish` with the result; a verifier checks it.",
             ToolClass::State,
             &[
                 req("status", "string", "met: the goal is achieved. unreachable: it cannot be met as stated.").one_of(&["met", "unreachable"]),
@@ -2568,27 +2568,28 @@ mod tests {
         format!("e{}", r.shared.ledger().unwrap().evidence.len())
     }
 
-    /// Record analysis of the target (a supported claim with attested evidence from `dep_scan`, an `Exec` tool
-    /// whose output is analysis), graded the way the evidence tool grades it. Returns the evidence id.
-    fn record_analysis(r: &Rig) -> String {
+    /// Record analysis of the target end to end: a supported claim with evidence attached through the `evidence`
+    /// tool, quoting an output of `dep_scan` (an `Exec` tool whose results say they are analysis). So a test using
+    /// it fails if the evidence tool records a scan as a run. Returns the evidence id.
+    async fn record_analysis(r: &Rig) -> String {
         let claim = format!("c{}", r.shared.ledger().unwrap().claims.len() + 1);
         r.model_op(LedgerOp::ClaimAdd { text: "the target has a vulnerable dependency".into() });
-        r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
-            claim: claim.clone(),
-            kind: EvidenceKind::Static,
-            supports: true,
-            session: "s-test".into(),
-            call_id: "call-0".into(),
-            blob: None,
-            lines: None,
-            quote: None,
-            note: "scanned the target".into(),
-            attested: true,
-            tool: Some("dep_scan".into()),
-            grade: Some(EvidenceGrade::Analysis),
-        }));
+        let h = r.output_graded(
+            "pkg:cargo/time@0.1.44 RUSTSEC-2020-0071 reachable\n",
+            "dep_scan",
+            ToolClass::Exec,
+            EvidenceGrade::Analysis,
+        );
+        let res = r
+            .call("evidence", json!({"claim": claim, "handle": h, "start": 1, "end": 1, "note": "scanned the target"}))
+            .await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let st = r.shared.ledger().unwrap();
+        let e = st.evidence.last().unwrap();
+        assert_eq!((e.input.kind, e.input.grade), (EvidenceKind::Static, Some(EvidenceGrade::Analysis)));
+        let id = e.id.clone();
         r.model_op(LedgerOp::ClaimUpdate { id: claim, status: ClaimStatus::Supported, note: String::new() });
-        format!("e{}", r.shared.ledger().unwrap().evidence.len())
+        id
     }
 
     /// Conclude the goal as met through the tool, after a recorded run.
@@ -2981,7 +2982,7 @@ mod tests {
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert_eq!(open_objections(&r), 2);
         // An analysis record after the objections answers nothing: the finish is still refused, no verifier.
-        record_analysis(&r);
+        record_analysis(&r).await;
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(res.text.contains("An objection is settled only by new work"), "{}", res.text);
@@ -3007,12 +3008,12 @@ mod tests {
         r.shared.take_emitted();
         // Analysis recorded since the rejection is not fresh work: the count keeps rising and the item opens
         // at the threshold, exactly as without it.
-        record_analysis(&r);
+        record_analysis(&r).await;
         r.shared.take_emitted();
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(!res.text.contains("non-blocking item"), "{}", res.text);
-        record_analysis(&r);
+        record_analysis(&r).await;
         r.shared.take_emitted();
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
@@ -3025,7 +3026,7 @@ mod tests {
     #[tokio::test]
     async fn conclude_met_citing_only_analysis_is_refused_and_records_nothing() {
         let r = lead_with_goal();
-        let e = record_analysis(&r);
+        let e = record_analysis(&r).await;
         let before = r.shared.ledger().unwrap();
         let res = r.call("conclude", json!({"status": "met", "note": "the scan shows it", "evidence": [e]})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);

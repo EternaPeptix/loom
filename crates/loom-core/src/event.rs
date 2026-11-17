@@ -106,7 +106,29 @@ impl EvidenceGrade {
             None => EvidenceGrade::Read,
         }
     }
+
+    /// The grade of a recorded result of the tool `name`: [`EvidenceGrade::of`], except that a result of one
+    /// of the tools that state their grade ([`GRADED_ANALYSIS_TOOLS`], [`GRADED_REFERENCE_TOOLS`]) which
+    /// carries no [`META_EVIDENCE_GRADE`] (a log written before they stated it) gets the grade they state
+    /// now, never `Run`. So an output stored before an upgrade cannot become a run by being cited after it.
+    pub fn of_tool_result(name: &str, class: ToolClass, meta: &Map<String, Value>) -> EvidenceGrade {
+        if !meta.contains_key(META_EVIDENCE_GRADE) {
+            if GRADED_ANALYSIS_TOOLS.contains(&name) {
+                return EvidenceGrade::Analysis;
+            }
+            if GRADED_REFERENCE_TOOLS.contains(&name) {
+                return EvidenceGrade::Reference;
+            }
+        }
+        EvidenceGrade::of(class, meta)
+    }
 }
+
+/// Tools whose every result states the grade `analysis` (see [`EvidenceGrade::of_tool_result`]).
+pub const GRADED_ANALYSIS_TOOLS: &[&str] = &["dep_scan", "bin_decompile", "bin_xrefs"];
+/// Tools whose every result states the grade `reference` (`web_fetch` states it only for some, so it is not
+/// here: an old `web_fetch` result grades by class, as `read`).
+pub const GRADED_REFERENCE_TOOLS: &[&str] = &["cve_lookup", "cve_search", "advisory_lookup"];
 
 /// Who produced an item. Never changed by projection, eviction or summarisation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1181,6 +1203,27 @@ mod tests {
             assert_eq!(EvidenceGrade::of(ToolClass::Exec, &meta), EvidenceGrade::Analysis, "{bad}");
             assert_eq!(EvidenceGrade::of(ToolClass::Read, &meta), EvidenceGrade::Read, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_self_grading_tools_result_without_a_grade_is_never_a_run() {
+        let none = Map::new();
+        for name in GRADED_ANALYSIS_TOOLS {
+            assert_eq!(EvidenceGrade::of_tool_result(name, ToolClass::Exec, &none), EvidenceGrade::Analysis);
+        }
+        for name in GRADED_REFERENCE_TOOLS {
+            for class in [ToolClass::Read, ToolClass::Nav] {
+                assert_eq!(EvidenceGrade::of_tool_result(name, class, &none), EvidenceGrade::Reference);
+            }
+        }
+        // Any other tool, and any result that states a grade, is graded by `of`.
+        assert_eq!(EvidenceGrade::of_tool_result("bash", ToolClass::Exec, &none), EvidenceGrade::Run);
+        assert_eq!(EvidenceGrade::of_tool_result("web_fetch", ToolClass::Read, &none), EvidenceGrade::Read);
+        assert_eq!(EvidenceGrade::of_tool_result("gdb_probe", ToolClass::Exec, &none), EvidenceGrade::Run);
+        let stated = graded(json!("analysis"));
+        assert_eq!(EvidenceGrade::of_tool_result("bash", ToolClass::Exec, &stated), EvidenceGrade::Analysis);
+        let reference = graded(json!("reference"));
+        assert_eq!(EvidenceGrade::of_tool_result("dep_scan", ToolClass::Exec, &reference), EvidenceGrade::Reference);
     }
 
     #[test]

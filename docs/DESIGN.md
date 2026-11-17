@@ -499,16 +499,25 @@ model that concludes on a scanner's "reachable" label has shown nothing about wh
 tool states its grade in its result's meta (`META_EVIDENCE_GRADE`): those three say `analysis`; the CVE and
 advisory tools, and `web_fetch` when its last hop used the reference client, say `reference`. A result that
 states none is graded by class, `run` for `Exec` and `read` otherwise, which is what the harness did before
-grades existed, so an old log grades as it did. The key can only lower a grade: `run` counts only on an
+grades existed, so an old log grades as it did, with one exception: a result of one of the six tools that
+state a fixed grade (`event::GRADED_ANALYSIS_TOOLS`, `GRADED_REFERENCE_TOOLS`) gets that grade even from a
+log written before they stated it, so a scan stored before an upgrade does not become a run by being cited
+after it. Evidence records already written stay as they were: one recorded from a scan before the upgrade
+is still `execution`. The key can only lower a grade: `run` counts only on an
 `Exec` result, and an unreadable value is `analysis` on one. The producer index carries the grade, the
 evidence record stores it with the tool's name, and `kind` follows from it. Every rule that asks for
 execution evidence keeps asking for `kind: execution` and therefore for a run: concluding the goal (and
 concluding it again after a reopening), settling a verifier's objection, and the progress that resets stuck
-detection (§8). Analysis evidence can still support a claim. Wherever evidence is listed for the model or a
-verifier, each record names its grade and tool (`e1 run by bash`, `e2 analysis by dep_scan`): in the
+detection (§8). Analysis evidence can still support a claim. Where the model or a verifier weighs
+evidence, each record names its grade and tool (`e1 run by bash`, `e2 analysis by dep_scan`): in the
 `evidence` result (which adds, for analysis and reference, that it is not a run), the brief's claims and
-goal status, and the evidence lines of a verifier's assignment. Entries written before grades carry none and
-are shown by their kind (`run`, `read`).
+goal status, the refusal of a `conclude` that cites no run, and the evidence lines of a verifier's
+assignment (the finish verifier's and `verify`'s); the ledger Markdown and the journal summary show them too.
+Entries written before grades carry none and are shown by their kind (`run`, `read`). The grade is a fact
+about the producing tool, not about what a command did: the same scanner or decompiler started through
+`bash` (or `pty_exec`, `box_exec`) is a `run`, since the harness does not read commands to guess what they
+are. What stands against a "run" that only printed a scanner's verdict is the verifier, which sees the
+quote and its source.
 
 **Quote check** (`observe::check_quote`, also used for the quotes of `finish`). Both sides are prepared
 the same way: trailing whitespace is removed from every line, and blank lines at either end of the

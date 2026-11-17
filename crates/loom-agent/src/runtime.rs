@@ -246,11 +246,13 @@
 //! stored); a `job_settled` whose output is `blob`, or a `job_matched` whose stored part is, credited
 //! to the call named by the `job_registered` of that job (`bash`, class `Exec`). Views of runtime tools
 //! register nothing.
-//! `Producer{session, call_id, tool: name, class, grade}`, where `grade` is `EvidenceGrade::of(class, meta)`
-//! of that `tool_result` (so `dep_scan`, `bin_decompile` and `bin_xrefs` give `Analysis`, the CVE and
-//! advisory tools and a reference-host `web_fetch` give `Reference`, any other `Exec` result `Run`, any
+//! `Producer{session, call_id, tool: name, class, grade}`, where `grade` is `EvidenceGrade::of_tool_result(name,
+//! class, meta)` of that `tool_result` (so `dep_scan`, `bin_decompile` and `bin_xrefs` give `Analysis`, the CVE
+//! and advisory tools and a reference-host `web_fetch` give `Reference`, any other `Exec` result `Run`, any
 //! other result `Read`), and a job's output is `Run` (the `bash` call that started it). A log written
-//! before the grade key existed grades by class alone, as before. Kept as an in-memory index fed by
+//! before the grade key existed grades by class, as before, except the results of those six tools, which get
+//! the grade the tools state now: an output a scan stored before an upgrade is not a run when it is cited
+//! after it. Kept as an in-memory index fed by
 //! every record that passes through the sink; on a miss for a mission whose logs have not been
 //! scanned since start, scan the logs of all its sessions once, then answer.
 //!
@@ -942,7 +944,7 @@ fn produced_by(
                 call_id: t.call_id.clone(),
                 tool: t.name.clone(),
                 class: t.class,
-                grade: EvidenceGrade::of(t.class, &t.meta),
+                grade: EvidenceGrade::of_tool_result(&t.name, t.class, &t.meta),
             };
             if let Some(o) = &t.output {
                 return Some((o.id.clone(), p));
@@ -6736,10 +6738,13 @@ mod tests {
         let p = e.rt.inner.orch.producer(&info.meta.mission, &blob).await.unwrap();
         assert_eq!(p.session, id);
         assert_eq!(p.call_id, call_id);
+        assert_eq!(p.grade, EvidenceGrade::Run);
         e.rt.shutdown().await;
         let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
         let p2 = rt2.inner.orch.producer(&info.meta.mission, &blob).await.unwrap();
         assert_eq!(p2.call_id, call_id);
+        // The scan of the logs after a restart grades the output as the live index did.
+        assert_eq!(p2.grade, p.grade);
         rt2.shutdown().await;
     }
 
@@ -7030,6 +7035,11 @@ mod tests {
         // A plain command result is a run.
         let bash = tool_result("c3", "bash", ToolClass::Exec, Some("aa03"), json!({}));
         assert_eq!(grade(&mut jobs, &bash), Some(EvidenceGrade::Run));
+        // A scan or a lookup logged before the tools stated a grade is still not a run.
+        let old_scan = tool_result("c7", "bin_decompile", ToolClass::Exec, Some("aa07"), json!({}));
+        assert_eq!(grade(&mut jobs, &old_scan), Some(EvidenceGrade::Analysis));
+        let old_lookup = tool_result("c8", "advisory_lookup", ToolClass::Read, Some("aa08"), json!({}));
+        assert_eq!(grade(&mut jobs, &old_lookup), Some(EvidenceGrade::Reference));
         // The key cannot raise a read to a run.
         let lying = tool_result("c4", "fetch", ToolClass::Read, Some("aa04"), json!({KEY: "run"}));
         assert_eq!(grade(&mut jobs, &lying), Some(EvidenceGrade::Read));

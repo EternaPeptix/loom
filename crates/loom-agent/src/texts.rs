@@ -179,7 +179,7 @@ pub fn evidence_not_a_run(grade: EvidenceGrade, tool: &str) -> Option<String> {
         EvidenceGrade::Run | EvidenceGrade::Read => return None,
     };
     Some(format!(
-        "The output of `{tool}` is {what}: it can support a claim, but it cannot conclude the goal, settle a verifier's objection, or count as new progress after a rejected finish. To show what the target does, run it and record that run with `evidence`."
+        "The output of `{tool}` is {what}: it is recorded, but it cannot conclude the goal, settle a verifier's objection, or count as new progress after a rejected finish. To show what the target does, run it and record that run with `evidence`."
     ))
 }
 

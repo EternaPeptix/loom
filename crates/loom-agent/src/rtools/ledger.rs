@@ -55,7 +55,7 @@
 //!   3. `EvidenceAdd(EvidenceInput { claim, kind, supports, session, call_id, blob: Some, lines:
 //!      Some((start, end)) as verified, quote: the verified text, note, attested: true, tool:
 //!      Some(producer.tool), grade: Some(producer.grade) })` where `kind` is `Execution` when the producer's
-//!      grade is `Run` and its class is `Exec`, else `Static`. The class alone no longer decides: `dep_scan`,
+//!      grade is `Run` and its class is `Exec`, else `Static`. The class alone does not decide: `dep_scan`,
 //!      `bin_decompile` and `bin_xrefs` are `Exec` tools whose output is analysis, so a quote of it is static
 //!      evidence and meets no rule that asks for a run. The verified text has no
 //!      line-number prefixes; a fragment is recorded as the complete line or lines it lies on, and `lines`

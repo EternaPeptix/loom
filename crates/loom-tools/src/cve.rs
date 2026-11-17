@@ -33,9 +33,10 @@
 //! (not raw JSON) whose first lines are the headline facts, so a cut still shows them; the complete
 //! upstream JSON of each source is stored too (see each tool). `outcome` is a few words. Numbers are
 //! plain. Every retrieval notes its source and that it was retrieved now (the record is a snapshot).
-//! Every result of the three tools, whatever its status, carries `meta[META_EVIDENCE_GRADE] = "reference"`:
-//! a CVE or advisory record is data about the world, not an observation of the target, so a quote of it is
-//! never a run (see `loom_core::event::EvidenceGrade`).
+//! Every result the three tools' `run` returns, whatever its status, carries `meta[META_EVIDENCE_GRADE] =
+//! "reference"`: a CVE or advisory record is data about the world, not an observation of the target, so a
+//! quote of it is never a run (see `loom_core::event::EvidenceGrade`; a call refused before `run` stores no
+//! output, and `EvidenceGrade::of_tool_result` grades their results without the key as reference too).
 //!
 //! ## `cve_lookup` — one consolidated CVE record (ToolClass::Read)
 //! Args: `id` (required string). Normalise to `CVE-YYYY-NNNN…` (uppercase; accept lowercase and a
